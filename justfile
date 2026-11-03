@@ -33,11 +33,11 @@ native-dir   := scratch / "native-state"
 # The workspace doesn't compile natively on macOS (minimald/lcache/mctx are
 # Linux-only): scope to the darwin-capable crates there; `just test-cross`
 # covers the rest. The Linux lanes run nextest's ci profile; macOS has none.
-scope      := if os() == "macos" { "-p minvmd -p sessions" } else { "--workspace" }
-# The strict gate's scope on macOS: the same pair `clippy` and `test` already
+scope      := if os() == "macos" { "-p minvmd -p boxes -p bep" } else { "--workspace" }
+# The strict gate's scope on macOS: the same crates `clippy` and `test` already
 # use, because the Linux-only crates do not build there. The script reports any
 # changed crate this leaves out, so the scope is never silently narrower.
-strict-scope := if os() == "macos" { "-p minvmd -p sessions" } else { "" }
+strict-scope := if os() == "macos" { "-p minvmd -p boxes -p bep" } else { "" }
 # Crates carrying a `fuzz/` workspace. `rcache` is Linux-only: it pulls in
 # `lcache`, which uses the Linux-only `common::renameat2`.
 fuzz-crates := if os() == "macos" { "args common diagnostics graph mfile paths" } else { "args common diagnostics graph mfile paths rcache" }
@@ -64,11 +64,29 @@ export MINVMD_LIFECYCLE_BOOT_TIMEOUT_SECS := env('MINVMD_LIFECYCLE_BOOT_TIMEOUT_
 default:
     @just --list
 
+# Installs nothing; each failed check prints the command that fixes it. The
+# list mirrors AGENTS.md §System dependencies.
+#
+# Check this host for the tools the recipes need, and print a fix for each gap.
+preflight:
+    @scripts/preflight.sh
+
+# `cross` runs the host's x86_64 Linux rustup toolchain inside its x86_64
+# image, and rustup refuses that toolchain on an arm64 Mac without
+# --force-non-host. Checking first turns rustup's install error into the fix.
+[macos]
+_preflight-cross:
+    @scripts/preflight.sh cross
+
+# Linux needs no gate here: `just preflight` warns when cross is missing.
+[linux]
+_preflight-cross:
+
 # ── build & fetch ────────────────────────────────────────────────────────────
 #
 # Prereqs — macOS: `brew install slp/krun/libkrun zstd jq`.
 # Linux: a KVM host with kvm-group membership, Rust + protoc + jq + cpio + zstd.
-# See crates/minvmd/README.md for the manual bring-up.
+# `just preflight` checks them. See crates/minvmd/README.md for the manual bring-up.
 
 # Prebuilt from the public cache via the per-commit package index — nothing is
 # built or materialized locally (scripts/fetch-prebuilt.sh; pkgs commit pinned
@@ -101,7 +119,11 @@ libkrun-static:
 # Fetch the pinned gvproxy switch (guest egress + own-IP; missing = switchless boot).
 gvproxy:
     @mkdir -p {{scratch}}
-    @[ -x {{gvproxy}} ] || scripts/fetch-gvproxy.sh {{gvproxy}}
+    @scripts/fetch-gvproxy.sh {{gvproxy}}
+
+# Run one Go test on the patched gvproxy source (`just gvproxy-test TestUnexposeClosesOnlyItsOwnAcceptedConnections`).
+gvproxy-test name:
+    scripts/build-gvproxy.sh --test {{quote(name)}}
 
 # Cross-compile minimald → initramfs /init.
 initramfs:
@@ -128,9 +150,17 @@ initramfs-nodocker:
 # The ad-hoc (-s -) hypervisor-entitlement codesign must be the LAST touch:
 # any later cargo call that relinks minvmd drops it (EINVAL from krun_start_enter).
 #
-# Build minvmd (debug); codesign is the last touch.
+# bep, the Box Egress Proxy, is built in its own cargo call beside minvmd:
+# minvmd starts it from its own directory (MINVMD_BEP_BIN overrides). It is
+# signed because the macOS Keychain admits its keys only to the signed
+# program that made them. An ad-hoc signature changes with each rebuild, so
+# set BEP_CODESIGN_IDENTITY to a stable identity to keep the keys usable.
+#
+# Build minvmd and bep (debug); codesign is the last touch.
 [macos]
 minvmd-build:
+    cargo build -p bep --bin bep --locked
+    codesign --force -s "${BEP_CODESIGN_IDENTITY:--}" {{minvmd-dir}}/bep
     cargo build -p minvmd --bin minvmd --locked
     codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - {{minvmd-bin}}
 
@@ -148,17 +178,36 @@ minvmd-build: libkrun-static
 # across the packages one build selects, and minvmd's default `libkrun`
 # feature would stamp libkrun's load command into this root-run program.
 #
-# Build the box-zone answerer service program, without libkrun.
-answerer-build:
-    cargo build -p min-answerer --locked
+# Build minzoned, the box-name service program, without libkrun.
+zoned-build:
+    cargo build -p minzoned --locked
 
 # The root-installed answerer copy must resolve no library from a
 # user-writable dir (a dylib reached through an rpath there is a root
 # escalation): otool -L on macOS, ldd on Linux, system paths only.
 #
-# Check that min-answerer links only system libraries.
-answerer-link-check: answerer-build
-    scripts/check-answerer-links.sh target/debug/min-answerer
+# Check that minzoned links only system libraries.
+zoned-link-check: zoned-build
+    scripts/check-zoned-links.sh target/debug/minzoned
+
+# The .icns is committed (packaging/macos/AppIcon.icns); this re-renders it
+# from packaging/macos/app-icon.svg after a change to the source. Needs
+# rsvg-convert (`brew install librsvg`) and iconutil.
+#
+# Render the macOS app icon from its SVG source.
+[macos]
+app-icon:
+    scripts/build-app-icon.sh
+
+# The bundle is unsigned: only the release workflow signs it. It lands under
+# target/app-bundle, not beside `min`, so a debug `min` keeps installing the
+# bare program until the bundle is copied beside it on purpose
+# (`cp -R target/app-bundle/Minimal.app target/debug/`).
+#
+# Assemble the unsigned macOS app bundle minzoned ships in.
+[macos]
+app-bundle: zoned-build
+    scripts/build-app-bundle.sh assemble target/debug/minzoned target/app-bundle/Minimal.app
 
 # Build the `min` CLI.
 minimal-cli:
@@ -185,36 +234,8 @@ minimald-build:
 dist-build target:
     scripts/dist-build.sh {{quote(target)}}
 
-# Build the .deb/.rpm/.apk packages for a staged semver release from the
-# installer bucket via the pinned nfpm (fetched + sha256-verified by the
-# script). Packages land in dist/. Apt/dnf/apk repo-tree hosting lives in the
-# infra repo, not here. (The release workflow builds them from its own
-# artifacts instead — ARTIFACTS_DIR mode — before the row is staged.)
-#
-# The semver row must exist: every versioned release build stages one;
-# releases up to and including 0.5.3 need scripts/backfill-version-row.sh
-# first. Linux-only for the same host-check reason as dist-build: the script
-# downloads static musl ELFs and runs the downloaded `min` to generate
-# completions.
-[linux]
-pkg-nfpm pkgver:
-    PKGVER={{quote(pkgver)}} scripts/package-nfpm.sh
-
-# Install-smoke packages built by pkg-nfpm (default OUT_DIR: dist/) in
-# throwaway distrobox boxes named min-test-{deb,rpm,apk}: the package manager
-# accepts and records the exact version, every shipped path exists, the
-# binaries run on the box's libc, and an uninstall round-trip cleans up. This
-# is the pre-publish ritual from the review feedback — run it before staging a
-# tag; the CI-native container smoke is a separate, follow-up lane. Distrobox
-# drives everything (no apx, no raw podman — see the script header); boxes are
-# removed even on failure unless --keep-boxes is passed through.
-# Linux-only: needs distrobox and a container engine on the host.
-[linux]
-pkg-smoke pkgdir="dist" *args:
-    scripts/pkg-smoke.sh --pkg-dir {{quote(pkgdir)}} {{args}}
-
-# Restage an already-shipped release under its semver so the command above can
-# see it (the one-time fix for releases staged before the semver-row
+# Restage an already-shipped release under its semver so `install.sh --version`
+# can find it (the one-time fix for releases staged before the semver-row
 # convention, e.g. `just backfill-version-row abc12345 0.5.3`).
 [linux]
 backfill-version-row sha version:
@@ -269,6 +290,16 @@ reap:
 # Review a guest-kernel bump (`just kernel-review 6.12.43 6.12.94`). Needs `gh`.
 kernel-review *args:
     scripts/kernel-bump-review.sh {{args}}
+
+# Not a CI gate: the report queries GitHub, kernel.org and Alpine. Lag never
+# fails; the checks do: duplicated pins that disagree, a pin that no longer
+# resolves to exactly one value, and a vendor lock file missing from the
+# inventory (`--check`, or `--check --offline` for the local-only subset,
+# which `just test-shell` runs against this tree). The pin inventory is the
+# PINS table in scripts/deps-freshness.sh. Needs `gh` and `jq`.
+# Report non-Rust dependency pins against upstream (`just deps-freshness [--check]`).
+deps-freshness *args:
+    scripts/deps-freshness.sh {{args}}
 
 # ── CI-parity gates ──────────────────────────────────────────────────────────
 
@@ -358,7 +389,7 @@ miri:
     cargo +nightly miri test -p switch
 
 # Kani bounded-verification harnesses over the pure security cores
-# (rcache index_file parse, sessions PathDecision lattice). See
+# (rcache index_file parse, boxes PathDecision lattice). See
 # scripts/kani.sh for install + the 0.68.0 pin rationale. #1109.
 kani: (_need "cargo-kani" "cargo install --locked kani-verifier --version 0.68.0 && cargo kani setup")
     ./scripts/kani.sh
@@ -395,9 +426,13 @@ fuzz crate target *args: (_need "cargo-fuzz" "cargo install cargo-fuzz --locked"
     [ -f "fuzz/{{target}}.dict" ] && dict="-dict=fuzz/{{target}}.dict"
     cargo +nightly fuzz run {{target}} -- -rss_limit_mb=2048 $dict {{args}}
 
+# Extra arguments go to nextest positionally, so a filterset like
+# `-E 'not binary(/_integration$/)'` stays one word (the macOS lane's unit step).
+#
 # Unit + in-process integration tests. CI: every lane's core-tests suite.
-test: _nextest
-    cargo nextest run {{scope}} {{ci-profile}} --locked --no-tests=fail
+[positional-arguments]
+test *args: _nextest
+    cargo nextest run {{scope}} {{ci-profile}} --locked --no-tests=fail "$@"
 
 # The tight loop while writing one test. Output is shown, so a test that prints
 # a measurement is readable without remembering `--no-capture`, and
@@ -416,10 +451,18 @@ test-one filter *args: _nextest
 doctest:
     cargo test {{scope}} --doc --locked
 
-# Regenerate the minimal-tui insta snapshots after an intentional render change;
+# CI: the macOS unit job stages this archive for the mini's hypervisor tier, so
+# the archived package set is whatever `scope` names, never a second list.
+#
+# Archive this host's test binaries for replay elsewhere (`just test-archive out.tar.zst`).
+[positional-arguments]
+test-archive file: _nextest
+    cargo nextest archive {{scope}} --locked --archive-file "$1"
+
+# Regenerate the `dash` insta snapshots after an intentional render change;
 # `just test` fails until these are updated. Review the diff, then `just test` to verify.
 test-snap-update:
-    INSTA_UPDATE=always cargo test -p minimal-tui --test snapshots --locked
+    INSTA_UPDATE=always cargo test -p minimal --test dash_snapshots --locked
 
 # The old `cargo test -- --include-ignored` pre-PR surface; the env-gated
 # VM/netns harnesses self-skip here (`just test-vm` runs those for real).
@@ -434,10 +477,9 @@ test-ignored: _nextest
 #
 # clippy + tests for the Linux-only crates from a Mac (musl in Docker; not minvmd).
 [macos]
-test-cross: (_need "cross" "cargo install cross --locked")
-    @docker info >/dev/null 2>&1 || { echo "docker daemon not running (cross needs it) — start Docker Desktop or OrbStack" >&2; exit 1; }
-    cross clippy --workspace --exclude minvmd --all-targets --target {{musl-target}} --locked -- -D warnings
-    CROSS_CONTAINER_OPTS="--env HOME=/tmp" cross test --workspace --exclude minvmd --target {{musl-target}} --locked
+test-cross: _preflight-cross
+    DOCKER_DEFAULT_PLATFORM="${DOCKER_DEFAULT_PLATFORM:-linux/amd64}" cross clippy --workspace --exclude minvmd --all-targets --target {{musl-target}} --locked -- -D warnings
+    DOCKER_DEFAULT_PLATFORM="${DOCKER_DEFAULT_PLATFORM:-linux/amd64}" CROSS_CONTAINER_OPTS="--env HOME=/tmp" cross test --workspace --exclude minvmd --target {{musl-target}} --locked
 
 # commitlint is not replicated by `just ci`; `just hooks` installs its local
 # twin as the commit-msg hook (scripts/git-hooks/commit-msg) for this clone,
@@ -467,12 +509,12 @@ hooks:
 #
 # The local PR gate set, cheapest first.
 [linux]
-ci: fmt-check check-version clippy clippy-strict deny test doctest test-ignored answerer-link-check
+ci: fmt-check check-version clippy clippy-strict deny test doctest test-ignored zoned-link-check
     @echo "ci: local PR gates green"
 
 # The local PR gate set, cheapest first (`just test-cross` covers the Linux-only crates).
 [macos]
-ci: fmt-check check-version clippy clippy-strict deny test doctest answerer-link-check
+ci: fmt-check check-version clippy clippy-strict deny test doctest zoned-link-check
     @echo "ci: local PR gates green"
 
 # Run the curl|sh installer's tests under every POSIX sh. CI: ci-shell-installer.yml.
@@ -603,13 +645,11 @@ test-promote-gate:
 check-version:
     scripts/next-version.sh --check
 
-# Run every scripts/*_test.sh harness in one go (the release/publishing logic:
-# semver resolution, version assertion, staged-version lookup, the packaging
-# renderer, and the AUR/brew publishers against fixture remotes). No network,
-# no credentials, no gcloud — the harnesses stub or fixture everything. CI runs
-# the same set through crates/common/tests/shell_harnesses.rs (part of
-# `just test`), which discovers them by convention so a new harness is never
-# forgotten.
+# Run every scripts/*_test.sh harness in one go (the release and installer
+# logic). No network, no credentials, no gcloud — the harnesses stub or
+# fixture everything. CI runs the same set through
+# crates/common/tests/shell_harnesses.rs (part of `just test`), which
+# discovers them by convention so a new harness is never forgotten.
 test-shell:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -685,7 +725,7 @@ test-root-integration: _nextest gvproxy
 # minvmd-build is LAST so its macOS codesign is the final touch on the binary.
 #
 # The unified session e2e against the VM-backed daemon. CI: the session e2e steps.
-e2e: _kvm artifacts gvproxy initramfs minimal-cli answerer-build minvmd-build
+e2e: _kvm artifacts gvproxy initramfs minimal-cli zoned-build minvmd-build
     {{e2e-env}} MINVMD_GVPROXY_BIN="{{gvproxy}}" ./scripts/session-e2e.sh
 
 # CI: ci-linux-native.yml `native-daemon-e2e`.
@@ -695,7 +735,7 @@ e2e: _kvm artifacts gvproxy initramfs minimal-cli answerer-build minvmd-build
 e2e-native:
     cargo build -p minimald --bin minimald -p minimal --bin min --locked
     @just _userns-check
-    ./scripts/session-e2e.sh
+    env -u E2E_VM ./scripts/session-e2e.sh
 
 # Boots switchless like CI's step — MINVMD_GVPROXY_BIN deliberately not set.
 #

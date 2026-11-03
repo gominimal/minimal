@@ -207,7 +207,7 @@ pub async fn cmd_complete_session_str(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sessions::SessionId;
+    use boxes::SessionId;
 
     fn entry(id: &str, name: Option<&str>) -> ListSessionsEntry {
         ListSessionsEntry {
@@ -217,6 +217,7 @@ mod tests {
             status: Default::default(),
             git: None,
             host_ip_enforcement: None,
+            shared_port_collisions: Vec::new(),
             attrs: None,
         }
     }

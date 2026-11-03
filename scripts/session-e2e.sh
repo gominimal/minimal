@@ -27,11 +27,11 @@
 #
 #     A session is interactive by design, so we drive it like a real user
 #     through a REAL pty (scripts/e2e-attach-pty.py) rather than a pipe: pump
-#     the command stream, then, when the shell exits and the daemon shows its
-#     Detach/Delete prompt, answer it with keystrokes (Down + Enter => Delete).
-#     A pipe is not a tty and could not answer that prompt. Selecting Delete
-#     tears the session down, so it must be delisted afterwards. The same daemon
-#     prompt runs whether local or in-guest, so the pty driver covers every lane.
+#     the command stream, whose `exit` ends the shell. The box ends with its
+#     shell (BOX-038): no prompt asks, and the box stays listed as exited
+#     until `min session destroy` removes it, so it must be delisted after the
+#     destroy. The daemon does the same whether local or in-guest, so the pty
+#     driver covers every lane.
 #
 # Host-side project seed: `min session activate` runs client-side and, since #758,
 # BAILS (rather than scaffolding over an existing config) when the target dir
@@ -80,9 +80,16 @@
 #   own_ip                           `--network own_ip` tap + switch attach
 #   own_ip_egress_declared_and_enforced
 #                                    the four egress fields declared, allowed
-#                                    and disallowed connections, the coming
-#                                    deny-all announcement, and the opt-out
+#                                    and disallowed connections, the in-force
+#                                    deny-all default and its note;
+#                                    a deny-all box's names outside the box
+#                                    zone are REFUSED fast at its relay, a
+#                                    zone TXT is NODATA there, while
+#                                    host.min.internal resolves, and its
+#                                    TCP 53 is dropped (NET-141)
 #   task_run                         `min task run` / `min session run` loop
+#   task_network_inherits_session    a task's network mode follows its session
+#                                    (own_ip egress + loopback isolation, none)
 #   hooks                            lifecycle hooks, loadouts, patches, shells
 #   skip_scaffold                    the daemon-scaffolded blueprint upload lane
 #   sandbox                          interactive attach: in-sandbox `min add`
@@ -131,11 +138,7 @@
 #                                    renderings list the runtime publish
 #                                    beside the declaration, and
 #                                    out-of-range and deny asks are
-#                                    refused with their own typed errors;
-#                                    a VM lane also asserts the ask
-#                                    create's typed refusal (T96: the
-#                                    answered ask must be recorded in
-#                                    the host-held row first)
+#                                    refused with their own typed errors
 #   listen_published_port_reaches_peer_and_host
 #                                    NET-016/017: a listen inside the
 #                                    declared range publishes with no
@@ -162,9 +165,8 @@
 #                                    3000' from inside the box, every stance
 #                                    end to end — allow publishes at the
 #                                    address the daemon's expose record
-#                                    names (the pending contract pinned:
-#                                    bound and listed, honestly not yet
-#                                    reachable, T97's to flip), ask routes
+#                                    names, and the host reaches the
+#                                    in-box server through it, ask routes
 #                                    its dialog to a human attached through
 #                                    a real pty and publishes on their
 #                                    Allow, records nothing on their deny,
@@ -173,9 +175,24 @@
 #                                    with the stance's own words, and every
 #                                    decision carries its line in the
 #                                    daemon's audit log; a VM lane runs the
-#                                    allow legs through the VM host daemon's
-#                                    admission (T94) and asserts the ask
-#                                    create's typed refusal instead (T96)
+#                                    same stances against the VM host
+#                                    daemon's own records: the allow publish
+#                                    crosses its host-side admission (the
+#                                    row holds the port, the owner-only
+#                                    host audit carries the line, the
+#                                    host reaches the in-box server),
+#                                    the ask is offered to the
+#                                    human attached on the host (whose
+#                                    Allow publishes, whose deny records
+#                                    nothing — a later expose asks again —
+#                                    nobody attached is refused), the deny
+#                                    box refuses with nothing recorded on
+#                                    the host, every decision is a line in
+#                                    the host audit, and with two named
+#                                    VMs an expose inside a box on the
+#                                    non-default VM publishes there, found
+#                                    by the flagless attach through the
+#                                    box's name
 #   proxy_refuses_like_direct        the proxy refuses exactly as the switch
 #                                    does: paired direct/proxied attempts,
 #                                    h2 closed, h2c stripped (NET-069..071, 135)
@@ -184,7 +201,7 @@
 #                                    and host-OS resolution with no proxies
 #   native_resolution_from_host_answerer_on_vm_host
 #                                    NET-124..128/138 on a VM-backed lane:
-#                                    the VM host daemon answers the zone on
+#                                    this VM's host daemon answers the zone on
 #                                    the host loopback and the in-VM daemon
 #                                    owns no answerer
 #   native_answerer_survives_session_stop
@@ -226,6 +243,28 @@
 #                                    own state, one `min ls` listing both,
 #                                    box names resolving to their VM, both
 #                                    routing at once, stop one leaves the other
+#   names_survive_restart_and_second_vm
+#                                    T121 on a Linux KVM host: the names
+#                                    step's boot unit re-creates the resolver
+#                                    link a restart removed, a second named
+#                                    VM's daemon joins the DNS service with
+#                                    no contention, both boxes' names
+#                                    resolve, and a withdrawn port closes a
+#                                    connection already through it
+#   ls_and_box_commands_tell_the_truth
+#                                    T114 on two VMs: `min ls` lists every
+#                                    box, a stopped VM's included, with the
+#                                    address and egress the policy shows;
+#                                    policy and forward need no --vm; both
+#                                    proxy ports after the preferred one
+#                                    frees; the unknown-box, stopped-VM,
+#                                    --public and out-of-range refusals
+#   macos_box_opens_by_name_and_proxy
+#                                    NET-010/069/123/144 on macOS: a declared
+#                                    and a runtime port open at the box's
+#                                    address, at its name and through the
+#                                    hostname proxy; a second box on the
+#                                    same port is refused at activate
 #   github_only_allowlist            NET-066/067/072/073/136 + NET-068's e2e
 #                                    half: a hostname-only allowlist runs a
 #                                    real toolchain against github.com and
@@ -288,6 +327,15 @@
 #                                    egress plus the baseline set; also
 #                                    pins no CAP_NET_RAW/CAP_NET_ADMIN in
 #                                    a box and no IPv6 route in the guest
+#   escapes_and_builds_stay_inside_box_rules
+#                                    VM host, one deny-all box: no vsock
+#                                    connect from it reaches the guest
+#                                    daemon's RPC listener (NET-139), its
+#                                    package build's web source and a frame
+#                                    wearing the node's address are dropped
+#                                    at the host-side gate (NET-155, NET-085),
+#                                    and each refusal's record is read back
+#                                    from the host's logs
 #   host_ip_deny_all
 #                                    NET-079 end to end, both halves: on a
 #                                    host that decides per box, a deny-all
@@ -331,15 +379,32 @@ E2E_VM="${E2E_VM:-}"
 case "${1:-}" in
   fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
     | linux_stock_install_runs_vm_boxes | two_named_vms_on_one_machine \
+    | names_survive_restart_and_second_vm \
+    | ls_and_box_commands_tell_the_truth \
     | unpublished_port_refused_on_vm_host | proxy_sees_boxes_by_address \
     | vm_host_row_read_tracks_create_and_destroy \
-    | answerer_survives_session_stop)
+    | answerer_survives_session_stop \
+    | escapes_and_builds_stay_inside_box_rules)
     E2E_VM="${E2E_VM:-1}"
     if [ -z "${E2E_MINIMAL_ARGS:-}" ]; then
       E2E_MINIMAL_ARGS="--provider local-minvmd"
     fi
     ;;
 esac
+
+# The host exposure the VM-backed daemon opens host.min.internal at. minvmd
+# closes the alias at every port unless MINVMD_HOST_EXPOSURE_PORTS lists
+# ports, and it reads the list from its own environment at each VM boot, so
+# the export must precede the first `min` call, whose autospawn inherits it.
+# The list is the one port NET-003 reaches the host's loopback at from a
+# host-address box (the proxy proof's PROXY_HOST_PORT) and nothing wider:
+# the same proof asserts the alias stays refused at an unlisted port, and
+# own-address boxes stay refused at every port, listed or not. A native
+# daemon has no alias gate and ignores the variable.
+E2E_HOST_EXPOSURE_PORT=18081
+if [ -n "$E2E_VM" ]; then
+  export MINVMD_HOST_EXPOSURE_PORTS="$E2E_HOST_EXPOSURE_PORT"
+fi
 
 # The non-baseline package the sandbox proof adds and then runs. It must be a
 # real upstream package that is genuinely ABSENT from a fresh shell-stack
@@ -364,6 +429,8 @@ SESSION_NAME="e2e-banner"
 SEED_DIR=""
 SEEDED_MFILE=""
 TASK_SEED_DIR="" # seeded by the `min task run` proof below; removed on teardown
+TN_SEED_DIR="" # seeded by the task-network proof below; removed on teardown
+TN_LISTENER_PID="" # the task-network proof's host-side http.server; killed on teardown
 HOOK_SEED_DIR="" # seeded by the lifecycle-hooks proof below; removed on teardown
 PATCH_SRC_DIR="" # patch sources for the patch-modes proof; removed on teardown
 SKIP_SEED_DIR="" # seeded by the skip-lane scaffold proof below; removed on teardown
@@ -376,7 +443,9 @@ RANGE_RESOLVER_BEFORE="" # the resolver file's prior bytes, when it had any; res
 ANSWERER_SERVICE_CHANNEL="" # set when a proof ran an advisory that installs the answerer service: its channel path; gates the service teardown
 BN_SEED_DIR="" # seeded by the browser-path proof below; removed on teardown
 E2E_NOT_RUN="" # the cases this lane could not run, named by `not_run`; the lane summary counts them
+E2E_NOT_RUN_WHY="" # one line per NOT RUN case: the case, a tab, and its gate
 E2E_KNOWN_GAP="" # the checks carried against a known product gap, named by `known_gap`; counted likewise
+E2E_KNOWN_GAP_WHY="" # one line per KNOWN GAP check: the case, a tab, and what is missing
 ASR_SEED_DIR="" # seeded by the answerer-service proof below; removed on teardown
 ASR_STATE2_DIR="" # that proof's second node's state base; stopped on teardown
 ASR_REVERT_LINK="" # the link that proof's advisory pointed the host resolver at; reverted on teardown
@@ -389,6 +458,7 @@ PROXY_SEED_DIR="" # seeded by the min.internal proxy proof; removed on teardown
 PROXY_OWN_SEED_DIR="" # its own-address box's seed; removed on teardown
 PROXY_HOST_DIR="" # the host-loopback dir that proof serves; removed on teardown
 PROXY_HOST_SRV_PID="" # the host-loopback server it starts; killed on teardown
+PROXY_UNEXPOSED_SRV_PID="" # its listener at a port outside the host exposure; killed on teardown
 PAR_SEED_DIR="" # seeded by the proxy-parity proof below; removed on teardown
 PAR_OWN_SEED_DIR="" # its own-address target box's seed; removed on teardown
 PAR_CALLER_SEED_DIR="" # its denied-caller box's seed; removed on teardown
@@ -399,13 +469,31 @@ RECOVER_HOLDER_PID="" # the port holder the recovery proof starts; killed
 RECOVER_SWITCH_SOCK="" # the minvmd switch socket beat C moves; restored
 RECOVER_SWITCH_HOLD="" # where beat C parks it mid-proof
 RETIRED_SEED_DIR="" # seeded by the retired-surfaces proof below; removed on teardown
+GRANT_SEED_DIR="" # seeded by the GitHub grant proof below; removed on teardown
+SR_ID="" # the store-reference proof's Keychain item; removed on teardown
+R3_SEED_DIR="" # seeded by the round-three walk below; removed on teardown
+R3_AUDIT_PLANT="" # the unreadable audit segment that walk plants; removed on teardown
+AR_AUDIT_EDIT="" # the audit segment the rotation proof edits; restored on teardown
+AR_AUDIT_BACKUP="" # its original bytes
+AR_AUDIT_DIR="" # the audit directory the rotation proof gives back on teardown
+AR_AUDIT_SAVED="" # where the real one waits meanwhile, or "none" when it did not exist
+PROXY_ENV_SEED_DIR="" # seeded by the proxy_env proofs below; removed on teardown
 RETIRED_FWD_PID="" # the `min net forward` it starts; killed on teardown
 EGRESS_SEED_DIR="" # seeded by the own-IP egress proof below; removed on teardown
 TWO_VM_NAME="" # the named VM the two-named-VMs proof creates; stopped on teardown
+NRV_VM_NAME="" # the second VM the names-survive-restart proof boots; stopped on teardown
+NRV_SEED_A_DIR="" # that proof's default-VM box seed; removed on teardown
+NRV_SEED_B_DIR="" # its second-VM box seed; removed on teardown
+NRV_REVERT_LINK="" # the resolver link its names step created; reverted on teardown
+NRV_UNIT_INSTALLED="" # set once its names step may have installed the boot unit; removed on teardown
+NRV_CONN_PID="" # its host client holding a connection open; killed on teardown
 TWO_VM_SEED_A_DIR="" # that proof's default-VM box seed; removed on teardown
 TWO_VM_SEED_B_DIR="" # its named-VM box seed; removed on teardown
 TWO_VM_FWD_PID="" # the `min net forward` it starts; killed on teardown
 TWO_VM_HOLD_PID="" # the non-minimal port holder it starts; killed on teardown
+MACOS_OPEN_SEED_A_DIR="" # the macOS name-and-proxy proof's box A seed; removed on teardown
+MACOS_OPEN_SEED_B_DIR="" # its refused box B seed; removed on teardown
+MACOS_OPEN_HOLD_PID="" # its range-address port holder; killed on teardown
 DA_ORIGIN_SEED_DIR="" # the deny-all answer proof's origin box seed; teardown
 DA_TARGET_SEED_DIR="" # its deny-all target box's seed; removed on teardown
 DA_SIBLING_SEED_DIR="" # its sibling box's seed; removed on teardown
@@ -433,12 +521,23 @@ ESU_A_SEED_DIR="" # the escape-union proof's box A seed; removed on teardown
 ESU_B_SEED_DIR="" # its box B seed; removed on teardown
 ESU_LISTENER_PID="" # its host listener; killed on teardown
 ESU_LISTEN_PORT="" # the port the listener binds; this proof's own band
+EBR_SEED_DIR="" # the escapes-and-builds proof's seed; removed on teardown
+EBR_LISTENER_PID="" # its host listener; killed on teardown
+EBR_LISTEN_PORT="" # the port the listener binds, beside the escape-union band
+EBR_EXPECTED="" # the record the leg in progress expects; printed on failure
 NET080_SEED_DIR="" # seeded by the daemon-fetch proof below; removed on teardown
 # The classifier tree+table the daemon-fetch proof installs when the lane has
 # none. A run that dies between that install and the proof's own uninstall must
 # not leave a host's packet filter deciding behind it, so the teardown unloads
 # whatever this flag says is ours.
 NET080_CLASSIFIER_INSTALLED=""
+# The classifier install a native case's setup script made: on a host with no
+# classifier, the script `min finalize-install --show --script` prints carries
+# the classifier's block beside the names', so a case that runs it whole also
+# installs the tree, the table, the step's copy and its systemd units. The case
+# removes them before it returns (setup_classifier_teardown), and the teardown
+# does for a run that died first.
+SETUP_CLASSIFIER_INSTALLED=""
 # The same three for the host_ip_deny_all proof: the two project seeds its two
 # halves activate against (removed on teardown like every other seed), and the
 # classifier tree+table its decided half installs (its own, removed before the
@@ -447,6 +546,15 @@ NET080_CLASSIFIER_INSTALLED=""
 HIDA_SEED_DIR="" # the decided half's project seed; removed on teardown
 HIDA_UNENFORCED_SEED_DIR="" # the unenforced half's project seed; removed on teardown
 HIDA_CLASSIFIER_INSTALLED=""
+# The classifier tree+table the cohort leg of the round-two walk installs on a
+# CI native lane: its own, removed before the leg returns. The teardown covers
+# a death between install and return.
+CO_CLASSIFIER_INSTALLED=""
+# The host_ip cohort proof's classifier install and its two project seeds;
+# removed on teardown.
+COHORT_CLASSIFIER_INSTALLED=""
+COHORT_SEED_DIR=""
+COHORT_SEED_BLOCK_DIR=""
 if [ -z "${E2E_PROJECT_DIR:-}" ]; then
   # Native: self-seed a small throwaway — never $ROOT (uploading the whole repo,
   # and scaffolding over its `.minimal/`, is the very clobber #758 prevents).
@@ -613,7 +721,7 @@ export RUST_LOG="${RUST_LOG:-warn,minimald::exec=info}"
 # (plan, watcher start, sockets seen, verdicts, admissions) must ride this
 # default to reach the guest at all. Widened only when nothing was set by hand.
 if [ -n "${E2E_VM:-}" ] && [ "$RUST_LOG" = "warn,minimald::exec=info" ]; then
-  export RUST_LOG="$RUST_LOG,minimald::net::listeners=debug,minimald::net::provider=debug,minimald::session_host=debug"
+  export RUST_LOG="$RUST_LOG,minimald::net::listeners=debug,minimald::net::provider=debug,minimald::box_runtime=debug"
 fi
 
 # Millisecond clock: GNU date on Linux; macOS `date` has no %N, use perl.
@@ -652,7 +760,7 @@ fi
 # (crates/switch/src/bep_host.rs) with nothing on the CLI's stderr naming
 # the cause. The proxy-source case below is where that stops being a
 # silent posture difference and becomes a failed proof. macOS resolves
-# the minvmd backend either way (`client_provider_kind` gates on the OS,
+# the minvmd backend either way (`client_host_kind` gates on the OS,
 # crates/minimal-client/src/lib.rs), so a run there is VM-backed with or
 # without the flag — and both of its lanes arrive here with no
 # E2E_MINIMAL_ARGS at all (the macOS CI lane exports none; the justfile's
@@ -711,8 +819,21 @@ elif command -v min >/dev/null 2>&1 && min --version >/dev/null 2>&1 \
   :
 else
   min_cli_dir=""
+  # A dir counts only with BOTH halves of the pair: a shared target dir can
+  # hold a 'min' from an earlier build and no daemon, and taking it skips the
+  # build below and dies at the daemon gate.
+  # A pair whose halves report different versions is not one build: an
+  # earlier build of one half ran from a dirty tree, say. The CLI refuses
+  # such a daemon at the first activate, so rebuild the pair below instead.
+  min_skewed_pair=""
   for d in "$ROOT/target/debug" "${CARGO_TARGET_DIR:-/nonexistent}/debug"; do
-    if [ -x "$d/min" ]; then
+    if [ -x "$d/min" ] && [ -x "$d/$min_daemon" ]; then
+      if [ "$("$d/min" --version 2>/dev/null | awk '{print $NF}')" \
+           != "$("$d/$min_daemon" --version 2>/dev/null | awk '{print $NF}')" ]; then
+        echo "the 'min' and '$min_daemon' under $d report different versions; rebuilding the pair"
+        min_skewed_pair=1
+        continue
+      fi
       min_cli_dir="$d"
       break
     fi
@@ -731,17 +852,22 @@ else
   # instead of the run dying at the CLI gate with a build instruction the
   # caller cannot read mid-verify.
   if [ -z "$min_cli_dir" ] && command -v cargo >/dev/null 2>&1; then
-    echo "no usable 'min' on PATH and no build under target/; building the pair this run drives (cargo build --locked -p minimal --bin min -p $min_daemon --bin $min_daemon)"
+    echo "no usable 'min' and '$min_daemon' pair on PATH or under target/; building the pair this run drives (cargo build --locked -p minimal --bin min -p $min_daemon --bin $min_daemon)"
     # A VM-backed run also needs the answerer program the advisory's command
     # copies into place (beside min). It builds in its own invocation, as
-    # `just answerer-build` does: beside `-p minvmd`, cargo would unify
+    # `just zoned-build` does: beside `-p minvmd`, cargo would unify
     # minvmd's `libkrun` feature into the root-run program.
+    # The version build script reruns only on a git change, so a skewed pair
+    # keeps its skew through a rebuild unless the script is made to rerun.
+    if [ -n "$min_skewed_pair" ]; then
+      touch "$ROOT/crates/version/build.rs"
+    fi
     if (cd "$ROOT" && cargo build --locked -p minimal --bin min \
         -p "$min_daemon" --bin "$min_daemon" \
-        && { [ "$min_daemon" != minvmd ] || cargo build --locked -p min-answerer; }) \
+        && { [ "$min_daemon" != minvmd ] || cargo build --locked -p minzoned; }) \
         >"$WORK/cli-build.log" 2>&1; then
       for d in "$ROOT/target/debug" "${CARGO_TARGET_DIR:-/nonexistent}/debug"; do
-        if [ -x "$d/min" ]; then
+        if [ -x "$d/min" ] && [ -x "$d/$min_daemon" ]; then
           min_cli_dir="$d"
           break
         fi
@@ -829,6 +955,7 @@ switch_spawn_fault() {
 not_run() {
   echo "$1: NOT RUN ($2)"
   E2E_NOT_RUN="$E2E_NOT_RUN $1"
+  E2E_NOT_RUN_WHY="$E2E_NOT_RUN_WHY$1"$'\t'"$2"$'\n'
 }
 
 # A check a case carries against a known product gap: one named line citing
@@ -839,9 +966,14 @@ not_run() {
 known_gap() {
   echo "$1: KNOWN GAP ($2)"
   E2E_KNOWN_GAP="$E2E_KNOWN_GAP $1"
+  E2E_KNOWN_GAP_WHY="$E2E_KNOWN_GAP_WHY$1"$'\t'"$2"$'\n'
 }
 
 teardown() {
+  # The audit, HTTP and message walk's grant box, when one of its legs ran
+  # alone: only the whole walk destroys it before it returns.
+  if [ -n "${AHM_SID:-}" ]; then mnl session destroy --force "$AHM_SID" >/dev/null 2>&1 || true; fi
+  AHM_SID=""
   mnl stop --force >/dev/null 2>&1 || true
   if [ -n "$E2E_VM" ]; then
     minvmd stop >/dev/null 2>&1 || true
@@ -853,6 +985,17 @@ teardown() {
   if [ -n "$TWO_VM_NAME" ]; then
     minvmd --vm "$TWO_VM_NAME" stop >/dev/null 2>&1 || true
   fi
+  # The names-survive-restart proof's second VM, client, seeds, boot unit
+  # and link, by the same net.
+  if [ -n "$NRV_VM_NAME" ]; then
+    minvmd --vm "$NRV_VM_NAME" stop >/dev/null 2>&1 || true
+  fi
+  if [ -n "$NRV_CONN_PID" ]; then
+    kill "$NRV_CONN_PID" 2>/dev/null || true
+  fi
+  [ -n "$NRV_SEED_A_DIR" ] && rm -rf "$NRV_SEED_A_DIR"
+  [ -n "$NRV_SEED_B_DIR" ] && rm -rf "$NRV_SEED_B_DIR"
+  nrv_teardown_names
   # The daemon-fetch proof's classifier tree+table, if a mid-proof death left
   # them: the daemon stop above comes first because the uninstall refuses while
   # a live leaf or process holds the tree (its own guard) — and the daemon sits
@@ -872,9 +1015,27 @@ teardown() {
     sudo -n "$ROOT/scripts/install-host-classifier.sh" --uninstall >/dev/null 2>&1 || true
     HIDA_CLASSIFIER_INSTALLED=""
   fi
+  # The cohort leg of the round-two walk installs the classifier on a CI
+  # native lane. This is the same net, under the same ordering reason.
+  if [ -n "$CO_CLASSIFIER_INSTALLED" ]; then
+    sudo -n "$ROOT/scripts/install-host-classifier.sh" --uninstall >/dev/null 2>&1 || true
+    CO_CLASSIFIER_INSTALLED=""
+  fi
+  # The host_ip cohort proof's own classifier install, by the same net.
+  if [ -n "$COHORT_CLASSIFIER_INSTALLED" ]; then
+    sudo -n "$ROOT/scripts/install-host-classifier.sh" --uninstall >/dev/null 2>&1 || true
+    COHORT_CLASSIFIER_INSTALLED=""
+  fi
+  [ -n "$COHORT_SEED_DIR" ] && rm -rf "$COHORT_SEED_DIR"
+  [ -n "$COHORT_SEED_BLOCK_DIR" ] && rm -rf "$COHORT_SEED_BLOCK_DIR"
   [ -n "$SEED_DIR" ] && rm -rf "$SEED_DIR"
   [ -n "$SEEDED_MFILE" ] && rm -f "$SEEDED_MFILE"
   [ -n "$TASK_SEED_DIR" ] && rm -rf "$TASK_SEED_DIR"
+  [ -n "$TN_SEED_DIR" ] && rm -rf "$TN_SEED_DIR"
+  if [ -n "$TN_LISTENER_PID" ]; then
+    kill "$TN_LISTENER_PID" 2>/dev/null || true
+    TN_LISTENER_PID=""
+  fi
   [ -n "$HOOK_SEED_DIR" ] && rm -rf "$HOOK_SEED_DIR"
   [ -n "$PATCH_SRC_DIR" ] && rm -rf "$PATCH_SRC_DIR"
   [ -n "$SKIP_SEED_DIR" ] && rm -rf "$SKIP_SEED_DIR"
@@ -909,6 +1070,8 @@ teardown() {
   # Every proof that runs the advisory as root also installs the answerer
   # host service; a run that died after that must not leave it behind.
   answerer_service_teardown
+  # Nor the classifier install the same script made on a host with none.
+  setup_classifier_teardown || true
   # The native-resolution proof points the HOST resolver at the daemon's
   # answerer; a run that died between that and its own revert must not leave
   # the change behind. `resolvectl revert` restores the link's DNS state and
@@ -935,6 +1098,9 @@ teardown() {
   if [ -n "$PROXY_HOST_SRV_PID" ]; then
     kill "$PROXY_HOST_SRV_PID" 2>/dev/null || true
   fi
+  if [ -n "$PROXY_UNEXPOSED_SRV_PID" ]; then
+    kill "$PROXY_UNEXPOSED_SRV_PID" 2>/dev/null || true
+  fi
   [ -n "$PAR_SEED_DIR" ] && rm -rf "$PAR_SEED_DIR"
   [ -n "$PAR_OWN_SEED_DIR" ] && rm -rf "$PAR_OWN_SEED_DIR"
   [ -n "$PAR_CALLER_SEED_DIR" ] && rm -rf "$PAR_CALLER_SEED_DIR"
@@ -956,6 +1122,23 @@ teardown() {
   [ -n "$RECOVER_SEED_DIR" ] && rm -rf "$RECOVER_SEED_DIR"
   [ -n "$SECOND_SEED_DIR" ] && rm -rf "$SECOND_SEED_DIR"
   [ -n "$RETIRED_SEED_DIR" ] && rm -rf "$RETIRED_SEED_DIR"
+  [ -n "$GRANT_SEED_DIR" ] && rm -rf "$GRANT_SEED_DIR"
+  # The store-reference proof's Keychain item is in the developer's real
+  # Keychain, not under $WORK. Its rule is in $XDG_CONFIG_HOME, which the
+  # `rm -rf "$WORK"` below removes. `min secret rm` uses only the host store
+  # and starts no daemon, so it runs after the stop above.
+  [ -n "$SR_ID" ] && mnl secret rm "$SR_ID" </dev/null >/dev/null 2>&1
+  [ -n "$PROXY_ENV_SEED_DIR" ] && rm -rf "$PROXY_ENV_SEED_DIR"
+  # The round-three walk's planted audit segment: a proxy start refuses a
+  # log that holds it, so a run that died with it in place must not keep it.
+  [ -n "$R3_AUDIT_PLANT" ] && rm -f "$R3_AUDIT_PLANT"
+  # The rotation proof's edited audit segment goes back to its own bytes,
+  # before the `rm -rf "$WORK"` below removes the copy.
+  ar_restore_edit
+  # Its own audit directory goes, and the real one is renamed back. The
+  # stop above leaves no proxy to write them.
+  ar_restore_audit
+  [ -n "$R3_SEED_DIR" ] && rm -rf "$R3_SEED_DIR"
   [ -n "$EGRESS_SEED_DIR" ] && rm -rf "$EGRESS_SEED_DIR"
   [ -n "$TWO_VM_SEED_A_DIR" ] && rm -rf "$TWO_VM_SEED_A_DIR"
   [ -n "$TWO_VM_SEED_B_DIR" ] && rm -rf "$TWO_VM_SEED_B_DIR"
@@ -969,6 +1152,11 @@ teardown() {
   if [ -n "$TWO_VM_HOLD_PID" ]; then
     kill "$TWO_VM_HOLD_PID" 2>/dev/null || true
   fi
+  if [ -n "$MACOS_OPEN_HOLD_PID" ]; then
+    kill "$MACOS_OPEN_HOLD_PID" 2>/dev/null || true
+  fi
+  [ -n "$MACOS_OPEN_SEED_A_DIR" ] && rm -rf "$MACOS_OPEN_SEED_A_DIR"
+  [ -n "$MACOS_OPEN_SEED_B_DIR" ] && rm -rf "$MACOS_OPEN_SEED_B_DIR"
   [ -n "$DA_ORIGIN_SEED_DIR" ] && rm -rf "$DA_ORIGIN_SEED_DIR"
   [ -n "$DA_TARGET_SEED_DIR" ] && rm -rf "$DA_TARGET_SEED_DIR"
   [ -n "$DA_SIBLING_SEED_DIR" ] && rm -rf "$DA_SIBLING_SEED_DIR"
@@ -1017,6 +1205,11 @@ teardown() {
   if [ -n "$ESU_LISTENER_PID" ]; then
     kill "$ESU_LISTENER_PID" 2>/dev/null || true
   fi
+  # The escapes-and-builds proof's seed and listener, for the same reasons.
+  [ -n "$EBR_SEED_DIR" ] && rm -rf "$EBR_SEED_DIR"
+  if [ -n "$EBR_LISTENER_PID" ]; then
+    kill "$EBR_LISTENER_PID" 2>/dev/null || true
+  fi
   # The forward holds the laptop-side listener; INT is the documented stop,
   # KILL the backstop so a hung relay cannot outlive the run.
   if [ -n "$RETIRED_FWD_PID" ]; then
@@ -1029,9 +1222,27 @@ teardown() {
   # INT leaves a live activation — the same INT, then the KILL backstop.
   if [ -n "$BOXREG_CTRLC_PID" ]; then
     kill -INT "$BOXREG_CTRLC_PID" 2>/dev/null || true
+    # The proof may have left it stopped mid-step; resume it so the INT lands.
+    kill -CONT "$BOXREG_CTRLC_PID" 2>/dev/null || true
     sleep 0.5 2>/dev/null || true
     kill -9 "$BOXREG_CTRLC_PID" 2>/dev/null || true
   fi
+  # The round-two walk's key leg: a failure between its write of a refused
+  # value and the creation that replaces it leaves that value in the login
+  # keychain. Delete the item, so the next creation writes a new key.
+  if [ -n "${RT_KEY_STUB:-}" ]; then
+    security delete-generic-password -s dev.minimal.client-key -a minimal >/dev/null 2>&1 || true
+  fi
+  # Its quarantine leg: stop the 'bep serve' it started, and take its
+  # unreadable line back out of the audit segment if it is still there.
+  if [ -n "${RT_QU_PID:-}" ]; then
+    pkill -P "$RT_QU_PID" 2>/dev/null || true
+    kill "$RT_QU_PID" 2>/dev/null || true
+  fi
+  if [ -n "${RT_QU_SEG:-}" ]; then
+    rt_quarantine_unwrite
+  fi
+  [ -n "${RT_QU_SOCKETS:-}" ] && rm -rf "$RT_QU_SOCKETS"
   # And the state dir — which is NOT just metadata. On a VM lane it holds the
   # provider's per-VM writable data volume
   # (`minimal/providers/local-minvmd0/data-vol.raw`), a sparse image whose HOST
@@ -1179,6 +1390,54 @@ box_row_end_record() {
       | grep -F "\"box\":\"$name\"" | tail -n1)"
   fi
   printf '%s' "$rec"
+}
+
+# Exiting a box's shell ends the box (BOX-038): no prompt asks to keep or
+# delete it, and the box stays listed as `exited`, with the shell's exit
+# code. Asserts that for box $1 (an id or a name): it is listed, and
+# `min box show` reads `State: exited` and `Exit code: $2`. $3 names the
+# leg for the error. The attach returns when the shell exits, and the
+# daemon writes the record as it ends the box, so this polls for a moment.
+# $4, when set, is the wrapper that reaches the box's daemon, in place of
+# `mnl`. `box_exited_check` returns 1 on a miss, for a leg that hands its
+# own teardown back to its caller. `assert_box_exited` fails the run.
+assert_box_exited() {
+  box_exited_check "$@" || fail
+}
+box_exited_check() {
+  local box="$1" want="$2" leg="$3" via="${4:-mnl}" shown="" state="" code="" i
+  for i in $(seq 1 20); do
+    shown="$("$via" box show "$box" </dev/null 2>&1)" || shown=""
+    state="$(printf '%s\n' "$shown" | sed -n 's/^State: *//p' | tr -d '\r')"
+    code="$(printf '%s\n' "$shown" | sed -n 's/^Exit code: *//p' | tr -d '\r')"
+    if [ "$state" = exited ] && [ "$code" = "$want" ]; then
+      echo "$leg: the box ended with its shell, listed as exited with exit code $code (BOX-038)"
+      return 0
+    fi
+    sleep 0.5
+  done
+  echo "::error::$leg: box $box is not listed as exited with exit code $want after its shell exited (state '${state:-<none>}', exit code '${code:-<none>}', BOX-038)"
+  echo "--- min box show $box ---"; printf '%s\n' "$shown"
+  return 1
+}
+
+# Destroys box $1 (an id or a name) and asserts it is no longer listed. $2
+# is the id to look for in `min ls --raw`, $3 names the leg for the error.
+# `--force`: the box can hold in-session files, and without a terminal a
+# destroy of such a box refuses unless `--force` confirms it.
+destroy_box_and_assert_gone() {
+  local box="$1" id="$2" leg="$3" listed
+  mnl session destroy --force "$box" </dev/null >"$WORK/destroy-exited.out" 2>&1 || {
+    echo "::error::$leg: 'min session destroy --force $box' failed"
+    cat "$WORK/destroy-exited.out" 2>/dev/null || true
+    fail
+  }
+  # Capture, then match: `| grep -q` exits early and SIGPIPEs the producer.
+  listed="$(mnl ls --raw 2>/dev/null || true)"
+  if printf '%s\n' "$listed" | grep -Fqx "$id"; then
+    echo "::error::$leg: box $id is still listed after 'min session destroy --force $box'"
+    fail
+  fi
 }
 
 # The sandbox proof below forks a real session sandbox, which needs
@@ -1626,11 +1885,17 @@ published_loopback_host() {
 # (`--allow-subnets`, `--allow-dns-hosts`, `--allow-protocols`, `--deny-subnets`)
 # through an own-address box, checks that `min session policy` shows the
 # effective rules, proves an allowed connection completes and a disallowed one
-# is dropped silently and logged, and records the deny-all default story around
-# it: while the default is only announced this build still allows a bare
-# own-address box and prints the coming change; an explicit deny-all declaration
-# stands in for the in-force default to show the box reaching nothing; and the
-# announcement names the opt-out flag that keeps the prior default.
+# is dropped silently and logged, and proves the deny-all default in force
+# (NET-074/NET-075): a bare own-address box is told its default on one line at
+# activate, `min session policy` shows `deny-all (default)`, and the box
+# reaches nothing — not a literal destination an explicitly allowing box
+# reaches in the same run, and not an external name, which fails fast at
+# resolution while host.min.internal still resolves. An explicit deny-all
+# declaration carries NET-141's deny-all case: its relay answers a name
+# outside the box zone REFUSED, fast, while host.min.internal still resolves,
+# and its TCP to the resolver's port is dropped. NET-077's opt-out is not
+# driven here (it needs a daemon restarted with it); it stays with the unit
+# test deny_all_opt_out_keeps_prior_default.
 proof_own_ip_egress_declared_and_enforced() {
   echo "::group::own-IP egress: declared and enforced (NET T20)"
 
@@ -1676,28 +1941,45 @@ proof_own_ip_egress_declared_and_enforced() {
     return 1
   }
 
-  # ---- NET-076: the coming deny-all default is announced -------------------
-  # A bare own-address box still allows everything while the default is only
-  # announced, but the user is told what is coming and how to keep the current
-  # behaviour.
-  announce_sid="$(cd "$EGRESS_SEED_DIR" && mnl session activate . --no-prompt \
-    --name e2e-egress-announce --network own_ip 2>"$WORK/egress-announce.err")" || {
-    echo "::error::'min session activate --network own_ip' (announcement probe) failed"
-    cat "$WORK/egress-announce.err" 2>/dev/null || true
+  # ---- NET-074/NET-075/NET-076: a bare own-address box has deny-all --------
+  # The default is in force: an own-address box with no egress section is
+  # told so on one line at activate (and the retired announcement, NET-076,
+  # no longer prints), and `min session policy` names the default it got.
+  # This daemon runs without the opt-out, so the default binds. The box is
+  # kept for the reach legs below, which need a live control first.
+  egress_in_force_note="This box can reach no external address: a --network own_ip box with no egress rules gets the deny-all default"
+  bare_sid="$(cd "$EGRESS_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-egress-bare --network own_ip 2>"$WORK/egress-bare.err")" || {
+    echo "::error::'min session activate --network own_ip' (bare box) failed"
+    cat "$WORK/egress-bare.err" 2>/dev/null || true
     fail
   }
-  announce_sid="$(printf '%s\n' "$announce_sid" | tail -n1 | tr -d '\r')"
-  if ! grep -q "Heads-up: the next release denies all external reach" "$WORK/egress-announce.err"; then
-    echo "::error::activate did not announce the coming deny-all default (NET-076)"
-    cat "$WORK/egress-announce.err" 2>/dev/null || true
+  bare_sid="$(printf '%s\n' "$bare_sid" | tail -n1 | tr -d '\r')"
+  bare_note_count="$(grep -cF -- "$egress_in_force_note" "$WORK/egress-bare.err" || true)"
+  if [ "$bare_note_count" != 1 ]; then
+    echo "::error::NET-074: activate of a bare own-address box did not print the in-force note once (got ${bare_note_count:-0})"
+    cat "$WORK/egress-bare.err" 2>/dev/null || true
     fail
   fi
-  if ! grep -q -- "--egress-deny-all-opt-out" "$WORK/egress-announce.err"; then
-    echo "::error::the deny-all announcement did not name the opt-out flag"
-    cat "$WORK/egress-announce.err" 2>/dev/null || true
+  if grep -q "Heads-up" "$WORK/egress-bare.err"; then
+    echo "::error::NET-076: the retired deny-all announcement still printed at activate"
+    cat "$WORK/egress-bare.err" 2>/dev/null || true
     fail
   fi
-  echo "NET-076 OK: activate announced the coming default and named the opt-out"
+  echo "NET-076 OK: no announcement; activate printed the in-force note once"
+
+  bare_policy="$(mnl session policy "$bare_sid" 2>"$WORK/egress-bare-policy.err")" || {
+    echo "::error::'min session policy' failed for the bare box"
+    cat "$WORK/egress-bare-policy.err" 2>/dev/null || true
+    fail
+  }
+  echo "effective policy of the bare box:"
+  printf '%s\n' "$bare_policy" | sed 's/^/  /'
+  if ! grep -qF "deny-all (default)" <<<"$bare_policy"; then
+    echo "::error::NET-075: 'min session policy' did not show the deny-all default for a bare own-address box"
+    fail
+  fi
+  echo "NET-075 OK: the bare box's policy shows deny-all (default)"
 
   # The remaining probes exercise allowed/disallowed flows against the public
   # internet, so they follow the same weather-aware policy as
@@ -1751,23 +2033,39 @@ proof_own_ip_egress_declared_and_enforced() {
     return 1
   }
 
-  if egress_reachability_probe "$announce_sid" "announce" example.com example.org; then
-    echo "allowed-connection OK: a bare box still reaches the network during the announcement"
+  # The control box: an own-address box that declares reach to every
+  # address, so it reaches what the lane reaches. It declares egress, so no
+  # in-force note prints for it.
+  open_sid="$(cd "$EGRESS_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-egress-open --network own_ip --allow-subnets 0.0.0.0/0 \
+    2>"$WORK/egress-open.err")" || {
+    echo "::error::'min session activate --network own_ip --allow-subnets 0.0.0.0/0' failed"
+    cat "$WORK/egress-open.err" 2>/dev/null || true
+    fail
+  }
+  open_sid="$(printf '%s\n' "$open_sid" | tail -n1 | tr -d '\r')"
+  if grep -qF -- "$egress_in_force_note" "$WORK/egress-open.err"; then
+    echo "::error::a box that declared egress was given the in-force note for a box with no egress section"
+    cat "$WORK/egress-open.err" 2>/dev/null || true
+    fail
+  fi
+
+  if egress_reachability_probe "$open_sid" "open" example.com example.org; then
+    echo "allowed-connection OK: a box that declares reach to every address reaches the network"
   else
-    echo "allowed-connection WARNING: the bare box could not prove external reachability; the announcement text and opt-out were still verified above"
+    echo "allowed-connection WARNING: the allowing box could not prove external reachability; the note and policy were still verified above"
   fi
 
   # ---- the destination the declared box must be refused, proven live first --
   # NET-062's drop is only meaningful against a destination this lane can
   # actually reach: a connection nobody could have completed reads as a
   # "silent drop" on a networkless lane, which is enforcement nobody enforced.
-  # So the SAME run first asks a box with NO egress section — the announce box
-  # above, which the announcement phase still leaves unrestricted — to
-  # complete the exact connection the declared box must be refused. Its
-  # completing proves the destination is live and reachable through this
-  # switch fabric, so the declared box's non-completion below can only be its
-  # own rules — and it doubles as the reach the coming deny-all default takes
-  # away (NET-074).
+  # So the SAME run first asks the allowing box above — its egress admits
+  # every address — to complete the exact connection the declared box must
+  # be refused. Its completing proves the destination is live and reachable
+  # through this switch fabric, so the declared box's non-completion below
+  # can only be its own rules — and so is the bare box's, which is the reach
+  # the deny-all default takes away (NET-074).
   #
   # The destination is a LITERAL public address, and it is chosen so nothing
   # the declared box admits can ever cover it. Its allow subnets are a
@@ -1786,21 +2084,21 @@ proof_own_ip_egress_declared_and_enforced() {
   # name this box pins (example.com) can never resolve to — and being
   # literals, no resolver has to agree with anything for the probe to run.
   # Two of them, because a lane whose network blocks one still deserves the
-  # proof: the first the bare box reaches is the one the declared box must be
-  # refused.
+  # proof: the first the allowing box reaches is the one the declared box
+  # must be refused.
   egress_disallowed_dst=""
   for egress_dst_candidate in 1.1.1.1 9.9.9.9; do
     for egress_dst_try in 1 2 3; do
-      egress_dst_out="$(mnl session exec "$announce_sid" \
+      egress_dst_out="$(mnl session exec "$open_sid" \
         "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 20 https://$egress_dst_candidate/" \
         2>"$WORK/egress-dst-live.err")"
       egress_dst_rc=$?
       if egress_curl_answered "$egress_dst_rc" "${egress_dst_out:-}"; then
         egress_disallowed_dst="$egress_dst_candidate"
-        echo "control GET https://$egress_dst_candidate/ from the bare box -> ${egress_dst_out:-<none>} (attempt ${egress_dst_try}/3): the destination is live on this lane, so the declared box below must be refused this same connection"
+        echo "control GET https://$egress_dst_candidate/ from the allowing box -> ${egress_dst_out:-<none>} (attempt ${egress_dst_try}/3): the destination is live on this lane, so the declared box below must be refused this same connection"
         break
       fi
-      echo "control GET https://$egress_dst_candidate/ from the bare box failed on attempt ${egress_dst_try}/3 (rc ${egress_dst_rc}, got '${egress_dst_out:-<none>}')"
+      echo "control GET https://$egress_dst_candidate/ from the allowing box failed on attempt ${egress_dst_try}/3 (rc ${egress_dst_rc}, got '${egress_dst_out:-<none>}')"
       cat "$WORK/egress-dst-live.err" 2>/dev/null || true
       if [ "$egress_dst_try" -lt 3 ]; then
         sleep 3
@@ -1811,9 +2109,59 @@ proof_own_ip_egress_declared_and_enforced() {
     fi
   done
   if [ -z "$egress_disallowed_dst" ]; then
-    echo "::warning::the bare box could not reach a disallowed candidate destination on this run, so the disallowed-connection drop below is skipped as a weather warning (without this control a non-completion would be indistinguishable from a dead route)"
+    echo "::warning::the allowing box could not reach a disallowed candidate destination on this run, so the disallowed-connection drop below is skipped as a weather warning (without this control a non-completion would be indistinguishable from a dead route)"
   fi
-  mnl session destroy --force "$announce_sid" >/dev/null 2>&1 || true
+
+  # ---- NET-074: the bare box reaches nothing outside itself ----------------
+  # The literal destination the allowing box just completed a connection to
+  # must not complete from the bare box: same run, same fabric, so a
+  # non-completion is the default's doing, not a dead route.
+  if [ -z "$egress_disallowed_dst" ]; then
+    echo "::warning::NET-074: the bare box's reach assertion is skipped as a weather warning (the allowing box reached no candidate destination above)"
+  else
+    mnl session exec "$bare_sid" \
+      "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 10 https://$egress_disallowed_dst/" \
+      >"$WORK/egress-bare-ip.out" 2>"$WORK/egress-bare-ip.err"
+    bare_ip_rc=$?
+    bare_ip_status="$(cat "$WORK/egress-bare-ip.out" 2>/dev/null)"
+    echo "bare-box GET https://$egress_disallowed_dst/ -> rc=$bare_ip_rc status=${bare_ip_status:-<none>} curl: $(tr '\n' ' ' < "$WORK/egress-bare-ip.err" 2>/dev/null)"
+    if egress_curl_answered "$bare_ip_rc" "${bare_ip_status:-}"; then
+      echo "::error::NET-074: a bare own-address box completed a connection to $egress_disallowed_dst, which the allowing box reached in this run; the deny-all default did not bind"
+      cat "$WORK/egress-bare-ip.err" 2>/dev/null || true
+      fail
+    fi
+    echo "NET-074 OK: the bare box did not reach $egress_disallowed_dst, which the allowing box reached in this run"
+  fi
+
+  # An external name fails fast at resolution: the relay refuses every name
+  # outside the box zone for a deny-all box, so the lookup is answered, never
+  # left to time out. Timed inside the box, so the exec's own round trip is
+  # not counted; single-quoted so the box's shell, not this one, expands it.
+  # The zone still resolves: host.min.internal answers from the same box.
+  # shellcheck disable=SC2016
+  bare_lookup="$(mnl session exec "$bare_sid" \
+    's=$(date +%s%N); getent ahostsv4 example.com; rc=$?; e=$(date +%s%N); echo "rc=$rc ms=$(( (e - s) / 1000000 ))"' \
+    2>"$WORK/egress-bare-getent.err" | tr -d '\r' | tail -n1)" || true
+  echo "NET-074: getent ahostsv4 example.com from the bare box -> ${bare_lookup:-<none>}"
+  bare_lookup_rc="$(printf '%s' "$bare_lookup" | sed -n 's/^rc=\([0-9]*\) .*/\1/p')"
+  bare_lookup_ms="$(printf '%s' "$bare_lookup" | sed -n 's/.* ms=\([0-9]*\)$/\1/p')"
+  if [ -z "$bare_lookup_rc" ] || [ "$bare_lookup_rc" = 0 ] || [ -z "$bare_lookup_ms" ] \
+     || [ "$bare_lookup_ms" -ge 5000 ]; then
+    echo "::error::NET-074: the bare box's lookup of example.com did not fail fast (want a non-zero getent exit inside 5000 ms, got '${bare_lookup:-none}')"
+    cat "$WORK/egress-bare-getent.err" 2>/dev/null || true
+    fail
+  fi
+  bare_host="$(mnl session exec "$bare_sid" "getent ahostsv4 host.min.internal" \
+    2>"$WORK/egress-bare-host.err" | awk 'NR == 1 { print $1 }' | tr -d '\r')" || true
+  echo "NET-074: host.min.internal from the bare box -> ${bare_host:-<none>}"
+  if ! printf '%s' "$bare_host" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+    echo "::error::NET-074: host.min.internal did not resolve from the bare box (got '${bare_host:-none}')"
+    cat "$WORK/egress-bare-host.err" 2>/dev/null || true
+    fail
+  fi
+  echo "NET-074 OK: the bare box's external name fails fast at resolution and host.min.internal resolves"
+  mnl session destroy --force "$bare_sid" >/dev/null 2>&1 || true
+  mnl session destroy --force "$open_sid" >/dev/null 2>&1 || true
 
   # ---- NET-060/061/062/063: four-field declaration, effective rules, drop --
   # The allowed list is intentionally narrow: one non-loopback documentation
@@ -1838,8 +2186,8 @@ proof_own_ip_egress_declared_and_enforced() {
     fail
   }
   declare_sid="$(printf '%s\n' "$declare_sid" | tail -n1 | tr -d '\r')"
-  if grep -q "Heads-up: the next release denies all external reach" "$WORK/egress-declared.err"; then
-    echo "::error::a declared box was announced as if it had no egress section"
+  if grep -qF -- "$egress_in_force_note" "$WORK/egress-declared.err"; then
+    echo "::error::a declared box was given the in-force note for a box with no egress section"
     cat "$WORK/egress-declared.err" 2>/dev/null || true
     fail
   fi
@@ -1869,7 +2217,7 @@ proof_own_ip_egress_declared_and_enforced() {
   # lane's network and the allowed path — and, on the SAME run, separates a
   # policy drop from a dead network, which is what lets the fast-failure
   # branches below be hard fails instead of weather warnings. The control's
-  # result is kept for the deny-all stand-in further down, whose own
+  # result is kept for the declared deny-all box further down, whose own
   # reachability cannot be probed from itself (it reaches nothing by
   # construction, so a guard run from it could never pass).
   declared_reach_ok=0
@@ -1882,15 +2230,15 @@ proof_own_ip_egress_declared_and_enforced() {
     # name outside `allow_dns_hosts` is a resolver matter (design §5.3 refuses
     # non-matching names at resolution), so the drop is proven against a
     # destination ADDRESS no rule and no pin admits — the literal chosen and
-    # proven live further up, from the bare box, in this same run. Two
-    # controls bracket it: the bare box's completed connection to the very
+    # proven live further up, from the allowing box, in this same run. Two
+    # controls bracket it: the allowing box's completed connection to the very
     # destination (a live destination on this lane, reached through the same
     # fabric) and this box's own completed connection to example.com above
     # (this box's network and its allowed path), so a non-completion here is
     # neither a dead route nor a dead box, and a fast refusal is the box's own
     # doing rather than weather.
     if [ -z "$egress_disallowed_dst" ]; then
-      echo "::warning::NET-062: the disallowed-address drop is skipped as a weather warning (the bare box reached no candidate destination above, so a drop here would prove nothing about the rules)"
+      echo "::warning::NET-062: the disallowed-address drop is skipped as a weather warning (the allowing box reached no candidate destination above, so a drop here would prove nothing about the rules)"
     else
       deny_start_ms="$(now_ms)"
       mnl session exec "$declare_sid" \
@@ -1902,7 +2250,7 @@ proof_own_ip_egress_declared_and_enforced() {
       deny_err="$(tr '\n' ' ' < "$WORK/egress-deny-ip.err" 2>/dev/null)"
       echo "disallowed-address GET https://$egress_disallowed_dst/ -> rc=$deny_rc status=${deny_status:-<none>} elapsed=${deny_elapsed_ms}ms curl: ${deny_err:-<none>}"
       if egress_curl_answered "$deny_rc" "${deny_status:-}"; then
-        echo "::error::NET-062: a connection to an address no rule admits ($egress_disallowed_dst) completed — the bare box completed this same connection above, so the lane reaches the destination and the egress rules did not enforce"
+        echo "::error::NET-062: a connection to an address no rule admits ($egress_disallowed_dst) completed — the allowing box completed this same connection above, so the lane reaches the destination and the egress rules did not enforce"
         cat "$WORK/egress-deny-ip.err" 2>/dev/null || true
         fail
       fi
@@ -1912,11 +2260,11 @@ proof_own_ip_egress_declared_and_enforced() {
         fail
       fi
       if [ "$deny_elapsed_ms" -ge 6000 ]; then
-        echo "NET-062 OK: the disallowed connection to $egress_disallowed_dst dropped silently (no answer and no reset until the 10 s timeout), while the bare box completed the same connection in this run"
+        echo "NET-062 OK: the disallowed connection to $egress_disallowed_dst dropped silently (no answer and no reset until the 10 s timeout), while the allowing box completed the same connection in this run"
         assert_egress_drop_logged
         echo "NET-062 (rate-limited warning) OK: the drop is logged"
       else
-        echo "::error::NET-062: the disallowed connection failed in ${deny_elapsed_ms}ms — a fast refusal, not a silent drop. The controls bracketing this probe (the bare box's completed connection to the same destination, and this box's own to https://example.com) both completed on this run, so the network path is alive and the fast failure is the box's own doing"
+        echo "::error::NET-062: the disallowed connection failed in ${deny_elapsed_ms}ms — a fast refusal, not a silent drop. The controls bracketing this probe (the allowing box's completed connection to the same destination, and this box's own to https://example.com) both completed on this run, so the network path is alive and the fast failure is the box's own doing"
         cat "$WORK/egress-deny-ip.err" 2>/dev/null || true
         fail
       fi
@@ -1924,13 +2272,8 @@ proof_own_ip_egress_declared_and_enforced() {
 
     # ---- the disallowed NAME, its own assertion ----------------------------
     # example.org is outside `allow_dns_hosts`, so its connection must not
-    # complete. Whether it is refused FAST at resolution (the design outcome:
-    # the resolver refuses a non-matching name) or TIMES OUT with no reset
-    # (the current relay leaves the name unpinned and drops the SYN) is NOT
-    # asserted either way — reconciling those two is the dns_gate work's, not
-    # this proof's — but the observed outcome is printed, with the curl error
-    # and the elapsed time, so the transcript names which behaviour this
-    # build has.
+    # complete. Its relay answers the name REFUSED (NET-141), so curl must
+    # fail at resolution, inside 5000 ms, before any connection is tried.
     name_deny_start_ms="$(now_ms)"
     mnl session exec "$declare_sid" \
       "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 10 https://example.org" \
@@ -1944,34 +2287,152 @@ proof_own_ip_egress_declared_and_enforced() {
       cat "$WORK/egress-deny-name.err" 2>/dev/null || true
       fail
     fi
-    name_outcome="fast refusal"
+    name_outcome="not a resolver refusal"
     if grep -qi 'could not resolve' "$WORK/egress-deny-name.err" 2>/dev/null; then
-      name_outcome="fast resolver refusal"
-    elif [ "$name_elapsed_ms" -ge 6000 ]; then
-      name_outcome="timeout with no reset"
+      name_outcome="resolver refusal"
     fi
     echo "disallowed-name GET https://example.org -> rc=$name_rc status=${name_status:-<none>} elapsed=${name_elapsed_ms}ms ($name_outcome) curl: ${name_err:-<none>}"
+    if [ "$name_outcome" != "resolver refusal" ] || [ "$name_elapsed_ms" -ge 5000 ]; then
+      echo "::error::NET-141: the partial-allow-list box's GET https://example.org did not fail fast at resolution (want 'could not resolve' inside 5000 ms, got $name_outcome in ${name_elapsed_ms}ms) — its relay refuses every name the list does not match"
+      cat "$WORK/egress-deny-name.err" 2>/dev/null || true
+      fail
+    fi
   else
     echo "allowed/disallowed-connection WARNING: the declared box could not complete its allowed connection to https://example.com; the connection assertions that need the public internet are skipped as weather warnings"
   fi
 
-  # ---- NET-074 stand-in: no egress section reaches nothing once the default
-  # is in force. The shipped phase is announced, so we exercise the
-  # enforcement shape with an explicit deny-all declaration (deny 0.0.0.0/0);
-  # the unit and CLI tests already cover the in-force resolution, and the
-  # announcement above covers the transition notice. This is a stand-in for
-  # NET-074's REACH only: NET-075's observable is the word `deny-all` in
-  # `min session policy`, which an explicit-rule box cannot show — it shows
-  # its rule — so that rendering stays with the CLI tests that pin it.
+  # ---- a declared deny-all box: `--deny-all-egress`, every allow list
+  # present and empty — the very section the in-force default materializes
+  # for the bare box above (NET-074), here declared, so the box carries it
+  # whatever the daemon's opt-out says. It carries NET-141's deny-all case
+  # below, and reaches nothing.
   deny_all_sid="$(cd "$EGRESS_SEED_DIR" && mnl session activate . --no-prompt \
     --name e2e-egress-deny-all --network own_ip \
-    --deny-subnets 0.0.0.0/0 \
+    --deny-all-egress \
     2>"$WORK/egress-deny-all.err")" || {
-    echo "::error::'min session activate --deny-subnets 0.0.0.0/0' failed"
+    echo "::error::'min session activate --network own_ip --deny-all-egress' failed"
     cat "$WORK/egress-deny-all.err" 2>/dev/null || true
     fail
   }
   deny_all_sid="$(printf '%s\n' "$deny_all_sid" | tail -n1 | tr -d '\r')"
+
+  # ---- NET-141's deny-all case: the relay's DNS gate answers a deny-all
+  # box's lookup of any name outside the box zone REFUSED itself, whatever
+  # the record type, and forwards nothing; zone names pass; and DNS over TCP
+  # to the resolver is dropped, because the resolver carve-out is UDP alone.
+  # None of it needs the public internet: the refusal is the relay's own
+  # answer, the zone is answered on the switch, and the drop is the box's
+  # own verdict, so these legs are hard assertions on every lane that runs
+  # this proof. The resolver is the one the box's resolv.conf names: the
+  # switch gateway.
+  da_resolv="$(mnl session exec "$deny_all_sid" 'cat /etc/resolv.conf' \
+    2>"$WORK/egress-deny-all-resolv.err" | tr -d '\r')" || true
+  da_ns="$(printf '%s\n' "$da_resolv" | awk '$1 == "nameserver" { print $2; exit }')"
+  if [ -z "$da_ns" ]; then
+    echo "::error::NET-141: the deny-all box's /etc/resolv.conf names no nameserver"
+    printf '%s\n' "$da_resolv"
+    cat "$WORK/egress-deny-all-resolv.err" 2>/dev/null || true
+    fail
+  fi
+  echo "NET-141: the deny-all box's resolver is $da_ns"
+
+  # The rcode itself, read off the wire: a raw query sent from inside the box
+  # with socat, carried in and out as base64 (both launcher baseline
+  # packages), built and parsed host-side with python3 (an e2e prerequisite).
+  # A REFUSED answer to the query's own id is the relay's: NXDOMAIN, an
+  # answer, or silence would each be something else.
+  da_dns_rcode() { # $1 name, $2 qtype number -> prints "rcode ancount", or nothing
+    local q b64
+    q="$(python3 -c '
+import base64, struct, sys
+name, qtype = sys.argv[1], int(sys.argv[2])
+wire = b"".join(bytes([len(l)]) + l.encode() for l in name.split(".")) + b"\0"
+sys.stdout.write(base64.b64encode(
+    struct.pack("!HHHHHH", 0x4d31, 0x0100, 1, 0, 0, 0) + wire + struct.pack("!HH", qtype, 1)
+).decode())' "$1" "$2")"
+    b64="$(mnl session exec "$deny_all_sid" \
+      "printf %s '$q' | /usr/bin/base64 -d | /usr/bin/socat -t 2 - UDP:$da_ns:53 | /usr/bin/base64 -w0" \
+      2>"$WORK/egress-deny-all-rcode.err" | tr -d '\r\n')" || true
+    python3 -c '
+import base64, sys
+try:
+    r = base64.b64decode(sys.argv[1])
+except Exception:
+    sys.exit(0)
+if len(r) >= 8 and r[0:2] == b"\x4d\x31" and r[2] & 0x80:
+    print(r[3] & 0x0f, int.from_bytes(r[6:8], "big"))' "$b64"
+  }
+  for da_q in A:1 AAAA:28 TXT:16; do
+    da_rcode="$(da_dns_rcode example.com "${da_q#*:}")"
+    da_rcode="${da_rcode%% *}"
+    echo "NET-141: ${da_q%%:*} example.com from the deny-all box -> rcode ${da_rcode:-<no reply>}"
+    if [ "$da_rcode" != 5 ]; then
+      echo "::error::NET-141: the deny-all box's ${da_q%%:*} lookup of example.com, a name outside the box zone, was not answered REFUSED (rcode 5) by its relay (got '${da_rcode:-no reply}')"
+      cat "$WORK/egress-deny-all-rcode.err" 2>/dev/null || true
+      fail
+    fi
+  done
+
+  # A zone name's non-A query is answered NODATA at the relay too (rcode 0,
+  # no answers, its own id): the switch's resolver answers only A for the
+  # zone and sends every other type on to the host's resolvers, so a TXT for
+  # a made-up zone name would carry the name out if it were forwarded.
+  da_nonce="e2e$(date +%s)$$"
+  da_zone_reply="$(da_dns_rcode "$da_nonce.min.internal" 16)"
+  echo "NET-141: TXT $da_nonce.min.internal from the deny-all box -> rcode/answers ${da_zone_reply:-<no reply>}"
+  if [ "$da_zone_reply" != "0 0" ]; then
+    echo "::error::NET-141: the deny-all box's TXT lookup of $da_nonce.min.internal, a zone name, was not answered NODATA (rcode 0, no answers) by its relay (got '${da_zone_reply:-no reply}')"
+    cat "$WORK/egress-deny-all-rcode.err" 2>/dev/null || true
+    fail
+  fi
+
+  # Fast, through the box's own resolver stack: the lookup fails inside the
+  # libc resolver's 5 s timeout, so it was answered, never left to time out.
+  # Timed inside the box, so the exec's own round trip is not counted; the
+  # command is single-quoted so the box's shell, not this one, expands it.
+  # shellcheck disable=SC2016
+  da_lookup="$(mnl session exec "$deny_all_sid" \
+    's=$(date +%s%N); getent ahostsv4 example.com; rc=$?; e=$(date +%s%N); echo "rc=$rc ms=$(( (e - s) / 1000000 ))"' \
+    2>"$WORK/egress-deny-all-getent.err" | tr -d '\r' | tail -n1)" || true
+  echo "NET-141: getent ahostsv4 example.com from the deny-all box -> ${da_lookup:-<none>}"
+  da_lookup_rc="$(printf '%s' "$da_lookup" | sed -n 's/^rc=\([0-9]*\) .*/\1/p')"
+  da_lookup_ms="$(printf '%s' "$da_lookup" | sed -n 's/.* ms=\([0-9]*\)$/\1/p')"
+  if [ -z "$da_lookup_rc" ] || [ "$da_lookup_rc" = 0 ] || [ -z "$da_lookup_ms" ] \
+     || [ "$da_lookup_ms" -ge 5000 ]; then
+    echo "::error::NET-141: the deny-all box's lookup of example.com did not fail fast (want a non-zero getent exit inside 5000 ms, got '${da_lookup:-none}')"
+    cat "$WORK/egress-deny-all-getent.err" 2>/dev/null || true
+    fail
+  fi
+
+  # The zone passes (NET-072): host.min.internal resolves from the same box.
+  da_host="$(mnl session exec "$deny_all_sid" "getent ahostsv4 host.min.internal" \
+    2>"$WORK/egress-deny-all-host.err" | awk 'NR == 1 { print $1 }' | tr -d '\r')" || true
+  echo "NET-141: host.min.internal from the deny-all box -> ${da_host:-<none>}"
+  if ! printf '%s' "$da_host" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+    echo "::error::NET-141: host.min.internal, a box-zone name, did not resolve from the deny-all box (got '${da_host:-none}')"
+    cat "$WORK/egress-deny-all-host.err" 2>/dev/null || true
+    fail
+  fi
+
+  # TCP 53 to the resolver is dropped: the carve-out is UDP alone, so the
+  # box's own deny-all decides the connect, silently — it runs out its window
+  # with no reset. A fast failure would be a reject, not the drop.
+  da_tcp_start_ms="$(now_ms)"
+  mnl session exec "$deny_all_sid" \
+    "/usr/bin/socat /dev/null TCP:$da_ns:53,connect-timeout=8" \
+    >/dev/null 2>"$WORK/egress-deny-all-tcp53.err" && {
+    echo "::error::NET-141: the deny-all box completed a TCP connection to its resolver's port 53"
+    fail
+  }
+  da_tcp_ms=$(( $(now_ms) - da_tcp_start_ms ))
+  echo "NET-141: TCP $da_ns:53 from the deny-all box -> elapsed=${da_tcp_ms}ms socat: $(tail -n1 "$WORK/egress-deny-all-tcp53.err" 2>/dev/null)"
+  if grep -qE 'Connection refused|reset|No route to host|unreachable' "$WORK/egress-deny-all-tcp53.err" 2>/dev/null \
+     || [ "$da_tcp_ms" -lt 5000 ]; then
+    echo "::error::NET-141: the deny-all box's TCP to its resolver's port 53 was rejected or failed fast, not silently dropped"
+    cat "$WORK/egress-deny-all-tcp53.err" 2>/dev/null || true
+    fail
+  fi
+  echo "NET-141 OK: the deny-all box's names outside the zone are REFUSED at its relay, a zone TXT is NODATA, host.min.internal resolves, and its TCP 53 is dropped"
 
   # "A box with no effective reach reaches nothing" only means something if
   # the lane can already reach the public internet — otherwise the
@@ -1982,7 +2443,7 @@ proof_own_ip_egress_declared_and_enforced() {
   # the control — a hard assertion when it passed, a weather warning when it
   # did not — and probe the same endpoint the control just proved answers.
   if [ "$declared_reach_ok" != 1 ]; then
-    echo "::warning::NET-074: the declared box could not prove external reachability in this run, so the deny-all stand-in's reach assertion is skipped as a weather warning"
+    echo "::warning::the declared box could not prove external reachability in this run, so the declared deny-all box's reach assertion is skipped as a weather warning"
   else
     deny_all_start_ms="$(now_ms)"
     mnl session exec "$deny_all_sid" \
@@ -1997,36 +2458,22 @@ proof_own_ip_egress_declared_and_enforced() {
       cat "$WORK/egress-deny-all-curl.err" 2>/dev/null || true
       fail
     fi
-    # Two outcomes are legitimate for this box, and only two: the resolver
-    # refuses the name outright (example.com is in no allow list, and the
-    # address it resolves to sits inside the 0.0.0.0/0 deny), or the SYN
-    # leaves, matches the deny, and gets no answer until the timeout — the
-    # silent drop NET-062 binds, which is what an enforcing filter looks like
-    # from inside the box. A fast failure that is neither of those means the
-    # connection reached something that answered it, and the control that
-    # gated this branch completed https://example.com from the declared box in
-    # this run, so the destination answers on this lane: the fast failure is
-    # the box's own escaping SYN (or a broken probe), never weather. The
-    # disallowed-IP probe above hard-fails this same shape; accepting it here
-    # would print a policy hole as `NET-074 OK`.
-    deny_all_outcome="fast refusal"
+    # One outcome is legitimate for this box: the lookup is refused before any
+    # connection is tried. Its relay answers every name outside the box zone
+    # REFUSED (NET-141, asserted on the wire above), so curl must fail at
+    # resolution, fast. A SYN that left — reset, answered, or silently
+    # dropped — would mean the name resolved, which the refusal rules out.
+    deny_all_outcome="not a resolver refusal"
     if grep -qi 'could not resolve' "$WORK/egress-deny-all-curl.err" 2>/dev/null; then
       deny_all_outcome="fast resolver refusal"
-    elif [ "$deny_all_elapsed_ms" -ge 6000 ]; then
-      deny_all_outcome="timeout with no reset"
     fi
     echo "deny-all GET https://example.com -> rc=$deny_all_rc status=${deny_all_status:-<none>} elapsed=${deny_all_elapsed_ms}ms ($deny_all_outcome) curl: ${deny_all_err:-<none>}"
-    if printf '%s' "$deny_all_err" | grep -qi 'reset by peer'; then
-      echo "::error::NET-074: the deny-all box's connection to https://example.com was reset by the destination — the SYN escaped the 0.0.0.0/0 deny and reached a server this run's control proved answers"
+    if [ "$deny_all_outcome" != "fast resolver refusal" ]; then
+      echo "::error::NET-141: the deny-all box's GET https://example.com did not fail at resolution — its relay refuses every name outside the box zone, so no connection should have been tried"
       cat "$WORK/egress-deny-all-curl.err" 2>/dev/null || true
       fail
     fi
-    if [ "$deny_all_outcome" = "fast refusal" ]; then
-      echo "::error::NET-074: the deny-all box failed in ${deny_all_elapsed_ms}ms — a fast refusal that is neither a resolver refusal nor a silent drop. The control above completed https://example.com from the declared box in this run, so the destination answers on this lane and the fast failure is the box's own escaping connection or a broken probe, not weather"
-      cat "$WORK/egress-deny-all-curl.err" 2>/dev/null || true
-      fail
-    fi
-    echo "NET-074 OK: a box with no effective external reach gets nothing (explicit deny-all stand-in for the in-force default)"
+    echo "declared deny-all OK: a box that declared no external reach gets nothing"
   fi
 
   mnl session destroy --force "$declare_sid" >/dev/null 2>&1 || true
@@ -2150,11 +2597,11 @@ proof_host_ip_deny_all() {
 
   # The record filter both halves warm their own daemon under: the launch
   # and node-plane records this case reads are INFO from
-  # minimald::session_host and minimald::net::classifier, the
+  # minimald::box_runtime and minimald::net::classifier, the
   # advisory-bearing create record is INFO from minimald::rpc, and the
   # lane's default filter would drop all of them before they reached the
   # file this case reads them from.
-  hida_rust_log="warn,minimald::exec=info,minimald::net::classifier=info,minimald::session_host=info,minimald::rpc=info"
+  hida_rust_log="warn,minimald::exec=info,minimald::net::classifier=info,minimald::box_runtime=info,minimald::rpc=info"
 
   # ---- the decided half's gates: one fact each, printed when it is missing.
   # Where one misses the decided half does not run and the unenforced half
@@ -2258,12 +2705,14 @@ proof_host_ip_deny_all() {
     # the common ancestor of its starting cgroup and the slice is the
     # root-owned hierarchy root — the barrier that stops a box climbing out
     # is the same fact that stops the daemon climbing in. The installer's
-    # --pid step is the supported placement, and the placement probe is per
-    # launch, so the next box this daemon launches is decided on a leaf of
-    # its own. Found off /proc, keyed on comm (a cmdline match would take an
-    # editor holding a file under crates/minimald for the daemon itself)
-    # and on this account, so another account's daemon is never placed in
-    # this case's tree.
+    # --place-listener step is the placement the path unit `min
+    # finalize-install` installs makes at every daemon start: it finds the
+    # daemon by the socket it holds, never by a pid anyone names, and the
+    # placement probe is per launch, so the next box this daemon launches
+    # is decided on a leaf of its own. The pid is still read here, off
+    # /proc, keyed on comm (a cmdline match would take an editor holding a
+    # file under crates/minimald for the daemon itself) and on this account,
+    # to check the step placed THAT process and no other.
     hida_daemons=""
     for hida_proc in /proc/[0-9]*; do
       [ -r "$hida_proc/comm" ] || continue
@@ -2277,20 +2726,31 @@ proof_host_ip_deny_all() {
       echo "::error::expected exactly one $min_daemon under this account to place in its leaf, found: ${hida_daemons:-none}"
       fail
     fi
+    hida_sock="$XDG_STATE_HOME/minimal/providers/local-minimald0/ssh.sock"
+    if [ ! -S "$hida_sock" ]; then
+      echo "::error::the daemon's listener is not at $hida_sock, so the placement unit's step has nothing to find it by"
+      fail
+    fi
     # shellcheck disable=SC2024
-    if ! sudo -n "$ROOT/scripts/install-host-classifier.sh" --pid "$hida_pid" \
+    if ! sudo -n "$ROOT/scripts/install-host-classifier.sh" --user "$(id -un)" \
+        --place-listener "$hida_sock" \
         >"$WORK/hida-place.out" 2>"$WORK/hida-place.err"; then
-      echo "::error::the installer's --pid step could not place $min_daemon $hida_pid in its leaf"
+      echo "::error::the installer's --place-listener step could not place $min_daemon $hida_pid in its leaf"
       echo "--- installer stderr ---"; cat "$WORK/hida-place.err" 2>/dev/null || true
       fail
     fi
     hida_place_out="$(cat "$WORK/hida-place.out" 2>/dev/null || true)"
     if [[ "$hida_place_out" != *"placed $hida_pid in"* ]]; then
-      echo "::error::the --pid step did not report placing $min_daemon $hida_pid"
+      echo "::error::the --place-listener step did not report placing $min_daemon $hida_pid (the holder of $hida_sock)"
       echo "--- installer output ---"; printf '%s\n' "$hida_place_out"
       fail
     fi
-    echo "place: $min_daemon $hida_pid is inside the slice, so the box this case launches is decided on a leaf of its own"
+    if ! grep -qx "$hida_pid" /sys/fs/cgroup/minimald.slice/daemon/cgroup.procs 2>/dev/null; then
+      echo "::error::$min_daemon $hida_pid is not a member of /sys/fs/cgroup/minimald.slice/daemon after the --place-listener step"
+      echo "--- daemon leaf members ---"; cat /sys/fs/cgroup/minimald.slice/daemon/cgroup.procs 2>/dev/null || true
+      fail
+    fi
+    echo "place: $min_daemon $hida_pid, found as the holder of $hida_sock, is inside the slice's daemon leaf, so the box this case launches is decided on a leaf of its own"
 
     # ---- the daemon's own fact, turned the one way it is: a launch. A
     # create answers from the last read the host gave it — the start-up
@@ -2317,7 +2777,7 @@ proof_host_ip_deny_all() {
     }
     hida_warm_sid="$(printf '%s\n' "$hida_warm_sid" | tail -n1 | tr -d '\r')"
     hida_warm_activate_err="$(cat "$WORK/hida-warm-activate.err" 2>/dev/null || true)"
-    if [[ "$hida_warm_activate_err" == *"cannot decide a host-address box's"* ]]; then
+    if [[ "$hida_warm_activate_err" == *"can't enforce it yet"* ]]; then
       echo "warm create: the throwaway box's start printed the advisory the start-up read left the fact carrying — the placement above clears the cause for reads after it, and the launch that turns the fact is the next beat:"
       printf '%s\n' "$hida_warm_activate_err" | sed 's/^/  /'
     fi
@@ -2378,7 +2838,7 @@ proof_host_ip_deny_all() {
     }
     hida_sid="$(printf '%s\n' "$hida_sid" | tail -n1 | tr -d '\r')"
     hida_activate_err="$(cat "$WORK/hida-activate.err" 2>/dev/null || true)"
-    if [[ "$hida_activate_err" == *"cannot decide a host-address box's"* ]]; then
+    if [[ "$hida_activate_err" == *"can't enforce it yet"* ]]; then
       echo "::error::the activation on a decided host printed the classifier advisory anyway: the create reply carried a cause the refresh launch above just ruled out of the fact"
       printf '%s\n' "$hida_activate_err"
       fail
@@ -2425,9 +2885,9 @@ proof_host_ip_deny_all() {
     # two host-loopback listeners this box's connections are about to meet —
     # printed because they are what the verdicts below are read against.
     hida_ls="$(mnl ls 2>"$WORK/hida-ls.err" || true)"
-    hida_answerer_line="$(printf '%s\n' "$hida_ls" | grep -F -- 'ZONE ANSWERER' | head -n1 || true)"
+    hida_answerer_line="$(printf '%s\n' "$hida_ls" | grep -F -- 'DNS SERVICE' | head -n1 || true)"
     if [ -z "$hida_answerer_line" ]; then
-      echo "::error::min ls reports no ZONE ANSWERER line: the daemon's answerer never came up, so the resolver this box is given is an address with nothing behind it"
+      echo "::error::min ls reports no DNS SERVICE line: the daemon's answerer never came up, so the resolver this box is given is an address with nothing behind it"
       fail
     fi
     hida_proxy_port="$(printf '%s\n' "$hida_ls" \
@@ -2440,7 +2900,7 @@ proof_host_ip_deny_all() {
     echo "surfaces: the answerer above, and the hostname proxy on 127.0.0.1:$hida_proxy_port — the two listeners this box's connections meet below"
 
     # ---- the resolver Minimal owns for this box: the plan's answerer
-    # address is all /etc/resolv.conf can name (the table retargets its
+    # address is all /etc/resolv.conf can name (the table steers its
     # DNS-port lookups onto the answerer's own port, the one port the deny
     # chain admits), and nothing else is left in the box's resolver file —
     # the host's own first nameserver, printed beside it, is not this box's.
@@ -2460,7 +2920,7 @@ proof_host_ip_deny_all() {
 
     # ---- the box's own connections, each printed with its verdict. First
     # its own name: the lookup must answer through the answerer (its only
-    # resolver, reached through the table's DNS retarget), and the connect
+    # resolver, reached through the table's DNS steer), and the connect
     # must then be refused — a deny-all box serves what reaches it, but
     # opens nothing. Port 9 is the discard port, an address with nothing
     # listening, so the connect alone is what this beat reads.
@@ -2480,7 +2940,7 @@ proof_host_ip_deny_all() {
       fail
     fi
     hida_tail="$(printf '%s\n' "$hida_err" | tail -n1)"
-    echo "verdict: GET http://e2e-hida.min.internal:9/ from the box — the name resolved to 127.0.0.1 through the answerer (the one resolver the box has, reached through the table's DNS retarget) and the connect was refused (rc=$hida_rc, ${hida_tail:-no detail})"
+    echo "verdict: GET http://e2e-hida.min.internal:9/ from the box — the name resolved to 127.0.0.1 through the answerer (the one resolver the box has, reached through the table's DNS steer) and the connect was refused (rc=$hida_rc, ${hida_tail:-no detail})"
 
     # A name outside the box zone: the answerer is authoritative for the
     # box zone and refuses everything else, and the box has no other
@@ -2693,11 +3153,11 @@ proof_host_ip_deny_all() {
 
     # ---- the fetch: the daemon's own package fetch still completes as
     # node-plane traffic — the NET-080 clause that rides with this one,
-    # driven the way a person drives it, through a REAL pty attach (a pipe
-    # cannot answer the session-exit prompt), against the daemon this case
-    # started on an empty cache above, so this add had to fetch.
+    # driven the way a person drives it, through a REAL pty attach, against
+    # the daemon this case started on an empty cache above, so this add had
+    # to fetch. The stream's `exit` ends the box with its shell (BOX-038).
     # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
-    hida_attach_out="$(E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" "$ADD_TOOL" \
+    hida_attach_out="$(python3 "$ROOT/scripts/e2e-attach-pty.py" "$ADD_TOOL" \
       min ${E2E_MINIMAL_ARGS:-} session attach "$hida_sid" 2>"$WORK/hida-attach.err")" || {
       echo "::error::the pty attach to the deny-all host-address box failed"
       echo "--- transcript ---"; printf '%s\n' "$hida_attach_out"
@@ -2716,6 +3176,7 @@ proof_host_ip_deny_all() {
       fail
     fi
     echo "fetch: 'min add $ADD_TOOL' completed inside the deny-all box and made it runnable ('$ADD_TOOL_MARKER' round-tripped) — the daemon fetched it on this same host while the box itself reaches nothing"
+    assert_box_exited "$hida_sid" 0 "deny-all host-address box"
 
     # ---- the node-plane record: the fetch this case pinned its daemon's
     # cache empty for, named for this box (any earlier case whose own add
@@ -2820,18 +3281,18 @@ proof_host_ip_deny_all() {
   }
   hida_un_sid="$(printf '%s\n' "$hida_un_sid" | tail -n1 | tr -d '\r')"
   hida_un_activate_err="$(cat "$WORK/hida-un-activate.err" 2>/dev/null || true)"
-  if [[ "$hida_un_activate_err" != *"note: this host cannot decide a host-address box's egress verdict per box:"* ]]; then
-    echo "::error::the activation's stderr carries no classifier advisory: a native host that cannot decide per box owes the session start the cause in words"
+  if [[ "$hida_un_activate_err" != *"note: you asked this box for no network access, but this machine can't enforce it yet, so the box can still reach the network."* ]]; then
+    echo "::error::the activation's stderr carries no classifier advisory: a native host that cannot decide per box owes a session start that declared egress the first line (what was asked, that it is not enforced, what the box does instead)"
     printf '%s\n' "$hida_un_activate_err"
     fail
   fi
-  if [[ "$hida_un_activate_err" != *"While it cannot, its host-address boxes run unenforced"* ]]; then
-    echo "::error::the advisory does not say the boxes run unenforced — the outcome a native host's advisory owes"
+  if [[ "$hida_un_activate_err" != *"  Enforce it: "* ]]; then
+    echo "::error::the advisory does not carry its second line naming how to enforce the declaration"
     printf '%s\n' "$hida_un_activate_err"
     fail
   fi
-  if [[ "$hida_un_activate_err" != *"whatever the boxes' declarations say"* ]]; then
-    echo "::error::the advisory does not carry the clause that says the declaration is not what is running here"
+  if [[ "$hida_un_activate_err" != *"--network own_ip, which enforces it now"* ]]; then
+    echo "::error::the advisory does not name the own-address start that enforces the declaration now"
     printf '%s\n' "$hida_un_activate_err"
     fail
   fi
@@ -2857,10 +3318,10 @@ proof_host_ip_deny_all() {
   fi
   # The cause, from the record's own field — the two a native host's start
   # can carry, each with its own rule for the install command: the missing
-  # step names the one command that ends it, a mount that cannot confine a
-  # box names none (installing the step over that tree would leave the
-  # cause standing). The stderr advisory must name the same cause, and its
-  # install command must follow the same rule.
+  # step names `min finalize-install` as the remedy, a mount that cannot
+  # confine a box names the own-address start alone and says why the
+  # install cannot help (installing the step over that tree would leave the
+  # cause standing). The stderr advisory must follow the same rule.
   hida_un_cause=""
   case "$hida_un_create" in
     *"the classifier's privileged step is not installed on this host"*)
@@ -2874,27 +3335,32 @@ proof_host_ip_deny_all() {
       fail
       ;;
   esac
-  if [[ "$hida_un_activate_err" != *"$hida_un_cause"* ]]; then
-    echo "::error::the advisory's cause does not match the create record's own (expected: $hida_un_cause)"
-    printf '%s\n' "$hida_un_activate_err"
-    fail
-  fi
   case "$hida_un_cause" in
     "the classifier's privileged step is not installed on this host")
-      if [[ "$hida_un_activate_err" != *"install-host-classifier.sh"* ]]; then
-        echo "::error::the advisory names the missing step but not the command that installs it"
+      if [[ "$hida_un_activate_err" != *"Enforce it: min finalize-install"* ]]; then
+        echo "::error::the advisory's cause is the missing step but it does not name min finalize-install as the remedy"
         printf '%s\n' "$hida_un_activate_err"
         fail
       fi
-      echo "advisory: the cause is the missing step, and the advisory ends with the exact command that installs it"
+      if [[ "$hida_un_activate_err" == *"curl"* || "$hida_un_activate_err" == *"install-host-classifier.sh"* ]]; then
+        echo "::error::the advisory names a script or a fetch instead of min finalize-install"
+        printf '%s\n' "$hida_un_activate_err"
+        fail
+      fi
+      echo "advisory: the cause is the missing step, and the advisory names min finalize-install as the remedy"
       ;;
     *)
-      if [[ "$hida_un_activate_err" == *"install-host-classifier.sh"* ]]; then
-        echo "::error::the advisory names an install command for a host that cannot confine a box: installing the step over that tree would leave the cause standing"
+      if [[ "$hida_un_activate_err" == *"Enforce it: min finalize-install"* ]]; then
+        echo "::error::the advisory hands out the install for a host that cannot confine a box: installing the step over that tree would leave the cause standing"
         printf '%s\n' "$hida_un_activate_err"
         fail
       fi
-      echo "advisory: the cause is the mount that cannot confine a box, and the advisory names no command — none would end it"
+      if [[ "$hida_un_activate_err" != *"min finalize-install can't fix this: $hida_un_cause"* ]]; then
+        echo "::error::the advisory does not say why the install cannot help, in the create record's own cause words (expected: $hida_un_cause)"
+        printf '%s\n' "$hida_un_activate_err"
+        fail
+      fi
+      echo "advisory: the cause is the mount that cannot confine a box, and the advisory names the own-address start alone and says why the install cannot help"
       ;;
   esac
   printf '%s\n' "$hida_un_activate_err" | sed 's/^/  /'
@@ -3194,7 +3660,7 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
   # pattern). Nothing after the warm-up can spawn a daemon.
   #
   # The filter: the two records this proof reads are INFO records from
-  # minimald::net::classifier and minimald::session_host, a daemon's filter
+  # minimald::net::classifier and minimald::box_runtime, a daemon's filter
   # comes from RUST_LOG at autospawn, and the lane's default filter would
   # drop both before they reached the file this proof reads them from.
   #
@@ -3204,7 +3670,7 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
   # cache into an empty dir of its own, under $WORK so it shares the state
   # dir's device (the daemon hardlinks built packages from its cache into
   # the session rootfs, and a hardlink cannot cross filesystems).
-  net080_rust_log="warn,minimald::exec=info,minimald::net::classifier=info,minimald::session_host=info"
+  net080_rust_log="warn,minimald::exec=info,minimald::net::classifier=info,minimald::box_runtime=info"
   net080_cache="$WORK/net080-cache"
   if ! RUST_LOG="$net080_rust_log" XDG_CACHE_HOME="$net080_cache" \
       mnl ls >/dev/null 2>"$WORK/net080-warm.err"; then
@@ -3361,10 +3827,10 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
   fi
   grep -q "deny_subnets 0.0.0.0/0" "$WORK/net080-refused-range.err" \
     || { echo "::error::the refused create does not name the rule it refused over (deny_subnets 0.0.0.0/0)"; cat "$WORK/net080-refused-range.err" 2>/dev/null || true; fail; }
-  grep -q "own-address boxes enforce them" "$WORK/net080-refused-range.err" \
+  grep -qF -- "--network own_ip to apply them" "$WORK/net080-refused-range.err" \
     || { echo "::error::the refused create does not say own-address boxes enforce these rules"; cat "$WORK/net080-refused-range.err" 2>/dev/null || true; fail; }
-  grep -q "remove these rules" "$WORK/net080-refused-range.err" \
-    || { echo "::error::the refused create does not end with what to do (remove these rules)"; cat "$WORK/net080-refused-range.err" 2>/dev/null || true; fail; }
+  grep -q "Remove them" "$WORK/net080-refused-range.err" \
+    || { echo "::error::the refused create does not end with what to do (Remove them)"; cat "$WORK/net080-refused-range.err" 2>/dev/null || true; fail; }
   if (cd "$NET080_SEED_DIR" && mnl session activate . --no-prompt \
       --name e2e-net080-refused-list --network host_ip \
       --allow-subnets 10.0.0.0/8) >/dev/null 2>"$WORK/net080-refused-list.err"; then
@@ -3417,12 +3883,12 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
   fi
   echo "refused: the box's own connection to 1.1.1.1:443 did not complete (rc=$net080_rc, ${net080_status_before:-no status}) — the deny chain's verdict on a connection the box opened itself"
 
-  # ---- the install inside the box, driven like a user: a REAL pty attach (a
-  # pipe cannot answer the session-exit prompt), the driver's default stream
-  # — the tool absent before, `min add`, `hash -r`, its version banner —
-  # answered with the detach lane so the session survives the after-reads.
+  # ---- the install inside the box, driven like a user: a REAL pty attach,
+  # the driver's default stream — the tool absent before, `min add`,
+  # `hash -r`, its version banner, `exit`. The `exit` ends the box with its
+  # shell (BOX-038), and the box stays listed as exited for the after-reads.
   # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
-  net080_attach_out="$(E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" "$ADD_TOOL" \
+  net080_attach_out="$(python3 "$ROOT/scripts/e2e-attach-pty.py" "$ADD_TOOL" \
     min ${E2E_MINIMAL_ARGS:-} session attach "$net080_sid" 2>"$WORK/net080-attach.err")" || {
     echo "::error::the pty attach to the deny-all host-address box failed"
     echo "--- transcript ---"; printf '%s\n' "$net080_attach_out"
@@ -3445,6 +3911,7 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
     fail
   fi
   echo "install: 'min add $ADD_TOOL' completed inside the deny-all box and made it runnable ('$ADD_TOOL_MARKER' round-tripped) — the daemon fetched it on this same host"
+  assert_box_exited "$net080_sid" 0 "deny-all box install"
 
   # ---- the node-plane record: the line the requirement is for. The needle
   # names this box (see net080_log): any earlier proof whose own add fetched
@@ -3572,13 +4039,22 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
 #     design blesses on purpose: both ends are a withdrawn row.
 #
 # The Ctrl-C half interrupts in [create returned, session Active] — the
-# window the CLI's interrupt guard covers. It cannot sleep its way in from
-# a hook (on_activate runs daemon-side INSIDE the create, before the guard
-# exists), so the trigger is host-visible instead: the deny-all
-# announcement a bare box prints to stderr immediately before arming the
-# guard (the same NET-076 text the egress proof above asserts), with the
-# fixture's bulk data holding the activation in the window long enough for
-# the SIGINT to land well inside it.
+# window the CLI's interrupt guard covers — and, within it, before the
+# loadout is configured: only a session still in its draft state can be
+# aborted. It cannot hold that window from an on_activate hook. The hook
+# runs in FinalizeSession, inside the guard, but on the session's actor:
+# the guard's AbortSession queues behind the finalize and is refused once
+# it runs, because the session is past its draft state by then. Racing the
+# activation from outside is no good either: a release build finishes the
+# project upload, the configure, and the finalize before a poll-then-signal
+# lands. So the case freezes the CLI instead. It single-steps the activation
+# under SIGSTOP/SIGCONT, so the CLI never runs more than a few milliseconds
+# unobserved. It stops for good once the CLI has printed the deny-all
+# in-force note (the same NET-076 text the egress proof above asserts, printed
+# immediately before the guard is armed) AND holds the fixture's bulk data
+# open. That combination means the project upload is under way: after the
+# guard, before the configure. Then the SIGINT lands while the CLI is
+# still frozen there, so the window is held on purpose rather than won.
 #
 # Ordered in the whole-lane run right after `restart`: that proof already
 # stopped and respawned the daemon, so nothing behind it shares a live
@@ -3594,7 +4070,8 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   local boxreg_declared_switch="" boxreg_declared_out="" boxreg_declared_rc=""
   local boxreg_declared_reach_ok="" boxreg_refuse_start_ms=""
   local boxreg_refuse_rc="" boxreg_refuse_elapsed_ms="" boxreg_refuse_status=""
-  local boxreg_refuse_err="" boxreg_gate_drop=""
+  local boxreg_refuse_err="" boxreg_gate_drop="" boxreg_ctrlc_held=""
+  local boxreg_ctrlc_bulk="" boxreg_ctrlc_deadline=""
   echo "::group::own-address box registers with the VM host daemon, no provider flag (T78)"
 
   if [ "$min_daemon" != minvmd ]; then
@@ -3620,11 +4097,11 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   hook_seed_preamble > "$BOXREG_CTRLC_SEED_DIR/minimal.toml"
   mkdir "$BOXREG_CTRLC_SEED_DIR/.git"
   # 64 MiB of random data. The activate that carries it uploads the project
-  # before it can finish, and that upload — over the VM bridge on the lanes
-  # this case runs on — is a multi-second window, so the interrupt below
-  # lands inside [create returned, session Active] rather than racing the
-  # far end of it. A plain byte count, not an `m` suffix: GNU and BSD dd
-  # spell those differently.
+  # before it can finish, and the file being open in the CLI is the host-
+  # visible proof that the upload is under way, so the freeze below stops
+  # the CLI inside [create returned, session Active], before the configure.
+  # The size keeps that file open across many of the freeze's steps. A plain
+  # byte count, not an `m` suffix: GNU and BSD dd spell those differently.
   dd if=/dev/urandom of="$BOXREG_CTRLC_SEED_DIR/bulk.bin" bs=1048576 count=64 \
     >/dev/null 2>&1
 
@@ -3633,8 +4110,12 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   mnl stop --force >/dev/null 2>&1 || true
 
   # ---- (a) create registers the box with the VM host daemon ----------------
+  # The box declares reach to every address: it is the live control for the
+  # declared box's refusal below, and a bare own-address box now has the
+  # deny-all default (NET-074), so it could not be one.
   boxreg_sid="$(cd "$BOXREG_SEED_DIR" && RUST_LOG="warn,minvmd=debug" mnl session activate . \
-    --no-prompt --name e2e-box-reg --network own_ip 2>"$WORK/boxreg-activate.err")" || {
+    --no-prompt --name e2e-box-reg --network own_ip --allow-subnets 0.0.0.0/0 \
+    2>"$WORK/boxreg-activate.err")" || {
     echo "::error::'min session activate --network own_ip' (no provider flag) failed"
     cat "$WORK/boxreg-activate.err" 2>/dev/null || true
     fail
@@ -3646,7 +4127,7 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
     cat "$WORK/boxreg-activate.err" 2>/dev/null || true
     fail
   fi
-  echo "bare own-address box: $boxreg_sid (activated with no provider flag)"
+  echo "own-address box: $boxreg_sid (activated with no provider flag; egress open to every address)"
 
   # The registration, straight from the VM host daemon's record: one INFO
   # line per box, naming it and the address pair it allocated. The CLI could
@@ -3699,8 +4180,8 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   # ---- the destination the declared box below must be refused, proven live --
   # Same doctrine as the egress proof above: a non-completion only means
   # enforcement if this lane can reach the destination at all, so the SAME
-  # connection is first completed from the box with NO egress section
-  # (allow-all while the shipped default is only announced). The destination
+  # connection is first completed from the box above, whose declared egress
+  # admits every address. The destination
   # is a literal public anycast endpoint, live on 443 and chosen so nothing
   # the declared box admits can ever cover it — no resolver has to agree with
   # anything for the probe to run. curl always writes its -w line, and
@@ -3715,17 +4196,17 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
       if [ "$boxreg_dst_rc" -eq 0 ] \
         || { [ -n "${boxreg_dst_out:-}" ] && [ "$boxreg_dst_out" != "HTTP:000" ]; }; then
         boxreg_live_dst="$boxreg_dst"
-        echo "control GET https://$boxreg_dst/ from the bare box -> ${boxreg_dst_out:-<none>} (attempt ${boxreg_try}/3): the destination is live on this lane, so the declared box below must be refused this same connection"
+        echo "control GET https://$boxreg_dst/ from the allowing box -> ${boxreg_dst_out:-<none>} (attempt ${boxreg_try}/3): the destination is live on this lane, so the declared box below must be refused this same connection"
         break
       fi
-      echo "control GET https://$boxreg_dst/ from the bare box failed on attempt ${boxreg_try}/3 (rc ${boxreg_dst_rc}, got '${boxreg_dst_out:-<none>}')"
+      echo "control GET https://$boxreg_dst/ from the allowing box failed on attempt ${boxreg_try}/3 (rc ${boxreg_dst_rc}, got '${boxreg_dst_out:-<none>}')"
       cat "$WORK/boxreg-dst-live.err" 2>/dev/null || true
       [ "$boxreg_try" -lt 3 ] && sleep 3
     done
     [ -n "$boxreg_live_dst" ] && break
   done
   if [ -z "$boxreg_live_dst" ]; then
-    echo "::warning::the bare box reached no candidate destination on this run, so the declared box's refusal below is skipped as a weather warning (without this control a non-completion would be indistinguishable from a dead route)"
+    echo "::warning::the allowing box reached no candidate destination on this run, so the declared box's refusal below is skipped as a weather warning (without this control a non-completion would be indistinguishable from a dead route)"
   fi
 
   # ---- (b) destroy withdraws the row ---------------------------------------
@@ -3765,10 +4246,12 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   # that an interrupt would kill it with the row still published — and drops
   # the guard once the session is Active. The guard aborts the half-built
   # session, withdraws the box row, and exits 130. What the HOST can see of
-  # "the create returned" is the deny-all announcement a box with no egress
-  # section prints to stderr immediately before the guard is armed, so this
-  # half polls the backgrounded activation's stderr for it and interrupts
-  # only once it has appeared — never sleeping a fixed delay and hoping.
+  # "the create returned" is the deny-all in-force note a box with no egress
+  # section prints to stderr immediately before the guard is armed, and of
+  # "the upload is under way" is the bulk file held open. This half freezes
+  # the backgrounded activation once both are true (see the header comment)
+  # and interrupts it there — never sleeping a fixed delay, and never racing
+  # a running activation to the end of the window.
   # Not `mnl ... &`: mnl is a function, so `$!` would be a subshell that
   # ignores SIGINT; exec the binary so the pid is `min`'s and Ctrl-C reaches
   # it.
@@ -3777,22 +4260,46 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
     --no-prompt --name e2e-box-ctrlc --network own_ip ) \
     >"$WORK/boxreg-ctrlc.out" 2>"$WORK/boxreg-ctrlc.err" &
   BOXREG_CTRLC_PID=$!
-  # Cold VM boots overrun the 150 s spawn ceiling the recipes pin, so the
-  # poll's budget is a full cold boot (0.5 s × 600) rather than the warm
-  # case's seconds.
-  for _ in $(seq 1 600); do
-    if grep -q "Heads-up: the next release denies all external reach" \
-      "$WORK/boxreg-ctrlc.err" 2>/dev/null; then
+  # Single-step the activation until it is frozen inside the window (see the
+  # header comment): each step stops the CLI, looks, and lets it run ~10 ms
+  # more. Once the deny-all in-force note is on stderr the guard is armed, and
+  # once the bulk file is also open the project upload is under way. The CLI
+  # is left stopped there, so nothing it does next can race the interrupt.
+  # lsof reports the resolved path on macOS (/tmp is /private/tmp), so the
+  # match is on the seed dir's own name, not the full path. Cold VM boots
+  # overrun the 150 s spawn ceiling the recipes pin, so the budget is a full
+  # cold boot rather than the warm case's seconds.
+  boxreg_ctrlc_bulk="$(basename "$BOXREG_CTRLC_SEED_DIR")/bulk.bin"
+  boxreg_ctrlc_deadline=$((SECONDS + 300))
+  while [ "$SECONDS" -lt "$boxreg_ctrlc_deadline" ]; do
+    kill -STOP "$BOXREG_CTRLC_PID" 2>/dev/null || break
+    if [ -z "$boxreg_ctrlc_armed" ] \
+      && grep -qF -- "This box can reach no external address: a --network own_ip box with no egress rules gets the deny-all default" \
+        "$WORK/boxreg-ctrlc.err" 2>/dev/null; then
       boxreg_ctrlc_armed=1
-      break
     fi
-    if ! kill -0 "$BOXREG_CTRLC_PID" 2>/dev/null; then
-      break
+    if [ -n "$boxreg_ctrlc_armed" ]; then
+      if [ -d "/proc/$BOXREG_CTRLC_PID/fd" ]; then
+        find "/proc/$BOXREG_CTRLC_PID/fd" -lname "*/$boxreg_ctrlc_bulk" 2>/dev/null \
+          | grep -q . && boxreg_ctrlc_held=1
+      else
+        lsof -p "$BOXREG_CTRLC_PID" -Fn 2>/dev/null | grep -qF -- "$boxreg_ctrlc_bulk" \
+          && boxreg_ctrlc_held=1
+      fi
+      [ -n "$boxreg_ctrlc_held" ] && break
     fi
-    sleep 0.5
+    kill -CONT "$BOXREG_CTRLC_PID" 2>/dev/null || true
+    sleep 0.01
   done
   if [ -z "$boxreg_ctrlc_armed" ]; then
-    echo "::error::the interrupted activation never announced the deny-all default on stderr — the create did not return (or failed outright), so the Ctrl-C guard was never in play"
+    echo "::error::the interrupted activation never printed the deny-all in-force note on stderr — the create did not return (or failed outright), so the Ctrl-C guard was never in play"
+    cat "$WORK/boxreg-ctrlc.err" 2>/dev/null || true
+    kill -9 "$BOXREG_CTRLC_PID" 2>/dev/null || true
+    BOXREG_CTRLC_PID=""
+    fail
+  fi
+  if [ -z "$boxreg_ctrlc_held" ]; then
+    echo "::error::the interrupted activation was never caught holding its bulk data open — it got past the project upload (or exited) without being frozen inside the Ctrl-C guard's abortable window"
     cat "$WORK/boxreg-ctrlc.err" 2>/dev/null || true
     kill -9 "$BOXREG_CTRLC_PID" 2>/dev/null || true
     BOXREG_CTRLC_PID=""
@@ -3816,8 +4323,11 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   fi
   boxreg_ctrlc_switch="$(printf '%s\n' "$boxreg_record" \
     | sed -n 's/.*"switch_address":"\([0-9.]*\)".*/\1/p')"
-  echo "interrupt window: the create returned and the row is registered; sending Ctrl-C"
+  # Queued while the CLI is stopped, so the guard sees it the moment the CLI
+  # resumes, still inside the upload.
+  echo "interrupt window: the guard is armed, the upload is under way, and the row is registered; sending Ctrl-C"
   kill -INT "$BOXREG_CTRLC_PID" 2>/dev/null || true
+  kill -CONT "$BOXREG_CTRLC_PID" 2>/dev/null || true
   for _ in $(seq 1 120); do
     kill -0 "$BOXREG_CTRLC_PID" 2>/dev/null || break
     sleep 0.25
@@ -3974,7 +4484,7 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   if [ "$boxreg_declared_reach_ok" -ne 1 ]; then
     echo "::warning::the declared box's allowed connection to https://example.com did not complete, so the refusal below is skipped as a weather warning (the row is registered; the behavioural half needs the public internet)"
   elif [ -z "$boxreg_live_dst" ]; then
-    echo "::warning::the declared box's refusal is skipped as a weather warning (no candidate destination was live from the bare box above)"
+    echo "::warning::the declared box's refusal is skipped as a weather warning (no candidate destination was live from the allowing box above)"
   else
     # The refusal, hard-failed on every shape that is not a silent drop: an
     # answer, a reset, or a fast failure — bracketed by the two controls that
@@ -3990,7 +4500,7 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
     echo "undeclared GET https://$boxreg_live_dst/ from the declared box -> rc=$boxreg_refuse_rc status=${boxreg_refuse_status:-<none>} elapsed=${boxreg_refuse_elapsed_ms}ms curl: ${boxreg_refuse_err:-<none>}"
     if [ "$boxreg_refuse_rc" -eq 0 ] \
       || { [ -n "${boxreg_refuse_status:-}" ] && [ "$boxreg_refuse_status" != "HTTP:000" ]; }; then
-      echo "::error::the declared box's connection to $boxreg_live_dst answered — the bare box completed this same connection above and this box's own allowed connection completed, so the declared egress did not enforce"
+      echo "::error::the declared box's connection to $boxreg_live_dst answered — the allowing box completed this same connection above and this box's own allowed connection completed, so the declared egress did not enforce"
       cat "$WORK/boxreg-refuse.err" 2>/dev/null || true
       fail
     fi
@@ -4000,11 +4510,11 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
       fail
     fi
     if [ "$boxreg_refuse_elapsed_ms" -lt 6000 ]; then
-      echo "::error::the declared box's undeclared connection failed in ${boxreg_refuse_elapsed_ms}ms — a fast refusal, not a silent drop. Both controls completed in this run (the bare box reached the destination, and this box reached its allowed name), so the network is alive and the fast failure is this box's own doing"
+      echo "::error::the declared box's undeclared connection failed in ${boxreg_refuse_elapsed_ms}ms — a fast refusal, not a silent drop. Both controls completed in this run (the allowing box reached the destination, and this box reached its allowed name), so the network is alive and the fast failure is this box's own doing"
       cat "$WORK/boxreg-refuse.err" 2>/dev/null || true
       fail
     fi
-    echo "declared egress: the undeclared destination $boxreg_live_dst is refused (no answer and no reset until the 10 s timeout), while the bare box completed the same connection and this box completed its allowed one"
+    echo "declared egress: the undeclared destination $boxreg_live_dst is refused (no answer and no reset until the 10 s timeout), while the allowing box completed the same connection and this box completed its allowed one"
 
     # The host-side gate's own account, where the frame reached it. An honest
     # box's in-guest egress leg applies the same declared policy and refuses
@@ -4206,10 +4716,11 @@ proof_vm_host_row_read_tracks_create_and_destroy() {
 # record in the daemon's log per exposed mapping (host, port, session).
 #
 # Gating, decided by where the proof's pieces actually run:
-#   * Native Linux only. A VM lane's daemon runs in the guest while the pair
-#     this proof installs lives host-side (macOS is always VM-backed), so
-#     there is no fresh-install story to drive there — those lanes'
-#     own-address boxes are the proxy proof's own-address half.
+#   * The install half is native Linux only. A VM lane's daemon runs in the
+#     guest while the pair this proof installs lives host-side. On the macOS
+#     lane the case runs fresh_install_range_lands_on_macos instead: the
+#     range that `min finalize-install` applies lands on the running VM. A
+#     Linux VM lane skips.
 #   * The box needs a TUN device: its session program opens /dev/net/tun for
 #     its in-namespace tap, and a host that is itself a sandbox (the
 #     agent-runtime boxes this harness runs on) has none and cannot mknod one,
@@ -4222,7 +4733,7 @@ proof_vm_host_row_read_tracks_create_and_destroy() {
 #     for want of one: a lane that cannot ship a switch cannot prove what
 #     this case exists for, so the fetch failing is a failure.
 #   * The system-package half (the daemon serving the same mapping from
-#     /usr/bin/gvproxy-min, the nfpm/AUR dest) runs only on a lane that can
+#     /usr/bin/gvproxy-min, the package dest) runs only on a lane that can
 #     stage that path — writable /usr/bin, never over an existing binary;
 #     the probe ORDER that finds it is pinned by the switch crate's resolver
 #     tests either way.
@@ -4249,6 +4760,11 @@ local fi_h_minimald fi_h_minimal fi_h_gvmin fi_sid fi_sid2 fi_log fi_rec
 local fi_ready fi_answered fi_status fi_bucket_host fi_hport fi_portpat
 local fi_host fi_host2 fi_pkg_log
 local fi_lane_minimald fi_restore_profile
+if [ -n "$E2E_VM" ] && [ "$(uname -s)" = Darwin ]; then
+  # The macOS lane's half: the range lands on a running VM (NET-010/NET-123).
+  fresh_install_range_lands_on_macos
+  return $?
+fi
 if [ -n "$E2E_VM" ] || [ "$(uname -s)" != Linux ]; then
   echo "fresh-install loopback publish SKIPPED (VM-backed lane: the pair this proof installs lives host-side)"
   return 0
@@ -4268,7 +4784,7 @@ esac
 # this branch, and the native CI lane — where the tap root integration harness
 # already builds a tap — runs the case for real.
 if [ ! -c /dev/net/tun ]; then
-  echo "fresh-install loopback publish SKIPPED (no /dev/net/tun on this host: an own-IP box cannot open its in-namespace tap; runs for real on a host that has the device)"
+  echo "fresh-install loopback publish SKIPPED (no /dev/net/tun on this host: this case is native-only, so its own-IP box opens its in-namespace tap on this host and needs the host device; runs for real on a host that has it)"
   return 0
 fi
 
@@ -4585,8 +5101,8 @@ if (
   done
 
   # The system-package half: the daemon must serve the same mapping when the
-  # only switch binary it can find is /usr/bin/gvproxy-min (the nfpm/AUR
-  # dest), not the one the installer placed in ~/.local/bin. Gated on what
+  # only switch binary it can find is /usr/bin/gvproxy-min (the distro
+  # package dest), not the one the installer placed in ~/.local/bin. Gated on what
   # this lane permits — never over an existing binary — and the subshell's
   # EXIT trap (set above) removes the staged one on every path out of the proof.
   if [ -w /usr/bin ] && [ ! -e /usr/bin/gvproxy-min ]; then
@@ -4663,6 +5179,183 @@ echo "fresh-install loopback publish OK (installed pair, shipped switch, host-lo
 echo "::endgroup::"
 }
 
+# The fresh-install case on the macOS lane (NET-010, NET-040, NET-123): the
+# VM is already up, and its daemon walked the host's loopback at its start.
+# The case runs the script `min finalize-install` runs, which applies the
+# reserved local range to lo0. Then, WITHOUT a VM restart, a new own-IP box
+# with `--ingress 8080:8080` must publish at its own 127.0.64.N address: the
+# session start walks the range again, finds it present, and the box's name
+# answers there. Two facts are asserted:
+#   * `http://<name>.min.internal:8080` returns the in-box server's response,
+#     through the resolver file the same script wrote;
+#   * the box's own range address (the zone answerer's A record for its name)
+#     returns the same response at port 8080;
+#   * `min ls` shows the same range address in the box's ADDRESS column,
+#     never `-` or the `127.0.0.1` fallback.
+# The host is restored on every exit: the range unit, its aliases, the
+# resolver file and the answerer service go (range_teardown_unit,
+# answerer_service_teardown — the teardown repeats both if the case dies).
+fresh_install_range_lands_on_macos() {
+  local frm_name="e2e-fi-range" frm_port=8080 frm_marker="FRESH_INSTALL_RANGE_OK"
+  local frm_seed="" frm_sid="" frm_setup="" frm_cmd="" frm_ready="" frm_aliases=0
+  local frm_ans_port="" frm_addr="" frm_status="" frm_body="" frm_rc=0 frm_url=""
+  echo "::group::fresh install publishes an own-IP ingress at the box's range address on macOS"
+  if ! command -v launchctl >/dev/null 2>&1 || ! sudo -n true >/dev/null 2>&1; then
+    echo "fresh-install range publish on macOS SKIPPED (needs launchctl and passwordless sudo to run the script min finalize-install runs)"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    echo "fresh-install range publish on macOS SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch, so no box publishes a port)"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ "$(ifconfig lo0 2>/dev/null | grep -c -- '127\.0\.64\.')" != 0 ]; then
+    echo "::error::lo0 already carries addresses of 127.0.64.0/24 before the case ran min finalize-install; the case proves the range landing on a running VM, so it needs a host without the range"
+    fail
+  fi
+
+  # A box before the range: the VM's daemon read the range absent, so the
+  # walk this case proves is the one a later session start makes.
+  frm_setup="$WORK/fi-range-finalize-install.out"
+  mnl finalize-install --show --script >"$frm_setup" 2>"$frm_setup.note" || true
+  frm_cmd="$(setup_script_from "$frm_setup")"
+  case "$frm_cmd" in
+    '#!/bin/sh'*) ;;
+    *)
+      echo "::error::no setup script from 'min finalize-install --show --script' (got: '$frm_cmd')"
+      cat "$frm_setup" "$frm_setup.note" 2>/dev/null || true
+      fail
+      ;;
+  esac
+  if [ -f /etc/resolver/min.internal ]; then
+    RANGE_RESOLVER_BEFORE="$WORK/fi-range-resolver.before"
+    cp /etc/resolver/min.internal "$RANGE_RESOLVER_BEFORE"
+  fi
+  # Record every undo before the run, so a half-failed script still leaves
+  # the teardown its targets.
+  RANGE_INSTALLED=yes
+  ANSWERER_SERVICE_CHANNEL="$(answerer_channel_of "$frm_cmd")"
+  # shellcheck disable=SC2024 # the output files are this user's, not root's
+  if ! sudo -n sh "$frm_setup" >"$WORK/fi-range-cmd.out" 2>"$WORK/fi-range-cmd.err"; then
+    echo "::error::the script min finalize-install runs did not run"
+    cat "$WORK/fi-range-cmd.out" "$WORK/fi-range-cmd.err" 2>/dev/null || true
+    fail
+  fi
+  for _ in $(seq 1 40); do
+    frm_aliases="$(ifconfig lo0 2>/dev/null | grep -c -- '127\.0\.64\.')"
+    [ "$frm_aliases" = 254 ] && break
+    sleep 0.25
+  done
+  if [ "$frm_aliases" != 254 ]; then
+    echo "::error::the script applied $frm_aliases of 254 range addresses to lo0"
+    fail
+  fi
+  echo "min finalize-install applied the range: 254 of 254 addresses on lo0; the VM keeps running"
+
+  # The new box, on the VM that read the range absent at its start.
+  frm_seed="$(hook_mktemp /tmp/mnlfr.XXXXXX)"
+  hook_seed_preamble > "$frm_seed/minimal.toml"
+  mkdir "$frm_seed/.git"
+  frm_sid="$(cd "$frm_seed" && mnl session activate . --no-prompt \
+    --name "$frm_name" --network own_ip --ingress "$frm_port:$frm_port" \
+    2>"$WORK/fi-range-activate.err")" || {
+    echo "::error::'min session activate --network own_ip --ingress $frm_port:$frm_port' failed after min finalize-install"
+    cat "$WORK/fi-range-activate.err" 2>/dev/null || true
+    fail
+  }
+  frm_sid="$(printf '%s\n' "$frm_sid" | tail -n1 | tr -d '\r')"
+  mnl session exec "$frm_sid" \
+    "body=$frm_marker; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/fr200" \
+    >/dev/null 2>"$WORK/fi-range-responder.err" || {
+    echo "::error::could not write the box's responder response"
+    cat "$WORK/fi-range-responder.err" 2>/dev/null || true
+    fail
+  }
+  mnl session exec "$frm_sid" \
+    "nohup /usr/bin/socat TCP-LISTEN:$frm_port,reuseaddr,fork SYSTEM:\"cat /home/fr200\" >/dev/null 2>&1 &" \
+    >/dev/null 2>"$WORK/fi-range-responder.err" || {
+    echo "::error::could not start the box's responder"
+    cat "$WORK/fi-range-responder.err" 2>/dev/null || true
+    fail
+  }
+  for _ in $(seq 1 40); do
+    if [ "$(mnl session exec "$frm_sid" \
+      "curl -sS --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:$frm_port/" \
+      2>/dev/null || true)" = "200" ]; then
+      frm_ready=1; break
+    fi
+    sleep 0.25
+  done
+  [ -n "$frm_ready" ] || {
+    echo "::error::the box's responder never answered inside its own box"
+    fail
+  }
+
+  # The box's own address: the zone answerer's A record for its name.
+  for _ in $(seq 1 40); do
+    frm_ans_port="$(mnl ls 2>/dev/null \
+      | sed -En 's/^DNS SERVICE:.* on 127\.0\.0\.1:([0-9]+) \(UDP\).*/\1/p' \
+      | head -n1)"
+    [ -n "$frm_ans_port" ] && break
+    sleep 0.25
+  done
+  if [ -z "$frm_ans_port" ]; then
+    echo "::error::'min ls' carries no DNS SERVICE line after min finalize-install, so the box's address cannot be asked for"
+    mnl ls 2>&1 | head -40 || true
+    fail
+  fi
+  frm_addr="$(zone_answerer_a "$frm_ans_port" "$frm_name.min.internal" 2>"$WORK/fi-range-ans.err")" || true
+  case "$frm_addr" in
+    127.0.64.*) ;;
+    *)
+      echo "::error::$frm_name.min.internal answers ${frm_addr:-nothing}, not an address of 127.0.64.0/24: the session start did not land the range on the running VM (NET-123's re-walk), so the box stands at the 127.0.0.1 interim"
+      cat "$WORK/fi-range-ans.err" 2>/dev/null || true
+      fail
+      ;;
+  esac
+  echo "the zone answers $frm_name.min.internal with $frm_addr, an address of the range"
+
+  # Both URLs, with every proxy variable stripped: no client needs setup.
+  for frm_url in "http://$frm_name.min.internal:$frm_port/" "http://$frm_addr:$frm_port/"; do
+    frm_status=""; frm_body=""
+    for _ in $(seq 1 20); do
+      env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+        -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+        curl -sS --max-time 8 -o "$WORK/fi-range.body" -w 'HTTP:%{http_code}' \
+        "$frm_url" >"$WORK/fi-range.out" 2>"$WORK/fi-range.err"
+      frm_rc=$?
+      frm_status="$(cat "$WORK/fi-range.out" 2>/dev/null)"
+      frm_body="$(cat "$WORK/fi-range.body" 2>/dev/null || true)"
+      [ "$frm_rc" -eq 0 ] && [ "$frm_status" = "HTTP:200" ] \
+        && [[ "$frm_body" == *"$frm_marker"* ]] && break
+      sleep 0.5
+    done
+    echo "GET $frm_url -> ${frm_status:-<none>} ${frm_body:-<no body>} (curl exit $frm_rc)"
+    if [ "$frm_rc" -ne 0 ] || [ "$frm_status" != "HTTP:200" ] \
+       || [[ "$frm_body" != *"$frm_marker"* ]]; then
+      echo "::error::GET $frm_url did not return the in-box server's response"
+      cat "$WORK/fi-range.err" 2>/dev/null || true
+      fail
+    fi
+  done
+
+  # The listing shows the address the zone answers for the box (T110).
+  mnl ls >"$WORK/fi-range-ls.out" 2>&1 || true
+  if ! grep -F -- "$frm_name" "$WORK/fi-range-ls.out" | grep -qF -- " $frm_addr "; then
+    echo "::error::'min ls' does not show $frm_addr on the $frm_name row, the address the zone answers for it"
+    cat "$WORK/fi-range-ls.out" 2>/dev/null || true
+    fail
+  fi
+  echo "min ls shows $frm_addr on the $frm_name row"
+
+  mnl session destroy --force "$frm_sid" >/dev/null 2>&1 || true
+  range_teardown_unit
+  answerer_service_teardown
+  echo "fresh-install range publish on macOS OK (min finalize-install on a running VM, $frm_name.min.internal and $frm_addr answer at :$frm_port, min ls shows $frm_addr, host restored)"
+  echo "::endgroup::"
+}
+
 # ---------------------------------------------------------------------------
 # The network postures of a stock install, end to end (the S2 integration
 # case). From a REAL scripts/install.sh run into a fresh HOME — the same
@@ -4688,11 +5381,12 @@ echo "::endgroup::"
 #     refused from inside the box, fast, and a public host is
 #     unreachable too. The stock posture (host_ip, the default) completes
 #     an outbound request (NET-107).
-#   * from the fresh install, `--network own_ip --ingress 8080:8080`
-#     answers ON THE HOST at the box's own loopback address with the box's
-#     own server's response (NET-040, NET-010) — and that box completes an
-#     outbound request through the switch the installer shipped (NET-107's
-#     switch half).
+#   * from the fresh install, `--network own_ip --allow-subnets 0.0.0.0/0
+#     --ingress 8080:8080` answers ON THE HOST at the box's own loopback
+#     address with the box's own server's response (NET-040, NET-010) — and
+#     that box completes an outbound request through the switch the
+#     installer shipped (NET-107's switch half). The egress is declared
+#     because a bare own-address box is deny-all by NET-074.
 #
 # Lane gating, decided by where the proof's pieces actually run:
 #   * Native Linux only: the install pair lives host-side on a VM lane
@@ -4737,7 +5431,7 @@ proof_network_posture_from_stock_install() {
     np_want_switch=1
   else
     np_want_switch=0
-    echo "own-IP half SKIPPED (no /dev/net/tun: an own-IP box cannot open its in-namespace tap; the help, hint, none-box and stock-posture halves still run)"
+    echo "own-IP half SKIPPED (no /dev/net/tun on this host: this case is native-only, so its own-IP box opens its in-namespace tap on this host and needs the host device; the help, hint, none-box and stock-posture halves still run)"
   fi
 
   echo "::group::network posture from a stock install (help, hints, none box, own-ip, reach)"
@@ -5213,13 +5907,13 @@ STUB
     echo "the none box cannot reach the internet (exit $POSTURE_EXEC_RC in $((np_t1 - np_t0))ms: $(head -n1 "$WORK/posture-probe.err" 2>/dev/null || true))"
 
     # The attach: a REAL pty attach to the none box (the sandbox case's
-    # driver), answered with the detach lane so the session stays for its
-    # destroy below. The marker the typed command prints is the proof the
-    # attach reached the box.
+    # driver). Its `exit` ends the box with its shell (BOX-038), and the box
+    # stays listed as exited for its destroy below. The marker the typed
+    # command prints is the proof the attach reached the box.
     local np_attach_out
     # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
     np_attach_out="$(E2E_PTY_COMMANDS='echo POSTURE_NONE_ATTACH_OK
-exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
+exit' python3 "$ROOT/scripts/e2e-attach-pty.py" - \
       min ${E2E_MINIMAL_ARGS:-} session attach "$np_none_sid" \
       2>"$np_root/none-attach.err")" || {
       echo "::error::the pty attach to the none box failed (NET-039)"
@@ -5237,6 +5931,7 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
       exit 1
     fi
     echo "attach: POSTURE_NONE_ATTACH_OK came back through the attached terminal"
+    assert_box_exited "$np_none_sid" 0 "none box attach"
     mnl session destroy --force "$np_none_sid" >/dev/null 2>&1 || true
     echo "step: min session destroy --force (the none box) → exit 0"
 
@@ -5261,8 +5956,12 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
       mkdir -p "$np_ownip_seed"
       hook_seed_preamble >"$np_ownip_seed/minimal.toml"
       mkdir "$np_ownip_seed/.git"
+      # The box declares its egress: a bare own-address box is deny-all by
+      # NET-074 and reaches nothing outside itself, and this half proves the
+      # own-IP posture's outbound request (NET-107) beside its ingress.
       np_own_sid="$(cd "$np_ownip_seed" && mnl session activate . --no-prompt \
-        --name e2e-posture-ownip --network own_ip --ingress "$np_hport2":8080 \
+        --name e2e-posture-ownip --network own_ip --allow-subnets 0.0.0.0/0 \
+        --ingress "$np_hport2":8080 \
         2>"$np_own_err")" || {
         echo "::error::the installed pair failed to activate an own-IP session with an ingress mapping"
         echo "--- stderr ---"
@@ -5270,7 +5969,7 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
         exit 1
       }
       np_own_sid="$(printf '%s\n' "$np_own_sid" | tail -n1 | tr -d '\r')"
-      echo "step: min session activate --network own_ip --ingress $np_hport2:8080 → exit 0, session $np_own_sid"
+      echo "step: min session activate --network own_ip --allow-subnets 0.0.0.0/0 --ingress $np_hport2:8080 → exit 0, session $np_own_sid"
       if grep -q -- 'note: --network' "$np_own_err"; then
         echo "::error::the current spelling --network own_ip printed a legacy hint"
         echo "--- stderr ---"
@@ -5378,7 +6077,7 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
         sleep 0.25
       done
     else
-      echo "own-IP half SKIPPED (no /dev/net/tun: the fresh install ships no switch and the half is gated on the tap — see the skip note at the top)"
+      echo "own-IP half SKIPPED (no /dev/net/tun on this host, which this native-only case needs for its own-IP box's tap: the fresh install ships no switch and the half is gated on the tap — see the skip note at the top)"
     fi
 
     # Leave the lane as it was: the installed daemon stopped, so the next
@@ -5501,8 +6200,15 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     printf '\n[tasks.e2e-echo]\necho = "TASK_RUN_E2E_OK"\n'
     printf '\n[tasks.e2e-fail]\nbash = "exit 7"\n'
     printf '\n[tasks.e2e-envprint]\nexec = "printenv E2E_INHERIT_MARKER"\nenv_vars.E2E_INHERIT_MARKER = { inherit = true }\n'
+    # shellcheck disable=SC2016 # $PWD is the task's, expanded in the box
+    printf '\n[tasks.e2e-ic]\ninherit_cwd = true\nbash = "echo PWD=$PWD"\n'
+    # shellcheck disable=SC2016 # as above
+    printf '\n[tasks.e2e-noic]\nbash = "echo PWD=$PWD"\n'
   } > "$TASK_SEED_DIR/minimal.toml"
   mkdir "$TASK_SEED_DIR/.git"
+  # A file, not just the directory: the upload ships files.
+  mkdir -p "$TASK_SEED_DIR/sub/inner"
+  : > "$TASK_SEED_DIR/sub/inner/marker"
 
   # The loop: run → the task's output on stdout → exit 0 → session gone.
   t0=$(now_ms)
@@ -5525,7 +6231,7 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   # Capture-then-glob, never `mnl ls | grep -q`: grep's early exit SIGPIPEs
   # the ls under pipefail and the leftover check would falsely pass.
   ls_out="$(mnl ls 2>/dev/null)"
-  if [[ "$ls_out" == *task-e2e-echo-* ]]; then
+  if [[ "$ls_out" == *e2e-echo-[0-9]* ]]; then
     echo "::error::ephemeral session still listed after 'min task run e2e-echo'"
     fail
   fi
@@ -5541,18 +6247,18 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     fail
   fi
   ls_out="$(mnl ls 2>/dev/null)"
-  if [[ "$ls_out" == *task-e2e-fail-* ]]; then
+  if [[ "$ls_out" == *e2e-fail-[0-9]* ]]; then
     echo "::error::ephemeral session still listed after a failing 'min task run'"
     fail
   fi
   echo "task run exit-code relay: 7 → 7 OK"
 
-  # --keep retains the session, named task-<task>-<hex>, attachable later.
+  # --keep retains the session, named <task>-<n> by the daemon, attachable later.
   (cd "$TASK_SEED_DIR" && mnl task run e2e-echo --keep >/dev/null 2>"$WORK/task-keep.err") \
     || { echo "::error::'min task run e2e-echo --keep' failed"; cat "$WORK/task-keep.err" 2>/dev/null || true; fail; }
-  kept="$(mnl ls 2>/dev/null | grep -o 'task-e2e-echo-[0-9a-f]\{4\}' | head -n1)"
+  kept="$(mnl ls 2>/dev/null | grep -o 'e2e-echo-[0-9][0-9]*' | head -n1)"
   if [ -z "$kept" ]; then
-    echo "::error::--keep did not leave a 'task-e2e-echo-*' session listed"
+    echo "::error::--keep did not leave a 'e2e-echo-<n>' session listed"
     mnl ls 2>&1 || true
     fail
   fi
@@ -5668,8 +6374,246 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   unset E2E_INHERIT_MARKER # leave the invoking shell as this proof found it
   echo "env_vars inherit: ungranted var refused at the policy gate OK"
 
+  # inherit_cwd: run from a subdirectory, a task that declares it starts at
+  # the same place inside the uploaded tree; one that does not starts at
+  # the root.
+  ic_out="$(cd "$TASK_SEED_DIR/sub/inner" && mnl task run e2e-ic 2>"$WORK/task-ic.err")" \
+    || { echo "::error::'min task run e2e-ic' failed"; cat "$WORK/task-ic.err" 2>/dev/null || true; fail; }
+  if [[ "$ic_out" != *PWD=/workbench/sub/inner* ]]; then
+    echo "::error::inherit_cwd task did not start in sub/inner, got '$ic_out'"
+    fail
+  fi
+  noic_out="$(cd "$TASK_SEED_DIR/sub/inner" && mnl task run e2e-noic 2>"$WORK/task-noic.err")" \
+    || { echo "::error::'min task run e2e-noic' failed"; cat "$WORK/task-noic.err" 2>/dev/null || true; fail; }
+  if [[ "$noic_out" != *PWD=/workbench ]]; then
+    echo "::error::task without inherit_cwd did not start at /workbench, got '$noic_out'"
+    fail
+  fi
+  echo "task run inherit_cwd: sub/inner vs root OK"
+
   echo "task run proof OK"
   echo "::endgroup::"
+fi
+}
+
+# A task run against an EXISTING session inherits that session's network
+# MODE (exec.rs task_network): a task in an own-IP session gets an own-IP
+# namespace of its own beside the session's box — its loopback is its own,
+# not the host's — while its egress still works through the switch; a task
+# in a none session has no network at all. Each refusal leg asserts curl's
+# exit code, so a task that fails for another reason (curl missing, the task
+# never starting) cannot pass for a refused connection. A host_ip control
+# task reaches the same host listener, so the own-IP refusal is shown to
+# depend on the mode. The own-IP and host_ip legs are native-only: on a VM
+# lane a task self-allocates a switch address the host-side table holds no
+# row for, so the egress gate drops its traffic (NET-085, until NET-138
+# registers every box), and the listener is on the CI host while every task
+# runs in the guest. The none leg runs on every lane. Own seeded project (the
+# shared seed declares no tasks), switch-gated like the own-IP proofs above
+# (a task in an own-IP session needs the tap the switch carries):
+# MINVMD_GVPROXY_BIN on a VM lane, E2E_NATIVE_SWITCH on the native one.
+proof_task_network_inherits_session() {
+if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ] && [ -z "$E2E_NATIVE_SWITCH" ]; then
+    not_run task_network_inherits_session "no switch staged: neither MINVMD_GVPROXY_BIN (VM) nor E2E_NATIVE_SWITCH (native) is set"
+  else
+  echo "::group::task network proof (a task inherits its session's network mode)"
+  native_switch_daemon
+  TN_SEED_DIR="$(hook_mktemp /tmp/mnltn.XXXXXX)"
+  TN_LISTENER_PID=""
+  # The listener's port is baked into the task TOML as a literal (the task's
+  # shell never sees this script's variables), so pick the port BEFORE the
+  # tasks are written. Probed free with a bind, the network-posture proof's
+  # pattern (np_port_free).
+  TN_LB_PORT=""
+  for tn_cand in 18130 18131 18132 18133; do
+    if np_port_free "$tn_cand"; then
+      TN_LB_PORT="$tn_cand"
+      break
+    fi
+  done
+  if [ -z "$TN_LB_PORT" ]; then
+    echo "::error::no free candidate port among 18130-18133 for the host-side listener"
+    fail
+  fi
+  {
+    hook_seed_preamble
+    printf '\n[tasks.e2e-tn-egress-com]\nbash = "curl -fsS --max-time 30 -o /dev/null https://example.com"\n'
+    printf '\n[tasks.e2e-tn-egress-org]\nbash = "curl -fsS --max-time 30 -o /dev/null https://example.org"\n'
+    printf '\n[tasks.e2e-tn-loopback]\nbash = "curl -fsS --max-time 5 -o /dev/null http://127.0.0.1:%s/"\n' "$TN_LB_PORT"
+  } > "$TN_SEED_DIR/minimal.toml"
+  mkdir "$TN_SEED_DIR/.git"
+
+  # The host-side listener the loopback task must NOT reach: bound to the
+  # host's loopback (the network-posture proof's pattern). The task's own
+  # 127.0.0.1 is its namespace's loopback, a different interface than this
+  # one — the reach leg asserts exactly that.
+  TN_HOST_DIR="$WORK/tn-host-listener"
+  mkdir -p "$TN_HOST_DIR"
+  printf 'tn-host-listener-ok\n' > "$TN_HOST_DIR/marker"
+  ( cd "$TN_HOST_DIR" && exec python3 -m http.server "$TN_LB_PORT" --bind 127.0.0.1 ) \
+    >/dev/null 2>"$WORK/tn-hostsrv.err" &
+  TN_LISTENER_PID=$!
+  tn_up=""
+  for _ in $(seq 1 40); do
+    if [ "$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' \
+      "http://127.0.0.1:$TN_LB_PORT/marker" 2>/dev/null || true)" = "200" ]; then
+      tn_up=1
+      break
+    fi
+    sleep 0.25
+  done
+  if [ -z "$tn_up" ]; then
+    echo "::error::the host-side listener never answered on 127.0.0.1:$TN_LB_PORT"
+    echo "--- server stderr ---"; cat "$WORK/tn-hostsrv.err" 2>/dev/null || true
+    kill "$TN_LISTENER_PID" 2>/dev/null || true
+    TN_LISTENER_PID=""
+    fail
+  fi
+  echo "host listener: answers 200 on 127.0.0.1:$TN_LB_PORT"
+
+  # -- own-IP (native only): its own namespace beside the session's box ----
+  tn_own_proven=""
+  if [ -z "$E2E_VM" ]; then
+  # The session declares reach to every address: an own-address box with no
+  # egress section gets the deny-all default (NET-074), and the egress leg
+  # below needs a task that can reach example.com.
+  tn_sid="$(cd "$TN_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-tn-ownip --network own_ip --allow-subnets 0.0.0.0/0 \
+    2>"$WORK/tn-activate.err")" || {
+    echo "::error::'min session activate --network own_ip' failed for the task-network proof"
+    echo "--- stderr ---"; cat "$WORK/tn-activate.err" 2>/dev/null || true
+    kill "$TN_LISTENER_PID" 2>/dev/null || true
+    TN_LISTENER_PID=""
+    fail
+  }
+  tn_sid="$(printf '%s\n' "$tn_sid" | tail -n1 | tr -d '\r')"
+
+  # Egress, the outbound proofs' shape: two hosts, three attempts each, one
+  # answering passes (a host that fails all three is a warning, not a fail —
+  # the other host proves the box's egress).
+  tn_egress_ok=0
+  for tn_h in com org; do
+    tn_status=1
+    for tn_t in 1 2 3; do
+      mnl session run "$tn_sid" "e2e-tn-egress-$tn_h" >/dev/null 2>"$WORK/tn-egress.err"
+      tn_status=$?
+      echo "exec: min session run e2e-tn-egress-$tn_h (own-IP session, attempt $tn_t) → exit $tn_status"
+      [ "$tn_status" -eq 0 ] && break
+      if [ "$tn_t" -lt 3 ]; then
+        echo "  retrying in $((tn_t * 3))s"
+        sleep "$((tn_t * 3))"
+      fi
+    done
+    if [ "$tn_status" -eq 0 ]; then
+      tn_egress_ok=$((tn_egress_ok + 1))
+    else
+      echo "::warning::outbound from the own-IP session's task to example.$tn_h failed all 3 attempts; not fatal while the other host still proves egress"
+      cat "$WORK/tn-egress.err" 2>/dev/null || true
+    fi
+  done
+  if [ "$tn_egress_ok" -eq 0 ]; then
+    echo "::error::a task in an own-IP session completed an outbound request against no host — its egress does not work"
+    echo "--- last task stderr ---"; cat "$WORK/tn-egress.err" 2>/dev/null || true
+    mnl session destroy --force "$tn_sid" >/dev/null 2>&1 || true
+    kill "$TN_LISTENER_PID" 2>/dev/null || true
+    TN_LISTENER_PID=""
+    fail
+  fi
+  echo "own-IP session task: egress OK ($tn_egress_ok of 2 hosts answered)"
+
+  # Loopback: the listener answers on the host, and the task still cannot
+  # reach it — its 127.0.0.1 is its own namespace's loopback, where nothing
+  # listens, so curl must exit 7 (could not connect). The task's exit code is
+  # the client's (the task_run proof's exit relay), and the egress leg above
+  # already proved curl runs in this session's tasks.
+  mnl session run "$tn_sid" e2e-tn-loopback >/dev/null 2>"$WORK/tn-loopback.err"
+  rc=$?
+  if [ "$rc" -ne 7 ]; then
+    if [ "$rc" -eq 0 ]; then
+      echo "::error::a task in an own-IP session reached the host's listener at 127.0.0.1:$TN_LB_PORT — its loopback is not its own"
+    else
+      echo "::error::the own-IP session's loopback task exited $rc, want 7 (curl: could not connect) — it failed for a reason other than an empty loopback"
+      echo "--- task stderr ---"; cat "$WORK/tn-loopback.err" 2>/dev/null || true
+    fi
+    mnl session destroy --force "$tn_sid" >/dev/null 2>&1 || true
+    kill "$TN_LISTENER_PID" 2>/dev/null || true
+    TN_LISTENER_PID=""
+    fail
+  fi
+  echo "own-IP session task: 127.0.0.1:$TN_LB_PORT unreachable (exit $rc: $(head -n1 "$WORK/tn-loopback.err" 2>/dev/null || true))"
+  mnl session destroy --force "$tn_sid" >/dev/null 2>&1 || true
+
+  # -- host_ip control: the same task reaches the listener ------------------
+  # Without this the own-IP leg's exit 7 is not shown to depend on the mode:
+  # a host_ip task shares the host's namespace, so the same loopback task
+  # must reach the host-side listener and exit 0.
+  tn_host_sid="$(cd "$TN_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-tn-hostip --network host_ip 2>"$WORK/tn-host-activate.err")" || {
+    echo "::error::'min session activate --network host_ip' failed for the task-network proof"
+    echo "--- stderr ---"; cat "$WORK/tn-host-activate.err" 2>/dev/null || true
+    kill "$TN_LISTENER_PID" 2>/dev/null || true
+    TN_LISTENER_PID=""
+    fail
+  }
+  tn_host_sid="$(printf '%s\n' "$tn_host_sid" | tail -n1 | tr -d '\r')"
+  mnl session run "$tn_host_sid" e2e-tn-loopback >/dev/null 2>"$WORK/tn-host-loopback.err"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "::error::a task in a host_ip session could not reach the host's listener at 127.0.0.1:$TN_LB_PORT (exit $rc) — the own-IP refusal above is not shown to depend on the mode"
+    echo "--- task stderr ---"; cat "$WORK/tn-host-loopback.err" 2>/dev/null || true
+    mnl session destroy --force "$tn_host_sid" >/dev/null 2>&1 || true
+    kill "$TN_LISTENER_PID" 2>/dev/null || true
+    TN_LISTENER_PID=""
+    fail
+  fi
+  echo "host_ip session task: 127.0.0.1:$TN_LB_PORT reachable (exit 0)"
+  mnl session destroy --force "$tn_host_sid" >/dev/null 2>&1 || true
+  tn_own_proven=1
+  else
+    known_gap task_network_inherits_session "own-IP/host_ip task legs on a VM lane: a task self-allocates a switch address the host-side table holds no row for, so the egress gate drops its traffic (NET-085, closed by NET-138); the host listener is also unreachable from the guest"
+  fi
+
+  # -- none: the task has no network at all ----------------------------------
+  tn_none_sid="$(cd "$TN_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-tn-none --network none 2>"$WORK/tn-none-activate.err")" || {
+    echo "::error::'min session activate --network none' failed for the task-network proof"
+    echo "--- stderr ---"; cat "$WORK/tn-none-activate.err" 2>/dev/null || true
+    kill "$TN_LISTENER_PID" 2>/dev/null || true
+    TN_LISTENER_PID=""
+    fail
+  }
+  tn_none_sid="$(printf '%s\n' "$tn_none_sid" | tail -n1 | tr -d '\r')"
+  # The refusal must be the network's: curl exits 6 (could not resolve the
+  # host) or 7 (could not connect). Any other exit — 127 for a missing curl,
+  # a task that never started — is a failure of the proof, not a refusal.
+  mnl session run "$tn_none_sid" e2e-tn-egress-com >/dev/null 2>"$WORK/tn-none-egress.err"
+  rc=$?
+  if [ "$rc" -ne 6 ] && [ "$rc" -ne 7 ]; then
+    if [ "$rc" -eq 0 ]; then
+      echo "::error::a task in a none session completed an outbound request — it has no network"
+    else
+      echo "::error::the none session's egress task exited $rc, want 6 or 7 (curl: could not resolve / connect) — it failed for a reason other than having no network"
+      echo "--- task stderr ---"; cat "$WORK/tn-none-egress.err" 2>/dev/null || true
+    fi
+    mnl session destroy --force "$tn_none_sid" >/dev/null 2>&1 || true
+    kill "$TN_LISTENER_PID" 2>/dev/null || true
+    TN_LISTENER_PID=""
+    fail
+  fi
+  echo "none session task: outbound refused (exit $rc: $(head -n1 "$WORK/tn-none-egress.err" 2>/dev/null || true))"
+  mnl session destroy --force "$tn_none_sid" >/dev/null 2>&1 || true
+
+  kill "$TN_LISTENER_PID" 2>/dev/null || true
+  TN_LISTENER_PID=""
+  rm -rf "$TN_SEED_DIR"; TN_SEED_DIR=""
+  if [ -n "$tn_own_proven" ]; then
+    echo "task network proof OK (own-IP: egress via the switch, host loopback unreachable; host_ip: host loopback reachable; none: no network)"
+  else
+    echo "task network proof OK (none: no network; own-IP and host_ip legs known_gap on this VM lane)"
+  fi
+  echo "::endgroup::"
+  fi
 fi
 }
 
@@ -5746,9 +6690,7 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
 
   # on_attach and on_detach, over a REAL pty — `on_attach` writes to the
   # terminal you are attached to, and a detach is by definition something a
-  # non-interactive caller cannot perform. Answer the exit prompt with `keep`
-  # (Enter, the first option) so leaving the shell is a detach rather than a
-  # destroy.
+  # non-interactive caller cannot perform.
   #
   # This attach also proves `TERM`, and this is the only place in the lane
   # that can: the session's shell was minted HEADLESSLY, by the activation
@@ -5800,9 +6742,19 @@ __e2e_same_shell=yes' \
     echo "--- transcript ---"; printf '%s\n' "$attach_out"
     fail
   fi
-  # Keeping at the exit prompt is a detach, and the session must survive it.
-  if ! mnl ls --raw 2>/dev/null | grep -q -- "$hook_sid"; then
-    echo "::error::session gone after answering the exit prompt with 'keep'"
+  # The detach chord leaves the session running, and it must survive it.
+  # Capture-then-match, never `mnl ls --raw | grep -q`: grep's early exit
+  # SIGPIPEs the CLI under pipefail, and a failed listing would read as a
+  # gone session. On a miss, print what the listing said and its stderr so
+  # a failed `min ls` is told apart from a session that is truly gone.
+  hook_ls_status=0
+  hook_ls="$(mnl ls --raw 2>"$WORK/hooks-ls.err")" || hook_ls_status=$?
+  if ! printf '%s\n' "$hook_ls" | grep -Fq -- "$hook_sid"; then
+    echo "::error::session gone after the detach chord"
+    echo "--- min ls --raw (exit $hook_ls_status) ---"; printf '%s\n' "$hook_ls"
+    echo "--- min ls --raw stderr ---"; cat "$WORK/hooks-ls.err" 2>/dev/null || true
+    echo "--- attach transcript ---"; printf '%s\n' "$attach_out"
+    echo "--- attach stderr ---"; cat "$WORK/hooks-attach.err" 2>/dev/null || true
     fail
   fi
   # `on_detach` is headless (the terminal it would have used is the thing
@@ -5838,7 +6790,7 @@ __e2e_same_shell=yes' \
   # shellcheck disable=SC2016 # `$TERM` must reach the SESSION's shell unexpanded.
   reattach_out="$(E2E_PTY_COMMANDS='echo TERM_INSHELL=$TERM
 echo SHELLMARK=[$__e2e_same_shell]
-exit' E2E_PTY_ANSWER=keep TERM=vt220 python3 "$ROOT/scripts/e2e-attach-pty.py" - \
+exit' TERM=vt220 python3 "$ROOT/scripts/e2e-attach-pty.py" - \
     min ${E2E_MINIMAL_ARGS:-} session attach "$hook_sid" \
     2>"$WORK/hooks-reattach.err")" || {
     echo "::error::pty re-attach for the TERM proof failed"
@@ -5859,6 +6811,8 @@ exit' E2E_PTY_ANSWER=keep TERM=vt220 python3 "$ROOT/scripts/e2e-attach-pty.py" -
     fail
   fi
   echo "re-attach from a different terminal updated TERM in the same shell OK"
+  # The re-attach's `exit` ended the box with its shell (BOX-038).
+  assert_box_exited "$hook_sid" 0 "hooks re-attach"
 
   # on_destroy. The session's filesystem goes with it, so the evidence is the
   # daemon log — and the failing hook must not have blocked the teardown.
@@ -6186,15 +7140,11 @@ exit' python3 "$ROOT/scripts/e2e-attach-pty.py" - \
     fail
   fi
   echo "declared shell OK (SHELL=/usr/bin/sh started sh, not bash)"
-  # The driver's "Delete" at the exit prompt is not this proof's teardown: the
-  # daemon hands a shell's exit to the attached binding best-effort (a
-  # non-blocking send it drops when the binding's queue is full — "could not
-  # hand the teardown to the binding; no shell-exit prompt will render"), and
-  # this shell exits within milliseconds of starting. When the hand-off drops,
-  # no prompt renders, the attach still ends cleanly, and the session survives
-  # to block the unforced `min stop` below. Destroy it explicitly; a no-op when
-  # the prompt already did.
-  mnl session destroy --force "$sh_sid" >/dev/null 2>&1 || true
+  # The `exit` ended the box with its shell (BOX-038): it stays listed as
+  # exited until the destroy, so the unforced `min stop` below finds no
+  # running box.
+  assert_box_exited "$sh_sid" 0 "declared shell"
+  destroy_box_and_assert_gone "$sh_sid" "$sh_sid" "declared shell"
 
   # The fallback: a shell that isn't installed leaves bash running AND tells
   # the user why, on the terminal, before the first prompt.
@@ -6224,8 +7174,9 @@ exit' python3 "$ROOT/scripts/e2e-attach-pty.py" - \
     echo "--- transcript ---"; printf '%s\n' "$miss_out"
     fail
   fi
-  # Same best-effort prompt as above; same explicit teardown.
-  mnl session destroy --force "$miss_sid" >/dev/null 2>&1 || true
+  # The same end with the shell, and the same destroy, as above.
+  assert_box_exited "$miss_sid" 0 "shell fallback"
+  destroy_box_and_assert_gone "$miss_sid" "$miss_sid" "shell fallback"
   rm -rf "$HOOK_SEED_DIR"; HOOK_SEED_DIR=""
   rm -f "$XDG_CONFIG_HOME/minimal/loadouts/shelldev.toml"
   rm -f "$XDG_CONFIG_HOME/minimal/loadouts/shellmissing.toml"
@@ -6282,9 +7233,10 @@ exit' python3 "$ROOT/scripts/e2e-attach-pty.py" - \
     echo "--- transcript ---"; printf '%s\n' "$rc_out"
     fail
   fi
-  # Same best-effort exit prompt as the shell proofs above; same explicit
-  # teardown.
-  mnl session destroy --force "$rc_sid" >/dev/null 2>&1 || true
+  # The same end with the shell, and the same destroy, as the shell proofs
+  # above.
+  assert_box_exited "$rc_sid" 0 "patched .bashrc"
+  destroy_box_and_assert_gone "$rc_sid" "$rc_sid" "patched .bashrc"
   rm -rf "$HOOK_SEED_DIR"; HOOK_SEED_DIR=""
   rm -rf "$PATCH_SRC_DIR"; PATCH_SRC_DIR=""
   rm -f "$XDG_CONFIG_HOME/minimal/loadouts/bashrcdev.toml"
@@ -6360,14 +7312,16 @@ echo "::endgroup::"
 #   1. a resize while attached is what `stty size` reports in the session,
 #      then the detach chord detaches,
 #   2. a re-attach finds the session, a large paste arrives intact and in
-#      order (checksummed on both sides), and the session-exit prompt still
-#      answers ("keep"),
-#   3. killing the ssh transport mid-attach (the `min proxy` ProxyCommand,
+#      order (checksummed on both sides), and the shell's `exit` ends the box,
+#      which stays listed as exited (BOX-038),
+#   3. a re-attach resumes the exited box, and killing the ssh transport
+#      mid-attach (the `min proxy` ProxyCommand,
 #      as a dropped connection) exits 255 and leaves the terminal's termios
 #      (its `stty -g`) exactly as it was before the attach,
-#   4. the session outlives the drop, and the exit prompt answers "Delete".
+#   4. the session outlives the drop, its shell's `exit` ends the box as
+#      exited, and `min session destroy` then removes it.
 proof_tty_relay() {
-echo "::group::terminal relay (resize, paste, detach + re-attach, transport drop, exit prompt)"
+echo "::group::terminal relay (resize, paste, detach + re-attach, transport drop, shell exit)"
 local relay_sid relay_out relay_paste relay_sum
 # shellcheck disable=SC2086
 relay_sid="$(cd "$PROJECT_DIR" && mnl session activate . --name e2e-relay ${E2E_ACTIVATE_ARGS:-} 2>"$WORK/relay-activate.err")" || {
@@ -6413,7 +7367,7 @@ relay_sum="$(cksum <"$relay_paste" | tr -s ' ')"
 # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
 relay_out="$(E2E_PTY_COMMANDS='cat > /home/relay-paste' E2E_PTY_PASTE_FILE="$relay_paste" \
   E2E_PTY_AFTER="$(printf '\004')"'printf "PASTE_SUM[%s]\n" "$(cksum < /home/relay-paste | tr -s " ")"
-exit' E2E_PTY_ANSWER=keep \
+exit' \
   python3 "$ROOT/scripts/e2e-attach-pty.py" - \
   min ${E2E_MINIMAL_ARGS:-} session attach "$relay_sid" 2>"$WORK/relay-paste.err")" || {
   echo "::error::the paste attach through the relay failed"
@@ -6426,13 +7380,11 @@ if [[ "$relay_out" != *"PASTE_SUM[$relay_sum]"* ]]; then
   echo "--- transcript (tail) ---"; printf '%s\n' "$relay_out" | tail -n 40
   fail
 fi
-if ! mnl ls --raw 2>/dev/null | grep -Fqx "$relay_sid"; then
-  echo "::error::the session is gone after answering the exit prompt with 'keep'"
-  fail
-fi
-echo "re-attach found the session; a $(wc -c <"$relay_paste" | tr -d ' ')-byte paste arrived intact; the exit prompt answered"
+assert_box_exited "$relay_sid" 0 "terminal relay paste"
+echo "re-attach found the session; a $(wc -c <"$relay_paste" | tr -d ' ')-byte paste arrived intact; the shell's exit ended the box"
 
-# 3. Kill the transport mid-attach.
+# 3. Re-attach, which resumes the exited box, and kill the transport
+# mid-attach.
 # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
 relay_out="$(E2E_PTY_COMMANDS='echo RELAY_BEFORE_DROP' E2E_PTY_KILL_TRANSPORT=1 E2E_PTY_EXPECT_EXIT=255 \
   python3 "$ROOT/scripts/e2e-attach-pty.py" - \
@@ -6449,7 +7401,8 @@ if [[ "$relay_out" != *OUTER_STTY_UNCHANGED* ]]; then
 fi
 echo "a dropped transport exited 255 and left the terminal's stty -g unchanged"
 
-# 4. The session outlived the drop; leave it through the exit prompt.
+# 4. The session outlived the drop. Its shell's `exit` ends the box, and the
+# destroy removes it.
 # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
 relay_out="$(E2E_PTY_COMMANDS='echo RELAY_AFTER_DROP
 exit' python3 "$ROOT/scripts/e2e-attach-pty.py" - \
@@ -6459,10 +7412,8 @@ exit' python3 "$ROOT/scripts/e2e-attach-pty.py" - \
   echo "--- stderr ---"; cat "$WORK/relay-exit.err" 2>/dev/null || true
   fail
 }
-if mnl ls --raw 2>/dev/null | grep -Fqx "$relay_sid"; then
-  echo "::error::session $relay_sid still listed after answering 'Delete' at the exit prompt"
-  fail
-fi
+assert_box_exited "$relay_sid" 0 "terminal relay after the drop"
+destroy_box_and_assert_gone e2e-relay "$relay_sid" "terminal relay after the drop"
 echo "terminal relay OK"
 echo "::endgroup::"
 }
@@ -6471,16 +7422,15 @@ echo "::endgroup::"
 # Session-sandbox proof (every lane). Everything above proves the lifecycle;
 # this forks a real sandbox and proves the in-sandbox `min add`. A session is
 # interactive by design, so we drive it like a real user through a REAL pty
-# (scripts/e2e-attach-pty.py), NOT a pipe — a pipe is not a tty and cannot
-# answer the session-exit prompt. The driver:
+# (scripts/e2e-attach-pty.py), NOT a pipe — a pipe is not a tty. The driver:
 #   1. records that $ADD_TOOL is ABSENT before the add (a baseline tool would
 #      already be present, so the add would prove nothing),
 #   2. `min add`s it into this session,
 #   3. `hash -r` so bash re-scans PATH for the freshly hardlinked binary,
 #   4. runs it — its version banner round-tripping proves it is now runnable,
-#   5. `exit`s, then answers the Detach/Delete prompt with keystrokes (Down +
-#      Enter => "Delete"), the genuine interactive teardown — which destroys the
-#      session, so it must then be delisted.
+#   5. `exit`s, which ends the box with its shell (BOX-038). No prompt asks,
+#      and the box stays listed as exited until `min session destroy` removes
+#      it, which must then delist it.
 proof_sandbox() {
 echo "::group::sandbox proof (interactive attach via pty: min add $ADD_TOOL + run)"
 proof_shared_session
@@ -6515,6 +7465,16 @@ if [[ "$attach_out" != *"$ADD_TOOL_MARKER"* ]]; then
   echo "--- driver stderr ---"; cat "$WORK/exec.err" 2>/dev/null || true
   fail
 fi
+# The shared session's box runs on the default network mode, which registers
+# no row with the VM host daemon, so the attach must not have tried to
+# subscribe to its port prompts and then warned that it could not. The
+# warning goes to the attach's terminal, which is the pty this transcript
+# was read from.
+if [[ "$attach_out" == *"will not show port prompts for box"* ]]; then
+  echo "::error::attach warned about port prompts for a box that registered no row"
+  echo "--- attach output ---"; printf '%s\n' "$attach_out"
+  fail
+fi
 # Orientation banner: the first interactive prompt must have printed the
 # two orientation lines, with the ACTUAL session name and loadout list
 # interpolated in-shell from the $MINIMAL_* vars (daemon baseline +
@@ -6543,13 +7503,11 @@ fi
 echo "sandbox proof: in-sandbox 'min add $ADD_TOOL' + run OK, orientation banner rendered ($((t1 - t0))ms)"
 echo "::endgroup::"
 
-# We answered the exit prompt with "Delete", so the session was destroyed and
-# must have dropped out of the listing — this doubles as the interactive
-# delete/lifecycle-teardown proof.
-if mnl ls --raw 2>/dev/null | grep -Fqx "$sid"; then
-  echo "::error::session $sid still listed after answering 'Delete' at the exit prompt"
-  fail
-fi
+# The shell's `exit` ended the box, which stays listed as exited. The
+# destroy must then drop it from the listing — this doubles as the
+# lifecycle-teardown proof.
+assert_box_exited "$sid" 0 "sandbox proof"
+destroy_box_and_assert_gone "$sid" "$sid" "sandbox proof"
 }
 
 # ---------------------------------------------------------------------------
@@ -6657,11 +7615,11 @@ fi
 # Native host-OS resolution of a box name, with no proxy settings anywhere
 # (NET-009, with the client halves of NET-122 and NET-123).
 #
-# The session-start advisory (NET-122) must print on a host whose resolver is
-# not configured for the zone, and name the EXACT command that points it at
-# the daemon's zone answerer — this case runs the text it printed, verbatim,
-# not a reconstruction of it, so what the user would have copied is what is
-# proved. And session start must never prompt: this case drives `min session
+# `min finalize-install --show --script` (NET-122) must print, on a host whose resolver is
+# not configured for the zone, the EXACT script that points it at the
+# daemon's zone answerer — this case runs the file it printed, under one
+# `sudo sh`, not a reconstruction of it, so what `min finalize-install` would run is
+# what is proved. And session start must never prompt: this case drives `min session
 # activate` from a script with no answers to give, so the activate completing
 # at all is half the proof. The other half, where this host can run it: after
 # the command, a plain `getent hosts` — any process, through the host's
@@ -6701,15 +7659,15 @@ fi
 #     the quiet was right.
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# NET-123's macOS half: the advisory's one privileged command installs the
-# boot-time unit that reserves the local range (design §7.1) — the same
-# `sudo sh -c` that writes the resolver file, so both halves of the host's
-# configuration land in one elevation, never two commands the user runs
-# separately.
+# NET-123's macOS half: the one privileged script `min finalize-install` runs
+# installs the boot-time unit that reserves the local range (design §7.1) —
+# the same script that writes the resolver file, so both halves of the
+# host's configuration land in one elevation, never two commands the user
+# runs separately.
 #
-# The proof runs the exact command the advisory printed — the bytes a user
-# would have copied off the terminal, including the two files' bodies riding
-# inside it as quoted heredocs — and then asserts what the spec promises:
+# The proof runs the exact script `min finalize-install --show --script` printed — the
+# bytes `min finalize-install` runs under `sudo sh`, including the two files'
+# bodies riding inside it as quoted heredocs — and then asserts what the spec promises:
 # both files root-owned at their exact modes, the plist's ProgramArguments
 # naming the root-owned program, the whole reserved range present on this
 # host's lo0, a session started afterwards with no advisory and no interim
@@ -6751,6 +7709,11 @@ proof_local_range_reserved_by_privileged_step() {
   RANGE_LABEL="dev.minimal.local-range"
   RANGE_PROGRAM_PATH="/Library/PrivilegedHelperTools/$RANGE_LABEL"
   RANGE_PLIST_PATH="/Library/LaunchDaemons/$RANGE_LABEL.plist"
+  # Where the step installs the answerer's app bundle (a `min` with a
+  # bundled minzoned beside it or on PATH, as a release ships it), the
+  # range unit runs the bundle's program with the range verb instead of
+  # the script at RANGE_PROGRAM_PATH, and the script removes that file.
+  RANGE_BUNDLE_PROGRAM="/Library/PrivilegedHelperTools/Minimal.app/Contents/MacOS/minzoned"
   RANGE_NAME="e2e-local-range"
 
   # A prior run killed past its own EXIT trap (a SIGKILL'd runner) can leave
@@ -6766,8 +7729,9 @@ proof_local_range_reserved_by_privileged_step() {
     echo "removing a leftover range unit from a prior run, so this proof starts from the advisory's own premise"
     range_remove_unit
   fi
-  if [ -e /Library/LaunchDaemons/dev.minimal.zone-answerer.plist ] \
-     || [ -e /Library/PrivilegedHelperTools/dev.minimal.zone-answerer ]; then
+  if [ -e /Library/LaunchDaemons/dev.gominimal.zone.plist ] \
+     || [ -e /Library/PrivilegedHelperTools/Minimal.app ] \
+     || [ -e /Library/PrivilegedHelperTools/minzoned ]; then
     echo "removing a leftover answerer service from a prior run, for the same reason"
     ANSWERER_SERVICE_CHANNEL="${ANSWERER_SERVICE_CHANNEL:-/nonexistent}"
     answerer_service_teardown
@@ -6783,13 +7747,13 @@ proof_local_range_reserved_by_privileged_step() {
   range_port=""
   for _ in $(seq 1 40); do
     range_port="$(mnl ls 2>/dev/null \
-      | sed -n 's/^ZONE ANSWERER: *listening on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' \
+      | sed -n 's/^DNS SERVICE: *listening on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' \
       | head -n1)"
     [ -n "$range_port" ] && break
     sleep 0.25
   done
   if [ -z "$range_port" ]; then
-    echo "::error::the daemon's zone answerer never came up (no ZONE ANSWERER line in min ls)"
+    echo "::error::the daemon's zone answerer never came up (no DNS SERVICE line in min ls)"
     fail
   fi
 
@@ -6804,26 +7768,53 @@ proof_local_range_reserved_by_privileged_step() {
     fail
   }
   echo "activated $RANGE_NAME ($(printf '%s' "$range_sid" | tail -n1 | tr -d '\r')); answerer on 127.0.0.1:$range_port"
+  # A session start prints no advisory (host DNS is opt-in, NET-122); the
+  # setup script is what `min finalize-install --show --script` prints on stdout, from the
+  # same host reads, with its note on stderr.
+  range_setup="$WORK/range-finalize-install.out"
+  mnl finalize-install --show --script >"$range_setup" 2>"$range_setup.note" || true
 
-  # The command the advisory named, exactly as a user would have copied it:
-  # on macOS it spans several lines, because the two files' bytes ride
-  # inside it as quoted heredocs, so the extraction runs from the
-  # de-indented `sudo` line to the closing quote.
-  range_cmd="$(awk -v lead="Configure the host's resolver, reserve the local range, and install the box-zone answerer service with:" -v q="'" '
-    index($0, lead) > 0 { started = 1; next }
-    started && !first { sub(/^  /, ""); first = 1 }
-    started { print; if (substr($0, length($0), 1) == q) exit }
-  ' "$range_err")"
+  # The script `min finalize-install` runs, exactly as `--show --script` wrote
+  # it: the two files' bytes ride inside it as quoted heredocs, and its header
+  # names the names item it finishes — on macOS the resolver and the local
+  # range together, each step under its own comment.
+  range_cmd="$(setup_script_from "$range_setup")"
   case "$range_cmd" in
-    "sudo sh -c '"*) ;;
+    '#!/bin/sh'*) ;;
     *)
-      echo "::error::no range-reserving advisory on the activate's stderr (got: '$range_cmd')"
-      echo "  (the lead-in must say the command configures the resolver and reserves the range)"
+      echo "::error::no setup script from 'min finalize-install --show --script' (got: '$range_cmd')"
       echo "--- activate stderr ---"; cat "$range_err" 2>/dev/null || true
+      echo "--- min finalize-install --show --script ---"; cat "$range_setup" "$range_setup.note" 2>/dev/null || true
       fail
       ;;
   esac
-  # The command the lead-in promised: one elevation for the resolver and the
+  if ! printf '%s\n' "$range_cmd" | sed -n 2p | grep -qF -- "# Finish the Minimal install on this host: DNS names for boxes (<box>.min.internal) in every program on this machine"; then
+    echo "::error::the setup script's header does not name the names item it finishes"
+    echo "--- script (first lines) ---"; printf '%s\n' "$range_cmd" | sed -n '1,4p'
+    fail
+  fi
+  if ! printf '%s\n' "$range_cmd" | grep -qF -- "# The resolver: " || ! printf '%s\n' "$range_cmd" | grep -qF -- "# The local range: "; then
+    echo "::error::the setup script does not carry both the resolver step and the local-range step"
+    echo "--- script (first lines) ---"; printf '%s\n' "$range_cmd" | sed -n '1,12p'
+    fail
+  fi
+  # The program the range unit runs, read off the range plist the script
+  # carries (its heredoc alone: the answerer's own plist names the bundle's
+  # program in both shapes): the bundle's program when the script installs
+  # the bundle, else the script it writes to RANGE_PROGRAM_PATH.
+  if printf '%s\n' "$range_cmd" \
+       | awk -v start="cat > $RANGE_PLIST_PATH <<" '
+           index($0, start) == 1 { inside = 1; next }
+           inside && /^MINIMAL_RANGE_PLIST_EOF$/ { inside = 0 }
+           inside { print }' \
+       | grep -qF -- "<string>$RANGE_BUNDLE_PROGRAM</string>"; then
+    RANGE_UNIT_PROGRAM="$RANGE_BUNDLE_PROGRAM"
+    echo "the range unit runs the answerer bundle's program ($RANGE_UNIT_PROGRAM)"
+  else
+    RANGE_UNIT_PROGRAM="$RANGE_PROGRAM_PATH"
+    echo "the range unit runs the script it installs ($RANGE_UNIT_PROGRAM)"
+  fi
+  # The script the header promised: one elevation for the resolver and the
   # range together, carrying both files' bytes and the boot step.
   case "$range_cmd" in
     *"$RANGE_PROGRAM_PATH"*) ;;
@@ -6857,10 +7848,11 @@ proof_local_range_reserved_by_privileged_step() {
       fail
       ;;
   esac
-  range_sudos="$(printf '%s\n' "$range_cmd" | grep -c -- sudo)"
-  if [ "$range_sudos" != 1 ]; then
-    echo "::error::the command is not one privilege elevation ($range_sudos 'sudo's) — the user must never run two commands"
-    echo "--- command ---"; printf '%s\n' "$range_cmd"
+  # One elevation: the user runs the script under one sudo, so no statement
+  # in it elevates again (the header's comment names the sudo it runs under).
+  if setup_script_elevates "$range_cmd"; then
+    echo "::error::the setup script elevates on its own — the user must never be asked twice"
+    echo "--- script ---"; printf '%s\n' "$range_cmd"
     fail
   fi
 
@@ -6880,7 +7872,8 @@ proof_local_range_reserved_by_privileged_step() {
     echo "--- command (first and last lines) ---"; printf '%s\n' "$range_cmd" | sed -n '1p;$p'
     fail
   fi
-  if ! sh -c "$range_cmd" >"$WORK/range-cmd.out" 2>"$WORK/range-cmd.err"; then
+  # shellcheck disable=SC2024 # the output files are this user's, not root's
+  if ! sudo -n sh "$range_setup" >"$WORK/range-cmd.out" 2>"$WORK/range-cmd.err"; then
     echo "::error::the advisory's command did not run"
     echo "--- command (first and last lines) ---"
     printf '%s\n' "$range_cmd" | sed -n '1p;$p'
@@ -6892,7 +7885,7 @@ proof_local_range_reserved_by_privileged_step() {
   # Custody, the facts the CLI's own detection checks: both files root-owned
   # at their exact modes, the directories the command made root's, and the
   # plist naming the root-owned program.
-  range_prog_stat="$(stat -f '%u %Lp' "$RANGE_PROGRAM_PATH" 2>/dev/null || true)"
+  range_prog_stat="$(stat -f '%u %Lp' "$RANGE_UNIT_PROGRAM" 2>/dev/null || true)"
   range_plist_stat="$(stat -f '%u %Lp' "$RANGE_PLIST_PATH" 2>/dev/null || true)"
   if [ "$range_prog_stat" != "0 755" ] || [ "$range_plist_stat" != "0 644" ]; then
     echo "::error::the range unit's files are not root-owned at their modes (program: '$range_prog_stat', plist: '$range_plist_stat')"
@@ -6908,9 +7901,20 @@ proof_local_range_reserved_by_privileged_step() {
     esac
   done
   range_plist_prog="$(plutil -extract ProgramArguments.0 raw -o - "$RANGE_PLIST_PATH" 2>/dev/null || true)"
-  if [ "$range_plist_prog" != "$RANGE_PROGRAM_PATH" ]; then
-    echo "::error::the plist does not name the root-owned program (ProgramArguments[0]: '$range_plist_prog')"
+  if [ "$range_plist_prog" != "$RANGE_UNIT_PROGRAM" ]; then
+    echo "::error::the plist does not name the root-owned program $RANGE_UNIT_PROGRAM (ProgramArguments[0]: '$range_plist_prog')"
     fail
+  fi
+  if [ "$RANGE_UNIT_PROGRAM" = "$RANGE_BUNDLE_PROGRAM" ]; then
+    range_plist_verb="$(plutil -extract ProgramArguments.1 raw -o - "$RANGE_PLIST_PATH" 2>/dev/null || true)"
+    if [ "$range_plist_verb" != reserve-local-range ]; then
+      echo "::error::the plist does not run the bundle's program with the range verb (ProgramArguments[1]: '$range_plist_verb')"
+      fail
+    fi
+    if [ -e "$RANGE_PROGRAM_PATH" ]; then
+      echo "::error::the range script $RANGE_PROGRAM_PATH is still on the host, though the unit runs the bundle's program"
+      fail
+    fi
   fi
   echo "custody holds: both files root-owned at 0755/0644, the plist runs the root-owned program"
 
@@ -6951,8 +7955,10 @@ proof_local_range_reserved_by_privileged_step() {
     echo "--- second activate stderr ---"; cat "$range2_err" 2>/dev/null || true
     fail
   fi
-  if ! grep -q -- 'native DNS is the live name surface' "$range2_err"; then
-    echo "::error::a session started after the range step does not read native DNS as its live surface (the host probe must read present)"
+  # The range is present and the box is off the interim, so its ports
+  # answer at its own address: the host line reads the own-address form.
+  if ! grep -qF -- "names: $RANGE_NAME-2.min.internal opens at its name on this machine" "$range2_err"; then
+    echo "::error::a session started after the range step does not say its box opens at its name on this machine (the host probe must read present, and the box must be off the 127.0.0.1 interim)"
     echo "--- second activate stderr ---"; cat "$range2_err" 2>/dev/null || true
     fail
   fi
@@ -6968,7 +7974,7 @@ proof_local_range_reserved_by_privileged_step() {
     launchctl print "system/$RANGE_LABEL" 2>&1 || true
     fail
   fi
-  if ! printf '%s' "$range_print" | grep -q -- "program = $RANGE_PROGRAM_PATH"; then
+  if ! printf '%s' "$range_print" | grep -q -- "program = $RANGE_UNIT_PROGRAM"; then
     echo "::error::the loaded job does not name the root-owned program (launchctl print:)"
     printf '%s\n' "$range_print" | head -40
     fail
@@ -7002,7 +8008,8 @@ proof_local_range_reserved_by_privileged_step() {
   # addresses lo0 already carries rather than re-adding them: a re-run adds
   # only the missing aliases and removes nothing. (The command boots out
   # the prior load first, its guarded half, then bootstraps the unit again.)
-  if ! sh -c "$range_cmd" >"$WORK/range-cmd2.out" 2>"$WORK/range-cmd2.err"; then
+  # shellcheck disable=SC2024 # the output files are this user's, not root's
+  if ! sudo -n sh "$range_setup" >"$WORK/range-cmd2.out" 2>"$WORK/range-cmd2.err"; then
     echo "::error::the advisory's command failed on its re-run over the aliases it had already applied"
     echo "--- command (first and last lines) ---"
     printf '%s\n' "$range_cmd" | sed -n '1p;$p'
@@ -7109,19 +8116,23 @@ range_teardown_unit() {
 answerer_service_teardown() {
   [ -n "${ANSWERER_SERVICE_CHANNEL:-}" ] || return 0
   if [ "$(uname -s)" = Darwin ]; then
-    sudo -n launchctl bootout "system/dev.minimal.zone-answerer" >/dev/null 2>&1 || true
-    sudo -n rm -f "/Library/LaunchDaemons/dev.minimal.zone-answerer.plist" \
-      "/Library/PrivilegedHelperTools/dev.minimal.zone-answerer" >/dev/null 2>&1 || true
+    sudo -n launchctl bootout "system/dev.gominimal.zone" >/dev/null 2>&1 || true
+    # The program copy sits in an app bundle; the bare path is where an
+    # install from before the bundle put it.
+    sudo -n rm -f "/Library/LaunchDaemons/dev.gominimal.zone.plist" \
+      "/Library/PrivilegedHelperTools/minzoned" >/dev/null 2>&1 || true
+    sudo -n rm -rf "/Library/PrivilegedHelperTools/Minimal.app" \
+      "/Library/PrivilegedHelperTools/Minimal.app.old" >/dev/null 2>&1 || true
   else
-    sudo -n systemctl disable --now dev.minimal.zone-answerer.socket \
-      dev.minimal.zone-answerer.service >/dev/null 2>&1 || true
-    sudo -n rm -f /etc/systemd/system/dev.minimal.zone-answerer.socket \
-      /etc/systemd/system/dev.minimal.zone-answerer.service \
-      /usr/local/lib/minimal/dev.minimal.zone-answerer >/dev/null 2>&1 || true
+    sudo -n systemctl disable --now minzoned.socket \
+      minzoned.service >/dev/null 2>&1 || true
+    sudo -n rm -f /etc/systemd/system/minzoned.socket \
+      /etc/systemd/system/minzoned.service \
+      /usr/local/lib/minimal/minzoned >/dev/null 2>&1 || true
     sudo -n rmdir /usr/local/lib/minimal >/dev/null 2>&1 || true
     sudo -n systemctl daemon-reload >/dev/null 2>&1 || true
-    sudo -n systemctl reset-failed dev.minimal.zone-answerer.socket \
-      dev.minimal.zone-answerer.service >/dev/null 2>&1 || true
+    sudo -n systemctl reset-failed minzoned.socket \
+      minzoned.service >/dev/null 2>&1 || true
   fi
   sudo -n rm -f "$ANSWERER_SERVICE_CHANNEL" >/dev/null 2>&1 || true
   # And the directory it sat in, when the command made it and it is now
@@ -7143,24 +8154,91 @@ answerer_channel_of() {
     -e 's/^[[:space:]]*<string>\(\/.*\/answerer\.sock\)<\/string>$/\1/p' | head -n1
 }
 
-# The command the advisory named, whole, as a user would copy it: from the
-# line after the lead-in (de-indented) to the line that closes the quote the
-# command opened (`sudo sh -c "` on Linux, `sudo sh -c '` on macOS). The
-# command spans several lines on both platforms, because the unit files'
-# bytes ride inside it as quoted heredocs, so the first line alone is a
-# command with an unterminated quote. $1: the stderr file. $2: the lead-in.
-advisory_command_from() {
-  awk -v lead="$2" '
-    !started && index($0, lead) > 0 { started = 1; next }
-    started && !first {
-      sub(/^  /, ""); first = 1
-      q = substr($0, length("sudo sh -c ") + 1, 1)
-      print
-      if (length($0) > length("sudo sh -c ") + 1 && substr($0, length($0), 1) == q) exit
-      next
-    }
-    started { print; if (substr($0, length($0), 1) == q) exit }
-  ' "$1" 2>/dev/null
+# Called on the setup script file $1 just before a case runs it as root:
+# records that the run is about to install the classifier, when the script
+# carries the classifier's block (its ownership-record line) and this host
+# has no classifier yet. A host that already carries one — its tree, or the
+# record of an earlier install — is the host's own: the block only refreshes
+# it, and nothing here removes it afterwards.
+setup_classifier_note() {
+  grep -q '^: > /var/lib/minimal/finalize-install-classifier$' "$1" 2>/dev/null || return 0
+  if [ -e /sys/fs/cgroup/minimald.slice ] \
+     || [ -e /var/lib/minimal/finalize-install-classifier ]; then
+    return 0
+  fi
+  SETUP_CLASSIFIER_INSTALLED=1
+}
+
+# Prints what the manager recorded for the units a setup script installs. A
+# failed `systemctl start` says only that the unit failed; the reason is in
+# the unit's journal, which this run's own output never carries.
+setup_units_journal() {
+  command -v journalctl >/dev/null 2>&1 || return 0
+  for unit in minimald-classifier.service minimald-place.path minimald-place.service; do
+    echo "--- journal: $unit ---"
+    sudo -n journalctl --no-pager -n 40 -u "$unit" 2>&1 || true
+  done
+}
+
+# Removes the classifier install a setup script made (see
+# SETUP_CLASSIFIER_INSTALLED): the cases that run the script are about names,
+# and the two classifier proofs later in the lane install their own and refuse
+# a host that already carries one, so the host must be as the case found it.
+# The order is the installer's: the daemon stops first (the path unit placed
+# it in the tree's daemon leaf, and the uninstall refuses while a process or
+# a live leaf holds the tree), the units go before the tree so no later
+# daemon start is placed and no boot re-installs it, then the step's own
+# --uninstall, then the files the block wrote. A no-op until a case recorded
+# an install. Returns non-zero when the tree is still there.
+setup_classifier_teardown() {
+  [ -n "${SETUP_CLASSIFIER_INSTALLED:-}" ] || return 0
+  mnl stop --force >/dev/null 2>&1 || true
+  sudo -n systemctl disable --now minimald-place.path minimald-place.service \
+    minimald-classifier.service >/dev/null 2>&1 || true
+  # A box's leaf can outlive the stop by a moment; the uninstall is retried
+  # over a bounded wait rather than failed on the first refusal.
+  for _ in $(seq 1 20); do
+    [ -e /sys/fs/cgroup/minimald.slice ] || break
+    sudo -n "$ROOT/scripts/install-host-classifier.sh" --uninstall >/dev/null 2>&1 && break
+    sleep 0.5
+  done
+  sudo -n rm -f /etc/systemd/system/minimald-place.path \
+    /etc/systemd/system/minimald-place.service \
+    /etc/systemd/system/minimald-classifier.service \
+    /usr/local/lib/minimal/install-host-classifier.sh \
+    /usr/local/lib/minimal/install-host-classifier.sh.new >/dev/null 2>&1 || true
+  sudo -n rmdir /usr/local/lib/minimal >/dev/null 2>&1 || true
+  sudo -n systemctl daemon-reload >/dev/null 2>&1 || true
+  sudo -n systemctl reset-failed minimald-place.path minimald-place.service \
+    minimald-classifier.service >/dev/null 2>&1 || true
+  if [ -e /sys/fs/cgroup/minimald.slice ]; then
+    return 1
+  fi
+  sudo -n rm -f /var/lib/minimal/finalize-install-classifier >/dev/null 2>&1 || true
+  SETUP_CLASSIFIER_INSTALLED=""
+}
+
+# Whether a setup script elevates on its own: `sudo` in command position on
+# a line that is not a comment. A hint inside a quoted message ("try: sudo
+# ...") is text, not an elevation. awk reads its whole input, so no early
+# exit can break the pipe; under `pipefail` a broken pipe would read as "no
+# sudo" and pass a script that elevates.
+setup_script_elevates() {
+  printf '%s\n' "$1" | awk '
+    /^[[:space:]]*#/ { next }
+    /(^|[;&|({`!]|(^|[^[:alnum:]_])(then|do|else|if|elif|while|until|time))[[:space:]]*sudo([[:space:]]|$)/ { found = 1 }
+    END { exit !found }'
+}
+
+# The setup script `min finalize-install --show --script` wrote to $1 (its stdout), whole,
+# when that is a script — its first line `#!/bin/sh` — and nothing otherwise
+# (a host with nothing to run, or a blocker, prints only its note on
+# stderr). The proof runs this file with one `sudo -n sh`, the way
+# `min finalize-install` itself runs it.
+setup_script_from() {
+  if [ "$(head -n1 "$1" 2>/dev/null)" = '#!/bin/sh' ]; then
+    cat "$1"
+  fi
 }
 
 # Wait for the range unit to finish the run its `bootstrap` started, before
@@ -7243,7 +8321,7 @@ proof_native_resolution_without_proxy_env() {
   native_port=""
   for _ in $(seq 1 40); do
     native_port="$(mnl ls 2>/dev/null \
-      | sed -n 's/^ZONE ANSWERER: *listening on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' \
+      | sed -n 's/^DNS SERVICE: *listening on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' \
       | head -n1)"
     [ -n "$native_port" ] && break
     sleep 0.25
@@ -7257,7 +8335,7 @@ proof_native_resolution_without_proxy_env() {
       echo "::endgroup::"
       return 0
     fi
-    echo "::error::the daemon's zone answerer never came up (no ZONE ANSWERER line in min ls)"
+    echo "::error::the daemon's zone answerer never came up (no DNS SERVICE line in min ls)"
     fail
   fi
 
@@ -7272,15 +8350,15 @@ proof_native_resolution_without_proxy_env() {
   }
   native_sid="$(printf '%s\n' "$native_sid" | tail -n1 | tr -d '\r')"
   echo "activated $NATIVE_NAME ($native_sid); answerer on 127.0.0.1:$native_port"
+  # A session start prints no advisory (host DNS is opt-in, NET-122); the
+  # setup script is what `min finalize-install --show --script` prints on stdout, from the
+  # same host reads, with its note on stderr.
+  native_setup="$WORK/native-finalize-install.out"
+  mnl finalize-install --show --script >"$native_setup" 2>"$native_setup.note" || true
 
-  # The command the advisory named: the line after its lead-in, de-indented —
-  # exactly what a user would have copied off the terminal. The lead-in's
-  # shared prefix matches both platforms' wording ("…and install the box-zone
-  # answerer service with:" on Linux, "…reserve the local range, and install
-  # the box-zone answerer service with:" on macOS, whose command
-  # carries the range step NET-123 folds into it); the range-reserving case
-  # below extracts the multi-line command whole.
-  native_cmd="$(advisory_command_from "$native_err" "Configure the host's resolver")"
+  # The script `min finalize-install` runs, whole, exactly as `--show --script` wrote it.
+  # On macOS it carries the range step NET-123 folds into it too.
+  native_cmd="$(setup_script_from "$native_setup")"
 
   if [ -n "$native_cmd" ]; then
     # The command must name this platform's mechanism and THIS daemon's
@@ -7317,23 +8395,24 @@ proof_native_resolution_without_proxy_env() {
           ;;
       esac
     fi
-    case "$native_cmd" in
-      sudo*) ;;
-      *) echo "::error::the advisory's command is not one the user runs (got: '$native_cmd')"; fail ;;
-    esac
-    echo "advisory named the exact command: $native_cmd"
+    if setup_script_elevates "$native_cmd"; then
+      echo "::error::the setup script elevates on its own; it must run whole under the one sudo the user gives it"
+      echo "--- script ---"; printf '%s\n' "$native_cmd"
+      fail
+    fi
+    echo "min finalize-install --show --script named the setup script ($(printf '%s\n' "$native_cmd" | wc -l | tr -d ' ') lines)"
     native_proved="advised"
 
     # NET-123's present arm, client side: a probe that found the reserved
     # range adds no interim sentence to the advisory. On the lanes that run
     # Linux daemons (native guest, or the Linux host of a VM lane) the
     # probe always succeeds, so the word must be absent.
-    if [ "$(uname -s)" = Linux ] && grep -q -- interim "$native_err"; then
+    if [ "$(uname -s)" = Linux ] && grep -q -- interim "$native_setup.note"; then
       echo "::error::the advisory names the 127.0.0.1 interim where the probe found the reserved range"
       echo "--- activate stderr ---"; cat "$native_err" 2>/dev/null || true
       fail
     fi
-  elif grep -q -- 'bypass systemd-resolved' "$native_err" 2>/dev/null; then
+  elif grep -q -- 'bypass systemd-resolved' "$native_setup.note" 2>/dev/null; then
     # An advisory that names no command: this host's lookups never reach
     # systemd-resolved's stub, so the routing-domain command would
     # configure nothing a host process consults — NET-122's detection says
@@ -7342,7 +8421,7 @@ proof_native_resolution_without_proxy_env() {
     # command above.
     native_bypassed=yes
     echo "advisory said this host's lookups bypass systemd-resolved's stub (NET-122 detection):"
-    echo "  $(grep -F -- 'bypass systemd-resolved' "$native_err" 2>/dev/null | head -n1)"
+    echo "  $(grep -F -- 'bypass systemd-resolved' "$native_setup.note" 2>/dev/null | head -n1)"
     if [ -n "${CI:-}" ]; then
       echo "::error::this lane's host bypasses systemd-resolved's stub, so NET-009 cannot be proved on it"
       echo "--- activate stderr ---"; cat "$native_err" 2>/dev/null || true
@@ -7358,8 +8437,8 @@ proof_native_resolution_without_proxy_env() {
     # daemon before. CI's fresh runners never see it, which is why it is an
     # error there.
     if [ -n "${CI:-}" ]; then
-      echo "::error::no advisory on the activate's stderr, and this lane's resolver is not configured for the zone (NET-122)"
-      echo "--- activate stderr ---"; cat "$native_err" 2>/dev/null || true
+      echo "::error::'min finalize-install --show --script' printed no script, and this lane's resolver is not configured for the zone (NET-122)"
+      echo "--- min finalize-install --show --script ---"; cat "$native_setup" "$native_setup.note" 2>/dev/null || true
       fail
     fi
     echo "::warning::no advisory printed — this host's resolver already routes the zone to this answerer (NET-122's quiet state)"
@@ -7432,7 +8511,7 @@ proof_native_resolution_without_proxy_env() {
       # (T90); record the channel it binds BEFORE running it, so a
       # half-failed run still leaves the teardown a service to remove.
       case "$native_cmd" in
-        *zone-answerer*)
+        *minzoned*)
           ANSWERER_SERVICE_CHANNEL="$(answerer_channel_of "$native_cmd")"
           if [ -z "$ANSWERER_SERVICE_CHANNEL" ]; then
             echo "::error::the advisory's command names no answerer channel, so this run could not undo the service it installs; it was not run (got: '$native_cmd')"
@@ -7442,10 +8521,13 @@ proof_native_resolution_without_proxy_env() {
       esac
       # Run the exact command the advisory printed — verbatim, as the user
       # would have. Passwordless sudo is the gate above, so it cannot prompt.
-      if ! sh -c "$native_cmd" >"$WORK/native-cmd.out" 2>"$WORK/native-cmd.err"; then
+      setup_classifier_note "$native_setup"
+      # shellcheck disable=SC2024 # the output files are this user's, not root's
+      if ! sudo -n sh "$native_setup" >"$WORK/native-cmd.out" 2>"$WORK/native-cmd.err"; then
         echo "::error::the advisory's command did not run (are resolvectl and ip usable here?)"
         echo "--- command ---"; echo "$native_cmd"
         echo "--- output ---"; cat "$WORK/native-cmd.out" "$WORK/native-cmd.err" 2>/dev/null || true
+        setup_units_journal
         fail
       fi
       echo "ran the advisory's command"
@@ -7542,6 +8624,12 @@ proof_native_resolution_without_proxy_env() {
   fi
 
   mnl session destroy --force "$native_sid" >/dev/null 2>&1 || true
+  # The classifier the same script installed on a host that had none: removed
+  # here, so the lane's classifier proofs find the host as this case did.
+  if ! setup_classifier_teardown; then
+    echo "::error::the classifier install the setup script made could not be removed — a live leaf or process still holds /sys/fs/cgroup/minimald.slice"
+    fail
+  fi
   echo "native min.internal resolution with no proxy settings OK (${native_proved:-advisory race} — each printed)"
   echo "::endgroup::"
 }
@@ -7556,8 +8644,8 @@ proof_native_resolution_without_proxy_env() {
 #     a VM-backed host the zone is the host's to answer, the guest daemon
 #     starts no answerer, and the CLI reads the host answerer's state from
 #     minvmd's control socket — never through the guest — and prints the
-#     ZONE ANSWERER line from it: answered by the VM host daemon, naming the
-#     holder.
+#     DNS SERVICE line from it: the VM host daemon answering this VM's
+#     box names, or another VM host daemon answering them.
 #   * The VM host daemon's answerer answers real zone names on the host, and
 #     dig reads the wire a host resolver would, at the port the answerer's
 #     own start record names — the listener it holds, or the machine's
@@ -7617,13 +8705,13 @@ proof_native_resolution_from_host_answerer_on_vm_host() {
   # `mnl ls | grep`: grep's early exit SIGPIPEs the CLI.
   host_answerer_ls="$(mnl ls 2>/dev/null || true)"
   if ! printf '%s\n' "$host_answerer_ls" \
-      | grep -qF -- 'ZONE ANSWERER:   answered by the VM host daemon (single-operator interim)'; then
+      | grep -qE -- "DNS SERVICE: +(this VM's host daemon answers its|another VM host daemon answers this VM's) box names on 127\.0\.0\.1:"; then
     echo "::error::min ls does not name the VM host daemon as the zone's answerer — the line the CLI reads from minvmd's control socket is missing"
     echo "--- min ls ---"; printf '%s\n' "$host_answerer_ls"
     fail
   fi
   echo "min ls names the VM host daemon as the zone's answerer (NET-138):"
-  printf '%s\n' "$host_answerer_ls" | grep -- 'ZONE ANSWERER' | sed 's/^/  /'
+  printf '%s\n' "$host_answerer_ls" | grep -- 'DNS SERVICE' | sed 's/^/  /'
 
   # The VM host daemon's own log candidates, newest first: the answerer is a
   # host process, so its start record sits beside the daemon's in minvmd's
@@ -7963,7 +9051,7 @@ proof_box_name_resolves_natively_without_proxy() {
   # switch so a host that cannot use one never pays for fetching it.
   bn_tun=""
   if [ ! -c /dev/net/tun ]; then
-    bn_tun="no /dev/net/tun on this host, so an own-IP box cannot open its in-namespace tap and no box can serve a page"
+    bn_tun="no /dev/net/tun on this host, and this native-only case opens its own-IP box's in-namespace tap on this host, so no box can serve a page"
   fi
   # The switch that box's session program must spawn, placed where the
   # daemon's own probe (switch::installed_gvproxy_bin, which reads
@@ -8006,12 +9094,12 @@ proof_box_name_resolves_natively_without_proxy() {
   fi
 
   # The daemon's log filter for the restart below — INFO for the records
-  # this case reads (the loopback lease and release, minimald::session; the
+  # this case reads (the loopback lease and release, minimald::box_actor; the
   # name registrations, minimald::net::dns; the publish exposes,
   # minimald::net::gvproxy_network) and DEBUG for the zone answerer, so
   # every lookup this case makes leaves its own line. The exec records the
   # harness's default keeps, for the `min bug` tail.
-  bn_rust_log="warn,minimald::exec=info,minimald::session=info,minimald::net::dns=info,minimald::net::gvproxy_network=info,minimald::net::answerer=debug"
+  bn_rust_log="warn,minimald::exec=info,minimald::box_actor=info,minimald::net::dns=info,minimald::net::gvproxy_network=info,minimald::net::answerer=debug"
   # Restart with it — a standalone run has no daemon yet; `min ls` below
   # autospawns it. No restart and no new filter when this run cannot read
   # the daemon's log: the daemon already up keeps the one it came with.
@@ -8042,7 +9130,7 @@ proof_box_name_resolves_natively_without_proxy() {
   bn_port=""
   for _ in $(seq 1 40); do
     bn_port="$(bn_warm ls 2>/dev/null \
-      | sed -n 's/^ZONE ANSWERER: *listening on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' \
+      | sed -n 's/^DNS SERVICE: *listening on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' \
       | head -n1)"
     [ -n "$bn_port" ] && break
     sleep 0.25
@@ -8057,7 +9145,7 @@ proof_box_name_resolves_natively_without_proxy() {
       echo "::endgroup::"
       return 0
     fi
-    echo "::error::the daemon's zone answerer never came up (no ZONE ANSWERER line in min ls)"
+    echo "::error::the daemon's zone answerer never came up (no DNS SERVICE line in min ls)"
     fail
   fi
 
@@ -8072,10 +9160,15 @@ proof_box_name_resolves_natively_without_proxy() {
   }
   bn_sid="$(printf '%s\n' "$bn_sid" | tail -n1 | tr -d '\r')"
   echo "activated $BN_WEB_NAME ($bn_sid); answerer on 127.0.0.1:$bn_port"
+  # A session start prints no advisory (host DNS is opt-in, NET-122); the
+  # setup script is what `min finalize-install --show --script` prints on stdout, from the
+  # same host reads, with its note on stderr.
+  bn_setup="$WORK/bn-net-setup.out"
+  mnl finalize-install --show --script >"$bn_setup" 2>"$bn_setup.note" || true
   # The surface the activation reports — printed, not asserted: before the
   # advisory's command runs it is the proxy's surface, and the verdict the
   # command is about to move is the second box's to report (NET-018).
-  bn_surface="$(grep -F -- 'live name surface' "$bn_err" 2>/dev/null | head -n1 || true)"
+  bn_surface="$(grep -F -- 'names: ' "$bn_err" 2>/dev/null | head -n1 || true)"
   echo "activate reported the surface: ${bn_surface:-<none>}"
 
   # Polls the pair of records that own a box's address — the finalize lease
@@ -8123,10 +9216,10 @@ proof_box_name_resolves_natively_without_proxy() {
   echo "$BN_WEB_NAME's address: $bn_web_ip, leased at finalize (NET-010) — registered for its name there (NET-011)"
   echo "daemon log: $bn_box_reg"
 
-  # NET-122: the advisory, on the activate's stderr — the exact command, no
-  # prompt anywhere in the path. The command must name this platform's
-  # mechanism and THIS daemon's answerer, and be one the user runs.
-  bn_cmd="$(advisory_command_from "$bn_err" "Configure the host's resolver")"
+  # NET-122: the setup script `min finalize-install --show --script` prints — the exact
+  # script, no prompt anywhere in the path. It must name this platform's
+  # mechanism and THIS daemon's answerer, and run whole under one sudo.
+  bn_cmd="$(setup_script_from "$bn_setup")"
   if [ -n "$bn_cmd" ]; then
     case "$bn_cmd" in
       *resolvectl*) ;;
@@ -8144,19 +9237,20 @@ proof_box_name_resolves_natively_without_proxy() {
         fail
         ;;
     esac
-    case "$bn_cmd" in
-      sudo*) ;;
-      *) echo "::error::the advisory's command is not one the user runs (got: '$bn_cmd')"; fail ;;
-    esac
-    echo "advisory named the exact command: $bn_cmd"
-  elif grep -q -- 'bypass systemd-resolved' "$bn_err" 2>/dev/null; then
+    if setup_script_elevates "$bn_cmd"; then
+      echo "::error::the setup script elevates on its own; it must run whole under the one sudo the user gives it"
+      echo "--- script ---"; printf '%s\n' "$bn_cmd"
+      fail
+    fi
+    echo "min finalize-install --show --script named the setup script ($(printf '%s\n' "$bn_cmd" | wc -l | tr -d ' ') lines)"
+  elif grep -q -- 'bypass systemd-resolved' "$bn_setup.note" 2>/dev/null; then
     # An advisory that names no command: this host's lookups never reach
     # systemd-resolved's stub, so the routing-domain command would configure
     # nothing a host process consults — NET-122's detection says so instead.
     # Only a dev host can see this; a lane's lookups go through the stub.
     bn_bypassed=yes
     echo "advisory said this host's lookups bypass systemd-resolved's stub (NET-122 detection):"
-    echo "  $(grep -F -- 'bypass systemd-resolved' "$bn_err" 2>/dev/null | head -n1)"
+    echo "  $(grep -F -- 'bypass systemd-resolved' "$bn_setup.note" 2>/dev/null | head -n1)"
     if [ -n "${CI:-}" ]; then
       echo "::error::this lane's host bypasses systemd-resolved's stub, so NET-009 cannot be proved on it"
       echo "--- activate stderr ---"; cat "$bn_err" 2>/dev/null || true
@@ -8170,8 +9264,8 @@ proof_box_name_resolves_natively_without_proxy() {
     # right. CI's fresh runners never see it, which is why it is an error
     # there.
     if [ -n "${CI:-}" ]; then
-      echo "::error::no advisory on the activate's stderr, and this lane's resolver is not configured for the zone (NET-122)"
-      echo "--- activate stderr ---"; cat "$bn_err" 2>/dev/null || true
+      echo "::error::'min finalize-install --show --script' printed no script, and this lane's resolver is not configured for the zone (NET-122)"
+      echo "--- min finalize-install --show --script ---"; cat "$bn_setup" "$bn_setup.note" 2>/dev/null || true
       fail
     fi
     echo "::warning::no advisory printed — this host's resolver already routes the zone to this answerer (NET-122's quiet state)"
@@ -8338,7 +9432,7 @@ proof_box_name_resolves_natively_without_proxy() {
     # A native daemon's advisory carries the manager-held answerer step
     # (T90); record its channel first so the teardown can remove it.
     case "$bn_cmd" in
-      *zone-answerer*)
+      *minzoned*)
         ANSWERER_SERVICE_CHANNEL="$(answerer_channel_of "$bn_cmd")"
         if [ -z "$ANSWERER_SERVICE_CHANNEL" ]; then
           echo "::error::the advisory's command names no answerer channel, so this run could not undo the service it installs; it was not run (got: '$bn_cmd')"
@@ -8346,29 +9440,37 @@ proof_box_name_resolves_natively_without_proxy() {
         fi
         ;;
     esac
-    if ! sh -c "$bn_cmd" >"$WORK/bn-cmd.out" 2>"$WORK/bn-cmd.err"; then
+    setup_classifier_note "$bn_setup"
+    # shellcheck disable=SC2024 # the output files are this user's, not root's
+    if ! sudo -n sh "$bn_setup" >"$WORK/bn-cmd.out" 2>"$WORK/bn-cmd.err"; then
       echo "::error::the advisory's command did not run (are resolvectl and ip usable here?)"
       echo "--- command ---"; echo "$bn_cmd"
       echo "--- output ---"; cat "$WORK/bn-cmd.out" "$WORK/bn-cmd.err" 2>/dev/null || true
+      setup_units_journal
       fail
     fi
-    echo "ran the advisory's command: $bn_cmd"
+    echo "ran the setup script under one sudo"
   fi
 
   # ---- NET-018: the second box's activate reports the verdict -------------
   bn_second_box
-  bn_api_surface="$(grep -F -- 'native DNS is the live name surface' \
+  # The box publishes at its own leased address (asserted below), so its
+  # host line reads the own-address form, never the 127.0.0.1 fallback form.
+  bn_api_surface="$(grep -F -- 'opens at its name on this machine' \
     "$bn_api_err" 2>/dev/null | head -n1 || true)"
   if [ -z "$bn_api_surface" ]; then
-    echo "::error::the second box's activate does not report native DNS as the live name surface (NET-018) — the command ran, so the verdict must have moved"
+    echo "::error::the second box's activate does not say its box opens at its name on this machine (NET-018) — the command ran, so the verdict must have moved"
     echo "--- activate stderr ---"; cat "$bn_api_err" 2>/dev/null || true
     fail
   fi
   echo "activate reported the surface (NET-018): $bn_api_surface"
+  # The activate line is the one host line, naming the box (NET-142). That
+  # the hostname proxy still serves beside native DNS (NET-019) is `min
+  # ls`'s to say, on its BOX NAMES row, asserted below.
   case "$bn_api_surface" in
-    *"the hostname proxy still serves on 127.0.0.1:"*) ;;
+    "names: $BN_API_NAME.min.internal opens at its name on this machine"*) ;;
     *)
-      echo "::error::the native surface line does not say the hostname proxy still serves (NET-019)"
+      echo "::error::the second box's activate line is not the one host line naming the box (NET-142)"
       echo "--- surface line ---"; printf '%s\n' "$bn_api_surface"
       fail
       ;;
@@ -8448,20 +9550,22 @@ proof_box_name_resolves_natively_without_proxy() {
   # ---- NET-018/NET-019: what `min ls` reports beside the live boxes -------
   bn_ls="$(mnl ls 2>&1 || true)"
   echo "--- min ls ---"; printf '%s\n' "$bn_ls"
-  bn_surface_line="$(printf '%s\n' "$bn_ls" | grep -F -- 'NAME SURFACE:' | head -n1 || true)"
+  bn_surface_line="$(printf '%s\n' "$bn_ls" | grep -F -- 'BOX NAMES:' | head -n1 || true)"
+  # Both boxes stand at their own addresses, so no box is on the fallback
+  # and the row reads the own-address form, as the activate line did.
   case "$bn_surface_line" in
-    *"native DNS is the live name surface"*) ;;
+    *"<box>.min.internal opens at its name on this machine"*) ;;
     *)
-      echo "::error::min ls does not report native DNS as the live name surface (NET-018)"
-      echo "--- NAME SURFACE line ---"; printf '%s\n' "$bn_surface_line"
+      echo "::error::min ls's BOX NAMES line does not say box names open at their names on this machine (NET-018)"
+      echo "--- BOX NAMES line ---"; printf '%s\n' "$bn_surface_line"
       fail
       ;;
   esac
   case "$bn_surface_line" in
-    *"the hostname proxy still serves on 127.0.0.1:"*) ;;
+    *"the HTTP proxy at 127.0.0.1:"*) ;;
     *)
-      echo "::error::min ls's surface line does not say the hostname proxy still serves (NET-019)"
-      echo "--- NAME SURFACE line ---"; printf '%s\n' "$bn_surface_line"
+      echo "::error::min ls's BOX NAMES line does not name the HTTP proxy that still serves (NET-019)"
+      echo "--- BOX NAMES line ---"; printf '%s\n' "$bn_surface_line"
       fail
       ;;
   esac
@@ -8663,6 +9767,12 @@ proof_box_name_resolves_natively_without_proxy() {
 
   rm -rf "$BN_SEED_DIR" "$BN_API_SEED_DIR"
   BN_SEED_DIR=""; BN_API_SEED_DIR=""
+  # The classifier the same script installed on a host that had none: removed
+  # here, so the lane's classifier proofs find the host as this case did.
+  if ! setup_classifier_teardown; then
+    echo "::error::the classifier install the setup script made could not be removed — a live leaf or process still holds /sys/fs/cgroup/minimald.slice"
+    fail
+  fi
   echo "box names resolve natively in any browser OK (each lookup with its answer, each record, and the surface — printed)"
   echo "::endgroup::"
 }
@@ -8678,7 +9788,7 @@ proof_box_name_resolves_natively_without_proxy() {
 #
 #   1. Node A (this lane's state dir) starts with no service installed and
 #      hosts the interim on the hook port.
-#   2. A's session start prints the advisory; its command, run verbatim,
+#   2. `min finalize-install --show --script` prints the setup script; run as root, it
 #      asks A to release the port, installs the service, and starts it. A
 #      becomes a channel client of the manager-held service, and its box
 #      name still answers on the host.
@@ -8697,33 +9807,33 @@ proof_box_name_resolves_natively_without_proxy() {
 # Every host change — the units, the program copy, the channel socket, the
 # resolver link (Linux) or file (macOS), the second node — is undone here
 # and again by the EXIT trap, so the shared runner is left as found.
-# Makes the min-answerer program findable for this run: beside `min` or on
-# PATH already, or built by `just answerer-build` (else that recipe's own
+# Makes the minzoned program findable for this run: beside `min` or on
+# PATH already, or built by `just zoned-build` (else that recipe's own
 # cargo line) and staged on PATH. A lane that can do neither fails: the
 # case must prove the handover there, never record it as not run.
 asr_answerer_ready() {
   local min_dir built
   min_dir="$(dirname -- "$(command -v min)")"
-  if [ -x "$min_dir/min-answerer" ]; then
-    echo "min-answerer: beside min at $min_dir/min-answerer"
+  if [ -x "$min_dir/minzoned" ]; then
+    echo "minzoned: beside min at $min_dir/minzoned"
     return 0
   fi
-  if command -v min-answerer >/dev/null 2>&1; then
-    echo "min-answerer: on PATH at $(command -v min-answerer)"
+  if command -v minzoned >/dev/null 2>&1; then
+    echo "minzoned: on PATH at $(command -v minzoned)"
     return 0
   fi
-  echo "min-answerer is not beside min or on PATH; building it (just answerer-build)"
+  echo "minzoned is not beside min or on PATH; building it (just zoned-build)"
   if command -v just >/dev/null 2>&1; then
-    (cd "$ROOT" && just answerer-build) >"$WORK/answerer-build.log" 2>&1 || {
-      echo "::error::'just answerer-build' failed"; tail -20 "$WORK/answerer-build.log"; fail; }
+    (cd "$ROOT" && just zoned-build) >"$WORK/zoned-build.log" 2>&1 || {
+      echo "::error::'just zoned-build' failed"; tail -20 "$WORK/zoned-build.log"; fail; }
   elif command -v cargo >/dev/null 2>&1; then
-    (cd "$ROOT" && cargo build -p min-answerer --locked) >"$WORK/answerer-build.log" 2>&1 || {
-      echo "::error::'cargo build -p min-answerer --locked' failed"; tail -20 "$WORK/answerer-build.log"; fail; }
+    (cd "$ROOT" && cargo build -p minzoned --locked) >"$WORK/zoned-build.log" 2>&1 || {
+      echo "::error::'cargo build -p minzoned --locked' failed"; tail -20 "$WORK/zoned-build.log"; fail; }
   else
-    echo "::error::this lane has no min-answerer and neither just nor cargo to build it; the handover cannot be proved"
+    echo "::error::this lane has no minzoned and neither just nor cargo to build it; the handover cannot be proved"
     fail
   fi
-  built="${CARGO_TARGET_DIR:-$ROOT/target}/debug/min-answerer"
+  built="${CARGO_TARGET_DIR:-$ROOT/target}/debug/minzoned"
   if [ ! -x "$built" ]; then
     echo "::error::the answerer build left no program at $built"
     fail
@@ -8731,11 +9841,11 @@ asr_answerer_ready() {
   # Staged alone: target/debug also holds a min and a minvmd this run must
   # not pick up in place of the lane's own.
   mkdir -p "$WORK/answerer-bin"
-  cp "$built" "$WORK/answerer-bin/min-answerer"
+  cp "$built" "$WORK/answerer-bin/minzoned"
   # shellcheck disable=SC2031 # other proofs change PATH in their own subshells; this runs in the main shell
   PATH="$WORK/answerer-bin:$PATH"
   export PATH
-  echo "min-answerer: built and staged at $WORK/answerer-bin/min-answerer"
+  echo "minzoned: built and staged at $WORK/answerer-bin/minzoned"
 }
 
 proof_answerer_survives_session_stop() {
@@ -8749,7 +9859,7 @@ proof_answerer_survives_session_stop() {
   case "$asr_os" in
     Linux)
       asr_channel=/run/minimal/answerer.sock
-      asr_marker=/etc/systemd/system/dev.minimal.zone-answerer.socket
+      asr_marker=/etc/systemd/system/minzoned.socket
       if ! command -v systemctl >/dev/null 2>&1 || ! command -v resolvectl >/dev/null 2>&1 \
          || ! command -v ip >/dev/null 2>&1 || ! command -v dig >/dev/null 2>&1 \
          || ! sudo -n true >/dev/null 2>&1; then
@@ -8759,7 +9869,7 @@ proof_answerer_survives_session_stop() {
       ;;
     Darwin)
       asr_channel="/Library/Application Support/minimal/run/answerer.sock"
-      asr_marker=/Library/LaunchDaemons/dev.minimal.zone-answerer.plist
+      asr_marker=/Library/LaunchDaemons/dev.gominimal.zone.plist
       if ! command -v launchctl >/dev/null 2>&1 || ! command -v dig >/dev/null 2>&1 \
          || ! sudo -n true >/dev/null 2>&1; then
         echo "::error::this macOS host cannot install the answerer LaunchDaemon (needs launchctl, dig and passwordless sudo); the case fails rather than self-skips, so the pin is never silent"
@@ -8776,8 +9886,9 @@ proof_answerer_survives_session_stop() {
   # channel client from its first start, so the interim this case hands
   # over could never exist. Remove it first, the range case's reasoning.
   if [ -e "$asr_marker" ] || [ -e "$asr_channel" ] \
-     || [ -e /usr/local/lib/minimal/dev.minimal.zone-answerer ] \
-     || [ -e /Library/PrivilegedHelperTools/dev.minimal.zone-answerer ]; then
+     || [ -e /usr/local/lib/minimal/minzoned ] \
+     || [ -e /Library/PrivilegedHelperTools/Minimal.app ] \
+     || [ -e /Library/PrivilegedHelperTools/minzoned ]; then
     echo "removing a leftover answerer service from a prior run, so node A starts from the interim"
     ANSWERER_SERVICE_CHANNEL="$asr_channel"
     answerer_service_teardown
@@ -8923,10 +10034,10 @@ for row in json.load(open(sys.argv[1])):
     fail
   }
 
-  # The advisory's command copies the min-answerer program found beside
+  # The advisory's command copies the minzoned program found beside
   # min or on PATH; a lane whose testbed carries only min and minvmd has
   # none, and its advisory then omits the step. Build it here, through
-  # `just answerer-build` — its own invocation, never beside -p minvmd (the
+  # `just zoned-build` — its own invocation, never beside -p minvmd (the
   # libkrun feature would unify in) — or that recipe's exact cargo line
   # where just is absent, and put it on PATH for this run.
   asr_answerer_ready
@@ -8954,6 +10065,11 @@ for row in json.load(open(sys.argv[1])):
 
   local asr_a_sid asr_a_err="$WORK/asr-a-activate.err"
   asr_a_sid="$(asr_activate mnl e2e-asr-a "$asr_a_err")" || fail
+  # A session start prints no advisory (host DNS is opt-in, NET-122); the
+  # setup script is what `min finalize-install --show --script` prints on stdout, from the
+  # same host reads, with its note on stderr.
+  local asr_a_setup="$WORK/asr-a-net-setup.out"
+  mnl finalize-install --show --script >"$asr_a_setup" 2>"$asr_a_setup.note" || true
   local asr_a_ip
   asr_a_ip="$(asr_zone_address "$asr_base_a" e2e-asr-a.min.internal)"
   if [ -z "$asr_a_ip" ]; then
@@ -9006,12 +10122,13 @@ for row in json.load(open(sys.argv[1])):
 
   # ---- 2. the advisory hands the port to the service -----------------------
   local asr_cmd
-  asr_cmd="$(advisory_command_from "$asr_a_err" "Configure the host's resolver")"
+  asr_cmd="$(setup_script_from "$asr_a_setup")"
   case "$asr_cmd" in
-    *zone-answerer*) ;;
+    *minzoned*) ;;
     *)
       echo "::error::node A's session start printed no advisory carrying the answerer service step"
       echo "--- activate stderr ---"; cat "$asr_a_err" 2>/dev/null || true
+      echo "--- min finalize-install --show --script ---"; cat "$asr_a_setup" 2>/dev/null || true
       fail
       ;;
   esac
@@ -9048,7 +10165,8 @@ for row in json.load(open(sys.argv[1])):
   local asr_released_before asr_service_before
   asr_released_before="$(asr_count "$asr_base_a" 'released the interim answerer')"
   asr_service_before="$(asr_count "$asr_base_a" 'the manager-held answerer service')"
-  if ! sh -c "$asr_cmd" >"$WORK/asr-cmd.out" 2>"$WORK/asr-cmd.err"; then
+  # shellcheck disable=SC2024 # the output files are this user's, not root's
+  if ! sudo -n sh "$asr_a_setup" >"$WORK/asr-cmd.out" 2>"$WORK/asr-cmd.err"; then
     echo "::error::the advisory's command did not run"
     echo "--- command ---"; printf '%s\n' "$asr_cmd"
     echo "--- output ---"; cat "$WORK/asr-cmd.out" "$WORK/asr-cmd.err" 2>/dev/null || true
@@ -9067,9 +10185,9 @@ for row in json.load(open(sys.argv[1])):
     fail
   fi
   if [ "$asr_os" = Linux ]; then
-    if ! systemctl is-active --quiet dev.minimal.zone-answerer.socket; then
+    if ! systemctl is-active --quiet minzoned.socket; then
       echo "::error::the answerer socket unit is not active after the command"
-      systemctl status dev.minimal.zone-answerer.socket 2>&1 | tail -n 15 || true
+      systemctl status minzoned.socket 2>&1 | tail -n 15 || true
       fail
     fi
     asr_holders="$(sudo -n ss -lunp 2>/dev/null | grep -F -- "127.0.0.1:$asr_port " || true)"
@@ -9081,7 +10199,7 @@ for row in json.load(open(sys.argv[1])):
     esac
     echo "  the hook port's holder: ${asr_holders:-<none listed>}"
   else
-    if ! sudo -n launchctl print system/dev.minimal.zone-answerer >/dev/null 2>&1; then
+    if ! sudo -n launchctl print system/dev.gominimal.zone >/dev/null 2>&1; then
       echo "::error::the answerer LaunchDaemon is not loaded after the command"
       fail
     fi
@@ -9113,23 +10231,23 @@ for row in json.load(open(sys.argv[1])):
   fi
   echo "  node A released the port and publishes to the manager-held service over $asr_channel"
   asr_expect_a e2e-asr-a.min.internal "$asr_a_ip"
-  # The hook probe's own answer, as `min ls` prints it: manager-held, with
-  # the channel node A publishes over. Capture-then-grep (grep's early exit
-  # would SIGPIPE the CLI).
+  # The hook probe's own answer, as `min ls` prints it: Minimal's DNS
+  # service answers this VM's box names. Capture-then-grep (grep's early
+  # exit would SIGPIPE the CLI).
   local asr_ls=""
   for _ in $(seq 1 20); do
     asr_ls="$(mnl ls 2>/dev/null || true)"
     case "$asr_ls" in
-      *"manager-held: answered by the answerer host service"*"$asr_channel"*) break ;;
+      *"Minimal's DNS service answers this VM's box names on 127.0.0.1:"*) break ;;
     esac
     sleep 0.5
   done
   case "$asr_ls" in
-    *"manager-held: answered by the answerer host service"*"$asr_channel"*)
-      printf '%s\n' "$asr_ls" | grep -F -- 'ZONE ANSWERER' | sed 's/^/  /'
+    *"Minimal's DNS service answers this VM's box names on 127.0.0.1:"*)
+      printf '%s\n' "$asr_ls" | grep -F -- 'DNS SERVICE' | sed 's/^/  /'
       ;;
     *)
-      echo "::error::min ls does not say the zone is manager-held after the handover"
+      echo "::error::min ls does not say Minimal's DNS service answers this VM's box names after the handover"
       echo "--- min ls ---"; printf '%s\n' "$asr_ls"
       fail
       ;;
@@ -9144,14 +10262,14 @@ for row in json.load(open(sys.argv[1])):
   for _ in $(seq 1 60); do
     asr_b_ls="$(mnl2 ls 2>/dev/null || true)"
     case "$asr_b_ls" in
-      *"manager-held: answered by the answerer host service"*"$asr_channel"*) break ;;
+      *"Minimal's DNS service answers this VM's box names on 127.0.0.1:"*) break ;;
     esac
     sleep 0.5
   done
   case "$asr_b_ls" in
-    *"manager-held: answered by the answerer host service"*"$asr_channel"*)
+    *"Minimal's DNS service answers this VM's box names on 127.0.0.1:"*)
       echo "  node B re-published to the manager-held service after the handover"
-      printf '%s\n' "$asr_b_ls" | grep -F -- 'ZONE ANSWERER' | sed 's/^/  /'
+      printf '%s\n' "$asr_b_ls" | grep -F -- 'DNS SERVICE' | sed 's/^/  /'
       ;;
     *)
       echo "::error::node B never re-published to the manager-held answerer service after the handover"
@@ -9172,15 +10290,15 @@ for row in json.load(open(sys.argv[1])):
   # ---- 4. a service restart answers both names again -------------------------
   local asr_pid_before asr_pid_after
   if [ "$asr_os" = Linux ]; then
-    asr_pid_before="$(systemctl show -p MainPID --value dev.minimal.zone-answerer.service)"
-    sudo -n systemctl restart dev.minimal.zone-answerer.service
-    asr_pid_after="$(systemctl show -p MainPID --value dev.minimal.zone-answerer.service)"
+    asr_pid_before="$(systemctl show -p MainPID --value minzoned.service)"
+    sudo -n systemctl restart minzoned.service
+    asr_pid_after="$(systemctl show -p MainPID --value minzoned.service)"
   else
-    asr_pid_before="$(sudo -n launchctl print system/dev.minimal.zone-answerer 2>/dev/null \
+    asr_pid_before="$(sudo -n launchctl print system/dev.gominimal.zone 2>/dev/null \
       | sed -n 's/^[[:space:]]*pid = //p' | head -n1)"
-    sudo -n launchctl kickstart -k system/dev.minimal.zone-answerer
+    sudo -n launchctl kickstart -k system/dev.gominimal.zone
     sleep 1
-    asr_pid_after="$(sudo -n launchctl print system/dev.minimal.zone-answerer 2>/dev/null \
+    asr_pid_after="$(sudo -n launchctl print system/dev.gominimal.zone 2>/dev/null \
       | sed -n 's/^[[:space:]]*pid = //p' | head -n1)"
   fi
   echo "4. restarted the answerer service (pid ${asr_pid_before:-?} -> ${asr_pid_after:-on demand})"
@@ -9296,8 +10414,8 @@ for row in json.load(open(sys.argv[1])):
 #
 #   1. Node A (this lane's state dir) starts with no service installed and
 #      hosts the interim on the hook port; its box name answers there.
-#   2. A's session start prints the advisory; its command, run verbatim as
-#      root, asks A's own control socket to release the port, installs the
+#   2. `min finalize-install --show --script` prints the setup script; run as root, it
+#      asks A's own control socket to release the port, installs the
 #      service and starts it. A becomes a client of the manager-held
 #      answerer, no minimald holds the port, and A's name keeps answering
 #      the same address — now from the service.
@@ -9333,7 +10451,7 @@ proof_native_answerer_survives_session_stop() {
   echo "::group::the native daemon publishes into the manager-held answerer, which survives a session stop (NET-122, T90)"
 
   local nasr_channel=/run/minimal/answerer.sock
-  local nasr_marker=/etc/systemd/system/dev.minimal.zone-answerer.socket
+  local nasr_marker=/etc/systemd/system/minzoned.socket
   local nasr_base_a="$XDG_STATE_HOME/minimal"
   local nasr_log_filter="warn,minimald::rpc=info,minimald::net::answerer=info"
   local nasr_port=""
@@ -9342,7 +10460,7 @@ proof_native_answerer_survives_session_stop() {
   # client from its first start, so the interim this case hands over could
   # never exist. Remove it first.
   if [ -e "$nasr_marker" ] || [ -e "$nasr_channel" ] \
-     || [ -e /usr/local/lib/minimal/dev.minimal.zone-answerer ]; then
+     || [ -e /usr/local/lib/minimal/minzoned ]; then
     echo "removing a leftover answerer service from a prior run, so node A starts from the interim"
     ANSWERER_SERVICE_CHANNEL="$nasr_channel"
     answerer_service_teardown
@@ -9446,7 +10564,7 @@ proof_native_answerer_survives_session_stop() {
     fail
   }
 
-  # The advisory's command copies the min-answerer program found beside min
+  # The advisory's command copies the minzoned program found beside min
   # or on PATH; the answerer-service case's helper builds and stages it.
   asr_answerer_ready
   NASR_SEED_DIR="$(hook_mktemp /tmp/mnlnasr.XXXXXX)"
@@ -9471,6 +10589,11 @@ proof_native_answerer_survives_session_stop() {
 
   local nasr_a_sid nasr_a_err="$WORK/nasr-a-activate.err" nasr_a_ip
   nasr_a_sid="$(nasr_activate mnl e2e-nasr-a "$nasr_a_err")" || fail
+  # A session start prints no advisory (host DNS is opt-in, NET-122); the
+  # setup script is what `min finalize-install --show --script` prints on stdout, from the
+  # same host reads, with its note on stderr.
+  local nasr_a_setup="$WORK/nasr-a-net-setup.out"
+  mnl finalize-install --show --script >"$nasr_a_setup" 2>"$nasr_a_setup.note" || true
   nasr_a_ip="$(nasr_address e2e-nasr-a.min.internal)"
   if [ -z "$nasr_a_ip" ]; then
     echo "::error::e2e-nasr-a.min.internal does not answer from node A's interim on 127.0.0.1:$nasr_port"
@@ -9481,12 +10604,13 @@ proof_native_answerer_survives_session_stop() {
 
   # ---- 2. the advisory hands the port to the service -----------------------
   local nasr_cmd
-  nasr_cmd="$(advisory_command_from "$nasr_a_err" "Configure the host's resolver")"
+  nasr_cmd="$(setup_script_from "$nasr_a_setup")"
   case "$nasr_cmd" in
-    *zone-answerer*) ;;
+    *minzoned*) ;;
     *)
       echo "::error::node A's native session start printed no advisory carrying the answerer service step"
       echo "--- activate stderr ---"; cat "$nasr_a_err" 2>/dev/null || true
+      echo "--- min finalize-install --show --script ---"; cat "$nasr_a_setup" 2>/dev/null || true
       fail
       ;;
   esac
@@ -9515,7 +10639,9 @@ proof_native_answerer_survives_session_stop() {
   local nasr_released_before nasr_service_before
   nasr_released_before="$(nasr_count "$nasr_base_a" 'released the interim answerer')"
   nasr_service_before="$(nasr_count "$nasr_base_a" 'the manager-held answerer service')"
-  if ! sh -c "$nasr_cmd" >"$WORK/nasr-cmd.out" 2>"$WORK/nasr-cmd.err"; then
+  setup_classifier_note "$nasr_a_setup"
+  # shellcheck disable=SC2024 # the output files are this user's, not root's
+  if ! sudo -n sh "$nasr_a_setup" >"$WORK/nasr-cmd.out" 2>"$WORK/nasr-cmd.err"; then
     echo "::error::the advisory's command did not run"
     echo "--- command ---"; printf '%s\n' "$nasr_cmd"
     echo "--- output ---"; cat "$WORK/nasr-cmd.out" "$WORK/nasr-cmd.err" 2>/dev/null || true
@@ -9533,9 +10659,9 @@ proof_native_answerer_survives_session_stop() {
     nasr_dump_log "$nasr_base_a"
     fail
   fi
-  if ! systemctl is-active --quiet dev.minimal.zone-answerer.socket; then
+  if ! systemctl is-active --quiet minzoned.socket; then
     echo "::error::the answerer socket unit is not active after the command"
-    systemctl status dev.minimal.zone-answerer.socket 2>&1 | tail -n 15 || true
+    systemctl status minzoned.socket 2>&1 | tail -n 15 || true
     fail
   fi
   local nasr_holders
@@ -9600,6 +10726,12 @@ proof_native_answerer_survives_session_stop() {
     echo "::warning::could not remove the dedicated link $NASR_REVERT_LINK"
   fi
   rm -rf "$NASR_SEED_DIR"; NASR_SEED_DIR=""
+  # The classifier the same script installed on a host that had none: removed
+  # here, so the lane's classifier proofs find the host as this case did.
+  if ! setup_classifier_teardown; then
+    echo "::error::the classifier install the setup script made could not be removed — a live leaf or process still holds /sys/fs/cgroup/minimald.slice"
+    fail
+  fi
   echo "native answerer survives session stop OK (interim, handover, second node, session and daemon stop — each printed)"
   echo "::endgroup::"
 }
@@ -9946,7 +11078,7 @@ while True:
 
   recover_activate_err="$(cat "$WORK/recover-activate.err" 2>/dev/null || true)"
   case "$recover_activate_err" in
-    *"session hostnames will not route"*"could not bind 127.0.0.1:$RECOVER_PIN"*"Remedy: free the listen address"*) ;;
+    *"warning: the hostname proxy is not serving"*"could not bind 127.0.0.1:$RECOVER_PIN"*"Remedy: free the listen address"*) ;;
     *)
       echo "::error::activate against the held port did not warn with the reason and the remedy (NET-020)"
       echo "--- activate stderr ---"; cat "$WORK/recover-activate.err" 2>/dev/null || true
@@ -9963,7 +11095,7 @@ while True:
 
   recover_ls_out="$(mnl ls 2>&1)"
   case "$recover_ls_out" in
-    *"session hostnames will not route"*"could not bind 127.0.0.1:$RECOVER_PIN"*"Remedy: free the listen address"*) ;;
+    *"warning: the hostname proxy is not serving"*"could not bind 127.0.0.1:$RECOVER_PIN"*"Remedy: free the listen address"*) ;;
     *)
       echo "::error::min ls against the held port did not warn with the reason and the remedy (NET-020)"
       echo "--- min ls output ---"; printf '%s\n' "$recover_ls_out"
@@ -9976,7 +11108,7 @@ while True:
     echo "--- min ls output ---"; printf '%s\n' "$recover_ls_out"
     fail
   fi
-  printf '%s\n' "$recover_ls_out" | grep -F -- 'session hostnames will not route' | sed 's/^/  /'
+  printf '%s\n' "$recover_ls_out" | grep -F -- 'warning: the hostname proxy is not serving' | sed 's/^/  /'
 
   # The daemon log's own record: the warn the retry left, with its status
   # and next-retry schedule (the file log is JSON lines).
@@ -10034,7 +11166,7 @@ while True:
       | grep -oE '127\.0\.0\.1:[0-9]+' | head -n1 | cut -d: -f2 || true)"
     if [ "$recover_port_now" = "$RECOVER_PIN" ]; then
       case "$recover_ls_after" in
-        *"session hostnames will not route"*) ;; # serving but still warning: keep polling
+        *"warning: the hostname proxy is not serving"*) ;; # serving but still warning: keep polling
         *) recover_cleared=1; break ;;
       esac
     fi
@@ -10046,7 +11178,7 @@ while True:
     fail
   fi
   echo "min ls cleared the warning after ${recover_try} one-second poll(s); it now reads:"
-  printf '%s\n' "$recover_ls_after" | grep -E -- 'HOSTNAME PROXY|ZONE ANSWERER' | sed 's/^/  /'
+  printf '%s\n' "$recover_ls_after" | grep -E -- 'HOSTNAME PROXY|DNS SERVICE' | sed 's/^/  /'
 
   recover_pid_after="$(recover_pids_for "hostname-proxy-port $RECOVER_PIN" | head -n1)"
   if [ "$recover_pid_after" != "$recover_pid_before" ]; then
@@ -10099,41 +11231,60 @@ while True:
 
   # ---- beat D: a second daemon on the same machine ------------------------
   echo "beat D: a second daemon under its own state dir"
-  # Beat A picked a spare pin when 7654 looked busy, but that holder may be
-  # gone by now (a daemon still shutting down from the stop above releases
-  # it a moment later). Re-assert the invariant rather than trust beat A's
-  # probe: if 7654 is free, hold it ourselves so the second daemon's
-  # default is busy and it must relocate.
-  if [ "$RECOVER_PIN" != 7654 ] && recover_port_free 7654; then
+  # Beat A picked a spare pin when 7654 looked busy, but a busy probe now
+  # says nothing about the moment the second daemon starts: whatever held
+  # the port at beat A may be a transient (a daemon still shutting down
+  # from the stop above) that releases mid-beat, leaving the default free
+  # for daemon 2 to bind — and then the relocation this beat stages, and
+  # its NET-025 warn, are never owed. So never gate on the probe: wait out
+  # any foreign holder, then hold 7654 with this run's own stand-in.
+  if [ "$RECOVER_PIN" != 7654 ]; then
+    for _ in $(seq 1 60); do
+      recover_port_free 7654 && break
+      sleep 0.5
+    done
+    rm -f "$WORK/recover-default-holder.ready"
     python3 -c 'import socket,sys,time
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(("127.0.0.1", 7654))
 s.listen(1)
+open(sys.argv[1], "w").close()
 while True:
-    time.sleep(3600)' \
+    time.sleep(3600)' "$WORK/recover-default-holder.ready" \
       >/dev/null 2>"$WORK/recover-default-holder.err" &
     RECOVER_HOLDER_PID=$!
     holder_bound=""
     for _ in $(seq 1 40); do
-      if ! recover_port_free 7654; then holder_bound=1; break; fi
+      [ -f "$WORK/recover-default-holder.ready" ] && { holder_bound=1; break; }
+      kill -0 "$RECOVER_HOLDER_PID" 2>/dev/null || break # its bind lost: it exited
       sleep 0.25
     done
-    if [ -z "$holder_bound" ]; then
-      echo "::error::7654 was free at beat D and the stand-in holder never took it — the relocation cannot be staged"
+    if [ -n "$holder_bound" ]; then
+      echo "default port: python3 holds 127.0.0.1:7654 (pid $RECOVER_HOLDER_PID) for the second daemon's start"
+    elif ! recover_port_free 7654; then
+      # The stand-in's bind lost to a foreign listener that outlasted the
+      # wait above — no transient does that. It keeps the default busy the
+      # way a dev host's own daemon does, so the story stands; the assert
+      # below still fails loudly if it lets go before daemon 2 starts.
+      kill "$RECOVER_HOLDER_PID" 2>/dev/null || true
+      RECOVER_HOLDER_PID=""
+      echo "default port: a foreign listener owns 127.0.0.1:7654, so it keeps the second daemon's default busy"
+    else
+      echo "::error::127.0.0.1:7654 is free and this staging does not hold it — the foreign holder that looked busy released, so the relocation cannot be staged"
       echo "--- holder stderr ---"; cat "$WORK/recover-default-holder.err" 2>/dev/null || true
       fail
     fi
-    echo "default port: 7654 was free again, so python3 holds it (pid $RECOVER_HOLDER_PID) for the second daemon's start"
   fi
   RECOVER_STATE2_DIR="$WORK/state2"
   mkdir -p "$RECOVER_STATE2_DIR"
   mnl2() { min --minimal-dir "$RECOVER_STATE2_DIR" "$@"; }
 
   # Boot it through the CLI's own autospawn, then read the port `min ls`
-  # discovers (NET-026): the default is busy (the first daemon holds 7654,
-  # or the dev daemon that made us pick a spare pin does), so this daemon
-  # selects a free one (NET-025) and reports it.
+  # discovers (NET-026): the default is busy (daemon 1 holds it when the
+  # pin is 7654; otherwise the stand-in or the foreign listener the staging
+  # left on it does), so this daemon selects a free one (NET-025) and
+  # reports it.
   recover_ls2=""
   for _ in $(seq 1 60); do
     if recover_ls2="$(mnl2 ls 2>&1)"; then break; fi
@@ -10154,6 +11305,10 @@ while True:
   if [ -z "$recover_port2" ]; then
     echo "::error::the second daemon never reported a HOSTNAME PROXY port (NET-026)"
     echo "--- min ls output ---"; printf '%s\n' "${recover_ls2:-<none>}"
+    fail
+  fi
+  if [ "$RECOVER_PIN" != 7654 ] && [ "$recover_port2" = 7654 ]; then
+    echo "::error::daemon 2 ended up on the default 127.0.0.1:7654, so the port was not held when it started — the staging lost the busy default and the relocation cannot be staged (NET-025)"
     fail
   fi
   if [ "$recover_port2" = "$RECOVER_PIN" ]; then
@@ -10363,6 +11518,7 @@ proof_switch_steers_proxy_mac_frames_to_the_host_stack() {
     minvmd stop >/dev/null 2>&1 || true
   fi
   export MINVMD_BEP_STUB=1
+  BEP_LIVE_DAEMON=""
 
   BEP_SEED_DIR="$(hook_mktemp /tmp/mnlbep.XXXXXX)"
   hook_seed_preamble > "$BEP_SEED_DIR/minimal.toml"
@@ -10744,11 +11900,4822 @@ proof_published_proxy_routes_from_host() {
   echo "::endgroup::"
 }
 
+# ---------------------------------------------------------------------------
+# The live Box Egress Proxy gate (BEP-015, #2275). The VM host daemon starts
+# `bep serve` beside gvproxy on a production boot, and the proxy opens its
+# control socket under the real home. Records case $1 as NOT RUN and returns
+# 1 where no proxy can run: off macOS (the proxy keeps its keys in the macOS
+# Keychain), without gvproxy (the daemon starts the proxy beside it), or
+# without a GitHub sign-in a person made with `min auth login`. A case that
+# passes "no_sign_in" as $2 skips the sign-in check, and is NOT RUN without
+# a bep binary in its place (MINVMD_BEP_BIN, else the bep beside minvmd, as
+# rt_bep_bin resolves it; the macOS CI testbed ships none). Everywhere
+# else the proxy must come up, so a proxy that does not is a failure, never
+# NOT RUN.
+#
+# A daemon an earlier case started under MINVMD_BEP_STUB runs the stand-in
+# in place of the proxy, so the first live case restarts the daemon pair
+# without the flag; BEP_LIVE_DAEMON records that the running pair has the
+# proxy, and every case that exports MINVMD_BEP_STUB clears it.
+BEP_LIVE_DAEMON=""
+bep_control_live() {
+  python3 -c 'import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(2)
+s.connect(sys.argv[1])' "$1" 2>/dev/null
+}
+bep_live_gate() {
+  # This reads the real home, which no earlier subshell export changes.
+  # shellcheck disable=SC2031
+  local lg_control="$HOME/.minimal/bep/control.sock" lg_status lg_try
+  local lg_log="$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log"
+  if [ "$(uname -s)" != "Darwin" ]; then
+    not_run "$1" "the Box Egress Proxy runs on macOS only"
+    return 1
+  fi
+  if [ -z "$E2E_VM" ] || [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    not_run "$1" "no MINVMD_GVPROXY_BIN: the VM host daemon starts the Box Egress Proxy beside gvproxy, and this target has none"
+    return 1
+  fi
+  # A case that needs no GitHub sign-in passes "no_sign_in" as $2. Such a
+  # case can reach a lane that ships no bep binary, so only that case turns
+  # a missing binary into NOT RUN. For a signed-in case a missing binary
+  # stays a failure.
+  if [ "${2:-}" = no_sign_in ]; then
+    if ! rt_bep_bin >/dev/null 2>&1; then
+      not_run "$1" "no bep binary beside minvmd: set MINVMD_BEP_BIN to the bep binary the VM host daemon runs"
+      return 1
+    fi
+  else
+    lg_status="$(mnl auth status </dev/null 2>/dev/null || true)"
+    if [[ "$lg_status" != "Signed in to GitHub"* ]]; then
+      not_run "$1" "no GitHub sign-in on this machine: run 'min auth login' first"
+      return 1
+    fi
+  fi
+  if [ "$BEP_LIVE_DAEMON" != 1 ]; then
+    unset MINVMD_BEP_STUB
+    mnl stop --force >/dev/null 2>&1 || true
+    minvmd stop >/dev/null 2>&1 || true
+    if ! mnl ls >/dev/null 2>"$WORK/bep-live-up.err"; then
+      echo "::error::the daemon did not start for $1"
+      cat "$WORK/bep-live-up.err" 2>/dev/null || true
+      fail
+    fi
+  fi
+  for lg_try in $(seq 1 60); do
+    [ "$lg_try" -gt 1 ] && sleep 1
+    bep_control_live "$lg_control" && break
+  done
+  if ! bep_control_live "$lg_control"; then
+    echo "::error::the Box Egress Proxy is not serving: nothing answers on $lg_control 60 s after the VM host daemon started (it starts 'bep serve' beside gvproxy)"
+    echo "--- $lg_log (tail) ---"; tail -40 "$lg_log" 2>/dev/null || echo "(absent)"
+    fail
+  fi
+  BEP_LIVE_DAEMON=1
+}
+
 # Ordered late in the whole-lane run on purpose: it restarts the daemon (see
 # the RUST_LOG note inside) and nothing after it depends on the one before.
 # The proxy_sees_each_vm_box_by_its_switch_address case, which the dispatch
 # runs after this one, stops and respawns both daemons for its own filter
 # and stand-in.
+# ---------------------------------------------------------------------------
+# GitHub grant proof (BEP-003, BEP-005): with a sign-in held and the Box
+# Egress Proxy running, two boxes that declare a GitHub grant start one after
+# the other, headless, and neither asks for a sign-in. Each creation mints a
+# sealed sign-in reference and registers the box with the proxy, so the second
+# box reuses the sign-in the first one found. `bep serve` runs on macOS only,
+# and the case needs a sign-in a person made with `min auth login`, so a lane
+# without both records it as NOT RUN.
+proof_bep_second_box_needs_no_sign_in() {
+  echo "::group::GitHub grant boxes: the second box needs no sign-in"
+  bep_live_gate bep_second_box_needs_no_sign_in || { echo "::endgroup::"; return 0; }
+
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlgrant.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\nscopes = ["github:user-token"]\n'
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+  bep_sids=""
+  for bep_name in e2e-bep-first e2e-bep-second; do
+    # Headless: stdin from /dev/null and --no-prompt. A sign-in prompt has
+    # no terminal to ask on, so a box that needed one fails here.
+    bep_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --name "$bep_name" --no-prompt \
+      --network own_ip --credentialed-upstream \
+      --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+      --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com \
+      </dev/null 2>"$WORK/bep-$bep_name.err")" || {
+      echo "::error::'min session activate' of the GitHub grant box $bep_name failed"
+      echo "--- stdout ---"; printf '%s\n' "$bep_out"
+      echo "--- stderr ---"; cat "$WORK/bep-$bep_name.err" 2>/dev/null || true
+      fail
+    }
+    if grep -q 'min auth login' "$WORK/bep-$bep_name.err"; then
+      echo "::error::the GitHub grant box $bep_name asked for a sign-in while one is held"
+      cat "$WORK/bep-$bep_name.err"
+      fail
+    fi
+    bep_sids="$bep_sids $(printf '%s\n' "$bep_out" | tail -n1 | tr -d '\r')"
+  done
+  for bep_sid in $bep_sids; do
+    mnl session destroy --force "$bep_sid" >/dev/null 2>&1 || true
+  done
+  rm -rf "$GRANT_SEED_DIR"; GRANT_SEED_DIR=""
+  echo "GitHub grant proof OK (two grant boxes started headless, with no sign-in prompt)"
+  echo "::endgroup::"
+}
+
+# Sealed-value placement proof (BEP-007): with a sign-in held and the Box
+# Egress Proxy running, two boxes that declare a GitHub grant start one after
+# the other, headless, and each box's GH_TOKEN holds a sealed value and no
+# plaintext token. Each box's value names its own box, so the two differ.
+# The case looks for a plaintext token by its GitHub shape (ghp_, gho_, ghu_,
+# ghs_, ghr_ or github_pat_) in the box's whole environment. The same gates
+# as the second-box proof above record a lane without the proxy as NOT RUN.
+proof_bep_box_env_holds_sealed_value_only() {
+  echo "::group::GitHub grant boxes: the grant's variable holds a sealed value only"
+  bep_live_gate bep_box_env_holds_sealed_value_only || { echo "::endgroup::"; return 0; }
+
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlgrant.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\nscopes = ["github:user-token"]\n'
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+  bep_sids=""
+  bep_values=""
+  for bep_name in e2e-bep-env-first e2e-bep-env-second; do
+    bep_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --name "$bep_name" --no-prompt \
+      --network own_ip --credentialed-upstream \
+      --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+      --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com \
+      </dev/null 2>"$WORK/bep-env-$bep_name.err")" || {
+      echo "::error::'min session activate' of the GitHub grant box $bep_name failed"
+      echo "--- stdout ---"; printf '%s\n' "$bep_out"
+      echo "--- stderr ---"; cat "$WORK/bep-env-$bep_name.err" 2>/dev/null || true
+      fail
+    }
+    if grep -q 'min auth login' "$WORK/bep-env-$bep_name.err"; then
+      echo "::error::the GitHub grant box $bep_name asked for a sign-in while one is held"
+      cat "$WORK/bep-env-$bep_name.err"
+      fail
+    fi
+    bep_sid="$(printf '%s\n' "$bep_out" | tail -n1 | tr -d '\r')"
+    bep_sids="$bep_sids $bep_sid"
+    if ! mnl session exec "$bep_sid" sh -c 'env' \
+      >"$WORK/bep-env-$bep_name.env" 2>"$WORK/bep-env-$bep_name.exec.err"; then
+      echo "::error::'min session exec' in the GitHub grant box $bep_name failed"
+      cat "$WORK/bep-env-$bep_name.exec.err" 2>/dev/null || true
+      fail
+    fi
+    # The value itself is never printed: the transcript names only its length.
+    bep_value="$(sed -n 's/^GH_TOKEN=//p' "$WORK/bep-env-$bep_name.env" | tr -d '\r' | head -n1)"
+    if [ -z "$bep_value" ]; then
+      echo "::error::the GitHub grant box $bep_name has no value in GH_TOKEN"
+      fail
+    fi
+    # A sealed value is a compact JWE, header..iv.ciphertext.tag, the form
+    # bep::seal returns.
+    if ! [[ "$bep_value" =~ ^[A-Za-z0-9_-]+\.\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]; then
+      echo "::error::the GH_TOKEN value of the GitHub grant box $bep_name is not a sealed value: it is not in the compact JWE form header..iv.ciphertext.tag"
+      fail
+    fi
+    if grep -qE '(gh[opusr]_|github_pat_)[A-Za-z0-9_]{20,}' "$WORK/bep-env-$bep_name.env"; then
+      echo "::error::the environment of the GitHub grant box $bep_name holds a plaintext GitHub token"
+      fail
+    fi
+    case " $bep_values " in
+      *" $bep_value "*)
+        echo "::error::the GitHub grant box $bep_name holds the same GH_TOKEN value as an earlier box, so the value does not name its box"
+        fail
+        ;;
+    esac
+    bep_values="$bep_values $bep_value"
+    rm -f "$WORK/bep-env-$bep_name.env"
+    echo "$bep_name: GH_TOKEN holds a sealed value (${#bep_value} characters), and no plaintext token"
+  done
+  for bep_sid in $bep_sids; do
+    mnl session destroy --force "$bep_sid" >/dev/null 2>&1 || true
+  done
+  rm -rf "$GRANT_SEED_DIR"; GRANT_SEED_DIR=""
+  echo "Sealed-value placement proof OK (two grant boxes started headless, each GH_TOKEN a sealed value of its own)"
+  echo "::endgroup::"
+}
+
+# git and gh through the live proxy (BEP-015): a proxy_env box that holds a
+# sealed GitHub member clones a private repository of the signed-in account,
+# pushes to it and reads it with `gh api`, with no tool configured in the box
+# beyond what it carries at creation. E2E_BEP_PRIVATE_REPO names the
+# repository as <owner>/<name>: private, with at least one commit, and one
+# the signed-in account can push to. The push makes a throwaway branch from
+# the cloned HEAD and the case deletes it again with a second push. A lane
+# without the proxy, or without a repository named, records NOT RUN.
+# #2500 (https://github.com/gominimal/minimal/issues/2500) owns the macOS
+# lane with `bep` in its testbed, a sign-in and E2E_BEP_PRIVATE_REPO. The
+# T14 (#2490) and T16 (#2495) residuals moved to #2500 too.
+#
+# git sends an Authorization header only when a credential helper gives it
+# one. The box answers with the git credential helper it carries from
+# creation (#2499). The case configures no helper of its own.
+# bep_git_credential_helper_sends_header proves the helper alone.
+proof_bep_git_and_gh_against_private_repo() {
+  echo "::group::GitHub grant box: git clone, git push and gh api against a private repository (BEP-015)"
+  local gg_case=bep_git_and_gh_against_private_repo gg_repo="${E2E_BEP_PRIVATE_REPO:-}"
+  local gg_out gg_sid gg_branch gg_step gg_private
+  if [ -z "$gg_repo" ]; then
+    not_run "$gg_case" "no private repository named: set E2E_BEP_PRIVATE_REPO to <owner>/<name>, a private repository the signed-in account can push to"
+    echo "::endgroup::"
+    return 0
+  fi
+  if ! [[ "$gg_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "::error::E2E_BEP_PRIVATE_REPO is '$gg_repo', not <owner>/<name>"
+    fail
+  fi
+  bep_live_gate "$gg_case" || { echo "::endgroup::"; return 0; }
+
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlgrant.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = ["base", "coreutils", "git", "gh", "ca-certificates"]\n'
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\nscopes = ["github:user-token"]\n'
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+  gg_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-bep-git-and-gh \
+    --network own_ip --credentialed-upstream \
+    --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+    --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com \
+    </dev/null 2>"$WORK/$gg_case.err")" || {
+    echo "::error::'min session activate' of the proxy_env GitHub grant box failed"
+    echo "--- stdout ---"; printf '%s\n' "$gg_out"
+    echo "--- stderr ---"; cat "$WORK/$gg_case.err" 2>/dev/null || true
+    rm -rf "$GRANT_SEED_DIR"; GRANT_SEED_DIR=""
+    fail
+  }
+  rm -rf "$GRANT_SEED_DIR"; GRANT_SEED_DIR=""
+  gg_sid="$(printf '%s\n' "$gg_out" | tail -n1 | tr -d '\r')"
+  gg_branch="e2e-bep-$(date +%s)-$$"
+
+  # Each step runs on its own, so a failure names the tool that failed. The
+  # prompt switch only keeps a refused git from waiting on a terminal: it
+  # gives git no credential.
+  for gg_step in \
+    "clone:rm -rf /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 180 git clone https://github.com/$gg_repo /tmp/bep-repo" \
+    "push:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin HEAD:refs/heads/$gg_branch" \
+    "delete:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin --delete $gg_branch"; do
+    if ! mnl session exec "$gg_sid" sh -c "${gg_step#*:}" \
+      >"$WORK/$gg_case.${gg_step%%:*}.out" 2>&1; then
+      echo "::error::'git ${gg_step%%:*}' against the private repository $gg_repo failed in the proxy_env box"
+      cat "$WORK/$gg_case.${gg_step%%:*}.out" 2>/dev/null || true
+      mnl session destroy --force "$gg_sid" >/dev/null 2>&1 || true
+      fail
+    fi
+    echo "git ${gg_step%%:*}: OK"
+  done
+  if ! gg_private="$(mnl session exec "$gg_sid" sh -c \
+    "timeout 60 gh api repos/$gg_repo --jq .private" 2>"$WORK/$gg_case.gh.err")"; then
+    echo "::error::'gh api repos/$gg_repo' failed in the proxy_env box"
+    cat "$WORK/$gg_case.gh.err" 2>/dev/null || true
+    mnl session destroy --force "$gg_sid" >/dev/null 2>&1 || true
+    fail
+  fi
+  gg_private="$(printf '%s' "$gg_private" | tr -d '\r' | tail -n1)"
+  mnl session destroy --force "$gg_sid" >/dev/null 2>&1 || true
+  if [ "$gg_private" != true ]; then
+    echo "::error::'gh api repos/$gg_repo' answered private='$gg_private': the case needs a private repository"
+    fail
+  fi
+  rm -f "$WORK/$gg_case".*
+  echo "proxy_env grant box: git clone, git push and gh api against the private repository $gg_repo"
+  echo "::endgroup::"
+}
+
+# The shipped git credential helper (BEP-015, Gatehouse §6.4): a GitHub grant
+# box with no git configuration of its own clones the private repository
+# E2E_BEP_PRIVATE_REPO and pushes a throwaway branch to it, which a second
+# push deletes again. git sends an Authorization header only when a helper
+# answers, so the clone of a private repository is the proof that git sent
+# the sealed value and the proxy substituted it. The case first checks that
+# the one helper git finds for github.com is the one the box carries, that
+# it answers with the box's sealed GH_TOKEN, and afterwards that its log
+# names github.com and never the value. A lane off macOS, without a sign-in
+# or without E2E_BEP_PRIVATE_REPO records NOT RUN. #2500 owns the macOS lane
+# that runs it.
+proof_bep_git_credential_helper_sends_header() {
+  echo "::group::GitHub grant box: the shipped git credential helper sends a header the proxy substitutes (BEP-015)"
+  local gh_case=bep_git_credential_helper_sends_header gh_repo="${E2E_BEP_PRIVATE_REPO:-}"
+  local gh_out gh_sid gh_branch gh_step gh_helpers gh_fill gh_sealed gh_log
+  if [ -z "$gh_repo" ]; then
+    not_run "$gh_case" "no private repository named: set E2E_BEP_PRIVATE_REPO to <owner>/<name>, a private repository the signed-in account can push to"
+    echo "::endgroup::"
+    return 0
+  fi
+  if ! [[ "$gh_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "::error::E2E_BEP_PRIVATE_REPO is '$gh_repo', not <owner>/<name>"
+    fail
+  fi
+  bep_live_gate "$gh_case" || { echo "::endgroup::"; return 0; }
+
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlgrant.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = ["base", "coreutils", "git", "ca-certificates"]\n'
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\nscopes = ["github:user-token"]\n'
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+  gh_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-bep-git-credential-helper \
+    --network own_ip --credentialed-upstream \
+    --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+    --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com \
+    </dev/null 2>"$WORK/$gh_case.err")" || {
+    echo "::error::'min session activate' of the proxy_env GitHub grant box failed"
+    echo "--- stdout ---"; printf '%s\n' "$gh_out"
+    echo "--- stderr ---"; cat "$WORK/$gh_case.err" 2>/dev/null || true
+    rm -rf "$GRANT_SEED_DIR"; GRANT_SEED_DIR=""
+    fail
+  }
+  rm -rf "$GRANT_SEED_DIR"; GRANT_SEED_DIR=""
+  gh_sid="$(printf '%s\n' "$gh_out" | tail -n1 | tr -d '\r')"
+  gh_branch="e2e-bep-helper-$(date +%s)-$$"
+
+  # Every helper git finds is the shipped one, set at command scope in the
+  # box environment, and one is for github.com.
+  gh_helpers="$(mnl session exec "$gh_sid" sh -c \
+    "git config --show-origin --get-regexp '^credential\\..*helper\$'" \
+    2>"$WORK/$gh_case.helpers.err" | tr -d '\r')"
+  if printf '%s\n' "$gh_helpers" | grep -v '^command line:' | grep -q . \
+    || ! printf '%s\n' "$gh_helpers" | grep -q 'credential.https://github.com.helper .*git-credential-minimal'; then
+    echo "::error::the grant box does not have the shipped git credential helper as its only helper, for github.com"
+    printf '%s\n' "$gh_helpers"; cat "$WORK/$gh_case.helpers.err" 2>/dev/null || true
+    mnl session destroy --force "$gh_sid" >/dev/null 2>&1 || true
+    fail
+  fi
+  # It answers with the box's sealed value.
+  gh_sealed="$(mnl session exec "$gh_sid" sh -c 'printenv GH_TOKEN' 2>/dev/null | tr -d '\r')"
+  gh_fill="$(mnl session exec "$gh_sid" sh -c \
+    'printf "protocol=https\nhost=github.com\n\n" | GIT_TERMINAL_PROMPT=0 git credential fill' \
+    2>"$WORK/$gh_case.fill.err" | tr -d '\r')"
+  if [ -z "$gh_sealed" ] || [[ "$gh_fill" != *"password=$gh_sealed"* ]]; then
+    echo "::error::'git credential fill' for github.com in the grant box does not answer with the box's sealed GH_TOKEN"
+    cat "$WORK/$gh_case.fill.err" 2>/dev/null || true
+    mnl session destroy --force "$gh_sid" >/dev/null 2>&1 || true
+    fail
+  fi
+
+  # Each step runs on its own, so a failure names the step. The prompt
+  # switch only keeps a refused git from waiting on a terminal.
+  for gh_step in \
+    "clone:rm -rf /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 180 git clone https://github.com/$gh_repo /tmp/bep-repo" \
+    "push:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin HEAD:refs/heads/$gh_branch" \
+    "delete:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin --delete $gh_branch"; do
+    if ! mnl session exec "$gh_sid" sh -c "${gh_step#*:}" \
+      >"$WORK/$gh_case.${gh_step%%:*}.out" 2>&1; then
+      echo "::error::'git ${gh_step%%:*}' against the private repository $gh_repo failed in the grant box with the shipped helper"
+      cat "$WORK/$gh_case.${gh_step%%:*}.out" 2>/dev/null || true
+      mnl session destroy --force "$gh_sid" >/dev/null 2>&1 || true
+      fail
+    fi
+    echo "git ${gh_step%%:*}: OK"
+  done
+
+  # shellcheck disable=SC2016 # $HOME must expand in the box's shell, not here.
+  gh_log="$(mnl session exec "$gh_sid" sh -c \
+    'cat "$HOME/.local/state/minimal/git-credential.log"' 2>/dev/null | tr -d '\r')"
+  mnl session destroy --force "$gh_sid" >/dev/null 2>&1 || true
+  if [[ "$gh_log" != *"answered for host github.com"* ]]; then
+    echo "::error::the git credential helper's log names no answer for github.com"
+    printf '%s\n' "$gh_log"
+    fail
+  fi
+  if [[ "$gh_log" == *"$gh_sealed"* ]]; then
+    echo "::error::the git credential helper's log holds the sealed value"
+    fail
+  fi
+  rm -f "$WORK/$gh_case".*
+  echo "grant box with the shipped helper: git clone and git push against the private repository $gh_repo"
+  echo "::endgroup::"
+}
+
+# The first slice end to end (BEP, T19): one case that walks the slice the
+# way a person does. It needs the sign-in a person made with `min auth
+# login` (the live gate below records NOT RUN without one), then:
+#   1. `min box spec` on the demo project shows the root CA fingerprint, the
+#      grant `github:user-token` marked `full` with the four GitHub hosts,
+#      and the steering `proxy_env`.
+#   2. The demo box starts headless on a credentialed lane, and its GH_TOKEN
+#      holds a sealed value.
+#   3. In that box, `gh api user` answers, and git clones the private
+#      repository E2E_BEP_PRIVATE_REPO and pushes a throwaway branch, which
+#      a second push deletes again.
+#   4. The value copied to the host shell is refused: GitHub answers 401 to
+#      it. The host has no way to reach the proxy itself (BEP-026).
+#   5. The value copied into a second box is refused by the proxy, because
+#      the value names the first box (BEP-020).
+#   6. `min box audit` shows the first box's admits for github.com and
+#      api.github.com, and the second box's refusal marked `cross_box`.
+# The value is never printed: the transcript names only its length.
+# The clone and push use the git credential helper the box carries from
+# creation (#2499, shipped in #2547); the case configures no helper of its
+# own.
+bep_slice_jsonl_check() { # $1 = the jsonl file, $2 = admit or cross_box
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+path, want = sys.argv[1], sys.argv[2]
+records = []
+with open(path) as f:
+    for line in f:
+        line = line.strip()
+        if line:
+            records.append(json.loads(line))
+decisions = [r for r in records if r.get("kind") == "decision"]
+if want == "admit":
+    admits = [r for r in decisions if r.get("decision") == "admit"]
+    seen = {r.get("upstream") for r in admits}
+    missing = [a for a in ("github.com:443", "api.github.com:443") if a not in seen]
+    if missing:
+        print("no admit record for: " + ", ".join(missing))
+        sys.exit(1)
+    if not any(r.get("upstream") == "api.github.com:443"
+               and r.get("identifier") not in (None, "none") for r in admits):
+        print("no admit record for api.github.com:443 names a member: the sealed value was not redeemed")
+        sys.exit(1)
+    print("%d admit record(s), for %s" % (len(admits), ", ".join(sorted(seen))))
+else:
+    hits = [r for r in decisions if r.get("decision") == "refuse" and r.get("marker") == want]
+    if not hits:
+        print("no refuse record marked %s" % want)
+        sys.exit(1)
+    print("%d refuse record(s) marked %s, for %s" % (
+        len(hits), want, ", ".join(sorted({r.get("upstream") for r in hits}))))
+PY
+}
+
+proof_bep_first_slice_end_to_end() {
+  echo "::group::Box Egress Proxy first slice: spec, gh, clone, push, a copied value refused, audit"
+  local fs_case=bep_first_slice_end_to_end fs_repo="${E2E_BEP_PRIVATE_REPO:-}"
+  local fs_out fs_value fs_branch fs_step fs_spec fs_code fs_check
+  local fs_name=e2e-bep-slice-demo fs_name2=e2e-bep-slice-second
+  if [ -z "$fs_repo" ]; then
+    not_run "$fs_case" "no private repository named: set E2E_BEP_PRIVATE_REPO to <owner>/<name>, a private repository the signed-in account can push to"
+    echo "::endgroup::"
+    return 0
+  fi
+  if ! [[ "$fs_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "::error::E2E_BEP_PRIVATE_REPO is '$fs_repo', not <owner>/<name>"
+    fail
+  fi
+  bep_live_gate "$fs_case" || { echo "::endgroup::"; return 0; }
+
+  # Not local: fs_cleanup and fs_fail read them.
+  FS_SID="" FS_SID2=""
+  fs_cleanup() {
+    [ -n "$FS_SID" ] && mnl session destroy --force "$FS_SID" >/dev/null 2>&1
+    [ -n "$FS_SID2" ] && mnl session destroy --force "$FS_SID2" >/dev/null 2>&1
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    return 0
+  }
+  fs_fail() {
+    # The proxy's connection spans, which name the box id, the authority and
+    # the outcome of each request (no credential).
+    echo "--- bep.log (box connections, tail) ---"
+    grep -h 'box_connection' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null \
+      | tail -20 || true
+    fs_cleanup
+    fail
+  }
+
+  # The demo project: the GitHub grant spelt `github:user-token`, proxy_env
+  # steering, and the tools the steps below run.
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlslice.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = ["base", "coreutils", "git", "gh", "ca-certificates"]\n'
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\nscopes = ["github:user-token"]\n'
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+
+  # 1. `min box spec` (BEP-038).
+  if ! fs_spec="$(mnl box spec "$GRANT_SEED_DIR" </dev/null 2>"$WORK/$fs_case.spec.err")"; then
+    echo "::error::'min box spec' of the demo project failed"
+    cat "$WORK/$fs_case.spec.err" 2>/dev/null || true
+    fs_fail
+  fi
+  fs_spec="$(printf '%s\n' "$fs_spec" | tr -d '\r')"
+  for fs_check in \
+    '^root CA  certificate SHA256:[0-9A-Fa-f:]+$' \
+    '^grant  github:user-token  full  GH_TOKEN  hosts github\.com, api\.github\.com, uploads\.github\.com, codeload\.github\.com$' \
+    '^steering  proxy_env$'; do
+    if ! printf '%s\n' "$fs_spec" | grep -Eq -- "$fs_check"; then
+      echo "::error::'min box spec' of the demo project has no line matching: $fs_check"
+      echo "--- min box spec ---"; printf '%s\n' "$fs_spec"
+      fs_fail
+    fi
+  done
+  echo "min box spec: root CA fingerprint, grant github:user-token marked full with the four GitHub hosts, steering proxy_env"
+
+  # 2. The demo box and the second box, headless: a sign-in prompt has no
+  # terminal to ask on. Both stay up until step 6, so the second box's
+  # refusal is cross_box and not revoked.
+  for fs_step in "$fs_name" "$fs_name2"; do
+    fs_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt --name "$fs_step" \
+      --network own_ip --credentialed-upstream \
+      --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+      --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com \
+      </dev/null 2>"$WORK/$fs_case.$fs_step.err")" || {
+      echo "::error::'min session activate' of the box $fs_step failed"
+      echo "--- stdout ---"; printf '%s\n' "$fs_out"
+      echo "--- stderr ---"; cat "$WORK/$fs_case.$fs_step.err" 2>/dev/null || true
+      fs_fail
+    }
+    if [ "$fs_step" = "$fs_name" ]; then
+      FS_SID="$(printf '%s\n' "$fs_out" | tail -n1 | tr -d '\r')"
+    else
+      FS_SID2="$(printf '%s\n' "$fs_out" | tail -n1 | tr -d '\r')"
+    fi
+  done
+
+  if ! mnl session exec "$FS_SID" sh -c 'env' \
+    >"$WORK/$fs_case.env" 2>"$WORK/$fs_case.env.err"; then
+    echo "::error::'min session exec' in the demo box failed"
+    cat "$WORK/$fs_case.env.err" 2>/dev/null || true
+    fs_fail
+  fi
+  fs_value="$(sed -n 's/^GH_TOKEN=//p' "$WORK/$fs_case.env" | tr -d '\r' | head -n1)"
+  if grep -qE '(gh[opusr]_|github_pat_)[A-Za-z0-9_]{20,}' "$WORK/$fs_case.env"; then
+    rm -f "${WORK:?}/${fs_case:?}.env"
+    echo "::error::the environment of the demo box holds a plaintext GitHub token"
+    fs_fail
+  fi
+  rm -f "${WORK:?}/${fs_case:?}.env"
+  if ! [[ "$fs_value" =~ ^[A-Za-z0-9_-]+\.\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]; then
+    echo "::error::the GH_TOKEN value of the demo box is not a sealed value (${#fs_value} characters): it is not in the compact JWE form header..iv.ciphertext.tag"
+    fs_fail
+  fi
+  echo "demo box: GH_TOKEN holds a sealed value (${#fs_value} characters), and no plaintext token"
+
+  # 3. gh, clone and push from the demo box. Each step runs on its own, so a
+  # failure names the tool that failed. The prompt switch only keeps a
+  # refused git from waiting on a terminal: it gives git no credential.
+  fs_branch="e2e-bep-slice-$(date +%s)-$$"
+  for fs_step in \
+    "gh:timeout 60 gh api user --jq .login" \
+    "clone:rm -rf /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 180 git clone https://github.com/$fs_repo /tmp/bep-repo" \
+    "push:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin HEAD:refs/heads/$fs_branch" \
+    "delete:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin --delete $fs_branch"; do
+    if ! mnl session exec "$FS_SID" sh -c "${fs_step#*:}" \
+      >"$WORK/$fs_case.${fs_step%%:*}.out" 2>&1; then
+      echo "::error::'${fs_step%%:*}' against $fs_repo failed in the demo box"
+      cat "$WORK/$fs_case.${fs_step%%:*}.out" 2>/dev/null || true
+      fs_fail
+    fi
+    echo "${fs_step%%:*} in the demo box: OK"
+  done
+
+  # 4. The copied value on the host shell. GitHub sees the sealed value
+  # itself, never a token, and answers 401.
+  fs_code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 \
+    -H "Authorization: token $fs_value" https://api.github.com/user 2>"$WORK/$fs_case.host.err")" || {
+    echo "::error::the host request to api.github.com with the copied value did not complete"
+    cat "$WORK/$fs_case.host.err" 2>/dev/null || true
+    fs_fail
+  }
+  if [ "$fs_code" != 401 ]; then
+    echo "::error::GitHub answered $fs_code, not 401, to the value copied out of the demo box onto the host"
+    fs_fail
+  fi
+  echo "copied value on the host: GitHub answered 401"
+
+  # 5. The copied value in the second box. The proxy refuses it, because the
+  # value names the demo box and the request comes from another box.
+  if mnl session exec "$FS_SID2" sh -c "GH_TOKEN='$fs_value' timeout 60 gh api user --jq .login" \
+    >"$WORK/$fs_case.cross.out" 2>&1; then
+    echo "::error::'gh api user' in the second box succeeded with the value copied out of the demo box"
+    fs_fail
+  fi
+  echo "copied value in the second box: 'gh api user' failed"
+
+  # 6. `min box audit` for each box, by name (BEP-042, BEP-039).
+  for fs_step in "$fs_name:admit" "$fs_name2:cross_box"; do
+    if ! mnl box audit "${fs_step%%:*}" -o jsonl </dev/null \
+      >"$WORK/$fs_case.audit" 2>"$WORK/$fs_case.audit.err"; then
+      echo "::error::'min box audit ${fs_step%%:*}' failed"
+      cat "$WORK/$fs_case.audit.err" 2>/dev/null || true
+      fs_fail
+    fi
+    if ! fs_out="$(bep_slice_jsonl_check "$WORK/$fs_case.audit" "${fs_step#*:}")"; then
+      echo "::error::'min box audit ${fs_step%%:*}': $fs_out"
+      echo "--- min box audit ${fs_step%%:*} -o jsonl ---"; cat "$WORK/$fs_case.audit"
+      fs_fail
+    fi
+    echo "min box audit ${fs_step%%:*}: $fs_out"
+  done
+
+  fs_cleanup
+  rm -f "${WORK:?}/${fs_case:?}".*
+  echo "Box Egress Proxy first slice OK (spec, gh, clone and push of $fs_repo, a copied value refused on the host and in a second box, both boxes audited)"
+  echo "::endgroup::"
+}
+
+# Keychain secret by reference, end to end (BEP-032, BEP-033, BEP-050,
+# BEP-079, BEP-063, BEP-038, BEP-042). With the Box Egress Proxy running:
+#   1. `min secret set` stores a fresh random value under a fresh identifier
+#      from standard input, and writes its rule from --upstream and --header
+#      to the user-level config.toml. It prints the identifier, never the
+#      value, and `min secret list` names the identifier and no value.
+#   2. A box spec references the identifier as a broker grant scope.
+#      `min box spec` shows the reference with its registered upstream.
+#   3. The box sends its sealed value in the rule's header to an HTTPS echo
+#      service, E2E_BEP_STORE_ECHO_URL (default https://httpbin.org/headers).
+#      The default is a public third-party service that this repository does
+#      not control: it sees the request, and the case depends on it. The
+#      value it receives is a fresh random throwaway, never a real secret.
+#      Set E2E_BEP_STORE_ECHO_URL to an echo service you run to avoid it.
+#      The service answers with the headers it received. The box hashes the
+#      echoed header in a pipe and prints only the hash, so the echo is
+#      written to no file and no variable the box exports. The host compares
+#      the hash with the hash of the stored value: the upstream received the
+#      value, not the sealed value.
+#   4. The value is nowhere in the box: not in its environment and not in a
+#      file. The box searches for the value's shape (a fixed prefix and 32
+#      hex digits), so the search itself does not carry the value in.
+#   5. `min box audit` shows the admitted injection for the upstream by
+#      store and identifier, and neither the audit nor bep.log holds the
+#      value.
+# The case needs no GitHub sign-in. The value is never printed: the
+# transcript names only its length. The case removes the item at the end.
+bep_store_jsonl_check() { # $1 = the jsonl file, $2 = the upstream authority, $3 = the store, $4 = the identifier
+  python3 - "$1" "$2" "$3" "$4" <<'PY'
+import json, sys
+path, upstream, store, ident = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+want = store + ":" + ident
+records = []
+with open(path) as f:
+    for line in f:
+        line = line.strip()
+        if line:
+            records.append(json.loads(line))
+hits = [r for r in records
+        if r.get("kind") == "decision" and r.get("decision") == "admit"
+        and r.get("upstream") == upstream
+        and r.get("identifier") == want]
+if not hits:
+    seen = sorted({"%s %s %s" % (r.get("decision"), r.get("upstream"), r.get("identifier"))
+                   for r in records if r.get("kind") == "decision"})
+    print("no admit record for %s names %s (decisions: %s)" % (upstream, want, "; ".join(seen) or "none"))
+    sys.exit(1)
+print("%d admitted injection(s) for %s, by %s" % (
+    len(hits), upstream, ", ".join(sorted({r.get("identifier") for r in hits}))))
+PY
+}
+
+proof_bep_store_reference_end_to_end() {
+  echo "::group::Box Egress Proxy: a Keychain secret by reference reaches its upstream and never enters the box"
+  local sr_case=bep_store_reference_end_to_end
+  local sr_url="${E2E_BEP_STORE_ECHO_URL:-https://httpbin.org/headers}"
+  local sr_host sr_id sr_value sr_out sr_spec sr_got sr_want sr_hits sr_scan sr_audit
+  local sr_name=e2e-bep-store-ref sr_header=X-Minimal-E2E-Probe sr_header_lc=x-minimal-e2e-probe
+  sr_host="${sr_url#https://}"
+  sr_host="${sr_host%%/*}"
+  if [ "$sr_host" = "$sr_url" ] || [ -z "$sr_host" ] || [[ "$sr_host" == *:* ]]; then
+    echo "::error::E2E_BEP_STORE_ECHO_URL is '$sr_url', not an https:// URL on port 443"
+    fail
+  fi
+  bep_live_gate "$sr_case" no_sign_in || { echo "::endgroup::"; return 0; }
+  # r3_proxy_pids selects this run's proxy by its listener socket. Step 1
+  # must leave the same proxy serving.
+  local sr_pids
+  sr_pids="$(r3_proxy_pids)"
+
+  sr_id="e2e-store-ref-$(date +%s)-$$"
+  sr_value="mne2e$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+  # Not local: sr_cleanup and sr_fail read them.
+  SR_SID="" SR_ID="$sr_id"
+  sr_cleanup() {
+    [ -n "$SR_SID" ] && mnl session destroy --force "$SR_SID" >/dev/null 2>&1
+    [ -n "$SR_ID" ] && mnl secret rm "$SR_ID" </dev/null >/dev/null 2>&1
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    return 0
+  }
+  sr_fail() {
+    # The proxy's connection spans name the box, the authority and the
+    # outcome of each request, never a value. On a redeemed store reference
+    # the `box_connection` span also carries `store` and `identifier`, as the
+    # audit record in step 5 does.
+    echo "--- bep.log (box connections, tail) ---"
+    grep -h 'box_connection' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null \
+      | grep -vF -- "$sr_value" | tail -20 || true
+    sr_cleanup
+    rm -f "${WORK:?}/${sr_case:?}".*
+    fail
+  }
+
+  # 1. `min secret set`, with the value on standard input and the rule from
+  # the flags (BEP-050, BEP-079), then `min secret list` (BEP-052).
+  if ! sr_out="$(printf '%s' "$sr_value" | mnl secret set "$sr_id" \
+    --upstream "$sr_host" --header "$sr_header" --yes 2>"$WORK/$sr_case.set.err")"; then
+    echo "::error::'min secret set $sr_id --upstream $sr_host --header $sr_header' failed"
+    grep -vF -- "$sr_value" "$WORK/$sr_case.set.err" 2>/dev/null || true
+    sr_fail
+  fi
+  if printf '%s\n' "$sr_out" | grep -qF -- "$sr_value" \
+    || grep -qF -- "$sr_value" "$WORK/$sr_case.set.err" 2>/dev/null; then
+    echo "::error::'min secret set' printed the value it stored"
+    sr_fail
+  fi
+  if ! printf '%s\n' "$sr_out" | grep -qF -- "$sr_id"; then
+    echo "::error::'min secret set' did not print the identifier $sr_id"
+    echo "--- stdout ---"; printf '%s\n' "$sr_out"
+    sr_fail
+  fi
+  if ! grep -qF -- "$sr_id" "$XDG_CONFIG_HOME/minimal/config.toml" 2>/dev/null; then
+    echo "::error::'min secret set' wrote no rule for $sr_id to $XDG_CONFIG_HOME/minimal/config.toml"
+    sr_fail
+  fi
+  if ! sr_out="$(mnl secret list </dev/null 2>"$WORK/$sr_case.list.err")"; then
+    echo "::error::'min secret list' failed"
+    cat "$WORK/$sr_case.list.err" 2>/dev/null || true
+    sr_fail
+  fi
+  if printf '%s\n' "$sr_out" | grep -qF -- "$sr_value"; then
+    echo "::error::'min secret list' printed the stored value"
+    sr_fail
+  fi
+  if ! printf '%s\n' "$sr_out" | grep -F -- "$sr_id" | grep -qF -- "$sr_host"; then
+    echo "::error::'min secret list' has no row for $sr_id with the upstream $sr_host"
+    echo "--- min secret list ---"; printf '%s\n' "$sr_out"
+    sr_fail
+  fi
+  echo "min secret set: stored $sr_id (${#sr_value} characters) with its rule for $sr_host, and printed no value"
+
+  # `min secret set` asked the running proxy to re-certify its root, and the
+  # proxy published a root with the new rule before it answered. The box in
+  # step 3 activates against that same proxy, with no restart (BEP-013).
+  if grep -qF "did not update its root certificate" "$WORK/$sr_case.set.err" 2>/dev/null; then
+    echo "::error::the running proxy did not re-certify its root for $sr_host after 'min secret set'"
+    grep -vF -- "$sr_value" "$WORK/$sr_case.set.err" 2>/dev/null || true
+    sr_fail
+  fi
+  if [ "$(r3_proxy_pids)" != "$sr_pids" ]; then
+    echo "::error::the proxy is not the one that ran before 'min secret set' (pids '$sr_pids', now '$(r3_proxy_pids)')"
+    sr_fail
+  fi
+  echo "the running proxy re-certified its root for $sr_host, with no restart"
+
+  # 2. The box spec references the identifier (BEP-032), and `min box spec`
+  # shows the reference with its upstream (BEP-038).
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlstore.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = ["base", "coreutils", "ca-certificates"]\n'
+    printf '\n[session.secrets.E2E_STORE_KEY]\nsource = "store"\nstore = "keychain"\nid = "%s"\n' "$sr_id"
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+  if ! sr_spec="$(mnl box spec "$GRANT_SEED_DIR" </dev/null 2>"$WORK/$sr_case.spec.err")"; then
+    echo "::error::'min box spec' of the store-reference project failed"
+    cat "$WORK/$sr_case.spec.err" 2>/dev/null || true
+    sr_fail
+  fi
+  sr_spec="$(printf '%s\n' "$sr_spec" | tr -d '\r')"
+  if ! printf '%s\n' "$sr_spec" | grep -Eq -- "^store  $sr_id  E2E_STORE_KEY  upstream .*$sr_host"; then
+    echo "::error::'min box spec' has no line 'store  $sr_id  E2E_STORE_KEY  upstream $sr_host'"
+    echo "--- min box spec ---"; printf '%s\n' "$sr_spec"
+    sr_fail
+  fi
+  echo "min box spec: store $sr_id for E2E_STORE_KEY, upstream $sr_host"
+
+  # 3. The box, headless, with egress to the upstream only (BEP-036).
+  sr_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt --name "$sr_name" \
+    --network own_ip --credentialed-upstream --allow-dns-hosts "$sr_host" \
+    </dev/null 2>"$WORK/$sr_case.activate.err")" || {
+    echo "::error::'min session activate' of the store-reference box failed"
+    echo "--- stdout ---"; printf '%s\n' "$sr_out"
+    echo "--- stderr ---"; cat "$WORK/$sr_case.activate.err" 2>/dev/null || true
+    sr_fail
+  }
+  SR_SID="$(printf '%s\n' "$sr_out" | tail -n1 | tr -d '\r')"
+
+  # The box prints one word and the hash of the echoed header: "absent" when
+  # the echo has no such header, "sealed" when the upstream got the sealed
+  # value, and "other" for anything else. The echo stays in the pipe.
+  # shellcheck disable=SC2016 # expanded inside the box
+  if ! sr_out="$(mnl session exec "$SR_SID" sh -c '
+      command -v curl >/dev/null || { echo "no curl in the box" >&2; exit 9; }
+      r="$(curl -fsS --max-time 60 -H "'"$sr_header"': $E2E_STORE_KEY" "'"$sr_url"'")" || exit 7
+      v="$(printf "%s" "$r" | tr "[:upper:]" "[:lower:]" \
+        | grep -o "\"'"$sr_header_lc"'\": *\"[^\"]*\"" | head -n1 \
+        | sed "s/^[^:]*: *\"//; s/\"\$//")"
+      r=""
+      if [ -z "$v" ]; then w=absent
+      elif [ "$v" = "$(printf "%s" "$E2E_STORE_KEY" | tr "[:upper:]" "[:lower:]")" ]; then w=sealed
+      else w=other; fi
+      printf "%s %s\n" "$w" "$(printf "%s" "$v" | sha256sum | cut -d" " -f1)"
+    ' </dev/null 2>"$WORK/$sr_case.request.err")"; then
+    echo "::error::the request from the box to $sr_url failed"
+    cat "$WORK/$sr_case.request.err" 2>/dev/null || true
+    sr_fail
+  fi
+  sr_got="$(printf '%s\n' "$sr_out" | tr -d '\r' | tail -n1)"
+  sr_want="other $(printf '%s' "$sr_value" | python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"
+  case "$sr_got" in
+    "$sr_want") ;;
+    absent*)
+      echo "::error::$sr_host received no $sr_header header from the box"
+      sr_fail
+      ;;
+    sealed*)
+      echo "::error::$sr_host received the box's sealed value in $sr_header, not the stored value: the proxy did not inject it"
+      sr_fail
+      ;;
+    *)
+      echo "::error::$sr_host received a $sr_header value that is not the stored value (box answered '${sr_got%% *}')"
+      sr_fail
+      ;;
+  esac
+  echo "request from the box: $sr_host received the stored value in $sr_header"
+
+  # 4. The value is nowhere in the box: its environment holds the sealed
+  # value only, and no file holds the value.
+  if ! mnl session exec "$SR_SID" sh -c 'env' >"$WORK/$sr_case.env" 2>"$WORK/$sr_case.env.err"; then
+    echo "::error::'min session exec' in the store-reference box failed"
+    cat "$WORK/$sr_case.env.err" 2>/dev/null || true
+    sr_fail
+  fi
+  if grep -qF -- "$sr_value" "$WORK/$sr_case.env"; then
+    echo "::error::the environment of the store-reference box holds the stored value"
+    sr_fail
+  fi
+  sr_out="$(sed -n 's/^E2E_STORE_KEY=//p' "$WORK/$sr_case.env" | tr -d '\r' | head -n1)"
+  rm -f "${WORK:?}/${sr_case:?}.env"
+  if ! [[ "$sr_out" =~ ^[A-Za-z0-9_-]+\.\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]; then
+    echo "::error::the E2E_STORE_KEY value of the store-reference box is not a sealed value (${#sr_out} characters): it is not in the compact JWE form header..iv.ciphertext.tag"
+    sr_fail
+  fi
+  # grep exits 2 when it cannot read a file, even after it lists matches.
+  # So the host keeps the match list whatever the exit status, and fails on
+  # a match first. grep's own errors name paths only, never file content.
+  # shellcheck disable=SC2016 # $? and $s expand in the box's shell
+  sr_hits="$(mnl session exec "$SR_SID" sh -c \
+    'timeout 600 grep -rlIE "mne2e[0-9a-f]{32}" / --exclude-dir=proc --exclude-dir=sys --exclude-dir=dev; s=$?; [ "$s" -le 1 ] || exit "$s"' \
+    </dev/null 2>"$WORK/$sr_case.scan.err")"
+  sr_scan=$?
+  sr_hits="$(printf '%s\n' "$sr_hits" | tr -d '\r' | sed '/^$/d')"
+  if [ -n "$sr_hits" ]; then
+    echo "::error::files in the store-reference box hold a value of the stored value's shape:"
+    printf '%s\n' "$sr_hits"
+    sr_fail
+  fi
+  if [ "$sr_scan" -ne 0 ]; then
+    echo "::error::the file search in the store-reference box did not finish (exit $sr_scan)"
+    echo "--- search errors (tail) ---"
+    tail -n 20 "$WORK/$sr_case.scan.err" 2>/dev/null || true
+    sr_fail
+  fi
+  echo "store-reference box: E2E_STORE_KEY holds a sealed value (${#sr_out} characters), and no file or variable holds the stored value"
+
+  # 5. `min box audit` shows the injection by store and identifier (BEP-042),
+  # and no host record holds the value (BEP-033).
+  if ! mnl box audit "$sr_name" -o jsonl </dev/null \
+    >"$WORK/$sr_case.audit" 2>"$WORK/$sr_case.audit.err"; then
+    echo "::error::'min box audit $sr_name' failed"
+    cat "$WORK/$sr_case.audit.err" 2>/dev/null || true
+    sr_fail
+  fi
+  if grep -qF -- "$sr_value" "$WORK/$sr_case.audit"; then
+    echo "::error::'min box audit $sr_name' holds the stored value"
+    sr_fail
+  fi
+  if ! sr_audit="$(bep_store_jsonl_check "$WORK/$sr_case.audit" "$sr_host:443" keychain "$sr_id")"; then
+    echo "::error::'min box audit $sr_name': $sr_audit"
+    sr_fail
+  fi
+  if grep -qF -- "$sr_value" "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null; then
+    echo "::error::bep.log holds the stored value"
+    sr_fail
+  fi
+  echo "min box audit $sr_name: $sr_audit"
+
+  sr_cleanup
+  SR_SID="" SR_ID=""
+  rm -f "${WORK:?}/${sr_case:?}".*
+  echo "Keychain secret by reference OK ($sr_id set with its rule, referenced in a box spec, received by $sr_host, absent from the box, audited)"
+  echo "::endgroup::"
+}
+
+# Destroy-revocation proofs (BEP-043, BEP-067). A grant box "web" and a
+# second grant box start. The case copies web's sealed GH_TOKEN value, and
+# then runs 'min session destroy' on web. The proxy refuses the copied value,
+# and the refusal stays in force after the destroy.
+#   - With the proxy up, `min box audit` on web shows a `revocation` record
+#     within 60 s of the destroy, and the copied value is refused from the
+#     second box.
+#   - With the proxy down, the destroy still completes, and minvmd logs one
+#     warning. After the proxy comes back, a new box sends the copied value,
+#     and the proxy refuses it: no live box holds web's attachment. Web's
+#     trail holds no revocation record.
+# Both need a live proxy, so bep_live_gate records them NOT RUN elsewhere.
+# The value is never printed: the transcript names only its length.
+
+# Starts one grant box named $2 for case $1, headless, and prints its
+# session id. Needs GRANT_SEED_DIR.
+bep_revoke_activate() {
+  local ra_out
+  ra_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt --name "$2" \
+    --network own_ip --credentialed-upstream \
+    --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+    --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com \
+    </dev/null 2>"$WORK/$1.$2.err")" || {
+    echo "::error::'min session activate' of the GitHub grant box $2 failed" >&2
+    echo "--- stdout ---" >&2; printf '%s\n' "$ra_out" >&2
+    echo "--- stderr ---" >&2; cat "$WORK/$1.$2.err" >&2 2>/dev/null || true
+    return 1
+  }
+  printf '%s\n' "$ra_out" | tail -n1 | tr -d '\r'
+}
+
+# Writes the grant seed for case $1 into a new GRANT_SEED_DIR.
+bep_revoke_seed() {
+  GRANT_SEED_DIR="$(hook_mktemp "/tmp/mnlrevoke.XXXXXX")"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = ["base", "coreutils", "gh", "ca-certificates"]\n'
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\nscopes = ["github:user-token"]\n'
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+}
+
+# Prints the sealed GH_TOKEN value of the box $2 for case $1, after one
+# 'gh api user' in the box answers with it.
+bep_revoke_copy_value() {
+  local cv_value
+  if ! mnl session exec "$2" sh -c 'timeout 60 gh api user --jq .login' \
+    >"$WORK/$1.before" 2>&1; then
+    echo "::error::'gh api user' failed in the box web before the destroy, so the case proves nothing" >&2
+    cat "$WORK/$1.before" >&2 2>/dev/null || true
+    return 1
+  fi
+  if ! mnl session exec "$2" sh -c 'env' >"$WORK/$1.env" 2>"$WORK/$1.env.err"; then
+    echo "::error::'min session exec' in the box web failed" >&2
+    cat "$WORK/$1.env.err" >&2 2>/dev/null || true
+    return 1
+  fi
+  cv_value="$(sed -n 's/^GH_TOKEN=//p' "$WORK/$1.env" | tr -d '\r' | head -n1)"
+  rm -f "${WORK:?}/${1:?}.env"
+  if ! [[ "$cv_value" =~ ^[A-Za-z0-9_-]+\.\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]; then
+    echo "::error::the GH_TOKEN value of the box web is not a sealed value (${#cv_value} characters)" >&2
+    return 1
+  fi
+  printf '%s\n' "$cv_value"
+}
+
+# Counts the records of kind $2 in the jsonl file $1.
+bep_revoke_count() {
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+n = 0
+with open(sys.argv[1]) as f:
+    for line in f:
+        line = line.strip()
+        if line and json.loads(line).get("kind") == sys.argv[2]:
+            n += 1
+print(n)
+PY
+}
+
+proof_bep_destroyed_box_values_refused_within_60s() {
+  echo "::group::min session destroy: a value copied from the box is refused within 60 s"
+  local dv_case=bep_destroyed_box_values_refused_within_60s
+  local dv_web=e2e-bep-revoke-web dv_other=e2e-bep-revoke-other
+  local dv_value dv_try dv_count=0 dv_out
+  bep_live_gate "$dv_case" || { echo "::endgroup::"; return 0; }
+
+  # Not local: dv_cleanup reads them.
+  DV_SID="" DV_SID2=""
+  dv_cleanup() {
+    [ -n "$DV_SID" ] && mnl session destroy --force "$DV_SID" >/dev/null 2>&1
+    [ -n "$DV_SID2" ] && mnl session destroy --force "$DV_SID2" >/dev/null 2>&1
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    return 0
+  }
+  dv_fail() { dv_cleanup; fail; }
+
+  bep_revoke_seed "$dv_case"
+  DV_SID="$(bep_revoke_activate "$dv_case" "$dv_web")" || dv_fail
+  DV_SID2="$(bep_revoke_activate "$dv_case" "$dv_other")" || dv_fail
+  dv_value="$(bep_revoke_copy_value "$dv_case" "$DV_SID")" || dv_fail
+  echo "web: 'gh api user' answered, and GH_TOKEN holds a sealed value (${#dv_value} characters)"
+
+  if ! mnl session destroy --force "$DV_SID" </dev/null >/dev/null 2>"$WORK/$dv_case.destroy.err"; then
+    echo "::error::'min session destroy' of the box web failed"
+    cat "$WORK/$dv_case.destroy.err" 2>/dev/null || true
+    dv_fail
+  fi
+  DV_SID=""
+
+  # The revocation record, within 60 s of the destroy.
+  for dv_try in $(seq 1 12); do
+    [ "$dv_try" -gt 1 ] && sleep 5
+    mnl box audit "$dv_web" -o jsonl </dev/null >"$WORK/$dv_case.audit" 2>"$WORK/$dv_case.audit.err" \
+      || continue
+    dv_count="$(bep_revoke_count "$WORK/$dv_case.audit" revocation)"
+    [ "$dv_count" -ge 1 ] && break
+  done
+  if [ "$dv_count" != 1 ]; then
+    echo "::error::'min box audit $dv_web' shows $dv_count revocation records 60 s after the destroy, not 1"
+    echo "--- min box audit $dv_web -o jsonl ---"; cat "$WORK/$dv_case.audit" 2>/dev/null || true
+    cat "$WORK/$dv_case.audit.err" 2>/dev/null || true
+    dv_fail
+  fi
+  echo "min box audit $dv_web: 1 revocation record within 60 s of the destroy"
+
+  # The copied value, from the second box, after the destroy.
+  if mnl session exec "$DV_SID2" sh -c "GH_TOKEN='$dv_value' timeout 60 gh api user --jq .login" \
+    >"$WORK/$dv_case.after" 2>&1; then
+    echo "::error::'gh api user' in the second box succeeded with the value copied from the destroyed box web"
+    dv_fail
+  fi
+  if ! mnl box audit "$dv_other" -o jsonl </dev/null >"$WORK/$dv_case.audit2" 2>&1 \
+    || ! dv_out="$(bep_slice_jsonl_check "$WORK/$dv_case.audit2" cross_box)"; then
+    echo "::error::'min box audit $dv_other' shows no refusal of the copied value: $dv_out"
+    cat "$WORK/$dv_case.audit2" 2>/dev/null || true
+    dv_fail
+  fi
+  echo "copied value in the second box after the destroy: 'gh api user' failed, and min box audit shows $dv_out"
+
+  dv_cleanup
+  rm -f "${WORK:?}/${dv_case:?}".*
+  echo "Destroy revocation OK (one revocation record within 60 s, and the copied value refused)"
+  echo "::endgroup::"
+}
+
+# Re-creation proof (BEP-070). A grant box starts under a name, and the case
+# copies its sealed GH_TOKEN value. 'min session destroy' removes the box, and
+# a new grant box starts under the same name.
+#   - 'min box audit <name>' names a different box id for each box: the name
+#     is an alias, and each creation gets an id of its own.
+#   - In the new box, 'gh api user' answers with the box's own value, and
+#     'min box audit' shows an admit record for api.github.com that names a
+#     member: the proxy redeemed the new value.
+#   - The value copied from the destroyed box is refused in the new box,
+#     though both boxes have one name: the value names the old id.
+# It needs a live proxy, so bep_live_gate records it NOT RUN elsewhere. The
+# values are never printed: the transcript names only their lengths.
+
+# Prints the box id that 'min box audit $2' names for case $1, from its
+# "Showing <name> (box <id>)." line.
+bep_recreate_audited_id() {
+  local ai_err
+  if ! mnl box audit "$2" -o jsonl </dev/null >"$WORK/$1.$2.audit" 2>"$WORK/$1.$2.audit.err"; then
+    echo "::error::'min box audit $2' failed" >&2
+    cat "$WORK/$1.$2.audit.err" >&2 2>/dev/null || true
+    return 1
+  fi
+  ai_err="$(cat "$WORK/$1.$2.audit.err" 2>/dev/null || true)"
+  if ! [[ "$ai_err" =~ \(box\ ([0-9a-fA-F-]+)\)\. ]]; then
+    echo "::error::'min box audit $2' names no box id" >&2
+    printf '%s\n' "$ai_err" >&2
+    return 1
+  fi
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+proof_bep_box_recreated_under_its_name_redeems() {
+  echo "::group::a box re-created under its name redeems its own values, and the old value stays refused"
+  local rc_case=bep_box_recreated_under_its_name_redeems
+  local rc_name=e2e-bep-recreate
+  local rc_old_value rc_new_value rc_old_id rc_new_id rc_try rc_count=0 rc_out
+  bep_live_gate "$rc_case" || { echo "::endgroup::"; return 0; }
+
+  # Not local: rc_cleanup reads it.
+  RC_SID=""
+  rc_cleanup() {
+    [ -n "$RC_SID" ] && mnl session destroy --force "$RC_SID" >/dev/null 2>&1
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    return 0
+  }
+  rc_fail() { rc_cleanup; fail; }
+
+  # The first box under the name, and the value copied from it.
+  bep_revoke_seed "$rc_case"
+  RC_SID="$(bep_revoke_activate "$rc_case" "$rc_name")" || rc_fail
+  rc_old_value="$(bep_revoke_copy_value "$rc_case" "$RC_SID")" || rc_fail
+  rc_old_id="$(bep_recreate_audited_id "$rc_case" "$rc_name")" || rc_fail
+  echo "first $rc_name (box $rc_old_id): 'gh api user' answered, and GH_TOKEN holds a sealed value (${#rc_old_value} characters)"
+
+  if ! mnl session destroy --force "$RC_SID" </dev/null >/dev/null 2>"$WORK/$rc_case.destroy.err"; then
+    echo "::error::'min session destroy' of the first box $rc_name failed"
+    cat "$WORK/$rc_case.destroy.err" 2>/dev/null || true
+    rc_fail
+  fi
+  RC_SID=""
+  # The destroy's revocation record, by the old id: the name is the new
+  # box's from here on.
+  for rc_try in $(seq 1 12); do
+    [ "$rc_try" -gt 1 ] && sleep 5
+    mnl box audit "$rc_old_id" -o jsonl </dev/null >"$WORK/$rc_case.old.audit" 2>"$WORK/$rc_case.old.audit.err" \
+      || continue
+    rc_count="$(bep_revoke_count "$WORK/$rc_case.old.audit" revocation)"
+    [ "$rc_count" -ge 1 ] && break
+  done
+  if [ "$rc_count" != 1 ]; then
+    echo "::error::'min box audit $rc_old_id' shows $rc_count revocation records 60 s after the destroy, not 1"
+    cat "$WORK/$rc_case.old.audit" "$WORK/$rc_case.old.audit.err" 2>/dev/null || true
+    rc_fail
+  fi
+  echo "min box audit $rc_old_id: 1 revocation record after the destroy"
+
+  # The second box under the same name: an id of its own, and its own value
+  # redeems.
+  RC_SID="$(bep_revoke_activate "$rc_case" "$rc_name")" || rc_fail
+  rc_new_value="$(bep_revoke_copy_value "$rc_case" "$RC_SID")" || {
+    echo "::error::the box re-created under $rc_name did not redeem its own value"
+    rc_fail
+  }
+  rc_new_id="$(bep_recreate_audited_id "$rc_case" "$rc_name")" || rc_fail
+  if [ "$rc_new_id" = "$rc_old_id" ]; then
+    echo "::error::'min box audit $rc_name' names box $rc_new_id for both boxes: the re-created box reused the destroyed box's id"
+    rc_fail
+  fi
+  if [ "$rc_new_value" = "$rc_old_value" ]; then
+    echo "::error::the re-created box holds the destroyed box's sealed value"
+    rc_fail
+  fi
+  if ! rc_out="$(python3 - "$WORK/$rc_case.$rc_name.audit" <<'PY'
+import json, sys
+admits = []
+with open(sys.argv[1]) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        r = json.loads(line)
+        if (r.get("kind") == "decision" and r.get("decision") == "admit"
+                and r.get("upstream") == "api.github.com:443"
+                and r.get("identifier") not in (None, "none")):
+            admits.append(r)
+if not admits:
+    print("no admit record for api.github.com:443 names a member")
+    sys.exit(1)
+print("%d admit record(s) for api.github.com:443" % len(admits))
+PY
+)"; then
+    echo "::error::'min box audit $rc_name' shows the re-created box's value was not redeemed: $rc_out"
+    cat "$WORK/$rc_case.$rc_name.audit" 2>/dev/null || true
+    rc_fail
+  fi
+  echo "second $rc_name (box $rc_new_id): 'gh api user' answered with its own value (${#rc_new_value} characters), and min box audit shows $rc_out"
+
+  # The destroyed box's value, in the box that now has its name.
+  if mnl session exec "$RC_SID" sh -c "GH_TOKEN='$rc_old_value' timeout 60 gh api user --jq .login" \
+    >"$WORK/$rc_case.old-value" 2>&1; then
+    echo "::error::'gh api user' in the re-created box succeeded with the value copied from the destroyed box of the same name"
+    rc_fail
+  fi
+  if ! mnl box audit "$rc_new_id" -o jsonl </dev/null >"$WORK/$rc_case.new.audit" 2>&1 \
+    || ! rc_out="$(bep_slice_jsonl_check "$WORK/$rc_case.new.audit" cross_box)"; then
+    echo "::error::'min box audit $rc_new_id' shows no refusal of the destroyed box's value: $rc_out"
+    cat "$WORK/$rc_case.new.audit" 2>/dev/null || true
+    rc_fail
+  fi
+  echo "destroyed box's value in the re-created box: 'gh api user' failed, and min box audit shows $rc_out"
+
+  rc_cleanup
+  rm -f "${WORK:?}/${rc_case:?}".*
+  echo "Re-created box OK (a new box id under the old name, its own value redeemed, the old value refused)"
+  echo "::endgroup::"
+}
+
+proof_bep_destroy_with_proxy_down_refuses_by_attachment() {
+  echo "::group::min session destroy with the proxy down: the destroy completes, and the value is refused"
+  local pd_case=bep_destroy_with_proxy_down_refuses_by_attachment
+  local pd_web=e2e-bep-down-web pd_probe=e2e-bep-down-probe
+  # This reads the real home, which no earlier subshell export changes.
+  # shellcheck disable=SC2031
+  local pd_control="$HOME/.minimal/bep/control.sock"
+  local pd_value pd_pids pd_try pd_count pd_out pd_id
+  bep_live_gate "$pd_case" || { echo "::endgroup::"; return 0; }
+
+  # Not local: pd_cleanup reads them.
+  PD_SID="" PD_SID2=""
+  pd_cleanup() {
+    [ -n "$PD_SID" ] && mnl session destroy --force "$PD_SID" >/dev/null 2>&1
+    [ -n "$PD_SID2" ] && mnl session destroy --force "$PD_SID2" >/dev/null 2>&1
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    return 0
+  }
+  pd_fail() { pd_cleanup; fail; }
+
+  bep_revoke_seed "$pd_case"
+  PD_SID="$(bep_revoke_activate "$pd_case" "$pd_web")" || pd_fail
+  pd_value="$(bep_revoke_copy_value "$pd_case" "$PD_SID")" || pd_fail
+  echo "web: 'gh api user' answered, and GH_TOKEN holds a sealed value (${#pd_value} characters)"
+
+  # Stop the proxy. minvmd does not restart it, so it stays down.
+  pd_pids="$(pgrep -f '/bep serve ' 2>/dev/null || true)"
+  if [ -z "$pd_pids" ]; then
+    echo "::error::no 'bep serve' process runs, though the proxy answered on $pd_control"
+    pd_fail
+  fi
+  # shellcheck disable=SC2086
+  kill -KILL $pd_pids 2>/dev/null || true
+  for pd_try in $(seq 1 20); do
+    bep_control_live "$pd_control" || break
+    sleep 0.5
+  done
+  if bep_control_live "$pd_control"; then
+    echo "::error::the proxy still answers on $pd_control after its process was killed"
+    pd_fail
+  fi
+  BEP_LIVE_DAEMON=""
+  echo "the proxy is down"
+
+  if ! mnl session destroy --force "$PD_SID" </dev/null >/dev/null 2>"$WORK/$pd_case.destroy.err"; then
+    echo "::error::'min session destroy' of the box web failed with the proxy down: the destroy must complete"
+    cat "$WORK/$pd_case.destroy.err" 2>/dev/null || true
+    pd_fail
+  fi
+  PD_SID=""
+  echo "min session destroy of web completed with the proxy down"
+  for pd_try in $(seq 1 20); do
+    [ "$pd_try" -gt 1 ] && sleep 0.5
+    pd_out="$(minvmd_log_lines 'the destroy completed without a revocation from the Box Egress Proxy' | tail -n1)"
+    [ -n "$pd_out" ] && break
+  done
+  if [ -z "$pd_out" ]; then
+    echo "::error::minvmd logged no warning that the destroy completed without a revocation from the proxy"
+    pd_fail
+  fi
+  echo "minvmd log: the destroy completed without a revocation from the proxy"
+
+  # The proxy comes back with the restarted daemon pair. A new box sends
+  # the copied value, and the proxy refuses it.
+  bep_live_gate "$pd_case" || pd_fail
+  PD_SID2="$(bep_revoke_activate "$pd_case" "$pd_probe")" || pd_fail
+  if mnl session exec "$PD_SID2" sh -c "GH_TOKEN='$pd_value' timeout 60 gh api user --jq .login" \
+    >"$WORK/$pd_case.after" 2>&1; then
+    echo "::error::'gh api user' in a new box succeeded with the value copied from the destroyed box web"
+    pd_fail
+  fi
+  if ! mnl box audit "$pd_probe" -o jsonl </dev/null >"$WORK/$pd_case.audit2" 2>&1 \
+    || ! pd_out="$(bep_slice_jsonl_check "$WORK/$pd_case.audit2" cross_box)"; then
+    echo "::error::'min box audit $pd_probe' shows no refusal of the copied value: $pd_out"
+    cat "$WORK/$pd_case.audit2" 2>/dev/null || true
+    pd_fail
+  fi
+  echo "copied value in a new box: 'gh api user' failed, and min box audit shows $pd_out"
+
+  # No revocation was recorded: the refusal is the withdrawn attachment's.
+  if ! mnl box audit "$pd_web" -o jsonl </dev/null >"$WORK/$pd_case.audit" 2>"$WORK/$pd_case.audit.err"; then
+    echo "::error::'min box audit $pd_web' failed"
+    cat "$WORK/$pd_case.audit.err" 2>/dev/null || true
+    pd_fail
+  fi
+  pd_count="$(bep_revoke_count "$WORK/$pd_case.audit" revocation)"
+  if [ "$pd_count" != 0 ]; then
+    echo "::error::'min box audit $pd_web' shows $pd_count revocation records, though the proxy was down at the destroy"
+    pd_fail
+  fi
+  pd_id="$(bep_revoke_count "$WORK/$pd_case.audit" decision)"
+  echo "min box audit $pd_web: $pd_id decision records and no revocation record"
+
+  pd_cleanup
+  rm -f "${WORK:?}/${pd_case:?}".*
+  echo "Destroy with the proxy down OK (the destroy completed, and the copied value was refused after the proxy came back)"
+  echo "::endgroup::"
+}
+
+# A signing rotation under a running grant box (BEP-061, T52): one grant box
+# clones and pushes, `bep --rotate-signing` rotates the proxy's signing
+# certificate, and the same box clones and pushes again. The box is never
+# re-created: every step runs in the box id the activation printed, and the
+# case checks that the box is still listed under that id after the rotation.
+# `min box spec` prints the root CA fingerprint before and after the
+# rotation, and the two must match: a rotation changes the certificate below
+# the root, never the root the box trusts. The case needs the sign-in a
+# person made with `min auth login` and the private repository
+# E2E_BEP_PRIVATE_REPO, and records NOT RUN without them, as
+# bep_first_slice_end_to_end does. The clone and push use the git credential
+# helper the box carries from creation (#2499, shipped in #2547).
+proof_bep_signing_rotation_keeps_running_box_working() {
+  echo "::group::Box Egress Proxy signing rotation: a running grant box clones and pushes before and after"
+  local sr_case=bep_signing_rotation_keeps_running_box_working sr_repo="${E2E_BEP_PRIVATE_REPO:-}"
+  local sr_out sr_spec sr_root_before sr_root_after sr_round sr_step sr_branch sr_bep sr_ls
+  local sr_name=e2e-bep-signing-rotation
+  # This reads the real home, as bep_live_gate does.
+  # shellcheck disable=SC2031
+  local sr_control="$HOME/.minimal/bep/control.sock"
+  if [ -z "$sr_repo" ]; then
+    not_run "$sr_case" "no private repository named: set E2E_BEP_PRIVATE_REPO to <owner>/<name>, a private repository the signed-in account can push to"
+    echo "::endgroup::"
+    return 0
+  fi
+  if ! [[ "$sr_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "::error::E2E_BEP_PRIVATE_REPO is '$sr_repo', not <owner>/<name>"
+    fail
+  fi
+  bep_live_gate "$sr_case" || { echo "::endgroup::"; return 0; }
+
+  # The bep binary the VM host daemon starts: MINVMD_BEP_BIN, else the bep
+  # beside minvmd (crates/minvmd/src/cmd/run.rs, resolve_bep_binary).
+  sr_bep="${MINVMD_BEP_BIN:-}"
+  if [ -z "$sr_bep" ]; then
+    sr_bep="$(command -v minvmd 2>/dev/null || true)"
+    sr_bep="${sr_bep%/*}/bep"
+  fi
+  if [ ! -x "$sr_bep" ]; then
+    echo "::error::no bep binary at '$sr_bep': set MINVMD_BEP_BIN to the bep binary the VM host daemon runs"
+    fail
+  fi
+
+  # Not local: sr_cleanup and sr_fail read them.
+  SR_SID=""
+  sr_cleanup() {
+    [ -n "$SR_SID" ] && mnl session destroy --force "$SR_SID" >/dev/null 2>&1
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    return 0
+  }
+  sr_fail() {
+    echo "--- bep.log (box connections, tail) ---"
+    grep -h 'box_connection' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null \
+      | tail -20 || true
+    sr_cleanup
+    fail
+  }
+  # The root CA fingerprint from `min box spec` of the project ($1 = the
+  # round, for the error).
+  sr_root_fingerprint() {
+    if ! sr_spec="$(mnl box spec "$GRANT_SEED_DIR" </dev/null 2>"$WORK/$sr_case.spec.err")"; then
+      echo "::error::'min box spec' of the grant project failed $1 the rotation" >&2
+      cat "$WORK/$sr_case.spec.err" >&2 2>/dev/null || true
+      return 1
+    fi
+    sr_spec="$(printf '%s\n' "$sr_spec" | tr -d '\r' \
+      | sed -n 's/^root CA  certificate \(SHA256:[0-9A-Fa-f:]*\)$/\1/p' | head -n1)"
+    if [ -z "$sr_spec" ]; then
+      echo "::error::'min box spec' of the grant project prints no root CA fingerprint $1 the rotation" >&2
+      return 1
+    fi
+    printf '%s\n' "$sr_spec"
+  }
+
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlrotate.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = ["base", "coreutils", "git", "ca-certificates"]\n'
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\nscopes = ["github:user-token"]\n'
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+
+  sr_root_before="$(sr_root_fingerprint before)" || sr_fail
+  echo "root CA before the rotation: $sr_root_before"
+
+  # The grant box, headless: a sign-in prompt has no terminal to ask on.
+  sr_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt --name "$sr_name" \
+    --network own_ip --credentialed-upstream \
+    --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+    --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com \
+    </dev/null 2>"$WORK/$sr_case.activate.err")" || {
+    echo "::error::'min session activate' of the grant box $sr_name failed"
+    echo "--- stdout ---"; printf '%s\n' "$sr_out"
+    echo "--- stderr ---"; cat "$WORK/$sr_case.activate.err" 2>/dev/null || true
+    sr_fail
+  }
+  SR_SID="$(printf '%s\n' "$sr_out" | tail -n1 | tr -d '\r')"
+  echo "grant box: $SR_SID"
+
+  for sr_round in before after; do
+    if [ "$sr_round" = after ]; then
+      # The rotation, through the serving proxy's control socket.
+      if ! sr_out="$("$sr_bep" --rotate-signing --control "$sr_control" \
+        </dev/null 2>"$WORK/$sr_case.rotate.err")"; then
+        echo "::error::'bep --rotate-signing' failed"
+        cat "$WORK/$sr_case.rotate.err" 2>/dev/null || true
+        sr_fail
+      fi
+      if [[ "$sr_out" != "Signing certificate rotated from "* ]]; then
+        echo "::error::'bep --rotate-signing' did not report a rotation"
+        printf '%s\n' "$sr_out"
+        sr_fail
+      fi
+      echo "rotation: $sr_out"
+      # The same box, under the same id: the rotation re-created nothing.
+      # Capture-then-glob, never `mnl ls | grep -q`: grep's early exit
+      # SIGPIPEs the pipeline under pipefail and fails a healthy box.
+      sr_ls="$(mnl ls </dev/null 2>/dev/null)"
+      sr_ls="${sr_ls//$'\r'/}"
+      if [[ "$sr_ls" != *"$SR_SID"* ]]; then
+        echo "::error::'min ls' does not list the grant box $SR_SID after the rotation"
+        printf '%s\n' "$sr_ls"
+        sr_fail
+      fi
+    fi
+    # Each step runs on its own, so a failure names the tool that failed. The
+    # prompt switch only keeps a refused git from waiting on a terminal: it
+    # gives git no credential.
+    sr_branch="e2e-bep-rotate-$sr_round-$(date +%s)-$$"
+    for sr_step in \
+      "clone:rm -rf /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 180 git clone https://github.com/$sr_repo /tmp/bep-repo" \
+      "push:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin HEAD:refs/heads/$sr_branch" \
+      "delete:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin --delete $sr_branch"; do
+      if ! mnl session exec "$SR_SID" sh -c "${sr_step#*:}" \
+        >"$WORK/$sr_case.$sr_round.${sr_step%%:*}.out" 2>&1; then
+        echo "::error::'git ${sr_step%%:*}' against $sr_repo failed in the grant box $sr_round the rotation"
+        cat "$WORK/$sr_case.$sr_round.${sr_step%%:*}.out" 2>/dev/null || true
+        sr_fail
+      fi
+      echo "git ${sr_step%%:*} $sr_round the rotation: OK"
+    done
+  done
+
+  sr_root_after="$(sr_root_fingerprint after)" || sr_fail
+  echo "root CA after the rotation: $sr_root_after"
+  if [ "$sr_root_after" != "$sr_root_before" ]; then
+    echo "::error::the root CA fingerprint changed across the signing rotation: $sr_root_before before, $sr_root_after after"
+    sr_fail
+  fi
+
+  sr_cleanup
+  rm -f "${WORK:?}/${sr_case:?}".*
+  echo "Box Egress Proxy signing rotation OK (the box $SR_SID cloned and pushed $sr_repo before and after the rotation, never re-created, root CA $sr_root_before unchanged)"
+  echo "::endgroup::"
+}
+
+# Logout proof (BEP-044): `min auth logout` deletes the sign-in item, and
+# every running box's next GitHub request is refused, while the boxes keep
+# running. Two boxes that declare a GitHub grant each answer `gh api user`
+# through the proxy. Then `min auth logout` runs, `min auth status` reports
+# no sign-in, and `gh api user` fails in both boxes. `min box audit` shows a
+# refusal marked `github_sign_in_required` for each box. The case signs this
+# machine out of GitHub, so it runs only with E2E_BEP_LOGOUT=1, and the
+# whole-lane run orders it after every other live proxy case. Sign in again
+# with `min auth login` after it. That a later sign-in revives none of the
+# refused references is proven by the unit test
+# sign_in_after_logout_revives_no_earlier_reference: a sign-in needs a
+# person at the device flow, and this script has none.
+proof_bep_logout_refuses_every_reference_at_next_request() {
+  echo "::group::min auth logout: every box's next GitHub request is refused"
+  local lo_case=bep_logout_refuses_every_reference_at_next_request
+  local lo_out lo_name lo_sid lo_sids="" lo_status
+  if [ "${E2E_BEP_LOGOUT:-}" != 1 ]; then
+    not_run "$lo_case" "the case signs this machine out of GitHub: set E2E_BEP_LOGOUT=1 to run it, then run 'min auth login' again"
+    echo "::endgroup::"
+    return 0
+  fi
+  bep_live_gate "$lo_case" || { echo "::endgroup::"; return 0; }
+
+  # Not local: lo_cleanup reads them.
+  LO_SIDS=""
+  lo_cleanup() {
+    local c_sid
+    for c_sid in $LO_SIDS; do
+      mnl session destroy --force "$c_sid" >/dev/null 2>&1
+    done
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    return 0
+  }
+  lo_fail() {
+    echo "--- bep.log (box connections, tail) ---"
+    grep -h 'box_connection' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null \
+      | tail -20 || true
+    lo_cleanup
+    fail
+  }
+
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnllogout.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = ["base", "coreutils", "gh", "ca-certificates"]\n'
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\nscopes = ["github:user-token"]\n'
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+
+  # Two grant boxes, headless. Each answers `gh api user` before the logout,
+  # so a refusal after it is the logout's.
+  for lo_name in e2e-bep-logout-first e2e-bep-logout-second; do
+    lo_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt --name "$lo_name" \
+      --network own_ip --credentialed-upstream \
+      --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+      --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com \
+      </dev/null 2>"$WORK/$lo_case.$lo_name.err")" || {
+      echo "::error::'min session activate' of the GitHub grant box $lo_name failed"
+      echo "--- stdout ---"; printf '%s\n' "$lo_out"
+      echo "--- stderr ---"; cat "$WORK/$lo_case.$lo_name.err" 2>/dev/null || true
+      lo_fail
+    }
+    lo_sid="$(printf '%s\n' "$lo_out" | tail -n1 | tr -d '\r')"
+    LO_SIDS="$LO_SIDS $lo_sid"
+    lo_sids="$lo_sids $lo_name:$lo_sid"
+    if ! mnl session exec "$lo_sid" sh -c 'timeout 60 gh api user --jq .login' \
+      >"$WORK/$lo_case.$lo_name.before" 2>&1; then
+      echo "::error::'gh api user' failed in the box $lo_name before the logout, so the case proves nothing"
+      cat "$WORK/$lo_case.$lo_name.before" 2>/dev/null || true
+      lo_fail
+    fi
+    echo "$lo_name before the logout: 'gh api user' answered"
+  done
+
+  # The logout. It succeeds whether or not GitHub confirms the revocation.
+  if ! lo_out="$(mnl auth logout </dev/null 2>"$WORK/$lo_case.logout.err")"; then
+    echo "::error::'min auth logout' failed"
+    echo "--- stdout ---"; printf '%s\n' "$lo_out"
+    echo "--- stderr ---"; cat "$WORK/$lo_case.logout.err" 2>/dev/null || true
+    lo_fail
+  fi
+  lo_out="$(printf '%s\n' "$lo_out" | tr -d '\r')"
+  if [ "$lo_out" != "Signed out of GitHub. Boxes created before now lose GitHub access at their next request." ]; then
+    echo "::error::'min auth logout' printed an unexpected line on stdout"
+    printf '%s\n' "$lo_out"
+    lo_fail
+  fi
+  if grep -qF "GitHub did not confirm the sign-out" "$WORK/$lo_case.logout.err"; then
+    echo "min auth logout: the sign-in is deleted, and GitHub did not confirm the revocation"
+  else
+    echo "min auth logout: the sign-in is deleted, and GitHub confirmed the revocation"
+  fi
+  lo_status="$(mnl auth status </dev/null 2>&1 | tr -d '\r')"
+  if [[ "$lo_status" != "Not signed in to GitHub."* ]]; then
+    echo "::error::'min auth status' after the logout does not report that no sign-in is held"
+    printf '%s\n' "$lo_status"
+    lo_fail
+  fi
+
+  # The next request of each box is refused, and each box keeps running.
+  for lo_sid in $lo_sids; do
+    lo_name="${lo_sid%%:*}"
+    lo_sid="${lo_sid#*:}"
+    if mnl session exec "$lo_sid" sh -c 'timeout 60 gh api user --jq .login' \
+      >"$WORK/$lo_case.$lo_name.after" 2>&1; then
+      echo "::error::'gh api user' in the box $lo_name succeeded after 'min auth logout'"
+      cat "$WORK/$lo_case.$lo_name.after" 2>/dev/null || true
+      lo_fail
+    fi
+    if ! mnl session exec "$lo_sid" true >/dev/null 2>"$WORK/$lo_case.$lo_name.alive"; then
+      echo "::error::the box $lo_name does not run a command after the logout: the logout must keep the box's processes running"
+      cat "$WORK/$lo_case.$lo_name.alive" 2>/dev/null || true
+      lo_fail
+    fi
+    if ! mnl box audit "$lo_name" -o jsonl </dev/null \
+      >"$WORK/$lo_case.audit" 2>"$WORK/$lo_case.audit.err"; then
+      echo "::error::'min box audit $lo_name' failed"
+      cat "$WORK/$lo_case.audit.err" 2>/dev/null || true
+      lo_fail
+    fi
+    if ! lo_out="$(bep_slice_jsonl_check "$WORK/$lo_case.audit" github_sign_in_required)"; then
+      echo "::error::'min box audit $lo_name': $lo_out"
+      echo "--- min box audit $lo_name -o jsonl ---"; cat "$WORK/$lo_case.audit"
+      lo_fail
+    fi
+    echo "$lo_name after the logout: 'gh api user' failed, the box still runs, and min box audit shows $lo_out"
+  done
+
+  lo_cleanup
+  rm -f "${WORK:?}/${lo_case:?}".*
+  echo "Logout proof OK (both boxes refused at their next request after 'min auth logout'). Run 'min auth login' to sign this machine in again."
+  echo "::endgroup::"
+}
+
+# Revoke and sign out, end to end (BEP T23). One box name carries the whole
+# story, and each step shows its refusal or its admit in 'min box audit':
+#   1. A grant box starts under the name, 'gh api user' answers, and the case
+#      copies its sealed GH_TOKEN value.
+#   2. 'min session destroy' removes it. 'min box audit <old id>' shows one
+#      revocation record within 60 s.
+#   3. A new grant box starts under the same name. It gets a new box id, its
+#      own value redeems (an admit record), and the copied value is refused
+#      in it (a cross_box refusal).
+#   4. 'min auth logout' runs. The next 'gh api user' in the box is refused
+#      (a github_sign_in_required refusal), and the box keeps running.
+#   5. 'min auth login --device' signs this machine in again. The person who
+#      runs the case enters the code that the command prints.
+#   6. The box's own value stays refused (one more github_sign_in_required
+#      refusal), and the destroyed box's value stays refused (one more
+#      cross_box refusal). A box started after the sign-in redeems.
+# The case signs this machine out of GitHub and needs a person at the device
+# flow, so it runs only with E2E_BEP_LOGOUT=1, and bep_live_gate records it
+# NOT RUN where no proxy can run. The values are never printed: the
+# transcript names only their lengths.
+
+# Counts the refuse records marked $2 in the jsonl file $1.
+bep_e2e_refusals() {
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+n = 0
+with open(sys.argv[1]) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        r = json.loads(line)
+        if r.get("kind") == "decision" and r.get("decision") == "refuse" and r.get("marker") == sys.argv[2]:
+            n += 1
+print(n)
+PY
+}
+
+# Counts the admit records for api.github.com:443 that name a member, in the
+# jsonl file $1.
+bep_e2e_admits() {
+  python3 - "$1" <<'PY'
+import json, sys
+n = 0
+with open(sys.argv[1]) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        r = json.loads(line)
+        if (r.get("kind") == "decision" and r.get("decision") == "admit"
+                and r.get("upstream") == "api.github.com:443"
+                and r.get("identifier") not in (None, "none")):
+            n += 1
+print(n)
+PY
+}
+
+proof_bep_revoke_and_sign_out_end_to_end() {
+  echo "::group::destroy, re-create, log out and sign in again: each refusal and admit"
+  local ee_case=bep_revoke_and_sign_out_end_to_end
+  local ee_name=e2e-bep-end-to-end ee_after=e2e-bep-end-to-end-after
+  local ee_old_value ee_new_value ee_old_id ee_new_id ee_try ee_count=0 ee_n
+  local ee_out ee_status ee_cross ee_signin
+  if [ "${E2E_BEP_LOGOUT:-}" != 1 ]; then
+    not_run "$ee_case" "the case signs this machine out of GitHub and asks for a sign-in code: set E2E_BEP_LOGOUT=1 to run it"
+    echo "::endgroup::"
+    return 0
+  fi
+  bep_live_gate "$ee_case" || { echo "::endgroup::"; return 0; }
+
+  # Not local: ee_cleanup reads them.
+  EE_SID="" EE_SID2=""
+  ee_cleanup() {
+    [ -n "$EE_SID" ] && mnl session destroy --force "$EE_SID" >/dev/null 2>&1
+    [ -n "$EE_SID2" ] && mnl session destroy --force "$EE_SID2" >/dev/null 2>&1
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    return 0
+  }
+  ee_fail() {
+    echo "--- bep.log (box connections, tail) ---"
+    grep -h 'box_connection\|revocation\|logout' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null \
+      | tail -20 || true
+    ee_cleanup
+    fail
+  }
+  # Writes 'min box audit $1' to $WORK/$ee_case.audit, or fails the case.
+  ee_audit() {
+    if ! mnl box audit "$1" -o jsonl </dev/null >"$WORK/$ee_case.audit" 2>"$WORK/$ee_case.audit.err"; then
+      echo "::error::'min box audit $1' failed"
+      cat "$WORK/$ee_case.audit.err" 2>/dev/null || true
+      ee_fail
+    fi
+  }
+
+  # 1. The first box under the name, and the value copied from it.
+  bep_revoke_seed "$ee_case"
+  EE_SID="$(bep_revoke_activate "$ee_case" "$ee_name")" || ee_fail
+  ee_old_value="$(bep_revoke_copy_value "$ee_case" "$EE_SID")" || ee_fail
+  ee_old_id="$(bep_recreate_audited_id "$ee_case" "$ee_name")" || ee_fail
+  echo "first $ee_name (box $ee_old_id): 'gh api user' answered, and GH_TOKEN holds a sealed value (${#ee_old_value} characters)"
+
+  # 2. The destroy, and its revocation record within 60 s.
+  if ! mnl session destroy --force "$EE_SID" </dev/null >/dev/null 2>"$WORK/$ee_case.destroy.err"; then
+    echo "::error::'min session destroy' of the first box $ee_name failed"
+    cat "$WORK/$ee_case.destroy.err" 2>/dev/null || true
+    ee_fail
+  fi
+  EE_SID=""
+  for ee_try in $(seq 1 12); do
+    [ "$ee_try" -gt 1 ] && sleep 5
+    mnl box audit "$ee_old_id" -o jsonl </dev/null >"$WORK/$ee_case.old.audit" 2>"$WORK/$ee_case.old.audit.err" \
+      || continue
+    ee_count="$(bep_revoke_count "$WORK/$ee_case.old.audit" revocation)"
+    [ "$ee_count" -ge 1 ] && break
+  done
+  if [ "$ee_count" != 1 ]; then
+    echo "::error::'min box audit $ee_old_id' shows $ee_count revocation records 60 s after the destroy, not 1"
+    cat "$WORK/$ee_case.old.audit" "$WORK/$ee_case.old.audit.err" 2>/dev/null || true
+    ee_fail
+  fi
+  echo "min box audit $ee_old_id: 1 revocation record within 60 s of the destroy"
+
+  # 3. The box re-created under the name: a new id, its own value admitted,
+  # and the destroyed box's value refused.
+  EE_SID="$(bep_revoke_activate "$ee_case" "$ee_name")" || ee_fail
+  ee_new_value="$(bep_revoke_copy_value "$ee_case" "$EE_SID")" || {
+    echo "::error::the box re-created under $ee_name did not redeem its own value"
+    ee_fail
+  }
+  ee_new_id="$(bep_recreate_audited_id "$ee_case" "$ee_name")" || ee_fail
+  if [ "$ee_new_id" = "$ee_old_id" ]; then
+    echo "::error::'min box audit $ee_name' names box $ee_new_id for both boxes: the re-created box reused the destroyed box's id"
+    ee_fail
+  fi
+  if [ "$ee_new_value" = "$ee_old_value" ]; then
+    echo "::error::the re-created box holds the destroyed box's sealed value"
+    ee_fail
+  fi
+  ee_n="$(bep_e2e_admits "$WORK/$ee_case.$ee_name.audit")"
+  if [ "$ee_n" -lt 1 ]; then
+    echo "::error::'min box audit $ee_name' shows no admit record for api.github.com:443 that names a member: the re-created box's value was not redeemed"
+    cat "$WORK/$ee_case.$ee_name.audit" 2>/dev/null || true
+    ee_fail
+  fi
+  echo "second $ee_name (box $ee_new_id): 'gh api user' answered with its own value (${#ee_new_value} characters), and min box audit shows $ee_n admit record(s) for api.github.com:443"
+  if mnl session exec "$EE_SID" sh -c "GH_TOKEN='$ee_old_value' timeout 60 gh api user --jq .login" \
+    >"$WORK/$ee_case.old-value" 2>&1; then
+    echo "::error::'gh api user' in the re-created box succeeded with the value copied from the destroyed box of the same name"
+    ee_fail
+  fi
+  ee_audit "$ee_new_id"
+  ee_cross="$(bep_e2e_refusals "$WORK/$ee_case.audit" cross_box)"
+  if [ "$ee_cross" -lt 1 ]; then
+    echo "::error::'min box audit $ee_new_id' shows no cross_box refusal of the destroyed box's value"
+    cat "$WORK/$ee_case.audit" 2>/dev/null || true
+    ee_fail
+  fi
+  echo "destroyed box's value in the re-created box: 'gh api user' failed, and min box audit shows $ee_cross cross_box refusal(s)"
+
+  # 4. The logout: the box's next request is refused, and the box runs on.
+  if ! ee_out="$(mnl auth logout </dev/null 2>"$WORK/$ee_case.logout.err")"; then
+    echo "::error::'min auth logout' failed"
+    echo "--- stdout ---"; printf '%s\n' "$ee_out"
+    echo "--- stderr ---"; cat "$WORK/$ee_case.logout.err" 2>/dev/null || true
+    ee_fail
+  fi
+  ee_status="$(mnl auth status </dev/null 2>&1 | tr -d '\r')"
+  if [[ "$ee_status" != "Not signed in to GitHub."* ]]; then
+    echo "::error::'min auth status' after the logout does not report that no sign-in is held"
+    printf '%s\n' "$ee_status"
+    ee_fail
+  fi
+  if mnl session exec "$EE_SID" sh -c 'timeout 60 gh api user --jq .login' \
+    >"$WORK/$ee_case.after-logout" 2>&1; then
+    echo "::error::'gh api user' in the box $ee_name succeeded after 'min auth logout'"
+    ee_fail
+  fi
+  if ! mnl session exec "$EE_SID" true >/dev/null 2>"$WORK/$ee_case.alive"; then
+    echo "::error::the box $ee_name does not run a command after the logout: the logout must keep the box's processes running"
+    cat "$WORK/$ee_case.alive" 2>/dev/null || true
+    ee_fail
+  fi
+  ee_audit "$ee_new_id"
+  ee_count="$(bep_e2e_refusals "$WORK/$ee_case.audit" github_sign_in_required)"
+  if [ "$ee_count" -lt 1 ]; then
+    echo "::error::'min box audit $ee_new_id' shows no github_sign_in_required refusal after the logout"
+    cat "$WORK/$ee_case.audit" 2>/dev/null || true
+    ee_fail
+  fi
+  echo "after the logout: 'gh api user' in $ee_name failed, the box still runs, and min box audit shows $ee_count github_sign_in_required refusal(s)"
+
+  # 5. The sign-in again. The device flow prints a code on stderr, and the
+  # person who runs the case enters it. The command waits until the code
+  # expires.
+  echo "Sign in to GitHub again: open the address below and enter the code."
+  if ! mnl auth login --device </dev/null 2>&1 | tee "$WORK/$ee_case.login"; then
+    echo "::error::'min auth login --device' did not sign this machine in again"
+    ee_fail
+  fi
+  ee_signin="$(mnl auth status </dev/null 2>/dev/null | tr -d '\r' || true)"
+  if [[ "$ee_signin" != "Signed in to GitHub"* ]]; then
+    echo "::error::'min auth status' after 'min auth login' does not report a sign-in"
+    printf '%s\n' "$ee_signin"
+    ee_fail
+  fi
+  echo "min auth status: ${ee_signin%%$'\n'*}"
+
+  # 6. The sign-in revives nothing: the box's own value and the destroyed
+  # box's value stay refused, each with one more refusal in the audit.
+  if mnl session exec "$EE_SID" sh -c 'timeout 60 gh api user --jq .login' \
+    >"$WORK/$ee_case.after-login" 2>&1; then
+    echo "::error::'gh api user' in the box $ee_name succeeded after the sign-in: the sign-in revived a value made before the logout"
+    ee_fail
+  fi
+  if mnl session exec "$EE_SID" sh -c "GH_TOKEN='$ee_old_value' timeout 60 gh api user --jq .login" \
+    >"$WORK/$ee_case.old-value" 2>&1; then
+    echo "::error::'gh api user' in the box $ee_name succeeded with the destroyed box's value after the sign-in"
+    ee_fail
+  fi
+  ee_audit "$ee_new_id"
+  ee_n="$(bep_e2e_refusals "$WORK/$ee_case.audit" github_sign_in_required)"
+  if [ "$ee_n" -le "$ee_count" ]; then
+    echo "::error::'min box audit $ee_new_id' shows no new github_sign_in_required refusal after the sign-in ($ee_n, $ee_count before it)"
+    cat "$WORK/$ee_case.audit" 2>/dev/null || true
+    ee_fail
+  fi
+  ee_count="$(bep_e2e_refusals "$WORK/$ee_case.audit" cross_box)"
+  if [ "$ee_count" -le "$ee_cross" ]; then
+    echo "::error::'min box audit $ee_new_id' shows no new cross_box refusal after the sign-in ($ee_count, $ee_cross before it)"
+    cat "$WORK/$ee_case.audit" 2>/dev/null || true
+    ee_fail
+  fi
+  echo "after the sign-in: both values in $ee_name are still refused, and min box audit shows $ee_n github_sign_in_required and $ee_count cross_box refusal(s)"
+
+  # A box started after the sign-in redeems, so the refusals above are not a
+  # broken sign-in.
+  EE_SID2="$(bep_revoke_activate "$ee_case" "$ee_after")" || ee_fail
+  if ! mnl session exec "$EE_SID2" sh -c 'timeout 60 gh api user --jq .login' \
+    >"$WORK/$ee_case.fresh" 2>&1; then
+    echo "::error::'gh api user' failed in the box $ee_after, started after the sign-in"
+    cat "$WORK/$ee_case.fresh" 2>/dev/null || true
+    ee_fail
+  fi
+  ee_audit "$ee_after"
+  ee_n="$(bep_e2e_admits "$WORK/$ee_case.audit")"
+  if [ "$ee_n" -lt 1 ]; then
+    echo "::error::'min box audit $ee_after' shows no admit record for api.github.com:443 that names a member"
+    cat "$WORK/$ee_case.audit" 2>/dev/null || true
+    ee_fail
+  fi
+  echo "$ee_after, started after the sign-in: 'gh api user' answered, and min box audit shows $ee_n admit record(s)"
+
+  ee_cleanup
+  rm -f "${WORK:?}/${ee_case:?}".*
+  echo "Revoke and sign out OK (the destroyed box's value refused within 60 s, the re-created box redeemed, the logout refused its next request, and the sign-in revived neither value)"
+  echo "::endgroup::"
+}
+
+# DNS steering fails closed, end to end (BEP T32): one case on a VM lane with
+# the gvproxy switch. A box on a credentialed lane with the default `dns`
+# steering and `quic443 = "block"` starts. Then the case stops the Box Egress
+# Proxy (`bep serve`, which minvmd starts on macOS only, so elsewhere no proxy
+# runs and it is down from the start) and, from inside the box:
+#   1. an A lookup of api.github.com, a steered name, must be answered
+#      SERVFAIL (rcode 2) by the box's resolver, never by real DNS (BEP-062);
+#   2. AAAA, HTTPS and SVCB lookups of it must be NODATA: rcode 0, no
+#      answers (BEP-078, NET-136);
+#   3. a UDP datagram to port 443 must be rejected at once: the switch
+#      answers ICMP port unreachable, so socat reads "Connection refused"
+#      well inside its 5 s wait (BEP-018).
+# All three legs are hard assertions. The relay's DNS gate asks minvmd over
+# the guest report door whether the proxy listens, so leg 1 holds on every
+# host (Networking §5.3).
+# Admission refuses `dns` steering for a box with a broker secret on every
+# host today (no box-zone resolver, BEP-017), so the lane comes from
+# --credentialed-upstream alone, and the stance comes from `quic443 = "block"`
+# (its `auto` blocks only with a credentialed secret).
+# Diagnostics: the pair restarts with the relay's switch and DNS gate records
+# at debug, so on a failure the `min bug` bundle's daemon-log tail carries the
+# SERVFAIL warnings and the rejected datagrams. On a pass, the case prints the
+# same two records out of a bundle it writes itself.
+proof_bep_dns_steering_fails_closed_end_to_end() {
+  echo "::group::DNS steering fails closed while the Box Egress Proxy is down"
+  local ds_case=bep_dns_steering_fails_closed_end_to_end
+  local ds_sid ds_out ds_ns ds_resolv ds_ans ds_rc ds_q ds_quic ds_ms
+  local ds_sock="$XDG_STATE_HOME/minimal/providers/local-minvmd0/gvproxy-bep.sock"
+  local ds_bundle ds_lines
+  if [ -z "$E2E_VM" ] || [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    not_run "$ds_case" "no MINVMD_GVPROXY_BIN: the steered lookups and the UDP 443 rejection run on the VM host's switch, and this target has none"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # A fresh pair: without MINVMD_BEP_STUB (the stand-in is not the proxy) and
+  # with the switch's debug records, which the UDP 443 rejection writes. The
+  # guest daemon takes its filter from the RUST_LOG minvmd starts with.
+  unset MINVMD_BEP_STUB
+  BEP_LIVE_DAEMON=""
+  mnl stop --force >/dev/null 2>&1 || true
+  minvmd stop >/dev/null 2>&1 || true
+  if ! RUST_LOG="$RUST_LOG,minimald::net::switch=debug,minimald::net::dns_gate=debug" \
+    mnl ls >/dev/null 2>"$WORK/$ds_case.up.err"; then
+    echo "::error::the daemon did not start for $ds_case"
+    cat "$WORK/$ds_case.up.err" 2>/dev/null || true
+    fail
+  fi
+
+  # Not local: ds_cleanup reads it.
+  DS_SID=""
+  ds_cleanup() {
+    [ -n "$DS_SID" ] && mnl session destroy --force "$DS_SID" >/dev/null 2>&1
+    DS_SID=""
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    # The proxy is stopped: the next live case restarts the pair.
+    BEP_LIVE_DAEMON=""
+    return 0
+  }
+  ds_fail() {
+    ds_cleanup
+    fail
+  }
+
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlsteer.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session.network]\nquic443 = "block"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+  ds_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-bep-dns-steering --network own_ip --credentialed-upstream \
+    --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+    </dev/null 2>"$WORK/$ds_case.err")" || {
+    echo "::error::'min session activate --network own_ip --credentialed-upstream' failed for the DNS steering box"
+    echo "--- stdout ---"; printf '%s\n' "$ds_out"
+    echo "--- stderr ---"; cat "$WORK/$ds_case.err" 2>/dev/null || true
+    ds_fail
+  }
+  DS_SID="$(printf '%s\n' "$ds_out" | tail -n1 | tr -d '\r')"
+  ds_sid="$DS_SID"
+  mnl session exec "$ds_sid" 'test -x /usr/bin/socat && test -x /usr/bin/base64' >/dev/null 2>&1 || {
+    echo "::error::the DNS steering box has no /usr/bin/socat or /usr/bin/base64 (both launcher baseline packages)"
+    ds_fail
+  }
+
+  # Stop the proxy. minvmd does not restart a `bep serve` that exits, so the
+  # proxy stays down for the rest of the case.
+  if pkill -f -- "serve --listener $ds_sock" 2>/dev/null; then
+    for _ in $(seq 1 20); do
+      pgrep -f -- "serve --listener $ds_sock" >/dev/null 2>&1 || break
+      sleep 0.5
+    done
+    if pgrep -f -- "serve --listener $ds_sock" >/dev/null 2>&1; then
+      echo "::error::the Box Egress Proxy (bep serve --listener $ds_sock) still runs 10 s after SIGTERM"
+      ds_fail
+    fi
+    echo "stopped the Box Egress Proxy (bep serve --listener $ds_sock)"
+  else
+    echo "no Box Egress Proxy runs for this VM host, so it is down for the whole case"
+  fi
+
+  ds_resolv="$(mnl session exec "$ds_sid" 'cat /etc/resolv.conf' 2>/dev/null | tr -d '\r')" || true
+  ds_ns="$(printf '%s\n' "$ds_resolv" | awk '$1 == "nameserver" { print $2; exit }')"
+  if [ -z "$ds_ns" ]; then
+    echo "::error::the DNS steering box's /etc/resolv.conf names no nameserver"
+    printf '%s\n' "$ds_resolv"
+    ds_fail
+  fi
+
+  # A raw query from inside the box, the way the NET-141 legs send one:
+  # built and parsed host-side with python3, carried as base64. Prints
+  # "rcode ancount" for a reply to the query's own id, or nothing.
+  ds_dns() { # $1 name, $2 qtype number
+    local q b64
+    q="$(python3 -c '
+import base64, struct, sys
+name, qtype = sys.argv[1], int(sys.argv[2])
+wire = b"".join(bytes([len(l)]) + l.encode() for l in name.split(".")) + b"\0"
+sys.stdout.write(base64.b64encode(
+    struct.pack("!HHHHHH", 0x5e32, 0x0100, 1, 0, 0, 0) + wire + struct.pack("!HH", qtype, 1)
+).decode())' "$1" "$2")"
+    b64="$(mnl session exec "$ds_sid" \
+      "printf %s '$q' | /usr/bin/base64 -d | /usr/bin/socat -t 3 - UDP:$ds_ns:53 | /usr/bin/base64 -w0" \
+      2>"$WORK/$ds_case.dns.err" | tr -d '\r\n')" || true
+    python3 -c '
+import base64, sys
+try:
+    r = base64.b64decode(sys.argv[1])
+except Exception:
+    sys.exit(0)
+if len(r) >= 8 and r[0:2] == b"\x5e\x32" and r[2] & 0x80:
+    print(r[3] & 0x0f, int.from_bytes(r[6:8], "big"))' "$b64"
+  }
+
+  # Leg 1: the steered A lookup fails closed.
+  ds_ans="$(ds_dns api.github.com 1)"
+  echo "A api.github.com with the proxy down -> rcode and answers: ${ds_ans:-no reply}"
+  if [ "${ds_ans%% *}" = 2 ]; then
+    echo "steered A lookup: SERVFAIL while the proxy is down"
+  else
+    echo "::error::the A lookup of the steered name api.github.com was not answered SERVFAIL while the Box Egress Proxy is down: got '${ds_ans:-no reply}'"
+    cat "$WORK/$ds_case.dns.err" 2>/dev/null || true
+    ds_fail
+  fi
+
+  # Leg 2: AAAA, HTTPS and SVCB of the steered name are NODATA.
+  for ds_q in AAAA:28 HTTPS:65 SVCB:64; do
+    ds_ans="$(ds_dns api.github.com "${ds_q#*:}")"
+    echo "${ds_q%%:*} api.github.com -> rcode and answers: ${ds_ans:-no reply}"
+    if [ "$ds_ans" != "0 0" ]; then
+      echo "::error::the ${ds_q%%:*} lookup of the steered name api.github.com was not answered NODATA (rcode 0, no answers): got '${ds_ans:-no reply}'"
+      cat "$WORK/$ds_case.dns.err" 2>/dev/null || true
+      ds_fail
+    fi
+  done
+
+  # Leg 3: UDP to port 443 is rejected at once. 192.0.2.1 is TEST-NET-1: the
+  # switch answers before any egress verdict, so nothing leaves the host.
+  # Without the rejection socat waits its full 5 s and exits 0.
+  # shellcheck disable=SC2016
+  ds_quic="$(mnl session exec "$ds_sid" \
+    's=$(date +%s%N); printf q | /usr/bin/socat -t 5 -T 5 - UDP:192.0.2.1:443 2>&1; rc=$?; e=$(date +%s%N); echo "rc=$rc ms=$(( (e - s) / 1000000 ))"' \
+    2>&1 | tr -d '\r')" || true
+  ds_rc="$(printf '%s\n' "$ds_quic" | sed -n 's/^rc=\([0-9]*\) ms=.*/\1/p' | tail -n1)"
+  ds_ms="$(printf '%s\n' "$ds_quic" | sed -n 's/^rc=[0-9]* ms=\([0-9]*\)$/\1/p' | tail -n1)"
+  echo "UDP 192.0.2.1:443 from the blocked box -> exit ${ds_rc:-?} after ${ds_ms:-?} ms"
+  if [ -z "$ds_rc" ] || [ "$ds_rc" = 0 ] || ! printf '%s\n' "$ds_quic" | grep -q 'Connection refused' \
+    || [ -z "$ds_ms" ] || [ "$ds_ms" -ge 2000 ]; then
+    echo "::error::UDP to port 443 from a box with quic443 = \"block\" was not rejected at once (expected 'Connection refused' within 2000 ms)"
+    printf '%s\n' "$ds_quic"
+    ds_fail
+  fi
+
+  # The daemon's records of the run, from the bundle a person attaches to a
+  # report. A note only: the bundle carries a tail of the log.
+  ds_bundle="${WORK:?}/$ds_case.tar.zst"
+  if mnl bug --guest-timeout-secs 30 --output "$ds_bundle" >/dev/null 2>&1; then
+    ds_lines="$(zstd -dc "$ds_bundle" 2>/dev/null | tar -xOf - 2>/dev/null \
+      | grep -a -e 'answered SERVFAIL for a steered name' -e 'rejected UDP to port 443' | tail -n4)"
+    echo "daemon records in the min bug bundle:"
+    printf '%s\n' "${ds_lines:-(none found)}"
+  else
+    echo "(min bug produced no bundle)"
+  fi
+  rm -f "${WORK:?}/${ds_case:?}".*
+
+  ds_cleanup
+  echo "DNS steering fails closed: A SERVFAIL, AAAA, HTTPS and SVCB NODATA, UDP 443 rejected in ${ds_ms} ms"
+  echo "::endgroup::"
+}
+
+# DNS steering through the box-zone resolver, end to end (BEP T115). One walk
+# over the slice on a VM host whose gvproxy switch resolves box names, with the
+# Box Egress Proxy running. Each box sets `steering = "dns"`, so it gets no
+# proxy variables, and the switch answers a steered name with the proxy's
+# address. Each leg prints PASS, or NOT RUN with the gate it misses:
+#   store        `min secret set` stores a fresh throwaway value with its rule
+#                for the echo service E2E_BEP_STORE_ECHO_URL (default
+#                https://httpbin.org/headers, as bep_store_reference_end_to_end
+#                uses). A box references it. The upstream's A lookup in the box
+#                answers the proxy's address, and a plain curl with no proxy
+#                variable reaches the upstream with the stored value in the
+#                rule's header (BEP-062, the store-rule authorities of T114).
+#   git          With a GitHub sign-in and E2E_BEP_PRIVATE_REPO, a grant box
+#                resolves github.com to the proxy and clones the private
+#                repository through it (BEP-062, BEP-015).
+#   fail_closed  With the proxy stopped, the A lookup of each steered name a
+#                box above holds is answered SERVFAIL (BEP-062).
+# A lane without the live proxy records the whole case NOT RUN. Admission refuses
+# `dns` steering with a credentialed upstream until the proxy takes a direct
+# TLS connection (#2805). Until then the case records a KNOWN GAP that cites
+# #2805, with that refusal. When #2805 lands, the refusal becomes a hard
+# failure. The stored value is never printed.
+proof_bep_dns_steering_through_the_box_zone_resolver() {
+  echo "::group::DNS steering through the box-zone resolver: store upstream and GitHub through the proxy, SERVFAIL while it is down"
+  local bz_case=bep_dns_steering_through_the_box_zone_resolver
+  local bz_url="${E2E_BEP_STORE_ECHO_URL:-https://httpbin.org/headers}"
+  local bz_repo="${E2E_BEP_PRIVATE_REPO:-}"
+  local bz_proxy_ip=100.64.255.252
+  # This reads the real home, which no earlier subshell export changes.
+  # shellcheck disable=SC2031
+  local bz_control="$HOME/.minimal/bep/control.sock"
+  local bz_header=X-Minimal-E2E-Probe bz_header_lc=x-minimal-e2e-probe
+  local bz_host bz_id bz_value bz_out bz_got bz_want bz_ans bz_try bz_status
+  local bz_summary=""
+  bz_host="${bz_url#https://}"
+  bz_host="${bz_host%%/*}"
+  if [ "$bz_host" = "$bz_url" ] || [ -z "$bz_host" ] || [[ "$bz_host" == *:* ]]; then
+    echo "::error::E2E_BEP_STORE_ECHO_URL is '$bz_url', not an https:// URL on port 443"
+    fail
+  fi
+  if [ -n "$bz_repo" ] && ! [[ "$bz_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "::error::E2E_BEP_PRIVATE_REPO is '$bz_repo', not <owner>/<name>"
+    fail
+  fi
+  bep_live_gate "$bz_case" no_sign_in || { echo "::endgroup::"; return 0; }
+
+  # Not local: bz_cleanup and bz_fail read them.
+  BZ_STORE_SID="" BZ_GIT_SID="" BZ_ID=""
+  bz_cleanup() {
+    [ -n "$BZ_STORE_SID" ] && mnl session destroy --force "$BZ_STORE_SID" >/dev/null 2>&1
+    [ -n "$BZ_GIT_SID" ] && mnl session destroy --force "$BZ_GIT_SID" >/dev/null 2>&1
+    [ -n "$BZ_ID" ] && mnl secret rm "$BZ_ID" </dev/null >/dev/null 2>&1
+    BZ_STORE_SID="" BZ_GIT_SID="" BZ_ID=""
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    return 0
+  }
+  bz_fail() {
+    echo "--- bep.log (box connections, tail) ---"
+    grep -h 'box_connection' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null \
+      | grep -vF -- "${bz_value:-no value}" | tail -20 || true
+    bz_cleanup
+    rm -f "${WORK:?}/${bz_case:?}".*
+    fail
+  }
+  # The leg $1 did not run for the reason $2: a summary line, and the leg
+  # counted NOT RUN in the lane summary.
+  bz_not_run() {
+    not_run "$bz_case/$1" "$2"
+    bz_summary="$bz_summary$1: NOT RUN ($2)"$'\n'
+  }
+  bz_pass() {
+    bz_summary="$bz_summary$1: PASS ($2)"$'\n'
+    echo "$1: PASS"
+  }
+
+  # Activates the box named $2 from GRANT_SEED_DIR with egress to the names
+  # after it, and prints its id. Returns 3 when admission refuses dns
+  # steering with a credentialed upstream (#2805), and records why in
+  # $WORK/$bz_case.refused. Any other refusal fails: after bep_live_gate the
+  # host is minvmd and the box is own_ip, so its switch resolves box names.
+  bz_activate() { # $1 leg, $2 name, $3... egress names
+    local ba_leg="$1" ba_name="$2" ba_out ba_flags=() ba_h
+    shift 2
+    for ba_h in "$@"; do ba_flags+=(--allow-dns-hosts "$ba_h"); done
+    ba_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt --name "$ba_name" \
+      --network own_ip --credentialed-upstream "${ba_flags[@]}" \
+      </dev/null 2>"$WORK/$bz_case.$ba_leg.activate.err")" && {
+      printf '%s\n' "$ba_out" | tail -n1 | tr -d '\r'
+      return 0
+    }
+    if grep -q 'does not yet take a direct TLS connection' "$WORK/$bz_case.$ba_leg.activate.err" 2>/dev/null; then
+      echo "admission refuses steering = \"dns\" for a box with a credentialed upstream: the proxy takes no direct TLS connection yet (#2805)" \
+        >"$WORK/$bz_case.refused"
+      return 3
+    fi
+    echo "::error::'min session activate' of the dns-steered box $ba_name failed" >&2
+    echo "--- stdout ---" >&2; printf '%s\n' "$ba_out" >&2
+    echo "--- stderr ---" >&2; grep -vF -- "${bz_value:-no value}" "$WORK/$bz_case.$ba_leg.activate.err" >&2 2>/dev/null || true
+    return 1
+  }
+
+  # A box with dns steering carries no proxy variable (BEP-062: the name,
+  # not the environment, steers its traffic).
+  bz_no_proxy_env() { # $1 box id, $2 leg
+    local pe_vars
+    pe_vars="$(mnl session exec "$1" sh -c 'env' 2>/dev/null | tr -d '\r' \
+      | grep -iE '^(https?|all)_proxy=' | cut -d= -f1)"
+    if [ -n "$pe_vars" ]; then
+      echo "::error::the dns-steered $2 box has proxy variables: $(printf '%s' "$pe_vars" | tr '\n' ' ')"
+      return 1
+    fi
+  }
+
+  # A raw query from inside box $1 to its resolver, built and parsed
+  # host-side with python3 and carried as base64, as the fail-closed case
+  # sends one. Prints "rcode ancount first-A-address" for a reply to the
+  # query's own id, or nothing.
+  bz_dns() { # $1 box id, $2 name, $3 qtype number
+    local dq_ns dq_q dq_b64
+    dq_ns="$(mnl session exec "$1" 'cat /etc/resolv.conf' 2>/dev/null | tr -d '\r' \
+      | awk '$1 == "nameserver" { print $2; exit }')"
+    [ -n "$dq_ns" ] || return 0
+    dq_q="$(python3 -c '
+import base64, struct, sys
+name, qtype = sys.argv[1], int(sys.argv[2])
+wire = b"".join(bytes([len(l)]) + l.encode() for l in name.split(".")) + b"\0"
+sys.stdout.write(base64.b64encode(
+    struct.pack("!HHHHHH", 0x5e33, 0x0100, 1, 0, 0, 0) + wire + struct.pack("!HH", qtype, 1)
+).decode())' "$2" "$3")"
+    dq_b64="$(mnl session exec "$1" \
+      "printf %s '$dq_q' | /usr/bin/base64 -d | /usr/bin/socat -t 3 - UDP:$dq_ns:53 | /usr/bin/base64 -w0" \
+      2>"$WORK/$bz_case.dns.err" | tr -d '\r\n')" || true
+    python3 -c '
+import base64, sys
+try:
+    r = base64.b64decode(sys.argv[1])
+except Exception:
+    sys.exit(0)
+if len(r) < 12 or r[0:2] != b"\x5e\x33" or not r[2] & 0x80:
+    sys.exit(0)
+rcode, an = r[3] & 0x0f, int.from_bytes(r[6:8], "big")
+def skip(i):
+    while i < len(r):
+        n = r[i]
+        if n == 0:
+            return i + 1
+        if n & 0xc0 == 0xc0:
+            return i + 2
+        i += 1 + n
+    return len(r)
+i = skip(12) + 4
+addr = "-"
+for _ in range(an):
+    i = skip(i)
+    if i + 10 > len(r):
+        break
+    t, ln = int.from_bytes(r[i:i+2], "big"), int.from_bytes(r[i+8:i+10], "big")
+    i += 10
+    if t == 1 and ln == 4:
+        addr = ".".join(str(b) for b in r[i:i+4])
+        break
+    i += ln
+print(rcode, an, addr)' "$dq_b64"
+  }
+
+  # The A lookup of $2 in box $1 answers the proxy's address.
+  bz_steered_to_proxy() { # $1 box id, $2 name
+    bz_ans="$(bz_dns "$1" "$2" 1)"
+    echo "A $2 in the dns-steered box -> rcode, answers and address: ${bz_ans:-no reply}"
+    if [ "${bz_ans%% *}" != 0 ] || [ "${bz_ans##* }" != "$bz_proxy_ip" ]; then
+      echo "::error::the A lookup of the steered name $2 did not answer the proxy's address $bz_proxy_ip: got '${bz_ans:-no reply}'"
+      cat "$WORK/$bz_case.dns.err" 2>/dev/null || true
+      return 1
+    fi
+  }
+
+  # --- store: a store reference's upstream resolves to the proxy, and its
+  # request carries the stored value.
+  bz_id="e2e-dns-store-$(date +%s)-$$"
+  bz_value="mne2e$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+  BZ_ID="$bz_id"
+  if ! printf '%s' "$bz_value" | mnl secret set "$bz_id" \
+    --upstream "$bz_host" --header "$bz_header" --yes >/dev/null 2>"$WORK/$bz_case.set.err"; then
+    echo "::error::'min secret set $bz_id --upstream $bz_host --header $bz_header' failed"
+    grep -vF -- "$bz_value" "$WORK/$bz_case.set.err" 2>/dev/null || true
+    bz_fail
+  fi
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnldnsstore.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = ["base", "coreutils", "ca-certificates"]\n'
+    printf '\n[session.secrets.E2E_STORE_KEY]\nsource = "store"\nstore = "keychain"\nid = "%s"\n' "$bz_id"
+    printf '\n[session.network.bep]\nsteering = "dns"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+  BZ_STORE_SID="$(bz_activate store e2e-bep-dns-store "$bz_host")"
+  bz_status=$?
+  rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
+  if [ "$bz_status" = 3 ]; then
+    BZ_STORE_SID=""
+    known_gap "$bz_case" "$(cat "$WORK/$bz_case.refused")"
+    bz_cleanup
+    rm -f "${WORK:?}/${bz_case:?}".*
+    echo "::endgroup::"
+    return 0
+  fi
+  [ "$bz_status" = 0 ] || bz_fail
+  mnl session exec "$BZ_STORE_SID" 'test -x /usr/bin/socat && test -x /usr/bin/base64' >/dev/null 2>&1 || {
+    echo "::error::the dns-steered store box has no /usr/bin/socat or /usr/bin/base64 (both launcher baseline packages)"
+    bz_fail
+  }
+  bz_no_proxy_env "$BZ_STORE_SID" store || bz_fail
+  bz_steered_to_proxy "$BZ_STORE_SID" "$bz_host" || bz_fail
+  # The box prints one word and the hash of the echoed header, as the
+  # store-reference case does. The echo stays in the pipe.
+  # shellcheck disable=SC2016 # expanded inside the box
+  if ! bz_out="$(mnl session exec "$BZ_STORE_SID" sh -c '
+      command -v curl >/dev/null || { echo "no curl in the box" >&2; exit 9; }
+      r="$(curl -fsS --max-time 60 -H "'"$bz_header"': $E2E_STORE_KEY" "'"$bz_url"'")" || exit 7
+      v="$(printf "%s" "$r" | tr "[:upper:]" "[:lower:]" \
+        | grep -o "\"'"$bz_header_lc"'\": *\"[^\"]*\"" | head -n1 \
+        | sed "s/^[^:]*: *\"//; s/\"\$//")"
+      r=""
+      if [ -z "$v" ]; then w=absent
+      elif [ "$v" = "$(printf "%s" "$E2E_STORE_KEY" | tr "[:upper:]" "[:lower:]")" ]; then w=sealed
+      else w=other; fi
+      printf "%s %s\n" "$w" "$(printf "%s" "$v" | sha256sum | cut -d" " -f1)"
+    ' </dev/null 2>"$WORK/$bz_case.request.err")"; then
+    echo "::error::the request from the dns-steered box to $bz_url, with no proxy variable, failed"
+    grep -vF -- "$bz_value" "$WORK/$bz_case.request.err" 2>/dev/null || true
+    bz_fail
+  fi
+  bz_got="$(printf '%s\n' "$bz_out" | tr -d '\r' | tail -n1)"
+  bz_want="other $(printf '%s' "$bz_value" | python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"
+  if [ "$bz_got" != "$bz_want" ]; then
+    case "$bz_got" in
+      absent*) echo "::error::$bz_host received no $bz_header header from the dns-steered box" ;;
+      sealed*) echo "::error::$bz_host received the box's sealed value in $bz_header, not the stored value: the proxy did not inject it" ;;
+      *) echo "::error::$bz_host received a $bz_header value that is not the stored value (box answered '${bz_got%% *}')" ;;
+    esac
+    bz_fail
+  fi
+  bz_pass store "$bz_host resolved to $bz_proxy_ip and received the stored value in $bz_header, with no proxy variable"
+
+  # --- git: a grant box clones a private repository through the proxy.
+  bz_status="$(mnl auth status </dev/null 2>/dev/null || true)"
+  if [ -z "$bz_repo" ]; then
+    bz_not_run git "no private repository named: set E2E_BEP_PRIVATE_REPO to <owner>/<name>, a private repository the signed-in account can read"
+  elif [[ "$bz_status" != "Signed in to GitHub"* ]]; then
+    bz_not_run git "no GitHub sign-in on this machine: run 'min auth login' first"
+  else
+    GRANT_SEED_DIR="$(hook_mktemp /tmp/mnldnsgrant.XXXXXX)"
+    {
+      hook_seed_preamble
+      printf '\n[session]\npackages = ["base", "coreutils", "git", "ca-certificates"]\n'
+      printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\nscopes = ["github:user-token"]\n'
+      printf '\n[session.network.bep]\nsteering = "dns"\n'
+    } > "$GRANT_SEED_DIR/minimal.toml"
+    mkdir "$GRANT_SEED_DIR/.git"
+    BZ_GIT_SID="$(bz_activate git e2e-bep-dns-git \
+      github.com api.github.com uploads.github.com codeload.github.com)"
+    bz_status=$?
+    rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
+  fi
+  if [ "$bz_status" = 3 ]; then
+    # The same #2805 refusal the store leg handles, met by the grant box.
+    BZ_GIT_SID=""
+    known_gap "$bz_case/git" "$(cat "$WORK/$bz_case.refused")"
+    bz_summary="${bz_summary}git: KNOWN GAP ($(cat "$WORK/$bz_case.refused"))"$'\n'
+  elif [ "$bz_status" = 1 ]; then
+    bz_fail
+  elif [ "$bz_status" = 0 ]; then
+    [ -n "$BZ_GIT_SID" ] || { echo "::error::'min session activate' of the dns-steered grant box printed no box id"; bz_fail; }
+    bz_no_proxy_env "$BZ_GIT_SID" git || bz_fail
+    bz_steered_to_proxy "$BZ_GIT_SID" github.com || bz_fail
+    if ! mnl session exec "$BZ_GIT_SID" sh -c \
+      "rm -rf /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 180 git clone https://github.com/$bz_repo /tmp/bep-repo" \
+      >"$WORK/$bz_case.clone.out" 2>&1; then
+      echo "::error::'git clone' of the private repository $bz_repo failed in the dns-steered grant box"
+      cat "$WORK/$bz_case.clone.out" 2>/dev/null || true
+      bz_fail
+    fi
+    bz_pass git "github.com resolved to $bz_proxy_ip and git cloned $bz_repo, with no proxy variable"
+  fi
+
+  # --- fail_closed: with the proxy stopped, each steered name is SERVFAIL.
+  # The DNS gate learns that the listener is down from minvmd, so the case
+  # allows it 10 s.
+  if ! r3_proxy_down "$bz_control"; then
+    bz_fail
+  fi
+  echo "stopped the Box Egress Proxy"
+  bz_servfail() { # $1 box id, $2 name
+    for bz_try in $(seq 1 20); do
+      [ "$bz_try" -gt 1 ] && sleep 0.5
+      bz_ans="$(bz_dns "$1" "$2" 1)"
+      [ "${bz_ans%% *}" = 2 ] && break
+    done
+    echo "A $2 with the proxy down -> rcode, answers and address: ${bz_ans:-no reply}"
+    if [ "${bz_ans%% *}" != 2 ]; then
+      echo "::error::the A lookup of the steered name $2 was not answered SERVFAIL 10 s after the proxy stopped: got '${bz_ans:-no reply}'"
+      cat "$WORK/$bz_case.dns.err" 2>/dev/null || true
+      return 1
+    fi
+  }
+  bz_servfail "$BZ_STORE_SID" "$bz_host" || bz_fail
+  if [ -n "$BZ_GIT_SID" ]; then
+    bz_servfail "$BZ_GIT_SID" github.com || bz_fail
+    bz_pass fail_closed "$bz_host and github.com answered SERVFAIL while the proxy was down"
+  else
+    bz_pass fail_closed "$bz_host answered SERVFAIL while the proxy was down. github.com was not checked: the git leg did not run"
+  fi
+
+  bz_cleanup
+  rm -f "${WORK:?}/${bz_case:?}".*
+  echo "::endgroup::"
+  echo "::group::DNS steering through the box-zone resolver: each leg"
+  printf '%s' "$bz_summary"
+  echo "::endgroup::"
+}
+
+# Round-two conditions closed, end to end (BEP T76, #2591). One walk over
+# the residuals that the second review round filed. Each leg prints PASS, or
+# records NOT RUN with the gate it misses. On a lane that runs no leg, the
+# whole walk is NOT RUN.
+#   store     (BEP-032) `bep serve` holds the client's [secret-store-rules]
+#             at its start. The injection of a store value into a box's
+#             request is NOT RUN until a box can carry a store handle
+#             (#2525): today no box creation mints one.
+#   key       (BEP-063, BEP-067, BEP-070) runs only with
+#             E2E_BEP_KEY_REPLACE=1. The manual macOS lane runs it
+#             (#2500). A grant box A answers 'gh api user'. The case
+#             puts a value that is no key in the keychain item of the
+#             client's signing key, so the next creation (box
+#             B) replaces the key. The proxy keeps the replaced key, which
+#             it names by its kid, and A still answers. The admit records of
+#             A and B each carry the jti of their own handle. The destroy of
+#             A records a revocation of A's id, the proxy revokes the
+#             replaced key, and a box re-created under A's name gets a new
+#             UUIDv7 id. `bep serve --help` names the client key bound.
+#             A refusal of a colliding id is not drivable from the CLI: the
+#             unit test colliding_box_id_refuses_creation proves it.
+#   cohort    (BEP-018) native Linux with the QUIC block installed, which
+#             a CI native lane must have: UDP 443 flows that a host_ip
+#             box opened before the cohort turned blocked end refused,
+#             and so do the processes 'min session exec' injects into it
+#             while the cohort turns and after.
+#   quarantine (BEP-068, BEP-070) the leg writes an unreadable line into
+#             this machine's Box Egress Proxy audit log and moves its
+#             segment into quarantine: set E2E_BEP_QUARANTINE=1 on a host
+#             whose audit log may be moved aside to run it. The manual
+#             macOS lane runs it (#2500). The unreadable line refuses a box
+#             creation with no proxy, refuses a plain `bep serve`, and
+#             `bep serve --quarantine-unreadable` moves its segment aside,
+#             records the quarantine in the chain, and serves.
+# The values are never printed: the transcript names only their lengths.
+RT_CASE=bep_round_two_conditions_closed
+RT_RAN=""
+# Set while the key leg's refused value is in the keychain, and while the
+# quarantine leg's unreadable line, proxy and sockets exist: teardown reads
+# them, so every path out of a leg puts the machine back.
+RT_KEY_STUB="" RT_QU_PID="" RT_QU_SEG="" RT_QU_SIZE="" RT_QU_SOCKETS=""
+RT_QU_LINE='{"schema":"min/v1/audit","kind":"decis'
+
+# Takes the quarantine leg's unreadable line back out of RT_QU_SEG: the
+# segment is cut to its size before the write, only when it still ends in
+# that line, so no record the proxy wrote after it is lost.
+rt_quarantine_unwrite() {
+  python3 - "$RT_QU_SEG" "$RT_QU_SIZE" "$RT_QU_LINE" <<'PY' || true
+import os, sys
+path, size, line = sys.argv[1], int(sys.argv[2]), sys.argv[3] + "\n"
+try:
+    with open(path, "rb") as f:
+        data = f.read()
+except FileNotFoundError:
+    sys.exit(0)
+if len(data) == size + len(line) and data[size:] == line.encode():
+    os.truncate(path, size)
+PY
+  RT_QU_SEG="" RT_QU_SIZE=""
+}
+
+# Prints the bep binary that the VM host daemon starts: MINVMD_BEP_BIN,
+# else the bep beside minvmd, or fails the case.
+rt_bep_bin() {
+  local rb_bin="${MINVMD_BEP_BIN:-}"
+  if [ -z "$rb_bin" ]; then
+    rb_bin="$(command -v minvmd 2>/dev/null || true)"
+    rb_bin="${rb_bin%/*}/bep"
+  fi
+  if [ ! -x "$rb_bin" ]; then
+    echo "::error::no bep binary at '$rb_bin': set MINVMD_BEP_BIN to the bep binary the VM host daemon runs" >&2
+    return 1
+  fi
+  printf '%s\n' "$rb_bin"
+}
+
+# The proxy's log lines after line $1, that contain $2.
+rt_bep_log_since() {
+  tail -n +"$(( $1 + 1 ))" "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null \
+    | grep -F -- "$2" || true
+}
+rt_bep_log_lines() {
+  wc -l <"$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null | tr -d ' ' || echo 0
+}
+
+# Prints the jti of each admit record for api.github.com:443 that names a
+# member, in the jsonl file $1, one a line.
+rt_admit_jtis() {
+  python3 - "$1" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        r = json.loads(line)
+        if (r.get("kind") == "decision" and r.get("decision") == "admit"
+                and r.get("upstream") == "api.github.com:443"
+                and r.get("identifier") not in (None, "none")):
+            print(r.get("jti", ""))
+PY
+}
+
+rt_leg_store() {
+  local st_leg="$RT_CASE/store" st_line
+  bep_live_gate "$st_leg" || return 0
+  st_line="$(grep -h 'holds the secret-store rules of the client configuration' \
+    "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null | tail -n1)"
+  if [ -z "$st_line" ]; then
+    echo "::error::the Box Egress Proxy log has no line that says it holds the client's secret-store rules: 'bep serve' did not read them at its start"
+    tail -40 "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null || true
+    fail
+  fi
+  echo "$st_leg: the proxy read the client's secret-store rules at its start: ${st_line##*INFO }"
+  echo "$st_leg/rules: PASS (bep serve holds the client's secret-store rules)"
+  RT_RAN="$RT_RAN store"
+  not_run "$st_leg/injection" "no box carries a store handle yet, so no request can redeem one (#2525)"
+}
+
+rt_leg_key() {
+  local ck_leg="$RT_CASE/key" ck_bep ck_help ck_mark ck_kept ck_gone ck_try
+  local ck_a=e2e-bep-round-two-a ck_b=e2e-bep-round-two-b
+  local ck_id_a ck_id_b ck_id_a2 ck_jti_a ck_jti_b ck_n
+  local ck_v7='^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+  if [ "${E2E_BEP_KEY_REPLACE:-}" != 1 ]; then
+    not_run "$ck_leg" "the leg replaces the client signing key in this machine's login keychain: set E2E_BEP_KEY_REPLACE=1 to run it. The manual macOS lane runs it (#2500)"
+    return 0
+  fi
+  bep_live_gate "$ck_leg" || return 0
+  ck_bep="$(rt_bep_bin)" || fail
+
+  # The key bound: the proxy takes it as a flag, with its default.
+  ck_help="$("$ck_bep" serve --help 2>&1 || true)"
+  if [[ "$ck_help" != *"--max-client-keys"* ]]; then
+    echo "::error::'bep serve --help' does not name --max-client-keys: the proxy has no client key bound"
+    printf '%s\n' "$ck_help"
+    fail
+  fi
+  echo "key bound: $(printf '%s\n' "$ck_help" | grep -F -A1 -- '--max-client-keys' | tr -s ' ' | tr '\n' ' ')"
+
+  # Not local: ck_cleanup reads them.
+  CK_SID_A="" CK_SID_B="" CK_SID_A2=""
+  ck_cleanup() {
+    [ -n "$CK_SID_A" ] && mnl session destroy --force "$CK_SID_A" >/dev/null 2>&1
+    [ -n "$CK_SID_B" ] && mnl session destroy --force "$CK_SID_B" >/dev/null 2>&1
+    [ -n "$CK_SID_A2" ] && mnl session destroy --force "$CK_SID_A2" >/dev/null 2>&1
+    CK_SID_A="" CK_SID_B="" CK_SID_A2=""
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    return 0
+  }
+  ck_fail() {
+    echo "--- bep.log (client keys and box connections, tail) ---"
+    grep -h 'client key\|box_connection\|revocation' \
+      "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null | tail -20 || true
+    ck_cleanup
+    fail
+  }
+  # 'gh api user' in the box $1, or the case fails naming $2.
+  ck_gh() {
+    if ! mnl session exec "$1" sh -c 'timeout 60 gh api user --jq .login' \
+      >"$WORK/$RT_CASE.gh" 2>&1; then
+      echo "::error::'gh api user' failed in $2"
+      cat "$WORK/$RT_CASE.gh" 2>/dev/null || true
+      ck_fail
+    fi
+  }
+
+  bep_revoke_seed "$RT_CASE"
+  CK_SID_A="$(bep_revoke_activate "$RT_CASE" "$ck_a")" || ck_fail
+  ck_gh "$CK_SID_A" "box A ($ck_a) before the key replacement"
+  ck_id_a="$(bep_recreate_audited_id "$RT_CASE" "$ck_a")" || ck_fail
+  echo "box A: $ck_a, box id $ck_id_a, 'gh api user' answered"
+
+  # The keychain item now holds no valid key, so the next creation reads a
+  # refused key and replaces it. The original key is not restored: the
+  # proxy revokes it when box A ends, so a restored copy can not verify.
+  RT_KEY_STUB=1
+  security delete-generic-password -s dev.minimal.client-key -a minimal >/dev/null 2>&1 || true
+  if ! security add-generic-password -s dev.minimal.client-key -a minimal \
+      -l "Minimal client signing key" -w not-a-key >/dev/null 2>"$WORK/$RT_CASE.security.err"; then
+    echo "::error::'security add-generic-password' did not write the client key item"
+    cat "$WORK/$RT_CASE.security.err" 2>/dev/null || true
+    ck_fail
+  fi
+  ck_mark="$(rt_bep_log_lines)"
+  CK_SID_B="$(bep_revoke_activate "$RT_CASE" "$ck_b")" || ck_fail
+  RT_KEY_STUB=""
+  ck_gh "$CK_SID_B" "box B ($ck_b), created under the replacement key"
+  ck_id_b="$(bep_recreate_audited_id "$RT_CASE" "$ck_b")" || ck_fail
+  ck_kept="$(rt_bep_log_since "$ck_mark" 'kept a replaced client key until the running boxes that use it end')"
+  if [[ "$ck_kept" != *"kid="*"replacement="* ]]; then
+    echo "::error::the proxy did not keep the replaced client key for box A, by its kid, when box B's creation replaced it"
+    rt_bep_log_since "$ck_mark" 'client key'
+    ck_fail
+  fi
+  echo "replacement: ${ck_kept##*INFO }"
+  ck_gh "$CK_SID_A" "box A ($ck_a) after the key replacement: a replaced key must keep verifying until its boxes end"
+  echo "box A answered 'gh api user' after the replacement"
+
+  # The audit jti: each box's admits carry its own handle's jti.
+  ck_jti_a="$(rt_admit_jtis "$WORK/$RT_CASE.$ck_a.audit" | sort -u)"
+  mnl box audit "$ck_b" -o jsonl </dev/null >"$WORK/$RT_CASE.$ck_b.audit" 2>/dev/null || true
+  ck_jti_b="$(rt_admit_jtis "$WORK/$RT_CASE.$ck_b.audit" | sort -u)"
+  if [ -z "$ck_jti_a" ] || [ -z "$ck_jti_b" ] \
+     || printf '%s\n' "$ck_jti_a" "$ck_jti_b" | grep -qx ''; then
+    echo "::error::an admit record for api.github.com:443 carries no jti (box A: '${ck_jti_a//$'\n'/ }', box B: '${ck_jti_b//$'\n'/ }')"
+    ck_fail
+  fi
+  if [ "$(printf '%s\n' "$ck_jti_a" | wc -l)" -ne 1 ] || [ "$ck_jti_a" = "$ck_jti_b" ]; then
+    echo "::error::the admit records do not carry one jti per box: box A '${ck_jti_a//$'\n'/ }', box B '${ck_jti_b//$'\n'/ }'"
+    ck_fail
+  fi
+  echo "audit jti: box A's admits carry $ck_jti_a, box B's carry $ck_jti_b"
+
+  # The destroy of A ends the last box under the replaced key.
+  ck_mark="$(rt_bep_log_lines)"
+  if ! mnl session destroy --force "$CK_SID_A" >/dev/null 2>"$WORK/$RT_CASE.destroy.err"; then
+    echo "::error::'min session destroy' of box A failed"
+    cat "$WORK/$RT_CASE.destroy.err" 2>/dev/null || true
+    ck_fail
+  fi
+  CK_SID_A=""
+  ck_gone="" ck_n=0
+  for ck_try in $(seq 1 60); do
+    [ "$ck_try" -gt 1 ] && sleep 1
+    [ -z "$ck_gone" ] && ck_gone="$(rt_bep_log_since "$ck_mark" 'revoked a replaced client key: the last box created under it ended')"
+    if mnl box audit "$ck_id_a" -o jsonl </dev/null >"$WORK/$RT_CASE.old.audit" 2>/dev/null; then
+      ck_n="$(bep_revoke_count "$WORK/$RT_CASE.old.audit" revocation)"
+    fi
+    [ -n "$ck_gone" ] && [ "$ck_n" -ge 1 ] && break
+  done
+  if [[ "$ck_gone" != *"kid="* ]]; then
+    echo "::error::the proxy did not revoke the replaced client key, by its kid, within 60 s of the destroy of box A"
+    rt_bep_log_since "$ck_mark" 'client key'
+    ck_fail
+  fi
+  echo "end of box A: ${ck_gone##*INFO }"
+  if [ "$ck_n" -lt 1 ]; then
+    echo "::error::'min box audit $ck_id_a' shows no revocation record within 60 s of the destroy"
+    ck_fail
+  fi
+
+  # The revoked id never returns: the name gets a new UUIDv7 id.
+  CK_SID_A2="$(bep_revoke_activate "$RT_CASE" "$ck_a")" || ck_fail
+  ck_id_a2="$(bep_recreate_audited_id "$RT_CASE" "$ck_a")" || ck_fail
+  for ck_n in "$ck_id_a" "$ck_id_b" "$ck_id_a2"; do
+    if ! [[ "$(printf '%s' "$ck_n" | tr 'A-F' 'a-f')" =~ $ck_v7 ]]; then
+      echo "::error::box id $ck_n is not a UUIDv7"
+      ck_fail
+    fi
+  done
+  if [ "$ck_id_a2" = "$ck_id_a" ]; then
+    echo "::error::the box re-created under $ck_a got the revoked id $ck_id_a again"
+    ck_fail
+  fi
+  echo "revoked id: $ck_id_a has a revocation record, and $ck_a re-created as $ck_id_a2 (UUIDv7)"
+
+  ck_cleanup
+  rm -f "${WORK:?}/${RT_CASE:?}".*
+  RT_RAN="$RT_RAN key"
+  echo "$ck_leg: PASS (key bound, replaced key kept by kid until box A ended, one jti per box in the audit, revoked id not reused)"
+}
+
+rt_leg_cohort() {
+  local co_leg="$RT_CASE/cohort" co_helper=/usr/local/lib/minimal/quic443-leaf
+  local co_sock co_out co_t0 co_tb co_i co_rc co_end co_line co_probe co_why co_try
+  local co_took co_src
+  if [ "$(uname -s)" != Linux ] || [ -n "$E2E_VM" ]; then
+    not_run "$co_leg" "the UDP 443 block of host_ip boxes runs in a native minimald on Linux"
+    return 0
+  fi
+  co_why=""
+  if [ ! -x "$co_helper" ] || [ ! -e /sys/fs/cgroup/minimald.slice/classifier-table ]; then
+    co_why="the QUIC block is not installed: run 'sudo scripts/install-host-classifier.sh --cohort-address <ip> --node-plane-address <ip>' first"
+  elif ! sudo -n true 2>/dev/null; then
+    co_why="no passwordless sudo, which places the daemon in the classifier tree"
+  fi
+  if [ -n "$co_why" ] && [ -n "${CI:-}" ]; then
+    # A CI native lane installs the QUIC block here, with the gates and the
+    # install of proof_host_ip_deny_all. Only a missing gate or a failed
+    # install fails the leg.
+    co_why=""
+    co_src=""
+    if ! command -v nft >/dev/null 2>&1; then
+      co_why="no nft on PATH: the classifier table is loaded with it"
+    elif ! command -v ip >/dev/null 2>&1; then
+      co_why="no ip on PATH: the leg cannot derive the default-route source address the install renders both identities from"
+    elif ! sudo -n true >/dev/null 2>&1; then
+      co_why="no passwordless sudo: the install that loads the tree and the table needs root"
+    elif ! "$ROOT/scripts/install-host-classifier.sh" --print-ruleset \
+        --cohort-address 127.0.0.1 --node-plane-address 127.0.0.1 \
+        >/dev/null 2>"$WORK/$RT_CASE.mount.err"; then
+      co_why="the installer's own mount check refuses this host: $(head -n1 "$WORK/$RT_CASE.mount.err" 2>/dev/null || true)"
+    else
+      co_src="$(ip route get 1.1.1.1 2>/dev/null \
+        | sed -n 's/.* src \([0-9][0-9.]*\).*/\1/p' | head -n1)"
+      [ -n "$co_src" ] \
+        || co_why="no default-route source address to render the install's two identities from"
+    fi
+    if [ -n "$co_why" ]; then
+      echo "::error::a CI native lane must be able to load the classifier table: $co_why"
+      fail
+    fi
+    # The daemon starts again under the install. The flag is set before the
+    # install, so a death inside it still leaves the teardown a table to remove.
+    mnl stop --force >/dev/null 2>&1 || true
+    BEP_LIVE_DAEMON=""
+    CO_CLASSIFIER_INSTALLED=1
+    # shellcheck disable=SC2024
+    if ! sudo -n "$ROOT/scripts/install-host-classifier.sh" \
+        --cohort-address "$co_src" --node-plane-address "$co_src" \
+        >"$WORK/$RT_CASE.install.out" 2>&1; then
+      echo "::error::the classifier install failed, so the QUIC block is not loaded for $co_leg"
+      cat "$WORK/$RT_CASE.install.out" 2>/dev/null || true
+      fail
+    fi
+    if [ ! -x "$co_helper" ] || [ ! -e /sys/fs/cgroup/minimald.slice/classifier-table ]; then
+      echo "::error::the classifier install exited 0 but left no QUIC block helper at $co_helper or no table marker"
+      cat "$WORK/$RT_CASE.install.out" 2>/dev/null || true
+      fail
+    fi
+  fi
+  if [ -n "$co_why" ]; then
+    not_run "$co_leg" "$co_why"
+    return 0
+  fi
+  co_sock="$XDG_STATE_HOME/minimal/providers/local-minimald0/ssh.sock"
+  mnl ls >/dev/null 2>&1 || { echo "::error::the daemon did not start for $co_leg"; fail; }
+  # shellcheck disable=SC2024
+  if ! sudo -n "$ROOT/scripts/install-host-classifier.sh" --user "$(id -un)" \
+      --place-listener "$co_sock" >"$WORK/$RT_CASE.place.out" 2>&1; then
+    echo "::error::the installer's --place-listener step did not place the daemon in the classifier tree"
+    cat "$WORK/$RT_CASE.place.out" 2>/dev/null || true
+    fail
+  fi
+
+  # Not local: co_cleanup reads them.
+  CO_SID_A="" CO_SID_B="" CO_SEED_A="" CO_SEED_B="" CO_PIDS=""
+  co_cleanup() {
+    [ -n "$CO_SID_A" ] && mnl session destroy --force "$CO_SID_A" >/dev/null 2>&1
+    [ -n "$CO_SID_B" ] && mnl session destroy --force "$CO_SID_B" >/dev/null 2>&1
+    CO_SID_A="" CO_SID_B=""
+    [ -n "$CO_SEED_A" ] && rm -rf "${CO_SEED_A:?}"
+    [ -n "$CO_SEED_B" ] && rm -rf "${CO_SEED_B:?}"
+    CO_SEED_A="" CO_SEED_B=""
+    # shellcheck disable=SC2086
+    [ -n "$CO_PIDS" ] && { wait $CO_PIDS 2>/dev/null || true; }
+    CO_PIDS=""
+    return 0
+  }
+  co_fail() { co_cleanup; fail; }
+  # Activates the project $1 as host_ip box $2, and prints its id.
+  co_activate() {
+    local ca_out
+    ca_out="$(cd "$1" && mnl session activate . --no-prompt --name "$2" --network host_ip \
+      </dev/null 2>"$WORK/$RT_CASE.$2.err")" || {
+      echo "::error::'min session activate --network host_ip' of $2 failed" >&2
+      printf '%s\n' "$ca_out" >&2
+      cat "$WORK/$RT_CASE.$2.err" >&2 2>/dev/null || true
+      return 1
+    }
+    printf '%s\n' "$ca_out" | tail -n1 | tr -d '\r'
+  }
+  # A UDP flow to TEST-NET-1 port 443 from box A, written to probe file $1:
+  # one datagram each half second for 120 s, then the end time and exit
+  # code. Before the block nothing answers, so socat waits. A reject ends
+  # it with 'Connection refused', or with 'Operation not permitted' when
+  # the local OUTPUT hook fails sendmsg. The flow outlasts a slow
+  # activation of box B, so only the block can end it early.
+  co_flow() {
+    # shellcheck disable=SC2016
+    mnl session exec "$CO_SID_A" sh -c \
+      'n=0; while [ $n -lt 240 ]; do echo q; sleep 0.5; n=$((n+1)); done | socat -t 1 - UDP:192.0.2.1:443 2>&1; echo "rc=$? end=$(date +%s)"' \
+      >"$1" 2>&1
+  }
+  # Whether the output $1 carries one of the two refusals.
+  co_refused() {
+    [[ "$1" == *"Connection refused"* ]] || [[ "$1" == *"Operation not permitted"* ]]
+  }
+  # A drop in the OUTPUT hook also fails sendmsg with EPERM. So when the
+  # output $1 carries only 'Operation not permitted', the table must hold
+  # the active reject for the blocked leaves, never a silent drop.
+  # port-unreachable is the default reject of an inet table, so 'nft list'
+  # prints it as a bare 'reject'. A 'with' clause must name port-unreachable.
+  co_eperm_is_reject() {
+    local cr_table cr_line cr_rest cr_ok=""
+    [[ "$1" == *"Connection refused"* ]] && return 0
+    [[ "$1" == *"Operation not permitted"* ]] || return 0
+    cr_table="$(sudo -n nft list table inet minimal_class 2>&1 </dev/null || true)"
+    while IFS= read -r cr_line; do
+      [[ "$cr_line" == *drop* ]] && continue
+      cr_rest="${cr_line#*@quic443_blocked_leaves udp dport 443 reject}"
+      if [[ "$cr_rest" == *with* ]] && [[ "$cr_rest" != *port-unreachable* ]]; then
+        continue
+      fi
+      cr_ok=1
+    done < <(printf '%s\n' "$cr_table" | grep -F '@quic443_blocked_leaves udp dport 443 reject' || true)
+    if [ -z "$cr_ok" ]; then
+      echo "::error::$2 got 'Operation not permitted', but the table inet minimal_class holds no reject for quic443_blocked_leaves, so the refusal can be a silent drop"
+      printf '%s\n' "$cr_table"
+      co_fail
+    fi
+  }
+  # Whether box A's own leaf is in the table's set of blocked leaves.
+  co_a_blocked() {
+    sudo -n nft -j list set inet minimal_class quic443_blocked_leaves 2>/dev/null </dev/null \
+      | grep -qF "/$CO_SID_A\""
+  }
+
+  CO_SEED_A="$(hook_mktemp /tmp/mnlquica.XXXXXX)"
+  hook_seed_preamble >"$CO_SEED_A/minimal.toml"
+  mkdir "$CO_SEED_A/.git"
+  CO_SEED_B="$(hook_mktemp /tmp/mnlquicb.XXXXXX)"
+  { hook_seed_preamble; printf '\n[session.network]\nquic443 = "block"\n'; } >"$CO_SEED_B/minimal.toml"
+  mkdir "$CO_SEED_B/.git"
+
+  CO_SID_A="$(co_activate "$CO_SEED_A" e2e-quic-cohort-a)" || co_fail
+  # The earlier flows: open before the cohort turns blocked.
+  co_flow "$WORK/$RT_CASE.flow1" & CO_PIDS="$CO_PIDS $!"
+  co_flow "$WORK/$RT_CASE.flow2" & CO_PIDS="$CO_PIDS $!"
+  sleep 3
+  co_t0="$(date +%s)"
+  # The race: injections that start while the cohort turns blocked.
+  ( sleep 0.2; co_flow "$WORK/$RT_CASE.race1" ) & CO_PIDS="$CO_PIDS $!"
+  ( sleep 0.6; co_flow "$WORK/$RT_CASE.race2" ) & CO_PIDS="$CO_PIDS $!"
+  CO_SID_B="$(co_activate "$CO_SEED_B" e2e-quic-cohort-b)" || co_fail
+  # Box B's first exec, then the block itself: box A's own leaf in the
+  # table's set of blocked leaves, polled, never a fixed window.
+  mnl session exec "$CO_SID_B" true >/dev/null 2>&1 \
+    || { echo "::error::the first 'min session exec' in box B failed"; co_fail; }
+  for co_try in $(seq 1 60); do
+    [ "$co_try" -gt 1 ] && sleep 0.5
+    co_a_blocked && break
+  done
+  if ! co_a_blocked; then
+    echo "::error::box A's own leaf did not appear in the table's quic443_blocked_leaves set within 30 s of box B's first exec"
+    sudo -n nft -j list set inet minimal_class quic443_blocked_leaves 2>&1 </dev/null || true
+    co_fail
+  fi
+  co_tb="$(date +%s)"
+  echo "the cohort blocks UDP 443: box A's own leaf is in quic443_blocked_leaves at $co_tb"
+  # shellcheck disable=SC2086
+  wait $CO_PIDS 2>/dev/null || true
+  CO_PIDS=""
+  for co_i in flow1 flow2 race1 race2; do
+    co_out="$(tr -d '\r' <"$WORK/$RT_CASE.$co_i" 2>/dev/null || true)"
+    co_line="$(printf '%s\n' "$co_out" | sed -n 's/^rc=\([0-9]*\) end=\([0-9]*\)$/\1 \2/p' | tail -n1)"
+    co_rc="${co_line%% *}" co_end="${co_line##* }"
+    if [ -z "$co_line" ] || [ "$co_rc" = 0 ] || ! co_refused "$co_out" \
+       || [ "$co_end" -lt "$co_t0" ] || [ "$co_end" -gt "$(( co_tb + 2 ))" ]; then
+      echo "::error::the UDP 443 flow $co_i from box A did not end refused when the cohort turned blocked at $co_tb (expected 'Connection refused' or 'Operation not permitted', and an end between $co_t0 and $(( co_tb + 2 )))"
+      printf '%s\n' "$co_out"
+      co_fail
+    fi
+    co_eperm_is_reject "$co_out" "the UDP 443 flow $co_i from box A"
+    echo "$co_i: refused, ended at $co_end (box B's activation began at $co_t0, the block was seen at $co_tb)"
+  done
+
+  # An injection while the cohort blocks: refused within 2 s.
+  # shellcheck disable=SC2016
+  co_probe='s=$(date +%s); printf q | socat -t 2 - UDP:192.0.2.1:443 2>&1; echo "rc=$? took=$(( $(date +%s) - s ))"'
+  co_out="$(mnl session exec "$CO_SID_A" sh -c "$co_probe" 2>&1 | tr -d '\r')" || true
+  co_took="$(printf '%s\n' "$co_out" | sed -n 's/^rc=[0-9]* took=\([0-9]*\)$/\1/p' | tail -n1)"
+  if ! co_refused "$co_out" || [ -z "$co_took" ] || [ "$co_took" -gt 2 ]; then
+    echo "::error::UDP 443 from a process injected into box A while the cohort blocks was not refused within 2 s"
+    printf '%s\n' "$co_out"
+    co_fail
+  fi
+  co_eperm_is_reject "$co_out" "UDP 443 from a process injected into box A"
+  echo "injection while blocked: refused"
+  # The block is the cohort's: with box B gone, box A sends again.
+  mnl session destroy --force "$CO_SID_B" >/dev/null 2>&1 || true
+  CO_SID_B=""
+  co_out="$(mnl session exec "$CO_SID_A" sh -c "$co_probe" 2>&1 | tr -d '\r')" || true
+  if co_refused "$co_out" || [[ "$co_out" != *"rc=0 "* ]]; then
+    echo "::error::UDP 443 from box A was still refused after the last blocking box of the cohort ended"
+    printf '%s\n' "$co_out"
+    co_fail
+  fi
+  echo "after box B ended: box A's UDP 443 is not refused"
+
+  co_cleanup
+  if [ -n "$CO_CLASSIFIER_INSTALLED" ]; then
+    # The install is this leg's own, and a later proof refuses a host that
+    # carries one. The uninstall refuses while the daemon holds the tree.
+    mnl stop --force >/dev/null 2>&1 || true
+    BEP_LIVE_DAEMON=""
+    # shellcheck disable=SC2024
+    if ! sudo -n "$ROOT/scripts/install-host-classifier.sh" --uninstall >"$WORK/$RT_CASE.uninstall.out" 2>&1; then
+      echo "::error::the classifier uninstall after $co_leg failed"
+      cat "$WORK/$RT_CASE.uninstall.out" 2>/dev/null || true
+      fail
+    fi
+    CO_CLASSIFIER_INSTALLED=""
+  fi
+  rm -f "${WORK:?}/${RT_CASE:?}".*
+  RT_RAN="$RT_RAN cohort"
+  echo "$co_leg: PASS (earlier flows and injections during and after the turn all refused, and released with the last blocking box)"
+}
+
+rt_leg_quarantine() {
+  local qu_leg="$RT_CASE/quarantine" qu_bep qu_dir qu_seg qu_name qu_out qu_try
+  local qu_sockets qu_listener qu_control
+  if [ "${E2E_BEP_QUARANTINE:-}" != 1 ]; then
+    not_run "$qu_leg" "the leg writes an unreadable line into this machine's Box Egress Proxy audit log and moves its segment into quarantine: set E2E_BEP_QUARANTINE=1 on a host whose audit log may be moved aside to run it. The manual macOS lane runs it (#2500)"
+    return 0
+  fi
+  bep_live_gate "$qu_leg" || return 0
+  qu_bep="$(rt_bep_bin)" || fail
+  # A short directory: a socket path has a length limit.
+  qu_sockets="$(mktemp -d /tmp/mnlrtq.XXXXXX)"
+  RT_QU_SOCKETS="$qu_sockets"
+  qu_listener="$qu_sockets/l.sock" qu_control="$qu_sockets/c.sock"
+  # This reads the real home, as bep_live_gate does.
+  # shellcheck disable=SC2031
+  qu_dir="$HOME/.minimal/bep/audit"
+
+  # No proxy runs from here, so the next live leg restarts the pair.
+  mnl stop --force >/dev/null 2>&1 || true
+  minvmd stop >/dev/null 2>&1 || true
+  BEP_LIVE_DAEMON=""
+  qu_seg="$(find "$qu_dir" -maxdepth 1 -name 'audit-*.jsonl' 2>/dev/null \
+    | sed 's/.*audit-\([0-9]*\)\.jsonl$/\1 &/' | sort -n | tail -n1 | cut -d' ' -f2-)"
+  if [ -z "$qu_seg" ]; then
+    echo "::error::the audit log in $qu_dir has no segment, though the proxy served"
+    fail
+  fi
+  qu_name="${qu_seg##*/}"
+  RT_QU_SIZE="$(wc -c <"$qu_seg" | tr -d ' ')"
+  RT_QU_SEG="$qu_seg"
+  printf '%s\n' "$RT_QU_LINE" >>"$qu_seg"
+  echo "wrote one unreadable line into $qu_seg"
+
+  # A creation with no proxy that can read the log is refused.
+  bep_revoke_seed "$RT_CASE"
+  if qu_out="$(bep_revoke_activate "$RT_CASE" e2e-bep-round-two-quarantine 2>&1)"; then
+    mnl session destroy --force "$(printf '%s\n' "$qu_out" | tail -n1)" >/dev/null 2>&1 || true
+    rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
+    echo "::error::a box was created while the audit log held a line that nothing can read"
+    fail
+  fi
+  rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
+  if [[ "$qu_out" != *"--quarantine-unreadable"* ]] \
+     && ! grep -qF -- '--quarantine-unreadable' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null; then
+    echo "::error::the refused creation names no way out: neither its error nor the proxy log names 'bep serve --quarantine-unreadable'"
+    printf '%s\n' "$qu_out"
+    fail
+  fi
+  echo "creation with the unreadable line: refused, and the way out is named"
+  mnl stop --force >/dev/null 2>&1 || true
+  minvmd stop >/dev/null 2>&1 || true
+
+  # A plain start is refused, and names the flag. Standard input closes
+  # after the token, so a start that is not refused stops at once.
+  qu_out="$(printf '%064d\n' 0 | "$qu_bep" serve --listener "$qu_listener" \
+    --control "$qu_control" --exit-on-stdin-close 2>&1)" && {
+    echo "::error::'bep serve' started on an audit log with an unreadable line"
+    fail
+  }
+  if [[ "$qu_out" != *"--quarantine-unreadable"* ]]; then
+    echo "::error::the refused 'bep serve' does not name --quarantine-unreadable"
+    printf '%s\n' "$qu_out"
+    fail
+  fi
+  echo "plain 'bep serve': refused, naming --quarantine-unreadable"
+
+  # The way out: the segment moves aside, the chain records it, bep serves.
+  ( sleep 600 | { printf '%064d\n' 0; cat; } | "$qu_bep" serve --listener "$qu_listener" \
+      --control "$qu_control" --quarantine-unreadable --exit-on-stdin-close \
+      >"$WORK/$RT_CASE.serve.out" 2>&1 ) &
+  QU_PID=$!
+  RT_QU_PID=$QU_PID
+  for qu_try in $(seq 1 60); do
+    [ "$qu_try" -gt 1 ] && sleep 1
+    bep_control_live "$qu_control" && break
+  done
+  if ! bep_control_live "$qu_control"; then
+    echo "::error::'bep serve --quarantine-unreadable' did not serve within 60 s"
+    cat "$WORK/$RT_CASE.serve.out" 2>/dev/null || true
+    pkill -P "$QU_PID" 2>/dev/null || true
+    fail
+  fi
+  if [ ! -f "$qu_dir/quarantine/$qu_name" ] || [ -e "$qu_seg" ]; then
+    echo "::error::'bep serve --quarantine-unreadable' did not move $qu_name into $qu_dir/quarantine"
+    pkill -P "$QU_PID" 2>/dev/null || true
+    fail
+  fi
+  qu_out="$(grep -hF '"kind":"quarantine"' "$qu_dir"/audit-*.jsonl 2>/dev/null | grep -F "$qu_name" | tail -n1)"
+  pkill -P "$QU_PID" 2>/dev/null || true
+  wait "$QU_PID" 2>/dev/null || true
+  RT_QU_PID=""
+  # The segment moved into quarantine, so no line is left to take out.
+  RT_QU_SEG="" RT_QU_SIZE=""
+  if [[ "$qu_out" != *'"previous_hash":"'* ]]; then
+    echo "::error::the audit log has no chained quarantine record that names $qu_name"
+    fail
+  fi
+  rm -rf "${qu_sockets:?}"
+  RT_QU_SOCKETS=""
+  echo "quarantine: $qu_name moved into $qu_dir/quarantine, and a chained quarantine record names it"
+  rm -f "${WORK:?}/${RT_CASE:?}".*
+  RT_RAN="$RT_RAN quarantine"
+  echo "$qu_leg: PASS (unreadable line refused the creation and the plain start, and the quarantine start served)"
+}
+
+proof_bep_round_two_conditions_closed() {
+  echo "::group::round-two conditions closed: store rules, client key, audit jti, key bound, cohort, revoked id, quarantine"
+  RT_RAN=""
+  rt_leg_store
+  rt_leg_key
+  rt_leg_cohort
+  rt_leg_quarantine
+  if [ -z "$RT_RAN" ]; then
+    not_run "$RT_CASE" "no leg of the walk can run on this lane"
+  else
+    echo "Round-two conditions closed OK (legs that ran:$RT_RAN)"
+  fi
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
+# The host_ip cohort's UDP 443 block (BEP-018, T53), end to end on a native
+# host that decides per box. Under this case's own classifier install (the
+# arrangement host_ip_deny_all carries: the privileged step's tree and
+# table, removed before it returns), two host-address boxes share the
+# cohort address:
+#   1. box A declares no quic443 stance and holds no grant, so its own
+#      stance is open, and its UDP to port 443 is not rejected;
+#   2. box B declares quic443 = "block" and joins the cohort; the daemon
+#      log records the cohort's stance flipping to blocked, naming B, and
+#      box A's own leaf added to the set that is refused UDP 443. A's UDP to
+#      port 443 is now rejected at once, and so is B's. A host-address box's
+#      socket is in the host netns, so the reject runs in the local OUTPUT
+#      hook and drops the packet: socat's send fails with "Operation not
+#      permitted". The leaf in the set tells this reject from a silent drop;
+#   3. box B is destroyed; the daemon log records the stance flipping
+#      back, naming B, and A's UDP to port 443 is not rejected again.
+# The daemon log tail of the cohort's stance changes prints at the end.
+# Records NOT RUN on a VM lane (the classifier is a host install and the
+# guest daemon has no cohort leaf), and where the classifier table cannot
+# be loaded: no nft or ip, no passwordless sudo, a classifier install the
+# host already carries, or the installer's own mount check refusing.
+proof_bep_host_ip_cohort_blocks_udp_443() {
+  echo "::group::host-address cohort: one box with quic443 = \"block\" blocks UDP 443 for the cohort, and leaving lifts it (BEP-018)"
+  local cq_case=bep_host_ip_cohort_blocks_udp_443
+  local cq_why="" cq_src="" cq_rust_log cq_sock cq_pid cq_proc cq_comm cq_daemons=""
+  local cq_open_sid="" cq_block_sid="" cq_out cq_launch cq_probe_out cq_flip cq_try cq_members
+  local cq_warm_sid=""
+  local cq_slice=/sys/fs/cgroup/minimald.slice
+  local cq_blocked_leaf=/sys/fs/cgroup/minimald.slice/boxes/quic443-blocked
+  local cq_stance_msg="the host-address cohort's UDP 443 stance changed"
+  local cq_set_add_msg="added a host-address box's own leaf to the set that is refused UDP 443"
+
+  if [ -n "$E2E_VM" ]; then
+    not_run "$cq_case" "a VM lane: the host-address cohort block runs in a native daemon's classifier tree, which a VM guest does not have"
+    echo "::endgroup::"
+    return 0
+  fi
+  if ! command -v nft >/dev/null 2>&1; then
+    cq_why="no nft on PATH: the classifier table is loaded with it"
+  elif ! command -v ip >/dev/null 2>&1; then
+    cq_why="no ip on PATH: the install needs the default-route source address"
+  elif ! sudo -n true >/dev/null 2>&1; then
+    cq_why="no passwordless sudo: the classifier install needs root"
+  elif [ -e "$cq_slice" ] || sudo -n nft list table inet minimal_class >/dev/null 2>&1; then
+    cq_why="this host already has a classifier install ($cq_slice or the table inet minimal_class), and this case replaces no host's own"
+  elif ! "$ROOT/scripts/install-host-classifier.sh" --print-ruleset \
+      --cohort-address 127.0.0.1 --node-plane-address 127.0.0.1 \
+      >/dev/null 2>"$WORK/$cq_case.mount.err"; then
+    cq_why="the installer's mount check refuses this host: $(head -n1 "$WORK/$cq_case.mount.err" 2>/dev/null || true)"
+  else
+    cq_src="$(ip route get 1.1.1.1 2>/dev/null \
+      | sed -n 's/.* src \([0-9][0-9.]*\).*/\1/p' | head -n1)"
+    [ -n "$cq_src" ] || cq_why="no default-route source address for the install"
+  fi
+  if [ -n "$cq_why" ]; then
+    # A native CI lane carries every gate above, so a missing one there is a
+    # lane fault, as in proof_host_ip_deny_all, never a NOT RUN.
+    if [ -n "${CI:-}" ]; then
+      echo "::error::a CI native lane must be able to load the classifier table: $cq_why"
+      fail
+    fi
+    not_run "$cq_case" "$cq_why"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # The daemon's file log is JSON lines with the event's fields under
+  # "fields" (crates/mlog/src/lib.rs). Prints the lines that hold $1.
+  cq_log() {
+    find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f \
+      -exec grep -hF -- "$1" {} + 2>/dev/null || true
+  }
+  # One UDP datagram to TEST-NET-1 port 443 from box $1. Prints socat's own
+  # output and a last line "rc=<exit> ms=<elapsed>". Under the block the
+  # table rejects the datagram in the local OUTPUT hook: it sends ICMP port
+  # unreachable and drops the packet, so socat's first send fails at once
+  # with EPERM ("Operation not permitted"). A later send or recv can read
+  # ECONNREFUSED ("Connection refused") instead. Without the block nothing
+  # answers, and socat waits its 3 s.
+  cq_probe() {
+    # shellcheck disable=SC2016
+    mnl session exec "$1" \
+      's=$(date +%s%N); printf q | /usr/bin/socat -t 3 -T 3 - UDP:192.0.2.1:443 2>&1; rc=$?; e=$(date +%s%N); echo "rc=$rc ms=$(( (e - s) / 1000000 ))"' \
+      2>&1 | tr -d '\r' || true
+  }
+  # 0 when the probe output $1 shows the datagram rejected at once. The
+  # errno alone cannot tell a reject from a drop: the timing tells it from
+  # the 3 s path where nothing answers, and the set check below tells it
+  # from a drop.
+  cq_rejected() {
+    local rc ms
+    rc="$(printf '%s\n' "$1" | sed -n 's/^rc=\([0-9]*\) ms=.*/\1/p' | tail -n1)"
+    ms="$(printf '%s\n' "$1" | sed -n 's/^rc=[0-9]* ms=\([0-9]*\)$/\1/p' | tail -n1)"
+    [ -n "$rc" ] && [ "$rc" != 0 ] && [ -n "$ms" ] && [ "$ms" -lt 2000 ] \
+      && printf '%s\n' "$1" | grep -qE 'Operation not permitted|Connection refused'
+  }
+  # 0 when the probe output $1 ran to its end and shows no rejection.
+  cq_not_rejected() {
+    printf '%s\n' "$1" | grep -q '^rc=[0-9]* ms=[0-9]*$' \
+      && ! printf '%s\n' "$1" | grep -qE 'Operation not permitted|Connection refused'
+  }
+  # The case's own teardown, in the order the uninstall needs: the boxes'
+  # leaves empty when they are destroyed, the daemon's when it stops.
+  # Returns the uninstall's exit status.
+  cq_unwind() {
+    [ -n "$cq_warm_sid" ] && mnl session destroy --force "$cq_warm_sid" >/dev/null 2>&1
+    [ -n "$cq_block_sid" ] && mnl session destroy --force "$cq_block_sid" >/dev/null 2>&1
+    [ -n "$cq_open_sid" ] && mnl session destroy --force "$cq_open_sid" >/dev/null 2>&1
+    cq_warm_sid=""; cq_block_sid=""; cq_open_sid=""
+    [ -n "$COHORT_SEED_DIR" ] && rm -rf "${COHORT_SEED_DIR:?}"
+    [ -n "$COHORT_SEED_BLOCK_DIR" ] && rm -rf "${COHORT_SEED_BLOCK_DIR:?}"
+    COHORT_SEED_DIR=""; COHORT_SEED_BLOCK_DIR=""
+    mnl stop --force >/dev/null 2>&1 || true
+    if [ -n "$COHORT_CLASSIFIER_INSTALLED" ]; then
+      sudo -n "$ROOT/scripts/install-host-classifier.sh" --uninstall >/dev/null 2>&1 || return 1
+      COHORT_CLASSIFIER_INSTALLED=""
+    fi
+    return 0
+  }
+  cq_fail() {
+    local cq_err
+    for cq_err in "$WORK/$cq_case".*.err; do
+      [ -s "$cq_err" ] || continue
+      echo "--- stderr: ${cq_err##*/} ---"
+      cat "$cq_err" 2>/dev/null || true
+    done
+    echo "--- daemon log: the boxes' classifier-leaf launch records (tail) ---"
+    cq_log 'egress verdict is decided on its classifier leaf' | tail -n 20
+    echo "--- daemon log: the cohort's UDP 443 stance changes (tail) ---"
+    cq_log "$cq_stance_msg" | tail -n 20
+    echo "--- daemon log: the leaves added to the set that is refused UDP 443 (tail) ---"
+    cq_log "$cq_set_add_msg" | tail -n 20
+    cq_unwind
+    fail
+  }
+
+  # ---- the install. The daemon stops first, so the one this case drives
+  # starts under the install.
+  mnl stop --force >/dev/null 2>&1 || true
+  COHORT_CLASSIFIER_INSTALLED=1
+  # The notes are captured as this lane's user: sudo's privilege ends at
+  # the script it runs.
+  # shellcheck disable=SC2024
+  if ! sudo -n "$ROOT/scripts/install-host-classifier.sh" \
+      --cohort-address "$cq_src" --node-plane-address "$cq_src" \
+      >"$WORK/$cq_case.install.out" 2>"$WORK/$cq_case.install.err"; then
+    echo "::error::the classifier install failed, so no table rejects the cohort's UDP 443"
+    cat "$WORK/$cq_case.install.err" 2>/dev/null || true
+    cq_fail
+  fi
+  if [ ! -d "$cq_blocked_leaf" ]; then
+    echo "::error::the classifier install laid out no blocked leaf at $cq_blocked_leaf"
+    cq_fail
+  fi
+  echo "install: the classifier tree at $cq_slice with the blocked leaf $cq_blocked_leaf, and the table inet minimal_class, cohort address $cq_src"
+
+  # ---- the daemon, up under a filter that keeps the classifier's and the
+  # launcher's INFO records, then placed in the slice's daemon leaf.
+  cq_rust_log="warn,minimald::net::classifier=info,minimald::box_runtime=info,minimald::box_actor=info"
+  if ! RUST_LOG="$cq_rust_log" mnl ls >/dev/null 2>"$WORK/$cq_case.warm.err"; then
+    echo "::error::the daemon for $cq_case did not come up under its record filter"
+    cat "$WORK/$cq_case.warm.err" 2>/dev/null || true
+    cq_fail
+  fi
+  for cq_proc in /proc/[0-9]*; do
+    [ -r "$cq_proc/comm" ] || continue
+    read -r cq_comm <"$cq_proc/comm" 2>/dev/null || continue
+    [ "$cq_comm" = "$min_daemon" ] || continue
+    [ -O "$cq_proc" ] || continue
+    cq_daemons="$cq_daemons${cq_daemons:+ }${cq_proc#/proc/}"
+  done
+  cq_pid="${cq_daemons%% *}"
+  if [ -z "$cq_pid" ] || [ "${cq_daemons#"$cq_pid"}" != "" ]; then
+    echo "::error::expected exactly one $min_daemon under this account to place in its leaf, found: ${cq_daemons:-none}"
+    cq_fail
+  fi
+  cq_sock="$XDG_STATE_HOME/minimal/providers/local-minimald0/ssh.sock"
+  # shellcheck disable=SC2024
+  if ! sudo -n "$ROOT/scripts/install-host-classifier.sh" --user "$(id -un)" \
+      --place-listener "$cq_sock" \
+      >"$WORK/$cq_case.place.out" 2>"$WORK/$cq_case.place.err" \
+    || ! grep -qx "$cq_pid" "$cq_slice/daemon/cgroup.procs" 2>/dev/null; then
+    echo "::error::the installer's --place-listener step did not place $min_daemon $cq_pid in $cq_slice/daemon"
+    cat "$WORK/$cq_case.place.err" 2>/dev/null || true
+    cq_fail
+  fi
+  echo "place: $min_daemon $cq_pid is in the slice's daemon leaf"
+
+  COHORT_SEED_DIR="$(hook_mktemp /tmp/mnlcohort.XXXXXX)"
+  hook_seed_preamble >"$COHORT_SEED_DIR/minimal.toml"
+  mkdir "$COHORT_SEED_DIR/.git"
+
+  # ---- a throwaway host-address box turns the daemon's classifier fact,
+  # as in proof_host_ip_deny_all. The daemon started outside the slice and
+  # was placed after, so its start-up read still carries that cause. Each
+  # host-address launch re-reads the host, so this box's launch turns the
+  # fact to per_box before box A is created against it.
+  cq_out="$(cd "$COHORT_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-cohort-warm --network host_ip </dev/null 2>"$WORK/$cq_case.warm-box.err")" || {
+    echo "::error::the throwaway host-address box that turns the daemon's classifier fact failed to activate"
+    cat "$WORK/$cq_case.warm-box.err" 2>/dev/null || true
+    cq_fail
+  }
+  cq_warm_sid="$(printf '%s\n' "$cq_out" | tail -n1 | tr -d '\r')"
+  if ! mnl session exec "$cq_warm_sid" 'true' >"$WORK/$cq_case.warm-gate.err" 2>&1 \
+     && ! { sleep 1; mnl session exec "$cq_warm_sid" 'true' >"$WORK/$cq_case.warm-gate.err" 2>&1; }; then
+    echo "::error::the throwaway box $cq_warm_sid did not run a command"
+    cat "$WORK/$cq_case.warm-gate.err" 2>/dev/null || true
+    cq_fail
+  fi
+  cq_launch="$(cq_log 'egress verdict is decided on its classifier leaf' \
+    | grep -F -- "boxes/allow/$cq_warm_sid" || true)"
+  if [[ "$cq_launch" != *'"host_ip_enforcement":"per_box"'* ]]; then
+    echo "::error::the throwaway box $cq_warm_sid was not launched into its own leaf boxes/allow/$cq_warm_sid with per-box enforcement, so the placement did not take effect: ${cq_launch:-no launch record}"
+    cq_fail
+  fi
+  if ! mnl session destroy --force "$cq_warm_sid" >/dev/null 2>"$WORK/$cq_case.warm-destroy.err"; then
+    echo "::error::the throwaway box $cq_warm_sid would not destroy"
+    cat "$WORK/$cq_case.warm-destroy.err" 2>/dev/null || true
+    cq_fail
+  fi
+  echo "refresh: the throwaway box's launch (leaf boxes/allow/$cq_warm_sid) says per_box"
+  cq_warm_sid=""
+
+  # ---- box A: open stance, alone in the cohort.
+  cq_out="$(cd "$COHORT_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-cohort-open --network host_ip </dev/null 2>"$WORK/$cq_case.open.err")" || {
+    echo "::error::'min session activate --network host_ip' failed for the open-stance box"
+    cat "$WORK/$cq_case.open.err" 2>/dev/null || true
+    cq_fail
+  }
+  cq_open_sid="$(printf '%s\n' "$cq_out" | tail -n1 | tr -d '\r')"
+  # A session's box launches on its first exec, not at the activate, so
+  # the launch record exists only after this exec.
+  if ! mnl session exec "$cq_open_sid" 'true' >"$WORK/$cq_case.open-gate.err" 2>&1 \
+     && ! { sleep 1; mnl session exec "$cq_open_sid" 'true' >"$WORK/$cq_case.open-gate.err" 2>&1; }; then
+    echo "::error::the open-stance box's own exec failed: the box this case is about cannot be driven"
+    cq_fail
+  fi
+  cq_launch="$(cq_log 'egress verdict is decided on its classifier leaf' \
+    | grep -F -- "boxes/allow/$cq_open_sid" || true)"
+  if [[ "$cq_launch" != *'"host_ip_enforcement":"per_box"'* ]]; then
+    echo "::error::the open-stance box $cq_open_sid was not launched into its own leaf boxes/allow/$cq_open_sid with per-box enforcement: ${cq_launch:-no launch record}"
+    cq_fail
+  fi
+  mnl session exec "$cq_open_sid" 'test -x /usr/bin/socat' >/dev/null 2>&1 || {
+    echo "::error::the open-stance box has no /usr/bin/socat (a launcher baseline package)"
+    cq_fail
+  }
+  cq_probe_out="$(cq_probe "$cq_open_sid")"
+  echo "box A ($cq_open_sid) alone, UDP 192.0.2.1:443 -> $(printf '%s\n' "$cq_probe_out" | tail -n1)"
+  if ! cq_not_rejected "$cq_probe_out"; then
+    echo "::error::UDP to port 443 from a host-address box with an open stance, alone in the cohort, was rejected or did not run"
+    printf '%s\n' "$cq_probe_out"
+    cq_fail
+  fi
+
+  # ---- box B: quic443 = "block" joins, and the whole cohort is blocked.
+  COHORT_SEED_BLOCK_DIR="$(hook_mktemp /tmp/mnlcohortb.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session.network]\nquic443 = "block"\n'
+  } >"$COHORT_SEED_BLOCK_DIR/minimal.toml"
+  mkdir "$COHORT_SEED_BLOCK_DIR/.git"
+  cq_out="$(cd "$COHORT_SEED_BLOCK_DIR" && mnl session activate . --no-prompt \
+    --name e2e-cohort-block --network host_ip </dev/null 2>"$WORK/$cq_case.block.err")" || {
+    echo "::error::'min session activate --network host_ip' failed for the box with quic443 = \"block\""
+    cat "$WORK/$cq_case.block.err" 2>/dev/null || true
+    cq_fail
+  }
+  cq_block_sid="$(printf '%s\n' "$cq_out" | tail -n1 | tr -d '\r')"
+  # Box B joins the cohort when it launches, on its first exec.
+  if ! mnl session exec "$cq_block_sid" 'true' >"$WORK/$cq_case.block-gate.err" 2>&1 \
+     && ! { sleep 1; mnl session exec "$cq_block_sid" 'true' >"$WORK/$cq_case.block-gate.err" 2>&1; }; then
+    echo "::error::the exec in box B ($cq_block_sid) failed: the box with quic443 = \"block\" cannot be driven"
+    cq_fail
+  fi
+  cq_flip="$(cq_log "$cq_stance_msg" | grep -F -- "\"box_id\":\"$cq_block_sid\"" \
+    | grep -F -- '"blocked":true' || true)"
+  if [ -z "$cq_flip" ]; then
+    echo "::error::the daemon log records no change of the cohort's UDP 443 stance to blocked when box B ($cq_block_sid) joined"
+    cq_fail
+  fi
+  echo "log: the cohort's stance changed to blocked when box B ($cq_block_sid) joined"
+  cq_members="$(wc -l 2>/dev/null <"$cq_blocked_leaf/cgroup.procs" | tr -d ' ')"
+  echo "blocked leaf: $cq_members process(es) in $cq_blocked_leaf"
+  if [ "$cq_members" = 0 ]; then
+    echo "::error::the blocked leaf $cq_blocked_leaf holds no process while the cohort blocks UDP 443"
+    cq_fail
+  fi
+  # An errno cannot tell a reject from a silent drop, so box A's own leaf
+  # must be in the set that the table refuses UDP 443.
+  cq_flip=""
+  for cq_try in $(seq 1 20); do
+    [ "$cq_try" -gt 1 ] && sleep 0.5
+    cq_flip="$(cq_log "$cq_set_add_msg" | grep -F -- "\"box_id\":\"$cq_open_sid\"" || true)"
+    [ -n "$cq_flip" ] && break
+  done
+  if [ -z "$cq_flip" ]; then
+    echo "::error::the daemon log records no add of box A's ($cq_open_sid) own leaf to the set that is refused UDP 443 while box B blocks the cohort"
+    cq_fail
+  fi
+  echo "log: box A's ($cq_open_sid) own leaf was added to the set that is refused UDP 443"
+  cq_probe_out="$(cq_probe "$cq_open_sid")"
+  echo "box A ($cq_open_sid) beside B, UDP 192.0.2.1:443 -> $(printf '%s\n' "$cq_probe_out" | tail -n1)"
+  if ! cq_rejected "$cq_probe_out"; then
+    echo "::error::UDP to port 443 from box A was not rejected at once while box B's quic443 = \"block\" blocks the cohort (expected 'Operation not permitted' or 'Connection refused' within 2000 ms)"
+    printf '%s\n' "$cq_probe_out"
+    cq_fail
+  fi
+  cq_probe_out="$(cq_probe "$cq_block_sid")"
+  echo "box B ($cq_block_sid), UDP 192.0.2.1:443 -> $(printf '%s\n' "$cq_probe_out" | tail -n1)"
+  if ! cq_rejected "$cq_probe_out"; then
+    echo "::error::UDP to port 443 from box B, which declares quic443 = \"block\", was not rejected at once (expected 'Operation not permitted' or 'Connection refused' within 2000 ms)"
+    printf '%s\n' "$cq_probe_out"
+    cq_fail
+  fi
+
+  # ---- box B leaves, and the block lifts for box A.
+  if ! mnl session destroy --force "$cq_block_sid" >/dev/null 2>"$WORK/$cq_case.destroy.err"; then
+    echo "::error::box B ($cq_block_sid) would not destroy"
+    cat "$WORK/$cq_case.destroy.err" 2>/dev/null || true
+    cq_fail
+  fi
+  for cq_try in $(seq 1 20); do
+    [ "$cq_try" -gt 1 ] && sleep 0.5
+    cq_flip="$(cq_log "$cq_stance_msg" | grep -F -- "\"box_id\":\"$cq_block_sid\"" \
+      | grep -F -- '"blocked":false' || true)"
+    [ -n "$cq_flip" ] && break
+  done
+  if [ -z "$cq_flip" ]; then
+    echo "::error::the daemon log records no change of the cohort's UDP 443 stance back to open when box B ($cq_block_sid) left"
+    cq_fail
+  fi
+  echo "log: the cohort's stance changed back to open when box B ($cq_block_sid) left"
+  local cq_left_sid="$cq_block_sid"
+  cq_block_sid=""
+  for cq_try in $(seq 1 20); do
+    [ "$cq_try" -gt 1 ] && sleep 0.5
+    cq_members="$(wc -l 2>/dev/null <"$cq_blocked_leaf/cgroup.procs" | tr -d ' ')"
+    [ "$cq_members" = 0 ] && break
+  done
+  if [ "$cq_members" != 0 ]; then
+    echo "::error::the blocked leaf $cq_blocked_leaf still holds $cq_members process(es) after the last blocking box left"
+    cq_fail
+  fi
+  cq_probe_out="$(cq_probe "$cq_open_sid")"
+  echo "box A ($cq_open_sid) after B left, UDP 192.0.2.1:443 -> $(printf '%s\n' "$cq_probe_out" | tail -n1)"
+  if ! cq_not_rejected "$cq_probe_out"; then
+    echo "::error::UDP to port 443 from box A is still rejected after the last blocking box left the cohort"
+    printf '%s\n' "$cq_probe_out"
+    cq_fail
+  fi
+
+  echo "--- daemon log: the cohort's UDP 443 stance changes (tail) ---"
+  cq_log "$cq_stance_msg" | grep -F -- "\"box_id\":\"$cq_left_sid\"" | tail -n 4
+  if ! cq_unwind; then
+    echo "::error::the classifier uninstall failed, so this case left the tree and the table on the host"
+    fail
+  fi
+  rm -f "${WORK:?}/${cq_case:?}".*
+  echo "host-address cohort: UDP 443 open alone, rejected for every member while one blocks, open again after it leaves"
+  echo "::endgroup::"
+}
+
+# The BEP conditions closed, end to end (T56): one walk over the residual
+# cases the slice's arch conditions held open at merge.
+#   * bep_git_credential_helper_sends_header: git in a grant box sends a
+#     header the proxy substitutes (BEP-015).
+#   * bep_signing_rotation_keeps_running_box_working: the signing
+#     certificate rotates under a running proxy, and the box keeps
+#     pushing (BEP-061).
+#   * bep_host_ip_cohort_blocks_udp_443: a blocked host_ip cohort sends no
+#     UDP to port 443 (BEP-018).
+# The first two need the macOS lane with a sign-in and E2E_BEP_PRIVATE_REPO.
+# The third needs a native Linux host that can load the classifier table.
+# Each case records NOT RUN with its gate where it cannot run, and the walk
+# prints PASS or NOT RUN for each at its end. A failing case ends the run,
+# as every case does. The store-reference check at creation (BEP-034) and
+# the CA deny set have their own unit tests in crates/bep.
+proof_bep_conditions_closed_end_to_end() {
+  local cc_case cc_before cc_why cc_ran=0 cc_summary=""
+  for cc_case in bep_git_credential_helper_sends_header \
+      bep_signing_rotation_keeps_running_box_working \
+      bep_host_ip_cohort_blocks_udp_443; do
+    cc_before="$E2E_NOT_RUN"
+    "proof_$cc_case"
+    if [ "$E2E_NOT_RUN" = "$cc_before" ]; then
+      cc_ran=$((cc_ran + 1))
+      cc_summary="$cc_summary$cc_case: PASS"$'\n'
+    else
+      cc_why="$(printf '%s' "$E2E_NOT_RUN_WHY" | awk -F '\t' -v c="$cc_case" '$1 == c { w = $2 } END { print w }')"
+      cc_summary="$cc_summary$cc_case: NOT RUN (${cc_why:-no reason recorded})"$'\n'
+    fi
+  done
+  echo "::group::BEP conditions closed: each case"
+  printf '%s' "$cc_summary"
+  echo "::endgroup::"
+  if [ "$cc_ran" = 0 ]; then
+    not_run bep_conditions_closed_end_to_end "none of its cases can run on this lane"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# The BEP round-three conditions closed (T94): one walk over the residuals
+# that the third round of the slice's arch conditions held open. Each case
+# is runnable alone, and the walk prints PASS or NOT RUN with its gate for
+# each at its end. A failing case ends the run, as every case does.
+#   * bep_r3_spec_names_jti_and_quarantine: the spec's BEP-039 names the
+#     handle's jti, BEP-041 names the quarantine directory, and BEP-068
+#     refuses a start over an unreadable line and names
+#     `bep serve --quarantine-unreadable`. Runs on every lane.
+#   * bep_r3_pre_flip_udp_443_refused: a real kernel refuses a UDP 443
+#     socket that a host_ip member opened before its cohort turned blocked,
+#     and the socket sends again after the block lifts (BEP-018). It runs
+#     the root integration leg that proves it, and records the leg's own
+#     NOT RUN gate. Native Linux with passwordless sudo and nft only.
+#   * bep_r3_finalize_install_names_quic_helper: `min finalize-install
+#     --show` lists the QUIC block helper, and the JSON report names its
+#     path while it is missing (BEP-018). Native Linux only.
+#   * bep_r3_uninstall_removes_quic_helper: the installer's uninstall names
+#     the QUIC block helper and its sudoers rule, and its printed remedy
+#     removes both. It runs the installer harness case over a fake root,
+#     so it changes nothing on this host. Runs on every lane.
+#   * bep_r3_minted_id_checked_without_proxy: with no proxy running, a box
+#     creation reads the proxy's audit log for the minted id. An audit
+#     segment with a line that does not parse refuses the creation, and the
+#     same creation succeeds once the segment is gone (BEP-070).
+#   * bep_r3_stranded_box_frees_client_key: a grant box destroyed while the
+#     proxy is down keeps its id in the proxy's client-key registrations.
+#     The next proxy start frees it (BEP-063).
+#   * bep_r3_widened_store_rule_without_restart: a rule added to
+#     [secret-store-rules] while the proxy runs turns the proxy's 403 for its
+#     host into an admitted CONNECT, with the same `bep serve` process
+#     (BEP-032).
+#   * bep_r3_config_dir_rule_reaches_bep_serve: NOT RUN on every lane. Box
+#     creation mints no store handle yet (#2525), so no `min` command reaches
+#     the --config-dir rule check. Its unit tests in crates/minimal/src/mint.rs
+#     pin the check.
+# The four proxy cases need the live proxy gate (bep_live_gate): macOS, the
+# VM host daemon with gvproxy, and a GitHub sign-in.
+R3_SPEC="docs/specs/24-spec-box-egress-proxy/24-spec-box-egress-proxy.md"
+R3_PRE_FLIP_LEG=a_blocked_cohort_rejects_a_pre_flip_udp_443_socket
+R3_STORE_RULE_ID=e2e-round-three
+R3_STORE_HOST=example.com
+
+# Prints the requirement line of $1 (BEP-039, ...) in the spec, and the
+# lines under it up to the next requirement.
+r3_spec_block() {
+  awk -v id="$1" '
+    index($0, "- **" id "**") == 1 { grab = 1; print; next }
+    grab && /^- \*\*[A-Z]+-[0-9]+\*\*/ { exit }
+    grab && /^#/ { exit }
+    grab { print }
+  ' "$ROOT/$R3_SPEC"
+}
+
+proof_bep_r3_spec_names_jti_and_quarantine() {
+  echo "::group::BEP spec: the audit record names the handle jti, and an unreadable segment moves to quarantine"
+  local sq_039 sq_041 sq_068
+  sq_039="$(r3_spec_block BEP-039 | head -n1)"
+  sq_041="$(r3_spec_block BEP-041 | head -n1)"
+  sq_068="$(r3_spec_block BEP-068)"
+  if [ -z "$sq_039" ] || [ -z "$sq_041" ] || [ -z "$sq_068" ]; then
+    echo "::error::$R3_SPEC lacks one of the BEP-039, BEP-041 and BEP-068 requirements"
+    fail
+  fi
+  if [[ "$sq_039" != *"the handle's \`jti\` or empty"* ]]; then
+    echo "::error::BEP-039 in $R3_SPEC does not name the handle's jti among the audit record's fields"
+    printf '%s\n' "$sq_039"
+    fail
+  fi
+  echo "BEP-039 names the handle's \`jti\` among the audit record's fields"
+  if [[ "$sq_041" != *"into the \`quarantine\` directory"* ]]; then
+    echo "::error::BEP-041 in $R3_SPEC does not name the move of an unreadable segment into the quarantine directory"
+    printf '%s\n' "$sq_041"
+    fail
+  fi
+  echo "BEP-041 names the move of a segment with an unreadable line into the \`quarantine\` directory"
+  # shellcheck disable=SC2016 # the backticks are the spec's own text
+  if [[ "$sq_068" != *'refuse the start and name `bep serve --quarantine-unreadable`'* ]]; then
+    echo "::error::BEP-068 in $R3_SPEC does not say that a start over an unreadable line is refused and names bep serve --quarantine-unreadable"
+    fail
+  fi
+  echo "BEP-068 refuses a start over an unreadable line and names \`bep serve --quarantine-unreadable\`"
+  echo "::endgroup::"
+}
+
+proof_bep_r3_pre_flip_udp_443_refused() {
+  echo "::group::host-address cohort: a UDP 443 socket opened before the flip is refused after it (BEP-018)"
+  local pf_case=bep_r3_pre_flip_udp_443_refused pf_why="" pf_rc pf_gate
+  local pf_out="$WORK/bep_r3_pre_flip.out"
+  if [ "$(uname -s)" != Linux ] || [ -n "$E2E_VM" ]; then
+    pf_why="not a native Linux lane: the leg loads the classifier table over this host's own cgroup2"
+  elif ! command -v cargo-nextest >/dev/null 2>&1; then
+    pf_why="no cargo-nextest on PATH: the leg is a test in crates/minimald/tests/netns_root_integration.rs"
+  elif [ "$(id -u)" != 0 ] && ! sudo -n true >/dev/null 2>&1; then
+    pf_why="no passwordless sudo: the classifier install and the QUIC block helper need root"
+  elif [ -e /sys/fs/cgroup/minimald.slice ]; then
+    pf_why="this host already has a classifier tree at /sys/fs/cgroup/minimald.slice, and the leg replaces no host's own"
+  fi
+  if [ -n "$pf_why" ]; then
+    not_run "$pf_case" "$pf_why"
+    echo "::endgroup::"
+    return 0
+  fi
+  echo "running $R3_PRE_FLIP_LEG (cargo nextest run -p minimald --test netns_root_integration)"
+  (cd "$ROOT" && MINIMALD_NETNS_TEST=1 cargo nextest run --locked -p minimald \
+    --test netns_root_integration --run-ignored only --no-capture --no-tests=fail \
+    -E "test(=$R3_PRE_FLIP_LEG)") >"$pf_out" 2>&1
+  pf_rc=$?
+  grep -F -- "$R3_PRE_FLIP_LEG" "$pf_out" || true
+  if [ "$pf_rc" != 0 ]; then
+    echo "::error::$R3_PRE_FLIP_LEG failed (exit $pf_rc)"
+    tail -n 60 "$pf_out"
+    fail
+  fi
+  pf_gate="$(sed -n "s/^NOT RUN $R3_PRE_FLIP_LEG: //p" "$pf_out" | head -n1)"
+  if [ -n "$pf_gate" ]; then
+    not_run "$pf_case" "$pf_gate"
+    rm -f "$pf_out"
+    echo "::endgroup::"
+    return 0
+  fi
+  if ! grep -qF -- "step 6: after the flip the pre-flip socket is refused with ECONNREFUSED" "$pf_out" \
+    || ! grep -qF -- "step 8: the pre-flip socket sends again after the block lifts" "$pf_out"; then
+    echo "::error::$R3_PRE_FLIP_LEG passed without printing its refusal and its resend steps, so it did not run"
+    tail -n 60 "$pf_out"
+    fail
+  fi
+  rm -f "$pf_out"
+  echo "a real kernel refused the pre-flip UDP 443 socket while the cohort was blocked, and it sent again after the block lifted"
+  echo "::endgroup::"
+}
+
+proof_bep_r3_finalize_install_names_quic_helper() {
+  echo "::group::min finalize-install names the QUIC block helper (BEP-018)"
+  local fq_case=bep_r3_finalize_install_names_quic_helper fq_out fq_state
+  if [ "$(uname -s)" != Linux ] || [ -n "$E2E_VM" ]; then
+    not_run "$fq_case" "not a native Linux lane: the QUIC block helper is an item of the native daemon's install"
+    echo "::endgroup::"
+    return 0
+  fi
+  mnl finalize-install --show </dev/null >"$WORK/$fq_case.show" 2>&1 || true
+  if ! grep -qF -- "QUIC block helper" "$WORK/$fq_case.show"; then
+    echo "::error::'min finalize-install --show' does not list the QUIC block helper"
+    cat "$WORK/$fq_case.show"
+    fail
+  fi
+  echo "min finalize-install --show lists the QUIC block helper"
+  mnl finalize-install --show --json </dev/null >"$WORK/$fq_case.json" 2>"$WORK/$fq_case.json.err" || true
+  if ! fq_out="$(python3 - "$WORK/$fq_case.json" <<'PY'
+import json, sys
+# The shell captures stdout only, so the reason goes to stdout before exit 1.
+def die(msg):
+    print(msg)
+    sys.exit(1)
+path = "/usr/local/lib/minimal/quic443-leaf"
+try:
+    with open(sys.argv[1]) as f:
+        report = json.load(f)
+except (OSError, ValueError) as e:
+    die("the report is not valid JSON: %s" % e)
+items = [i for i in report.get("items", []) if i.get("id") == "quic443-helper"]
+if len(items) != 1:
+    die("the report holds %d quic443-helper items, not 1" % len(items))
+item = items[0]
+if item.get("label") != "QUIC block helper":
+    die("the quic443-helper item is labelled %r" % item.get("label"))
+state = item.get("state")
+if state == "missing" and path not in (item.get("today") or ""):
+    die("the missing helper's item does not name %s: %r" % (path, item.get("today")))
+print(state)
+PY
+)"; then
+    echo "::error::'min finalize-install --show --json': $fq_out"
+    cat "$WORK/$fq_case.json" "$WORK/$fq_case.json.err" 2>/dev/null || true
+    fail
+  fi
+  fq_state="$fq_out"
+  if [ "$fq_state" = "done" ] && [ ! -f /usr/local/lib/minimal/quic443-leaf ]; then
+    echo "::error::'min finalize-install --show --json' reports the QUIC block helper done, but /usr/local/lib/minimal/quic443-leaf is absent"
+    fail
+  fi
+  rm -f "${WORK:?}/${fq_case:?}".*
+  echo "min finalize-install --show --json: the quic443-helper item's state is $fq_state, and the item names /usr/local/lib/minimal/quic443-leaf where it is missing"
+  echo "::endgroup::"
+}
+
+proof_bep_r3_uninstall_removes_quic_helper() {
+  echo "::group::uninstall names the QUIC block helper and its sudoers rule, and its remedy removes both"
+  local uq_out="$WORK/bep_r3_uninstall.out" uq_want
+  if ! sh "$ROOT/scripts/install_test.sh" finalize_install_uninstall >"$uq_out" 2>&1; then
+    echo "::error::scripts/install_test.sh finalize_install_uninstall failed"
+    grep -E '^FAIL' "$uq_out" || tail -n 40 "$uq_out"
+    fail
+  fi
+  for uq_want in \
+    "ok   - the uninstall names the QUIC block helper and its sudoers rule" \
+    "ok   - the printed remedy removes usr/local/lib/minimal/quic443-leaf" \
+    "ok   - the printed remedy removes etc/sudoers.d/minimal-quic443-leaf"; do
+    if ! grep -qxF -- "$uq_want" "$uq_out"; then
+      echo "::error::scripts/install_test.sh finalize_install_uninstall does not report: ${uq_want#ok   - }"
+      tail -n 40 "$uq_out"
+      fail
+    fi
+    echo "${uq_want#ok   - }"
+  done
+  rm -f "$uq_out"
+  echo "::endgroup::"
+}
+
+# The pids of this run's `bep serve`, sorted, one per line. minvmd starts it
+# with `--listener` on a socket under this run's $XDG_STATE_HOME, so a proxy
+# from another checkout or a person's own proxy does not match.
+r3_proxy_pids() {
+  pgrep -f -- "serve --listener $XDG_STATE_HOME/minimal/providers/local-minvmd0/gvproxy-bep.sock" \
+    2>/dev/null | sort || true
+}
+
+# Kills this run's `bep serve` and waits until nothing answers on its control
+# socket $1. Clears BEP_LIVE_DAEMON, so the next bep_live_gate restarts the
+# daemon pair with the proxy. Returns 1 when the proxy still answers.
+r3_proxy_down() {
+  local pd_pids pd_try
+  pd_pids="$(r3_proxy_pids)"
+  if [ -z "$pd_pids" ]; then
+    echo "::error::no 'bep serve' process runs for this VM host, though the proxy answered on $1"
+    return 1
+  fi
+  # shellcheck disable=SC2086
+  kill -KILL $pd_pids 2>/dev/null || true
+  BEP_LIVE_DAEMON=""
+  for pd_try in $(seq 1 20); do
+    bep_control_live "$1" || return 0
+    sleep 0.5
+  done
+  echo "::error::the proxy still answers on $1 after its process was killed"
+  return 1
+}
+
+# Activates a plain own-IP box named $2 for case $1 from R3_SEED_DIR, and
+# prints its id. stderr goes to $WORK/$1.$2.err. Returns the activation's
+# exit status.
+r3_activate_plain() {
+  local ap_out
+  ap_out="$(cd "$R3_SEED_DIR" && mnl session activate . --no-prompt --name "$2" \
+    --network own_ip </dev/null 2>"$WORK/$1.$2.err")" || return 1
+  printf '%s\n' "$ap_out" | tail -n1 | tr -d '\r'
+}
+
+r3_plain_seed() {
+  R3_SEED_DIR="$(hook_mktemp /tmp/mnlr3.XXXXXX)"
+  hook_seed_preamble > "$R3_SEED_DIR/minimal.toml"
+  mkdir "$R3_SEED_DIR/.git"
+}
+
+proof_bep_r3_minted_id_checked_without_proxy() {
+  echo "::group::with no proxy running, a box creation checks its minted id against the proxy's audit log (BEP-070)"
+  local mi_case=bep_r3_minted_id_checked_without_proxy
+  # This reads the real home, which no earlier subshell export changes.
+  # shellcheck disable=SC2031
+  local mi_control="$HOME/.minimal/bep/control.sock"
+  local mi_audit mi_last mi_n mi_seg mi_sid mi_before mi_after
+  local mi_warn="the Box Egress Proxy's audit log was not read whole"
+  bep_live_gate "$mi_case" || { echo "::endgroup::"; return 0; }
+  mi_audit="$(dirname "$mi_control")/audit"
+
+  MI_SID=""
+  mi_cleanup() {
+    [ -n "$R3_AUDIT_PLANT" ] && rm -f "$R3_AUDIT_PLANT"
+    R3_AUDIT_PLANT=""
+    [ -n "$MI_SID" ] && mnl session destroy --force "$MI_SID" >/dev/null 2>&1
+    MI_SID=""
+    [ -n "$R3_SEED_DIR" ] && rm -rf "${R3_SEED_DIR:?}"
+    R3_SEED_DIR=""
+    return 0
+  }
+  mi_fail() { mi_cleanup; fail; }
+
+  r3_plain_seed
+  r3_proxy_down "$mi_control" || mi_fail
+  echo "the proxy is down"
+
+  # A new segment after the last one, with one complete line that does not
+  # parse. Removed before the proxy starts again: a start refuses it.
+  mkdir -p "$mi_audit"
+  mi_last="$(find "$mi_audit" -maxdepth 1 -name 'audit-*.jsonl' -type f 2>/dev/null \
+    | sed -n 's/.*\/audit-\([0-9][0-9]*\)\.jsonl$/\1/p' | sort -n | tail -n1)"
+  mi_n=$(( ${mi_last:--1} + 1 ))
+  mi_seg="$mi_audit/audit-$mi_n.jsonl"
+  R3_AUDIT_PLANT="$mi_seg"
+  printf 'e2e round three: this line does not parse\n' >"$mi_seg"
+  echo "planted $mi_seg with one line that does not parse"
+
+  mi_before="$(minvmd_log_lines "$mi_warn" | wc -l | tr -d ' ')"
+  if mi_sid="$(r3_activate_plain "$mi_case" e2e-r3-mint-refused)"; then
+    MI_SID="$mi_sid"
+    echo "::error::'min session activate' created a box while the proxy's audit log held a line that does not parse, with no proxy running"
+    mi_fail
+  fi
+  echo "--- min session activate (refused) stderr ---"
+  cat "$WORK/$mi_case.e2e-r3-mint-refused.err" 2>/dev/null || true
+  mi_after="$(minvmd_log_lines "$mi_warn" | wc -l | tr -d ' ')"
+  if [ "$mi_after" -le "$mi_before" ]; then
+    echo "::error::the creation failed, but minvmd logged no refusal for the unread audit log ('$mi_warn')"
+    mi_fail
+  fi
+  if [[ "$(minvmd_log_lines "$mi_warn" | tail -n1)" != *"--quarantine-unreadable"* ]]; then
+    echo "::error::minvmd's refusal does not name bep serve --quarantine-unreadable as the way out"
+    minvmd_log_lines "$mi_warn" | tail -n1
+    mi_fail
+  fi
+  echo "minvmd refused the creation: the audit log was not read whole, and the refusal names --quarantine-unreadable"
+
+  rm -f "$mi_seg"
+  R3_AUDIT_PLANT=""
+  if ! MI_SID="$(r3_activate_plain "$mi_case" e2e-r3-mint-checked)"; then
+    MI_SID=""
+    echo "::error::'min session activate' failed with no proxy running and an audit log that reads whole"
+    cat "$WORK/$mi_case.e2e-r3-mint-checked.err" 2>/dev/null || true
+    mi_fail
+  fi
+  if bep_control_live "$mi_control"; then
+    echo "::error::the proxy answers on $mi_control again, so the second creation was not checked with no proxy"
+    mi_fail
+  fi
+  echo "with the segment gone and the proxy still down, the box $MI_SID was created"
+
+  mi_cleanup
+  rm -f "${WORK:?}/${mi_case:?}".*
+  echo "Minted id checked with no proxy OK (an unread audit log refused the creation, a log read whole let it through)"
+  echo "::endgroup::"
+}
+
+# Prints the box id of box $2 for case $1 as the proxy's control socket
+# spells it: 32 lowercase hex digits.
+r3_box_hex() {
+  local bh_id
+  bh_id="$(bep_recreate_audited_id "$1" "$2")" || return 1
+  printf '%s\n' "$bh_id" | tr -d '-' | tr 'A-F' 'a-f'
+}
+
+# 0 when the client-key registrations file $1 holds box id $2 in a boxes= set.
+r3_keys_hold_box() {
+  tr 'A-F' 'a-f' <"$1" 2>/dev/null | grep -oE 'boxes=[0-9a-f,]+' | sed 's/^boxes=//' | tr ',' '\n' \
+    | grep -xF -- "$2" >/dev/null
+}
+
+proof_bep_r3_stranded_box_frees_client_key() {
+  echo "::group::a box destroyed while the proxy is down frees its client key at the next proxy start (BEP-063)"
+  local sk_case=bep_r3_stranded_box_frees_client_key sk_name=e2e-r3-stranded
+  # This reads the real home, which no earlier subshell export changes.
+  # shellcheck disable=SC2031
+  local sk_control="$HOME/.minimal/bep/control.sock"
+  # shellcheck disable=SC2031
+  local sk_keys="$HOME/.minimal/bep/control.sock.client-keys" sk_hex sk_try sk_freed=""
+  bep_live_gate "$sk_case" || { echo "::endgroup::"; return 0; }
+
+  SK_SID=""
+  sk_cleanup() {
+    [ -n "$SK_SID" ] && mnl session destroy --force "$SK_SID" >/dev/null 2>&1
+    SK_SID=""
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    return 0
+  }
+  sk_fail() { sk_cleanup; fail; }
+
+  bep_revoke_seed "$sk_case"
+  SK_SID="$(bep_revoke_activate "$sk_case" "$sk_name")" || { SK_SID=""; sk_fail; }
+  sk_hex="$(r3_box_hex "$sk_case" "$sk_name")" || sk_fail
+  if ! r3_keys_hold_box "$sk_keys" "$sk_hex"; then
+    echo "::error::$sk_keys does not hold the grant box $sk_hex in a boxes= set after its creation"
+    sk_fail
+  fi
+  echo "$sk_keys holds the grant box $sk_hex"
+
+  r3_proxy_down "$sk_control" || sk_fail
+  if ! mnl session destroy --force "$SK_SID" </dev/null >/dev/null 2>"$WORK/$sk_case.destroy.err"; then
+    echo "::error::'min session destroy' of $sk_name failed with the proxy down"
+    cat "$WORK/$sk_case.destroy.err" 2>/dev/null || true
+    sk_fail
+  fi
+  SK_SID=""
+  if ! r3_keys_hold_box "$sk_keys" "$sk_hex"; then
+    echo "::error::$sk_keys no longer holds $sk_hex with the proxy down, so the box was not stranded"
+    sk_fail
+  fi
+  echo "the box ended with the proxy down, and $sk_keys still holds it"
+
+  bep_live_gate "$sk_case" || sk_fail
+  for sk_try in $(seq 1 60); do
+    [ "$sk_try" -gt 1 ] && sleep 0.5
+    if ! r3_keys_hold_box "$sk_keys" "$sk_hex"; then
+      sk_freed=1
+      break
+    fi
+  done
+  if [ -z "$sk_freed" ]; then
+    echo "::error::$sk_keys still holds the ended box $sk_hex 30 s after the proxy started again"
+    sk_fail
+  fi
+  echo "after the proxy started again, $sk_keys no longer holds $sk_hex"
+
+  sk_cleanup
+  rm -f "${WORK:?}/${sk_case:?}".*
+  echo "Stranded box OK (its id left the client key's boxes at the next proxy start)"
+  echo "::endgroup::"
+}
+
+# One CONNECT to $R3_STORE_HOST:443 through the proxy that box $1's
+# HTTPS_PROXY names. Prints the proxy's answer head.
+r3_connect_probe() {
+  # shellcheck disable=SC2016
+  mnl session exec "$1" sh -c \
+    'p="${HTTPS_PROXY:-${https_proxy:-}}"; p="${p#*://}"; p="${p%%/*}"
+     printf "CONNECT %s:443 HTTP/1.1\r\nHost: %s:443\r\n\r\n" "$0" "$0" \
+       | /usr/bin/socat -t 10 -T 20 - "TCP:$p" 2>&1 | head -c 400' "$R3_STORE_HOST" \
+    </dev/null 2>&1 | tr -d '\r' || true
+}
+
+# The first HTTP status line in the probe output $1, or nothing.
+r3_status_line() {
+  printf '%s\n' "$1" | sed -n '/^HTTP\/1\.1 [0-9][0-9][0-9]/{p;q;}'
+}
+
+proof_bep_r3_widened_store_rule_without_restart() {
+  echo "::group::a store rule added while the proxy runs is admitted with no restart (BEP-032)"
+  local wr_case=bep_r3_widened_store_rule_without_restart
+  local wr_sid wr_before wr_after wr_pid_before wr_pid_after wr_try
+  local wr_config="$XDG_CONFIG_HOME/minimal/config.toml" wr_saved="$WORK/bep_r3_config.saved"
+  local wr_off="is not one."
+  bep_live_gate "$wr_case" || { echo "::endgroup::"; return 0; }
+
+  WR_SID="" WR_HAD_CONFIG=""
+  [ -f "$wr_config" ] && { cp "$wr_config" "$wr_saved"; WR_HAD_CONFIG=1; }
+  wr_cleanup() {
+    if [ -n "$WR_HAD_CONFIG" ]; then
+      mv -f "$wr_saved" "$wr_config"
+    else
+      rm -f "$wr_config"
+    fi
+    WR_HAD_CONFIG=""
+    [ -n "$WR_SID" ] && mnl session destroy --force "$WR_SID" >/dev/null 2>&1
+    WR_SID=""
+    [ -n "$R3_SEED_DIR" ] && rm -rf "${R3_SEED_DIR:?}"
+    R3_SEED_DIR=""
+    return 0
+  }
+  wr_fail() { wr_cleanup; fail; }
+
+  R3_SEED_DIR="$(hook_mktemp /tmp/mnlr3.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$R3_SEED_DIR/minimal.toml"
+  mkdir "$R3_SEED_DIR/.git"
+  if ! wr_sid="$(cd "$R3_SEED_DIR" && mnl session activate . --no-prompt --name e2e-r3-store-rule \
+    --network own_ip --credentialed-upstream </dev/null 2>"$WORK/$wr_case.err")"; then
+    echo "::error::'min session activate --network own_ip --credentialed-upstream' of the proxy_env box failed"
+    cat "$WORK/$wr_case.err" 2>/dev/null || true
+    wr_fail
+  fi
+  WR_SID="$(printf '%s\n' "$wr_sid" | tail -n1 | tr -d '\r')"
+
+  wr_pid_before="$(r3_proxy_pids | tr '\n' ' ')"
+  wr_before="$(r3_connect_probe "$WR_SID")"
+  echo "before the rule, CONNECT $R3_STORE_HOST:443 -> $(r3_status_line "$wr_before")"
+  if [[ "$(r3_status_line "$wr_before")" != "HTTP/1.1 403 "* ]] || [[ "$wr_before" != *"$wr_off"* ]]; then
+    echo "::error::before the rule, the proxy did not refuse $R3_STORE_HOST as a host that is not credentialed"
+    printf '%s\n' "$wr_before"
+    wr_fail
+  fi
+
+  mkdir -p "$(dirname "$wr_config")"
+  printf '\n[secret-store-rules.%s]\nupstream = ["%s"]\nheader = "Authorization"\nprefix = "Bearer "\n' \
+    "$R3_STORE_RULE_ID" "$R3_STORE_HOST" >>"$wr_config"
+  echo "added [secret-store-rules.$R3_STORE_RULE_ID] for $R3_STORE_HOST to $wr_config"
+
+  # The proxy reads the rules again when the file's stamp changes, and a
+  # stamp younger than its settle time is read again at the next CONNECT.
+  for wr_try in $(seq 1 10); do
+    [ "$wr_try" -gt 1 ] && sleep 1
+    wr_after="$(r3_connect_probe "$WR_SID")"
+    [ -n "$(r3_status_line "$wr_after")" ] && [[ "$wr_after" != *"$wr_off"* ]] && break
+  done
+  echo "after the rule, CONNECT $R3_STORE_HOST:443 -> $(r3_status_line "$wr_after")"
+  if [ -z "$(r3_status_line "$wr_after")" ] || [[ "$wr_after" == *"$wr_off"* ]]; then
+    echo "::error::after the rule was added, the proxy still refuses $R3_STORE_HOST as a host that is not credentialed"
+    printf '%s\n' "$wr_after"
+    wr_fail
+  fi
+  wr_pid_after="$(r3_proxy_pids | tr '\n' ' ')"
+  if [ -z "$wr_pid_before" ] || [ "$wr_pid_before" != "$wr_pid_after" ]; then
+    echo "::error::the bep serve process changed across the rule change ('$wr_pid_before' -> '$wr_pid_after'), so the proxy restarted"
+    wr_fail
+  fi
+  echo "the same bep serve process (pid $wr_pid_after) admitted $R3_STORE_HOST"
+
+  wr_cleanup
+  rm -f "${WORK:?}/${wr_case:?}".*
+  echo "Widened store rule OK (refused before the rule, admitted after it, no proxy restart)"
+  echo "::endgroup::"
+}
+
+proof_bep_r3_config_dir_rule_reaches_bep_serve() {
+  # Box creation mints no store handle yet: the sealed member list has no
+  # store kind (#2525). So no min command reaches the check that refuses a
+  # --config-dir rule bep serve does not read. Its unit tests in
+  # crates/minimal/src/mint.rs pin it until then.
+  not_run bep_r3_config_dir_rule_reaches_bep_serve \
+    "box creation mints no store handle yet (#2525), so no min command reaches the --config-dir store rule check"
+}
+
+proof_bep_round_three_conditions_closed() {
+  local r3_case r3_before r3_why r3_ran=0 r3_summary=""
+  for r3_case in bep_r3_spec_names_jti_and_quarantine \
+      bep_r3_pre_flip_udp_443_refused \
+      bep_r3_finalize_install_names_quic_helper \
+      bep_r3_uninstall_removes_quic_helper \
+      bep_r3_minted_id_checked_without_proxy \
+      bep_r3_stranded_box_frees_client_key \
+      bep_r3_widened_store_rule_without_restart \
+      bep_r3_config_dir_rule_reaches_bep_serve; do
+    r3_before="$E2E_NOT_RUN"
+    "proof_$r3_case"
+    if [ "$E2E_NOT_RUN" = "$r3_before" ]; then
+      r3_ran=$((r3_ran + 1))
+      r3_summary="$r3_summary$r3_case: PASS"$'\n'
+    else
+      r3_why="$(printf '%s' "$E2E_NOT_RUN_WHY" | awk -F '\t' -v c="$r3_case" '$1 == c { w = $2 } END { print w }')"
+      r3_summary="$r3_summary$r3_case: NOT RUN (${r3_why:-no reason recorded})"$'\n'
+    fi
+  done
+  echo "::group::BEP round-three conditions closed: each case"
+  printf '%s' "$r3_summary"
+  echo "::endgroup::"
+  if [ "$r3_ran" = 0 ]; then
+    not_run bep_round_three_conditions_closed "none of its cases can run on this lane"
+  fi
+}
+
+# Audit rotation proof (BEP-068, BEP-042, BEP-049). The case restarts the
+# daemon pair with BEP_AUDIT_SEGMENT_BYTES set, so `bep serve` rotates its
+# audit log at a small bound. A grant box then sends 'gh api user' until the
+# log rotates twice. The case checks, in order:
+#   1. bep.log names the bound at the start and logs each rotation.
+#   2. The chain verifies across the new segments.
+#   3. `min box audit` shows every record of the box, from every segment.
+#   4. With the proxy down, one record is edited, and `min doctor` reports
+#      the break and exits 6.
+#   5. With the record restored, `min doctor` reports the chain verified.
+# bep has no setting that moves its audit directory from
+# $HOME/.minimal/bep/audit, and min doctor and min box audit read that path.
+# The small bound prunes segments past the retained count, so the case must
+# not run against the real log. Before the restart, with no proxy up, the
+# case renames the real directory to audit.e2e-saved beside it. The proxy
+# then writes a new, empty directory of the case's own. No process opens
+# the real log while the case runs, so nothing in it rotates or is pruned.
+# On every exit, and in the teardown, the case removes its own directory
+# once no proxy writes it, and renames the real one back.
+ar_segment_numbers() { # $1 = the audit directory; prints the segment numbers, sorted
+  find "$1" -maxdepth 1 -name 'audit-*.jsonl' -type f 2>/dev/null \
+    | sed -n 's/.*\/audit-\([0-9][0-9]*\)\.jsonl$/\1/p' | sort -n
+}
+ar_restore_edit() {
+  if [ -n "$AR_AUDIT_EDIT" ] && [ -f "$AR_AUDIT_BACKUP" ]; then
+    cp -p "$AR_AUDIT_BACKUP" "$AR_AUDIT_EDIT"
+  fi
+  AR_AUDIT_EDIT=""
+  AR_AUDIT_BACKUP=""
+}
+# Removes the rotation proof's own audit directory and renames the real
+# one back. It runs only when no `bep serve` of this run writes the log.
+# Otherwise it keeps the real directory where it waits, and names it.
+ar_restore_audit() {
+  if [ -z "$AR_AUDIT_DIR" ] || [ -z "$AR_AUDIT_SAVED" ]; then
+    AR_AUDIT_DIR=""
+    AR_AUDIT_SAVED=""
+    return 0
+  fi
+  for _ in $(seq 1 20); do
+    [ -z "$(r3_proxy_pids)" ] && break
+    sleep 0.5
+  done
+  if [ -n "$(r3_proxy_pids)" ]; then
+    if [ "$AR_AUDIT_SAVED" = none ]; then
+      echo "::error::the audit directory $AR_AUDIT_DIR of the rotation case was not removed: a bep serve still writes it"
+    else
+      echo "::error::the audit log in $AR_AUDIT_DIR was not given back: a bep serve still writes it. The real log is in $AR_AUDIT_SAVED. Stop bep, remove $AR_AUDIT_DIR, and rename $AR_AUDIT_SAVED to $AR_AUDIT_DIR"
+    fi
+    return 0
+  fi
+  if [ "$AR_AUDIT_SAVED" = none ]; then
+    rm -rf "${AR_AUDIT_DIR:?}"
+    echo "removed the audit directory of the rotation case, $AR_AUDIT_DIR"
+  elif [ -d "$AR_AUDIT_SAVED" ]; then
+    rm -rf "${AR_AUDIT_DIR:?}"
+    if mv "$AR_AUDIT_SAVED" "$AR_AUDIT_DIR"; then
+      echo "gave back the real audit log in $AR_AUDIT_DIR, as it was before the rotation case"
+    else
+      echo "::error::the real audit log was not renamed back. It is in $AR_AUDIT_SAVED. Rename it to $AR_AUDIT_DIR"
+      return 0
+    fi
+  fi
+  AR_AUDIT_DIR=""
+  AR_AUDIT_SAVED=""
+}
+proof_bep_audit_rotation_and_doctor_end_to_end() {
+  echo "::group::audit log rotation: the chain carries across segments, min box audit reads them all, min doctor reports an edit"
+  local ar_case=bep_audit_rotation_and_doctor_end_to_end
+  local ar_name=e2e-bep-audit-rotation ar_bound=4096
+  # This reads the real home, which no earlier subshell export changes.
+  # shellcheck disable=SC2031
+  local ar_control="$HOME/.minimal/bep/control.sock"
+  local ar_log="$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log"
+  local ar_audit ar_first ar_last ar_new ar_try ar_rot ar_out ar_id ar_rc ar_seg ar_mark
+
+  # The first gate only checks that a proxy can run here. Then the pair
+  # stops, so no writer holds the real log when it moves aside.
+  if ! bep_live_gate "$ar_case"; then
+    echo "::endgroup::"
+    return 0
+  fi
+  mnl stop --force >/dev/null 2>&1 || true
+  minvmd stop >/dev/null 2>&1 || true
+  BEP_LIVE_DAEMON=""
+  for ar_try in $(seq 1 20); do
+    { bep_control_live "$ar_control" || [ -n "$(r3_proxy_pids)" ]; } || break
+    sleep 0.5
+  done
+  if bep_control_live "$ar_control" || [ -n "$(r3_proxy_pids)" ]; then
+    echo "::error::the Box Egress Proxy still runs after 'min stop --force' and 'minvmd stop', so the case cannot move the audit log aside"
+    fail
+  fi
+  ar_audit="$(dirname "$ar_control")/audit"
+  # The saved name is fixed, so a copy that an earlier killed run left
+  # behind stops the case before anything can overwrite it.
+  if [ -e "$ar_audit.e2e-saved" ]; then
+    echo "::error::$ar_audit.e2e-saved exists. An earlier run of this case moved the real audit log there and did not rename it back. Remove $ar_audit if it holds only test segments, and rename $ar_audit.e2e-saved to $ar_audit"
+    fail
+  fi
+  if [ -e "$ar_audit" ]; then
+    mv "$ar_audit" "$ar_audit.e2e-saved" || fail
+    AR_AUDIT_SAVED="$ar_audit.e2e-saved"
+    echo "moved the real audit log aside to $AR_AUDIT_SAVED, with $(ar_segment_numbers "$AR_AUDIT_SAVED" | wc -l | tr -d ' ') segment(s)"
+  else
+    AR_AUDIT_SAVED=none
+    echo "no audit log exists yet, so the case writes a new one in $ar_audit and removes it at the end"
+  fi
+  AR_AUDIT_DIR="$ar_audit"
+
+  # The second gate restarts the daemon pair, and the proxy inherits this
+  # bound from minvmd's environment.
+  export BEP_AUDIT_SEGMENT_BYTES="$ar_bound"
+  # The lane's filter drops bep's INFO records, and the bound line and the
+  # rotation lines are INFO. Only this restart admits them: minvmd passes
+  # its RUST_LOG to the proxy, and ar_cleanup restores the lane's filter.
+  AR_SAVED_RUST_LOG="${RUST_LOG-}"
+  AR_HAD_RUST_LOG="${RUST_LOG+1}"
+  export RUST_LOG="${RUST_LOG:+$RUST_LOG,}bep=info"
+  ar_mark="$({ wc -l <"$ar_log"; } 2>/dev/null | tr -d ' ')"
+  ar_mark="${ar_mark:-0}"
+  AR_SID=""
+  ar_cleanup() {
+    ar_restore_edit
+    [ -n "$AR_SID" ] && mnl session destroy --force "$AR_SID" >/dev/null 2>&1
+    AR_SID=""
+    [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    # No later case gets a proxy with the small bound: the next live gate
+    # restarts the daemon pair without it.
+    unset BEP_AUDIT_SEGMENT_BYTES
+    if [ -n "$AR_HAD_RUST_LOG" ]; then
+      export RUST_LOG="$AR_SAVED_RUST_LOG"
+    else
+      unset RUST_LOG
+    fi
+    if [ "$BEP_LIVE_DAEMON" = 1 ] || [ -n "${AR_STARTED:-}" ]; then
+      mnl stop --force >/dev/null 2>&1 || true
+      minvmd stop >/dev/null 2>&1 || true
+    fi
+    BEP_LIVE_DAEMON=""
+    AR_STARTED=""
+    ar_restore_audit
+    return 0
+  }
+  ar_fail() { ar_cleanup; fail; }
+  AR_STARTED=1
+  if ! bep_live_gate "$ar_case"; then
+    ar_fail
+  fi
+
+  # 1a. The info line at the start names the bound.
+  # A release bep ignores the override and logs a warning in its place.
+  if tail -n +"$(( ar_mark + 1 ))" "$ar_log" 2>/dev/null \
+    | grep -qF 'ignored the audit segment test override: this is a release build'; then
+    echo "::error::bep serve ignored BEP_AUDIT_SEGMENT_BYTES because it is a release build. This case needs a debug build of bep. Set MINVMD_BEP_BIN to a debug build of bep, then run the case again"
+    ar_fail
+  fi
+  # The awk drops the colour escapes the log can carry around a field.
+  if ! tail -n +"$(( ar_mark + 1 ))" "$ar_log" 2>/dev/null \
+    | grep -F 'audit segment bound set by the test override' \
+    | awk '{ gsub(/\033\[[0-9;]*m/, ""); print }' | grep -qF " bound=$ar_bound "; then
+    echo "::error::bep.log has no line that names the audit segment bound $ar_bound at the proxy's start"
+    echo "--- $ar_log (tail) ---"; tail -40 "$ar_log" 2>/dev/null || true
+    ar_fail
+  fi
+  echo "bep serve started with the audit segment bound $ar_bound"
+
+  ar_first="$(ar_segment_numbers "$ar_audit" | tail -n1)"
+  ar_first="${ar_first:-0}"
+  bep_revoke_seed "$ar_case"
+  AR_SID="$(bep_revoke_activate "$ar_case" "$ar_name")" || ar_fail
+
+  # 2. Requests until two segments after the first one exist.
+  ar_new=0
+  for ar_try in $(seq 1 60); do
+    if ! mnl session exec "$AR_SID" sh -c 'timeout 60 gh api user --jq .login' \
+      >"$WORK/$ar_case.gh" 2>&1; then
+      echo "::error::'gh api user' failed in the box $ar_name (request $ar_try)"
+      cat "$WORK/$ar_case.gh" 2>/dev/null || true
+      ar_fail
+    fi
+    ar_new="$(ar_segment_numbers "$ar_audit" | awk -v f="$ar_first" '$1 > f' | wc -l | tr -d ' ')"
+    [ "$ar_new" -ge 2 ] && break
+  done
+  if [ "$ar_new" -lt 2 ]; then
+    echo "::error::the audit log opened $ar_new new segment(s) after $ar_try requests, with a bound of $ar_bound bytes"
+    ls -l "$ar_audit" 2>/dev/null || true
+    ar_fail
+  fi
+  ar_last="$(ar_segment_numbers "$ar_audit" | tail -n1)"
+  echo "the audit log rotated: $ar_new new segment(s) after $ar_try request(s), the active one is audit-$ar_last.jsonl"
+  ar_rot="$(tail -n +"$(( ar_mark + 1 ))" "$ar_log" 2>/dev/null | grep -cF 'rotated the audit log' || true)"
+  if [ "${ar_rot:-0}" -lt "$ar_new" ]; then
+    echo "::error::bep.log has ${ar_rot:-0} 'rotated the audit log' line(s) for $ar_new new segment(s)"
+    ar_fail
+  fi
+  echo "--- the rotation lines of this run in bep.log ---"
+  tail -n +"$(( ar_mark + 1 ))" "$ar_log" 2>/dev/null | grep -F 'rotated the audit log' || true
+
+  # 3. `min box audit` shows every record of the box, from every segment.
+  ar_id="$(bep_recreate_audited_id "$ar_case" "$ar_name")" || ar_fail
+  if ! ar_out="$(python3 - "$WORK/$ar_case.$ar_name.audit" "$ar_audit" "$ar_id" <<'PY'
+import json, os, re, sys
+trail, audit, box = sys.argv[1], sys.argv[2], sys.argv[3]
+# The proxy writes the subject as 32 lowercase hex digits, without hyphens
+# (box_id_text in crates/bep/src/listener.rs. The subject of an audit record
+# is the box id, gominimal/arch architecture.md line 505). The box argument is
+# the hyphenated id that min box audit prints, so every subject match below
+# uses the hex form.
+subject = sys.argv[3].replace("-", "").lower()
+def die(msg):
+    print(msg)
+    sys.exit(1)
+shown = [json.loads(l) for l in open(trail) if l.strip()]
+on_disk, segments = 0, set()
+for name in os.listdir(audit):
+    if not re.fullmatch(r"audit-[0-9]+\.jsonl", name):
+        continue
+    with open(os.path.join(audit, name)) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if record.get("subject") == subject:
+                on_disk += 1
+                segments.add(name)
+if len(segments) < 2:
+    die("the records of box %s are in %d segment(s), not 2 or more" % (box, len(segments)))
+if len(shown) != on_disk:
+    die("min box audit shows %d record(s), and the segments hold %d for box %s"
+        % (len(shown), on_disk, box))
+print("%d record(s) across %d segments" % (on_disk, len(segments)))
+PY
+)"; then
+    echo "::error::'min box audit $ar_name': $ar_out"
+    ar_fail
+  fi
+  echo "min box audit $ar_name: $ar_out"
+
+  # 4. The proxy goes down, so no writer races the edit.
+  r3_proxy_down "$ar_control" || ar_fail
+  AR_STARTED=1
+  ar_rc=0
+  mnl doctor </dev/null >"$WORK/$ar_case.doctor" 2>&1 || ar_rc=$?
+  if [ "$ar_rc" != 0 ] || ! grep -qxF 'Audit log: chain verified.' "$WORK/$ar_case.doctor"; then
+    echo "::error::'min doctor' exited $ar_rc before the edit, and did not print 'Audit log: chain verified.'"
+    cat "$WORK/$ar_case.doctor" 2>/dev/null || true
+    ar_fail
+  fi
+  echo "min doctor before the edit: $(head -n1 "$WORK/$ar_case.doctor")"
+  # The edit: the first record of the second-newest segment, a rotated one.
+  ar_seg="$ar_audit/audit-$(ar_segment_numbers "$ar_audit" | tail -n2 | head -n1).jsonl"
+  AR_AUDIT_BACKUP="$WORK/$ar_case.segment"
+  cp -p "$ar_seg" "$AR_AUDIT_BACKUP"
+  AR_AUDIT_EDIT="$ar_seg"
+  if ! python3 - "$ar_seg" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path) as f:
+    lines = f.read().split("\n")
+record = json.loads(lines[0])
+record["upstream"] = "edited.example:443"
+lines[0] = json.dumps(record, separators=(",", ":"))
+with open(path, "w") as f:
+    f.write("\n".join(lines))
+PY
+  then
+    echo "::error::the case could not edit the first record of $ar_seg"
+    ar_fail
+  fi
+  echo "edited the upstream of the first record in $ar_seg"
+  ar_rc=0
+  mnl doctor </dev/null >"$WORK/$ar_case.doctor" 2>&1 || ar_rc=$?
+  if [ "$ar_rc" != 6 ] || ! grep -qF 'Audit log: the hash chain breaks at record' "$WORK/$ar_case.doctor"; then
+    echo "::error::'min doctor' exited $ar_rc after the edit, not 6 with the break"
+    cat "$WORK/$ar_case.doctor" 2>/dev/null || true
+    ar_fail
+  fi
+  echo "min doctor after the edit (exit 6): $(head -n1 "$WORK/$ar_case.doctor")"
+
+  # 5. The record goes back, and the chain verifies across the rotated
+  # segments again.
+  ar_restore_edit
+  ar_rc=0
+  mnl doctor </dev/null >"$WORK/$ar_case.doctor" 2>&1 || ar_rc=$?
+  if [ "$ar_rc" != 0 ] || ! grep -qxF 'Audit log: chain verified.' "$WORK/$ar_case.doctor"; then
+    echo "::error::'min doctor' exited $ar_rc with the record restored, and did not print 'Audit log: chain verified.'"
+    cat "$WORK/$ar_case.doctor" 2>/dev/null || true
+    ar_fail
+  fi
+  echo "min doctor with the record restored: chain verified across audit-$ar_first.jsonl to audit-$ar_last.jsonl ($ar_new rotated segment(s) in this run)"
+
+  ar_cleanup
+  rm -f "${WORK:?}/${ar_case:?}".*
+  echo "Audit rotation OK (the chain carries across $ar_new new segments, min box audit reads them all, min doctor reports the edit)"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
+# Audit, HTTP and message conditions (BEP, T112): one walk over the slice,
+# the way a person meets it. Each leg prints PASS or NOT RUN with its gate.
+#   bep_ahm_audit_by_id_and_name: a running grant box sends 'gh api user',
+#     and `min box audit` shows its decision records by box id and by name.
+#     Every record names that box, and the read by name names the box id.
+#   bep_ahm_parent_merges_children: `min box audit --parent` on that box
+#     reads cleanly and says the box has no child boxes. No box gets a
+#     parent today (minimald stamps none until the creating connection can
+#     carry the caller's box identity, BOX-001 and BOX-140), so the merge of
+#     a child's records is a KNOWN GAP on the live path. The issue
+#     https://github.com/gominimal/minimal/issues/2828 owns that gap.
+#   bep_ahm_relayed_response_has_no_alt_svc: a response relayed through the
+#     proxy carries no Alt-Svc header (BEP-076). The leg also says if the
+#     upstream sent one on this run, read directly from the host.
+#   bep_ahm_missing_proxy_refused: with MINVMD_BEP_BIN naming a missing
+#     file and no proxy published under the home directory, a grant box is
+#     refused with exit 5. The text names where `bep` is not installed and
+#     the one next step. The leg runs `min` with a new, empty HOME, so the
+#     live proxy's published identity is not read and the real one is not
+#     touched. The refusal comes before the daemon is asked for anything.
+# The first three legs need the live gate: macOS, a VM lane with gvproxy,
+# and a GitHub sign-in. The fourth needs only macOS and the VM lane.
+AHM_SID="" AHM_GATE=""
+AHM_NAME=e2e-bep-ahm
+
+ahm_cleanup() {
+  if [ -n "${AHM_SID:-}" ]; then mnl session destroy --force "$AHM_SID" >/dev/null 2>&1 || true; fi
+  AHM_SID=""
+  [ -n "$GRANT_SEED_DIR" ] && rm -rf "${GRANT_SEED_DIR:?}"
+  GRANT_SEED_DIR=""
+  return 0
+}
+ahm_fail() {
+  echo "--- bep.log (box connections, tail) ---"
+  grep -h 'box_connection' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null \
+    | tail -20 || true
+  ahm_cleanup
+  fail
+}
+
+# The box id in the form `bep serve` writes in a record's subject: 32
+# lowercase hex digits, with no hyphens.
+ahm_subject() {
+  printf '%s' "$1" | tr -d '-' | tr 'A-F' 'a-f'
+}
+
+# Starts the one grant box the first three legs share, once, and sends one
+# 'gh api user' through the proxy from it. $1 is the leg. A missing gate
+# records the leg, and each later leg, as NOT RUN with the same reason.
+ahm_box_up() {
+  [ -n "$AHM_SID" ] && return 0
+  if [ -n "$AHM_GATE" ]; then
+    not_run "$1" "$AHM_GATE"
+    return 1
+  fi
+  if ! bep_live_gate "$1"; then
+    AHM_GATE="$(printf '%s' "$E2E_NOT_RUN_WHY" | awk -F '\t' -v c="$1" '$1 == c { w = $2 } END { print w }')"
+    return 1
+  fi
+  bep_revoke_seed "$1"
+  AHM_SID="$(bep_revoke_activate "$1" "$AHM_NAME")" || { AHM_SID=""; ahm_fail; }
+  if ! mnl session exec "$AHM_SID" sh -c 'timeout 60 gh api user --jq .login' \
+    >"$WORK/bep_ahm.first" 2>&1; then
+    echo "::error::'gh api user' failed in the box $AHM_NAME, so the proxy wrote no record to read"
+    cat "$WORK/bep_ahm.first" 2>/dev/null || true
+    ahm_fail
+  fi
+  echo "box $AHM_NAME ($AHM_SID): 'gh api user' answered through the proxy"
+}
+
+# Checks the jsonl file $1 from `min box audit`: at least one record, every
+# record's subject is $2, and an admit decision for api.github.com names
+# it. With $3, every record of the jsonl file $3, an earlier read, is
+# also in $1. The proxy can append records between the two reads, so $1
+# can hold more records than $3.
+ahm_audit_check() {
+  python3 - "$1" "$2" "${3:-}" <<'PY'
+import json, sys
+path, subject, other = sys.argv[1], sys.argv[2], sys.argv[3]
+def read(p):
+    with open(p) as f:
+        return [l.strip() for l in f if l.strip()]
+lines = read(path)
+records = [json.loads(l) for l in lines]
+if not records:
+    print("no records")
+    sys.exit(1)
+foreign = sorted({r.get("subject", "") for r in records if r.get("subject") != subject})
+if foreign:
+    print("records of another subject: " + ", ".join(foreign))
+    sys.exit(1)
+decisions = [r for r in records if r.get("kind") == "decision"]
+admits = [r for r in decisions if r.get("decision") == "admit"
+          and r.get("upstream") == "api.github.com:443"]
+if not admits:
+    print("no admit decision for api.github.com:443")
+    sys.exit(1)
+if other:
+    later = set(lines)
+    missing = [l for l in read(other) if l not in later]
+    if missing:
+        print("%d record(s) read by id are missing from the read by name" % len(missing))
+        sys.exit(1)
+print("%d records, %d decisions, %d admits for api.github.com:443" % (len(records), len(decisions), len(admits)))
+PY
+}
+
+proof_bep_ahm_audit_by_id_and_name() {
+  local ai_case=bep_ahm_audit_by_id_and_name ai_subject ai_out ai_err
+  ahm_box_up "$ai_case" || return 0
+  ai_subject="$(ahm_subject "$AHM_SID")"
+  if ! mnl box audit "$AHM_SID" -o jsonl </dev/null \
+    >"$WORK/$ai_case.id" 2>"$WORK/$ai_case.id.err"; then
+    echo "::error::'min box audit $AHM_SID' failed"
+    cat "$WORK/$ai_case.id.err" 2>/dev/null || true
+    ahm_fail
+  fi
+  if ! ai_out="$(ahm_audit_check "$WORK/$ai_case.id" "$ai_subject")"; then
+    echo "::error::'min box audit $AHM_SID': $ai_out"
+    echo "--- min box audit $AHM_SID -o jsonl ---"; cat "$WORK/$ai_case.id"
+    ahm_fail
+  fi
+  echo "min box audit $AHM_SID: $ai_out"
+  if ! mnl box audit "$AHM_NAME" -o jsonl </dev/null \
+    >"$WORK/$ai_case.name" 2>"$WORK/$ai_case.name.err"; then
+    echo "::error::'min box audit $AHM_NAME' failed"
+    cat "$WORK/$ai_case.name.err" 2>/dev/null || true
+    ahm_fail
+  fi
+  ai_err="$(tr -d '\r' <"$WORK/$ai_case.name.err")"
+  if ! [[ "$ai_err" =~ Showing\ $AHM_NAME\ \(box\ ([0-9a-fA-F-]+)\)\. ]] \
+    || [ "$(ahm_subject "${BASH_REMATCH[1]}")" != "$ai_subject" ]; then
+    echo "::error::'min box audit $AHM_NAME' does not name the box id $AHM_SID it read"
+    printf '%s\n' "$ai_err"
+    ahm_fail
+  fi
+  if ! ai_out="$(ahm_audit_check "$WORK/$ai_case.name" "$ai_subject" "$WORK/$ai_case.id")"; then
+    echo "::error::'min box audit $AHM_NAME': $ai_out"
+    echo "--- min box audit $AHM_NAME -o jsonl ---"; cat "$WORK/$ai_case.name"
+    ahm_fail
+  fi
+  echo "min box audit $AHM_NAME: names box $AHM_SID, and shows $ai_out"
+}
+
+proof_bep_ahm_parent_merges_children() {
+  local pm_case=bep_ahm_parent_merges_children pm_err
+  ahm_box_up "$pm_case" || return 0
+  if ! mnl box audit --parent "$AHM_SID" -o jsonl </dev/null \
+    >"$WORK/$pm_case.out" 2>"$WORK/$pm_case.err"; then
+    echo "::error::'min box audit --parent $AHM_SID' failed"
+    cat "$WORK/$pm_case.err" 2>/dev/null || true
+    ahm_fail
+  fi
+  pm_err="$(tr -d '\r' <"$WORK/$pm_case.err")"
+  if ! [[ "$pm_err" =~ Box\ ([0-9a-fA-F-]+)\ has\ no\ child\ boxes\. ]] \
+    || [ "$(ahm_subject "${BASH_REMATCH[1]}")" != "$(ahm_subject "$AHM_SID")" ]; then
+    echo "::error::'min box audit --parent $AHM_SID' does not say that box $AHM_SID has no child boxes"
+    printf '%s\n' "$pm_err"
+    ahm_fail
+  fi
+  if [ -s "$WORK/$pm_case.out" ]; then
+    echo "::error::'min box audit --parent $AHM_SID' shows records, though the box has no child boxes"
+    cat "$WORK/$pm_case.out"
+    ahm_fail
+  fi
+  echo "min box audit --parent $AHM_SID: no records, and it says the box has no child boxes"
+  known_gap "$pm_case" "no box has a parent on the live path, so no child's records can be merged: minimald stamps no parent until the creating connection carries the caller's box; https://github.com/gominimal/minimal/issues/2828"
+}
+
+proof_bep_ahm_relayed_response_has_no_alt_svc() {
+  local as_case=bep_ahm_relayed_response_has_no_alt_svc as_direct
+  ahm_box_up "$as_case" || return 0
+  # The same upstream, read directly from the host with no credential, goes
+  # first. With no Alt-Svc header there, the proxy has none to remove on this
+  # run, so the leg does not test the removal. /user answers a read with no
+  # credential with a 401, and a 401 and a 200 can carry different headers.
+  # /rate_limit answers it with a 200, the status of the relayed read below.
+  if ! curl -sS -D "$WORK/$as_case.direct" -o /dev/null --max-time 30 https://api.github.com/rate_limit \
+    2>"$WORK/$as_case.direct.err"; then
+    not_run "$as_case" "curl could not read https://api.github.com/rate_limit from the host: $(head -n1 "$WORK/$as_case.direct.err" 2>/dev/null)"
+    return 0
+  fi
+  if ! head -n1 "$WORK/$as_case.direct" | grep -Eq '^HTTP/[0-9.]+ 200'; then
+    not_run "$as_case" "https://api.github.com/rate_limit read directly from the host answered '$(head -n1 "$WORK/$as_case.direct" | tr -d '\r')', not 200, so its headers cannot stand for a 200"
+    return 0
+  fi
+  as_direct="$(tr -d '\r' <"$WORK/$as_case.direct" | grep -i '^alt-svc:' | head -n1 || true)"
+  if [ -z "$as_direct" ]; then
+    not_run "$as_case" "api.github.com read directly from the host sent no Alt-Svc header with a 200 on this run, so the proxy had none to remove"
+    return 0
+  fi
+  echo "api.github.com read directly from the host with no credential answers 200 with '$as_direct'"
+  # gh prints the response's status line and headers before the body.
+  if ! mnl session exec "$AHM_SID" sh -c 'timeout 60 gh api --include user' \
+    >"$WORK/$as_case.relayed" 2>&1; then
+    echo "::error::'gh api --include user' failed in the box $AHM_NAME"
+    cat "$WORK/$as_case.relayed" 2>/dev/null || true
+    ahm_fail
+  fi
+  if ! head -n1 "$WORK/$as_case.relayed" | grep -Eq '^HTTP/[0-9.]+ 200'; then
+    echo "::error::'gh api --include user' in the box $AHM_NAME printed no 200 status line, so its headers cannot be read"
+    head -20 "$WORK/$as_case.relayed"
+    ahm_fail
+  fi
+  # The head ends at the first empty line. awk reads to the end, so no
+  # stage of the pipe stops early.
+  tr -d '\r' <"$WORK/$as_case.relayed" | awk 'NF == 0 { body = 1 } !body { print }' \
+    >"$WORK/$as_case.head"
+  if grep -iq '^alt-svc:' "$WORK/$as_case.head"; then
+    echo "::error::the response relayed through the proxy to the box $AHM_NAME carries an Alt-Svc header"
+    grep -i '^alt-svc:' "$WORK/$as_case.head"
+    ahm_fail
+  fi
+  echo "gh api --include user in the box: the relayed response carries no Alt-Svc header"
+}
+
+proof_bep_ahm_missing_proxy_refused() {
+  local mp_case=bep_ahm_missing_proxy_refused mp_home mp_bin mp_rc=0 mp_err mp_want mp_next
+  if [ "$(uname -s)" != "Darwin" ]; then
+    not_run "$mp_case" "the Box Egress Proxy runs on macOS only"
+    return 0
+  fi
+  if [ -z "$E2E_VM" ] || [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    not_run "$mp_case" "no MINVMD_GVPROXY_BIN: the VM host daemon starts the Box Egress Proxy beside gvproxy, and this target has none"
+    return 0
+  fi
+  mp_home="$(hook_mktemp /tmp/mnlnobep.XXXXXX)"
+  mp_bin="$mp_home/no-such-bep"
+  mkdir "$mp_home/project" "$mp_home/project/.git"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = ["base", "coreutils", "gh", "ca-certificates"]\n'
+    printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\nscopes = ["github:user-token"]\n'
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$mp_home/project/minimal.toml"
+  (cd "$mp_home/project" && HOME="$mp_home" MINVMD_BEP_BIN="$mp_bin" \
+    mnl session activate . --no-prompt --name e2e-bep-ahm-no-proxy \
+      --network own_ip --credentialed-upstream \
+      --allow-dns-hosts github.com --allow-dns-hosts api.github.com \
+      --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com \
+      </dev/null >"$WORK/$mp_case.out" 2>"$WORK/$mp_case.err") || mp_rc=$?
+  mp_err="$(tr -d '\r' <"$WORK/$mp_case.err")"
+  rm -rf "${mp_home:?}"
+  if [ "$mp_rc" != 5 ]; then
+    echo "::error::'min session activate' of a grant box with MINVMD_BEP_BIN=$mp_bin exited $mp_rc, not 5"
+    echo "--- stdout ---"; cat "$WORK/$mp_case.out" 2>/dev/null || true
+    echo "--- stderr ---"; printf '%s\n' "$mp_err"
+    fail
+  fi
+  mp_want="it declares the GitHub grant GH_TOKEN, and \`bep\`, the Box Egress Proxy, is not installed at $mp_bin, so no proxy serves boxes on this machine."
+  mp_next="To create the box without the grant, remove GH_TOKEN from [session.secrets] in minimal.toml."
+  if ! grep -qF -- "$mp_want" <<<"$mp_err" || ! grep -qF -- "$mp_next" <<<"$mp_err"; then
+    echo "::error::the refusal of a grant box with no proxy does not name where bep is not installed and the next step"
+    echo "  want: $mp_want $mp_next"
+    echo "--- stderr ---"; printf '%s\n' "$mp_err"
+    fail
+  fi
+  echo "grant box with MINVMD_BEP_BIN naming a missing file: refused with exit 5: $(grep -F -- "$mp_want" <<<"$mp_err" | head -n1)"
+}
+
+proof_bep_audit_http_and_messages_closed() {
+  local ahm_case ahm_before ahm_gap_before ahm_why ahm_ran=0 ahm_summary=""
+  echo "::group::BEP audit, HTTP and message conditions: one walk over the slice"
+  for ahm_case in bep_ahm_audit_by_id_and_name \
+      bep_ahm_parent_merges_children \
+      bep_ahm_relayed_response_has_no_alt_svc \
+      bep_ahm_missing_proxy_refused; do
+    # The shared box goes before the leg that needs no box, so the refusal
+    # leg runs with no grant box of this case alive.
+    [ "$ahm_case" = bep_ahm_missing_proxy_refused ] && ahm_cleanup
+    ahm_before="$E2E_NOT_RUN"
+    ahm_gap_before="$E2E_KNOWN_GAP"
+    "proof_$ahm_case"
+    if [ "$E2E_NOT_RUN" = "$ahm_before" ] && [ "$E2E_KNOWN_GAP" != "$ahm_gap_before" ]; then
+      ahm_ran=$((ahm_ran + 1))
+      ahm_why="$(printf '%s' "$E2E_KNOWN_GAP_WHY" | awk -F '\t' -v c="$ahm_case" '$1 == c { w = $2 } END { print w }')"
+      ahm_summary="$ahm_summary$ahm_case: KNOWN GAP (${ahm_why:-no reason recorded})"$'\n'
+    elif [ "$E2E_NOT_RUN" = "$ahm_before" ]; then
+      ahm_ran=$((ahm_ran + 1))
+      ahm_summary="$ahm_summary$ahm_case: PASS"$'\n'
+    else
+      ahm_why="$(printf '%s' "$E2E_NOT_RUN_WHY" | awk -F '\t' -v c="$ahm_case" '$1 == c { w = $2 } END { print w }')"
+      ahm_summary="$ahm_summary$ahm_case: NOT RUN (${ahm_why:-no reason recorded})"$'\n'
+    fi
+  done
+  ahm_cleanup
+  rm -f "${WORK:?}"/bep_ahm*
+  echo "::endgroup::"
+  echo "::group::BEP audit, HTTP and message conditions: each case"
+  printf '%s' "$ahm_summary"
+  echo "::endgroup::"
+  if [ "$ahm_ran" = 0 ]; then
+    not_run bep_audit_http_and_messages_closed "none of its cases can run on this lane"
+  fi
+}
+
+# Proxy-variable proof (BEP-012): a box whose [session.network.bep] steering
+# is proxy_env starts on an own-address credentialed lane, and its
+# environment points at the Box Egress Proxy. The two cases share one box
+# start. The lane needs a switch, so a target without one records the case
+# as NOT RUN. The box declares no grant, so the case needs no sign-in and no
+# running proxy: it reads the variables, never a connection through them.
+# $1: the case name. Leaves the box's `env` output in $WORK/$1.env.
+bep_proxy_env_box_env() {
+  local pe_case="$1" pe_sid pe_out
+  PROXY_ENV_SEED_DIR="$(hook_mktemp /tmp/mnlpenv.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\nno_proxy = ["e2e-direct.example", "10.0.0.0/8"]\n'
+  } > "$PROXY_ENV_SEED_DIR/minimal.toml"
+  mkdir "$PROXY_ENV_SEED_DIR/.git"
+  pe_out="$(cd "$PROXY_ENV_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "e2e-$(printf '%s' "$pe_case" | tr '_' '-' | cut -c1-40)" \
+    --network own_ip --credentialed-upstream \
+    </dev/null 2>"$WORK/$pe_case.err")" || {
+    echo "::error::'min session activate --network own_ip --credentialed-upstream' of the proxy_env box failed"
+    echo "--- stdout ---"; printf '%s\n' "$pe_out"
+    echo "--- stderr ---"; cat "$WORK/$pe_case.err" 2>/dev/null || true
+    rm -rf "$PROXY_ENV_SEED_DIR"; PROXY_ENV_SEED_DIR=""
+    fail
+  }
+  pe_sid="$(printf '%s\n' "$pe_out" | tail -n1 | tr -d '\r')"
+  if ! mnl session exec "$pe_sid" sh -c 'env' \
+    >"$WORK/$pe_case.env" 2>"$WORK/$pe_case.exec.err"; then
+    echo "::error::'min session exec' in the proxy_env box failed"
+    cat "$WORK/$pe_case.exec.err" 2>/dev/null || true
+    mnl session destroy --force "$pe_sid" >/dev/null 2>&1 || true
+    rm -rf "$PROXY_ENV_SEED_DIR"; PROXY_ENV_SEED_DIR=""
+    fail
+  fi
+  tr -d '\r' <"$WORK/$pe_case.env" >"$WORK/$pe_case.env.tmp" && mv "$WORK/$pe_case.env.tmp" "$WORK/$pe_case.env"
+  mnl session destroy --force "$pe_sid" >/dev/null 2>&1 || true
+  rm -rf "$PROXY_ENV_SEED_DIR"; PROXY_ENV_SEED_DIR=""
+}
+
+# The value of variable $2 in the env dump $1, or nothing.
+bep_env_value() {
+  sed -n "s/^$2=//p" "$1" | head -n1
+}
+
+proof_bep_proxy_env_and_no_proxy_are_set() {
+  echo "::group::proxy_env box: HTTPS_PROXY, HTTP_PROXY and NO_PROXY (BEP-012)"
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    not_run bep_proxy_env_and_no_proxy_are_set "no MINVMD_GVPROXY_BIN: this target has no switch, so no box has a credentialed lane"
+    echo "::endgroup::"
+    return 0
+  fi
+  local pe_env pe_https pe_http pe_no
+  bep_proxy_env_box_env bep_proxy_env_and_no_proxy_are_set
+  pe_env="$WORK/bep_proxy_env_and_no_proxy_are_set.env"
+  pe_https="$(bep_env_value "$pe_env" HTTPS_PROXY)"
+  pe_http="$(bep_env_value "$pe_env" HTTP_PROXY)"
+  pe_no="$(bep_env_value "$pe_env" NO_PROXY)"
+  # The proxy's address is the switch subnet's broadcast - 3, and its
+  # listener port is 8118 (boxes::core::egress::PROXY_LISTENER_PORT).
+  if ! [[ "$pe_https" =~ ^http://100\.64\.[0-9]+\.[0-9]+:8118$ ]]; then
+    echo "::error::the proxy_env box's HTTPS_PROXY is '${pe_https:-<unset>}', not the proxy's address on the switch at port 8118"
+    fail
+  fi
+  if [ "$pe_http" != "$pe_https" ]; then
+    echo "::error::the proxy_env box's HTTP_PROXY is '${pe_http:-<unset>}', not its HTTPS_PROXY '$pe_https'"
+    fail
+  fi
+  if [ "$pe_no" != ".min.internal,host.min.internal,localhost,127.0.0.1,e2e-direct.example,10.0.0.0/8" ]; then
+    echo "::error::the proxy_env box's NO_PROXY is '${pe_no:-<unset>}', not the local zone, loopback and the seed's no_proxy entries"
+    fail
+  fi
+  rm -f "$pe_env"
+  echo "proxy_env box: HTTPS_PROXY=HTTP_PROXY=$pe_https, NO_PROXY=$pe_no"
+  echo "::endgroup::"
+}
+
+proof_bep_proxy_env_sets_node_use_env_proxy() {
+  echo "::group::proxy_env box: NODE_USE_ENV_PROXY (BEP-012)"
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    not_run bep_proxy_env_sets_node_use_env_proxy "no MINVMD_GVPROXY_BIN: this target has no switch, so no box has a credentialed lane"
+    echo "::endgroup::"
+    return 0
+  fi
+  local pe_env pe_node
+  bep_proxy_env_box_env bep_proxy_env_sets_node_use_env_proxy
+  pe_env="$WORK/bep_proxy_env_sets_node_use_env_proxy.env"
+  pe_node="$(bep_env_value "$pe_env" NODE_USE_ENV_PROXY)"
+  if [ "$pe_node" != "1" ]; then
+    echo "::error::the proxy_env box's NODE_USE_ENV_PROXY is '${pe_node:-<unset>}', not 1"
+    fail
+  fi
+  rm -f "$pe_env"
+  echo "proxy_env box: NODE_USE_ENV_PROXY=1"
+  echo "::endgroup::"
+}
+
+# Trust-store proofs (BEP-011). A GitHub grant box gets the proxy's root in
+# its own CA bundle copy and in /etc/ssl/certs under its subject hash, and
+# the trust variables point at them. A box with no grant, from the same
+# packages, gets none of it. Both seeds add ca-certificates, so the grant
+# box's bundle holds the system roots beside the root.
+BEP_TRUST_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+BEP_TRUST_ROOT=/etc/ssl/certs/minimal-box-egress-proxy-root.pem
+
+# Records case $1 as NOT RUN and returns 1 when this target cannot start a
+# GitHub grant box: the same gates as the sealed-value proof.
+bep_trust_grant_gate() {
+  bep_live_gate "$1"
+}
+
+# Removes the files bep_trust_box_files left for case $1.
+bep_trust_clean() {
+  local tc_ext
+  for tc_ext in env root bundle links err exec.err; do
+    rm -f "${WORK:?}/${1:?}.$tc_ext"
+  done
+}
+
+# Starts a box from a seed with ca-certificates, copies its trust store out
+# and destroys it. $1: the case name. $2: "grant" for a box with a GitHub
+# grant, "plain" for a box with none. Leaves $WORK/$1.env (the box's trust
+# variables), $WORK/$1.root and $WORK/$1.bundle (the files, empty when
+# absent) and $WORK/$1.links (each hashed-directory link and its target).
+bep_trust_box_files() {
+  local tb_case="$1" tb_kind="$2" tb_seed tb_out tb_sid tb_file
+  local -a tb_egress
+  tb_seed="$(hook_mktemp /tmp/mnltrust.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = ["ca-certificates"]\n'
+    if [ "$tb_kind" = grant ]; then
+      printf '\n[session.secrets.GH_TOKEN]\nsource = "broker"\nscopes = ["github:user-token"]\n'
+      printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+    fi
+  } > "$tb_seed/minimal.toml"
+  mkdir "$tb_seed/.git"
+  # Only the grant box declares the GitHub hosts its grant needs, and it
+  # takes its own IP with a credentialed upstream, as the other grant cases
+  # do. A box with no grant declares no egress rules: a --network host_ip box
+  # on a VM host refuses hostname rules at the start, and that box needs none.
+  tb_egress=()
+  if [ "$tb_kind" = grant ]; then
+    tb_egress=(--network own_ip --credentialed-upstream
+      --allow-dns-hosts github.com --allow-dns-hosts api.github.com
+      --allow-dns-hosts uploads.github.com --allow-dns-hosts codeload.github.com)
+  fi
+  tb_out="$(cd "$tb_seed" && mnl session activate . --no-prompt \
+    --name "e2e-$(printf '%s' "$tb_case" | tr '_' '-' | cut -c1-36)-$tb_kind" \
+    ${tb_egress[@]+"${tb_egress[@]}"} \
+    </dev/null 2>"$WORK/$tb_case.err")" || {
+    echo "::error::'min session activate' of the $tb_kind box for $tb_case failed"
+    echo "--- stdout ---"; printf '%s\n' "$tb_out"
+    echo "--- stderr ---"; cat "$WORK/$tb_case.err" 2>/dev/null || true
+    rm -rf "${tb_seed:?}"
+    fail
+  }
+  rm -rf "${tb_seed:?}"
+  tb_sid="$(printf '%s\n' "$tb_out" | tail -n1 | tr -d '\r')"
+  if ! mnl session exec "$tb_sid" sh -c 'env' >"$WORK/$tb_case.env" 2>"$WORK/$tb_case.exec.err"; then
+    echo "::error::'min session exec' in the $tb_kind box for $tb_case failed"
+    cat "$WORK/$tb_case.exec.err" 2>/dev/null || true
+    mnl session destroy --force "$tb_sid" >/dev/null 2>&1 || true
+    fail
+  fi
+  # The grant's sealed value is never kept: only the trust variables are.
+  grep -E '^(SSL_CERT_FILE|REQUESTS_CA_BUNDLE|NODE_EXTRA_CA_CERTS)=' "$WORK/$tb_case.env" \
+    | tr -d '\r' >"$WORK/$tb_case.env.tmp" || true
+  mv "$WORK/$tb_case.env.tmp" "$WORK/$tb_case.env"
+  for tb_file in root:"$BEP_TRUST_ROOT" bundle:"$BEP_TRUST_BUNDLE"; do
+    mnl session exec "$tb_sid" sh -c "cat '${tb_file#*:}' 2>/dev/null || true" \
+      2>/dev/null | tr -d '\r' >"$WORK/$tb_case.${tb_file%%:*}" || true
+  done
+  # shellcheck disable=SC2016 # expanded inside the box
+  mnl session exec "$tb_sid" sh -c \
+    'for f in /etc/ssl/certs/*.[0-9]; do [ -L "$f" ] && printf "%s %s\n" "${f##*/}" "$(readlink "$f")"; done; true' \
+    2>/dev/null | tr -d '\r' >"$WORK/$tb_case.links" || true
+  mnl session destroy --force "$tb_sid" >/dev/null 2>&1 || true
+}
+
+# The number of certificates in the PEM file $1.
+bep_trust_cert_count() {
+  grep -c -- '-----BEGIN CERTIFICATE-----' "$1" 2>/dev/null || true
+}
+
+proof_bep_root_ca_present_in_box_trust_store() {
+  echo "::group::GitHub grant box: the proxy's root in both trust-store forms (BEP-011)"
+  bep_trust_grant_gate bep_root_ca_present_in_box_trust_store || { echo "::endgroup::"; return 0; }
+  local tp_case=bep_root_ca_present_in_box_trust_store tp_hash tp_size tp_count
+  bep_trust_box_files "$tp_case" grant
+  if [ "$(bep_trust_cert_count "$WORK/$tp_case.root")" != 1 ]; then
+    echo "::error::the grant box has no certificate at $BEP_TRUST_ROOT"
+    fail
+  fi
+  if ! openssl x509 -noout -subject -in "$WORK/$tp_case.root" | grep -q 'Minimal Box Egress Proxy Root CA'; then
+    echo "::error::the certificate at $BEP_TRUST_ROOT in the grant box is not the proxy's root"
+    fail
+  fi
+  # The bundle is the system roots with the root appended.
+  tp_size="$(wc -c <"$WORK/$tp_case.root" | tr -d ' ')"
+  if ! tail -c "$tp_size" "$WORK/$tp_case.bundle" | cmp -s - "$WORK/$tp_case.root"; then
+    echo "::error::the grant box's $BEP_TRUST_BUNDLE does not end with the proxy's root"
+    fail
+  fi
+  tp_count="$(bep_trust_cert_count "$WORK/$tp_case.bundle")"
+  if [ "${tp_count:-0}" -lt 2 ]; then
+    echo "::error::the grant box's $BEP_TRUST_BUNDLE holds ${tp_count:-0} certificates, so the system roots are not beside the root"
+    fail
+  fi
+  # The hashed directory links the root under its subject hash.
+  tp_hash="$(openssl x509 -noout -subject_hash -in "$WORK/$tp_case.root")"
+  if ! grep -Eq "^$tp_hash\.[0-9] ${BEP_TRUST_ROOT##*/}\$" "$WORK/$tp_case.links"; then
+    echo "::error::the grant box's /etc/ssl/certs has no link $tp_hash.N to ${BEP_TRUST_ROOT##*/}"
+    echo "--- links ---"; cat "$WORK/$tp_case.links"
+    fail
+  fi
+  bep_trust_clean "$tp_case"
+  echo "grant box: the root is at $BEP_TRUST_ROOT, at the end of $BEP_TRUST_BUNDLE beside $((tp_count - 1)) system roots, and linked as $tp_hash"
+  echo "::endgroup::"
+}
+
+proof_bep_root_ca_absent_from_box_without_credentialed_upstream() {
+  echo "::group::box with no grant: no proxy root in its trust store (BEP-011)"
+  local ta_case=bep_root_ca_absent_from_box_without_credentialed_upstream ta_grant=""
+  # With a grant box from the same packages first, the plain box proves that
+  # the grant box's root did not reach the shared packages.
+  if bep_trust_grant_gate "${ta_case}_beside_a_grant_box"; then
+    bep_trust_box_files "${ta_case}_grant" grant
+    if [ "$(bep_trust_cert_count "$WORK/${ta_case}_grant.root")" != 1 ]; then
+      echo "::error::the grant box has no certificate at $BEP_TRUST_ROOT"
+      fail
+    fi
+    ta_grant="$WORK/${ta_case}_grant.root"
+  fi
+  bep_trust_box_files "$ta_case" plain
+  if [ -s "$WORK/$ta_case.root" ]; then
+    echo "::error::the box with no grant has a file at $BEP_TRUST_ROOT"
+    fail
+  fi
+  if grep -q " ${BEP_TRUST_ROOT##*/}\$" "$WORK/$ta_case.links"; then
+    echo "::error::the box with no grant links ${BEP_TRUST_ROOT##*/} in /etc/ssl/certs"
+    fail
+  fi
+  if [ -n "$ta_grant" ] && grep -qFf <(grep -v -- '-----' "$ta_grant") "$WORK/$ta_case.bundle"; then
+    echo "::error::the $BEP_TRUST_BUNDLE of the box with no grant holds the grant box's root"
+    fail
+  fi
+  if [ -s "$WORK/$ta_case.env" ]; then
+    echo "::error::the box with no grant has trust variables set:"
+    cat "$WORK/$ta_case.env"
+    fail
+  fi
+  bep_trust_clean "$ta_case"
+  bep_trust_clean "${ta_case}_grant"
+  if [ -n "$ta_grant" ]; then
+    echo "box with no grant: no proxy root in its trust store, beside a grant box from the same packages"
+  else
+    echo "box with no grant: no proxy root in its trust store"
+  fi
+  echo "::endgroup::"
+}
+
+proof_bep_trust_env_points_at_bundle_and_root() {
+  echo "::group::GitHub grant box: SSL_CERT_FILE, REQUESTS_CA_BUNDLE and NODE_EXTRA_CA_CERTS (BEP-011)"
+  bep_trust_grant_gate bep_trust_env_points_at_bundle_and_root || { echo "::endgroup::"; return 0; }
+  local te_case=bep_trust_env_points_at_bundle_and_root te_var te_want te_got
+  bep_trust_box_files "$te_case" grant
+  for te_var in SSL_CERT_FILE:"$BEP_TRUST_BUNDLE" REQUESTS_CA_BUNDLE:"$BEP_TRUST_BUNDLE" \
+    NODE_EXTRA_CA_CERTS:"$BEP_TRUST_ROOT"; do
+    te_want="${te_var#*:}"
+    te_got="$(bep_env_value "$WORK/$te_case.env" "${te_var%%:*}")"
+    if [ "$te_got" != "$te_want" ]; then
+      echo "::error::the grant box's ${te_var%%:*} is '${te_got:-<unset>}', not $te_want"
+      fail
+    fi
+  done
+  if [ "$(bep_trust_cert_count "$WORK/$te_case.root")" != 1 ] || [ ! -s "$WORK/$te_case.bundle" ]; then
+    echo "::error::the files the grant box's trust variables name are not in the box"
+    fail
+  fi
+  bep_trust_clean "$te_case"
+  echo "grant box: SSL_CERT_FILE=REQUESTS_CA_BUNDLE=$BEP_TRUST_BUNDLE, NODE_EXTRA_CA_CERTS=$BEP_TRUST_ROOT"
+  echo "::endgroup::"
+}
+
 proof_github_only_allowlist() {
   echo "::group::github-only allowlist: toolchain fetches, nothing else, one refused answer, empty lookups, box-zone reach"
 
@@ -10780,8 +16747,8 @@ proof_github_only_allowlist() {
   # TEST-NET-3 (RFC 5737), the same range the own-IP egress proof uses as its
   # can-never-admit-live-traffic allow rule.
   GOA_DEAD_CIDR="203.0.113.0/24"
-  # The toolchain's hosts, verbatim from sessions::NET068_TOOLCHAIN_EGRESS_HOSTS
-  # (crates/sessions/src/lib.rs) — the one list the minimald unit fixture and
+  # The toolchain's hosts, verbatim from boxes::NET068_TOOLCHAIN_EGRESS_HOSTS
+  # (crates/boxes/src/lib.rs) — the one list the minimald unit fixture and
   # the minvmd VM harness share; keep this copy in step with it. Docker Hub
   # serves its image blobs through a 307 redirect that lands on either of
   # its two CDNs, so a container pull needs both.
@@ -11274,7 +17241,7 @@ $(cat "$WORK/goa-$label-1.err" "$WORK/goa-$label-2.err" 2>/dev/null || true)"
       "/usr/bin/timeout 20 python3 /workbench/e2e-dns-probe.py github.com $qtype" \
       2>"$WORK/goa-probe-$qtype.err")"
     rc=$?
-    goa_print_net_since "$before" "answered an empty-records lookup"
+    goa_print_net_since "$before" "answered a lookup at the relay"
     echo "probe $qtype github.com -> ${out:-<none>} (exit $rc)"
     if [ "$rc" -ne 0 ]; then
       echo "::error::the $qtype probe did not complete (exit $rc)"
@@ -11285,7 +17252,7 @@ $(cat "$WORK/goa-$label-1.err" "$WORK/goa-$label-2.err" 2>/dev/null || true)"
       echo "::error::the $qtype lookup for github.com did not come back empty: got '${out:-<none>}' (NET-136 wants NOERROR with zero answers)"
       fail
     fi
-    if [[ "$GOA_RECORDS" != *"answered an empty-records lookup"* ]]; then
+    if [[ "$GOA_RECORDS" != *"answered a lookup at the relay"*"answer=NoError"* ]]; then
       echo "::error::the daemon log does not record the relay answering the $qtype lookup — the evidence that the empty answer came from the relay rather than an empty upstream is missing"
       fail
     fi
@@ -11724,7 +17691,7 @@ PY
 #     published: the zone answerer's A record for the box's name
 #     (NET-010/NET-127), the address the host-side forwarders bind, asked
 #     for straight at the answerer's own port — the one `min ls` reports as
-#     `ZONE ANSWERER`, which the guest daemon binds and the VM host's
+#     `DNS SERVICE`, which the guest daemon binds and the VM host's
 #     forwarders publish on the host loopback — with no OS resolver hook in
 #     the way. The box-registry record's `loopback_address` is a different
 #     allocation the forwarders do not bind at (#1908), so the leg does not
@@ -12067,7 +18034,7 @@ proof_unpublished_port_refused_on_vm_host() {
   upr_ans_port=""
   for _ in $(seq 1 40); do
     upr_ans_port="$(mnl ls 2>/dev/null \
-      | sed -n 's/^ZONE ANSWERER:.*listening on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' \
+      | sed -n 's/^DNS SERVICE:.*listening on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' \
       | head -n1)"
     [ -n "$upr_ans_port" ] && break
     sleep 0.25
@@ -12075,7 +18042,7 @@ proof_unpublished_port_refused_on_vm_host() {
   upr_addr_leg=""
   upr_ans_addr=""
   if [ -z "$upr_ans_port" ]; then
-    upr_addr_leg="skipped (no zone answerer on record for this VM host: 'min ls' carries no ZONE ANSWERER line, so the host's own word for where the box is published cannot be asked for)"
+    upr_addr_leg="skipped (no zone answerer on record for this VM host: 'min ls' carries no DNS SERVICE line, so the host's own word for where the box is published cannot be asked for)"
     echo "host address leg: SKIPPED ($upr_addr_leg)"
   elif ! upr_ans_addr="$(zone_answerer_a "$upr_ans_port" \
        "$upr_t_name.min.internal" 2>"$WORK/upr-ans.err")"; then
@@ -12305,6 +18272,7 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
     minvmd stop >/dev/null 2>&1 || true
   fi
   export MINVMD_BEP_STUB=1
+  BEP_LIVE_DAEMON=""
 
   # The filter the daemon this case autospawns will read its log at. The
   # lane runs the whole script under `warn,minimald::exec=info`, and the
@@ -12678,7 +18646,7 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
 #     that declared the lane reaches the proxy's acceptor on its listener
 #     port, and nothing else on the host answers it.
 #   * box_without_credentialed_lane_cannot_reach_proxy — a box with no
-#     lane, allow-all rules included so only the lane's absence can refuse
+#     lane, rules open to every address so only the lane's absence can refuse
 #     the address, has every frame to the proxy's address dropped at the
 #     FIRST gate, its own relay, inside the guest: the connect runs out its
 #     window with no reset, and the host gate's log stays silent, because
@@ -12819,6 +18787,7 @@ proof_deny_all_box_reaches_proxy_and_no_other_host_port() {
   local probe_start_ms probe_ms
   cred_begin
   export MINVMD_BEP_STUB=1
+  BEP_LIVE_DAEMON=""
   CRED_STUB=1
 
   local proxy_ip proxy_port host_alias lane_sid lane_ip sock sock_wait
@@ -12972,8 +18941,8 @@ proof_deny_all_box_reaches_proxy_and_no_other_host_port() {
   echo "::endgroup::"
 }
 
-# The refusal's half: a box with NO lane — allow-all rules, so nothing but
-# the lane's absence can refuse the proxy's address — gets silence at the
+# The refusal's half: a box with NO lane — rules open to every address, so
+# nothing but the lane's absence can refuse the proxy's address — gets silence at the
 # proxy's address and one rate-limited warn line in the daemon's log, the
 # refused frame's source (the box's own switch address) and the rule that
 # dropped it named. The control runs first: the same box's probe to a
@@ -13001,13 +18970,16 @@ proof_box_without_credentialed_lane_cannot_reach_proxy() {
   hook_seed_preamble > "$CRED_NO_LANE_SEED_DIR/minimal.toml"
   mkdir "$CRED_NO_LANE_SEED_DIR/.git"
 
-  # No lane and no rules: the allow-all default. Any rules at all would
-  # give the refusal a second author; this box's declaration is empty, so
-  # the only thing that can refuse the proxy's address is the lane's
-  # absence.
+  # No lane, and rules open to every address. A narrower declaration would
+  # give the refusal a second author, and so would no section at all: an
+  # own-address box with no egress section gets the deny-all default
+  # (NET-074), which would also drop the sibling control below. With
+  # 0.0.0.0/0 the only thing that can refuse the proxy's address is the
+  # lane's absence.
   nolane_sid="$(cd "$CRED_NO_LANE_SEED_DIR" && mnl session activate . --no-prompt \
-    --name e2e-cred-nolane --network own_ip 2>"$WORK/cred-nolane.err")" || {
-    echo "::error::'min session activate --network own_ip' failed for the no-lane case"
+    --name e2e-cred-nolane --network own_ip --allow-subnets 0.0.0.0/0 \
+    2>"$WORK/cred-nolane.err")" || {
+    echo "::error::'min session activate --network own_ip --allow-subnets 0.0.0.0/0' failed for the no-lane case"
     cat "$WORK/cred-nolane.err" 2>/dev/null || true
     cred_fail
   }
@@ -13028,7 +19000,7 @@ proof_box_without_credentialed_lane_cannot_reach_proxy() {
 
   # The control: a sibling own-address box's lease, at a port the sibling
   # publishes (so its ingress gate admits the SYN) and nothing in it
-  # listens on. An allow-all row admits the lease, so the frame crosses the
+  # listens on. A row open to every address admits the lease, so the frame crosses the
   # box's relay, the gate and the switch to the sibling, whose kernel
   # resets the connect. A reset here proves the fabric and the gates' admit
   # path are live for this box; the proxy's address is a whole different
@@ -13108,16 +19080,37 @@ proof_box_without_credentialed_lane_cannot_reach_proxy() {
   else
     echo "relay-side warn line skipped (guest-side daemon log on VM lane — its count and fields are pinned by the native switch test)"
   fi
-  # What this host CAN observe is the consequence of a first-gate refusal:
-  # the frame never crossed the switch, so the VM host's gate never saw it
-  # and minvmd's log says nothing about it. That silence is the pin — a
-  # proxy-lane line in the host gate's log would mean the frame reached the
-  # host, the exception the relay no longer makes. The control above was
-  # reset through the same fabric, so the box and its path are live, and
-  # the absence below is the drop, not a dead fabric.
-  if cred_case_log | grep -q -- "egress-uncredentialed-proxy-destination"; then
+  # What this host CAN observe is the consequence of a first-gate refusal.
+  # The frame never crossed the switch, so the VM host's gate never saw it
+  # and minvmd never logs the gate's own drop line (its `rule_matched` field)
+  # for it. That silence is the pin: a gate drop line would mean the frame
+  # reached the host, the exception the relay no longer makes. The relay now
+  # reports its refusal over the guest door, so the host does see the relay's
+  # audit record, which minvmd::control logs with a `rule` field, never
+  # `rule_matched`. Its presence proves the relay refused and reported the
+  # frame. The control above was reset through the same fabric, so the box
+  # and its path are live, and the gate's silence is the drop, not a dead
+  # fabric.
+  if cred_case_log | grep -qF -- '"rule_matched":"egress-uncredentialed-proxy-destination"'; then
     echo "::error::the minvmd gate logged a proxy-lane drop for the no-lane box — the box's own relay must refuse the frame before the switch, so the host gate never sees it"
-    cred_case_log | grep -- "egress-uncredentialed-proxy-destination" | tail -n5 | sed 's/^/  /'
+    cred_case_log | grep -F -- '"rule_matched":"egress-uncredentialed-proxy-destination"' | tail -n5 | sed 's/^/  /'
+    cred_fail
+  fi
+  nolane_audit_found=""
+  for _ in $(seq 1 20); do
+    if cred_case_log \
+      | grep -F -- "recorded the box's refused egress in the host audit log" \
+      | grep -F -- '"box":"e2e-cred-nolane"' \
+      | grep -F -- '"reported_by":"guest"' \
+      | grep -qF -- '"rule":"egress-uncredentialed-proxy-destination"'; then
+      nolane_audit_found=1
+      break
+    fi
+    sleep 0.5
+  done
+  if [ -z "$nolane_audit_found" ]; then
+    echo "::error::the host audit log has no refused-egress record for e2e-cred-nolane under the rule 'egress-uncredentialed-proxy-destination' — the box's relay must refuse the frame and report it to the host"
+    cred_case_log | grep -F -- "recorded the box's refused egress in the host audit log" | tail -n5 | sed 's/^/  /'
     cred_fail
   fi
 
@@ -13148,8 +19141,8 @@ proof_box_without_credentialed_lane_cannot_reach_proxy() {
 #     ahead of the box's first delivered connection, and the ended box's
 #     withdrawn with its row while its sibling's second connection is
 #     still answered from its own address;
-#   * the lane's necessity (NET-134): a third box with no lane — allow-all
-#     rules, so only the lane's absence can refuse — gets silence at the
+#   * the lane's necessity (NET-134): a third box with no lane — rules open
+#     to every address, so only the lane's absence can refuse — gets silence at the
 #     proxy's address while its control probe to the node's own address is
 #     reset through the same fabric, the host gate's log says nothing, and
 #     no delivery is ever recorded for its address;
@@ -13191,6 +19184,7 @@ proof_proxy_sees_boxes_by_address() {
   local probe_start_ms probe_ms
   cred_begin
   export MINVMD_BEP_STUB=1
+  BEP_LIVE_DAEMON=""
   CRED_STUB=1
   # One directive wider than cred_begin's: the pool's per-delivery record is
   # a DEBUG one, and the delivery assertions below read it, so widen the
@@ -13244,8 +19238,10 @@ proof_proxy_sees_boxes_by_address() {
   # (the box's own relay admitting the proxy's address as the lane's
   # infrastructure under 0.0.0.0/0, and the VM host's gate under the row's
   # declared lane) and still arrives attributed to the box's own address; C
-  # declares nothing — no lane, allow-all rules — so nothing but the lane's
-  # absence can refuse the proxy's address for it.
+  # declares no lane and rules open to every address (with no section it
+  # would get the deny-all default, NET-074, and its sibling control would
+  # drop), so nothing but the lane's absence can refuse the proxy's address
+  # for it.
   PSBA_SEED_DIR_A="$(hook_mktemp /tmp/mnlpsba.XXXXXX)"
   hook_seed_preamble > "$PSBA_SEED_DIR_A/minimal.toml"
   mkdir "$PSBA_SEED_DIR_A/.git"
@@ -13279,8 +19275,9 @@ proof_proxy_sees_boxes_by_address() {
   psba_sid_b="$(printf '%s\n' "$psba_sid_b" | tail -n1 | tr -d '\r')"
   cred_wait_registered "the proxy-views case's box B" "e2e-psba-b"
   psba_sid_c="$(cd "$PSBA_SEED_DIR_C" && mnl session activate . --no-prompt \
-    --name e2e-psba-nolane --network own_ip 2>"$WORK/psba-box-c.err")" || {
-    echo "::error::'min session activate --network own_ip' failed for the proxy-views case's laneless box"
+    --name e2e-psba-nolane --network own_ip --allow-subnets 0.0.0.0/0 \
+    2>"$WORK/psba-box-c.err")" || {
+    echo "::error::'min session activate --network own_ip --allow-subnets 0.0.0.0/0' failed for the proxy-views case's laneless box"
     cat "$WORK/psba-box-c.err" 2>/dev/null || true
     cred_fail
   }
@@ -13534,12 +19531,33 @@ proof_proxy_sees_boxes_by_address() {
     cred_case_log | grep -F -- 'connection delivered' | tail -n5 | sed 's/^/  /'
     cred_fail
   fi
-  if cred_case_log | grep -q -- "egress-uncredentialed-proxy-destination"; then
+  # The gate's own drop line carries `rule_matched`. The relay's refusal
+  # reaches the host as the audit record minvmd::control logs with a `rule`
+  # field, so match only the gate's field here, and expect the audit record
+  # for this box below.
+  if cred_case_log | grep -qF -- '"rule_matched":"egress-uncredentialed-proxy-destination"'; then
     echo "::error::the minvmd gate logged a proxy-lane drop for the laneless box — the box's own relay must refuse the frame before the switch, so the host gate never sees it"
-    cred_case_log | grep -- "egress-uncredentialed-proxy-destination" | tail -n5 | sed 's/^/  /'
+    cred_case_log | grep -F -- '"rule_matched":"egress-uncredentialed-proxy-destination"' | tail -n5 | sed 's/^/  /'
     cred_fail
   fi
-  echo "the laneless box ($psba_ip_c, allow-all, no lane) was silent at $proxy_ip:$proxy_port for ${probe_ms}ms; the host gate stayed silent"
+  psba_nolane_audit_found=""
+  for _ in $(seq 1 20); do
+    if cred_case_log \
+      | grep -F -- "recorded the box's refused egress in the host audit log" \
+      | grep -F -- '"box":"e2e-psba-nolane"' \
+      | grep -F -- '"reported_by":"guest"' \
+      | grep -qF -- '"rule":"egress-uncredentialed-proxy-destination"'; then
+      psba_nolane_audit_found=1
+      break
+    fi
+    sleep 0.5
+  done
+  if [ -z "$psba_nolane_audit_found" ]; then
+    echo "::error::the host audit log has no refused-egress record for e2e-psba-nolane under the rule 'egress-uncredentialed-proxy-destination' — the box's relay must refuse the frame and report it to the host"
+    cred_case_log | grep -F -- "recorded the box's refused egress in the host audit log" | tail -n5 | sed 's/^/  /'
+    cred_fail
+  fi
+  echo "the laneless box ($psba_ip_c, open to every address, no lane) was silent at $proxy_ip:$proxy_port for ${probe_ms}ms; the host gate stayed silent, and the host audit log holds the relay's refusal"
 
   # The host process's leg: NET-132's IF-clause, end to end. A process
   # outside every box connects straight to the acceptor's own unix socket
@@ -13696,11 +19714,14 @@ PY
 # own drops rather than by the boxes' declared union.
 #
 # Two resident boxes with disjoint declared egress bound the union: box A
-# declares 10.0.0.0/8, box B 192.168.0.0/16, and both declare the runner's
-# address as a /32 (the destination their own probes reach) and the fabric
-# (100.64.0.0/16), which carries the host alias, the node-plane baseline
-# set's one category-pair (NET-130: the alias is the registry and the cache,
-# shown beside the rules by `min session policy`). The arms:
+# declares 198.18.0.0/16 and box B 198.19.0.0/16 — the two halves of
+# 198.18.0.0/15, RFC 2544 benchmark space, spelled outside RFC 1918 so no
+# infrastructure rule can take a cross-box destination before the row's
+# own rules do — and both declare the runner's address as a /32 (the
+# destination their own probes reach) and the fabric (100.64.0.0/16),
+# which carries the host alias, the node-plane baseline set's one
+# category-pair (NET-130: the alias is the registry and the cache, shown
+# beside the rules by `min session policy`). The arms:
 #
 #   * each box's own probe to the runner's address arrives — the whole chain
 #     working, and the union's declared half live for a box's own address;
@@ -13709,12 +19730,13 @@ PY
 #     rows declare: it is dropped before any frame leaves the VM, under the
 #     gate's own unregistered rule, and the drop line names the source —
 #     the receipt for the frames the spoofer spoke;
-#   * box A's address toward 192.168.77.7, declared only by box B — the
-#     union's other half — is refused: the row that holds the source address
-#     decides, and box A's row does not cover it (the RFC 1918 the
-#     infrastructure set takes where the row's own allow-list does not);
-#   * box B's address toward 10.0.0.7, box A's private half, refused the
-#     same way from the other side;
+#   * box A's address toward 198.19.0.7, declared only by box B — the
+#     union's other half — is refused under egress-undeclared-subnet: the
+#     row that holds the source address decides, and box A's row does not
+#     cover it — the verdict the union bound rides on, which the public
+#     range cannot let the private-space rule answer for;
+#   * box B's address toward 198.18.0.7, box A's half, refused the same way
+#     from the other side;
 #   * box A's address toward 198.51.100.7 — beyond the whole union — is
 #     refused by box A's own rules (egress-undeclared-subnet);
 #   * a made-up in-plan lease toward that same 198.51.100.7 is dropped the
@@ -14057,11 +20079,11 @@ ESU_LISTENER_EOF
 
   esu_sid_a="$(cd "$ESU_A_SEED_DIR" && RUST_LOG="warn,minvmd=info" mnl session activate . \
     --no-prompt --name e2e-esc-a --network own_ip \
-    --allow-subnets 10.0.0.0/8 --allow-subnets 100.64.0.0/16 \
+    --allow-subnets 198.18.0.0/16 --allow-subnets 100.64.0.0/16 \
     --allow-subnets "$esu_host/32" \
     --allow-protocols tcp \
     2>"$WORK/esu-activate-a.err")" || {
-    echo "::error::box A's activate (--network own_ip, 10.0.0.0/8, the fabric and $esu_host/32 declared) failed"
+    echo "::error::box A's activate (--network own_ip, 198.18.0.0/16, the fabric and $esu_host/32 declared) failed"
     cat "$WORK/esu-activate-a.err" 2>/dev/null || true
     esu_fail
   }
@@ -14074,11 +20096,11 @@ ESU_LISTENER_EOF
   fi
   esu_sid_b="$(cd "$ESU_B_SEED_DIR" && RUST_LOG="warn,minvmd=info" mnl session activate . \
     --no-prompt --name e2e-esc-b --network own_ip \
-    --allow-subnets 192.168.0.0/16 --allow-subnets 100.64.0.0/16 \
+    --allow-subnets 198.19.0.0/16 --allow-subnets 100.64.0.0/16 \
     --allow-subnets "$esu_host/32" \
     --allow-protocols tcp \
     2>"$WORK/esu-activate-b.err")" || {
-    echo "::error::box B's activate (--network own_ip, 192.168.0.0/16, the fabric and $esu_host/32 declared) failed"
+    echo "::error::box B's activate (--network own_ip, 198.19.0.0/16, the fabric and $esu_host/32 declared) failed"
     cat "$WORK/esu-activate-b.err" 2>/dev/null || true
     esu_fail
   }
@@ -14122,8 +20144,8 @@ ESU_LISTENER_EOF
     echo "::error::a registration record does not name the switch address it allocated (A: $esu_ip_a, B: $esu_ip_b)"
     esu_fail
   fi
-  echo "box A: $esu_sid_a at switch address $esu_ip_a (declared 10.0.0.0/8 + the fabric + $esu_host/32)"
-  echo "box B: $esu_sid_b at switch address $esu_ip_b (declared 192.168.0.0/16 + the fabric + $esu_host/32)"
+  echo "box A: $esu_sid_a at switch address $esu_ip_a (declared 198.18.0.0/16 + the fabric + $esu_host/32)"
+  echo "box B: $esu_sid_b at switch address $esu_ip_b (declared 198.19.0.0/16 + the fabric + $esu_host/32)"
 
   # ---- path (a)'s precondition: the boxes hold no raw-socket capability ---
   # NET-083 (and the seal NET-084 rides on): the box may not forge frames on
@@ -14223,18 +20245,18 @@ ESU_LISTENER_EOF
     echo "box $esu_box's effective policy (the baseline set beside the rules):"
     printf '%s\n' "$esu_policy" | sed 's/^/  /'
     if [ "$esu_box" = a ]; then
-      esu_line="subnets  10.0.0.0/8, 100.64.0.0/16, $esu_host/32"
+      esu_line="subnets  198.18.0.0/16, 100.64.0.0/16, $esu_host/32"
     else
-      esu_line="subnets  192.168.0.0/16, 100.64.0.0/16, $esu_host/32"
+      esu_line="subnets  198.19.0.0/16, 100.64.0.0/16, $esu_host/32"
     fi
     if ! grep -q -- "$esu_line" <<<"$esu_policy"; then
       echo "::error::box $esu_box's policy does not show its declared subnets ('$esu_line')"
       esu_fail
     fi
-    if ! grep -q 'node-plane baseline set (helper enumeration)' <<<"$esu_policy" \
-      || ! grep -q 'registry  100.64.255.254/32' <<<"$esu_policy" \
-      || ! grep -q 'cache  100.64.255.254/32' <<<"$esu_policy"; then
-      echo "::error::box $esu_box's policy does not show the node-plane baseline set beside its rules (the registry and cache categories at the host alias)"
+    if ! grep -q 'own downloads in this VM' <<<"$esu_policy" \
+      || ! grep -q 'registry  github.com' <<<"$esu_policy" \
+      || ! grep -q 'cache  cache.minimal.dev' <<<"$esu_policy"; then
+      echo "::error::box $esu_box's policy does not show the node-plane baseline set beside its rules (the registry github.com and the cache cache.minimal.dev)"
       esu_fail
     fi
   done
@@ -14598,19 +20620,20 @@ source=$esu_ip_b (box B's own probe) destination=$esu_host:$ESU_LISTEN_PORT verd
   esu_rows="$esu_rows
 source=100.64.0.99 destination=$esu_host:$ESU_LISTEN_PORT verdict=refused at the gate (egress-unregistered-source — an in-plan lease no row holds, dropped toward a destination both rows declare)"
 
-  # Box A's address toward box B's private half — inside the union, outside
-  # the row that holds the worn address: the gate's infrastructure rule
-  # refuses it, and its line names both the source and the destination, so
-  # both are pinned inside the wait: a line box A's own traffic wrote under
-  # the same rule names a different destination and cannot pass for this
-  # arm's, and a line that predates the arm cannot either (the window
-  # discipline below).
-  esu_prior="$(esu_gate_lines "$esu_ip_a" egress-infrastructure-destination 192.168.77.7 | wc -l)"
-  esu_run_spoofer cross-a "$esu_ip_a" 192.168.77.7 esu-spoof-cross-a 3 no
+  # Box A's address toward box B's half — inside the union, outside the row
+  # that holds the worn address: box A's own rules refuse it, under
+  # egress-undeclared-subnet — the public half no infrastructure rule
+  # takes, so the refusal is the row's own and the union bound it proves.
+  # The line names both the source and the destination, so both are pinned
+  # inside the wait: a line box A's own traffic wrote under the same rule
+  # names a different destination and cannot pass for this arm's, and a
+  # line that predates the arm cannot either (the window discipline below).
+  esu_prior="$(esu_gate_lines "$esu_ip_a" egress-undeclared-subnet 198.19.0.7 | wc -l)"
+  esu_run_spoofer cross-a "$esu_ip_a" 198.19.0.7 esu-spoof-cross-a 3 no
   case "$esu_out" in
     outcome=refused*) : ;;
     *)
-      echo "::error::the spoofer wearing box A's address completed a flow to 192.168.77.7 — box B's declared half must be refused for a source box A's row holds"
+      echo "::error::the spoofer wearing box A's address completed a flow to 198.19.0.7 — box B's declared half must be refused for a source box A's row holds"
       esu_fail
       ;;
   esac
@@ -14618,13 +20641,25 @@ source=100.64.0.99 destination=$esu_host:$ESU_LISTEN_PORT verdict=refused at the
     echo "::error::a refused spoof from box A's address still left a marker at the host listener"
     esu_fail
   fi
-  esu_line="$(esu_wait_new_gate_line "$esu_ip_a" egress-infrastructure-destination \
-    192.168.77.7 "$esu_prior")" || {
-    echo "::error::the gate refused box A's address toward 192.168.77.7 without its infrastructure line naming the source and the destination ($esu_prior such line(s) existed before the arm)"
+  esu_line="$(esu_wait_new_gate_line "$esu_ip_a" egress-undeclared-subnet \
+    198.19.0.7 "$esu_prior")" || {
+    echo "::error::the gate refused box A's address toward 198.19.0.7 without its undeclared-subnet line naming the source and the destination ($esu_prior such line(s) existed before the arm)"
     esu_fail
   }
   esu_rows="$esu_rows
-source=$esu_ip_a destination=192.168.77.7:$ESU_LISTEN_PORT verdict=refused at the gate (egress-infrastructure-destination — box B's declared half, which box A's row does not cover)"
+source=$esu_ip_a destination=198.19.0.7:$ESU_LISTEN_PORT verdict=refused at the gate (egress-undeclared-subnet — box B's declared half, which box A's row does not cover)"
+
+  # The window pace: box A wears two undeclared-subnet arms — this one and
+  # the far-side one below — and the gate's limiter writes one line per
+  # source per rule per DROP_WARN_MIN_INTERVAL (60s), keyed by source and
+  # rule only, never the destination (DropLimiter::decide in
+  # crates/minvmd/src/net/egress_gate.rs). The far-side arm's line would be
+  # Silent inside this arm's window and never land, failing its wait. The
+  # made-up arms dodge the same limiter by wearing a fresh made-up address
+  # no row holds; these two arms cannot — the address each wears is box
+  # A's own, and that is the bound they prove — so the window is waited
+  # out instead.
+  sleep 60
 
   # Box A's address toward a destination no resident box declared — beyond
   # the whole union: the row's own rules refuse it, and the undeclared-subnet
@@ -14688,15 +20723,15 @@ source=$esu_ip_a destination=198.51.100.7:$ESU_LISTEN_PORT verdict=refused at th
   esu_rows="$esu_rows
 source=100.64.0.98 destination=198.51.100.7:$ESU_LISTEN_PORT verdict=refused at the gate (egress-unregistered-source names the source, no marker — an in-plan lease no row holds never reaches past the union)"
 
-  # Box B's address toward box A's private half: the same refusal, worn from
-  # the other side — whichever box's address the spoofer wears, its own row is
+  # Box B's address toward box A's half: the same refusal, worn from the
+  # other side — whichever box's address the spoofer wears, its own row is
   # the one that decides, and the destination stays pinned inside the wait.
-  esu_prior="$(esu_gate_lines "$esu_ip_b" egress-infrastructure-destination 10.0.0.7 | wc -l)"
-  esu_run_spoofer cross-b "$esu_ip_b" 10.0.0.7 esu-spoof-cross-b 3 no
+  esu_prior="$(esu_gate_lines "$esu_ip_b" egress-undeclared-subnet 198.18.0.7 | wc -l)"
+  esu_run_spoofer cross-b "$esu_ip_b" 198.18.0.7 esu-spoof-cross-b 3 no
   case "$esu_out" in
     outcome=refused*) : ;;
     *)
-      echo "::error::the spoofer wearing box B's address completed a flow to 10.0.0.7 — box A's declared half must be refused for a source box B's row holds"
+      echo "::error::the spoofer wearing box B's address completed a flow to 198.18.0.7 — box A's declared half must be refused for a source box B's row holds"
       esu_fail
       ;;
   esac
@@ -14704,13 +20739,13 @@ source=100.64.0.98 destination=198.51.100.7:$ESU_LISTEN_PORT verdict=refused at 
     echo "::error::a refused spoof from box B's address still left a marker at the host listener"
     esu_fail
   fi
-  esu_line="$(esu_wait_new_gate_line "$esu_ip_b" egress-infrastructure-destination \
-    10.0.0.7 "$esu_prior")" || {
-    echo "::error::the gate refused box B's address toward 10.0.0.7 without its infrastructure line naming the source and the destination ($esu_prior such line(s) existed before the arm)"
+  esu_line="$(esu_wait_new_gate_line "$esu_ip_b" egress-undeclared-subnet \
+    198.18.0.7 "$esu_prior")" || {
+    echo "::error::the gate refused box B's address toward 198.18.0.7 without its undeclared-subnet line naming the source and the destination ($esu_prior such line(s) existed before the arm)"
     esu_fail
   }
   esu_rows="$esu_rows
-source=$esu_ip_b destination=10.0.0.7:$ESU_LISTEN_PORT verdict=refused at the gate (egress-infrastructure-destination — box A's declared half, which box B's row does not cover)"
+source=$esu_ip_b destination=198.18.0.7:$ESU_LISTEN_PORT verdict=refused at the gate (egress-undeclared-subnet — box A's declared half, which box B's row does not cover)"
 
   # An address outside the plan's lease block: refused outright, under either
   # posture — outside the plan there is no lease to spoof. The source is
@@ -14769,6 +20804,527 @@ source=203.0.113.7 destination=$esu_host:$ESU_LISTEN_PORT verdict=refused at the
   ESU_A_SEED_DIR=""
   ESU_B_SEED_DIR=""
   echo "escape reaches only the declared union OK (an escapee wearing any in-plan address — a resident box's own, or a made-up lease no row holds — reaches only the union of the resident boxes' declared egress plus the baseline set: each resident-address spoof was refused at the host-side gate beyond its own row's declaration, and each made-up lease was dropped under the gate's unregistered rule toward a destination the resident union declares and the union's far side alike, whatever the egress default's phase; both boxes hold neither CAP_NET_RAW nor CAP_NET_ADMIN, no IPv6 route in the guest, the baseline set beside the rules). NET-085"
+  echo "::endgroup::"
+}
+
+# T108 on the VM host, end to end: escapes and builds stay inside the box's
+# rules. Each refusal that reaches the host leaves a record there. The
+# vsock refusal inside the box is the one exception (see the RPC leg). One deny-all
+# own-address box (`--network own_ip --deny-all-egress`) carries three legs:
+#
+#   * the RPC leg (NET-139): from inside the box, a vsock connect to the
+#     guest daemon's RPC port (2222, instance 0) at the loopback CID 1 and
+#     at CID 3, a sibling's or the guest's own. No seal admits AF_VSOCK, so
+#     the expected refusal is the box's own `socket(AF_VSOCK)` failing with
+#     EAFNOSUPPORT. That refusal has no host-side record: no connection
+#     leaves the box, so the guest daemon logs nothing, and the row says so.
+#     Where a socket opens anyway, the guest daemon's accept check must
+#     refuse the peer, and a new audited line ("refused an RPC connection
+#     from a vsock peer"), written after this attempt, must reach the
+#     host-side boot log. The attempt never reads the server's SSH banner
+#     either way.
+#
+#   * the build leg (NET-155 under NET-130): `min add --session` of a
+#     project-local package whose one web source is a literal address in
+#     TEST-NET-2. An own-address box has no classifier leaf, so the daemon
+#     fetches the source from its own namespace with the node's address,
+#     and the host-side gate decides it by the node-plane baseline set: the
+#     address is no registry or cache pin, so the gate drops it and writes
+#     its `egress-node-plane-unpinned` line naming the destination. The
+#     build fails and the package is not installed. This is the interim
+#     that the NET-155 scope note names, and issue #2802 owns it. When #2802
+#     gives an own-address box its own leaf, change this leg to expect the
+#     box's own drop in place of the node's.
+#
+#   * the escape leg (NET-085): a root escapee wearing the node's own
+#     address speaks the shuttle protocol at the gate's landing edge (the
+#     escape-union case's spoofer, read out of this script) toward the
+#     runner's interface address, which no baseline entry pins. That
+#     address is also an infrastructure destination, and the gate checks the
+#     infrastructure deny set before the node-plane pin. So the gate drops it
+#     under `egress-infrastructure-destination` or
+#     `egress-node-plane-unpinned`, its line names the source and the
+#     destination, and the host listener sees no marker. A second frame from
+#     the node's address goes to the build leg's TEST-NET-2 address, which is
+#     no infrastructure destination and no pin. The gate drops it under
+#     `egress-node-plane-unpinned`, which proves the pin itself.
+#
+# The build leg runs before the escape leg on purpose: the gate writes one
+# line per source per rule per 60 s, and both legs' lines are the node
+# address's under the same rule, so each escape probe waits out the window
+# that the line before it opened. Every leg's failure prints the record it expected
+# and the host log lines it searched.
+proof_escapes_and_builds_stay_inside_box_rules() {
+  local ebr_sid="" ebr_rec="" ebr_ip="" ebr_node="" ebr_host="" ebr_out=""
+  local ebr_line="" ebr_log0="" ebr_log0_lines=0 ebr_boot="" ebr_boot0_lines=0
+  local ebr_gate_sock="" ebr_listener_log="" ebr_rows="" ebr_cid="" ebr_prior=0
+  local ebr_policy="" ebr_rc="" ebr_prior_infra=0 ebr_prior_pin=0
+  local ebr_pkg="e2e-ebr-fetch" ebr_build_dst="198.51.100.9"
+  echo "::group::escapes and builds stay inside the box's rules (NET-085, NET-139, NET-155)"
+
+  if [ "$min_daemon" != minvmd ] && [ -z "$E2E_VM" ]; then
+    echo "escapes-and-builds proof SKIPPED (this run's daemon is minimald: a native host has no VM to escape into — the proof runs where the CLI is VM-backed)"
+    echo "::endgroup::"
+    return 0
+  fi
+  # A Linux VM boots on KVM. Without it no VM host daemon starts, so there
+  # is no VM to escape from and no host-side gate to read — the same gate
+  # the sibling VM-backed cases apply. With KVM present, a missing switch
+  # stays a fault below, never a skip.
+  if [ "$(uname -s)" = Linux ] && { [ ! -e /dev/kvm ] || [ ! -w /dev/kvm ]; }; then
+    not_run escapes_and_builds_stay_inside_box_rules "no writable /dev/kvm: a Linux VM boots on KVM and this host has none — the case drives a VM-backed host, and no VM means no host-side gate to read"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    echo "::error::no MINVMD_GVPROXY_BIN on this VM-backed run: the switch binary the host-side egress gate stands beside is missing, so the escapes-and-builds proof has no gate to read its records from"
+    fail
+  fi
+
+  ebr_gate_sock="$XDG_STATE_HOME/minimal/providers/local-minvmd0/gvproxy-gate.sock"
+  ebr_boot="${MINVMD_BOOT_LOG:-$XDG_STATE_HOME/minimal/providers/local-minvmd0/boot.log}"
+  ebr_listener_log="$WORK/ebr-listener.log"
+  EBR_LISTEN_PORT=18095
+  EBR_EXPECTED="the deny-all box's activate"
+
+  # The host-side logs this case reads: the VM host daemon's file log (the
+  # gate's lines, the registration and the baseline set) and the boot log
+  # (the guest daemon's console). Both are scoped to the lines written after
+  # the snapshots below.
+  ebr_host_log() {
+    find "$XDG_STATE_HOME/minimal/logs" -maxdepth 1 -name 'minvmd.log*' -type f 2>/dev/null \
+      | sort -r | head -n1
+  }
+  ebr_case_log() {
+    local f
+    f="$(ebr_host_log)"
+    [ -n "$f" ] || return 0
+    if [ "$f" = "$ebr_log0" ] && [ "$ebr_log0_lines" -gt 0 ]; then
+      tail -n +"$((ebr_log0_lines + 1))" "$f" 2>/dev/null
+    else
+      cat "$f" 2>/dev/null
+    fi
+  }
+  # The boot console paints ANSI around field names, so strip it first.
+  # A boot that rewrote the file leaves fewer lines than the snapshot, and
+  # then every line in it is this case's.
+  ebr_boot_case_log() {
+    local from=$((ebr_boot0_lines + 1)) now
+    now="$(wc -l <"$ebr_boot" 2>/dev/null)" || now=0
+    [ "$now" -ge "$ebr_boot0_lines" ] || from=1
+    tail -n +"$from" "$ebr_boot" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g'
+  }
+  ebr_fail() {
+    if [ -n "${EBR_LISTENER_PID:-}" ]; then
+      kill "$EBR_LISTENER_PID" 2>/dev/null || true
+      EBR_LISTENER_PID=""
+    fi
+    echo "--- the record this leg expected ---"
+    echo "  $EBR_EXPECTED"
+    echo "--- the host logs searched ---"
+    echo "  VM host daemon log: $(ebr_host_log) (lines after $ebr_log0_lines of ${ebr_log0:-no earlier file})"
+    echo "  guest console (boot log): $ebr_boot (lines after $ebr_boot0_lines)"
+    echo "--- this case's gate drop lines ---"
+    ebr_case_log 2>/dev/null | grep -F 'rule_matched' | grep -F 'egress-' || true
+    echo "--- this case's vsock refusal lines from the guest console ---"
+    ebr_boot_case_log | grep -F 'refused an RPC connection from a vsock peer' || true
+    echo "--- the attempts so far ---"
+    printf '%s\n' "$ebr_rows" | sed '/^$/d; s/^/  /'
+    echo "--- the listener's record ---"
+    cat "$ebr_listener_log" 2>/dev/null || true
+    fail
+  }
+  # The guest daemon's vsock refusal lines for one peer CID, oldest first.
+  # The console prints the field as peer_cid=N, a JSON record as
+  # "peer_cid":N, so match both and never a longer number.
+  ebr_vsock_refusals() {
+    ebr_boot_case_log | grep -F 'refused an RPC connection from a vsock peer' \
+      | grep -E "peer_cid(=|\":)$1([^0-9]|\$)" || true
+  }
+  # The gate's lines for one source, rule and destination, oldest first.
+  ebr_gate_lines() {
+    ebr_case_log | grep -F "\"source\":\"$1\"" | grep -F "\"rule_matched\":\"$2\"" \
+      | grep -F "\"destination\":\"$3\"" | sed '/^$/d'
+  }
+  # Waits until the gate wrote more such lines than $4, then prints the
+  # newest. SRC RULE DST BASE_COUNT
+  ebr_wait_new_gate_line() {
+    local count
+    for _ in $(seq 1 40); do
+      count="$(ebr_gate_lines "$1" "$2" "$3" | wc -l)"
+      if [ "$count" -gt "$4" ]; then
+        ebr_gate_lines "$1" "$2" "$3" | tail -n1
+        return 0
+      fi
+      sleep 0.5
+    done
+    return 1
+  }
+
+  # The seed: a project with one local package whose only web source is a
+  # literal address no baseline entry pins, so no name lookup stands between
+  # the build and the gate.
+  EBR_SEED_DIR="$(hook_mktemp /tmp/mnlebr.XXXXXX)"
+  hook_seed_preamble > "$EBR_SEED_DIR/minimal.toml"
+  mkdir "$EBR_SEED_DIR/.git"
+  mkdir -p "$EBR_SEED_DIR/packages/$ebr_pkg"
+  cat > "$EBR_SEED_DIR/packages/$ebr_pkg/build.ncl" <<EBR_PKG_EOF
+let {BuildSpec, Source, OutputLib, ..} = import "minimal.ncl" in
+{
+  name = "$ebr_pkg",
+  prebuilt = true,
+  build_deps = [
+    {
+      url = "https://$ebr_build_dst/$ebr_pkg-1.0.tar.zst",
+      sha256 = "0000000000000000000000000000000000000000000000000000000000000000",
+      extract = true,
+    } | Source,
+  ],
+  runtime_deps = [],
+  outputs = { docs = { glob = "*" } | OutputLib },
+} | BuildSpec
+EBR_PKG_EOF
+
+  # The spoofer: the escape-union case's own, read from this script so the
+  # two cases speak the same shuttle protocol.
+  awk '/ESU_SPOOFER_EOF/ { if (grab) exit; grab = 1; next } grab' \
+    "$ROOT/scripts/session-e2e.sh" > "$WORK/ebr-spoofer.py"
+  if ! grep -q '^def spoofed_flow' "$WORK/ebr-spoofer.py"; then
+    echo "::error::the escape-union case's spoofer could not be read out of this script into $WORK/ebr-spoofer.py"
+    ebr_fail
+  fi
+
+  # The destination of the escape leg: the runner's interface address, the
+  # same read and the same exclusions as the escape-union case.
+  ebr_host="$(python3 -c "
+import socket
+probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+probe.connect(('192.0.2.1', 9))
+print(probe.getsockname()[0])
+" 2>"$WORK/ebr-host.err")" || ebr_host=""
+  if [ -z "$ebr_host" ] || ! python3 -c "
+import ipaddress, sys
+addr = ipaddress.IPv4Address(sys.argv[1])
+blocked = ('127.0.0.0/8', '100.64.0.0/10', '127.0.64.0/24')
+sys.exit(1 if addr.is_unspecified or any(addr in ipaddress.ip_network(n) for n in blocked) else 0)
+" "$ebr_host" 2>>"$WORK/ebr-host.err"; then
+    echo "::error::the runner's interface address ('$ebr_host') is unreadable, unspecified, loopback, inside 100.64/10, or in 127.0.64.0/24, so the escape leg has no destination outside the switch's own drops"
+    cat "$WORK/ebr-host.err" 2>/dev/null || true
+    ebr_fail
+  fi
+  if python3 -c "import socket; socket.create_connection(('$ebr_host', $EBR_LISTEN_PORT), 2)" \
+      2>/dev/null; then
+    echo "::error::$ebr_host:$EBR_LISTEN_PORT already answers on this host; the escape leg needs it free for its listener"
+    ebr_fail
+  fi
+  cat > "$WORK/ebr-listener.py" <<'EBR_LISTENER_EOF'
+"""Logs each connection and each chunk it reads, flushed as it happens."""
+import socket
+import sys
+
+host, port, log = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+
+
+def note(line):
+    with open(log, "a") as handle:
+        handle.write(line + "\n")
+
+
+listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind((host, port))
+listener.listen(16)
+note(f"listening on {host}:{port}")
+while True:
+    conn, peer = listener.accept()
+    note(f"accepted from {peer[0]}")
+    conn.settimeout(5)
+    try:
+        chunk = conn.recv(256)
+        if chunk:
+            note("marker " + chunk.decode("utf-8", "replace"))
+    except OSError:
+        pass
+    conn.close()
+EBR_LISTENER_EOF
+  : > "$ebr_listener_log"
+  python3 "$WORK/ebr-listener.py" "$ebr_host" "$EBR_LISTEN_PORT" "$ebr_listener_log" \
+    >"$WORK/ebr-listener.out" 2>"$WORK/ebr-listener.err" &
+  EBR_LISTENER_PID=$!
+  ebr_line=""
+  for _ in $(seq 1 40); do
+    ebr_line="$(grep '^listening ' "$ebr_listener_log" 2>/dev/null)" && break
+    sleep 0.25
+  done
+  if [ -z "$ebr_line" ]; then
+    echo "::error::the host listener never came up on $ebr_host:$EBR_LISTEN_PORT"
+    cat "$WORK/ebr-listener.err" 2>/dev/null || true
+    ebr_fail
+  fi
+  echo "host listener: $ebr_line"
+
+  # Snapshot both host-side logs, then respawn the daemon pair under a filter
+  # that keeps the VM host daemon's INFO records (the registration and the
+  # baseline set). The gate's drop lines are WARN and pass either way.
+  ebr_log0="$(ebr_host_log)"
+  ebr_log0_lines=0
+  if [ -n "$ebr_log0" ]; then
+    ebr_log0_lines="$(wc -l <"$ebr_log0" 2>/dev/null)" || ebr_log0_lines=0
+  fi
+  mnl stop --force >/dev/null 2>&1 || true
+  minvmd stop >/dev/null 2>&1 || true
+  ebr_boot0_lines=0
+  if [ -f "$ebr_boot" ]; then
+    ebr_boot0_lines="$(wc -l <"$ebr_boot" 2>/dev/null)" || ebr_boot0_lines=0
+  fi
+
+  ebr_sid="$(cd "$EBR_SEED_DIR" && RUST_LOG="warn,minvmd=info" mnl session activate . \
+    --no-prompt --name e2e-ebr --network own_ip --deny-all-egress \
+    2>"$WORK/ebr-activate.err")" || {
+    echo "::error::'min session activate --network own_ip --deny-all-egress' failed"
+    cat "$WORK/ebr-activate.err" 2>/dev/null || true
+    ebr_fail
+  }
+  ebr_sid="$(printf '%s\n' "$ebr_sid" | tail -n1 | tr -d '\r')"
+  if ! printf '%s' "$ebr_sid" | grep -Eqx \
+    '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'; then
+    echo "::error::the deny-all box's activate printed no session id: '$ebr_sid'"
+    cat "$WORK/ebr-activate.err" 2>/dev/null || true
+    ebr_fail
+  fi
+
+  EBR_EXPECTED="the VM host daemon's registration record for e2e-ebr ('registered box with the VM host daemon; addresses allocated') and its 'node-plane baseline set at the gate' record naming node_addr"
+  ebr_rec="" ebr_line=""
+  for _ in $(seq 1 40); do
+    [ -n "$ebr_rec" ] || ebr_rec="$(ebr_case_log \
+      | grep -F 'registered box with the VM host daemon; addresses allocated' \
+      | grep -F '"box":"e2e-ebr"' | tail -n1)"
+    [ -n "$ebr_line" ] || ebr_line="$(ebr_case_log \
+      | grep -F 'node-plane baseline set at the gate' | tail -n1)"
+    [ -n "$ebr_rec" ] && [ -n "$ebr_line" ] && break
+    sleep 0.25
+  done
+  ebr_ip="$(printf '%s\n' "$ebr_rec" | sed -n 's/.*"switch_address":"\([0-9.]*\)".*/\1/p')"
+  ebr_node="$(printf '%s\n' "$ebr_line" | sed -n 's/.*"node_addr":"\([0-9.]*\)".*/\1/p')"
+  if [ -z "$ebr_ip" ] || [ -z "$ebr_node" ]; then
+    echo "::error::the VM host daemon's log does not name the box's switch address ('$ebr_ip') or the node's address ('$ebr_node')"
+    ebr_fail
+  fi
+  echo "box e2e-ebr: $ebr_sid at switch address $ebr_ip, declared deny-all"
+  echo "the node's own address (the in-VM daemon's, decided by the baseline set): $ebr_node"
+  if ! ebr_policy="$(mnl session policy "$ebr_sid" 2>"$WORK/ebr-policy.err")"; then
+    echo "::error::'min session policy $ebr_sid' failed"
+    cat "$WORK/ebr-policy.err" 2>/dev/null || true
+    ebr_fail
+  fi
+  echo "the box's effective policy (the baseline set beside the rules):"
+  printf '%s\n' "$ebr_policy" | sed 's/^/  /'
+  if ! grep -q 'registry  github.com' <<<"$ebr_policy" \
+    || ! grep -q 'cache  cache.minimal.dev' <<<"$ebr_policy"; then
+    echo "::error::the box's policy does not show the baseline set beside its rules (the registry github.com and the cache cache.minimal.dev)"
+    ebr_fail
+  fi
+  if [ ! -S "$ebr_gate_sock" ]; then
+    echo "::error::the egress gate's socket is not at $ebr_gate_sock — the VM host daemon did not stand the gate up"
+    ebr_fail
+  fi
+
+  # ---- the RPC leg: a vsock connect from inside the box (NET-139) ---------
+  for ebr_cid in 1 3; do
+    EBR_EXPECTED="the box's socket(AF_VSOCK) refused with 'Address family not supported', or the guest daemon's line 'refused an RPC connection from a vsock peer' naming peer_cid=$ebr_cid in the boot log; never an SSH banner"
+    # Count this CID's refusal lines before the attempt, so the attempt's
+    # own line is the new one the wait below looks for.
+    ebr_prior="$(ebr_vsock_refusals "$ebr_cid" | wc -l)"
+    # shellcheck disable=SC2016 # `$?` must reach the box's shell unexpanded.
+    ebr_out="$(mnl session exec "$ebr_sid" \
+      "/usr/bin/socat -T 3 -u VSOCK-CONNECT:$ebr_cid:2222 - 2>&1; echo socat-exit=\$?" \
+      2>"$WORK/ebr-vsock-$ebr_cid.err")" || {
+      echo "::error::the vsock attempt toward CID $ebr_cid could not run inside the box"
+      cat "$WORK/ebr-vsock-$ebr_cid.err" 2>/dev/null || true
+      ebr_fail
+    }
+    ebr_out="$(printf '%s\n' "$ebr_out" | tr -d '\r')"
+    echo "attempt: vsock connect from the box to CID $ebr_cid port 2222:"
+    printf '%s\n' "$ebr_out" | sed 's/^/  /'
+    if grep -q 'SSH-' <<<"$ebr_out"; then
+      echo "::error::the box read the RPC listener's SSH banner over vsock CID $ebr_cid — a box reached the guest daemon's RPC listener"
+      ebr_fail
+    fi
+    if grep -qi 'unknown device\|unknown address\|wrong number of parameters' <<<"$ebr_out"; then
+      echo "::error::the box's socat cannot make a vsock attempt, so the RPC leg was never tried"
+      ebr_fail
+    fi
+    # Only socat's own socket(AF_VSOCK) error (AF_VSOCK is 40) with a
+    # non-zero exit counts as the in-box refusal. Any other failure that
+    # prints the same errno text falls through to the boot-log check.
+    ebr_rc="$(printf '%s\n' "$ebr_out" | sed -n 's/^socat-exit=//p' | tail -n1)"
+    if [ -n "$ebr_rc" ] && [ "$ebr_rc" != 0 ] \
+      && grep -F 'socket(40,' <<<"$ebr_out" | grep -q 'Address family not supported'; then
+      ebr_rows="$ebr_rows
+attempt=vsock CID $ebr_cid port 2222 refusal=socket(AF_VSOCK) refused inside the box (EAFNOSUPPORT, socat exit $ebr_rc) record=none on the host: no connection left the box, so the guest daemon logged nothing"
+      continue
+    fi
+    # The socket opened. The guest daemon must write a new refusal line
+    # naming this CID: the count before the attempt is the baseline, so
+    # neither an earlier attempt nor another CID's line stands in for it.
+    ebr_line=""
+    for _ in $(seq 1 20); do
+      if [ "$(ebr_vsock_refusals "$ebr_cid" | wc -l)" -gt "$ebr_prior" ]; then
+        ebr_line="$(ebr_vsock_refusals "$ebr_cid" | tail -n1)"
+        break
+      fi
+      sleep 0.5
+    done
+    if [ -z "$ebr_line" ]; then
+      echo "::error::a vsock socket opened inside the box toward CID $ebr_cid, and the boot log carries no new refusal line from the guest daemon naming peer_cid=$ebr_cid ($ebr_prior such line(s) before the attempt)"
+      ebr_fail
+    fi
+    ebr_rows="$ebr_rows
+attempt=vsock CID $ebr_cid port 2222 refusal=refused at the guest daemon's accept record=boot log: $ebr_line"
+  done
+  echo "RPC leg OK: no box reached the guest daemon's RPC listener over vsock"
+
+  # ---- the build leg: a deny-all box's package build (NET-155) -------------
+  # The gate writes one line per source address per rule in a 60 s window,
+  # whatever the destination. An earlier drop from the node's address (the
+  # activate, or an earlier case) can hold that window open and silence this
+  # leg's line. Wait it out, as the escape leg does.
+  echo "waiting 61 s for the gate's per-source line window for $ebr_node to close"
+  sleep 61
+  EBR_EXPECTED="'min add --session $ebr_pkg' fails inside the box, and the gate writes an egress-node-plane-unpinned line with source $ebr_node and destination $ebr_build_dst"
+  ebr_prior="$(ebr_gate_lines "$ebr_node" egress-node-plane-unpinned "$ebr_build_dst" | wc -l)"
+  # shellcheck disable=SC2016 # `$?` must reach the box's shell unexpanded.
+  ebr_out="$(mnl session exec "$ebr_sid" \
+    "timeout 300 min add --session $ebr_pkg 2>&1; echo min-add-exit=\$?" \
+    2>"$WORK/ebr-build.err")" || {
+    echo "::error::the in-box 'min add --session $ebr_pkg' could not run"
+    cat "$WORK/ebr-build.err" 2>/dev/null || true
+    ebr_fail
+  }
+  ebr_out="$(printf '%s\n' "$ebr_out" | tr -d '\r')"
+  echo "attempt: 'min add --session $ebr_pkg' inside the deny-all box (web source https://$ebr_build_dst/):"
+  printf '%s\n' "$ebr_out" | tail -n 20 | sed 's/^/  /'
+  ebr_rc="$(printf '%s\n' "$ebr_out" | sed -n 's/^min-add-exit=//p' | tail -n1)"
+  if [ -z "$ebr_rc" ] || [ "$ebr_rc" = 0 ]; then
+    echo "::error::the deny-all box's build of $ebr_pkg did not fail (exit '$ebr_rc'): its web source at $ebr_build_dst is outside the box's rules and the baseline set"
+    ebr_fail
+  fi
+  if [ "$ebr_rc" = 124 ]; then
+    echo "::error::the deny-all box's build of $ebr_pkg hung until 'timeout 300' stopped it (exit 124): a hang is a fault, not a refusal"
+    ebr_fail
+  fi
+  if grep -qi "unknown package\|no package named\|not found in" <<<"$ebr_out" \
+    && ! grep -q "$ebr_build_dst" <<<"$ebr_out"; then
+    echo "::error::the build never started: the box did not resolve the project's own package $ebr_pkg"
+    ebr_fail
+  fi
+  ebr_line="$(ebr_wait_new_gate_line "$ebr_node" egress-node-plane-unpinned \
+    "$ebr_build_dst" "$ebr_prior")" || {
+    echo "::error::the build failed, but the gate wrote no egress-node-plane-unpinned line for $ebr_node toward $ebr_build_dst ($ebr_prior such line(s) before the leg)"
+    ebr_fail
+  }
+  ebr_rows="$ebr_rows
+attempt=package build of $ebr_pkg, web source $ebr_build_dst:443 refusal=build failed (exit $ebr_rc) record=gate: $ebr_line"
+  echo "build leg OK: the deny-all box's build reached nothing outside its rules and the baseline set"
+
+  # ---- the escape leg: root in the VM wearing the node's address (NET-085) --
+  # Two probes, each after a 61 s wait: the build leg's line, and the first
+  # probe's line, each open the gate's 60 s window for this source and rule.
+  #
+  # Probe 1 aims at the runner's own address, where the host listener sits.
+  # That address is also an infrastructure destination, and the gate checks
+  # the infrastructure deny set before the node-plane pin. So its drop line
+  # can carry either rule. The leg accepts either, and asserts the source,
+  # the destination and no marker at the listener.
+  #
+  # Probe 2 proves the node-plane pin itself: it aims at a TEST-NET-2
+  # address that is no infrastructure destination and no baseline pin, so
+  # only the pin can drop it, under egress-node-plane-unpinned.
+  echo "waiting 61 s for the gate's per-source line window for $ebr_node to close"
+  sleep 61
+  EBR_EXPECTED="the spoofer's flow from $ebr_node toward $ebr_host refused, no marker at the listener, and an egress-infrastructure-destination or egress-node-plane-unpinned line with source $ebr_node and destination $ebr_host"
+  ebr_prior_infra="$(ebr_gate_lines "$ebr_node" egress-infrastructure-destination "$ebr_host" | wc -l)"
+  ebr_prior_pin="$(ebr_gate_lines "$ebr_node" egress-node-plane-unpinned "$ebr_host" | wc -l)"
+  if ! ebr_out="$(python3 "$WORK/ebr-spoofer.py" --gate "$ebr_gate_sock" \
+      --src "$ebr_node" --dst "$ebr_host" --port "$EBR_LISTEN_PORT" \
+      --marker ebr-spoof-node-arrived --deadline 5 --claim no \
+      2>"$WORK/ebr-spoof.err")"; then
+    echo "::error::the spoofer could not speak to the gate at $ebr_gate_sock"
+    cat "$WORK/ebr-spoof.err" 2>/dev/null || true
+    ebr_fail
+  fi
+  echo "attempt: a frame from the node's address $ebr_node toward $ebr_host:$EBR_LISTEN_PORT: $ebr_out"
+  case "$ebr_out" in
+    outcome=refused*) : ;;
+    *)
+      echo "::error::a flow wearing the node's address completed toward $ebr_host, which no baseline entry pins"
+      ebr_fail
+      ;;
+  esac
+  if grep -q -- ebr-spoof-node-arrived "$ebr_listener_log"; then
+    echo "::error::the flow wearing the node's address was refused, but its marker reached the host listener"
+    ebr_fail
+  fi
+  ebr_line=""
+  for _ in $(seq 1 40); do
+    if [ "$(ebr_gate_lines "$ebr_node" egress-infrastructure-destination "$ebr_host" | wc -l)" -gt "$ebr_prior_infra" ]; then
+      ebr_line="$(ebr_gate_lines "$ebr_node" egress-infrastructure-destination "$ebr_host" | tail -n1)"
+      break
+    fi
+    if [ "$(ebr_gate_lines "$ebr_node" egress-node-plane-unpinned "$ebr_host" | wc -l)" -gt "$ebr_prior_pin" ]; then
+      ebr_line="$(ebr_gate_lines "$ebr_node" egress-node-plane-unpinned "$ebr_host" | tail -n1)"
+      break
+    fi
+    sleep 0.5
+  done
+  if [ -z "$ebr_line" ]; then
+    echo "::error::the gate wrote no egress-infrastructure-destination or egress-node-plane-unpinned line for $ebr_node toward $ebr_host ($ebr_prior_infra and $ebr_prior_pin such line(s) before the probe)"
+    ebr_fail
+  fi
+  ebr_rows="$ebr_rows
+attempt=root in the VM, source $ebr_node (the node's address) toward $ebr_host:$EBR_LISTEN_PORT refusal=no SYN-ACK, no marker record=gate: $ebr_line"
+
+  echo "waiting 61 s for the gate's per-source line window for $ebr_node to close"
+  sleep 61
+  EBR_EXPECTED="the spoofer's flow from $ebr_node toward $ebr_build_dst:443 refused, and an egress-node-plane-unpinned line with source $ebr_node and destination $ebr_build_dst"
+  ebr_prior="$(ebr_gate_lines "$ebr_node" egress-node-plane-unpinned "$ebr_build_dst" | wc -l)"
+  if ! ebr_out="$(python3 "$WORK/ebr-spoofer.py" --gate "$ebr_gate_sock" \
+      --src "$ebr_node" --dst "$ebr_build_dst" --port 443 \
+      --marker ebr-spoof-node-unpinned --deadline 5 --claim no \
+      2>"$WORK/ebr-spoof-pin.err")"; then
+    echo "::error::the spoofer could not speak to the gate at $ebr_gate_sock"
+    cat "$WORK/ebr-spoof-pin.err" 2>/dev/null || true
+    ebr_fail
+  fi
+  echo "attempt: a frame from the node's address $ebr_node toward $ebr_build_dst:443: $ebr_out"
+  case "$ebr_out" in
+    outcome=refused*) : ;;
+    *)
+      echo "::error::a flow wearing the node's address completed toward $ebr_build_dst, which no baseline entry pins"
+      ebr_fail
+      ;;
+  esac
+  ebr_line="$(ebr_wait_new_gate_line "$ebr_node" egress-node-plane-unpinned \
+    "$ebr_build_dst" "$ebr_prior")" || {
+    echo "::error::the gate wrote no egress-node-plane-unpinned line for $ebr_node toward $ebr_build_dst ($ebr_prior such line(s) before the probe)"
+    ebr_fail
+  }
+  ebr_rows="$ebr_rows
+attempt=root in the VM, source $ebr_node (the node's address) toward $ebr_build_dst:443 refusal=no SYN-ACK record=gate: $ebr_line"
+  echo "escape leg OK: the node's address reached nothing outside the baseline set"
+
+  echo "each leg's attempt, its refusal and the host-side record:"
+  printf '%s\n' "$ebr_rows" | sed '/^$/d; s/^/  /'
+  echo "--- the listener's record ---"
+  sed 's/^/  /' "$ebr_listener_log"
+
+  mnl session destroy --force "$ebr_sid" >"$WORK/ebr-destroy.out" 2>"$WORK/ebr-destroy.err" \
+    || { echo "::error::destroying the deny-all box failed"; cat "$WORK/ebr-destroy.err" 2>/dev/null || true; ebr_fail; }
+  kill "$EBR_LISTENER_PID" 2>/dev/null || true
+  EBR_LISTENER_PID=""
+  rm -rf "$EBR_SEED_DIR"
+  EBR_SEED_DIR=""
+  echo "escapes and builds stay inside the box's rules OK (no box reached the RPC listener over vsock, and a vsock socket refused inside the box has no host-side record; the deny-all box's build and two frames wearing the node's address each reached nothing outside the box's rules and the baseline set, each with its gate record). NET-085 NET-139 NET-155"
   echo "::endgroup::"
 }
 
@@ -15000,7 +21556,8 @@ proof_min_internal_names_through_proxy() {
   PROXY_OWN_NAME="e2e-own-proxy"     # the own-address box, on switch lanes
   PROXY_BOX_PORT=18080               # the in-box responders' listen port
   PROXY_OWN_EXTERNAL_PORT=18082      # ... published externally by --ingress
-  PROXY_HOST_PORT=18081              # the host-loopback listener (NET-003/004)
+  PROXY_HOST_PORT="$E2E_HOST_EXPOSURE_PORT" # the host-loopback listener (NET-003/004)
+  PROXY_UNEXPOSED_PORT=18089         # a host-loopback listener outside the exposure
   PROXY_DEAD_PORT=19090              # nothing listens: an upstream-refused 502
   PROXY_CLOSED_PORT=19091            # not in the own box's ingress map: a 403
   PROXY_HOST_ALIAS="100.64.255.254"  # the deprecated literal (NET-004)
@@ -15076,7 +21633,7 @@ proof_min_internal_names_through_proxy() {
   for proxy_bind_try in 1 2 3 4 5; do
     proxy_ls_out="$(mnl ls 2>&1)"
     case "$proxy_ls_out" in
-      *"session hostnames will not route"*) proxy_bind_taken=1 ;;
+      *"warning: the hostname proxy is not serving"*) proxy_bind_taken=1 ;;
       *) proxy_bind_taken=0; break ;;
     esac
     [ "$proxy_bind_try" = 5 ] || sleep 3
@@ -15102,7 +21659,7 @@ proof_min_internal_names_through_proxy() {
   proxy_start_host_listener
 
   # socat carries the in-box responder below. It is a launcher baseline
-  # package (crates/minimald/src/session_host.rs BASELINE_PACKAGES), so every
+  # package (crates/minimald/src/box_runtime.rs BASELINE_PACKAGES), so every
   # box ships it — at /usr/bin: packages install with --prefix=/usr, and the
   # generic rootfs has no /bin, so the case says the absolute path, the
   # daemon's own convention for in-box argv, rather than lean on PATH.
@@ -15215,6 +21772,62 @@ proof_min_internal_names_through_proxy() {
   # ---- NET-003: host.min.internal from a host-address box -------------------
   proxy_assert_host_by_name "$proxy_sid" "NET-003" host
 
+  # ---- the host exposure is the only opening (design §7.1) ----------------
+  # A VM host's gate opens host.min.internal at the listed exposure alone
+  # (MINVMD_HOST_EXPOSURE_PORTS, exported at the top), so the same box, the
+  # same alias, at a port outside the list must not reach the host, even
+  # with a host-loopback listener answering there. A native host-address box
+  # shares the host's namespace, with no alias gate to assert.
+  if [ -n "$E2E_VM" ]; then
+    ( cd "$PROXY_HOST_DIR" && exec python3 -m http.server "$PROXY_UNEXPOSED_PORT" --bind 127.0.0.1 ) \
+      >/dev/null 2>"$WORK/proxy-unexposed-srv.err" &
+    PROXY_UNEXPOSED_SRV_PID=$!
+    proxy_unexposed_up=0
+    for _ in $(seq 1 40); do
+      if [ "$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' \
+        "http://127.0.0.1:$PROXY_UNEXPOSED_PORT/marker" 2>/dev/null || true)" = "200" ]; then
+        proxy_unexposed_up=1
+        break
+      fi
+      sleep 0.25
+    done
+    if [ "$proxy_unexposed_up" -ne 1 ]; then
+      echo "::error::the unexposed host-loopback http.server never answered on 127.0.0.1:$PROXY_UNEXPOSED_PORT"
+      cat "$WORK/proxy-unexposed-srv.err" 2>/dev/null || true
+      fail
+    fi
+    # One exec runs both fetches, so a broken exec, a missing curl or a
+    # failed lookup shows on the exposed fetch and cannot pass as a refusal.
+    # The exposed port must answer with the marker. The unexposed port must
+    # fail as a refused connection (curl exit 7) or a timeout (exit 28).
+    proxy_unexposed_out="$(mnl session exec "$proxy_sid" \
+      "curl -sS --max-time 8 http://host.min.internal:$PROXY_HOST_PORT/marker; echo \"exposed_rc=\$?\"; curl -sS --max-time 8 -o /dev/null http://host.min.internal:$PROXY_UNEXPOSED_PORT/marker; echo \"closed_rc=\$?\"" \
+      2>"$WORK/proxy-unexposed.err" || true)"
+    printf '%s\n' "$proxy_unexposed_out" >"$WORK/proxy-unexposed.out"
+    proxy_exposed_rc="$(sed -n 's/^.*exposed_rc=\([0-9]*\)$/\1/p' "$WORK/proxy-unexposed.out" | head -n1)"
+    proxy_unexposed_rc="$(sed -n 's/^closed_rc=\([0-9]*\)$/\1/p' "$WORK/proxy-unexposed.out" | tail -n1)"
+    if [ "$proxy_exposed_rc" != "0" ] || [[ "$proxy_unexposed_out" != *"$PROXY_HOST_MARKER"* ]]; then
+      echo "::error::the host-address box did not fetch the marker from host.min.internal at the exposed port $PROXY_HOST_PORT (curl exit '${proxy_exposed_rc:-none}'), so the unexposed-port check proves nothing"
+      echo "--- exec stdout ---"; cat "$WORK/proxy-unexposed.out" 2>/dev/null || true
+      echo "--- exec stderr ---"; cat "$WORK/proxy-unexposed.err" 2>/dev/null || true
+      fail
+    fi
+    case "$proxy_unexposed_rc" in
+      7 | 28) ;;
+      0)
+        echo "::error::the host-address box reached the host through host.min.internal at port $PROXY_UNEXPOSED_PORT, outside MINVMD_HOST_EXPOSURE_PORTS=$MINVMD_HOST_EXPOSURE_PORTS"
+        fail
+        ;;
+      *)
+        echo "::error::the fetch from host.min.internal at port $PROXY_UNEXPOSED_PORT failed with curl exit '${proxy_unexposed_rc:-none}', not a refused connection (7) or a timeout (28)"
+        echo "--- exec stdout ---"; cat "$WORK/proxy-unexposed.out" 2>/dev/null || true
+        echo "--- exec stderr ---"; cat "$WORK/proxy-unexposed.err" 2>/dev/null || true
+        fail
+        ;;
+    esac
+    echo "host exposure: host.min.internal:$PROXY_HOST_PORT reached and host.min.internal:$PROXY_UNEXPOSED_PORT refused from the host-address box (curl exit $proxy_unexposed_rc: $(tail -n1 "$WORK/proxy-unexposed.err" 2>/dev/null)) OK"
+  fi
+
   # ---- NET-001's own-address half: a VM host's lease route -----------------
   # Gated like the own-IP proof: MINVMD_GVPROXY_BIN is the one signal that a
   # switch exists. On every lane that sets it the daemon is in a VM, so its
@@ -15224,10 +21837,14 @@ proof_min_internal_names_through_proxy() {
     PROXY_OWN_SEED_DIR="$(hook_mktemp /tmp/mnlpo.XXXXXX)"
     hook_seed_preamble > "$PROXY_OWN_SEED_DIR/minimal.toml"
     mkdir "$PROXY_OWN_SEED_DIR/.git"
+    # Rules open to every address: with no egress section the box would get
+    # the deny-all default (NET-074), which drops the NET-004 connect below
+    # on its own, so the leg would pass whatever the infrastructure deny set
+    # did. With 0.0.0.0/0 that set is the only thing left to drop it.
     PROXY_OWN_SID="$(cd "$PROXY_OWN_SEED_DIR" && mnl session activate . --no-prompt \
-      --name "$PROXY_OWN_NAME" --network own_ip \
+      --name "$PROXY_OWN_NAME" --network own_ip --allow-subnets 0.0.0.0/0 \
       --ingress "$PROXY_OWN_EXTERNAL_PORT:$PROXY_BOX_PORT" 2>"$WORK/proxy-own.err")" || {
-      echo "::error::'min session activate --network own_ip --ingress ...' failed"
+      echo "::error::'min session activate --network own_ip --allow-subnets 0.0.0.0/0 --ingress ...' failed"
       echo "--- stderr ---"; cat "$WORK/proxy-own.err" 2>/dev/null || true
       fail
     }
@@ -15277,8 +21894,9 @@ proof_min_internal_names_through_proxy() {
     # NET-003's own-address half, narrowed to resolution: the box resolves
     # host.min.internal through the switch zone, to the host alias. Box→host
     # reach over that alias is default-deny except configured host exposures
-    # (design §7.1), and this box's switch has none, so the reach is not
-    # asserted here. TODO(host-exposure): the positive reach arm comes back
+    # (design §7.1), and an own-address box is refused even at the one
+    # exposure this run lists, so the reach is not asserted here.
+    # TODO(host-exposure): the positive reach arm comes back
     # with a configured exposure (gominimal/inbox#867).
     proxy_own_resolved="$(mnl session exec "$PROXY_OWN_SID" \
       "getent ahostsv4 host.min.internal" 2>"$WORK/proxy-own-resolve.err" \
@@ -15292,7 +21910,11 @@ proof_min_internal_names_through_proxy() {
 
     # NET-004: the deprecated literal itself. Box→host reach over the alias
     # is default-deny except configured host exposures (design §7.1), and
-    # none is configured, so the box's own relay drops the connect: no
+    # an own-address box gets none — not even PROXY_HOST_PORT, the one this
+    # run lists for host-address boxes — so the box's own relay drops the
+    # connect — though
+    # its egress rules admit every address (0.0.0.0/0 above), so the drop
+    # is the infrastructure deny set's and not the deny-all default's: no
     # answer and no reset until the timeout, and the relay names the drop
     # under the infrastructure deny set's rule. The deprecation notice is
     # not asserted: the relay emits it only for a frame its verdict admits,
@@ -15312,7 +21934,7 @@ proof_min_internal_names_through_proxy() {
     mnl session exec "$PROXY_OWN_SID" \
       "/usr/bin/socat /dev/null TCP:$PROXY_HOST_ALIAS:$PROXY_HOST_PORT,connect-timeout=10" \
       >/dev/null 2>"$WORK/proxy-alias.err" && {
-      echo "::error::NET-004: the own-address box completed a connection to the host alias $PROXY_HOST_ALIAS:$PROXY_HOST_PORT with no host exposure configured"
+      echo "::error::NET-004: the own-address box completed a connection to the host alias $PROXY_HOST_ALIAS:$PROXY_HOST_PORT, which an own-address box must never reach"
       fail
     }
     proxy_alias_elapsed_ms=$(( $(now_ms) - proxy_alias_start_ms ))
@@ -15407,10 +22029,10 @@ proof_own_ip_deny_all_box_answers_published_port() {
   # The box opens /dev/net/tun for its in-namespace tap; without the device
   # its session program cannot spawn, and a host that is itself a sandbox
   # cannot mknod one either. Skip rather than fail: the failure would say
-  # nothing about this branch, and the native CI lane — where the tap root
-  # integration harness already builds a tap — runs the case for real.
-  if [ ! -c /dev/net/tun ]; then
-    echo "deny-all answer proof SKIPPED (no /dev/net/tun on this host: an own-IP box cannot open its in-namespace tap; runs for real on a host that has the device)"
+  # nothing about this branch. Only a native box opens its tap on this host;
+  # a VM lane opens it inside the guest, so the host check gates native runs.
+  if [ -z "${E2E_VM:-}" ] && [ ! -c /dev/net/tun ]; then
+    echo "deny-all answer proof SKIPPED (no /dev/net/tun on this host: a native own-IP box cannot open its in-namespace tap; a VM lane opens it inside the guest and runs this case)"
     echo "::endgroup::"
     return 0
   fi
@@ -15493,7 +22115,7 @@ proof_own_ip_deny_all_box_answers_published_port() {
   for da_bind_try in 1 2 3 4 5; do
     da_ls_out="$(mnl ls 2>&1)"
     case "$da_ls_out" in
-      *"session hostnames will not route"*) da_bind_taken=1 ;;
+      *"warning: the hostname proxy is not serving"*) da_bind_taken=1 ;;
       *) da_bind_taken=0; break ;;
     esac
     [ "$da_bind_try" = 5 ] || sleep 3
@@ -15568,18 +22190,17 @@ proof_own_ip_deny_all_box_answers_published_port() {
   # On a Linux VM lane the record is the guest's, so the listener is read
   # from the host's own socket table: /proc/net/tcp spells an IPv4 socket's
   # local address as the address' four octets in little-endian order with the
-  # port in big-endian hex — 127.64.0.14:18086 reads `0E00407F:46A6` — so
-  # the match pins the port, the LISTEN state, and the loopback half of
-  # either spelling the publish surface can bind a box's port at: `127.64.0.x`,
-  # the reserved local range a granted publish answers on (NET-010), or
-  # `127.0.0.1`, the interim a publish stands at where the surface's range
-  # verdict read the range absent (NET-123). The KVM lane lands absent: the
-  # range walk rides the same shuttle the publishes do, and the host gate
-  # refuses every one of its probe rounds — the probe's `remote` is a
-  # placeholder, so no registered row holds the address its publish is keyed
-  # at — so the interim is that lane's own answer, not a broken publish.
-  # The reserved-range arm is tried first and stays for a lane whose verdict
-  # lands present, and the marker the dial below demands keeps either
+  # port in big-endian hex — 127.0.64.14:18086 reads `0E40007F:46A6`, the
+  # third octet in characters 3-4 and the second in 5-6 — so the match pins
+  # the port, the LISTEN state, and the loopback half of either spelling the
+  # publish surface can bind a box's port at: `127.0.64.x`, the reserved
+  # local range a granted publish answers on (NET-010), or `127.0.0.1`, the
+  # interim a publish stands at where the surface's range verdict read the
+  # range absent (NET-123). The KVM lane lands present: the range walk rides
+  # the same shuttle the publishes do, and the host gate admits its probe
+  # rounds (#2748), so the reserved-range arm is that lane's answer. The
+  # interim arm stays for a lane whose verdict lands absent, and the marker
+  # the dial below demands keeps either
   # spelling honest: a stray host listener at the same port does not carry
   # this box's answer. A macOS VM host has neither a readable record nor
   # /proc, so that leg names itself skipped there.
@@ -15608,7 +22229,7 @@ proof_own_ip_deny_all_box_answers_published_port() {
     da_row=""
     for _ in $(seq 1 40); do
       da_row="$(awk -v want="$(printf '%04X' "$DA_EXT")" \
-        'substr($2, 7, 2) == "7F" && substr($2, 5, 2) == "40" && substr($2, 3, 2) == "00" \
+        'substr($2, 7, 2) == "7F" && substr($2, 5, 2) == "00" && substr($2, 3, 2) == "40" \
          && $4 == "0A" && index($2, ":" want) == 9 { print $2 }' /proc/net/tcp 2>/dev/null | tail -n1)"
       if [ -z "$da_row" ]; then
         da_row="$(awk -v want="$(printf '%04X' "$DA_EXT")" \
@@ -15716,10 +22337,14 @@ proof_own_ip_deny_all_box_answers_published_port() {
     DA_SIBLING_SEED_DIR="$(hook_mktemp /tmp/mnlds.XXXXXX)"
     hook_seed_preamble > "$DA_SIBLING_SEED_DIR/minimal.toml"
     mkdir "$DA_SIBLING_SEED_DIR/.git"
+    # The sibling declares the fabric: leg 3 has it dial the deny-all box's
+    # lease, and with no egress section it would get the deny-all default
+    # (NET-074) and drop its own dial.
     da_sibling_sid="$(cd "$DA_SIBLING_SEED_DIR" && mnl session activate . --no-prompt \
       --name "$DA_SIBLING_NAME" --network own_ip \
+      --allow-subnets 100.64.0.0/10 --allow-protocols tcp \
       --ingress "$DA_SIB_EXT:$DA_SIB_INT" 2>"$WORK/da-sibling-activate.err")" || {
-      echo "::error::'min session activate --network own_ip --ingress ...' for the sibling box failed"
+      echo "::error::'min session activate --network own_ip --allow-subnets ... --ingress ...' for the sibling box failed"
       echo "--- stderr ---"; cat "$WORK/da-sibling-activate.err" 2>/dev/null || true
       fail
     }
@@ -15876,6 +22501,7 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
   PO_OUTLIVE_CLIENT_NAME="e2e-port-out-client" # the detach half's outside client, on a VM lane
   PO_EXT=18096                         # the declared — published — port
   PO_UNDECLARED=18097                  # a listen no declaration names
+  PO_HOLD=18099                        # a second declared port, whose connection is held across the destroy
   PO_DETACH_PORT=18098                 # the detach box's server, on the shared loopback
   PO_MARKER="PO_PUBLISH_OK"            # what the port half's box answers with
   PO_OUTLIVE_MARKER="PO_OUTLIVE_OK"    # what the detach box answers with
@@ -15906,8 +22532,8 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       echo "port-publish half SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch)"
       return 0
     fi
-    if [ ! -c /dev/net/tun ]; then
-      echo "port-publish half SKIPPED (no /dev/net/tun on this host: an own-IP box cannot open its in-namespace tap; runs for real on a host that has the device)"
+    if [ -z "${E2E_VM:-}" ] && [ ! -c /dev/net/tun ]; then
+      echo "port-publish half SKIPPED (no /dev/net/tun on this host: a native own-IP box cannot open its in-namespace tap; a VM lane opens it inside the guest and runs this case)"
       return 0
     fi
 
@@ -15918,19 +22544,35 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       echo "::error::127.0.0.1:$PO_EXT already answers on this host; the port-publish half needs it free"
       fail
     fi
+    if curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:$PO_HOLD/" 2>/dev/null; then
+      echo "::error::127.0.0.1:$PO_HOLD already answers on this host; the port-publish half needs it free"
+      fail
+    fi
 
     # The watcher's records and the expose record both live at info under
     # modules the lane's `warn` filter drops, so a readable-log lane restarts
     # the daemon with them at info — the same restart the deny-all answer
     # proof runs — and puts the lane's filter back afterwards. A VM lane
-    # keeps its records (they are the guest's) and its filter. The run half
-    # below reads its own record off this same daemon but pins its own module
-    # (it restarts for it): this half's pin is skipped along with this half
-    # on a lane with no switch, so nothing below may lean on it.
+    # keeps its guest's minimald records, but its host gate (minvmd) writes
+    # the records this half ends on too — the box's registration, and the
+    # egress gate's unbind and terminate records for the revocation leg
+    # below — and the daemon an earlier case left up was spawned under the
+    # quiet filter, so it drops them (the host answerer case's mechanism).
+    # Same recipe as there: take the daemon down — sessions survive it, the
+    # restart proof pins that — and let the ONE call that autospawns carry
+    # minvmd at info, command-local, before this half's box registers into
+    # the fresh daemon.
     if hook_log_readable; then
       mnl stop >/dev/null 2>&1 || true # a standalone run has no daemon yet
       PO_SAVED_RUST_LOG="${RUST_LOG:-}"
       export RUST_LOG="warn,minimald::exec=info,minimald::net::gvproxy_network=info,minimald::net::listeners=info"
+    elif [ -n "${E2E_VM:-}" ]; then
+      mnl stop --force >/dev/null 2>&1 || true # a standalone run has no daemon yet
+      PO_SAVED_RUST_LOG="${RUST_LOG:-}" # the filter is command-local; restore exactly
+      if ! RUST_LOG="warn,minvmd=info" mnl ls >/dev/null 2>&1; then
+        echo "::error::'min ls' could not bring this VM lane's daemon up (this half reads the egress gate's revocation records off it)"
+        fail
+      fi
     fi
     po_restore_log() {
       if [ -n "$PO_SAVED_RUST_LOG" ]; then export RUST_LOG="$PO_SAVED_RUST_LOG"; else unset RUST_LOG; fi
@@ -15941,12 +22583,45 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     mkdir "$PO_OWNIP_SEED_DIR/.git"
     po_sid="$(cd "$PO_OWNIP_SEED_DIR" && mnl session activate . --no-prompt \
       --name "$PO_BOX_NAME" --network own_ip \
-      --ingress "$PO_EXT:$PO_EXT" 2>"$WORK/po-activate.err")" || {
-      echo "::error::'min session activate --network own_ip --ingress $PO_EXT:$PO_EXT' failed"
+      --ingress "$PO_EXT:$PO_EXT" --ingress "$PO_HOLD:$PO_HOLD" 2>"$WORK/po-activate.err")" || {
+      echo "::error::'min session activate --network own_ip --ingress $PO_EXT:$PO_EXT --ingress $PO_HOLD:$PO_HOLD' failed"
       echo "--- stderr ---"; cat "$WORK/po-activate.err" 2>/dev/null || true
       fail
     }
     po_sid="$(printf '%s\n' "$po_sid" | tail -n1 | tr -d '\r')"
+
+    # The box's switch address, on a VM lane: the egress gate's revocation
+    # records name the box only by it, so the leg below cannot ask for its
+    # records without it. It comes from the registration record — the
+    # daemon's own word for the address pair it allocated — not from the
+    # host-side listener address the address legs read (that is the
+    # published loopback, a different address). Read the way the box
+    # registration case reads its own: polled, because the record lands
+    # after activate returns.
+    po_switch_addr=""
+    if [ -n "${E2E_VM:-}" ]; then
+      po_reg=""
+      for _ in $(seq 1 40); do
+        po_reg="$(minvmd_log_lines \
+          'registered box with the VM host daemon; addresses allocated' \
+          | grep -F -- "\"box\":\"$PO_BOX_NAME\"" | tail -n1)"
+        [ -n "$po_reg" ] && break
+        sleep 0.25
+      done
+      if [ -z "$po_reg" ]; then
+        echo "::error::the VM host daemon's log carries no registration record for box '$PO_BOX_NAME' after activate — the revocation leg below has no switch address to ask its records by"
+        echo "--- minvmd log (tail) ---"
+        find "$XDG_STATE_HOME/minimal/logs" -name 'minvmd.log.*' -type f \
+          -exec tail -n 40 {} + 2>/dev/null || true
+        fail
+      fi
+      po_switch_addr="$(printf '%s\n' "$po_reg" \
+        | sed -n 's/.*"switch_address":"\([0-9.]*\)".*/\1/p')"
+      if [ -z "$po_switch_addr" ]; then
+        echo "::error::the VM host daemon's registration record for box '$PO_BOX_NAME' does not name the switch address it allocated: $po_reg"
+        fail
+      fi
+    fi
 
     # Capability gates, the two the deny-all answer proof runs: this half
     # needs a session sandbox AND this run's daemon owning the proxy, and a
@@ -15973,7 +22648,7 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     for po_try in 1 2 3 4 5; do
       po_ls="$(mnl ls 2>&1)"
       case "$po_ls" in
-        *"session hostnames will not route"*) po_bind_taken=1 ;;
+        *"warning: the hostname proxy is not serving"*) po_bind_taken=1 ;;
         *) po_bind_taken=0; break ;;
       esac
       [ "$po_try" = 5 ] || sleep 3
@@ -16019,7 +22694,7 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       po_row=""
       for _ in $(seq 1 40); do
         po_row="$(awk -v want="$(printf '%04X' "$PO_EXT")" \
-          'substr($2, 7, 2) == "7F" && substr($2, 5, 2) == "40" && substr($2, 3, 2) == "00" \
+          'substr($2, 7, 2) == "7F" && substr($2, 5, 2) == "00" && substr($2, 3, 2) == "40" \
            && $4 == "0A" && index($2, ":" want) == 9 { print $2 }' /proc/net/tcp 2>/dev/null | tail -n1)"
         if [ -z "$po_row" ]; then
           po_row="$(awk -v want="$(printf '%04X' "$PO_EXT")" \
@@ -16286,28 +22961,194 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     fi
     echo "the box outlived its detached client and still serves by name (NET-015)"
 
+    # Ingress revocation also terminates the connections a forward already
+    # carries (design §7.1), so one is held open across the destroy: the
+    # second declared port's in-box server accepts, marks the accept, and
+    # then says nothing, so the host's connection stays established until
+    # something ends it.
+    po_hold_pid=""
+    if [ -n "$po_addr" ]; then
+      mnl session exec "$po_sid" \
+        "nohup /usr/bin/socat TCP-LISTEN:$PO_HOLD,reuseaddr,fork SYSTEM:\"touch /home/po-held; sleep 600\" >/dev/null 2>&1 &" \
+        >/dev/null 2>>"$WORK/po-responder.err" \
+        || { echo "::error::could not start the in-box holder on the second declared port"; cat "$WORK/po-responder.err" 2>/dev/null || true; fail; }
+      # Up when a direct connect inside the box is accepted and held: curl
+      # times out (exit 28) instead of being refused (exit 7).
+      po_hold_listening=""
+      for _ in $(seq 1 40); do
+        if mnl session exec "$po_sid" \
+          "curl -sS --max-time 1 -o /dev/null http://127.0.0.1:$PO_HOLD/; test \$? -eq 28" \
+          >/dev/null 2>&1; then
+          po_hold_listening=1
+          break
+        fi
+        sleep 0.25
+      done
+      if [ -z "$po_hold_listening" ]; then
+        echo "::error::the in-box holder on the second declared port never accepted a direct connect"
+        echo "--- socat exec stderr ---"; cat "$WORK/po-responder.err" 2>/dev/null || true
+        fail
+      fi
+      mnl session exec "$po_sid" 'rm -f /home/po-held' >/dev/null 2>&1 || true
+      curl -sS --max-time 120 -o /dev/null "http://$po_addr:$PO_HOLD/" \
+        >/dev/null 2>"$WORK/po-held.err" &
+      po_hold_pid=$!
+      po_held=""
+      for _ in $(seq 1 40); do
+        if mnl session exec "$po_sid" 'test -e /home/po-held' >/dev/null 2>&1; then
+          po_held=1
+          break
+        fi
+        sleep 0.25
+      done
+      if [ -z "$po_held" ] || ! kill -0 "$po_hold_pid" 2>/dev/null; then
+        kill "$po_hold_pid" 2>/dev/null || true
+        wait "$po_hold_pid" 2>/dev/null || true
+        echo "::error::the host's connection to the second declared port $po_addr:$PO_HOLD was not held open by the box before the destroy (reached the box: ${po_held:-no}; $(head -n1 "$WORK/po-held.err" 2>/dev/null || true))"
+        fail
+      fi
+      echo "held: a host connection to $po_addr:$PO_HOLD is established through its declared forward, and the box holds it open"
+    fi
+
+    # Snapshot the terminate records at this box's switch address BEFORE
+    # the destroy: the log dir carries every earlier case's records too (a
+    # daemon's file outlives it), and address allocation starts over on a
+    # fresh daemon, so an earlier box's records can sit at this box's
+    # address. The leg below requires a record NOT in this snapshot, so a
+    # stale record can never pass it. A set of lines, not a count: each
+    # line carries its own timestamp, so retention pruning a rotated
+    # day-file between here and the check cannot hide a new one. Keyed by
+    # the whole field — `"switch_addr":"<addr>"` — so 10.0.0.1 never
+    # matches a record for 10.0.0.12.
+    po_term_key="\"switch_addr\":\"$po_switch_addr\""
+    po_term_msg="terminated the connections the box's forwarders carried"
+    po_term_before_file="$WORK/po-term-before.log"
+    : >"$po_term_before_file"
+    if [ -n "$po_switch_addr" ]; then
+      minvmd_log_lines "$po_term_msg" | grep -F -- "$po_term_key" \
+        >"$po_term_before_file" || true
+    fi
     mnl session destroy --force "$po_sid" >/dev/null 2>&1 || true
+    po_destroyed_ms=$(now_ms)
 
     # After the box ends, its declared port's published address must refuse a
     # host connect fast: nothing in the box answers, so a forward still bound
-    # there is a bind that outlived its box. Not a hard assertion yet: the
-    # host's egress gate refuses the guest's retraction of a declared port's
-    # forward by design (sessions::core::switch_request, Refusal::Unheld), and
-    # nothing on the host unbinds it at box end, so on main this leg is
-    # expected to find the bind still standing. Carried as a known gap until
-    # the host-side unbind lands (gominimal/inbox#915); flip it to `fail` then.
+    # there is a bind that outlived its box (design §7.1, NET-121). On a
+    # VM-backed host the guest cannot retract a declared forward (the host's
+    # egress gate refuses it by design); the host unbinds it when the box's
+    # row is withdrawn, which `session destroy` does before it returns. The
+    # unbind itself runs just after the withdrawal, so the probe allows a
+    # short settle window: each try is bounded at 2s, and the leg passes on
+    # the first refusal that came back in under 4s.
     if [ -n "$po_addr" ]; then
-      po_t0=$(now_ms)
-      curl -sS --max-time 8 -o /dev/null "http://$po_addr:$PO_EXT/" \
-        >/dev/null 2>"$WORK/po-after-destroy.err"
-      po_gone_rc=$?
-      po_t1=$(now_ms)
-      echo "after destroy: GET http://$po_addr:$PO_EXT/ -> curl exit $po_gone_rc in $((po_t1 - po_t0))ms ($(head -n1 "$WORK/po-after-destroy.err" 2>/dev/null || true))"
-      if [ "$po_gone_rc" -eq 7 ] && [ $((po_t1 - po_t0)) -lt 4000 ]; then
+      po_gone_rc=-1; po_gone_ms=0; po_settle_t0=$(now_ms)
+      while [ $(($(now_ms) - po_settle_t0)) -lt 10000 ]; do
+        po_t0=$(now_ms)
+        curl -sS --max-time 2 -o /dev/null "http://$po_addr:$PO_EXT/" \
+          >/dev/null 2>"$WORK/po-after-destroy.err"
+        po_gone_rc=$?
+        po_gone_ms=$(($(now_ms) - po_t0))
+        if [ "$po_gone_rc" -eq 7 ] && [ "$po_gone_ms" -lt 4000 ]; then
+          break
+        fi
+        sleep 0.5
+      done
+      echo "after destroy: GET http://$po_addr:$PO_EXT/ -> curl exit $po_gone_rc in ${po_gone_ms}ms, $(($(now_ms) - po_settle_t0))ms after the destroy returned ($(head -n1 "$WORK/po-after-destroy.err" 2>/dev/null || true))"
+      if [ "$po_gone_rc" -eq 7 ] && [ "$po_gone_ms" -lt 4000 ]; then
         echo "declared port refused fast after its box ended: no bind outlived the box"
       else
-        known_gap proof_port_publishes_on_listen_and_box_outlives_client \
-          "the declared port $po_addr:$PO_EXT was not refused fast after its box was destroyed (curl exit $po_gone_rc in $((po_t1 - po_t0))ms), so the declared forward's bind outlived the box — https://github.com/gominimal/inbox/issues/915"
+        echo "::error::the declared port $po_addr:$PO_EXT was not refused fast after its box was destroyed (curl exit $po_gone_rc in ${po_gone_ms}ms), so the declared forward's bind outlived the box (design §7.1, NET-121)"
+        fail
+      fi
+    fi
+
+    # The held connection must end within the bound once the box is gone:
+    # closed or reset by the host's revocation, never left to wait out its
+    # TCP timeouts against a box that no longer exists (design §7.1). curl
+    # reports the end as 52 (closed, empty reply) or 56 (reset); 28 would be
+    # its own 120s timeout, far past the bound.
+    if [ -n "$po_hold_pid" ]; then
+      while kill -0 "$po_hold_pid" 2>/dev/null \
+        && [ $(($(now_ms) - po_destroyed_ms)) -lt 15000 ]; do
+        sleep 0.25
+      done
+      po_hold_ms=$(($(now_ms) - po_destroyed_ms))
+      # What the egress gate said about this box's forwards, for either
+      # failure below: the unbind record at every forward's row-withdrawal
+      # and the terminate record for the connections they carried are the
+      # gate's own account of the revocation (the record sites live at
+      # info), so their presence or absence tells the two failure modes
+      # apart — but only on a lane whose gate records reach a log, which
+      # is the VM lane (the gate is minvmd's; on a native lane it is
+      # minimald's, behind the same filter story the readable-log restart
+      # above handles, and the revocation records carry no module pin this
+      # half can lean on there — `po_switch_addr` marks the lane).
+      po_gate_recs=""
+      if [ -n "$po_switch_addr" ]; then
+        po_gate_recs="$(minvmd_log_lines "$po_term_key" 2>/dev/null || true)"
+      fi
+      if kill -0 "$po_hold_pid" 2>/dev/null; then
+        kill "$po_hold_pid" 2>/dev/null || true
+        wait "$po_hold_pid" 2>/dev/null || true
+        echo "::error::the connection held through the declared forward $po_addr:$PO_HOLD was still open ${po_hold_ms}ms after its box was destroyed, so revocation did not terminate it (design §7.1)"
+        if [ -n "$po_gate_recs" ]; then
+          echo "--- egress gate records for this box ---"
+          printf '%s\n' "$po_gate_recs" | tail -n 20
+        fi
+        fail
+      fi
+      po_hold_rc=0
+      wait "$po_hold_pid" || po_hold_rc=$?
+      echo "after destroy: the held connection to $po_addr:$PO_HOLD ended with curl exit $po_hold_rc, ${po_hold_ms}ms after the destroy returned ($(head -n1 "$WORK/po-held.err" 2>/dev/null || true))"
+      if [ "$po_hold_rc" -eq 0 ] || [ "$po_hold_rc" -eq 28 ]; then
+        echo "::error::the held connection to $po_addr:$PO_HOLD did not end closed or reset (curl exit $po_hold_rc) after its box was destroyed (design §7.1)"
+        fail
+      fi
+      # A close the egress gate made leaves its record behind: the box's
+      # row withdrawal takes every tracked flow at the box's address and
+      # resets each at the switch, writing one terminate record that names
+      # the switch address. A FIN removes no tracked flow, so a connection
+      # the box already FIN-closed is still taken and counted, and the
+      # earlier forwards' flows keep the count non-zero: the record proves
+      # revocation ran at this box's address and reset the connections its
+      # forwards carried, not that the gate's reset is what ended curl. So
+      # on the lane that can read the gate's records, a close without a
+      # NEW terminate record (one absent from the snapshot this half took
+      # before the destroy — an earlier box's records can share the
+      # address) means the gate did not reset the box's connections: either
+      # revocation never reached the gate, or its inject failed (a WARN at
+      # the same address, which the dump below shows). Absent the record,
+      # say so, so the next failure is not read as a pass.
+      if [ -n "$po_switch_addr" ]; then
+        po_term_rec=""
+        for _ in $(seq 1 60); do
+          # grep -vxFf with an empty snapshot keeps every line: no record
+          # before the destroy, so any record now is new.
+          po_term_rec="$(minvmd_log_lines "$po_term_msg" 2>/dev/null \
+            | grep -F -- "$po_term_key" \
+            | grep -vxFf "$po_term_before_file" | tail -n1)"
+          [ -n "$po_term_rec" ] && break
+          sleep 0.25
+        done
+        if [ -n "$po_term_rec" ]; then
+          echo "egress gate: $po_term_rec"
+          echo "the egress gate ran revocation at the box's switch address $po_switch_addr when its box ended and reset the connections its forwards carried (design §7.1)"
+        else
+          echo "::error::the held connection to $po_addr:$PO_HOLD ended, but the egress gate wrote no terminate record for the box's switch address $po_switch_addr after its box was destroyed, so the gate did not reset it (design §7.1)"
+          echo "--- egress gate records for this box (bind, unbind, terminate) ---"
+          po_gate_recs="$(minvmd_log_lines "$po_term_key" 2>/dev/null || true)"
+          if [ -n "$po_gate_recs" ]; then
+            printf '%s\n' "$po_gate_recs" | tail -n 20
+          else
+            echo "(none — the gate wrote no record naming this box's address)"
+          fi
+          echo "--- minvmd log (tail) ---"
+          find "$XDG_STATE_HOME/minimal/logs" -name 'minvmd.log.*' -type f \
+            -exec tail -n 40 {} + 2>/dev/null || true
+          fail
+        fi
+      else
+        echo "the connection the declared forward carried was closed when its box ended: revocation terminated it"
       fi
     fi
 
@@ -16575,7 +23416,7 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     fi
     echo "run: the task is inside its box and printed $PO_RUN_MARKER"
     po_task_ls="$(mnl ls 2>/dev/null)"
-    po_task_box="$(printf '%s\n' "$po_task_ls" | grep -o 'task-e2e-port-run-[0-9a-f]\{4\}' | head -n1)"
+    po_task_box="$(printf '%s\n' "$po_task_ls" | grep -o 'e2e-port-run-[0-9][0-9]*' | head -n1)"
     if [ -z "$po_task_box" ]; then
       echo "::error::the run's box was not listed while its task ran"
       echo "--- min ls ---"; printf '%s\n' "$po_task_ls"
@@ -16604,7 +23445,7 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       # failure arm.
       if [ -n "$po_task_ls_now" ]; then
         po_task_ls="$po_task_ls_now"
-        if [[ "$po_task_ls_now" != *task-e2e-port-run-* ]]; then
+        if [[ "$po_task_ls_now" != *e2e-port-run-[0-9]* ]]; then
           po_box_ended=1
           break
         fi
@@ -16649,44 +23490,6 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
 }
 
 # ---------------------------------------------------------------------------
-# The refusal a VM-backed create still gives an ask stance, held as one
-# helper so the dynamic-ingress proof asserts the same words. An allow
-# create stands on a VM-backed host now (T94): the publish it makes rides
-# the bridged guest report door to the VM host daemon, which admits it
-# against the host-held grant the create registered. An ask is not there
-# yet — the port the attached human answers yes to must be recorded in the
-# host-held row by the client (NET-138), and until that answered-ask carry
-# reaches the host table (T96) the CLI refuses the create before any box
-# exists, and the VM lanes assert exactly that refusal — never a skip.
-VM_DYNAMIC_ASK_REFUSAL="dynamic ingress ask is not yet supported on VM-backed hosts (T96: the answered ask must be recorded in the host-held row)"
-assert_vm_refuses_dynamic_stance() { # $1 = stance (ask), $2 = box name, $3 = label for files; rest = extra activate flags
-  local stance="$1" name="$2" label="$3" seed="" out="" rc=0
-  shift 3
-  seed="$(hook_mktemp /tmp/mnlvr.XXXXXX)"
-  hook_seed_preamble > "$seed/minimal.toml"
-  mkdir "$seed/.git"
-  out="$(cd "$seed" && mnl session activate . --no-prompt \
-    --name "$name" --network own_ip "$@" --dynamic-ingress "$stance" \
-    2>"$WORK/$label-vmrefusal.err")" || rc=$?
-  rm -rf "$seed"
-  if [ "$rc" -eq 0 ]; then
-    echo "::error::the VM-backed create accepted --dynamic-ingress $stance (printed '$out') — an ask stance is refused before any box exists until the answered ask reaches the host-held row (T96)"
-    mnl session destroy --force "$(printf '%s\n' "$out" | tail -n1 | tr -d '\r')" >/dev/null 2>&1 || true
-    fail
-  fi
-  if ! grep -qF "$VM_DYNAMIC_ASK_REFUSAL" "$WORK/$label-vmrefusal.err"; then
-    echo "::error::the VM-backed create refused --dynamic-ingress $stance without the typed reason (want: '$VM_DYNAMIC_ASK_REFUSAL')"
-    echo "--- stderr ---"; cat "$WORK/$label-vmrefusal.err" 2>/dev/null || true
-    fail
-  fi
-  if mnl ls 2>/dev/null | grep -qF "$name"; then
-    echo "::error::the refused create for $name left a session behind — the refusal must come before any box exists"
-    fail
-  fi
-  echo "VM lane: --dynamic-ingress $stance refused before any box existed, with the typed reason: $VM_DYNAMIC_ASK_REFUSAL"
-}
-
-# ---------------------------------------------------------------------------
 # A runtime expose, decided and listed end to end (NET-043, NET-044). The
 # dynamic_ingress stance a box is CREATED with — the CLI's
 # `--dynamic-ingress`/`--dynamic-range` flags, this tree's one host-side way
@@ -16710,12 +23513,9 @@ assert_vm_refuses_dynamic_stance() { # $1 = stance (ask), $2 = box name, $3 = la
 # reports it over the bridged guest report door and the VM host daemon
 # admits it against the host-held grant the create registered (T94) —
 # the same publish, the same reply, the same listing, decided by a host
-# gate instead of the stance alone. A VM lane still owes the ask create's
-# typed refusal (`assert_vm_refuses_dynamic_stance` above): the answered
-# ask's carry to the host-held row is T96's, so the create says so up
-# front. The deny box declares the same range on every lane, so its
-# listing carries a declared stance and range with no live publication —
-# the fail-closed half both lanes read.
+# gate instead of the stance alone. The deny box declares the same range
+# on every lane, so its listing carries a declared stance and range with no
+# live publication — the fail-closed half both lanes read.
 proof_min_net_expose_publishes_lists_and_refuses() {
   echo "::group::min net expose publishes what the stance allows, lists the publication, and refuses the rest (NET-043, NET-044)"
 
@@ -16743,8 +23543,8 @@ proof_min_net_expose_publishes_lists_and_refuses() {
     echo "::endgroup::"
     return 0
   fi
-  if [ ! -c /dev/net/tun ]; then
-    echo "min net expose SKIPPED (no /dev/net/tun on this host: an own-IP box cannot open its in-namespace tap; runs for real on a host that has the device)"
+  if [ -z "${E2E_VM:-}" ] && [ ! -c /dev/net/tun ]; then
+    echo "min net expose SKIPPED (no /dev/net/tun on this host: a native own-IP box cannot open its in-namespace tap; a VM lane opens it inside the guest and runs this case)"
     echo "::endgroup::"
     return 0
   fi
@@ -16816,16 +23616,6 @@ if problems:
 PY
   }
 
-  # ---- the ask create's typed refusal, the one stance a VM lane cannot
-  # keep yet: the port the attached human answers yes to must be recorded
-  # in the host-held row by the client (NET-138), and until that answered
-  # ask reaches the host table (T96) the create refuses before any box
-  # exists. An allow create stands on every lane — the arm below publishes
-  # through whatever gate the lane has.
-  if [ -n "${E2E_VM:-}" ]; then
-    assert_vm_refuses_dynamic_stance ask "$mnx_allow_name" mnx-ask \
-      --dynamic-range "$mnx_lo-$mnx_hi"
-  fi
   native_switch_daemon
   MNX_SEED_DIR="$(hook_mktemp /tmp/mnlxe.XXXXXX)"
   hook_seed_preamble > "$MNX_SEED_DIR/minimal.toml"
@@ -16869,12 +23659,9 @@ PY
 
   # ---- the ask: an in-range port of an allow box --------------------------
   # The reply is the box's own word that the publish stood: the address its
-  # forward bound, spelled host:port. A runtime-only port's reply carries the
-  # honesty caveat NET-047 pins — bound, but the relay gate has not admitted
-  # it — and this box declared no static mapping, so the caveat is expected;
-  # the case prints whichever reply it got and asserts only the publish line
-  # itself. A native host has no host gate in the ask's way, so any refusal
-  # here is a failure.
+  # forward bound, spelled host:port, with no caveat — the publish admitted
+  # the port at the box's relay gate (NET-044). A native host has no host
+  # gate in the ask's way, so any refusal here is a failure.
   mnl session exec "$mnx_sid" "/usr/bin/min net expose $mnx_port" \
     >"$WORK/mnx-expose.out" 2>"$WORK/mnx-expose.err"
   mnx_expose_rc=$?
@@ -16887,7 +23674,6 @@ PY
     fail
   fi
   case "$mnx_expose_out" in
-    "published port $mnx_port at "*":$mnx_port; not yet reachable") ;;
     "published port $mnx_port at "*":$mnx_port") ;;
     *)
       echo "::error::the expose's reply is not a publish line naming the port and its address (got: '$mnx_expose_out')"
@@ -16942,7 +23728,7 @@ PY
     fail
   fi
   case "$mnx_ref_err" in
-    *"port $mnx_out_port is outside this box's declared dynamic range $mnx_lo-$mnx_hi"*) ;;
+    *"port $mnx_out_port is outside this box's --dynamic-range $mnx_lo-$mnx_hi. Nothing was published."*) ;;
     *) echo "::error::the out-of-range refusal does not name the port and the declared range (got: '$mnx_ref_err')"; fail ;;
   esac
   echo "out of range: refused with its own typed error — the range the create declared is the whole gate (NET-043)"
@@ -17006,7 +23792,7 @@ PY
       fail
     fi
     case "$policy" in
-      *"  dynamic ports  $mnx_lo–$mnx_hi"*) ;;
+      *"  dynamic ports  ${mnx_lo}–${mnx_hi}"*) ;;
       *) echo "::error::the text policy does not show the declared dynamic range $mnx_lo-$mnx_hi"; fail ;;
     esac
     if [ "$mode" = "live" ]; then
@@ -17018,7 +23804,7 @@ PY
         *":$mnx_port → :$mnx_port"*) ;;
         *) echo "::error::the live-ingress section carries no row for the exposed port $mnx_port"; fail ;;
       esac
-      echo "policy (text): stance allow over $mnx_lo–$mnx_hi, one live row for :$mnx_port (NET-043, NET-044)"
+      echo "policy (text): stance allow over ${mnx_lo}–${mnx_hi}, one live row for :$mnx_port (NET-043, NET-044)"
     else
       case "$policy" in
         *"live ingress (published at runtime)"*)
@@ -17026,7 +23812,7 @@ PY
           fail
           ;;
       esac
-      echo "policy (text): stance deny over $mnx_lo–$mnx_hi, and no live-ingress section — a box that published nothing lists nothing (NET-044, fail-closed)"
+      echo "policy (text): stance deny over ${mnx_lo}–${mnx_hi}, and no live-ingress section — a box that published nothing lists nothing (NET-044, fail-closed)"
     fi
 
     json="$(mnl session policy "$sid" -o json 2>"$WORK/mnx-json-$stance.err")" \
@@ -17047,7 +23833,7 @@ PY
   mnl session destroy --force "$mnx_deny_sid" >/dev/null 2>&1 || true
   rm -rf "$MNX_SEED_DIR" "$MNX_DENY_SEED_DIR"
   if [ -n "${E2E_VM:-}" ]; then
-    echo "min net expose publishes, lists and refuses OK on a VM lane (the in-range expose published through the VM host daemon's admission and is listed on both policy renderings; out-of-range and deny asks refused with their own typed errors; the ask create refused with the typed T96 reason; the deny box listed nothing on both renderings)"
+    echo "min net expose publishes, lists and refuses OK on a VM lane (the in-range expose published through the VM host daemon's admission and is listed on both policy renderings; out-of-range and deny asks refused with their own typed errors; the deny box listed nothing on both renderings)"
   else
     echo "min net expose publishes, lists and refuses OK (in-range publish listed on both policy renderings; out-of-range and deny asks refused with their own typed errors; the deny box listed nothing on both renderings)"
   fi
@@ -17099,6 +23885,7 @@ proof_listen_published_port_reaches_peer_and_host() {
   local lp_sid="" lp_peer_sid="" lp_peer_host="" lp_peer_why=""
   local lp_ans_port="" lp_addr="" lp_listening="" lp_published="" lp_refused=""
   local lp_rc="" lp_status="" lp_body="" lp_hrc="" lp_hstatus="" lp_hbody="" lp_hms=""
+  local lp_unlisted=""               # set once the policy stops listing the closed listen
   local lp_target_name="e2e-dyn-listen" lp_peer_name="e2e-dyn-peer"
   local lp_lo=18110 lp_hi=18115      # the declared dynamic range (this case's band)
   local lp_listen_port=18112         # in-range: the listen that publishes
@@ -17123,9 +23910,9 @@ proof_listen_published_port_reaches_peer_and_host() {
     echo "::endgroup::"
     return 0
   fi
-  if [ ! -c /dev/net/tun ]; then
+  if [ -z "${E2E_VM:-}" ] && [ ! -c /dev/net/tun ]; then
     not_run listen_published_port_reaches_peer_and_host \
-      "no /dev/net/tun on this host: an own-IP box cannot open its in-namespace tap, so the listen through the VM bridge is proven on the KVM lane only — https://github.com/gominimal/inbox/issues/925"
+      "no /dev/net/tun on this host: a native own-IP box cannot open its in-namespace tap; a VM lane opens it inside the guest and runs this case"
     echo "::endgroup::"
     return 0
   fi
@@ -17242,12 +24029,13 @@ proof_listen_published_port_reaches_peer_and_host() {
   echo "listen: socat also serves the OUT-OF-RANGE port $lp_out_port inside the box — the stance does not allow it, so nothing may publish it"
 
   # The host answerer's own port, read the way the proofs around this one
-  # read it: the ZONE ANSWERER line of `min ls`, whose spelling is the
+  # read it: the DNS SERVICE line of `min ls`, whose spelling is the
   # target's own — a host-native daemon prints "listening on
   # 127.0.0.1:PORT (UDP)", while the VM-backed target this case's own-address
   # box needs names the port in the line the CLI renders from the VM host
-  # daemon's answerer state ("this VM's minvmd holds it on 127.0.0.1:PORT
-  # (UDP)", or the registered form) — so both spellings read here. A target
+  # daemon's answerer state ("this VM's host daemon answers its box names
+  # on 127.0.0.1:PORT (UDP)", or the registered form) — so both spellings
+  # read here. A target
   # that names no port has no word for where its boxes are published, and the
   # host legs below are WHERE-skipped on it, never failed: the peer legs
   # carry the case's enforcement assertions without it.
@@ -17255,17 +24043,17 @@ proof_listen_published_port_reaches_peer_and_host() {
   lp_ans_port=""
   for _ in $(seq 1 40); do
     lp_ans_port="$(mnl ls 2>/dev/null \
-      | sed -n 's/^ZONE ANSWERER:.*on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' \
+      | sed -n 's/^DNS SERVICE:.*on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' \
       | head -n1)"
     [ -n "$lp_ans_port" ] && break
     sleep 0.25
   done
   if [ -z "$lp_ans_port" ]; then
-    lp_ans_why="no zone answerer on record for this host: 'min ls' carries no ZONE ANSWERER line naming a port, so the host's own word for where the box is published cannot be asked for"
+    lp_ans_why="no zone answerer on record for this host: 'min ls' carries no DNS SERVICE line naming a port, so the host's own word for where the box is published cannot be asked for"
     echo "host legs: SKIPPED ($lp_ans_why)"
-    echo "--- min ls (ZONE ANSWERER lines) ---"
+    echo "--- min ls (DNS SERVICE lines) ---"
     lp_ans_ls="$(mnl ls 2>/dev/null || true)"
-    printf '%s\n' "$lp_ans_ls" | grep -F 'ZONE ANSWERER' | sed 's/^/  /' || true
+    printf '%s\n' "$lp_ans_ls" | grep -F 'DNS SERVICE' | sed 's/^/  /' || true
   fi
 
   # WHERE-gated like the answerer's port above it: without the box's
@@ -17473,19 +24261,16 @@ proof_listen_published_port_reaches_peer_and_host() {
     sleep 0.25
   done
   # An in-range listen under allow is a dynamic ingress request, so NET-044
-  # owes its row in `min session policy`. The watcher commits only to the
-  # box's publications today, never to the runtime-ingress table the policy
-  # renders: a known gap, carried as one until gominimal/inbox#912 lands and
-  # this turns into a hard assertion. The peer and host legs below prove
-  # the publish itself (NET-016) — on a VM lane, through the VM host
-  # daemon's admission (T94).
-  if [ -n "$lp_live" ]; then
-    echo "listen: the in-range listen on port $lp_listen_port is listed as published in min session policy (NET-044)"
-  else
-    known_gap listen_published_port_reaches_peer_and_host \
-      "the in-range listen on port $lp_listen_port is not listed in min session policy, NET-044 — https://github.com/gominimal/inbox/issues/912"
-    lp_live=1
+  # owes its row in `min session policy`: the watcher's publication is
+  # listed beside the runtime exposes for as long as the listener holds the
+  # port. The peer and host legs below prove the publish itself (NET-016) —
+  # on a VM lane, through the VM host daemon's admission (T94).
+  if [ -z "$lp_live" ]; then
+    echo "::error::the in-range listen on port $lp_listen_port is not listed in min session policy — an allowed dynamic ingress request must show its mapping (NET-044)"
+    echo "--- min session policy ---"; printf '%s\n' "${lp_policy:-<no answer>}"
+    fail
   fi
+  echo "listen: the in-range listen on port $lp_listen_port is listed as published in min session policy (NET-044)"
 
   if [ -n "$lp_live" ] && [ -n "$lp_peer_host" ]; then
   # ---- reach: the peer, polled — the watcher publishes within its own poll
@@ -17565,9 +24350,15 @@ proof_listen_published_port_reaches_peer_and_host() {
   fi
 
   # ---- the audit: the allow decision has its decisions.log line (NET-046) --
-  # The watcher writes no decision record today; carried as a known gap until
-  # gominimal/inbox#912 lands, when this turns into a hard assertion.
-  if python3 - "$lp_target_name" "$lp_listen_port" \
+  # The watcher appends one record per listen it publishes, to the audit log
+  # of the daemon that runs the box. On a VM lane that daemon is the guest's,
+  # whose state directory this host does not read — the same split the
+  # expose case's guest-audit legs carry — so the leg is counted NOT RUN
+  # there and asserted everywhere else.
+  if [ -n "${E2E_VM:-}" ]; then
+    not_run listen_published_port_reaches_peer_and_host \
+      "VM lane: the listen's decision record is in the guest daemon's audit file, which this host does not read (NET-046)"
+  elif python3 - "$lp_target_name" "$lp_listen_port" \
       "$XDG_STATE_HOME/minimal/audit/decisions.log" <<'PY'
 import json
 import sys
@@ -17580,7 +24371,13 @@ try:
                 record = json.loads(line)
             except ValueError:
                 continue
-            if record.get("box") == box and record.get("port") == port:
+            if (
+                record.get("box") == box
+                and record.get("port") == port
+                and record.get("decision") == "allow"
+                and record.get("decided_by") == "box-policy"
+                and record.get("outcome") == "published"
+            ):
                 print(f"  {line.strip()}")
                 sys.exit(0)
 except FileNotFoundError:
@@ -17588,10 +24385,11 @@ except FileNotFoundError:
 sys.exit(1)
 PY
   then
-    echo "audit: the listen's allow decision has its decisions.log line (NET-046)"
+    echo "audit: the listen's allow decision has its decisions.log line, decided by the box's policy, outcome published (NET-046)"
   else
-    known_gap listen_published_port_reaches_peer_and_host \
-      "no decisions.log line for the in-range listen on port $lp_listen_port, NET-046 — https://github.com/gominimal/inbox/issues/912"
+    echo "::error::no decisions.log line records box $lp_target_name port $lp_listen_port as allowed by the box's policy and published — the listen's decision was never audited (NET-046)"
+    tail -n 20 "$XDG_STATE_HOME/minimal/audit/decisions.log" 2>/dev/null || echo "(no audit log)"
+    fail
   fi
 
   # ---- the close: the publication withdraws with the listener -------------
@@ -17624,6 +24422,26 @@ PY
     fail
   fi
   echo "peer, after the close: the same GET -> connection refused (curl exit $lp_rc) $(( $(now_ms) - lp_close_start ))ms after the kill — the listen's publication withdrew with its listener (NET-017)"
+  # The row goes with the publication (NET-044): a policy that still lists
+  # the port names a mapping nothing publishes. An empty answer is no
+  # reading at all, so only an answer that names the box ends the poll.
+  lp_unlisted=""
+  for _ in $(seq 1 16); do
+    lp_policy="$(mnl session policy "$lp_sid" 2>/dev/null || true)"
+    if [ -n "$lp_policy" ]; then
+      case "$lp_policy" in
+        *":$lp_listen_port → :$lp_listen_port"*) ;;
+        *) lp_unlisted=1; break ;;
+      esac
+    fi
+    sleep 0.25
+  done
+  if [ -z "$lp_unlisted" ]; then
+    echo "::error::min session policy still lists port $lp_listen_port after its listener closed — the row must go with the publication (NET-044)"
+    echo "--- min session policy ---"; printf '%s\n' "${lp_policy:-<no answer>}"
+    fail
+  fi
+  echo "policy, after the close: port $lp_listen_port is no longer listed (NET-044)"
   if [ -n "$lp_bridge_switch" ]; then
     lp_bridge_row=""
     for _ in $(seq 1 20); do
@@ -17680,6 +24498,380 @@ PY
 }
 
 # ---------------------------------------------------------------------------
+# The ask legs of `proof_expose_from_inside_box` on a VM lane (NET-045): the
+# human who answers a VM-backed box's ask is the one attached on the HOST.
+# The in-VM daemon raises the ask with the VM host daemon, which offers it
+# to the host client attached to the box's row: the `min session attach`
+# relay, driven here through a real pty (scripts/e2e-attach-pty.py), which
+# suspends itself and renders the dialog with the native dialog's own frame,
+# so the pty driver answers it the same way. Every outcome is a line in the
+# VM host daemon's own owner-only audit log, read here on the host:
+#   * answered yes: the expose publishes, and the audit records `yes`;
+#   * answered no: nothing publishes, no live row, the audit records `no`,
+#     and a later expose asks again — a new ask, refused for no client here,
+#     never a stored answer;
+#   * nobody attached: refused with the typed nobody-attached error, and the
+#     audit records `refused_no_client`.
+# $1 = port, $2 = range low, $3 = range high, $4 = yes box, $5 = no box,
+# $6 = nobody box. Echoes the sessions it created on fd 3, for the caller's
+# teardown.
+eib_vm_ask_legs() {
+  local port="$1" lo="$2" hi="$3" yes_name="$4" no_name="$5" nobody_name="$6"
+  local host_audit="$XDG_STATE_HOME/minimal/providers/local-minvmd0/audit/box-admissions.log"
+  local rc=0 out="" err="" policy="" before=0 after=0
+  local yes_sid="" no_sid="" nobody_sid=""
+
+  # The host audit line for an ask outcome: event ask, the outcome, the box
+  # and the port, read from the VM host daemon's own log.
+  vm_ask_audited() { # $1 box, $2 outcome
+    grep -F '"event":"ask"' "$host_audit" 2>/dev/null \
+      | grep -F "\"outcome\":\"$2\"" \
+      | grep -F "\"box\":\"$1\"" \
+      | grep -cF "\"port\":$port"
+  }
+  vm_ask_box() { # $1 name; echoes the session id
+    local box_seed=""
+    box_seed="$(hook_mktemp /tmp/mnleva.XXXXXX)"
+    hook_seed_preamble > "$box_seed/minimal.toml"
+    mkdir "$box_seed/.git"
+    if ! (cd "$box_seed" && mnl session activate . --no-prompt \
+        --name "$1" --network own_ip \
+        --dynamic-ingress ask --dynamic-range "$lo-$hi" \
+        2>"$WORK/eib-vm-$1-activate.err") >"$WORK/eib-vm-$1-activate.out"; then
+      echo "::error::the VM-backed ask create for $1 failed — an ask stance stands on a VM-backed host (NET-045)" >&2
+      cat "$WORK/eib-vm-$1-activate.err" >&2 2>/dev/null || true
+      rm -rf "$box_seed"
+      return 1
+    fi
+    rm -rf "$box_seed"
+    tail -n1 "$WORK/eib-vm-$1-activate.out" | tr -d '\r'
+  }
+  # The attached human answers $2 (allow|deny) to the ask an exec outside
+  # the attach raises; echoes the expose's exit code.
+  vm_ask_answered() { # $1 sid, $2 allow|deny, $3 label
+    local a_pid="" a_live="" a_rc=0
+    # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+    # Leaves by the detach chord once the ask is answered, never by `exit`:
+    # the box's first host holds its host-side row (NET-138), and a later
+    # exec must reach that same live host rather than be refused a new one.
+    E2E_PTY_COMMANDS="> /home/eib-$3-live" E2E_PTY_ASK="$2" E2E_PTY_DETACH=1 \
+      python3 "$ROOT/scripts/e2e-attach-pty.py" - min ${E2E_MINIMAL_ARGS:-} session attach "$1" \
+      >"$WORK/eib-vm-$3-attach.out" 2>"$WORK/eib-vm-$3-attach.err" &
+    a_pid=$!
+    for _ in $(seq 1 60); do
+      if mnl session exec "$1" "test -e /home/eib-$3-live" >/dev/null 2>&1; then
+        a_live=1
+        break
+      fi
+      sleep 0.25
+    done
+    if [ -z "$a_live" ]; then
+      kill "$a_pid" 2>/dev/null || true
+      wait "$a_pid" 2>/dev/null || true
+      echo "::error::the pty attach to $1 never reached its shell" >&2
+      cat "$WORK/eib-vm-$3-attach.out" "$WORK/eib-vm-$3-attach.err" >&2 2>/dev/null || true
+      return 1
+    fi
+    mnl session exec "$1" "/usr/bin/min net expose $port" \
+      >"$WORK/eib-vm-$3-expose.out" 2>"$WORK/eib-vm-$3-expose.err" || a_rc=$?
+    if ! wait "$a_pid"; then
+      echo "::error::the pty attach to $1 failed (NET-045)" >&2
+      cat "$WORK/eib-vm-$3-attach.out" "$WORK/eib-vm-$3-attach.err" >&2 2>/dev/null || true
+      return 1
+    fi
+    echo "--- the attached host terminal ($3: the ask the VM host daemon offered, and its answer) ---" >&2
+    sed 's/^/  /' "$WORK/eib-vm-$3-attach.out" >&2 2>/dev/null || true
+    if ! grep -qF "asks to publish port $port/tcp." "$WORK/eib-vm-$3-attach.out" 2>/dev/null; then
+      echo "::error::the host-side ask dialog never rendered on the attached terminal — the VM host daemon did not offer the ask to the attached client (NET-045)" >&2
+      return 1
+    fi
+    echo "$a_rc"
+  }
+
+  # ---- answered yes: the attached human's Allow publishes ------------------
+  yes_sid="$(vm_ask_box "$yes_name")" || fail
+  echo "$yes_sid" >&3
+  echo "ask box (yes, VM lane): $yes_sid ($yes_name, ask over $lo-$hi)"
+  rc="$(vm_ask_answered "$yes_sid" allow vm-yes)" || fail
+  out="$(cat "$WORK/eib-vm-vm-yes-expose.out" 2>/dev/null)"
+  err="$(tr '\n' ' ' < "$WORK/eib-vm-vm-yes-expose.err" 2>/dev/null)"
+  echo "expose: min net expose $port in the ask box (attached on the host, Allow) -> exit $rc: ${out:-<no reply>}${err:+ [$err]}"
+  if [ "$rc" -ne 0 ]; then
+    echo "::error::the VM-backed ask box's expose failed with the host's attached human answering Allow (got: '$err')"
+    fail
+  fi
+  case "$out" in
+    "published port $port at "*) ;;
+    *) echo "::error::the answered-yes expose's reply is not a publish line (got: '$out')"; fail ;;
+  esac
+  if [ "$(vm_ask_audited "$yes_name" yes)" -lt 1 ]; then
+    echo "::error::the VM host daemon's audit log has no 'yes' line for $yes_name's ask on port $port"
+    grep -F '"event":"ask"' "$host_audit" 2>/dev/null || true
+    fail
+  fi
+  # The publish's other record on this lane: the VM host daemon pre-recorded
+  # the runtime port when its client answered (`record_ask_yes`), so the
+  # host-held row holds the port the Allow published — at the switch address
+  # the box's own registration named.
+  yes_switch="$(grep -F -- 'BOX REGISTRATION:' "$WORK/eib-vm-$yes_name-activate.err" 2>/dev/null | tail -n1 \
+    | sed -n 's/.*switch address \([0-9.]*\).*/\1/p')"
+  if [ -z "$yes_switch" ]; then
+    echo "::error::the yes box's registration printed no switch address — the host row its Allow pre-records into is keyed at one"
+    cat "$WORK/eib-vm-$yes_name-activate.err" 2>/dev/null || true
+    fail
+  fi
+  local yes_row="" yes_row_ok=""
+  for _ in $(seq 1 20); do
+    yes_row="$(minvmd status --row "$yes_name" 2>/dev/null || true)"
+    if [[ "$yes_row" == *" switch $yes_switch "* ]] \
+       && [[ "$yes_row" =~ runtime\ \[([0-9]+,)*$port(,[0-9]+)*\] ]]; then
+      yes_row_ok=1
+      break
+    fi
+    sleep 0.25
+  done
+  if [ -z "$yes_row_ok" ]; then
+    echo "::error::the VM host daemon's row does not hold port $port for $yes_name — the client's Allow must pre-record the publish before the reply (T94)"
+    echo "minvmd status --row $yes_name -> '${yes_row:-<no answer>}'"
+    fail
+  fi
+  echo "the host's attached human's Allow published through the host-side admission, and the host audit records yes (NET-045)"
+  echo "host row: $yes_row"
+
+  # ---- answered no: nothing publishes, and a later expose asks again -------
+  no_sid="$(vm_ask_box "$no_name")" || fail
+  echo "$no_sid" >&3
+  echo "ask box (no, VM lane): $no_sid ($no_name, ask over $lo-$hi)"
+  rc="$(vm_ask_answered "$no_sid" deny vm-no)" || fail
+  err="$(tr '\n' ' ' < "$WORK/eib-vm-vm-no-expose.err" 2>/dev/null)"
+  echo "expose: min net expose $port in the ask box (attached on the host, Deny) -> exit $rc: ${err:-<no error>}"
+  if [ "$rc" -eq 0 ]; then
+    echo "::error::the answered-no ask published on a VM lane — the human's deny must refuse it"
+    fail
+  fi
+  case "$err" in
+    *"dynamic ingress is denied for this box"*) ;;
+    *) echo "::error::the answered-no refusal does not say dynamic ingress is denied (got: '$err')"; fail ;;
+  esac
+  policy="$(mnl session policy "$no_sid" 2>/dev/null)" || true
+  case "$policy" in
+    *"live ingress (published at runtime)"*)
+      echo "::error::the answered-no ask box lists a live ingress row on a VM lane — a deny records nothing"
+      fail
+      ;;
+  esac
+  if [ "$(vm_ask_audited "$no_name" no)" -lt 1 ]; then
+    echo "::error::the VM host daemon's audit log has no 'no' line for $no_name's ask on port $port"
+    grep -F '"event":"ask"' "$host_audit" 2>/dev/null || true
+    fail
+  fi
+  before="$(vm_ask_audited "$no_name" refused_no_client)"
+  rc=0
+  mnl session exec "$no_sid" "/usr/bin/min net expose $port" \
+    >/dev/null 2>"$WORK/eib-vm-no-again.err" || rc=$?
+  after="$(vm_ask_audited "$no_name" refused_no_client)"
+  if [ "$rc" -eq 0 ] || [ "$after" -le "$before" ]; then
+    echo "::error::a later expose after the deny did not ask again (exit $rc, refused_no_client lines $before -> $after): the deny must store nothing an expose could reuse"
+    cat "$WORK/eib-vm-no-again.err" 2>/dev/null || true
+    fail
+  fi
+  echo "the deny recorded nothing: no live row, the host audit records no, and a later expose asked again (NET-045)"
+
+  # ---- nobody attached: the fail-closed refusal ----------------------------
+  nobody_sid="$(vm_ask_box "$nobody_name")" || fail
+  echo "$nobody_sid" >&3
+  rc=0
+  mnl session exec "$nobody_sid" "/usr/bin/min net expose $port" \
+    >"$WORK/eib-vm-nobody.out" 2>"$WORK/eib-vm-nobody.err" || rc=$?
+  err="$(tr '\n' ' ' < "$WORK/eib-vm-nobody.err" 2>/dev/null)"
+  echo "expose: min net expose $port in the ask box (nobody attached on the host) -> exit $rc: ${err:-<no error>}"
+  if [ "$rc" -eq 0 ]; then
+    echo "::error::the nobody-attached ask published on a VM lane — it must fail closed"
+    fail
+  fi
+  case "$err" in
+    *"dynamic ingress is set to ask and nobody is attached to answer"*) ;;
+    *) echo "::error::the nobody-attached refusal does not say nobody is attached (got: '$err')"; fail ;;
+  esac
+  if [ "$(vm_ask_audited "$nobody_name" refused_no_client)" -lt 1 ]; then
+    echo "::error::the VM host daemon's audit log has no 'refused_no_client' line for $nobody_name"
+    fail
+  fi
+  echo "nobody attached on the host: refused with its own typed error, and the host audit records it (NET-045)"
+  echo "--- the VM host daemon's ask audit lines ---"
+  grep -F '"event":"ask"' "$host_audit" 2>/dev/null | sed 's/^/  /' || true
+}
+
+# The shell-exit leg of a registered box, on a VM lane (NET-138): an own_ip
+# box's first host holds its host-side row, and the row ends with that host's
+# shell. Attach, look up a box-zone name (an admitted DNS frame, so the
+# host's relay carries the box's address and its end detaches the row; a
+# row no frame ever reached waits out the longer resume bound instead),
+# `exit`, which ends the box with its shell (BOX-038): no prompt asks, and
+# the box stays listed as exited. The leg then waits out the detach grace until the VM host daemon
+# withdraws the row (`minvmd status --row` answers no row). A pty
+# `min session attach <name>` then resumes the exited box under the same box
+# id (BOX-025) and leaves by the detach chord; the row is back, an exec into
+# the running box succeeds, and the host's read of the row afterwards is the same row as before the exit — the same
+# box id, switch address and allow-list — with the box itself holding that
+# switch address (read from /proc/net/fib_trie: a session rootfs has no
+# iproute2) and its frames decided by the row again: the same zone lookup
+# resolves, where the gate would drop a rowless source's. The attach runs
+# through the real pty driver, as a person at a terminal attaches.
+# $1 = box name. Echoes the session it created on fd 3, for the caller's
+# teardown.
+eib_vm_kept_box_resumes_leg() {
+  local name="$1" seed="" sid="" rc=0 err="" row_before="" row_after="" switch=""
+  local row_rc=0 row="" gone="" fib_ip="" zone=""
+  seed="$(hook_mktemp /tmp/mnlevr.XXXXXX)"
+  hook_seed_preamble > "$seed/minimal.toml"
+  mkdir "$seed/.git"
+  if ! sid="$(cd "$seed" && mnl session activate . --no-prompt \
+      --name "$name" --network own_ip \
+      2>"$WORK/eib-vm-kept-activate.err")"; then
+    echo "::error::the VM-backed own_ip create for $name failed"
+    cat "$WORK/eib-vm-kept-activate.err" 2>/dev/null || true
+    rm -rf "$seed"
+    return 1
+  fi
+  rm -rf "$seed"
+  sid="$(printf '%s\n' "$sid" | tail -n1 | tr -d '\r')"
+  echo "$sid" >&3
+  echo "registered box (VM lane): $sid ($name, own_ip)"
+
+  # The host's own read of the row before the shell exits: the box id, the
+  # switch address and the allow-list the resumed row must carry again.
+  for _ in $(seq 1 10); do
+    if row_before="$(minvmd status --row "$name" --json 2>"$WORK/eib-vm-kept-row.err")"; then
+      break
+    fi
+    row_before=""
+    sleep 0.25
+  done
+  echo "minvmd status --row $name --json (before exit) -> '${row_before:-<no answer>}'"
+  switch="$(printf '%s\n' "$row_before" | sed -n 's/.*"switch_address":"\([0-9.]*\)".*/\1/p')"
+  if [ -z "$switch" ]; then
+    echo "::error::the VM host daemon holds no row naming a switch address for the registered box $name"
+    cat "$WORK/eib-vm-kept-row.err" 2>/dev/null || true
+    return 1
+  fi
+
+  # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+  if ! E2E_PTY_COMMANDS="getent ahostsv4 host.min.internal
+exit" \
+      python3 "$ROOT/scripts/e2e-attach-pty.py" - min ${E2E_MINIMAL_ARGS:-} session attach "$sid" \
+      >"$WORK/eib-vm-kept-attach.out" 2>"$WORK/eib-vm-kept-attach.err"; then
+    echo "::error::the pty attach to the registered box $name failed"
+    cat "$WORK/eib-vm-kept-attach.out" "$WORK/eib-vm-kept-attach.err" 2>/dev/null || true
+    return 1
+  fi
+  box_exited_check "$sid" 0 "registered box (VM lane)" || return 1
+
+  # The row detaches with the shell and is withdrawn after the detach grace
+  # (45 s, swept every second; NET-138 bounds it at 60 s). Waiting it out
+  # makes the exec below resume a withdrawn row, not merely a detached one.
+  for _ in $(seq 1 150); do
+    rc=0
+    minvmd status --row "$name" >"$WORK/eib-vm-kept-row-gone.out" 2>/dev/null || rc=$?
+    row="$(cat "$WORK/eib-vm-kept-row-gone.out" 2>/dev/null || true)"
+    if [ "$rc" -eq 1 ] && [ "$row" = "no row for $name" ]; then
+      gone=1
+      break
+    fi
+    sleep 0.5
+  done
+  echo "minvmd status --row $name (after exit) -> exit $rc: '${row:-<no answer>}'"
+  if [ -z "$gone" ]; then
+    echo "::error::the kept box's row was not withdrawn within 75 s of its shell's exit (NET-138 bounds it at 60 s)"
+    return 1
+  fi
+  echo "the kept box's row was withdrawn after the detach grace (NET-138)"
+
+  # An exec runs only in a running box, so the exited box comes back first
+  # through `min session attach` under its name (BOX-025). The attach leaves
+  # by the detach chord, so the resumed shell keeps running for the exec.
+  # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+  if ! E2E_PTY_COMMANDS="echo KEPT_RESUMED" E2E_PTY_DETACH=1 \
+      python3 "$ROOT/scripts/e2e-attach-pty.py" - min ${E2E_MINIMAL_ARGS:-} session attach "$name" \
+      >"$WORK/eib-vm-kept-resume.out" 2>"$WORK/eib-vm-kept-resume.err"; then
+    echo "::error::'min session attach $name' did not resume the exited registered box"
+    cat "$WORK/eib-vm-kept-resume.out" "$WORK/eib-vm-kept-resume.err" 2>/dev/null || true
+    return 1
+  fi
+  local shown="" state="" shown_id=""
+  for _ in $(seq 1 20); do
+    shown="$(mnl box show "$name" </dev/null 2>&1)" || shown=""
+    state="$(printf '%s\n' "$shown" | sed -n 's/^State: *//p' | tr -d '\r')"
+    shown_id="$(printf '%s\n' "$shown" | sed -n 's/^ID: *//p' | tr -d '\r')"
+    [ "$state" = running ] && [ "$shown_id" = "$sid" ] && break
+    sleep 0.5
+  done
+  echo "min box show $name (after resume) -> state '${state:-<none>}', id '${shown_id:-<none>}'"
+  if [ "$state" != running ] || [ "$shown_id" != "$sid" ]; then
+    echo "::error::'min session attach $name' did not resume the box as running under its id $sid (BOX-025)"
+    printf '%s\n' "$shown"
+    return 1
+  fi
+  echo "the attach resumed the kept box as running under the same id (BOX-025)"
+
+  rc=1
+  for _ in $(seq 1 20); do
+    rc=0
+    minvmd status --row "$name" >"$WORK/eib-vm-kept-row-back.out" 2>&1 || rc=$?
+    [ "$rc" -eq 0 ] && break
+    sleep 0.5
+  done
+  row="$(cat "$WORK/eib-vm-kept-row-back.out" 2>/dev/null || true)"
+  echo "minvmd status --row $name (after resume) -> exit $rc: '${row:-<no answer>}'"
+  if [ "$rc" -ne 0 ]; then
+    echo "::error::the VM host daemon shows no row for $name after 'min session attach $name' resumed it (NET-138)"
+    return 1
+  fi
+  echo "the resumed box holds its row again (NET-138)"
+
+  rc=0
+  mnl session exec "$sid" "true" \
+    >"$WORK/eib-vm-kept-exec.out" 2>"$WORK/eib-vm-kept-exec.err" || rc=$?
+  err="$(cat "$WORK/eib-vm-kept-exec.out" "$WORK/eib-vm-kept-exec.err" 2>/dev/null | tr '\n' ' ')"
+  echo "exec into the kept registered box -> exit $rc: ${err:-<no output>}"
+  if [ "$rc" -ne 0 ]; then
+    echo "::error::an exec into the resumed registered box $name failed (NET-138)"
+    return 1
+  fi
+
+  row_rc=0
+  row_after="$(minvmd status --row "$name" --json 2>"$WORK/eib-vm-kept-row.err")" || row_rc=$?
+  echo "minvmd status --row $name --json (after exec) -> exit $row_rc: '${row_after:-<no answer>}'"
+  if [ "$row_rc" -ne 0 ] || [ "$row_after" != "$row_before" ]; then
+    echo "::error::the resumed row is not the row the box held before its shell exited (want: '$row_before')"
+    return 1
+  fi
+
+  if ! mnl session exec "$sid" sh -c 'cat /proc/net/fib_trie' \
+      >"$WORK/eib-vm-kept-fib.out" 2>"$WORK/eib-vm-kept-fib.err"; then
+    echo "::error::could not read /proc/net/fib_trie from the resumed box $name"
+    cat "$WORK/eib-vm-kept-fib.err" 2>/dev/null || true
+    return 1
+  fi
+  fib_ip="$(awk '/\|--/ { addr = $2 }
+                 /\/32 host LOCAL/ && addr !~ /^127\./ { print addr; exit }' "$WORK/eib-vm-kept-fib.out")"
+  echo "the resumed box's own address (fib_trie): ${fib_ip:-<none>}"
+  if [ "$fib_ip" != "$switch" ]; then
+    echo "::error::the resumed box does not hold its row's switch address $switch (got: '${fib_ip:-<none>}')"
+    return 1
+  fi
+  zone="$(mnl session exec "$sid" "getent ahostsv4 host.min.internal" \
+    2>"$WORK/eib-vm-kept-zone.err" | awk 'NR == 1 { print $1 }' | tr -d '\r')" || true
+  echo "host.min.internal from the resumed box -> ${zone:-<none>}"
+  if ! printf '%s' "$zone" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+    echo "::error::host.min.internal did not resolve from the resumed box — its frames are not decided by a row (got '${zone:-none}')"
+    cat "$WORK/eib-vm-kept-zone.err" 2>/dev/null || true
+    return 1
+  fi
+  echo "an exec into the kept box resumed its row: the same box id, switch address $switch and allow-list, held by the box, and its frames pass the gate again (NET-138)"
+}
+
+# ---------------------------------------------------------------------------
 # `min net expose` from inside the box, end to end (NET-043, NET-045, NET-046,
 # NET-047): the request a process in the box sends with the CLI's own helper,
 # every stance a box's create can name, and the two records every decision
@@ -17690,17 +24882,11 @@ PY
 #     info line NET-044's observability owes every decided request; the
 #     NET-040 attach record names only a create's declared mappings, and
 #     this box declares none) records the same address, and the host's own
-#     probe at that address meets the contract NET-047 pins for a
-#     runtime-only port: the publish is BOUND on the host, but the box's
-#     relay gate has not admitted it — the gate's set is the declared ports
-#     plus the listen watcher's publishes (switch.rs `admits_tcp`), and an
-#     expose publishes without admitting, so the live row reads
-#     `(pending; not yet reachable)` and a host connect delivers nothing of
-#     the box. The listener stands inside the box first, so the refusal
-#     cannot be blamed on a port nothing answers for. The reach itself —
-#     the gate growing to admit runtime publishes — is T97's work
-#     (gominimal/minimal#1897), and this case asserts today's contract so
-#     that task has a leg to flip;
+#     probe at that address reaches the in-box server and gets its
+#     response (NET-044): the publish admits the port at the box's relay
+#     gate (switch.rs `admits_tcp`) as it binds the forward, so the live
+#     row carries no pending caveat. The listener stands inside the box
+#     first, so a miss cannot be blamed on a port nothing answers for;
 #   * an ask box, answered YES through a real pty attach
 #     (scripts/e2e-attach-pty.py, `E2E_PTY_ASK=allow`) — the request is
 #     driven from an exec OUTSIDE the attach, so the dialog reaching the
@@ -17721,21 +24907,40 @@ PY
 # carries each request, its decision and its record. The `min bug` bundle a
 # failing run writes ships the audit tail (diag.rs' audit collector) beside
 # the daemon log tail, so a lane that cannot read this case's prints still
-# carries both records.
+# carries both records. On a VM lane the audit is the VM host daemon's own
+# box-admissions.log: its tail rides the failure handler's state-dir read,
+# beside the bundle's minvmd log and the nested in-VM daemon log the guest
+# bundle carries.
 #
-# The lane split: a VM lane holds an allow stance since T94 but not yet an
-# ask stance (T96), so there the case asserts the ask create's typed refusal
-# (`assert_vm_refuses_dynamic_stance`) and counts its positive legs NOT RUN,
-# T97's to add (gominimal/minimal#1970).
+# The lane split: on a VM lane the whole case runs against the VM host
+# daemon, whose records replace the guest daemon's. The allow stance's
+# publish crosses the report door T94 opened (`report_admitted_port`): the
+# host-held row admits the runtime port at the switch address the box's
+# registration named (`minvmd status --row`), and the admission's own copy
+# lands in the VM host daemon's owner-only host audit (T84) — printed,
+# like every record this case asserts. The deny stance is decided inside
+# the box, so nothing is admitted on the host: no live row and an empty
+# runtime set. The decision still crosses the report door (NET-046), so the
+# host audit holds exactly one deny line for it. The host's own probe at the published address must reach the
+# in-box server and get its response (NET-044). The ask legs
+# (`eib_vm_ask_legs` above) are the host-attached human's. And the expose half of T61 lands on this lane: a
+# box created on the non-default VM (`min --vm alpha session activate`,
+# autospawning the VM) publishes an in-box expose THERE, driven through
+# the flagless `min session attach` that finds the VM from the box name —
+# the one verb that resolves a box name across the machine's VMs — with
+# alpha's own row and alpha's own audit carrying the admission while the
+# default VM answers `no row` and holds no line for the box.
 proof_expose_from_inside_box() {
   echo "::group::min net expose from inside the box: allow publishes, ask asks the attached human, deny and nobody-attached refuse, and every decision is audited (NET-043, NET-045, NET-046, NET-047)"
 
   local eib_allow_sid="" eib_yes_sid="" eib_no_sid="" eib_nobody_sid="" eib_deny_sid=""
   local eib_out="" eib_rc="" eib_err="" eib_addr="" eib_log="" eib_rec="" eib_hrc="" eib_hms=""
   local eib_rec_addr="" eib_t0="" eib_t1=""
-  local eib_policy="" eib_pid="" eib_prc="" eib_live="" eib_listening="" eib_hstatus="" eib_body=""
+  local eib_policy="" eib_pid="" eib_prc="" eib_live="" eib_listening="" eib_hstatus=""
+  local eib_reached="" eib_policy_row=""
   local eib_allow_name="e2e-inside-allow" eib_yes_name="e2e-inside-ask-yes"
   local eib_no_name="e2e-inside-ask-no" eib_nobody_name="e2e-inside-ask-nobody"
+  local eib_kept_name="e2e-inside-kept"
   local eib_deny_name="e2e-inside-deny"
   local eib_port=3000                  # the port every box asks for
   local eib_lo=3000 eib_hi=3005        # the range every create declares
@@ -17749,26 +24954,530 @@ proof_expose_from_inside_box() {
     echo "::endgroup::"
     return 0
   fi
-  if [ ! -c /dev/net/tun ]; then
-    echo "expose from inside the box SKIPPED (no /dev/net/tun on this host: an own-IP box cannot open its in-namespace tap; runs for real on a host that has the device)"
+  if [ -z "${E2E_VM:-}" ] && [ ! -c /dev/net/tun ]; then
+    echo "expose from inside the box SKIPPED (no /dev/net/tun on this host: a native own-IP box cannot open its in-namespace tap; a VM lane opens it inside the guest and runs this case)"
     echo "::endgroup::"
     return 0
   fi
 
-  # ---- a VM lane: the ask create's typed refusal is the assertion ---------
-  # An allow create stands on a VM lane since T94 — its publish rides the VM
-  # host daemon's admission, which the mnx case proves there — but the ask
-  # create is still refused before any box exists, until the answered ask
-  # reaches the host-held row (T96). The allow legs below read the daemon's
-  # own log and audit file on this host, which a VM lane's guest daemon does
-  # not write here, so they are counted NOT RUN on a VM lane and land there
-  # with T97 (gominimal/minimal#1970).
+  # ---- a VM lane: the whole case runs against the VM host daemon ----------
+  # The records this lane's legs read are the VM host daemon's own (T84): its
+  # host-held row table (`minvmd status --row <name>`) and its owner-only
+  # host audit (audit/box-admissions.log). The allow stance's publish crosses
+  # the report door T94 opened: the guest daemon reports it, the host admits
+  # the runtime port into the row, and the admission's own copy lands in the
+  # host audit. The ask stays with `eib_vm_ask_legs` — the human attached on
+  # the host answers. The deny is decided inside the box, so nothing is
+  # admitted on the host, and its one audit line is reported there. The two-VM leg at the end is the
+  # expose half of T61: a box on the non-default VM publishes there.
   if [ -n "${E2E_VM:-}" ]; then
-    assert_vm_refuses_dynamic_stance ask "$eib_yes_name" eib-inside-ask \
-      --dynamic-range "$eib_lo-$eib_hi"
-    not_run expose_from_inside_box \
-      "VM lane: the allow, answered-ask and audit legs read the host daemon's own log and audit file, which the guest daemon does not write here — T97, gominimal/minimal#1970"
-    echo "expose from inside the box OK on a VM lane (ask refused at the create with the typed T96 reason; the allow and audit legs are T97's on this lane)"
+    local eib_vm_sids=""
+    local eib_vm_root="$XDG_STATE_HOME/minimal/providers/local-minvmd0"
+    local eib_vm_audit="$eib_vm_root/audit/box-admissions.log"
+    local eib_vm_reg="" eib_vm_switch="" eib_vm_row="" eib_vm_line=""
+    local eib_two_name="e2e-inside-alpha" eib_two_vm="alpha"
+    local eib_two_sid="" eib_two_reg="" eib_two_switch="" eib_two_row=""
+    local eib_two_line="" eib_two_attach="" eib_two_skip=""
+    local eib_two_audit="" eib_two_drc=0 eib_two_drow=""
+    local eib_two_stopped="" eib_vm_ok="" EIB_TWO_SEED_DIR=""
+    eib_vm_sids="$WORK/eib-vm-sids"
+    : > "$eib_vm_sids"
+
+    # Whether a `minvmd status --row` answer is the box's row at its switch
+    # address (the one its registration named) with the expose's port in its
+    # runtime set.
+    eib_vm_row_holds() { # $1 row, $2 switch address, $3 port (default $eib_port)
+      local p="${3:-$eib_port}"
+      [ -n "$2" ] && [[ "$1" == *" switch $2 "* ]] || return 1
+      [[ "$1" =~ runtime\ \[([0-9]+,)*$p(,[0-9]+)*\] ]]
+    }
+    # The admission line the VM host audit owes a report a host admitted
+    # (T84): the box, the port with its ending delimiter, and the source the
+    # report carried — an expose's is 'expose'.
+    eib_vm_admission_line() { # $1 box, $2 port (default $eib_port)
+      grep -F "\"box\":\"$1\"" "$eib_vm_audit" 2>/dev/null \
+        | grep -E "\"port\":${2:-$eib_port}[,}]" \
+        | grep -F '"source":"expose"' | tail -n1
+    }
+    # The named VM's own CLI surface, exactly as a user types it
+    # (two_named_vms' two_vm_mn).
+    eib_two_mn() {
+      # shellcheck disable=SC2086
+      min ${E2E_MINIMAL_ARGS:-} --vm "$eib_two_vm" "$@"
+    }
+
+    # ---- the allow box: the publish crosses to the host (T94) --------------
+    # The registration's own word for the address the host row is keyed at:
+    # the BOX REGISTRATION line on the activate's stderr, the same read the
+    # row-read case makes.
+    EIB_ALLOW_SEED_DIR="$(hook_mktemp /tmp/mnlevm.XXXXXX)"
+    hook_seed_preamble > "$EIB_ALLOW_SEED_DIR/minimal.toml"
+    mkdir "$EIB_ALLOW_SEED_DIR/.git"
+    eib_allow_sid="$(cd "$EIB_ALLOW_SEED_DIR" && mnl session activate . --no-prompt \
+      --name "$eib_allow_name" --network own_ip \
+      --dynamic-ingress allow --dynamic-range "$eib_lo-$eib_hi" \
+      2>"$WORK/eib-vm-allow-activate.err")" || {
+      echo "::error::'min session activate --network own_ip --dynamic-ingress allow --dynamic-range $eib_lo-$eib_hi' failed for the allow box on a VM lane"
+      echo "--- stderr ---"; cat "$WORK/eib-vm-allow-activate.err" 2>/dev/null || true
+      rm -rf "$EIB_ALLOW_SEED_DIR"
+      fail
+    }
+    eib_allow_sid="$(printf '%s\n' "$eib_allow_sid" | tail -n1 | tr -d '\r')"
+    echo "$eib_allow_sid" >>"$eib_vm_sids"
+    echo "allow box (VM lane): $eib_allow_sid ($eib_allow_name, dynamic ingress allow over $eib_lo-$eib_hi)"
+    eib_vm_reg="$(grep -F -- 'BOX REGISTRATION:' "$WORK/eib-vm-allow-activate.err" 2>/dev/null | tail -n1)"
+    eib_vm_switch="$(printf '%s\n' "$eib_vm_reg" | sed -n 's/.*switch address \([0-9.]*\).*/\1/p')"
+    if [ -z "$eib_vm_switch" ]; then
+      echo "::error::the allow box's registration printed no switch address — the host row the admission lands in is keyed at one"
+      cat "$WORK/eib-vm-allow-activate.err" 2>/dev/null || true
+      rm -rf "$EIB_ALLOW_SEED_DIR"
+      fail
+    fi
+    echo "registration: $eib_vm_reg (the host row is keyed at switch address $eib_vm_switch)"
+    mnl session exec "$eib_allow_sid" 'test -x /usr/bin/min' >/dev/null 2>&1 \
+      || { echo "::error::the allow box has no min helper at /usr/bin/min (the daemon installs one in every box)"; fail; }
+    mnl session exec "$eib_allow_sid" 'test -x /usr/bin/socat' >/dev/null 2>&1 \
+      || { echo "::error::the allow box has no socat at /usr/bin/socat (a launcher baseline package — every box ships one)"; fail; }
+
+    # The request itself, sent from inside the box with its own helper.
+    mnl session exec "$eib_allow_sid" "/usr/bin/min net expose $eib_port" \
+      >"$WORK/eib-vm-allow-expose.out" 2>"$WORK/eib-vm-allow-expose.err"
+    eib_rc=$?
+    eib_out="$(cat "$WORK/eib-vm-allow-expose.out" 2>/dev/null)"
+    eib_err="$(tr '\n' ' ' < "$WORK/eib-vm-allow-expose.err" 2>/dev/null)"
+    echo "expose: min net expose $eib_port in the allow box (VM lane) -> exit $eib_rc: ${eib_out:-<no reply>}${eib_err:+ [$eib_err]}"
+    if [ "$eib_rc" -ne 0 ]; then
+      echo "::error::the allow box's expose failed on a VM lane — the box was created allow over $eib_lo-$eib_hi and asked for $eib_port (got: '$eib_err')"
+      cat "$WORK/eib-vm-allow-expose.err" 2>/dev/null || true
+      fail
+    fi
+    case "$eib_out" in
+      "published port $eib_port at "*":$eib_port") ;;
+      *)
+        echo "::error::the expose's reply is not a publish line naming the port and its address (got: '$eib_out')"
+        fail
+        ;;
+    esac
+    echo "the allow stance published through the VM host daemon's admission: $eib_out (NET-043, NET-044)"
+    eib_addr="$(printf '%s\n' "$eib_out" | sed -n "s/^published port $eib_port at \(.*\):$eib_port.*/\1/p")"
+    if [ -z "$eib_addr" ]; then
+      echo "::error::the publish reply named no address (got: '$eib_out')"
+      fail
+    fi
+
+    # The host-side admission (T94): the runtime port the report named,
+    # admitted into the host-held row at the switch address the
+    # registration gave — read from the VM host daemon's own table, the
+    # surface a person on this host reads.
+    eib_vm_row=""
+    for _ in $(seq 1 40); do
+      eib_vm_row="$(minvmd status --row "$eib_allow_name" 2>/dev/null || true)"
+      if eib_vm_row_holds "$eib_vm_row" "$eib_vm_switch"; then break; fi
+      eib_vm_row=""
+      sleep 0.25
+    done
+    if [ -z "$eib_vm_row" ]; then
+      echo "::error::the VM host daemon's row never admitted the allow box's runtime port $eib_port at switch address $eib_vm_switch (T94)"
+      echo "minvmd status --row $eib_allow_name -> '$(minvmd status --row "$eib_allow_name" 2>&1 || true)'"
+      fail
+    fi
+    echo "host row: $eib_vm_row (the runtime publish is admitted in the VM host daemon's own table, T94, NET-044)"
+
+    # The admission's own copy in the owner-only host audit (T84): the one
+    # record a person reads to see what a guest admitted.
+    eib_vm_line=""
+    for _ in $(seq 1 20); do
+      eib_vm_line="$(eib_vm_admission_line "$eib_allow_name")"
+      [ -n "$eib_vm_line" ] && break
+      sleep 0.25
+    done
+    if [ -z "$eib_vm_line" ]; then
+      echo "::error::the VM host daemon's host audit carries no admission line for $eib_allow_name's publish on port $eib_port (T84, T94)"
+      grep -F "\"box\":\"$eib_allow_name\"" "$eib_vm_audit" 2>/dev/null | sed 's/^/  /' || true
+      fail
+    fi
+    echo "host audit: $eib_vm_line (the admission's own line in the owner-only host audit, T84, NET-046)"
+
+    # The listener inside the box, started after the publish the way the
+    # native lane starts its own, so the host probe below cannot blame a
+    # port nothing answers for.
+    mnl session exec "$eib_allow_sid" \
+      "body=$eib_marker; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/eib-http200" \
+      >/dev/null 2>"$WORK/eib-vm-allow-responder.err" \
+      || { echo "::error::could not write the in-box responder's response"; cat "$WORK/eib-vm-allow-responder.err" 2>/dev/null || true; fail; }
+    mnl session exec "$eib_allow_sid" \
+      "nohup /usr/bin/socat TCP-LISTEN:$eib_port,reuseaddr,fork SYSTEM:\"cat /home/eib-http200\" >/dev/null 2>&1 &" \
+      >/dev/null 2>>"$WORK/eib-vm-allow-responder.err" \
+      || { echo "::error::could not start the in-box responder on port $eib_port"; cat "$WORK/eib-vm-allow-responder.err" 2>/dev/null || true; fail; }
+    eib_listening=""
+    for _ in $(seq 1 40); do
+      if [ "$(mnl session exec "$eib_allow_sid" \
+        "curl -sS --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:$eib_port/" \
+        2>/dev/null || true)" = "200" ]; then
+        eib_listening=1
+        break
+      fi
+      sleep 0.25
+    done
+    if [ -z "$eib_listening" ]; then
+      echo "::error::the in-box responder on port $eib_port never answered a direct curl — the host probe below could not be told from a listener that never started"
+      echo "--- socat exec stderr ---"; cat "$WORK/eib-vm-allow-responder.err" 2>/dev/null || true
+      fail
+    fi
+    echo "listener: socat now serves port $eib_port inside the allow box (its own loopback answers $eib_marker)"
+
+    # The host's own probe at the published address (NET-044): an allowed
+    # expose is reachable, so the probe must reach the in-box server through
+    # the published address and get its response, the marker. Polled, so a
+    # forward still settling is not a verdict.
+    eib_reached=""
+    for _ in $(seq 1 20); do
+      eib_t0=$(now_ms)
+      env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+        -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+        curl -sS --max-time 3 -o "$WORK/eib-vm-host.body" -w '%{http_code}' \
+        "http://$eib_addr:$eib_port/" >"$WORK/eib-vm-host.out" 2>"$WORK/eib-vm-host.err"
+      eib_hrc=$?
+      eib_t1=$(now_ms)
+      eib_hms=$((eib_t1 - eib_t0))
+      eib_hstatus="$(tail -n1 "$WORK/eib-vm-host.out" 2>/dev/null | tr -d '\r\n')"
+      if grep -qF "$eib_marker" "$WORK/eib-vm-host.body" 2>/dev/null; then
+        eib_reached=1
+        break
+      fi
+      sleep 0.25
+    done
+    echo "host probe: GET http://$eib_addr:$eib_port/ -> curl exit $eib_hrc in ${eib_hms}ms (status ${eib_hstatus:-none})"
+    if [ -z "$eib_reached" ]; then
+      echo "::error::the host probe at $eib_addr:$eib_port did not reach the allow box's in-box server on a VM lane (curl exit $eib_hrc, status ${eib_hstatus:-none}) — the allow-exposed port is not admitted at the guest relay gate (NET-044)"
+      cat "$WORK/eib-vm-host.err" 2>/dev/null || true
+      fail
+    fi
+    echo "the host probe reached the allow box's in-box server through the published address and got its marker (NET-044)"
+
+    # The publish listed beside the declaration, read the way a person reads
+    # it (NET-044): one live row for the port. The row's trailing text is
+    # printed as evidence, not asserted.
+    eib_policy="$(mnl session policy "$eib_allow_sid" 2>"$WORK/eib-vm-allow-policy.err")" \
+      || { echo "::error::'min session policy' failed for the allow box on a VM lane"; cat "$WORK/eib-vm-allow-policy.err" 2>/dev/null || true; fail; }
+    echo "--- min session policy (text, the allow box, VM lane) ---"; printf '%s\n' "$eib_policy" | sed 's/^/  /'
+    eib_policy_row="$(printf '%s\n' "$eib_policy" | grep -F ":$eib_port → :$eib_port" | head -n1)"
+    if [ -z "$eib_policy_row" ]; then
+      echo "::error::min session policy lists no live row for :$eib_port on a VM lane — the runtime publish is not listed beside the declaration (NET-044)"
+      fail
+    fi
+    echo "policy (text): one live row for :$eib_port (NET-044); observed: $eib_policy_row"
+
+    # ---- the ask legs: the human attached on the host answers (T96) --------
+    # On a VM lane every box publishes at the host's 127.0.0.1, and the allow
+    # box above still holds its expose of $eib_port there, so the ask legs ask
+    # for the next port in the same declared range: a second expose of one
+    # host address:port is gvproxy's "proxy already running", not an answer.
+    eib_vm_ask_legs "$((eib_port + 1))" "$eib_lo" "$eib_hi" \
+      "$eib_yes_name" "$eib_no_name" "$eib_nobody_name" 3>>"$eib_vm_sids"
+
+    # ---- a registered box's shell exits: the kept box resumes (NET-138) ---
+    eib_vm_kept_box_resumes_leg "$eib_kept_name" 3>>"$eib_vm_sids" || fail
+
+    # ---- the deny box: refused inside the box, recorded nowhere -------------
+    EIB_DENY_SEED_DIR="$(hook_mktemp /tmp/mnlevd.XXXXXX)"
+    hook_seed_preamble > "$EIB_DENY_SEED_DIR/minimal.toml"
+    mkdir "$EIB_DENY_SEED_DIR/.git"
+    eib_deny_sid="$(cd "$EIB_DENY_SEED_DIR" && mnl session activate . --no-prompt \
+      --name "$eib_deny_name" --network own_ip \
+      --dynamic-ingress deny --dynamic-range "$eib_lo-$eib_hi" \
+      2>"$WORK/eib-vm-deny-activate.err")" || {
+      echo "::error::'min session activate --network own_ip --dynamic-ingress deny --dynamic-range $eib_lo-$eib_hi' failed for the deny box on a VM lane"
+      echo "--- stderr ---"; cat "$WORK/eib-vm-deny-activate.err" 2>/dev/null || true
+      rm -rf "$EIB_DENY_SEED_DIR"
+      fail
+    }
+    eib_deny_sid="$(printf '%s\n' "$eib_deny_sid" | tail -n1 | tr -d '\r')"
+    echo "$eib_deny_sid" >>"$eib_vm_sids"
+    echo "deny box (VM lane): $eib_deny_sid ($eib_deny_name, dynamic ingress deny over $eib_lo-$eib_hi)"
+    mnl session exec "$eib_deny_sid" "/usr/bin/min net expose $eib_port" \
+      >"$WORK/eib-vm-deny-expose.out" 2>"$WORK/eib-vm-deny-expose.err"
+    eib_rc=$?
+    eib_out="$(cat "$WORK/eib-vm-deny-expose.out" 2>/dev/null)"
+    eib_err="$(tr '\n' ' ' < "$WORK/eib-vm-deny-expose.err" 2>/dev/null)"
+    echo "expose: min net expose $eib_port in the deny box (VM lane) -> exit $eib_rc: ${eib_err:-<no error>}"
+    if [ "$eib_rc" -eq 0 ]; then
+      echo "::error::the deny box's expose succeeded on a VM lane — a box created --dynamic-ingress deny must refuse every ask"
+      cat "$WORK/eib-vm-deny-expose.out" 2>/dev/null || true
+      fail
+    fi
+    case "$eib_err" in
+      *"dynamic ingress is denied for this box"*) ;;
+      *) echo "::error::the deny box's refusal does not say dynamic ingress is denied for the box (got: '$eib_err')"; fail ;;
+    esac
+    echo "deny box: refused with the deny the stance spells (NET-043)"
+    # The guest decided deny, so nothing is admitted on the host: no live row
+    # in the box's own listing and an empty runtime set in the host-held row.
+    # The decision itself still crosses the report door (NET-046), so the host
+    # audit holds exactly one expose_decision line for it.
+    eib_policy="$(mnl session policy "$eib_deny_sid" 2>"$WORK/eib-vm-deny-policy.err")" \
+      || { echo "::error::'min session policy' failed for the deny box on a VM lane"; cat "$WORK/eib-vm-deny-policy.err" 2>/dev/null || true; fail; }
+    case "$eib_policy" in
+      *"live ingress (published at runtime)"*)
+        echo "::error::the deny box lists a live ingress row — a stance that refuses every ask must record nothing (NET-044)"
+        fail
+        ;;
+    esac
+    eib_vm_row="$(minvmd status --row "$eib_deny_name" 2>/dev/null || true)"
+    case "$eib_vm_row" in
+      "box $eib_deny_name switch "*) ;;
+      *)
+        echo "::error::the VM host daemon holds no row for the deny box — its registration created one"
+        echo "minvmd status --row $eib_deny_name -> '${eib_vm_row:-<no answer>}'"
+        fail
+        ;;
+    esac
+    case "$eib_vm_row" in
+      *" runtime []"*) ;;
+      *)
+        echo "::error::the VM host daemon's row holds a runtime port for the deny box — nothing was reported, so nothing may be admitted (T94)"
+        echo "minvmd status --row $eib_deny_name -> '$eib_vm_row'"
+        fail
+        ;;
+    esac
+    # The report is sent after the refusal, so poll briefly for its line.
+    eib_deny_lines=""
+    eib_deny_count=0
+    for _ in $(seq 1 20); do
+      eib_deny_lines="$(grep -F "\"box\":\"$eib_deny_name\"" "$eib_vm_audit" 2>/dev/null \
+        | grep -F '"event":"expose_decision"' || true)"
+      eib_deny_count="$(printf '%s' "$eib_deny_lines" | grep -c . || true)"
+      [ "$eib_deny_count" -ge 1 ] && break
+      sleep 0.25
+    done
+    if [ "$eib_deny_count" -ne 1 ]; then
+      echo "::error::the VM host daemon's host audit carries $eib_deny_count expose_decision lines for $eib_deny_name — the deny decided in the box must reach the host as exactly one line (NET-046)"
+      grep -F "\"box\":\"$eib_deny_name\"" "$eib_vm_audit" 2>/dev/null | sed 's/^/  /' || true
+      fail
+    fi
+    case "$eib_deny_lines" in
+      *'"reported_by":"guest"'*'"decision":"deny"'*'"decided_by":"box-policy"'*'"outcome":"refused"'*) ;;
+      *)
+        echo "::error::the host audit's expose_decision line for $eib_deny_name is not a deny reported by the guest, decided by box-policy and refused (NET-046)"
+        echo "  $eib_deny_lines"
+        fail
+        ;;
+    esac
+    echo "host audit: $eib_deny_lines (the deny decided in the box, reported to the host, NET-046)"
+    echo "the deny admitted nothing: no live row and an empty runtime set in the host row, and the host audit holds the one deny line (NET-044, NET-046)"
+
+    while IFS= read -r eib_vm_sid; do
+      [ -n "$eib_vm_sid" ] && { mnl session destroy --force "$eib_vm_sid" >/dev/null 2>&1 || true; }
+    done < "$eib_vm_sids"
+    rm -rf "$EIB_ALLOW_SEED_DIR" "$EIB_DENY_SEED_DIR"
+
+    # ---- two named VMs: the expose half of T61 ------------------------------
+    # Alpha's switch publishes at the same host 127.0.0.1 as the default VM.
+    # Each host 127.0.0.1:port carries one gvproxy forward, and a forward the
+    # default VM's boxes published can outlive those boxes (a VM box's declared
+    # forwards are not yet unbound when it ends), so this leg asks for its own
+    # port in the declared range.
+    local eib_two_port=$((eib_port + 2))
+    # A box on the NON-DEFAULT VM publishes there. `min --vm alpha session
+    # activate` creates the box on alpha (autospawning and booting it), the
+    # expose runs inside a FLAGLESS `min session attach` by the box's name —
+    # the one verb that resolves a box name across the machine's VMs — and
+    # the records land in alpha's own row and alpha's own audit, never the
+    # default VM's. Gated the way the two-named-VMs case gates itself: a
+    # daemon that is not minvmd hosts no named VM, a host without the guest
+    # images cannot boot one, and on Linux the hypervisor is /dev/kvm.
+    eib_two_skip=""
+    if [ "$min_daemon" != minvmd ]; then
+      eib_two_skip="this run drives '$min_daemon': a named VM is a minvmd-backed story"
+    else
+      locate_vm_guest_images
+      if [ ! -f "$STAGED_KERNEL" ] || [ ! -f "$STAGED_ROOTFS" ] || [ ! -f "$STAGED_INITRAMFS" ]; then
+        eib_two_skip="guest images not available: the second VM cannot boot"
+      elif [ "$(uname -s)" = Linux ] && { [ ! -e /dev/kvm ] || [ ! -w /dev/kvm ]; }; then
+        eib_two_skip="no writable /dev/kvm: this Linux host cannot boot a second VM"
+      fi
+    fi
+    if [ -n "$eib_two_skip" ]; then
+      echo "two named VMs (expose half, VM lane) SKIPPED ($eib_two_skip)"
+    else
+      # A named VM left up by an earlier run would answer the by-name
+      # lookups below, so any live one is stopped first: every boot after
+      # this line is this leg's own (a VM that was never created answers
+      # 'stopped' already — status.rs renders NotProvisioned as stopped).
+      TWO_VM_NAME="$eib_two_vm" # teardown stops the named VM if this leg dies mid-flight
+      minvmd --vm "$eib_two_vm" stop >/dev/null 2>&1 || true
+      eib_two_stopped=""
+      for _ in $(seq 1 30); do
+        case "$(minvmd --vm "$eib_two_vm" status --json 2>/dev/null || true)" in
+          *'"state":"stopped"'*) eib_two_stopped=1; break ;;
+        esac
+        sleep 1
+      done
+      if [ -z "$eib_two_stopped" ]; then
+        echo "::error::a live named VM '$eib_two_vm' would not stop — this leg cannot boot its own"
+        minvmd --vm "$eib_two_vm" status --json 2>&1 || true
+        fail
+      fi
+
+      EIB_TWO_SEED_DIR="$(hook_mktemp /tmp/mnlevt.XXXXXX)"
+      hook_seed_preamble > "$EIB_TWO_SEED_DIR/minimal.toml"
+      mkdir "$EIB_TWO_SEED_DIR/.git"
+      eib_two_sid="$(cd "$EIB_TWO_SEED_DIR" && eib_two_mn session activate . --no-prompt \
+        --name "$eib_two_name" --network own_ip \
+        --dynamic-ingress allow --dynamic-range "$eib_lo-$eib_hi" \
+        2>"$WORK/eib-vm-two-activate.err")" || {
+        echo "::error::'min --vm $eib_two_vm session activate --network own_ip --dynamic-ingress allow' failed — the named VM could not host the box"
+        echo "--- stderr ---"; cat "$WORK/eib-vm-two-activate.err" 2>/dev/null || true
+        echo "--- named VM run log (tail) ---"; tail -30 "$eib_vm_root/$eib_two_vm/run.log" 2>/dev/null || true
+        rm -rf "$EIB_TWO_SEED_DIR"
+        fail
+      }
+      eib_two_sid="$(printf '%s\n' "$eib_two_sid" | tail -n1 | tr -d '\r')"
+      echo "alpha box: $eib_two_sid ($eib_two_name on VM $eib_two_vm, dynamic ingress allow over $eib_lo-$eib_hi)"
+      eib_two_reg="$(grep -F -- 'BOX REGISTRATION:' "$WORK/eib-vm-two-activate.err" 2>/dev/null | tail -n1)"
+      eib_two_switch="$(printf '%s\n' "$eib_two_reg" | sed -n 's/.*switch address \([0-9.]*\).*/\1/p')"
+      if [ -z "$eib_two_switch" ]; then
+        echo "::error::the alpha box's registration printed no switch address — alpha's host row is keyed at one"
+        cat "$WORK/eib-vm-two-activate.err" 2>/dev/null || true
+        rm -rf "$EIB_TWO_SEED_DIR"
+        fail
+      fi
+      case "$eib_two_reg" in
+        *"on VM '$eib_two_vm'"*) ;;
+        *)
+          echo "::error::the alpha box's registration does not name VM '$eib_two_vm' — the box landed on another VM (got: '$eib_two_reg')"
+          rm -rf "$EIB_TWO_SEED_DIR"
+          fail
+          ;;
+      esac
+      echo "registration: $eib_two_reg"
+
+      # The resolution under test: a FLAGLESS attach by the box's name — the
+      # one verb that resolves a box name across the machine's VMs — with
+      # the expose typed at its terminal, the way the human attached to the
+      # box runs it. The driver types its commands on its own clock and they
+      # buffer in the pty until the shell is ready, so a cold first-boot
+      # mint inside the driver's 240 s deadline is fine. The `exit` ends the
+      # box with its shell (BOX-038), and it stays listed as exited for the
+      # destroy below.
+      # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+      eib_two_attach="$(
+        E2E_PTY_COMMANDS="/usr/bin/min net expose $eib_two_port
+sleep 2
+exit" \
+        python3 "$ROOT/scripts/e2e-attach-pty.py" - \
+        min ${E2E_MINIMAL_ARGS:-} session attach "$eib_two_name" \
+        2>"$WORK/eib-vm-two-attach.err")" || {
+        echo "::error::the flagless pty attach to the alpha box by name failed (NET-058)"
+        echo "--- stderr ---"; cat "$WORK/eib-vm-two-attach.err" 2>/dev/null || true
+        echo "--- named VM run log (tail) ---"; tail -30 "$eib_vm_root/$eib_two_vm/run.log" 2>/dev/null || true
+        rm -rf "$EIB_TWO_SEED_DIR"
+        fail
+      }
+      echo "--- the attached terminal (the flagless by-name attach, the expose typed at it, and its reply) ---"
+      printf '%s\n' "$eib_two_attach" | sed 's/^/  /'
+      if [[ "$eib_two_attach" != *"Attaching to session $eib_two_name ("*"on VM $eib_two_vm"* ]]; then
+        echo "::error::the flagless attach did not announce the alpha box on VM $eib_two_vm — the by-name resolution did not find the VM (NET-058)"
+        rm -rf "$EIB_TWO_SEED_DIR"
+        fail
+      fi
+      case "$eib_two_attach" in
+        *"published port $eib_two_port at "*":$eib_two_port"*) ;;
+        *)
+          echo "::error::the expose inside the alpha box did not publish — the reply never rendered on the attached terminal (NET-043)"
+          rm -rf "$EIB_TWO_SEED_DIR"
+          fail
+          ;;
+      esac
+      echo "the flagless attach found VM $eib_two_vm from the box name, and the expose typed inside published: $(printf '%s\n' "$eib_two_attach" | grep -F "published port $eib_two_port" | tail -n1 | tr -d '\r')"
+      if ! box_exited_check "$eib_two_sid" 0 "alpha box on VM $eib_two_vm" eib_two_mn; then
+        rm -rf "$EIB_TWO_SEED_DIR"
+        fail
+      fi
+
+      # The publish's records live on alpha (NET-055): alpha's own row holds
+      # the runtime port at alpha's registration address, and alpha's own
+      # audit carries the admission line — while the default VM answers
+      # `no row` for the box and its audit holds no line at all.
+      eib_two_row=""
+      for _ in $(seq 1 40); do
+        eib_two_row="$(minvmd --vm "$eib_two_vm" status --row "$eib_two_name" 2>/dev/null || true)"
+        if eib_vm_row_holds "$eib_two_row" "$eib_two_switch" "$eib_two_port"; then break; fi
+        eib_two_row=""
+        sleep 0.25
+      done
+      if [ -z "$eib_two_row" ]; then
+        echo "::error::alpha's own row never admitted the runtime port $eib_two_port at switch address $eib_two_switch — the expose inside its box published nowhere (T94, NET-055)"
+        echo "minvmd --vm $eib_two_vm status --row $eib_two_name -> '$(minvmd --vm "$eib_two_vm" status --row "$eib_two_name" 2>&1 || true)'"
+        rm -rf "$EIB_TWO_SEED_DIR"
+        fail
+      fi
+      echo "alpha's row: $eib_two_row (the publish is admitted in the named VM's own table, T94, NET-055)"
+      eib_two_audit="$eib_vm_root/$eib_two_vm/audit/box-admissions.log"
+      eib_two_line=""
+      for _ in $(seq 1 20); do
+        eib_two_line="$(grep -F "\"box\":\"$eib_two_name\"" "$eib_two_audit" 2>/dev/null \
+          | grep -E "\"port\":${eib_two_port}[,}]" | grep -F '"source":"expose"' | tail -n1)"
+        [ -n "$eib_two_line" ] && break
+        sleep 0.25
+      done
+      if [ -z "$eib_two_line" ]; then
+        echo "::error::alpha's own host audit carries no admission line for the box's publish — the publish's records never crossed to its VM (T84, NET-055)"
+        grep -F "\"box\":\"$eib_two_name\"" "$eib_two_audit" 2>/dev/null | sed 's/^/  /' || true
+        rm -rf "$EIB_TWO_SEED_DIR"
+        fail
+      fi
+      echo "alpha's audit: $eib_two_line (the admission's own line in the named VM's owner-only host audit, T84)"
+      minvmd status --row "$eib_two_name" >"$WORK/eib-vm-two-default-row.out" 2>/dev/null
+      eib_two_drc=$?
+      eib_two_drow="$(tr -d '\r\n' < "$WORK/eib-vm-two-default-row.out" 2>/dev/null)"
+      if [ "$eib_two_drc" -ne 1 ] || [ "$eib_two_drow" != "no row for $eib_two_name" ]; then
+        echo "::error::the DEFAULT VM answered the by-name row read for the alpha box — a box on the named VM must not exist on the default one (NET-055)"
+        echo "minvmd status --row $eib_two_name -> exit $eib_two_drc: '${eib_two_drow:-<no answer>}'"
+        rm -rf "$EIB_TWO_SEED_DIR"
+        fail
+      fi
+      echo "default VM: no row for $eib_two_name (the box exists only on $eib_two_vm, NET-055)"
+      if grep -qF "\"box\":\"$eib_two_name\"" "$eib_vm_audit" 2>/dev/null; then
+        echo "::error::the DEFAULT VM's host audit carries a line for the alpha box — the publish's records crossed to the wrong VM (T84, NET-055)"
+        grep -F "\"box\":\"$eib_two_name\"" "$eib_vm_audit" 2>/dev/null | sed 's/^/  /' || true
+        rm -rf "$EIB_TWO_SEED_DIR"
+        fail
+      fi
+      echo "default VM's audit: no line for the box (the admission lives only in $eib_two_vm's audit, NET-055)"
+
+      eib_two_mn session destroy --force "$eib_two_sid" >/dev/null 2>&1 || true
+      rm -rf "$EIB_TWO_SEED_DIR"
+      # The named VM is stopped here — not left to teardown — because the
+      # two-named-VMs case that follows asserts its own in-case boots, and
+      # TWO_VM_NAME stays set until the stop is observed so a failure above
+      # still hands teardown a VM to stop.
+      minvmd --vm "$eib_two_vm" stop >/dev/null 2>"$WORK/eib-vm-two-stop.err" || {
+        echo "::error::'minvmd --vm $eib_two_vm stop' failed after the two-VM leg"
+        cat "$WORK/eib-vm-two-stop.err" 2>/dev/null || true
+        fail
+      }
+      eib_two_stopped=""
+      for _ in $(seq 1 60); do
+        case "$(minvmd --vm "$eib_two_vm" status --json 2>/dev/null || true)" in
+          *'"state":"stopped"'*) eib_two_stopped=1; break ;;
+        esac
+        sleep 1
+      done
+      if [ -z "$eib_two_stopped" ]; then
+        echo "::error::the named VM '$eib_two_vm' never reached 'stopped' after the two-VM leg — the case after this one asserts its own in-case boots"
+        fail
+      fi
+      TWO_VM_NAME=""
+      echo "two named VMs: the expose inside the box on $eib_two_vm published on $eib_two_vm, and the named VM is stopped again (NET-055, NET-058)"
+    fi
+
+    eib_vm_ok="expose from inside the box OK on a VM lane (the allow stance published through the VM host daemon's admission — the row holds the port at the registration's switch address and the owner-only host audit carries the line, and the host reached the in-box server through the published address; the host's attached human's Allow published and their deny recorded nothing, a later expose asked again, nobody attached was refused, the deny box was refused with nothing admitted on the host and its deny recorded in the host audit, and every decision is a line in the VM host daemon's own audit"
+    if [ -n "$eib_two_skip" ]; then
+      echo "$eib_vm_ok; the two named VMs leg SKIPPED: $eib_two_skip)"
+    else
+      echo "$eib_vm_ok; and an expose inside a box on the non-default VM '$eib_two_vm' published there — found by the flagless attach through the box's name)"
+    fi
     echo "::endgroup::"
     return 0
   fi
@@ -17788,7 +25497,7 @@ proof_expose_from_inside_box() {
   # prefix mnl hands an autospawn (native_switch_daemon).
   mnl stop --force >/dev/null 2>&1 || true # a standalone run has no daemon yet
   eib_saved_rust_log="${RUST_LOG:-}"
-  export RUST_LOG="warn,minimald::session=info"
+  export RUST_LOG="warn,minimald::box_actor=info"
   eib_restore_log() {
     if [ -n "$eib_saved_rust_log" ]; then export RUST_LOG="$eib_saved_rust_log"; else unset RUST_LOG; fi
   }
@@ -17872,7 +25581,7 @@ if problems:
 PY
   }
 
-  # ---- the allow box: the publish, its recorded address, the pending gate ---
+  # ---- the allow box: the publish, its recorded address, its admission -----
   EIB_ALLOW_SEED_DIR="$(hook_mktemp /tmp/mnleia.XXXXXX)"
   hook_seed_preamble > "$EIB_ALLOW_SEED_DIR/minimal.toml"
   mkdir "$EIB_ALLOW_SEED_DIR/.git"
@@ -17930,7 +25639,6 @@ PY
     fail
   fi
   case "$eib_out" in
-    "published port $eib_port at "*":$eib_port; not yet reachable") ;;
     "published port $eib_port at "*":$eib_port") ;;
     *)
       echo "::error::the expose's reply is not a publish line naming the port and its address (got: '$eib_out')"
@@ -17974,11 +25682,10 @@ PY
   # The listener inside the box, started after the publish the way the mnx
   # case starts its own: its own direct answer proves the port answers
   # inside the box, so the host probe below cannot blame a port nothing
-  # listens on — and the watcher that sees the LISTEN settles it against the
-  # publication the expose already holds, without admitting it at the gate
-  # (listeners.rs: "left a listening port the runtime expose already
-  # published"), so the pending contract below is the gate's, not the
-  # listener's absence.
+  # listens on. The watcher that sees the LISTEN settles it against the
+  # publication the expose already holds (listeners.rs: "left a listening
+  # port the runtime expose already published"); the admission at the gate
+  # is the expose's own, made when it published (NET-044).
   mnl session exec "$eib_allow_sid" \
     "body=$eib_marker; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/eib-http200" \
     >/dev/null 2>"$WORK/eib-allow-responder.err" \
@@ -18005,50 +25712,55 @@ PY
   fi
   echo "listener: socat now serves port $eib_port inside the allow box (its own loopback answers $eib_marker)"
 
-  # The host's own probe at the recorded address — the pinned contract for a
-  # runtime-only publish (NET-047): the forward is BOUND on the host at the
-  # recorded address, but the box's relay gate has not admitted the port, so
-  # the connection is the relay's to answer, not the box's. Asserted as what
-  # the tree pins — never a delivered answer — with the mode the refusal took
-  # reported beside it; the reach is T97's to add (gominimal/minimal#1897),
-  # and its landing flips this leg to the delivered marker.
-  eib_t0=$(now_ms)
-  env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
-    -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
-    curl -sS --max-time 8 -o "$WORK/eib-host.body" -w '%{http_code}' \
-    "http://$eib_rec_addr/" >"$WORK/eib-host.out" 2>"$WORK/eib-host.err"
-  eib_hrc=$?
-  eib_t1=$(now_ms)
-  eib_hms=$((eib_t1 - eib_t0))
-  eib_hstatus="$(tail -n1 "$WORK/eib-host.out" 2>/dev/null | tr -d '\r\n')"
-  eib_body="$(cat "$WORK/eib-host.body" 2>/dev/null || true)"
-  echo "host probe: GET http://$eib_rec_addr/ -> curl exit $eib_hrc in ${eib_hms}ms (status ${eib_hstatus:-none}) — bound at the recorded address, and the relay gate has not admitted it (NET-047's pending contract)"
-  if [ "$eib_hrc" -eq 0 ] || [ "$eib_hstatus" = "200" ]; then
-    echo "::error::the host probe reached the allow box's runtime publish — the gate admitted a port no declaration names and no watcher published (NET-047)"
+  # The host's own probe at the recorded address (NET-044): an allowed
+  # expose is reachable, so the probe must reach the in-box server through
+  # the recorded address and get its response, the marker. Polled, so a
+  # forward still settling is not a verdict.
+  eib_reached=""
+  for _ in $(seq 1 20); do
+    eib_t0=$(now_ms)
+    env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+      -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+      curl -sS --max-time 3 -o "$WORK/eib-host.body" -w '%{http_code}' \
+      "http://$eib_rec_addr/" >"$WORK/eib-host.out" 2>"$WORK/eib-host.err"
+    eib_hrc=$?
+    eib_t1=$(now_ms)
+    eib_hms=$((eib_t1 - eib_t0))
+    eib_hstatus="$(tail -n1 "$WORK/eib-host.out" 2>/dev/null | tr -d '\r\n')"
+    if grep -qF "$eib_marker" "$WORK/eib-host.body" 2>/dev/null; then
+      eib_reached=1
+      break
+    fi
+    sleep 0.25
+  done
+  echo "host probe: GET http://$eib_rec_addr/ -> curl exit $eib_hrc in ${eib_hms}ms (status ${eib_hstatus:-none})"
+  if [ -z "$eib_reached" ]; then
+    echo "::error::the host probe at $eib_rec_addr did not reach the allow box's in-box server (curl exit $eib_hrc, status ${eib_hstatus:-none}) — the allow-exposed port is not admitted at the box's relay gate (NET-044)"
+    cat "$WORK/eib-host.err" 2>/dev/null || true
     eib_restore_log
     fail
   fi
-  if printf '%s' "$eib_body" | grep -qF "$eib_marker"; then
-    echo "::error::the host probe delivered the box's marker through a runtime publish the gate has not admitted (NET-047)"
-    eib_restore_log
-    fail
-  fi
+  echo "the host probe reached the allow box's in-box server through the recorded address and got its marker (NET-044)"
 
   # The publish listed beside the declaration, read the way a person reads it
-  # (NET-044): the live row carries the pending reading, spelled as the
-  # rendering pins it, until the gate admits the port.
+  # (NET-044): one live row for the port, with no pending caveat — the
+  # publish admitted the port at the gate.
   eib_policy="$(mnl session policy "$eib_allow_sid" 2>"$WORK/eib-allow-policy.err")" \
     || { echo "::error::'min session policy' failed for the allow box"; cat "$WORK/eib-allow-policy.err" 2>/dev/null || true; eib_restore_log; fail; }
   echo "--- min session policy (text, the allow box) ---"; printf '%s\n' "$eib_policy" | sed 's/^/  /'
-  case "$eib_policy" in
-    *":$eib_port → :$eib_port  (pending; not yet reachable)"*) ;;
-    *)
-      echo "::error::the live row for :$eib_port does not read '(pending; not yet reachable)' — the runtime publish is listed as reachable before the gate admitted it (NET-044, NET-047)"
+  eib_policy_row="$(printf '%s\n' "$eib_policy" | grep -F ":$eib_port → :$eib_port" | head -n1)"
+  case "$eib_policy_row" in
+    "") echo "::error::min session policy lists no live row for :$eib_port — the runtime publish is not listed beside the declaration (NET-044)"
+      eib_restore_log
+      fail
+      ;;
+    *"(pending"*|*"(unknown"*)
+      echo "::error::the live row for :$eib_port carries a reachability caveat ('$eib_policy_row') — the publish admitted the port at the gate, so the row must read as reachable (NET-044)"
       eib_restore_log
       fail
       ;;
   esac
-  echo "policy (text): one live row for :$eib_port, reading (pending; not yet reachable) — bound, listed, and honestly not reachable yet (NET-044, NET-047)"
+  echo "policy (text): one live row for :$eib_port, listed as reachable (NET-044): $eib_policy_row"
 
   if ! eib_audit_assert "$eib_allow_name" "$eib_port" allow box-policy published - \
       >"$WORK/eib-allow-audit.out" 2>"$WORK/eib-allow-audit.err"; then
@@ -18060,8 +25772,8 @@ PY
   sed 's/^/  /' "$WORK/eib-allow-audit.out" 2>/dev/null || true
 
   # ---- the ask box, answered yes by the attached human (NET-045) -----------
-  # The attach: a REAL pty (the sandbox case's driver), held open by a sleep
-  # and detached through the exit menu's keep lane when the commands end. The
+  # The attach: a REAL pty (the sandbox case's driver), held open by a sleep.
+  # Its `exit` ends the box with its shell (BOX-038) when the commands end. The
   # request is driven from an exec OUTSIDE the attach once the terminal is
   # live, so the dialog that renders on the attached terminal is the ask
   # ROUTED there (NET-045), and the driver answers it the way the daemon's
@@ -18084,7 +25796,7 @@ PY
   # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
   E2E_PTY_COMMANDS='> /home/eib-yes-live
 sleep 20
-exit' E2E_PTY_ASK=allow E2E_PTY_ANSWER=keep \
+exit' E2E_PTY_ASK=allow \
     python3 "$ROOT/scripts/e2e-attach-pty.py" - min ${E2E_MINIMAL_ARGS:-} session attach "$eib_yes_sid" \
     >"$WORK/eib-yes-attach.out" 2>"$WORK/eib-yes-attach.err" &
   eib_pid=$!
@@ -18121,9 +25833,11 @@ exit' E2E_PTY_ASK=allow E2E_PTY_ANSWER=keep \
     eib_restore_log
     fail
   fi
+  # The stream's `exit` ended the box with its shell (BOX-038).
+  box_exited_check "$eib_yes_sid" 0 "ask box (yes)" || { eib_restore_log; fail; }
   echo "--- the attached terminal (the ask dialog the request routed there, and its answer) ---"
   sed 's/^/  /' "$WORK/eib-yes-attach.out" 2>/dev/null || true
-  if ! grep -qF "asks to publish port $eib_port." "$WORK/eib-yes-attach.out" 2>/dev/null; then
+  if ! grep -qF "asks to publish port $eib_port/tcp." "$WORK/eib-yes-attach.out" 2>/dev/null; then
     echo "::error::the ask dialog never rendered on the attached terminal — the request was not routed to the attached human (NET-045)"
     eib_restore_log
     fail
@@ -18135,7 +25849,6 @@ exit' E2E_PTY_ASK=allow E2E_PTY_ANSWER=keep \
     fail
   fi
   case "$eib_out" in
-    "published port $eib_port at "*":$eib_port; not yet reachable") ;;
     "published port $eib_port at "*":$eib_port") ;;
     *)
       echo "::error::the answered-yes expose's reply is not a publish line naming the port and its address (got: '$eib_out')"
@@ -18175,7 +25888,7 @@ exit' E2E_PTY_ASK=allow E2E_PTY_ANSWER=keep \
   # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
   E2E_PTY_COMMANDS='> /home/eib-no-live
 sleep 20
-exit' E2E_PTY_ASK=deny E2E_PTY_ANSWER=keep \
+exit' E2E_PTY_ASK=deny \
     python3 "$ROOT/scripts/e2e-attach-pty.py" - min ${E2E_MINIMAL_ARGS:-} session attach "$eib_no_sid" \
     >"$WORK/eib-no-attach.out" 2>"$WORK/eib-no-attach.err" &
   eib_pid=$!
@@ -18212,9 +25925,11 @@ exit' E2E_PTY_ASK=deny E2E_PTY_ANSWER=keep \
     eib_restore_log
     fail
   fi
+  # The stream's `exit` ended the box with its shell (BOX-038).
+  box_exited_check "$eib_no_sid" 0 "second ask box" || { eib_restore_log; fail; }
   echo "--- the attached terminal (the ask dialog the request routed there, and its answer) ---"
   sed 's/^/  /' "$WORK/eib-no-attach.out" 2>/dev/null || true
-  if ! grep -qF "asks to publish port $eib_port." "$WORK/eib-no-attach.out" 2>/dev/null; then
+  if ! grep -qF "asks to publish port $eib_port/tcp." "$WORK/eib-no-attach.out" 2>/dev/null; then
     echo "::error::the ask dialog never rendered on the second ask box's terminal — the request was not routed to the attached human (NET-045)"
     eib_restore_log
     fail
@@ -18350,7 +26065,7 @@ exit' E2E_PTY_ASK=deny E2E_PTY_ANSWER=keep \
   mnl session destroy --force "$eib_deny_sid" >/dev/null 2>&1 || true
   rm -rf "$EIB_ALLOW_SEED_DIR" "$EIB_YES_SEED_DIR" "$EIB_NO_SEED_DIR" \
     "$EIB_NOBODY_SEED_DIR" "$EIB_DENY_SEED_DIR"
-  echo "expose from inside the box OK (allow published at the recorded address and listed pending; the attached human's Allow published and their deny refused it; nobody attached and the deny box were refused with their own typed errors; every decision carries its audit line)"
+  echo "expose from inside the box OK (allow published at the recorded address and listed reachable; the attached human's Allow published and their deny refused it; nobody attached and the deny box were refused with their own typed errors; every decision carries its audit line)"
   echo "::endgroup::"
 }
 
@@ -18496,7 +26211,7 @@ proof_proxy_refuses_like_direct() {
   for par_bind_try in 1 2 3 4 5; do
     par_ls_out="$(mnl ls 2>&1)"
     case "$par_ls_out" in
-      *"session hostnames will not route"*) par_bind_taken=1 ;;
+      *"warning: the hostname proxy is not serving"*) par_bind_taken=1 ;;
       *) par_bind_taken=0; break ;;
     esac
     [ "$par_bind_try" = 5 ] || sleep 3
@@ -18515,7 +26230,7 @@ proof_proxy_refuses_like_direct() {
   fi
 
   # socat carries the responders below and base64 carries the echo script in;
-  # both are launcher-baseline packages (crates/minimald/src/session_host.rs
+  # both are launcher-baseline packages (crates/minimald/src/box_runtime.rs
   # BASELINE_PACKAGES), at /usr/bin — packages install with --prefix=/usr and
   # the generic rootfs has no /bin, so the absolute paths are the daemon's own
   # convention for in-box argv.
@@ -18861,19 +26576,20 @@ PAR_EO
 # ---------------------------------------------------------------------------
 # The retired surfaces are gone, end to end (NET-109, NET-110). The mTLS/OIDC
 # HTTPS reverse proxy, its daemon-issued client certificates and the
-# `min ssh-forward` verb came out of the tree, `min login` stopped minting,
-# and `direct-tcpip` stayed — serving in EVERY build now that the feature
-# gate is gone. The source-scan unit tests (`retired_surfaces_absent`,
-# `login_mints_no_certificate`, `cli_reference_has_no_retired_commands`)
+# `min ssh-forward` verb came out of the tree, `min login` became the
+# GitHub sign-in (the same as `min auth login`), and `direct-tcpip` stayed — serving in EVERY build now that the feature
+# gate is gone. The unit tests (`retired_surfaces_absent`,
+# `login_runs_auth_login`, `cli_reference_has_no_retired_commands`)
 # hold the tree to that statically; this case holds the runtime to it, on
 # the build the lane actually drives:
 #
 #   * `min ssh-forward` does not parse — the argument parser refuses the
 #     verb by name, with its usage.
-#   * `min login` mints nothing: it succeeds without a daemon, prints the
-#     one nothing-to-mint line, and leaves no client.pem / client.key /
-#     ca.pem in the config directory where the mint used to write them —
-#     and the `--cert-dir` flag that steered those writes is refused too.
+#   * `min login --help` describes the GitHub sign-in. The case does not run
+#     `min login` itself: the lane has no terminal and no keychain, so the
+#     sign-in would fail or wait on GitHub. No client.pem / client.key /
+#     ca.pem exists in the config or state directory, and the `--cert-dir`
+#     flag that steered the retired writes is refused.
 #   * the retired proxy's :7655 listener is gone: with this run's daemon up,
 #     nothing answers HTTP there (the egress proxy's :7654 is the one
 #     listener left). No gate in front of this probe on purpose: a dev host
@@ -18937,29 +26653,20 @@ echo "::group::retired surfaces gone (ssh-forward, login, :7655, direct-tcpip)"
   fi
   echo "retired surface: min ssh-forward → refused (exit $retired_sf_rc: unrecognized subcommand 'ssh-forward')"
 
-  # ---- the retired mint: `min login` mints nothing --------------------------
-  # Runs without a daemon, prints the one notice, and leaves the config
-  # directory — where the minted client.pem/client.key/ca.pem used to land —
-  # exactly as it found it. The file list is snapshotted around the call so
-  # the assertion is about what THIS login did, not what the tree contains.
-  retired_config_before="$(find "$XDG_CONFIG_HOME" -type f 2>/dev/null | sort)"
-  retired_login="$(mnl login 2>"$WORK/retired-login.err")"
+  # ---- `min login` is the GitHub sign-in -----------------------------------
+  # Only its help: the sign-in itself needs a terminal or a keychain, and
+  # the lane has neither. No retired certificate material may exist either.
+  retired_login="$(mnl login --help 2>"$WORK/retired-login.err")"
   retired_login_rc=$?
   retired_login="$(printf '%s\n' "$retired_login" | tr -d '\r')"
-  if [ "$retired_login_rc" -ne 0 ] || [[ "$retired_login" != *"Nothing to mint"* ]]; then
-    echo "::error::'min login' did not print the nothing-to-mint notice (exit $retired_login_rc):"
+  if [ "$retired_login_rc" -ne 0 ] \
+    || [[ "$retired_login" != *"Sign in to GitHub (the same as min auth login)"* ]]; then
+    echo "::error::'min login --help' did not describe the GitHub sign-in (exit $retired_login_rc):"
     printf '%s\n' "$retired_login" | head -5 | sed 's/^/  /'
     echo "--- stderr ---"; cat "$WORK/retired-login.err" 2>/dev/null || true
     fail
   fi
-  echo "retired surface: min login → \"$retired_login\""
-  retired_config_after="$(find "$XDG_CONFIG_HOME" -type f 2>/dev/null | sort)"
-  if [ "$retired_config_before" != "$retired_config_after" ]; then
-    echo "::error::'min login' wrote to the config directory, where the minted certificates used to land:"
-    diff <(printf '%s\n' "$retired_config_before") <(printf '%s\n' "$retired_config_after") \
-      | sed 's/^/  /'
-    fail
-  fi
+  echo "min login --help → exit 0, describes the GitHub sign-in"
   if find "$XDG_CONFIG_HOME" "$XDG_STATE_HOME" -type f \( -name 'client.pem' -o -name 'client.key' -o -name 'ca.pem' \) 2>/dev/null \
     | grep -q .; then
     echo "::error::the retired client certificate material exists on this host (client.pem / client.key / ca.pem):"
@@ -19054,7 +26761,7 @@ echo "::group::retired surfaces gone (ssh-forward, login, :7655, direct-tcpip)"
   fi
 
   # socat carries the in-box responder. It is a launcher baseline package
-  # (crates/minimald/src/session_host.rs BASELINE_PACKAGES), so every box
+  # (crates/minimald/src/box_runtime.rs BASELINE_PACKAGES), so every box
   # ships it — at /usr/bin: packages install with --prefix=/usr, and the
   # generic rootfs has no /bin, so the case says the absolute path, the
   # daemon's own convention for in-box argv, rather than lean on PATH.
@@ -20469,14 +28176,13 @@ else:
   # no --vm anywhere in its argv, exactly as a user's shell stands — so
   # finding e2e-two-vm-b is the CLI's own work: ask the selected VM first,
   # then every VM's socket, and say which one answered. Over a real pty (an
-  # interactive attach's own requirement), answering the exit prompt with
-  # `keep` so the session survives: it must still be live when the case stops
-  # the named VM below — the stopped-VM beats need a box that WAS listed, or
-  # its absence from the after-stop listing would prove nothing about the
-  # stop.
+  # interactive attach's own requirement). The `exit` ends the box with its
+  # shell (BOX-038), and the box stays listed as exited: the stopped-VM beats
+  # below need a box that WAS listed, or its absence from the after-stop
+  # listing would prove nothing about the stop.
   # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
   tw_attach_out="$(E2E_PTY_COMMANDS='cat /home/two-vm-b.mark
-exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
+exit' python3 "$ROOT/scripts/e2e-attach-pty.py" - \
     min ${E2E_MINIMAL_ARGS:-} session attach "$TWO_VM_B_NAME" \
     2>"$WORK/two-vm-attach.err")" || {
     echo "::error::the pty attach by box name failed"
@@ -20496,6 +28202,7 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
   fi
   printf '%s\n' "$tw_attach_out" | grep -F -- "on VM $tw_name" | sed 's/^/  /'
   echo "attach by name: 'min session attach $TWO_VM_B_NAME' — no flag — landed in $tw_name's box and said so"
+  assert_box_exited "$tw_b_sid" 0 "attach by box name on VM $tw_name" two_vm_mn
 
   # ---- the shipping exposing verb: forward a box's service by name --------
   # `min net forward` stays in the foreground, prints its banner on stderr
@@ -20898,6 +28605,1204 @@ while True:
 }
 
 # ---------------------------------------------------------------------------
+# `min ls` and the box commands tell the truth, end to end (T114, over T110,
+# T111, T112, T8 and the expose refusals). Two VMs on one host — the default
+# VM and a named one — each with a box, driven the way a user drives them,
+# through `min` alone:
+#
+#   * `min ls` lists every box on every VM. Its ADDRESS cell is the address
+#     the box's own `min net expose` reply names, and `min session policy`
+#     lists the same address under live ingress. Its EGRESS cell is the
+#     posture `min session policy` prints, in the same words.
+#   * `min session policy <box>` and `min net forward <box>` find the named
+#     VM's box from its name alone, with no `--vm`, and the forward relays.
+#   * a name no VM holds is refused with the `--vm` form of the command, and
+#     a box on a stopped VM is refused with the command that starts the VM.
+#   * the named VM boots while the default VM holds the hostname proxy's
+#     preferred port, so its proxy serves on a substitute port. Once the
+#     default VM stops and frees the preferred port, the named VM takes it
+#     back, and its `HOSTNAME PROXY` row lists both ports. A request through
+#     each port reaches the box.
+#   * a stopped VM's boxes stay in `min ls`, marked `(stopped)`.
+#   * inside a box, `min net expose --public` and an expose outside the
+#     box's --dynamic-range are refused, and each refusal says nothing was
+#     published.
+#
+# Diagnostics: each leg prints the command it ran, its exit status and the
+# line it checked. The VM host daemon log lines written during the case are
+# copied to $WORK/ls-truth/minvmd.log at every step and on every failure,
+# and a failure prints their tail.
+proof_ls_and_box_commands_tell_the_truth() {
+  local lc="ls_and_box_commands_tell_the_truth"
+  if [ "$min_daemon" != minvmd ]; then
+    not_run "$lc" "this run drives '$min_daemon': a named VM is a minvmd-backed story"
+    return 0
+  fi
+  locate_vm_guest_images
+  if [ ! -f "$STAGED_KERNEL" ] || [ ! -f "$STAGED_ROOTFS" ] || [ ! -f "$STAGED_INITRAMFS" ]; then
+    not_run "$lc" "guest images not available"
+    return 0
+  fi
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ] || [ ! -x "$MINVMD_GVPROXY_BIN" ]; then
+    not_run "$lc" "no MINVMD_GVPROXY_BIN: this target has no switch, so no box could mint and no proxy could publish"
+    return 0
+  fi
+  if [ "$(uname -s)" = Linux ] && { [ ! -e /dev/kvm ] || [ ! -w /dev/kvm ]; }; then
+    not_run "$lc" "no writable /dev/kvm: this host cannot boot a VM"
+    return 0
+  fi
+
+  echo "::group::min ls and the box commands tell the truth (T114)"
+
+  # A legal VM name: lowercase ASCII inside the 24-byte budget, one path
+  # component under the provider directory.
+  local lt_vm="lsvm"
+  local lt_a="e2e-lt-a"            # the default VM's box (host address)
+  local lt_b="e2e-lt-b"            # the named VM's box (own address)
+  local lt_nobody="e2e-lt-nobody"  # a name no VM holds
+  local lt_lo=18140 lt_hi=18145    # the named VM box's --dynamic-range
+  local lt_port=18140              # in range: exposed, then served by socat
+  local lt_out_port=18150          # outside the range
+  local lt_local=18153             # the `min net forward` laptop-side listener
+  local lt_marker="LS_TRUTH_B_OK"
+  local lt_dir="$WORK/ls-truth"
+  mkdir -p "$lt_dir"
+
+  lt_mn() {
+    # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+    min ${E2E_MINIMAL_ARGS:-} --vm "$lt_vm" "$@"
+  }
+
+  # The VM host daemon log every VM of this state base shares, and the lines
+  # it gained since the snapshot taken below, copied into this case's work
+  # directory. A rotation since the snapshot puts this run's lines in two
+  # files: the snapshot file's tail, then the whole newer one.
+  lt_minvmd_log() {
+    find "$XDG_STATE_HOME/minimal/logs" -maxdepth 1 -name 'minvmd.log*' -type f 2>/dev/null \
+      | sort | tail -n1
+  }
+  lt_save_logs() {
+    local f
+    f="$(lt_minvmd_log)"
+    : >"$lt_dir/minvmd.log"
+    [ -n "$f" ] || return 0
+    if [ "$f" = "$LT_LOG" ]; then
+      tail -n "+$((LT_LOG_LINES + 1))" "$f" >>"$lt_dir/minvmd.log" 2>/dev/null || true
+      return 0
+    fi
+    if [ -n "$LT_LOG" ]; then
+      tail -n "+$((LT_LOG_LINES + 1))" "$LT_LOG" >>"$lt_dir/minvmd.log" 2>/dev/null || true
+    fi
+    cat "$f" >>"$lt_dir/minvmd.log" 2>/dev/null || true
+  }
+  lt_fail() {
+    lt_save_logs
+    echo "--- VM host daemon log from this case ($lt_dir/minvmd.log, tail) ---"
+    tail -n 60 "$lt_dir/minvmd.log" 2>/dev/null || true
+    fail
+  }
+
+  # One leg: run the command, keep its output in the work directory, and
+  # print the command with its exit status. $1 is the leg's file stem, the
+  # rest is the command. LT_RC, LT_OUT and LT_ERR carry the result.
+  lt_run() {
+    local stem="$1"
+    shift
+    LT_RC=0
+    "$@" >"$lt_dir/$stem.out" 2>"$lt_dir/$stem.err" || LT_RC=$?
+    LT_OUT="$(cat "$lt_dir/$stem.out" 2>/dev/null || true)"
+    LT_ERR="$(cat "$lt_dir/$stem.err" 2>/dev/null || true)"
+    echo "run: $* -> exit $LT_RC"
+  }
+  # The checks a leg makes, each printed with the line it checked.
+  lt_want_rc() {
+    if [ "$1" = ok ] && [ "$LT_RC" -ne 0 ]; then
+      echo "::error::$2: expected exit 0, got $LT_RC"
+      echo "--- stdout ---"; printf '%s\n' "$LT_OUT"
+      echo "--- stderr ---"; printf '%s\n' "$LT_ERR"
+      lt_fail
+    fi
+    if [ "$1" = refused ] && [ "$LT_RC" -eq 0 ]; then
+      echo "::error::$2: expected a refusal (non-zero exit), got exit 0"
+      echo "--- stdout ---"; printf '%s\n' "$LT_OUT"
+      lt_fail
+    fi
+  }
+  # $1 = what the check is, $2 = the text that must appear, $3 = the text.
+  lt_want_line() {
+    local line
+    line="$(printf '%s\n' "$3" | grep -F -- "$2" | head -n1 || true)"
+    if [ -z "$line" ]; then
+      echo "::error::$1: no line carries '$2'"
+      echo "--- the text checked ---"; printf '%s\n' "$3"
+      lt_fail
+    fi
+    echo "check: $1: $line"
+  }
+
+  # The cells of one box's row in a `min ls` table, as `VM|ADDRESS|STATUS|EGRESS`.
+  # The columns are cut at the header's own offsets, so a cell with spaces in
+  # it (`lsvm (stopped)`, `deny-all (default)`) stays whole.
+  lt_ls_cells() {
+    printf '%s\n' "$2" | python3 -c '
+import sys
+name = sys.argv[1]
+lines = sys.stdin.read().splitlines()
+header = next((l for l in lines if "SESSION ID" in l and "EGRESS" in l), None)
+if header is None:
+    sys.exit(0)
+cols = ["VM", "SESSION ID", "NAME", "ADDRESS", "STATUS", "EGRESS", "TITLE"]
+starts = {c: header.find(c) for c in cols}
+def cell(row, col):
+    start = starts[col]
+    if start < 0:
+        return ""
+    later = sorted(s for s in starts.values() if s > start)
+    end = later[0] if later else len(row)
+    return row[start:end].strip()
+for row in lines:
+    if row is header or "  " not in row:
+        continue
+    if cell(row, "NAME") == name:
+        print("|".join(cell(row, c) for c in ["VM", "ADDRESS", "STATUS", "EGRESS"]))
+        break
+' "$1"
+  }
+
+  # Every port one VM's `HOSTNAME PROXY` row names, space-separated. An
+  # unscoped listing with two VMs names the VM as the row's third field. A
+  # listing scoped with `--vm` has one row and no VM field.
+  lt_proxy_ports() {
+    printf '%s\n' "$2" | awk -v vm="$1" '
+      $1 == "HOSTNAME" && $2 == "PROXY:" && ($3 == vm || vm == "") && /listening on/ { print; exit }
+    ' | grep -oE '127\.0\.0\.1:[0-9]+' | sed 's/^127\.0\.0\.1://' | tr '\n' ' ' | sed 's/ $//'
+  }
+
+  # One request from the host through a published proxy port to the box's
+  # name, with the host's proxy env stripped so the request takes the VM's
+  # path. $1 = the port, $2 = the label.
+  lt_route() {
+    local status body
+    status="$(env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+      -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+      curl -sS --max-time 20 -x "http://127.0.0.1:$1" \
+      -o "$lt_dir/route.body" -w '%{http_code}' \
+      "http://$lt_b.min.internal:$lt_port/" 2>"$lt_dir/route.err" | tail -n1 | tr -d '\r\n')"
+    body="$(cat "$lt_dir/route.body" 2>/dev/null || true)"
+    echo "run: curl -x http://127.0.0.1:$1 http://$lt_b.min.internal:$lt_port/ -> HTTP ${status:-<none>} ${body:0:48}"
+    if [ "$status" != 200 ] || [[ "$body" != *"$lt_marker"* ]]; then
+      echo "::error::$2: the request through 127.0.0.1:$1 did not reach $lt_b"
+      echo "--- curl stderr ---"; cat "$lt_dir/route.err" 2>/dev/null || true
+      lt_fail
+    fi
+    echo "check: $2: HTTP 200 carrying $lt_marker"
+  }
+
+  # ---- two VMs, each with its own box -------------------------------------
+  # The default VM comes down first, whatever an earlier case left running,
+  # so both boots happen in this case and the log copy is this case's own.
+  mnl stop --force >/dev/null 2>&1 || true
+  minvmd stop >/dev/null 2>&1 || true
+  local lt_stopped=""
+  for _ in $(seq 1 30); do
+    case "$(minvmd status --json 2>/dev/null || true)" in
+      *'"state":"stopped"'*) lt_stopped=1; break ;;
+    esac
+    sleep 1
+  done
+  if [ -z "$lt_stopped" ]; then
+    echo "::error::the default VM never reached 'stopped' before the case's own boots"
+    minvmd status --json 2>&1 || true
+    fail
+  fi
+  LT_LOG="$(lt_minvmd_log)"
+  LT_LOG_LINES=0
+  if [ -n "$LT_LOG" ]; then LT_LOG_LINES="$(wc -l < "$LT_LOG" | tr -d ' ')"; fi
+
+  TWO_VM_SEED_A_DIR="$(hook_mktemp /tmp/mnllta.XXXXXX)"
+  hook_seed_preamble > "$TWO_VM_SEED_A_DIR/minimal.toml"
+  mkdir "$TWO_VM_SEED_A_DIR/.git"
+  TWO_VM_SEED_B_DIR="$(hook_mktemp /tmp/mnlltb.XXXXXX)"
+  hook_seed_preamble > "$TWO_VM_SEED_B_DIR/minimal.toml"
+  mkdir "$TWO_VM_SEED_B_DIR/.git"
+
+  # The default VM boots first and takes the hostname proxy's preferred
+  # port. The named VM boots second, finds that port held, and serves on a
+  # substitute: the start the reclaim beat below needs. The RUST_LOG filter
+  # keeps the VM host daemon's INFO records for the log copy.
+  # Each runs in a subshell, so its `cd` leaves the case's directory alone.
+  lt_seed_a() {
+    ( cd "$TWO_VM_SEED_A_DIR" && RUST_LOG="warn,minvmd=info" \
+        mnl session activate . --no-prompt --name "$lt_a" )
+  }
+  lt_seed_b() {
+    ( cd "$TWO_VM_SEED_B_DIR" && RUST_LOG="warn,minvmd=info" \
+        lt_mn session activate . --no-prompt --name "$lt_b" --network own_ip \
+          --dynamic-ingress allow --dynamic-range "$lt_lo-$lt_hi" )
+  }
+  lt_run activate-a lt_seed_a
+  lt_want_rc ok "min session activate . --name $lt_a (the default VM)"
+  local lt_a_sid lt_b_sid
+  lt_a_sid="$(printf '%s\n' "$LT_OUT" | tail -n1 | tr -d '\r')"
+  TWO_VM_NAME="$lt_vm" # teardown stops the named VM from here on
+  lt_run activate-b lt_seed_b
+  lt_want_rc ok "min --vm $lt_vm session activate . --name $lt_b --network own_ip --dynamic-ingress allow --dynamic-range $lt_lo-$lt_hi"
+  lt_b_sid="$(printf '%s\n' "$LT_OUT" | tail -n1 | tr -d '\r')"
+  echo "box A: $lt_a_sid ($lt_a) on VM default"
+  echo "box B: $lt_b_sid ($lt_b) on VM $lt_vm"
+  lt_save_logs
+
+  # The first exec mints the box on a freshly booted VM. Give the mint a
+  # bounded window, as the two-VM case does.
+  local lt_ready=""
+  for _ in 1 2 3; do
+    if lt_mn session exec "$lt_b_sid" 'test -x /usr/bin/socat' >/dev/null 2>"$lt_dir/exec-gate.err"; then
+      lt_ready=1; break
+    fi
+    sleep 2
+  done
+  if [ -z "$lt_ready" ]; then
+    echo "::error::box $lt_b on VM $lt_vm never answered an exec (or has no /usr/bin/socat)"
+    cat "$lt_dir/exec-gate.err" 2>/dev/null || true
+    lt_fail
+  fi
+  echo "check: min --vm $lt_vm session exec $lt_b 'test -x /usr/bin/socat': exit 0"
+
+  # ---- the box's own expose: the address `min ls` must show ---------------
+  lt_run expose lt_mn session exec "$lt_b_sid" "/usr/bin/min net expose $lt_port"
+  lt_want_rc ok "min net expose $lt_port inside $lt_b"
+  lt_want_line "the expose reply names the port and the box's address" "published port $lt_port at " "$LT_OUT"
+  local lt_addr
+  # A reply carried over the exec channel can end in a carriage return.
+  lt_addr="$(printf '%s\n' "$LT_OUT" | tr -d '\r' \
+    | sed -n "s/^published port $lt_port at \([^ ]*\):${lt_port}[[:space:]]*\$/\1/p" | head -n1)"
+  if [ -z "$lt_addr" ]; then
+    echo "::error::the expose reply carries no address (got: '$LT_OUT')"
+    lt_fail
+  fi
+  echo "address: $lt_b answers at $lt_addr"
+
+  # The responder the forward and the proxy legs reach, started after the
+  # expose so the expose publishes rather than finds a listener first.
+  lt_mn session exec "$lt_b_sid" \
+    "body=$lt_marker; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/http200" \
+    >/dev/null 2>"$lt_dir/responder.err" \
+    || { echo "::error::could not write the in-box responder's response"; cat "$lt_dir/responder.err"; lt_fail; }
+  lt_mn session exec "$lt_b_sid" \
+    "nohup /usr/bin/socat TCP-LISTEN:$lt_port,reuseaddr,fork SYSTEM:\"cat /home/http200\" >/dev/null 2>&1 &" \
+    >/dev/null 2>"$lt_dir/responder.err" \
+    || { echo "::error::could not start the in-box responder"; cat "$lt_dir/responder.err"; lt_fail; }
+  echo "responder: $lt_b answers 127.0.0.1:$lt_port with $lt_marker"
+
+  # ---- `min ls`: every box on every VM, with its address and egress -------
+  lt_run ls mnl ls
+  lt_want_rc ok "min ls with both VMs running"
+  local lt_ls="$LT_OUT" lt_cells_a lt_cells_b
+  lt_cells_a="$(lt_ls_cells "$lt_a" "$lt_ls")"
+  lt_cells_b="$(lt_ls_cells "$lt_b" "$lt_ls")"
+  if [ -z "$lt_cells_a" ] || [ -z "$lt_cells_b" ]; then
+    echo "::error::min ls does not list both boxes (A: '${lt_cells_a:-<missing>}', B: '${lt_cells_b:-<missing>}')"
+    printf '%s\n' "$lt_ls"
+    lt_fail
+  fi
+  echo "check: min ls row for $lt_a: $lt_cells_a"
+  echo "check: min ls row for $lt_b: $lt_cells_b"
+  local lt_vm_a lt_vm_b lt_addr_b lt_egress_a lt_egress_b
+  lt_vm_a="$(printf '%s' "$lt_cells_a" | cut -d'|' -f1)"
+  lt_vm_b="$(printf '%s' "$lt_cells_b" | cut -d'|' -f1)"
+  lt_addr_b="$(printf '%s' "$lt_cells_b" | cut -d'|' -f2)"
+  lt_egress_a="$(printf '%s' "$lt_cells_a" | cut -d'|' -f4)"
+  lt_egress_b="$(printf '%s' "$lt_cells_b" | cut -d'|' -f4)"
+  if [ "$lt_vm_a" != default ] || [ "$lt_vm_b" != "$lt_vm" ]; then
+    echo "::error::min ls names the wrong VM for a box (A on '$lt_vm_a', want default; B on '$lt_vm_b', want $lt_vm)"
+    lt_fail
+  fi
+  if [ "$lt_addr_b" != "$lt_addr" ]; then
+    echo "::error::min ls shows ADDRESS '$lt_addr_b' for $lt_b, but the box's expose published at '$lt_addr'"
+    lt_fail
+  fi
+  echo "check: ADDRESS for $lt_b is $lt_addr_b, the address its expose reply named"
+
+  # ---- `min session policy`, no --vm: the same address and egress ---------
+  # The EGRESS cell is the policy's posture in the policy's words, and a
+  # `; per-box enforcement <x>` suffix is the policy's own row of that name.
+  lt_egress_matches_policy() {
+    local box="$1" cell="$2" policy="$3" words enforcement
+    words="${cell%%;*}"
+    if [ "$cell" = "-" ]; then
+      echo "::error::min ls shows no EGRESS posture for $box"
+      lt_fail
+    fi
+    # The first line under the policy's `egress` heading: a named verdict,
+    # or the first rule row of a declared section.
+    local posture
+    posture="$(printf '%s\n' "$policy" | awk '$0 == "egress" { getline; sub(/^ +/, ""); print; exit }')"
+    if [ "$words" = "declared rules" ]; then
+      # A declared section lists its rules as rows, the first one `subnets`.
+      # No named verdict heads it.
+      case "$posture" in
+        "subnets "*) ;;
+        *)
+          echo "::error::min ls shows EGRESS 'declared rules' for $box, but the egress block of min session policy opens with '${posture:-<no egress block>}', not a subnets rule row"
+          printf '%s\n' "$policy"
+          lt_fail
+          ;;
+      esac
+      echo "check: EGRESS for $box is 'declared rules', and min session policy lists its rules, first '$posture'"
+    else
+      if [ "$posture" != "$words" ]; then
+        echo "::error::min ls shows EGRESS '$words' for $box, but min session policy says '${posture:-<no egress block>}'"
+        printf '%s\n' "$policy"
+        lt_fail
+      fi
+      echo "check: EGRESS for $box is '$words', the posture min session policy prints"
+    fi
+    if [[ "$cell" == *"; per-box enforcement "* ]]; then
+      enforcement="${cell##*; per-box enforcement }"
+      lt_want_line "policy for $box names per-box enforcement $enforcement" "per-box enforcement  $enforcement" "$policy"
+    fi
+  }
+  lt_run policy-a mnl session policy "$lt_a"
+  lt_want_rc ok "min session policy $lt_a"
+  lt_egress_matches_policy "$lt_a" "$lt_egress_a" "$LT_OUT"
+  lt_run policy-b mnl session policy "$lt_b"
+  lt_want_rc ok "min session policy $lt_b, with no --vm, for a box on VM $lt_vm"
+  lt_egress_matches_policy "$lt_b" "$lt_egress_b" "$LT_OUT"
+  lt_want_line "policy for $lt_b lists the exposed port at the ADDRESS min ls shows" "$lt_addr:$lt_port" "$LT_OUT"
+
+  # ---- `min net forward`, no --vm -----------------------------------------
+  echo "run: min net forward $lt_b $lt_local:$lt_port (background)"
+  # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+  ( exec min ${E2E_MINIMAL_ARGS:-} net forward "$lt_b" "$lt_local:$lt_port" ) \
+    >"$lt_dir/forward.out" 2>"$lt_dir/forward.err" &
+  TWO_VM_FWD_PID=$!
+  local lt_fwd_ready=""
+  for _ in $(seq 1 40); do
+    if grep -q "Forwarding localhost:$lt_local" "$lt_dir/forward.err" 2>/dev/null; then
+      lt_fwd_ready=1; break
+    fi
+    kill -0 "$TWO_VM_FWD_PID" 2>/dev/null || break
+    sleep 0.25
+  done
+  if [ -z "$lt_fwd_ready" ]; then
+    echo "::error::'min net forward $lt_b' with no --vm never bound its listener (no 'Forwarding localhost:$lt_local' line)"
+    cat "$lt_dir/forward.err" 2>/dev/null || true
+    lt_fail
+  fi
+  echo "check: forward: $(grep -F "Forwarding localhost:$lt_local" "$lt_dir/forward.err" | head -n1)"
+  local lt_fwd_body=""
+  lt_fwd_body="$(env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+    -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+    curl -sS --max-time 20 "http://127.0.0.1:$lt_local/" 2>"$lt_dir/forward-curl.err" || true)"
+  echo "run: curl http://127.0.0.1:$lt_local/ -> ${lt_fwd_body:0:48}"
+  if [[ "$lt_fwd_body" != *"$lt_marker"* ]]; then
+    echo "::error::the request through the forward did not reach $lt_b on VM $lt_vm"
+    cat "$lt_dir/forward-curl.err" 2>/dev/null || true
+    cat "$lt_dir/forward.err" 2>/dev/null || true
+    lt_fail
+  fi
+  echo "check: the forward reached $lt_b: $lt_marker"
+  kill -INT "$TWO_VM_FWD_PID" 2>/dev/null || true
+  for _ in $(seq 1 40); do
+    kill -0 "$TWO_VM_FWD_PID" 2>/dev/null || break
+    sleep 0.25
+  done
+  kill -9 "$TWO_VM_FWD_PID" 2>/dev/null || true
+  wait "$TWO_VM_FWD_PID" 2>/dev/null || true
+  TWO_VM_FWD_PID=""
+
+  # ---- a name no VM holds -------------------------------------------------
+  lt_run unknown mnl session policy "$lt_nobody"
+  lt_want_rc refused "min session policy $lt_nobody"
+  lt_want_line "the unknown-box refusal says no running VM has the box" \
+    "no running VM has a box named '$lt_nobody'." "$LT_ERR"
+  lt_want_line "the unknown-box refusal shows the --vm form of the command" \
+    "min --vm <vm> session policy $lt_nobody" "$LT_ERR"
+
+  # ---- the expose refusals inside the box ---------------------------------
+  lt_run expose-public lt_mn session exec "$lt_b_sid" "/usr/bin/min net expose --public $lt_port"
+  lt_want_rc refused "min net expose --public $lt_port inside $lt_b"
+  lt_want_line "the --public refusal says public exposure is not available and nothing was published" \
+    "public exposure is not available on this host. Nothing was published." "$LT_OUT
+$LT_ERR"
+  lt_run expose-out lt_mn session exec "$lt_b_sid" "/usr/bin/min net expose $lt_out_port"
+  lt_want_rc refused "min net expose $lt_out_port inside $lt_b"
+  lt_want_line "the out-of-range refusal names the port and the range, and says nothing was published" \
+    "port $lt_out_port is outside this box's --dynamic-range $lt_lo-$lt_hi. Nothing was published." "$LT_OUT
+$LT_ERR"
+
+  # ---- the preferred proxy port, taken back -------------------------------
+  local lt_port_default lt_ports_named
+  lt_port_default="$(lt_proxy_ports default "$lt_ls" | awk '{ print $1 }')"
+  lt_ports_named="$(lt_proxy_ports "$lt_vm" "$lt_ls")"
+  echo "check: HOSTNAME PROXY ports with both VMs up: default '${lt_port_default:-<none>}', $lt_vm '${lt_ports_named:-<none>}'"
+  if [ -z "$lt_port_default" ] || [ -z "$lt_ports_named" ]; then
+    echo "::error::min ls does not name a hostname proxy port for each VM"
+    printf '%s\n' "$lt_ls"
+    lt_fail
+  fi
+  if [[ " $lt_ports_named " == *" $lt_port_default "* ]]; then
+    echo "::error::VM $lt_vm already lists the default VM's port $lt_port_default while the default VM holds it"
+    printf '%s\n' "$lt_ls"
+    lt_fail
+  fi
+  local lt_substitute="${lt_ports_named%% *}"
+  lt_run stop-default minvmd stop
+  lt_want_rc ok "minvmd stop (the default VM)"
+  lt_stopped=""
+  for _ in $(seq 1 30); do
+    case "$(minvmd status --json 2>/dev/null || true)" in
+      *'"state":"stopped"'*) lt_stopped=1; break ;;
+    esac
+    sleep 1
+  done
+  if [ -z "$lt_stopped" ]; then
+    echo "::error::the default VM never reached 'stopped' after 'minvmd stop'"
+    lt_fail
+  fi
+  echo "check: the default VM is stopped, so port $lt_port_default is free"
+  # The watcher probes every 5 s. Allow several probes before the verdict.
+  local lt_both="" lt_scoped=""
+  for _ in $(seq 1 24); do
+    lt_scoped="$(lt_mn ls 2>/dev/null || true)"
+    lt_ports_named="$(lt_proxy_ports "" "$lt_scoped")"
+    if [[ " $lt_ports_named " == *" $lt_port_default "* ]] \
+       && [[ " $lt_ports_named " == *" $lt_substitute "* ]]; then
+      lt_both=1; break
+    fi
+    sleep 2.5
+  done
+  echo "run: min --vm $lt_vm ls -> HOSTNAME PROXY ports '${lt_ports_named:-<none>}'"
+  if [ -z "$lt_both" ]; then
+    echo "::error::VM $lt_vm did not list both its substitute port $lt_substitute and the freed preferred port $lt_port_default"
+    printf '%s\n' "$lt_scoped"
+    lt_fail
+  fi
+  lt_want_line "the HOSTNAME PROXY row names both ports" "127.0.0.1:$lt_port_default" "$lt_scoped"
+  lt_route "$lt_port_default" "the preferred port, taken back"
+  lt_route "$lt_substitute" "the substitute port, still serving"
+  lt_save_logs
+
+  # ---- a stopped VM: listed, and its box refused with the next step ------
+  lt_run stop-named minvmd --vm "$lt_vm" stop
+  lt_want_rc ok "minvmd --vm $lt_vm stop"
+  lt_stopped=""
+  for _ in $(seq 1 30); do
+    case "$(minvmd --vm "$lt_vm" status --json 2>/dev/null || true)" in
+      *'"state":"stopped"'*) lt_stopped=1; break ;;
+    esac
+    sleep 1
+  done
+  if [ -z "$lt_stopped" ]; then
+    echo "::error::VM $lt_vm never reached 'stopped' after 'minvmd --vm $lt_vm stop'"
+    lt_fail
+  fi
+  TWO_VM_NAME=""
+  # `min ls` starts the default VM again and lists the stopped VM's box from
+  # its persisted record.
+  lt_run ls-stopped mnl ls
+  lt_want_rc ok "min ls with VM $lt_vm stopped"
+  lt_cells_b="$(lt_ls_cells "$lt_b" "$LT_OUT")"
+  echo "check: min ls row for $lt_b: ${lt_cells_b:-<missing>}"
+  if [ "$(printf '%s' "$lt_cells_b" | cut -d'|' -f1)" != "$lt_vm (stopped)" ] \
+     || [ "$(printf '%s' "$lt_cells_b" | cut -d'|' -f3)" != stopped ]; then
+    echo "::error::min ls does not list $lt_b as a stopped box on '$lt_vm (stopped)'"
+    printf '%s\n' "$LT_OUT"
+    lt_fail
+  fi
+  lt_run policy-stopped mnl session policy "$lt_b"
+  lt_want_rc refused "min session policy $lt_b, with VM $lt_vm stopped"
+  lt_want_line "the stopped-VM refusal names the box and its VM" \
+    "box '$lt_b' is on VM '$lt_vm', which is stopped." "$LT_ERR"
+  lt_want_line "the stopped-VM refusal gives the command that starts the VM" \
+    "Start it with: min --vm $lt_vm session attach $lt_b" "$LT_ERR"
+
+  lt_save_logs
+  echo "logs: the VM host daemon log lines from this case are in $lt_dir/minvmd.log"
+  mnl session destroy --force "$lt_a_sid" >/dev/null 2>&1 || true
+  rm -rf "$TWO_VM_SEED_A_DIR" "$TWO_VM_SEED_B_DIR"
+  TWO_VM_SEED_A_DIR=""
+  TWO_VM_SEED_B_DIR=""
+  echo "min ls and the box commands tell the truth OK (both VMs' boxes listed, a stopped VM's included; address and egress match the policy; policy and forward find a box with no --vm; both proxy ports listed and routing after the preferred port freed; the unknown-box, stopped-VM, --public and out-of-range refusals each say what to do)"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
+# Box names survive a restart and a second VM, and a withdrawn port closes
+# the connections already through it — end to end on a Linux KVM host (T121,
+# over T119's boot unit and second-VM registration and T120's patched
+# switch). One box on the default VM, one on a second named VM, and every
+# lookup printed with the address it answered:
+#
+#   1. The names step (`min finalize-install --show --script`, run whole under
+#      one `sudo -n sh`) points systemd-resolved at the VM host daemon's DNS
+#      service through the minzone0 link and enables minzone0-link.service,
+#      the unit a boot starts. Box A's name resolves through the host's own
+#      resolver (getent, no proxy settings).
+#   2. A restart, simulated: the link is deleted — what a reboot leaves, since
+#      a dummy link does not persist — and A's name stops resolving. Then the
+#      enabled unit is started the way a boot starts it, its journal line is
+#      read, and A's name resolves again to the same address.
+#   3. A second named VM boots beside the default one and mints box B. Both
+#      VM host daemons' DNS service records are read: none may say the VM's
+#      box names are not answered on the host, and the second daemon must
+#      write its own record (it holds the port or registers into the holder).
+#      A and B each resolve through the host resolver, at different addresses.
+#   4. A port A's listener published is withdrawn while a host connection
+#      through it is open: the listener's parent is SIGKILLed, so the
+#      in-box connection's own socat child keeps the box side open, and the
+#      host connection must still end within 20 s — closed by the switch.
+#
+# Gates, by observed fact: Linux (the boot unit is systemd's), a minvmd lane
+# with guest images, a switch and a writable /dev/kvm; and the resolver half's
+# tools with passwordless sudo, which a CI lane must have.
+#
+# Diagnostics, when it fails: the boot unit's journal, both VM host daemons'
+# zone-answerer lines, the link's resolvectl state, then `fail`'s bundle.
+proof_names_survive_restart_and_second_vm() {
+  local nc="names_survive_restart_and_second_vm"
+  local unit="minzone0-link.service"
+  local a_name="e2e-nrv-a" b_name="e2e-nrv-b" vm="beta"
+  local port=18132 lo=18130 hi=18135
+  local a_sid="" b_sid="" a_addr="" a_addr_after="" b_addr="" setup="" cmd=""
+  local before_records="" after_records="" tool nrv_journal="" nrv_lines="" b_record=""
+
+  if [ "$(uname -s)" != Linux ]; then
+    not_run "$nc" "the box-name boot unit is a Linux systemd unit; macOS reserves its names another way"
+    return 0
+  fi
+  if [ "$min_daemon" != minvmd ]; then
+    not_run "$nc" "this run drives '$min_daemon': two VM host daemons are a minvmd-backed story"
+    return 0
+  fi
+  locate_vm_guest_images
+  if [ ! -f "$STAGED_KERNEL" ] || [ ! -f "$STAGED_ROOTFS" ] || [ ! -f "$STAGED_INITRAMFS" ]; then
+    not_run "$nc" "guest images not available"
+    return 0
+  fi
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ] || [ ! -x "$MINVMD_GVPROXY_BIN" ]; then
+    not_run "$nc" "no MINVMD_GVPROXY_BIN: no switch, so no box could mint or publish a port"
+    return 0
+  fi
+  if [ ! -e /dev/kvm ] || [ ! -w /dev/kvm ]; then
+    not_run "$nc" "no writable /dev/kvm: this host cannot boot a VM"
+    return 0
+  fi
+  for tool in resolvectl systemctl journalctl ip getent python3; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      if [ -n "${CI:-}" ]; then
+        echo "::error::$nc: a CI KVM lane must have $tool to run the names step and read its boot unit"
+        fail
+      fi
+      not_run "$nc" "this host has no $tool"
+      return 0
+    fi
+  done
+  if ! sudo -n true >/dev/null 2>&1; then
+    if [ -n "${CI:-}" ]; then
+      echo "::error::$nc: a CI KVM lane must have passwordless sudo to run the names step"
+      fail
+    fi
+    not_run "$nc" "no passwordless sudo: the names step runs as root"
+    return 0
+  fi
+
+  echo "::group::box names survive a restart and a second VM; a withdrawn port closes its connections (T121)"
+
+  # The zone-answerer start records every VM host daemon of this state base
+  # wrote, in the one log directory they share, plus each VM's run.log.
+  nrv_log_files() {
+    {
+      find "$XDG_STATE_HOME/minimal/logs" -name 'minvmd.log*' -type f 2>/dev/null
+      find "$XDG_STATE_HOME/minimal/providers/local-minvmd0" -maxdepth 2 -name run.log -type f 2>/dev/null
+    } | sort -u
+  }
+  nrv_answerer_lines() {
+    local f
+    nrv_log_files | while IFS= read -r f; do
+      grep -h -- 'zone-answerer' "$f" 2>/dev/null || true
+    done
+  }
+  # A mark is one "<line count>\t<path>" row per log file. Earlier e2e cases
+  # write to the same logs, so a check about this case reads only the lines
+  # after its mark. A file that is new since the mark is read whole.
+  nrv_log_mark() {
+    local f
+    nrv_log_files | while IFS= read -r f; do
+      printf '%s\t%s\n' "$(wc -l < "$f" 2>/dev/null || echo 0)" "$f"
+    done
+  }
+  nrv_answerer_lines_since() {
+    local mark="$1" f n
+    nrv_log_files | while IFS= read -r f; do
+      n="$(printf '%s\n' "$mark" | awk -F'\t' -v f="$f" '$2 == f { n = $1 } END { print n + 0 }')"
+      tail -n "+$((n + 1))" "$f" 2>/dev/null | grep -h -- 'zone-answerer' || true
+    done
+  }
+  nrv_start_records() {
+    nrv_answerer_lines | grep -F -e 'holds the host loopback' \
+      -e "registered this table's zone rows with it" | sort -u
+  }
+  nrv_diag() {
+    echo "--- journal: $unit ---"
+    sudo -n journalctl --no-pager -n 20 -u "$unit" 2>&1 || true
+    echo "--- systemctl status $unit ---"
+    sudo -n systemctl --no-pager status "$unit" 2>&1 | head -n 15 || true
+    echo "--- resolvectl status minzone0 ---"; resolvectl status minzone0 2>&1 || true
+    echo "--- both VM host daemons: zone-answerer lines (tail) ---"
+    nrv_answerer_lines | tail -n 20
+  }
+  # One host-resolver lookup with no proxy settings, polled up to $3 tries
+  # (0.5 s apart) for an answer ($2 = want) or for none ($2 = gone). Prints
+  # the lookup and its answer; leaves the address in NRV_ADDR.
+  nrv_lookup() {
+    local label="$1" want="$2" tries="$3" name="$4" i
+    NRV_ADDR=""
+    for i in $(seq 1 "$tries"); do
+      NRV_ADDR="$(env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+        -u ALL_PROXY -u all_proxy getent hosts "$name" 2>/dev/null | awk '{ print $1; exit }')"
+      if [ "$want" = gone ]; then [ -z "$NRV_ADDR" ] && break; else [ -n "$NRV_ADDR" ] && break; fi
+      [ "$i" -lt "$tries" ] && sleep 0.5
+    done
+    echo "lookup ($label): getent hosts $name -> ${NRV_ADDR:-<no answer>}"
+  }
+
+  NRV_SEED_A_DIR="$(hook_mktemp /tmp/mnlnra.XXXXXX)"
+  hook_seed_preamble > "$NRV_SEED_A_DIR/minimal.toml"
+  mkdir "$NRV_SEED_A_DIR/.git"
+  NRV_SEED_B_DIR="$(hook_mktemp /tmp/mnlnrb.XXXXXX)"
+  hook_seed_preamble > "$NRV_SEED_B_DIR/minimal.toml"
+  mkdir "$NRV_SEED_B_DIR/.git"
+
+  # The default VM comes up under `minvmd=info`, so its DNS service writes
+  # the start record this case reads (the harness quiets the run to warn).
+  mnl stop --force >/dev/null 2>&1 || true
+  # shellcheck disable=SC2086
+  a_sid="$(cd "$NRV_SEED_A_DIR" && RUST_LOG="warn,minvmd=info" mnl session activate . --no-prompt \
+    --name "$a_name" --network own_ip --dynamic-ingress allow --dynamic-range "$lo-$hi" \
+    ${E2E_ACTIVATE_ARGS:-} 2>"$WORK/nrv-a-activate.err")" || {
+    echo "::error::'min session activate --network own_ip --dynamic-ingress allow' failed for box $a_name on the default VM"
+    cat "$WORK/nrv-a-activate.err" 2>/dev/null || true
+    fail
+  }
+  a_sid="$(printf '%s\n' "$a_sid" | tail -n1 | tr -d '\r')"
+  echo "box A: $a_sid ($a_name) on the default VM"
+
+  # ---- 1. the names step, with its boot unit -------------------------------
+  setup="$WORK/nrv-finalize-install.out"
+  mnl finalize-install --show --script >"$setup" 2>"$setup.note" || true
+  cmd="$(setup_script_from "$setup")"
+  if [ -z "$cmd" ]; then
+    echo "::error::'min finalize-install --show --script' printed no setup script, so this case cannot install the box-name step"
+    cat "$setup" "$setup.note" 2>/dev/null || true
+    fail
+  fi
+  case "$cmd" in
+    *"systemctl enable $unit"*) ;;
+    *)
+      echo "::error::the setup script does not enable $unit, so box names would stop resolving after a restart"
+      printf '%s\n' "$cmd"
+      fail
+      ;;
+  esac
+  # Recorded before the run, so the teardown undoes a half-applied script.
+  NRV_REVERT_LINK=minzone0
+  NRV_UNIT_INSTALLED=1
+  case "$cmd" in
+    *minzoned*) ANSWERER_SERVICE_CHANNEL="$(answerer_channel_of "$cmd")" ;;
+  esac
+  setup_classifier_note "$setup"
+  # shellcheck disable=SC2024 # the output files are this user's, not root's
+  if ! sudo -n sh "$setup" >"$WORK/nrv-setup.out" 2>"$WORK/nrv-setup.err"; then
+    echo "::error::the setup script 'min finalize-install' runs did not run"
+    cat "$WORK/nrv-setup.out" "$WORK/nrv-setup.err" 2>/dev/null || true
+    setup_units_journal
+    nrv_diag
+    fail
+  fi
+  echo "ran the setup script; $unit is $(systemctl is-enabled "$unit" 2>/dev/null || echo '<unknown>') for boot"
+  if [ "$(systemctl is-enabled "$unit" 2>/dev/null)" != enabled ]; then
+    echo "::error::$unit is not enabled after the setup script, so a boot would not start it"
+    nrv_diag
+    fail
+  fi
+
+  nrv_lookup "before the restart" found 40 "$a_name.min.internal"
+  a_addr="$NRV_ADDR"
+  if [ -z "$a_addr" ]; then
+    echo "::error::$a_name.min.internal did not resolve through the host resolver after the names step"
+    nrv_diag
+    fail
+  fi
+
+  # ---- 2. the restart, simulated -------------------------------------------
+  # A reboot leaves no dummy link behind. Delete it, and the name must stop
+  # resolving: otherwise the restart below proves nothing.
+  if ! sudo -n ip link del minzone0 >/dev/null 2>"$WORK/nrv-linkdel.err"; then
+    echo "::error::could not delete the minzone0 link to simulate a restart"
+    cat "$WORK/nrv-linkdel.err" 2>/dev/null || true
+    fail
+  fi
+  sudo -n resolvectl flush-caches >/dev/null 2>&1 || true
+  echo "simulated restart: deleted the minzone0 link"
+  nrv_lookup "link removed, as after a reboot" gone 40 "$a_name.min.internal"
+  if [ -n "$NRV_ADDR" ]; then
+    echo "::error::$a_name.min.internal still resolves with the minzone0 link deleted, so this host routes the zone some other way and the restart cannot be simulated"
+    nrv_diag
+    fail
+  fi
+  # A boot starts the enabled oneshot. It is RemainAfterExit, so `restart`
+  # runs it whether or not the setup script left it active.
+  if ! sudo -n systemctl restart "$unit" >/dev/null 2>"$WORK/nrv-unit.err"; then
+    echo "::error::$unit failed to start, as a boot would start it"
+    cat "$WORK/nrv-unit.err" 2>/dev/null || true
+    nrv_diag
+    fail
+  fi
+  echo "boot unit journal:"
+  sudo -n journalctl --no-pager -n 5 -u "$unit" 2>/dev/null | sed 's/^/  /' || true
+  # Capture first: under pipefail, `grep -q` can SIGPIPE the producer and
+  # turn a match into a failed pipeline. Match the text in bash.
+  nrv_journal="$(sudo -n journalctl --no-pager -n 20 -u "$unit" 2>/dev/null || true)"
+  if [[ "$nrv_journal" != *"re-created minzone0"* ]]; then
+    echo "::error::$unit ran but its journal has no 're-created minzone0' line"
+    nrv_diag
+    fail
+  fi
+  nrv_lookup "after the boot unit ran" found 40 "$a_name.min.internal"
+  a_addr_after="$NRV_ADDR"
+  if [ "$a_addr_after" != "$a_addr" ]; then
+    echo "::error::after the boot unit ran, $a_name.min.internal answers '${a_addr_after:-<no answer>}', not its address $a_addr from before the restart"
+    nrv_diag
+    fail
+  fi
+
+  # ---- 3. a second VM beside the first --------------------------------------
+  before_records="$(nrv_start_records)"
+  nrv_beta_mark="$(nrv_log_mark)"
+  NRV_VM_NAME="$vm"
+  # shellcheck disable=SC2086
+  b_sid="$(cd "$NRV_SEED_B_DIR" && RUST_LOG="warn,minvmd=info" \
+    min ${E2E_MINIMAL_ARGS:-} --vm "$NRV_VM_NAME" session activate . --no-prompt \
+    --name "$b_name" --network own_ip 2>"$WORK/nrv-b-activate.err")" || {
+    echo "::error::'min --vm $NRV_VM_NAME session activate' failed to boot a second VM and mint box $b_name"
+    cat "$WORK/nrv-b-activate.err" 2>/dev/null || true
+    nrv_diag
+    fail
+  }
+  b_sid="$(printf '%s\n' "$b_sid" | tail -n1 | tr -d '\r')"
+  echo "box B: $b_sid ($b_name) on VM $NRV_VM_NAME"
+  # The second daemon's own record: it holds the port or registers into the
+  # holder. A record saying the names are not answered is contention. The
+  # record must be new since the boot and carry the second VM's node id,
+  # `<state dir>#<vm>` (crates/minvmd/src/net/answerer.rs node_id_for), so a
+  # re-register line from the first daemon or an old log line cannot pass.
+  # The detached supervisor writes minvmd.log as JSON (`"node":"<id>"` under
+  # `fields`); a foreground run writes text (`node=<id>`). Match either.
+  b_record=""
+  for _ in $(seq 1 40); do
+    after_records="$(nrv_start_records)"
+    b_record="$(comm -13 <(printf '%s\n' "$before_records") <(printf '%s\n' "$after_records") \
+      | grep -E -- "(node=|\"node\":\")[^ \"]*#${NRV_VM_NAME}( |\"|\$)" || true)"
+    [ -n "$b_record" ] && break
+    sleep 0.5
+  done
+  echo "both VM host daemons' DNS service records:"
+  printf '%s\n' "$after_records" | sed 's/^/  /'
+  echo "VM $NRV_VM_NAME's new record:"
+  printf '%s\n' "${b_record:-<none>}" | sed 's/^/  /'
+  if [ -z "$b_record" ]; then
+    echo "::error::the second VM's host daemon wrote no DNS service record for node #$NRV_VM_NAME within 20 s: it neither holds the port nor registered with the holder"
+    nrv_diag
+    fail
+  fi
+  # Contention shows only in lines written since VM $NRV_VM_NAME started.
+  # Earlier cases, before the answerer service existed, wrote "not answered"
+  # lines to the same logs, and those are no evidence about this pair.
+  # Capture first, as above: a SIGPIPE on the producer must not hide a match.
+  nrv_lines="$(nrv_answerer_lines_since "$nrv_beta_mark")"
+  if [[ "$nrv_lines" == *"box names are not answered on the host"* ]]; then
+    echo "::error::a VM host daemon says its box names are not answered on the host: the two daemons contended for the DNS service"
+    echo "--- zone-answerer lines since VM $NRV_VM_NAME started ---"
+    printf '%s\n' "$nrv_lines" | grep -F -- 'box names are not answered on the host' | sed 's/^/  /' || true
+    nrv_diag
+    fail
+  fi
+  nrv_lookup "second VM up, box A" found 40 "$a_name.min.internal"
+  if [ "$NRV_ADDR" != "$a_addr" ]; then
+    echo "::error::with the second VM up, $a_name.min.internal answers '${NRV_ADDR:-<no answer>}', not $a_addr"
+    nrv_diag
+    fail
+  fi
+  nrv_lookup "second VM up, box B" found 40 "$b_name.min.internal"
+  b_addr="$NRV_ADDR"
+  if [ -z "$b_addr" ] || [ "$b_addr" = "$a_addr" ]; then
+    echo "::error::$b_name.min.internal on VM $NRV_VM_NAME answers '${b_addr:-<no answer>}' through the host resolver; it must answer an address of its own, not box A's $a_addr"
+    nrv_diag
+    fail
+  fi
+
+  # ---- 4. a withdrawn port closes the connection already through it -------
+  mnl session exec "$a_sid" \
+    "nohup /usr/bin/socat TCP-LISTEN:$port,reuseaddr,fork EXEC:cat >/dev/null 2>&1 & echo \$! > /home/nrv.pid" \
+    >/dev/null 2>"$WORK/nrv-listen.err" \
+    || { echo "::error::could not start the echo listener on port $port in box $a_name"; cat "$WORK/nrv-listen.err" 2>/dev/null || true; fail; }
+  # The host client: connect, see one echo, then hold the connection and
+  # report how it ended. "open" is written once the echo came back.
+  cat > "$WORK/nrv-client.py" <<'PY'
+import socket, sys, time
+addr, port, out = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+def say(line):
+    with open(out, "a") as f:
+        f.write(line + "\n")
+try:
+    s = socket.create_connection((addr, port), timeout=3)
+    s.sendall(b"nrv\n")
+    if s.recv(16) != b"nrv\n":
+        say("no echo"); sys.exit(1)
+except OSError as e:
+    say(f"connect failed: {e}"); sys.exit(1)
+say("open")
+start = time.monotonic()
+s.settimeout(60)
+try:
+    data = s.recv(16)
+    say(f"closed after {int((time.monotonic() - start) * 1000)}ms" if not data else f"unexpected data {data!r}")
+except socket.timeout:
+    say("still open after 60s")
+except OSError as e:
+    say(f"closed after {int((time.monotonic() - start) * 1000)}ms ({e.__class__.__name__})")
+PY
+  local conn_out="$WORK/nrv-client.out" opened=""
+  for _ in $(seq 1 40); do
+    : > "$conn_out"
+    python3 -I "$WORK/nrv-client.py" "$a_addr" "$port" "$conn_out" &
+    NRV_CONN_PID=$!
+    for _ in $(seq 1 10); do
+      grep -qx open "$conn_out" 2>/dev/null && { opened=1; break; }
+      kill -0 "$NRV_CONN_PID" 2>/dev/null || break
+      sleep 0.3
+    done
+    [ -n "$opened" ] && break
+    kill "$NRV_CONN_PID" 2>/dev/null || true; wait "$NRV_CONN_PID" 2>/dev/null || true
+    NRV_CONN_PID=""
+    sleep 0.5
+  done
+  if [ -z "$opened" ]; then
+    echo "::error::the host never opened an echoing connection to $a_addr:$port, the port box $a_name's listener published"
+    cat "$conn_out" 2>/dev/null || true
+    mnl session policy "$a_sid" 2>&1 || true
+    fail
+  fi
+  echo "connection: host -> $a_addr:$port open, echo answered"
+  # SIGKILL the listener alone: its forked child keeps the box side of the
+  # connection open, so only the switch can end the host's side.
+  # shellcheck disable=SC2016 # expands in the box's shell
+  mnl session exec "$a_sid" 'kill -9 "$(cat /home/nrv.pid)"' >/dev/null 2>&1 \
+    || { echo "::error::could not stop the listener on port $port in box $a_name"; fail; }
+  echo "withdraw: killed the listener on port $port in box $a_name; its connection child stays"
+  local ended=""
+  for _ in $(seq 1 40); do
+    ended="$(grep -v -x open "$conn_out" 2>/dev/null | head -n1)"
+    [ -n "$ended" ] && break
+    sleep 0.5
+  done
+  echo "connection after the withdrawal: ${ended:-still open after 20s}"
+  case "$ended" in
+    "closed after"*) ;;
+    *)
+      echo "::error::the host connection through port $port stayed open after the port was withdrawn: the withdrawal must close the connections it accepted"
+      echo "--- in box: TCP sockets on port $port ---"
+      mnl session exec "$a_sid" "grep -i ':$(printf '%04X' "$port") ' /proc/net/tcp" 2>&1 || true
+      mnl session policy "$a_sid" 2>&1 || true
+      fail
+      ;;
+  esac
+  kill "$NRV_CONN_PID" 2>/dev/null || true; wait "$NRV_CONN_PID" 2>/dev/null || true
+  NRV_CONN_PID=""
+
+  # ---- leave the host as found ---------------------------------------------
+  mnl session destroy --force "$a_sid" >/dev/null 2>&1 || true
+  # shellcheck disable=SC2086
+  min ${E2E_MINIMAL_ARGS:-} --vm "$NRV_VM_NAME" session destroy --force "$b_sid" >/dev/null 2>&1 || true
+  minvmd --vm "$NRV_VM_NAME" stop >/dev/null 2>&1 || true
+  NRV_VM_NAME=""
+  nrv_teardown_names
+  answerer_service_teardown
+  setup_classifier_teardown || true
+  rm -rf "$NRV_SEED_A_DIR" "$NRV_SEED_B_DIR"
+  NRV_SEED_A_DIR="" NRV_SEED_B_DIR=""
+  echo "$nc OK ($a_name answered $a_addr before and after the simulated restart, $b_name on VM $vm answered $b_addr beside it with no contention, and the withdrawn port $port closed the open connection: $ended)"
+  echo "::endgroup::"
+}
+
+# Undoes what the names step of proof_names_survive_restart_and_second_vm
+# installed: the boot unit first, so nothing re-creates the link, then the
+# link. A no-op until the case recorded the install.
+nrv_teardown_names() {
+  if [ -n "$NRV_UNIT_INSTALLED" ]; then
+    sudo -n systemctl disable --now minzone0-link.service >/dev/null 2>&1 || true
+    sudo -n rm -f /etc/systemd/system/minzone0-link.service >/dev/null 2>&1 || true
+    sudo -n systemctl daemon-reload >/dev/null 2>&1 || true
+    sudo -n systemctl reset-failed minzone0-link.service >/dev/null 2>&1 || true
+    NRV_UNIT_INSTALLED=""
+  fi
+  if [ -n "$NRV_REVERT_LINK" ]; then
+    sudo -n resolvectl revert "$NRV_REVERT_LINK" >/dev/null 2>&1 || true
+    sudo -n ip link del "$NRV_REVERT_LINK" >/dev/null 2>&1 || true
+    NRV_REVERT_LINK=""
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# A box's ports open by name on macOS, end to end (NET-010, NET-069,
+# NET-123, NET-144). One own-address box declares one port at activate and
+# publishes a second port at runtime with `min net expose`. Each port must
+# open at the box's address, at http://<name>.min.internal:<port>, and through
+# the hostname proxy that `min ls` names. A second box that declares the same
+# port must then be refused at activate, with no box left behind.
+#
+# The case runs on the host as it finds it, and says which state that is:
+#   * With the reserved range on lo0 (`min finalize-install` ran), the box
+#     stands at its own 127.0.64.N address. The second box gets an address of
+#     its own, so the case holds the port on every other range address with a
+#     plain listener. The second box's bind then fails, and the refusal names
+#     another program as the holder.
+#   * Without the range, the box stands at the 127.0.0.1 interim, which is
+#     shared. The second box collides with the first, and the refusal names
+#     the first box.
+#   * The name leg needs /etc/resolver/min.internal, which the same script
+#     writes. Without it the leg is NOT RUN, and the address and proxy legs
+#     still run.
+#
+# Observability: every leg prints its URL and its status, so a failed run
+# names the leg. Diagnostics: `fail` writes the `min bug` bundle, whose
+# daemon log carries the session-start range probe, the proxy's route lines
+# and the activation refusal line.
+proof_macos_box_opens_by_name_and_proxy() {
+  local mo_case="macos_box_opens_by_name_and_proxy"
+  local mo_name_a="e2e-mac-open-a" mo_name_b="e2e-mac-open-b"
+  # This case's own band, clear of every band the other proofs fix.
+  local mo_declared=18190 mo_runtime=18191
+  local mo_marker_d="MACOS_OPEN_DECLARED_OK" mo_marker_r="MACOS_OPEN_RUNTIME_OK"
+  local mo_sid_a="" mo_sid_b="" mo_range="" mo_ans_port="" mo_addr=""
+  local mo_proxy_port="" mo_ls="" mo_port="" mo_marker="" mo_ready=""
+  local mo_status="" mo_body="" mo_rc=0 mo_err="" mo_want_holder=""
+  local mo_expose_rc=0 mo_holder_addrs=""
+
+  echo "::group::a macOS box opens by name and through the hostname proxy, and a held port refuses the activation (NET-010, NET-069, NET-123, NET-144)"
+  if [ "$(uname -s)" != Darwin ]; then
+    echo "$mo_case SKIPPED (macOS lane only: this host is $(uname -s), and the Linux lanes prove the native path)"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    echo "$mo_case SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch, so no box publishes a port)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # The host's state, as found.
+  if [ "$(ifconfig lo0 2>/dev/null | grep -c -- '127\.0\.64\.')" = 254 ]; then
+    mo_range=present
+    echo "host: lo0 carries the reserved range (min finalize-install ran), so the box stands at its own address"
+  else
+    mo_range=absent
+    echo "host: lo0 does not carry the reserved range, so the box stands at the 127.0.0.1 interim"
+  fi
+
+  # Box A: one declared port, and a dynamic range that admits the runtime one.
+  MACOS_OPEN_SEED_A_DIR="$(hook_mktemp /tmp/mnlmoa.XXXXXX)"
+  hook_seed_preamble > "$MACOS_OPEN_SEED_A_DIR/minimal.toml"
+  mkdir "$MACOS_OPEN_SEED_A_DIR/.git"
+  mo_sid_a="$(cd "$MACOS_OPEN_SEED_A_DIR" && mnl session activate . --no-prompt \
+    --name "$mo_name_a" --network own_ip --ingress "$mo_declared:$mo_declared" \
+    --dynamic-ingress allow --dynamic-range "$mo_runtime-$mo_runtime" \
+    2>"$WORK/mo-activate-a.err")" || {
+    echo "::error::'min session activate --network own_ip --ingress $mo_declared:$mo_declared' failed for the first box"
+    cat "$WORK/mo-activate-a.err" 2>/dev/null || true
+    fail
+  }
+  mo_sid_a="$(printf '%s\n' "$mo_sid_a" | tail -n1 | tr -d '\r')"
+  echo "box A: $mo_sid_a ($mo_name_a, declared $mo_declared, dynamic ingress allow over $mo_runtime)"
+
+  # One responder per port, each with its own page.
+  for mo_port in "$mo_declared" "$mo_runtime"; do
+    if [ "$mo_port" = "$mo_declared" ]; then mo_marker="$mo_marker_d"; else mo_marker="$mo_marker_r"; fi
+    if ! { mnl session exec "$mo_sid_a" \
+        "body=$mo_marker; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/mo$mo_port" \
+        >/dev/null 2>"$WORK/mo-responder.err" \
+      && mnl session exec "$mo_sid_a" \
+        "nohup /usr/bin/socat TCP-LISTEN:$mo_port,reuseaddr,fork SYSTEM:\"cat /home/mo$mo_port\" >/dev/null 2>&1 &" \
+        >/dev/null 2>>"$WORK/mo-responder.err"; }; then
+      echo "::error::could not start the box's responder on port $mo_port"
+      cat "$WORK/mo-responder.err" 2>/dev/null || true
+      fail
+    fi
+    mo_ready=""
+    for _ in $(seq 1 40); do
+      if [ "$(mnl session exec "$mo_sid_a" \
+        "curl -sS --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:$mo_port/" \
+        2>/dev/null || true)" = "200" ]; then
+        mo_ready=1; break
+      fi
+      sleep 0.25
+    done
+    [ -n "$mo_ready" ] || { echo "::error::the box's responder on port $mo_port never answered inside the box"; fail; }
+  done
+
+  # The runtime port: published from inside the box.
+  mnl session exec "$mo_sid_a" "/usr/bin/min net expose $mo_runtime" \
+    >"$WORK/mo-expose.out" 2>"$WORK/mo-expose.err"
+  mo_expose_rc=$?
+  echo "expose: min net expose $mo_runtime in box A -> exit $mo_expose_rc: $(tr '\n' ' ' < "$WORK/mo-expose.out" 2>/dev/null)$(tr '\n' ' ' < "$WORK/mo-expose.err" 2>/dev/null)"
+  if [ "$mo_expose_rc" -ne 0 ]; then
+    echo "::error::'min net expose $mo_runtime' inside box A did not publish an in-range port"
+    fail
+  fi
+
+  # The box's address (the zone's A record for its name) and the proxy port.
+  for _ in $(seq 1 40); do
+    mo_ls="$(mnl ls 2>/dev/null || true)"
+    mo_ans_port="$(printf '%s\n' "$mo_ls" \
+      | sed -En 's/^DNS SERVICE:.* on 127\.0\.0\.1:([0-9]+) \(UDP\).*/\1/p' | head -n1)"
+    mo_proxy_port="$(printf '%s\n' "$mo_ls" \
+      | sed -En 's/^HOSTNAME PROXY: .*listening on 127\.0\.0\.1:([0-9]+).*/\1/p' | head -n1)"
+    [ -n "$mo_ans_port" ] && [ -n "$mo_proxy_port" ] && break
+    sleep 0.25
+  done
+  if [ -z "$mo_ans_port" ] || [ -z "$mo_proxy_port" ]; then
+    echo "::error::'min ls' names no DNS SERVICE port or no HOSTNAME PROXY port (got '${mo_ans_port:-<none>}' and '${mo_proxy_port:-<none>}')"
+    printf '%s\n' "$mo_ls" | head -40
+    fail
+  fi
+  mo_addr="$(zone_answerer_a "$mo_ans_port" "$mo_name_a.min.internal" 2>"$WORK/mo-ans.err")" || true
+  case "$mo_range:$mo_addr" in
+    present:127.0.64.*|absent:127.0.0.1) ;;
+    *)
+      echo "::error::$mo_name_a.min.internal answers '${mo_addr:-nothing}', but the range is $mo_range on this host (want a 127.0.64.N address when present, 127.0.0.1 when absent)"
+      cat "$WORK/mo-ans.err" 2>/dev/null || true
+      fail
+      ;;
+  esac
+  echo "zone: $mo_name_a.min.internal answers $mo_addr; hostname proxy: 127.0.0.1:$mo_proxy_port"
+
+  # One GET, retried while the publish settles. $1: the leg. $2: the URL.
+  # $3: the page. $4: a proxy URL, or "" for a direct request.
+  mo_get() {
+    local leg="$1" url="$2" want="$3" via="$4"
+    for _ in $(seq 1 20); do
+      if [ -n "$via" ]; then
+        env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
+          curl -sS --max-time 8 -x "$via" -o "$WORK/mo.body" -w 'HTTP:%{http_code}' \
+          "$url" >"$WORK/mo.out" 2>"$WORK/mo.err"
+      else
+        env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
+          curl -sS --max-time 8 -o "$WORK/mo.body" -w 'HTTP:%{http_code}' \
+          "$url" >"$WORK/mo.out" 2>"$WORK/mo.err"
+      fi
+      mo_rc=$?
+      mo_status="$(cat "$WORK/mo.out" 2>/dev/null)"
+      mo_body="$(cat "$WORK/mo.body" 2>/dev/null || true)"
+      [ "$mo_rc" -eq 0 ] && [ "$mo_status" = "HTTP:200" ] && [[ "$mo_body" == *"$want"* ]] && break
+      sleep 0.5
+    done
+    echo "$leg: GET $url${via:+ via $via} -> ${mo_status:-<none>} ${mo_body:-<no body>} (curl exit $mo_rc)"
+    if [ "$mo_rc" -ne 0 ] || [ "$mo_status" != "HTTP:200" ] || [[ "$mo_body" != *"$want"* ]]; then
+      echo "::error::$leg: GET $url${via:+ via $via} did not return the in-box server's page '$want'"
+      cat "$WORK/mo.err" 2>/dev/null || true
+      fail
+    fi
+  }
+
+  for mo_port in "$mo_declared" "$mo_runtime"; do
+    if [ "$mo_port" = "$mo_declared" ]; then mo_marker="$mo_marker_d"; else mo_marker="$mo_marker_r"; fi
+    mo_get "address leg :$mo_port" "http://$mo_addr:$mo_port/" "$mo_marker" ""
+    if [ -f /etc/resolver/min.internal ]; then
+      mo_get "name leg :$mo_port" "http://$mo_name_a.min.internal:$mo_port/" "$mo_marker" ""
+    else
+      not_run "${mo_case}_name_leg_$mo_port" "no /etc/resolver/min.internal on this host: min finalize-install did not run, so this host's resolver does not ask the box zone"
+    fi
+    mo_get "proxy leg :$mo_port" "http://$mo_name_a.min.internal:$mo_port/" "$mo_marker" \
+      "http://127.0.0.1:$mo_proxy_port"
+  done
+
+  # Box B declares the same port. Under the range the case holds that port
+  # at every other range address, so box B's own address is held too.
+  if [ "$mo_range" = present ]; then
+    mo_holder_addrs="$(ifconfig lo0 2>/dev/null | sed -n 's/^[[:space:]]*inet \(127\.0\.64\.[0-9]*\) .*/\1/p' \
+      | grep -vxF -- "$mo_addr" | tr '\n' ' ')"
+    # One address per word, so the list splits on purpose.
+    # shellcheck disable=SC2086
+    python3 -c 'import socket,sys,time
+held = []
+for addr in sys.argv[2:]:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind((addr, int(sys.argv[1])))
+        s.listen(1)
+        held.append(s)
+    except OSError as e:
+        print("skipped %s: %s" % (addr, e), file=sys.stderr)
+print("held %d" % len(held), flush=True)
+while True:
+    time.sleep(3600)' "$mo_declared" $mo_holder_addrs \
+      >"$WORK/mo-hold.out" 2>"$WORK/mo-hold.err" &
+    MACOS_OPEN_HOLD_PID=$!
+    for _ in $(seq 1 40); do
+      grep -q '^held' "$WORK/mo-hold.out" 2>/dev/null && break
+      kill -0 "$MACOS_OPEN_HOLD_PID" 2>/dev/null || break
+      sleep 0.25
+    done
+    if ! grep -q '^held [1-9]' "$WORK/mo-hold.out" 2>/dev/null; then
+      echo "::error::could not hold port $mo_declared on the other range addresses with a plain listener"
+      cat "$WORK/mo-hold.err" 2>/dev/null || true
+      fail
+    fi
+    echo "holder: a plain listener holds port $mo_declared at $(sed -n 's/^held //p' "$WORK/mo-hold.out") range addresses other than $mo_addr"
+    mo_want_holder="another program on this machine."
+  else
+    mo_want_holder="box $mo_name_a."
+  fi
+  MACOS_OPEN_SEED_B_DIR="$(hook_mktemp /tmp/mnlmob.XXXXXX)"
+  hook_seed_preamble > "$MACOS_OPEN_SEED_B_DIR/minimal.toml"
+  mkdir "$MACOS_OPEN_SEED_B_DIR/.git"
+  if mo_sid_b="$(cd "$MACOS_OPEN_SEED_B_DIR" && mnl session activate . --no-prompt \
+      --name "$mo_name_b" --network own_ip --ingress "$mo_declared:$mo_declared" \
+      2>"$WORK/mo-activate-b.err")"; then
+    echo "::error::the second box's activate with --ingress $mo_declared:$mo_declared succeeded while that port is held ($mo_sid_b)"
+    mnl session destroy --force "$(printf '%s\n' "$mo_sid_b" | tail -n1 | tr -d '\r')" >/dev/null 2>&1 || true
+    fail
+  fi
+  mo_err="$(cat "$WORK/mo-activate-b.err" 2>/dev/null || true)"
+  echo "refusal: min session activate --ingress $mo_declared:$mo_declared for box B -> $(printf '%s\n' "$mo_err" | tr '\n' ' ')"
+  if [[ "$mo_err" != *"Port $mo_declared is already in use on this machine by $mo_want_holder"* ]] \
+     || [[ "$mo_err" != *"--ingress"* ]]; then
+    echo "::error::the refusal does not name port $mo_declared, its holder ($mo_want_holder) and the --ingress remedy"
+    fail
+  fi
+  mo_ls="$(mnl ls 2>/dev/null || true)"
+  if [[ "$mo_ls" == *"$mo_name_b"* ]]; then
+    echo "::error::the refused activation left box $mo_name_b behind in 'min ls'"
+    printf '%s\n' "$mo_ls" | head -40
+    fail
+  fi
+  echo "the refused activation left no box behind"
+
+  if [ -n "$MACOS_OPEN_HOLD_PID" ]; then
+    kill "$MACOS_OPEN_HOLD_PID" 2>/dev/null || true
+    wait "$MACOS_OPEN_HOLD_PID" 2>/dev/null || true
+    MACOS_OPEN_HOLD_PID=""
+  fi
+  mnl session destroy --force "$mo_sid_a" >/dev/null 2>&1 || true
+  rm -rf "$MACOS_OPEN_SEED_A_DIR" "$MACOS_OPEN_SEED_B_DIR"
+  MACOS_OPEN_SEED_A_DIR=""
+  MACOS_OPEN_SEED_B_DIR=""
+  echo "$mo_case OK (range $mo_range: the declared and the runtime port open at $mo_addr, by name where the resolver file exists, and through the hostname proxy; a second box on port $mo_declared is refused and left nothing behind)"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
 # Dispatch on the first argument: every proof in today's order when none is
 # given, or exactly the named one. The names are the proof functions' suffixes.
 case "${1:-}" in
@@ -20909,6 +29814,7 @@ case "${1:-}" in
     proof_own_ip
     proof_own_ip_egress_declared_and_enforced
     proof_task_run
+    proof_task_network_inherits_session
     proof_hooks
     proof_skip_scaffold
     proof_tty_relay
@@ -20956,7 +29862,32 @@ case "${1:-}" in
     proof_switch_steers_proxy_mac_frames_to_the_host_stack
     proof_switch_answers_no_arp_for_the_proxy_address
     proof_two_named_vms_on_one_machine
+    proof_names_survive_restart_and_second_vm
+    proof_ls_and_box_commands_tell_the_truth
+    proof_macos_box_opens_by_name_and_proxy
     proof_github_only_allowlist
+    proof_bep_second_box_needs_no_sign_in
+    proof_bep_box_env_holds_sealed_value_only
+    proof_bep_git_and_gh_against_private_repo
+    proof_bep_git_credential_helper_sends_header
+    proof_bep_first_slice_end_to_end
+    proof_bep_store_reference_end_to_end
+    proof_bep_signing_rotation_keeps_running_box_working
+    proof_bep_proxy_env_and_no_proxy_are_set
+    proof_bep_proxy_env_sets_node_use_env_proxy
+    proof_bep_root_ca_present_in_box_trust_store
+    proof_bep_root_ca_absent_from_box_without_credentialed_upstream
+    proof_bep_trust_env_points_at_bundle_and_root
+    proof_bep_destroyed_box_values_refused_within_60s
+    proof_bep_box_recreated_under_its_name_redeems
+    proof_bep_destroy_with_proxy_down_refuses_by_attachment
+    proof_bep_logout_refuses_every_reference_at_next_request
+    proof_bep_revoke_and_sign_out_end_to_end
+    proof_bep_dns_steering_fails_closed_end_to_end
+    proof_bep_dns_steering_through_the_box_zone_resolver
+    proof_bep_round_two_conditions_closed
+    proof_bep_audit_rotation_and_doctor_end_to_end
+    proof_bep_audit_http_and_messages_closed
     proof_unpublished_port_refused_on_vm_host
     proof_proxy_sees_each_vm_box_by_its_switch_address
     proof_deny_all_box_reaches_proxy_and_no_other_host_port
@@ -20969,6 +29900,9 @@ case "${1:-}" in
     # are INFO, which the lane's default filter drops), and the daemon-fetch
     # proof respawns the pair again for its own needs.
     proof_escape_reaches_only_declared_union
+    # Beside the escape-union proof, for the same reason: it stops the daemon
+    # pair and autospawns a fresh one under its own record filter.
+    proof_escapes_and_builds_stay_inside_box_rules
     # Second-to-last on purpose, for the same reasons the daemon-fetch proof
     # below is last: it installs its own host classifier tree and table (its
     # own, removed before it returns) and respawns the daemon pair under its
@@ -20978,13 +29912,18 @@ case "${1:-}" in
     # already carries a classifier install, and a residue here would read as
     # one there.
     proof_host_ip_deny_all
+    # After proof_host_ip_deny_all and before the daemon-fetch proof, for the
+    # same reasons: it installs its own host classifier tree and table
+    # (removed before it returns) and respawns the daemon under its own
+    # record filter, and a residue would trip the daemon-fetch proof's gates.
+    proof_bep_host_ip_cohort_blocks_udp_443
     # Last on purpose: the daemon-fetch proof installs a host classifier
     # tree and table (its own, removed before it returns) and stops the
     # daemon to place a fresh one inside the tree, so nothing after it may
     # rely on the lane's daemon or the host's packet filter as it found them.
     proof_daemon_fetch_under_deny_all_host_address_box
     ;;
-  lifecycle | session_exec | session_rename | session_outbound_request | own_ip | own_ip_egress_declared_and_enforced | task_run | hooks \
+  lifecycle | session_exec | session_rename | session_outbound_request | own_ip | own_ip_egress_declared_and_enforced | task_run | task_network_inherits_session | hooks \
     | skip_scaffold | tty_relay | sandbox | restart | fresh_install_own_ip_ingress_publishes_loopback \
     | own_ip_box_registers_with_the_vm_host_without_a_provider_flag \
     | vm_host_row_read_tracks_create_and_destroy \
@@ -21002,6 +29941,9 @@ case "${1:-}" in
     | proxy_refuses_like_direct | retired_surfaces_gone \
     | fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
     | linux_stock_install_runs_vm_boxes | two_named_vms_on_one_machine \
+    | names_survive_restart_and_second_vm \
+    | ls_and_box_commands_tell_the_truth \
+    | macos_box_opens_by_name_and_proxy \
     | switch_steers_proxy_mac_frames_to_the_host_stack | switch_answers_no_arp_for_the_proxy_address \
     | github_only_allowlist | unpublished_port_refused_on_vm_host \
     | proxy_sees_each_vm_box_by_its_switch_address \
@@ -21010,14 +29952,50 @@ case "${1:-}" in
     | proxy_sees_boxes_by_address \
     | published_proxy_routes_from_host \
     | escape_reaches_only_declared_union \
+    | escapes_and_builds_stay_inside_box_rules \
     | host_ip_deny_all \
-    | daemon_fetch_under_deny_all_host_address_box)
+    | daemon_fetch_under_deny_all_host_address_box \
+    | bep_second_box_needs_no_sign_in \
+    | bep_box_env_holds_sealed_value_only \
+    | bep_git_and_gh_against_private_repo \
+    | bep_git_credential_helper_sends_header \
+    | bep_first_slice_end_to_end \
+    | bep_store_reference_end_to_end \
+    | bep_signing_rotation_keeps_running_box_working \
+    | bep_proxy_env_and_no_proxy_are_set \
+    | bep_proxy_env_sets_node_use_env_proxy \
+    | bep_root_ca_present_in_box_trust_store \
+    | bep_root_ca_absent_from_box_without_credentialed_upstream \
+    | bep_trust_env_points_at_bundle_and_root \
+    | bep_destroyed_box_values_refused_within_60s \
+    | bep_box_recreated_under_its_name_redeems \
+    | bep_destroy_with_proxy_down_refuses_by_attachment \
+    | bep_logout_refuses_every_reference_at_next_request \
+    | bep_revoke_and_sign_out_end_to_end \
+    | bep_dns_steering_fails_closed_end_to_end \
+    | bep_dns_steering_through_the_box_zone_resolver \
+    | bep_round_two_conditions_closed \
+    | bep_audit_rotation_and_doctor_end_to_end \
+    | bep_host_ip_cohort_blocks_udp_443 \
+    | bep_conditions_closed_end_to_end \
+    | bep_r3_spec_names_jti_and_quarantine \
+    | bep_r3_pre_flip_udp_443_refused \
+    | bep_r3_finalize_install_names_quic_helper \
+    | bep_r3_uninstall_removes_quic_helper \
+    | bep_r3_minted_id_checked_without_proxy \
+    | bep_r3_stranded_box_frees_client_key \
+    | bep_r3_widened_store_rule_without_restart \
+    | bep_r3_config_dir_rule_reaches_bep_serve \
+    | bep_round_three_conditions_closed \
+    | bep_ahm_audit_by_id_and_name | bep_ahm_parent_merges_children \
+    | bep_ahm_relayed_response_has_no_alt_svc | bep_ahm_missing_proxy_refused \
+    | bep_audit_http_and_messages_closed)
     "proof_$1"
     ;;
   *)
     echo "usage: $0 [case]"
     echo "  no argument: every proof, in the whole-lane order"
-    echo "  cases: lifecycle session_exec session_rename session_outbound_request own_ip own_ip_egress_declared_and_enforced task_run hooks"
+    echo "  cases: lifecycle session_exec session_rename session_outbound_request own_ip own_ip_egress_declared_and_enforced task_run task_network_inherits_session hooks"
     echo "         skip_scaffold tty_relay sandbox restart fresh_install_own_ip_ingress_publishes_loopback"
     echo "         own_ip_box_registers_with_the_vm_host_without_a_provider_flag"
     echo "         vm_host_row_read_tracks_create_and_destroy"
@@ -21036,7 +30014,9 @@ case "${1:-}" in
     echo "         expose_from_inside_box"
     echo "         proxy_refuses_like_direct retired_surfaces_gone"
     echo "         switch_steers_proxy_mac_frames_to_the_host_stack switch_answers_no_arp_for_the_proxy_address"
-    echo "         two_named_vms_on_one_machine"
+    echo "         two_named_vms_on_one_machine macos_box_opens_by_name_and_proxy"
+    echo "         names_survive_restart_and_second_vm"
+    echo "         ls_and_box_commands_tell_the_truth"
     echo "         github_only_allowlist unpublished_port_refused_on_vm_host"
     echo "         proxy_sees_each_vm_box_by_its_switch_address"
     echo "         deny_all_box_reaches_proxy_and_no_other_host_port"
@@ -21044,8 +30024,32 @@ case "${1:-}" in
     echo "         proxy_sees_boxes_by_address"
     echo "         published_proxy_routes_from_host"
     echo "         escape_reaches_only_declared_union"
+    echo "         escapes_and_builds_stay_inside_box_rules"
     echo "         host_ip_deny_all"
     echo "         daemon_fetch_under_deny_all_host_address_box"
+    echo "         bep_second_box_needs_no_sign_in"
+    echo "         bep_box_env_holds_sealed_value_only"
+    echo "         bep_git_and_gh_against_private_repo bep_git_credential_helper_sends_header"
+    echo "         bep_first_slice_end_to_end bep_store_reference_end_to_end"
+    echo "         bep_signing_rotation_keeps_running_box_working"
+    echo "         bep_proxy_env_and_no_proxy_are_set bep_proxy_env_sets_node_use_env_proxy"
+    echo "         bep_root_ca_present_in_box_trust_store"
+    echo "         bep_root_ca_absent_from_box_without_credentialed_upstream"
+    echo "         bep_trust_env_points_at_bundle_and_root bep_logout_refuses_every_reference_at_next_request"
+    echo "         bep_destroyed_box_values_refused_within_60s bep_destroy_with_proxy_down_refuses_by_attachment"
+    echo "         bep_box_recreated_under_its_name_redeems bep_revoke_and_sign_out_end_to_end"
+    echo "         bep_dns_steering_fails_closed_end_to_end bep_round_two_conditions_closed"
+    echo "         bep_dns_steering_through_the_box_zone_resolver"
+    echo "         bep_host_ip_cohort_blocks_udp_443 bep_conditions_closed_end_to_end"
+    echo "         bep_r3_spec_names_jti_and_quarantine bep_r3_pre_flip_udp_443_refused"
+    echo "         bep_r3_finalize_install_names_quic_helper bep_r3_uninstall_removes_quic_helper"
+    echo "         bep_r3_minted_id_checked_without_proxy bep_r3_stranded_box_frees_client_key"
+    echo "         bep_r3_widened_store_rule_without_restart bep_r3_config_dir_rule_reaches_bep_serve"
+    echo "         bep_round_three_conditions_closed"
+    echo "         bep_audit_rotation_and_doctor_end_to_end"
+    echo "         bep_ahm_audit_by_id_and_name bep_ahm_parent_merges_children"
+    echo "         bep_ahm_relayed_response_has_no_alt_svc bep_ahm_missing_proxy_refused"
+    echo "         bep_audit_http_and_messages_closed"
     exit 2
     ;;
 esac

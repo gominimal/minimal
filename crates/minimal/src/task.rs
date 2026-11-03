@@ -11,7 +11,7 @@
 //! here — unless `--keep` retains it as an attachable session.
 //!
 //! Deliberately composed from the same client/RPC primitives `cmd_activate`
-//! uses (`SessionConfig`, `CreateSession`, the upload gates,
+//! uses (`BoxConfig`, `CreateSession`, the upload gates,
 //! `ConfigureLoadout`, the gating hooks, `FinalizeSession`) rather than
 //! refactored out of it: a few duplicated lines of glue keep
 //! `cmd_activate`'s diff at zero.
@@ -61,20 +61,36 @@ fn exit_outcome(code: Option<u32>) -> Result<(), anyhow::Error> {
 /// ends the session once the task's exit status is on the wire, whether or
 /// not this process is still there. `--keep` withholds it, because a kept
 /// session is meant to outlive the run — its end stays with whoever holds it.
-fn task_run_request(task: &str, args: &[String], keep: bool) -> minimald_rpc::exec::ExecRequest {
+/// `cwd` is the invocation directory relative to the uploaded tree (see
+/// [`task_run_cwd`]), where a task declaring `inherit_cwd` starts.
+fn task_run_request(
+    task: &str,
+    args: &[String],
+    keep: bool,
+    cwd: String,
+) -> minimald_rpc::exec::ExecRequest {
     minimald_rpc::exec::ExecRequest::TaskRun {
         task: task.to_string(),
         owns_box: !keep,
         args: args.to_vec(),
+        cwd,
     }
 }
 
-/// Mint the ephemeral session name `task-<task>-<hex>`: the task name is
-/// reduced to the session-name alphabet by the same sanitizer the activate
-/// autogen path uses, and the caller supplies the hex so a collision retry
-/// can re-mint with fresh entropy.
-fn task_session_name(task: &str, hex: &str) -> String {
-    format!("task-{}-{hex}", crate::sanitize_name_component(task))
+/// The invocation directory relative to the upload root, `/`-separated:
+/// `sub/inner` for a run started there, empty when the user is at the root.
+/// The daemon starts a task that declares `inherit_cwd` at the same place
+/// inside the uploaded tree.
+fn task_run_cwd(upload_root: &camino::Utf8Path, invocation_dir: &camino::Utf8Path) -> String {
+    invocation_dir
+        .strip_prefix(upload_root)
+        .map(|rel| {
+            rel.components()
+                .map(|c| c.as_str())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .unwrap_or_default()
 }
 
 /// The hidden top-level `min run` muscle-memory catch: always errors, naming
@@ -179,19 +195,19 @@ fn declared_task(dir: &camino::Utf8Path, task: &str) -> Result<mfile::Task, anyh
 /// no one. Resolving them would fail a run that works today over a variable
 /// the task has no use for, and gate one over a name it never sees.
 ///
-/// [`VarsPolicy::check`]: sessions::core::policy::VarsPolicy::check
-/// [`Source::Project`]: sessions::core::source::Source::Project
+/// [`VarsPolicy::check`]: boxes::core::policy::VarsPolicy::check
+/// [`Source::Project`]: boxes::core::source::Source::Project
 /// [`TaskEnv::drop`]: minimald_rpc::taskenv::TaskEnv::drop
 fn resolve_task_env(
     task: &mfile::Task,
     task_name: &str,
-    vars_policy: sessions::core::policy::VarsPolicy,
+    vars_policy: boxes::core::policy::VarsPolicy,
     policy_path: &std::path::Path,
-    source: &sessions::core::source::Source,
-    hooks: &dyn sessions::core::hooks::PolicyHooks,
+    source: &boxes::core::source::Source,
+    hooks: &dyn boxes::core::hooks::PolicyHooks,
     env: impl Fn(&str) -> Result<String, std::env::VarError>,
 ) -> Result<minimald_rpc::taskenv::TaskEnv, anyhow::Error> {
-    use sessions::core::compose::NameVerdict;
+    use boxes::core::compose::NameVerdict;
 
     let mut resolved = minimald_rpc::taskenv::TaskEnv::default();
     if task.action.as_echo().is_some() {
@@ -204,18 +220,18 @@ fn resolve_task_env(
     // by a sort here.
     let names: Vec<&str> = task.vars.keys().map(String::as_str).collect();
 
-    // The gate is `sessions`' own — the same three passes the session
+    // The gate is `boxes`' own — the same three passes the session
     // composer runs, called with names alone so that no value is read
     // before the policy has spoken.
-    let pairs: Vec<(&str, &sessions::core::source::Source)> =
+    let pairs: Vec<(&str, &boxes::core::source::Source)> =
         names.iter().map(|n| (*n, source)).collect();
     let (verdicts, _policy) =
-        match sessions::core::compose::gate_names(&pairs, vars_policy, Some(hooks)) {
+        match boxes::core::compose::gate_names(&pairs, vars_policy, Some(hooks)) {
             Ok(out) => out,
             // The gate stops at the first denial and names it. Reported
             // here rather than relayed, so the operator gets the task, the
             // variable, and the file the rule lives in.
-            Err(sessions::core::compose::ComposeError::Denied { what, .. }) => {
+            Err(boxes::core::compose::ComposeError::Denied { what, .. }) => {
                 bail!(denied_task_var_message(task_name, &what, policy_path))
             }
             Err(e) => {
@@ -273,12 +289,12 @@ impl RefuseAndRecord {
     }
 }
 
-impl sessions::core::hooks::PolicyHooks for RefuseAndRecord {
+impl boxes::core::hooks::PolicyHooks for RefuseAndRecord {
     fn on_var_unapproved(
         &self,
-        _policy: sessions::core::policy::VarsPolicy,
-        items: &[sessions::core::hooks::Unapproved<'_, str>],
-    ) -> sessions::core::hooks::HookResult<sessions::core::policy::VarsPolicy> {
+        _policy: boxes::core::policy::VarsPolicy,
+        items: &[boxes::core::hooks::Unapproved<'_, str>],
+    ) -> boxes::core::hooks::HookResult<boxes::core::policy::VarsPolicy> {
         let mut names = self.names.borrow_mut();
         for item in items {
             let name = item.item().to_owned();
@@ -286,14 +302,14 @@ impl sessions::core::hooks::PolicyHooks for RefuseAndRecord {
                 names.push(name);
             }
         }
-        sessions::core::hooks::HookResult::Abort
+        boxes::core::hooks::HookResult::Abort
     }
 
     fn on_patch_unapproved(
         &self,
-        _policy: sessions::core::policy::PatchesPolicy,
-        _items: &[sessions::core::hooks::Unapproved<'_, camino::Utf8Path>],
-    ) -> sessions::core::hooks::HookResult<sessions::core::policy::PatchesPolicy> {
+        _policy: boxes::core::policy::PatchesPolicy,
+        _items: &[boxes::core::hooks::Unapproved<'_, camino::Utf8Path>],
+    ) -> boxes::core::hooks::HookResult<boxes::core::policy::PatchesPolicy> {
         unreachable!("task env resolution never gates patches")
     }
 }
@@ -358,7 +374,9 @@ fn unknown_task_message(file: &mfile::File, task: &str) -> String {
 /// phase, modeled on [`crate::arm_activation_interrupt`]: the primary
 /// connection is parked in the exec bridge, so the handler works over a
 /// fresh connection. Without `--keep` the first Ctrl-C best-effort
-/// `DestroySession`s the box; with it the session is left alive and the
+/// `DestroySession`s the box and releases the name hold an attach or exec
+/// may have re-made for it ([`release_task_name_hold`]); with it the
+/// session is left alive and the
 /// handler says how to reach it. Either way the process exits 130. The
 /// destroy leg is bounded: the connect-and-destroy runs under the same
 /// 10-second cleanup ceiling as [`crate::best_effort_destroy`], and a
@@ -382,24 +400,28 @@ impl Drop for TaskRunInterrupt {
 
 fn arm_task_run_interrupt(
     global: &GlobalArgs,
-    session_id: sessions::SessionId,
-    session_name: String,
+    box_id: boxes::SessionId,
+    box_name: String,
     keep: bool,
 ) -> TaskRunInterrupt {
     let sock =
         crate::client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd());
+    let control_sock = crate::vm_host_control_sock(
+        crate::daemon_host_kind(global),
+        global.minimal_dir.as_deref(),
+    );
     let task = tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_err() {
             return;
         }
         if keep {
             eprintln!(
-                "\nInterrupted; session {session_name} kept — attach with: \
-                 min session attach {session_name}"
+                "\nInterrupted; session {box_name} kept — attach with: \
+                 min session attach {box_name}"
             );
             std::process::exit(130);
         }
-        eprintln!("\nInterrupted; destroying session {session_name}…");
+        eprintln!("\nInterrupted; destroying session {box_name}…");
         // The whole connect-and-destroy is bounded by the same 10-second
         // cleanup ceiling as `best_effort_destroy` — the interrupt may well
         // mean the daemon is already wedged — and raced against a second
@@ -416,16 +438,22 @@ fn arm_task_run_interrupt(
             {
                 use minimald_rpc::{DestroySession, DestroySessionRequest};
                 let _ = client
-                    .oneshot_rpc::<DestroySession>(DestroySessionRequest { id: session_id })
+                    .oneshot_rpc::<DestroySession>(DestroySessionRequest {
+                        id: box_id,
+                        only_if_unfinalized: false,
+                    })
                     .await;
             }
+            // The run's own return never comes on this path, so the release
+            // it owes is made here, inside the same bound.
+            release_task_name_hold(control_sock, box_id, &box_name, false).await;
         };
         tokio::select! {
             res = tokio::time::timeout(CLEANUP_TIMEOUT, destroy) => {
                 if res.is_err() {
                     eprintln!(
                         "DestroySession timed out after {CLEANUP_TIMEOUT:?}; the session may \
-                         still be present (run `min session destroy {session_name}` to clean \
+                         still be present (run `min session destroy {box_name}` to clean \
                          up manually)"
                     );
                 }
@@ -520,6 +548,14 @@ async fn bridge_exec(
     Ok(exit_status)
 }
 
+/// The name the create of a task with no spec carries (BOX-163): the
+/// task's name, cleaned as the daemon cleans a spec's entry. The daemon
+/// sends a request name unchanged to its name check, so a `build_all` task
+/// is sent as `build-all`.
+fn interactive_task_box_name(task: &str) -> String {
+    boxes::box_name::entry_box_name(task)
+}
+
 /// Run a declared task in an ephemeral session: create, upload, exec the
 /// canonical in-box `min task run <task>`, relay its exit code, and let the
 /// daemon end the session with the run (NET-131) — or keep it with `--keep`.
@@ -559,11 +595,15 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // project asking for its value — the same two lanes as an activate: the
     // interactive prompt on a real terminal, the collect-and-refuse
     // `NoPromptHook` anywhere else.
-    let source = sessions::core::source::Source::Project {
+    let source = boxes::core::source::Source::Project {
         path: paths::HostPath::try_new(utf8_path.clone()).context("Invalid project path")?,
     };
     let non_interactive = global.no_input || !crate::can_prompt_interactively();
-    let (task_env, user_policy) = if non_interactive {
+    // The policy amended by the task-env gating above: persisted to disk on
+    // the interactive path, and carried into `prepare_activation_inputs`
+    // below as an override, so composition and the pending gate run under the
+    // approved rules even when that save failed.
+    let (task_env, amended_policy) = if non_interactive {
         let hooks = RefuseAndRecord::default();
         let task_env = resolve_task_env(
             &declared,
@@ -616,154 +656,156 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
 
     crate::ensure_daemon(global)?;
 
-    let config = minimald_rpc::SessionConfig {
-        name: Some(task_session_name(&args.task, &crate::random_hex4())),
-        project_path: abs_path.clone(),
-        network: sessions::NetworkMode::HostNet,
-        policy: sessions::SessionPolicy::default(),
-        box_addresses: None,
-        // Same default as an activate with no flags, matching the
-        // loadout handling below. `min task run` has no `--no-hooks` of
-        // its own; a `--keep` session is attachable later, so its hooks
-        // should behave like any other session's.
-        hooks_enabled: true,
-        attrs: Default::default(),
-    };
-
-    // Loadouts and user policy: the same defaults as an activate with no
-    // loadout flags — the config's `default_loadouts` apply. Resolved before
-    // the daemon connection so a broken loadout fails loudly client-side.
-    let cfg = crate::config::read_client_config(global)?;
-    let initial_policy = user_policy.clone();
-    let compose_options = crate::loadouts::compose_options_from_config(&cfg);
-    let selection = crate::loadouts::LoadoutSelection::from_flags(&[], false);
-    let active = crate::loadouts::resolve_active_loadouts(selection, &cfg, global)?;
-    if !active.loadouts.is_empty() {
-        let names: Vec<&str> = active.loadouts.iter().map(|l| l.name().as_ref()).collect();
-        eprintln!("Applying loadouts: {}", names.join(", "));
+    // Same default as an activate with no flags, matching the loadout
+    // handling below: `min task run` has no `--no-hooks` of its own, and a
+    // `--keep` session is attachable later, so its hooks behave like any
+    // other session's. The constructor turns them on.
+    let mut request = minimald_rpc::CreateSessionRequest::new(
+        String::new(),
+        abs_path.clone(),
+        boxes::NetworkMode::HostNet,
+        boxes::BoxPolicy::default(),
+    );
+    // BOX-163: every task run is a fresh instance. The daemon names the box
+    // `<task>-<n>` from the spec's entry, with the smallest `n` no retained
+    // box uses. The client invents no name.
+    request.config.name = None;
+    request.fresh_instance = true;
+    // The box ends with this run unless `--keep` retains it: marked at
+    // create, so a daemon restart before or during the run destroys it
+    // rather than resuming it (NET-131).
+    request.config.ends_with_run = !args.keep;
+    // Refused by a daemon of another build before it allocates anything;
+    // `None` under the skew override.
+    request.must_match_version = minimal_client::version_assertion();
+    // The record's type is the task verb's (BOX-001).
+    request.config.creating_verb = minimald_rpc::CreatingVerb::Task;
+    // BOX-068: the declared task's spec, with this command's settings. An
+    // interactive task sends none: the task type denies a terminal.
+    if let Some(spec) =
+        mfile::spec::BoxSpec::for_task(&args.task, &declared, crate::spec_flags(&request))
+    {
+        crate::put_spec(&mut request, &spec)?;
+    } else {
+        // With no spec to name it, the request carries the entry's name,
+        // cleaned as the daemon cleans a spec's entry.
+        request.config.name = Some(interactive_task_box_name(&args.task));
     }
-    // Same pre-daemon staging as an activate, so a broken hook script
-    // path fails here rather than after the ephemeral session exists.
-    let hook_scripts = crate::loadouts::stage_loadout_hook_scripts(&active, &abs_path, true)?;
-
-    // Same first-class orientation field as an activate: a `--keep`
-    // task session is attachable later, and its banner should orient
-    // too.
-    // Size the later `FinalizeSession` deadline to the composition's
-    // `on_activate` hook timeouts, read while the loadouts are still in hand.
-    let finalize_hook_budget = crate::loadouts::activate_hook_budget(&active, &utf8_path, true);
-
-    let (contribution, user_policy) =
-        crate::loadouts::compose_user_contribution(active, user_policy, compose_options, true)?;
 
     // Upload per the normal activate rules: tarball sync (the default), the
     // same empty/`$HOME` and non-VCS-root gates, no `--sync` escape hatch.
     let upload_root = crate::resolve_upload_root(&utf8_path)?;
-    let skip_empty_or_home = crate::file_upload::is_empty_or_home(
-        upload_root.as_std_path(),
-        std::env::home_dir().as_deref(),
-    );
+    crate::stamp_project_root(&mut request, &upload_root)?;
+
+    // Loadouts and user policy: the same defaults as an activate with no
+    // loadout flags — the config's `default_loadouts` apply. Resolved before
+    // the daemon connection so a broken loadout fails loudly client-side, and
+    // through the same shared helper an activate uses so the staged hook
+    // scripts and the finalize budget match. The helper gets the resolved
+    // project root, not the directory `min task run` was invoked from, so a
+    // task started in a subdirectory still finds the project's config.
+    //
+    // `HookPrep::StageOnly` keeps this path's own behaviour: a task's hooks
+    // reach the daemon inside the uploaded mfile, and this command never
+    // refused a project whose hook script the staging check rejects.
+    let selection = crate::loadouts::LoadoutSelection::from_flags(&[], false);
+    let inputs = crate::loadouts::prepare_activation_inputs(
+        global,
+        &upload_root,
+        selection,
+        crate::loadouts::HookPrep::StageOnly,
+        Some(amended_policy),
+    )?;
+    inputs.announce_loadouts();
+
+    let initial_policy = inputs.initial_policy;
+    let compose_options = inputs.compose_options;
+    let hook_scripts = inputs.hook_scripts;
+    let finalize_hook_budget = inputs.hook_budget;
+    let contribution = inputs.contribution;
+    let user_policy = inputs.user_policy;
+    // Sent only for a task that declares `inherit_cwd`; any other task
+    // starts at the root of the uploaded tree.
+    let task_cwd = if declared.inherit_cwd {
+        task_run_cwd(&upload_root, &utf8_path)
+    } else {
+        String::new()
+    };
 
     // Not `connect_daemon`: like `min session activate`, this creates a session
     // and the version gate rides on that `CreateSession` rather than on a
     // `GetVersion` ahead of it.
     let mut client = crate::connect_daemon_unchecked(global).await?;
 
-    use minimald_rpc::{
-        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
-    };
-    // The minted name can (rarely) collide; retry with fresh entropy on the
-    // daemon's already-exists rejection, within the activate autogen budget.
-    let mut config = config;
-    let mut attempts = 0u32;
-    let created = loop {
-        let resp = client
-            .oneshot_rpc::<CreateSession>(CreateSessionRequest {
-                config: config.clone(),
-                // Refused by a daemon of another build before it allocates
-                // anything; `None` under the skew override.
-                must_match_version: minimal_client::version_assertion(),
-            })
-            .await
-            .context("CreateSession RPC failed")?;
-        match resp {
-            minimald_rpc::Errorable::Ok(r) => break r,
-            minimald_rpc::Errorable::Err { error } => {
-                if crate::should_retry_autogen(true, attempts, &error) {
-                    attempts += 1;
-                    config.name = Some(task_session_name(&args.task, &crate::random_hex4()));
-                    continue;
-                }
-                bail!("CreateSession failed: {error}");
-            }
-        }
+    use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
+    tracing::info!(
+        task = %args.task,
+        requested_name = ?request.config.name,
+        fresh_instance = request.fresh_instance,
+        "creating the task box as a fresh instance"
+    );
+    let resp = client
+        .oneshot_rpc::<CreateSession>(request.clone())
+        .await
+        .map_err(|error| crate::session_rpc_failed(crate::SessionRpc::CreateSession, error))?;
+    let created = match resp {
+        minimald_rpc::Errorable::Ok(r) => r,
+        minimald_rpc::Errorable::Err { error } => return Err(crate::create_refusal(error)),
     };
     // A daemon too old to know the field ignored it and echoes no version;
     // that silence is the skew. Caught here, before the upload and the
     // finalize, with the record still unfinalized and reapable.
     minimal_client::ensure_version_reported(created.daemon_version.as_deref())?;
     let id = created.id;
-    let session_name = config
-        .name
-        .clone()
-        .expect("the task session is always named");
+    // The task box is a `host_ip` box: its egress is admitted on the VM
+    // host daemon before it runs anything (NET-085), or the host gate drops
+    // every frame it sends outside the VM. The guard retires it on an early
+    // return; the run's end retires it through `release_task_name_hold`.
+    let mut host_ip_residency = crate::HostIpResidency::admit(
+        crate::vm_host_control_sock(
+            crate::daemon_host_kind(global),
+            global.minimal_dir.as_deref(),
+        ),
+        id,
+        request.config.network,
+        request.config.policy.egress.as_ref(),
+    )
+    .await;
+    // The daemon named the box `<task>-<n>`. A box whose name cannot be read
+    // back goes by its id.
+    let session_name = crate::daemon_box_name(&mut client, id)
+        .await
+        .unwrap_or_else(|| id.to_string());
+    tracing::info!(session_id = %id, box_name = %session_name, "the daemon named the task box");
 
     // Until the session is Active, a Ctrl-C must abort the half-built
     // session exactly as during an activate.
     let interrupt_guard = crate::arm_activation_interrupt(global, id);
 
-    if skip_empty_or_home {
-        eprintln!("Starting with an empty box (nothing here to sync)");
-    } else {
-        if upload_root != utf8_path {
-            eprintln!("Uploading from project root {upload_root} (resolved from {utf8_path})");
-        }
-        let headless = global.no_input || !crate::can_prompt_interactively();
-        let should_upload = match crate::file_upload::upload_gate(
-            crate::file_upload::is_vcs_root(upload_root.as_std_path()),
-            false,
-            crate::project_has_mfile(&upload_root),
-            headless,
-        ) {
-            crate::file_upload::UploadGate::Upload => true,
-            crate::file_upload::UploadGate::SkipHeadless => {
-                eprintln!(
-                    "{}",
-                    crate::file_upload::skipped_upload_warning(upload_root.as_std_path())
-                );
-                false
-            }
-            crate::file_upload::UploadGate::Prompt => crate::confirm(
-                &format!(
-                    "{upload_root} is not a version control repository root. \
-                     Upload all files from this directory?"
-                ),
-                false,
-            )?,
-        };
-        if should_upload {
-            client
-                .upload_workspace_files(id, upload_root.as_std_path())
-                .await
-                .context("Failed to upload project files")?;
-        } else if !headless {
-            eprintln!("Skipping file upload; the session will start with an empty workspace.");
-        }
-    }
+    let headless = global.no_input || !crate::can_prompt_interactively();
+    let decision = crate::decide_workspace_upload(
+        &upload_root,
+        false,
+        headless,
+        std::env::home_dir().as_deref(),
+    );
+    // `min task run` has no `--sync` flags, so it warns rather than refuses:
+    // an undeclared root starts empty, and a `$HOME` skip names the lifecycle
+    // hooks it drops. The box still starts, as it did before the shared gate.
+    crate::cli_workspace_upload(
+        &mut client,
+        id,
+        &utf8_path,
+        &upload_root,
+        decision,
+        crate::DroppedHooksPolicy::Warn,
+    )
+    .await?;
 
     // Client-side loadout patches land in the composition whether the
     // configure response is Materialized or Pending; daemon-side patches
     // approved through a Pending gate are appended below.
-    let mut collected_patches: Vec<(std::path::PathBuf, paths::SandboxRelPath)> = contribution
-        .patches
-        .iter()
-        .map(|p| {
-            (
-                p.patch.host_path.as_utf8_path().as_std_path().to_path_buf(),
-                p.patch.destination.clone(),
-            )
-        })
-        .collect();
+    let mut collected_patches = minimal_client::contribution_patch_uploads(&contribution);
 
     let configured = client
         .oneshot_rpc::<ConfigureLoadout>(ConfigureLoadoutRequest {
@@ -771,7 +813,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
             contribution,
         })
         .await
-        .context("ConfigureLoadout RPC failed")?;
+        .map_err(|error| crate::session_rpc_failed(crate::SessionRpc::ConfigureLoadout, error))?;
     let configured = match configured {
         minimald_rpc::Errorable::Ok(r) => r,
         // Same failure, same wording as an activate: the user knows the
@@ -843,8 +885,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     }
     let _ = initial_policy;
 
-    collected_patches.sort_by(|a, b| a.1.as_str().cmp(b.1.as_str()));
-    collected_patches.dedup_by(|a, b| a.1.as_str() == b.1.as_str());
+    minimal_client::dedup_patch_uploads(&mut collected_patches);
     if let Err(e) = crate::upload_and_finalize(
         &mut client,
         id,
@@ -854,7 +895,11 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     )
     .await
     {
-        crate::best_effort_destroy(&mut client, id).await;
+        // Unconditional: a task box is its run's own, and one whose finalize
+        // completed after the client gave up has no exec whose end would
+        // destroy it, so a kept box would be stranded. Only an activation's
+        // cleanup keeps a finished session (inbox#690).
+        crate::best_effort_destroy(&mut client, id, false).await;
         return Err(e);
     }
 
@@ -868,7 +913,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     let outcome = match client
         .open_session_exec_channel(
             id,
-            &task_run_request(&args.task, &args.args, args.keep).encode(),
+            &task_run_request(&args.task, &args.args, args.keep, task_cwd).encode(),
             &task_env,
         )
         .await
@@ -880,7 +925,8 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         // always did. A run that bridged leaves its box to the daemon.
         Err(e) => {
             if !args.keep {
-                crate::best_effort_destroy(&mut client, id).await;
+                // Finished (the exec never started): unconditional.
+                crate::best_effort_destroy(&mut client, id, false).await;
             }
             Err(e)
         }
@@ -893,23 +939,50 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     if args.keep {
         eprintln!("Session {session_name} kept — attach with: min session attach {session_name}");
     }
+    if let Some(residency) = host_ip_residency.as_mut() {
+        residency.keep();
+    }
+    release_task_name_hold(
+        crate::vm_host_control_sock(
+            crate::daemon_host_kind(global),
+            global.minimal_dir.as_deref(),
+        ),
+        id,
+        &session_name,
+        args.keep,
+    )
+    .await;
     drop(run_guard);
 
     exit_outcome(outcome?)
 }
 
+/// Releases the name hold a finished run's session may carry on the VM
+/// host daemon, best-effort. A task run holds no name of its own, but a
+/// `min session attach` or `min exec` into its running session re-makes
+/// one (`rehold_held_name_before_attach` cannot tell a task session
+/// apart), and the daemon ends the session with the run, where no client
+/// destroy releases it; an interrupted run's raw `DestroySession` releases
+/// nothing either, so its handler calls this too. The release is by the
+/// session's `id`, so it frees
+/// only this session's hold, and a name nothing held is the goal state
+/// already holding. `keep` withholds it: a kept session lives on, and its
+/// destroy releases its hold.
+pub(crate) async fn release_task_name_hold(
+    control_sock: Option<std::path::PathBuf>,
+    id: boxes::SessionId,
+    name: &str,
+    keep: bool,
+) {
+    if keep {
+        return;
+    }
+    crate::release_held_box_name(control_sock, id, Some(name), None).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The minted session name is `task-<task>-<hex>`, with the task name
-    /// pushed through the same sanitizer as the activate autogen so it
-    /// always clears `validate_session_name`.
-    #[test]
-    fn task_session_name_sanitizes_the_task_stem() {
-        assert_eq!(task_session_name("build", "9c1e"), "task-build-9c1e");
-        assert_eq!(task_session_name("My Task!", "4f2a"), "task-mytask-4f2a");
-    }
 
     /// The hidden `min run` redirect names both canonical forms — the host
     /// `min task run <task>` and the in-box
@@ -969,6 +1042,13 @@ mod tests {
         assert!(err.to_string().contains("whitespace"), "got: {err}");
     }
 
+    /// BOX-163: a task with no spec sends its name cleaned, as the daemon
+    /// cleans a spec's entry, so the daemon's name check accepts it.
+    #[test]
+    fn interactive_task_sends_its_name_cleaned() {
+        assert_eq!(interactive_task_box_name("build_all"), "build-all");
+    }
+
     /// Exit-status relay: a reported 0 is success; anything else downcasts
     /// to the typed `TaskExit`, clamped into `u8` like the git-remote
     /// helper's status.
@@ -1012,36 +1092,67 @@ mod tests {
         use minimald_rpc::exec::ExecRequest;
 
         // A normal run: the request names the box as the run's own.
-        let req = task_run_request("build", &[], false);
+        let req = task_run_request("build", &[], false, String::new());
         assert_eq!(
             req,
             ExecRequest::TaskRun {
                 task: "build".to_string(),
                 owns_box: true,
                 args: vec![],
+                cwd: String::new(),
             }
         );
         // The flag is carried, not inferred: it survives the wire.
         assert_eq!(ExecRequest::parse(&req.encode()), Ok(req.clone()));
 
         // `--keep` keeps the box: no owns-box flag, nothing ends it here.
-        let kept = task_run_request("build", &[], true);
+        let kept = task_run_request("build", &[], true, String::new());
         assert_eq!(
             kept,
             ExecRequest::TaskRun {
                 task: "build".to_string(),
                 owns_box: false,
                 args: vec![],
+                cwd: String::new(),
             }
         );
         assert_eq!(ExecRequest::parse(&kept.encode()), Ok(kept));
     }
 
+    /// `inherit_cwd` from the client side: the invocation directory is sent
+    /// relative to the upload root — the tree the daemon unpacks at
+    /// `/workbench` — and is empty when the user is at the root itself.
+    #[test]
+    fn task_run_cwd_is_relative_to_the_upload_root() {
+        use camino::Utf8Path;
+
+        let root = Utf8Path::new("/home/dev/project");
+        assert_eq!(
+            task_run_cwd(root, Utf8Path::new("/home/dev/project/sub/inner")),
+            "sub/inner"
+        );
+        assert_eq!(task_run_cwd(root, root), "");
+
+        // The cwd rides the request to the daemon intact.
+        let req = task_run_request(
+            "ic",
+            &[],
+            false,
+            task_run_cwd(root, Utf8Path::new("/home/dev/project/sub")),
+        );
+        let minimald_rpc::exec::ExecRequest::TaskRun { cwd, .. } =
+            minimald_rpc::exec::ExecRequest::parse(&req.encode()).unwrap()
+        else {
+            panic!("a task run must parse back as a task run");
+        };
+        assert_eq!(cwd, "sub");
+    }
+
     /// The empty `[vars]` policy — a fresh install, where nothing is
     /// denied or ignored. The default for the resolution tests that are
     /// not about policy.
-    fn no_vars_policy() -> sessions::core::policy::VarsPolicy {
-        sessions::core::policy::VarsPolicy::empty()
+    fn no_vars_policy() -> boxes::core::policy::VarsPolicy {
+        boxes::core::policy::VarsPolicy::empty()
     }
 
     /// Stand-in for the on-disk policy path, which only ever reaches the
@@ -1053,14 +1164,14 @@ mod tests {
     /// A policy that allows every name, for the resolution tests that are
     /// not about gating. An empty policy would refer everything to the
     /// hook, which is a different test.
-    fn allow_all() -> sessions::core::policy::VarsPolicy {
+    fn allow_all() -> boxes::core::policy::VarsPolicy {
         no_vars_policy().try_with_allow(["*"]).unwrap()
     }
 
     /// A task's `env_vars` always carry project provenance — the whole
     /// point of the gate is that the project is what it constrains.
-    fn project_source() -> sessions::core::source::Source {
-        sessions::core::source::Source::Project {
+    fn project_source() -> boxes::core::source::Source {
+        boxes::core::source::Source::Project {
             path: paths::HostPath::try_new(camino::Utf8PathBuf::from("/home/dev/proj")).unwrap(),
         }
     }
@@ -1068,12 +1179,12 @@ mod tests {
     /// A hook that answers every referred name the same way, recording
     /// what it was asked about. Stands in for the interactive prompt.
     struct ScriptedHook {
-        decision: sessions::core::decision::ItemDecision,
+        decision: boxes::core::decision::ItemDecision,
         asked: std::cell::RefCell<Vec<String>>,
     }
 
     impl ScriptedHook {
-        fn new(decision: sessions::core::decision::ItemDecision) -> Self {
+        fn new(decision: boxes::core::decision::ItemDecision) -> Self {
             Self {
                 decision,
                 asked: std::cell::RefCell::new(Vec::new()),
@@ -1085,23 +1196,23 @@ mod tests {
         }
     }
 
-    impl sessions::core::hooks::PolicyHooks for ScriptedHook {
+    impl boxes::core::hooks::PolicyHooks for ScriptedHook {
         fn on_var_unapproved(
             &self,
-            _policy: sessions::core::policy::VarsPolicy,
-            items: &[sessions::core::hooks::Unapproved<'_, str>],
-        ) -> sessions::core::hooks::HookResult<sessions::core::policy::VarsPolicy> {
+            _policy: boxes::core::policy::VarsPolicy,
+            items: &[boxes::core::hooks::Unapproved<'_, str>],
+        ) -> boxes::core::hooks::HookResult<boxes::core::policy::VarsPolicy> {
             self.asked
                 .borrow_mut()
                 .extend(items.iter().map(|i| i.item().to_string()));
-            sessions::core::hooks::HookResult::decided(vec![self.decision; items.len()])
+            boxes::core::hooks::HookResult::decided(vec![self.decision; items.len()])
         }
 
         fn on_patch_unapproved(
             &self,
-            _policy: sessions::core::policy::PatchesPolicy,
-            _items: &[sessions::core::hooks::Unapproved<'_, camino::Utf8Path>],
-        ) -> sessions::core::hooks::HookResult<sessions::core::policy::PatchesPolicy> {
+            _policy: boxes::core::policy::PatchesPolicy,
+            _items: &[boxes::core::hooks::Unapproved<'_, camino::Utf8Path>],
+        ) -> boxes::core::hooks::HookResult<boxes::core::policy::PatchesPolicy> {
             unreachable!("task env resolution never gates patches")
         }
     }
@@ -1110,20 +1221,20 @@ mod tests {
     /// must decide on its own.
     struct NeverAsked;
 
-    impl sessions::core::hooks::PolicyHooks for NeverAsked {
+    impl boxes::core::hooks::PolicyHooks for NeverAsked {
         fn on_var_unapproved(
             &self,
-            _policy: sessions::core::policy::VarsPolicy,
-            items: &[sessions::core::hooks::Unapproved<'_, str>],
-        ) -> sessions::core::hooks::HookResult<sessions::core::policy::VarsPolicy> {
+            _policy: boxes::core::policy::VarsPolicy,
+            items: &[boxes::core::hooks::Unapproved<'_, str>],
+        ) -> boxes::core::hooks::HookResult<boxes::core::policy::VarsPolicy> {
             panic!("the policy should have decided alone, was asked about {items:?}");
         }
 
         fn on_patch_unapproved(
             &self,
-            _policy: sessions::core::policy::PatchesPolicy,
-            _items: &[sessions::core::hooks::Unapproved<'_, camino::Utf8Path>],
-        ) -> sessions::core::hooks::HookResult<sessions::core::policy::PatchesPolicy> {
+            _policy: boxes::core::policy::PatchesPolicy,
+            _items: &[boxes::core::hooks::Unapproved<'_, camino::Utf8Path>],
+        ) -> boxes::core::hooks::HookResult<boxes::core::policy::PatchesPolicy> {
             unreachable!("task env resolution never gates patches")
         }
     }
@@ -1351,7 +1462,7 @@ mod tests {
         let policy = no_vars_policy()
             .try_with_allow(["SOMETHING_ELSE_*"])
             .unwrap();
-        let hooks = ScriptedHook::new(sessions::core::decision::ItemDecision::AllowOnce);
+        let hooks = ScriptedHook::new(boxes::core::decision::ItemDecision::AllowOnce);
 
         let out = resolve_task_env(
             &task,
@@ -1383,7 +1494,7 @@ mod tests {
         let task = task_from_toml(
             "[tasks.t]\nenv_vars.AWS_SECRET_ACCESS_KEY = { inherit = true }\nexec = 'true'\n",
         );
-        let hooks = ScriptedHook::new(sessions::core::decision::ItemDecision::IgnoreOnce);
+        let hooks = ScriptedHook::new(boxes::core::decision::ItemDecision::IgnoreOnce);
 
         let out = resolve_task_env(
             &task,
@@ -1411,7 +1522,7 @@ mod tests {
         let task = task_from_toml(
             "[tasks.t]\nenv_vars.A = 'literal'\nenv_vars.B = { inherit = true }\nexec = 'true'\n",
         );
-        let hooks = ScriptedHook::new(sessions::core::decision::ItemDecision::AllowOnce);
+        let hooks = ScriptedHook::new(boxes::core::decision::ItemDecision::AllowOnce);
 
         resolve_task_env(
             &task,

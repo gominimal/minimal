@@ -2,7 +2,12 @@
 
 use std::collections::BTreeMap;
 
+mod attach_shell;
 mod audit;
+mod box_actor;
+mod box_manager;
+pub mod box_ops;
+pub mod box_runtime;
 pub mod channel_progress;
 pub mod connection;
 mod diag;
@@ -15,19 +20,19 @@ mod maintenance;
 #[cfg(target_os = "linux")]
 pub mod net;
 pub mod nsenter;
+#[cfg(target_os = "linux")]
+pub mod reaper;
 pub mod rpc;
 mod sandbox_progress;
 pub mod server;
-mod session;
-mod session_delta;
-pub mod session_host;
-mod session_shell;
-pub mod session_sop;
-mod sessions;
 mod sftp;
 mod store;
+#[cfg(target_os = "linux")]
+pub mod telemetry_forward;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_harness;
+pub mod traced;
+mod workspace_delta;
 
 /// Env var that the client must set (via `env_request`) before the SFTP
 /// subsystem request, naming which session the SFTP channel attaches to.
@@ -48,6 +53,19 @@ pub struct RequestedPty {
 pub struct ChannelConfig {
     pub(crate) env_vars: BTreeMap<String, String>,
     pub(crate) pty: Option<RequestedPty>,
+}
+
+/// The fix to run for a host that refuses the unprivileged user namespace
+/// every session sandbox needs. One source for the daemon's startup warning
+/// and the spawn-failed attach error, so both name the same remediation:
+/// the daemon's own remedy for the restriction, the text the create gate's
+/// refusal carries too.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn userns_restriction_fix(restriction: sandbox::UsernsRestriction) -> String {
+    restriction.remedy(sandbox::RemedyTarget::Daemon {
+        bin: &server::this_daemon_path(),
+    })
 }
 
 #[cfg(test)]

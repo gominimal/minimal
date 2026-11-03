@@ -61,8 +61,23 @@ pub use switch::bep_host::BoxId;
 /// bits make the all-zero id impossible by construction, and the acceptor
 /// that reads a delivered header refuses it like any other id the source's
 /// attachment does not hold.
+///
+/// The bytes are those of [`mint_record_box_id`]: the one box id type
+/// every record names a box by. The in-VM daemon stores this id in the
+/// record's `box_id` field. The switch and the delivery header carry the
+/// same 16 bytes.
 pub fn mint_box_id() -> BoxId {
-    uuid::Uuid::now_v7().into_bytes()
+    mint_record_box_id().to_bytes()
+}
+
+/// Mints the box id as the one box id type: the type of the record's key,
+/// the id the registration reply hands back, and the id the attachment
+/// holds. The in-VM daemon stores it in the record's `box_id` field.
+/// [`mint_box_id`] is the same mint, in the 16 raw bytes the switch
+/// carries.
+#[must_use]
+pub fn mint_record_box_id() -> minimald_rpc::BoxId {
+    minimald_rpc::BoxId::mint()
 }
 
 /// One box's attachment: the facts the proxy attributes a delivered
@@ -125,18 +140,17 @@ impl Attachment {
     }
 }
 
-/// A box id rendered for a log line: 32 lowercase hex digits, one fixed
-/// form every diagnostic that names a box id uses — the same spelling the
-/// wire's own [`minimald_rpc::BoxId`] renders — so a tail can compare two
-/// lines for the same box.
+/// A box id rendered for a log line only: the hyphenated UUID form, the
+/// same spelling `minimald` logs and a reply's id prints
+/// ([`minimald_rpc::BoxId`]'s `Display`), so a tail can compare a line
+/// from each daemon for the same box. An audit record does not use it: it
+/// spells the id as 32 lowercase hex digits, the form
+/// `bep::listener::box_id_text` gives every BEP audit `subject`.
 pub(crate) struct BoxIdText<'a>(pub(crate) &'a BoxId);
 
 impl fmt::Display for BoxIdText<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in self.0 {
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
+        fmt::Display::fmt(&minimald_rpc::BoxId::from_bytes(*self.0), f)
     }
 }
 
@@ -307,6 +321,38 @@ mod tests {
     use crate::net::egress_gate::test_support::capture_log;
 
     use super::*;
+
+    /// The VM host mints the one box id type: the minted id is the type a
+    /// box record is keyed by. The raw bytes the switch carries and the
+    /// log spelling name the same id.
+    #[test]
+    fn minted_box_id_is_the_record_key_type() {
+        let minted: minimald_rpc::BoxId = mint_record_box_id();
+        // The record's key and its handed id are this type: a compile-time
+        // check that no conversion stands between the mint and the record.
+        let mut record_key: boxes::BoxId = minted;
+        let key_of: fn(&boxes::Record) -> boxes::SessionId = |record| record.id;
+        let _ = key_of;
+        assert!(!record_key.is_nil(), "a mint never names the nil id");
+        let uuid: &uuid::Uuid = record_key.as_ref();
+        assert_eq!(uuid.get_version_num(), 7, "a minted id is a UUIDv7");
+
+        // The raw mint is the same type's bytes, and reads back as the same id.
+        let raw = mint_box_id();
+        record_key = minimald_rpc::BoxId::from_bytes(raw);
+        assert_eq!(record_key.to_bytes(), raw);
+        assert!(
+            minted < record_key,
+            "a later mint sorts after an earlier one"
+        );
+
+        // The log spelling is the record key's own printed spelling.
+        assert_eq!(BoxIdText(&raw).to_string(), record_key.to_string());
+        assert_eq!(
+            minimald_rpc::BoxId::parse_str(&BoxIdText(&raw).to_string()).unwrap(),
+            record_key
+        );
+    }
 
     /// A minted box id is unique per creation and unique to the box it
     /// names: one UUIDv7 — a millisecond timestamp and 74 random bits from

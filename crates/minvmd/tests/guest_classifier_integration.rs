@@ -2,9 +2,9 @@
 //! proof that the table the guest daemon renders and loads at boot is the
 //! table the native installer renders for the same parameters, and that a
 //! loaded table decides a deny-all host-address box per box — refusing what
-//! the box originates, its DNS to the gateway included (a VM-backed guest
-//! renders no resolver carve-out, follow-up gominimal/inbox#897), and
-//! recording the effect probe's per-family errno.
+//! the box originates, keeping the one carve-out (the guest's own DNS
+//! listener, which refuses names outside the zone) answering, and recording
+//! the effect probe's per-family errno.
 //!
 //! Eight proofs, one VM boot each, all through the supervisor path
 //! (`minvmd run --detach`, `status --json` until Running, `stop` on drop):
@@ -32,9 +32,11 @@
 //!   address off the guest is refused, and the errno the box reads is
 //!   EHOSTUNREACH — the `reject with icmpx admin-prohibited` verdict as
 //!   IPv4 surfaces it.
-//! - `guest_deny_all_dns_to_gateway_refused`: the same box's udp and tcp 53
-//!   to the gateway (100.64.0.1) is refused — a VM-backed guest renders no
-//!   resolver carve-out (follow-up gominimal/inbox#897).
+//! - `guest_deny_all_resolver_reachable`: the same box resolves
+//!   `host.min.internal` through the guest's own DNS listener — the deny
+//!   subtree's lookups are steered onto it, it forwards the zone's A
+//!   questions to the gateway and refuses every name outside the zone —
+//!   and its connect to the address it resolved is refused.
 //! - `guest_deny_all_box_answers_inbound_through_the_proxy`: a connection
 //!   another box opens to it through the hostname proxy is answered — the
 //!   reply-direction admission that lets a deny-all box serve what reaches
@@ -84,15 +86,15 @@ use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use boxes::core::decision::ItemDecision;
+use boxes::core::hooks::{HookResult, PolicyHooks, Unapproved};
+use boxes::core::policy::{HooksPolicy, PatchesPolicy, VarsPolicy};
 use serial_test::serial;
-use sessions::core::decision::ItemDecision;
-use sessions::core::hooks::{HookResult, PolicyHooks, Unapproved};
-use sessions::core::policy::{HooksPolicy, PatchesPolicy, VarsPolicy};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 /// Isolated `XDG_STATE_HOME` under /tmp: macOS's $TMPDIR is deep enough that
-/// provider sockets beneath a default tempdir would overflow sun_path (104).
+/// host sockets beneath a default tempdir would overflow sun_path (104).
 fn short_state_dir() -> tempfile::TempDir {
     tempfile::Builder::new()
         .prefix("mnl")
@@ -116,18 +118,25 @@ const RUNNING_TIMEOUT: Duration = Duration::from_secs(90);
 /// Bound on any one `minvmd` subcommand (`run --detach`, `status`, `stop`) so
 /// a wedged daemon fails the test instead of hanging it.
 const SUBPROC_TIMEOUT: Duration = Duration::from_secs(180);
-/// Bound on any one exec inside a box.
-const EXEC_TIMEOUT: Duration = Duration::from_secs(60);
+/// Bound on any one exec inside a box, measured as silence on the channel.
+/// A session's first exec launches its box, and the launch fetches the box's
+/// package closure from the remote cache onto the guest's freshly formatted
+/// data volume before the command runs. On the KVM lane two concurrent first
+/// launches have taken 84-122 s; one launch alone usually finishes in under
+/// 40 s, so the bound covers it with headroom. A guest that stays silent for
+/// two minutes is wedged, not slow.
+const EXEC_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long a boot-log line may take to appear after the guest is Running:
 /// the guest daemon writes them at boot, before it serves, so this only
 /// covers the console flush.
 const LOG_DEADLINE: Duration = Duration::from_secs(30);
 
-/// The guest daemon's log filter: info everywhere, with the classifier's and
-/// the answerer's debug lines promoted — the probe's per-family record and
-/// the answerer's per-lookup lines are the evidence two of these proofs read
-/// off the guest's console.
-const GUEST_LOG_FILTER: &str = "info,minimald::net::classifier=debug,minimald::net::answerer=debug";
+/// The guest daemon's log filter: info everywhere, with the classifier's, the
+/// answerer's, the DNS gate's and the guest DNS listener's debug lines
+/// promoted — the probe's per-family record and the per-lookup lines are
+/// evidence these proofs read off the guest's console.
+const GUEST_LOG_FILTER: &str = "info,minimald::net::classifier=debug,minimald::net::answerer=debug,\
+                                minimald::net::dns_gate=debug,minimald::net::guest_dns=debug";
 
 /// Env var the server reads to scope an exec to a session.
 const MINIMAL_SESSION_ID_ENV: &str = "MINIMAL_SESSION_ID";
@@ -139,7 +148,7 @@ const NODE_PROXY_PORT: &str = "7654";
 const NODE_ANSWERER_PORT: &str = "7656";
 
 /// The classifier tree the guest daemon mounts and renders for:
-/// `sandbox2::classifier::TREE_ROOT` (the sandbox layer is not a `minvmd`
+/// `sandbox::classifier::TREE_ROOT` (the sandbox layer is not a `minvmd`
 /// dependency, so the one path is spelled here beside the digest that would
 /// catch it drifting).
 const GUEST_TREE_ROOT: &str = "/sys/fs/cgroup/minimald.slice";
@@ -157,7 +166,6 @@ const GUEST_CT_MARK_MASK_ARG: &str = "0x30000000";
 const ERRNO_EHOSTUNREACH: i32 = 113;
 const ERRNO_EACCES: i32 = 13;
 const ERRNO_EPERM: i32 = 1;
-const ERRNO_ECONNREFUSED: i32 = 111;
 
 /// The loopback families the probe reads, as its own record spells them
 /// (`Family::name` in `minimald::net::classifier`).
@@ -353,13 +361,13 @@ impl Guest {
     /// deadlines, quoting the supervisor's `run.log`.
     fn boot(gvproxy: &Path) -> Guest {
         let state = short_state_dir();
-        let provider_dir = state.path().join("minimal/providers/local-minvmd0");
+        let host_dir = state.path().join("minimal/providers/local-minvmd0");
         let boot_log_path = std::env::var_os("MINVMD_BOOT_LOG")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|| provider_dir.join("boot.log"));
+            .unwrap_or_else(|| host_dir.join("boot.log"));
         let mut guest = Guest {
-            sock_path: provider_dir.join("ssh.sock"),
+            sock_path: host_dir.join("ssh.sock"),
             boot_log_path,
             gvproxy: gvproxy.to_path_buf(),
             vmm_pid: None,
@@ -500,8 +508,8 @@ impl BoxSession {
     /// pending), finalizes the record, and keeps the handle for execs.
     async fn open(
         sock_path: &Path,
-        network: sessions::NetworkMode,
-        egress: Option<sessions::EgressPolicy>,
+        network: boxes::NetworkMode,
+        egress: Option<boxes::EgressPolicy>,
         label: &str,
         packages: &[&str],
     ) -> Result<BoxSession, String> {
@@ -562,27 +570,19 @@ impl BoxSession {
                 .await
                 .map_err(|e| format!("request_subsystem: {e}"))?;
 
-            let policy = sessions::SessionPolicy {
+            let policy = boxes::BoxPolicy {
                 egress,
                 ..Default::default()
             };
-            let req = CreateSessionRequest {
-                config: minimald_rpc::SessionConfig {
-                    name: Some(name.clone()),
-                    project_path: paths::HostAbsPath::try_new("/tmp")
-                        .map_err(|e| format!("project_path: {e}"))?,
-                    network,
-                    policy,
-                    // No registration happened on this path: the box attaches
-                    // as an unregistered one always has.
-                    box_addresses: None,
-                    // The serde default; this session only runs execs, so it
-                    // declares no hooks either way.
-                    hooks_enabled: true,
-                    attrs: Default::default(),
-                },
-                must_match_version: None,
-            };
+            // No registration happened on this path: the box attaches as an
+            // unregistered one always has. Hooks stay on, the serde default;
+            // this session only runs execs, so it declares no hooks either way.
+            let req = CreateSessionRequest::new(
+                name.clone(),
+                paths::HostAbsPath::try_new("/tmp").map_err(|e| format!("project_path: {e}"))?,
+                network,
+                policy,
+            );
             let body =
                 serde_json_lenient::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
             let mut rpc = channel.into_stream();
@@ -700,7 +700,10 @@ impl BoxSession {
                 .request_subsystem(false, FinalizeSession::NAME)
                 .await
                 .map_err(|e| format!("request_subsystem: {e}"))?;
-            let req = FinalizeSessionRequest { session_id };
+            let req = FinalizeSessionRequest {
+                session_id,
+                report_shared_port_collisions: false,
+            };
             let body =
                 serde_json_lenient::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
             let mut rpc = channel.into_stream();
@@ -806,8 +809,8 @@ fn strip_ansi(text: &str) -> String {
 
 async fn open_box(
     guest: &Guest,
-    network: sessions::NetworkMode,
-    egress: Option<sessions::EgressPolicy>,
+    network: boxes::NetworkMode,
+    egress: Option<boxes::EgressPolicy>,
     label: &str,
     packages: &[&str],
 ) -> Result<BoxSession, String> {
@@ -879,10 +882,10 @@ where
 /// ships the verdict with `SubmitVerdict`, which composes the loadout.
 async fn submit_verdict(
     handle: &mut russh::client::Handle<ClientHandler>,
-    response: sessions::wire::request::ContributionResponse,
+    response: boxes::wire::request::ContributionResponse,
 ) -> Result<(), String> {
+    use boxes::wire::request::BoxStep;
     use minimald_rpc::{OneshotSshRpc, SubmitVerdict};
-    use sessions::wire::request::SessionStep;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     eprintln!(
@@ -891,12 +894,12 @@ async fn submit_verdict(
         response.patches.len(),
         response.lifecycle_hooks.len(),
     );
-    let (verdict, _policy) = sessions::client::handler::handle_response(
+    let (verdict, _policy) = boxes::client::handler::handle_response(
         response,
         &[],
-        sessions::core::policy::UserPolicy::empty(),
+        boxes::core::policy::UserPolicy::empty(),
         &NoPromptVars,
-        sessions::core::compose::ComposeOptions::default(),
+        boxes::core::compose::ComposeOptions::default(),
         &|name| std::env::var(name),
     )
     .map_err(|e| format!("gating pending items: {e}"))?;
@@ -925,8 +928,8 @@ async fn submit_verdict(
     let resp: <SubmitVerdict as OneshotSshRpc>::Response = serde_json_lenient::from_slice(&buf)
         .map_err(|e| format!("decode SubmitVerdict response: {e}"))?;
     match resp.ok() {
-        Some(SessionStep::Materialized { .. }) => Ok(()),
-        Some(SessionStep::Fault { error }) => Err(format!("SubmitVerdict faulted: {error:?}")),
+        Some(BoxStep::Materialized { .. }) => Ok(()),
+        Some(BoxStep::Fault { error }) => Err(format!("SubmitVerdict faulted: {error:?}")),
         None => Err("SubmitVerdict returned an error".into()),
     }
 }
@@ -1037,8 +1040,8 @@ async fn guest_classifier_table_present() {
     // and refuses the box, so the open failing is the recheck's negative.
     open_box(
         &guest,
-        sessions::NetworkMode::HostNet,
-        Some(sessions::EgressPolicy::deny_all()),
+        boxes::NetworkMode::HostNet,
+        Some(boxes::EgressPolicy::deny_all()),
         "denyall",
         &["python"],
     )
@@ -1067,8 +1070,8 @@ async fn guest_deny_all_probe_refused() {
     let guest = Guest::boot(&gvproxy);
     let mut box_session = open_box(
         &guest,
-        sessions::NetworkMode::HostNet,
-        Some(sessions::EgressPolicy::deny_all()),
+        boxes::NetworkMode::HostNet,
+        Some(boxes::EgressPolicy::deny_all()),
         "denyall",
         &["python"],
     )
@@ -1105,28 +1108,35 @@ async fn guest_deny_all_probe_refused() {
     );
 }
 
-/// A deny-all box's DNS to the gateway is refused like any other destination:
-/// on a VM-backed host the guest renders no resolver carve-out, because the
-/// node's DNS layer applies no per-box name rule to host-address boxes
-/// (follow-up gominimal/inbox#897). The deny chain ends in `reject with icmpx
-/// admin-prohibited`, so the TCP connect to 53 must read an errno in the
-/// reject set. A UDP send to a refused destination often succeeds locally,
-/// so the UDP leg asserts only that no reply arrives within a bounded wait:
-/// the wait running out, or the reject's errno coming back on the connected
-/// socket (ECONNREFUSED included), passes; an answer fails. The render's own
-/// line is on the guest's console.
+/// A deny-all host-address box still resolves (NET-003, NET-079): its one
+/// carve-out is the guest's own DNS listener, which the deny subtree's
+/// lookups are steered onto and which refuses every name outside the box
+/// zone. Four reads from inside the box:
+///
+/// - `a`: its lookup of `host.min.internal` through its own `/etc/resolv.conf`
+///   answers the switch's host alias — the listener forwards the zone's A
+///   questions to the gateway (NET-003), the address the zone holds for the
+///   host;
+/// - `refused`: a raw AAAA query for example.com comes back REFUSED, the
+///   listener's own verdict — answered inside the guest, so no resolver
+///   beyond it ever sees the name — and the guest's console carries the
+///   listener's own line for it;
+/// - `tcp`: a TCP connect to the gateway's port 53 is refused by the table,
+///   so a truncated answer cannot retry past the verdict;
+/// - `reach`: a connect to the address it resolved is refused with an errno
+///   in the reject set, so the box resolves the name and reaches nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 #[ignore = "gated MINVMD_E2E=1; requires libkrun, kernel/rootfs/initramfs images, and the gvproxy switch"]
-async fn guest_deny_all_dns_to_gateway_refused() {
+async fn guest_deny_all_resolver_reachable() {
     let Some(gvproxy) = e2e_enabled() else {
         return;
     };
     let guest = Guest::boot(&gvproxy);
     let mut box_session = open_box(
         &guest,
-        sessions::NetworkMode::HostNet,
-        Some(sessions::EgressPolicy::deny_all()),
+        boxes::NetworkMode::HostNet,
+        Some(boxes::EgressPolicy::deny_all()),
         "denydns",
         &["python"],
     )
@@ -1135,79 +1145,137 @@ async fn guest_deny_all_dns_to_gateway_refused() {
 
     assert!(
         guest.boot_log_contains(
-            "deny-all host-address box on VM host: no resolver carve-out \
-             (follow-up gominimal/inbox#897)"
+            "deny-all host-address box on VM host: resolver carve-out is the guest's own DNS \
+             listener, which refuses names outside the zone"
         ),
-        "the guest's render did not log that it carves no resolver out:\n{}",
+        "the guest's render did not log the listener carve-out:\n{}",
         guest.boot_log(),
     );
 
     // Python's blocks need their indentation, which a `\`-continued Rust
-    // literal strips, so the script is joined from lines that keep it. A
-    // standard A query for example.com, as hex so no quoting reaches it.
+    // literal strips, so the script is joined from lines that keep it. The
+    // example.com AAAA query is hex, so no quoting reaches it.
     let gateway = switch::DEFAULT_SUBNET.gateway();
+    let host_alias = switch::DEFAULT_SUBNET.host_alias();
     let script = [
         "import socket".to_string(),
-        "def udp():".to_string(),
+        "def a():".to_string(),
+        "    infos = socket.getaddrinfo(\"host.min.internal\", 80, socket.AF_INET, \
+         socket.SOCK_STREAM)"
+            .to_string(),
+        "    return \",\".join(sorted({i[4][0] for i in infos}))".to_string(),
+        "def refused():".to_string(),
         "    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)".to_string(),
         "    u.settimeout(5)".to_string(),
+        // The box's resolver stack asks the address its resolv.conf names —
+        // the switch gateway — and the table steers the lookup onto the
+        // guest's own listener, which refuses the name.
         format!("    u.connect((\"{gateway}\", 53))"),
-        "    q = bytes.fromhex(\"123401000001000000000000076578616d706c6503636f6d0000010001\")"
+        "    q = bytes.fromhex(\"123401000001000000000000076578616d706c6503636f6d00001c0001\")"
             .to_string(),
         "    try:".to_string(),
         "        u.send(q)".to_string(),
-        "        u.recv(512)".to_string(),
-        "        return \"answered\"".to_string(),
+        "        r = u.recv(512)".to_string(),
         "    except socket.timeout:".to_string(),
         "        return \"timeout\"".to_string(),
         "    except OSError as e:".to_string(),
-        "        return str(e.errno)".to_string(),
+        "        return \"errno \" + str(e.errno)".to_string(),
+        "    return str(r[3] & 15)".to_string(),
         "def tcp():".to_string(),
         "    t = socket.socket()".to_string(),
         "    t.settimeout(5)".to_string(),
-        format!("    return str(t.connect_ex((\"{gateway}\", 53)))"),
-        "print(\"udp\", udp())".to_string(),
+        "    try:".to_string(),
+        format!("        return str(t.connect_ex((\"{gateway}\", 53)))"),
+        "    except socket.timeout:".to_string(),
+        "        return \"timeout\"".to_string(),
+        "def reach(addr):".to_string(),
+        "    s = socket.socket()".to_string(),
+        "    s.settimeout(10)".to_string(),
+        "    try:".to_string(),
+        "        return str(s.connect_ex((addr, 80)))".to_string(),
+        "    except socket.timeout:".to_string(),
+        "        return \"timeout\"".to_string(),
+        "resolved = a()".to_string(),
+        "print(\"a\", resolved)".to_string(),
+        "print(\"refused\", refused())".to_string(),
         "print(\"tcp\", tcp())".to_string(),
+        "print(\"reach\", reach(resolved.split(\",\")[0]))".to_string(),
     ]
     .join("\n");
     let (stdout, stderr, exit) = box_session
         .exec(&format!("python3 -c '{script}'"))
         .await
-        .expect("the box runs its own DNS probes");
+        .expect("the box runs its own lookups");
     assert_eq!(
         exit,
         Some(0),
-        "the DNS probes did not run in the box; stderr: {stderr}"
+        "the lookups did not run in the box; stderr: {stderr}"
     );
+    let read = |what: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{what} ")))
+            .unwrap_or("missing")
+            .to_string()
+    };
+    let context = || {
+        format!(
+            "--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n--- guest boot log ---\n{}",
+            guest.boot_log()
+        )
+    };
+
+    let resolved = read("a");
+    assert_eq!(
+        resolved,
+        host_alias.to_string(),
+        "a deny-all box must resolve host.min.internal to the host alias through the \
+         guest's own DNS listener\n{}",
+        context(),
+    );
+
+    // REFUSED (rcode 5): the listener answers the example.com AAAA lookup
+    // itself — the name is outside the box zone, so no resolver beyond the
+    // guest ever sees it.
+    let refused = read("refused");
+    assert_eq!(
+        refused,
+        "5",
+        "a deny-all box's example.com AAAA lookup must be refused by the guest's own \
+         listener; read {refused}\n{}",
+        context(),
+    );
+    assert!(
+        guest
+            .boot_log_lines(&["answered a lookup at the guest listener"])
+            .iter()
+            .any(|line| line.contains("example.com") && line.contains("answer=Refused")),
+        "the guest's own listener never left its REFUSED verdict on the box's example.com \
+         lookup\n{}",
+        context(),
+    );
+
     let reject_set = [
         ERRNO_EHOSTUNREACH.to_string(),
         ERRNO_EACCES.to_string(),
         ERRNO_EPERM.to_string(),
     ];
-    let read = |transport: &str| {
-        stdout
-            .lines()
-            .find_map(|line| line.strip_prefix(&format!("{transport} ")))
-            .unwrap_or("missing")
-            .to_string()
-    };
-    // UDP: no reply within the bound. The reject's errno, or ECONNREFUSED,
-    // read back on the connected socket is the same refusal seen sooner.
-    let udp = read("udp");
-    assert!(
-        udp == "timeout" || udp == ERRNO_ECONNREFUSED.to_string() || reject_set.contains(&udp),
-        "a deny-all box's udp 53 to the gateway {gateway} must get no reply; read {udp}\n\
-         --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n--- guest boot log ---\n{}",
-        guest.boot_log(),
-    );
-    // TCP: the deny chain rejects, so the connect reads the reject's errno.
+    // DNS over TCP is neither steered nor admitted: a truncated answer
+    // cannot retry past the verdict.
     let tcp = read("tcp");
     assert!(
         reject_set.contains(&tcp),
-        "a deny-all box's tcp 53 to the gateway {gateway} must be refused with an errno in \
-         EHOSTUNREACH, EACCES and EPERM (the deny chain rejects); read {tcp}\n\
-         --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n--- guest boot log ---\n{}",
-        guest.boot_log(),
+        "a deny-all box's tcp 53 to the gateway {gateway} must be refused by the table; \
+         read {tcp}\n{}",
+        context(),
+    );
+
+    let reach = read("reach");
+    assert!(
+        reject_set.contains(&reach),
+        "a deny-all box must reach nothing it resolves: its connect to {resolved}:80 must \
+         read an errno in EHOSTUNREACH, EACCES and EPERM; read {reach}\n{}",
+        context(),
     );
 }
 
@@ -1225,8 +1293,8 @@ async fn guest_deny_all_box_answers_inbound_through_the_proxy() {
     let guest = Guest::boot(&gvproxy);
     let mut serving = open_box(
         &guest,
-        sessions::NetworkMode::HostNet,
-        Some(sessions::EgressPolicy::deny_all()),
+        boxes::NetworkMode::HostNet,
+        Some(boxes::EgressPolicy::deny_all()),
         "denysrv",
         &["python"],
     )
@@ -1238,13 +1306,28 @@ async fn guest_deny_all_box_answers_inbound_through_the_proxy() {
     // the pinned in-guest port.
     let mut client = open_box(
         &guest,
-        sessions::NetworkMode::HostNet,
+        boxes::NetworkMode::HostNet,
         None,
         "client",
         &["python"],
     )
     .await
     .expect("the plain box that asks is an ordinary launch");
+    // Launch each box with a no-op exec, one after the other. A box's first
+    // exec fetches its package closure, so the second launch reads the cache
+    // the first one filled. Otherwise both fetches run inside the concurrent
+    // exchange below, where they have outrun EXEC_TIMEOUT.
+    for (label, session) in [("server", &mut serving), ("client", &mut client)] {
+        let (_, stderr, exit) = session
+            .exec("true")
+            .await
+            .unwrap_or_else(|e| panic!("the {label} box's launch exec ran: {e}"));
+        assert_eq!(
+            exit,
+            Some(0),
+            "the {label} box did not launch; stderr: {stderr}"
+        );
+    }
 
     const SERVE_PORT: u16 = 8412;
     // One-shot server in the deny-all box: bind, accept one, answer, exit.
@@ -1353,8 +1436,8 @@ async fn guest_host_ip_enforcement_per_box_after_load() {
     let guest = Guest::boot(&gvproxy);
     let mut box_session = open_box(
         &guest,
-        sessions::NetworkMode::HostNet,
-        Some(sessions::EgressPolicy::deny_all()),
+        boxes::NetworkMode::HostNet,
+        Some(boxes::EgressPolicy::deny_all()),
         "denyall",
         &["python"],
     )
@@ -1428,8 +1511,8 @@ async fn guest_effect_probe_errno_per_family() {
     // probe at boot has already run one.
     open_box(
         &guest,
-        sessions::NetworkMode::HostNet,
-        Some(sessions::EgressPolicy::deny_all()),
+        boxes::NetworkMode::HostNet,
+        Some(boxes::EgressPolicy::deny_all()),
         "denyall",
         &["python"],
     )
@@ -1526,7 +1609,8 @@ fn probe_families(record: &str) -> Vec<(&str, &str)> {
 }
 
 /// The sha256 of the native installer's `--print-ruleset` output for the
-/// guest's own parameters: the same tree root, no resolver carve-out, the
+/// guest's own parameters: the same tree root, the guest's own DNS listener
+/// as the carve-out, the
 /// two source identities the guest's boot hands as its one address
 /// (NET-078), and the same ct-mark bits — rendered over a stand-in mount
 /// table that spells the guest's own cgroup2 mount (`/sys/fs/cgroup`, root
@@ -1553,19 +1637,35 @@ fn native_ruleset_digest() -> String {
     // switch address on the default subnet, which is what the guest's boot
     // renders with (`DEFAULT_SUBNET.daemon_ip()` in its `main`).
     let identity = switch::DEFAULT_SUBNET.daemon_ip();
+    // The guest's resolver carve-out (NET-079): the guest's own DNS
+    // listener — the answerer's port at the guest's loopback, the pair its
+    // `main` renders with (`guest_dns::LISTENER_ADDRESS`/`LISTENER_PORT`,
+    // pinned here as the mask above is, so a drift between the two lanes
+    // fails this digest, not a guest's table).
+    let listener_addr = "127.0.0.1";
+    let listener_port = "7656";
+    // The guest's render also names the box mark its table writes into a
+    // box's packets, so the VM host's gate can tell a box's frame from the
+    // daemon's own at the one address both leave from.
+    let cohort_dscp = boxes::core::egress::BOX_COHORT_DSCP.to_string();
     let out = Command::new("bash")
         .arg(&script)
         .args([
             "--print-ruleset",
             "--root",
             GUEST_TREE_ROOT,
-            "--no-resolver-carve-out",
+            "--answerer-address",
+            listener_addr,
+            "--answerer-port",
+            listener_port,
             "--cohort-address",
             &identity.to_string(),
             "--node-plane-address",
             &identity.to_string(),
             "--ct-mark-mask",
             GUEST_CT_MARK_MASK_ARG,
+            "--cohort-dscp",
+            &cohort_dscp,
         ])
         .env("MINIMAL_OVERRIDE_CGROUP_MOUNTINFO", &mountinfo)
         .output()

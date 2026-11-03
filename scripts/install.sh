@@ -23,10 +23,20 @@
 # ending them; --force-stop (or a non-empty MINIMAL_INSTALL_FORCE_STOP) skips the
 # question, for scripted upgrades that must not block.
 #
+# The install never elevates. At its end the installed `min` probes what the
+# host still lacks (`min finalize-install --show`); when something is missing
+# and a terminal is attached the installer shows the summary and offers to run
+# `min finalize-install` (one sudo command, default yes); declined or without a
+# terminal it points at the command and never blocks. A finished host sees no
+# offer.
+#
 # Uninstall walks the local install record (no network) and removes each file
-# whose on-disk bytes still match what the installer recorded writing; it accepts
-# --force (remove modified files too), --purge (also delete the minimal data/
-# state/cache trees), and --dry-run.
+# whose on-disk bytes still match what the installer recorded writing. It
+# stops the running daemon first — asking on the terminal when that daemon
+# has active sessions, exactly as an upgrade does — and accepts --force
+# (remove modified files too), --force-stop (stop live sessions without
+# asking), --purge (also delete the minimal data/state/cache trees), and
+# --dry-run.
 #
 # After the files are placed, the installer wires up shell integration:
 # it generates per-shell init files that prepend the bin dir to PATH, installs
@@ -36,10 +46,13 @@
 # stripped by its markers).
 #
 # Every component the manifest carries installs by the same generic loop, and
-# one of them carries a contract worth naming: `min-answerer` (NET-122's
-# box-zone answerer) installs as `bin/min-answerer` beside `min` on every
+# one of them carries a contract worth naming: `minzoned` (NET-122's
+# box-zone answerer) installs as `bin/minzoned` beside `min` on every Linux
 # platform the manifest ships `min` for, and an upgrade replaces it like every
-# other `bin` row — same SHA-256 compare, same swap. The installed copy is
+# other `bin` row — same SHA-256 compare, same swap. On macOS it installs
+# inside an app bundle, `bin/Minimal.app`, still beside `min`, one row per
+# bundle file: macOS lists a background service under an app's name and icon
+# only when its program belongs to a signed app bundle. The installed copy is
 # ONLY the copy source: the session-start advisory finds it beside `min` and
 # its one privileged command copies it to a root-owned path before the service
 # manager ever runs it. The installer itself writes no answerer service — no
@@ -162,6 +175,16 @@ human_size() {
     fi
 }
 
+# Shell-quote one word for a command line that is itself re-parsed by another
+# shell (the manual remedies maybe_remove_finalize_install composes are run
+# verbatim through `sh -c`, or pasted at a prompt). Double quotes do not
+# survive that second parse — $HOME and $(…) would expand again — so a
+# pathname with spaces or an embedded $ stays one literal word only when it
+# is single-quoted with each `'` doubled as '\''.
+shq() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
 # $HOME-relative display path: the card and the table are meant to be read, and
 # an absolute /Users/... prefix on every line is noise.
 tilde() {
@@ -223,8 +246,9 @@ if [ "${1-}" = "--uninstall" ]; then
         case "$1" in
             --force)      uninstall_force=1 ;;
             --purge)      uninstall_purge=1 ;;
+            --force-stop) force_stop=1 ;;
             -n|--dry-run) dry_run=1 ;;
-            *)            die "unknown uninstall option '$1' (allowed: --force, --purge, --dry-run)" ;;
+            *)            die "unknown uninstall option '$1' (allowed: --force, --force-stop, --purge, --dry-run)" ;;
         esac
         shift
     done
@@ -407,43 +431,190 @@ strip_rc_block() {
     say "  removed shell-init block from $(tilde "$1")"
 }
 
-# Offer to also remove the *system* AppArmor profile on uninstall. That profile
-# (packaging/apparmor/minimald) is installed separately, with root, by
-# install-apparmor-profile.sh; it outlives minimald, leaving an inert label
-# bound to a now-absent binary path under /etc/apparmor.d. Removing it needs
-# root — which this installer never assumes — so on an interactive terminal we
-# prompt and, on yes, elevate via the shipped loader's own --uninstall (run here,
-# before the record walk deletes that loader). Piped (curl|sh), non-interactive,
-# or dry-run: advise the root command instead, which stays valid after the walk.
-# Gated on the profile actually being present, so macOS and never-set-up hosts
-# see nothing. The apparmor.d path is overridable for install_test.sh.
-maybe_remove_apparmor_profile() {
+# Offer to also remove what `min finalize-install` installed on uninstall,
+# together with the system AppArmor profile. `min finalize-install` (opt-in,
+# with root) points the host's resolver at the box zone and installs the
+# Minimal box-name service — on macOS, the boot unit that reserves the local
+# range too; on Linux, the user-namespace profile (recorded as the step's
+# own), the classifier tree (recorded the same way) with the units that
+# rebuild it at boot, and the kvm group membership. None of it is in
+# the install record, and all of it outlives `min`. The profile may instead
+# have been installed separately, with root, by install-apparmor-profile.sh
+# (no record): it outlives minimald the same way, so it rides in the same
+# prompt, removed through the shipped loader's own --uninstall (run here,
+# before the record walk deletes that loader). Gated on any of those host
+# paths being present, so a host that never set up sees nothing. On an
+# interactive terminal, prompt once and, on yes, run `min finalize-install
+# --undo` (here, before the walk deletes `min`) and the loader for an
+# unrecorded profile; piped (curl|sh), non-interactive, or dry-run, advise the
+# root commands for everything found instead, which stay valid after the
+# walk. Those commands follow what `min finalize-install --undo` runs
+# (linux_undo_command and macos_undo_command in
+# crates/minimal/src/resolver.rs): install_test.sh executes them against a
+# fake root and fails when that file names a path this advice does not. The
+# profile and the classifier tree come away only by the step's record; one
+# without its record was installed another way. The roots are overridable
+# for install_test.sh.
+maybe_remove_finalize_install() {
+    _fi_root="${MINIMAL_OVERRIDE_FINALIZE_INSTALL_ROOT:-}"
     _aa_dir="${MINIMAL_OVERRIDE_APPARMOR_DIR:-/etc/apparmor.d}"
     _aa_profile="$_aa_dir/minimald"
-    [ -e "$_aa_profile" ] || return 0
     _aa_tunable="$_aa_dir/tunables/minimald"
+    _aa_record="$_fi_root/var/lib/minimal/finalize-install-apparmor-profile"
+    _kvm_record="$_fi_root/var/lib/minimal/finalize-install-kvm-group"
+    _cls_record="$_fi_root/var/lib/minimal/finalize-install-classifier"
+    _cls_root=/sys/fs/cgroup/minimald.slice
+    _lib_dir="$_fi_root/usr/local/lib/minimal"
+    # _ns_files are the files the DNS remedy removes; _ns_paths adds what else
+    # says the setup is there. _ns_chan is the answerer's channel socket, kept
+    # out of both lists because the macOS path has a space in it and its
+    # presence alone never says the service is installed.
+    if [ "$os" = darwin ]; then
+        # Minimal.app is the app bundle the service's program is installed
+        # in, a directory (so the remedy removes it, and only it and the
+        # .old a replaced bundle leaves, with -r); the bare minzoned is where
+        # an install from before the bundle put the program.
+        _ns_files="/etc/resolver/min.internal /Library/LaunchDaemons/dev.gominimal.zone.plist /Library/PrivilegedHelperTools/Minimal.app /Library/PrivilegedHelperTools/Minimal.app.old /Library/PrivilegedHelperTools/minzoned /Library/LaunchDaemons/dev.minimal.local-range.plist /Library/PrivilegedHelperTools/dev.minimal.local-range"
+        _ns_paths="$_ns_files"
+        _ns_chan="$_fi_root/Library/Application Support/minimal/run/answerer.sock"
+    else
+        # minzone0-link.service is the boot unit that re-creates the link at
+        # every boot. Its enable link goes with it, before the daemon-reload.
+        _ns_files="/etc/systemd/system/minzoned.socket /etc/systemd/system/minzoned.service /usr/local/lib/minimal/minzoned /etc/systemd/system/minzone0-link.service /etc/systemd/system/multi-user.target.wants/minzone0-link.service"
+        _ns_paths="$_ns_files /sys/class/net/minzone0"
+        _ns_chan="$_fi_root/run/minimal/answerer.sock"
+    fi
+    _ns_rm=
+    _ns_rm_r=
+    for _ns_p in $_ns_files; do
+        case "$_ns_p" in
+            */Minimal.app|*/Minimal.app.old) _ns_rm_r="$_ns_rm_r $(shq "$_fi_root$_ns_p")" ;;
+            *) _ns_rm="$_ns_rm $(shq "$_fi_root$_ns_p")" ;;
+        esac
+    done
+    _ns_rm="$_ns_rm $(shq "$_ns_chan")"
+    if [ "$os" = darwin ]; then
+        _ns_undo="sudo launchctl bootout system/dev.gominimal.zone; sudo launchctl bootout system/dev.minimal.local-range; sudo rm -f$_ns_rm; sudo rm -rf$_ns_rm_r; sudo rmdir $(shq "${_ns_chan%/*}") $(shq "$_fi_root/Library/Application Support/minimal") 2>/dev/null || true"
+    else
+        _ns_undo="sudo systemctl disable --now minzoned.socket minzoned.service; sudo rm -f$_ns_rm; sudo systemctl daemon-reload; sudo systemctl reset-failed minzoned.socket minzoned.service; [ ! -e $(shq "$_fi_root/sys/class/net/minzone0") ] || { sudo resolvectl revert minzone0; sudo ip link del minzone0; }; sudo rmdir $(shq "${_ns_chan%/*}") $(shq "$_lib_dir") 2>/dev/null || true"
+    fi
+    # What is found, as a list for the prompt; what `min finalize-install
+    # --undo` removes; the manual remedy, one root command line per item.
+    _fi_list=
+    _fi_owned=
+    _fi_undo=
+    _aa_unowned=
+    _qb_found=
+    for _ns_p in $_ns_paths; do
+        if [ -e "$_fi_root$_ns_p" ]; then
+            _fi_list="the host DNS setup ($_ns_p)"
+            _fi_owned=1
+            _fi_undo="      $_ns_undo"
+            break
+        fi
+    done
+    if [ "$os" != darwin ]; then
+        if [ -e "$_aa_profile" ]; then
+            if [ -e "$_aa_record" ]; then
+                _fi_list="$_fi_list${_fi_list:+, }the user-namespace profile ($_aa_profile)"
+                _fi_owned=1
+                _fi_undo="$_fi_undo${_fi_undo:+
+}      sudo apparmor_parser -R $(shq "$_aa_profile"); sudo rm -f $(shq "$_aa_profile") $(shq "$_aa_tunable") $(shq "$_aa_dir/tunables/minimald.d/local"); sudo rmdir $(shq "$_aa_dir/tunables/minimald.d") 2>/dev/null; sudo rm -f $(shq "$_aa_record")"
+            else
+                _fi_list="$_fi_list${_fi_list:+, }the system AppArmor profile ($_aa_profile, not min finalize-install's)"
+                _aa_unowned=1
+                _fi_undo="$_fi_undo${_fi_undo:+
+}      sudo apparmor_parser -R $(shq "$_aa_profile"); sudo rm -f $(shq "$_aa_profile") $(shq "$_aa_tunable")"
+            fi
+        fi
+        # The classifier's units, the boot unit first: it re-runs the step at
+        # every boot, so left enabled it lays the tree and the table out again.
+        # They are disabled before their files go, and before the tree's line.
+        _cls_rm=
+        _cls_found=
+        for _cls_p in /etc/systemd/system/minimald-classifier.service /etc/systemd/system/minimald-place.path /etc/systemd/system/minimald-place.service /usr/local/lib/minimal/install-host-classifier.sh; do
+            _cls_rm="$_cls_rm $(shq "$_fi_root$_cls_p")"
+            if [ -z "$_cls_found" ] && [ -e "$_fi_root$_cls_p" ]; then
+                _cls_found="$_cls_p"
+            fi
+        done
+        if [ -n "$_cls_found" ]; then
+            _fi_list="$_fi_list${_fi_list:+, }the classifier units ($_cls_found)"
+            _fi_owned=1
+            _fi_undo="$_fi_undo${_fi_undo:+
+}      sudo systemctl disable --now minimald-classifier.service minimald-place.path minimald-place.service; sudo rm -f$_cls_rm; sudo systemctl daemon-reload; sudo rmdir $(shq "$_lib_dir") 2>/dev/null || true"
+        fi
+        # The QUIC block helper and its sudoers rule, an item of their own.
+        # `min finalize-install --undo` does not remove them, so a yes
+        # removes them here, and either one left prints the manual remedy.
+        _qb_rm=
+        for _qb_p in /usr/local/lib/minimal/quic443-leaf /etc/sudoers.d/minimal-quic443-leaf; do
+            _qb_rm="$_qb_rm $(shq "$_fi_root$_qb_p")"
+            if [ -z "$_qb_found" ] && [ -e "$_fi_root$_qb_p" ]; then
+                _qb_found="$_qb_p"
+            fi
+        done
+        if [ -n "$_qb_found" ]; then
+            _fi_list="$_fi_list${_fi_list:+, }the QUIC block helper and its sudoers rule ($_qb_found)"
+            _fi_owned=1
+            _fi_undo="$_fi_undo${_fi_undo:+
+}      sudo rm -f$_qb_rm; sudo rmdir $(shq "$_lib_dir") 2>/dev/null || true"
+        fi
+        # The tree, by the step's record only: a tree without the record was
+        # installed another way and stays. The record goes once the tree has.
+        if [ -e "$_cls_record" ]; then
+            _fi_list="$_fi_list${_fi_list:+, }the classifier tree ($_cls_root)"
+            _fi_owned=1
+            _fi_undo="$_fi_undo${_fi_undo:+
+}      sudo nft delete table inet minimal_class; { [ ! -d $(shq "$_fi_root$_cls_root") ] || sudo find $(shq "$_fi_root$_cls_root") -depth -type d -exec rmdir {} +; } && sudo rm -f $(shq "$_cls_record")"
+        fi
+        if [ -e "$_kvm_record" ]; then
+            _fi_list="$_fi_list${_fi_list:+, }the kvm group membership"
+            _fi_owned=1
+            _fi_undo="$_fi_undo${_fi_undo:+
+}      while IFS= read -r u; do sudo gpasswd -d \"\$u\" kvm; done < $(shq "$_kvm_record"); sudo rm -f $(shq "$_kvm_record")"
+        fi
+    fi
+    [ -n "$_fi_list" ] || return 0
 
     if [ "$dry_run" -eq 1 ]; then
-        say "  would offer to remove the system AppArmor profile $_aa_profile"
+        say "  would offer to remove the host setup outside the install record: $_fi_list"
         return 0
     fi
 
     # Prompt only when stdin is a terminal. Under `curl … | sh -s -- --uninstall`
     # stdin is the script pipe, not a tty, so advise rather than consume it.
     if [ -t 0 ]; then
+        _fi_min="$bindir/min"
         _aa_loader="$(resolve_prefix data)/apparmor/install-apparmor-profile.sh"
-        printf 'Also remove the system AppArmor profile %s (needs root)? [y/N] ' \
-            "$_aa_profile" >&2
-        _aa_ans=
-        read -r _aa_ans || _aa_ans=
-        case "$_aa_ans" in
+        printf 'Also remove the host setup installed with root outside the install record: %s? [y/N] ' \
+            "$_fi_list" >&2
+        _fi_ans=
+        read -r _fi_ans || _fi_ans=
+        case "$_fi_ans" in
             [Yy]*)
-                if [ -f "$_aa_loader" ] && command -v sudo >/dev/null 2>&1 \
-                    && sudo bash "$_aa_loader" --uninstall; then
-                    return 0
+                _fi_ok=1
+                if [ -n "$_fi_owned" ]; then
+                    { [ -x "$_fi_min" ] && "$_fi_min" finalize-install --undo; } || _fi_ok=
                 fi
-                say "  warning: could not remove it automatically; do it manually (root):"
-                say "      sudo apparmor_parser -R \"$_aa_profile\" && sudo rm -f \"$_aa_profile\" \"$_aa_tunable\""
+                # `min finalize-install --undo` does not remove the QUIC
+                # block helper or its sudoers rule, so remove them here.
+                if [ -n "$_qb_found" ]; then
+                    for _qb_p in /usr/local/lib/minimal/quic443-leaf /etc/sudoers.d/minimal-quic443-leaf; do
+                        if [ -e "$_fi_root$_qb_p" ]; then
+                            sudo rm -f "$_fi_root$_qb_p" || _fi_ok=
+                        fi
+                        [ ! -e "$_fi_root$_qb_p" ] || _fi_ok=
+                    done
+                    sudo rmdir "$_lib_dir" 2>/dev/null || true
+                fi
+                if [ -n "$_aa_unowned" ]; then
+                    { [ -f "$_aa_loader" ] && command -v sudo >/dev/null 2>&1 \
+                        && sudo bash "$_aa_loader" --uninstall; } || _fi_ok=
+                fi
+                [ -n "$_fi_ok" ] && return 0
+                say "  warning: could not remove it all automatically; do it manually (root):"
+                say "$_fi_undo"
                 return 0
                 ;;
             *) return 0 ;;
@@ -451,9 +622,14 @@ maybe_remove_apparmor_profile() {
     fi
 
     say ""
-    say "note: the system AppArmor profile is still loaded at $_aa_profile."
-    say "  it was installed separately with root; remove it too with:"
-    say "      sudo apparmor_parser -R \"$_aa_profile\" && sudo rm -f \"$_aa_profile\" \"$_aa_tunable\""
+    say "note: still installed on this host, with root, outside the install record: $_fi_list."
+    if [ -n "$_fi_owned" ]; then
+        say "  \`min finalize-install --undo\` removes what min finalize-install installed, while min"
+        say "  is installed. With min gone, remove everything listed with:"
+    else
+        say "  it was installed separately with root; remove it too with:"
+    fi
+    say "$_fi_undo"
 }
 
 # --- Uninstall (walk the install record and undo it) -----------------------
@@ -480,9 +656,22 @@ do_uninstall() {
     say ""
     [ "$dry_run" -eq 1 ] && say "uninstall: dry run — nothing will be removed"
 
-    # Before the walk (which deletes the shipped loader), offer to tear down the
-    # separately-installed system AppArmor profile too.
-    maybe_remove_apparmor_profile
+    # The walk below deletes `min` itself, so the daemon it runs must be
+    # stopped first, while the `min` that matches it is still on disk — a
+    # daemon left running through an uninstall+reinstall keeps serving the old
+    # build, and every daemon-backed command on the fresh install then hits a
+    # version skew. Same escalation as the upgrade swap: graceful stop, consent
+    # on the terminal if sessions are live, --force after. Uninstall and the
+    # upgrade share the once-guard, so a `min` removed here stays removed.
+    if [ "$dry_run" -eq 1 ]; then
+        say "  would stop the running daemon (it is stopped on the real run)"
+    else
+        stop_running_daemon || die "aborted: the daemon is still running; nothing was removed"
+    fi
+
+    # Before the walk (which deletes `min` and the shipped loader), offer to
+    # tear down what was installed with root outside the record too.
+    maybe_remove_finalize_install
 
     # Tab, computed once, so rows are split on tab alone: a dest under a
     # $HOME containing spaces must still parse as one field.
@@ -630,8 +819,19 @@ do_uninstall() {
         # Shell-integration dirs first: the init dir must empty out
         # before the data prefix can, and the completion dirs (plus their
         # parents, which the installer may have created) are shared with other
-        # tools so, like bin, they are only ever rmdir'd-if-empty.
+        # tools so, like bin, they are only ever rmdir'd-if-empty. The macOS
+        # app bundles' directories (bin/Minimal.app, bin/bep.app) go
+        # innermost first, so the bin dir can empty out after them.
         for d in "$init_dir" \
+                 "$bindir/Minimal.app/Contents/MacOS" \
+                 "$bindir/Minimal.app/Contents/Resources" \
+                 "$bindir/Minimal.app/Contents/_CodeSignature" \
+                 "$bindir/Minimal.app/Contents" \
+                 "$bindir/Minimal.app" \
+                 "$bindir/bep.app/Contents/MacOS" \
+                 "$bindir/bep.app/Contents/_CodeSignature" \
+                 "$bindir/bep.app/Contents" \
+                 "$bindir/bep.app" \
                  "$(resolve_prefix data)/apparmor/tunables" \
                  "$(resolve_prefix data)/apparmor" \
                  "$bash_comp_dir" "${bash_comp_dir%/*}" \
@@ -655,6 +855,96 @@ do_uninstall() {
     say "uninstall: $removed removed, $absent already gone, $kept_modified kept (modified), $kept_foreign kept (foreign)"
     [ "$dry_run" -eq 1 ] && say "uninstall: dry run — nothing was actually removed"
     return 0
+}
+
+# --- Daemon stop (shared by the upgrade swap and the uninstall walk) ---------
+
+# Swapping binaries under a running daemon wedges it: the daemon keeps
+# serving from the old image while the new `min` talks to it. Stop it first,
+# using the `min` ALREADY on disk — that one matches the daemon it started, and
+# it is about to be overwritten. Deliberately best-effort and silent: nothing
+# installed yet, no daemon running, or a `min` too old to have `stop` all mean
+# "nothing to stop", and none of them should fail an install whose binaries are
+# otherwise fine. `min stop` only connects (it never autospawns), so with no
+# daemon up this is a failed connect and nothing more.
+#
+# The graceful `min stop` goes first because it already refuses while sessions
+# are live, printing exactly this message — the one signal that an upgrade is
+# about to destroy someone's work, and worth a question. Matched literally
+# rather than on exit status: a bare non-zero also means no daemon, a failed
+# connect, or a transport drop on an otherwise successful stop, and none of
+# those may turn every upgrade into a prompt.
+#
+# Every `min` below reads from /dev/null: a child that ever read stdin would
+# eat the applicable-manifest rows still to be installed (the upgrade calls
+# this inside the component loop).
+sessions_live_msg='daemon has active sessions'
+
+# Ask, on the CONTROLLING TERMINAL, whether to end the live sessions. Under
+# `curl … | sh` stdin is the script pipe, so reading the answer from it would
+# consume the script; /dev/tty is the only sound source (overridable so the
+# test harness can drive both answers). No terminal to ask on — CI, a
+# non-interactive shell — means nobody can consent: say so and let the caller
+# abort, rather than hang or silently destroy work. Returns non-zero when the
+# upgrade must not proceed. The argument names the calling stop: `pre` (the
+# default) may tell the user to rerun with --force-stop, which works before
+# the swaps; `post` runs after them, where a rerun replaces nothing and could
+# never reach this stop, so it must not suggest one.
+confirm_force_stop() {
+    _tty="${MINIMAL_OVERRIDE_TTY:-/dev/tty}"
+    say ""
+    say "warning: the running daemon has active sessions:"
+    "$bindir/min" ls >&2 </dev/null || true
+    say ""
+    if ! (exec <"$_tty") 2>/dev/null; then
+        if [ "${1:-pre}" = post ]; then
+            say "there is no terminal to confirm on."
+        else
+            say "there is no terminal to confirm on; rerun with --force-stop"
+            say "(or MINIMAL_INSTALL_FORCE_STOP=1) to stop those sessions anyway."
+        fi
+        return 1
+    fi
+    printf 'Stopping the daemon ends them. Continue? [y/N] ' >&2
+    _ans=
+    read -r _ans <"$_tty" || _ans=
+    case "$_ans" in
+        [Yy]*) return 0 ;;
+        *)     return 1 ;;
+    esac
+}
+
+# daemon_stop_consent records that this run may end live sessions: the user
+# passed --force-stop, or answered yes on the terminal. The post-swap stop
+# reads it, so it never forces a stop the user did not agree to. A yes covers
+# only the sessions the question listed, so their ids are kept in
+# pre_swap_sessions (`min ls --raw`, one per line). A listing that fails leaves
+# it empty, and then every session the post-swap stop finds counts as new.
+daemon_stop_tried=0
+daemon_stop_consent=0
+pre_swap_sessions=
+stop_running_daemon() {
+    [ "$daemon_stop_tried" -eq 0 ] || return 0
+    daemon_stop_tried=1
+    [ "$force_stop" -eq 0 ] || daemon_stop_consent=1
+    [ -x "$bindir/min" ] || return 0
+
+    if [ "$force_stop" -eq 0 ]; then
+        # Stopped gracefully (or there was nothing to stop): done, no --force.
+        if _stop_out="$("$bindir/min" stop 2>&1 </dev/null)"; then
+            return 0
+        fi
+        case "$_stop_out" in
+            *"$sessions_live_msg"*)
+                pre_swap_sessions="$("$bindir/min" ls --raw 2>/dev/null </dev/null)" \
+                    || pre_swap_sessions=
+                confirm_force_stop || return 1
+                daemon_stop_consent=1
+                ;;
+        esac
+        # Any other failure falls through to the force stop, silent as before.
+    fi
+    "$bindir/min" stop --force >/dev/null 2>&1 </dev/null || true
 }
 
 # Dispatch uninstall before any target/manifest work. resolve_prefix and
@@ -752,72 +1042,92 @@ records="$tmpdir/installed"
 : >"$records"
 installed=0 skipped=0
 
-# Swapping binaries under a running daemon wedges it: the daemon keeps
-# serving from the old image while the new `min` talks to it. Stop it first,
-# using the `min` ALREADY on disk — that one matches the daemon it started, and
-# it is about to be overwritten. Deliberately best-effort and silent: nothing
-# installed yet, no daemon running, or a `min` too old to have `stop` all mean
-# "nothing to stop", and none of them should fail an install whose binaries are
-# otherwise fine. `min stop` only connects (it never autospawns), so with no
-# daemon up this is a failed connect and nothing more.
+# The pre-swap stop used the OLD `min`, the one that matched the daemon. Two
+# ways leave a daemon of the old build running after the swap anyway:
 #
-# The graceful `min stop` goes first because it already refuses while sessions
-# are live, printing exactly this message — the one signal that an upgrade is
-# about to destroy someone's work, and worth a question. Matched literally
-# rather than on exit status: a bare non-zero also means no daemon, a failed
-# connect, or a transport drop on an otherwise successful stop, and none of
-# those may turn every upgrade into a prompt.
+# - An install can START with no `min` on disk (a fresh prefix over a leftover
+#   socket, or an uninstall whose walk kept a modified `min` that a later
+#   --force removed). Then nothing above stopped anything.
+# - An attached client autospawns a replacement daemon the moment the pre-swap
+#   stop ends, and that window spans every swap after the first. The daemon it
+#   spawns serves the old version from the binaries the run is replacing.
 #
-# Every `min` below reads from /dev/null: this runs inside the component loop,
-# whose stdin is the applicable-manifest file, and a child that ever read stdin
-# would eat the rows still to be installed.
-sessions_live_msg='daemon has active sessions'
-
-# Ask, on the CONTROLLING TERMINAL, whether to end the live sessions. Under
-# `curl … | sh` stdin is the script pipe, so reading the answer from it would
-# consume the script; /dev/tty is the only sound source (overridable so the
-# test harness can drive both answers). No terminal to ask on — CI, a
-# non-interactive shell — means nobody can consent: say so and let the caller
-# abort, rather than hang or silently destroy work. Returns non-zero when the
-# upgrade must not proceed.
-confirm_force_stop() {
-    _tty="${MINIMAL_OVERRIDE_TTY:-/dev/tty}"
-    say ""
-    say "warning: the running daemon has active sessions:"
-    "$bindir/min" ls >&2 </dev/null || true
-    say ""
-    if ! (exec <"$_tty") 2>/dev/null; then
-        say "there is no terminal to confirm on; rerun with --force-stop"
-        say "(or MINIMAL_INSTALL_FORCE_STOP=1) to stop those sessions anyway."
-        return 1
-    fi
-    printf 'Stopping the daemon ends them. Continue? [y/N] ' >&2
-    _ans=
-    read -r _ans <"$_tty" || _ans=
-    case "$_ans" in
-        [Yy]*) return 0 ;;
-        *)     return 1 ;;
-    esac
-}
-
-daemon_stop_tried=0
-stop_running_daemon() {
-    [ "$daemon_stop_tried" -eq 0 ] || return 0
-    daemon_stop_tried=1
+# Either way every daemon-backed command on the new install then speaks to it
+# across a version skew. So once the swaps are done, probe with the NEW `min`
+# and stop only a daemon whose version differs from it. `min version` never
+# autospawns. It reports the client and, when a daemon answers, its version
+# too. Matching versions or no answer stop nothing and say nothing, so an
+# ordinary install, an up-to-date rerun, and a daemon respawned from the new
+# binaries are all left alone.
+#
+# A session can open in a respawned daemon while the run is still going (a
+# `min new`, an unattended job), and R5.5 never ends a session unasked. So the
+# stop is graceful unless this run already holds consent: --force-stop, or a
+# yes to the pre-swap question. The yes covers only the sessions that question
+# listed. So before it forces, the stop lists the daemon's live sessions, and
+# any session the yes did not see (or a listing that fails) makes the stop
+# graceful again. A graceful stop refused for live sessions asks
+# on the terminal, as the pre-swap stop does. Declined, or with no terminal to
+# ask on, it leaves the daemon running and says how to stop it: the swaps are
+# done, so the install itself still succeeds.
+stale_stop_tried=0
+stop_stale_daemon() {
+    [ "$stale_stop_tried" -eq 0 ] || return 0
+    stale_stop_tried=1
     [ -x "$bindir/min" ] || return 0
-
-    if [ "$force_stop" -eq 0 ]; then
-        # Stopped gracefully (or there was nothing to stop): done, no --force.
+    _vout="$("$bindir/min" version 2>&1 </dev/null)" || _vout=
+    _cv="$(printf '%s\n' "$_vout" | sed -n 's/^Client: minimal //p')"
+    _sv="$(printf '%s\n' "$_vout" | sed -n 's/^Server: minimald //p')"
+    [ -n "$_cv" ] && [ -n "$_sv" ] && [ "$_cv" != "$_sv" ] || return 0
+    say "stopping a daemon still running from build $_sv"
+    if [ "$force_stop" -eq 0 ] && { [ "$daemon_stop_consent" -eq 0 ] || ! sessions_seen_pre_swap; }; then
         if _stop_out="$("$bindir/min" stop 2>&1 </dev/null)"; then
             return 0
         fi
         case "$_stop_out" in
-            *"$sessions_live_msg"*) confirm_force_stop || return 1 ;;
+            *"$sessions_live_msg"*)
+                if confirm_force_stop post; then
+                    force_stop_stale "$_sv"
+                    return 0
+                fi
+                say "the daemon has active sessions, so it is still running build $_sv."
+                say "run 'min stop' after those sessions end, or 'min stop --force' to end them now."
+                return 0
+                ;;
         esac
-        # Any other failure falls through to the force stop, silent as before.
+        # Any other failure falls through to the force stop, as the pre-swap
+        # stop does: no live sessions were reported, so none are at risk.
     fi
-    "$bindir/min" stop --force >/dev/null 2>&1 </dev/null || true
+    force_stop_stale "$_sv"
 }
+
+# Succeeds when every live session the daemon lists now was in the list the
+# pre-swap yes covered. A failed listing proves nothing, so it fails too.
+sessions_seen_pre_swap() {
+    _now="$("$bindir/min" ls --raw 2>/dev/null </dev/null)" || return 1
+    printf '%s\n' "$_now" | while read -r _id; do
+        [ -z "$_id" ] && continue
+        printf '%s\n' "$pre_swap_sessions" | grep -qxF -e "$_id" || exit 1
+    done
+}
+
+# The post-swap force stop. It follows a "stopping a daemon" line, so a failed
+# stop is reported rather than left looking like success: a daemon of the old
+# build may still be serving, and the user is told how to stop it.
+force_stop_stale() {
+    "$bindir/min" stop --force >/dev/null 2>&1 </dev/null && return 0
+    say "the daemon on build $1 may still be running; run 'min stop --force'"
+}
+
+# Set once the pre-swap stop has run and the first executable is about to be
+# replaced. From then on a `die` (a failed download or checksum on a later
+# component) must still run the post-swap stop below: an attached client can
+# already have respawned the daemon from the half-replaced binaries. The EXIT
+# trap does that. From the trap, confirm_force_stop can ask its question after
+# the die message. That is acceptable: it only asks when a terminal is present,
+# and the question lists the sessions a yes would end.
+daemon_stop_ran=0
+trap 'if [ "$daemon_stop_ran" -eq 1 ]; then stop_stale_daemon; fi; rm -rf "$tmpdir"' EXIT
 
 # No field ever contains whitespace, so default IFS splitting is exact.
 # The os/arch/version columns are consumed into `_` (already matched in awk, or
@@ -935,6 +1245,7 @@ while read -r comp _ _ _ want kind dest src; do
                 rm -f "$tmp"
                 die "aborted: no executables were replaced, the daemon is still running"
             }
+            daemon_stop_ran=1
             ;;
     esac
 
@@ -948,6 +1259,11 @@ while read -r comp _ _ _ want kind dest src; do
     # written by earlier installer versions.
     printf '%s\t%s\t%s\t%s\n' "$comp" "$target_file" "$want" "$(sha256 "$target_file")" >>"$records"
 done <"$applicable"
+
+# The post-swap stop: stop_stale_daemon, defined above the loop.
+if [ "$installed" -gt 0 ]; then
+    stop_stale_daemon
+fi
 
 # --- Generated shell-init files and completions ----------------------------
 
@@ -1146,6 +1462,59 @@ verify_switch_binary() {
 verify_switch_binary
 remove_renamed_gvproxy
 
+# --- minzoned files a previous release placed elsewhere ------------------
+
+# On macOS `minzoned` moved from `bin/minzoned` into the app bundle
+# `bin/Minimal.app`. The component kept its name and changed its dest, so the
+# file at the old dest is in no manifest any more and the record written below
+# no longer lists it: it would sit on PATH forever, where `min` could still
+# find it as a copy source. Remove it on the same terms as uninstall, only
+# when its bytes are still exactly what was recorded, and only when this run
+# placed the component somewhere else: a manifest that ships no `minzoned`
+# at all leaves the old file alone. The same walk covers the bundle's other
+# files, so a channel that points back at a release from before the bundle
+# leaves no half bundle behind.
+remove_moved_minzoned() {
+    [ -f "$prev_record" ] || return 0
+    cut -f1 "$records" | grep -qx minzoned || return 0
+    _tab="$(printf '\t')"
+    while IFS="$_tab" read -r _comp _dest _ _want; do
+        case "$_comp" in
+            minzoned|minzoned-*) ;;
+            *) continue ;;
+        esac
+        [ -n "$_dest" ] || continue
+        # Still a path this run placed a file at: nothing moved.
+        if cut -f2 "$records" | grep -qxF "$_dest"; then
+            continue
+        fi
+        [ -f "$_dest" ] || continue
+        [ -L "$_dest" ] && continue
+        if [ "$(sha256 "$_dest")" != "$_want" ]; then
+            say "  $_comp: kept $_dest (modified since install; the release now places it elsewhere)"
+        elif rm -f "$_dest"; then
+            say "  $_comp: removed $_dest (the release now places it elsewhere)"
+        else
+            # Carry the row into this run's record so the next run retries:
+            # the record is replaced below, and without the row the old file
+            # would never be revisited.
+            say "  $_comp: could not remove $_dest; will retry on the next install"
+            printf '%s\t%s\t%s\t%s\n' "$_comp" "$_dest" "$_want" "$_want" >>"$records"
+        fi
+    done <"$prev_record"
+    # The bundle's directories, when the walk emptied them: innermost first.
+    for _d in "$bindir/Minimal.app/Contents/MacOS" \
+              "$bindir/Minimal.app/Contents/Resources" \
+              "$bindir/Minimal.app/Contents/_CodeSignature" \
+              "$bindir/Minimal.app/Contents" \
+              "$bindir/Minimal.app"; do
+        if [ -d "$_d" ]; then
+            rmdir "$_d" 2>/dev/null || true
+        fi
+    done
+}
+remove_moved_minzoned
+
 # Persist the resolved (component, dest, installed-hash) rows for this
 # platform, replacing the prior record read during the loop. Enables a future
 # uninstall and surfaces prefix drift across XDG changes.
@@ -1249,48 +1618,85 @@ say ""
 say "  $b$installed installed$rst $sep $skipped current$elapsed"
 say "  ${dim}record: $(tilde "$prev_record")$rst"
 
-# --- Linux host advisory: unprivileged user namespaces ---------------------
+# --- Finish the host: offer `min finalize-install` -------------------------
 
-# Ubuntu 24.04+ defaults kernel.apparmor_restrict_unprivileged_userns=1, under
-# which minimald cannot create the user namespace every session sandbox needs —
-# sessions then die at uid_map with an opaque EPERM, far from here. Detect the
-# restriction at install time (Linux only) and point at the AppArmor loader we
-# just shipped. Advice only: installing the profile needs root, and this
-# installer never elevates. Silent on hosts that do not need it, AND on a host
-# already remediated — but "remediated" depends on the bin prefix: the stock
-# tunable attaches only /usr/bin, /usr/local/bin, and ~/.local/bin, so for a
-# custom MINIMAL_BIN the advised command carries --path, and a loaded profile
-# counts as remediation only if the tunables actually name this binary
-# (otherwise sessions still die and a reinstall must keep saying so). The
-# sysctl and apparmor.d paths are overridable for install_test.sh.
-userns_sysctl="${MINIMAL_OVERRIDE_USERNS_SYSCTL:-/proc/sys/kernel/apparmor_restrict_unprivileged_userns}"
-apparmor_dir="${MINIMAL_OVERRIDE_APPARMOR_DIR:-/etc/apparmor.d}"
-if [ "$os" = linux ] && [ -r "$userns_sysctl" ] \
-    && [ "$(cat "$userns_sysctl" 2>/dev/null)" = 1 ]; then
-    apparmor_loader="$(resolve_prefix data)/apparmor/install-apparmor-profile.sh"
-    aa_loader_args=""
-    aa_remediated=0
-    case "$bindir" in
-        /usr/bin|/usr/local/bin|"$HOME/.local/bin")
-            [ -e "$apparmor_dir/minimald" ] && aa_remediated=1
-            ;;
-        *)
-            aa_loader_args=" --path \"$bindir/minimald\""
-            if [ -e "$apparmor_dir/minimald" ] \
-                && grep -rqs "$bindir/minimald" "$apparmor_dir/tunables" 2>/dev/null; then
-                aa_remediated=1
-            fi
-            ;;
+# The install itself never elevates, so a host may still lack a privileged
+# part: the user-namespace profile on Ubuntu 24.04+, the box-name resolver
+# link and answerer (every host, macOS included), the classifier tree, KVM
+# group membership. The just-installed `min` probes all of them in ONE call
+# (`finalize-install --show --script`, exit 0 whatever it finds): the summary
+# on stderr — a ✓/✗ line per item — and on stdout the one script a run
+# executes, printed only while some item is `missing`, the only state the
+# step changes. One call, because each probe reads the daemon and, with none
+# running (a fresh install, always), waits out its connect retries. A finished
+# host (no ✗ in the summary), or a `min` too old to know the command, adds
+# nothing to the output above. With something missing, show the summary and
+# offer the step, default yes: it is non-destructive and undoable, and sudo's
+# own password prompt is a second consent. The answer comes from the
+# controlling terminal (overridable for install_test.sh), never stdin, which
+# under `curl … | sh` is the script itself. Declined, or no terminal to ask
+# on: point at the command. The run prints the same summary again on its
+# stdout before it elevates, then its closing lines; only the lines the
+# probe's summary did not already show are printed, so a kvm-group join's
+# "starts at your next login" reaches the operator once. Its prompt is on
+# the terminal and its outcome on stderr. A ✗ item no script can run — the names
+# item `waiting on a daemon` until the first `min` starts one, or a `cannot`
+# — gets the summary and no offer: there is nothing to run yet. A failed step
+# is reported and the installer still exits 0: Minimal is installed either
+# way. Every printed command names `min` as this shell can resolve it: bare
+# only once $bindir is on PATH, which on a fresh install it is not yet.
+offer_finalize_install() {
+    [ -x "$bindir/min" ] || return 0
+    _fi_summary="$tmpdir/finalize-summary"
+    _fi_script="$tmpdir/finalize-script"
+    "$bindir/min" finalize-install --show --script </dev/null \
+        >"$_fi_script" 2>"$_fi_summary" || return 0
+    grep -q '✗' "$_fi_summary" || return 0
+    case ":${PATH:-}:" in
+        *":$bindir:"*) _fi_min=min ;;
+        *)             _fi_min="\"$bindir/min\"" ;;
     esac
-    if [ "$aa_remediated" -eq 0 ] && [ -f "$apparmor_loader" ]; then
-        say ""
-        say "note: this host restricts unprivileged user namespaces (Ubuntu 24.04+);"
-        say "  minimald's session sandbox cannot start until you install its AppArmor"
-        say "  profile — a one-time step that needs root:"
-        say "      sudo bash \"$apparmor_loader\"$aa_loader_args"
-        say "  details: https://docs.minimal.dev/reference/linux-host-setup"
+    say ""
+    # The probe's own warnings (a broken named VM it skipped) are not the
+    # summary; the installer prints the status lines and nothing else.
+    grep -v '^warning: ' "$_fi_summary" >&2 || true
+    if ! [ -s "$_fi_script" ]; then
+        if grep -q 'waiting on a daemon' "$_fi_summary"; then
+            say "  box names finish once a daemon runs: after your first \`min\`, run \`$_fi_min finalize-install\`."
+        fi
+        return 0
     fi
-fi
+    _fi_tty="${MINIMAL_OVERRIDE_TTY:-/dev/tty}"
+    if (exec <"$_fi_tty") 2>/dev/null; then
+        printf 'Finish setup now? This runs one sudo command. [Y/n] ' >&2
+        _fi_ans=
+        read -r _fi_ans <"$_fi_tty" || _fi_ans=
+        case "$_fi_ans" in
+            ""|[Yy]*)
+                _fi_run="$tmpdir/finalize-run"
+                _fi_err="$tmpdir/finalize-run-err"
+                _fi_rc=0
+                "$bindir/min" finalize-install <"$_fi_tty" >"$_fi_run" 2>"$_fi_err" || _fi_rc=$?
+                # The run rebuilds the probe's plan, so its stderr repeats the
+                # probe's warnings; drop those and keep the rest (its own
+                # errors). sudo's password prompt is on the terminal, not here.
+                grep -v '^warning: ' "$_fi_err" >&2 || true
+                if [ "$_fi_rc" -eq 0 ]; then
+                    # The run's stdout is the summary again, then its closing
+                    # lines (what starts when: a kvm group joins at the next
+                    # login). Show only what the probe did not already.
+                    grep -vxF -f "$_fi_summary" "$_fi_run" >&2 || true
+                    return 0
+                fi
+                say "  ✗ setup did not finish; retry with \`$_fi_min finalize-install\`"
+                return 0
+                ;;
+        esac
+    fi
+    say "run \`$_fi_min finalize-install\` when you're ready; without a terminal, use:"
+    say "f=\$(mktemp) && $_fi_min finalize-install --show --script > \"\$f\" && sudo sh \"\$f\""
+}
+offer_finalize_install
 
 # --- The closing card ------------------------------------------------------
 

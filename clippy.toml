@@ -12,3 +12,12 @@ allow-expect-in-tests = true
 allow-panic-in-tests = true
 allow-indexing-slicing-in-tests = true
 allow-dbg-in-tests = true
+
+# `Entry::unpack` resolves a hardlink's link name against the process CWD, not
+# the destination root, so a contained entry path can still write outside it.
+# Clippy reads only the nearest clippy.toml above a crate's manifest, so every
+# per-crate clippy.toml (crates/minimald/clippy.toml) must restate these entries.
+disallowed-methods = [
+    { path = "tar::Entry::unpack", reason = "resolves hardlink targets against the process CWD, escaping the destination root; use `Archive::unpack` or intercept hardlinks (see `common::archive::extract_tar_impl`)" },
+    { path = "async_tar::Entry::unpack", reason = "resolves hardlink targets against the process CWD, escaping the destination root; use `Archive::unpack` or intercept hardlinks (see `common::archive::extract_tar_impl`)" },
+]

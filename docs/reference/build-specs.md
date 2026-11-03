@@ -102,7 +102,7 @@ More examples are maintained in the [Minimal Public Package Registry](https://gi
 
 ## Schema
 
-The canonical typing of a Build-spec is defined using [Nickel](https://nickel-lang.org/) in Minimal's
+The canonical typing of a build spec is defined using [Nickel](https://nickel-lang.org/) in Minimal's
 embedded standard library, in
 [`crates/stdlib/minimal-ncl/minimal.ncl`](https://github.com/gominimal/minimal/blob/main/crates/stdlib/minimal-ncl/minimal.ncl)
 (the `BuildSpec` contract).

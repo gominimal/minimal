@@ -485,6 +485,10 @@ mod tests {
     fn live_row() -> minimald_rpc::BoxRow {
         minimald_rpc::BoxRow {
             name: "web".to_string(),
+            box_id: minimald_rpc::BoxId::from_bytes([
+                0x01, 0x95, 0x65, 0x5f, 0x7f, 0x1e, 0x7a, 0xbc, 0x9d, 0x1f, 0x2a, 0x3b, 0x4c, 0x5d,
+                0x6e, 0x7f,
+            ]),
             switch_address: "100.64.0.9".parse().unwrap(),
             egress_allow_list: vec!["10.0.0.0/8".to_string()],
             declared_ports: vec![8080],

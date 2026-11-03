@@ -19,7 +19,7 @@ Specifically, the cleanroom sandbox wires:
  - The source of the package being built
  - Network connectivity (when called-for by a dependency)
 
-At the completion of the build, artifacts are gathered based on the outputs specified in the packages' build-spec, and
+At the completion of the build, artifacts are gathered based on the outputs specified in the packages' build spec, and
 are cached for later consumption when needed by a task or another package build.
 
 By default, Minimal is configured to fetch completed builds from our binary cache, to avoid a slow process building everything locally the first time it is needed.

@@ -4,7 +4,7 @@
 //! from minimal packages. It generates multi-layer images where each runtime dependency
 //! becomes a separate layer.
 
-use crate::materialize::{Emitter, MaterializeEvent};
+use crate::materialize_events::{Emitter, MaterializeEvent};
 use crate::{Error, Options};
 use common::SpecHash;
 use flate2::{Compression, write::GzEncoder};

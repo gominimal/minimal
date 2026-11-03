@@ -35,9 +35,18 @@
 //! min://task/run [--owns-box] <task> [args]
 //!                                daemon-serviced: run a declared task;
 //!                                --owns-box ends the box with the run (NET-131);
-//!                                args is a JSON array of the task's arguments
+//!                                args is a JSON array of the task's arguments,
+//!                                optionally followed by the invocation
+//!                                directory relative to the uploaded tree
 //! min://package/build [args]     daemon-serviced: build packages
 //! min://check [args]             daemon-serviced: lint the session's config
+//! min://exec {"argv":[..],"mode":"detached","timeout_secs":30}
+//!                                exec this argv in the box, no shell, under
+//!                                an exec id; mode is attached, tty or
+//!                                detached, and timeout_secs is optional
+//! min://exec/attach <exec-id>    resume a tty exec's terminal
+//! min://exec/output <exec-id>    read an exec's captured output
+//! min://exec/wait <exec-id>      wait for an exec and take its exit code
 //! <anything else>                a shell command for the session
 //! ```
 //!
@@ -46,6 +55,8 @@
 //! gets here.
 
 use std::fmt;
+
+use serde::{Deserialize, Serialize};
 
 /// Prefix marking a request as one this vocabulary defines. A command that does
 /// not start with it is a shell command for the session, never a daemon one.
@@ -86,11 +97,114 @@ pub enum ExecRequest {
         /// task that declares no args — in which case the daemon binds only
         /// the task's defaults.
         args: Vec<String>,
+        /// Where the client was invoked, relative to the uploaded tree's
+        /// root: `sub/inner` for a run started in that subdirectory. A task
+        /// that declares `inherit_cwd` starts there. Empty when the client
+        /// ran from the root, or sent none — an older `min` — in which case
+        /// the task starts at the root, as before. Never absolute and never
+        /// holding a `..` component: [`ExecRequest::parse`] refuses both.
+        cwd: String,
     },
     /// Build packages against the session.
     PackageBuild(String),
     /// Lint the session's `minimal.toml`, packages, profiles and stacks.
     Check(String),
+    /// An argv to exec in the box, no shell, under an exec id the daemon
+    /// mints, with its mode and its own timeout (BOX-149).
+    Exec(ExecSpec),
+    /// Resume the terminal of a [`ExecMode::Tty`] exec by its id.
+    ExecAttach(ExecId),
+    /// Read the output an exec captured, by its id.
+    ExecOutput(ExecId),
+    /// Wait for an exec to end and take its exit code, by its id.
+    ExecWait(ExecId),
+}
+
+/// How an exec's process meets its client (BOX-149).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecMode {
+    /// Stdio on the channel's pipes, for as long as the client stays. The
+    /// mode the older `min://argv` form always has.
+    #[default]
+    Attached,
+    /// A terminal the daemon allocates. The request returns the exec id at
+    /// once, and `min://exec/attach` resumes the terminal by it.
+    Tty,
+    /// Stdin closed at creation. The request returns the exec id at once,
+    /// and the output and the exit code read back by it.
+    Detached,
+}
+
+impl ExecMode {
+    /// The mode as the wire and the daemon log spell it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Attached => "attached",
+            Self::Tty => "tty",
+            Self::Detached => "detached",
+        }
+    }
+}
+
+/// The payload of [`ExecRequest::Exec`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecSpec {
+    /// The argv to exec. Never empty: [`ExecRequest::parse`] refuses an
+    /// empty one.
+    pub argv: Vec<String>,
+    /// How the process meets its client. Attached when the payload names
+    /// none.
+    #[serde(default)]
+    pub mode: ExecMode,
+    /// The exec's own timeout in whole seconds. `None` runs the exec under
+    /// the box's ceilings only. Never zero: [`ExecRequest::parse`] refuses
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+}
+
+/// An exec's id: a UUIDv7 the daemon mints when the exec starts, in its
+/// hyphenated lowercase spelling (BOX-149).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ExecId(String);
+
+impl ExecId {
+    /// Reads an exec id from its text.
+    ///
+    /// # Errors
+    ///
+    /// [`ExecParseError::ExecId`] when `text` is not a hyphenated UUID of
+    /// version 7 and the RFC 9562 variant.
+    pub fn parse(text: &str) -> Result<Self, ExecParseError> {
+        let text = text.trim();
+        let bytes = text.as_bytes();
+        let shaped = bytes.len() == 36
+            && bytes.iter().enumerate().all(|(i, b)| match i {
+                8 | 13 | 18 | 23 => *b == b'-',
+                _ => b.is_ascii_hexdigit(),
+            });
+        let v7 = shaped
+            && bytes[14] == b'7'
+            && matches!(bytes[19].to_ascii_lowercase(), b'8' | b'9' | b'a' | b'b');
+        if !v7 {
+            return Err(ExecParseError::ExecId(text.to_string()));
+        }
+        Ok(Self(text.to_ascii_lowercase()))
+    }
+
+    /// The id's text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ExecId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 /// Tag for [`ExecRequest::Shell`].
@@ -110,8 +224,27 @@ const PACKAGE_BUILD: &str = "package/build";
 /// Tag for [`ExecRequest::Check`].
 const CHECK: &str = "check";
 
+/// Tag for [`ExecRequest::Exec`].
+const EXEC: &str = "exec";
+/// Tag for [`ExecRequest::ExecAttach`].
+const EXEC_ATTACH: &str = "exec/attach";
+/// Tag for [`ExecRequest::ExecOutput`].
+const EXEC_OUTPUT: &str = "exec/output";
+/// Tag for [`ExecRequest::ExecWait`].
+const EXEC_WAIT: &str = "exec/wait";
+
 /// Every tag, for the error message that lists what the daemon accepts.
-const TAGS: [&str; 5] = [SHELL, ARGV, TASK_RUN, PACKAGE_BUILD, CHECK];
+const TAGS: [&str; 9] = [
+    SHELL,
+    ARGV,
+    TASK_RUN,
+    PACKAGE_BUILD,
+    CHECK,
+    EXEC,
+    EXEC_ATTACH,
+    EXEC_OUTPUT,
+    EXEC_WAIT,
+];
 
 impl ExecRequest {
     /// The wire string for this request.
@@ -132,6 +265,7 @@ impl ExecRequest {
                 task,
                 owns_box,
                 args,
+                cwd,
             } => {
                 let marker = if *owns_box { TASK_RUN_OWNS_BOX } else { "" };
                 // Args ride only when present: the bare form is the legacy
@@ -141,9 +275,14 @@ impl ExecRequest {
                 // name and its args are framed together as one JSON array
                 // `[task, args]`, so a task name containing spaces — or one
                 // named exactly `--owns-box` — cannot be split off from its
-                // args by the space delimiter.
-                if args.is_empty() {
+                // args by the space delimiter. A non-empty cwd rides as a
+                // third element of that array, `[task, args, cwd]`.
+                if args.is_empty() && cwd.is_empty() {
                     format!("{EXEC_SCHEME}{TASK_RUN} {marker}{task}")
+                } else if !cwd.is_empty() {
+                    let json = serde_json_lenient::to_string(&(task, args, cwd))
+                        .expect("a task name, its args and its cwd always serialize to JSON");
+                    format!("{EXEC_SCHEME}{TASK_RUN} {marker}{json}")
                 } else {
                     let json = serde_json_lenient::to_string(&(task, args))
                         .expect("a task name and its args always serialize to JSON");
@@ -152,6 +291,14 @@ impl ExecRequest {
             }
             Self::PackageBuild(args) => format!("{EXEC_SCHEME}{PACKAGE_BUILD} {args}"),
             Self::Check(args) => format!("{EXEC_SCHEME}{CHECK} {args}"),
+            Self::Exec(spec) => {
+                let json = serde_json_lenient::to_string(spec)
+                    .expect("an exec spec always serializes to JSON");
+                format!("{EXEC_SCHEME}{EXEC} {json}")
+            }
+            Self::ExecAttach(id) => format!("{EXEC_SCHEME}{EXEC_ATTACH} {id}"),
+            Self::ExecOutput(id) => format!("{EXEC_SCHEME}{EXEC_OUTPUT} {id}"),
+            Self::ExecWait(id) => format!("{EXEC_SCHEME}{EXEC_WAIT} {id}"),
         }
     }
 
@@ -203,27 +350,68 @@ impl ExecRequest {
                 // together, so neither the space delimiter nor the owns-box
                 // marker can split them. Anything else is the legacy bare
                 // form — a task name with no args, sent by every client from
-                // before args.
+                // before args. The framed array carries the cwd as an
+                // optional third element; without it the cwd is empty.
                 if rest.starts_with('[') {
-                    let (task, args): (String, Vec<String>) = serde_json_lenient::from_str(rest)
-                        .map_err(|e| ExecParseError::TaskArgs(e.to_string()))?;
+                    let (task, args, cwd) =
+                        match serde_json_lenient::from_str::<(String, Vec<String>, String)>(rest) {
+                            Ok(framed) => framed,
+                            Err(_) => {
+                                let (task, args): (String, Vec<String>) =
+                                    serde_json_lenient::from_str(rest)
+                                        .map_err(|e| ExecParseError::TaskArgs(e.to_string()))?;
+                                (task, args, String::new())
+                            }
+                        };
+                    validate_task_cwd(&cwd)?;
                     return Ok(Self::TaskRun {
                         task,
                         owns_box,
                         args,
+                        cwd,
                     });
                 }
                 Ok(Self::TaskRun {
                     task: rest.to_string(),
                     owns_box,
                     args: vec![],
+                    cwd: String::new(),
                 })
             }
             PACKAGE_BUILD => Ok(Self::PackageBuild(payload.to_string())),
             CHECK => Ok(Self::Check(payload.to_string())),
+            EXEC => {
+                let spec: ExecSpec = serde_json_lenient::from_str(payload)
+                    .map_err(|e| ExecParseError::ExecSpec(e.to_string()))?;
+                if spec.argv.is_empty() {
+                    return Err(ExecParseError::EmptyArgv);
+                }
+                if spec.timeout_secs == Some(0) {
+                    return Err(ExecParseError::ZeroTimeout);
+                }
+                Ok(Self::Exec(spec))
+            }
+            EXEC_ATTACH => Ok(Self::ExecAttach(ExecId::parse(payload)?)),
+            EXEC_OUTPUT => Ok(Self::ExecOutput(ExecId::parse(payload)?)),
+            EXEC_WAIT => Ok(Self::ExecWait(ExecId::parse(payload)?)),
             unknown => Err(ExecParseError::UnknownTag(unknown.to_string())),
         }
     }
+}
+
+/// Refuses a task-run cwd that could leave the uploaded tree: an absolute
+/// path, or one with a `..` component. The empty cwd is the tree's root.
+fn validate_task_cwd(cwd: &str) -> Result<(), ExecParseError> {
+    let escapes = std::path::Path::new(cwd).components().any(|c| {
+        !matches!(
+            c,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    });
+    if escapes {
+        return Err(ExecParseError::TaskCwd(cwd.to_string()));
+    }
+    Ok(())
 }
 
 /// Why an exec request naming the [`EXEC_SCHEME`] could not be understood.
@@ -236,9 +424,18 @@ pub enum ExecParseError {
     Argv(String),
     /// The `task/run` argument payload was not a JSON array of strings.
     TaskArgs(String),
+    /// The `task/run` cwd is absolute or has a `..` component, so it does
+    /// not name a directory inside the uploaded tree.
+    TaskCwd(String),
     /// The `argv` payload was a well-formed but empty array, which names no
     /// program to run.
     EmptyArgv,
+    /// The `exec` payload was not a JSON object with an `argv` array.
+    ExecSpec(String),
+    /// The `exec` payload asked for a timeout of zero seconds.
+    ZeroTimeout,
+    /// The text that names an exec is not an exec id.
+    ExecId(String),
 }
 
 impl fmt::Display for ExecParseError {
@@ -257,7 +454,20 @@ impl fmt::Display for ExecParseError {
                 f,
                 "the {EXEC_SCHEME}{TASK_RUN} argument payload is not a JSON array of strings: {e}"
             ),
+            Self::TaskCwd(cwd) => write!(
+                f,
+                "the {EXEC_SCHEME}{TASK_RUN} cwd '{cwd}' must be a relative path without '..'"
+            ),
             Self::EmptyArgv => write!(f, "the {EXEC_SCHEME}{ARGV} payload names no program"),
+            Self::ExecSpec(e) => write!(
+                f,
+                "the {EXEC_SCHEME}{EXEC} payload is not a JSON object with an argv array: {e}"
+            ),
+            Self::ZeroTimeout => write!(
+                f,
+                "the {EXEC_SCHEME}{EXEC} timeout must be at least 1 second"
+            ),
+            Self::ExecId(text) => write!(f, "'{text}' is not an exec id"),
         }
     }
 }
@@ -278,11 +488,72 @@ mod tests {
                 task: "build".to_string(),
                 owns_box: false,
                 args: vec![],
+                cwd: String::new(),
             },
             ExecRequest::PackageBuild("--verbose pkg".to_string()),
             ExecRequest::Check(String::new()),
         ] {
             assert_eq!(ExecRequest::parse(&req.encode()), Ok(req));
+        }
+    }
+
+    const AN_EXEC_ID: &str = "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f4a5b";
+
+    /// BOX-149: the exec form carries its argv as words, its mode and its
+    /// own timeout, and each survives the round trip. A payload that names
+    /// no mode is attached with no timeout. The id forms carry a UUIDv7.
+    #[test]
+    fn exec_request_carries_mode_and_timeout() {
+        for mode in [ExecMode::Attached, ExecMode::Tty, ExecMode::Detached] {
+            for timeout_secs in [None, Some(30)] {
+                let req = ExecRequest::Exec(ExecSpec {
+                    argv: vec!["sh".into(), "-c".into(), "echo A B C; echo $HOME".into()],
+                    mode,
+                    timeout_secs,
+                });
+                let wire = req.encode();
+                assert!(wire.contains(mode.name()), "{wire}");
+                assert_eq!(ExecRequest::parse(&wire), Ok(req));
+            }
+        }
+
+        assert_eq!(
+            ExecRequest::parse(r#"min://exec {"argv":["true"]}"#),
+            Ok(ExecRequest::Exec(ExecSpec {
+                argv: vec!["true".into()],
+                mode: ExecMode::Attached,
+                timeout_secs: None,
+            })),
+        );
+        assert_eq!(
+            ExecRequest::parse(
+                r#"min://exec {"argv":["true"],"mode":"detached","timeout_secs":0}"#
+            ),
+            Err(ExecParseError::ZeroTimeout),
+        );
+        assert_eq!(
+            ExecRequest::parse(r#"min://exec {"argv":[]}"#),
+            Err(ExecParseError::EmptyArgv),
+        );
+        assert!(matches!(
+            ExecRequest::parse(r#"min://exec {"argv":["true"],"mode":"background"}"#),
+            Err(ExecParseError::ExecSpec(_)),
+        ));
+
+        let id = ExecId::parse(AN_EXEC_ID).unwrap();
+        for req in [
+            ExecRequest::ExecAttach(id.clone()),
+            ExecRequest::ExecOutput(id.clone()),
+            ExecRequest::ExecWait(id.clone()),
+        ] {
+            assert_eq!(ExecRequest::parse(&req.encode()), Ok(req));
+        }
+        // A v4 UUID is not an exec id, and neither is a box name.
+        for text in ["01928a3b-4c5d-4e6f-8a9b-0c1d2e3f4a5b", "my-box", ""] {
+            assert_eq!(
+                ExecRequest::parse(&format!("min://exec/wait {text}")),
+                Err(ExecParseError::ExecId(text.to_string())),
+            );
         }
     }
 
@@ -351,6 +622,7 @@ mod tests {
             task: "build".to_string(),
             owns_box: true,
             args: vec![],
+            cwd: String::new(),
         };
         assert_eq!(owned.encode(), "min://task/run --owns-box build");
         assert_eq!(
@@ -364,6 +636,7 @@ mod tests {
             task: "build".to_string(),
             owns_box: false,
             args: vec![],
+            cwd: String::new(),
         };
         assert_eq!(plain.encode(), "min://task/run build");
         assert_eq!(ExecRequest::parse("min://task/run build"), Ok(plain));
@@ -374,6 +647,7 @@ mod tests {
             task: "--owns-box".to_string(),
             owns_box: false,
             args: vec![],
+            cwd: String::new(),
         };
         assert_eq!(
             ExecRequest::parse(&marked.encode()),
@@ -403,6 +677,7 @@ mod tests {
             task: "build".to_string(),
             owns_box: false,
             args: vec!["--count".into(), "42".into(), "it's \"quoted\"".into()],
+            cwd: String::new(),
         };
         assert_eq!(
             ExecRequest::parse(&req.encode()),
@@ -415,6 +690,7 @@ mod tests {
             task: "build".to_string(),
             owns_box: false,
             args: vec![],
+            cwd: String::new(),
         };
         assert_eq!(ExecRequest::parse("min://task/run build"), Ok(plain));
 
@@ -435,6 +711,7 @@ mod tests {
             task: "deploy prod".to_string(),
             owns_box: false,
             args: vec!["--force".into()],
+            cwd: String::new(),
         };
         assert_eq!(
             ExecRequest::parse(&spaced.encode()),
@@ -448,6 +725,7 @@ mod tests {
             task: "--owns-box".to_string(),
             owns_box: false,
             args: vec!["--count".into(), "42".into()],
+            cwd: String::new(),
         };
         assert_eq!(
             ExecRequest::parse(&marked.encode()),
@@ -460,6 +738,7 @@ mod tests {
             task: "build".to_string(),
             owns_box: true,
             args: vec!["--count".into(), "42".into()],
+            cwd: String::new(),
         };
         assert_eq!(
             ExecRequest::parse(&owned.encode()),
@@ -495,5 +774,44 @@ mod tests {
             ExecRequest::parse(&req.encode()),
             Ok(ExecRequest::Argv(nasty))
         );
+    }
+
+    /// A task run carries the invocation directory relative to the uploaded
+    /// tree, so a task declaring `inherit_cwd` can start there. A request
+    /// without one — every older client — parses as the empty cwd, and a
+    /// cwd that would leave the tree is refused rather than run.
+    #[test]
+    fn a_task_run_round_trips_its_cwd() {
+        for args in [vec![], vec!["--count".to_string(), "42".to_string()]] {
+            let req = ExecRequest::TaskRun {
+                task: "ic".to_string(),
+                owns_box: true,
+                args,
+                cwd: "sub/inner".to_string(),
+            };
+            assert_eq!(
+                ExecRequest::parse(&req.encode()),
+                Ok(req),
+                "the cwd survives the round trip"
+            );
+        }
+
+        // No cwd: the legacy spellings, bare and framed, parse as empty.
+        for wire in ["min://task/run ic", "min://task/run [\"ic\",[\"a\"]]"] {
+            let Ok(ExecRequest::TaskRun { cwd, .. }) = ExecRequest::parse(wire) else {
+                panic!("{wire} must parse as a task run");
+            };
+            assert_eq!(cwd, "", "{wire}");
+        }
+
+        // A cwd that escapes the tree is refused.
+        for bad in ["/etc", "..", "sub/../..", "sub/.."] {
+            let wire = format!("min://task/run [\"ic\",[],\"{bad}\"]");
+            assert_eq!(
+                ExecRequest::parse(&wire),
+                Err(ExecParseError::TaskCwd(bad.to_string())),
+                "{bad} must be refused"
+            );
+        }
     }
 }

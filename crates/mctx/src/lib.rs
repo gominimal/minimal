@@ -19,14 +19,14 @@ use ot::OpTracker;
 use rcache::{Error as RemoteError, RemoteBinProvider, RemoteCache, RemoteCacheWriter};
 
 mod error;
-pub use error::Error;
+pub use error::{Error, remote_cache_setup_error};
 mod config;
 pub use config::{Config, ConfigBuilder, ConfigError, DEFAULT_REMOTE_CACHE_BUCKET};
 mod env;
 use graph::Error as GraphError;
 use graph::{BinProvider, BuildSpecRef, Graph, MaskingBinProvider, Transitives};
 use mfile::{EnvPatches, EnvVarValue, LinkConfig, Task};
-pub use sandbox2::config::Invocation;
+pub use sandbox::config::Invocation;
 
 mod mfile_search_strategy;
 pub use mfile_search_strategy::MFileSearchStrategy;
@@ -34,7 +34,7 @@ pub use mfile_search_strategy::MFileSearchStrategy;
 mod project_setup;
 pub use project_setup::ProjectSetup;
 
-pub use env::{Env, PatchHome, WdLayout, interpolate_task_strings};
+pub use env::{Env, PatchHome, WdLayout, interpolate_task_strings, task_arg_env};
 use tokio::sync::Semaphore;
 use toml_edit::{Array, DocumentMut, Item, TableLike, Value};
 
@@ -267,6 +267,16 @@ pub struct DaemonContext {
 pub struct Context {
     pub(crate) daemon: Arc<DaemonContext>,
     pub(crate) mfile: mfile::File,
+    /// The classifier leaf of the box this context builds for, if any
+    /// (NET-155). Every package build the context starts runs in it, so the
+    /// box's egress verdict decides the build's connections. `None` for a
+    /// context that builds as its caller's own traffic.
+    pub(crate) classifier_leaf: Option<sandbox::config::ClassifierLeaf>,
+    /// The network of the own-address box this context builds for, if any
+    /// (NET-155). Every package build the context starts that needs the
+    /// network attaches to it, so the box's egress verdict decides the
+    /// build's connections.
+    pub(crate) box_network: Option<op::BuildNetwork>,
 }
 
 impl fmt::Display for Context {
@@ -422,7 +432,12 @@ impl Context {
     pub fn new_with_strategy(config: Config, strategy: MFileSearchStrategy) -> Result<Self, Error> {
         let daemon = Arc::new(DaemonContext::init(config)?);
         let mfile = strategy.find_mfile()?;
-        Ok(Self { daemon, mfile })
+        Ok(Self {
+            daemon,
+            mfile,
+            classifier_leaf: None,
+            box_network: None,
+        })
     }
 
     /// Constructs a new context using the lower-level primitives.
@@ -441,7 +456,12 @@ impl Context {
             vcs,
             cache,
         });
-        Self { daemon, mfile }
+        Self {
+            daemon,
+            mfile,
+            classifier_leaf: None,
+            box_network: None,
+        }
     }
 
     /// Constructs a `Context` from a shared `DaemonContext` and an
@@ -450,7 +470,39 @@ impl Context {
     /// without repeating the (moderately expensive)
     /// [`DaemonContext::init`] work per session.
     pub fn from_daemon(daemon: Arc<DaemonContext>, mfile: mfile::File) -> Self {
-        Self { daemon, mfile }
+        Self {
+            daemon,
+            mfile,
+            classifier_leaf: None,
+            box_network: None,
+        }
+    }
+
+    /// Places every package build this context starts in `leaf`, the
+    /// classifier leaf of the box the builds run for (NET-155).
+    #[must_use]
+    pub fn with_classifier_leaf(mut self, leaf: sandbox::config::ClassifierLeaf) -> Self {
+        self.classifier_leaf = Some(leaf);
+        self
+    }
+
+    /// The classifier leaf this context's package builds run in, if any.
+    pub fn classifier_leaf(&self) -> Option<&sandbox::config::ClassifierLeaf> {
+        self.classifier_leaf.as_ref()
+    }
+
+    /// Runs every package build this context starts that needs the network
+    /// on `network`, the network of the own-address box the builds run for
+    /// (NET-155).
+    #[must_use]
+    pub fn with_box_network(mut self, network: op::BuildNetwork) -> Self {
+        self.box_network = Some(network);
+        self
+    }
+
+    /// The box network this context's package builds attach to, if any.
+    pub fn box_network(&self) -> Option<&op::BuildNetwork> {
+        self.box_network.as_ref()
     }
 
     /// Returns a clone of the shared daemon-scoped context. Cheap —
@@ -486,7 +538,11 @@ impl Context {
             MFileSearchStrategy::CurrentDirRecursive
         };
         let mfile = strategy.find_mfile()?;
-        Ok(Self::from_daemon(Arc::clone(&self.daemon), mfile))
+        Ok(Self {
+            classifier_leaf: self.classifier_leaf.clone(),
+            box_network: self.box_network.clone(),
+            ..Self::from_daemon(Arc::clone(&self.daemon), mfile)
+        })
     }
 
     /// Builds a [`ProjectSetup`] from this context, for running project-setup
@@ -802,6 +858,33 @@ impl Context {
         .await
     }
 
+    /// The orchestrator this context builds `graph` with. It carries the
+    /// context's classifier leaf (NET-155), so every spec build it schedules
+    /// runs in the leaf of the box the context was made for.
+    async fn local_orchestrator(
+        &self,
+        graph: &Graph,
+        rc: Option<RemoteCache<common::fetchers::AnyBackend>>,
+        log_sink: Option<futures::channel::mpsc::UnboundedSender<orchestrator::BuildEvent>>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<orchestrator::Orchestrator<orchestrator::LocalBackend<common::RemoteStorage>>, Error>
+    {
+        Ok(orchestrator::LocalBackend::new_orchestrator(
+            self.daemon.config.builds_base_dir(),
+            rc,
+            self.remote_storage().await?,
+            self.daemon.config.num_parallel_builds(),
+            graph.clone(),
+            self.local_cache(),
+            self.daemon_id(),
+            log_sink,
+            self.daemon.config.ot.clone(),
+            cancel,
+            self.classifier_leaf.clone(),
+            self.box_network.clone(),
+        )?)
+    }
+
     pub async fn build_graph_with_cancel(
         &mut self,
         graph: &Graph,
@@ -816,58 +899,80 @@ impl Context {
             None
         };
 
-        use orchestrator::LocalBackend;
-        let orchestrator = LocalBackend::new_orchestrator(
-            self.daemon.config.builds_base_dir(),
-            rc.clone(),
-            self.remote_storage().await?,
-            self.daemon.config.num_parallel_builds(),
-            graph.clone(),
-            cache.clone(),
-            self.daemon_id(),
-            log_sink,
-            self.daemon.config.ot.clone(),
-            cancel,
-        )?;
+        // Specs the remote index lists but whose artifact the store no longer
+        // has (a dangling hit, inbox#535). The planner trusts the index, so
+        // such a spec is planned as a cache fill with no build behind it; the
+        // fill reports the miss and the graph is planned again with the spec
+        // masked out of every cache, which makes it a build like any other
+        // miss. Each pass masks one more spec, so the loop is bounded by the
+        // graph.
+        let mut dangling: Vec<BuildSpecRef> = Vec::new();
+        loop {
+            use orchestrator::LocalBackend;
+            let orchestrator = self
+                .local_orchestrator(graph, rc.clone(), log_sink.clone(), cancel.clone())
+                .await?;
 
-        let mut bin_provider: Box<dyn BinProvider> = match (
-            self.daemon.config.use_local_cache(),
-            self.daemon.config.use_remote_cache(),
-        ) {
-            // No local or remote cache
-            (false, false) => Box::new(()),
-            // Both caches
-            (true, true) => {
-                let local_adapter = CacheBinProvider::new(graph, cache.clone());
-                let remote_adapter = RemoteBinProvider::new(graph, rc.as_ref().unwrap());
-                Box::new((local_adapter, remote_adapter))
+            let mut bin_provider: Box<dyn BinProvider> = match (
+                self.daemon.config.use_local_cache(),
+                self.daemon.config.use_remote_cache(),
+            ) {
+                // No local or remote cache
+                (false, false) => Box::new(()),
+                // Both caches
+                (true, true) => {
+                    let local_adapter = CacheBinProvider::new(graph, cache.clone());
+                    let remote_adapter = RemoteBinProvider::new(graph, rc.as_ref().unwrap());
+                    Box::new((local_adapter, remote_adapter))
+                }
+                // Only remote cache
+                (false, true) => Box::new(RemoteBinProvider::new(graph, rc.as_ref().unwrap())),
+                // Only local cache
+                (true, false) => Box::new(CacheBinProvider::new(graph, cache.clone())),
+            };
+            if rebuild_top_level {
+                // Forcing a rebuild of named packages was requested. To do this, we wrap the BinProvider
+                // with one that pretends the named packages are never in any cache, resulting in a build for them.
+                bin_provider = Box::new(MaskingBinProvider::new(
+                    bin_provider,
+                    graph.top_levels.clone(),
+                ));
             }
-            // Only remote cache
-            (false, true) => Box::new(RemoteBinProvider::new(graph, rc.as_ref().unwrap())),
-            // Only local cache
-            (true, false) => Box::new(CacheBinProvider::new(graph, cache.clone())),
-        };
-        if rebuild_top_level {
-            // Forcing a rebuild of named packages was requested. To do this, we wrap the BinProvider
-            // with one that pretends the named packages are never in any cache, resulting in a build for them.
-            bin_provider = Box::new(MaskingBinProvider::new(
-                bin_provider,
-                graph.top_levels.clone(),
-            ));
+            if !dangling.is_empty() {
+                bin_provider = Box::new(MaskingBinProvider::new(
+                    bin_provider,
+                    dangling.iter().copied(),
+                ));
+            }
+
+            let (built, result) = LocalBackend::run_local_build(orchestrator, bin_provider).await;
+
+            // commit all built artifacts to the local cache
+            for (pending_dir, meta) in built {
+                pending_dir
+                    .finalize(meta)
+                    .map_err(|e| Error::Other(e.into()))?;
+            }
+            match result {
+                Ok(()) => return Ok(()),
+                Err(orchestrator::Error::DanglingCacheHit(hits))
+                    if hits.iter().all(|b| !dangling.contains(b)) =>
+                {
+                    for bsr in hits {
+                        let spec = graph.get(&bsr).map(|b| b.name.as_str()).unwrap_or("?");
+                        tracing::warn!(
+                            kind = "dangling_replan",
+                            spec,
+                            "the remote cache lists a package the store no longer has; building it locally"
+                        );
+                        dangling.push(bsr);
+                    }
+                }
+                // propagate any other error (a dangling hit on a spec already
+                // masked cannot happen: a masked spec is never a cache fill)
+                Err(e) => return Err(e.into()),
+            }
         }
-
-        let (built, result) = LocalBackend::run_local_build(orchestrator, bin_provider).await;
-
-        // commit all built artifacts to the local cache
-        for (pending_dir, meta) in built {
-            pending_dir
-                .finalize(meta)
-                .map_err(|e| Error::Other(e.into()))?;
-        }
-        // propergate any error
-        result?;
-
-        Ok(())
     }
 
     pub fn iter_tasks(&self, graph: &Graph) -> Vec<(String, TaskSource)> {
@@ -934,7 +1039,7 @@ impl Context {
     #[allow(clippy::too_many_arguments)]
     /// Builds an [`env::Env`] whose sandbox shares the host network. Use
     /// [`make_env_with_network`](Self::make_env_with_network) to run it under
-    /// another [`sandbox2::Network`] (e.g. an isolated PTask).
+    /// another [`sandbox::Network`] (e.g. an isolated PTask).
     pub async fn make_env<'a, S: PackageSelection>(
         &'a mut self,
         name: &'a str,
@@ -954,7 +1059,7 @@ impl Context {
             patches,
             env_vars,
             packages,
-            std::sync::Arc::new(sandbox2::HostNet),
+            std::sync::Arc::new(sandbox::HostNet),
             home,
             WdLayout::BoundDir,
         )
@@ -962,7 +1067,7 @@ impl Context {
     }
 
     /// Like [`make_env`](Self::make_env) but runs the sandbox under the given
-    /// [`sandbox2::Network`], so callers (e.g. the minimald task-exec path) can
+    /// [`sandbox::Network`], so callers (e.g. the minimald task-exec path) can
     /// give a task the same network as its session rather than always the
     /// host's. A provider, not a mode: the caller owns the mode and what it
     /// means, and the sandbox layer acts on what the provider says to do.
@@ -987,7 +1092,7 @@ impl Context {
         patches: Option<&'a EnvPatches>,
         env_vars: Option<&'a BTreeMap<String, EnvVarValue>>,
         packages: S,
-        network: std::sync::Arc<dyn sandbox2::Network>,
+        network: std::sync::Arc<dyn sandbox::Network>,
         home: PatchHome,
         wd_layout: WdLayout,
     ) -> Result<env::Env<'a>, Error> {
@@ -1147,35 +1252,55 @@ impl Context {
                 let rc_clone = rc.clone(); // TODO: This is trash
                 let cache_clone = self.daemon.cache.clone();
                 let semaphore = semaphore.clone();
-                task_set.spawn(async move {
+                // A spawned task starts with no current span: without this every
+                // package fetch (`materialize`) began a trace of its own, cut off
+                // from the activation that needed it.
+                let fetch = async move {
                     let sema = semaphore.acquire().await;
-                    let res = rc_clone
-                        .materialize(&spec_hash, &cache_clone, &name)
-                        .await
-                        .map(|(t, d)| {
-                            (
-                                d,
-                                lcache::EntryMeta {
-                                    inner: lcache::MetaInner::Spec(name),
-                                    fetched: true,
-                                    fetch_ms: Some(t.as_millis() as usize),
-                                    origin: Some(origin),
-                                    ..Default::default()
-                                },
-                            )
-                        });
+                    let package = name.clone();
+                    let res = match rc_clone.materialize(&spec_hash, &cache_clone, &name).await {
+                        Ok((t, d)) => Ok(Some((
+                            d,
+                            lcache::EntryMeta {
+                                inner: lcache::MetaInner::Spec(name),
+                                fetched: true,
+                                fetch_ms: Some(t.as_millis() as usize),
+                                origin: Some(origin),
+                                ..Default::default()
+                            },
+                        ))),
+                        // A dangling index hit: the index lists an artifact the
+                        // store no longer has. That is a miss, not a failure;
+                        // the package is built locally like any other miss,
+                        // and rcache has logged it (`kind = "dangling_hit"`).
+                        Err(rcache::Error::NotFound { .. }) => Ok(None),
+                        // The error names the package, not just the object:
+                        // "the remote cache has no artifact for ..." alone
+                        // tells the user nothing about which package.
+                        Err(e) => Err(anyhow::anyhow!("{package}: {e}")),
+                    };
                     drop(sema);
                     res
-                });
+                };
+                task_set.spawn(tracing::Instrument::instrument(
+                    fetch,
+                    tracing::Span::current(),
+                ));
             }
         }
 
         // Wait for all materialization tasks to complete, committing each pending dir
         // to the cache as it is finished being staged
         while let Some(result) = task_set.join_next().await {
-            let (pending_dir, meta) = result
+            let Some((pending_dir, meta)) = result
                 .map_err(|e| Error::Other(anyhow::anyhow!("package fetch task failed: {e}")))?
-                .map_err(|e| Error::Other(anyhow::Error::from(e)))?;
+                .map_err(Error::Other)?
+            else {
+                // a dangling hit: nothing to commit. A build (`build_graph`) makes the
+                // package; a prefetch-only caller (mip add/update/check) leaves it
+                // uncached, which rcache's `dangling_hit` warning has recorded.
+                continue;
+            };
             pending_dir
                 .finalize(meta)
                 .map_err(|e| Error::Other(e.into()))?;
@@ -1202,74 +1327,101 @@ impl Context {
             }
         };
 
-        let toml = std::fs::read_to_string(&mfile_path)
-            .map_err(|e| Error::IO("reading minimal.toml for add", mfile_path.to_path_buf(), e))?;
-        let mut doc = toml
-            .parse::<DocumentMut>()
-            .map_err(|e| Error::Other(anyhow!("parsing minimal.toml: {}", e)))?;
-
-        let resolved: Vec<String> = deps
-            .as_bsrs(graph)?
-            .into_iter()
-            .map(|bsr| graph.get(&bsr).unwrap().name.clone())
-            .collect();
-
+        // The whole read-edit-write runs under `File::edit_exclusively`'s
+        // lock so a concurrent `min` command cannot interleave between our read
+        // and our write (the write itself is an atomic replace).
         let mut did_edit = false;
-        match mode {
-            AddDepMode::BuildPackages => {
-                if let Some(h) = doc["stack"].as_table_mut() {
-                    did_edit |= upsert_toml_packages_list(h, "build_packages", &resolved)?;
-                    println!("Added {} to stack.build_packages", resolved.join(", "));
-                } else {
-                    return Err(Error::Other(anyhow!(
-                        "could not find [stack] in minimal.toml: needed for update"
-                    )));
-                }
-            }
-            AddDepMode::RuntimePackages => {
-                if let Some(h) = doc["stack"].as_table_mut() {
-                    did_edit |= upsert_toml_packages_list(h, "runtime_packages", &resolved)?;
-                    println!("Added {} to stack.runtime_packages", resolved.join(", "));
-                } else {
-                    return Err(Error::Other(anyhow!(
-                        "could not find [stack] in minimal.toml: needed for update"
-                    )));
-                }
-            }
-            AddDepMode::TaskPackages { name } => {
-                if let Some(tasks) = doc.get_mut("tasks")
-                    && let Some(t) = tasks.get_mut(&name)
-                    && let Some(t) = t.as_table_mut()
-                {
-                    did_edit |= upsert_toml_packages_list(t, "packages", &resolved)?;
-                    println!("Added {} to tasks.{}.packages", resolved.join(", "), name);
-                } else {
-                    return Err(Error::Other(anyhow!(
-                        "could not find [tasks.{}] in minimal.toml: needed for update",
-                        name
-                    )));
-                }
-            }
-            AddDepMode::SessionPackages => {
-                if let Some(h) = doc["session"].as_table_mut() {
-                    did_edit |= upsert_toml_packages_list(h, "packages", &resolved)?;
-                } else {
-                    doc.insert(
-                        "session",
-                        Item::Table(toml_edit::Table::from_iter([(
-                            "packages",
-                            Item::Value(Value::Array(Array::from_iter(resolved.iter()))),
-                        )])),
-                    );
-                    did_edit = true;
-                }
-                println!("Added {} to session.packages", resolved.join(", "));
-            }
-        }
+        let mut added = None;
+        mfile::File::edit_exclusively(&mfile_path, |content| {
+            let toml = content.ok_or_else(|| {
+                Error::IO(
+                    "reading minimal.toml for add",
+                    mfile_path.to_path_buf(),
+                    std::io::Error::new(std::io::ErrorKind::NotFound, "minimal.toml disappeared"),
+                )
+            })?;
+            let mut doc = toml
+                .parse::<DocumentMut>()
+                .map_err(|e| Error::Other(anyhow!("parsing minimal.toml: {}", e)))?;
 
+            let resolved: Vec<String> = deps
+                .as_bsrs(graph)?
+                .into_iter()
+                .map(|bsr| graph.get(&bsr).unwrap().name.clone())
+                .collect();
+
+            let mut edited = false;
+            match mode {
+                AddDepMode::BuildPackages => {
+                    if let Some(h) = doc["stack"].as_table_like_mut() {
+                        edited |= upsert_toml_packages_list(h, "build_packages", &resolved)?;
+                        added = Some(format!(
+                            "Added {} to stack.build_packages",
+                            resolved.join(", ")
+                        ));
+                    } else {
+                        return Err(Error::Other(anyhow!(
+                            "could not find [stack] in minimal.toml: needed for update"
+                        )));
+                    }
+                }
+                AddDepMode::RuntimePackages => {
+                    if let Some(h) = doc["stack"].as_table_like_mut() {
+                        edited |= upsert_toml_packages_list(h, "runtime_packages", &resolved)?;
+                        added = Some(format!(
+                            "Added {} to stack.runtime_packages",
+                            resolved.join(", ")
+                        ));
+                    } else {
+                        return Err(Error::Other(anyhow!(
+                            "could not find [stack] in minimal.toml: needed for update"
+                        )));
+                    }
+                }
+                AddDepMode::TaskPackages { name } => {
+                    if let Some(tasks) = doc.get_mut("tasks")
+                        && let Some(t) = tasks.get_mut(&name)
+                        && let Some(t) = t.as_table_like_mut()
+                    {
+                        edited |= upsert_toml_packages_list(t, "packages", &resolved)?;
+                        added = Some(format!(
+                            "Added {} to tasks.{}.packages",
+                            resolved.join(", "),
+                            name
+                        ));
+                    } else {
+                        return Err(Error::Other(anyhow!(
+                            "could not find [tasks.{}] in minimal.toml: needed for update",
+                            name
+                        )));
+                    }
+                }
+                AddDepMode::SessionPackages => {
+                    if let Some(h) = doc["session"].as_table_like_mut() {
+                        edited |= upsert_toml_packages_list(h, "packages", &resolved)?;
+                    } else {
+                        doc.insert(
+                            "session",
+                            Item::Table(toml_edit::Table::from_iter([(
+                                "packages",
+                                Item::Value(Value::Array(Array::from_iter(resolved.iter()))),
+                            )])),
+                        );
+                        edited = true;
+                    }
+                    added = Some(format!("Added {} to session.packages", resolved.join(", ")));
+                }
+            }
+
+            did_edit = edited;
+            Ok(if edited { Some(doc.to_string()) } else { None })
+        })?;
+
+        // Printed only once the write has succeeded.
+        if let Some(added) = added {
+            println!("{added}");
+        }
         if did_edit {
-            std::fs::write(&mfile_path, doc.to_string())
-                .map_err(|e| Error::Other(anyhow::Error::from(e)))?;
             *self = self.cloned_reinit()?;
         }
         Ok(())
@@ -1288,7 +1440,7 @@ pub enum AddDepMode {
     SessionPackages,
 }
 
-fn upsert_toml_packages_list<T: TableLike>(
+fn upsert_toml_packages_list<T: TableLike + ?Sized>(
     t: &mut T,
     key: &str,
     upsert: &[String],
@@ -1449,6 +1601,76 @@ mod tests {
             &ctx_a.daemon_context(),
             &ctx_b.daemon_context()
         ));
+    }
+
+    /// NET-155: a context made for a box carries the box's classifier leaf,
+    /// across a clone and a reload of its mfile, into the orchestrator it
+    /// builds with. A context made for no box carries no leaf.
+    #[tokio::test]
+    async fn box_context_carries_its_classifier_leaf() {
+        let state = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let config = ConfigBuilder::new()
+            .with_state_dir(state.path().to_path_buf())
+            .with_cache_dir(cache.path().to_path_buf())
+            .with_stdlib_dir(
+                std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("../stdlib/minimal-ncl"),
+            )
+            .build()
+            .unwrap();
+        let daemon = Arc::new(DaemonContext::init(config).unwrap());
+        let repo = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("testdata")
+            .join("fakerepo");
+        let mfile = MFileSearchStrategy::Override(repo)
+            .find_mfile()
+            .expect("fakerepo has a minimal.toml");
+        let leaf = sandbox::config::ClassifierLeaf::under(
+            std::path::Path::new("/sys/fs/cgroup/minimald.slice"),
+            "box-1",
+            sandbox::config::Verdict::Deny,
+        );
+
+        let plain = Context::from_daemon(Arc::clone(&daemon), mfile);
+        assert_eq!(plain.classifier_leaf(), None);
+        let graph = Graph::new();
+        let orchestrator = plain
+            .local_orchestrator(&graph, None, None, Default::default())
+            .await
+            .unwrap();
+        assert_eq!(orchestrator.backend.classifier_leaf(), None);
+
+        let boxed = plain.clone().with_classifier_leaf(leaf.clone());
+        assert_eq!(boxed.clone().classifier_leaf(), Some(&leaf));
+        assert_eq!(
+            boxed.cloned_reinit().unwrap().classifier_leaf(),
+            Some(&leaf)
+        );
+        let orchestrator = boxed
+            .local_orchestrator(&graph, None, None, Default::default())
+            .await
+            .unwrap();
+        assert_eq!(orchestrator.backend.classifier_leaf(), Some(&leaf));
+        assert!(orchestrator.backend.box_network().is_none());
+
+        // An own-address box has no leaf. Its context carries the box's
+        // network instead, across a clone and a reload, into the
+        // orchestrator.
+        assert!(plain.box_network().is_none());
+        let on_box_network = plain.with_box_network(op::BuildNetwork::new(|| {
+            Arc::new(sandbox::NoNet) as Arc<dyn sandbox::Network>
+        }));
+        assert!(on_box_network.clone().box_network().is_some());
+        let reloaded = on_box_network.cloned_reinit().unwrap();
+        assert!(reloaded.box_network().is_some());
+        assert_eq!(reloaded.classifier_leaf(), None);
+        let orchestrator = reloaded
+            .local_orchestrator(&graph, None, None, Default::default())
+            .await
+            .unwrap();
+        assert!(orchestrator.backend.box_network().is_some());
+        assert_eq!(orchestrator.backend.classifier_leaf(), None);
     }
 
     #[test]
@@ -1750,6 +1972,119 @@ mod tests {
                 .unwrap()
                 .contains("[session]\npackages = [\"uroot\"]")
         );
+    }
+
+    #[test]
+    fn add_deps_inline_tables() {
+        let state = tempdir().unwrap();
+        let cwd = tempdir().unwrap();
+        let mfile_path = cwd.path().join("minimal.toml");
+        std::fs::write(
+            &mfile_path,
+            format!(
+                indoc! {
+                    "
+                    stack = {{ use = \"fake-stack\", build_packages = [] }}
+                    tasks = {{ something = {{ exec = \"./something\" }} }}
+                    session = {{ packages = [], vars = {{ ANSWER = \"42\" }} }}
+
+                    [upstream]
+                    dir = \"{}\"
+                    "
+                },
+                std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("testdata")
+                    .join("fakerepo-with-stack")
+                    .to_str()
+                    .unwrap()
+            ),
+        )
+        .unwrap();
+
+        let config = ConfigBuilder::new()
+            .with_state_dir(state.path().to_path_buf())
+            .with_repo_dir(cwd.path().to_path_buf())
+            .with_stdlib_dir(
+                std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                    .join("../stdlib/minimal-ncl"),
+            )
+            .build()
+            .unwrap();
+
+        let mut ctx = Context::new(config).unwrap();
+        let graph = ctx.graph_from_all_packages().unwrap();
+
+        let read_doc = || {
+            std::fs::read_to_string(&mfile_path)
+                .unwrap()
+                .parse::<DocumentMut>()
+                .unwrap()
+        };
+        let str_list = |item: &Item| -> Vec<String> {
+            item.as_array()
+                .unwrap_or_else(|| panic!("expected an array, got {item:?}"))
+                .iter()
+                .map(|v| v.as_str().unwrap().to_owned())
+                .collect()
+        };
+
+        // Adding to an inline [stack] must edit it in place and keep its
+        // sibling keys.
+        ctx.add_deps(&graph, ["uroot"], AddDepMode::BuildPackages)
+            .unwrap();
+        ctx.add_deps(&graph, ["extra-runtime-pkg"], AddDepMode::RuntimePackages)
+            .unwrap();
+        let doc = read_doc();
+        assert!(doc["stack"].is_inline_table(), "stack lost inline form");
+        assert_eq!(str_list(&doc["stack"]["build_packages"]), ["uroot"]);
+        assert_eq!(
+            str_list(&doc["stack"]["runtime_packages"]),
+            ["extra-runtime-pkg"]
+        );
+        assert_eq!(doc["stack"]["use"].as_str(), Some("fake-stack"));
+
+        // Adding to an inline task must edit it in place and keep its
+        // sibling keys.
+        ctx.add_deps(
+            &graph,
+            ["uroot"],
+            AddDepMode::TaskPackages {
+                name: "something".to_string(),
+            },
+        )
+        .unwrap();
+        let doc = read_doc();
+        assert!(doc["tasks"]["something"].is_inline_table());
+        assert_eq!(str_list(&doc["tasks"]["something"]["packages"]), ["uroot"]);
+        assert_eq!(
+            doc["tasks"]["something"]["exec"].as_str(),
+            Some("./something")
+        );
+
+        // A task that is not in the inline `tasks` table is still an error.
+        assert!(
+            ctx.add_deps(
+                &graph,
+                ["uroot"],
+                AddDepMode::TaskPackages {
+                    name: "missing".to_string(),
+                },
+            )
+            .is_err()
+        );
+
+        // Adding to an inline [session] must not replace the whole table.
+        ctx.add_deps(&graph, ["uroot"], AddDepMode::SessionPackages)
+            .unwrap();
+        let doc = read_doc();
+        assert!(doc["session"].is_inline_table(), "session lost inline form");
+        assert_eq!(str_list(&doc["session"]["packages"]), ["uroot"]);
+        assert_eq!(doc["session"]["vars"]["ANSWER"].as_str(), Some("42"));
+
+        // The surviving settings must still parse into the config.
+        let session = ctx.minimal_file().session.clone().unwrap_or_default();
+        assert!(session.vars.keys().any(|k| k.as_ref() == "ANSWER"));
+        assert!(session.packages.contains(&"uroot".to_string()));
     }
 
     #[test]

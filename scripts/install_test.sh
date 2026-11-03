@@ -138,13 +138,124 @@ case "${1:-}" in
         [ $# -gt 0 ] || set -- bash zsh fish
         for _s in "$@"; do comp_install "$_s"; done
         ;;
-    ls)          printf 'session-alpha  running\n' ;;
+    version)
+        # The post-swap probe contract: client line always, server line only
+        # when a daemon answers. $HOME/minver.client / minver.server override
+        # the reported versions (default: matching, so ordinary scenarios
+        # stop nothing); an empty minver.server means "no daemon answered".
+        if [ -s "$HOME/minver.client" ]; then
+            _vc="$(cat "$HOME/minver.client")"
+        else
+            _vc=v1
+        fi
+        printf 'Client: minimal %s\n' "$_vc"
+        if [ -s "$HOME/minver.server" ]; then
+            printf 'Server: minimald %s\n' "$(cat "$HOME/minver.server")"
+        elif [ -f "$HOME/daemon.running" ]; then
+            # A modelled daemon (see `stop` below) answers with this build
+            # when it serves the minimald on disk, and an older one otherwise.
+            if cmp -s "$HOME/daemon.running" "$HOME/bin/minimald"; then
+                printf 'Server: minimald %s\n' "$_vc"
+            else
+                printf 'Server: minimald old\n'
+            fi
+        fi
+        ;;
+    ls)
+        # `ls --raw` prints one session id per line: those in
+        # $HOME/sessions.ids, else session-alpha while sessions are live.
+        if [ "${2:-}" = --raw ]; then
+            if [ -f "$HOME/sessions.ids" ]; then
+                cat "$HOME/sessions.ids"
+            elif [ -f "$HOME/sessions.live" ]; then
+                printf 'session-alpha\n'
+            fi
+        else
+            printf 'session-alpha  running\n'
+        fi
+        ;;
     stop)
         printf '%s\n' "$*" >>"$HOME/stop.calls"
         if [ -f "$HOME/sessions.live" ] && [ "${2:-}" != "--force" ]; then
             echo "daemon has active sessions; pass --force to shut down anyway" >&2
             exit 1
         fi
+        # $HOME/stopforce.fail: a forced stop fails and the daemon keeps running.
+        if [ -f "$HOME/stopforce.fail" ] && [ "${2:-}" = "--force" ]; then
+            echo "error: stop failed" >&2
+            exit 1
+        fi
+        # A daemon that stops is gone; --force takes its live sessions with
+        # it. $HOME/daemon.running carries the daemon binary the running
+        # daemon serves from, and a $HOME/daemon.reconnect client autospawns
+        # a replacement daemon from whatever is on disk the moment the
+        # previous one stops — a respawn holds no live sessions of its own,
+        # and serves from the binaries present at the moment it spawns.
+        rm -f "$HOME/daemon.running"
+        [ "${2:-}" = "--force" ] && rm -f "$HOME/sessions.live" "$HOME/sessions.ids"
+        if [ -f "$HOME/daemon.reconnect" ] && [ -f "$HOME/bin/minimald" ]; then
+            cat "$HOME/bin/minimald" >"$HOME/daemon.running"
+            # $HOME/respawn.sessions: the client opens a session in the
+            # respawned daemon, as a `min new` during the install would. A
+            # non-empty file holds the ids of the sessions it opens.
+            if [ -f "$HOME/respawn.sessions" ]; then
+                : >"$HOME/sessions.live"
+                [ -s "$HOME/respawn.sessions" ] && cp "$HOME/respawn.sessions" "$HOME/sessions.ids"
+            fi
+            # $HOME/respawn.notty names a terminal file that goes away at the
+            # respawn: the user answered once, then left.
+            if [ -s "$HOME/respawn.notty" ]; then rm -f "$(cat "$HOME/respawn.notty")"; fi
+        fi
+        ;;
+    finalize-install)
+        # Every invocation is recorded, arguments and all, in $HOME/finalize.calls.
+        # The probe (`--show --script`) answers like the real command: the
+        # summary on stderr, exit 0 whatever it finds, and on stdout the script
+        # only while some item is missing. $HOME/finalize.summary marks a host
+        # with a `missing` item; $HOME/finalize.waiting one whose names item
+        # waits on a daemon; $HOME/finalize.cannot one whose open item no script
+        # can fix — each holds the summary to print, as the real command renders
+        # it. $HOME/finalize.show.status makes the probe exit with that status
+        # and print nothing (a `min` too old to know the command). The plain run
+        # prints the summary on stdout, as the real command does before it
+        # elevates, exits with $HOME/finalize.run.status (default 0), and on
+        # success ends with $HOME/finalize.closing's lines, its closing lines.
+        printf '%s\n' "$*" >>"$HOME/finalize.calls"
+        fi_summary_file=
+        for _f in summary waiting cannot; do
+            [ -f "$HOME/finalize.$_f" ] && fi_summary_file="$HOME/finalize.$_f"
+        done
+        case "${2:-} ${3:-}" in
+            "--show --script")
+                if [ -f "$HOME/finalize.show.status" ]; then
+                    echo "mock min: unrecognized subcommand 'finalize-install'" >&2
+                    exit "$(cat "$HOME/finalize.show.status")"
+                fi
+                echo "warning: skipping VM broken-vm: its control socket did not answer" >&2
+                if [ -n "$fi_summary_file" ]; then
+                    cat "$fi_summary_file" >&2
+                else
+                    echo "Every part of the install is finished on this machine; there is nothing to run." >&2
+                fi
+                if [ -f "$HOME/finalize.summary" ]; then
+                    printf '#!/bin/sh\n# mock finalize-install script\n'
+                fi
+                ;;
+            " ")
+                # The run rebuilds the probe's plan, warnings included.
+                echo "warning: skipping VM broken-vm: its control socket did not answer" >&2
+                if [ -n "$fi_summary_file" ]; then
+                    cat "$fi_summary_file"
+                fi
+                if [ -f "$HOME/finalize.run.status" ]; then
+                    echo "min finalize-install: the script exited with status 1" >&2
+                    exit "$(cat "$HOME/finalize.run.status")"
+                fi
+                # A completed run ends with its closing lines on stdout, as
+                # the real command does: $HOME/finalize.closing when present.
+                [ -f "$HOME/finalize.closing" ] && cat "$HOME/finalize.closing"
+                ;;
+        esac
         ;;
 esac
 MOCKEOF
@@ -160,7 +271,7 @@ MOCKEOF
 printf 'linux-amd64-minimald-body\n'     >"$mock/versions/v1/minimald-linux-amd64"
 write_min_stub "$mock/versions/v1/minimal-linux-amd64"  linux-amd64
 # The answerer NET-122's advisory copies from beside min (NET-122).
-printf 'linux-amd64-answerer-body\n'    >"$mock/versions/v1/min-answerer-linux-amd64"
+printf 'linux-amd64-answerer-body\n'    >"$mock/versions/v1/minzoned-linux-amd64"
 printf 'linux-amd64-minvmd-body\n'       >"$mock/versions/v1/minvmd-linux-amd64"
 printf 'linux-amd64-initramfs-body\n'   >"$mock/versions/v1/initramfs-amd64.cpio"
 printf 'linux-amd64-rootfs-body\n'      >"$mock/versions/v1/rootfs-amd64.img"
@@ -172,7 +283,7 @@ printf 'mock-gvproxy-switch-body\n'      >"$mock/versions/v1/gvproxy-min-linux-a
 # Linux arm64 release artifacts, including the VM stack (NET-050).
 printf 'linux-arm64-minimald-body\n'    >"$mock/versions/v1/minimald-linux-arm64"
 write_min_stub "$mock/versions/v1/minimal-linux-arm64" linux-arm64
-printf 'linux-arm64-answerer-body\n'    >"$mock/versions/v1/min-answerer-linux-arm64"
+printf 'linux-arm64-answerer-body\n'    >"$mock/versions/v1/minzoned-linux-arm64"
 printf 'linux-arm64-minvmd-body\n'      >"$mock/versions/v1/minvmd-linux-arm64"
 printf 'linux-arm64-initramfs-body\n'    >"$mock/versions/v1/initramfs-arm64.cpio"
 printf 'linux-arm64-rootfs-body\n'       >"$mock/versions/v1/rootfs-arm64.img"
@@ -182,7 +293,9 @@ printf 'mock-gvproxy-switch-arm64-body\n' >"$mock/versions/v1/gvproxy-min-linux-
 # macOS arm64 guest payload (kept distinct from the linux arm64 rootfs so each
 # architecture is exercised with its own artifact and hash).
 write_min_stub "$mock/versions/v1/minimal-darwin-arm64" darwin-arm64
-printf 'darwin-arm64-answerer-body\n'    >"$mock/versions/v1/min-answerer-macos-arm64"
+printf 'darwin-arm64-answerer-body\n'    >"$mock/versions/v1/minzoned-macos-arm64"
+# One of the other files of the app bundle the answerer ships in on macOS.
+printf 'darwin-arm64-answerer-info-body\n' >"$mock/versions/v1/minzoned-macos-arm64-Info.plist"
 printf 'darwin-arm64-rootfs-body\n'      >"$mock/versions/v1/rootfs-darwin-arm64.img"
 
 # AppArmor components: noarch text (the loader is a runnable stub here), shipped
@@ -194,7 +307,7 @@ printf '#!/bin/sh\n# mock apparmor loader\n' >"$mock/versions/v1/install-apparmo
 # Hashes for every artifact referenced by the component table below.
 h_minimald="$(hash_file "$mock/versions/v1/minimald-linux-amd64")"
 h_minimal="$(hash_file "$mock/versions/v1/minimal-linux-amd64")"
-h_answerer="$(hash_file "$mock/versions/v1/min-answerer-linux-amd64")"
+h_answerer="$(hash_file "$mock/versions/v1/minzoned-linux-amd64")"
 h_minvmd="$(hash_file "$mock/versions/v1/minvmd-linux-amd64")"
 h_initramfs="$(hash_file "$mock/versions/v1/initramfs-amd64.cpio")"
 h_rootfs="$(hash_file "$mock/versions/v1/rootfs-amd64.img")"
@@ -203,7 +316,7 @@ h_gvmin="$(hash_file "$mock/versions/v1/gvproxy-min-linux-amd64")"
 
 h_minimald_arm="$(hash_file "$mock/versions/v1/minimald-linux-arm64")"
 h_minimal_arm="$(hash_file "$mock/versions/v1/minimal-linux-arm64")"
-h_answerer_arm="$(hash_file "$mock/versions/v1/min-answerer-linux-arm64")"
+h_answerer_arm="$(hash_file "$mock/versions/v1/minzoned-linux-arm64")"
 h_minvmd_arm="$(hash_file "$mock/versions/v1/minvmd-linux-arm64")"
 h_initramfs_arm="$(hash_file "$mock/versions/v1/initramfs-arm64.cpio")"
 h_rootfs_arm="$(hash_file "$mock/versions/v1/rootfs-arm64.img")"
@@ -211,7 +324,8 @@ h_vmlinuz_arm="$(hash_file "$mock/versions/v1/vmlinuz-arm64")"
 h_gvmin_arm="$(hash_file "$mock/versions/v1/gvproxy-min-linux-arm64")"
 
 h_dmin="$(hash_file "$mock/versions/v1/minimal-darwin-arm64")"
-h_danswerer="$(hash_file "$mock/versions/v1/min-answerer-macos-arm64")"
+h_danswerer="$(hash_file "$mock/versions/v1/minzoned-macos-arm64")"
+h_dinfo="$(hash_file "$mock/versions/v1/minzoned-macos-arm64-Info.plist")"
 h_drootfs="$(hash_file "$mock/versions/v1/rootfs-darwin-arm64.img")"
 
 h_aaprof="$(hash_file "$mock/versions/v1/minimald.apparmor")"
@@ -234,7 +348,7 @@ write_manifest() {
         # The answerer installs beside min on every platform min ships for
         # (NET-122); the installed copy is only the advisory's copy source.
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-            min-answerer linux amd64 v1 "$h_answerer" file bin/min-answerer versions/v1/min-answerer-linux-amd64
+            minzoned linux amd64 v1 "$h_answerer" file bin/minzoned versions/v1/minzoned-linux-amd64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             gvproxy-min linux amd64 v1 "$h_gvmin" file bin/gvproxy-min versions/v1/gvproxy-min-linux-amd64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
@@ -251,7 +365,7 @@ write_manifest() {
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             minimal linux arm64 v1 "$h_minimal_arm" file bin/min versions/v1/minimal-linux-arm64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-            min-answerer linux arm64 v1 "$h_answerer_arm" file bin/min-answerer versions/v1/min-answerer-linux-arm64
+            minzoned linux arm64 v1 "$h_answerer_arm" file bin/minzoned versions/v1/minzoned-linux-arm64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             gvproxy-min linux arm64 v1 "$h_gvmin_arm" file bin/gvproxy-min versions/v1/gvproxy-min-linux-arm64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
@@ -266,7 +380,9 @@ write_manifest() {
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             minimal darwin arm64 v1 "$h_dmin" file bin/min versions/v1/minimal-darwin-arm64
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
-            min-answerer darwin arm64 v1 "$h_danswerer" file bin/min-answerer versions/v1/min-answerer-macos-arm64
+            minzoned darwin arm64 v1 "$h_danswerer" file bin/Minimal.app/Contents/MacOS/minzoned versions/v1/minzoned-macos-arm64
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            minzoned-info darwin arm64 v1 "$h_dinfo" file bin/Minimal.app/Contents/Info.plist versions/v1/minzoned-macos-arm64-Info.plist
         printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
             rootfs darwin arm64 v1 "$h_drootfs" file data/rootfs.img versions/v1/rootfs-darwin-arm64.img
         # AppArmor support files ship to every Linux arch.
@@ -358,6 +474,41 @@ printf '%s\n' "\$*" >>"$root/xattr.calls"
 STUB
 chmod +x "$stubbin/xattr"
 
+# Remedy-bin: the whole PATH the advisory's commands run with (see
+# apply_remedies), so a command that is not here fails instead of reaching
+# the host's. sudo is a pass-through, so the "root" removals act on the
+# seeded fake root. Commands that only change live host state (systemd, nft,
+# gpasswd, apparmor_parser, ip, resolvectl, launchctl) log their call to
+# $remedy_calls and succeed. `rm`, `rmdir` and `find` are the real ones, so
+# each remedy provably removes its artifact.
+remedybin="$root/remedybin"
+remedy_calls="$root/remedy.calls"
+mkdir -p "$remedybin"
+cat >"$remedybin/sudo" <<'STUB'
+#!/bin/sh
+exec "$@"
+STUB
+chmod +x "$remedybin/sudo"
+for _rb_cmd in systemctl nft gpasswd apparmor_parser ip resolvectl launchctl; do
+    cat >"$remedybin/$_rb_cmd" <<STUB
+#!/bin/sh
+printf '%s %s\\n' "$_rb_cmd" "\$*" >>"$remedy_calls"
+STUB
+    chmod +x "$remedybin/$_rb_cmd"
+done
+for _rb_cmd in rm rmdir find; do
+    _rb_real="$(command -v "$_rb_cmd")"
+    # A builtin or an alias comes back as a bare name, and the link would
+    # point at itself.
+    case "$_rb_real" in
+        /*) ;;
+        *) echo "remedy-bin: no real $_rb_cmd on PATH" >&2; exit 1 ;;
+    esac
+    ln -s "$_rb_real" "$remedybin/$_rb_cmd"
+done
+# The shell the remedies run in, resolved now: the remedy PATH has no shell.
+remedy_sh="$(command -v "$SH")"
+
 downloads() { wc -l <"$dlcount" | tr -d ' '; }
 reset_dl()  { : >"$dlcount"; }
 
@@ -373,27 +524,32 @@ PLAT_M=x86_64
 # unknown-shell fallback branch).
 TEST_SHELL=
 
-# Host userns state the installer sees. Empty leaves both overrides pointing at
-# nonexistent paths (a host without the restriction and without a system
-# profile), so the AppArmor advisory/prompt stays silent; scenarios point these
-# at fixtures to drive it. USERNS_SYSCTL is a file whose contents are the sysctl
-# value; APPARMOR_DIR stands in for /etc/apparmor.d.
-USERNS_SYSCTL=
+# Stand-in for /etc/apparmor.d, where uninstall looks for the system profile.
+# Empty points the override at a nonexistent path (a host without a system
+# profile), so the uninstall prompt stays silent; scenarios point it at a
+# fixture to drive it.
 APPARMOR_DIR=
 
-# Bin prefix the installer sees. Empty means the harness default ($hp/bin — a
-# custom MINIMAL_BIN, NOT one of the AppArmor tunable's stock attachment
-# paths); scenarios set it to $hp/.local/bin to exercise the default-prefix
-# branch of the userns advisory.
-BIN_OVERRIDE=
+# Root the installer looks under for the host paths `min finalize-install` installs.
+# Empty points it at a nonexistent directory, so this host's own setup never
+# leaks into a scenario; scenarios seed a fake root to drive the offer.
+FINALIZE_INSTALL_ROOT=
 
-# Stand-in for /dev/tty, where the active-sessions prompt reads its answer
-# (R5.5). Empty points the installer at a path that cannot be opened — the
-# harness's own terminal must never be read, and every scenario that does not
-# stage an answer must behave like a non-interactive run. Scenarios point it at
-# a file holding the keystroke. FORCE_STOP fills MINIMAL_INSTALL_FORCE_STOP.
+# Stand-in for /dev/tty, where the active-sessions prompt (R5.5) and the
+# finalize-install offer (NET-122) read their answers. Empty points the
+# installer at a path that cannot be opened — the harness's own terminal must
+# never be read, and every scenario that does not stage an answer must behave
+# like a non-interactive run. Scenarios point it at a file holding the
+# keystroke. FORCE_STOP fills MINIMAL_INSTALL_FORCE_STOP.
 TTY_FILE=
 FORCE_STOP=
+
+# Whether the bin prefix is already on the installer's PATH. Empty — the
+# default, and a fresh install's reality — leaves it off, so every command
+# the installer prints must name the installed `min` by path; a non-empty
+# value prepends $hp/bin, the state of a rerun from a shell the rc hook
+# already reached.
+BIN_ON_PATH=
 
 # run <label> <homeprefix> [args...] ; sets rc, captures combined output in $OUT.
 OUT=
@@ -402,11 +558,11 @@ run() {
     OUT="$root/out.$label"
     set +e
     env -i \
-        PATH="$stubbin:/usr/bin:/bin" \
+        PATH="${BIN_ON_PATH:+$hp/bin:}$stubbin:/usr/bin:/bin" \
         TERM=xterm-256color \
         HOME="$hp" \
         SHELL="${TEST_SHELL:-/bin/sh}" \
-        MINIMAL_BIN="${BIN_OVERRIDE:-$hp/bin}" \
+        MINIMAL_BIN="$hp/bin" \
         XDG_DATA_HOME="$hp/xdg-data" \
         XDG_STATE_HOME="$hp/xdg-state" \
         XDG_CACHE_HOME="$hp/xdg-cache" \
@@ -414,13 +570,67 @@ run() {
         MINIMAL_OVERRIDE_INSTALLER_BUCKET="$BUCKET_HOST" \
         STUB_UNAME_S="$PLAT_S" \
         STUB_UNAME_M="$PLAT_M" \
-        MINIMAL_OVERRIDE_USERNS_SYSCTL="${USERNS_SYSCTL:-$root/no-such-sysctl}" \
         MINIMAL_OVERRIDE_APPARMOR_DIR="${APPARMOR_DIR:-$root/no-such-apparmor.d}" \
+        MINIMAL_OVERRIDE_FINALIZE_INSTALL_ROOT="${FINALIZE_INSTALL_ROOT:-$root/no-such-finalize-install-root}" \
         MINIMAL_OVERRIDE_TTY="${TTY_FILE:-$root/no-such-tty}" \
         MINIMAL_INSTALL_FORCE_STOP="${FORCE_STOP:-}" \
         "$SH" "$installer" "$@" </dev/null >"$OUT" 2>&1
     rc=$?
     set -e
+}
+
+# apply_remedies <expected-lines> — the proof behind the advisory: run every
+# remedy line the last run printed (each is one 6-space-indented root command)
+# so the artifacts the advisory named are actually removed from the seeded
+# fake root; the scenario then asserts each one is gone. `rm`, `rmdir` and
+# `find` are real, so two guards keep a line from reaching the host. A line
+# is refused before it runs unless every path in it is a single-quoted one
+# under $root (the bare tokens the remedies use are allow-listed), which
+# covers an advisory printed without the root override and a stray indented
+# line from other installer output. And the line runs with the remedy-bin as
+# its whole PATH, so a command with no stub there fails. It also runs from
+# $root with $root as its HOME, so a relative or `~` operand, which the first
+# guard does not see, stays inside the fake root too. Keep the indent in
+# sync with the advisory lines maybe_remove_finalize_install() embeds in
+# scripts/install.sh.
+apply_remedies() {
+    _ar_want="$1"; _ar_ok=0
+    : >"$remedy_calls"
+    while IFS= read -r _ar_line; do
+        [ -n "$_ar_line" ] || continue
+        # What is left of the line once every quoted path under $root and
+        # every allow-listed token is taken out: a slash still there is a
+        # path somewhere else.
+        _ar_rest="$(printf '%s\n' "$_ar_line" | awk -v r="'$root/" -v q="'" '{
+            s = $0; out = ""
+            while ((i = index(s, r)) > 0) {
+                out = out substr(s, 1, i - 1)
+                s = substr(s, i + length(r))
+                j = index(s, q)
+                if (j == 0) { out = out "/"; s = ""; break }
+                s = substr(s, j + 1)
+            }
+            out = out s
+            gsub(/2>\/dev\/null/, "", out)
+            gsub(/system\/dev\.(gominimal\.zone|minimal\.local-range)/, "", out)
+            print out
+        }')"
+        _ar_refuse=
+        case "$_ar_line" in *..*) _ar_refuse=1 ;; esac
+        case "$_ar_rest" in */*) _ar_refuse=1 ;; esac
+        if [ -n "$_ar_refuse" ]; then
+            bad "a printed remedy names a path outside the fake root: $_ar_line"
+            continue
+        fi
+        if (cd "$root" && HOME="$root" PATH="$remedybin" "$remedy_sh" -c "$_ar_line"); then
+            _ar_ok=$((_ar_ok + 1))
+        else
+            bad "a printed remedy failed to run: $_ar_line"
+        fi
+    done <<EOF
+$(awk '/^      /{sub(/^      /, ""); print}' "$OUT")
+EOF
+    check "$_ar_want" "$_ar_ok" "every printed remedy ran ($_ar_want line(s))"
 }
 
 # ===========================================================================
@@ -476,9 +686,13 @@ case_install() {
 }
 
 case_apparmor() {
-    # --- AppArmor components + Ubuntu 24.04+ advisory --------------------------
-    # The components and the advisory both assert over a home holding a completed
-    # install, so this case seeds its own instead of inheriting another case's.
+    # --- AppArmor components ---------------------------------------------------
+    # The components assert over a home holding a completed install, so this
+    # case seeds its own instead of inheriting another case's. The installer
+    # ships them and says nothing about them: the Ubuntu 24.04+ user-namespace
+    # restriction is one of the items `min finalize-install` probes and offers
+    # (the installer_offers_finalize_install_on_a_tty case), not an installer
+    # note of its own.
     H_A="$root/ha"; mkdir -p "$H_A"
     run aa_seed "$H_A"
     check 0 "$rc" "apparmor seed install exits 0"
@@ -487,59 +701,8 @@ case_apparmor() {
     want_ok "apparmor profile installed under data prefix"  test -f "$aa_root/minimald"
     want_ok "apparmor tunable installed under data prefix"  test -f "$aa_root/tunables/minimald"
     want_ok "apparmor loader installed under data prefix"   test -f "$aa_root/install-apparmor-profile.sh"
-
-    # The advisory fires only when the userns restriction is active (sysctl reads 1),
-    # points at the shipped loader, and never elevates — install still exits 0.
-    printf '1\n' >"$root/sysctl-on"
-    printf '0\n' >"$root/sysctl-off"
-
-    USERNS_SYSCTL="$root/sysctl-on"
-    run aa_restricted "$H_A"
-    USERNS_SYSCTL=
-    check 0 "$rc" "install on a restricted host still exits 0 (advice only)"
-    want_ok "advisory names the userns restriction" \
+    want_err "the installer carries no AppArmor-only note of its own" \
         grep -q "restricts unprivileged user namespaces" "$OUT"
-    want_ok "advisory points at the shipped loader with sudo bash" \
-        grep -q "sudo bash .*apparmor/install-apparmor-profile.sh" "$OUT"
-    # The harness bindir is a custom MINIMAL_BIN, outside the tunable's stock
-    # attachment set, so the advised command must attach it explicitly.
-    want_ok "advisory carries --path for a custom MINIMAL_BIN" \
-        grep -q -- "--path \"$H_A/bin/minimald\"" "$OUT"
-    # The card is the parting block even when the AppArmor advisory is the last note.
-    want_card_last "the card follows the AppArmor advisory (R10.4)"
-
-    USERNS_SYSCTL="$root/sysctl-off"
-    run aa_unrestricted "$H_A"
-    USERNS_SYSCTL=
-    want_err "no advisory when the restriction is off (sysctl 0)" \
-        grep -q "restricts unprivileged user namespaces" "$OUT"
-
-    # A loaded system profile alone is NOT remediation for a custom MINIMAL_BIN:
-    # the stock tunable does not attach it, so sessions still die and the advisory
-    # must keep firing (with --path) until the tunables name this binary.
-    mkdir -p "$root/aa-present"; printf 'profile\n' >"$root/aa-present/minimald"
-    USERNS_SYSCTL="$root/sysctl-on"; APPARMOR_DIR="$root/aa-present"
-    run aa_present_unattached "$H_A"
-    want_ok "advisory still fires when the profile is loaded but MINIMAL_BIN unattached" \
-        grep -q -- "--path \"$H_A/bin/minimald\"" "$OUT"
-
-    # ...and is suppressed once the tunables do name it (what the loader's --path
-    # records under tunables/minimald.d).
-    mkdir -p "$root/aa-present/tunables/minimald.d"
-    printf '@{minimald_bin} += %s/bin/minimald\n' "$H_A" \
-        >"$root/aa-present/tunables/minimald.d/paths"
-    run aa_attached "$H_A"
-    want_err "no advisory when the tunables attach this MINIMAL_BIN" \
-        grep -q "restricts unprivileged user namespaces" "$OUT"
-
-    # For the stock prefix (~/.local/bin) the profile's own tunable already
-    # attaches the binary, so the profile file existing IS remediation.
-    BIN_OVERRIDE="$H_A/.local/bin"
-    run aa_already_default_bin "$H_A"
-    BIN_OVERRIDE=
-    want_err "no advisory for the default prefix when the system profile is installed" \
-        grep -q "restricts unprivileged user namespaces" "$OUT"
-    USERNS_SYSCTL=; APPARMOR_DIR=
 
     # Darwin hosts never receive the apparmor components (linux-only manifest rows).
     HAA_D="$root/haa_d"; mkdir -p "$HAA_D"
@@ -557,6 +720,9 @@ case_apparmor_uninstall() {
     # A non-interactive uninstall (stdin is /dev/null, not a tty) advises the root
     # removal command and never elevates: the seeded system profile survives, while
     # the shipped loader is removed by the record walk like any other component.
+    # Without the step's record the profile is not `min finalize-install`'s, so
+    # the advisory does not point at `--undo`. The printed remedy is then
+    # executed with the remedy-bin stubs on PATH, proving it removes the profile.
     HAA_U="$root/haa_u"; mkdir -p "$HAA_U"
     run aa_u_seed "$HAA_U"
     check 0 "$rc" "uninstall-apparmor seed install exits 0"
@@ -567,13 +733,579 @@ case_apparmor_uninstall() {
     run aa_u_run "$HAA_U" --uninstall
     APPARMOR_DIR=
     check 0 "$rc" "uninstall with a loaded system profile exits 0"
-    want_ok "uninstall advises the system profile is still loaded" \
-        grep -q "system AppArmor profile is still loaded" "$OUT"
-    want_ok "advisory gives the root removal command" grep -q "apparmor_parser -R" "$OUT"
+    want_ok "uninstall advises the system profile is still installed" \
+        grep -q "still installed on this host.*system AppArmor profile" "$OUT"
+    want_err "an unrecorded profile is not offered to min finalize-install --undo" \
+        grep -q "min finalize-install --undo" "$OUT"
     want_ok "non-interactive uninstall never elevates (profile survives)" \
         test -f "$fake_aa/minimald"
+    apply_remedies 1
+    want_err "the printed remedy removes the system profile" \
+        test -e "$fake_aa/minimald"
     want_err "uninstall removed the shipped apparmor loader" \
         test -e "$HAA_U/xdg-data/minimal/apparmor/install-apparmor-profile.sh"
+}
+
+case_finalize_install_uninstall() {
+    # --- Uninstall: advise removing what min finalize-install installed ----------
+    # A non-interactive uninstall on a host where `min finalize-install` ran advises
+    # `min finalize-install --undo` and the root commands that stay valid once `min`
+    # is gone, and never elevates: the seeded host files survive the uninstall.
+    # Each printed remedy is then executed (see apply_remedies) and must actually
+    # remove its artifact from the fake root. Every artifact the step owns is
+    # detected on its own, and everything found shares one advisory. A host that
+    # never ran the step sees nothing.
+
+    # The remedy runner fails closed. A line naming a path outside the fake
+    # root is refused before it runs, and a command the remedy-bin does not
+    # carry fails, so neither can reach this host. Each shows as a failure,
+    # counted here and then taken back out of the tally.
+    _g_pass=$pass; _g_fail=$fail
+    OUT="$root/out.remedy_guard"
+    printf "      sudo rm -f '/no-such-minimal-dir/guard-probe'\n      sudo rm -f '%s/../guard-probe'\n      sudo rm -f \"%s/guard-probe\"\n      sudo uname\n" \
+        "$root" "$root" >"$OUT"
+    apply_remedies 0 >/dev/null 2>&1
+    _g_refused=$((fail - _g_fail)); _g_counted=$((pass - _g_pass))
+    pass=$_g_pass; fail=$_g_fail
+    check 4 "$_g_refused" "the remedy runner refuses an unrooted path, a .. path, a path not single-quoted and an unstubbed command"
+    check 1 "$_g_counted" "the remedy runner counts no refused line as run"
+
+    # The advice and `min finalize-install --undo` name the same paths: every
+    # absolute path constant in the undo's source appears in the code of
+    # maybe_remove_finalize_install, apart from the ones that are not the
+    # step's to remove. A path added to the undo and not to the advice fails
+    # here. The path has to stand as a whole word in a line that is not a
+    # comment, so a mention in a comment or a longer path that starts with it
+    # does not count. This shows the function names the path, not that a
+    # remedy removes it: the seeded scenarios below are the proof of removal.
+    _advice="$root/advice.body"
+    sed -n '/^maybe_remove_finalize_install()/,/^}$/p' "$installer" \
+        | grep -v '^ *#' >"$_advice" || true
+    advice_names() {
+        awk -v p="$1" '{
+            s = $0
+            while ((i = index(s, p)) > 0) {
+                c = substr(s, i + length(p), 1)
+                if (c == "" || index(" \"\047;}", c) > 0) found = 1
+                s = substr(s, i + 1)
+            }
+        } END { exit !found }' "$_advice"
+    }
+    want_err "a path that only starts a longer one is not named by the advice" \
+        advice_names /usr/local/lib/min
+    _src="$here/../crates"
+    _undo_paths="$({
+        awk '/const [A-Z_]+: &str =/ { want = 2 } want > 0 { print; want-- }' \
+            "$_src/minimal/src/resolver.rs"
+        grep 'const GLOBAL_CHANNEL_SOCK' "$_src/minvmd/src/net/answerer.rs"
+    } | sed -n 's|.*"\(/[^"]*\)".*|\1|p' | sort -u)"
+    _undo_n=0
+    while IFS= read -r _undo_p; do
+        case "$_undo_p" in
+            # Read by the step, never written: the host's own resolver files.
+            /etc/nsswitch.conf|/etc/resolv.conf) continue ;;
+            # System directories the step installs into and leaves.
+            /Library/LaunchDaemons|/Library/PrivilegedHelperTools) continue ;;
+            # Paths inside the app bundle, which the advice removes whole.
+            /Library/PrivilegedHelperTools/Minimal.app/*) continue ;;
+            # A fixture path in the source's own tests.
+            /opt/minimal-test/*) continue ;;
+            '') continue ;;
+        esac
+        _undo_n=$((_undo_n + 1))
+        want_ok "the uninstall advice names the undo's path $_undo_p" \
+            advice_names "$_undo_p"
+    done <<EOF
+$_undo_paths
+EOF
+    want_ok "the undo's source yielded its paths ($_undo_n)" test "$_undo_n" -ge 15
+
+    # The host DNS setup, every file of it, with the answerer's channel socket
+    # and the directories the step made for it.
+    HNS="$root/hns"; mkdir -p "$HNS"
+    run ns_seed "$HNS"
+    check 0 "$rc" "uninstall-net-setup seed install exits 0"
+    # The fake root holds a space and a literal $HOME: a remedy is a command
+    # line another shell parses again (apply_remedies runs it through `sh -c`;
+    # a pasted prompt is the same), so every path has to come through as one
+    # single-quoted word, never split and never expanded.
+    fake_ns="$root/fake net root \$HOME"
+    ns_files="etc/systemd/system/minzoned.socket etc/systemd/system/minzoned.service usr/local/lib/minimal/minzoned run/minimal/answerer.sock"
+    for f in $ns_files sys/class/net/minzone0; do
+        mkdir -p "$fake_ns/$(dirname "$f")"
+        printf 'unit\n' >"$fake_ns/$f"
+    done
+    FINALIZE_INSTALL_ROOT="$fake_ns"
+    run ns_run "$HNS" --uninstall
+    FINALIZE_INSTALL_ROOT=
+    check 0 "$rc" "uninstall with the host DNS setup present exits 0"
+    want_ok "uninstall advises the host DNS setup is still installed" \
+        grep -q "still installed on this host.*host DNS setup" "$OUT"
+    want_ok "advisory names min finalize-install --undo" grep -q "min finalize-install --undo" "$OUT"
+    for f in $ns_files; do
+        want_ok "non-interactive uninstall never elevates ($f survives)" test -f "$fake_ns/$f"
+    done
+    apply_remedies 1
+    for f in $ns_files run/minimal usr/local/lib/minimal; do
+        want_err "the printed remedy removes $f" test -e "$fake_ns/$f"
+    done
+    want_ok "the remedy stops the service" \
+        grep -qx "systemctl disable --now minzoned.socket minzoned.service" "$remedy_calls"
+    want_ok "the remedy deletes the link" grep -qx "ip link del minzone0" "$remedy_calls"
+    check "resolvectl revert minzone0" \
+        "$(grep -E '^(resolvectl|ip) ' "$remedy_calls" | head -n 1)" \
+        "the link's DNS configuration is reverted before the link is deleted"
+
+    # The same on macOS, where the channel's path has a space in it.
+    HNSD="$root/hns_darwin"; mkdir -p "$HNSD"
+    PLAT_S=Darwin; PLAT_M=arm64
+    run nsd_seed "$HNSD"
+    check 0 "$rc" "darwin: uninstall-net-setup seed install exits 0"
+    fake_nsd="$root/fake net root-d \$HOME"
+    for f in etc/resolver/min.internal Library/LaunchDaemons/dev.gominimal.zone.plist \
+        Library/PrivilegedHelperTools/Minimal.app/Contents/MacOS/minzoned \
+        Library/PrivilegedHelperTools/Minimal.app/Contents/Info.plist \
+        Library/PrivilegedHelperTools/Minimal.app.old/Contents/MacOS/minzoned \
+        Library/PrivilegedHelperTools/minzoned Library/LaunchDaemons/dev.minimal.local-range.plist \
+        Library/PrivilegedHelperTools/dev.minimal.local-range \
+        "Library/Application Support/minimal/run/answerer.sock"; do
+        mkdir -p "$fake_nsd/$(dirname "$f")"
+        printf 'unit\n' >"$fake_nsd/$f"
+    done
+    FINALIZE_INSTALL_ROOT="$fake_nsd"
+    run nsd_run "$HNSD" --uninstall
+    FINALIZE_INSTALL_ROOT=
+    PLAT_S=Linux; PLAT_M=x86_64
+    check 0 "$rc" "darwin: uninstall with the host DNS setup present exits 0"
+    want_ok "darwin: uninstall advises the host DNS setup is still installed" \
+        grep -q "still installed on this host.*host DNS setup" "$OUT"
+    want_ok "darwin: non-interactive uninstall never elevates (resolver file survives)" \
+        test -f "$fake_nsd/etc/resolver/min.internal"
+    apply_remedies 1
+    for f in etc/resolver/min.internal Library/LaunchDaemons/dev.gominimal.zone.plist \
+        Library/PrivilegedHelperTools/Minimal.app Library/PrivilegedHelperTools/Minimal.app.old \
+        Library/PrivilegedHelperTools/minzoned Library/LaunchDaemons/dev.minimal.local-range.plist \
+        Library/PrivilegedHelperTools/dev.minimal.local-range \
+        "Library/Application Support/minimal"; do
+        want_err "darwin: the printed remedy removes $f" test -e "$fake_nsd/$f"
+    done
+    for f in Library/LaunchDaemons Library/PrivilegedHelperTools "Library/Application Support"; do
+        want_ok "darwin: the system directory $f stays" test -d "$fake_nsd/$f"
+    done
+    for job in dev.gominimal.zone dev.minimal.local-range; do
+        want_ok "darwin: the remedy boots out $job" \
+            grep -qx "launchctl bootout system/$job" "$remedy_calls"
+    done
+
+    HNS2="$root/hns2"; mkdir -p "$HNS2"
+    run ns2_seed "$HNS2"
+    run ns2_run "$HNS2" --uninstall
+    check 0 "$rc" "uninstall on a host without the setup exits 0"
+    want_err "a host that never ran min finalize-install sees no advisory" \
+        grep -q "min finalize-install" "$OUT"
+
+    # The user-namespace profile with the step's record: offered to --undo, with
+    # the record in the manual remedy.
+    HNS3="$root/hns3"; mkdir -p "$HNS3"
+    run ns3_seed "$HNS3"
+    fake_aa3="$root/fake apparmor.d-3 \$HOME"; mkdir -p "$fake_aa3/tunables/minimald.d"
+    printf 'profile\n' >"$fake_aa3/minimald"
+    printf 'tunable\n' >"$fake_aa3/tunables/minimald"
+    printf 'local\n' >"$fake_aa3/tunables/minimald.d/local"
+    fake_ns3="$root/fake-net-setup-root-3"
+    mkdir -p "$fake_ns3/var/lib/minimal"
+    : >"$fake_ns3/var/lib/minimal/finalize-install-apparmor-profile"
+    APPARMOR_DIR="$fake_aa3"; FINALIZE_INSTALL_ROOT="$fake_ns3"
+    run ns3_run "$HNS3" --uninstall
+    APPARMOR_DIR=; FINALIZE_INSTALL_ROOT=
+    check 0 "$rc" "uninstall with a recorded profile exits 0"
+    want_ok "a recorded profile is advised as min finalize-install's" \
+        grep -q "still installed on this host.*user-namespace profile" "$OUT"
+    want_ok "a recorded profile points at min finalize-install --undo" \
+        grep -q "min finalize-install --undo" "$OUT"
+    want_ok "the recorded profile survives a non-interactive uninstall" \
+        test -f "$fake_aa3/minimald"
+    apply_remedies 1
+    for f in minimald tunables/minimald tunables/minimald.d; do
+        want_err "the printed remedy removes the profile's $f" test -e "$fake_aa3/$f"
+    done
+    want_ok "the remedy leaves the host's own tunables directory" test -d "$fake_aa3/tunables"
+    want_err "the printed remedy removes the step's record" \
+        test -e "$fake_ns3/var/lib/minimal/finalize-install-apparmor-profile"
+    want_ok "the remedy unloads the profile" \
+        grep -qxF "apparmor_parser -R $fake_aa3/minimald" "$remedy_calls"
+
+    # The classifier tree, by the step's record, with the units that rebuild it
+    # at boot: the units' line comes first, so the boot unit is disabled before
+    # the tree goes.
+    HNS4="$root/hns4"; mkdir -p "$HNS4"
+    run ns4_seed "$HNS4"
+    fake_ns4="$root/fake net root-4 \$HOME"
+    cls_tree="sys/fs/cgroup/minimald.slice"
+    cls_files="etc/systemd/system/minimald-classifier.service etc/systemd/system/minimald-place.path etc/systemd/system/minimald-place.service usr/local/lib/minimal/install-host-classifier.sh usr/local/lib/minimal/quic443-leaf etc/sudoers.d/minimal-quic443-leaf var/lib/minimal/finalize-install-classifier"
+    mkdir -p "$fake_ns4/$cls_tree/classifier-table" "$fake_ns4/$cls_tree/daemon" \
+        "$fake_ns4/$cls_tree/boxes/allow" "$fake_ns4/$cls_tree/boxes/deny"
+    for f in $cls_files; do
+        mkdir -p "$fake_ns4/$(dirname "$f")"
+        printf 'unit\n' >"$fake_ns4/$f"
+    done
+    FINALIZE_INSTALL_ROOT="$fake_ns4"
+    run ns4_run "$HNS4" --uninstall
+    FINALIZE_INSTALL_ROOT=
+    check 0 "$rc" "uninstall with the classifier tree exits 0"
+    want_ok "the classifier units are advised" \
+        grep -q "still installed on this host.*classifier units" "$OUT"
+    want_ok "the classifier tree is advised" \
+        grep -q "still installed on this host.*classifier tree" "$OUT"
+    want_ok "the QUIC block helper is advised as its own item" \
+        grep -q "still installed on this host.*the QUIC block helper and its sudoers rule" "$OUT"
+    want_ok "non-interactive uninstall never elevates (the tree survives)" \
+        test -d "$fake_ns4/$cls_tree/classifier-table"
+    apply_remedies 3
+    for f in $cls_files "$cls_tree" usr/local/lib/minimal; do
+        want_err "the printed remedies remove $f" test -e "$fake_ns4/$f"
+    done
+    check "systemctl disable --now minimald-classifier.service minimald-place.path minimald-place.service" \
+        "$(head -n 1 "$remedy_calls")" "the boot unit is disabled before anything is removed"
+    want_ok "the remedy removes the classifier table" \
+        grep -qx "nft delete table inet minimal_class" "$remedy_calls"
+
+    # A tree without the step's record was installed another way: it is not
+    # the step's to remove, so nothing advises removing it.
+    HNS4B="$root/hns4b"; mkdir -p "$HNS4B"
+    run ns4b_seed "$HNS4B"
+    fake_ns4b="$root/fake-net-setup-root-4b"
+    mkdir -p "$fake_ns4b/$cls_tree/classifier-table"
+    FINALIZE_INSTALL_ROOT="$fake_ns4b"
+    run ns4b_run "$HNS4B" --uninstall
+    FINALIZE_INSTALL_ROOT=
+    check 0 "$rc" "uninstall with an unrecorded classifier tree exits 0"
+    want_err "an unrecorded classifier tree is not advised for removal" \
+        grep -q "classifier tree" "$OUT"
+    apply_remedies 0
+    want_ok "an unrecorded classifier tree stays" test -d "$fake_ns4b/$cls_tree/classifier-table"
+
+    # A tree something still holds stays, and so does its record: the record
+    # goes only once the tree has. The remedy's failure is counted here and
+    # then taken back out of the tally.
+    HNS4C="$root/hns4c"; mkdir -p "$HNS4C"
+    run ns4c_seed "$HNS4C"
+    fake_ns4c="$root/fake-net-setup-root-4c"
+    mkdir -p "$fake_ns4c/$cls_tree/daemon" "$fake_ns4c/var/lib/minimal"
+    printf 'held\n' >"$fake_ns4c/$cls_tree/daemon/held"
+    : >"$fake_ns4c/var/lib/minimal/finalize-install-classifier"
+    FINALIZE_INSTALL_ROOT="$fake_ns4c"
+    run ns4c_run "$HNS4C" --uninstall
+    FINALIZE_INSTALL_ROOT=
+    _h_pass=$pass; _h_fail=$fail
+    apply_remedies 0 >/dev/null 2>&1
+    _h_failed=$((fail - _h_fail))
+    pass=$_h_pass; fail=$_h_fail
+    check 1 "$_h_failed" "the tree's remedy fails while the tree is held"
+    want_ok "a held tree keeps its record" \
+        test -f "$fake_ns4c/var/lib/minimal/finalize-install-classifier"
+
+    # The QUIC block helper and its sudoers rule, on their own: they are found,
+    # named in the list, and the printed remedy removes both.
+    HNS4D="$root/hns4d"; mkdir -p "$HNS4D"
+    run ns4d_seed "$HNS4D"
+    fake_ns4d="$root/fake net root-4d \$HOME"
+    qb_files="usr/local/lib/minimal/quic443-leaf etc/sudoers.d/minimal-quic443-leaf"
+    for f in $qb_files; do
+        mkdir -p "$fake_ns4d/$(dirname "$f")"
+        printf 'helper\n' >"$fake_ns4d/$f"
+    done
+    FINALIZE_INSTALL_ROOT="$fake_ns4d"
+    run ns4d_run "$HNS4D" --uninstall
+    FINALIZE_INSTALL_ROOT=
+    check 0 "$rc" "uninstall with only the QUIC block helper exits 0"
+    want_ok "the uninstall names the QUIC block helper and its sudoers rule" \
+        grep -q "still installed on this host.*the QUIC block helper and its sudoers rule (/usr/local/lib/minimal/quic443-leaf)" "$OUT"
+    want_err "the QUIC block helper is not called a classifier unit" \
+        grep -q "classifier units" "$OUT"
+    want_ok "non-interactive uninstall never elevates (the helper survives)" \
+        test -f "$fake_ns4d/usr/local/lib/minimal/quic443-leaf"
+    apply_remedies 1
+    for f in $qb_files; do
+        want_err "the printed remedy removes $f" test -e "$fake_ns4d/$f"
+    done
+
+    # The kvm group membership, by its record.
+    HNS5="$root/hns5"; mkdir -p "$HNS5"
+    run ns5_seed "$HNS5"
+    fake_ns5="$root/fake net root-5 \$HOME"
+    mkdir -p "$fake_ns5/var/lib/minimal"
+    printf 'alice\n' >"$fake_ns5/var/lib/minimal/finalize-install-kvm-group"
+    FINALIZE_INSTALL_ROOT="$fake_ns5"
+    run ns5_run "$HNS5" --uninstall
+    FINALIZE_INSTALL_ROOT=
+    check 0 "$rc" "uninstall with the kvm record exits 0"
+    want_ok "the kvm membership is advised" \
+        grep -q "still installed on this host.*kvm group membership" "$OUT"
+    want_ok "non-interactive uninstall never elevates (the record survives)" \
+        test -f "$fake_ns5/var/lib/minimal/finalize-install-kvm-group"
+    apply_remedies 1
+    want_err "the printed remedy removes the kvm record" \
+        test -e "$fake_ns5/var/lib/minimal/finalize-install-kvm-group"
+    want_ok "the remedy takes the recorded membership back" \
+        grep -qx "gpasswd -d alice kvm" "$remedy_calls"
+
+    # Everything at once, an unrecorded profile included: one advisory, one list.
+    HNS6="$root/hns6"; mkdir -p "$HNS6"
+    run ns6_seed "$HNS6"
+    fake_aa6="$root/fake-apparmor.d-6"; mkdir -p "$fake_aa6/tunables"
+    printf 'profile\n' >"$fake_aa6/minimald"
+    fake_ns6="$root/fake-net-setup-root-6"
+    mkdir -p "$fake_ns6/$cls_tree/classifier-table"
+    all_files="$ns_files $cls_files var/lib/minimal/finalize-install-kvm-group"
+    for f in $all_files; do
+        mkdir -p "$fake_ns6/$(dirname "$f")"
+        printf 'alice\n' >"$fake_ns6/$f"
+    done
+    APPARMOR_DIR="$fake_aa6"; FINALIZE_INSTALL_ROOT="$fake_ns6"
+    run ns6_run "$HNS6" --uninstall
+    APPARMOR_DIR=; FINALIZE_INSTALL_ROOT=
+    check 0 "$rc" "uninstall with every artifact exits 0"
+    check 1 "$(grep -c "still installed on this host" "$OUT")" "one advisory covers everything found"
+    for item in "host DNS setup" "system AppArmor profile" "classifier units" "classifier tree" "kvm group membership"; do
+        want_ok "the one advisory lists: $item" grep -q "still installed on this host.*$item" "$OUT"
+    done
+    for f in $all_files "$cls_tree/classifier-table"; do
+        want_ok "non-interactive uninstall leaves $f in place" test -e "$fake_ns6/$f"
+    done
+    want_ok "non-interactive uninstall leaves the system profile in place" \
+        test -f "$fake_aa6/minimald"
+    apply_remedies 6
+    for f in $all_files "$cls_tree" usr/local/lib/minimal run/minimal; do
+        want_err "the printed remedies remove $f" test -e "$fake_ns6/$f"
+    done
+    want_err "the printed remedies remove the system profile" \
+        test -e "$fake_aa6/minimald"
+}
+
+# --- The finalize-install offer (NET-122) -------------------------------------
+# At the end of an install the installer runs the just-installed `min`'s probe
+# once (`finalize-install --show --script`: the summary on stderr, the script
+# on stdout only while some item is missing) and, while something is missing,
+# shows the summary and offers the step. The stub `min` the mock bucket ships
+# answers from files under the home (see write_min_stub) and records every
+# invocation in $HOME/finalize.calls, so each case asserts what ran and with
+# which arguments. The probe is the first `finalize-install` call every run
+# makes, so the calls file is the whole story of a run.
+
+fi_probe="finalize-install --show --script"
+fi_prompt="Finish setup now? This runs one sudo command. [Y/n]"
+fi_status="install status on this machine"
+# The real command's closing lines (finalize_install.rs PICKED_UP, NEEDS_LOGIN).
+fi_picked_up="Running boxes pick this up on their next start."
+fi_needs_login="KVM group membership starts at your next login: log out and back in, or restart the daemon from a new login."
+
+# The harness bindir is never on the installer's PATH unless BIN_ON_PATH says
+# so, so every printed command names the installed `min` by its quoted path:
+# fi_min <home> is that spelling, fi_pointer <home> the file route built on it.
+fi_min()     { printf '"%s/bin/min"' "$1"; }
+# shellcheck disable=SC2016 # the line is printed for the user to run, not expanded here
+fi_pointer() { printf 'f=$(mktemp) && %s finalize-install --show --script > "$f" && sudo sh "$f"' "$(fi_min "$1")"; }
+# The file route's tail, the one fragment every spelling of it shares.
+# shellcheck disable=SC2016 # printed, not expanded
+fi_route='sudo sh "$f"'
+
+# fi_summary <home> [label] — mark <home>'s stub as a host with a missing item,
+# with the summary the real command prints for one: a ✗ line and its facts.
+fi_summary() {
+    printf '%s:\n  ✗ %s\n      today: %s\n      this step: %s\n' "$fi_status" \
+        "${2:-the private sandbox every box runs in}" \
+        "no box can start on this machine" \
+        "installs a profile for minimald alone" >"$1/finalize.summary"
+}
+
+case_installer_offers_finalize_install_on_a_tty() {
+    # On a terminal, a host that lacks a step sees the summary and the offer,
+    # and Enter — the default — runs `min finalize-install` once, with no
+    # arguments. The run prints the summary again on its stdout before it
+    # elevates, then its closing lines (the stub does too); the installer
+    # shows only the lines the probe's summary did not, so the status block
+    # appears exactly once and the closing lines reach the operator. The
+    # probe's own warnings are not the summary and never reach the output.
+    HF1="$root/hf1"; mkdir -p "$HF1"
+    fi_summary "$HF1"
+    printf '%s\n' "$fi_picked_up" "$fi_needs_login" >"$HF1/finalize.closing"
+    printf '\n' >"$root/tty-enter"
+    TTY_FILE="$root/tty-enter"
+    run fi_enter "$HF1"
+    TTY_FILE=
+    check 0 "$rc" "an install that offers the step exits 0"
+    want_ok "the --show summary is shown before the question" grep -q "$fi_status" "$OUT"
+    want_ok "the missing item is shown as the real command prints it" \
+        grep -q "✗ the private sandbox every box runs in" "$OUT"
+    check 1 "$(grep -c "$fi_status" "$OUT")" "the summary appears once, not again from the run"
+    check 1 "$(grep -cF "$fi_picked_up" "$OUT")" "the run's closing line is shown, once"
+    check 1 "$(grep -cF "$fi_needs_login" "$OUT")" "a kvm group join's next-login line is shown, once"
+    want_err "the probe's warnings are not shown" grep -q "skipping VM" "$OUT"
+    want_ok "the offer names what a yes costs" grep -qF "$fi_prompt" "$OUT"
+    check "$fi_probe
+finalize-install" "$(cat "$HF1/finalize.calls")" \
+        "the probe runs once and Enter runs the step once, with no arguments"
+    want_err "no pointer when the step ran" grep -qF "when you're ready" "$OUT"
+    want_card_last "the card follows the offer (R10.4)"
+
+    # An explicit yes is the same as Enter.
+    HF2="$root/hf2"; mkdir -p "$HF2"
+    fi_summary "$HF2"
+    printf 'y\n' >"$root/tty-y"
+    TTY_FILE="$root/tty-y"
+    run fi_yes "$HF2"
+    TTY_FILE=
+    check 0 "$rc" "a confirmed offer exits 0"
+    want_ok "y runs the step" grep -qx "finalize-install" "$HF2/finalize.calls"
+
+    # macOS is a first-class host: every daemon there is VM-backed, and the
+    # probe reports the names item (resolver link, answerer unit, reserved
+    # range). The offer works the same way.
+    HF3="$root/hf3"; mkdir -p "$HF3"
+    fi_summary "$HF3" "DNS names for boxes (<box>.min.internal) in every program on this machine"
+    PLAT_S=Darwin; PLAT_M=arm64
+    TTY_FILE="$root/tty-enter"
+    run fi_darwin "$HF3"
+    TTY_FILE=
+    PLAT_S=Linux; PLAT_M=x86_64
+    check 0 "$rc" "darwin: an install that offers the step exits 0"
+    want_ok "darwin: the names item is shown" \
+        grep -qF "✗ DNS names for boxes (<box>.min.internal) in every program on this machine" "$OUT"
+    want_ok "darwin: the offer is made" grep -qF "$fi_prompt" "$OUT"
+    want_ok "darwin: Enter runs the step" grep -qx "finalize-install" "$HF3/finalize.calls"
+
+    # A step that fails is reported with a retry pointer that names the
+    # installed `min` by path (the bin dir is not on PATH in this shell yet),
+    # and the installer still exits 0: Minimal is installed either way.
+    HF4="$root/hf4"; mkdir -p "$HF4"
+    fi_summary "$HF4"
+    printf '1\n' >"$HF4/finalize.run.status"
+    TTY_FILE="$root/tty-enter"
+    run fi_failed "$HF4"
+    TTY_FILE=
+    check 0 "$rc" "a failed step does not fail the install"
+    want_ok "a failed step is shown as ✗" grep -q "✗ setup did not finish" "$OUT"
+    want_ok "the run's own error reaches the operator" \
+        grep -qF "the script exited with status 1" "$OUT"
+    want_err "the run's repeated warnings do not" grep -q "skipping VM" "$OUT"
+    want_ok "a failed step points at the retry by path" \
+        grep -qF "retry with \`$(fi_min "$HF4") finalize-install\`" "$OUT"
+    want_card_last "the card follows a failed step (R10.4)"
+}
+
+case_installer_prints_the_pointer_when_declined_or_without_tty() {
+    # Declining leaves the host as it is and prints the pointer: the spec's
+    # line and, under it, the file route for a caller without a terminal,
+    # both naming the installed `min` by path since the bin dir is not on
+    # PATH in this shell yet.
+    HF5="$root/hf5"; mkdir -p "$HF5"
+    fi_summary "$HF5"
+    printf 'n\n' >"$root/tty-n"
+    TTY_FILE="$root/tty-n"
+    run fi_declined "$HF5"
+    TTY_FILE=
+    check 0 "$rc" "a declined offer exits 0"
+    want_ok "the offer was made" grep -qF "$fi_prompt" "$OUT"
+    want_ok "declining prints the spec's pointer text, naming min by path" \
+        grep -qF "run \`$(fi_min "$HF5") finalize-install\` when you're ready" "$OUT"
+    want_ok "declining prints the file route, exactly, on its own line" \
+        grep -qxF "$(fi_pointer "$HF5")" "$OUT"
+    check "$fi_probe" "$(cat "$HF5/finalize.calls")" "declining runs nothing but the probe"
+    want_card_last "the card follows the pointer (R10.4)"
+
+    # No terminal to ask on (`curl … | sh` in CI, a non-interactive shell):
+    # the summary and the pointer, no question, no wait.
+    HF6="$root/hf6"; mkdir -p "$HF6"
+    fi_summary "$HF6"
+    run fi_notty "$HF6"
+    check 0 "$rc" "an install without a terminal exits 0"
+    want_ok "without a terminal the summary is still shown" grep -q "$fi_status" "$OUT"
+    want_err "nothing is asked without a terminal" grep -qF "Finish setup now?" "$OUT"
+    want_ok "without a terminal the spec's pointer text is printed" \
+        grep -qF "run \`$(fi_min "$HF6") finalize-install\` when you're ready" "$OUT"
+    want_ok "without a terminal the file route is printed, exactly" \
+        grep -qxF "$(fi_pointer "$HF6")" "$OUT"
+    check 1 "$(grep -cF "$fi_route" "$OUT")" "the pointer is printed once"
+    check "$fi_probe" "$(cat "$HF6/finalize.calls")" "without a terminal nothing but the probe runs"
+    want_card_last "the card follows the pointer without a terminal (R10.4)"
+
+    # Once the bin dir is on PATH (a rerun from a shell the rc hook reached),
+    # the printed commands say `min` bare, as the spec writes them.
+    HF6B="$root/hf6b"; mkdir -p "$HF6B"
+    fi_summary "$HF6B"
+    BIN_ON_PATH=1
+    run fi_notty_onpath "$HF6B"
+    BIN_ON_PATH=
+    want_ok "with the bin dir on PATH the spec's pointer text names min bare" \
+        grep -qF "run \`min finalize-install\` when you're ready" "$OUT"
+    # shellcheck disable=SC2016 # the line is printed for the user to run, not expanded here
+    want_ok "with the bin dir on PATH the file route names min bare" \
+        grep -qxF 'f=$(mktemp) && min finalize-install --show --script > "$f" && sudo sh "$f"' "$OUT"
+}
+
+case_installer_does_not_prompt_on_a_finished_host() {
+    # A host that needs nothing completes without the offer, the summary or
+    # the pointer: the receipt and the card, as before. Even with a terminal
+    # to ask on.
+    HF7="$root/hf7"; mkdir -p "$HF7"
+    TTY_FILE="$root/tty-enter"
+    run fi_finished "$HF7"
+    TTY_FILE=
+    check 0 "$rc" "a finished host exits 0"
+    want_err "a finished host is not asked" grep -qF "Finish setup now?" "$OUT"
+    want_err "a finished host sees no summary" grep -q "$fi_status" "$OUT"
+    want_err "a finished host sees no pointer" grep -qF "when you're ready" "$OUT"
+    check "$fi_probe" "$(cat "$HF7/finalize.calls")" "a finished host runs only the probe"
+    want_card_last "the card is the parting block on a finished host (R10.4)"
+
+    # A host whose only open item waits on a daemon (the names item, on every
+    # fresh install) has nothing the step can run yet: the summary — the line
+    # the real command renders for a waiting item — and when to come back, but
+    # no question and no pointer to a step that would run nothing, even with a
+    # terminal.
+    HF8="$root/hf8"; mkdir -p "$HF8"
+    printf '%s:\n  ✓ the private sandbox every box runs in\n  ✗ DNS names for boxes (<box>.min.internal) in every program on this machine — waiting on a daemon (no daemon is reachable to report the port its DNS service listens on)\n' \
+        "$fi_status" >"$HF8/finalize.waiting"
+    TTY_FILE="$root/tty-enter"
+    run fi_waiting "$HF8"
+    TTY_FILE=
+    check 0 "$rc" "a waiting host exits 0"
+    want_ok "a waiting host sees the real waiting line" \
+        grep -qF "✗ DNS names for boxes (<box>.min.internal) in every program on this machine — waiting on a daemon" "$OUT"
+    want_err "a waiting host is not asked" grep -qF "Finish setup now?" "$OUT"
+    want_err "a waiting host gets no pointer" grep -qF "$fi_route" "$OUT"
+    want_ok "a waiting host is told when to come back" \
+        grep -qF "after your first \`min\`, run \`$(fi_min "$HF8") finalize-install\`" "$OUT"
+    check "$fi_probe" "$(cat "$HF8/finalize.calls")" "a waiting host runs only the probe"
+    want_card_last "the card follows the waiting note (R10.4)"
+
+    # A host whose only open item no script can fix (`cannot`) sees the
+    # summary, which names the cause, and nothing else: no question, no
+    # pointer, no come-back note.
+    HF8C="$root/hf8c"; mkdir -p "$HF8C"
+    printf '%s:\n  ✓ DNS names for boxes (<box>.min.internal) in every program on this machine\ncan'"'"'t do on this machine:\n  ✗ the private sandbox every box runs in — user namespaces are disabled on this machine (user.max_user_namespaces is 0 or missing), and no profile can turn them on\n' \
+        "$fi_status" >"$HF8C/finalize.cannot"
+    TTY_FILE="$root/tty-enter"
+    run fi_cannot "$HF8C"
+    TTY_FILE=
+    check 0 "$rc" "a cannot-only host exits 0"
+    want_ok "a cannot-only host sees the cause" grep -qF "can't do on this machine:" "$OUT"
+    want_err "a cannot-only host is not asked" grep -qF "Finish setup now?" "$OUT"
+    want_err "a cannot-only host gets no pointer" grep -qF "finalize-install" "$OUT"
+    check "$fi_probe" "$(cat "$HF8C/finalize.calls")" "a cannot-only host runs only the probe"
+
+    # A `min` that cannot answer the probe (too old to know the command) adds
+    # nothing either: the installer stays silent rather than guess.
+    HF9="$root/hf9"; mkdir -p "$HF9"
+    fi_summary "$HF9"
+    printf '2\n' >"$HF9/finalize.show.status"
+    run fi_oldmin "$HF9"
+    check 0 "$rc" "a min that cannot probe does not fail the install"
+    want_err "a failed probe asks nothing" grep -qF "Finish setup now?" "$OUT"
+    want_err "a failed probe prints no pointer" grep -qF "$fi_route" "$OUT"
+    want_err "a failed probe's stderr is hidden" grep -q "unrecognized subcommand" "$OUT"
+    check "$fi_probe" "$(cat "$HF9/finalize.calls")" "a failed probe is the run's only call"
 }
 
 case_checksum_mismatch() {
@@ -775,10 +1507,12 @@ case_daemon_stop() {
     check 0 "$rc" "up-to-date rerun exits 0"
     want_err "up-to-date rerun stops no daemon (R5.5)" test -e "$H8/stop.calls"
 
-    # An upgrade (two components stale) stops the daemon exactly once, before the
-    # swap, via the min that is on disk now — an older build than the manifest's,
-    # still runnable, still able to reach the daemon it started. With no sessions
-    # running the graceful stop succeeds, so nothing is forced and nothing is asked.
+    # An upgrade (two components stale) stops the daemon before the swap via the
+    # min that is on disk now — an older build than the manifest's, still
+    # runnable, still able to reach the daemon it started. With no sessions
+    # running the graceful stop succeeds, so nothing is forced and nothing is
+    # asked. No daemon answers the post-swap version probe here, so the
+    # graceful stop is the only one.
     printf 'stale\n' >"$H8/bin/minimald"
     write_min_stub "$H8/bin/min" "previous release"
     run daemonupgrade "$H8"
@@ -909,6 +1643,168 @@ EOF
     check 0 "$rc" "target plus --force-stop exits 0 (R5.5/R2.1)"
     want_ok "the target survives the option filter (R2.1)" grep -q "target 'unstable'" "$OUT"
     want_ok "the trailing flag still force-stops (R5.5)" grep -qx "stop --force" "$HL6/stop.calls"
+
+    # A daemon respawned mid-run serves the old version from the replaced
+    # binaries: the stop above happened before the first swap, and an attached
+    # client autospawns a replacement daemon within that window. The installer
+    # must stop again once every swap is done, so the daemon the run leaves —
+    # if any — is the one it just installed. The respawned daemon holds no
+    # live sessions of its own, so the closing stop is a --force one, already
+    # consented to by the pre-swap answer. A client that reconnects after the
+    # last stop respawns the daemon from the NEW binaries, which is the
+    # version the run just installed — the acceptable end state.
+    HL7="$root/hl7"; mkdir -p "$HL7"
+    stage_live_upgrade "$HL7" livereconnect
+    printf 'stale\n' >"$HL7/daemon.running"
+    : >"$HL7/daemon.reconnect"
+    printf 'y\n' >"$root/tty-yes7"
+    TTY_FILE="$root/tty-yes7"
+    run livereconnect "$HL7"
+    TTY_FILE=
+    check 0 "$rc" "an upgrade with a respawning client exits 0 (R5.5)"
+    check "stop
+stop --force
+stop --force" "$(cat "$HL7/stop.calls")" \
+        "graceful stop, consented force stop, then the closing force stop (R5.5)"
+    check "$h_minimald" "$(hash_file "$HL7/daemon.running")" \
+        "the daemon the run leaves is the one just installed (R5.5)"
+    check "$h_minimald" "$(hash_file "$HL7/bin/minimald")" "the upgrade still completes (R5.5)"
+
+    # A session opened in the respawned daemon while the run is still going
+    # (a `min new`, an unattended job) is never ended unasked. Without
+    # --force-stop or a yes on the terminal, the closing stop is graceful.
+    # Refused for live sessions, it asks; with no terminal to ask on, it
+    # leaves the old-build daemon running and tells the user how to stop it,
+    # and the upgrade itself still succeeds.
+    HL8="$root/hl8"; mkdir -p "$HL8"
+    stage_live_upgrade "$HL8" liverespawnsession
+    rm -f "$HL8/sessions.live"
+    printf 'stale\n' >"$HL8/daemon.running"
+    : >"$HL8/daemon.reconnect"
+    : >"$HL8/respawn.sessions"
+    run liverespawnsession "$HL8"
+    check 0 "$rc" "an upgrade with a session opened mid-run exits 0 (R5.5)"
+    check "stop
+stop" "$(cat "$HL8/stop.calls")" \
+        "graceful stop before the swap, graceful closing stop, no --force (R5.5)"
+    want_ok "the session opened mid-run survives (R5.5)" test -f "$HL8/sessions.live"
+    want_ok "the user is told how to stop the old daemon (R5.5)" \
+        grep -q "min stop --force" "$OUT"
+    want_ok "with no terminal, the closing stop says it cannot ask (R5.5)" \
+        grep -q "there is no terminal to confirm on" "$OUT"
+    want_err "the no-terminal closing stop does not suggest a rerun (R5.5)" \
+        grep -q "rerun with --force-stop" "$OUT"
+    check "$h_minimald" "$(hash_file "$HL8/bin/minimald")" "the upgrade still completes (R5.5)"
+
+    # The same mid-run session with a yes on the terminal: the closing stop
+    # asks, and only then forces the stop.
+    HL8Y="$root/hl8y"; mkdir -p "$HL8Y"
+    stage_live_upgrade "$HL8Y" liverespawnyes
+    rm -f "$HL8Y/sessions.live"
+    printf 'stale\n' >"$HL8Y/daemon.running"
+    : >"$HL8Y/daemon.reconnect"
+    : >"$HL8Y/respawn.sessions"
+    printf 'y\n' >"$root/tty-yes8"
+    TTY_FILE="$root/tty-yes8"
+    run liverespawnyes "$HL8Y"
+    TTY_FILE=
+    check 0 "$rc" "an upgrade that ends a mid-run session on a yes exits 0 (R5.5)"
+    want_ok "the closing stop asks before forcing (R5.5)" grep -q "Continue?" "$OUT"
+    check "stop
+stop
+stop --force" "$(cat "$HL8Y/stop.calls")" \
+        "graceful stop, graceful closing stop, then the consented force stop (R5.5)"
+
+    # The same yes, but the forced closing stop fails: the run does not leave
+    # the "stopping a daemon" line looking like success. It says the old
+    # daemon may still be running and names the command to stop it.
+    HL8F="$root/hl8f"; mkdir -p "$HL8F"
+    stage_live_upgrade "$HL8F" liverespawnforcefail
+    rm -f "$HL8F/sessions.live"
+    printf 'stale\n' >"$HL8F/daemon.running"
+    : >"$HL8F/daemon.reconnect"
+    : >"$HL8F/respawn.sessions"
+    : >"$HL8F/stopforce.fail"
+    TTY_FILE="$root/tty-yes8"
+    run liverespawnforcefail "$HL8F"
+    TTY_FILE=
+    check 0 "$rc" "an upgrade whose closing force stop fails still exits 0 (R5.5)"
+    check "stop
+stop
+stop --force" "$(cat "$HL8F/stop.calls")" \
+        "the closing stop asks, then tries the force stop once (R5.5)"
+    want_ok "a failed closing force stop is reported (R5.5)" \
+        grep -q "the daemon on build old may still be running; run 'min stop --force'" "$OUT"
+
+    # A yes to the pre-swap question covers only the sessions it listed. A
+    # session the client opens in the respawned daemon after that yes is one
+    # the user never saw, so the closing stop does not force it on the old
+    # answer: it stops gracefully, and when that is refused it asks again.
+    HL10="$root/hl10"; mkdir -p "$HL10"
+    stage_live_upgrade "$HL10" livenewsessionyes
+    printf 'stale\n' >"$HL10/daemon.running"
+    : >"$HL10/daemon.reconnect"
+    printf 'session-beta\n' >"$HL10/respawn.sessions"
+    printf 'y\n' >"$root/tty-yes10"
+    TTY_FILE="$root/tty-yes10"
+    run livenewsessionyes "$HL10"
+    TTY_FILE=
+    check 0 "$rc" "an upgrade with a session opened after the pre-swap yes exits 0 (R5.5)"
+    check 2 "$(grep -c "Continue?" "$OUT")" \
+        "a session opened after the pre-swap yes is asked about again (R5.5)"
+    check "stop
+stop --force
+stop
+stop --force" "$(cat "$HL10/stop.calls")" \
+        "the closing stop is graceful first, then forced on the second yes (R5.5)"
+    check "$h_minimald" "$(hash_file "$HL10/daemon.running")" \
+        "the daemon the run leaves is the one just installed (R5.5)"
+
+    # The same session, but the terminal is gone after the pre-swap yes: the
+    # closing stop never forces it. The session survives, and the user is
+    # told how to stop the old-build daemon.
+    HL11="$root/hl11"; mkdir -p "$HL11"
+    stage_live_upgrade "$HL11" livenewsessionnotty
+    printf 'stale\n' >"$HL11/daemon.running"
+    : >"$HL11/daemon.reconnect"
+    printf 'session-beta\n' >"$HL11/respawn.sessions"
+    printf 'y\n' >"$root/tty-yes11"
+    printf '%s\n' "$root/tty-yes11" >"$HL11/respawn.notty"
+    TTY_FILE="$root/tty-yes11"
+    run livenewsessionnotty "$HL11"
+    TTY_FILE=
+    check 0 "$rc" "an upgrade that cannot ask about a new session exits 0 (R5.5)"
+    check "stop
+stop --force
+stop" "$(cat "$HL11/stop.calls")" \
+        "the pre-swap yes does not force the closing stop over a new session (R5.5)"
+    want_ok "the session opened after the yes survives (R5.5)" test -f "$HL11/sessions.live"
+    want_ok "the user is told how to stop the old daemon (R5.5)" \
+        grep -q "min stop --force" "$OUT"
+    check "$h_minimald" "$(hash_file "$HL11/bin/minimald")" "the upgrade still completes (R5.5)"
+
+    # A download that fails after the first swap still runs the closing stop,
+    # from the EXIT trap, so the daemon a client respawned from the
+    # half-replaced binaries does not outlive the failed run.
+    # minimald is swapped first (the pre-swap stop runs there and the client
+    # respawns from the old minimald), then minvmd fails its checksum.
+    HL9="$root/hl9"; mkdir -p "$HL9"
+    stage_live_upgrade "$HL9" livediemidrun
+    rm -f "$HL9/sessions.live"
+    printf 'stale\n' >"$HL9/bin/minvmd"
+    printf 'stale\n' >"$HL9/daemon.running"
+    : >"$HL9/daemon.reconnect"
+    awk '$1=="minvmd" && $2=="linux" {$5="deadbeef"} {print}' "$root/good-components" \
+        >"$mock/versions/v1/components"
+    run livediemidrun "$HL9"
+    cp "$root/good-components" "$mock/versions/v1/components"   # restore
+    check 1 "$rc" "a checksum failure after the first swap exits non-zero (R5.3)"
+    want_ok "the failure is named" grep -q "checksum mismatch for minvmd" "$OUT"
+    check "stop
+stop" "$(cat "$HL9/stop.calls")" \
+        "the failed run still takes the closing stop (R5.5)"
+    check "$h_minimald" "$(hash_file "$HL9/daemon.running")" \
+        "the daemon the failed run leaves serves the minimald it installed (R5.5)"
 }
 
 case_shell_integration() {
@@ -1377,6 +2273,148 @@ case_uninstall() {
     want_ok "dump kept when no zsh completions were installed (R9.4)" \
         grep -q '# untouched user cache' "$HUD/.zcompdump"
     cp "$root/good-components" "$mock/versions/v1/components"   # restore
+
+    # --- Uninstall vs a running daemon --------------------------------------
+    # The uninstall walk deletes `min` itself, so the daemon must be stopped
+    # before it, while the `min` that matches the daemon is still on disk. A
+    # daemon left running through an uninstall+reinstall keeps serving the old
+    # build and every daemon-backed command on the fresh install then hits a
+    # version skew. Same escalation as the upgrade swap: graceful stop, a
+    # consent question when sessions are live, --force-stop after.
+
+    # Live sessions: the installer lists them and asks; answering yes stops the
+    # daemon and the uninstall completes.
+    HU10="$root/hu10"; mkdir -p "$HU10"
+    run u10_install "$HU10"
+    check 0 "$rc" "daemon-uninstall: seed install exits 0"
+    : >"$HU10/sessions.live"
+    rm -f "$HU10/stop.calls"
+    printf 'y\n' >"$root/tty-yes10"
+    TTY_FILE="$root/tty-yes10"
+    run u10_live "$HU10" --uninstall
+    TTY_FILE=
+    check 0 "$rc" "uninstall with a live daemon exits 0"
+    want_ok "the running sessions are listed" grep -q "session-alpha" "$OUT"
+    want_ok "the user is asked before sessions die" grep -q "Continue?" "$OUT"
+    want_ok "the graceful stop is tried first" grep -qx "stop" "$HU10/stop.calls"
+    want_ok "confirmation escalates to --force" grep -qx "stop --force" "$HU10/stop.calls"
+    want_err "uninstall removed minimald" test -e "$HU10/bin/minimald"
+    want_err "uninstall removed the record" test -e "$HU10/xdg-state/minimal/installed"
+
+    # Declining leaves everything exactly as it was: nothing removed, daemon
+    # still up, record intact.
+    HU11="$root/hu11"; mkdir -p "$HU11"
+    run u11_install "$HU11"
+    : >"$HU11/sessions.live"
+    rm -f "$HU11/stop.calls"
+    printf 'n\n' >"$root/tty-no11"
+    TTY_FILE="$root/tty-no11"
+    run u11_decline "$HU11" --uninstall
+    TTY_FILE=
+    check 1 "$rc" "declining aborts the uninstall"
+    want_ok "the abort reports nothing was removed" grep -q "nothing was removed" "$OUT"
+    want_err "declining never force-stops" grep -qx "stop --force" "$HU11/stop.calls"
+    want_ok "the record survives the abort" test -f "$HU11/xdg-state/minimal/installed"
+    want_ok "the binaries survive the abort" test -f "$HU11/bin/minimald"
+
+    # No terminal to ask on: abort naming the escape hatch, remove nothing.
+    HU12="$root/hu12"; mkdir -p "$HU12"
+    run u12_install "$HU12"
+    : >"$HU12/sessions.live"
+    rm -f "$HU12/stop.calls"
+    run u12_notty "$HU12" --uninstall
+    check 1 "$rc" "an unconfirmable uninstall aborts"
+    want_ok "the abort names the escape hatch" grep -q -- "--force-stop" "$OUT"
+    want_err "nothing is asked without a terminal" grep -q "Continue?" "$OUT"
+    want_ok "the record survives the abort" test -f "$HU12/xdg-state/minimal/installed"
+
+    # --force-stop skips the question and the graceful stop entirely.
+    HU13="$root/hu13"; mkdir -p "$HU13"
+    run u13_install "$HU13"
+    : >"$HU13/sessions.live"
+    rm -f "$HU13/stop.calls"
+    run u13_force "$HU13" --uninstall --force-stop
+    check 0 "$rc" "uninstall --force-stop exits 0"
+    want_err "--force-stop asks nothing" grep -q "Continue?" "$OUT"
+    want_err "--force-stop skips the graceful stop" grep -qx "stop" "$HU13/stop.calls"
+    want_ok "--force-stop force-stops" grep -qx "stop --force" "$HU13/stop.calls"
+    want_err "uninstall removed the binaries" test -e "$HU13/bin/minimald"
+
+    # --dry-run announces the stop and stops nothing.
+    HU14="$root/hu14"; mkdir -p "$HU14"
+    run u14_install "$HU14"
+    : >"$HU14/sessions.live"
+    rm -f "$HU14/stop.calls"
+    run u14_dry "$HU14" --uninstall --dry-run
+    check 0 "$rc" "uninstall --dry-run with a live daemon exits 0"
+    want_ok "dry-run announces the stop" grep -q "would stop the running daemon" "$OUT"
+    want_err "dry-run stops nothing" test -e "$HU14/stop.calls"
+    want_ok "dry-run keeps minimald" test -f "$HU14/bin/minimald"
+
+    # A daemon with no sessions stops gracefully on a plain uninstall: no
+    # question, no --force.
+    HU15="$root/hu15"; mkdir -p "$HU15"
+    run u15_install "$HU15"
+    rm -f "$HU15/stop.calls"
+    run u15_plain "$HU15" --uninstall
+    check 0 "$rc" "plain uninstall with an idle daemon exits 0"
+    want_ok "an idle daemon is stopped gracefully" grep -qx "stop" "$HU15/stop.calls"
+    want_err "an idle daemon is never asked about" grep -q "Continue?" "$OUT"
+    want_err "an idle daemon is never force-stopped" grep -qx "stop --force" "$HU15/stop.calls"
+    want_err "uninstall removed minimald" test -e "$HU15/bin/minimald"
+
+    # --- Uninstall, then reinstall: the post-swap stale-daemon probe ----------
+    # The uninstall stops the daemon it finds, but nothing stops the user from
+    # having an old-build daemon running again by the time they reinstall
+    # (started by hand, autospawned from a stale PATH). That reinstall has no
+    # `min` on disk at its first swap, so the pre-swap stop sees nothing; the
+    # post-swap probe — the installed `min` comparing its version against the
+    # answering daemon's — is what must catch it. minver.server seeds the
+    # daemon side of the mock `min version`; no file means no daemon answers.
+    HU16="$root/hu16"; mkdir -p "$HU16"
+    run u16_install "$HU16"
+    check 0 "$rc" "stale-daemon: seed install exits 0"
+    run u16_uninstall "$HU16" --uninstall
+    check 0 "$rc" "stale-daemon: uninstall exits 0"
+    printf 'v9\n' >"$HU16/minver.server"      # an old-build daemon answers
+    rm -f "$HU16/stop.calls"
+    run u16_reinstall "$HU16"
+    check 0 "$rc" "reinstall over a stale daemon exits 0"
+    want_ok "the stale daemon is reported" \
+        grep -q "stopping a daemon still running from build v9" "$OUT"
+    want_ok "the stale daemon is stopped gracefully" grep -qx "stop" "$HU16/stop.calls"
+    want_err "nothing consented, so the stale daemon is never force-stopped" \
+        grep -qx "stop --force" "$HU16/stop.calls"
+
+    # Matching versions: the probe runs (a component was re-placed) but stops
+    # nothing and says nothing — the pre-swap stop already handled the daemon.
+    HU17="$root/hu17"; mkdir -p "$HU17"
+    run u17_install "$HU17"
+    check 0 "$rc" "matching-daemon: seed install exits 0"
+    printf 'stale\n' >"$HU17/bin/minimald"    # force a re-placement, so the probe runs
+    printf 'v1\n' >"$HU17/minver.server"      # a daemon of this build answers
+    rm -f "$HU17/stop.calls"
+    run u17_upgrade "$HU17"
+    check 0 "$rc" "upgrade with a matching daemon exits 0"
+    want_ok "the pre-swap stop still ran" grep -qx "stop" "$HU17/stop.calls"
+    want_err "a matching daemon is never force-stopped" \
+        grep -qx "stop --force" "$HU17/stop.calls"
+    want_err "a matching daemon is never reported" \
+        grep -q "stopping a daemon still running" "$OUT"
+
+    # An unreachable daemon (no minver.server) answers nothing: the probe stays
+    # silent, the pre-swap stop is all that ran.
+    HU18="$root/hu18"; mkdir -p "$HU18"
+    run u18_install "$HU18"
+    check 0 "$rc" "unreachable-daemon: seed install exits 0"
+    printf 'stale\n' >"$HU18/bin/minimald"    # force a component re-placement
+    rm -f "$HU18/stop.calls"
+    run u18_upgrade "$HU18"
+    check 0 "$rc" "upgrade over an unreachable daemon exits 0"
+    want_ok "the pre-swap stop still ran" grep -qx "stop" "$HU18/stop.calls"
+    want_err "an unreachable daemon is not asked about" grep -q "Continue?" "$OUT"
+    want_err "no version probe fires without a server line" \
+        grep -q "stopping a daemon still running" "$OUT"
 }
 
 case_gvproxy_rename_migration() {
@@ -1595,10 +2633,18 @@ if [ "$1" = "list" ] && [ "$2" = "ruleset" ]; then
     cat "${NFT_RULESET:-/dev/null}"
     exit 0
 fi
+if [ "$1" = "-j" ] && [ "$2" = "list" ] && [ "$3" = "set" ]; then
+    [ -n "${NFT_LEAF_SET:-}" ] || exit 1
+    cat "$NFT_LEAF_SET"
+    exit 0
+fi
 [ "$1" = "list" ] && exit 1
 exit 0
 STUB
-    chmod +x "$hcbin/nft"
+    # The helper runs this nft as root, so the install checks that only its
+    # owner can write it and its directory. The modes are set here, not left
+    # to the umask.
+    chmod 0755 "$hcbin" "$hcbin/nft"
 
     # run_hc <label> <mountinfo> [args...] ; sets rc, captures output in $OUT.
     run_hc() {
@@ -1606,13 +2652,17 @@ STUB
         OUT="$root/hc.$label"
         set +e
         env -i \
-            PATH="$hcbin:/usr/bin:/bin" \
+            PATH="${HC_PATH_PREFIX:+$HC_PATH_PREFIX:}$hcbin:/usr/bin:/bin" \
             CHOWN_CALLS="$chown_calls" \
             NFT_CALLS="$nft_calls" \
             NFT_INPUT="$nft_input" \
             NFT_FAIL="${NFT_FAIL:-0}" \
             NFT_RULESET="${NFT_RULESET:-}" \
+            NFT_LEAF_SET="${NFT_LEAF_SET:-}" \
             MINIMAL_OVERRIDE_CGROUP_MOUNTINFO="$mi" \
+            MINIMAL_OVERRIDE_PROC="${HC_PROC:-/proc}" \
+            MINIMAL_OVERRIDE_QUIC443_HELPER="${HC_HELPER:-}" \
+            MINIMAL_OVERRIDE_QUIC443_SUDOERS="${HC_SUDOERS:-}" \
             bash "$hc" --root "$tree" "$@" </dev/null >"$OUT" 2>&1
         rc=$?
         set -e
@@ -1632,11 +2682,18 @@ STUB
     check 1 "$rc" "check exits 1 before the tree exists"
     want_ok "check names the tree it cannot find" grep -q "does not exist" "$OUT"
     want_ok "check advises the install, not a re-check" grep -q "install it: sudo" "$OUT"
-    want_ok "the pre-install hint names the cohort's identity flag" \
-        grep -q -- "--cohort-address <cohort address>" "$OUT"
-    want_ok "the pre-install hint names the node plane's identity flag too" \
-        grep -q -- "--node-plane-address <node-plane address>" "$OUT"
+    want_err "the pre-install hint carries no placeholder: an install told no identity is the un-enrolled host's own" \
+        grep -q -- "<cohort address>" "$OUT"
+    want_err "the pre-install hint carries no node-plane placeholder either" \
+        grep -q -- "<node-plane address>" "$OUT"
     want_err "check creates nothing" test -e "$tree"
+    # With one identity: the install would refuse it, so the hint drops it.
+    run_hc pre_check_lone "$root/mi-on" --check --user "$me" --cohort-address 100.72.0.9
+    check 1 "$rc" "check with a lone identity still exits 1 before the tree exists"
+    want_ok "the hint is still the install" grep -q "install it: sudo" "$OUT"
+    want_err "the hint carries no lone identity the install would refuse" \
+        grep -q -- "install it: sudo .*--cohort-address" "$OUT"
+    want_ok "the hint keeps the account asked about" grep -q -- "install it: sudo .*--user $me" "$OUT"
 
     # --- Refusals: every one of them dies before a directory is made.
     run_hc no_nsdelegate "$root/mi-off" --user "$me"
@@ -1670,32 +2727,66 @@ STUB
     want_ok "the refusal names the account" grep -q "no such account" "$OUT"
     want_err "a bad account still creates nothing" test -e "$tree"
 
-    # --- The two source identities are required, together: a table that
-    # refuses a deny-all box's connections while its cohort keeps the host's
-    # own source identity is half of the classification, so the step refuses
-    # to render half of it — with either missing, and with both missing.
-    run_hc no_identity "$root/mi-on" --user "$me"
-    check 1 "$rc" "install dies without the two source identities"
-    want_ok "the refusal names the flag it needs" \
-        grep -q -- "--cohort-address ADDR" "$OUT"
-    want_ok "the refusal names the other flag too" \
-        grep -q -- "--node-plane-address ADDR" "$OUT"
-    want_err "no identities, no tree" test -e "$tree"
-
+    # --- The two source identities go together: a table that translates its
+    # cohort while the rest of the slice keeps the host's own source identity
+    # is half of the classification, so the step refuses to render half of
+    # it. Neither given is whole: the un-enrolled host (NET-078), whose two
+    # identities are the classify chain's cgroup matches with no source
+    # translation, and whose postrouting chain stands empty for an
+    # association to fill without a reinstall.
     run_hc half_identity "$root/mi-on" --user "$me" --cohort-address 100.72.0.9
     check 1 "$rc" "install dies with one of the two identities missing"
-    want_ok "the refusal says they go together" grep -q "both source identities" "$OUT"
+    want_ok "the refusal says they go together" grep -q "both source identities or neither" "$OUT"
     want_err "half an identity still creates nothing" test -e "$tree"
+
+    run_hc unenrolled_print "$root/mi-on" --print-ruleset
+    check 0 "$rc" "--print-ruleset renders with no source identity"
+    want_err "no identity renders no source translation" grep -q "snat" "$OUT"
+    want_ok "the postrouting chain stands, empty, for an association to fill" \
+        grep -q "chain postrouting" "$OUT"
+    want_ok "the cohort is still its cgroup subtree's match" \
+        grep -q 'socket cgroupv2 level 2 "minimald.slice/boxes"' "$OUT"
+    want_ok "the node plane is still the slice's remaining match" \
+        grep -q 'ct mark and 0x30000000 == 0 socket cgroupv2 level 1 "minimald.slice"' "$OUT"
+
+    run_hc unenrolled "$root/mi-on" --user "$me"
+    check 0 "$rc" "install exits 0 with neither identity"
+    want_ok "the un-enrolled install lays out the tree" test -d "$tree/boxes/deny"
+    want_ok "the un-enrolled install lays out the QUIC block leaf" \
+        test -d "$tree/boxes/quic443-blocked"
+    want_ok "the un-enrolled install writes the marker" test -d "$tree/classifier-table"
+    want_err "the un-enrolled transaction carries no SNAT rule" grep -q "snat" "$nft_input"
+    want_ok "the un-enrolled install says nothing is translated" \
+        grep -q "nothing is translated" "$OUT"
+    want_ok "the un-enrolled install names the placement unit, not a per-restart root step alone" \
+        grep -q "min finalize-install" "$OUT"
+    want_err "the un-enrolled install prints no placeholder" grep -q "<cohort address>" "$OUT"
+    # Taken down again so the enrolled install below starts from nothing, and
+    # the recorders emptied so its transaction is the only one they hold.
+    for _cg in "$tree" "$tree/daemon" "$tree/boxes" "$tree/boxes/deny" "$tree/boxes/allow" \
+        "$tree/boxes/quic443-blocked"; do
+        drop_cgroup_files "$_cg"
+    done
+    run_hc unenrolled_uninstall "$root/mi-on" --uninstall
+    check 0 "$rc" "the un-enrolled tree uninstalls"
+    : >"$nft_input"; : >"$nft_calls"; : >"$chown_calls"
 
     # --- The install: the slice, its daemon leaf, the cohort's two subtrees,
     # and the whole v2 contract delegated to the account minimald runs as.
+    # The QUIC block helper and its sudoers rule go under the scratch root,
+    # through the step's own override knobs: a rehearsal writes nothing to
+    # /usr/local or /etc.
+    HC_HELPER="$root/hclib/quic443-leaf"
+    HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
     run_hc install "$root/mi-on" --user "$me" \
         --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    unset HC_HELPER HC_SUDOERS
     check 0 "$rc" "install exits 0 on a delegated cgroup2 mount"
     want_ok "the daemon leaf exists" test -d "$tree/daemon"
     want_ok "the box cohort exists"   test -d "$tree/boxes"
     want_ok "the deny subtree exists"  test -d "$tree/boxes/deny"
     want_ok "the allow subtree exists" test -d "$tree/boxes/allow"
+    want_ok "the host-address QUIC block leaf exists" test -d "$tree/boxes/quic443-blocked"
     want_ok "the table's marker exists once the transaction succeeded" \
         test -d "$tree/classifier-table"
     want_ok "install names the tree it laid out"   grep -q "installed the classifier tree" "$OUT"
@@ -1716,10 +2807,11 @@ STUB
     # cgroup.procs, and that ancestor is the slice itself — and never
     # reached above the slice: a box runs as the daemon's uid, so a mount
     # root owned by that account is every cgroup on the host. The two
-    # subtrees are delegated like the cohort they live under.
+    # subtrees and the QUIC block leaf are delegated like the cohort they
+    # live under.
     _o="$(id -u):$(id -g)"
     _want=""
-    for _cg in "" "/daemon" "/boxes" "/boxes/deny" "/boxes/allow"; do
+    for _cg in "" "/daemon" "/boxes" "/boxes/deny" "/boxes/allow" "/boxes/quic443-blocked"; do
         for _f in cgroup.procs cgroup.threads cgroup.subtree_control; do
             _want="$_want$_o $tree$_cg/$_f "
         done
@@ -1735,7 +2827,7 @@ STUB
     # ruleset tests read the same input in depth; this pins what the step
     # decided, at the layer the installer owns: the transaction replaces the
     # table rather than adding to it, the cohort's two identities, the
-    # answerer as the deny subtree's one destination, and the retarget that
+    # answerer as the deny subtree's one destination, and the steer that
     # makes the answerer the destination a deny-all box's lookups reach.
     want_ok "the step loaded one transaction, exactly once" \
         [ "$(grep -c '^-f ' "$nft_calls")" -eq 1 ]
@@ -1763,9 +2855,9 @@ originates is refused" \
         grep -q 'ct state established,related accept' "$nft_input"
     want_ok "the deny rule admits the answerer by address and port only" \
         grep -q 'ip daddr 127.0.0.1 udp dport 7656 accept' "$nft_input"
-    want_ok "the deny subtree's DNS-port lookups are retargeted onto the answerer" \
-        grep -q 'level 3 "minimald.slice/boxes/deny" ip daddr 127.0.0.1 udp dport 53 dnat ip to 127.0.0.1:7656' "$nft_input"
-    want_ok "the retarget runs at dstnat, before the filter chain decides" \
+    want_ok "the deny subtree's DNS-port lookups are steered onto the answerer" \
+        grep -q 'level 3 "minimald.slice/boxes/deny" udp dport 53 dnat ip to 127.0.0.1:7656' "$nft_input"
+    want_ok "the steer runs at dstnat, before the filter chain decides" \
         grep -q 'type nat hook output priority dstnat' "$nft_input"
     want_ok "the deny rule refuses actively, never a silent drop" \
         grep -q 'reject with icmpx admin-prohibited' "$nft_input"
@@ -1800,6 +2892,49 @@ originates is refused" \
         [ "$(grep -c '^list ruleset' "$nft_calls")" -eq 1 ]
     want_ok "the install records the ct-mark mask beside the marker" \
         test -d "$tree/ct-mark-mask-0x30000000"
+
+    # BEP-018: a socket keeps the cgroup it was created in, so the table
+    # also rejects UDP 443 from a socket whose box leaf is in the
+    # blocked-leaves set, declared before the rule that names it.
+    want_ok "the table declares the blocked-leaves set of box leaves" \
+        awk '/set quic443_blocked_leaves \{/ {s = NR}
+             s && NR == s + 1 && /typeof socket cgroupv2 level 4$/ {ok = 1}
+             /chain output \{/ {o = NR}
+             END {exit !(ok && s < o)}' "$nft_input"
+    want_ok "the output chain rejects UDP 443 from a leaf in the set" \
+        grep -q 'socket cgroupv2 level 4 @quic443_blocked_leaves udp dport 443 reject with icmpx port-unreachable' "$nft_input"
+    hc_helper="$root/hclib/quic443-leaf"
+    want_ok "the install writes the QUIC block helper" test -x "$hc_helper"
+    want_ok "the sudoers rule lets the account run the helper alone" \
+        grep -qx "#$me ALL=(root) NOPASSWD: $hc_helper" "$root/hcsudoers/minimal-quic443-leaf"
+    want_ok "the install names the helper it wrote" grep -q "installed $hc_helper" "$OUT"
+    # run_helper <label> <verb> <leaf> ; sets rc, output in $OUT.
+    run_helper() {
+        OUT="$root/helper.$1"
+        set +e
+        env -i PATH="$hcbin:/usr/bin:/bin" NFT_CALLS="$nft_calls" \
+            "$hc_helper" "$2" "$3" </dev/null >"$OUT" 2>&1
+        rc=$?
+        set -e
+    }
+    mkdir -p "$tree/boxes/allow/grant"
+    : >"$nft_calls"
+    run_helper add add "$tree/boxes/allow/grant"
+    check 0 "$rc" "the helper adds a box leaf under the allow subtree"
+    run_helper remove remove "$tree/boxes/allow/grant"
+    check 0 "$rc" "the helper removes a box leaf under the allow subtree"
+    check 'add element inet minimal_class quic443_blocked_leaves { "minimald.slice/boxes/allow/grant" }
+delete element inet minimal_class quic443_blocked_leaves { "minimald.slice/boxes/allow/grant" }' \
+        "$(cat "$nft_calls")" "the helper changes one element of the set"
+    : >"$nft_calls"
+    for _leaf in "$cg" "/etc" "$tree/daemon" "$tree/boxes/deny" "$tree/boxes/quic443-blocked" \
+        "$tree/boxes/allow" "$tree/boxes/allow/../deny" "$tree/boxes/allow/grant/x"; do
+        run_helper refused add "$_leaf"
+        check 2 "$rc" "the helper refuses $_leaf"
+        want_ok "the refusal for $_leaf says so" grep -q "refused" "$OUT"
+    done
+    rmdir "$tree/boxes/allow/grant"
+    want_ok "no refused path reaches nft" [ ! -s "$nft_calls" ]
 
     # --- --print-ruleset prints the same transaction the install loaded:
     # the daemon's own ruleset tests read this mode, so the two spellings
@@ -1841,9 +2976,32 @@ originates is refused" \
     # vouches for a table this step did not render. The tree's half is
     # already done, and stays.
     NFT_FAIL=1
+    # The pair from the first install is in place. A failed load must leave
+    # it as it was: mv replaces a file's inode, so the same inode says the
+    # install did not write it again.
+    HC_HELPER="$root/hclib/quic443-leaf"
+    HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
+    _helper_ino="$(ls -i "$HC_HELPER")"
+    _sudoers_ino="$(ls -i "$HC_SUDOERS")"
     run_hc reload_failed "$root/mi-on" --user "$me" \
         --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
     check 1 "$rc" "a re-install whose nft transaction dies exits 1"
+    check "$_helper_ino" "$(ls -i "$HC_HELPER")" \
+        "a failed re-load leaves the existing QUIC block helper as it was"
+    check "$_sudoers_ino" "$(ls -i "$HC_SUDOERS")" \
+        "a failed re-load leaves the existing sudoers rule as it was"
+    # A first install whose load dies writes neither the helper nor its
+    # passwordless sudoers rule.
+    HC_HELPER="$root/hcfresh/lib/quic443-leaf"
+    HC_SUDOERS="$root/hcfresh/sudoers/minimal-quic443-leaf"
+    run_hc load_failed_fresh "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    check 1 "$rc" "an install whose nft transaction dies exits 1"
+    want_err "a failed load writes no QUIC block helper" test -e "$HC_HELPER"
+    want_err "a failed load writes no sudoers rule for it" test -e "$HC_SUDOERS"
+    want_ok "a failed load leaves no staging file for either" \
+        [ -z "$(ls -A "$root/hcfresh" 2>/dev/null)" ]
+    unset HC_HELPER HC_SUDOERS
     want_err "a failed re-load leaves no marker" test -e "$tree/classifier-table"
     want_err "a failed re-load leaves no ct-mark mask record either" \
         test -e "$tree/ct-mark-mask-0x30000000"
@@ -1851,6 +3009,26 @@ originates is refused" \
         grep -q "neither the marker nor its ct-mark mask record was written" "$OUT"
     want_ok "the tree itself survives a failed re-load" test -d "$tree/boxes/deny"
     NFT_FAIL=0
+
+    # --- Root runs the helper for the delegated account, so the install
+    # refuses a helper directory that another account can write: that
+    # account could replace the helper, or plant its staging name.
+    mkdir -p "$root/hcopen"
+    chmod 0777 "$root/hcopen"
+    HC_HELPER="$root/hcopen/quic443-leaf"
+    HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
+    run_hc open_helper_dir "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    unset HC_HELPER HC_SUDOERS
+    check 1 "$rc" "an install whose helper directory others can write exits 1"
+    want_ok "the refusal names the directory and the fix" \
+        grep -q "$(cd -P "$root/hcopen" && pwd -P) can be written by accounts other than its owner (mode 777)" "$OUT"
+    want_err "no helper is written into a directory others can write" \
+        test -e "$root/hcopen/quic443-leaf"
+    want_ok "no staging file is left behind either" \
+        [ -z "$(ls -A "$root/hcopen")" ]
+    rmdir "$root/hcopen"
+
     run_hc reloaded "$root/mi-on" --user "$me" \
         --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
     check 0 "$rc" "the next good re-install exits 0"
@@ -1858,6 +3036,86 @@ originates is refused" \
         test -d "$tree/classifier-table"
     want_ok "the next good re-install restores the mask record beside it" \
         test -d "$tree/ct-mark-mask-0x30000000"
+
+    # --- The helper runs nft as root for the delegated account, so the
+    # install refuses an nft that another account can write, or one in a
+    # directory another account can write. It refuses before the load.
+    for _open in dir file; do
+        _nftdir="$root/hcnft-$_open"
+        mkdir -p "$_nftdir"
+        cp "$hcbin/nft" "$_nftdir/nft"
+        if [ "$_open" = dir ]; then
+            chmod 0777 "$_nftdir"; chmod 0755 "$_nftdir/nft"; _named="$_nftdir"
+        else
+            chmod 0755 "$_nftdir"; chmod 0777 "$_nftdir/nft"; _named="$_nftdir/nft"
+        fi
+        # The install names the nft by its physical path: on macOS the
+        # scratch root sits under /var, a symlink to /private/var.
+        _named="$(cd -P "$_nftdir" && pwd -P)${_named#"$_nftdir"}"
+        : >"$nft_input"
+        HC_PATH_PREFIX="$_nftdir"
+        HC_HELPER="$root/hcnftlib/quic443-leaf"
+        HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
+        run_hc "open_nft_$_open" "$root/mi-on" --user "$me" \
+            --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+        unset HC_PATH_PREFIX HC_HELPER HC_SUDOERS
+        check 1 "$rc" "an install whose nft $_open others can write exits 1"
+        want_ok "the refusal names the writable nft $_open and the fix" \
+            grep -q "cannot install the QUIC block helper at $root/hcnftlib/quic443-leaf: $_named can be written by accounts other than its owner (mode 777)" "$OUT"
+        want_err "no helper runs an nft $_open others can write" \
+            test -e "$root/hcnftlib/quic443-leaf"
+        want_ok "a refused nft $_open loads no table" [ ! -s "$nft_input" ]
+        rm -rf "$_nftdir"
+    done
+
+    # --- A re-install while the daemon runs keeps the leaves in the
+    # blocked-leaves set: the set is declared with them in the same
+    # transaction that replaces the table. A leaf whose directory is gone,
+    # and a path outside the allow subtree, are not carried over.
+    mkdir -p "$tree/boxes/allow/grant"
+    nft_leaf_set="$root/nft-leaf-set.json"
+    printf '%s' '{"nftables": [{"metainfo": {"version": "1.0.6"}}, {"set": {"family": "inet", "name": "quic443_blocked_leaves", "table": "minimal_class", "type": "cgroupsv2", "handle": 4, "elem": ["minimald.slice/boxes/allow/grant", "minimald.slice/boxes/allow/gone", "minimald.slice/boxes/deny"]}}]}' \
+        >"$nft_leaf_set"
+    : >"$nft_input"
+    NFT_LEAF_SET="$nft_leaf_set"
+    HC_HELPER="$root/hclib/quic443-leaf"
+    HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
+    run_hc reload_kept "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    unset NFT_LEAF_SET HC_HELPER HC_SUDOERS
+    check 0 "$rc" "a re-install with a leaf in the blocked-leaves set exits 0"
+    # shellcheck disable=SC2016 # $0 is awk's line, not a shell expansion
+    want_ok "the re-install declares the set with the leaf still in it" \
+        awk '/set quic443_blocked_leaves \{/ {s = NR}
+             s && NR == s + 2 && $0 == "        elements = { \"minimald.slice/boxes/allow/grant\" }" {ok = 1}
+             END {exit !ok}' "$nft_input"
+    want_ok "the leaf is kept in the same transaction that deletes the table" \
+        [ "$(grep -c '^delete table inet minimal_class$' "$nft_input")" -eq 1 ]
+    want_ok "the re-install names the leaf it kept" \
+        grep -q "kept the box leaves that are refused UDP to port 443: minimald.slice/boxes/allow/grant$" "$OUT"
+    rmdir "$tree/boxes/allow/grant"
+
+    # --- A set listing that fails while the loaded table declares the set
+    # stops the install before the load: rendering the set empty would let
+    # a blocked box send UDP to port 443 again. The stub's `-j list set`
+    # fails when NFT_LEAF_SET is unset.
+    nft_ruleset_with_set="$root/nft-ruleset-with-set"
+    printf '%s\n' 'table inet minimal_class {' '	set quic443_blocked_leaves {' \
+        '		typeof socket cgroupv2 level 4' '	}' '}' >"$nft_ruleset_with_set"
+    : >"$nft_input"
+    NFT_RULESET="$nft_ruleset_with_set"
+    HC_HELPER="$root/hclib/quic443-leaf"
+    HC_SUDOERS="$root/hcsudoers/minimal-quic443-leaf"
+    run_hc leaf_set_unreadable "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    unset HC_HELPER HC_SUDOERS
+    NFT_RULESET=
+    check 1 "$rc" "an install that cannot list the declared blocked-leaves set exits 1"
+    want_ok "the refusal says it cannot read the blocked box leaves" \
+        grep -q "cannot read the box leaves that are refused UDP to port 443 from inet minimal_class: nft -j list set inet minimal_class quic443_blocked_leaves failed" "$OUT"
+    want_ok "the refusal says the loaded table is unchanged" \
+        grep -q "The loaded table is unchanged.$" "$OUT"
+    want_ok "an unreadable blocked-leaves set loads no table" [ ! -s "$nft_input" ]
 
     # --- The ct-mark bits are a shared namespace: a component already
     # classing with one of them would be silently overwritten by the
@@ -1876,24 +3134,71 @@ originates is refused" \
     want_ok "the refusal names the conflicting rule itself" \
         grep -q 'ct mark set ct mark or 0x10000000' "$OUT"
     want_ok "the refusal names the override it would take instead" \
-        grep -q -- "--ct-mark-mask <two contiguous bits nothing else classes with>" "$OUT"
+        grep -q -- "Choose two contiguous bits that no rule above uses and run: min finalize-install --ct-mark-mask <mask>$" "$OUT"
     want_ok "the refusal dies before touching anything: the previous marker \
 still vouches for the table it loaded" \
         test -d "$tree/classifier-table"
     run_hc conflict_escaped "$root/mi-on" --user "$me" \
         --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1 \
-        --ct-mark-mask 0x0000c000
+        --ct-mark-mask 0x03000000
     check 0 "$rc" "an install with non-overlapping bits escapes the conflict"
     want_ok "the escape renders its own bits, both identities on them" \
-        grep -q 'ct mark and 0x0000c000 == 0x00004000 oifname != "lo" snat ip to 100.72.0.9' "$nft_input"
+        grep -q 'ct mark and 0x03000000 == 0x01000000 oifname != "lo" snat ip to 100.72.0.9' "$nft_input"
     want_ok "the escape records the bits it chose" \
-        test -d "$tree/ct-mark-mask-0x0000c000"
+        test -d "$tree/ct-mark-mask-0x03000000"
     want_err "the escape left no record of the refused mask" \
         test -e "$tree/ct-mark-mask-0x30000000"
-    run_hc conflict_back "$root/mi-on" --user "$me" \
+    # --- With no --ct-mark-mask, the next install re-applies the mask the
+    # previous install recorded, so a re-run keeps the operator's bits
+    # rather than falling back to the default that conflicts.
+    : >"$nft_input"
+    run_hc conflict_recorded "$root/mi-on" --user "$me" \
         --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
-    check 1 "$rc" "the next default-mask install refuses again"
+    check 0 "$rc" "an install with no mask re-applies the recorded mask over the conflict"
+    want_ok "the install says which recorded mask it uses" \
+        grep -q "using the ct-mark mask 0x03000000 that the previous install recorded" "$OUT"
+    want_ok "the install renders the recorded bits" \
+        grep -q 'ct mark and 0x03000000 == 0x01000000 oifname != "lo" snat ip to 100.72.0.9' "$nft_input"
+    want_ok "the recorded mask is still the one record" \
+        test -d "$tree/ct-mark-mask-0x03000000"
+    want_err "the install wrote no default-mask record" \
+        test -e "$tree/ct-mark-mask-0x30000000"
+    run_hc conflict_back "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1 \
+        --ct-mark-mask 0x30000000
+    check 1 "$rc" "an explicit default-mask install refuses again"
     NFT_RULESET=
+
+    # --- A CONNMARK --restore-mark copies the connection mark into the
+    # packet mark and never writes the connection mark, so a restore with
+    # no mask is no conflict. A stand-in iptables-save serves the listing.
+    _iptdir="$root/hc-iptables-save"; mkdir -p "$_iptdir"
+    cat >"$_iptdir/iptables-save" <<'STUB'
+#!/bin/sh
+cat "$(dirname "$0")/listing"
+STUB
+    chmod 0755 "$_iptdir/iptables-save"
+    HC_PATH_PREFIX="$_iptdir"
+    printf '*mangle\n:OUTPUT ACCEPT [0:0]\n-A OUTPUT -p udp -j CONNMARK --restore-mark\nCOMMIT\n' \
+        >"$_iptdir/listing"
+    run_hc restore_mark_nomask "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    check 0 "$rc" "a --restore-mark with no mask does not block the install"
+    unset HC_PATH_PREFIX
+
+    # --- A mask in a range a well-known component classes with is refused
+    # even when no loaded rule uses it yet: the component can start after
+    # the install. The refusal names the range and the component.
+    run_hc well_known_range "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1 \
+        --ct-mark-mask 0x0000c000
+    check 1 "$rc" "an install with a mask in kube-proxy's range exits 1"
+    want_ok "the refusal names the range and the component" \
+        grep -q "uses bits in 0x0000c000, the range kube-proxy marks connections with" "$OUT"
+    want_ok "the refusal names min finalize-install with another mask" \
+        grep -q -- "two contiguous bits outside 0x0000c000 and run: min finalize-install --ct-mark-mask <mask>$" "$OUT"
+    want_err "the refused mask is not recorded" \
+        test -e "$tree/ct-mark-mask-0x0000c000"
 
     # --- --ct-mark-mask is validated before anything is made: exactly two
     # contiguous set bits inside the 32 a connection mark holds, nothing
@@ -1933,6 +3238,7 @@ still vouches for the table it loaded" \
     drop_cgroup_files "$tree/boxes"
     drop_cgroup_files "$tree/boxes/deny"
     drop_cgroup_files "$tree/boxes/allow"
+    drop_cgroup_files "$tree/boxes/quic443-blocked"
     run_hc uninstall "$root/mi-on" --uninstall
     check 0 "$rc" "uninstall removes the installed tree"
     want_err "uninstall leaves no tree behind" test -e "$tree"
@@ -1965,11 +3271,113 @@ still vouches for the table it loaded" \
     want_ok "the refusal asks for a numeric process id" \
         grep -q "numeric process id" "$OUT"
 
+    # --- --place-listener: the same placement, found from the daemon's own
+    # listener so a manager-held path unit can make it at every start the
+    # socket announces (no per-restart --pid). Over a stand-in process table:
+    # the holder of the socket that runs as the delegated account outside
+    # the slice is placed; a holder of another uid, a holder of another
+    # socket, a same-uid holder already inside the slice (a box in
+    # boxes/deny that bound a socket spelled like the listener), and a
+    # holder whose cgroup cannot be read are left alone; a second run is
+    # idempotent; and a socket nobody holds is nothing to place rather than
+    # a failure.
+    fproc="$root/proc"; rm -rf "$fproc"
+    lsock="$root/state/providers/local-minimald0/ssh.sock"
+    mkdir -p "$fproc/net" "$fproc/4242/fd" "$fproc/4243/fd" "$fproc/4244/fd" \
+        "$fproc/4245/fd" "$fproc/4246/fd"
+    {
+        printf 'Num       RefCount Protocol Flags    Type St Inode Path\n'
+        printf '0000 00000002 00000000 00010000 0001 01 777 %s\n' "$lsock"
+        printf '0000 00000002 00000000 00010000 0001 01 778 /run/other.sock\n'
+    } >"$fproc/net/unix"
+    ln -s 'socket:[777]' "$fproc/4242/fd/5"
+    printf 'Name:\tminimald\nUid:\t%s\t%s\t%s\t%s\n' "$me" "$me" "$me" "$me" >"$fproc/4242/status"
+    ln -s 'socket:[777]' "$fproc/4243/fd/3"
+    printf 'Name:\tother\nUid:\t0\t0\t0\t0\n' >"$fproc/4243/status"
+    ln -s 'socket:[778]' "$fproc/4244/fd/3"
+    printf 'Name:\tother\nUid:\t%s\t%s\t%s\t%s\n' "$me" "$me" "$me" "$me" >"$fproc/4244/status"
+    for p in 4242 4243 4244; do
+        printf '0::/user.slice/user-%s.slice/session-1.scope\n' "$me" >"$fproc/$p/cgroup"
+    done
+    # A box: the delegated account, the listener's own path string, but
+    # already placed in a deny leaf under the slice.
+    ln -s 'socket:[777]' "$fproc/4245/fd/7"
+    printf 'Name:\tbash\nUid:\t%s\t%s\t%s\t%s\n' "$me" "$me" "$me" "$me" >"$fproc/4245/status"
+    printf '0::/minimald.slice/boxes/deny/box-1\n' >"$fproc/4245/cgroup"
+    # A holder whose cgroup cannot be read: unknown, so not moved.
+    ln -s 'socket:[777]' "$fproc/4246/fd/7"
+    printf 'Name:\tminimald\nUid:\t%s\t%s\t%s\t%s\n' "$me" "$me" "$me" "$me" >"$fproc/4246/status"
+    : >"$tree/daemon/cgroup.procs"
+    HC_PROC="$fproc"
+    run_hc place_listener "$root/mi-on" --user "$me" --place-listener "$lsock"
+    check 0 "$rc" "--place-listener exits 0"
+    want_ok "the delegated account's holder of the socket is placed" \
+        grep -qx 4242 "$tree/daemon/cgroup.procs"
+    want_err "a holder of another uid is left alone" grep -qx 4243 "$tree/daemon/cgroup.procs"
+    want_ok "the placement says what it left alone and why" grep -q "left 4243 alone" "$OUT"
+    want_err "a holder of another socket is not placed" grep -qx 4244 "$tree/daemon/cgroup.procs"
+    want_err "a same-uid holder inside boxes/deny is never moved" \
+        grep -qx 4245 "$tree/daemon/cgroup.procs"
+    want_ok "the placement says the box stands inside the slice" \
+        grep -q "left 4245 alone: .*inside the slice at /minimald.slice/boxes/deny/box-1" "$OUT"
+    want_err "a holder whose cgroup cannot be read is not moved" \
+        grep -qx 4246 "$tree/daemon/cgroup.procs"
+    want_ok "the placement says the cgroup could not be read" \
+        grep -q "left 4246 alone: .*cgroup could not be read" "$OUT"
+    want_ok "exactly one holder was placed" \
+        [ "$(grep -c . "$tree/daemon/cgroup.procs")" -eq 1 ]
+    # A scan that find reports as failed (an fd table that changed under it,
+    # which a live process table does all the time): the holders it printed
+    # are still placed and the step still exits 0. The stand-in find prints
+    # what the real one does and then fails the way a vanished entry does.
+    : >"$tree/daemon/cgroup.procs"
+    printf '#!/bin/sh\n/usr/bin/find "$@"\nexit 1\n' >"$hcbin/find"
+    chmod +x "$hcbin/find"
+    run_hc place_listener_racy "$root/mi-on" --user "$me" --place-listener "$lsock"
+    rm -f "$hcbin/find"
+    check 0 "$rc" "--place-listener exits 0 when the fd scan reports a failure"
+    want_ok "the holder the failed scan still printed is placed" \
+        grep -qx 4242 "$tree/daemon/cgroup.procs"
+    run_hc place_listener_again "$root/mi-on" --user "$me" --place-listener "$lsock"
+    check 0 "$rc" "a second --place-listener exits 0"
+    want_ok "the second run finds the daemon already placed" grep -q "already in" "$OUT"
+    want_ok "the second run writes the pid no second time" \
+        [ "$(grep -cx 4242 "$tree/daemon/cgroup.procs")" -eq 1 ]
+    # Only holders that are left alone (the daemon gone, a box on the same
+    # path still there): the closing line says so, not that nobody holds it.
+    rm -rf "$fproc/4242"
+    : >"$tree/daemon/cgroup.procs"
+    run_hc place_listener_skipped "$root/mi-on" --user "$me" --place-listener "$lsock"
+    check 0 "$rc" "--place-listener over holders it leaves alone exits 0"
+    want_ok "the closing line says the holders were left where they stand" \
+        grep -q "every holder of .* was left where it stands" "$OUT"
+    want_err "and does not claim the socket is unheld" grep -q "no process holds" "$OUT"
+    want_err "and places nothing" [ -s "$tree/daemon/cgroup.procs" ]
+    printf 'Num       RefCount Protocol Flags    Type St Inode Path\n' >"$fproc/net/unix"
+    run_hc place_listener_nobody "$root/mi-on" --user "$me" --place-listener "$lsock"
+    check 0 "$rc" "--place-listener over a socket nobody holds exits 0"
+    want_ok "nobody holding it is nothing to place, said so" grep -q "no process holds .*: nothing to place" "$OUT"
+    want_err "an unbound socket is not scanned twice" grep -q "scanned again" "$OUT"
+    # A listed inode whose holder is not in any fd table (it vanished under
+    # the scan): one more pass after a moment, then nothing to place, and
+    # still not a failure.
+    {
+        printf 'Num       RefCount Protocol Flags    Type St Inode Path\n'
+        printf '0000 00000002 00000000 00010000 0001 01 779 %s\n' "$lsock"
+    } >"$fproc/net/unix"
+    run_hc place_listener_vanished "$root/mi-on" --user "$me" --place-listener "$lsock"
+    check 0 "$rc" "--place-listener over a socket whose holder vanished exits 0"
+    want_ok "the vanished holder is looked for once more" grep -q "scanned again" "$OUT"
+    want_ok "and then it is nothing to place" grep -q "nothing to place" "$OUT"
+    HC_PROC=
+    : >"$tree/daemon/cgroup.procs"
+
     drop_cgroup_files "$tree"
     drop_cgroup_files "$tree/daemon"
     drop_cgroup_files "$tree/boxes"
     drop_cgroup_files "$tree/boxes/deny"
     drop_cgroup_files "$tree/boxes/allow"
+    drop_cgroup_files "$tree/boxes/quic443-blocked"
     mkdir "$tree/boxes/deny/a-session"
     run_hc uninstall_live "$root/mi-on" --uninstall
     check 1 "$rc" "uninstall dies while a box leaf survives"
@@ -1990,6 +3398,9 @@ still vouches for the table it loaded" \
     want_ok "usage shows the unprivileged --check" grep -q -- "--check" "$OUT"
     want_ok "usage shows the unprivileged --print-ruleset" grep -q -- "--print-ruleset" "$OUT"
     want_ok "usage shows the --pid step" grep -q -- "--pid PID" "$OUT"
+    want_ok "usage shows the --place-listener step" grep -q -- "--place-listener SOCK" "$OUT"
+    want_err "the step's own remedies carry no placeholder a person must fill" \
+        grep -q "<the account" "$hc"
     want_ok "usage shows the ct-mark mask override" grep -q -- "--ct-mark-mask" "$OUT"
 
     # --- Without the rehearsal seam the script demands root, like the other
@@ -2060,10 +3471,93 @@ case_linux_vm_stack() {
         grep -qE "^  switch-binary +(verified|current)" "$OUT"
 }
 
+# --- #2498: the Box Egress Proxy installs beside minvmd on macOS -------------
+# minvmd starts `bep` from beside its own binary, so an installed minvmd finds
+# the proxy only when both land in the same directory. The proof reads the
+# release's own component table (scripts/stage-release.sh), then installs a
+# darwin manifest with those two rows and checks where they land.
+case_bep_installs_beside_minvmd() {
+    _table="$here/stage-release.sh"
+    _row() {
+        awk -F'|' -v c="$1" '$1 ~ "\"" c "$" && $2 == "darwin" && $3 == "arm64" {print $4 "|" $5 "|" $6}' "$_table"
+    }
+    # bin/bep is a link to the program inside bin/bep.app, whose provisioning
+    # profile carries the program's keychain entitlement (#2812).
+    check 'symlink|bin/bep|bep.app/Contents/MacOS/bep"' "$(_row bep)" \
+        "the release links bin/bep to the program in bin/bep.app"
+    check 'file|bin/bep.app/Contents/MacOS/bep|bep-macos-arm64"' "$(_row bep-program)" \
+        "the release stages the bep program inside bin/bep.app"
+    check "bin/minvmd" "$(_row minvmd | cut -d'|' -f2)" "the release stages minvmd for darwin/arm64 at bin/minvmd"
+    want_err "the release stages no bep for Linux" \
+        grep -qE '^    "bep[-a-z]*\|linux\|' "$_table"
+
+    printf 'darwin-arm64-minvmd-body\n' >"$mock/versions/v1/minvmd-macos-arm64"
+    printf 'darwin-arm64-bep-body\n'    >"$mock/versions/v1/bep-macos-arm64"
+    h_dminvmd="$(hash_file "$mock/versions/v1/minvmd-macos-arm64")"
+    h_dbep="$(hash_file "$mock/versions/v1/bep-macos-arm64")"
+    # _bep_components SRC — the manifest, with the bep program fetched from
+    # SRC. The link row comes after the program row, as in the release table.
+    _bep_components() {
+        printf '# format: 1\n'
+        printf '# c o a v s k d s\n'
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            minvmd darwin arm64 v1 "$h_dminvmd" file bin/minvmd versions/v1/minvmd-macos-arm64
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            bep-program darwin arm64 v1 "$h_dbep" file bin/bep.app/Contents/MacOS/bep "$1"
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            bep darwin arm64 v1 - symlink bin/bep bep.app/Contents/MacOS/bep
+    }
+    want_ok "the release table links bin/bep after every bep.app file" \
+        test "$(grep -E '^    "bep[-a-z]*\|darwin\|' "$_table" | tail -n1 | cut -d'|' -f1)" = '    "bep'
+
+    PLAT_S=Darwin; PLAT_M=arm64
+    : >"$root/xattr.calls"
+    H_BEP="$root/h_bep_darwin"; mkdir -p "$H_BEP/bin"
+    # A host that ran an earlier release has bin/bep as a plain file.
+    printf 'old-bep\n' >"$H_BEP/bin/bep"
+
+    # A bundle download that fails leaves that bin/bep in place.
+    _bep_components versions/v1/bep-not-there >"$mock/versions/v1/components"
+    reset_dl
+    run bep_darwin_failed_install "$H_BEP"
+    want_err "darwin install with an unreachable bep program fails" test "$rc" -eq 0
+    want_err "bin/bep is not yet a link" test -L "$H_BEP/bin/bep"
+    check "old-bep" "$(cat "$H_BEP/bin/bep")" "the earlier bin/bep is still in place"
+
+    _bep_components versions/v1/bep-macos-arm64 >"$mock/versions/v1/components"
+    : >"$root/xattr.calls"
+    reset_dl
+    run bep_darwin_install "$H_BEP"
+    check 0 "$rc" "darwin install with the bep rows exits 0"
+    want_ok "minvmd installs in the same bin directory" test -f "$H_BEP/bin/minvmd"
+    want_ok "bin/bep replaces the earlier plain file with a link" test -L "$H_BEP/bin/bep"
+    check "bep.app/Contents/MacOS/bep" "$(readlink "$H_BEP/bin/bep")" "bin/bep links to the program in the bundle"
+    check "$h_dbep" "$(hash_file "$H_BEP/bin/bep")" "bin/bep resolves to the program the manifest hashes"
+    want_ok "the bep program is executable like every bin row" test -x "$H_BEP/bin/bep.app/Contents/MacOS/bep"
+    want_ok "quarantine stripped from the bep program (xattr)" \
+        grep -q "/bin/bep\.app/Contents/MacOS/bep\.tmp" "$root/xattr.calls"
+    want_ok "bin/bep is recorded at its user-prefix path" \
+        record_has bep "$H_BEP/bin/bep" "$H_BEP/xdg-state/minimal/installed"
+    want_ok "the bep program is recorded at its user-prefix path" \
+        record_has bep-program "$H_BEP/bin/bep.app/Contents/MacOS/bep" "$H_BEP/xdg-state/minimal/installed"
+    want_ok "the installer printed the bep link status" \
+        grep -qE "^  bep +linked" "$OUT"
+
+    run bep_darwin_uninstall "$H_BEP" --uninstall
+    check 0 "$rc" "darwin uninstall with the bep rows exits 0"
+    want_err "uninstall removed the bin/bep link" test -L "$H_BEP/bin/bep"
+    want_err "uninstall removed the bep program" test -e "$H_BEP/bin/bep.app/Contents/MacOS/bep"
+    want_err "uninstall removed the emptied bin/bep.app directories" test -e "$H_BEP/bin/bep.app"
+    want_err "uninstall removed minvmd beside it" test -e "$H_BEP/bin/minvmd"
+    cp "$root/good-components" "$mock/versions/v1/components"   # restore
+    PLAT_S=Linux; PLAT_M=x86_64
+}
+
 case_linux_amd64_manifest_ships_vm_stack() { case_linux_vm_stack amd64; }
 case_linux_arm64_manifest_ships_vm_stack() { case_linux_vm_stack arm64; }
 
-# --- NET-122: the answerer ships beside min on every platform, as the copy
+# --- NET-122: the answerer ships beside min on every platform (on macOS
+# inside the app bundle bin/Minimal.app), as the copy
 # source the session advisory's privileged step copies from. The installer
 # places it with the same rules as the other binaries and writes no unit or
 # plist naming the user-prefix path — the advisory's one privileged command is
@@ -2073,16 +3567,16 @@ case_answerer_source_installed() {
     H_A1="$root/h_ans_amd64"; mkdir -p "$H_A1"
     run ans_amd64_install "$H_A1"
     check 0 "$rc" "amd64 install with the answerer row exits 0"
-    want_ok "amd64: the answerer installs beside min" test -f "$H_A1/bin/min-answerer"
+    want_ok "amd64: the answerer installs beside min" test -f "$H_A1/bin/minzoned"
     want_ok "amd64: beside the installed min itself" test -f "$H_A1/bin/min"
-    want_ok "amd64: the answerer is executable like every bin row" test -x "$H_A1/bin/min-answerer"
-    check "$h_answerer" "$(hash_file "$H_A1/bin/min-answerer")" \
+    want_ok "amd64: the answerer is executable like every bin row" test -x "$H_A1/bin/minzoned"
+    check "$h_answerer" "$(hash_file "$H_A1/bin/minzoned")" \
         "amd64: installed answerer matches the manifest hash"
     want_ok "amd64: the installer printed the answerer status" \
-        grep -qE "^  min-answerer +(installed|current)" "$OUT"
+        grep -qE "^  minzoned +(installed|current)" "$OUT"
     _rec="$H_A1/xdg-state/minimal/installed"
     want_ok "amd64: the answerer is recorded at its user-prefix path" \
-        record_has min-answerer "$H_A1/bin/min-answerer" "$_rec"
+        record_has minzoned "$H_A1/bin/minzoned" "$_rec"
     # The installed copy is only the copy source: no unit or plist was
     # written, and no record row names a service-manager path or the
     # root-owned program path.
@@ -2091,20 +3585,20 @@ case_answerer_source_installed() {
         sh -c 'find "$1" \( -name "*.plist" -o -name "*.service" -o -name "*.socket" \) -print | grep -q .' sh "$H_A1"
     # shellcheck disable=SC2016  # $2 is awk's second field, not a shell parameter
     want_ok "no record row names a unit, plist, or root-owned answerer path" \
-        awk '$2 ~ /(systemd|launchd|PrivilegedHelperTools|zone-answerer)/ {bad=1} END{exit bad ? 1 : 0}' "$_rec"
+        awk '$2 ~ /(systemd|launchd|PrivilegedHelperTools|lib\/minimal\/minzoned|dev\.gominimal\.zone)/ {bad=1} END{exit bad ? 1 : 0}' "$_rec"
 
     # An upgrade replaces it like the other binaries: a new release's answerer
     # bytes alone re-download and land.
-    printf 'linux-amd64-answerer-body-v2\n' >"$mock/versions/v1/min-answerer-linux-amd64-v2"
-    h_answerer2="$(hash_file "$mock/versions/v1/min-answerer-linux-amd64-v2")"
+    printf 'linux-amd64-answerer-body-v2\n' >"$mock/versions/v1/minzoned-linux-amd64-v2"
+    h_answerer2="$(hash_file "$mock/versions/v1/minzoned-linux-amd64-v2")"
     awk -v h="$h_answerer2" \
-        '$1=="min-answerer" && $2=="linux" && $3=="amd64" {$5=h; $8="versions/v1/min-answerer-linux-amd64-v2"} {print}' \
+        '$1=="minzoned" && $2=="linux" && $3=="amd64" {$5=h; $8="versions/v1/minzoned-linux-amd64-v2"} {print}' \
         "$root/good-components" >"$mock/versions/v1/components"
     reset_dl
     run ans_amd64_upgrade "$H_A1"
     check 0 "$rc" "answerer upgrade install exits 0"
     check 1 "$(downloads)" "a new manifest hash re-downloads the answerer alone"
-    check "$h_answerer2" "$(hash_file "$H_A1/bin/min-answerer")" \
+    check "$h_answerer2" "$(hash_file "$H_A1/bin/minzoned")" \
         "the upgraded answerer replaced the installed copy"
     cp "$root/good-components" "$mock/versions/v1/components"   # restore
 
@@ -2113,22 +3607,61 @@ case_answerer_source_installed() {
     H_A2="$root/h_ans_arm64"; mkdir -p "$H_A2"
     run ans_arm64_install "$H_A2"
     check 0 "$rc" "arm64 install with the answerer row exits 0"
-    check "$h_answerer_arm" "$(hash_file "$H_A2/bin/min-answerer")" \
+    check "$h_answerer_arm" "$(hash_file "$H_A2/bin/minzoned")" \
         "arm64: the answerer installs beside min"
     PLAT_M=x86_64
 
-    # darwin/arm64: beside min, dequarantined like every other bin row,
-    # recorded at the user prefix.
+    # darwin/arm64: inside the app bundle beside min, one row per bundle
+    # file, dequarantined like every other bin row, recorded at the user
+    # prefix.
     PLAT_S=Darwin; PLAT_M=arm64
     : >"$root/xattr.calls"
     H_A3="$root/h_ans_darwin"; mkdir -p "$H_A3"
+    _app="bin/Minimal.app/Contents"
     run ans_darwin_install "$H_A3"
     check 0 "$rc" "darwin install with the answerer row exits 0"
-    want_ok "darwin: the answerer installs beside min" test -f "$H_A3/bin/min-answerer"
+    check "$h_danswerer" "$(hash_file "$H_A3/$_app/MacOS/minzoned")" \
+        "darwin: the answerer installs inside the app bundle beside min"
+    want_ok "darwin: the answerer is executable like every bin row" test -x "$H_A3/$_app/MacOS/minzoned"
+    check "$h_dinfo" "$(hash_file "$H_A3/$_app/Info.plist")" \
+        "darwin: the bundle's other files install at their paths inside it"
+    want_err "darwin: no bare answerer is installed beside the bundle" test -e "$H_A3/bin/minzoned"
     want_ok "darwin: quarantine stripped from the answerer bin (xattr)" \
-        grep -q "/bin/min-answerer\.tmp" "$root/xattr.calls"
+        grep -q "/$_app/MacOS/minzoned\.tmp" "$root/xattr.calls"
     want_ok "darwin: the answerer is recorded at its user-prefix path" \
-        record_has min-answerer "$H_A3/bin/min-answerer" "$H_A3/xdg-state/minimal/installed"
+        record_has minzoned "$H_A3/$_app/MacOS/minzoned" "$H_A3/xdg-state/minimal/installed"
+    run ans_darwin_uninstall "$H_A3" --uninstall
+    check 0 "$rc" "darwin uninstall exits 0"
+    want_err "darwin: uninstall leaves no bundle directory behind" test -e "$H_A3/bin/Minimal.app"
+
+    # A release from before the bundle placed the answerer at bin/minzoned.
+    # Upgrading to a release with the bundle removes that file, so it does
+    # not stay on PATH as a second copy source; and a channel that points
+    # back at the older release leaves no half bundle.
+    H_A4="$root/h_ans_darwin_moved"; mkdir -p "$H_A4"
+    # shellcheck disable=SC2016  # $1.. are awk's fields, not shell parameters
+    awk '$1=="minzoned-info" && $2=="darwin" {next}
+         $1=="minzoned" && $2=="darwin" {$7="bin/minzoned"} {print}' \
+        "$root/good-components" >"$root/pre-bundle-components"
+    cp "$root/pre-bundle-components" "$mock/versions/v1/components"
+    run ans_darwin_pre_bundle "$H_A4"
+    check 0 "$rc" "darwin install from a release before the bundle exits 0"
+    want_ok "darwin: that release installs the bare answerer" test -f "$H_A4/bin/minzoned"
+    cp "$root/good-components" "$mock/versions/v1/components"   # restore
+    run ans_darwin_moved "$H_A4"
+    check 0 "$rc" "darwin upgrade to the bundle exits 0"
+    want_ok "darwin: the upgrade installs the bundle" test -f "$H_A4/$_app/MacOS/minzoned"
+    want_err "darwin: the upgrade removes the answerer's old path" test -e "$H_A4/bin/minzoned"
+    want_ok "darwin: the installer says what it removed" \
+        grep -q "minzoned: removed .*/bin/minzoned (the release now places it elsewhere)" "$OUT"
+    want_err "darwin: the removed path is no longer recorded" \
+        record_has minzoned "$H_A4/bin/minzoned" "$H_A4/xdg-state/minimal/installed"
+    cp "$root/pre-bundle-components" "$mock/versions/v1/components"
+    run ans_darwin_back "$H_A4"
+    check 0 "$rc" "darwin install back to the release before the bundle exits 0"
+    want_ok "darwin: the bare answerer is back" test -f "$H_A4/bin/minzoned"
+    want_err "darwin: no half bundle is left behind" test -e "$H_A4/bin/Minimal.app"
+    cp "$root/good-components" "$mock/versions/v1/components"   # restore
     PLAT_S=Linux; PLAT_M=x86_64
 }
 
@@ -2143,6 +3676,11 @@ case_for() {
         install)                            case_install ;;
         apparmor)                           case_apparmor ;;
         apparmor_uninstall)                 case_apparmor_uninstall ;;
+        finalize_install_uninstall)         case_finalize_install_uninstall ;;
+        installer_offers_finalize_install_on_a_tty) case_installer_offers_finalize_install_on_a_tty ;;
+        installer_prints_the_pointer_when_declined_or_without_tty)
+            case_installer_prints_the_pointer_when_declined_or_without_tty ;;
+        installer_does_not_prompt_on_a_finished_host) case_installer_does_not_prompt_on_a_finished_host ;;
         checksum_mismatch)                  case_checksum_mismatch ;;
         target_validation)                  case_target_validation ;;
         prefix_resolution)                  case_prefix_resolution ;;
@@ -2157,6 +3695,7 @@ case_for() {
         answerer_source_installed)      case_answerer_source_installed ;;
         linux_amd64_manifest_ships_vm_stack) case_linux_amd64_manifest_ships_vm_stack ;;
         linux_arm64_manifest_ships_vm_stack) case_linux_arm64_manifest_ships_vm_stack ;;
+        bep_installs_beside_minvmd)         case_bep_installs_beside_minvmd ;;
         *)
             echo "install_test: unknown case '$1' (known cases listed in the dispatch)" >&2
             exit 2
@@ -2165,12 +3704,16 @@ case_for() {
 }
 case "${1:-}" in
     "")
-        for _c in install apparmor apparmor_uninstall checksum_mismatch \
+        for _c in install apparmor apparmor_uninstall finalize_install_uninstall \
+            installer_offers_finalize_install_on_a_tty \
+            installer_prints_the_pointer_when_declined_or_without_tty \
+            installer_does_not_prompt_on_a_finished_host checksum_mismatch \
             target_validation prefix_resolution install_record daemon_stop \
             shell_integration darwin_dequarantine uninstall \
             gvproxy_rename_migration installer_switch_binary_executable \
             host_classifier_tree_installed answerer_source_installed \
-            linux_amd64_manifest_ships_vm_stack linux_arm64_manifest_ships_vm_stack; do
+            linux_amd64_manifest_ships_vm_stack linux_arm64_manifest_ships_vm_stack \
+            bep_installs_beside_minvmd; do
             case_for "$_c"
         done
         ;;

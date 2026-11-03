@@ -30,6 +30,36 @@ pub struct Cli {
     pub global_args: GlobalArgs,
 }
 
+/// Retired top-level verbs, each with the tip naming what replaced it.
+const RETIRED_COMMANDS: &[(&str, &str)] = &[(
+    "ssh-forward",
+    "`min ssh-forward` was removed: forward a box port with \
+     `min net forward <SESSION> <LOCAL>:<PORT>`",
+)];
+
+/// Adds a tip naming the replacement when `err` refuses a retired verb. The
+/// parser still refuses the verb, with its usage; the tip says where it went.
+pub fn with_retired_command_hint(mut err: clap::Error) -> clap::Error {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    if err.kind() != ErrorKind::InvalidSubcommand {
+        return err;
+    }
+    let tip = match err.get(ContextKind::InvalidSubcommand) {
+        Some(ContextValue::String(verb)) => RETIRED_COMMANDS
+            .iter()
+            .find(|(retired, _)| *retired == verb.as_str())
+            .map(|(_, tip)| tip),
+        _ => None,
+    };
+    if let Some(tip) = tip {
+        err.insert(
+            ContextKind::Suggested,
+            ContextValue::StyledStrs(vec![(*tip).to_owned().into()]),
+        );
+    }
+    err
+}
+
 #[derive(Subcommand)]
 pub enum Command {
     /// List sessions
@@ -56,6 +86,10 @@ pub enum Command {
     Task(TaskArgs),
     /// Network subcommands: bring a box's services to the laptop
     Net(NetArgs),
+    /// Box subcommands: show what a box will get
+    Box(BoxArgs),
+    /// Finish the install on this host: every privileged step it still needs, in one run (`--show` names them, `--show --script` prints the script, `--undo` removes them)
+    FinalizeInstall(FinalizeInstallArgs),
     /// Muscle-memory catch for the in-box `min run <task>`: always errors,
     /// naming the canonical `min task run <task>` (host) and
     /// `min session attach --command 'min task run <task>'` (in-box) forms.
@@ -63,6 +97,14 @@ pub enum Command {
     Run(RunArgs),
     /// Print important directories and file paths for debugging
     Dirs,
+    /// Check this host for problems: today, that no record of the audit log
+    /// was changed or removed
+    ///
+    /// Exits 0 when the audit log verifies or audit files are missing, and 6
+    /// when a record was changed or removed.
+    // BEP-049: whole-log verification of the audit chain is a `min doctor`
+    // check, never a `min box audit` flag.
+    Doctor,
     /// Collect a diagnostic bundle (logs, state, config) to send to the
     /// minimal dev team.
     ///
@@ -83,14 +125,18 @@ pub enum Command {
     /// Proxy stdio to a daemon UDS socket (used as an SSH ProxyCommand).
     #[command(hide = true)]
     Proxy(ProxyArgs),
-    /// Print that there is nothing to mint
+    /// Sign in to GitHub, and show the sign-in that boxes use
+    Auth(AuthArgs),
+    /// Store, list and remove the secrets that boxes reference by name
+    Secret(SecretArgs),
+    // NET-109: `min login` is the alias for `min auth login`, so it takes
+    // the same arguments and runs the same sign-in.
+    /// Sign in to GitHub (the same as min auth login)
     ///
-    /// The HTTPS reverse proxy this verb once served is retired, so it
-    /// issues nothing and writes nothing to disk. The verb stays as the
-    /// future home of the sign-in that replaces it.
-    #[command(verbatim_doc_comment)]
-    #[command(hide = true)]
-    Login(LoginArgs),
+    /// Opens GitHub in your browser. With `--device`, or in a build with no
+    /// browser sign-in, prints a code to enter at github.com instead. The
+    /// token is kept in the host keychain and never written to a file.
+    Login(AuthLoginArgs),
     // `init`, `add`, and `update` are deliberate exceptions to the
     // `<noun> <verb>` convention (documented in docs/reference/cli.md): they
     // are passthroughs to the project-configuration commands of the same name
@@ -121,9 +167,19 @@ pub enum Command {
     /// Draws the same build-hold-fade spinner used by the file-upload
     /// phases of `min session activate` so you can eyeball timing and layout
     /// without triggering a real upload. Stops after `--seconds` or
-    /// on Ctrl-C, whichever comes first.
+    /// on Ctrl-C, whichever comes first. Debug builds only.
+    #[cfg(debug_assertions)]
     #[command(hide = true)]
     Spin(SpinArgs),
+    /// Print the privileged command that installs this host's resolver,
+    /// local range and box-name service (development aid).
+    ///
+    /// The command a session start's advisory prints, rendered without a
+    /// daemon, so the service install can be tested on a host that cannot
+    /// boot a VM. Debug builds only.
+    #[cfg(debug_assertions)]
+    #[command(name = "debug-answerer-command", hide = true)]
+    DebugAnswererCommand,
     /// Print session-identifier completion candidates (used by the shell).
     ///
     /// The completion path a shell actually takes runs in-process (see
@@ -207,7 +263,7 @@ pub enum SessionCommand {
 
 #[derive(Debug, Args)]
 pub struct SetupZedArgs {
-    /// Session identifier (UUID or session name)
+    /// Session identifier (UUID, unique id prefix, or session name)
     #[arg(add = completion::session_completer())]
     pub session: String,
     /// Zed settings file to edit (default: `~/.config/zed/settings.json`)
@@ -221,7 +277,7 @@ pub struct SetupZedArgs {
 /// Args for `min session hooks`.
 #[derive(Debug, Args)]
 pub struct HooksArgs {
-    /// Session identifier (UUID or session name)
+    /// Session identifier (UUID, unique id prefix, or session name)
     #[arg(add = completion::session_completer())]
     pub session: String,
     /// Emit the raw JSON the daemon returned instead of a table
@@ -231,7 +287,7 @@ pub struct HooksArgs {
 
 #[derive(Debug, Args)]
 pub struct ExecArgs {
-    /// Session identifier (UUID or session name).
+    /// Session identifier (UUID, unique id prefix, or session name).
     #[arg(add = completion::session_completer())]
     pub session: String,
     /// Command to execute in the session context
@@ -246,7 +302,7 @@ pub struct ExecArgs {
 
 #[derive(Debug, Args)]
 pub struct SessionRunArgs {
-    /// Session identifier (UUID or session name).
+    /// Session identifier (UUID, unique id prefix, or session name).
     #[arg(add = completion::session_completer())]
     pub session: String,
     /// Name of a task declared in the session project's minimal.toml
@@ -255,7 +311,7 @@ pub struct SessionRunArgs {
 
 #[derive(Debug, Args)]
 pub struct PolicyArgs {
-    /// Session identifier (UUID or session name)
+    /// Session identifier (UUID, unique id prefix, or session name)
     #[arg(add = completion::session_completer())]
     pub session: String,
     /// Write one JSON document instead of text (the default)
@@ -352,6 +408,94 @@ impl std::fmt::Display for OutputWriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("failed to write the document to stdout")
     }
+}
+
+#[derive(Debug, Args)]
+pub struct BoxArgs {
+    #[command(subcommand)]
+    pub command: BoxCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BoxCommand {
+    /// Show how a project's box reaches GitHub through the local proxy:
+    /// the proxy's root certificate fingerprint, each secret with its hosts,
+    /// the steering mode and the UDP 443 stance
+    Spec(BoxSpecArgs),
+    /// Show what the local proxy recorded for one box: each request it
+    /// admitted or refused, each secret minted for the box, and the box's
+    /// revocation. A removed box's records stay readable by its id
+    Audit(BoxAuditArgs),
+    /// List the boxes of the current project, in any state: their id,
+    /// name, type, parent, project and state, with how a stopped or exited
+    /// box ended. `--all` lists every box on this host
+    List(BoxListArgs),
+    /// Show one box: its id, name, type, parent, project, state, how it
+    /// ended and the identity it runs under
+    Show(BoxShowArgs),
+}
+
+// BOX-158 (BCLI-001): `min box list [--all]`.
+#[derive(Debug, Args)]
+pub struct BoxListArgs {
+    /// List every box on this host, not only the boxes of the current
+    /// project
+    #[arg(long)]
+    pub all: bool,
+}
+
+// BOX-159 (BCLI-003): `min box show <box>`.
+#[derive(Debug, Args)]
+pub struct BoxShowArgs {
+    /// The box: its id, the start of its id, or its name, as `min box list`
+    /// prints them
+    pub target: String,
+}
+
+// BEP-042: `min box audit <box|self> | --parent <box|self> [-o jsonl] [--follow]`.
+#[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("box_or_parent").required(true).args(["target", "parent"])))]
+pub struct BoxAuditArgs {
+    /// The box: its id, or its name. A name reads the running box of that
+    /// name, else the newest box created under it. `self` is the box this
+    /// command runs in
+    pub target: Option<String>,
+    /// Show the records of every child box of this box (an id, a name or
+    /// `self`) together, each record naming its box
+    #[arg(long, value_name = "BOX")]
+    pub parent: Option<String>,
+    /// Write each record as one JSON line, as the proxy wrote it
+    #[arg(short = 'o', long = "output", value_enum)]
+    pub output: Option<BoxAuditOutputFormat>,
+    /// Show the records so far, then keep showing new records as the proxy
+    /// writes them, until interrupted
+    #[arg(long)]
+    pub follow: bool,
+}
+
+/// The rendering `min box audit` writes, beside the text default.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum BoxAuditOutputFormat {
+    /// One JSON object for each record
+    Jsonl,
+}
+
+#[derive(Debug, Args)]
+pub struct BoxSpecArgs {
+    /// The project directory whose minimal.toml declares the box
+    /// (default: --repo-dir, or the current directory)
+    pub path: Option<PathBuf>,
+    // The same flag as `min session activate --network`, from the same
+    // definition, so the preview is of the box that activation creates.
+    #[arg(
+        long,
+        value_name = NETWORK_VALUE_NAME,
+        value_parser = parse_network_mode,
+        default_value = NETWORK_DEFAULT,
+        help = NETWORK_HELP,
+        long_help = NETWORK_LONG_HELP
+    )]
+    pub network: CliNetworkMode,
 }
 
 #[derive(Debug, Args)]
@@ -487,7 +631,7 @@ pub struct MeshJoinArgs {
 // Deliberately NOT a doc comment: clap propagates a flattened struct's doc
 // comment into the parent command's long_about, which would replace the
 // top-level `min --help` description with this text.
-#[derive(Debug, Default, Args)]
+#[derive(Debug, Default, Clone, Args)]
 pub struct GlobalArgs {
     /// Use the given directory as the repository root, instead of the current
     /// working directory.
@@ -545,7 +689,7 @@ impl GlobalArgs {
         matches!(self.provider, Some(Provider::LocalMinvmd))
     }
 
-    /// Publish `--vm` as this process's VM name so every provider dir the
+    /// Publish `--vm` as this process's VM name so every host dir the
     /// command resolves — socket, state dir, autospawn — names the same VM
     /// (NET-052). Called once at dispatch, before any path resolution; the
     /// default VM is untouched when the flag is absent (NET-053).
@@ -596,42 +740,35 @@ pub struct ActivateArgs {
     /// are otherwise skipped without a prompt.
     #[arg(long, value_enum)]
     pub sync: Option<SyncMode>,
-    /// Network mode for the session: `none` gives the session no network
-    /// (every socket it opens to a destination outside itself fails),
-    /// `host_ip` shares the host's network namespace (the default), and
-    /// `own_ip` gives the session an IP of its own on the host's switch, so
-    /// `--ingress` can publish ports.
-    ///
-    /// The hyphenated spellings `no-net`, `host-net`, and `own-ip` are still
-    /// accepted, but each prints a one-line hint naming the current spelling.
+    // The `--network` flag is shared with `min box spec`, so the two
+    // cannot drift: see [`NETWORK_HELP`].
     #[arg(
         long,
-        value_name = "none|host_ip|own_ip",
+        value_name = NETWORK_VALUE_NAME,
         value_parser = parse_network_mode,
-        default_value = "host_ip"
+        default_value = NETWORK_DEFAULT,
+        help = NETWORK_HELP,
+        long_help = NETWORK_LONG_HELP
     )]
     pub network: CliNetworkMode,
     /// Static ingress port mapping `EXT:INT[/PROTO]` (PROTO = tcp|udp, default
     /// tcp). Repeatable. Requires `--network own_ip`.
     #[arg(long = "ingress", value_name = "EXT:INT[/PROTO]")]
     pub ingress: Vec<String>,
-    /// How dynamic ingress requests from inside this box are decided
-    /// (NET-043): `allow` publishes a port the box asks to expose (or
-    /// listens on inside `--dynamic-range`), `ask` routes the request to
-    /// the attached human, `deny` — like an unset flag — refuses every
-    /// one. Requires `--network own_ip`; the flags are the interim source
-    /// of the Box Spec `[network]` block's `dynamic_ingress` setting.
+    /// How the box's requests to publish a port while it runs are decided:
+    /// `allow` publishes a port the box asks for with `min net expose` or
+    /// listens on inside `--dynamic-range`, `ask` puts each request to the
+    /// person attached to the box, and `deny`, the same as leaving the flag
+    /// unset, refuses every request. Requires `--network own_ip`.
     #[arg(
         long = "dynamic-ingress",
         value_name = "allow|ask|deny",
         value_parser = parse_dynamic_ingress_mode
     )]
-    pub dynamic_ingress: Option<sessions::DynamicIngress>,
-    /// Inclusive port range `lo-hi` (both ends included) within which
-    /// `--dynamic-ingress allow` accepts dynamic ingress requests; outside
-    /// it a request is refused with the out-of-range error. Only meaningful
-    /// beside `--dynamic-ingress`, so the range-without-mode spelling is
-    /// rejected rather than read as a deliberate allow.
+    pub dynamic_ingress: Option<boxes::DynamicIngress>,
+    /// Port range `LO-HI`, both ends included, in which
+    /// `--dynamic-ingress allow` accepts requests, e.g. `8000-8443`; a
+    /// request outside it is refused. Requires `--dynamic-ingress`.
     #[arg(
         long = "dynamic-range",
         value_name = "LO-HI",
@@ -639,44 +776,45 @@ pub struct ActivateArgs {
         requires = "dynamic_ingress"
     )]
     pub dynamic_range: Option<(u16, u16)>,
-    /// Allowed destination subnets in CIDR form (`egress.allow_subnets`),
-    /// e.g. `10.0.0.0/8`. Repeatable; unset means allow-all subnets. Valid on
-    /// an own-address (`--network own_ip`) or host-address
-    /// (`--network host_ip`) box; a none box rejects the whole egress
-    /// declaration.
+    /// Allow outbound traffic to this destination subnet, in CIDR form,
+    /// e.g. `10.0.0.0/8`. Repeatable. Once any egress flag is given, an
+    /// `--allow-subnets` or `--allow-dns-hosts` list that is not given
+    /// allows nothing, unless the host opts out: `--allow-dns-hosts
+    /// github.com` alone reaches no address directly, and `--allow-subnets
+    /// 0.0.0.0/0` writes allow-all out. The egress flags are accepted with
+    /// `--network own_ip` and `--network host_ip`, and only `own_ip`
+    /// enforces these rules: a `host_ip` box is refused at creation or, on
+    /// a host that cannot filter it, runs with the rules unenforced.
+    /// `--network none` rejects every egress flag. `min session policy`
+    /// shows the rules a box ended up with.
     #[arg(long = "allow-subnets", value_name = "CIDR")]
     pub allow_subnets: Vec<String>,
-    /// Allowed destination DNS hostnames (`egress.allow_dns_hosts`), e.g.
-    /// `github.com`. Repeatable; unset means allow-all hosts.
+    /// Allow outbound traffic to this DNS hostname, e.g. `github.com`.
+    /// Repeatable. Given without `--allow-subnets`, the box reaches the
+    /// named hosts by name and no address directly; see `--allow-subnets`.
     #[arg(long = "allow-dns-hosts", value_name = "HOST")]
     pub allow_dns_hosts: Vec<String>,
-    /// Allowed outbound transport protocols (`egress.allow_protocols`):
-    /// tcp, udp, or icmp. Repeatable; unset means allow all protocols.
+    /// Allow this outbound transport protocol: tcp, udp, or icmp.
+    /// Repeatable; unset allows every protocol. Narrows what the other
+    /// allow flags admit and admits nothing on its own.
     #[arg(long = "allow-protocols", value_name = "PROTO")]
     pub allow_protocols: Vec<String>,
-    /// Denied destination subnets in CIDR form (`egress.deny_subnets`),
-    /// subtracted from the allowed set. Repeatable; unset means nothing is
-    /// denied.
+    /// Deny outbound traffic to this destination subnet, in CIDR form,
+    /// subtracted from what the allow flags admit. Repeatable; unset
+    /// denies nothing.
     #[arg(long = "deny-subnets", value_name = "CIDR")]
     pub deny_subnets: Vec<String>,
-    /// Declare deny-all egress: the box reaches no external address. The
-    /// section this writes is the deny-all shape — every allow list present
-    /// and empty, nothing denied on top (`sessions::EgressPolicy::deny_all()`)
-    /// — a declaration, not the default: on a host-address box the host's
-    /// classifier decides it per box (NET-079), while a box that declares no
-    /// egress at all keeps the default the rollout phase resolves
-    /// (NET-074). Valid wherever the egress rule flags are; conflicts with
-    /// every one of them, because deny-all admits no exceptions.
+    /// Declare deny-all egress: the box reaches no external address.
+    /// Cannot be combined with the `--allow-*` or `--deny-subnets` flags.
+    /// Unless the host opts out, a `--network own_ip` box with no egress
+    /// rules already gets this by default. With `--network host_ip` it is
+    /// enforced only on a host that can filter each box.
     #[arg(long = "deny-all-egress", conflicts_with = "egress-rules")]
     pub deny_all_egress: bool,
-    /// Declare a credentialed upstream for this box (NET-134): the Box
-    /// Egress Proxy's listener becomes the box's infrastructure, reachable
-    /// whatever its `--allow-*`/`--deny-*` rules say. Without the flag every
-    /// frame this box sends to the proxy's address is dropped — by the VM
-    /// host's egress gate on a VM-backed host, by the relay's own
-    /// `egress-uncredentialed-proxy-destination` drop on a native one. The
-    /// steering the proxy applies and the credentials it redeems are the
-    /// proxy document's; this declares the lane, nothing more.
+    /// Let the box reach the Box Egress Proxy, whatever its
+    /// `--allow-*`/`--deny-*` rules say. Without this flag, everything the
+    /// box sends to the proxy's address is dropped. Takes effect only with
+    /// `--network own_ip`.
     #[arg(long)]
     pub credentialed_upstream: bool,
     /// Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml`.
@@ -710,7 +848,7 @@ pub struct ActivateArgs {
     pub attach: bool,
 }
 
-/// Which daemon backend ("provider") hosts sessions.
+/// Which daemon backend (box host) serves sessions, as `--provider` names it.
 ///
 /// On Linux the default is the host-native daemon (DM2); `local-minvmd` runs
 /// `minimald` inside the minvmd microVM (DM1) instead. On macOS minvmd is the
@@ -732,10 +870,10 @@ pub enum SyncMode {
     None,
 }
 
-/// CLI surface for [`sessions::NetworkMode`]. Parsed by hand in
+/// CLI surface for [`boxes::NetworkMode`]. Parsed by hand in
 /// [`parse_network_mode`] rather than derived from a `ValueEnum`: the hand
 /// parser is what accepts the legacy hyphenated spellings with a rename hint,
-/// which a derived enum cannot, and it keeps the `sessions` crate free of a
+/// which a derived enum cannot, and it keeps the `boxes` crate free of a
 /// clap dependency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliNetworkMode {
@@ -743,6 +881,38 @@ pub enum CliNetworkMode {
     HostNet,
     OwnIp,
 }
+
+/// The `--network` value name, shared by `min session activate` and
+/// `min box spec`.
+pub(crate) const NETWORK_VALUE_NAME: &str = "none|host_ip|own_ip";
+
+/// The `--network` default, shared by `min session activate` and `min box
+/// spec`, so a preview with no flag is of a box created with no flag.
+pub(crate) const NETWORK_DEFAULT: &str = "host_ip";
+
+/// The first paragraph of the `--network` help, as a literal so that
+/// [`NETWORK_LONG_HELP`] can extend it.
+macro_rules! network_help {
+    () => {
+        "Network mode for the session: `none` gives the session no network (every socket it \
+         opens to a destination outside itself fails), `host_ip` shares the host's network \
+         namespace (the default), and `own_ip` gives the session its own IP address, so \
+         `--ingress` can publish ports; unless the host opts out, an `own_ip` session with no \
+         egress rules can reach no external address"
+    };
+}
+
+/// The `--network` short help, shared by `min session activate` and `min
+/// box spec`.
+pub(crate) const NETWORK_HELP: &str = network_help!();
+
+/// The `--network` long help: the short help and the legacy spellings.
+pub(crate) const NETWORK_LONG_HELP: &str = concat!(
+    network_help!(),
+    ".\n\n",
+    "The hyphenated spellings `no-net`, `host-net`, and `own-ip` are still accepted, but each \
+     prints a one-line hint naming the current spelling."
+);
 
 /// Parses the `--network <none|host_ip|own_ip>` value (NET-037). The
 /// hyphenated spellings `no-net`, `host-net`, and `own-ip` predate the
@@ -783,23 +953,23 @@ pub(crate) fn legacy_network_hint(raw: &str) -> Option<String> {
     ))
 }
 
-impl From<CliNetworkMode> for sessions::NetworkMode {
+impl From<CliNetworkMode> for boxes::NetworkMode {
     fn from(m: CliNetworkMode) -> Self {
         match m {
-            CliNetworkMode::NoNet => sessions::NetworkMode::NoNet,
-            CliNetworkMode::HostNet => sessions::NetworkMode::HostNet,
-            CliNetworkMode::OwnIp => sessions::NetworkMode::OwnIp,
+            CliNetworkMode::NoNet => boxes::NetworkMode::NoNet,
+            CliNetworkMode::HostNet => boxes::NetworkMode::HostNet,
+            CliNetworkMode::OwnIp => boxes::NetworkMode::OwnIp,
         }
     }
 }
 
-/// Parse an `--ingress EXT:INT[/PROTO]` spec into a [`sessions::PortMapping`].
+/// Parse an `--ingress EXT:INT[/PROTO]` spec into a [`boxes::PortMapping`].
 /// PROTO defaults to tcp; only tcp/udp are accepted (gvproxy's static forwarder
 /// exposes no other transport).
-pub(crate) fn parse_ingress_mapping(spec: &str) -> Result<sessions::PortMapping, anyhow::Error> {
+pub(crate) fn parse_ingress_mapping(spec: &str) -> Result<boxes::PortMapping, anyhow::Error> {
     let (ports, proto) = match spec.split_once('/') {
         Some((ports, proto)) => (ports, parse_ingress_proto(proto)?),
-        None => (spec, sessions::IpProto::Tcp),
+        None => (spec, boxes::IpProto::Tcp),
     };
     let (ext, int) = ports
         .split_once(':')
@@ -815,17 +985,17 @@ pub(crate) fn parse_ingress_mapping(spec: &str) -> Result<sessions::PortMapping,
             "ingress '{spec}': internal port 0 is reserved — choose an internal port >= 1"
         );
     }
-    Ok(sessions::PortMapping {
+    Ok(boxes::PortMapping {
         external_port,
         internal_port,
         proto,
     })
 }
 
-pub(crate) fn parse_ingress_proto(proto: &str) -> Result<sessions::IpProto, anyhow::Error> {
+pub(crate) fn parse_ingress_proto(proto: &str) -> Result<boxes::IpProto, anyhow::Error> {
     match proto.to_ascii_lowercase().as_str() {
-        "tcp" => Ok(sessions::IpProto::Tcp),
-        "udp" => Ok(sessions::IpProto::Udp),
+        "tcp" => Ok(boxes::IpProto::Tcp),
+        "udp" => Ok(boxes::IpProto::Udp),
         other => Err(anyhow::anyhow!(
             "ingress: unsupported protocol '{other}' (use tcp or udp)"
         )),
@@ -833,7 +1003,7 @@ pub(crate) fn parse_ingress_proto(proto: &str) -> Result<sessions::IpProto, anyh
 }
 
 /// Parse a `--dynamic-ingress <allow|ask|deny>` value (NET-043) into the
-/// [`sessions::DynamicIngress`] stance the create request carries. The
+/// [`boxes::DynamicIngress`] stance the create request carries. The
 /// snake_case spellings are the record's own — the same words
 /// `min session policy` prints back — so what a person types to create the
 /// box is what they read from it later. `deny` parses the same as an unset
@@ -841,11 +1011,11 @@ pub(crate) fn parse_ingress_proto(proto: &str) -> Result<sessions::IpProto, anyh
 /// them as, but spelling it is still meaningful — it makes the ingress
 /// declaration, so `min session policy` shows the resolved row rather than
 /// no ingress block at all.
-pub(crate) fn parse_dynamic_ingress_mode(raw: &str) -> Result<sessions::DynamicIngress, String> {
+pub(crate) fn parse_dynamic_ingress_mode(raw: &str) -> Result<boxes::DynamicIngress, String> {
     match raw {
-        "allow" => Ok(sessions::DynamicIngress::Allow),
-        "deny" => Ok(sessions::DynamicIngress::Deny),
-        "ask" => Ok(sessions::DynamicIngress::Ask),
+        "allow" => Ok(boxes::DynamicIngress::Allow),
+        "deny" => Ok(boxes::DynamicIngress::Deny),
+        "ask" => Ok(boxes::DynamicIngress::Ask),
         other => Err(format!(
             "dynamic ingress: unknown mode '{other}' (expected allow, ask, or deny)"
         )),
@@ -856,7 +1026,7 @@ pub(crate) fn parse_dynamic_ingress_mode(raw: &str) -> Result<sessions::DynamicI
 /// `(lo, hi)` pair the create request's `dynamic_allowed_range` carries.
 /// A malformed value (no `-`, a non-numeric end, a port outside u16), an
 /// inverted one (`hi` below `lo`), or a privileged one (`lo` below
-/// [`sessions::MIN_DYNAMIC_INGRESS_PORT`]) is a create-time error here, at the flag,
+/// [`boxes::MIN_DYNAMIC_INGRESS_PORT`]) is a create-time error here, at the flag,
 /// rather than a daemon-side refusal after the box's directory exists: the
 /// user sees what they typed named in the error, with no half-created
 /// session behind it.
@@ -879,24 +1049,24 @@ pub(crate) fn parse_dynamic_range(raw: &str) -> Result<(u16, u16), String> {
     }
     // The launch check's own bound and wording (`validate_policy`), so a
     // privileged range is refused here, at the flag, in the same words.
-    if lo < sessions::MIN_DYNAMIC_INGRESS_PORT {
+    if lo < boxes::MIN_DYNAMIC_INGRESS_PORT {
         return Err(format!(
             "dynamic range '{raw}': {}",
-            sessions::PolicyError::PrivilegedDynamicRange { lo }
+            boxes::PolicyError::PrivilegedDynamicRange { lo }
         ));
     }
     Ok((lo, hi))
 }
 
-/// Parse an `--allow-protocols <PROTO>` spec into an [`sessions::IpProto`].
+/// Parse an `--allow-protocols <PROTO>` spec into an [`boxes::IpProto`].
 /// Egress rules name any transport the policy type carries, so unlike the
 /// ingress parser (whose vocabulary is gvproxy's static forwarder's), icmp is
 /// accepted here.
-pub(crate) fn parse_egress_proto(proto: &str) -> Result<sessions::IpProto, anyhow::Error> {
+pub(crate) fn parse_egress_proto(proto: &str) -> Result<boxes::IpProto, anyhow::Error> {
     match proto.to_ascii_lowercase().as_str() {
-        "tcp" => Ok(sessions::IpProto::Tcp),
-        "udp" => Ok(sessions::IpProto::Udp),
-        "icmp" => Ok(sessions::IpProto::Icmp),
+        "tcp" => Ok(boxes::IpProto::Tcp),
+        "udp" => Ok(boxes::IpProto::Udp),
+        "icmp" => Ok(boxes::IpProto::Icmp),
         other => Err(anyhow::anyhow!(
             "egress: unsupported protocol '{other}' (use tcp, udp, or icmp)"
         )),
@@ -923,9 +1093,9 @@ pub(crate) fn parse_forward_spec(spec: &str) -> Result<(u16, u16), anyhow::Error
 
 #[derive(Debug, Args)]
 pub struct AttachArgs {
-    /// Session identifier (UUID or session name). When omitted, `min session attach`
-    /// resolves a session from the current working directory (or the only
-    /// existing session), and opens an interactive picker if the choice is
+    /// Session identifier (UUID, unique id prefix, or session name). When
+    /// omitted, `min session attach` resolves a session from the current
+    /// working directory (or the only existing session), and opens an interactive picker if the choice is
     /// ambiguous. See `--no-input` to skip the picker in scripts.
     #[arg(add = completion::session_completer())]
     pub session: Option<String>,
@@ -945,13 +1115,13 @@ pub struct LsArgs {
 #[derive(Debug, Args)]
 #[command(group(ArgGroup::new("target").args(["session", "all"]).required(true).multiple(false)))]
 pub struct DestroyArgs {
-    /// Session identifier (UUID or session name)
+    /// Session identifier (UUID, unique id prefix, or session name)
     #[arg(add = completion::session_completer())]
     pub session: Option<String>,
     /// Destroy all sessions
     #[arg(long)]
     pub all: bool,
-    /// Skip the destroy confirmation
+    /// Skip the destroy confirmation, and treat a session that is already destroyed as success
     #[arg(long, short)]
     pub force: bool,
 }
@@ -976,7 +1146,7 @@ pub enum NetCommand {
 
 #[derive(Debug, Args)]
 pub struct NetForwardArgs {
-    /// Session identifier (UUID or session name)
+    /// Session identifier (UUID, unique id prefix, or session name)
     #[arg(add = completion::session_completer())]
     pub session: String,
     /// Ports to relay, as `<LOCAL>:<PORT>` — the laptop-side listener and
@@ -987,15 +1157,41 @@ pub struct NetForwardArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct FinalizeInstallArgs {
+    /// Name what is missing on this host and run nothing
+    #[arg(long)]
+    pub show: bool,
+    /// With --show, also print the script a run would execute, on stdout
+    #[arg(long, requires = "show", conflicts_with = "json")]
+    pub script: bool,
+    /// With --show, print the report as JSON (schema `min/v1/finalize-install`); exits non-zero while any part is missing
+    #[arg(long, requires = "show", conflicts_with = "undo")]
+    pub json: bool,
+    /// Remove everything the step installed on this host (with --show --script, print the removal script instead)
+    #[arg(long)]
+    pub undo: bool,
+    /// The two contiguous connection-mark bits that egress enforcement uses, in hex (for example 0x0c000000). Use it when another firewall rule already uses the default bits. The boot service keeps the value
+    #[arg(
+        long,
+        value_name = "MASK",
+        value_parser = crate::cmd::parse_ct_mark_mask,
+        conflicts_with = "undo"
+    )]
+    pub ct_mark_mask: Option<u32>,
+}
+
+#[derive(Debug, Args)]
 pub struct StopArgs {
-    /// Force shutdown even if a session is mid-create or still holds a host handle (even a dead one)
+    /// Force shutdown even if a session is mid-create or still holds a host handle (even a dead one).
+    /// On a VM backend whose in-guest daemon does not answer, stops the VM from the host;
+    /// data not yet flushed inside the VM can then be lost
     #[arg(long, short, default_value_t = false)]
     pub force: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct RenameArgs {
-    /// Session identifier (UUID or session name)
+    /// Session identifier (UUID, unique id prefix, or session name)
     #[arg(add = completion::session_completer())]
     pub session: String,
     /// New name for the session
@@ -1043,6 +1239,7 @@ pub struct AddKind {
 #[derive(Debug, Args)]
 pub struct UpdateArgs {}
 
+#[cfg(debug_assertions)]
 #[derive(Debug, Args)]
 pub struct SpinArgs {
     /// How long to keep the spinner visible before auto-exiting.
@@ -1056,11 +1253,131 @@ pub struct ProxyArgs {
     /// UDS socket path to connect to
     #[arg(long)]
     pub socket: Option<String>,
+    /// The `min` process this proxy serves (ssh's parent): the proxy exits,
+    /// closing the daemon connection, once that process is gone.
+    #[arg(long, hide = true)]
+    pub owner: Option<u32>,
+    /// A file the owner holds an exclusive `flock` on for its lifetime: the
+    /// proxy exits the moment it can take that lock, which the kernel
+    /// releases on any end of the owner, a SIGKILL included. The pid above
+    /// is the fallback where no lock was handed.
+    #[arg(long, hide = true)]
+    pub owner_lock: Option<PathBuf>,
 }
 
-/// Arguments for `min login`.
 #[derive(Debug, Args)]
-pub struct LoginArgs {}
+pub struct AuthArgs {
+    #[command(subcommand)]
+    pub command: AuthCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AuthCommand {
+    /// Sign in to GitHub and keep the sign-in in the host keychain
+    ///
+    /// Opens GitHub in your browser. With `--device`, or in a build with no
+    /// browser sign-in, prints a code to enter at github.com instead. The
+    /// token is kept in the host keychain and never written to a file.
+    Login(AuthLoginArgs),
+    /// Show whether you are signed in to GitHub, and when the token expires
+    ///
+    /// Never prints the token.
+    Status,
+    /// Sign out of GitHub and remove the sign-in from the host keychain
+    ///
+    /// Boxes created before the sign-out lose GitHub access at their next
+    /// request, and their processes keep running. Also asks GitHub to revoke
+    /// the sign-in. A later `min auth login` gives those boxes no access
+    /// back.
+    Logout,
+}
+
+#[derive(Debug, Args)]
+pub struct AuthLoginArgs {
+    /// Sign in with a code entered at github.com, not in this browser
+    #[arg(long)]
+    pub device: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SecretArgs {
+    #[command(subcommand)]
+    pub command: SecretCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SecretCommand {
+    /// Store a secret in the host keychain under a name
+    ///
+    /// Reads the value from the terminal, or from standard input when it is
+    /// not a terminal. Prints only the name. Only the Box Egress Proxy reads
+    /// the stored value without a prompt.
+    Set(SecretSetArgs),
+    /// List the stored secrets and the rules that use them
+    ///
+    /// Never prints a value.
+    #[command(alias = "ls")]
+    List(SecretListArgs),
+    /// Remove a stored secret
+    Rm(SecretRmArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SecretSetArgs {
+    /// The name that box specs use for the secret
+    pub id: String,
+    /// The store to keep the secret in (default: the host keychain)
+    #[arg(long)]
+    pub store: Option<String>,
+    // Neither of these fields carries a value into the store: each one is
+    // here so that `set` refuses a value given on the command line with its
+    // own message (BEP-050), not with a generic usage error.
+    #[arg(hide = true)]
+    pub value: Option<String>,
+    #[arg(long = "env", alias = "from-env", value_name = "VAR", hide = true)]
+    pub env: Option<String>,
+    /// The host or host:port the secret is sent to; repeat for more than one.
+    /// Writes the secret's rule to your config.toml
+    #[arg(
+        long,
+        value_name = "HOST[:PORT]",
+        conflicts_with = "preset",
+        requires = "form"
+    )]
+    pub upstream: Vec<String>,
+    /// The HTTP header that carries the secret
+    #[arg(long, value_name = "NAME", group = "form", requires = "upstream")]
+    pub header: Option<String>,
+    /// Text sent before the secret in the header, such as "Bearer "
+    #[arg(long, value_name = "TEXT", requires = "header")]
+    pub prefix: Option<String>,
+    /// Send the secret as this basic authentication field: user or password
+    #[arg(long, value_name = "FIELD", group = "form", requires = "upstream")]
+    pub basic_auth: Option<String>,
+    /// Use the upstream and header of a known service: anthropic,
+    /// anthropic-api-key, cloudflare, linear or sentry
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["header", "prefix", "basic_auth"])]
+    pub preset: Option<String>,
+    /// Replace a different rule for this secret without asking
+    #[arg(long, short)]
+    pub yes: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct SecretListArgs {
+    /// The store to list (default: the host keychain)
+    #[arg(long)]
+    pub store: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SecretRmArgs {
+    /// The name of the secret to remove
+    pub id: String,
+    /// The store that holds the secret (default: the host keychain)
+    #[arg(long)]
+    pub store: Option<String>,
+}
 
 /// Arguments for the hidden `min complete-session-str`.
 #[derive(Debug, Args)]

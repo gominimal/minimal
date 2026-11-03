@@ -48,12 +48,15 @@ pub use notices::{NoticeFile, SourceNotices};
 mod sources;
 pub use sources::{SourceFetcher, SourceLoad};
 mod specs;
-pub use specs::{SpecBuild, SpecBuildResult};
+pub use specs::{BuildNetwork, SpecBuild, SpecBuildResult};
 
 mod oci_image;
 
+mod materialize_events;
+pub use materialize_events::MaterializeEvent;
+
 mod materialize;
-pub use materialize::{Materialize, MaterializeEvent, OutputSpec, Report, Sink};
+pub use materialize::{Materialize, OutputSpec, Report, Sink};
 
 mod patched;
 pub use patched::{PatchedBuild, PatchedBuildResult};

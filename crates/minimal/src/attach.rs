@@ -24,13 +24,13 @@ use minimald_rpc::ListSessionsEntry;
 /// reset.
 ///
 /// The same vocabulary `minimald` draws its per-session unwind codes from
-/// (both sides name the sequences out of [`sessions::terminal`], so neither
+/// (both sides name the sequences out of [`boxes::terminal`], so neither
 /// can drift), but without the "only if currently set" narrowing: a client has
 /// no screen model to diff against, so it can only write the lot.
 ///
 /// Writing the lot is *not* free. Every sequence here bar one is inert against
 /// a terminal that was never in that mode; the exception is
-/// [`LEAVE_ALT_SCREEN`](sessions::terminal::LEAVE_ALT_SCREEN), which on
+/// [`LEAVE_ALT_SCREEN`](boxes::terminal::LEAVE_ALT_SCREEN), which on
 /// xterm-family terminals performs a `DECRC`-style cursor restore even from
 /// the normal buffer, so a gratuitous one can jump the cursor to a stale saved
 /// position and have the shell prompt redraw over existing content. That is
@@ -38,24 +38,24 @@ use minimald_rpc::ListSessionsEntry;
 /// demonstrably could not have spoken for itself, rather than on every attach.
 const TERMINAL_UNWIND: &[&str] = &[
     // mouse reporting: press, press/release, button-motion, any-motion
-    sessions::terminal::MOUSE_X10_OFF,
-    sessions::terminal::MOUSE_PRESS_RELEASE_OFF,
-    sessions::terminal::MOUSE_BUTTON_MOTION_OFF,
-    sessions::terminal::MOUSE_ANY_MOTION_OFF,
+    boxes::terminal::MOUSE_X10_OFF,
+    boxes::terminal::MOUSE_PRESS_RELEASE_OFF,
+    boxes::terminal::MOUSE_BUTTON_MOTION_OFF,
+    boxes::terminal::MOUSE_ANY_MOTION_OFF,
     // mouse encodings: utf-8, SGR, urxvt
-    sessions::terminal::MOUSE_ENCODING_UTF8_OFF,
-    sessions::terminal::MOUSE_ENCODING_SGR_OFF,
-    sessions::terminal::MOUSE_ENCODING_URXVT_OFF,
+    boxes::terminal::MOUSE_ENCODING_UTF8_OFF,
+    boxes::terminal::MOUSE_ENCODING_SGR_OFF,
+    boxes::terminal::MOUSE_ENCODING_URXVT_OFF,
     // bracketed paste, application cursor keys, application keypad
-    sessions::terminal::BRACKETED_PASTE_OFF,
-    sessions::terminal::APPLICATION_CURSOR_KEYS_OFF,
-    sessions::terminal::APPLICATION_KEYPAD_OFF,
+    boxes::terminal::BRACKETED_PASTE_OFF,
+    boxes::terminal::APPLICATION_CURSOR_KEYS_OFF,
+    boxes::terminal::APPLICATION_KEYPAD_OFF,
     // leave the alternate screen, unhide the cursor
-    sessions::terminal::LEAVE_ALT_SCREEN,
-    sessions::terminal::SHOW_CURSOR,
+    boxes::terminal::LEAVE_ALT_SCREEN,
+    boxes::terminal::SHOW_CURSOR,
     // reset drawing attributes ('SGR') and focus reporting
-    sessions::terminal::SGR_RESET,
-    sessions::terminal::FOCUS_REPORTING_OFF,
+    boxes::terminal::SGR_RESET,
+    boxes::terminal::FOCUS_REPORTING_OFF,
 ];
 
 /// [`TERMINAL_UNWIND`] as the byte string that goes to the tty.
@@ -83,7 +83,7 @@ fn terminal_unwind_bytes() -> Vec<u8> {
 /// The one ambiguity is honest and unavoidable: a session process that itself
 /// exits 255 is indistinguishable, from out here, from an ssh transport
 /// failure, so it earns a redundant blind unwind. Harmless but for the
-/// [`LEAVE_ALT_SCREEN`](sessions::terminal::LEAVE_ALT_SCREEN) caveat on
+/// [`LEAVE_ALT_SCREEN`](boxes::terminal::LEAVE_ALT_SCREEN) caveat on
 /// [`TERMINAL_UNWIND`].
 ///
 /// Pure in its input so both branches are unit-testable without spawning ssh.
@@ -150,6 +150,40 @@ impl<W: Write> Drop for TerminalUnwind<W> {
         // that cannot be written to is already beyond repair.
         let _ = self.out.write_all(&terminal_unwind_bytes());
         let _ = self.out.flush();
+    }
+}
+
+/// The interactive attach could not take the terminal, so it never changed
+/// it: the marker that tells the attach a failure owes the terminal no
+/// unwind ([`crate::cmd::interactive_attach`]).
+#[derive(Debug)]
+pub(crate) struct TerminalNotTaken;
+
+impl fmt::Display for TerminalNotTaken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the interactive attach needs a terminal, but none could be taken")
+    }
+}
+
+impl std::error::Error for TerminalNotTaken {}
+
+/// A relay that failed before ssh's session reached the real terminal: the
+/// pty, the spawn or the raw mode failed, and the relay put back whatever
+/// it changed. The marker tells the attach that the failure owes the
+/// terminal no unwind ([`crate::cmd::interactive_attach`]). It wraps the
+/// relay's error and prints exactly as that error does.
+#[derive(Debug)]
+pub(crate) struct RelayNotStarted(pub(crate) anyhow::Error);
+
+impl fmt::Display for RelayNotStarted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for RelayNotStarted {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
     }
 }
 
@@ -252,7 +286,7 @@ pub(crate) struct ResolvedBoxVm {
     /// That VM's daemon socket.
     pub sock: std::path::PathBuf,
     /// The record the name resolved to on that VM.
-    pub record: sessions::Record,
+    pub record: boxes::Record,
 }
 
 /// Resolve the VM that owns a box name from the name alone (NET-058), across
@@ -265,10 +299,15 @@ pub(crate) struct ResolvedBoxVm {
 /// original error (the selected VM's — usually the more useful of the two).
 /// An explicit `--vm` pins where to look, so it resolves nothing: the
 /// operator chose, and a resolution across the others would override that
-/// choice. A VM that is not running cannot own the name — an answer given
-/// without a word, since finding a stopped VM is the normal case on a host
-/// with several — and a VM whose daemon answers nothing is skipped with a
-/// warning, so the name is resolved from the VMs that did answer. Each look
+/// choice. A VM that is not running is asked through its persisted box
+/// records instead (NET-152): a name only a stopped VM holds is refused with
+/// a [`crate::cmd::BoxNotFound`] that names the VM and the command that
+/// starts it. Any name that more than one VM holds, running or stopped, is
+/// an [`crate::cmd::AmbiguousBoxName`] that lists every VM, each stopped one
+/// marked, and names `--vm`: a name that matches on more than one host is an
+/// error that lists the candidates, whatever state each box is in.
+/// A VM whose daemon answers nothing is skipped with a warning, so the name
+/// is resolved from the VMs that did answer. Each look
 /// is leashed ([`crate::client::PROBE_TIMEOUT`]): the loop spans every VM on
 /// the host, and a wedged one must not hold an attach for the stacked
 /// connect, handshake and RPC deadlines (~72 s each).
@@ -288,11 +327,19 @@ pub(crate) async fn resolve_box_vm(
     let vms =
         crate::client::enumerate_vm_sockets(global.minimal_dir.as_deref(), global.use_minvmd())?;
     let mut owners: Vec<ResolvedBoxVm> = Vec::new();
+    // The stopped VMs whose persisted box records hold the name (NET-152).
+    // Each with how it holds the name, so an id prefix never competes with a
+    // name.
+    let mut stopped_holders: Vec<(String, HeldBy)> = Vec::new();
     for vm in vms {
-        // A VM that is not running cannot own the name. The check is free, so
-        // it is made first; the probe classifies the cases it cannot see — a
-        // socket that vanished mid-walk reads the same as one never bound.
+        // A VM that is not running has no daemon to ask, so its persisted
+        // records answer for it. The check is free, so it is made first; the
+        // probe classifies the cases it cannot see — a socket that vanished
+        // mid-walk reads the same as one never bound.
         if !vm.sock.exists() {
+            if let Some(held_by) = stopped_vm_holds(&vm, name) {
+                stopped_holders.push((vm.vm, held_by));
+            }
             continue;
         }
         #[expect(
@@ -308,12 +355,17 @@ pub(crate) async fn resolve_box_vm(
                 )
             });
         match look {
-            Ok(Ok(Some(record))) => owners.push(ResolvedBoxVm {
+            Ok(Ok(BoxLook::Found(record))) => owners.push(ResolvedBoxVm {
                 vm: vm.vm,
                 sock: vm.sock,
-                record,
+                record: *record,
             }),
-            Ok(Ok(None)) => {}
+            Ok(Ok(BoxLook::Absent)) => {}
+            Ok(Ok(BoxLook::NotRunning)) => {
+                if let Some(held_by) = stopped_vm_holds(&vm, name) {
+                    stopped_holders.push((vm.vm, held_by));
+                }
+            }
             // VMs that could not be looked at are named, not silent: a
             // resolution that quietly could not look would read as "no such
             // box".
@@ -323,24 +375,63 @@ pub(crate) async fn resolve_box_vm(
             ),
         }
     }
-    match owners.len() {
-        0 => Ok(None),
-        1 => {
+    // A daemon matches an exact name before an id prefix
+    // (`crate::cmd::match_id_prefix`), and so does the walk across VMs: when
+    // any VM holds the name as a name, a holder that matched only an id
+    // prefix is not a candidate.
+    let any_by_name = owners
+        .iter()
+        .any(|owner| held_by(&owner.record, name) == HeldBy::Name)
+        || stopped_holders.iter().any(|(_, by)| *by == HeldBy::Name);
+    if any_by_name {
+        owners.retain(|owner| held_by(&owner.record, name) == HeldBy::Name);
+        stopped_holders.retain(|(_, by)| *by == HeldBy::Name);
+    }
+    let stopped_holders: Vec<String> = stopped_holders.into_iter().map(|(vm, _)| vm).collect();
+    match (owners.len(), stopped_holders.as_slice()) {
+        (0, []) => Ok(None),
+        // NET-152: the box is there, on a VM that is down. Say which VM and
+        // the command that starts it: `--vm` selects the VM, and the attach
+        // autospawns the selected VM's daemon before it looks.
+        (0, [vm]) => {
+            tracing::debug!(
+                box = name,
+                vm = %vm,
+                outcome = "on a stopped VM",
+                "box name resolved to a VM"
+            );
+            Err(crate::cmd::BoxNotFound(crate::cmd::box_on_stopped_vm(name, vm)).into())
+        }
+        (0, several) => Err(crate::cmd::AmbiguousBoxName(format!(
+            "box name '{name}' exists on more than one stopped VM ({}); \
+             name the one you mean with --vm",
+            several.join(", ")
+        ))
+        .into()),
+        (1, []) => {
             let resolved = owners.pop().expect("the one owner");
-            tracing::debug!(box = name, vm = %resolved.vm, "box name resolved to a VM");
+            tracing::debug!(
+                box = name,
+                vm = %resolved.vm,
+                outcome = "on a running VM",
+                "box name resolved to a VM"
+            );
             Ok(Some(resolved))
         }
-        // Two VMs can both own the name, and picking one silently would send
-        // an attach into a project the operator may not have meant. The flag
-        // is the disambiguator, so the error names both and points at it.
-        _ => Err(anyhow::anyhow!(
+        // Two VMs can both hold the name, running or stopped, and picking one
+        // silently would send an attach into a project the operator may not
+        // have meant. The flag is the disambiguator, so the error names every
+        // VM, marks each stopped one, and points at it.
+        (_, stopped) => Err(crate::cmd::AmbiguousBoxName(format!(
             "box name '{name}' exists on more than one VM ({}); name the one you mean with --vm",
             owners
                 .iter()
-                .map(|owner| owner.vm.as_str())
+                .map(|owner| owner.vm.clone())
+                .chain(stopped.iter().map(|vm| format!("{vm} (stopped)")))
                 .collect::<Vec<_>>()
                 .join(", ")
-        )),
+        ))
+        .into()),
     }
 }
 
@@ -356,13 +447,10 @@ pub(crate) async fn resolve_box_vm(
 /// The owning daemon is gated on the very reply that named it; the probe
 /// that finds nothing stays ungated, exactly like the dashboard's listing of
 /// a skewed daemon.
-async fn box_record_on(
-    vm: &crate::client::VmSocket,
-    name: &str,
-) -> Result<Option<sessions::Record>, anyhow::Error> {
+async fn box_record_on(vm: &crate::client::VmSocket, name: &str) -> Result<BoxLook, anyhow::Error> {
     let mut client = match crate::client::Client::probe(&vm.sock).await {
         Ok(client) => client,
-        Err(crate::client::ProbeRefusal::NotRunning) => return Ok(None),
+        Err(crate::client::ProbeRefusal::NotRunning) => return Ok(BoxLook::NotRunning),
         Err(crate::client::ProbeRefusal::Unreachable(e)) => {
             return Err(e.context(format!(
                 "Failed to connect to the daemon at {}",
@@ -374,18 +462,96 @@ async fn box_record_on(
     match resp.record {
         Some(record) => {
             crate::client::ensure_version_reported(resp.daemon_version.as_deref())?;
-            Ok(Some(record))
+            Ok(BoxLook::Found(Box::new(record)))
         }
-        None => Ok(None),
+        None => Ok(BoxLook::Absent),
     }
+}
+
+/// What one VM's daemon said about a box name ([`box_record_on`]).
+enum BoxLook {
+    /// The daemon owns the name: its record, boxed so the other answers stay
+    /// small.
+    Found(Box<boxes::Record>),
+    /// The daemon answered and does not know the name.
+    Absent,
+    /// No daemon listens: the VM is stopped.
+    NotRunning,
+}
+
+/// Whether the stopped VM `vm` holds a box named `name` in its persisted box
+/// records (NET-152), read from its state dir with no daemon: the name as it
+/// was registered, compared ignoring ASCII case as names are made unique, or
+/// the box's id or an id prefix. A name match wins over an id prefix, as on
+/// a daemon. Read-only, so a file this build cannot use holds nothing and
+/// stays as it is.
+fn stopped_vm_holds(vm: &crate::client::VmSocket, name: &str) -> Option<HeldBy> {
+    let held = stopped_vm_boxes(vm);
+    if held.iter().any(|h| h.name.eq_ignore_ascii_case(name)) {
+        return Some(HeldBy::Name);
+    }
+    held.iter()
+        .any(|h| id_has_prefix(&h.id, name))
+        .then_some(HeldBy::IdPrefix)
+}
+
+/// How a VM holds a box name: as the box's name, or only as a prefix of its
+/// id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeldBy {
+    Name,
+    IdPrefix,
+}
+
+/// How the record a running daemon resolved `name` to holds it.
+fn held_by(record: &boxes::Record, name: &str) -> HeldBy {
+    if record
+        .name
+        .as_deref()
+        .is_some_and(|n| n.eq_ignore_ascii_case(name))
+    {
+        HeldBy::Name
+    } else {
+        HeldBy::IdPrefix
+    }
+}
+
+/// Whether `name` is shaped like an id prefix and `id` starts with it,
+/// compared without dashes and ignoring case.
+fn id_has_prefix(id: &boxes::BoxId, name: &str) -> bool {
+    crate::cmd::is_id_prefix(name)
+        && id
+            .as_ref()
+            .simple()
+            .to_string()
+            .starts_with(&name.replace('-', "").to_ascii_lowercase())
+}
+
+/// The boxes a stopped VM's persisted records hold (NET-152), read
+/// from the state dir beside its socket. One debug line records the count.
+pub(crate) fn stopped_vm_boxes(
+    vm: &crate::client::VmSocket,
+) -> Vec<minvmd::box_registry::PersistedBox> {
+    let held = vm
+        .sock
+        .parent()
+        .map(minvmd::box_registry::persisted_box_names)
+        .unwrap_or_default();
+    tracing::debug!(
+        vm = %vm.vm,
+        boxes = held.len(),
+        "read a stopped VM's persisted box records"
+    );
+    held
 }
 
 /// A pickable session. `Display` renders the row the user sees and fuzzy-
 /// searches against; the carried entry preserves the id/name so the chosen
-/// one can be attached without a follow-up round-trip.
+/// one can be attached without a follow-up round-trip. Boxed, as in
+/// [`Picked::Session`], so the entry's size stays off every picker row.
 #[derive(Clone)]
 struct SessionCandidate {
-    entry: ListSessionsEntry,
+    entry: Box<ListSessionsEntry>,
     label: String,
 }
 
@@ -400,11 +566,15 @@ impl fmt::Display for SessionCandidate {
 /// `Materializing` ones aren't attachable yet — `Pending` is still awaiting
 /// the client's verdict, `Materializing` has finalized its composition but
 /// is still ingesting patches. Both render with the hollow glyph so the
-/// picker communicates "not-yet-ready" uniformly.
-fn state_glyph(status: sessions::SessionStatus) -> &'static str {
+/// picker communicates "not-yet-ready" uniformly. A `Stopped` or `Exited`
+/// box is not attachable either, so it renders hollow too.
+fn state_glyph(status: boxes::BoxState) -> &'static str {
     match status {
-        sessions::SessionStatus::Active => "●",
-        sessions::SessionStatus::Pending | sessions::SessionStatus::Materializing => "◯",
+        boxes::BoxState::Active => "●",
+        boxes::BoxState::Pending
+        | boxes::BoxState::Materializing
+        | boxes::BoxState::Stopped
+        | boxes::BoxState::Exited => "◯",
     }
 }
 
@@ -477,8 +647,9 @@ impl fmt::Display for PickerRow {
 
 /// The user's choice from the attach picker.
 pub(crate) enum Picked {
-    /// Attach to this existing session.
-    Session(ListSessionsEntry),
+    /// Attach to this existing session. Boxed: the entry is far larger
+    /// than the create arm, which carries nothing.
+    Session(Box<ListSessionsEntry>),
     /// The create row was chosen: activate a fresh session for the cwd and
     /// attach, exactly as `min session activate --attach .` would.
     CreateNew,
@@ -523,7 +694,7 @@ pub(crate) fn pick_session(
         .iter()
         .map(|e| {
             PickerRow::Session(SessionCandidate {
-                entry: (*e).clone(),
+                entry: Box::new((*e).clone()),
                 label: format_candidate(e, cwd),
             })
         })
@@ -580,32 +751,34 @@ pub(crate) fn ambiguous_no_input_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boxes::BoxState;
     use minimald_rpc::{ListSessionsEntry, RunningSessionAttrs};
     use paths::HostAbsPath;
-    use sessions::SessionStatus;
 
-    fn entry(id: &str, path: &str, status: SessionStatus) -> ListSessionsEntry {
+    fn entry(id: &str, path: &str, status: BoxState) -> ListSessionsEntry {
         ListSessionsEntry {
-            id: sessions::SessionId::parse_str(id).unwrap(),
+            id: boxes::SessionId::parse_str(id).unwrap(),
             name: None,
             project_path: Some(HostAbsPath::try_new(path).unwrap()),
             status,
             git: None,
             host_ip_enforcement: None,
+            shared_port_collisions: Vec::new(),
             attrs: None,
         }
     }
 
     /// Like [`entry`] but builds a session with no project_path, simulating an
     /// entry from an older daemon that predates the field.
-    fn entry_no_path(id: &str, status: SessionStatus) -> ListSessionsEntry {
+    fn entry_no_path(id: &str, status: BoxState) -> ListSessionsEntry {
         ListSessionsEntry {
-            id: sessions::SessionId::parse_str(id).unwrap(),
+            id: boxes::SessionId::parse_str(id).unwrap(),
             name: None,
             project_path: None,
             status,
             git: None,
             host_ip_enforcement: None,
+            shared_port_collisions: Vec::new(),
             attrs: None,
         }
     }
@@ -642,7 +815,7 @@ mod tests {
         }
     }
 
-    /// The unwind set is now assembled from named constants in `sessions`,
+    /// The unwind set is now assembled from named constants in `boxes`,
     /// shared with the daemon. Naming them cannot be allowed to change what
     /// goes on the wire, so this pins the exact byte string the guard emitted
     /// before the constants existed: edit a constant and this test says so.
@@ -724,13 +897,13 @@ mod tests {
         let entries = vec![entry(
             "019f5d0f-0a99-78b1-9165-0809440f0052",
             "/elsewhere",
-            SessionStatus::Active,
+            BoxState::Active,
         )];
         match resolve_for_attach(&entries, &cwd("/a")) {
             SmartResolve::Attach(e) => {
                 assert_eq!(
                     e.id,
-                    sessions::SessionId::parse_str("019f5d0f-0a99-78b1-9165-0809440f0052").unwrap()
+                    boxes::SessionId::parse_str("019f5d0f-0a99-78b1-9165-0809440f0052").unwrap()
                 );
             }
             other => panic!("expected Attach, got {other:?}"),
@@ -743,19 +916,19 @@ mod tests {
             entry(
                 "019f5d0f-0a99-78b1-9165-0809440f0052",
                 "/a",
-                SessionStatus::Active,
+                BoxState::Active,
             ),
             entry(
                 "019f5d0f-0a99-78b1-9165-0809440f0066",
                 "/b",
-                SessionStatus::Active,
+                BoxState::Active,
             ),
         ];
         match resolve_for_attach(&entries, &cwd("/a")) {
             SmartResolve::Attach(e) => {
                 assert_eq!(
                     e.id,
-                    sessions::SessionId::parse_str("019f5d0f-0a99-78b1-9165-0809440f0052").unwrap()
+                    boxes::SessionId::parse_str("019f5d0f-0a99-78b1-9165-0809440f0052").unwrap()
                 );
             }
             other => panic!("expected Attach, got {other:?}"),
@@ -768,17 +941,17 @@ mod tests {
             entry(
                 "019f5d0f-0a99-78b1-9165-0809440f0052",
                 "/a",
-                SessionStatus::Active,
+                BoxState::Active,
             ),
             entry(
                 "019f5d0f-0a99-78b1-9165-0809440f0066",
                 "/a",
-                SessionStatus::Active,
+                BoxState::Active,
             ),
             entry(
                 "019f5d0f-0a99-78b1-9165-0809440f0077",
                 "/b",
-                SessionStatus::Active,
+                BoxState::Active,
             ),
         ];
         match resolve_for_attach(&entries, &cwd("/a")) {
@@ -796,12 +969,12 @@ mod tests {
             entry(
                 "019f5d0f-0a99-78b1-9165-0809440f0052",
                 "/a",
-                SessionStatus::Active,
+                BoxState::Active,
             ),
             entry(
                 "019f5d0f-0a99-78b1-9165-0809440f0066",
                 "/b",
-                SessionStatus::Active,
+                BoxState::Active,
             ),
         ];
         match resolve_for_attach(&entries, &cwd("/c")) {
@@ -815,7 +988,7 @@ mod tests {
         let e = entry(
             "019f5d0f-0a99-78b1-9165-0809440f0052",
             "/a",
-            SessionStatus::Active,
+            BoxState::Active,
         );
         let label = format_candidate(&e, &cwd("/a"));
         assert!(label.starts_with("● "), "active glyph prefix: {label}");
@@ -848,7 +1021,7 @@ mod tests {
         let e = entry(
             "019f5d0f-0a99-78b1-9165-0809440f0052",
             "/a",
-            SessionStatus::Pending,
+            BoxState::Pending,
         );
         let label = format_candidate(&e, &cwd("/a"));
         assert!(label.starts_with("◯ "), "pending glyph prefix: {label}");
@@ -860,12 +1033,12 @@ mod tests {
             entry(
                 "019f5d0f-0a99-78b1-9165-0809440f0052",
                 "/a",
-                SessionStatus::Active,
+                BoxState::Active,
             ),
             entry(
                 "019f5d0f-0a99-78b1-9165-0809440f0066",
                 "/a",
-                SessionStatus::Active,
+                BoxState::Active,
             ),
         ];
         let msg = ambiguous_no_input_message(&entries, &cwd("/a"));
@@ -883,27 +1056,21 @@ mod tests {
     fn entry_without_project_path_never_matches_cwd_but_still_attaches() {
         let entries = vec![entry_no_path(
             "019f5d0f-0a99-78b1-9165-0809440f0052",
-            SessionStatus::Active,
+            BoxState::Active,
         )];
         // Single session, no cwd match → attach directly.
         match resolve_for_attach(&entries, &cwd("/a")) {
             SmartResolve::Attach(e) => assert_eq!(
                 e.id,
-                sessions::SessionId::parse_str("019f5d0f-0a99-78b1-9165-0809440f0052").unwrap()
+                boxes::SessionId::parse_str("019f5d0f-0a99-78b1-9165-0809440f0052").unwrap()
             ),
             other => panic!("expected Attach for pathless single session, got {other:?}"),
         }
 
         // Two pathless sessions → pick over all, none tagged as cwd.
         let entries = vec![
-            entry_no_path(
-                "019f5d0f-0a99-78b1-9165-0809440f0052",
-                SessionStatus::Active,
-            ),
-            entry_no_path(
-                "019f5d0f-0a99-78b1-9165-0809440f0066",
-                SessionStatus::Active,
-            ),
+            entry_no_path("019f5d0f-0a99-78b1-9165-0809440f0052", BoxState::Active),
+            entry_no_path("019f5d0f-0a99-78b1-9165-0809440f0066", BoxState::Active),
         ];
         match resolve_for_attach(&entries, &cwd("/a")) {
             SmartResolve::Pick(cands) => {
@@ -924,7 +1091,7 @@ mod tests {
         let e = entry(
             "019f5d0f-0a99-78b1-9165-0809440f0052",
             "/a",
-            SessionStatus::Active,
+            BoxState::Active,
         );
         let label = format_candidate(&e, &cwd("/a"));
         assert!(
@@ -942,7 +1109,7 @@ mod tests {
         let e = entry(
             "019f5d0f-0a99-78b1-9165-0809440f0052",
             "/elsewhere",
-            SessionStatus::Active,
+            BoxState::Active,
         );
         assert_eq!(
             created_from_suffix(&e, &cwd("/a")),
@@ -955,17 +1122,14 @@ mod tests {
         let e = entry(
             "019f5d0f-0a99-78b1-9165-0809440f0052",
             "/a",
-            SessionStatus::Active,
+            BoxState::Active,
         );
         assert_eq!(created_from_suffix(&e, &cwd("/a")), "");
     }
 
     #[test]
     fn created_from_suffix_empty_when_project_path_absent() {
-        let e = entry_no_path(
-            "019f5d0f-0a99-78b1-9165-0809440f0052",
-            SessionStatus::Active,
-        );
+        let e = entry_no_path("019f5d0f-0a99-78b1-9165-0809440f0052", BoxState::Active);
         assert_eq!(created_from_suffix(&e, &cwd("/a")), "");
     }
 
@@ -988,10 +1152,10 @@ mod tests {
         let e = entry(
             "019f5d0f-0a99-78b1-9165-0809440f0052",
             "/a",
-            SessionStatus::Active,
+            BoxState::Active,
         );
         let row = PickerRow::Session(SessionCandidate {
-            entry: e.clone(),
+            entry: Box::new(e.clone()),
             label: format_candidate(&e, &cwd("/a")),
         });
         match resolve_pick(row) {

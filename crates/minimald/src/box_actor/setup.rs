@@ -1,0 +1,1501 @@
+use super::*;
+
+/// The daemon log's one line for an activation refused on a declared host
+/// port that something else holds (NET-144): the session, the port, the
+/// address and the holder (`box:<name>` or `host`).
+#[cfg(target_os = "linux")]
+fn warn_port_refusal(
+    record: &Record,
+    address: Option<std::net::Ipv4Addr>,
+    refusal: &minimald_rpc::PortInUseRefusal,
+) {
+    tracing::warn!(
+        session = %record.id,
+        port = refusal.port,
+        address = %address.map_or_else(|| "none".to_string(), |address| address.to_string()),
+        holder = %refusal.holder.log_label(),
+        action = "host-port-in-use",
+        "declared ingress port is already in use; activation refused"
+    );
+}
+
+/// The egress *section* the gate compiles for a session: the materialized
+/// form of [`boxes::effective_egress`]'s answer — `None` for the
+/// allow-all default, the deny-all section for an absent declaration under the
+/// in-force default (NET-074), and a declaration with the destination lists
+/// it left absent resolved as that function documents. `phase` is the
+/// rollout phase to resolve under — the launcher and the task path pass
+/// [`boxes::EGRESS_DEFAULT_PHASE`], the phase this build ships, and the
+/// tests name [`boxes::EgressDefaultPhase::InForce`] so the posture they
+/// prove does not hang on that constant. `opt_out` is the daemon's deny-all
+/// opt-out (NET-077), threaded from the server config.
+///
+/// Shared by the session launcher (the box's own gate) and the task path
+/// ([`crate::exec::task_network`]), so a task runs under the same egress
+/// its session does.
+pub(crate) fn effective_egress_section(
+    policy: &boxes::BoxPolicy,
+    network: boxes::NetworkMode,
+    phase: boxes::EgressDefaultPhase,
+    opt_out: bool,
+) -> Option<boxes::EgressPolicy> {
+    match boxes::effective_egress(policy.egress.as_ref(), network, phase, opt_out) {
+        boxes::EffectiveEgress::DenyAll => Some(boxes::EgressPolicy::deny_all()),
+        boxes::EffectiveEgress::AllowAll => None,
+        boxes::EffectiveEgress::Declared(section) => Some(section),
+    }
+}
+
+/// The classifier leaf a package build for the box `box_id` runs in
+/// (NET-155): the leaf the box's launch placed it in, under `root`. The
+/// launch places a box in exactly one subtree, so the leaf is the one of the
+/// two that exists.
+///
+/// `placed` is whether the box's launch recorded a leaf of its own
+/// ([`boxes::HostIpEnforcement::PerBox`]). A box that was never placed has no
+/// leaf by design (it is not host-address, or the host has no classifier
+/// tree), and its builds run in the daemon's own cgroup, as before. A placed
+/// box whose leaf is gone fails closed: the build is refused, never run
+/// outside the box's egress verdict. The `Err` is the refusal for the person
+/// who asked for the build.
+pub(crate) fn box_build_leaf(
+    root: &std::path::Path,
+    box_id: &str,
+    box_name: &str,
+    placed: bool,
+) -> Result<Option<sandbox::config::ClassifierLeaf>, String> {
+    let leaf = [
+        sandbox::config::Verdict::Deny,
+        sandbox::config::Verdict::Allow,
+    ]
+    .into_iter()
+    .map(|verdict| sandbox::config::ClassifierLeaf::under(root, box_id, verdict))
+    .find(|leaf| leaf.dir().is_dir());
+    match leaf {
+        Some(leaf) => Ok(Some(leaf)),
+        None if placed => Err(placed_box_build_refusal(box_name)),
+        None => Ok(None),
+    }
+}
+
+/// The network the package builds of the box `record` attach to, when the
+/// box has a network namespace of its own and so no classifier leaf: an
+/// own-address box (NET-155). Each build gets the network a task of the box
+/// gets ([`crate::exec::task_network`]): a task address of the box's own,
+/// under the box's egress rules. So the box's egress verdict decides every
+/// connection the build makes, and the build is never the daemon's own
+/// traffic. `None` for every other box.
+pub(crate) fn own_address_build_network(
+    record: &boxes::Record,
+    switch: &Arc<Mutex<crate::net::SwitchClient>>,
+    deny_all_opt_out: bool,
+) -> Option<op::BuildNetwork> {
+    if record.network != boxes::NetworkMode::OwnIp {
+        return None;
+    }
+    let egress = effective_egress_section(
+        &record.policy,
+        record.network,
+        boxes::EGRESS_DEFAULT_PHASE,
+        deny_all_opt_out,
+    );
+    let denies_all =
+        crate::net::classifier::verdict_of(egress.as_ref()) == sandbox::config::Verdict::Deny;
+    let record = record.clone();
+    let switch = Arc::clone(switch);
+    Some(
+        op::BuildNetwork::new(move || {
+            Arc::new(OwnAddressBuildNetwork {
+                inner: crate::exec::task_network(
+                    &record,
+                    &switch,
+                    boxes::EGRESS_DEFAULT_PHASE,
+                    deny_all_opt_out,
+                ),
+                record: record.clone(),
+                switch: Arc::clone(&switch),
+            }) as Arc<dyn sandbox::Network>
+        })
+        .with_denies_all(denies_all),
+    )
+}
+
+/// The network of one package build of an own-address box (NET-155). Before
+/// each plan it asks, as a task run does, whether the box's host-side row
+/// still stands, so the build never attaches under another box's row.
+struct OwnAddressBuildNetwork {
+    record: boxes::Record,
+    switch: Arc<Mutex<crate::net::SwitchClient>>,
+    inner: Arc<dyn sandbox::Network>,
+}
+
+impl std::fmt::Debug for OwnAddressBuildNetwork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnAddressBuildNetwork")
+            .field("box_id", &self.record.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl sandbox::Network for OwnAddressBuildNetwork {
+    fn plan(&self) -> sandbox::PlanFuture<'_> {
+        Box::pin(async move {
+            crate::exec::ensure_task_rows_stand(&self.record, &self.switch)
+                .await
+                .map_err(sandbox::NetworkError::new)?;
+            self.inner.plan().await
+        })
+    }
+
+    fn attach(&self, spawned: sandbox::Spawned) -> sandbox::AttachFuture<'_> {
+        self.inner.attach(spawned)
+    }
+
+    fn abandon(&self) -> sandbox::AbandonFuture<'_> {
+        self.inner.abandon()
+    }
+}
+
+/// The refusal for a build of the box `box_name` when its launch placed it
+/// in a classifier leaf and that leaf is gone (NET-155). Every refusal of
+/// this kind uses this text: [`box_build_leaf`] and the task path
+/// (`exec::task_build_refusal`).
+///
+/// Only an Active box reaches this refusal: `context()` refuses a stopped or
+/// exited box first. An Active placed box loses its leaf when its shell ends
+/// (the host's teardown removes the leaf). An attach with no running shell
+/// mints a new one, and that launch places the box in a leaf again, so the
+/// attach is the next step.
+pub(crate) fn placed_box_build_refusal(box_name: &str) -> String {
+    format!(
+        "the build for box {box_name} did not start: box {box_name} runs under \
+         egress rules, and its shell is not running to apply them to the build. \
+         Run `min session attach {box_name}` to start its shell, then run the \
+         build again."
+    )
+}
+
+/// The policy the gate enforces for a session: its declared ingress, and its
+/// egress resolved to the section [`effective_egress_section`] names — the
+/// deny-all section for an own-address box with no `egress` section once the
+/// default is in force (NET-074), the allow-all default for everything an
+/// opt-out (NET-077) or an earlier phase leaves in place, and a declaration
+/// with the destination lists it left absent resolved. `phase` resolves
+/// under, exactly as [`effective_egress_section`] documents. The
+/// declaration on the record is left untouched: the strict `BoxPolicy`
+/// a client reads back stays exactly what the box was launched with.
+pub(crate) fn effective_session_policy(
+    policy: &boxes::BoxPolicy,
+    network: boxes::NetworkMode,
+    phase: boxes::EgressDefaultPhase,
+    opt_out: bool,
+) -> boxes::BoxPolicy {
+    boxes::BoxPolicy {
+        egress: effective_egress_section(policy, network, phase, opt_out),
+        ingress: policy.ingress.clone(),
+        // The credentialed-upstream declaration (NET-134) resolves nothing —
+        // the lane it opens is decided host-side, by the row the client's
+        // registration fills — so it is carried verbatim, like the ingress:
+        // the effective policy a box's gate reads keeps the lane the box
+        // declared beside it.
+        credentialed_upstream: policy.credentialed_upstream.clone(),
+        // BEP-018: the declared `quic443` stance resolves nothing here
+        // either. The gate resolves it, so it is carried verbatim.
+        quic443: policy.quic443,
+    }
+}
+
+/// How long [`BoxActor::check_composed_packages`] waits for the session
+/// graph to resolve before stepping aside.
+///
+/// Evaluating the graph can clone the upstream repo when the daemon's
+/// cache is cold — network I/O with no bound of its own — and the check
+/// runs inside the `FinalizeSession` round-trip. The deadline on that
+/// round-trip is otherwise the *client's* (`minimal-client`'s 60 s base
+/// plus the activate-hook budget; the dashboard grants only the base),
+/// and a client that expires does not cancel the daemon-side finalize:
+/// the session actor runs on, and may promote the record — running the
+/// activate hooks on the way — while the client, which has already
+/// reported a failed activation and best-effort-destroyed the session,
+/// believes nothing was activated. So the daemon bounds the work it
+/// adds itself: past this deadline the check logs a warning, steps
+/// aside, and reports the skip back to the client. Expiry cancels the
+/// wait, not the evaluation — the detached `spawn_blocking` runs to
+/// completion and warms the cache the launch reads — and finalize
+/// proceeds exactly as it did before the check existed, the launch
+/// resolving names at first exec as it always has.
+///
+/// Half the client's 60 s base: a warm cache evaluates in seconds, well
+/// inside it, and what follows the check in finalize — patch
+/// materialization, and the host mint an activate hook needs — keeps
+/// the other half of the base for itself.
+pub(crate) const PACKAGE_CHECK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// This session's workspace baseline for the shell-exit prompt's change
+/// detection, established once before the first host launches and reused
+/// across every host teardown and rebuild. Re-arming the baseline at each
+/// launch would re-snapshot an already-modified workspace when a "keep
+/// filesystem" exit is followed by a reattach, so the next exit would detect
+/// no changes and drop the save-then-delete option.
+pub(super) enum WorkspaceBaseline {
+    /// No host has launched yet; the baseline is armed on the first launch.
+    Unarmed,
+    /// Armed once at first launch and reused for the session's lifetime. Holds
+    /// the arm result verbatim — including the `None` of a walk that timed out
+    /// — so a rebuild never re-snapshots against a dirty tree.
+    Armed(Option<Arc<DeltaSource>>),
+}
+
+// Opaque so `BoxActor`'s derived `Debug` need not dump the whole baseline
+// snapshot: only whether the baseline is armed and present is informative.
+impl fmt::Debug for WorkspaceBaseline {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unarmed => f.write_str("Unarmed"),
+            Self::Armed(delta) => write!(f, "Armed(present: {})", delta.is_some()),
+        }
+    }
+}
+
+impl BoxActor {
+    /// Watches for the range verdict to land, for a box that finalized at
+    /// the shared `127.0.0.1` fallback under a pending verdict while another
+    /// box there held one of its declared ports (NET-144). Under a pending
+    /// verdict the box yields the port, because a present landing moves it
+    /// to its own address. When the verdict lands absent, the box stays at
+    /// the fallback with the port unbound. The box is `Active` by then, so
+    /// the watcher reports the held port in one warn line with the same
+    /// fields as a refused activation, and does not destroy the box. A box
+    /// that moved off the fallback, or no longer publishes, is not reported.
+    #[cfg(target_os = "linux")]
+    fn watch_fallback_landing(&self, record: &Record, ingress: &boxes::IngressPolicy) {
+        let book = Arc::clone(&self.loopback);
+        let hostnames = Arc::clone(&self.hostnames);
+        let session = record.id;
+        let mappings = ingress.port_mappings.clone();
+        crate::traced::spawn_detached(
+            tracing::info_span!(parent: None, "session.fallback_port_watch", session = %session),
+            async move {
+                if book.await_landing().await != crate::net::dns::RangeVerdict::Absent {
+                    return;
+                }
+                let held = hostnames
+                    .read()
+                    .expect("hostname registry lock poisoned")
+                    .fallback_port_refusal(session);
+                let Some((port, holder)) = held else {
+                    return;
+                };
+                let box_port = mappings
+                    .iter()
+                    .find(|mapping| mapping.external_port == port)
+                    .map_or(port, |mapping| mapping.internal_port);
+                let refusal = minimald_rpc::PortInUseRefusal {
+                    port,
+                    box_port,
+                    holder: minimald_rpc::PortHolder::Box(holder),
+                };
+                tracing::warn!(
+                    session = %session,
+                    port = refusal.port,
+                    address = %std::net::Ipv4Addr::LOCALHOST,
+                    holder = %refusal.holder.log_label(),
+                    action = "host-port-in-use",
+                    "the range verdict landed absent, so this active box stays at the \
+                     127.0.0.1 fallback, where another box holds its declared ingress \
+                     port; the port is not bound for this box"
+                );
+            },
+        );
+    }
+
+    /// Compose this session's loadout from its project config and the
+    /// client's wire contribution, then either finalize it (`Ok(None)`, the
+    /// session is now `Active`) or park it in `Draft` holding the resume
+    /// state until the client gates the returned items (`Ok(Some(response))`).
+    ///
+    /// Every failure leaves the actor alive and `Draft`: the caller decides
+    /// whether to retry with a different contribution or tear the session
+    /// down, so a compose error can't strand a half-built session.
+    ///
+    /// A re-`ConfigureLoadout` against a session that already holds
+    /// `Draft{pending: Some(_)}` is refused with `WouldBlock`: overwriting
+    /// the stashed [`PendingComposeState`] would invalidate every
+    /// `PendingId` the first caller received (they were valid moments ago,
+    /// but a fresh stash starts numbering from 0 again). The client must
+    /// `AbortSession` and create a new session to retry rather than
+    /// silently strand its outstanding verdict submission.
+    /// `hooks_enabled` is passed rather than read from the record
+    /// because the two callers disagree: the `ConfigureLoadout` RPC
+    /// honours what the user chose at activation, while the attach
+    /// shortcut always composes with hooks off (see its call site).
+    pub(super) async fn configure_loadout(
+        &mut self,
+        contribution: WireContribution,
+        hooks_enabled: bool,
+    ) -> Result<Option<ContributionResponse>, std::io::Error> {
+        match &self.inner {
+            BoxInner::Active { .. } => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "session loadout is already configured",
+                ));
+            }
+            BoxInner::Draft { pending: Some(_) } => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "session already has a pending contribution awaiting its verdict; \
+                     abort it and create a new session to retry",
+                ));
+            }
+            BoxInner::Draft { pending: None } => {}
+        }
+        // Composing mid-upload would scaffold and resolve against a
+        // half-populated tree, and the session could then go `Active` with
+        // the upload still streaming into it.
+        if self.workspace_uploads_in_flight > 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ResourceBusy,
+                "session is still receiving its workspace upload; retry once \
+                 the upload completes",
+            ));
+        }
+        let object = self.record.object().await?;
+        let workspace_path = object.workspace_path();
+
+        // Scaffold before composing, not after: the launcher's package set is
+        // its baseline unioned with the composition's packages (see the note
+        // on `BoxInner::Active::composition`), so a default written any
+        // later never reaches the sandbox. Propagated, not logged — an
+        // activation that hands back a session id must hand back a usable
+        // session, and a box with no blueprint can't run anything.
+        //
+        // Fenced: the scaffold resolves the default package repo over the
+        // network and runs inline on the session actor, so an unfenced call
+        // would pin a worker for the whole fetch. The compose shares the
+        // fence: it resolves the graph through the checkouts cache, whose
+        // lock may block for up to the lock timeout, and that wait must not
+        // park a tokio worker. Flavor-guarded because `block_in_place`
+        // panics on a current-thread runtime.
+        let declared_path = self.record.record().await?.project_path;
+        let scaffold_and_compose = || {
+            self.scaffold_mfile_if_missing(&workspace_path)
+                .map_err(|e| std::io::Error::other(format!("scaffolding a default mfile: {e}")))?;
+            // Phase 1+2: resolve the project and drive the composer. Kept
+            // fully synchronous — its non-`Send` intermediaries must not
+            // cross an `.await`; `block_in_place` keeps them on this thread.
+            // A session activated with `--no-hooks` drops the project's
+            // hooks here, the same way the client already dropped its
+            // loadouts' before sending. Both ends honour the flag, so the
+            // composition — and the snapshot persisted from it — records
+            // that the session has no hooks at all, rather than carrying
+            // hooks that every later transition has to remember to skip.
+            composables::run_compose(
+                &self.daemon_ctx,
+                &workspace_path,
+                &declared_path,
+                contribution,
+                hooks_enabled,
+            )
+        };
+        let (outcome, graph_names) = match tokio::runtime::Handle::current().runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(scaffold_and_compose)
+            }
+            _ => scaffold_and_compose(),
+        }?;
+        // Set before the outcome match: whichever arm later promotes
+        // this session to `Active` — the one-shot `Ready` here, or the
+        // `Pending` park resuming through `handle_verdict` — the
+        // finalize check judges against the graph this same compose
+        // evaluated, never a re-evaluation.
+        self.composed_graph_names = graph_names;
+
+        match outcome {
+            // The composition is complete: promote the record
+            // `Pending → Active` and hold the composition for the launcher.
+            ComposeOutcome::Ready(composition) => {
+                // Compose finalized in one shot — the record is now
+                // `Materializing`, not yet `Active`. `Active` waits
+                // for `FinalizeSession` after the client has
+                // uploaded the composition's patches. Hostname
+                // registration is deferred to the same transition
+                // (a session isn't attachable until then, so
+                // publishing the route would let something reach a
+                // launcher that can't materialize its patches).
+                //
+                // Persist the composition snapshot before the record
+                // write so a crash at any point leaves either a
+                // reaped session (Pending/Materializing records are
+                // reaped at startup) or an Active session with its
+                // sidecar intact.
+                self.record.store_composition(&composition).await?;
+                let mut record = object.record().clone();
+                record.status = BoxState::Materializing;
+                self.record.write(record.clone()).await?;
+                self.inner = BoxInner::Active {
+                    composition: Some(Arc::new(composition)),
+                    host: None,
+                    sops: vec![],
+                };
+                Ok(None)
+            }
+            // The client must gate items before the composition completes.
+            // Park in `Draft` with the daemon-side resume state; the record
+            // is already `Pending` on disk, so nothing to write.
+            ComposeOutcome::Pending {
+                mut response,
+                state,
+            } => {
+                // The composer ran before the allocated id was known to it.
+                response.session_id = *self.record.id();
+                self.inner = BoxInner::Draft {
+                    pending: Some(Box::new(state)),
+                };
+                Ok(Some(response))
+            }
+        }
+    }
+
+    /// Resume a `Draft` session with the client's verdict: finalize the
+    /// composition and transition to `Active`.
+    ///
+    /// Structured refusals — a session that is already `Active` or was never
+    /// configured, and a verdict the composer can't apply — come back as a
+    /// [`BoxStep::Fault`] and leave the session `Draft` and resumable, so
+    /// a client that mis-gated an item can correct it and re-submit rather
+    /// than lose the session.
+    pub(super) async fn handle_verdict(
+        &mut self,
+        verdict: ContributionVerdict,
+    ) -> Result<BoxStep, std::io::Error> {
+        let wrong_state = |what: &str| {
+            Ok(BoxStep::Fault {
+                error: boxes::wire::errors::WireError::WrongState {
+                    what: what.to_string(),
+                },
+            })
+        };
+        let pending = match &self.inner {
+            BoxInner::Active { .. } => return wrong_state("expected Pending, found Active"),
+            BoxInner::Draft { pending: None } => {
+                return wrong_state(
+                    "expected Pending, found a session with no composition to resume",
+                );
+            }
+            BoxInner::Draft {
+                pending: Some(state),
+            } => state,
+        };
+
+        // Clone rather than take: `resume_from_verdict` consumes the state,
+        // and a rejected verdict has to leave the session resumable.
+        let composition = match resume_from_verdict((**pending).clone(), verdict) {
+            Ok(c) => c,
+            Err(e) => return Ok(BoxStep::Fault { error: e.into() }),
+        };
+
+        // Promote the on-disk record `Pending → Materializing`. A
+        // write failure leaves both the record and the actor
+        // `Draft`, so the client can re-submit the same verdict
+        // once the store recovers. `Active` waits for a follow-up
+        // `FinalizeSession` after patches upload — see
+        // [`Self::finalize`] for the transition and its
+        // preconditions.
+        //
+        // Persist the composition snapshot before the record write
+        // (same crash-safety reasoning as the Materialized fast
+        // path above).
+        self.record.store_composition(&composition).await?;
+        let mut record = self.record.record().await?;
+        record.status = BoxState::Materializing;
+        self.record.write(record.clone()).await?;
+        self.inner = BoxInner::Active {
+            composition: Some(Arc::new(composition)),
+            host: None,
+            sops: vec![],
+        };
+        Ok(BoxStep::Materialized { id: record.id })
+    }
+
+    /// Finalize a `Materializing` session: verify that the client
+    /// has uploaded its composition patches (marker present under
+    /// `<workspace>/patches/`), promote the record
+    /// `Materializing → Active`, and publish the PTask route so
+    /// the session becomes attachable.
+    ///
+    /// Idempotent: a session already in `Active` (client retried
+    /// after a network blip that lost the ack) returns success
+    /// without side effects. Refuses `Pending` or `Draft` sessions
+    /// with `WrongState`; refuses `Materializing` sessions without
+    /// a patches-ready marker with a "patches upload never
+    /// finished" fault.
+    pub(super) async fn finalize(
+        &mut self,
+    ) -> Result<minimald_rpc::FinalizeSessionResponse, std::io::Error> {
+        let record = self.record.record().await?;
+        match record.status {
+            BoxState::Active => {
+                // Already finalized — retry is a no-op, and its hooks ran
+                // on the finalize that did the work. Like the hooks, a
+                // skipped package check is reported only by that first
+                // finalize; a retry does not re-report it.
+                Ok(minimald_rpc::FinalizeSessionResponse::default())
+            }
+            BoxState::Materializing => {
+                // Guard against a `Materializing` record whose
+                // actor didn't carry compose state through — the
+                // only path there is `BoxActor::run` spawning from
+                // an on-disk `Materializing` record after a
+                // restart survived the reap in `BoxManager::init`
+                // (delete failed, log-and-skip). Without the
+                // in-memory composition we can't tell whether the
+                // patches were uploaded; `has_patches` below would
+                // trivially match `false` and skip the marker
+                // check, then `materialize_patches_into_home`
+                // would iterate an empty composition and no-op —
+                // silently promoting the session to `Active` with
+                // an empty home. Fault the finalize so the client
+                // sees the problem instead of the user attaching
+                // to a broken shell.
+                if !matches!(
+                    &self.inner,
+                    BoxInner::Active {
+                        composition: Some(_),
+                        ..
+                    }
+                ) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "session is Materializing but has no in-memory composition \
+                         (restart-orphaned actor); destroy the session and re-activate",
+                    ));
+                }
+
+                // Precondition: patches marker present on disk. The
+                // marker is the last thing the patches unpacker
+                // writes, so its presence proves every patch is
+                // staged. Without this check a client-side bug
+                // that skipped the patches upload would silently
+                // yield an Active session with a broken sandbox
+                // rootfs.
+                //
+                // Short-circuit: a composition with no patches has
+                // nothing for the client to upload, so the marker
+                // isn't required. Callers with empty compositions
+                // (internal ones — sftp/exec/session-recovery — and
+                // any project with no fs mappings) go straight
+                // through here.
+                let paths_obj = self.record.object().await?;
+                let patches_dir = paths_obj.patches_path();
+                let has_patches = matches!(
+                    &self.inner,
+                    BoxInner::Active {
+                        composition: Some(c),
+                        ..
+                    } if !c.patches().is_empty()
+                );
+                if has_patches {
+                    let marker = patches_dir
+                        .as_utf8_path()
+                        .join(crate::rpc::PATCHES_READY_MARKER);
+                    // Distinguish "marker absent" (client forgot the
+                    // upload; retry the upload + FinalizeSession)
+                    // from "we couldn't tell" (permissions, filesystem
+                    // I/O). Collapsing the latter into the former
+                    // sends the operator chasing an upload that
+                    // already succeeded when the real fault is a
+                    // broken workspace dir.
+                    let marker_present = tokio::fs::try_exists(&marker).await.map_err(|e| {
+                        std::io::Error::new(
+                            e.kind(),
+                            format!("checking patches-ready marker at {}: {e}", marker.as_str()),
+                        )
+                    })?;
+                    if !marker_present {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "patches upload never completed; cannot finalize \
+                             (upload patches, then retry the activation)",
+                        ));
+                    }
+                }
+
+                // Same precondition for hook scripts that arrive by
+                // upload. Without it, a client that skipped that upload
+                // would produce an `Active` session whose hooks name
+                // files that were never staged — and the first symptom
+                // would be an activation hook failing at some later
+                // point, far from the cause. Which hooks those are is
+                // narrower than "any external script": see
+                // [`composition_needs_staged_scripts`].
+                let needs_staged_scripts = matches!(
+                    &self.inner,
+                    BoxInner::Active {
+                        composition: Some(c),
+                        ..
+                    } if composition_needs_staged_scripts(c)
+                );
+                if needs_staged_scripts {
+                    let marker = paths_obj
+                        .hooks_path()
+                        .as_utf8_path()
+                        .join(crate::rpc::HOOKS_READY_MARKER);
+                    let marker_present = tokio::fs::try_exists(&marker).await.map_err(|e| {
+                        std::io::Error::new(
+                            e.kind(),
+                            format!("checking hooks-ready marker at {}: {e}", marker.as_str()),
+                        )
+                    })?;
+                    if !marker_present {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "hook-script upload never completed; cannot finalize \
+                             (upload hook scripts, then retry the activation)",
+                        ));
+                    }
+                }
+
+                // Every composed package name has to resolve before the
+                // record is promoted: otherwise activate hands back an id
+                // for a session whose first spawn fails with `no such
+                // package`. Refusing here leaves the record unpromoted,
+                // and the client's activate cleanup removes it.
+                let mut package_check_skipped = false;
+                if self.check_packages_at_finalize
+                    && let BoxInner::Active {
+                        composition: Some(comp),
+                        ..
+                    } = &self.inner
+                {
+                    package_check_skipped = self.check_composed_packages(comp).await?;
+                }
+
+                // Materialize the composition's patches into the
+                // session's home dir. Done here — once — rather
+                // than on every attach so the sandbox home is
+                // populated exactly at the point the session
+                // becomes attachable, and subsequent attaches see
+                // the same tree without re-copying (which would
+                // clobber any in-sandbox modifications the user
+                // made in prior attaches). If the composition has
+                // no patches, this is a no-op.
+                if let BoxInner::Active {
+                    composition: Some(comp),
+                    ..
+                } = &self.inner
+                {
+                    let home = paths_obj.home_path();
+                    materialize_patches_into_home(&patches_dir, &home, comp).await?;
+                }
+
+                // Activate hooks run here — after the patches are in the
+                // sandbox home, before the session becomes attachable —
+                // so setup work and its failures land at
+                // `min session activate` rather than at some later
+                // attach.
+                //
+                // A hook runs *inside* the session, which means a shell
+                // has to exist for its namespaces to be joined. Nothing
+                // launches one this early, so this does, and keeps it:
+                // the next attach reuses it, and whatever the hooks put
+                // in `/tmp` survives into the session instead of dying
+                // with a throwaway sandbox. Gated on there actually
+                // being activate hooks, so a session without them pays
+                // nothing and comes up exactly as before.
+                //
+                // The box's name and publish come first (NET-010/NET-011):
+                // the box's first finalize, the one registration that may
+                // wait for the range verdict (NET-123 §7.1), runs before
+                // the hook launch below, because that launch is the box's
+                // first attach. An own-address box that declared ingress
+                // binds its forwards at the address this registration
+                // publishes, and an attach that finds none fails with "no
+                // published address handed" by design (NET-121) — so a box
+                // with an activate hook and a static ingress could never
+                // activate if the hooks launched first (#2070). The
+                // registration reads only the record's identity, network
+                // mode and policy, which the `Active` write below does not
+                // change. A finalize that fails after this point — an
+                // activate hook that fails, a launch that cannot start, the
+                // record write — leaves the publish standing on a
+                // `Materializing` record, and the client's activate cleanup
+                // destroys the session, whose destroy withdraws the publish,
+                // the name and any grant for good
+                // ([`Self::deregister_hostname`]). A retried finalize
+                // registers again, which is idempotent for one session id.
+                #[cfg(target_os = "linux")]
+                let yielded_ports = self.register_hostname(&record, true).await;
+                #[cfg(target_os = "linux")]
+                let shared_port_collisions: Vec<minimald_rpc::SharedPortCollision> = yielded_ports
+                    .iter()
+                    .map(|c| minimald_rpc::SharedPortCollision {
+                        port: c.port,
+                        held_by: c.other.clone(),
+                    })
+                    .collect();
+                #[cfg(not(target_os = "linux"))]
+                let shared_port_collisions: Vec<minimald_rpc::SharedPortCollision> = Vec::new();
+
+                // A declared host port that something else already holds
+                // fails the finalize before the `Active` write (NET-121,
+                // NET-144, design §7.1: the bind succeeds before the box is
+                // active, and a failed bind is an error). The refusal names
+                // the port and its holder, and the client's activate cleanup
+                // destroys the box, so no record stays behind. The checks need
+                // the address the registration above publishes, so they run
+                // here.
+                //
+                // Another box that holds the port at the shared `127.0.0.1`
+                // fallback refuses the box: nobody chose to share that
+                // address. Only a landed range verdict keeps a box there.
+                // Under a pending verdict the interim is a waypoint, the box
+                // moves to its hand when the verdict lands present, and the
+                // port is yielded as before. If the verdict then lands absent,
+                // the box stays at the fallback, and a watcher reports the
+                // held port in the daemon log ([`Self::watch_fallback_landing`]).
+                // At a node's shared address the port is yielded too
+                // (NET-129). Then the daemon checks the ports that something
+                // outside the registry holds. On a native host the forwarder
+                // binds in the daemon's own network namespace, so the daemon
+                // probes. On a VM-backed host the forwarder binds on the host
+                // OS, so a probe here proves nothing: the daemon binds the
+                // forwards at publish instead, toward the switch address the
+                // host handed the box, and a held port fails that bind with
+                // the same refusal. The check is skipped when activate hooks
+                // run: their launch binds the forwards, and a taken port
+                // fails that apply with the same refusal.
+                #[cfg(target_os = "linux")]
+                if let (boxes::NetworkMode::OwnIp, Some(ingress)) =
+                    (&record.network, record.policy.ingress.as_ref())
+                {
+                    let (published, fallback_refusal) = {
+                        let hostnames = self
+                            .hostnames
+                            .read()
+                            .expect("hostname registry lock poisoned");
+                        (
+                            hostnames.published_own_address(record.id),
+                            hostnames.fallback_port_refusal(record.id),
+                        )
+                    };
+                    let fallback_refusal = if fallback_refusal.is_some()
+                        && self.loopback.range_verdict() == crate::net::dns::RangeVerdict::Pending
+                    {
+                        self.watch_fallback_landing(&record, ingress);
+                        None
+                    } else {
+                        fallback_refusal
+                    };
+                    let box_port = |port: u16| {
+                        ingress
+                            .port_mappings
+                            .iter()
+                            .find(|mapping| mapping.external_port == port)
+                            .map_or(port, |mapping| mapping.internal_port)
+                    };
+                    let mut refusal =
+                        fallback_refusal.map(|(port, holder)| minimald_rpc::PortInUseRefusal {
+                            port,
+                            box_port: box_port(port),
+                            holder: minimald_rpc::PortHolder::Box(holder),
+                        });
+                    if refusal.is_none()
+                        && !self.has_hooks_for(crate::hooks::HookEvent::Activate)
+                        && let Some(published) = published
+                    {
+                        let control = self.switch_control().await;
+                        let own_name = super::helpers::registry_name(&record);
+                        let holder_of = |port: u16| {
+                            crate::net::policy::port_holder(
+                                &self.hostnames,
+                                &own_name,
+                                published,
+                                port,
+                            )
+                        };
+                        let switch_address = record
+                            .box_addresses
+                            .map(|addresses| addresses.switch_address);
+                        match (control.host_unbinds_declared_forwards(), switch_address) {
+                            // A VM-backed host: bind at publish.
+                            (true, Some(switch_address)) => {
+                                if let Err(e) = crate::net::policy::bind_declared_at_publish(
+                                    &control,
+                                    published,
+                                    switch_address,
+                                    ingress,
+                                    &yielded_ports,
+                                    &holder_of,
+                                )
+                                .await
+                                {
+                                    match crate::net::policy::port_in_use_refusal(&e) {
+                                        Some(held) => refusal = Some(held),
+                                        // Any other failed bind fails the
+                                        // finalize as it is (NET-121).
+                                        None => return Err(e),
+                                    }
+                                }
+                            }
+                            // A VM-backed box the host handed no switch
+                            // address has no forward to bind yet. Its
+                            // first attach binds the forwards.
+                            (true, None) => {}
+                            (false, _) => {
+                                let yielded: Vec<u16> =
+                                    yielded_ports.iter().map(|c| c.port).collect();
+                                // The probe binds each port and pauses between
+                                // binds of a held one, so on the blocking pool.
+                                let in_use = {
+                                    let control = control.clone();
+                                    let ingress = ingress.clone();
+                                    crate::traced::spawn_blocking(move || {
+                                        crate::net::policy::host_ports_in_use(
+                                            &control, published, &ingress, &yielded,
+                                        )
+                                    })
+                                    .await
+                                    .map_err(std::io::Error::other)?
+                                };
+                                if let Some(&port) = in_use.first() {
+                                    refusal = Some(minimald_rpc::PortInUseRefusal {
+                                        port,
+                                        box_port: box_port(port),
+                                        holder: holder_of(port),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    if let Some(refusal) = refusal {
+                        warn_port_refusal(&record, published, &refusal);
+                        return Err(crate::net::policy::address_in_use_error(refusal));
+                    }
+                }
+
+                let mut ran: Vec<minimald_rpc::RanHook> = Vec::new();
+                if self.has_hooks_for(crate::hooks::HookEvent::Activate) {
+                    self.launch_host_for_hooks(LaunchPhase::Activating)
+                        .await
+                        .inspect_err(|e| {
+                            // The launch's attach binds the declared forwards.
+                            // A taken port fails it with the typed refusal,
+                            // which this finalize logs like its own (NET-144).
+                            #[cfg(target_os = "linux")]
+                            if let Some(refusal) = crate::net::policy::port_in_use_refusal(e) {
+                                let published = self
+                                    .hostnames
+                                    .read()
+                                    .expect("hostname registry lock poisoned")
+                                    .published_own_address(record.id);
+                                warn_port_refusal(&record, published, &refusal);
+                            }
+                        })?;
+                    let outcomes = run_session_hooks(
+                        &self.inner,
+                        &self.record,
+                        crate::hooks::HookEvent::Activate,
+                    )
+                    .await;
+                    // Unlike every other transition, an activate failure
+                    // aborts: a development environment whose setup
+                    // script failed is not the environment the user
+                    // asked for, and handing back a quietly-wrong
+                    // session is worse than refusing.
+                    if let Some(failed) = outcomes.iter().find(|o| o.failed()) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!(
+                                "activation hook from {} {}; the session was not \
+                                 activated{}",
+                                failed.declared_by,
+                                failed.status,
+                                if failed.output.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(":\n{}", failed.output)
+                                },
+                            ),
+                        ));
+                    }
+                    // Nothing failed, so every outcome here is a hook that
+                    // ran. Reported back so the client can say what it did
+                    // — an activate hook is headless, and without this the
+                    // only trace is the daemon log.
+                    ran.extend(outcomes.iter().map(|o| minimald_rpc::RanHook {
+                        declared_by: o.declared_by.clone(),
+                        description: o.description.clone(),
+                        output: o.output.clone(),
+                    }));
+                }
+
+                // Re-read rather than reuse the record read above: the
+                // activate-hook launch wrote its own facts to it (the
+                // placement outcome, the host-row binding), and promoting a
+                // stale copy would erase them.
+                let mut record = self.record.record().await?;
+                record.status = BoxState::Active;
+                self.record.write(record.clone()).await?;
+                Ok(minimald_rpc::FinalizeSessionResponse {
+                    activate_hooks: ran,
+                    package_check_skipped,
+                    shared_port_collisions,
+                })
+            }
+            BoxState::Pending => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "session is Pending; configure the loadout first",
+            )),
+            BoxState::Stopped | BoxState::Exited => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "session has ended; it cannot be finalized",
+            )),
+        }
+    }
+
+    /// Where this box's package builds run (NET-155): the box's own
+    /// classifier leaf, so its egress verdict decides what the builds can
+    /// reach. A box whose launch placed it in a leaf never builds outside it,
+    /// so a missing leaf refuses the build.
+    async fn build_placement(&self) -> Result<crate::box_ops::BuildPlacement, std::io::Error> {
+        let record = self.record.record().await?;
+        let box_id = record.id.to_string();
+        let box_name = record.name.clone().unwrap_or_else(|| box_id.clone());
+        let placed = record.host_ip_enforcement == Some(boxes::HostIpEnforcement::PerBox);
+        let leaf = box_build_leaf(
+            std::path::Path::new(sandbox::classifier::TREE_ROOT),
+            &box_id,
+            &box_name,
+            placed,
+        )
+        .map_err(|refusal| {
+            tracing::warn!(
+                box_name = %box_name,
+                "refusing a package build for a placed box whose classifier leaf is missing",
+            );
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, refusal)
+        })?;
+        let network = match leaf {
+            Some(_) => None,
+            None => own_address_build_network(&record, &self.net_switch, self.deny_all_opt_out),
+        };
+        Ok(crate::box_ops::BuildPlacement {
+            box_name,
+            leaf,
+            network,
+        })
+    }
+
+    /// Kicks off a background package build as a side-op and registers it on
+    /// this session, returning the receiver end of its event stream. The build
+    /// runs against a fresh workspace-rooted context (rebuilt per call so it
+    /// tracks `minimal.toml` edits).
+    ///
+    /// The returned receiver closes when the build ends.
+    pub(super) async fn start_build(
+        &mut self,
+        rebuild: bool,
+        pkgs: Vec<String>,
+    ) -> Result<mpsc::Receiver<BuildUpdate>, std::io::Error> {
+        let ctx = self.context(false).await.map_err(std::io::Error::other)?;
+        let placement = self.build_placement().await?;
+        let (sop, rx) =
+            SideOp::spawn_build(self.weak_self.clone(), rebuild, pkgs, ctx, placement, 64).await?;
+        match &mut self.inner {
+            BoxInner::Active { sops, .. } => sops.push(sop),
+            BoxInner::Draft { .. } => {
+                sop.shutdown().await;
+                unreachable!("`context()` already rejected a `Draft`");
+            }
+        }
+        Ok(rx)
+    }
+
+    /// Kicks off a background check run as a side-op and registers it on this
+    /// session, returning the receiver end of its result stream. Like
+    /// [`start_build`](Self::start_build) it runs against a fresh
+    /// workspace-rooted context, so it sees `minimal.toml` edits made since the
+    /// session came up.
+    ///
+    /// The returned receiver closes when the run ends.
+    pub(super) async fn start_check(
+        &mut self,
+        opts: CheckOpts,
+    ) -> Result<mpsc::Receiver<CheckUpdate>, std::io::Error> {
+        let ctx = self.context(false).await.map_err(std::io::Error::other)?;
+        // NET-155: a check's package builds follow the box's egress verdict.
+        // A placed box whose leaf is gone is refused, the same as a task, so
+        // its builds never run in the daemon's own cgroup. No relaunch asks
+        // for a check, so the refusal cannot block a launch.
+        let record = self.record.record().await?;
+        let box_name = record.name.clone().unwrap_or_else(|| record.id.to_string());
+        crate::exec::task_build_refusal(
+            record.host_ip_enforcement,
+            &box_name,
+            ctx.classifier_leaf().is_some(),
+        )?;
+        let (sop, rx) = SideOp::spawn_check(self.weak_self.clone(), opts, ctx, 64).await?;
+        match &mut self.inner {
+            BoxInner::Active { sops, .. } => sops.push(sop),
+            BoxInner::Draft { .. } => {
+                sop.shutdown().await;
+                unreachable!("`context()` already rejected a `Draft`");
+            }
+        }
+        Ok(rx)
+    }
+
+    /// Kicks off a background materialize run as a side-op and registers it on
+    /// this session, returning the receiver end of its stream. Like
+    /// [`start_build`](Self::start_build) it runs against a fresh
+    /// workspace-rooted context, so it sees outputs declared since the session
+    /// came up. The receiver closes when the run ends.
+    pub(super) async fn start_materialize(
+        &mut self,
+        opts: MaterializeOpts,
+    ) -> Result<mpsc::Receiver<MaterializeUpdate>, std::io::Error> {
+        let ctx = self.context(false).await.map_err(std::io::Error::other)?;
+        // NET-155: the package builds a materialize starts run in the box's
+        // leaf, the same as a build side-op's.
+        let placement = self.build_placement().await?;
+        let ctx = match (placement.leaf.clone(), placement.network.clone()) {
+            (Some(leaf), _) => {
+                tracing::info!(
+                    box_name = %placement.box_name,
+                    leaf = %leaf.dir().display(),
+                    "starting a materialize for a box in the box's classifier leaf",
+                );
+                ctx.with_classifier_leaf(leaf)
+            }
+            (None, Some(network)) => {
+                tracing::info!(
+                    box_name = %placement.box_name,
+                    leaf = "none",
+                    "starting a materialize for a box on the box's own network, \
+                     under the box's egress rules",
+                );
+                ctx.with_box_network(network)
+            }
+            (None, None) => {
+                tracing::info!(
+                    box_name = %placement.box_name,
+                    leaf = "none",
+                    "starting a materialize for a box in the daemon's own cgroup, with no \
+                     per-box egress enforcement, because the box has none",
+                );
+                ctx
+            }
+        };
+        let (sop, rx) =
+            SideOp::spawn_materialize(self.weak_self.clone(), opts, ctx, placement, 64).await?;
+        match &mut self.inner {
+            BoxInner::Active { sops, .. } => sops.push(sop),
+            BoxInner::Draft { .. } => {
+                sop.shutdown().await;
+                unreachable!("`context()` already rejected a `Draft`");
+            }
+        }
+        Ok(rx)
+    }
+
+    /// Produces this session's arm result for [`WorkspaceBaseline`]: the
+    /// persisted sidecar when one is readable — so a daemon restart keeps
+    /// the activation-time baseline — and a fresh walk otherwise, persisted
+    /// best-effort so the next restart finds it. Every failure degrades to
+    /// the fresh walk or to skipping persistence with a warning: change
+    /// detection is a courtesy and never blocks a launch.
+    pub(super) async fn load_or_arm_baseline(
+        &self,
+        workspace_root: std::path::PathBuf,
+    ) -> Option<Arc<DeltaSource>> {
+        match self.record.load_delta_baseline().await {
+            Ok(Some(bytes)) => {
+                match workspace_delta::from_sidecar_bytes(&bytes, workspace_root.clone()) {
+                    Ok(delta) => return delta,
+                    Err(e) => {
+                        tracing::warn!(
+                            session_id = %self.record.id(),
+                            error = %e,
+                            "unreadable delta-baseline sidecar; arming afresh",
+                        );
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %self.record.id(),
+                    error = %e,
+                    "failed to read delta-baseline sidecar; arming afresh",
+                );
+            }
+        }
+        let delta = DeltaSource::arm(workspace_root).await;
+        // Persist the arm result — a failed arm included, so a restart
+        // honors "change detection disabled" instead of re-snapshotting a
+        // tree the session may already have modified.
+        match workspace_delta::to_sidecar_bytes(delta.as_ref()) {
+            Ok(bytes) => {
+                if let Err(e) = self.record.store_delta_baseline(bytes).await {
+                    tracing::warn!(
+                        session_id = %self.record.id(),
+                        error = %e,
+                        "failed to persist the delta baseline; a daemon restart will re-arm",
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %self.record.id(),
+                    error = %e,
+                    "unserializable delta baseline; a daemon restart will re-arm",
+                );
+            }
+        }
+        delta
+    }
+
+    /// The held [`Composition`], if any — `None` in `Draft` or for an actor
+    /// spawned from disk after a daemon restart.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(super) fn composition(&self) -> Option<Arc<Composition>> {
+        match &self.inner {
+            BoxInner::Active { composition, .. } => composition.clone(),
+            BoxInner::Draft { .. } => None,
+        }
+    }
+
+    /// Return this session's workspace-rooted [`mctx::Context`].
+    ///
+    /// This is NOT cached to enable session execution to change as the
+    /// `minimal.toml` file changes.
+    ///
+    /// Gated on the same lifecycle status as [`BoxActor::attach`]:
+    /// the on-disk record must be `Active`. `BoxInner::Active`
+    /// alone doesn't distinguish `Materializing` (composition done,
+    /// patches not yet uploaded and not yet materialized into the
+    /// sandbox home) from `Active` (fully ready). Building a
+    /// context and running a task against a `Materializing`
+    /// session would execute against an unpopulated home dir —
+    /// the exact lifecycle escape the `Materializing` state was
+    /// added to prevent.
+    ///
+    /// The one caller that legitimately runs before the promotion —
+    /// [`BoxActor::finalize`]'s activation-hook launch — reaches
+    /// [`Self::build_context`] directly instead, via
+    /// [`LaunchPhase::Activating`]. It materializes the home dir first, so
+    /// it satisfies the invariant this gate protects without being able to
+    /// satisfy the gate itself.
+    pub(super) async fn context(
+        &mut self,
+        scaffold_if_missing: bool,
+    ) -> Result<mctx::Context, String> {
+        if matches!(&self.inner, BoxInner::Draft { .. }) {
+            return Err("session is pending composition".to_string());
+        }
+        let record = self
+            .record
+            .record()
+            .await
+            .map_err(|e| format!("reading session record: {e}"))?;
+        if record.status != BoxState::Active {
+            return Err(format!(
+                "session isn't attachable yet (status is {:?}, need Active — \
+             finish the activation first)",
+                record.status,
+            ));
+        }
+
+        let ctx = self.build_context(scaffold_if_missing).await?;
+        // NET-155: every context the box hands out places the package builds
+        // it starts in the box's leaf while the box has one, so a task run,
+        // a check or a launch's builds follow the box's egress verdict. The
+        // lookup does not refuse here: a relaunch asks for this context
+        // before its launch creates the leaf again, and the launch then
+        // places the env's builds in that leaf itself (`Env::build`). The
+        // build and materialize side operations refuse a placed box whose
+        // leaf is gone (`build_placement`).
+        let box_id = record.id.to_string();
+        let box_name = record.name.clone().unwrap_or_else(|| box_id.clone());
+        let leaf = box_build_leaf(
+            std::path::Path::new(sandbox::classifier::TREE_ROOT),
+            &box_id,
+            &box_name,
+            false,
+        )?;
+        // An own-address box has no leaf: `build_context` gave its context
+        // the box's own network instead.
+        Ok(match leaf {
+            Some(leaf) => ctx.with_classifier_leaf(leaf),
+            None => ctx,
+        })
+    }
+
+    /// The mctx [`Config`] rooted at this session's workspace, shared by the
+    /// scaffold and context-construction paths so both see one session.
+    ///
+    /// [`Config`]: mctx::Config
+    pub(super) fn workspace_config(&self, wsp: &DaemonAbsPath) -> Result<mctx::Config, String> {
+        ConfigBuilder::new()
+            .with_repo_dir(wsp.as_utf8_path())
+            .with_cache_dir(self.minimal_cache_dir.as_utf8_path())
+            .with_state_dir(self.minimal_state_dir.as_utf8_path())
+            // Every context this session builds reports into its operation tree.
+            // The host-mint path renders that tree onto the SSH channel; the
+            // task-exec path (via `MakeContext`) also feeds it, so task builds
+            // surface on the same tracker even though only a mint renders it.
+            .with_operation_tracker(self.tracker.clone())
+            .with_daemon_id(self.daemon_ctx.daemon_id().unwrap()) // always set under minimald
+            .build()
+            .map_err(|e| mctx::Error::from(e).to_string())
+    }
+
+    /// TEMPORARY: write a default shell-stack `minimal.toml` into the
+    /// session's workspace if it has none, so [`mctx::Context::new`] can
+    /// succeed and the session gets a usable set of packages. A workspace
+    /// that already holds an uploaded `minimal.toml` is left alone.
+    ///
+    /// Runs from [`Self::configure_loadout`], ahead of the composition that
+    /// decides the launcher's packages; [`Self::build_context`] repeats it as
+    /// an idempotent backstop for sessions brought up from disk.
+    pub(super) fn scaffold_mfile_if_missing(&self, wsp: &DaemonAbsPath) -> Result<(), String> {
+        if wsp.as_utf8_path().join(mfile::MFILE_NAME).exists() {
+            return Ok(());
+        }
+        match mfile::File::from_dir(wsp.as_utf8_path()) {
+            Ok(_) => Ok(()), // it exists
+            Err(mfile::Error::NotFound) => {
+                let (toml_path, content) = self.default_mfile_plan(wsp)?;
+                // Under the lock `min init`/`add`/`update` take, and only if
+                // the file is still missing there, so a concurrent writer's
+                // file is never clobbered by the default.
+                mfile::File::edit_exclusively::<mfile::Error>(&toml_path, |existing| {
+                    Ok(existing.is_none().then_some(content))
+                })
+                .map_err(|e| e.to_string())
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// The default `minimal.toml` [`Self::scaffold_mfile_if_missing`] writes.
+    ///
+    /// Production: `op::InitProject` detects the workspace's stack against the
+    /// default package repo, whose branch head it resolves over the network.
+    ///
+    /// Under `test`/`test-support`: stand in for that network round-trip. Tests
+    /// run offline, and what they need from the scaffold is that it lands before
+    /// the composition — not what stack detection would have picked. The two
+    /// packages are what `op::InitProject` falls back to when nothing matches.
+    pub(super) fn default_mfile_plan(
+        &self,
+        wsp: &DaemonAbsPath,
+    ) -> Result<(std::path::PathBuf, String), String> {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            Ok((
+                wsp.as_utf8_path()
+                    .join(mfile::MFILE_NAME)
+                    .into_std_path_buf(),
+                "[session]\npackages = [\"base\", \"vim\"]\n".to_string(),
+            ))
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            let config = self.workspace_config(wsp)?;
+
+            use op::ProjectOp as _;
+            let mut env = mctx::ProjectSetup::for_init(config).map_err(|e| e.to_string())?;
+            let plan = op::InitProject.run(&mut env).map_err(|e| e.to_string())?;
+
+            Ok((plan.toml_path, plan.content))
+        }
+    }
+
+    /// Do the actual context construction: run [`mctx::Context::new`] against
+    /// a session-rooted [`Config`]. Called at most once per actor lifetime by
+    /// [`Self::context`].
+    ///
+    /// The workspace mfile it parses is either the client's uploaded one or
+    /// the default [`Self::configure_loadout`] scaffolded. The scaffold is
+    /// repeated here as a backstop — it early-returns when the mfile exists,
+    /// so it only fires for a session whose compose predates it.
+    ///
+    /// [`Config`]: mctx::Config
+    pub(super) async fn build_context(
+        &self,
+        scaffold_if_missing: bool,
+    ) -> Result<mctx::Context, String> {
+        let wsp = self.record.object().await.unwrap().workspace_path();
+        if scaffold_if_missing {
+            // Fenced: the scaffold updates the default package checkout,
+            // whose checkouts cache lock may block for up to the lock
+            // timeout, and that wait must not park a tokio worker.
+            // Flavor-guarded because `block_in_place` panics on a
+            // current-thread runtime.
+            let scaffold = || self.scaffold_mfile_if_missing(&wsp);
+            match tokio::runtime::Handle::current().runtime_flavor() {
+                tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(scaffold),
+                _ => scaffold(),
+            }?;
+        }
+        let ctx = mctx::Context::new(self.workspace_config(&wsp)?).map_err(|e| e.to_string())?;
+        // NET-155: an own-address box has no classifier leaf. Every package
+        // build its context starts, the activation launch's among them,
+        // attaches to a network of the box's own, under the box's egress
+        // rules.
+        let record = self
+            .record
+            .record()
+            .await
+            .map_err(|e| format!("reading session record: {e}"))?;
+        Ok(
+            match own_address_build_network(&record, &self.net_switch, self.deny_all_opt_out) {
+                Some(network) => ctx.with_box_network(network),
+                None => ctx,
+            },
+        )
+    }
+
+    /// Refuse a composition that names a package the session's graph does
+    /// not declare, naming each such package and who declared it (the
+    /// project or a loadout).
+    ///
+    /// Resolves names only: nothing is built, and no graph is retained
+    /// here, since the launch evaluates its own. When
+    /// [`Self::configure_loadout`] captured the compose-time graph's
+    /// names, membership in them answers the same lookup the launch uses
+    /// ([`crate::env::session_package`]) without re-evaluating the graph
+    /// — the most expensive step of a compose — a second time; otherwise
+    /// the check evaluates the graph itself, once. A context or graph
+    /// that cannot be evaluated at all (an upstream that does not resolve)
+    /// is not judged here; the launch reports it, as it did before this
+    /// check existed — and so is one that does not resolve within
+    /// [`PACKAGE_CHECK_DEADLINE`]: the daemon bounds the work the check
+    /// adds to the `FinalizeSession` round-trip itself, because the
+    /// round-trip's other deadline is the client's, and its expiry does not
+    /// cancel the daemon-side finalize. An expired check steps aside,
+    /// warned, and the launch resolves the names at first exec, as it
+    /// always has. Because tokio polls the check before its timer, expiry
+    /// is not left to the race between them: the check measures its own
+    /// budget first, and a deadline already lapsed steps aside before any
+    /// verdict.
+    ///
+    /// Returns `Ok(true)` when the check stepped aside (expired deadline,
+    /// no session context, or no package graph) so the client can warn the
+    /// operator; `Ok(false)` when it ran to a verdict (nothing unknown, or
+    /// an unknown package refused via `Err`).
+    pub(super) async fn check_composed_packages(
+        &self,
+        comp: &Composition,
+    ) -> Result<bool, std::io::Error> {
+        // Both expiry routes (the budget measured up front, the timer
+        // below) step aside with the same warning.
+        fn warn_check_expired(deadline: std::time::Duration) {
+            tracing::warn!(
+                ?deadline,
+                "package check skipped at finalize: the session graph did not \
+                 resolve within its deadline; unknown package names will surface \
+                 at first exec, as before this check existed",
+            );
+        }
+        if comp.packages().is_empty() {
+            return Ok(false);
+        }
+        let started = std::time::Instant::now();
+        let checked: Result<Result<bool, std::io::Error>, _> =
+            tokio::time::timeout(self.package_check_deadline, async {
+                // The budget check first: tokio polls this future before
+                // its timer, and judging the captured names (the match
+                // below) is cheap enough to complete within that first
+                // poll, so an already-lapsed deadline — a
+                // `Duration::ZERO` switch — would never fire against it
+                // (see the expiry test). Measuring costs nothing on the
+                // slow fallback, which the timeout bounds anyway.
+                if started.elapsed() >= self.package_check_deadline {
+                    warn_check_expired(self.package_check_deadline);
+                    return Ok(true);
+                }
+                let unknown: Vec<String> = match self.composed_graph_names.as_ref() {
+                    // A handful of set lookups: judged inline, no
+                    // blocking-pool round-trip.
+                    Some(known) => comp
+                        .packages()
+                        .iter()
+                        .filter(|p| !known.contains(p.package()))
+                        .map(|p| {
+                            format!(
+                                "{} (declared by {})",
+                                crate::env::unknown_package(p.package()),
+                                boxes::core::source::Provenanced::source(p)
+                            )
+                        })
+                        .collect(),
+                    None => {
+                        let ctx = match self.build_context(true).await {
+                            Ok(ctx) => ctx,
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    "package check skipped at finalize: no session context"
+                                );
+                                return Ok(true);
+                            }
+                        };
+                        // CPU-heavy (nickel evaluation), so on the blocking pool, as
+                        // the launch runs it.
+                        let graph = crate::traced::spawn_blocking(move || {
+                            let mut ctx = ctx;
+                            ctx.graph_from_all_packages().map_err(|e| e.to_string())
+                        })
+                        .await
+                        .map_err(std::io::Error::other)?;
+                        let graph = match graph {
+                            Ok(graph) => graph,
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    "package check skipped at finalize: no package graph"
+                                );
+                                return Ok(true);
+                            }
+                        };
+                        comp.packages()
+                            .iter()
+                            .filter_map(|p| {
+                                crate::env::session_package(&graph, p.package())
+                                    .err()
+                                    .map(|e| {
+                                        format!(
+                                            "{e} (declared by {})",
+                                            boxes::core::source::Provenanced::source(p)
+                                        )
+                                    })
+                            })
+                            .collect()
+                    }
+                };
+                if unknown.is_empty() {
+                    return Ok(false);
+                }
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{}; the session was not activated", unknown.join("; ")),
+                ))
+            })
+            .await;
+        match checked {
+            Ok(result) => result,
+            Err(_expired) => {
+                // Stepping aside, not failing: a graph this slow is one the
+                // launch tolerates — it evaluates its own, unbounded, at
+                // first exec — so the check tolerates it too. The evaluation
+                // the timeout detached keeps running on the blocking pool and
+                // warms the cache that launch reads.
+                warn_check_expired(self.package_check_deadline);
+                Ok(true)
+            }
+        }
+    }
+}

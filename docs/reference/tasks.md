@@ -60,6 +60,9 @@ all; useful for pointers and reminders:
 echo = "Docs live at https://docs.minimal.dev"
 ```
 
+Each task sets exactly one action. If a task sets two, such as `exec` and
+`bash`, the file fails to load with an error that names the task and both keys.
+
 When [args](#args) are set on the task, arguments can be substituted into the invocation using
 Nickel's string interpolation [syntax](https://nickel-lang.org/user-manual/syntax/#strings):
 
@@ -85,6 +88,61 @@ exec = 'curl -s -o /dev/null -w "%{http_code}" https://example.com'
 [tasks.probe]
 exec = 'curl -s -o /dev/null -w "%{"%"}{http_code}" https://example.com'
 ```
+
+Argument values are data. What reaches the program depends on the action.
+
+Minimal splits an `exec` string into words before it fills in any value, and
+no shell runs the result. Each string value lands inside the one word that
+holds its reference. This holds whatever spaces, quotes, or shell syntax the
+value contains. It also holds whether the reference is bare, in single quotes,
+or in double quotes:
+
+```toml
+[tasks.deploy]
+args.environment = "string"
+exec = "runner --environment=%{environment} apply"
+```
+
+Passing `--environment "stage; rm -rf /"` runs `runner` with the two
+arguments `--environment=stage; rm -rf /` and `apply`.
+
+Minimal never pastes a string value into a `bash` script. Instead, it sets
+each argument `name` in the script's environment as `MIN_ARG_<NAME>`. In that
+variable name, the argument name is in upper case, and `_` replaces every
+character other than a letter or digit. A reference `%{name}` to a string
+argument becomes `${MIN_ARG_NAME}` in the script. The shell expands it as a
+variable and never runs the value. Quote it as you quote any shell variable:
+
+```toml
+[tasks.greet]
+args.name = "string"
+bash = "echo \"Hello %{name}!\""  # same as: echo "Hello $MIN_ARG_NAME!"
+```
+
+- Inside double quotes, the value arrives whole.
+- Outside quotes, the shell splits the value into words and expands
+  wildcards in it, as it does for any unquoted variable.
+- Inside single quotes, the shell prints the reference itself, such as
+  `${MIN_ARG_NAME}`, not the value.
+
+An array argument `files` sets `MIN_ARG_FILES_COUNT` to its length and
+`MIN_ARG_FILES_0`, `MIN_ARG_FILES_1`, and so on to its elements. Argument
+names that map to the same variable, such as `a-b` and `a_b`, are an error.
+
+Number and boolean arguments keep their real values in `%{...}` expressions,
+such as `%{std.string.from_number count}`. Minimal does not replace them with
+a variable reference. Enum arguments keep their real values too, because
+an enum value is always one of the values the task lists. So
+`%{if profile == "release" then "--release" else ""}` takes the branch the
+value selects, in `exec` and in `bash`.
+
+Inside a `%{...}` expression, a string argument in an `exec` string or a
+`bash` script is an opaque placeholder. You can place it or join it with other
+text. An expression that compares or parses it does not see the value the
+caller passed.
+
+`echo` and list-form `exec` actions take each value as it is. Neither one
+runs a shell.
 
 
 ### `description` - Describe the task
@@ -283,6 +341,10 @@ of the repository root.
 inherit_cwd = true
 ```
 
+Under `min task run`, the task starts at the matching path under `/workbench`: run from
+`sub/inner`, it starts at `/workbench/sub/inner`. If that directory is not in the uploaded tree, the
+task starts at `/workbench` and prints a one-line notice on stderr.
+
 ### `args` - Pass arguments to tasks {#args}
 
 _Optional_
@@ -336,3 +398,47 @@ Instead of a bare datatype string, an argument can be declared as a table with a
 args.name = { type = "string", help = "who to greet", default = "world" }
 exec = "echo Hello %{name}"
 ```
+
+## Networking {#networking}
+
+A task has no `--network` flag of its own. It uses the network of the
+session that runs it, which the session's
+[`--network` mode](./cli-min.md#session-activate) sets:
+
+- `min task run` composes an ephemeral session with the default mode,
+  `host_ip`.
+- `min run <task>` inside a session and
+  [`min session run <session> <task>`](./cli-min.md#session-run) run the task
+  in a session that already exists. The task takes that session's mode.
+
+`host_ip` (the default) shares the host's network namespace. The task
+reaches everything the host reaches. This includes the host-side hostname
+proxy, the port clients point `HTTP(S)_PROXY` at. `min ls` prints the port
+in use. On a native Linux host the proxy listens on `127.0.0.1:7654` by
+default, and picks a free port when 7654 is busy. On a native host only,
+[`minimald run --hostname-proxy-port`](./cli-minimald.md#run) pins it.
+
+On a host where Minimal runs in a VM (macOS), the task shares the VM's
+network, not your computer's. `127.0.0.1` inside the task is the VM's
+loopback. A service listening on your computer's loopback is not reachable
+at that address. The VM helper assigns the proxy port there, so read it from
+`min ls` rather than assuming 7654.
+
+`own_ip` gives the task its own address on the host's switch, in its own
+network namespace. This namespace is a second box beside the session's box,
+not the session's namespace. `127.0.0.1` inside the task is the task's own
+loopback, so a connection to it does not reach the hostname proxy on the host.
+Outbound traffic goes through the switch, so a task that fetches from the
+network does not need the proxy. The task also follows the session's egress
+policy: when the session cannot reach a destination, the task cannot reach it
+either.
+
+On a VM-backed host, which includes every macOS host, a task in an `own_ip`
+session has no outbound reach yet. The task takes a switch address that the
+host's table of boxes does not hold. The switch drops traffic from such an
+address. Run a task that needs the network in a `host_ip`
+session there.
+
+`none` gives the task no network. Every connection to a destination outside
+the task fails. When a task needs the network, give its session a mode that
+has one.

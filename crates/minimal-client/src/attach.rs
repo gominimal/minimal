@@ -8,11 +8,27 @@
 
 use std::path::Path;
 
+use crate::HANDSHAKE_TIMEOUT;
+// AskWatch is deliberately NOT re-exported here. CodeRabbit asked to
+// `pub use crate::ask_dialog::AskWatch` to keep the historical
+// `attach::AskWatch` path, but minimal-client is an in-workspace crate,
+// nothing names that path, and `ask_dialog` is a `pub mod`, so the public
+// path is `minimal_client::ask_dialog::AskWatch`. The re-export was
+// withdrawn by the reviewer (PR #2341); restoring it would re-couple the
+// two modules this refactor split apart.
+use crate::ask_dialog::{AskDialogEnd, AskWatch, is_dismissal_of, render_ask_dialog};
 use crate::tty_relay;
 use anyhow::Context as _;
 
+/// Seconds between ssh keepalive probes on a non-interactive exec channel.
+/// With [`EXEC_SERVER_ALIVE_COUNT_MAX`], a peer that stops answering ends the
+/// exec after about 60 s instead of hanging it.
+const EXEC_SERVER_ALIVE_INTERVAL_SECS: u32 = 15;
+/// Unanswered keepalive probes ssh tolerates before it drops an exec channel.
+const EXEC_SERVER_ALIVE_COUNT_MAX: u32 = 4;
+
 /// Read and validate the session-key config, returning the resolved
-/// [`sessions::keys::SessionKeys`] to negotiate at attach. A missing config
+/// [`boxes::keys::SessionKeys`] to negotiate at attach. A missing config
 /// file yields the shipped defaults; a present-but-invalid one (e.g. a
 /// termios-special leader) surfaces its error loudly so the user fixes the
 /// config rather than silently attaching with the wrong chord.
@@ -22,9 +38,9 @@ use anyhow::Context as _;
 /// those.
 pub fn resolve_session_keys(
     config_dir: Option<&Path>,
-) -> Result<sessions::keys::SessionKeys, anyhow::Error> {
+) -> Result<boxes::keys::SessionKeys, anyhow::Error> {
     let cfg_path = paths::minimal_config_dir_with_override(config_dir).join("config.toml");
-    let cfg = sessions::client::config::read_config_or_default(&cfg_path)
+    let cfg = boxes::client::config::read_config_or_default(&cfg_path)
         .map_err(|e| anyhow::anyhow!("reading session-keys config {cfg_path:?}: {e}"))?;
     cfg.session_keys
         .to_session_keys()
@@ -72,6 +88,119 @@ pub fn host_key_opts(known_hosts: &Path) -> [String; 2] {
     }
 }
 
+/// The exclusive lock this process holds for the proxies it drives, taken
+/// once and kept for the process's life; see [`hold_owner_lock`].
+static OWNER_LOCK: std::sync::OnceLock<(std::path::PathBuf, nix::fcntl::Flock<std::fs::File>)> =
+    std::sync::OnceLock::new();
+
+/// Takes (once per process) the exclusive `flock` the proxy's owner watch
+/// reads, on a file beside the daemon socket named for this pid, and
+/// returns its path. Held in [`OWNER_LOCK`] until the process ends: that
+/// end — a SIGKILL as much as an exit — is what releases it, and what the
+/// proxy is waiting for. Best-effort: where the file cannot be made or
+/// locked (a socket path with no directory yet, a read-only state dir)
+/// the proxy keeps the pid watch alone, and the attach goes on.
+fn hold_owner_lock(sock: &Path) -> Option<std::path::PathBuf> {
+    if let Some((path, _)) = OWNER_LOCK.get() {
+        return Some(path.clone());
+    }
+    // One coordination lock per directory, held across the sweep of stale
+    // owner files and this one's create-and-lock, so a sweep never removes
+    // a file between its creation and its owner's lock. Not taken, the
+    // proxy keeps the pid watch alone.
+    let coord_path = sock.with_file_name(OWNER_COORD_FILE);
+    let coord = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&coord_path)
+        .ok()
+        .and_then(|f| nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusive).ok());
+    if coord.is_none() {
+        tracing::debug!(
+            path = %coord_path.display(),
+            "no proxy owner coordination lock; the proxy watches the pid alone"
+        );
+        return None;
+    }
+    if let Some(dir) = sock.parent() {
+        sweep_stale_owner_locks(dir);
+    }
+    // Unique to this process, not just its pid: a recycled pid must not
+    // find (or be found by) a proxy still watching the old owner's path.
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let path = sock.with_file_name(format!("proxy-owner-{}-{started}.lock", std::process::id()));
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::debug!(
+                path = %path.display(),
+                %error,
+                "no proxy owner lock; the proxy watches the pid alone"
+            );
+            return None;
+        }
+    };
+    let lock = match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => lock,
+        Err((_, errno)) => {
+            tracing::debug!(
+                path = %path.display(),
+                %errno,
+                "could not lock the proxy owner lock; the proxy watches the pid alone"
+            );
+            return None;
+        }
+    };
+    // A second caller racing this one holds the same lock: either value is
+    // the process's, and the loser's lock drops, released, with its file
+    // still ours through the winner.
+    let (path, _) = OWNER_LOCK.get_or_init(|| (path, lock));
+    drop(coord);
+    Some(path.clone())
+}
+
+/// The coordination lock beside the daemon socket; see [`hold_owner_lock`].
+const OWNER_COORD_FILE: &str = "proxy-owners.lock";
+
+/// Removes the `proxy-owner-*.lock` files in `dir` that no live process
+/// holds: an owner that ended (an attach or exec that completed, or one
+/// killed) leaves its file behind, and the proxy unlinks it only when it
+/// was still watching at that moment. A file is removed while this process
+/// holds its lock, then released. Called under the coordination lock, so a
+/// new file is never caught between its creation and its owner's lock.
+fn sweep_stale_owner_locks(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !(name.starts_with("proxy-owner-") && name.ends_with(".lock")) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        if let Ok(lock) = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+        {
+            let removed = std::fs::remove_file(&path);
+            drop(lock);
+            tracing::debug!(?removed, path = %path.display(), "swept a stale proxy owner lock");
+        }
+    }
+}
+
 /// Build the `ssh` command that attaches to session `id` via the daemon
 /// socket at `sock`.
 ///
@@ -90,20 +219,44 @@ pub fn host_key_opts(known_hosts: &Path) -> [String; 2] {
 /// matching `SendEnv` option) the daemon reads back alongside
 /// `MINIMAL_SESSION_ID` and re-validates as a silent backstop. Pass `None`
 /// for non-interactive exec channels, which have no detach.
+///
+/// Returns the command without spawning ssh. Configures the proxy to close
+/// when this process exits, using a process-lifetime owner lock when available
+/// and a PID watch otherwise. Preparing the lock may create files beside
+/// `sock` and remove stale owner lock files; lock failures use the PID fallback.
+///
+/// # Errors
+///
+/// Returns an error if the current executable cannot be located or `sock`
+/// has no parent from which an SSH host alias can be derived.
 pub fn attach_command(
     sock: &Path,
-    id: sessions::SessionId,
+    id: boxes::SessionId,
     wire: Option<&str>,
-    session_keys: Option<&sessions::keys::SessionKeys>,
+    session_keys: Option<&boxes::keys::SessionKeys>,
 ) -> Result<std::process::Command, anyhow::Error> {
     // ProxyCommand points at our own `proxy` subcommand so we don't
-    // depend on socat or nc being installed.
+    // depend on socat or nc being installed. `--owner-lock` is a file this
+    // process holds an exclusive `flock` on for its lifetime, and `--owner`
+    // its pid: a `min` that dies without taking ssh down (SIGKILL, an OOM
+    // kill) leaves ssh and the proxy holding the daemon's socket open, and
+    // the daemon learns of a lost client only from that socket closing — so
+    // the proxy watches its owner and exits when it is gone. The lock is
+    // the watch that cannot be fooled: the kernel releases it on any end of
+    // this process, where a pid can be recycled or linger as a zombie.
     let exe = std::env::current_exe().context("cannot determine current exe")?;
-    let proxy_cmd = format!(
-        "{} proxy --socket {}",
+    let mut proxy_cmd = format!(
+        "{} proxy --socket {} --owner {}",
         shell_quote(&exe.display().to_string()),
         shell_quote(&sock.display().to_string()),
+        std::process::id(),
     );
+    if let Some(owner_lock) = hold_owner_lock(sock) {
+        proxy_cmd.push_str(&format!(
+            " --owner-lock {}",
+            shell_quote(&owner_lock.display().to_string())
+        ));
+    }
 
     let [strict, known_hosts_file] = host_key_opts(&sock.with_file_name(paths::KNOWN_HOSTS_FILE));
 
@@ -117,6 +270,16 @@ pub fn attach_command(
     // always-present `/bin/sh` rather than inherit the user's interactive shell.
     ssh.env("SHELL", "/bin/sh");
     ssh.env("MINIMAL_SESSION_ID", id.to_string());
+    // The CLI's trace context, as the native client sends it on every channel
+    // (`send_trace_context`): without it a `min session exec` / `run` /
+    // `attach` reached the daemon with no parent and its `exec` span began a
+    // trace of its own. With telemetry off the opt-out marker goes instead,
+    // and no `TRACEPARENT`. The daemon reads either from the channel config,
+    // not the session env (neither is in the `AcceptEnv` allowlist and
+    // neither reaches the box).
+    let (trace_var, trace_value) = trace_env();
+    ssh.env(trace_var, trace_value);
+    ssh.args(["-o", &format!("SendEnv={trace_var}")]);
     ssh.args([
         "-o",
         "SendEnv=MINIMAL_SESSION_ID",
@@ -136,6 +299,10 @@ pub fn attach_command(
         &strict,
         "-o",
         &known_hosts_file,
+        // Bound the connect and the initial protocol handshake/key exchange so
+        // a bridge that accepts but never serves fails instead of hanging ssh.
+        "-o",
+        &format!("ConnectTimeout={}", HANDSHAKE_TIMEOUT.as_secs()),
     ]);
     // Negotiate the session-key config per channel: send each resolved key
     // as an env var the daemon reads back (alongside MINIMAL_SESSION_ID) and
@@ -144,28 +311,25 @@ pub fn attach_command(
     // paired with its `env` set above. Only the interactive attach path sends
     // these — exec/task channels pass `None`.
     if let Some(keys) = session_keys {
-        ssh.env(sessions::keys::LEADER_ENV, keys.leader.as_config_str())
+        ssh.env(boxes::keys::LEADER_ENV, keys.leader.as_config_str())
+            .env(boxes::keys::DETACH_KEY_ENV, keys.detach_key.as_config_str())
             .env(
-                sessions::keys::DETACH_KEY_ENV,
-                keys.detach_key.as_config_str(),
-            )
-            .env(
-                sessions::keys::FORWARD_KEY_ENV,
+                boxes::keys::FORWARD_KEY_ENV,
                 keys.forward_key.as_config_str(),
             )
             .env(
-                sessions::keys::BELL_ENV,
+                boxes::keys::BELL_ENV,
                 if keys.bell_on_leader { "1" } else { "0" },
             )
             .args([
                 "-o",
-                &format!("SendEnv={}", sessions::keys::LEADER_ENV),
+                &format!("SendEnv={}", boxes::keys::LEADER_ENV),
                 "-o",
-                &format!("SendEnv={}", sessions::keys::DETACH_KEY_ENV),
+                &format!("SendEnv={}", boxes::keys::DETACH_KEY_ENV),
                 "-o",
-                &format!("SendEnv={}", sessions::keys::FORWARD_KEY_ENV),
+                &format!("SendEnv={}", boxes::keys::FORWARD_KEY_ENV),
                 "-o",
-                &format!("SendEnv={}", sessions::keys::BELL_ENV),
+                &format!("SendEnv={}", boxes::keys::BELL_ENV),
             ]);
     }
 
@@ -181,6 +345,19 @@ pub fn attach_command(
     // forever (#953). Callers must guarantee a terminal on stdin.
     if wire.is_none() {
         ssh.arg("-tt");
+    }
+
+    // A non-interactive exec channel must not hang forever on a peer that
+    // accepted the connection but stopped answering after the handshake:
+    // keepalives end it with exit 255 within about a minute. The interactive
+    // path is left without them so a laptop sleep does not kill the attach.
+    if wire.is_some() {
+        ssh.args([
+            "-o",
+            &format!("ServerAliveInterval={EXEC_SERVER_ALIVE_INTERVAL_SECS}"),
+            "-o",
+            &format!("ServerAliveCountMax={EXEC_SERVER_ALIVE_COUNT_MAX}"),
+        ]);
     }
 
     // The SSH host identity must match the known_hosts entry the daemon wrote,
@@ -219,8 +396,8 @@ pub fn attach_command(
 /// (attach-start termios, session output buffered) and whose `resume`
 /// takes it back. The hook thread is not joined: an attach that ends
 /// while a prompt is up still exits with ssh's status, and every handle
-/// call after that is a no-op or an error. `None` for callers that just
-/// attach: the CLI and the TUI today.
+/// call after that is a no-op or an error. The VM-backed attach hands
+/// [`HostAsks::into_hook`]; `None` for callers that just attach.
 ///
 /// The exec path (`wire: Some`) never comes here: the caller runs ssh
 /// itself, with no relay and no pty.
@@ -252,6 +429,586 @@ pub fn run_interactive_attach_on(
         }
     }
     relay.join(None)
+}
+
+// ---------------------------------------------------------------------------
+// Host-side asks (NET-045)
+// ---------------------------------------------------------------------------
+
+/// The VM host daemon's control socket's file name beside its ssh socket:
+/// `minvmd::control::CONTROL_SOCK_FILE`, spelled here because this crate
+/// does not depend on the VM host daemon; the CLI's tests pin the two equal.
+pub const VM_HOST_CONTROL_SOCK_FILE: &str = "control.sock";
+
+/// How long one exchange with the VM host daemon's control socket may take:
+/// the row read, the subscription's acknowledgement, and a recorded answer.
+/// The subscription itself is held for the whole attach, with no bound.
+const HOST_ASK_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// An interactive attach's subscription to its box's pending asks on a
+/// VM-backed host (NET-045): the VM host daemon offers each ask the in-VM
+/// daemon raises to every interactive attach subscribed to the box's row,
+/// and this side renders the dialog on the real terminal and records the
+/// human's answer through the host door. Only an interactive relay attach
+/// subscribes: an exec channel, a task and `min dash`'s list view never do,
+/// so none of them counts as attached.
+///
+/// Opened before the attach starts, so the subscription is in place by the
+/// time the human could expose a port; served for the attach's duration
+/// by the relay's suspend hook ([`Self::into_hook`]).
+pub struct HostAsks {
+    control_sock: std::path::PathBuf,
+    subscription: std::io::BufReader<std::os::unix::net::UnixStream>,
+    /// Lines a dialog read off the subscription while it watched for its
+    /// own dismissal, kept in order for the serving loop.
+    held: std::collections::VecDeque<String>,
+}
+
+/// The terminal side of the ask dialog: the relay's suspend and resume, as
+/// a trait so the serving loop is testable without a pty.
+pub trait AskTerminal {
+    /// Hand the real terminal to the dialog: the relay stops forwarding and
+    /// puts the attach-start termios back. Errors once the attach ended.
+    fn suspend_for_ask(&self) -> Result<(), anyhow::Error>;
+    /// Take the terminal back and resume relaying.
+    fn resume_after_ask(&self);
+    /// Whether the session ended while the dialog held the terminal: a
+    /// cancelled dialog records nothing.
+    fn ask_cancelled(&self) -> bool;
+}
+
+impl AskTerminal for tty_relay::RelayHandle {
+    fn suspend_for_ask(&self) -> Result<(), anyhow::Error> {
+        // The lease is not held: the handle's resume ends the suspension.
+        self.suspend().map(drop)
+    }
+
+    fn resume_after_ask(&self) {
+        self.resume();
+    }
+
+    fn ask_cancelled(&self) -> bool {
+        self.is_cancelled()
+    }
+}
+
+/// One request line to the VM host daemon's control socket, one reply line
+/// back, both bounded by [`HOST_ASK_CONTROL_TIMEOUT`]; the connection is
+/// handed back for a caller that keeps it.
+fn host_control(
+    control_sock: &Path,
+    request: &minimald_rpc::BoxControlRequest,
+) -> Result<
+    (
+        minimald_rpc::BoxControlReply,
+        std::io::BufReader<std::os::unix::net::UnixStream>,
+    ),
+    anyhow::Error,
+> {
+    host_control_within(control_sock, request, HOST_ASK_CONTROL_TIMEOUT)
+}
+
+/// The bound on a box row exchange the async front-ends run on a blocking
+/// thread under [`crate::box_registration::BOX_CONTROL_TIMEOUT`]: one second
+/// past it, so the caller's own deadline is the one that answers, and the
+/// thread ends soon after the caller gives up on it rather than holding the
+/// runtime's shutdown — and the process's exit — for the ask bound.
+const BOX_CONTROL_THREAD_BOUND: std::time::Duration =
+    std::time::Duration::from_secs(crate::box_registration::BOX_CONTROL_TIMEOUT.as_secs() + 1);
+
+/// [`host_control`] bounded by `timeout` instead ([`BOX_CONTROL_THREAD_BOUND`]).
+fn host_control_within(
+    control_sock: &Path,
+    request: &minimald_rpc::BoxControlRequest,
+    timeout: std::time::Duration,
+) -> Result<
+    (
+        minimald_rpc::BoxControlReply,
+        std::io::BufReader<std::os::unix::net::UnixStream>,
+    ),
+    anyhow::Error,
+> {
+    use std::io::{BufRead as _, Write as _};
+
+    use crate::box_registration::HostUnreachable;
+    // Every failure short of a reply is the host unreached
+    // ([`HostUnreachable`]); a reply that does not parse is a host that
+    // answered.
+    let mut stream = std::os::unix::net::UnixStream::connect(control_sock).map_err(|error| {
+        HostUnreachable::over(
+            error,
+            format!(
+                "connecting to the VM host daemon's control socket at {}",
+                control_sock.display()
+            ),
+        )
+    })?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .and_then(|()| stream.set_write_timeout(Some(timeout)))
+        .map_err(|error| HostUnreachable::over(error, "bounding the control exchange"))?;
+    let mut line = serde_json_lenient::to_string(request).context("serializing the request")?;
+    line.push('\n');
+    stream
+        .write_all(line.as_bytes())
+        .map_err(|error| HostUnreachable::over(error, "writing the control request"))?;
+    let mut reader = std::io::BufReader::new(stream);
+    let mut reply = String::new();
+    reader
+        .read_line(&mut reply)
+        .map_err(|error| HostUnreachable::over(error, "reading the control reply"))?;
+    if reply.trim().is_empty() {
+        return Err(HostUnreachable::error(
+            "the VM host daemon closed its control socket without answering",
+        ));
+    }
+    let reply = serde_json_lenient::from_str(reply.trim())
+        .with_context(|| format!("the VM host daemon's reply did not parse: {reply}"))?;
+    Ok((reply, reader))
+}
+
+/// Holds (`hold`) or releases a `host_ip` box's name in the zone of the VM
+/// host daemon beside the daemon's ssh socket `ssh_sock`: the \[proposed\]
+/// pre-alias interim (deployment-and-egress-gateway ruling §7.1) that
+/// answers a held name NODATA where an unheld one answers NXDOMAIN.
+/// Best-effort for a caller that does not know whether the daemon is
+/// VM-backed: no control socket beside it is nothing to do, and a refusal
+/// or a failed exchange warns and leaves the name answering as it did.
+/// `session_id` is the session the hold is for: a release that names it
+/// frees only that session's hold.
+pub fn hold_box_name_beside(
+    ssh_sock: &Path,
+    box_name: &str,
+    session_id: Option<boxes::SessionId>,
+    hold: bool,
+) {
+    let Some(control_sock) = ssh_sock
+        .parent()
+        .map(|dir| dir.join(VM_HOST_CONTROL_SOCK_FILE))
+    else {
+        return;
+    };
+    if !control_sock.exists() {
+        return;
+    }
+    let request = minimald_rpc::HoldBoxNameRequest {
+        name: box_name.to_string(),
+        session_id,
+    };
+    let (verb, operation) = if hold {
+        (
+            minimald_rpc::BoxControlRequest::HoldBoxName(request),
+            "hold",
+        )
+    } else {
+        (
+            minimald_rpc::BoxControlRequest::ReleaseBoxName(request),
+            "release",
+        )
+    };
+    let failure = match host_control(&control_sock, &verb) {
+        Ok((minimald_rpc::BoxControlReply::NameHeld { .. }, _)) => return,
+        Ok((other, _)) => format!("another verb's reply: {other:?}"),
+        Err(error) => format!("{error:#}"),
+    };
+    tracing::warn!(
+        box = %box_name,
+        operation,
+        "the box name {operation} could not be made ({failure}); the name answers as it did before"
+    );
+}
+
+/// Admits (`resident`) or retires a `host_ip` box's egress policy at the
+/// VM host daemon whose control socket is `control_sock` (NET-085). A
+/// `host_ip` box leaves the VM from the node's own address, and the host
+/// gate decides its frames by the policies admitted here: a box whose
+/// policy is not admitted reaches nothing outside the VM. Keyed by the
+/// session `session_id`, so an unnamed box and a task box admit the same
+/// way. Blocking and best-effort: a failed exchange warns and returns
+/// `false`. A daemon that predates the verbs refuses them, and its gate
+/// predates the decision too.
+pub fn host_ip_box_at(
+    control_sock: &Path,
+    session_id: boxes::SessionId,
+    egress: Option<&boxes::EgressPolicy>,
+    resident: bool,
+) -> bool {
+    let (verb, operation) = if resident {
+        (
+            minimald_rpc::BoxControlRequest::AdmitHostIpBox(minimald_rpc::HostIpBoxRequest {
+                session_id,
+                egress: egress.cloned(),
+            }),
+            "admit",
+        )
+    } else {
+        (
+            minimald_rpc::BoxControlRequest::RetireHostIpBox(
+                minimald_rpc::RetireHostIpBoxRequest { session_id },
+            ),
+            "retire",
+        )
+    };
+    let failure = match host_control(control_sock, &verb) {
+        Ok((minimald_rpc::BoxControlReply::HostIpBox { .. }, _)) => return true,
+        Ok((other, _)) => format!("another verb's reply: {other:?}"),
+        Err(error) => format!("{error:#}"),
+    };
+    tracing::warn!(
+        session = %session_id,
+        operation,
+        "the host_ip box's egress {operation} could not be made ({failure})"
+    );
+    false
+}
+
+/// Withdraws a box's host row (T66) on the VM host daemon whose control
+/// socket is `control_sock`, once the session that registered it is gone:
+/// the creator presents the name and the pair the registration handed back,
+/// and the daemon stops the pair's addresses admitting anything and returns
+/// them to its hand-out books. `box_id` is the id the registration handed
+/// back beside the pair, where the caller still holds it: the daemon then
+/// withdraws only that box, never a newer one handed the same name and pair
+/// after the quarantine. `None` — a session record carries no id — is the
+/// pair proof alone.
+///
+/// Best-effort and blocking: a withdrawal that cannot be made — the socket
+/// unreachable, a daemon that refuses the line, no answer in time — leaves
+/// the row published and warns rather than failing the destroy or the
+/// activation error it rides on. A daemon answering with a pair that is not
+/// the pair asked is answering something else, and says the row stays too.
+pub fn withdraw_box_row_at(
+    control_sock: &Path,
+    box_name: &str,
+    addresses: boxes::BoxAddresses,
+    box_id: Option<minimald_rpc::BoxId>,
+) {
+    let request = minimald_rpc::BoxControlRequest::Withdraw(minimald_rpc::WithdrawBoxRequest {
+        name: box_name.to_string(),
+        switch_address: addresses.switch_address,
+        loopback_address: addresses.loopback_address,
+        box_id,
+    });
+    let failure = match host_control_within(control_sock, &request, BOX_CONTROL_THREAD_BOUND) {
+        Ok((minimald_rpc::BoxControlReply::Addresses(handed), _)) if handed == addresses => {
+            tracing::info!(
+                box = %box_name,
+                switch_address = %handed.switch_address,
+                loopback_address = %handed.loopback_address,
+                "withdrew the box's host row; its addresses admit nothing"
+            );
+            return;
+        }
+        Ok((minimald_rpc::BoxControlReply::Addresses(handed), _)) => format!(
+            "the daemon answered with a different address pair, switch address {}",
+            handed.switch_address
+        ),
+        Ok((minimald_rpc::BoxControlReply::Error { error }, _)) => {
+            format!("the daemon refused it: {error}")
+        }
+        Ok((other, _)) => format!("another verb's reply: {other:?}"),
+        Err(error) => format!("{error:#}"),
+    };
+    tracing::warn!(
+        box = %box_name,
+        "the box row withdrawal could not be made ({failure}); the row stays published"
+    );
+}
+
+/// [`withdraw_box_row_at`] on the control socket beside the daemon's ssh
+/// socket `ssh_sock`, for a caller that does not know whether the daemon is
+/// VM-backed: no control socket beside it is a native host, which holds no
+/// rows, and nothing to do.
+pub fn withdraw_box_row_beside(
+    ssh_sock: &Path,
+    box_name: &str,
+    addresses: boxes::BoxAddresses,
+    box_id: Option<minimald_rpc::BoxId>,
+) {
+    let Some(control_sock) = ssh_sock
+        .parent()
+        .map(|dir| dir.join(VM_HOST_CONTROL_SOCK_FILE))
+    else {
+        return;
+    };
+    if !control_sock.exists() {
+        return;
+    }
+    withdraw_box_row_at(&control_sock, box_name, addresses, box_id);
+}
+
+/// Asks the VM host daemon whose control socket is `control_sock` for box
+/// `box_name`'s host row back (NET-138), before an attach or an exec runs
+/// in a box whose row may have been withdrawn while nothing carried its
+/// frames — its host ended and stayed down past the daemon's detach grace,
+/// or the daemon restarted under it. The creator presents the name and the
+/// pair its registration handed back, the proof a withdrawal presents; the
+/// daemon reinstates the row from its own record of the registration, or
+/// keeps the one that stands. `box_id` narrows the proof to one creation,
+/// where the caller holds it.
+///
+/// Blocking. A resume the daemon answers without the row — a daemon that
+/// predates the verb or holds no registration of the box — is a warn
+/// line, and the attach goes ahead: the in-VM daemon still refuses to
+/// relaunch a box whose row is gone. Returns whether the daemon answered
+/// with the row.
+///
+/// # Errors
+///
+/// [`crate::box_registration::HostUnreachable`] when the daemon cannot be
+/// reached at all (#1790): the caller fails closed on it.
+pub fn resume_box_row_at(
+    control_sock: &Path,
+    box_name: &str,
+    addresses: boxes::BoxAddresses,
+    box_id: Option<minimald_rpc::BoxId>,
+) -> anyhow::Result<bool> {
+    let request = minimald_rpc::BoxControlRequest::ResumeBox(minimald_rpc::ResumeBoxRequest {
+        name: box_name.to_string(),
+        switch_address: addresses.switch_address,
+        loopback_address: addresses.loopback_address,
+        box_id,
+    });
+    let failure = match host_control_within(control_sock, &request, BOX_CONTROL_THREAD_BOUND) {
+        Ok((minimald_rpc::BoxControlReply::Registered(row), _))
+            if row.switch_address == addresses.switch_address
+                && row.loopback_address == addresses.loopback_address =>
+        {
+            tracing::debug!(
+                box = %box_name,
+                switch_address = %row.switch_address,
+                "the box's host row stands"
+            );
+            return Ok(true);
+        }
+        Ok((minimald_rpc::BoxControlReply::Registered(row), _)) => format!(
+            "the daemon answered with a different address pair, switch address {}",
+            row.switch_address
+        ),
+        Ok((minimald_rpc::BoxControlReply::Error { error }, _)) => {
+            format!("the daemon refused it: {error}")
+        }
+        Ok((other, _)) => format!("another verb's reply: {other:?}"),
+        Err(error)
+            if error
+                .downcast_ref::<crate::box_registration::HostUnreachable>()
+                .is_some() =>
+        {
+            return Err(error);
+        }
+        Err(error) => format!("{error:#}"),
+    };
+    tracing::warn!(
+        box = %box_name,
+        "the box's host row could not be resumed ({failure})"
+    );
+    Ok(false)
+}
+
+impl HostAsks {
+    /// Subscribe to the pending asks of the box whose row is named
+    /// `box_name` on the VM host daemon at `control_sock`: the row read
+    /// answers the row's host-minted box id, and the subscription is keyed
+    /// by that id, never by a name a guest could report.
+    ///
+    /// # Errors
+    ///
+    /// The socket did not answer, no live row carries the name, or the
+    /// daemon refused the subscription.
+    pub fn subscribe(control_sock: &Path, box_name: &str) -> Result<Self, anyhow::Error> {
+        let (row, _) = host_control(
+            control_sock,
+            &minimald_rpc::BoxControlRequest::ReadRow(minimald_rpc::ReadRowRequest {
+                name: box_name.to_string(),
+            }),
+        )?;
+        let box_id = match row {
+            minimald_rpc::BoxControlReply::Row(row) => row.box_id,
+            minimald_rpc::BoxControlReply::NoRow { .. } => {
+                anyhow::bail!("the VM host daemon holds no row for box {box_name:?}")
+            }
+            other => anyhow::bail!("the VM host daemon answered the row read with {other:?}"),
+        };
+        let (ack, subscription) = host_control(
+            control_sock,
+            &minimald_rpc::BoxControlRequest::SubscribeAsks(minimald_rpc::SubscribeAsksRequest {
+                box_id,
+            }),
+        )?;
+        match ack {
+            minimald_rpc::BoxControlReply::AsksSubscribed { .. } => {}
+            minimald_rpc::BoxControlReply::Error { error } => {
+                anyhow::bail!("the VM host daemon refused the ask subscription: {error}")
+            }
+            other => anyhow::bail!("the VM host daemon answered the subscription with {other:?}"),
+        }
+        // Held for the attach's whole life: offers arrive whenever the box
+        // asks, so the read has no bound.
+        subscription.get_ref().set_read_timeout(None)?;
+        tracing::info!(box = %box_name, "subscribed to the box's pending asks on the VM host");
+        Ok(Self {
+            control_sock: control_sock.to_path_buf(),
+            subscription,
+            held: std::collections::VecDeque::new(),
+        })
+    }
+
+    /// [`Self::subscribe`] on the VM host daemon's control socket beside
+    /// the daemon's ssh socket `ssh_sock`, for a caller that does not know
+    /// whether the daemon is VM-backed: anything but a subscription — no
+    /// such socket, a native daemon's socket that serves no rows, no row
+    /// for the box — is `None`, said at debug.
+    pub fn subscribe_beside(ssh_sock: &Path, box_name: &str) -> Option<Self> {
+        let control_sock = ssh_sock.parent()?.join(VM_HOST_CONTROL_SOCK_FILE);
+        if !control_sock.exists() {
+            return None;
+        }
+        Self::subscribe(&control_sock, box_name)
+            .inspect_err(|error| {
+                tracing::debug!(box = %box_name, error = %format!("{error:#}"), "no host-side ask subscription");
+            })
+            .ok()
+    }
+
+    /// The relay's suspend hook: serve the subscription for the attach's
+    /// duration, rendering each offer with [`render_ask_dialog`].
+    pub fn into_hook(self) -> tty_relay::SuspendHook {
+        Box::new(move |handle| self.serve(handle, render_ask_dialog))
+    }
+
+    /// The next subscription line: a held one first, then the socket.
+    /// `None` once the subscription ended.
+    fn next_line(&mut self) -> Option<String> {
+        use std::io::BufRead as _;
+        self.held.pop_front().or_else(|| {
+            let mut line = String::new();
+            match self.subscription.read_line(&mut line) {
+                Ok(0) | Err(_) => None,
+                Ok(_) => Some(line),
+            }
+        })
+    }
+
+    /// Serve offers until the subscription ends: for each, suspend the
+    /// relay, render the dialog with `dialog`, record its answer through
+    /// the host door, and resume. The dialog watches the subscription
+    /// through its [`AskWatch`]: one the host dismisses comes down unanswered
+    /// and records nothing. An offer the daemon already dismissed is
+    /// skipped; an attach that ended under the dialog records nothing.
+    pub fn serve<T: AskTerminal>(
+        mut self,
+        terminal: &T,
+        mut dialog: impl FnMut(&minimald_rpc::PendingAskOffer, &mut AskWatch<'_>) -> AskDialogEnd,
+    ) {
+        loop {
+            let Some(line) = self.next_line() else {
+                return;
+            };
+            let offer = match serde_json_lenient::from_str(line.trim()) {
+                Ok(minimald_rpc::BoxControlReply::PendingAskOffer(offer)) => offer,
+                Ok(_) | Err(_) => continue,
+            };
+            if self.dismissed_already(offer.ask_id) {
+                continue;
+            }
+            if terminal.suspend_for_ask().is_err() {
+                return;
+            }
+            tracing::info!(
+                ask_id = %offer.ask_id,
+                box = %offer.name,
+                port = offer.port,
+                "showing the host-side ask dialog"
+            );
+            let end = dialog(
+                &offer,
+                &mut AskWatch::new(offer.ask_id, &mut self.subscription, &mut self.held),
+            );
+            if terminal.ask_cancelled() {
+                return;
+            }
+            let answer = match end {
+                AskDialogEnd::Answered(answer) => answer,
+                AskDialogEnd::Dismissed => {
+                    tracing::info!(ask_id = %offer.ask_id, "the ask was dismissed; its dialog came down unanswered");
+                    terminal.resume_after_ask();
+                    continue;
+                }
+            };
+            tracing::info!(ask_id = %offer.ask_id, answer = ?answer, "the ask dialog was answered");
+            match self.record(offer.ask_id, answer) {
+                Ok(None) => {}
+                // Another attach ended the ask first: say how it really
+                // ended, not what this dialog chose.
+                Ok(Some(late)) => {
+                    tracing::info!(ask_id = %offer.ask_id, %late, "the ask had already ended");
+                    eprintln!("{late}");
+                }
+                Err(error) => {
+                    tracing::warn!(ask_id = %offer.ask_id, %error, "the ask answer was not recorded");
+                    eprintln!("The answer was not recorded: {error:#}");
+                }
+            }
+            terminal.resume_after_ask();
+        }
+    }
+
+    /// Whether a dismissal for `ask_id` is already buffered behind its
+    /// offer: another attach answered first, so there is no dialog to show.
+    fn dismissed_already(&self, ask_id: minimald_rpc::AskId) -> bool {
+        let buffered = String::from_utf8_lossy(self.subscription.buffer());
+        self.held
+            .iter()
+            .map(String::as_str)
+            .chain(buffered.lines())
+            .any(|line| is_dismissal_of(line, ask_id))
+    }
+
+    /// Record `answer` for `ask_id` through the host door. `Ok(Some)` is
+    /// the line saying how the ask had already ended when the answer came
+    /// late; nothing was recorded then.
+    fn record(
+        &self,
+        ask_id: minimald_rpc::AskId,
+        answer: minimald_rpc::AskAnswer,
+    ) -> Result<Option<String>, anyhow::Error> {
+        let (reply, _) = host_control(
+            &self.control_sock,
+            &minimald_rpc::BoxControlRequest::RecordAskAnswer(
+                minimald_rpc::RecordAskAnswerRequest { ask_id, answer },
+            ),
+        )?;
+        match reply {
+            minimald_rpc::BoxControlReply::AskAnswerRecorded { .. } => Ok(None),
+            minimald_rpc::BoxControlReply::AskAlreadyEnded {
+                port,
+                proto,
+                already_ended,
+                ..
+            } => Ok(Some(late_answer_line(port, proto, already_ended))),
+            minimald_rpc::BoxControlReply::Error { error } => {
+                anyhow::bail!("the VM host daemon refused it: {error}")
+            }
+            other => anyhow::bail!("the VM host daemon answered with {other:?}"),
+        }
+    }
+}
+
+/// The one line a late answer prints: how the ask it answered had already
+/// ended, as the VM host daemon recorded it.
+#[must_use]
+pub fn late_answer_line(port: u16, proto: boxes::IpProto, end: minimald_rpc::AskLateEnd) -> String {
+    match end {
+        minimald_rpc::AskLateEnd::Allowed => {
+            format!("ask {port}/{proto} was already allowed by another attach")
+        }
+        minimald_rpc::AskLateEnd::Denied => {
+            format!("ask {port}/{proto} was already denied by another attach")
+        }
+        minimald_rpc::AskLateEnd::Cancelled { cause } => {
+            format!("ask {port}/{proto} was cancelled ({cause})")
+        }
+    }
 }
 
 /// The single command string to hand `ssh`, or `None` for the interactive
@@ -321,15 +1078,125 @@ pub fn checked_remote_command(command: &[String]) -> anyhow::Result<Option<Strin
     Ok(wire)
 }
 
+/// The one trace variable the ssh child carries to the daemon: the
+/// process's `TRACEPARENT`, or the opt-out marker when telemetry is off
+/// ([`crate::telemetry_opted_out`]).
+pub(crate) fn trace_env() -> (&'static str, String) {
+    use minimald_rpc::trace::{OTEL_ENV, OTEL_OFF, TRACEPARENT_ENV};
+    if crate::telemetry_opted_out() {
+        (OTEL_ENV, OTEL_OFF.to_owned())
+    } else {
+        (TRACEPARENT_ENV, crate::trace_context().traceparent())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stale owner file (its owner gone, its lock free) is swept; one a
+    /// live process holds stays, as does anything that is not an owner file.
+    #[test]
+    fn stale_owner_locks_are_swept_and_held_ones_kept() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let stale = dir.path().join("proxy-owner-1-1.lock");
+        std::fs::File::create(&stale).expect("the stale file");
+        let held_path = dir.path().join("proxy-owner-2-2.lock");
+        let held = nix::fcntl::Flock::lock(
+            std::fs::File::create(&held_path).expect("the held file"),
+            nix::fcntl::FlockArg::LockExclusiveNonblock,
+        )
+        .unwrap_or_else(|(_, errno)| panic!("taking the lock: {errno}"));
+        let other = dir.path().join(OWNER_COORD_FILE);
+        std::fs::File::create(&other).expect("the coordination file");
+
+        sweep_stale_owner_locks(dir.path());
+
+        assert!(!stale.exists(), "a free owner file is swept");
+        assert!(held_path.exists(), "a held owner file is kept");
+        assert!(other.exists(), "the coordination file is not an owner file");
+        drop(held);
+    }
     use std::path::PathBuf;
 
+    /// The dashboard's hold verbs: a release is one release line naming the
+    /// box on the control socket beside the ssh socket, a hold one hold
+    /// line, and a daemon with no control socket beside it (a native host)
+    /// is sent nothing.
     #[test]
-    fn attach_command_targets_the_provider_alias() {
+    fn hold_box_name_beside_speaks_the_hold_verbs_on_the_control_socket() {
+        use std::io::{BufRead as _, Write as _};
+        let dir = tempfile::TempDir::new().unwrap();
+        let ssh_sock = dir.path().join("ssh.sock");
+
+        // No control socket: nothing to connect to, nothing happens.
+        hold_box_name_beside(&ssh_sock, "web", None, false);
+
+        let listener =
+            std::os::unix::net::UnixListener::bind(dir.path().join(VM_HOST_CONTROL_SOCK_FILE))
+                .unwrap();
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                reader
+                    .get_mut()
+                    .write_all(b"{\"name\":\"web\",\"held\":false}\n")
+                    .unwrap();
+                seen.push(line);
+            }
+            seen
+        });
+        let id = boxes::SessionId::nil();
+        hold_box_name_beside(&ssh_sock, "web", Some(id), false);
+        hold_box_name_beside(&ssh_sock, "api", Some(id), true);
+        let seen = server.join().unwrap();
+        let decode = |line: &str| -> minimald_rpc::BoxControlRequest {
+            serde_json_lenient::from_str(line.trim()).expect("the request is the wire type")
+        };
+        let minimald_rpc::BoxControlRequest::ReleaseBoxName(release) = decode(&seen[0]) else {
+            panic!("a release is carried by the release verb");
+        };
+        assert_eq!(release.name, "web");
+        assert_eq!(release.session_id, Some(id));
+        let minimald_rpc::BoxControlRequest::HoldBoxName(hold) = decode(&seen[1]) else {
+            panic!("a hold is carried by the hold verb");
+        };
+        assert_eq!(hold.name, "api");
+    }
+
+    /// A late answer prints exactly how the ask had already ended.
+    #[test]
+    fn late_answer_line_names_the_real_end() {
+        use minimald_rpc::{AskCancelCause, AskLateEnd};
+        let tcp = boxes::IpProto::Tcp;
+        assert_eq!(
+            late_answer_line(3000, tcp, AskLateEnd::Allowed),
+            "ask 3000/tcp was already allowed by another attach"
+        );
+        assert_eq!(
+            late_answer_line(3000, tcp, AskLateEnd::Denied),
+            "ask 3000/tcp was already denied by another attach"
+        );
+        assert_eq!(
+            late_answer_line(
+                3000,
+                tcp,
+                AskLateEnd::Cancelled {
+                    cause: AskCancelCause::GuestClosed
+                }
+            ),
+            "ask 3000/tcp was cancelled (the guest connection closed)"
+        );
+    }
+
+    #[test]
+    fn attach_command_targets_the_host_alias() {
         let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
-        let cmd = attach_command(&sock, sessions::SessionId::nil(), None, None).unwrap();
+        let cmd = attach_command(&sock, boxes::SessionId::nil(), None, None).unwrap();
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -340,6 +1207,14 @@ mod tests {
             args.iter()
                 .any(|a| a.starts_with("ProxyCommand=") && a.contains("proxy --socket"))
         );
+        // The proxy is told who it serves (lab scenario 732): without the
+        // flag a SIGKILLed `min` leaves the daemon socket open again.
+        let owner = format!("--owner {}", std::process::id());
+        assert!(
+            args.iter()
+                .any(|a| a.starts_with("ProxyCommand=") && a.contains(&owner)),
+            "the ProxyCommand should name this process as the proxy's owner: {args:?}"
+        );
     }
 
     /// The exec path (`wire: Some`) is not the relay's: its command carries
@@ -348,7 +1223,7 @@ mod tests {
     #[test]
     fn exec_path_keeps_inherited_stdio() {
         let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
-        let cmd = attach_command(&sock, sessions::SessionId::nil(), Some("wire"), None).unwrap();
+        let cmd = attach_command(&sock, boxes::SessionId::nil(), Some("wire"), None).unwrap();
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -362,12 +1237,56 @@ mod tests {
         }
     }
 
+    /// Every attach bounds its connect and handshake with the shared deadline;
+    /// only the non-interactive exec path adds keepalives, so a peer that
+    /// stops answering ends the exec instead of hanging it.
+    #[test]
+    fn attach_command_bounds_the_handshake() {
+        let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
+        let interactive = attach_command(&sock, boxes::SessionId::nil(), None, None).unwrap();
+        let exec = attach_command(&sock, boxes::SessionId::nil(), Some("wire"), None).unwrap();
+
+        let args = |cmd: &std::process::Command| -> Vec<String> {
+            cmd.get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+
+        let connect_timeout = format!("ConnectTimeout={}", HANDSHAKE_TIMEOUT.as_secs());
+        for cmd in [&interactive, &exec] {
+            let args = args(cmd);
+            assert!(
+                args.iter().any(|a| a == &connect_timeout),
+                "missing {connect_timeout} in {args:?}",
+            );
+        }
+
+        let interactive_args = args(&interactive);
+        assert!(
+            !interactive_args
+                .iter()
+                .any(|a| a.starts_with("ServerAlive")),
+            "interactive attach must not carry keepalives: {interactive_args:?}",
+        );
+
+        let exec_args = args(&exec);
+        for opt in [
+            format!("ServerAliveInterval={EXEC_SERVER_ALIVE_INTERVAL_SECS}"),
+            format!("ServerAliveCountMax={EXEC_SERVER_ALIVE_COUNT_MAX}"),
+        ] {
+            assert!(
+                exec_args.iter().any(|a| a == &opt),
+                "missing {opt} in {exec_args:?}",
+            );
+        }
+    }
+
     /// A named VM's socket nests under a per-name subdirectory, so the ssh
-    /// host is the VM name namespaced under the provider-instance name.
+    /// host is the VM name namespaced under the host name.
     #[test]
     fn attach_command_targets_a_named_vm_alias() {
         let sock = PathBuf::from("/tmp/x/providers/local-minvmd0/alpha/ssh.sock");
-        let cmd = attach_command(&sock, sessions::SessionId::nil(), None, None).unwrap();
+        let cmd = attach_command(&sock, boxes::SessionId::nil(), None, None).unwrap();
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -383,7 +1302,7 @@ mod tests {
     fn attach_command_with_exec_has_no_forced_pty() {
         let sock = PathBuf::from("/tmp/x/providers/local-minvmd0/ssh.sock");
         let wire = remote_command(&["min".to_string(), "run".to_string(), "test".to_string()]);
-        let cmd = attach_command(&sock, sessions::SessionId::nil(), wire.as_deref(), None).unwrap();
+        let cmd = attach_command(&sock, boxes::SessionId::nil(), wire.as_deref(), None).unwrap();
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -483,8 +1402,8 @@ mod tests {
     #[test]
     fn attach_command_negotiates_session_keys_when_given() {
         let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
-        let keys = sessions::keys::SessionKeys::default();
-        let cmd = attach_command(&sock, sessions::SessionId::nil(), None, Some(&keys)).unwrap();
+        let keys = boxes::keys::SessionKeys::default();
+        let cmd = attach_command(&sock, boxes::SessionId::nil(), None, Some(&keys)).unwrap();
 
         let env: std::collections::HashMap<String, String> = cmd
             .get_envs()
@@ -498,19 +1417,19 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            env.get(sessions::keys::LEADER_ENV).map(String::as_str),
+            env.get(boxes::keys::LEADER_ENV).map(String::as_str),
             Some("ctrl-]")
         );
         assert_eq!(
-            env.get(sessions::keys::DETACH_KEY_ENV).map(String::as_str),
+            env.get(boxes::keys::DETACH_KEY_ENV).map(String::as_str),
             Some("d")
         );
         assert_eq!(
-            env.get(sessions::keys::FORWARD_KEY_ENV).map(String::as_str),
+            env.get(boxes::keys::FORWARD_KEY_ENV).map(String::as_str),
             Some("ctrl-]")
         );
         assert_eq!(
-            env.get(sessions::keys::BELL_ENV).map(String::as_str),
+            env.get(boxes::keys::BELL_ENV).map(String::as_str),
             Some("0")
         );
 
@@ -519,10 +1438,10 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         for name in [
-            sessions::keys::LEADER_ENV,
-            sessions::keys::DETACH_KEY_ENV,
-            sessions::keys::FORWARD_KEY_ENV,
-            sessions::keys::BELL_ENV,
+            boxes::keys::LEADER_ENV,
+            boxes::keys::DETACH_KEY_ENV,
+            boxes::keys::FORWARD_KEY_ENV,
+            boxes::keys::BELL_ENV,
         ] {
             assert!(
                 args.iter().any(|a| a == format!("SendEnv={name}").as_str()),
@@ -536,7 +1455,7 @@ mod tests {
     #[test]
     fn attach_command_omits_session_keys_when_none() {
         let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
-        let cmd = attach_command(&sock, sessions::SessionId::nil(), None, None).unwrap();
+        let cmd = attach_command(&sock, boxes::SessionId::nil(), None, None).unwrap();
 
         let env: std::collections::HashMap<String, String> = cmd
             .get_envs()
@@ -550,10 +1469,10 @@ mod tests {
             })
             .collect();
         for name in [
-            sessions::keys::LEADER_ENV,
-            sessions::keys::DETACH_KEY_ENV,
-            sessions::keys::FORWARD_KEY_ENV,
-            sessions::keys::BELL_ENV,
+            boxes::keys::LEADER_ENV,
+            boxes::keys::DETACH_KEY_ENV,
+            boxes::keys::FORWARD_KEY_ENV,
+            boxes::keys::BELL_ENV,
         ] {
             assert!(!env.contains_key(name), "{name} should not be set for exec");
         }
@@ -563,10 +1482,10 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         for name in [
-            sessions::keys::LEADER_ENV,
-            sessions::keys::DETACH_KEY_ENV,
-            sessions::keys::FORWARD_KEY_ENV,
-            sessions::keys::BELL_ENV,
+            boxes::keys::LEADER_ENV,
+            boxes::keys::DETACH_KEY_ENV,
+            boxes::keys::FORWARD_KEY_ENV,
+            boxes::keys::BELL_ENV,
         ] {
             assert!(
                 !args.iter().any(|a| a == format!("SendEnv={name}").as_str()),
@@ -575,7 +1494,7 @@ mod tests {
         }
     }
 
-    /// A VM-backed provider dir carries the guest's recorded host key, so
+    /// A VM-backed host dir carries the guest's recorded host key, so
     /// attach must verify against it rather than waive the check.
     #[test]
     fn host_key_opts_pin_to_an_adjacent_known_hosts() {

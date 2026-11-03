@@ -121,8 +121,8 @@ fn classify(lifecycle: Lifecycle) -> Decision {
 /// On targets with no minvmd backend this is a no-op (see below).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn ensure_minvmd_running(minimal_dir: Option<&Path>) -> io::Result<()> {
-    let provider_dir = crate::client::resolve_provider_dir(minimal_dir, true)?;
-    let state_dir = minvmd::state::StateDir::new(provider_dir)?;
+    let host_dir = crate::client::resolve_host_dir(minimal_dir, true)?;
+    let state_dir = minvmd::state::StateDir::new(host_dir)?;
 
     match classify(state_dir.effective_state()?.lifecycle) {
         Decision::AlreadyRunning => {
@@ -180,6 +180,13 @@ pub fn ensure_minvmd_running(minimal_dir: Option<&Path>) -> io::Result<()> {
         .arg("--detach")
         .arg("--timeout")
         .arg(timeout_secs.to_string());
+    // The CLI's trace context, so the minvmd it starts (and, through the
+    // supervisor and the guest boot line, the VM it boots) joins this
+    // invocation's trace. minvmd adopts it only with telemetry on.
+    cmd.env(
+        minimald_rpc::trace::TRACEPARENT_ENV,
+        minimal_client::trace_context().traceparent(),
+    );
 
     // `minvmd run --detach` blocks until the VM is serving (or times out): a
     // cold first boot can sit here for up to ~1 min. Run it on a thread (so
@@ -241,8 +248,8 @@ pub fn ensure_minvmd_running(_minimal_dir: Option<&Path>) -> io::Result<()> {
 /// `Stopped` still resolves rather than pinning the wait to its deadline.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn wait_for_minvmd_stopped(minimal_dir: Option<&Path>) -> io::Result<()> {
-    let provider_dir = crate::client::resolve_provider_dir(minimal_dir, true)?;
-    let state_dir = minvmd::state::StateDir::new(provider_dir)?;
+    let host_dir = crate::client::resolve_host_dir(minimal_dir, true)?;
+    let state_dir = minvmd::state::StateDir::new(host_dir)?;
 
     let deadline = Instant::now() + Duration::from_secs(STOPPED_WAIT_SECS);
     loop {
@@ -369,8 +376,8 @@ pub fn is_daemon_running(use_minvmd: bool, minimal_dir: Option<&Path>) -> io::Re
 /// return as though the VM were already down.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn is_minvmd_running(minimal_dir: Option<&Path>) -> io::Result<bool> {
-    let provider_dir = crate::client::resolve_provider_dir(minimal_dir, true)?;
-    let state_dir = minvmd::state::StateDir::new(provider_dir)?;
+    let host_dir = crate::client::resolve_host_dir(minimal_dir, true)?;
+    let state_dir = minvmd::state::StateDir::new(host_dir)?;
     Ok(state_dir.effective_state()?.lifecycle.is_active())
 }
 
@@ -512,8 +519,7 @@ mod tests {
 
     /// The state dir a `--minimal-dir` override resolves to.
     fn state_dir_for(minimal_dir: &std::path::Path) -> StateDir {
-        StateDir::new(crate::client::resolve_provider_dir(Some(minimal_dir), true).unwrap())
-            .unwrap()
+        StateDir::new(crate::client::resolve_host_dir(Some(minimal_dir), true).unwrap()).unwrap()
     }
 
     #[test]

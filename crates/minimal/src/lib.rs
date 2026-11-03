@@ -1,5 +1,9 @@
 //! The minimal CLI which pairs/talks-with minimald.
 
+// The in-process daemon's async bodies are deep: rustc's default query depth (128)
+// overflows computing their layout (`queries overflow the depth limit!`), as the
+// daemon crates themselves already declare.
+#![recursion_limit = "256"]
 mod attach;
 pub mod autospawn;
 // The SSH client transport lives in the shared `minimal-client` crate (used
@@ -9,10 +13,12 @@ pub use minimal_client as client;
 pub mod completion;
 pub mod completions;
 pub mod config;
+pub mod dash;
 pub mod diag;
 pub mod dirs;
 pub mod git_remote;
 pub mod loadouts;
+pub(crate) mod mint;
 pub mod prompt;
 pub mod resolver;
 pub mod task;

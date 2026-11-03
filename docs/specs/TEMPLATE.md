@@ -14,7 +14,7 @@ updated: <YYYY-MM-DD>
 # XXX — <feature name>
 
 <!--
-SOURCE  gominimal/foundry spec/template.md @ 485d77a148a14785347d76995b833510bbf04253
+SOURCE  gominimal/foundry plugins/spec/linter/template.md @ 6195f83a08458741065d3c6b72c6ac72296dbebb
   This file is a copy. Edit it in foundry and open a PR here; a change made
   only in this repo is lost the next time the template is updated. The SOURCE
   line is what a drift check reads to tell whether this copy is behind.
@@ -66,6 +66,13 @@ WRITING
   Every behaviour must be verifiable. If a behaviour cannot be checked against a
   running system it is background, not a requirement — so an adjective with no
   bound is not a requirement either: "fast" becomes "p95 under 200 ms".
+  Text the product prints (errors, warnings, status rows, `--help`, prompts) is
+  for the person who reads it, not for the developer. A requirement that adds
+  or changes it states what the message must carry, in the person's words: the
+  situation, the action and its effect, the condition that prints it, and
+  where it appears. Inside the printed content, never a design term or a
+  requirement ID. A requirement that freezes existing printed text says so,
+  and why.
   The lint comments on the PR. It never blocks a merge.
 -->
 

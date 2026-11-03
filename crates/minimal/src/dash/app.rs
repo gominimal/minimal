@@ -1,0 +1,2496 @@
+//! The Elm-style core of `min dash`: a [`Model`] of everything on screen,
+//! a [`Msg`] enum of everything that can happen, and a pure [`update`]
+//! producing follow-up [`Effect`]s that the tokio driver executes against
+//! the daemon connections.
+//!
+//! Deliberately hand-rolled rather than built on a TEA framework: the
+//! reusable machinery is ~200 lines of boring Rust, and our pure
+//! `update -> Vec<Effect>` doesn't fit component-centric frameworks. If
+//! `min dash` grows beyond a single screen (multiple views, reusable
+//! widgets), reevaluate adopting `tui-realm` instead of extending this.
+
+use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
+
+use anyhow::Context as _;
+use boxes::{NetworkMode, SessionId};
+use chrono::{DateTime, Utc};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+use crate::dash::filter;
+use crate::dash::rpc::{self, HostData};
+use crate::dash::state::{self, DashState};
+
+/// How often the session list refreshes.
+const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often the driver attempts to (re)connect missing hosts, so a
+/// daemon restarted after startup rejoins the dashboard.
+const REDISCOVERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Identifies a session in the model: its host's label plus its
+/// daemon-assigned id. The label — not a list index — is the identity, so
+/// a host dropping out of one refresh can't re-index every key onto
+/// the wrong daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SessionKey {
+    pub host: String,
+    pub id: SessionId,
+}
+
+/// A host group in the sidebar.
+#[derive(Debug, Clone)]
+pub struct HostView {
+    pub label: String,
+    pub version: String,
+    pub collapsed: bool,
+    /// False when the last refresh couldn't reach the daemon: the group
+    /// stays in the sidebar (with its sessions cleared — stale sessions
+    /// aren't actionable) so it can rejoin when the daemon comes back.
+    pub reachable: bool,
+    pub sessions: Vec<minimald_rpc::ListSessionsEntry>,
+}
+
+/// The record + policy behind the detail pane, cached per session.
+#[derive(Debug, Clone, Default)]
+pub struct Detail {
+    pub record: Option<boxes::Record>,
+    pub policy: Option<boxes::EffectiveBoxPolicy>,
+    /// Why the policy could not be fetched, when it could not: a daemon that
+    /// predates `GetEffectiveSessionPolicy` refuses the RPC, and the pane
+    /// says so instead of sitting on "loading policy…".
+    pub policy_error: Option<String>,
+}
+
+/// A modal prompt capturing footer input, if one is open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    /// `d` on a session: "Destroy <name>? y/n".
+    ConfirmDestroy(SessionKey, String),
+    /// `r` on a session: inline rename input.
+    Rename { key: SessionKey, input: String },
+    /// `n`: the create form.
+    Create(CreateForm),
+    /// A dashboard create paused on the undeclared non-VCS upload confirm
+    /// (the CLI's #770 prompt): "y" uploads the root, "n" skips it and
+    /// creates the box empty, Esc calls the create off.
+    ConfirmCreateUpload { token: u64, root: String },
+}
+
+/// The create form's fields. `field` is which one has input focus.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateForm {
+    pub name: String,
+    pub path: String,
+    /// Index into [`NETWORK_MODES`].
+    pub net_idx: usize,
+    pub field: CreateField,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateField {
+    Name,
+    Path,
+    Network,
+}
+
+impl CreateForm {
+    /// The focused text field's buffer, if it is one (`Network` cycles
+    /// modes instead of taking text).
+    fn input_mut(&mut self) -> Option<&mut String> {
+        match self.field {
+            CreateField::Name => Some(&mut self.name),
+            CreateField::Path => Some(&mut self.path),
+            CreateField::Network => None,
+        }
+    }
+}
+
+/// The network modes the create form cycles through, in cycle order.
+pub const NETWORK_MODES: &[NetworkMode] =
+    &[NetworkMode::HostNet, NetworkMode::OwnIp, NetworkMode::NoNet];
+
+/// The Preview section's state for a session: the screen snapshot, a soft
+/// "not active", or the fetch error (e.g. a daemon too old to serve
+/// `GetSessionScreen`) — rendered legibly rather than loading forever.
+pub type ScreenFetch = Result<Option<minimald_rpc::ScreenSnapshot>, String>;
+
+/// Everything that can happen to the model.
+#[derive(Debug)]
+pub enum Msg {
+    Key(KeyEvent),
+    Tick,
+    /// A refresh pass: every reachable host's data, plus the labels of
+    /// hosts whose connection failed mid-run.
+    Refreshed {
+        ok: Vec<HostData>,
+        failed: Vec<String>,
+    },
+    /// Detail-pane data for a session.
+    DetailLoaded(SessionKey, Box<Detail>),
+    /// A screen fetch for the Preview section.
+    ScreenLoaded(SessionKey, ScreenFetch),
+    /// A destroy/rename completed.
+    ActionDone(Result<String, String>),
+    /// A create completed; the new session gets focused after the refresh.
+    Created {
+        host: String,
+        id: SessionId,
+        /// What the tree upload did, for the status line.
+        upload: crate::WorkspaceUpload,
+        /// The daemon's package check stepped aside at finalize.
+        package_check_skipped: bool,
+        /// The deny-all egress default binds the new box (NET-074).
+        egress_deny_all_default: bool,
+    },
+    /// A create paused for the undeclared non-VCS upload confirm: the
+    /// background task holds the create and awaits the user's answer on
+    /// `reply`. The driver stashes `reply` keyed by `token` (a `oneshot::Sender`
+    /// cannot live in [`Action`], which derives `Clone`/`Eq`) and opens the
+    /// confirm modal.
+    CreateUploadConfirm {
+        token: u64,
+        root: String,
+        reply: tokio::sync::oneshot::Sender<UploadAnswer>,
+    },
+}
+
+/// The user's answer to a create's upload confirm. "n" and Esc are different
+/// answers: the first creates the box without the tree, the second calls the
+/// create off, as Esc does everywhere else in the dashboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadAnswer {
+    /// Upload the root and create the box from it.
+    Upload,
+    /// Skip the upload and create the box empty.
+    Decline,
+    /// Create nothing at all.
+    Cancel,
+}
+
+/// What a finished create task got.
+enum CreateOutcome {
+    /// The box was created and activated.
+    Created(rpc::Activated),
+    /// The user called the create off at the upload confirm.
+    Cancelled,
+}
+
+/// Side effects [`update`] asks the driver to run.
+#[derive(Debug)]
+pub enum Effect {
+    /// Re-list every host.
+    Refresh,
+    FetchDetail(SessionKey),
+    FetchScreen(SessionKey),
+    Destroy(SessionKey),
+    Rename(SessionKey, String),
+    Create {
+        host: String,
+        name: Option<String>,
+        path: String,
+        network: NetworkMode,
+    },
+    /// Suspend the TUI, attach to the session over ssh, and resume when the
+    /// user detaches.
+    Attach(SessionKey),
+    /// Answer a paused create's upload confirm. Handled inline by the run
+    /// loop (it owns the stashed `oneshot::Sender`, which cannot live in this
+    /// `Effect`).
+    AnswerCreateUpload {
+        token: u64,
+        answer: UploadAnswer,
+    },
+    /// Persist the last-focused session to `dash-state.json`.
+    SaveState,
+}
+
+/// One line in the flattened sidebar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Row {
+    HostHeader(usize),
+    Session(SessionKey),
+}
+
+/// The full TUI state. Pure data; rendering reads it, [`update`] mutates
+/// it, and neither talks to a daemon directly.
+#[derive(Debug)]
+pub struct Model {
+    pub hosts: Vec<HostView>,
+    /// Index into [`Model::visible_rows`].
+    pub cursor: usize,
+    /// Sidebar scroll offset (a row index), adjusted at render time to
+    /// keep the cursor inside the viewport.
+    pub scroll: usize,
+    pub filter: FilterState,
+    pub details: HashMap<SessionKey, Detail>,
+    /// When each cached detail's policy fetch last failed, so the retry is
+    /// throttled to [`REDISCOVERY_INTERVAL`] instead of riding every 2s
+    /// refresh tick: a daemon that predates `GetEffectiveSessionPolicy`
+    /// refuses it every time.
+    pub policy_failed_at: HashMap<SessionKey, DateTime<Utc>>,
+    pub screens: HashMap<SessionKey, ScreenFetch>,
+    /// The most recent bell timestamp acknowledged for a session; a bell
+    /// newer than this lights the `●` indicator.
+    pub bells_seen: HashMap<SessionKey, DateTime<Utc>>,
+    pub action: Option<Action>,
+    /// A transient status line (action outcomes, refresh errors).
+    pub status: Option<String>,
+    pub spinner_frame: usize,
+    /// Wall clock of the last refresh; idle times and activity windows are
+    /// computed against it so rendering is deterministic in tests.
+    pub now: DateTime<Utc>,
+    /// Focus to apply after the next refresh (startup restore, or a
+    /// freshly created session).
+    pub pending_focus: Option<(String, SessionId)>,
+    pub quit: bool,
+}
+
+impl Default for Model {
+    fn default() -> Self {
+        Self::new(Utc::now())
+    }
+}
+
+/// The `/` filter line's state.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FilterState {
+    pub editing: bool,
+    pub input: String,
+}
+
+impl Model {
+    pub fn new(now: DateTime<Utc>) -> Self {
+        Self {
+            hosts: Vec::new(),
+            cursor: 0,
+            scroll: 0,
+            filter: FilterState::default(),
+            details: HashMap::new(),
+            policy_failed_at: HashMap::new(),
+            screens: HashMap::new(),
+            bells_seen: HashMap::new(),
+            action: None,
+            status: None,
+            spinner_frame: 0,
+            now,
+            pending_focus: None,
+            quit: false,
+        }
+    }
+
+    /// The flattened sidebar rows after collapsing and filtering, in render
+    /// order. Host grouping is preserved under a filter; a host with
+    /// no matching sessions keeps its header (so the group structure stays
+    /// visible while narrowing).
+    pub fn visible_rows(&self) -> Vec<Row> {
+        let mut rows = Vec::new();
+        for (p, host) in self.hosts.iter().enumerate() {
+            rows.push(Row::HostHeader(p));
+            if host.collapsed {
+                continue;
+            }
+            let mut matched: Vec<_> = host
+                .sessions
+                .iter()
+                .filter_map(|entry| {
+                    match filter::session_match(&self.filter.input, entry) {
+                        Some(rank) => Some((Some(rank), entry.id)),
+                        // An empty filter means "no filter": keep everything
+                        // in daemon order rather than ranking.
+                        None if self.filter.input.is_empty() => Some((None, entry.id)),
+                        None => None,
+                    }
+                })
+                .collect();
+            // Best match first within the group when filtering; list order
+            // (daemon order) when not.
+            if !self.filter.input.is_empty() {
+                matched.sort_by_key(|m| std::cmp::Reverse(m.0));
+            }
+            rows.extend(matched.into_iter().map(|(_, id)| {
+                Row::Session(SessionKey {
+                    host: host.label.clone(),
+                    id,
+                })
+            }));
+        }
+        rows
+    }
+
+    /// The row under the cursor.
+    pub fn cursor_row(&self) -> Option<Row> {
+        self.visible_rows().get(self.cursor).cloned()
+    }
+
+    /// The session under the cursor, if the cursor is on a session row.
+    pub fn focused(&self) -> Option<SessionKey> {
+        match self.cursor_row() {
+            Some(Row::Session(key)) => Some(key),
+            _ => None,
+        }
+    }
+
+    /// Look up a session's list entry by key.
+    pub fn entry(&self, key: &SessionKey) -> Option<&minimald_rpc::ListSessionsEntry> {
+        self.hosts
+            .iter()
+            .find(|p| p.label == key.host)?
+            .sessions
+            .iter()
+            .find(|e| e.id == key.id)
+    }
+
+    /// A session's display name: its assigned name, or the generated short
+    /// form `<project>-<id-suffix>` for anonymous sessions.
+    pub fn display_name(&self, key: &SessionKey) -> String {
+        match self.entry(key) {
+            Some(entry) => display_name_of(entry),
+            None => key.id.to_string(),
+        }
+    }
+
+    /// Clamp the cursor into the visible row range. When the filter narrows
+    /// the list under the cursor, land on the first visible session row (a
+    /// host header is a poor focus — it shows no detail pane).
+    pub fn clamp_cursor(&mut self) {
+        let rows = self.visible_rows();
+        if rows.is_empty() || self.cursor >= rows.len() {
+            self.cursor = rows
+                .iter()
+                .position(|r| matches!(r, Row::Session(_)))
+                .unwrap_or(0);
+        }
+    }
+
+    /// The latest bell timestamp in a session's live attrs.
+    fn latest_bell(&self, key: &SessionKey) -> Option<DateTime<Utc>> {
+        let attrs = &self.entry(key)?.attrs;
+        [
+            attrs.as_ref()?.audible_bell.as_ref().map(|b| b.last),
+            attrs.as_ref()?.visual_bell.as_ref().map(|b| b.last),
+        ]
+        .into_iter()
+        .flatten()
+        .max()
+    }
+
+    /// Whether an unacknowledged bell lights the session's `●` indicator.
+    pub fn has_unseen_bell(&self, key: &SessionKey) -> bool {
+        match self.latest_bell(key) {
+            Some(latest) => self.bells_seen.get(key).is_none_or(|seen| latest > *seen),
+            None => false,
+        }
+    }
+
+    /// The activity indicator glyph for a session row, computed from the
+    /// live attrs: `◌` while the session is still coming up (a create's
+    /// upload/compose is in flight, or a verdict is pending), a cycling
+    /// spinner when stdout flowed in the last 5s, `○` when the user typed
+    /// recently but nothing came back, `●` for an unacknowledged bell,
+    /// blank when idle.
+    pub fn indicator(&self, key: &SessionKey) -> String {
+        const SPINNER: &[&str] = &["◐", "◓", "◑", "◒"];
+        const RECENT: chrono::Duration = chrono::Duration::seconds(5);
+        if let Some(entry) = self.entry(key)
+            && !matches!(entry.status, boxes::BoxState::Active)
+        {
+            return "◌".to_string();
+        }
+        if self.has_unseen_bell(key) {
+            return "●".to_string();
+        }
+        let attrs = self.entry(key).and_then(|e| e.attrs.as_ref());
+        let recent = |t: Option<DateTime<Utc>>| {
+            t.is_some_and(|t| self.now.signed_duration_since(t) <= RECENT)
+        };
+        let stdout_hot = recent(attrs.and_then(|a| a.last_stdout));
+        let stdin_hot = recent(attrs.and_then(|a| a.last_stdin));
+        if stdout_hot {
+            SPINNER[self.spinner_frame % SPINNER.len()].to_string()
+        } else if stdin_hot {
+            "○".to_string()
+        } else {
+            String::new()
+        }
+    }
+
+    /// The host label + session id of the current focus, for the state
+    /// file.
+    fn focus_for_state(&self) -> Option<(String, SessionId)> {
+        let key = self.focused()?;
+        Some((key.host, key.id))
+    }
+}
+
+/// The display name for a list entry: the assigned name, or `(unnamed)`
+/// for anonymous sessions (the full id is always visible in the Info tab).
+pub fn display_name_of(entry: &minimald_rpc::ListSessionsEntry) -> String {
+    match &entry.name {
+        Some(name) => name.clone(),
+        None => "(unnamed)".to_string(),
+    }
+}
+
+/// Render a network mode the way the sidebar shows it: the CLI's word.
+pub fn network_mode_label(mode: NetworkMode) -> &'static str {
+    mode.word()
+}
+
+/// The canonical sidebar order for host groups; unknown labels sort
+/// last, alphabetically.
+fn host_rank(label: &str) -> u8 {
+    match label {
+        "host" => 0,
+        "vm" => 1,
+        _ => 2,
+    }
+}
+
+/// The pure state transition. Returns the effects the driver should run.
+pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
+    match msg {
+        Msg::Tick => {
+            model.spinner_frame += 1;
+            model.now = Utc::now();
+            // The detail pane stacks Info, Policy, and Preview vertically,
+            // so the focused session's screen refreshes on every tick.
+            let mut effects = vec![Effect::Refresh];
+            if let Some(key) = model.focused() {
+                effects.push(Effect::FetchScreen(key));
+            }
+            effects
+        }
+        Msg::Refreshed { ok, failed } => {
+            model.now = Utc::now();
+            // Upsert hosts by label: one whose refresh failed keeps its
+            // slot (marked unreachable, sessions cleared) instead of
+            // dropping out and re-indexing every session key onto the wrong
+            // daemon.
+            let focused_before = model.focused().map(|key| (key.host.clone(), key.id));
+            let mut views: HashMap<String, HostView> = model
+                .hosts
+                .drain(..)
+                .map(|v| (v.label.clone(), v))
+                .collect();
+            for data in ok {
+                let view = views.entry(data.label.clone()).or_insert_with(|| HostView {
+                    label: data.label.clone(),
+                    version: String::new(),
+                    collapsed: false,
+                    reachable: true,
+                    sessions: Vec::new(),
+                });
+                view.version = data.version;
+                view.sessions = data.sessions;
+                view.reachable = true;
+            }
+            for label in &failed {
+                if let Some(view) = views.get_mut(label) {
+                    view.reachable = false;
+                    view.sessions.clear();
+                }
+            }
+            model.hosts = views.into_values().collect();
+            model.hosts.sort_by(|a, b| {
+                host_rank(&a.label)
+                    .cmp(&host_rank(&b.label))
+                    .then_with(|| a.label.cmp(&b.label))
+            });
+
+            // The cursor tracks the focused session's identity across
+            // refreshes, not its row index — a session appearing or
+            // disappearing above the cursor must not silently move focus.
+            // Restore the pending focus (startup's last-session memory, or a
+            // freshly created session) if it still exists; otherwise keep
+            // the previously focused session when it survives the refresh,
+            // else fall back to the first session row — row 0 is a host
+            // header, where d/r are dead keys.
+            let focus_target = model.pending_focus.take().or(focused_before);
+            if let Some((label, id)) = focus_target {
+                let target = model.visible_rows().iter().position(|row| {
+                    matches!(row, Row::Session(key)
+                            if key.id == id
+                                && key.host == label)
+                });
+                model.cursor = target.unwrap_or_else(|| {
+                    model
+                        .visible_rows()
+                        .iter()
+                        .position(|r| matches!(r, Row::Session(_)))
+                        .unwrap_or(0)
+                });
+            }
+            model.clamp_cursor();
+            // Keep detail/screen caches only for sessions that still exist.
+            let live: std::collections::HashSet<SessionKey> = model
+                .hosts
+                .iter()
+                .flat_map(|pv| {
+                    pv.sessions.iter().map(|e| SessionKey {
+                        host: pv.label.clone(),
+                        id: e.id,
+                    })
+                })
+                .collect();
+            model.details.retain(|k, _| live.contains(k));
+            model.policy_failed_at.retain(|k, _| live.contains(k));
+            model.screens.retain(|k, _| live.contains(k));
+            model.bells_seen.retain(|k, _| live.contains(k));
+            // The cursor may have (re)landed on a session — restore from the
+            // state file, a create, or plain list churn — without a key
+            // press, so pull its detail data here too. Bells are NOT
+            // acknowledged here: only an explicit focus change does that,
+            // or the ● indicator would clear on every refresh tick.
+            fetch_focused(model)
+        }
+        Msg::DetailLoaded(key, detail) => {
+            if detail.policy_error.is_some() {
+                model.policy_failed_at.insert(key.clone(), model.now);
+            } else {
+                model.policy_failed_at.remove(&key);
+            }
+            model.details.insert(key, *detail);
+            Vec::new()
+        }
+        Msg::ScreenLoaded(key, screen) => {
+            model.screens.insert(key, screen);
+            Vec::new()
+        }
+        Msg::ActionDone(result) => {
+            match result {
+                Ok(text) => model.status = Some(text),
+                Err(e) => model.status = Some(format!("error: {e}")),
+            }
+            vec![Effect::Refresh]
+        }
+        Msg::Created {
+            host,
+            id,
+            upload,
+            package_check_skipped,
+            egress_deny_all_default,
+        } => {
+            model.status = Some(created_status(
+                upload,
+                package_check_skipped,
+                egress_deny_all_default,
+            ));
+            model.pending_focus = Some((host, id));
+            vec![Effect::Refresh]
+        }
+        Msg::Key(key) => update_key(model, key),
+        // Intercepted by the run loop before `update` (it carries the create
+        // task's reply sender); reaching here would drop that reply and hang
+        // the create.
+        Msg::CreateUploadConfirm { .. } => {
+            unreachable!("CreateUploadConfirm is handled by the run loop")
+        }
+    }
+}
+
+/// The status line a create ends with: what the upload did with the tree,
+/// the package check's warning when it stepped aside, and the note `min
+/// session activate` prints when the deny-all egress default binds the new
+/// box (NET-074) — the dashboard has no egress fields, so a bare own-address
+/// box it creates reaches nothing outside itself until it is re-created with
+/// declared reach.
+fn created_status(
+    upload: crate::WorkspaceUpload,
+    package_check_skipped: bool,
+    egress_deny_all_default: bool,
+) -> String {
+    let mut status = "session created".to_string();
+    match upload {
+        crate::WorkspaceUpload::Uploaded => {}
+        crate::WorkspaceUpload::SkippedEmptyOrHome { .. } => {
+            status.push_str("; starting with an empty box (nothing here to sync)");
+        }
+        // Defensive: the dashboard's create task always passes
+        // `headless: false` and resolves its own confirm, so it can only
+        // produce `Uploaded`, `SkippedEmptyOrHome` or `Declined`. The arm is
+        // kept so the match stays exhaustive over the shared `WorkspaceUpload`.
+        crate::WorkspaceUpload::SkippedUndeclared => {
+            status.push_str(
+                "; the file upload was skipped: not a repository root and no minimal.toml, \
+                 so the box starts with an empty workspace",
+            );
+        }
+        crate::WorkspaceUpload::Declined => {
+            status.push_str(
+                "; the file upload was skipped as you asked: the box starts with an empty \
+                 workspace",
+            );
+        }
+    }
+    if package_check_skipped {
+        status.push_str(
+            "; warning: package names were not checked, so an unknown package name \
+             shows up as an error the first time a command runs in the box",
+        );
+    }
+    if egress_deny_all_default {
+        status.push_str(
+            "; This box can reach no external address: a --network own_ip box with no \
+             egress rules gets the deny-all default. To allow outbound traffic, activate a \
+             new session with --allow-subnets or --allow-dns-hosts, for example \
+             --allow-dns-hosts github.com.",
+        );
+    }
+    status
+}
+
+fn update_key(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
+    // A modal captures all keys until it resolves.
+    if model.action.is_some() {
+        return update_modal(model, key);
+    }
+    if model.filter.editing {
+        return update_filter(model, key);
+    }
+
+    let rows = model.visible_rows();
+    // Char bindings require no modifiers: a wildcard modifier match would
+    // reroute chords like Ctrl-D into the destroy prompt.
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('q'), KeyModifiers::NONE) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+            model.quit = true;
+            vec![Effect::SaveState]
+        }
+        (KeyCode::Char('/'), KeyModifiers::NONE) => {
+            model.filter.editing = true;
+            Vec::new()
+        }
+        // Esc clears an applied filter (the footer advertises this) but
+        // does nothing when no filter is set, so it stays a safe no-op.
+        // Clearing restores rows ahead of the cursor, so the session under
+        // it can change: refresh focus like any other cursor change.
+        (KeyCode::Esc, _) if !model.filter.input.is_empty() => {
+            model.filter = FilterState::default();
+            model.clamp_cursor();
+            on_focus_change(model)
+        }
+        (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
+            model.cursor = model.cursor.saturating_sub(1);
+            on_focus_change(model)
+        }
+        (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
+            if model.cursor + 1 < rows.len() {
+                model.cursor += 1;
+            }
+            on_focus_change(model)
+        }
+        (KeyCode::Enter, _) => match model.cursor_row() {
+            Some(Row::HostHeader(p)) => {
+                if let Some(host) = model.hosts.get_mut(p) {
+                    host.collapsed = !host.collapsed;
+                }
+                model.clamp_cursor();
+                Vec::new()
+            }
+            // Enter on a session attaches to it (suspend TUI → ssh →
+            // resume on detach); its bells count as seen either way.
+            Some(Row::Session(key)) => {
+                acknowledge_bells(model, &key);
+                vec![Effect::Attach(key), Effect::SaveState]
+            }
+            None => Vec::new(),
+        },
+        (KeyCode::Char('d'), KeyModifiers::NONE) => match model.focused() {
+            Some(key) => {
+                let name = model.display_name(&key);
+                model.action = Some(Action::ConfirmDestroy(key, name));
+                Vec::new()
+            }
+            None => Vec::new(),
+        },
+        (KeyCode::Char('r'), KeyModifiers::NONE) => match model.focused() {
+            Some(key) => {
+                let input = model
+                    .entry(&key)
+                    .and_then(|e| e.name.clone())
+                    .unwrap_or_default();
+                model.action = Some(Action::Rename { key, input });
+                Vec::new()
+            }
+            None => Vec::new(),
+        },
+        (KeyCode::Char('n'), KeyModifiers::NONE) => {
+            let path = std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            model.action = Some(Action::Create(CreateForm {
+                name: String::new(),
+                path,
+                net_idx: 0,
+                field: CreateField::Name,
+            }));
+            Vec::new()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Keys while the `/` filter line is editing.
+fn update_filter(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
+    match key.code {
+        KeyCode::Esc => {
+            model.filter = FilterState::default();
+            model.clamp_cursor();
+        }
+        KeyCode::Enter => {
+            model.filter.editing = false;
+        }
+        KeyCode::Backspace => {
+            model.filter.input.pop();
+            model.clamp_cursor();
+        }
+        KeyCode::Char(c) if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+            model.filter.input.push(c);
+            model.clamp_cursor();
+        }
+        _ => {}
+    }
+    on_focus_change(model)
+}
+
+/// Keys while a modal action (destroy confirm / rename / create) is open.
+fn update_modal(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
+    let Some(action) = model.action.clone() else {
+        return Vec::new();
+    };
+    match action {
+        Action::ConfirmDestroy(target, _) => match (key.code, key.modifiers) {
+            (KeyCode::Char('y'), KeyModifiers::NONE) => {
+                model.action = None;
+                vec![Effect::Destroy(target)]
+            }
+            // The global quit keys are not swallowed by an open confirm.
+            (KeyCode::Char('q'), KeyModifiers::NONE)
+            | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                model.quit = true;
+                vec![Effect::SaveState]
+            }
+            (KeyCode::Char('n'), KeyModifiers::NONE) | (KeyCode::Esc, _) => {
+                model.action = None;
+                Vec::new()
+            }
+            _ => Vec::new(),
+        },
+        Action::ConfirmCreateUpload { token, .. } => match (key.code, key.modifiers) {
+            (KeyCode::Char('y'), KeyModifiers::NONE) => {
+                model.action = None;
+                vec![Effect::AnswerCreateUpload {
+                    token,
+                    answer: UploadAnswer::Upload,
+                }]
+            }
+            (KeyCode::Char('n'), KeyModifiers::NONE) => {
+                model.action = None;
+                vec![Effect::AnswerCreateUpload {
+                    token,
+                    answer: UploadAnswer::Decline,
+                }]
+            }
+            // Esc backs out the way it does on every other dashboard prompt:
+            // no session is created, rather than an empty one.
+            (KeyCode::Esc, _) => {
+                model.action = None;
+                vec![Effect::AnswerCreateUpload {
+                    token,
+                    answer: UploadAnswer::Cancel,
+                }]
+            }
+            // The global quit keys are not swallowed by an open confirm. The
+            // create task's reply drops with the loop, which it reads as a
+            // cancel.
+            (KeyCode::Char('q'), KeyModifiers::NONE)
+            | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                model.quit = true;
+                vec![Effect::SaveState]
+            }
+            _ => Vec::new(),
+        },
+        Action::Rename {
+            key: target,
+            mut input,
+        } => match key.code {
+            KeyCode::Enter => {
+                model.action = None;
+                let unchanged = model
+                    .entry(&target)
+                    .and_then(|e| e.name.as_deref())
+                    .is_some_and(|name| name == input.trim());
+                if input.trim().is_empty() {
+                    model.status = Some("rename cancelled: empty name".to_string());
+                    Vec::new()
+                } else if unchanged {
+                    model.status = Some("rename cancelled: name unchanged".to_string());
+                    Vec::new()
+                } else {
+                    vec![Effect::Rename(target, input.trim().to_string())]
+                }
+            }
+            KeyCode::Esc => {
+                model.action = None;
+                Vec::new()
+            }
+            _ => {
+                line_edit(&mut input, &key);
+                model.action = Some(Action::Rename { key: target, input });
+                Vec::new()
+            }
+        },
+        Action::Create(mut form) => {
+            match (key.code, form.field) {
+                (KeyCode::Esc, _) => {
+                    model.action = None;
+                }
+                (KeyCode::BackTab, _) => {
+                    form.field = prev_field(form.field);
+                    model.action = Some(Action::Create(form));
+                }
+                (KeyCode::Tab, _) => {
+                    form.field = next_field(form.field);
+                    model.action = Some(Action::Create(form));
+                }
+                // Left/right cycle the network mode when that field is focused.
+                (KeyCode::Left, CreateField::Network) => {
+                    form.net_idx = (form.net_idx + NETWORK_MODES.len() - 1) % NETWORK_MODES.len();
+                    model.action = Some(Action::Create(form));
+                }
+                (KeyCode::Right, CreateField::Network) => {
+                    form.net_idx = (form.net_idx + 1) % NETWORK_MODES.len();
+                    model.action = Some(Action::Create(form));
+                }
+                (KeyCode::Char(' '), CreateField::Network) => {
+                    form.net_idx = (form.net_idx + 1) % NETWORK_MODES.len();
+                    model.action = Some(Action::Create(form));
+                }
+                // Enter advances through the fields and submits on the last.
+                (KeyCode::Enter, CreateField::Name) | (KeyCode::Enter, CreateField::Path) => {
+                    form.field = next_field(form.field);
+                    model.action = Some(Action::Create(form));
+                }
+                (KeyCode::Enter, CreateField::Network) => {
+                    // Create on the host the user is pointing at: the
+                    // focused session's host, or the host whose
+                    // group header the cursor sits on.
+                    let label = match model.cursor_row() {
+                        Some(Row::Session(key)) => Some(key.host),
+                        Some(Row::HostHeader(p)) => model.hosts.get(p).map(|pv| pv.label.clone()),
+                        None => None,
+                    };
+                    let Some(host) = label else {
+                        model.status = Some("no provider to create on".to_string());
+                        model.action = Some(Action::Create(form));
+                        return Vec::new();
+                    };
+                    if !model
+                        .hosts
+                        .iter()
+                        .any(|pv| pv.label == host && pv.reachable)
+                    {
+                        model.status = Some(format!("error: provider '{host}' is unreachable"));
+                        model.action = Some(Action::Create(form));
+                        return Vec::new();
+                    }
+                    model.action = None;
+                    return vec![Effect::Create {
+                        host,
+                        name: match form.name.trim() {
+                            "" => None,
+                            n => Some(n.to_string()),
+                        },
+                        path: form.path.trim().to_string(),
+                        network: NETWORK_MODES[form.net_idx],
+                    }];
+                }
+                _ => {
+                    if let Some(input) = form.input_mut() {
+                        line_edit(input, &key);
+                    }
+                    model.action = Some(Action::Create(form));
+                }
+            }
+            Vec::new()
+        }
+    }
+}
+
+/// Apply one line-editing key to an input buffer: backspace deletes,
+/// ctrl-u clears, a printable char appends; anything else is a no-op.
+fn line_edit(input: &mut String, key: &KeyEvent) {
+    match key.code {
+        KeyCode::Backspace => {
+            input.pop();
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => input.clear(),
+        // Only plain (or shifted) chars are text: a Ctrl chord is a command,
+        // not input.
+        KeyCode::Char(c) if matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+            input.push(c);
+        }
+        _ => {}
+    }
+}
+
+fn next_field(field: CreateField) -> CreateField {
+    match field {
+        CreateField::Name => CreateField::Path,
+        CreateField::Path => CreateField::Network,
+        CreateField::Network => CreateField::Name,
+    }
+}
+
+fn prev_field(field: CreateField) -> CreateField {
+    match field {
+        CreateField::Name => CreateField::Network,
+        CreateField::Path => CreateField::Name,
+        CreateField::Network => CreateField::Path,
+    }
+}
+
+/// Mark the focused session's bells as seen up to now.
+fn acknowledge_bells(model: &mut Model, key: &SessionKey) {
+    let seen = model.latest_bell(key).unwrap_or_else(Utc::now);
+    model.bells_seen.insert(key.clone(), seen);
+}
+
+/// Effects triggered by the cursor landing on a (possibly different)
+/// session: acknowledge its bells and fetch detail data not yet cached.
+fn on_focus_change(model: &mut Model) -> Vec<Effect> {
+    if let Some(key) = model.focused() {
+        acknowledge_bells(model, &key);
+    }
+    fetch_focused(model)
+}
+
+/// Fetch detail data for the focused session when it isn't cached. The
+/// screen preview is covered by the 2s tick, not per-keystroke fetches.
+fn fetch_focused(model: &Model) -> Vec<Effect> {
+    let Some(key) = model.focused() else {
+        return Vec::new();
+    };
+    // A detail whose policy fetch failed is not an answer: retry it rather
+    // than caching the failure for the session's lifetime, but no sooner
+    // than REDISCOVERY_INTERVAL after the failure — an older daemon refuses
+    // the RPC every time, and the 2s tick would otherwise re-ask forever.
+    if let Some(detail) = model.details.get(&key) {
+        if detail.policy_error.is_none() {
+            return Vec::new();
+        }
+        let retry_due = model.policy_failed_at.get(&key).is_none_or(|&t| {
+            model
+                .now
+                .signed_duration_since(t)
+                .to_std()
+                .is_ok_and(|d| d >= REDISCOVERY_INTERVAL)
+        });
+        if !retry_due {
+            return Vec::new();
+        }
+    }
+    vec![Effect::FetchDetail(key)]
+}
+
+/// Options for [`run`].
+#[derive(Debug, Clone)]
+pub struct DashOptions {
+    /// `--minimal-dir` override; `None` uses the platform default state dir.
+    pub minimal_dir: Option<PathBuf>,
+    /// `--config-dir` override; `None` uses the platform default config dir.
+    /// Resolved into session keys at attach so a dash-attach honors the
+    /// `[session-keys]` config just like `min session attach`.
+    pub config_dir: Option<PathBuf>,
+    /// The loadout selection every dashboard create resolves its activation
+    /// inputs from — `LoadoutSelection::Defaults`, matching `min session
+    /// activate` with no flags, so `default_loadouts` and the user policy
+    /// apply to dashboard-created sessions.
+    pub(crate) loadouts: crate::loadouts::LoadoutSelection,
+}
+
+/// One create waiting on an upload confirm: the token keys it, `root` is
+/// shown in the footer, and `reply` is answered when the user answers.
+struct PendingConfirm {
+    token: u64,
+    root: String,
+    reply: tokio::sync::oneshot::Sender<UploadAnswer>,
+}
+
+/// The next upload-confirm token. A create task picks one before it sends
+/// [`Msg::CreateUploadConfirm`]; the driver keys the stashed reply by it, so
+/// two creates in flight never answer each other's prompt.
+fn next_confirm_token() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Discards keys already in flight when a prompt opens. They were typed
+/// before it appeared, so answering with one would make an `n` meant for the
+/// list create the box on an empty workspace; the prompt must wait for a
+/// deliberate answer.
+async fn discard_buffered_input(events: &mut crossterm::event::EventStream) {
+    use futures::StreamExt as _;
+    // Only a real event is discarded. A stream that ended (`None`) or failed
+    // (`Some(Err(_))`) stops the drain instead of spinning, and the main loop
+    // sees the stream end on its next read.
+    while let Ok(Some(Ok(_))) = tokio::time::timeout(std::time::Duration::ZERO, events.next()).await
+    {
+    }
+}
+
+/// Show the oldest pending upload confirm if no other modal is open, and
+/// report whether one opened. A queued confirm shown behind an open modal
+/// must leave that modal's keystrokes alone; the caller drains in-flight
+/// input only when the confirm actually appears.
+fn show_pending_confirm(model: &mut Model, pending: &mut VecDeque<PendingConfirm>) -> bool {
+    if model.action.is_some() {
+        return false;
+    }
+    let Some(p) = pending.front() else {
+        return false;
+    };
+    model.action = Some(Action::ConfirmCreateUpload {
+        token: p.token,
+        root: p.root.clone(),
+    });
+    true
+}
+
+/// Entry point for `min dash`: discover hosts, then drive the
+/// Elm loop until the user quits.
+pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
+    if !std::io::IsTerminal::is_terminal(&std::io::stdout())
+        || !std::io::IsTerminal::is_terminal(&std::io::stdin())
+    {
+        // stdin too: crossterm falls back to /dev/tty for input, so a
+        // redirected stdin would still yield a working TUI — whose attach
+        // then spawns `ssh -tt` reading /dev/null, the #953 hang.
+        anyhow::bail!("min dash requires an interactive terminal on stdin and stdout");
+    }
+
+    // Gated before the terminal is taken over, so a skewed daemon refuses the
+    // dashboard the same way it refuses `min ls` — plain message, terminal
+    // untouched.
+    let mut hosts = rpc::discover(opts.minimal_dir.as_deref()).await?;
+    // The create task resolves each session's activation inputs through the
+    // CLI's helper; it needs a `GlobalArgs` carrying the same directory
+    // overrides the dashboard was launched with (the other fields do not
+    // affect activation-inputs resolution).
+    let global = crate::GlobalArgs {
+        minimal_dir: opts.minimal_dir.clone(),
+        config_dir: opts.config_dir.clone(),
+        ..Default::default()
+    };
+    // Read once here, before the TUI owns the screen: the read prints the
+    // organization-file errors and refused store rules on stderr, and a
+    // config or policy that does not parse must fail at startup rather than
+    // at each create. A default loadout that cannot be resolved fails here
+    // for the same reason; the create task resolves and stages them again
+    // against the create's own project root.
+    let client_config = crate::config::read_client_config(&global)?;
+    let user_policy = crate::config::read_user_policy(&global)?;
+    crate::loadouts::resolve_active_loadouts(opts.loadouts.clone(), &client_config, &global)?;
+    let mut last_rediscovery = std::time::Instant::now();
+    let saved = state::load(opts.minimal_dir.as_deref());
+    let mut model = Model::new(Utc::now());
+    model.pending_focus = saved
+        .last_session_id
+        .as_deref()
+        .and_then(|id| SessionId::parse_str(id).ok())
+        .map(|id| (saved.last_provider.clone().unwrap_or_default(), id));
+
+    // Guard restores the terminal on every exit path, including `?`.
+    let mut terminal = TerminalGuard::enter()?;
+
+    let mut events = crossterm::event::EventStream::new();
+    let mut tick = tokio::time::interval(REFRESH_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // Background tasks (the create flow runs its upload off the UI loop)
+    // report back over this channel.
+    let (bg_tx, mut bg_rx) = tokio::sync::mpsc::channel::<Msg>(8);
+
+    // Creates paused on an upload confirm, oldest first. Each carries the
+    // `oneshot::Sender` its task awaits; the modal answers the front one.
+    let mut pending_confirms: VecDeque<PendingConfirm> = VecDeque::new();
+
+    // Prime the list immediately rather than waiting out the first tick.
+    let mut inbox: VecDeque<Msg> = VecDeque::from([Msg::Tick]);
+    loop {
+        terminal
+            .draw(|frame| crate::dash::render::view(&mut model, frame))
+            .context("draw frame")?;
+
+        let msg = match inbox.pop_front() {
+            Some(msg) => msg,
+            None => {
+                use futures::StreamExt as _;
+                tokio::select! {
+                    maybe_event = events.next() => match maybe_event {
+                        Some(Ok(event)) => match crate::dash::event::into_msg(event) {
+                            Some(msg) => msg,
+                            // Resizes and friends just trigger a redraw.
+                            None => continue,
+                        },
+                        Some(Err(e)) => return Err(e).context("reading terminal events"),
+                        None => break,
+                    },
+                    Some(bg) = bg_rx.recv() => bg,
+                    _ = tick.tick() => Msg::Tick,
+                }
+            }
+        };
+
+        // A create pausing for the upload confirm is not a pure state
+        // transition (it carries the task's reply sender), so the driver
+        // intercepts it, stashes the sender, and opens the modal itself.
+        let msg = match msg {
+            Msg::CreateUploadConfirm { token, root, reply } => {
+                pending_confirms.push_back(PendingConfirm { token, root, reply });
+                if show_pending_confirm(&mut model, &mut pending_confirms) {
+                    discard_buffered_input(&mut events).await;
+                }
+                continue;
+            }
+            other => other,
+        };
+
+        for effect in update(&mut model, msg) {
+            match effect {
+                // State persistence is local disk, not a daemon call, so it
+                // runs inline rather than going through `exec_effect`.
+                Effect::SaveState => save_state(&model, opts.minimal_dir.as_deref()),
+                // The upload confirm the user just answered: deliver the
+                // stashed reply and, if another create is waiting, show its
+                // modal now that `update` closed this one.
+                Effect::AnswerCreateUpload { token, answer } => {
+                    if let Some(i) = pending_confirms.iter().position(|p| p.token == token) {
+                        // `remove` needs the index; the element is known to
+                        // exist from the `position` above.
+                        if let Some(p) = pending_confirms.remove(i) {
+                            let _ = p.reply.send(answer);
+                        }
+                    }
+                    if show_pending_confirm(&mut model, &mut pending_confirms) {
+                        discard_buffered_input(&mut events).await;
+                    }
+                }
+                // Attach suspends the TUI around a blocking ssh child; it
+                // needs the terminal guard, so it can't live in exec_effect.
+                Effect::Attach(key) => match hosts.iter_mut().find(|p| p.label == key.host) {
+                    Some(p) => {
+                        let sock = p.sock.clone();
+                        let box_name = model.entry(&key).and_then(|entry| entry.name.clone());
+                        // The box's row is asked back before the attach
+                        // (NET-138), and the pair it was registered with is
+                        // read: a Delete at the shell-exit prompt leaves no
+                        // record to read it from after.
+                        let box_addresses = match box_name {
+                            Some(_) => {
+                                rpc::prepare_attach(&sock, rpc::record_of(p, key.id).await).await
+                            }
+                            None => Ok(None),
+                        };
+                        // A VM host that cannot be reached fails the attach
+                        // closed (#1790), with the CLI's message.
+                        let box_addresses = match box_addresses {
+                            Ok(box_addresses) => box_addresses,
+                            Err(error) => {
+                                model.status = Some(format!("error: {error:#}"));
+                                continue;
+                            }
+                        };
+                        attach_and_resume(
+                            &mut terminal,
+                            &sock,
+                            key.id,
+                            box_name.as_deref(),
+                            opts.config_dir.as_deref(),
+                            &mut model,
+                        );
+                        // The attach may have ended in the shell-exit
+                        // prompt's Delete: withdraw the box's row, or
+                        // release a `host_ip` box's hold, through the CLI's
+                        // helper (it carries the lookup timeout the dashboard's
+                        // old copy lacked).
+                        if let Some(name) = box_name.as_deref() {
+                            crate::release_held_name_after_attach(
+                                &sock,
+                                key.id,
+                                name,
+                                box_addresses,
+                            )
+                            .await;
+                        }
+                        inbox.push_back(Msg::Tick);
+                    }
+                    None => {
+                        model.status =
+                            Some(format!("error: provider '{}' is unreachable", key.host));
+                    }
+                },
+                // Create runs the upload+compose flow on a background task
+                // with its own connection, so the UI keeps redrawing (the
+                // status line shows progress).
+                Effect::Create {
+                    host,
+                    name,
+                    path,
+                    network,
+                } => match hosts.iter().find(|p| p.label == host) {
+                    Some(p) => {
+                        let sock = p.sock.clone();
+                        let tx = bg_tx.clone();
+                        let global = global.clone();
+                        let client_config = client_config.clone();
+                        let user_policy = user_policy.clone();
+                        let loadouts = opts.loadouts.clone();
+                        model.status = Some(format!(
+                            "creating {}…",
+                            name.as_deref().unwrap_or("session")
+                        ));
+                        tokio::spawn(async move {
+                            let result = async {
+                                let canonical =
+                                    std::fs::canonicalize(&path).with_context(|| {
+                                        format!("cannot resolve project path '{path}'")
+                                    })?;
+                                let utf8 = camino::Utf8PathBuf::from_path_buf(canonical).map_err(
+                                    |_| anyhow::anyhow!("project path is not valid UTF-8"),
+                                )?;
+                                let abs = paths::HostAbsPath::try_new(utf8)
+                                    .context("invalid project path")?;
+                                // Resolve the loadout contribution, stage its
+                                // hook scripts, size the hook budget against
+                                // this project path, resolve the upload root,
+                                // and take the upload gate's stats — all
+                                // through the same CLI helpers `min session
+                                // activate` uses, so an external loadout hook
+                                // works from the dashboard too. Every one of
+                                // them is blocking filesystem work (config and
+                                // policy reads, loadout resolution, hook
+                                // staging, the resolve walk), so run the batch
+                                // off the async worker: a stalled mount must
+                                // not stall the runtime.
+                                let (upload_root, _) =
+                                    rpc::resolve_project_off_worker(abs.as_utf8_path()).await?;
+                                let (inputs, decision) = {
+                                    let global_blocking = global.clone();
+                                    let root = upload_root.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        let inputs =
+                                            crate::loadouts::prepare_activation_inputs_with_config(
+                                                &client_config,
+                                                &global_blocking,
+                                                &root,
+                                                loadouts,
+                                                crate::loadouts::HookPrep::Enforce,
+                                                Some(user_policy),
+                                            )?;
+                                        let decision = crate::decide_workspace_upload(
+                                            &root,
+                                            false,
+                                            false,
+                                            std::env::home_dir().as_deref(),
+                                        );
+                                        Ok::<_, anyhow::Error>((inputs, decision))
+                                    })
+                                    .await
+                                    .context("preparing the session create")??
+                                };
+                                // The undeclared non-VCS root gets the CLI's
+                                // confirm here, through the TUI, before the
+                                // session is created: a form pre-filled with
+                                // the home directory must not stream it on
+                                // three Enters (#770).
+                                let decision = if decision == crate::UploadDecision::Confirm {
+                                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                                    let _ = tx
+                                        .send(Msg::CreateUploadConfirm {
+                                            token: next_confirm_token(),
+                                            root: upload_root.to_string(),
+                                            reply: reply_tx,
+                                        })
+                                        .await;
+                                    match reply_rx.await.unwrap_or(UploadAnswer::Cancel) {
+                                        UploadAnswer::Upload => crate::UploadDecision::Upload,
+                                        // The user declined: the session
+                                        // starts on an empty box, the way the
+                                        // CLI's own "no" does. Declined, not
+                                        // the headless skip — that one is what
+                                        // the CLI refuses over dropped hooks.
+                                        UploadAnswer::Decline => crate::UploadDecision::Declined,
+                                        // Esc called the create off: nothing
+                                        // reaches the daemon, so there is no
+                                        // empty box to clean up.
+                                        UploadAnswer::Cancel => {
+                                            return Ok(CreateOutcome::Cancelled);
+                                        }
+                                    }
+                                } else {
+                                    decision
+                                };
+                                // A `$HOME` skip that would drop the project's
+                                // lifecycle hooks refuses here, before the
+                                // create and its row registration, rather than
+                                // tearing a created box back down.
+                                crate::refuse_dropped_hooks_before_create(
+                                    decision,
+                                    &upload_root,
+                                    crate::DASH_DROPPED_HOOKS_REMEDY,
+                                )?;
+                                rpc::activate(
+                                    &sock,
+                                    name,
+                                    abs,
+                                    upload_root,
+                                    network,
+                                    decision,
+                                    inputs,
+                                )
+                                .await
+                                .map(CreateOutcome::Created)
+                            }
+                            .await;
+                            let msg = match result {
+                                Ok(CreateOutcome::Created(rpc::Activated {
+                                    id,
+                                    upload,
+                                    package_check_skipped,
+                                    egress_deny_all_default,
+                                })) => Msg::Created {
+                                    host,
+                                    id,
+                                    upload,
+                                    package_check_skipped,
+                                    egress_deny_all_default,
+                                },
+                                Ok(CreateOutcome::Cancelled) => {
+                                    Msg::ActionDone(Ok("create cancelled".to_string()))
+                                }
+                                Err(e) => Msg::ActionDone(Err(format!("{e:#}"))),
+                            };
+                            let _ = tx.send(msg).await;
+                        });
+                    }
+                    None => {
+                        model.status = Some(format!("error: provider '{host}' is unreachable"));
+                    }
+                },
+                other => {
+                    if let Some(follow_up) = exec_effect(
+                        &mut hosts,
+                        other,
+                        opts.minimal_dir.as_deref(),
+                        &mut last_rediscovery,
+                    )
+                    .await
+                    {
+                        inbox.push_back(follow_up);
+                    }
+                }
+            }
+        }
+        // A modal may have just closed (a destroy/rename/create answered): if
+        // a create confirm was queued behind it, show it now, dropping keys
+        // typed before it appeared.
+        if show_pending_confirm(&mut model, &mut pending_confirms) {
+            discard_buffered_input(&mut events).await;
+        }
+        if model.quit {
+            break;
+        }
+    }
+
+    drop(terminal);
+    save_state(&model, opts.minimal_dir.as_deref());
+    Ok(())
+}
+
+/// Persist the last-focused session. Called on quit and on explicit
+/// selection (Enter on a session row) rather than every key press.
+fn save_state(model: &Model, minimal_dir: Option<&std::path::Path>) {
+    let (host, id) = match model.focus_for_state() {
+        Some(f) => f,
+        None => return,
+    };
+    let state = DashState {
+        last_session_id: Some(id.to_string()),
+        last_provider: Some(host),
+    };
+    if let Err(e) = state::save(minimal_dir, &state) {
+        tracing::warn!(error = %e, "failed to write dash-state.json");
+    }
+}
+
+/// Execute one effect against the daemon connections, producing the
+/// follow-up message for [`update`].
+async fn exec_effect(
+    hosts: &mut Vec<rpc::Host>,
+    effect: Effect,
+    minimal_dir: Option<&std::path::Path>,
+    last_rediscovery: &mut std::time::Instant,
+) -> Option<Msg> {
+    match effect {
+        Effect::Refresh => {
+            // Give a daemon that (re)appeared since startup a chance to
+            // join, throttled so a wedged acceptor can't stall the loop.
+            if last_rediscovery.elapsed() >= REDISCOVERY_INTERVAL {
+                *last_rediscovery = std::time::Instant::now();
+                rpc::connect_missing(hosts, minimal_dir).await;
+            }
+            let mut ok = Vec::with_capacity(hosts.len());
+            let mut failed = Vec::new();
+            let mut i = 0;
+            while i < hosts.len() {
+                match rpc::refresh(&mut hosts[i]).await {
+                    Ok(d) => {
+                        ok.push(d);
+                        i += 1;
+                    }
+                    Err(e) => {
+                        // A failed refresh means a dead connection: drop it
+                        // so the rediscovery pass can rebuild it, and mark
+                        // the host unreachable in the model rather than
+                        // re-indexing its sessions onto another daemon.
+                        let gone = hosts.remove(i);
+                        tracing::warn!(provider = gone.label, error = %e, "refresh failed; dropping the connection");
+                        failed.push(gone.label.to_string());
+                    }
+                }
+            }
+            Some(Msg::Refreshed { ok, failed })
+        }
+        Effect::FetchDetail(key) => {
+            let host = hosts.iter_mut().find(|p| p.label == key.host)?;
+            match rpc::fetch_detail(host, key.id).await {
+                Ok((record, policy)) => {
+                    let (policy, policy_error) = match policy {
+                        Ok(policy) => (Some(policy), None),
+                        Err(e) => (None, Some(e)),
+                    };
+                    Some(Msg::DetailLoaded(
+                        key,
+                        Box::new(Detail {
+                            record,
+                            policy,
+                            policy_error,
+                        }),
+                    ))
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "detail fetch failed");
+                    None
+                }
+            }
+        }
+        Effect::FetchScreen(key) => {
+            let host = hosts.iter_mut().find(|p| p.label == key.host)?;
+            let fetch = rpc::fetch_screen(host, key.id)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            Some(Msg::ScreenLoaded(key, fetch))
+        }
+        Effect::Destroy(key) => {
+            let result = match hosts.iter_mut().find(|p| p.label == key.host) {
+                Some(host) => rpc::destroy(host, key.id)
+                    .await
+                    .map(|()| "session destroyed".to_string())
+                    .map_err(|e| format!("{e:#}")),
+                None => Err(format!("provider '{}' is unreachable", key.host)),
+            };
+            Some(Msg::ActionDone(result))
+        }
+        Effect::Rename(key, new_name) => {
+            let result = match hosts.iter_mut().find(|p| p.label == key.host) {
+                Some(host) => rpc::rename(host, key.id, &new_name)
+                    .await
+                    .map(|()| format!("renamed to {new_name}"))
+                    .map_err(|e| format!("{e:#}")),
+                None => Err(format!("provider '{}' is unreachable", key.host)),
+            };
+            Some(Msg::ActionDone(result))
+        }
+        // Handled inline by the run loop: SaveState is local disk, Attach
+        // needs the terminal guard, Create spawns a background task, and
+        // AnswerCreateUpload delivers a stashed reply the loop owns.
+        Effect::SaveState
+        | Effect::Attach(_)
+        | Effect::Create { .. }
+        | Effect::AnswerCreateUpload { .. } => None,
+    }
+}
+
+/// Suspend the TUI, attach to the session over ssh (blocking until the user
+/// detaches), then resume. The session-key config is resolved from
+/// `config_dir` so the daemon adopts the user's detach/forward chord; a bad
+/// config is reported in the status bar rather than aborting the TUI.
+///
+/// On a VM-backed daemon the attach subscribes to `box_name`'s pending asks
+/// on the VM host daemon and answers them the way `min session attach`
+/// does (NET-045); the dash's list view never subscribes, so only an attach
+/// counts as an attached client.
+fn attach_and_resume(
+    terminal: &mut TerminalGuard,
+    sock: &std::path::Path,
+    id: SessionId,
+    box_name: Option<&str>,
+    config_dir: Option<&std::path::Path>,
+    model: &mut Model,
+) {
+    let session_keys = match minimal_client::attach::resolve_session_keys(config_dir) {
+        Ok(keys) => Some(keys),
+        Err(e) => {
+            model.status = Some(format!("error: {e:#}"));
+            return;
+        }
+    };
+    let result = minimal_client::attach::attach_command(sock, id, None, session_keys.as_ref())
+        .and_then(|cmd| {
+            attach_through_relay(terminal, cmd, |cmd| {
+                let host_asks = box_name.and_then(|name| {
+                    minimal_client::attach::HostAsks::subscribe_beside(sock, name)
+                });
+                minimal_client::attach::run_interactive_attach(
+                    cmd,
+                    host_asks.map(minimal_client::attach::HostAsks::into_hook),
+                )
+            })
+        });
+    match result {
+        Ok(status) => {
+            model.status = Some(match status.code() {
+                Some(0) => "detached".to_string(),
+                _ => format!("attach ended: {status}"),
+            });
+        }
+        Err(e) => model.status = Some(format!("error: attach failed: {e:#}")),
+    }
+}
+
+/// The terminal the dash hands over for an attach and takes back after.
+trait SuspendableTerminal {
+    /// Leave raw mode and the alternate screen, releasing the terminal.
+    fn suspend(&mut self);
+    /// Take the terminal back for the TUI.
+    fn resume(&mut self) -> std::io::Result<()>;
+}
+
+/// Run an attach with the TUI suspended around it. crossterm releases the
+/// terminal first (raw mode off, alternate screen left), and only then does
+/// `relay` start, so the termios the relay captures, and puts back when the
+/// attach ends, is the released terminal's, never crossterm's raw mode. The
+/// relay's [`minimal_client::tty_relay::RealTty::acquire`] picks the fd by
+/// crossterm's own rule (stdin when a tty, else `/dev/tty`), so both act on
+/// the same terminal.
+fn attach_through_relay(
+    terminal: &mut impl SuspendableTerminal,
+    cmd: std::process::Command,
+    relay: impl FnOnce(std::process::Command) -> Result<std::process::ExitStatus, anyhow::Error>,
+) -> Result<std::process::ExitStatus, anyhow::Error> {
+    terminal.suspend();
+    let status = relay(cmd);
+    // A failed resume leaves the TUI unusable; report it over the attach
+    // outcome.
+    terminal
+        .resume()
+        .context("restoring terminal after detach")?;
+    status.context("running ssh attach")
+}
+
+/// Enters the alternate screen on construction and restores the terminal
+/// on drop, so every exit path — including `?` early returns — leaves the
+/// terminal usable. `suspend`/`resume` hand the terminal to a child process
+/// (attach) and take it back.
+struct TerminalGuard(Option<ratatui::DefaultTerminal>);
+
+impl TerminalGuard {
+    fn enter() -> std::io::Result<Self> {
+        let mut terminal = ratatui::init();
+        terminal.clear()?;
+        Ok(Self(Some(terminal)))
+    }
+
+    fn draw(
+        &mut self,
+        f: impl FnOnce(&mut ratatui::Frame<'_>),
+    ) -> std::io::Result<ratatui::CompletedFrame<'_>> {
+        match self.0.as_mut() {
+            Some(t) => t.draw(f),
+            // Suspended (an attach child owns the terminal): nothing to draw.
+            None => Err(std::io::Error::other("terminal suspended")),
+        }
+    }
+}
+
+impl SuspendableTerminal for TerminalGuard {
+    /// Leave the alternate screen and drop the terminal, handing the TTY to
+    /// the attach.
+    fn suspend(&mut self) {
+        if self.0.take().is_some() {
+            ratatui::restore();
+        }
+    }
+
+    /// Re-enter the alternate screen after the attach ends.
+    fn resume(&mut self) -> std::io::Result<()> {
+        let mut terminal = ratatui::init();
+        terminal.clear()?;
+        self.0 = Some(terminal);
+        Ok(())
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            ratatui::restore();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dash::rpc::HostData;
+
+    fn id(n: u128) -> SessionId {
+        SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012x}")).unwrap()
+    }
+
+    fn skey(host: &str, n: u128) -> SessionKey {
+        SessionKey {
+            host: host.to_string(),
+            id: id(n),
+        }
+    }
+
+    fn entry(n: u128, name: Option<&str>) -> minimald_rpc::ListSessionsEntry {
+        entry_at(n, name, "/src/api")
+    }
+
+    fn entry_at(n: u128, name: Option<&str>, project: &str) -> minimald_rpc::ListSessionsEntry {
+        minimald_rpc::ListSessionsEntry {
+            id: id(n),
+            name: name.map(str::to_owned),
+            project_path: Some(paths::HostAbsPath::try_new(project).unwrap()),
+            status: boxes::BoxState::Active,
+            git: None,
+            host_ip_enforcement: None,
+            shared_port_collisions: Vec::new(),
+            attrs: None,
+        }
+    }
+
+    fn host(label: &str, sessions: Vec<minimald_rpc::ListSessionsEntry>) -> HostData {
+        HostData {
+            label: label.to_string(),
+            version: "0.1".to_string(),
+            sessions,
+        }
+    }
+
+    fn model_with(hosts: Vec<HostData>) -> Model {
+        let now = DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z")
+            .unwrap()
+            .to_utc();
+        let mut model = Model::new(now);
+        update(
+            &mut model,
+            Msg::Refreshed {
+                ok: hosts,
+                failed: Vec::new(),
+            },
+        );
+        model
+    }
+
+    fn key(code: KeyCode) -> Msg {
+        Msg::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// NET-074 from the dashboard: a create the deny-all default binds ends
+    /// with the in-force note on the status line, as `min session activate`
+    /// prints it; one it does not bind says only that the session was made.
+    #[test]
+    fn created_status_notes_the_deny_all_default() {
+        let mut model = model_with(Vec::new());
+        update(
+            &mut model,
+            Msg::Created {
+                host: "host".to_string(),
+                id: id(1),
+                upload: crate::WorkspaceUpload::Uploaded,
+                package_check_skipped: false,
+                egress_deny_all_default: true,
+            },
+        );
+        let status = model.status.clone().unwrap_or_default();
+        assert!(
+            status.ends_with(
+                "; This box can reach no external address: a --network own_ip box with no \
+                 egress rules gets the deny-all default. To allow outbound traffic, activate \
+                 a new session with --allow-subnets or --allow-dns-hosts, for example \
+                 --allow-dns-hosts github.com."
+            ),
+            "{status}"
+        );
+        update(
+            &mut model,
+            Msg::Created {
+                host: "host".to_string(),
+                id: id(2),
+                upload: crate::WorkspaceUpload::Uploaded,
+                package_check_skipped: false,
+                egress_deny_all_default: false,
+            },
+        );
+        assert_eq!(model.status.as_deref(), Some("session created"));
+    }
+
+    /// A create that skipped the tree says so on the status line, the way the
+    /// CLI prints its own line for the same skip: the box looks created either
+    /// way, and only the status tells them apart.
+    #[test]
+    fn created_status_reports_each_upload_outcome() {
+        let status_of = |upload| {
+            let mut model = model_with(Vec::new());
+            update(
+                &mut model,
+                Msg::Created {
+                    host: "host".to_string(),
+                    id: id(3),
+                    upload,
+                    package_check_skipped: false,
+                    egress_deny_all_default: false,
+                },
+            );
+            model.status.clone().unwrap_or_default()
+        };
+        assert_eq!(
+            status_of(crate::WorkspaceUpload::Uploaded),
+            "session created"
+        );
+        assert!(
+            status_of(crate::WorkspaceUpload::SkippedEmptyOrHome { dropped_hooks: 0 })
+                .contains("nothing here to sync"),
+            "an empty or home root says the box starts empty"
+        );
+        assert!(
+            status_of(crate::WorkspaceUpload::Declined).contains("as you asked"),
+            "a declined upload is the user's own answer"
+        );
+        // The defensive arm: the dashboard cannot reach this today (its
+        // create never runs headless), but the renderer still maps it.
+        assert!(
+            status_of(crate::WorkspaceUpload::SkippedUndeclared).contains("was skipped"),
+            "an undeclared root says the upload was skipped"
+        );
+    }
+
+    fn two_hosts() -> Model {
+        model_with(vec![
+            host("host", vec![entry(1, Some("api-staging")), entry(2, None)]),
+            host("vm", vec![entry_at(3, Some("bench"), "/src/bench")]),
+        ])
+    }
+
+    #[test]
+    fn q_quits_and_saves_state() {
+        let mut model = two_hosts();
+        let effects = update(&mut model, key(KeyCode::Char('q')));
+        assert!(model.quit);
+        assert!(effects.iter().any(|e| matches!(e, Effect::SaveState)));
+    }
+
+    #[test]
+    fn arrow_keys_move_the_cursor_with_bounds() {
+        let mut model = two_hosts();
+        // Rows: host header, api-staging, (unnamed), vm header, bench.
+        assert_eq!(model.cursor, 0);
+        update(&mut model, key(KeyCode::Down));
+        assert_eq!(model.cursor, 1);
+        assert_eq!(model.focused(), Some(skey("host", 1)));
+        update(&mut model, key(KeyCode::Up));
+        assert_eq!(model.cursor, 0);
+        // Can't move above the first row.
+        update(&mut model, key(KeyCode::Up));
+        assert_eq!(model.cursor, 0);
+        // Or past the last row.
+        for _ in 0..10 {
+            update(&mut model, key(KeyCode::Down));
+        }
+        assert_eq!(model.cursor, model.visible_rows().len() - 1);
+    }
+
+    #[test]
+    fn enter_on_a_header_toggles_collapse() {
+        let mut model = two_hosts();
+        update(&mut model, key(KeyCode::Enter));
+        assert!(model.hosts[0].collapsed);
+        // Collapsing hides the host's sessions from the row list.
+        assert_eq!(model.visible_rows().len(), 3);
+        update(&mut model, key(KeyCode::Enter));
+        assert!(!model.hosts[0].collapsed);
+    }
+
+    #[test]
+    fn filter_narrows_and_esc_clears() {
+        let mut model = two_hosts();
+        update(&mut model, key(KeyCode::Char('/')));
+        assert!(model.filter.editing);
+        for c in "bench".chars() {
+            update(&mut model, key(KeyCode::Char(c)));
+        }
+        // Only the vm host's "bench" session matches; headers stay.
+        let rows = model.visible_rows();
+        let sessions: Vec<_> = rows
+            .iter()
+            .filter(|r| matches!(r, Row::Session(_)))
+            .collect();
+        assert_eq!(sessions, [&Row::Session(skey("vm", 3))]);
+        update(&mut model, key(KeyCode::Esc));
+        assert!(!model.filter.editing);
+        assert!(model.filter.input.is_empty());
+        assert_eq!(model.visible_rows().len(), 5);
+    }
+
+    #[test]
+    fn esc_clears_an_applied_filter_and_is_otherwise_a_no_op() {
+        let mut model = two_hosts();
+        // Apply a filter, then leave the editing mode (Enter keeps input).
+        update(&mut model, key(KeyCode::Char('/')));
+        for c in "bench".chars() {
+            update(&mut model, key(KeyCode::Char(c)));
+        }
+        update(&mut model, key(KeyCode::Enter));
+        assert!(!model.filter.editing);
+        assert_eq!(model.filter.input, "bench");
+        // Focus "bench": the only session row left by the filter (both
+        // host headers stay visible, so it sits at row 2).
+        update(&mut model, key(KeyCode::Down));
+        update(&mut model, key(KeyCode::Down));
+        assert_eq!(model.focused(), Some(skey("vm", 3)));
+        // Esc clears the applied filter...
+        let effects = update(&mut model, key(KeyCode::Esc));
+        assert!(model.filter.input.is_empty());
+        // ...restoring the host sessions ahead of "bench", so its row index
+        // shifts and the focus lands on the session now under the cursor and
+        // refreshes (detail fetched, bells acknowledged).
+        assert_eq!(model.focused(), Some(skey("host", 2)));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::FetchDetail(k) if *k == skey("host", 2)))
+        );
+        // ...and a second Esc does not quit or otherwise change state.
+        update(&mut model, key(KeyCode::Esc));
+        assert!(!model.quit);
+        assert!(model.action.is_none());
+    }
+
+    #[test]
+    fn cursor_clamps_to_first_visible_row_when_filtered_out() {
+        let mut model = two_hosts();
+        // Focus "bench" (last row).
+        for _ in 0..4 {
+            update(&mut model, key(KeyCode::Down));
+        }
+        assert_eq!(model.cursor, 4);
+        // Filter it out: the cursor lands on the first visible session row
+        // (a host header would show no detail pane).
+        update(&mut model, key(KeyCode::Char('/')));
+        for c in "api".chars() {
+            update(&mut model, key(KeyCode::Char(c)));
+        }
+        assert_eq!(model.focused(), Some(skey("host", 1)));
+    }
+
+    #[test]
+    fn refresh_keeps_the_cursor_on_the_same_session() {
+        let mut model = two_hosts();
+        update(&mut model, key(KeyCode::Down));
+        assert_eq!(model.focused().map(|k| k.id), Some(id(1)));
+        // A refresh that inserts a new session above the focused one must
+        // not move focus.
+        update(
+            &mut model,
+            Msg::Refreshed {
+                ok: vec![
+                    host(
+                        "host",
+                        vec![
+                            entry(9, Some("new")),
+                            entry(1, Some("api-staging")),
+                            entry(2, None),
+                        ],
+                    ),
+                    host("vm", vec![entry(3, Some("bench"))]),
+                ],
+                failed: Vec::new(),
+            },
+        );
+        assert_eq!(model.focused().map(|k| k.id), Some(id(1)));
+    }
+
+    #[test]
+    fn pending_focus_restores_the_last_session() {
+        let now = DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z")
+            .unwrap()
+            .to_utc();
+        let mut model = Model::new(now);
+        model.pending_focus = Some(("vm".to_string(), id(3)));
+        update(
+            &mut model,
+            Msg::Refreshed {
+                ok: vec![
+                    host("host", vec![entry(1, Some("api-staging"))]),
+                    host("vm", vec![entry(3, Some("bench"))]),
+                ],
+                failed: Vec::new(),
+            },
+        );
+        assert_eq!(model.focused(), Some(skey("vm", 3)));
+    }
+
+    #[test]
+    fn pending_focus_falls_back_when_the_session_is_gone() {
+        let now = DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z")
+            .unwrap()
+            .to_utc();
+        let mut model = Model::new(now);
+        model.pending_focus = Some(("vm".to_string(), id(99)));
+        update(
+            &mut model,
+            Msg::Refreshed {
+                ok: vec![host("host", vec![entry(1, Some("api"))])],
+                failed: Vec::new(),
+            },
+        );
+        // The fallback is the first session row, not row 0 (a host
+        // header, where d/r are dead keys).
+        assert_eq!(model.focused(), Some(skey("host", 1)));
+    }
+
+    #[test]
+    fn destroy_flow_prompts_then_effects() {
+        let mut model = two_hosts();
+        update(&mut model, key(KeyCode::Down));
+        update(&mut model, key(KeyCode::Char('d')));
+        assert!(matches!(
+            model.action,
+            Some(Action::ConfirmDestroy(_, ref name)) if name == "api-staging"
+        ));
+        // 'n' cancels.
+        let effects = update(&mut model, key(KeyCode::Char('n')));
+        assert!(model.action.is_none());
+        assert!(effects.is_empty());
+        // 'y' issues the destroy.
+        update(&mut model, key(KeyCode::Char('d')));
+        let effects = update(&mut model, key(KeyCode::Char('y')));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Destroy(k) if k.id == id(1)))
+        );
+    }
+
+    #[test]
+    fn rename_prefills_and_submits() {
+        let mut model = two_hosts();
+        update(&mut model, key(KeyCode::Down));
+        update(&mut model, key(KeyCode::Char('r')));
+        assert!(matches!(
+            &model.action,
+            Some(Action::Rename { input, .. }) if input == "api-staging"
+        ));
+        update(&mut model, key(KeyCode::Char('x')));
+        let effects = update(&mut model, key(KeyCode::Enter));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Rename(k, n) if k.id == id(1) && n == "api-stagingx"))
+        );
+    }
+
+    #[test]
+    fn rename_with_unchanged_name_sends_nothing() {
+        let mut model = two_hosts();
+        update(&mut model, key(KeyCode::Down));
+        update(&mut model, key(KeyCode::Char('r')));
+        let effects = update(&mut model, key(KeyCode::Enter));
+        assert!(effects.is_empty());
+        assert_eq!(
+            model.status.as_deref(),
+            Some("rename cancelled: name unchanged")
+        );
+    }
+
+    #[test]
+    fn create_form_submits_on_last_field() {
+        let mut model = two_hosts();
+        update(&mut model, key(KeyCode::Char('n')));
+        assert!(matches!(model.action, Some(Action::Create(_))));
+        update(&mut model, key(KeyCode::Enter)); // name -> path
+        update(&mut model, key(KeyCode::Enter)); // path -> network
+        let effects = update(&mut model, key(KeyCode::Enter)); // submit
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::Create {
+                network: NetworkMode::HostNet,
+                ..
+            }
+        )));
+        assert!(model.action.is_none());
+    }
+
+    /// "n" and Esc are different answers: "n" creates the box without the
+    /// tree, Esc calls the create off. Everywhere else in the dashboard Esc
+    /// backs out, and a user who mistyped the path must be able to too.
+    #[test]
+    fn create_upload_confirm_answers_y_n_and_esc() {
+        let answer = |code: KeyCode| {
+            let mut model = two_hosts();
+            model.action = Some(Action::ConfirmCreateUpload {
+                token: 7,
+                root: "/srv/data".to_string(),
+            });
+            let effects = update(&mut model, key(code));
+            assert!(model.action.is_none(), "the modal closes on {code:?}");
+            effects
+                .into_iter()
+                .find_map(|e| match e {
+                    Effect::AnswerCreateUpload { token: 7, answer } => Some(answer),
+                    _ => None,
+                })
+                .expect("the answer reaches the waiting create")
+        };
+        assert_eq!(answer(KeyCode::Char('y')), UploadAnswer::Upload);
+        assert_eq!(answer(KeyCode::Char('n')), UploadAnswer::Decline);
+        assert_eq!(answer(KeyCode::Esc), UploadAnswer::Cancel);
+    }
+
+    /// The global quit keys are not swallowed by an open confirm: the modal
+    /// captures every other key, but `q` and Ctrl-C still end the dashboard.
+    #[test]
+    fn upload_confirm_does_not_swallow_quit() {
+        for keys in [
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ] {
+            let mut model = two_hosts();
+            model.action = Some(Action::ConfirmCreateUpload {
+                token: 7,
+                root: "/srv/data".to_string(),
+            });
+            let effects = update(&mut model, Msg::Key(keys));
+            assert!(model.quit, "{keys:?} quits");
+            assert!(
+                effects.iter().any(|e| matches!(e, Effect::SaveState)),
+                "{keys:?} saves state"
+            );
+        }
+    }
+
+    /// Two creates can pause on the upload confirm at once: the second waits
+    /// behind whichever modal is open and is shown only once the first is
+    /// answered, so neither task's reply is dropped.
+    #[test]
+    fn pending_upload_confirms_queue_behind_an_open_modal() {
+        let mut model = two_hosts();
+        let (tx1, _rx1) = tokio::sync::oneshot::channel();
+        let (tx2, _rx2) = tokio::sync::oneshot::channel();
+        let mut pending = VecDeque::from([
+            PendingConfirm {
+                token: 1,
+                root: "a".into(),
+                reply: tx1,
+            },
+            PendingConfirm {
+                token: 2,
+                root: "b".into(),
+                reply: tx2,
+            },
+        ]);
+
+        // Another modal owns the footer: the confirm waits, and says so, so
+        // the caller leaves that modal's keystrokes alone.
+        model.action = Some(Action::ConfirmDestroy(skey("host", 1), "x".into()));
+        assert!(!show_pending_confirm(&mut model, &mut pending));
+        assert!(matches!(model.action, Some(Action::ConfirmDestroy(..))));
+
+        // With the footer free, the oldest confirm shows, keyed by its token.
+        model.action = None;
+        assert!(show_pending_confirm(&mut model, &mut pending));
+        assert!(matches!(
+            model.action,
+            Some(Action::ConfirmCreateUpload { token: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn focusing_a_session_acknowledges_its_bell() {
+        let now = DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z")
+            .unwrap()
+            .to_utc();
+        let mut with_bell = entry(1, Some("api"));
+        with_bell.attrs = Some(minimald_rpc::RunningSessionAttrs {
+            last_stdout: None,
+            last_stdin: None,
+            title: None,
+            audible_bell: Some(minimald_rpc::Bell {
+                count: 2,
+                last: now,
+            }),
+            visual_bell: None,
+        });
+        let mut model = model_with(vec![host("host", vec![with_bell])]);
+        // Focus the session (row 1) — the bell was already in the attrs at
+        // focus time, so it's acknowledged and doesn't light the indicator.
+        update(&mut model, key(KeyCode::Down));
+        assert!(!model.has_unseen_bell(&skey("host", 1)));
+    }
+
+    #[test]
+    fn focusing_fetches_detail_once() {
+        let mut model = two_hosts();
+        let effects = update(&mut model, key(KeyCode::Down));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::FetchDetail(k) if k.id == id(1)))
+        );
+        // A second focus of the same session is served from the cache.
+        update(
+            &mut model,
+            Msg::DetailLoaded(skey("host", 1), Box::default()),
+        );
+        update(&mut model, key(KeyCode::Down));
+        let effects = update(&mut model, key(KeyCode::Up));
+        assert!(!effects.iter().any(|e| matches!(e, Effect::FetchDetail(_))));
+    }
+
+    #[test]
+    fn a_failed_policy_fetch_is_retried() {
+        let mut model = two_hosts();
+        update(&mut model, key(KeyCode::Down));
+        // The policy fetch failed (an older daemon, a transient error): the
+        // failure is shown but not cached as the session's answer.
+        update(
+            &mut model,
+            Msg::DetailLoaded(
+                skey("host", 1),
+                Box::new(Detail {
+                    policy_error: Some("request subsystem failed".to_string()),
+                    ..Detail::default()
+                }),
+            ),
+        );
+        // Not straight away: an older daemon refuses every time, so the
+        // retry waits out REDISCOVERY_INTERVAL rather than riding each tick.
+        update(&mut model, key(KeyCode::Down));
+        let effects = update(&mut model, key(KeyCode::Up));
+        assert!(!effects.iter().any(|e| matches!(e, Effect::FetchDetail(_))));
+        model.now += chrono::Duration::from_std(REDISCOVERY_INTERVAL).unwrap();
+        update(&mut model, key(KeyCode::Down));
+        let effects = update(&mut model, key(KeyCode::Up));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::FetchDetail(k) if k.id == id(1)))
+        );
+    }
+
+    #[test]
+    fn indicator_shows_spinner_for_recent_stdout() {
+        let now = DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z")
+            .unwrap()
+            .to_utc();
+        let mut hot = entry(1, Some("hot"));
+        hot.attrs = Some(minimald_rpc::RunningSessionAttrs {
+            last_stdout: Some(now - chrono::Duration::seconds(2)),
+            last_stdin: None,
+            title: None,
+            audible_bell: None,
+            visual_bell: None,
+        });
+        // Refreshed overwrites `now` with the wall clock; pin it back.
+        let mut model = model_with(vec![host("host", vec![hot])]);
+        model.now = now;
+        assert_eq!(model.indicator(&skey("host", 1)), "◐");
+    }
+
+    #[test]
+    fn indicator_shows_waiting_for_stdin_without_stdout() {
+        let now = DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z")
+            .unwrap()
+            .to_utc();
+        let mut waiting = entry(1, Some("wait"));
+        waiting.attrs = Some(minimald_rpc::RunningSessionAttrs {
+            last_stdout: Some(now - chrono::Duration::seconds(60)),
+            last_stdin: Some(now - chrono::Duration::seconds(2)),
+            title: None,
+            audible_bell: None,
+            visual_bell: None,
+        });
+        let mut model = model_with(vec![host("host", vec![waiting])]);
+        model.now = now;
+        assert_eq!(model.indicator(&skey("host", 1)), "○");
+    }
+
+    #[test]
+    fn indicator_blank_when_idle() {
+        let model = two_hosts();
+        assert_eq!(model.indicator(&skey("host", 1)), "");
+    }
+    #[test]
+    fn tick_fetches_the_focused_sessions_screen() {
+        let mut model = two_hosts();
+        update(&mut model, key(KeyCode::Down));
+        let effects = update(&mut model, Msg::Tick);
+        assert!(effects.iter().any(|e| matches!(e, Effect::Refresh)));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::FetchScreen(k) if k.id == id(1)))
+        );
+    }
+
+    /// Ctrl-D is a shell reflex, not "destroy": modified chords must not
+    /// reach the bare-key bindings.
+    #[test]
+    fn ctrl_chords_do_not_reach_the_bare_key_bindings() {
+        let mut model = two_hosts();
+        update(&mut model, key(KeyCode::Down));
+        for code in [KeyCode::Char('d'), KeyCode::Char('r'), KeyCode::Char('n')] {
+            let effects = update(
+                &mut model,
+                Msg::Key(KeyEvent::new(code, KeyModifiers::CONTROL)),
+            );
+            assert!(model.action.is_none(), "{code:?} opened a modal");
+            assert!(effects.is_empty(), "{code:?} produced effects");
+        }
+        // Ctrl-C still quits (it is an explicit binding).
+        update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        );
+        assert!(model.quit);
+    }
+
+    /// A failed refresh keeps the host's slot (marked unreachable)
+    /// instead of dropping it and re-indexing every session key onto the
+    /// surviving daemon.
+    #[test]
+    fn a_failed_refresh_marks_the_host_unreachable() {
+        let mut model = two_hosts();
+        update(
+            &mut model,
+            Msg::Refreshed {
+                ok: vec![host("host", vec![entry(1, Some("api-staging"))])],
+                failed: vec!["vm".to_string()],
+            },
+        );
+        let vm = model
+            .hosts
+            .iter()
+            .find(|p| p.label == "vm")
+            .expect("the vm slot must survive its failed refresh");
+        assert!(!vm.reachable);
+        assert!(vm.sessions.is_empty());
+        // The host's sessions still resolve to the `host` group by label.
+        assert_eq!(model.entry(&skey("host", 1)).map(|e| e.id), Some(id(1)));
+    }
+
+    /// A host that comes back rejoins with its sessions and is marked
+    /// reachable again.
+    #[test]
+    fn a_reconnected_host_rejoins() {
+        let mut model = two_hosts();
+        update(
+            &mut model,
+            Msg::Refreshed {
+                ok: vec![host("host", vec![entry(1, Some("api-staging"))])],
+                failed: vec!["vm".to_string()],
+            },
+        );
+        update(
+            &mut model,
+            Msg::Refreshed {
+                ok: vec![
+                    host("host", vec![entry(1, Some("api-staging"))]),
+                    host("vm", vec![entry(3, Some("bench"))]),
+                ],
+                failed: Vec::new(),
+            },
+        );
+        let vm = model.hosts.iter().find(|p| p.label == "vm").unwrap();
+        assert!(vm.reachable);
+        assert_eq!(model.entry(&skey("vm", 3)).map(|e| e.id), Some(id(3)));
+        // Canonical group order is preserved after the rejoin.
+        let labels: Vec<&str> = model.hosts.iter().map(|p| p.label.as_str()).collect();
+        assert_eq!(labels, ["host", "vm"]);
+    }
+
+    /// Opening the create form from a host's group header targets THAT
+    /// host, not the first one in the list.
+    #[test]
+    fn create_from_a_host_header_targets_that_host() {
+        let mut model = two_hosts();
+        // Rows: host header, api-staging, (unnamed), vm header, bench.
+        for _ in 0..3 {
+            update(&mut model, key(KeyCode::Down));
+        }
+        assert!(matches!(model.cursor_row(), Some(Row::HostHeader(1))));
+        update(&mut model, key(KeyCode::Char('n')));
+        update(&mut model, key(KeyCode::Enter)); // name -> path
+        update(&mut model, key(KeyCode::Enter)); // path -> network
+        let effects = update(&mut model, key(KeyCode::Enter)); // submit
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Create { host, .. } if host == "vm")),
+            "expected a create targeted at vm, got {effects:?}"
+        );
+    }
+
+    /// Creating on a host marked unreachable fails loudly instead of
+    /// silently targeting another daemon.
+    #[test]
+    fn create_on_an_unreachable_host_errors() {
+        let mut model = two_hosts();
+        update(
+            &mut model,
+            Msg::Refreshed {
+                ok: vec![host("host", vec![entry(1, Some("api-staging"))])],
+                failed: vec!["vm".to_string()],
+            },
+        );
+        // Rows: host header, api-staging, vm header (sessions cleared).
+        for _ in 0..2 {
+            update(&mut model, key(KeyCode::Down));
+        }
+        assert!(matches!(model.cursor_row(), Some(Row::HostHeader(_))));
+        update(&mut model, key(KeyCode::Char('n')));
+        update(&mut model, key(KeyCode::Enter));
+        update(&mut model, key(KeyCode::Enter));
+        let effects = update(&mut model, key(KeyCode::Enter));
+        assert!(!effects.iter().any(|e| matches!(e, Effect::Create { .. })));
+        assert_eq!(
+            model.status.as_deref(),
+            Some("error: provider 'vm' is unreachable")
+        );
+    }
+
+    /// `min dash` hands the terminal to the attach the same way the CLI
+    /// does, through the relay, and crossterm lets go first: the relay
+    /// starts only after the release, so the termios it puts back when the
+    /// attach ends is the released terminal's, not crossterm's raw mode.
+    #[test]
+    fn dash_attach_goes_through_relay_after_crossterm_release() {
+        use nix::sys::termios::{LocalFlags, SetArg, Termios, cfmakeraw, tcgetattr, tcsetattr};
+        use std::io::Read as _;
+        use std::os::fd::OwnedFd;
+        use std::sync::{Arc, Mutex};
+
+        fn mode(t: &Termios) -> String {
+            // PENDIN is kernel bookkeeping on macOS, not a mode anyone set; and
+            // only the named control characters count (Linux's kernel keeps
+            // fewer than libc's `NCCS`, so the array's tail is stack garbage).
+            use nix::sys::termios::SpecialCharacterIndices as C;
+            let cc: Vec<u8> = [
+                C::VEOF,
+                C::VEOL,
+                C::VERASE,
+                C::VINTR,
+                C::VKILL,
+                C::VMIN,
+                C::VQUIT,
+                C::VSTART,
+                C::VSTOP,
+                C::VSUSP,
+                C::VTIME,
+            ]
+            .iter()
+            .map(|&i| t.control_chars[i as usize])
+            .collect();
+            format!(
+                "{:?} {:?} {:?} {:?} {cc:?}",
+                t.input_flags,
+                t.output_flags,
+                t.control_flags,
+                t.local_flags - LocalFlags::PENDIN,
+            )
+        }
+
+        /// The TUI's terminal on a pty: raw (crossterm's) until suspended,
+        /// the shell's own termios after.
+        struct Tui {
+            tty: OwnedFd,
+            released: Termios,
+            steps: Arc<Mutex<Vec<String>>>,
+        }
+        impl SuspendableTerminal for Tui {
+            fn suspend(&mut self) {
+                tcsetattr(&self.tty, SetArg::TCSANOW, &self.released).unwrap();
+                self.steps.lock().unwrap().push("release".into());
+            }
+            fn resume(&mut self) -> std::io::Result<()> {
+                let now = mode(&tcgetattr(&self.tty).unwrap());
+                self.steps.lock().unwrap().push(format!("resume in {now}"));
+                Ok(())
+            }
+        }
+
+        let pty = nix::pty::openpty(None, None).unwrap();
+        let released = tcgetattr(&pty.slave).unwrap();
+        let mut crossterm_raw = released.clone();
+        cfmakeraw(&mut crossterm_raw);
+        tcsetattr(&pty.slave, SetArg::TCSANOW, &crossterm_raw).unwrap();
+        let mut master = std::fs::File::from(pty.master);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match master.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    // A signal can interrupt the read on some targets.
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let steps = Arc::new(Mutex::new(Vec::new()));
+        let mut tui = Tui {
+            tty: pty.slave.try_clone().unwrap(),
+            released: released.clone(),
+            steps: Arc::clone(&steps),
+        };
+        let mut session = std::process::Command::new("/bin/sh");
+        session
+            .arg("-c")
+            .arg("stty raw -echo -iexten; printf R; exit 0");
+        let status = attach_through_relay(&mut tui, session, |cmd| {
+            steps.lock().unwrap().push("relay".into());
+            let real = minimal_client::tty_relay::RealTty::from_fds(
+                pty.slave.try_clone().unwrap(),
+                pty.slave.try_clone().unwrap(),
+            );
+            minimal_client::attach::run_interactive_attach_on(cmd, real, None)
+        })
+        .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            *steps.lock().unwrap(),
+            vec![
+                "release".to_string(),
+                "relay".to_string(),
+                format!("resume in {}", mode(&released)),
+            ],
+        );
+    }
+}

@@ -123,7 +123,7 @@ pub async fn config(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyho
                         }
                     };
                     if is_dir {
-                        let file = path.join(sessions::client::disk::LOADOUT_FILE_NAME);
+                        let file = path.join(boxes::client::disk::LOADOUT_FILE_NAME);
                         // Existence only. Whether this is a *safe* file to
                         // read is `add_redacted_toml`'s call, and it makes
                         // it independently — a symlinked `loadout.toml` is
@@ -135,7 +135,7 @@ pub async fn config(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyho
                                 &file,
                                 &format!(
                                     "config/loadouts/{name}/{}.redacted",
-                                    sessions::client::disk::LOADOUT_FILE_NAME
+                                    boxes::client::disk::LOADOUT_FILE_NAME
                                 ),
                             )
                             .await;
@@ -156,23 +156,8 @@ pub async fn config(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyho
         Err(e) => w.skip("config/loadouts/", format!("unreadable: {e}")),
     }
 
-    // mTLS material: cert/CA metadata only, private key never touched.
-    w.skip(
-        "config/client.key",
-        "private key material — never collected",
-    );
-    let certs: std::collections::BTreeMap<&str, Option<FileMeta>> = [
-        (
-            "client.pem",
-            file_meta(&paths.config.join("client.pem")).await,
-        ),
-        ("ca.pem", file_meta(&paths.config.join("ca.pem")).await),
-    ]
-    .into_iter()
-    .collect();
-    let json = serde_json_lenient::to_vec_pretty(&certs).context("serializing cert metadata")?;
-    w.add_bytes("config/client-cert.json", &json, Redaction::ListingOnly)
-        .await?;
+    // The retired reverse proxy's client certificate, key and CA are not
+    // collected, and their absence is not recorded either (NET-109).
 
     // Mesh enrolment holds only a host:port endpoint. No-follow like every
     // other content read: it ships verbatim, so a symlink here would
@@ -228,24 +213,6 @@ async fn read_string_nofollow(src: &Path) -> Result<String, anyhow::Error> {
     Ok(content)
 }
 
-#[derive(Serialize)]
-struct FileMeta {
-    bytes: u64,
-    mtime_unix: Option<u64>,
-}
-
-async fn file_meta(path: &Path) -> Option<FileMeta> {
-    let meta = tokio::fs::metadata(path).await.ok()?;
-    Some(FileMeta {
-        bytes: meta.len(),
-        mtime_unix: meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs()),
-    })
-}
-
 // ── state/ ───────────────────────────────────────────────────────────────────
 
 pub async fn state(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyhow::Error> {
@@ -288,7 +255,7 @@ enum Locality {
     Host,
     /// Not necessarily a host process at all: on macOS minimald runs *inside*
     /// the microVM and logs to the guest data volume, so its records reach the
-    /// bundle through the per-provider guest fetch and never through this
+    /// bundle through the per-host guest fetch and never through this
     /// directory. "Not here" is then a fact about this directory only.
     HostOrGuest,
 }
@@ -314,7 +281,7 @@ const LOG_PREFIXES: [LogPrefix; 2] = [
     },
 ];
 
-/// What the provider loop established about the daemon's own logs reaching
+/// What the host loop established about the daemon's own logs reaching
 /// the bundle by another route — the fact a host-side absence has to be read
 /// against.
 ///
@@ -325,17 +292,17 @@ const LOG_PREFIXES: [LogPrefix; 2] = [
 /// asserting something the archive does not back.
 #[derive(Debug, Clone, Copy)]
 pub enum DaemonLogSources<'a> {
-    /// The provider directory could not be listed, so whether any daemon
+    /// The host directory could not be listed, so whether any daemon
     /// logged elsewhere is *unknown*. Absence may not be claimed.
-    ProvidersUnknown,
-    /// No provider instance exists, so no daemon could have logged elsewhere.
-    NoProviders,
-    /// Providers exist, but none yielded a daemon bundle this run.
+    HostsUnknown,
+    /// No host exists, so no daemon could have logged elsewhere.
+    NoHosts,
+    /// Hosts exist, but none yielded a daemon bundle this run.
     NoneFetched,
-    /// These providers' nested bundles verified and were observed to hold
+    /// These hosts' nested bundles verified and were observed to hold
     /// `logs/minimald.log*`. Non-empty by construction.
     Nested(&'a [&'a str]),
-    /// A nested bundle arrived from these providers, but this run could not
+    /// A nested bundle arrived from these hosts, but this run could not
     /// confirm it holds the daemon's logs — truncated, failed verification,
     /// or verified with no such entry. Non-empty by construction.
     NestedUnconfirmed(&'a [&'a str]),
@@ -345,7 +312,7 @@ pub enum DaemonLogSources<'a> {
 ///
 /// Prefixes that matched no file are *reported back* through `absent` rather
 /// than skipped on the spot: whether "nothing under `<state>/logs`" also means
-/// "nothing in this bundle" depends on what the provider loop finds
+/// "nothing in this bundle" depends on what the host loop finds
 /// afterwards, and the shared collector contract (`collect_step!`) fixes this
 /// signature's return type at `Result<(), _>`.
 /// [`explain_absent_log_prefixes`] records those skips once the answer is in.
@@ -355,6 +322,20 @@ pub enum DaemonLogSources<'a> {
 pub async fn logs(
     w: &mut BundleWriter,
     paths: &DiagPaths,
+    tail_bytes: u64,
+    absent: &mut Vec<LogPrefix>,
+) -> Result<(), anyhow::Error> {
+    let audit_dir = bep::audit::default_dir();
+    logs_with_audit(w, paths, audit_dir.as_deref(), tail_bytes, absent).await
+}
+
+/// [`logs`], with the proxy's audit log read from `audit_dir` in place of
+/// the user's home. Tests pass a temp dir here so a real audit log on the
+/// host never enters their bundle.
+async fn logs_with_audit(
+    w: &mut BundleWriter,
+    paths: &DiagPaths,
+    audit_dir: Option<&Path>,
     tail_bytes: u64,
     absent: &mut Vec<LogPrefix>,
 ) -> Result<(), anyhow::Error> {
@@ -386,7 +367,7 @@ pub async fn logs(
         }
     }
 
-    // Provider-scoped files. run.log: the detached supervisor's stderr
+    // Host-scoped files. run.log: the detached supervisor's stderr
     // redirect (panics, the final error print of a failed boot). boot.log:
     // the VMM's hvc0 console capture — kernel prints and the guest pid-1's
     // stdout, the only evidence when the guest wedges before (or its
@@ -394,11 +375,18 @@ pub async fn logs(
     // host daemon's zone-table dump (NET-138) — the table its answerer
     // answered from, written at start and on every change — so a bundle
     // holds the table the answers were given by, not only its name in the
-    // dir listing. Absent the same way a log that never appeared is: a
-    // provider dir with no daemon (or a daemon predating the dump) records
-    // absence, not an error.
-    for (name, dir) in provider_dirs(&paths.state).await? {
-        for file_name in ["run.log", "boot.log", minvmd::diag::ZONE_TABLE_FILE] {
+    // dir listing. bep.log: the Box Egress Proxy's stdout and stderr, which
+    // the VM host daemon starts beside gvproxy and writes here (BEP-015).
+    // Absent the same way a log that never appeared is: a host dir with
+    // no daemon (or a daemon predating the dump, or a host the proxy does
+    // not run on) records absence, not an error.
+    for (name, dir) in host_dirs(&paths.state).await? {
+        for file_name in [
+            "run.log",
+            "boot.log",
+            BEP_LOG_FILE,
+            minvmd::diag::ZONE_TABLE_FILE,
+        ] {
             let dest = format!("providers/{name}/{file_name}");
             match w
                 .add_file_tail(&dest, &dir.join(file_name), tail_bytes)
@@ -411,6 +399,10 @@ pub async fn logs(
         }
     }
 
+    // The proxy's audit log lives under the user's home, not the state dir:
+    // `bep` writes it there wherever it runs from.
+    bep_audit(w, audit_dir, tail_bytes).await;
+
     // The legend for everything above, plus the daemon logs that arrive
     // nested from the guest: two overlapping copies of the same output, each
     // systematically missing what the other has.
@@ -422,7 +414,337 @@ pub async fn logs(
     .await
 }
 
-/// Records the skips [`logs`] held back, now that the provider loop has said
+/// The file in a host dir that holds the Box Egress Proxy's output. The
+/// VM host daemon names the same file beside the proxy's socket.
+const BEP_LOG_FILE: &str = "bep.log";
+
+/// Collects the newest segments of the Box Egress Proxy's audit log from
+/// `dir` into `bep/audit/`, tail-capped and line-scrubbed like a log.
+/// `None` is a host with no home directory.
+async fn bep_audit(w: &mut BundleWriter, dir: Option<&Path>, tail_bytes: u64) {
+    let Some(dir) = dir else {
+        w.skip("bep/audit/", "no home directory, so no audit log location");
+        return;
+    };
+    // The listing is synchronous, so it runs on a blocking thread, as
+    // `state`'s does: a wedged filesystem strands that thread, not the
+    // worker whose collect_step! timeout is the failsafe.
+    let listed = {
+        let dir = dir.to_path_buf();
+        tokio::task::spawn_blocking(move || bep::audit::segments(&dir)).await
+    };
+    let segments = match listed {
+        Ok(Ok(segments)) => segments,
+        Ok(Err(e)) => {
+            w.skip("bep/audit/", format!("unreadable: {e}"));
+            return;
+        }
+        Err(e) => {
+            w.skip("bep/audit/", format!("listing worker: {e}"));
+            return;
+        }
+    };
+    if segments.is_empty() {
+        w.skip(
+            "bep/audit/",
+            format!("absent: no audit segments in {}", dir.display()),
+        );
+        return;
+    }
+    let newest = segments.len().saturating_sub(LOG_FILES_PER_PREFIX);
+    for path in &segments[newest..] {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let dest = format!("bep/audit/{name}");
+        if let Err(e) = w.add_file_tail(&dest, path, tail_bytes).await {
+            w.skip(&dest, format!("unreadable: {e}"));
+        }
+    }
+}
+
+/// The host-side telemetry spool: the CLI's and minvmd's records (spec 25
+/// TEL-044). One directory is read, [`spool_dir`] resolved from `min bug`'s
+/// own environment and state directory: its `MINIMAL_OTEL_SPOOL_DIR` when
+/// set, else `<state>/telemetry/spool`. A producer picks its directory from
+/// its own environment, so a minvmd or CLI whose `MINIMAL_OTEL_SPOOL_DIR`
+/// (a systemd unit's, say) or state directory differs from `min bug`'s
+/// wrote elsewhere, and its files are not collected; `host/telemetry.json`
+/// names the directory read ([`SPOOL_DIR_NOTE`]). The daemon's spool
+/// travels in its own nested bundle. The newest [`LOG_FILES_PER_PREFIX`]
+/// `*.jsonl` files of each producer ([`diagnostics::spool::producer`]), each
+/// tail-capped and line-scrubbed like a log, behind the same symlink guards
+/// ([`spool_in`]).
+pub async fn spool(
+    w: &mut BundleWriter,
+    paths: &DiagPaths,
+    tail_bytes: u64,
+) -> Result<(), anyhow::Error> {
+    let dir = spool_dir(paths, std::env::var_os("MINIMAL_OTEL_SPOOL_DIR"));
+    let headers = diagnostics::redact::exporter_header_values(|n| std::env::var(n).ok());
+    spool_in(w, &dir, tail_bytes, &headers).await?;
+    // The VMs' guest spools, `<dir>/guest/<vm>/`, each bounded on its own
+    // (`mlog::otel::spool_guest_line`): collected beside the host's. `guest`
+    // itself is taken only as a real directory, the no-follow discipline
+    // `diagnostics::spool::collect` applies to each directory it is handed.
+    let guest = dir.join("guest");
+    let guest_is_dir = tokio::fs::symlink_metadata(&guest)
+        .await
+        .is_ok_and(|m| m.is_dir());
+    if guest_is_dir && let Ok(mut vms) = tokio::fs::read_dir(&guest).await {
+        while let Ok(Some(vm)) = vms.next_entry().await {
+            if vm.file_type().await.is_ok_and(|t| t.is_dir()) {
+                spool_in(w, &vm.path(), tail_bytes, &headers).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The spool directory `min bug` reads: `override_dir`, the value of
+/// `MINIMAL_OTEL_SPOOL_DIR` in `min bug`'s own environment, when set and not
+/// empty, else `<state>/telemetry/spool`. mlog's writer applies the same
+/// rule, but each producer to its own environment and state directory, so
+/// this is where processes that share `min bug`'s settings wrote, not
+/// every spool on the host.
+pub fn spool_dir(paths: &DiagPaths, override_dir: Option<std::ffi::OsString>) -> PathBuf {
+    match override_dir {
+        Some(d) if !d.is_empty() => PathBuf::from(d),
+        _ => paths.state.join("telemetry").join("spool"),
+    }
+}
+
+/// [`diagnostics::spool::collect`] with the host bundle's policy: the newest
+/// [`LOG_FILES_PER_PREFIX`] files of each producer, so a chatty minvmd cannot
+/// push the CLI's only file out of the bundle.
+async fn spool_in(
+    w: &mut BundleWriter,
+    dir: &Path,
+    tail_bytes: u64,
+    header_values: &[String],
+) -> Result<(), anyhow::Error> {
+    diagnostics::spool::collect(
+        w,
+        dir,
+        tail_bytes,
+        diagnostics::spool::SpoolKeep::NewestPerProducer(LOG_FILES_PER_PREFIX),
+        header_values,
+        "no spool directory — telemetry never ran on this host",
+    )
+    .await
+}
+
+// ── host/telemetry.json ──────────────────────────────────────────────────────
+
+/// What telemetry was set to in the `min bug` process's environment when the
+/// bundle was collected (spec 25 TEL-051): the switch and the variable that
+/// decided it, each signal's exporter, each endpoint as its origin only (the
+/// TEL-040 form), the spool, and the trace id of the newest `cmd` span the
+/// CLI spooled. This is the CLI's state as the shell running `min bug` sets
+/// it, not the whole host's: a daemon or minvmd keeps the switches it was
+/// started with (TEL-009), so it can export while this says off, or the
+/// reverse; [`Self::source`] says so in the file. Nothing here is a
+/// credential: no header, no endpoint path or query.
+#[derive(Debug, Serialize)]
+pub struct TelemetryState {
+    /// Whose state this is: always [`TELEMETRY_STATE_SOURCE`].
+    pub source: &'static str,
+    /// The opt-in: `MINIMAL_TELEMETRY` truthy and no veto.
+    pub enabled: bool,
+    /// The variable that settled [`Self::enabled`]: `DO_NOT_TRACK` or
+    /// `OTEL_SDK_DISABLED` when either vetoes, else `MINIMAL_TELEMETRY`.
+    pub decided_by: &'static str,
+    pub traces: SignalState,
+    pub logs: SignalState,
+    /// Finished records are spooled locally.
+    pub spool: bool,
+    /// The spool directory the bundle read ([`spool_dir`]).
+    pub spool_dir: PathBuf,
+    /// Always [`SPOOL_DIR_NOTE`]: [`Self::spool_dir`] is the only spool
+    /// directory read.
+    pub spool_dir_note: &'static str,
+    /// The `traceId` of the newest `cmd` span in the CLI's spool files.
+    pub newest_cmd_trace_id: Option<String>,
+}
+
+/// One signal's part of a [`TelemetryState`].
+#[derive(Debug, Serialize)]
+pub struct SignalState {
+    /// The signal is exported to [`Self::endpoint`].
+    pub exporting: bool,
+    /// The signal's exporter variable is `none`.
+    pub exporter_none: bool,
+    /// The endpoint's `scheme://host[:port]`, never its userinfo, path,
+    /// query or fragment (TEL-040).
+    pub endpoint: Option<String>,
+    /// The configured endpoint was refused, so the signal is not exported.
+    pub refused: bool,
+}
+
+/// [`TelemetryState::spool_dir_note`]: the bundle reads one spool
+/// directory, and a spool another process pinned elsewhere is not in it.
+pub const SPOOL_DIR_NOTE: &str = "the only spool directory read: MINIMAL_OTEL_SPOOL_DIR from the \
+     min bug process environment, else <state>/telemetry/spool; a spool another process placed \
+     elsewhere through its own environment is not collected";
+
+/// [`TelemetryState::source`]: the record is the `min bug` process's own
+/// environment, not the daemon's or minvmd's.
+pub const TELEMETRY_STATE_SOURCE: &str =
+    "min bug process environment (a daemon or minvmd may run with other settings)";
+
+pub async fn telemetry(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyhow::Error> {
+    let state = telemetry_state(paths, |n| std::env::var_os(n)).await;
+    let json = serde_json_lenient::to_vec_pretty(&state).context("serializing telemetry state")?;
+    w.add_bytes("host/telemetry.json", &json, Redaction::None)
+        .await
+}
+
+/// [`TelemetryState`] over the variables `var` gives. The exporter, endpoint
+/// and spool decision is mlog's own ([`mlog::otel::guest_exports`]). The
+/// switch's deciding variable mirrors mlog's private `Switches::enabled`,
+/// which mlog does not export; `the_mirrored_switch_agrees_with_mlog` holds
+/// the two together.
+async fn telemetry_state(
+    paths: &DiagPaths,
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> TelemetryState {
+    let set = |name: &str| var(name).is_some_and(|v| !v.is_empty());
+    let text = |name: &str| var(name).and_then(|v| v.into_string().ok());
+    let (enabled, decided_by) = if set("DO_NOT_TRACK") {
+        (false, "DO_NOT_TRACK")
+    } else if text("OTEL_SDK_DISABLED").is_some_and(|v| v.eq_ignore_ascii_case("true")) {
+        (false, "OTEL_SDK_DISABLED")
+    } else {
+        let on = text("MINIMAL_TELEMETRY").is_some_and(|v| {
+            ["1", "true", "yes", "on"]
+                .iter()
+                .any(|t| v.eq_ignore_ascii_case(t))
+        });
+        (on, "MINIMAL_TELEMETRY")
+    };
+    let exports = mlog::otel::guest_exports(|n| text(n));
+    let signal = |s: &mlog::otel::GuestSignal| SignalState {
+        exporting: matches!(s.url, Some(Ok(_))),
+        exporter_none: s.off,
+        endpoint: match &s.url {
+            Some(Ok(u)) => url::Url::parse(u)
+                .ok()
+                .map(|u| u.origin().ascii_serialization()),
+            _ => None,
+        },
+        refused: matches!(s.url, Some(Err(_))),
+    };
+    let dir = spool_dir(paths, var("MINIMAL_OTEL_SPOOL_DIR"));
+    TelemetryState {
+        source: TELEMETRY_STATE_SOURCE,
+        enabled,
+        decided_by,
+        traces: signal(&exports.traces),
+        logs: signal(&exports.logs),
+        spool: exports.spool,
+        newest_cmd_trace_id: newest_cmd_trace_id(&dir).await,
+        spool_dir: dir,
+        spool_dir_note: SPOOL_DIR_NOTE,
+    }
+}
+
+/// The most a trace-id lookup reads from the end of one spool file.
+const TRACE_LOOKUP_TAIL: u64 = 1 << 20;
+
+/// The `traceId` of the newest `cmd` span (by `endTimeUnixNano`) in the
+/// newest of the CLI's spool files that holds one. It reads at most the
+/// newest [`LOG_FILES_PER_PREFIX`] files, [`TRACE_LOOKUP_TAIL`] bytes of
+/// each, through the bundle's no-follow open. A line that is not JSON is
+/// passed over.
+async fn newest_cmd_trace_id(dir: &Path) -> Option<String> {
+    use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+    // The same no-follow discipline as the spool collector: a spool directory
+    // that is a symlink is not read, so the two readers refuse the same dirs.
+    if !tokio::fs::symlink_metadata(dir)
+        .await
+        .is_ok_and(|m| m.is_dir())
+    {
+        return None;
+    }
+    let mut rd = tokio::fs::read_dir(dir).await.ok()?;
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.ends_with(".jsonl") || diagnostics::spool::producer(&name) != "minimal-cli" {
+            continue;
+        }
+        if let Ok(m) = tokio::fs::symlink_metadata(entry.path()).await
+            && m.is_file()
+        {
+            files.push((m.modified().unwrap_or(UNIX_EPOCH), entry.path()));
+        }
+    }
+    files.sort_by_key(|f| std::cmp::Reverse(f.0));
+    for (_, path) in files.into_iter().take(LOG_FILES_PER_PREFIX) {
+        let Ok((mut file, meta)) = open_regular_nofollow(&path).await else {
+            continue;
+        };
+        if meta.len() > TRACE_LOOKUP_TAIL {
+            let back = i64::try_from(TRACE_LOOKUP_TAIL).unwrap_or(i64::MAX);
+            if file.seek(std::io::SeekFrom::End(-back)).await.is_err() {
+                continue;
+            }
+        }
+        let mut bytes = Vec::new();
+        if (&mut file)
+            .take(TRACE_LOOKUP_TAIL)
+            .read_to_end(&mut bytes)
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        if let Some(id) = newest_cmd_trace_id_in(&String::from_utf8_lossy(&bytes)) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+/// [`newest_cmd_trace_id`] over one file's text.
+fn newest_cmd_trace_id_in(text: &str) -> Option<String> {
+    use serde_json_lenient::Value;
+    let end = |s: &Value| match s.get("endTimeUnixNano") {
+        Some(Value::String(n)) => n.parse::<u64>().unwrap_or(0),
+        Some(n) => n.as_u64().unwrap_or(0),
+        None => 0,
+    };
+    let mut best: Option<(u64, String)> = None;
+    for line in text.lines() {
+        let Ok(v) = serde_json_lenient::from_str::<Value>(line) else {
+            continue;
+        };
+        let spans = v
+            .get("resourceSpans")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|r| r.get("scopeSpans").and_then(Value::as_array))
+            .flatten()
+            .filter_map(|s| s.get("spans").and_then(Value::as_array))
+            .flatten();
+        for span in spans {
+            if span.get("name").and_then(Value::as_str) != Some("cmd") {
+                continue;
+            }
+            let Some(id) = span.get("traceId").and_then(Value::as_str) else {
+                continue;
+            };
+            let t = end(span);
+            // Files are visited newest first, so an equal end time keeps
+            // the span already recorded: strictly greater, not `>=`.
+            if best.as_ref().is_none_or(|(b, _)| t > *b) {
+                best = Some((t, id.to_owned()));
+            }
+        }
+    }
+    best.map(|(_, id)| id)
+}
+
+/// Records the skips [`logs`] held back, now that the host loop has said
 /// whether the daemon's own logs reached the bundle another way.
 ///
 /// The plain absence claim ([`NO_SUCH_FILES`]) is made only where it is true
@@ -440,9 +762,9 @@ pub fn explain_absent_log_prefixes(
 ) {
     let log_dir = paths.state.join("logs");
     let log_dir = log_dir.display();
-    // Where in the bundle a named provider's nested daemon bundle sits.
-    let carriers = |providers: &[&str]| {
-        providers
+    // Where in the bundle a named host's nested daemon bundle sits.
+    let carriers = |hosts: &[&str]| {
+        hosts
             .iter()
             .map(|p| format!("providers/{p}/guest/daemon-diag.tar.zst"))
             .collect::<Vec<_>>()
@@ -451,36 +773,36 @@ pub fn explain_absent_log_prefixes(
     for prefix in absent {
         let reason = match (prefix.locality, sources) {
             // A host process that wrote nothing here wrote nothing anywhere —
-            // including when the provider listing failed, which says nothing
-            // about a host writer. And with no provider instance there is no
+            // including when the host listing failed, which says nothing
+            // about a host writer. And with no host there is no
             // guest to have logged in either. Both are genuine absence.
-            (Locality::Host, _) | (Locality::HostOrGuest, DaemonLogSources::NoProviders) => {
+            (Locality::Host, _) | (Locality::HostOrGuest, DaemonLogSources::NoHosts) => {
                 format!("{NO_SUCH_FILES} in {log_dir}")
             }
             // The listing failed, so whether a guest daemon logged elsewhere
             // was never established. Saying "absent" here would be asserting
             // the one thing this run did not find out.
-            (Locality::HostOrGuest, DaemonLogSources::ProvidersUnknown) => format!(
+            (Locality::HostOrGuest, DaemonLogSources::HostsUnknown) => format!(
                 "none in {log_dir}, and whether any exist elsewhere is unknown — the \
                  provider directory could not be listed this run (see the `providers` \
                  error in this manifest). Where minimald runs inside the microVM it \
                  logs to the guest data volume, not to this host"
             ),
-            (Locality::HostOrGuest, DaemonLogSources::Nested(providers)) => format!(
+            (Locality::HostOrGuest, DaemonLogSources::Nested(hosts)) => format!(
                 "none in {log_dir} — where minimald runs inside the microVM it logs \
                  to the guest data volume, not to this host. Its own logs are in \
                  this bundle, nested in {} (see logs/PROVENANCE.txt)",
-                carriers(providers)
+                carriers(hosts)
             ),
             // A bundle came back, so "no daemon bundle was fetched" would be
             // false; but it was truncated, failed its checks, or held no such
             // entry, so naming it as the carrier would be false too.
-            (Locality::HostOrGuest, DaemonLogSources::NestedUnconfirmed(providers)) => format!(
+            (Locality::HostOrGuest, DaemonLogSources::NestedUnconfirmed(hosts)) => format!(
                 "none in {log_dir} — where minimald runs inside the microVM it logs \
                  to the guest data volume, not to this host. A daemon bundle was \
                  collected at {}, but this run could not confirm it carries them; \
                  see the guest.* entries in this manifest (see logs/PROVENANCE.txt)",
-                carriers(providers)
+                carriers(hosts)
             ),
             (Locality::HostOrGuest, DaemonLogSources::NoneFetched) => format!(
                 "none in {log_dir} — where minimald runs inside the microVM it logs to \
@@ -520,6 +842,18 @@ providers/<name>/boot.log
   lacks      nothing observed; a measured incident window showed no console
              record absent under saturation
 
+providers/<name>/bep.log
+  source     the Box Egress Proxy's stdout and stderr, written by the VM host
+             daemon that starts it beside gvproxy
+  retention  appended across boots. A start moves a log past 8 MiB to
+             bep.log.old, and the bundle does not collect bep.log.old.
+  format     human-readable tracing output
+
+bep/audit/audit-<n>.jsonl
+  source     the Box Egress Proxy's audit log, ~/.minimal/bep/audit
+  retention  the newest segments only
+  format     JSON lines, one decision per line
+
 providers/<name>/guest/daemon-diag.tar.zst -> logs/minimald.log.<date>
   source     the on-volume file appender inside the guest, attached once the
              state volume mounts
@@ -553,14 +887,14 @@ fn is_not_found(err: &anyhow::Error) -> bool {
 
 // ── providers/local-<kind><n>/ discovery ───────────────────────────────────────────
 
-/// Provider instance dirs under `<state>/providers`, sorted, plus every named
+/// Host dirs under `<state>/providers`, sorted, plus every named
 /// VM nested in a minvmd instance dir as its own `local-minvmd0/<vm>` entry
 /// (NET-052) — so the bundle lists every VM by name. The default VM keeps the
-/// bare provider entry; a named VM's state dir is the per-name subdirectory
+/// bare host entry; a named VM's state dir is the per-name subdirectory
 /// (NET-054). Empty when the providers dir doesn't exist (nothing was ever
 /// spawned); any other filesystem error is an `Err` — "no daemon was ever
 /// spawned here" must never be claimed on the strength of an EACCES.
-pub async fn provider_dirs(state: &Path) -> Result<Vec<(String, PathBuf)>, std::io::Error> {
+pub async fn host_dirs(state: &Path) -> Result<Vec<(String, PathBuf)>, std::io::Error> {
     let mut entries = match tokio::fs::read_dir(state.join("providers")).await {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -587,14 +921,14 @@ pub async fn provider_dirs(state: &Path) -> Result<Vec<(String, PathBuf)>, std::
     Ok(dirs)
 }
 
-/// The named VMs under one minvmd provider dir, as
-/// (`<provider>/<vm>`, state dir) entries. A subdirectory is a VM only when
+/// The named VMs under one minvmd host dir, as
+/// (`<host>/<vm>`, state dir) entries. A subdirectory is a VM only when
 /// its name is a valid VM name — an unnamed directory a tool left behind must
 /// not be reported as a VM, and the in-guest diagnostic bundle's `guest/`
 /// directory is among the names the validator reserves, so it never reads as
-/// a VM either. An unreadable provider dir yields no VMs rather than failing
-/// the whole listing: the provider entry above still says what it holds.
-async fn named_vms(provider: &str, dir: &Path) -> Vec<(String, PathBuf)> {
+/// a VM either. An unreadable host dir yields no VMs rather than failing
+/// the whole listing: the host entry above still says what it holds.
+async fn named_vms(host: &str, dir: &Path) -> Vec<(String, PathBuf)> {
     let mut entries = match tokio::fs::read_dir(dir).await {
         Ok(entries) => entries,
         Err(_) => return Vec::new(),
@@ -610,22 +944,18 @@ async fn named_vms(provider: &str, dir: &Path) -> Vec<(String, PathBuf)> {
         if paths::validate_vm_name(&vm).is_err() {
             continue;
         }
-        vms.push((format!("{provider}/{vm}"), entry.path()));
+        vms.push((format!("{host}/{vm}"), entry.path()));
     }
     vms
 }
 
-/// Non-log per-provider evidence: what the instance dir holds, its raw
+/// Non-log per-host evidence: what the instance dir holds, its raw
 /// lifecycle state, and whether anything is still alive behind it (R7.6).
 ///
 /// `run.log`/`boot.log` are deliberately *not* collected here — [`logs`]
-/// already tail-caps them for every discovered provider, and a second copy
+/// already tail-caps them for every discovered host, and a second copy
 /// would be a duplicate archive entry.
-pub async fn provider_files(
-    w: &mut BundleWriter,
-    name: &str,
-    dir: &Path,
-) -> Result<(), anyhow::Error> {
+pub async fn host_files(w: &mut BundleWriter, name: &str, dir: &Path) -> Result<(), anyhow::Error> {
     // Shallow inventory of the instance dir: which sockets, locks, keys and
     // images exist. Metadata only — the walk is synchronous, so it runs on a
     // blocking thread like every other listing.
@@ -675,7 +1005,7 @@ pub async fn provider_files(
     // every VM in the bundle is identifiable at a glance (NET-052).
     let status_vm = vm_of_entry(name);
     let status =
-        tokio::task::spawn_blocking(move || provider_status(status_vm.as_deref(), &status_dir))
+        tokio::task::spawn_blocking(move || host_status(status_vm.as_deref(), &status_dir))
             .await
             .context("provider status worker")?;
     let json = serde_json_lenient::to_vec_pretty(&status).context("serializing provider status")?;
@@ -739,8 +1069,8 @@ fn volume_info(dir: &Path) -> VolumeInfo {
 }
 
 #[derive(Serialize)]
-struct ProviderStatus {
-    /// The VM this entry serves: `default` for a bare minvmd provider dir,
+struct HostStatus {
+    /// The VM this entry serves: `default` for a bare minvmd host dir,
     /// the per-name subdirectory for a named VM (`local-minvmd0/alpha`), and
     /// `None` for the native minimald backend, which hosts no VMs.
     vm: Option<String>,
@@ -757,9 +1087,9 @@ struct ProviderStatus {
     minimald_alive: Option<bool>,
 }
 
-/// The VM a provider entry names: the per-name subdirectory of a nested entry
+/// The VM a host entry names: the per-name subdirectory of a nested entry
 /// (`local-minvmd0/alpha` → `alpha`), the default VM for a bare minvmd
-/// provider dir, and `None` for the native minimald backend, which hosts no
+/// host dir, and `None` for the native minimald backend, which hosts no
 /// VMs.
 fn vm_of_entry(name: &str) -> Option<String> {
     if let Some((_, vm)) = name.rsplit_once('/') {
@@ -769,13 +1099,13 @@ fn vm_of_entry(name: &str) -> Option<String> {
         .then(|| paths::DEFAULT_VM_NAME.to_owned())
 }
 
-/// Reads the provider's lifecycle state and probes the advisory locks.
+/// Reads the host's lifecycle state and probes the advisory locks.
 ///
 /// Deliberately *not* `StateDir::effective_state()`, which repairs stale state
 /// by writing `Stopped` back — a diagnostic must never mutate what it reads.
 /// Synchronous (file locks and `std::fs`); callers run it on a blocking thread.
-fn provider_status(vm: Option<&str>, dir: &Path) -> ProviderStatus {
-    // `StateDir::new` runs `create_dir_all`, so probing a provider whose
+fn host_status(vm: Option<&str>, dir: &Path) -> HostStatus {
+    // `StateDir::new` runs `create_dir_all`, so probing a host whose
     // directory had been deleted would recreate it — leaving ghost state
     // behind and making this collector a mutation, which the paragraph above
     // says it must never be.
@@ -788,7 +1118,7 @@ fn provider_status(vm: Option<&str>, dir: &Path) -> ProviderStatus {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, None),
         Err(e) => (None, Some(e.to_string())),
     };
-    ProviderStatus {
+    HostStatus {
         vm: vm.map(str::to_owned),
         state_dir: dir.to_path_buf(),
         socket: dir.join(paths::SSH_SOCK_FILE),
@@ -845,6 +1175,44 @@ mod tests {
         files
     }
 
+    /// The retired reverse proxy's client certificate is not collected: a
+    /// bundle has no entry for the client certificate, even when the file is still on disk
+    /// from an older install (NET-109).
+    #[tokio::test]
+    async fn diag_collects_no_client_certificate() {
+        // Built from parts: `retired_surfaces_absent` scans this file for
+        // the literal name, and only this test may say it.
+        const CLIENT_CERT: &str = concat!("client", ".pem");
+        let dir = tempfile::TempDir::new().unwrap();
+        let diag = paths(dir.path());
+        tokio::fs::create_dir_all(&diag.config).await.unwrap();
+        tokio::fs::write(diag.config.join(CLIENT_CERT), b"leftover")
+            .await
+            .unwrap();
+        let out = dir.path().join("diag.tar.zst");
+        let mut w = BundleWriter::create(&out, "r", "v").await.unwrap();
+        config(&mut w, &diag).await.unwrap();
+        w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        let files = unpack(&out, "r").await;
+        for (path, contents) in &files {
+            assert!(
+                !path.contains(CLIENT_CERT),
+                "the bundle carries a {CLIENT_CERT} entry: {path}"
+            );
+            assert!(
+                !String::from_utf8_lossy(contents).contains(CLIENT_CERT),
+                "{path} names {CLIENT_CERT}"
+            );
+        }
+        assert!(
+            !files.contains_key("config/client-cert.json"),
+            "the retired CA metadata is still collected: {:?}",
+            files.keys().collect::<Vec<_>>()
+        );
+    }
+
     fn paths(state: &Path) -> DiagPaths {
         DiagPaths {
             config: state.join("config"),
@@ -882,21 +1250,21 @@ mod tests {
     }
 
     /// The strong claim ([`NO_SUCH_FILES`]) is licensed by only some of the
-    /// states a run can end in. A run that could not list the provider
+    /// states a run can end in. A run that could not list the host
     /// directory has not established absence, it has established nothing —
     /// and "I did not find out" recorded as "it is not there" is the same
     /// defect as the one this whole path exists to correct.
     #[tokio::test]
     async fn plain_absence_is_claimed_only_where_the_run_established_it() {
         let all = [
-            DaemonLogSources::ProvidersUnknown,
-            DaemonLogSources::NoProviders,
+            DaemonLogSources::HostsUnknown,
+            DaemonLogSources::NoHosts,
             DaemonLogSources::NoneFetched,
             DaemonLogSources::Nested(&["local-minvmd0"]),
             DaemonLogSources::NestedUnconfirmed(&["local-minvmd0"]),
         ];
 
-        // minvmd is a host process wherever the providers are: nothing under
+        // minvmd runs on the machine wherever the hosts are: nothing under
         // <state>/logs is the whole story in every state.
         for sources in all {
             let reasons = reasons_for(sources).await;
@@ -907,11 +1275,11 @@ mod tests {
         }
 
         // minimald may be inside the microVM, so only a *settled* empty
-        // provider list rules out its logs having gone elsewhere.
+        // host list rules out its logs having gone elsewhere.
         for sources in all {
             let reasons = reasons_for(sources).await;
             let claims_absence = reasons["logs/minimald.log*"].starts_with(NO_SUCH_FILES);
-            let established = matches!(sources, DaemonLogSources::NoProviders);
+            let established = matches!(sources, DaemonLogSources::NoHosts);
             assert_eq!(
                 claims_absence,
                 established,
@@ -1053,6 +1421,92 @@ mod tests {
         );
     }
 
+    /// BEP-015's diagnostics: a bundle carries the proxy's log beside the VM
+    /// host daemon's, and the newest audit segments, oldest dropped first.
+    #[tokio::test]
+    async fn bundle_collects_the_proxy_log_and_audit_segments() {
+        let state = tempfile::TempDir::new().unwrap();
+        let host_dir = state.path().join("providers/local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        std::fs::write(host_dir.join("run.log"), b"minvmd run\n").unwrap();
+        std::fs::write(host_dir.join(BEP_LOG_FILE), b"bep serving\n").unwrap();
+
+        let home = tempfile::TempDir::new().unwrap();
+        let audit = home.path().join("audit");
+        std::fs::create_dir_all(&audit).unwrap();
+        let count = LOG_FILES_PER_PREFIX as u64 + 2;
+        for n in 0..count {
+            std::fs::write(
+                audit.join(bep::audit::segment_name(n)),
+                format!("{{\"segment\":{n}}}\n"),
+            )
+            .unwrap();
+        }
+
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let out = out_dir.path().join("diag.tar.zst");
+        let mut w = BundleWriter::create(&out, "r", "v").await.unwrap();
+        // The audit dir is injected, so a real audit log on this host never
+        // enters the bundle.
+        logs_with_audit(
+            &mut w,
+            &paths(state.path()),
+            Some(&audit),
+            diagnostics::LOG_TAIL_CAP,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+
+        let files = unpack(&out, "r").await;
+        assert_eq!(
+            files["providers/local-minvmd0/bep.log"], b"bep serving\n",
+            "the proxy's log sits beside the VM host daemon's"
+        );
+        assert!(files.contains_key("providers/local-minvmd0/run.log"));
+        for n in 0..count {
+            let dest = format!("bep/audit/{}", bep::audit::segment_name(n));
+            let kept = n >= count - LOG_FILES_PER_PREFIX as u64;
+            assert_eq!(
+                files.contains_key(&dest),
+                kept,
+                "{dest} kept={kept}: {:?}",
+                files.keys().collect::<Vec<_>>()
+            );
+            if kept {
+                assert_eq!(files[&dest], format!("{{\"segment\":{n}}}\n").as_bytes());
+            }
+        }
+        let note = String::from_utf8(files["logs/PROVENANCE.txt"].clone()).unwrap();
+        assert!(note.contains("providers/<name>/bep.log"));
+        assert!(note.contains("bep/audit/"));
+    }
+
+    /// An empty audit directory is recorded as absent, not as an error.
+    #[tokio::test]
+    async fn an_empty_audit_dir_is_recorded_as_absent() {
+        let home = tempfile::TempDir::new().unwrap();
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let out = out_dir.path().join("diag.tar.zst");
+        let mut w = BundleWriter::create(&out, "r", "v").await.unwrap();
+        bep_audit(&mut w, Some(&home.path().join("audit")), 1024).await;
+        w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        let files = unpack(&out, "r").await;
+        let manifest: serde_json_lenient::Value =
+            serde_json_lenient::from_slice(&files["manifest.json"]).unwrap();
+        let skipped = manifest["skipped"].as_array().unwrap();
+        assert!(
+            skipped.iter().any(|s| s["what"] == "bep/audit/"
+                && s["reason"].as_str().unwrap().starts_with("absent")),
+            "{skipped:?}"
+        );
+    }
+
     /// A reader cannot tell the console mirror and the on-volume appender
     /// apart, or know what each is missing, unless the bundle says so.
     #[tokio::test]
@@ -1091,12 +1545,12 @@ mod tests {
         }
     }
 
-    /// One provider dir with two named VMs beside the guest payload and the
-    /// default VM, plus a native instance dir: `provider_dirs` must list every
+    /// One host dir with two named VMs beside the guest payload and the
+    /// default VM, plus a native instance dir: `host_dirs` must list every
     /// VM as its own entry (`local-minvmd0/<vm>`), keep the default VM as the
-    /// bare provider entry, and never report the guest payload as a VM.
+    /// bare host entry, and never report the guest payload as a VM.
     #[tokio::test]
-    async fn provider_dirs_lists_named_vms() {
+    async fn host_dirs_lists_named_vms() {
         let state = tempfile::TempDir::new().unwrap();
         let providers = state.path().join("providers");
         let minvmd = providers.join("local-minvmd0");
@@ -1105,7 +1559,7 @@ mod tests {
         }
         std::fs::create_dir_all(providers.join("local-minimald0")).unwrap();
 
-        let listed = provider_dirs(state.path()).await.unwrap();
+        let listed = host_dirs(state.path()).await.unwrap();
         let names: Vec<&str> = listed.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(
             names,
@@ -1135,18 +1589,18 @@ mod tests {
         let out = out_dir.path().join("diag.tar.zst");
         let mut w = BundleWriter::create(&out, "r", "v").await.unwrap();
 
-        // A default VM's bare provider dir and a named VM's per-name subdir.
+        // A default VM's bare host dir and a named VM's per-name subdir.
         let alpha = state.path().join("providers/local-minvmd0/alpha");
         std::fs::create_dir_all(&alpha).unwrap();
         std::fs::create_dir_all(state.path().join("providers/local-minvmd0")).unwrap();
-        provider_files(
+        host_files(
             &mut w,
             "local-minvmd0",
             &state.path().join("providers/local-minvmd0"),
         )
         .await
         .unwrap();
-        provider_files(&mut w, "local-minvmd0/alpha", &alpha)
+        host_files(&mut w, "local-minvmd0/alpha", &alpha)
             .await
             .unwrap();
         w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
@@ -1189,11 +1643,11 @@ mod tests {
         let out = out_dir.path().join("diag.tar.zst");
         let mut w = BundleWriter::create(&out, "r", "v").await.unwrap();
 
-        let provider = state.path().join("providers/local-minvmd0");
-        std::fs::create_dir_all(&provider).unwrap();
+        let host_dir = state.path().join("providers/local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
         // A sparse file: 1 MiB apparent, one 4 KiB block allocated. Write
         // without truncation so the apparent size stays 1 MiB.
-        let image = provider.join("data-vol.raw");
+        let image = host_dir.join("data-vol.raw");
         use std::io::Write as _;
         let mut f = std::fs::OpenOptions::new()
             .create(true)
@@ -1204,7 +1658,7 @@ mod tests {
         f.set_len(1024 * 1024).unwrap();
         f.write_all(&[0u8; 4096]).unwrap();
 
-        provider_files(&mut w, "local-minvmd0", &provider)
+        host_files(&mut w, "local-minvmd0", &host_dir)
             .await
             .unwrap();
         w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
@@ -1224,5 +1678,581 @@ mod tests {
             volume["allocated_bytes"].as_u64().unwrap() >= 4096,
             "the written block must be counted: {volume}"
         );
+    }
+
+    /// The host bundle carries the CLI's and minvmd's spool records
+    /// (spec 25 TEL-044) as the newest `*.jsonl` files under
+    /// `telemetry/spool/`, and nothing else from that directory.
+    #[tokio::test]
+    async fn bundle_carries_the_host_telemetry_spool() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = tmp.path().join("state");
+        let spool_dir = state.join("telemetry").join("spool");
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        std::fs::write(
+            spool_dir.join("minimal-cli-1-1700000000000.jsonl"),
+            b"{\"resourceSpans\":[{\"scopeSpans\":[{\"spans\":[{\"name\":\"cmd\"}]}]}]}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            spool_dir.join("minvmd-2-1700000000000.jsonl"),
+            b"{\"resourceLogs\":[]}\n",
+        )
+        .unwrap();
+        std::fs::write(spool_dir.join("notes.txt"), b"not a spool file").unwrap();
+        let paths = DiagPaths {
+            config: tmp.path().join("config"),
+            state: state.clone(),
+            cache: tmp.path().join("cache"),
+            mesh_enrolment: tmp.path().join("mesh"),
+            cwd: tmp.path().to_path_buf(),
+        };
+        let out = tmp.path().join("bundle.tar.zst");
+        let mut w = BundleWriter::create(&out, "root", "test").await.unwrap();
+        spool(&mut w, &paths, 1 << 20).await.unwrap();
+        w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        let files = unpack(&out, "root").await;
+        let cli = files
+            .get("telemetry/spool/minimal-cli-1-1700000000000.jsonl")
+            .unwrap_or_else(|| panic!("missing the CLI spool: {:?}", files.keys()));
+        assert!(std::str::from_utf8(cli).unwrap().contains("resourceSpans"));
+        assert!(files.contains_key("telemetry/spool/minvmd-2-1700000000000.jsonl"));
+        assert!(
+            !files.contains_key("telemetry/spool/notes.txt"),
+            "only *.jsonl spool files travel"
+        );
+    }
+
+    /// `MINIMAL_OTEL_SPOOL_DIR` names the spool (the writer's rule), the
+    /// state directory is the default, and an empty value is unset.
+    #[test]
+    fn spool_dir_honours_the_override() {
+        let paths = DiagPaths {
+            config: PathBuf::from("/c"),
+            state: PathBuf::from("/s"),
+            cache: PathBuf::from("/k"),
+            mesh_enrolment: PathBuf::from("/m"),
+            cwd: PathBuf::from("/w"),
+        };
+        assert_eq!(spool_dir(&paths, None), PathBuf::from("/s/telemetry/spool"));
+        assert_eq!(
+            spool_dir(&paths, Some("".into())),
+            PathBuf::from("/s/telemetry/spool")
+        );
+        assert_eq!(
+            spool_dir(&paths, Some("/elsewhere/spool".into())),
+            PathBuf::from("/elsewhere/spool")
+        );
+    }
+
+    /// The cap is per producer: six newer minvmd files do not push the
+    /// CLI's older file out, and the oldest minvmd file is the one dropped.
+    #[tokio::test]
+    async fn spool_keeps_the_newest_files_of_each_producer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let spool_dir = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        let base =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let put = |name: &str, age_s: u64| {
+            let p = spool_dir.join(name);
+            std::fs::write(&p, b"{}\n").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&p)
+                .unwrap()
+                .set_modified(base - std::time::Duration::from_secs(age_s))
+                .unwrap();
+        };
+        put("minimal-cli-7-1700000000000.jsonl", 100);
+        for n in 0..6u64 {
+            put(&format!("minvmd-9-1700000000000-{}.jsonl", n + 1), 60 - n);
+        }
+        let out = tmp.path().join("bundle.tar.zst");
+        let mut w = BundleWriter::create(&out, "root", "test").await.unwrap();
+        spool_in(&mut w, &spool_dir, 1 << 20, &[]).await.unwrap();
+        w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        let files = unpack(&out, "root").await;
+        assert!(
+            files.contains_key("telemetry/spool/minimal-cli-7-1700000000000.jsonl"),
+            "the older CLI file survives minvmd's churn: {:?}",
+            files.keys()
+        );
+        let minvmd: Vec<_> = files
+            .keys()
+            .filter(|k| k.starts_with("telemetry/spool/minvmd-"))
+            .collect();
+        assert_eq!(minvmd.len(), LOG_FILES_PER_PREFIX, "{minvmd:?}");
+        assert!(
+            !files.contains_key("telemetry/spool/minvmd-9-1700000000000-1.jsonl"),
+            "the oldest minvmd file is the one dropped: {:?}",
+            files.keys()
+        );
+    }
+
+    /// TEL-044's two security claims over the host spool collector: a spool
+    /// line holding the configured exporter header value (under a harmless
+    /// attribute name) and a secret-shaped attribute reaches the bundle
+    /// without either value.
+    #[tokio::test]
+    async fn a_host_bundle_never_carries_a_header_value_or_a_secret_attribute() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let spool_dir = tmp.path().join("spool");
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        std::fs::write(
+            spool_dir.join("minimal-cli-1-1700000000000.jsonl"),
+            concat!(
+                r#"{"resourceSpans":[{"scopeSpans":[{"spans":[{"name":"cmd","attributes":["#,
+                r#"{"key":"note","value":{"stringValue":"hcaik_s3cr3tINGEST"}},"#,
+                r#"{"key":"vendor.api_key","value":{"stringValue":"opensesame"}},"#,
+                r#"{"key":"cmd.name","value":{"stringValue":"build"}}]}]}]}]}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let headers = diagnostics::redact::exporter_header_values(|n| {
+            (n == "MINIMAL_OTEL_EXPORTER_OTLP_HEADERS")
+                .then(|| "x-honeycomb-team=hcaik_s3cr3tINGEST".to_owned())
+        });
+        let out = tmp.path().join("bundle.tar.zst");
+        let mut w = BundleWriter::create(&out, "root", "test").await.unwrap();
+        spool_in(&mut w, &spool_dir, 1 << 20, &headers)
+            .await
+            .unwrap();
+        w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        let files = unpack(&out, "root").await;
+        let body = std::str::from_utf8(&files["telemetry/spool/minimal-cli-1-1700000000000.jsonl"])
+            .unwrap();
+        assert!(body.contains("\"build\""), "the record travels: {body}");
+        for (path, bytes) in &files {
+            let text = String::from_utf8_lossy(bytes);
+            assert!(
+                !text.contains("hcaik_s3cr3tINGEST"),
+                "header value in {path}"
+            );
+            assert!(!text.contains("opensesame"), "secret attribute in {path}");
+        }
+    }
+
+    /// TEL-044 per producer: a header that only the producer's
+    /// environment holds (minvmd started with it, the `min bug` shell
+    /// without it) is scrubbed from that producer's spool file while the
+    /// producer runs. Linux reads the producer's environment through /proc;
+    /// the macOS read (`sysctl(KERN_PROCARGS2)`) is proved in `diagnostics`
+    /// (`a_live_producers_headers_are_scrubbed_from_its_spool_file`), since
+    /// the kernel there withholds a platform binary's environment and this
+    /// test's `sleep` producer is one.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_producers_own_header_value_never_reaches_the_host_bundle() {
+        let mut producer = std::process::Command::new("sleep")
+            .arg("30")
+            .env(
+                "OTEL_EXPORTER_OTLP_HEADERS",
+                "authorization=Bearer%20minvmdONLYtoken42",
+            )
+            .spawn()
+            .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let spool_dir = tmp.path().join("spool");
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        let name = format!("minvmd-{}-1700000000000.jsonl", producer.id());
+        std::fs::write(
+            spool_dir.join(&name),
+            concat!(
+                r#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"body":{"stringValue":"sent minvmdONLYtoken42"},"#,
+                r#""attributes":[{"key":"vm","value":{"stringValue":"keep-me"}}]}]}]}]}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let out = tmp.path().join("bundle.tar.zst");
+        let mut w = BundleWriter::create(&out, "root", "test").await.unwrap();
+        spool_in(&mut w, &spool_dir, 1 << 20, &[]).await.unwrap();
+        producer.kill().unwrap();
+        producer.wait().unwrap();
+        w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        let files = unpack(&out, "root").await;
+        let body = std::str::from_utf8(&files[&format!("telemetry/spool/{name}")]).unwrap();
+        assert!(body.contains("keep-me"), "the record travels: {body}");
+        assert!(!body.contains("minvmdONLYtoken42"), "{body}");
+    }
+
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        move |n| pairs.iter().find(|(k, _)| k == n).map(|(_, v)| v.into())
+    }
+
+    /// TEL-051: the bundle records the switch and the variable that decided
+    /// it, each signal's exporter, each endpoint as its origin only, the
+    /// spool, and the trace id of the newest `cmd` span in the CLI spool.
+    #[tokio::test]
+    async fn the_bundle_records_the_telemetry_state() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let spool_dir = tmp.path().join("spool");
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        std::fs::write(
+            spool_dir.join("minimal-cli-1-1700000000000.jsonl"),
+            concat!(
+                r#"{"resourceSpans":[{"scopeSpans":[{"spans":[{"traceId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","name":"cmd","endTimeUnixNano":"200"}]}]}]}"#,
+                "\n",
+                r#"{"resourceSpans":[{"scopeSpans":[{"spans":[{"traceId":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","name":"cmd","endTimeUnixNano":"300"},{"traceId":"cccccccccccccccccccccccccccccccc","name":"rpc","endTimeUnixNano":"400"}]}]}]}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let paths = paths(tmp.path());
+        let dir = spool_dir.to_str().unwrap();
+        let state = telemetry_state(
+            &paths,
+            env_of(&[
+                ("MINIMAL_TELEMETRY", "1"),
+                ("MINIMAL_OTEL_SPOOL_DIR", dir),
+                (
+                    "MINIMAL_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                    "https://u:p@collector.example:4318/ingest/abc?key=v",
+                ),
+                ("MINIMAL_OTEL_EXPORTER_OTLP_HEADERS", "x-key=s3cr3tvalue"),
+                ("MINIMAL_OTEL_LOGS_EXPORTER", "none"),
+            ]),
+        )
+        .await;
+        assert!(state.enabled);
+        assert_eq!(state.source, TELEMETRY_STATE_SOURCE, "whose state it is");
+        assert_eq!(state.decided_by, "MINIMAL_TELEMETRY");
+        assert!(state.traces.exporting);
+        assert_eq!(
+            state.traces.endpoint.as_deref(),
+            Some("https://collector.example:4318")
+        );
+        assert!(!state.logs.exporting && state.logs.exporter_none);
+        assert!(state.spool);
+        assert_eq!(state.spool_dir, spool_dir);
+        assert_eq!(state.spool_dir_note, SPOOL_DIR_NOTE);
+        assert_eq!(
+            state.newest_cmd_trace_id.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+        let json = serde_json_lenient::to_string(&state).unwrap();
+        for leak in ["u:p", "ingest", "key=v", "s3cr3tvalue"] {
+            assert!(!json.contains(leak), "{leak} in {json}");
+        }
+
+        let off = telemetry_state(
+            &paths,
+            env_of(&[("MINIMAL_TELEMETRY", "1"), ("DO_NOT_TRACK", "0")]),
+        )
+        .await;
+        assert!(!off.enabled && !off.spool && !off.traces.exporting);
+        assert_eq!(off.decided_by, "DO_NOT_TRACK");
+        assert_eq!(off.newest_cmd_trace_id, None);
+
+        // A base endpoint with a query is refused (mlog's rule): recorded as
+        // refused, with no endpoint.
+        let refused = telemetry_state(
+            &paths,
+            env_of(&[
+                ("MINIMAL_TELEMETRY", "1"),
+                (
+                    "MINIMAL_OTEL_EXPORTER_OTLP_ENDPOINT",
+                    "https://c.example/x?k=v",
+                ),
+            ]),
+        )
+        .await;
+        assert!(refused.traces.refused && !refused.traces.exporting);
+        assert_eq!(refused.traces.endpoint, None);
+    }
+
+    /// The bundle path the child of
+    /// [`a_bundle_collected_with_telemetry_on_carries_no_secret`] writes;
+    /// set only in that child.
+    const T18_OUT: &str = "DIAG_T18_BUNDLE_OUT";
+    /// The state and config directories that child collects from.
+    const T18_STATE: &str = "DIAG_T18_STATE_DIR";
+    const T18_CONFIG: &str = "DIAG_T18_CONFIG_DIR";
+
+    /// Not a test on its own: the process
+    /// [`a_bundle_collected_with_telemetry_on_carries_no_secret`] spawns (this
+    /// test binary, with telemetry settings in its real environment) to run
+    /// `min bug`'s collection, [`crate::diag::cmd_bug`], host side only. Run
+    /// on its own it returns at once.
+    #[tokio::test]
+    #[ignore = "the child process of a_bundle_collected_with_telemetry_on_carries_no_secret"]
+    async fn telemetry_on_bundle_child() {
+        let Some(out) = std::env::var_os(T18_OUT) else {
+            return;
+        };
+        let dir = |name| PathBuf::from(std::env::var_os(name).unwrap());
+        let global = crate::GlobalArgs {
+            repo_dir: None,
+            minimal_dir: Some(dir(T18_STATE)),
+            config_dir: Some(dir(T18_CONFIG)),
+            provider: None,
+            no_input: true,
+            vm: None,
+        };
+        let args = crate::diag::BugArgs {
+            output: Some(PathBuf::from(out)),
+            no_guest: true,
+            guest_timeout_secs: 5,
+            log_tail_bytes: diagnostics::LOG_TAIL_CAP,
+            upload: false,
+            portal: crate::diag::PortalArgs {
+                context: None,
+                endpoint: crate::diag::upload::DEFAULT_ENDPOINT.to_owned(),
+            },
+        };
+        // Boxed: `cmd_bug` is a large future (clippy::large_futures).
+        Box::pin(crate::diag::cmd_bug(&global, args)).await.unwrap();
+    }
+
+    /// Plan T18 (spec 25 TEL-044, TEL-051): `min bug` run with telemetry on
+    /// carries the spool, names the telemetry settings without their values,
+    /// and lets no secret through. The collection runs in a child process
+    /// whose real environment holds the settings (an endpoint with
+    /// credentials, a tenant path and a query; exporter headers, one
+    /// percent-encoded), because `min bug` reads its own environment; the
+    /// spool holds a header value in free text, a secret-shaped attribute, a
+    /// header-like attribute and a remote URL with a token in it. Every file
+    /// in the bundle is then opened and searched for each secret.
+    #[tokio::test]
+    async fn a_bundle_collected_with_telemetry_on_carries_no_secret() {
+        const SECRETS: &[&str] = &[
+            "ingestPASSWORD9",
+            "TENANTsecret77",
+            "QUERYsecret55",
+            "hcaik_HEADERsecret01",
+            "BEARERsecret02",
+            "opensesame-api-k3y",
+            "AUTHZsecret03",
+            "ghp_REMOTEtoken1234567890abcdefABCDEF12",
+        ];
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = tmp.path().join("state");
+        let config = tmp.path().join("config");
+        let spool_dir = tmp.path().join("spool");
+        for d in [&state, &config, &spool_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(
+            spool_dir.join("minimal-cli-1-1700000000000.jsonl"),
+            concat!(
+                r#"{"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"minimal-cli"}}]},"#,
+                r#""scopeSpans":[{"spans":[{"traceId":"0af7651916cd43dd8448eb211c80319c","spanId":"b7ad6b7169203331","#,
+                r#""name":"cmd","endTimeUnixNano":"200","attributes":["#,
+                r#"{"key":"cmd.name","value":{"stringValue":"ls"}},"#,
+                r#"{"key":"note","value":{"stringValue":"sent hcaik_HEADERsecret01 to the collector"}},"#,
+                r#"{"key":"vendor.api_key","value":{"stringValue":"opensesame-api-k3y"}},"#,
+                r#"{"key":"http.request.header.authorization","value":{"stringValue":"Bearer AUTHZsecret03"}},"#,
+                r#"{"key":"vcs.remote","value":{"stringValue":"https://x-access-token:ghp_REMOTEtoken1234567890abcdefABCDEF12@github.com/o/r.git"}}"#,
+                r#"]}]}]}]}"#,
+                "\n",
+                r#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"body":{"stringValue":"export failed: BEARERsecret02 refused"}}]}]}]}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let out = tmp.path().join("bundle.tar.zst");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child.args([
+            "--exact",
+            "diag::collect::tests::telemetry_on_bundle_child",
+            "--ignored",
+        ]);
+        for (k, _) in std::env::vars_os() {
+            let name = k.to_string_lossy();
+            if name.starts_with("OTEL_")
+                || name.starts_with("MINIMAL_")
+                || name == "DO_NOT_TRACK"
+                || name == "TRACEPARENT"
+            {
+                child.env_remove(&k);
+            }
+        }
+        child
+            .env(T18_OUT, &out)
+            .env(T18_STATE, &state)
+            .env(T18_CONFIG, &config)
+            .env("MINIMAL_TELEMETRY", "1")
+            .env("MINIMAL_OTEL_SPOOL_DIR", &spool_dir)
+            .env(
+                "MINIMAL_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                "https://ingest:ingestPASSWORD9@collector.example:4318/TENANTsecret77/v1/traces",
+            )
+            .env(
+                "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+                "https://collector.example:4318/v1/logs?key=QUERYsecret55",
+            )
+            .env(
+                "MINIMAL_OTEL_EXPORTER_OTLP_HEADERS",
+                "x-honeycomb-team=hcaik_HEADERsecret01,authorization=Bearer%20BEARERsecret02",
+            );
+        let status = child.status().unwrap();
+        assert!(status.success(), "the collecting child failed: {status}");
+
+        let files = {
+            let bytes = std::fs::read(&out).unwrap();
+            let decoder = async_compression::tokio::bufread::ZstdDecoder::new(&bytes[..]);
+            let mut entries = async_tar::Archive::new(decoder).entries().unwrap();
+            let mut files = BTreeMap::new();
+            while let Some(entry) = entries.next().await {
+                let mut entry = entry.unwrap();
+                let path = entry.path().unwrap().to_string_lossy().into_owned();
+                let mut contents = Vec::new();
+                entry.read_to_end(&mut contents).await.unwrap();
+                // Drop the bundle's root directory.
+                let rel = path
+                    .split_once('/')
+                    .map_or(path.clone(), |(_, r)| r.to_owned());
+                files.insert(rel, contents);
+            }
+            files
+        };
+
+        // The spool travels, its harmless attribute intact.
+        let spool = files
+            .get("telemetry/spool/minimal-cli-1-1700000000000.jsonl")
+            .unwrap_or_else(|| panic!("no spool file in {:?}", files.keys()));
+        let spool = String::from_utf8_lossy(spool);
+        assert!(
+            spool.contains("\"cmd.name\"") && spool.contains("\"ls\""),
+            "{spool}"
+        );
+        // Every secret-bearing value is still there, redacted in place:
+        // scrubbed, not dropped with its record.
+        for kept in [
+            "\"vendor.api_key\"",
+            "\"vcs.remote\"",
+            "@github.com/o/r.git",
+            "export failed:",
+        ] {
+            assert!(spool.contains(kept), "{kept} missing: {spool}");
+        }
+        assert!(spool.matches("<redacted").count() >= 5, "{spool}");
+
+        // The settings are named, their values are not.
+        let telemetry: serde_json_lenient::Value =
+            serde_json_lenient::from_slice(&files["host/telemetry.json"]).unwrap();
+        assert_eq!(telemetry["enabled"], true, "{telemetry}");
+        assert_eq!(
+            telemetry["traces"]["endpoint"],
+            "https://collector.example:4318"
+        );
+        let env = String::from_utf8_lossy(&files["host/env.json"]);
+        for name in [
+            "MINIMAL_TELEMETRY",
+            "MINIMAL_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+            "MINIMAL_OTEL_EXPORTER_OTLP_HEADERS",
+        ] {
+            assert!(
+                env.contains(name),
+                "{name} is not named in host/env.json: {env}"
+            );
+        }
+
+        // No secret anywhere in the bundle.
+        for (path, bytes) in &files {
+            let text = String::from_utf8_lossy(bytes);
+            for secret in SECRETS {
+                assert!(!text.contains(secret), "{secret} in {path}:\n{text}");
+            }
+        }
+    }
+
+    /// TEL-051: the bundle reads one spool directory, the one `min bug`'s
+    /// own environment names, and says so. A spool a producer pinned through
+    /// its own `MINIMAL_OTEL_SPOOL_DIR` stays out, and `host/telemetry.json`
+    /// records the directory read with [`SPOOL_DIR_NOTE`].
+    #[tokio::test]
+    async fn a_spool_pinned_only_in_another_process_is_not_collected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let line = concat!(
+            r#"{"resourceSpans":[{"scopeSpans":[{"spans":[{"traceId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","name":"cmd","endTimeUnixNano":"1"}]}]}]}"#,
+            "\n"
+        );
+        let ours = tmp.path().join("ours");
+        let theirs = tmp.path().join("pinned-by-a-unit");
+        for d in [&ours, &theirs] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(ours.join("minimal-cli-1-1700000000000.jsonl"), line).unwrap();
+        std::fs::write(theirs.join("minvmd-2-1700000000000.jsonl"), line).unwrap();
+
+        let paths = paths(tmp.path());
+        let vars = [("MINIMAL_OTEL_SPOOL_DIR", ours.to_str().unwrap())];
+        let env = env_of(&vars);
+        let out = tmp.path().join("bundle.tar.zst");
+        let mut w = BundleWriter::create(&out, "root", "test").await.unwrap();
+        spool_in(
+            &mut w,
+            &spool_dir(&paths, env("MINIMAL_OTEL_SPOOL_DIR")),
+            1 << 20,
+            &[],
+        )
+        .await
+        .unwrap();
+        w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        let files = unpack(&out, "root").await;
+        assert!(files.contains_key("telemetry/spool/minimal-cli-1-1700000000000.jsonl"));
+        assert!(
+            !files.keys().any(|k| k.contains("minvmd-2-1")),
+            "only the directory min bug resolves is read: {:?}",
+            files.keys()
+        );
+
+        let state = telemetry_state(&paths, env).await;
+        assert_eq!(state.spool_dir, ours);
+        let json = serde_json_lenient::to_string(&state).unwrap();
+        assert!(
+            json.contains(&format!("\"spool_dir_note\":\"{SPOOL_DIR_NOTE}\"")),
+            "{json}"
+        );
+    }
+
+    /// The deciding-variable mirror in [`telemetry_state`] says on exactly
+    /// where mlog's own decision spools (with no exporter set to `none`,
+    /// spooling is the switch).
+    #[tokio::test]
+    async fn the_mirrored_switch_agrees_with_mlog() {
+        let paths = paths(Path::new("/nonexistent"));
+        let cases: &[&[(&str, &str)]] = &[
+            &[],
+            &[("MINIMAL_TELEMETRY", "1")],
+            &[("MINIMAL_TELEMETRY", "TRUE")],
+            &[("MINIMAL_TELEMETRY", "yes")],
+            &[("MINIMAL_TELEMETRY", "0")],
+            &[("MINIMAL_TELEMETRY", "maybe")],
+            &[("MINIMAL_TELEMETRY", "1"), ("DO_NOT_TRACK", "false")],
+            &[("MINIMAL_TELEMETRY", "1"), ("OTEL_SDK_DISABLED", "TRUE")],
+            &[("MINIMAL_TELEMETRY", "1"), ("OTEL_SDK_DISABLED", "1")],
+        ];
+        for case in cases {
+            let state = telemetry_state(&paths, env_of(case)).await;
+            let var = env_of(case);
+            let mlog_on =
+                mlog::otel::guest_exports(|n| var(n).and_then(|v| v.into_string().ok())).spool;
+            assert_eq!(state.enabled, mlog_on, "{case:?}");
+        }
+    }
+
+    #[test]
+    fn a_trace_lookup_passes_over_torn_lines() {
+        let text = "torn\"}]}\n{\"resourceSpans\":[{\"scopeSpans\":[{\"spans\":[{\"traceId\":\"dd\",\"name\":\"cmd\"}]}]}]}\n";
+        assert_eq!(newest_cmd_trace_id_in(text).as_deref(), Some("dd"));
+        assert_eq!(newest_cmd_trace_id_in("{}\n"), None);
     }
 }

@@ -15,6 +15,7 @@
 //! - [`capture`] — bounded subprocess output capture for command-shaped
 //!   collectors
 //! - [`logs`] — newest-first selection of rotated log files
+//! - [`spool`] — the local telemetry spool's files, scrubbed, into a bundle
 //! - [`kmsg`] — the kernel ring buffer, read without `dmesg`
 //! - [`disk`] — filesystem capacity probes
 //! - [`system`] — host identity/capability probe (OS, kernel, KVM, disks)
@@ -40,6 +41,7 @@ pub mod power;
 #[cfg(unix)]
 pub mod procs;
 pub mod redact;
+pub mod spool;
 #[cfg(unix)]
 pub mod system;
 #[cfg(unix)]

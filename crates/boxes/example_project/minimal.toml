@@ -1,0 +1,148 @@
+# A minimal.toml built for demoing `[session]` composition. The
+# `[session]` block contributes three packages plus a handful of
+# project-level vars chosen to exercise every branch of the user-
+# policy prompt logic.
+#
+# Try it:
+#   cargo build -p minimal -p minimald
+#   ./target/debug/min session activate crates/boxes/example_project --attach
+#
+# Then inside the session:
+#
+#   # Project-declared package (Source::Project):
+#   mermaid-ascii -f "$DIAGRAM"
+#
+#   # Project-declared vars (Source::Project):
+#   echo "$DIAGRAM $LANG $TZ"
+#
+#   # Package-declared vars (Source::Package "go"): the `go`
+#   # package sets these via `env_state_wiring` — the composer
+#   # picked them up automatically without them being named in
+#   # this file.
+#   echo "$GOCACHE $GOMODCACHE"     # /state/gocache /state/gomodcache
+#
+# Demo punchline: comment out the `[session]` block, re-activate,
+# re-run — every command breaks. `mermaid-ascii` is `command not
+# found`; `$DIAGRAM`/`$GOCACHE`/`$GOMODCACHE` are all unset.
+# Composition is doing real work.
+#
+# ---
+#
+# What should prompt (and what shouldn't) on the first activation
+# after wiping `~/.config/minimal/user_policy.toml`:
+#
+#   DIAGRAM       — no prompt. Hardcoded literal; `carries_user_data`
+#                   is false, so the gate auto-approves without
+#                   touching the user's policy.
+#   LANG          — prompts if the host has `LANG` set (env-hit
+#                   path → `carries_user_data = true`). No prompt if
+#                   `LANG` is unset (fallback default → no user
+#                   data crosses the boundary).
+#   TZ            — usually no prompt. Most systems leave `TZ`
+#                   unset, so the fallback default `"UTC"` kicks in
+#                   and the gate skips it. Set `TZ=America/New_York`
+#                   in your shell and re-activate to see the prompt
+#                   path.
+#   GOCACHE       — no prompt. Package `env_state_wiring` values
+#   GOMODCACHE      are `Specified` (the package attr declares the
+#                   literal), so `carries_user_data` is false.
+#   hooks         — prompts once, for the project as a whole. A
+#                   project's lifecycle hooks are arbitrary code it
+#                   asked to run inside your session, so the gate
+#                   asks before any of them run, and the answer is
+#                   per-project rather than per-script. Approve
+#                   permanently and it lands in `[hooks] allow` in
+#                   `user_policy.toml`; decline and the session
+#                   still comes up, just without them. Loadout
+#                   hooks are not gated — those are your own files.
+#
+# `min session activate --no-hooks` skips the question and the
+# hooks entirely, for the run where you just want the box.
+#
+# `claude-code` also contributes a patch source that resolves to
+# `~/.claude`. If you don't have that directory the client emits a
+# synthetic `Ignored` verdict so the daemon doesn't reject the
+# whole activation with "verdict missing entry for pending patch".
+
+[upstream]
+repo = "https://github.com/gominimal/pkgs"
+branch = "unstable"
+# Reused from the workspace's own `minimal.toml` — guaranteed to
+# resolve as long as that pin does. Keep this in sync with
+# `.minimal/minimal.toml`; a drifted pin that upstream has since
+# rebased away fails at checkout with "invalid reference".
+locked_commit = "c854d6b1e0fdc67efd84fc664251079c0719987d"
+
+[stack]
+use = "shell"
+
+[session]
+# Unioned with the launcher baseline (`base`, `coreutils`, `socat`)
+# and with anything a client loadout adds.
+#
+# `go` is included not because we run it here, but because it
+# declares two `env_state_wiring` entries (`GOCACHE`,
+# `GOMODCACHE`). Adding it demonstrates a package contributing
+# vars to the session automatically — the composer reads them off
+# the package's build attrs and routes them through the same
+# `PatchPolicy`/`VarsPolicy` gate every other contribution goes
+# through.
+packages = ["mermaid-ascii", "go"]
+
+[session.vars]
+# Hardcoded literal — auto-approves at the gate because
+# `carries_user_data` is false (no env lookup happened, so nothing
+# from the host is crossing into the sandbox). The user's policy
+# is never consulted for this var.
+DIAGRAM = "arch.mmd"
+
+# Inherit-with-default: reads from the host env when set, falls
+# back to `en_US.UTF-8` otherwise. On most systems `LANG` is set, so
+# activation prompts once for approval. Add
+# `[vars] allow = ["LANG"]` (or hit "Allow permanent" at the
+# prompt) to skip the prompt on the next run.
+LANG = { inherit = true, default = "en_US.UTF-8" }
+
+# Same shape as `LANG`, but `TZ` is typically unset on Linux hosts
+# — so this branch usually takes the fallback path and no prompt
+# fires. Export `TZ=America/New_York` in your shell and re-run to
+# force the env-hit path.
+TZ = { inherit = true, default = "UTC" }
+
+# One hook covering all four transitions, so each can be observed
+# without arranging anything. Scripts run under POSIX `sh` unless they
+# open with a shebang, and every command here is a shell builtin or a
+# coreutil the baseline already carries — so nothing depends on a
+# package being installed or has a failure mode of its own.
+#
+# The two transitions with nowhere to print (`on_activate`,
+# `on_detach`) leave a marker file in `/home` instead, which you can
+# see from inside the session; the two that do print, print.
+#
+# WHERE THE OUTPUT GOES differs by transition, and it is the part
+# that surprises people:
+#
+#   on_attach              — your terminal. It runs on the PTY you
+#                            are attached to, printing just after
+#                            the session binds, so you see it
+#                            directly.
+#   the other three        — the daemon log, not your terminal.
+#                            There is no PTY to write to at any of
+#                            them: activate and destroy have none,
+#                            and a detach is the terminal leaving.
+#                            Look for `lifecycle hook ran` records.
+#
+# A script can also read `$MINIMAL_HOOK_EVENT`, one of the metadata
+# variables the runner sets alongside the session's own
+# environment — see `MINIMAL_HOOK_SOURCE_KIND`,
+# `MINIMAL_HOOK_SOURCE_NAME`, `MINIMAL_HOOK_INDEX`, and
+# `MINIMAL_HOOK_COUNT` for the rest.
+#
+# `min session hooks <session>` lists these back, showing where
+# each was declared and what will actually run.
+[[session.lifecycle_hooks]]
+description = "print at each transition"
+on_activate = { type = "inline", value = "touch /home/alpha.txt" }
+on_attach   = { type = "inline", value = "echo \"beta\"" }
+on_detach   = { type = "inline", value = "touch /home/gamma.txt" }
+on_destroy  = { type = "inline", value = "echo \"omega\"" }

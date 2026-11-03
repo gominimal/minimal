@@ -75,14 +75,16 @@
 //! A socket in the pool is a lane onto the host for the box whose share
 //! holds it, so binding one is gated: **T69 is the only task that may
 //! bind a socket on the peer** — it carries the per-source caps and the
-//! pre-screen that holds a share before the stack assigns a listener —
-//! and not even T69 binds on a production boot yet. The credentialed-
-//! only gate rule (NET-145, T45, #1665) is still ahead, so the
-//! supervisor wires [`NoBoxes`] there: no row, no share, no socket, and
-//! a box's connection to the proxy's address is answered the way a
-//! stack with no listener answers it. Only the stand-in's own boot
-//! (`MINVMD_BEP_STUB`, a test/e2e surface) wires rows, and only where a
-//! lane asked for it.
+//! pre-screen that holds a share before the stack assigns a listener.
+//! The credentialed-only gate is `egress::proxy_lane_admits` (T45,
+//! #1885). `bep_box_source` in `minvmd`'s `cmd/run.rs` picks the source
+//! the supervisor wires. A boot with no listening acceptor wires
+//! [`NoBoxes`]: no row, no share, no socket, and a box's connection to
+//! the proxy's address is answered the way a stack with no listener
+//! answers it. A boot whose `bep serve` listens wires
+//! `CredentialedBoxes`, and only the registered rows that declare a
+//! credentialed upstream get a share (§7.1). When the acceptor stops
+//! listening, that source gives no rows again, and the shares go.
 //!
 //! The peer is silent until spoken to. It originates no frame except in
 //! answer to one that addressed it — the ARP reply, the TCP reset for an
@@ -331,12 +333,12 @@ pub trait BepBoxSource: Send + Sync {
 
 /// A box source with no rows: the wiring that binds nothing. A socket in
 /// the pool is a lane onto the host for the box whose share holds it, so
-/// until the credentialed-only gate rule (NET-145, T45, #1665) decides who
-/// may reach one, a production boot hands the peer this source — no row,
-/// no share, no socket — and a box's connection to the proxy's address
-/// meets the stack's own reset, the answer an acceptor that is down is
-/// specified to give. The stand-in's own boot is the one wiring that
-/// registers rows, and it runs only where a lane asked for it.
+/// where the gate `egress::proxy_lane_admits` (T45, #1885) decides who
+/// may reach one, a boot with no listening acceptor hands the peer this
+/// source — no row, no share, no socket — and a box's connection to the
+/// proxy's address meets the stack's own reset, the answer an acceptor
+/// that is down is specified to give. A boot whose `bep serve` listens
+/// uses `CredentialedBoxes` in `minvmd` instead.
 #[derive(Debug, Default)]
 pub struct NoBoxes;
 
@@ -1652,7 +1654,7 @@ impl BepStack {
 }
 
 impl Drop for BepStack {
-    /// The stack's teardown flush, mirroring the relay's `SessionGate::Drop`
+    /// The stack's teardown flush, mirroring the relay's `BoxGate::Drop`
     /// half: every count its audit still holds unsaid is said now, in the one
     /// audit format, because nothing after the stack exists to carry one. The
     /// peer's stack lives for the daemon's lifetime, so this is the whole
@@ -2515,6 +2517,10 @@ pub mod test_util {
 
 #[cfg(test)]
 mod tests {
+    // The Miri rule for this module: a test that creates a temp dir or binds
+    // a socket is `#[cfg_attr(miri, ignore)]`, because Miri's isolation has
+    // no `mkdir` and refuses the socket calls. A test driven in memory
+    // through `BepDevice::pair()` stays ungated, so Miri still interprets it.
     use super::*;
     use smoltcp::socket::tcp::State;
     use smoltcp::wire::{
@@ -3049,6 +3055,7 @@ mod tests {
     /// and its drop aborts the socket connection and the poll task. We stand in
     /// for gvproxy with a bound listener that accepts the connect upgrade; the
     /// peer dials it, sends the upgrade head, and then runs until dropped.
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn stack_peer_stops_with_the_switch() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3127,6 +3134,7 @@ mod tests {
     /// covers several poll periods, an idle peer writes nothing onto the
     /// switch socket: no gratuitous ARP at attach, no probe, nothing — and
     /// with no registered box, no socket either.
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn idle_peer_emits_no_frames() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3161,6 +3169,7 @@ mod tests {
     /// back length-framed on the same socket, addressed to the asking box.
     /// The length prefix is written one byte at a time so a short read of it
     /// cannot end the peer.
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn spawned_peer_answers_arp_over_the_socket() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3559,6 +3568,7 @@ mod tests {
     /// connections arrive at the acceptor from the box's own switch address
     /// — the delivery header's source — with the per-boot token and the
     /// fixed header ahead of any flow byte, and one connection each.
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn connections_past_the_per_source_cap_are_reset() {
         let cap = 2;
@@ -3632,6 +3642,7 @@ mod tests {
     /// filled from the attachment the row holds — and a box-plane source
     /// whose row stands while its attachment does not is aborted, nothing
     /// delivered for it.
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn delivered_header_box_id_matches_attachment() {
         let (mut h, _proxy_sock, _token) = harness(1, Stall::None, true).await;
@@ -3731,6 +3742,7 @@ mod tests {
     /// interface sees the burst — A's two extra SYNs are refused there —
     /// so B's same-turn SYN still finds its own listener; A's
     /// exhaustion costs A alone.
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn one_boxs_exhaustion_never_starves_a_sibling() {
         let (mut h, _proxy_sock, _token) = harness(1, Stall::None, true).await;
@@ -3794,6 +3806,7 @@ mod tests {
     /// window is the brake — it can send no more — while the sibling's
     /// fresh flow still round-trips: the stack never waited on the one
     /// stalled connection.
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn a_slow_acceptor_stalls_one_flow_not_the_stack() {
         let cap = 2;
@@ -3880,6 +3893,7 @@ mod tests {
     /// pool's socket aborts: the box's client sees its connection reset,
     /// and the slot returns to its share — the next connection is reset the
     /// same way, and the share never leaks away.
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn a_down_acceptor_resets_the_boxs_connection() {
         let (mut h, _proxy_sock, _token) = harness(1, Stall::None, false).await;
@@ -3919,6 +3933,7 @@ mod tests {
     /// NET-132/T69: a withdrawn row takes its share with it — its live
     /// flows are aborted, the listening slots are removed, and the pool
     /// holds the rows that remain.
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn a_withdrawn_boxs_share_is_withdrawn() {
         let (mut h, _proxy_sock, _token) = harness(1, Stall::None, true).await;
@@ -3961,6 +3976,7 @@ mod tests {
     /// bytes: the flow's socket is aborted — its reset is the one frame
     /// that leaves for it — and no frame for it leaves the peer
     /// afterwards, not even when the owed bytes arrive.
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn a_withdrawn_rows_flow_sends_no_frame_after_its_reset() {
         let subnet = SwitchSubnet::default();
@@ -4045,6 +4061,7 @@ mod tests {
     /// into `CloseWait`, and such a connection is still delivered: the
     /// acceptor takes it from the box's own switch address, and the answer
     /// still reaches a box that can only listen.
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn a_half_closed_connection_is_still_delivered() {
         let (mut h, _proxy_sock, _token) = harness(1, Stall::None, true).await;
@@ -4119,6 +4136,7 @@ mod tests {
     /// box had sent it. The re-resolved flow still delivers its late
     /// bytes, and every frame the peer sent to do it is addressed to the
     /// box: zero broadcast frames, zero ARP requests.
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn an_expired_neighbour_is_answered_from_the_pin_never_arp() {
         let subnet = SwitchSubnet::default();
@@ -4234,6 +4252,7 @@ mod tests {
     /// MAC — and B's return bytes still reach only B, at B's MAC. The
     /// leg still answers the ARP requests whose senders hold, so a box
     /// that has never connected can still find it.
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn a_gratuitous_arp_cannot_re_point_a_boxs_return_bytes() {
         let subnet = SwitchSubnet::default();
@@ -4321,6 +4340,7 @@ mod tests {
     /// other refusal leg says, and is bounded per source: a box that floods
     /// the address spends its own window's quota and loses only its own
     /// replies, while a sibling's are untouched.
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn stack_peer_refusals_use_the_shared_emitter() {
         let (log, _guard) = capture_warn_lines();
@@ -4442,6 +4462,7 @@ mod tests {
     /// the turn after the window passes says it, with the count that window
     /// really saw. A stack that goes away says whatever its still-live
     /// windows hold, at the leg's own end.
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn stack_peer_says_a_silent_windows_count() {
         let (log, _guard) = capture_warn_lines();
@@ -4516,6 +4537,7 @@ mod tests {
     /// its Ethernet destination does not have to — and a reset whose source
     /// is the broadcast's MAC is a frame no switch would forward: the
     /// refusal would never reach the box it refused.
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn stack_peer_reset_source_is_leg_mac() {
         let (mut h, _proxy_sock, _token) = harness(1, Stall::None, true).await;
@@ -4573,6 +4595,7 @@ mod tests {
     /// switch's static leases hold. It is reset, never delivered, and the
     /// reset is answered at the MAC that sent it, so the refusal reaches
     /// whoever claimed the address.
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn a_syn_with_a_foreign_mac_is_reset_and_never_delivered() {
         let (mut h, _proxy_sock, _token) = harness(1, Stall::None, true).await;
@@ -4647,6 +4670,7 @@ mod tests {
     /// wearing X's switch-derived MAC, connects and is delivered, and
     /// every frame the peer sends it is addressed to that MAC — zero ARP
     /// requests, zero broadcasts.
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn a_reused_address_arrives_only_through_a_new_row() {
         let (mut h, _proxy_sock, _token) = harness(1, Stall::None, true).await;
@@ -4777,6 +4801,7 @@ mod tests {
     /// the box side of the lane, and A re-sends a SYN on the tuple it
     /// holds, so both reach the pre-screen in one drain. The sibling is
     /// delivered and A's connection stands.
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn a_retransmit_on_a_held_tuple_takes_no_siblings_listener() {
         let (mut h, _proxy_sock, _token) = harness(1, Stall::None, true).await;
@@ -4889,6 +4914,7 @@ mod tests {
     /// no socket at all — the pool it was admitted against holds only
     /// B's busy connection — and the stack would answer it with the
     /// reset it gives an unlistened port.
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn a_row_registered_with_its_first_syn_takes_no_sibling_listener() {
         let (mut h, _proxy_sock, _token) = harness(1, Stall::None, true).await;

@@ -19,9 +19,23 @@
 //!   execs with the box's credentials: the box uid and gid, `no_new_privs`,
 //!   and the same empty capability sets the box's own processes exec with,
 //!   so joining a running box cannot open a raw socket either.
+//! * `sigterm_to_the_shim_kills_the_injected_group` — a SIGTERM to the
+//!   injection shim ends the injected process's whole process group, the
+//!   grandchild it forked included, and exits as soon as the group is gone.
+//! * `a_group_member_that_traps_sigterm_runs_its_trap` — the group gets
+//!   SIGTERM before any SIGKILL, so a member's SIGTERM trap runs.
+//! * `a_group_member_that_ignores_sigterm_is_sigkilled_after_the_grace` — a
+//!   member that outlives the leader's SIGTERM is SIGKILLed when the shim's
+//!   grace period runs out.
+//! * `a_blocked_cohort_rejects_a_pre_flip_udp_443_socket` — against the
+//!   installer's loaded classifier table, a `host_ip` member's UDP 443
+//!   socket opened before its cohort turns blocked is refused with
+//!   ECONNREFUSED after the flip, and sends again after the block lifts
+//!   (BEP-018). It prints NOT RUN with its gate on a host with no `nft` or
+//!   outside the root network namespace.
 //!
 //! The sandbox-layer half of NET-083 is another crate's test binary,
-//! `crates/sandbox2/tests/caps_root_integration.rs`
+//! `crates/sandbox/tests/caps_root_integration.rs`
 //! (`boxes_lack_cap_net_raw`), pinning the same credentials for the box's own
 //! processes. Test binaries in separate crates cannot call each other's
 //! helpers, so the plumbing this file and that one share — the base-directory
@@ -33,7 +47,7 @@
 //!
 //! The own-IP proofs drive the **production** switch-attach wiring rather than a
 //! hand-rolled `ip netns` sequence: each task's namespace is created by the same
-//! `CLONE_NEWNET` `unshare` that `sandbox2::new_container` performs for own-IP
+//! `CLONE_NEWNET` `unshare` that `sandbox::new_container` performs for own-IP
 //! tasks, identified by the holder process's PID exactly as the live launcher
 //! identifies a sandbox child's netns, and the tap is moved+configured by the
 //! production [`minimald::net::switch::tap_netns_commands`]. Those commands
@@ -73,10 +87,17 @@
 //! neither captured nor indented — reaching the parser as an annotation on
 //! the check run that every reader of the pull request can see.
 #![cfg(target_os = "linux")]
+// An integration test has no `crate::traced` to route its spawns through,
+// and nothing it spawns is in a daemon request's trace; the crate's clippy
+// `disallowed-methods` (see clippy.toml) is for the daemon's own sources.
+#![expect(
+    clippy::disallowed_methods,
+    reason = "an integration test cannot reach crate::traced, and traces nothing"
+)]
 
-use sandbox2::NetPlan;
-use sandbox2::Network as _;
-use sandbox2::config::{BOX_FORBIDDEN_CAPABILITIES, BOX_GID, BOX_UID, Config, SandboxMapped};
+use sandbox::NetPlan;
+use sandbox::Network as _;
+use sandbox::config::{BOX_FORBIDDEN_CAPABILITIES, BOX_GID, BOX_UID, Config, SandboxMapped};
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -84,9 +105,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
 
-use minimald::net::switch::{SessionGate, attach_to_switch, open_tap, tap_netns_commands};
+use boxes::BoxPolicy;
+use minimald::net::classifier::{QUIC443_BLOCKED_DIR, QUIC443_LEAF_SET, quic443_blocked_leaf};
+use minimald::net::switch::{BoxGate, attach_to_switch, open_tap, tap_netns_commands};
 use minimald::net::{PtaskLease, SwitchClient, SwitchSubnet};
-use sessions::SessionPolicy;
+use minimald::nsenter::GROUP_GRACE;
 
 /// Whether the gate env var is set; when absent both proofs early-return so the
 /// default `cargo test` run (and this sandbox) never attempts privileged netns
@@ -195,7 +218,11 @@ fn sudo(args: &[&str]) -> Output {
 /// `SHELL` on stdout, then sleeps forever so the sandbox stays alive for
 /// attach tests; with argument `caps` it reports its identity and capability
 /// sets and the errno of a raw socket, an ordinary stream socket, and a vsock
-/// socket; with argument `attach` it checks that `AF_UNIX` is still
+/// socket; with argument `group` it forks a child that sleeps forever, prints
+/// `forked` and waits; with arguments `trap <marker>` it forks a child whose
+/// SIGTERM handler creates `<marker>` and exits, and with argument `ignore` a
+/// child that ignores SIGTERM, each child printing `forked` once its
+/// disposition is set; with argument `attach` it checks that `AF_UNIX` is still
 /// usable inside an injected process and reports the same two lines.
 const SOCKET_PROBE_C: &str = r#"
 #include <sys/socket.h>
@@ -206,6 +233,18 @@ const SOCKET_PROBE_C: &str = r#"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <signal.h>
+#include <fcntl.h>
+
+/* The `trap` mode's SIGTERM handler: create the marker file, then exit.
+ * open, close and _exit are async-signal-safe. */
+static const char *marker_path;
+static void on_term_write_marker(int sig) {
+    (void)sig;
+    int fd = open(marker_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) close(fd);
+    _exit(0);
+}
 
 /* Two lines on stdout: the cwd hakoniwa chdir'd to and the SHELL it exported,
  * both of which the seccomp closure must carry across its command swap. */
@@ -255,6 +294,49 @@ int main(int argc, char **argv) {
         if (fd >= 0) close(fd);
         fflush(stdout);
         return 0;
+    }
+
+    /* A process with a descendant in its own process group: fork a child
+     * that sleeps forever, say so, then wait forever. The group kill must
+     * take the child as well as this process. */
+    if (argc > 1 && strcmp(argv[1], "group") == 0) {
+        pid_t pid = fork();
+        if (pid < 0) { perror("fork"); return 40; }
+        if (pid == 0) { while (1) sleep(60); }
+        printf("forked\n");
+        fflush(stdout);
+        while (1) pause();
+    }
+
+    /* A group member that traps SIGTERM: fork a child whose handler writes
+     * the marker file named by argv[2] and exits, then let the child say it
+     * is ready. This process keeps SIGTERM's default action. */
+    if (argc > 2 && strcmp(argv[1], "trap") == 0) {
+        pid_t pid = fork();
+        if (pid < 0) { perror("fork"); return 41; }
+        if (pid == 0) {
+            marker_path = argv[2];
+            signal(SIGTERM, on_term_write_marker);
+            printf("forked\n");
+            fflush(stdout);
+            while (1) pause();
+        }
+        while (1) pause();
+    }
+
+    /* A group member that ignores SIGTERM: fork a child that ignores it and
+     * says it is ready. This process keeps SIGTERM's default action, so the
+     * group SIGTERM ends it and leaves the child running. */
+    if (argc > 1 && strcmp(argv[1], "ignore") == 0) {
+        pid_t pid = fork();
+        if (pid < 0) { perror("fork"); return 42; }
+        if (pid == 0) {
+            signal(SIGTERM, SIG_IGN);
+            printf("forked\n");
+            fflush(stdout);
+            while (1) pause();
+        }
+        while (1) pause();
     }
 
     if (argc > 1 && strcmp(argv[1], "attach") == 0) {
@@ -452,7 +534,7 @@ fn proc_session_and_tty(pid: u32) -> (u32, i32) {
 ///
 /// The plan comes from the production provider, not the `NetPlan::none()`
 /// constructor: `network_for(NetworkMode::NoNet)` maps every no-net consumer
-/// to `sandbox2::NoNet` — a `--network none` session's box and a no-net
+/// to `sandbox::NoNet` — a `--network none` session's box and a no-net
 /// task's sandbox alike, since `task_network` goes through the same mapping —
 /// so this proof runs the exact plan a no-net task's sandbox is built with
 /// and pins that the task path is sealed like the session path.
@@ -469,7 +551,7 @@ async fn network_none_blocks_all_outside_sockets() {
     let source = rootfs_tmp.path().join("rootfs-src");
     probe_rootfs(&source, &probe);
 
-    let no_net = sandbox2::NoNet
+    let no_net = sandbox::NoNet
         .plan()
         .await
         .expect("the production NoNet provider plans do not fail");
@@ -544,8 +626,8 @@ async fn network_none_attach_works() {
         return;
     }
     announce_to_the_runner("network_none_attach_works");
+    use minimald::box_runtime::{Pty, WinSize};
     use minimald::nsenter::{Injection, session_leader_pid};
-    use minimald::session_host::{Pty, WinSize};
     use std::io::{BufRead as _, Read as _};
 
     /// What the session host would set: the shell that is actually running.
@@ -570,7 +652,7 @@ async fn network_none_attach_works() {
     let mut container = sandbox
         .new_container(&plan)
         .expect("building none-box container");
-    // The session host's own sequence (session_host.rs:2207): the box becomes
+    // The session host's own sequence (box_runtime.rs:2207): the box becomes
     // its own session leader *before* `Sandbox::command` builds the command
     // whose program the seccomp closure swap replaces, so the swap is what has
     // to carry the runctl to the child hakoniwa forks.
@@ -595,7 +677,7 @@ async fn network_none_attach_works() {
     // The terminal the launch hands the box, on stdin — the fd hakoniwa's
     // `TIOCSCTTY` acts on, so `Runctl::NewSession` can make it the box's
     // controlling terminal.  A real session wires stdout and stderr to the
-    // same slave (session_host.rs:2256-2260); stdout stays a pipe here so the
+    // same slave (box_runtime.rs:2256-2260); stdout stays a pipe here so the
     // report below arrives byte-exact, and the box's stdin — the one the
     // terminal dance needs — is the part this proof exercises.  The pair
     // outlives the box: closing the master while the box runs would SIGHUP it.
@@ -1052,7 +1134,7 @@ impl Drop for LiveBox {
 /// mount setup, no report) from one that did.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn injected_process_lacks_cap_net_raw() {
-    if let Some(reason) = sandbox2::user_namespaces_restriction() {
+    if let Some(reason) = sandbox::user_namespaces_restriction() {
         eprintln!(
             "skipping injected_process_lacks_cap_net_raw: this host denies the \
              unprivileged user namespace every sandbox starts by unsharing: \
@@ -1192,6 +1274,284 @@ async fn injected_process_lacks_cap_net_raw() {
     );
 }
 
+/// Whether `pid` is gone or a zombie, per `/proc/<pid>/stat`. The grandchild
+/// is reparented to the box's PID 1, which need not reap it, so a zombie
+/// counts as dead.
+fn dead_or_zombie(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return true;
+    };
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .is_some_and(|state| state == "Z")
+}
+
+/// What a group-kill proof observed: the shim's exit status, how long the shim
+/// took to exit after its SIGTERM, whether the grandchild was still running
+/// half a second into the grace period, and whether the injected process and
+/// the grandchild are dead, plus whether the marker file exists in the box.
+struct GroupKillOutcome {
+    status: std::process::ExitStatus,
+    shim_exit_after: Duration,
+    grandchild_alive_mid_grace: bool,
+    injected: u32,
+    injected_dead: bool,
+    grandchild: u32,
+    grandchild_dead: bool,
+    marker_exists: bool,
+}
+
+/// The marker file the `trap` probe's SIGTERM handler creates, inside the box.
+const GROUP_KILL_MARKER: &str = "/tmp/group-kill-marker";
+
+/// Inject `/usr/bin/probe <probe_args>` into an open box, wait for it to fork
+/// its grandchild, SIGTERM the injection shim the way the daemon does when an
+/// exec's client is gone (`TokioProcess::start_kill`), and report what became
+/// of the shim and the injected process group.
+///
+/// `None` when the host denies the unprivileged user namespace every sandbox
+/// starts by unsharing; the caller skips.
+async fn group_kill_proof(name: &str, probe_args: &[&str]) -> Option<GroupKillOutcome> {
+    if let Some(reason) = sandbox::user_namespaces_restriction() {
+        eprintln!(
+            "skipping {name}: this host denies the unprivileged user namespace \
+             every sandbox starts by unsharing: {reason}"
+        );
+        return None;
+    }
+    announce_to_the_runner(name);
+    use minimald::nsenter::{Injection, session_leader_pid};
+    use std::io::BufRead as _;
+
+    let proofs = proof_base_dir();
+    let no_base_dir = format!("base temp dir under {}", proofs.display());
+    let base = tempfile::tempdir_in(&proofs).expect(&no_base_dir);
+    let probe = compile_socket_probe(base.path());
+    let source = base.path().join("rootfs-src");
+    probe_rootfs(&source, &probe);
+
+    let config = Config::new("group-kill")
+        .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
+        .with_dns(false)
+        .with_plan(NetPlan::host());
+    let no_sandbox_dir = format!("sandbox temp dir under {}", proofs.display());
+    let sandbox_base = tempfile::tempdir_in(&proofs).expect(&no_sandbox_dir);
+    let mut sandbox = config
+        .build(sandbox_base.path().join("sandbox"), ())
+        .await
+        .expect("building the open-box sandbox");
+    let plan = sandbox.built_in_plan();
+    let container = sandbox
+        .new_container(&plan)
+        .expect("building the open-box container");
+
+    let mut hold = sandbox
+        .command(
+            &container,
+            "/usr/bin/probe",
+            ["hold"],
+            std::iter::empty::<(&str, &str)>(),
+        )
+        .expect("building hold command");
+    hold.stdout(hakoniwa::Stdio::MakePipe);
+    let mut child = hold.spawn().expect("spawning hold process in open box");
+    let hold_stdout = child.stdout.take().expect("hold process stdout pipe");
+    let mut guard = LiveBox::new(child);
+    let hold_report = tokio::task::spawn_blocking(move || {
+        let mut line = String::new();
+        let _read = std::io::BufReader::new(hold_stdout).read_line(&mut line);
+        line
+    })
+    .await
+    .expect("spawn_blocking join");
+    if !hold_report.starts_with("cwd=") {
+        let end = guard.stop();
+        panic!("the hold process did not report: {hold_report:?}\nstatus: {end:?}");
+    }
+    let leader =
+        session_leader_pid(guard.child_id()).expect("resolving the open box's program pid");
+    guard.holds(leader);
+
+    let injection = Injection::new(leader, "/usr/bin/probe", probe_args.iter().copied())
+        .with_shim(shim())
+        .with_cwd(sandbox.command_cwd().expect("resolving sandbox cwd"))
+        .with_env(sandbox.command_env());
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || {
+            let mut shim = injection
+                .command()
+                .expect("building injection command")
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawning the injection shim");
+            let mut line = String::new();
+            std::io::BufReader::new(shim.stdout.take().expect("piped stdout"))
+                .read_line(&mut line)
+                .expect("reading the probe's fork report");
+            assert_eq!(line.trim(), "forked", "the probe did not fork");
+
+            // Host pids: the shim's sole child is the injected probe, whose
+            // sole child is the grandchild it forked.
+            let injected = session_leader_pid(shim.id()).expect("resolving the injected pid");
+            let grandchild = session_leader_pid(injected).expect("resolving the grandchild pid");
+
+            let shim_pid = i32::try_from(shim.id()).expect("the shim pid fits an i32");
+            let signalled = std::time::Instant::now();
+            // SAFETY: `kill` is a plain syscall on a pid this proof spawned.
+            assert_eq!(unsafe { libc::kill(shim_pid, libc::SIGTERM) }, 0);
+            std::thread::sleep(Duration::from_millis(500));
+            let grandchild_alive_mid_grace = !dead_or_zombie(grandchild);
+            let status = shim.wait().expect("reaping the shim");
+            let shim_exit_after = signalled.elapsed();
+
+            // From the SIGTERM: the grace period, then a margin for the
+            // SIGKILL to land.
+            let deadline = signalled + GROUP_GRACE + Duration::from_secs(2);
+            while !dead_or_zombie(grandchild) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            (
+                status,
+                shim_exit_after,
+                grandchild_alive_mid_grace,
+                injected,
+                grandchild,
+            )
+        }),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{name}: the group-kill proof timed out"))
+    .expect("spawn_blocking join");
+    let (status, shim_exit_after, grandchild_alive_mid_grace, injected, grandchild) = outcome;
+    let grandchild_dead = dead_or_zombie(grandchild);
+    let injected_dead = dead_or_zombie(injected);
+    // The box's mount namespace, through its still-running program.
+    let marker_exists = Path::new(&format!("/proc/{leader}/root{GROUP_KILL_MARKER}")).exists();
+
+    let _stopped = guard.stop();
+
+    Some(GroupKillOutcome {
+        status,
+        shim_exit_after,
+        grandchild_alive_mid_grace,
+        injected,
+        injected_dead,
+        grandchild,
+        grandchild_dead,
+        marker_exists,
+    })
+}
+
+/// The daemon cancels an exec whose client is gone with a SIGTERM to the
+/// injection shim (`TokioProcess::start_kill`). The shim forwards it to the
+/// injected process's whole process group, which `setpgid(0, 0)` in the
+/// shim's pre-exec made, so a grandchild the injected process forked dies with
+/// it rather than run on under the box's PID 1. Every member here keeps
+/// SIGTERM's default action, so the group is empty at once and the shim exits
+/// well inside its grace period rather than waiting it out. The shim's exit
+/// code, 128 + SIGTERM, proves the handler ran: the default disposition would
+/// have killed the shim by the signal, with no code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sigterm_to_the_shim_kills_the_injected_group() {
+    let name = "sigterm_to_the_shim_kills_the_injected_group";
+    let Some(outcome) = group_kill_proof(name, &["group"]).await else {
+        return;
+    };
+    assert_eq!(
+        outcome.status.code(),
+        Some(128 + libc::SIGTERM),
+        "the shim must exit through its SIGTERM handler: {:?}",
+        outcome.status
+    );
+    assert!(
+        outcome.injected_dead,
+        "the injected process {} survived",
+        outcome.injected
+    );
+    assert!(
+        outcome.grandchild_dead,
+        "the grandchild {} survived the group kill",
+        outcome.grandchild
+    );
+    assert!(
+        outcome.shim_exit_after < GROUP_GRACE,
+        "a group that dies of its SIGTERM must not be held for the whole grace \
+         period: the shim took {:?}",
+        outcome.shim_exit_after
+    );
+}
+
+/// Ending an exec is SIGTERM, a grace period, then SIGKILL, so a member that
+/// traps SIGTERM gets to run its trap: the probe's grandchild creates a marker
+/// file in its SIGTERM handler. An immediate SIGKILL would leave no marker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_group_member_that_traps_sigterm_runs_its_trap() {
+    let name = "a_group_member_that_traps_sigterm_runs_its_trap";
+    let Some(outcome) = group_kill_proof(name, &["trap", GROUP_KILL_MARKER]).await else {
+        return;
+    };
+    assert_eq!(
+        outcome.status.code(),
+        Some(128 + libc::SIGTERM),
+        "the shim must exit through its SIGTERM handler: {:?}",
+        outcome.status
+    );
+    assert!(
+        outcome.marker_exists,
+        "the grandchild's SIGTERM trap did not run: no {GROUP_KILL_MARKER} in the box"
+    );
+    assert!(
+        outcome.grandchild_dead,
+        "the grandchild {} survived its own trap",
+        outcome.grandchild
+    );
+}
+
+/// The usual shape of a lost client: the group leader dies of the SIGTERM,
+/// while a grandchild ignores it. The shim must not give up when its child
+/// exits; it holds the group until the grace period runs out and then
+/// SIGKILLs it, so the grandchild is still running half a second in and dead
+/// (or a zombie) within the grace period plus a margin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_group_member_that_ignores_sigterm_is_sigkilled_after_the_grace() {
+    let name = "a_group_member_that_ignores_sigterm_is_sigkilled_after_the_grace";
+    let Some(outcome) = group_kill_proof(name, &["ignore"]).await else {
+        return;
+    };
+    assert_eq!(
+        outcome.status.code(),
+        Some(128 + libc::SIGTERM),
+        "the shim must exit through its SIGTERM handler: {:?}",
+        outcome.status
+    );
+    assert!(
+        outcome.injected_dead,
+        "the injected process {} survived its SIGTERM",
+        outcome.injected
+    );
+    assert!(
+        outcome.grandchild_alive_mid_grace,
+        "the grandchild {} was killed before the grace period ran out",
+        outcome.grandchild
+    );
+    assert!(
+        outcome.grandchild_dead,
+        "the grandchild {} ignoring SIGTERM survived the grace period's SIGKILL",
+        outcome.grandchild
+    );
+    assert!(
+        outcome.shim_exit_after >= GROUP_GRACE.saturating_sub(Duration::from_millis(500)),
+        "the shim exited after {:?}, before the grace period ran out",
+        outcome.shim_exit_after
+    );
+    assert!(
+        outcome.shim_exit_after < GROUP_GRACE + Duration::from_secs(2),
+        "the shim took {:?}, past the grace period plus a margin",
+        outcome.shim_exit_after
+    );
+}
+
 /// NET-137, the joined-process half: a process the daemon injects into a
 /// running box carries the box's socket-family seal. The filter installed at
 /// launch is inherited by children of the filtered process only, so the
@@ -1214,7 +1574,7 @@ async fn injected_process_lacks_cap_net_raw() {
 /// hakoniwa's mount setup, no report) from one that did.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn joined_process_refuses_namespace_bypass_families() {
-    if let Some(reason) = sandbox2::user_namespaces_restriction() {
+    if let Some(reason) = sandbox::user_namespaces_restriction() {
         eprintln!(
             "skipping joined_process_refuses_namespace_bypass_families: this \
              host denies the unprivileged user namespace every sandbox starts \
@@ -1378,7 +1738,7 @@ async fn joined_process_refuses_namespace_bypass_families() {
 /// A no-network task cannot reach the internet.
 ///
 /// Drives the egress attempt through `unshare --net`, which calls the same
-/// `CLONE_NEWNET` syscall that `sandbox2::new_container` calls for an
+/// `CLONE_NEWNET` syscall that `sandbox::new_container` calls for an
 /// isolating plan. If `new_container` stopped calling `CLONE_NEWNET`, the
 /// `isolates_netns` assertion would no longer match the actual namespacing
 /// behaviour; the `unshare --net` egress test guards the OS-level contract.
@@ -1392,10 +1752,10 @@ async fn netns_nonet_refuses_egress() {
 
     // The production decision under test: `NoNet` plans an isolated network
     // namespace, `HostNet` a shared one.
-    assert!(sandbox2::NoNet.plan().await.unwrap().isolates_netns());
-    assert!(!sandbox2::HostNet.plan().await.unwrap().isolates_netns());
+    assert!(sandbox::NoNet.plan().await.unwrap().isolates_netns());
+    assert!(!sandbox::HostNet.plan().await.unwrap().isolates_netns());
 
-    // Exercise the same OS primitive that sandbox2::new_container uses for NoNet
+    // Exercise the same OS primitive that sandbox::new_container uses for NoNet
     // (CLONE_NEWNET via unshare): enter a fresh, empty network namespace and
     // attempt egress. The namespace has only a down lo and no routes, so the
     // TCP connect must fail with ENETUNREACH — the same contract new_container
@@ -1430,7 +1790,7 @@ async fn netns_ownip_ptask_to_ptask() {
         return;
     }
     announce_to_the_runner("netns_ownip_ptask_to_ptask");
-    use sessions::{IngressPolicy, IpProto, PortMapping};
+    use boxes::{IngressPolicy, IpProto, PortMapping};
 
     let state = tempfile::tempdir().expect("switch state dir");
 
@@ -1450,8 +1810,8 @@ async fn netns_ownip_ptask_to_ptask() {
     // inbound listeners. PTask B declares the port its listener sits on inbound,
     // which is what the inbound gate needs to admit A's connection.
     const PORT: u16 = 9009;
-    let mut a = Ptask::provision("peer-a", lease_a, subnet, &sock, &SessionPolicy::default()).await;
-    let b_policy = SessionPolicy {
+    let mut a = Ptask::provision("peer-a", lease_a, subnet, &sock, &BoxPolicy::default()).await;
+    let b_policy = BoxPolicy {
         ingress: Some(IngressPolicy {
             port_mappings: vec![PortMapping {
                 external_port: PORT,
@@ -1463,6 +1823,7 @@ async fn netns_ownip_ptask_to_ptask() {
         }),
         egress: None,
         credentialed_upstream: None,
+        quic443: None,
     };
     let mut b = Ptask::provision("peer-b", lease_b, subnet, &sock, &b_policy).await;
 
@@ -1525,8 +1886,8 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
         return;
     }
     announce_to_the_runner("netns_ingress_static_port_mapping_exposes_then_unexposes");
+    use boxes::{IngressPolicy, IpProto, PortMapping};
     use minimald::net::policy::{ControlChannel, apply_ingress, remove_ingress};
-    use sessions::{IngressPolicy, IpProto, PortMapping};
 
     const INTERNAL: u16 = 80;
     const EXTERNAL: u16 = 18080;
@@ -1542,7 +1903,7 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
     // targets the PTask's `INTERNAL` listener — so the inbound gate must see
     // that port declared or the proof's own gate would drop the connection it
     // exists to expose.
-    let gate_policy = SessionPolicy {
+    let gate_policy = BoxPolicy {
         ingress: Some(IngressPolicy {
             port_mappings: vec![PortMapping {
                 external_port: EXTERNAL,
@@ -1554,6 +1915,7 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
         }),
         egress: None,
         credentialed_upstream: None,
+        quic443: None,
     };
     let mut ptask = Ptask::provision("ingress", lease, subnet, &sock, &gate_policy).await;
 
@@ -1581,6 +1943,7 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
         lease.ip,
         &ingress,
         None,
+        &[],
     )
     .await
     .expect("apply ingress");
@@ -1667,14 +2030,14 @@ impl Ptask {
         lease: PtaskLease,
         subnet: SwitchSubnet,
         api_sock: &std::path::Path,
-        policy: &SessionPolicy,
+        policy: &BoxPolicy,
     ) -> Self {
         let tap = format!("tap-{name}");
         let _ = sudo(&["ip", "link", "del", &tap]);
 
         // Create the PTask's network namespace the way the production path does:
         // a process that `unshare`s `CLONE_NEWNET` (the same syscall
-        // `sandbox2::new_container` issues for OwnIp) and then lingers, so its
+        // `sandbox::new_container` issues for OwnIp) and then lingers, so its
         // PID identifies `/proc/<pid>/ns/net` for the move/config below.
         let (netns_pid, holder) = spawn_netns_holder();
 
@@ -1704,7 +2067,7 @@ impl Ptask {
             sudo_ok("configure PTask tap", &strs);
         }
 
-        let gate = SessionGate::for_session(lease.ip.to_string(), lease.ip, policy, subnet, None);
+        let gate = BoxGate::for_session(lease.ip.to_string(), lease.ip, policy, subnet, None);
         let relay = attach_to_switch(
             fd,
             api_sock,
@@ -1764,7 +2127,7 @@ impl Ptask {
 }
 
 /// Spawns a long-lived process in a fresh network namespace (the same
-/// `CLONE_NEWNET` `sandbox2::new_container` unshares for `OwnIp`/`NoNet`) and
+/// `CLONE_NEWNET` `sandbox::new_container` unshares for `OwnIp`/`NoNet`) and
 /// returns its host PID plus the wrapper handle. `/proc/<pid>/ns/net` is the
 /// PTask netns the production launcher targets.
 fn spawn_netns_holder() -> (u32, std::process::Child) {
@@ -1784,4 +2147,549 @@ fn spawn_netns_holder() -> (u32, std::process::Child) {
     // holder's host PID.
     let netns_pid: u32 = line.trim().parse().expect("parse netns holder pid");
     (netns_pid, child)
+}
+
+// ---------------------------------------------------------------------------
+// BEP-018, live: a blocked cohort rejects a UDP 443 socket opened before the
+// flip (issue #2606).
+// ---------------------------------------------------------------------------
+
+/// The table the installer loads, by the installer's own name for it.
+const QUIC443_TABLE: &str = "minimal_class";
+
+/// The leg's name, as nextest and the NOT RUN line spell it.
+const QUIC443_LEG: &str = "a_blocked_cohort_rejects_a_pre_flip_udp_443_socket";
+
+/// The privileged step that lays out the tree and loads the table.
+fn classifier_installer() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/install-host-classifier.sh")
+}
+
+/// Whether this binary itself runs as root. The lane runs it unprivileged
+/// and every privileged step goes through `sudo -n`.
+fn quic443_as_root() -> bool {
+    // SAFETY: `geteuid(2)` has no failure modes or preconditions.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// A command that needs root: direct when this binary is root, else
+/// through `sudo -n`, so a host that asks for a password fails at once.
+fn quic443_privileged(program: &str) -> Command {
+    if quic443_as_root() {
+        Command::new(program)
+    } else {
+        let mut sudo = Command::new("sudo");
+        sudo.arg("-n").arg(program);
+        sudo
+    }
+}
+
+/// One line per step of the leg, on the proof's own stderr.
+fn quic443_step(text: &str) {
+    eprintln!("{QUIC443_LEG}: {text}");
+}
+
+/// The NOT RUN record for a gate this host does not meet.
+fn quic443_not_run(gate: &str) {
+    let line = format!("NOT RUN {QUIC443_LEG}: {gate}");
+    eprintln!("{line}");
+    tell_the_runner(&line);
+}
+
+/// The deepest cgroup2 mount that is the hierarchy itself and carries
+/// `nsdelegate`, the two facts the installer's `verify_mount` demands.
+/// The same reading as `classifier_root_integration`'s.
+fn quic443_cgroup2_mount() -> Option<PathBuf> {
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let mut mount: Option<(usize, PathBuf)> = None;
+    for line in mountinfo.lines() {
+        let fields: Vec<&str> = line.split(' ').collect();
+        let Some(sep) = fields.iter().position(|field| *field == "-") else {
+            continue;
+        };
+        if fields.len() < sep + 4 || fields[sep + 1] != "cgroup2" {
+            continue;
+        }
+        if fields[3] != "/" || !fields[sep + 3].split(',').any(|o| o == "nsdelegate") {
+            continue;
+        }
+        if mount
+            .as_ref()
+            .is_none_or(|(depth, _)| fields[4].len() > *depth)
+        {
+            mount = Some((fields[4].len(), fields[4].into()));
+        }
+    }
+    mount.map(|(_, mountpoint)| mountpoint)
+}
+
+/// The account the scratch tree is delegated to: this process's own when
+/// it runs unprivileged, else the first human-range account, because the
+/// install refuses to delegate to root.
+fn quic443_delegated_account() -> String {
+    // SAFETY: `getuid(2)` has no failure modes or preconditions.
+    let uid = unsafe { libc::getuid() };
+    let passwd = std::fs::read_to_string("/etc/passwd").expect("reading /etc/passwd");
+    passwd
+        .lines()
+        .find_map(|line| {
+            let fields: Vec<&str> = line.split(':').collect();
+            let line_uid: u32 = fields.get(2)?.parse().ok()?;
+            let wanted = if uid == 0 {
+                (1000..=60000).contains(&line_uid)
+            } else {
+                line_uid == uid
+            };
+            wanted.then(|| fields[0].to_string())
+        })
+        .expect("an account to delegate the scratch tree to (never root)")
+}
+
+/// Whether this process shares the network namespace of pid 1: the table
+/// the leg loads is the host's, so the leg runs only in the root netns.
+/// `None` when the root netns cannot be read even with root reach.
+fn quic443_in_root_netns() -> Option<bool> {
+    let own = std::fs::read_link("/proc/self/ns/net").ok()?;
+    let init = match std::fs::read_link("/proc/1/ns/net") {
+        Ok(init) => init,
+        Err(_) => {
+            let out = quic443_privileged("readlink")
+                .arg("/proc/1/ns/net")
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
+        }
+    };
+    Some(own == init)
+}
+
+/// Moves this whole process (every thread) into the cgroup at `dir`.
+fn quic443_move_self(dir: &Path) {
+    sandbox::classifier::place_pid(&dir.join("cgroup.procs"), std::process::id())
+        .unwrap_or_else(|e| panic!("moving this proof process into {}: {e}", dir.display()));
+}
+
+/// A root-bound UDP listener on 127.0.0.1:443, run as `python3` through
+/// the root reach: port 443 is privileged, and the leg needs a listener
+/// so a delivered datagram draws no port unreachable from the kernel
+/// itself. Each datagram it receives is one line on its stdout.
+struct Quic443Listener {
+    child: std::process::Child,
+    lines: std::sync::mpsc::Receiver<String>,
+}
+
+impl Quic443Listener {
+    fn spawn() -> Self {
+        const SCRIPT: &str = "import socket\n\
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n\
+            s.bind(('127.0.0.1', 443))\n\
+            print('ready', flush=True)\n\
+            while True:\n    \
+                print(s.recv(256).decode(errors='replace'), flush=True)\n";
+        let mut child = quic443_privileged("python3")
+            .args(["-u", "-c", SCRIPT])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .expect("spawning the root-bound UDP 443 listener (python3)");
+        let stdout = child.stdout.take().expect("the listener's stdout");
+        let (send, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::BufRead as _;
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
+                if send.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let listener = Self { child, lines };
+        assert_eq!(
+            listener.next_line(Duration::from_secs(10)).as_deref(),
+            Some("ready"),
+            "the UDP listener binds 127.0.0.1:443 (is something already bound there?)"
+        );
+        listener
+    }
+
+    /// The next datagram, or `None` when none arrives within `wait`.
+    fn next_line(&self, wait: Duration) -> Option<String> {
+        self.lines.recv_timeout(wait).ok()
+    }
+}
+
+impl Drop for Quic443Listener {
+    fn drop(&mut self) {
+        // SIGTERM, not SIGKILL: sudo relays SIGTERM to python3, and a
+        // SIGKILL to sudo would leave python3 holding port 443.
+        let Ok(pid) = libc::pid_t::try_from(self.child.id()) else {
+            return;
+        };
+        // SAFETY: `kill(2)` addresses this proof's own child.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        for _ in 0..50 {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        eprintln!("the UDP 443 listener did not stop on SIGTERM; killing pid {pid}");
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Everything the leg lays out, removed however the leg ends: this
+/// process leaves the tree, the box leaf goes, then the installer's own
+/// uninstall removes the table, the helper, its sudoers rule and the tree.
+struct Quic443Scratch {
+    root: PathBuf,
+    mountpoint: PathBuf,
+    helper_dir: PathBuf,
+    leaf: Option<PathBuf>,
+}
+
+impl Quic443Scratch {
+    fn helper(&self) -> PathBuf {
+        self.helper_dir.join("quic443-leaf")
+    }
+
+    /// The installer run through the root reach, with the helper and its
+    /// sudoers rule under this leg's own root-owned directory, never at
+    /// the host's own paths.
+    fn installer(&self) -> Command {
+        let mut step = quic443_privileged("env");
+        step.arg(format!(
+            "MINIMAL_OVERRIDE_QUIC443_HELPER={}",
+            self.helper().display()
+        ))
+        .arg(format!(
+            "MINIMAL_OVERRIDE_QUIC443_SUDOERS={}",
+            self.helper_dir.join("sudoers").display()
+        ))
+        .arg("bash")
+        .arg(classifier_installer())
+        .arg("--root")
+        .arg(&self.root);
+        step
+    }
+
+    /// Runs the helper the daemon runs, as root, on the box leaf.
+    fn helper_on_leaf(&self, verb: &str, leaf: &Path) {
+        let out = quic443_privileged(&self.helper().to_string_lossy())
+            .arg(verb)
+            .arg(leaf)
+            .output()
+            .expect("running the QUIC block helper");
+        assert!(
+            out.status.success(),
+            "the QUIC block helper runs `{verb}` on {}: {}",
+            leaf.display(),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    /// The elements of the blocked-leaves set in the loaded table.
+    fn listed_set(&self) -> String {
+        let out = quic443_privileged("nft")
+            .args(["list", "set", "inet", QUIC443_TABLE, QUIC443_LEAF_SET])
+            .output()
+            .expect("listing the blocked-leaves set");
+        assert!(
+            out.status.success(),
+            "nft lists the set {QUIC443_LEAF_SET}: {}",
+            String::from_utf8_lossy(&out.stderr),
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+}
+
+impl Drop for Quic443Scratch {
+    fn drop(&mut self) {
+        // Out of the tree first: the kernel refuses to remove a cgroup that
+        // still holds a process.
+        let back = quic443_privileged("tee")
+            .arg("-a")
+            .arg(self.mountpoint.join("cgroup.procs"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .and_then(|mut tee| {
+                if let Some(mut stdin) = tee.stdin.take() {
+                    stdin.write_all(format!("{}\n", std::process::id()).as_bytes())?;
+                }
+                tee.wait()
+            });
+        if !back.is_ok_and(|status| status.success()) {
+            eprintln!("could not return this proof process to the cgroup2 root");
+        }
+        if let Some(leaf) = self.leaf.take() {
+            let _ = sandbox::classifier::remove_box_leaf(&leaf);
+        }
+        match self.installer().arg("--uninstall").output() {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => eprintln!(
+                "the uninstall over {} failed: {}",
+                self.root.display(),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            Err(e) => eprintln!("running the uninstall: {e}"),
+        }
+        let _ = quic443_privileged("rm")
+            .arg("-rf")
+            .arg(&self.helper_dir)
+            .status();
+    }
+}
+
+/// The errno of one datagram on `socket`, `None` when the send succeeded.
+fn quic443_send(socket: &std::net::UdpSocket, payload: &str) -> Option<i32> {
+    socket
+        .send(payload.as_bytes())
+        .err()
+        .map(|e| e.raw_os_error().unwrap_or(-1))
+}
+
+/// BEP-018, live on this kernel against the installer's loaded table: a
+/// `host_ip` member's UDP socket to port 443, opened in its own allow leaf
+/// before the cohort flips to blocked, is rejected after the flip, and
+/// sends again after the block lifts.
+///
+/// A socket keeps the cgroup it was created in, so the flip's process move
+/// into `boxes/quic443-blocked` does not cover it. What covers it is the
+/// own leaf in the table's `quic443_blocked_leaves` set, added and removed
+/// by the root-owned helper the install writes, the way the daemon runs it.
+/// The proof process plays the member: it opens the socket in its own
+/// leaf, then moves itself as the daemon moves a member.
+///
+/// Gated on `MINIMALD_NETNS_TEST` like every proof here. Where the host
+/// has no `nft`, or this process is not in the root network namespace,
+/// the leg prints NOT RUN with the gate and returns. Every other missing
+/// precondition fails it.
+#[test]
+#[ignore = "loads the installer's nftables table over this host's real cgroup2; gated on MINIMALD_NETNS_TEST; runs in the native lane's minimald-root-integration job"]
+fn a_blocked_cohort_rejects_a_pre_flip_udp_443_socket() {
+    use std::os::unix::io::AsRawFd as _;
+
+    if !gated() {
+        return;
+    }
+    let has_nft = Command::new("nft")
+        .arg("--version")
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if !has_nft {
+        quic443_not_run("no nft on this host (apt install nftables)");
+        return;
+    }
+    assert!(
+        quic443_as_root()
+            || quic443_privileged("true")
+                .status()
+                .is_ok_and(|status| status.success()),
+        "the install and the helper need root: run the lane's recipe under \
+         sudo, or give this account passwordless sudo"
+    );
+    match quic443_in_root_netns() {
+        Some(true) => {}
+        Some(false) => {
+            quic443_not_run("this process is not in the root network namespace");
+            return;
+        }
+        None => {
+            quic443_not_run("the root network namespace cannot be read on this host");
+            return;
+        }
+    }
+    announce_to_the_runner(QUIC443_LEG);
+
+    // One table at a time across binaries: classifier_root_integration
+    // loads the same table under the same lock.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(std::env::temp_dir().join("minimald-classifier-root-proof.lock"))
+        .expect("the classifier proofs' lock file");
+    // SAFETY: `flock(2)` on the descriptor just opened. The kernel releases
+    // the lock when the descriptor closes at the end of the leg.
+    let taken = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+    assert_eq!(taken, 0, "locking the classifier proofs against each other");
+
+    assert!(
+        !Path::new(sandbox::classifier::TREE_ROOT).exists(),
+        "a classifier tree is already installed at {}: this leg never runs \
+         over a host's own install",
+        sandbox::classifier::TREE_ROOT
+    );
+    assert!(
+        !quic443_privileged("nft")
+            .args(["list", "table", "inet", QUIC443_TABLE])
+            .output()
+            .is_ok_and(|out| out.status.success()),
+        "a table named {QUIC443_TABLE} is already loaded: this leg never \
+         replaces a host's own table"
+    );
+    let mountpoint =
+        quic443_cgroup2_mount().expect("no cgroup2 mounted with nsdelegate on this host");
+    let account = quic443_delegated_account();
+
+    // The helper runs as root, so the install wants its directory and every
+    // one above it root-only: a fresh directory under /run is.
+    let made = quic443_privileged("mktemp")
+        .args(["-d", "/run/minimald-quic443-proof.XXXXXX"])
+        .output()
+        .expect("making the helper's root-owned directory");
+    assert!(
+        made.status.success(),
+        "mktemp -d under /run: {}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    let helper_dir = PathBuf::from(String::from_utf8_lossy(&made.stdout).trim());
+
+    let mut scratch = Quic443Scratch {
+        root: mountpoint.join(format!("minimald-quic443-proof-{}", std::process::id())),
+        mountpoint,
+        helper_dir,
+        leaf: None,
+    };
+    // Outside the tree, so it never holds a cgroup the cleanup removes.
+    // Declared after the scratch, so it stops before the scratch goes.
+    let listener = Quic443Listener::spawn();
+    quic443_step("step 1: a root-bound UDP listener is on 127.0.0.1:443");
+
+    let installed = scratch
+        .installer()
+        .arg("--user")
+        .arg(&account)
+        .output()
+        .expect("running the install over the scratch tree");
+    assert!(
+        installed.status.success(),
+        "the install lays out the scratch tree and loads its table: {}{}",
+        String::from_utf8_lossy(&installed.stdout),
+        String::from_utf8_lossy(&installed.stderr),
+    );
+    quic443_step(&format!(
+        "step 2: the installer loaded table inet {QUIC443_TABLE} over {}",
+        scratch.root.display()
+    ));
+
+    // The daemon's leaf first: every migration below is checked at the
+    // tree's root, which only a process inside the tree can write.
+    let placed = scratch
+        .installer()
+        .arg("--pid")
+        .arg(std::process::id().to_string())
+        .output()
+        .expect("running the step's placement half");
+    assert!(
+        placed.status.success(),
+        "placing this proof process in the scratch tree's daemon leaf: {}",
+        String::from_utf8_lossy(&placed.stderr),
+    );
+    let leaf = sandbox::classifier::create_box_leaf(
+        &scratch.root,
+        &format!("quic443-proof-{}", std::process::id()),
+        sandbox::config::Verdict::Allow,
+    )
+    .expect("creating the member's own leaf under boxes/allow");
+    scratch.leaf = Some(leaf.clone());
+    quic443_move_self(&leaf);
+    quic443_step(&format!(
+        "step 3: this process runs as a host_ip member in {}",
+        leaf.display()
+    ));
+
+    // The socket is made here, so it keeps the member's own leaf.
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("a UDP socket");
+    socket
+        .connect("127.0.0.1:443")
+        .expect("connecting the UDP socket to 127.0.0.1:443");
+    assert_eq!(
+        quic443_send(&socket, "before"),
+        None,
+        "the pre-flip datagram sends"
+    );
+    assert_eq!(
+        listener.next_line(Duration::from_secs(5)).as_deref(),
+        Some("before"),
+        "the listener receives the pre-flip datagram"
+    );
+    quic443_step("step 4: a UDP 443 socket opened in the own leaf sends before the flip");
+
+    // The flip, as the daemon makes it: the member's processes move into
+    // the blocked leaf, and its own leaf joins the blocked-leaves set.
+    quic443_move_self(&quic443_blocked_leaf(&scratch.root));
+    scratch.helper_on_leaf("add", &leaf);
+    let set = scratch.listed_set();
+    let leaf_rel = leaf
+        .strip_prefix(&scratch.mountpoint)
+        .expect("the leaf is under the cgroup2 mount")
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        set.contains(&leaf_rel),
+        "the set {QUIC443_LEAF_SET} lists the own leaf {leaf_rel}: {set}"
+    );
+    quic443_step(&format!(
+        "step 5: the cohort is blocked: the process is in {QUIC443_BLOCKED_DIR}, \
+         and {leaf_rel} is in {QUIC443_LEAF_SET}"
+    ));
+
+    // The rejected datagram: the output chain drops it with an ICMP port
+    // unreachable, and the send itself reports the drop or nothing.
+    let rejected = quic443_send(&socket, "during");
+    assert!(
+        matches!(rejected, None | Some(libc::EPERM | libc::ECONNREFUSED)),
+        "the first datagram after the flip is dropped, got errno {rejected:?}"
+    );
+    if rejected != Some(libc::ECONNREFUSED) {
+        std::thread::sleep(Duration::from_millis(200));
+        let next = quic443_send(&socket, "during-next");
+        assert_eq!(
+            next,
+            Some(libc::ECONNREFUSED),
+            "the next datagram after the flip reports ECONNREFUSED (the first gave {rejected:?})"
+        );
+    }
+    assert_eq!(
+        listener.next_line(Duration::from_millis(500)),
+        None,
+        "no datagram reaches the listener while the cohort is blocked"
+    );
+    quic443_step("step 6: after the flip the pre-flip socket is refused with ECONNREFUSED");
+
+    // The lift: the own leaf leaves the set, the processes go home.
+    scratch.helper_on_leaf("remove", &leaf);
+    let set = scratch.listed_set();
+    assert!(
+        !set.contains(&leaf_rel),
+        "the set {QUIC443_LEAF_SET} no longer lists {leaf_rel}: {set}"
+    );
+    quic443_move_self(&leaf);
+    quic443_step("step 7: the block lifted: the own leaf left the set, the process is home");
+
+    assert_eq!(
+        quic443_send(&socket, "after"),
+        None,
+        "the same socket sends after the block lifts"
+    );
+    assert_eq!(
+        listener.next_line(Duration::from_secs(5)).as_deref(),
+        Some("after"),
+        "the listener receives the datagram sent after the block lifts"
+    );
+    quic443_step("step 8: the pre-flip socket sends again after the block lifts");
+
+    drop(socket);
+    drop(listener);
+    drop(scratch);
+    drop(lock);
+    quic443_step("step 9: the table, the helper and the scratch tree are removed");
 }

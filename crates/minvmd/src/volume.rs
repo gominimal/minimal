@@ -8,6 +8,7 @@
 
 use std::fs::OpenOptions;
 use std::io;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
 /// Default size of a freshly provisioned data volume: 256 GiB. The image is a
@@ -46,7 +47,7 @@ pub fn volume_bytes() -> u64 {
 ///
 /// [`DATA_VOLUME_PATH_ENV`] overrides it explicitly (used verbatim); otherwise
 /// the image lives beside the instance's socket and locks as
-/// `<provider dir>/data-vol.raw`, so it survives clean restarts and follows
+/// `<host dir>/data-vol.raw`, so it survives clean restarts and follows
 /// the same `--minimal-state-dir` / `XDG_STATE_HOME` resolution — isolating
 /// an instance isolates its writable image too (double-attaching one image
 /// corrupts it).
@@ -55,12 +56,12 @@ pub fn resolve_data_volume_path() -> PathBuf {
     std::env::var_os(DATA_VOLUME_PATH_ENV)
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| data_volume_path_in(&crate::state::provider_dir()))
+        .unwrap_or_else(|| data_volume_path_in(&crate::state::host_dir()))
 }
 
-/// `<provider dir>/data-vol.raw`. Pure, for unit testing.
-fn data_volume_path_in(provider_dir: &Path) -> PathBuf {
-    provider_dir.join("data-vol.raw")
+/// `<host dir>/data-vol.raw`. Pure, for unit testing.
+fn data_volume_path_in(host_dir: &Path) -> PathBuf {
+    host_dir.join("data-vol.raw")
 }
 
 /// Failure modes of [`ensure_sparse_raw`].
@@ -118,6 +119,7 @@ pub fn ensure_sparse_raw(path: &Path, size_bytes: u64) -> Result<(), VolumeError
                     "existing data volume differs from requested size; keeping as-is",
                 );
             }
+            warn_if_overcommitted(path, &meta);
             Ok(())
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -128,6 +130,11 @@ pub fn ensure_sparse_raw(path: &Path, size_bytes: u64) -> Result<(), VolumeError
                         size_bytes,
                         "provisioned blank sparse data volume",
                     );
+                    // A freshly provisioned sparse image can still overcommit a
+                    // small host (256 GiB apparent, ~0 allocated), so check it.
+                    if let Ok(meta) = std::fs::metadata(path) {
+                        warn_if_overcommitted(path, &meta);
+                    }
                     Ok(())
                 }
                 // Lost a creation race with a concurrent provisioner between the
@@ -140,6 +147,9 @@ pub fn ensure_sparse_raw(path: &Path, size_bytes: u64) -> Result<(), VolumeError
                         path = %path.display(),
                         "data volume created concurrently; keeping as-is",
                     );
+                    if let Ok(meta) = std::fs::metadata(path) {
+                        warn_if_overcommitted(path, &meta);
+                    }
                     Ok(())
                 }
                 Err(e) => Err(e),
@@ -160,10 +170,14 @@ fn create_sparse_raw(path: &Path, size_bytes: u64) -> Result<(), VolumeError> {
             source,
         })?;
     }
+    // 0600, never the mode the umask gives (formerly BEP-047,
+    // gominimal/inbox#1184): only the VM user opens the data disk, and
+    // `min diag` reads only its size.
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
+        .mode(0o600)
         .open(path)
         .map_err(|source| VolumeError::Create {
             path: path.to_path_buf(),
@@ -183,10 +197,70 @@ fn create_sparse_raw(path: &Path, size_bytes: u64) -> Result<(), VolumeError> {
     Ok(())
 }
 
+/// Shortfall in bytes when the host cannot back the image's apparent size:
+/// `Some(apparent - (avail + allocated))` when `avail + allocated < apparent`,
+/// else `None`. Pure, for unit testing.
+fn host_overcommit(avail: u64, allocated: u64, apparent: u64) -> Option<u64> {
+    let backed = avail.saturating_add(allocated);
+    (backed < apparent).then(|| apparent - backed)
+}
+
+/// Free bytes available to an unprivileged caller on the filesystem holding
+/// `path` (`f_bavail * f_frsize`), or `None` when `statvfs` fails.
+fn host_free_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `libc::statvfs` is a plain-old-data C struct; all-zero bytes are
+    // a valid value.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: valid NUL-terminated path and out-pointer to a zeroed struct.
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    let frsize = stat.f_frsize as u64;
+    Some((stat.f_bavail as u64).saturating_mul(frsize))
+}
+
+/// Warn when the host cannot back the image's apparent size: `statvfs` the
+/// image for host free bytes, take the image's allocated bytes
+/// from `st_blocks` and its apparent size from `st_size`, and warn when
+/// `avail + allocated < apparent` (see [`host_overcommit`]).
+fn warn_if_overcommitted(path: &Path, meta: &std::fs::Metadata) {
+    use std::os::unix::fs::MetadataExt as _;
+    // `statvfs` the image itself, not its parent directory: `metadata(path)`
+    // follows a symlinked image, so both reads must describe the same filesystem.
+    let Some(avail) = host_free_bytes(path) else {
+        return;
+    };
+    warn_overcommit(path, avail, meta.blocks() * 512, meta.len());
+}
+
+/// Emit the overcommit warning when `avail + allocated < apparent`. `avail` is
+/// injected so the warning path is unit-testable without filling a real disk.
+fn warn_overcommit(path: &Path, avail: u64, allocated: u64, apparent: u64) {
+    if let Some(shortfall) = host_overcommit(avail, allocated, apparent) {
+        tracing::warn!(
+            path = %path.display(),
+            host_free_bytes = avail,
+            allocated_bytes = allocated,
+            advertised_bytes = apparent,
+            shortfall_bytes = shortfall,
+            "host free disk cannot back the data volume's remaining growth; \
+             the guest will hit ENOSPC before its filesystem looks full. \
+             Free host disk space, or re-provision the volume smaller: its \
+             size is fixed once the image exists, so set MINVMD_VOLUME_BYTES \
+             smaller and delete the image (this discards the volume's data)",
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
     use std::os::unix::fs::MetadataExt;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
 
     /// A unique temp dir per test. Keyed by `tag` as well as the pid so
     /// concurrently-running tests (cargo's default) never share a directory —
@@ -196,6 +270,18 @@ mod tests {
         let p = PathBuf::from(base).join(format!("minvmd-vol-test-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         p
+    }
+
+    /// Formerly BEP-047 (gominimal/inbox#1184): the data volume is created
+    /// 0600 whatever the umask gives.
+    #[test]
+    fn data_volume_is_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tmpdir("mode");
+        let path = dir.join("data-vol.raw");
+        ensure_sparse_raw(&path, 1024 * 1024).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "got {mode:04o}");
     }
 
     #[test]
@@ -220,6 +306,30 @@ mod tests {
     }
 
     #[test]
+    fn warn_stays_silent_when_host_free_space_backs_the_volume() {
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let apparent = 8 * 1024 * 1024 * 1024;
+        warn_overcommit(Path::new("data-vol.raw"), apparent, 0, apparent);
+
+        let logged = buf.contents();
+        assert!(logged.is_empty(), "expected no warning, got: {logged}");
+    }
+
+    #[test]
+    fn host_free_bytes_reads_the_real_filesystem() {
+        let dir = tmpdir("statvfs");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(host_free_bytes(&dir).is_some_and(|b| b > 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn ensure_is_idempotent_and_does_not_resize() {
         let dir = tmpdir("idempotent");
         let path = dir.join("data-vol.raw");
@@ -237,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn data_volume_path_sits_in_provider_dir() {
+    fn data_volume_path_sits_in_host_dir() {
         assert_eq!(
             data_volume_path_in(Path::new("/state/minimal/providers/local-minvmd0")),
             PathBuf::from("/state/minimal/providers/local-minvmd0/data-vol.raw"),
@@ -248,5 +358,76 @@ mod tests {
     fn volume_bytes_defaults_when_unset() {
         // Not asserting on the env (tests share a process); just the default.
         assert_eq!(DEFAULT_VOLUME_BYTES, 256 * 1024 * 1024 * 1024);
+    }
+
+    /// A `MakeWriter` accumulating everything written into a shared buffer, so
+    /// a test can assert on the log line the overcommit check emits.
+    #[derive(Clone, Default)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl CaptureWriter {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn host_overcommit_reports_shortfall_only_when_backing_is_short() {
+        // avail + allocated == apparent: exactly backed, no overcommit.
+        assert_eq!(host_overcommit(100, 0, 100), None);
+        // avail + allocated > apparent: comfortably backed.
+        assert_eq!(host_overcommit(100, 50, 100), None);
+        // avail + allocated < apparent: shortfall is the uncovered gap.
+        assert_eq!(host_overcommit(30, 20, 100), Some(50));
+        // A sparse image with no allocated blocks overcommits by the whole gap.
+        assert_eq!(host_overcommit(92, 0, 256), Some(164));
+    }
+
+    #[test]
+    fn warn_fires_when_host_free_space_is_short() {
+        let dir = tmpdir("overcommit");
+        let path = dir.join("data-vol.raw");
+        let size = 8 * 1024 * 1024 * 1024; // 8 GiB apparent
+        ensure_sparse_raw(&path, size).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let apparent = meta.len();
+        let allocated = meta.blocks() * 512;
+
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Inject a host free-space figure far below the apparent size; no real
+        // disk fill.
+        let fake_avail = 1024 * 1024 * 1024; // 1 GiB
+        warn_overcommit(&path, fake_avail, allocated, apparent);
+
+        let logged = buf.contents();
+        assert!(
+            logged.contains("host free disk cannot back the data volume's remaining growth"),
+            "expected overcommit warning, got: {logged}",
+        );
+        // Best-effort cleanup; a leftover temp dir must not fail the test.
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

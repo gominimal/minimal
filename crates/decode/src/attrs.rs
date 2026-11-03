@@ -89,9 +89,19 @@ impl AttrValue {
             return Ok(Some(Self::Map(map)));
         }
         if let Some(a) = rt.as_array() {
+            // Element contracts are pending on the array; without applying
+            // them a bad element is accepted on every consumer path.
+            let pending = a.iter_pending_contracts().cloned().collect::<Vec<_>>();
             return Ok(Some(Self::List(
                 a.iter()
-                    .map(|e| Self::from_term_at(e, program, depth + 1))
+                    .map(|e| {
+                        let e = RuntimeContract::apply_all(
+                            e.clone(),
+                            pending.iter().cloned(),
+                            e.pos_idx(),
+                        );
+                        Self::from_term_at(&e, program, depth + 1)
+                    })
                     .collect::<Result<Vec<_>, Error>>()?
                     .into_iter()
                     .flatten()
@@ -258,6 +268,70 @@ mod tests {
         assert!(matches!(&list[1], AttrValue::String(a, _) if a == "b"));
     }
 
+    /// A valid array-of-record attribute (e.g. `env_dir_mappings`) must decode
+    /// to the same value whether or not its element contracts are applied. No
+    /// element contract in `attr_classes.ncl` carries a `default`, so applying
+    /// them is a no-op for valid inputs. Pin the decoded value so a future
+    /// `default` on an element contract changes this assertion and fails loudly.
+    #[test]
+    fn array_of_records_decodes_to_pinned_value() {
+        let (term, mut program, _origin, _target) = Loader::new(
+            "let {Attrs, ..} = import \"minimal.ncl\" in \
+                 {env_dir_mappings = [\
+                    {read_only = true, path = \"/data\", class = 'State},\
+                    {read_only = false, path = \"/secrets\", class = 'Credential}\
+                 ]} | Attrs",
+            None,
+            &LoadOptions::for_test(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("load failed");
+        })
+        .finish()
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("finish failed");
+        });
+
+        let result = AttrValue::from_term(&term, &mut program).unwrap().unwrap();
+        let attrs = result.as_map().unwrap();
+        let mappings = attrs.get("env_dir_mappings").unwrap().as_list().unwrap();
+
+        assert_eq!(mappings.len(), 2);
+
+        let first = mappings[0].as_map().unwrap();
+        // A `default` on an element contract would add a key here.
+        assert_eq!(first.len(), 3, "element keys: {:?}", first.keys());
+        assert!(matches!(
+            first.get("read_only").unwrap(),
+            AttrValue::Bool(true)
+        ));
+        assert!(matches!(
+            first.get("path").unwrap(),
+            AttrValue::String(p, _) if p == "/data"
+        ));
+        assert!(matches!(
+            first.get("class").unwrap(),
+            AttrValue::String(c, _) if c == "State"
+        ));
+
+        let second = mappings[1].as_map().unwrap();
+        assert_eq!(second.len(), 3, "element keys: {:?}", second.keys());
+        assert!(matches!(
+            second.get("read_only").unwrap(),
+            AttrValue::Bool(false)
+        ));
+        assert!(matches!(
+            second.get("path").unwrap(),
+            AttrValue::String(p, _) if p == "/secrets"
+        ));
+        assert!(matches!(
+            second.get("class").unwrap(),
+            AttrValue::String(c, _) if c == "Credential"
+        ));
+    }
+
     /// Config that nests attribute values past the cap must surface a
     /// structured [`Error::AttrTooDeep`] rather than aborting the process with a
     /// stack overflow. Evaluation forces one level per nested list, so the
@@ -325,6 +399,74 @@ mod tests {
     }
 
     #[test]
+    fn attr_array_element_contract_nickel_err() {
+        let (term, mut program, _origin, _target) = Loader::new(
+            "let {Attrs, ..} = import \"minimal.ncl\" in {env_dir_mappings = [42]} | Attrs",
+            None,
+            &LoadOptions::for_test(),
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("load failed");
+        })
+        .finish()
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("finish failed");
+        });
+
+        let err = AttrValue::from_term(&term, &mut program).expect_err("element contract");
+        assert!(matches!(err, Error::Nickel(_)), "got {err:?}");
+
+        // The element contract fired, and its report points at the element.
+        let mut buf = codespan_reporting::term::termcolor::Buffer::no_color();
+        err.report_to(&mut buf);
+        let out = String::from_utf8(buf.into_inner()).unwrap();
+        assert!(out.contains("contract broken"), "report: {out}");
+        assert!(out.contains("[42]"), "report: {out}");
+    }
+
+    fn decode_src(src: &str) -> Result<Option<AttrValue>, Error> {
+        let (term, mut program, _origin, _target) =
+            Loader::new(src, None, &LoadOptions::for_test())
+                .unwrap()
+                .finish()
+                .unwrap();
+        AttrValue::from_term(&term, &mut program)
+    }
+
+    #[test]
+    fn array_element_contracts_reach_nested_values() {
+        // Elements reached through an array of records and an array of arrays
+        // are checked against the element contract.
+        assert!(matches!(
+            decode_src("[{a = 1}] | Array {a | String}"),
+            Err(Error::Nickel(_))
+        ));
+        assert!(matches!(
+            decode_src("[[1]] | Array (Array String)"),
+            Err(Error::Nickel(_))
+        ));
+
+        // Elements that satisfy the contract still decode.
+        let nested = decode_src("[[\"x\"]] | Array (Array String)")
+            .unwrap()
+            .unwrap();
+        let inner = nested.as_list().unwrap()[0].as_list().unwrap();
+        assert!(matches!(&inner[0], AttrValue::String(s, _) if s == "x"));
+        let records = decode_src(
+            "let {Attrs, ..} = import \"minimal.ncl\" in \
+             {env_dir_mappings = [{read_only = true, path = \"p\", class = 'State}]} | Attrs",
+        )
+        .unwrap()
+        .unwrap();
+        let AttrValue::Map(m) = records else {
+            panic!("expected a map, got {records:?}");
+        };
+        assert_eq!(m["env_dir_mappings"].as_list().unwrap().len(), 1);
+    }
+
+    #[test]
     fn attr_binary_from_ok() {
         let res = Loader::new(
             "let {Attrs, ..} = import \"minimal.ncl\" in {binary_from = \"https://example.com/bersh.exe\"} | Attrs",
@@ -354,5 +496,126 @@ mod tests {
         .finish();
 
         assert!(res.is_ok());
+    }
+
+    /// Evaluates `attrs | Attrs` and reports whether it was accepted.
+    fn attrs_accepted(attrs: &str) -> bool {
+        let src = format!("let {{Attrs, ..}} = import \"minimal.ncl\" in {attrs} | Attrs");
+        Loader::new(&src, None, &LoadOptions::for_test())
+            .unwrap_or_else(|e| {
+                e.report_to_stderr();
+                panic!("load failed");
+            })
+            .finish()
+            .is_ok()
+    }
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// An attrs record with an upstream_version, plus `rest`.
+    fn versioned(rest: &str) -> String {
+        format!("{{upstream_version = \"1.0\", {rest}}}")
+    }
+
+    fn security_entry() -> String {
+        format!(
+            "{{ file = \"CVE-2026-1234.patch\", kind = 'security, cve = \"CVE-2026-1234\", \
+             sha256 = \"{SHA}\", origin = \"https://example.org/advisory\", upstream_commit = \"deadbeef0\" }}"
+        )
+    }
+
+    /// REV-001: the advisory-matching key never carries our revision suffix.
+    #[test]
+    fn attrs_upstream_version_rejects_revision_suffix() {
+        assert!(attrs_accepted("{upstream_version = \"1.25.0\"}"));
+        assert!(!attrs_accepted("{upstream_version = \"1.25.0-r1\"}"));
+        assert!(!attrs_accepted("{upstream_version = \"2026.9.3-r12\"}"));
+    }
+
+    /// REV-003: an entry's shape follows its kind, and nothing is left blank.
+    #[test]
+    fn patch_ledger_entries_fail_closed() {
+        let ok = |entry: &str| {
+            attrs_accepted(&format!(
+                "{{upstream_version = \"1.0\", revision = 1, patches = [{entry}]}}"
+            ))
+        };
+        let e = security_entry();
+        assert!(ok(&e));
+        assert!(ok(&format!(
+            "{{ file = \"aarch64-build.patch\", kind = 'build, sha256 = \"{SHA}\", origin = \"https://example.org/bug/1\" }}"
+        )));
+        assert!(ok(&format!(
+            "{{ file = \"pins.patch\", kind = 'vendor, sha256 = \"{SHA}\", origin = \"https://example.org/mr/2\", upstream_commit = \"0123456\" }}"
+        )));
+        // Not a record; no kind, an unknown kind, or a kind that does not
+        // match its fields.
+        assert!(!ok("42"));
+        assert!(!ok(&e.replace("kind = 'security, ", "")));
+        assert!(!ok(&e.replace("'security", "'hotfix")));
+        assert!(!ok(&e.replace("'security", "'build")));
+        // A security fix without its CVE or commit, or with a blank one.
+        assert!(!ok(&e.replace("cve = \"CVE-2026-1234\", ", "")));
+        assert!(!ok(&e.replace("CVE-2026-1234\"", "\"")));
+        // CVE sequence syntax: four digits may be zero-padded, five or more
+        // may not start with zero.
+        assert!(ok(&e.replace("CVE-2026-1234", "CVE-2026-0001")));
+        assert!(ok(&e.replace("CVE-2026-1234", "CVE-2026-12345")));
+        assert!(!ok(&e.replace("CVE-2026-1234", "CVE-2026-01234")));
+        assert!(!ok(&e.replace("CVE-2026-1234", "CVE-2026-123")));
+        assert!(!ok(&e.replace(", upstream_commit = \"deadbeef0\"", "")));
+        assert!(!ok(&e.replace("deadbeef0", "not-a-commit")));
+        // A blank origin, a misshapen digest, a missing file.
+        assert!(!ok(&e.replace("https://example.org/advisory", " ")));
+        assert!(!ok(&e.replace(SHA, "abc123")));
+        assert!(!ok(&e.replace("file = \"CVE-2026-1234.patch\", ", "")));
+    }
+
+    /// REV-002: the revision is a non-negative integer, never a string.
+    #[test]
+    fn revision_is_a_non_negative_integer() {
+        let rev = |v: &str| attrs_accepted(&versioned(&format!("revision = {v}")));
+        assert!(rev("0"));
+        assert!(rev("3"));
+        assert!(!rev("-1"));
+        assert!(!rev("1.5"));
+        assert!(!rev("\"1\""));
+    }
+
+    /// A ledger with entries counts as at least one revision.
+    #[test]
+    fn a_patch_ledger_implies_a_revision() {
+        let with = |rest: &str| attrs_accepted(&versioned(rest));
+        let entry = security_entry();
+        assert!(with(&format!("revision = 1, patches = [{entry}]")));
+        assert!(with("revision = 0, patches = []"));
+        assert!(!with(&format!("patches = [{entry}]")));
+        assert!(!with(&format!("revision = 0, patches = [{entry}]")));
+    }
+
+    /// REV-002 across an upstream bump: a build patch that survives the bump
+    /// leaves the artifact non-pristine, so pkgmgr restarts the counter at 1,
+    /// not 0. That state loads; the reset-to-0-with-patches state does not, so
+    /// a bump PR can never be written in a shape that fails to parse.
+    #[test]
+    fn a_patch_surviving_an_upstream_bump_keeps_revision_one() {
+        let bumped =
+            |rest: &str| attrs_accepted(&format!("{{upstream_version = \"2.0\", {rest}}}"));
+        let build = format!(
+            "{{ file = \"aarch64-build.patch\", kind = 'build, sha256 = \"{SHA}\", origin = \"https://example.org/bug/1\" }}"
+        );
+        assert!(bumped(&format!("revision = 1, patches = [{build}]")));
+        assert!(!bumped(&format!("revision = 0, patches = [{build}]")));
+        // Every patch dropped in review: back to pristine upstream.
+        assert!(bumped("revision = 0, patches = []"));
+    }
+
+    /// REV-011: a label with no upstream half is not a label.
+    #[test]
+    fn versionless_recipes_carry_no_revision() {
+        assert!(!attrs_accepted("{revision = 1}"));
+        assert!(!attrs_accepted("{revision = 0}"));
+        assert!(!attrs_accepted("{patches = []}"));
+        assert!(attrs_accepted("{license_spdx = \"MIT\"}"));
     }
 }

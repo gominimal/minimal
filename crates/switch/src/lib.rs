@@ -22,6 +22,22 @@ pub mod refusal;
 /// MTU advertised to the switch and the tap devices. gvproxy's own default.
 pub const DEFAULT_MTU: u16 = 1500;
 
+/// How many outbound TCP connection attempts the switch keeps in flight at
+/// once (gvproxy's `tcpMaxInFlight`).
+///
+/// Each attempt holds its slot while the switch dials the remote host, and the
+/// switch drops a SYN that arrives with every slot taken, leaving the guest to
+/// retransmit on its backoff. gvproxy up to v0.8.9 fixed the bound at 10 and
+/// v0.9.0 defaults it to 128. A package manager opens a few hundred
+/// connections at once, so the bound is set above that burst.
+pub const TCP_MAX_IN_FLIGHT: u32 = 512;
+
+/// How long the switch waits on one outbound TCP dial before giving its slot
+/// back, in seconds (gvproxy's `tcpConnectTimeout`). It is gvproxy v0.9.0's
+/// own default, written out so the time an unanswered dial holds a slot does
+/// not move with the pinned version.
+pub const TCP_CONNECT_TIMEOUT_SECS: u32 = 30;
+
 /// Stable, locally-administered MAC for the switch gateway.
 pub const GATEWAY_MAC: MacAddr = MacAddr([0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xdd]);
 
@@ -29,6 +45,35 @@ pub const GATEWAY_MAC: MacAddr = MacAddr([0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xdd]);
 /// [`DEFAULT_SUBNET`]. It matches [`MacAddr::for_switch_ip`] applied to
 /// [`SwitchSubnet::box_egress_proxy_address`] on that subnet.
 pub const BEP_MAC: MacAddr = MacAddr([0x52, 0x54, 0x00, 0x40, 0xff, 0xfc]);
+
+/// How long the Box Egress Proxy leg's smoltcp neighbour cache keeps an
+/// entry: smoltcp 0.14's `iface::neighbor::Cache::ENTRY_LIFETIME`, which the
+/// crate keeps `pub(crate)`, so it is restated here. A switch address handed
+/// again wears the same derived MAC ([`MacAddr::for_switch_ip`]), so an
+/// allocator that reuses addresses must quarantine a released one for longer
+/// than this, or the leg could still answer the new holder from the old
+/// holder's entry. Change it with the smoltcp version.
+pub const BEP_NEIGHBOUR_CACHE_LIFETIME: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a released switch address waits before it may be handed again,
+/// by either allocator that hands them: the in-VM or native daemon's
+/// self-allocation reserve and the VM host daemon's hand-out run. One value
+/// for both, because both hand addresses that wear the same derived MAC
+/// ([`MacAddr::for_switch_ip`]) on the one switch.
+///
+/// It must outlast every record that can still name a released address once
+/// its holder is gone: [`BEP_NEIGHBOUR_CACHE_LIFETIME`] (asserted below), and
+/// each allocator's own flow and admission timers, which each side asserts
+/// against this constant where those timers live. Waiting it out is
+/// necessary, not sufficient: each allocator also skips an address its own
+/// live state still names.
+pub const SWITCH_ADDRESS_REUSE_QUARANTINE: std::time::Duration =
+    std::time::Duration::from_secs(300);
+
+const _: () = assert!(
+    SWITCH_ADDRESS_REUSE_QUARANTINE.as_millis() > BEP_NEIGHBOUR_CACHE_LIFETIME.as_millis(),
+    "the reuse quarantine must outlast the BEP leg's neighbour-cache entry"
+);
 
 /// AF_VSOCK CID of the host as seen from inside a libkrun guest. Well-known:
 /// `VMADDR_CID_HOST == 2`. The per-PTask shuttle dials this CID to reach the
@@ -61,6 +106,22 @@ pub const DEFAULT_SUBNET: SwitchSubnet = SwitchSubnet {
 /// the range the zone answers.
 pub const RESERVED_LOCAL_RANGE: (Ipv4Addr, u8) = (Ipv4Addr::new(127, 0, 64, 0), 24);
 
+/// The run of [`RESERVED_LOCAL_RANGE`] a box's published address may come
+/// from (design §7.1): the range's `.2` to its last-but-one address (`.254`
+/// of the /24). The network address, `.1` and the broadcast address are
+/// never a box's.
+///
+/// The one definition of that run: the answerer's address book hands boxes
+/// out of it, and the box registry's single-node test cursor clamps its
+/// slice to it, so the two cannot drift.
+#[must_use]
+pub fn box_loopback_interior() -> (Ipv4Addr, Ipv4Addr) {
+    let (network, prefix) = RESERVED_LOCAL_RANGE;
+    let size = 1u32 << (32 - u32::from(prefix));
+    let first = u32::from(network);
+    (Ipv4Addr::from(first + 2), Ipv4Addr::from(first + size - 2))
+}
+
 /// Prefix of the reserved local range slice each switch (one gvproxy) publishes
 /// its boxes at. A /27 is 32 addresses — 32 published boxes per switch — and a
 /// /24 range holds exactly eight of them, which is also how many switches the
@@ -79,9 +140,8 @@ pub const SWITCH_SLICE_PREFIX: u8 = 27;
 pub const GVPROXY_FILE: &str = "gvproxy-min";
 
 /// System package install path for the switch binary: where the distro
-/// packages place it (`packaging/nfpm.yaml` for deb/rpm/apk,
-/// `packaging/arch/PKGBUILD-bin.tmpl` for the AUR), so a host that installed
-/// minimal through its package manager finds the binary without a user-local
+/// packages of earlier releases placed it, so a host that installed minimal
+/// through its package manager finds the binary without a user-local
 /// install.
 pub const PACKAGE_GVPROXY_BIN: &str = "/usr/bin/gvproxy-min";
 
@@ -284,6 +344,26 @@ impl SwitchSubnet {
     #[must_use]
     pub fn host_alias(self) -> Ipv4Addr {
         Ipv4Addr::from(u32::from(self.broadcast()) - 1)
+    }
+
+    /// The documented host literal this switch also maps to the host's
+    /// loopback (NET-004): the default subnet's host alias, `100.64.255.254`,
+    /// when this subnet is a block carved out of [`DEFAULT_SUBNET`] that does
+    /// not hold that address itself. A box on a carved `/24` reaches the host
+    /// at its own subnet's alias, so the old literal needs its own `nat` and
+    /// virtual-IP entry to keep reaching what `host.min.internal` reaches.
+    /// `None` for the default subnet, whose own alias is the literal, and for
+    /// a subnet outside the default block, which the literal never named.
+    #[must_use]
+    pub fn documented_host_literal(self) -> Option<Ipv4Addr> {
+        let literal = DEFAULT_SUBNET.host_alias();
+        let holds = |subnet: Self, addr: Ipv4Addr| {
+            u32::from(addr) & subnet.mask() == u32::from(subnet.network())
+        };
+        (self.prefix > DEFAULT_SUBNET.prefix
+            && holds(DEFAULT_SUBNET, self.network())
+            && !holds(self, literal))
+        .then_some(literal)
     }
 
     /// The Box Egress Proxy address (the address below [`Self::daemon_ip`],
@@ -569,11 +649,15 @@ impl MacAddr {
 
 /// Renders the gvproxy `-config` YAML for the given subnet and static leases.
 ///
-/// gvproxy v0.8.9 has no `-subnet` CLI flag: the subnet, gateway, NAT alias, DNS
-/// zone, and DHCP static leases are all expressed through a `-config` YAML file
-/// (see the 2026-06-21 spike). gvproxy reads this file only at spawn time; an
-/// `OwnIp` PTask configures its switch address statically rather than via DHCP,
-/// so `dhcpStaticLeases` is a startup-time seed, not a live source.
+/// The subnet, gateway, NAT alias, DNS zone, DHCP static leases and TCP
+/// forwarder bounds are all expressed through a `-config` YAML file (see the
+/// 2026-06-21 spike): gvproxy v0.9.0 also takes the subnet and gateway as CLI
+/// flags, but the rest is YAML-only. gvproxy reads this file only at spawn
+/// time; an `OwnIp` PTask configures its switch address statically rather than
+/// via DHCP, so `dhcpStaticLeases` is a startup-time seed, not a live source.
+///
+/// `tcpMaxInFlight` and `tcpConnectTimeout` need gvproxy v0.9.0 or later: an
+/// older switch ignores both keys and keeps its fixed bound of 10 attempts.
 #[must_use]
 pub fn render_gvproxy_config(subnet: SwitchSubnet, leases: &[(Ipv4Addr, MacAddr)]) -> String {
     let mut s = String::with_capacity(256 + leases.len() * 48);
@@ -582,10 +666,24 @@ pub fn render_gvproxy_config(subnet: SwitchSubnet, leases: &[(Ipv4Addr, MacAddr)
     s.push_str(&format!("  subnet: \"{subnet}\"\n"));
     s.push_str(&format!("  gatewayIP: \"{}\"\n", subnet.gateway()));
     s.push_str(&format!("  gatewayMacAddress: \"{GATEWAY_MAC}\"\n"));
+    s.push_str(&format!("  tcpMaxInFlight: {TCP_MAX_IN_FLIGHT}\n"));
+    s.push_str(&format!(
+        "  tcpConnectTimeout: {TCP_CONNECT_TIMEOUT_SECS}\n"
+    ));
+    // NET-004: a switch carved from the default block also maps the
+    // documented literal to the host's loopback, beside its own alias, so the
+    // literal reaches what `host.min.internal` reaches.
+    let literal = subnet.documented_host_literal();
     s.push_str("  nat:\n");
     s.push_str(&format!("    \"{}\": \"127.0.0.1\"\n", subnet.host_alias()));
+    if let Some(literal) = literal {
+        s.push_str(&format!("    \"{literal}\": \"127.0.0.1\"\n"));
+    }
     s.push_str("  gatewayVirtualIPs:\n");
     s.push_str(&format!("    - \"{}\"\n", subnet.host_alias()));
+    if let Some(literal) = literal {
+        s.push_str(&format!("    - \"{literal}\"\n"));
+    }
     // NET-003: the switch answers `host.min.internal` itself, with the host
     // alias — the address its `nat` table maps to the host's loopback. Rendered
     // from first boot, ahead of any dynamic `min.internal.` registration; the
@@ -624,6 +722,17 @@ mod tests {
         assert_eq!(BEP_MAC.to_string(), "52:54:00:40:ff:fc");
         assert_eq!(net.daemon_ip(), Ipv4Addr::new(100, 64, 255, 253));
         assert_eq!(net.host_alias(), Ipv4Addr::new(100, 64, 255, 254));
+    }
+
+    /// Design §7.1: a box's published address is the reserved local range's
+    /// interior, `.2` to `.254`, never its network address, `.1` or its
+    /// broadcast.
+    #[test]
+    fn box_loopback_interior_is_the_range_s_dot2_to_dot254() {
+        assert_eq!(
+            box_loopback_interior(),
+            (Ipv4Addr::new(127, 0, 64, 2), Ipv4Addr::new(127, 0, 64, 254))
+        );
     }
 
     /// The lease run's end has one source: the run the lease book hands from
@@ -688,6 +797,49 @@ mod tests {
         }
     }
 
+    /// NET-004: a `/24` switch carved from the default `/16` maps the
+    /// documented literal to the host's loopback and carries it as a gateway
+    /// virtual address, beside its own alias. The `/16` a guest daemon uses
+    /// renders as before, and a subnet outside the default block gets nothing.
+    #[test]
+    fn gvproxy_config_maps_documented_literal_on_a_slash_24() {
+        let literal = Ipv4Addr::new(100, 64, 255, 254);
+        let carved = SwitchSubnet::new(Ipv4Addr::new(100, 64, 3, 0), 24).unwrap();
+        assert_eq!(carved.documented_host_literal(), Some(literal));
+        let yaml = render_gvproxy_config(carved, &[]);
+        assert!(
+            yaml.contains(
+                "  nat:\n    \"100.64.3.254\": \"127.0.0.1\"\n    \"100.64.255.254\": \"127.0.0.1\"\n"
+            ),
+            "{yaml}"
+        );
+        assert!(
+            yaml.contains(
+                "  gatewayVirtualIPs:\n    - \"100.64.3.254\"\n    - \"100.64.255.254\"\n  dns:\n"
+            ),
+            "{yaml}"
+        );
+        // `host.min.internal` keeps the switch's own alias.
+        assert!(yaml.contains("          ip: \"100.64.3.254\"\n"), "{yaml}");
+
+        // The default /16: its own alias is the literal, rendered once each.
+        assert_eq!(DEFAULT_SUBNET.documented_host_literal(), None);
+        let yaml = render_gvproxy_config(DEFAULT_SUBNET, &[]);
+        assert_eq!(yaml.matches("\"100.64.255.254\": \"127.0.0.1\"").count(), 1);
+        assert_eq!(yaml.matches("- \"100.64.255.254\"").count(), 1);
+
+        // The /24 that holds the literal as its own alias renders it once.
+        let top = SwitchSubnet::new(Ipv4Addr::new(100, 64, 255, 0), 24).unwrap();
+        assert_eq!(top.documented_host_literal(), None);
+        let yaml = render_gvproxy_config(top, &[]);
+        assert_eq!(yaml.matches("\"100.64.255.254\": \"127.0.0.1\"").count(), 1);
+
+        // A subnet outside the default block never maps the literal.
+        let custom = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 24).unwrap();
+        assert_eq!(custom.documented_host_literal(), None);
+        assert!(!render_gvproxy_config(custom, &[]).contains("100.64.255.254"));
+    }
+
     #[test]
     fn proxy_address_is_neither_virtual_ip_nor_translated() {
         let yaml = render_gvproxy_config(SwitchSubnet::default(), &[]);
@@ -749,6 +901,26 @@ mod tests {
         let yaml = render_gvproxy_config(SwitchSubnet::default(), &[]);
         assert!(yaml.contains("dhcpStaticLeases:\n    {}\n"));
         assert!(yaml.contains("subnet: \"100.64.0.0/16\""));
+    }
+
+    /// The switch's outbound TCP bounds are scalars directly under `stack:`,
+    /// spelled as gvproxy v0.9.0's `types.Configuration` reads them
+    /// (`tcpMaxInFlight`, and `tcpConnectTimeout` in whole seconds).
+    #[test]
+    fn gvproxy_config_raises_the_tcp_connect_bound() {
+        let yaml = render_gvproxy_config(SwitchSubnet::default(), &[]);
+        let mut lines = yaml.lines();
+        assert_eq!(lines.next(), Some("stack:"));
+        let stack: Vec<&str> = lines.collect();
+        assert!(
+            stack.iter().all(|l| l.starts_with("  ")),
+            "every key sits under `stack:`; config was:\n{yaml}"
+        );
+        assert!(stack.contains(&"  tcpMaxInFlight: 512"), "config:\n{yaml}");
+        assert!(
+            stack.contains(&"  tcpConnectTimeout: 30"),
+            "config:\n{yaml}"
+        );
     }
 
     #[test]
@@ -860,10 +1032,10 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn package_install_wins_over_the_operator_paths() {
-        // /usr/bin/gvproxy-min is where the system packages put the binary
-        // (packaging/nfpm.yaml, packaging/arch/PKGBUILD-bin.tmpl): a managed
-        // package install outranks an operator-provisioned /usr/lib path, and
-        // is itself outranked by a user-local install.
+        // /usr/bin/gvproxy-min is where the system packages of earlier
+        // releases put the binary: a managed package install outranks an
+        // operator-provisioned /usr/lib path, and is itself outranked by a
+        // user-local install.
         let tmp = tempfile::tempdir().unwrap();
         let package = tmp.path().join("package-gvproxy-min");
         std::fs::write(&package, b"from the package").unwrap();

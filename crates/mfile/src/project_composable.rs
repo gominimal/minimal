@@ -18,15 +18,15 @@
 //! `docs/reference/minimal-dot-toml.md`.
 //!
 //! [`Session`]: crate::Session
-//! [`Composable`]: sessions::core::compose::Composable
-//! [`Source::Project`]: sessions::core::source::Source::Project
-//! [`Loadout`]: sessions::core::loadout::Loadout
-//! [`contribute_primitives`]: sessions::core::compose::contribute_primitives
-//! [`ResolvedVar::resolve_with`]: sessions::core::primitives::ResolvedVar::resolve_with
+//! [`Composable`]: boxes::core::compose::Composable
+//! [`Source::Project`]: boxes::core::source::Source::Project
+//! [`Loadout`]: boxes::core::loadout::Loadout
+//! [`contribute_primitives`]: boxes::core::compose::contribute_primitives
+//! [`ResolvedVar::resolve_with`]: boxes::core::primitives::ResolvedVar::resolve_with
 
+use boxes::core::compose::{Composable, Contribution, Error, contribute_primitives};
+use boxes::core::source::Source;
 use paths::HostPath;
-use sessions::core::compose::{Composable, Contribution, Error, contribute_primitives};
-use sessions::core::source::Source;
 
 use crate::Session;
 
@@ -37,8 +37,8 @@ use crate::Session;
 /// [`Source::Project`] provenance tag; the `session` carries the
 /// actual primitives.
 ///
-/// [`SessionComposer::add`]: sessions::daemon::composer::SessionComposer::add
-/// [`Source::Project`]: sessions::core::source::Source::Project
+/// [`SessionComposer::add`]: boxes::daemon::composer::SessionComposer::add
+/// [`Source::Project`]: boxes::core::source::Source::Project
 #[derive(Debug, Clone)]
 pub struct ProjectComposable {
     project_path: HostPath,
@@ -66,8 +66,8 @@ impl Composable for ProjectComposable {
     /// unresolvable inherits back to the client as pending items is
     /// a downstream concern for the composer, not this trait impl.
     ///
-    /// [`Source::Project`]: sessions::core::source::Source::Project
-    /// [`Inherit`]: sessions::core::primitives::VarValue::Inherit
+    /// [`Source::Project`]: boxes::core::source::Source::Project
+    /// [`Inherit`]: boxes::core::primitives::VarValue::Inherit
     fn contribute(
         self,
         env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
@@ -95,8 +95,8 @@ impl Composable for ProjectComposable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boxes::core::source::Provenanced;
     use indoc::indoc;
-    use sessions::core::source::Provenanced;
 
     /// A fully-populated `[session]` block contributes every domain,
     /// tagged with [`Source::Project`] carrying the project path.
@@ -165,8 +165,8 @@ mod tests {
     /// the pending var against its own env.
     ///
     /// [`NotPresent`]: std::env::VarError::NotPresent
-    /// [`ResolutionFailure`]: sessions::core::primitives::VarError::ResolutionFailure
-    /// [`Loadout::contribute`]: sessions::core::loadout::Loadout::contribute
+    /// [`ResolutionFailure`]: boxes::core::primitives::VarError::ResolutionFailure
+    /// [`Loadout::contribute`]: boxes::core::loadout::Loadout::contribute
     #[test]
     fn inherit_without_env_surfaces_as_error() {
         let mf: crate::File = toml::from_str(indoc! {
@@ -193,7 +193,7 @@ mod tests {
     /// unchanged.
     ///
     /// [`NotPresent`]: std::env::VarError::NotPresent
-    /// [`ResolvedVar::resolve_with`]: sessions::core::primitives::ResolvedVar::resolve_with
+    /// [`ResolvedVar::resolve_with`]: boxes::core::primitives::ResolvedVar::resolve_with
     #[test]
     fn inherit_with_default_falls_back_when_absent() {
         let mf: crate::File = toml::from_str(indoc! {

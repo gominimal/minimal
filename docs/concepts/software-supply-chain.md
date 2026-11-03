@@ -42,7 +42,7 @@ semantics of what the software needs to function as well as an exact, reproducib
 Dependencies of packages are references to other packages, an approach that enables Minimal to build exact production and development environments
 from simple, composable descriptions of individual packages.
 
-For readers familiar with Nix/Nixpkgs, package build-specs are similar to Nix derivations.
+For readers familiar with Nix/Nixpkgs, package build specs are similar to Nix derivations.
 
 ## Everything is (composable) configuration
 

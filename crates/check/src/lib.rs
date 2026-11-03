@@ -270,9 +270,9 @@ impl CheckCache {
             (bsr, lib_path.to_path_buf()),
             || -> Result<Arc<HashSet<String>>, anyhow::Error> {
                 let full_path = dep_path.join(lib_path);
-                let data = std::fs::read(&full_path)
+                let data = open_output(&full_path)
                     .map_err(|e| anyhow!("reading library {}: {e}", full_path.display()))?;
-                let elf = object::File::parse(&*data)
+                let elf = object::File::parse(&data)
                     .map_err(|e| anyhow!("parsing {}: {e}", full_path.display()))?;
 
                 // `exports()` is a lazy iterator that reports per-export parse
@@ -315,9 +315,9 @@ impl CheckCache {
 
                 if likely_glibc_stub_lib {
                     let libc_path = dep_path.join("usr/lib/libc.so.6");
-                    let data = std::fs::read(&libc_path)
+                    let data = open_output(&libc_path)
                         .map_err(|e| anyhow!("reading libc {}: {e}", libc_path.display()))?;
-                    let libc = object::File::parse(&*data)
+                    let libc = object::File::parse(&data)
                         .map_err(|e| anyhow!("parsing {}: {e}", libc_path.display()))?;
                     for s in libc.dynamic_symbols() {
                         let name = s.name().map_err(|e| {
@@ -331,6 +331,30 @@ impl CheckCache {
             },
         )
     }
+}
+
+/// Open an artifact file for `object`'s parsers, which read only the ranges
+/// they need (the header and the tables they walk) through the cache.
+/// `fs::read` pulled in every byte: a full-catalog check sweep reads every
+/// artifact of every package on both arches, which on a host with a cold page
+/// cache made the sweep disk-bound (build-servers#210: 4x slower per package
+/// than warm, and >90% of check time spent waiting).
+///
+/// Not `mmap`: these files are hardlinked into build sandboxes, and a build
+/// writing through such a link (`cp` or `>` onto it) truncates the shared
+/// inode, which turns a mapped read past the new end into SIGBUS for the whole
+/// process. A read past the end here is a short read and a parse error for
+/// that one file. On a cold sweep of 39 GiB of artifacts (20 threads): read
+/// whole 112–123 s / 19 GiB from disk; mmap with MADV_RANDOM 25–26 s /
+/// 1.8 GiB; this 24–27 s / 2.0 GiB, and warm 0.6 s against mmap's 3 s.
+pub(crate) fn open_output(path: &Path) -> std::io::Result<object::read::ReadCache<std::fs::File>> {
+    let f = std::fs::File::open(path)?;
+    // The parsers jump between the header and a few tables; default readahead
+    // pulls in a window behind every read (cold: 39 s / 2.4 GiB without this).
+    // Advisory, so a refusal is ignored.
+    #[cfg(target_os = "linux")]
+    let _ = nix::fcntl::posix_fadvise(&f, 0, 0, nix::fcntl::PosixFadviseAdvice::POSIX_FADV_RANDOM);
+    Ok(object::read::ReadCache::new(f))
 }
 
 /// Parameters that remain constant across all checkers within a single
@@ -1028,73 +1052,85 @@ impl GraphBasedChecker for StandaloneTestCheck {
             let cancel = ctx.cancel.clone();
             let daemon_id = ctx.daemon_id.clone();
             drop(graph);
-            result = tokio::task::spawn(async move {
-                let mut result = result;
-                for (name, test) in tests {
-                    if test.build_test {
-                        continue; // We only do standalone tests here
-                    }
-                    // This task is detached, so it outlives a dropped check
-                    // stream: without this it would keep running tests (and
-                    // their sandboxes) after the caller has given up.
-                    if cancel.is_cancelled() {
-                        break;
-                    }
-                    let temp_dir = cache.temp_dir().map_err(anyhow::Error::from)?;
+            // The task outlives the check stream it was spawned from, so it
+            // gets a root of its own, linked to the request's span
+            // (`follows_from`) rather than parented under it: it must never
+            // record children under a span that has already closed.
+            let span = tracing::info_span!(parent: None, "check.standalone_tests", pkg = %pkg);
+            span.follows_from(tracing::Span::current().id());
+            // A root takes its own sampling decision: under an opted-out
+            // request it must record nothing, as the request does (TEL-045).
+            mlog::otel::inherit_opt_out(&span);
+            result = tokio::task::spawn(tracing::Instrument::instrument(
+                async move {
+                    let mut result = result;
+                    for (name, test) in tests {
+                        if test.build_test {
+                            continue; // We only do standalone tests here
+                        }
+                        // This task is detached, so it outlives a dropped check
+                        // stream: without this it would keep running tests (and
+                        // their sandboxes) after the caller has given up.
+                        if cancel.is_cancelled() {
+                            break;
+                        }
+                        let temp_dir = cache.temp_dir().map_err(anyhow::Error::from)?;
 
-                    let stdout_buf = SharedBuf::new();
-                    let stderr_buf = SharedBuf::new();
-                    let mut t = StandaloneTest {
-                        spec: &bsr,
-                        test_name: name.as_str(),
-                        stdout_writer: Some(Box::new(stdout_buf.clone())),
-                        stderr_writer: Some(Box::new(stderr_buf.clone())),
-                        cancel: cancel.clone(),
-                    };
-                    let opts = Options {
-                        cache: cache.clone(),
-                        exec_base: temp_dir.path().to_path_buf(),
-                        graph: &graph2,
-                        ot: ot.clone(),
-                        daemon_id: daemon_id.clone(),
-                    };
+                        let stdout_buf = SharedBuf::new();
+                        let stderr_buf = SharedBuf::new();
+                        let mut t = StandaloneTest {
+                            spec: &bsr,
+                            test_name: name.as_str(),
+                            stdout_writer: Some(Box::new(stdout_buf.clone())),
+                            stderr_writer: Some(Box::new(stderr_buf.clone())),
+                            cancel: cancel.clone(),
+                        };
+                        let opts = Options {
+                            cache: cache.clone(),
+                            exec_base: temp_dir.path().to_path_buf(),
+                            graph: &graph2,
+                            ot: ot.clone(),
+                            daemon_id: daemon_id.clone(),
+                        };
 
-                    match t.run(&opts).await {
-                        Ok(errors) => {
-                            if !errors.is_empty() {
-                                result.verdict = CheckVerdict::Fail;
-                                errors.iter().for_each(|e| {
-                                    result.err.push(format!(
-                                        "{}: {} {} had exit code {}",
-                                        name,
-                                        e.program,
-                                        e.args.join(" "),
-                                        e.exit_code
-                                    ))
-                                });
-                                let stdout = stdout_buf.into_string();
-                                let stderr = stderr_buf.into_string();
-                                if !stdout.is_empty() {
-                                    result.err.push(format!("stdout:\n{}", stdout));
-                                }
-                                if !stderr.is_empty() {
-                                    result.err.push(format!("stderr:\n{}", stderr));
+                        match t.run(&opts).await {
+                            Ok(errors) => {
+                                if !errors.is_empty() {
+                                    result.verdict = CheckVerdict::Fail;
+                                    errors.iter().for_each(|e| {
+                                        result.err.push(format!(
+                                            "{}: {} {} had exit code {}",
+                                            name,
+                                            e.program,
+                                            e.args.join(" "),
+                                            e.exit_code
+                                        ))
+                                    });
+                                    let stdout = stdout_buf.into_string();
+                                    let stderr = stderr_buf.into_string();
+                                    if !stdout.is_empty() {
+                                        result.err.push(format!("stdout:\n{}", stdout));
+                                    }
+                                    if !stderr.is_empty() {
+                                        result.err.push(format!("stderr:\n{}", stderr));
+                                    }
                                 }
                             }
-                        }
-                        Err(op::Error::Cache(CacheErr::NotFound)) => {
-                            result.verdict = CheckVerdict::Skip;
-                            return Ok(result);
-                        }
-                        Err(e) => {
-                            return Err(anyhow::Error::from(e)
-                                .context(format!("running tests for spec {}", build.name))
-                                .context(format!("failed setup for test {}", name)));
+                            Err(op::Error::Cache(CacheErr::NotFound)) => {
+                                result.verdict = CheckVerdict::Skip;
+                                return Ok(result);
+                            }
+                            Err(e) => {
+                                return Err(anyhow::Error::from(e)
+                                    .context(format!("running tests for spec {}", build.name))
+                                    .context(format!("failed setup for test {}", name)));
+                            }
                         }
                     }
-                }
-                Ok::<_, anyhow::Error>(result)
-            })
+                    Ok::<_, anyhow::Error>(result)
+                },
+                span,
+            ))
             .await
             .map_err(|e| Error::Other(anyhow::Error::from(e)))?
             .map_err(Error::Other)?;
@@ -1452,5 +1488,27 @@ mod tests {
 
         assert_eq!(seen.len(), 2, "expected one check per object, got {seen:?}");
         std::fs::remove_dir_all(&dir).expect("cleanup test tmp dir");
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod open_output_tests {
+    /// An artifact truncated while a check holds it open (a build writing
+    /// through a hardlink can do that) is a parse error for that file. With a
+    /// shared mapping, the read past the new end was SIGBUS for the process,
+    /// and this test would kill the test runner.
+    #[test]
+    fn a_file_truncated_under_the_reader_is_an_error_not_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lib.so");
+        std::fs::copy(std::env::current_exe().unwrap(), &path).unwrap();
+        let data = super::open_output(&path).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(64)
+            .unwrap();
+        assert!(object::File::parse(&data).is_err());
     }
 }

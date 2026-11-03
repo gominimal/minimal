@@ -19,9 +19,11 @@
 # Usage:
 #   sudo scripts/install-host-classifier.sh [--user NAME|UID] [--root DIR]
 #         [--answerer-address ADDR] [--answerer-port PORT]
-#         [--no-resolver-carve-out] [--ct-mark-mask 0x30000000]
-#         --cohort-address ADDR --node-plane-address ADDR
+#         [--ct-mark-mask 0x30000000]
+#         [--cohort-address ADDR --node-plane-address ADDR]
+#         [--cohort-dscp 1-63]                          # VM guest only
 #   sudo scripts/install-host-classifier.sh --pid PID
+#   sudo scripts/install-host-classifier.sh --user NAME --place-listener SOCK
 #   sudo scripts/install-host-classifier.sh --uninstall
 #        scripts/install-host-classifier.sh --check           # unprivileged
 #        scripts/install-host-classifier.sh --print-ruleset   # unprivileged
@@ -32,7 +34,11 @@
 # stand-in tree. --pid places the running daemon in the slice's daemon
 # leaf: the one migration the delegated account cannot make itself,
 # because the common ancestor of the cgroup the daemon starts in and the
-# slice is the root-owned hierarchy root.
+# slice is the root-owned hierarchy root. --place-listener makes the same
+# placement for every process of the delegated account that holds the unix
+# socket at SOCK — the daemon's own listener — so a manager-held path unit
+# watching that socket (`min finalize-install` installs one) places each
+# daemon the account starts, and no restart needs a root step of its own.
 #
 # The install also lays out the cohort's two subtrees, boxes/deny and
 # boxes/allow — a box's declaration, not its session name, decides which
@@ -57,10 +63,13 @@
 # only the mask's two bits, so bits another component already classes
 # with survive untouched. Its postrouting chain translates by that
 # mark, giving the boxes cohort and the rest of the slice their two
-# source identities (--cohort-address and --node-plane-address, both
-# required: they are this host's to know, and a table that refuses a
-# deny-all box's connections while its cohort keeps the host's own
-# source identity is half of the classification), each with a `lo`
+# source identities (--cohort-address and --node-plane-address, given
+# together or not at all: an un-enrolled native host has no egress
+# gateway reading a source address, so it translates nothing and the two
+# identities are the classify chain's two matches alone — the cgroup
+# subtree and the slice's remainder — while an association later adds the
+# reserved addresses to those same matches; one identity without the
+# other is half of the classification and is refused), each with a `lo`
 # guard so a packet to the answerer is never rewritten. Rules are keyed
 # on the cgroups' paths and the connection mark alone — never a uid or
 # pid, which a box could change about itself — and nothing is per-box:
@@ -69,7 +78,9 @@
 # components commonly class with; --ct-mark-mask overrides them (it
 # must name exactly two contiguous bits), the ruleset this host already
 # carries is scanned for a ct-mark user of those bits and the install
-# refuses over one, and the chosen mask is recorded beside the marker
+# refuses over one (a rule that writes the mark with no mask uses every
+# bit, so no mask avoids it), a mask in a range Tailscale or kube-proxy
+# classes with is refused, and the chosen mask is recorded beside the marker
 # minimald probes, so the daemon and this step read one value. That
 # marker is removed before the transaction and written only after it
 # succeeds, so a re-install that fails leaves the host honestly
@@ -77,13 +88,36 @@
 # table that is not the one this step rendered.
 set -euo pipefail
 
-# Mirrors sandbox2::classifier's constants (crates/sandbox2/src/lib.rs): the
+# Mirrors sandbox::classifier's constants (crates/sandbox/src/lib.rs): the
 # tree this script lays out is the one the daemon looks for at startup.
 readonly DEFAULT_TREE_ROOT=/sys/fs/cgroup/minimald.slice
 readonly DAEMON_LEAF=daemon
 readonly BOXES_DIR=boxes
 readonly DENY_DIR=deny
 readonly ALLOW_DIR=allow
+# The host-address cohort's blocked leaf (BEP-018): a delegated leaf
+# directly under the cohort, beside its two subtrees. The daemon moves the
+# processes of the cohort's allow-subtree boxes in here while any resident
+# member's resolved quic443 stance is blocked, and back to their own leaves
+# when the last blocking member stops. The one rule keyed on it rejects UDP
+# to port 443, so the table is never edited at launch or stop: membership
+# is the switch. It is directly under the cohort, so the cohort's
+# source-identity match still covers it.
+readonly QUIC443_BLOCKED_DIR=quic443-blocked
+# The set of box leaves whose sockets are refused UDP to port 443 as well
+# (BEP-018). A socket keeps the cgroup it was created in, so a process moved
+# into the blocked leaf still sends from the sockets it opened in its own
+# leaf. The daemon adds each allow-subtree member's own leaf to this set
+# while the cohort blocks, through the helper below, and removes it after.
+readonly QUIC443_LEAF_SET=quic443_blocked_leaves
+# The root-owned helper that adds or removes one box leaf in that set, and
+# the sudoers drop-in that lets the delegated account run it with `sudo -n`
+# and nothing else. The daemon spells the helper's path the same way
+# (QUIC443_LEAF_HELPER in crates/minimald/src/box_actor/host.rs). The
+# MINIMAL_OVERRIDE_* knobs put both under a rehearsal's scratch directory.
+readonly QUIC443_HELPER=${MINIMAL_OVERRIDE_QUIC443_HELPER:-/usr/local/lib/minimal/quic443-leaf}
+readonly QUIC443_SUDOERS=${MINIMAL_OVERRIDE_QUIC443_SUDOERS:-/etc/sudoers.d/minimal-quic443-leaf}
+readonly quic443_helper_overridden=${MINIMAL_OVERRIDE_QUIC443_HELPER:+1}
 # The name the loaded table and its presence marker share: the daemon probes
 # $tree_root/$TABLE_MARKER (read-only, no CAP_NET_ADMIN) because listing the
 # table itself needs the very capability that loaded it.
@@ -103,10 +137,20 @@ readonly MASK_RECORD_PREFIX=ct-mark-mask-
 # The resolver carve-out the loaded table admits, recorded beside the
 # marker as "$CARVE_OUT_RECORD_PREFIX<address>-<port>" so the daemon can
 # refuse a deny-all box whose carve-out no longer names its live answerer.
-# A table rendered with --no-resolver-carve-out carries none and records
-# none.
 readonly CARVE_OUT_RECORD_PREFIX=carve-out-
 readonly DEFAULT_CT_MARK_MASK=0x30000000
+# The mark ranges well-known components of a host class connections with,
+# one "<component> <range>" per line. --ct-mark-mask refuses a mask that
+# touches one of them even when this host's ruleset shows no user of it
+# yet: the component can start after the install, and the scan below sees
+# only the rules loaded now. Tailscale classes with 0x00ff0000, kube-proxy
+# with 0x4000 (masquerade) and 0x8000 (drop).
+readonly WELL_KNOWN_MARK_RANGES='Tailscale 0x00ff0000
+kube-proxy 0x0000c000'
+# The named counter every refusal of this table counts in: the deny-all
+# chain's and the IPv6 chain's alike, so one listing reads both
+# (`nft list counter inet minimal_class refused`).
+readonly REFUSED_COUNTER=refused
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*"; }
@@ -144,23 +188,29 @@ tree_root=$DEFAULT_TREE_ROOT
 # carve-out is by address and port, never loopback-wide).
 answerer_address=127.0.0.1
 answerer_port=7656
-# --no-resolver-carve-out renders neither the answerer's admission in
-# deny_out nor the dstnat retarget: a VM-backed guest has no resolver a
-# deny-all box may be admitted to (its node DNS layer applies no per-box
-# name rule to host-address boxes), so its DNS is refused like any other
-# destination until gominimal/inbox#897 gives it one.
-resolver_carve_out=1
-answerer_given=
 # The cohort's and the node plane's source identities (NET-078). They are
-# this host's to know, not the script's to guess: each SNAT rule is rendered
-# only when its address was given, and the two go together — half a
-# classification is one identity wearing two names.
+# this host's to know, not the script's to guess: the SNAT rules are
+# rendered only when the addresses were given, and the two go together —
+# half a classification is one identity wearing two names. Neither given
+# is the un-enrolled host: the identities are the classify chain's two
+# cgroup matches, translated to nothing.
 cohort_address=
 node_plane_address=
+# The DSCP value a VM guest writes on a box's packets, so the VM host's
+# gate can tell a box's frame from the guest daemon's own when both leave
+# from the guest's one address. Only the guest's own render passes it. A
+# native host renders no DSCP rule and leaves the field alone.
+cohort_dscp=
+# The unix socket --place-listener reads the daemon's pid from: every
+# process of the delegated account holding it is placed in the daemon leaf.
+listener=
 # The two ct-mark bits the classify chain classifies with (see the
 # constants above); require_mask checks the value and derives every
 # spelling the ruleset renders from it.
 ct_mark_mask=$DEFAULT_CT_MARK_MASK
+# Set when --ct-mark-mask names the mask. Without it, an install re-applies
+# the mask a previous install recorded under the tree, if there is one.
+ct_mark_mask_given=
 # The parse loop consumes $@; keep the original invocation for the sudo hint
 # below, or a copy-pasted retry silently drops --user/--uninstall.
 original_args=("$@")
@@ -180,7 +230,6 @@ while [ $# -gt 0 ]; do
         --answerer-address)
             [ $# -ge 2 ] || die "--answerer-address needs an address"
             answerer_address=$2
-            answerer_given=1
             shift 2
             ;;
         --answerer-port)
@@ -189,7 +238,6 @@ while [ $# -gt 0 ]; do
                 die "--answerer-port needs a numeric port, got: $2" ;;
             esac
             answerer_port=$2
-            answerer_given=1
             shift 2
             ;;
         --cohort-address)
@@ -202,12 +250,23 @@ while [ $# -gt 0 ]; do
             node_plane_address=$2
             shift 2
             ;;
+        --cohort-dscp)
+            [ $# -ge 2 ] || die "--cohort-dscp needs a DSCP value"
+            case "$2" in ''|*[!0-9]*)
+                die "--cohort-dscp needs a numeric DSCP value, got: $2" ;;
+            esac
+            if [ "$2" -lt 1 ] || [ "$2" -gt 63 ]; then
+                die "--cohort-dscp needs a DSCP value from 1 to 63, got: $2"
+            fi
+            cohort_dscp=$2
+            shift 2
+            ;;
         --ct-mark-mask)
             [ $# -ge 2 ] || die "--ct-mark-mask needs a mask"
             ct_mark_mask=$2
+            ct_mark_mask_given=1
             shift 2
             ;;
-        --no-resolver-carve-out) resolver_carve_out=; shift ;;
         --uninstall) mode=uninstall; shift ;;
         --check)     mode=check; shift ;;
         --print-ruleset) mode=print_ruleset; shift ;;
@@ -220,19 +279,19 @@ while [ $# -gt 0 ]; do
             mode=place
             shift 2
             ;;
+        --place-listener)
+            [ $# -ge 2 ] || die "--place-listener needs a socket path"
+            listener=$2
+            mode=place_listener
+            shift 2
+            ;;
         # The header above this line is the usage. Two explicit strips, not
         # 's/^# \?//': \? is a GNU sed extension BSD sed does not know, and this
         # script's own tests run on macOS's /bin/sh too.
-        -h|--help)   sed -n '2,77p' "$0" | sed -e 's/^# //' -e 's/^#//'; exit 0 ;;
+        -h|--help)   sed -n '2,87p' "$0" | sed -e 's/^# //' -e 's/^#//'; exit 0 ;;
         *)           die "unknown argument: $1 (see --help)" ;;
     esac
 done
-
-# A render without the carve-out has no answerer to name, so a call that
-# names one asked for two renders at once.
-if [ -z "$resolver_carve_out" ] && [ -n "$answerer_given" ]; then
-    die "--no-resolver-carve-out renders no answerer: drop --answerer-address and --answerer-port"
-fi
 
 # The account the tree is delegated to, and the one whose boxes it is:
 # --user wins, else the account that ran sudo, else there is no default worth
@@ -338,18 +397,29 @@ do_check() {
     resolve_owner
     # The fix for a missing tree is the install, not a re-check: hint the
     # caller's own invocation with --check dropped, keeping whatever --root
-    # and --user they asked about. The two source identities the install
-    # refuses to run without (see require_identities) are appended for
-    # whichever this check was not told — the hint must be the command an
-    # install would accept, so copy-pasting it lands on the refusal the
-    # install makes of a half-told classification, never a refusal of the
-    # hint's own shape.
+    # and --user they asked about. Nothing is appended for it: an install
+    # told no source identity is the un-enrolled host's own, so the hint is
+    # a command the install accepts as it stands, never one with a
+    # placeholder the caller has no value for. A lone identity is one the
+    # install refuses, so the hint drops it too rather than hint a command
+    # that dies.
+    lone_identity=
+    if { [ -n "$cohort_address" ] && [ -z "$node_plane_address" ]; } ||
+        { [ -z "$cohort_address" ] && [ -n "$node_plane_address" ]; }; then
+        lone_identity=1
+    fi
     hint_args=()
-    for a in "${original_args[@]}"; do [ "$a" = --check ] || hint_args+=("$a"); done
-    [ -n "$cohort_address" ] ||
-        hint_args+=(--cohort-address "<cohort address>")
-    [ -n "$node_plane_address" ] ||
-        hint_args+=(--node-plane-address "<node-plane address>")
+    skip_value=
+    for a in "${original_args[@]}"; do
+        if [ -n "$skip_value" ]; then skip_value=; continue; fi
+        case "$a" in
+        --check) continue ;;
+        --cohort-address | --node-plane-address)
+            if [ -n "$lone_identity" ]; then skip_value=1; continue; fi
+            ;;
+        esac
+        hint_args+=("$a")
+    done
     hint="sudo $0${hint_args[0]+ }${hint_args[*]-}"
     if covering="$(covering_mount "$tree_root")"; then
         read -r covering_point nsdel nsroot <<<"$covering"
@@ -385,7 +455,8 @@ do_check() {
     # its declaration picked.
     for cgroup in \
         "" "/$DAEMON_LEAF" "/$BOXES_DIR" \
-        "/$BOXES_DIR/$DENY_DIR" "/$BOXES_DIR/$ALLOW_DIR"
+        "/$BOXES_DIR/$DENY_DIR" "/$BOXES_DIR/$ALLOW_DIR" \
+        "/$BOXES_DIR/$QUIC443_BLOCKED_DIR"
     do
         path="$tree_root$cgroup"
         if [ ! -d "$path" ]; then
@@ -420,7 +491,7 @@ do_check() {
     fi
     [ "$problems" -eq 0 ] || die "$problems problem(s): the tree is not installed as minimald needs it"
     note "tree:     $tree_root"
-    note "delegated: $owner_uid:$owner_gid — the slice, $DAEMON_LEAF, $BOXES_DIR and its $DENY_DIR and $ALLOW_DIR subtrees, each with its cgroup.procs, cgroup.threads and cgroup.subtree_control"
+    note "delegated: $owner_uid:$owner_gid — the slice, $DAEMON_LEAF, $BOXES_DIR, its $DENY_DIR and $ALLOW_DIR subtrees and its $QUIC443_BLOCKED_DIR leaf, each with its cgroup.procs, cgroup.threads and cgroup.subtree_control"
     note "table:    $tree_root/$TABLE_MARKER (the loaded table's marker; minimald records a per-box verdict only while it is there)"
     note "ct-mark:  ${recorded:-<none recorded>} (the mask the table classifies cohort and node plane with, recorded beside the marker)"
     note "the cgroup2 mount above the slice stays root-owned"
@@ -438,7 +509,7 @@ place_daemon() {
     verify_mount
     procs="$tree_root/$DAEMON_LEAF/cgroup.procs"
     if [ ! -e "$procs" ]; then
-        die "$tree_root/$DAEMON_LEAF is not installed (run: sudo $0 --user <the account minimald runs as>)"
+        die "$tree_root/$DAEMON_LEAF is not installed (run: min finalize-install)"
     fi
     kill -0 "$pid" 2>/dev/null ||
         die "no process $pid: pass the pid of the running minimald (its startup line names the tree it is outside)"
@@ -446,7 +517,126 @@ place_daemon() {
         die "cannot place $pid in $procs (is $pid a process root may move, and is it the running minimald?)"
     note "placed $pid in $tree_root/$DAEMON_LEAF"
     note "the running minimald is inside the slice now: the placement probe runs per launch, so the next box it launches is placed in a leaf of its own"
-    note "a plain restart loses this placement — a new minimald starts in its starter's cgroup unless a Delegate=yes unit starts it in the slice, so pass --pid again afterwards"
+    note "a plain restart loses this placement — a new minimald starts in its starter's cgroup unless a Delegate=yes unit starts it in the slice or the placement unit \`min finalize-install\` installs places it, so pass --pid again afterwards where neither is in force"
+}
+
+# The process table --place-listener reads: the real one, or a stand-in a
+# rehearsal lays out in the shape of /proc — <pid>/status, <pid>/fd/* and
+# net/unix — so an unprivileged test can pin which holder is placed and
+# which is left alone without a kernel to hold a socket.
+readonly PROC=${MINIMAL_OVERRIDE_PROC:-/proc}
+
+# place_listener — the --pid placement for every process of the delegated
+# account that holds the unix socket at $listener: the daemon's own
+# listener names the daemon without anyone having to read its pid, so the
+# manager-held path unit `min finalize-install` installs can make the
+# placement at every start the socket announces. The holders are read the
+# way the kernel states them — the socket's inode from net/unix, then every
+# process whose fd table carries it — never from a pidfile the account
+# could write any pid into. Only the delegated account's own processes are
+# placed: root moving a process of uid U into a cgroup delegated to U gives
+# U nothing it does not already own, and nothing of anyone else's is ever
+# moved. And only a process standing OUTSIDE the slice is moved: a box runs
+# as the same account and could bind a socket spelled like the listener,
+# so a holder already anywhere under the slice — a box in its leaf first of
+# all — is left where it is, because moving it into the daemon's leaf would
+# lift it out of its verdict (design §4.1: a box's placement is
+# inescapable, by root's hand as much as its own). A socket nobody holds is
+# nothing to place and exits 0: the unit fires on the socket's removal too,
+# and that is not a failure.
+place_listener() {
+    verify_mount
+    resolve_owner
+    compute_cgroup_paths
+    procs="$tree_root/$DAEMON_LEAF/cgroup.procs"
+    [ -e "$procs" ] ||
+        die "$tree_root/$DAEMON_LEAF is not installed (run: min finalize-install)"
+    [ -r "$PROC/net/unix" ] || die "cannot read the unix socket table at $PROC/net/unix"
+    # net/unix: "Num RefCount Protocol Flags Type St Inode Path"; the
+    # listener's path may be bound more than once over a daemon's life (a
+    # stale entry outlives nothing here, but the match is by inode, so each
+    # live one is placed and a dead one simply has no holder).
+    inodes="$(awk -v p="$listener" '$8 == p { print $7 }' "$PROC/net/unix")"
+    if [ -z "$inodes" ]; then
+        note "no process holds $listener: nothing to place"
+        return 0
+    fi
+    # The holders, one pass over every fd table per inode (find walks it
+    # without a fork per descriptor; the unit runs this as root on every
+    # start, so the scan must be cheap). A daemon that restarts while the
+    # scan runs is a holder that vanishes under it, and the manager does
+    # not watch the path while the oneshot is active, so a vanished holder
+    # is noted, never fatal, and a socket whose holder was not found is
+    # looked for once more after a moment before it reads as unheld.
+    holders="$(listener_holders)"
+    if [ -z "$holders" ]; then
+        sleep 1
+        holders="$(listener_holders)"
+        note "no holder of $listener was found on the first pass; scanned again"
+    fi
+    placed=0
+    for holder_pid in $holders; do
+        dir="$PROC/$holder_pid"
+        # The real uid, the first of the four status reports.
+        holder_uid="$(awk '$1 == "Uid:" { print $2 }' "$dir/status" 2>/dev/null || true)"
+        if [ "$holder_uid" != "$owner_uid" ]; then
+            note "left $holder_pid alone: it holds $listener but runs as uid ${holder_uid:-?}, not the delegated account $owner_uid"
+            continue
+        fi
+        if grep -qx "$holder_pid" "$procs" 2>/dev/null; then
+            note "$holder_pid is already in $tree_root/$DAEMON_LEAF"
+            placed=$((placed + 1))
+            continue
+        fi
+        # Where the holder stands now, as the kernel states it (the unified
+        # hierarchy's one "0::" line). Unreadable is unknown, and unknown
+        # is not moved.
+        holder_cgroup="$(awk -F: '$1 == "0" { print $3 }' "$dir/cgroup" 2>/dev/null || true)"
+        if [ -z "$holder_cgroup" ]; then
+            note "left $holder_pid alone: it holds $listener but its cgroup could not be read"
+            continue
+        fi
+        case "$holder_cgroup" in
+        "/$rel" | "/$rel/"*)
+            note "left $holder_pid alone: it holds $listener but already stands inside the slice at $holder_cgroup, and nothing under $rel is ever moved"
+            continue
+            ;;
+        esac
+        if printf '%s\n' "$holder_pid" >"$procs" 2>/dev/null; then
+            note "placed $holder_pid in $tree_root/$DAEMON_LEAF (it holds $listener)"
+            placed=$((placed + 1))
+        else
+            note "could not place $holder_pid in $procs: it has gone, or is not a process root may move"
+        fi
+    done
+    # The closing line is the one a person reads last, so it states what
+    # happened: an unheld socket, or holders that were each left alone for
+    # the reason noted above.
+    if [ -z "$holders" ]; then
+        note "no process holds $listener: nothing to place"
+    elif [ "$placed" -eq 0 ]; then
+        note "every holder of $listener was left where it stands, for the reasons above: nothing placed"
+    fi
+}
+
+# listener_holders — the pids whose fd tables carry one of $inodes, found by
+# one find per inode over every process's fd directory (the pid is the path
+# component after $PROC), each printed once. The brackets are escaped: a
+# find -lname pattern is a glob.
+listener_holders() {
+    for inode in $inodes; do
+        # find's exit status is not evidence here: a process that exits, or a
+        # descriptor any process closes, between find listing an fd table and
+        # reading an entry of it makes find exit non-zero, on a host where
+        # nothing is wrong. Under pipefail that status would end the unit,
+        # so it is dropped; what find printed is the scan.
+        find "$PROC"/[0-9]*/fd -lname "socket:\\[$inode\\]" 2>/dev/null || true
+    done | awk -v proc="$PROC/" '
+        index($0, proc) == 1 {
+            rest = substr($0, length(proc) + 1)
+            split(rest, part, "/")
+            if (!(part[1] in seen)) { seen[part[1]] = 1; print part[1] }
+        }'
 }
 
 # The cgroups' paths as the packet filter spells them: relative to the
@@ -462,6 +652,8 @@ compute_cgroup_paths() {
         die "$tree_root is the cgroup2 mount root itself; the classifier needs a slice below the mount root to key its rules on"
     deny_path="$rel/$BOXES_DIR/$DENY_DIR"
     boxes_path="$rel/$BOXES_DIR"
+    quic443_blocked_path="$rel/$BOXES_DIR/$QUIC443_BLOCKED_DIR"
+    allow_path="$rel/$BOXES_DIR/$ALLOW_DIR"
 }
 
 # cgroup_level <path> — the nft socket match compares that many leading
@@ -470,6 +662,200 @@ compute_cgroup_paths() {
 # shifts every rule with it.
 cgroup_level() {
     awk -v p="$1" 'BEGIN { printf "%d\n", split(p, a, "/") }'
+}
+
+# box_leaf_level — the depth of a box's own leaf under the allow subtree,
+# the level the blocked-leaves set and its rule compare at.
+box_leaf_level() {
+    echo $(( $(cgroup_level "$allow_path") + 1 ))
+}
+
+# render_quic443_helper — the root-owned helper, on stdout. It takes `add`
+# or `remove` and one path, and it changes the $QUIC443_LEAF_SET set only
+# when that path is one box leaf directly under this tree's allow subtree.
+# It refuses every other path, so the account that may run it as root can
+# put no other cgroup in the set and run nothing else. The tree's paths and
+# the nft binary are written in at install: under sudo nothing in the
+# caller's environment reaches them. The nft path is $quic443_nft, which
+# resolve_quic443_nft resolved and checked before the install began.
+render_quic443_helper() {
+    local allow_root="$tree_root/$BOXES_DIR/$ALLOW_DIR"
+    local nft_bin="$quic443_nft"
+    cat <<'HEAD'
+#!/bin/bash
+# Written by install-host-classifier.sh. Adds a box's own leaf to the set of
+# leaves that are refused UDP to port 443, or removes it. minimald runs this
+# with `sudo -n` while the host-address boxes block QUIC.
+set -eu
+export LC_ALL=C
+HEAD
+    printf 'readonly ALLOW_ROOT=%q
+' "$allow_root"
+    printf 'readonly ALLOW_REL=%q
+' "$allow_path"
+    printf 'readonly NFT=%q
+' "$nft_bin"
+    printf 'readonly TABLE=%q
+' "$TABLE_NAME"
+    printf 'readonly SET=%q
+' "$QUIC443_LEAF_SET"
+    cat <<'BODY'
+refuse() { printf 'error: %s
+' "$*" >&2; exit 2; }
+[ "$#" -eq 2 ] || refuse "usage: $0 add|remove <box leaf directory>"
+case "$1" in
+    add) verb=add ;;
+    remove) verb=delete ;;
+    *) refuse "refused: the first argument must be add or remove, not: $1" ;;
+esac
+leaf=$2
+name=${leaf#"$ALLOW_ROOT/"}
+[ "$name" != "$leaf" ] || refuse "refused: $leaf is not a box leaf in $ALLOW_ROOT"
+case "$name" in
+    ''|.|..|-*|*/*|*[!A-Za-z0-9._-]*)
+        refuse "refused: $leaf is not a box leaf in $ALLOW_ROOT" ;;
+esac
+if [ "$verb" = add ] && { [ -L "$leaf" ] || [ ! -d "$leaf" ]; }; then
+    refuse "refused: $leaf is not a directory"
+fi
+exec "$NFT" "$verb" element inet "$TABLE" "$SET" "{ \"$ALLOW_REL/$name\" }"
+BODY
+}
+
+# stat_mode <path> — the permission bits in octal, GNU or BSD syntax.
+stat_mode() {
+    out="$(stat -c '%a' "$1" 2>/dev/null || true)"
+    if [ -n "$out" ]; then printf '%s\n' "$out"; return 0; fi
+    stat -f '%Lp' "$1"
+}
+
+# assert_root_only_dir <dir> — succeeds when no account but root can change
+# what <dir> holds: the directory and every parent up to / are owned by
+# root and are not group or other writable. Otherwise it prints the first
+# directory that fails, and why, and returns 1. Root runs the helper for
+# the delegated account, so a directory that account can write would let
+# it replace the helper. A rehearsal checks only <dir> itself, and accepts
+# the running account as its owner, because its scratch tree sits under a
+# temporary directory that is not root-owned.
+assert_root_only_dir() {
+    local dir
+    dir="$(cd -P "$1" 2>/dev/null && pwd -P)" || {
+        printf '%s is not a directory that can be read' "$1"
+        return 1
+    }
+    while :; do
+        assert_root_only_entry "$dir" || return 1
+        [ "$rehearsal" = 1 ] && return 0
+        [ "$dir" = / ] && return 0
+        dir="$(dirname "$dir")"
+    done
+}
+
+# assert_root_only_entry <path> — succeeds when <path> itself is owned by
+# root and is not group or other writable. Otherwise it prints why and
+# returns 1. A rehearsal also accepts the running account as the owner.
+assert_root_only_entry() {
+    local owner_ok mode uid
+    owner_ok=0
+    [ "$rehearsal" = 1 ] && owner_ok="$(id -u)"
+    if ! uid="$(stat_uid_gid "$1")" || ! mode="$(stat_mode "$1")"; then
+        printf 'cannot read the owner and mode of %s' "$1"
+        return 1
+    fi
+    uid=${uid%% *}
+    if [ "$uid" != 0 ] && [ "$uid" != "$owner_ok" ]; then
+        printf '%s is owned by uid %s, not root. Make root its owner, then run this installer again.' "$1" "$uid"
+        return 1
+    fi
+    if [ $(( 8#$mode & 8#022 )) -ne 0 ]; then
+        printf '%s can be written by accounts other than its owner (mode %s). Remove group and other write, e.g.: chmod go-w %s' "$1" "$mode" "$1"
+        return 1
+    fi
+}
+
+# resolve_quic443_nft — sets quic443_nft to the nft binary the helper runs
+# as root, with every symlink resolved. It refuses the binary unless the
+# file and each directory above it are root-only, because an account that
+# can replace that file gets root through the helper.
+resolve_quic443_nft() {
+    local found
+    found="$(command -v nft)" ||
+        die "cannot install the QUIC block helper at $QUIC443_HELPER: nft is not on PATH"
+    if ! quic443_nft="$(readlink -f "$found" 2>/dev/null)"; then
+        die "cannot install the QUIC block helper at $QUIC443_HELPER: cannot resolve $found to a file"
+    fi
+    if [ ! -f "$quic443_nft" ]; then
+        die "cannot install the QUIC block helper at $QUIC443_HELPER: cannot resolve $found to a file"
+    fi
+    local why
+    why="$(assert_root_only_entry "$quic443_nft")" ||
+        die "cannot install the QUIC block helper at $QUIC443_HELPER: $why"
+    why="$(assert_root_only_dir "$(dirname "$quic443_nft")")" ||
+        die "cannot install the QUIC block helper at $QUIC443_HELPER: $why"
+}
+
+# install_quic443_helper — writes the helper root-owned, mode 0755, and the
+# sudoers drop-in that lets the delegated account run that one file as root
+# with no password, checked with visudo before it is put in place. A real
+# install refuses when visudo is missing. A rehearsal writes them only where
+# its MINIMAL_OVERRIDE_* knobs say, and skips the check when visudo is
+# missing, because its drop-in is not in a directory sudo reads.
+install_quic443_helper() {
+    if [ "$rehearsal" = 1 ] && [ "$quic443_helper_overridden" != 1 ]; then
+        return 0
+    fi
+    local why
+    why="$(mkdir -p "$(dirname "$QUIC443_HELPER")" 2>&1)" ||
+        die "cannot install the QUIC block helper at $QUIC443_HELPER: $why"
+    why="$(assert_root_only_dir "$(dirname "$QUIC443_HELPER")")" ||
+        die "cannot install the QUIC block helper at $QUIC443_HELPER: $why"
+    # mktemp creates a new file with O_EXCL, so a staging name planted in
+    # advance, a symlink included, is never written through.
+    local staged
+    staged="$(mktemp "$QUIC443_HELPER.XXXXXX" 2>&1)" ||
+        die "cannot install the QUIC block helper at $QUIC443_HELPER: $staged"
+    why="$( { render_quic443_helper >"$staged" && chmod 0755 "$staged"; } 2>&1)" || {
+        rm -f "$staged"
+        die "cannot install the QUIC block helper at $QUIC443_HELPER: $why"
+    }
+    if [ "$rehearsal" != 1 ]; then
+        why="$(chown root:root "$staged" 2>&1)" ||
+            die "cannot install the QUIC block helper at $QUIC443_HELPER: $why"
+    fi
+    why="$(mv -f "$staged" "$QUIC443_HELPER" 2>&1)" ||
+        die "cannot install the QUIC block helper at $QUIC443_HELPER: $why"
+
+    why="$(mkdir -p "$(dirname "$QUIC443_SUDOERS")" 2>&1)" ||
+        die "cannot install the sudoers rule for the QUIC block helper at $QUIC443_SUDOERS: $why"
+    why="$(assert_root_only_dir "$(dirname "$QUIC443_SUDOERS")")" ||
+        die "cannot install the sudoers rule for the QUIC block helper at $QUIC443_SUDOERS: $why"
+    # sudoers ignores a drop-in whose name carries a dot, so the staged
+    # copy is never read before it is checked.
+    local staged_rule
+    staged_rule="$(mktemp "$QUIC443_SUDOERS.XXXXXX" 2>&1)" ||
+        die "cannot install the sudoers rule for the QUIC block helper at $QUIC443_SUDOERS: $staged_rule"
+    why="$( {
+        printf '# Written by install-host-classifier.sh: minimald runs this one helper as root.\n'
+        printf '#%s ALL=(root) NOPASSWD: %s\n' "$owner_uid" "$QUIC443_HELPER"
+    } 2>&1 >"$staged_rule" && chmod 0440 "$staged_rule" 2>&1)" ||
+        die "cannot install the sudoers rule for the QUIC block helper at $QUIC443_SUDOERS: $why"
+    if command -v visudo >/dev/null 2>&1; then
+        why="$(visudo -cf "$staged_rule" 2>&1)" || {
+            rm -f "$staged_rule"
+            die "cannot install the sudoers rule for the QUIC block helper at $QUIC443_SUDOERS: visudo refused it: $why"
+        }
+    elif [ "$rehearsal" != 1 ]; then
+        # An unchecked drop-in that sudo cannot parse breaks sudo for the
+        # whole host, so a real install never puts one in place.
+        rm -f "$staged_rule"
+        die "cannot install the sudoers rule for the QUIC block helper at $QUIC443_SUDOERS: visudo is not installed, so the rule cannot be checked. Install the sudo package, then run this installer again."
+    fi
+    if [ "$rehearsal" != 1 ]; then
+        why="$(chown root:root "$staged_rule" 2>&1)" ||
+            die "cannot install the sudoers rule for the QUIC block helper at $QUIC443_SUDOERS: $why"
+    fi
+    why="$(mv -f "$staged_rule" "$QUIC443_SUDOERS" 2>&1)" ||
+        die "cannot install the sudoers rule for the QUIC block helper at $QUIC443_SUDOERS: $why"
 }
 
 # render_ruleset — the one table this step owns, on stdout, as one `nft -f`
@@ -486,10 +872,13 @@ cgroup_level() {
 # things — and leaves the previous table standing when it dies.
 #
 # The dstnat chain (priority dstnat, before the filter output chain)
-# retargets the deny subtree's DNS-port lookups on the answerer's address
-# onto the answerer's own port: a deny-all box resolves through the
-# answerer (NET-079) by asking DNS's port like any resolver would, and the
-# one destination its deny rule admits is the one its lookups reach.
+# retargets the deny subtree's DNS-port lookups onto the answerer's own
+# port: a deny-all box resolves through the carve-out (NET-079)
+# by asking DNS's port like any resolver would, and the one destination
+# its deny rule admits is the one its lookups reach. The match carries no
+# destination address: on a guest the box asks the switch gateway, not the
+# answerer, and the retarget is what steers the lookup onto the listener
+# that answers it.
 #
 # The filter output chain runs before the postrouting chain (priority
 # srcnat), so a connection refused on the box's own cgroup is refused
@@ -505,6 +894,22 @@ cgroup_level() {
 # is active — reject, never a silent drop — and each one logs,
 # rate-limited, so a diagnostics bundle's daemon log tail carries the
 # refused connections themselves.
+#
+# The output chain's second rule is the cohort's QUIC stance (BEP-018): a
+# socket in the cohort's blocked leaf that sends UDP to port 443 gets ICMP
+# port unreachable, an active reject, so a client falls back to TCP at once.
+# The rule is fixed with the table like every other. The daemon decides
+# who it reaches by moving the cohort's processes into that leaf and out of
+# it, a cgroup.procs write inside the delegated slice. Its third rule is the
+# same reject for a socket created in a box leaf that is in the
+# $QUIC443_LEAF_SET set: a socket keeps the cgroup it was created in, so a
+# socket a member opened before the cohort turned blocked is matched on
+# its own leaf. Only the root-owned helper the install adds changes the
+# set, one leaf under the allow subtree at a time. A first install declares
+# it empty. A re-install declares it with the leaves in
+# $quic443_kept_leaves, which kept_quic443_leaves read from the loaded
+# table, so the delete and the re-declare in one transaction never take a
+# blocked leaf out of the set, even for an instant.
 #
 # The classify chain is where a flow is classed, at the mangle priority —
 # ahead of the dstnat and filter chains, and the last place the kernel
@@ -523,30 +928,95 @@ cgroup_level() {
 # The postrouting chain translates by the mark, not the socket, with a
 # `lo` guard on each SNAT: a packet to the answerer never leaves the host,
 # so translating its source would rewrite the reply the conntrack entry
-# already knows.
+# already knows. Rendered with no source identity it holds no rule: the
+# un-enrolled host's two identities are the classify chain's matches and
+# nothing is translated, and the chain stands so an association can add
+# the reserved addresses to the same two marks without a reinstall.
+#
+# With --cohort-dscp, a VM guest's render adds the mark_cohort chain. It
+# runs at postrouting as a filter chain, so it sees every packet, not only
+# a connection's first. A packet of a connection the boxes cohort opened
+# leaves with the given DSCP value. Every other packet leaves with the
+# field cleared, so no process outside the cohort can wear the value. The
+# VM host's gate reads the value to decide a frame from the guest's one
+# address by the box's rules, and an unmarked frame by the node plane's.
+#
+# The ipv6_out chain refuses every IPv6 connection a box in the boxes
+# subtree opens to anything but loopback, whatever the box declares. A
+# host-address box's allow list is decided by IPv4 address rules only, and
+# this table has no IPv6 path to decide one on, so IPv6 would be a way
+# around every box's verdict, the allow subtree's included. Its refusal is
+# the deny chain's: replies admitted, then the same named counter, log
+# prefix and active reject, so one counter reads every refusal this table
+# makes, IPv4 and IPv6 alike.
+#
+# This refusal is the v1 posture, not the end state. It stays until the
+# IPv6 admission path of design section 12 item 5 (gominimal/arch#43)
+# lands. That path decides a box's IPv6 egress the way the IPv4 rules
+# decide it, and replaces this blanket refusal. Until then, IPv6 is a way
+# around the allow list, and this chain closes it.
 render_ruleset() {
+    leaf_elements=
+    if [ -n "${quic443_kept_leaves:-}" ]; then
+        leaf_elements="$(printf '%s\n' "$quic443_kept_leaves" |
+            awk 'NF { printf "%s\"%s\"", (n++ ? ", " : ""), $0 }')"
+        leaf_elements="
+        elements = { $leaf_elements }"
+    fi
     carve_out_rule=
     dstnat_chain=
-    if [ -n "$resolver_carve_out" ]; then
-        carve_out_rule="
-        ip daddr $answerer_address udp dport $answerer_port accept"
-        dstnat_chain="
-    chain dstnat {
-        type nat hook output priority dstnat; policy accept;
-        socket cgroupv2 level $(cgroup_level "$deny_path") \"$deny_path\" ip daddr $answerer_address udp dport 53 dnat ip to $answerer_address:$answerer_port
+    snat_rules=
+    if [ -n "$cohort_address" ]; then
+        snat_rules="
+        ct mark and $mask_hex == $cohort_hex oifname != \"lo\" snat ip to $cohort_address
+        ct mark and $mask_hex == $node_hex oifname != \"lo\" snat ip to $node_plane_address"
+    fi
+    dscp_chain=
+    if [ -n "$cohort_dscp" ]; then
+        dscp_chain="
+    chain mark_cohort {
+        type filter hook postrouting priority mangle; policy accept;
+        ct mark and $mask_hex == $cohort_hex ip dscp set $cohort_dscp
+        ct mark and $mask_hex != $cohort_hex ip dscp set 0
     }"
     fi
+    carve_out_rule="
+        ip daddr $answerer_address udp dport $answerer_port accept"
+    dstnat_chain="
+    chain dstnat {
+        type nat hook output priority dstnat; policy accept;
+        socket cgroupv2 level $(cgroup_level "$deny_path") \"$deny_path\" udp dport 53 dnat ip to $answerer_address:$answerer_port
+    }"
     cat <<RULES
 add table inet $TABLE_NAME
 delete table inet $TABLE_NAME
 
 table inet $TABLE_NAME {
+    counter $REFUSED_COUNTER {
+        packets 0 bytes 0
+    }
+    set $QUIC443_LEAF_SET {
+        typeof socket cgroupv2 level $(box_leaf_level)$leaf_elements
+    }
     chain output {
         type filter hook output priority filter; policy accept;
         socket cgroupv2 level $(cgroup_level "$deny_path") "$deny_path" jump deny_out
+        socket cgroupv2 level $(cgroup_level "$quic443_blocked_path") "$quic443_blocked_path" udp dport 443 reject with icmpx port-unreachable
+        socket cgroupv2 level $(box_leaf_level) @$QUIC443_LEAF_SET udp dport 443 reject with icmpx port-unreachable
     }
     chain deny_out {
         ct state established,related ct direction reply accept$carve_out_rule
+        counter name "$REFUSED_COUNTER"
+        limit rate 1/second burst 4 packets log prefix "minimal-classifier: refused " level warn
+        reject with icmpx admin-prohibited
+    }
+    chain ipv6_out {
+        type filter hook output priority filter; policy accept;
+        meta nfproto ipv6 oifname != "lo" socket cgroupv2 level $(cgroup_level "$boxes_path") "$boxes_path" jump ipv6_refuse
+    }
+    chain ipv6_refuse {
+        ct state established,related ct direction reply accept
+        counter name "$REFUSED_COUNTER"
         limit rate 1/second burst 4 packets log prefix "minimal-classifier: refused " level warn
         reject with icmpx admin-prohibited
     }$dstnat_chain
@@ -556,23 +1026,71 @@ table inet $TABLE_NAME {
         ct state new ct mark and $mask_hex == 0 socket cgroupv2 level $(cgroup_level "$rel") "$rel" ct mark set ct mark and $clear_hex or $node_hex
     }
     chain postrouting {
-        type nat hook postrouting priority srcnat; policy accept;
-        ct mark and $mask_hex == $cohort_hex oifname != "lo" snat ip to $cohort_address
-        ct mark and $mask_hex == $node_hex oifname != "lo" snat ip to $node_plane_address
-    }
+        type nat hook postrouting priority srcnat; policy accept;$snat_rules
+    }$dscp_chain
 }
 RULES
 }
 
+# kept_quic443_leaves — the box leaves in the loaded table's
+# $QUIC443_LEAF_SET set, one per line, read with `nft -j list set`. It keeps
+# only a leaf the helper can add: one directory directly under the allow
+# subtree, with a plain name. A leaf whose directory is gone is dropped,
+# because nft refuses a cgroup path that does not exist. No table, or no
+# set, prints nothing. When the listing fails while the loaded table
+# declares the set, it prints why and returns 1: rendering the set empty
+# would let a blocked box send UDP to port 443 again. The loaded table is
+# read from $host_ruleset, the listing scan_ct_mark_conflicts took.
+kept_quic443_leaves() {
+    local listing elems elem name why
+    if ! listing="$(nft -j list set inet "$TABLE_NAME" "$QUIC443_LEAF_SET" </dev/null 2>/dev/null)"; then
+        printf '%s\n' "$host_ruleset" | quic443_set_declared || return 0
+        why="$(nft -j list set inet "$TABLE_NAME" "$QUIC443_LEAF_SET" 2>&1 >/dev/null </dev/null || true)"
+        printf 'nft -j list set inet %s %s failed: %s' "$TABLE_NAME" "$QUIC443_LEAF_SET" "${why:-no error text}"
+        return 1
+    fi
+    elems="$(printf '%s' "$listing" | tr -d '\n' | grep -o '"elem": *\[[^]]*\]' || true)"
+    elems=${elems#*\[}
+    printf '%s' "$elems" | { grep -o '"[^"]*"' || true; } | while IFS= read -r elem; do
+        elem=${elem#\"}
+        elem=${elem%\"}
+        name=${elem#"$allow_path/"}
+        [ "$name" != "$elem" ] || continue
+        case "$name" in
+            ''|.|..|-*|*/*|*[!A-Za-z0-9._-]*) continue ;;
+        esac
+        if [ ! -d "$tree_root/$BOXES_DIR/$ALLOW_DIR/$name" ]; then
+            continue
+        fi
+        if [ -L "$tree_root/$BOXES_DIR/$ALLOW_DIR/$name" ]; then
+            continue
+        fi
+        printf '%s\n' "$elem"
+    done
+}
+
+# quic443_set_declared — succeeds when the `nft list ruleset` text on
+# stdin declares the set $QUIC443_LEAF_SET in the table inet $TABLE_NAME.
+quic443_set_declared() {
+    awk -v table="table inet $TABLE_NAME {" -v set="set $QUIC443_LEAF_SET {" '
+        $0 == table { in_table = 1; next }
+        in_table && $0 == "}" { in_table = 0 }
+        in_table { line = $0; sub(/^[ \t]+/, "", line); if (line == set) found = 1 }
+        END { exit !found }'
+}
+
 # require_identities — the cohort's and the node plane's source identities
-# are this host's to know, not the script's to guess, and not optional to the
-# classification: a table that refuses a deny-all box's connections while its
-# cohort leaves with the host's own source identity is half of NET-078
-# wearing the other half's name, so an install refuses to render half of
-# it. They go together or the install does not run.
+# are this host's to know, not the script's to guess, and they go together:
+# a table that translates its cohort while the rest of the slice leaves
+# with the host's own source identity is half of NET-078 wearing the other
+# half's name, so an install refuses to render half of it. Neither given is
+# whole too — the un-enrolled host, whose identities are the classify
+# chain's two cgroup matches with no translation, because no egress gateway
+# reads a source address until an association exists.
 require_identities() {
-    if [ -z "$cohort_address" ] || [ -z "$node_plane_address" ]; then
-        die "the install needs both source identities: pass --cohort-address ADDR (what the boxes cohort leaves as) and --node-plane-address ADDR (what the rest of the slice leaves as)"
+    if { [ -z "$cohort_address" ] && [ -n "$node_plane_address" ]; } ||
+        { [ -n "$cohort_address" ] && [ -z "$node_plane_address" ]; }; then
+        die "the install needs both source identities or neither: pass --cohort-address ADDR (what the boxes cohort leaves as) and --node-plane-address ADDR (what the rest of the slice leaves as) together, or neither for an un-enrolled host"
     fi
 }
 
@@ -628,6 +1146,51 @@ require_mask() {
     cohort_hex=0x$(printf '%08x' "$cohort_bit")
     node_hex=0x$(printf '%08x' "$node_bit")
     clear_hex=0x$(printf '%08x' "$clear_mask")
+    refuse_well_known_mark_ranges
+}
+
+# mask_rerun_hint — the command a person runs to choose two other bits.
+# It is min finalize-install, not this step: that command installs the
+# boot unit too, and the unit carries the mask, so the choice outlives a
+# reboot. A run of this step alone keeps the mask only until the next boot.
+mask_rerun_hint() {
+    printf 'min finalize-install --ct-mark-mask <mask>'
+}
+
+# adopt_recorded_mask — with no --ct-mark-mask, an install re-applies the
+# mask a previous install recorded under the tree, so a re-run classifies
+# with the bits the operator chose and not the default. Exactly one
+# record is adopted. Two records that disagree are a step that did not
+# finish, and the default stands.
+adopt_recorded_mask() {
+    local recorded
+    [ -z "$ct_mark_mask_given" ] || return 0
+    recorded="$(recorded_ct_mark_masks "$tree_root")"
+    case "$recorded" in
+        ''|*"
+"*) return 0 ;;
+    esac
+    ct_mark_mask=$recorded
+    note "using the ct-mark mask $recorded that the previous install recorded at $tree_root"
+}
+
+# refuse_well_known_mark_ranges — a mask that touches a range in
+# WELL_KNOWN_MARK_RANGES is refused, with the range and the component that
+# classes with it named. The scan reads only the rules loaded now, and a
+# component that starts after the install would share bits with this
+# table, each side overwriting the other's marks.
+refuse_well_known_mark_ranges() {
+    local component range
+    while read -r component range; do
+        [ -n "$component" ] || continue
+        if [ $((mask_value & range)) -ne 0 ]; then
+            printf 'error: --ct-mark-mask %s uses bits in %s, the range %s marks connections with. The two would overwrite each other'"'"'s marks.\n' \
+                "$mask_hex" "$range" "$component" >&2
+            die "refusing to install with that mask. Choose two contiguous bits outside $range and run: $(mask_rerun_hint)"
+        fi
+    done <<EOF
+$WELL_KNOWN_MARK_RANGES
+EOF
 }
 
 # ct_mark_conflicts_in — the lines of an nftables or iptables-save listing,
@@ -656,11 +1219,39 @@ ct_mark_conflicts_in() {
         # A table header names whose rules follow: everything until the next
         # header belongs to it, and this step replacing its own table is not
         # a host it must refuse to install over.
-        $1 == "table" { own_table = ($3 == own); next }
+        $1 == "table" { own_table = ($3 == own); where = "table " $2 " " $3; chain = ""; next }
         own_table { next }
+        $1 == "chain" { chain = $2; next }
+        # iptables-save: "*mangle" opens a table, "-A CHAIN" names a rule.
+        /^\*/ { where = "iptables table " substr($1, 2); chain = ""; next }
         /ct mark|CONNMARK|connmark/ {
             line = $0
+            sub(/^[ \t]+/, "", line)
             hit = 0
+            whole = 0
+            if ($1 == "-A") chain = $2
+            # A write with no explicit mask sets every bit of the connection
+            # mark, whatever value it writes, so it overlaps every mask: an
+            # nft `ct mark set` whose value is not a read of the ct mark
+            # itself (`ct mark set meta mark`, `ct mark set 0x1`), a CONNMARK
+            # --set-mark or --set-xmark with no "/mask", and a CONNMARK
+            # --save-mark with no --mask or --ctmask.
+            if (match(line, /ct mark set /)) {
+                if (substr(line, RSTART + RLENGTH) !~ /^ct mark( |$)/) whole = 1
+            }
+            if (line ~ /CONNMARK/) {
+                for (i = 1; i < NF; i++) {
+                    if ($i == "--set-mark" || $i == "--set-xmark") {
+                        if ($(i + 1) !~ /\// || tolower($(i + 1)) ~ /\/0xffffffff$/) whole = 1
+                    }
+                }
+                # iptables-save spells a save with no mask as an all-ones one.
+                if (line ~ /--save-mark/) {
+                    if (line !~ /--(mask|ctmask) /) whole = 1
+                    if (tolower(line) ~ /--(mask|ctmask) 0xffffffff/) whole = 1
+                }
+            }
+            if (whole) hit = 1
             rest = line
             while (match(rest, /0[xX][0-9a-fA-F]+/)) {
                 v = hex(substr(rest, RSTART + 2, RLENGTH - 2))
@@ -676,7 +1267,11 @@ ct_mark_conflicts_in() {
                     }
                 }
             }
-            if (hit) print line
+            if (hit) {
+                comp = where == "" ? "the host ruleset" : where
+                if (chain != "") comp = comp ", chain " chain
+                printf "  %s: %s%s\n", comp, line, whole ? " (writes every bit of the connection mark)" : ""
+            }
         }
     '
 }
@@ -698,15 +1293,27 @@ scan_ct_mark_conflicts() {
     if ! listing="$(nft list ruleset 2>/dev/null)"; then
         die "cannot read this host's ruleset with \`nft list ruleset\` to check the ct-mark bits $mask_hex: refusing to load a classification over a ruleset this step cannot see"
     fi
+    # kept_quic443_leaves reads the same listing, so nft lists it once.
+    host_ruleset="$listing"
     conflicting="$(printf '%s\n' "$listing" | ct_mark_conflicts_in)"
     if command -v iptables-save >/dev/null 2>&1 &&
         legacy="$(iptables-save 2>/dev/null)" && [ -n "$legacy" ]
     then
-        conflicting="$conflicting$(printf '%s\n' "$legacy" | ct_mark_conflicts_in)"
+        legacy_hits="$(printf '%s\n' "$legacy" | ct_mark_conflicts_in)"
+        # Command substitution strips the trailing newline, so the two
+        # listings' hits are joined with one, or two rules print as one line.
+        conflicting="$conflicting${conflicting:+${legacy_hits:+
+}}$legacy_hits"
     fi
     if [ -n "$conflicting" ]; then
         printf 'error: this host already uses the ct-mark bits %s this install classifies with:\n%s\n' "$mask_hex" "$conflicting" >&2
-        die "refusing to install over another ct-mark user: pass --ct-mark-mask <two contiguous bits nothing else classes with> and this step classifies with those instead"
+        # A rule that writes every bit overlaps every mask, so no other
+        # mask avoids it: the remedy is the rule, not the flag.
+        case "$conflicting" in
+            *"(writes every bit of the connection mark)"*)
+                die "refusing to install over a rule that writes every bit of the connection mark: no --ct-mark-mask avoids it. Change that rule to write only the bits it uses, then run min finalize-install again." ;;
+        esac
+        die "refusing to install over another ct-mark user. Choose two contiguous bits that no rule above uses and run: $(mask_rerun_hint)"
     fi
 }
 
@@ -751,6 +1358,11 @@ if [ "$mode" = place ]; then
     exit 0
 fi
 
+if [ "$mode" = place_listener ]; then
+    place_listener
+    exit 0
+fi
+
 if [ "$mode" = uninstall ]; then
     # The table first: it is this step's own artifact and it outlives the
     # cgroups it is keyed on — a table left loaded over a removed tree
@@ -765,6 +1377,9 @@ if [ "$mode" = uninstall ]; then
             die "cannot remove the classifier table inet $TABLE_NAME (is another nft call holding it?)"
         note "removed the classifier table inet $TABLE_NAME"
     fi
+    if [ "$rehearsal" != 1 ] || [ "$quic443_helper_overridden" = 1 ]; then
+        rm -f "$QUIC443_SUDOERS" "$QUIC443_HELPER"
+    fi
     rmdir "$tree_root/$DAEMON_LEAF" 2>/dev/null || true
     rmdir "$tree_root/$TABLE_MARKER" 2>/dev/null || true
     # The mask records go with the marker they were written beside, read
@@ -776,6 +1391,7 @@ if [ "$mode" = uninstall ]; then
     done
     rmdir "$tree_root/$BOXES_DIR/$DENY_DIR" 2>/dev/null || true
     rmdir "$tree_root/$BOXES_DIR/$ALLOW_DIR" 2>/dev/null || true
+    rmdir "$tree_root/$BOXES_DIR/$QUIC443_BLOCKED_DIR" 2>/dev/null || true
     rmdir "$tree_root/$BOXES_DIR" 2>/dev/null || true
     if rmdir "$tree_root" 2>/dev/null; then
         note "removed the classifier tree at $tree_root"
@@ -787,9 +1403,16 @@ fi
 verify_mount
 resolve_owner
 require_identities
+adopt_recorded_mask
 require_mask
 command -v nft >/dev/null 2>&1 ||
     die "nft is this step's dependency: install it (e.g. apt install nftables) and run this step again"
+# The helper runs nft as root, so the nft it will run is checked here,
+# before anything is laid out or loaded: a refused binary changes nothing.
+quic443_nft=
+if [ "$rehearsal" != 1 ] || [ "$quic443_helper_overridden" = 1 ]; then
+    resolve_quic443_nft
+fi
 # The bits this install classifies with are nobody else's: whatever ruleset
 # the host carries is scanned for a ct-mark user of them, ours excepted,
 # and a conflict is refused, named, with the override — never installed
@@ -811,6 +1434,9 @@ mkdir "$tree_root/$BOXES_DIR/$DENY_DIR" 2>/dev/null ||
 mkdir "$tree_root/$BOXES_DIR/$ALLOW_DIR" 2>/dev/null ||
     [ -d "$tree_root/$BOXES_DIR/$ALLOW_DIR" ] ||
     die "cannot create $tree_root/$BOXES_DIR/$ALLOW_DIR"
+mkdir "$tree_root/$BOXES_DIR/$QUIC443_BLOCKED_DIR" 2>/dev/null ||
+    [ -d "$tree_root/$BOXES_DIR/$QUIC443_BLOCKED_DIR" ] ||
+    die "cannot create $tree_root/$BOXES_DIR/$QUIC443_BLOCKED_DIR"
 
 # Delegate each cgroup this script lays out — the slice first, because a
 # migration between two of its leaves is a write to the slice's own
@@ -822,7 +1448,8 @@ mkdir "$tree_root/$BOXES_DIR/$ALLOW_DIR" 2>/dev/null ||
 # touched — the mount root stays root-owned, which is the barrier.
 for cgroup in \
     "" "/$DAEMON_LEAF" "/$BOXES_DIR" \
-    "/$BOXES_DIR/$DENY_DIR" "/$BOXES_DIR/$ALLOW_DIR"
+    "/$BOXES_DIR/$DENY_DIR" "/$BOXES_DIR/$ALLOW_DIR" \
+    "/$BOXES_DIR/$QUIC443_BLOCKED_DIR"
 do
     dir="$tree_root$cgroup"
     for file in cgroup.procs cgroup.threads cgroup.subtree_control; do
@@ -838,6 +1465,13 @@ done
 # The cgroups' paths the ruleset is keyed on, as the covering mount spells
 # them (see compute_cgroup_paths).
 compute_cgroup_paths
+
+# The leaves a running daemon put in the blocked-leaves set are read before
+# the marker is removed, and the render declares the set with them, so a
+# re-install does not let a blocked box send UDP to port 443 again. A read
+# that fails stops the install while the marker still vouches for the table.
+quic443_kept_leaves="$(kept_quic443_leaves)" ||
+    die "cannot read the box leaves that are refused UDP to port 443 from inet $TABLE_NAME: $quic443_kept_leaves. The loaded table is unchanged."
 
 # The one nftables transaction. `nft -f` applies a batch whole or not at
 # all, so the ruleset above carries its own prelude — declare this table,
@@ -873,6 +1507,14 @@ IFS= read -r -d '' ruleset < <(render_ruleset) || true
 ruleset_sha256="$(sha256_of "$ruleset")"
 printf '%s' "$ruleset" | nft -f - || die "nft refused the classifier table: the previous table, if any, is untouched and neither the marker nor its ct-mark mask record was written, so minimald reports no per-box verdict until this step succeeds (nft's own error is above)"
 note "loaded the classifier table inet $TABLE_NAME: sha256 $ruleset_sha256, over exactly the bytes piped to nft"
+if [ -n "$quic443_kept_leaves" ]; then
+    note "kept the box leaves that are refused UDP to port 443: $(printf '%s' "$quic443_kept_leaves" | tr '\n' ' ')"
+fi
+# The helper and its sudoers rule go in only after the load succeeded, so a
+# load that fails writes neither and leaves a pair from an earlier install as
+# it was. They still go in before the marker, so a host whose helper cannot
+# be installed writes no marker.
+install_quic443_helper
 
 # The presence marker the daemon probes at start, and the ct-mark mask
 # recorded beside it: on real cgroupfs a plain file cannot exist, so each
@@ -885,12 +1527,10 @@ note "loaded the classifier table inet $TABLE_NAME: sha256 $ruleset_sha256, over
 # at. The record is written first and the marker last, so the marker is
 # the commit point: it is never there without the mask beside it, and a
 # daemon that reads it also reads the one value the table classifies by.
-if [ -n "$resolver_carve_out" ]; then
-    carve_out_record="$tree_root/$CARVE_OUT_RECORD_PREFIX$answerer_address-$answerer_port"
-    mkdir "$carve_out_record" 2>/dev/null ||
-        [ -d "$carve_out_record" ] ||
-        die "cannot record the table's resolver carve-out at $carve_out_record"
-fi
+carve_out_record="$tree_root/$CARVE_OUT_RECORD_PREFIX$answerer_address-$answerer_port"
+mkdir "$carve_out_record" 2>/dev/null ||
+    [ -d "$carve_out_record" ] ||
+    die "cannot record the table's resolver carve-out at $carve_out_record"
 mask_record="$tree_root/$MASK_RECORD_PREFIX$mask_hex"
 mkdir "$mask_record" 2>/dev/null ||
     [ -d "$mask_record" ] ||
@@ -903,11 +1543,19 @@ note "installed the classifier tree at $tree_root"
 note "  $DAEMON_LEAF/            the daemon itself, entered at startup or placed with --pid"
 note "  $BOXES_DIR/$DENY_DIR/    the boxes that admit no destination, resolved through the answerer"
 note "  $BOXES_DIR/$ALLOW_DIR/   every other box"
+note "  $BOXES_DIR/$QUIC443_BLOCKED_DIR/   the host-address boxes while one of them blocks QUIC: UDP to port 443 is refused"
+if [ "$rehearsal" != 1 ] || [ "$quic443_helper_overridden" = 1 ]; then
+    note "installed $QUIC443_HELPER: account $owner_uid can run it with sudo -n to add or remove one box leaf in $ALLOW_DIR/ in the set that is refused UDP to port 443 ($QUIC443_SUDOERS)"
+fi
 note "delegated to $owner_uid:$owner_gid per the v2 contract: each directory plus its cgroup.procs, cgroup.threads and cgroup.subtree_control"
 note "loaded the classifier table inet $TABLE_NAME: $deny_path is refused everything but the answerer at $answerer_address:$answerer_port (its DNS-port lookups retargeted there), and the refusal is active, never a silent drop"
-note "the boxes cohort leaves as $cohort_address; everything else in the slice as $node_plane_address"
+if [ -n "$cohort_address" ]; then
+    note "the boxes cohort leaves as $cohort_address; everything else in the slice as $node_plane_address"
+else
+    note "no source identity was given, so nothing is translated: the boxes cohort and the rest of the slice are the two classifier matches, and an association adds the reserved addresses to them without a reinstall"
+fi
 note "classified the cohort and the node plane on the ct-mark bits $mask_hex: the ruleset this host carried used neither, and a re-install rescans before it loads"
 note "wrote the table's presence marker at $tree_root/$TABLE_MARKER with the ct-mark mask $mask_hex recorded beside it: minimald records a per-box verdict only while both are there"
 note "the cgroup2 mount above the slice stays root-owned"
-note "place the running daemon next: sudo $0 --pid <pid of minimald> (or start it from a Delegate=yes unit)"
+note "place the running daemon next: sudo $0 --pid <pid of minimald>, or let the placement unit \`min finalize-install\` installs place it at every start (or start it from a Delegate=yes unit)"
 note "once minimald is in the slice, each box it launches runs in a leaf of its own; its launch log names the leaf each box entered"

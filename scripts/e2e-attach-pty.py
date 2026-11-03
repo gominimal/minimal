@@ -1,41 +1,37 @@
 #!/usr/bin/env python3
 """Drive an interactive `min session attach` over a REAL pty, like a user at a terminal.
 
-The session-exit path shows a Detach/Delete prompt (`async_dialog::Select`) and
-reads the answer as keystrokes from the channel. A piped stdin cannot answer it
-(and is not a real tty), so the session e2e drives the attach through a pty here
-instead: pump the sandbox-proof command stream, wait for the exit prompt, then
-read the rendered menu and send the arrow-keys + Enter that select the
-requested lane by label — exercising the genuine interactive teardown a user
-performs.
+The session e2e drives an attach here through a pty, not a pipe, because a
+pipe is not a tty: the attach would not run its terminal relay, and the box's
+dialogs (the runtime port-publish ask) could not be answered. The driver pumps
+the sandbox-proof command stream, whose `exit` ends the box's shell. The box
+then ends with its shell (no prompt asks anything), and the attach ends with
+it. The caller checks the box afterwards with `min ls` or `min session ls`.
 
 Usage: e2e-attach-pty.py <add_tool> <argv...>
   <add_tool>  package to `min add` (also its binary + `--version` subject)
   <argv...>   the command to spawn under the pty, e.g. `min --provider local-minvmd session attach <sid>`
 
-Two environment variables retarget it for callers that want a pty and a
+These environment variables retarget it for callers that want a pty and a
 transcript but not the sandbox proof's command stream (the lifecycle-hooks
 proof drives an attach to observe `on_attach` on the terminal, then leaves
 to fire `on_detach`):
 
   E2E_PTY_COMMANDS  newline-separated lines to type instead of the default
                     `min add` stream. `<add_tool>` is then unused; pass `-`.
-  E2E_PTY_ANSWER    how to answer the session-exit prompt: `delete` (the
-                    default, what the sandbox proof needs) or `keep`, which
-                    leaves the session alive — a detach.
   E2E_PTY_DETACH    set to leave via the session detach chord (the shipped
                     default: `ctrl-]` then `d`) once the command stream goes
                     quiet, instead of ending it with `exit`. The session's
                     SHELL then survives, which is what a test of re-attaching
                     to a still-running shell needs: `exit` ends that shell,
-                    and the next attach mints a new one.
+                    and the box ends with it. With E2E_PTY_ASK
+                    set, the chord also waits until the ask is answered.
   E2E_PTY_ASK       answer a runtime port-publish ask the attached human is
                     shown: `allow` selects Allow (Down then Enter — Deny
                     stands highlighted), `deny` takes the highlighted Deny
-                    (Enter). The ask's dialog (session_host.rs `ask_prompt`,
-                    NET-045) renders on the attached terminal exactly the way
-                    the session-exit prompt does, so it too can only be
-                    answered through a real pty: bytes typed ahead of the
+                    (Enter). The ask's dialog (box_runtime.rs `ask_prompt`,
+                    NET-045) renders on the attached terminal as a select
+                    menu, so it can only be answered through a real pty: bytes typed ahead of the
                     dialog are consumed by the shell before the dialog
                     stands. One ask per attach — the request itself may come
                     from anywhere (an exec'd `min net expose` inside the box
@@ -105,23 +101,12 @@ else:
         "exit",
     ]
 
-EXIT_PROMPT = b"would you like to do with this session"  # SHELL_EXIT_PROMPT, lowercased
-# The daemon builds the exit menu conditionally: a "Save changes ..., then
-# delete" lane is inserted between "Exit, leaving ... in place" (a detach) and
-# "Delete, ..." only when the session's file delta is non-empty, so a lane's
-# row index is not fixed. Navigate by label instead — each answer names its row
-# by the word the label starts with, and we count Down presses to reach it.
-ANSWER_LABEL_PREFIX = {"keep": "Exit", "delete": "Delete"}
-answer = os.environ.get("E2E_PTY_ANSWER", "delete")
 DETACH = os.environ.get("E2E_PTY_DETACH") is not None
-if answer not in ANSWER_LABEL_PREFIX:
-    sys.stderr.write(f"e2e-attach-pty: unknown E2E_PTY_ANSWER {answer!r}\n")
-    sys.exit(2)
 
-# The runtime port-publish ask's own prompt (session_host.rs `ASK_PROMPT`), the
-# frame the answer below keys on: the lead-in ("... asks to publish port N.")
+# The runtime port-publish ask's own prompt (box_runtime.rs `ASK_PROMPT`), the
+# frame the answer below keys on: the lead-in ("... asks to publish port N/tcp.")
 # then the Select with Deny highlighted. The two answers are the keystrokes
-# the daemon's own test driver sends (`session_host/tests.rs` `answer_ask_on`):
+# the daemon's own test driver sends (`box_runtime/tests.rs` `answer_ask_on`):
 # Down lands on Allow, Enter takes the row; a bare Enter takes the highlighted
 # Deny. One ask per attach — a second dialog would park unanswered.
 ASK_PROMPT = b"Allow the publish to the host?"
@@ -148,46 +133,6 @@ EXPECT_EXIT = int(os.environ.get("E2E_PTY_EXPECT_EXIT", "0"))
 SECOND_STAGE = RESIZE is not None or PASTE_FILE is not None or AFTER is not None
 
 ANSI_CSI = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]")
-
-
-def menu_rows(raw):
-    """The exit menu's item labels, in render order.
-
-    The Select prompt draws each item on its own line — prefixed with "> " for
-    the highlighted row, two spaces otherwise — after a header line carrying
-    EXIT_PROMPT. Strip the ANSI control sequences, anchor on that header (its
-    last occurrence, so a re-render wins), and return the labels that follow.
-    """
-    text = ANSI_CSI.sub(b"", raw).decode("utf-8", "replace")
-    lines = [ln.replace("\r", "") for ln in text.split("\n")]
-    header = None
-    for i, ln in enumerate(lines):
-        if EXIT_PROMPT.decode() in ln.lower():
-            header = i
-    if header is None:
-        return []
-    rows = []
-    for ln in lines[header + 1:]:
-        if ln.startswith("> ") or ln.startswith("  "):
-            rows.append(ln[2:].rstrip())
-        else:
-            break
-    return rows
-
-
-def answer_keystrokes(raw):
-    """Keys selecting the requested lane, or None until its row is rendered.
-
-    The menu opens highlighted on the top row, so it is one Down per row down
-    to the target, then Enter. Returns None while the target row has not yet
-    appeared in `raw` — the caller keeps reading, and tells a not-yet-rendered
-    menu from a genuinely absent lane by whether the frame has settled.
-    """
-    prefix = ANSWER_LABEL_PREFIX[answer]
-    for idx, label in enumerate(menu_rows(raw)):
-        if label.startswith(prefix):
-            return b"\x1b[B" * idx + b"\r"
-    return None
 
 
 DEADLINE = time.monotonic() + 240  # overall safety cap
@@ -272,7 +217,6 @@ if pid == 0:  # child
         os._exit(127)
 
 buf = bytearray()
-answered = False
 ask_answered = False
 failed = False
 
@@ -373,34 +317,22 @@ try:
         # chord can't be mistaken for their tail. It is the shipped default
         # chord (leader `ctrl-]` = 0x1d, then the detach subcommand `d`), in a
         # single coalesced chunk, which is exactly the shape the daemon's
-        # ChordMatcher accepts (sessions::keys matches chords across and within
+        # ChordMatcher accepts (boxes::keys matches chords across and within
         # stdin chunks). An earlier era of this script sent a bare ctrl-w
         # (0x17) here; that key retired as a detach, so a stale byte now just
         # reaches the shell — where readline eats it as delete-previous-word
         # and rings the bell — and the attach never ends.
-        if DETACH and staged and not detached and quiet >= 2:
+        # With an ask to answer, the chord also waits for that answer: the
+        # ask arrives from outside on no schedule of this driver's, and the
+        # terminal has to still be attached for its dialog to render.
+        if DETACH and staged and not detached and quiet >= 2 and (not ask or ask_answered):
             os.write(fd, b"\x1dd")
             detached = True
-        if not answered and EXIT_PROMPT in bytes(buf).lower():
-            keys = answer_keystrokes(bytes(buf))
-            if keys is not None:
-                os.write(fd, keys)  # navigate to the requested lane like a user
-                answered = True
-            elif not chunk:
-                # The frame has settled (the daemon is now blocking on input)
-                # yet no row matches the request — fail loudly rather than
-                # silently answering whatever lane a fixed keystroke lands on.
-                sys.stderr.write(
-                    f"e2e-attach-pty: no {answer!r} lane in the session-exit "
-                    f"menu; saw {menu_rows(bytes(buf))!r}\n"
-                )
-                failed = True
-                break
         # The publish ask can come from anywhere — an exec'd `min net expose`
-        # inside the box routes its dialog to whoever is attached — so, like
-        # the exit prompt, it is answered reactively: watch for the dialog's
-        # frame, not for the caller's keystrokes, and answer it once, with the
-        # daemon's own test-driver keystrokes for that stance.
+        # inside the box routes its dialog to whoever is attached — so it is
+        # answered reactively: watch for the dialog's frame, not for the
+        # caller's keystrokes, and answer it once, with the daemon's own
+        # test-driver keystrokes for that stance.
         if ask and not ask_answered and ASK_PROMPT in bytes(buf):
             os.write(fd, ASK_KEYS[ask])
             ask_answered = True

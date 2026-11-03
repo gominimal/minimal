@@ -1,0 +1,5057 @@
+//! Manages session state on disk.
+
+use std::{
+    collections::BTreeMap,
+    io::ErrorKind::{AlreadyExists, NotFound},
+};
+
+use serde::{Deserialize, Serialize};
+
+use paths::{DaemonAbsPath, DaemonRelPath, sub_path};
+
+use crate::{
+    Record, SESSION_BOX_TYPE, SessionId,
+    box_name::NamedBox,
+    core::zone_answer::{HOST_ROW_LABEL, NODE_ROW_LABEL},
+    events::{BoxEvent, DecodedEvents, decode_lines},
+};
+
+/// Describes the session object yielded by [`Loader`].
+pub trait BoxObject: Sized + Send + Clone + 'static + std::fmt::Debug {
+    type Key: BoxKey;
+
+    fn record(&self) -> &Record;
+    fn refresh_from_record(&mut self, r: Record);
+
+    fn key(&self) -> &Self::Key;
+    fn workspace_path(&self) -> DaemonAbsPath;
+    fn home_path(&self) -> DaemonAbsPath;
+    fn cache_path(&self) -> DaemonAbsPath;
+    /// Directory the daemon stages the client-uploaded
+    /// composition patches into, ready for the launcher to
+    /// materialize into the sandbox home. Each entry is stored
+    /// under the patch's sandbox-home-relative destination path.
+    fn patches_path(&self) -> DaemonAbsPath;
+    /// Directory the daemon stages the client-uploaded external
+    /// lifecycle-hook scripts into. Each entry is stored under the
+    /// path [`staged_script_path`] derives from its hook's source, so
+    /// the daemon can find a script again from the composition alone.
+    ///
+    /// Deliberately not under [`patches_path`](Self::patches_path):
+    /// the whole patch tree is copied into the sandbox home when the
+    /// session finalizes, and hook scripts are not dotfiles.
+    ///
+    /// [`staged_script_path`]: crate::core::lifecyclehook::staged_script_path
+    fn hooks_path(&self) -> DaemonAbsPath;
+}
+
+/// Describes the primary key a [`Loader`] uses to reference
+/// sessions.
+pub trait BoxKey: Sized + Send + 'static + std::fmt::Debug + Clone + Eq + Ord {
+    /// Returns the ID of the session.
+    fn id(&self) -> &SessionId;
+}
+
+/// A type which can load sessions.
+pub trait Loader {
+    type Key: BoxKey;
+    type Object: BoxObject<Key = Self::Key>;
+
+    /// Lists all sessions known to this loader, by key.
+    fn keys(&self) -> impl Iterator<Item = Self::Key>;
+
+    /// Gets a session.
+    ///
+    /// # Errors
+    ///
+    /// - `NotFound` if `key` is stale — its short is gone from the index, or
+    ///   has been re-allocated to a different session (same semantics as
+    ///   [`Self::save`]). Prevents reading an unrelated session's record.
+    /// - Other I/O errors if the backing record cannot be read or deserialized.
+    fn get(&self, key: &Self::Key) -> Result<Self::Object, std::io::Error>;
+
+    /// Returns a lookup key corresponding to the given session ID, if
+    /// a session with that ID is known.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the backing record cannot be read or
+    /// deserialized.
+    fn find_by_id(&self, id: &SessionId) -> Result<Option<Self::Key>, std::io::Error>;
+
+    /// Returns a lookup key corresponding to the given session name, if
+    /// a session with that name is known.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the backing record cannot be read or
+    /// deserialized.
+    fn find_by_name<S: AsRef<str>>(&self, name: S) -> Result<Option<Self::Key>, std::io::Error>;
+
+    /// Creates a session using the given record.
+    ///
+    /// The id within the given record is ignored, and the
+    /// actual ID is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the session directory, record, or index
+    /// cannot be written.
+    fn create(&mut self, record: Record) -> Result<Self::Key, std::io::Error>;
+
+    /// Overwrites the session at `key` with the given record.
+    ///
+    /// The record's `id` must match `key.id()` — id is the primary
+    /// key, never changes after [`Self::create`]. Other fields
+    /// (`name`, `status`, `policy`, `attrs`, …) are written verbatim;
+    /// the store does not enforce state-machine transitions (e.g.
+    /// `Pending` → `Active`), that policy belongs in higher layers.
+    ///
+    /// If `record.name` differs from the on-disk name, the index's alias
+    /// for the id is replaced. A name is shared by any number of records,
+    /// and held by at most one running one (BOX-004): a new name that a
+    /// *different* running session holds, or a record that starts running
+    /// again while another running session holds its name, surfaces as
+    /// `AlreadyExists`.
+    ///
+    /// # Errors
+    ///
+    /// - `InvalidInput` if `record.id != key.id()`.
+    /// - `NotFound` if `key` is stale — its short is no longer in the
+    ///   index (e.g. the session was deleted after the caller obtained
+    ///   the key). Prevents silent resurrection of removed sessions.
+    /// - `AlreadyExists` if `record.name` is held by a different running
+    ///   session, as above.
+    /// - `InvalidInput` if `record.name` changes to `self` or to an
+    ///   invalid name.
+    /// - Other I/O errors from writing the record or flushing the index.
+    fn save(&mut self, key: &Self::Key, record: &Record) -> Result<(), std::io::Error>;
+
+    /// Renames the session with the given key (BOX-010): `get` → mutate
+    /// `name` → [`Self::save`], then a `renamed` event that carries the
+    /// old and new names. Only the alias changes: the id, the spec, the
+    /// filesystem and the earlier events stay as they were. See `save` for
+    /// the underlying write semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the session directory, record, or index
+    /// cannot be written.
+    /// - `NotFound` if `key` is stale (same as [`Self::save`]); the
+    ///   internal `get` may also surface `NotFound` when the record
+    ///   file is gone.
+    /// - `AlreadyExists` if a *running* session other than this one holds
+    ///   the requested name, and `InvalidInput` for the reserved name
+    ///   `self`. A stopped or exited session's name is free. Renaming to
+    ///   the session's current name is a no-op and records no event.
+    ///
+    /// A failure to write the renamed event after the new name is saved is
+    /// logged, and the rename still returns `Ok`.
+    fn rename(&mut self, key: &Self::Key, new_name: String) -> Result<(), std::io::Error>;
+
+    /// Deletes the session with the given key, dropping its index entries and
+    /// removing its on-disk directory tree (record, workspace, home, cache).
+    ///
+    /// Crash-safe: if the daemon dies mid-call, the next loader open
+    /// (e.g. [`DiskLoader::new`]) reaps the half-deleted session dir,
+    /// so a missing index entry is the only persistent visible effect
+    /// of a successful or partial delete.
+    ///
+    /// # Errors
+    ///
+    /// - `NotFound` if `key` is stale — its short is gone from the index, or
+    ///   has been re-allocated to a different session (same semantics as
+    ///   [`Self::save`]). Prevents destroying an unrelated session. A missing
+    ///   *directory tree* for a still-indexed key is not an error.
+    /// - Other I/O errors if the record cannot be read or the index cannot be
+    ///   flushed.
+    fn delete(&mut self, key: &Self::Key) -> Result<(), std::io::Error>;
+
+    /// Loads the persisted composition snapshot for the session at
+    /// `key`, if one exists. Returns `Ok(None)` when the sidecar is
+    /// absent (a session that predates the sidecar, or whose
+    /// composition was never assembled). A corrupt or unreadable
+    /// sidecar surfaces as an error so the caller can log it and
+    /// decide on a fallback.
+    ///
+    /// # Errors
+    ///
+    /// - `NotFound` if `key` is stale (same semantics as [`Self::save`]).
+    /// - I/O or deserialization errors if the sidecar exists but
+    ///   cannot be read or parsed.
+    fn load_composition(
+        &self,
+        key: &Self::Key,
+    ) -> Result<Option<crate::core::compose::Composition>, std::io::Error>;
+
+    /// Atomically persists the composition snapshot for the session
+    /// at `key` (tmp + rename, same crash-safety as [`Self::save`]).
+    /// Called at composition-assembly time so a restart can re-apply
+    /// the exact composition that was approved at `min session activate` time.
+    ///
+    /// # Errors
+    ///
+    /// - `NotFound` if `key` is stale (same semantics as [`Self::save`]).
+    /// - I/O or serialization errors if the sidecar cannot be written.
+    fn store_composition(
+        &self,
+        key: &Self::Key,
+        composition: &crate::core::compose::Composition,
+    ) -> Result<(), std::io::Error>;
+
+    /// Loads the persisted workspace delta-baseline sidecar for the
+    /// session at `key`, if one exists. Returns `Ok(None)` when the
+    /// sidecar is absent (a session that predates it, or whose baseline
+    /// was never persisted).
+    ///
+    /// The payload is opaque bytes: the baseline's shape belongs to the
+    /// daemon's change-detection code, so this crate stores and returns
+    /// it verbatim rather than learning its schema.
+    ///
+    /// # Errors
+    ///
+    /// - `NotFound` if `key` is stale (same semantics as [`Self::save`]).
+    /// - I/O errors if the sidecar exists but cannot be read.
+    fn load_delta_baseline(&self, key: &Self::Key) -> Result<Option<Vec<u8>>, std::io::Error>;
+
+    /// Atomically persists the workspace delta-baseline sidecar for the
+    /// session at `key` (tmp + rename, same crash-safety as
+    /// [`Self::save`]). Written once at first arm so a daemon restart
+    /// can keep reporting changes against the activation-time baseline
+    /// instead of re-snapshotting an already-modified workspace.
+    ///
+    /// # Errors
+    ///
+    /// - `NotFound` if `key` is stale (same semantics as [`Self::save`]).
+    /// - I/O errors if the sidecar cannot be written.
+    fn store_delta_baseline(&self, key: &Self::Key, payload: &[u8]) -> Result<(), std::io::Error>;
+}
+
+/// The concrete key used to identify sessions from [`DiskLoader`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DiskBoxKey {
+    session_id: SessionId,
+    dir_key: DaemonRelPath,
+}
+
+impl BoxKey for DiskBoxKey {
+    fn id(&self) -> &SessionId {
+        &self.session_id
+    }
+}
+
+/// The concrete session object from [`DiskLoader`].
+#[derive(Debug, Clone)]
+pub struct DiskBox {
+    key: DiskBoxKey,
+    minimal_state_dir: DaemonAbsPath,
+    record: Record,
+}
+
+/// The name of the file beside `record.json` that holds the box's spec as
+/// its creating client sent it (BOX-068).
+pub const SPEC_FILE: &str = "spec.json";
+
+impl DiskBox {
+    fn root_path(&self) -> DaemonAbsPath {
+        sub_path!(self.minimal_state_dir, "sessions")
+            .join(&DaemonRelPath::try_new(&self.key.dir_key).unwrap())
+    }
+
+    /// The path of the box's spec file, [`SPEC_FILE`], beside its record.
+    /// `sub_path!` takes only a literal, so a test pins the literal to
+    /// [`SPEC_FILE`].
+    pub fn spec_path(&self) -> DaemonAbsPath {
+        sub_path!(self.root_path(), "spec.json")
+    }
+
+    /// Writes the box's spec beside its record (BOX-068), atomically (tmp +
+    /// rename, the same crash safety as the record). The bytes are stored
+    /// as given: the spec's shape belongs to its builder, not to the store.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the box's directory or the file cannot be written.
+    pub fn store_spec(&self, spec: &[u8]) -> Result<(), std::io::Error> {
+        let dir = self.root_path();
+        let dir = dir.as_utf8_path();
+        std::fs::create_dir_all(dir)?;
+        // One source for the path: the file this writes is the one
+        // `spec_path` reports and the daemon logs.
+        let dest = self.spec_path();
+        let dest = dest.as_utf8_path();
+        let tmp = dir.join("spec.json.tmp");
+        std::fs::write(&tmp, spec)?;
+
+        #[cfg(target_os = "linux")]
+        common::renameat2::renameat2_cwd(tmp.as_std_path(), dest.as_std_path(), 0)?;
+        #[cfg(not(target_os = "linux"))]
+        std::fs::rename(&tmp, dest)?;
+
+        Ok(())
+    }
+
+    /// Reads the box's spec from beside its record. `Ok(None)` for a box
+    /// with no spec file: one created before specs were stored, or by a
+    /// client that sent none.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the spec file exists but cannot be read.
+    pub fn load_spec(&self) -> Result<Option<Vec<u8>>, std::io::Error> {
+        match std::fs::read(self.spec_path().as_utf8_path()) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The path of the box's events file, [`EVENTS_FILE`](crate::events::EVENTS_FILE), beside its
+    /// record (BOX-040). No path mounted into the box reaches it: the box
+    /// sees only the `tree`, `home`, `cache`, `patches` and `hooks`
+    /// directories beside it (BOX-041). A test pins the literal to
+    /// [`EVENTS_FILE`](crate::events::EVENTS_FILE).
+    pub fn events_path(&self) -> DaemonAbsPath {
+        sub_path!(self.root_path(), "events.jsonl")
+    }
+
+    /// Appends `event` to the box's events file as one line (BOX-040). The
+    /// append holds an exclusive lock on the file from the read of its
+    /// length through the cut, the write and the sync. That lock is why two
+    /// writers never interleave and one never cuts the other's line, and
+    /// the file order is the write order (BOX-162). `O_APPEND` alone is not
+    /// enough, because a cut and a write are two steps.
+    /// The file is created owner-only.
+    ///
+    /// A last line torn by a crash has no newline. Its write was never
+    /// acknowledged, so no event is lost when it goes: the file is cut back
+    /// to the end of its last complete line before this event is written.
+    /// The event then never joins the torn bytes, and no line that does not
+    /// parse stays in the file. A warning names the box and the bytes cut.
+    ///
+    /// The box's directory is never created here. An event for a box whose
+    /// directory is gone, because the box was reaped, fails with
+    /// `NotFound` and leaves nothing on disk.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` if the box's directory does not exist, and an I/O error
+    /// if the file cannot be read or written.
+    pub fn append_event(&self, event: &BoxEvent) -> Result<(), std::io::Error> {
+        append_event_line(&self.events_path(), self.key.id(), event)
+    }
+
+    /// The transcript file of the exec `exec_id` in this box, beside its
+    /// record (BOX-149). See [`exec_transcript_path`].
+    #[must_use]
+    pub fn exec_transcript_path(&self, exec_id: &str) -> camino::Utf8PathBuf {
+        exec_transcript_path(self.root_path().as_utf8_path(), exec_id)
+    }
+
+    /// Reads the box's events file from byte `offset` (BOX-162): every
+    /// complete line from there, in file order, and the offset after the
+    /// last of them. A box with no events file reads as no events.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the file exists but cannot be read.
+    pub fn read_events_from(&self, offset: u64) -> Result<DecodedEvents, std::io::Error> {
+        use std::io::{Read as _, Seek as _};
+
+        let mut file = match std::fs::File::open(self.events_path().as_utf8_path()) {
+            Ok(file) => file,
+            Err(e) if e.kind() == NotFound => return Ok(DecodedEvents::default()),
+            Err(e) => return Err(e),
+        };
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)?;
+        Ok(decode_lines(&buf, offset))
+    }
+
+    /// Whether the box's record is still retained: its `record.json` is on
+    /// disk and no delete of its directory has begun. A follower of the
+    /// box's events stops once this is false (BOX-162).
+    #[must_use]
+    pub fn is_retained(&self) -> bool {
+        self.dir().is_retained()
+    }
+
+    /// The path of the box's output log, [`LOG_FILE`], beside its record
+    /// (BOX-155). Like the events file, no path mounted into the box
+    /// reaches it (BOX-164). A test pins the literal to [`LOG_FILE`].
+    pub fn log_path(&self) -> DaemonAbsPath {
+        self.dir().log_path()
+    }
+
+    /// The box's directory, for a writer or reader outside the store.
+    #[must_use]
+    pub fn dir(&self) -> BoxDir {
+        BoxDir {
+            root: self.root_path(),
+        }
+    }
+}
+
+/// The name of the file beside `record.json` that holds the box's output
+/// log (BOX-155): every byte its entrypoint wrote to its terminal, from
+/// each start, whether or not a client was attached. Only the daemon
+/// writes it (BOX-164).
+pub const LOG_FILE: &str = "output.log";
+
+/// The name of the directory beside `record.json` that the box sees as its
+/// workspace. Its parent is the box's directory.
+const TREE_DIR: &str = "tree";
+
+/// The directory that holds a box's record, as code outside the store sees
+/// it: the box's runtime, which knows only the paths mounted into the box,
+/// and a reader that knows only the box's id.
+///
+/// The files this names, `record.json`, [`EVENTS_FILE`](crate::events::EVENTS_FILE)
+/// and [`LOG_FILE`], sit in this directory itself. The box sees only the
+/// `tree`, `home`, `cache`, `patches` and `hooks` directories under it, so
+/// no process inside the box can open them (BOX-041, BOX-164).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoxDir {
+    root: DaemonAbsPath,
+}
+
+impl BoxDir {
+    /// The box directory whose workspace is `tree`, as
+    /// [`BoxObject::workspace_path`] names it. `None` when `tree` is not
+    /// named `tree`, or has no parent: no box's workspace is then known,
+    /// so nothing is written beside it.
+    #[must_use]
+    pub fn for_tree(tree: &DaemonAbsPath) -> Option<Self> {
+        if tree.file_name() != Some(TREE_DIR) {
+            return None;
+        }
+        tree.parent().map(|root| Self { root })
+    }
+
+    /// The directory of the retained box `id` under the daemon state
+    /// directory `minimal_dir`, found through the store's index on disk.
+    /// The index is replaced by a rename, so a read sees a whole one.
+    /// `None` when no indexed box has `id`, when the record in the
+    /// indexed directory names another box, and when the box is reaped or
+    /// its delete has begun.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the index or the record exists but cannot be read.
+    pub fn find(
+        minimal_dir: &DaemonAbsPath,
+        id: &SessionId,
+    ) -> Result<Option<Self>, std::io::Error> {
+        let sessions = sub_path!(minimal_dir, "sessions");
+        let index: Index = match std::fs::File::open(sessions.as_utf8_path().join("index.json")) {
+            Ok(file) => serde_json_lenient::from_reader(file)?,
+            Err(e) if e.kind() == NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let Some(short) = index.short_by_id(id) else {
+            return Ok(None);
+        };
+        if !is_valid_short(short) {
+            return Ok(None);
+        }
+        let dir = Self {
+            root: sessions.sub_path_unchecked(short),
+        };
+        match dir.record() {
+            Ok(record) if record.id == *id => Ok(dir.is_retained().then_some(dir)),
+            Ok(_) => Ok(None),
+            Err(e) if e.kind() == NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The path of the box's output log, [`LOG_FILE`].
+    pub fn log_path(&self) -> DaemonAbsPath {
+        sub_path!(self.root, "output.log")
+    }
+
+    /// The path of the box's events file,
+    /// [`EVENTS_FILE`](crate::events::EVENTS_FILE).
+    pub fn events_path(&self) -> DaemonAbsPath {
+        sub_path!(self.root, "events.jsonl")
+    }
+
+    /// Reads the box's record from disk.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` once the box is reaped, and an I/O error if the record
+    /// cannot be read or parsed.
+    pub fn record(&self) -> Result<Record, std::io::Error> {
+        let file = std::fs::File::open(self.root.as_utf8_path().join("record.json"))?;
+        Ok(serde_json_lenient::from_reader(file)?)
+    }
+
+    /// Whether the box's record is still retained: its `record.json` is on
+    /// disk and no delete of its directory has begun.
+    #[must_use]
+    pub fn is_retained(&self) -> bool {
+        let root = self.root.as_utf8_path();
+        let tombstone = match (root.parent(), root.file_name()) {
+            (Some(sessions), Some(short)) => Some(sessions.join(tombstone_name(short))),
+            _ => None,
+        };
+        root.join("record.json").exists() && !tombstone.is_some_and(|t| t.exists())
+    }
+
+    /// Writes one lifecycle event of type `kind` for the box, stamped now
+    /// with the id and parent its record on disk names (BOX-040), with the
+    /// same lock and torn-line repair as [`DiskBox::append_event`]. For a
+    /// writer that holds no [`DiskBox`]: the box's runtime, which records
+    /// `detached` (BOX-016).
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` once the box is reaped, and an I/O error if the record
+    /// cannot be read or the event cannot be appended.
+    pub fn append_event(
+        &self,
+        kind: crate::events::BoxEventType,
+    ) -> Result<BoxEvent, std::io::Error> {
+        let record = self.record()?;
+        let event = BoxEvent::for_record(&record, kind);
+        append_event_line(&self.events_path(), &record.id, &event)?;
+        Ok(event)
+    }
+
+    /// Reads at most `max` bytes of the box's output log from byte
+    /// `offset` (BOX-155). A box with no log yet reads as empty.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the log exists but cannot be read.
+    pub fn read_log_from(&self, offset: u64, max: usize) -> Result<Vec<u8>, std::io::Error> {
+        use std::io::{Read as _, Seek as _};
+
+        let mut file = match open_log_for_read(&self.log_path()) {
+            Ok(file) => file,
+            Err(e) if e.kind() == NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        let mut buf = Vec::new();
+        file.take(max as u64).read_to_end(&mut buf)?;
+        Ok(buf)
+    }
+}
+
+/// The most bytes a box's output log holds on disk: 8 MiB, the same cap
+/// as an exec's transcript. A box that writes more keeps running. Its log
+/// then drops the oldest bytes and keeps the newest, so a box that writes
+/// without end does not fill the daemon's state directory.
+///
+/// So a box that writes more than 8 MiB loses the start of its log. This
+/// departs from docs/architecture.md line 473, which says the log is
+/// complete from the box's start. The design does not state this bound
+/// yet. <https://github.com/gominimal/arch/issues/159> decides it.
+pub const LOG_CAP: u64 = 8 * 1024 * 1024;
+
+/// The first line of a log that dropped its oldest bytes.
+pub const LOG_DROPPED: &[u8] = b"[older output was dropped. Only the newest output is kept.]\n";
+
+/// How many bytes of output a log keeps when it drops its oldest bytes
+/// under `cap`: half the cap, less the [`LOG_DROPPED`] line before them.
+fn log_kept(cap: u64) -> u64 {
+    (cap / 2).saturating_sub(LOG_DROPPED.len() as u64)
+}
+
+/// Opens the log at `path` for a read without following a symbolic link.
+/// The path must name a regular file, and the file opened must be that
+/// same file, so a link or a swap at the path is refused. (The crate has
+/// no `O_NOFOLLOW`, so the open compares the device and inode instead.)
+fn open_log_for_read(path: &DaemonAbsPath) -> Result<std::fs::File, std::io::Error> {
+    let not_regular = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the log path is not a regular file",
+        )
+    };
+    let link = std::fs::symlink_metadata(path.as_utf8_path())?;
+    if !link.file_type().is_file() {
+        return Err(not_regular());
+    }
+    let file = std::fs::File::open(path.as_utf8_path())?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || file_id(&opened) != file_id(&link) {
+        return Err(not_regular());
+    }
+    Ok(file)
+}
+
+/// The device and inode of a file, which tell two files apart.
+#[cfg(unix)]
+fn file_id(meta: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt as _;
+    (meta.dev(), meta.ino())
+}
+
+/// No device and inode off unix: every file reads as the same one, so a
+/// rotation is not seen and the reader keeps its file.
+#[cfg(not(unix))]
+fn file_id(_meta: &std::fs::Metadata) -> (u64, u64) {
+    (0, 0)
+}
+
+/// A box's output log as the daemon writes it: never more than
+/// [`LOG_CAP`] bytes at rest.
+///
+/// Past 8 MiB, [`LOG_CAP`] drops the start of the box's output. This
+/// departs from docs/architecture.md line 473, which says the log is
+/// complete from the box's start.
+/// <https://github.com/gominimal/arch/issues/159> decides the bound.
+///
+/// A write that takes the file past the cap is appended first. Then the
+/// file is replaced with [`LOG_DROPPED`] and the newest bytes of the old
+/// file, half the cap in all. The new file is written beside the old one
+/// and renamed over it, so a reader that has the old file open still reads
+/// the whole of it. [`LogReader`] reads across that replacement.
+#[derive(Debug)]
+pub struct LogWriter {
+    path: DaemonAbsPath,
+    file: std::fs::File,
+    len: u64,
+    cap: u64,
+}
+
+impl LogWriter {
+    /// Writes the log at `path` through `file`, which the caller opened for
+    /// reads and appends at that path, under the cap [`LOG_CAP`].
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the file's length cannot be read.
+    pub fn new(path: DaemonAbsPath, file: std::fs::File) -> Result<Self, std::io::Error> {
+        let len = file.metadata()?.len();
+        Ok(Self {
+            path,
+            file,
+            len,
+            cap: LOG_CAP,
+        })
+    }
+
+    /// The same writer under a different cap, for a test that does not
+    /// write [`LOG_CAP`] bytes. The reader must use the same cap.
+    #[must_use]
+    pub fn with_cap(mut self, cap: u64) -> Self {
+        self.cap = cap;
+        self
+    }
+
+    /// Appends `bytes`, and drops the oldest bytes if the file is then
+    /// past the cap.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the append or the replacement fails.
+    pub fn write(&mut self, bytes: &[u8]) -> Result<(), std::io::Error> {
+        use std::io::Write as _;
+
+        self.file.write_all(bytes)?;
+        self.len += bytes.len() as u64;
+        if self.len > self.cap {
+            self.drop_oldest()?;
+        }
+        Ok(())
+    }
+
+    /// Replaces the file with [`LOG_DROPPED`] and the newest bytes of the
+    /// file, half the cap in all.
+    fn drop_oldest(&mut self) -> Result<(), std::io::Error> {
+        use std::io::{Read as _, Seek as _, Write as _};
+
+        let keep = log_kept(self.cap).min(self.len);
+        let mut tail = Vec::with_capacity(LOG_DROPPED.len() + usize::try_from(keep).unwrap_or(0));
+        tail.extend_from_slice(LOG_DROPPED);
+        self.file.seek(std::io::SeekFrom::Start(self.len - keep))?;
+        (&mut self.file).take(keep).read_to_end(&mut tail)?;
+
+        let next_path = self.path.as_utf8_path().with_extension("log.next");
+        match std::fs::remove_file(&next_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == NotFound => {}
+            Err(e) => return Err(e),
+        }
+        let mut options = std::fs::OpenOptions::new();
+        // `create_new` refuses anything already at the path, a link too.
+        options.read(true).append(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut next = options.open(&next_path)?;
+        next.write_all(&tail)?;
+        std::fs::rename(&next_path, self.path.as_utf8_path())?;
+        tracing::info!(
+            log_path = %self.path.as_str(),
+            dropped_after = self.len,
+            kept = tail.len(),
+            "a box's output log reached its cap and dropped its oldest bytes"
+        );
+        self.file = next;
+        self.len = tail.len() as u64;
+        Ok(())
+    }
+}
+
+/// A box's output log in the bytes the reader gets back from
+/// [`LogReader::read`]: `data` starts at byte `offset` of the log file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogChunk {
+    pub offset: u64,
+    pub data: Vec<u8>,
+}
+
+/// A read of a box's output log that carries on across the times the
+/// [`LogWriter`] drops the oldest bytes (BOX-155).
+///
+/// The reader keeps its file open. An offset is a byte of the file it
+/// has open. When the writer replaces the file, the reader first reads
+/// the old file to its end, then moves to the new file:
+///
+/// - When the new file starts with [`LOG_DROPPED`] and the bytes the old
+///   file ended with, the reader already sent those bytes. It goes on from
+///   the byte after them, so no byte is sent twice.
+/// - Otherwise the writer replaced the file more than once since the
+///   reader moved. The reader reads the new file from its first byte, so
+///   the [`LOG_DROPPED`] line marks the output it never saw.
+///
+/// The offset of a chunk read from the new file is smaller than the end of
+/// the old one, because the new file is half the cap.
+#[derive(Debug)]
+pub struct LogReader {
+    path: DaemonAbsPath,
+    file: Option<std::fs::File>,
+    offset: u64,
+    cap: u64,
+}
+
+impl LogReader {
+    /// A read of `dir`'s log from byte `offset` of the file at the path
+    /// now, under the cap [`LOG_CAP`]. Nothing is opened until the first
+    /// [`Self::read`].
+    #[must_use]
+    pub fn new(dir: &BoxDir, offset: u64) -> Self {
+        Self {
+            path: dir.log_path(),
+            file: None,
+            offset,
+            cap: LOG_CAP,
+        }
+    }
+
+    /// The same reader under a different cap, the cap of its writer.
+    #[must_use]
+    pub fn with_cap(mut self, cap: u64) -> Self {
+        self.cap = cap;
+        self
+    }
+
+    /// The byte of the open file that the next read starts at.
+    #[must_use]
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Reads at most `max` bytes from where the last read stopped. An
+    /// empty chunk means the log has no more bytes now. A box with no log
+    /// yet reads as empty.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the log cannot be read, and `InvalidInput` if the
+    /// path is not a regular file. A log that is gone, because the box is
+    /// reaped, reads as empty once the open file is read to its end.
+    pub fn read(&mut self, max: usize) -> Result<LogChunk, std::io::Error> {
+        loop {
+            let Some(file) = self.file.as_mut() else {
+                match open_log_for_read(&self.path) {
+                    Ok(file) => self.file = Some(file),
+                    Err(e) if e.kind() == NotFound => return Ok(self.empty()),
+                    Err(e) => return Err(e),
+                }
+                continue;
+            };
+            let data = read_at(file, self.offset, max as u64)?;
+            if !data.is_empty() {
+                let chunk = LogChunk {
+                    offset: self.offset,
+                    data,
+                };
+                self.offset += chunk.data.len() as u64;
+                return Ok(chunk);
+            }
+            let current = match open_log_for_read(&self.path) {
+                Ok(current) => current,
+                // The box is reaped. Its open file was read to its end.
+                Err(e) if e.kind() == NotFound => return Ok(self.empty()),
+                Err(e) => return Err(e),
+            };
+            if file_id(&current.metadata()?) == file_id(&file.metadata()?) {
+                return Ok(self.empty());
+            }
+            // The writer replaced the file. The old one is no longer
+            // written, but a write can land before the replacement and
+            // after the read above: read it to its end first.
+            let data = read_at(file, self.offset, max as u64)?;
+            if !data.is_empty() {
+                let chunk = LogChunk {
+                    offset: self.offset,
+                    data,
+                };
+                self.offset += chunk.data.len() as u64;
+                return Ok(chunk);
+            }
+            let resume = self.resume_in(&current)?;
+            tracing::debug!(
+                log_path = %self.path.as_str(),
+                old_end = self.offset,
+                resume,
+                "a read of a box's output log moved to the replaced file"
+            );
+            self.file = Some(current);
+            self.offset = resume;
+        }
+    }
+
+    /// The byte of `next`, the file that replaced the open one, to go on
+    /// from: past the bytes the open file ended with, when `next` starts
+    /// with them, and 0 otherwise.
+    fn resume_in(&mut self, next: &std::fs::File) -> Result<u64, std::io::Error> {
+        // Compared in steps, so the reader holds no more than two steps.
+        const STEP: u64 = 64 * 1024;
+        let Some(old) = self.file.as_mut() else {
+            return Ok(0);
+        };
+        let keep = log_kept(self.cap).min(self.offset);
+        let mark = LOG_DROPPED.len() as u64;
+        let mut next = next.try_clone()?;
+        if read_at(&mut next, 0, mark)? != LOG_DROPPED {
+            return Ok(0);
+        }
+        let mut at = 0;
+        while at < keep {
+            let n = STEP.min(keep - at);
+            let kept = read_at(&mut next, mark + at, n)?;
+            let seen = read_at(old, self.offset - keep + at, n)?;
+            if kept.len() as u64 != n || kept != seen {
+                return Ok(0);
+            }
+            at += n;
+        }
+        Ok(mark + keep)
+    }
+
+    fn empty(&self) -> LogChunk {
+        LogChunk {
+            offset: self.offset,
+            data: Vec::new(),
+        }
+    }
+}
+
+/// Reads at most `max` bytes of `file` from byte `offset`.
+fn read_at(file: &mut std::fs::File, offset: u64, max: u64) -> Result<Vec<u8>, std::io::Error> {
+    use std::io::{Read as _, Seek as _};
+
+    file.seek(std::io::SeekFrom::Start(offset))?;
+    let mut buf = Vec::new();
+    file.take(max).read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+/// The body of [`DiskBox::append_event`] and [`BoxDir::append_event`]:
+/// appends `event` as one line to the events file at `events_path`.
+fn append_event_line(
+    events_path: &DaemonAbsPath,
+    box_id: &SessionId,
+    event: &BoxEvent,
+) -> Result<(), std::io::Error> {
+    use std::io::Write as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(events_path.as_utf8_path())?;
+    // Held until `file` drops after `sync_data`: the length, the cut and
+    // the write below are one step for every other appender.
+    file.lock()?;
+    let len = file.metadata()?.len();
+    let complete = complete_len(&mut file, len)?;
+    if complete < len {
+        file.set_len(complete)?;
+        tracing::warn!(
+            box_id = %box_id,
+            dropped_bytes = len - complete,
+            events_path = %events_path.as_str(),
+            "cut a torn last line from a box's events file before an append"
+        );
+    }
+    file.write_all(&event.to_line()?)?;
+    file.sync_data()
+}
+
+/// [`DiskBox::append_event`] for the events file at `events_path`, for a
+/// writer that holds the box's state directory but not its [`DiskBox`]. The
+/// same lock, cut and sync apply, so the two kinds of writer never
+/// interleave.
+///
+/// # Errors
+///
+/// `NotFound` if the box's directory does not exist, and an I/O error if
+/// the file cannot be read or written.
+pub fn append_event_at(
+    events_path: &camino::Utf8Path,
+    event: &BoxEvent,
+) -> Result<(), std::io::Error> {
+    use std::io::Write as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(events_path)?;
+    // Held until `file` drops after `sync_data`: the length, the cut and
+    // the write below are one step for every other appender.
+    file.lock()?;
+    let len = file.metadata()?.len();
+    let complete = complete_len(&mut file, len)?;
+    if complete < len {
+        file.set_len(complete)?;
+        tracing::warn!(
+            box_id = %event.box_id,
+            dropped_bytes = len - complete,
+            events_path = %events_path,
+            "cut a torn last line from a box's events file before an append"
+        );
+    }
+    file.write_all(&event.to_line()?)?;
+    file.sync_data()
+}
+
+/// The directory beside `record.json` that holds the box's exec
+/// transcripts (BOX-149). No path mounted into the box reaches it.
+pub const EXECS_DIR: &str = "execs";
+
+/// The transcript file of the exec `exec_id` in the box whose state
+/// directory is `box_dir`: `<box_dir>/execs/<exec_id>.log`. The file holds
+/// what the exec wrote, stdout and stderr together, in the order it wrote
+/// them. A box's delete removes its whole directory, so a transcript reads
+/// back by its exec id until the box is reaped.
+#[must_use]
+pub fn exec_transcript_path(box_dir: &camino::Utf8Path, exec_id: &str) -> camino::Utf8PathBuf {
+    box_dir.join(EXECS_DIR).join(format!("{exec_id}.log"))
+}
+
+/// The length of `file` up to and including its last `\n`, or 0 if it has
+/// none. `len` is the file's length. Reads back from the end in chunks, so
+/// a file whose last byte is `\n` costs one byte read.
+fn complete_len(file: &mut std::fs::File, len: u64) -> Result<u64, std::io::Error> {
+    use std::io::{Read as _, Seek as _};
+
+    const CHUNK: u64 = 4096;
+    let mut end = len;
+    let mut buf = Vec::new();
+    while end > 0 {
+        let start = if end == len {
+            end - 1
+        } else {
+            end.saturating_sub(CHUNK)
+        };
+        buf.resize(usize::try_from(end - start).unwrap_or(0), 0);
+        file.seek(std::io::SeekFrom::Start(start))?;
+        file.read_exact(&mut buf)?;
+        if let Some(i) = buf.iter().rposition(|b| *b == b'\n') {
+            return Ok(start + i as u64 + 1);
+        }
+        end = start;
+    }
+    Ok(0)
+}
+
+impl BoxObject for DiskBox {
+    type Key = DiskBoxKey;
+
+    fn record(&self) -> &Record {
+        &self.record
+    }
+    fn refresh_from_record(&mut self, r: Record) {
+        let id = self.record.id;
+        self.record = r;
+        self.record.id = id; // ID must never change
+    }
+
+    fn key(&self) -> &DiskBoxKey {
+        &self.key
+    }
+    fn workspace_path(&self) -> DaemonAbsPath {
+        sub_path!(self.root_path(), "tree")
+    }
+    fn home_path(&self) -> DaemonAbsPath {
+        sub_path!(self.root_path(), "home")
+    }
+    fn cache_path(&self) -> DaemonAbsPath {
+        sub_path!(self.root_path(), "cache")
+    }
+    fn patches_path(&self) -> DaemonAbsPath {
+        sub_path!(self.root_path(), "patches")
+    }
+    fn hooks_path(&self) -> DaemonAbsPath {
+        sub_path!(self.root_path(), "hooks")
+    }
+}
+
+/// The store's index. Every map in it is keyed on the box's short
+/// directory name or on its id, never on its name (BOX-143): a name is an
+/// alias that many retained records can share (BOX-004).
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct Index {
+    short_to_id: BTreeMap<String, SessionId>,
+    /// Each named box's current alias, keyed on its id. An index written
+    /// before names were shared carries a `name_to_id` map instead, which
+    /// is ignored: the first open rebuilds this map from the records.
+    #[serde(default)]
+    names: BTreeMap<SessionId, String>,
+}
+
+impl Index {
+    pub fn insert(&mut self, short: String, id: SessionId, name: Option<String>) {
+        self.short_to_id.insert(short, id);
+        self.set_name(id, name);
+    }
+
+    /// Sets or clears the alias of the box `id`.
+    fn set_name(&mut self, id: SessionId, name: Option<String>) {
+        match name {
+            Some(name) => self.names.insert(id, name),
+            None => self.names.remove(&id),
+        };
+    }
+
+    /// Removes a session's entries from both the short and name maps.
+    pub fn remove(&mut self, short: &str) {
+        if let Some(id) = self.short_to_id.remove(short) {
+            self.names.remove(&id);
+        }
+    }
+
+    /// Iterates over all (shortname, session id) pairs.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &SessionId)> {
+        self.short_to_id.iter()
+    }
+
+    /// The ids of the boxes whose alias folds to `name` under ASCII case,
+    /// as hostnames do.
+    fn ids_named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = SessionId> + 'a {
+        self.names
+            .iter()
+            .filter(move |(_, alias)| alias.eq_ignore_ascii_case(name))
+            .map(|(id, _)| *id)
+    }
+
+    /// Returns the session ID corresponding to the given short name, if known.
+    pub fn find_by_short<S: AsRef<str>>(&self, name: S) -> Option<&SessionId> {
+        self.short_to_id.get(name.as_ref())
+    }
+
+    /// Returns the short corresponding to the given session ID, if known.
+    pub fn short_by_id(&self, id: &SessionId) -> Option<&String> {
+        self.short_to_id
+            .iter()
+            .find(|(_short, iter_id)| *iter_id == id)
+            .map(|(short, _)| short)
+    }
+
+    /// Returns the name corresponding to the given session ID, if it has one.
+    pub fn name_by_id(&self, id: &SessionId) -> Option<&String> {
+        self.names.get(id)
+    }
+}
+
+/// Pass B's per-entry decision. `Skip` for transient I/O errors;
+/// `DropMissing` for `NotFound` and unparseable records.
+enum ReconcileFix {
+    DropMissing,
+    Skip {
+        reason: std::io::Error,
+    },
+    UpdateName {
+        old_name: Option<String>,
+        new_name: Option<String>,
+    },
+}
+
+/// Prefix for delete-tombstone marker files, placed alongside
+/// (not inside) the target session dir.
+const TOMBSTONE_PREFIX: &str = ".deleting-";
+
+/// Build the tombstone marker file name for a given short.
+fn tombstone_name(short: &str) -> String {
+    format!("{TOMBSTONE_PREFIX}{short}")
+}
+
+/// True when `short` matches `DiskLoader::create`'s format: exactly
+/// 5 lowercase hex characters. Tombstone reaping refuses any other
+/// shape to bound `remove_dir_all` to intended session dirs.
+fn is_valid_short(short: &str) -> bool {
+    short.len() == 5
+        && short
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Whether a stored record predates `box_type` and `parent` (BOX-003): it
+/// has no `box_type`, or a null one, or no `parent` key. A record with no
+/// parent writes the key as `null`, so only an absent key reads as old.
+fn record_predates_box_types(raw: &serde_json_lenient::Value) -> bool {
+    let Some(fields) = raw.as_object() else {
+        return false;
+    };
+    fields
+        .get("box_type")
+        .is_none_or(serde_json_lenient::Value::is_null)
+        || !fields.contains_key("parent")
+}
+
+/// Read `record_file` and compare its name against `index_name` to
+/// decide what pass B should do with this index entry. Returns `None`
+/// when the record exists, parses, and agrees with the index.
+fn classify_record_for_reconcile(
+    record_file: &camino::Utf8Path,
+    index_name: Option<String>,
+) -> Option<ReconcileFix> {
+    let file = match std::fs::File::open(record_file) {
+        Ok(f) => f,
+        Err(e) if e.kind() == NotFound => return Some(ReconcileFix::DropMissing),
+        // Transient I/O failure: leave the entry alone, retry next startup.
+        Err(reason) => return Some(ReconcileFix::Skip { reason }),
+    };
+    // Distinguish I/O failure (transient — skip, retry next startup) from
+    // syntactic/data corruption (definitive — DropMissing so the index
+    // doesn't keep pointing at unreadable content).
+    let record: Record = match serde_json_lenient::from_reader(file) {
+        Ok(r) => r,
+        Err(e) if e.is_io() => return Some(ReconcileFix::Skip { reason: e.into() }),
+        Err(_) => return Some(ReconcileFix::DropMissing),
+    };
+    if record.name == index_name {
+        return None;
+    }
+    Some(ReconcileFix::UpdateName {
+        old_name: index_name,
+        new_name: record.name,
+    })
+}
+
+/// Logs a loaded record whose `reason` this build does not know (BOX-011).
+/// The record loads with the reason as written, and a save keeps it, so
+/// the log line is the one place the daemon says it cannot read the
+/// ending.
+fn log_unknown_reason(record: &Record) {
+    if let Some(reason @ crate::core::record::StoredReason::Unknown(_)) = &record.reason {
+        tracing::warn!(
+            session_id = %record.id,
+            status = ?record.status,
+            reason = reason.as_str(),
+            "loaded a box record with a reason this build does not know; kept as written",
+        );
+    }
+}
+
+/// Enumerate the immediate session subdirectories under `sessions_dir`.
+/// Missing dir is treated as empty (the parent `DiskLoader::new` has
+/// already ensured the dir exists, but a race during init is harmless).
+fn enumerate_session_dirs(
+    sessions_dir: &camino::Utf8Path,
+) -> Result<Vec<(String, std::path::PathBuf)>, std::io::Error> {
+    match std::fs::read_dir(sessions_dir) {
+        Ok(rd) => Ok(rd
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                Some((name, e.path()))
+            })
+            .collect()),
+        Err(e) if e.kind() == NotFound => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
+/// A loader of session state based on <minimal-state-dir>/sessions.
+///
+/// ./index.json maps short directory names to session UUIDs. Typically
+/// short directory names are the last few characters of the UUID, but
+/// thats not a guarantee.
+///
+/// ./<short-dir-name>/record.json is the session record.
+pub struct DiskLoader {
+    minimal_dir: DaemonAbsPath,
+    /// Keeps track of a mapping from shortname to UUID, as well as name to UUID.
+    /// Always kept up to date.
+    index: Index,
+}
+
+impl DiskLoader {
+    /// Open (or initialize) a disk-backed session store rooted at
+    /// `<minimal_dir>/sessions`, running a self-heal pass so
+    /// [`Loader::create`], [`Loader::rename`], and [`Loader::delete`]
+    /// tolerate a daemon crash at any point.
+    ///
+    /// Self-heal runs three passes: tombstone reap (finish deletes
+    /// interrupted mid-flight), index-vs-record reconciliation
+    /// (records are source of truth for name), and orphan re-index
+    /// (add sessions whose records parse but aren't indexed).
+    ///
+    /// # Errors
+    ///
+    /// I/O error if the sessions directory can't be created or
+    /// `index.json` can't be read.
+    pub fn new(minimal_dir: DaemonAbsPath) -> Result<Self, std::io::Error> {
+        std::fs::create_dir_all(minimal_dir.as_utf8_path().join("sessions"))?;
+        let index_file = minimal_dir.as_utf8_path().join("sessions/index.json");
+        let index = if std::fs::exists(&index_file)? {
+            serde_json_lenient::from_reader(std::fs::File::open(index_file)?)?
+        } else {
+            Index::default()
+        };
+
+        let mut this = Self { minimal_dir, index };
+        if this.self_heal()? {
+            this.flush_index()?;
+        }
+        Ok(this)
+    }
+
+    /// Reconcile in-memory index state with on-disk record state.
+    /// Returns `true` if any change was made (caller should flush).
+    fn self_heal(&mut self) -> Result<bool, std::io::Error> {
+        let sessions_dir = self.minimal_dir.as_utf8_path().join("sessions");
+
+        let mut changed = false;
+        let reaped = self.heal_reap_tombstones(&sessions_dir, &mut changed)?;
+        // Enumerate session dirs *after* pass A so the orphan re-index in
+        // pass C doesn't see dirs we just removed.
+        let session_dirs = enumerate_session_dirs(&sessions_dir)?;
+        self.heal_reconcile_index(&sessions_dir, &mut changed);
+        self.heal_reindex_orphans(&session_dirs, &reaped, &mut changed);
+        self.heal_migrate_untyped_records(&sessions_dir, &mut changed);
+        Ok(changed)
+    }
+
+    /// Pass D (BOX-003): migrate each indexed record written before the
+    /// record carried `box_type` and `parent`. A record with no `box_type`
+    /// becomes a `session` box with no parent. A record with a `box_type`
+    /// keeps it, and an absent `parent` key is written as no parent. A
+    /// record gets a fresh id only when its stored id is nil. A migrated
+    /// record carries both keys, so a later start leaves it unchanged. A record that cannot be read or written
+    /// is logged and left for the next start.
+    fn heal_migrate_untyped_records(
+        &mut self,
+        sessions_dir: &camino::Utf8Path,
+        changed: &mut bool,
+    ) {
+        let indexed: Vec<(String, SessionId)> = self
+            .index
+            .iter()
+            .map(|(short, id)| (short.clone(), *id))
+            .collect();
+        for (short, indexed_id) in indexed {
+            let record_file = sessions_dir.join(&short).join("record.json");
+            // Pass B already logged a record it could not read.
+            let Ok(raw) = std::fs::File::open(&record_file).and_then(|f| {
+                serde_json_lenient::from_reader::<_, serde_json_lenient::Value>(f)
+                    .map_err(std::io::Error::from)
+            }) else {
+                continue;
+            };
+            if !record_predates_box_types(&raw) {
+                continue;
+            }
+            let mut record: Record = match serde_json_lenient::from_value(raw) {
+                Ok(record) => record,
+                Err(e) => {
+                    tracing::warn!(
+                        short = %short,
+                        error = %e,
+                        "could not migrate a box record without box_type or parent: \
+                         record.json does not parse; leaving it unchanged",
+                    );
+                    continue;
+                }
+            };
+            let stored_id = record.id;
+            // Keep a type the record already has. A record with an absent or
+            // null `box_type` becomes a `session` box with no parent. An
+            // absent `parent` key reads as `None` and is written as `null`.
+            if record.box_type.is_none() {
+                record.box_type = Some(SESSION_BOX_TYPE.to_string());
+                record.parent = None;
+            }
+            if record.id.is_nil() {
+                record.id = SessionId::mint();
+            }
+            if let Err(e) = self.write_record(&short, &record) {
+                tracing::warn!(
+                    short = %short,
+                    box_id = %record.id,
+                    error = %e,
+                    "could not write a migrated box record; it migrates on the next start",
+                );
+                continue;
+            }
+            if record.id != indexed_id {
+                self.index.names.remove(&indexed_id);
+                self.index.short_to_id.insert(short.clone(), record.id);
+                self.index.set_name(record.id, record.name.clone());
+                *changed = true;
+            }
+            tracing::info!(
+                short = %short,
+                box_id = %record.id,
+                stored_id = %stored_id,
+                box_type = record.box_type.as_deref().unwrap_or(SESSION_BOX_TYPE),
+                parent = ?record.parent,
+                "migrated a box record without box_type or parent",
+            );
+        }
+    }
+
+    /// Pass A: reap any session dir whose external `.deleting-<short>`
+    /// tombstone is present in `sessions_dir`. Removes the dir,
+    /// then the marker (so a retry on a subsequent crash converges).
+    /// Drops any matching index entry. Returns the set of shorts
+    /// successfully reaped so pass C skips them.
+    fn heal_reap_tombstones(
+        &mut self,
+        sessions_dir: &camino::Utf8Path,
+        changed: &mut bool,
+    ) -> Result<std::collections::HashSet<String>, std::io::Error> {
+        let mut reaped = std::collections::HashSet::new();
+        let entries = match std::fs::read_dir(sessions_dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == NotFound => return Ok(reaped),
+            Err(e) => return Err(e),
+        };
+        for entry in entries.filter_map(Result::ok) {
+            // Tombstones are always regular files. Skipping non-files
+            // here means a hand-created directory like `.deleting-foo`
+            // doesn't get processed (which would warn-loop forever on
+            // the `remove_file` of a directory).
+            if !entry.file_type().is_ok_and(|t| t.is_file()) {
+                continue;
+            }
+            let Ok(fname) = entry.file_name().into_string() else {
+                continue;
+            };
+            let Some(short) = fname.strip_prefix(TOMBSTONE_PREFIX) else {
+                continue;
+            };
+            // Refuse to act on hand-crafted markers whose suffix doesn't
+            // match the create()-produced short format. Without this,
+            // `.deleting-` (empty), `.deleting-..`, etc. would redirect
+            // `remove_dir_all` to the parent or sessions dir itself.
+            if !is_valid_short(short) {
+                tracing::warn!(
+                    short = %short,
+                    "tombstone marker with malformed short suffix; refusing to act on it",
+                );
+                continue;
+            }
+            let short = short.to_owned();
+            // Record the short as tombstoned *before* any cleanup attempt.
+            // Pass C consults this set to decide whether to re-index, so
+            // even if `remove_dir_all` fails this cycle, the still-present
+            // `record.json` won't be silently "undeleted" by pass C.
+            // Failure paths below preserve this state.
+            reaped.insert(short.clone());
+            let doomed_dir = sessions_dir.join(&short);
+            tracing::info!(short = %short, "reaping tombstoned session dir");
+            match std::fs::remove_dir_all(doomed_dir.as_std_path()) {
+                Ok(()) => {}
+                Err(e) if e.kind() == NotFound => {}
+                Err(e) => {
+                    tracing::warn!(
+                        short = %short,
+                        error = %e,
+                        "failed to reap tombstoned session dir; leaving marker for next startup",
+                    );
+                    // `reaped` already has this short — pass C will skip it.
+                    continue;
+                }
+            }
+            // Remove the tombstone marker last so a crash above leaves
+            // the marker on disk for the next startup to retry.
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => {}
+                Err(e) if e.kind() == NotFound => {}
+                Err(e) => {
+                    tracing::warn!(
+                        short = %short,
+                        error = %e,
+                        "failed to remove tombstone marker; leaving for next startup",
+                    );
+                    // `reaped` already has this short — pass C will skip it.
+                    continue;
+                }
+            }
+            // An index entry may linger if delete crashed before flushing
+            // the index. The record is gone, so look up the name from the
+            // current in-memory index.
+            if self.index.short_to_id.contains_key(&short) {
+                self.index.remove(&short);
+                *changed = true;
+            }
+        }
+        Ok(reaped)
+    }
+
+    /// Pass B: reconcile each index entry against its record.json.
+    /// The record is the source of truth — drop entries whose record
+    /// is missing/unparseable; update name mappings when the record's
+    /// `name` differs from the index's name for that id (rename-crash
+    /// recovery).
+    fn heal_reconcile_index(&mut self, sessions_dir: &camino::Utf8Path, changed: &mut bool) {
+        let fixes: Vec<(String, SessionId, ReconcileFix)> = self
+            .index
+            .iter()
+            .filter_map(|(short, id)| {
+                let record_file = sessions_dir.join(short).join("record.json");
+                let fix = classify_record_for_reconcile(
+                    &record_file,
+                    self.index.name_by_id(id).cloned(),
+                )?;
+                Some((short.clone(), *id, fix))
+            })
+            .collect();
+        for (short, id, fix) in fixes {
+            match fix {
+                ReconcileFix::DropMissing => {
+                    tracing::info!(
+                        short = %short,
+                        id = %id,
+                        "dropping dangling index entry (record.json missing or unparseable)",
+                    );
+                    self.index.remove(&short);
+                    *changed = true;
+                }
+                ReconcileFix::Skip { reason } => {
+                    // The record may be readable on a future startup;
+                    // leave the index entry alone for now.
+                    tracing::warn!(
+                        short = %short,
+                        id = %id,
+                        error = %reason,
+                        "could not read record.json for reconcile; leaving index entry as-is",
+                    );
+                }
+                ReconcileFix::UpdateName { old_name, new_name } => {
+                    tracing::info!(
+                        short = %short,
+                        id = %id,
+                        old_name = ?old_name,
+                        new_name = ?new_name,
+                        "reconciling index entry's name with record.json (rename-crash recovery)",
+                    );
+                    self.index.set_name(id, new_name);
+                    *changed = true;
+                }
+            }
+        }
+    }
+
+    /// Pass C: re-index orphan records (record.json present, no index
+    /// entry, not already reaped). A running orphan whose `name` a running
+    /// indexed box holds is skipped and logged (BOX-004). A stopped or
+    /// exited orphan shares its name with any other record.
+    fn heal_reindex_orphans(
+        &mut self,
+        session_dirs: &[(String, std::path::PathBuf)],
+        reaped: &std::collections::HashSet<String>,
+        changed: &mut bool,
+    ) {
+        for (short, path) in session_dirs {
+            if reaped.contains(short) || self.index.short_to_id.contains_key(short) {
+                continue;
+            }
+            let record_file = path.join("record.json");
+            let record: Record = match std::fs::File::open(&record_file)
+                .and_then(|f| serde_json_lenient::from_reader(f).map_err(std::io::Error::from))
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        short = %short,
+                        error = %e,
+                        "found orphan session dir but record.json is missing or unparseable; \
+                         leaving for manual triage",
+                    );
+                    continue;
+                }
+            };
+            if self.index.short_by_id(&record.id).is_some() {
+                tracing::warn!(
+                    short = %short,
+                    id = %record.id,
+                    "orphan record's id collides with an existing index entry; \
+                     leaving orphan unindexed for manual triage",
+                );
+                continue;
+            }
+            if let Some(name) = &record.name
+                && crate::box_name::holds_name(record.status)
+            {
+                match self.running_holder(name, None) {
+                    Ok(None) => {}
+                    Ok(Some(holder)) => {
+                        tracing::warn!(
+                            short = %short,
+                            name = %name,
+                            holder = %holder.id,
+                            holder_name = %holder.name,
+                            "orphan record's name is held by a running box; \
+                             leaving orphan unindexed for manual triage",
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            short = %short,
+                            name = %name,
+                            error = %e,
+                            "could not check whether a running box holds the orphan \
+                             record's name; leaving orphan unindexed for manual triage",
+                        );
+                        continue;
+                    }
+                }
+            }
+            tracing::info!(
+                short = %short,
+                id = %record.id,
+                "re-indexing orphan session record",
+            );
+            self.index.insert(short.clone(), record.id, record.name);
+            *changed = true;
+        }
+    }
+
+    /// Writes the in-memory index back to disk.
+    ///
+    /// The write is staged into a sibling temp file and then atomically
+    /// renamed into place, so a crash mid-write can never leave a partially
+    /// serialized `index.json` behind.
+    fn flush_index(&self) -> Result<(), std::io::Error> {
+        let sessions_dir = self.minimal_dir.as_utf8_path().join("sessions");
+        let index_file = sessions_dir.join("index.json");
+        let tmp_file = sessions_dir.join("index.json.tmp");
+
+        let file = std::fs::File::create(&tmp_file)?;
+        serde_json_lenient::to_writer(&file, &self.index)?;
+        file.sync_all()?;
+        drop(file);
+
+        #[cfg(target_os = "linux")]
+        common::renameat2::renameat2_cwd(tmp_file.as_std_path(), index_file.as_std_path(), 0)?;
+        #[cfg(not(target_os = "linux"))]
+        std::fs::rename(&tmp_file, &index_file)?;
+
+        Ok(())
+    }
+
+    /// Writes the given session record to disk.
+    ///
+    /// The write is staged into a sibling temp file and then atomically
+    /// renamed into place, so a crash mid-write can never leave a partially
+    /// serialized `record.json` behind.
+    fn write_record(&mut self, short: &String, record: &Record) -> Result<(), std::io::Error> {
+        let session_dir = self.minimal_dir.as_utf8_path().join("sessions").join(short);
+        std::fs::create_dir_all(&session_dir)?;
+        let record_file = session_dir.join("record.json");
+        let tmp_file = session_dir.join("record.json.tmp");
+
+        let file = std::fs::File::create(&tmp_file)?;
+        serde_json_lenient::to_writer(&file, &record)?;
+        file.sync_all()?;
+        drop(file);
+
+        #[cfg(target_os = "linux")]
+        common::renameat2::renameat2_cwd(tmp_file.as_std_path(), record_file.as_std_path(), 0)?;
+        #[cfg(not(target_os = "linux"))]
+        std::fs::rename(&tmp_file, &record_file)?;
+
+        Ok(())
+    }
+
+    /// Resolve `key` to its live short directory name, or `NotFound` if the
+    /// key is stale.
+    ///
+    /// A [`DiskBoxKey`] can outlive the session it names — a caller may
+    /// hold a key (or a `BoxRecordHandle`) across a concurrent delete. A
+    /// stale key is refused two ways:
+    ///
+    /// - its short is no longer in the index (the session was deleted), or
+    /// - its short is present but now maps to a *different* id. The short is
+    ///   the UUID's last 5 hex chars (20 bits) and is re-allocatable after a
+    ///   delete, so a freed short can be handed to a new session.
+    ///
+    /// The id-strict second check is what stops a stale key from addressing
+    /// the unrelated session that inherited its short — without it, [`get`]
+    /// would read, and [`delete`] would destroy, the wrong session.
+    ///
+    /// [`get`]: Loader::get
+    /// [`delete`]: Loader::delete
+    fn live_short(&self, key: &DiskBoxKey) -> Result<String, std::io::Error> {
+        let short = key.dir_key.to_string();
+        match self.index.short_to_id.get(&short) {
+            Some(stored_id) if stored_id == key.id() => Ok(short),
+            _ => Err(std::io::Error::new(
+                NotFound,
+                format!(
+                    "no session with key (short `{short}`, id `{}`) \
+                     is present in the index",
+                    key.id(),
+                ),
+            )),
+        }
+    }
+
+    /// Reads the record filed under `short`.
+    fn read_record(&self, short: &str) -> Result<Record, std::io::Error> {
+        let record_file = self
+            .minimal_dir
+            .as_utf8_path()
+            .join("sessions")
+            .join(short)
+            .join("record.json");
+        Ok(serde_json_lenient::from_reader(std::fs::File::open(
+            record_file,
+        )?)?)
+    }
+
+    /// The name facts of every indexed box whose alias folds to `name`,
+    /// read from their records. The index finds the ids, and the records
+    /// give each box's current name and state. A record that is gone
+    /// since the index listed it belongs to no box and is skipped.
+    ///
+    /// # Errors
+    ///
+    /// Any other error reading one of the records: a record that cannot
+    /// be read can belong to a running box that holds the name.
+    pub fn boxes_named(&self, name: &str) -> Result<Vec<NamedBox>, std::io::Error> {
+        let mut found = Vec::new();
+        for id in self.index.ids_named(name) {
+            let Some(short) = self.index.short_by_id(&id) else {
+                continue;
+            };
+            let record = match self.read_record(short) {
+                Ok(record) => record,
+                Err(e) if e.kind() == NotFound => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        box_id = %id,
+                        name,
+                        error = %e,
+                        "could not read a box record while matching a name",
+                    );
+                    return Err(e);
+                }
+            };
+            if let Some(named) = NamedBox::from_record(&record) {
+                found.push(named);
+            }
+        }
+        Ok(found)
+    }
+
+    /// The running box other than `except` that holds a name folding to
+    /// `name` (BOX-004), or `None`.
+    ///
+    /// # Errors
+    ///
+    /// The error of [`Self::boxes_named`].
+    pub fn running_holder(
+        &self,
+        name: &str,
+        except: Option<SessionId>,
+    ) -> Result<Option<NamedBox>, std::io::Error> {
+        let named = self.boxes_named(name)?;
+        let holder = crate::box_name::running_holder(&named, name, except).cloned();
+        if let Some(holder) = &holder {
+            tracing::debug!(
+                name,
+                holder = %holder.id,
+                candidates = ?named.iter().map(|b| (b.id, b.state_word())).collect::<Vec<_>>(),
+                "a running box holds the name",
+            );
+        }
+        Ok(holder)
+    }
+}
+
+/// The refusal of a creation or resume whose name a running box holds.
+fn held_name_error(name: &str, holder: &NamedBox) -> std::io::Error {
+    tracing::info!(
+        name,
+        holder = %holder.id,
+        holder_name = %holder.name,
+        "refused a name: a running box holds it",
+    );
+    std::io::Error::new(
+        AlreadyExists,
+        format!(
+            "a running session named `{}` already exists (session names are \
+             case-insensitive)",
+            holder.name
+        ),
+    )
+}
+
+/// Session names that collide with infrastructure names once the daemon
+/// renders them into box names (`<name>.min.internal`): `host` is the zone's
+/// fixed host row, `local` is the legacy three-label form's host-id label,
+/// `localhost` is the loopback name, and `minimald` is the node namespace's
+/// row in the zone. Refused under ASCII case folding because box names are
+/// lower-cased. The two node-row labels are read from
+/// [`crate::core::zone_answer`] so this list cannot drift from the
+/// registries that key those rows.
+const RESERVED_SESSION_NAMES: [&str; 4] = [HOST_ROW_LABEL, "local", "localhost", NODE_ROW_LABEL];
+
+/// Reject a session name that would break a downstream output contract.
+///
+/// `complete-session-str` emits one `value<TAB>description` line per session
+/// and the `min ls` table renders the name verbatim; a control character —
+/// tab or newline in particular — splits one row into several, and an empty
+/// or whitespace-padded name is useless as an addressable handle. Enforced
+/// here beside the name-collision check so both name writers (`create` for
+/// `activate --name`, `save` for `rename`) share one gate. The name must
+/// also be a single DNS label (ASCII letters, digits and `-`, 1 to 63
+/// octets, no `-` at either end) because the daemon renders it into
+/// `<name>.min.internal`. A name that parses as a session UUID is refused,
+/// because the CLI resolves a UUID before a name.
+fn validate_session_name(name: &str) -> Result<(), std::io::Error> {
+    let invalid = |msg: &str| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid session name: {msg}"),
+        )
+    };
+    if name.trim().is_empty() {
+        return Err(invalid("must not be empty or whitespace"));
+    }
+    if name.trim() != name {
+        return Err(invalid("must not have leading or trailing whitespace"));
+    }
+    if name.chars().any(char::is_control) {
+        return Err(invalid("must not contain control characters"));
+    }
+    if let Some(reserved) = RESERVED_SESSION_NAMES
+        .iter()
+        .find(|reserved| name.eq_ignore_ascii_case(reserved))
+    {
+        return Err(invalid(&format!("`{reserved}` is reserved")));
+    }
+    // Lookups try a UUID before a name, so a UUID-shaped name would be
+    // shadowed by (or shadow) the session that id belongs to.
+    if SessionId::parse_str(name).is_ok() {
+        return Err(invalid("must not be a session id"));
+    }
+    // Session names are rendered into `<name>.min.internal` box names, so a
+    // name must be a single DNS label: ASCII letters, digits and `-`, 1 to 63
+    // octets, not starting or ending with `-`.
+    let is_ldh = |c: char| c.is_ascii_alphanumeric() || c == '-';
+    if name.len() > 63 || !name.chars().all(is_ldh) || name.starts_with('-') || name.ends_with('-')
+    {
+        return Err(invalid(
+            "must be a DNS label: ASCII letters, digits and `-`, \
+             1 to 63 characters, not starting or ending with `-`",
+        ));
+    }
+    Ok(())
+}
+
+impl DiskLoader {
+    /// Files `record` under the id it already carries, which the caller
+    /// minted: [`Loader::create`] mints one, and the daemon's store mints
+    /// its own and refuses an id a retained record names before it calls
+    /// this (BOX-001). The name checks are the same as [`Loader::create`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` for the nil id or an invalid name, `Other`
+    /// when the index already holds the id, `AlreadyExists` when another
+    /// session holds the name, and an I/O error if the session directory,
+    /// record, or index cannot be written. A held id is never
+    /// `AlreadyExists`: a caller reads that kind as a name collision and
+    /// retries under another name.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: the directory key is always five hex digits, a
+    /// valid relative path.
+    pub fn create_with_id(&mut self, record: Record) -> Result<DiskBoxKey, std::io::Error> {
+        if record.id.is_nil() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a box record cannot be filed under the nil id",
+            ));
+        }
+        // BOX-001: an id names one box. A handed id that the index already
+        // holds fails closed here, before anything is written.
+        if self.index.short_by_id(&record.id).is_some() {
+            tracing::warn!(
+                box_id = %record.id,
+                "refused to file a box record: the index already holds its id"
+            );
+            return Err(std::io::Error::other(format!(
+                "the box id {} is already in use by another box",
+                record.id
+            )));
+        }
+        if let Some(name) = &record.name {
+            validate_session_name(name)?;
+            // BOX-004: only a running box holds a name. A stopped or exited
+            // box keeps its name and leaves it free for this one.
+            if crate::box_name::holds_name(record.status)
+                && let Some(holder) = self.running_holder(name, None)?
+            {
+                return Err(held_name_error(name, &holder));
+            }
+        }
+
+        let id = record.id;
+        let id_hex = id.simple();
+        let mut short = id_hex[id_hex.len() - 5..].to_string();
+        // We got unlucky and the short name collided, 20 bits of entropy
+        // so rare but very possible. Increment the short name past
+        // any collisions in this case.
+        while self.index.find_by_short(&short).is_some() {
+            let n = u32::from_str_radix(&short, 16)
+                .expect("short dir name is always 5 hex chars from a UUID suffix");
+            short = format!("{:05x}", n.wrapping_add(1));
+        }
+
+        self.write_record(&short, &record)?;
+
+        self.index.insert(short.clone(), id, record.name);
+        self.flush_index()?;
+
+        Ok(DiskBoxKey {
+            session_id: id,
+            dir_key: DaemonRelPath::try_new(short).unwrap(),
+        })
+    }
+}
+
+impl Loader for DiskLoader {
+    type Key = DiskBoxKey;
+    type Object = DiskBox;
+
+    fn create(&mut self, mut record: Record) -> Result<Self::Key, std::io::Error> {
+        // The box id is the record's one key, minted here: a client never
+        // names it, so `record.id` is overwritten whatever it held.
+        record.id = SessionId::mint();
+        self.create_with_id(record)
+    }
+
+    fn keys(&self) -> impl Iterator<Item = Self::Key> {
+        self.index.iter().map(|(short, id)| Self::Key {
+            session_id: *id,
+            dir_key: DaemonRelPath::try_new(short).unwrap(),
+        })
+    }
+
+    fn find_by_id(&self, id: &SessionId) -> Result<Option<Self::Key>, std::io::Error> {
+        Ok(self.index.short_by_id(id).map(|short| Self::Key {
+            dir_key: DaemonRelPath::try_new(short).unwrap(),
+            session_id: *id,
+        }))
+    }
+    /// BOX-005: the running box of that name, else the most recently
+    /// created box of that name, else `None`. The answer is the box's key,
+    /// so a caller holds the id, not the name.
+    fn find_by_name<S: AsRef<str>>(&self, name: S) -> Result<Option<Self::Key>, std::io::Error> {
+        let name = name.as_ref();
+        let named = self.boxes_named(name)?;
+        match crate::box_name::resolve_on_host(&named, name) {
+            Some(id) => self.find_by_id(&id),
+            None => Ok(None),
+        }
+    }
+
+    #[tracing::instrument(level = "debug", name = "sessions.store.get", skip_all)]
+    fn get(&self, key: &Self::Key) -> Result<Self::Object, std::io::Error> {
+        // Refuse a stale key (session deleted, or its short re-allocated to a
+        // different session) with `NotFound` rather than reading the wrong
+        // record. See `live_short`.
+        let short = self.live_short(key)?;
+        let record_file = self
+            .minimal_dir
+            .as_utf8_path()
+            .join("sessions")
+            .join(&short)
+            .join("record.json");
+        let record: Record = serde_json_lenient::from_reader(std::fs::File::open(record_file)?)?;
+        log_unknown_reason(&record);
+        Ok(DiskBox {
+            minimal_state_dir: self.minimal_dir.clone(),
+            key: key.clone(),
+            record,
+        })
+    }
+
+    fn save(&mut self, key: &Self::Key, record: &Record) -> Result<(), std::io::Error> {
+        // The id is the primary key — `save` overwrites the row, it
+        // doesn't move it. Mismatched ids would corrupt the index.
+        if record.id != *key.id() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "save: record id {} does not match key id {}",
+                    record.id,
+                    key.id(),
+                ),
+            ));
+        }
+
+        // Refuse to save against a stale key — one the index has dropped, or
+        // whose short has since been re-allocated to a different session — so
+        // a stale caller can't overwrite the session that inherited the short.
+        // See `live_short`.
+        let short = self.live_short(key)?;
+        let id = *key.id();
+
+        let old_name = self.index.name_by_id(&id).cloned();
+        let new_name = record.name.clone();
+
+        if old_name != new_name
+            && let Some(name) = &new_name
+        {
+            // BOX-010: a new name is refused when it is `self` or a running
+            // box on this host holds it, whatever state this box is in.
+            // Same-id same-name is a no-op, not a collision.
+            let named = self.boxes_named(name)?;
+            crate::box_name::check_rename(&named, id, name).map_err(|refusal| {
+                tracing::info!(
+                    box_id = %id,
+                    name,
+                    candidates = ?named.iter().map(|b| (b.id, b.state_word())).collect::<Vec<_>>(),
+                    %refusal,
+                    "refused a new name for a box",
+                );
+                std::io::Error::from(refusal)
+            })?;
+            // Validate a newly-assigned name at the character level. Gate on
+            // an actual change so re-saving an unchanged record (e.g. a
+            // status promotion) never re-validates a name.
+            validate_session_name(name)?;
+        } else if let Some(name) = &new_name
+            && crate::box_name::holds_name(record.status)
+            && self.index.ids_named(name).any(|other| other != id)
+            && !self
+                .read_record(&short)
+                .is_ok_and(|old| crate::box_name::holds_name(old.status))
+        {
+            // BOX-004, BOX-025: a box that starts running again takes its
+            // name back only when no other running box holds it.
+            if let Some(holder) = self.running_holder(name, Some(id))? {
+                return Err(held_name_error(name, &holder));
+            }
+        }
+
+        // Atomic record write (temp + renameat2).
+        self.write_record(&short, record)?;
+
+        // Only mutate the in-memory index after the on-disk write succeeds.
+        if old_name != new_name {
+            self.index.set_name(id, new_name);
+            self.flush_index()?;
+        }
+
+        Ok(())
+    }
+
+    fn rename(&mut self, key: &Self::Key, new_name: String) -> Result<(), std::io::Error> {
+        let object = self.get(key)?;
+        let old_name = object.record.name.clone();
+        if old_name.as_deref() == Some(new_name.as_str()) {
+            return Ok(());
+        }
+        let mut record = object.record.clone();
+        record.name = Some(new_name.clone());
+        self.save(key, &record)?;
+        // BOX-010: the rename changed the alias and nothing else. The event
+        // carries both names, and is keyed on the box's id like every other.
+        let mut event = BoxEvent::for_record(&record, crate::events::BoxEventType::Renamed);
+        event.data = crate::box_name::renamed_event_data(old_name.as_deref(), &new_name);
+        // The new name is already saved. A failed event write does not undo
+        // it, so the rename still succeeds, as on the actor path.
+        match object.append_event(&event) {
+            Ok(()) => tracing::info!(
+                box_id = %record.id,
+                old_name = ?old_name,
+                new_name = %new_name,
+                "renamed a box",
+            ),
+            Err(error) => tracing::warn!(
+                box_id = %record.id,
+                old_name = ?old_name,
+                new_name = %new_name,
+                %error,
+                "rename: could not write the renamed event",
+            ),
+        }
+        Ok(())
+    }
+
+    fn delete(&mut self, key: &Self::Key) -> Result<(), std::io::Error> {
+        // Refuse a stale key up front: without the id-strict check, a key
+        // whose short was re-allocated after its own session was deleted would
+        // deindex and `remove_dir_all` the *unrelated* session that inherited
+        // the short. `live_short` returns `NotFound` in that case.
+        let short = self.live_short(key)?;
+
+        let sessions_root = self.minimal_dir.as_utf8_path().join("sessions");
+        let session_dir = sessions_root.join(&short);
+        let tombstone = sessions_root.join(tombstone_name(&short));
+
+        // Write a tombstone marker into the *parent* (sessions/) dir before
+        // doing anything else. Putting it outside the session dir means
+        // `remove_dir_all` below can't race the marker's existence — the
+        // marker survives until we explicitly remove it last. This lets
+        // `DiskLoader::new` distinguish a crashed-mid-delete dir (reap it,
+        // even if `remove_dir_all` partially completed) from a
+        // crashed-mid-create orphan record (re-index it).
+        //
+        // A NotFound here would mean `sessions_root` itself is gone, which
+        // is a loader-invariant violation; let it propagate.
+        std::fs::write(&tombstone, b"")?;
+
+        // Drop the index entries and flush before touching the filesystem: the
+        // index is the source of truth for `keys()`, so removing it first means
+        // a crash mid-delete can only ever orphan a directory (invisible and
+        // harmless), never leave a key pointing at a removed tree.
+        // Index cleanup reads only the index, not the record, so a
+        // half-deleted session (dir gone, index entries left) can still be
+        // scrubbed.
+        self.index.remove(&short);
+        self.flush_index()?;
+
+        match std::fs::remove_dir_all(&session_dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == NotFound => {}
+            Err(e) => return Err(e),
+        }
+
+        // Tombstone removed last: any prior crash leaves it on disk for
+        // `DiskLoader::new` to re-drive the reap idempotently.
+        match std::fs::remove_file(&tombstone) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn load_composition(
+        &self,
+        key: &Self::Key,
+    ) -> Result<Option<crate::core::compose::Composition>, std::io::Error> {
+        let short = self.live_short(key)?;
+        let path = self
+            .minimal_dir
+            .as_utf8_path()
+            .join("sessions")
+            .join(&short)
+            .join("composition.json");
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let wire: crate::wire::request::WireComposition =
+                    serde_json_lenient::from_slice(&bytes).map_err(|e| {
+                        std::io::Error::other(format!(
+                            "parsing composition snapshot at {}: {e}",
+                            path.as_str()
+                        ))
+                    })?;
+                crate::core::compose::Composition::try_from(wire)
+                    .map(Some)
+                    .map_err(|e| {
+                        std::io::Error::other(format!(
+                            "reconstructing composition from snapshot at {}: {e}",
+                            path.as_str()
+                        ))
+                    })
+            }
+            Err(e) if e.kind() == NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn store_composition(
+        &self,
+        key: &Self::Key,
+        composition: &crate::core::compose::Composition,
+    ) -> Result<(), std::io::Error> {
+        let short = self.live_short(key)?;
+        let session_dir = self
+            .minimal_dir
+            .as_utf8_path()
+            .join("sessions")
+            .join(&short);
+        std::fs::create_dir_all(&session_dir)?;
+        let dest = session_dir.join("composition.json");
+        let tmp = session_dir.join("composition.json.tmp");
+
+        let wire = crate::wire::request::WireComposition::from(composition);
+        let json = serde_json_lenient::to_vec_pretty(&wire)
+            .map_err(|e| std::io::Error::other(format!("serializing composition snapshot: {e}")))?;
+        std::fs::write(&tmp, &json)?;
+
+        #[cfg(target_os = "linux")]
+        common::renameat2::renameat2_cwd(tmp.as_std_path(), dest.as_std_path(), 0)?;
+        #[cfg(not(target_os = "linux"))]
+        std::fs::rename(&tmp, dest)?;
+
+        Ok(())
+    }
+
+    fn load_delta_baseline(&self, key: &Self::Key) -> Result<Option<Vec<u8>>, std::io::Error> {
+        let short = self.live_short(key)?;
+        let path = self
+            .minimal_dir
+            .as_utf8_path()
+            .join("sessions")
+            .join(&short)
+            .join("delta-baseline.json");
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn store_delta_baseline(&self, key: &Self::Key, payload: &[u8]) -> Result<(), std::io::Error> {
+        let short = self.live_short(key)?;
+        let session_dir = self
+            .minimal_dir
+            .as_utf8_path()
+            .join("sessions")
+            .join(&short);
+        std::fs::create_dir_all(&session_dir)?;
+        let dest = session_dir.join("delta-baseline.json");
+        let tmp = session_dir.join("delta-baseline.json.tmp");
+
+        std::fs::write(&tmp, payload)?;
+
+        #[cfg(target_os = "linux")]
+        common::renameat2::renameat2_cwd(tmp.as_std_path(), dest.as_std_path(), 0)?;
+        #[cfg(not(target_os = "linux"))]
+        std::fs::rename(&tmp, dest)?;
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::BoxState;
+    use paths::HostAbsPath;
+    use std::{collections::BTreeSet, io::ErrorKind};
+    use tempfile::TempDir;
+    use uuid::Uuid;
+
+    fn loader_dir(tmp: &TempDir) -> DaemonAbsPath {
+        DaemonAbsPath::try_new(tmp.path().to_str().unwrap()).unwrap()
+    }
+
+    fn sample_record() -> Record {
+        Record {
+            id: SessionId::nil(),
+            name: Some("my-session".to_string()),
+            username: Some("alice".to_string()),
+            project_path: HostAbsPath::try_new("/home/alice/proj").unwrap(),
+            // An OwnIp session carrying a non-default policy, so the round-trip
+            // tests prove a configured policy — the live source for the
+            // GetSessionPolicy RPC — survives a disk round-trip, not just the
+            // all-`None` default. Every egress field is set, deny_subnets
+            // included, so a field dropped on write shows up as a diff.
+            network: crate::NetworkMode::OwnIp,
+            policy: crate::BoxPolicy::new(
+                Some(crate::EgressPolicy {
+                    allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                    allow_dns_hosts: None,
+                    allow_protocols: None,
+                    deny_subnets: Some(vec!["192.168.0.0/16".to_string()]),
+                }),
+                None,
+            ),
+            status: BoxState::default(),
+            reason: None,
+            exit_code: None,
+            signal: None,
+            // Deliberately the non-default shapes: `hooks_enabled: false`
+            // and a present `box_addresses` are both serde defaults to
+            // `None`/`true`, so a fixture using those would round-trip
+            // green even if the field were dropped on write.
+            hooks_enabled: false,
+            task_addresses: Vec::new(),
+            box_addresses: Some(crate::BoxAddresses {
+                switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
+                loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
+            }),
+            // `None` is the honest value for this own-address record: only a
+            // host-address box's launch ever writes the field, so a
+            // `Some` here would model a record no daemon writes. The
+            // round-trip of a `Some` is proved at the daemon's own launch
+            // record, which a client reads back through `GetSessionRecord`.
+            host_ip_enforcement: None,
+            // Non-default too, for the same reason: `false` is its serde default.
+            box_id: None,
+            host_row_bound: true,
+            bound_ports: std::collections::BTreeSet::new(),
+            // Non-default for the same reason: `false` is its serde default, and
+            // a dropped marker would strand a run box on resume (NET-131).
+            ends_with_run: true,
+            sealed_deliveries: Vec::new(),
+            root_certificate: None,
+            // Set, so a field dropped on write shows up as a diff: `None` is
+            // the serde default of all three.
+            box_type: Some(crate::SESSION_BOX_TYPE.to_string()),
+            parent: Some(SessionId::mint()),
+            project_root: Some(HostAbsPath::try_new("/home/alice/proj").unwrap()),
+            attrs: [("color".to_string(), "blue".to_string())]
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    /// BOX-001: `create_with_id` refuses an id the index already holds,
+    /// with a kind that is not `AlreadyExists`, and writes nothing.
+    #[test]
+    fn create_with_id_refuses_an_id_the_index_holds() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let held = loader.create(sample_record()).unwrap();
+
+        let mut again = sample_record();
+        again.id = held.session_id;
+        again.name = Some("another-name".to_string());
+        let err = loader.create_with_id(again).unwrap_err();
+
+        assert_ne!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(loader.keys().count(), 1, "nothing new is filed");
+        assert_eq!(loader.find_by_name("another-name").unwrap(), None);
+        assert_eq!(loader.find_by_id(&held.session_id).unwrap(), Some(held));
+    }
+
+    /// BOX-068: a box's spec is stored beside its record, in the box's
+    /// own directory, and is read back as it was written. A box with no
+    /// spec file reads as none, and deleting the box removes the file.
+    #[test]
+    fn spec_file_is_stored_beside_the_record() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let object = loader.get(&key).unwrap();
+        assert_eq!(object.load_spec().unwrap(), None);
+
+        let spec = br#"{"box":{"type":"session"},"v":0}"#;
+        object.store_spec(spec).unwrap();
+
+        let record_dir = loader_dir(&tmp)
+            .as_utf8_path()
+            .join("sessions")
+            .join(key.dir_key.as_str());
+        assert_eq!(
+            object.spec_path().as_utf8_path(),
+            record_dir.join(SPEC_FILE)
+        );
+        assert!(record_dir.join("record.json").exists());
+        assert_eq!(
+            loader.get(&key).unwrap().load_spec().unwrap().as_deref(),
+            Some(&spec[..])
+        );
+
+        loader.delete(&key).unwrap();
+        assert!(!record_dir.join(SPEC_FILE).exists());
+    }
+
+    /// BOX-155, BOX-164: the box's output log sits beside its record, the
+    /// box directory a runtime finds from the workspace is the store's own,
+    /// and a reader finds it by id until the box is deleted.
+    #[test]
+    fn box_dir_names_the_log_beside_the_record() {
+        use crate::events::BoxEventType;
+
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let object = loader.get(&key).unwrap();
+        let record_dir = root
+            .as_utf8_path()
+            .join("sessions")
+            .join(key.dir_key.as_str());
+
+        assert_eq!(object.log_path().as_utf8_path(), record_dir.join(LOG_FILE));
+        assert_eq!(
+            BoxDir::for_tree(&object.workspace_path()),
+            Some(object.dir())
+        );
+        assert_eq!(BoxDir::for_tree(&object.home_path()), None);
+        assert_eq!(
+            BoxDir::find(&root, &key.session_id).unwrap(),
+            Some(object.dir())
+        );
+        assert_eq!(BoxDir::find(&root, &SessionId::mint()).unwrap(), None);
+
+        std::fs::write(record_dir.join(LOG_FILE), b"hello\r\nworld").unwrap();
+        assert_eq!(
+            object.dir().read_log_from(0, 64).unwrap(),
+            b"hello\r\nworld"
+        );
+        assert_eq!(object.dir().read_log_from(7, 3).unwrap(), b"wor");
+
+        let event = object.dir().append_event(BoxEventType::Detached).unwrap();
+        assert_eq!(event.box_id, key.session_id);
+        assert_eq!(event.parent, object.record().parent);
+        assert_eq!(object.read_events_from(0).unwrap().events, [event]);
+
+        loader.delete(&key).unwrap();
+        assert!(!record_dir.join(LOG_FILE).exists());
+        assert_eq!(BoxDir::find(&root, &key.session_id).unwrap(), None);
+    }
+
+    /// BOX-164: a read of a box's log does not follow a link planted where
+    /// the log goes, and refuses what is not a regular file.
+    #[cfg(unix)]
+    #[test]
+    fn log_read_refuses_a_link_at_the_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = loader_dir(&tmp);
+        let mut loader = DiskLoader::new(root).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let dir = loader.get(&key).unwrap().dir();
+        let target = tmp.path().join("secret");
+        std::fs::write(&target, b"secret").unwrap();
+        std::os::unix::fs::symlink(&target, dir.log_path().as_utf8_path()).unwrap();
+
+        let err = dir.read_log_from(0, 64).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+        let err = LogReader::new(&dir, 0).read(64).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+
+        std::fs::remove_file(dir.log_path().as_utf8_path()).unwrap();
+        std::fs::create_dir(dir.log_path().as_utf8_path()).unwrap();
+        let err = dir.read_log_from(0, 64).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+    }
+
+    /// A writer and a reader over one box's log under a small cap.
+    fn capped_log(cap: u64) -> (tempfile::TempDir, BoxDir, LogWriter) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = loader_dir(&tmp);
+        let mut loader = DiskLoader::new(root).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let dir = loader.get(&key).unwrap().dir();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(dir.log_path().as_utf8_path())
+            .unwrap();
+        let writer = LogWriter::new(dir.log_path(), file).unwrap().with_cap(cap);
+        (tmp, dir, writer)
+    }
+
+    /// Every chunk the reader has now, joined.
+    fn drain(reader: &mut LogReader) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let chunk = reader.read(7).unwrap();
+            if chunk.data.is_empty() {
+                return out;
+            }
+            out.extend_from_slice(&chunk.data);
+        }
+    }
+
+    /// BOX-155: past the cap the log keeps the drop mark and the newest
+    /// output, and is never larger than the cap. A reader that keeps up
+    /// reads every byte once, across each replacement.
+    #[test]
+    fn capped_log_keeps_the_newest_and_a_reader_sees_each_byte_once() {
+        let cap = 256;
+        let (_tmp, dir, mut writer) = capped_log(cap);
+        let mut reader = LogReader::new(&dir, 0).with_cap(cap);
+        let mut written = Vec::new();
+        let mut read = Vec::new();
+        for i in 0..200 {
+            let line = format!("line {i:04}\n");
+            writer.write(line.as_bytes()).unwrap();
+            written.extend_from_slice(line.as_bytes());
+            let len = std::fs::metadata(dir.log_path().as_utf8_path())
+                .unwrap()
+                .len();
+            assert!(len <= cap, "the log is {len} bytes, past the cap {cap}");
+            read.extend_from_slice(&drain(&mut reader));
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&read),
+            String::from_utf8_lossy(&written),
+            "a reader that keeps up reads each byte once, in order"
+        );
+
+        let log = dir.read_log_from(0, usize::MAX).unwrap();
+        assert!(
+            log.starts_with(LOG_DROPPED),
+            "{}",
+            String::from_utf8_lossy(&log)
+        );
+        assert!(
+            written.ends_with(&log[LOG_DROPPED.len()..]),
+            "the log holds the newest output"
+        );
+    }
+
+    /// A reader that falls behind by more than one replacement gets the
+    /// drop mark where its output has a gap, and no byte twice.
+    #[test]
+    fn capped_log_reader_behind_two_drops_sees_the_mark_and_no_repeat() {
+        let cap = 256;
+        let (_tmp, dir, mut writer) = capped_log(cap);
+        let mut reader = LogReader::new(&dir, 0).with_cap(cap);
+        let mut written = Vec::new();
+        let mut read = Vec::new();
+        for i in 0..10 {
+            let line = format!("line {i:04}\n");
+            writer.write(line.as_bytes()).unwrap();
+            written.extend_from_slice(line.as_bytes());
+        }
+        read.extend_from_slice(&drain(&mut reader));
+        for i in 10..200 {
+            let line = format!("line {i:04}\n");
+            writer.write(line.as_bytes()).unwrap();
+            written.extend_from_slice(line.as_bytes());
+        }
+        read.extend_from_slice(&drain(&mut reader));
+
+        let text = String::from_utf8_lossy(&read).into_owned();
+        let mark = String::from_utf8_lossy(LOG_DROPPED).into_owned();
+        let (before, after) = text.split_once(&mark).expect("the gap is marked");
+        assert!(written.starts_with(before.as_bytes()), "{text}");
+        assert!(written.ends_with(after.as_bytes()), "{text}");
+        let lines: Vec<&str> = text.lines().filter(|l| l.starts_with("line ")).collect();
+        let mut sorted = lines.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(lines, sorted, "no line twice, in order: {text}");
+    }
+
+    /// BOX-149: an exec's transcript lives beside the record, outside every
+    /// directory the box sees, and the box's delete removes it.
+    #[test]
+    fn exec_transcripts_live_beside_the_record_until_the_box_is_reaped() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let object = loader.get(&key).unwrap();
+        let record_dir = loader_dir(&tmp)
+            .as_utf8_path()
+            .join("sessions")
+            .join(key.dir_key.as_str());
+
+        let id = "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f4a5b";
+        let transcript = object.exec_transcript_path(id);
+        assert_eq!(
+            transcript,
+            record_dir.join(EXECS_DIR).join(format!("{id}.log"))
+        );
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, b"out\n").unwrap();
+
+        loader.delete(&key).unwrap();
+        assert!(!transcript.exists());
+    }
+
+    /// BOX-040, BOX-162: events append beside the record, outside every
+    /// directory the box sees, and read back in the order they were
+    /// written, from the start or from an offset. Deleting the box removes
+    /// the file and ends its retention.
+    #[test]
+    fn events_file_appends_in_write_order() {
+        use crate::events::{BoxEvent, BoxEventType, EVENTS_FILE};
+
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let object = loader.get(&key).unwrap();
+        assert_eq!(
+            object.read_events_from(0).unwrap().events,
+            [] as [crate::events::BoxEvent; 0]
+        );
+        assert!(object.is_retained());
+
+        let kinds = [
+            BoxEventType::Created,
+            BoxEventType::Started,
+            BoxEventType::Detached,
+            BoxEventType::Resumed,
+            BoxEventType::Exited,
+        ];
+        let written: Vec<BoxEvent> = kinds
+            .iter()
+            .map(|kind| BoxEvent::for_record(object.record(), *kind))
+            .collect();
+        object.append_event(&written[0]).unwrap();
+        let first = object.read_events_from(0).unwrap();
+        assert_eq!(first.events, written[..1]);
+        for event in &written[1..] {
+            object.append_event(event).unwrap();
+        }
+
+        let all = object.read_events_from(0).unwrap();
+        assert_eq!(all.events, written);
+        assert_eq!(all.refused, [] as [(u64, String); 0]);
+        let rest = object.read_events_from(first.consumed).unwrap();
+        assert_eq!(rest.events, written[1..]);
+        assert_eq!(rest.consumed + first.consumed, all.consumed);
+        assert!(written.iter().all(|e| e.box_id == key.session_id));
+        assert!(written.iter().all(|e| e.parent == object.record().parent));
+
+        let record_dir = loader_dir(&tmp)
+            .as_utf8_path()
+            .join("sessions")
+            .join(key.dir_key.as_str());
+        assert_eq!(
+            object.events_path().as_utf8_path(),
+            record_dir.join(EVENTS_FILE)
+        );
+        for seen in [
+            object.workspace_path(),
+            object.home_path(),
+            object.cache_path(),
+            object.patches_path(),
+            object.hooks_path(),
+        ] {
+            assert!(
+                !object
+                    .events_path()
+                    .as_utf8_path()
+                    .starts_with(seen.as_utf8_path())
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(record_dir.join(EVENTS_FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        loader.delete(&key).unwrap();
+        assert!(!record_dir.join(EVENTS_FILE).exists());
+        assert!(!object.is_retained());
+        assert_eq!(
+            object.read_events_from(0).unwrap().events,
+            [] as [crate::events::BoxEvent; 0]
+        );
+    }
+
+    /// BOX-162: an append after a torn last line, one a crash left without
+    /// its newline, cuts the torn bytes first. The event before them and the
+    /// new event read back, the torn bytes are gone, and no line is refused.
+    #[test]
+    fn append_after_a_torn_line_drops_the_fragment() {
+        use crate::events::{BoxEvent, BoxEventType};
+        use std::io::Write as _;
+
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let object = loader.get(&key).unwrap();
+        let before = BoxEvent::for_record(object.record(), BoxEventType::Created);
+        object.append_event(&before).unwrap();
+        let path = object.events_path();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path.as_utf8_path())
+            .unwrap()
+            .write_all(b"{\"box\":\"torn")
+            .unwrap();
+        let after = BoxEvent::for_record(object.record(), BoxEventType::Started);
+        object.append_event(&after).unwrap();
+
+        let all = object.read_events_from(0).unwrap();
+        assert_eq!(all.events, [before.clone(), after.clone()]);
+        assert_eq!(all.refused.len(), 0);
+        let text = std::fs::read_to_string(path.as_utf8_path()).unwrap();
+        assert!(!text.contains("torn"), "the torn bytes stay: {text}");
+        assert_eq!(all.consumed, text.len() as u64);
+
+        // A file that holds only a torn line is cut to nothing.
+        std::fs::write(path.as_utf8_path(), b"{\"box\"").unwrap();
+        object.append_event(&after).unwrap();
+        let all = object.read_events_from(0).unwrap();
+        assert_eq!(all.events, [after]);
+        assert_eq!(all.refused.len(), 0);
+    }
+
+    /// BOX-162: two threads append to a file with a torn tail at once. The
+    /// file lock makes each cut and write one step, so the second cut never
+    /// removes the first append's event. Every event reads back, and no line
+    /// is refused.
+    #[test]
+    fn concurrent_appends_after_a_torn_line_keep_every_event() {
+        use crate::events::{BoxEvent, BoxEventType};
+
+        const PER_THREAD: usize = 50;
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let object = loader.get(&key).unwrap();
+        let path = object.events_path();
+        std::fs::write(path.as_utf8_path(), b"{\"box\":\"torn").unwrap();
+
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for kind in [BoxEventType::Started, BoxEventType::Detached] {
+                let object = loader.get(&key).unwrap();
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let event = BoxEvent::for_record(object.record(), kind);
+                    barrier.wait();
+                    for _ in 0..PER_THREAD {
+                        object.append_event(&event).unwrap();
+                    }
+                });
+            }
+        });
+
+        let all = object.read_events_from(0).unwrap();
+        assert_eq!(all.refused, [] as [(u64, String); 0]);
+        assert_eq!(all.events.len(), 2 * PER_THREAD);
+        for kind in [BoxEventType::Started, BoxEventType::Detached] {
+            let count = all.events.iter().filter(|e| e.kind == kind).count();
+            assert_eq!(count, PER_THREAD, "events of {kind:?} lost");
+        }
+        let text = std::fs::read_to_string(path.as_utf8_path()).unwrap();
+        assert!(!text.contains("torn"), "the torn bytes stay: {text}");
+    }
+
+    /// An event for a box whose directory is gone fails with `NotFound`
+    /// and does not create the directory again.
+    #[test]
+    fn append_after_delete_leaves_no_directory() {
+        use crate::events::{BoxEvent, BoxEventType};
+
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let object = loader.get(&key).unwrap();
+        loader.delete(&key).unwrap();
+        let event = BoxEvent::for_record(object.record(), BoxEventType::Exited);
+        let err = object.append_event(&event).unwrap_err();
+        assert_eq!(err.kind(), NotFound);
+        assert!(!object.root_path().as_utf8_path().exists());
+    }
+
+    #[test]
+    fn create_then_get_round_trips_record_contents() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let input = sample_record();
+        let key = loader.create(input.clone()).unwrap();
+        let got = loader.get(&key).unwrap();
+
+        // The id is reassigned by the loader, but every other field
+        // is the caller's to control and must survive a round-trip.
+        assert_eq!(got.record().name, input.name);
+        assert_eq!(got.record().username, input.username);
+        assert_eq!(got.record().project_path, input.project_path);
+        assert_eq!(got.record().attrs, input.attrs);
+        // The configured network mode and policy must survive too: Record.policy
+        // is the authoritative source the GetSessionPolicy RPC reads back.
+        assert_eq!(got.record().network, input.network);
+        assert_eq!(got.record().policy, input.policy);
+        // Likewise `--no-hooks`: the attach, detach, and destroy
+        // transitions read this back off disk, long after the flag that
+        // set it is gone.
+        assert_eq!(got.record().hooks_enabled, input.hooks_enabled);
+        assert!(!got.record().hooks_enabled);
+
+        // Check find_by_id as well.
+        assert_eq!(
+            loader.find_by_id(&got.record.id).unwrap().as_ref(),
+            Some(&key)
+        );
+        // Check find_by_name as well.
+        assert_eq!(
+            loader.find_by_name(got.record.name.unwrap()).unwrap(),
+            Some(key)
+        );
+    }
+
+    /// A record written before the session id and the box id merged into
+    /// one type carries the record's id in the hyphenated form and the
+    /// host-handed id as 32 hex digits. The store reads it from disk under
+    /// the same id, and writes both fields back in the spelling they were
+    /// read in, so the file a newer daemon saves reads the same to an
+    /// older one.
+    #[test]
+    fn record_json_written_before_the_merge_round_trips() {
+        const OLD_ID: &str = "0190b3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b";
+        const OLD_BOX_ID: &str = "0190b3c45d6e7f809a1b2c3d4e5f6a7b";
+
+        // The pre-merge record: every other field as a record writes it,
+        // and the two ids spelled the way each type wrote them then.
+        let mut old = serde_json_lenient::to_value(sample_record()).unwrap();
+        old["id"] = serde_json_lenient::Value::String(OLD_ID.to_string());
+        old["box_id"] = serde_json_lenient::Value::String(OLD_BOX_ID.to_string());
+        let old_bytes = serde_json_lenient::to_vec(&old).unwrap();
+
+        // Read straight from the bytes: both spellings name the one id.
+        let read: Record = serde_json_lenient::from_slice(&old_bytes).unwrap();
+        let expected = SessionId::parse_str(OLD_ID).unwrap();
+        assert_eq!(read.id, expected);
+        assert_eq!(
+            read.box_id,
+            Some(expected),
+            "the hex spelling reads as the same id"
+        );
+        assert_eq!(read.id.to_string(), OLD_ID);
+        assert_eq!(read.id.simple(), OLD_BOX_ID);
+        let rewritten = serde_json_lenient::to_value(&read).unwrap();
+        assert_eq!(
+            rewritten, old,
+            "a read and a write leave every field as it was"
+        );
+
+        // Read through the store, from a record planted on disk.
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+        let dir = root.as_utf8_path().join("sessions").join("a6a7b");
+        std::fs::create_dir_all(dir.as_std_path()).unwrap();
+        std::fs::write(dir.join("record.json").as_std_path(), &old_bytes).unwrap();
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader
+            .find_by_id(&expected)
+            .unwrap()
+            .expect("the old record is indexed under its id");
+        assert_eq!(key.id(), &expected);
+        let by_name = loader
+            .find_by_name("my-session")
+            .unwrap()
+            .expect("found by name");
+        assert_eq!(by_name.id(), &expected, "a name resolves to the same id");
+        let got = loader.get(&key).unwrap().record().clone();
+        assert_eq!(got, read);
+
+        // Save it back and read the file: the same spellings, the same values.
+        loader.save(&key, &got).unwrap();
+        let saved: serde_json_lenient::Value = serde_json_lenient::from_slice(
+            &std::fs::read(dir.join("record.json").as_std_path()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            saved, old,
+            "a saved record keeps the pre-merge bytes of both ids"
+        );
+    }
+
+    #[test]
+    fn create_assigns_a_fresh_id_and_key_uuid_matches_stored_record() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let mut input = sample_record();
+        input.id = SessionId::nil();
+        let key = loader.create(input).unwrap();
+
+        assert_ne!(
+            *key.id().as_ref(),
+            Uuid::nil(),
+            "create must overwrite caller id"
+        );
+        let stored = loader.get(&key).unwrap();
+        assert_eq!(&stored.record().id, key.id());
+    }
+
+    #[test]
+    fn create_errors_on_non_unique_name() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        loader.create(sample_record()).unwrap();
+        assert_eq!(
+            loader.create(sample_record()).err().map(|e| e.kind()),
+            Some(ErrorKind::AlreadyExists)
+        );
+    }
+
+    #[test]
+    fn create_errors_on_case_only_name_collision() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        loader.create(sample_record()).unwrap();
+        let mut record = sample_record();
+        record.name = Some("MY-SESSION".to_string());
+        assert_eq!(
+            loader.create(record).err().map(|e| e.kind()),
+            Some(ErrorKind::AlreadyExists)
+        );
+    }
+
+    #[test]
+    fn find_by_name_resolves_case_insensitively() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let mut record = sample_record();
+        record.name = Some("My-Session".to_string());
+        let key = loader.create(record).unwrap();
+
+        // The exact name resolves, and so does any casing of it: names are
+        // unique under ASCII case folding, so the fallback is unambiguous.
+        assert_eq!(
+            loader.find_by_name("My-Session").unwrap(),
+            Some(key.clone())
+        );
+        assert_eq!(
+            loader.find_by_name("my-session").unwrap(),
+            Some(key.clone())
+        );
+        assert_eq!(loader.find_by_name("MY-SESSION").unwrap(), Some(key));
+    }
+
+    /// Sessions written before names were unique under case folding can sit
+    /// side by side in the index. An exact name still resolves to its own
+    /// session, and a casing that folds to both resolves to neither.
+    #[test]
+    fn find_by_name_prefers_exact_and_refuses_an_ambiguous_fold() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let mut upper = sample_record();
+        upper.name = Some("Case-R".to_string());
+        let upper_key = loader.create(upper).unwrap();
+        let mut lower = sample_record();
+        lower.name = Some("Case-X".to_string());
+        let lower_key = loader.create(lower).unwrap();
+        // Plant the legacy case-only duplicate the create path now refuses,
+        // in the record and in the index.
+        let mut planted = loader.get(&lower_key).unwrap().record;
+        planted.name = Some("case-r".to_string());
+        loader
+            .write_record(&short_of(&lower_key), &planted)
+            .unwrap();
+        loader
+            .index
+            .set_name(lower_key.session_id, Some("case-r".to_string()));
+
+        assert_eq!(loader.find_by_name("Case-R").unwrap(), Some(upper_key));
+        assert_eq!(loader.find_by_name("case-r").unwrap(), Some(lower_key));
+        assert_eq!(loader.find_by_name("CASE-R").unwrap(), None);
+    }
+
+    #[test]
+    fn validate_session_name_accepts_ordinary_names() {
+        assert!(validate_session_name("debug-qa").is_ok());
+        assert!(validate_session_name("my-session").is_ok());
+        assert!(validate_session_name("a".repeat(63).as_str()).is_ok());
+    }
+
+    #[test]
+    fn validate_session_name_rejects_non_ldh_labels() {
+        for bad in [
+            "bad name/y",
+            "dot.ted.name",
+            "Ünï-cødé",
+            "-leading",
+            "trailing-",
+            "a".repeat(64).as_str(),
+        ] {
+            assert_eq!(
+                validate_session_name(bad).err().map(|e| e.kind()),
+                Some(ErrorKind::InvalidInput),
+                "expected `{bad:?}` to be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_session_name_rejects_empty_whitespace_and_control_chars() {
+        for bad in ["", "   ", " leading", "trailing ", "a\tb", "x\ny"] {
+            assert_eq!(
+                validate_session_name(bad).err().map(|e| e.kind()),
+                Some(ErrorKind::InvalidInput),
+                "expected `{bad:?}` to be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_session_name_rejects_reserved_names() {
+        for bad in [
+            "host",
+            "local",
+            "localhost",
+            "minimald",
+            "HOST",
+            "Localhost",
+            "MINIMALD",
+        ] {
+            assert_eq!(
+                validate_session_name(bad).err().map(|e| e.kind()),
+                Some(ErrorKind::InvalidInput),
+                "expected `{bad:?}` to be rejected",
+            );
+        }
+    }
+
+    /// Every node-row label the zone defines is reserved: a registry that
+    /// keys a new row under the apex must not let a session take its
+    /// label, so the reserved list has to carry the label too. This pins
+    /// the list to the zone's labels: a label added to
+    /// [`crate::core::zone_answer::NODE_ROW_LABELS`] without a matching
+    /// reserved entry fails here rather than in production.
+    #[test]
+    fn reserved_session_names_carry_every_node_row_label() {
+        for label in crate::core::zone_answer::NODE_ROW_LABELS {
+            assert!(
+                RESERVED_SESSION_NAMES
+                    .iter()
+                    .any(|reserved| reserved.eq_ignore_ascii_case(label)),
+                "node-row label `{label}` is missing from the reserved names"
+            );
+        }
+    }
+
+    #[test]
+    fn create_and_rename_refuse_a_uuid_shaped_name() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let uuid = "019f5d0f-0a99-78b1-9165-0809440f0052";
+
+        for name in [uuid, "019f5d0f0a9978b191650809440f0052"] {
+            let mut record = sample_record();
+            record.name = Some(name.to_string());
+            let err = loader.create(record).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput, "create `{name}`");
+            assert!(
+                err.to_string().contains("must not be a session id"),
+                "{err}"
+            );
+        }
+        assert!(loader.keys().next().is_none());
+
+        let key = loader.create(sample_record()).unwrap();
+        let err = loader.rename(&key, uuid.to_string()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("must not be a session id"),
+            "{err}"
+        );
+        assert_eq!(loader.find_by_name("my-session").unwrap(), Some(key));
+    }
+
+    #[test]
+    fn validate_session_name_accepts_names_containing_reserved_words() {
+        validate_session_name("host-a").unwrap();
+        validate_session_name("my-localhost").unwrap();
+        validate_session_name("localdev").unwrap();
+        validate_session_name("minimald-dev").unwrap();
+        validate_session_name("my-minimald").unwrap();
+    }
+
+    #[test]
+    fn create_rejects_a_reserved_name_and_creates_no_session_dir() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let mut record = sample_record();
+        record.name = Some("host".to_string());
+        assert_eq!(
+            loader.create(record).err().map(|e| e.kind()),
+            Some(ErrorKind::InvalidInput)
+        );
+        // No session directory was created for the rejected name.
+        assert!(loader.keys().next().is_none());
+    }
+
+    #[test]
+    fn rename_to_a_reserved_name_fails_and_keeps_the_old_one() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        assert_eq!(
+            loader
+                .rename(&key, "Local".to_string())
+                .err()
+                .map(|e| e.kind()),
+            Some(ErrorKind::InvalidInput)
+        );
+        // The failed rename left the original name intact.
+        assert_eq!(loader.find_by_name("my-session").unwrap(), Some(key));
+    }
+
+    #[test]
+    fn save_of_an_unchanged_reserved_named_record_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        // Plant a record already named `host` directly on disk (create
+        // refuses it now), then reopen so self-heal indexes it.
+        let orphan_short = "zzzzz";
+        let orphan_dir = root.as_utf8_path().join("sessions").join(orphan_short);
+        std::fs::create_dir_all(orphan_dir.as_std_path()).unwrap();
+        let mut orphan_record = sample_record();
+        orphan_record.id = SessionId::from(uuid::Uuid::from_u128(0xDEAD_BEEF));
+        orphan_record.name = Some("host".to_string());
+        std::fs::write(
+            orphan_dir.join("record.json").as_std_path(),
+            serde_json_lenient::to_vec(&orphan_record).unwrap(),
+        )
+        .unwrap();
+
+        let mut loader = DiskLoader::new(root).unwrap();
+        let key = loader.find_by_name("host").unwrap().expect("re-indexed");
+
+        // Re-saving the unchanged record (e.g. a status promotion) must not
+        // re-validate the reserved name.
+        let mut promoted = loader.get(&key).unwrap().record().clone();
+        promoted.status = BoxState::Active;
+        loader.save(&key, &promoted).unwrap();
+
+        assert_eq!(loader.get(&key).unwrap().record().status, BoxState::Active,);
+    }
+
+    #[test]
+    fn create_rejects_a_control_character_name() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let mut record = sample_record();
+        record.name = Some("a\tb".to_string());
+        assert_eq!(
+            loader.create(record).err().map(|e| e.kind()),
+            Some(ErrorKind::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn create_rejects_a_non_ldh_name_and_creates_no_session_dir() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        for bad in ["bad name/y", "dot.ted.name", "Ünï-cødé", "-lead", "trail-"] {
+            let mut record = sample_record();
+            record.name = Some(bad.to_string());
+            assert_eq!(
+                loader.create(record).err().map(|e| e.kind()),
+                Some(ErrorKind::InvalidInput),
+                "expected `{bad:?}` to be rejected",
+            );
+        }
+        assert!(loader.keys().next().is_none());
+    }
+
+    #[test]
+    fn rename_rejects_a_control_character_name_and_keeps_the_old_one() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        // The production rename path flows through `save`, so this exercises
+        // the same gate the daemon's rename does.
+        let key = loader.create(sample_record()).unwrap();
+        assert_eq!(
+            loader
+                .rename(&key, "x\ny".to_string())
+                .err()
+                .map(|e| e.kind()),
+            Some(ErrorKind::InvalidInput)
+        );
+        assert_eq!(
+            loader.get(&key).unwrap().record().name.as_deref(),
+            Some("my-session"),
+            "a rejected rename must leave the original name intact"
+        );
+    }
+
+    #[test]
+    fn rename_rejects_a_non_ldh_name_and_keeps_the_old_one() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        assert_eq!(
+            loader
+                .rename(&key, "dot.ted.name".to_string())
+                .err()
+                .map(|e| e.kind()),
+            Some(ErrorKind::InvalidInput)
+        );
+        assert_eq!(
+            loader.get(&key).unwrap().record().name.as_deref(),
+            Some("my-session"),
+            "a rejected rename must leave the original name intact"
+        );
+    }
+
+    #[test]
+    fn rename_of_a_legacy_invalid_named_session_to_a_valid_name_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        // Plant a record with a pre-existing invalid name directly on disk
+        // (create refuses it now), then reopen so self-heal indexes it.
+        let orphan_short = "zzzzz";
+        let orphan_dir = root.as_utf8_path().join("sessions").join(orphan_short);
+        std::fs::create_dir_all(orphan_dir.as_std_path()).unwrap();
+        let mut orphan_record = sample_record();
+        orphan_record.id = SessionId::from(uuid::Uuid::from_u128(0xDEAD_BEEF));
+        orphan_record.name = Some("bad name/y".to_string());
+        std::fs::write(
+            orphan_dir.join("record.json").as_std_path(),
+            serde_json_lenient::to_vec(&orphan_record).unwrap(),
+        )
+        .unwrap();
+
+        let mut loader = DiskLoader::new(root).unwrap();
+        let key = loader
+            .find_by_name("bad name/y")
+            .unwrap()
+            .expect("re-indexed");
+
+        loader.rename(&key, "good-name".to_string()).unwrap();
+        assert_eq!(
+            loader.get(&key).unwrap().record().name.as_deref(),
+            Some("good-name"),
+        );
+    }
+
+    #[test]
+    fn loading_a_store_with_a_legacy_invalid_name_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        let orphan_short = "zzzzz";
+        let orphan_dir = root.as_utf8_path().join("sessions").join(orphan_short);
+        std::fs::create_dir_all(orphan_dir.as_std_path()).unwrap();
+        let mut orphan_record = sample_record();
+        orphan_record.id = SessionId::from(uuid::Uuid::from_u128(0xDEAD_BEEF));
+        orphan_record.name = Some("dot.ted.name".to_string());
+        std::fs::write(
+            orphan_dir.join("record.json").as_std_path(),
+            serde_json_lenient::to_vec(&orphan_record).unwrap(),
+        )
+        .unwrap();
+
+        let mut loader = DiskLoader::new(root).unwrap();
+        let key = loader
+            .find_by_name("dot.ted.name")
+            .unwrap()
+            .expect("re-indexed");
+
+        // Re-saving the record with its legacy name unchanged (e.g. a status
+        // promotion) must not re-validate the name.
+        let mut promoted = loader.get(&key).unwrap().record().clone();
+        promoted.status = BoxState::Active;
+        loader.save(&key, &promoted).unwrap();
+        assert_eq!(loader.get(&key).unwrap().record().status, BoxState::Active,);
+    }
+
+    /// BOX-001: a record written before `box_type`, `parent` and
+    /// `project_root` existed still loads, with all three absent and every
+    /// other field as it was written. A record written now carries all
+    /// three keys, `parent` as `null` when the box has none.
+    #[test]
+    fn records_without_the_new_fields_still_load() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        let old_short = "0ld00";
+        let old_dir = root.as_utf8_path().join("sessions").join(old_short);
+        std::fs::create_dir_all(old_dir.as_std_path()).unwrap();
+        let mut old_record = sample_record();
+        old_record.id = SessionId::from(uuid::Uuid::from_u128(0x0123_4567));
+        let mut raw = serde_json_lenient::to_value(&old_record).unwrap();
+        let object = raw.as_object_mut().unwrap();
+        for key in ["box_type", "parent", "project_root"] {
+            assert!(object.remove(key).is_some(), "{key} is written today");
+        }
+        std::fs::write(
+            old_dir.join("record.json").as_std_path(),
+            serde_json_lenient::to_vec(&raw).unwrap(),
+        )
+        .unwrap();
+
+        let mut loader = DiskLoader::new(root).unwrap();
+        let key = loader
+            .find_by_id(&old_record.id)
+            .unwrap()
+            .expect("the old record is indexed");
+        let read_back = loader.get(&key).unwrap().record().clone();
+        // BOX-003: the start migrated the record to a session box.
+        assert_eq!(read_back.box_type.as_deref(), Some(crate::SESSION_BOX_TYPE));
+        assert_eq!(read_back.parent, None);
+        assert_eq!(read_back.project_root, None);
+        assert_eq!(
+            read_back,
+            Record {
+                box_type: Some(crate::SESSION_BOX_TYPE.to_string()),
+                parent: None,
+                project_root: None,
+                ..old_record
+            },
+            "every other field loads as it was written"
+        );
+
+        let mut fresh = sample_record();
+        fresh.name = Some("fresh".to_string());
+        fresh.parent = None;
+        let fresh_key = loader.create(fresh).unwrap();
+        let written: serde_json_lenient::Value = serde_json_lenient::from_slice(
+            &std::fs::read(
+                loader_dir(&tmp)
+                    .as_utf8_path()
+                    .join("sessions")
+                    .join(fresh_key.dir_key.as_str())
+                    .join("record.json")
+                    .as_std_path(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(written["box_type"], "session");
+        assert!(written["parent"].is_null());
+        assert!(
+            written.as_object().unwrap().contains_key("parent"),
+            "no parent is written as null, not left out"
+        );
+        assert_eq!(written["project_root"], "/home/alice/proj");
+    }
+
+    /// Writes `raw` as the record of a session dir the index does not
+    /// hold yet, the way a record from an older daemon sits on disk.
+    fn write_raw_record(root: &DaemonAbsPath, short: &str, raw: &serde_json_lenient::Value) {
+        let dir = root.as_utf8_path().join("sessions").join(short);
+        std::fs::create_dir_all(dir.as_std_path()).unwrap();
+        std::fs::write(
+            dir.join("record.json").as_std_path(),
+            serde_json_lenient::to_vec(raw).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Every file under the sessions dir, with its bytes.
+    fn sessions_tree(root: &DaemonAbsPath) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
+        let mut files = BTreeMap::new();
+        let mut dirs = vec![root.as_utf8_path().join("sessions").into_std_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else {
+                    files.insert(path.clone(), std::fs::read(&path).unwrap());
+                }
+            }
+        }
+        files
+    }
+
+    // BOX-003: a record without box_type or parent becomes a session box
+    // with no parent, a nil id is replaced, and a later start changes
+    // nothing.
+    #[test]
+    fn restart_migrates_records_missing_type_or_parent_once() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        // An old session with an id, and neither key.
+        let mut old = sample_record();
+        old.id = SessionId::from(uuid::Uuid::from_u128(0x0123_4567));
+        old.name = Some("old".to_string());
+        let mut raw_old = serde_json_lenient::to_value(&old).unwrap();
+        for key in ["box_type", "parent"] {
+            raw_old.as_object_mut().unwrap().remove(key);
+        }
+        write_raw_record(&root, "0ld00", &raw_old);
+
+        // An older one still: no id, and no box_type.
+        let mut idless = sample_record();
+        idless.name = Some("idless".to_string());
+        let mut raw_idless = serde_json_lenient::to_value(&idless).unwrap();
+        for key in ["id", "box_type"] {
+            raw_idless.as_object_mut().unwrap().remove(key);
+        }
+        write_raw_record(&root, "1d1e5", &raw_idless);
+
+        // A task box that carries both keys is left as it is.
+        let mut task = sample_record();
+        task.id = SessionId::mint();
+        task.name = Some("task".to_string());
+        task.box_type = Some(crate::TASK_BOX_TYPE.to_string());
+        task.parent = None;
+        let raw_task = serde_json_lenient::to_value(&task).unwrap();
+        write_raw_record(&root, "7a5c0", &raw_task);
+        let task_bytes = serde_json_lenient::to_vec(&raw_task).unwrap();
+
+        let loader = DiskLoader::new(root.clone()).unwrap();
+
+        let key = loader.find_by_id(&old.id).unwrap().expect("old is indexed");
+        let migrated = loader.get(&key).unwrap().record().clone();
+        assert_eq!(
+            migrated,
+            Record {
+                box_type: Some(crate::SESSION_BOX_TYPE.to_string()),
+                parent: None,
+                ..old
+            },
+            "only the type and the parent change, and the id is kept"
+        );
+        let written: serde_json_lenient::Value = serde_json_lenient::from_slice(
+            &std::fs::read(session_dir_path(&root, "0ld00").join("record.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(written["parent"].is_null());
+        assert!(written.as_object().unwrap().contains_key("parent"));
+
+        let key = loader
+            .find_by_name("idless")
+            .unwrap()
+            .expect("the idless record is still found by its name");
+        let fresh = loader.get(&key).unwrap().record().clone();
+        assert!(!fresh.id.is_nil(), "a nil id is replaced");
+        assert_eq!(*key.id(), fresh.id, "the index files it under the new id");
+        assert_eq!(loader.find_by_id(&SessionId::nil()).unwrap(), None);
+        assert_eq!(fresh.box_type.as_deref(), Some(crate::SESSION_BOX_TYPE));
+        assert_eq!(fresh.parent, None);
+
+        assert_eq!(
+            std::fs::read(session_dir_path(&root, "7a5c0").join("record.json")).unwrap(),
+            task_bytes,
+            "a record with both keys is not rewritten"
+        );
+
+        let after_first = sessions_tree(&root);
+        drop(loader);
+        let again = DiskLoader::new(root.clone()).unwrap();
+        assert_eq!(
+            sessions_tree(&root),
+            after_first,
+            "a later start leaves every migrated record unchanged"
+        );
+        assert_eq!(again.find_by_name("idless").unwrap(), Some(key));
+    }
+
+    // BOX-003: a record that has a `box_type` but no `parent` key keeps its
+    // type. The migration only adds `parent: null`.
+    #[test]
+    fn heal_migrate_keeps_box_type_of_record_without_parent_key() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        let mut typed = sample_record();
+        typed.id = SessionId::from(uuid::Uuid::from_u128(0x7a5c_0001));
+        typed.name = Some("typed".to_string());
+        typed.box_type = Some(crate::TASK_BOX_TYPE.to_string());
+        let mut raw = serde_json_lenient::to_value(&typed).unwrap();
+        raw.as_object_mut().unwrap().remove("parent");
+        assert_eq!(raw["box_type"], "task");
+        write_raw_record(&root, "7a5c1", &raw);
+
+        let loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader
+            .find_by_id(&typed.id)
+            .unwrap()
+            .expect("typed is indexed");
+        let migrated = loader.get(&key).unwrap().record().clone();
+        assert_eq!(migrated.box_type.as_deref(), Some(crate::TASK_BOX_TYPE));
+        assert_eq!(migrated.parent, None);
+
+        let written: serde_json_lenient::Value = serde_json_lenient::from_slice(
+            &std::fs::read(session_dir_path(&root, "7a5c1").join("record.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(written["box_type"], "task");
+        assert!(written.as_object().unwrap().contains_key("parent"));
+        assert!(written["parent"].is_null());
+    }
+
+    #[test]
+    fn list_yields_a_key_for_every_created_session() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let created: BTreeSet<SessionId> = (0..5)
+            .map(|i| {
+                *loader
+                    .create({
+                        let mut record = sample_record();
+                        record.name = Some(format!("session-{i}"));
+                        record
+                    })
+                    .unwrap()
+                    .id()
+            })
+            .collect();
+        let listed: BTreeSet<SessionId> = loader.keys().map(|k| *k.id()).collect();
+
+        assert_eq!(listed, created);
+    }
+
+    #[test]
+    fn sessions_survive_loader_reinit_on_the_same_directory() {
+        let tmp = TempDir::new().unwrap();
+
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let original = loader.create(sample_record()).unwrap();
+        drop(loader);
+
+        let reloaded = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let key = reloaded
+            .keys()
+            .find(|k| k.id() == original.id())
+            .expect("previously-created session should be visible after reinit");
+        let stored = reloaded.get(&key).unwrap();
+        assert_eq!(&stored.record().id, original.id());
+        assert_eq!(stored.record().name.as_deref(), Some("my-session"));
+    }
+
+    #[test]
+    fn rename_updates_the_on_disk_record() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        loader.rename(&key, "renamed".to_string()).unwrap();
+
+        // The record read back from disk reflects the new name.
+        assert_eq!(
+            loader.get(&key).unwrap().record().name.as_deref(),
+            Some("renamed")
+        );
+    }
+
+    #[test]
+    fn rename_remaps_the_name_index() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        loader.rename(&key, "renamed".to_string()).unwrap();
+
+        // The new name resolves to the session...
+        assert_eq!(loader.find_by_name("renamed").unwrap(), Some(key));
+        // ...and the old name no longer resolves to anything.
+        assert_eq!(loader.find_by_name("my-session").unwrap(), None);
+    }
+
+    #[test]
+    fn rename_leaves_the_id_and_key_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        let id = *key.id();
+        loader.rename(&key, "renamed".to_string()).unwrap();
+
+        // Renaming touches only the name; the id and short key are stable.
+        assert_eq!(loader.find_by_id(&id).unwrap().as_ref(), Some(&key));
+        assert_eq!(&loader.get(&key).unwrap().record().id, &id);
+    }
+
+    #[test]
+    fn rename_persists_across_loader_reinit() {
+        let tmp = TempDir::new().unwrap();
+
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        loader.rename(&key, "renamed".to_string()).unwrap();
+        drop(loader);
+
+        // Both the record write and the index flush must survive a reload.
+        let reloaded = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        assert_eq!(
+            reloaded.get(&key).unwrap().record().name.as_deref(),
+            Some("renamed")
+        );
+        assert_eq!(reloaded.find_by_name("renamed").unwrap(), Some(key));
+        assert_eq!(reloaded.find_by_name("my-session").unwrap(), None);
+    }
+
+    #[test]
+    fn rename_errors_when_the_target_name_is_taken() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let first = loader.create(sample_record()).unwrap();
+        loader
+            .create({
+                let mut record = sample_record();
+                record.name = Some("other".to_string());
+                record
+            })
+            .unwrap();
+
+        // "other" is already taken, so renaming the first session onto it fails.
+        assert_eq!(
+            loader
+                .rename(&first, "other".to_string())
+                .err()
+                .map(|e| e.kind()),
+            Some(ErrorKind::AlreadyExists)
+        );
+        // The failed rename left the original name intact.
+        assert_eq!(loader.find_by_name("my-session").unwrap(), Some(first));
+    }
+
+    #[test]
+    fn rename_errors_on_case_only_name_collision() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let first = loader.create(sample_record()).unwrap();
+        loader
+            .create({
+                let mut record = sample_record();
+                record.name = Some("other".to_string());
+                record
+            })
+            .unwrap();
+
+        // "OTHER" folds to "other", so renaming the first session onto it fails.
+        assert_eq!(
+            loader
+                .rename(&first, "OTHER".to_string())
+                .err()
+                .map(|e| e.kind()),
+            Some(ErrorKind::AlreadyExists)
+        );
+        // The failed rename left the original name intact.
+        assert_eq!(loader.find_by_name("my-session").unwrap(), Some(first));
+    }
+
+    #[test]
+    fn rename_to_own_case_variant_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        loader.rename(&key, "MY-SESSION".to_string()).unwrap();
+
+        assert_eq!(
+            loader.get(&key).unwrap().record().name.as_deref(),
+            Some("MY-SESSION")
+        );
+        assert_eq!(loader.find_by_name("MY-SESSION").unwrap(), Some(key));
+    }
+
+    #[test]
+    fn delete_removes_record_and_index_entries() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        let dir = tmp.path().join("sessions").join(&key.dir_key);
+        assert!(dir.exists(), "session dir should exist before delete");
+
+        loader.delete(&key).unwrap();
+
+        // The on-disk tree is gone, and neither lookup resolves any more.
+        assert!(!dir.exists(), "session dir should be removed after delete");
+        assert_eq!(loader.find_by_id(key.id()).unwrap(), None);
+        assert_eq!(loader.find_by_name("my-session").unwrap(), None);
+        assert!(
+            loader.keys().next().is_none(),
+            "keys() should be empty after the only session is deleted"
+        );
+    }
+
+    #[test]
+    fn delete_scrubs_index_when_directory_is_already_missing() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+
+        // Simulate a half-deleted session: the directory tree is gone but the
+        // index entries remain. delete() must still succeed (a missing tree is
+        // not an error) and scrub the stale index entries.
+        let dir = tmp.path().join("sessions").join(&key.dir_key);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        loader.delete(&key).unwrap();
+
+        assert_eq!(loader.find_by_id(key.id()).unwrap(), None);
+        assert_eq!(loader.find_by_name("my-session").unwrap(), None);
+        assert!(
+            loader.keys().next().is_none(),
+            "stale index entries should be removed even with the dir missing"
+        );
+    }
+
+    #[test]
+    fn delete_frees_the_name_for_reuse() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        loader.delete(&key).unwrap();
+
+        // The name index entry was dropped, so the same name can be taken again.
+        loader.create(sample_record()).unwrap();
+    }
+
+    #[test]
+    fn delete_persists_across_loader_reinit() {
+        let tmp = TempDir::new().unwrap();
+
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        loader.delete(&key).unwrap();
+        drop(loader);
+
+        // The index flush survived the reload: the session stays gone.
+        let reloaded = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        assert_eq!(reloaded.find_by_id(key.id()).unwrap(), None);
+        assert!(reloaded.keys().next().is_none());
+    }
+
+    #[test]
+    fn rename_names_a_previously_unnamed_session() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader
+            .create({
+                let mut record = sample_record();
+                record.name = None;
+                record
+            })
+            .unwrap();
+        loader.rename(&key, "now-named".to_string()).unwrap();
+
+        assert_eq!(
+            loader.get(&key).unwrap().record().name.as_deref(),
+            Some("now-named")
+        );
+        assert_eq!(loader.find_by_name("now-named").unwrap(), Some(key));
+    }
+
+    // =================================================================
+    // Loader::save
+    // =================================================================
+
+    #[test]
+    fn save_overwrites_existing_record() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        let mut updated = loader.get(&key).unwrap().record().clone();
+        updated.attrs.insert("color".into(), "red".into());
+        updated.username = Some("bob".into());
+
+        loader.save(&key, &updated).unwrap();
+
+        let reread = loader.get(&key).unwrap();
+        assert_eq!(
+            reread.record().attrs.get("color").map(String::as_str),
+            Some("red")
+        );
+        assert_eq!(reread.record().username.as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn save_promotes_pending_to_active() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader
+            .create({
+                let mut r = sample_record();
+                r.status = BoxState::Pending;
+                r
+            })
+            .unwrap();
+        let mut promoted = loader.get(&key).unwrap().record().clone();
+        promoted.status = BoxState::Active;
+        loader.save(&key, &promoted).unwrap();
+
+        assert_eq!(loader.get(&key).unwrap().record().status, BoxState::Active,);
+    }
+
+    // BOX-011: a record saved stopped or exited loads in the same state,
+    // with the reason, exit code and signal of how the box ended.
+    #[test]
+    fn record_stores_stopped_and_exited_with_their_ending() {
+        use crate::core::record::{ExitEnding, RecordState, StopEnding};
+
+        let endings = [
+            RecordState::Exited(ExitEnding::Exit { exit_code: 3 }),
+            RecordState::Exited(ExitEnding::Timeout),
+            RecordState::Exited(ExitEnding::Oom),
+            RecordState::Stopped(StopEnding::ExitedFirst { exit_code: 0 }),
+            RecordState::Stopped(StopEnding::Signalled { signal: 15 }),
+            RecordState::Stopped(StopEnding::AtDaemonStart),
+        ];
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let mut keys = Vec::new();
+        for (n, ending) in endings.iter().enumerate() {
+            let mut record = sample_record();
+            record.name = Some(format!("ended-{n}"));
+            let key = loader.create(record).unwrap();
+            let mut ended = loader.get(&key).unwrap().record().clone();
+            ended.set_state(*ending);
+            loader.save(&key, &ended).unwrap();
+            keys.push(key);
+        }
+
+        // A fresh loader reads the records from disk, not from memory.
+        let loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        for (key, ending) in keys.iter().zip(endings) {
+            let record = loader.get(key).unwrap().record().clone();
+            assert_eq!(record.state(), Ok(ending), "{ending:?}");
+            assert_eq!(record.exit_code, ending.exit_code(), "{ending:?}");
+            assert_eq!(record.signal, ending.signal(), "{ending:?}");
+
+            let written: serde_json_lenient::Value = serde_json_lenient::from_slice(
+                &std::fs::read(
+                    loader_dir(&tmp)
+                        .as_utf8_path()
+                        .join("sessions")
+                        .join(loader.live_short(key).unwrap())
+                        .join("record.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(written["status"], ending.name(), "{ending:?}");
+            assert_eq!(
+                written["reason"],
+                ending
+                    .reason()
+                    .map(crate::core::record::EndReason::name)
+                    .unwrap(),
+                "{ending:?}"
+            );
+            assert_eq!(
+                written
+                    .get("exit_code")
+                    .and_then(serde_json_lenient::Value::as_i64),
+                ending.exit_code().map(i64::from),
+                "{ending:?}"
+            );
+            assert_eq!(
+                written
+                    .get("signal")
+                    .and_then(serde_json_lenient::Value::as_i64),
+                ending.signal().map(i64::from),
+                "{ending:?}"
+            );
+        }
+
+        // Back to running clears the ending from the record.
+        let mut loader = loader;
+        let mut running = loader.get(&keys[0]).unwrap().record().clone();
+        running.set_state(RecordState::Running);
+        loader.save(&keys[0], &running).unwrap();
+        let read = loader.get(&keys[0]).unwrap().record().clone();
+        assert_eq!(read.state(), Ok(RecordState::Running));
+        assert_eq!(
+            (read.reason, read.exit_code, read.signal),
+            (None, None, None)
+        );
+    }
+
+    // BOX-011: a reason this build does not know loads, reads as an
+    // unreadable ending rather than as a guess, and saves as written.
+    #[test]
+    fn unknown_reason_loads_as_written() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+        let id = SessionId::mint();
+        let mut raw = serde_json_lenient::to_value(Record {
+            id,
+            name: Some("evicted".to_string()),
+            ..sample_record()
+        })
+        .unwrap();
+        raw["status"] = serde_json_lenient::json!("exited");
+        raw["reason"] = serde_json_lenient::json!("evicted");
+        raw["exit_code"] = serde_json_lenient::json!(143);
+        write_raw_record(&root, "0e0e0", &raw);
+
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader.find_by_id(&id).unwrap().expect("record is indexed");
+        let record = loader.get(&key).unwrap().record().clone();
+        assert_eq!(record.status, BoxState::Exited);
+        assert_eq!(
+            record.reason,
+            Some(crate::core::record::StoredReason::Unknown(
+                "evicted".to_string()
+            ))
+        );
+        assert_eq!(record.exit_code, Some(143));
+        assert_eq!(
+            record.state(),
+            Err(crate::core::record::UnreadableEnding {
+                state: "exited",
+                reason: Some("evicted".to_string()),
+                exit_code: Some(143),
+                signal: None,
+            })
+        );
+
+        loader.save(&key, &record).unwrap();
+        let written: serde_json_lenient::Value = serde_json_lenient::from_slice(
+            &std::fs::read(session_dir_path(&root, "0e0e0").join("record.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(written["status"], "exited");
+        assert_eq!(written["reason"], "evicted");
+        assert_eq!(written["exit_code"], 143);
+    }
+
+    #[test]
+    fn save_can_change_name_and_updates_index() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        let mut updated = loader.get(&key).unwrap().record().clone();
+        updated.name = Some("renamed".into());
+        loader.save(&key, &updated).unwrap();
+
+        assert_eq!(loader.find_by_name("renamed").unwrap(), Some(key.clone()));
+        assert_eq!(loader.find_by_name("my-session").unwrap(), None);
+    }
+
+    #[test]
+    fn save_rejects_id_change() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        // Snapshot the whole stored record so a future refactor that
+        // accidentally moves a side effect above the id check would
+        // be caught — not just the id field.
+        let before = loader.get(&key).unwrap().record().clone();
+
+        let mut tampered = before.clone();
+        tampered.id = SessionId::from(uuid::Uuid::from_u128(0xCAFE_BABE));
+        tampered.username = Some("intruder".into());
+
+        let err = loader.save(&key, &tampered).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+
+        let after = loader.get(&key).unwrap().record().clone();
+        assert_eq!(after, before, "failed save must not mutate any field");
+    }
+
+    #[test]
+    fn save_rejects_name_collision() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let first = loader.create(sample_record()).unwrap();
+        let second = loader
+            .create({
+                let mut r = sample_record();
+                r.name = Some("other".into());
+                r
+            })
+            .unwrap();
+
+        // Try to save `first` claiming "other" — already taken by `second`.
+        let mut conflict = loader.get(&first).unwrap().record().clone();
+        conflict.name = Some("other".into());
+        let err = loader.save(&first, &conflict).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+
+        // Index untouched.
+        assert_eq!(loader.find_by_name("my-session").unwrap(), Some(first));
+        assert_eq!(loader.find_by_name("other").unwrap(), Some(second));
+    }
+
+    /// Saving a record whose name equals the current on-disk name is a
+    /// no-op for the index — not a self-collision. This is the same
+    /// reason `find_by_name(current).is_some()` isn't a valid
+    /// collision check.
+    #[test]
+    fn save_with_same_name_is_not_a_collision() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        let record = loader.get(&key).unwrap().record().clone();
+        loader.save(&key, &record).unwrap();
+
+        assert_eq!(loader.find_by_name("my-session").unwrap(), Some(key));
+    }
+
+    /// Saving against a stale key — for a session that's been
+    /// deleted — must refuse, not resurrect the session by
+    /// re-creating its on-disk dir + record.json.
+    #[test]
+    fn save_against_stale_key_after_delete_errors_with_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        let record = loader.get(&key).unwrap().record().clone();
+        loader.delete(&key).unwrap();
+
+        let err = loader.save(&key, &record).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        // No resurrection: id still unknown to the loader.
+        assert_eq!(loader.find_by_id(key.id()).unwrap(), None);
+    }
+
+    /// Saving against a stale key whose short has been *reused* by a
+    /// different session must refuse — otherwise the stale caller
+    /// would overwrite the new session's record.json. The check is
+    /// id-strict, not just short-presence-strict.
+    #[test]
+    fn save_against_stale_key_with_reused_short_errors_with_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let stale_key = loader.create(sample_record()).unwrap();
+        let stale_id = *stale_key.id();
+        let stale_short = stale_key.dir_key.to_string();
+        let stale_record = loader.get(&stale_key).unwrap().record().clone();
+        loader.delete(&stale_key).unwrap();
+        drop(loader);
+
+        // Simulate UUIDv7-suffix collision: another session "reuses"
+        // the same short, but with a different id. We can't make
+        // `create` reliably collide, so we craft the on-disk state
+        // directly: a new session dir at the freed short with a
+        // freshly-minted record id, then surface it to the loader by
+        // re-opening (self-heal picks it up as an orphan).
+        let new_id = SessionId::from(uuid::Uuid::from_u128(0xFACE_FEED));
+        assert_ne!(new_id, stale_id, "test setup: ids must differ");
+        let sessions_dir = loader_dir(&tmp).as_utf8_path().join("sessions");
+        let dir = sessions_dir.join(&stale_short);
+        std::fs::create_dir_all(dir.as_std_path()).unwrap();
+        let mut new_record = sample_record();
+        new_record.id = new_id;
+        new_record.name = Some("squatter".into());
+        std::fs::write(
+            dir.join("record.json").as_std_path(),
+            serde_json_lenient::to_vec(&new_record).unwrap(),
+        )
+        .unwrap();
+
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        // The new session is in the index under the reused short.
+        assert_eq!(
+            loader.index.short_to_id.get(&stale_short).copied(),
+            Some(new_id),
+        );
+
+        // Stale-key save must refuse: id mismatch, not just short presence.
+        let err = loader.save(&stale_key, &stale_record).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        // The squatting session's record on disk is untouched.
+        let reread: Record = serde_json_lenient::from_reader(
+            std::fs::File::open(dir.join("record.json").as_std_path()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reread.id, new_id);
+        assert_eq!(reread.name.as_deref(), Some("squatter"));
+    }
+
+    /// Saving a record with `name = None` removes the name mapping
+    /// without disturbing the short index.
+    #[test]
+    fn save_can_clear_name() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        let mut anonymized = loader.get(&key).unwrap().record().clone();
+        anonymized.name = None;
+        loader.save(&key, &anonymized).unwrap();
+
+        assert_eq!(loader.find_by_name("my-session").unwrap(), None);
+        // Session still reachable by id.
+        assert_eq!(loader.find_by_id(key.id()).unwrap(), Some(key));
+    }
+
+    // =================================================================
+    // Stale-key rejection on get / delete (id-strict, mirrors save)
+    // =================================================================
+
+    /// `get` against a stale key — for a session that's been deleted — must
+    /// refuse with `NotFound` rather than trying to read a now-absent record.
+    #[test]
+    fn get_against_stale_key_after_delete_errors_with_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        loader.delete(&key).unwrap();
+
+        let err = loader.get(&key).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    /// Plant the "reused short" scenario: create a session, delete it (freeing
+    /// its short), then write a *different* session (distinct id, name
+    /// "squatter") straight onto disk at the freed short and re-open the loader
+    /// so self-heal indexes it as an orphan. Returns the reopened loader, the
+    /// now-stale key of the deleted session, and the new session's id + short.
+    fn reused_short_scenario(tmp: &TempDir) -> (DiskLoader, DiskBoxKey, SessionId, String) {
+        let mut loader = DiskLoader::new(loader_dir(tmp)).unwrap();
+        let stale_key = loader.create(sample_record()).unwrap();
+        let stale_short = stale_key.dir_key.to_string();
+        loader.delete(&stale_key).unwrap();
+        drop(loader);
+
+        // We can't make `create` reliably collide on the 20-bit short, so we
+        // craft the on-disk state directly at the freed short.
+        let new_id = SessionId::from(uuid::Uuid::from_u128(0xFACE_FEED));
+        assert_ne!(new_id, *stale_key.id(), "test setup: ids must differ");
+        let dir = loader_dir(tmp)
+            .as_utf8_path()
+            .join("sessions")
+            .join(&stale_short);
+        std::fs::create_dir_all(dir.as_std_path()).unwrap();
+        let mut new_record = sample_record();
+        new_record.id = new_id;
+        new_record.name = Some("squatter".into());
+        std::fs::write(
+            dir.join("record.json").as_std_path(),
+            serde_json_lenient::to_vec(&new_record).unwrap(),
+        )
+        .unwrap();
+
+        let loader = DiskLoader::new(loader_dir(tmp)).unwrap();
+        assert_eq!(
+            loader.index.short_to_id.get(&stale_short).copied(),
+            Some(new_id),
+            "test setup: the new session should own the reused short",
+        );
+        (loader, stale_key, new_id, stale_short)
+    }
+
+    /// `get` against a stale key whose short has been *reused* by a different
+    /// session must refuse — otherwise a stale caller reads the unrelated
+    /// session's record. The check is id-strict, not just short-presence.
+    #[test]
+    fn get_against_stale_key_with_reused_short_errors_with_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let (loader, stale_key, _new_id, _short) = reused_short_scenario(&tmp);
+
+        let err = loader.get(&stale_key).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    /// `delete` against a stale key whose short was reused must refuse and
+    /// leave the session that inherited the short fully intact — its index
+    /// entry, its `record.json`, and its dir. Without the id-strict guard the
+    /// stale delete would deindex and `remove_dir_all` the wrong session.
+    #[test]
+    fn delete_against_stale_key_with_reused_short_leaves_new_session_intact() {
+        let tmp = TempDir::new().unwrap();
+        let (mut loader, stale_key, new_id, stale_short) = reused_short_scenario(&tmp);
+
+        let err = loader.delete(&stale_key).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+
+        // The squatting session is untouched: still indexed, record readable,
+        // dir on disk.
+        let new_key = loader
+            .find_by_id(&new_id)
+            .unwrap()
+            .expect("the reused-short session must remain indexed");
+        assert_eq!(
+            loader.get(&new_key).unwrap().record().name.as_deref(),
+            Some("squatter"),
+        );
+        assert!(
+            session_dir_path(&loader_dir(&tmp), &stale_short).exists(),
+            "the reused-short session's dir must not be removed",
+        );
+    }
+
+    // =================================================================
+    // self-heal on DiskLoader::new
+    // =================================================================
+    //
+    // Each crash scenario is simulated by direct filesystem
+    // manipulation — we never go through the Loader API to corrupt
+    // state, because the API guarantees consistency. We're testing
+    // the on-disk recovery.
+
+    fn short_of(key: &DiskBoxKey) -> String {
+        key.dir_key.to_string()
+    }
+
+    fn session_dir_path(loader_root: &DaemonAbsPath, short: &str) -> std::path::PathBuf {
+        loader_root
+            .as_utf8_path()
+            .join("sessions")
+            .join(short)
+            .as_std_path()
+            .to_path_buf()
+    }
+
+    fn read_index_bytes(loader_root: &DaemonAbsPath) -> Vec<u8> {
+        let p = loader_root.as_utf8_path().join("sessions/index.json");
+        std::fs::read(p.as_std_path()).unwrap()
+    }
+
+    fn tombstone_path(loader_root: &DaemonAbsPath, short: &str) -> std::path::PathBuf {
+        loader_root
+            .as_utf8_path()
+            .join("sessions")
+            .join(tombstone_name(short))
+            .as_std_path()
+            .to_path_buf()
+    }
+
+    #[test]
+    fn self_heal_on_clean_state_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        loader.create(sample_record()).unwrap();
+        drop(loader);
+
+        let before = read_index_bytes(&root);
+        // Re-opening over a consistent state must not touch index.json.
+        let _ = DiskLoader::new(root.clone()).unwrap();
+        let after = read_index_bytes(&root);
+        assert_eq!(before, after, "index.json was rewritten on a clean state");
+    }
+
+    #[test]
+    fn self_heal_reaps_tombstoned_dir() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let short = short_of(&key);
+        let id = *key.id();
+        drop(loader);
+
+        // Simulate a crash mid-delete: tombstone present (in the
+        // *parent* sessions dir, not inside the session dir),
+        // index entry still there, dir still there.
+        let dir = session_dir_path(&root, &short);
+        let marker = tombstone_path(&root, &short);
+        std::fs::write(&marker, b"").unwrap();
+
+        let loader = DiskLoader::new(root).unwrap();
+        assert!(!dir.exists(), "tombstoned dir should have been reaped");
+        assert!(
+            !marker.exists(),
+            "tombstone marker should have been removed"
+        );
+        assert_eq!(loader.find_by_id(&id).unwrap(), None);
+    }
+
+    #[test]
+    fn self_heal_drops_dangling_index_entry() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let short = short_of(&key);
+        let id = *key.id();
+        drop(loader);
+
+        // Simulate a half-deleted session WITHOUT a tombstone: the
+        // session dir was removed but the index entry remained
+        // (e.g. someone hand-deleted the dir).
+        std::fs::remove_dir_all(session_dir_path(&root, &short)).unwrap();
+
+        let loader = DiskLoader::new(root).unwrap();
+        assert_eq!(loader.find_by_id(&id).unwrap(), None);
+        assert_eq!(loader.find_by_name("my-session").unwrap(), None);
+    }
+
+    #[test]
+    fn self_heal_reindexes_orphan_record() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let short = short_of(&key);
+        let id = *key.id();
+        drop(loader);
+
+        // Simulate a crash mid-create: record.json on disk, but the
+        // index doesn't know about it. We rewrite the index to a
+        // default empty Index.
+        let sessions_dir = root.as_utf8_path().join("sessions");
+        let empty = serde_json_lenient::to_vec(&Index::default()).unwrap();
+        std::fs::write(sessions_dir.join("index.json").as_std_path(), empty).unwrap();
+
+        let loader = DiskLoader::new(root).unwrap();
+        // The orphan was re-indexed: it's reachable by id and name.
+        let key2 = loader.find_by_id(&id).unwrap().expect("re-indexed");
+        assert_eq!(short_of(&key2), short);
+        assert_eq!(loader.find_by_name("my-session").unwrap(), Some(key2),);
+    }
+
+    #[test]
+    fn self_heal_skips_orphan_with_name_collision() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        // First session: created normally, claims "my-session".
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let a_key = loader.create(sample_record()).unwrap();
+        let a_id = *a_key.id();
+        drop(loader);
+
+        // Manually plant an orphan session in a sibling dir that ALSO
+        // claims name = "my-session", with a distinct id so the ids
+        // don't collide. The short is intentionally NOT in the format
+        // `create()` produces (5 lowercase hex chars), so the test
+        // can never collide with the real session's dir even on an
+        // unlucky UUIDv7 suffix.
+        let orphan_short = "zzzzz";
+        let orphan_dir = root.as_utf8_path().join("sessions").join(orphan_short);
+        std::fs::create_dir_all(orphan_dir.as_std_path()).unwrap();
+        let mut orphan_record = sample_record();
+        orphan_record.id = SessionId::from(uuid::Uuid::from_u128(0xDEAD_BEEF));
+        let record_file = orphan_dir.join("record.json");
+        let buf = serde_json_lenient::to_vec(&orphan_record).unwrap();
+        std::fs::write(record_file.as_std_path(), buf).unwrap();
+
+        let loader = DiskLoader::new(root.clone()).unwrap();
+        // The original (indexed) session still resolves; the orphan is
+        // not in the index.
+        assert_eq!(loader.find_by_id(&a_id).unwrap(), Some(a_key));
+        assert_eq!(loader.find_by_id(&orphan_record.id).unwrap(), None);
+        // The orphan dir is left on disk for manual triage.
+        assert!(
+            session_dir_path(&root, orphan_short).exists(),
+            "orphan dir should be preserved for triage",
+        );
+    }
+
+    #[test]
+    fn self_heal_skips_orphan_with_case_only_name_collision() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        // First session: created normally, claims "my-session".
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let a_key = loader.create(sample_record()).unwrap();
+        let a_id = *a_key.id();
+        drop(loader);
+
+        // Plant an orphan whose name differs from the live one only in
+        // ASCII case. The short is outside `create()`'s format so it can
+        // never collide with the real session's dir.
+        let orphan_short = "zzzzz";
+        let orphan_dir = root.as_utf8_path().join("sessions").join(orphan_short);
+        std::fs::create_dir_all(orphan_dir.as_std_path()).unwrap();
+        let mut orphan_record = sample_record();
+        orphan_record.id = SessionId::from(uuid::Uuid::from_u128(0xDEAD_BEEF));
+        orphan_record.name = Some("MY-SESSION".to_string());
+        let record_file = orphan_dir.join("record.json");
+        let buf = serde_json_lenient::to_vec(&orphan_record).unwrap();
+        std::fs::write(record_file.as_std_path(), buf).unwrap();
+
+        let loader = DiskLoader::new(root.clone()).unwrap();
+        // The live session still resolves; the case-colliding orphan is not
+        // indexed. Its name resolves to the live session under the
+        // case-insensitive lookup, not to the orphan.
+        assert_eq!(loader.find_by_id(&a_id).unwrap(), Some(a_key.clone()));
+        assert_eq!(loader.find_by_id(&orphan_record.id).unwrap(), None);
+        assert_eq!(loader.find_by_name("MY-SESSION").unwrap(), Some(a_key));
+        // The orphan dir is left on disk for manual triage.
+        assert!(
+            session_dir_path(&root, orphan_short).exists(),
+            "orphan dir should be preserved for triage",
+        );
+    }
+
+    #[test]
+    fn self_heal_recovers_from_rename_crash() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let short = short_of(&key);
+        drop(loader);
+
+        // Simulate a crash mid-rename: record.json has the NEW name,
+        // index.json still has the OLD name.
+        let dir = session_dir_path(&root, &short);
+        let record_file = dir.join("record.json");
+        let buf = std::fs::read(&record_file).unwrap();
+        let mut record: Record = serde_json_lenient::from_slice(&buf).unwrap();
+        record.name = Some("after-rename".to_string());
+        std::fs::write(&record_file, serde_json_lenient::to_vec(&record).unwrap()).unwrap();
+
+        let loader = DiskLoader::new(root).unwrap();
+        // The index is reconciled: the new name resolves, the old one
+        // does not.
+        let resolved = loader.find_by_name("after-rename").unwrap();
+        assert!(resolved.is_some(), "new name should resolve");
+        assert_eq!(loader.find_by_name("my-session").unwrap(), None);
+    }
+
+    #[test]
+    fn self_heal_handles_tombstone_with_lingering_index_entry() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let short = short_of(&key);
+        let id = *key.id();
+        drop(loader);
+
+        // Crash mid-delete BEFORE the index flush: tombstone on disk
+        // (in the parent sessions dir), index entry still present,
+        // dir intact.
+        let dir = session_dir_path(&root, &short);
+        std::fs::write(tombstone_path(&root, &short), b"").unwrap();
+
+        let loader = DiskLoader::new(root.clone()).unwrap();
+        // Pass A reaps the dir AND clears the index entry; pass B has
+        // nothing to do for this short.
+        assert!(!dir.exists(), "dir should be reaped");
+        assert_eq!(loader.find_by_id(&id).unwrap(), None);
+        assert_eq!(loader.find_by_name("my-session").unwrap(), None);
+    }
+
+    /// Simulates `remove_dir_all` having partially completed before a
+    /// crash: with the *external* tombstone design, the marker is in
+    /// the parent dir and `remove_dir_all` never touches it. Even if
+    /// `record.json` (the file that would otherwise let pass C
+    /// re-index the dir as an orphan) is still on disk, the marker
+    /// drives a deterministic reap.
+    #[test]
+    fn self_heal_reaps_even_when_record_still_present_during_partial_remove() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let short = short_of(&key);
+        let id = *key.id();
+        drop(loader);
+
+        // Drop the index entry to simulate "delete had flushed the
+        // index" — but DO leave the dir + record.json on disk to
+        // simulate "remove_dir_all crashed mid-walk". The external
+        // tombstone is also present.
+        let sessions_dir = root.as_utf8_path().join("sessions");
+        let empty = serde_json_lenient::to_vec(&Index::default()).unwrap();
+        std::fs::write(sessions_dir.join("index.json").as_std_path(), empty).unwrap();
+        let dir = session_dir_path(&root, &short);
+        std::fs::write(tombstone_path(&root, &short), b"").unwrap();
+        assert!(
+            dir.join("record.json").exists(),
+            "record.json should still be present (simulating partial remove_dir_all)",
+        );
+
+        let loader = DiskLoader::new(root).unwrap();
+        // Pass A reaps the dir even though record.json was still there.
+        // Pass C is consequently not tempted to "undelete" the orphan.
+        assert!(!dir.exists(), "dir should be reaped");
+        assert_eq!(loader.find_by_id(&id).unwrap(), None);
+        assert_eq!(loader.find_by_name("my-session").unwrap(), None);
+    }
+
+    /// Regression guard for the marker location: `delete()` must put
+    /// the tombstone in the *parent* sessions/ dir (so it survives
+    /// `remove_dir_all`). After a successful delete, the marker must
+    /// be cleaned up too.
+    #[test]
+    fn delete_writes_external_tombstone_and_cleans_it_up() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let short = short_of(&key);
+        let marker = tombstone_path(&root, &short);
+        let inside = session_dir_path(&root, &short).join(".deleting");
+
+        loader.delete(&key).unwrap();
+
+        // After a successful delete, neither location should have a
+        // marker — the external one was removed at the end of delete,
+        // and the internal one was never written.
+        assert!(!marker.exists(), "external tombstone should be cleaned up");
+        assert!(
+            !inside.exists(),
+            "no tombstone should ever be placed inside the session dir",
+        );
+    }
+
+    /// Pass A's `NotFound` branch: a tombstone for a short whose session
+    /// dir is already gone (e.g. someone hand-deleted it after the
+    /// marker was written but before self-heal ran).
+    #[test]
+    fn self_heal_reaps_orphan_tombstone_without_session_dir() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        // Manually plant a tombstone marker pointing at a short that
+        // doesn't exist as a dir. The short matches the
+        // create()-produced format (5 lowercase hex) so `is_valid_short`
+        // accepts it.
+        let _ = DiskLoader::new(root.clone()).unwrap();
+        let orphan_short = "abcde";
+        let marker = tombstone_path(&root, orphan_short);
+        std::fs::write(&marker, b"").unwrap();
+        assert!(
+            !session_dir_path(&root, orphan_short).exists(),
+            "test setup: orphan session dir must not exist",
+        );
+
+        let _loader = DiskLoader::new(root).unwrap();
+        assert!(
+            !marker.exists(),
+            "orphan tombstone should be cleaned up by self-heal",
+        );
+    }
+
+    /// Self-heal must reap every tombstone in one pass, not just the
+    /// first one it encounters.
+    #[test]
+    fn self_heal_reaps_multiple_tombstones_in_one_pass() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key_a = loader.create(sample_record()).unwrap();
+        let key_b = loader
+            .create({
+                let mut r = sample_record();
+                r.name = Some("other".into());
+                r
+            })
+            .unwrap();
+        drop(loader);
+
+        let marker_a = tombstone_path(&root, &short_of(&key_a));
+        let marker_b = tombstone_path(&root, &short_of(&key_b));
+        std::fs::write(&marker_a, b"").unwrap();
+        std::fs::write(&marker_b, b"").unwrap();
+
+        let loader = DiskLoader::new(root.clone()).unwrap();
+
+        assert!(!marker_a.exists(), "marker A should be cleaned up");
+        assert!(!marker_b.exists(), "marker B should be cleaned up");
+        assert!(
+            !session_dir_path(&root, &short_of(&key_a)).exists(),
+            "session A dir should be reaped",
+        );
+        assert!(
+            !session_dir_path(&root, &short_of(&key_b)).exists(),
+            "session B dir should be reaped",
+        );
+        assert_eq!(loader.find_by_id(key_a.id()).unwrap(), None);
+        assert_eq!(loader.find_by_id(key_b.id()).unwrap(), None);
+    }
+
+    /// The delta-baseline sidecar is absent until stored, then round-trips
+    /// its payload verbatim — the bytes are opaque to the store, so what
+    /// went in must come out untouched.
+    #[test]
+    fn delta_baseline_sidecar_round_trips_and_is_absent_until_stored() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+
+        assert_eq!(loader.load_delta_baseline(&key).unwrap(), None);
+
+        let payload = br#"{"version":1,"baseline":null}"#;
+        loader.store_delta_baseline(&key, payload).unwrap();
+        assert_eq!(
+            loader.load_delta_baseline(&key).unwrap().as_deref(),
+            Some(payload.as_slice())
+        );
+
+        // A rewrite replaces the payload; the sidecar holds one baseline.
+        let payload2 = br#"{"version":1,"baseline":[]}"#;
+        loader.store_delta_baseline(&key, payload2).unwrap();
+        assert_eq!(
+            loader.load_delta_baseline(&key).unwrap().as_deref(),
+            Some(payload2.as_slice())
+        );
+    }
+
+    /// A stale key — one whose session has been deleted — is `NotFound` on
+    /// both sidecar operations, matching `save`'s semantics: neither call
+    /// may touch a directory the index no longer owns.
+    #[test]
+    fn delta_baseline_sidecar_rejects_a_stale_key() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        loader.delete(&key).unwrap();
+
+        assert_eq!(
+            loader.load_delta_baseline(&key).unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
+        assert_eq!(
+            loader.store_delta_baseline(&key, b"{}").unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
+    }
+
+    // ---- Box names: one name, many records (BOX-004, BOX-005, BOX-010,
+    // BOX-143) ----
+
+    use crate::core::record::{ExitEnding, RecordState, StopEnding};
+    use proptest::prelude::*;
+
+    /// A running record named `name`.
+    fn named(name: &str) -> Record {
+        let mut record = sample_record();
+        record.name = Some(name.to_string());
+        record.set_state(RecordState::Running);
+        record
+    }
+
+    /// Puts the box at `key` in `state` through the store.
+    fn set_state(loader: &mut DiskLoader, key: &DiskBoxKey, state: RecordState) {
+        let mut record = loader.get(key).unwrap().record;
+        record.set_state(state);
+        loader.save(key, &record).unwrap();
+    }
+
+    fn stopped() -> RecordState {
+        RecordState::Stopped(StopEnding::Signalled { signal: 15 })
+    }
+
+    fn exited() -> RecordState {
+        RecordState::Exited(ExitEnding::Exit { exit_code: 0 })
+    }
+
+    /// Every retained record of the store, read through it.
+    fn all_records(loader: &DiskLoader) -> Vec<(DiskBoxKey, Record)> {
+        loader
+            .keys()
+            .map(|key| {
+                let record = loader.get(&key).unwrap().record;
+                (key, record)
+            })
+            .collect()
+    }
+
+    /// The events of the box at `key`, in file order.
+    fn events_of(loader: &DiskLoader, key: &DiskBoxKey) -> Vec<BoxEvent> {
+        loader.get(key).unwrap().read_events_from(0).unwrap().events
+    }
+
+    /// BOX-004: no two running records share a name under ASCII case.
+    fn assert_running_names_unique(loader: &DiskLoader) {
+        let running: Vec<String> = all_records(loader)
+            .into_iter()
+            .filter(|(_, r)| crate::box_name::holds_name(r.status))
+            .filter_map(|(_, r)| r.name.map(|n| n.to_ascii_lowercase()))
+            .collect();
+        let unique: BTreeSet<&String> = running.iter().collect();
+        assert_eq!(unique.len(), running.len(), "running names: {running:?}");
+    }
+
+    /// One operation on one host's boxes. A box is picked by its position
+    /// among the retained records, modulo their count.
+    #[derive(Debug, Clone)]
+    enum NameOp {
+        Create { name: usize, fresh: bool },
+        Stop(usize),
+        Exit(usize),
+        Resume(usize),
+        Rename(usize, usize),
+        Reap(usize),
+    }
+
+    /// Names that collide under ASCII case, plus the reserved `self`,
+    /// which only a rename asks for.
+    const NAME_POOL: [&str; 4] = ["dev", "Dev", "web", "self"];
+
+    fn name_op() -> impl Strategy<Value = NameOp> {
+        prop_oneof![
+            (0..3usize, any::<bool>()).prop_map(|(name, fresh)| NameOp::Create { name, fresh }),
+            any::<usize>().prop_map(NameOp::Stop),
+            any::<usize>().prop_map(NameOp::Exit),
+            any::<usize>().prop_map(NameOp::Resume),
+            (any::<usize>(), 0..NAME_POOL.len()).prop_map(|(i, n)| NameOp::Rename(i, n)),
+            any::<usize>().prop_map(NameOp::Reap),
+        ]
+    }
+
+    /// The running record other than `except` whose name folds to `name`.
+    fn model_holder(
+        loader: &DiskLoader,
+        name: &str,
+        except: Option<SessionId>,
+    ) -> Option<SessionId> {
+        all_records(loader)
+            .into_iter()
+            .find(|(key, r)| {
+                Some(*key.id()) != except
+                    && crate::box_name::holds_name(r.status)
+                    && r.name
+                        .as_deref()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(name))
+            })
+            .map(|(key, _)| *key.id())
+    }
+
+    /// Applies `op`, and checks its outcome against what BOX-004, BOX-010
+    /// and BOX-163 allow.
+    fn apply_name_op(loader: &mut DiskLoader, op: &NameOp) {
+        let retained = all_records(loader);
+        let pick = |i: usize| retained.get(i % retained.len().max(1)).cloned();
+        match *op {
+            NameOp::Create { name, fresh } => {
+                let base = NAME_POOL[name];
+                let name = if fresh {
+                    // BOX-163: the smallest `n` no retained record uses.
+                    let n = (1..=retained.len() + 1)
+                        .find(|n| {
+                            !retained.iter().any(|(_, r)| {
+                                r.name.as_deref().is_some_and(|got| {
+                                    got.eq_ignore_ascii_case(&format!("{base}-{n}"))
+                                })
+                            })
+                        })
+                        .unwrap();
+                    format!("{base}-{n}")
+                } else {
+                    base.to_string()
+                };
+                let holder = model_holder(loader, &name, None);
+                let got = loader.create(named(&name));
+                match holder {
+                    Some(_) => assert_eq!(
+                        got.unwrap_err().kind(),
+                        ErrorKind::AlreadyExists,
+                        "a running box holds `{name}`"
+                    ),
+                    None => {
+                        got.unwrap_or_else(|e| panic!("`{name}` is free: {e}"));
+                    }
+                }
+            }
+            NameOp::Stop(i) | NameOp::Exit(i) => {
+                let Some((key, record)) = pick(i) else { return };
+                if crate::box_name::holds_name(record.status) {
+                    let state = if matches!(op, NameOp::Stop(_)) {
+                        stopped()
+                    } else {
+                        exited()
+                    };
+                    set_state(loader, &key, state);
+                }
+            }
+            NameOp::Resume(i) => {
+                let Some((key, mut record)) = pick(i) else {
+                    return;
+                };
+                if crate::box_name::holds_name(record.status) {
+                    return;
+                }
+                let name = record.name.clone().unwrap();
+                let holder = model_holder(loader, &name, Some(*key.id()));
+                record.set_state(RecordState::Running);
+                let got = loader.save(&key, &record);
+                assert_eq!(
+                    got.is_err(),
+                    holder.is_some(),
+                    "resume of `{name}`: {got:?}"
+                );
+            }
+            NameOp::Rename(i, n) => {
+                let Some((key, record)) = pick(i) else { return };
+                let new_name = NAME_POOL[n];
+                let refused = new_name == "self"
+                    || (record.name.as_deref() != Some(new_name)
+                        && model_holder(loader, new_name, Some(*key.id())).is_some());
+                let got = loader.rename(&key, new_name.to_string());
+                assert_eq!(got.is_err(), refused, "rename to `{new_name}`: {got:?}");
+            }
+            NameOp::Reap(i) => {
+                let Some((key, record)) = pick(i) else { return };
+                if !crate::box_name::holds_name(record.status) {
+                    loader.delete(&key).unwrap();
+                }
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        /// BOX-004: over every sequence of create, stop, exit, resume,
+        /// rename and reap on one host, no two running boxes share a name,
+        /// and a name held only by a stopped or exited box is reusable.
+        #[test]
+        fn name_unique_among_running_on_host_reusable_after_stop(
+            ops in prop::collection::vec(name_op(), 1..24),
+        ) {
+            let tmp = TempDir::new().unwrap();
+            let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+            for op in &ops {
+                apply_name_op(&mut loader, op);
+                assert_running_names_unique(&loader);
+            }
+            // The invariant holds for the index a later start reads.
+            drop(loader);
+            let loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+            assert_running_names_unique(&loader);
+        }
+    }
+
+    /// BOX-004 by example: a stopped or exited box keeps its name, and a
+    /// new box reuses it. Resuming the first while the second runs is
+    /// refused.
+    #[test]
+    fn name_unique_among_running_on_host_reusable_after_stop_by_example() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let first = loader.create(named("dev")).unwrap();
+        assert_eq!(
+            loader.create(named("DEV")).unwrap_err().kind(),
+            ErrorKind::AlreadyExists
+        );
+        set_state(&mut loader, &first, stopped());
+        let second = loader.create(named("dev")).unwrap();
+        set_state(&mut loader, &second, exited());
+        let third = loader.create(named("dev")).unwrap();
+        for key in [&first, &second, &third] {
+            assert_eq!(loader.get(key).unwrap().record.name.as_deref(), Some("dev"));
+        }
+        let mut resumed = loader.get(&first).unwrap().record;
+        resumed.set_state(RecordState::Running);
+        let err = loader.save(&first, &resumed).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(loader.get(&first).unwrap().record.status, BoxState::Stopped);
+    }
+
+    /// BOX-005, the task's proof: two boxes named `dev` are retained, and
+    /// the running one answers. With none running, the latest answers.
+    #[test]
+    fn unqualified_name_resolves_running_else_latest() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        assert_eq!(loader.find_by_name("dev").unwrap(), None);
+
+        let older = loader.create(named("dev")).unwrap();
+        set_state(&mut loader, &older, stopped());
+        let newer = loader.create(named("dev")).unwrap();
+        // The newer box runs: it answers.
+        assert_eq!(loader.find_by_name("dev").unwrap(), Some(newer.clone()));
+
+        // Only the older box runs: it answers, though it is not the latest.
+        set_state(&mut loader, &newer, exited());
+        set_state(&mut loader, &older, RecordState::Running);
+        assert_eq!(loader.find_by_name("dev").unwrap(), Some(older.clone()));
+        assert_eq!(loader.find_by_name("DEV").unwrap(), Some(older.clone()));
+
+        // None runs: the most recently created answers.
+        set_state(&mut loader, &older, stopped());
+        assert_eq!(loader.find_by_name("dev").unwrap(), Some(newer.clone()));
+
+        // A stopped `Dev` does not hide a running `dev`: case folds
+        // first, and the running box answers for either case.
+        let upper = loader.create(named("Dev")).unwrap();
+        set_state(&mut loader, &upper, stopped());
+        set_state(&mut loader, &older, RecordState::Running);
+        assert_eq!(loader.find_by_name("Dev").unwrap(), Some(older.clone()));
+        assert_eq!(loader.find_by_name("dev").unwrap(), Some(older.clone()));
+
+        // None runs: the exact case breaks the tie, then the latest wins.
+        set_state(&mut loader, &older, stopped());
+        assert_eq!(loader.find_by_name("Dev").unwrap(), Some(upper));
+        assert_eq!(loader.find_by_name("dev").unwrap(), Some(newer.clone()));
+
+        // The answer survives a restart, which rebuilds the index.
+        drop(loader);
+        let loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        assert_eq!(loader.find_by_name("dev").unwrap(), Some(newer));
+    }
+
+    /// An index written before names were shared keyed its names on the
+    /// name. A start reads it, drops that map, and rebuilds the names from
+    /// the records.
+    #[test]
+    fn unqualified_name_resolves_running_else_latest_after_a_legacy_index() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader.create(named("dev")).unwrap();
+        drop(loader);
+        let index_file = root.as_utf8_path().join("sessions/index.json");
+        let legacy = format!(
+            r#"{{"short_to_id":{{"{}":"{}"}},"name_to_id":{{"dev":"{}"}}}}"#,
+            short_of(&key),
+            key.id(),
+            key.id()
+        );
+        std::fs::write(&index_file, legacy).unwrap();
+
+        let loader = DiskLoader::new(root).unwrap();
+        assert_eq!(loader.find_by_name("dev").unwrap(), Some(key));
+        let rewritten = std::fs::read_to_string(&index_file).unwrap();
+        assert!(!rewritten.contains("name_to_id"), "{rewritten}");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        /// BOX-010: a successful rename leaves the id, the spec and the
+        /// filesystem path as they were, keeps every earlier event, and
+        /// appends exactly one `renamed` event with the old and new names.
+        #[test]
+        fn rename_changes_only_alias_and_records_event(
+            names in prop::collection::vec(0..3usize, 1..8),
+            stop_first in any::<bool>(),
+        ) {
+            let pool = ["dev", "web", "api"];
+            let tmp = TempDir::new().unwrap();
+            let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+            let key = loader.create(named("start")).unwrap();
+            let object = loader.get(&key).unwrap();
+            object.store_spec(br#"{"box":{"name":"start"}}"#).unwrap();
+            object
+                .append_event(&BoxEvent::for_record(
+                    object.record(),
+                    crate::events::BoxEventType::Created,
+                ))
+                .unwrap();
+            if stop_first {
+                set_state(&mut loader, &key, stopped());
+            }
+            for n in names {
+                let before = loader.get(&key).unwrap();
+                let events_before = events_of(&loader, &key);
+                let new_name = pool[n];
+                loader.rename(&key, new_name.to_string()).unwrap();
+                let after = loader.get(&key).unwrap();
+                let events_after = events_of(&loader, &key);
+
+                prop_assert_eq!(after.record().id, before.record().id);
+                prop_assert_eq!(after.key(), before.key());
+                prop_assert_eq!(after.load_spec().unwrap(), before.load_spec().unwrap());
+                prop_assert_eq!(after.workspace_path(), before.workspace_path());
+                prop_assert_eq!(after.record().name.as_deref(), Some(new_name));
+                let mut unaliased = after.record().clone();
+                unaliased.name.clone_from(&before.record().name);
+                prop_assert_eq!(&unaliased, before.record());
+
+                prop_assert_eq!(&events_after[..events_before.len()], &events_before[..]);
+                let added = &events_after[events_before.len()..];
+                if before.record().name.as_deref() == Some(new_name) {
+                    // A rename to the current name changes nothing.
+                    prop_assert!(added.is_empty());
+                } else {
+                    prop_assert_eq!(added.len(), 1);
+                    prop_assert_eq!(added[0].kind, crate::events::BoxEventType::Renamed);
+                    prop_assert_eq!(added[0].box_id, *key.id());
+                    prop_assert_eq!(
+                        &added[0].data,
+                        &crate::box_name::renamed_event_data(
+                            before.record().name.as_deref(),
+                            new_name,
+                        )
+                    );
+                }
+            }
+        }
+    }
+
+    /// BOX-010: a rename to a name a running box on the host holds, or to
+    /// `self`, is refused with exit 2, naming the holder or `self`. The
+    /// box, its name and its events stay as they were. A name only a
+    /// stopped box keeps is free.
+    #[test]
+    fn rename_to_running_held_name_or_self_refused_exit2_names_holder() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let holder = loader.create(named("dev")).unwrap();
+        let renamed = loader.create(named("web")).unwrap();
+        let retained = loader.create(named("api")).unwrap();
+        set_state(&mut loader, &retained, stopped());
+        let records_before = all_records(&loader);
+        let events_before = events_of(&loader, &renamed);
+
+        // Held by a running box, under any case, and whatever state the
+        // renamed box is in.
+        for (state, new_name) in [(RecordState::Running, "dev"), (stopped(), "DEV")] {
+            set_state(&mut loader, &renamed, state);
+            let err = loader.rename(&renamed, new_name.to_string()).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+            let refusal = err
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<crate::box_name::RenameRefusal>())
+                .expect("the refusal travels in the error");
+            assert_eq!(refusal.exit_code(), 2);
+            assert_eq!(
+                refusal,
+                &crate::box_name::RenameRefusal::HeldByRunning {
+                    name: new_name.to_string(),
+                    holder: *holder.id(),
+                    holder_name: "dev".to_string(),
+                }
+            );
+            let text = err.to_string();
+            assert!(text.contains(&holder.id().to_string()), "{text}");
+            assert!(text.contains("`dev`"), "{text}");
+        }
+        set_state(&mut loader, &renamed, RecordState::Running);
+
+        // `self`, in any case.
+        for reserved in ["self", "SELF"] {
+            let err = loader.rename(&renamed, reserved.to_string()).unwrap_err();
+            let refusal = err
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<crate::box_name::RenameRefusal>())
+                .expect("the refusal travels in the error");
+            assert_eq!(refusal, &crate::box_name::RenameRefusal::Reserved);
+            assert_eq!(refusal.exit_code(), 2);
+            assert!(err.to_string().contains("`self`"), "{err}");
+        }
+
+        // Nothing changed: every record and the renamed box's events.
+        assert_eq!(all_records(&loader), records_before);
+        assert_eq!(events_of(&loader, &renamed), events_before);
+
+        // A name only a stopped box keeps is free.
+        loader.rename(&renamed, "api".to_string()).unwrap();
+        assert_eq!(loader.find_by_name("api").unwrap(), Some(renamed));
+    }
+
+    /// One operation on box ids for `nothing_keys_on_box_name`.
+    #[derive(Debug, Clone)]
+    enum KeyOp {
+        Create(usize),
+        Rename(usize, usize),
+        Stop(usize),
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        /// BOX-143: every record, event and index entry is keyed on the box
+        /// id. An id-addressed read gives the same box before and after any
+        /// rename, and a name lookup finds a box only by its current alias.
+        #[test]
+        fn nothing_keys_on_box_name(
+            ops in prop::collection::vec(
+                prop_oneof![
+                    (0..3usize).prop_map(KeyOp::Create),
+                    (any::<usize>(), 0..3usize).prop_map(|(i, n)| KeyOp::Rename(i, n)),
+                    any::<usize>().prop_map(KeyOp::Stop),
+                ],
+                1..16,
+            ),
+        ) {
+            let pool = ["dev", "web", "api"];
+            let tmp = TempDir::new().unwrap();
+            let root = loader_dir(&tmp);
+            let mut loader = DiskLoader::new(root.clone()).unwrap();
+            // Every box ever created, by id, with its directory.
+            let mut boxes: Vec<(DiskBoxKey, DaemonAbsPath)> = Vec::new();
+            for op in ops {
+                match op {
+                    KeyOp::Create(n) => {
+                        let Ok(key) = loader.create(named(pool[n])) else { continue };
+                        let object = loader.get(&key).unwrap();
+                        object
+                            .append_event(&BoxEvent::for_record(
+                                object.record(),
+                                crate::events::BoxEventType::Created,
+                            ))
+                            .unwrap();
+                        boxes.push((key, object.workspace_path()));
+                    }
+                    KeyOp::Rename(i, n) if !boxes.is_empty() => {
+                        let key = boxes[i % boxes.len()].0.clone();
+                        let _ = loader.rename(&key, pool[n].to_string());
+                    }
+                    KeyOp::Stop(i) if !boxes.is_empty() => {
+                        let key = boxes[i % boxes.len()].0.clone();
+                        set_state(&mut loader, &key, stopped());
+                    }
+                    KeyOp::Rename(..) | KeyOp::Stop(_) => {}
+                }
+                for (key, workspace) in &boxes {
+                    // Id-addressed reads give this box, whatever its name.
+                    prop_assert_eq!(loader.find_by_id(key.id()).unwrap(), Some(key.clone()));
+                    let object = loader.get(key).unwrap();
+                    prop_assert_eq!(&object.record().id, key.id());
+                    prop_assert_eq!(&object.workspace_path(), workspace);
+                    for event in events_of(&loader, key) {
+                        prop_assert_eq!(&event.box_id, key.id());
+                    }
+                    // A name lookup finds a box only under its current alias.
+                    let current = object.record().name.clone().unwrap();
+                    for name in pool {
+                        if let Some(found) = loader.find_by_name(name).unwrap() {
+                            let alias = loader.get(&found).unwrap().record.name.unwrap();
+                            prop_assert!(alias.eq_ignore_ascii_case(name));
+                            if &found == key {
+                                prop_assert!(current.eq_ignore_ascii_case(name));
+                            }
+                        }
+                    }
+                }
+            }
+            // The index on disk keys every map on a short or a box id. A store
+            // that never filed a box has written no index.
+            let Ok(bytes) = std::fs::read(root.as_utf8_path().join("sessions/index.json")) else {
+                prop_assert!(boxes.is_empty());
+                return Ok(());
+            };
+            let index: serde_json_lenient::Value = serde_json_lenient::from_slice(&bytes).unwrap();
+            let maps = index.as_object().unwrap();
+            for (field, map) in maps {
+                for map_key in map.as_object().unwrap().keys() {
+                    prop_assert!(
+                        is_valid_short(map_key) || SessionId::parse_str(map_key).is_ok(),
+                        "index map `{}` is keyed on `{}`",
+                        field,
+                        map_key
+                    );
+                }
+            }
+        }
+    }
+}

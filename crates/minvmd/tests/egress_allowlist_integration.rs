@@ -46,10 +46,10 @@ use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use boxes::core::decision::ItemDecision;
+use boxes::core::hooks::{HookResult, PolicyHooks, Unapproved};
+use boxes::core::policy::{HooksPolicy, PatchesPolicy, VarsPolicy};
 use serial_test::serial;
-use sessions::core::decision::ItemDecision;
-use sessions::core::hooks::{HookResult, PolicyHooks, Unapproved};
-use sessions::core::policy::{HooksPolicy, PatchesPolicy, VarsPolicy};
 use tempfile::TempDir;
 
 mod common;
@@ -58,10 +58,10 @@ mod common;
 /// protocols beyond TCP). Every operation's reach must be earned by DNS-pinned
 /// admission. The list is shared with the `minimald` unit fixture so the two
 /// cannot drift.
-const TOOLCHAIN_HOSTS: &[&str] = sessions::NET068_TOOLCHAIN_EGRESS_HOSTS;
+const TOOLCHAIN_HOSTS: &[&str] = boxes::NET068_TOOLCHAIN_EGRESS_HOSTS;
 
 /// Isolated `XDG_STATE_HOME` under /tmp: macOS's $TMPDIR is deep enough that
-/// provider sockets beneath a default tempdir would overflow sun_path (104).
+/// host sockets beneath a default tempdir would overflow sun_path (104).
 fn short_state_dir() -> tempfile::TempDir {
     tempfile::Builder::new()
         .prefix("mnl")
@@ -220,13 +220,13 @@ impl Guest {
     /// deadlines, quoting the supervisor's `run.log`.
     fn boot() -> Guest {
         let state = short_state_dir();
-        let provider_dir = state.path().join("minimal/providers/local-minvmd0");
-        let sock_path = provider_dir.join("ssh.sock");
-        let control_sock = provider_dir.join(minvmd::control::CONTROL_SOCK_FILE);
+        let host_dir = state.path().join("minimal/providers/local-minvmd0");
+        let sock_path = host_dir.join("ssh.sock");
+        let control_sock = host_dir.join(minvmd::control::CONTROL_SOCK_FILE);
         let boot_log_path = std::env::var_os(MINVMD_BOOT_LOG_ENV)
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|| provider_dir.join("boot.log"));
+            .unwrap_or_else(|| host_dir.join("boot.log"));
 
         // minimald boots as the initramfs `/init` (MINVMD_INITRAMFS, set by
         // the caller); the rootfs stays generic.
@@ -478,7 +478,7 @@ packages = [
 async fn create_toolchain_session(
     sock_path: &Path,
     control_sock: &Path,
-) -> Result<sessions::SessionId, String> {
+) -> Result<boxes::SessionId, String> {
     use minimald_rpc::{CreateSession, CreateSessionRequest, OneshotSshRpc};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -502,8 +502,8 @@ async fn create_toolchain_session(
         .unwrap_or(0);
 
     let name = format!("hostname-allowlist-{uniq:x}");
-    let egress = sessions::EgressPolicy {
-        allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+    let egress = boxes::EgressPolicy {
+        allow_protocols: Some(vec![boxes::IpProto::Tcp]),
         allow_subnets: Some(Vec::new()),
         allow_dns_hosts: Some(TOOLCHAIN_HOSTS.iter().map(|h| (*h).to_string()).collect()),
         deny_subnets: None,
@@ -511,23 +511,18 @@ async fn create_toolchain_session(
     // The box's row, filed with the VM host the way `min session activate`
     // files it: a box with no row is an unregistered source the gate drops
     // unconditionally (NET-085), its resolver queries included.
-    let addresses = common::register_box(control_sock, &name, Some(egress.clone()))?;
+    let (addresses, box_id) = common::register_box(control_sock, &name, Some(egress.clone()))?;
 
-    let req = CreateSessionRequest {
-        config: minimald_rpc::SessionConfig {
-            name: Some(name),
-            project_path: paths::HostAbsPath::try_new("/tmp")
-                .map_err(|e| format!("project_path: {e}"))?,
-            network: sessions::NetworkMode::OwnIp,
-            policy: sessions::SessionPolicy::new(Some(egress), None),
-            // The addresses the registration handed back, so the in-VM
-            // daemon attaches the box at its row's lease.
-            box_addresses: Some(addresses),
-            hooks_enabled: true,
-            attrs: Default::default(),
-        },
-        must_match_version: None,
-    };
+    let mut req = CreateSessionRequest::new(
+        name,
+        paths::HostAbsPath::try_new("/tmp").map_err(|e| format!("project_path: {e}"))?,
+        boxes::NetworkMode::OwnIp,
+        boxes::BoxPolicy::new(Some(egress), None),
+    );
+    // The addresses the registration handed back, so the in-VM daemon
+    // attaches the box at its row's lease.
+    req.config.box_id = Some(box_id);
+    req.config.box_addresses = Some(addresses);
     let body = serde_json_lenient::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
 
     let mut rpc = channel.into_stream();
@@ -604,7 +599,7 @@ async fn connect_and_auth(
 /// in the workspace (the SFTP subsystem presents `/workbench` as the root).
 async fn upload_workspace_file(
     handle: &mut russh::client::Handle<ClientHandler>,
-    session_id: sessions::SessionId,
+    session_id: boxes::SessionId,
     remote_path: &str,
     contents: &str,
 ) -> Result<(), String> {
@@ -714,7 +709,7 @@ where
     HookResult::decided(Vec::new())
 }
 
-/// Phase 3 of the compose flow (see `crates/sessions/docs/COMPOSITION.md`):
+/// Phase 3 of the compose flow (see `crates/boxes/docs/COMPOSITION.md`):
 /// gate the daemon's pending items with [`ApproveExpectedVar`] and ship the verdict
 /// with `SubmitVerdict`. Package patches whose source does not exist on this
 /// host come back `Ignored`; an `Approved` patch would need the
@@ -722,11 +717,11 @@ where
 /// not, so it is reported rather than left to fail at `FinalizeSession`.
 async fn submit_gated_verdict(
     handle: &mut russh::client::Handle<ClientHandler>,
-    response: sessions::wire::request::ContributionResponse,
+    response: boxes::wire::request::ContributionResponse,
 ) -> Result<(), String> {
+    use boxes::wire::policy::WirePatchVerdict;
+    use boxes::wire::request::BoxStep;
     use minimald_rpc::{OneshotSshRpc, SubmitVerdict};
-    use sessions::wire::policy::WirePatchVerdict;
-    use sessions::wire::request::SessionStep;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     eprintln!(
@@ -735,12 +730,12 @@ async fn submit_gated_verdict(
         response.patches.len(),
         response.lifecycle_hooks.len(),
     );
-    let (verdict, _policy) = sessions::client::handler::handle_response(
+    let (verdict, _policy) = boxes::client::handler::handle_response(
         response,
         &[],
-        sessions::core::policy::UserPolicy::empty(),
+        boxes::core::policy::UserPolicy::empty(),
         &ApproveExpectedVar,
-        sessions::core::compose::ComposeOptions::default(),
+        boxes::core::compose::ComposeOptions::default(),
         &|name| std::env::var(name),
     )
     .map_err(|e| format!("gating pending items: {e}"))?;
@@ -783,8 +778,8 @@ async fn submit_gated_verdict(
     let resp: <SubmitVerdict as OneshotSshRpc>::Response = serde_json_lenient::from_slice(&buf)
         .map_err(|e| format!("decode SubmitVerdict response: {e}"))?;
     match resp.ok() {
-        Some(SessionStep::Materialized { .. }) => Ok(()),
-        Some(SessionStep::Fault { error }) => Err(format!("SubmitVerdict faulted: {error:?}")),
+        Some(BoxStep::Materialized { .. }) => Ok(()),
+        Some(BoxStep::Fault { error }) => Err(format!("SubmitVerdict faulted: {error:?}")),
         None => Err("SubmitVerdict returned an error".into()),
     }
 }
@@ -793,7 +788,7 @@ async fn submit_gated_verdict(
 /// `FinalizeSession`.
 async fn configure_and_finalize(
     handle: &mut russh::client::Handle<ClientHandler>,
-    session_id: sessions::SessionId,
+    session_id: boxes::SessionId,
 ) -> Result<(), String> {
     use minimald_rpc::{
         ConfigureLoadout, ConfigureLoadoutRequest, ConfigureLoadoutResponse, FinalizeSession,
@@ -850,7 +845,10 @@ async fn configure_and_finalize(
             .await
             .map_err(|e| format!("request_subsystem: {e}"))?;
 
-        let req = FinalizeSessionRequest { session_id };
+        let req = FinalizeSessionRequest {
+            session_id,
+            report_shared_port_collisions: false,
+        };
         let body = serde_json_lenient::to_vec(&req)
             .map_err(|e| format!("serialize FinalizeSession request: {e}"))?;
         let mut rpc = channel.into_stream();
@@ -881,7 +879,7 @@ async fn configure_and_finalize(
 /// `(stdout, stderr, exit_status)`.
 async fn run_session_exec(
     sock_path: &Path,
-    session_id: sessions::SessionId,
+    session_id: boxes::SessionId,
     command: &str,
 ) -> Result<(String, String, Option<u32>), String> {
     use russh::ChannelMsg;

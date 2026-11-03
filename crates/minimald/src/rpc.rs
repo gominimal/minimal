@@ -1,33 +1,35 @@
+use boxes::SessionId;
 use futures::StreamExt as _;
 use minimald_rpc::{
     AbortSession, AbortSessionResponse, BoxControlReply, BoxControlRequest, CleanCacheRequest,
     CleanCacheUpdate, CreateSession, DestroySession, DestroySessionResponse, Errorable,
-    FinalizeSession, FinalizeSessionResponse, GetEffectiveSessionPolicy,
-    GetEffectiveSessionPolicyRequest, GetMeshStatus, GetSessionPolicy, GetSessionPolicyRequest,
-    GetSessionRecord, GetSessionRecordRequest, GetSessionRecordResponse, GetSessionScreen,
-    GetVersion, GetVersionResponse, ListSessions, ListSessionsEntry, ListSessionsResponse,
-    OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession, RenameSessionResponse, ResourcePool,
-    SessionDelta, SessionDeltaRequest, SessionDeltaResponse, Shutdown, ShutdownRequest,
-    ShutdownResponse, SubmitVerdict,
+    FinalizeSession, GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest, GetMeshStatus,
+    GetSessionPolicy, GetSessionPolicyRequest, GetSessionRecord, GetSessionRecordRequest,
+    GetSessionRecordResponse, GetSessionScreen, GetVersion, GetVersionResponse, ListSessions,
+    ListSessionsEntry, ListSessionsResponse, OneshotSshRpc, RPC_SUBSYSTEM_PREFIX, RenameSession,
+    RenameSessionResponse, ResourcePool, SessionDelta, SessionDeltaRequest, SessionDeltaResponse,
+    Shutdown, ShutdownRequest, ShutdownResponse, SubmitVerdict,
 };
 use russh::{
     Channel as RuChannel, ChannelId,
     server::{Msg, Session},
 };
-use sessions::SessionId;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
-use tokio::task::spawn;
+
+// Every task this module spawns carries the caller's span (TEL-022): the
+// clippy `disallowed-methods` for the crate names tokio's own spawn.
+use crate::traced::spawn;
 
 use crate::{
     ChannelConfig,
+    box_manager::BoxKeyPredicate,
     connection::{ConnectionError, ConnectionHandle},
     net::classifier,
     server::ServerStateHandle,
-    sessions::SessionKeyPredicate,
 };
 
 /// This daemon's build, reported on every reply a version-gated client path
@@ -117,7 +119,7 @@ async fn serve_list_sessions(
 ) -> Result<(), ConnectionError> {
     ListSessions
         .handle_channel(c, async |_req| {
-            let resource_pool = tokio::task::spawn_blocking(detect_resource_pool)
+            let resource_pool = crate::traced::spawn_blocking(detect_resource_pool)
                 .await
                 .map_err(|e| ConnectionError::Internal(e.to_string()))?;
             let mngr = s.sessions_manager().await;
@@ -147,24 +149,55 @@ async fn serve_list_sessions(
             // host-address session", so one unreadable record fails no
             // listing.
             let in_microvm = s.in_microvm().await;
-            let fact = crate::session_host::host_ip_enforcement_fact();
-            let enforcement = futures::future::join_all(infos.iter().map(|i| async {
-                let record = mngr
-                    .get_record(SessionKeyPredicate::Id(i.id))
+            let fact = crate::box_runtime::host_ip_enforcement_fact();
+            let opt_out = s.deny_all_opt_out().await;
+            let records = futures::future::join_all(infos.iter().map(|i| async {
+                mngr.get_record(BoxKeyPredicate::Id(i.id))
                     .await
                     .ok()
-                    .flatten();
-                record.map(|record| {
-                    crate::session_host::displayed_host_ip_enforcement(
-                        in_microvm,
-                        record.network,
-                        classifier::verdict_of(record.policy.egress.as_ref()),
-                        &fact,
-                        record.host_ip_enforcement,
-                    )
-                })
+                    .flatten()
             }))
             .await;
+            let enforcement: Vec<_> = records
+                .iter()
+                .map(|record| {
+                    record.as_ref().map(|record| {
+                        crate::box_runtime::displayed_host_ip_enforcement(
+                            in_microvm,
+                            record.network,
+                            classifier::verdict_of(record.policy.egress.as_ref()),
+                            &fact,
+                            record.host_ip_enforcement,
+                        )
+                    })
+                })
+                .collect();
+            // T110: each box's address and egress posture, from its record
+            // and the hostname registry. A box with no fact for a field
+            // leaves it `None`, so the listing shows `-` rather than an
+            // invented value.
+            let box_networks: std::collections::BTreeMap<_, _> = infos
+                .iter()
+                .zip(&records)
+                .map(|(i, record)| {
+                    (
+                        i.id,
+                        box_network_facts(&mngr, i.id, record.as_ref(), opt_out, in_microvm),
+                    )
+                })
+                .collect();
+            tracing::info!(
+                boxes = infos.len(),
+                with_address = box_networks
+                    .values()
+                    .filter(|f| f.loopback_address.is_some())
+                    .count(),
+                with_posture = box_networks
+                    .values()
+                    .filter(|f| f.egress_posture.is_some())
+                    .count(),
+                "listed boxes with their address and egress posture"
+            );
             Ok(ListSessionsResponse {
                 daemon_version: Some(OWN_VERSION.to_string()),
                 hostname_routing_unavailable: s.proxy_unavailable().await,
@@ -172,6 +205,7 @@ async fn serve_list_sessions(
                 zone_answerer_port,
                 answerer_bound: zone_answerer_port.is_some(),
                 resource_pool,
+                box_networks,
                 // `git` is left `None`: the daemon cannot probe it — on
                 // macOS it runs in the minvmd guest, where the host's
                 // project paths do not exist and git is not on PATH. The
@@ -180,6 +214,9 @@ async fn serve_list_sessions(
                     .into_iter()
                     .zip(enforcement)
                     .map(|(i, host_ip_enforcement)| ListSessionsEntry {
+                        // NET-129: the listing names the ports this box
+                        // yields, from the same read the runtime facts use.
+                        shared_port_collisions: shared_port_collisions_of(&mngr, i.id),
                         id: i.id,
                         name: i.name,
                         project_path: Some(i.project_path),
@@ -209,6 +246,104 @@ async fn serve_list_sessions(
         .await
 }
 
+/// The address a host-address box reports in the listing (T110): the
+/// node's address, except in a microVM whose node address is still
+/// `127.0.0.1`, where the box reports none.
+fn host_address_loopback(node: std::net::Ipv4Addr, in_microvm: bool) -> Option<std::net::Ipv4Addr> {
+    (!in_microvm || node != std::net::Ipv4Addr::LOCALHOST).then_some(node)
+}
+
+/// Whether a listed box stands on the `127.0.0.1` fallback (T110). A
+/// host-address box's node address can be `127.0.0.1` too, so only an
+/// own-address or `none` box at `127.0.0.1` is at the fallback. A
+/// host-address box whose address is withheld (a VM node not yet granted
+/// its address) is reached only through the proxy, so it reads as the
+/// fallback too (design §7.1). Any other box with no address reports none.
+fn box_at_fallback(
+    host_address: bool,
+    loopback_address: Option<std::net::Ipv4Addr>,
+) -> Option<bool> {
+    match loopback_address {
+        None => host_address.then_some(true),
+        Some(address) => Some(!host_address && address == std::net::Ipv4Addr::LOCALHOST),
+    }
+}
+
+/// One box's network facts as the listing reports them (T110). The address
+/// is the host loopback address its ports answer at: the node's address for
+/// a host-address box, and for an own-address or `none` box the address its
+/// publish holds (NET-010, or the `127.0.0.1` interim where the range is
+/// absent), else the loopback address its registration was handed. The
+/// posture is the effective egress `GetEffectiveSessionPolicy` resolves for
+/// the same record ([`effective_policy_reply`]). A box whose record cannot
+/// be read reports no posture, and one that publishes nowhere reports no
+/// address. In a microVM, a host-address box reports no address while the
+/// node's address is still `127.0.0.1`: the answerer has not granted the
+/// node its address yet, and a VM node's host-address boxes are never
+/// mirrored onto `127.0.0.1` (design §7.1).
+fn box_network_facts(
+    mngr: &crate::box_manager::BoxManagerHandle,
+    id: SessionId,
+    record: Option<&boxes::Record>,
+    opt_out: bool,
+    in_microvm: bool,
+) -> minimald_rpc::BoxNetworkFacts {
+    let host_address = matches!(
+        record.map(|record| record.network),
+        Some(boxes::NetworkMode::HostNet)
+    );
+    let loopback_address = {
+        let registry = mngr.hostnames();
+        let routes = registry.read().expect("hostname registry lock poisoned");
+        if host_address {
+            host_address_loopback(routes.node_address(), in_microvm)
+        } else {
+            routes.published_own_address(id).or_else(|| {
+                record
+                    .and_then(|record| record.box_addresses)
+                    .map(|addresses| addresses.loopback_address)
+            })
+        }
+    };
+    let at_fallback = box_at_fallback(host_address, loopback_address);
+    let egress_posture = record.map(|record| {
+        let effective = effective_policy_reply(
+            &record.policy,
+            record.network,
+            boxes::EGRESS_DEFAULT_PHASE,
+            opt_out,
+        );
+        minimald_rpc::EgressPosture::of(&effective.egress, record.network)
+    });
+    minimald_rpc::BoxNetworkFacts {
+        loopback_address,
+        egress_posture,
+        at_fallback,
+    }
+}
+
+/// The ports a box's attach yields because a sibling at the same shared
+/// loopback address holds them (NET-129, first-come), as the wire names
+/// them: the one registry read both the runtime facts and the listing answer
+/// from, so `min session policy` and `min session list` cannot disagree.
+/// Empty for every mode but a shared-address own-ip box; a plain map lookup
+/// behind the registry's lock, so it never holds up a reply.
+fn shared_port_collisions_of(
+    mngr: &crate::box_manager::BoxManagerHandle,
+    id: SessionId,
+) -> Vec<minimald_rpc::SharedPortCollision> {
+    let registry = mngr.hostnames();
+    let routes = registry.read().expect("hostname registry lock poisoned");
+    routes
+        .shared_port_collisions(id)
+        .into_iter()
+        .map(|c| minimald_rpc::SharedPortCollision {
+            port: c.port,
+            held_by: c.other,
+        })
+        .collect()
+}
+
 fn detect_resource_pool() -> Option<ResourcePool> {
     let cpu_cores = std::thread::available_parallelism()
         .ok()?
@@ -229,28 +364,40 @@ async fn serve_get_session_record(
     s: ServerStateHandle,
     c: RuChannel<Msg>,
 ) -> Result<(), ConnectionError> {
-    use crate::sessions::SessionKeyPredicate;
+    use crate::box_manager::BoxKeyPredicate;
     GetSessionRecord
         .handle_channel(c, async |req| {
             let mngr = s.sessions_manager().await;
-            Ok(GetSessionRecordResponse {
-                daemon_version: Some(OWN_VERSION.to_string()),
-                record: mngr
-                    .get_record(match req {
-                        GetSessionRecordRequest::Id(id) => SessionKeyPredicate::Id(id),
-                        GetSessionRecordRequest::Name(name) => SessionKeyPredicate::Name(name),
-                    })
-                    .await
-                    .map_err(|e| ConnectionError::Internal(e.to_string()))?,
-            })
+            let record = mngr
+                .get_record(match req {
+                    GetSessionRecordRequest::Id(id) => BoxKeyPredicate::Id(id),
+                    GetSessionRecordRequest::Name(name) => BoxKeyPredicate::Name(name),
+                })
+                .await
+                .map_err(|e| ConnectionError::Internal(e.to_string()))?;
+            Ok(session_record_response(record))
         })
         .await
 }
 
+/// The [`GetSessionRecord`] reply for a stored record. The reply never
+/// carries the box's sealed values (BEP-007): only the daemon's own launch
+/// reads them, so a daemon client does not read another box's values. The
+/// store keeps them.
+pub(crate) fn session_record_response(record: Option<boxes::Record>) -> GetSessionRecordResponse {
+    GetSessionRecordResponse {
+        daemon_version: Some(OWN_VERSION.to_string()),
+        record: record.map(|mut record| {
+            record.sealed_deliveries.clear();
+            record
+        }),
+    }
+}
+
 /// Stand-in for `session_name` on the lifecycle records when the session
-/// carries no user-assigned name. `SessionConfig::name` is `None` for an
+/// carries no user-assigned name. `BoxConfig::name` is `None` for an
 /// anonymous session, and an absent field reads like a logging bug.
-const ANONYMOUS_SESSION: &str = "<anonymous>";
+pub(crate) const ANONYMOUS_SESSION: &str = "<anonymous>";
 
 /// The egress rule counts a session config parses to, one per egress field.
 /// Logged beside the record the daemon stores at session start, they are the
@@ -265,7 +412,7 @@ struct EgressRuleCounts {
 }
 
 impl EgressRuleCounts {
-    fn of(policy: &minimald_rpc::SessionPolicy) -> Self {
+    fn of(policy: &minimald_rpc::BoxPolicy) -> Self {
         let egress = policy.egress.as_ref();
         Self {
             allow_subnets: egress
@@ -307,11 +454,34 @@ async fn serve_create_session(
                 return Ok(Errorable::Err { error: message });
             }
 
+            // The user-namespace gate (NET-143): a host that refuses the
+            // unprivileged user namespace every session sandbox starts by
+            // unsharing would otherwise mint a session whose first attach
+            // dies writing /proc/self/uid_map, with the cause in this log
+            // alone. Refused here, before the manager allocates anything,
+            // so the activation fails on a reply that names the cause and
+            // the remedy, and nothing is left behind for its caller to tear
+            // down.
+            if let Some(restriction) = s.user_namespace_verdict().await {
+                tracing::warn!(
+                    reason = %restriction,
+                    "session create refused: this host refuses the unprivileged user \
+                     namespace every session sandbox needs"
+                );
+                return Ok(Errorable::Err {
+                    error: user_namespace_refusal(restriction),
+                });
+            }
+
             let mngr = s.sessions_manager().await;
             // Read the name off the config before it is handed to the
             // manager: the success record below needs it, and the reply
             // carries only the assigned id.
             let session_name = req.config.name.clone();
+            // Read the network mode off the config for the same reason: the
+            // manager consumes it, and the mode the session activated with is
+            // what the field below reports beside the "session created" line.
+            let network = req.config.network;
             // Read the egress rule counts off the config for the same reason:
             // the manager consumes it, and the stored record's egress is what
             // the counts below report beside the "session created" line.
@@ -355,11 +525,15 @@ async fn serve_create_session(
                     error: refused.to_string(),
                 });
             }
-            let fact = crate::session_host::host_ip_enforcement_fact();
+            let fact = crate::box_runtime::host_ip_enforcement_fact();
             let classifier_cause = fact.cause;
-            let classifier_advisory =
-                create_classifier_advisory(in_microvm, req.config.network, classifier_cause);
-            let host_ip_enforcement = crate::session_host::displayed_host_ip_enforcement(
+            let classifier_advisory = create_classifier_advisory(
+                in_microvm,
+                req.config.network,
+                classifier_cause,
+                req.config.policy.egress.as_ref(),
+            );
+            let host_ip_enforcement = crate::box_runtime::displayed_host_ip_enforcement(
                 in_microvm,
                 req.config.network,
                 classifier::verdict_of(req.config.policy.egress.as_ref()),
@@ -368,7 +542,27 @@ async fn serve_create_session(
             );
             req.config.attrs.remove(HOST_IP_ENFORCEMENT_ATTR);
 
-            Ok(match mngr.create_session(req.config, ssh_username).await {
+            // The session remembers its creator, so an attach from another
+            // connection cannot run the Draft shortcut while this one is
+            // still mid-activation (uploading, then configuring).
+            let creator = conn.liveness().await;
+            // BOX-068: the spec rides into the manager with the config, so
+            // the manager checks it before the record exists and stores it
+            // beside the record before the box starts.
+            let spec = req.spec.take();
+            let has_spec = spec.is_some();
+            // BOX-163: a fresh instance is named `<name>-<n>` and is never
+            // refused for a held name. Any other create takes `<name>`, and
+            // a running box that holds it refuses the create.
+            let fresh_instance = req.fresh_instance;
+            let created = if fresh_instance {
+                mngr.create_fresh_box_with_spec(req.config, spec, ssh_username, creator)
+                    .await
+            } else {
+                mngr.create_box_with_spec(req.config, spec, ssh_username, creator)
+                    .await
+            };
+            Ok(match created {
                 Ok(id) => {
                     // Tag the session to this connection so it is reaped if
                     // the client drops before finalizing it (e.g. Ctrl-C at
@@ -378,10 +572,13 @@ async fn serve_create_session(
                     tracing::info!(
                         session_id = %id,
                         session_name = session_name.as_deref().unwrap_or(ANONYMOUS_SESSION),
+                        network_mode = %network.word(),
                         egress_allow_subnets = egress_counts.allow_subnets,
                         egress_allow_protocols = egress_counts.allow_protocols,
                         egress_allow_dns_hosts = egress_counts.allow_dns_hosts,
                         egress_deny_subnets = egress_counts.deny_subnets,
+                        spec_stored = has_spec,
+                        fresh_instance,
                         "session created"
                     );
                     // NET-079's observability: one info line per create
@@ -410,11 +607,23 @@ async fn serve_create_session(
                     // NET-123: the session-start loopback probe, before any
                     // of this session's names publish. Its interim flag on
                     // the reply is what tells the client to surface the
-                    // naming advisory again (NET-122). NET-018 reads the
+                    // naming advisory again (NET-122). On a VM-backed daemon
+                    // the guest's own `lo` always carries the range, so the
+                    // forwarder walks the host's loopback instead, and the
+                    // flag is the host's verdict. NET-018 reads the
                     // answerer's half straight off the state, not off this
-                    // probe: the range the probe covers is the guest's on a
-                    // VM-backed host, so it is not the reply's fact to read.
-                    let interim_loopback = session_start_loopback_probe(&id).await.interim();
+                    // probe.
+                    #[cfg(target_os = "linux")]
+                    let walked = mngr
+                        .session_start_range_walk()
+                        .await
+                        .map(|answer| session_start_range_walk_line(&id, &answer));
+                    #[cfg(not(target_os = "linux"))]
+                    let walked: Option<bool> = None;
+                    let interim_loopback = match walked {
+                        Some(interim) => interim,
+                        None => session_start_loopback_probe(&id).await.interim(),
+                    };
                     let hostname_proxy_port = s.hostname_proxy_port().await;
                     let zone_answerer_port = s.zone_answerer_port().await;
                     Errorable::Ok(minimald_rpc::CreateSessionResponse {
@@ -441,8 +650,23 @@ async fn serve_create_session(
                             .map(|enforcement| enforcement.machine_str().to_string()),
                     })
                 }
+                // BOX-163: a running box holds the name. The reply names the
+                // holder, so the client can say who holds it and exit 2.
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {
-                    error: "A session with that name already exists".to_string(),
+                    error: match held_name_refusal(&e) {
+                        Some(refusal) => {
+                            tracing::info!(
+                                name = %refusal.name,
+                                holder = ?refusal.holder,
+                                holder_name = %refusal.holder_name,
+                                fresh_instance,
+                                "create refused: a running box holds the name; \
+                                 the reply names the holder"
+                            );
+                            refusal.to_string()
+                        }
+                        None => "A session with that name already exists".to_string(),
+                    },
                 },
                 // R2.1: a policy/network-mode mismatch is rejected at
                 // declaration time and surfaced as a clean typed error rather
@@ -455,6 +679,12 @@ async fn serve_create_session(
                 // could not be honoured — and what to type instead — rather
                 // than reading a transport failure off the activate.
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Errorable::Err {
+                    error: e.to_string(),
+                },
+                // BOX-002: a create minvmd gave no id is refused with a
+                // reply. The internal arm below closes the channel, and the
+                // client then reads an empty reply with no cause in it.
+                Err(e) if crate::box_manager::BoxIdNotMinted::is(&e) => Errorable::Err {
                     error: e.to_string(),
                 },
                 Err(e) => return Err(ConnectionError::Internal(e.to_string())),
@@ -473,54 +703,21 @@ async fn serve_create_session(
 /// carries.
 const HOST_IP_ENFORCEMENT_ATTR: &str = "host_ip_enforcement";
 
-/// The advisory a cause yields for the reply (NET-079): the cause in words,
-/// the state it leaves the box in, and — only when the cause is one the
-/// command ends — the exact command that ends it. Spelled here, on the one
-/// side that read the host, so the daemon's log line, the reply a client
-/// prints verbatim, and the start that prints it agree by construction, and
-/// the advisory is never a prompt: it names what a person may run, and
-/// running it (and any privilege prompt it carries) is the person's act,
-/// never the session start's.
-///
-/// The state it names is the box outcome the cause leaves, with the
-/// "whatever the boxes' declarations say" clause carried only while that
-/// outcome names no refusals: natively the step's and the mount's causes
-/// leave even a deny-all box running unenforced, while the two probe causes
-/// refuse a deny-all box at placement — an advisory that said "whatever the
-/// declarations say" over a refusal would deny the refusal a person is about
-/// to hit — and in the guest every cause refuses.
-fn classifier_advisory_text(cause: classifier::Cause, guest: bool) -> String {
-    let mut advisory = format!(
-        "note: this host cannot decide a host-address box's egress verdict \
-         per box: {}. While it cannot, {}",
-        cause.detail(),
-        cause.host_ip_box_outcome(guest),
-    );
-    // The clause holds exactly while the outcome sentence names no
-    // refusals — the same causes [`classifier::Cause::host_ip_box_outcome`]
-    // spells "run unenforced" for on a native host, mirrored here so the
-    // clause and the outcome it qualifies cannot drift apart. `guest` is
-    // folded into the mirror: every guest outcome names refusals.
-    if !guest
-        && matches!(
-            cause,
-            classifier::Cause::StepNotInstalled
-                | classifier::Cause::CannotConfine
-                | classifier::Cause::GuestTableNotLoaded
-        )
-    {
-        advisory.push_str(" — whatever the boxes' declarations say");
-    }
-    if let Some(command) = cause.install_command() {
-        // The command ends the advisory with nothing after it, so the line
-        // a person copies from the terminal is the command, verbatim.
-        advisory.push_str(&format!(
-            ". Install the classifier's privileged step with:\n  {command}"
-        ));
-    } else {
-        advisory.push('.');
-    }
-    advisory
+/// The refusal a host's user-namespace restriction yields (NET-143): the
+/// wire crate's lead — what the client recognises the refusal by — around
+/// the cause in the words the person reads, then that cause's own remedy
+/// for the daemon on its own line: the install step and the restart it
+/// needs for the AppArmor restriction, the persistent sysctl (or a kernel
+/// with the namespace) when it is switched off.
+fn user_namespace_refusal(restriction: crate::server::UsernsRestriction) -> String {
+    format!(
+        "{}{}), so no box can start here yet.\n{}",
+        minimald_rpc::USER_NAMESPACE_REFUSAL_LEAD,
+        restriction.cause(),
+        restriction.remedy(sandbox::RemedyTarget::Daemon {
+            bin: &crate::server::this_daemon_path(),
+        })
+    )
 }
 
 /// The refusal an own-address create gets on a VM-backed node when it
@@ -536,7 +733,7 @@ fn classifier_advisory_text(cause: classifier::Cause, guest: bool) -> String {
 fn refuse_unhanded_vm_box(
     in_microvm: bool,
     network: minimald_rpc::NetworkMode,
-    box_addresses: Option<&sessions::BoxAddresses>,
+    box_addresses: Option<&boxes::BoxAddresses>,
 ) -> std::io::Result<()> {
     if in_microvm && network == minimald_rpc::NetworkMode::OwnIp && box_addresses.is_none() {
         return Err(std::io::Error::new(
@@ -548,27 +745,32 @@ fn refuse_unhanded_vm_box(
     Ok(())
 }
 
-/// The advisory a create owes the start it answers (NET-079): only when both
-/// halves it is about are true — the daemon is not running inside a microVM,
-/// and the session is a host-address box, whose verdict is the one the
-/// host's cgroup tree decides. In the guest the start-up line and each
-/// launch's own record already say the interim's state, and a guest's
-/// causes name its image's builder rather than anything the person starting
-/// a session could run; an own-address box's verdict is decided on address
-/// leases, so there is no per-box state to advise about. Over a host-address
-/// box on a native host, the advisory is the cause in words —
-/// [`classifier_advisory_text`]'s, the same text the daemon's log line for
-/// an advisory-carrying create carries. Pure over its inputs, so the gate
-/// is pinned where it is written.
+/// The advisory a create owes the start it answers (NET-079): only when
+/// every half it is about is true — the daemon is not running inside a
+/// microVM, the session is a host-address box, whose verdict is the one the
+/// host's cgroup tree decides, and the box declares egress at all. In the
+/// guest the start-up line and each launch's own record already say the
+/// interim's state, and a guest's causes name its image's builder rather
+/// than anything the person starting a session could run; an own-address
+/// box's verdict is decided on address leases, so there is no per-box state
+/// to advise about; and a box that declared nothing asked for no enforcement,
+/// so there is nothing to tell it the host cannot enforce — the host fact
+/// is still recorded on the reply, for `min session policy` to show. Over a
+/// declaring host-address box on a native host, the advisory is
+/// [`classifier::advisory_text`]'s — the same text the daemon's log line for
+/// an advisory-carrying create carries. Pure over its inputs, so the gate is
+/// pinned where it is written.
 fn create_classifier_advisory(
     in_microvm: bool,
     network: minimald_rpc::NetworkMode,
     cause: Option<classifier::Cause>,
+    egress: Option<&boxes::EgressPolicy>,
 ) -> Option<String> {
     if in_microvm || network != minimald_rpc::NetworkMode::HostNet {
         return None;
     }
-    cause.map(|cause| classifier_advisory_text(cause, false))
+    let egress = egress?;
+    cause.map(|cause| classifier::advisory_text(cause, egress))
 }
 
 /// The bind probe over the reserved local range, on the blocking pool —
@@ -589,7 +791,7 @@ async fn run_loopback_probe() -> crate::net::loopback::RangeProbe {
     let probe_fn = crate::net::loopback::session_start_probe;
     #[cfg(not(any(test, feature = "test-support")))]
     let probe_fn = crate::net::loopback::probe;
-    tokio::task::spawn_blocking(probe_fn)
+    crate::traced::spawn_blocking(probe_fn)
         .await
         .unwrap_or_else(|join| {
             tracing::warn!(
@@ -620,6 +822,40 @@ async fn session_start_loopback_probe(session_id: &SessionId) -> crate::net::loo
         "session-start loopback probe picked the publish surface"
     );
     probe
+}
+
+/// The session-start line of a VM-backed daemon (NET-123): the same record
+/// [`session_start_loopback_probe`] writes, over the forwarder's walk of the
+/// host's loopback, with whether this start walked and how many boxes the
+/// landing moved off the `127.0.0.1` interim. Returns the reply's interim
+/// flag.
+#[cfg(target_os = "linux")]
+fn session_start_range_walk_line(
+    session_id: &SessionId,
+    answer: &crate::box_manager::RangeWalkAnswer,
+) -> bool {
+    let probe = &answer.probe;
+    // A walk that got no answer over a present verdict keeps that verdict,
+    // so the box publishes in the range and the surface is the range's.
+    let interim = probe.interim() && !answer.kept_present;
+    let surface = if answer.kept_present {
+        "reserved-range"
+    } else {
+        probe.surface()
+    };
+    tracing::info!(
+        session_id = %session_id,
+        via = "forwarder",
+        walked = answer.walked,
+        moved_off_interim = answer.moved,
+        verdict_kept = answer.kept_present,
+        probe = %probe.summary(),
+        surface = %surface,
+        first_failure = ?probe.first_failure,
+        interim_loopback = interim,
+        "session-start loopback probe picked the publish surface"
+    );
+    interim
 }
 
 /// How long [`log_live_name_surface`] lets the proxy's driver finish
@@ -696,7 +932,7 @@ async fn settled_proxy_port(state: &ServerStateHandle) -> Option<u16> {
 }
 
 /// The answerer control socket's file name, beside the daemon's identity
-/// dir (its provider instance dir) — the native door the answerer's
+/// dir (its host dir) — the native door the answerer's
 /// handover verbs knock on, the counterpart of the VM host daemon's
 /// `control.sock` (its `minvmd` control module's socket of the same
 /// name): one door per daemon, in a dir only this operator (and root)
@@ -721,7 +957,7 @@ const CONTROL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// else: this daemon's boxes register over RPC channels, not over this
 /// door, so every box verb is refused as a wrong-door ask.
 ///
-/// The socket lives in the daemon's identity dir (its provider instance
+/// The socket lives in the daemon's identity dir (its host
 /// dir, the dir its node id is), at [`ANSWERER_CONTROL_SOCK_FILE`], bound
 /// before the answerer's acquisition starts so a control surface is
 /// there whatever the acquisition decides; a daemon with no identity dir
@@ -772,7 +1008,7 @@ pub(crate) async fn spawn_answerer_control(
         std::os::unix::fs::PermissionsExt::from_mode(0o600),
     )?;
     let shutdown = state.shutdown_token().await;
-    tokio::spawn(async move {
+    crate::traced::spawn(async move {
         loop {
             tokio::select! {
                 biased;
@@ -780,7 +1016,7 @@ pub(crate) async fn spawn_answerer_control(
                 accepted = listener.accept() => {
                     let Ok((stream, _)) = accepted else { return };
                     let status = status.clone();
-                    tokio::spawn(serve_answerer_control(stream, status));
+                    crate::traced::spawn(serve_answerer_control(stream, status));
                 }
             }
         }
@@ -851,7 +1087,12 @@ async fn serve_answerer_control(
                 return;
             }
             match request {
-                BoxControlRequest::AnswererStatus => BoxControlReply::Status(status.get()),
+                BoxControlRequest::AnswererStatus => {
+                    BoxControlReply::Status(minimald_rpc::AnswererStatusReply {
+                        answerer: status.get(),
+                        proxy_down: None,
+                    })
+                }
                 BoxControlRequest::ReleaseAnswerer => {
                     let reply = status.release().await;
                     tracing::info!(
@@ -880,9 +1121,24 @@ async fn serve_answerer_control(
                 }
                 BoxControlRequest::Register(_)
                 | BoxControlRequest::Withdraw(_)
+                | BoxControlRequest::HoldBoxName(_)
+                | BoxControlRequest::ReleaseBoxName(_)
+                | BoxControlRequest::AdmitHostIpBox(_)
+                | BoxControlRequest::RetireHostIpBox(_)
                 | BoxControlRequest::AdmitPort(_)
                 | BoxControlRequest::WithdrawPort(_)
-                | BoxControlRequest::ReadRow(_) => BoxControlReply::Error {
+                | BoxControlRequest::ReadRow(_)
+                | BoxControlRequest::AdmitAsk(_)
+                | BoxControlRequest::RecordAskAnswer(_)
+                | BoxControlRequest::SubscribeAsks(_)
+                | BoxControlRequest::ResumeBox(_)
+                | BoxControlRequest::RowStanding(_)
+                | BoxControlRequest::ProxyListening
+                | BoxControlRequest::ProxyPorts
+                | BoxControlRequest::MintBoxId(_)
+                | BoxControlRequest::ReportExposeDecision(_)
+                | BoxControlRequest::ReportRefusedEgress(_)
+                | BoxControlRequest::ListenNotice(_) => BoxControlReply::Error {
                     error: "the native daemon's control socket answers only the answerer \
                             verbs; boxes register over the daemon's RPC channels"
                         .to_string(),
@@ -997,12 +1253,16 @@ async fn serve_configure_loadout(
         .handle_channel(c, async |req: minimald_rpc::ConfigureLoadoutRequest| {
             let mngr = s.sessions_manager().await;
             let handle = mngr
-                .get_session(SessionKeyPredicate::Id(req.session_id))
+                .get_session(BoxKeyPredicate::Id(req.session_id))
                 .await
                 .map_err(|e| ConnectionError::Internal(e.to_string()))?;
             let Some(h) = handle else {
                 return Ok(Errorable::Err {
-                    error: format!("no session with ID `{}`", req.session_id.as_ref()),
+                    error: format!(
+                        "{} `{}`",
+                        minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                        req.session_id.as_ref()
+                    ),
                 });
             };
             Ok(match h.configure_loadout(req.contribution).await {
@@ -1021,8 +1281,8 @@ async fn serve_configure_loadout(
 /// `SubmitVerdict`: the client's per-item decisions for a `Pending`
 /// session. Resolves the session's live actor and routes the verdict
 /// to it; the actor runs `resume_from_verdict` and promotes its
-/// record `Pending → Active`. Replies with `Errorable::Ok(SessionStep)`
-/// where the `SessionStep` is `Active { id }` on success or
+/// record `Pending → Active`. Replies with `Errorable::Ok(BoxStep)`
+/// where the `BoxStep` is `Active { id }` on success or
 /// `Fault { error }` for a structured failure. A verdict for an id
 /// with no live session — including an actor that died between
 /// resolve and delivery — maps to `Fault { UnknownSessionId }` here;
@@ -1032,29 +1292,26 @@ async fn serve_submit_verdict(
     c: RuChannel<Msg>,
 ) -> Result<(), ConnectionError> {
     SubmitVerdict
-        .handle_channel(
-            c,
-            async |req: sessions::wire::request::ContributionVerdict| {
-                let mngr = s.sessions_manager().await;
-                let unknown = || {
-                    Errorable::Ok(sessions::wire::request::SessionStep::Fault {
-                        error: sessions::wire::errors::WireError::UnknownSessionId,
-                    })
-                };
-                let handle = mngr
-                    .get_session(SessionKeyPredicate::Id(req.session_id))
-                    .await
-                    .map_err(|e| ConnectionError::Internal(e.to_string()))?;
-                match handle {
-                    None => Ok(unknown()),
-                    Some(h) => match h.submit_verdict(req).await {
-                        Ok(step) => Ok(Errorable::Ok(step)),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotConnected => Ok(unknown()),
-                        Err(e) => Err(ConnectionError::Internal(e.to_string())),
-                    },
-                }
-            },
-        )
+        .handle_channel(c, async |req: boxes::wire::request::ContributionVerdict| {
+            let mngr = s.sessions_manager().await;
+            let unknown = || {
+                Errorable::Ok(boxes::wire::request::BoxStep::Fault {
+                    error: boxes::wire::errors::WireError::UnknownSessionId,
+                })
+            };
+            let handle = mngr
+                .get_session(BoxKeyPredicate::Id(req.session_id))
+                .await
+                .map_err(|e| ConnectionError::Internal(e.to_string()))?;
+            match handle {
+                None => Ok(unknown()),
+                Some(h) => match h.submit_verdict(req).await {
+                    Ok(step) => Ok(Errorable::Ok(step)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotConnected => Ok(unknown()),
+                    Err(e) => Err(ConnectionError::Internal(e.to_string())),
+                },
+            }
+        })
         .await
 }
 
@@ -1071,22 +1328,48 @@ async fn serve_finalize_session(
         .handle_channel(c, async |req| {
             let mngr = s.sessions_manager().await;
             let handle = mngr
-                .get_session(SessionKeyPredicate::Id(req.session_id))
+                .get_session(BoxKeyPredicate::Id(req.session_id))
                 .await
                 .map_err(|e| ConnectionError::Internal(e.to_string()))?;
             let Some(h) = handle else {
                 return Ok(Errorable::Err {
-                    error: format!("no session with ID `{}`", req.session_id.as_ref()),
+                    error: format!(
+                        "{} `{}`",
+                        minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                        req.session_id.as_ref()
+                    ),
                 });
             };
             Ok(match h.finalize().await {
-                Ok(activate_hooks) => Errorable::Ok(FinalizeSessionResponse { activate_hooks }),
+                Ok(mut response) => {
+                    // The reply is `deny_unknown_fields`, so a client that
+                    // did not ask for the yielded ports would refuse a reply
+                    // naming them and abort its activation: only a client
+                    // that asked gets the list (the yield itself stands).
+                    if !req.report_shared_port_collisions {
+                        response.shared_port_collisions.clear();
+                    }
+                    Errorable::Ok(response)
+                }
                 Err(e) => Errorable::Err {
                     error: e.to_string(),
                 },
             })
         })
         .await
+}
+
+/// The wire refusal of a create whose name a running box holds
+/// (BOX-163), when the manager's `AlreadyExists` carries its holder.
+fn held_name_refusal(error: &std::io::Error) -> Option<minimald_rpc::HeldNameRefusal> {
+    let refusal = error
+        .get_ref()?
+        .downcast_ref::<crate::box_manager::HeldNameRefusal>()?;
+    Some(minimald_rpc::HeldNameRefusal {
+        name: refusal.name.clone(),
+        holder: Some(refusal.holder),
+        holder_name: refusal.holder_name.clone(),
+    })
 }
 
 /// `RenameSession`: resolves the session's actor (spinning it up from
@@ -1103,12 +1386,16 @@ async fn serve_rename_session(
                 match s
                     .sessions_manager()
                     .await
-                    .get_session(SessionKeyPredicate::Id(req.id))
+                    .get_session(BoxKeyPredicate::Id(req.id))
                     .await?
                 {
                     None => Err(std::io::Error::new(
                         std::io::ErrorKind::NotFound,
-                        format!("no session with ID `{}`", req.id.as_ref()),
+                        format!(
+                            "{} `{}`",
+                            minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                            req.id.as_ref()
+                        ),
                     )),
                     Some(h) => h.rename(req.new_name).await,
                 }
@@ -1120,6 +1407,107 @@ async fn serve_rename_session(
                     error: e.to_string(),
                 }),
             }
+        })
+        .await
+}
+
+/// `StopBox`: stops the running box and keeps its record (BOX-013,
+/// BOX-018). Answers how the box ended, as the record now stores it.
+async fn serve_stop_box(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), ConnectionError> {
+    minimald_rpc::StopBox
+        .handle_channel(c, async |req: minimald_rpc::StopBoxRequest| {
+            let mngr = s.sessions_manager().await;
+            match mngr.stop_box(req.id, req.force).await {
+                Ok(ending) => {
+                    let state = boxes::core::record::RecordState::Stopped(ending);
+                    tracing::info!(
+                        session_id = %req.id,
+                        force = req.force,
+                        exit_code = state.exit_code(),
+                        signal = state.signal(),
+                        "session stopped"
+                    );
+                    Ok(Errorable::Ok(minimald_rpc::StopBoxResponse {
+                        exit_code: state.exit_code(),
+                        signal: state.signal(),
+                    }))
+                }
+                Err(e) => Ok(Errorable::Err {
+                    error: e.to_string(),
+                }),
+            }
+        })
+        .await
+}
+
+/// `ReapBox`: deletes one box's record, events and files (BOX-019,
+/// BOX-045). A running box is refused unless the request forces the reap.
+async fn serve_reap_box(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), ConnectionError> {
+    minimald_rpc::ReapBox
+        .handle_channel(c, async |req: minimald_rpc::ReapBoxRequest| {
+            let mngr = s.sessions_manager().await;
+            Ok(match mngr.reap_box(req.id, req.force).await {
+                Ok(reply) => Errorable::Ok(reply),
+                Err(e) => Errorable::Err {
+                    error: e.to_string(),
+                },
+            })
+        })
+        .await
+}
+
+/// `PruneBoxes`: reaps every stopped or exited box that matches the
+/// request's selectors, and answers with what it reaped (BOX-021).
+async fn serve_prune_boxes(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), ConnectionError> {
+    minimald_rpc::PruneBoxes
+        .handle_channel(c, async |req: minimald_rpc::PruneBoxesRequest| {
+            let mngr = s.sessions_manager().await;
+            let older_than = req.older_than_secs.map(std::time::Duration::from_secs);
+            Ok(match mngr.prune_boxes(older_than, req.parent).await {
+                Ok(reply) => Errorable::Ok(reply),
+                Err(e) => Errorable::Err {
+                    error: format!("The stopped and exited boxes were not removed: {e}"),
+                },
+            })
+        })
+        .await
+}
+
+/// `ListBoxes`: every retained box record on this host, in any state,
+/// optionally scoped to one project root (BOX-158).
+async fn serve_list_boxes(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), ConnectionError> {
+    minimald_rpc::ListBoxes
+        .handle_channel(c, async |req: minimald_rpc::ListBoxesRequest| {
+            let mngr = s.sessions_manager().await;
+            Ok(match mngr.list_boxes(req.project_root.as_ref()).await {
+                Ok(boxes) => Errorable::Ok(minimald_rpc::ListBoxesResponse { boxes }),
+                Err(e) => Errorable::Err {
+                    error: format!("The box records could not be read: {e}"),
+                },
+            })
+        })
+        .await
+}
+
+/// `ShowBox`: one box record with its state, identity and live execs
+/// (BOX-159).
+async fn serve_show_box(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), ConnectionError> {
+    minimald_rpc::ShowBox
+        .handle_channel(c, async |req: minimald_rpc::ShowBoxRequest| {
+            let mngr = s.sessions_manager().await;
+            Ok(match mngr.show_box(req.id).await {
+                Ok(Some(reply)) => Errorable::Ok(reply),
+                Ok(None) => Errorable::Err {
+                    error: format!(
+                        "{} `{}`",
+                        minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                        req.id.as_ref()
+                    ),
+                },
+                Err(e) => Errorable::Err {
+                    error: format!("The box record could not be read: {e}"),
+                },
+            })
         })
         .await
 }
@@ -1137,19 +1525,38 @@ async fn serve_destroy_session(
             // lookup degrades to the anonymous stand-in rather than failing
             // a destroy that would otherwise succeed.
             let session_name = mngr
-                .get_record(SessionKeyPredicate::Id(req.id))
+                .get_record(BoxKeyPredicate::Id(req.id))
                 .await
                 .ok()
                 .flatten()
                 .and_then(|record| record.name);
-            match mngr.delete_session(req.id).await {
-                Ok(()) => {
+            let outcome = if req.only_if_unfinalized {
+                mngr.delete_session_if_unfinalized(req.id).await
+            } else {
+                mngr.delete_session(req.id).await.map(Some)
+            };
+            match outcome {
+                Ok(Some(hook_failures)) => {
                     tracing::info!(
                         session_id = %req.id,
                         session_name = session_name.as_deref().unwrap_or(ANONYMOUS_SESSION),
                         "session destroyed"
                     );
-                    Ok(Errorable::Ok(DestroySessionResponse))
+                    Ok(Errorable::Ok(DestroySessionResponse {
+                        hook_failures,
+                        kept: false,
+                    }))
+                }
+                Ok(None) => {
+                    tracing::info!(
+                        session_id = %req.id,
+                        session_name = session_name.as_deref().unwrap_or(ANONYMOUS_SESSION),
+                        "kept the session a cleanup destroy was sent for: it finished activating"
+                    );
+                    Ok(Errorable::Ok(DestroySessionResponse {
+                        hook_failures: Vec::new(),
+                        kept: true,
+                    }))
                 }
                 Err(e) => Ok(Errorable::Err {
                     error: e.to_string(),
@@ -1165,18 +1572,15 @@ async fn serve_shutdown(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), C
             let mngr = s.sessions_manager().await;
             Ok(match mngr.shutdown(req.force).await {
                 Ok(()) => {
-                    // Close the file log first (both the native daemon and the
-                    // microVM): it flushes buffered records, and in the
-                    // microVM its write-open fd under the mountpoint would
-                    // otherwise defeat the clean unmount below. Records still
-                    // reach the console. A no-op for a foreground run.
-                    s.release_log().await;
-                    // R2.1/R2.2: with the sessions drained, quiesce the state
-                    // volume (syncfs + detach) before acknowledging, so a
-                    // caller-driven VMM teardown right after the ack leaves a
-                    // clean ext4 journal. Best-effort with a bounded wait; the
-                    // journal replay backstop covers every failure arm.
-                    quiesce_state_volume_if_mounted(&s).await;
+                    // With the sessions drained, run the clean-stop steps in
+                    // their fixed order (see [`clean_stop_steps`]): every fd
+                    // the daemon holds write-open under the state volume is
+                    // closed before the quiesce, so a caller-driven VMM
+                    // teardown right after the ack leaves a clean ext4
+                    // journal.
+                    for step in clean_stop_steps(s.state_volume_mounted().await) {
+                        run_clean_stop_step(&s, step).await;
+                    }
                     // Manager is down; tell the accept loop to stop and drain
                     // so the process can exit. Firing before the response is
                     // written is safe: the drain waits out the grace period,
@@ -1188,6 +1592,86 @@ async fn serve_shutdown(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), C
             })
         })
         .await
+}
+
+/// One step of the clean stop the `Shutdown` handler runs once its sessions
+/// have drained. [`clean_stop_steps`] decides which run and in what order;
+/// [`run_clean_stop_step`] runs one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CleanStopStep {
+    /// Close the file log (both the native daemon and the microVM): it flushes
+    /// buffered records, and in the microVM its write-open fd under the
+    /// mountpoint would otherwise defeat the read-only remount. Records still
+    /// reach the console. A no-op for a foreground run.
+    ReleaseLog,
+    /// Export the telemetry recorded so far, bounded by
+    /// [`CLEAN_STOP_TELEMETRY_FLUSH`]. Before the ack, because `minvmd stop`
+    /// SIGTERMs the VMM as soon as the ack arrives, so the guest's exit-time
+    /// flush in `main` rarely gets to run. Non-terminal: what follows (the
+    /// Shutdown span itself) still goes out with that exit-time flush when it
+    /// does run. Before [`CleanStopStep::ReleaseSpool`], so records the flush
+    /// emits are still spooled.
+    FlushTelemetry,
+    /// Close the telemetry spool's file and stop spooling: the spool lives on
+    /// the state volume (`<state>/telemetry/spool`), and its write-open fd
+    /// would defeat the read-only remount exactly as the file log's would.
+    /// Records after this point are dropped, as a spool with no directory yet
+    /// drops them.
+    ReleaseSpool,
+    /// R2.1/R2.2: quiesce the state volume (syncfs, read-only remount, trim,
+    /// detach). Best-effort with a bounded wait; the journal replay backstop
+    /// covers every failure arm.
+    QuiesceVolume,
+}
+
+/// Bound on the clean stop's telemetry flush. It delays the ack, and with it
+/// every `minvmd stop`, by at most this much when the collector is slow or
+/// down. Short, because every stop pays it while a reachable collector
+/// answers in a few hundred milliseconds; the exit-time flush in `main`
+/// keeps its 5 s bound.
+const CLEAN_STOP_TELEMETRY_FLUSH: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// The clean-stop steps, in order, for a daemon that did (or did not) mount
+/// the state volume itself.
+///
+/// The order is the contract: everything that holds a write-open fd under
+/// the state volume (the file log, the telemetry spool) is released before
+/// the quiesce, or the read-only remount fails and the journal stays dirty.
+/// Only the microVM guest (the daemon that mounted the volume) flushes before
+/// the ack, since only its process is torn down right after it. A daemon that
+/// mounted no volume keeps its spool: nothing is quiesced, and the records up
+/// to its exit still spool.
+fn clean_stop_steps(volume_mounted: bool) -> Vec<CleanStopStep> {
+    let mut steps = vec![CleanStopStep::ReleaseLog];
+    if volume_mounted {
+        steps.push(CleanStopStep::FlushTelemetry);
+        steps.push(CleanStopStep::ReleaseSpool);
+        steps.push(CleanStopStep::QuiesceVolume);
+    }
+    steps
+}
+
+/// Runs one [`CleanStopStep`]. None fails the stop: each is best-effort.
+async fn run_clean_stop_step(s: &ServerStateHandle, step: CleanStopStep) {
+    match step {
+        CleanStopStep::ReleaseLog => s.release_log().await,
+        CleanStopStep::FlushTelemetry => flush_telemetry_for_clean_stop().await,
+        CleanStopStep::ReleaseSpool => mlog::otel::release_spool(),
+        CleanStopStep::QuiesceVolume => quiesce_state_volume_if_mounted(s).await,
+    }
+}
+
+/// Flushes telemetry on the blocking pool, since the flush blocks its thread
+/// for up to [`CLEAN_STOP_TELEMETRY_FLUSH`]. The handler stops waiting shortly
+/// after that bound even if the flush thread is still stuck in the exporter.
+async fn flush_telemetry_for_clean_stop() {
+    let flush = crate::traced::spawn_blocking(|| mlog::otel::flush(CLEAN_STOP_TELEMETRY_FLUSH));
+    let ceiling = CLEAN_STOP_TELEMETRY_FLUSH + std::time::Duration::from_millis(500);
+    match tokio::time::timeout(ceiling, flush).await {
+        Ok(Ok(())) => {}
+        Ok(Err(join)) => tracing::warn!(error = %join, "telemetry flush task panicked"),
+        Err(_) => tracing::warn!("telemetry flush outlived its bound; proceeding"),
+    }
 }
 
 /// Quiesce the guest state volume during shutdown (R2.2). No-op unless the
@@ -1206,10 +1690,10 @@ async fn quiesce_state_volume_if_mounted(s: &ServerStateHandle) {
     if !s.state_volume_mounted().await {
         return;
     }
-    // The file log was already released by the shutdown handler, so its fd no
-    // longer holds the mountpoint busy.
+    // The file log and the telemetry spool were already released by the
+    // shutdown handler, so their fds no longer hold the mountpoint busy.
     let mountpoint = s.minimal_state_dir().await;
-    let quiesce = tokio::task::spawn_blocking(move || {
+    let quiesce = crate::traced::spawn_blocking(move || {
         crate::guest::quiesce_state_volume(mountpoint.as_utf8_path().as_str())
     });
     match tokio::time::timeout(QUIESCE_TIMEOUT, quiesce).await {
@@ -1239,12 +1723,16 @@ async fn serve_abort_session(
                 match s
                     .sessions_manager()
                     .await
-                    .get_session(SessionKeyPredicate::Id(req.id))
+                    .get_session(BoxKeyPredicate::Id(req.id))
                     .await?
                 {
                     None => Err(std::io::Error::new(
                         std::io::ErrorKind::NotFound,
-                        format!("no session with ID `{}`", req.id.as_ref()),
+                        format!(
+                            "{} `{}`",
+                            minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                            req.id.as_ref()
+                        ),
                     )),
                     Some(h) => h.abort().await,
                 }
@@ -1268,8 +1756,8 @@ async fn serve_get_session_policy(
         .handle_channel(c, async |req| {
             let mngr = s.sessions_manager().await;
             let predicate = match req {
-                GetSessionPolicyRequest::Id(id) => SessionKeyPredicate::Id(id),
-                GetSessionPolicyRequest::Name(name) => SessionKeyPredicate::Name(name),
+                GetSessionPolicyRequest::Id(id) => BoxKeyPredicate::Id(id),
+                GetSessionPolicyRequest::Name(name) => BoxKeyPredicate::Name(name),
             };
             let record = mngr
                 .get_record(predicate)
@@ -1289,26 +1777,31 @@ async fn serve_get_session_policy(
 
 /// The `GetEffectiveSessionPolicy` reply for one record's policy and network
 /// mode: the egress half resolved to what the gate enforces, the ingress half
-/// verbatim. NET-079's enforcement state answers beside this reply, over
-/// `GetSessionRuntimeFacts` — never as a field here, because the policy
-/// struct is `deny_unknown_fields`: an older `min` rejects a key it has no
-/// field for, so a fact that did not exist when that client was built must
-/// ride its own reply or the rules stop reading at all.
-/// `phase` is the rollout
-/// phase to resolve under — the handler serves
-/// [`sessions::EGRESS_DEFAULT_PHASE`], the phase this build ships, while the
-/// tests pass [`sessions::EgressDefaultPhase::InForce`] so the deny-all
-/// posture the rollout ends at stays proven while the default is only
-/// announced (NET-076).
+/// verbatim, and the credentialed-upstream lane (NET-134) verbatim.
+///
+/// The reply rule: the policy struct is `deny_unknown_fields`, so an older
+/// `min` rejects a key it has no field for. A field that changes what the
+/// box can reach goes in this strict reply, so an older `min` fails visibly
+/// instead of under-reporting the box's reach — the lane is such a field,
+/// and `min session policy` reads no other reply that carries it.
+/// Descriptive state — NET-079's enforcement state among it — never rides
+/// here: it answers beside this reply, over `GetSessionRuntimeFacts`, so an
+/// older client keeps reading the rules.
+///
+/// `phase` is the rollout phase to resolve under — the handler serves
+/// [`boxes::EGRESS_DEFAULT_PHASE`], the phase this build ships, and the
+/// tests name [`boxes::EgressDefaultPhase::InForce`] so the deny-all
+/// posture they prove does not hang on that constant.
 pub(crate) fn effective_policy_reply(
-    policy: &sessions::SessionPolicy,
-    network: sessions::NetworkMode,
-    phase: sessions::EgressDefaultPhase,
+    policy: &boxes::BoxPolicy,
+    network: boxes::NetworkMode,
+    phase: boxes::EgressDefaultPhase,
     opt_out: bool,
-) -> minimald_rpc::EffectiveSessionPolicy {
-    minimald_rpc::EffectiveSessionPolicy {
-        egress: sessions::effective_egress(policy.egress.as_ref(), network, phase, opt_out),
+) -> minimald_rpc::EffectiveBoxPolicy {
+    minimald_rpc::EffectiveBoxPolicy {
+        egress: boxes::effective_egress(policy.egress.as_ref(), network, phase, opt_out),
         ingress: policy.ingress.clone(),
+        credentialed_upstream: policy.credentialed_upstream.clone(),
     }
 }
 
@@ -1318,12 +1811,15 @@ pub(crate) fn effective_policy_reply(
 ///
 /// Resolved here rather than in the client because the inputs are this
 /// daemon's own facts: the rollout phase its build ships
-/// ([`sessions::EGRESS_DEFAULT_PHASE`]) and its opt-out flag (NET-077). An
-/// own-address box with no `egress` section answers `deny_all` once the
-/// default is in force (NET-074) and `allow_all` behind the opt-out or while
-/// the default is only announced; a declared section answers verbatim; the
-/// strict declaration the record holds is never rewritten to say any of
-/// this.
+/// ([`boxes::EGRESS_DEFAULT_PHASE`]) and its opt-out flag (NET-077). An
+/// own-address box with no `egress` section answers `deny_all` with the
+/// default in force (NET-074) and `allow_all` behind the opt-out; a declared
+/// section answers as the gate resolves it — the lists it declared
+/// verbatim, and under the in-force default, on a box of any network mode,
+/// a destination list it left absent present and empty, the wire meaning
+/// being "what this box is held to", never "what it wrote"; the strict
+/// declaration the record holds is never rewritten to say any of this, and
+/// `GetSessionPolicy` is the reply that echoes it.
 async fn serve_get_effective_session_policy(
     s: ServerStateHandle,
     c: RuChannel<Msg>,
@@ -1333,8 +1829,8 @@ async fn serve_get_effective_session_policy(
             let opt_out = s.deny_all_opt_out().await;
             let mngr = s.sessions_manager().await;
             let predicate = match req {
-                GetEffectiveSessionPolicyRequest::Id(id) => SessionKeyPredicate::Id(id),
-                GetEffectiveSessionPolicyRequest::Name(name) => SessionKeyPredicate::Name(name),
+                GetEffectiveSessionPolicyRequest::Id(id) => BoxKeyPredicate::Id(id),
+                GetEffectiveSessionPolicyRequest::Name(name) => BoxKeyPredicate::Name(name),
             };
             let record = mngr
                 .get_record(predicate)
@@ -1355,7 +1851,7 @@ async fn serve_get_effective_session_policy(
                     Ok(Errorable::Ok(effective_policy_reply(
                         &record.policy,
                         record.network,
-                        sessions::EGRESS_DEFAULT_PHASE,
+                        boxes::EGRESS_DEFAULT_PHASE,
                         opt_out,
                     )))
                 }
@@ -1370,21 +1866,18 @@ async fn serve_get_effective_session_policy(
 /// permitted.
 ///
 /// The live actor's own state, so this resolves the session where the policy
-/// RPCs read the record: [`Manager::get_session`] brings a known session's
+/// RPCs read the record: [`BoxManager::get_session`] brings a known session's
 /// actor up if it has none running, and an actor holding no host answers an
 /// empty list — the honest answer for a box that is not running, since a
 /// publish lives only while its box does.
 ///
-/// Each row's reachability state is filled here, at read time, from the same
-/// set the box's relay gate was compiled from — the declared ports
-/// [`declared_ingress_ports`] — because it is a fact about the box, not about
-/// the bind: a runtime-published port is bound on the host at once, but the
-/// frame only reaches the box through the relay gate its attach installed,
-/// and that gate admits the ports the *declaration* named. So a runtime
-/// publish reads `pending` until the gate's admitted set grows to include
-/// runtime-published ports, and a publish of a port the declaration already
-/// names — the one overlap — is not pending, because the declared forward is
-/// what answers at that address.
+/// Every row reads not pending: a runtime publish admits its port at the
+/// box's relay gate in the same turn it records the mapping (NET-044), so a
+/// listed publish is reachable. The `pending` field stays on the wire so a
+/// client can still tell this daemon's rows from an older daemon's. The
+/// listen watcher's rows — the in-range listens the box's `allow` stance
+/// published — follow the exposes' rows, reachable too: the watcher admits
+/// each port at the gate as its publish's last step.
 async fn serve_get_live_ingress(
     s: ServerStateHandle,
     c: RuChannel<Msg>,
@@ -1393,8 +1886,8 @@ async fn serve_get_live_ingress(
         .handle_channel(c, async |req| {
             let mngr = s.sessions_manager().await;
             let predicate = match req {
-                minimald_rpc::GetLiveIngressRequest::Id(id) => SessionKeyPredicate::Id(id),
-                minimald_rpc::GetLiveIngressRequest::Name(name) => SessionKeyPredicate::Name(name),
+                minimald_rpc::GetLiveIngressRequest::Id(id) => BoxKeyPredicate::Id(id),
+                minimald_rpc::GetLiveIngressRequest::Name(name) => BoxKeyPredicate::Name(name),
             };
             let session = mngr
                 .get_session(predicate)
@@ -1404,37 +1897,19 @@ async fn serve_get_live_ingress(
                 None => Ok(Errorable::Err {
                     error: "no session found".to_string(),
                 }),
-                Some(session) => {
-                    // The admitted set the gate is compiled from, per
-                    // mapping's transport — an unreadable record reads as
-                    // "nothing admitted", so its mappings all read pending: a
-                    // row is reachable only when the gate is known to admit
-                    // it.
-                    let record = session.record().await.ok();
-                    let policy = record.as_ref().map(|record| &record.policy);
-                    match session.live_ingress().await {
-                        Ok(live) => Ok(Errorable::Ok(
-                            live.into_iter()
-                                .map(|mut mapping| {
-                                    let admitted = crate::net::switch::declared_ingress_ports(
-                                        policy,
-                                        mapping.proto,
-                                    );
-                                    // The daemon knows the state, so it says
-                                    // it: `Some`, never the unknown a reply
-                                    // from a daemon older than the field
-                                    // decodes as.
-                                    mapping.pending =
-                                        Some(!admitted.contains(&mapping.internal_port));
-                                    mapping
-                                })
-                                .collect(),
-                        )),
-                        Err(e) => Ok(Errorable::Err {
-                            error: e.to_string(),
-                        }),
-                    }
-                }
+                Some(session) => match session.live_ingress().await {
+                    // The actor's own rows, `pending: Some(false)` each: the
+                    // publish admitted the port when it recorded the row. The
+                    // listen watcher's rows follow the exposes' as they
+                    // stand: the gate admitted each one as its publish's
+                    // last step.
+                    Ok(live) => Ok(Errorable::Ok(
+                        live.exposed.into_iter().chain(live.listened).collect(),
+                    )),
+                    Err(e) => Ok(Errorable::Err {
+                        error: e.to_string(),
+                    }),
+                },
             }
         })
         .await
@@ -1463,8 +1938,8 @@ async fn serve_get_session_runtime_facts(
         .handle_channel(c, async |req| {
             let mngr = s.sessions_manager().await;
             let predicate = match req {
-                GetSessionRuntimeFactsRequest::Id(id) => SessionKeyPredicate::Id(id),
-                GetSessionRuntimeFactsRequest::Name(name) => SessionKeyPredicate::Name(name),
+                GetSessionRuntimeFactsRequest::Id(id) => BoxKeyPredicate::Id(id),
+                GetSessionRuntimeFactsRequest::Name(name) => BoxKeyPredicate::Name(name),
             };
             let record = mngr
                 .get_record(predicate)
@@ -1475,16 +1950,53 @@ async fn serve_get_session_runtime_facts(
                     error: "no session found".to_string(),
                 }),
                 Some(record) => {
-                    let host_ip_enforcement = crate::session_host::displayed_host_ip_enforcement(
+                    let host_ip_enforcement = crate::box_runtime::displayed_host_ip_enforcement(
                         s.in_microvm().await,
                         record.network,
                         classifier::verdict_of(record.policy.egress.as_ref()),
-                        &crate::session_host::host_ip_enforcement_fact(),
+                        &crate::box_runtime::host_ip_enforcement_fact(),
                         record.host_ip_enforcement,
                     );
-                    Ok(Errorable::Ok(minimald_rpc::SessionRuntimeFacts {
+                    // The listen publishes the audit log refused (NET-046):
+                    // a watcher-driven publish has no caller to answer, so
+                    // the live actor's set is read here and `min session
+                    // policy` warns per port. A session whose actor cannot
+                    // answer has no watcher running, and nothing to warn
+                    // about.
+                    let unaudited_listen_ports =
+                        match mngr.get_session(BoxKeyPredicate::Id(record.id)).await {
+                            Ok(Some(session)) => session
+                                .live_ingress()
+                                .await
+                                .map(|live| live.unaudited_listen_ports)
+                                .unwrap_or_default(),
+                            Ok(None) | Err(_) => Vec::new(),
+                        };
+                    let audit_log = if unaudited_listen_ports.is_empty() {
+                        None
+                    } else {
+                        let state_dir = s.minimal_state_dir().await;
+                        Some(
+                            crate::audit::log_path(state_dir.as_utf8_path().as_std_path())
+                                .display()
+                                .to_string(),
+                        )
+                    };
+                    // The ports this box's attach yields because a sibling at
+                    // the same shared loopback address holds them (first-come):
+                    // the same registry record the attach path reads to skip
+                    // those forwards, surfaced so the policy view can mark the
+                    // declared rows that are served elsewhere. Empty for every
+                    // mode but a shared-address own-ip box — and read behind
+                    // the registry's lock, a plain map lookup, so it never
+                    // holds up the reply.
+                    let shared_port_collisions = shared_port_collisions_of(&mngr, record.id);
+                    Ok(Errorable::Ok(minimald_rpc::BoxRuntimeFacts {
                         id: record.id,
                         host_ip_enforcement,
+                        unaudited_listen_ports,
+                        audit_log,
+                        shared_port_collisions,
                     }))
                 }
             }
@@ -1508,8 +2020,8 @@ async fn serve_get_session_hooks(
         .handle_channel(c, async |req| {
             let mngr = s.sessions_manager().await;
             let predicate = match req {
-                minimald_rpc::GetSessionHooksRequest::Id(id) => SessionKeyPredicate::Id(id),
-                minimald_rpc::GetSessionHooksRequest::Name(name) => SessionKeyPredicate::Name(name),
+                minimald_rpc::GetSessionHooksRequest::Id(id) => BoxKeyPredicate::Id(id),
+                minimald_rpc::GetSessionHooksRequest::Name(name) => BoxKeyPredicate::Name(name),
             };
             // The record first, only to tell "no such session" from "a
             // session with nothing recorded" — both of which the
@@ -1557,7 +2069,7 @@ async fn serve_session_delta(
 ) -> Result<(), ConnectionError> {
     SessionDelta
         .handle_channel(c, async |req: SessionDeltaRequest| {
-            let predicate = SessionKeyPredicate::Id(req.id);
+            let predicate = BoxKeyPredicate::Id(req.id);
             Ok(
                 match s.sessions_manager().await.get_session(predicate).await {
                     Ok(Some(h)) => h.workspace_at_risk().await,
@@ -1580,7 +2092,7 @@ async fn serve_get_session_screen(
         .handle_channel(c, async |id| {
             let mngr = s.sessions_manager().await;
             let snapshot = mngr
-                .get_screen(SessionKeyPredicate::Id(id))
+                .get_screen(BoxKeyPredicate::Id(id))
                 .await
                 .map_err(|e| ConnectionError::Internal(e.to_string()))?;
             Ok(match snapshot {
@@ -1700,6 +2212,286 @@ async fn write_update(
     Ok(())
 }
 
+/// Serves [`READ_EVENTS_SUBSYSTEM`](minimald_rpc::READ_EVENTS_SUBSYSTEM):
+/// one box's retained events in the order they were written, then, for a
+/// follower, each new one until the box is reaped or the client closes
+/// the channel (BOX-162). A refusal before the first event, such as an
+/// unknown id, leaves the payload stream empty and says why on extended
+/// data, the same split as [`serve_clean_cache`].
+async fn serve_read_events(
+    s: ServerStateHandle,
+    mut c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    match read_events_stream(&s, &mut c).await {
+        Ok(()) => {
+            // A follower that closed its side is already gone: the close
+            // it answers is best-effort.
+            let _ = c.eof().await;
+            let _ = c.close().await;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = c.extended_data_bytes(1, e.to_string()).await;
+            let _ = c.close().await;
+            Err(e)
+        }
+    }
+}
+
+/// Reads the request, then streams the box's events. The `Err` arm is for
+/// a refusal before the first event, and for a channel that breaks.
+async fn read_events_stream(
+    s: &ServerStateHandle,
+    c: &mut RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    use minimald_rpc::{ReadEventsRequest, ReadEventsUpdate};
+
+    let req: ReadEventsRequest = read_channel_request(c).await?;
+    let mut reader = match s.sessions_manager().await.box_events(req.id).await {
+        Ok(reader) => reader,
+        Err(e) => {
+            tracing::info!(
+                box_id = %req.id,
+                follow = req.follow,
+                refusal = %e,
+                "refused a read of a box's events"
+            );
+            return Err(ConnectionError::Internal(e.to_string()));
+        }
+    };
+    tracing::info!(box_id = %req.id, follow = req.follow, "reading a box's events");
+
+    let failed = |e: std::io::Error| {
+        tracing::warn!(box_id = %req.id, error = %e, "a read of a box's events failed");
+        ReadEventsUpdate::Failed {
+            error: format!("the events of box {} could not be read: {e}", req.id),
+        }
+    };
+    match reader.read_new() {
+        Ok(events) => {
+            for event in events {
+                write_events_update(c, &ReadEventsUpdate::Event { event }).await?;
+            }
+        }
+        Err(e) => return write_events_update(c, &failed(e)).await,
+    }
+    if !req.follow {
+        return write_events_update(c, &ReadEventsUpdate::Done).await;
+    }
+    loop {
+        tokio::select! {
+            next = reader.next_events() => match next {
+                Ok(Some(events)) => {
+                    for event in events {
+                        write_events_update(c, &ReadEventsUpdate::Event { event }).await?;
+                    }
+                }
+                Ok(None) => {
+                    tracing::info!(box_id = %req.id, "a followed box was reaped; ending the read");
+                    return write_events_update(c, &ReadEventsUpdate::Reaped).await;
+                }
+                Err(e) => return write_events_update(c, &failed(e)).await,
+            },
+            msg = c.wait() => match msg {
+                None | Some(russh::ChannelMsg::Close) => {
+                    tracing::info!(box_id = %req.id, "the reader closed a followed read of a box's events");
+                    return Ok(());
+                }
+                Some(_) => {}
+            },
+        }
+    }
+}
+
+/// Writes one newline-delimited JSON events update.
+async fn write_events_update(
+    c: &mut RuChannel<Msg>,
+    update: &minimald_rpc::ReadEventsUpdate,
+) -> Result<(), ConnectionError> {
+    let mut line = serde_json_lenient::to_vec(update)?;
+    line.push(b'\n');
+    c.data_bytes(line).await?;
+    Ok(())
+}
+
+/// The most bytes of a box's log one `Output` line carries.
+const LOG_CHUNK: usize = 64 * 1024;
+
+/// How often a followed read of a box's log looks for new output and for
+/// the box's reap. The host appends to the log with no wake-up to send.
+const LOG_FOLLOW_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Serves [`READ_LOG_SUBSYSTEM`](minimald_rpc::READ_LOG_SUBSYSTEM): one
+/// box's output log from the requested byte, then, for a follower, each new
+/// chunk until the box is reaped or the client closes the channel
+/// (BOX-155). The log is found by the box's id alone, so a stopped box's
+/// log reads the same as a running one's. A refusal before the first chunk,
+/// such as an unknown id, leaves the payload stream empty and says why on
+/// extended data, the same split as [`serve_read_events`].
+async fn serve_read_log(
+    s: ServerStateHandle,
+    mut c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    match read_log_stream(&s, &mut c).await {
+        Ok(()) => {
+            let _ = c.eof().await;
+            let _ = c.close().await;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = c.extended_data_bytes(1, e.to_string()).await;
+            let _ = c.close().await;
+            Err(e)
+        }
+    }
+}
+
+/// Reads the request, then streams the box's log. The `Err` arm is for a
+/// refusal before the first chunk, and for a channel that breaks.
+async fn read_log_stream(
+    s: &ServerStateHandle,
+    c: &mut RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    use minimald_rpc::{ReadLogRequest, ReadLogUpdate};
+
+    let req: ReadLogRequest = read_channel_request(c).await?;
+    let state_dir = s.minimal_state_dir().await;
+    let refuse = |refusal: String| {
+        tracing::info!(
+            box_id = %req.id,
+            follow = req.follow,
+            refusal = %refusal,
+            "refused a read of a box's log"
+        );
+        ConnectionError::Internal(refusal)
+    };
+    // The store calls below are blocking file reads. Each runs on the
+    // blocking pool, so a slow disk does not hold a runtime worker.
+    let found = {
+        let id = req.id;
+        crate::traced::spawn_blocking(move || boxes::store::BoxDir::find(&state_dir, &id))
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+    };
+    let dir = match found {
+        Ok(Some(dir)) => dir,
+        Ok(None) => {
+            return Err(refuse(format!(
+                "{} `{}`",
+                minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                req.id.as_ref()
+            )));
+        }
+        Err(e) => {
+            return Err(refuse(format!(
+                "the log of box {} could not be found: {e}",
+                req.id
+            )));
+        }
+    };
+    tracing::info!(
+        box_id = %req.id,
+        offset = req.offset,
+        follow = req.follow,
+        log_path = %dir.log_path().as_str(),
+        "reading a box's log"
+    );
+
+    let failed = |e: std::io::Error| {
+        tracing::warn!(box_id = %req.id, error = %e, "a read of a box's log failed");
+        ReadLogUpdate::Failed {
+            error: format!("the log of box {} could not be read: {e}", req.id),
+        }
+    };
+    // One reader for the whole stream, so a drop of the log's oldest
+    // bytes during the read sends no byte twice (see `LogReader`).
+    let mut reader = Some(boxes::store::LogReader::new(&dir, req.offset));
+    loop {
+        // Everything written so far, in chunks.
+        loop {
+            match read_log_chunk(&mut reader).await {
+                Ok(chunk) if chunk.data.is_empty() => break,
+                Ok(boxes::store::LogChunk { offset, data }) => {
+                    write_log_update(c, &ReadLogUpdate::Output { offset, data }).await?;
+                }
+                Err(e) => return write_log_update(c, &failed(e)).await,
+            }
+        }
+        if !req.follow {
+            let offset = reader.as_ref().map_or(0, boxes::store::LogReader::offset);
+            return write_log_update(c, &ReadLogUpdate::Done { offset }).await;
+        }
+        if !is_box_retained(&dir).await {
+            // Output written after the read above and before the reap is
+            // still sent: the stream ends on the first empty read after the
+            // box is gone.
+            match read_log_chunk(&mut reader).await {
+                Ok(chunk) if chunk.data.is_empty() => {
+                    tracing::info!(box_id = %req.id, "a followed box was reaped; ending the read of its log");
+                    return write_log_update(c, &ReadLogUpdate::Reaped).await;
+                }
+                Ok(boxes::store::LogChunk { offset, data }) => {
+                    write_log_update(c, &ReadLogUpdate::Output { offset, data }).await?;
+                    continue;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return write_log_update(c, &ReadLogUpdate::Reaped).await;
+                }
+                Err(e) => return write_log_update(c, &failed(e)).await,
+            }
+        }
+        tokio::select! {
+            () = tokio::time::sleep(LOG_FOLLOW_POLL) => {}
+            msg = c.wait() => match msg {
+                None | Some(russh::ChannelMsg::Close) => {
+                    tracing::info!(box_id = %req.id, "the reader closed a followed read of a box's log");
+                    return Ok(());
+                }
+                Some(_) => {}
+            },
+        }
+    }
+}
+
+/// Reads the next chunk of up to [`LOG_CHUNK`] bytes through `reader`, on
+/// the blocking pool. The reader moves to the pool and back. A read whose
+/// task fails loses the reader, and every read after it fails.
+async fn read_log_chunk(
+    reader: &mut Option<boxes::store::LogReader>,
+) -> std::io::Result<boxes::store::LogChunk> {
+    let Some(mut taken) = reader.take() else {
+        return Err(std::io::Error::other("the earlier read of the log failed"));
+    };
+    let (taken, chunk) = crate::traced::spawn_blocking(move || {
+        let chunk = taken.read(LOG_CHUNK);
+        (taken, chunk)
+    })
+    .await
+    .map_err(std::io::Error::other)?;
+    *reader = Some(taken);
+    chunk
+}
+
+/// Whether the box `dir` holds is still retained, checked on the blocking
+/// pool. A failed check counts as retained, so the next poll asks again.
+async fn is_box_retained(dir: &boxes::store::BoxDir) -> bool {
+    let dir = dir.clone();
+    crate::traced::spawn_blocking(move || dir.is_retained())
+        .await
+        .unwrap_or(true)
+}
+
+/// Writes one newline-delimited JSON log update.
+async fn write_log_update(
+    c: &mut RuChannel<Msg>,
+    update: &minimald_rpc::ReadLogUpdate,
+) -> Result<(), ConnectionError> {
+    let mut line = serde_json_lenient::to_vec(update)?;
+    line.push(b'\n');
+    c.data_bytes(line).await?;
+    Ok(())
+}
+
 /// Reads a JSON request body off `c`, draining until the client half-closes.
 /// The streaming handlers' equivalent of what
 /// [`ServeOneshot::handle_channel`] does inline.
@@ -1793,6 +2585,68 @@ impl<R: AsyncRead + Unpin> AsyncRead for CountingReader<R> {
     }
 }
 
+/// How long a `WorkspaceFilesTarZst` upload may deliver no bytes before the
+/// daemon gives up on it. A peer that stalls half-open would otherwise hold
+/// the upload — and the attach refusal its in-flight mark carries — until
+/// SSH keepalive notices, which takes up to an hour and a half. Generous,
+/// because the client compresses as it reads and a large, highly
+/// compressible file can leave the wire quiet for a while.
+const WORKSPACE_UPLOAD_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Fails a read with `TimedOut` once the peer has kept it waiting for
+/// `limit`. The clock starts when a read first finds no data and stops when
+/// one completes, so only a stall counts — never the length of the whole
+/// transfer, nor time the consumer spent busy between reads.
+struct IdleDeadline<R> {
+    inner: R,
+    limit: std::time::Duration,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+    /// Whether the last poll found no data, i.e. `deadline` is armed for the
+    /// current wait.
+    waiting: bool,
+}
+
+impl<R> IdleDeadline<R> {
+    fn new(inner: R, limit: std::time::Duration) -> Self {
+        Self {
+            inner,
+            limit,
+            deadline: Box::pin(tokio::time::sleep(limit)),
+            waiting: false,
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for IdleDeadline<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = &mut *self;
+        match Pin::new(&mut this.inner).poll_read(cx, buf) {
+            Poll::Ready(read) => {
+                this.waiting = false;
+                Poll::Ready(read)
+            }
+            Poll::Pending => {
+                if !this.waiting {
+                    this.waiting = true;
+                    let until = tokio::time::Instant::now() + this.limit;
+                    this.deadline.as_mut().reset(until);
+                }
+                match this.deadline.as_mut().poll(cx) {
+                    Poll::Ready(()) => Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("no upload data for {:?}", this.limit),
+                    ))),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+    }
+}
+
 async fn serve_stream_workspace_files(
     s: ServerStateHandle,
     config: ChannelConfig,
@@ -1840,22 +2694,13 @@ async fn serve_stream_workspace_patches(
 
 /// Look up the session for an upload channel: pulls the session id
 /// out of the channel env, resolves the live actor via the manager,
-/// and returns its paths. Shared by both `WorkspaceFilesTarZst` and
-/// `WorkspacePatchesTarZst`.
-async fn upload_session_paths(
-    s: &ServerStateHandle,
-    config: &ChannelConfig,
-) -> Result<crate::session::SessionPaths, String> {
-    Ok(upload_session_handle(s, config).await?.1)
-}
-
-/// Same lookup as [`upload_session_paths`] but returns the session
-/// handle too, so callers that need per-session serialization can
-/// grab a lock without a second manager round-trip.
+/// and returns its handle and paths. Shared by the `Workspace*TarZst`
+/// handlers — the ones that need per-session serialization or actor
+/// coordination keep the handle too.
 async fn upload_session_handle(
     s: &ServerStateHandle,
     config: &ChannelConfig,
-) -> Result<(crate::session::SessionHandle, crate::session::SessionPaths), String> {
+) -> Result<(crate::box_actor::BoxHandle, crate::box_actor::BoxPaths), String> {
     let session_id_str = config
         .env_vars
         .get(crate::MINIMAL_SESSION_ID_ENV)
@@ -1865,7 +2710,7 @@ async fn upload_session_handle(
 
     let mngr = s.sessions_manager().await;
     let session_handle = mngr
-        .get_session(SessionKeyPredicate::Id(session_id))
+        .get_session(BoxKeyPredicate::Id(session_id))
         .await
         .map_err(|e| format!("session UUID lookup failed: {e}"))?
         .ok_or("unknown session UUID")?;
@@ -1874,6 +2719,49 @@ async fn upload_session_handle(
         .await
         .map_err(|e| format!("session is gone: {e}"))?;
     Ok((session_handle, paths))
+}
+
+/// One `WorkspaceFilesTarZst` upload marked in flight on its session, so
+/// attaches are refused until the mark is cleared. [`Self::finish`] clears
+/// it and awaits the actor's ack; a guard dropped without finishing (a
+/// panic, or the upload task torn down mid-stream) enqueues the clear
+/// without awaiting it instead, so no exit path leaves the session refusing
+/// attaches forever.
+pub(crate) struct WorkspaceUploadInFlight(Option<crate::box_actor::BoxHandle>);
+
+impl WorkspaceUploadInFlight {
+    /// Marks the upload in flight. Refused, marking nothing, when the
+    /// session is no longer unconfigured: an upload belongs to the create
+    /// flow, ahead of the configure, and one into a composed or configured
+    /// session's tree is not part of it.
+    pub(crate) async fn begin(handle: crate::box_actor::BoxHandle) -> Result<Self, String> {
+        handle
+            .set_workspace_upload_in_flight(true)
+            .await
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotConnected => format!("session is gone: {e}"),
+                _ => e.to_string(),
+            })?;
+        Ok(Self(Some(handle)))
+    }
+
+    pub(crate) async fn finish(mut self) -> Result<(), String> {
+        let Some(handle) = self.0.take() else {
+            return Ok(());
+        };
+        handle
+            .set_workspace_upload_in_flight(false)
+            .await
+            .map_err(|e| format!("session is gone: {e}"))
+    }
+}
+
+impl Drop for WorkspaceUploadInFlight {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.end_workspace_upload_detached();
+        }
+    }
 }
 
 /// Unpacks the zstd-compressed tarball streamed over `c` into the
@@ -1888,23 +2776,39 @@ async fn unpack_workspace_files(
     c: &mut RuChannel<Msg>,
     received: &Arc<AtomicU64>,
 ) -> Result<(), String> {
-    let paths = upload_session_paths(s, config).await?;
+    let (session_handle, paths) = upload_session_handle(s, config).await?;
     // Emitted once the upload has a destination and before a single byte is
     // pulled, so a transfer that wedges mid-stream still leaves a record
     // saying which session it was for. Its pair is the complete/failed
     // record in the caller.
     tracing::info!("workspace upload started");
 
-    let reader = async_compression::tokio::bufread::ZstdDecoder::new(tokio::io::BufReader::new(
-        CountingReader {
-            inner: c.make_reader(),
-            count: Arc::clone(received),
-        },
-    ));
-    async_tar::Archive::new(reader)
-        .unpack(paths.working.as_utf8_path())
-        .await
-        .map_err(|e| format!("unpack failed: {e}"))?;
+    // Bracket the unpack with the in-flight mark, and await both acks: the
+    // Begin ack guarantees an attach that races the upload sees the mark
+    // before the first byte lands, and the End ack fires before this
+    // function reports, so the caller's outcome log never says complete
+    // while an attach is still refused. Cleared on both arms — a failed
+    // upload must not wedge the session behind a mark nothing clears —
+    // and by the guard's drop if this future never reaches the clear (a
+    // panic in the unpack, or the task being torn down mid-stream).
+    let upload = WorkspaceUploadInFlight::begin(session_handle).await?;
+    let unpacked = async_tar::Archive::new(async_compression::tokio::bufread::ZstdDecoder::new(
+        tokio::io::BufReader::new(IdleDeadline::new(
+            CountingReader {
+                inner: c.make_reader(),
+                count: Arc::clone(received),
+            },
+            WORKSPACE_UPLOAD_IDLE_TIMEOUT,
+        )),
+    ))
+    .unpack(paths.working.as_utf8_path())
+    .await;
+    // The unpack error wins when both fail: a session destroyed mid-upload
+    // fails the clear too, and "session is gone" would hide why the
+    // unpack stopped.
+    let cleared = upload.finish().await;
+    unpacked.map_err(|e| format!("unpack failed: {e}"))?;
+    cleared?;
 
     Ok(())
 }
@@ -2285,7 +3189,7 @@ async fn unpack_tar_zst_into(target: UnpackTarget, c: &mut RuChannel<Msg>) -> Re
     // gates that wrapper behind `target_env = "gnu"`, but `minimald`
     // is also cross-compiled for static musl (the guest initramfs),
     // where the nix item is configured out.
-    let swap_result = tokio::task::spawn_blocking({
+    let swap_result = crate::traced::spawn_blocking({
         let staging_dir = staging_dir.clone();
         let dir = dir.clone();
         move || {
@@ -2358,7 +3262,7 @@ async fn unpack_workspace_patches(
 /// `<workspace>/hooks/`.
 ///
 /// Entry paths are the staged paths
-/// [`staged_script_path`](sessions::core::lifecyclehook::staged_script_path)
+/// [`staged_script_path`](boxes::core::lifecyclehook::staged_script_path)
 /// produced on the client; the daemon re-derives the same paths from
 /// the composition when it goes looking for a script, so nothing here
 /// needs a manifest.
@@ -2440,6 +3344,11 @@ pub async fn handle_ssh_rpc(
         | FinalizeSession::NAME
         | RenameSession::NAME
         | DestroySession::NAME
+        | minimald_rpc::StopBox::NAME
+        | minimald_rpc::ReapBox::NAME
+        | minimald_rpc::PruneBoxes::NAME
+        | minimald_rpc::ListBoxes::NAME
+        | minimald_rpc::ShowBox::NAME
         | Shutdown::NAME
         | AbortSession::NAME
         | GetSessionPolicy::NAME
@@ -2454,7 +3363,9 @@ pub async fn handle_ssh_rpc(
         | STREAM_WORKSPACE_PATCHES
         | STREAM_WORKSPACE_HOOK_SCRIPTS
         | minimald_rpc::DIAG_BUNDLE_SUBSYSTEM
-        | minimald_rpc::CLEAN_CACHE_SUBSYSTEM => {
+        | minimald_rpc::CLEAN_CACHE_SUBSYSTEM
+        | minimald_rpc::READ_EVENTS_SUBSYSTEM
+        | minimald_rpc::READ_LOG_SUBSYSTEM => {
             let mut conn_lock = c.lock().await;
             let c_hnd = match conn_lock.take(id) {
                 None => {
@@ -2483,29 +3394,21 @@ pub async fn handle_ssh_rpc(
     // malformed values mint fresh — propagation is a diagnostic aid and must
     // never fail a request. Every record the handler emits carries the ids,
     // so one trace_id grep joins the CLI's log with this daemon's.
-    use minimald_rpc::trace::{TRACEPARENT_ENV, TraceContext};
     use tracing::Instrument as _;
-    let client_ctx = config
-        .env_vars
-        .get(TRACEPARENT_ENV)
-        .and_then(|v| TraceContext::parse_traceparent(v));
-    let ctx = client_ctx
-        .as_ref()
-        .map(TraceContext::child)
-        .unwrap_or_else(TraceContext::mint);
     let span = tracing::info_span!(
         "rpc",
         rpc = name,
-        trace_id = %ctx.trace_id_hex(),
-        span_id = %ctx.span_id_hex(),
+        telemetry = tracing::field::Empty,
+        trace_id = tracing::field::Empty,
+        span_id = tracing::field::Empty,
         parent_span_id = tracing::field::Empty,
     );
-    if let Some(client_ctx) = &client_ctx {
-        span.record(
-            "parent_span_id",
-            tracing::field::display(client_ctx.span_id_hex()),
-        );
-    }
+    // With OTel export on, the exported span's ids are the ids; otherwise
+    // adopt-or-mint exactly as before. The shared helper also notes the ids
+    // for the mailbox messages this RPC sends (`traced::caller_context`),
+    // and honours a client's opt-out (`MINIMAL_OTEL=off`): the span and
+    // what it sends are then recorded nowhere.
+    crate::exec::adopt_client_trace(&span, &config);
 
     // Handle the named RPC (fire-and-forget; join handles are discarded).
     // `served` brackets each handler with its dispatch/outcome records —
@@ -2526,6 +3429,11 @@ pub async fn handle_ssh_rpc(
         FinalizeSession::NAME => serve!(serve_finalize_session(s, channel)),
         RenameSession::NAME => serve!(serve_rename_session(s, channel)),
         DestroySession::NAME => serve!(serve_destroy_session(s, channel)),
+        minimald_rpc::StopBox::NAME => serve!(serve_stop_box(s, channel)),
+        minimald_rpc::ReapBox::NAME => serve!(serve_reap_box(s, channel)),
+        minimald_rpc::PruneBoxes::NAME => serve!(serve_prune_boxes(s, channel)),
+        minimald_rpc::ListBoxes::NAME => serve!(serve_list_boxes(s, channel)),
+        minimald_rpc::ShowBox::NAME => serve!(serve_show_box(s, channel)),
         Shutdown::NAME => serve!(serve_shutdown(s, channel)),
         AbortSession::NAME => serve!(serve_abort_session(s, channel)),
         GetSessionPolicy::NAME => serve!(serve_get_session_policy(s, channel)),
@@ -2551,6 +3459,8 @@ pub async fn handle_ssh_rpc(
             serve!(crate::diag::serve_stream_diag_bundle(s, config, channel))
         }
         minimald_rpc::CLEAN_CACHE_SUBSYSTEM => serve!(serve_clean_cache(s, channel)),
+        minimald_rpc::READ_EVENTS_SUBSYSTEM => serve!(serve_read_events(s, channel)),
+        minimald_rpc::READ_LOG_SUBSYSTEM => serve!(serve_read_log(s, channel)),
         _ => unreachable!(),
     };
 
@@ -2558,3898 +3468,447 @@ pub async fn handle_ssh_rpc(
 }
 
 #[cfg(test)]
-mod tests {
-    use minimald_rpc::{
-        CreateSession, CreateSessionRequest, DestroySessionRequest, EffectiveEgress,
-        EffectiveSessionPolicy, EgressPolicy, GetEffectiveSessionPolicy,
-        GetEffectiveSessionPolicyRequest, GetSessionPolicy, GetSessionPolicyRequest,
-        RenameSessionRequest, SessionPolicy, Shutdown, ShutdownRequest, ShutdownResponse,
-    };
-    use paths::HostAbsPath;
-    use sessions::{NetworkMode, SessionId};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+mod tests;
 
-    use super::*;
-    use crate::MINIMAL_SESSION_ID_ENV;
-    use crate::session_host::PROBE_TEST_MUTEX;
-    use crate::sessions::SessionKeyPredicate;
-    use crate::test_harness::{TestClient, TestServer};
+/// The spans an RPC's work runs in (TEL-021, TEL-022): the
+/// `rpc` span adopts the client's `TRACEPARENT`, each mailbox message's
+/// span is a child of its sender's, and a long-lived actor started by a
+/// request does not hold that request's spans open. Export is off here, so
+/// the ids are the ones `exec::adopt_trace` records for the file log.
+#[cfg(test)]
+mod trace_tests {
+    use minimald_rpc::{CreateSession, DestroySession, DestroySessionRequest};
+    use tracing_subscriber::layer::SubscriberExt as _;
 
-    /// Serializes `(path, contents)` entries into a tar archive and
-    /// zstd-compresses it, producing exactly the wire format that
-    /// [`serve_stream_workspace_files`] decodes.
-    async fn tar_zst(entries: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut tar = async_tar::Builder::new(Vec::new());
-        for (path, contents) in entries {
-            let mut header = async_tar::Header::new_gnu();
-            header.set_size(contents.len() as u64);
-            header.set_mode(0o644);
-            tar.append_data(&mut header, path, *contents).await.unwrap();
-        }
-        let tar_bytes = tar.into_inner().await.unwrap();
+    use crate::test_harness::{SpanLog, TestServer, create_session_req};
 
-        let mut encoder = async_compression::tokio::write::ZstdEncoder::new(Vec::new());
-        encoder.write_all(&tar_bytes).await.unwrap();
-        encoder.shutdown().await.unwrap();
-        encoder.into_inner()
+    const TRACE: &str = "0af7651916cd43dd8448eb211c80319c";
+    const PARENT: &str = "b7ad6b7169203331";
+
+    fn env() -> [(&'static str, &'static str); 1] {
+        [(
+            minimald_rpc::trace::TRACEPARENT_ENV,
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+        )]
     }
 
-    use crate::test_harness::create_session_req as req;
-
-    /// Creates a session through the public RPCs and returns its id, ready
-    /// to attach.
-    async fn fresh_session(client: &mut TestClient) -> SessionId {
-        crate::test_harness::create_configured_session(client, "stream-test", "/tmp").await
-    }
-
+    /// TEL-021 (daemon side), TEL-022: the `rpc` span is a child of
+    /// the client's span; the manager message it sends is a child of the
+    /// `rpc` span; the session message the manager sends on is a child of
+    /// the manager's; all in the client's trace.
     #[tokio::test]
-    async fn stream_workspace_files_unpacks_tarball_into_workspace() {
+    async fn a_manager_and_a_session_message_are_children_of_their_senders() {
+        let log = SpanLog::default();
+        let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
         let server = TestServer::new().await;
         let mut client = server.connect().await;
-        let session_id = fresh_session(&mut client).await;
-
-        let payload = tar_zst(&[
-            ("hello.txt", b"hello world\n"),
-            ("dir/nested.txt", b"nested contents"),
-        ])
-        .await;
-
-        let channel = client
-            .open_subsystem(
-                STREAM_WORKSPACE_FILES,
-                &[(MINIMAL_SESSION_ID_ENV, &session_id.to_string())],
-            )
-            .await;
-        let mut stream = channel.into_stream();
-        stream.write_all(&payload).await.unwrap();
-        // Half-close so the server's decoder sees EOF; then read to the
-        // server's channel close so the unpack has completed on-disk
-        // before we assert.
-        stream.shutdown().await.unwrap();
-        let mut trailing = Vec::new();
-        stream.read_to_end(&mut trailing).await.unwrap();
-
-        let mngr = server.state.sessions_manager().await;
-        let handle = mngr
-            .get_session(SessionKeyPredicate::Id(session_id))
-            .await
-            .unwrap()
-            .expect("freshly-created session should be retrievable");
-        let paths = handle.paths().await.unwrap();
-
-        assert_eq!(
-            tokio::fs::read(paths.working.as_utf8_path().join("hello.txt"))
-                .await
-                .unwrap(),
-            b"hello world\n",
-        );
-        assert_eq!(
-            tokio::fs::read(paths.working.as_utf8_path().join("dir/nested.txt"))
-                .await
-                .unwrap(),
-            b"nested contents",
-        );
-    }
-
-    /// Drives the `CleanCache` subsystem to completion, returning every update
-    /// it streamed back in order.
-    async fn clean_cache(client: &mut TestClient, req: CleanCacheRequest) -> Vec<CleanCacheUpdate> {
-        let channel = client
-            .open_subsystem(minimald_rpc::CLEAN_CACHE_SUBSYSTEM, &[])
-            .await;
-        let mut stream = channel.into_stream();
-        stream
-            .write_all(&serde_json_lenient::to_vec(&req).unwrap())
-            .await
-            .unwrap();
-        // Half-close: the handler reads the request until the client is done.
-        stream.shutdown().await.unwrap();
-
-        let mut body = Vec::new();
-        stream.read_to_end(&mut body).await.unwrap();
-        String::from_utf8(body)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json_lenient::from_str(line).expect("each line is an update"))
-            .collect()
-    }
-
-    /// The clean runs through the daemon's actor and reports back: a line per
-    /// thing reclaimed, then exactly one terminal `Done` carrying the totals.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn clean_cache_streams_progress_then_a_terminal_done() {
-        use lcache::{EntryMeta, FileSystem, MetaInner};
-        use std::io::Write as _;
-
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-
-        // Two cold entries — nothing has read them, and no session needs them.
-        let cache = server.state.daemon_context().await.local_cache();
-        for byte in [1u8, 2] {
-            let w = cache
-                .write_dir(&common::SpecHash::from_bytes([byte; 32]))
-                .unwrap();
-            w.open_write("f").unwrap().write_all(b"x").unwrap();
-            w.finalize(EntryMeta {
-                inner: MetaInner::Spec(format!("pkg-{byte}")),
-                fetched: false,
-                ..Default::default()
-            })
-            .unwrap();
-        }
-
-        // `older_than_secs` of 1 rather than the daemon default, so entries
-        // written a moment ago are in scope.
-        let updates = clean_cache(
-            &mut client,
-            CleanCacheRequest::default().with_older_than_secs(1),
-        )
-        .await;
-
-        let (terminal, progress) = updates.split_last().expect("at least a terminal update");
-        assert_eq!(
-            *terminal,
-            CleanCacheUpdate::Done {
-                entries: 2,
-                dirs: 0
-            }
-        );
-        assert_eq!(
-            progress.len(),
-            2,
-            "one line per reclaimed entry: {progress:?}"
-        );
-        assert!(
-            progress.iter().all(|u| matches!(u, CleanCacheUpdate::Removed { detail } if detail.starts_with("Deleting package pkg-"))),
-            "progress should name what went: {progress:?}",
-        );
-        assert_eq!(cache.iter_entries().count(), 0);
-    }
-
-    /// An empty cache still terminates the stream properly — a client can
-    /// always read to a terminal update.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn clean_cache_with_nothing_to_do_still_terminates() {
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-
-        let updates = clean_cache(&mut client, CleanCacheRequest::default()).await;
-
-        assert_eq!(
-            updates,
-            vec![CleanCacheUpdate::Done {
-                entries: 0,
-                dirs: 0
-            }]
-        );
-    }
-
-    #[tokio::test]
-    async fn stream_workspace_files_rejects_unknown_session() {
-        use russh::ChannelMsg;
-
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-
-        // A well-formed but unknown session id: the handler should report
-        // an error on stderr (ssh extended data) rather than unpacking.
-        let mut channel = client
-            .open_subsystem(
-                STREAM_WORKSPACE_FILES,
-                &[(MINIMAL_SESSION_ID_ENV, &SessionId::nil().to_string())],
-            )
-            .await;
-        channel.eof().await.unwrap();
-
-        let mut stderr = Vec::new();
-        while let Some(msg) = channel.wait().await {
-            if let ChannelMsg::ExtendedData { data, ext: 1 } = msg {
-                stderr.extend_from_slice(&data);
-            }
-        }
-
-        assert!(
-            String::from_utf8_lossy(&stderr).contains("unknown session"),
-            "expected an unknown-session error on stderr, got {:?}",
-            String::from_utf8_lossy(&stderr),
-        );
-    }
-
-    /// The upload's `bytes_received` field is only worth logging if it is
-    /// exact, so pull a payload through in many small polls and check the
-    /// tally accumulates across them rather than recording the last read.
-    #[tokio::test]
-    async fn counting_reader_tallies_every_byte_pulled_through() {
-        let payload: Vec<u8> = (0..8192u32).map(|i| i as u8).collect();
-        let count = Arc::new(AtomicU64::new(0));
-        let mut sunk = Vec::new();
-
-        let read = tokio::io::copy(
-            &mut CountingReader {
-                inner: payload.as_slice(),
-                count: Arc::clone(&count),
-            },
-            &mut sunk,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(sunk, payload);
-        assert_eq!(read, payload.len() as u64);
-        assert_eq!(count.load(Ordering::Relaxed), payload.len() as u64);
-    }
-
-    /// `WorkspacePatchesTarZst` unpacks each entry under
-    /// `<workspace>/patches/<archive-path>` and drops the ready
-    /// marker on success. Guards the write ordering
-    /// (staging-dir → atomic rename → marker) that FinalizeSession
-    /// depends on.
-    #[tokio::test]
-    async fn stream_workspace_patches_unpacks_and_writes_marker() {
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-        let session_id = fresh_session(&mut client).await;
-
-        let payload = tar_zst(&[
-            (".config/helix/config.toml", b"theme = 'nord'\n"),
-            (".config/other.toml", b"key = 'value'\n"),
-        ])
-        .await;
-
-        let channel = client
-            .open_subsystem(
-                STREAM_WORKSPACE_PATCHES,
-                &[(MINIMAL_SESSION_ID_ENV, &session_id.to_string())],
-            )
-            .await;
-        let mut stream = channel.into_stream();
-        stream.write_all(&payload).await.unwrap();
-        stream.shutdown().await.unwrap();
-        let mut trailing = Vec::new();
-        stream.read_to_end(&mut trailing).await.unwrap();
-
-        let mngr = server.state.sessions_manager().await;
-        let handle = mngr
-            .get_session(SessionKeyPredicate::Id(session_id))
-            .await
-            .unwrap()
-            .expect("session should be retrievable");
-        let paths = handle.paths().await.unwrap();
-        let patches = paths.patches.as_utf8_path();
-
-        assert_eq!(
-            tokio::fs::read(patches.join(".config/helix/config.toml"))
-                .await
-                .unwrap(),
-            b"theme = 'nord'\n",
-        );
-        assert_eq!(
-            tokio::fs::read(patches.join(".config/other.toml"))
-                .await
-                .unwrap(),
-            b"key = 'value'\n",
-        );
-        assert!(
-            tokio::fs::try_exists(patches.join(PATCHES_READY_MARKER))
-                .await
-                .unwrap(),
-            "patches-ready marker must be written on successful unpack",
-        );
-    }
-
-    /// Build a tar+zstd archive whose entries carry the modes given,
-    /// rather than `tar_zst`'s uniform `0o644` — the shape the patches
-    /// uploader produces once it stopped flattening the source's mode.
-    async fn tar_zst_with_modes(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
-        let mut tar = async_tar::Builder::new(Vec::new());
-        for (path, contents, mode) in entries {
-            let mut header = async_tar::Header::new_gnu();
-            header.set_size(contents.len() as u64);
-            header.set_mode(*mode);
-            tar.append_data(&mut header, path, *contents).await.unwrap();
-        }
-        let tar_bytes = tar.into_inner().await.unwrap();
-        let mut encoder = async_compression::tokio::write::ZstdEncoder::new(Vec::new());
-        encoder.write_all(&tar_bytes).await.unwrap();
-        encoder.shutdown().await.unwrap();
-        encoder.into_inner()
-    }
-
-    /// An entry's permission bits reach the staged file, so a patched
-    /// script stays executable and a patched secret stays private. The
-    /// `0o600` case is the one that proves the mode is applied
-    /// explicitly rather than left to the daemon's umask, which would
-    /// have produced `0o644` from the same header.
-    ///
-    /// setuid is masked off: the header arrives over the wire, so a
-    /// peer must not be able to ask the daemon to create a setuid file
-    /// in a session's tree. (`async_tar::Archive::unpack`, which
-    /// handles the workspace stream, drops it for the same reason.)
-    #[tokio::test]
-    async fn stream_workspace_patches_preserves_entry_modes() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-        let session_id = fresh_session(&mut client).await;
-
-        let payload = tar_zst_with_modes(&[
-            (".local/bin/tool", b"#!/bin/sh\necho hi\n", 0o755),
-            (".config/secret.toml", b"token = 'hunter2'\n", 0o600),
-            (".local/bin/suid", b"#!/bin/sh\n", 0o4755),
-        ])
-        .await;
-
-        let channel = client
-            .open_subsystem(
-                STREAM_WORKSPACE_PATCHES,
-                &[(MINIMAL_SESSION_ID_ENV, &session_id.to_string())],
-            )
-            .await;
-        let mut stream = channel.into_stream();
-        stream.write_all(&payload).await.unwrap();
-        stream.shutdown().await.unwrap();
-        let mut trailing = Vec::new();
-        stream.read_to_end(&mut trailing).await.unwrap();
-
-        let mngr = server.state.sessions_manager().await;
-        let handle = mngr
-            .get_session(SessionKeyPredicate::Id(session_id))
-            .await
-            .unwrap()
-            .expect("session should be retrievable");
-        let paths = handle.paths().await.unwrap();
-        let patches = paths.patches.as_utf8_path();
-
-        let mode_of = async |rel: &str| {
-            tokio::fs::metadata(patches.join(rel))
-                .await
-                .unwrap_or_else(|e| panic!("staged patch `{rel}` should exist: {e}"))
-                .permissions()
-                .mode()
-                & 0o7777
-        };
-
-        assert_eq!(mode_of(".local/bin/tool").await, 0o755, "exec bit survives");
-        assert_eq!(
-            mode_of(".config/secret.toml").await,
-            0o600,
-            "a private mode is applied exactly, not widened by the umask",
-        );
-        assert_eq!(
-            mode_of(".local/bin/suid").await,
-            0o755,
-            "setuid is masked off, the rest of the mode is kept",
-        );
-    }
-
-    /// Build a tar+zstd archive with full control over each entry's
-    /// type and declared size, so tests can produce the malformed
-    /// shapes a hostile peer would hand-craft — `tar_zst` can only
-    /// build well-formed regular-file entries.
-    ///
-    /// `declared_size` overrides the header's size field without
-    /// changing the body, which is how the forged-header case is
-    /// reproduced.
-    async fn tar_zst_raw(entries: &[(&str, &[u8], async_tar::EntryType, Option<u64>)]) -> Vec<u8> {
-        let mut tar = async_tar::Builder::new(Vec::new());
-        for (path, contents, entry_type, declared_size) in entries {
-            let mut header = async_tar::Header::new_gnu();
-            header.set_size(declared_size.unwrap_or(contents.len() as u64));
-            header.set_mode(0o644);
-            header.set_entry_type(*entry_type);
-            tar.append_data(&mut header, path, *contents).await.unwrap();
-        }
-        let tar_bytes = tar.into_inner().await.unwrap();
-        let mut encoder = async_compression::tokio::write::ZstdEncoder::new(Vec::new());
-        encoder.write_all(&tar_bytes).await.unwrap();
-        encoder.shutdown().await.unwrap();
-        encoder.into_inner()
-    }
-
-    /// Build a tar+zstd archive whose entry name is written straight
-    /// into the header's raw name field, bypassing the path validation
-    /// `Builder::append_data` performs.
-    ///
-    /// This is the only way to produce the archive shape the daemon's
-    /// traversal guard exists for: `async_tar`'s builder refuses to
-    /// *construct* a `..` entry, so a well-behaved client cannot make
-    /// one — but a hostile peer writing tar bytes by hand can, and that
-    /// is the case the guard has to catch.
-    async fn tar_zst_forged_name(name: &[u8], contents: &[u8]) -> Vec<u8> {
-        let mut header = async_tar::Header::new_gnu();
-        header.set_size(contents.len() as u64);
-        header.set_mode(0o644);
-        header.set_entry_type(async_tar::EntryType::Regular);
-        // Raw name write: `set_path` would reject or normalize this.
-        {
-            let gnu = header.as_gnu_mut().expect("new_gnu produces a GNU header");
-            gnu.name[..name.len()].copy_from_slice(name);
-        }
-        header.set_cksum();
-
-        let mut tar = async_tar::Builder::new(Vec::new());
-        tar.append(&header, contents).await.unwrap();
-        let tar_bytes = tar.into_inner().await.unwrap();
-
-        let mut encoder = async_compression::tokio::write::ZstdEncoder::new(Vec::new());
-        encoder.write_all(&tar_bytes).await.unwrap();
-        encoder.shutdown().await.unwrap();
-        encoder.into_inner()
-    }
-
-    /// Push `payload` through `subsystem` for `session_id` and return
-    /// whatever the daemon relayed on stderr — empty on success. Keeps
-    /// the channel (rather than `into_stream`) so extended data stays
-    /// readable, which is how a rejection is signalled.
-    async fn upload_and_collect_stderr(
-        client: &mut TestClient,
-        subsystem: &str,
-        session_id: SessionId,
-        payload: &[u8],
-    ) -> String {
-        use russh::ChannelMsg;
-        let mut channel = client
-            .open_subsystem(
-                subsystem,
-                &[(MINIMAL_SESSION_ID_ENV, &session_id.to_string())],
-            )
-            .await;
-        channel.data(payload).await.unwrap();
-        channel.eof().await.unwrap();
-        let mut stderr = Vec::new();
-        while let Some(msg) = channel.wait().await {
-            if let ChannelMsg::ExtendedData { data, ext: 1 } = msg {
-                stderr.extend_from_slice(&data);
-            }
-        }
-        String::from_utf8_lossy(&stderr).into_owned()
-    }
-
-    /// Resolve a session's staged-patches and staged-hooks dirs.
-    async fn staged_dirs(
-        server: &TestServer,
-        session_id: SessionId,
-    ) -> (camino::Utf8PathBuf, camino::Utf8PathBuf) {
-        let mngr = server.state.sessions_manager().await;
-        let handle = mngr
-            .get_session(SessionKeyPredicate::Id(session_id))
-            .await
-            .unwrap()
-            .expect("session should be retrievable");
-        let paths = handle.paths().await.unwrap();
-        (
-            paths.patches.as_utf8_path().to_owned(),
-            paths.hooks.as_utf8_path().to_owned(),
-        )
-    }
-
-    /// A `..` entry is refused end-to-end, not merely by the
-    /// `safe_relative_path` unit above: the guard has to actually be
-    /// wired into the unpack loop, before any byte reaches disk.
-    #[tokio::test]
-    async fn stream_workspace_patches_rejects_traversal_end_to_end() {
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-        let session_id = fresh_session(&mut client).await;
-
-        let payload = tar_zst_forged_name(b"../escape.toml", b"pwned\n").await;
-        let stderr =
-            upload_and_collect_stderr(&mut client, STREAM_WORKSPACE_PATCHES, session_id, &payload)
-                .await;
-
-        assert!(
-            stderr.contains("`..`") || stderr.contains("absolute path"),
-            "expected a traversal rejection, got: {stderr:?}",
-        );
-        let (patches, _) = staged_dirs(&server, session_id).await;
-        assert!(
-            !tokio::fs::try_exists(patches.join(PATCHES_READY_MARKER))
-                .await
-                .unwrap_or(false),
-            "a rejected upload must not leave a ready marker",
-        );
-    }
-
-    /// An entry named exactly like the ready marker is refused: it
-    /// would otherwise be copied into the sandbox home by
-    /// `materialize_patches_into_home`, zeroing whatever the user had
-    /// at that path.
-    #[tokio::test]
-    async fn stream_workspace_patches_rejects_marker_collision() {
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-        let session_id = fresh_session(&mut client).await;
-
-        let payload = tar_zst(&[(PATCHES_READY_MARKER, b"")]).await;
-        let stderr =
-            upload_and_collect_stderr(&mut client, STREAM_WORKSPACE_PATCHES, session_id, &payload)
-                .await;
-
-        assert!(
-            stderr.contains("ready-marker"),
-            "expected a marker-collision rejection, got: {stderr:?}",
-        );
-    }
-
-    /// Only regular files are unpacked. A directory entry would
-    /// otherwise be written as an empty *file*, which then breaks
-    /// `create_dir_all` for anything nested beneath it.
-    #[tokio::test]
-    async fn stream_workspace_patches_rejects_non_regular_entry() {
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-        let session_id = fresh_session(&mut client).await;
-
-        let payload = tar_zst_raw(&[("adir", b"", async_tar::EntryType::Directory, None)]).await;
-        let stderr =
-            upload_and_collect_stderr(&mut client, STREAM_WORKSPACE_PATCHES, session_id, &payload)
-                .await;
-
-        assert!(
-            stderr.contains("only regular files"),
-            "expected a non-regular-entry rejection, got: {stderr:?}",
-        );
-    }
-
-    /// A forged header declaring more bytes than the per-entry cap is
-    /// refused on the header alone, before the body is read — the
-    /// check that stops `Vec::with_capacity` being driven into an
-    /// allocation failure.
-    #[tokio::test]
-    async fn stream_workspace_patches_rejects_oversize_declared_entry() {
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-        let session_id = fresh_session(&mut client).await;
-
-        let payload = tar_zst_raw(&[(
-            "big.toml",
-            b"small body",
-            async_tar::EntryType::Regular,
-            Some(MAX_PATCH_ENTRY_BYTES + 1),
-        )])
-        .await;
-        let stderr =
-            upload_and_collect_stderr(&mut client, STREAM_WORKSPACE_PATCHES, session_id, &payload)
-                .await;
-
-        assert!(
-            stderr.contains("per-entry cap"),
-            "expected an oversize rejection, got: {stderr:?}",
-        );
-    }
-
-    /// A second upload replaces the first tree wholesale rather than
-    /// merging into it, and the marker survives. Exercises both swap
-    /// branches: the first upload takes the plain-rename path (no
-    /// prior tree), the second takes `RENAME_EXCHANGE`.
-    #[tokio::test]
-    async fn stream_workspace_patches_second_upload_replaces_the_tree() {
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-        let session_id = fresh_session(&mut client).await;
-
-        let first = tar_zst(&[("only-in-first.toml", b"a\n")]).await;
-        assert_eq!(
-            upload_and_collect_stderr(&mut client, STREAM_WORKSPACE_PATCHES, session_id, &first)
-                .await,
-            "",
-        );
-        let second = tar_zst(&[("only-in-second.toml", b"b\n")]).await;
-        assert_eq!(
-            upload_and_collect_stderr(&mut client, STREAM_WORKSPACE_PATCHES, session_id, &second)
-                .await,
-            "",
-        );
-
-        let (patches, _) = staged_dirs(&server, session_id).await;
-        assert!(
-            tokio::fs::try_exists(patches.join("only-in-second.toml"))
-                .await
-                .unwrap(),
-            "the second upload's contents must be present",
-        );
-        assert!(
-            !tokio::fs::try_exists(patches.join("only-in-first.toml"))
-                .await
-                .unwrap(),
-            "the first upload's contents must be gone, not merged",
-        );
-        assert!(
-            tokio::fs::try_exists(patches.join(PATCHES_READY_MARKER))
-                .await
-                .unwrap(),
-            "the marker must survive the swap",
-        );
-    }
-
-    // -- hook scripts ---------------------------------------------------
-
-    /// The hook-script stream unpacks under `<workspace>/hooks/` at the
-    /// staged path the client derived, and drops its own ready marker.
-    #[tokio::test]
-    async fn stream_workspace_hook_scripts_unpacks_and_writes_marker() {
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-        let session_id = fresh_session(&mut client).await;
-
-        let payload = tar_zst(&[
-            ("loadout/dev/activate.sh", b"echo hi\n"),
-            ("project/scripts/setup.sh", b"echo setup\n"),
-        ])
-        .await;
-        let stderr = upload_and_collect_stderr(
-            &mut client,
-            STREAM_WORKSPACE_HOOK_SCRIPTS,
-            session_id,
-            &payload,
-        )
-        .await;
-        assert_eq!(stderr, "", "upload should succeed");
-
-        let (_, hooks) = staged_dirs(&server, session_id).await;
-        assert_eq!(
-            tokio::fs::read(hooks.join("loadout/dev/activate.sh"))
-                .await
-                .unwrap(),
-            b"echo hi\n",
-        );
-        assert_eq!(
-            tokio::fs::read(hooks.join("project/scripts/setup.sh"))
-                .await
-                .unwrap(),
-            b"echo setup\n",
-        );
-        assert!(
-            tokio::fs::try_exists(hooks.join(HOOKS_READY_MARKER))
-                .await
-                .unwrap(),
-            "hooks-ready marker must be written on successful unpack",
-        );
-    }
-
-    /// The hook-script stream enforces the same entry guards as the
-    /// patch stream. Parameterized over the malformed shapes so the two
-    /// paths can't drift in what they refuse.
-    #[tokio::test]
-    async fn stream_workspace_hook_scripts_rejects_malformed_entries() {
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-        let session_id = fresh_session(&mut client).await;
-
-        let cases: Vec<(&str, Vec<u8>)> = vec![
-            (
-                "`..`",
-                tar_zst_forged_name(b"../escape.sh", b"pwned\n").await,
-            ),
-            ("ready-marker", tar_zst(&[(HOOKS_READY_MARKER, b"")]).await),
-            (
-                "only regular files",
-                tar_zst_raw(&[("adir", b"", async_tar::EntryType::Directory, None)]).await,
-            ),
-            (
-                "per-entry cap",
-                tar_zst_raw(&[(
-                    "big.sh",
-                    b"small",
-                    async_tar::EntryType::Regular,
-                    Some(MAX_HOOK_SCRIPT_BYTES + 1),
-                )])
-                .await,
-            ),
-        ];
-        for (needle, payload) in cases {
-            let stderr = upload_and_collect_stderr(
-                &mut client,
-                STREAM_WORKSPACE_HOOK_SCRIPTS,
-                session_id,
-                &payload,
-            )
-            .await;
-            assert!(
-                stderr.contains(needle),
-                "expected a rejection mentioning {needle:?}, got: {stderr:?}",
-            );
-        }
-
-        let (_, hooks) = staged_dirs(&server, session_id).await;
-        assert!(
-            !tokio::fs::try_exists(hooks.join(HOOKS_READY_MARKER))
-                .await
-                .unwrap_or(false),
-            "no rejected upload may leave a ready marker",
-        );
-    }
-
-    /// Unit test on the daemon-side traversal guard — the piece
-    /// covering a malicious peer that hand-crafts a raw tar with
-    /// `..` entries (the client's own `async_tar` builder refuses
-    /// to construct one, and `SandboxRelPath::try_new` already
-    /// rejects them at the wire-schema level, so this is a
-    /// defense-in-depth check for the "hand-crafted bytes"
-    /// scenario the earlier layers don't cover).
-    #[test]
-    fn safe_relative_path_rejects_absolute_and_traversal() {
-        use std::path::Path as StdPath;
-        // Absolute — must reject.
-        assert!(!super::safe_relative_path(StdPath::new("/etc/foo")));
-        // `..` at any position — must reject.
-        assert!(!super::safe_relative_path(StdPath::new("../evil")));
-        assert!(!super::safe_relative_path(StdPath::new("a/../b")));
-        assert!(!super::safe_relative_path(StdPath::new("a/b/..")));
-        // Ordinary relative paths — must accept.
-        assert!(super::safe_relative_path(StdPath::new("a")));
-        assert!(super::safe_relative_path(StdPath::new("a/b/c")));
-        assert!(super::safe_relative_path(StdPath::new(
-            ".config/helix/config.toml"
-        )));
-    }
-
-    /// When the daemon fails to parse a request (or the handler errors),
-    /// the error message must reach the client on extended data instead
-    /// of the client seeing an opaque EOF on the response stream (#901).
-    #[tokio::test]
-    async fn oneshot_rpc_surfaces_handler_errors_as_extended_data() {
-        use russh::ChannelMsg;
-
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-
-        // Send invalid JSON to a known subsystem: handle_channel will fail
-        // at serde_json_lenient::from_slice, which now writes the error to extended
-        // data before closing the channel.
-        let mut channel = client.open_subsystem(GetVersion::NAME, &[]).await;
-        channel
-            .data_bytes(b"not valid json".to_vec())
-            .await
-            .unwrap();
-        channel.eof().await.unwrap();
-
-        let mut err_buf = Vec::new();
-        let mut data_buf = Vec::new();
-        while let Some(msg) = channel.wait().await {
-            match msg {
-                ChannelMsg::ExtendedData { data, ext: 1 } => err_buf.extend_from_slice(&data),
-                ChannelMsg::Data { data } => data_buf.extend_from_slice(&data),
-                _ => {}
-            }
-        }
-
-        assert!(
-            !err_buf.is_empty(),
-            "expected an error on extended data, got data={:?}, err=empty",
-            String::from_utf8_lossy(&data_buf),
-        );
-        assert!(
-            data_buf.is_empty(),
-            "expected no response data on error, got {:?}",
-            String::from_utf8_lossy(&data_buf),
-        );
-    }
-
-    #[tokio::test]
-    async fn get_version_returns_compiled_in_versions() {
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-
-        let resp = client.call::<GetVersion>(&()).await;
-
-        assert_eq!(resp.version, version::VERSION);
-        assert_eq!(resp.long_version, version::LONG_VERSION);
-        assert_eq!(resp.stdlib_version, stdlib::VERSION);
-    }
-
-    #[tokio::test]
-    async fn list_sessions_is_empty_on_a_fresh_state_dir() {
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-
-        let resp = client.call::<ListSessions>(&()).await;
-
-        assert!(
-            resp.sessions.is_empty(),
-            "fresh tempdir should yield no sessions, got {:?}",
-            resp.sessions,
-        );
-    }
-
-    #[tokio::test]
-    async fn get_session_record_returns_none_for_unknown_name() {
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-
-        let resp = client
-            .call::<GetSessionRecord>(&GetSessionRecordRequest::Name("does-not-exist".to_string()))
-            .await;
-
-        assert!(resp.record.is_none());
-    }
-
-    #[tokio::test]
-    async fn get_session_record_returns_none_for_unknown_id() {
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-
-        let resp = client
-            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(SessionId::nil()))
-            .await;
-
-        assert!(resp.record.is_none());
-    }
-
-    #[tokio::test]
-    async fn one_server_serves_multiple_back_to_back_clients() {
-        // Each connect() spawns its own server-side task; this proves
-        // the harness reuses a single ServerStateHandle across them.
-        let server = TestServer::new().await;
-
-        for _ in 0..3 {
-            let mut client = server.connect().await;
-            let resp = client.call::<GetVersion>(&()).await;
-            assert_eq!(resp.version, version::VERSION);
-        }
-    }
-
-    /// NET-079's per-box enforcement is a daemon-owned launch record, never
-    /// a client attr, displayed as the record lowered by the current fact.
-    /// A box no launch has recorded yet shows the daemon's one classifier
-    /// fact: a listing shows the same state the create response said for a
-    /// host-address box (this test's default create is one, never
-    /// launched), and the fact a test that set its own wrote. The guard is taken
-    /// before the server is built and held across the awaited creates on
-    /// purpose: the fact is process-global, so under libtest — where the
-    /// tests of one binary share a process — a listing driven by another
-    /// test would answer over a fact that test set.
-    #[expect(
-        clippy::await_holding_lock,
-        reason = "the fact is process-global, so the guard must span the awaited \
-                  reads it is held for"
-    )]
-    #[tokio::test]
-    async fn create_session_shows_in_get_and_list() {
-        let _fact_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-
-        let created = client
-            .call::<CreateSession>(&req("my-session", "/uwu"))
-            .await
-            .unwrap();
-        let id = created.id;
-        assert!(id != SessionId::nil());
-
-        let get_session = client
-            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(id))
-            .await;
-        assert_eq!(get_session.record.as_ref().unwrap().id, id);
-        assert_eq!(
-            get_session.record.as_ref().unwrap().name,
-            Some("my-session".to_string())
-        );
-        assert_eq!(
-            get_session.record.as_ref().unwrap().project_path,
-            HostAbsPath::try_new("/uwu").unwrap()
-        );
-        assert!(
-            !get_session
-                .record
-                .as_ref()
-                .unwrap()
-                .attrs
-                .contains_key(super::HOST_IP_ENFORCEMENT_ATTR),
-            "the per-box enforcement is a daemon-owned launch record, never \
-             an attr: the record's own field carries it, written only by a \
-             launch, and displayed as that record lowered by the host's \
-             current fact, got: {:?}",
-            get_session.record.as_ref().unwrap().attrs
-        );
-
-        // The create reply's state is the one node fact's, spelled for the
-        // wire — the derivation this test's default (host-address) create
-        // reads it from, pinned here so the listing below is proven to
-        // answer over the same fact the create did, whatever this host
-        // actually decides.
-        let fact = crate::session_host::host_ip_enforcement_fact();
-        assert_eq!(
-            created.host_ip_enforcement.as_deref(),
-            Some(fact.enforcement.machine_str()),
-            "a host-address create states the fact the daemon holds, got: {:?}",
-            created.host_ip_enforcement
-        );
-
-        let list_sessions = client.call::<ListSessions>(&()).await;
-        assert!(list_sessions.resource_pool.is_some());
-        assert_eq!(
-            list_sessions.sessions,
-            vec![ListSessionsEntry {
-                id,
-                name: Some("my-session".to_string()),
-                project_path: Some(HostAbsPath::try_new("/uwu").unwrap()),
-                // A freshly-created session that hasn't been configured yet
-                // sits in `Pending` until `ConfigureLoadout` promotes it.
-                status: sessions::SessionStatus::Pending,
-                // /uwu is not a git repository, so the probe yields nothing.
-                git: None,
-                // The same state the create response above carried
-                // (NET-079) — derived, with the rest of the surfaces, from
-                // the fact this process holds, not read off the record the
-                // create wrote nothing on. This box declares an allow
-                // verdict, so no host's gate refuses it and the fact is what
-                // shows, on any host this test runs on.
-                host_ip_enforcement: Some(fact.enforcement),
-                attrs: None,
-            }]
-        );
-    }
-
-    /// The classifier facts a test builds as the step's whole half (NET-079):
-    /// both subtrees with the kernel's delegation-contract files, the loaded
-    /// table's presence marker, and the ct-mark mask recorded beside it — the
-    /// facts that gate the probe, so an injected reading (the session host's
-    /// reading stand-in) is the only input the decision still needs. The
-    /// mount table the test spells beside the tree stands in for the daemon's
-    /// own. Returns the tree guard, which the caller keeps alive for as long
-    /// as the stand-in answers, and the root and mount table to hand a
-    /// launch's re-read ([`crate::session_host::re_read_classifier_fact`]).
-    fn installed_cohort_tree() -> (tempfile::TempDir, std::path::PathBuf, String) {
-        let tree = tempfile::tempdir().expect("a temp dir standing in for the classifier tree");
-        let root = tree.path().to_path_buf();
-        for verdict in [
-            sandbox2::config::Verdict::Deny,
-            sandbox2::config::Verdict::Allow,
-        ] {
-            let subtree = root
-                .join(sandbox2::classifier::BOXES_DIR)
-                .join(verdict.dir_name());
-            std::fs::create_dir_all(&subtree).expect("the step makes the subtree");
-            for file in ["cgroup.procs", "cgroup.threads", "cgroup.subtree_control"] {
-                std::fs::write(subtree.join(file), "")
-                    .unwrap_or_else(|e| panic!("modeling {file} in {}: {e}", subtree.display()));
-            }
-        }
-        std::fs::create_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
-            .expect("the step writes the table's marker");
-        std::fs::create_dir_all(root.join("ct-mark-mask-0x30000000"))
-            .expect("the step records the ct-mark mask beside the marker");
-        let mountinfo = format!(
-            "35 30 0:26 / {} rw,relatime shared:2 - cgroup2 cgroup2 rw,nsdelegate\n",
-            root.display()
-        );
-        (tree, root, mountinfo)
-    }
-
-    /// The classifier-advisory lines this session's create produced (the
-    /// NET-079 observability contract). Attributed by session id, because
-    /// under libtest the capture buffer is shared by every test in the
-    /// binary — assertions on it say `contains`, never `equals`.
-    fn classifier_lines(log: &str, session_id: &SessionId) -> Vec<String> {
-        let message = "session create carried the classifier advisory";
-        let id = format!("session_id={session_id}");
-        log.lines()
-            .filter(|line| line.contains(message) && line.contains(&id))
-            .map(str::to_string)
-            .collect()
-    }
-
-    /// NET-079: a native create on a host that cannot decide per box answers
-    /// with the advisory the requirement spells — the cause in words, the
-    /// state it leaves the box in, and, only when the cause is one the
-    /// command ends, the exact command that ends it. Both causes a test has
-    /// to set as the fact, because the daemon's own host decides them for
-    /// real: the step never having run, and a mount that cannot confine a
-    /// box at all — so the advisory a person reads is never handed an
-    /// install that cannot help. The advisory is spelled without a question,
-    /// because it names what a person may run and never asks them to run it,
-    /// and the daemon logs one line per advisory-carrying create naming the
-    /// cause, the command when one applies, and the per-box enforcement the
-    /// reply states — the bundle's tail then says what every create said.
-    // The guard is taken before the server is even built and held across
-    // both awaited creates on purpose: the fact is process-global, so under
-    // libtest another test's create in the window would answer over it too.
-    #[expect(
-        clippy::await_holding_lock,
-        reason = "the fact is process-global, so the guard must span the awaited \
-                  creates it is set for"
-    )]
-    #[tokio::test]
-    async fn native_host_advises_classifier_install_without_prompt() {
-        let _fact_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-        let capture = crate::test_harness::captured_log();
-
-        // The fact a start-up read over a step-missing host leaves: state
-        // `none`, cause the step's — the state the daemon's own start-up
-        // line would spell with the same words the advisory below carries.
-        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
-            classifier::Cause::StepNotInstalled,
-        ));
-        let step_missing = client
-            .call::<CreateSession>(&req("step-missing", "/uwu"))
-            .await
-            .unwrap();
-        let advisory = step_missing
-            .classifier_advisory
-            .expect("a create on a step-missing host carries the advisory");
-        assert!(
-            advisory.contains("the classifier's privileged step is not installed on this host"),
-            "the advisory must name the cause in words, got: {advisory}"
-        );
-        assert!(
-            advisory.contains("its host-address boxes run unenforced"),
-            "the advisory must say the state it leaves the box in, got: {advisory}"
-        );
-        // The command's spelling is the install hint's own, pinned in the
-        // classifier crate; the pin here is that the advisory carries the
-        // whole of it, verbatim, whatever the hint currently says — a
-        // stock install ships no `scripts/` tree, so the hint names where
-        // the script lives in the repository instead.
-        let install = sandbox2::classifier::install_hint();
-        assert!(
-            advisory.contains(&install),
-            "a missing step is the cause the install command ends, so the \
-             advisory must carry it, got: {advisory}"
-        );
-        assert!(
-            !advisory.contains('?'),
-            "the advisory names what a person may run; it never asks: {advisory}"
-        );
-
-        // The cannot-confine fact over the same box: the cause is the
-        // mount's, so the advisory names it and nothing to run.
-        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
-            classifier::Cause::CannotConfine,
-        ));
-        let cannot_confine = client
-            .call::<CreateSession>(&req("cannot-confine", "/uwu"))
-            .await
-            .unwrap();
-        crate::session_host::clear_host_ip_enforcement_fact();
-        let advisory = cannot_confine
-            .classifier_advisory
-            .expect("a host that cannot confine still gets the advisory");
-        assert!(
-            advisory.contains(
-                "no cgroup2 mount with nsdelegate covers the classifier tree, so a \
-                 box could migrate out of its leaf"
-            ),
-            "the advisory must name this cause in words too, got: {advisory}"
-        );
-        assert!(
-            !advisory.contains("install-host-classifier"),
-            "no command ends this cause, so the advisory must name none: {advisory}"
-        );
-        assert!(
-            !advisory.contains('?'),
-            "the advisory names what a person may run; it never asks: {advisory}"
-        );
-
-        // One line per advisory-carrying create, attributed by the session
-        // it carried — the cause, the command when one applies, and the
-        // enforcement the reply states for the host-address box.
-        let tail = capture.contents();
-        let step_line = classifier_lines(&tail, &step_missing.id);
-        assert_eq!(
-            step_line.len(),
-            1,
-            "each advisory-carrying create must log exactly one line naming \
-             it, got: {tail}"
-        );
-        let step_line = &step_line[0];
-        assert!(
-            step_line.contains("advisory=\"note: this host cannot decide"),
-            "the logged line must carry the advisory's own text, not only \
-             its facts, got: {step_line}"
-        );
-        assert!(
-            step_line.contains("the classifier's privileged step is not installed"),
-            "the logged line must name the cause, got: {step_line}"
-        );
-        assert!(
-            step_line.contains(&install),
-            "the logged line must carry the command when one applies, got: {step_line}"
-        );
-        let confine_line = classifier_lines(&tail, &cannot_confine.id);
-        assert_eq!(
-            confine_line.len(),
-            1,
-            "each advisory-carrying create must log exactly one line naming \
-             it, got: {tail}"
-        );
-        let confine_line = &confine_line[0];
-        assert!(
-            confine_line.contains("no cgroup2 mount with nsdelegate covers the classifier tree"),
-            "the logged line must name this cause too, got: {confine_line}"
-        );
-        assert!(
-            confine_line.contains("host_ip_enforcement=Some(\"none\")"),
-            "the logged line must carry the enforcement stated for the host-address box, got: {confine_line}"
-        );
-    }
-
-    /// NET-079: while the host cannot decide per box, a host-address box's
-    /// create reply and every surface that reads the session after the
-    /// create all say its egress is not enforced per box — the reply so a
-    /// client can say it at once, the listing a picker reads without a
-    /// round trip per session, and the runtime-facts reply
-    /// `min session policy` renders beside the rules it qualifies: a
-    /// deny-all declaration with an enforcement of `none` is the state the
-    /// box actually runs in, not a verdict that looks decided and is not.
-    /// A deny-all box running unenforced is the requirement's own case. The
-    /// enforcement is a daemon-owned launch record — never an attr a
-    /// client can assert, and nothing the create writes — displayed as
-    /// that record lowered by the host's current fact; none of these
-    /// sessions launches, so the reads answer over the fact alone. A box
-    /// whose verdict is decided on address leases instead of the host's
-    /// cgroup tree carries nothing: `None`, not `none`, on every surface —
-    /// the same nothing a daemon that predates the field says. A box the
-    /// classifier refuses — the deny-all box over a probe cause — shows
-    /// nothing on the create reply or the read surfaces, exactly as its
-    /// launch refuses it, while the host-address boxes that are not
-    /// refused keep showing the fact.
-    // The guard is taken before the server is even built and held across
-    // the awaited creates on purpose: the fact is process-global, so under
-    // libtest another test's read in the window would answer over it too.
-    #[expect(
-        clippy::await_holding_lock,
-        reason = "the fact is process-global, so the guard must span the awaited \
-                  reads it is set for"
-    )]
-    #[tokio::test]
-    async fn create_response_shows_enforcement_none_while_the_host_cannot_decide() {
-        let _fact_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-
-        // The fact a start-up read over a step-missing host leaves.
-        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
-            classifier::Cause::StepNotInstalled,
-        ));
-        let mut deny_all = req("deny-all", "/uwu");
-        deny_all.config.policy = SessionPolicy::new(Some(EgressPolicy::deny_all()), None);
-        let created = client.call::<CreateSession>(&deny_all).await.unwrap();
-
-        assert_eq!(
-            created.host_ip_enforcement.as_deref(),
-            Some("none"),
-            "a deny-all box running unenforced on a host that cannot decide \
-             per box must show egress enforcement none, got: {:?}",
-            created.host_ip_enforcement
-        );
-        assert!(
-            created
-                .classifier_advisory
-                .as_deref()
-                .is_some_and(|advisory| advisory.contains("its host-address boxes run unenforced")),
-            "the reply must carry the advisory that says the same state in \
-             words, got: {:?}",
-            created.classifier_advisory
-        );
-
-        // Nothing is recorded by the create: the state the reply named is
-        // the daemon's one classifier fact, and the launch record the reads
-        // answer over — the record's own `host_ip_enforcement` field, which
-        // only a launch writes — is still empty, so the record's attrs
-        // carry no enforcement key at all.
-        let record = client
-            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(created.id))
-            .await;
-        let attrs = &record
-            .record
-            .expect("the created session has a record")
-            .attrs;
-        assert!(
-            !attrs.contains_key(super::HOST_IP_ENFORCEMENT_ATTR),
-            "the per-box enforcement is a daemon-owned launch record, never \
-             an attr: no create records it, and the reads show the record a \
-             launch wrote, lowered by the host's current fact, got: {attrs:?}"
-        );
-
-        // The surfaces that read a session after the create derive their
-        // answer from the same fact the reply stated: the listing a picker
-        // reads without a round trip per session, and the runtime-facts
-        // reply `min session policy` renders. All of them agree by
-        // construction here — they read one fact, the daemon's own.
-        let listed = client.call::<ListSessions>(&()).await;
-        let entry = listed
-            .sessions
-            .iter()
-            .find(|e| e.id == created.id)
-            .expect("the created session is in the listing");
-        assert_eq!(
-            entry.host_ip_enforcement,
-            Some(minimald_rpc::HostIpEnforcement::None),
-            "the listing must carry the same state the create reply did, \
-             got: {:?}",
-            entry.host_ip_enforcement
-        );
-        let policy = client
-            .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(created.id))
-            .await
-            .unwrap();
-        assert_eq!(
-            policy.egress,
-            EffectiveEgress::Declared(EgressPolicy::deny_all()),
-            "the policy reply keeps the declaration the box launched with"
-        );
-        assert_eq!(
-            facts_enforcement(&mut client, created.id).await,
-            Some(minimald_rpc::HostIpEnforcement::None),
-            "the runtime-facts reply carries the state beside the rules it \
-             qualifies: a deny-all declaration that is not decided per box \
-             is the state the box runs in"
-        );
-
-        // A box whose verdict is decided on address leases carries nothing:
-        // `None`, not `none`, over the same host that cannot decide.
-        let own_address = own_ip_session(
-            &mut client,
-            "own-address",
-            SessionPolicy::new(Some(EgressPolicy::deny_all()), None),
-        )
-        .await;
-        assert!(own_address != SessionId::nil());
-        let reply = client
-            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(own_address))
-            .await;
-        let attrs = &reply
-            .record
-            .expect("the own-address session has a record")
-            .attrs;
-        assert!(
-            !attrs.contains_key(super::HOST_IP_ENFORCEMENT_ATTR),
-            "an own-address box's verdict is decided on address leases, so \
-             its record carries no per-box enforcement, got: {attrs:?}"
-        );
-        let listed = client.call::<ListSessions>(&()).await;
-        let own_entry = listed
-            .sessions
-            .iter()
-            .find(|e| e.id == own_address)
-            .expect("the own-address session is in the listing");
-        assert!(
-            own_entry.host_ip_enforcement.is_none(),
-            "an own-address box shows nothing on the listing either — its \
-             verdict was decided on address leases, got: {:?}",
-            own_entry.host_ip_enforcement
-        );
-        assert!(
-            facts_enforcement(&mut client, own_address).await.is_none(),
-            "an own-address box shows nothing on the runtime-facts reply \
-             either — there is no per-box state to qualify rules that are \
-             decided on leases"
-        );
-
-        // A box the classifier refuses shows nothing on any surface: the
-        // same fact, over the probe cause that refuses a placed deny-all
-        // box natively, and the same launch gate the derivation shares —
-        // the deny-all box's launch is refused on this ground, so the
-        // create that mints it says no enforcement value, and its listing
-        // entry and its runtime-facts reply say nothing rather than `none`. The
-        // host-address boxes that are not refused keep showing the fact:
-        // the one carrying an egress section still runs unenforced and
-        // still says so, at its create and after.
-        let mut sectioned = req("sectioned", "/uwu");
-        sectioned.config.policy = SessionPolicy::new(
-            Some(EgressPolicy {
-                allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
-                ..EgressPolicy::deny_all()
-            }),
-            None,
-        );
-        let sectioned_id = client.call::<CreateSession>(&sectioned).await.unwrap().id;
-        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
-            classifier::Cause::TableNotEffective,
-        ));
-        let mut refused_create = req("refused-create", "/uwu");
-        refused_create.config.policy = SessionPolicy::new(Some(EgressPolicy::deny_all()), None);
-        let refused_create = client.call::<CreateSession>(&refused_create).await.unwrap();
-        assert!(
-            refused_create.host_ip_enforcement.is_none(),
-            "a create over the probe cause that refuses the deny-all box \
-             carries no enforcement value on its reply either — the box's \
-             own launch would refuse it, got: {:?}",
-            refused_create.host_ip_enforcement
-        );
-        let mut unrefused_create = req("unrefused-create", "/uwu");
-        unrefused_create.config.policy = SessionPolicy::new(
-            Some(EgressPolicy {
-                allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
-                ..EgressPolicy::deny_all()
-            }),
-            None,
-        );
-        let unrefused_create = client
-            .call::<CreateSession>(&unrefused_create)
-            .await
-            .unwrap();
-        assert_eq!(
-            unrefused_create.host_ip_enforcement.as_deref(),
-            Some("none"),
-            "the sectioned box the fact does not refuse keeps getting the \
-             state it runs in on its create reply too, got: {:?}",
-            unrefused_create.host_ip_enforcement
-        );
-        let listed = client.call::<ListSessions>(&()).await;
-        let refused = listed
-            .sessions
-            .iter()
-            .find(|e| e.id == created.id)
-            .expect("the deny-all session is in the listing");
-        assert!(
-            refused.host_ip_enforcement.is_none(),
-            "a deny-all box the classifier refuses shows nothing on the \
-             listing — the refusal is what its launch said, got: {:?}",
-            refused.host_ip_enforcement
-        );
-        assert!(
-            facts_enforcement(&mut client, created.id).await.is_none(),
-            "a refused box shows nothing on the runtime-facts reply either"
-        );
-        let unrefused = listed
-            .sessions
-            .iter()
-            .find(|e| e.id == sectioned_id)
-            .expect("the sectioned session is in the listing");
-        assert_eq!(
-            unrefused.host_ip_enforcement,
-            Some(minimald_rpc::HostIpEnforcement::None),
-            "the host-address boxes the fact does not refuse keep showing \
-             the state they run in, got: {:?}",
-            unrefused.host_ip_enforcement
-        );
-
-        // The decided host, pinned pure over the derivation every read
-        // surface answers through: a decided fact shows `per_box` for the
-        // box its host places, the probe cause shows nothing for the box it
-        // refuses and the state for the box it does not, and no host shows
-        // a per-box state for a box whose verdict is decided on leases. A
-        // box with no launch record yet — these pins' `None` — shows the
-        // fact; a box with one shows that record, lowered by the fact and
-        // never raised above it.
-        let decided = fact_of(&classifier::Decision::decided());
-        let ineffective = fact_of(&classifier::Decision::undecidable(
-            classifier::Cause::TableNotEffective,
-        ));
-        let step_missing = fact_of(&classifier::Decision::undecidable(
-            classifier::Cause::StepNotInstalled,
-        ));
-        assert_eq!(
-            crate::session_host::displayed_host_ip_enforcement(
-                false,
-                NetworkMode::HostNet,
-                sandbox2::config::Verdict::Deny,
-                &decided,
-                None,
-            ),
-            Some(minimald_rpc::HostIpEnforcement::PerBox),
-            "a host that can decide per box shows its host-address boxes as \
-             enforced"
-        );
-        assert_eq!(
-            crate::session_host::displayed_host_ip_enforcement(
-                false,
-                NetworkMode::HostNet,
-                sandbox2::config::Verdict::Allow,
-                &decided,
-                None,
-            ),
-            Some(minimald_rpc::HostIpEnforcement::PerBox),
-            "the decided fact shows for the box that declared an egress \
-             section too"
-        );
-        assert_eq!(
-            crate::session_host::displayed_host_ip_enforcement(
-                false,
-                NetworkMode::OwnIp,
-                sandbox2::config::Verdict::Deny,
-                &decided,
-                None,
-            ),
-            None,
-            "a decided host still decides an own-address box's verdict on \
-             address leases, not on the cgroup tree"
-        );
-        assert_eq!(
-            crate::session_host::displayed_host_ip_enforcement(
-                false,
-                NetworkMode::HostNet,
-                sandbox2::config::Verdict::Deny,
-                &ineffective,
-                None,
-            ),
-            None,
-            "the probe cause's refusal is the launch's own gate: the box it \
-             refuses shows nothing, exactly as its launch refuses it"
-        );
-        assert_eq!(
-            crate::session_host::displayed_host_ip_enforcement(
-                false,
-                NetworkMode::HostNet,
-                sandbox2::config::Verdict::Allow,
-                &ineffective,
-                None,
-            ),
-            Some(minimald_rpc::HostIpEnforcement::None),
-            "the probe cause refuses only the deny-all box: the others run \
-             unenforced and show that state"
-        );
-        assert_eq!(
-            crate::session_host::displayed_host_ip_enforcement(
-                false,
-                NetworkMode::HostNet,
-                sandbox2::config::Verdict::Deny,
-                &step_missing,
-                None,
-            ),
-            Some(minimald_rpc::HostIpEnforcement::None),
-            "the step's causes keep the exception: even the deny-all box \
-             runs unenforced and says so"
-        );
-        // The box's own launch record, pinned over the same facts: a box
-        // its launch placed shows `per_box` while the host can still decide,
-        // and `none` the moment it cannot; a box its launch left unenforced
-        // shows `none` whatever the host has since decided, because the
-        // record is the launch's outcome and never the host's current
-        // state's to raise.
-        assert_eq!(
-            crate::session_host::displayed_host_ip_enforcement(
-                false,
-                NetworkMode::HostNet,
-                sandbox2::config::Verdict::Allow,
-                &decided,
-                Some(minimald_rpc::HostIpEnforcement::PerBox),
-            ),
-            Some(minimald_rpc::HostIpEnforcement::PerBox),
-            "a box its launch placed shows the per-box state its placement \
-             gave it, while this host can still decide per box"
-        );
-        assert_eq!(
-            crate::session_host::displayed_host_ip_enforcement(
-                false,
-                NetworkMode::HostNet,
-                sandbox2::config::Verdict::Allow,
-                &ineffective,
-                Some(minimald_rpc::HostIpEnforcement::PerBox),
-            ),
-            Some(minimald_rpc::HostIpEnforcement::None),
-            "a placed box on a host that has since stopped deciding shows \
-             the undecidable state, never the per-box one its record holds"
-        );
-        assert_eq!(
-            crate::session_host::displayed_host_ip_enforcement(
-                false,
-                NetworkMode::HostNet,
-                sandbox2::config::Verdict::Allow,
-                &decided,
-                Some(minimald_rpc::HostIpEnforcement::None),
-            ),
-            Some(minimald_rpc::HostIpEnforcement::None),
-            "a box its own launch left unenforced stays `none` — the record \
-             is never raised to the per-box state a later launch reached"
-        );
-
-        crate::session_host::clear_host_ip_enforcement_fact();
-    }
-
-    /// The fact a decision leaves, as the reads see it — set and copied back
-    /// through the daemon's own accessors, so a pure pin answers over the
-    /// pairing a real read produced, never a pairing a test invented.
-    fn fact_of(decision: &classifier::Decision) -> crate::session_host::HostIpEnforcementFact {
-        crate::session_host::set_host_ip_enforcement_fact(decision);
-        crate::session_host::host_ip_enforcement_fact()
-    }
-
-    /// The listing entry's enforcement for one session: the read surface the
-    /// re-read proof asserts on, so each leg of it says only what changed.
-    async fn listed_enforcement(
-        client: &mut TestClient,
-        id: SessionId,
-    ) -> Option<minimald_rpc::HostIpEnforcement> {
-        client
-            .call::<ListSessions>(&())
-            .await
-            .sessions
-            .into_iter()
-            .find(|e| e.id == id)
-            .expect("the created session is in the listing")
-            .host_ip_enforcement
-    }
-
-    /// The enforcement the runtime-facts reply carries for one session
-    /// (NET-079): the read surface `min session policy` renders beside the
-    /// rules, so the proofs assert on what that command actually prints —
-    /// the same derivation the listing answers over, over the reply the
-    /// CLI reads.
-    async fn facts_enforcement(
-        client: &mut TestClient,
-        id: SessionId,
-    ) -> Option<minimald_rpc::HostIpEnforcement> {
-        use minimald_rpc::{GetSessionRuntimeFacts, GetSessionRuntimeFactsRequest};
-        client
-            .call::<GetSessionRuntimeFacts>(&GetSessionRuntimeFactsRequest::Id(id))
-            .await
-            .unwrap()
-            .host_ip_enforcement
-    }
-
-    /// NET-079's fact follows the launch re-read: the start-up read seeds it
-    /// and every host-address launch's re-read refreshes it, so the read
-    /// surfaces show the state the *last* read reached, never one a re-read
-    /// has replaced. Driven here over the facts a test lays out — the
-    /// installed step's cohort, a spelled mount table, and the probe's
-    /// reading injected the way a test injects every other classifier fact —
-    /// so the table can read as refusing (a host that decides per box), as
-    /// removed (the marker standing over a table whose refusal is gone), and
-    /// as reinstalled, with the listing answering after each read the
-    /// daemon's own launches answer through. The session is a host-address
-    /// box created over the start-up default fact — nothing read, nothing
-    /// decided — so the create gate that refuses a declaration's
-    /// unenforceable rules refuses nothing here, and the listing's answer is
-    /// the fact's alone, on any host.
-    // The guard is taken before the server is even built and held across
-    // the awaited re-reads on purpose: the fact is process-global, so under
-    // libtest another test's read in the window would answer over it too.
-    #[expect(
-        clippy::await_holding_lock,
-        reason = "the fact is process-global, so the guard must span the awaited \
-                  re-reads it is held for"
-    )]
-    #[tokio::test]
-    async fn host_ip_enforcement_follows_the_launch_reread() {
-        let _fact_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-
-        // A host-address box created over the start-up default fact — nothing
-        // read, nothing decided — so the create gate refuses nothing here; the
-        // section it declares is what keeps the listing entry the fact's.
-        let mut session = req("reread-proof", "/uwu");
-        session.config.policy = SessionPolicy::new(
-            Some(EgressPolicy {
-                allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
-                ..EgressPolicy::deny_all()
-            }),
-            None,
-        );
-        let created = client.call::<CreateSession>(&session).await.unwrap();
-
-        // The tree the re-read answers over: the step's whole half, with
-        // the mount table spelled to cover it — the same facts a launch's
-        // knobs stand in, so the decision logic itself runs over them.
-        let (tree, root, mountinfo) = installed_cohort_tree();
-
-        // The re-read over a table that is refusing: `per_box`, the state
-        // the proof starts from. A test's stand-in tree cannot model a
-        // table whose refusal the probe reads — the kernel behind it is not
-        // there — so the reading is injected, the one classifier fact a
-        // stand-in tree cannot vouch for.
-        crate::session_host::install_classifier_reading_standin(classifier::Reading::Refused(
-            Vec::new(),
-        ));
-        let (_, decision) = crate::session_host::re_read_classifier_fact(
-            root.clone(),
-            Some(mountinfo.clone()),
-            false,
-        )
-        .await
-        .expect("the re-read runs");
-        assert!(
-            decision.can_decide_per_box(),
-            "a table whose refusal the probe read decides per box, got: {decision:?}"
-        );
-        assert_eq!(
-            listed_enforcement(&mut client, created.id).await,
-            Some(minimald_rpc::HostIpEnforcement::PerBox),
-            "the listing shows the fact the re-read wrote: a host that \
-             decides per box"
-        );
-
-        // The table read as removed: the marker still stands over a refusal
-        // that is gone, so the same launch re-reads `none` — and the
-        // listing shows it, not the state the earlier read reached.
-        crate::session_host::install_classifier_reading_standin(classifier::Reading::NotRefused {
-            because: "the injected reading stands in for a probe whose \
-                          every leg completed"
-                .to_string(),
-            families: Vec::new(),
-        });
-        let (_, decision) = crate::session_host::re_read_classifier_fact(
-            root.clone(),
-            Some(mountinfo.clone()),
-            false,
-        )
-        .await
-        .expect("the re-read runs");
-        assert_eq!(
-            decision.cause(),
-            Some(classifier::Cause::TableNotEffective),
-            "a marker standing over a table that is not refusing is its own \
-             cause, got: {decision:?}"
-        );
-        assert_eq!(
-            listed_enforcement(&mut client, created.id).await,
-            Some(minimald_rpc::HostIpEnforcement::None),
-            "the listing follows the re-read: a host whose table read as \
-             removed shows `none`"
-        );
-
-        // The table read as reinstalled: the next launch re-reads `per_box`,
-        // and the listing shows the fact the re-read refreshed.
-        crate::session_host::install_classifier_reading_standin(classifier::Reading::Refused(
-            Vec::new(),
-        ));
-        let (_, decision) = crate::session_host::re_read_classifier_fact(
-            root.clone(),
-            Some(mountinfo.clone()),
-            false,
-        )
-        .await
-        .expect("the re-read runs");
-        assert!(
-            decision.can_decide_per_box(),
-            "a table whose refusal the probe read again decides per box, \
-             got: {decision:?}"
-        );
-        assert_eq!(
-            listed_enforcement(&mut client, created.id).await,
-            Some(minimald_rpc::HostIpEnforcement::PerBox),
-            "the listing follows the re-read back: a host whose table read \
-             as reinstalled shows `per_box` again"
-        );
-
-        crate::session_host::clear_classifier_reading_standin();
-        crate::session_host::clear_host_ip_enforcement_fact();
-        drop(tree);
-    }
-
-    /// NET-079: on a host that decides per box, a host-address box whose
-    /// declaration names rules the classifier cannot enforce is refused at
-    /// create — before anything is allocated, so no record, no held name,
-    /// no actor survives the refusal — and the typed error the client reads
-    /// off the activate names each unenforced rule, says own-address boxes
-    /// enforce them, and ends with what to do about the rules it named. The
-    /// refusal rides this RPC's `InvalidInput` arm — the arm a kind other
-    /// than the typed one never reaches, answering as an internal error
-    /// instead — so the create's refusal is the same machine-mode code the
-    /// launch's identically-typed error carries. The daemon logs one info
-    /// line per refused create naming the box, the host's per-box value in
-    /// the machine spelling, and each unenforced rule; the refusal counter
-    /// counts each one. An own-address box's declaration is enforced on the
-    /// address the box holds, so it is never refused on this ground,
-    /// whatever the host decides.
-    // The guard is taken before the server is even built and held across the
-    // awaited creates on purpose: the fact is process-global, so under
-    // libtest another test's create in the window would answer over it too.
-    #[expect(
-        clippy::await_holding_lock,
-        reason = "the fact is process-global, so the guard must span the awaited \
-                  creates it is set for"
-    )]
-    #[tokio::test]
-    async fn per_box_host_refuses_unenforceable_host_ip_declaration() {
-        let _fact_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-        let capture = crate::test_harness::captured_log();
-        let refused_before = crate::sessions::refused_unenforceable_creates();
-
-        // The host decides per box: the state a loaded, refusing table reads,
-        // and the one the create gate answers over — the same bit the launch
-        // that follows re-reads for its own gate.
-        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::decided());
-
-        // The CLI's own spellings of a narrowing, each refused with the rule
-        // it names: `--deny-subnets` subtracts a range from an allow-all —
-        // a partial refusal the deny subtree does not spell — and
-        // `--allow-subnets` narrows what the box may reach — a narrowing the
-        // allow subtree refuses nothing to enforce.
-        let mut deny_a_range = req("refused-deny-range", "/uwu");
-        deny_a_range.config.policy = SessionPolicy::new(
-            Some(EgressPolicy {
-                deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
-                ..Default::default()
-            }),
-            None,
-        );
-        // The refusal arrives over the RPC's `InvalidInput` arm — the arm
-        // the typed error keys on, where any other kind answers as an
-        // internal error and the call never yields an `Errorable::Err` —
-        // so what the create reads here is the machine-mode code the
-        // launch's identically-typed refusal carries too.
-        let error = match client.call::<CreateSession>(&deny_a_range).await {
-            Errorable::Err { error } => error,
-            other => panic!("a per-box host refuses the denied range, got: {other:?}"),
-        };
-        assert!(
-            error.contains("deny_subnets 0.0.0.0/0"),
-            "the refusal names the rule it refused over, by field and entry: {error}"
-        );
-        assert!(
-            error.contains("this host decides a host-address box's egress verdict per box"),
-            "the refusal says whose verdict it is that cannot enforce the rule: {error}"
-        );
-        assert!(
-            error.contains("own-address boxes enforce them"),
-            "the refusal says own-address boxes enforce these rules, so the \
-             person who typed the declaration is told where they do work: {error}"
-        );
-        // The refusal ends with what to do: remove the rules, declare the
-        // one shape this host's classifier enforces, or take the mode that
-        // enforces them — the words a person reads last are the ones they
-        // can act on.
-        assert!(
-            error.contains("remove these rules")
-                && error.contains("declare deny-all egress")
-                && error.contains("all three allow lists present and empty"),
-            "the refusal names the remedy for the rules it refused: {error}"
-        );
-
-        let mut allow_a_subnet = req("refused-allow-list", "/uwu");
-        allow_a_subnet.config.policy = SessionPolicy::new(
-            Some(EgressPolicy {
-                allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
-                ..Default::default()
-            }),
-            None,
-        );
-        let error = match client.call::<CreateSession>(&allow_a_subnet).await {
-            Errorable::Err { error } => error,
-            other => panic!("a per-box host refuses the narrowing allow list, got: {other:?}"),
-        };
-        assert!(
-            error.contains("allow_subnets"),
-            "the narrowing allow list is refused over the rule it names: {error}"
-        );
-
-        // The refusal is before anything is allocated: the store holds
-        // neither refused box.
-        let mngr = server.state.sessions_manager().await;
-        assert!(
-            mngr.list().await.unwrap().is_empty(),
-            "the refused creates allocated nothing — no record, no held name, \
-             no actor survived them"
-        );
-
-        // The counter counted each refusal, and each refusal logged one info
-        // line: the box, the host's per-box value, and each unenforced rule.
-        let refused_after = crate::sessions::refused_unenforceable_creates();
-        assert_eq!(
-            refused_after,
-            refused_before + 2,
-            "each refused create counted once, got {refused_after} after \
-             {refused_before} before"
-        );
-        let logged = capture.contents();
-        for (name, rule) in [
-            ("refused-deny-range", "deny_subnets 0.0.0.0/0"),
-            ("refused-allow-list", "allow_subnets"),
-        ] {
-            assert!(
-                logged.lines().any(|line| {
-                    line.contains("refused a create whose host-address declaration names rules")
-                        && line.contains(&format!("session_name=Some(\"{name}\")"))
-                        && line.contains("host_ip_enforcement=per_box")
-                        && line.contains(rule)
-                }),
-                "the refused create of {name} logged the box, the per-box value, \
-                 and the rule it refused over, got: {logged}"
-            );
-        }
-
-        // The refusal is the host-address mode's alone: an own-address box
-        // carrying the same narrowing is created, its verdict decided on the
-        // address it holds.
-        let own_address = own_ip_session(
-            &mut client,
-            "own-address-narrowed",
-            SessionPolicy::new(
-                Some(EgressPolicy {
-                    deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
-                    ..Default::default()
-                }),
-                None,
-            ),
-        )
-        .await;
-        assert!(
-            own_address != SessionId::nil(),
-            "an own-address box's narrowing is enforced, not refused"
-        );
-
-        crate::session_host::clear_host_ip_enforcement_fact();
-    }
-
-    /// NET-079: a host that decides per box refuses only the declarations
-    /// that ask for a verdict its table cannot make. A host-address box
-    /// with no egress section — the allow-all it is, every verdict the
-    /// classifier could decide for it enforced by its leaf — and a deny-all
-    /// box — the one shape the deny subtree enforces — are both created on
-    /// that host, their replies stating the per-box state the fact says,
-    /// and nothing is counted as refused.
-    // The guard is taken before the server is even built and held across the
-    // awaited creates on purpose: the fact is process-global, so under
-    // libtest another test's create in the window would answer over it too.
-    #[expect(
-        clippy::await_holding_lock,
-        reason = "the fact is process-global, so the guard must span the awaited \
-                  creates it is set for"
-    )]
-    #[tokio::test]
-    async fn per_box_host_creates_host_ip_box_with_no_section_or_deny_all() {
-        let _fact_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-        let refused_before = crate::sessions::refused_unenforceable_creates();
-
-        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::decided());
-
-        let plain = client
-            .call::<CreateSession>(&req("plain-host-address", "/uwu"))
-            .await
-            .unwrap();
-        assert_eq!(
-            plain.host_ip_enforcement.as_deref(),
-            Some("per_box"),
-            "a host-address box with no egress section is created on a \
-             per-box host, its reply stating the enforcement the fact says, \
-             got: {:?}",
-            plain.host_ip_enforcement
-        );
-
-        let mut deny_all = req("deny-all-host-address", "/uwu");
-        deny_all.config.policy = SessionPolicy::new(Some(EgressPolicy::deny_all()), None);
-        let deny_all = client.call::<CreateSession>(&deny_all).await.unwrap();
-        assert_eq!(
-            deny_all.host_ip_enforcement.as_deref(),
-            Some("per_box"),
-            "a deny-all host-address box is created on a per-box host — its \
-             shape is the deny subtree's own verdict, got: {:?}",
-            deny_all.host_ip_enforcement
-        );
-
-        // Both in the store, and neither counted as refused: the gate refused
-        // nothing a per-box verdict can enforce.
-        let mngr = server.state.sessions_manager().await;
-        let listed = mngr.list().await.unwrap();
-        assert_eq!(
-            listed.len(),
-            2,
-            "both boxes the per-box host can enforce are in the store: {listed:?}"
-        );
-        for name in ["plain-host-address", "deny-all-host-address"] {
-            assert!(
-                listed.iter().any(|s| s.name.as_deref() == Some(name)),
-                "{name} is in the store, got: {listed:?}"
-            );
-        }
-        assert_eq!(
-            crate::sessions::refused_unenforceable_creates(),
-            refused_before,
-            "an enforceable declaration is never counted as refused"
-        );
-
-        crate::session_host::clear_host_ip_enforcement_fact();
-    }
-
-    /// NET-079's exception, at the create: a host that cannot decide per
-    /// box creates every host-address box it is handed, whatever its
-    /// declaration names — the narrowing shapes a decided host refuses, the
-    /// deny-all shape, a box with no section, and the narrowed own-address
-    /// box — because the box will run unenforced on it and be recorded as
-    /// such, never refused on that ground. The probe cause that comes
-    /// closest to deciding — the step installed, the table's refusal gone —
-    /// creates them too: its own refusal is the *launch's*, for the box
-    /// whose declaration promises the verdict, and never the create's.
-    // The guard is taken before the server is even built and held across the
-    // awaited creates on purpose: the fact is process-global, so under
-    // libtest another test's create in the window would answer over it too.
-    #[expect(
-        clippy::await_holding_lock,
-        reason = "the fact is process-global, so the guard must span the awaited \
-                  creates it is set for"
-    )]
-    #[tokio::test]
-    async fn unenforcing_host_still_creates_host_ip_box_with_any_declaration() {
-        let _fact_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-        let refused_before = crate::sessions::refused_unenforceable_creates();
-
-        // A host that cannot decide per box: the step never having run, the
-        // plainest cause — its boxes run unenforced and say so.
-        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
-            classifier::Cause::StepNotInstalled,
-        ));
-
-        // Every declaration shape, created: the two narrowings a per-box
-        // host refuses, the deny-all shape, and no section at all.
-        let narrowing = SessionPolicy::new(
-            Some(EgressPolicy {
-                deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
-                ..Default::default()
-            }),
-            None,
-        );
-        let mut denied_range = req("unenforcing-deny-range", "/uwu");
-        denied_range.config.policy = narrowing.clone();
-        let denied_range = client.call::<CreateSession>(&denied_range).await.unwrap();
-        let mut narrowed = req("unenforcing-allow-list", "/uwu");
-        narrowed.config.policy = SessionPolicy::new(
-            Some(EgressPolicy {
-                allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
-                ..Default::default()
-            }),
-            None,
-        );
-        let narrowed = client.call::<CreateSession>(&narrowed).await.unwrap();
-        let mut deny_all = req("unenforcing-deny-all", "/uwu");
-        deny_all.config.policy = SessionPolicy::new(Some(EgressPolicy::deny_all()), None);
-        let deny_all = client.call::<CreateSession>(&deny_all).await.unwrap();
-        let plain = client
-            .call::<CreateSession>(&req("unenforcing-plain", "/uwu"))
-            .await
-            .unwrap();
-        for (id, why) in [
-            (denied_range.id, "a denied range over an allow-all"),
-            (narrowed.id, "a narrowing allow list"),
-            (deny_all.id, "the deny-all shape"),
-            (plain.id, "no egress section at all"),
-        ] {
-            assert!(
-                id != SessionId::nil(),
-                "a host that cannot decide per box creates {why}, runs it \
-                 unenforced and records that, never refusing it on this ground"
-            );
-        }
-
-        // The narrowed own-address box too: its verdict is its own, on the
-        // address it holds.
-        let own_address = own_ip_session(&mut client, "unenforcing-own-address", narrowing).await;
-        assert!(
-            own_address != SessionId::nil(),
-            "an own-address box's declaration is its own to enforce, whatever \
-             the host can decide"
-        );
-
-        // The probe cause nearest deciding — the tree installed, the table's
-        // refusal gone — creates the narrowing a decided host refuses: the
-        // create answers over the host's `can_decide_per_box` alone, and the
-        // launch's own refusal for the promised verdict is never a reason to
-        // hold the name or the record hostage here.
-        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
-            classifier::Cause::TableNotEffective,
-        ));
-        let mut nearly_decided = req("unenforcing-nearly-decided", "/uwu");
-        nearly_decided.config.policy = SessionPolicy::new(
-            Some(EgressPolicy {
-                deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
-                ..Default::default()
-            }),
-            None,
-        );
-        let nearly_decided = client.call::<CreateSession>(&nearly_decided).await.unwrap();
-        assert!(
-            nearly_decided.id != SessionId::nil(),
-            "the probe cause that refuses a promised verdict at launch still \
-             creates the box whose declaration names it"
-        );
-
-        // Nothing was counted as refused: the exception keeps the creates.
-        let mngr = server.state.sessions_manager().await;
-        let listed = mngr.list().await.unwrap();
-        assert_eq!(
-            listed.len(),
-            6,
-            "every host-address box the undeciding hosts were handed was \
-             created: {listed:?}"
-        );
-        assert_eq!(
-            crate::sessions::refused_unenforceable_creates(),
-            refused_before,
-            "a host that cannot decide per box refuses no create on this ground"
-        );
-
-        crate::session_host::clear_host_ip_enforcement_fact();
-    }
-
-    /// Waits for the mock host's echo of `line`, which proves this session's
-    /// attach minted its host — and with it that the launch's own record
-    /// write, which runs before the host is handed back, has landed. The
-    /// shell channel is confirmed before the attach runs, so the echo is the
-    /// earliest a test can know the launch it drove is done.
-    async fn await_launch_echo(channel: &mut russh::Channel<russh::client::Msg>, line: &str) {
-        use russh::ChannelMsg;
-
-        let expected = format!("got:{line}");
-        channel
-            .data_bytes(format!("{line}\n").as_bytes().to_vec())
-            .await
-            .expect("the probe line reaches the shell");
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            let mut stdout = Vec::new();
-            loop {
-                match channel.wait().await {
-                    Some(ChannelMsg::Data { data }) => {
-                        stdout.extend_from_slice(&data);
-                        if String::from_utf8_lossy(&stdout).contains(&expected) {
-                            return;
-                        }
-                    }
-                    Some(_) => {}
-                    None => panic!(
-                        "the launch's shell never echoed {expected:?}, got: {:?}",
-                        String::from_utf8_lossy(&stdout)
-                    ),
-                }
-            }
-        })
-        .await
-        .expect("the attach mints its host within its timeout");
-    }
-
-    /// NET-079's "recorded as such" belongs to the box, not the node: each
-    /// host-address box's own launch records its placement outcome on the
-    /// session record, and every read surface shows that record — lowered to
-    /// `none` when the host cannot decide per box, never raised above the
-    /// placement the launch made. Driven end to end over the daemon's own
-    /// attach path, the launches a session's start takes: boxes A and B
-    /// placed — A while the injected classifier reads undecided, B once it
-    /// reads per_box — and box C left unplaced by the step's absence. A
-    /// records the placement its launch made over a table that was not
-    /// refusing, and shows `none` while the host cannot decide, `per_box`
-    /// the moment the table refuses again — the box is in the leaf its
-    /// launch placed it in. C records `none` and shows `none` beside its
-    /// siblings' `per_box` on the same host, whatever the host has since
-    /// decided — which is what proves the reads answer over the box's own
-    /// record and not the host's state — and when the fact reads `none`
-    /// again, every box on it is lowered beside it.
-    // The guard is taken before the server is even built and held across
-    // every launch and read on purpose: the fact the launches record over
-    // and the reads lower by is process-global, so under libtest another
-    // test's launch or read in the window would answer over it too.
-    #[expect(
-        clippy::await_holding_lock,
-        reason = "the fact is process-global, so the guard must span the \
-                  awaited launches and reads it is held for"
-    )]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_unplaced_launch_stays_none_after_the_host_decides() {
-        let _fact_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-        let capture = crate::test_harness::captured_log();
-
-        // The tree the launches' re-reads answer over: the step's whole
-        // half, with the mount table spelled to cover it, so the only thing
-        // injected is the table's effect — the one fact a stand-in tree
-        // cannot vouch for.
-        let (tree, root, mountinfo) = installed_cohort_tree();
-
-        // Box A's host reads undecided: the marker stands over a table whose
-        // refusal is gone, so this host cannot decide per box — but the step's
-        // tree is still there for a launch to place a box in, and the
-        // placement is the outcome A's launch records; the table's state is
-        // the reads' to lower it by, never the launch's to record.
-        crate::session_host::install_classifier_reading_standin(classifier::Reading::NotRefused {
-            because: "the injected reading stands in for a probe whose \
-                          every leg completed"
-                .to_string(),
-            families: Vec::new(),
-        });
-        let (_, decision) = crate::session_host::re_read_classifier_fact(
-            root.clone(),
-            Some(mountinfo.clone()),
-            false,
-        )
-        .await
-        .expect("the re-read runs");
-        assert_eq!(
-            decision.cause(),
-            Some(classifier::Cause::TableNotEffective),
-            "the undecided reading the proof launches A under, got: {decision:?}"
-        );
-
-        // Box A: created, then launched by the attach its start takes.
-        let created_a = client
-            .call::<CreateSession>(&req("launch-proof-a", "/uwu"))
-            .await
-            .unwrap();
-        let mut channel_a = client.open_shell(created_a.id).await;
-        await_launch_echo(&mut channel_a, "probe-a").await;
-
-        // Box A's own record, read back while its host still cannot decide:
-        // the placement its launch made, not the table's state — and every
-        // read surface lowers it to `none` over the fact, never shows a
-        // `per_box` nothing is enforcing.
-        let record_a = client
-            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(created_a.id))
-            .await
-            .record
-            .expect("box A's record is readable");
-        assert_eq!(
-            record_a.host_ip_enforcement,
-            Some(minimald_rpc::HostIpEnforcement::PerBox),
-            "box A's own launch recorded the placement it made over the \
-             table that was not refusing, got: {:?}",
-            record_a.host_ip_enforcement
-        );
-        assert_eq!(
-            listed_enforcement(&mut client, created_a.id).await,
-            Some(minimald_rpc::HostIpEnforcement::None),
-            "the listing lowers box A's record to the state its host is in \
-             now — a leaf over a table that is not refusing decides nothing"
-        );
-        assert_eq!(
-            facts_enforcement(&mut client, created_a.id).await,
-            Some(minimald_rpc::HostIpEnforcement::None),
-            "the runtime-facts reply lowers box A's record beside the rules \
-             it runs under"
-        );
-
-        // Box B's host reads per_box: the table's refusal is in force, so
-        // this host can decide a box's verdict on a leaf of its own.
-        crate::session_host::install_classifier_reading_standin(classifier::Reading::Refused(
-            Vec::new(),
-        ));
-        let (_, decision) = crate::session_host::re_read_classifier_fact(
-            root.clone(),
-            Some(mountinfo.clone()),
-            false,
-        )
-        .await
-        .expect("the re-read runs");
-        assert!(
-            decision.can_decide_per_box(),
-            "the per-box reading the proof launches B under, got: {decision:?}"
-        );
-
-        // Box B: the same create-and-attach, on the host that just decided.
-        let created_b = client
-            .call::<CreateSession>(&req("launch-proof-b", "/uwu"))
-            .await
-            .unwrap();
-        let mut channel_b = client.open_shell(created_b.id).await;
-        await_launch_echo(&mut channel_b, "probe-b").await;
-
-        // The boxes' own records: each launch's outcome, each on the box it
-        // launched — the daemon-owned field a create left empty and only a
-        // launch wrote.
-        let record_b = client
-            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(created_b.id))
-            .await
-            .record
-            .expect("box B's record is readable");
-        assert_eq!(
-            record_b.host_ip_enforcement,
-            Some(minimald_rpc::HostIpEnforcement::PerBox),
-            "box B's own launch recorded the placement its host decided, \
-             got: {:?}",
-            record_b.host_ip_enforcement
-        );
-
-        // The reads while the host decides: A's recorded placement is one
-        // this host can honour again — the table refuses per the leaf A's
-        // launch placed it in, so A shows `per_box` beside B, without a
-        // relaunch — on the listing and the runtime-facts reply both.
-        assert_eq!(
-            listed_enforcement(&mut client, created_a.id).await,
-            Some(minimald_rpc::HostIpEnforcement::PerBox),
-            "the listing shows box A's record as it stands while the table \
-             refuses again — the box is in the leaf its launch placed it in"
-        );
-        assert_eq!(
-            listed_enforcement(&mut client, created_b.id).await,
-            Some(minimald_rpc::HostIpEnforcement::PerBox),
-            "the listing shows box B's own launch record while its host can \
-             still decide per box"
-        );
-        assert_eq!(
-            facts_enforcement(&mut client, created_a.id).await,
-            Some(minimald_rpc::HostIpEnforcement::PerBox),
-            "the runtime-facts reply shows box A's placement beside the \
-             rules it runs under, once the table enforces it again"
-        );
-        assert_eq!(
-            facts_enforcement(&mut client, created_b.id).await,
-            Some(minimald_rpc::HostIpEnforcement::PerBox),
-            "the runtime-facts reply shows box B's own launch record while \
-             its host can still decide per box"
-        );
-
-        // Box C's host reads the step's absence: a cause the cohort tree
-        // cannot produce — it has the step's whole half — so the fact is
-        // set the way a host without it reads, which is the only half the
-        // test launcher's placement consults. Nothing places a leaf for C:
-        // its launch records the outcome of a placement that did not
-        // happen.
-        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
-            classifier::Cause::StepNotInstalled,
-        ));
-
-        // Box C: the same create-and-attach, on the host whose tree is not
-        // there to place it.
-        let created_c = client
-            .call::<CreateSession>(&req("launch-proof-c", "/uwu"))
-            .await
-            .unwrap();
-        let mut channel_c = client.open_shell(created_c.id).await;
-        await_launch_echo(&mut channel_c, "probe-c").await;
-
-        let record_c = client
-            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(created_c.id))
-            .await
-            .record
-            .expect("box C's record is readable");
-        assert_eq!(
-            record_c.host_ip_enforcement,
-            Some(minimald_rpc::HostIpEnforcement::None),
-            "box C's own launch recorded the placement it could not make, \
-             got: {:?}",
-            record_c.host_ip_enforcement
-        );
-        assert_eq!(
-            listed_enforcement(&mut client, created_c.id).await,
-            Some(minimald_rpc::HostIpEnforcement::None),
-            "the listing shows box C's own record — the outcome of a launch \
-             that placed nothing"
-        );
-        assert_eq!(
-            facts_enforcement(&mut client, created_c.id).await,
-            Some(minimald_rpc::HostIpEnforcement::None),
-            "the runtime-facts reply shows box C's own record beside the \
-             rules it runs under"
-        );
-
-        // The observability half: one info line per host-address box launch,
-        // each carrying the outcome its own launch recorded, attributed to
-        // the session it belongs to — the placement for A and B, the
-        // placement that did not happen for C.
-        let logged = capture.contents();
-        for (id, expected, label) in [
-            (
-                created_a.id,
-                "host_ip_enforcement=per_box",
-                "the launch that placed its box over a table that was not \
-                 refusing",
-            ),
-            (
-                created_b.id,
-                "host_ip_enforcement=per_box",
-                "the launch whose host decided per box",
-            ),
-            (
-                created_c.id,
-                "host_ip_enforcement=none",
-                "the launch that placed nothing",
-            ),
-        ] {
-            assert!(
-                logged.lines().any(|line| {
-                    line.contains("recorded its host-address box's egress enforcement")
-                        && line.contains(&format!("session_id={id}"))
-                        && line.contains(expected)
-                }),
-                "{label} records its outcome on the daemon's log, got: {logged}"
-            );
-        }
-
-        // The fact reads `none` again: the host can no longer decide per
-        // box, so every box on it shows the state its own record is lowered
-        // to — B falls from `per_box` to `none`, and A stays where its
-        // launch left it.
-        crate::session_host::install_classifier_reading_standin(classifier::Reading::NotRefused {
-            because: "the injected reading stands in for a probe whose \
-                          every leg completed"
-                .to_string(),
-            families: Vec::new(),
-        });
-        let (_, decision) = crate::session_host::re_read_classifier_fact(
-            root.clone(),
-            Some(mountinfo.clone()),
-            false,
-        )
-        .await
-        .expect("the re-read runs");
-        assert_eq!(
-            decision.cause(),
-            Some(classifier::Cause::TableNotEffective),
-            "the undecidable reading the proof lowers both boxes under, got: \
-             {decision:?}"
-        );
-        assert_eq!(
-            listed_enforcement(&mut client, created_b.id).await,
-            Some(minimald_rpc::HostIpEnforcement::None),
-            "the listing lowers box B's own record to the state its host is \
-             in now — never raised above it, never left standing above it"
-        );
-        assert_eq!(
-            listed_enforcement(&mut client, created_a.id).await,
-            Some(minimald_rpc::HostIpEnforcement::None),
-            "box A stays `none` — the state its own launch left it in"
-        );
-        assert_eq!(
-            facts_enforcement(&mut client, created_b.id).await,
-            Some(minimald_rpc::HostIpEnforcement::None),
-            "the runtime-facts reply lowers box B's own record too, beside \
-             the rules it qualifies"
-        );
-
-        drop(channel_a);
-        drop(channel_b);
-        crate::session_host::clear_classifier_reading_standin();
-        crate::session_host::clear_host_ip_enforcement_fact();
-        drop(tree);
-    }
-
-    /// NET-079's state is the host's verdict, so no client may assert it:
-    /// the daemon strips its own `host_ip_enforcement` key from a create's
-    /// attrs unconditionally — whatever the session's network mode, whatever
-    /// the value — and every read surface answers from the daemon's own
-    /// fact. An own-address box carrying the assertion shows no enforcement
-    /// anywhere (its verdict is decided on leases, so there is no per-box
-    /// state to say), and a host-address box over a host that cannot decide
-    /// still shows the state it runs in, never the `per_box` the activation
-    /// tried to hand the reads.
-    // The guard is taken before the server is even built: the fact the
-    // assertions answer over is process-global, so under libtest another
-    // test's read in the window would answer over it too.
-    #[expect(
-        clippy::await_holding_lock,
-        reason = "the fact is process-global, so the guard must span the awaited \
-                  reads it is held for"
-    )]
-    #[tokio::test]
-    async fn client_cannot_assert_host_ip_enforcement() {
-        let _fact_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-
-        // The fact the reads answer from: a host that cannot decide.
-        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
-            classifier::Cause::StepNotInstalled,
-        ));
-
-        let mut asserting = req("asserting", "/uwu");
-        asserting.config.network = NetworkMode::OwnIp;
-        asserting.config.attrs.insert(
-            super::HOST_IP_ENFORCEMENT_ATTR.to_string(),
-            "per_box".to_string(),
-        );
-        let own_address = client.call::<CreateSession>(&asserting).await.unwrap();
-
-        // The assertion is stripped, not honoured: the record carries no
-        // enforcement key, and the read surfaces show nothing — their own
-        // derivation for a box whose verdict is decided on leases.
-        let reply = client
-            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(own_address.id))
-            .await;
-        let attrs = &reply
-            .record
-            .expect("the created session has a record")
-            .attrs;
-        assert!(
-            !attrs.contains_key(super::HOST_IP_ENFORCEMENT_ATTR),
-            "a client-supplied enforcement key is stripped, never recorded, \
-             got: {attrs:?}"
-        );
-        assert_eq!(
-            listed_enforcement(&mut client, own_address.id).await,
-            None,
-            "an own-address box shows no enforcement on the listing, \
-             assertion or not: its verdict is decided on address leases"
-        );
-        assert!(
-            facts_enforcement(&mut client, own_address.id)
-                .await
-                .is_none(),
-            "an own-address box shows no enforcement on the runtime-facts \
-             reply either, assertion or not"
-        );
-
-        // The strip is for every network mode: a host-address box carrying
-        // the same assertion records nothing either, and its listing shows
-        // the daemon's fact — the state the host actually runs in — never
-        // the `per_box` the activation tried to assert.
-        let mut host_address = req("host-address", "/uwu");
-        host_address.config.attrs.insert(
-            super::HOST_IP_ENFORCEMENT_ATTR.to_string(),
-            "per_box".to_string(),
-        );
-        let host_address = client.call::<CreateSession>(&host_address).await.unwrap();
-        let reply = client
-            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(host_address.id))
-            .await;
-        let attrs = &reply
-            .record
-            .expect("the created session has a record")
-            .attrs;
-        assert!(
-            !attrs.contains_key(super::HOST_IP_ENFORCEMENT_ATTR),
-            "the strip is unconditional — the mode does not let an assertion \
-             through, got: {attrs:?}"
-        );
-        assert_eq!(
-            listed_enforcement(&mut client, host_address.id).await,
-            Some(minimald_rpc::HostIpEnforcement::None),
-            "a host-address box's listing is the daemon's own fact, not the \
-             client's assertion: a host that cannot decide shows `none`"
-        );
-
-        crate::session_host::clear_host_ip_enforcement_fact();
-    }
-
-    /// NET-079's advisory is built only where it applies: a create over a
-    /// host-address box on a daemon that is not itself a microVM's guest.
-    /// An own-address box's verdict is decided on address leases, so over
-    /// the same fact that makes a host-address create carry the advisory —
-    /// pinned here as the contrast — an own-address create carries none:
-    /// `None`, the same nothing a host that decides says.
-    // The guard is taken before the server is even built: the fact the
-    // contrast reads is process-global, so under libtest another test's
-    // read in the window would answer over it too.
-    #[expect(
-        clippy::await_holding_lock,
-        reason = "the fact is process-global, so the guard must span the awaited \
-                  creates it is set for"
-    )]
-    #[tokio::test]
-    async fn own_ip_create_has_no_classifier_advisory() {
-        let _fact_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-
-        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
-            classifier::Cause::StepNotInstalled,
-        ));
-        // The contrast: the same fact over a host-address box carries it.
-        let host_address = client
-            .call::<CreateSession>(&req("host-address", "/uwu"))
-            .await
-            .unwrap();
-        assert!(
-            host_address.classifier_advisory.is_some(),
-            "the fact carries a cause, so a host-address create over it \
-             advises — the contrast this proof needs, got: {:?}",
-            host_address.classifier_advisory
-        );
-        let own_address =
-            own_ip_create_reply(&mut client, "own-address", SessionPolicy::default()).await;
-        assert_eq!(
-            own_address.classifier_advisory, None,
-            "an own-address box's verdict is decided on address leases, so \
-             its create carries no classifier advisory, got: {:?}",
-            own_address.classifier_advisory
-        );
-
-        crate::session_host::clear_host_ip_enforcement_fact();
-    }
-
-    /// NET-079's advisory, the other half of where it applies: a daemon
-    /// running inside a microVM never carries it, whatever its sessions are
-    /// and whatever its fact holds — the guest's start-up line and each
-    /// launch's own record say the interim's state, and its causes name an
-    /// image's builder rather than anything the person starting a session
-    /// could run. Pinned pure over the create's gate: the test harness
-    /// builds native daemons only, so the guest arm is the gate's, with the
-    /// same cause a native host-address create advises on as the input that
-    /// proves the `None` is the guest's doing and not the cause's.
-    #[test]
-    fn microvm_create_has_no_classifier_advisory() {
-        let cause = Some(classifier::Cause::StepNotInstalled);
-        assert_eq!(
-            super::create_classifier_advisory(true, NetworkMode::HostNet, cause),
-            None,
-            "a microVM's daemon carries no classifier advisory, whatever its \
-             sessions or its fact"
-        );
-        assert!(
-            super::create_classifier_advisory(false, NetworkMode::HostNet, cause).is_some(),
-            "the same cause over a native host-address create does advise — \
-             the contrast that proves the guest arm is the gate's own"
-        );
-        assert_eq!(
-            super::create_classifier_advisory(false, NetworkMode::OwnIp, cause),
-            None,
-            "the own-address arm stays the gate's own too, guest or not"
-        );
-    }
-
-    /// NET-081's host-table rule at the create: on a VM-backed node an
-    /// own-address create that carries no handed addresses is refused with
-    /// `InvalidInput`, naming the registration the client skipped, because
-    /// the guest never mints a box-plane address and a box with no host row
-    /// would start silently dark (NET-085). Pinned pure over the create's
-    /// gate: the test harness builds native daemons only. A handed create
-    /// passes, a native own-address create keeps NET-010's own allocator,
-    /// and a box that is not own-address has nothing to hand.
-    #[test]
-    fn vm_backed_create_without_handed_addresses_is_refused() {
-        let refused = super::refuse_unhanded_vm_box(true, NetworkMode::OwnIp, None)
-            .expect_err("a VM-backed own-address create with no handed addresses");
-        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput);
-        assert_eq!(
-            refused.to_string(),
-            "box not registered with the VM host (no handed addresses); register \
-             through minvmd's control socket first"
-        );
-        let handed = sessions::BoxAddresses {
-            switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
-            loopback_address: std::net::Ipv4Addr::new(127, 0, 0, 2),
-        };
-        assert!(
-            super::refuse_unhanded_vm_box(true, NetworkMode::OwnIp, Some(&handed)).is_ok(),
-            "a VM-backed create carrying the host's handed addresses passes"
-        );
-        assert!(
-            super::refuse_unhanded_vm_box(false, NetworkMode::OwnIp, None).is_ok(),
-            "a native own-address create keeps its own allocator (NET-010)"
-        );
-        for network in [NetworkMode::HostNet, NetworkMode::NoNet] {
-            assert!(
-                super::refuse_unhanded_vm_box(true, network, None).is_ok(),
-                "a VM-backed {network:?} create has no box-plane address to hand"
-            );
-        }
-    }
-
-    /// The advisory over the two probe causes (NET-079), pinned pure: no
-    /// stand-in can carry either — a fake tree's probe child never places,
-    /// so the stand-ins answer a step or mount cause, and a stand-in that
-    /// carried a decided tree would need a table whose refusal the probe
-    /// could read. The two are the exception's one limit: natively the
-    /// outcome names the refusal — a deny-all host-address box is refused at
-    /// placement — so the advisory must not claim the boxes' declarations do
-    /// not matter over a refusal a person is about to hit. The table a
-    /// reload would fix still names the command; the probe no command can
-    /// make run names none. And in the guest every cause refuses, so the
-    /// clause never appears there either.
-    #[test]
-    fn advisory_over_a_probe_cause_names_the_refusal_not_a_blanket_unenforced() {
-        let not_effective =
-            super::classifier_advisory_text(classifier::Cause::TableNotEffective, false);
-        assert!(
-            not_effective.contains(
-                "its deny-all host-address boxes are refused and its other \
-                 host-address boxes run unenforced"
-            ),
-            "the probe cause's advisory names the refusal, got: {not_effective}"
-        );
-        assert!(
-            !not_effective.contains("whatever the boxes' declarations say"),
-            "the clause holds only while no box is refused, got: {not_effective}"
-        );
-        assert!(
-            not_effective.contains(&sandbox2::classifier::install_hint()),
-            "a table the marker vouches for but the probe does not is the one \
-             the step's install reloads, so the advisory still carries the \
-             command, got: {not_effective}"
-        );
-        assert!(
-            !not_effective.contains('?'),
-            "the advisory names what a person may run; it never asks: {not_effective}"
-        );
-
-        let unreadable = super::classifier_advisory_text(classifier::Cause::ProbeUnreadable, false);
-        assert!(
-            unreadable.contains(
-                "its deny-all host-address boxes are refused and its other \
-                 host-address boxes run unenforced"
-            ),
-            "an unreadable probe leaves the same refusal-naming outcome, \
-             got: {unreadable}"
-        );
-        assert!(
-            !unreadable.contains("whatever the boxes' declarations say"),
-            "the clause still does not apply, got: {unreadable}"
-        );
-        assert!(
-            !unreadable.contains("install-host-classifier"),
-            "no command is known to make a probe run, so none is named, \
-             got: {unreadable}"
-        );
-
-        let guest = super::classifier_advisory_text(classifier::Cause::StepNotInstalled, true);
-        assert!(
-            !guest.contains("whatever the boxes' declarations say"),
-            "a guest refuses a deny-all box on every cause, so its advisory \
-             must not claim the declarations do not matter, got: {guest}"
-        );
-    }
-
-    /// The version gate, made by the RPC the activation path already sends
-    /// rather than by a `GetVersion` ahead of it (#1251).
-    ///
-    /// A matching assertion is invisible; a differing one fails the call with
-    /// the skew message *and leaves nothing behind* — which is the whole
-    /// point, since the failure this closes is a session that exists and is
-    /// then destroyed by its own caller's cleanup. An absent assertion (an
-    /// older client) behaves exactly as this RPC always did.
-    #[tokio::test]
-    async fn create_session_refuses_a_version_skew_before_allocating_anything() {
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-
-        let mut skewed = req("skewed", "/uwu");
-        skewed.must_match_version = Some("0.0.0-not-this-build".to_string());
-        let refused = client.call::<CreateSession>(&skewed).await;
-        let error = refused.err().expect("a skewed create must be refused");
-        assert!(
-            error.contains("0.0.0-not-this-build") && error.contains(OWN_VERSION),
-            "the refusal must name both builds, got: {error}"
-        );
-        assert!(error.contains("min stop"), "missing the recovery: {error}");
-        assert!(
-            error.contains(minimald_rpc::SKEW_OVERRIDE_VAR),
-            "missing the override: {error}"
-        );
-        assert!(
-            client.call::<ListSessions>(&()).await.sessions.is_empty(),
-            "a refused create must not have allocated a session"
-        );
-
-        // The matching assertion goes through, and the reply names the build
-        // that honoured it — the half of the handshake that catches a daemon
-        // too old to have looked at `must_match_version` at all.
-        let mut matching = req("matching", "/uwu");
-        matching.must_match_version = Some(OWN_VERSION.to_string());
-        let created = client
-            .call::<CreateSession>(&matching)
-            .await
-            .ok()
-            .expect("a matching assertion must be accepted");
-        assert_eq!(created.daemon_version.as_deref(), Some(OWN_VERSION));
-
-        // And a client that asserts nothing — an older one, or one running
-        // under the skew override — is unaffected.
-        let created = client
-            .call::<CreateSession>(&req("unasserted", "/uwu"))
-            .await
-            .ok()
-            .expect("an unasserted create must behave as it always has");
-        assert_eq!(created.daemon_version.as_deref(), Some(OWN_VERSION));
-    }
-
-    /// The two read RPCs the attach / exec / setup-zed paths gate on must
-    /// report the daemon's build, or those paths have nothing to assert
-    /// against and would have to spend a `GetVersion` to find out.
-    #[tokio::test]
-    async fn the_read_rpcs_report_the_daemon_build() {
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-
         let id = client
-            .call::<CreateSession>(&req("my-session", "/uwu"))
+            .call_with_env::<CreateSession>(&env(), &create_session_req("s", "/tmp"))
             .await
             .unwrap()
             .id;
+        client
+            .call_with_env::<DestroySession>(
+                &env(),
+                &DestroySessionRequest {
+                    id,
+                    only_if_unfinalized: false,
+                },
+            )
+            .await
+            .unwrap();
 
-        assert_eq!(
-            client
-                .call::<ListSessions>(&())
-                .await
-                .daemon_version
-                .as_deref(),
-            Some(OWN_VERSION)
+        let child_of = |child: &crate::test_harness::LoggedSpan,
+                        parent: &crate::test_harness::LoggedSpan| {
+            assert_eq!(child.field("trace_id"), Some(TRACE), "{child:?}");
+            assert_eq!(
+                child.field("parent_span_id"),
+                parent.field("span_id"),
+                "{} is a child of {}: {child:?} {parent:?}",
+                child.name,
+                parent.name
+            );
+        };
+        let create = log.one("rpc", "rpc", "minimald-v1-CreateSession");
+        assert_eq!(create.field("trace_id"), Some(TRACE));
+        assert_eq!(create.field("parent_span_id"), Some(PARENT));
+        child_of(
+            &log.one("sessions.manager.message", "kind", "CreateSession"),
+            &create,
         );
-        assert_eq!(
-            client
-                .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(id))
-                .await
-                .daemon_version
-                .as_deref(),
-            Some(OWN_VERSION)
-        );
+        let destroy = log.one("rpc", "rpc", "minimald-v1-DestroySession");
+        let delete = log.one("sessions.manager.message", "kind", "DeleteSession");
+        child_of(&delete, &destroy);
+        child_of(&log.one("session.message", "kind", "Destroy"), &delete);
     }
 
-    /// The probe a host whose `lo0` carries no range alias reads: the stock
-    /// macOS the spike measured — every bind refused, first at `.1`.
-    fn absent_range_probe() -> crate::net::loopback::RangeProbe {
-        crate::net::loopback::RangeProbe {
-            bound: 0,
-            probed: 254,
-            first_failure: Some((
-                std::net::Ipv4Addr::new(127, 0, 64, 1),
-                std::io::ErrorKind::AddrNotAvailable,
-            )),
+    /// TEL-022: the session actor a CreateSession starts runs in
+    /// a root span of its own, so the request's `rpc` and manager-message
+    /// spans close once the RPC has answered while the actor lives on. They
+    /// stayed open for the actor's whole life (a 313 s CreateSession message
+    /// behind a 114 ms RPC).
+    #[tokio::test]
+    async fn a_request_span_closes_when_its_rpc_returns() {
+        let log = SpanLog::default();
+        let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        client
+            .call_with_env::<CreateSession>(&env(), &create_session_req("s", "/tmp"))
+            .await
+            .unwrap();
+        // The answer can reach the client a moment before the handler's
+        // span is dropped: give it a bounded moment.
+        let closed = || {
+            log.one("rpc", "rpc", "minimald-v1-CreateSession").closed
+                && log
+                    .one("sessions.manager.message", "kind", "CreateSession")
+                    .closed
+        };
+        for _ in 0..100 {
+            if closed() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            closed(),
+            "the request's spans are still open: {:#?}",
+            log.spans()
+        );
+        let actors: Vec<_> = log
+            .spans()
+            .into_iter()
+            .filter(|s| s.name == "session.actor")
+            .collect();
+        assert_eq!(actors.len(), 1, "{actors:?}");
+        assert!(!actors[0].closed, "the actor lives on");
+        assert!(actors[0].parent.is_none(), "the actor's span is a root");
+    }
+}
+
+/// BOX-163 over the wire: what a `CreateSession` reply says when a running
+/// box holds the name, and how a fresh instance is named.
+#[cfg(test)]
+mod create_naming_tests {
+    use boxes::SessionId;
+    use minimald_rpc::{CreateSession, CreateSessionRequest, Errorable, HeldNameRefusal};
+
+    use crate::box_manager::BoxKeyPredicate;
+    use crate::test_harness::{TestClient, TestServer, create_session_req};
+
+    /// A create with no name on the request and a task spec whose entry is
+    /// `entry`, so the daemon names the box from the entry.
+    fn entry_req(entry: &str, fresh_instance: bool) -> CreateSessionRequest {
+        let mut request = create_session_req("unused", "/tmp");
+        request.config.name = None;
+        let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+        spec.box_type = boxes::TASK_BOX_TYPE.to_string();
+        spec.pty_enabled = false;
+        spec.entry = entry.to_string();
+        request.spec = Some(serde_json_lenient::to_value(&spec).expect("a spec serializes"));
+        request.fresh_instance = fresh_instance;
+        request
+    }
+
+    async fn create(client: &mut TestClient, request: &CreateSessionRequest) -> SessionId {
+        match client.call::<CreateSession>(request).await {
+            Errorable::Ok(created) => created.id,
+            Errorable::Err { error } => panic!("the create is refused: {error}"),
         }
     }
 
-    /// The one session-start probe line this session's create produced: the
-    /// record that carries the probe's result and the surface it picked
-    /// (NET-123's observability contract). Attributed by session id, because
-    /// under libtest the capture buffer is shared by every test in the
-    /// binary — assertions on it say `contains`, never `equals`.
-    fn probe_line(log: &str, session_id: &SessionId) -> String {
-        let message = "session-start loopback probe picked the publish surface";
-        let id = format!("session_id={session_id}");
-        log.lines()
-            .find(|line| line.contains(message) && line.contains(&id))
-            .unwrap_or_else(|| {
-                panic!("no session-start loopback probe record for {id}, got: {log}")
-            })
-            .to_string()
-    }
-
-    /// NET-123's reply flag: the create response carries the interim verdict
-    /// the session-start probe reached — `true` when the reserved range read
-    /// absent, `false` when it read present. The flag is the whole re-advise
-    /// contract: a client that reads `true` surfaces the naming advisory
-    /// again (NET-122).
-    // The guard is taken before the server is even built: both creates read
-    // the process-global probe, the first because it *must not* see another
-    // test's stand-in, the second because it must. It is held across both
-    // awaited creates on purpose.
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test]
-    async fn create_response_carries_interim_flag() {
-        let _standin_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-
-        // The present verdict needs no stand-in: on Linux the whole 127/8 is
-        // local to `lo`, so the real probe finds the range present.
-        let present = client
-            .call::<CreateSession>(&req("interim-present", "/uwu"))
-            .await
-            .ok()
-            .expect("a create with the range present must publish");
-        assert!(
-            !present.interim_loopback,
-            "a present reserved range must not report the interim"
-        );
-
-        // The absent verdict does — no real bind on this host can produce it.
-        crate::net::loopback::install_probe_standin(absent_range_probe);
-        let absent = client
-            .call::<CreateSession>(&req("interim-absent", "/uwu"))
-            .await
-            .ok()
-            .expect("a create with the range absent must still publish");
-        crate::net::loopback::clear_probe_standin();
-        assert!(
-            absent.interim_loopback,
-            "an absent reserved range must report the interim on the reply"
-        );
-    }
-
-    /// NET-123's probe: session start bind-probes the reserved local range
-    /// before publishing, and the one session-start log line carries the
-    /// probe's result and the surface it picked. On this host the whole
-    /// `127/8` is local to `lo`, so the probe covers every address, finds
-    /// the range present, and the reply stays off the interim.
-    // The guard covers the awaited create for the same reason it covers the
-    // absent arm's window: this test drives no stand-in of its own, so
-    // another test's installed one must not leak into its create.
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test]
-    async fn session_start_probes_reserved_range() {
-        let _standin_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        let log = crate::test_harness::captured_log();
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-
-        let created = client
-            .call::<CreateSession>(&req("probe-covered", "/uwu"))
-            .await
-            .ok()
-            .expect("a create with a present range");
-        assert!(!created.interim_loopback);
-
-        let line = probe_line(&log.contents(), &created.id);
-        assert!(
-            line.contains("127.0.64.0/24 254/254 bound"),
-            "the probe covers the whole reserved range, and the line says so: {line}"
-        );
-        assert!(
-            line.contains("surface=reserved-range"),
-            "the surface the probe picked is named: {line}"
-        );
-    }
-
-    /// NET-123's absent arm: when the session-start probe finds the reserved
-    /// range absent the reply carries the interim and the log names it as the
-    /// surface picked — the two things that make the client surface the
-    /// naming advisory again. The stand-in stands in for the host without
-    /// the aliases; no real bind on this Linux one can reproduce it, and the
-    /// flag itself still switches no published address (see
-    /// `net::loopback`'s module doc for what the verdict carries).
-    // The stand-in window must cover the awaited create, so the mutex guard
-    // is held across the await on purpose.
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test]
-    async fn absent_range_publishes_interim_and_readvises() {
-        let log = crate::test_harness::captured_log();
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-
-        let _standin_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        crate::net::loopback::install_probe_standin(absent_range_probe);
-        let interim = client
-            .call::<CreateSession>(&req("interim-published", "/uwu"))
-            .await
-            .ok()
-            .expect("an absent range must not refuse the session");
-        crate::net::loopback::clear_probe_standin();
-
-        assert!(
-            interim.interim_loopback,
-            "the reply carries the interim — the flag a client re-surfaces \
-             the naming advisory on"
-        );
-        let line = probe_line(&log.contents(), &interim.id);
-        assert!(
-            line.contains("surface=127.0.0.1-interim"),
-            "the log names the interim as the surface chosen: {line}"
-        );
-        assert!(
-            line.contains("interim_loopback=true"),
-            "the interim verdict is on the line, for the log's reader: {line}"
-        );
-    }
-
-    /// NET-018: once the answerer is serving beside the proxy, the replies
-    /// report the one fact that is the daemon's to know — its answerer
-    /// bound — and the one log line, emitted the moment the answerer binds,
-    /// names that surface and that the hostname proxy keeps serving beside
-    /// it: the verdict switches what a client *reports*, never what the
-    /// proxy does (NET-019). NET-019's other half is proved on this
-    /// daemon's own proxy too: after the native line, one request still
-    /// routes through the listener whose port the reply carries — the
-    /// pure verdict in `proxy`'s test routes through a serve loop a test
-    /// spun up itself; this is the daemon's. The answerer is the half the
-    /// daemon's start path brings up on a detached driver; here it is
-    /// driven to serving the same way, the proxy beside it — the proxy
-    /// first, so the answerer's line reads an already-recorded port
-    /// deterministically rather than racing the proxy's record moment.
-    ///
-    /// The fresh-daemon list first proves the absent half: no answerer, no
-    /// bound report — and no surface line at all, the line being the
-    /// answerer's bind moment, not a request's.
-    // The answerer helper binds the host loopback, so this test runs only
-    // where the helper does. The stand-in window covers the awaited
-    // create — the one call left that runs the process-global probe — for
-    // the same reason the interim tests take it. The log assertions say
-    // `contains`, never `equals`: the capture buffer is shared
-    // process-wide, and any test that drives an answerer to serving
-    // writes a surface line into it.
-    #[expect(
-        clippy::await_holding_lock,
-        reason = "the stand-in window has to cover the awaited create's probe"
-    )]
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn name_surface_reported_when_both_deployed() {
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-        use std::time::Duration;
-
-        let log = crate::test_harness::captured_log();
-        let _standin_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-
-        // A daemon with neither listener up reports the read that changes
-        // nothing: not bound.
-        let bare = client.call::<ListSessions>(&()).await;
-        assert!(
-            !bare.answerer_bound,
-            "a daemon whose answerer has not come up must not report it bound"
-        );
-
-        // Bring both listeners to serving — the startup loops
-        // `start_host_proxies` spawns — with a compressed backoff. The
-        // proxy first: the answerer's serving tail is what logs the
-        // surface line, and its proxy half reads the recorded port, so
-        // recording it before the answerer binds is what makes the line's
-        // "keeps serving" half deterministic here.
-        let compressed =
-            crate::server::RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(40));
-        let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        crate::server::retry_hostname_proxy_until_serving(
-            server.state.clone(),
-            loopback,
-            compressed,
-        )
-        .await;
-        crate::server::retry_zone_answerer_until_serving(
-            server.state.clone(),
-            loopback,
-            compressed,
-        )
-        .await;
-
-        // Both listeners up: the list and create replies report the
-        // answerer bound, and the activation reply carries the same fact
-        // the list does.
-        let listed = client.call::<ListSessions>(&()).await;
-        assert!(
-            listed.answerer_bound,
-            "a daemon whose answerer serves reports it bound"
-        );
-        let created = client
-            .call::<CreateSession>(&req("surface-native", "/uwu"))
-            .await
-            .ok()
-            .expect("a create on a host whose answerer serves must succeed");
-        assert!(
-            created.answerer_bound,
-            "the activation reply carries the same bound fact the list does"
-        );
-
-        // The log says what this daemon knows and no more: the bound
-        // answerer and its port — the one fact the replies carry — that
-        // native DNS waits on the host's resolver before it is the live
-        // surface there, that `min ls` reports the host's verdict, and the
-        // proxy's half beside it. The assertions read the message, plus the
-        // two fields a bundle's reader greps (`answerer_bound`,
-        // `proxy_serves`); the rest of the field quoting is the
-        // subscriber's business.
-        let log = log.contents();
-        let answerer_line = log
-            .lines()
-            .find(|line| line.contains("box-zone answerer is bound"))
-            .expect("the answerer's bind logs one line a diagnostics bundle can tail");
-        let answerer_port = created
-            .zone_answerer_port
-            .expect("with the answerer up, the reply carries its port");
-        assert!(
-            answerer_line.contains("answerer_bound=true"),
-            "the line's field is the fact the daemon knows, not a surface verdict: {answerer_line}"
-        );
-        assert!(
-            answerer_line.contains(&format!("is bound on 127.0.0.1:{answerer_port}")),
-            "the line names the bound answerer and its port: {answerer_line}"
-        );
-        assert!(
-            answerer_line.contains("once its resolver routes the zone"),
-            "the line says native DNS waits on the host's resolver routing the zone: {answerer_line}"
-        );
-        assert!(
-            answerer_line.contains("`min ls` reports the host's surface"),
-            "the line points at where the host's verdict is reported: {answerer_line}"
-        );
-        assert!(
-            !answerer_line.contains("the live name surface is native"),
-            "the daemon cannot read the host's resolver, so the line must not claim its surface: \
-             {answerer_line}"
-        );
-        assert!(
-            answerer_line.contains("proxy_serves=true"),
-            "the line says the proxy still serves beside the answerer (NET-019): {answerer_line}"
-        );
-        assert!(
-            answerer_line.contains("the hostname proxy keeps serving"),
-            "the line says the proxy keeps serving, in the words its reader reads: {answerer_line}"
-        );
-        let port = created
-            .hostname_proxy_port
-            .expect("with the proxy up, the reply carries its port");
-        assert!(
-            answerer_line.contains(&format!("127.0.0.1:{port}")),
-            "the line names the port a client keeps routing through: {answerer_line}"
-        );
-
-        // NET-019 on the daemon's own proxy: the verdict that just reported
-        // native DNS stops nothing — one request still routes through the
-        // listener whose port the reply carries. The registry holds the
-        // create's session as a host-net route the way the session-start
-        // path registers one, so the request has a target to reach.
-        let backend_port = crate::net::proxy::spawn_backend().await;
+    async fn name_of(server: &TestServer, id: SessionId) -> Option<String> {
         server
             .state
             .sessions_manager()
             .await
-            .hostnames()
-            .write()
-            .expect("hostname registry lock poisoned")
-            .register_host_net(created.id, "surface-native");
-        let routed = crate::net::proxy::proxy_get(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
-            &format!("surface-native.min.internal:{backend_port}"),
-        )
-        .await;
-        assert!(
-            routed.contains("200 OK"),
-            "the daemon's own proxy still routes beside the native verdict (NET-019), got: {routed}"
-        );
-    }
-
-    #[tokio::test]
-    async fn get_session_policy_returns_the_policy_configured_at_launch() {
-        // R2.6: GetSessionPolicy reads the live per-session policy from the
-        // record, not a hardcoded default. Create an `OwnIp` session carrying an
-        // explicit egress policy, then read it back over the RPC.
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-
-        let egress = EgressPolicy {
-            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
-            allow_dns_hosts: None,
-            allow_protocols: None,
-            deny_subnets: Some(vec!["192.168.0.0/16".to_string()]),
-        };
-        let created_id = client
-            .call::<CreateSession>(&CreateSessionRequest {
-                config: minimald_rpc::SessionConfig {
-                    name: Some("policy-session".to_string()),
-                    project_path: HostAbsPath::try_new("/uwu").unwrap(),
-                    network: NetworkMode::OwnIp,
-                    policy: SessionPolicy::new(Some(egress.clone()), None),
-                    box_addresses: None,
-                    hooks_enabled: true,
-                    attrs: Default::default(),
-                },
-                must_match_version: None,
-            })
+            .get_record(BoxKeyPredicate::Id(id))
             .await
             .unwrap()
-            .id;
-
-        let policy = client
-            .call::<GetSessionPolicy>(&GetSessionPolicyRequest::Id(created_id))
-            .await
-            .unwrap();
-        assert_eq!(policy.egress, Some(egress));
-        // The configured ingress was `None`, and the read reflects that rather
-        // than the old hardcoded `Some(IngressPolicy::default())`.
-        assert_eq!(policy.ingress, None);
+            .expect("the created record is filed")
+            .name
     }
 
-    /// Creates an own-address session carrying `policy` and returns the
-    /// whole create reply — the box shape the deny-all default is about
-    /// (NET-074): an own-address box, whatever its egress declaration.
-    /// Tests that only need the box take [`own_ip_session`].
-    async fn own_ip_create_reply(
-        client: &mut TestClient,
-        name: &str,
-        policy: SessionPolicy,
-    ) -> minimald_rpc::CreateSessionResponse {
-        client
-            .call::<CreateSession>(&CreateSessionRequest {
-                config: minimald_rpc::SessionConfig {
-                    name: Some(name.to_string()),
-                    project_path: HostAbsPath::try_new("/uwu").unwrap(),
-                    network: NetworkMode::OwnIp,
-                    policy,
-                    box_addresses: None,
-                    hooks_enabled: true,
-                    attrs: Default::default(),
-                },
-                must_match_version: None,
-            })
-            .await
-            .unwrap()
-    }
-
-    /// Creates an own-address session carrying `policy` and returns its id —
-    /// [`own_ip_create_reply`] for a caller that needs only the box.
-    async fn own_ip_session(
-        client: &mut TestClient,
-        name: &str,
-        policy: SessionPolicy,
-    ) -> SessionId {
-        own_ip_create_reply(client, name, policy).await.id
-    }
-
-    /// NET-074/NET-075: `GetEffectiveSessionPolicy` answers, over the real
-    /// SSH wire, what the gate enforces. This build ships the deny-all
-    /// default as announced (NET-076), so the wire half asserts the reply
-    /// the shipped phase resolves, while the in-force posture the rollout
-    /// ends at is proven by passing the phase explicitly to the same
-    /// resolver the handler serves. In force, an own-address box with no
-    /// `egress` section answers `deny_all` — reported as the posture, not as
-    /// a materialized section — and that reply survives the wire codec it
-    /// travels as, while the strict `GetSessionPolicy` reply still carries
-    /// the absent section as `None`: the default reaches the client without
-    /// rewriting the record. A box that declared its own egress answers it
-    /// verbatim, survived the JSON round trip, with its ingress beside it.
-    #[tokio::test]
-    async fn effective_policy_response_round_trips() {
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-
-        let egress = EgressPolicy {
-            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
-            allow_dns_hosts: None,
-            allow_protocols: None,
-            deny_subnets: Some(vec!["192.168.0.0/16".to_string()]),
-        };
-        let declared_id = own_ip_session(
-            &mut client,
-            "declared-egress",
-            SessionPolicy::new(Some(egress.clone()), None),
-        )
-        .await;
-        let bare_id = own_ip_session(&mut client, "bare-egress", SessionPolicy::default()).await;
-
-        // The default's own case, with the phase passed explicitly
-        // (NET-074): an own-address box that declared nothing is deny-all
-        // once the default is in force.
-        assert_eq!(
-            super::effective_policy_reply(
-                &SessionPolicy::default(),
-                NetworkMode::OwnIp,
-                sessions::EgressDefaultPhase::InForce,
-                false,
-            ),
-            EffectiveSessionPolicy {
-                egress: EffectiveEgress::DenyAll,
-                ingress: None,
-            },
-            "an own-address box with no egress section must answer deny-all in force",
-        );
-
-        // The response carries that posture across the wire codec it
-        // travels as — the strict shape untouched beside it: the effective
-        // reply spells the default, `deny_all`, and decodes back to the
-        // same value.
-        let deny_all = EffectiveSessionPolicy {
-            egress: EffectiveEgress::DenyAll,
-            ingress: None,
-        };
-        let wire = serde_json_lenient::to_string(&minimald_rpc::Errorable::Ok(deny_all.clone()))
-            .expect("the deny-all reply must serialize");
-        assert!(
-            wire.contains(r#""egress":"deny_all""#),
-            "the wire must carry the deny-all posture, got: {wire}",
-        );
-        assert_eq!(
-            serde_json_lenient::from_str::<minimald_rpc::Errorable<EffectiveSessionPolicy>>(&wire)
-                .expect("the deny-all reply must decode back"),
-            minimald_rpc::Errorable::Ok(deny_all),
-        );
-
-        // Over the real wire, the reply follows the phase this build ships:
-        // whatever [`sessions::EGRESS_DEFAULT_PHASE`] resolves for a bare
-        // own-address box is what the daemon answers.
-        let bare = client
-            .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(bare_id))
-            .await
-            .unwrap();
-        assert_eq!(
-            bare,
-            super::effective_policy_reply(
-                &SessionPolicy::default(),
-                NetworkMode::OwnIp,
-                sessions::EGRESS_DEFAULT_PHASE,
-                false,
-            ),
-            "the wire must answer the shipped phase's resolution for a bare box",
-        );
-
-        // The strict reply is unchanged: the declaration the box was
-        // launched with, absent section still absent.
-        let strict = client
-            .call::<GetSessionPolicy>(&GetSessionPolicyRequest::Id(bare_id))
-            .await
-            .unwrap();
-        assert_eq!(
-            strict,
-            SessionPolicy::default(),
-            "the strict policy reply must keep the declaration as launched",
-        );
-
-        // A declared section round-trips verbatim, ingress beside it.
-        let declared = client
-            .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(declared_id))
-            .await
-            .unwrap();
-        assert_eq!(declared.egress, EffectiveEgress::Declared(egress));
-        assert_eq!(declared.ingress, None);
-    }
-
-    /// NET-077: a daemon started with the deny-all opt-out keeps the shipped
-    /// allow-all default — an own-address box with no `egress` section
-    /// answers `allow_all` where the same box on an opted-in daemon answers
-    /// `deny_all` once the default is in force (that half passes the phase
-    /// explicitly, since this build ships the default as announced) — and
-    /// its gate resolves no section, so nothing is enforced. A box that
-    /// declared its own egress keeps it either way.
-    #[tokio::test]
-    async fn deny_all_opt_out_keeps_prior_default() {
-        let server = TestServer::new_opted_out_in(tempfile::tempdir().unwrap()).await;
-        let mut client = server.connect().await;
-
-        let egress = EgressPolicy {
-            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
-            ..EgressPolicy::default()
-        };
-        let declared_id = own_ip_session(
-            &mut client,
-            "opt-out-declared",
-            SessionPolicy::new(Some(egress.clone()), None),
-        )
-        .await;
-        let bare_id = own_ip_session(&mut client, "opt-out-bare", SessionPolicy::default()).await;
-
-        let bare = client
-            .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(bare_id))
-            .await
-            .unwrap();
-        assert_eq!(
-            bare,
-            EffectiveSessionPolicy {
-                egress: EffectiveEgress::AllowAll,
-                ingress: None,
-            },
-            "behind the opt-out, an absent egress section keeps the shipped allow-all",
-        );
-
-        // The report and the gate agree, even in force: the same resolution
-        // the launcher applies materializes no section to enforce. The phase
-        // is passed explicitly so the opt-out is proven against the posture
-        // it exists to defer, not only against the announced build.
-        assert_eq!(
-            crate::session::effective_egress_section(
-                &sessions::SessionPolicy::default(),
-                NetworkMode::OwnIp,
-                sessions::EgressDefaultPhase::InForce,
-                true,
-            ),
-            None,
-            "behind the opt-out, the gate compiles no egress section at all",
-        );
-
-        // The opt-out never rewrites a declaration: what the box said is
-        // what it gets, whichever daemon it runs on.
-        let declared = client
-            .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(declared_id))
-            .await
-            .unwrap();
-        assert_eq!(declared.egress, EffectiveEgress::Declared(egress));
-    }
-
-    /// NET-076/NET-077: the create reply carries the daemon's opt-out —
-    /// the rollout's one fact the client cannot know from its own build,
-    /// since the phase is a build-time constant both sides share and the
-    /// flag is set on the daemon alone. `min session activate` reads it to
-    /// keep its coming-change notice off a deployment that has already
-    /// chosen to keep the shipped default; the create reply is the RPC the
-    /// activation path already holds, so the answer costs no extra round
-    /// trip. An opted-out daemon says `true`, a daemon without the flag
-    /// says `false` — never `None`, which is reserved for a daemon that
-    /// predates the field and so cannot have opted out.
-    #[tokio::test]
-    async fn create_reply_reports_the_deny_all_opt_out() {
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-        assert_eq!(
-            own_ip_create_reply(
-                &mut client,
-                "opt-out-reply-default",
-                SessionPolicy::default()
-            )
-            .await
-            .deny_all_opt_out,
-            Some(false),
-            "a daemon without the flag must say it did not opt out",
-        );
-
-        let server = TestServer::new_opted_out_in(tempfile::tempdir().unwrap()).await;
-        let mut client = server.connect().await;
-        assert_eq!(
-            own_ip_create_reply(&mut client, "opt-out-reply-set", SessionPolicy::default())
-                .await
-                .deny_all_opt_out,
-            Some(true),
-            "an opted-out daemon must say so, so the notice can stay off",
-        );
-    }
-
-    #[tokio::test]
-    async fn get_session_screen_snapshots_the_live_terminal() {
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-        let session_id = fresh_session(&mut client).await;
-
-        // Before anything attaches there is no host: the RPC answers with a
-        // soft error instead of minting one.
-        let inactive = client.call::<GetSessionScreen>(&session_id).await;
-        assert!(
-            matches!(&inactive, Errorable::Err { error } if error.contains("not active")),
-            "expected a not-active error, got {inactive:?}",
-        );
-
-        // Attach a shell (the mock launcher runs an echo program), then write
-        // a line the program echoes back prefixed with `got:`.
-        let shell = client.open_shell(session_id).await;
-        shell.data_bytes(&b"hello-screen\n"[..]).await.unwrap();
-
-        // The echo round-trips through the pty asynchronously; poll the RPC
-        // until the parser has seen it.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let snapshot = loop {
-            let resp = client.call::<GetSessionScreen>(&session_id).await;
-            match resp {
-                Errorable::Ok(snap) => {
-                    let text: String = snap
-                        .lines
-                        .iter()
-                        .map(|row| row.cells.iter().map(|c| c.ch).collect::<String>())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if text.contains("got:hello-screen") {
-                        break snap;
-                    }
-                }
-                Errorable::Err { .. } => {}
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "timed out waiting for the echo to reach the screen snapshot",
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        };
-        assert_eq!((snapshot.rows, snapshot.cols), (24, 80));
-    }
-
-    #[tokio::test]
-    async fn create_session_errors_if_name_not_unique() {
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-
-        let id = client
-            .call::<CreateSession>(&req("my-session", "/uwu"))
-            .await
-            .unwrap()
-            .id;
-        assert!(id != SessionId::nil());
-
-        assert_eq!(
-            client
-                .call::<CreateSession>(&req("my-session", "/uwu"))
-                .await,
-            Errorable::Err {
-                error: "A session with that name already exists".to_string()
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn create_session_rejects_policy_incompatible_with_network_mode() {
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-
-        // NET-065: an egress policy on a none (`NoNet`) box is rejected at
-        // declaration time, so the invalid session is never stored. Egress on
-        // a host-address box is accepted (NET-120), so `NoNet` is the only
-        // mode that still refuses it.
-        let egress = EgressPolicy {
-            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
-            allow_dns_hosts: None,
-            allow_protocols: None,
-            deny_subnets: None,
-        };
-        let resp = client
-            .call::<CreateSession>(&CreateSessionRequest {
-                config: minimald_rpc::SessionConfig {
-                    name: Some("bad-policy".to_string()),
-                    project_path: HostAbsPath::try_new("/uwu").unwrap(),
-                    network: NetworkMode::NoNet,
-                    policy: SessionPolicy::new(Some(egress), None),
-                    box_addresses: None,
-                    hooks_enabled: true,
-                    attrs: Default::default(),
-                },
-                must_match_version: None,
-            })
-            .await;
-        assert_eq!(
-            resp,
-            Errorable::Err {
-                error: "egress policy is only valid for an own-IP or host-address PTask, not NoNet"
-                    .to_string()
-            }
-        );
-
-        // The rejected session left nothing behind in the store.
-        let mngr = server.state.sessions_manager().await;
-        assert!(mngr.list().await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn rename_session_propagates_into_the_running_session() {
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-        let session_id = fresh_session(&mut client).await;
-
-        // Bring the session up before renaming, so the rename has to reach the
-        // live actor's in-memory record rather than only touching disk.
-        let mngr = server.state.sessions_manager().await;
-        let handle = mngr
-            .get_session(SessionKeyPredicate::Id(session_id))
-            .await
-            .unwrap()
-            .expect("freshly-created session should be retrievable");
-
-        let resp = client
-            .call::<RenameSession>(&RenameSessionRequest {
-                id: session_id,
-                new_name: "renamed".to_string(),
-            })
-            .await;
-        assert_eq!(resp, Errorable::Ok(RenameSessionResponse));
-
-        // The record held by the running session reflects the new name...
-        let record = handle.record().await.unwrap();
-        assert_eq!(record.name.as_deref(), Some("renamed"));
-        // ...while its id is untouched by the rename.
-        assert_eq!(record.id, session_id);
-
-        // The rename is reflected by GetRecord...
-        let get_session = client
-            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(record.id))
-            .await;
-        assert_eq!(
-            get_session.record.as_ref().unwrap().name,
-            Some("renamed".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn rename_session_to_its_current_name_is_an_error() {
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-        let session_id = fresh_session(&mut client).await;
-
-        // `fresh_session` names the session "stream-test"; renaming it to that
-        // same name must fail rather than silently no-op.
-        let resp = client
-            .call::<RenameSession>(&RenameSessionRequest {
-                id: session_id,
-                new_name: "stream-test".to_string(),
-            })
-            .await;
-
-        assert!(
-            matches!(&resp, Errorable::Err { error } if error.contains("session is already named")),
-            "expected a rename-to-self error, got {resp:?}",
-        );
-
-        // The failed rename left the name intact.
-        let mngr = server.state.sessions_manager().await;
-        let handle = mngr
-            .get_session(SessionKeyPredicate::Id(session_id))
-            .await
-            .unwrap()
-            .expect("freshly-created session should be retrievable");
-        let record = handle.record().await.unwrap();
-        assert_eq!(record.name.as_deref(), Some("stream-test"));
-    }
-
-    #[tokio::test]
-    async fn rename_session_errors_for_unknown_id() {
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-
-        let resp = client
-            .call::<RenameSession>(&RenameSessionRequest {
-                id: SessionId::nil(),
-                new_name: "renamed".to_string(),
-            })
-            .await;
-
-        assert!(
-            matches!(resp, Errorable::Err { error } if error.contains("no session with ID")),
-            "expected an unknown-id error",
-        );
-    }
-
-    /// A verdict for an id with no live session is a terminal, structured
-    /// `Fault::UnknownSessionId` on the wire — not a transport error. This
-    /// mapping lives in `serve_submit_verdict` now that verdicts route to
-    /// per-session actors.
-    #[tokio::test]
-    async fn submit_verdict_unknown_id_returns_unknown_session_id() {
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-
-        let resp = client
-            .call::<minimald_rpc::SubmitVerdict>(&sessions::wire::request::ContributionVerdict {
-                session_id: SessionId::nil(),
-                vars: vec![],
-                patches: vec![],
-                lifecycle_hooks: vec![],
-            })
-            .await;
-        match resp {
-            Errorable::Ok(sessions::wire::request::SessionStep::Fault {
-                error: sessions::wire::errors::WireError::UnknownSessionId,
-            }) => {}
-            other => panic!("expected Fault::UnknownSessionId, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn destroy_session_removes_it_from_get_and_list() {
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-        let session_id = fresh_session(&mut client).await;
-
-        let resp = client
-            .call::<DestroySession>(&DestroySessionRequest { id: session_id })
-            .await;
-        assert_eq!(resp, Errorable::Ok(DestroySessionResponse));
-
-        // The record is gone: it no longer resolves by id...
-        let get_session = client
-            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(session_id))
-            .await;
-        assert!(get_session.record.is_none());
-
-        // ...and it's dropped from the listing.
-        let list_sessions = client.call::<ListSessions>(&()).await;
-        assert!(
-            list_sessions.sessions.is_empty(),
-            "destroyed session should not be listed, got {:?}",
-            list_sessions.sessions,
-        );
-    }
-
-    #[tokio::test]
-    async fn destroy_session_errors_for_unknown_id() {
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-
-        let resp = client
-            .call::<DestroySession>(&DestroySessionRequest {
-                id: SessionId::nil(),
-            })
-            .await;
-
-        assert!(
-            matches!(resp, Errorable::Err { error } if error.contains("no session with ID")),
-            "expected an unknown-id error",
-        );
-    }
-
-    #[tokio::test]
-    async fn shutdown_reports_shutting_down_when_no_sessions_are_live() {
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-
-        let resp = client
-            .call::<Shutdown>(&ShutdownRequest { force: false })
-            .await;
-        assert_eq!(resp, ShutdownResponse::ShuttingDown);
-    }
-
-    #[tokio::test]
-    async fn shutdown_rejects_further_session_work_once_shut_down() {
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-
-        let resp = client
-            .call::<Shutdown>(&ShutdownRequest { force: false })
-            .await;
-        assert_eq!(resp, ShutdownResponse::ShuttingDown);
-
-        // After shutdown the manager refuses to bring sessions up, so even a
-        // lookup for a well-formed id is rejected rather than answered.
-        let mngr = server.state.sessions_manager().await;
-        assert!(
-            mngr.get_session(SessionKeyPredicate::Id(SessionId::nil()))
-                .await
-                .is_err(),
-            "manager should reject session work while shutting down",
-        );
-    }
-
+    /// A create under a name a running box holds is refused, and the
+    /// reply names the holder for the client to print and exit 2 on.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn shutdown_without_force_refuses_while_a_session_is_live() {
+    async fn create_session_reply_names_the_holder_of_a_held_name() {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
-        let session_id = fresh_session(&mut client).await;
+        let holder = create(&mut client, &entry_req("dev", false)).await;
+        assert_eq!(name_of(&server, holder).await.as_deref(), Some("dev"));
 
-        // A session is only "busy" once it hosts a live shell (an idle actor
-        // no longer blocks an unforced shutdown). Open one and drive an echo
-        // round trip so the host is provably up before the shutdown request.
-        let mut channel = client.open_shell(session_id).await;
-        channel.data_bytes(b"hello\n".to_vec()).await.unwrap();
-        let mut stdout = Vec::new();
-        loop {
-            match channel.wait().await {
-                Some(russh::ChannelMsg::Data { data }) => {
-                    stdout.extend_from_slice(&data);
-                    if String::from_utf8_lossy(&stdout).contains("got:hello") {
-                        break;
-                    }
-                }
-                Some(_) => {}
-                None => panic!("channel closed before the echo arrived"),
-            }
-        }
-
-        let resp = client
-            .call::<Shutdown>(&ShutdownRequest { force: false })
-            .await;
-        assert_eq!(resp, ShutdownResponse::SessionsLive);
-
-        // The refusal left the daemon fully operational: the live session is
-        // still reachable and no shutdown flag was latched.
-        let mngr = server.state.sessions_manager().await;
-        assert!(
-            mngr.get_session(SessionKeyPredicate::Id(session_id))
-                .await
-                .unwrap()
-                .is_some(),
-            "an unforced, refused shutdown must not tear down live sessions",
-        );
-    }
-
-    /// A session whose shell has exited still holds its host (the slot
-    /// outlives the process), but nothing runs there for an unforced shutdown
-    /// to interrupt, so it must not refuse. Driven the way the session e2e
-    /// meets it: exit the shell, keep the session at the exit prompt, then
-    /// stop the daemon.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn shutdown_without_force_proceeds_once_a_sessions_shell_has_exited() {
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-        let session_id = fresh_session(&mut client).await;
-
-        let mut channel = client.open_shell(session_id).await;
-        channel.data_bytes(b"hello\n".to_vec()).await.unwrap();
-        let mut stdout = Vec::new();
-        loop {
-            match channel.wait().await {
-                Some(russh::ChannelMsg::Data { data }) => {
-                    stdout.extend_from_slice(&data);
-                    if String::from_utf8_lossy(&stdout).contains("got:hello") {
-                        break;
-                    }
-                }
-                Some(_) => {}
-                None => panic!("channel closed before the echo arrived"),
-            }
-        }
-
-        // Exit the shell and take the prompt's default (keep): the session
-        // survives, its host gone.
-        channel
-            .data_bytes(format!("{}\n", crate::session_host::MOCK_EXIT_LINE).into_bytes())
+        let error = match client
+            .call::<CreateSession>(&create_session_req("dev", "/tmp"))
             .await
-            .unwrap();
-        let mut answered = false;
-        let mut prompt_out = Vec::new();
-        while let Ok(msg) =
-            tokio::time::timeout(std::time::Duration::from_secs(10), channel.wait()).await
         {
-            match msg {
-                Some(russh::ChannelMsg::Data { data }) => {
-                    prompt_out.extend_from_slice(&data);
-                    if !answered
-                        && String::from_utf8_lossy(&prompt_out)
-                            .contains(crate::session_host::SHELL_EXIT_PROMPT)
-                    {
-                        channel.data_bytes(b"\r".to_vec()).await.unwrap();
-                        answered = true;
-                    }
+            Errorable::Err { error } => error,
+            Errorable::Ok(created) => panic!("a held name is not refused: {created:?}"),
+        };
+        let refusal = HeldNameRefusal::from_error(&error)
+            .unwrap_or_else(|| panic!("the reply names the holder: {error}"));
+        assert_eq!(
+            refusal,
+            HeldNameRefusal {
+                name: "dev".to_string(),
+                holder: Some(holder),
+                holder_name: "dev".to_string(),
+            }
+        );
+        assert_eq!(HeldNameRefusal::EXIT_CODE, 2);
+        assert!(error.contains(&holder.to_string()), "{error}");
+        assert!(
+            error.contains(&format!("min session rename {holder} <new-name>")),
+            "the refusal names the next step: {error}"
+        );
+        assert_eq!(
+            HeldNameRefusal::from_error("A session with that name already exists"),
+            None,
+            "any other error is not a held-name refusal"
+        );
+    }
+
+    /// A fresh instance takes `<name>-<n>`, with the smallest `n` that no
+    /// retained record uses, while a running box holds `<name>`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_session_fresh_instance_takes_the_smallest_unused_suffix() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let dev = create(&mut client, &entry_req("dev", false)).await;
+        let first = create(&mut client, &entry_req("dev", true)).await;
+        let second = create(&mut client, &entry_req("dev", true)).await;
+        assert_eq!(name_of(&server, dev).await.as_deref(), Some("dev"));
+        assert_eq!(name_of(&server, first).await.as_deref(), Some("dev-1"));
+        assert_eq!(name_of(&server, second).await.as_deref(), Some("dev-2"));
+
+        // A fresh instance with no running holder still takes a suffix.
+        let web = create(&mut client, &entry_req("web", true)).await;
+        assert_eq!(name_of(&server, web).await.as_deref(), Some("web-1"));
+    }
+
+    /// A task entry that is not a DNS label, such as `build_all`, names a
+    /// fresh instance with a valid label, not a refused create.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_session_fresh_instance_maps_the_entry_onto_a_label() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let build = create(&mut client, &entry_req("build_all", true)).await;
+        assert_eq!(
+            name_of(&server, build).await.as_deref(),
+            Some("build-all-1")
+        );
+        let lint = create(&mut client, &entry_req("CI.Lint", true)).await;
+        assert_eq!(name_of(&server, lint).await.as_deref(), Some("ci-lint-1"));
+    }
+}
+
+/// BOX-155 and BOX-164 over the wire: a box's log reads back by id, and a
+/// write from inside the box reaches neither the log nor the record.
+#[cfg(test)]
+mod read_log_tests {
+    use boxes::SessionId;
+    use boxes::store::{BoxDir, LOG_FILE};
+    use minimald_rpc::{CreateSession, Errorable, ReadLogRequest, ReadLogUpdate};
+    use paths::DaemonAbsPath;
+
+    use crate::box_actor::BoxPaths;
+    use crate::box_runtime::BoxOutputLog;
+    use crate::test_harness::{TestClient, TestServer, captured_log, create_session_req};
+
+    /// Reads the box's log over [`READ_LOG_SUBSYSTEM`](minimald_rpc::READ_LOG_SUBSYSTEM)
+    /// without following: every update line, and the extended data.
+    async fn read_log(client: &mut TestClient, id: SessionId) -> (Vec<ReadLogUpdate>, String) {
+        use tokio::io::AsyncWriteExt as _;
+
+        let mut channel = client
+            .open_subsystem(minimald_rpc::READ_LOG_SUBSYSTEM, &[])
+            .await;
+        let req = ReadLogRequest {
+            id,
+            offset: 0,
+            follow: false,
+        };
+        let mut writer = channel.make_writer();
+        writer
+            .write_all(&serde_json_lenient::to_vec(&req).unwrap())
+            .await
+            .unwrap();
+        drop(writer);
+        channel.eof().await.unwrap();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while let Some(msg) = channel.wait().await {
+                match msg {
+                    russh::ChannelMsg::Data { data } => out.extend_from_slice(&data),
+                    russh::ChannelMsg::ExtendedData { data, .. } => err.extend_from_slice(&data),
+                    russh::ChannelMsg::Close => break,
+                    _ => {}
                 }
-                Some(_) => {}
-                None => break,
+            }
+        })
+        .await
+        .expect("the read answers in time");
+        let updates = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json_lenient::from_str(line).expect("each line is an update"))
+            .collect();
+        (updates, String::from_utf8_lossy(&err).into_owned())
+    }
+
+    /// The directories mounted into the box whose directory is `dir`.
+    fn box_paths(dir: &BoxDir) -> BoxPaths {
+        let root = dir.log_path().parent().unwrap();
+        BoxPaths {
+            working: paths::sub_path!(root, "tree"),
+            cache: paths::sub_path!(root, "cache"),
+            home: paths::sub_path!(root, "home"),
+            patches: paths::sub_path!(root, "patches"),
+            hooks: paths::sub_path!(root, "hooks"),
+        }
+    }
+
+    fn visible(paths: &BoxPaths) -> [&DaemonAbsPath; 5] {
+        [
+            &paths.working,
+            &paths.cache,
+            &paths.home,
+            &paths.patches,
+            &paths.hooks,
+        ]
+    }
+
+    async fn create(client: &mut TestClient, name: &str) -> SessionId {
+        match client
+            .call::<CreateSession>(&create_session_req(name, "/tmp"))
+            .await
+        {
+            Errorable::Ok(created) => created.id,
+            Errorable::Err { error } => panic!("the create is refused: {error}"),
+        }
+    }
+
+    /// BOX-164, placement and refusal: the log, the record and the events
+    /// sit outside every directory the box sees. A log, a record, a spec or
+    /// an events file written into those directories, as root inside the
+    /// box can, is not the box's: the log reads back only what the daemon
+    /// wrote, and the record is unchanged. A link planted where a log goes
+    /// is refused, not written through, and the daemon log names the
+    /// refusal. No process runs inside a box here. The proof that uid 0
+    /// inside a real sandbox cannot write is the `_root_integration` test
+    /// that #2661 owns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_box_root_cannot_write_record_or_log() {
+        let capture = captured_log();
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let id = create(&mut client, "guarded").await;
+        let state = server.state.minimal_state_dir().await;
+        let dir = BoxDir::find(&state, &id)
+            .unwrap()
+            .expect("the created box has a directory");
+        let paths = box_paths(&dir);
+        let record = dir.record().unwrap();
+        let spec_path = dir
+            .log_path()
+            .parent()
+            .unwrap()
+            .as_utf8_path()
+            .join("spec.json");
+        let spec = std::fs::read(&spec_path).ok();
+
+        for daemon_file in [dir.log_path(), dir.events_path()] {
+            for seen in visible(&paths) {
+                assert!(
+                    !daemon_file.starts_with(seen),
+                    "{} is inside {}, which the box sees",
+                    daemon_file.as_str(),
+                    seen.as_str()
+                );
             }
         }
-        assert!(
-            answered,
-            "expected the session-exit prompt to render; got: {:?}",
-            String::from_utf8_lossy(&prompt_out)
-        );
 
-        let mngr = server.state.sessions_manager().await;
-        let session = mngr
-            .get_session(SessionKeyPredicate::Id(session_id))
-            .await
-            .unwrap()
-            .expect("keep leaves the session in place");
-        // The host loop winds down after the channel closes; bounded wait.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        while session.is_busy().await {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "a session whose shell has exited stayed busy",
+        // The daemon writes the box's output.
+        let mut log = BoxOutputLog::open(id, &paths).expect("the daemon opens the box's log");
+        log.write(b"from the daemon\r\n");
+
+        // Root inside the box writes everywhere it can reach.
+        let mut forged = record.clone();
+        forged.exit_code = Some(9);
+        forged.parent = Some(SessionId::mint());
+        let forged = serde_json_lenient::to_vec(&forged).unwrap();
+        for seen in visible(&paths) {
+            let seen = seen.as_utf8_path();
+            std::fs::create_dir_all(seen).unwrap();
+            for name in [LOG_FILE, boxes::events::EVENTS_FILE, "spec.json"] {
+                std::fs::write(seen.join(name), b"forged\n").unwrap();
+            }
+            std::fs::write(seen.join("record.json"), &forged).unwrap();
+        }
+        log.write(b"still the daemon\r\n");
+
+        let (updates, err) = read_log(&mut client, id).await;
+        let expected = b"from the daemon\r\nstill the daemon\r\n".to_vec();
+        let len = expected.len() as u64;
+        assert_eq!(
+            updates,
+            [
+                ReadLogUpdate::Output {
+                    offset: 0,
+                    data: expected
+                },
+                ReadLogUpdate::Done { offset: len },
+            ],
+            "only what the daemon wrote reads back (stderr: {err})"
+        );
+        assert_eq!(dir.record().unwrap(), record, "the record is unchanged");
+        assert_eq!(
+            std::fs::read(&spec_path).ok(),
+            spec,
+            "the spec is unchanged"
+        );
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(dir.log_path().as_utf8_path())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "only the daemon's user can open the log"
             );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
-        let resp = client
-            .call::<Shutdown>(&ShutdownRequest { force: false })
-            .await;
-        assert_eq!(resp, ShutdownResponse::ShuttingDown);
-    }
-
-    #[tokio::test]
-    async fn shutdown_with_force_tears_down_live_sessions() {
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-        let session_id = fresh_session(&mut client).await;
-
-        let mngr = server.state.sessions_manager().await;
-        mngr.get_session(SessionKeyPredicate::Id(session_id))
-            .await
-            .unwrap()
-            .expect("freshly-created session should be retrievable");
-
-        // `force` overrides the live-session guard: the daemon shuts down...
-        let resp = client
-            .call::<Shutdown>(&ShutdownRequest { force: true })
-            .await;
-        assert_eq!(resp, ShutdownResponse::ShuttingDown);
-
-        // ...and, being in shutdown, refuses to hand out sessions afterwards.
+        // A link where a second box's log goes is refused, not followed.
+        let linked = create(&mut client, "linked").await;
+        let linked_dir = BoxDir::find(&state, &linked).unwrap().unwrap();
+        let linked_paths = box_paths(&linked_dir);
+        std::fs::create_dir_all(linked_paths.working.as_utf8_path()).unwrap();
+        let target = linked_paths.working.as_utf8_path().join("target");
+        std::fs::write(&target, b"").unwrap();
+        std::os::unix::fs::symlink(&target, linked_dir.log_path().as_utf8_path()).unwrap();
         assert!(
-            mngr.get_session(SessionKeyPredicate::Id(session_id))
-                .await
-                .is_err(),
-            "a forced shutdown should leave the manager rejecting session work",
+            BoxOutputLog::open(linked, &linked_paths).is_err(),
+            "a box whose log is refused does not get a log"
         );
-    }
-
-    #[tokio::test]
-    async fn get_mesh_status_is_unconfigured_by_default() {
-        // Without a mesh installed, the RPC answers cleanly with `configured =
-        // false` rather than erroring (this is also the answer a daemon built
-        // without the `networking-wg` feature gives).
-        let server = TestServer::new().await;
-        let mut client = server.connect().await;
-
-        let resp = client.call::<minimald_rpc::GetMeshStatus>(&()).await;
-
-        assert!(!resp.configured);
-        assert!(resp.own_public_key.is_none());
-        assert!(resp.peers.is_empty());
-    }
-
-    #[cfg(feature = "networking-wg")]
-    #[tokio::test]
-    async fn get_mesh_status_reports_own_key_and_peers() {
-        use crate::net::wg::{Keypair, MeshConfig, PeerConfig};
-
-        let server = TestServer::new().await;
-
-        // Stand up a real mesh peer with one configured peer and install it.
-        let remote = Keypair::generate();
-        let cfg = MeshConfig {
-            keypair: Keypair::generate(),
-            listen_port: 0, // ephemeral; no traffic is sent in this test
-            advertised_subnets: vec!["100.64.0.0/16".parse().unwrap()],
-            peers: vec![PeerConfig {
-                name: "remote".to_string(),
-                public_key: remote.public(),
-                endpoint: None,
-                allowed_ips: vec!["100.65.0.0/16".parse().unwrap()],
-            }],
-        };
-        let (sink_tx, _sink_rx) = tokio::sync::mpsc::channel(1);
-        let mesh = std::sync::Arc::new(crate::net::wg::start(cfg, sink_tx).await.unwrap());
-        let own_pub = mesh.own_public_key().to_base64();
-        server.state.set_mesh(mesh).await;
-
-        let mut client = server.connect().await;
-        let resp = client.call::<minimald_rpc::GetMeshStatus>(&()).await;
-
-        assert!(resp.configured);
-        assert_eq!(resp.own_public_key.as_deref(), Some(own_pub.as_str()));
-        assert_eq!(resp.advertised_subnets, vec!["100.64.0.0/16".to_string()]);
-        assert_eq!(resp.peers.len(), 1);
-        assert_eq!(resp.peers[0].name, "remote");
-        assert_eq!(resp.peers[0].public_key, remote.public().to_base64());
-        // Keep the sink alive until the assertions complete.
-        drop(_sink_rx);
-    }
-
-    /// The answerer control socket's gate mirrors the VM host daemon's
-    /// door: the daemon's own uid asks every verb, root only the handover's
-    /// release and its cancel — a status ask or a box verb from root is
-    /// refused — and any other uid nothing.
-    #[test]
-    fn answerer_control_admits_root_only_the_handover_verbs() {
-        let own = 1000;
-        for request in [
-            BoxControlRequest::AnswererStatus,
-            BoxControlRequest::ReleaseAnswerer,
-            BoxControlRequest::ReleaseAnswererCancel,
-        ] {
-            assert!(answerer_control_admits(own, own, &request), "{request:?}");
-        }
-        assert!(answerer_control_admits(
-            0,
-            own,
-            &BoxControlRequest::ReleaseAnswerer
-        ));
-        assert!(answerer_control_admits(
-            0,
-            own,
-            &BoxControlRequest::ReleaseAnswererCancel
-        ));
-        assert!(
-            !answerer_control_admits(0, own, &BoxControlRequest::AnswererStatus),
-            "root asking the status is refused"
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"",
+            "the link was not written through"
         );
+        let logged = capture.contents();
         assert!(
-            !answerer_control_admits(
-                0,
-                own,
-                &BoxControlRequest::ReadRow(minimald_rpc::ReadRowRequest {
-                    name: "web".to_string(),
-                })
-            ),
-            "root asking a row read is refused"
-        );
-        assert!(!answerer_control_admits(
-            4242,
-            own,
-            &BoxControlRequest::ReleaseAnswerer
-        ));
-    }
-
-    /// A stale control socket — a file at the daemon's own path that no
-    /// listener answers — is unlinked and re-bound; a live one is refused
-    /// and left in place, never taken out from under the daemon serving it.
-    #[tokio::test]
-    async fn answerer_control_rebinds_a_stale_socket_and_refuses_a_live_one() {
-        let server = TestServer::new().await;
-        let dir = std::path::PathBuf::from(server.state.minimal_state_dir().await.as_str());
-        let sock = dir.join(ANSWERER_CONTROL_SOCK_FILE);
-
-        // A corpse: bound, then its listener dropped, so the file stays.
-        drop(std::os::unix::net::UnixListener::bind(&sock).expect("a stale socket binds"));
-        assert!(sock.exists(), "the stale socket file is left behind");
-        spawn_answerer_control(
-            &server.state,
-            crate::net::answerer::AnswererStatus::starting(),
-        )
-        .await
-        .expect("a stale socket is unlinked and re-bound");
-        let mut stream = tokio::net::UnixStream::connect(&sock)
-            .await
-            .expect("the re-bound socket answers");
-        stream
-            .write_all(b"{\"verb\":\"answerer_status\"}\n")
-            .await
-            .expect("the ask is written");
-        let mut reply = String::new();
-        stream
-            .read_to_string(&mut reply)
-            .await
-            .expect("the reply is read");
-        assert!(
-            reply.contains("state"),
-            "the re-bound door answers its own uid a status: {reply}"
+            logged.contains("refused to open the box's output log")
+                && logged.contains(linked_dir.log_path().as_str()),
+            "the daemon log names the refused log: {logged}"
         );
 
-        // Live: a second bind at the same path is refused, the file kept.
-        let refused = spawn_answerer_control(
-            &server.state,
-            crate::net::answerer::AnswererStatus::starting(),
-        )
-        .await
-        .expect_err("a live door is not taken");
-        assert_eq!(refused.kind(), std::io::ErrorKind::AddrInUse);
-        assert!(
-            tokio::net::UnixStream::connect(&sock).await.is_ok(),
-            "the live door still answers"
-        );
+        // A read of a box no record names is refused before any update.
+        let unknown = SessionId::mint();
+        let (updates, err) = read_log(&mut client, unknown).await;
+        assert!(updates.is_empty(), "{updates:?}");
+        assert!(err.contains(minimald_rpc::UNKNOWN_SESSION_ID_LEAD), "{err}");
     }
 }

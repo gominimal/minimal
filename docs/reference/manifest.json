@@ -13,6 +13,7 @@
     "reproducibility.md",
     "stack-specs.md",
     "sandbox-operations.md",
-    "linux-host-setup.md"
+    "linux-host-setup.md",
+    "telemetry.md"
   ]
 }

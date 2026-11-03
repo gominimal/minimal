@@ -4,6 +4,6 @@ description: How session contributions flow from declarative sources to the Comp
 ---
 
 This page embeds the maintained crate document
-[`crates/sessions/docs/COMPOSITION.md`](https://github.com/gominimal/minimal/blob/main/crates/sessions/docs/COMPOSITION.md).
+[`crates/boxes/docs/COMPOSITION.md`](https://github.com/gominimal/minimal/blob/main/crates/boxes/docs/COMPOSITION.md).
 
-<!--@include: ../../crates/sessions/docs/COMPOSITION.md-->
+<!--@include: ../../crates/boxes/docs/COMPOSITION.md-->

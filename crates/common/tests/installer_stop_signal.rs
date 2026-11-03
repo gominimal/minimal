@@ -57,9 +57,9 @@ fn installer_matches_the_message_the_cli_actually_prints() {
          with a stopped daemon would prompt"
     );
 
-    let cli_path = root.join("crates/minimal/src/cmd/session.rs");
+    let cli_path = root.join("crates/minimal/src/cmd/boxes/lifecycle.rs");
     let cli = std::fs::read_to_string(&cli_path)
-        .expect("failed to read crates/minimal/src/cmd/session.rs");
+        .expect("failed to read crates/minimal/src/cmd/boxes/lifecycle.rs");
 
     assert!(
         cli.contains(needle),

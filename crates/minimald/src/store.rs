@@ -1,8 +1,8 @@
-use paths::DaemonAbsPath;
-use sessions::{
+use boxes::{
     Record, SessionId,
-    store::{DiskLoader, DiskSession, DiskSessionKey, Loader as _, SessionKey, SessionObject},
+    store::{BoxKey, BoxObject, DiskBox, DiskBoxKey, DiskLoader, Loader as _},
 };
+use paths::DaemonAbsPath;
 
 use std::fmt;
 use tokio::sync::{mpsc, oneshot};
@@ -24,44 +24,39 @@ impl fmt::Display for RecordPredicate {
 }
 
 enum StoreMessage {
-    Handles(oneshot::Sender<Result<Vec<SessionRecordHandle>, std::io::Error>>),
+    Handles(oneshot::Sender<Result<Vec<BoxRecordHandle>, std::io::Error>>),
     Create(
         Box<Record>,
-        oneshot::Sender<Result<SessionRecordHandle, std::io::Error>>,
+        Option<SessionId>,
+        oneshot::Sender<Result<BoxRecordHandle, std::io::Error>>,
     ),
     Find(
         RecordPredicate,
-        oneshot::Sender<Result<Option<SessionRecordHandle>, std::io::Error>>,
+        oneshot::Sender<Result<Option<BoxRecordHandle>, std::io::Error>>,
     ),
-    SessionGet(
-        DiskSessionKey,
-        oneshot::Sender<Result<Record, std::io::Error>>,
-    ),
-    SessionObject(
-        DiskSessionKey,
-        oneshot::Sender<Result<DiskSession, std::io::Error>>,
-    ),
+    SessionGet(DiskBoxKey, oneshot::Sender<Result<Record, std::io::Error>>),
+    BoxObject(DiskBoxKey, oneshot::Sender<Result<DiskBox, std::io::Error>>),
     SessionWrite(
-        DiskSessionKey,
+        DiskBoxKey,
         Box<Record>,
         oneshot::Sender<Result<(), std::io::Error>>,
     ),
-    SessionDelete(DiskSessionKey, oneshot::Sender<Result<(), std::io::Error>>),
+    SessionDelete(DiskBoxKey, oneshot::Sender<Result<(), std::io::Error>>),
     CompositionLoad(
-        DiskSessionKey,
-        oneshot::Sender<Result<Option<sessions::core::compose::Composition>, std::io::Error>>,
+        DiskBoxKey,
+        oneshot::Sender<Result<Option<boxes::core::compose::Composition>, std::io::Error>>,
     ),
     CompositionStore(
-        DiskSessionKey,
-        std::sync::Arc<sessions::core::compose::Composition>,
+        DiskBoxKey,
+        std::sync::Arc<boxes::core::compose::Composition>,
         oneshot::Sender<Result<(), std::io::Error>>,
     ),
     DeltaBaselineLoad(
-        DiskSessionKey,
+        DiskBoxKey,
         oneshot::Sender<Result<Option<Vec<u8>>, std::io::Error>>,
     ),
     DeltaBaselineStore(
-        DiskSessionKey,
+        DiskBoxKey,
         Vec<u8>,
         oneshot::Sender<Result<(), std::io::Error>>,
     ),
@@ -73,12 +68,25 @@ pub struct Store {
     receiver: mpsc::Receiver<StoreMessage>,
     weak_self: WeakStoreHandle,
     store: DiskLoader,
+    /// Mints the id of each record this store creates. Production's is
+    /// [`SessionId::mint`]; a test hands one that repeats an id, to drive
+    /// the collision refusal.
+    mint: fn() -> SessionId,
 }
 
 impl Store {
     /// Launches the session store actor, managing session records in
     /// the given minimal state dir.
     pub async fn init(minimal_state_dir: DaemonAbsPath) -> Result<StoreHandle, std::io::Error> {
+        Self::init_with_mint(minimal_state_dir, SessionId::mint).await
+    }
+
+    /// [`Store::init`] with the id minter `mint` in place of
+    /// [`SessionId::mint`].
+    pub(crate) async fn init_with_mint(
+        minimal_state_dir: DaemonAbsPath,
+        mint: fn() -> SessionId,
+    ) -> Result<StoreHandle, std::io::Error> {
         let l = DiskLoader::new(minimal_state_dir.clone())?;
 
         let (sender, receiver) = mpsc::channel(8);
@@ -88,9 +96,11 @@ impl Store {
             receiver,
             weak_self,
             store: l,
+            mint,
         };
 
-        tokio::spawn(store.mainloop());
+        // Lives for the daemon: a root of its own (see `traced::spawn_detached`).
+        crate::traced::spawn_detached(tracing::info_span!(parent: None, "store"), store.mainloop());
         Ok(handle)
     }
 }
@@ -103,17 +113,50 @@ impl Store {
     }
 
     /// Resolves a predicate to a key, if a matching record exists.
-    fn resolve(&self, pred: &RecordPredicate) -> Result<Option<DiskSessionKey>, std::io::Error> {
+    fn resolve(&self, pred: &RecordPredicate) -> Result<Option<DiskBoxKey>, std::io::Error> {
         match pred {
             RecordPredicate::Id(id) => self.store.find_by_id(id),
             RecordPredicate::Name(name) => self.store.find_by_name(name),
         }
     }
 
+    /// Files `record` under a freshly minted id (BOX-001). The id the
+    /// record carries is overwritten: a client never names a box's id. A
+    /// minted id that a retained record already names refuses the
+    /// creation and leaves the store unchanged (BEP-070).
+    ///
+    /// `handed` is the id the VM host daemon minted for the box (BOX-002).
+    /// The store files the record under it in place of its own mint, with
+    /// the same refusal.
+    fn create(
+        &mut self,
+        mut record: Record,
+        handed: Option<SessionId>,
+    ) -> Result<DiskBoxKey, std::io::Error> {
+        let id = handed.unwrap_or_else(self.mint);
+        if self.store.find_by_id(&id)?.is_some() {
+            tracing::warn!(
+                box_id = %id,
+                handed = handed.is_some(),
+                "refused a create: the minted box id is already held by a retained record"
+            );
+            // A re-run gets a new id. A fresh mint differs on the next
+            // run. A handed id is the id of a row the client registered:
+            // the client withdraws that row on a failed create and
+            // registers a fresh one, with a fresh id, on the next run.
+            return Err(std::io::Error::other(format!(
+                "the new session's id {id} is already in use by another session. \
+                 No session was created. Run the command again."
+            )));
+        }
+        record.id = id;
+        self.store.create_with_id(record)
+    }
+
     /// Wraps a key in a record handle. The caller awaiting this message holds a
     /// strong [`StoreHandle`], so the upgrade always succeeds.
-    fn handle_for(&self, k: DiskSessionKey) -> SessionRecordHandle {
-        SessionRecordHandle {
+    fn handle_for(&self, k: DiskBoxKey) -> BoxRecordHandle {
+        BoxRecordHandle {
             h: self
                 .weak_self
                 .upgrade()
@@ -128,8 +171,8 @@ impl Store {
             StoreMessage::Handles(r) => {
                 let _ = r.send(Ok(self.store.keys().map(|k| self.handle_for(k)).collect()));
             }
-            StoreMessage::Create(record, r) => {
-                let created = self.store.create(*record);
+            StoreMessage::Create(record, handed, r) => {
+                let created = self.create(*record, handed);
                 let _ = r.send(created.map(|k| self.handle_for(k)));
             }
             StoreMessage::Find(pred, r) => {
@@ -141,13 +184,20 @@ impl Store {
             StoreMessage::SessionGet(k, r) => {
                 let _ = r.send(self.store.get(&k).map(|o| o.record().clone()));
             }
-            StoreMessage::SessionObject(k, r) => {
+            StoreMessage::BoxObject(k, r) => {
                 let _ = r.send(self.store.get(&k));
             }
             StoreMessage::SessionWrite(k, v, r) => {
                 let _ = r.send(self.store.save(&k, &v));
             }
             StoreMessage::SessionDelete(k, r) => {
+                #[cfg(test)]
+                if test_faults::take_delete_failure(k.id()) {
+                    let _ = r.send(Err(std::io::Error::other(
+                        "test fault: the record delete failed",
+                    )));
+                    return;
+                }
                 let _ = r.send(self.store.delete(&k));
             }
             StoreMessage::CompositionLoad(k, r) => {
@@ -182,7 +232,7 @@ impl StoreHandle {
     }
 
     /// Returns a handle to every session record known to this store.
-    pub async fn handles(&self) -> Result<Vec<SessionRecordHandle>, std::io::Error> {
+    pub async fn handles(&self) -> Result<Vec<BoxRecordHandle>, std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self.sender.send(StoreMessage::Handles(send)).await;
@@ -190,13 +240,32 @@ impl StoreHandle {
     }
 
     /// Creates a record, returning a handle to it. The record's `id` is
-    /// ignored — the store allocates the real one.
-    pub async fn create(&self, record: Record) -> Result<SessionRecordHandle, std::io::Error> {
+    /// ignored — the store mints the real one, and refuses the creation
+    /// when a retained record already names it.
+    pub async fn create(&self, record: Record) -> Result<BoxRecordHandle, std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self
             .sender
-            .send(StoreMessage::Create(Box::new(record), send))
+            .send(StoreMessage::Create(Box::new(record), None, send))
+            .await;
+        recv.await.expect("corresponding store is dead")
+    }
+
+    /// [`Self::create`] under `id`, the id the VM host daemon minted for
+    /// the box (BOX-002), in place of the store's own mint. The record's
+    /// `id` is ignored the same way, and an `id` that a retained record
+    /// already names refuses the creation the same way.
+    pub async fn create_under(
+        &self,
+        record: Record,
+        id: SessionId,
+    ) -> Result<BoxRecordHandle, std::io::Error> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .sender
+            .send(StoreMessage::Create(Box::new(record), Some(id), send))
             .await;
         recv.await.expect("corresponding store is dead")
     }
@@ -205,7 +274,7 @@ impl StoreHandle {
     pub async fn find(
         &self,
         record: RecordPredicate,
-    ) -> Result<Option<SessionRecordHandle>, std::io::Error> {
+    ) -> Result<Option<BoxRecordHandle>, std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self.sender.send(StoreMessage::Find(record, send)).await;
@@ -216,12 +285,12 @@ impl StoreHandle {
 /// A handle to read or write a specific session record. All mutations to
 /// a specific record are mediated through one of these handles.
 #[derive(Debug, Clone)]
-pub struct SessionRecordHandle {
+pub struct BoxRecordHandle {
     h: StoreHandle,
-    k: DiskSessionKey,
+    k: DiskBoxKey,
 }
 
-impl SessionRecordHandle {
+impl BoxRecordHandle {
     /// Returns the session ID this handle corresponds to.
     pub fn id(&self) -> &SessionId {
         self.k.id()
@@ -229,13 +298,13 @@ impl SessionRecordHandle {
 
     /// Returns the full session object (record plus its on-disk paths), for
     /// callers that need the workspace/home/cache layout to spawn a session.
-    pub async fn object(&self) -> Result<DiskSession, std::io::Error> {
+    pub async fn object(&self) -> Result<DiskBox, std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self
             .h
             .sender
-            .send(StoreMessage::SessionObject(self.k.clone(), send))
+            .send(StoreMessage::BoxObject(self.k.clone(), send))
             .await;
         recv.await.expect("corresponding store is dead")
     }
@@ -287,7 +356,7 @@ impl SessionRecordHandle {
     /// and fall back to baseline.
     pub async fn load_composition(
         &self,
-    ) -> Result<Option<sessions::core::compose::Composition>, std::io::Error> {
+    ) -> Result<Option<boxes::core::compose::Composition>, std::io::Error> {
         let (send, recv) = oneshot::channel();
         let _ = self
             .h
@@ -303,7 +372,7 @@ impl SessionRecordHandle {
     /// `min session activate` time.
     pub async fn store_composition(
         &self,
-        composition: &sessions::core::compose::Composition,
+        composition: &boxes::core::compose::Composition,
     ) -> Result<(), std::io::Error> {
         let (send, recv) = oneshot::channel();
         let _ = self
@@ -369,11 +438,49 @@ impl WeakStoreHandle {
     }
 }
 
+/// Test-only faults the store actor injects, keyed by the box id so
+/// tests that run in parallel do not see each other's faults.
+#[cfg(test)]
+pub(crate) mod test_faults {
+    use boxes::SessionId;
+    use std::sync::Mutex;
+
+    static FAIL_NEXT_DELETE: Mutex<Vec<SessionId>> = Mutex::new(Vec::new());
+
+    /// Makes the next record delete of `id` fail once.
+    pub(crate) fn fail_next_delete(id: SessionId) {
+        FAIL_NEXT_DELETE
+            .lock()
+            .expect("test fault lock poisoned")
+            .push(id);
+    }
+
+    /// Whether a delete failure of `id` is armed and not yet consumed.
+    pub(crate) fn delete_failure_armed(id: &SessionId) -> bool {
+        FAIL_NEXT_DELETE
+            .lock()
+            .expect("test fault lock poisoned")
+            .contains(id)
+    }
+
+    /// Consumes the armed delete failure of `id`, if there is one.
+    pub(super) fn take_delete_failure(id: &SessionId) -> bool {
+        let mut armed = FAIL_NEXT_DELETE.lock().expect("test fault lock poisoned");
+        match armed.iter().position(|armed_id| armed_id == id) {
+            Some(index) => {
+                armed.swap_remove(index);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boxes::{BoxState, NetworkMode};
     use paths::HostAbsPath;
-    use sessions::{NetworkMode, SessionStatus};
     use std::collections::BTreeSet;
     use std::io::ErrorKind;
     use tempfile::TempDir;
@@ -391,12 +498,26 @@ mod tests {
             project_path: HostAbsPath::try_new("/home/alice/proj").unwrap(),
             network: NetworkMode::default(),
             policy: Default::default(),
+            task_addresses: Vec::new(),
             box_addresses: None,
             hooks_enabled: true,
-            status: SessionStatus::default(),
+            status: BoxState::default(),
+            reason: None,
+            exit_code: None,
+            signal: None,
             // No launch has recorded anything: these records are built
             // straight from disk-side seeds, never launched.
             host_ip_enforcement: None,
+            box_id: None,
+            host_row_bound: false,
+            bound_ports: std::collections::BTreeSet::new(),
+            // No run ever minted these records, so none ends with one.
+            ends_with_run: false,
+            sealed_deliveries: Vec::new(),
+            root_certificate: None,
+            box_type: None,
+            parent: None,
+            project_root: None,
             attrs: Default::default(),
         }
     }
@@ -416,8 +537,74 @@ mod tests {
         (handle, ids)
     }
 
+    /// BOX-001, BEP-070: a minted id that a retained record already names
+    /// refuses the creation, and the store is unchanged after it.
+    #[tokio::test]
+    async fn colliding_box_id_refuses_creation() {
+        static HELD: std::sync::OnceLock<SessionId> = std::sync::OnceLock::new();
+        fn mint_the_held_id() -> SessionId {
+            *HELD
+                .get()
+                .expect("the held id is set before the store mints")
+        }
+
+        let dir = TempDir::new().unwrap();
+        let held = {
+            // Seed a record that already names its box type, so the
+            // one-time migration at the reopen below leaves it unchanged.
+            let seed = Record {
+                box_type: Some(boxes::SESSION_BOX_TYPE.to_string()),
+                ..record_named("held")
+            };
+            let (store, ids) = store_seeded_with(&dir, [seed]).await;
+            let held = open(&store, RecordPredicate::Id(ids[0]))
+                .await
+                .record()
+                .await
+                .unwrap();
+            assert_eq!(held.id, ids[0]);
+            held
+        };
+        HELD.set(held.id).unwrap();
+
+        let store = Store::init_with_mint(daemon_dir(&dir), mint_the_held_id)
+            .await
+            .unwrap();
+        // Read the held record after the reopen, so the start-up migration
+        // is not part of what the refused create must leave unchanged.
+        let before = open(&store, RecordPredicate::Id(held.id))
+            .await
+            .record()
+            .await
+            .unwrap();
+        let err = store
+            .create(record_named("other"))
+            .await
+            .expect_err("a minted id a retained record names is refused");
+        assert!(
+            err.to_string().contains("already in use"),
+            "the refusal says what happened: {err}"
+        );
+
+        assert_eq!(stored_ids(&store).await, BTreeSet::from([held.id]));
+        assert!(
+            store
+                .find(RecordPredicate::Name("other".to_string()))
+                .await
+                .unwrap()
+                .is_none(),
+            "the refused record is not filed"
+        );
+        let after = open(&store, RecordPredicate::Id(held.id))
+            .await
+            .record()
+            .await
+            .unwrap();
+        assert_eq!(after, before, "the retained record is unchanged");
+    }
+
     /// Resolve a handle to a record expected to exist.
-    async fn open(store: &StoreHandle, pred: RecordPredicate) -> SessionRecordHandle {
+    async fn open(store: &StoreHandle, pred: RecordPredicate) -> BoxRecordHandle {
         store
             .find(pred)
             .await
@@ -477,6 +664,11 @@ mod tests {
             handle.record().await.unwrap().name.as_deref(),
             Some("named")
         );
+
+        // A different casing resolves to the same record: names are unique
+        // under ASCII case folding.
+        let folded = open(&store, RecordPredicate::Name("NAMED".to_string())).await;
+        assert_eq!(*folded.id(), ids[0]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

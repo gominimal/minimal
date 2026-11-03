@@ -175,8 +175,8 @@ fn resolve_switch_octet(lock_dir: Option<&std::path::Path>, identity: &str) -> u
     octet
 }
 
-use crate::connection::Connection;
-use crate::sessions;
+use crate::box_manager;
+use crate::connection::{Connection, ConnectionHandle};
 
 /// The ed25519 host private key for the SSH server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -265,16 +265,61 @@ pub struct Config {
     #[serde(default)]
     pub daemon_identity_dir: Option<DaemonAbsPath>,
 
-    /// The daemon's opt-out of the deny-all egress default (NET-077). While
-    /// the default is in force (see [`sessions::EGRESS_DEFAULT_PHASE`]), an
+    /// The daemon's opt-out of the deny-all egress default (NET-077). With
+    /// the default in force (see [`boxes::EGRESS_DEFAULT_PHASE`]), an
     /// own-address box created with no `egress` section reaches nothing
-    /// outside itself (NET-074) and shows `deny all` in `min session policy`
-    /// (NET-075). A deployment that cannot carry that in this release opts
-    /// out, and its boxes keep the shipped allow-all default of 03-spec
-    /// R2.1. Set by `minimald listen --egress-deny-all-opt-out`; a box that
-    /// declares its own egress section is unaffected either way.
+    /// outside itself (NET-074) and shows `deny-all (default)` in
+    /// `min session policy` (NET-075). A deployment that cannot carry that
+    /// yet opts out, and its boxes keep the earlier allow-all default of
+    /// 03-spec R2.1. Set by `minimald run --egress-deny-all-opt-out`. A box
+    /// that declares its own egress section keeps its declared lists either
+    /// way; the opt-out also keeps the earlier allow-all reading of a
+    /// destination list the section left absent, which in force resolves to
+    /// present and empty (`boxes::effective_egress`).
     #[serde(default)]
     pub deny_all_opt_out: bool,
+    /// How the create gate learns the host's verdict on the unprivileged
+    /// user namespace every session sandbox starts by unsharing (NET-143).
+    /// Never persisted or handed in: the daemon binary decides it at start
+    /// (live, or off under `MINIMALD_USERNS_GATE=off`), and the test harness
+    /// fixes it per server.
+    #[serde(skip)]
+    pub user_namespace_gate: UsernsGate,
+}
+
+/// This daemon's own binary path, for the user-namespace remedy that names
+/// it (the AppArmor profile attaches by path, so a source-built daemon needs
+/// the loader pointed at this path, not the installed one). A placeholder
+/// when the path cannot be read, so the remedy still shows its shape.
+#[must_use]
+pub fn this_daemon_path() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_owned))
+        .unwrap_or_else(|| "<path to this minimald>".to_string())
+}
+
+/// The verdict [`UsernsGate::Fixed`] carries, re-exported so the daemon
+/// binary and the harness-driven tests name it without a `sandbox`
+/// dependency of their own.
+pub use sandbox::UsernsRestriction;
+
+/// Where the create gate's user-namespace verdict comes from (NET-143).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UsernsGate {
+    /// Probe this process on every create — a few `/proc` reads — so a
+    /// remedy applied to the running host (a sysctl made persistent) takes
+    /// effect at the next create, with no restart. The production default.
+    #[default]
+    Live,
+    /// Never refuse. The operator's escape hatch for a false positive, and
+    /// the harness default: the harness runs unconfined on a restricted host
+    /// without ever starting a sandbox, so a live probe there would refuse
+    /// creates that are not about this gate at all.
+    Off,
+    /// Answer with this verdict, whatever the host says: the seam the gate's
+    /// own tests refuse a create through.
+    Fixed(UsernsRestriction),
 }
 
 impl Config {
@@ -337,7 +382,10 @@ impl DaemonLogRelease {
         Self(Box::new(release))
     }
 
-    fn run(self) {
+    /// Run the release: the file layer off, the appender flushed and closed.
+    /// Once, at shutdown ([`ServerStateHandle::release_log`]), or by a test of
+    /// the binary's `DaemonLogger` that wants to read what the file holds.
+    pub fn run(self) {
         (self.0)()
     }
 }
@@ -352,8 +400,14 @@ impl std::fmt::Debug for DaemonLogRelease {
 #[derive(Debug)]
 pub struct ServerState {
     config: Config,
-    sessions: sessions::ManagerHandle,
+    sessions: box_manager::BoxManagerHandle,
     daemon_id: String,
+
+    /// The daemon-scoped gvproxy switch, cloned beside the copy the sessions
+    /// manager owns, so daemon-level startup work that runs after the manager
+    /// took its copy — [`HostProxyStartup::record_bound`] — can update the
+    /// switch's hostname-proxy port to the port the proxy actually bound.
+    net_switch: Arc<Mutex<crate::net::SwitchClient>>,
 
     /// Daemon-scoped mctx state (dirs, VCS, local cache, stdlib), built once
     /// at startup and shared with the sessions manager. Held here too so
@@ -422,8 +476,8 @@ impl ServerState {
         let minimal_cache_dir = config.minimal_cache_dir.clone();
         let daemon_id = common::random_alphanumeric(5);
         // Construct the per-host switch once, here at daemon scope, so a single
-        // gvproxy runs for the host and a single allocator never reuses an
-        // address for the daemon's lifetime (R1.4/R1.6). Its config/socket/pid
+        // gvproxy runs for the host and a single allocator hands each address
+        // to one live attach at a time (R1.4/R1.6). Its config/socket/pid
         // live under `<state>/gvproxy/<daemon_id>/`, keyed per daemon instance
         // so two native daemons sharing a state root never unlink each
         // other's control socket or overwrite each other's config or pid
@@ -470,16 +524,29 @@ impl ServerState {
         // (in a microVM, the host-handed) port, or the documented default —
         // is the node address's interim opening in every box's own-address
         // set (design §7.1). The OS-picks `0` names no port, so no opening.
-        // An OS-picked port the bind lands on instead is not opened; the
-        // proxy warns when it serves there (see gominimal/minimal#1952).
+        // When the bind lands elsewhere (an OS-chosen port, NET-025), the
+        // opening is re-pointed to the port actually bound once the proxy is
+        // bound (see `record_bound`). Every seed — a pinned port included —
+        // is pending until that bind is recorded, and a box waits for it: a
+        // pinned port never relocates (NET-024: a busy one is retried, not
+        // moved), but while it retries another host process holds it, so an
+        // opening compiled from the seed would let a box reach that foreign
+        // process (design §7.1's parity rule). The pinned OS-picks `0` names
+        // no port until bound, so it is marked pending without a seed, and a
+        // box waits rather than reading "no port known" as "no proxy on this
+        // host". On Linux a proxy bind is always pending (the daemon always
+        // starts one).
         #[cfg(target_os = "linux")]
-        let hostname_proxy_port = ProxyPort::from_config(
-            config.hostname_proxy_port,
-            crate::net::proxy::DEFAULT_EGRESS_PROXY_PORT,
-        )
-        .opening_port();
+        let (hostname_proxy_port, hostname_proxy_pending) = (
+            ProxyPort::from_config(
+                config.hostname_proxy_port,
+                crate::net::proxy::DEFAULT_EGRESS_PROXY_PORT,
+            )
+            .opening_port(),
+            true,
+        );
         #[cfg(not(target_os = "linux"))]
-        let hostname_proxy_port = None;
+        let (hostname_proxy_port, hostname_proxy_pending) = (None, false);
         let net_switch = Arc::new(Mutex::new(
             crate::net::SwitchClient::with_subnet(
                 config.gvproxy_bin_path(),
@@ -495,7 +562,8 @@ impl ServerState {
             // so a second daemon on the same host registers its own names
             // instead of overwriting the first's records (NET-027).
             .with_host_id(daemon_id.clone())
-            .with_hostname_proxy_port(hostname_proxy_port),
+            .with_hostname_proxy_port(hostname_proxy_port)
+            .with_hostname_proxy_pending(hostname_proxy_pending),
         ));
         // One line at daemon start naming the switch subnet this instance's
         // boxes lease on and the pool its published addresses are granted
@@ -511,8 +579,8 @@ impl ServerState {
             slice_octet = slice_octet,
             reserved_loopback = %format!(
                 "{first}-{last}",
-                first = ::sessions::core::loopback::POOL_FIRST,
-                last = ::sessions::core::loopback::POOL_LAST
+                first = ::boxes::core::loopback::POOL_FIRST,
+                last = ::boxes::core::loopback::POOL_LAST
             ),
             "gvproxy switch this daemon's boxes lease on; published boxes \
              are granted from this host's reserved local range"
@@ -537,11 +605,11 @@ impl ServerState {
         );
 
         Ok(Self {
-            sessions: sessions::Manager::init(
+            sessions: box_manager::BoxManager::init(
                 minimal_state_dir,
                 minimal_cache_dir,
                 Arc::clone(&daemon_ctx),
-                net_switch,
+                Arc::clone(&net_switch),
                 // Threaded into every session actor so the launcher and the
                 // task path resolve the same effective egress the daemon
                 // was started with (NET-074/NET-077).
@@ -550,6 +618,7 @@ impl ServerState {
             .await?,
             config,
             daemon_id,
+            net_switch,
             daemon_ctx,
             maintenance: None,
             shutdown: CancellationToken::new(),
@@ -710,7 +779,7 @@ impl ServerStateHandle {
     }
 
     /// Returns a handle to the sessions manager.
-    pub async fn sessions_manager(&self) -> sessions::ManagerHandle {
+    pub async fn sessions_manager(&self) -> box_manager::BoxManagerHandle {
         self.0.lock().await.sessions.clone()
     }
 
@@ -732,6 +801,29 @@ impl ServerStateHandle {
         self.0.lock().await.config.deny_all_opt_out
     }
 
+    /// The host's user-namespace verdict the create gate decides on
+    /// (NET-143), per [`Config::user_namespace_gate`]: probed live from this
+    /// process on each call, so nothing is cached across creates; the lock
+    /// is held for the copy of the gate alone, never across the probe.
+    pub(crate) async fn user_namespace_verdict(&self) -> Option<UsernsRestriction> {
+        // Bound first so the guard is dropped before the probe runs; the
+        // match scrutinee would otherwise hold it across the `/proc` reads.
+        let gate = self.0.lock().await.config.user_namespace_gate;
+        match gate {
+            UsernsGate::Live => sandbox::user_namespaces_restriction(),
+            UsernsGate::Off => None,
+            UsernsGate::Fixed(restriction) => Some(restriction),
+        }
+    }
+
+    /// Re-points the gate on a harness server: the seam the create-gate
+    /// tests refuse a create through ([`UsernsGate::Fixed`]) and clear again
+    /// ([`UsernsGate::Off`]), scoped to this server alone.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn set_user_namespace_gate(&self, gate: UsernsGate) {
+        self.0.lock().await.config.user_namespace_gate = gate;
+    }
+
     /// Clears the hostname-routing unavailability note: the proxy's startup
     /// retry bound and published it, so `ListSessions` stops reporting the
     /// reason and `min ls` stops printing the warning — without a daemon
@@ -746,12 +838,47 @@ impl ServerStateHandle {
         self.0.lock().await.hostname_proxy_port = Some(port);
     }
 
+    /// Re-points the switch's node-address opening to the port the proxy
+    /// actually bound — distinct from [`Self::hostname_proxy_port`], which
+    /// carries the port a *client* dials. Boxes reach the bound port on the
+    /// loopback they share with the daemon, so their own-address openings
+    /// compile from it, not the configured port the daemon may have moved off.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn set_switch_hostname_proxy_port(&self, port: u16) {
+        let switch = Arc::clone(&self.0.lock().await.net_switch);
+        let stranded = switch.lock().await.set_hostname_proxy_port(Some(port));
+        if stranded > 0 {
+            tracing::warn!(
+                port,
+                stranded,
+                "the hostname proxy now serves on port {port}, but {stranded} box(es) \
+                 attached while it was not serving were compiled with no node-address \
+                 opening (design §7.1); restart those sessions to reach the hostname proxy"
+            );
+        }
+    }
+
     /// The port the hostname proxy listens on, or `None` while it is still
     /// coming up. Filled on the `ListSessions` and `CreateSession` replies
     /// so a client can print — and point `HTTP(S)_PROXY` at — the port this
     /// daemon is on (NET-026).
     pub(crate) async fn hostname_proxy_port(&self) -> Option<u16> {
         self.0.lock().await.hostname_proxy_port
+    }
+
+    /// The switch's hostname-proxy port — the node address's interim opening
+    /// every box's own-address set compiles (design §7.1).
+    #[cfg(test)]
+    async fn switch_hostname_proxy_port(&self) -> Option<u16> {
+        let switch = Arc::clone(&self.0.lock().await.net_switch);
+        switch.lock().await.hostname_proxy_port()
+    }
+
+    /// The daemon's shared gvproxy switch, for tests that drive the
+    /// attach path's serving transition against it.
+    #[cfg(test)]
+    async fn test_switch(&self) -> Arc<Mutex<crate::net::SwitchClient>> {
+        Arc::clone(&self.0.lock().await.net_switch)
     }
 
     /// Records the port the box-zone answerer actually listens on (UDP),
@@ -823,7 +950,7 @@ impl ServerStateHandle {
         self.0.lock().await.config.minimal_state_dir.clone()
     }
 
-    /// The daemon's identity dir — the provider instance dir it runs under,
+    /// The daemon's identity dir — the host dir it runs under,
     /// whose canonical path is the node id its channel client publishes
     /// under (`main`'s `client_instance_dir`). `None` for a daemon with no
     /// identity dir configured (a harness server): its node id falls back
@@ -893,6 +1020,87 @@ pub trait Listener: Send {
     const IS_LOCAL: bool;
 
     fn accept(&self) -> impl Future<Output = std::io::Result<(Self::Stream, Self::Addr)>> + Send;
+
+    /// The vsock CID of a peer this transport refuses at accept, or `None`
+    /// to serve it. The accept loop asks this before it reads a byte from
+    /// the connection, and drops a refused one unread. Only the vsock
+    /// transport refuses a peer ([`vsock_peer_refused`]); a UDS peer is
+    /// gated by its socket's file mode instead.
+    fn refused_cid(_peer: &Self::Addr) -> Option<u32> {
+        None
+    }
+}
+
+/// Whether a vsock peer at `cid` is refused by the in-VM daemon's RPC
+/// listener (NET-139): every CID but the host's (`VMADDR_CID_HOST`, 2). The
+/// vsock channel into a VM runs host to guest only, so a guest-local peer
+/// (loopback CID 1, the VM's own CID, or a sibling) is not the host and is
+/// refused, whatever the box seal's state.
+#[cfg(target_os = "linux")]
+pub(crate) fn vsock_peer_refused(cid: u32) -> bool {
+    cid != tokio_vsock::VMADDR_CID_HOST
+}
+
+/// How often the refusal line for one peer CID is written (NET-139): the
+/// first refusal in a window writes the line, and the line carries the
+/// count of refusals since the last one, so a peer that connects in a loop
+/// cannot flood the daemon's log.
+const PEER_REFUSAL_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The most peer CIDs the refusal limiter tracks at once. Past it the
+/// table is cleared, so a peer that cycles CIDs costs a line per CID, not
+/// memory.
+const PEER_REFUSAL_TRACKED: usize = 64;
+
+/// Per peer CID: when its refusal line was last written, and how many
+/// refusals came after that line.
+static PEER_REFUSALS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u32, (std::time::Instant, u64)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Records one refused peer at `cid` and answers how many refusals the
+/// line to write now covers, or `None` while the CID's window is still
+/// open and the line is suppressed.
+fn peer_refusal_due(cid: u32, now: std::time::Instant) -> Option<u64> {
+    let mut refusals = PEER_REFUSALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if refusals.len() >= PEER_REFUSAL_TRACKED && !refusals.contains_key(&cid) {
+        refusals.clear();
+    }
+    match refusals.get_mut(&cid) {
+        Some((last, unlogged)) if now.duration_since(*last) < PEER_REFUSAL_LOG_INTERVAL => {
+            *unlogged = unlogged.saturating_add(1);
+            None
+        }
+        Some((last, unlogged)) => {
+            let covered = unlogged.saturating_add(1);
+            *last = now;
+            *unlogged = 0;
+            Some(covered)
+        }
+        None => {
+            refusals.insert(cid, (now, 0));
+            Some(1)
+        }
+    }
+}
+
+/// Writes the audited line for a refused vsock peer (NET-139), rate-limited
+/// per CID by [`peer_refusal_due`]. The line names the CID and counts the
+/// refusals it covers. It is a warn line in the daemon's log, which the
+/// diagnostics bundle ships.
+fn log_refused_peer(transport: &'static str, cid: u32) {
+    if let Some(refused) = peer_refusal_due(cid, std::time::Instant::now()) {
+        tracing::warn!(
+            audit = true,
+            transport,
+            peer_cid = cid,
+            refused,
+            "refused an RPC connection from a vsock peer that is not the host; \
+             only the host (CID 2) may connect"
+        );
+    }
 }
 
 impl Listener for UnixListener {
@@ -929,6 +1137,14 @@ impl Listener for tokio_vsock::VsockListener {
     async fn accept(&self) -> std::io::Result<(Self::Stream, Self::Addr)> {
         tokio_vsock::VsockListener::accept(self).await
     }
+
+    /// The vsock listener serves only the host (NET-139): a vsock listener
+    /// is what a VM-hosted daemon binds (`--vsock`), and its every peer
+    /// but CID 2 is refused at accept.
+    fn refused_cid(peer: &Self::Addr) -> Option<u32> {
+        let cid = peer.cid();
+        vsock_peer_refused(cid).then_some(cid)
+    }
 }
 
 /// How long [`Server::run`] waits for in-flight connections to drain after a
@@ -937,9 +1153,41 @@ impl Listener for tokio_vsock::VsockListener {
 /// so an unbounded wait could hang the process; this bounds it.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long a freshly accepted connection may spend exchanging SSH id lines
+/// before it is dropped. The id-line exchange is the only pre-auth step that
+/// `russh::server::run_stream` awaits, so a client that connects and never
+/// speaks would otherwise hold its task and socket forever. Later stalls in
+/// KEX or auth run in russh's spawned session task, off the accept loop, and
+/// are governed by keepalive rather than by this deadline.
+const HANDSHAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Monotonic id carried by each accepted connection's span, so a
 /// connection's accept, channel bindings, and close correlate across the log.
 static CONN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a connection that ended with `e` was hung up by its peer rather
+/// than broken by a fault on this side.
+///
+/// A peer that closes its socket with bytes still unread in its receive queue
+/// makes the kernel answer the next read here with `ECONNRESET` instead of an
+/// end of file (Linux `AF_UNIX`, and TCP's RST). That is the same abrupt
+/// hangup as an end of file: which one arrives depends on whether the client
+/// had drained the daemon's last output when it went away. The rendered
+/// message is still matched for the cases russh reports as its own errors
+/// rather than as an io error.
+fn closed_by_peer(e: &crate::connection::ConnectionError) -> bool {
+    use std::io::ErrorKind;
+    if let crate::connection::ConnectionError::Protocol(russh::Error::IO(io)) = e
+        && matches!(
+            io.kind(),
+            ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
+        )
+    {
+        return true;
+    }
+    let msg = e.to_string();
+    msg.contains("early eof") || msg.contains("Broken pipe") || msg.contains("Disconnected")
+}
 
 /// A listening minimald server.
 #[derive(Debug)]
@@ -963,6 +1211,30 @@ impl Server {
         let zone_answerer_port = config.zone_answerer_port;
         let state = ServerStateHandle::new(config, log_release).await?;
 
+        // Bring up the actor of every active session restored from the
+        // store, so each one's box name routes from daemon start rather than
+        // from the first RPC that names the session. Enqueued here, before
+        // the accept loop opens, so the manager's mailbox orders it ahead of
+        // every RPC the loop admits; only the answer is awaited off the
+        // accept path.
+        #[cfg(target_os = "linux")]
+        {
+            let resumed = state
+                .sessions_manager()
+                .await
+                .enqueue_resume_active_sessions()
+                .await;
+            crate::traced::spawn(async move {
+                if let Err(error) = resumed.await {
+                    tracing::warn!(
+                        %error,
+                        "could not resume active sessions at daemon start; their names \
+                         register when an RPC first names each session",
+                    );
+                }
+            });
+        }
+
         // Start minimald's host-side egress proxy (B5, on its configured,
         // default, or OS-selected port) and the box-zone answerer beside it
         // for the server's lifetime, and in a microVM (DM1) publish them on
@@ -970,6 +1242,10 @@ impl Server {
         // hostname registry they route against only exists on Linux.
         #[cfg(target_os = "linux")]
         start_host_proxies(&state, in_microvm, hostname_proxy_port, zone_answerer_port).await;
+        #[cfg(target_os = "linux")]
+        if in_microvm {
+            start_host_address_listen_watcher(&state).await;
+        }
 
         Self::serve(state, listener).await
     }
@@ -1014,6 +1290,14 @@ impl Server {
                 () = shutdown.cancelled() => break,
                 accepted = listener.accept() => accepted?,
             };
+            // NET-139: a peer the transport refuses is dropped here, at
+            // accept, before a byte of its stream is read and before it
+            // takes a connection id or a task.
+            if let Some(cid) = L::refused_cid(&peer) {
+                drop(stream);
+                log_refused_peer(L::TRANSPORT, cid);
+                continue;
+            }
             // One span per accepted connection: every record the connection
             // and its channels emit carries `conn`, so accept, channel
             // bindings, and close correlate across the log with a grep
@@ -1021,25 +1305,44 @@ impl Server {
             let conn = CONN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let span = tracing::info_span!("conn", conn, transport = L::TRANSPORT);
             span.in_scope(|| tracing::info!(?peer, "accepted connection"));
-            let from_stream =
-                Connection::from_stream(stream, russh_config.clone(), state.clone(), L::IS_LOCAL);
-            let (conn_hnd, session_fut) = match from_stream.instrument(span.clone()).await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    // A handshake failure must not take the daemon down — in
-                    // the guest minimald is pid-1. Drop this connection and
-                    // keep accepting.
-                    span.in_scope(
-                        || tracing::warn!(error = %e, "SSH handshake failed; dropping connection"),
-                    );
-                    continue;
-                }
-            };
-            // Log session errors instead of silently dropping the spawned
-            // future, so a failed handshake is visible on any transport.
-            let reap_state = state.clone();
+            // The handshake runs in the spawned task, not here: awaiting it in
+            // the loop would serialize accepts behind each client's id line,
+            // so one slow or silent client could stall the whole daemon.
+            let russh_config = russh_config.clone();
+            let state = state.clone();
+            let handshake_span = span.clone();
             session_set.spawn(
                 async move {
+                    let from_stream =
+                        Connection::from_stream(stream, russh_config, state.clone(), L::IS_LOCAL);
+                    let (conn_hnd, session_fut) =
+                        match tokio::time::timeout(HANDSHAKE_DEADLINE, from_stream)
+                            .instrument(handshake_span.clone())
+                            .await
+                        {
+                            Ok(Ok(conn)) => conn,
+                            Ok(Err(e)) => {
+                                // A handshake failure must not take the daemon
+                                // down — in the guest minimald is pid-1. Drop
+                                // this connection and keep accepting.
+                                handshake_span.in_scope(|| {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "SSH handshake failed; dropping connection"
+                                    )
+                                });
+                                return;
+                            }
+                            Err(_) => {
+                                handshake_span.in_scope(|| {
+                                    tracing::warn!("SSH handshake timed out; dropping connection")
+                                });
+                                return;
+                            }
+                        };
+                    // Log session errors instead of silently dropping the
+                    // spawned future, so a failed handshake is visible on any
+                    // transport.
                     match session_fut.await {
                         Ok(()) => tracing::info!("connection closed"),
                         Err(e) => {
@@ -1047,27 +1350,16 @@ impl Server {
                             // connections and Ctrl-C'd attaches normally end;
                             // framing them as errors makes routine traffic
                             // read like a transport incident during field
-                            // analysis. Match on the rendered message: russh
-                            // wraps the underlying io error, and this is log
-                            // framing only.
+                            // analysis. This is log framing only.
                             let msg = e.to_string();
-                            if msg.contains("early eof")
-                                || msg.contains("Broken pipe")
-                                || msg.contains("Disconnected")
-                            {
+                            if closed_by_peer(&e) {
                                 tracing::info!(reason = %msg, "connection closed by peer");
                             } else {
                                 tracing::warn!(error = %msg, "session ended with error");
                             }
                         }
                     }
-                    // The connection is gone. Reap any session it created that
-                    // never reached `Active` — a client that dropped
-                    // mid-activation (Ctrl-C at the gating prompt, a crash, a
-                    // network blip) would otherwise strand a `Pending` /
-                    // `Materializing` session that holds its name hostage.
-                    reap_unfinalized_sessions(&reap_state, conn_hnd.take_created_sessions().await)
-                        .await;
+                    close_connection(&state, &conn_hnd).await;
                 }
                 .instrument(span),
             );
@@ -1118,6 +1410,14 @@ const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3
 /// Unanswered keepalives tolerated before the connection is torn down.
 const KEEPALIVE_MAX: usize = 3;
 
+/// Wall-clock budget for tearing down a connection whose transport has
+/// stopped making progress — a full keepalive cycle plus one interval, so
+/// an otherwise-quiet but healthy attach (which answers each keepalive,
+/// resetting the clock) is never reaped: a healthy idle attach sees a
+/// keepalive every [`KEEPALIVE_INTERVAL`], long before this fires.
+const INACTIVITY_TIMEOUT: std::time::Duration =
+    KEEPALIVE_INTERVAL.saturating_mul(KEEPALIVE_MAX as u32 + 1);
+
 /// Builds the shared russh server config from the server state.
 async fn build_russh_config(
     state: &ServerStateHandle,
@@ -1126,13 +1426,87 @@ async fn build_russh_config(
         keys: vec![state.host_key().await?],
         auth_rejection_time_initial: Some(std::time::Duration::ZERO),
         nodelay: true,
-        // Keepalives own deadness detection; the default 600s inactivity
-        // reaper would kill healthy idle attaches, so it is explicitly off.
-        inactivity_timeout: None,
+        // Keepalives own deadness detection, so this must never reap an
+        // idle-but-alive attach (the default 600s would). But russh bounds
+        // every transport write by the inactivity timer, and with `None` a
+        // wedged write parks the session loop forever — keepalives are
+        // dispatched from that same loop, so they stop firing too and the
+        // connection outlives every budget. Arming it at the keepalive
+        // budget bounds a stuck transport without touching a healthy one.
+        inactivity_timeout: Some(INACTIVITY_TIMEOUT),
         keepalive_interval: Some(KEEPALIVE_INTERVAL),
         keepalive_max: KEEPALIVE_MAX,
         ..Default::default()
     }))
+}
+
+/// Finishes a connection that is gone. Reaps any session it created that
+/// never reached `Active` — a client that dropped mid-activation (Ctrl-C at
+/// the gating prompt, a crash, a network blip) would otherwise strand a
+/// `Pending` / `Materializing` session that holds its name hostage — and only
+/// then ends the connection's liveness.
+///
+/// The order is the point. A session's creator-only attach gate holds while
+/// its creator's liveness does, so ending it before the reap would open the
+/// gate on a `Draft` the reap is about to delete: an attach from another
+/// connection landing in between would configure the half-uploaded workspace
+/// and, if it reached `Active` before the reap read the status, leave the
+/// session alive behind a layout conflict no retry clears. Held until the
+/// reap is done, the gate refuses that attach, and what the reap leaves
+/// behind is either gone or was never the creator's to finish.
+async fn close_connection(state: &ServerStateHandle, conn: &ConnectionHandle) {
+    let created = conn.take_created_sessions().await;
+    #[cfg(test)]
+    reap_seam::park(&created).await;
+    reap_unfinalized_sessions(state, created).await;
+    conn.release_liveness().await;
+}
+
+/// The test seam for the window between a closed connection's teardown
+/// starting and its reap: a test holds one session id, and the teardown of
+/// the connection that created it parks just before the reap until the test
+/// lets it go. Keyed by session id, like the session actor's seams, so tests
+/// running beside each other in one process never park each other's
+/// teardowns.
+#[cfg(test)]
+mod reap_seam {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use ::boxes::SessionId;
+    use tokio::sync::oneshot;
+
+    type Hold = (oneshot::Sender<()>, oneshot::Receiver<()>);
+
+    static HELD: Mutex<Option<HashMap<SessionId, Hold>>> = Mutex::new(None);
+
+    /// Makes the teardown that would reap `id` park before its reap. The
+    /// first half resolves once it has parked; sending on (or dropping) the
+    /// second lets it go on.
+    pub(super) fn hold(id: SessionId) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (parked, on_parked) = oneshot::channel();
+        let (release, on_release) = oneshot::channel();
+        HELD.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(id, (parked, on_release));
+        (on_parked, release)
+    }
+
+    /// Parks for each of `ids` a test holds, until that test releases it.
+    pub(super) async fn park(ids: &[SessionId]) {
+        for id in ids {
+            let held = HELD
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_mut()
+                .and_then(|held| held.remove(id));
+            if let Some((parked, on_release)) = held {
+                let _ = parked.send(());
+                let _ = on_release.await;
+            }
+        }
+    }
 }
 
 /// Reap sessions a now-closed connection created but never finalized.
@@ -1146,16 +1520,24 @@ async fn build_russh_config(
 /// restart. A finalized (`Active`) session is long-lived and must
 /// survive the connection that created it, so it is left untouched.
 /// Best-effort and never fatal: minimald is pid-1 in the guest.
-async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::sessions::SessionId>) {
+#[tracing::instrument(level = "info", name = "sessions.reap_unfinalized", skip_all, fields(count = ids.len()))]
+async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::boxes::SessionId>) {
     if ids.is_empty() {
         return;
     }
     let mngr = state.sessions_manager().await;
+    // Behind a VM host daemon the client's registration lease closed with
+    // its connection, and the host withdrew the box's row on that close. A
+    // session kept here would run with no row: its name would not resolve,
+    // and the host could hand its addresses to another box. Nothing in the
+    // VM can publish the row again, so here a finished session is reaped as
+    // an unfinished one is. A native daemon has no such row, and keeps it.
+    let keep_finished = !state.in_microvm().await;
     for id in ids {
         // Re-read the status at teardown: a clean client abort already
         // deleted the record (`get_record` → `None`), and a finalized
         // session is `Active` — neither should be reaped here.
-        let status = match mngr.get_record(sessions::SessionKeyPredicate::Id(id)).await {
+        let status = match mngr.get_record(box_manager::BoxKeyPredicate::Id(id)).await {
             Ok(Some(record)) => record.status,
             Ok(None) => continue,
             Err(e) => {
@@ -1169,15 +1551,27 @@ async fn reap_unfinalized_sessions(state: &ServerStateHandle, ids: Vec<::session
         };
         if !matches!(
             status,
-            ::sessions::SessionStatus::Pending | ::sessions::SessionStatus::Materializing
+            ::boxes::BoxState::Pending | ::boxes::BoxState::Materializing
         ) {
             continue;
         }
-        match mngr.delete_session(id).await {
-            Ok(()) => tracing::info!(
+        // Only if still unfinished when the session gets to it: a finalize
+        // already in flight ends first, and a session it finished is kept
+        // (inbox#690's reap half) — on a native daemon; see above.
+        let reaped = if keep_finished {
+            mngr.delete_session_if_unfinalized(id).await
+        } else {
+            mngr.delete_session(id).await.map(Some)
+        };
+        match reaped {
+            Ok(Some(_)) => tracing::info!(
                 session_id = %id,
                 ?status,
                 "reaped unfinalized session after its connection closed"
+            ),
+            Ok(None) => tracing::info!(
+                session_id = %id,
+                "kept a session whose connection closed: it finished activating first"
             ),
             Err(e) => tracing::warn!(
                 session_id = %id,
@@ -1240,7 +1634,7 @@ async fn start_host_proxies(
     // that port on the host loopback follows the same default-first rule and
     // walks to a host port of its own when the host already holds the
     // default — the bind itself never moves for a publish (NET-059).
-    tokio::spawn(drive_proxy_until_serving(
+    crate::traced::spawn(drive_proxy_until_serving(
         state.clone(),
         HostProxyStartup::Egress {
             bind_base,
@@ -1273,7 +1667,7 @@ async fn start_host_proxies(
     // Native (NET-122): the zone is answered by the machine's *one*
     // answerer, and this daemon is its client before it is its host. The
     // acquisition below decides publish-or-host — publish this daemon's
-    // rows into the manager-held `min-answerer` service over the
+    // rows into the manager-held `minzoned` service over the
     // machine-global channel when its channel answers, host the
     // single-operator interim itself only while no channel answers and
     // the hook port is free, never both — and its status cell feeds the
@@ -1294,10 +1688,33 @@ async fn start_host_proxies(
         );
     }
     let hook_port = zone_answerer_port.unwrap_or(crate::net::answerer::ANSWERER_PORT);
-    tokio::spawn(crate::net::answerer::acquire(
+    crate::traced::spawn(crate::net::answerer::acquire(
         state.clone(),
         hook_port,
         answerer_status,
+    ));
+}
+
+/// Starts the host-address listen watcher of a daemon inside a microVM for
+/// the daemon's life (NET-138): a host-address box shares the node's
+/// namespace, so the VM host daemon opens its listeners on the host only
+/// from the listen notices this watcher sends over the report door. It
+/// stops when the daemon shuts down.
+#[cfg(target_os = "linux")]
+async fn start_host_address_listen_watcher(state: &ServerStateHandle) {
+    let shutdown = state.shutdown_token().await;
+    let (stop_tx, stop) = tokio::sync::watch::channel(false);
+    crate::traced::spawn(async move {
+        shutdown.cancelled().await;
+        let _ = stop_tx.send(true);
+    });
+    crate::traced::spawn(crate::net::listeners::watch_host_address_listens(
+        crate::net::policy::ControlChannel::Vsock {
+            cid: crate::net::VSOCK_HOST_CID,
+            port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
+        },
+        crate::net::DEFAULT_SUBNET.daemon_ip(),
+        stop,
     ));
 }
 
@@ -1536,7 +1953,7 @@ impl HostProxyStartup {
             proxied_request_verdict,
         );
         match self {
-            Self::Egress { .. } => tokio::spawn(async move {
+            Self::Egress { .. } => crate::traced::spawn(async move {
                 if let Err(error) = serve(listener, router).await {
                     tracing::error!(%error, "egress proxy accept loop exited");
                 }
@@ -1583,7 +2000,7 @@ impl HostProxyStartup {
         reported_port: u16,
     ) {
         match self {
-            Self::Egress { port, .. } => {
+            Self::Egress { .. } => {
                 tracing::info!(
                     component = self.component(),
                     port = bound_port,
@@ -1592,20 +2009,43 @@ impl HostProxyStartup {
                     "hostname proxy is serving on its {} port",
                     source.as_str()
                 );
-                warn_if_proxy_opening_missed(port.opening_port(), bound_port);
                 state.set_hostname_proxy_port(reported_port).await;
+            }
+        }
+    }
+
+    /// Points the switch's node-address opening at the port the listener
+    /// bound, the moment it is bound and its serve loop spawned — before any
+    /// host publication, which serves a *host* client, not this daemon's
+    /// boxes: they reach the bound port on the loopback they share with the
+    /// daemon, so a publish still retrying (or terminally refused) never
+    /// holds a box's opening back. This is the switch's serving transition
+    /// ([`crate::net::hostname_proxy_serving_port`] waits for it), and the
+    /// one place it happens: the listener is never rebound.
+    async fn record_bound(&self, state: &ServerStateHandle, bound_port: u16) {
+        match self {
+            Self::Egress { port, .. } => {
+                note_switch_opening_moved(port.opening_port(), bound_port);
+                // The switch's node-address opening follows the port this
+                // daemon's boxes reach on the loopback they share with it —
+                // the bound port — so an unpinned daemon whose default was
+                // busy compiles its own-address boxes at the port it
+                // actually landed on, not the configured one it moved off.
+                state.set_switch_hostname_proxy_port(bound_port).await;
             }
         }
     }
 }
 
-/// Warns, once at the proxy's startup, when the port it bound is not the
-/// port every box's own-address set opens at the node address (the
-/// interim opening, design §7.1): an unpinned daemon that found the default
-/// busy and took an OS-picked port, or a pinned `0`. Boxes on the switch
-/// then cannot reach the proxy at all. Returns whether it warned.
+/// Logs, once at the proxy's startup, when the port it bound is not the
+/// port the switch's node-address opening was built with (design §7.1): an
+/// unpinned daemon that found the default busy and took an OS-chosen port,
+/// or a pinned `0`. The opening is re-pointed to the bound port, but a box
+/// reads it once, when it attaches, so a box that attached before the proxy
+/// was serving keeps the old opening until it reattaches or restarts.
+/// Returns whether it logged.
 #[cfg(target_os = "linux")]
-fn warn_if_proxy_opening_missed(opening: Option<u16>, bound_port: u16) -> bool {
+fn note_switch_opening_moved(opening: Option<u16>, bound_port: u16) -> bool {
     if opening == Some(bound_port) {
         return false;
     }
@@ -1613,9 +2053,10 @@ fn warn_if_proxy_opening_missed(opening: Option<u16>, bound_port: u16) -> bool {
     tracing::warn!(
         bound_port,
         opening_port = %opening,
-        "hostname proxy bound port {bound_port} but the switch opening is at port \
-         {opening}: own-address boxes cannot reach the hostname proxy; pin \
-         hostname_proxy_port"
+        "hostname proxy bound port {bound_port}, not the switch opening's port \
+         {opening}: boxes attached from now on compile the opening at port \
+         {bound_port}; a box attached earlier cannot reach the hostname proxy \
+         until it reattaches or restarts"
     );
     true
 }
@@ -1935,6 +2376,7 @@ pub(crate) async fn drive_proxy_until_serving(
                             // aborts it, because nothing ever rebinds.
                             drop(proxy.spawn_serve(&state, listener).await);
                             bound = true;
+                            proxy.record_bound(&state, bound_port).await;
                             if !publish_on_host {
                                 break;
                             }
@@ -2035,7 +2477,7 @@ pub(crate) async fn drive_proxy_until_serving(
                 // tell. Sent in the background: the report's vsock dial can
                 // take seconds per try, and the drive must record serving
                 // without waiting on it.
-                tokio::spawn(report_proxy_serving(host_port));
+                crate::traced::spawn(report_proxy_serving(host_port));
                 break;
             }
             Some(failure) => {
@@ -2094,7 +2536,7 @@ pub(crate) async fn drive_proxy_until_serving(
                     // ends here and never waits on the report's vsock dial,
                     // which can take seconds per try.
                     proxy.record_unavailable(&state, failure.report).await;
-                    tokio::spawn(report_proxy_port_held(host_port));
+                    crate::traced::spawn(report_proxy_port_held(host_port));
                     return;
                 }
                 // No rung left to walk to, a pinned port, or a transient
@@ -2244,7 +2686,7 @@ pub(crate) async fn drive_answerer_until_serving<T: crate::net::answerer::Zone>(
                         // handle is dropped on purpose — nothing ever aborts
                         // it, because nothing ever rebinds: the walk below
                         // moves the *publication*, never the socket.
-                        drop(tokio::spawn(async move {
+                        drop(crate::traced::spawn(async move {
                             if let Err(error) =
                                 crate::net::answerer::serve(socket, serve_answerer).await
                             {
@@ -2642,2639 +3084,15 @@ pub(crate) fn test_config(dir: &std::path::Path) -> Config {
         // The default every unit-test daemon runs: the rollout phase this
         // build ships, not opted out.
         deny_all_opt_out: false,
+        // A unit-test daemon never starts a sandbox, and the host it runs on
+        // may itself be restricted: the gate stays off unless a test fixes it.
+        user_namespace_gate: UsernsGate::Off,
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use minimald_rpc::{Shutdown, ShutdownRequest, ShutdownResponse};
-    use tempfile::TempDir;
-
-    use super::*;
-    use crate::test_harness::connect_uds;
-
-    /// A `Config` backed by a fresh tempdir, mirroring `TestServer::new`.
-    fn test_config(dir: &TempDir) -> Config {
-        super::test_config(dir.path())
-    }
-
-    /// The interim node-address opening is compiled at the port the
-    /// proxy's first bind asks for; when the bind lands elsewhere (an
-    /// OS-picked port), the daemon says so once, naming both ports and the
-    /// consequence, and says nothing when the ports agree
-    /// (gominimal/minimal#1952).
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn proxy_opening_mismatch_warns_once_naming_both_ports() {
-        let capture = crate::test_harness::captured_log();
-        let line = "hostname proxy bound port 41913 but the switch opening is at port 7654: \
-                    own-address boxes cannot reach the hostname proxy; pin hostname_proxy_port";
-
-        assert!(!warn_if_proxy_opening_missed(Some(7654), 7654));
-        assert!(
-            !capture
-                .contents()
-                .contains("the switch opening is at port 7654"),
-            "equal ports say nothing"
-        );
-
-        assert!(warn_if_proxy_opening_missed(Some(7654), 41913));
-        let logged = capture.contents();
-        assert_eq!(logged.matches(line).count(), 1, "one line: {logged}");
-        assert!(logged.contains("WARN"), "a warn line: {logged}");
-    }
-
-    /// The volume-log release must run exactly once no matter how many
-    /// times the Shutdown path invokes it, and a harness-style `None`
-    /// release must be a no-op.
-    #[tokio::test]
-    async fn log_release_runs_exactly_once() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-
-        let dir = TempDir::new().unwrap();
-        let count = Arc::new(AtomicU32::new(0));
-        let counted = count.clone();
-        let release = DaemonLogRelease::new(move || {
-            counted.fetch_add(1, Ordering::SeqCst);
-        });
-        let state = ServerStateHandle::new(test_config(&dir), Some(release))
-            .await
-            .unwrap();
-        state.release_log().await;
-        state.release_log().await;
-        assert_eq!(count.load(Ordering::SeqCst), 1, "one-shot, then a no-op");
-
-        let none = ServerStateHandle::new(test_config(&dir), None)
-            .await
-            .unwrap();
-        none.release_log().await;
-    }
-
-    /// Binds a UDS in `dir` and spawns `Server::run` against it, returning the
-    /// run task's join handle alongside the socket path clients dial.
-    fn spawn_server(
-        dir: &TempDir,
-    ) -> (
-        tokio::task::JoinHandle<Result<(), std::io::Error>>,
-        std::path::PathBuf,
-    ) {
-        spawn_server_with(dir, test_config(dir))
-    }
-
-    /// [`spawn_server`] with an explicit [`Config`]: the tests that pin ports
-    /// or flip the deployment model drive the flags' path through
-    /// [`Server::run`] rather than around it.
-    fn spawn_server_with(
-        dir: &TempDir,
-        config: Config,
-    ) -> (
-        tokio::task::JoinHandle<Result<(), std::io::Error>>,
-        std::path::PathBuf,
-    ) {
-        let sock = dir.path().join("minimald.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
-        let run = tokio::spawn(Server::run(config, listener, None));
-        (run, sock)
-    }
-
-    /// [`spawn_server_with`] with the built state handed back to the caller.
-    /// The start path is the one `Server::run` takes — the same proxy startup
-    /// against the config's port choices, then the real accept loop off the
-    /// same listener — but the state stays reachable, for the tests that must
-    /// fill the hostname registry the running proxy routes against: no RPC
-    /// does, it is the session launch path that fills it.
-    #[cfg(target_os = "linux")]
-    async fn spawn_stateful_server_with(
-        dir: &TempDir,
-        config: Config,
-    ) -> (
-        ServerStateHandle,
-        tokio::task::JoinHandle<Result<(), std::io::Error>>,
-        std::path::PathBuf,
-    ) {
-        let in_microvm = config.in_microvm;
-        let hostname_proxy_port = config.hostname_proxy_port;
-        let zone_answerer_port = config.zone_answerer_port;
-        let state = ServerStateHandle::new(config, None).await.unwrap();
-        start_host_proxies(&state, in_microvm, hostname_proxy_port, zone_answerer_port).await;
-        let sock = dir.path().join("minimald.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
-        let run = tokio::spawn(Server::serve(state.clone(), listener));
-        (state, run, sock)
-    }
-
-    #[tokio::test]
-    async fn shutdown_rpc_drives_run_to_return_once_the_client_disconnects() {
-        let dir = TempDir::new().unwrap();
-        let (run, sock) = spawn_server(&dir);
-
-        {
-            let mut client = connect_uds(&sock).await;
-            let resp = client
-                .call::<Shutdown>(&ShutdownRequest { force: false })
-                .await;
-            assert_eq!(resp, ShutdownResponse::ShuttingDown);
-            // Dropping `client` closes the connection, so the drain sees the
-            // last in-flight session finish and `run` returns without waiting
-            // out the grace period.
-        }
-
-        let res = tokio::time::timeout(Duration::from_secs(5), run)
-            .await
-            .expect("run should return promptly once the client disconnects");
-        assert!(res.unwrap().is_ok(), "run should return Ok after shutdown");
-    }
-
-    #[tokio::test]
-    async fn shutdown_rpc_returns_even_if_the_initiating_client_lingers() {
-        let dir = TempDir::new().unwrap();
-        let (run, sock) = spawn_server(&dir);
-
-        // Keep the client — and thus its connection — open past the shutdown.
-        // The drain can't complete gracefully, so the grace period must elapse
-        // and abort the straggler, guaranteeing `run` still returns.
-        let mut client = connect_uds(&sock).await;
-        let resp = client
-            .call::<Shutdown>(&ShutdownRequest { force: false })
-            .await;
-        assert_eq!(resp, ShutdownResponse::ShuttingDown);
-
-        let res = tokio::time::timeout(SHUTDOWN_GRACE + Duration::from_secs(3), run)
-            .await
-            .expect("run must return after the grace period aborts lingering connections");
-        assert!(res.unwrap().is_ok(), "run should return Ok after shutdown");
-        drop(client);
-    }
-
-    /// A session left unfinalized when its creating connection closes —
-    /// the state an interrupted `min session activate` (Ctrl-C at the gating
-    /// prompt) leaves on the daemon — is reaped, while a finalized
-    /// (`Active`) session created over that same connection survives.
-    #[tokio::test]
-    async fn dropping_a_connection_reaps_only_its_unfinalized_sessions() {
-        use crate::test_harness::{create_configured_session, create_session_req};
-        use minimald_rpc::{CreateSession, GetSessionRecord, GetSessionRecordRequest};
-
-        let dir = TempDir::new().unwrap();
-        let (run, sock) = spawn_server(&dir);
-
-        // Connection A: create a Pending session (no ConfigureLoadout) AND a
-        // fully-finalized Active session, then drop the connection.
-        let (pending_id, active_id) = {
-            let mut client = connect_uds(&sock).await;
-            let pending = client
-                .call::<CreateSession>(&create_session_req("interrupted", "/tmp"))
-                .await
-                .ok()
-                .expect("create pending session")
-                .id;
-            let active = create_configured_session(&mut client, "finalized", "/tmp").await;
-            (pending, active)
-            // `client` dropped here → connection closes → the server's
-            // per-connection task runs the teardown reap.
-        };
-
-        // The reap is asynchronous (it runs once the socket close is
-        // observed), so poll a fresh connection until the Pending record is
-        // gone. The Active record must remain throughout.
-        let mut client = connect_uds(&sock).await;
-        let mut reaped = false;
-        for _ in 0..100 {
-            let pending_gone = client
-                .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(pending_id))
-                .await
-                .record
-                .is_none();
-            if pending_gone {
-                reaped = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(
-            reaped,
-            "an unfinalized (Pending) session must be reaped when its creating connection closes",
-        );
-        assert!(
-            client
-                .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(active_id))
-                .await
-                .record
-                .is_some(),
-            "an Active session must survive the connection that created it",
-        );
-
-        let _ = client
-            .call::<Shutdown>(&ShutdownRequest { force: false })
-            .await;
-        let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
-    }
-
-    /// A `MakeWriter` accumulating everything written into a shared buffer, so
-    /// a test can assert on the structured fields a `tracing` event emitted.
-    /// Local twin of the helper the `net::proxy` tests used before the bind
-    /// failure's log line moved to the startup retry that owns the schedule.
-    #[cfg(target_os = "linux")]
-    #[derive(Clone, Default)]
-    struct CaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    #[cfg(target_os = "linux")]
-    impl CaptureWriter {
-        fn contents(&self) -> String {
-            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    impl std::io::Write for CaptureWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    impl tracing_subscriber::fmt::MakeWriter<'_> for CaptureWriter {
-        type Writer = CaptureWriter;
-        fn make_writer(&self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    /// The `next_retry=<delay>` values the startup retry's failure warnings
-    /// carried, in the order they were logged.
-    #[cfg(target_os = "linux")]
-    fn logged_next_retries(log: &str) -> Vec<&str> {
-        log.match_indices("next_retry=")
-            .map(|(start, _)| {
-                let rest = &log[start + "next_retry=".len()..];
-                rest.split([' ', '\n', ',']).next().unwrap_or_default()
-            })
-            .collect()
-    }
-
-    /// The hostname proxy's startup retry keeps trying a held listen address:
-    /// each failed bind warns once with the reason, the remedy, and the next
-    /// (doubling, capped) retry delay and records the reason-and-remedy report
-    /// on the state note (NET-021); once the address frees, the next attempt
-    /// binds, the note clears, and the recovery is logged (NET-022) — no
-    /// daemon restart anywhere.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn listener_retries_with_backoff() {
-        // Hold an address so the startup retry's binds fail deterministically.
-        let held = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
-        let addr = held.local_addr().unwrap();
-
-        let buf = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        let dir = TempDir::new().unwrap();
-        let state = ServerStateHandle::new(test_config(&dir), None)
-            .await
-            .unwrap();
-        // A compressed schedule: first retry 5 ms after the failure, doubling
-        // to a 20 ms cap, so a loop's worth of failures costs milliseconds.
-        let retrier = tokio::spawn(drive_proxy_until_serving(
-            state.clone(),
-            HostProxyStartup::Egress {
-                bind_base: addr.ip(),
-                // Pinned: a configured port's bind failure is the operator's
-                // to clear, never a relocation.
-                port: ProxyPort::Pinned(addr.port()),
-            },
-            false,
-            HostExpose::Shuttle,
-            RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(20)),
-        ));
-
-        // Three failures are enough to see the doubling and the cap.
-        let mut saw_three_warnings = false;
-        for _ in 0..200 {
-            if buf
-                .contents()
-                .matches("could not bind its listener")
-                .count()
-                >= 3
-            {
-                saw_three_warnings = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(
-            saw_three_warnings,
-            "expected three failure warnings while the address is held, got: {}",
-            buf.contents()
-        );
-        let note = state
-            .proxy_unavailable()
-            .await
-            .expect("a held address must be recorded as the unavailable note");
-        assert!(
-            note.contains("could not bind") && note.contains("Remedy"),
-            "the note must carry the reason and the remedy, got: {note}"
-        );
-
-        // The retry delays double from the schedule's initial wait and cap at
-        // its max: 5 ms, 10 ms, then 20 ms for as long as the address stays
-        // held.
-        let logged = buf.contents();
-        let delays = logged_next_retries(&logged);
-        assert_eq!(
-            &delays[..3.min(delays.len())],
-            &["5ms", "10ms", "20ms"][..3.min(delays.len())],
-            "retry delays must grow with backoff and cap, got: {delays:?}"
-        );
-        assert!(
-            delays.iter().skip(3).all(|d| *d == "20ms"),
-            "retries past the cap must wait the cap, got: {delays:?}"
-        );
-
-        // Freeing the address lets the next attempt bind: the retry task
-        // resolves, the note clears, and the recovery is on the log.
-        drop(held);
-        tokio::time::timeout(Duration::from_secs(5), retrier)
-            .await
-            .expect("the retry must finish once the address frees")
-            .expect("the retry task must not panic");
-        assert!(
-            state.proxy_unavailable().await.is_none(),
-            "recovery must clear the unavailable note without a restart"
-        );
-        let logged = buf.contents();
-        assert!(
-            logged.contains(r#"status="recovered""#),
-            "the recovery must be logged, got: {logged}"
-        );
-        assert!(
-            logged.contains(r#"status="reachable""#),
-            "the successful bind must be logged as reachable, got: {logged}"
-        );
-    }
-
-    /// Spawns a backend on `addr` that answers every request with a `200 OK`
-    /// whose body is `body`. Local twin of `net::proxy`'s one-shot helper,
-    /// with a body so the two-daemon test can tell its backends apart — and
-    /// with the address as a parameter, so two daemons' boxes can publish the
-    /// same port on different addresses.
-    #[cfg(target_os = "linux")]
-    async fn spawn_backend_on(addr: std::net::SocketAddr, body: &'static str) {
-        let backend = TcpListener::bind(addr).await.unwrap();
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = backend.accept().await {
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-                    let mut scratch = [0u8; 1024];
-                    let _ = sock.read(&mut scratch).await;
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = sock.write_all(response.as_bytes()).await;
-                    // `sock` drops here, closing the upstream side.
-                });
-            }
-        });
-    }
-
-    /// Spawns a loopback backend (see [`spawn_backend_on`]) on a free port,
-    /// returning the port it listens on.
-    #[cfg(target_os = "linux")]
-    async fn spawn_backend_saying(body: &'static str) -> u16 {
-        use std::net::{IpAddr, Ipv4Addr};
-
-        // Reserve then drop: the bind below re-takes the port for keeps.
-        let port = {
-            let bind = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-            bind.local_addr().unwrap().port()
-        };
-        spawn_backend_on(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port), body).await;
-        port
-    }
-
-    /// Drives the hostname proxy with a `GET` carrying `Host: <authority>`
-    /// and returns the raw response the client read back — the proxy's own
-    /// test-facing shape, driven through the port a daemon's startup bound.
-    #[cfg(target_os = "linux")]
-    async fn proxy_get(proxy_addr: SocketAddr, authority: &str) -> String {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-        let mut client = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
-        let request = format!("GET / HTTP/1.1\r\nHost: {authority}\r\n\r\n");
-        client.write_all(request.as_bytes()).await.unwrap();
-        let mut response = Vec::new();
-        client.read_to_end(&mut response).await.unwrap();
-        String::from_utf8_lossy(&response).into_owned()
-    }
-
-    /// Waits until the state reports the port its hostname proxy ended up on.
-    #[cfg(target_os = "linux")]
-    async fn wait_for_proxy_port(state: &ServerStateHandle) -> u16 {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Some(port) = state.hostname_proxy_port().await {
-                    return port;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the hostname proxy must bind and report its port")
-    }
-
-    /// T63 (NET-025, NET-138): a VM-hosted daemon binds the port its host
-    /// handed it on the boot line, and selects none of its own. The handed
-    /// port is read exactly the way pid-1 reads it — off the environment
-    /// the kernel passes through — and the startup is driven the way a VM
-    /// daemon's is: bind 0.0.0.0, publish behind the host-loopback gate, then
-    /// record the bound port for the discovery reply to carry. With a handed
-    /// port held busy, the startup keeps retrying that port and never
-    /// re-picks: the host's box table names it, so a silent move would strand
-    /// every client pointed at it.
-    ///
-    /// The handed port is the hostname proxy's alone: a VM-hosted daemon
-    /// starts no zone answerer (NET-138 — the VM host daemon's host answerer
-    /// owns the zone), so no answerer token exists to read or drive.
-    ///
-    /// The host-loopback publish is the `Fixed(None)` stand-in — the real
-    /// gate's decisions are proven from the gate side (`minvmd`'s
-    /// `switch_request_refused_and_logged`); what is under test here is the
-    /// port policy the handed values feed.
-    // Env is process state: nextest runs every test in its own process.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn vm_hosted_daemon_binds_handed_port() {
-        use std::net::{IpAddr, Ipv4Addr};
-
-        use crate::guest;
-
-        // Reserve a free port, then write it onto the boot line the way
-        // minvmd does: as a token the kernel hands pid-1 as an environment
-        // variable.
-        let probe = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
-        let proxy_port = probe.local_addr().unwrap().port();
-        drop(probe);
-        unsafe {
-            std::env::set_var(guest::HANDED_PROXY_PORT_TOKEN, proxy_port.to_string());
-        }
-        // What pid-1's CLI is built with: the handed port.
-        assert_eq!(guest::handed_proxy_port().unwrap(), Some(proxy_port));
-
-        let dir = TempDir::new().unwrap();
-        let state = ServerStateHandle::new(test_config(&dir), None)
-            .await
-            .unwrap();
-
-        // The VM startup shape: bind UNSPECIFIED, publish behind the
-        // host-loopback gate, record the bound port. The compressed backoff
-        // keeps a failed attempt cheap should the box be noisy.
-        let retry = RetryBackoff::new(Duration::from_millis(10), Duration::from_millis(100));
-        tokio::spawn(drive_proxy_until_serving(
-            state.clone(),
-            HostProxyStartup::Egress {
-                bind_base: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                port: ProxyPort::from_config(
-                    guest::handed_proxy_port().unwrap(),
-                    crate::net::proxy::DEFAULT_EGRESS_PROXY_PORT,
-                ),
-            },
-            true,
-            HostExpose::Fixed(None),
-            retry,
-        ));
-
-        // Bound as handed, and reported on the discovery path the RPC
-        // replies carry.
-        assert_eq!(
-            wait_for_proxy_port(&state).await,
-            proxy_port,
-            "the handed proxy port is bound, not re-picked"
-        );
-
-        // And it really is a listener on the handed port: the proxy answers
-        // (a name no live box owns gets its refusal).
-        let routed = proxy_get(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), proxy_port),
-            "ghost.min.internal",
-        )
-        .await;
-        assert!(routed.contains("502"), "the handed port answers: {routed}");
-
-        // Selects none: with a handed port held, the startup keeps retrying
-        // that port and never re-picks — the state stays portless while the
-        // loop is alive. A fresh state, so the first phase's recorded port
-        // cannot stand in for this one's.
-        let probe = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
-        let held = probe.local_addr().unwrap().port();
-        unsafe { std::env::set_var(guest::HANDED_PROXY_PORT_TOKEN, held.to_string()) };
-        let dir = TempDir::new().unwrap();
-        let state = ServerStateHandle::new(test_config(&dir), None)
-            .await
-            .unwrap();
-        let drive = tokio::spawn(drive_proxy_until_serving(
-            state.clone(),
-            HostProxyStartup::Egress {
-                bind_base: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                port: ProxyPort::from_config(
-                    guest::handed_proxy_port().unwrap(),
-                    crate::net::proxy::DEFAULT_EGRESS_PROXY_PORT,
-                ),
-            },
-            true,
-            HostExpose::Fixed(None),
-            RetryBackoff::new(Duration::from_millis(10), Duration::from_millis(50)),
-        ));
-        // Several retries on the compressed backoff, then prove it stayed put.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            !drive.is_finished(),
-            "a busy handed port is retried, not abandoned"
-        );
-        assert_eq!(
-            state.hostname_proxy_port().await,
-            None,
-            "a busy handed port is never re-picked"
-        );
-        drive.abort();
-        drop(probe);
-    }
-
-    /// T65 (NET-009 on a VM host): a VM-hosted daemon starts no zone answerer
-    /// and publishes none through the forwarder. The zone on a VM-backed host
-    /// is the VM host daemon's to answer — `minvmd`'s host answerer serves it
-    /// on the host loopback, from the host-authored table (NET-138) — so an
-    /// in-guest answerer behind the switch would only shadow it. What must
-    /// stay is the *other* half of `start_host_proxies`: the hostname proxy
-    /// starts in a microVM exactly as before.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn vm_hosted_daemon_starts_no_answerer() {
-        use std::net::{IpAddr, Ipv4Addr};
-
-        use hickory_proto::rr::RecordType;
-
-        use crate::net::answerer::encode_query;
-
-        // A free UDP port the daemon is configured to put its answerer on —
-        // the handed-answerer port a VM-hosted daemon used to bind before the
-        // host answerer took the zone. Reserved here only to learn a free
-        // number, then released: if the daemon starts an answerer despite its
-        // deployment model, it is this port it binds and answers on, which is
-        // exactly what the datagram below would find.
-        let probe = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let configured = probe.local_addr().unwrap().port();
-        drop(probe);
-
-        let buf = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        let dir = TempDir::new().unwrap();
-        let state = ServerStateHandle::new(
-            Config {
-                in_microvm: true,
-                zone_answerer_port: Some(configured),
-                ..test_config(&dir)
-            },
-            None,
-        )
-        .await
-        .unwrap();
-
-        // The real startup path, the way a VM-hosted `Server::run` takes it.
-        start_host_proxies(&state, true, None, Some(configured)).await;
-
-        // The positive control: the hostname proxy's half ran — its listen
-        // address bindable line is the first thing the VM startup logs, well
-        // before the host publish this harness has no gvproxy to answer. What
-        // changed is the answerer, not the daemon's whole proxy half.
-        let mut proxy_bound = false;
-        for _ in 0..200 {
-            if buf
-                .contents()
-                .contains("egress proxy listen address is bindable")
-            {
-                proxy_bound = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(
-            proxy_bound,
-            "the hostname proxy must start in a microVM as before, got: {}",
-            buf.contents()
-        );
-
-        // The answerer never does: no line of its component — not a bind, not
-        // a retry, not a serving — and its discovery field, the one `min ls`
-        // prints its ZONE ANSWERER line from, stays empty for a window the
-        // native startup fills it in within its first bind attempt.
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        assert_eq!(
-            state.zone_answerer_port().await,
-            None,
-            "a VM-hosted daemon reports no zone answerer: the host answerer owns the zone"
-        );
-        assert!(
-            !buf.contents().contains("zone-answerer"),
-            "no zone-answerer line may appear in a VM-hosted daemon's log, got: {}",
-            buf.contents()
-        );
-
-        // And nothing listens for zone datagrams on the port it was
-        // configured to take: a query sent there gets no reply at all — no
-        // rcode, no error, nothing — which is the port's state a VM host's
-        // host answerer finds when it takes it.
-        let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        socket
-            .set_read_timeout(Some(Duration::from_millis(150)))
-            .unwrap();
-        socket
-            .send_to(
-                &encode_query("web.min.internal.", RecordType::A),
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), configured),
-            )
-            .unwrap();
-        let mut reply = [0u8; 512];
-        match socket.recv_from(&mut reply) {
-            Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock
-                    || error.kind() == std::io::ErrorKind::TimedOut => {}
-            outcome => panic!(
-                "the daemon must answer nothing in the zone's place on a VM host, got: {outcome:?}"
-            ),
-        }
-
-        // The same deployment model with nothing handed at all — no handed
-        // boot token and no configured port, the state a VM boots in now the
-        // handoff carries the proxy port only: an answerer that ran anyway
-        // would take the documented default (7656) on the guest's wildcard.
-        // Both of its outcomes are caught without this test binding that
-        // port itself (a dev host may hold it): a bind that succeeded would
-        // set the discovery claim, and one that failed would log its
-        // component line — neither may appear.
-        let dir = TempDir::new().unwrap();
-        let unconfigured = ServerStateHandle::new(
-            Config {
-                in_microvm: true,
-                zone_answerer_port: None,
-                ..test_config(&dir)
-            },
-            None,
-        )
-        .await
-        .unwrap();
-        start_host_proxies(&unconfigured, true, None, None).await;
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        assert_eq!(
-            unconfigured.zone_answerer_port().await,
-            None,
-            "a VM-hosted daemon with nothing handed binds no answerer on the \
-             default port either: the host answerer owns the zone (NET-138)"
-        );
-        assert!(
-            !buf.contents().contains("zone-answerer"),
-            "no zone-answerer line may appear for a VM-hosted daemon with \
-             nothing handed, got: {}",
-            buf.contents()
-        );
-    }
-
-    /// T63 (NET-025): the pid-1 boot reads its handed port fail-closed and
-    /// binds it before anything else answers. A token present but unusable
-    /// is a surfaced boot error — the read is an `Err` naming the token and
-    /// the value it carried, not a `None` the daemon would fall back from —
-    /// and a handed port something already holds fails the probe bind, which
-    /// is boot-fatal: the startup pid-1 would drive next is driven here and
-    /// stays portless, the boot was over before it, never rescued by a
-    /// re-pick.
-    // Env is process state: nextest runs every test in its own process.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn a_broken_handoff_fails_the_boot_before_any_listener_comes_up() {
-        use std::net::Ipv4Addr;
-
-        use crate::guest;
-
-        // A present token that carries no port: the surfaced error, not a
-        // quiet absence.
-        unsafe { std::env::set_var(guest::HANDED_PROXY_PORT_TOKEN, "no-port-here") };
-        let error = guest::handed_proxy_port()
-            .expect_err("an unusable token is a surfaced boot error, not an absence");
-        assert_eq!(error.token, guest::HANDED_PROXY_PORT_TOKEN);
-        assert_eq!(error.value, "no-port-here");
-
-        // A handed port something already holds — the way a stale daemon or
-        // an unrelated process in the guest holds one: the probe bind fails
-        // it, with the port named, and that is the boot's end.
-        let held_listener = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
-        let held = held_listener.local_addr().unwrap().port();
-        unsafe { std::env::set_var(guest::HANDED_PROXY_PORT_TOKEN, held.to_string()) };
-        let proxy = guest::handed_proxy_port().unwrap();
-        assert_eq!(proxy, Some(held));
-        let error = guest::probe_handed_node_port(proxy)
-            .expect_err("a held handed port cannot bind for the probe");
-        assert!(
-            error.to_string().contains(&held.to_string()),
-            "the boot-fatal bind names the port it failed on, got: {error}"
-        );
-
-        // And no listener ever comes up from it: the startup pid-1 would
-        // drive next, driven here, keeps retrying the held handed port and
-        // never re-picks — the boot was over before it.
-        let dir = TempDir::new().unwrap();
-        let state = ServerStateHandle::new(test_config(&dir), None)
-            .await
-            .unwrap();
-        let drive = tokio::spawn(drive_proxy_until_serving(
-            state.clone(),
-            HostProxyStartup::Egress {
-                bind_base: std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                port: ProxyPort::from_config(
-                    guest::handed_proxy_port().unwrap(),
-                    crate::net::proxy::DEFAULT_EGRESS_PROXY_PORT,
-                ),
-            },
-            true,
-            HostExpose::Fixed(None),
-            RetryBackoff::new(Duration::from_millis(10), Duration::from_millis(50)),
-        ));
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            !drive.is_finished(),
-            "the held handed port is retried, not abandoned"
-        );
-        assert_eq!(
-            state.hostname_proxy_port().await,
-            None,
-            "a boot that failed its probe bind never publishes a listener"
-        );
-        drive.abort();
-        drop(held_listener);
-    }
-
-    /// NET-024: a daemon configured with a hostname-proxy port listens on
-    /// exactly that one — driven through the start path [`Server::run`] takes,
-    /// so the flags a deployment passes are the ones proven. The startup
-    /// binds the port rather than re-picking, both listeners' discovery
-    /// fields (the proxy's and the answerer's) carry the configured ports to
-    /// the RPC replies a client reads, the startup lines name the ports as
-    /// configured, the proxy answers on that port — refusing a name no live
-    /// box owns and routing one a live box owns — and the answerer replies
-    /// from the port the host resolver would be pointed at.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn proxy_listens_on_configured_port() {
-        use std::net::{IpAddr, Ipv4Addr};
-
-        use hickory_proto::op::{Message, ResponseCode};
-        use hickory_proto::rr::RecordType;
-        use minimald_rpc::ListSessions;
-
-        use crate::net::answerer::encode_query;
-
-        // Reserve free ports, then hand them to the daemon the way a pinned
-        // deployment does: unheld, for its own binds.
-        let probe = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-        let probe = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let answerer_port = probe.local_addr().unwrap().port();
-        drop(probe);
-
-        let buf = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        let dir = TempDir::new().unwrap();
-        let (state, run, sock) = spawn_stateful_server_with(
-            &dir,
-            Config {
-                hostname_proxy_port: Some(port),
-                zone_answerer_port: Some(answerer_port),
-                ..test_config(&dir)
-            },
-        )
-        .await;
-
-        // The daemon reports its listeners once they are up — that report is
-        // the discovery path a client takes, so this poll is the proof the
-        // ports are the configured ones.
-        let mut client = connect_uds(&sock).await;
-        let resp = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let resp = client.call::<ListSessions>(&()).await;
-                if resp.hostname_proxy_port.is_some() && resp.zone_answerer_port.is_some() {
-                    return resp;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the daemon must report its listeners on the list reply");
-        assert_eq!(
-            resp.hostname_proxy_port,
-            Some(port),
-            "a configured port must be listened on, not re-picked"
-        );
-        assert_eq!(
-            resp.zone_answerer_port,
-            Some(answerer_port),
-            "the answerer's configured port must be listened on, not re-picked"
-        );
-
-        // And it really is a listener there: the proxy answers on the
-        // configured port (refusing a name no live box owns, which is its
-        // answer for one), and the answerer replies over UDP from the same
-        // port the resolver would be pointed at.
-        let routed = proxy_get(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
-            "ghost.min.internal",
-        )
-        .await;
-        assert!(
-            routed.contains("502"),
-            "the configured port must answer, got: {routed}"
-        );
-
-        let client = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let query = encode_query("ghost.min.internal.", RecordType::A);
-        let mut scratch = [0u8; 512];
-        let mut reply = None;
-        for _ in 0..200 {
-            client
-                .send_to(
-                    &query,
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), answerer_port),
-                )
-                .await
-                .unwrap();
-            if let Ok(Ok((bytes, _))) =
-                tokio::time::timeout(Duration::from_millis(25), client.recv_from(&mut scratch))
-                    .await
-            {
-                reply = Some(scratch[..bytes].to_vec());
-                break;
-            }
-        }
-        let bytes = reply.expect("the answerer must answer on its configured port");
-        let message = Message::from_vec(&bytes).expect("the reply decodes");
-        assert_eq!(message.metadata.response_code, ResponseCode::NXDomain);
-        assert!(
-            message.answers.is_empty(),
-            "a name no live box owns must answer NXDOMAIN, got: {bytes:?}"
-        );
-
-        // And a name a live box owns routes with a 200 through the same
-        // configured port — the refusal above only means something once a
-        // routed name is proved beside it.
-        let backend = spawn_backend_saying("live").await;
-        state
-            .sessions_manager()
-            .await
-            .hostnames()
-            .write()
-            .unwrap()
-            .register_host_net(::sessions::SessionId::nil(), "web");
-        let authority = format!("web.min.internal:{backend}");
-        let routed = proxy_get(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
-            &authority,
-        )
-        .await;
-        assert!(
-            routed.contains("200 OK"),
-            "the configured port must route a live name, got: {routed}"
-        );
-
-        let logged = buf.contents();
-        assert!(
-            logged.contains(&format!("port={port}")),
-            "the startup line must name the port, got: {logged}"
-        );
-        assert!(
-            logged.contains(r#"port_source="configured""#),
-            "the startup line must say the port was configured, got: {logged}"
-        );
-        run.abort();
-    }
-
-    /// NET-025: a daemon started without a configured port takes the
-    /// documented default when it is free — and only when something on the
-    /// host already holds it asks the OS for a free one, reporting the port it
-    /// got. That is what lets a second daemon on the same host keep its names
-    /// instead of silently losing routing: it relocates, it does not fail.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn proxy_auto_selects_free_port() {
-        use std::net::{IpAddr, Ipv4Addr};
-
-        // Hold the documented default so the fallback is observable: the
-        // daemon's first bind must fail, its second must land elsewhere.
-        let held = TcpListener::bind((
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            crate::net::proxy::DEFAULT_EGRESS_PROXY_PORT,
-        ))
-        .await
-        .ok();
-
-        let buf = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        let dir = TempDir::new().unwrap();
-        let state = ServerStateHandle::new(test_config(&dir), None)
-            .await
-            .unwrap();
-        start_host_proxies(&state, false, None, None).await;
-
-        let bound = wait_for_proxy_port(&state).await;
-        assert_ne!(bound, 0, "port 0 is a request for a port, not an answer");
-        assert_ne!(
-            bound,
-            crate::net::proxy::DEFAULT_EGRESS_PROXY_PORT,
-            "a busy default must not be waited on or taken"
-        );
-        assert!(
-            state.proxy_unavailable().await.is_none(),
-            "a relocated default must not report the proxy unavailable"
-        );
-
-        // The picked port is a real listener, the relocation is said out
-        // loud, and the startup line reports the port as selected.
-        let backend = spawn_backend_saying("selected").await;
-        state
-            .sessions_manager()
-            .await
-            .hostnames()
-            .write()
-            .unwrap()
-            .register_host_net(::sessions::SessionId::nil(), "web");
-        let authority = format!("web.min.internal:{backend}");
-        let routed = proxy_get(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bound),
-            &authority,
-        )
-        .await;
-        assert!(
-            routed.contains("200 OK"),
-            "the selected port must route a name, got: {routed}"
-        );
-
-        let logged = buf.contents();
-        assert!(
-            logged.contains("the default hostname-proxy port is busy"),
-            "the busy default must be reported as the reason the daemon moved, got: {logged}"
-        );
-        assert!(
-            logged.contains(&format!("port={bound}")),
-            "the startup line must name the port, got: {logged}"
-        );
-        assert!(
-            logged.contains(r#"port_source="selected""#),
-            "the startup line must say the port was selected, got: {logged}"
-        );
-        drop(held);
-    }
-
-    /// NET-024's hard edge: a daemon *configured* with a port that is busy
-    /// keeps retrying it with backoff rather than relocating — the operator
-    /// named the port, and moving the listener would hide the loss the
-    /// report is there to surface.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn a_busy_configured_port_is_not_relocated() {
-        use std::net::{IpAddr, Ipv4Addr};
-
-        // A free port this test holds for its whole lifetime: the daemon is
-        // configured with it, and its bind must fail on it — deterministically,
-        // whatever else on the box holds the documented default.
-        let held = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let configured = held.local_addr().unwrap().port();
-
-        let buf = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        let dir = TempDir::new().unwrap();
-        let state = ServerStateHandle::new(test_config(&dir), None)
-            .await
-            .unwrap();
-        let retrier = tokio::spawn(drive_proxy_until_serving(
-            state.clone(),
-            HostProxyStartup::Egress {
-                bind_base: IpAddr::V4(Ipv4Addr::LOCALHOST),
-                port: ProxyPort::Pinned(configured),
-            },
-            false,
-            HostExpose::Shuttle,
-            RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(20)),
-        ));
-
-        // The bind keeps failing on the *same* address — no relocation line,
-        // and the note stays, because a pinned port is the operator's to fix.
-        let mut saw_two_failures = false;
-        for _ in 0..200 {
-            if buf
-                .contents()
-                .matches("could not bind its listener")
-                .count()
-                >= 2
-            {
-                saw_two_failures = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(
-            saw_two_failures,
-            "a busy configured port must keep failing loudly, got: {}",
-            buf.contents()
-        );
-        assert!(
-            !buf.contents().contains("selecting a free one"),
-            "a configured port must not be relocated, got: {}",
-            buf.contents()
-        );
-        assert!(
-            state.proxy_unavailable().await.is_some(),
-            "the busy configured port must stay reported as unavailable"
-        );
-        retrier.abort();
-        drop(held);
-    }
-
-    /// NET-025's other edge: only a *busy* address relocates. Any other bind
-    /// failure keeps the address it named and retries with backoff (NET-021),
-    /// because it is not another daemon holding the port and moving the
-    /// listener would hide the report. Driven with an address the host cannot
-    /// assign — the shape a half-up or misconfigured interface gives — which
-    /// fails with `EADDRNOTAVAIL` under glibc and musl alike, so this also
-    /// holds for the musl guest build the busy-port predicate once missed.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn a_non_busy_bind_failure_keeps_its_address() {
-        use std::net::{IpAddr, Ipv4Addr};
-
-        // A free port stands in for the documented default, as in the other
-        // retry tests: what fails here is the address, not the port.
-        let probe = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let default_port = probe.local_addr().unwrap().port();
-        drop(probe);
-
-        let buf = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        let dir = TempDir::new().unwrap();
-        let state = ServerStateHandle::new(test_config(&dir), None)
-            .await
-            .unwrap();
-        let retrier = tokio::spawn(drive_proxy_until_serving(
-            state.clone(),
-            HostProxyStartup::Egress {
-                // `192.0.2.1` is TEST-NET-1: no interface holds it, so every
-                // bind fails `EADDRNOTAVAIL`, deterministically, root or not.
-                bind_base: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-                port: ProxyPort::DefaultThenSelect {
-                    default: default_port,
-                },
-            },
-            false,
-            HostExpose::Shuttle,
-            RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(20)),
-        ));
-
-        // At least two failed binds on the *same* address — no relocation
-        // line, and the note stays, because the failure is not a busy port.
-        let mut saw_two_failures = false;
-        for _ in 0..200 {
-            if buf
-                .contents()
-                .matches("could not bind its listener")
-                .count()
-                >= 2
-            {
-                saw_two_failures = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let logged = buf.contents();
-        assert!(
-            saw_two_failures,
-            "a non-busy bind failure must keep retrying loudly, got: {logged}"
-        );
-        assert!(
-            !logged.contains("selecting a free one"),
-            "a bind failure that is not a busy port must not relocate, got: {logged}"
-        );
-        assert!(
-            logged
-                .matches(&format!("addr=192.0.2.1:{default_port}"))
-                .count()
-                >= 2,
-            "the retries must keep the address the report names, got: {logged}"
-        );
-        assert!(
-            state.proxy_unavailable().await.is_some(),
-            "the bind failure must stay reported as unavailable"
-        );
-        assert!(
-            state.hostname_proxy_port().await.is_none(),
-            "a proxy that never bound must not report serving"
-        );
-        retrier.abort();
-    }
-
-    /// NET-027's publish half: a guest-chosen port the host *could not
-    /// take* is released and a fresh one picked, not retried forever — two
-    /// VMs on one host whose ports collide at the host's loopback are
-    /// exactly the case the re-pick resolves. The refusal is driven through
-    /// a fixed publish answer (`port_taken`), because the transient half of
-    /// the publish's failure space — the arm that must not re-pick — is the
-    /// next test's subject and needs the real path.
-    /// NET-059's publish half, driven from the failure side: a host port the
-    /// host will not give up is walked off — one rung of its own further up,
-    /// the publication relocating and never the listener. The refusal is
-    /// driven through a fixed publish answer (`port_taken`), because the
-    /// transient half of the publish's failure space — the arm that must
-    /// not walk — is the next test's subject and needs the real path.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn a_refused_host_publish_walks_ports_of_its_own() {
-        use std::net::{IpAddr, Ipv4Addr};
-
-        // A free port stands in for the documented default: a test cannot
-        // hold the real one without racing every parallel process that
-        // binds it (nextest runs one per test).
-        let probe = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let default_port = probe.local_addr().unwrap().port();
-        drop(probe);
-
-        let buf = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        let dir = TempDir::new().unwrap();
-        let state = ServerStateHandle::new(test_config(&dir), None)
-            .await
-            .unwrap();
-        let retrier = tokio::spawn(drive_proxy_until_serving(
-            state.clone(),
-            HostProxyStartup::Egress {
-                bind_base: IpAddr::V4(Ipv4Addr::LOCALHOST),
-                port: ProxyPort::DefaultThenSelect {
-                    default: default_port,
-                },
-            },
-            // The publish gate is the subject: every attempt here reports a
-            // host port some other publication holds.
-            true,
-            HostExpose::Fixed(Some(HostPublishFailure {
-                report: "the gvproxy forwarder could not take 127.0.0.1 on the \
-                         host: the port is held. Remedy: free the host port, or \
-                         configure this daemon onto another"
-                    .to_owned(),
-                port_taken: true,
-            })),
-            RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(20)),
-        ));
-
-        // The relocation line names the host port it gives up on; two of
-        // them with different ports means the driver really is walking the
-        // host side, not retrying one proposal.
-        let mut seen = std::collections::BTreeSet::new();
-        let mut walked = false;
-        for _ in 0..400 {
-            for port in refused_ports(&buf.contents()) {
-                seen.insert(port);
-            }
-            if seen.len() >= 2 {
-                walked = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(
-            walked,
-            "a refused host port must be walked off, not retried; \
-             host ports refused so far: {seen:?}, log: {}",
-            buf.contents()
-        );
-
-        // And the walk never touches the listener: the bound port answers
-        // for the whole walk — the in-guest surface this VM's own boxes
-        // reach, at the documented default they were promised.
-        let routed = proxy_get(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), default_port),
-            "ghost.min.internal",
-        )
-        .await;
-        assert!(
-            routed.contains("502"),
-            "the listener must keep its port while the publication walks, got: {routed}"
-        );
-        assert!(
-            state.proxy_unavailable().await.is_some(),
-            "a publish that exhausts its rungs must stay reported as unavailable"
-        );
-        assert!(
-            state.hostname_proxy_port().await.is_none(),
-            "a proxy whose publish keeps failing must not report serving"
-        );
-        retrier.abort();
-    }
-
-    /// NET-059's publish half, driven from the success side: the host already
-    /// holds the bound port's number — another VM's publication — so this
-    /// daemon's publication takes the next rung of its own, the port a
-    /// client can reach is the rung it published on, and the listener keeps
-    /// the documented default this VM's own boxes share its loopback on.
-    /// The publication line beside the bind is the bundle's answer to which
-    /// VM owns which host port.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn a_walked_publication_keeps_the_bind_and_reports_the_rung() {
-        use std::net::{IpAddr, Ipv4Addr};
-
-        // A free port stands in for the documented default, with a free rung
-        // above it for the walk to land on.
-        let (default_port, rung) = loop {
-            let probe = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-            let port = probe.local_addr().unwrap().port();
-            drop(probe);
-            let Some(rung) = next_host_publish_port(port) else {
-                continue;
-            };
-            match std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, rung)) {
-                Ok(rung_probe) => drop(rung_probe),
-                Err(_) => continue,
-            }
-            break (port, rung);
-        };
-
-        let buf = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        let dir = TempDir::new().unwrap();
-        let state = ServerStateHandle::new(test_config(&dir), None)
-            .await
-            .unwrap();
-
-        // The forwarder's ledger with the default already held — the host
-        // loopback as a second VM's daemon finds it.
-        let held = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::from([
-            default_port,
-        ])));
-
-        drive_proxy_until_serving(
-            state.clone(),
-            HostProxyStartup::Egress {
-                bind_base: IpAddr::V4(Ipv4Addr::LOCALHOST),
-                port: ProxyPort::DefaultThenSelect {
-                    default: default_port,
-                },
-            },
-            true,
-            HostExpose::HeldPorts(held),
-            RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(20)),
-        )
-        .await;
-
-        // The port a client can reach is the rung the publication landed on.
-        assert_eq!(
-            state.hostname_proxy_port().await,
-            Some(rung),
-            "a refused publication must land on a host port of its own, log: {}",
-            buf.contents()
-        );
-
-        // The listener never moved: the documented default still answers,
-        // for the boxes that share this VM's loopback with the daemon.
-        let routed = proxy_get(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), default_port),
-            "ghost.min.internal",
-        )
-        .await;
-        assert!(
-            routed.contains("502"),
-            "the bind must keep the documented port while the publication walks, got: {routed}"
-        );
-
-        // The publication is named in the log, with both ports: the
-        // diagnostics-bundle answer to "where is this VM's proxy published".
-        let logged = buf.contents();
-        assert!(
-            logged.contains("hostname proxy is published on the host loopback"),
-            "the publication must be named in the log, got: {logged}"
-        );
-        assert!(
-            logged.contains(&format!("host_port={rung}")),
-            "the publication line must name the host port it landed on, got: {logged}"
-        );
-        assert!(
-            logged.contains(&format!("guest_port={default_port}")),
-            "the publication line must name the guest port beside it, got: {logged}"
-        );
-        assert!(
-            state.proxy_unavailable().await.is_none(),
-            "a publication that landed must clear the unavailable note"
-        );
-    }
-
-    /// T93's terminal half of the publish policy: inside a microVM, a host
-    /// port the host already holds — on the port the boot line handed this
-    /// daemon, which has no rung of its own to walk to — is reported to the
-    /// VM host daemon as a terminal publish failure naming the port, and the
-    /// drive *ends* there: the VM host holds the reservation and owns the
-    /// retry (a redraw hands a fresh port, or the start fails naming this
-    /// one), so a backoff loop the host never learns from would leave the VM
-    /// up with no hostname proxy. The unavailable note `min ls` warns from
-    /// stays recorded, and serving is never claimed for a publication that
-    /// did not happen.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn proxy_publish_in_use_is_reported_not_retried() {
-        use std::net::{IpAddr, Ipv4Addr};
-
-        // A free port stands in for the one the VM host handed down the boot
-        // line, so the bind cannot race another process's listener.
-        let probe = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let handed = probe.local_addr().unwrap().port();
-        drop(probe);
-
-        let buf = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        let dir = TempDir::new().unwrap();
-        let state = ServerStateHandle::new(test_config(&dir), None)
-            .await
-            .unwrap();
-        let drive = tokio::spawn(drive_proxy_until_serving(
-            state.clone(),
-            HostProxyStartup::Egress {
-                bind_base: IpAddr::V4(Ipv4Addr::LOCALHOST),
-                port: ProxyPort::Pinned(handed),
-            },
-            // The in-VM flag: this drive is the one with a VM host daemon on
-            // the other end of the boot-marker channel.
-            true,
-            HostExpose::Fixed(Some(HostPublishFailure {
-                report: "the gvproxy forwarder could not take 127.0.0.1 on the \
-                         host: the port is held. Remedy: free the host port, or \
-                         configure this daemon onto another"
-                    .to_owned(),
-                port_taken: true,
-            })),
-            RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(20)),
-        ));
-
-        // The drive must end on its own — the report is the terminal
-        // failure, not a preface to another backoff the test would have to
-        // abort. (The report is sent in the background, so the drive never
-        // waits on its vsock dial, which on a host with no VM host daemon
-        // can take seconds per try.)
-        let drove = tokio::time::timeout(Duration::from_secs(8), drive).await;
-        assert!(
-            drove.is_ok(),
-            "a taken hostname-proxy port must end the drive, not retry it \
-             with backoff forever; log: {}",
-            buf.contents()
-        );
-
-        // The terminal warning names the port it gives up on, exactly once,
-        // and the backoff arm's retry line never runs.
-        let log = buf.contents();
-        assert_eq!(
-            log.matches("reporting the terminal publish failure to the VM host daemon")
-                .count(),
-            1,
-            "the taken port must be reported once as terminal, got: {log}"
-        );
-        assert!(
-            log.contains(&format!("host_port={handed}")),
-            "the terminal report must name the port the host holds, got: {log}"
-        );
-        assert!(
-            !log.contains("retrying with backoff"),
-            "a taken hostname-proxy port must not enter the backoff retry, got: {log}"
-        );
-        assert!(
-            refused_ports(&log).is_empty(),
-            "a handed port has no rung to walk to, got: {log}"
-        );
-        assert!(
-            state.proxy_unavailable().await.is_some(),
-            "the terminal failure must stay recorded as the unavailable note \
-             min ls warns from"
-        );
-        assert!(
-            state.hostname_proxy_port().await.is_none(),
-            "a proxy whose publish failed must not report serving"
-        );
-
-        // And the listener keeps the port it was handed — the bind is this
-        // VM's own surface; only the publication is the host's.
-        let routed = proxy_get(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), handed),
-            "ghost.min.internal",
-        )
-        .await;
-        assert!(
-            routed.contains("502"),
-            "the handed bind must keep its port, got: {routed}"
-        );
-    }
-
-    /// The two-line payloads the publish-outcome reports write, in the exact
-    /// shape the VM host daemon's marker gate classifies — the twin of
-    /// guest.rs's `write_ready_beacon` format test, because the gate on the
-    /// host parses the same two lines the writer here formats.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn publish_outcome_reports_are_two_lines_naming_the_port() {
-        async fn drain(mut reader: tokio::io::DuplexStream) -> String {
-            let mut output = Vec::new();
-            tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut output)
-                .await
-                .unwrap();
-            String::from_utf8(output).unwrap()
-        }
-
-        let port = 19_911u16;
-
-        let (mut writer, reader) = tokio::io::duplex(4096);
-        write_proxy_serving_report(&mut writer, port, None)
-            .await
-            .unwrap();
-        drop(writer);
-        assert_eq!(
-            drain(reader).await,
-            format!("PROXY_SERVING\n{port}\n"),
-            "the PROXY_SERVING report must be two lines naming the port"
-        );
-
-        let (mut writer, reader) = tokio::io::duplex(4096);
-        write_proxy_port_held_report(&mut writer, port, None)
-            .await
-            .unwrap();
-        drop(writer);
-        assert_eq!(
-            drain(reader).await,
-            format!("PROXY_PORT_HELD\n{port}\n"),
-            "the PROXY_PORT_HELD report must be two lines naming the port"
-        );
-
-        // With the boot's publish generation handed, every report echoes it
-        // on a third line (T93), the line the host keeps or drops it by.
-        let (mut writer, reader) = tokio::io::duplex(4096);
-        write_proxy_serving_report(&mut writer, port, Some(42))
-            .await
-            .unwrap();
-        drop(writer);
-        assert_eq!(drain(reader).await, format!("PROXY_SERVING\n{port}\n42\n"));
-
-        let (mut writer, reader) = tokio::io::duplex(4096);
-        write_proxy_port_held_report(&mut writer, port, Some(42))
-            .await
-            .unwrap();
-        drop(writer);
-        assert_eq!(
-            drain(reader).await,
-            format!("PROXY_PORT_HELD\n{port}\n42\n")
-        );
-    }
-
-    /// NET-025's boot-time edge: a publish that fails for a *transient*
-    /// reason — here, nothing answering the shuttle, the exact shape a
-    /// daemon that starts before its host gvproxy (minvmd) is ready sees —
-    /// must keep the port it bound, the default included, and keep
-    /// retrying with backoff (NET-021). Only a host port genuinely taken
-    /// walks; a transient failure that walked would move a VM daemon's
-    /// publication off the default at every boot race and leave it on a
-    /// random host port until the daemon restarts.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn a_transient_publish_failure_keeps_the_default_port() {
-        use std::net::{IpAddr, Ipv4Addr};
-
-        // A free port stands in for the documented default: a test cannot
-        // hold the real one without racing every parallel process that
-        // binds it (nextest runs one per test).
-        let probe = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let default_port = probe.local_addr().unwrap().port();
-        drop(probe);
-
-        let buf = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        let dir = TempDir::new().unwrap();
-        let state = ServerStateHandle::new(test_config(&dir), None)
-            .await
-            .unwrap();
-        tokio::spawn(drive_proxy_until_serving(
-            state.clone(),
-            HostProxyStartup::Egress {
-                bind_base: IpAddr::V4(Ipv4Addr::LOCALHOST),
-                port: ProxyPort::DefaultThenSelect {
-                    default: default_port,
-                },
-            },
-            // The publish gate rides the real shuttle path: with no host
-            // gvproxy answering it, every attempt fails transiently — never
-            // with a host port taken.
-            true,
-            HostExpose::Shuttle,
-            RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(20)),
-        ));
-
-        // At least two failed publishes, each with the retry warning and
-        // none with a re-pick.
-        let mut saw_two_failures = false;
-        for _ in 0..600 {
-            if buf
-                .contents()
-                .matches("could not publish on the host loopback")
-                .count()
-                >= 2
-            {
-                saw_two_failures = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(
-            saw_two_failures,
-            "the transient publish failure must keep retrying, got: {}",
-            buf.contents()
-        );
-        let logged = buf.contents();
-        assert!(
-            !logged.contains("relocated"),
-            "a transient publish failure must keep the port it bound, got: {logged}"
-        );
-
-        // The port the listener bound, as the publish warnings name it. The
-        // probe's port is free only until the probe drops: a parallel test
-        // can take it before the bind (an outgoing connection's ephemeral
-        // port, say), and then NET-025 relocates the *bind* — its own tests
-        // cover that — and nothing listens on the probed port. Follow the
-        // listener to where it landed, and hold it to the probed port
-        // whenever the bind did not relocate.
-        let bound_port: u16 = logged
-            .split("guest_port=")
-            .nth(1)
-            .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
-            .and_then(|port| port.parse().ok())
-            .unwrap_or_else(|| {
-                panic!("the publish warning must name the bound port, got: {logged}")
-            });
-        if !logged.contains("selecting a free one") {
-            assert_eq!(
-                bound_port, default_port,
-                "a bind that did not relocate must hold the default, got: {logged}"
-            );
-        }
-        // Relocated bind or not, every failed publish proposed the port it
-        // bound: no walk, on either side of the publication.
-        let field = |line: &str, key: &str| -> Option<u16> {
-            line.split(key)
-                .nth(1)?
-                .split(|c: char| !c.is_ascii_digit())
-                .next()?
-                .parse()
-                .ok()
-        };
-        for line in logged
-            .lines()
-            .filter(|line| line.contains("could not publish on the host loopback"))
-        {
-            assert_eq!(
-                (field(line, " host_port="), field(line, " guest_port=")),
-                (Some(bound_port), Some(bound_port)),
-                "each failed publish must propose the bound port, got: {line}"
-            );
-        }
-
-        // The port it keeps is the one it bound: the listener is serving
-        // behind the still-failing publish — exactly the state a VM daemon
-        // is in while its host gvproxy comes up.
-        let routed = proxy_get(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bound_port),
-            "ghost.min.internal",
-        )
-        .await;
-        assert!(
-            routed.contains("502"),
-            "the kept port must answer while the publish retries, got: {routed}"
-        );
-        assert!(
-            state.proxy_unavailable().await.is_some(),
-            "the publish failure must be reported as the unavailable note"
-        );
-        assert!(
-            state.hostname_proxy_port().await.is_none(),
-            "a proxy whose publish keeps failing must not report serving"
-        );
-    }
-
-    /// Serves one gvproxy-shaped control channel at `path`: every request is
-    /// read to its end-of-head marker and answered with `status` and `body`,
-    /// the connection held open the way the real forwarder holds its
-    /// keep-alive exchange (see `net::policy::post_json`).
-    #[cfg(target_os = "linux")]
-    async fn spawn_control_channel_answering(
-        path: std::path::PathBuf,
-        status: &'static str,
-        body: &'static str,
-    ) {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-        let listener = UnixListener::bind(&path).unwrap();
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    let mut scratch = [0u8; 1024];
-                    let _ = sock.read(&mut scratch).await;
-                    let response = format!(
-                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = sock.write_all(response.as_bytes()).await;
-                    // `sock` stays alive to the end of this task only; the
-                    // client reads its Content-Length and closes first.
-                });
-            }
-        });
-    }
-
-    /// The publish classifier's *taken* arm: a forwarder that answers and
-    /// refuses — it could not take the host-side port, which on this endpoint
-    /// is a host port some other process holds — is the one publish failure a
-    /// guest-chosen port re-picks from. Driven over a unix control channel
-    /// standing in for the shuttle, answering with the HTTP error status
-    /// `post_json` folds into an io::Error, so the arm is reached without a
-    /// host gvproxy to answer.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn a_forwarder_refusal_classifies_the_host_port_as_taken() {
-        let dir = TempDir::new().unwrap();
-        let control = dir.path().join("gvproxy.sock");
-        spawn_control_channel_answering(control.clone(), "409 Conflict", "port already in use")
-            .await;
-
-        // The listener bound in-guest on 7654; the publication proposes the
-        // next rung above it — the split this test's report names.
-        let failure = publish_listener_on_control(
-            &crate::net::policy::ControlChannel::Unix(control),
-            std::net::Ipv4Addr::new(100, 64, 0, 2),
-            7654,
-            7654 + HOST_PUBLISH_PORT_STRIDE as u16,
-            "tcp",
-        )
-        .await
-        .expect("a refused publish must report a failure");
-
-        assert!(
-            failure.port_taken,
-            "a forwarder that answered and refused has taken the host port, got: {}",
-            failure.report
-        );
-        assert!(
-            failure.report.contains(&format!(
-                "could not publish port {}",
-                7654 + HOST_PUBLISH_PORT_STRIDE
-            )),
-            "the taken arm's report must name the host port the publication proposed, got: {}",
-            failure.report
-        );
-        assert!(
-            failure.report.contains("returned HTTP 409"),
-            "the taken arm's report must name the status the forwarder answered with, got: {}",
-            failure.report
-        );
-        assert!(
-            failure.report.contains("Remedy:"),
-            "the report must carry the remedy, got: {}",
-            failure.report
-        );
-    }
-
-    /// The publish classifier's *transient* arm: a forwarder that never
-    /// answered — here, nothing listening where the control channel points,
-    /// the exact shape a daemon that starts before its host gvproxy (minvmd)
-    /// sees — says nothing about the host port, so it must not read as taken:
-    /// a transient failure that re-picked would move a VM daemon off its
-    /// documented default at every boot race.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn an_unreachable_forwarder_classifies_the_failure_as_transient() {
-        let dir = TempDir::new().unwrap();
-        // Nothing binds this path: the control channel points where no
-        // forwarder is.
-        let control = dir.path().join("absent.sock");
-
-        let failure = publish_listener_on_control(
-            &crate::net::policy::ControlChannel::Unix(control),
-            std::net::Ipv4Addr::new(100, 64, 0, 2),
-            7654,
-            7654,
-            "tcp",
-        )
-        .await
-        .expect("a failed publish must report a failure");
-
-        assert!(
-            !failure.port_taken,
-            "a forwarder that never answered has not taken the host port, got: {}",
-            failure.report
-        );
-        assert!(
-            !failure.report.contains("returned HTTP"),
-            "a failure that never got an answer must not be classified as a refusal, got: {}",
-            failure.report
-        );
-        assert!(
-            failure.report.contains("could not publish port 7654"),
-            "the report must name the port and the failure, got: {}",
-            failure.report
-        );
-    }
-
-    /// The host ports named by the publication's relocation warnings in
-    /// `log` — the rungs the driver walked off because the host already
-    /// held them.
-    #[cfg(target_os = "linux")]
-    fn refused_ports(log: &str) -> Vec<u16> {
-        log.lines()
-            .filter(|line| line.contains("publishing on a port of its own"))
-            .filter_map(|line| {
-                let rest = line.split_once("host_port=")?.1;
-                rest.split(|c: char| !c.is_ascii_digit())
-                    .next()
-                    .and_then(|digits| digits.parse().ok())
-            })
-            .collect()
-    }
-
-    /// NET-002 beside NET-027: the registry a daemon builds — through its
-    /// generated instance id, the way [`crate::ServerState::new`] builds it —
-    /// still answers the `local` zone every daemon promised before instance
-    /// ids existed, beside its own instance's zone.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn local_zone_routes_on_an_instance_scoped_registry() {
-        use ::sessions::SessionId;
-
-        let dir = TempDir::new().unwrap();
-        let state = ServerStateHandle::new(test_config(&dir), None)
-            .await
-            .unwrap();
-        let id = state.daemon_id().await;
-        assert_ne!(
-            id, "local",
-            "a daemon's instance id is its own, not the shared label"
-        );
-
-        let registry = state.sessions_manager().await.hostnames();
-        registry
-            .write()
-            .unwrap()
-            .register_host_net(SessionId::nil(), "web");
-
-        // The two-label name, the instance's own three-label zone, and the
-        // `local` zone a pre-instance name lives in all route; another
-        // daemon's zone does not, and neither does an unknown session under
-        // any of them.
-        let read = registry.read().unwrap();
-        assert!(read.resolve("web.min.internal:8080").is_some());
-        assert!(
-            read.resolve(&format!("web.{id}.min.internal:8080"))
-                .is_some()
-        );
-        assert!(
-            read.resolve("web.local.min.internal:8080").is_some(),
-            "the local zone must keep routing on every daemon"
-        );
-        assert!(read.resolve("ghost.local.min.internal:8080").is_none());
-        assert!(read.resolve("ghost.min.internal:8080").is_none());
-    }
-
-    /// NET-027: two daemons on one machine route both sets of names at the
-    /// same time — including, each, the `local` zone NET-002 promised (which
-    /// is a per-daemon zone now, answered from that daemon's own
-    /// registration). The daemons are shaped the way two on one host really
-    /// are: VM hosts (`in_microvm`), each box published on its own address,
-    /// so both publish the **same** port and carry the **same** Host header —
-    /// the only things that pick a backend are the name and which daemon's
-    /// proxy the request goes through.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn two_daemons_route_hostnames_concurrently() {
-        use std::collections::BTreeMap;
-        use std::net::{IpAddr, Ipv4Addr};
-
-        use ::sessions::SessionId;
-
-        // `in_microvm` is what makes a daemon's registry route an own-IP box
-        // to its reported address (a lease on the switch) rather than to the
-        // one loopback address every native box would share — the shape two
-        // daemons must take to publish the same port at the same time.
-        let vm_host = |dir: &TempDir| Config {
-            in_microvm: true,
-            ..test_config(dir)
-        };
-        let dir_a = TempDir::new().unwrap();
-        let dir_b = TempDir::new().unwrap();
-        let a = ServerStateHandle::new(vm_host(&dir_a), None).await.unwrap();
-        let b = ServerStateHandle::new(vm_host(&dir_b), None).await.unwrap();
-
-        // Two daemon instances: distinct ids, or the names they mint below
-        // would not be distinct either.
-        let id_a = a.daemon_id().await;
-        let id_b = b.daemon_id().await;
-        assert_ne!(id_a, id_b, "two daemon instances must mint two host ids");
-
-        // Neither daemon was configured with a port, so each drives its own
-        // startup and ends up on its own.
-        let auto = || SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let compressed = RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(20));
-        let (_, _) = tokio::join!(
-            retry_hostname_proxy_until_serving(a.clone(), auto(), compressed),
-            retry_hostname_proxy_until_serving(b.clone(), auto(), compressed),
-        );
-        let port_a = wait_for_proxy_port(&a).await;
-        let port_b = wait_for_proxy_port(&b).await;
-        assert_ne!(port_a, port_b, "two daemons must not land on one port");
-
-        // Each daemon's `web` box, published at its own address on the same
-        // port — the two "leases" the attach path would report. The external
-        // port is 80 (a `Host:` header with no port routes as 80) and both
-        // publish the same one: which box answers is decided by the name and
-        // the proxy alone.
-        let probe = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let published = probe.local_addr().unwrap().port();
-        drop(probe);
-        let lease_a = Ipv4Addr::new(127, 0, 0, 1);
-        let lease_b = Ipv4Addr::new(127, 0, 0, 2);
-        spawn_backend_on(SocketAddr::new(IpAddr::V4(lease_a), published), "daemon-a").await;
-        spawn_backend_on(SocketAddr::new(IpAddr::V4(lease_b), published), "daemon-b").await;
-
-        let registry_a = a.sessions_manager().await.hostnames();
-        let registry_b = b.sessions_manager().await.hostnames();
-        registry_a.write().unwrap().report_own_address(
-            SessionId::nil(),
-            "web",
-            lease_a,
-            BTreeMap::from([(80, published)]),
-        );
-        registry_b.write().unwrap().report_own_address(
-            SessionId::nil(),
-            "web",
-            lease_b,
-            BTreeMap::from([(80, published)]),
-        );
-
-        // The two daemons' registries do not see each other's instance
-        // zones — each answers its own instance's three-label form (and the
-        // shared two-label and `local` forms, each from its own
-        // registration), and not the other daemon's.
-        let own_a = format!("web.{id_a}.min.internal");
-        let own_b = format!("web.{id_b}.min.internal");
-        assert!(
-            registry_a.read().unwrap().resolve(&own_a).is_some(),
-            "daemon A must answer its own instance's name"
-        );
-        assert!(
-            registry_a.read().unwrap().resolve(&own_b).is_none(),
-            "daemon A must not answer daemon B's name"
-        );
-        assert!(
-            registry_b.read().unwrap().resolve(&own_b).is_some(),
-            "daemon B must answer its own instance's name"
-        );
-        assert!(
-            registry_b.read().unwrap().resolve(&own_a).is_none(),
-            "daemon B must not answer daemon A's name"
-        );
-
-        // Both sets of names route at the same time, decided by the Host
-        // header alone: the same authority through each daemon's proxy
-        // reaches that daemon's own box, concurrently — and the deprecated
-        // three-label forms (instance's own, and `local`) route to it too,
-        // while the *other* daemon's instance form is refused with a 502
-        // (the proxy serves it: "no live box owns this host").
-        let proxy_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_a);
-        let proxy_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_b);
-        let (a_two_label, a_local, a_own, a_foreign, b_two_label, b_local, b_own, b_foreign) = tokio::join!(
-            proxy_get(proxy_a, "web.min.internal"),
-            proxy_get(proxy_a, "web.local.min.internal"),
-            proxy_get(proxy_a, &own_a),
-            proxy_get(proxy_a, &own_b),
-            proxy_get(proxy_b, "web.min.internal"),
-            proxy_get(proxy_b, "web.local.min.internal"),
-            proxy_get(proxy_b, &own_b),
-            proxy_get(proxy_b, &own_a),
-        );
-        assert!(a_two_label.contains("daemon-a"), "got: {a_two_label}");
-        assert!(a_local.contains("daemon-a"), "got: {a_local}");
-        assert!(a_own.contains("daemon-a"), "got: {a_own}");
-        assert!(b_two_label.contains("daemon-b"), "got: {b_two_label}");
-        assert!(b_local.contains("daemon-b"), "got: {b_local}");
-        assert!(b_own.contains("daemon-b"), "got: {b_own}");
-        assert!(
-            a_foreign.contains("502"),
-            "daemon A must refuse daemon B's instance name, got: {a_foreign}"
-        );
-        assert!(
-            b_foreign.contains("502"),
-            "daemon B must refuse daemon A's instance name, got: {b_foreign}"
-        );
-    }
-
-    /// NET-027's switch half beside NET-010's address half: two daemons on
-    /// one machine take two different switch /24s — the pinned pair here, 37
-    /// and 52 — while the addresses their published boxes are granted from
-    /// are the *same* host-wide pool, the reserved local range the answerer's
-    /// lease record arbitrates (design §7.1). Each daemon's start line
-    /// carries both facts, so a reader of two daemons' logs (a diagnostics
-    /// bundle tails exactly this log) sees what distinguishes them — the
-    /// switch — and what cannot distinguish them: the pool is the host's,
-    /// never the daemon's, so no octet pair, congruent modulo the slice
-    /// count of the carve this line replaced or otherwise, can hand two
-    /// daemons one address between them.
-    ///
-    /// The `in_microvm: true` daemon keeps the host's default /16 whatever
-    /// octet it was pinned to (it does not own its switch) and still draws
-    /// its published addresses from the same one pool.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn two_daemons_log_one_host_wide_loopback_pool() {
-        let buf = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        // Two daemons pinned onto different /24s of the host switch, through
-        // `Server::run` the way a deployment starts them.
-        let dir_a = TempDir::new().unwrap();
-        let (run_a, _sock_a) = spawn_server_with(
-            &dir_a,
-            Config {
-                switch_subnet_octet: Some(37),
-                ..test_config(&dir_a)
-            },
-        );
-        let dir_b = TempDir::new().unwrap();
-        let (run_b, _sock_b) = spawn_server_with(
-            &dir_b,
-            Config {
-                switch_subnet_octet: Some(52),
-                ..test_config(&dir_b)
-            },
-        );
-        // A VM daemon on the first pinned octet: the octet does not reach
-        // its switch (the host gvproxy's /16 stays), and its published
-        // addresses come from the same pool as both native daemons'.
-        let dir_c = TempDir::new().unwrap();
-        let state_c = ServerStateHandle::new(
-            Config {
-                in_microvm: true,
-                switch_subnet_octet: Some(37),
-                ..test_config(&dir_c)
-            },
-            None,
-        )
-        .await
-        .unwrap();
-
-        // The start lines are logged as each daemon comes up; wait for all
-        // three before reading the pool back out of them.
-        let logged = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let logged = buf.contents();
-                if logged.matches("reserved_loopback=").count() >= 3 {
-                    return logged;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("all three daemons must log the pool their published boxes come from");
-
-        // Each daemon's start line, found by the field that identifies the
-        // daemon: the configured /24 for the two pinned ones, the host's /16
-        // for the VM one.
-        let id_c = state_c.daemon_id().await;
-        let line_of = |marker: &str| {
-            logged
-                .lines()
-                .find(|line| line.contains(marker) && line.contains("reserved_loopback="))
-                .unwrap_or_else(|| panic!("no start line carrying {marker}, got: {logged}"))
-                .to_owned()
-        };
-        let line_a = line_of("subnet=100.64.37.0/24");
-        let line_b = line_of("subnet=100.64.52.0/24");
-        let line_c = line_of("subnet=100.64.0.0/16");
-        assert!(
-            line_c.contains(&format!("daemon_id={id_c}")),
-            "the /16 line is the VM daemon's own, got: {line_c}"
-        );
-
-        // Every daemon's line carries the same one pool: the answerer's
-        // whole grantable range, first address to last, never a per-daemon
-        // carve of it.
-        for line in [&line_a, &line_b, &line_c] {
-            assert!(
-                line.contains("reserved_loopback=127.0.64.2-127.0.64.254"),
-                "a daemon's published boxes come from this host's one pool, got: {line}"
-            );
-        }
-        // And what distinguishes the daemons is their switches, not their
-        // pools: two different /24s for the pinned pair.
-        assert_ne!(
-            line_a, line_b,
-            "two daemons pinned to different octets take different switches"
-        );
-
-        run_a.abort();
-        run_b.abort();
-    }
-
-    /// NET-027: the /24 a daemon's id derives is stable — the same id names
-    /// the same /24 start after start — and distinct ids name distinct ones
-    /// often enough that two daemons on a host do not meet on one /24 by
-    /// accident. Every derived octet stays inside the `100.64/16`: never
-    /// the `0` of the /16's own gateway /24 nor the `255` of its host-alias
-    /// and daemon-address /24, which the host switch keeps for itself.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn derived_switch_octets_are_stable_and_in_range() {
-        assert_eq!(octet_for_daemon_id("abc12"), 21);
-        assert_eq!(
-            octet_for_daemon_id("abc12"),
-            21,
-            "derivation must be stable"
-        );
-        assert_ne!(
-            octet_for_daemon_id("abc12"),
-            octet_for_daemon_id("abc13"),
-            "near ids must not collapse onto one /24"
-        );
-        for id in ["aaaaa", "abc12", "abc13", "x9y8z", "zzzzz"] {
-            let octet = octet_for_daemon_id(id);
-            assert!(
-                (1..=254).contains(&octet),
-                "{id} derived {octet}, which is outside 1..=254"
-            );
-        }
-    }
-
-    /// A native daemon's switch octet is stable across restarts: the
-    /// identity is persisted under the state root on first start and read
-    /// back on subsequent starts, so the derived /24 stays the same. Each
-    /// "start" uses its own lock dir, since the first start's lock is held
-    /// for the life of this test process.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn native_switch_octet_is_stable_across_restarts() {
-        let dir = TempDir::new().unwrap();
-        let state_dir = DaemonAbsPath::try_new(
-            camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap(),
-        )
-        .unwrap();
-        let start = |state_dir: &DaemonAbsPath| {
-            let locks = TempDir::new().unwrap();
-            let identity = load_or_create_daemon_identity(state_dir).unwrap();
-            resolve_switch_octet(Some(locks.path()), &identity)
-        };
-        let first = start(&state_dir);
-        let second = start(&state_dir);
-        assert_eq!(
-            first, second,
-            "the switch octet must be stable across restarts"
-        );
-        assert!(
-            (1..=254).contains(&first),
-            "derived octet {first} is outside 1..=254"
-        );
-    }
-
-    /// An empty identity file is regenerated and persisted rather than
-    /// sending every start to the per-start fallback.
-    #[test]
-    fn empty_daemon_identity_file_is_regenerated() {
-        let dir = TempDir::new().unwrap();
-        let state_dir = DaemonAbsPath::try_new(
-            camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap(),
-        )
-        .unwrap();
-        let path = dir.path().join(DAEMON_IDENTITY_FILE);
-        std::fs::write(&path, "  \n").unwrap();
-        let identity = load_or_create_daemon_identity(&state_dir).unwrap();
-        assert!(!identity.is_empty());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), identity);
-        assert_eq!(
-            load_or_create_daemon_identity(&state_dir).unwrap(),
-            identity
-        );
-    }
-
-    /// Two daemons on one machine that derive the same octet end up on
-    /// different blocks: the first holds the per-octet lock, so the second
-    /// re-derives.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn colliding_daemons_end_up_on_different_octets() {
-        let locks = TempDir::new().unwrap();
-        let first = resolve_switch_octet(Some(locks.path()), "same-identity");
-        let second = resolve_switch_octet(Some(locks.path()), "same-identity");
-        assert_eq!(first, octet_for_daemon_id("same-identity"));
-        assert_ne!(
-            first, second,
-            "a daemon whose octet is already held must re-derive to a different one"
-        );
-    }
-
-    /// A microVM daemon never persists an identity: its octet is always
-    /// derived from the per-start id, because the guest does not own its
-    /// switch.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn microvm_daemon_never_persists_identity() {
-        let dir = TempDir::new().unwrap();
-        let state_dir = DaemonAbsPath::try_new(
-            camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap(),
-        )
-        .unwrap();
-        let first = native_switch_octet(true, Some(&state_dir), "per-start-id");
-        let second = native_switch_octet(true, Some(&state_dir), "different-per-start-id");
-        assert_ne!(
-            first, second,
-            "a microVM daemon must derive its octet from the per-start id, not a persisted identity"
-        );
-        // The identity file must not have been written.
-        let identity_path = state_dir
-            .as_utf8_path()
-            .as_std_path()
-            .join(DAEMON_IDENTITY_FILE);
-        assert!(
-            !identity_path.exists(),
-            "a microVM daemon must not persist a daemon identity"
-        );
-    }
-
-    /// NET-027: a configured third octet places the daemon's switch /24
-    /// inside the host gvproxy's `100.64/16`, where its leases stay valid
-    /// beside the host's own gateway, host-alias, and PTask reservations.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_configured_octet_places_the_switch_inside_the_host_s_16() {
-        let subnet = switch_subnet_for_octet(200);
-        assert_eq!(subnet.to_string(), "100.64.200.0/24");
-        let octets = subnet.network().octets();
-        assert_eq!(&octets[..2], &[100, 64], "the /24 must stay in 100.64/16");
-        assert_eq!(octets[3], 0, "a /24's network address ends in 0");
-    }
-
-    /// The other half of the ownership rule [`switch_subnet_for`] states —
-    /// the half the macOS e2e caught: a daemon in a microVM does not own its
-    /// gvproxy (it attaches its boxes' taps to the one `minvmd` runs on the
-    /// host, whose config renders the default /16), so the guest must carry
-    /// that switch's subnet, never derive a /24 of its own. Every address a
-    /// guest daemon derives from its switch must be one that switch answers
-    /// at: the gateway is where a box's default route and DNS server live
-    /// (a host-address box's resolver is the switch's DNS server, an
-    /// own-IP box's tap carries the subnet's gateway and netmask), and a
-    /// derived /24's gateway — `100.64.<octet>.1` — is an address no
-    /// gvproxy answers, so every box in the VM lost egress, DNS first.
-    /// Read off the daemon's own start line, which names the subnet its
-    /// switch carries, with an octet pinned to show the pin cannot move a
-    /// switch the guest does not own.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn a_microvm_daemon_attaches_to_the_host_switch_s_own_subnet() {
-        let buf = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        let dir = TempDir::new().unwrap();
-        let state = ServerStateHandle::new(
-            Config {
-                in_microvm: true,
-                switch_subnet_octet: Some(37),
-                ..test_config(&dir)
-            },
-            None,
-        )
-        .await
-        .unwrap();
-
-        let id = state.daemon_id().await;
-        let logged = buf.contents();
-        let line = logged
-            .lines()
-            .find(|l| l.contains("reserved_loopback=") && l.contains(&format!("daemon_id={id}")))
-            .unwrap_or_else(|| panic!("no start line for daemon {id}, got: {logged}"));
-        assert!(
-            line.contains("subnet=100.64.0.0/16"),
-            "a microVM daemon must carry the host gvproxy's /16, got: {line}"
-        );
-
-        // The mapping's native arms beside it: a native daemon honors the
-        // pin — it renders its own gvproxy's config — and an unpinned one
-        // derives its /24 from its instance id (NET-027).
-        assert_eq!(
-            switch_subnet_for(false, 37).to_string(),
-            "100.64.37.0/24",
-            "a pinned native daemon owns its switch and takes the pinned /24"
-        );
-        assert_eq!(
-            switch_subnet_for(false, octet_for_daemon_id(&id)),
-            switch_subnet_for_octet(octet_for_daemon_id(&id)),
-            "an unpinned native daemon derives its own /24"
-        );
-        // The published-address half the octet no longer touches: the pool a
-        // daemon's boxes are granted from is the host's one pool, the same
-        // for a VM daemon as for every native one, whatever octet either
-        // carries (NET-010 — allocation is the answerer's, never the
-        // daemon's).
-        assert!(
-            line.contains("reserved_loopback=127.0.64.2-127.0.64.254"),
-            "a daemon's published boxes come from this host's one pool, \
-             got: {line}"
-        );
-        // And the address that broke the e2e follows: the /16's gateway is
-        // where the host gvproxy answers DNS, and a native /24's is inside
-        // the /16's span but is no switch's address.
-        assert_eq!(
-            crate::net::DEFAULT_SUBNET.dns_server().to_string(),
-            "100.64.0.1",
-            "the host switch's /16 answers DNS at its own gateway"
-        );
-    }
-
-    /// The box-zone answerer starts beside the hostname proxy and serves the
-    /// zone on loopback (NET-009): `drive_answerer_until_serving` binds the
-    /// address, the log names the listener's address and port at start, and a
-    /// real UDP exchange over the bound socket answers a box name with its
-    /// local address.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn answerer_starts_and_serves_the_zone_on_loopback() {
-        use std::net::{IpAddr, Ipv4Addr};
-
-        use ::sessions::SessionId;
-        use hickory_proto::op::{Message, ResponseCode};
-        use hickory_proto::rr::rdata::A;
-        use hickory_proto::rr::{RData, RecordType};
-
-        use crate::net::answerer::{AnswerScope, ZoneAnswerer, encode_query};
-
-        // A free port, handed to the driver the way startup hands it a fixed
-        // one: bound and dropped, uncontended in a test binary.
-        let probe = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-
-        let buf = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        let dir = TempDir::new().unwrap();
-        let state = ServerStateHandle::new(test_config(&dir), None)
-            .await
-            .unwrap();
-        let hostnames = state.sessions_manager().await.hostnames();
-        hostnames
-            .write()
-            .expect("registry lock")
-            .register_host_net(SessionId::nil(), "web");
-
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-        let answerer = ZoneAnswerer::new(hostnames, AnswerScope::Native);
-        tokio::spawn(drive_answerer_until_serving(
-            state.clone(),
-            answerer,
-            addr.ip(),
-            ProxyPort::Pinned(port),
-            false,
-            HostExpose::Shuttle,
-            RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(20)),
-        ));
-
-        // Poll until the driver's bind lands, then do one real exchange.
-        let client = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let query = encode_query("web.min.internal.", RecordType::A);
-        let mut scratch = [0u8; 512];
-        let mut reply = None;
-        for _ in 0..200 {
-            client.send_to(&query, addr).await.unwrap();
-            if let Ok(Ok((bytes, _))) =
-                tokio::time::timeout(Duration::from_millis(25), client.recv_from(&mut scratch))
-                    .await
-            {
-                reply = Some(scratch[..bytes].to_vec());
-                break;
-            }
-        }
-        let bytes = reply.expect("the answerer must answer once the driver binds it");
-        let reply = Message::from_vec(&bytes).expect("the reply decodes");
-        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
-        let [answer] = &reply.answers[..] else {
-            panic!("an A lookup on a held name answers once")
-        };
-        let RData::A(A(address)) = &answer.data else {
-            panic!("the answer is an A record")
-        };
-        assert_eq!(*address, Ipv4Addr::LOCALHOST);
-
-        // The daemon log names the answerer's listener address and port, the
-        // state records the port for the discovery replies to carry, and the
-        // serving line says who chose it.
-        let logged = buf.contents();
-        assert!(
-            logged.contains("zone-answerer") && logged.contains(&format!("{addr}")),
-            "the answerer's start must name its listener, got: {logged}"
-        );
-        assert!(
-            logged.contains(r#"port_source="configured""#),
-            "the answerer's serving line must name its port source, got: {logged}"
-        );
-        let reported = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if state.zone_answerer_port().await == Some(port) {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await;
-        assert!(
-            reported.is_ok(),
-            "the answerer's bound port must be recorded on the state, got: {logged}"
-        );
-    }
-
-    /// The answerer shares the hostname proxy's port policy (NET-025): a
-    /// busy default is relocated — loudly — rather than failed, and the
-    /// relocated port is the one the discovery field reports as selected.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn answerer_relocates_when_its_default_port_is_busy() {
-        use std::net::{IpAddr, Ipv4Addr};
-
-        use crate::net::answerer::{ANSWERER_PORT, AnswerScope, ZoneAnswerer};
-
-        // Hold the answerer's documented default (UDP) for the whole test.
-        // `.ok()`, not `unwrap`: the `Server::run` tests beside this one bind
-        // the real defaults too, and nextest runs each test in its own
-        // process, so another process may already hold it. Either holder
-        // produces the same relocation; nothing here needs *this* process to
-        // be the one holding it.
-        let held = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, ANSWERER_PORT)).ok();
-
-        let buf = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        let dir = TempDir::new().unwrap();
-        let state = ServerStateHandle::new(test_config(&dir), None)
-            .await
-            .unwrap();
-        let hostnames = state.sessions_manager().await.hostnames();
-        let answerer = ZoneAnswerer::new(hostnames, AnswerScope::Native);
-        tokio::spawn(drive_answerer_until_serving(
-            state.clone(),
-            answerer,
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            ProxyPort::DefaultThenSelect {
-                default: ANSWERER_PORT,
-            },
-            false,
-            HostExpose::Shuttle,
-            RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(20)),
-        ));
-
-        let reported = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Some(port) = state.zone_answerer_port().await {
-                    return port;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the answerer must relocate and report its port");
-        assert_ne!(
-            reported, ANSWERER_PORT,
-            "a busy default must not be waited on or taken"
-        );
-
-        let logged = buf.contents();
-        assert!(
-            logged.contains("the default zone-answerer port is busy"),
-            "the busy default must be reported as the reason the answerer moved, got: {logged}"
-        );
-        assert!(
-            logged.contains(r#"port_source="selected""#),
-            "the serving line must say the port was selected, got: {logged}"
-        );
-        drop(held);
-    }
-
-    /// NET-059's publish half for the answerer, driven from the success
-    /// side: the host already holds the bound port's number — another VM's
-    /// publication — so this daemon's answerer publishes on the next rung of
-    /// its own, the port the host's resolver reaches is the rung it landed
-    /// on, and the socket keeps the documented default this VM's own boxes
-    /// query its loopback on. The walk is the proxies' — the socket is never
-    /// rebound — so both halves of the host's hostname surface follow one
-    /// rule, and two VMs' answerers can serve their zones on one host at
-    /// once, each on a port of its own.
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn a_walked_answerer_publication_keeps_the_bind_and_reports_the_rung() {
-        use std::net::{IpAddr, Ipv4Addr};
-
-        use ::sessions::SessionId;
-        use hickory_proto::op::{Message, ResponseCode};
-        use hickory_proto::rr::RecordType;
-
-        use crate::net::answerer::{AnswerScope, ZoneAnswerer, encode_query};
-
-        // A free port stands in for the documented default, with a free rung
-        // above it for the walk to land on.
-        let (default_port, rung) = loop {
-            let probe = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-            let port = probe.local_addr().unwrap().port();
-            drop(probe);
-            let Some(rung) = next_host_publish_port(port) else {
-                continue;
-            };
-            match std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, rung)) {
-                Ok(rung_probe) => drop(rung_probe),
-                Err(_) => continue,
-            }
-            break (port, rung);
-        };
-
-        let buf = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        let dir = TempDir::new().unwrap();
-        let state = ServerStateHandle::new(test_config(&dir), None)
-            .await
-            .unwrap();
-        let hostnames = state.sessions_manager().await.hostnames();
-        hostnames
-            .write()
-            .expect("registry lock")
-            .register_host_net(SessionId::nil(), "web");
-
-        // The forwarder's ledger with the default already held — the host
-        // loopback as a second VM's daemon finds it.
-        let held = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::from([
-            default_port,
-        ])));
-
-        let answerer = ZoneAnswerer::new(hostnames, AnswerScope::Native);
-        drive_answerer_until_serving(
-            state.clone(),
-            answerer,
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            ProxyPort::DefaultThenSelect {
-                default: default_port,
-            },
-            true,
-            HostExpose::HeldPorts(held),
-            RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(20)),
-        )
-        .await;
-
-        // The port the host's resolver reaches is the rung the publication
-        // landed on.
-        assert_eq!(
-            state.zone_answerer_port().await,
-            Some(rung),
-            "a refused answerer publication must land on a host port of its own, log: {}",
-            buf.contents()
-        );
-
-        // The socket never moved: the documented default still answers a
-        // real exchange — the in-guest surface this VM's own boxes reach, at
-        // the port they were promised.
-        let client = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let query = encode_query("web.min.internal.", RecordType::A);
-        let mut scratch = [0u8; 512];
-        let mut reply = None;
-        for _ in 0..200 {
-            client
-                .send_to(
-                    &query,
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), default_port),
-                )
-                .await
-                .unwrap();
-            if let Ok(Ok((bytes, _))) =
-                tokio::time::timeout(Duration::from_millis(25), client.recv_from(&mut scratch))
-                    .await
-            {
-                reply = Some(scratch[..bytes].to_vec());
-                break;
-            }
-        }
-        let bytes =
-            reply.expect("the answerer must keep answering on the port it bound through the walk");
-        let reply = Message::from_vec(&bytes).expect("the reply decodes");
-        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
-
-        // The relocation and the publication are named in the log, with both
-        // ports — the diagnostics answer to "where on the host is this VM's
-        // answerer".
-        let logged = buf.contents();
-        assert!(
-            logged.contains("relocated"),
-            "a walked publication must say so, got: {logged}"
-        );
-        assert!(
-            logged.contains("box-zone answerer is published on the host loopback"),
-            "the publication must be named in the log, got: {logged}"
-        );
-        assert!(
-            logged.contains(&format!("host_port={rung}")),
-            "the publication line must name the host port it landed on, got: {logged}"
-        );
-        assert!(
-            logged.contains(&format!("guest_port={default_port}")),
-            "the publication line must name the guest port beside it, got: {logged}"
-        );
-    }
-}
+#[expect(
+    clippy::disallowed_methods,
+    reason = "upstream's tests spawn plain tokio tasks; the traced-spawn rule is for request handling"
+)]
+mod tests;

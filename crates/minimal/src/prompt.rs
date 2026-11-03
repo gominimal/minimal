@@ -16,8 +16,8 @@
 //!   error message that includes a `user_policy.toml` snippet
 //!   showing every item the user would need to allowlist.
 //!
-//! [`UserPolicy`]: sessions::core::policy::UserPolicy
-//! [`PolicyHooks`]: sessions::core::hooks::PolicyHooks
+//! [`UserPolicy`]: boxes::core::policy::UserPolicy
+//! [`PolicyHooks`]: boxes::core::hooks::PolicyHooks
 
 use std::cell::RefCell;
 #[cfg(test)]
@@ -25,10 +25,10 @@ use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use sessions::core::decision::ItemDecision;
-use sessions::core::hooks::{HookResult, PolicyHooks, Unapproved};
-use sessions::core::policy::{HooksPolicy, PatchesPolicy, VarNameGlobs, VarsPolicy};
-use sessions::core::source::Source;
+use boxes::core::decision::ItemDecision;
+use boxes::core::hooks::{HookResult, PolicyHooks, Unapproved};
+use boxes::core::policy::{HooksPolicy, PatchesPolicy, VarNameGlobs, VarsPolicy};
+use boxes::core::source::Source;
 
 /// One choice a user makes at a prompt. Names carry both intent
 /// ("allow/ignore/deny") and scope ("once" vs. "permanent").
@@ -185,7 +185,7 @@ impl InteractivePrompt {
     /// state so the first hook call sees the same view as the
     /// composer.
     #[must_use]
-    pub fn new(policy_path: &Path, initial: sessions::core::policy::UserPolicy) -> Self {
+    pub fn new(policy_path: &Path, initial: boxes::core::policy::UserPolicy) -> Self {
         let (vars, patches, hooks) = initial.into_parts();
         Self {
             prompter: Box::new(InquirePrompter),
@@ -203,8 +203,8 @@ impl InteractivePrompt {
     /// `drive_pending_to_active`; the mutations live in
     /// [`RefCell`]s that don't care which happened.
     #[must_use]
-    pub fn into_final_policy(self) -> sessions::core::policy::UserPolicy {
-        sessions::core::policy::UserPolicy::empty()
+    pub fn into_final_policy(self) -> boxes::core::policy::UserPolicy {
+        boxes::core::policy::UserPolicy::empty()
             .with_vars(self.vars_policy.into_inner())
             .with_patches(self.patches_policy.into_inner())
             .with_hooks(self.hooks_policy.into_inner())
@@ -592,7 +592,7 @@ fn append_hook_pattern(policy: HooksPolicy, bucket: HookBucket, root: &str) -> H
     // too — approving code execution nobody was asked about — or match
     // nothing, leaving a rule that silently never fires. See
     // [`literal_policy_pattern`].
-    let root = sessions::core::expansion::literal_policy_pattern(root);
+    let root = boxes::core::expansion::literal_policy_pattern(root);
     let extend = |existing: &[String]| -> Vec<String> {
         existing
             .iter()
@@ -664,7 +664,7 @@ fn append_patch_pattern(policy: PatchesPolicy, bucket: PatchBucket, path: &str) 
     // patch moves data rather than running it, so the stakes are lower
     // — but a rule that silently never matches is the same bug either
     // way, and the user picked one file.
-    let path = &sessions::core::expansion::literal_policy_pattern(path);
+    let path = &boxes::core::expansion::literal_policy_pattern(path);
     match bucket {
         PatchBucket::Allow => {
             let patterns: Vec<String> = policy
@@ -885,7 +885,7 @@ impl PolicyHooks for NoPromptHook {
 /// user hand-broke it since the last load).
 pub fn save_user_policy(
     policy_path: &Path,
-    policy: &sessions::core::policy::UserPolicy,
+    policy: &boxes::core::policy::UserPolicy,
 ) -> Result<(), anyhow::Error> {
     // Parse the existing file if present. A missing file yields an
     // empty document, which the merge logic treats identically to a
@@ -977,7 +977,7 @@ impl Drop for RemoveOnDrop<'_> {
 /// sections.
 fn merge_policy_into_document(
     doc: &mut toml_edit::DocumentMut,
-    policy: &sessions::core::policy::UserPolicy,
+    policy: &boxes::core::policy::UserPolicy,
 ) {
     let vars = policy.vars();
     upsert_string_array(doc, "vars", "allow", vars.allow().raw_patterns());
@@ -1092,7 +1092,7 @@ fn with_extension_tmp(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sessions::core::policy::UserPolicy;
+    use boxes::core::policy::UserPolicy;
     use tempfile::TempDir;
 
     fn project_source() -> Source {
@@ -1128,10 +1128,9 @@ mod tests {
         );
 
         // What matters is the behaviour after expansion, not the spelling.
-        let vars: [sessions::core::primitives::ResolvedVar; 0] = [];
-        let fs =
-            sessions::core::expansion::expand_policy_pattern(&stored[0], vars.as_slice(), None)
-                .expect("the stored entry should expand");
+        let vars: [boxes::core::primitives::ResolvedVar; 0] = [];
+        let fs = boxes::core::expansion::expand_policy_pattern(&stored[0], vars.as_slice(), None)
+            .expect("the stored entry should expand");
         assert!(
             fs.is_match("/tmp/build*"),
             "should match the project itself"
@@ -1354,8 +1353,7 @@ mod tests {
 
         let path = camino::Utf8Path::new("/etc/foo");
         let patch_items = [Unapproved::new(path, &source)];
-        let _ =
-            hook.on_patch_unapproved(sessions::core::policy::PatchesPolicy::empty(), &patch_items);
+        let _ = hook.on_patch_unapproved(boxes::core::policy::PatchesPolicy::empty(), &patch_items);
 
         let summary = hook.into_summary();
         assert_eq!(summary.vars, vec!["DIAGRAM", "GOCACHE", "LOG_LEVEL"]);
@@ -1389,7 +1387,7 @@ mod tests {
         assert!(snippet.contains("[hooks]"), "got: {snippet}");
         assert!(snippet.contains("\"/repo\""), "got: {snippet}");
         // The snippet must parse — it is meant to be pasted verbatim.
-        let parsed: sessions::core::policy::UserPolicy =
+        let parsed: boxes::core::policy::UserPolicy =
             toml::from_str(&snippet).expect("snippet must be valid user_policy.toml");
         assert_eq!(parsed.hooks().allow(), &["/repo".to_string()]);
     }
@@ -1472,7 +1470,7 @@ allow = [\"/etc/foo\"]
         );
         save_user_policy(&path, &policy).unwrap();
         let round =
-            sessions::core::policy::read_user_policy_file(&path).expect("re-read must succeed");
+            boxes::core::policy::read_user_policy_file(&path).expect("re-read must succeed");
         assert_eq!(round, policy);
     }
 

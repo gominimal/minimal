@@ -69,7 +69,7 @@ pub fn kill_group(child: &mut Child) {
 /// variable nor `MINVMD_E2E=1` is set).
 ///
 /// Under `MINVMD_E2E=1` the switch comes from `MINVMD_GVPROXY_BIN` when set,
-/// else from `scripts/fetch-gvproxy.sh` into a per-version cache, and in every
+/// else from `scripts/fetch-gvproxy.sh` into a per-digest cache, and in every
 /// case its SHA-256 must match `vendor/gvproxy/gvproxy.lock`. Outside E2E an
 /// unpinned `MINVMD_GVPROXY_BIN` is used as given.
 pub fn gvproxy_bin() -> Option<PathBuf> {
@@ -152,16 +152,24 @@ impl GvproxyLock {
     }
 }
 
-/// The pinned gvproxy in a per-version cache under `$RUNNER_TEMP` (else the
-/// system temp dir), fetched by `scripts/fetch-gvproxy.sh` when absent. The
-/// fetch lands in a unique temp file renamed into place, so concurrent test
-/// processes never see a partial binary.
+/// The pinned gvproxy in a cache under `$RUNNER_TEMP` (else the system temp
+/// dir), fetched by `scripts/fetch-gvproxy.sh` when absent.
 fn fetch_cached(workspace: &Path, lock: &GvproxyLock) -> PathBuf {
-    let dir = std::env::var_os("RUNNER_TEMP")
+    let root = std::env::var_os("RUNNER_TEMP")
         .filter(|v| !v.is_empty())
         .map_or_else(std::env::temp_dir, PathBuf::from)
-        .join("minimal-gvproxy")
-        .join(&lock.version);
+        .join("minimal-gvproxy");
+    fetch_cached_in(&root, workspace, lock)
+}
+
+/// [`fetch_cached`] with its cache root explicit. The cache is keyed on the
+/// asset's pinned digest, not on `version`: a patched build keeps the
+/// upstream version, so a switch cached under an earlier pin of the same
+/// version is fetched again rather than run as if it were the new pin. The
+/// fetch lands in a unique temp file renamed into place, so concurrent test
+/// processes never see a partial binary.
+pub fn fetch_cached_in(root: &Path, workspace: &Path, lock: &GvproxyLock) -> PathBuf {
+    let dir = root.join(format!("{}-{}", lock.asset, lock.sha256));
     let dest = dir.join("gvproxy");
     let executable = std::fs::metadata(&dest)
         .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
@@ -199,12 +207,14 @@ fn fetch_cached(workspace: &Path, lock: &GvproxyLock) -> PathBuf {
 /// Registers one box with the VM host daemon over its control socket: one
 /// request line in, one reply line out, the exchange `min session activate`
 /// makes before it creates the session. Returns the addresses the host's
-/// table allocated for the row.
+/// table allocated for the row and the box id it assigned, which the
+/// session's config must carry: the in-VM daemon checks the row by that id
+/// before each exec and refuses a box without one.
 pub fn register_box(
     control_sock: &Path,
     name: &str,
-    egress: Option<sessions::EgressPolicy>,
-) -> Result<minimald_rpc::BoxAddresses, String> {
+    egress: Option<boxes::EgressPolicy>,
+) -> Result<(minimald_rpc::BoxAddresses, minimald_rpc::BoxId), String> {
     let request = minimald_rpc::BoxControlRequest::Register(minimald_rpc::RegisterBoxRequest {
         name: name.to_string(),
         ingress_ports: Vec::new(),
@@ -212,6 +222,8 @@ pub fn register_box(
         credentialed_upstream: None,
         dynamic_ingress: None,
         dynamic_allowed_range: None,
+        hold: false,
+        task_slots: 0,
     });
     let mut line = serde_json_lenient::to_string(&request)
         .map_err(|e| format!("serialize the box registration: {e}"))?;
@@ -231,11 +243,13 @@ pub fn register_box(
     match serde_json_lenient::from_str(reply.trim())
         .map_err(|e| format!("parse the box registration's reply {reply:?}: {e}"))?
     {
-        minimald_rpc::BoxControlReply::Registered(registered) => Ok(minimald_rpc::BoxAddresses {
-            switch_address: registered.switch_address,
-            loopback_address: registered.loopback_address,
-        }),
-        minimald_rpc::BoxControlReply::Addresses(addresses) => Ok(addresses),
+        minimald_rpc::BoxControlReply::Registered(registered) => Ok((
+            minimald_rpc::BoxAddresses {
+                switch_address: registered.switch_address,
+                loopback_address: registered.loopback_address,
+            },
+            registered.box_id,
+        )),
         other => Err(format!(
             "the VM host refused the box registration: {other:?}"
         )),

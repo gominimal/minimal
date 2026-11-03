@@ -19,7 +19,10 @@
 //!    When the parent also bound the guest report door (T94), its path
 //!    arrives as `MINVMD_GUEST_REPORT_SOCK` and is registered for
 //!    `VM_HOST_BOX_REPORT_PORT` the same way, so the in-VM daemon's port
-//!    reports reach the VM host daemon's host-held grant.
+//!    reports reach the VM host daemon's host-held grant. Likewise the
+//!    guest telemetry door (`MINVMD_GUEST_TELEMETRY_SOCK`, registered for
+//!    `VSOCK_TELEMETRY_PORT`), over which the in-VM daemon's telemetry
+//!    records reach the host's exporter (TEL-034).
 //! 6. On macOS, registers the timekeep socket for `VSOCK_TIMEKEEP_PORT`
 //!    (host→guest) and starts the thread that sends the host wall clock to the
 //!    guest, so a host suspend does not leave the guest clock frozen
@@ -89,7 +92,7 @@ fn run_vmm() -> Result<()> {
 
     // Provision + attach the per-VM writable data volume as /dev/vdb (spec R1.4).
     // On by default: the image lives at the resolved path (MINVMD_DATA_VOLUME_PATH
-    // override, else `<provider dir>/data-vol.raw`) and is created sparse if
+    // override, else `<host dir>/data-vol.raw`) and is created sparse if
     // missing.
     // Provisioning at the literal path — not a stem-reconstructed one — so an
     // explicit override is honoured verbatim.
@@ -102,17 +105,21 @@ fn run_vmm() -> Result<()> {
         .context("applying VmConfig to krun context")?;
 
     // Console capture (hvc0 → host file). `MINVMD_BOOT_LOG=<path>` overrides;
-    // the default is `<provider dir>/boot.log` — a silently-discarded console
+    // the default is `<host dir>/boot.log` — a silently-discarded console
     // is exactly the evidence lost in wedged-boot/dead-transport incidents,
-    // and `min bug` bundles this file (tail-capped) per provider. Truncated
+    // and `min bug` bundles this file (tail-capped) per host. Truncated
     // each boot so it holds the current VM generation's console.
     let boot_log = std::env::var_os("MINVMD_BOOT_LOG")
         .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| crate::state::provider_dir().join("boot.log"));
+        .unwrap_or_else(|| crate::state::host_dir().join("boot.log"));
     // Capture is diagnostics, not a boot dependency: any failure — creating
     // the file or wiring the console — warns and boots on, never propagates.
-    if let Err(e) = std::fs::File::create(&boot_log) {
+    // The log is 0640 (formerly BEP-047, gominimal/inbox#1184): the VM user
+    // writes it, and the login reads it through the `minimal-vmm` group for
+    // `min diag`. The mode is set on the descriptor too, because a log from
+    // an earlier boot keeps its own.
+    if let Err(e) = create_boot_log(&boot_log) {
         tracing::warn!(path = %boot_log.display(), error = %e, "cannot create boot log; console discarded");
     } else if let Err(e) = ctx.set_console_output(&boot_log) {
         tracing::warn!(path = %boot_log.display(), error = %e, "cannot wire console to boot log; console discarded");
@@ -138,6 +145,19 @@ fn run_vmm() -> Result<()> {
     {
         ctx.add_vsock_port(minimald_rpc::VM_HOST_BOX_REPORT_PORT, &guest_report_sock)
             .context("registering the guest report door's vsock port")?;
+    }
+
+    // The guest telemetry door's vsock port (TEL-034): registered only when
+    // the supervisor bound the door, which is what the env names; the
+    // in-VM daemon's telemetry records then reach the host over it.
+    if let Some(guest_telemetry_sock) =
+        std::env::var_os(crate::guest_telemetry::GUEST_TELEMETRY_SOCK_ENV).filter(|p| !p.is_empty())
+    {
+        ctx.add_vsock_port(
+            crate::guest_telemetry::VSOCK_TELEMETRY_PORT,
+            &guest_telemetry_sock,
+        )
+        .context("registering the guest telemetry door's vsock port")?;
     }
 
     // Host wall-clock updates (host→guest, `crate::timekeep`), macOS only.
@@ -256,4 +276,42 @@ fn start_timekeep(ctx: &mut crate::krun::Context) -> Result<()> {
         "registered host→guest timekeep bridge",
     );
     Ok(())
+}
+
+/// Create or truncate the boot log at `path` with mode 0640, never with
+/// the mode the umask gives (design fact 4).
+#[cfg(any(minvmd_libkrun, test))]
+fn create_boot_log(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o640)
+        .open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o640))
+}
+
+#[cfg(test)]
+mod tests {
+    /// Formerly BEP-047 (gominimal/inbox#1184): the boot log is 0640, also
+    /// when a log from an earlier boot had another mode.
+    #[test]
+    fn boot_log_is_created_0640() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("boot.log");
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        super::create_boot_log(&log).unwrap();
+        assert_eq!(mode(&log), 0o640);
+        std::fs::write(&log, b"old boot").unwrap();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o666)).unwrap();
+        super::create_boot_log(&log).unwrap();
+        assert_eq!(mode(&log), 0o640);
+        assert_eq!(
+            std::fs::metadata(&log).unwrap().len(),
+            0,
+            "truncated each boot"
+        );
+    }
 }

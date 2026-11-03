@@ -83,10 +83,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use boxes::core::decision::ItemDecision;
+use boxes::core::hooks::{HookResult, PolicyHooks, Unapproved};
+use boxes::core::policy::{HooksPolicy, PatchesPolicy, VarsPolicy};
 use serial_test::serial;
-use sessions::core::decision::ItemDecision;
-use sessions::core::hooks::{HookResult, PolicyHooks, Unapproved};
-use sessions::core::policy::{HooksPolicy, PatchesPolicy, VarsPolicy};
 use tempfile::TempDir;
 
 mod common;
@@ -309,13 +309,13 @@ impl Guest {
     /// Panics past the deadlines, quoting the supervisor's `run.log`.
     fn boot(gvproxy: &Path) -> Guest {
         let state = short_state_dir();
-        let provider_dir = state.path().join("minimal/providers/local-minvmd0");
+        let host_dir = state.path().join("minimal/providers/local-minvmd0");
         let guest = Guest {
-            sock_path: provider_dir.join("ssh.sock"),
+            sock_path: host_dir.join("ssh.sock"),
             // The gate binds the socket beside the switch socket, which sits
             // beside the bridge socket.
-            gate_sock: provider_dir.join("gvproxy-gate.sock"),
-            control_sock: provider_dir.join(minvmd::control::CONTROL_SOCK_FILE),
+            gate_sock: host_dir.join("gvproxy-gate.sock"),
+            control_sock: host_dir.join(minvmd::control::CONTROL_SOCK_FILE),
             gvproxy: gvproxy.to_path_buf(),
             vmm_pid: None,
             _state: state,
@@ -459,8 +459,8 @@ impl BoxSession {
     async fn open(
         sock_path: &Path,
         control_sock: &Path,
-        network: sessions::NetworkMode,
-        egress: sessions::EgressPolicy,
+        network: boxes::NetworkMode,
+        egress: boxes::EgressPolicy,
         label: &str,
     ) -> Result<BoxSession, String> {
         use minimald_rpc::{
@@ -517,7 +517,7 @@ impl BoxSession {
                 .await
                 .map_err(|e| format!("request_subsystem: {e}"))?;
 
-            let policy = sessions::SessionPolicy {
+            let policy = boxes::BoxPolicy {
                 egress: Some(egress.clone()),
                 ..Default::default()
             };
@@ -537,25 +537,20 @@ impl BoxSession {
             // activate` files it: a box with no row is an unregistered
             // source the gate drops unconditionally (NET-085), so a box
             // whose own declared traffic is a positive control must hold one.
-            let addresses = common::register_box(control_sock, &name, Some(egress))?;
-            let req = CreateSessionRequest {
-                config: minimald_rpc::SessionConfig {
-                    name: Some(name),
-                    project_path: paths::HostAbsPath::try_new("/tmp")
-                        .map_err(|e| format!("project_path: {e}"))?,
-                    network,
-                    policy,
-                    // The addresses the registration handed back, so the
-                    // in-VM daemon attaches the box at its row's lease.
-                    box_addresses: Some(addresses),
-                    // The serde default, and what every non-`--no-hooks`
-                    // activation sends. This session only runs execs, so it
-                    // declares no hooks either way.
-                    hooks_enabled: true,
-                    attrs: Default::default(),
-                },
-                must_match_version: None,
-            };
+            let (addresses, box_id) = common::register_box(control_sock, &name, Some(egress))?;
+            // Hooks stay on, the serde default and what every non-`--no-hooks`
+            // activation sends; this session only runs execs, so it declares
+            // no hooks either way.
+            let mut req = CreateSessionRequest::new(
+                name,
+                paths::HostAbsPath::try_new("/tmp").map_err(|e| format!("project_path: {e}"))?,
+                network,
+                policy,
+            );
+            // The addresses the registration handed back, so the in-VM
+            // daemon attaches the box at its row's lease.
+            req.config.box_id = Some(box_id);
+            req.config.box_addresses = Some(addresses);
             let body =
                 serde_json_lenient::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
 
@@ -664,7 +659,10 @@ impl BoxSession {
                 .request_subsystem(false, FinalizeSession::NAME)
                 .await
                 .map_err(|e| format!("request_subsystem: {e}"))?;
-            let req = FinalizeSessionRequest { session_id };
+            let req = FinalizeSessionRequest {
+                session_id,
+                report_shared_port_collisions: false,
+            };
             let body =
                 serde_json_lenient::to_vec(&req).map_err(|e| format!("serialize request: {e}"))?;
             let mut rpc = channel.into_stream();
@@ -784,10 +782,10 @@ where
 /// ships the verdict with `SubmitVerdict`, which composes the loadout.
 async fn submit_verdict(
     handle: &mut russh::client::Handle<ClientHandler>,
-    response: sessions::wire::request::ContributionResponse,
+    response: boxes::wire::request::ContributionResponse,
 ) -> Result<(), String> {
+    use boxes::wire::request::BoxStep;
     use minimald_rpc::{OneshotSshRpc, SubmitVerdict};
-    use sessions::wire::request::SessionStep;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     eprintln!(
@@ -796,12 +794,12 @@ async fn submit_verdict(
         response.patches.len(),
         response.lifecycle_hooks.len(),
     );
-    let (verdict, _policy) = sessions::client::handler::handle_response(
+    let (verdict, _policy) = boxes::client::handler::handle_response(
         response,
         &[],
-        sessions::core::policy::UserPolicy::empty(),
+        boxes::core::policy::UserPolicy::empty(),
         &NoPromptVars,
-        sessions::core::compose::ComposeOptions::default(),
+        boxes::core::compose::ComposeOptions::default(),
         &|name| std::env::var(name),
     )
     .map_err(|e| format!("gating pending items: {e}"))?;
@@ -830,8 +828,8 @@ async fn submit_verdict(
     let resp: <SubmitVerdict as OneshotSshRpc>::Response = serde_json_lenient::from_slice(&buf)
         .map_err(|e| format!("decode SubmitVerdict response: {e}"))?;
     match resp.ok() {
-        Some(SessionStep::Materialized { .. }) => Ok(()),
-        Some(SessionStep::Fault { error }) => Err(format!("SubmitVerdict faulted: {error:?}")),
+        Some(BoxStep::Materialized { .. }) => Ok(()),
+        Some(BoxStep::Fault { error }) => Err(format!("SubmitVerdict faulted: {error:?}")),
         None => Err("SubmitVerdict returned an error".into()),
     }
 }
@@ -840,8 +838,8 @@ async fn submit_verdict(
 /// startup race the session harness documents.
 async fn open_box(
     guest: &Guest,
-    network: sessions::NetworkMode,
-    egress: sessions::EgressPolicy,
+    network: boxes::NetworkMode,
+    egress: boxes::EgressPolicy,
     label: &str,
 ) -> BoxSession {
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -880,6 +878,10 @@ struct SpoofedFlow {
     dst_port: u16,
     src_port: u16,
     marker: String,
+    /// The DSCP value the flow's IPv4 frames carry: `0` for an unmarked
+    /// frame, [`boxes::core::egress::BOX_COHORT_DSCP`] for a frame that
+    /// wears the box mark.
+    dscp: u8,
 }
 
 const TCP_SYN: u8 = 0x02;
@@ -909,6 +911,7 @@ const ARP_REPLY: u16 = 2;
               would repeat the flow's own fields"
 )]
 fn tcp_frame(
+    dscp: u8,
     src_mac: [u8; 6],
     src_ip: Ipv4Addr,
     src_port: u16,
@@ -937,7 +940,7 @@ fn tcp_frame(
     // IPv4 header: version 4, IHL 5, no options, total length, checksum.
     let total_len = (20 + tcp.len()) as u16;
     let mut ip = Vec::with_capacity(20);
-    ip.extend_from_slice(&[0x45, 0x00]);
+    ip.extend_from_slice(&[0x45, dscp << 2]);
     ip.extend_from_slice(&total_len.to_be_bytes());
     ip.extend_from_slice(&[0x00, 0x01]); // id
     ip.extend_from_slice(&[0x00, 0x00]); // no fragment flags
@@ -1040,7 +1043,7 @@ fn tcp_checksum(src: Ipv4Addr, dst: Ipv4Addr, tcp: &[u8]) -> u16 {
 
 /// One length-framed frame to the gate: the shuttle's own framing, a
 /// little-endian `u16` length and the raw frame, the form the gate reads
-/// (`relay_guest_to_switch`) and the guest relay writes.
+/// (`relay_frames_to_switch`) and the guest relay writes.
 fn write_frame(sock: &mut UnixStream, frame: &[u8]) -> Result<(), String> {
     let mut framed = Vec::with_capacity(2 + frame.len());
     let len = u16::try_from(frame.len()).map_err(|_| "frame too long for the shuttle framing")?;
@@ -1283,6 +1286,7 @@ fn spoofed_flow(
         write_frame(&mut sock, &claim).map_err(|e| format!("write ARP claim: {e}"))?;
         if !sent_syn {
             let syn = tcp_frame(
+                flow.dscp,
                 flow.src_mac,
                 flow.src,
                 flow.src_port,
@@ -1314,6 +1318,7 @@ fn spoofed_flow(
             Some(Incoming::SynAck(synack_seq)) => {
                 // The handshake's last leg: ACK, then the marker on a push.
                 let ack = tcp_frame(
+                    flow.dscp,
                     flow.src_mac,
                     flow.src,
                     flow.src_port,
@@ -1326,6 +1331,7 @@ fn spoofed_flow(
                 );
                 write_frame(&mut sock, &ack).map_err(|e| format!("write ACK: {e}"))?;
                 let push = tcp_frame(
+                    flow.dscp,
                     flow.src_mac,
                     flow.src,
                     flow.src_port,
@@ -1378,7 +1384,7 @@ fn host_interface_address() -> Ipv4Addr {
         let mask = u32::MAX.checked_shl(32 - prefix).unwrap_or(0);
         u32::from(addr) & mask == u32::from(base) & mask
     };
-    let (reserved, reserved_prefix) = sessions::core::loopback::RESERVED_LOCAL_RANGE;
+    let (reserved, reserved_prefix) = boxes::core::loopback::RESERVED_LOCAL_RANGE;
     assert!(
         !addr.is_unspecified()
             && !in_block(Ipv4Addr::new(127, 0, 0, 0), 8)
@@ -1554,6 +1560,18 @@ impl HostListener {
         log.join("; ")
     }
 
+    /// How many connections the listener accepted so far. The switch's NAT
+    /// dials the listener when a SYN arrives, before it answers the SYN, so
+    /// a new accept proves a SYN left the VM whatever happens to its reply.
+    fn accepted(&self) -> usize {
+        self.log
+            .lock()
+            .expect("log lock is held only across this read")
+            .iter()
+            .filter(|entry| entry.starts_with("a connection was accepted"))
+            .count()
+    }
+
     /// Whether a marker whose text contains `needle` has arrived yet.
     fn seen_any(&self, needle: &str) -> bool {
         self.seen
@@ -1583,6 +1601,53 @@ impl Drop for HostListener {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+/// Admits (`resident`) or retires a `host_ip` box's egress on the VM host
+/// daemon's control socket, the exchange `min session activate` makes for a
+/// `host_ip` box (NET-085): one request line in, one reply line out.
+fn host_ip_box(
+    control_sock: &Path,
+    session_id: boxes::SessionId,
+    egress: Option<boxes::EgressPolicy>,
+    resident: bool,
+) -> Result<(), String> {
+    use std::io::BufRead as _;
+    let request = if resident {
+        minimald_rpc::BoxControlRequest::AdmitHostIpBox(minimald_rpc::HostIpBoxRequest {
+            session_id,
+            egress,
+        })
+    } else {
+        minimald_rpc::BoxControlRequest::RetireHostIpBox(minimald_rpc::RetireHostIpBoxRequest {
+            session_id,
+        })
+    };
+    let mut line = serde_json_lenient::to_string(&request)
+        .map_err(|e| format!("serialize the host_ip box request: {e}"))?;
+    line.push('\n');
+    let mut stream = UnixStream::connect(control_sock)
+        .map_err(|e| format!("connect to the control socket: {e}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .map_err(|e| format!("set the control socket's read timeout: {e}"))?;
+    stream
+        .write_all(line.as_bytes())
+        .map_err(|e| format!("write the host_ip box request: {e}"))?;
+    let mut reply = String::new();
+    std::io::BufReader::new(stream)
+        .read_line(&mut reply)
+        .map_err(|e| format!("read the host_ip box reply: {e}"))?;
+    match serde_json_lenient::from_str(reply.trim())
+        .map_err(|e| format!("parse the host_ip box reply {reply:?}: {e}"))?
+    {
+        minimald_rpc::BoxControlReply::HostIpBox {
+            resident: answered, ..
+        } if answered == resident => Ok(()),
+        other => Err(format!(
+            "the VM host answered the host_ip box request with {other:?}"
+        )),
     }
 }
 
@@ -1626,9 +1691,9 @@ async fn vm_escape_bounded_to_resident_union() {
     // disjoint half the cross-box spoof would have to buy.
     let mut box_a = open_box(
         &guest,
-        sessions::NetworkMode::OwnIp,
-        sessions::EgressPolicy {
-            allow_protocols: Some(vec![sessions::IpProto::Tcp, sessions::IpProto::Udp]),
+        boxes::NetworkMode::OwnIp,
+        boxes::EgressPolicy {
+            allow_protocols: Some(vec![boxes::IpProto::Tcp, boxes::IpProto::Udp]),
             allow_subnets: Some(vec![
                 "10.0.0.0/8".to_string(),
                 "100.64.0.0/16".to_string(),
@@ -1642,9 +1707,9 @@ async fn vm_escape_bounded_to_resident_union() {
     .await;
     let mut box_b = open_box(
         &guest,
-        sessions::NetworkMode::OwnIp,
-        sessions::EgressPolicy {
-            allow_protocols: Some(vec![sessions::IpProto::Tcp, sessions::IpProto::Udp]),
+        boxes::NetworkMode::OwnIp,
+        boxes::EgressPolicy {
+            allow_protocols: Some(vec![boxes::IpProto::Tcp, boxes::IpProto::Udp]),
             allow_subnets: Some(vec![
                 "192.168.0.0/16".to_string(),
                 "100.64.0.0/16".to_string(),
@@ -1749,6 +1814,7 @@ async fn vm_escape_bounded_to_resident_union() {
             dst_port: port,
             src_port: 40_000 + u16::from(src.octets()[3]),
             marker: format!("spoof-{src}-arrived"),
+            dscp: 0,
         };
         // The one arm this posture leaves: refused before any frame leaves
         // the VM — silence at the listener, and the unregistered-source line
@@ -1802,6 +1868,7 @@ async fn vm_escape_bounded_to_resident_union() {
         dst_port: port,
         src_port: 40_000,
         marker: "spoof-203.0.113.7-arrived".to_string(),
+        dscp: 0,
     };
     let verdict = match spoofed_flow(&guest.gate_sock, &flow, DROP_DEADLINE) {
         Ok(_) => panic!(
@@ -1859,6 +1926,156 @@ async fn vm_escape_bounded_to_resident_union() {
     // unobservable frames; the record above is what the VM boundary can say
     // today.
 
+    // The box-marked spoof from the node's own address (NET-085): root in
+    // the VM writes the box mark on a frame from the node address. The mark
+    // proves no box, so the gate decides the frame by the union of the
+    // resident `host_ip` boxes' rules and drops it when no `host_ip` box is
+    // resident. Sent last: the flow's ARP claim announces the node's address
+    // from the spoofer's MAC, and the guest daemon's own traffic does not
+    // need the switch after this point.
+    let node = switch::DEFAULT_SUBNET.daemon_ip();
+    let marked_flow = |tag: &str, src_port: u16| SpoofedFlow {
+        src: node,
+        src_mac: [0x02, 0x50, 0x64, 0x00, 0xfd, 0x01],
+        dst: host,
+        dst_port: port,
+        src_port,
+        marker: format!("marked-{tag}-arrived"),
+        dscp: boxes::core::egress::BOX_COHORT_DSCP,
+    };
+    // The drop line is rate-limited per source and rule, so only the first
+    // refusal is sure to write one: a later refusal inside the window is
+    // read off the listener's silence alone.
+    let refused_marked = |flow: &SpoofedFlow, resident: usize, line_due: bool| -> String {
+        match spoofed_flow(&guest.gate_sock, flow, DROP_DEADLINE) {
+            Ok(marker_ack) => panic!(
+                "vm_escape_integration: a box-marked spoof from the node address \
+                 reached {host}:{port} with {resident} host_ip box(es) resident and \
+                 none admitting it; the gate must drop it (NET-085) [{marker_ack}]"
+            ),
+            Err(e) => {
+                assert!(
+                    !listener.seen_any(&flow.marker),
+                    "the marked spoof was refused at the gate, but its marker reached \
+                     the host listener; the listener saw: {}",
+                    listener.report()
+                );
+                assert!(
+                    !line_due
+                        || guest
+                            .log_lines(&["egress-host-ip-boxes"])
+                            .iter()
+                            .any(|line| {
+                                line.contains(&format!("source={node}"))
+                                    && line.contains(&format!("resident_host_ip_boxes={resident}"))
+                            }),
+                    "the gate dropped the marked spoof without its host_ip line naming \
+                     the node address and {resident} resident box(es); the gate said: {}",
+                    gate_account(&guest)
+                );
+                format!("marked spoof refused with {resident} host_ip box(es) resident [{e}]")
+            }
+        }
+    };
+    // No `host_ip` box resident: dropped.
+    let verdict = refused_marked(&marked_flow("none-resident", 41_001), 0, true);
+    attempts.push(Attempt {
+        source: node,
+        destination: host,
+        port,
+        verdict,
+    });
+    // One `host_ip` box resident whose rules do not name the listener:
+    // still dropped.
+    let elsewhere = boxes::SessionId::mint();
+    host_ip_box(
+        &guest.control_sock,
+        elsewhere,
+        Some(boxes::EgressPolicy {
+            allow_protocols: Some(vec![boxes::IpProto::Tcp]),
+            allow_subnets: Some(vec!["192.0.2.0/24".to_string()]),
+            allow_dns_hosts: None,
+            deny_subnets: None,
+        }),
+        true,
+    )
+    .expect("admitting a host_ip box elsewhere");
+    let verdict = refused_marked(&marked_flow("not-admitted", 41_002), 1, false);
+    attempts.push(Attempt {
+        source: node,
+        destination: host,
+        port,
+        verdict,
+    });
+    // A second `host_ip` box whose rules name the listener: the marked frame
+    // passes under that box's rules, and its SYN reaches the listener.
+    //
+    // The spoofer cannot complete the handshake, and the gate is not why.
+    // The in-VM daemon holds the node address with its own MAC, and its own
+    // traffic keeps the switch's neighbor entry for that address reachable.
+    // An unsolicited ARP reply does not override a reachable entry, so the
+    // SYN-ACK goes to the daemon's connection, where the VM's kernel answers
+    // it, and never to the spoofer's. A real host_ip box shares the daemon's
+    // address and MAC, so its replies take that same path. What the gate
+    // decides is the outbound frame, and the NAT's dial at the listener is
+    // the proof that the SYN left the VM: the NAT dials the backend before
+    // it answers the SYN.
+    let reaching = boxes::SessionId::mint();
+    host_ip_box(
+        &guest.control_sock,
+        reaching,
+        Some(boxes::EgressPolicy {
+            allow_protocols: Some(vec![boxes::IpProto::Tcp]),
+            allow_subnets: Some(vec![host_cidr.clone()]),
+            allow_dns_hosts: None,
+            deny_subnets: None,
+        }),
+        true,
+    )
+    .expect("admitting a host_ip box that reaches the listener");
+    let admitted = marked_flow("admitted", 41_003);
+    let accepted_before = listener.accepted();
+    // The flow ends at its deadline without a SYN-ACK: the reply goes to the
+    // in-VM daemon (see above). A completed flow is fine too.
+    let outcome = match spoofed_flow(&guest.gate_sock, &admitted, Duration::from_secs(10)) {
+        Ok(marker_ack) => format!("the flow completed [{marker_ack}]"),
+        Err(e) => format!("the reply went to the in-VM daemon [{e}]"),
+    };
+    let dialed_end = Instant::now() + Duration::from_secs(10);
+    while listener.accepted() <= accepted_before && Instant::now() < dialed_end {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        listener.accepted() > accepted_before,
+        "vm_escape_integration: a box-marked frame a resident host_ip box admits \
+         never reached {host}:{port}: the listener accepted no new connection \
+         ({outcome}); the listener saw: {}; the gate said: {}",
+        listener.report(),
+        gate_account(&guest)
+    );
+    assert!(
+        !guest
+            .log_lines(&["egress-host-ip-boxes"])
+            .iter()
+            .any(|line| line.contains("resident_host_ip_boxes=2")),
+        "the gate dropped the admitted marked frame under the host_ip rule; \
+         the gate said: {}",
+        gate_account(&guest)
+    );
+    attempts.push(Attempt {
+        source: node,
+        destination: host,
+        port,
+        verdict: format!(
+            "marked frame admitted by a resident host_ip box's rules, and its SYN \
+             reached the listener ({outcome})"
+        ),
+    });
+    for session in [elsewhere, reaching] {
+        host_ip_box(&guest.control_sock, session, None, false)
+            .expect("retiring the test's host_ip boxes");
+    }
+
     // The record, then the host-side gate's own lines for the spoofed
     // sources: the attempt table and the drop lines beside it, so the
     // bound can be read off the test output.
@@ -1874,6 +2091,7 @@ async fn vm_escape_bounded_to_resident_union() {
         "egress-unregistered-source",
         "egress-unknown-source",
         "egress-undeclared-subnet",
+        "egress-host-ip-boxes",
     ]) {
         eprintln!("  {line}");
     }

@@ -5,7 +5,7 @@ owner: norrietaylor
 epic: gominimal/inbox#625
 arch: https://github.com/gominimal/arch/blob/5c1201517ba07347344fb9725efb06ee39d5c03e/specs/authn-authz/gatehouse-spec.md
 arch_sha: "5c1201517ba07347344fb9725efb06ee39d5c03e"
-updated: 2026-09-23
+updated: 2026-11-02
 ---
 
 # BEP — Local Box Egress Proxy — sealed GitHub credentials and host-store secrets without Gatehouse
@@ -65,6 +65,10 @@ references with `min secret`, `dns` steering, the browser sign-in flow, `min box
 audit --follow` and `--parent`, audit segment rotation, signing-CA rotation, the
 PAC recipe and `host_ip` cohort handling are later slices.
 
+The `host_ip` lane on a host that runs its boxes in a VM, with `dns` as its
+default steering, is BEP-082 to BEP-087. The direct TLS path that `dns`
+steering needs is BEP-080 and BEP-081.
+
 ## Users and stories
 
 **Roles:** developer on an un-enrolled laptop, developer working in a box, developer reviewing what a box may reach
@@ -113,7 +117,7 @@ Sign-in
   verify:   ./scripts/session-e2e.sh bep_second_box_needs_no_sign_in
   - IF a box declaring a GitHub grant is created while no GitHub sign-in is held THEN THE SYSTEM SHALL fail the creation with the defined error `github_sign_in_required` and not prompt for sign-in.
     tier:   T0
-    verify: cargo nextest run -p sessions creation_without_sign_in_fails_with_defined_error
+    verify: cargo nextest run -p boxes creation_without_sign_in_fails_with_defined_error
     <!-- Gatehouse §6.2 v1.20 leaves the error name to this document; distinct from `gatehouse_unenrolled_node`, which stays the refusal where no proxy exists -->
 
 - **BEP-004** WHEN `min auth status` is run THE SYSTEM SHALL report whether a GitHub sign-in is held and its expiry, and output no token value.
@@ -171,31 +175,31 @@ Minting and sealing
 
 - **BEP-008** IF a box spec declares a GitHub grant and its `egress.allow_dns_hosts` does not admit every host in the module's host set THEN THE SYSTEM SHALL refuse expansion with exit 3 naming each missing host.
   tier:     T1
-  verify:   cargo nextest run -p sessions prop_grant_host_set_outside_egress_is_exit_3
+  verify:   cargo nextest run -p boxes prop_grant_host_set_outside_egress_is_exit_3
   property: for every box spec and every module host set, expansion refuses with exit 3 iff some host of the set is absent from `egress.allow_dns_hosts`, and the refusal names exactly the absent hosts
 
 - **BEP-009** IF a box spec declares `network.mode = "none"` and a GitHub grant THEN THE SYSTEM SHALL refuse expansion with exit 3.
   tier:     T1
-  verify:   cargo nextest run -p sessions prop_none_mode_with_grant_is_exit_3
+  verify:   cargo nextest run -p boxes prop_none_mode_with_grant_is_exit_3
   property: for every box spec, expansion refuses iff `network.mode` is `none` and at least one runtime grant is declared
 
 - **BEP-010** IF a box spec declares `steering = "off"` and a GitHub grant THEN THE SYSTEM SHALL create the box with no interception CA injected and emit a validation warning naming the grant.
   tier:     T0
-  verify:   cargo nextest run -p sessions steering_off_with_grant_warns_and_injects_no_ca
+  verify:   cargo nextest run -p boxes steering_off_with_grant_warns_and_injects_no_ca
   - IF a box spec declares `steering = "off"` and `[network.bep] proxy_env = true` THEN THE SYSTEM SHALL refuse the expansion with exit 3 naming both fields.
     tier:   T0
-    verify: cargo nextest run -p sessions steering_off_with_proxy_env_is_refused
+    verify: cargo nextest run -p boxes steering_off_with_proxy_env_is_refused
     <!-- design §5.4 composes `proxy_env` with any steering mode, but `off` also disables CA injection, so an environment pointing at the proxy would fail every TLS handshake; the combination is unbuildable and is refused rather than warned -->
 
 - **BEP-056** WHERE the host is not enrolled, IF a box spec declares a GitHub grant with `mode = "installation"` THEN THE SYSTEM SHALL refuse expansion with exit 3 naming the grant.
   tier:     T1
-  verify:   cargo nextest run -p sessions prop_installation_mode_unenrolled_is_exit_3
+  verify:   cargo nextest run -p boxes prop_installation_mode_unenrolled_is_exit_3
   property: for every box spec on an un-enrolled host, expansion refuses with exit 3 iff a GitHub grant declares `mode = "installation"`
   <!-- Gatehouse §6.10 Validation, un-enrolled: no App private key exists locally -->
 
 - **BEP-057** WHERE the host is not enrolled, IF a box spec declares a GitHub grant whose `github:repo:*` scopes are narrower than `full` and the client configuration does not acknowledge full-breadth minting THEN THE SYSTEM SHALL refuse expansion with exit 3 naming the grant and the acknowledgement as the remedy.
   tier:     T1
-  verify:   cargo nextest run -p sessions prop_narrow_scopes_unenrolled_need_acknowledgement
+  verify:   cargo nextest run -p boxes prop_narrow_scopes_unenrolled_need_acknowledgement
   property: for every box spec on an un-enrolled host and every client configuration, expansion refuses with exit 3 iff some GitHub grant declares scopes narrower than `full` and the acknowledgement is unset
   <!-- Gatehouse §6.10 Validation, un-enrolled: the declared bound cannot be honored locally until local narrowing lands, and a warning would be the silent widening §6.4 forbids -->
   - WHERE the user-level or organization-level client configuration sets `[secrets] acknowledge_full_breadth_unenrolled = true` THE SYSTEM SHALL mint the member `full` and render it as `full` in `min box spec` with the acknowledgement visible and stating that it covers the member's reach for the box's life, within the credentialed lane's ceiling.
@@ -204,7 +208,7 @@ Minting and sealing
     <!-- the field name is this document's; the architecture carries it as a placeholder; Gatehouse v1.23 extends the acknowledgement to the reference's box-lifetime reach, so the rendering names that window, not the 8-hour token it replaced -->
   - IF a project `minimal.toml` sets the acknowledgement THEN THE SYSTEM SHALL ignore it and emit a warning.
     tier:   T0
-    verify: cargo nextest run -p sessions project_acknowledgement_is_ignored_with_warning
+    verify: cargo nextest run -p boxes project_acknowledgement_is_ignored_with_warning
     <!-- never project-supplied, so the declared scopes are honored unchanged the moment the host enrolls -->
 
 Steering and the interception CA
@@ -223,30 +227,38 @@ Steering and the interception CA
     <!-- Gatehouse §6.10 trust-store injection's environment block, carried there as [proposed]: making it normative was considered and declined (Gatehouse v1.22), so the architecture's guarantee covers OS-trust-store readers alone and this document builds the proposed block; if the architecture ratifies a different variable list, this requirement follows it; the block serves stacks that keep a store of their own; Node reads no OS store, so a Node client such as Claude Code refuses every leaf without it; the list is maintained with the package set, and the JVM keystore is outside it -->
   - IF a box spec's environment sets one of those variables THEN THE SYSTEM SHALL keep the spec's value and emit a validation warning naming the variable.
     tier:   T0
-    verify: cargo nextest run -p sessions spec_trust_env_shadows_platform_with_warning
+    verify: cargo nextest run -p boxes spec_trust_env_shadows_platform_with_warning
 
-- **BEP-012** WHERE a box's steering is `proxy_env` or `both`, or its `[network.bep] proxy_env` is true, WHEN the box is created THE SYSTEM SHALL set `HTTPS_PROXY` and `HTTP_PROXY` in the box environment to the proxy's address and set `NO_PROXY` to `.min.internal`, `host.min.internal`, `localhost`, `127.0.0.1` and the box's `[network.bep] no_proxy` entries.
+- **BEP-012** WHERE a box declares a credentialed upstream that is in effect for its network mode, and its steering is `proxy_env` or `both` or its `[network.bep] proxy_env` is true, WHEN the box is created THE SYSTEM SHALL set `HTTPS_PROXY` and `HTTP_PROXY` in the box environment to the proxy's address and set `NO_PROXY` to `.min.internal`, `host.min.internal`, `localhost`, `127.0.0.1` and the box's `[network.bep] no_proxy` entries.
   tier:     T0
   verify:   ./scripts/session-e2e.sh bep_proxy_env_and_no_proxy_are_set
+  <!-- the lane gate: a box with no credentialed upstream in effect cannot reach the proxy's address (networking §7.1), so a proxy variable there points at nothing -->
+  - WHERE a box declares a credentialed upstream that is in effect for its network mode, and its steering is `proxy_env` or `both` or its `[network.bep] proxy_env` is true, WHEN the box is created THE SYSTEM SHALL set `NODE_USE_ENV_PROXY` to `1` in the box environment.
+    tier:   T0
+    verify: ./scripts/session-e2e.sh bep_proxy_env_sets_node_use_env_proxy
+    <!-- Node's built-in `fetch` ignores `HTTPS_PROXY` unless this variable is set, so a Node client that uses it connects directly and its handle reaches the upstream unsubstituted; measured in docs/spikes/2026-10-20-sealed-handle-bearer-clients.md; Node reads the variable from v22.21.0 on the 22.x line and from v24.0.0, and an older Node ignores it: under `dns` or `both` steering the box resolver still sends its credentialed names to the proxy, and under `proxy_env` alone it connects directly and the upstream refuses the unsubstituted handle, so a box that runs an older Node client uses `both` -->
 
 - **BEP-013** WHEN a box connects to an admitted credentialed hostname through the proxy THE SYSTEM SHALL present a leaf certificate for that hostname that chains through the host's one signing CA to the host root CA, whose name constraints equal the union of the configured modules' host sets and the authorities the operator's `[secret-store-rules]` register, less the fixed deny set.
   tier:     T1
   verify:   cargo nextest run -p bep prop_root_constraints_equal_registered_union
   property: for every family of module host sets and registered authorities on a host, the root's permitted-names constraint equals their union less the deny set, a leaf for a name in the union validates against the root alone, a leaf for any name outside the subtrees the union permits fails validation, and the proxy issues leaves for names in the union alone
   <!-- Gatehouse §6.10 per-node interception CA and trust-store injection: the constraints come from the host's registrations, never a spec-chosen name, and sit on the self-signed anchor itself; one keychain-held signing CA per host (BEP-014, BEP-059 to BEP-061), not one per box; X.509 permitted subtrees admit a name's subdomains (RFC 5280 §4.2.1.10), so exact admission is by leaf issuance, never by the constraint alone; a box's own reach within the union is bounded by its egress declaration (BEP-022) and its sealed values' host sets (BEP-021); a rule's authority written with no port is port 443 -->
+  <!-- the fixed deny set: the T55 task text gives its categories (`min.internal`, `minimal.dev`, the tenant issuer, the BEP, EGW and relay endpoints, the registry and build cache, and the node-plane baseline set) and keeps `localhost`, `.local`, `home.arpa` and `.internal` allowed; the mapping of each category to a domain is this change's reading, which waits for a confirmation on gominimal/minimal#2441: `min.internal` (the box-internal names and the proxy's in-box address), `minimal.dev` (the hosted tenant issuers, the registry and the build cache), `cache.gominimal.dev` (the build cache by the name the design gives it, that host alone) and `minimal.farm` (the BEP, EGW and relay endpoints and the hosted build cache), each with every name under it; the built-in baseline of an un-enrolled host (`NodePlaneBaseline::built_in`, `crates/minvmd/src/net/baseline.rs`) is addresses, and the root excludes every IP address; this claim holds for that built-in baseline only; the deny set does not cover a configured cache (`MINIMAL_REMOTE_CACHE_URL`), registry or baseline endpoint outside its domains, a gap that waits on gominimal/minimal#2441; `minimal.dev` covers the hosted tenant issuers only, and a self-hosted Gatehouse issuer (Gatehouse §2.1 F14) is under no entry, a gap that is residual on gominimal/minimal#2441; `localhost`, `.local`, `home.arpa` and `.internal` other than `min.internal` stay allowed; `bep::ca::DENY_SET` is the one definition, and the BEP-034 store-rule check reads it -->
   - WHEN the registered authorities change THE SYSTEM SHALL re-issue the root under the same key and subject with the changed constraints, and leave every running box's trust store as it was.
     tier:   T0
     verify: cargo nextest run -p bep root_recertified_under_same_key_and_subject
     <!-- Gatehouse §6.10: re-certification is not rotation; a running box keeps validating the names its root already permitted and reaches an added authority once re-created; the certificates below the root carry a key-identifier-only authority key identifier, so they chain to either issue of it -->
 
-- **BEP-014** THE SYSTEM SHALL hold the signing CA private key in the host keychain as a non-exportable key and write it to no file.
+- **BEP-014** WHILE the proxy is a release build THE SYSTEM SHALL hold the signing CA private key in the host keychain as a non-exportable key and write it to no file.
   tier:     T0
   verify:   cargo nextest run -p bep signing_key_is_non_exportable_and_has_no_file
+  <!-- a debug build keeps an exportable key, and writes a warning for each role at each start: the macOS login keychain lets the process that made a key export it although `kSecAttrIsExtractable` is false (the probe on #2436), and the keychain that enforces it needs an entitlement that only a Developer ID signature carries, so a debug build would never start on a developer's Mac; decided 2026-10-31, this note is the record, and the architecture's key-custody rule stays as it is; `bep::keys::custody` is the one decision, at the keychain's generation, at `bep::keys::load` for a stored sealing key, and at the CA's key check for the root and signing keys -->
 
-- **BEP-059** THE SYSTEM SHALL generate the proxy's sealing key and the root CA key non-exportable on the host, hold them in the host keychain across proxy restarts, and write them to no file.
+- **BEP-059** WHILE the proxy is a release build THE SYSTEM SHALL generate the proxy's sealing key and the root CA key non-exportable on the host, hold them in the host keychain across proxy restarts, and write them to no file.
   tier:     T0
   verify:   cargo nextest run -p bep sealing_and_root_keys_persist_non_exportable
   <!-- Gatehouse §6.10 un-enrolled lifecycle and the hardware-backed custody bullet -->
+  <!-- a debug build keeps an exportable key, and writes a warning for each role at each start: the macOS login keychain lets the process that made a key export it although `kSecAttrIsExtractable` is false (the probe on #2436), and the keychain that enforces it needs an entitlement that only a Developer ID signature carries, so a debug build would never start on a developer's Mac; decided 2026-10-31, this note is the record, and the architecture's key-custody rule stays as it is; `bep::keys::custody` is the one decision, at the keychain's generation, at `bep::keys::load` for a stored sealing key, and at the CA's key check for the root and signing keys -->
 
 - **BEP-072** THE SYSTEM SHALL publish the sealing key's public half, the key fingerprints a sealed context binds and the root certificate where the operator's processes read them, and seal every value from that published material without opening the proxy's key store.
   tier:     T0
@@ -277,14 +289,23 @@ Steering and the interception CA
   tier:     T0
   verify:   ./scripts/session-e2e.sh bep_git_and_gh_against_private_repo
   <!-- a clone's pack fetch is served by `github.com` itself over the smart HTTP protocol, inside the host set; archive downloads redirect to `codeload.github.com`, also inside the host set; release assets redirect to `release-assets.githubusercontent.com`, ordinary egress a box lists in `[network.bep] no_proxy` under `proxy_env` (Gatehouse §6.10: `NO_PROXY` is the compatibility lever) -->
+  - WHILE a box holds a sealed GitHub member THE SYSTEM SHALL carry from creation a git credential helper that answers `git credential fill` with the sealed value as the password for each host in the GitHub module's host set, and for no other host.
+    tier:   T0
+    verify: cargo nextest run -p minimald grant_box_git_credential_helper_answers_for_grant_hosts
+    verify: ./scripts/session-e2e.sh bep_git_credential_helper_sends_header
+    <!-- Gatehouse §6.4 (line 718): the shipped git-credential-helper; git sends an Authorization header only when a helper answers, and the proxy substitutes the sealed value in the Basic password (BEP-025); the helper logs one line per answer naming the host, never the value -->
+  - WHILE a box holds a sealed GitHub member THE SYSTEM SHALL make the shipped git credential helper git's sole credential helper for each host in the GitHub module's host set, so that a `store` or `cache` helper that the box configures does not run for those hosts.
+    tier:   T0
+    verify: cargo nextest run -p minimald grant_box_git_credential_helper_answers_for_grant_hosts
+    <!-- Gatehouse §6.4 (line 718): the helper is the sole helper, with `store` and `cache` disabled; the launch sets the helper's entries at command scope (`GIT_CONFIG_COUNT`), which git reads after `~/.gitconfig` and the repository configuration, as an empty `helper` that clears the list and then the shipped helper; the host set is `bep::module::GITHUB`'s (Gatehouse §6.10 line 851); no git configuration file in the box is changed; the test puts a `store` helper in `~/.gitconfig` and in a repository configuration, and `git credential fill` and `git credential approve` for each grant host write nothing to `~/.git-credentials` -->
 
 - **BEP-016** WHERE a box spec declares a credentialed upstream and no `steering` THE SYSTEM SHALL resolve `steering` to `dns`.
   tier:     T0
-  verify:   cargo nextest run -p sessions steering_defaults_to_dns
+  verify:   cargo nextest run -p boxes steering_defaults_to_dns
 
 - **BEP-017** WHILE the host has no box-zone resolver, IF a box spec's resolved steering is `dns` or `both` and it declares a credentialed upstream THEN THE SYSTEM SHALL refuse expansion with exit 3 naming the missing resolver.
   tier:     T1
-  verify:   cargo nextest run -p sessions prop_dns_steering_without_resolver_is_exit_3
+  verify:   cargo nextest run -p boxes prop_dns_steering_without_resolver_is_exit_3
   property: for every box spec declaring a credentialed upstream, on a host with no box-zone resolver, expansion refuses iff the resolved steering is `dns` or `both`
 
 - **BEP-018** WHILE a box's resolved `quic443` stance is blocked, IF the box sends UDP to port 443 THEN THE SYSTEM SHALL reject the datagram with ICMP port unreachable.
@@ -293,7 +314,7 @@ Steering and the interception CA
   <!-- networking design §5.3 (v0.9): an active reject, never a silent drop, so a client falls back to TCP at once (§5.7's determinism rule); the stance governs the resolver-bypass path -->
   - THE SYSTEM SHALL resolve `quic443 = "auto"` to blocked exactly when the box declares a credentialed upstream and its resolved steering is `dns` or `both`, and to allowed otherwise.
     tier:   T1
-    verify: cargo nextest run -p sessions prop_quic443_auto_resolves_on_grants_and_steering
+    verify: cargo nextest run -p boxes prop_quic443_auto_resolves_on_grants_and_steering
     property: for every `quic443` value, credentialed-upstream set and steering mode, the resolved stance is blocked iff the value is `block`, or the value is `auto`, the set is non-empty and the steering is `dns` or `both`
     <!-- ubiquitous; Gatehouse §6.3.2/§6.11 (v1.25): under `proxy_env` or `off` nothing is steered at a TCP-only listener, so the block bought neither interception coverage nor fallback determinism -->
   - IF a box sends UDP to port 443 toward the steered proxy address THEN THE SYSTEM SHALL reject it with ICMP port unreachable, whatever the box's stance.
@@ -314,6 +335,80 @@ Steering and the interception CA
   tier:     T0
   verify:   cargo nextest run -p minimald steered_name_servfail_while_proxy_down
   <!-- fail closed: a steered name never falls back to real DNS, so the egress re-check and the audit record are never skipped; under `proxy_env` a dead listener reaches nothing already -->
+
+- **BEP-080** WHERE a box's steering is `dns` or `both`, WHEN the box opens a TLS connection to the proxy's address on TCP port 443 without a CONNECT request THE SYSTEM SHALL route it by its SNI to the termination, substitution and egress re-check that a CONNECT to that authority receives.
+  tier:     T0
+  verify:   cargo nextest run -p bep direct_tls_on_443_routes_by_sni
+  <!-- gominimal/minimal#2805: under `dns` steering the box resolver answers a credentialed name with the proxy's address and sets no `HTTPS_PROXY` (BEP-012), so the client opens TCP 443 to that address and sends a ClientHello, never a CONNECT; networking §5.4: `dns` is the mode in which tools work unmodified -->
+  - IF a TLS connection on port 443 carries no SNI, or its SNI names an authority outside the union of the configured modules' host sets and the registered store authorities, THEN THE SYSTEM SHALL refuse it and record an audit event marked `off_module`.
+    tier:   T0
+    verify: cargo nextest run -p bep direct_tls_without_admitted_sni_is_refused_off_module
+    <!-- unwanted; the BEP-029 refusal applied to the path with no CONNECT line: the SNI is the only authority the connection names -->
+  - WHILE a box declares a credentialed upstream THE SYSTEM SHALL admit its TCP connections to the proxy's address on port 443 and on the listener's port, and on no other port or protocol.
+    tier:   T0
+    verify: cargo nextest run -p boxes proxy_lane_admits_tls_443_and_listener_port_only
+    <!-- NET-134 widened by one (address, port, protocol) triple; UDP 443 toward the steered address stays rejected (BEP-018) -->
+
+- **BEP-081** WHERE the host runs its boxes in a VM THE SYSTEM SHALL admit `dns` and `both` steering for `own_ip` and `host_ip` boxes.
+  tier:     T0
+  verify:   cargo nextest run -p minimal vm_host_admits_dns_and_both_for_own_ip_and_host_ip
+  <!-- the box-zone resolver fact of BEP-017 for a VM host, both modes; an `own_ip` box is steered at the switch's DNS gate and a `host_ip` box through its own resolver (BEP-086); this retires the interim refusal of `dns` that waited on gominimal/minimal#2805; a host with no VM keeps BEP-017's refusal, and a SharedLinux host has no proxy (Non-goals) -->
+
+The `host_ip` lane on a VM host
+
+- **BEP-082** WHERE the host runs its boxes in a VM, WHEN a `host_ip` box that declares a credentialed upstream is created THE SYSTEM SHALL mint its box id on the host side, unique to that creation, before the creation request is sent.
+  tier:     T0
+  verify:   cargo nextest run -p minvmd host_ip_box_registration_mints_a_creation_unique_id
+  <!-- Gatehouse §6.10 v1.24 Attribution: the host-side creator mints the id, unique per creation; the sealed values ride the creation request, so the id exists before it; the registration allocates no switch address for a `host_ip` box -->
+  - IF a `host_ip` box on a VM host declares a credentialed upstream, THEN THE SYSTEM SHALL NOT refuse its creation for the proxy's absence while the proxy serves the host.
+    tier:   T0
+    verify: cargo nextest run -p minimal host_ip_grant_box_on_vm_host_is_not_refused_as_unserved
+    <!-- unwanted; before this requirement a `host_ip` box got no box id and its creation was refused as though no proxy served the host -->
+
+- **BEP-083** WHILE a resident `host_ip` box of a VM host declares a credentialed upstream THE SYSTEM SHALL admit connections from the `host_ip` cohort address to the proxy's listener and to the proxy's address on TCP port 443.
+  tier:     T0
+  verify:   cargo nextest run -p minvmd host_ip_cohort_reaches_proxy_while_a_member_declares_a_lane
+  <!-- NET-134 applied to the cohort: networking §4.3 rule 2 makes the shared address's reach the union of its resident members' rules, and the residual is T28; port 443 is BEP-080's direct TLS path, which `dns` steering (BEP-086) sends a `host_ip` box's lookups to -->
+  - WHILE no resident `host_ip` box of a VM host declares a credentialed upstream THE SYSTEM SHALL drop connections from the `host_ip` cohort address to the proxy's address.
+    tier:   T0
+    verify: cargo nextest run -p minvmd host_ip_cohort_proxy_lane_dropped_without_a_declaring_member
+
+- **BEP-084** WHEN the proxy accepts a connection from the `host_ip` cohort address THE SYSTEM SHALL mark its delivery cohort-attributed, with no box id in it.
+  tier:     T0
+  verify:   cargo nextest run -p switch cohort_delivery_names_no_box
+  <!-- a shared address names no single box; a delivery that stamped one member's id would give the egress re-check and the audit record the wrong subject -->
+  - WHERE a request is cohort-attributed, WHEN it carries a sealed value that names a live `host_ip` box of this host THE SYSTEM SHALL re-check the request against that box's egress and record that box as the audit subject.
+    tier:   T0
+    verify: cargo nextest run -p bep cohort_redemption_uses_named_box_egress_and_subject
+    <!-- Gatehouse §6.10 redemption step 2: host-ip attribution is to the cohort and the value's `sub` must be a live `host_ip` box of the node; step 3: the egress declaration checked is that box's, the only box the request identifies -->
+  - IF a cohort-attributed request carries a sealed value that names a box that is not a live `host_ip` box of this host THEN THE SYSTEM SHALL refuse the request and record an audit event marked `cohort_misattributed`.
+    tier:   T0
+    verify: cargo nextest run -p bep cohort_value_naming_no_live_host_ip_box_is_refused
+    <!-- unwanted; a cohort delivery names no box, so the value's `sub` is the only box the request carries: a value naming an `own_ip` box, a box that ended, or a box of another host is refused here as BEP-020 refuses it on a box-attributed connection -->
+
+- **BEP-085** THE SYSTEM SHALL treat a credentialed upstream as in effect for an `own_ip` box and for a `host_ip` box on a VM host, and as not in effect for a `none` box and for a `host_ip` box on a host with no VM.
+  tier:     T0
+  verify:   cargo nextest run -p boxes credentialed_upstream_in_effect_by_mode_and_host
+  verify:   cargo nextest run -p minimal detail_pane_shows_a_host_ip_lane_in_effect_on_a_vm_host
+  <!-- ubiquitous; the one decision that BEP-012's proxy variables, the `min session policy` row, the `min dash` detail pane and the `--credentialed-upstream` help text read -->
+
+- **BEP-086** WHERE a `host_ip` box on a VM host declares a credentialed upstream and its steering is `dns` or `both` THE SYSTEM SHALL answer that box's lookups of its steered names with the proxy's address.
+  tier:     T0
+  verify:   cargo nextest run -p minimald host_ip_grant_box_steered_names_resolve_to_proxy
+  <!-- per box, never per namespace: on a VM host a `host_ip` box resolves through the node's DNS layer (NET-003's VM-backed sub-requirement, which forwards under NET-066), and the box's resolver configuration is its own, so a steering answer goes to this box alone; BEP-078 and BEP-062 hold for these answers as for an `own_ip` box's -->
+  - IF a process in the shared namespace that is not a `host_ip` box with `dns` or `both` steering and a credentialed upstream looks up a steered name, THEN THE SYSTEM SHALL answer it from real DNS.
+    tier:   T0
+    verify: cargo nextest run -p minimald host_ip_lookup_outside_a_steered_box_resolves_real
+    <!-- unwanted; Gatehouse §6.10 injects the interception CA only into a box whose own spec declares credentialed upstreams, so a lookup steered for any other process would end in a TLS failure, and would show the proxy traffic its spec did not declare (networking §5.4) -->
+
+- **BEP-087** WHILE a `host_ip` box on a VM host holds a sealed GitHub member under its default steering THE SYSTEM SHALL complete `git clone`, `git push` and `gh api` against a private repository of the signed-in account with no proxy variables in the box.
+  tier:     T0
+  verify:   ./scripts/session-e2e.sh bep_host_ip_git_and_gh_under_dns_steering
+  <!-- architecture D6, Interaction with Network Modes: `host_ip` works, at the tier its chooser accepted; the default steering is `dns` in every mode (networking §5.4, BEP-016) -->
+  - WHILE a `host_ip` box on a VM host holds a sealed GitHub member under `proxy_env` steering THE SYSTEM SHALL complete `git clone`, `git push` and `gh api` against a private repository of the signed-in account.
+    tier:   T0
+    verify: ./scripts/session-e2e.sh bep_host_ip_git_and_gh_under_proxy_env
+    <!-- state-driven; BEP-015's case for a `host_ip` box: the proxy variables (BEP-012, BEP-085) carry the flows instead of the steering answers -->
 
 HTTP versions and framing
 
@@ -457,27 +552,43 @@ Store references
   tier:     T0
   verify:   cargo nextest run -p bep store_value_read_per_request_never_written
 
-- **BEP-063** WHEN a store reference is minted for a box THE SYSTEM SHALL issue a handle signed under the client's local key carrying the store, the identifier, the registered upstream authorities, the injection form and an expiry equal to the root CA's remaining validity at the mint, and register that key with the proxy over the proxy's control socket before the handle is delivered.
+- **BEP-063** WHEN a store reference is minted for a box THE SYSTEM SHALL issue a handle of JWS `typ` `gatehouse-store-handle+jws`, signed under the client's local key, carrying the box id (`sub`), the host (`node_id`), the store, the identifier, the registered upstream authorities, the injection form, the issue time (`iat`), a unique handle id (`jti`) and an expiry equal to the root CA's remaining validity at the mint, and register that key with the proxy over the proxy's control socket before the handle is delivered.
   tier:     T0
   verify:   cargo nextest run -p minimal store_handle_signed_and_key_registered
-  <!-- Gatehouse §6.10 store members, un-enrolled: the client signs handles in the store-handle wire format under its local key, and an un-enrolled handle's expiry is the credentialed-lane ceiling (v1.23), the same as a sign-in reference's (BEP-005): the value is resolved per request and item deletion revokes it at once, so a shorter clock would only end a running box's references with no re-mint path to renew them; the control socket is the local UDS of §6.2's same-machine trust, distinct from the redemption listener BEP-026 closes to non-box connections -->
+  <!-- Gatehouse §6.10 store members, un-enrolled: the client signs handles in the store-handle wire format under its local key, and an un-enrolled handle's expiry is the credentialed-lane ceiling (v1.23), the same as a sign-in reference's (BEP-005): the value is resolved per request, item deletion revokes it at once, and revoking the signing key by its `kid` ends every handle signed under it, so a shorter clock would only end a running box's references with no re-mint path to renew them; the control socket is the local UDS of §6.2's same-machine trust, distinct from the redemption listener BEP-026 closes to non-box connections -->
   - WHEN the proxy restarts THE SYSTEM SHALL verify store handles under every client key registered before the restart.
     tier:   T0
     verify: cargo nextest run -p bep client_key_registrations_survive_restart
     <!-- event-driven; a registration held only by the running process would refuse every running box's store references after a restart, until the next mint registered the key again -->
   - IF the host keychain refuses the running client its handle-signing key THEN THE SYSTEM SHALL replace the key and register the replacement before minting.
     tier:   T0
-    verify: cargo nextest run -p bep a_client_key_this_program_is_refused_is_replaced
-    <!-- unwanted; unlike the proxy's keys (BEP-060), this key signs handles only and every mint registers the key it signs under, so its replacement needs no operator step -->
+    verify: cargo nextest run -p minimal a_refused_client_key_is_replaced_and_registered_before_the_mint
+    <!-- unwanted; unlike the proxy's keys (BEP-060), this key signs handles only and every mint registers the key it signs under, so its replacement needs no operator step; the verify line names the client-side test, because `a_client_key_this_program_is_refused_is_replaced` in `bep` proves only that a second registered key goes in beside the first -->
+  - WHEN the control socket's owner revokes a registered client key by its `kid` THE SYSTEM SHALL remove the key from the registry and from the kept registrations before the reply, so no store handle signed under it verifies again, after a restart included.
+    tier:   T0
+    verify: cargo nextest run -p bep a_revoked_client_key_no_longer_verifies_a_store_handle
+    <!-- event-driven; `revoke_client_key` on the control socket; the other registered keys stay; `a_key_removal_survives_a_restart` holds the removal across a restart -->
+  - WHEN the client replaces a client key that the host keychain refused THE SYSTEM SHALL register the replacement with `register_client_key`, then keep the replacement in the keychain, then revoke with `replace_client_key` every other registered key that no running box uses, and keep each key that a running box uses verifying until the last such box ends.
+    tier:   T0
+    verify: cargo nextest run -p minimal a_replaced_client_key_keeps_verifying_until_its_boxes_end
+    <!-- event-driven; the client cannot read the refused key, so it cannot name its `kid`, and `replace_client_key` revokes every key but the one it carries and those that running boxes use; the [gominimal/arch#144 ruling](https://github.com/gominimal/arch/issues/144#issuecomment-6409882482) keeps the old key verifying until the boxes minted under it end (Gatehouse §6.10), so a replacement is not a cause to re-create a box; each mint names its box in `register_client_key`, the proxy keeps each key's running boxes in the registrations file, so the keep holds across a restart, and `forget_box` at the box's destroy ends the box's use; a box can end with no `forget_box` (a creation stopped by Ctrl-C before `minvmd` records the box, a stopped `minvmd`, or a failed write of the file at the forget), and a restart keeps every box in the file as a user of its key, so a box created before the restart keeps redeeming; each time `bep serve` starts to listen, `minvmd` sends `live_boxes` with every box id its registry holds, and the proxy frees the key of each box that the file held at that start and that the list leaves out, revokes a retired key whose boxes all ended, and logs an info line that names each freed `kid`, so the bound counts only the keys that running boxes use (`a_stranded_box_frees_its_key_at_start`, `proxy_gets_the_live_box_ids_when_it_starts_to_listen`); until the list arrives, the proxy frees no key; a replaced key that a running box uses is retired, and the forget of the last such box revokes it, with an info log line that names its `kid`; on the failure paths the order keeps running boxes redeeming: a proxy that refuses step one leaves the refused key in the store for the next creation to try again, and a store that fails step two leaves every old key registered; a lock file beside the control socket serialises the replacement across `min` processes, so two creations that both meet a refusal revoke once (`a_replaced_client_key_is_revoked_at_the_proxy_once_for_two_creations`), and a replacement the store does not keep revokes no key (`a_replacement_the_store_does_not_keep_revokes_no_key`) -->
+  - IF the revoke of the other client keys fails after the keychain keeps the replacement THEN THE SYSTEM SHALL keep the replacement registered and revoke again at the next box creation, from the pending-revoke file beside the control socket that names the replacement's `kid`.
+    tier:   T0
+    verify: cargo nextest run -p minimal a_replaced_client_key_is_revoked_at_the_proxy_after_a_failed_revoke
+    <!-- unwanted; the client writes the file after step one and before step two, so the file exists even when step two fails; the proxy never removes the file, and the client removes it when `replace_client_key` succeeds, at the replacement or at the retry; after a failed step two the store still refuses, so the next creation makes a new key and overwrites the file with that key's `kid`; a file that names a key other than the one the store holds is stale, and the next creation removes it; the failure is a warn log line, not a message, because the creation goes on under a registered key -->
+  - THE SYSTEM SHALL hold at most a bounded count of client keys in the registry, 16 by default, and drop the key registered least recently that no running box uses when a registration passes the bound, or refuse the registration when running boxes use every key, after a restart included.
+    tier:   T0
+    verify: cargo nextest run -p bep the_registry_bound_never_drops_a_key_a_running_box_uses
+    <!-- ubiquitous; the client keeps one key for each user and a replacement revokes the others that no running box uses, so the registry usually holds one key, and the bound limits what other registrations on the socket can add; the bound never drops a key that a running box uses, so no running box loses its store handles or sign-in references to it; when running boxes use every key, the proxy refuses the new key, and the creation fails with "min did not create the box: the Box Egress Proxy already holds 16 client keys, and running boxes use each one. A key is freed when the last box created under it ends." on stderr (`a_replacement_past_a_bound_of_keys_in_use_fails_the_creation`); `the_registry_never_holds_more_keys_than_its_bound` holds the count and the idle period for keys no box uses; `bep serve --max-client-keys <N>` sets the bound, 16 by default (`KeyBound::DEFAULT_MAX_KEYS`), and refuses a value below 1 when the arguments parse (`serve_passes_its_key_bound_to_the_control_socket`); the idle period stays unset until gominimal/arch#85 decides the root validity, and it never drops a key that a running box uses; an embedder that sets a bound above the count of keys in the file keeps every key the file holds (`a_larger_key_bound_keeps_every_key_the_file_holds`); each dropped key is a warn log line -->
   - THE SYSTEM SHALL accept key registration and audit submissions only over a control socket owned by the operator's user with mode `0600`, separate from the redemption listener.
     tier:   T0
     verify: cargo nextest run -p bep control_socket_is_owner_only_and_separate_from_listener
     <!-- ubiquitous; the operator's own processes are the trust boundary un-enrolled (Gatehouse §6.2), and the redemption listener stays closed to them (BEP-026) -->
 
-- **BEP-064** IF a store handle's signature does not verify under a registered client key, its expiry has passed, its `upstream` is not a subset of the current rule for its store and identifier, or its `inject` differs from that rule's THEN THE SYSTEM SHALL refuse the request and record an audit event marked `store_handle_invalid`.
+- **BEP-064** IF a store handle's signature does not verify under a registered client key, its `sub` or `node_id` differs from the sealed value's box or host, its expiry has passed, its `upstream` is not a subset of the current rule for its store and identifier, or its `inject` differs from that rule's THEN THE SYSTEM SHALL refuse the request and record an audit event marked `store_handle_invalid`.
   tier:     T2
   verify:   cargo nextest run -p bep prop_store_handle_verified_against_current_rule
-  property: for every handle, every registered key set, every clock reading and every current rule, redemption admits only when the signature verifies, the clock is before `exp`, `upstream` is a subset of the rule's authorities and `inject` equals the rule's form
+  property: for every handle, every registered key set, every clock reading and every current rule, redemption admits only when the signature verifies, `sub` and `node_id` equal the sealed value's box and host, the clock is before `exp`, `upstream` is a subset of the rule's authorities and `inject` equals the rule's form
   harness:  kani_redeem_refuses_invalid_store_handle, same bound and purity constraint as BEP-019
   <!-- a rule that has since narrowed, or changed its injection form, refuses: editing a rule bites a running box -->
   - WHEN the operator's `[secret-store-rules]` change THE SYSTEM SHALL judge the next request against the changed rules, with no restart of the proxy or the box.
@@ -491,10 +602,10 @@ Store references
 
 - **BEP-034** IF a `[secret-store-rules]` rule names a deep module's host, Minimal's own infrastructure, or an injection header among `Host`, `:authority`, `Cookie`, `Proxy-*`, `Transfer-Encoding`, `Connection` and `Upgrade` THEN THE SYSTEM SHALL refuse the rule when reading configuration and name it.
   tier:     T0
-  verify:   cargo nextest run -p sessions store_rule_in_deny_set_is_refused
+  verify:   cargo nextest run -p boxes store_rule_in_deny_set_is_refused
   - IF a `[secret-store-rules]` rule or a `source = "store"` reference names the GitHub sign-in item THEN THE SYSTEM SHALL refuse it when reading configuration and name the GitHub module as the item's owner.
     tier:   T0
-    verify: cargo nextest run -p sessions store_rule_naming_sign_in_item_is_refused
+    verify: cargo nextest run -p boxes store_rule_naming_sign_in_item_is_refused
     <!-- Gatehouse §6.10 (v1.23): the item's identifier is reserved to the module, so a generic reference can never inject the operator's GitHub token -->
 
 - **BEP-065** WHEN a store value is injected THE SYSTEM SHALL emit exactly the registered prefix followed by the value as the header's value, or fill one `basic_auth` field with it.
@@ -508,16 +619,16 @@ Store references
 
 - **BEP-035** WHERE the client has no TTY, IF a store reference matches a rule with `action = "ask"` THEN THE SYSTEM SHALL deny the reference.
   tier:     T0
-  verify:   cargo nextest run -p sessions ask_rule_without_tty_denies
+  verify:   cargo nextest run -p boxes ask_rule_without_tty_denies
 
 - **BEP-036** IF a box spec declares a store reference whose registered upstream is not admitted by the box's egress THEN THE SYSTEM SHALL refuse expansion with exit 3 naming the missing host.
   tier:     T1
-  verify:   cargo nextest run -p sessions prop_store_upstream_outside_egress_is_exit_3
+  verify:   cargo nextest run -p boxes prop_store_upstream_outside_egress_is_exit_3
   property: for every box spec and every registered upstream set, expansion refuses with exit 3 iff some registered upstream is absent from the egress declaration, naming exactly the absent hosts
 
 - **BEP-037** IF a project `minimal.toml` contains a `[secret-store-rules]` section THEN THE SYSTEM SHALL ignore it and emit a warning.
   tier:     T0
-  verify:   cargo nextest run -p sessions project_store_rules_are_ignored_with_warning
+  verify:   cargo nextest run -p boxes project_store_rules_are_ignored_with_warning
 
 Review, audit and revocation
 
@@ -533,10 +644,10 @@ Review, audit and revocation
     verify: cargo nextest run -p minimal box_spec_flags_allowed_quic_stance_on_grant_box
     <!-- networking §5.3 (v0.9): the flag keys to the resolved stance, never the input; at v1.25 rollout a running grant-holding `auto` box under `proxy_env` or `off` flips from blocked to allowed with no event of its own -->
 
-- **BEP-039** WHEN the proxy admits or refuses a request THE SYSTEM SHALL append one JSONL record under the `min/v1` audit schema carrying its `kind`, the subject box, `act` and `txn` left empty, the upstream authority, the member or store identifier or `none`, the mapped resource and permission or `module_unmapped`, the decision and any marker.
+- **BEP-039** WHEN the proxy admits or refuses a request THE SYSTEM SHALL append one JSONL record under the `min/v1` audit schema carrying its `kind`, the subject box, `act` and `txn` left empty, the upstream authority, the member or store identifier or `none`, the handle's `jti` or empty, the mapped resource and permission or `module_unmapped`, the decision and any marker.
   tier:     T0
   verify:   cargo nextest run -p bep every_decision_appends_one_audit_record
-  <!-- the F12 shape by ruling (Gatehouse §6.10 Audit bullet, v1.20.1); `kind` tells a proxy decision from an identity event once the host enrolls; off-module and unsealed records carry `none` -->
+  <!-- the F12 shape by ruling (Gatehouse §6.10 Audit bullet, v1.20.1); `kind` tells a proxy decision from an identity event once the host enrolls; off-module and unsealed records carry `none`; the `jti` is the handle's correlation id (Gatehouse §6.10), empty when the request carries no handle or the handle does not parse, and on a refusal it is the handle's unverified claim, kept so a forged or tampered handle still correlates -->
 
 - **BEP-067** WHEN the client mints a member or a store handle, or a live box is destroyed (BEP-043) THE SYSTEM SHALL append a record of kind `mint` or `revocation` to the same log through the proxy, the log's sole writer, over the control socket.
   tier:     T0
@@ -546,11 +657,12 @@ Review, audit and revocation
 - **BEP-040** THE SYSTEM SHALL write no credential, injected header value, or request body to the audit log.
   tier:     T1
   verify:   cargo nextest run -p bep prop_audit_records_never_contain_secrets
-  property: for every two requests identical in every BEP-039 field and differing only in body, the serialized records are identical apart from BEP-048's chain field; and every record field is derived from the BEP-039 field set and the chain field alone, which carry neither the member credential, the store value, an injected header value nor the body
+  property: for every two requests identical in every BEP-039 field, the handle's `jti` included, and differing only in body, the serialized records are identical apart from BEP-048's chain field; and every record field is derived from the BEP-039 field set and the chain field alone, which carry neither the member credential, the store value, an injected header value nor the body
 
-- **BEP-041** THE SYSTEM SHALL open the audit log for append only and modify or remove no existing record.
+- **BEP-041** THE SYSTEM SHALL open each audit segment for append only and modify no existing record, and remove a record from the retained set only by removing a whole segment that BEP-068 retention no longer retains, or by moving a whole segment that holds an unreadable line into the `quarantine` directory under BEP-068.
   tier:     T0
   verify:   cargo nextest run -p bep audit_log_is_opened_append_only
+  <!-- the quarantine move (`bep serve --quarantine-unreadable`, #2613) moves a segment and edits none: it appends the `quarantine` record and re-records the segment's readable revocations before the move, so the moved bytes stay intact under `quarantine/` and the chain still verifies across the gap -->
 
 - **BEP-068** WHEN the active audit segment reaches its size bound THE SYSTEM SHALL open a new segment whose first record carries the previous segment's final hash.
   tier:     T0
@@ -566,11 +678,24 @@ Review, audit and revocation
     tier:   T0
     verify: cargo nextest run -p bep segment_with_live_revocation_is_retained
     <!-- ubiquitous; Gatehouse §6.10 v1.24: a revocation record is compactable once no value naming its box can be unexpired, and the credentialed-lane ceiling bounds that; pruning earlier would lose the revocation at the next start -->
+  - WHEN the proxy starts and a retained segment holds a complete line that does not parse THE SYSTEM SHALL refuse the start and name `bep serve --quarantine-unreadable`.
+    tier:   T0
+    verify: cargo nextest run -p bep serve_refuses_start_on_unreadable_audit_line
+    <!-- an unreadable line can be a revocation, and a start without it redeems a value for a destroyed box; the partial last line of a torn write is cut at open and does not count -->
+  - WHEN `bep serve --quarantine-unreadable` starts and a retained segment holds a complete line that does not parse THE SYSTEM SHALL append one record of kind `quarantine` for that segment, then append again each revocation it reads in that segment with the marker `quarantine_restated`, then move the segment into the `quarantine` directory beside the log, and log one warn line for the move.
+    tier:   T0
+    verify: cargo nextest run -p bep quarantine_of_the_active_segment_opens_the_next
+    <!-- the `quarantine` record carries `segment` (the moved file's name), `from_hash` (the hash the moved segment's first record chains to), `final_hash` (the hash the record after it chains to), `unreadable` (its complete lines that did not parse) and BEP-048's `previous_hash`; the records go to the log before the move, so a crash between the two leaves the segment in place for the next quarantine and never leaves a moved segment unrecorded; a quarantine of the active segment first opens the next segment; the `quarantine_restated` marker tells the copy from the revocation a destroy wrote, so a reader does not count one destroy twice; the warn line names the segment, where it moved, the unreadable count, the count of records of a kind this bep does not know, and the final hash, and says that a revocation on such a line is no longer in force -->
+  - WHEN the chain is verified THE SYSTEM SHALL bridge a gap before the first record of a segment only through a `quarantine` record whose moved segment is present under `quarantine/`, agrees with the record's `from_hash` and `final_hash`, and sits between the two segments the gap separates.
+    tier:   T0
+    verify: cargo nextest run -p bep forged_quarantine_record_bridges_no_gap
+    <!-- a forged `quarantine` record, or one whose moved segment is absent or altered, bridges nothing, so the break still reports (BEP-049) -->
 
 - **BEP-042** WHEN `min box audit <id> [-o jsonl]` is run with a box id THE SYSTEM SHALL output the retained audit records whose subject is that box and no other, a reaped box included.
   tier:     T0
   verify:   cargo nextest run -p minimal box_audit_filters_to_one_box
   <!-- the ruled grammar: `min box audit <box|self> | --parent <box|self> [-o jsonl] [--follow]`; the log is the proxy's, not part of the box record, so `rm` and `prune` never touch it; retention is BEP-068's -->
+  <!-- the design reads over the helper's local UDS (architecture line 501, Gatehouse §6.10 line 836, ruled on gominimal/arch#137); v1 reads the operator-owned log files under file mode in its place until gominimal/minimal#2463 serves the read; the interim is gominimal/minimal#2459 -->
   - WHEN `min box audit <name>` is run with a friendly name THE SYSTEM SHALL read the live box of that name, else the most recent creation under it, and name the id it read.
     tier:   T0
     verify: cargo nextest run -p minimal box_audit_name_reads_live_else_latest_creation
@@ -617,6 +742,9 @@ Review, audit and revocation
   - IF a minted box id is named by any retained record THEN THE SYSTEM SHALL refuse the creation.
     tier:   T0
     verify: cargo nextest run -p minimal colliding_box_id_refuses_creation
+    verify: cargo nextest run -p minvmd colliding_box_id_refused
+    verify: cargo nextest run -p minvmd a_minted_id_a_revocation_holds_is_refused_with_no_proxy
+    <!-- The host's collision check reads live rows, kept creations and attachments, then the revocation records. When the proxy answers its control socket, the check reads the records the proxy holds in force. When no proxy answers, the check reads the revocation records in the audit log beside the socket, `~/.minimal/bep/audit`. These are the records that the next `bep serve` start restores. When that log is not read whole, the check refuses the creation, because a line that does not parse can be a revocation. The refusal names `bep serve --quarantine-unreadable`, which moves those segments aside and starts the proxy. -->
   - WHEN a box is created under the name a destroyed box held THE SYSTEM SHALL redeem the new box's sealed values and keep refusing the destroyed box's.
     tier:   T0
     verify: ./scripts/session-e2e.sh bep_box_recreated_under_its_name_redeems
@@ -639,10 +767,6 @@ Review, audit and revocation
     tier:   T0
     verify: cargo nextest run -p bep reference_to_another_sign_in_instance_is_refused
     <!-- unwanted; what keeps a reference minted before a logout refused after the next sign-in (BEP-002, BEP-044) -->
-
-- **BEP-047** THE SYSTEM SHALL run the proxy as the operator's login user and gvproxy and the VM as a dedicated unprivileged user, as separate processes sharing no writable state.
-  tier:     T0
-  verify:   cargo nextest run -p minvmd bep_and_gvproxy_are_separate_processes_and_users
 
 - **BEP-048** WHEN a record is appended to the audit log THE SYSTEM SHALL include in it, as `previous_hash`, the SHA-256 of the previous record's serialized line, the UTF-8 JSON bytes without the trailing newline, or the all-zero hash for the first record of a log.
   tier:     T0
@@ -692,9 +816,43 @@ Setting secrets
   tier:     T0
   verify:   cargo nextest run -p bep replaced_secret_is_injected_on_next_request
 
+- **BEP-079** WHEN `min secret set <id>` is run with `--upstream <authority>` and an injection form, `--header <name>` with an optional `--prefix <text>` or `--basic-auth <field>`, or with `--preset <name>` THE SYSTEM SHALL write the `[secret-store-rules]` rule for `<id>` with those fields and no consent `action` to the user-level client configuration, replacing any rule for `<id>` there.
+  tier:     T0
+  verify:   cargo nextest run -p minimal secret_set_writes_user_level_store_rule
+  <!-- the rule is client-owned (BEP-037), so the verb writes the one file the operator owns; consent stays a hand-set field -->
+  - THE SYSTEM SHALL write store rules from `min secret set` to the user-level client configuration alone, and to no project `minimal.toml` and no organization configuration.
+    tier:   T0
+    verify: cargo nextest run -p minimal secret_set_writes_no_project_or_org_config
+  - THE SYSTEM SHALL resolve `--preset anthropic` to `api.anthropic.com` with header `Authorization` and prefix `Bearer `, `--preset anthropic-api-key` to `api.anthropic.com` with header `x-api-key` and no prefix, `--preset linear` to `mcp.linear.app` with header `Authorization` and prefix `Bearer `, `--preset sentry` to `mcp.sentry.dev` with header `Authorization` and prefix `Sentry-Bearer `, and `--preset cloudflare` to `mcp.cloudflare.com` with header `Authorization` and prefix `Bearer `.
+    tier:   T0
+    verify: cargo nextest run -p minimal secret_set_presets_resolve_to_their_rules
+    <!-- fixed-token upstreams only; an upstream whose client signs in through OAuth with expiring tokens needs a module (Non-goals); `anthropic` fits a box that sets `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_AUTH_TOKEN`, and `anthropic-api-key` fits one that sets `ANTHROPIC_API_KEY`, which Claude Code sends in `x-api-key` (docs/spikes/2026-10-20-sealed-handle-bearer-clients.md) -->
+  - IF `--preset` does not name a built-in preset THEN THE SYSTEM SHALL refuse the command before reading the value and print the preset names it knows.
+    tier:   T0
+    verify: cargo nextest run -p minimal secret_set_unknown_preset_lists_known_ones
+  - IF the configuration reader refuses the rule that `min secret set` writes (BEP-034) THEN THE SYSTEM SHALL refuse the command, naming what the rule names, before reading the value and before writing the item or the rule.
+    tier:   T0
+    verify: cargo nextest run -p minimal secret_set_refuses_deny_set_rule_before_reading_value
+  - WHEN `min secret set <id>` replaces a rule for `<id>` whose fields differ, with a terminal attached and without `--yes`, THE SYSTEM SHALL show the current and the new fields and replace the rule only on confirmation.
+    tier:   T0
+    verify: cargo nextest run -p minimal secret_set_shows_rule_change_and_asks
+  - IF `min secret set <id>` replaces a rule whose fields differ, with no terminal attached and without `--yes`, THEN THE SYSTEM SHALL refuse the command, write neither the item nor the rule, and name `--yes` as the way to accept the change.
+    tier:   T0
+    verify: cargo nextest run -p minimal secret_set_rule_change_without_tty_needs_yes
+  - WHERE the command carries `--yes` THE SYSTEM SHALL replace a rule whose fields differ without asking.
+    tier:   T0
+    verify: cargo nextest run -p minimal secret_set_yes_replaces_rule_without_asking
+  - IF storing the item or writing the rule fails THEN THE SYSTEM SHALL restore the other to its state before the command and report which step failed.
+    tier:   T0
+    verify: cargo nextest run -p minimal secret_set_partial_failure_restores_both
+  - WHEN `min secret set <id>` is run with no rule flag THE SYSTEM SHALL store the value and leave any rule for `<id>` unchanged.
+    tier:   T0
+    verify: cargo nextest run -p minimal secret_set_without_rule_flags_leaves_rule_unchanged
+
 ## Non-goals
 
 - Caching public artifacts through the proxy: a separate story, not yet filed.
+- Presets for Slack, Google Drive, Notion and other services whose clients sign in through OAuth with tokens that expire. A stored secret stops working when its token expires. Each such service needs a module with a sign-in flow and renewal at the proxy, as the GitHub module has, and follows the Anthropic and MCP module epics.
 - Anthropic and MCP upstream modules; 1Password, LastPass, Linux Secret Service, `pass` and Bitwarden store backends: follow-on epics reusing this document's module and resolver seams (Gatehouse §6.10 store members lists the roster).
 - The Gatehouse-hosted proxy, the enrolled `gateway` helper, the tenant secret store and the revocation feed: [GHI](https://github.com/gominimal/gatehouse/pull/1), Gatehouse §6.10, §6.11, §8.6. With a Gatehouse configured, `min` delegates sign-in, minting and sealing to it; nothing here forecloses that and the envelope is the same.
 - Repository narrowing of a locally minted GitHub member: later work, the §6.4 scoped-token endpoint against the local App under the embedded client secret (Gatehouse §14.4 item 7); an open question below records the residual meanwhile.
@@ -709,6 +867,7 @@ Setting secrets
 - A node-local proxy on a SharedLinux host, inside the escape boundary: Gatehouse §6.10, SharedLinux paragraph.
 - The execution-facade lane: a separate design.
 - Multi-user hosts: the degraded-mode profile assumes a single-operator host (networking design §7.1).
+- Separate users for gvproxy and the VM (formerly BEP-047): [gominimal/inbox#1184](https://github.com/gominimal/inbox/issues/1184). That epic runs gvproxy and the VM as dedicated unprivileged users and moves the egress gate into its own process. Its design is `docs/design/2026-10-25-split-user-vmm-provider-dir.md`. Today the proxy, gvproxy and the VM all run as the operator's login user. A compromised VMM or gvproxy also runs as that user.
 
 ## Non-functional requirements
 
@@ -826,7 +985,8 @@ or copied as the plan sees fit. Extending the router in place was rejected
 because the router runs inside the box host and the proxy must run outside it.
 **The proxy runs as the operator.** Keychain items are per user and `min secret
 set` writes to the operator's keychain, so the proxy reads as the operator's
-login user; gvproxy and the VM run as a dedicated unprivileged user (BEP-047).
+login user. Running gvproxy and the VM as dedicated unprivileged users is a
+non-goal of this document (see Non-goals).
 A proxy user with a keychain of its own was rejected for v1 because the write
 path would need a helper channel and the items would fall outside the
 operator's Keychain Access view. On macOS the keychain keys on code signature: a
@@ -925,6 +1085,16 @@ form and refuses the tenant-store one. Without the verb an item created outside
 prompts on the host and a store reference is unusable from an unattended box.
 Replacing an item is rotation: the proxy reads per request (BEP-033), so no
 restart is needed.
+`min secret set` also writes the rule when it gets one (BEP-079). One command
+then stores a key and says where the proxy sends it. The alternative was a
+rule the operator edits by hand. We set it aside because a missing or mistyped
+rule leaves a stored key that no box can use. The verb writes only the
+user-level configuration. The organization configuration is not the
+operator's, and the proxy ignores a project rule (BEP-037). Presets cover only
+services that take a fixed token. A service that signs in through OAuth needs a
+renewal that no stored value can give. Anthropic has two presets because Claude
+Code sends an API key and a token in different headers. With one preset, one
+of the two travels in a header the proxy never fills.
 
 **Prior art.** The `docs/spec-credential-lane` branch's policy gate, resolver
 seam, `min session credentials` review surface and the "tasks stop mapping
@@ -952,6 +1122,13 @@ longer than the 8-hour token it replaces and is why `full` members belong on
 compromised box, the irreducible floor, now scoped, audited and revocable. The
 baseline this replaces, a raw token in the box environment usable from anywhere
 for its full TTL, is retired in every mode.
+
+On a VM host, `host_ip` boxes share the cohort address. The proxy lane is
+open to the cohort while one resident member declares a credentialed upstream
+(BEP-083). That is the T28 tier. The redemption checks still bind each value
+to the live `host_ip` box it names (BEP-084). Per-box steering (BEP-086)
+gives a cohort member with no credentialed upstream neither a steered answer
+nor the interception CA.
 
 Residuals recorded: T28 for `host_ip` cohort attribution, and, until NET-132
 and NET-133 are built, for every VM-hosted box, `own_ip` included, and the host
@@ -984,7 +1161,7 @@ per-request Keychain access control.
 
 - **Invariant:** THE SYSTEM SHALL redeem a sealed value only on this host, and only from the box it names or, where that box is `host_ip`, from another live `host_ip` box of this host with the redemption audited `cohort_attributed`.
   enforced by: host key binding; box attribution from the switch's source address and the host-side creator's attachments; the `host_ip` cohort rule
-  covered by: BEP-019, BEP-020, BEP-026, BEP-028, BEP-058, BEP-070
+  covered by: BEP-019, BEP-020, BEP-026, BEP-028, BEP-058, BEP-070, BEP-083, BEP-084
 
 - **Invariant:** THE SYSTEM SHALL substitute a credential only into a request whose connection authority and `Host` are one declared authority of its module or registration, on an upstream connection that authenticated as that authority.
   enforced by: host-set membership, request-authority pinning, port discipline, name-constrained CA, upstream validation against the host trust store, TLS-only upstream legs for credentialed hosts, canonical re-serialization with ambiguous framing refused, no upstream connection shared across boxes
@@ -992,15 +1169,16 @@ per-request Keychain access control.
 
 - **Invariant:** THE SYSTEM SHALL admit no credentialed reach that the box's declared egress denies.
   enforced by: full-set validation at expansion; egress re-check at redemption
-  covered by: BEP-008, BEP-022, BEP-036
+  covered by: BEP-008, BEP-022, BEP-036, BEP-084
 
 - **Invariant:** THE SYSTEM SHALL write no credential to any log, spec rendering or diagnostic bundle.
   enforced by: audit record construction from the decision only; `min box spec` and `min secret` render identifiers and references only
   covered by: BEP-004, BEP-038, BEP-040, BEP-050, BEP-052
 
 - **Invariant:** THE SYSTEM SHALL grant unattended access to the signing key, the sealing key and store items to the proxy's process identity alone.
-  enforced by: process separation; keychain access control bound to the proxy's identity
-  covered by: BEP-014, BEP-047, BEP-051, BEP-059, BEP-060, BEP-072
+  enforced by: keychain access control bound to the proxy's code signature, and process separation
+  covered by: BEP-014, BEP-051, BEP-059, BEP-060, BEP-072
+  <!-- The proxy, gvproxy and the VM run as the same login user, so process separation keeps them in separate processes but not under separate users. The user split is deferred to gominimal/inbox#1184. Custody on a real macOS keychain is unproven: gominimal/minimal#2436 is open because the login keychain was observed to make keys exportable. -->
 
 - **Invariant:** THE SYSTEM SHALL stop redeeming a revoked or expired value within 60 seconds.
   enforced by: expiry in the sealed context; revocation records consulted per request before any resolution; sign-in and store items resolved per request, so deletion revokes
