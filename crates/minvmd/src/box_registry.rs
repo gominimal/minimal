@@ -5744,11 +5744,24 @@ impl BoxRegistry {
         if inserted {
             tracing::info!(
                 box = %name,
-                "held a box name in the zone with no row behind it; it answers NODATA"
+                "held a box name in the zone with no row behind it"
             );
             self.ping();
         }
         inserted
+    }
+
+    /// The names [`Self::hold_box_name`] holds, each with the session the
+    /// hold is for, in name order. The host answerer reads them to answer
+    /// a running host-address box's name with its node's address (NET-129).
+    #[must_use]
+    pub fn held_name_owners(&self) -> Vec<(String, Option<boxes::SessionId>)> {
+        self.held_names
+            .read()
+            .expect("the held names' lock is never held across a panic, so it cannot be poisoned")
+            .iter()
+            .map(|(name, owner)| (name.clone(), *owner))
+            .collect()
     }
 
     /// Releases a name [`Self::hold_box_name`] holds: the name answers
@@ -6215,7 +6228,7 @@ impl BoxRegistry {
             // resident box took under it stay too.
             return true;
         }
-        resident.boxes.insert(session_id, Arc::new(rules));
+        let newly_resident = resident.boxes.insert(session_id, Arc::new(rules)).is_none();
         resident.cohort = HostIpBoxes::cohort_record(&resident.boxes, self.subnet);
         let count = resident.boxes.len();
         // Under the resident set's lock, so the mirror's flag follows the
@@ -6227,10 +6240,22 @@ impl BoxRegistry {
         if !was_published {
             self.node_mirror.bind_held();
         }
+        // A resident box's held name answers its node's address, so the
+        // answerer's table changed (NET-129).
+        if newly_resident {
+            self.ping();
+        }
+        // The mirror's state beside the count, so a host can read whether the
+        // node's binds were mirrored when the set changed (NET-129).
+        let mirrored = self
+            .node_mirror
+            .mirrored_address()
+            .map_or_else(|| "none".to_string(), |address| address.to_string());
         tracing::info!(
             session = %session_id,
             resident_host_ip_boxes = count,
             credentialed_upstream,
+            mirrored_address = %mirrored,
             "holding the host_ip box's egress rules; box-marked frames from the node \
              address are decided by the resident boxes' rules"
         );
@@ -6271,6 +6296,8 @@ impl BoxRegistry {
             if count == 0 {
                 self.node_mirror.end_binds(MirrorEnd::BoxEnd);
             }
+            // The box's held name answers NODATA again (NET-128).
+            self.ping();
         }
         removed
     }
@@ -6319,7 +6346,30 @@ impl BoxRegistry {
             return Err(MirrorAddressRefused::HeldByAnotherNamespace(address));
         }
         self.node_mirror.open(address);
+        // The resident host-address boxes' names answer at the address now
+        // (NET-129).
+        self.ping();
         Ok(())
+    }
+
+    /// Records the whole-range probe's verdict on the node's mirror
+    /// ([`NodeMirror::set_range_probe`]) and pings the table when the
+    /// mirrored address changed. A failing probe then republishes the
+    /// host-address names as NODATA at once (NET-129), and a passing one
+    /// republishes the node's address, never a recheck interval later.
+    pub fn set_node_range_probe(&self, passes: bool) {
+        let before = self.node_mirror.mirrored_address();
+        self.node_mirror.set_range_probe(passes);
+        let after = self.node_mirror.mirrored_address();
+        if before != after {
+            tracing::debug!(
+                ?before,
+                ?after,
+                range_passes = passes,
+                "the node's mirrored address changed on a range probe verdict"
+            );
+            self.ping();
+        }
     }
 
     /// Takes one listen notice from the in-VM daemon ([`NodeMirror::notice`])
@@ -6627,6 +6677,14 @@ impl NodeMirror {
     /// The node's address the mirror binds at, once open.
     pub fn address(&self) -> Option<Ipv4Addr> {
         self.lock().address
+    }
+
+    /// The node's address while its binds are mirrored there: the mirror
+    /// is open, the whole-range probe passes, and a binder is set. `None`
+    /// otherwise, and a host-address box's name then answers NODATA
+    /// (NET-129).
+    pub fn mirrored_address(&self) -> Option<Ipv4Addr> {
+        self.lock().bind_target().map(|(address, _)| address)
     }
 
     /// The ports bound at the node's address.

@@ -125,6 +125,9 @@ const LOG_DEADLINE: Duration = Duration::from_secs(5);
 /// read as the verdict. The gate decides before any frame leaves the VM, so
 /// the silence is available well within this.
 const DROP_DEADLINE: Duration = Duration::from_secs(3);
+/// The tracing target of the gate's debug line for a box-marked frame's
+/// decision (`minvmd`'s `MARKED_DECISION_TARGET`).
+const MARKED_DECISION_TARGET: &str = "minvmd::egress_gate::marked";
 /// The env var the guest scopes an exec to a session with.
 const MINIMAL_SESSION_ID_ENV: &str = "MINIMAL_SESSION_ID";
 /// The `/connect` upgrade head the guest shuttle speaks to the switch, and
@@ -237,6 +240,13 @@ fn try_minvmd(state: &Path, gvproxy: &Path, args: &[&str]) -> Result<Output, Str
         // READY wait reads this (60 s by default), and a cold boot can
         // outrun that, so give it the same budget.
         .env("MINVMD_READY_TIMEOUT_SECS", DETACH_TIMEOUT_SECS)
+        // The gate's one debug line for a box-marked frame's decision, on
+        // top of whatever filter the runner set, so a failed assertion can
+        // quote why the gate decided the frame.
+        .env("RUST_LOG", {
+            let base = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
+            format!("{base},{MARKED_DECISION_TARGET}=debug")
+        })
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1434,6 +1444,66 @@ fn gate_account(guest: &Guest) -> String {
     lines.join(" | ")
 }
 
+/// What the supervisor knew about one box-marked flow, for the assertion
+/// that finds it never arrived: every gate line that names the flow's
+/// source, destination or the resident host_ip set; the gate's debug line
+/// for each marked frame it decided (verdict, rule, resident set and cohort
+/// record at that moment); each host_ip admission's mirrored address; every
+/// backpressure drop; and the zone-table dump.
+fn marked_flow_account(
+    guest: &Guest,
+    node: Ipv4Addr,
+    host: Ipv4Addr,
+    port: u16,
+    src_port: u16,
+) -> String {
+    let log = guest.log();
+    let source = format!("source={node}");
+    let destination = format!("destination={host}");
+    let flow_lines: Vec<&str> = log
+        .lines()
+        .filter(|line| {
+            line.contains(&source)
+                || line.contains(&destination)
+                || line.contains(&format!("{host}:{port}"))
+                || line.contains("resident_host_ip_boxes=")
+        })
+        .collect();
+    let decisions: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("decided a box-marked frame"))
+        .collect();
+    let this_flow = decisions
+        .iter()
+        .any(|line| line.contains(&format!("source_port={src_port}")));
+    let mirrored: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("mirrored_address="))
+        .collect();
+    let backpressure: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("-backpressure"))
+        .collect();
+    let zone_path = guest
+        ._state
+        .path()
+        .join("minimal/providers/local-minvmd0")
+        .join(minvmd::diag::ZONE_TABLE_FILE);
+    let zone = std::fs::read_to_string(&zone_path)
+        .unwrap_or_else(|e| format!("(no zone-table dump at {}: {e})", zone_path.display()));
+    format!(
+        "the gate's lines for {node} -> {host}:{port} and the host_ip set: [{}]; \
+         the gate's marked-frame decisions (this flow's source port {src_port} \
+         {}): [{}]; the mirrored address at each host_ip admission: [{}]; \
+         backpressure drops: [{}]; the zone-table dump: {zone}",
+        flow_lines.join(" | "),
+        if this_flow { "logged" } else { "not logged" },
+        decisions.join(" | "),
+        mirrored.join(" | "),
+        backpressure.join(" | "),
+    )
+}
+
 /// Reads one accepted connection, recording what arrives as it arrives. A
 /// read timeout is not an end: the sender may still be completing the
 /// handshake this connection was dialed for, so the read is retried until the
@@ -2046,14 +2116,8 @@ async fn vm_escape_bounded_to_resident_union() {
     while listener.accepted() <= accepted_before && Instant::now() < dialed_end {
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert!(
-        listener.accepted() > accepted_before,
-        "vm_escape_integration: a box-marked frame a resident host_ip box admits \
-         never reached {host}:{port}: the listener accepted no new connection \
-         ({outcome}); the listener saw: {}; the gate said: {}",
-        listener.report(),
-        gate_account(&guest)
-    );
+    // Checked before the arrival, so a drop under the host_ip rule fails
+    // here with its own cause rather than as a missing connection.
     assert!(
         !guest
             .log_lines(&["egress-host-ip-boxes"])
@@ -2062,6 +2126,15 @@ async fn vm_escape_bounded_to_resident_union() {
         "the gate dropped the admitted marked frame under the host_ip rule; \
          the gate said: {}",
         gate_account(&guest)
+    );
+    assert!(
+        listener.accepted() > accepted_before,
+        "vm_escape_integration: a box-marked frame a resident host_ip box admits \
+         never reached {host}:{port}: the listener accepted no new connection \
+         ({outcome}); the listener saw: {}; the gate said: {}; {}",
+        listener.report(),
+        gate_account(&guest),
+        marked_flow_account(&guest, node, host, port, admitted.src_port)
     );
     attempts.push(Attempt {
         source: node,
