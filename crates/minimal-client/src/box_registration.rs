@@ -307,8 +307,14 @@ impl RegisteredWithVmHost {
 
 /// The refusal when the VM host daemon answers a `host_ip` registration
 /// with an address row: that daemon is older than `host_ip` registration.
-const HOST_IP_REGISTRATION_UNSUPPORTED: &str = "the VM host daemon is older than host_ip box \
-     registration. It answered with a box address and no box id. The registration did not happen";
+/// An older daemon takes the unheld path and publishes a row under the
+/// box's name, and nothing here withdraws it, so the text says it may
+/// remain. A VM restart starts a fresh VM host daemon with no rows.
+const HOST_IP_REGISTRATION_UNSUPPORTED: &str = "the VM host daemon is older than this min, so \
+     it cannot start a --network host_ip box with a credentialed upstream. It may keep a box \
+     address under this box's name until the VM restarts. Run `min stop` and `min ls` to \
+     restart the VM with the matching VM host daemon (with the same --vm or --provider flags, \
+     if you use them)";
 
 /// Registers an own-address box with the VM host daemon over its control
 /// socket (T66), returning what it handed back.
@@ -323,9 +329,6 @@ pub async fn register_box_with_vm_host(
     )
     .await?;
     match reply {
-        // The answer a daemon this build boots beside sends: the addresses
-        // beside the id the published row holds, on the connection a held
-        // registration keeps as its lease.
         // An older daemon answers a `host_ip` request as an own-address
         // registration: it allocated an address row and minted no box id
         // for the `host_ip` box. That registration is refused here, never
@@ -336,6 +339,9 @@ pub async fn register_box_with_vm_host(
         {
             Err(anyhow::anyhow!(HOST_IP_REGISTRATION_UNSUPPORTED))
         }
+        // The answer a daemon this build boots beside sends: the addresses
+        // beside the id the published row holds, on the connection a held
+        // registration keeps as its lease.
         minimald_rpc::BoxControlReply::Registered(web) => Ok(RegisteredWithVmHost {
             addresses: boxes::BoxAddresses {
                 switch_address: web.switch_address,
@@ -1215,9 +1221,14 @@ mod tests {
                 ),
                 Err(error) => error,
             };
-            assert!(
-                format!("{error:#}").contains("older than host_ip box registration"),
-                "{reply:?}: {error:#}"
+            assert_eq!(
+                format!("{error:#}"),
+                "the VM host daemon is older than this min, so it cannot start a --network \
+                 host_ip box with a credentialed upstream. It may keep a box address under this \
+                 box's name until the VM restarts. Run `min stop` and `min ls` to restart the VM \
+                 with the matching VM host daemon (with the same --vm or --provider flags, if \
+                 you use them)",
+                "{reply:?}"
             );
         }
     }
