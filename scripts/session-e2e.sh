@@ -9097,7 +9097,7 @@ proof_host_address_names_and_host_alias() {
   echo "::group::host-address boxes by name, and host.min.internal (NET-003, NET-129)"
   local han_name=e2e-han-host han_port=18093 han_host_port=18094
   local han_sid han_ls han_dns_port han_reply han_addr han_status han_out han_range
-  local han_body han_code han_i
+  local han_body han_code han_i han_mirror_rec
   local han_marker="HAN_HOST_LOOPBACK_OK"
 
   # The log lines a person reads when this case fails: the mirrored binds
@@ -9251,10 +9251,17 @@ proof_host_address_names_and_host_alias() {
       echo "--- curl stderr ---"; cat "$WORK/han-curl.err" 2>/dev/null || true
       han_fail
     fi
-    if [ -z "$(minvmd_log_lines "mirrored a host-address box's bind at the node's address" | grep -F -- "$han_port" | tail -n1)" ]; then
-      echo "::error::the VM host daemon's log has no mirrored-bind record for port $han_port, though the request reached the box"
+    # One record must carry the address the name answered, this exact port,
+    # and the bound outcome, so the mirror is proved at that address.
+    han_mirror_rec="$(minvmd_log_lines "mirrored a host-address box's bind at the node's address" \
+      | grep -F -- "\"address\":\"$han_addr\"" \
+      | grep -E -- "\"port\":${han_port}[,}]" \
+      | grep -F -- '"outcome":"bound"' | tail -n1)"
+    if [ -z "$han_mirror_rec" ]; then
+      echo "::error::the VM host daemon's log has no bound mirrored-bind record at $han_addr port $han_port, though the request reached the box"
       han_fail
     fi
+    echo "mirrored bind: $han_mirror_rec"
     echo "$han_name opens by name at the node's address $han_addr"
   else
     # ---- native lane: host.min.internal against the documented literal -----
