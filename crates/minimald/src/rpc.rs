@@ -1412,25 +1412,25 @@ async fn serve_rename_session(
 }
 
 /// `StopBox`: stops the running box and keeps its record (BOX-013,
-/// BOX-018). Answers how the box ended, as the record now stores it.
+/// BOX-018). Answers how the box ended, as the record now stores it. A
+/// stop that the entrypoint's return beat answers that the box already
+/// exited, with the exit's code (BOX-038).
 async fn serve_stop_box(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), ConnectionError> {
     minimald_rpc::StopBox
         .handle_channel(c, async |req: minimald_rpc::StopBoxRequest| {
             let mngr = s.sessions_manager().await;
             match mngr.stop_box(req.id, req.force).await {
-                Ok(ending) => {
-                    let state = boxes::core::record::RecordState::Stopped(ending);
+                Ok(answer) => {
+                    let response = stop_box_response(answer);
                     tracing::info!(
                         session_id = %req.id,
                         force = req.force,
-                        exit_code = state.exit_code(),
-                        signal = state.signal(),
+                        outcome = answer.outcome(),
+                        exit_code = response.exit_code,
+                        signal = response.signal,
                         "session stopped"
                     );
-                    Ok(Errorable::Ok(minimald_rpc::StopBoxResponse {
-                        exit_code: state.exit_code(),
-                        signal: state.signal(),
-                    }))
+                    Ok(Errorable::Ok(response))
                 }
                 Err(e) => Ok(Errorable::Err {
                     error: e.to_string(),
@@ -1438,6 +1438,19 @@ async fn serve_stop_box(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), C
             }
         })
         .await
+}
+
+/// The `StopBox` answer for how a stop ended: the record's exit code and
+/// ending signal, and whether the box already exited before the stop.
+pub(crate) fn stop_box_response(
+    answer: crate::box_manager::StopAnswer,
+) -> minimald_rpc::StopBoxResponse {
+    let state = answer.state();
+    minimald_rpc::StopBoxResponse {
+        exit_code: state.exit_code(),
+        signal: state.signal(),
+        already_exited: matches!(answer, crate::box_manager::StopAnswer::AlreadyExited(_)),
+    }
 }
 
 /// `ReapBox`: deletes one box's record, events and files (BOX-019,

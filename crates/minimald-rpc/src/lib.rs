@@ -2669,6 +2669,12 @@ pub struct StopBoxResponse {
     /// of the stop ended it.
     #[serde(default)]
     pub signal: Option<i32>,
+    /// The entrypoint returned before the stop could end the box, so the
+    /// box already exited on its own and the stop changed nothing.
+    /// `exit_code` is then that exit's code. Absent, as from a daemon that
+    /// does not send it, the stop ended the box.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub already_exited: bool,
 }
 
 impl OneshotSshRpc for StopBox {
@@ -3810,10 +3816,17 @@ mod stop_box_tests {
             StopBoxResponse {
                 exit_code: None,
                 signal: Some(15),
+                already_exited: false,
             },
             StopBoxResponse {
                 exit_code: Some(0),
                 signal: None,
+                already_exited: false,
+            },
+            StopBoxResponse {
+                exit_code: Some(3),
+                signal: None,
+                already_exited: true,
             },
             StopBoxResponse::default(),
         ];
