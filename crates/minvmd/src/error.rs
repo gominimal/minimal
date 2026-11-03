@@ -53,10 +53,19 @@ pub enum VmError {
     InvalidLogLevel { value: String },
 
     /// A required image could not be located: the override env var was unset or
-    /// empty, and no file exists at the default install location. `var` names
-    /// the override; `default` is the path that was checked.
-    #[error("{var} is unset and no file exists at the default location {}", default.display())]
-    MissingImage { var: &'static str, default: PathBuf },
+    /// empty, and no file exists at the default install location nor under any
+    /// system data directory. `var` names the override; `default` is the
+    /// user's path that was checked; `system_dirs` the machine-wide ones.
+    #[error(
+        "{var} is unset and no file exists at the default location {} or in a system data directory ({})",
+        default.display(),
+        system_dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", ")
+    )]
+    MissingImage {
+        var: &'static str,
+        default: PathBuf,
+        system_dirs: Vec<PathBuf>,
+    },
 
     /// An I/O error outside the libkrun FFI boundary (e.g. creating or
     /// checking the socket directory, R3.2).

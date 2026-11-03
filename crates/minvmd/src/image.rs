@@ -3,9 +3,13 @@
 //! Paths are supplied at runtime via environment variables. When an override is
 //! unset, each resolver falls back to the file the installer stamps into the
 //! minimal data directory (`$XDG_DATA_HOME/minimal`, else
-//! `$HOME/.local/share/minimal`) — but only when that file actually exists, so
-//! a default install works with no env setup while a genuinely missing image
-//! still errors rather than silently returning a non-existent path.
+//! `$HOME/.local/share/minimal`), then to the same file under each system data
+//! directory (`$XDG_DATA_DIRS`, else `/usr/local/share:/usr/share`, each with
+//! `minimal/` appended: where a machine-wide package puts the images) — but
+//! only when that file actually exists, so a default install works with no
+//! env setup, a system install serves every user with no per-user copy, and a
+//! genuinely missing image still errors rather than silently returning a
+//! non-existent path.
 
 use std::path::PathBuf;
 
@@ -35,24 +39,61 @@ fn data_dir() -> Option<PathBuf> {
         .map(|home| PathBuf::from(home).join(".local/share/minimal"))
 }
 
+/// System data directories, each with `minimal/` appended: `$XDG_DATA_DIRS`
+/// (colon-separated), else `/usr/local/share:/usr/share` (the XDG base
+/// directory default). A machine-wide install puts the images here:
+/// `/usr/local/share/minimal` on macOS, `/usr/share/minimal` for a Linux
+/// package. Looked at after the user's own data directory, so a user's copy
+/// wins over the machine's.
+fn system_data_dirs() -> Vec<PathBuf> {
+    let dirs = std::env::var("XDG_DATA_DIRS")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "/usr/local/share:/usr/share".to_owned());
+    // A relative entry is ignored, as the XDG specification says: it would
+    // name a directory under whatever the daemon's working directory is.
+    dirs.split(':')
+        .filter(|d| d.starts_with('/'))
+        .map(|d| PathBuf::from(d).join("minimal"))
+        .collect()
+}
+
 /// Return the override in `var` when set and non-empty (used verbatim, without
 /// an existence check — the caller owns an explicit path). Otherwise fall back
-/// to `<data-dir>/default_file`, but only when that file exists.
+/// to `<data-dir>/default_file`, then to `<system-data-dir>/default_file` for
+/// each system data directory, but only to a file that exists.
 ///
-/// Errors with `VmError::MissingEnv` when the override is unset and no data
-/// directory can be resolved, and `VmError::MissingImage` when the default path
-/// is resolvable but no file is present there.
+/// Errors with `VmError::MissingEnv` when the override is unset, no data
+/// directory can be resolved and no system data directory has the file,
+/// and `VmError::MissingImage` when the default path is resolvable but no
+/// file is present there or under any system data directory.
 fn resolve_or_default(var: &'static str, default_file: &str) -> Result<PathBuf, VmError> {
     if let Some(val) = std::env::var(var).ok().filter(|v| !v.is_empty()) {
         return Ok(PathBuf::from(val));
     }
-    let default = data_dir()
+    let default = data_dir().map(|dir| dir.join(default_file));
+    if let Some(default) = &default
+        && default.exists()
+    {
+        return Ok(default.clone());
+    }
+    // The machine's copy serves a daemon with no data directory of its
+    // own too (no HOME: a service account, a scrubbed environment).
+    let system_dirs = system_data_dirs();
+    if let Some(found) = system_dirs
+        .iter()
         .map(|dir| dir.join(default_file))
-        .ok_or(VmError::MissingEnv { var })?;
-    if default.exists() {
-        Ok(default)
-    } else {
-        Err(VmError::MissingImage { var, default })
+        .find(|path| path.exists())
+    {
+        return Ok(found);
+    }
+    match default {
+        Some(default) => Err(VmError::MissingImage {
+            var,
+            default,
+            system_dirs,
+        }),
+        None => Err(VmError::MissingEnv { var }),
     }
 }
 
@@ -169,7 +210,108 @@ mod tests {
         unsafe {
             std::env::remove_var(var);
             std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("XDG_DATA_DIRS");
         }
+    }
+
+    // The user's data dir at `xdg` (empty or not) and one system data dir at
+    // `system`, with the override var cleared.
+    fn scoped_data_dirs(var: &str, xdg: &std::path::Path, system: &std::path::Path) {
+        scoped_data_dir(var, xdg);
+        // SAFETY: ENV_LOCK is held by this test, so nothing else reads or
+        // writes the process environment meanwhile.
+        unsafe { std::env::set_var("XDG_DATA_DIRS", system) };
+    }
+
+    #[test]
+    fn falls_back_to_a_system_data_dir_when_the_user_has_no_copy() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let system = tempfile::tempdir().unwrap();
+        let want = system.path().join("minimal").join(DEFAULT_KERNEL_FILE);
+        std::fs::create_dir_all(want.parent().unwrap()).unwrap();
+        std::fs::write(&want, b"kernel").unwrap();
+
+        scoped_data_dirs("MINVMD_KERNEL_PATH", home.path(), system.path());
+        let path = resolve_kernel_path().unwrap();
+        assert_eq!(path, want);
+        clear_env("MINVMD_KERNEL_PATH");
+    }
+
+    #[test]
+    fn the_users_copy_wins_over_the_systems() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let system = tempfile::tempdir().unwrap();
+        for root in [home.path(), system.path()] {
+            let file = root.join("minimal").join(DEFAULT_ROOTFS_FILE);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, b"rootfs").unwrap();
+        }
+
+        scoped_data_dirs("MINVMD_ROOTFS_PATH", home.path(), system.path());
+        let path = resolve_rootfs_path().unwrap();
+        assert_eq!(path, home.path().join("minimal").join(DEFAULT_ROOTFS_FILE));
+        clear_env("MINVMD_ROOTFS_PATH");
+    }
+
+    #[test]
+    fn missing_everywhere_names_the_system_dirs_too() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let system = tempfile::tempdir().unwrap();
+        scoped_data_dirs("MINVMD_INITRAMFS", home.path(), system.path());
+        let err = resolve_initramfs_path().unwrap_err();
+        let VmError::MissingImage {
+            var,
+            default,
+            system_dirs,
+        } = &err
+        else {
+            panic!("expected MissingImage, got {err:?}");
+        };
+        assert_eq!(*var, "MINVMD_INITRAMFS");
+        assert_eq!(
+            *default,
+            home.path().join("minimal").join(DEFAULT_INITRAMFS_FILE)
+        );
+        assert_eq!(*system_dirs, vec![system.path().join("minimal")]);
+        let text = err.to_string();
+        assert!(text.contains(&default.display().to_string()), "{text}");
+        assert!(
+            text.contains(&system.path().join("minimal").display().to_string()),
+            "{text}"
+        );
+        clear_env("MINVMD_INITRAMFS");
+    }
+
+    #[test]
+    fn system_data_dirs_default_to_the_xdg_base_dirs() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: ENV_LOCK is held by this test, so nothing else reads or
+        // writes the process environment meanwhile.
+        unsafe { std::env::remove_var("XDG_DATA_DIRS") };
+        assert_eq!(
+            system_data_dirs(),
+            vec![
+                PathBuf::from("/usr/local/share/minimal"),
+                PathBuf::from("/usr/share/minimal")
+            ]
+        );
+        // SAFETY: ENV_LOCK is held by this test, so nothing else reads or
+        // writes the process environment meanwhile.
+        unsafe { std::env::set_var("XDG_DATA_DIRS", "/opt/data::/srv/share") };
+        assert_eq!(
+            system_data_dirs(),
+            vec![
+                PathBuf::from("/opt/data/minimal"),
+                PathBuf::from("/srv/share/minimal")
+            ],
+            "an empty entry is skipped"
+        );
+        // SAFETY: ENV_LOCK is held by this test, so nothing else reads or
+        // writes the process environment meanwhile.
+        unsafe { std::env::remove_var("XDG_DATA_DIRS") };
     }
 
     #[test]
@@ -204,7 +346,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         scoped_data_dir("MINVMD_ROOTFS_PATH", tmp.path());
         let err = resolve_rootfs_path().unwrap_err();
-        let VmError::MissingImage { var, default } = &err else {
+        let VmError::MissingImage { var, default, .. } = &err else {
             panic!("expected MissingImage, got {err:?}");
         };
         assert_eq!(*var, "MINVMD_ROOTFS_PATH");
