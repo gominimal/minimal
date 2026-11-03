@@ -7698,6 +7698,94 @@ async fn until_complete_ends_on_entrypoint_return_without_client() {
     );
 }
 
+// BOX-013, BOX-038: a kill from the daemon can lose the race to the loop's
+// own reap. The kill is queued, but the process is already dead, and the
+// loop reaps it before `step` takes the kill. The daemon asked for that end,
+// so the loop never reports it as the entrypoint's own return. With no kill
+// queued, the same reap is not a requested end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_kill_racing_reap_is_not_a_natural_exit() {
+    /// Kills the host's process and waits until it is a zombie, so the
+    /// loop's first `try_wait` reaps it.
+    async fn kill_and_await_zombie(host: &Host<MockProcess, ()>) {
+        let pid = libc::pid_t::try_from(host.container_pid()).expect("pid fits in pid_t");
+        // SAFETY: `kill` takes plain integers; `pid` is the mock entrypoint
+        // this test spawned, which is not reaped yet.
+        let rc = unsafe { libc::kill(pid, libc::SIGKILL) };
+        assert_eq!(rc, 0, "failed to SIGKILL the mock entrypoint");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+                let state = stat
+                    .rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().next());
+                if state == Some("Z") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the killed entrypoint becomes a zombie");
+    }
+
+    let capture = captured_log();
+    let (host, handle) = until_complete_host().await;
+    kill_and_await_zombie(&host).await;
+    handle.kill(false).await.expect("the kill is queued");
+    let exit = tokio::time::timeout(Duration::from_secs(10), crate::traced::spawn(host.run()))
+        .await
+        .expect("the loop ends on the reaped process")
+        .expect("host task should not panic")
+        .expect("the loop reaps the killed entrypoint");
+    assert!(
+        exit.requested,
+        "a queued kill that lost the race to the reap is still the daemon's end: {exit:?}"
+    );
+    let logged = capture.contents();
+    assert!(
+        logged.contains("session host killed on request; the process was already reaped"),
+        "the log says the kill lost the race to the reap:\n{logged}"
+    );
+
+    let (host, _handle) = until_complete_host().await;
+    kill_and_await_zombie(&host).await;
+    let exit = tokio::time::timeout(Duration::from_secs(10), crate::traced::spawn(host.run()))
+        .await
+        .expect("the loop ends on the reaped process")
+        .expect("host task should not panic")
+        .expect("the loop reaps the killed entrypoint");
+    assert!(
+        !exit.requested,
+        "with no kill queued, the daemon did not ask for the end: {exit:?}"
+    );
+}
+
+// BOX-038: a pty error can be stashed before a kill from the daemon arrives.
+// The kill still ends the box, so the loop reports the end as requested, not
+// as the entrypoint's own return.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_kill_racing_reap_is_not_a_natural_exit_after_pty_error() {
+    let capture = captured_log();
+    let (mut host, handle) = until_complete_host().await;
+    host.record_pty_err(PtyOp::Read, std::io::Error::from_raw_os_error(libc::EIO));
+    handle.kill(false).await.expect("the kill is queued");
+    let exit = tokio::time::timeout(Duration::from_secs(10), crate::traced::spawn(host.run()))
+        .await
+        .expect("the loop ends on the kill")
+        .expect("host task should not panic")
+        .expect("the loop reaps the killed entrypoint");
+    assert!(
+        exit.requested,
+        "a kill after a stashed pty error is the daemon's end: {exit:?}"
+    );
+    let logged = capture.contents();
+    assert!(
+        logged.contains("session process reaped after requested teardown"),
+        "the reap is logged as a requested teardown:\n{logged}"
+    );
+}
+
 /// A box filed in a real store under a temp dir, so its host writes the
 /// box's log and its bindings write the box's events beside a real record.
 struct StoredBox {

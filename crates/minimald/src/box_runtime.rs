@@ -106,6 +106,10 @@ pub(crate) struct Host<P: BoxProcess, G: BoxGuard> {
     /// failure, never by a deliberate kill, which is what keeps a destroy from
     /// raising a shell-exit prompt.
     pending_pty_err: Option<std::io::Error>,
+    /// Set when [`Host::step`] takes a `Message::Kill`. The step-error branch
+    /// of [`Host::mainloop`] reads it to tell a requested end from a pty
+    /// failure. A pty error stashed before the kill does not hide the kill.
+    kill_requested: bool,
     /// The master-side fd of the Pty.
     master: AsyncFd<std::fs::File>,
     /// The box's output log (BOX-155). Every read from the master lands
@@ -1344,6 +1348,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             parser,
             process,
             pending_pty_err: None,
+            kill_requested: false,
             master,
             output_log,
             box_dir,
@@ -1439,10 +1444,16 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                     // repeat it here, where it is attributable, for the same
                     // reason the pty/step path does.
                     let exit = self.process.exit_reason();
+                    // A kill from the daemon can lose the race to this reap:
+                    // it is queued, but the process is reaped here before
+                    // `step` takes it. The daemon asked for the end, so the
+                    // entrypoint's own return does not end the box (BOX-038).
+                    let requested = self.kill_queued();
                     tracing::info!(
                         session_id = %self.session_id,
                         session = %self.session_name,
                         exit_code,
+                        requested,
                         abnormal = exit.as_ref().is_some_and(ExitReason::is_abnormal),
                         exit_reason = exit.as_ref().map_or("", |r| r.reason.as_str()),
                         "session process exited; reaped by the host loop",
@@ -1466,7 +1477,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                     break Ok(HostExit {
                         code: exit_code,
                         reason: exit,
-                        requested: false,
+                        requested,
                     });
                 }
                 Ok(None) => {}
@@ -1490,10 +1501,10 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                 // `Err` from `step`, but a destroy or a daemon shutdown either
                 // wants no farewell at all or has already sent its own teardown.
                 let mut pending = self.pending_pty_err.take();
-                // Read before `take_if` below can empty `pending`: with no
-                // stashed pty error, the only way `step` errs is
-                // `Message::Kill`, so the end was asked for.
-                let requested = pending.is_none();
+                // Read from the kill itself, not from `pending`: a kill can
+                // arrive after a pty error was stashed, and that end is still
+                // the daemon's, not the entrypoint's own return (BOX-038).
+                let requested = self.kill_requested;
 
                 // Notify *before* the reap when the process may still be
                 // running, because `wait` below is unbounded — see
@@ -1586,6 +1597,26 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         }
 
         result
+    }
+
+    /// Whether a kill from the daemon waits in the mailbox. Called once the
+    /// process is reaped and the loop ends, so it drains the mailbox: the
+    /// loop takes no message after this, and the other messages drop as
+    /// they do when the host ends.
+    fn kill_queued(&mut self) -> bool {
+        let mut killed = false;
+        while let Ok(msg) = self.receiver.try_recv() {
+            if let Message::Kill(for_shutdown) = msg {
+                tracing::info!(
+                    session_id = %self.session_id,
+                    session = %self.session_name,
+                    for_shutdown,
+                    "session host killed on request; the process was already reaped",
+                );
+                killed = true;
+            }
+        }
+        killed
     }
 
     /// Logs a pty-master failure and stashes it for [`Self::mainloop`] to hand
@@ -1713,6 +1744,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                             for_shutdown,
                             "session host killed on request",
                         );
+                        self.kill_requested = true;
                         if for_shutdown
                             && let Some(binding) = self.remote.take() {
                                 // If there was a binding we just swapped out, tell it to
