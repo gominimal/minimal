@@ -477,6 +477,16 @@ printf '%s\n' "\$*" >>"$root/xattr.calls"
 STUB
 chmod +x "$stubbin/xattr"
 
+# Stub `pkgutil`: the macOS receipt the uninstall asks for before it advises
+# on the host DNS setup. STUB_PKG_RECEIPT non-empty means the minimal
+# package is installed (the query exits 0); empty, the default, means no
+# receipt. Nothing else of pkgutil is used.
+cat >"$stubbin/pkgutil" <<'STUB'
+#!/bin/sh
+[ "$1" = --pkg-info ] && [ "$2" = dev.minimal.min ] && [ -n "${STUB_PKG_RECEIPT:-}" ]
+STUB
+chmod +x "$stubbin/pkgutil"
+
 # Remedy-bin: the whole PATH the advisory's commands run with (see
 # apply_remedies), so a command that is not here fails instead of reaching
 # the host's. sudo is a pass-through, so the "root" removals act on the
@@ -538,6 +548,10 @@ APPARMOR_DIR=
 # leaks into a scenario; scenarios seed a fake root to drive the offer.
 FINALIZE_INSTALL_ROOT=
 
+# Whether the macOS package's receipt is on the host (the pkgutil stub).
+# Empty, the default, is a Mac without the package.
+PKG_RECEIPT=
+
 # Stand-in for /dev/tty, where the active-sessions prompt (R5.5) and the
 # finalize-install offer (NET-122) read their answers. Empty points the
 # installer at a path that cannot be opened — the harness's own terminal must
@@ -573,6 +587,7 @@ run() {
         MINIMAL_OVERRIDE_INSTALLER_BUCKET="$BUCKET_HOST" \
         STUB_UNAME_S="$PLAT_S" \
         STUB_UNAME_M="$PLAT_M" \
+        STUB_PKG_RECEIPT="${PKG_RECEIPT:-}" \
         MINIMAL_OVERRIDE_APPARMOR_DIR="${APPARMOR_DIR:-$root/no-such-apparmor.d}" \
         MINIMAL_OVERRIDE_FINALIZE_INSTALL_ROOT="${FINALIZE_INSTALL_ROOT:-$root/no-such-finalize-install-root}" \
         MINIMAL_OVERRIDE_TTY="${TTY_FILE:-$root/no-such-tty}" \
@@ -917,6 +932,44 @@ EOF
         want_ok "darwin: the remedy boots out $job" \
             grep -qx "launchctl bootout system/$job" "$remedy_calls"
     done
+
+    # The same setup on a Mac where it is the system package's (the receipt
+    # dev.minimal.min): not this user's to remove, so no remedy is printed
+    # and the package's uninstaller is named instead; the dry run says it
+    # would leave the setup alone.
+    HNSP="$root/hns_pkg"; mkdir -p "$HNSP"
+    PLAT_S=Darwin; PLAT_M=arm64
+    run nsp_seed "$HNSP"
+    check 0 "$rc" "darwin+pkg: seed install exits 0"
+    fake_nsp="$root/fake net root-pkg"
+    for f in etc/resolver/min.internal Library/LaunchDaemons/dev.gominimal.zone.plist \
+        Library/PrivilegedHelperTools/Minimal.app/Contents/MacOS/minzoned \
+        "Library/Application Support/minimal/run/answerer.sock"; do
+        mkdir -p "$fake_nsp/$(dirname "$f")"
+        printf 'unit\n' >"$fake_nsp/$f"
+    done
+    FINALIZE_INSTALL_ROOT="$fake_nsp"; PKG_RECEIPT=1
+    run nsp_dry "$HNSP" --uninstall --dry-run
+    check 0 "$rc" "darwin+pkg: dry-run uninstall exits 0"
+    want_ok "darwin+pkg: the dry run says the setup is the package's and stays" \
+        grep -q "would leave the host DNS setup (/etc/resolver/min.internal) alone: it is the minimal package's (dev.minimal.min)" "$OUT"
+    run nsp_run "$HNSP" --uninstall
+    FINALIZE_INSTALL_ROOT=; PKG_RECEIPT=
+    PLAT_S=Linux; PLAT_M=x86_64
+    check 0 "$rc" "darwin+pkg: uninstall exits 0"
+    want_ok "darwin+pkg: the note says the setup is the package's and names its uninstaller" \
+        grep -q "is the minimal package's (dev.minimal.min)" "$OUT"
+    want_ok "darwin+pkg: the note names the package's uninstaller" \
+        grep -q "sudo /usr/local/share/minimal/uninstall.sh" "$OUT"
+    want_err "darwin+pkg: no root remedy is advised for the package's setup" \
+        grep -q "still installed on this host" "$OUT"
+    want_err "darwin+pkg: no launchctl bootout is advised" \
+        grep -q "launchctl bootout" "$OUT"
+    want_ok "darwin+pkg: the package's resolver file survives" \
+        test -f "$fake_nsp/etc/resolver/min.internal"
+    want_ok "darwin+pkg: the package's service bundle survives" \
+        test -f "$fake_nsp/Library/PrivilegedHelperTools/Minimal.app/Contents/MacOS/minzoned"
+    want_err "darwin+pkg: the user's own min is still removed" test -e "$HNSP/bin/min"
 
     HNS2="$root/hns2"; mkdir -p "$HNS2"
     run ns2_seed "$HNS2"
