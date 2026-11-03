@@ -2993,8 +2993,12 @@ async fn stopped_box_record_readable_until_reaped() {
     let (_state, _cache, mngr) = manager().await;
     let id = create_active_session_with(&mngr, sample_config()).await;
     // A spec beside the record, as a create that carries one writes it
-    // (BOX-068).
-    let spec = br#"{"type":"session"}"#.to_vec();
+    // (BOX-068). A launch reads it, so it must be a spec the daemon reads.
+    let spec = serde_json_lenient::to_vec(&mfile::spec::BoxSpec::for_session(
+        None,
+        mfile::spec::SpecFlags::default(),
+    ))
+    .expect("a spec serializes");
     mngr.box_events(id)
         .await
         .unwrap()
@@ -4754,6 +4758,176 @@ async fn reap_hands_name_to_retained_holder() {
             .lines()
             .any(|line| line.contains("name-handed-over") && line.contains(&first.to_string())),
         "the daemon log names the box the name went to:\n{logged}"
+    );
+}
+
+/// BOX-019, NET-012, NET-128: a destroy of the box that holds a name's row
+/// hands the row to the next retained box with that name, as a reap does.
+/// The destroy returns after the handover. A destroy of a box that does not
+/// hold the row leaves the row where it is. Once the last holder is
+/// destroyed, the name answers nothing. The daemon log names the destroyed
+/// box and the successor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn destroy_hands_name_to_retained_holder() {
+    use boxes::core::record::RecordState;
+
+    let log = crate::test_harness::captured_log();
+    let (_state, _cache, mngr) = manager().await;
+
+    // `first` stops. A running `dev` beside it holds the row.
+    let first = host_net_box(&mngr, "dev").await;
+    stop(&mngr, first).await;
+    let second = host_net_box(&mngr, "dev").await;
+    assert_eq!(row_of(&mngr, "dev", &[first, second]), Some(second));
+
+    // The destroy of the running holder hands the row to the stopped box.
+    mngr.delete_session(second).await.unwrap();
+    assert!(
+        mngr.get_record(BoxKeyPredicate::Id(second))
+            .await
+            .unwrap()
+            .is_none(),
+        "the destroyed record is gone when the destroy returns"
+    );
+    assert_eq!(row_of(&mngr, "dev", &[first, second]), Some(first));
+    assert_eq!(answers_to(&mngr, "dev").await, Some(first));
+    assert!(matches!(
+        state_of(&mngr, first).await,
+        RecordState::Stopped(_)
+    ));
+
+    // A stopped `third` takes the row. The destroy of `first`, which does
+    // not hold it, leaves the row with `third`.
+    let third = host_net_box(&mngr, "dev").await;
+    stop(&mngr, third).await;
+    assert_eq!(row_of(&mngr, "dev", &[first, third]), Some(third));
+    mngr.delete_session(first).await.unwrap();
+    assert_eq!(row_of(&mngr, "dev", &[first, third]), Some(third));
+
+    // The last holder goes: the name answers nothing.
+    mngr.delete_session(third).await.unwrap();
+    assert_eq!(row_of(&mngr, "dev", &[first, second, third]), None);
+    assert_eq!(answers_to(&mngr, "dev").await, None);
+
+    let logged = log.contents();
+    assert!(
+        logged.lines().any(|line| line.contains("destroy:")
+            && line.contains(&second.to_string())
+            && line.contains(&format!("successor={first}"))),
+        "the daemon log names the destroyed box and its successor:\n{logged}"
+    );
+    assert!(
+        logged.lines().any(|line| line.contains("destroy:")
+            && line.contains(&third.to_string())
+            && line.contains("successor=none")),
+        "the daemon log says no box took the row:\n{logged}"
+    );
+}
+
+/// BOX-019, BOX-021, NET-012: a reap returns only once the reaped box's
+/// teardown and the handover of its name are both done, under contention.
+/// The removal of another box with the name is held in its teardown while
+/// the row holder is reaped. When that reap returns, the reaped record is
+/// gone, the reaped box holds no row, and the row is with the one retained
+/// box that is not being removed. A prune that runs beside the held removal
+/// does the same. The daemon log orders the release before the handover.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reap_returns_after_teardown_and_handover() {
+    let log = crate::test_harness::captured_log();
+    let (state, _cache, mngr) = manager().await;
+
+    // `kept` and `leaving` stop. `holder` runs and holds the row.
+    let kept = host_net_box(&mngr, "dev").await;
+    stop(&mngr, kept).await;
+    let leaving = host_net_box(&mngr, "dev").await;
+    stop(&mngr, leaving).await;
+    let holder = host_net_box(&mngr, "dev").await;
+    let all = [kept, leaving, holder];
+    assert_eq!(row_of(&mngr, "dev", &all), Some(holder));
+
+    // The removal of `leaving`, the most recent stopped creation, waits in
+    // its teardown.
+    let handle = session(&mngr, leaving).await;
+    let release = handle.hold_for_test().await;
+    let held_reap = crate::traced::spawn({
+        let mngr = mngr.clone();
+        async move { mngr.reap_box(leaving, false).await }
+    });
+    handle.until_queued(1).await;
+
+    mngr.reap_box(holder, true).await.unwrap();
+    assert!(
+        mngr.get_record(BoxKeyPredicate::Id(holder))
+            .await
+            .unwrap()
+            .is_none(),
+        "the reaped record is gone when the reap returns"
+    );
+    assert!(
+        !mngr
+            .hostnames()
+            .read()
+            .expect("registry lock")
+            .name_held_by(holder, "dev"),
+        "the reaped box holds no row when the reap returns"
+    );
+    assert_eq!(row_of(&mngr, "dev", &all), Some(kept));
+
+    release.send(()).expect("the actor is held");
+    held_reap.await.unwrap().expect("the held removal goes on");
+    assert_eq!(row_of(&mngr, "dev", &all), Some(kept));
+
+    // Prune beside a held removal: `pruned` holds the row and is pruned,
+    // `waiting` is being removed, and the row goes to `kept`.
+    let waiting = host_net_box(&mngr, "dev").await;
+    stop(&mngr, waiting).await;
+    let pruned = host_net_box(&mngr, "dev").await;
+    stop(&mngr, pruned).await;
+    let all = [kept, waiting, pruned];
+    assert_eq!(row_of(&mngr, "dev", &all), Some(pruned));
+    let handle = session(&mngr, waiting).await;
+    let release = handle.hold_for_test().await;
+    let held_reap = crate::traced::spawn({
+        let mngr = mngr.clone();
+        async move { mngr.reap_box(waiting, false).await }
+    });
+    handle.until_queued(1).await;
+    // Only `pruned` ended long enough ago for the age selector.
+    let now = std::time::SystemTime::now();
+    let hour = std::time::Duration::from_secs(3600);
+    write_exited_event(state.path(), pruned, now - 2 * hour).await;
+    write_exited_event(state.path(), kept, now + hour).await;
+    let reply = mngr.prune_boxes(Some(hour), None).await.unwrap();
+    let reaped: Vec<_> = reply.reaped.iter().map(|entry| entry.box_id).collect();
+    assert_eq!(
+        reaped,
+        vec![pruned],
+        "the prune reaped the holder alone: {reply:?}"
+    );
+    assert!(
+        !mngr
+            .hostnames()
+            .read()
+            .expect("registry lock")
+            .name_held_by(pruned, "dev"),
+        "the pruned box holds no row when the prune returns"
+    );
+    assert_eq!(row_of(&mngr, "dev", &all), Some(kept));
+    release.send(()).expect("the actor is held");
+    held_reap.await.unwrap().expect("the held removal goes on");
+    assert_eq!(row_of(&mngr, "dev", &all), Some(kept));
+
+    let logged = log.contents();
+    let position = |action: &str, id: SessionId| {
+        logged
+            .lines()
+            .position(|line| line.contains(action) && line.contains(&id.to_string()))
+    };
+    let released = position("name-released", holder).expect("the release is logged");
+    let handed = position("name-handed-over", kept).expect("the handover is logged");
+    assert!(
+        released < handed,
+        "the daemon log orders the release before the handover:\n{logged}"
     );
 }
 

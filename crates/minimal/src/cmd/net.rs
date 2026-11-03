@@ -58,6 +58,7 @@ pub async fn cmd_net_forward(
     // The name alone decides where to look (NET-058): a box on another VM is
     // forwarded over that VM's socket, with no global flag.
     let example = format!("net forward {} {}", args.session, args.spec);
+    let selected = sock.clone();
     let (record, sock) = crate::cmd::resolve_named_box_version_gated(
         global,
         &mut client,
@@ -67,6 +68,9 @@ pub async fn cmd_net_forward(
         &example,
     )
     .await?;
+    // The session poll below asks the VM that holds the box, never the
+    // selected one, or a box on another VM reads as gone on the first tick.
+    let mut client = poll_client_for(client, &selected, &sock).await?;
 
     // Loopback only: the forward publishes a box's service to the laptop
     // running the command, not to the network the laptop sits on. A local
@@ -195,6 +199,25 @@ pub async fn cmd_net_forward(
         "net forward closed"
     );
     finish_forward(end, local_port, box_port)
+}
+
+/// The connection the forward's session poll runs over: `client`, which is
+/// connected to the `selected` VM, when that VM holds the box, else a new
+/// connection to the `owning` VM's socket, version-gated before the loop
+/// as the selected VM's is.
+pub(crate) async fn poll_client_for(
+    client: client::Client,
+    selected: &std::path::Path,
+    owning: &std::path::Path,
+) -> Result<client::Client, anyhow::Error> {
+    if selected == owning {
+        return Ok(client);
+    }
+    let mut owner = client::Client::connect(owning)
+        .await
+        .context("Failed to connect to the daemon of the VM that holds the box")?;
+    client::ensure_version_match(&mut owner).await?;
+    Ok(owner)
 }
 
 /// How the forward's loop ended.

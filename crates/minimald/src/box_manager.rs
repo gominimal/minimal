@@ -667,7 +667,8 @@ impl BoxManagerHandle {
                     let end = outcome?;
                     #[cfg(target_os = "linux")]
                     if let Some(name) = &end.held_name {
-                        self.hand_over_name(key, name).await;
+                        self.hand_over_name(key, record.box_id.unwrap_or(key), name)
+                            .await;
                     }
                     return Ok(minimald_rpc::ReapBoxResponse {
                         reaped,
@@ -679,78 +680,34 @@ impl BoxManagerHandle {
     }
 
     /// Hands the name row that the reaped box `reaped` held to the next
-    /// retained box with the same name (NET-012, NET-128). A running box
-    /// comes first, else the most recent creation. The manager registers
-    /// the row, and a stopped or exited box holds it as a stopped box. With
-    /// no such box, the name answers nothing. A failure here does not fail
-    /// the reap: the daemon log names it.
+    /// retained box with the same name (NET-012, NET-128), and returns once
+    /// the manager did it. The manager first makes sure the reaped box no
+    /// longer holds the row, and then picks the successor and registers it
+    /// in the same step, so a reap or a resume that lands between the two
+    /// cannot leave the name with no row while a box with it is retained.
+    /// A failure here does not fail the reap: the daemon log names it.
+    /// Answers with the box that took the row, or `None` when no box did.
     #[cfg(target_os = "linux")]
-    async fn hand_over_name(&self, reaped: SessionId, name: &str) {
-        use boxes::core::record::RecordState;
-        let records = {
-            let (send, recv) = Responder::channel();
-            // A send error means the manager is gone: the recv fails as well.
-            let _ = self.sender.send(ManagerMessage::Records(send)).await;
-            match recv.await {
-                Ok(Ok(records)) => records,
-                Ok(Err(error)) => {
-                    tracing::warn!(
-                        session_id = %reaped,
-                        name,
-                        %error,
-                        "reap: the records cannot be read; the name is not handed over"
-                    );
-                    return;
-                }
-                Err(_) => return,
-            }
-        };
-        let holders: Vec<&boxes::Record> = records
-            .iter()
-            .filter(|record| {
-                record.id != reaped
-                    && matches!(
-                        record.network,
-                        boxes::NetworkMode::HostNet | boxes::NetworkMode::OwnIp
-                    )
-                    && crate::box_actor::registry_name(record).eq_ignore_ascii_case(name)
-            })
-            .collect();
-        let running = holders
-            .iter()
-            .filter(|record| matches!(record.state(), Ok(RecordState::Running)))
-            .map(|record| record.id)
-            .min();
-        // The order of `boxes::resolve_on_host` and the store's
-        // `find_by_name`: the running holder, else the most recent
-        // creation, which is the greatest UUIDv7 id.
-        let successor = running.or_else(|| {
-            holders
-                .iter()
-                .filter(|record| {
-                    matches!(
-                        record.state(),
-                        Ok(RecordState::Stopped(_) | RecordState::Exited(_))
-                    )
-                })
-                .map(|record| record.id)
-                .max()
-        });
-        let Some(successor) = successor else {
-            tracing::info!(
-                session_id = %reaped,
-                name,
-                "reap: no retained box has the name; it answers nothing"
-            );
-            return;
-        };
+    async fn hand_over_name(
+        &self,
+        reaped: SessionId,
+        reaped_box: SessionId,
+        name: &str,
+    ) -> Option<SessionId> {
         let (send, recv) = Responder::channel();
         // A send error means the manager is gone: the recv fails as well.
         let _ = self
             .sender
-            .send(ManagerMessage::HandOverName(successor, send))
+            .send(ManagerMessage::HandOverName(
+                NameHandOver {
+                    reaped,
+                    reaped_box,
+                    name: name.to_string(),
+                },
+                send,
+            ))
             .await;
-        let _ = recv.await;
+        recv.await.ok().and_then(Result::ok).flatten()
     }
 
     /// Reaps every `stopped` or `exited` box that matches all the given
@@ -1055,12 +1012,13 @@ enum ManagerMessage {
     /// the box is left as it is. A reap is a destroy otherwise: it runs
     /// the box's `on_destroy` hooks and releases its address and name.
     ReapEnded(SessionId, Responder<ReapEnd>),
-    /// Registers the name row of the box `successor` after the reap of the
-    /// box that held it (NET-012, NET-128). A no-op when another box took
-    /// the row since, when the successor is gone or being removed, or when
-    /// a resume of a box with that name is in flight.
+    /// Releases the name row of a reaped box, if its teardown left it, and
+    /// registers the row for the next retained box with the name (NET-012,
+    /// NET-128). The successor is picked here, among the boxes not being
+    /// removed. A no-op for the successor when another box took the row
+    /// since, or when a resume of a box with that name is in flight.
     #[cfg(target_os = "linux")]
-    HandOverName(SessionId, Responder<()>),
+    HandOverName(NameHandOver, Responder<Option<SessionId>>),
     Shutdown(bool, Responder<Result<(), ()>>),
     /// Bring up the actor of every `Active` record whose box owns a name,
     /// so a restarted daemon routes the names of the sessions it restored
@@ -3707,7 +3665,7 @@ impl BoxManager {
             }
             // Deletes a session: see `delete_box`.
             ManagerMessage::DeleteSession(id, only_if_unfinalized, r) => {
-                self.delete_box(id, only_if_unfinalized, r).await;
+                self.destroy_box(id, only_if_unfinalized, r).await;
             }
             // Reaps a stopped or exited box (BOX-019): the state check and
             // the delete's claim run in this one message, so no resume
@@ -3718,9 +3676,10 @@ impl BoxManager {
                 Err(e) => r.handle(async { Err(e) }).await,
             },
             #[cfg(target_os = "linux")]
-            ManagerMessage::HandOverName(successor, r) => {
-                self.hand_over_name(successor).await;
-                r.handle(async { Ok::<_, BoxManagerError>(()) }).await;
+            ManagerMessage::HandOverName(hand_over, r) => {
+                let successor = self.hand_over_reaped_name(hand_over).await;
+                r.handle(async move { Ok::<_, BoxManagerError>(successor) })
+                    .await;
             }
             ManagerMessage::Shutdown(force, r) => {
                 r.handle(async {
@@ -4117,6 +4076,53 @@ impl BoxManager {
     }
 }
 
+/// The name row a reap hands over: the reaped box and the name it held.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) struct NameHandOver {
+    /// The manager key of the reaped box.
+    reaped: SessionId,
+    /// The reaped box's `box_id`, for the daemon log.
+    reaped_box: SessionId,
+    /// The name whose row the reaped box held before its teardown.
+    name: String,
+}
+
+/// The retained box that takes the row of `name` after the reap of
+/// `reaped` (NET-012, NET-128), among `records`: the running holder, else
+/// the most recent creation, which is the greatest UUIDv7 id. This is the
+/// order of `boxes::resolve_on_host` and the store's `find_by_name`. Only a
+/// box with a network that owns a name is a holder.
+#[cfg(target_os = "linux")]
+fn name_successor(records: &[boxes::Record], reaped: SessionId, name: &str) -> Option<SessionId> {
+    use boxes::core::record::RecordState;
+    let holders = || {
+        records.iter().filter(|record| {
+            record.id != reaped
+                && matches!(
+                    record.network,
+                    boxes::NetworkMode::HostNet | boxes::NetworkMode::OwnIp
+                )
+                && crate::box_actor::registry_name(record).eq_ignore_ascii_case(name)
+        })
+    };
+    let running = holders()
+        .filter(|record| matches!(record.state(), Ok(RecordState::Running)))
+        .map(|record| record.id)
+        .min();
+    running.or_else(|| {
+        holders()
+            .filter(|record| {
+                matches!(
+                    record.state(),
+                    Ok(RecordState::Stopped(_) | RecordState::Exited(_))
+                )
+            })
+            .map(|record| record.id)
+            .max()
+    })
+}
+
 /// What a reap that went on answers: the hook failures of the destroy,
 /// and the name whose row the box held before the destroy.
 #[derive(Debug)]
@@ -4163,6 +4169,91 @@ impl BoxManager {
         }
     }
 
+    /// The destroy that [`ManagerMessage::DeleteSession`] asks for: as
+    /// [`Self::delete_box`], and then, when the destroyed box held its
+    /// name's row, the row goes to the next retained box with that name, as
+    /// a reap hands it over (BOX-019, NET-012). The destroy answers after
+    /// both. The `destroy` span records the box that took the row as
+    /// `successor`, or `none`.
+    async fn destroy_box(
+        &mut self,
+        id: SessionId,
+        only_if_unfinalized: bool,
+        r: Responder<Option<Vec<String>>>,
+    ) {
+        let span = tracing::info_span!(
+            "destroy",
+            session_id = %id,
+            successor = tracing::field::Empty,
+        );
+        #[cfg(target_os = "linux")]
+        let held = self.held_name_of_box(id).await;
+        #[cfg(not(target_os = "linux"))]
+        let held: Option<(SessionId, String)> = None;
+        let Some((destroyed_box, name)) = held else {
+            span.record("successor", tracing::field::display("none"));
+            tracing::Instrument::instrument(self.delete_box(id, only_if_unfinalized, r), span)
+                .await;
+            return;
+        };
+        let (send, recv) = Responder::channel();
+        tracing::Instrument::instrument(
+            self.delete_box(id, only_if_unfinalized, send),
+            span.clone(),
+        )
+        .await;
+        let manager = self.weak_self.clone();
+        // Not on `teardowns`: the handover is a message to this manager, and
+        // a shutdown that waits on `teardowns` reads no message meanwhile.
+        crate::traced::spawn(tracing::Instrument::instrument(
+            async move {
+                let answer = recv.await.unwrap_or_else(|_| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        minimald_rpc::SHUTDOWN_REFUSAL,
+                    ))
+                });
+                // Only a destroyed box gives up its row: `Ok(None)` is a box
+                // that was kept, and an error left the box as it is.
+                let destroyed = matches!(answer, Ok(Some(_)));
+                let successor = match manager.upgrade() {
+                    #[cfg(target_os = "linux")]
+                    Some(manager) if destroyed => {
+                        manager.hand_over_name(id, destroyed_box, &name).await
+                    }
+                    _ => None,
+                };
+                let shown = successor.map_or_else(|| "none".to_string(), |s| s.to_string());
+                tracing::Span::current().record("successor", tracing::field::display(&shown));
+                if destroyed {
+                    tracing::info!(
+                        box_id = %destroyed_box,
+                        session_name = &name,
+                        successor = %shown,
+                        "destroy: the destroyed box held the name's row; \
+                         the successor holds it now (none: no box does)"
+                    );
+                }
+                r.handle(async { answer }).await;
+            },
+            span,
+        ));
+    }
+
+    /// The `box_id` and name of box `id`, when the box holds that name's
+    /// row in the hostname registry.
+    #[cfg(target_os = "linux")]
+    async fn held_name_of_box(&self, id: SessionId) -> Option<(SessionId, String)> {
+        let handle = self.store.find(RecordPredicate::Id(id)).await.ok()??;
+        let record = handle.record().await.ok()?;
+        let name = crate::box_actor::registry_name(&record);
+        self.hostnames
+            .read()
+            .expect("hostname registry lock poisoned")
+            .name_held_by(id, &name)
+            .then(|| (record.box_id.unwrap_or(id), name))
+    }
+
     /// The name of box `id`, when the box holds that name's row in the
     /// hostname registry.
     #[cfg(target_os = "linux")]
@@ -4177,13 +4268,81 @@ impl BoxManager {
             .then_some(name)
     }
 
+    /// The manager half of a reap's name handover. The reaped box's row
+    /// goes first: its teardown withdraws it, and a teardown that ran
+    /// without an actor leaves it, so it is withdrawn here. Then the
+    /// successor is picked among the retained boxes that are not being
+    /// removed, and takes the row. Both steps run in one message, so no
+    /// other message of the manager lands between them. Answers with the
+    /// box that took the row, or `None` when no box did.
+    #[cfg(target_os = "linux")]
+    async fn hand_over_reaped_name(&mut self, hand_over: NameHandOver) -> Option<SessionId> {
+        let NameHandOver {
+            reaped,
+            reaped_box,
+            name,
+        } = hand_over;
+        {
+            let mut registry = self
+                .hostnames
+                .write()
+                .expect("hostname registry lock poisoned");
+            let left = registry.name_held_by(reaped, &name);
+            if left {
+                registry.withdraw_own_name(reaped, &name);
+            }
+            tracing::info!(
+                box_id = %reaped_box,
+                session_id = %reaped,
+                session_name = &name,
+                withdrawn_here = left,
+                action = "name-released",
+                "reap: the removed box no longer holds the name"
+            );
+        }
+        let tearing_down = self
+            .tearing_down
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut records = Vec::new();
+        let read: Result<(), BoxManagerError> = async {
+            for handle in self.store.handles().await? {
+                if !tearing_down.contains(handle.id()) {
+                    records.push(handle.record().await?);
+                }
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = read {
+            tracing::warn!(
+                box_id = %reaped_box,
+                session_name = &name,
+                %error,
+                "reap: the records cannot be read; the name is not handed over"
+            );
+            return None;
+        }
+        let Some(successor) = name_successor(&records, reaped, &name) else {
+            tracing::info!(
+                box_id = %reaped_box,
+                session_name = &name,
+                "reap: no retained box has the name; it answers nothing"
+            );
+            return None;
+        };
+        self.hand_over_name(successor).await.then_some(successor)
+    }
+
     /// Registers the name row of the retained box `successor`, after a
     /// reap removed the box that held it (NET-012). A box with a live actor
     /// is registered here, and a stopped or exited one is marked stopped
     /// (NET-128). A box with no actor gets one, and its bring-up registers
-    /// the name as a resume's bring-up does.
+    /// the name as a resume's bring-up does. Answers whether `successor`
+    /// holds the row afterwards.
     #[cfg(target_os = "linux")]
-    async fn hand_over_name(&mut self, successor: SessionId) {
+    async fn hand_over_name(&mut self, successor: SessionId) -> bool {
         use boxes::core::record::RecordState;
         let removing = self
             .tearing_down
@@ -4195,18 +4354,18 @@ impl BoxManager {
                 session_id = %successor,
                 "reap: the next holder of the name is being removed; the name is not handed over"
             );
-            return;
+            return false;
         }
         let handle = match self.store.find(RecordPredicate::Id(successor)).await {
             Ok(Some(handle)) => handle,
-            Ok(None) => return,
+            Ok(None) => return false,
             Err(error) => {
                 tracing::warn!(
                     session_id = %successor,
                     %error,
                     "reap: the next holder of the name cannot be found; the name is not handed over"
                 );
-                return;
+                return false;
             }
         };
         let record = match handle.record().await {
@@ -4218,7 +4377,7 @@ impl BoxManager {
                     "reap: the record of the next holder of the name cannot be read; \
                      the name is not handed over"
                 );
-                return;
+                return false;
             }
         };
         let name = crate::box_actor::registry_name(&record);
@@ -4232,7 +4391,7 @@ impl BoxManager {
                 session_name = &name,
                 "reap: a resume of a box with the name is in flight; it registers the name"
             );
-            return;
+            return false;
         }
         {
             let registry = self
@@ -4240,7 +4399,7 @@ impl BoxManager {
                 .read()
                 .expect("hostname registry lock poisoned");
             if registry.name_held_by(successor, &name) {
-                return;
+                return true;
             }
             if let Some(owner) = registry.hostname_held_by_another(successor, &name) {
                 tracing::info!(
@@ -4249,7 +4408,7 @@ impl BoxManager {
                     owner,
                     "reap: another box took the name since the reap; the name is not handed over"
                 );
-                return;
+                return false;
             }
         }
         let ended = matches!(
@@ -4282,7 +4441,7 @@ impl BoxManager {
                     "reap: the next holder of the name has no published address; \
                      the name is not handed over"
                 );
-                return;
+                return false;
             }
             if ended {
                 registry.mark_stopped(successor);
@@ -4299,17 +4458,19 @@ impl BoxManager {
                         "reap: the next holder of the name did not come up; \
                          the name is not handed over"
                     );
-                    return;
+                    return false;
                 }
             }
         }
         tracing::info!(
+            box_id = %record.box_id.unwrap_or(successor),
             session_id = %successor,
             session_name = &name,
             ended,
             action = "name-handed-over",
             "reap: the name now answers for the next box that holds it"
         );
+        true
     }
 }
 
