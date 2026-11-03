@@ -36,6 +36,13 @@ struct Cli {
     #[arg(long)]
     protocol_version: bool,
 
+    /// Admit the members of this group to the channel too (the installed
+    /// service of a Mac several users share), besides the service's own
+    /// uid and root. Every member can publish any box name on this host
+    /// (first publisher keeps it): a group of users who trust each other.
+    #[arg(long, value_name = "GROUP")]
+    admit_group: Option<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -161,7 +168,7 @@ fn main() -> Result<()> {
         }
         #[cfg(target_os = "macos")]
         Some(Command::ReserveLocalRange) => reserve_local_range(),
-        None => minvmd::cmd::answerer::run(cli.protocol_version),
+        None => minvmd::cmd::answerer::run(cli.protocol_version, cli.admit_group.as_deref()),
     }
 }
 

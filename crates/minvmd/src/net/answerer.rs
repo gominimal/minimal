@@ -1720,7 +1720,7 @@ const FOREIGN_PEER_HELLO_WAIT: Duration = Duration::from_secs(1);
 /// the profile), and another operator's daemons are turned away here. Its
 /// hello is drained unread, on a thread of its own, so a foreign peer that
 /// never writes cannot stall the gate's accept loop.
-fn refuse_foreign_peer(mut stream: UnixStream, peer_uid: u32, service_uid: u32) {
+fn refuse_foreign_peer(mut stream: UnixStream, peer_uid: u32, admission: Admission) {
     // The refusals in flight are capped: past the cap a foreign peer is
     // closed bare, and no peer can grow this service's threads or fds
     // by connecting, however connectable the socket's mode left it.
@@ -1734,10 +1734,7 @@ fn refuse_foreign_peer(mut stream: UnixStream, peer_uid: u32, service_uid: u32) 
             let _in_flight = RefusalSlot;
             let _ = stream.set_read_timeout(Some(FOREIGN_PEER_HELLO_WAIT));
             let _ = read_reply_line(&mut stream);
-            let reply = RegistrationReply::refused(format!(
-                "the host answerer service serves uid {service_uid}; this operator \
-                 (uid {peer_uid}) is refused: multi-operator hosts are not supported"
-            ));
+            let reply = RegistrationReply::refused(admission.refusal(peer_uid));
             if let Err(error) = write_reply(&mut stream, &reply) {
                 tracing::debug!(component = COMPONENT, %error, "foreign peer refusal failed");
             }
@@ -1904,11 +1901,214 @@ fn reserved_names(own: Option<&Arc<BoxRegistry>>) -> Vec<String> {
 /// so only the same user may connect, the same trust the control socket
 /// rests on, with the uid gate ([`peer_uid`]) as the wire's own check of
 /// it.
+/// Who the channel admits: the uid this answerer serves (every peer of an
+/// operator's own daemon), and, for an installed service that one machine's
+/// users share, the members of one group as well (the package's `_minimal`
+/// group on macOS: spec 18's open question on several users of one host).
+/// A peer is judged on what it is, before any byte of it is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Admission {
+    /// The uid this answerer serves.
+    uid: u32,
+    /// A group whose members are admitted too.
+    group: Option<AdmittedGroup>,
+}
+
+/// The group a shared service admits: its name, the unit's word, for the
+/// refusal a user reads; its gid, what the account database is asked.
+/// The name lives as long as the service: the unit's argument, read once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmittedGroup {
+    /// The group's name, as the unit passes it.
+    pub name: &'static str,
+    /// Its gid on this host.
+    pub gid: u32,
+}
+
+impl Admission {
+    /// The one-uid admission: the operator's own daemon's.
+    pub(crate) fn uid(uid: u32) -> Self {
+        Self { uid, group: None }
+    }
+
+    /// The service's admission: its own uid and a group's members.
+    pub(crate) fn uid_and_group(uid: u32, group: AdmittedGroup) -> Self {
+        Self {
+            uid,
+            group: Some(group),
+        }
+    }
+
+    /// Whether `peer_uid` may publish here. The shared service (the one
+    /// with a group) admits root too: root can add itself to the group
+    /// anyway, and a `sudo min` refused at the channel would only confuse.
+    fn admits(self, peer_uid: u32) -> bool {
+        peer_uid == self.uid
+            || self
+                .group
+                .is_some_and(|group| peer_uid == 0 || uid_in_group(peer_uid, group.gid))
+    }
+
+    /// The refusal a peer outside the admission reads. The shared
+    /// service's names the peer's account and the one command that admits
+    /// it, so the line a refused user sees is the way in.
+    fn refusal(self, peer_uid: u32) -> String {
+        match self.group {
+            None => format!(
+                "the host answerer service serves uid {}; this operator (uid {peer_uid}) is \
+                 refused: multi-operator hosts are not supported",
+                self.uid
+            ),
+            Some(group) => {
+                let user = account_of(peer_uid)
+                    .map(|(name, _)| name)
+                    .unwrap_or_else(|| format!("uid {peer_uid}"));
+                format!(
+                    "the host answerer service serves uid {}, root and the members of group \
+                     {name} (gid {gid}); this operator ({user}, uid {peer_uid}) is refused: \
+                     an administrator adds them with: sudo dseditgroup -o edit -a {user} -t \
+                     user {name}",
+                    self.uid,
+                    name = group.name,
+                    gid = group.gid,
+                )
+            }
+        }
+    }
+}
+
+/// Whether `uid` is a member of the group `gid`, by the account database
+/// (`getgrouplist`): the primary group and every supplementary one. A uid
+/// with no account is in no group.
+/// Whether the account of `uid` is in the group `gid`: its primary group,
+/// or any membership the directory resolves for it (`getgrouplist`). The
+/// one definition of membership: the channel's admission, and what the
+/// CLI's `--show` tells a user about it.
+pub fn uid_in_group(uid: u32, gid: u32) -> bool {
+    let Some((name, primary)) = account_of(uid) else {
+        return false;
+    };
+    if primary == gid {
+        return true;
+    }
+    let Ok(name) = std::ffi::CString::new(name) else {
+        return false;
+    };
+    // getgrouplist's group type is `int` on macOS and `gid_t` on Linux.
+    #[cfg(target_os = "macos")]
+    type Group = libc::c_int;
+    #[cfg(not(target_os = "macos"))]
+    type Group = libc::gid_t;
+    #[cfg(target_os = "macos")]
+    fn is_gid(g: Group, gid: u32) -> bool {
+        u32::try_from(g).is_ok_and(|g| g == gid)
+    }
+    #[cfg(not(target_os = "macos"))]
+    fn is_gid(g: Group, gid: u32) -> bool {
+        g == gid
+    }
+    // On truncation macOS reports the count stored, Linux the count
+    // needed; either way a failed call is retried with a larger buffer,
+    // up to a bound no real account reaches.
+    let mut groups = vec![0 as Group; 64];
+    loop {
+        let mut count = groups.len() as libc::c_int;
+        // SAFETY: `name` is a valid C string, `groups` has `count` elements
+        // and both pointers outlive the call; the result is read back
+        // within the elements the call reports filled.
+        let rc = unsafe {
+            libc::getgrouplist(
+                name.as_ptr(),
+                primary as Group,
+                groups.as_mut_ptr(),
+                &mut count,
+            )
+        };
+        let count = usize::try_from(count).unwrap_or(0);
+        if rc >= 0 {
+            return groups.iter().take(count).any(|g| is_gid(*g, gid));
+        }
+        if groups.len() >= 4096 {
+            return false;
+        }
+        let wanted = count.max(groups.len() * 2);
+        groups.resize(wanted, 0 as Group);
+    }
+}
+
+/// The first buffer the `*_r` account lookups get, and the largest: a
+/// record that does not fit (`ERANGE`: a group's member list, which can
+/// run to thousands of names on a directory-bound host) is retried with
+/// twice the room, up to the bound.
+const LOOKUP_BUF_FIRST: usize = 4096;
+const LOOKUP_BUF_MAX: usize = 1 << 20;
+
+/// The account name and primary gid of `uid`, if it has an account.
+fn account_of(uid: u32) -> Option<(String, u32)> {
+    // SAFETY: passwd is a plain C struct of integers and pointers, for
+    // which all-zero bytes are a valid value; the call below fills it.
+    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0u8; LOOKUP_BUF_FIRST];
+    loop {
+        let mut out: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: every pointer names storage that outlives the call, and
+        // `out` is read only when the call reports a result in it.
+        let rc =
+            unsafe { libc::getpwuid_r(uid, &mut pw, buf.as_mut_ptr().cast(), buf.len(), &mut out) };
+        if rc == libc::ERANGE && buf.len() < LOOKUP_BUF_MAX {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        if rc != 0 || out.is_null() {
+            return None;
+        }
+        // SAFETY: a found entry's pw_name is a valid C string within `buf`.
+        let name = unsafe { std::ffi::CStr::from_ptr(pw.pw_name) }
+            .to_string_lossy()
+            .into_owned();
+        return Some((name, pw.pw_gid));
+    }
+}
+
+/// The gid of the group named `name`: `Ok(None)` when there is no such
+/// group, `Err` when the lookup itself failed (so a service does not call
+/// a group it could not read "no such group").
+pub fn group_id(name: &str) -> io::Result<Option<u32>> {
+    let Ok(cname) = std::ffi::CString::new(name) else {
+        return Ok(None);
+    };
+    // SAFETY: group is a plain C struct of integers and pointers, for
+    // which all-zero bytes are a valid value; the call below fills it.
+    let mut gr: libc::group = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0u8; LOOKUP_BUF_FIRST];
+    loop {
+        let mut out: *mut libc::group = std::ptr::null_mut();
+        // SAFETY: as in `account_of`.
+        let rc = unsafe {
+            libc::getgrnam_r(
+                cname.as_ptr(),
+                &mut gr,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &mut out,
+            )
+        };
+        if rc == libc::ERANGE && buf.len() < LOOKUP_BUF_MAX {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc));
+        }
+        return Ok((!out.is_null()).then_some(gr.gr_gid));
+    }
+}
+
 fn hold_channel(
     sock: &Path,
     registered: Arc<RegisteredTables>,
     own: Option<Arc<BoxRegistry>>,
-    expected_uid: u32,
+    admission: Admission,
 ) -> io::Result<Arc<AtomicBool>> {
     crate::sock::check_uds_path_len(sock)?;
     prepare_interim_dir(sock)?;
@@ -1922,14 +2122,7 @@ fn hold_channel(
     std::thread::Builder::new()
         .name("minvmd-zone-channel".to_string())
         .spawn(move || {
-            serve_channel(
-                listener,
-                registered,
-                expected_uid,
-                own,
-                DAEMON_HOLDER,
-                serving,
-            );
+            serve_channel(listener, registered, admission, own, DAEMON_HOLDER, serving);
         })
         .map(|_| stop)
 }
@@ -1946,7 +2139,7 @@ fn hold_channel(
 fn serve_channel(
     listener: UnixListener,
     registered: Arc<RegisteredTables>,
-    expected_uid: u32,
+    admission: Admission,
     own: Option<Arc<BoxRegistry>>,
     holder: &'static str,
     stop: Arc<AtomicBool>,
@@ -1995,7 +2188,7 @@ fn serve_channel(
                 // much as a storm of them — the one a misconfigured
                 // unit's service user answers at a glance.
                 match peer_uid(&stream) {
-                    Ok(uid) if uid == expected_uid => {
+                    Ok(uid) if admission.admits(uid) => {
                         let connection = next;
                         next += 1;
                         let registered = Arc::clone(&registered);
@@ -2005,7 +2198,7 @@ fn serve_channel(
                             .name("minvmd-zone-publish".to_string())
                             .spawn(move || {
                                 serve_registration(
-                                    connection, stream, registered, own, holder, stop,
+                                    connection, uid, stream, registered, own, holder, stop,
                                 )
                             });
                         if let Err(error) = spawned {
@@ -2030,13 +2223,15 @@ fn serve_channel(
                             tracing::warn!(
                                 component = COMPONENT,
                                 peer_uid = uid,
-                                service_uid = expected_uid,
+                                service_uid = admission.uid,
+                                admitted_group = admission.group.map(|group| group.name),
                                 "refused an answerer channel connection from a foreign uid; \
-                                 only the uid this answerer serves may publish rows"
+                                 the uid this answerer serves, and the members of the \
+                                 admitted group when it has one, may publish rows"
                             );
                             foreign_warns.push_back(now);
                         }
-                        refuse_foreign_peer(stream, uid, expected_uid);
+                        refuse_foreign_peer(stream, uid, admission);
                     }
                     Err(error) => {
                         // A dropped connect loses that node's publishes
@@ -2065,6 +2260,13 @@ fn serve_channel(
     }
 }
 
+/// The node id the tables key on: the hello's node id and the peer's uid,
+/// as one string, so every rule that compares node ids compares users
+/// too, and a refusal that names the holder names both.
+fn qualified_node(node: &str, uid: u32) -> String {
+    format!("{node}, uid {uid}")
+}
+
 /// Serves one node's connection: the hello first — bounded, because a
 /// connection that never speaks is a stray connect, not a node — then the
 /// publishes, each replacing the connection's rows, until the connection
@@ -2074,6 +2276,7 @@ fn serve_channel(
 /// the one event that retires its rows — is the read's own EOF.
 fn serve_registration(
     connection: u64,
+    uid: u32,
     mut stream: UnixStream,
     registered: Arc<RegisteredTables>,
     own: Option<Arc<BoxRegistry>>,
@@ -2133,6 +2336,13 @@ fn serve_registration(
             return;
         }
     };
+    // A node id is the hello's own word. What makes it one user's is the
+    // peer's uid, read from the kernel, so the node the tables know is the
+    // pair: another user speaking the same words is another node, which
+    // cannot replace or release this user's rows, and a name clash between
+    // them is the ordinary first-publisher clash with the holder named.
+    // Nothing is remembered across a restart, because nothing needs to be.
+    let node = qualified_node(&node, uid);
     if let Err(error) = write_reply(&mut stream, &RegistrationReply::hello(holder)) {
         tracing::debug!(component = COMPONENT, %error, "channel hello reply failed");
         return;
@@ -3987,7 +4197,7 @@ fn host_interim(
             Arc::clone(&registered),
             Some(Arc::new(registry.clone())),
             // SAFETY: geteuid only reads the process's own uid.
-            unsafe { libc::geteuid() },
+            Admission::uid(unsafe { libc::geteuid() }),
         ) {
             Ok(stop) => Some(stop),
             Err(error) => {
@@ -4215,7 +4425,7 @@ fn serve_with_stop(socket: UdpSocket, answerer: HostAnswerer, stop: Option<Arc<A
 pub(crate) fn serve_service(
     listener: UdpSocket,
     channel: UnixListener,
-    expected_uid: u32,
+    admission: Admission,
     stop: Arc<AtomicBool>,
 ) {
     let registered = Arc::new(RegisteredTables::new());
@@ -4230,14 +4440,7 @@ pub(crate) fn serve_service(
         .name("minvmd-zone-answers".to_string())
         .spawn(move || serve_with_stop(listener, answerer, Some(answer_stop)))
         .expect("the answerer's answers thread should spawn");
-    serve_channel(
-        channel,
-        registered,
-        expected_uid,
-        None,
-        SERVICE_HOLDER,
-        stop,
-    );
+    serve_channel(channel, registered, admission, None, SERVICE_HOLDER, stop);
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -4256,6 +4459,144 @@ mod tests {
     /// The answerer's own row is the sessions zone's host row, byte for byte:
     /// the CLI's liveness query reads [`HOST_NAME`], so a spelling that drifts
     /// from the zone fails here rather than as a dead liveness probe.
+    /// A node is the hello's node id and the peer's uid together: another
+    /// user speaking the same id is another node, so its publish neither
+    /// replaces the first user's row (the name is refused it, the holder
+    /// named with its uid) nor releases it (the first user's rows stay
+    /// when the other's connection goes). The same user's second
+    /// connection replaces its own row as ever.
+    #[test]
+    fn another_uid_speaking_a_node_id_is_another_node() {
+        let tables = Arc::new(RegisteredTables::new());
+        let alice = qualified_node("vm-a", 501);
+        let bob = qualified_node("vm-a", 502);
+        let a = Ipv4Addr::new(127, 0, 64, 10);
+        let b = Ipv4Addr::new(127, 0, 64, 11);
+        let first = tables.install_validated(1, &alice, vec![published_row("web", a)], &[]);
+        assert!(first.refused.is_empty(), "{:?}", first.refused);
+        let second = tables.install_validated(2, &bob, vec![published_row("web", b)], &[]);
+        let [refused] = &second.refused[..] else {
+            panic!("the held name is refused once: {:?}", second.refused);
+        };
+        assert!(
+            refused.reason.contains("another node (vm-a, uid 501)"),
+            "{}",
+            refused.reason
+        );
+        assert!(tables.remove(2).is_some());
+        let still: Vec<_> = tables
+            .rows
+            .lock()
+            .unwrap()
+            .values()
+            .flat_map(|held| held.rows.iter().map(|row| row.address))
+            .collect();
+        assert_eq!(still, vec![Some(a)], "the first user's row holds");
+        let again = tables.install_validated(3, &alice, vec![published_row("web", b)], &[]);
+        assert!(
+            again.refused.is_empty(),
+            "the same user replaces its own row: {:?}",
+            again.refused
+        );
+    }
+
+    /// The admission: the service's own uid always; a group's members when
+    /// the unit names one, by the account database; nobody else.
+    #[test]
+    fn admission_is_the_own_uid_or_a_groups_members() {
+        // SAFETY: geteuid and getgroups only read the process's own ids.
+        let own = unsafe { libc::geteuid() };
+        let mut groups = vec![0 as libc::gid_t; 128];
+        // SAFETY: `groups` has the number of elements passed and outlives
+        // the call; only the elements the call reports filled are read.
+        let n = unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
+        let n = usize::try_from(n).expect("the test process is in some group");
+        assert!(n > 0, "the test process is in some group");
+        let groups = &groups[..n];
+        let (_, primary) = account_of(own).expect("the test process has an account");
+        let no_such_group = (0..u32::MAX)
+            .rev()
+            .find(|g| !groups.contains(&(*g as libc::gid_t)))
+            .expect("a gid the process is not in");
+
+        let alone = Admission::uid(own ^ 1);
+        assert!(!alone.admits(own), "a foreign uid with no group is refused");
+        assert!(
+            alone
+                .refusal(own)
+                .contains("multi-operator hosts are not supported")
+        );
+
+        let by_primary = Admission::uid_and_group(
+            own ^ 1,
+            AdmittedGroup {
+                name: "primary",
+                gid: primary,
+            },
+        );
+        assert!(
+            by_primary.admits(own),
+            "a member by primary group is admitted"
+        );
+        assert!(
+            by_primary.admits(own ^ 1),
+            "the service's own uid always is"
+        );
+        // A supplementary group is what getgrouplist answers for, past the
+        // primary-group short cut; the test process has one on every host
+        // the suite runs on (staff/everyone on macOS, the login groups on
+        // Linux), and without one that half is reported, not assumed.
+        match groups.iter().find(|g| **g != primary) {
+            Some(supplementary) => {
+                let by_list = Admission::uid_and_group(
+                    own ^ 1,
+                    AdmittedGroup {
+                        name: "supplementary",
+                        gid: *supplementary,
+                    },
+                );
+                assert!(
+                    by_list.admits(own),
+                    "a member by a supplementary group (gid {supplementary}) is admitted"
+                );
+            }
+            None => {
+                eprintln!("the test process has only its primary group; getgrouplist unexercised")
+            }
+        }
+
+        let other_group = Admission::uid_and_group(
+            own ^ 1,
+            AdmittedGroup {
+                name: "nosuch",
+                gid: no_such_group,
+            },
+        );
+        assert!(!other_group.admits(own), "a non-member is refused");
+        assert!(
+            other_group.admits(0) && !alone.admits(0),
+            "root is admitted to the shared service, not to a user's own"
+        );
+        let reason = other_group.refusal(own);
+        assert!(
+            reason.contains(&format!("group nosuch (gid {no_such_group})"))
+                && reason.contains("dseditgroup -o edit -a ")
+                && reason.contains(" -t user nosuch")
+                && !reason.contains("USER")
+                && !reason.contains("GROUP"),
+            "the refusal names the group, the user and the way in: {reason}"
+        );
+        assert!(
+            !uid_in_group(u32::MAX - 7, primary),
+            "a uid with no account is in no group"
+        );
+        assert_eq!(
+            group_id("no-such-group-for-minimal").expect("a lookup that ran"),
+            None,
+            "a missing group is None, not an error"
+        );
+    }
+
     #[test]
     fn host_name_is_the_zone_host_row() {
         assert_eq!(HOST_NAME, "host.min.internal");
@@ -4526,7 +4867,12 @@ mod tests {
             .spawn(move || {
                 // SAFETY: geteuid only reads the process's own uid.
                 let expected_uid = unsafe { libc::geteuid() };
-                serve_service(listener, channel, expected_uid, service_stop);
+                serve_service(
+                    listener,
+                    channel,
+                    Admission::uid(expected_uid),
+                    service_stop,
+                );
             })
             .expect("the service's thread spawns");
         (stop, handle)
@@ -5319,7 +5665,7 @@ mod tests {
             Arc::clone(&tables),
             None,
             // SAFETY: geteuid only reads the process's own uid.
-            unsafe { libc::geteuid() },
+            Admission::uid(unsafe { libc::geteuid() }),
         )
         .expect("the holder's channel binds beside the port");
         assert_eq!(
@@ -5494,7 +5840,7 @@ mod tests {
             Arc::new(RegisteredTables::new()),
             None,
             // SAFETY: geteuid only reads the process's own uid.
-            unsafe { libc::geteuid() },
+            Admission::uid(unsafe { libc::geteuid() }),
         )
         .expect("the holder's channel binds beside the foreign hold");
         // A table change wakes the loop now, at its ping, rather than at the
@@ -5734,7 +6080,7 @@ mod tests {
                 serve_channel(
                     listener,
                     registered,
-                    expected_uid,
+                    Admission::uid(expected_uid),
                     None,
                     SERVICE_HOLDER,
                     gate,
@@ -5840,7 +6186,7 @@ mod tests {
                 serve_channel(
                     listener,
                     registered,
-                    expected_uid,
+                    Admission::uid(expected_uid),
                     None,
                     SERVICE_HOLDER,
                     gate,
@@ -5925,7 +6271,7 @@ mod tests {
                 serve_channel(
                     listener,
                     Arc::new(RegisteredTables::new()),
-                    expected_uid,
+                    Admission::uid(expected_uid),
                     None,
                     SERVICE_HOLDER,
                     gate,
@@ -5969,7 +6315,7 @@ mod tests {
         // a thread or a reply, and the count is left as it was.
         FOREIGN_REFUSALS_IN_FLIGHT.store(FOREIGN_REFUSALS_MAX, Ordering::SeqCst);
         let (served, mut peer) = UnixStream::pair().expect("a socket pair");
-        refuse_foreign_peer(served, 1001, 1000);
+        refuse_foreign_peer(served, 1001, Admission::uid(1000));
         assert_eq!(
             FOREIGN_REFUSALS_IN_FLIGHT.load(Ordering::SeqCst),
             FOREIGN_REFUSALS_MAX,
@@ -6138,7 +6484,7 @@ mod tests {
             "the refused row is the held name"
         );
         assert!(
-            refused.reason.contains("another node (vm-a)")
+            refused.reason.contains("another node (vm-a, uid ")
                 && refused.reason.contains("first publisher"),
             "the refusal names the node that keeps the name: {}",
             refused.reason

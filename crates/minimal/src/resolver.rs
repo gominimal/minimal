@@ -1182,6 +1182,65 @@ pub(crate) struct AnswererFacts {
     /// The channel protocol version the installed copy answered the
     /// probe with, when it exists, runs, and answers a number.
     pub installed_version: Option<u32>,
+    /// The group of the installed channel socket's node, read with
+    /// [`AnswererFacts::channel_mode`]: what a shared service's socket is
+    /// bound to.
+    pub channel_group: Option<u32>,
+    /// The shared service the unit describes, when it admits a group
+    /// (`minzoned --admit-group`: the macOS package's service, one for
+    /// every user of the Mac). Its socket is the group's, not owner-only,
+    /// and the service's own account owns it, not the operator.
+    pub shared: Option<SharedService>,
+}
+
+/// A unit that runs the answerer for a group of users rather than one
+/// operator: the package's `minzoned --admit-group GROUP` as the role
+/// account `_minimal`. The checks then expect the socket to be the
+/// group's (mode `0660`) and the account's, and the step is never
+/// offered to replace it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct SharedService {
+    /// The group's name, as the unit passes it.
+    pub group_name: String,
+    /// Its gid on this host; `None` when no such group exists.
+    pub group: Option<u32>,
+    /// The uid of the account the unit runs the service as; `None` when
+    /// the unit names none, or the name resolves to no account.
+    pub account_uid: Option<u32>,
+}
+
+/// The group the unit tells the answerer to admit: the word after
+/// `--admit-group` in the unit's program arguments — the next `<string>`
+/// of a plist, the next word of a service unit's `ExecStart=`. `None`
+/// when the unit passes none. Pure over the file's bytes.
+pub(crate) fn unit_admit_group(text: &str) -> Option<&str> {
+    let (_, rest) = text.split_once("--admit-group")?;
+    // The flag's `--admit-group=GROUP` spelling, which the service takes
+    // too, names the group in the same word.
+    if let Some(attached) = rest.strip_prefix('=') {
+        return attached
+            .split(|c: char| c.is_whitespace() || c == '<')
+            .next()
+            .filter(|group| !group.is_empty());
+    }
+    if let Some(after) = rest.strip_prefix("</string>") {
+        let (_, from_open) = after.split_once("<string>")?;
+        let (group, _) = from_open.split_once("</string>")?;
+        return Some(group.trim()).filter(|group| !group.is_empty());
+    }
+    rest.split_whitespace().next()
+}
+
+/// The account the unit runs the service as, by platform: the plist's
+/// `UserName`, the service unit's `User=`.
+#[cfg(target_os = "macos")]
+fn unit_user_name(text: &str) -> Option<&str> {
+    plist_user_name(text)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn unit_user_name(text: &str) -> Option<&str> {
+    service_user(text)
 }
 
 /// The program path a systemd service unit's `ExecStart=` names: the
@@ -1279,29 +1338,86 @@ pub(crate) fn answerer_step_over(facts: &AnswererFacts, daemon: u32) -> Answerer
             Some(_) => {}
         }
     }
-    // The channel socket's mode, only when the service is installed
-    // enough to have one: an absent node carries no facts and no check,
-    // but one the unit did not bind owner-only — an install that
-    // predates the mode, or a hand that relaxed it — is re-surfaced, so
-    // the step re-runs and re-binds it.
-    if let Some(mode) = facts.channel_mode
-        && mode & 0o177 != 0
-    {
-        checks.push(format!(
-            "its channel socket at {} is connectable by others, not owner-only",
-            minvmd::net::answerer::resolve_channel_sock().display()
-        ));
-    }
-    // The channel socket's owner, on the same terms: a node another
-    // account owns (an install that predates the owner, or a hand that
-    // changed it) is re-surfaced, and an absent node carries no check.
-    if let Some(owner) = facts.channel_owner
-        && Some(owner) != facts.operator_uid
-    {
-        checks.push(format!(
-            "its channel socket at {} is owned by uid {owner}, not the operator's",
-            minvmd::net::answerer::resolve_channel_sock().display()
-        ));
+    let channel = minvmd::net::answerer::resolve_channel_sock();
+    match &facts.shared {
+        None => {
+            // The channel socket's mode, only when the service is installed
+            // enough to have one: an absent node carries no facts and no
+            // check, but one the unit did not bind owner-only — an install
+            // that predates the mode, or a hand that relaxed it — is
+            // re-surfaced, so the step re-runs and re-binds it.
+            if let Some(mode) = facts.channel_mode
+                && mode & 0o177 != 0
+            {
+                checks.push(format!(
+                    "its channel socket at {} is connectable by others, not owner-only",
+                    channel.display()
+                ));
+            }
+            // The channel socket's owner, on the same terms: a node another
+            // account owns (an install that predates the owner, or a hand
+            // that changed it) is re-surfaced, and an absent node carries
+            // no check.
+            if let Some(owner) = facts.channel_owner
+                && Some(owner) != facts.operator_uid
+            {
+                checks.push(format!(
+                    "its channel socket at {} is owned by uid {owner}, not the operator's",
+                    channel.display()
+                ));
+            }
+        }
+        // A shared service's socket is its group's and its account's: the
+        // group may connect, nobody else, and the owner is the account the
+        // unit runs the service as, never the operator.
+        Some(shared) => {
+            let group = &shared.group_name;
+            match shared.group {
+                None => checks.push(format!(
+                    "its unit admits the group {group}, which is no group on this host"
+                )),
+                Some(gid) => {
+                    // The group connects by its write bit; nobody else by
+                    // any bit of theirs.
+                    if let Some(mode) = facts.channel_mode
+                        && mode & 0o117 != 0
+                    {
+                        checks.push(format!(
+                            "its channel socket at {} is connectable by others, not only \
+                             by the group {group}",
+                            channel.display()
+                        ));
+                    } else if let Some(mode) = facts.channel_mode
+                        && mode & 0o020 == 0
+                    {
+                        checks.push(format!(
+                            "its channel socket at {} is mode {mode:o}, which the group \
+                             {group} cannot connect to (the service's is 0660)",
+                            channel.display(),
+                            mode = mode & 0o777,
+                        ));
+                    }
+                    if let Some(socket_group) = facts.channel_group
+                        && socket_group != gid
+                    {
+                        checks.push(format!(
+                            "its channel socket at {} is group {socket_group}, not the group \
+                             {group} its unit admits",
+                            channel.display()
+                        ));
+                    }
+                }
+            }
+            if let Some(owner) = facts.channel_owner
+                && Some(owner) != shared.account_uid
+            {
+                checks.push(format!(
+                    "its channel socket at {} is owned by uid {owner}, not the service \
+                     account's",
+                    channel.display()
+                ));
+            }
+        }
     }
     match facts.unit_program.as_deref() {
         None => checks.push(format!(
@@ -1457,6 +1573,108 @@ fn refuse_foreign_operator(
         }
         _ => step,
     }
+}
+
+/// `step`, unless the operator is outside the group the shared service
+/// admits (and not root, which the service admits too): then the service
+/// is there but not theirs to publish to, the step is unavailable, and
+/// the reason names the command an administrator runs. An absent step
+/// stays absent.
+fn refuse_outside_the_group(
+    step: AnswererStep,
+    shared: &SharedService,
+    operator: &str,
+    operator_uid: Option<u32>,
+) -> AnswererStep {
+    if matches!(
+        step,
+        AnswererStep::SourceUnavailable { .. } | AnswererStep::Absent
+    ) || operator_uid == Some(0)
+    {
+        return step;
+    }
+    let Some(gid) = shared.group else {
+        return step;
+    };
+    if uid_in_group(operator_uid, gid) {
+        return step;
+    }
+    AnswererStep::SourceUnavailable {
+        service: Box::new(step),
+        reason: format!(
+            "the host's DNS service is installed for the members of the group {group}, and \
+             {operator} is not one; an administrator adds them with: {add}",
+            group = shared.group_name,
+            add = add_to_group_command(operator, &shared.group_name),
+        ),
+    }
+}
+
+/// `step`, unless it would carry the copy over a shared service: a
+/// custody check failed or the protocol differs, and the step's install
+/// would replace the service of everyone the group admits with one
+/// user's own. Then the step is unavailable, and the reason names what
+/// repairs the shared service instead: the package that installed it.
+/// An installed, absent or already-unavailable step stays as it is.
+fn refuse_replacing_the_shared(step: AnswererStep, shared: &SharedService) -> AnswererStep {
+    if matches!(
+        step,
+        AnswererStep::Installed | AnswererStep::Absent | AnswererStep::SourceUnavailable { .. }
+    ) {
+        return step;
+    }
+    // A custody check's wording already starts with "its …".
+    let what = match &step {
+        AnswererStep::ProtocolMismatch { installed, daemon } => match installed {
+            Some(installed) => {
+                format!("it speaks channel protocol {installed}, not this daemon's {daemon}")
+            }
+            None => format!(
+                "it did not answer the channel protocol probe (this daemon speaks {daemon})"
+            ),
+        },
+        AnswererStep::CustodyFailed { failed_check } => failed_check.clone(),
+        other => format!("it is {other:?}"),
+    };
+    AnswererStep::SourceUnavailable {
+        service: Box::new(step),
+        reason: format!(
+            "the host's DNS service is the one installed for the members of the group \
+             {group}, and {what}; this step would replace it with one user's own, so \
+             it is not offered. {SHARED_SERVICE_REMEDY}",
+            group = shared.group_name,
+        ),
+    }
+}
+
+/// What repairs or removes the shared service: the package that installed
+/// it, never `min finalize-install`.
+pub(crate) const SHARED_SERVICE_REMEDY: &str = "A newer minimal package upgrades it \
+    (sudo installer -pkg minimal-VERSION.pkg -target /), and its uninstaller removes it \
+    (sudo /usr/local/share/minimal/uninstall.sh)";
+
+/// Whether the account of `uid` is in the group `gid`, by the service's
+/// own definition ([`minvmd::net::answerer::uid_in_group`]), so `--show`
+/// and the service never disagree about who is admitted.
+fn uid_in_group(uid: Option<u32>, gid: u32) -> bool {
+    uid.is_some_and(|uid| minvmd::net::answerer::uid_in_group(uid, gid))
+}
+
+/// The command that adds `user` to `group` on this platform.
+fn add_to_group_command(user: &str, group: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("sudo dseditgroup -o edit -a {user} -t user {group}")
+    } else {
+        format!("sudo usermod -aG {group} {user}")
+    }
+}
+
+/// The gid of the group `name`; `None` when no such group exists.
+fn group_gid(name: &str) -> Option<u32> {
+    nix::unistd::Group::from_name(name)
+        .ok()
+        .flatten()
+        .map(|group| group.gid.as_raw())
 }
 
 /// Where the answerer program is on this machine, pure over where to look:
@@ -1927,6 +2145,21 @@ pub(crate) async fn read_answerer_step() -> AnswererStep {
     .await;
     let operator = operator_name();
     let operator_uid = account_uid(&operator);
+    let shared = unit_text
+        .as_deref()
+        .and_then(unit_admit_group)
+        .map(|group| SharedService {
+            group_name: group.to_string(),
+            group: group_gid(group),
+            account_uid: unit_text
+                .as_deref()
+                .and_then(unit_user_name)
+                .and_then(account_uid),
+        });
+    let channel_group = tokio::fs::metadata(&minvmd::net::answerer::resolve_channel_sock())
+        .await
+        .ok()
+        .map(|metadata| std::os::unix::fs::MetadataExt::gid(&metadata));
     let facts = AnswererFacts {
         components: path_component_custody(&paths).await,
         program: file_custody(ANSWERER_PROGRAM_PATH).await,
@@ -1939,21 +2172,36 @@ pub(crate) async fn read_answerer_step() -> AnswererStep {
         channel_owner: channel.map(|custody| custody.owner),
         operator_uid,
         installed_version: installed_protocol_version().await,
+        channel_group,
+        shared,
     };
     let step = answerer_step_over(&facts, minvmd::net::answerer::CHANNEL_PROTOCOL_VERSION);
-    // The unit owns the channel socket by the operator's uid, so an
-    // operator whose name resolves to no account leaves the step nothing
-    // to offer.
-    let step = require_operator_account(step, &operator, operator_uid);
     // A channel socket another operator's account owns is that operator's
     // service: no step is offered that would take it over.
-    let owner_is_account = facts.channel_owner.is_some_and(|owner| {
-        nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(owner))
-            .ok()
-            .flatten()
-            .is_some()
-    });
-    let step = refuse_foreign_operator(step, facts.channel_owner, operator_uid, owner_is_account);
+    // A shared service's socket is its account's by design, and the
+    // service is everyone's the group admits: the operator outside the
+    // group is told the way in, and no step replaces the service, for a
+    // member or root either; what it lacks, the package it came with
+    // repairs.
+    let step = match &facts.shared {
+        Some(shared) => {
+            let step = refuse_outside_the_group(step, shared, &operator, operator_uid);
+            refuse_replacing_the_shared(step, shared)
+        }
+        None => {
+            // The unit owns the channel socket by the operator's uid, so an
+            // operator whose name resolves to no account leaves the step
+            // nothing to offer.
+            let step = require_operator_account(step, &operator, operator_uid);
+            let owner_is_account = facts.channel_owner.is_some_and(|owner| {
+                nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(owner))
+                    .ok()
+                    .flatten()
+                    .is_some()
+            });
+            refuse_foreign_operator(step, facts.channel_owner, operator_uid, owner_is_account)
+        }
+    };
     if matches!(step, AnswererStep::SourceUnavailable { .. }) {
         return step;
     }
@@ -3954,7 +4202,13 @@ pub(crate) fn other_operator_refusal(
     operator_of: fn(&str) -> Option<&str>,
     me: &str,
 ) -> Option<String> {
-    let installed = operator_of(unit_text?)?;
+    let text = unit_text?;
+    // A unit that admits a group is a shared service, everyone's the
+    // group admits: nothing of another user's to replace.
+    if unit_admit_group(text).is_some() {
+        return None;
+    }
+    let installed = operator_of(text)?;
     (!installed.is_empty() && installed != me).then(|| {
         format!(
             "Minimal's DNS service on this machine is installed for the user {installed}; \
@@ -3963,6 +4217,32 @@ pub(crate) fn other_operator_refusal(
              finalize-install` sets it up for {me}"
         )
     })
+}
+
+/// Why `--undo` refuses on this host, when it does: the installed answerer
+/// unit is a shared service's (it admits a group), so the package that
+/// installed it is what removes it, with its account and receipt; the
+/// removal script would take the service from everyone the group admits
+/// and leave the rest of the package behind. `None` when no unit is
+/// installed or it is one operator's.
+pub(crate) fn shared_service_undo_refusal_on_this_host() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    let path = ANSWERER_PLIST_PATH;
+    #[cfg(not(target_os = "macos"))]
+    let path = ANSWERER_UNIT_SERVICE_PATH;
+    let text = std::fs::read_to_string(path).ok()?;
+    shared_service_undo_refusal(&text)
+}
+
+/// [`shared_service_undo_refusal_on_this_host`] over a unit's text. Pure.
+pub(crate) fn shared_service_undo_refusal(unit_text: &str) -> Option<String> {
+    let group = unit_admit_group(unit_text)?;
+    Some(format!(
+        "Minimal's DNS service on this machine is the one installed for the members of \
+         the group {group}, by the minimal package; `--undo` would remove it for all of \
+         them and leave the rest of the package, so nothing was run. \
+         {SHARED_SERVICE_REMEDY}"
+    ))
 }
 
 /// [`other_operator_refusal`] over this host's installed answerer unit and
@@ -7193,6 +7473,45 @@ exit 0
                 None
             );
             assert_eq!(other_operator_refusal(None, operator_of, "bob"), None);
+            // A shared service's unit (it admits a group) is nobody's to
+            // replace: no refusal, whoever asks.
+            let shared = format!(
+                "{text}\n<key>ProgramArguments</key><array><string>/x/minzoned</string>\
+                 <string>--admit-group</string><string>_minimal</string></array>"
+            );
+            assert_eq!(
+                other_operator_refusal(Some(&shared), operator_of, "bob"),
+                None
+            );
+            assert_eq!(unit_admit_group(&shared), Some("_minimal"));
+            assert_eq!(
+                unit_admit_group("ExecStart=/x/minzoned --admit-group minimal --bindings /f"),
+                Some("minimal")
+            );
+            // The flag's attached spelling, in a unit and in a plist.
+            assert_eq!(
+                unit_admit_group("ExecStart=/x/minzoned --admit-group=minimal --x"),
+                Some("minimal")
+            );
+            assert_eq!(
+                unit_admit_group("<string>--admit-group=_minimal</string>"),
+                Some("_minimal")
+            );
+            assert_eq!(
+                unit_admit_group("ExecStart=/x/minzoned --admit-group="),
+                None
+            );
+            assert_eq!(unit_admit_group(text), None);
+            // `--undo` over a shared unit is refused with the package named;
+            // over one operator's, or none, it is not.
+            let undo = shared_service_undo_refusal(&shared).expect("a shared unit refuses --undo");
+            assert!(
+                undo.contains("the members of the group _minimal")
+                    && undo.contains("--undo` would remove it for all of them")
+                    && undo.contains("uninstall.sh"),
+                "{undo}"
+            );
+            assert_eq!(shared_service_undo_refusal(text), None);
             assert_eq!(
                 other_operator_refusal(Some("no operator here"), operator_of, "bob"),
                 None
@@ -9798,6 +10117,8 @@ resolvectl domain minzone0 '~min.internal'
             channel_owner: Some(1000),
             operator_uid: Some(1000),
             installed_version: version,
+            channel_group: None,
+            shared: None,
         }
     }
 
@@ -10009,6 +10330,130 @@ resolvectl domain minzone0 '~min.internal'
                 .contains("its channel socket at")
                 && failed_check.contains("is owned by uid 0, not the operator's")),
             "a channel socket another account owns fails custody: {step:?}"
+        );
+
+        // A shared service (the unit admits a group): the socket is the
+        // group's, 0660, and the service account's, and that holds. A
+        // world-connectable socket, another group's, or the operator's
+        // own fails custody, each check naming what it found; a group no
+        // host account has fails before any of them.
+        let shared = |group: Option<u32>| {
+            let mut facts = root_owned_answerer_facts(Some(daemon));
+            facts.shared = Some(SharedService {
+                group_name: "_minimal".to_string(),
+                group,
+                account_uid: Some(309),
+            });
+            facts.channel_mode = Some(0o660);
+            facts.channel_group = Some(310);
+            facts.channel_owner = Some(309);
+            facts
+        };
+        assert_eq!(
+            answerer_step_over(&shared(Some(310)), daemon),
+            AnswererStep::Installed,
+            "the group's 0660 socket, owned by the service account, holds"
+        );
+        let failed = |facts: &AnswererFacts| match answerer_step_over(facts, daemon) {
+            AnswererStep::CustodyFailed { failed_check } => failed_check,
+            other => panic!("expected a failed check, got {other:?}"),
+        };
+        let mut open = shared(Some(310));
+        open.channel_mode = Some(0o666);
+        assert!(
+            failed(&open).contains("not only by the group _minimal"),
+            "{}",
+            failed(&open)
+        );
+        // A socket the group cannot write is one it cannot connect to:
+        // owner-only is not the shared service's, however private.
+        let mut closed = shared(Some(310));
+        closed.channel_mode = Some(0o600);
+        assert!(
+            failed(&closed).contains("is mode 600, which the group _minimal cannot connect to"),
+            "{}",
+            failed(&closed)
+        );
+
+        // Over a shared service, no step carries the copy: a custody
+        // failure or a protocol mismatch is reported, and the step is
+        // unavailable with the package named as the remedy, for a member
+        // (whom `refuse_outside_the_group` let through) as for anyone.
+        let service = shared(Some(310)).shared.expect("shared");
+        for step in [
+            AnswererStep::ProtocolMismatch {
+                installed: Some(daemon - 1),
+                daemon,
+            },
+            AnswererStep::ProtocolMismatch {
+                installed: None,
+                daemon,
+            },
+            AnswererStep::CustodyFailed {
+                failed_check: "its channel socket is mode 600".to_string(),
+            },
+        ] {
+            let refused = refuse_replacing_the_shared(step.clone(), &service);
+            match &refused {
+                AnswererStep::SourceUnavailable { service, reason } => {
+                    assert_eq!(
+                        **service, step,
+                        "the service state read survives underneath"
+                    );
+                    assert!(
+                        reason.contains("installed for the members of the group _minimal")
+                            && reason.contains("would replace it with one user's own")
+                            && reason.contains("sudo installer -pkg")
+                            && reason.contains("uninstall.sh"),
+                        "{reason}"
+                    );
+                    if let AnswererStep::ProtocolMismatch { installed, .. } = &step {
+                        assert!(
+                            reason.contains(&match installed {
+                                Some(v) => format!("speaks channel protocol {v}, not"),
+                                None => "did not answer the channel protocol probe".to_string(),
+                            }),
+                            "{reason}"
+                        );
+                    }
+                }
+                other => panic!("a shared service's step is never carried: {other:?}"),
+            }
+        }
+        for step in [AnswererStep::Installed, AnswererStep::Absent] {
+            assert_eq!(
+                refuse_replacing_the_shared(step.clone(), &service),
+                step,
+                "nothing to replace, nothing refused"
+            );
+        }
+        let outside = AnswererStep::SourceUnavailable {
+            service: Box::new(AnswererStep::Installed),
+            reason: "not in the group".to_string(),
+        };
+        assert_eq!(
+            refuse_replacing_the_shared(outside.clone(), &service),
+            outside,
+            "the non-member's own refusal stands"
+        );
+        let mut other_group = shared(Some(310));
+        other_group.channel_group = Some(20);
+        assert!(
+            failed(&other_group).contains("is group 20, not the group _minimal"),
+            "{}",
+            failed(&other_group)
+        );
+        let mut operators = shared(Some(310));
+        operators.channel_owner = Some(1000);
+        assert!(
+            failed(&operators).contains("owned by uid 1000, not the service account's"),
+            "{}",
+            failed(&operators)
+        );
+        assert!(
+            failed(&shared(None)).contains("_minimal, which is no group on this host"),
+            "{}",
+            failed(&shared(None))
         );
         // A root-owned socket, or one whose uid names no account, is a
         // stale or relaxed install: it stays a custody failure, the step
@@ -11423,6 +11868,8 @@ resolvectl domain minzone0 '~min.internal'
             channel_owner: Some(1000),
             operator_uid: Some(1000),
             installed_version: Some(daemon),
+            channel_group: None,
+            shared: None,
         };
         let step = answerer_step_over(&facts, daemon);
         assert!(
