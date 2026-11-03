@@ -933,22 +933,28 @@ async fn box_policy_json_inputs(
 > {
     ensure_daemon(global)
         .map_err(|error| PolicyJsonFailure::DaemonUnreachable(format!("{error:#}")))?;
-    let mut client = connect_daemon(global)
+    let client = connect_daemon(global)
         .await
         .map_err(|error| PolicyJsonFailure::DaemonUnreachable(format!("{error:#}")))?;
 
     // The record the ingress key is gated on, resolved through the same
-    // lookup the text walk uses, with the failure kinds told apart where
-    // they can be: an RPC the daemon never answered is no daemon to ask;
-    // a lookup that answered with nothing is the not-found itself.
-    let resp = get_session_record(&mut client, box_name)
+    // lookup the text walk uses — on the VM that owns the name (NET-058) —
+    // with the failure kinds told apart where they can be: an RPC the daemon
+    // never answered is no daemon to ask; a lookup that answered with
+    // nothing, or a box on a stopped VM, is the not-found itself.
+    let example = format!("session policy {box_name} -o json");
+    let (mut client, record) = resolve_box_on_any_vm(global, client, box_name, &example)
         .await
-        .map_err(|error| match error.downcast_ref::<AmbiguousIdPrefix>() {
-            Some(ambiguous) => PolicyJsonFailure::SessionNotFound(ambiguous.to_string()),
-            None => PolicyJsonFailure::DaemonUnreachable(format!("{error:#}")),
+        .map_err(|error| {
+            if error.downcast_ref::<BoxNotFound>().is_some()
+                || error.downcast_ref::<AmbiguousIdPrefix>().is_some()
+                || error.downcast_ref::<AmbiguousBoxName>().is_some()
+            {
+                PolicyJsonFailure::SessionNotFound(error.to_string())
+            } else {
+                PolicyJsonFailure::DaemonUnreachable(format!("{error:#}"))
+            }
         })?;
-    let record = named_record(resp.record, box_name)
-        .map_err(|error| PolicyJsonFailure::SessionNotFound(error.to_string()))?;
     // By the resolved id, as the text walk does.
     let box_id = &record.id.to_string();
 

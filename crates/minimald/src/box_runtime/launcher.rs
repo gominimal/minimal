@@ -137,6 +137,108 @@ pub(crate) trait BoxLauncher {
         paths: BoxPaths,
         sz: WinSize,
     ) -> impl Future<Output = io::Result<Launched<Self::Process, Self::Guard>>> + Send;
+
+    /// What [`Self::launch`] starts as the box's first process, read from
+    /// the spec the box's actor handed this launcher.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` when the spec names an entrypoint no launch can start.
+    fn entrypoint(&self) -> io::Result<LaunchEntrypoint>;
+}
+
+/// The spec a launch starts its box from, as the box's actor hands it over.
+/// The actor keeps its own hold on the spec, so every later launch of the
+/// box reads the same one.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LaunchSpec {
+    /// The spec stored beside the box's record (BOX-068). `None` for a box
+    /// filed with no spec: a client that predates it, or the dashboard.
+    pub(crate) spec: Option<std::sync::Arc<mfile::spec::BoxSpec>>,
+    /// Whether an exec runs the command the box is for. When it is set, the
+    /// launch starts the shell, whatever entrypoint the spec names.
+    ///
+    /// Interim: the box's actor sets this to `true` on every launch, a hook
+    /// launch and an attach included. `min task run` sends a task's run
+    /// over the exec channel, so a task box starts the shell and not its
+    /// spec's argv, and the task runs once. Flip condition: T43 (#2405)
+    /// moves a task's run from the exec channel to the box's entrypoint,
+    /// and removes the constant.
+    pub(crate) run_by_exec: bool,
+}
+
+/// The first process a launch starts, as [`LaunchSpec::entrypoint`]
+/// decides it. Every launcher starts what this says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LaunchEntrypoint {
+    /// The box's login shell, which the launch resolves from the composed
+    /// `SHELL` (see `crate::attach_shell`).
+    Shell,
+    /// A program, by its absolute path in the box, and its arguments.
+    Argv { program: String, args: Vec<String> },
+}
+
+impl LaunchEntrypoint {
+    /// What a log line names for this entrypoint: `login shell`, or the
+    /// program's path without its arguments. An argument can carry a
+    /// secret, so no log line prints one. [`Self::arg_count`] says how many.
+    pub(crate) fn log_name(&self) -> &str {
+        match self {
+            Self::Shell => "login shell",
+            Self::Argv { program, .. } => program,
+        }
+    }
+
+    /// How many arguments the entrypoint passes to its program: 0 for the
+    /// shell.
+    pub(crate) fn arg_count(&self) -> usize {
+        match self {
+            Self::Shell => 0,
+            Self::Argv { args, .. } => args.len(),
+        }
+    }
+}
+
+impl LaunchSpec {
+    /// The one place a launch decides its box's first process (T42):
+    ///
+    /// - a box with no spec, and a box whose run an exec carries, start the
+    ///   shell;
+    /// - otherwise the spec's entrypoint: the shell, or its argv.
+    ///
+    /// A program word with no `/` names a program under `/usr/bin`, where
+    /// packages install: the box's rootfs has no `/bin` and no `PATH`
+    /// lookup happens before the exec.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` for an argv entrypoint with no program.
+    pub(crate) fn entrypoint(&self) -> io::Result<LaunchEntrypoint> {
+        let Some(spec) = self.spec.as_deref() else {
+            return Ok(LaunchEntrypoint::Shell);
+        };
+        match &spec.entrypoint {
+            mfile::spec::Entrypoint::Shell => Ok(LaunchEntrypoint::Shell),
+            mfile::spec::Entrypoint::Exec(_) if self.run_by_exec => Ok(LaunchEntrypoint::Shell),
+            mfile::spec::Entrypoint::Exec(argv) => {
+                let Some((program, args)) = argv.split_first() else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "the box's settings name an entrypoint with no program",
+                    ));
+                };
+                let program = if program.contains('/') {
+                    program.clone()
+                } else {
+                    format!("/usr/bin/{program}")
+                };
+                Ok(LaunchEntrypoint::Argv {
+                    program,
+                    args: args.to_vec(),
+                })
+            }
+        }
+    }
 }
 
 /// Where a command should start in a session, and with what environment.
@@ -223,6 +325,121 @@ pub(crate) struct Launched<P, G> {
     /// startup files are the user's — waits for the first attach. `None` on
     /// every other launch, whose shell starts at once.
     pub(super) start_gate: Option<sandbox::StartGate>,
+}
+
+/// The box's output log as its host writes it (BOX-155): every byte the
+/// box's entrypoint writes to its terminal, appended from the start of the
+/// launch. The host writes the log before it hands the same bytes to an
+/// attached client, so a client is a second reader. When a client leaves,
+/// the log already has everything it saw and everything after it.
+///
+/// The file is [`boxes::store::LOG_FILE`] beside the box's record. No path
+/// mounted into the box reaches it, and only the daemon's user can open it
+/// (BOX-164). The open does not follow a symlink, so a link planted where
+/// the log goes is refused and is not written through.
+///
+/// The log holds at most [`boxes::store::LOG_CAP`] bytes. Past the cap it
+/// keeps [`boxes::store::LOG_DROPPED`] and the newest output, and the box
+/// runs on (see [`boxes::store::LogWriter`]).
+pub(crate) struct BoxOutputLog {
+    /// `None` when the box has no log: its workspace is not in the store
+    /// (a test host), or a write failed.
+    writer: Option<boxes::store::LogWriter>,
+    path: Option<paths::DaemonAbsPath>,
+    session_id: boxes::SessionId,
+}
+
+impl BoxOutputLog {
+    /// Opens the log of the box whose workspace is `paths.working`, for
+    /// appends, before the launch starts the entrypoint. A box whose
+    /// workspace is not in the store has no log.
+    ///
+    /// # Errors
+    ///
+    /// The open's error for a box in the store, after the daemon log names
+    /// the path and the error. The box does not start without its log.
+    pub(crate) fn open(session_id: boxes::SessionId, paths: &BoxPaths) -> io::Result<Self> {
+        let Some(dir) = boxes::store::BoxDir::for_tree(&paths.working) else {
+            tracing::debug!(
+                box_id = %session_id,
+                workspace = %paths.working.as_str(),
+                "no output log: the box's workspace is not in the box store"
+            );
+            return Ok(Self {
+                writer: None,
+                path: None,
+                session_id,
+            });
+        };
+        let path = dir.log_path();
+        let writer = Self::open_path(&path)
+            .and_then(|file| boxes::store::LogWriter::new(path.clone(), file));
+        match writer {
+            Ok(writer) => {
+                tracing::info!(
+                    box_id = %session_id,
+                    log_path = %path.as_str(),
+                    cap_bytes = boxes::store::LOG_CAP,
+                    "logging the box's output from its start"
+                );
+                Ok(Self {
+                    writer: Some(writer),
+                    path: Some(path),
+                    session_id,
+                })
+            }
+            Err(e) => {
+                tracing::warn!(
+                    box_id = %session_id,
+                    log_path = %path.as_str(),
+                    error = %e,
+                    "refused to open the box's output log"
+                );
+                Err(e)
+            }
+        }
+    }
+
+    /// Opens `path` owner-only, for reads and appends, without following a
+    /// symlink. Anything there that is not a regular file is refused. The
+    /// reads are the cap's: it copies the newest bytes out of this file.
+    fn open_path(path: &paths::DaemonAbsPath) -> io::Result<std::fs::File> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path.as_utf8_path())?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the log path is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+
+    /// Appends `bytes` to the log. A write that fails goes to the daemon
+    /// log with the path and the error, and the log stops there: a log
+    /// with a hole in it is not complete, so nothing more is written.
+    pub(crate) fn write(&mut self, bytes: &[u8]) {
+        let Some(writer) = self.writer.as_mut() else {
+            return;
+        };
+        if let Err(e) = writer.write(bytes) {
+            tracing::warn!(
+                box_id = %self.session_id,
+                log_path = %self.path.as_ref().map_or("", |p| p.as_str()),
+                error = %e,
+                dropped_bytes = bytes.len(),
+                "refused a write to the box's output log; the log stops here"
+            );
+            self.writer = None;
+        }
+    }
 }
 
 /// Packages every session sandbox gets unconditionally, regardless of
@@ -548,6 +765,9 @@ pub(crate) struct SandboxLauncher {
     /// [`super::launch_root_certificate`] reads it from the box's record.
     /// `None` for a box that gets no root.
     pub(crate) root_certificate: Option<String>,
+    /// The spec this launch starts the box from: its first process comes
+    /// from here, through [`LaunchSpec::entrypoint`].
+    pub(crate) spec: LaunchSpec,
 }
 
 /// Reaps a freshly-spawned sandbox process if the launch is abandoned
@@ -868,6 +1088,11 @@ pub(super) fn say_closure_line(line: &str, session: &str) -> bool {
 
 impl BoxLauncher for SandboxLauncher {
     type Process = SandboxProcess;
+
+    fn entrypoint(&self) -> io::Result<LaunchEntrypoint> {
+        self.spec.entrypoint()
+    }
+
     // The session env, kept alive for the session's lifetime (it owns the
     // sandbox files backing the running process's rootfs). The own-IP switch
     // attachment, when present, travels separately as `Launched::net_guard` and
@@ -883,6 +1108,9 @@ impl BoxLauncher for SandboxLauncher {
         paths: BoxPaths,
         sz: WinSize,
     ) -> io::Result<Launched<SandboxProcess, Self::Guard>> {
+        // Decided before anything is built, so a spec no launch can start
+        // reserves nothing.
+        let entrypoint = self.entrypoint()?;
         let ctx = self.ctx;
         // Move the session policy out of `self` up front so it can be applied
         // after the switch attach below (the rest of `self` is consumed first).
@@ -1405,52 +1633,65 @@ impl BoxLauncher for SandboxLauncher {
                     );
                 }
             }
-            // The shell, and the argv it needs to reach the daemon's
-            // per-attach environment hook. Every program path here is
-            // absolute (`/usr/bin/<shell>`): packages install with
-            // `--prefix=/usr` and the generic rootfs has no `/bin`, so a
-            // bare name or a `/bin/…` path would fail with ENOENT.
-            let shell = crate::attach_shell::resolve(requested_shell.as_deref(), &env.rootfs());
-            if let Some(notice) = &shell.fallback {
-                tracing::warn!(
-                    session = %session_label,
-                    requested = requested_shell.as_deref().unwrap_or_default(),
-                    "{notice}",
-                );
-                // Onto the pty's *slave* — that is the shell's stdout, so
-                // the line reaches the attached terminal ahead of the
-                // first prompt. Writing to the master would feed it to
-                // the shell as input instead. Best-effort: a session that
-                // comes up must not fail over a notice, and the log above
-                // has already recorded it. CRLF because this is a raw
-                // terminal write, not a line through the shell.
-                let written = pty.dup_slave_fd().and_then(|fd| {
-                    use std::io::Write as _;
-                    std::fs::File::from(fd).write_all(format!("minimal: {notice}\r\n").as_bytes())
-                });
-                if let Err(e) = written {
-                    tracing::debug!(error = %e, "could not print the shell notice to the terminal");
+            // What the box runs first, from its spec (T42): the login shell,
+            // or the spec's argv.
+            let mut command = match &entrypoint {
+                LaunchEntrypoint::Shell => {
+                // The shell, and the argv it needs to reach the daemon's
+                // per-attach environment hook. Every program path here is
+                // absolute (`/usr/bin/<shell>`): packages install with
+                // `--prefix=/usr` and the generic rootfs has no `/bin`, so a
+                // bare name or a `/bin/…` path would fail with ENOENT.
+                let shell = crate::attach_shell::resolve(requested_shell.as_deref(), &env.rootfs());
+                if let Some(notice) = &shell.fallback {
+                    tracing::warn!(
+                        session = %session_label,
+                        requested = requested_shell.as_deref().unwrap_or_default(),
+                        "{notice}",
+                    );
+                    // Onto the pty's *slave* — that is the shell's stdout, so
+                    // the line reaches the attached terminal ahead of the
+                    // first prompt. Writing to the master would feed it to
+                    // the shell as input instead. Best-effort: a session that
+                    // comes up must not fail over a notice, and the log above
+                    // has already recorded it. CRLF because this is a raw
+                    // terminal write, not a line through the shell.
+                    let written = pty.dup_slave_fd().and_then(|fd| {
+                        use std::io::Write as _;
+                        std::fs::File::from(fd).write_all(format!("minimal: {notice}\r\n").as_bytes())
+                    });
+                    if let Err(e) = written {
+                        tracing::debug!(error = %e, "could not print the shell notice to the terminal");
+                    }
                 }
-            }
-            let mut command = env
-                .command(&container, &shell.program, shell.args.iter().copied())
-                .map_err(|e| io::Error::other(format!("build command: {e}")))?;
-            // Name the shell that is actually running. The composed
-            // value is a path on the machine the loadout was authored on
-            // (`/opt/homebrew/bin/fish`), which resolves to nothing
-            // in-session, and on the fallback path it names a shell that
-            // isn't the one at this prompt.
-            command.env("SHELL", &shell.program);
-            // The session default `PS1` is bash's, so a shell with its
-            // own prompt grammar needs the equivalent in that grammar —
-            // handed the bash one, zsh renders `\[\033[…\]\u@\h` as
-            // literal text. Skipped when the composition set `PS1`: that
-            // is the user's own prompt, in whatever syntax they meant.
-            if let Some(prompt) = shell.prompt
-                && !composed_prompt
-            {
-                command.env("PS1", prompt);
-            }
+                let mut command = env
+                    .command(&container, &shell.program, shell.args.iter().copied())
+                    .map_err(|e| io::Error::other(format!("build command: {e}")))?;
+                // Name the shell that is actually running. The composed
+                // value is a path on the machine the loadout was authored on
+                // (`/opt/homebrew/bin/fish`), which resolves to nothing
+                // in-session, and on the fallback path it names a shell that
+                // isn't the one at this prompt.
+                command.env("SHELL", &shell.program);
+                // The session default `PS1` is bash's, so a shell with its
+                // own prompt grammar needs the equivalent in that grammar —
+                // handed the bash one, zsh renders `\[\033[…\]\u@\h` as
+                // literal text. Skipped when the composition set `PS1`: that
+                // is the user's own prompt, in whatever syntax they meant.
+                if let Some(prompt) = shell.prompt
+                    && !composed_prompt
+                {
+                    command.env("PS1", prompt);
+                }
+                    command
+                }
+                // The argv runs in the same environment the shell gets.
+                // `SHELL` and `PS1` stay as composed: no shell of the
+                // daemon's choosing runs here for them to describe.
+                LaunchEntrypoint::Argv { program, args } => env
+                    .command(&container, program, args.iter().map(String::as_str))
+                    .map_err(|e| io::Error::other(format!("build command: {e}")))?,
+            };
             command.stdin(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
             command.stdout(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
             let tty_path = pty.slave_path().to_path_buf();

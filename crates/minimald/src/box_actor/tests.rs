@@ -228,6 +228,65 @@ async fn create_session(client: &mut TestClient) -> SessionId {
     create_configured_session(client, "shell-test", "/uwu").await
 }
 
+/// `req` with the spec of a box that runs until it is stopped. Its shell's
+/// exit leaves the box running, and the shell-exit prompt renders: BOX-038
+/// ends only an `until_complete` box.
+fn until_stopped(
+    mut req: minimald_rpc::CreateSessionRequest,
+) -> minimald_rpc::CreateSessionRequest {
+    let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+    spec.lifetime = mfile::spec::Lifetime::UntilStopped;
+    req.spec = Some(serde_json_lenient::to_value(&spec).expect("a spec serializes"));
+    req
+}
+
+/// Creates a box from `req`, configures it with `contribution`, finalizes
+/// it when `finalize` is set, and returns its id.
+async fn create_box_from(
+    client: &mut TestClient,
+    req: minimald_rpc::CreateSessionRequest,
+    contribution: boxes::wire::request::WireContribution,
+    finalize: bool,
+) -> SessionId {
+    use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
+    let id = client.call::<CreateSession>(&req).await.unwrap().id;
+    crate::test_harness::unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution,
+            })
+            .await
+            .unwrap(),
+    );
+    if finalize {
+        finalize_session(client, id).await;
+    }
+    id
+}
+
+/// [`create_session`] for a box that runs until it is stopped.
+async fn create_until_stopped_session(client: &mut TestClient) -> SessionId {
+    let req = crate::test_harness::create_session_req("shell-test", "/uwu");
+    create_box_from(client, until_stopped(req), Default::default(), true).await
+}
+
+/// [`session_with_hook`] for a box that runs until it is stopped.
+async fn until_stopped_session_with_hook(
+    client: &mut TestClient,
+    name: &str,
+    hook: boxes::wire::primitives::WireLifecycleHook,
+) -> SessionId {
+    let req = crate::test_harness::create_session_req(name, "/uwu");
+    create_box_from(
+        client,
+        until_stopped(req),
+        contribution_with_hook(hook),
+        true,
+    )
+    .await
+}
+
 /// Attaching to a session whose loadout was never configured must not
 /// blow up: nothing is in flight on a bare `Draft`, so the attach
 /// configures it with an empty contribution on the way in and mints the
@@ -729,34 +788,19 @@ async fn shell_round_trips_stdin_to_stdout_then_tears_down() {
         }
     }
 
-    // Now ask the mock to exit. The shell exiting raises the session-exit
-    // prompt (see `box_runtime`), rendered over the channel; answer it by
-    // confirming the first option (Enter -> detach) so teardown proceeds and
-    // the channel closes.
+    // Now ask the mock to exit. The box's spec sets `until_complete`, so the
+    // shell's exit ends the box: no prompt renders, and the channel closes
+    // (BOX-038).
     channel
         .data_bytes(format!("{}\n", crate::box_runtime::MOCK_EXIT_LINE).into_bytes())
         .await
         .unwrap();
     let mut saw_exit_status = false;
     let mut closed = false;
-    let mut answered_prompt = false;
-    let mut prompt_out = Vec::new();
+    let mut out = Vec::new();
     while let Ok(msg) = tokio::time::timeout(Duration::from_secs(10), channel.wait()).await {
         match msg {
-            Some(ChannelMsg::Data { data }) => {
-                // Wait for the prompt to render, then confirm the first
-                // option. The prompt only appears once the mainloop has
-                // stopped reading the channel, so this keypress reaches the
-                // prompt rather than the (now-defunct) stdin path.
-                prompt_out.extend_from_slice(&data);
-                if !answered_prompt
-                    && String::from_utf8_lossy(&prompt_out)
-                        .contains(crate::box_runtime::SHELL_EXIT_PROMPT)
-                {
-                    channel.data_bytes(b"\r".to_vec()).await.unwrap();
-                    answered_prompt = true;
-                }
-            }
+            Some(ChannelMsg::Data { data }) => out.extend_from_slice(&data),
             Some(ChannelMsg::ExitStatus { .. }) => saw_exit_status = true,
             Some(_) => {}
             None => {
@@ -766,16 +810,20 @@ async fn shell_round_trips_stdin_to_stdout_then_tears_down() {
         }
     }
     assert!(
-        answered_prompt,
-        "expected the session-exit prompt to render"
+        !String::from_utf8_lossy(&out).contains(crate::box_runtime::SHELL_EXIT_PROMPT),
+        "a box that ends with its shell raises no shell-exit prompt; got: {:?}",
+        String::from_utf8_lossy(&out)
     );
     assert!(closed, "channel should close once the mock process exits");
     assert!(saw_exit_status, "expected an exit status on teardown");
 
-    // Detach leaves the session alive: its record must still resolve.
+    // The box ended, and its record stays, set to `exited`.
+    let manager = server.state.sessions_manager().await;
+    let record = record_once_exited(&manager, session_id).await;
+    assert_eq!(record.exit_code, Some(0));
     assert!(
         record_exists(&mut client, session_id).await,
-        "detach must not delete the session record"
+        "an ended box keeps its record"
     );
 }
 
@@ -787,7 +835,7 @@ async fn shell_round_trips_stdin_to_stdout_then_tears_down() {
 async fn shell_exit_prompt_lists_files_changed_since_activation() {
     let server = TestServer::new().await;
     let mut client = server.connect().await;
-    let session_id = create_session(&mut client).await;
+    let session_id = create_until_stopped_session(&mut client).await;
 
     let mut channel = client.open_shell(session_id).await;
 
@@ -965,7 +1013,7 @@ async fn workspace_baseline_survives_keep_exit_and_reattach() {
 
     let server = TestServer::new().await;
     let mut client = server.connect().await;
-    let session_id = create_session(&mut client).await;
+    let session_id = create_until_stopped_session(&mut client).await;
 
     // First activation arms the baseline against the pristine workspace.
     let mut channel = client.open_shell(session_id).await;
@@ -1048,7 +1096,7 @@ async fn workspace_baseline_survives_a_daemon_restart() {
 
     let server = TestServer::new().await;
     let mut client = server.connect().await;
-    let session_id = create_session(&mut client).await;
+    let session_id = create_until_stopped_session(&mut client).await;
 
     // First activation arms the baseline and persists the sidecar.
     let mut channel = client.open_shell(session_id).await;
@@ -1208,7 +1256,7 @@ async fn session_delta_rpc_is_unavailable_without_a_running_host() {
 async fn terminate_option_deletes_session_and_closes_channel() {
     let server = TestServer::new().await;
     let mut client = server.connect().await;
-    let session_id = create_session(&mut client).await;
+    let session_id = create_until_stopped_session(&mut client).await;
 
     let mut channel = client.open_shell(session_id).await;
 
@@ -1282,7 +1330,7 @@ async fn terminate_option_deletes_session_and_closes_channel() {
 async fn save_option_archives_changed_files_then_deletes_session() {
     let server = TestServer::new().await;
     let mut client = server.connect().await;
-    let session_id = create_session(&mut client).await;
+    let session_id = create_until_stopped_session(&mut client).await;
 
     let mut channel = client.open_shell(session_id).await;
 
@@ -1906,6 +1954,143 @@ async fn ensure_host_launches_an_unattached_host_and_then_reuses_it() {
         again.same_host(&host),
         "a second exec request minted a second host instead of reusing the first"
     );
+}
+
+// T42: the actor reads the spec stored at creation, hands it to every
+// launcher it builds, and keeps its own hold, so a relaunch starts the box
+// from the same spec without reading the store again. Each launch says that
+// an exec carries the box's run, and the launcher then holds the shell.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actor_hands_stored_spec_to_launcher_and_keeps_hold() {
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+        FinalizeSessionRequest,
+    };
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+
+    let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+    spec.lifetime = mfile::spec::Lifetime::UntilStopped;
+    spec.entrypoint = mfile::spec::Entrypoint::Exec(vec!["/bin/echo".to_string()]);
+    let mut req = crate::test_harness::create_session_req("spec-hold", "/tmp");
+    req.spec = Some(serde_json_lenient::to_value(&spec).expect("a spec serializes"));
+    let session_id = client.call::<CreateSession>(&req).await.unwrap().id;
+    crate::test_harness::unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    match client
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id,
+            report_shared_port_collisions: false,
+        })
+        .await
+    {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+    }
+
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session launches a host");
+    let first = crate::box_actor::launch_spec_seam::observed(session_id);
+    let handed = first.last().expect("the launch was handed a spec");
+    let held = handed
+        .spec
+        .clone()
+        .expect("the actor hands over the spec stored at creation");
+    assert_eq!(*held, spec, "the stored spec, not a default");
+    // Every launch, not only the exec's: a hook launch or an attach can come
+    // before the exec that runs the box's command.
+    for launch in &first {
+        assert!(launch.run_by_exec, "an exec carries the box's run");
+        assert_eq!(
+            launch.entrypoint().unwrap(),
+            crate::box_runtime::LaunchEntrypoint::Shell,
+            "the exec runs the box's command, so the launch holds the shell"
+        );
+    }
+
+    // End the host, and have the next exec launch another one.
+    host.kill(false).await.expect("the host takes the kill");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while host.is_alive() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the killed host ends");
+    let again = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("a session whose host ended launches another");
+    assert!(!again.same_host(&host), "a new launch, not the old host");
+
+    let launches = crate::box_actor::launch_spec_seam::observed(session_id);
+    assert_eq!(launches.len(), first.len() + 1, "one more launch");
+    let relaunch = launches.last().unwrap();
+    assert!(relaunch.run_by_exec, "the relaunch holds the shell too");
+    let relaunch = relaunch.spec.clone().expect("a spec");
+    assert!(
+        std::sync::Arc::ptr_eq(&relaunch, &held),
+        "the actor kept its hold and handed the same spec again"
+    );
+}
+
+// T42: a stored spec the daemon cannot read refuses the launch, as a resume
+// of it is refused, and the box does not start its shell. The refusal is not
+// held, so a launch after the spec reads again starts the box.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn launch_refuses_unreadable_stored_spec() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+
+    let spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+    let spec = serde_json_lenient::to_value(&spec).expect("a spec serializes");
+    let session_id =
+        create_session_with_spec(&mut client, Some("bad-spec"), "/tmp", Some(spec.clone())).await;
+    let path = record_dir(&server, session_id).await.join("spec.json");
+    std::fs::write(&path, b"not a spec").unwrap();
+
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+    match handle.ensure_host("tester".to_string()).await {
+        Err(crate::box_actor::AttachError::SpawnFailed(error)) => {
+            let text = error.to_string();
+            assert!(text.contains("cannot be read"), "{text}");
+            assert!(text.contains("min session destroy bad-spec"), "{text}");
+        }
+        Err(other) => panic!("expected a refused launch, got {other}"),
+        Ok(_) => panic!("a box whose stored spec cannot be read launched"),
+    }
+    assert!(
+        crate::box_actor::launch_spec_seam::observed(session_id).is_empty(),
+        "no launcher was built"
+    );
+
+    rewrite_spec(&server, session_id, &spec).await;
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the refusal was not held, so the readable spec launches");
 }
 
 /// NET-079's "recorded as such" is not best-effort: a host-address box
@@ -2698,7 +2883,7 @@ async fn destroy_runs_its_hooks_after_the_session_shell_has_exited() {
 
     let server = TestServer::new().await;
     let mut client = server.connect().await;
-    let session_id = session_with_hook(
+    let session_id = until_stopped_session_with_hook(
         &mut client,
         "destroy-after-exit",
         boxes::wire::primitives::WireLifecycleHook {
@@ -2831,7 +3016,7 @@ async fn detach_runs_its_detach_hooks_after_the_shell_exits() {
 
     let server = TestServer::new().await;
     let mut client = server.connect().await;
-    let session_id = session_with_hook(
+    let session_id = until_stopped_session_with_hook(
         &mut client,
         "detach-hooks",
         boxes::wire::primitives::WireLifecycleHook {
@@ -4446,11 +4631,18 @@ async fn a_box_holding_a_host_row_refuses_remint_after_its_host_loop_ends() {
     let handed = std::net::Ipv4Addr::new(127, 0, 64, 23);
     let server = TestServer::new().await;
     let mut client = server.connect().await;
-    let id = finalize_handed_own_ip_session(
+    // A box that runs until it is stopped: its shell's exit leaves the box
+    // running, which is the case this test is about (BOX-038 ends only an
+    // `until_complete` box).
+    let id = create_box_from(
         &mut client,
-        "web",
-        std::net::Ipv4Addr::new(100, 64, 128, 23),
-        handed,
+        until_stopped(own_ip_handed_session_req(
+            "web",
+            std::net::Ipv4Addr::new(100, 64, 128, 23),
+            handed,
+        )),
+        Default::default(),
+        true,
     )
     .await;
 
@@ -4521,15 +4713,19 @@ async fn a_detach_hook_host_of_a_registered_box_is_refused_to_the_next_attach() 
     let marker = dir.path().join("detached");
     let server = TestServer::new().await;
     let mut client = server.connect().await;
-    let id = create_handed_own_ip_session_with_hook(
+    // Runs until it is stopped, so the shell's exit leaves the box running.
+    let id = create_box_from(
         &mut client,
-        "hooked-detach",
-        std::net::Ipv4Addr::new(100, 64, 128, 24),
-        std::net::Ipv4Addr::new(127, 0, 64, 24),
-        boxes::wire::primitives::WireLifecycleHook {
+        until_stopped(own_ip_handed_session_req(
+            "hooked-detach",
+            std::net::Ipv4Addr::new(100, 64, 128, 24),
+            std::net::Ipv4Addr::new(127, 0, 64, 24),
+        )),
+        contribution_with_hook(boxes::wire::primitives::WireLifecycleHook {
             on_detach: Some(inline(marker_body(&marker))),
             ..Default::default()
-        },
+        }),
+        false,
     )
     .await;
     finalize_session(&mut client, id).await;
@@ -14826,6 +15022,7 @@ fn stand_in_entrypoint(
         Ok(crate::box_runtime::HostExit {
             code: reason.code,
             reason: Some(reason),
+            requested: false,
         })
     })
 }
@@ -15927,4 +16124,284 @@ async fn resume_runs_only_on_attach_hook() {
         "ran\n",
         "on_activate ran again on resume"
     );
+}
+
+/// Reads the box's record until its state is `exited`, or panics after ten
+/// seconds.
+async fn record_once_exited(
+    manager: &crate::box_manager::BoxManagerHandle,
+    session_id: SessionId,
+) -> boxes::Record {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let record = manager
+                .get_record(crate::box_manager::BoxKeyPredicate::Id(session_id))
+                .await
+                .unwrap()
+                .expect("an ended box keeps its record");
+            if record.status == boxes::BoxState::Exited {
+                break record;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the box ends as exited when its entrypoint returns")
+}
+
+// BOX-038: the entrypoint of an `until_complete` box returns with no client
+// attached, and the daemon ends the box by itself: the record is retained
+// and set to `exited` with the exit code, and an `exited` event carries the
+// reason and the code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn until_complete_ends_on_entrypoint_return_without_client_records_exited() {
+    use boxes::core::record::{ExitEnding, RecordState};
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_session(&mut client).await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session launches a headless host");
+    assert!(host.is_alive());
+
+    // No channel is bound: the line reaches the shell as though typed.
+    host.feed_stdin(format!("{}\n", crate::box_runtime::MOCK_EXIT_LINE).into_bytes())
+        .await;
+    tokio::time::timeout(Duration::from_secs(10), host.closed())
+        .await
+        .expect("the host ends with its entrypoint");
+
+    let record = record_once_exited(&manager, session_id).await;
+    assert_eq!(
+        record.state().unwrap(),
+        RecordState::Exited(ExitEnding::Exit { exit_code: 0 })
+    );
+    assert_eq!(record.exit_code, Some(0));
+
+    let mut events = manager.box_events(session_id).await.unwrap();
+    let events = events.read_new().unwrap();
+    let exited = events
+        .iter()
+        .find(|e| e.kind == boxes::events::BoxEventType::Exited)
+        .expect("the end records an exited event");
+    assert_eq!(exited.data["reason"], "exit");
+    assert_eq!(exited.data["exit_code"], 0);
+}
+
+// BOX-038: an exec's `EnsureHost` is already queued when the entrypoint of
+// an `until_complete` box returns. The exit wins: the box ends `exited`
+// with its code and an `exited` event, and the exec is refused, so the
+// entrypoint is not launched again behind the record's back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn until_complete_ends_on_entrypoint_return_without_client_before_queued_ensure_host() {
+    use boxes::core::record::{ExitEnding, RecordState};
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_session(&mut client).await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session launches a headless host");
+    let started_before = {
+        let mut events = manager.box_events(session_id).await.unwrap();
+        events
+            .read_new()
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == boxes::events::BoxEventType::Started)
+            .count()
+    };
+
+    // The actor is held while the entrypoint returns and the exec's
+    // `EnsureHost` queues, so both are waiting when it wakes.
+    let release = handle.hold_for_test().await;
+    host.feed_stdin(format!("{}\n", crate::box_runtime::MOCK_EXIT_LINE).into_bytes())
+        .await;
+    tokio::time::timeout(Duration::from_secs(10), host.closed())
+        .await
+        .expect("the host ends with its entrypoint");
+    let queued = {
+        let handle = handle.clone();
+        crate::traced::spawn(async move { handle.ensure_host("tester".to_string()).await })
+    };
+    handle.until_queued(1).await;
+    drop(release);
+
+    let ensured = tokio::time::timeout(Duration::from_secs(10), queued)
+        .await
+        .expect("the queued exec is answered")
+        .unwrap();
+    assert!(
+        ensured.is_err(),
+        "the queued exec launched a host in an exited box"
+    );
+
+    let record = record_once_exited(&manager, session_id).await;
+    assert_eq!(
+        record.state().unwrap(),
+        RecordState::Exited(ExitEnding::Exit { exit_code: 0 })
+    );
+    let mut events = manager.box_events(session_id).await.unwrap();
+    let events = events.read_new().unwrap();
+    let exited = events
+        .iter()
+        .find(|e| e.kind == boxes::events::BoxEventType::Exited)
+        .expect("the end records an exited event");
+    assert_eq!(exited.data["reason"], "exit");
+    assert_eq!(exited.data["exit_code"], 0);
+    let started_after = events
+        .iter()
+        .filter(|e| e.kind == boxes::events::BoxEventType::Started)
+        .count();
+    assert_eq!(
+        started_after, started_before,
+        "the entrypoint started again after it returned"
+    );
+}
+
+// BOX-038: the host is gone once the entrypoint returns, so a write of the
+// exited record that fails at first is retried, and the box still ends as
+// exited with its code and its event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn until_complete_exit_record_write_retries_after_failure() {
+    use boxes::core::record::{ExitEnding, RecordState};
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_session(&mut client).await;
+    crate::box_actor::exit_record_seam::fail_next_writes(session_id, 2);
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session launches a headless host");
+
+    host.feed_stdin(format!("{}\n", crate::box_runtime::MOCK_EXIT_LINE).into_bytes())
+        .await;
+    tokio::time::timeout(Duration::from_secs(10), host.closed())
+        .await
+        .expect("the host ends with its entrypoint");
+
+    let record = record_once_exited(&manager, session_id).await;
+    assert_eq!(
+        record.state().unwrap(),
+        RecordState::Exited(ExitEnding::Exit { exit_code: 0 })
+    );
+    let mut events = manager.box_events(session_id).await.unwrap();
+    let events = events.read_new().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == boxes::events::BoxEventType::Exited),
+        "the retried end records an exited event"
+    );
+}
+
+// BOX-015: neither a client that goes away nor time with nothing to do
+// stops a box. The client's channel and connection close, the box sits
+// idle, and its entrypoint still runs, with the record still running and
+// no `exited` event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_never_stops_for_idle_or_client_loss() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_session(&mut client).await;
+
+    let mut channel = client.open_shell(session_id).await;
+    channel.data_bytes(b"hello\n".to_vec()).await.unwrap();
+    let mut stdout = Vec::new();
+    loop {
+        match channel.wait().await {
+            Some(ChannelMsg::Data { data }) => {
+                stdout.extend_from_slice(&data);
+                if String::from_utf8_lossy(&stdout).contains("got:hello") {
+                    break;
+                }
+            }
+            Some(_) => {}
+            None => panic!("channel closed before the echo arrived"),
+        }
+    }
+
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the attached session has a host");
+
+    // The client goes away with no detach: its channel and its connection
+    // drop.
+    drop(channel);
+    drop(client);
+
+    // Idle: nothing reaches the box for a while.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    assert!(
+        host.is_alive(),
+        "a box whose client went away and that sat idle still runs"
+    );
+    let record = manager
+        .get_record(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("the box keeps its record");
+    assert_eq!(
+        record.status,
+        boxes::BoxState::Active,
+        "the record still runs"
+    );
+    let mut events = manager.box_events(session_id).await.unwrap();
+    let events = events.read_new().unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.kind == boxes::events::BoxEventType::Exited),
+        "no exited event for a box nothing ended: {events:?}"
+    );
+
+    // The same entrypoint still answers.
+    host.feed_stdin(b"still\n".to_vec()).await;
+    let screen = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let screen = host.get_screen().await.expect("the host answers");
+            let text: String = screen
+                .lines
+                .iter()
+                .flat_map(|row| row.cells.iter().map(|cell| cell.ch))
+                .collect();
+            if text.contains("got:still") {
+                break text;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the box's entrypoint still runs after the client went away");
+    assert!(screen.contains("got:still"));
 }

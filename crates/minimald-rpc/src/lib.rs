@@ -1045,6 +1045,41 @@ pub struct WithdrawPortRequest {
     pub source: PortReportSource,
 }
 
+/// Whether the listener a [`ListenNotice`] names opened or closed.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ListenState {
+    /// A process in a host-address box started to listen on the port.
+    Listening,
+    /// The listener on the port closed.
+    Stopped,
+}
+
+/// The in-VM daemon's notice that a process in a host-address box started
+/// or stopped listening on a TCP port of the guest node (NET-138, NET-129):
+/// the fixed, size-bounded message the VM host daemon mirrors the node's
+/// binds from. It carries a port and a state and nothing else — no
+/// address, no path, no name, no box — so a forged notice can only select
+/// a port at the node's own host-allocated address, never say where the
+/// host binds it or for whom. Unknown fields refuse the line.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ListenNotice {
+    /// The TCP port the listener holds in the guest node's namespace.
+    pub port: u16,
+    /// Whether the listener opened or closed.
+    pub state: ListenState,
+}
+
+impl ListenNotice {
+    /// The longest request line a listen notice can be, its verb tag
+    /// included: `{"verb":"listen_notice","port":65535,"state":"listening"}`
+    /// is 57 bytes. The VM host daemon refuses a longer `listen_notice`
+    /// line before the mirror sees it. The line is parsed first, so before
+    /// the parse only the box control channel's own line bound applies.
+    pub const MAX_LINE_BYTES: usize = 96;
+}
+
 /// Who decided a dynamic ingress request, as the in-VM daemon's expose
 /// decision report names it ([`ExposeDecisionReport`]): the same three
 /// deciders, in the same kebab-case spelling, as the in-VM daemon's own
@@ -1561,6 +1596,10 @@ pub enum BoxControlRequest {
     /// steered name with the proxy's address only while the answer is
     /// `true`, and SERVFAIL otherwise.
     ProxyListening,
+    /// Read every host port this VM's hostname proxy serves on (NET-150,
+    /// NET-154): served on the VM host's control socket only, answered with
+    /// [`BoxControlReply::ProxyPorts`]. A read: no state changes.
+    ProxyPorts,
     /// The in-VM daemon's ask for the id of a box it is about to create
     /// ([`MintBoxIdRequest`], BOX-002): carried on the daemon's own control
     /// channel, answered with [`BoxControlReply::BoxIdMinted`].
@@ -1575,6 +1614,13 @@ pub enum BoxControlRequest {
     /// channel, appended to the host's audit log under a per-box cap, and
     /// answered with [`BoxControlReply::Audited`].
     ReportRefusedEgress(RefusedEgressReport),
+    /// The in-VM daemon's notice that a host-address box's listener opened
+    /// or closed ([`ListenNotice`], NET-138): carried on the daemon's own
+    /// control channel. The VM host daemon mirrors the bind at the node's
+    /// own address and answers [`BoxControlReply::PortRecorded`] when the
+    /// mirror holds the notice, or [`BoxControlReply::Error`] naming why
+    /// it does not.
+    ListenNotice(ListenNotice),
 }
 
 /// The VM host daemon's answerer status: the state of the machine's
@@ -1961,6 +2007,16 @@ pub enum BoxControlReply {
     ProxyListening {
         /// Whether the proxy's listener is live.
         listening: bool,
+    },
+    /// The proxy-ports read's answer (NET-154): every host port the VM's
+    /// hostname proxy serves on, the preferred port first. One port while
+    /// the proxy serves on one, two once a proxy that started on a
+    /// substitute port took its preferred port back. Empty when the proxy
+    /// serves on no host port. `proxy_ports` is required — the marker that
+    /// keeps this document from decoding as any other reply.
+    ProxyPorts {
+        /// The host ports, the preferred first.
+        proxy_ports: Vec<u16>,
     },
     /// An audit report's answer: whether the host wrote a record for it.
     /// `false` when the host's per-box cap suppressed the record, which the
@@ -2727,6 +2783,97 @@ impl OneshotSshRpc for ShowBox {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ShowBox");
     type Request<'a> = ShowBoxRequest;
     type Response = Errorable<ShowBoxResponse>;
+}
+
+/// An RPC to reap one box: delete its record, its events and its
+/// filesystem (BOX-019, BOX-045).
+///
+/// The daemon reaps a `stopped` or `exited` box. It refuses a `running`
+/// box and leaves it running, unless `force` is set. A forced reap stops
+/// the box with the forced stop of [`StopBox`] first, then deletes it.
+pub struct ReapBox;
+
+/// The request for a [`ReapBox`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReapBoxRequest {
+    /// The box to reap.
+    pub id: SessionId,
+    /// Stop a running box at once and then reap it. Absent, as from a
+    /// client that does not send it, a running box is refused.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force: bool,
+}
+
+/// The response for a [`ReapBox`] RPC.
+///
+/// `deny_unknown_fields`, so that `{"error": "..."}` never decodes as a
+/// reap that succeeded.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReapBoxResponse {
+    /// The box the daemon reaped, as its record read before the reap.
+    pub reaped: BoxListingEntry,
+    /// One line per `on_destroy` hook that did not succeed. A failing hook
+    /// does not stop the reap.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hook_failures: Vec<String>,
+}
+
+impl OneshotSshRpc for ReapBox {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ReapBox");
+    type Request<'a> = ReapBoxRequest;
+    type Response = Errorable<ReapBoxResponse>;
+}
+
+/// An RPC to reap every `stopped` or `exited` box that matches all the
+/// given selectors (BOX-021). The daemon never reaps a box in any other
+/// state. With no selector, every `stopped` and `exited` box matches.
+pub struct PruneBoxes;
+
+/// The request for a [`PruneBoxes`] RPC.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PruneBoxesRequest {
+    /// Match only the boxes that entered `stopped` or `exited` at least
+    /// this many seconds ago. A box with no record of when it entered
+    /// either state does not match. Absent, the age does not narrow the
+    /// prune.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub older_than_secs: Option<u64>,
+    /// Match only the boxes whose parent is this box. Absent, the parent
+    /// does not narrow the prune.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<SessionId>,
+}
+
+/// A box that a [`PruneBoxes`] matched and did not reap.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PruneFailure {
+    /// The box's id.
+    pub box_id: SessionId,
+    /// Why the daemon did not reap it.
+    pub error: String,
+}
+
+/// The response for a [`PruneBoxes`] RPC.
+///
+/// `deny_unknown_fields`, so that `{"error": "..."}` never decodes as a
+/// prune that reaped nothing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PruneBoxesResponse {
+    /// Every box the prune reaped, as its record read before the reap, in
+    /// box id order.
+    #[serde(default)]
+    pub reaped: Vec<BoxListingEntry>,
+    /// Every box the prune matched and did not reap, in box id order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed: Vec<PruneFailure>,
+}
+
+impl OneshotSshRpc for PruneBoxes {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "PruneBoxes");
+    type Request<'a> = PruneBoxesRequest;
+    type Response = Errorable<PruneBoxesResponse>;
 }
 
 /// An RPC to destroy an existing session.
@@ -3497,6 +3644,96 @@ impl ReadEventsUpdate {
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         !matches!(self, Self::Event { .. })
+    }
+}
+
+/// Read a box's output log (BOX-155), streaming.
+///
+/// The log holds every byte the box's entrypoint wrote to its terminal,
+/// from each start of the box, whether or not a client was attached. The
+/// daemon alone writes it, outside every path the box can reach (BOX-164).
+///
+/// Not an [`OneshotSshRpc`]: the client writes one JSON-encoded
+/// [`ReadLogRequest`] and half-closes. The daemon then streams back one
+/// JSON-encoded [`ReadLogUpdate`] per line: an `Output` for each chunk of
+/// the log from the request's `offset`, in log order, then, with
+/// `follow`, each new chunk as the box writes it. Exactly one terminal
+/// line ends the stream: `Done` at the end of the log for a read that does
+/// not follow, `Reaped` when a followed box is reaped, or `Failed`. A
+/// request the daemon refuses before it reads the log, such as an unknown
+/// id, leaves the stream empty and says why on extended data.
+///
+/// The log holds at most 8 MiB. Past that, the daemon replaces the file
+/// with a line that says older output was dropped, then the newest output,
+/// half the cap in all. One stream sends no byte twice across a drop. It
+/// goes on with the bytes after the ones it already sent, so an `Output`
+/// offset can then be smaller than the one before it. When the stream fell
+/// behind by more than one drop, it sends the new file from its first
+/// byte, and the dropped-output line marks the gap.
+///
+/// The design does not state this cap yet. A box that writes more than
+/// 8 MiB loses the start of its log, which departs from
+/// docs/architecture.md line 473 ("complete from the box's start").
+/// <https://github.com/gominimal/arch/issues/159> decides the bound.
+pub const READ_LOG_SUBSYSTEM: &str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ReadLog");
+
+/// Request body for [`READ_LOG_SUBSYSTEM`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadLogRequest {
+    /// The box whose log to read.
+    pub id: SessionId,
+    /// The byte of the log file to start from: 0 for the whole log. A
+    /// later read can resume from a `Done` offset. After a drop of the
+    /// oldest output (see [`READ_LOG_SUBSYSTEM`]) the file starts again, so
+    /// an offset from before the drop does not name the same byte.
+    #[serde(default)]
+    pub offset: u64,
+    /// Keep the stream open at the end of the log, and send each new chunk
+    /// as the box writes it, until the box is reaped or the client closes
+    /// the channel.
+    #[serde(default)]
+    pub follow: bool,
+}
+
+/// One line of a [`READ_LOG_SUBSYSTEM`] response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReadLogUpdate {
+    /// The log's bytes from `offset`, in log order. The bytes are the
+    /// terminal's raw output, so the wire carries them hex-encoded.
+    Output {
+        offset: u64,
+        #[serde(with = "hex_bytes")]
+        data: Vec<u8>,
+    },
+    /// Terminal: the read reached the end of the log, and does not follow.
+    /// `offset` is the log's length, where a later read can resume.
+    Done { offset: u64 },
+    /// Terminal: the followed box was reaped, so no output follows.
+    Reaped,
+    /// Terminal: the read stopped on an error after it started.
+    Failed { error: String },
+}
+
+impl ReadLogUpdate {
+    /// Whether this update ends the stream.
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self, Self::Output { .. })
+    }
+}
+
+/// Serialises bytes as one lowercase hex string.
+mod hex_bytes {
+    use serde::{Deserialize as _, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(bytes))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(d)?;
+        hex::decode(text).map_err(serde::de::Error::custom)
     }
 }
 

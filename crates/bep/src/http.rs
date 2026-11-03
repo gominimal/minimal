@@ -284,7 +284,12 @@ pub struct AuditEvent {
     pub rule: &'static str,
 }
 
-/// Where the proxy records audit events.
+/// Where this module's relay functions record audit events.
+///
+/// The live path does not write through this trait. There
+/// [`crate::forward::forward_requests`] writes each refused head to the
+/// audit log through `Flow::record`, as one `min/v1` record with the
+/// [`FRAMING_AMBIGUOUS`] marker. This trait serves this module's own tests.
 pub trait AuditSink {
     /// Record one event.
     fn record(&mut self, event: AuditEvent);

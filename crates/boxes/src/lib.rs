@@ -348,9 +348,32 @@ pub struct CredentialedUpstream {
     /// The `[secrets]` grants, by the environment variable each lands in.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub secrets: core::bep::SecretGrants,
+    /// The upstream authorities, each `host` or `host:port`, of the
+    /// `[secret-store-rules]` rules the creation accepted for this box's
+    /// store references. A `dns` or `both` box's lookups of their hosts are
+    /// steered to the proxy (BEP-062). Skipped when empty, so a box with no
+    /// store reference serializes as it did before the field existed, and a
+    /// daemon that predates the field still reads its policy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub store_upstreams: Vec<String>,
 }
 
 impl CredentialedUpstream {
+    /// The host part of each of [`Self::store_upstreams`], with any port
+    /// removed: the names a steered box's lookups resolve to the proxy.
+    pub fn store_upstream_hosts(&self) -> impl Iterator<Item = &str> + '_ {
+        self.store_upstreams
+            .iter()
+            .map(|authority| match authority.rsplit_once(':') {
+                Some((host, port))
+                    if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) =>
+                {
+                    host
+                }
+                _ => authority.as_str(),
+            })
+    }
+
     /// Whether a declared lane takes effect in a box of this network mode:
     /// the lane is admitted at the switch's gate, which only own-address
     /// boxes sit behind. A declaration in any other mode stays on the

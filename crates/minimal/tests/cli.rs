@@ -432,6 +432,7 @@ fn ls_reports_yielded_shared_address_ports() {
         vm: "default".to_string(),
         resp: resp.clone(),
         control_sock: None,
+        running: true,
     }];
 
     assert_eq!(
@@ -510,6 +511,7 @@ fn ls_across_vms_table_shows_host_address_enforcement() {
             sessions,
         },
         control_sock: None,
+        running: true,
     };
     let listings = vec![
         listing(
@@ -4350,6 +4352,7 @@ fn ls_across_vms_names_one_proxy_verdict_per_vm() {
             sessions: Vec::new(),
         },
         control_sock: None,
+        running: true,
     };
     let listings = vec![listing("default", 7_654), listing("alpha", 7_655)];
     let answerers = vec![

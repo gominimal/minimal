@@ -409,8 +409,15 @@ pub(crate) fn decide_publish(
 /// read on the serving thread — because that is the pattern the status
 /// read already serves under.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+///
+/// The second cell is the host ports the proxy serves on (NET-154): the
+/// port the start handed, and the preferred port in front of it once the
+/// reclaim watcher took that port back ([`crate::net::proxy_reclaim`]).
 #[derive(Clone, Default)]
-pub struct ProxyPublishStatus(Arc<Mutex<Option<(u16, ProxyDownCause)>>>);
+pub struct ProxyPublishStatus(
+    Arc<Mutex<Option<(u16, ProxyDownCause)>>>,
+    Arc<Mutex<Vec<u16>>>,
+);
 
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 impl ProxyPublishStatus {
@@ -446,6 +453,44 @@ impl ProxyPublishStatus {
         if *cell == Some((port, ProxyDownCause::PublishUnconfirmed)) {
             *cell = None;
         }
+    }
+
+    /// Record that the proxy serves on `port` and on no other host port:
+    /// the port the start handed, once the publish decision brought the VM
+    /// up.
+    pub(crate) fn set_serving(&self, port: u16) {
+        *self
+            .1
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = vec![port];
+    }
+
+    /// Record that the proxy also serves on its preferred port `preferred`
+    /// (NET-150): the reclaim watcher published it beside the substitute,
+    /// so the preferred port goes first and the substitute stays.
+    pub(crate) fn add_preferred(&self, preferred: u16) {
+        let mut ports = self
+            .1
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ports.retain(|port| *port != preferred);
+        ports.insert(0, preferred);
+    }
+
+    /// Every host port the proxy serves on, the preferred first: the
+    /// answer to [`BoxControlRequest::ProxyPorts`]. Empty before the start
+    /// recorded a port, and for a start that never brought the proxy up.
+    /// Empty too while a down cause is recorded ([`Self::down`]): an
+    /// unconfirmed publish or a port held after the start serves nothing
+    /// the host can vouch for.
+    pub(crate) fn serving_ports(&self) -> Vec<u16> {
+        if self.down().is_some() {
+            return Vec::new();
+        }
+        self.1
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// The proxy-down fact to serve beside the read-only verb's answer
@@ -786,6 +831,15 @@ fn serve_connection(
         // answer, nothing to log past the connection level.
         return Ok(());
     };
+    // The read-only mirror-collisions verb (T126) is answered before the
+    // shared verbs parse, on the host door only. A guest asking for it
+    // falls through to the parse refusal, as any verb it may not ask does.
+    if door == ControlDoor::Host
+        && !root_peer
+        && let Some(reply) = mirror_collisions_reply(&line, boxes)
+    {
+        return write_json_line(&mut stream, &reply);
+    }
     let request = match parse_request(&line) {
         Ok(request) => request,
         Err(error) => {
@@ -801,6 +855,11 @@ fn serve_connection(
              answerer or cancel a release"
         );
         return Ok(());
+    }
+    // A listen notice is the fixed, size-bounded message (NET-138): a line
+    // past its bound is refused before it reaches the mirror.
+    if let Some(reply) = oversized_listen_notice(&request, &line) {
+        return write_reply(&mut stream, &reply);
     }
     // The ask verbs hold their connection open for as long as the ask or
     // the subscription lives (NET-045), so each runs on a thread of its
@@ -1112,6 +1171,15 @@ fn serve_request(
             });
             write_reply(stream, &reply)
         }
+        (BoxControlRequest::ProxyPorts, ControlDoor::Host) => {
+            // Every host port the hostname proxy serves on (NET-154), the
+            // preferred first: `min ls` lists each one, so a person reads
+            // where to point a browser while the proxy serves on two.
+            let reply = BoxControlReply::ProxyPorts {
+                proxy_ports: proxy_publish.serving_ports(),
+            };
+            write_reply(stream, &reply)
+        }
         (BoxControlRequest::ReadRow(request), ControlDoor::Host) => {
             read_row_and_reply(stream, boxes, request)
         }
@@ -1125,6 +1193,10 @@ fn serve_request(
         }
         (BoxControlRequest::WithdrawPort(request), ControlDoor::GuestReports) => {
             let reply = order.apply(|| withdraw_report(boxes, &request));
+            write_reply(stream, &reply)
+        }
+        (BoxControlRequest::ListenNotice(notice), ControlDoor::GuestReports) => {
+            let reply = order.apply(|| listen_notice_reply(boxes, notice));
             write_reply(stream, &reply)
         }
         // The audit reports touch no row, so they take no ticket: each is
@@ -1175,6 +1247,98 @@ fn serve_request(
         // frame to drop silently.
         (request, door) => refused_wrong_door(stream, &request, door),
     }
+}
+
+/// The refusal of a `listen_notice` line longer than
+/// [`minimald_rpc::ListenNotice::MAX_LINE_BYTES`], or `None` for any
+/// other line.
+fn oversized_listen_notice(request: &BoxControlRequest, line: &str) -> Option<BoxControlReply> {
+    if !matches!(request, BoxControlRequest::ListenNotice(_))
+        || line.len() <= minimald_rpc::ListenNotice::MAX_LINE_BYTES
+    {
+        return None;
+    }
+    tracing::warn!(
+        bytes = line.len(),
+        max_bytes = minimald_rpc::ListenNotice::MAX_LINE_BYTES,
+        "refused a listen notice longer than its fixed size"
+    );
+    Some(BoxControlReply::Error {
+        error: format!(
+            "a listen notice is at most {} bytes; this one is {}",
+            minimald_rpc::ListenNotice::MAX_LINE_BYTES,
+            line.len()
+        ),
+    })
+}
+
+/// The guest infrastructure ports this VM host provisioned for the guest's
+/// own services, read from this daemon's own configuration and never from
+/// a guest report: the vsock ports it bridges (the in-VM daemon's RPC
+/// bridge, the boot marker, the timekeep bridge, the report door and the
+/// telemetry port), the zone answerer's port, the range probe's port, and
+/// the node row's admitted ports, which hold the hostname proxy's port the
+/// host assigned before boot.
+pub(crate) fn guest_infrastructure_ports(boxes: &BoxRegistry) -> std::collections::BTreeSet<u16> {
+    let vsock = [
+        crate::sock::VSOCK_BRIDGE_PORT,
+        crate::cmd::VSOCK_MARKER_PORT,
+        crate::timekeep::VSOCK_TIMEKEEP_PORT,
+        minimald_rpc::VM_HOST_BOX_REPORT_PORT,
+        crate::guest_telemetry::VSOCK_TELEMETRY_PORT,
+    ];
+    let mut ports: std::collections::BTreeSet<u16> = vsock
+        .into_iter()
+        .filter_map(|port| u16::try_from(port).ok())
+        .collect();
+    ports.insert(crate::net::answerer::DEFAULT_ANSWERER_PORT);
+    ports.insert(switch::loopback::RANGE_PROBE_PORT);
+    if let Some(node) = boxes.table().by_source(boxes.subnet().daemon_ip().octets()) {
+        ports.extend(node.admitted_ports().iter().copied());
+    }
+    ports
+}
+
+/// The guest door's answer to a listen notice (NET-138): the node's mirror
+/// binds or undoes the port at the node's own address. The mirror refuses a
+/// listening notice for one of [`guest_infrastructure_ports`] on this
+/// daemon's own authority, whatever the notice says. The outcome is the mirror's
+/// audit line; the reply is [`BoxControlReply::PortRecorded`] when the
+/// mirror holds the notice, and [`BoxControlReply::Error`] when it refused.
+fn listen_notice_reply(boxes: &BoxRegistry, notice: minimald_rpc::ListenNotice) -> BoxControlReply {
+    use crate::box_registry::MirrorOutcome;
+    let recorded = BoxControlReply::PortRecorded {
+        port: notice.port,
+        proto: IpProto::Tcp,
+    };
+    let error = match boxes.mirror_notice(notice) {
+        MirrorOutcome::Bound | MirrorOutcome::Waiting | MirrorOutcome::Unbound => {
+            return recorded;
+        }
+        MirrorOutcome::Collided => format!(
+            "port {} is already in use on the host; it is not opened",
+            notice.port
+        ),
+        MirrorOutcome::RefusedInfrastructure => format!(
+            "port {} is used by the VM's own services; it is not opened on the host",
+            notice.port
+        ),
+        MirrorOutcome::Capped => format!(
+            "port {} is not opened on the host: the VM sent too many listen notices, \
+             or holds the most ports the host opens ({})",
+            notice.port,
+            crate::box_registry::MIRRORED_BINDS_CAP
+        ),
+        MirrorOutcome::NoHostAddressBox => format!(
+            "port {} is not opened on the host: no host-address box runs in the VM",
+            notice.port
+        ),
+        MirrorOutcome::BindFailed => {
+            format!("port {} could not be opened on the host", notice.port)
+        }
+        MirrorOutcome::PortZero => "port 0 is not opened on the host".to_string(),
+    };
+    BoxControlReply::Error { error }
 }
 
 /// The mint verb's answer (BOX-002): the id of the box the in-VM daemon
@@ -1575,9 +1739,11 @@ fn request_verb(request: &BoxControlRequest) -> &'static str {
         BoxControlRequest::ResumeBox(_) => "resume_box",
         BoxControlRequest::RowStanding(_) => "row_standing",
         BoxControlRequest::ProxyListening => "proxy_listening",
+        BoxControlRequest::ProxyPorts => "proxy_ports",
         BoxControlRequest::MintBoxId(_) => "mint_box_id",
         BoxControlRequest::ReportExposeDecision(_) => "report_expose_decision",
         BoxControlRequest::ReportRefusedEgress(_) => "report_refused_egress",
+        BoxControlRequest::ListenNotice(_) => "listen_notice",
     }
 }
 
@@ -1739,6 +1905,85 @@ fn read_request_line(stream: &mut UnixStream) -> std::io::Result<Option<String>>
             ));
         }
     }
+}
+
+/// The host control socket's reads that the shared verb set does not carry.
+/// The request line of each is its verb alone, as
+/// `{"verb":"mirror_collisions"}`.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(tag = "verb", rename_all = "snake_case")]
+pub enum HostReadRequest {
+    /// The node's mirrored ports that collided with a holder on the host
+    /// (NET-138). The reply is a [`MirrorCollisionsReply`].
+    MirrorCollisions,
+}
+
+/// The reply to [`HostReadRequest::MirrorCollisions`]: the node's mirrored
+/// ports that collided with a holder on the host, in ascending order. It
+/// carries ports only, and no address, path or box name.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct MirrorCollisionsReply {
+    pub mirror_collisions: Vec<u16>,
+}
+
+/// How long [`read_mirror_collisions`] waits for the whole exchange.
+pub const MIRROR_COLLISIONS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The reply to a request line that asks for the mirror collisions, or
+/// `None` for any other line.
+fn mirror_collisions_reply(line: &str, boxes: &BoxRegistry) -> Option<MirrorCollisionsReply> {
+    match serde_json_lenient::from_str::<HostReadRequest>(line) {
+        Ok(HostReadRequest::MirrorCollisions) => {
+            let reply = MirrorCollisionsReply {
+                mirror_collisions: boxes.node_mirror().collisions(),
+            };
+            tracing::debug!(
+                collisions = reply.mirror_collisions.len(),
+                "answered the mirror collisions read"
+            );
+            Some(reply)
+        }
+        Err(_) => None,
+    }
+}
+
+fn write_json_line(stream: &mut UnixStream, reply: &impl serde::Serialize) -> std::io::Result<()> {
+    let mut line = serde_json_lenient::to_string(reply).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("control reply did not serialize: {error}"),
+        )
+    })?;
+    line.push('\n');
+    stream.write_all(line.as_bytes())
+}
+
+/// Reads the node's collided mirror ports from the VM host daemon's control
+/// socket at `sock_path`, for the host CLI.
+///
+/// `None` when the socket is not there, the exchange fails or passes
+/// [`MIRROR_COLLISIONS_TIMEOUT`], or the daemon predates the verb and
+/// answers with a refusal. The caller then prints nothing for it.
+pub async fn read_mirror_collisions(sock_path: &Path) -> Option<Vec<u16>> {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+    let exchange = async {
+        let mut stream = tokio::net::UnixStream::connect(sock_path).await.ok()?;
+        let mut line = serde_json_lenient::to_string(&HostReadRequest::MirrorCollisions).ok()?;
+        line.push('\n');
+        stream.write_all(line.as_bytes()).await.ok()?;
+        let mut reply = String::new();
+        tokio::io::BufReader::new(&mut stream)
+            .read_line(&mut reply)
+            .await
+            .ok()?;
+        serde_json_lenient::from_str::<MirrorCollisionsReply>(reply.trim())
+            .ok()
+            .map(|reply| reply.mirror_collisions)
+    };
+    tokio::time::timeout(MIRROR_COLLISIONS_TIMEOUT, exchange)
+        .await
+        .ok()
+        .flatten()
 }
 
 fn parse_request(line: &str) -> Result<BoxControlRequest, serde_json_lenient::Error> {
@@ -3798,6 +4043,7 @@ mod tests {
                 panic!("a box verb is never answered with a row-standing read, got {other:?}")
             }
             other @ (BoxControlReply::ProxyListening { .. }
+            | BoxControlReply::ProxyPorts { .. }
             | BoxControlReply::Audited { .. }
             | BoxControlReply::BoxIdMinted { .. }) => {
                 panic!("a box verb is never answered with a proxy-listening read, got {other:?}")
@@ -4279,6 +4525,7 @@ mod tests {
                 panic!("a box verb is never answered with a row-standing read, got {other:?}")
             }
             other @ (BoxControlReply::ProxyListening { .. }
+            | BoxControlReply::ProxyPorts { .. }
             | BoxControlReply::Audited { .. }
             | BoxControlReply::BoxIdMinted { .. }) => {
                 panic!("a box verb is never answered with a proxy-listening read, got {other:?}")
@@ -4402,6 +4649,7 @@ mod tests {
                     panic!("a box verb is never answered with a row-standing read, got {other:?}")
                 }
                 other @ (BoxControlReply::ProxyListening { .. }
+                | BoxControlReply::ProxyPorts { .. }
                 | BoxControlReply::Audited { .. }
                 | BoxControlReply::BoxIdMinted { .. }) => {
                     panic!(
@@ -4477,6 +4725,7 @@ mod tests {
                 panic!("a box verb is never answered with a row-standing read, got {other:?}")
             }
             other @ (BoxControlReply::ProxyListening { .. }
+            | BoxControlReply::ProxyPorts { .. }
             | BoxControlReply::Audited { .. }
             | BoxControlReply::BoxIdMinted { .. }) => {
                 panic!("a box verb is never answered with a proxy-listening read, got {other:?}")
@@ -7873,5 +8122,245 @@ mod tests {
         assert_eq!(suppressed.len(), 2, "the withdrawal flushes the count");
         assert_eq!(suppressed[1]["box"], "web");
         assert_eq!(suppressed[1]["suppressed"], dropped);
+    }
+
+    /// NET-138: the guest door refuses, on this daemon's own authority, a
+    /// listen notice for a guest infrastructure port it provisioned, read
+    /// from its own configuration: the in-VM daemon's RPC bridge port and
+    /// the hostname proxy's port the node row holds. A forged notice that
+    /// carries an address, or a line past the notice's fixed size, never
+    /// reaches the mirror. A box's own port binds.
+    #[test]
+    fn mirror_refuses_guest_rpc_port_under_forged_notice() {
+        let binder = Arc::new(crate::box_registry::TestMirrorBinder::default());
+        let boxes = BoxRegistry::new(SUBNET)
+            .with_mirror_binder(Arc::clone(&binder) as Arc<dyn crate::box_registry::MirrorBinder>);
+        let proxy_port = 7654;
+        boxes.register_node_namespace(proxy_port);
+        let node = switch::loopback::range_hosts()
+            .nth(201)
+            .expect("a reserved-range host");
+        boxes.open_node_mirror(node).expect("the mirror opens");
+        boxes.node_mirror().set_range_probe(true);
+        let session = boxes::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
+            .expect("a session id");
+        assert!(boxes.admit_host_ip_box(session, None));
+
+        let rpc_port = u16::try_from(crate::sock::VSOCK_BRIDGE_PORT).expect("a TCP-sized port");
+        // Every refusal logs at warn, a repeated one too: the notice rate
+        // cap bounds them, and its counter counts what it drops.
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for port in [
+                rpc_port,
+                proxy_port,
+                minimald_rpc::VM_HOST_BOX_REPORT_PORT as u16,
+            ] {
+                let line =
+                    format!(r#"{{"verb":"listen_notice","port":{port},"state":"listening"}}"#);
+                let request = parse_request(&line).expect("a well-formed notice parses");
+                assert!(oversized_listen_notice(&request, &line).is_none());
+                let BoxControlRequest::ListenNotice(notice) = request else {
+                    panic!("the line is a listen notice");
+                };
+                match listen_notice_reply(&boxes, notice) {
+                    BoxControlReply::Error { error } => assert!(
+                        error.contains("used by the VM's own services"),
+                        "the refusal says why: {error}"
+                    ),
+                    other => panic!("port {port} is the guest's own; got {other:?}"),
+                }
+            }
+            // The registry's own entry refuses them too, so no caller can
+            // reach a bind past the check.
+            for port in [rpc_port, proxy_port] {
+                assert_eq!(
+                    boxes.mirror_notice(minimald_rpc::ListenNotice {
+                        port,
+                        state: minimald_rpc::ListenState::Listening,
+                    }),
+                    crate::box_registry::MirrorOutcome::RefusedInfrastructure,
+                    "port {port} is the guest's own"
+                );
+            }
+        });
+        let log = capture.contents();
+        let refusals: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains("refused a mirrored bind"))
+            .collect();
+        assert_eq!(refusals.len(), 5, "one line per refusal:\n{log}");
+        assert!(
+            refusals
+                .iter()
+                .all(|line| line.contains("WARN") && line.contains("guest-infrastructure-port")),
+            "each refusal is a warn line:\n{log}"
+        );
+        assert_eq!(boxes.node_mirror().notices_dropped_by_rate(), 0);
+        assert!(binder.calls().is_empty(), "no infrastructure port is bound");
+
+        // A notice that names an address, a path or a name is not a notice.
+        for forged in [
+            r#"{"verb":"listen_notice","port":8080,"state":"listening","address":"127.0.0.1"}"#,
+            r#"{"verb":"listen_notice","port":8080,"state":"listening","name":"web"}"#,
+            r#"{"verb":"listen_notice","port":8080,"state":"listening","path":"/x"}"#,
+        ] {
+            assert!(parse_request(forged).is_err(), "refused: {forged}");
+        }
+        let padded = format!(
+            r#"{{"verb":"listen_notice","port":8080,"state":"listening"}}{}"#,
+            " ".repeat(minimald_rpc::ListenNotice::MAX_LINE_BYTES)
+        );
+        let request = parse_request(&padded).expect("trailing spaces still parse");
+        assert!(
+            matches!(
+                oversized_listen_notice(&request, &padded),
+                Some(BoxControlReply::Error { .. })
+            ),
+            "a line past the fixed size is refused"
+        );
+
+        // A forged notice for port 0 is refused: a bind there takes a port
+        // the host picks, and the mirror never moves a port.
+        assert!(matches!(
+            listen_notice_reply(
+                &boxes,
+                minimald_rpc::ListenNotice {
+                    port: 0,
+                    state: minimald_rpc::ListenState::Listening,
+                }
+            ),
+            BoxControlReply::Error { .. }
+        ));
+        assert!(binder.open().is_empty(), "port 0 binds nothing");
+
+        // A box's own port binds at the node's address.
+        let port = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .and_then(|listener| listener.local_addr())
+            .expect("a free port")
+            .port();
+        assert_eq!(
+            listen_notice_reply(
+                &boxes,
+                minimald_rpc::ListenNotice {
+                    port,
+                    state: minimald_rpc::ListenState::Listening,
+                }
+            ),
+            BoxControlReply::PortRecorded {
+                port,
+                proto: IpProto::Tcp
+            }
+        );
+        assert_eq!(binder.open(), vec![(node, port)]);
+        // A stop notice for an infrastructure port is the goal state.
+        assert!(matches!(
+            listen_notice_reply(
+                &boxes,
+                minimald_rpc::ListenNotice {
+                    port: rpc_port,
+                    state: minimald_rpc::ListenState::Stopped,
+                }
+            ),
+            BoxControlReply::PortRecorded { .. }
+        ));
+    }
+
+    /// T126 (NET-138): the host door's read-only `mirror_collisions` verb
+    /// answers the node's mirrored ports that collided with a holder on the
+    /// host, as ports alone. A port leaves the list when it binds. The guest
+    /// door does not answer the verb.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mirror_collisions_reported_over_control() {
+        use crate::box_registry::{MirrorBinder, MirrorOutcome, TestMirrorBinder};
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sock_path = dir.path().join(CONTROL_SOCK_FILE);
+        let binder = Arc::new(TestMirrorBinder::default());
+        let boxes = BoxRegistry::new(SUBNET)
+            .with_mirror_binder(Arc::clone(&binder) as Arc<dyn MirrorBinder>);
+        boxes.register_node_namespace(7654);
+        let node = switch::loopback::range_hosts()
+            .nth(200)
+            .expect("the reserved range has more than 200 hosts");
+        boxes
+            .open_node_mirror(node)
+            .expect("a reserved-range address no row holds opens the mirror");
+        boxes.node_mirror().set_range_probe(true);
+        let session = boxes::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
+            .expect("a session id");
+        assert!(boxes.admit_host_ip_box(session, None));
+        let answerer = AnswererStatus::allocating_for_tests("control-test-node");
+        let proxy_publish = ProxyPublishStatus::new();
+        let _server = spawn(
+            sock_path.clone(),
+            boxes.clone(),
+            answerer.clone(),
+            proxy_publish.clone(),
+        )
+        .expect("server binds");
+        for _ in 0..500 {
+            if TestStream::connect(&sock_path).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        assert_eq!(
+            read_mirror_collisions(&sock_path).await,
+            Some(Vec::new()),
+            "a node with no collision answers an empty list"
+        );
+
+        let holder =
+            std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a holder on the host");
+        let port = holder.local_addr().expect("the holder's address").port();
+        assert_eq!(
+            boxes.mirror_notice(minimald_rpc::ListenNotice {
+                port,
+                state: minimald_rpc::ListenState::Listening,
+            }),
+            MirrorOutcome::Collided
+        );
+        assert_eq!(read_mirror_collisions(&sock_path).await, Some(vec![port]));
+        let since = boxes.node_mirror().collisions_since();
+        assert_eq!(since.len(), 1);
+        assert_eq!(since[0].0, port);
+
+        // The raw reply carries the ports and nothing else.
+        let mut stream = TestStream::connect(&sock_path).expect("connects");
+        stream
+            .write_all(b"{\"verb\":\"mirror_collisions\"}\n")
+            .expect("writes");
+        let mut raw = String::new();
+        BufReader::new(stream).read_line(&mut raw).expect("reads");
+        let value: serde_json_lenient::Value =
+            serde_json_lenient::from_str(raw.trim()).expect("the reply is JSON");
+        assert_eq!(
+            value,
+            serde_json_lenient::json!({ "mirror_collisions": [port] }),
+            "the reply carries ports only"
+        );
+
+        // Once the holder is gone and the port binds, it leaves the list.
+        drop(holder);
+        assert_eq!(
+            boxes.mirror_notice(minimald_rpc::ListenNotice {
+                port,
+                state: minimald_rpc::ListenState::Listening,
+            }),
+            MirrorOutcome::Bound
+        );
+        assert_eq!(read_mirror_collisions(&sock_path).await, Some(Vec::new()));
+
+        // The guest door does not answer the verb.
+        let guest = spawn_guest_reports_door(&sock_path, boxes.clone(), answerer, proxy_publish)
+            .expect("the guest door binds");
+        assert_eq!(read_mirror_collisions(&guest).await, None);
     }
 }

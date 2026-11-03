@@ -1532,6 +1532,17 @@ fn credential_module_hosts() -> Vec<&'static str> {
         .collect()
 }
 
+/// The names a `dns` or `both` box's lookups are steered for: the GitHub
+/// module's hosts, and the host of each store-rule upstream the box's
+/// policy carries (BEP-062).
+fn steered_hosts(policy: &boxes::BoxPolicy) -> Vec<&str> {
+    let mut hosts = credential_module_hosts();
+    if let Some(declaration) = policy.credentialed_upstream.as_ref() {
+        hosts.extend(declaration.store_upstream_hosts());
+    }
+    hosts
+}
+
 impl BoxGate {
     /// Builds a gate from a session's whole policy: the declared internal ports
     /// per transport (TCP and UDP separately) drive the inbound half, the
@@ -1599,7 +1610,7 @@ impl BoxGate {
         )
         .with_steering(
             policy,
-            &credential_module_hosts(),
+            &steered_hosts(policy),
             subnet.box_egress_proxy_address(),
             listener,
         );
@@ -7584,6 +7595,7 @@ pub(crate) mod tests {
                         mode: None,
                     },
                 )]),
+                store_upstreams: Vec::new(),
             }),
             quic443: None,
         }
@@ -8023,6 +8035,83 @@ pub(crate) mod tests {
             door_task.abort();
         }
 
+        /// BEP-062: a `dns`-steered box with a store reference, whose
+        /// policy carries its accepted rule's upstream, resolves that
+        /// upstream to the proxy's address while the proxy listens, and gets
+        /// SERVFAIL while it does not. A name no rule names is not steered.
+        #[tokio::test]
+        async fn store_authority_of_a_dns_box_resolves_to_the_proxy() {
+            let capture = crate::test_harness::captured_log();
+            let dir = tempfile::tempdir().expect("temp dir");
+            let control_sock = dir.path().join("gvproxy.sock");
+            let door = dir.path().join("guest-control.sock");
+            let listening = Arc::new(AtomicBool::new(false));
+            let door_task = proxy_door(&door, Arc::clone(&listening));
+            crate::net::listeners::seed_vm_report_door_for_tests(&control_sock, &door);
+
+            // The policy the create request carries for a box whose store
+            // reference a rule for `api.openai.com:443` accepted.
+            let mut policy = steered_policy();
+            if let Some(egress) = policy.egress.as_mut() {
+                egress
+                    .allow_dns_hosts
+                    .get_or_insert_with(Vec::new)
+                    .extend(["api.openai.com".to_string(), "example.com".to_string()]);
+            }
+            policy.credentialed_upstream = Some(boxes::CredentialedUpstream {
+                store_upstreams: vec!["api.openai.com:443".to_string()],
+                ..boxes::CredentialedUpstream::default()
+            });
+            let lease = Ipv4Addr::new(100, 64, 0, 21);
+            let gate = BoxGate::for_session_steered(
+                lease.to_string(),
+                lease,
+                &policy,
+                SwitchSubnet::default(),
+                None,
+                ProxyListenerState::for_switch(&ControlChannel::Unix(control_sock.clone())),
+            );
+
+            let reply = lookup_until(&gate, "api.openai.com.", ResponseCode::ServFail).await;
+            assert!(
+                addresses(&reply).is_empty(),
+                "SERVFAIL carries no address while the proxy is down"
+            );
+
+            listening.store(true, Ordering::Release);
+            let reply = lookup_until(&gate, "api.openai.com.", ResponseCode::NoError).await;
+            assert_eq!(
+                addresses(&reply),
+                vec![SwitchSubnet::default().box_egress_proxy_address()],
+                "the rule's upstream resolves to the proxy, never a real address"
+            );
+            let reply = lookup(&gate, "github.com.");
+            assert_eq!(
+                addresses(&reply),
+                vec![SwitchSubnet::default().box_egress_proxy_address()],
+                "the GitHub module's hosts stay steered beside the store upstream"
+            );
+            let query = crate::net::dns_gate::tests::dns_query("example.com.", RecordType::A);
+            let resolver = SocketAddrV4::new(SwitchSubnet::default().dns_server(), 53);
+            assert!(
+                gate.dns.intercept_query(&resolver, &query).is_none(),
+                "a name no rule names is forwarded, not steered"
+            );
+            let logged = capture.contents();
+            for expected in ["name=api.openai.com", "session_id=100.64.0.21"] {
+                assert!(
+                    logged.contains(expected),
+                    "the log carries {expected:?}: {logged}"
+                );
+            }
+
+            listening.store(false, Ordering::Release);
+            lookup_until(&gate, "api.openai.com.", ResponseCode::ServFail).await;
+
+            crate::net::listeners::clear_vm_report_door_for_tests(&control_sock);
+            door_task.abort();
+        }
+
         /// BEP-062: a GitHub grant box with `steering = "dns"` or `"both"`,
         /// its gate built as the VM host's attach builds it. While the
         /// host reports the proxy's listener live, github.com resolves to
@@ -8057,6 +8146,7 @@ pub(crate) mod tests {
                     )]
                     .into_iter()
                     .collect(),
+                    store_upstreams: Vec::new(),
                 });
                 let lease = Ipv4Addr::new(100, 64, 0, 30 + u8::try_from(index).expect("small"));
                 // The attach's own construction (`gvproxy_network.rs`).

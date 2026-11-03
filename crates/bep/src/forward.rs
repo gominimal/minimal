@@ -1286,6 +1286,16 @@ pub fn forward_requests<R: Read, W: Write>(
         }
     };
     match &end {
+        // BEP-039: a refused head is audited, and its log line names the
+        // box and the framing rule, which the audit record has no field for.
+        HalfEnd::Closed(reason) if reason.audit_marker().is_some() => {
+            tracing::info!(
+                box_id = flow.box_id,
+                marker = reason.audit_marker(),
+                rule = reason.rule(),
+                "a request head was refused"
+            );
+        }
         HalfEnd::Closed(reason) => {
             tracing::debug!(
                 box_id = flow.box_id,
@@ -3846,5 +3856,49 @@ mod tests {
                 prop_assert_eq!(client, head.serialize());
             }
         }
+    }
+
+    // BEP-039, #2435: a head with ambiguous framing that the live request
+    // half reads is refused before any byte goes upstream. The audit log
+    // that `min box audit <box>` reads holds one `framing_ambiguous` refuse
+    // record for the box, and the log line names the box and the rule.
+    #[test]
+    fn live_path_audits_a_framing_ambiguous_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let flow = plain_flow("github.com", audit_log(&dir));
+        let raw = b"POST /repo.git/git-receive-pack HTTP/1.1\r\nHost: github.com\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+        let mut outcome = None;
+        let logged = logged_spans(|| outcome = Some(forwarded(&flow, raw)));
+        let (upstream, end) = outcome.unwrap();
+
+        assert!(upstream.is_empty(), "no byte reaches the upstream");
+        assert!(
+            matches!(
+                end,
+                HalfEnd::Closed(CloseReason::FramingAmbiguous(
+                    http::Ambiguity::ContentLengthWithTransferEncoding
+                ))
+            ),
+            "{end:?}"
+        );
+        let entries = LogReader::new(dir.path()).read_new().unwrap().entries;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        let record = &entries[0].record;
+        assert_eq!(record.subject, "box-a");
+        assert_eq!(record.upstream, "github.com:443");
+        assert_eq!(record.decision, Outcome::Refuse);
+        assert_eq!(record.marker.as_deref(), Some(http::FRAMING_AMBIGUOUS));
+
+        let line = logged
+            .lines()
+            .find(|line| line.contains("a request head was refused"))
+            .unwrap_or_else(|| panic!("no refusal line in {logged}"));
+        assert!(line.contains("INFO"), "{line}");
+        assert!(line.contains("box_id=\"box-a\""), "{line}");
+        assert!(line.contains("marker=\"framing_ambiguous\""), "{line}");
+        assert!(
+            line.contains("rule=\"content_length_with_transfer_encoding\""),
+            "{line}"
+        );
     }
 }

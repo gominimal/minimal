@@ -336,6 +336,63 @@ pub(super) fn watch_quic443_exit(
     })
 }
 
+/// The actor's end of an [`watch_entrypoint_exit`] watch: it receives how
+/// the watched host's runtime loop ended, once, when it ends with an exit.
+pub(super) type EntrypointWatch = tokio::sync::oneshot::Receiver<box_runtime::HostExit>;
+
+/// Whether a box ends when its entrypoint returns (BOX-038): its spec sets
+/// `lifetime = "until_complete"`. A box with no stored spec reads as one,
+/// as a spec stored without `box.lifetime` does.
+pub(super) fn ends_with_entrypoint(spec: Option<&mfile::spec::BoxSpec>) -> bool {
+    spec.is_none_or(|spec| spec.lifetime == mfile::spec::Lifetime::UntilComplete)
+}
+
+/// Watches a host's runtime loop `task` for the box's actor. When the loop
+/// ends, the watch receives its [`box_runtime::HostExit`], and the actor
+/// decides from it whether the box ends.
+///
+/// This is the one way a box ends without a request (BOX-015, BOX-038):
+/// its entrypoint returns. Nothing here, or anywhere in the daemon, ends a
+/// box because it is idle or because its clients went away. A client that
+/// detaches or drops leaves the entrypoint running, and the loop with it.
+///
+/// The handle it returns stands in for `task`, as [`watch_quic443_exit`]'s
+/// does: it yields the loop's result, and an abort of it aborts the loop.
+pub(super) fn watch_entrypoint_exit(
+    task: JoinHandle<Result<box_runtime::HostExit, std::io::Error>>,
+    box_id: boxes::SessionId,
+) -> (
+    JoinHandle<Result<box_runtime::HostExit, std::io::Error>>,
+    EntrypointWatch,
+) {
+    let (watch_tx, watch) = tokio::sync::oneshot::channel();
+    let mut abort_loop = AbortLoopOnDrop(Some(task.abort_handle()));
+    let root = tracing::info_span!(
+        parent: None,
+        "session.host.entrypoint_exit",
+        box_id = %box_id,
+    );
+    let watched = crate::traced::spawn_detached(root, async move {
+        let result = task.await;
+        abort_loop.disarm();
+        if let Ok(Ok(exit)) = &result {
+            // The actor may be gone, or may hold a later launch's watch: the
+            // exit is then nobody's to act on.
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "an actor that dropped the watch has nothing to end"
+            )]
+            let _ = watch_tx.send(exit.clone());
+        }
+        match result {
+            Ok(result) => result,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => Err(std::io::Error::other(error)),
+        }
+    });
+    (watched, watch)
+}
+
 /// Where in the session lifecycle a host launch is happening, which decides
 /// whether the launch has to wait for an `Active` record.
 ///
@@ -794,8 +851,35 @@ impl BoxActor {
             record.id,
             &box_runtime::launch_deliveries(&record),
         );
+        // The box starts from its stored spec. The actor keeps its hold, so
+        // the next launch reads the same spec. A stored spec that cannot be
+        // read refuses the launch, as a resume of it is refused: the box's
+        // first process cannot be decided without it.
+        let spec = self.held_spec().await.map_err(|error| {
+            AttachError::SpawnFailed(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "{error} Destroy it with `min session destroy {name}`, then start a new \
+                     one with `min session activate`.",
+                    name = registry_name(&record),
+                ),
+            ))
+        })?;
+        // Interim: `run_by_exec` is `true` on every launch, so every launch,
+        // a hook launch and an attach included, starts the shell, and a task
+        // box does not start its spec's argv. `min task run` sends the task's
+        // run over the exec channel, so the shell keeps the task to one run.
+        // Flip condition: T43 (#2405) moves a task's run from the exec
+        // channel to the box's entrypoint, and removes this constant.
+        let spec = box_runtime::LaunchSpec {
+            spec,
+            run_by_exec: true,
+        };
+        // Read before the launcher takes the spec: the host hands it to each
+        // binding, which raises no shell-exit prompt for a box that ends.
+        let ends_with_entrypoint = ends_with_entrypoint(spec.spec.as_deref());
         let launcher = self
-            .session_launcher(session_hnd, &record, attach_env, phase, for_hooks)
+            .session_launcher(session_hnd, &record, spec, attach_env, phase, for_hooks)
             .await?;
         // Where the shell-exit prompt's save-then-delete lane archives the
         // changed files. Daemon-side and session-independent; created on
@@ -856,6 +940,7 @@ impl BoxActor {
                 // network registration is restored on its next attach or exec
                 // (NET-138).
                 holds_host_row: record.box_addresses.is_some(),
+                ends_with_entrypoint,
                 session_id: record.id,
                 // The host runs attach and detach itself: it owns the terminal
                 // they write to and the process whose namespaces they join.
@@ -976,6 +1061,10 @@ impl BoxActor {
             ),
             None => task,
         };
+        // BOX-038: the actor reads how this launch's loop ends. A later
+        // launch replaces the watch, so an earlier loop never ends the box.
+        let (task, watch) = watch_entrypoint_exit(task, record.id);
+        self.entrypoint_watch = Some(watch);
         // A write that fails costs only the restart's memory of who bound
         // the port, never this launch: said, and the box is handed back.
         #[cfg(target_os = "linux")]
@@ -1104,6 +1193,54 @@ impl BoxActor {
         Ok(())
     }
 
+    /// The spec stored beside this box's record, read by the first launch
+    /// and then held by the actor. `None` for a box filed with no spec: that
+    /// box starts its shell, as every box did before its spec named an
+    /// entrypoint.
+    ///
+    /// # Errors
+    ///
+    /// A stored spec this daemon cannot read, or a failed read of the store.
+    /// The launch is refused, and the error is not held.
+    pub(super) async fn held_spec(&mut self) -> std::io::Result<Option<Arc<mfile::spec::BoxSpec>>> {
+        if let Some(held) = &self.held_spec {
+            return Ok(held.clone());
+        }
+        let stored = match self.record.object().await {
+            Ok(object) => object.load_spec(),
+            Err(error) => Err(error),
+        };
+        // An error is not held: the next launch reads the store again.
+        let spec = match stored {
+            Ok(Some(bytes)) => match box_runtime::stored_spec(&bytes) {
+                Ok(spec) => Some(Arc::new(spec)),
+                Err(error) => {
+                    tracing::warn!(
+                        box_id = %self.record.id(),
+                        %error,
+                        "launch: the stored spec cannot be read; the launch is refused"
+                    );
+                    return Err(error);
+                }
+            },
+            // A box filed with no spec starts its shell.
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(
+                    box_id = %self.record.id(),
+                    %error,
+                    "launch: reading the stored spec failed; the launch is refused"
+                );
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    "The settings it was created with cannot be read.",
+                ));
+            }
+        };
+        self.held_spec = Some(spec.clone());
+        Ok(spec)
+    }
+
     /// Hands back this session's host, launching one if none is running.
     ///
     /// Unlike [`Self::attach`] there is no channel: the host is minted with
@@ -1128,6 +1265,29 @@ impl BoxActor {
                 .map_err(AttachError::LoadoutFailed)?;
             if record.status != BoxState::Active {
                 return Err(AttachError::SessionPending);
+            }
+            // An ended box is resumed only by an attach (BOX-025). A host
+            // launched here would run its entrypoint again behind the
+            // record's back.
+            if let Ok(
+                state @ (boxes::core::record::RecordState::Stopped(_)
+                | boxes::core::record::RecordState::Exited(_)),
+            ) = record.state()
+            {
+                return Err(AttachError::ResumeRefused(
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "box {} is {}. Only a running box can run a command.",
+                            record
+                                .name
+                                .clone()
+                                .unwrap_or_else(|| self.record.id().to_string()),
+                            state.name()
+                        ),
+                    ),
+                    2,
+                ));
             }
             // Attach's refusal, for the same reason: neither the host a
             // later launch left in the slot nor a fresh one would hold the
@@ -2062,7 +2222,11 @@ mod quic443_cohort_tests {
             let task = crate::traced::spawn(async move {
                 let code = exited.await.unwrap_or(137);
                 assert!(code >= 0, "the host loop panics");
-                Ok(crate::box_runtime::HostExit { code, reason: None })
+                Ok(crate::box_runtime::HostExit {
+                    code,
+                    reason: None,
+                    requested: false,
+                })
             });
             let watched = watch_quic443_exit(
                 task,
