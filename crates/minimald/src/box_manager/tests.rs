@@ -4978,3 +4978,97 @@ async fn claim_name_refuses_a_box_being_removed() {
         "the record is gone"
     );
 }
+
+/// BOX-013, BOX-038: a stop reads the box as running, and the entrypoint
+/// returns before the stop reaches the box's actor. The daemon ends the box
+/// as `exited` with the code, and the stop answers that the box already
+/// exited, with that code. The stop writes no second ending: the record
+/// keeps `exited`, and it has one `exited` event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_racing_natural_end_answers_already_exited() {
+    use boxes::core::record::{ExitEnding, RecordState};
+
+    let log = crate::test_harness::captured_log();
+    let (_state, _cache, mngr) = manager().await;
+    let id = create_active_session_with(&mngr, sample_config()).await;
+    let host = session(&mngr, id)
+        .await
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session launches a headless host");
+
+    let (reached, release) = stop_dispatch_seam::pause(id);
+    let stop = {
+        let mngr = mngr.clone();
+        crate::traced::spawn(async move { mngr.stop_box(id, false).await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), reached)
+        .await
+        .expect("the stop reads the box as running")
+        .expect("the seam answers");
+
+    // The entrypoint returns while the stop is on its way to the actor.
+    host.feed_stdin(format!("{}\n", crate::box_runtime::MOCK_EXIT_LINE).into_bytes())
+        .await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let record = mngr
+                .get_record(BoxKeyPredicate::Id(id))
+                .await
+                .unwrap()
+                .expect("an ended box keeps its record");
+            if record.status == boxes::BoxState::Exited && mngr.running_count().await == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the daemon ends the box when its entrypoint returns");
+
+    release.send(()).expect("the stop waits at the seam");
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(10), stop)
+        .await
+        .expect("the stop answers")
+        .expect("the stop task does not panic")
+        .expect("a stop that lost the race is not an error");
+    assert_eq!(
+        answer,
+        StopAnswer::AlreadyExited(ExitEnding::Exit { exit_code: 0 })
+    );
+    assert_eq!(answer.outcome(), "already_exited");
+    assert_eq!(
+        crate::rpc::stop_box_response(answer),
+        minimald_rpc::StopBoxResponse {
+            exit_code: Some(0),
+            signal: None,
+            already_exited: true,
+        }
+    );
+
+    let record = mngr
+        .get_record(BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("an exited box keeps its record");
+    assert_eq!(
+        record.state().unwrap(),
+        RecordState::Exited(ExitEnding::Exit { exit_code: 0 })
+    );
+    let mut reader = mngr.box_events(id).await.unwrap();
+    let exited: Vec<_> = reader
+        .read_new()
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == BoxEventType::Exited)
+        .collect();
+    assert_eq!(exited.len(), 1, "one ending: {exited:?}");
+    assert_eq!(exited[0].data["reason"], "exit");
+    assert_eq!(exited[0].data["exit_code"], 0);
+
+    let logged = log.contents();
+    assert!(
+        logged.contains("stop: the box already exited before the stop reached it"),
+        "the daemon log names the race outcome:\n{logged}"
+    );
+}

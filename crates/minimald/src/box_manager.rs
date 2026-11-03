@@ -2285,7 +2285,8 @@ impl BoxManagerHandle {
 
     /// Stops the running box `id` and keeps its record (BOX-013, BOX-018),
     /// with the daemon's grace period between SIGTERM and SIGKILL. Answers
-    /// how the box ended.
+    /// how the box ended: stopped, or already exited when the entrypoint
+    /// returned first and the box ended on its own (BOX-038).
     ///
     /// # Errors
     ///
@@ -2296,18 +2297,65 @@ impl BoxManagerHandle {
         &self,
         id: SessionId,
         force: bool,
-    ) -> Result<boxes::core::record::StopEnding, BoxManagerError> {
-        self.stop_box_with_grace(id, force, crate::box_actor::STOP_GRACE)
+    ) -> Result<StopAnswer, BoxManagerError> {
+        self.stop_box_answer(id, force, crate::box_actor::STOP_GRACE)
             .await
     }
 
-    /// [`Self::stop_box`] with the grace period `grace`.
+    /// [`Self::stop_box`] with the grace period `grace`, for a caller that
+    /// needs the stop's own ending. A box whose entrypoint returned before
+    /// the stop ended it is refused with `InvalidInput`, as a box that is
+    /// not running is.
+    #[cfg(test)]
     pub(crate) async fn stop_box_with_grace(
         &self,
         id: SessionId,
         force: bool,
         grace: std::time::Duration,
     ) -> Result<boxes::core::record::StopEnding, BoxManagerError> {
+        match self.stop_box_answer(id, force, grace).await? {
+            StopAnswer::Stopped(ending) => Ok(ending),
+            StopAnswer::AlreadyExited(ending) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "session `{}` exited before the stop reached it ({ending:?})",
+                    id.as_ref()
+                ),
+            )),
+        }
+    }
+
+    /// [`Self::stop_box`] with the grace period `grace`. The `stop` span
+    /// records `outcome` as `stopped` or `already_exited`.
+    pub(crate) async fn stop_box_answer(
+        &self,
+        id: SessionId,
+        force: bool,
+        grace: std::time::Duration,
+    ) -> Result<StopAnswer, BoxManagerError> {
+        use tracing::Instrument as _;
+        let span = tracing::info_span!(
+            "stop",
+            session_id = %id,
+            force,
+            outcome = tracing::field::Empty,
+        );
+        let answer = self
+            .stop_box_answer_inner(id, force, grace)
+            .instrument(span.clone())
+            .await;
+        if let Ok(answer) = &answer {
+            span.record("outcome", answer.outcome());
+        }
+        answer
+    }
+
+    async fn stop_box_answer_inner(
+        &self,
+        id: SessionId,
+        force: bool,
+        grace: std::time::Duration,
+    ) -> Result<StopAnswer, BoxManagerError> {
         if self.in_shutdown.is_cancelled() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::ConnectionRefused,
@@ -2347,28 +2395,68 @@ impl BoxManagerHandle {
                 ));
             }
         }
+        #[cfg(test)]
+        stop_dispatch_seam::reached(id).await;
         tracing::info!(session_id = %id, force, "stop: dispatching to the session");
-        let session = self
-            .get_session(BoxKeyPredicate::Id(id))
-            .await?
-            .ok_or_else(unknown)?;
-        let stopped = session.stop_box(force, grace).await;
-        if stopped.is_err() {
-            // A stop that waited behind another stop of the same box finds
-            // the actor gone when the first one ends. The record then says
-            // how the box ended, and that is this stop's answer too.
-            if let Ok(Some(record)) = self.get_record(BoxKeyPredicate::Id(id)).await
-                && let Ok(boxes::core::record::RecordState::Stopped(ending)) = record.state()
-            {
+        let session = self.get_session(BoxKeyPredicate::Id(id)).await;
+        // The entrypoint can return between the read above and here, and
+        // its actor then ends the box as `exited` (BOX-038). A handle given
+        // out after that is a fresh actor with no host, whose stop would
+        // write a second ending over the first. Read the record again, so
+        // the box keeps the ending it already has.
+        if let Some(answer) = self.ended_while_stopping(id).await {
+            return Ok(answer);
+        }
+        let session = session?.ok_or_else(unknown)?;
+        match session.stop_box(force, grace).await {
+            Ok(ending) => {
                 tracing::info!(
                     session_id = %id,
+                    outcome = "stopped",
                     ending = ?ending,
-                    "stop: an earlier stop ended the box; answering with its ending"
+                    "stop: the stop ended the box"
                 );
-                return Ok(ending);
+                Ok(StopAnswer::Stopped(ending))
             }
+            // The actor ended before it took the stop: an earlier stop of
+            // the same box, or the entrypoint's own return, ended it. The
+            // record then says how the box ended, and that is this stop's
+            // answer too.
+            Err(error) => match self.ended_while_stopping(id).await {
+                Some(answer) => Ok(answer),
+                None => Err(error),
+            },
         }
-        stopped
+    }
+
+    /// The answer for a stop of `id` when the record says the box already
+    /// ended, as it does when another stop or the entrypoint's return
+    /// (BOX-038) ended it first. `None` while the box still runs, or when
+    /// the record cannot be read.
+    async fn ended_while_stopping(&self, id: SessionId) -> Option<StopAnswer> {
+        let record = self.get_record(BoxKeyPredicate::Id(id)).await.ok()??;
+        let answer = match record.state().ok()? {
+            boxes::core::record::RecordState::Stopped(ending) => StopAnswer::Stopped(ending),
+            boxes::core::record::RecordState::Exited(ending) => StopAnswer::AlreadyExited(ending),
+            _ => return None,
+        };
+        let state = answer.state();
+        match answer {
+            StopAnswer::Stopped(ending) => tracing::info!(
+                session_id = %id,
+                outcome = answer.outcome(),
+                ending = ?ending,
+                "stop: an earlier stop ended the box; answering with its ending"
+            ),
+            StopAnswer::AlreadyExited(ending) => tracing::info!(
+                session_id = %id,
+                outcome = answer.outcome(),
+                ending = ?ending,
+                exit_code = state.exit_code(),
+                "stop: the box already exited before the stop reached it; answering with its exit"
+            ),
+        }
+        Some(answer)
     }
 
     /// The state and directories of the box `id` when the box is stopped
@@ -2422,6 +2510,80 @@ impl BoxManagerHandle {
                 hooks: object.hooks_path(),
             },
         }))
+    }
+}
+
+/// The test seam for a stop that the entrypoint's return races (BOX-038):
+/// a test pauses the stop of one box after it read the record as running
+/// and before it reaches the box's actor. Keyed by box id, so tests running
+/// beside each other never pause each other's stops.
+#[cfg(test)]
+pub(crate) mod stop_dispatch_seam {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use boxes::SessionId;
+    use tokio::sync::oneshot;
+
+    type Pause = (oneshot::Sender<()>, oneshot::Receiver<()>);
+
+    static PAUSED: Mutex<Option<HashMap<SessionId, Pause>>> = Mutex::new(None);
+
+    /// Pauses the next stop of `id` at its dispatch. Answers a receiver
+    /// that fires when the stop reaches the pause, and the sender that
+    /// releases it.
+    pub(crate) fn pause(id: SessionId) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        PAUSED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(id, (reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+
+    /// Waits here when a test paused the stop of `id`.
+    pub(super) async fn reached(id: SessionId) {
+        let paused = PAUSED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .and_then(|p| p.remove(&id));
+        if let Some((reached, release)) = paused {
+            let _ = reached.send(());
+            let _ = release.await;
+        }
+    }
+}
+
+/// How a stop of a running box ended (BOX-013, BOX-038).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopAnswer {
+    /// The stop ended the box, or an earlier stop of it did.
+    Stopped(boxes::core::record::StopEnding),
+    /// The entrypoint returned before the stop could end the box, and the
+    /// box ended on its own: the record keeps that ending.
+    AlreadyExited(boxes::core::record::ExitEnding),
+}
+
+impl StopAnswer {
+    /// The record state this answer reports.
+    #[must_use]
+    pub const fn state(&self) -> boxes::core::record::RecordState {
+        match *self {
+            Self::Stopped(ending) => boxes::core::record::RecordState::Stopped(ending),
+            Self::AlreadyExited(ending) => boxes::core::record::RecordState::Exited(ending),
+        }
+    }
+
+    /// The `outcome` the stop span and the daemon log record.
+    #[must_use]
+    pub const fn outcome(&self) -> &'static str {
+        match self {
+            Self::Stopped(_) => "stopped",
+            Self::AlreadyExited(_) => "already_exited",
+        }
     }
 }
 
