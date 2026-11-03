@@ -358,11 +358,8 @@ fn refuse_unhonourable_grants(
 /// has no proxy, so a steered name there always fails closed, and a
 /// `host_ip` or `none` box has no steered lookups of its own. `min box
 /// spec` reads it for the network its `--network` flag names. Where this
-/// is true, `dns` steering is still refused on its own grounds until the proxy
-/// takes a direct TLS connection (#2805). Under `both`, a tool that
-/// ignores `HTTPS_PROXY` gets the proxy's address, and the switch drops its
-/// TCP connection to port 443 with no reset, so it stalls until #2805 adds
-/// the direct TLS path.
+/// is true, a `dns`-steered box opens TLS to the proxy's address on port
+/// 443, and the proxy routes it by its SNI (BEP-080).
 pub(crate) fn host_resolves_box_names(kind: paths::HostKind, network: boxes::NetworkMode) -> bool {
     kind == paths::HostKind::Minvmd && network == boxes::NetworkMode::OwnIp
 }
@@ -3799,12 +3796,11 @@ mod tests {
         assert_eq!(refused.exit_code(), 3);
     }
 
-    /// BEP-017, BEP-062: a GitHub grant box with `both` steering is created
-    /// where the VM host's switch resolves its names, and `min box spec`
-    /// shows it. There, `dns`, declared or by default, is refused with exit
-    /// 3 and a text that names the proxy, not the host, until the proxy
-    /// takes a direct TLS connection (#2805). On a native host, and for a
-    /// `host_ip` box, both are refused for the missing resolver. For every
+    /// BEP-017, BEP-062, BEP-080: a GitHub grant box with `dns` steering,
+    /// declared or by default, or with `both`, is created where the VM
+    /// host's switch resolves its names, and `min box spec` shows it. On a
+    /// native host, and for a `host_ip` box, both are refused for the
+    /// missing resolver. For every
     /// case, `min box spec` refuses exactly when creation does, with the
     /// same text.
     #[test]
@@ -3858,10 +3854,6 @@ mod tests {
                 "This box declares a secret with steering = \"{word}\", but this host \
                  has no box DNS resolver. Set steering = \"proxy_env\" in [network.bep]."
             );
-            let no_direct_tls = "This box declares a secret with steering = \"dns\", but the \
-                 Box Egress Proxy does not yet take a direct TLS connection, so dns steering \
-                 cannot reach it. Set steering = \"both\" or steering = \"proxy_env\" in \
-                 [network.bep].";
 
             for (kind, network) in [
                 (HostKind::Minvmd, boxes::NetworkMode::OwnIp),
@@ -3869,12 +3861,8 @@ mod tests {
                 (HostKind::Minvmd, boxes::NetworkMode::HostNet),
             ] {
                 let resolver = host_resolves_box_names(kind, network);
-                let accepted = word == "both" && resolver;
-                let refusal = if resolver {
-                    no_direct_tls
-                } else {
-                    no_resolver.as_str()
-                };
+                let accepted = resolver;
+                let refusal = no_resolver.as_str();
                 let case = format!("{word} {kind:?} {network:?}");
 
                 let created = refuse_unhonourable_grants(
@@ -3913,7 +3901,10 @@ mod tests {
                     let warnings = created.unwrap_or_else(|err| panic!("{case}: accepted: {err}"));
                     assert!(warnings.is_empty(), "{case}: no warning: {warnings:?}");
                     let text = String::from_utf8(out).expect("utf-8");
-                    assert!(text.contains("steering  both\n"), "{case}: {text}");
+                    assert!(
+                        text.contains(&format!("steering  {word}\n")),
+                        "{case}: {text}"
+                    );
                     continue;
                 }
                 for err in [
@@ -3980,15 +3971,19 @@ mod tests {
                     assert_eq!(created, previewed, "{case}: same refusal");
 
                     let own_ip_on_vm_host = kind == HostKind::Minvmd && flag == Some("own_ip");
-                    if word == "both" && own_ip_on_vm_host {
+                    if own_ip_on_vm_host {
                         // On the VM host, `min box spec --network own_ip`
-                        // admits a `both` spec with a credentialed upstream.
+                        // admits a `dns` or `both` spec with a credentialed
+                        // upstream.
                         assert_eq!(previewed, Ok(()), "{case}: admitted");
                         let text = String::from_utf8(out).expect("utf-8");
-                        assert!(text.contains("steering  both\n"), "{case}: {text}");
-                    } else if word == "both" {
+                        assert!(
+                            text.contains(&format!("steering  {word}\n")),
+                            "{case}: {text}"
+                        );
+                    } else {
                         // Any other mode or host has no steered lookups of
-                        // its own, so `both` is refused for the missing
+                        // its own, so the spec is refused for the missing
                         // resolver. That includes no flag at all, as a
                         // default activation is refused. A `none` box is
                         // also refused for its missing network.
@@ -3999,8 +3994,6 @@ mod tests {
                         } else {
                             assert_eq!(refused, no_resolver, "{case}");
                         }
-                    } else {
-                        assert!(previewed.is_err(), "{case}: dns is refused");
                     }
                 }
             }

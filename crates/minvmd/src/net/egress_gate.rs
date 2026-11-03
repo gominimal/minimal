@@ -5080,7 +5080,11 @@ async fn relay_frames_to_switch(
         // the table's parse supplies them — the same allocation-free,
         // bounds-checked read the in-VM relay's is.
         let l4 = dns_pins::parse_ipv4_l4(&frame[..n]);
-        let admitted = match gate_verdict(&summary, l4.as_ref(), table, baseline, pins, replies) {
+        let decided = gate_verdict(&summary, l4.as_ref(), table, baseline, pins, replies);
+        if summary.box_cohort_marked() {
+            log_marked_decision(&summary, l4.as_ref(), table, baseline, &decided);
+        }
+        let admitted = match decided {
             Ok(admitted) => admitted,
             Err(GateDrop::SwitchControlSurface { src, dst_port }) => {
                 limiter.warn_switch_surface(src, dst_port);
@@ -6244,6 +6248,75 @@ fn gate_verdict(
     row_verdict(summary, l4, table, baseline, pins, src)
 }
 
+/// The tracing target of [`log_marked_decision`]'s line, so a harness can
+/// turn on that one debug line without the gate's other debug output.
+pub(crate) const MARKED_DECISION_TARGET: &str = "minvmd::egress_gate::marked";
+
+/// Logs at debug why the gate decided one box-marked frame (NET-085): the
+/// verdict, the rule, which arm decided it, and the resident `host_ip` set
+/// and cohort record the decision read. Only a flow's opening frame (a TCP
+/// SYN, or any frame that is not TCP) writes a line, so a long connection
+/// writes one, not one per segment.
+fn log_marked_decision(
+    summary: &FrameSummary,
+    l4: Option<&dns_pins::L4Packet>,
+    table: &BoxTable,
+    baseline: &NodePlaneBaseline,
+    decided: &Result<GateAdmit, GateDrop>,
+) {
+    const TCP_SYN: u8 = 0x02;
+    const TCP_ACK: u8 = 0x10;
+    if !tracing::enabled!(target: MARKED_DECISION_TARGET, tracing::Level::DEBUG) {
+        return;
+    }
+    if let Some(l4) = l4
+        && l4.proto == egress::IPPROTO_TCP
+        && (l4.tcp_flags & (TCP_SYN | TCP_ACK)) != TCP_SYN
+    {
+        return;
+    }
+    let src = summary.source();
+    let phase = baseline.phase();
+    let node = baseline.node_addr();
+    let arm = if phase != NodeBaselinePhase::InForce {
+        "source-row: the node baseline is not in force"
+    } else if src != Some(node) {
+        "source-row: the source is not the node address"
+    } else {
+        "host-ip-boxes: the resident host_ip boxes' rules"
+    };
+    let resident = table.host_ip_boxes();
+    let sessions: Vec<String> = resident
+        .iter()
+        .map(|rules| rules.session_id().to_string())
+        .collect();
+    let cohort = table
+        .host_ip_cohort()
+        .map_or_else(|| "none".to_string(), |record| record.name().to_string());
+    let (verdict, rule) = match decided {
+        Ok(admit) => ("admitted", format!("{admit:?}")),
+        Err(drop) => ("dropped", drop.rule().to_string()),
+    };
+    tracing::debug!(
+        target: MARKED_DECISION_TARGET,
+        source = %src.map_or_else(|| "none".to_string(), |s| Ipv4Addr::from(s).to_string()),
+        destination = %summary
+            .destination()
+            .map_or_else(|| "none".to_string(), |d| Ipv4Addr::from(d).to_string()),
+        port = summary.destination_port(),
+        source_port = l4.map_or(0, |l4| l4.src.port()),
+        verdict,
+        rule,
+        arm,
+        baseline_phase = ?phase,
+        node_address = %Ipv4Addr::from(node),
+        resident_host_ip_boxes = resident.len(),
+        resident_sessions = %sessions.join(","),
+        cohort = %cohort,
+        "decided a box-marked frame",
+    );
+}
+
 /// The decision for a box-marked frame from the node address under the
 /// in-force baseline (NET-085, design §4.3 rule 2): admitted when one
 /// resident `host_ip` box's rules admit it, and dropped under
@@ -6474,8 +6547,10 @@ fn row_verdict(
     if let Some(dst) = summary.destination()
         && dst == table.subnet().box_egress_proxy_address().octets()
     {
-        // minvmd is the one crate that sees both spellings of the listener's port.
+        // minvmd is the one crate that sees both spellings of the listener's
+        // port and of the direct TLS port.
         const _: () = assert!(egress::PROXY_LISTENER_PORT == switch::bep_host::PROXY_PORT);
+        const _: () = assert!(egress::PROXY_DIRECT_TLS_PORT == switch::bep_host::PROXY_TLS_PORT);
         let listener = egress::ProxyListener::at(dst);
         if egress::proxy_lane_admits(record.declares_credentialed_upstream(), listener, summary) {
             return Ok(GateAdmit::ProxyLane);
@@ -12900,7 +12975,7 @@ mod tests {
         // reaches the switch. The marker after them, at the listener itself,
         // proves every one was decided before it and none passed.
         let refused = [
-            ipv4_frame(LEASE, 6, proxy, 443),
+            ipv4_frame(LEASE, 6, proxy, 444),
             ipv4_frame(LEASE, 6, proxy, 8080),
             ipv4_frame(LEASE, 17, proxy, 8118),
         ];
@@ -12926,7 +13001,7 @@ mod tests {
         for needle in [
             "source=100.64.0.9",
             "destination=100.64.255.252",
-            "port=443",
+            "port=444",
             "box=\"laned\"",
             "rule_matched=\"egress-uncredentialed-proxy-destination\"",
         ] {
