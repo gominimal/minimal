@@ -4198,10 +4198,12 @@ mod tests {
     }
 
     /// BEP-082: a `host_ip` registration is answered with a box id and no
-    /// address. Each registration is a new creation with its own id, the
-    /// same name included, and none of them puts a row in the address
-    /// table. A held registration holds no lease: the reply is written and
-    /// the connection closes.
+    /// address. Each registration is a new creation with its own id, and
+    /// none of them puts a row in the address table. A held registration
+    /// holds no lease: the reply is written and the connection closes.
+    /// BOX-163 parity: a second registration of a live name is refused with
+    /// the held-name text, and after the box retires the name registers
+    /// again under a fresh id.
     #[test]
     fn host_ip_box_registration_mints_a_creation_unique_id() {
         let dir = tempfile::TempDir::new().expect("temp dir");
@@ -4219,8 +4221,26 @@ mod tests {
             other => panic!("a host_ip registration is answered with a box id, got {other:?}"),
         };
         let first = minted(register(&sock_path, &host_ip(false)).expect("answered"));
+        match register(&sock_path, &host_ip(true)).expect("answered") {
+            BoxControlReply::Error { error } => assert_eq!(
+                error,
+                AllocationError::NameAlreadyHeld {
+                    held: "agent".to_string()
+                }
+                .to_string(),
+                "a live registration keeps its name"
+            ),
+            other => panic!("a second registration of a live name is refused, got {other:?}"),
+        }
+        assert_eq!(
+            registry.host_ip_id_for("agent"),
+            Some(first.to_bytes()),
+            "the refusal leaves the name with the first registration"
+        );
+        registry.retire_host_ip_box(boxes::SessionId::from_bytes(first.to_bytes()));
         let second = minted(register(&sock_path, &host_ip(true)).expect("answered"));
         assert_ne!(first, second, "each creation gets its own id");
+        assert_eq!(registry.host_ip_id_for("agent"), Some(second.to_bytes()));
         for id in [first, second] {
             assert!(
                 registry.holds_host_ip_id(id.to_bytes()),

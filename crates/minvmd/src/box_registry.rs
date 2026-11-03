@@ -4590,7 +4590,9 @@ impl BoxRegistry {
     /// # Errors
     ///
     /// The errors of [`Self::holds_box_id`], and
-    /// [`AllocationError::CollidingBoxId`] when a record holds the id.
+    /// [`AllocationError::CollidingBoxId`] when a record holds the id, and
+    /// [`AllocationError::NameAlreadyHeld`] when a live `host_ip`
+    /// registration holds the name.
     pub fn register_host_ip_box(&self, name: &str) -> Result<BoxId, AllocationError> {
         self.register_host_ip_box_as(name, crate::bep_attach::mint_box_id())
     }
@@ -4610,9 +4612,26 @@ impl BoxRegistry {
             return Err(AllocationError::CollidingBoxId { id });
         }
         let mut ids = self.host_ip_id_set();
+        // BOX-163 parity: a live registration keeps its name until its box
+        // retires or its creator withdraws it. A second registration under
+        // the name is refused as an own-address row's is, and it never
+        // takes the name from the first. The check and the insert run under
+        // one lock, so two registrations cannot both take the name.
+        let asked = canonical_box_name(name);
+        if let Some(held) = ids
+            .by_name
+            .keys()
+            .find(|named| canonical_box_name(named) == asked)
+            .cloned()
+        {
+            tracing::warn!(
+                asked = %name,
+                held = %held,
+                "refused a host_ip box registration whose name a live registration already holds"
+            );
+            return Err(AllocationError::NameAlreadyHeld { held });
+        }
         ids.ids.insert(id);
-        // A later registration under the name replaces the earlier one:
-        // the in-VM create that follows it is for the latest.
         ids.by_name.insert(name.to_owned(), id);
         Ok(id)
     }
@@ -4633,8 +4652,8 @@ impl BoxRegistry {
     }
 
     /// Whether a live `host_ip` registration name still answers `id`
-    /// ([`Self::host_ip_id_for`]): the box has not retired, and no later
-    /// registration took its name.
+    /// ([`Self::host_ip_id_for`]): the box has not retired, and its creator
+    /// did not withdraw the name.
     #[must_use]
     pub fn host_ip_id_is_named(&self, id: BoxId) -> bool {
         self.host_ip_id_set()
@@ -4643,7 +4662,7 @@ impl BoxRegistry {
             .any(|named| *named == id)
     }
 
-    /// The id the latest `host_ip` registration under `name` minted
+    /// The id the live `host_ip` registration under `name` minted
     /// ([`Self::register_host_ip_box`], BEP-082), so the box's record takes
     /// the id its grants are sealed under. `None` when no live `host_ip`
     /// registration uses the name: a `host_ip` box with no credentialed

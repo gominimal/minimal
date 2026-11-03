@@ -6239,13 +6239,14 @@ fn log_marked_decision(
 /// proxy's address drops under [`PROXY_LANE_RULE`].
 ///
 /// Interim: while the lane is open, a member that declares no credentialed
-/// upstream also reaches the listener and TCP 443. Gatehouse §6.10 says
-/// that member must not. The cause is that the gate cannot tell the
-/// members apart: every member leaves from the node address with the same
-/// cohort mark. The refusal of such a member belongs to the in-VM
-/// classifier, which knows the sender's cgroup. That classifier work is
-/// the follow-up the review of the BEP-083 gate half (PR #2861) asks to
-/// file. The interim ends when the in-VM classifier refuses a connection
+/// upstream also reaches the listener and TCP 443. Networking §7.1 (line
+/// 244) and §4.3 rule 2 (T28) say that member must not. The cause is that
+/// the gate cannot tell the members apart: every member leaves from the
+/// node address with the same cohort mark. The refusal of such a member
+/// belongs to the in-VM classifier, which knows the sender's cgroup. The
+/// owner accepted this exposure as an interim, and
+/// <https://github.com/gominimal/minimal/issues/2876> tracks the
+/// classifier work. The interim ends when the in-VM classifier refuses a connection
 /// to the proxy's address from a member that declares no lane. This gate
 /// logic stays as it is then: it is the gate half of the lane.
 fn host_ip_verdict(
