@@ -1,5 +1,5 @@
 //! Named VMs (NET-052..NET-055): a VM named with `--vm` gets its own state
-//! directory, socket, and daemon under a per-name subdirectory of the provider
+//! directory, socket, and daemon under a per-name subdirectory of the host
 //! directory, the default VM's paths are unchanged, and stopping one VM leaves
 //! the other running. Reaping scoped to this checkout's VMs (NET-056) is a
 //! shell harness, `scripts/reap-vms_test.sh`.
@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use minvmd::lifecycle::Lifecycle;
 use minvmd::state::{State, StateDir};
-use paths::{DaemonAbsPath, ProviderKind, SSH_SOCK_FILE};
+use paths::{DaemonAbsPath, HostKind, SSH_SOCK_FILE};
 
 /// The `minvmd` binary under test: `MINVMD_BIN` when set — the VM lanes' split
 /// build/test runners, where the absolute path baked by `CARGO_BIN_EXE_minvmd`
@@ -68,19 +68,19 @@ impl BinRun {
 }
 
 /// The state directory a VM named `vm` owns under `base` (NET-054): the
-/// per-name subdirectory of the provider dir for a named VM, the provider dir
+/// per-name subdirectory of the host dir for a named VM, the host dir
 /// itself for the default VM.
-fn provider_dir(base: &Path, vm: &str) -> PathBuf {
+fn host_dir(base: &Path, vm: &str) -> PathBuf {
     let base = DaemonAbsPath::try_new(base.to_str().expect("tempdir path is UTF-8"))
         .expect("tempdir path is absolute");
-    minvmd::state::provider_dir_for(&base, vm)
+    minvmd::state::host_dir_for(&base, vm)
 }
 
-/// The provider instance dir under `base`, by the pre-named-VMs spelling.
-fn provider_instance_dir(base: &Path) -> PathBuf {
+/// The host dir under `base`, by the pre-named-VMs spelling.
+fn base_host_dir(base: &Path) -> PathBuf {
     let base = DaemonAbsPath::try_new(base.to_str().expect("tempdir path is UTF-8"))
         .expect("tempdir path is absolute");
-    paths::provider_instance_dir(&base, ProviderKind::Minvmd, 0)
+    paths::host_dir(&base, HostKind::Minvmd, 0)
         .as_utf8_path()
         .as_std_path()
         .to_path_buf()
@@ -98,7 +98,7 @@ struct LiveVm {
 }
 
 fn live_vm(base: &Path, vm: &str) -> LiveVm {
-    let state_dir = StateDir::new(provider_dir(base, vm)).expect("opening the VM's state dir");
+    let state_dir = StateDir::new(host_dir(base, vm)).expect("opening the VM's state dir");
     let lock = state_dir
         .try_acquire_alive_lock()
         .expect("probing the alive lock")
@@ -165,8 +165,8 @@ impl Drop for LiveVm {
 #[test]
 fn named_vm_has_own_state_socket_daemon() {
     let base = tempfile::tempdir().unwrap();
-    let alpha = provider_dir(base.path(), "alpha");
-    let default = provider_dir(base.path(), paths::DEFAULT_VM_NAME);
+    let alpha = host_dir(base.path(), "alpha");
+    let default = host_dir(base.path(), paths::DEFAULT_VM_NAME);
 
     // The daemon resolves the named VM's own state directory: `status` acts
     // on it (creating it; a never-booted VM reports "stopped", exit 1), and it
@@ -183,7 +183,7 @@ fn named_vm_has_own_state_socket_daemon() {
         "the named VM must own its own state directory"
     );
     // The default VM's *files* are untouched: its state directory is the
-    // provider dir the named VM nests under, so the directory exists as a
+    // host dir the named VM nests under, so the directory exists as a
     // parent, but nothing of the default VM's own was written.
     assert!(
         !default.join("minvmd.toml").exists(),
@@ -248,19 +248,19 @@ fn default_vm_paths_unchanged() {
     let base = tempfile::tempdir().unwrap();
     let state =
         DaemonAbsPath::try_new(base.path().to_str().unwrap()).expect("tempdir path is absolute");
-    let default = minvmd::state::provider_dir_for(&state, paths::DEFAULT_VM_NAME);
+    let default = minvmd::state::host_dir_for(&state, paths::DEFAULT_VM_NAME);
 
-    // The default VM's directory is the provider instance dir itself, named or
+    // The default VM's directory is the host dir itself, named or
     // not — the pre-named-VMs resolution, byte for byte.
     assert_eq!(
         default,
-        paths::provider_instance_dir(&state, ProviderKind::Minvmd, 0)
+        paths::host_dir(&state, HostKind::Minvmd, 0)
             .as_utf8_path()
             .as_std_path()
     );
-    assert_eq!(minvmd::state::provider_dir_for(&state, "default"), default);
+    assert_eq!(minvmd::state::host_dir_for(&state, "default"), default);
 
-    // Every runtime file keeps its name and place directly in the provider
+    // Every runtime file keeps its name and place directly in the host
     // dir — none moved into a per-name subdirectory:
     let sd = StateDir::open_existing(default.clone());
     let files = [
@@ -285,7 +285,7 @@ fn default_vm_paths_unchanged() {
     }
 
     // And the binary agrees: with no `--vm` and with `--vm default`, the state
-    // directory it creates is the provider dir, never a `default/` subdir.
+    // directory it creates is the host dir, never a `default/` subdir.
     run_minvmd(base.path(), &["status"]);
     assert!(default.is_dir());
     assert!(
@@ -305,30 +305,28 @@ fn default_vm_paths_unchanged() {
 fn named_vm_under_per_name_subdirectory() {
     let base = tempfile::tempdir().unwrap();
 
-    // A named VM's state sits in a per-name subdirectory of the provider
+    // A named VM's state sits in a per-name subdirectory of the host
     // directory.
     assert_eq!(
-        provider_dir(base.path(), "alpha"),
-        provider_instance_dir(base.path()).join("alpha")
+        host_dir(base.path(), "alpha"),
+        base_host_dir(base.path()).join("alpha")
     );
 
     // The binary places it there: `--vm alpha` provisions exactly that
-    // subdirectory, and nothing at the provider dir's own level.
+    // subdirectory, and nothing at the host dir's own level.
     run_minvmd(base.path(), &["--vm", "alpha", "status"]);
-    let alpha = provider_instance_dir(base.path()).join("alpha");
+    let alpha = base_host_dir(base.path()).join("alpha");
     assert!(
         alpha.is_dir(),
         "the named VM's state must live in {alpha:?}"
     );
     assert!(
-        !provider_instance_dir(base.path())
-            .join("minvmd.toml")
-            .exists(),
+        !base_host_dir(base.path()).join("minvmd.toml").exists(),
         "the named VM must not act on the provider dir itself"
     );
 
     // A name outside the allowlist never resolves anywhere: each of these
-    // would otherwise reach outside the provider dir, or shadow the provider
+    // would otherwise reach outside the host dir, or shadow the host
     // dir's own entries (`guest`). In a fresh state dir, a rejected name
     // creates nothing at all.
     let fresh = tempfile::tempdir().unwrap();

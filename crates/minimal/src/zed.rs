@@ -45,7 +45,7 @@ pub fn default_settings_path() -> Result<PathBuf, anyhow::Error> {
 
 /// Everything needed to render one `ssh_connections` entry.
 pub struct Connection {
-    /// SSH host identity. Must be the provider-instance alias, because that is
+    /// SSH host identity. Must be the host alias, because that is
     /// what the daemon keys its `known_hosts` entry on.
     pub host: String,
     /// Local login name. The daemon authenticates the *session* from
@@ -71,7 +71,7 @@ impl Connection {
     ///
     /// The host-key options ride along because Zed spawns a bare `ssh` with no
     /// access to our config: without them ssh consults the user's own
-    /// `known_hosts`, does not find the provider alias, and the connection dies
+    /// `known_hosts`, does not find the host alias, and the connection dies
     /// on an interactive host-key prompt Zed cannot answer.
     ///
     /// `projects` is always the single [`WORKSPACE_ROOT`] entry — the session's
@@ -107,7 +107,7 @@ pub enum Outcome {
 /// Insert or refresh this session's entry in `settings["ssh_connections"]`.
 ///
 /// Identity is the `SetEnv MINIMAL_SESSION_ID=<id>` argument, not the host:
-/// every session on a provider shares that provider's host alias, so the host
+/// every session on a host shares that host's alias, so the host
 /// alone would collapse them all onto one entry.
 ///
 /// An existing entry is replaced outright, so a re-run restores the canonical
@@ -291,7 +291,7 @@ mod tests {
         assert_eq!(settings["ssh_connections"].as_array().unwrap().len(), 1);
     }
 
-    /// A moved socket (daemon reinstalled, provider dir changed) rewrites the
+    /// A moved socket (daemon reinstalled, host dir changed) rewrites the
     /// existing entry rather than leaving a stale one behind.
     #[test]
     fn upsert_rewrites_a_stale_proxy_command() {
@@ -310,7 +310,7 @@ mod tests {
         ));
     }
 
-    /// Two sessions on the same provider share a host alias, so they must be
+    /// Two sessions on the same host share a host alias, so they must be
     /// told apart by their session id — not collapsed onto one entry.
     #[test]
     fn upsert_keeps_sessions_on_one_host_distinct() {

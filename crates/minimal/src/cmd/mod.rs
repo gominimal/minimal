@@ -24,6 +24,7 @@ mod box_spec;
 // `boxes.rs` is mounted under another name: see its module docs.
 #[path = "boxes.rs"]
 mod box_verbs;
+mod doctor;
 mod finalize_install;
 mod list;
 mod net;
@@ -33,8 +34,8 @@ mod session;
 
 // The Ctrl-C cleanup (`arm_activation_interrupt`) withdraws the row the
 // activation registered with the VM host daemon; the withdrawal lives with
-// the session commands, as does the provider-kind rule its gate keys on.
-pub(crate) use box_verbs::{daemon_provider_kind, vm_host_control_sock, withdraw_box_row};
+// the session commands, as does the host-kind rule its gate keys on.
+pub(crate) use box_verbs::{daemon_host_kind, vm_host_control_sock, withdraw_box_row};
 
 pub use admin::*;
 pub use auth::{cmd_auth_login, cmd_auth_logout, cmd_auth_status};
@@ -85,6 +86,16 @@ pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
         None => Ok(()),
         Some(handoff) => Err(handoff.finish()),
     }
+}
+
+/// Run the GitHub sign-in inside its `auth.login` span. `verb` is what the
+/// user typed (`login` or `auth login`), so a trace tells the alias from the
+/// long form.
+async fn sign_in(global: &GlobalArgs, args: AuthLoginArgs, verb: &str) -> anyhow::Result<()> {
+    use tracing::Instrument as _;
+    cmd_auth_login(global, args)
+        .instrument(tracing::info_span!("auth.login", verb))
+        .await
 }
 
 /// What a command leaves for the process to do after its `cmd` span has
@@ -199,9 +210,9 @@ fn root_context(
 
 pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
     // Adopt any pre-split `providers/local-<N>` dirs into the kind-tagged scheme
-    // once per invocation, before any command resolves a provider dir, so an
+    // once per invocation, before any command resolves a host dir, so an
     // upgraded CLI finds an existing instance rather than orphaning it.
-    client::migrate_legacy_provider_dirs(cli.global_args.minimal_dir.as_deref());
+    client::migrate_legacy_host_dirs(cli.global_args.minimal_dir.as_deref());
 
     match cli.command {
         // A bare `min` (no subcommand) resolves-or-creates a session in a
@@ -232,12 +243,15 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Box(BoxArgs { command })) => match command {
             BoxCommand::Spec(args) => box_spec::cmd_box_spec(&cli.global_args, args),
             BoxCommand::Audit(args) => box_audit::cmd_box_audit(&cli.global_args, args).await,
+            BoxCommand::List(args) => cmd_box_list(&cli.global_args, args).await,
+            BoxCommand::Show(args) => cmd_box_show(&cli.global_args, args).await,
         },
         Some(Command::Net(NetArgs {
             command: NetCommand::Forward(args),
         })) => cmd_net_forward(&cli.global_args, args).await,
         Some(Command::FinalizeInstall(args)) => cmd_finalize_install(&cli.global_args, args).await,
         Some(Command::Dirs) => dirs::cmd_dirs(&cli.global_args),
+        Some(Command::Doctor) => doctor::cmd_doctor(),
         Some(Command::Bug(args)) => diag::cmd_bug(&cli.global_args, args).await,
         Some(Command::Diag(diag::DiagArgs { command })) => match command {
             diag::DiagCommand::Collect(args) => diag::cmd_bug(&cli.global_args, args).await,
@@ -252,7 +266,7 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         },
         Some(Command::Proxy(args)) => cmd_proxy(&cli.global_args, args).await,
         Some(Command::Auth(AuthArgs { command })) => match command {
-            AuthCommand::Login(args) => cmd_auth_login(&cli.global_args, args).await,
+            AuthCommand::Login(args) => sign_in(&cli.global_args, args, "auth login").await,
             AuthCommand::Status => cmd_auth_status(&cli.global_args),
             AuthCommand::Logout => cmd_auth_logout(&cli.global_args).await,
         },
@@ -261,9 +275,8 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             SecretCommand::List(args) => cmd_secret_list(&cli.global_args, args),
             SecretCommand::Rm(args) => cmd_secret_rm(&cli.global_args, args),
         },
-        Some(Command::Login(args)) => {
-            cmd_login(&cli.global_args, args, &mut std::io::stdout().lock()).await
-        }
+        // NET-109: `min login` is the alias for `min auth login`.
+        Some(Command::Login(args)) => sign_in(&cli.global_args, args, "login").await,
         // Unlocked handle: `Stdout` takes its lock per write, so the lock is
         // not held across the daemon handshake, where a spawned task's
         // logging may need stdout too.
@@ -300,14 +313,6 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Dash) => cmd_dash(&cli.global_args).await,
     }
 }
-
-// The autogen session name and its collision retry are the client
-// library's, shared with `min dash`.
-#[cfg(test)]
-pub(crate) use minimal_client::box_name::AUTOGEN_NAME_RETRIES;
-pub(crate) use minimal_client::box_name::{
-    autogen_session_name, random_hex4, sanitize_name_component, should_retry_autogen,
-};
 
 /// Connect to the daemon, resolving the socket path from global args, and
 /// refuse to proceed against a daemon of a different build
@@ -555,7 +560,165 @@ pub(crate) fn named_record(
     record: Option<boxes::Record>,
     session: &str,
 ) -> Result<boxes::Record, anyhow::Error> {
-    record.ok_or_else(|| anyhow::anyhow!("No session found matching '{session}'"))
+    record.ok_or_else(|| BoxNotFound(format!("No session found matching '{session}'")).into())
+}
+
+/// A box name that resolved to no box a command can reach; the message says
+/// why. Typed so a caller can tell the miss from a failed RPC: the selected
+/// VM's own miss ([`named_record`]), no running VM holding the name
+/// ([`no_running_vm_has_box`]), or the box on a stopped VM
+/// ([`box_on_stopped_vm`]).
+#[derive(Debug)]
+pub(crate) struct BoxNotFound(pub(crate) String);
+
+impl std::fmt::Display for BoxNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BoxNotFound {}
+
+/// A box name that more than one VM holds, running or stopped, with no
+/// `--vm` to pick one; the message names the VMs. Typed so a caller can tell
+/// the ambiguity from a failed RPC, as [`AmbiguousIdPrefix`] is.
+#[derive(Debug)]
+pub(crate) struct AmbiguousBoxName(pub(crate) String);
+
+impl std::fmt::Display for AmbiguousBoxName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AmbiguousBoxName {}
+
+/// The refusal for a box name no running VM holds, on a host with more than
+/// one VM (NET-058). `example` is the command the user ran, after `min` and
+/// with the box name in place, such as `session policy beta`.
+pub(crate) fn no_running_vm_has_box(name: &str, example: &str) -> String {
+    format!(
+        "no running VM has a box named '{name}'. A box on another VM is named with --vm, \
+         for example: min --vm <vm> {example}"
+    )
+}
+
+/// The refusal for a box name only a stopped VM's persisted records hold
+/// (NET-152). `min --vm <vm> session attach <box>` starts that VM:
+/// `--vm` selects it before any path resolves, and the attach runs
+/// `ensure_daemon`, which spawns the selected VM's `minvmd`
+/// (`autospawn::ensure_minvmd_running`).
+pub(crate) fn box_on_stopped_vm(name: &str, vm: &str) -> String {
+    format!(
+        "box '{name}' is on VM '{vm}', which is stopped. \
+         Start it with: min --vm {vm} session attach {name}"
+    )
+}
+
+/// The box `name` resolved across every VM once the selected VM's daemon
+/// missed it with `selected` (NET-058): the VM that owns it, published as
+/// this process's VM so everything keyed on the VM's name follows it, as
+/// `--vm` would have.
+///
+/// No VM owns it: the selected VM's own error, unless that error is the miss
+/// itself on a host with more than one VM and no `--vm`. Then the refusal
+/// says no running VM holds the name and shows `--vm` on `example`
+/// ([`no_running_vm_has_box`]). A box only a stopped VM holds is refused by
+/// the resolution itself ([`box_on_stopped_vm`]).
+pub(crate) async fn resolve_box_on_another_vm(
+    global: &GlobalArgs,
+    name: &str,
+    example: &str,
+    selected: anyhow::Error,
+) -> Result<crate::attach::ResolvedBoxVm, anyhow::Error> {
+    if let Some(resolved) = crate::attach::resolve_box_vm(global, name).await? {
+        // From here the process acts on the owning VM, as `--vm` would have
+        // made it: everything keyed on the VM's name (the VM host control
+        // socket the pre-attach re-hold asks, the answerer beside it) must be
+        // that VM's. The enumeration validated the name; a second set (none
+        // happens before a resolution) is a no-op.
+        let _ = client::set_vm_name(&resolved.vm);
+        return Ok(resolved);
+    }
+    if global.vm.is_none()
+        && selected.downcast_ref::<BoxNotFound>().is_some()
+        && several_vms(global)
+    {
+        return Err(BoxNotFound(no_running_vm_has_box(name, example)).into());
+    }
+    Err(selected)
+}
+
+/// Refuse a hit on the selected VM when another VM holds the same name
+/// (NET-058). A name that matches on more than one VM, running or stopped, is
+/// an [`AmbiguousBoxName`] that lists every VM and names `--vm`, so a hit on
+/// the selected VM is checked against every VM before it is used. With `--vm`,
+/// or on a host with one VM, nothing else can hold the name, and no lookup
+/// runs. `selected` is the record the selected VM's daemon returned.
+pub(crate) async fn ensure_selected_holds_box_alone(
+    global: &GlobalArgs,
+    name: &str,
+    selected: &boxes::Record,
+) -> Result<(), anyhow::Error> {
+    if global.vm.is_some() || !several_vms(global) {
+        return Ok(());
+    }
+    match crate::attach::resolve_box_vm(global, name).await? {
+        // The walk found one holder. It is the selected VM when its record is
+        // the one the selected daemon returned.
+        Some(resolved) if resolved.record.id != selected.id => Err(AmbiguousBoxName(format!(
+            "box name '{name}' exists on more than one VM ({}, {}); \
+             name the one you mean with --vm",
+            client::vm_name(),
+            resolved.vm
+        ))
+        .into()),
+        // The selected VM is the only holder, or its probe in the walk did
+        // not answer and no other VM holds the name.
+        _ => Ok(()),
+    }
+}
+
+/// Whether this host has more than one VM, running or not: only then can a
+/// box be on a VM other than the selected one.
+fn several_vms(global: &GlobalArgs) -> bool {
+    client::enumerate_vm_sockets(global.minimal_dir.as_deref(), global.use_minvmd())
+        .is_ok_and(|vms| vms.len() > 1)
+}
+
+/// Resolve `name` to its record and a client connected to the VM that owns
+/// it, for the commands that act on a named box over the daemon's RPCs
+/// rather than an ssh hand-off: `min session policy` and `min session
+/// destroy` (NET-058). The selected VM's `client` is asked first. A hit
+/// there is refused when another VM also holds the name
+/// ([`ensure_selected_holds_box_alone`]). When its daemon does not know the
+/// name, [`resolve_box_on_another_vm`] finds the
+/// owning VM, and the client returned is connected to that VM's socket.
+/// `example` is the command the user ran, for the not-found refusal.
+pub(crate) async fn resolve_box_on_any_vm(
+    global: &GlobalArgs,
+    mut client: client::Client,
+    name: &str,
+    example: &str,
+) -> Result<(client::Client, boxes::Record), anyhow::Error> {
+    match resolve_session(&mut client, name).await {
+        Ok(record) => {
+            ensure_selected_holds_box_alone(global, name, &record).await?;
+            Ok((client, record))
+        }
+        Err(selected) => {
+            let resolved = resolve_box_on_another_vm(global, name, example, selected).await?;
+            let mut client = client::Client::connect(&resolved.sock)
+                .await
+                .with_context(|| {
+                    format!("Failed to connect to the daemon of VM {}", resolved.vm)
+                })?;
+            // Gated as `connect_daemon` gates the selected VM: a destroy is
+            // a mutation, and this is the connection it runs over.
+            ensure_version_match(&mut client).await?;
+            Ok((client, resolved.record))
+        }
+    }
 }
 
 /// `ListSessions` with the daemon's build asserted off the same reply, for the
@@ -1080,14 +1243,14 @@ pub(crate) fn arm_activation_interrupt(
 ) -> ActivationInterrupt {
     let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd());
     // Resolved here, not inside the task: the withdrawal's socket is the
-    // same provider dir's, and the borrow must not cross the spawn. Keyed
-    // on the provider kind — the rule the socket resolution itself and the
+    // same host dir's, and the borrow must not cross the spawn. Keyed
+    // on the host kind — the rule the socket resolution itself and the
     // fabric display turn on — not on `use_minvmd()`, which is true only
     // under an explicit `--provider local-minvmd`: on macOS every invocation
     // is minvmd-backed with no flag at all, and a Ctrl-C that keyed on the
     // flag would leave exactly that host's box row published.
     let control_sock =
-        vm_host_control_sock(daemon_provider_kind(global), global.minimal_dir.as_deref());
+        vm_host_control_sock(daemon_host_kind(global), global.minimal_dir.as_deref());
     let task = tokio::spawn(async move {
         // Only the first Ctrl-C is intercepted; a second falls through to
         // the default disposition so a wedged cleanup can still be killed.

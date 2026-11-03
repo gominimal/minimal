@@ -11,6 +11,10 @@
 //! a child process whose environment starts with every `OTEL_*`,
 //! `MINIMAL_*`, `DO_NOT_TRACK`, `TRACEPARENT` and `RUST_LOG` variable
 //! removed, and writes its spans to a spool the test reads.
+// The in-process daemon's async bodies are deep: rustc's default query depth (128)
+// overflows computing their layout (`queries overflow the depth limit!`), as the
+// daemon crates themselves already declare.
+#![recursion_limit = "256"]
 #![cfg(target_os = "linux")]
 #![expect(
     clippy::unwrap_used,

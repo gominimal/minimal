@@ -121,6 +121,7 @@ pub fn cmd_secret_set(global: &GlobalArgs, args: SecretSetArgs) -> anyhow::Resul
     let proxy = set_proxy(&HostStore, proxy_path)?;
     let path = crate::config::user_config_path(global);
     let id = args.id.clone();
+    let control = crate::mint::control_path();
     let mut confirm = |change: &str| confirm_rule_change(&id, change);
     run_set_with_rule(
         &HostStore,
@@ -134,6 +135,7 @@ pub fn cmd_secret_set(global: &GlobalArgs, args: SecretSetArgs) -> anyhow::Resul
             path: &path,
             confirm: &mut confirm,
             notice: &mut std::io::stderr(),
+            control: control.as_deref(),
         }),
     )
 }
@@ -325,8 +327,12 @@ pub(crate) struct RuleTarget<'a> {
     /// Show the change and ask the person at the terminal. `true` replaces
     /// the rule.
     pub confirm: &'a mut dyn FnMut(&str) -> anyhow::Result<bool>,
-    /// Where `--yes` says which rule it replaces and what changes.
+    /// Where `--yes` says which rule it replaces and what changes, and
+    /// where a proxy that did not re-certify its root is reported.
     pub notice: &'a mut dyn Write,
+    /// The proxy's control socket, which gets the re-certify request after
+    /// the rule is written. `None` asks no proxy.
+    pub control: Option<&'a Path>,
 }
 
 /// The fields of `rule`, one per line, as the change prompt shows them.
@@ -575,6 +581,7 @@ pub(crate) fn run_set_with_rule(
     // Review finding 4369438785: the access control trusts this program, so
     // nobody but the current user or root can change it.
     bep::store::check_proxy_binary(proxy).context("min secret set did not read the value")?;
+    let control = target.as_ref().and_then(|target| target.control);
     // BEP-079: the rule is checked, and any change confirmed, before the
     // value is read.
     let mut write = match (rule, target.as_mut()) {
@@ -662,6 +669,54 @@ pub(crate) fn run_set_with_rule(
     }
     tracing::info!(store = store.name(), id = %args.id, "secret stored");
     writeln!(out, "{}", args.id)?;
+    if let (Some(control), Some((_, rule, _, notice))) = (control, &mut write) {
+        recertify(control, &args.id, &rule.upstream, &mut **notice)?;
+    }
+    Ok(())
+}
+
+/// Asks the proxy on `control` to re-certify its root after the rule for
+/// `id` was written, so a box created next trusts the rule's `upstream`
+/// with no restart of the proxy (BEP-013, #2746). With no proxy running it
+/// says nothing, because `bep serve` issues its root from the current rules
+/// when it starts. A proxy that did not re-issue or publish the root is
+/// reported on `notice`. The rule and the value stay saved.
+fn recertify(
+    control: &Path,
+    id: &str,
+    upstream: &[String],
+    notice: &mut dyn Write,
+) -> anyhow::Result<()> {
+    use crate::mint::{ControlClient, MintError};
+    let reason = match ControlClient::connect(control).and_then(|mut proxy| proxy.recertify_root())
+    {
+        Ok(()) => {
+            tracing::info!(
+                id,
+                "the proxy re-certified its root for the secret-store rule"
+            );
+            return Ok(());
+        }
+        Err(MintError::NotRunning { path, error }) => {
+            tracing::debug!(path = %path.display(), %error, "no proxy to re-certify its root; bep serve reads the rule when it starts");
+            return Ok(());
+        }
+        Err(MintError::Refused { error, .. }) => error,
+        Err(MintError::Control(error)) => format!("the connection to it failed: {error}"),
+        Err(other) => other.to_string(),
+    };
+    tracing::warn!(
+        id,
+        reason,
+        "the proxy did not re-certify its root for the secret-store rule"
+    );
+    let upstream = upstream.join(", ");
+    writeln!(
+        notice,
+        "min secret set saved the rule for {id}. \
+         The Box Egress Proxy did not update its root certificate for {upstream}: {reason}. \
+         A box created before the proxy updates its root certificate does not reach {upstream}."
+    )?;
     Ok(())
 }
 
@@ -1533,6 +1588,7 @@ attributes:
                 path,
                 confirm,
                 notice: &mut std::io::sink(),
+                control: None,
             }),
         );
         (result, String::from_utf8(out).unwrap())
@@ -1792,6 +1848,7 @@ attributes:
                     path: &path,
                     confirm: &mut no_confirm,
                     notice: &mut std::io::sink(),
+                    control: None,
                 }),
             )
             .expect_err("refused");
@@ -1878,6 +1935,7 @@ attributes:
                         path: &path,
                         confirm: &mut no_confirm,
                         notice: &mut std::io::sink(),
+                        control: None,
                     }),
                 )
                 .expect_err("refused");
@@ -2003,6 +2061,7 @@ attributes:
                     path: &path,
                     confirm: &mut no_confirm,
                     notice: &mut std::io::sink(),
+                    control: None,
                 }),
             )
             .expect_err("refused");
@@ -2094,6 +2153,7 @@ attributes:
                 path: &path,
                 confirm: &mut no_confirm,
                 notice: &mut notice,
+                control: None,
             }),
         )
         .unwrap();
@@ -2242,5 +2302,103 @@ attributes:
         );
         result.unwrap();
         assert!(!missing.exists());
+    }
+
+    /// A control socket at `path` that takes one connection, answers its
+    /// one line with `reply`, and gives the line it read.
+    fn fake_proxy(path: &Path, reply: &'static str) -> std::thread::JoinHandle<String> {
+        use std::io::{BufRead as _, BufReader};
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut read = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            read.read_line(&mut line).unwrap();
+            (&stream).write_all(reply.as_bytes()).unwrap();
+            line
+        })
+    }
+
+    /// Run `set` with the rule flags for `openai`, a rule file in `dir` and
+    /// the control socket at `control`. Gives the result and the notice.
+    fn set_asking(
+        store: &dyn SecretStore,
+        proxy: &Path,
+        dir: &Path,
+        control: &Path,
+    ) -> (anyhow::Result<()>, String) {
+        let path = dir.join("config.toml");
+        let mut notice = Vec::new();
+        let result = run_set_with_rule(
+            store,
+            &set_args(&[
+                "openai",
+                "--upstream",
+                "api.openai.com",
+                "--header",
+                "Authorization",
+            ]),
+            proxy,
+            ValueSource::Stdin,
+            &mut || Ok(Zeroizing::new("typed".to_owned())),
+            &mut &b"piped\n"[..],
+            &mut Vec::new(),
+            Some(RuleTarget {
+                path: &path,
+                confirm: &mut no_confirm,
+                notice: &mut notice,
+                control: Some(control),
+            }),
+        );
+        (result, String::from_utf8(notice).unwrap())
+    }
+
+    // BEP-013, #2746: after `set` writes a rule, it asks a running proxy to
+    // re-certify its root, so the next box trusts the upstream with no
+    // restart. A proxy that did not re-issue or publish the root is named
+    // with the upstream. With no proxy running, `set` prints nothing new.
+    #[test]
+    fn secret_set_asks_a_running_proxy_to_recertify() {
+        let (_dir, proxy) = proxy();
+        let store = MemorySecretStore::default();
+
+        // A running proxy that re-certifies: the request goes, and nothing
+        // more prints.
+        let dir = tempfile::tempdir().unwrap();
+        let control = dir.path().join("control.sock");
+        let asked = fake_proxy(&control, "{\"ok\":true}\n");
+        let (result, notice) = set_asking(&store, &proxy, dir.path(), &control);
+        result.unwrap();
+        assert_eq!(asked.join().unwrap(), "{\"op\":\"recertify_root\"}\n");
+        assert_eq!(notice, "");
+        assert_eq!(store.value("openai").as_deref(), Some(&b"piped"[..]));
+
+        // A running proxy that did not publish: the rule stays saved, and
+        // the notice names the upstream.
+        let dir = tempfile::tempdir().unwrap();
+        let control = dir.path().join("control.sock");
+        let asked = fake_proxy(
+            &control,
+            "{\"ok\":false,\"error\":\"the root certificate was not written to /id.json: denied\"}\n",
+        );
+        let (result, notice) = set_asking(&store, &proxy, dir.path(), &control);
+        result.unwrap();
+        assert_eq!(asked.join().unwrap(), "{\"op\":\"recertify_root\"}\n");
+        assert_eq!(
+            notice,
+            "min secret set saved the rule for openai. \
+             The Box Egress Proxy did not update its root certificate for api.openai.com: \
+             the root certificate was not written to /id.json: denied. \
+             A box created before the proxy updates its root certificate does not reach api.openai.com.\n"
+        );
+        assert!(written_rules(&dir.path().join("config.toml")).contains_key("openai"));
+
+        // No proxy running: nothing new prints.
+        let dir = tempfile::tempdir().unwrap();
+        let (result, notice) =
+            set_asking(&store, &proxy, dir.path(), &dir.path().join("control.sock"));
+        result.unwrap();
+        assert_eq!(notice, "");
+        assert!(written_rules(&dir.path().join("config.toml")).contains_key("openai"));
     }
 }

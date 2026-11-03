@@ -259,6 +259,9 @@ fn every_daemon_connection_is_classified() {
             // the same ride-along shape `resolve_session_version_gated` uses.
             "attach.rs::box_record_on = gated",
             "cmd/admin.rs::cmd_version = ungated",
+            // Test-only: the BEP-032 store mint test registers a box with a
+            // proxy control socket it serves itself, so no daemon is involved.
+            "cmd/boxes/create.rs::box_creation_seals_a_store_member_per_accepted_rule = ungated",
             // Not a daemon connection: `min` registers a GitHub grant box
             // with the Box Egress Proxy over its control socket. The proxy is
             // not the daemon, and the daemon's build is not in question here.
@@ -285,7 +288,19 @@ fn every_daemon_connection_is_classified() {
             "cmd/list.rs::list_selected_vm = gated",
             "cmd/mod.rs::arm_activation_interrupt = ungated",
             "cmd/mod.rs::connect_daemon_unchecked = ungated",
+            // `min session policy` and `min session destroy` on a box another
+            // VM owns: the connection to that VM, gated as `connect_daemon`
+            // gates the selected one.
+            "cmd/mod.rs::resolve_box_on_any_vm = gated",
             "cmd/net.rs::cmd_net_forward = gated",
+            // `min net forward` on a box another VM holds: the session poll's
+            // connection to that VM, gated before the loop (NET-058).
+            "cmd/net.rs::poll_client_for = gated",
+            // `min secret set` asks the egress proxy on its control socket to
+            // re-certify its root (#2746). The proxy is not the daemon, and
+            // the rule is already saved before the ask, so a skew can
+            // half-build nothing here, the same as the mint path's sites.
+            "cmd/secret.rs::recertify = ungated",
             "cmd/session.rs::cmd_attach = gated",
             "cmd/session.rs::cmd_exec = gated",
             "cmd/session.rs::cmd_session_run = gated",
@@ -327,6 +342,7 @@ fn every_daemon_connection_is_classified() {
             "tests.rs::an_identity_with_no_root_validity_mints_nothing = ungated",
             "tests.rs::attach_fall_through_hands_off_the_owning_vm = gated",
             "tests.rs::attach_refuses_a_box_name_two_vms_know = gated",
+            "tests.rs::exec_fall_through_hands_off_the_owning_vm = gated",
             "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy = ungated",
             "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy = ungated",
             "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy_until_the_creation_fails = ungated",
@@ -334,6 +350,9 @@ fn every_daemon_connection_is_classified() {
             // Not a product path, and not the daemon: the audit test submits
             // a revocation to a test Box Egress Proxy's control socket.
             "tests.rs::mint_and_destroy_append_audit_records = ungated",
+            // Test-only: the NET-058 and NET-152 tests' client on the selected
+            // harness daemon, which is this build.
+            "tests.rs::selected_client = ungated",
         ]
     );
 }
@@ -356,6 +375,13 @@ fn every_create_session_asserts_the_daemon_build() {
             "cmd/boxes/create.rs::activation_puts_the_spec_on_the_create_request = asserts nothing",
             // A unit test's request, never sent: it checks the project root.
             "cmd/boxes/create.rs::create_from_a_subdirectory_sends_the_project_root = asserts nothing",
+            // A unit test's request, never sent: it checks the row withdrawal.
+            "cmd/boxes/create.rs::unnamed_activation_withdraws_its_row_when_the_grant_mint_fails = asserts nothing",
+            // A unit test's request, never sent: it checks the list's scope.
+            "cmd/boxes/list.rs::box_list_and_show_render_retained_records = asserts nothing",
+            // A unit test's config, never sent: it checks that the create
+            // relays no box id (BOX-002).
+            "cmd/boxes/vm_host.rs::activation_relays_no_box_id = asserts nothing",
             // The dashboard's activation: the same create, the same assertion.
             "dash/rpc.rs::activate = asserts",
             // A unit test's request, never sent: it checks the project root.
@@ -369,6 +395,10 @@ fn every_create_session_asserts_the_daemon_build() {
             "tests.rs::create_box_on = asserts",
             // Not a client path: the mint unit tests' create-request fixture.
             "tests.rs::create_request = asserts",
+            // A unit test's request, never sent: it checks the box's name.
+            "tests.rs::created_box_name_is_the_entry_without_a_typed_name = asserts nothing",
+            // A unit test's request, never sent: it checks the cleaned entry name.
+            "tests.rs::entry_name_registers_and_creates_under_one_cleaned_name = asserts nothing",
         ]
     );
 }
@@ -630,12 +660,12 @@ fn matching_versions_are_not_a_skew() {
     assert!(client::version_skew_message(version::VERSION, version::VERSION).is_none());
 }
 
-/// The host-cache warm-up is gated on the session provider: a VM-backed
-/// provider caches on its own guest volume and never reads the host cache,
+/// The host-cache warm-up is gated on the session host: a VM-backed
+/// host caches on its own guest volume and never reads the host cache,
 /// so `--provider local-minvmd` (and macOS, always minvmd-backed) skip the
 /// warm-up, while the native daemon shares the host cache and downloads.
 #[test]
-fn host_cache_warmup_skips_vm_backed_providers() {
+fn host_cache_warmup_skips_vm_backed_hosts() {
     assert!(
         !should_warm_host_cache(true),
         "a VM-backed provider must not warm the host cache"
@@ -653,88 +683,6 @@ fn host_cache_warmup_skips_vm_backed_providers() {
 fn cli_command_tree_stays_renderable() {
     use clap::CommandFactory as _;
     Cli::command().debug_assert();
-}
-
-/// `min login` mints nothing (NET-109): the verb runs without a daemon and
-/// writes no key or certificate to the config directory, where the reverse
-/// proxy's files used to land, and it prints the one line saying there is
-/// nothing to mint. The `--cert-dir` flag that steered the old writes is
-/// refused by the parser.
-#[tokio::test]
-async fn login_mints_no_certificate() {
-    let dir = tempfile::tempdir().unwrap();
-    let config = dir.path().join("config");
-    let global = GlobalArgs {
-        repo_dir: None,
-        minimal_dir: Some(dir.path().join("state")),
-        config_dir: Some(config.clone()),
-        provider: None,
-        no_input: true,
-        vm: None,
-    };
-
-    // No daemon is running and none may be spawned: with the certificate
-    // RPC gone the verb has nothing to ask one for. The notice is captured
-    // from the verb itself, so the assertions below hold what it emits.
-    let mut out = Vec::new();
-    cmd_login(&global, LoginArgs {}, &mut out)
-        .await
-        .expect("a verb with nothing to mint succeeds without a daemon");
-
-    // The config directory is where the key and CA used to be written.
-    for file in ["client.pem", "client.key", "ca.pem"] {
-        assert!(
-            !config.join("minimal").join(file).exists(),
-            "login wrote {file}; it must write no key or certificate"
-        );
-    }
-
-    // The one line it prints, read back out of what the verb wrote: a
-    // handler that stopped emitting it, printed something else, or printed
-    // it twice fails here rather than passing on the helper's own text.
-    let printed = String::from_utf8(out).expect("stdout is UTF-8");
-    assert!(
-        printed.contains("Nothing to mint"),
-        "the line must say there is nothing to mint, got: {printed}"
-    );
-    assert_eq!(
-        printed,
-        format!("{}\n", login_nothing_to_mint_line()),
-        "the verb prints exactly the one required line"
-    );
-
-    // And the minting is gone from the verb's body, asserted on the source
-    // the way `the_activation_path_makes_no_version_round_trip` is: the
-    // certificate RPC, the write sites, the cert paths, and the daemon
-    // spawn must all be absent.
-    let text = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cmd/admin.rs"),
-    )
-    .expect("readable source");
-    let body = function_body(&text, "cmd_login").expect("admin.rs no longer defines cmd_login");
-    for minted_again in [
-        "IssueClientCert",
-        "client.pem",
-        "client.key",
-        "ca.pem",
-        "fs::write",
-        "ensure_daemon",
-    ] {
-        assert!(
-            !body.contains(minted_again),
-            "cmd_login mints again ({minted_again})"
-        );
-    }
-
-    // The flag that directed the writes is retired with them.
-    use clap::Parser as _;
-    let Err(err) = Cli::try_parse_from(["min", "login", "--cert-dir", "/tmp/certs"]) else {
-        panic!("--cert-dir is retired and must not parse");
-    };
-    assert!(
-        err.to_string().contains("--cert-dir"),
-        "the refusal must name the retired flag, got: {err}"
-    );
 }
 
 /// The CLI reference documents no retired command (NET-111): the reference
@@ -818,7 +766,7 @@ fn bare_status_renders_a_cwd_session_verbatim() {
     assert_eq!(
         render_bare_status("~/w", &entries, &cwd, true),
         "No terminal: not attaching. State for ~/w:\n\
-             \x20 sessions: 1 (web, active)\n\
+             \x20 sessions: 1 (web, running)\n\
              \x20 blueprint: minimal.toml present\n\
              Next:\n\
              \x20 min session run web <task>\n\
@@ -895,7 +843,7 @@ fn duplicate_session_warning_waits_before_attach_for_materializing() {
     let warning = duplicate_session_warning(&entries, &taken)
         .expect("a session on the target path must warn");
     assert!(
-        warning.contains("run `min ls` until its status is active"),
+        warning.contains("run `min ls` until its status is running"),
         "the wait guidance names the command to watch, got: {warning}"
     );
     assert!(
@@ -1077,77 +1025,133 @@ fn box_announce_label_prefers_name_with_short_id() {
     assert_eq!(box_announce_label(&id, None), "a1b2c3d4");
 }
 
-/// A session created without `--name` gets a typable `<dir>-<hex>` handle:
-/// the basename is lowercased and stripped to the name alphabet, and the
-/// caller-supplied hex tails it.
+/// BOX-163: a create refused because a running box holds its name ends
+/// `min` with exit 2, and the error names the holder and the next step.
+/// Any other refusal keeps the daemon's text and is not exit 2.
 #[test]
-fn autogen_session_name_slugs_the_basename() {
-    assert_eq!(
-        autogen_session_name(camino::Utf8Path::new("/home/u/code/foo"), "9c1e"),
-        "foo-9c1e"
-    );
-    // Disallowed characters are dropped and the rest lowercased.
-    assert_eq!(
-        autogen_session_name(camino::Utf8Path::new("/tmp/My Project!"), "4f2a"),
-        "myproject-4f2a"
-    );
-    // A basename that sanitizes to nothing falls back to `session`.
-    assert_eq!(
-        autogen_session_name(camino::Utf8Path::new("/"), "0001"),
-        "session-0001"
-    );
-}
+fn held_name_refusal_exits_2_and_names_the_holder() {
+    let holder = boxes::SessionId::parse_str("0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b").unwrap();
+    let reply = minimald_rpc::HeldNameRefusal {
+        name: "default".to_string(),
+        holder: Some(holder),
+        holder_name: "Default".to_string(),
+    }
+    .to_string();
 
-/// Sanitization drops out-of-alphabet characters, trims leading/trailing
-/// separators, and falls back to `session` for an all-symbol basename, so
-/// the minted name always clears `validate_session_name`.
-#[test]
-fn sanitize_name_component_trims_and_falls_back() {
-    assert_eq!(sanitize_name_component("--foo--"), "foo");
-    assert_eq!(sanitize_name_component("café"), "caf");
-    assert_eq!(sanitize_name_component("...."), "session");
-    assert_eq!(sanitize_name_component("a\tb"), "ab");
-    // `_` and `.` map to `-`, so the minted name stays a single DNS label.
-    assert_eq!(sanitize_name_component("my_app.dev"), "my-app-dev");
-    assert_eq!(sanitize_name_component("mnlh.Ab12_"), "mnlh-ab12");
-    // An over-long basename is capped and re-trimmed.
-    assert_eq!(sanitize_name_component(&"a".repeat(100)).len(), 48);
+    let error = create_refusal(reply);
+    let refusal = error
+        .downcast_ref::<minimald_rpc::HeldNameRefusal>()
+        .expect("main.rs maps this error to its exit code");
+    assert_eq!(minimald_rpc::HeldNameRefusal::EXIT_CODE, 2);
+    assert_eq!(refusal.holder, Some(holder));
+    assert_eq!(refusal.holder_name, "Default");
+    let printed = format!("{error:#}");
     assert_eq!(
-        sanitize_name_component(&format!("{}-tail", "b".repeat(47))),
-        "b".repeat(47)
+        printed,
+        "Cannot create a session named `default`: the running session `Default` \
+         (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) holds that name. Rename that session \
+         with `min session rename 0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b <new-name>`, \
+         or choose another name."
     );
-}
 
-/// The minted suffix is exactly four lowercase hex digits.
-#[test]
-fn random_hex4_is_four_lowercase_hex_digits() {
-    let h = random_hex4();
-    assert_eq!(h.len(), 4);
+    let other = create_refusal("the project path is not a directory".to_string());
     assert!(
-        h.chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
-        "expected four lowercase hex digits, got {h:?}"
+        other
+            .downcast_ref::<minimald_rpc::HeldNameRefusal>()
+            .is_none()
+    );
+    assert_eq!(format!("{other:#}"), "the project path is not a directory");
+}
+
+/// BOX-163: an own-address create whose VM host registration is refused
+/// because a live row holds the name ends `min` with exit 2. The error names
+/// the holder's id, read from the daemon. When the holder cannot be read,
+/// it is still exit 2 and names the held spelling.
+#[test]
+fn own_address_held_name_refusal_exits_2_and_names_the_holder() {
+    let holder = boxes::SessionId::parse_str("0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b").unwrap();
+    let error =
+        registration_held_name_refusal("dev", "Dev", Some((holder, Some("Dev".to_string()))));
+    let refusal = error
+        .downcast_ref::<minimald_rpc::HeldNameRefusal>()
+        .expect("main.rs maps this error to exit 2");
+    assert_eq!(minimald_rpc::HeldNameRefusal::EXIT_CODE, 2);
+    assert_eq!(refusal.holder, Some(holder));
+    assert_eq!(
+        format!("{error:#}"),
+        "Cannot create a session named `dev`: the running session `Dev` \
+         (0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b) holds that name. Rename that session \
+         with `min session rename 0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6a7b <new-name>`, \
+         or choose another name."
+    );
+
+    let unread = registration_held_name_refusal("dev", "Dev", None);
+    let refusal = unread
+        .downcast_ref::<minimald_rpc::HeldNameRefusal>()
+        .expect("an unread holder is still exit 2");
+    assert_eq!(refusal.holder, None);
+    assert_eq!(
+        format!("{unread:#}"),
+        "Cannot create a session named `dev`: the running session `Dev` holds that name. \
+         Choose another name."
+    );
+    assert_eq!(
+        minimald_rpc::HeldNameRefusal::from_error(&unread.to_string()).as_ref(),
+        Some(refusal),
+        "the text without an id parses back"
     );
 }
 
-/// Only an autogen name retries on collision, and only within the bounded
-/// budget; a user-supplied name never retries, so its collision passes
-/// through, and a non-collision failure is never retried.
+/// BOX-163: with no `--name`, the create carries no name and the box takes
+/// its entry's name. Nothing mints `<dir>-<hex>`. A `[box] name` in the
+/// spec comes first, then `--name`.
 #[test]
-fn autogen_collision_retry_is_bounded_and_skips_user_names() {
-    let collision = "A session with that name already exists";
-    assert!(should_retry_autogen(true, 0, collision));
-    assert!(should_retry_autogen(
-        true,
-        AUTOGEN_NAME_RETRIES - 1,
-        collision
-    ));
-    // Budget spent: stop retrying.
-    assert!(!should_retry_autogen(true, AUTOGEN_NAME_RETRIES, collision));
-    // A user-supplied name never retries — its collision surfaces verbatim.
-    assert!(!should_retry_autogen(false, 0, collision));
-    // A non-collision failure is never retried.
-    assert!(!should_retry_autogen(true, 0, "CreateSession failed: boom"));
+fn created_box_name_is_the_entry_without_a_typed_name() {
+    let mut request = minimald_rpc::CreateSessionRequest::new(
+        String::new(),
+        paths::HostAbsPath::try_new("/home/u/code/foo").unwrap(),
+        boxes::NetworkMode::HostNet,
+        boxes::BoxPolicy::default(),
+    );
+    request.config.name = minimal_client::box_name::request_name(None);
+    assert_eq!(created_box_name(&request), None, "no spec, no name");
+
+    let mut spec = mfile::spec::BoxSpec::for_session(None, spec_flags(&request));
+    put_spec(&mut request, &spec).unwrap();
+    assert_eq!(
+        created_box_name(&request).as_deref(),
+        Some(mfile::spec::DEFAULT_SESSION_ENTRY)
+    );
+
+    request.config.name = minimal_client::box_name::request_name(Some("api"));
+    assert_eq!(created_box_name(&request).as_deref(), Some("api"));
+
+    spec.name = Some("web".to_string());
+    put_spec(&mut request, &spec).unwrap();
+    assert_eq!(created_box_name(&request).as_deref(), Some("web"));
+}
+
+/// BOX-163: the VM host row and the box carry one name. For an entry such
+/// as `My App`, the client registers the row under the name the daemon
+/// gives the box, because both sides clean the entry with one function.
+#[test]
+fn entry_name_registers_and_creates_under_one_cleaned_name() {
+    let mut request = minimald_rpc::CreateSessionRequest::new(
+        String::new(),
+        paths::HostAbsPath::try_new("/home/u/code/foo").unwrap(),
+        boxes::NetworkMode::HostNet,
+        boxes::BoxPolicy::default(),
+    );
+    request.config.name = minimal_client::box_name::request_name(None);
+    let mut spec = mfile::spec::BoxSpec::for_session(None, spec_flags(&request));
+    spec.entry = "My App".to_string();
+    put_spec(&mut request, &spec).unwrap();
+    assert_eq!(created_box_name(&request).as_deref(), Some("myapp"));
+    assert_eq!(
+        created_box_name(&request).as_deref(),
+        Some(boxes::box_name::entry_box_name(&spec.entry).as_str()),
+        "the row's name is the daemon's name for the entry"
+    );
 }
 
 #[test]
@@ -1174,7 +1178,8 @@ fn finalize_install_parses_its_flags() {
             show: false,
             script: false,
             json: false,
-            undo: false
+            undo: false,
+            ct_mark_mask: None
         }))
     ));
     let cli = Cli::try_parse_from(["min", "finalize-install", "--show", "--script"]).unwrap();
@@ -1184,7 +1189,8 @@ fn finalize_install_parses_its_flags() {
             show: true,
             script: true,
             json: false,
-            undo: false
+            undo: false,
+            ct_mark_mask: None
         }))
     ));
     let cli = Cli::try_parse_from(["min", "finalize-install", "--show", "--json"]).unwrap();
@@ -1194,7 +1200,8 @@ fn finalize_install_parses_its_flags() {
             show: true,
             script: false,
             json: true,
-            undo: false
+            undo: false,
+            ct_mark_mask: None
         }))
     ));
     let cli =
@@ -1205,7 +1212,8 @@ fn finalize_install_parses_its_flags() {
             show: true,
             script: true,
             json: false,
-            undo: true
+            undo: true,
+            ct_mark_mask: None
         }))
     ));
     // `--script` and `--json` need `--show`; `--json` describes an install,
@@ -1220,6 +1228,58 @@ fn finalize_install_parses_its_flags() {
     ] {
         assert!(Cli::try_parse_from(args).is_err(), "{args:?}");
     }
+}
+
+/// `--ct-mark-mask` takes two contiguous bits in 0x-prefixed hex, the
+/// shape the install step requires, and is refused with `--undo`.
+#[test]
+fn finalize_install_parses_ct_mark_mask() {
+    use clap::Parser as _;
+    let cli =
+        Cli::try_parse_from(["min", "finalize-install", "--ct-mark-mask", "0x0c000000"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::FinalizeInstall(FinalizeInstallArgs {
+            ct_mark_mask: Some(0x0c00_0000),
+            undo: false,
+            ..
+        }))
+    ));
+    let cli = Cli::try_parse_from(["min", "finalize-install", "--show", "--ct-mark-mask", "0x3"])
+        .unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::FinalizeInstall(FinalizeInstallArgs {
+            ct_mark_mask: Some(0x3),
+            show: true,
+            ..
+        }))
+    ));
+    for bad in [
+        "0x10000000",
+        "0x50000000",
+        "0x70000000",
+        "0x0",
+        "0x100000000",
+        "30000000",
+        "0x",
+        "0xzz",
+    ] {
+        assert!(
+            Cli::try_parse_from(["min", "finalize-install", "--ct-mark-mask", bad]).is_err(),
+            "{bad}"
+        );
+    }
+    assert!(
+        Cli::try_parse_from([
+            "min",
+            "finalize-install",
+            "--undo",
+            "--ct-mark-mask",
+            "0x0c000000"
+        ])
+        .is_err()
+    );
 }
 
 #[test]
@@ -2445,9 +2505,8 @@ async fn stop_is_a_no_op_when_the_daemon_is_already_down() {
 #[tokio::test]
 async fn stop_force_stops_a_wedged_vm_from_the_host() {
     let dir = tempfile::tempdir().unwrap();
-    let provider_dir =
-        client::resolve_provider_dir(Some(dir.path()), true).expect("resolve provider dir");
-    let state_dir = minvmd::state::StateDir::new(provider_dir).expect("open state dir");
+    let host_dir = client::resolve_host_dir(Some(dir.path()), true).expect("resolve provider dir");
+    let state_dir = minvmd::state::StateDir::new(host_dir).expect("open state dir");
     // The alive lock is held the way a real VM holds it: by the VMM process,
     // through the inherited fd, so it is released when that process dies and
     // not before.
@@ -2507,9 +2566,8 @@ async fn stop_force_stops_a_wedged_vm_from_the_host() {
 #[tokio::test]
 async fn stop_force_refuses_a_booting_vm() {
     let dir = tempfile::tempdir().unwrap();
-    let provider_dir =
-        client::resolve_provider_dir(Some(dir.path()), true).expect("resolve provider dir");
-    let state_dir = minvmd::state::StateDir::new(provider_dir).expect("open state dir");
+    let host_dir = client::resolve_host_dir(Some(dir.path()), true).expect("resolve provider dir");
+    let state_dir = minvmd::state::StateDir::new(host_dir).expect("open state dir");
     state_dir
         .write_state(&minvmd::state::State {
             lifecycle: minvmd::lifecycle::Lifecycle::Starting,
@@ -2552,9 +2610,8 @@ async fn stop_force_refuses_a_booting_vm() {
 #[tokio::test]
 async fn stop_without_force_on_a_booting_vm_names_the_retry() {
     let dir = tempfile::tempdir().unwrap();
-    let provider_dir =
-        client::resolve_provider_dir(Some(dir.path()), true).expect("resolve provider dir");
-    let state_dir = minvmd::state::StateDir::new(provider_dir).expect("open state dir");
+    let host_dir = client::resolve_host_dir(Some(dir.path()), true).expect("resolve provider dir");
+    let state_dir = minvmd::state::StateDir::new(host_dir).expect("open state dir");
     state_dir
         .write_state(&minvmd::state::State {
             lifecycle: minvmd::lifecycle::Lifecycle::Starting,
@@ -2626,9 +2683,8 @@ fn host_stop_waits_for_the_alive_lock_not_the_lifecycle() {
 #[tokio::test]
 async fn stop_without_force_on_a_wedged_vm_names_the_recovery() {
     let dir = tempfile::tempdir().unwrap();
-    let provider_dir =
-        client::resolve_provider_dir(Some(dir.path()), true).expect("resolve provider dir");
-    let state_dir = minvmd::state::StateDir::new(provider_dir).expect("open state dir");
+    let host_dir = client::resolve_host_dir(Some(dir.path()), true).expect("resolve provider dir");
+    let state_dir = minvmd::state::StateDir::new(host_dir).expect("open state dir");
     state_dir
         .write_state(&minvmd::state::State {
             lifecycle: minvmd::lifecycle::Lifecycle::Running,
@@ -3023,7 +3079,7 @@ fn cli_reference_documents_network_flags() {
 }
 
 /// Stand up the two-VM shape the named-VM tests below need (NET-057/NET-058):
-/// a minimal state dir laid out as the minvmd provider nests a named VM
+/// a minimal state dir laid out as the minvmd host nests a named VM
 /// (NET-052) — the default VM serving `providers/local-minvmd0/ssh.sock`,
 /// `alpha` serving `providers/local-minvmd0/alpha/ssh.sock` — with a real
 /// daemon behind each socket. Real daemons, not stub sockets, because both
@@ -3137,7 +3193,7 @@ async fn ls_shows_vm_per_box() {
     let api = create_box_on(&default_vm, "api").await;
     let web = create_box_on(&alpha, "web").await;
 
-    let listings = cmd::ls_listings(&vm_globals(state.path(), None))
+    let mut listings = cmd::ls_listings(&vm_globals(state.path(), None))
         .await
         .expect("listing a two-VM host succeeds");
     assert_eq!(listings.len(), 2, "a two-VM host lists both VMs");
@@ -3158,6 +3214,16 @@ async fn ls_shows_vm_per_box() {
     // machine's port says so while a sibling registered with another
     // daemon names that holder instead — one `Holder` and one `Registered`
     // here, fed the same way.
+    // The named VM's box reports its own range address, as a published box
+    // does (T110), so its BOX NAMES row can read the own-address form.
+    listings[1].resp.box_networks.insert(
+        web,
+        minimald_rpc::BoxNetworkFacts {
+            loopback_address: Some(std::net::Ipv4Addr::new(127, 0, 64, 2)),
+            egress_posture: None,
+            at_fallback: Some(false),
+        },
+    );
     let surfaces = vec![
         Some(crate::resolver::LiveSurface::Proxy),
         Some(crate::resolver::LiveSurface::Native),
@@ -3209,11 +3275,11 @@ async fn ls_shows_vm_per_box() {
         surface_line_of("default")
             .contains("<box>.min.internal opens through the HTTP proxy at 127.0.0.1:")
             || surface_line_of("default")
-                .contains("the hostname proxy is not serving, and box names open only through it"),
+                .contains("<box>.min.internal: the hostname proxy is not serving"),
         "the VM the hook does not route to keeps its proxy line:\n{table}"
     );
     assert!(
-        surface_line_of("alpha").contains("resolves through this machine's DNS"),
+        surface_line_of("alpha").contains("<box>.min.internal opens at its name on this machine"),
         "the VM the hook routes to is named native:\n{table}"
     );
     let answerer_row_of = |vm: &str| {
@@ -3363,8 +3429,8 @@ async fn ls_shows_vm_per_box() {
 #[tokio::test]
 async fn ls_keeps_the_selected_vm_when_its_socket_appears_late() {
     let state = tempfile::tempdir().expect("a temp minimal state dir for two VMs");
-    let provider = state.path().join("providers/local-minvmd0");
-    std::fs::create_dir_all(provider.join("alpha")).expect("the named VM's provider subdir");
+    let host_dir = state.path().join("providers/local-minvmd0");
+    std::fs::create_dir_all(host_dir.join("alpha")).expect("the named VM's provider subdir");
     let default_sock =
         client::resolve_socket_path_named(Some(state.path()), true, paths::DEFAULT_VM_NAME)
             .expect("the default VM's socket path");
@@ -3374,7 +3440,7 @@ async fn ls_keeps_the_selected_vm_when_its_socket_appears_late() {
     let default_vm = minimald::test_harness::TestServer::new().await;
     create_box_on(&default_vm, "api").await;
     let alpha = minimald::test_harness::TestServer::new().await;
-    alpha.listen_on_uds(&provider.join("alpha/ssh.sock")).await;
+    alpha.listen_on_uds(&host_dir.join("alpha/ssh.sock")).await;
     create_box_on(&alpha, "web").await;
 
     let global = vm_globals(state.path(), None);
@@ -3412,9 +3478,9 @@ async fn ls_keeps_the_selected_vm_when_its_socket_appears_late() {
 #[tokio::test]
 async fn ls_leashes_the_vms_it_did_not_select() {
     let state = tempfile::tempdir().expect("a temp minimal state dir");
-    let provider = state.path().join("providers/local-minvmd0");
-    std::fs::create_dir_all(provider.join("alpha")).expect("the wedged VM's dir");
-    std::fs::create_dir_all(provider.join("beta")).expect("the stopped VM's dir");
+    let host_dir = state.path().join("providers/local-minvmd0");
+    std::fs::create_dir_all(host_dir.join("alpha")).expect("the wedged VM's dir");
+    std::fs::create_dir_all(host_dir.join("beta")).expect("the stopped VM's dir");
 
     // The selected VM, running, with its box.
     let default_sock =
@@ -3426,7 +3492,7 @@ async fn ls_leashes_the_vms_it_did_not_select() {
 
     // A wedged VM: the socket accepts and never speaks SSH — the shape a
     // suspended microVM presents behind an always-accepting bridge.
-    let wedged = tokio::net::UnixListener::bind(provider.join("alpha/ssh.sock"))
+    let wedged = tokio::net::UnixListener::bind(host_dir.join("alpha/ssh.sock"))
         .expect("the wedged VM's socket binds");
     tokio::spawn(async move {
         // Accepted connections are held, never read, never closed: the
@@ -3438,7 +3504,7 @@ async fn ls_leashes_the_vms_it_did_not_select() {
     });
 
     // A stopped VM: the listener died and left its socket path behind.
-    let stale = std::os::unix::net::UnixListener::bind(provider.join("beta/ssh.sock"))
+    let stale = std::os::unix::net::UnixListener::bind(host_dir.join("beta/ssh.sock"))
         .expect("the stopped VM's socket path binds");
     drop(stale);
 
@@ -3473,8 +3539,8 @@ async fn ls_leashes_the_vms_it_did_not_select() {
 #[tokio::test]
 async fn a_stopped_vm_does_not_hold_a_listing() {
     let state = tempfile::tempdir().expect("a temp minimal state dir");
-    let provider = state.path().join("providers/local-minvmd0");
-    std::fs::create_dir_all(provider.join("beta")).expect("the stopped VM's dir");
+    let host_dir = state.path().join("providers/local-minvmd0");
+    std::fs::create_dir_all(host_dir.join("beta")).expect("the stopped VM's dir");
 
     // The selected VM, running, with its box.
     let default_sock =
@@ -3485,7 +3551,7 @@ async fn a_stopped_vm_does_not_hold_a_listing() {
     create_box_on(&default_vm, "api").await;
 
     // The stopped VM: the listener died and left its socket path behind.
-    let stale = std::os::unix::net::UnixListener::bind(provider.join("beta/ssh.sock"))
+    let stale = std::os::unix::net::UnixListener::bind(host_dir.join("beta/ssh.sock"))
         .expect("the stopped VM's socket path binds");
     drop(stale);
 
@@ -3634,6 +3700,81 @@ async fn attach_fall_through_hands_off_the_owning_vm() {
     );
 }
 
+/// NET-058's exec half, and `session run` and `net forward` with it: the
+/// three go through the same resolution attach does, so a box activated with
+/// `--vm` is reached by name alone, over the owning VM's socket. Before this,
+/// `min ls` and attach found such a box and `min session exec` answered "No
+/// session found" (lab scenario 720).
+#[tokio::test]
+async fn exec_fall_through_hands_off_the_owning_vm() {
+    let (state, default_vm, alpha) = two_vms().await;
+    create_box_on(&default_vm, "api").await;
+    let web = create_box_on(&alpha, "web").await;
+    let global = vm_globals(state.path(), None);
+    let selected =
+        client::resolve_socket_path_named(Some(state.path()), true, paths::DEFAULT_VM_NAME)
+            .expect("the selected VM's socket path");
+    let mut client = client::Client::connect(&selected)
+        .await
+        .expect("connect to the selected VM's daemon");
+
+    for verb in ["Running in", "Running the task in", "Forwarding to"] {
+        let (record, handed_off) = cmd::resolve_named_box_version_gated(
+            &global,
+            &mut client,
+            selected.clone(),
+            "web",
+            verb,
+            "session exec web <command>",
+        )
+        .await
+        .expect("a name alpha owns resolves through the selected VM's miss");
+        assert_eq!(record.id, web, "{verb}: the owning VM's record");
+        assert_eq!(
+            handed_off,
+            state.path().join("providers/local-minvmd0/alpha/ssh.sock"),
+            "{verb}: the hand-off runs over the owning VM's socket"
+        );
+    }
+}
+
+/// NET-058's forward half: `min net forward` on a box another VM holds polls
+/// that VM for its session, not the selected one. The selected VM does not
+/// hold the box, so a poll there closed the forward on its first tick.
+#[tokio::test]
+async fn forward_polls_owning_vm() {
+    let (state, default_vm, alpha) = two_vms().await;
+    let api = create_box_on(&default_vm, "api").await;
+    let web = create_box_on(&alpha, "web").await;
+    let (client, selected) = selected_client(state.path()).await;
+    let owning = state.path().join("providers/local-minvmd0/alpha/ssh.sock");
+
+    let mut poll = cmd::poll_client_for(client, &selected, &owning)
+        .await
+        .expect("the owning VM's daemon answers");
+    let listed = cmd::list_sessions_version_gated(&mut poll)
+        .await
+        .expect("the poll's list succeeds");
+    assert!(
+        listed.sessions.iter().any(|s| s.id == web),
+        "the poll reaches alpha, which holds 'web'"
+    );
+    assert!(
+        !listed.sessions.iter().any(|s| s.id == api),
+        "the poll does not ask the selected VM"
+    );
+
+    // A box on the selected VM keeps the selected VM's connection.
+    let (client, selected) = selected_client(state.path()).await;
+    let mut poll = cmd::poll_client_for(client, &selected, &selected)
+        .await
+        .expect("the selected VM keeps its connection");
+    let listed = cmd::list_sessions_version_gated(&mut poll)
+        .await
+        .expect("the poll's list succeeds");
+    assert!(listed.sessions.iter().any(|s| s.id == api));
+}
+
 /// The resolution path gets the same treatment as the listing: a stopped
 /// VM's stale `ssh.sock` is probed once — "not running", not a fault to retry
 /// for — so a name resolution across every VM costs the VMs that are up, not
@@ -3641,8 +3782,8 @@ async fn attach_fall_through_hands_off_the_owning_vm() {
 #[tokio::test]
 async fn a_stopped_vm_does_not_hold_a_box_name_resolution() {
     let state = tempfile::tempdir().expect("a temp minimal state dir");
-    let provider = state.path().join("providers/local-minvmd0");
-    std::fs::create_dir_all(provider.join("beta")).expect("the stopped VM's dir");
+    let host_dir = state.path().join("providers/local-minvmd0");
+    std::fs::create_dir_all(host_dir.join("beta")).expect("the stopped VM's dir");
 
     let default_sock =
         client::resolve_socket_path_named(Some(state.path()), true, paths::DEFAULT_VM_NAME)
@@ -3652,7 +3793,7 @@ async fn a_stopped_vm_does_not_hold_a_box_name_resolution() {
     create_box_on(&default_vm, "api").await;
 
     // The stopped VM: a dead listener's socket path, still enumerable.
-    let stale = std::os::unix::net::UnixListener::bind(provider.join("beta/ssh.sock"))
+    let stale = std::os::unix::net::UnixListener::bind(host_dir.join("beta/ssh.sock"))
         .expect("the stopped VM's socket path binds");
     drop(stale);
 
@@ -3691,9 +3832,9 @@ async fn attach_refuses_a_box_name_two_vms_know() {
     // Three VMs: the selected one, plus alpha and beta, which both own the
     // ambiguous name.
     let state = tempfile::tempdir().expect("a temp minimal state dir for three VMs");
-    let provider = state.path().join("providers/local-minvmd0");
+    let host_dir = state.path().join("providers/local-minvmd0");
     for vm in ["alpha", "beta"] {
-        std::fs::create_dir_all(provider.join(vm)).expect("the named VM's provider subdir");
+        std::fs::create_dir_all(host_dir.join(vm)).expect("the named VM's provider subdir");
     }
     let selected_sock =
         client::resolve_socket_path_named(Some(state.path()), true, paths::DEFAULT_VM_NAME)
@@ -3701,9 +3842,9 @@ async fn attach_refuses_a_box_name_two_vms_know() {
     let selected_vm = minimald::test_harness::TestServer::new().await;
     selected_vm.listen_on_uds(&selected_sock).await;
     let alpha = minimald::test_harness::TestServer::new().await;
-    alpha.listen_on_uds(&provider.join("alpha/ssh.sock")).await;
+    alpha.listen_on_uds(&host_dir.join("alpha/ssh.sock")).await;
     let beta = minimald::test_harness::TestServer::new().await;
-    beta.listen_on_uds(&provider.join("beta/ssh.sock")).await;
+    beta.listen_on_uds(&host_dir.join("beta/ssh.sock")).await;
 
     // The selected VM knows a box of its own — so the connection, and the
     // version gate the lookup carries, are real — but not this name.
@@ -3776,6 +3917,7 @@ async fn walked_proxy_port_reported_at_start_and_in_ls() {
             // there is no control socket to read a state from — the shape
             // this render is fed, same as a listing that read none.
             control_sock: None,
+            running: true,
         }
     };
 
@@ -4805,14 +4947,30 @@ mod mint_tests {
     // proxy.
     #[test]
     fn a_grant_box_with_no_proxy_is_refused_as_an_unenrolled_node() {
+        use boxes::core::bep::ProxyAbsence;
         let dir = tempfile::tempdir().unwrap();
         let identity = dir.path().join("identity.json");
         let control = dir.path().join("control.sock");
+        let binary = dir.path().join("bep");
+        let log = dir.path().join("bep.log");
         assert!(!crate::cmd::proxy_present(Some(&identity), Some(&control)));
         assert!(!crate::cmd::proxy_present(None, None));
 
+        // No `bep` program: the proxy is not installed.
+        let absence = crate::cmd::proxy_absence(
+            Some(&identity),
+            Some(&control),
+            Ok(binary.clone()),
+            Some(log.clone()),
+        );
+        assert_eq!(
+            absence,
+            Some(ProxyAbsence::NotInstalled {
+                path: Some(binary.clone())
+            })
+        );
         let err =
-            crate::cmd::check_github_grants(&github_secrets(), false, &signed_in()).unwrap_err();
+            crate::cmd::check_github_grants(&github_secrets(), absence, &signed_in()).unwrap_err();
         let refused = refusal(&err);
         assert_eq!(
             refused.refusals[0].code(),
@@ -4825,14 +4983,128 @@ mod mint_tests {
         assert_eq!(refused.exit_code(), 5);
         assert_eq!(
             refused.to_string(),
-            "Cannot create the box: it declares the GitHub grant GH_TOKEN, and no Box Egress \
-             Proxy serves boxes on this machine. Remove the grant from the [secrets] table in \
-             minimal.toml, then create the box again."
+            format!(
+                "Cannot create the box: it declares the GitHub grant GH_TOKEN, and `bep`, the \
+                 Box Egress Proxy, is not installed at {}, so no proxy serves boxes on this \
+                 machine. To create the box without the grant, remove GH_TOKEN from \
+                 [session.secrets] in minimal.toml.",
+                binary.display()
+            )
+        );
+        // No path resolved for the program: the text names none.
+        let err = crate::cmd::check_github_grants(
+            &github_secrets(),
+            crate::cmd::proxy_absence(
+                None,
+                None,
+                Err(bep::store::ProxyLookupError::NoMinvmd),
+                None,
+            ),
+            &signed_in(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Cannot create the box: it declares the GitHub grant GH_TOKEN, and `bep`, the Box \
+             Egress Proxy, is not installed, so no proxy serves boxes on this machine. To \
+             create the box without the grant, remove GH_TOKEN from [session.secrets] in \
+             minimal.toml."
+        );
+
+        // A relative MINVMD_BEP_BIN: the text names the variable and its
+        // value, not a missing program.
+        let absence = crate::cmd::proxy_absence(
+            Some(&identity),
+            Some(&control),
+            Err(bep::store::ProxyLookupError::RelativeEnv("bin/bep".into())),
+            Some(log.clone()),
+        );
+        assert_eq!(
+            absence,
+            Some(ProxyAbsence::RelativePath {
+                path: "bin/bep".into()
+            })
+        );
+        let err =
+            crate::cmd::check_github_grants(&github_secrets(), absence, &signed_in()).unwrap_err();
+        let refused = refusal(&err);
+        assert_eq!(refused.exit_code(), 5);
+        assert_eq!(
+            refused.to_string(),
+            "Cannot create the box: it declares the GitHub grant GH_TOKEN, and MINVMD_BEP_BIN \
+             sets `bep`, the Box Egress Proxy, to the relative path bin/bep, and no proxy \
+             serves boxes on this machine. Set MINVMD_BEP_BIN to an absolute path. To create \
+             the box without the grant, remove GH_TOKEN from [session.secrets] in \
+             minimal.toml."
+        );
+
+        // A `bep` program that published nothing: installed, and not
+        // answering. With no log file written, the text names no log.
+        std::fs::write(&binary, "").unwrap();
+        let absence = crate::cmd::proxy_absence(
+            Some(&identity),
+            Some(&control),
+            Ok(binary.clone()),
+            Some(log.clone()),
+        );
+        assert_eq!(
+            absence,
+            Some(ProxyAbsence::NotAnswering {
+                path: binary.clone(),
+                log: None
+            })
+        );
+        let err =
+            crate::cmd::check_github_grants(&github_secrets(), absence, &signed_in()).unwrap_err();
+        let refused = refusal(&err);
+        assert_eq!(refused.exit_code(), 5);
+        assert_eq!(
+            refused.to_string(),
+            format!(
+                "Cannot create the box: it declares the GitHub grant GH_TOKEN, and `bep`, the \
+                 Box Egress Proxy, is installed at {}, but it does not answer, so no proxy \
+                 serves boxes on this machine. To create the box without the grant, remove \
+                 GH_TOKEN from [session.secrets] in minimal.toml.",
+                binary.display()
+            )
+        );
+        // With the log file written, the text names it.
+        std::fs::write(&log, "").unwrap();
+        let absence = crate::cmd::proxy_absence(
+            Some(&identity),
+            Some(&control),
+            Ok(binary.clone()),
+            Some(log.clone()),
+        );
+        assert_eq!(
+            absence,
+            Some(ProxyAbsence::NotAnswering {
+                path: binary.clone(),
+                log: Some(log.clone())
+            })
+        );
+        let err =
+            crate::cmd::check_github_grants(&github_secrets(), absence, &signed_in()).unwrap_err();
+        let refused = refusal(&err);
+        assert_eq!(refused.exit_code(), 5);
+        assert_eq!(
+            refused.to_string(),
+            format!(
+                "Cannot create the box: it declares the GitHub grant GH_TOKEN, and `bep`, the \
+                 Box Egress Proxy, is installed at {}, but it does not answer, so no proxy \
+                 serves boxes on this machine. The proxy's log is at {}. To create the box \
+                 without the grant, remove GH_TOKEN from [session.secrets] in minimal.toml.",
+                binary.display(),
+                log.display()
+            )
         );
         // With no sign-in held either, the missing proxy is what is refused.
-        let err =
-            crate::cmd::check_github_grants(&github_secrets(), false, &MemoryKeychain::default())
-                .unwrap_err();
+        let err = crate::cmd::check_github_grants(
+            &github_secrets(),
+            Some(ProxyAbsence::NotInstalled { path: None }),
+            &MemoryKeychain::default(),
+        )
+        .unwrap_err();
         assert_eq!(
             refusal(&err).refusals[0].code(),
             Some(boxes::core::bep::GATEHOUSE_UNENROLLED_NODE)
@@ -4842,8 +5114,12 @@ mod mint_tests {
         std::fs::write(&identity, "{}").unwrap();
         std::fs::write(&control, "").unwrap();
         assert!(crate::cmd::proxy_present(Some(&identity), Some(&control)));
+        assert_eq!(
+            crate::cmd::proxy_absence(Some(&identity), Some(&control), Ok(binary), Some(log)),
+            None
+        );
         let err =
-            crate::cmd::check_github_grants(&github_secrets(), true, &MemoryKeychain::default())
+            crate::cmd::check_github_grants(&github_secrets(), None, &MemoryKeychain::default())
                 .unwrap_err();
         let refused = refusal(&err);
         assert_eq!(
@@ -4854,13 +5130,17 @@ mod mint_tests {
         // With a proxy and a sign-in, the grants pass. A box with no GitHub
         // grant is never refused.
         assert_eq!(
-            crate::cmd::check_github_grants(&github_secrets(), true, &signed_in()).unwrap(),
+            crate::cmd::check_github_grants(&github_secrets(), None, &signed_in()).unwrap(),
             ["GH_TOKEN"]
         );
         assert!(
-            crate::cmd::check_github_grants(&Default::default(), false, &MemoryKeychain::default())
-                .unwrap()
-                .is_empty()
+            crate::cmd::check_github_grants(
+                &Default::default(),
+                Some(ProxyAbsence::NotServed),
+                &MemoryKeychain::default()
+            )
+            .unwrap()
+            .is_empty()
         );
     }
 
@@ -4926,9 +5206,9 @@ async fn box_id_is_a_csprng_uuidv7_per_creation() {
         quic443: None,
     };
     let dir = tempfile::TempDir::new().unwrap();
-    let provider_dir = dir.path().join("providers").join("local-minvmd0");
-    std::fs::create_dir_all(&provider_dir).unwrap();
-    let sock_path = provider_dir.join("control.sock");
+    let host_dir = dir.path().join("providers").join("local-minvmd0");
+    std::fs::create_dir_all(&host_dir).unwrap();
+    let sock_path = host_dir.join("control.sock");
     let attachments = minvmd::bep_attach::Attachments::new();
     let registry = minvmd::box_registry::BoxRegistry::new(switch::SwitchSubnet::default())
         .feeding_proxy_attachments(attachments.clone());
@@ -4944,7 +5224,7 @@ async fn box_id_is_a_csprng_uuidv7_per_creation() {
     for creation in 0..CREATIONS {
         let before = now_ms();
         let mut registered = register_box_for_activation(
-            paths::ProviderKind::Minvmd,
+            paths::HostKind::Minvmd,
             Some(dir.path()),
             boxes::NetworkMode::OwnIp,
             "web",
@@ -5108,9 +5388,9 @@ async fn colliding_box_id_refuses_creation() {
         quic443: None,
     };
     let dir = tempfile::TempDir::new().unwrap();
-    let provider_dir = dir.path().join("providers").join("local-minvmd0");
-    std::fs::create_dir_all(&provider_dir).unwrap();
-    let listener = tokio::net::UnixListener::bind(provider_dir.join("control.sock")).unwrap();
+    let host_dir = dir.path().join("providers").join("local-minvmd0");
+    std::fs::create_dir_all(&host_dir).unwrap();
+    let listener = tokio::net::UnixListener::bind(host_dir.join("control.sock")).unwrap();
 
     // The id a retained record already holds, and the refusal the host's
     // control server replies with when a mint lands on it.
@@ -5141,7 +5421,7 @@ async fn colliding_box_id_refuses_creation() {
     });
 
     let err = register_box_for_activation(
-        paths::ProviderKind::Minvmd,
+        paths::HostKind::Minvmd,
         Some(dir.path()),
         boxes::NetworkMode::OwnIp,
         "web",
@@ -5159,4 +5439,990 @@ async fn colliding_box_id_refuses_creation() {
         chain.contains("does not start"),
         "the activation ends on the refusal, so no box is created, got {chain:?}"
     );
+}
+
+/// The cell under `column` in the `min ls` row that contains `row_key`,
+/// read by the header's positions up to `next`, the column after it. A
+/// cell can hold spaces, so the row is not split on whitespace.
+fn ls_cell_at(text: &str, row_key: &str, column: &str, next: &str) -> String {
+    let header = text
+        .lines()
+        .find(|l| l.contains("SESSION ID"))
+        .unwrap_or_else(|| panic!("a header in:\n{text}"));
+    let start = header.find(column).expect("the column in the header");
+    let end = header.find(next).expect("the next column in the header");
+    let row = text
+        .lines()
+        .find(|l| l.contains(row_key) && !l.contains("SESSION ID"))
+        .unwrap_or_else(|| panic!("a row for {row_key} in:\n{text}"));
+    row[start..end].trim().to_string()
+}
+
+/// A listing of one box per entry in `boxes`: its name, its network facts
+/// and its per-box enforcement.
+fn listing_of(
+    boxes: &[(
+        &str,
+        Option<minimald_rpc::BoxNetworkFacts>,
+        Option<boxes::HostIpEnforcement>,
+    )],
+) -> minimald_rpc::ListSessionsResponse {
+    let id = |n: usize| {
+        boxes::SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012}")).unwrap()
+    };
+    minimald_rpc::ListSessionsResponse {
+        resource_pool: None,
+        sessions: boxes
+            .iter()
+            .enumerate()
+            .map(|(n, (name, _, enforcement))| {
+                let mut entry = twin_entry(
+                    &id(n + 1).to_string(),
+                    Some(name),
+                    Some("/work/proj"),
+                    boxes::BoxState::Active,
+                );
+                entry.host_ip_enforcement = *enforcement;
+                entry
+            })
+            .collect(),
+        daemon_version: None,
+        hostname_routing_unavailable: None,
+        hostname_proxy_port: None,
+        zone_answerer_port: None,
+        answerer_bound: false,
+        box_networks: boxes
+            .iter()
+            .enumerate()
+            .filter_map(|(n, (_, facts, _))| facts.clone().map(|facts| (id(n + 1), facts)))
+            .collect(),
+    }
+}
+
+/// T110: the BOX NAMES row speaks for every listed box, so it reads the
+/// `127.0.0.1` fallback form as soon as one box reports the fallback, even
+/// beside a box at its own address. A host-address box at the node address
+/// `127.0.0.1` is not at the fallback, so it keeps the own-address form.
+#[test]
+fn ls_shows_box_loopback_address_names_row_follows_any_fallback_box() {
+    let at = |address: std::net::Ipv4Addr, at_fallback: bool| {
+        Some(minimald_rpc::BoxNetworkFacts {
+            loopback_address: Some(address),
+            egress_posture: None,
+            at_fallback: Some(at_fallback),
+        })
+    };
+    let own = std::net::Ipv4Addr::new(127, 0, 64, 2);
+    let localhost = std::net::Ipv4Addr::LOCALHOST;
+    let row = |boxes: &[(
+        &str,
+        Option<minimald_rpc::BoxNetworkFacts>,
+        Option<boxes::HostIpEnforcement>,
+    )]| {
+        let mut resp = listing_of(boxes);
+        resp.hostname_proxy_port = Some(7654);
+        resp.answerer_bound = true;
+        let mut out = Vec::new();
+        format_ls(
+            &mut out,
+            &LsArgs {
+                raw: false,
+                json: false,
+            },
+            &resp,
+            Some(crate::resolver::LiveSurface::Native),
+            None,
+        )
+        .expect("rendering the listing");
+        let table = String::from_utf8(out).expect("the listing is UTF-8");
+        table
+            .lines()
+            .find(|l| l.starts_with("BOX NAMES:"))
+            .unwrap_or_else(|| panic!("a BOX NAMES row in:\n{table}"))
+            .to_string()
+    };
+    let opens = "<box>.min.internal opens at its name on this machine; the HTTP proxy at \
+                 127.0.0.1:7654 opens it too";
+    let resolves = "<box>.min.internal resolves on this machine; open it through the HTTP \
+                    proxy at 127.0.0.1:7654";
+    assert_eq!(
+        row(&[
+            ("own", at(own, false), None),
+            ("fallback", at(localhost, true), None)
+        ]),
+        format!("BOX NAMES:       {resolves}"),
+        "a mixed listing reads the fallback form"
+    );
+    assert_eq!(
+        row(&[("host", at(localhost, false), None)]),
+        format!("BOX NAMES:       {opens}"),
+        "a host-address box at 127.0.0.1 is not at the fallback"
+    );
+    assert_eq!(
+        row(&[("own", at(own, false), None)]),
+        format!("BOX NAMES:       {opens}")
+    );
+    assert_eq!(
+        row(&[("unreported", None, None)]),
+        format!("BOX NAMES:       {resolves}"),
+        "a listing that proves no box off the fallback reads the fallback form"
+    );
+    assert_eq!(
+        row(&[]),
+        format!("BOX NAMES:       {resolves}"),
+        "a listing with no box reads the fallback form"
+    );
+}
+
+/// T110: `min ls` shows each box's address in an ADDRESS column after NAME
+/// — its own address, the `127.0.0.1` fallback, or `-` when the daemon
+/// did not report one — and `--json` carries it per session as
+/// `loopback_address`, with no key for a box that reported none.
+#[test]
+fn ls_shows_box_loopback_address() {
+    let at = |address: std::net::Ipv4Addr| {
+        Some(minimald_rpc::BoxNetworkFacts {
+            loopback_address: Some(address),
+            egress_posture: None,
+            at_fallback: Some(address == std::net::Ipv4Addr::LOCALHOST),
+        })
+    };
+    let resp = listing_of(&[
+        ("own", at(std::net::Ipv4Addr::new(127, 0, 64, 2)), None),
+        ("fallback", at(std::net::Ipv4Addr::LOCALHOST), None),
+        ("unreported", None, None),
+    ]);
+    let render = |json: bool, listings: &[cmd::VmListing]| {
+        let mut out = Vec::new();
+        format_ls_across_vms(&mut out, &LsArgs { raw: false, json }, listings, &[], &[])
+            .expect("rendering the listing");
+        String::from_utf8(out).expect("the listing is UTF-8")
+    };
+    let one = [cmd::VmListing {
+        vm: "default".to_string(),
+        resp: resp.clone(),
+        control_sock: None,
+        running: true,
+    }];
+
+    let table = render(false, &one);
+    let header = table
+        .lines()
+        .find(|l| l.contains("SESSION ID"))
+        .expect("a header");
+    assert!(
+        header.find("NAME") < header.find("ADDRESS")
+            && header.find("ADDRESS") < header.find("STATUS"),
+        "ADDRESS sits after NAME: {header}"
+    );
+    let address = |name: &str| ls_cell_at(&table, name, "ADDRESS", "STATUS");
+    assert_eq!(address("own"), "127.0.64.2", "got:\n{table}");
+    assert_eq!(address("fallback"), "127.0.0.1", "got:\n{table}");
+    assert_eq!(address("unreported"), "-", "got:\n{table}");
+
+    let document: serde_json_lenient::Value =
+        serde_json_lenient::from_str(&render(true, &one)).expect("the listing is JSON");
+    let sessions = document["sessions"].as_array().expect("a sessions array");
+    assert_eq!(sessions[0]["loopback_address"], "127.0.64.2");
+    assert_eq!(sessions[1]["loopback_address"], "127.0.0.1");
+    assert!(
+        sessions[2].get("loopback_address").is_none(),
+        "an unreported address is no key, never an invented value: {document}"
+    );
+    assert!(
+        document.get("box_networks").is_none(),
+        "the facts ride on each session, not beside them: {document}"
+    );
+
+    // The multi-VM document carries the same field on each session.
+    let two = [
+        cmd::VmListing {
+            vm: "default".to_string(),
+            resp: resp.clone(),
+            control_sock: None,
+            running: true,
+        },
+        cmd::VmListing {
+            vm: "alpha".to_string(),
+            resp: listing_of(&[("other", at(std::net::Ipv4Addr::new(127, 0, 64, 9)), None)]),
+            control_sock: None,
+            running: true,
+        },
+    ];
+    let document: serde_json_lenient::Value =
+        serde_json_lenient::from_str(&render(true, &two)).expect("the listing is JSON");
+    let other = document["sessions"]
+        .as_array()
+        .expect("a sessions array")
+        .iter()
+        .find(|s| s["name"] == "other")
+        .expect("the alpha VM's box");
+    assert_eq!(other["loopback_address"], "127.0.64.9", "{document}");
+    assert_eq!(other["vm"], "alpha", "{document}");
+}
+
+/// T110: the EGRESS cell `min ls` prints for a box is the posture `min
+/// session policy` prints for the same box, in the same words: the named
+/// verdict, `declared rules` for a section listed as rows, and the per-box
+/// enforcement note for a host-address box this host cannot decide per
+/// box.
+#[test]
+fn ls_egress_matches_session_policy() {
+    use boxes::{EffectiveEgress, EgressPolicy, HostIpEnforcement, NetworkMode};
+    let rules = EgressPolicy {
+        allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+        allow_dns_hosts: Some(Vec::new()),
+        ..EgressPolicy::default()
+    };
+    let cases = [
+        (
+            "own-default",
+            EffectiveEgress::DenyAll,
+            NetworkMode::OwnIp,
+            None,
+            "deny-all (default)",
+        ),
+        (
+            "host-default",
+            EffectiveEgress::AllowAll,
+            NetworkMode::HostNet,
+            Some(HostIpEnforcement::PerBox),
+            "allow-all (default)",
+        ),
+        (
+            "host-unenforced",
+            EffectiveEgress::Declared(EgressPolicy::deny_all()),
+            NetworkMode::HostNet,
+            Some(HostIpEnforcement::None),
+            "deny-all; per-box enforcement none",
+        ),
+        (
+            "own-rules",
+            EffectiveEgress::Declared(rules),
+            NetworkMode::OwnIp,
+            None,
+            "declared rules",
+        ),
+    ];
+    let resp = listing_of(
+        &cases
+            .iter()
+            .map(|(name, egress, network, enforcement, _)| {
+                (
+                    *name,
+                    Some(minimald_rpc::BoxNetworkFacts {
+                        loopback_address: None,
+                        egress_posture: Some(minimald_rpc::EgressPosture::of(egress, *network)),
+                        at_fallback: None,
+                    }),
+                    *enforcement,
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+    let mut out = Vec::new();
+    format_ls(
+        &mut out,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        &resp,
+        None,
+        None,
+    )
+    .expect("rendering the listing");
+    let table = String::from_utf8(out).expect("the listing is UTF-8");
+
+    for (name, egress, network, enforcement, words) in cases {
+        let cell = ls_cell_at(&table, name, "EGRESS", "TITLE");
+        assert_eq!(cell, words, "{name}:\n{table}");
+        let mut policy = Vec::new();
+        format_policy(
+            &mut policy,
+            &boxes::EffectiveBoxPolicy {
+                egress,
+                ..Default::default()
+            },
+            network,
+            enforcement,
+            &[],
+            None,
+        )
+        .expect("rendering the policy");
+        let policy = String::from_utf8(policy).expect("the policy is UTF-8");
+        let (posture, note) = match cell.split_once("; ") {
+            Some((posture, note)) => (posture, Some(note)),
+            None => (cell.as_str(), None),
+        };
+        if posture == "declared rules" {
+            assert!(
+                policy.contains("egress\n  subnets  "),
+                "a declared-rules box lists its rows in the policy view:\n{policy}"
+            );
+        } else {
+            assert!(
+                policy.contains(&format!("egress\n  {posture}\n")),
+                "{name}: the policy view names the same posture:\n{policy}"
+            );
+        }
+        match note {
+            Some(note) => assert_eq!(note, "per-box enforcement none"),
+            None => assert!(
+                !policy.contains("per-box enforcement  none"),
+                "{name}: only an unenforced box carries the note:\n{policy}"
+            ),
+        }
+        if note.is_some() {
+            assert!(
+                policy.contains("  per-box enforcement  none\n"),
+                "{name}: the policy view states the same enforcement:\n{policy}"
+            );
+        }
+    }
+    assert!(!table.contains("per_box"), "got:\n{table}");
+}
+
+/// A stopped VM `vm` under `state`: its state dir with the persisted box
+/// records `boxes` (name, id), as its VM host daemon wrote them before it
+/// stopped, and a stale `ssh.sock` that no daemon listens on.
+fn stopped_vm_with_boxes(state: &std::path::Path, vm: &str, boxes: &[(&str, boxes::SessionId)]) {
+    let dir = state.join("providers/local-minvmd0").join(vm);
+    std::fs::create_dir_all(&dir).expect("the stopped VM's dir");
+    let records: Vec<serde_json_lenient::Value> = boxes
+        .iter()
+        .enumerate()
+        .map(|(index, (name, id))| {
+            serde_json_lenient::json!({
+                "name": name,
+                "box_id": id.to_string(),
+                "switch_address": format!("100.64.0.{}", index + 9),
+                "loopback_address": format!("127.0.64.{}", index + 2),
+                "ingress_ports": [],
+                "standing": true,
+            })
+        })
+        .collect();
+    std::fs::write(
+        dir.join(minvmd::box_registry::REGISTRY_FILE),
+        serde_json_lenient::to_vec(&serde_json_lenient::json!({
+            "version": 1,
+            "boxes": records,
+        }))
+        .expect("the records serialize"),
+    )
+    .expect("write the stopped VM's box records");
+    let stale = std::os::unix::net::UnixListener::bind(dir.join("ssh.sock"))
+        .expect("the stopped VM's socket path binds");
+    drop(stale);
+}
+
+/// The default VM, running, under a fresh state dir: the selected VM of
+/// every test below that pairs it with a stopped one.
+async fn running_default_vm() -> (tempfile::TempDir, minimald::test_harness::TestServer) {
+    let state = tempfile::tempdir().expect("a temp minimal state dir");
+    std::fs::create_dir_all(state.path().join("providers/local-minvmd0")).expect("the host dir");
+    let default_sock =
+        client::resolve_socket_path_named(Some(state.path()), true, paths::DEFAULT_VM_NAME)
+            .expect("the default VM's socket path");
+    let default_vm = minimald::test_harness::TestServer::new().await;
+    default_vm.listen_on_uds(&default_sock).await;
+    (state, default_vm)
+}
+
+/// A client on the selected (default) VM's daemon under `state`.
+async fn selected_client(state: &std::path::Path) -> (client::Client, std::path::PathBuf) {
+    let selected = client::resolve_socket_path_named(Some(state), true, paths::DEFAULT_VM_NAME)
+        .expect("the selected VM's socket path");
+    let client = client::Client::connect(&selected)
+        .await
+        .expect("connect to the selected VM's daemon");
+    (client, selected)
+}
+
+/// NET-058 for the commands that act on a named box over the daemon's RPCs:
+/// `min session policy` and `min session destroy` find a box on another VM
+/// by its name alone, and the client they get back is that VM's.
+#[tokio::test]
+async fn box_name_resolves_vm_without_flag_for_policy_and_destroy() {
+    let (state, default_vm, alpha) = two_vms().await;
+    create_box_on(&default_vm, "api").await;
+    let beta = create_box_on(&alpha, "beta").await;
+    let global = vm_globals(state.path(), None);
+
+    for example in ["session policy beta", "session destroy beta"] {
+        let (client, _) = selected_client(state.path()).await;
+        let (mut owner, record) = cmd::resolve_box_on_any_vm(&global, client, "beta", example)
+            .await
+            .expect("a name alpha owns resolves without --vm");
+        assert_eq!(record.id, beta, "{example}: alpha's record");
+        let again = cmd::resolve_session(&mut owner, "beta")
+            .await
+            .expect("the client returned is connected to alpha");
+        assert_eq!(again.id, beta, "{example}: the follow-up RPCs reach alpha");
+    }
+}
+
+/// NET-058: a box name no running VM holds, on a host with two VMs, is
+/// refused with the flag that names a box on another VM, shown on the
+/// command the user ran. With `--vm`, the selected VM's own miss stands.
+#[tokio::test]
+async fn unknown_box_names_vm_flag() {
+    let (state, _default_vm, _alpha) = two_vms().await;
+    let global = vm_globals(state.path(), None);
+
+    let (client, _) = selected_client(state.path()).await;
+    let err = cmd::resolve_box_on_any_vm(&global, client, "beta", "session policy beta")
+        .await
+        .map(|(_, record)| record)
+        .expect_err("no VM holds 'beta'");
+    assert_eq!(
+        format!("error: {err:#}"),
+        "error: no running VM has a box named 'beta'. A box on another VM is named with --vm, \
+         for example: min --vm <vm> session policy beta",
+        "the refusal as main prints it"
+    );
+
+    // The hand-off verbs say the same, on their own command.
+    let (mut client, sock) = selected_client(state.path()).await;
+    let err = cmd::resolve_named_box_version_gated(
+        &global,
+        &mut client,
+        sock,
+        "beta",
+        "Forwarding to",
+        "net forward beta 8080:3000",
+    )
+    .await
+    .expect_err("no VM holds 'beta'");
+    assert_eq!(
+        err.to_string(),
+        "no running VM has a box named 'beta'. A box on another VM is named with --vm, \
+         for example: min --vm <vm> net forward beta 8080:3000"
+    );
+
+    // An explicit --vm is the operator's choice: the selected VM's miss.
+    let pinned = vm_globals(state.path(), Some(paths::DEFAULT_VM_NAME.to_string()));
+    let (client, _) = selected_client(state.path()).await;
+    let err = cmd::resolve_box_on_any_vm(&pinned, client, "beta", "session policy beta")
+        .await
+        .map(|(_, record)| record)
+        .expect_err("no VM holds 'beta'");
+    assert_eq!(err.to_string(), "No session found matching 'beta'");
+}
+
+/// NET-152: a box only a stopped VM holds is named with that VM and the
+/// command that starts it, on every verb that resolves a box by name. A
+/// running VM's box of the same name and the stopped VM's record are an
+/// ambiguity that names both VMs.
+#[tokio::test]
+async fn box_on_stopped_vm_names_start_command() {
+    let (state, default_vm) = running_default_vm().await;
+    create_box_on(&default_vm, "api").await;
+    let beta = boxes::SessionId::mint();
+    stopped_vm_with_boxes(state.path(), "alpha", &[("beta", beta)]);
+    let global = vm_globals(state.path(), None);
+    let expected = "box 'beta' is on VM 'alpha', which is stopped. \
+                    Start it with: min --vm alpha session attach beta";
+
+    let err = attach::resolve_box_vm(&global, "beta")
+        .await
+        .expect_err("a box on a stopped VM is refused");
+    assert_eq!(format!("error: {err:#}"), format!("error: {expected}"));
+
+    // The attach path itself: the selected VM's miss falls through to the
+    // stopped VM's records.
+    let (mut client, sock) = selected_client(state.path()).await;
+    let err = cmd::resolve_attach_target_version_gated(&global, &mut client, sock, "beta")
+        .await
+        .expect_err("attach refuses a box on a stopped VM");
+    assert_eq!(err.to_string(), expected);
+
+    // And the RPC verbs, with the policy's machine reading still a miss.
+    let (client, _) = selected_client(state.path()).await;
+    let err = cmd::resolve_box_on_any_vm(&global, client, "beta", "session policy beta")
+        .await
+        .map(|(_, record)| record)
+        .expect_err("policy refuses a box on a stopped VM");
+    assert_eq!(err.to_string(), expected);
+    assert!(err.downcast_ref::<cmd::BoxNotFound>().is_some());
+
+    // A name two stopped VMs hold is ambiguous, and typed so the policy's
+    // machine reading reports a miss, not an unreachable daemon.
+    stopped_vm_with_boxes(state.path(), "delta", &[("dup", boxes::SessionId::mint())]);
+    stopped_vm_with_boxes(
+        state.path(),
+        "epsilon",
+        &[("dup", boxes::SessionId::mint())],
+    );
+    let (client, _) = selected_client(state.path()).await;
+    let err = cmd::resolve_box_on_any_vm(&global, client, "dup", "session policy dup")
+        .await
+        .map(|(_, record)| record)
+        .expect_err("a name two stopped VMs hold is ambiguous");
+    assert_eq!(
+        err.to_string(),
+        "box name 'dup' exists on more than one stopped VM (delta, epsilon); \
+         name the one you mean with --vm"
+    );
+    assert!(err.downcast_ref::<cmd::AmbiguousBoxName>().is_some());
+
+    // A name a running VM owns and a stopped VM's records hold is ambiguous,
+    // though the running box is active: the error lists both VMs, marks the
+    // stopped one, and names --vm.
+    stopped_vm_with_boxes(state.path(), "gamma", &[("api", boxes::SessionId::mint())]);
+    let err = attach::resolve_box_vm(&global, "api")
+        .await
+        .expect_err("a running owner and a stopped holder are ambiguous");
+    assert_eq!(
+        err.to_string(),
+        "box name 'api' exists on more than one VM (default, gamma (stopped)); \
+         name the one you mean with --vm"
+    );
+    assert!(err.downcast_ref::<cmd::AmbiguousBoxName>().is_some());
+
+    // A stopped record on the running VM and a stopped VM that holds the
+    // name are ambiguous: the error lists both VMs, marks the stopped one,
+    // and names --vm.
+    let web = create_box_on(&default_vm, "web").await;
+    stopped_vm_with_boxes(state.path(), "zeta", &[("web", boxes::SessionId::mint())]);
+    let mut rpc = default_vm.connect().await;
+    match rpc
+        .call::<minimald_rpc::StopBox>(&minimald_rpc::StopBoxRequest {
+            id: web,
+            force: true,
+        })
+        .await
+    {
+        minimald_rpc::Errorable::Ok(_) => {}
+        minimald_rpc::Errorable::Err { error } => panic!("StopBox failed: {error}"),
+    }
+    let err = attach::resolve_box_vm(&global, "web")
+        .await
+        .expect_err("a stopped owner and a stopped holder are ambiguous");
+    assert_eq!(
+        err.to_string(),
+        "box name 'web' exists on more than one VM (default, zeta (stopped)); \
+         name the one you mean with --vm"
+    );
+    assert!(err.downcast_ref::<cmd::AmbiguousBoxName>().is_some());
+
+    // The selected VM is the only holder: it resolves there.
+    create_box_on(&default_vm, "solo").await;
+    let (client, _) = selected_client(state.path()).await;
+    let (_, record) = cmd::resolve_box_on_any_vm(&global, client, "solo", "session policy solo")
+        .await
+        .expect("the selected VM's own box resolves");
+    assert_eq!(record.name.as_deref(), Some("solo"));
+
+    // A hit on the selected VM is ambiguous when a stopped VM also holds the
+    // name.
+    let (client, _) = selected_client(state.path()).await;
+    let err = cmd::resolve_box_on_any_vm(&global, client, "api", "session policy api")
+        .await
+        .map(|(_, record)| record)
+        .expect_err("the selected VM and a stopped VM both hold 'api'");
+    assert_eq!(
+        err.to_string(),
+        "box name 'api' exists on more than one VM (default, gamma (stopped)); \
+         name the one you mean with --vm"
+    );
+
+    // A name wins over an id prefix across VMs, as on one daemon: a running
+    // box named 'cafe' resolves though a stopped VM holds a box whose id
+    // starts with 'cafe'.
+    create_box_on(&default_vm, "cafe").await;
+    let mut cafe_id = [0x11; 16];
+    cafe_id[0] = 0xca;
+    cafe_id[1] = 0xfe;
+    stopped_vm_with_boxes(
+        state.path(),
+        "eta",
+        &[("other", boxes::SessionId::from_bytes(cafe_id))],
+    );
+    let resolved = attach::resolve_box_vm(&global, "cafe")
+        .await
+        .expect("a name match is not ambiguous with an id prefix")
+        .expect("the running VM owns 'cafe'");
+    assert_eq!(resolved.vm, "default");
+    assert_eq!(resolved.record.name.as_deref(), Some("cafe"));
+}
+
+/// NET-058: a name the selected VM holds is ambiguous when a second running
+/// VM holds it too. `min session destroy` and `min session attach` refuse it,
+/// name both VMs and `--vm`, and do not act on the selected VM's box. With
+/// `--vm`, the selected VM's box resolves.
+#[tokio::test]
+async fn box_name_resolves_vm_without_flag_refuses_a_name_two_vms_hold() {
+    let (state, default_vm, alpha) = two_vms().await;
+    let shared = create_box_on(&default_vm, "shared").await;
+    create_box_on(&alpha, "shared").await;
+    let global = vm_globals(state.path(), None);
+    let expected = "box name 'shared' exists on more than one VM (default, alpha); \
+                    name the one you mean with --vm";
+
+    let (client, _) = selected_client(state.path()).await;
+    let err = cmd::resolve_box_on_any_vm(&global, client, "shared", "session destroy shared")
+        .await
+        .map(|(_, record)| record)
+        .expect_err("destroy refuses a name two VMs hold");
+    assert_eq!(err.to_string(), expected);
+    assert!(err.downcast_ref::<cmd::AmbiguousBoxName>().is_some());
+
+    let (mut client, sock) = selected_client(state.path()).await;
+    let err = cmd::resolve_attach_target_version_gated(&global, &mut client, sock, "shared")
+        .await
+        .expect_err("attach refuses a name two VMs hold");
+    assert_eq!(err.to_string(), expected);
+    assert!(err.downcast_ref::<cmd::AmbiguousBoxName>().is_some());
+
+    // The selected VM's box is still there: nothing acted on it.
+    let (mut client, _) = selected_client(state.path()).await;
+    let record = cmd::resolve_session(&mut client, "shared")
+        .await
+        .expect("the selected VM still holds 'shared'");
+    assert_eq!(record.id, shared);
+
+    // With --vm, the operator chose: the selected VM's box resolves.
+    let pinned = vm_globals(state.path(), Some(paths::DEFAULT_VM_NAME.to_string()));
+    let (client, _) = selected_client(state.path()).await;
+    let (_, record) =
+        cmd::resolve_box_on_any_vm(&pinned, client, "shared", "session destroy shared")
+            .await
+            .expect("--vm picks the selected VM's box");
+    assert_eq!(record.id, shared);
+}
+
+/// NET-152: `min ls` lists a stopped VM's boxes from its persisted records:
+/// each row's STATUS reads `stopped` and its VM cell `alpha (stopped)`, the
+/// table rule runs under the VM column, and `--json` carries the boxes with
+/// `"status": "stopped"` and `"vm_running": false`.
+#[tokio::test]
+async fn ls_lists_boxes_on_stopped_vm() {
+    let (state, default_vm) = running_default_vm().await;
+    let api = create_box_on(&default_vm, "api").await;
+    let beta = boxes::SessionId::mint();
+    stopped_vm_with_boxes(state.path(), "alpha", &[("beta", beta)]);
+    // A stopped VM with no boxes adds no listing.
+    stopped_vm_with_boxes(state.path(), "empty", &[]);
+    let global = vm_globals(state.path(), None);
+
+    let listings = cmd::ls_listings(&global)
+        .await
+        .expect("listing past a stopped VM succeeds");
+    assert_eq!(listings.len(), 2, "the running VM and the stopped one");
+    assert_eq!(listings[0].vm, "default");
+    assert!(listings[0].running);
+    assert_eq!(listed_names(&listings[0]), ["api"]);
+    assert_eq!(listings[1].vm, "alpha");
+    assert!(!listings[1].running, "alpha is stopped");
+    assert_eq!(listed_names(&listings[1]), ["beta"]);
+    assert_eq!(listings[1].resp.sessions[0].id, beta);
+    assert_eq!(
+        listings[1].resp.sessions[0].status,
+        boxes::BoxState::Stopped
+    );
+
+    let mut out = Vec::new();
+    format_ls_across_vms(
+        &mut out,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        &listings,
+        &[],
+        &[],
+    )
+    .expect("the table renders");
+    let table = String::from_utf8(out).expect("UTF-8");
+    let lines: Vec<&str> = table.lines().collect();
+    let header = lines
+        .iter()
+        .position(|line| line.starts_with("VM "))
+        .expect("the table header");
+    assert!(
+        lines[header + 1].starts_with("---------------  "),
+        "the rule runs under the VM column, as wide as its widest cell:\n{table}"
+    );
+    let beta_row = lines
+        .iter()
+        .find(|line| line.contains(&beta.to_string()))
+        .expect("alpha's box has a row");
+    assert!(
+        beta_row.starts_with("alpha (stopped)  "),
+        "the VM cell says the VM is stopped: {beta_row:?}"
+    );
+    assert!(
+        beta_row.split_whitespace().any(|cell| cell == "stopped"),
+        "STATUS reads stopped: {beta_row:?}"
+    );
+    let api_row = lines
+        .iter()
+        .find(|line| line.contains(&api.to_string()))
+        .expect("the running VM's box has a row");
+    assert!(
+        api_row.starts_with("default          "),
+        "a running VM's cell is its name alone, padded to the column: {api_row:?}"
+    );
+
+    let mut out = Vec::new();
+    format_ls_across_vms(
+        &mut out,
+        &LsArgs {
+            raw: false,
+            json: true,
+        },
+        &listings,
+        &[],
+        &[],
+    )
+    .expect("the JSON renders");
+    let document: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(&out).expect("one JSON document");
+    let sessions = document["sessions"].as_array().expect("a sessions array");
+    let beta_entry = sessions
+        .iter()
+        .find(|entry| entry["name"] == "beta")
+        .expect("alpha's box is in the document");
+    assert_eq!(beta_entry["status"], "stopped");
+    assert_eq!(beta_entry["vm"], "alpha");
+    assert_eq!(beta_entry["vm_running"], false);
+    let api_entry = sessions
+        .iter()
+        .find(|entry| entry["name"] == "api")
+        .expect("the running VM's box is in the document");
+    assert_eq!(api_entry["vm_running"], true);
+}
+
+/// NET-152: an attach that fails once the relay holds the terminal ends
+/// `min session attach` with an error that `main` prints after the attach
+/// returns. By then the relay put the attach-start termios back and the
+/// unwind codes are on the terminal, so the error prints after them and
+/// stays on screen. A relay that never took the terminal writes nothing.
+#[test]
+fn attach_error_printed_after_terminal_restore() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// The user's terminal: everything written to it, in order.
+    #[derive(Clone, Default)]
+    struct Screen(Rc<RefCell<Vec<u8>>>);
+    impl std::io::Write for Screen {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let screen = Screen::default();
+    let err = interactive_attach(
+        std::process::Command::new("ssh"),
+        true,
+        || attach::TerminalUnwind::arm_on(screen.clone(), true),
+        |_| Err(anyhow::anyhow!("the relay lost the terminal mid-session")),
+    )
+    .expect_err("a failed relay ends the attach with an error");
+    assert!(
+        screen.0.borrow().ends_with(b"\x1b[?1004l"),
+        "the unwind is on the terminal before the attach returns"
+    );
+    // What main prints for the error, on the same terminal.
+    let printed = format!("error: {err:#}\n");
+    std::io::Write::write_all(&mut screen.clone(), printed.as_bytes()).expect("print");
+    let seen = screen.0.borrow().clone();
+    let at = seen
+        .windows(printed.len())
+        .position(|window| window == printed.as_bytes())
+        .expect("the error is on the terminal");
+    assert!(
+        seen[..at].ends_with(b"\x1b[?1004l"),
+        "the error prints after the restore sequence: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert_eq!(at + printed.len(), seen.len(), "nothing writes after it");
+
+    // A relay that never took the terminal never changed it.
+    let untouched = Screen::default();
+    interactive_attach(
+        std::process::Command::new("ssh"),
+        true,
+        || attach::TerminalUnwind::arm_on(untouched.clone(), true),
+        |_| {
+            Err(anyhow::Error::new(std::io::Error::other("no tty"))
+                .context(attach::TerminalNotTaken))
+        },
+    )
+    .expect_err("an attach with no terminal fails");
+    assert!(
+        untouched.0.borrow().is_empty(),
+        "no unwind for a terminal the attach never took"
+    );
+
+    // A relay that took the terminal and then failed to start ssh's session
+    // on it (ssh does not spawn) never let the session reach the terminal.
+    // The relay drops its suspend hook unrun, so the failure is marked, and
+    // the guard writes nothing. The error prints as the relay wrote it.
+    let not_started = Screen::default();
+    let err = interactive_attach(
+        std::process::Command::new("ssh"),
+        true,
+        || attach::TerminalUnwind::arm_on(not_started.clone(), true),
+        |_| {
+            mark_relay_not_started(None, |_hook| {
+                Err(
+                    anyhow::Error::new(std::io::Error::other("No such file or directory"))
+                        .context("spawning the ssh attach"),
+                )
+            })
+        },
+    )
+    .expect_err("an attach whose ssh does not spawn fails");
+    assert!(
+        not_started.0.borrow().is_empty(),
+        "no unwind for a relay that never started the session: {:?}",
+        String::from_utf8_lossy(&not_started.0.borrow())
+    );
+    assert_eq!(
+        format!("{err:#}"),
+        "failed to run ssh: spawning the ssh attach: No such file or directory"
+    );
+}
+
+/// NET-154: the HOSTNAME PROXY row names every host port the VM's proxy
+/// serves on, the preferred first, and `--json` carries them as
+/// `hostname_proxy_ports`. One served port prints the row it always did.
+#[tokio::test]
+async fn ls_reports_every_proxy_port() {
+    let mut resp = listing_of(&[("web", None, None)]);
+    resp.hostname_proxy_port = Some(65264);
+    let render = |json: bool, ports: &[u16]| {
+        let mut out = Vec::new();
+        cmd::format_ls_with_proxy_ports_on(
+            &mut out,
+            &LsArgs { raw: false, json },
+            &resp,
+            None,
+            None,
+            ports,
+            crate::resolver::HostInstall::default(),
+        )
+        .expect("rendering the listing");
+        String::from_utf8(out).expect("the listing is UTF-8")
+    };
+    let proxy_rows = |text: &str| {
+        text.lines()
+            .filter(|line| line.starts_with("HOSTNAME PROXY:"))
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+
+    // One port: the row as it always was, read or not.
+    let one = "HOSTNAME PROXY:  listening on 127.0.0.1:65264 as the HTTP proxy for \
+               <box>.min.internal names";
+    assert_eq!(proxy_rows(&render(false, &[65264])), vec![one]);
+    assert_eq!(proxy_rows(&render(false, &[])), vec![one]);
+
+    // Both ports serve: one row names both, the preferred first.
+    assert_eq!(
+        proxy_rows(&render(false, &[7654, 65264])),
+        vec![
+            "HOSTNAME PROXY:  listening on 127.0.0.1:7654 and 127.0.0.1:65264 as the HTTP \
+             proxy for <box>.min.internal names"
+        ]
+    );
+
+    // The JSON field.
+    let json = |ports: &[u16]| -> serde_json_lenient::Value {
+        serde_json_lenient::from_str(&render(true, ports)).expect("the listing is JSON")
+    };
+    assert_eq!(
+        json(&[7654, 65264])["hostname_proxy_ports"],
+        serde_json_lenient::json!([7654, 65264])
+    );
+    assert_eq!(
+        json(&[65264])["hostname_proxy_ports"],
+        serde_json_lenient::json!([65264])
+    );
+    assert!(json(&[]).get("hostname_proxy_ports").is_none());
+
+    // The VM host daemon reports no ports while the proxy is down, so a
+    // down proxy reaches `--json` as an empty served list and names no port.
+    let down = json(&[]);
+    assert!(down.get("hostname_proxy_ports").is_none());
+
+    // Two VMs: each VM's row names its own ports.
+    let listing = |vm: &str, port: u16| cmd::VmListing {
+        vm: vm.to_string(),
+        resp: {
+            let mut resp = resp.clone();
+            resp.hostname_proxy_port = Some(port);
+            resp
+        },
+        control_sock: None,
+        running: true,
+    };
+    let listings = [listing("default", 65264), listing("other", 7700)];
+    let across = |json: bool| {
+        let mut out = Vec::new();
+        cmd::format_ls_across_vms_with_proxy_ports_on(
+            &mut out,
+            &LsArgs { raw: false, json },
+            &listings,
+            &[],
+            &[],
+            &[vec![7654, 65264], vec![7700]],
+            crate::resolver::HostInstall::default(),
+        )
+        .expect("rendering the listing");
+        String::from_utf8(out).expect("the listing is UTF-8")
+    };
+    assert_eq!(
+        proxy_rows(&across(false)),
+        vec![
+            "HOSTNAME PROXY:  default  listening on 127.0.0.1:7654 and 127.0.0.1:65264 as \
+             the HTTP proxy for <box>.min.internal names",
+            "HOSTNAME PROXY:  other    listening on 127.0.0.1:7700 as the HTTP proxy for \
+             <box>.min.internal names",
+        ]
+    );
+    let doc: serde_json_lenient::Value =
+        serde_json_lenient::from_str(&across(true)).expect("the listing is JSON");
+    assert_eq!(
+        doc["vms"][0]["hostname_proxy_ports"],
+        serde_json_lenient::json!([7654, 65264])
+    );
+    assert_eq!(
+        doc["vms"][1]["hostname_proxy_ports"],
+        serde_json_lenient::json!([7700])
+    );
+
+    // The read over the VM host daemon's control socket.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sock = dir.path().join("control.sock");
+    let listener = tokio::net::UnixListener::bind(&sock).expect("bind the control socket");
+    let server = tokio::spawn(async move {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let mut line = String::new();
+        tokio::io::BufReader::new(&mut stream)
+            .read_line(&mut line)
+            .await
+            .expect("read the request");
+        stream
+            .write_all(b"{\"proxy_ports\":[7654,65264]}\n")
+            .await
+            .expect("write the reply");
+        line
+    });
+    assert_eq!(
+        cmd::vm_host_proxy_ports_at(Some(sock)).await,
+        vec![7654, 65264]
+    );
+    let request = server.await.expect("the server ends");
+    assert_eq!(request.trim(), r#"{"verb":"proxy_ports"}"#);
+    assert!(cmd::vm_host_proxy_ports_at(None).await.is_empty());
 }

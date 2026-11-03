@@ -5,6 +5,10 @@
 //! the plan's check for gominimal/minimal#1510: the frozen filter names the
 //! crate, so no proof in it can go green by never being run.
 
+// The in-process daemon's async bodies are deep: rustc's default query depth (128)
+// overflows computing their layout (`queries overflow the depth limit!`), as the
+// daemon crates themselves already declare.
+#![recursion_limit = "256"]
 use std::path::PathBuf;
 
 fn repo_root() -> PathBuf {

@@ -73,7 +73,7 @@ tokio.workspace = true
 # Production beacon-reading code calls russh::keys::known_hosts::learn_known_hosts_path
 # and russh::keys::ssh_key::PublicKey::from_openssh (R2.5).
 russh.workspace = true
-# Canonical state-dir base + provider-instance dir layout (`state`, `sock`,
+# Canonical state-dir base + host dir layout (`state`, `sock`,
 # `volume`).
 paths.workspace = true
 # The box ids a proxy attachment names its boxes by (NET-133, BEP-070): one

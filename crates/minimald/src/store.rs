@@ -27,6 +27,7 @@ enum StoreMessage {
     Handles(oneshot::Sender<Result<Vec<BoxRecordHandle>, std::io::Error>>),
     Create(
         Box<Record>,
+        Option<SessionId>,
         oneshot::Sender<Result<BoxRecordHandle, std::io::Error>>,
     ),
     Find(
@@ -123,13 +124,26 @@ impl Store {
     /// record carries is overwritten: a client never names a box's id. A
     /// minted id that a retained record already names refuses the
     /// creation and leaves the store unchanged (BEP-070).
-    fn create(&mut self, mut record: Record) -> Result<DiskBoxKey, std::io::Error> {
-        let id = (self.mint)();
+    ///
+    /// `handed` is the id the VM host daemon minted for the box (BOX-002).
+    /// The store files the record under it in place of its own mint, with
+    /// the same refusal.
+    fn create(
+        &mut self,
+        mut record: Record,
+        handed: Option<SessionId>,
+    ) -> Result<DiskBoxKey, std::io::Error> {
+        let id = handed.unwrap_or_else(self.mint);
         if self.store.find_by_id(&id)?.is_some() {
             tracing::warn!(
                 box_id = %id,
+                handed = handed.is_some(),
                 "refused a create: the minted box id is already held by a retained record"
             );
+            // A re-run gets a new id. A fresh mint differs on the next
+            // run. A handed id is the id of a row the client registered:
+            // the client withdraws that row on a failed create and
+            // registers a fresh one, with a fresh id, on the next run.
             return Err(std::io::Error::other(format!(
                 "the new session's id {id} is already in use by another session. \
                  No session was created. Run the command again."
@@ -157,8 +171,8 @@ impl Store {
             StoreMessage::Handles(r) => {
                 let _ = r.send(Ok(self.store.keys().map(|k| self.handle_for(k)).collect()));
             }
-            StoreMessage::Create(record, r) => {
-                let created = self.create(*record);
+            StoreMessage::Create(record, handed, r) => {
+                let created = self.create(*record, handed);
                 let _ = r.send(created.map(|k| self.handle_for(k)));
             }
             StoreMessage::Find(pred, r) => {
@@ -177,6 +191,13 @@ impl Store {
                 let _ = r.send(self.store.save(&k, &v));
             }
             StoreMessage::SessionDelete(k, r) => {
+                #[cfg(test)]
+                if test_faults::take_delete_failure(k.id()) {
+                    let _ = r.send(Err(std::io::Error::other(
+                        "test fault: the record delete failed",
+                    )));
+                    return;
+                }
                 let _ = r.send(self.store.delete(&k));
             }
             StoreMessage::CompositionLoad(k, r) => {
@@ -226,7 +247,25 @@ impl StoreHandle {
         // Ignore send errors - the recv will also fail.
         let _ = self
             .sender
-            .send(StoreMessage::Create(Box::new(record), send))
+            .send(StoreMessage::Create(Box::new(record), None, send))
+            .await;
+        recv.await.expect("corresponding store is dead")
+    }
+
+    /// [`Self::create`] under `id`, the id the VM host daemon minted for
+    /// the box (BOX-002), in place of the store's own mint. The record's
+    /// `id` is ignored the same way, and an `id` that a retained record
+    /// already names refuses the creation the same way.
+    pub async fn create_under(
+        &self,
+        record: Record,
+        id: SessionId,
+    ) -> Result<BoxRecordHandle, std::io::Error> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .sender
+            .send(StoreMessage::Create(Box::new(record), Some(id), send))
             .await;
         recv.await.expect("corresponding store is dead")
     }
@@ -399,6 +438,44 @@ impl WeakStoreHandle {
     }
 }
 
+/// Test-only faults the store actor injects, keyed by the box id so
+/// tests that run in parallel do not see each other's faults.
+#[cfg(test)]
+pub(crate) mod test_faults {
+    use boxes::SessionId;
+    use std::sync::Mutex;
+
+    static FAIL_NEXT_DELETE: Mutex<Vec<SessionId>> = Mutex::new(Vec::new());
+
+    /// Makes the next record delete of `id` fail once.
+    pub(crate) fn fail_next_delete(id: SessionId) {
+        FAIL_NEXT_DELETE
+            .lock()
+            .expect("test fault lock poisoned")
+            .push(id);
+    }
+
+    /// Whether a delete failure of `id` is armed and not yet consumed.
+    pub(crate) fn delete_failure_armed(id: &SessionId) -> bool {
+        FAIL_NEXT_DELETE
+            .lock()
+            .expect("test fault lock poisoned")
+            .contains(id)
+    }
+
+    /// Consumes the armed delete failure of `id`, if there is one.
+    pub(super) fn take_delete_failure(id: &SessionId) -> bool {
+        let mut armed = FAIL_NEXT_DELETE.lock().expect("test fault lock poisoned");
+        match armed.iter().position(|armed_id| armed_id == id) {
+            Some(index) => {
+                armed.swap_remove(index);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,12 +502,17 @@ mod tests {
             box_addresses: None,
             hooks_enabled: true,
             status: BoxState::default(),
+            reason: None,
+            exit_code: None,
+            signal: None,
             // No launch has recorded anything: these records are built
             // straight from disk-side seeds, never launched.
             host_ip_enforcement: None,
             box_id: None,
             host_row_bound: false,
             bound_ports: std::collections::BTreeSet::new(),
+            // No run ever minted these records, so none ends with one.
+            ends_with_run: false,
             sealed_deliveries: Vec::new(),
             root_certificate: None,
             box_type: None,

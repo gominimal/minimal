@@ -60,6 +60,28 @@ impl From<BoxKeyPredicate> for RecordPredicate {
 /// Transport / internal error when communicating with the sessions actor.
 type BoxManagerError = std::io::Error;
 
+/// A create refused because the VM host daemon gave the box no id
+/// (BOX-002). It rides inside a [`BoxManagerError`], so the `CreateSession`
+/// handler can tell it apart and answer the client with its text, in place
+/// of dropping the channel as it does for an internal failure.
+#[derive(Debug)]
+pub(crate) struct BoxIdNotMinted(String);
+
+impl std::fmt::Display for BoxIdNotMinted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BoxIdNotMinted {}
+
+impl BoxIdNotMinted {
+    /// Whether `error` is a create refused for want of a minted id.
+    pub(crate) fn is(error: &BoxManagerError) -> bool {
+        error.get_ref().is_some_and(|inner| inner.is::<Self>())
+    }
+}
+
 /// NET-079's observability, for the create path's half of the refusal: how
 /// many creates this daemon has refused because a host-address box's
 /// declaration named rules the classifier cannot enforce while the host
@@ -139,6 +161,9 @@ fn build_record(
         // daemon draws nothing for a task either (NET-138).
         task_addresses: config.task_addresses,
         status,
+        reason: None,
+        exit_code: None,
+        signal: None,
         hooks_enabled: config.hooks_enabled,
         // Daemon-owned from its first line: a create holds no launch's
         // outcome to record, and the key a client might assert in `attrs`
@@ -149,6 +174,10 @@ fn build_record(
         // Daemon-owned as well: only a launch binds the box's host-side row.
         host_row_bound: false,
         bound_ports: std::collections::BTreeSet::new(),
+        // Written by the create itself, never later: a box that ends with
+        // its run is marked from its first record, so no restart can land
+        // in a window where it reads as a plain session (NET-131).
+        ends_with_run: config.ends_with_run,
         // BEP-007: the grants' sealed values ride the record, so every host
         // launch of the box, after a daemon restart included, places them.
         sealed_deliveries: config.sealed_deliveries,
@@ -207,6 +236,129 @@ struct CreateSessionMsg {
 struct CreateBoxMsg {
     create: CreateSessionMsg,
     spec: Option<serde_json_lenient::Value>,
+    /// Whether the create asks for a fresh instance (BOX-163): the box is
+    /// named `<name>-<n>` and never refused for a held name.
+    fresh: bool,
+}
+
+/// The refusal of a create whose name a running box holds (BOX-163). It
+/// names the holder, as a rename's refusal does (BOX-010), and the
+/// rename command that frees the name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HeldNameRefusal {
+    /// The name the create asked for.
+    pub(crate) name: String,
+    /// The running box that holds it.
+    pub(crate) holder: SessionId,
+    /// The holder's name, with the case it was given.
+    pub(crate) holder_name: String,
+}
+
+impl HeldNameRefusal {
+    /// The exit code of the refusal.
+    pub(crate) fn exit_code(&self) -> i32 {
+        boxes::box_name::REFUSAL_EXIT_CODE
+    }
+}
+
+impl std::fmt::Display for HeldNameRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            name,
+            holder,
+            holder_name,
+        } = self;
+        write!(
+            f,
+            "A running session named `{holder_name}` ({holder}) already exists, so a new \
+             box cannot take the name `{name}`. Rename it with \
+             `min session rename {holder} <new-name>`, or choose another name."
+        )
+    }
+}
+
+impl std::error::Error for HeldNameRefusal {}
+
+/// Where a new box's name came from (BOX-163), for the create's log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NameSource {
+    /// The spec's `[box] name`.
+    SpecName,
+    /// The request's name, from a client that sends one beside the spec.
+    Request,
+    /// The spec's entry.
+    Entry,
+    /// No name at all: no spec and no name on the request.
+    None,
+}
+
+impl NameSource {
+    fn word(self) -> &'static str {
+        match self {
+            Self::SpecName => "spec box name",
+            Self::Request => "request name",
+            Self::Entry => "entry",
+            Self::None => "none",
+        }
+    }
+}
+
+/// The name a create gives its box (BOX-163): the expanded spec's
+/// `[box] name`, else the request's name, else the entry's name as a
+/// valid label ([`boxes::box_name::entry_box_name`]). `min` sends a
+/// request name only for `--name`. A spec the daemon cannot read as a v0 spec names nothing.
+fn creation_name(
+    requested: Option<&str>,
+    spec: Option<&serde_json_lenient::Value>,
+) -> (Option<String>, NameSource) {
+    let spec = spec.and_then(|value| {
+        serde_json_lenient::from_value::<mfile::spec::BoxSpec>(value.clone()).ok()
+    });
+    if let Some(name) = spec.as_ref().and_then(|spec| spec.name.clone()) {
+        return (Some(name), NameSource::SpecName);
+    }
+    if let Some(name) = requested {
+        return (Some(name.to_string()), NameSource::Request);
+    }
+    match spec {
+        // Only the entry is cleaned. A spec that sets `[box] name` returned
+        // above, unchanged, so the store still refuses an invalid one.
+        Some(spec) => (
+            Some(boxes::box_name::entry_box_name(&spec.entry)),
+            NameSource::Entry,
+        ),
+        None => (None, NameSource::None),
+    }
+}
+
+/// The name of a fresh instance of `base` (BOX-163): `<base>-<n>`, with
+/// the smallest positive `n` that no name in `retained` uses under ASCII
+/// case. Answers the name and its `n`.
+fn fresh_instance_name<'a>(
+    base: &str,
+    retained: impl IntoIterator<Item = &'a str>,
+) -> (String, usize) {
+    let prefix = format!("{base}-");
+    let used: std::collections::BTreeSet<usize> = retained
+        .into_iter()
+        .filter_map(|name| {
+            let head = name.get(..prefix.len())?;
+            if !head.eq_ignore_ascii_case(&prefix) {
+                return None;
+            }
+            let tail = &name[prefix.len()..];
+            // `dev-01` is not `dev-1`: only the plain spelling of `n`
+            // counts as using it.
+            if tail.starts_with('0') {
+                return None;
+            }
+            tail.parse::<usize>().ok()
+        })
+        .collect();
+    let n = (1..)
+        .find(|n| !used.contains(n))
+        .expect("a finite set leaves a positive integer unused");
+    (format!("{base}-{n}"), n)
 }
 
 impl BoxManagerHandle {
@@ -218,6 +370,33 @@ impl BoxManagerHandle {
         &self,
         config: minimald_rpc::BoxConfig,
         spec: Option<serde_json_lenient::Value>,
+        username: Option<String>,
+        creator: Option<std::sync::Weak<()>>,
+    ) -> Result<SessionId, BoxManagerError> {
+        self.send_create_box(config, spec, false, username, creator)
+            .await
+    }
+
+    /// [`Self::create_box_with_spec`] for a create that asks for a fresh
+    /// instance (BOX-163). The box is named `<name>-<n>`, with the smallest
+    /// `n` no retained record on this host uses, whether or not a running
+    /// box holds `<name>`. A request with `fresh_instance` set reaches this.
+    pub async fn create_fresh_box_with_spec(
+        &self,
+        config: minimald_rpc::BoxConfig,
+        spec: Option<serde_json_lenient::Value>,
+        username: Option<String>,
+        creator: Option<std::sync::Weak<()>>,
+    ) -> Result<SessionId, BoxManagerError> {
+        self.send_create_box(config, spec, true, username, creator)
+            .await
+    }
+
+    async fn send_create_box(
+        &self,
+        config: minimald_rpc::BoxConfig,
+        spec: Option<serde_json_lenient::Value>,
+        fresh: bool,
         username: Option<String>,
         creator: Option<std::sync::Weak<()>>,
     ) -> Result<SessionId, BoxManagerError> {
@@ -233,9 +412,514 @@ impl BoxManagerHandle {
                     responder: send,
                 },
                 spec,
+                fresh,
             })))
             .await;
         recv.await.expect("corresponding sessions manager is dead")
+    }
+}
+
+impl BoxManagerHandle {
+    /// Every retained box record on this host, in any state, in box id
+    /// order (BOX-158). With `project_root`, only the records whose
+    /// project root, as the create recorded it, is that one. A record that
+    /// predates the field has no project root and is never in a scoped
+    /// listing.
+    pub async fn list_boxes(
+        &self,
+        project_root: Option<&paths::HostAbsPath>,
+    ) -> Result<Vec<minimald_rpc::BoxListingEntry>, BoxManagerError> {
+        use tracing::Instrument as _;
+        let scope = project_root.map_or_else(|| "host".to_string(), |root| root.to_string());
+        let span = tracing::info_span!(
+            "box.list",
+            scope = %scope,
+            count = tracing::field::Empty
+        );
+        async {
+            let (send, recv) = Responder::channel();
+            // Ignore send errors - the recv will also fail.
+            let _ = self.sender.send(ManagerMessage::Records(send)).await;
+            let records = recv
+                .await
+                .expect("corresponding sessions manager is dead")?;
+            let mut boxes: Vec<_> = records
+                .iter()
+                .filter(|record| {
+                    project_root.is_none_or(|root| record.project_root.as_ref() == Some(root))
+                })
+                .map(box_listing_entry)
+                .collect();
+            boxes.sort_by_key(|entry| entry.box_id);
+            tracing::Span::current().record("count", boxes.len());
+            tracing::info!(scope = %scope, count = boxes.len(), "listed boxes");
+            Ok(boxes)
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// One box record with its state, the identity the box runs under and
+    /// its live execs (BOX-159). `id` is the id a listing reports: it
+    /// resolves as a record's `box_id` first and as its `id` second, so
+    /// every id [`list_boxes`](Self::list_boxes) prints reads back here.
+    /// `None` for an id no retained record names. It starts no actor.
+    pub async fn show_box(
+        &self,
+        id: SessionId,
+    ) -> Result<Option<minimald_rpc::ShowBoxResponse>, BoxManagerError> {
+        use tracing::Instrument as _;
+        let span = tracing::info_span!("box.show", session_id = %id, found = tracing::field::Empty);
+        async {
+            let (send, recv) = Responder::channel();
+            // Ignore send errors - the recv will also fail.
+            let _ = self.sender.send(ManagerMessage::Records(send)).await;
+            let records = recv
+                .await
+                .expect("corresponding sessions manager is dead")?;
+            // The listing reports `box_id` where a record has one (a VM
+            // guest's differs from its `id`), so that key wins.
+            let record = records
+                .iter()
+                .find(|record| record.box_id == Some(id))
+                .or_else(|| records.iter().find(|record| record.id == id))
+                .cloned();
+            tracing::Span::current().record("found", record.is_some());
+            tracing::info!(session_id = %id, found = record.is_some(), "read a box record");
+            Ok(record.map(|record| minimald_rpc::ShowBoxResponse {
+                record: box_listing_entry(&record),
+                // BOX-140: no host this daemon runs on is enrolled with a
+                // Gatehouse, so every box reports the identity none.
+                identity: minimald_rpc::BoxIdentity::None,
+                // BOX-149: the daemon does not give an exec an id yet, so
+                // this list is always empty, even when a process runs in
+                // the box. It fills when each exec has an id (BOX-149):
+                // https://github.com/gominimal/minimal/issues/2404 (T30).
+                live_execs: Vec::new(),
+            }))
+        }
+        .instrument(span)
+        .await
+    }
+}
+
+impl BoxManagerHandle {
+    /// The retained record that `id` names, read as [`Self::show_box`]
+    /// reads it: as a record's `box_id` first and as its `id` second.
+    async fn retained_record(
+        &self,
+        id: SessionId,
+    ) -> Result<Option<boxes::Record>, BoxManagerError> {
+        let (send, recv) = Responder::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self.sender.send(ManagerMessage::Records(send)).await;
+        let records = recv
+            .await
+            .expect("corresponding sessions manager is dead")?;
+        Ok(records
+            .iter()
+            .find(|record| record.box_id == Some(id))
+            .or_else(|| records.iter().find(|record| record.id == id))
+            .cloned())
+    }
+
+    /// Reaps the box `id` (BOX-019): deletes its record, its events
+    /// (BOX-045) and its filesystem, runs its `on_destroy` hooks and
+    /// releases the address and the name it holds. A `stopped` or `exited`
+    /// box is reaped. A `running` box is refused and left running, unless
+    /// `force` is set: then the box is stopped as a forced [`Self::stop_box`]
+    /// stops it, and reaped after. Nothing reaps a box but this call and
+    /// [`Self::prune_boxes`] (BOX-024).
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` for an id no record names, `InvalidInput` for a box this
+    /// call refuses, `ConnectionRefused` while the daemon shuts down, or
+    /// the error the stop or the delete ended on.
+    pub async fn reap_box(
+        &self,
+        id: SessionId,
+        force: bool,
+    ) -> Result<minimald_rpc::ReapBoxResponse, BoxManagerError> {
+        if self.in_shutdown.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                minimald_rpc::SHUTDOWN_REFUSAL,
+            ));
+        }
+        let Some(record) = self.retained_record(id).await? else {
+            tracing::info!(box_id = %id, force, "reap: no retained record names the box");
+            return Err(unknown_box(id));
+        };
+        self.reap_record(record, force).await
+    }
+
+    /// [`Self::reap_box`] for a record already read, in a span of its own.
+    async fn reap_record(
+        &self,
+        record: boxes::Record,
+        force: bool,
+    ) -> Result<minimald_rpc::ReapBoxResponse, BoxManagerError> {
+        use tracing::Instrument as _;
+        let key = record.id;
+        let span = tracing::info_span!(
+            "box.reap",
+            box_id = %record.box_id.unwrap_or(key),
+            session_id = %key,
+            force,
+            outcome = tracing::field::Empty
+        );
+        async {
+            let outcome = self.reap_record_now(record, force).await;
+            let word = match &outcome {
+                Ok(_) => "reaped",
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => "refused",
+                Err(_) => "failed",
+            };
+            tracing::Span::current().record("outcome", word);
+            match &outcome {
+                Ok(reply) => tracing::info!(
+                    box_id = %reply.reaped.box_id,
+                    session_id = %key,
+                    name = ?reply.reaped.name,
+                    state = %reply.reaped.state,
+                    force,
+                    hook_failures = reply.hook_failures.len(),
+                    "reaped a box: its record, events and files are deleted"
+                ),
+                Err(error) => tracing::info!(
+                    session_id = %key,
+                    force,
+                    outcome = word,
+                    %error,
+                    "reap: the box was not reaped"
+                ),
+            }
+            outcome
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// The reap itself. A forced reap stops a running box at once first.
+    /// A forced reap of a box whose resume is in flight waits for the
+    /// resume to end, for at most [`REAP_RESUME_WAIT`], and then reaps the
+    /// box in the state the resume left it: it stops a box the resume
+    /// started. It does not cancel the resume. A reap that is not forced
+    /// refuses such a box at once.
+    async fn reap_record_now(
+        &self,
+        mut record: boxes::Record,
+        force: bool,
+    ) -> Result<minimald_rpc::ReapBoxResponse, BoxManagerError> {
+        let key = record.id;
+        let deadline = tokio::time::Instant::now() + REAP_RESUME_WAIT;
+        loop {
+            if force
+                && matches!(
+                    record.state(),
+                    Ok(boxes::core::record::RecordState::Running)
+                )
+            {
+                tracing::info!(
+                    session_id = %key,
+                    "reap: stopping the running box at once before the reap"
+                );
+                match self.stop_box(key, true).await {
+                    Ok(ending) => {
+                        tracing::info!(session_id = %key, ending = ?ending, "reap: the forced stop ended the box");
+                    }
+                    // The box ended between the read and the stop. The reap
+                    // below reads the state it ended in.
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {}
+                    Err(e) => return Err(e),
+                }
+                record = self
+                    .get_record(BoxKeyPredicate::Id(key))
+                    .await?
+                    .ok_or_else(|| unknown_box(key))?;
+            }
+            let reaped = box_listing_entry(&record);
+            let (send, recv) = Responder::channel();
+            // A send error means the manager is gone: the recv fails as well.
+            let _ = self.sender.send(ManagerMessage::ReapEnded(key, send)).await;
+            let outcome = recv.await.unwrap_or_else(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    minimald_rpc::SHUTDOWN_REFUSAL,
+                ))
+            });
+            match outcome {
+                Err(e)
+                    if force && is_resume_pending(&e) && tokio::time::Instant::now() < deadline =>
+                {
+                    tracing::info!(
+                        session_id = %key,
+                        "reap: waiting for the box's resume to end before the forced reap"
+                    );
+                    tokio::time::sleep(REAP_RESUME_POLL).await;
+                    record = self
+                        .get_record(BoxKeyPredicate::Id(key))
+                        .await?
+                        .ok_or_else(|| unknown_box(key))?;
+                }
+                outcome => {
+                    let end = outcome?;
+                    #[cfg(target_os = "linux")]
+                    if let Some(name) = &end.held_name {
+                        self.hand_over_name(key, record.box_id.unwrap_or(key), name)
+                            .await;
+                    }
+                    return Ok(minimald_rpc::ReapBoxResponse {
+                        reaped,
+                        hook_failures: end.hook_failures.unwrap_or_default(),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Hands the name row that the reaped box `reaped` held to the next
+    /// retained box with the same name (NET-012, NET-128), and returns once
+    /// the manager did it. The manager first makes sure the reaped box no
+    /// longer holds the row, and then picks the successor and registers it
+    /// in the same step, so a reap or a resume that lands between the two
+    /// cannot leave the name with no row while a box with it is retained.
+    /// A failure here does not fail the reap: the daemon log names it.
+    /// Answers with the box that took the row, or `None` when no box did.
+    #[cfg(target_os = "linux")]
+    async fn hand_over_name(
+        &self,
+        reaped: SessionId,
+        reaped_box: SessionId,
+        name: &str,
+    ) -> Option<SessionId> {
+        let (send, recv) = Responder::channel();
+        // A send error means the manager is gone: the recv fails as well.
+        let _ = self
+            .sender
+            .send(ManagerMessage::HandOverName(
+                NameHandOver {
+                    reaped,
+                    reaped_box,
+                    name: name.to_string(),
+                },
+                send,
+            ))
+            .await;
+        recv.await.ok().and_then(Result::ok).flatten()
+    }
+
+    /// Reaps every `stopped` or `exited` box that matches all the given
+    /// selectors (BOX-021), and answers with each box it reaped and each
+    /// one it matched and did not reap. `older_than` matches a box that
+    /// entered `stopped` or `exited` at least that long ago, as the `ts` of
+    /// its last `exited` event says. A box with no `exited` event never
+    /// matches it. `parent` matches a box whose parent is that box. A box
+    /// in any other state never matches. Each reap is a
+    /// [`Self::reap_box`] that is not forced, so a box that resumes after
+    /// the match is refused, not reaped.
+    ///
+    /// # Errors
+    ///
+    /// `ConnectionRefused` while the daemon shuts down, or the store's
+    /// error from the read of the records.
+    pub async fn prune_boxes(
+        &self,
+        older_than: Option<std::time::Duration>,
+        parent: Option<SessionId>,
+    ) -> Result<minimald_rpc::PruneBoxesResponse, BoxManagerError> {
+        self.prune_boxes_at(older_than, parent, std::time::SystemTime::now())
+            .await
+    }
+
+    /// Whether the box `record` names entered `stopped` or `exited` at
+    /// least `older_than` before `now`, for a prune's age selector
+    /// (BOX-021). A box with no `exited` event, or whose events cannot be
+    /// read, does not match, and the daemon log names it.
+    async fn ended_long_enough(
+        &self,
+        record: &boxes::Record,
+        older_than: std::time::Duration,
+        now: std::time::SystemTime,
+    ) -> bool {
+        let box_id = record.box_id.unwrap_or(record.id);
+        let events = match self.box_events(record.id).await {
+            Ok(mut reader) => reader.read_new(),
+            Err(error) => Err(error),
+        };
+        let events = match events {
+            Ok(events) => events,
+            Err(error) => {
+                tracing::info!(
+                    box_id = %box_id,
+                    session_id = %record.id,
+                    %error,
+                    "prune: the box's events cannot be read; the age selector skips it"
+                );
+                return false;
+            }
+        };
+        match ended_at(&events) {
+            Some(ended) => now.duration_since(ended).is_ok_and(|age| age >= older_than),
+            None => {
+                tracing::info!(
+                    box_id = %box_id,
+                    session_id = %record.id,
+                    "prune: the box has no exited event; the age selector skips it"
+                );
+                false
+            }
+        }
+    }
+
+    /// [`Self::prune_boxes`] with `now` as the time that `older_than`
+    /// counts back from.
+    pub(crate) async fn prune_boxes_at(
+        &self,
+        older_than: Option<std::time::Duration>,
+        parent: Option<SessionId>,
+        now: std::time::SystemTime,
+    ) -> Result<minimald_rpc::PruneBoxesResponse, BoxManagerError> {
+        use tracing::Instrument as _;
+        let span = tracing::info_span!(
+            "box.prune",
+            older_than_secs = older_than.map(|d| d.as_secs()),
+            parent = parent.map(tracing::field::display),
+            matched = tracing::field::Empty,
+            reaped = tracing::field::Empty,
+            failed = tracing::field::Empty
+        );
+        async {
+            if self.in_shutdown.is_cancelled() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    minimald_rpc::SHUTDOWN_REFUSAL,
+                ));
+            }
+            let (send, recv) = Responder::channel();
+            // Ignore send errors - the recv will also fail.
+            let _ = self.sender.send(ManagerMessage::Records(send)).await;
+            let records = recv
+                .await
+                .expect("corresponding sessions manager is dead")?;
+            let mut matched = Vec::new();
+            for record in records {
+                if !prune_matches(&record, parent) {
+                    continue;
+                }
+                if let Some(older_than) = older_than
+                    && !self.ended_long_enough(&record, older_than, now).await
+                {
+                    continue;
+                }
+                matched.push(record);
+            }
+            matched.sort_by_key(|record| record.box_id.unwrap_or(record.id));
+            tracing::Span::current().record("matched", matched.len());
+            let mut reply = minimald_rpc::PruneBoxesResponse::default();
+            for record in matched {
+                let box_id = record.box_id.unwrap_or(record.id);
+                match self.reap_record(record, false).await {
+                    Ok(reaped) => reply.reaped.push(reaped.reaped),
+                    Err(error) => reply.failed.push(minimald_rpc::PruneFailure {
+                        box_id,
+                        error: error.to_string(),
+                    }),
+                }
+            }
+            tracing::Span::current().record("reaped", reply.reaped.len());
+            tracing::Span::current().record("failed", reply.failed.len());
+            tracing::info!(
+                older_than_secs = older_than.map(|d| d.as_secs()),
+                parent = parent.map(tracing::field::display),
+                reaped = reply.reaped.len(),
+                failed = reply.failed.len(),
+                "pruned the stopped and exited boxes"
+            );
+            Ok(reply)
+        }
+        .instrument(span)
+        .await
+    }
+}
+
+/// Whether `record` is a prune candidate (BOX-021): it is `stopped` or
+/// `exited`, and it matches the `parent` selector when one is given. The
+/// `older_than` selector needs the record's events, so
+/// [`BoxManagerHandle::prune_boxes_at`] checks it after this one.
+fn prune_matches(record: &boxes::Record, parent: Option<SessionId>) -> bool {
+    let ended = matches!(
+        record.state(),
+        Ok(boxes::core::record::RecordState::Stopped(_)
+            | boxes::core::record::RecordState::Exited(_))
+    );
+    if !ended {
+        return false;
+    }
+    parent.is_none_or(|parent| record.parent == Some(parent))
+}
+
+/// When the box entered `stopped` or `exited`: the `ts` of the last
+/// `exited` event in `events`. `None` when no `exited` event is there.
+fn ended_at(events: &[BoxEvent]) -> Option<std::time::SystemTime> {
+    events
+        .iter()
+        .rev()
+        .find(|event| event.kind == BoxEventType::Exited)
+        .map(|event| std::time::UNIX_EPOCH + std::time::Duration::from_millis(event.ts))
+}
+
+/// The refusal for an id no retained record names.
+fn unknown_box(id: SessionId) -> BoxManagerError {
+    std::io::Error::new(
+        NotFound,
+        format!(
+            "{} `{}`",
+            minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+            id.as_ref()
+        ),
+    )
+}
+
+/// A record as a listing reports it (BOX-158): its identity fields and its
+/// state as BOX-011 spells it. A `stopped` or `exited` record whose stored
+/// ending is not a row of the BOX-011 table reports its status with the
+/// stored `reason`, `exit_code` and `signal` as they are.
+fn box_listing_entry(record: &boxes::Record) -> minimald_rpc::BoxListingEntry {
+    let (state, reason, exit_code, signal) = match record.state() {
+        Ok(state) => (
+            state.name(),
+            state.reason().map(|reason| reason.name().to_string()),
+            state.exit_code(),
+            state.signal(),
+        ),
+        Err(_) => (
+            match record.status {
+                boxes::BoxState::Pending => "pending",
+                boxes::BoxState::Materializing => "materializing",
+                boxes::BoxState::Active => "running",
+                boxes::BoxState::Stopped => "stopped",
+                boxes::BoxState::Exited => "exited",
+            },
+            record
+                .reason
+                .as_ref()
+                .map(|reason| reason.as_str().to_string()),
+            record.exit_code,
+            record.signal,
+        ),
+    };
+    minimald_rpc::BoxListingEntry {
+        box_id: record.box_id.unwrap_or(record.id),
+        name: record.name.clone(),
+        box_type: record.box_type.clone(),
+        parent: record.parent,
+        project_root: record.project_root.clone(),
+        state: state.to_string(),
+        reason,
+        exit_code,
+        signal,
     }
 }
 
@@ -266,12 +950,30 @@ fn spec_bytes(spec: &serde_json_lenient::Value) -> Result<Vec<u8>, BoxManagerErr
 
 enum ManagerMessage {
     List(Responder<Vec<BoxInfo>>),
+    /// Every retained record, in any state (BOX-158). Read-only against
+    /// the store: it starts no actor and probes no host.
+    Records(Responder<Vec<boxes::Record>>),
     GetRecord(BoxKeyPredicate, Responder<Option<boxes::Record>>),
     /// The retained box an events read follows (BOX-162): its on-disk
     /// object, so the read runs off the mainloop. `None` for an id no
     /// retained record names.
     EventsSource(SessionId, Responder<Option<boxes::store::DiskBox>>),
+    /// The record and the on-disk object of the box `id`, read under one
+    /// teardown check (BOX-017). `None` for an id no record names, and
+    /// for a box being torn down, as to [`GetRecord`](Self::GetRecord).
+    /// It never starts an actor.
+    EndedSource(
+        SessionId,
+        Responder<Option<(boxes::Record, boxes::store::DiskBox)>>,
+    ),
     GetSession(BoxKeyPredicate, Responder<Option<BoxHandle>>),
+    /// The handle of the session's live actor, if it has one. Read-only
+    /// against the `running` map: unlike [`GetSession`](Self::GetSession)
+    /// it never starts an actor, so a stopped box stays without one. Linux
+    /// only, like the publish-move receiver that asks it: on macOS minimald
+    /// runs inside the Linux guest.
+    #[cfg(target_os = "linux")]
+    GetRunning(SessionId, Responder<Option<BoxHandle>>),
     /// Snapshot a running session's terminal screen (`min dash`'s
     /// `GetSessionScreen`). Read-only against the `running` map — unlike
     /// [`GetSession`](Self::GetSession) it never starts an actor, and a
@@ -305,6 +1007,18 @@ enum ManagerMessage {
     /// Destroy a session; with `true`, only if it has not finished
     /// activating (`None` when it was kept).
     DeleteSession(SessionId, bool, Responder<Option<Vec<String>>>),
+    /// Reap the box `id` only if its record is `stopped` or `exited` and
+    /// no resume of it is in flight (BOX-019). Otherwise it refuses, and
+    /// the box is left as it is. A reap is a destroy otherwise: it runs
+    /// the box's `on_destroy` hooks and releases its address and name.
+    ReapEnded(SessionId, Responder<ReapEnd>),
+    /// Releases the name row of a reaped box, if its teardown left it, and
+    /// registers the row for the next retained box with the name (NET-012,
+    /// NET-128). The successor is picked here, among the boxes not being
+    /// removed. A no-op for the successor when another box took the row
+    /// since, or when a resume of a box with that name is in flight.
+    #[cfg(target_os = "linux")]
+    HandOverName(NameHandOver, Responder<Option<SessionId>>),
     Shutdown(bool, Responder<Result<(), ()>>),
     /// Bring up the actor of every `Active` record whose box owns a name,
     /// so a restarted daemon routes the names of the sessions it restored
@@ -312,6 +1026,14 @@ enum ManagerMessage {
     /// actors it started.
     #[cfg(target_os = "linux")]
     ResumeActive(Responder<usize>),
+    /// The box, other than the one named by the id, that holds the name a
+    /// resume asks for (BOX-025), or `None`. A `None` claims the name for
+    /// the id until [`Self::ReleaseNameClaim`]. Read from the store and the
+    /// claims alone, so it never waits on an actor.
+    RunningNameHolder(SessionId, String, Responder<Option<NameHolder>>),
+    /// Fire-and-forget: drop the name claim of a resume that ended, as
+    /// refused or as running (BOX-025). A no-op for an id with no claim.
+    ReleaseNameClaim(SessionId),
     /// Fire-and-forget: drop the `running` entry for a session whose actor
     /// terminated on its own (abort, failed verdict resume, create failure).
     /// A no-op for an id already removed; ids are never reused, so a stale
@@ -324,9 +1046,13 @@ impl ManagerMessage {
     fn kind(&self) -> &'static str {
         match self {
             Self::List(..) => "List",
+            Self::Records(..) => "Records",
             Self::GetRecord(..) => "GetRecord",
             Self::EventsSource(..) => "EventsSource",
+            Self::EndedSource(..) => "EndedSource",
             Self::GetSession(..) => "GetSession",
+            #[cfg(target_os = "linux")]
+            Self::GetRunning(..) => "GetRunning",
             Self::GetScreen(..) => "GetScreen",
             Self::GetComposition(..) => "GetComposition",
             #[cfg(test)]
@@ -339,9 +1065,14 @@ impl ManagerMessage {
             // see one kind for every create (BOX-068).
             Self::CreateBox(..) => "CreateSession",
             Self::DeleteSession(..) => "DeleteSession",
+            Self::ReapEnded(..) => "ReapEnded",
+            #[cfg(target_os = "linux")]
+            Self::HandOverName(..) => "HandOverName",
             Self::Shutdown(..) => "Shutdown",
             #[cfg(target_os = "linux")]
             Self::ResumeActive(..) => "ResumeActive",
+            Self::RunningNameHolder(..) => "RunningNameHolder",
+            Self::ReleaseNameClaim(..) => "ReleaseNameClaim",
             Self::Evict(..) => "Evict",
         }
     }
@@ -373,6 +1104,12 @@ pub struct BoxManager {
     /// bring-up or a second destroy in that window starts no second actor and
     /// runs no `on_destroy` hook twice. A task removes its id as it ends.
     tearing_down: Arc<std::sync::Mutex<BTreeSet<SessionId>>>,
+    /// The names that resumes in flight claimed, keyed by the resuming box
+    /// (BOX-025). Each box has its own actor, so two stopped boxes that
+    /// share a name can resume at once. The name check claims the name, and
+    /// a later check for that name finds the claim, so at most one of them
+    /// writes `running`. The resume releases its claim when it ends.
+    name_claims: BTreeMap<SessionId, String>,
     /// The teardown tasks, joined by `Shutdown` before the state volume is
     /// quiesced: a hook still running or a record delete still in flight
     /// would otherwise race the unmount.
@@ -450,6 +1187,19 @@ impl BoxManager {
         // hostage.
         reap_unresumable_records(&store).await?;
 
+        // BOX-154: no box process outlives the daemon that launched it, so
+        // every record still `running` here has no process left. Set each
+        // to `stopped` with no code and no signal. An attach resumes it
+        // from its stored spec (BOX-025), and the restart's resume below
+        // no longer brings it back.
+        let stopped = stop_orphaned_running_records(&store).await?;
+        if stopped > 0 {
+            tracing::info!(
+                stopped,
+                "restart: set running records with no process left to stopped"
+            );
+        }
+
         let running = BTreeMap::new();
         let (sender, receiver) = crate::traced::channel(8);
         // Shared so the host-side proxies can resolve `Host:` headers directly;
@@ -482,6 +1232,8 @@ impl BoxManager {
         // (NET-129: "one allocated address per VM node") — the address its
         // host-address boxes answer at. A native node's address is the host
         // loopback itself, which it already owns.
+        #[cfg(target_os = "linux")]
+        let range_walk: Arc<std::sync::OnceLock<Arc<RangeWalk>>> = Arc::default();
         #[cfg(target_os = "linux")]
         let (hostnames, loopback) = {
             // This daemon's start, on the record's own clock: the stamp the
@@ -647,70 +1399,26 @@ impl BoxManager {
                 // each box under the registry's write lock before it
                 // publishes, and releases a grant drawn for a box whose
                 // publish is gone.
-                let book = Arc::clone(&loopback);
-                let registry = Arc::clone(&hostnames);
+                //
+                // The same walk runs again at each session start
+                // ([`RangeWalk::session_start`]), so a host that gains the
+                // range after this daemon started publishes its next box in
+                // the range, and a host that loses it moves its boxes to the
+                // interim. The walk lets one walk
+                // run at a time, so the session-start walk never overlaps
+                // this one on the forwarder.
+                let walk = Arc::new(RangeWalk::new(
+                    RangeWalkSource::Forwarder(crate::net::policy::ControlChannel::Vsock {
+                        cid,
+                        port,
+                    }),
+                    Arc::clone(&loopback),
+                    Arc::clone(&hostnames),
+                ));
+                // The cell is new and empty here, so the set cannot fail.
+                let _ = range_walk.set(Arc::clone(&walk));
                 crate::traced::spawn(async move {
-                    let probe = crate::net::policy::probe_publish_surface(
-                        &crate::net::policy::ControlChannel::Vsock { cid, port },
-                    )
-                    .await;
-                    tracing::info!(
-                        via = "forwarder",
-                        surface = probe.surface(),
-                        interim = probe.interim(),
-                        first_failure = ?probe.first_failure,
-                        "the daemon-start range probe walked the forwarder's loopback \
-                         and picked the publish surface",
-                    );
-                    land_range_verdict(
-                        &book,
-                        &registry,
-                        if probe.present() {
-                            crate::net::dns::RangeVerdict::Present
-                        } else {
-                            crate::net::dns::RangeVerdict::Absent
-                        },
-                    );
-                    if !probe.present() {
-                        tracing::warn!(
-                            first_failure = ?probe.first_failure,
-                            "the reserved local range is absent on the publish surface; \
-                             publishing boxes on the 127.0.0.1 interim",
-                        );
-                        return;
-                    }
-                    let node = match book.grant(crate::net::dns::LeaseNamespace::Node) {
-                        crate::net::dns::LoopbackGrant::Granted(address) => address,
-                        crate::net::dns::LoopbackGrant::RecordUnavailable => {
-                            // The shutdown shape: a daemon that went down
-                            // mid-walk has closed its book, and the grant that
-                            // comes back is the closed book's, not a fault on
-                            // the host — the manager stops every session
-                            // before it closes, so there is nothing left to
-                            // publish an interim for either. An unreadable
-                            // record lands here too, said at the same level:
-                            // neither is a verdict about this host's range.
-                            tracing::debug!(
-                                grant = ?crate::net::dns::LoopbackGrant::RecordUnavailable,
-                                "the node's own loopback address was not granted — \
-                                 the book was closed for shutdown, or its record could \
-                                 not be read or written",
-                            );
-                            return;
-                        }
-                        other => {
-                            tracing::warn!(
-                                grant = ?other,
-                                "the node's own loopback address was not granted; \
-                                 publishing host-address boxes on the 127.0.0.1 interim",
-                            );
-                            return;
-                        }
-                    };
-                    registry
-                        .write()
-                        .expect("hostname registry lock poisoned")
-                        .set_node_address(node);
+                    walk.daemon_start().await;
                 });
             }
             (hostnames, loopback)
@@ -721,6 +1429,8 @@ impl BoxManager {
             in_shutdown: in_shutdown.clone(),
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&hostnames),
+            #[cfg(target_os = "linux")]
+            range_walk,
             #[cfg(all(test, target_os = "linux"))]
             loopback: Arc::clone(&loopback),
         };
@@ -761,11 +1471,44 @@ impl BoxManager {
                 },
             );
         }
+        // #2748: each move of a box's publish is passed to that box's
+        // session, which binds its declared ports at the new address and
+        // moves the forwards its `min net expose` bound at the old one, if
+        // the box is running. Off the registry's lock, like the hand-overs
+        // above. Only a live actor is asked: the landing moves stopped boxes
+        // too, and a box with no actor has no forward to move, so none is
+        // started for it. Its next attach binds at the new address.
+        #[cfg(target_os = "linux")]
+        {
+            let (sender, mut moves) = tokio::sync::mpsc::unbounded_channel();
+            hostnames
+                .write()
+                .expect("hostname registry lock poisoned")
+                .notify_publish_moves(sender);
+            let manager = weak_self.clone();
+            crate::traced::spawn_detached(
+                tracing::info_span!(parent: None, "sessions.publish_moves"),
+                async move {
+                    while let Some(moved) = moves.recv().await {
+                        let Some(manager) = manager.upgrade() else {
+                            return;
+                        };
+                        if let Ok(Some(holder)) = manager.running_session(moved.holder).await {
+                            let ports = moved.hand_overs.iter().map(|hand_over| hand_over.port);
+                            holder
+                                .publish_moved(moved.from, moved.to, ports.collect())
+                                .await;
+                        }
+                    }
+                },
+            );
+        }
         let mngr = Self {
             in_shutdown,
             receiver,
             running,
             tearing_down: Arc::default(),
+            name_claims: BTreeMap::new(),
             teardowns: tokio::task::JoinSet::new(),
             store,
             weak_self,
@@ -788,6 +1531,260 @@ impl BoxManager {
             mngr.mainloop(),
         );
         Ok(handle)
+    }
+}
+
+/// What asks whether the host binds the reserved local range, for a daemon
+/// whose publish surface is the host's loopback, not its own.
+#[cfg(target_os = "linux")]
+pub(crate) enum RangeWalkSource {
+    /// The host forwarder, asked over the control channel the publishes
+    /// ride ([`crate::net::policy::probe_publish_surface`]).
+    Forwarder(crate::net::policy::ControlChannel),
+    /// A test's stand-in for the forwarder's binds: no Linux host can make
+    /// the range absent, and no harness daemon has a host forwarder.
+    #[cfg(test)]
+    StandIn(Arc<dyn Fn() -> crate::net::loopback::RangeProbe + Send + Sync>),
+}
+
+/// The answer a session-start range walk gives the create handler.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub(crate) struct RangeWalkAnswer {
+    /// The probe the verdict rests on: this walk's, or the concurrent
+    /// walk's when this call took that walk's answer.
+    pub(crate) probe: crate::net::loopback::RangeProbe,
+    /// Whether this session start walked the range. `false` only when a
+    /// walk that ended while this one waited for its turn gave the answer.
+    pub(crate) walked: bool,
+    /// How many boxes the landing moved off the `127.0.0.1` interim onto
+    /// their range addresses.
+    pub(crate) moved: usize,
+    /// Whether this walk was a fault of the channel over a landed present
+    /// verdict, so the verdict stayed present and `probe` is the failed
+    /// walk's, not the verdict's.
+    pub(crate) kept_present: bool,
+}
+
+/// Whether a probe that did not bind the whole range rests on a refusal
+/// the forwarder answered, recorded as `AddrNotAvailable`, rather than on
+/// a fault of the channel.
+#[cfg(target_os = "linux")]
+fn range_probe_refused(probe: &crate::net::loopback::RangeProbe) -> bool {
+    matches!(
+        probe.first_failure,
+        Some((_, std::io::ErrorKind::AddrNotAvailable))
+    )
+}
+
+/// The forwarder-conducted walk of the reserved local range (NET-123) and
+/// the landing of its verdict, shared by the daemon-start walk and every
+/// session-start walk of a microVM daemon.
+///
+/// One walk runs at a time: the walks share one probe port on one
+/// forwarder, and a session start that waits behind a walk takes that
+/// walk's answer, not a second walk of its own.
+#[cfg(target_os = "linux")]
+pub(crate) struct RangeWalk {
+    source: RangeWalkSource,
+    book: Arc<crate::net::dns::LoopbackLeaseBook>,
+    registry: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+    /// How many walks ended, read before a caller waits for its turn.
+    walks: std::sync::atomic::AtomicU64,
+    /// The turn, and the last walk's probe.
+    last: Mutex<Option<crate::net::loopback::RangeProbe>>,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for RangeWalk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let source = match &self.source {
+            RangeWalkSource::Forwarder(_) => "forwarder",
+            #[cfg(test)]
+            RangeWalkSource::StandIn(_) => "stand-in",
+        };
+        f.debug_struct("RangeWalk")
+            .field("source", &source)
+            .field(
+                "walks",
+                &self.walks.load(std::sync::atomic::Ordering::Acquire),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl RangeWalk {
+    pub(crate) fn new(
+        source: RangeWalkSource,
+        book: Arc<crate::net::dns::LoopbackLeaseBook>,
+        registry: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+    ) -> Self {
+        Self {
+            source,
+            book,
+            registry,
+            walks: std::sync::atomic::AtomicU64::new(0),
+            last: Mutex::new(None),
+        }
+    }
+
+    /// Asks the source to bind the whole range once.
+    async fn probe(&self) -> crate::net::loopback::RangeProbe {
+        match &self.source {
+            RangeWalkSource::Forwarder(control) => {
+                crate::net::policy::probe_publish_surface(control).await
+            }
+            #[cfg(test)]
+            RangeWalkSource::StandIn(walk) => walk(),
+        }
+    }
+
+    /// Walks the range and lands the verdict. The caller holds the turn.
+    ///
+    /// A walk that neither bound the whole range nor got a refusal from the
+    /// forwarder (a timeout, a missing socket, a malformed reply) is a fault
+    /// of the channel, not a fact about the host's loopback. Over a landed
+    /// present verdict such a walk lands nothing: the verdict stays present
+    /// and every box keeps its range address. The returned flag says so.
+    /// Over a pending or absent verdict the walk lands absent as before,
+    /// because the interim is what the surface can promise without an answer.
+    async fn walk_and_land(&self) -> (crate::net::loopback::RangeProbe, usize, bool) {
+        let probe = self.probe().await;
+        if !probe.present() && !range_probe_refused(&probe) && self.present_landed() {
+            tracing::warn!(
+                probe = %probe.summary(),
+                first_failure = ?probe.first_failure,
+                action = "loopback-range-walk-inconclusive",
+                "the range walk got no answer from the forwarder; \
+                 the present verdict stays and every box keeps its address",
+            );
+            self.walks.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            return (probe, 0, true);
+        }
+        let moved = land_range_verdict(
+            &self.book,
+            &self.registry,
+            if probe.present() {
+                crate::net::dns::RangeVerdict::Present
+            } else {
+                crate::net::dns::RangeVerdict::Absent
+            },
+        );
+        if probe.present() {
+            self.grant_node_address();
+        }
+        self.walks.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        (probe, moved, false)
+    }
+
+    /// Whether the book holds a landed present verdict: it vouches for an
+    /// address inside the reserved range only then.
+    fn present_landed(&self) -> bool {
+        ::switch::loopback::range_hosts()
+            .next()
+            .is_some_and(|host| self.book.vouches_for(host))
+    }
+
+    /// Hands the node its own loopback address once the range is present
+    /// (NET-129). The grant is idempotent by namespace, so a later present
+    /// landing asks again at no cost.
+    fn grant_node_address(&self) {
+        let node = match self.book.grant(crate::net::dns::LeaseNamespace::Node) {
+            crate::net::dns::LoopbackGrant::Granted(address) => address,
+            crate::net::dns::LoopbackGrant::RecordUnavailable => {
+                // The shutdown shape: a daemon that went down mid-walk has
+                // closed its book, and the grant that comes back is the
+                // closed book's, not a fault on the host — the manager stops
+                // every session before it closes, so there is nothing left
+                // to publish an interim for either. An unreadable record
+                // lands here too, said at the same level: neither is a
+                // verdict about this host's range.
+                tracing::debug!(
+                    grant = ?crate::net::dns::LoopbackGrant::RecordUnavailable,
+                    "the node's own loopback address was not granted — \
+                     the book was closed for shutdown, or its record could \
+                     not be read or written",
+                );
+                return;
+            }
+            other => {
+                tracing::warn!(
+                    grant = ?other,
+                    "the node's own loopback address was not granted; \
+                     publishing host-address boxes on the 127.0.0.1 interim",
+                );
+                return;
+            }
+        };
+        self.registry
+            .write()
+            .expect("hostname registry lock poisoned")
+            .set_node_address(node);
+    }
+
+    /// The daemon-start walk: spawned off `BoxManager::init`'s critical
+    /// path, it lands the first verdict the book opened pending on.
+    pub(crate) async fn daemon_start(&self) {
+        let mut last = self.last.lock().await;
+        let (probe, _, _) = self.walk_and_land().await;
+        tracing::info!(
+            via = "forwarder",
+            surface = probe.surface(),
+            interim = probe.interim(),
+            first_failure = ?probe.first_failure,
+            "the daemon-start range probe walked the forwarder's loopback \
+             and picked the publish surface",
+        );
+        if !probe.present() {
+            tracing::warn!(
+                first_failure = ?probe.first_failure,
+                "the reserved local range is absent on the publish surface; \
+                 publishing boxes on the 127.0.0.1 interim",
+            );
+        }
+        *last = Some(probe);
+    }
+
+    /// The session-start walk: walks the range again at every session
+    /// start, whatever verdict landed last, and lands what it finds. The
+    /// range can go away under a running VM, so a present verdict is
+    /// bind-probed again too: a present-to-absent walk lands the absent
+    /// arm, which moves every box in the range onto the `127.0.0.1`
+    /// interim. Only a refusal the forwarder answered lands that arm over a
+    /// present verdict. A walk that got no answer keeps the verdict
+    /// ([`Self::walk_and_land`]). A walk that ended while this call waited for its turn gives
+    /// this call its answer.
+    pub(crate) async fn session_start(&self) -> RangeWalkAnswer {
+        let seen = self.walks.load(std::sync::atomic::Ordering::Acquire);
+        let mut last = self.last.lock().await;
+        let ended_while_waiting = self.walks.load(std::sync::atomic::Ordering::Acquire) != seen;
+        if let Some(probe) = last.as_ref().filter(|_| ended_while_waiting) {
+            return RangeWalkAnswer {
+                probe: probe.clone(),
+                walked: false,
+                moved: 0,
+                kept_present: false,
+            };
+        }
+        let (probe, moved, kept_present) = self.walk_and_land().await;
+        if kept_present {
+            // The verdict did not move, so the last walk's probe stays the
+            // one a waiting session start takes as its answer.
+            return RangeWalkAnswer {
+                probe,
+                walked: true,
+                moved,
+                kept_present,
+            };
+        }
+        *last = Some(probe.clone());
+        RangeWalkAnswer {
+            probe,
+            walked: true,
+            moved,
+            kept_present,
+        }
     }
 }
 
@@ -815,7 +1812,7 @@ pub(crate) struct InterimUpgrade {
 }
 
 /// Lands a range verdict the way the deferred walk lands it
-/// ([`crate::box_manager::BoxManager::init`]'s spawned probe): the state moves
+/// ([`RangeWalk`]'s daemon-start and session-start walks): the state moves
 /// first, then the arm that follows it runs over the publishes the old
 /// verdict left standing — the one moment a verdict's landing has effects
 /// beside the atomic it sets, and the reason the walk cannot simply store
@@ -827,7 +1824,9 @@ pub(crate) struct InterimUpgrade {
 /// destroy. The landing is the one moment the daemon holds both facts — the
 /// verdict and every publish it contradicts — so it re-publishes each such
 /// box at the interim, name and route with it, and the box's attach binds
-/// where the surface listens instead of failing until destroy. The arm is
+/// where the surface listens instead of failing until destroy. The node's
+/// own address moves to the interim too when it stands in the range, so
+/// the names of host-address boxes stop answering at it. The arm is
 /// a belt behind the pending window's gate: no production path publishes a
 /// reserved-range address under anything but a landed present verdict — a
 /// hand waits for one or stands at the interim, and a resumed box the
@@ -861,19 +1860,21 @@ pub(crate) struct InterimUpgrade {
 /// the verdict under the registry's write lock before it publishes — its
 /// ask by the verdict's own arm, and each sweep only re-publishes what
 /// still stands.
+///
+/// Returns how many boxes the present arm moved off the interim, for the
+/// session-start walk's log line. The other arms return `0`.
 #[cfg(target_os = "linux")]
 fn land_range_verdict(
     book: &crate::net::dns::LoopbackLeaseBook,
     registry: &RwLock<crate::net::dns::HostnameRegistry>,
     verdict: crate::net::dns::RangeVerdict,
-) {
+) -> usize {
     book.set_range_verdict(verdict);
     match verdict {
-        crate::net::dns::RangeVerdict::Present => {
-            for upgrade in draw_interim_upgrades(book, registry) {
-                apply_interim_upgrade(book, registry, &upgrade);
-            }
-        }
+        crate::net::dns::RangeVerdict::Present => draw_interim_upgrades(book, registry)
+            .iter()
+            .filter(|upgrade| apply_interim_upgrade(book, registry, upgrade))
+            .count(),
         crate::net::dns::RangeVerdict::Absent => {
             // The boxes the window published at reserved-range addresses:
             // the surface cannot bind what they hold, and their attach
@@ -895,10 +1896,27 @@ fn land_range_verdict(
                 reg.publish_own_address(session, &name, Ipv4Addr::LOCALHOST, ports.clone());
                 reg.register_own_ip(session, &name, ports);
             }
+            // The node's own address a present landing granted: host-address
+            // boxes route at it, and the surface cannot bind it now. The
+            // node's lease stays in the book, so the next present landing
+            // grants the same address back.
+            let node = reg.node_address();
+            if ::switch::loopback::range_hosts().any(|host| host == node) {
+                tracing::warn!(
+                    from = %node,
+                    to = %Ipv4Addr::LOCALHOST,
+                    action = "loopback-range-absent-node",
+                    "the node's own loopback address stood inside the reserved \
+                     local range; the range is absent on the publish surface, \
+                     so the node's names move to the 127.0.0.1 interim",
+                );
+                reg.set_node_address(Ipv4Addr::LOCALHOST);
+            }
+            0
         }
         // The state a book opens on and the state a test re-opens it in:
         // nothing has been published under it to sweep.
-        crate::net::dns::RangeVerdict::Pending => {}
+        crate::net::dns::RangeVerdict::Pending => 0,
     }
 }
 
@@ -989,6 +2007,16 @@ pub(crate) fn draw_interim_upgrades(
 /// stopped box keeps its name, so the move applies to it with its stopped
 /// marker intact.
 ///
+/// A move also sends the move itself, with a hand-over for each port the box
+/// declares ([`crate::net::dns::HostnameRegistry::hand_over_moved_publish`]).
+/// A box that runs has its forwards at the interim, where its attach,
+/// its `min net expose` and its listen watcher bound them, so without these
+/// its name would answer at an address no forward listens on. Its actor
+/// binds the declared forwards and moves the exposed ones to the new
+/// address. Its listen watcher reads the new address on its next poll and
+/// moves the ports it published. A box with no actor running gets nothing:
+/// none is started for it, and its next attach binds at the new address.
+///
 /// The re-check is a runtime one, not an ordering argument: the landing
 /// runs on the deferred walk's own spawned task
 /// ([`crate::box_manager::BoxManager::init`]), never through the manager's
@@ -1031,6 +2059,11 @@ pub(crate) fn apply_interim_upgrade(
                 upgrade.ports.clone(),
             );
             reg.register_own_ip(upgrade.session, &upgrade.name, upgrade.ports.clone());
+            // The forwards follow the name (#2748): a box that runs bound
+            // them at the interim, so its actor binds each port again at the
+            // address the name now answers at, and moves the ports its
+            // `min net expose` published there.
+            reg.hand_over_moved_publish(upgrade.session, Ipv4Addr::LOCALHOST);
             true
         };
         (applied, standing.is_none())
@@ -1108,7 +2141,11 @@ async fn reap_unresumable_records(store: &crate::store::StoreHandle) -> Result<(
         };
         // BOX-012: the restart reaps only pending and materializing
         // records. Every other state, running included, is kept.
-        let state = record.state();
+        // A stopped or exited record whose ending this build cannot read
+        // is not pending or materializing, so the restart keeps it.
+        let Ok(state) = record.state() else {
+            continue;
+        };
         if !state.reaped_at_restart() {
             continue;
         }
@@ -1129,6 +2166,273 @@ async fn reap_unresumable_records(store: &crate::store::StoreHandle) -> Result<(
         }
     }
     Ok(())
+}
+
+/// BOX-154: sets every record the daemon finds `running` at its start, with
+/// no process left in the box, to `stopped` with no exit code and no signal,
+/// and records an `exited` event with that reason and no signal. No signal
+/// of this daemon ended such a box. Answers how many records it set.
+///
+/// Every box process dies with the daemon that launched it (the container
+/// arms `PR_SET_PDEATHSIG`), so a starting daemon finds no process in any
+/// box. A record marked to end with its run is left to the resume, which
+/// destroys it (NET-131, gominimal/inbox#731).
+///
+/// [`BoxManager::init`] calls this before the restart's resume
+/// ([`BoxManager::resume_active_sessions`]), so that resume finds no
+/// orphaned `running` record to bring back.
+pub(crate) async fn stop_orphaned_running_records(
+    store: &crate::store::StoreHandle,
+) -> Result<usize, std::io::Error> {
+    use boxes::core::record::{RecordState, StopEnding};
+
+    let mut stopped = 0;
+    for handle in store.handles().await? {
+        let mut record = match handle.record().await {
+            Ok(record) => record,
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %handle.id(),
+                    %error,
+                    "restart: could not read the record; its state is left as it is",
+                );
+                continue;
+            }
+        };
+        if record.ends_with_run || !matches!(record.state(), Ok(RecordState::Running)) {
+            continue;
+        }
+        let ending = StopEnding::AtDaemonStart;
+        record.set_state(RecordState::Stopped(ending));
+        handle.write(record).await?;
+        let object = handle.object().await?;
+        write_box_event(
+            &object,
+            BoxEventType::Exited,
+            crate::box_actor::stopped_event_data(ending),
+        )?;
+        tracing::info!(
+            session_id = %handle.id(),
+            "restart: set a running record with no process left to stopped, with no signal",
+        );
+        stopped += 1;
+    }
+    Ok(stopped)
+}
+
+/// The data of the `resumed` event a resume records (BOX-025): the state
+/// the box resumed from, `stopped` or `exited`.
+pub(crate) fn resumed_event_data(from: &boxes::core::record::RecordState) -> EventData {
+    let mut data = EventData::new();
+    data.insert("from".to_string(), from.name().into());
+    data
+}
+
+/// The box that holds a name a resume asks for (BOX-025).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NameHolder {
+    /// The name the box answers to.
+    pub(crate) name: String,
+    /// The box's id.
+    pub(crate) id: SessionId,
+    /// `true` when the box does not run yet, and its own resume claimed the
+    /// name. `false` when its record reads `running`.
+    pub(crate) resuming: bool,
+}
+
+impl BoxManagerHandle {
+    /// The box other than `id` that holds the name `name`, for a resume's
+    /// name check (BOX-025), or `None`. A `None` claims the name for `id`,
+    /// so a concurrent resume of another box with that name finds it held.
+    /// The caller must release the claim with [`Self::release_name_claim`]
+    /// once the resume writes `running` or is refused. The manager reads
+    /// only the store and its claims to answer.
+    ///
+    /// # Errors
+    ///
+    /// `ConnectionRefused` while the daemon shuts down, or the store's error.
+    pub(crate) async fn running_name_holder(
+        &self,
+        id: SessionId,
+        name: String,
+    ) -> Result<Option<NameHolder>, BoxManagerError> {
+        if self.in_shutdown.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                minimald_rpc::SHUTDOWN_REFUSAL,
+            ));
+        }
+        let (send, recv) = Responder::channel();
+        // A send error means the manager is gone: the recv fails as well.
+        let _ = self
+            .sender
+            .send(ManagerMessage::RunningNameHolder(id, name, send))
+            .await;
+        recv.await.unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                minimald_rpc::SHUTDOWN_REFUSAL,
+            ))
+        })
+    }
+
+    /// Drops the name claim that [`Self::running_name_holder`] made for `id`.
+    /// A no-op when `id` holds no claim or the manager is gone.
+    pub(crate) async fn release_name_claim(&self, id: SessionId) {
+        // A send error means the manager is gone, and its claims with it.
+        let _ = self.sender.send(ManagerMessage::ReleaseNameClaim(id)).await;
+    }
+
+    /// Stops the running box `id` and keeps its record (BOX-013, BOX-018),
+    /// with the daemon's grace period between SIGTERM and SIGKILL. Answers
+    /// how the box ended.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` for an id no record names, `InvalidInput` for a box that
+    /// is not running, `ConnectionRefused` while the daemon shuts down, or
+    /// the error the stop itself ended on.
+    pub async fn stop_box(
+        &self,
+        id: SessionId,
+        force: bool,
+    ) -> Result<boxes::core::record::StopEnding, BoxManagerError> {
+        self.stop_box_with_grace(id, force, crate::box_actor::STOP_GRACE)
+            .await
+    }
+
+    /// [`Self::stop_box`] with the grace period `grace`.
+    pub(crate) async fn stop_box_with_grace(
+        &self,
+        id: SessionId,
+        force: bool,
+        grace: std::time::Duration,
+    ) -> Result<boxes::core::record::StopEnding, BoxManagerError> {
+        if self.in_shutdown.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                minimald_rpc::SHUTDOWN_REFUSAL,
+            ));
+        }
+        let unknown = || {
+            std::io::Error::new(
+                NotFound,
+                format!(
+                    "{} `{}`",
+                    minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                    id.as_ref()
+                ),
+            )
+        };
+        let record = self
+            .get_record(BoxKeyPredicate::Id(id))
+            .await?
+            .ok_or_else(unknown)?;
+        match record.state() {
+            Ok(boxes::core::record::RecordState::Running) => {}
+            Ok(state) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "session `{}` is {}, not running, so there is nothing to stop",
+                        id.as_ref(),
+                        state.name()
+                    ),
+                ));
+            }
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    error.to_string(),
+                ));
+            }
+        }
+        tracing::info!(session_id = %id, force, "stop: dispatching to the session");
+        let session = self
+            .get_session(BoxKeyPredicate::Id(id))
+            .await?
+            .ok_or_else(unknown)?;
+        let stopped = session.stop_box(force, grace).await;
+        if stopped.is_err() {
+            // A stop that waited behind another stop of the same box finds
+            // the actor gone when the first one ends. The record then says
+            // how the box ended, and that is this stop's answer too.
+            if let Ok(Some(record)) = self.get_record(BoxKeyPredicate::Id(id)).await
+                && let Ok(boxes::core::record::RecordState::Stopped(ending)) = record.state()
+            {
+                tracing::info!(
+                    session_id = %id,
+                    ending = ?ending,
+                    "stop: an earlier stop ended the box; answering with its ending"
+                );
+                return Ok(ending);
+            }
+        }
+        stopped
+    }
+
+    /// The state and directories of the box `id` when the box is stopped
+    /// or exited, read from the store with no actor started (BOX-017).
+    /// Answers `None` for an id no record names, for a box being torn
+    /// down, and for a box that is not ended: that box has, or can get,
+    /// an actor through [`Self::get_session`].
+    ///
+    /// # Errors
+    ///
+    /// A store error, or `InvalidData` for a record whose state this
+    /// build cannot read.
+    pub(crate) async fn ended_box(
+        &self,
+        id: SessionId,
+    ) -> Result<Option<EndedBox>, BoxManagerError> {
+        // One manager message reads the record and the object, so a delete
+        // cannot start between the two reads.
+        let (send, recv) = Responder::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .sender
+            .send(ManagerMessage::EndedSource(id, send))
+            .await;
+        let Some((record, object)) = recv
+            .await
+            .expect("corresponding sessions manager is dead")?
+        else {
+            return Ok(None);
+        };
+        let state = record
+            .state()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        if !matches!(
+            state,
+            boxes::core::record::RecordState::Stopped(_)
+                | boxes::core::record::RecordState::Exited(_)
+        ) {
+            return Ok(None);
+        }
+        // The object is the store's object for the record, with no actor
+        // behind it. Its directories are the box's retained files.
+        use boxes::store::BoxObject as _;
+        Ok(Some(EndedBox {
+            state,
+            paths: crate::box_actor::BoxPaths {
+                working: object.workspace_path(),
+                cache: object.cache_path(),
+                home: object.home_path(),
+                patches: object.patches_path(),
+                hooks: object.hooks_path(),
+            },
+        }))
+    }
+}
+
+/// A stopped or exited box, as [`BoxManagerHandle::ended_box`] reads it
+/// from the store.
+#[derive(Debug)]
+pub(crate) struct EndedBox {
+    /// How the box ended.
+    pub state: boxes::core::record::RecordState,
+    /// The box's retained directories.
+    pub paths: crate::box_actor::BoxPaths,
 }
 
 /// Per-session deadline for the host probes this manager makes — the
@@ -1250,7 +2554,14 @@ impl BoxManager {
     }
 
     /// Starts the actor of every `Active` record whose box owns a name
-    /// (`HostNet`, `OwnIp`) and has no actor yet. A session's name is
+    /// (`HostNet`, `OwnIp`) and has no actor yet.
+    ///
+    /// A restart no longer relaunches a box whose processes are gone
+    /// (BOX-154): [`BoxManager::init`] already set each such record to
+    /// `stopped`, so this resume skips it, and the box's next attach resumes
+    /// it from its stored spec (BOX-025). What this resume still finds
+    /// `Active` is a record whose box is still live, plus a run's box, which
+    /// it destroys (NET-131). A session's name is
     /// registered when its actor starts ([`BoxActor::run`]), and a restarted
     /// daemon otherwise starts an actor only when an RPC first names the
     /// session, so until then the name of a session `min ls` lists as active
@@ -1324,6 +2635,102 @@ impl BoxManager {
                     continue;
                 }
             };
+            // A box that ends with its run dies with it even when the
+            // daemon did not (NET-131): the create marked the record, so a
+            // daemon death at any point after the create leaves the mark
+            // set. Destroying here is the same teardown a finished run's
+            // own box-end takes, so the box's `on_destroy` hooks run and
+            // its record is removed. The status and network filter below
+            // never sees it: a run box can hold any status the run's
+            // launch left it in.
+            //
+            // The actor comes up without registering the box's name, so
+            // it never takes over a name another box routes. The hooks
+            // run off the manager's message handling: each can take up to
+            // its timeout, and daemon startup and every queued RPC must
+            // not wait on them. The actor sits in `running` until they
+            // end, so an RPC naming the box in that window, such as the
+            // surviving run client's `DeleteSession`, reaches this actor
+            // rather than bringing up a second one.
+            //
+            // The interim is deliberate, not an oversight: the
+            // architecture's stopped-with-reason flip is BOX-012/BOX-154
+            // work owned by gominimal/inbox#731. The stored status enum
+            // (`BoxState`) has no `stopped` spelling and `Record`
+            // carries no `reason` field yet, so a restart cannot set
+            // `stopped` with `reason = "stopped"` here without adding
+            // both first. Applying that change on this PR would grow
+            // its scope past the run-owned-box reap it ships. Keeping
+            // this TODO until the inbox work lands and removes it.
+            //
+            // TODO(gominimal/inbox#731, BOX-012/BOX-154): this reap of a
+            // run's `running` record at restart is an interim against
+            // architecture line 495: a restart sets an orphaned `running`
+            // record to `stopped` and keeps it (spec 29 BOX-154). BOX-012
+            // reaps only `pending` and `materializing`. The flip sets the
+            // record to `stopped` and keeps it.
+            if record.ends_with_run {
+                tracing::info!(
+                    session_id = %session_id,
+                    session_name = record.name.as_deref().unwrap_or("<anonymous>"),
+                    "resume: destroying a run's box instead of resuming it \
+                     (its run ended with the daemon)",
+                );
+                let actor = self.start_box_teardown(session_id, &handle, false).await;
+                let manager = self.weak_self.clone();
+                crate::traced::spawn_detached(
+                    tracing::info_span!(
+                        parent: None,
+                        "resume_run_owned_teardown",
+                        session_id = %session_id
+                    ),
+                    async move {
+                        match Self::finish_box_teardown(actor, handle).await {
+                            Ok(hook_failures) => {
+                                for failure in hook_failures {
+                                    tracing::warn!(
+                                        %failure,
+                                        "resume: an on_destroy hook of the run-owned \
+                                         box failed; the box is destroyed anyway",
+                                    );
+                                }
+                                // A manager-initiated teardown does not
+                                // evict itself.
+                                if let Some(manager) = manager.upgrade() {
+                                    manager.evict(session_id).await;
+                                }
+                            }
+                            // The destroy ended the actor, but its record
+                            // is still on disk. The closed actor stays in
+                            // `running`, so a later `DeleteSession` reaches
+                            // it, its destroy answers `Ok` with no hooks
+                            // run, and the fallback record delete removes
+                            // the record. Evicting here instead makes that
+                            // delete bring up a new actor, which runs the
+                            // `on_destroy` hooks a second time.
+                            //
+                            // No retry until one of those two comes: the
+                            // run's client may have died with the daemon,
+                            // so no delete may ever arrive. That is
+                            // deliberate: the next restart reaps the record
+                            // through this same path, so the leftover is
+                            // bounded by a restart and not retried inside
+                            // this run.
+                            // Retrying sooner means evicting the closed
+                            // actor or spawning a second teardown, and
+                            // either lets a later delete bring up a fresh
+                            // actor that runs the `on_destroy` hooks a
+                            // second time.
+                            Err(error) => tracing::warn!(
+                                %error,
+                                "resume: destroying the run-owned box failed; \
+                                 leaving its record for a later delete",
+                            ),
+                        }
+                    },
+                );
+                continue;
+            }
             if !matches!(record.status, boxes::BoxState::Active)
                 || !matches!(
                     record.network,
@@ -1399,6 +2806,182 @@ impl BoxManager {
         Ok(resumed)
     }
 
+    /// The running box other than `id` whose name is `name` (BOX-025): the
+    /// name its route answers to, as [`crate::box_actor::registry_name`]
+    /// gives it, compared without ASCII case as hostnames are. Answers that
+    /// box's name and id, or `None`. A box being torn down holds no name. A
+    /// record that cannot be read can belong to a running box that holds the
+    /// name, so it fails the check, and the resume is refused.
+    async fn running_name_holder(
+        &self,
+        id: SessionId,
+        name: &str,
+    ) -> Result<Option<NameHolder>, BoxManagerError> {
+        let tearing_down = self
+            .tearing_down
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for handle in self.store.handles().await? {
+            let other = *handle.id();
+            if other == id || tearing_down.contains(&other) {
+                continue;
+            }
+            let record = match handle.record().await {
+                Ok(record) => record,
+                // A record removed since the listing belongs to no box.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %other,
+                        %error,
+                        "resume: could not read a record while checking the name",
+                    );
+                    return Err(std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "The record of session `{other}` cannot be read, so its name is \
+                             not known: {error}."
+                        ),
+                    ));
+                }
+            };
+            if matches!(
+                record.state(),
+                Ok(boxes::core::record::RecordState::Running)
+            ) {
+                let held = crate::box_actor::registry_name(&record);
+                if held.eq_ignore_ascii_case(name) {
+                    return Ok(Some(NameHolder {
+                        name: held,
+                        id: other,
+                        resuming: false,
+                    }));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// [`Self::running_name_holder`], then the claims of the resumes in
+    /// flight (BOX-025). When neither holds `name`, `id` claims it. The
+    /// manager loop runs one message at a time, so of two checks for one
+    /// name, the later one sees the claim of the earlier one.
+    async fn claim_name(
+        &mut self,
+        id: SessionId,
+        name: String,
+    ) -> Result<Option<NameHolder>, BoxManagerError> {
+        // A box that a removal tears down does not start again: the
+        // removal's destroy can be queued behind the attach that resumes
+        // it, and it then destroys a box that is running.
+        let removing = self
+            .tearing_down
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&id);
+        if removing {
+            tracing::info!(
+                session_id = %id,
+                "resume: the box is being removed; it is not started"
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ResourceBusy,
+                format!(
+                    "Box `{}` is being removed, so it was not started.",
+                    id.as_ref()
+                ),
+            ));
+        }
+        if let Some(holder) = self.running_name_holder(id, &name).await? {
+            return Ok(Some(holder));
+        }
+        let claimed = self
+            .name_claims
+            .iter()
+            .find(|(other, held)| **other != id && held.eq_ignore_ascii_case(&name));
+        if let Some((other, held)) = claimed {
+            return Ok(Some(NameHolder {
+                name: held.clone(),
+                id: *other,
+                resuming: true,
+            }));
+        }
+        self.name_claims.insert(id, name);
+        Ok(None)
+    }
+
+    /// The manager's half of a teardown: the box's actor in `running`, or one
+    /// brought up from its record and put in `running`. The actor stays there
+    /// until its caller removes or evicts it once the teardown ends, so an
+    /// RPC naming the box meanwhile reaches the same actor; its mailbox is
+    /// closed after the destroy, so a second destroy answers `Ok` with no
+    /// hooks run. `None` when the actor refuses to come up, and the record is
+    /// then removed without its hooks. `registers_name` is the bring-up's
+    /// [`BoxActorConfig::registers_name`]: `false` for the resume's
+    /// teardown, whose actor must not take over another box's name.
+    async fn start_box_teardown(
+        &mut self,
+        id: SessionId,
+        handle: &BoxRecordHandle,
+        registers_name: bool,
+    ) -> Option<BoxHandle> {
+        if let Some(hnd) = self.running.get(&id) {
+            return Some(hnd.clone());
+        }
+        let mut config = self.session_config(handle.clone());
+        config.registers_name = registers_name;
+        match BoxActor::run(config).await {
+            Ok(hnd) => {
+                self.running.insert(id, hnd.clone());
+                Some(hnd)
+            }
+            // A record the actor refuses to come up on — a
+            // restart-orphaned `Materializing` one is the known case —
+            // must still be destroyable, so fall through to deleting it
+            // directly. A box that cannot be torn down is worse than one
+            // torn down without its hooks.
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %id,
+                    error = %e,
+                    "could not start the session to run its destroy hooks; \
+                     removing its record without them",
+                );
+                None
+            }
+        }
+    }
+
+    /// The half of a teardown that waits on the box's `on_destroy` hooks.
+    /// It holds nothing of the manager's, so the resume can run it off the
+    /// manager's own message handling. Answers the hook failures.
+    async fn finish_box_teardown(
+        actor: Option<BoxHandle>,
+        handle: BoxRecordHandle,
+    ) -> Result<Vec<String>, BoxManagerError> {
+        match actor {
+            Some(hnd) => {
+                let hook_failures = hnd.destroy().await?;
+                // Belt-and-braces: a dead actor (self-terminated but not
+                // yet evicted) reads as `Ok` above, and may have died
+                // *without* deleting its record (its own delete failed).
+                // Remove any leftover; `NotFound` is the normal
+                // already-deleted case.
+                if let Err(e) = handle.delete().await
+                    && e.kind() != NotFound
+                {
+                    return Err(e);
+                }
+                Ok(hook_failures)
+            }
+            None => {
+                handle.delete().await?;
+                Ok(Vec::new())
+            }
+        }
+    }
+
     /// The spawn-time config for a session actor backing `record`. The one
     /// place the daemon-scoped dependencies are gathered, so the create and
     /// bring-up-from-disk paths can't hand their actors different worlds.
@@ -1412,6 +2995,7 @@ impl BoxManager {
             manager: self.weak_self.clone(),
             deny_all_opt_out: self.deny_all_opt_out,
             creator: None,
+            registers_name: true,
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
             #[cfg(target_os = "linux")]
@@ -1441,12 +3025,16 @@ impl BoxManager {
             box_type = tracing::field::Empty,
             parent = tracing::field::Empty,
             spec_bytes = tracing::field::Empty,
+            name_given = tracing::field::Empty,
+            name = tracing::field::Empty,
+            fresh,
         )
     )]
     async fn create_session(
         &mut self,
-        config: minimald_rpc::BoxConfig,
+        mut config: minimald_rpc::BoxConfig,
         spec: Option<serde_json_lenient::Value>,
+        fresh: bool,
         username: Option<String>,
         creator: Option<std::sync::Weak<()>>,
     ) -> Result<SessionId, BoxManagerError> {
@@ -1488,6 +3076,46 @@ impl BoxManager {
             );
             return Err(refusal);
         }
+        // BOX-163: the box takes the spec's `[box] name`, else its entry's
+        // name. The span keeps the name the request gave, so a refusal
+        // reads against what the client asked for.
+        let span = tracing::Span::current();
+        span.record(
+            "name_given",
+            config
+                .name
+                .as_deref()
+                .unwrap_or(crate::rpc::ANONYMOUS_SESSION),
+        );
+        let (name, source) = creation_name(config.name.as_deref(), spec.as_ref());
+        let name = match name {
+            Some(base) if fresh => {
+                let retained = self.retained_names().await?;
+                let (name, n) = fresh_instance_name(&base, retained.iter().map(String::as_str));
+                tracing::info!(
+                    base = %base,
+                    name = %name,
+                    suffix = n,
+                    retained = retained.len(),
+                    "named a fresh box with the smallest suffix no retained record uses"
+                );
+                Some(name)
+            }
+            name => name,
+        };
+        if config.name != name {
+            tracing::info!(
+                name_given = ?config.name,
+                name = ?name,
+                source = source.word(),
+                "named the box from its spec"
+            );
+        }
+        span.record(
+            "name",
+            name.as_deref().unwrap_or(crate::rpc::ANONYMOUS_SESSION),
+        );
+        config.name = name;
         // BOX-068: the spec is checked before the record exists, so a
         // refused spec leaves no record, id or name behind.
         let spec = match spec.as_ref().map(spec_bytes).transpose() {
@@ -1504,14 +3132,59 @@ impl BoxManager {
         if let Some(bytes) = &spec {
             tracing::Span::current().record("spec_bytes", bytes.len());
         }
-        // Allocate the record up front: `store.create` assigns the id and
-        // catches a name collision (`AlreadyExists`) before any actor exists.
-        // On a VM guest the box id is the one the VM host handed in
-        // `config.box_id`, and the in-VM store still mints the record key
-        // (https://github.com/gominimal/minimal/issues/2397 files the
-        // record under the handed id). Elsewhere the
-        // record key is the box id.
-        let handed_box_id = config.box_id;
+        // BOX-001, BOX-002: a client never names a box's id, so the id the
+        // request carries is dropped here. On a VM guest the VM host daemon
+        // mints the id and this daemon files the record under it. A box
+        // with a row takes the id its registration minted, so the record
+        // and the row name one id. On a native host the store mints it.
+        let mut config = config;
+        let client_box_id = config.box_id.take();
+        let switch_address = config.box_addresses.as_ref().map(|a| a.switch_address);
+        let control = crate::box_actor::switch_control_of(&self.net_switch).await;
+        let minted = match crate::net::listeners::mint_box_id(&control, switch_address).await {
+            None => None,
+            Some(Ok(minted)) => Some(minted),
+            Some(Err(error)) => {
+                tracing::warn!(
+                    session_name = config.name.as_deref().unwrap_or(crate::rpc::ANONYMOUS_SESSION),
+                    ?switch_address,
+                    %error,
+                    "refused a create: the VM host daemon handed no box id"
+                );
+                // A typed refusal, so the client gets this text as the
+                // create's reply and never a closed channel. A refusal
+                // names a row the client registered: the client withdraws
+                // that row on a failed create and registers a fresh one on
+                // the next run, so a re-run gets a new id. A VM that never
+                // answered gives no such promise, so that text stops.
+                let cause = error.to_string();
+                let cause = cause.trim_end_matches('.');
+                let next = if error.kind() == std::io::ErrorKind::TimedOut {
+                    ""
+                } else {
+                    " Run the command again."
+                };
+                return Err(BoxManagerError::other(BoxIdNotMinted(format!(
+                    "No session was created. The VM gave the new session no id: {cause}.{next}"
+                ))));
+            }
+        };
+        if let Some(minted) = minted {
+            tracing::info!(
+                box_id = %minted,
+                ?switch_address,
+                client_box_id = ?client_box_id,
+                "took the box id the VM host daemon minted; the request's box id is ignored"
+            );
+        } else if let Some(client_box_id) = client_box_id {
+            tracing::info!(
+                %client_box_id,
+                "ignored the box id the request carried; the store mints the box id"
+            );
+        }
+        // The record's row id is the minted id, and only for a box with a
+        // row: a box with no row has no row id.
+        config.box_id = minted.filter(|_| switch_address.is_some());
         // BOX-001, BOX-140: no caller reaches this daemon from inside a box
         // (a host with no nesting carries no per-box caller identity), so
         // every box created here has no parent. A parent comes from the
@@ -1529,7 +3202,17 @@ impl BoxManager {
         let project_root = record.project_root.clone();
         let name = record.name.clone();
         let retry = record.clone();
-        let handle = match self.store.create(record).await {
+        let store = self.store.clone();
+        let create = |record| {
+            let store = store.clone();
+            async move {
+                match minted {
+                    Some(id) => store.create_under(record, id).await,
+                    None => store.create(record).await,
+                }
+            }
+        };
+        let handle = match create(record).await {
             Ok(handle) => handle,
             // The name may be held by a session whose destroy is still
             // running (its record outlives its actor by the length of the
@@ -1553,14 +3236,22 @@ impl BoxManager {
                             ),
                         ));
                     }
-                    None => self.store.create(retry).await?,
-                    Some(false) => return Err(e),
+                    None => match create(retry).await {
+                        Ok(handle) => handle,
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                            return Err(self.held_name_refusal(&name, e).await);
+                        }
+                        Err(e) => return Err(e),
+                    },
+                    // BOX-163: a running box holds the name, so the create
+                    // is refused, naming the holder, and files nothing.
+                    Some(false) => return Err(self.held_name_refusal(&name, e).await),
                 }
             }
             Err(e) => return Err(e),
         };
         let session_id = *handle.id();
-        let box_id = handed_box_id.unwrap_or(session_id);
+        let box_id = session_id;
         let parent_field = parent.map_or_else(|| "none".to_string(), |p: SessionId| p.to_string());
         let span = tracing::Span::current();
         span.record("box_id", tracing::field::display(box_id));
@@ -1655,6 +3346,76 @@ impl BoxManager {
         }
     }
 
+    /// The name of every retained record on this host, in any state, for
+    /// a fresh instance's suffix (BOX-163). A record removed since the
+    /// listing is skipped. A record that cannot be read fails the create:
+    /// its name can be the suffix this create would take.
+    async fn retained_names(&self) -> Result<Vec<String>, BoxManagerError> {
+        let mut names = Vec::new();
+        for handle in self.store.handles().await? {
+            match handle.record().await {
+                Ok(record) => names.extend(record.name),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %handle.id(),
+                        %error,
+                        "create: could not read a record while picking a fresh name's suffix",
+                    );
+                    return Err(error);
+                }
+            }
+        }
+        Ok(names)
+    }
+
+    /// The refusal of a create whose name `name` a running box holds
+    /// (BOX-163), naming the holder, with exit code 2 in the log. `store`
+    /// is the store's own refusal, answered as it is when the holder is
+    /// gone by the time this reads the records.
+    async fn held_name_refusal(&self, name: &str, store: std::io::Error) -> BoxManagerError {
+        let holder = match self.store.handles().await {
+            Ok(handles) => {
+                let mut found = None;
+                for handle in handles {
+                    let Ok(record) = handle.record().await else {
+                        continue;
+                    };
+                    if boxes::box_name::holds_name(record.status)
+                        && let Some(held) = record.name
+                        && held.eq_ignore_ascii_case(name)
+                    {
+                        found = Some((*handle.id(), held));
+                        break;
+                    }
+                }
+                found
+            }
+            Err(_) => None,
+        };
+        let Some((holder, holder_name)) = holder else {
+            tracing::info!(
+                name,
+                error = %store,
+                "refused a create whose name a running box holds; the holder is gone since"
+            );
+            return store;
+        };
+        let refusal = HeldNameRefusal {
+            name: name.to_string(),
+            holder,
+            holder_name,
+        };
+        tracing::info!(
+            name,
+            holder = %refusal.holder,
+            holder_name = %refusal.holder_name,
+            exit_code = refusal.exit_code(),
+            "refused a create: a running box holds its name"
+        );
+        std::io::Error::new(std::io::ErrorKind::AlreadyExists, refusal)
+    }
+
     /// Handles a specific message recieved by the manager.
     async fn handle_message(&mut self, msg: ManagerMessage) {
         match msg {
@@ -1705,6 +3466,25 @@ impl BoxManager {
                 })
                 .await;
             }
+            // Gets every retained record, in any state.
+            ManagerMessage::Records(r) => {
+                // A record in teardown is gone here, as it is to `List`.
+                let tearing_down = self
+                    .tearing_down
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                r.handle(async {
+                    let mut records = Vec::new();
+                    for handle in self.store.handles().await? {
+                        if !tearing_down.contains(handle.id()) {
+                            records.push(handle.record().await?);
+                        }
+                    }
+                    Ok::<_, BoxManagerError>(records)
+                })
+                .await;
+            }
             // Gets the record for a specific session.
             ManagerMessage::GetRecord(pred, r) => {
                 let tearing_down = self
@@ -1733,9 +3513,34 @@ impl BoxManager {
                 })
                 .await;
             }
+            ManagerMessage::EndedSource(id, r) => {
+                let tearing_down = self
+                    .tearing_down
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                r.handle(async {
+                    Ok::<_, BoxManagerError>(
+                        match self.store.find(RecordPredicate::Id(id)).await? {
+                            // Gone, as to `GetRecord`: a delete that has
+                            // started hands out no paths of the box.
+                            Some(handle) if tearing_down.contains(handle.id()) => None,
+                            Some(handle) => Some((handle.record().await?, handle.object().await?)),
+                            None => None,
+                        },
+                    )
+                })
+                .await;
+            }
             #[cfg(target_os = "linux")]
             ManagerMessage::ResumeActive(r) => {
                 r.handle(self.resume_active_sessions()).await;
+            }
+            ManagerMessage::RunningNameHolder(id, name, r) => {
+                r.handle(self.claim_name(id, name)).await;
+            }
+            ManagerMessage::ReleaseNameClaim(id) => {
+                self.name_claims.remove(&id);
             }
             #[cfg(test)]
             ManagerMessage::RunningCount(r) => {
@@ -1768,6 +3573,12 @@ impl BoxManager {
             // if the session is known but not running.
             ManagerMessage::GetSession(pred, r) => {
                 r.handle(self.resolve_session(pred)).await;
+            }
+            #[cfg(target_os = "linux")]
+            ManagerMessage::GetRunning(id, r) => {
+                let running = self.running.get(&id).cloned();
+                r.handle(async move { Ok::<_, BoxManagerError>(running) })
+                    .await;
             }
             // Snapshot a running session's screen without starting its
             // actor. A name resolves through the store to its id, then the
@@ -1830,7 +3641,9 @@ impl BoxManager {
                     creator,
                     responder,
                 } = *msg;
-                let created = self.create_session(config, None, username, creator).await;
+                let created = self
+                    .create_session(config, None, false, username, creator)
+                    .await;
                 responder.handle(async move { created }).await;
             }
             ManagerMessage::CreateBox(msg) => {
@@ -1843,276 +3656,30 @@ impl BoxManager {
                             responder,
                         },
                     spec,
+                    fresh,
                 } = *msg;
-                let created = self.create_session(config, spec, username, creator).await;
+                let created = self
+                    .create_session(config, spec, fresh, username, creator)
+                    .await;
                 responder.handle(async move { created }).await;
             }
-            // Deletes a session: tears down its running host and actor (if
-            // any), then removes its on-disk record.
-            //
-            // The mainloop resolves the record and claims the actor; the
-            // teardown itself runs on a task of its own. Awaiting the actor
-            // here held every queued caller behind it: the reap of a session
-            // whose client gave up on `min session activate` while the
-            // actor was inside a stalled package-graph clone parked `min ls`
-            // for the rest of the clone's connect timeout (70 s in the lab,
-            // 710d).
+            // Deletes a session: see `delete_box`.
             ManagerMessage::DeleteSession(id, only_if_unfinalized, r) => {
-                if self.in_shutdown.is_cancelled() {
-                    r.handle(async {
-                        Err(BoxManagerError::new(
-                            std::io::ErrorKind::ConnectionRefused,
-                            minimald_rpc::SHUTDOWN_REFUSAL,
-                        ))
-                    })
+                self.destroy_box(id, only_if_unfinalized, r).await;
+            }
+            // Reaps a stopped or exited box (BOX-019): the state check and
+            // the delete's claim run in this one message, so no resume
+            // starts between them.
+            ManagerMessage::ReapEnded(id, r) => match self.reap_refusal(id).await {
+                Ok(None) => self.reap_ended(id, r).await,
+                Ok(Some(refusal)) => r.handle(async { Err(refusal) }).await,
+                Err(e) => r.handle(async { Err(e) }).await,
+            },
+            #[cfg(target_os = "linux")]
+            ManagerMessage::HandOverName(hand_over, r) => {
+                let successor = self.hand_over_reaped_name(hand_over).await;
+                r.handle(async move { Ok::<_, BoxManagerError>(successor) })
                     .await;
-                    return;
-                }
-                let handle = match self.store.find(RecordPredicate::Id(id)).await {
-                    Ok(Some(handle)) => handle,
-                    Ok(None) => {
-                        r.handle(async {
-                            Err(std::io::Error::new(
-                                NotFound,
-                                format!(
-                                    "{} `{}`",
-                                    minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
-                                    id.as_ref()
-                                ),
-                            ))
-                        })
-                        .await;
-                        return;
-                    }
-                    Err(e) => {
-                        r.handle(async { Err(e) }).await;
-                        return;
-                    }
-                };
-                // A destroy only for an unfinished session (inbox#690) goes
-                // to a live actor unclaimed: the actor decides, after any
-                // finalize ahead of it in its mailbox, and evicts itself if
-                // it destroys. An idle session has no finalize in flight, so
-                // its record answers: a finished one is kept, an unfinished
-                // one takes the unconditional path below.
-                if only_if_unfinalized {
-                    let busy = self
-                        .tearing_down
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .contains(&id);
-                    if busy {
-                        r.handle(async {
-                            Err(std::io::Error::new(
-                                std::io::ErrorKind::ResourceBusy,
-                                format!(
-                                    "a destroy of session `{}` is already in flight; if the \
-                                     session is still listed once it ends, destroy it again",
-                                    id.as_ref()
-                                ),
-                            ))
-                        })
-                        .await;
-                        return;
-                    }
-                    if let Some(hnd) = self.running.get(&id).cloned() {
-                        // In the tearing-down set until the actor answers, as
-                        // an unconditional destroy is for its whole teardown:
-                        // a second destroy is refused rather than queued
-                        // behind this one (where it would destroy a session
-                        // this one reports kept), a listing skips the
-                        // session rather than reading a record the actor may
-                        // be deleting, and a resolve finds nothing (the actor
-                        // stays in `running`, unclaimed, since the session
-                        // may be kept; the set is what hides it). A kept
-                        // session leaves the set with the answer, and is
-                        // listed and resolved again.
-                        let tearing_down = Arc::clone(&self.tearing_down);
-                        let handle = handle.clone();
-                        tearing_down
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .insert(id);
-                        let span = tracing::Span::current();
-                        self.teardowns.spawn(tracing::Instrument::instrument(
-                            async move {
-                                let release = TearingDown {
-                                    set: tearing_down,
-                                    id,
-                                };
-                                let answer: Result<Option<Vec<String>>, BoxManagerError> = async {
-                                    let answer = hnd.destroy_if_unfinalized().await?;
-                                    // Belt-and-braces, as on the unconditional
-                                    // path: a dead actor (self-terminated, not
-                                    // yet evicted) reads as destroyed above,
-                                    // and may have died without deleting its
-                                    // record. Only a destroyed answer removes
-                                    // a leftover: a kept session's record is
-                                    // the session. `NotFound` is the normal,
-                                    // already-deleted case.
-                                    if answer.is_some()
-                                        && let Err(e) = handle.delete().await
-                                        && e.kind() != NotFound
-                                    {
-                                        return Err(e);
-                                    }
-                                    Ok(answer)
-                                }
-                                .await;
-                                // Out of the set before the answer goes out: a
-                                // caller that reads the record or the listing on
-                                // the reply must not find a kept session still
-                                // hidden behind the set.
-                                drop(release);
-                                r.handle(async { answer }).await;
-                            },
-                            span,
-                        ));
-                        while let Some(joined) = self.teardowns.try_join_next() {
-                            log_teardown_join(joined);
-                        }
-                        return;
-                    }
-                    match handle.record().await {
-                        Ok(record) if record.status == boxes::BoxState::Active => {
-                            r.handle(async { Ok(None) }).await;
-                            return;
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            r.handle(async { Err(e) }).await;
-                            return;
-                        }
-                    }
-                }
-                // One teardown per session: a second destroy that lands
-                // while the first runs is refused rather than brought up
-                // as a fresh actor whose hooks would run again.
-                let tearing_down = Arc::clone(&self.tearing_down);
-                let first = tearing_down
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(id);
-                if !first {
-                    r.handle(async {
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::ResourceBusy,
-                            format!(
-                                "a destroy of session `{}` is already in flight; if the \
-                                 session is still listed once it ends, destroy it again",
-                                id.as_ref()
-                            ),
-                        ))
-                    })
-                    .await;
-                    return;
-                }
-                // Teardown belongs to the actor, so an idle session gets
-                // one brought up rather than having its record deleted
-                // out from under it. That used to be a fair shortcut —
-                // "nothing to undo" — but a session's `on_destroy` hooks
-                // now run on this path, and skipping the actor skipped
-                // them silently for any session whose actor had been
-                // reaped (every session, after a daemon restart).
-                //
-                // Claimed here, brought up and torn down on a task of its
-                // own: the mainloop awaits neither the actor's start (a
-                // record and composition read) nor its destroy (hooks), so
-                // a listing served meanwhile neither waits nor probes it.
-                // The caller gets the outcome when the task ends.
-                let claimed = self.running.remove(&id);
-                let seed = match claimed {
-                    Some(_) => None,
-                    None => Some(self.session_config(handle.clone())),
-                };
-                let in_shutdown = self.in_shutdown.clone();
-                let span = tracing::Span::current();
-                self.teardowns.spawn(tracing::Instrument::instrument(
-                    async move {
-                        // Out of the set as this task ends, whatever its outcome.
-                        let _release = TearingDown {
-                            set: tearing_down,
-                            id,
-                        };
-                        r.handle(async {
-                            // A shutdown that began after this destroy was
-                            // accepted: an idle session is not brought up
-                            // now (a fresh actor and sandbox while shutdown
-                            // waits on this task). The destroy is refused, as
-                            // one that arrived during shutdown is above, and
-                            // the record stays for the next start.
-                            if seed.is_some() && in_shutdown.is_cancelled() {
-                                return Err(BoxManagerError::new(
-                                    std::io::ErrorKind::ConnectionRefused,
-                                    minimald_rpc::SHUTDOWN_REFUSAL,
-                                ));
-                            }
-                            let actor = match (claimed, seed) {
-                                (Some(hnd), _) => Some(hnd),
-                                (None, Some(seed)) => match BoxActor::run(seed).await {
-                                    // The check above ran before the bring-up;
-                                    // a shutdown that began during it stops the
-                                    // fresh actor as it stops a live one, and
-                                    // the destroy is refused before its hooks
-                                    // would mint a sandbox.
-                                    Ok(hnd) if in_shutdown.is_cancelled() => {
-                                        hnd.stop().await;
-                                        return Err(BoxManagerError::new(
-                                            std::io::ErrorKind::ConnectionRefused,
-                                            minimald_rpc::SHUTDOWN_REFUSAL,
-                                        ));
-                                    }
-                                    Ok(hnd) => Some(hnd),
-                                    // A record the actor refuses to come up on — a
-                                    // restart-orphaned `Materializing` one is the
-                                    // known case — must still be destroyable, so
-                                    // fall through to deleting it directly. A
-                                    // session that cannot be torn down is worse
-                                    // than one torn down without its hooks.
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            session_id = %id,
-                                            error = %e,
-                                            "could not start the session to run its destroy hooks; \
-                                             removing its record without them",
-                                        );
-                                        None
-                                    }
-                                },
-                                // A claimed actor comes with no seed; the
-                                // match above covers every pair that occurs.
-                                (None, None) => None,
-                            };
-                            match actor {
-                                Some(hnd) => {
-                                    let hook_failures = hnd.destroy().await?;
-                                    // Belt-and-braces: a dead actor (self-terminated
-                                    // but not yet evicted) reads as `Ok` above, and
-                                    // may have died *without* deleting its record
-                                    // (its own delete failed). Remove any leftover;
-                                    // `NotFound` is the normal already-deleted case.
-                                    if let Err(e) = handle.delete().await
-                                        && e.kind() != NotFound
-                                    {
-                                        return Err(e);
-                                    }
-                                    Ok(Some(hook_failures))
-                                }
-                                None => {
-                                    handle.delete().await?;
-                                    Ok(Some(Vec::new()))
-                                }
-                            }
-                        })
-                        .await;
-                    },
-                    span,
-                ));
-                // Finished tasks leave the set on their own; their join
-                // handles leave it here, so the set holds only the live ones.
-                while let Some(joined) = self.teardowns.try_join_next() {
-                    log_teardown_join(joined);
-                }
             }
             ManagerMessage::Shutdown(force, r) => {
                 r.handle(async {
@@ -2180,9 +3747,762 @@ impl BoxManager {
             // reused, so a stale evict can't remove a fresh actor.
             ManagerMessage::Evict(id) => {
                 self.running.remove(&id);
+                // An actor that ended mid-resume holds its claim no more.
+                self.name_claims.remove(&id);
             }
         }
     }
+}
+
+impl BoxManager {
+    /// Deletes a session: tears down its running host and actor (if any),
+    /// then removes its on-disk record. With `only_if_unfinalized`, only a
+    /// session that has not finished activating (`None` when it was kept).
+    ///
+    /// The mainloop resolves the record and claims the actor; the teardown
+    /// itself runs on a task of its own. Awaiting the actor here held every
+    /// queued caller behind it: the reap of a session whose client gave up
+    /// on `min session activate` while the actor was inside a stalled
+    /// package-graph clone parked `min ls` for the rest of the clone's
+    /// connect timeout (70 s in the lab, 710d).
+    async fn delete_box(
+        &mut self,
+        id: SessionId,
+        only_if_unfinalized: bool,
+        r: Responder<Option<Vec<String>>>,
+    ) {
+        if self.in_shutdown.is_cancelled() {
+            r.handle(async {
+                Err(BoxManagerError::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    minimald_rpc::SHUTDOWN_REFUSAL,
+                ))
+            })
+            .await;
+            return;
+        }
+        let handle = match self.store.find(RecordPredicate::Id(id)).await {
+            Ok(Some(handle)) => handle,
+            Ok(None) => {
+                r.handle(async {
+                    Err(std::io::Error::new(
+                        NotFound,
+                        format!(
+                            "{} `{}`",
+                            minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                            id.as_ref()
+                        ),
+                    ))
+                })
+                .await;
+                return;
+            }
+            Err(e) => {
+                r.handle(async { Err(e) }).await;
+                return;
+            }
+        };
+        // A destroy only for an unfinished session (inbox#690) goes
+        // to a live actor unclaimed: the actor decides, after any
+        // finalize ahead of it in its mailbox, and evicts itself if
+        // it destroys. An idle session has no finalize in flight, so
+        // its record answers: a finished one is kept, an unfinished
+        // one takes the unconditional path below.
+        if only_if_unfinalized {
+            let busy = self
+                .tearing_down
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&id);
+            if busy {
+                r.handle(async {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::ResourceBusy,
+                        format!(
+                            "a destroy of session `{}` is already in flight; if the \
+                             session is still listed once it ends, destroy it again",
+                            id.as_ref()
+                        ),
+                    ))
+                })
+                .await;
+                return;
+            }
+            if let Some(hnd) = self.running.get(&id).cloned() {
+                // In the tearing-down set until the actor answers, as
+                // an unconditional destroy is for its whole teardown:
+                // a second destroy is refused rather than queued
+                // behind this one (where it would destroy a session
+                // this one reports kept), a listing skips the
+                // session rather than reading a record the actor may
+                // be deleting, and a resolve finds nothing (the actor
+                // stays in `running`, unclaimed, since the session
+                // may be kept; the set is what hides it). A kept
+                // session leaves the set with the answer, and is
+                // listed and resolved again.
+                let tearing_down = Arc::clone(&self.tearing_down);
+                let handle = handle.clone();
+                tearing_down
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(id);
+                let span = tracing::Span::current();
+                self.teardowns.spawn(tracing::Instrument::instrument(
+                    async move {
+                        let release = TearingDown {
+                            set: tearing_down,
+                            id,
+                        };
+                        let answer: Result<Option<Vec<String>>, BoxManagerError> = async {
+                            let answer = hnd.destroy_if_unfinalized().await?;
+                            // Belt-and-braces, as on the unconditional
+                            // path: a dead actor (self-terminated, not
+                            // yet evicted) reads as destroyed above,
+                            // and may have died without deleting its
+                            // record. Only a destroyed answer removes
+                            // a leftover: a kept session's record is
+                            // the session. `NotFound` is the normal,
+                            // already-deleted case.
+                            if answer.is_some()
+                                && let Err(e) = handle.delete().await
+                                && e.kind() != NotFound
+                            {
+                                return Err(e);
+                            }
+                            Ok(answer)
+                        }
+                        .await;
+                        // Out of the set before the answer goes out: a
+                        // caller that reads the record or the listing on
+                        // the reply must not find a kept session still
+                        // hidden behind the set.
+                        drop(release);
+                        r.handle(async { answer }).await;
+                    },
+                    span,
+                ));
+                while let Some(joined) = self.teardowns.try_join_next() {
+                    log_teardown_join(joined);
+                }
+                return;
+            }
+            match handle.record().await {
+                Ok(record) if record.status == boxes::BoxState::Active => {
+                    r.handle(async { Ok(None) }).await;
+                    return;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    r.handle(async { Err(e) }).await;
+                    return;
+                }
+            }
+        }
+        // One teardown per session: a second destroy that lands
+        // while the first runs is refused rather than brought up
+        // as a fresh actor whose hooks would run again.
+        let tearing_down = Arc::clone(&self.tearing_down);
+        let first = tearing_down
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id);
+        if !first {
+            r.handle(async {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ResourceBusy,
+                    format!(
+                        "a destroy of session `{}` is already in flight; if the \
+                         session is still listed once it ends, destroy it again",
+                        id.as_ref()
+                    ),
+                ))
+            })
+            .await;
+            return;
+        }
+        // Teardown belongs to the actor, so an idle session gets
+        // one brought up rather than having its record deleted
+        // out from under it. That used to be a fair shortcut —
+        // "nothing to undo" — but a session's `on_destroy` hooks
+        // now run on this path, and skipping the actor skipped
+        // them silently for any session whose actor had been
+        // reaped (every session, after a daemon restart).
+        //
+        // Claimed here, brought up and torn down on a task of its
+        // own: the mainloop awaits neither the actor's start (a
+        // record and composition read) nor its destroy (hooks), so
+        // a listing served meanwhile neither waits nor probes it.
+        // The caller gets the outcome when the task ends.
+        let claimed = self.running.remove(&id);
+        let seed = match claimed {
+            Some(_) => None,
+            None => Some(self.session_config(handle.clone())),
+        };
+        let in_shutdown = self.in_shutdown.clone();
+        let span = tracing::Span::current();
+        self.teardowns.spawn(tracing::Instrument::instrument(
+            async move {
+                // Out of the set as this task ends, whatever its outcome.
+                let _release = TearingDown {
+                    set: tearing_down,
+                    id,
+                };
+                r.handle(async {
+                    // A shutdown that began after this destroy was
+                    // accepted: an idle session is not brought up
+                    // now (a fresh actor and sandbox while shutdown
+                    // waits on this task). The destroy is refused, as
+                    // one that arrived during shutdown is above, and
+                    // the record stays for the next start.
+                    if seed.is_some() && in_shutdown.is_cancelled() {
+                        return Err(BoxManagerError::new(
+                            std::io::ErrorKind::ConnectionRefused,
+                            minimald_rpc::SHUTDOWN_REFUSAL,
+                        ));
+                    }
+                    let actor = match (claimed, seed) {
+                        (Some(hnd), _) => Some(hnd),
+                        (None, Some(seed)) => match BoxActor::run(seed).await {
+                            // The check above ran before the bring-up;
+                            // a shutdown that began during it stops the
+                            // fresh actor as it stops a live one, and
+                            // the destroy is refused before its hooks
+                            // would mint a sandbox.
+                            Ok(hnd) if in_shutdown.is_cancelled() => {
+                                hnd.stop().await;
+                                return Err(BoxManagerError::new(
+                                    std::io::ErrorKind::ConnectionRefused,
+                                    minimald_rpc::SHUTDOWN_REFUSAL,
+                                ));
+                            }
+                            Ok(hnd) => Some(hnd),
+                            // A record the actor refuses to come up on — a
+                            // restart-orphaned `Materializing` one is the
+                            // known case — must still be destroyable, so
+                            // fall through to deleting it directly. A
+                            // session that cannot be torn down is worse
+                            // than one torn down without its hooks.
+                            Err(e) => {
+                                tracing::warn!(
+                                    session_id = %id,
+                                    error = %e,
+                                    "could not start the session to run its destroy hooks; \
+                                     removing its record without them",
+                                );
+                                None
+                            }
+                        },
+                        // A claimed actor comes with no seed; the
+                        // match above covers every pair that occurs.
+                        (None, None) => None,
+                    };
+                    match actor {
+                        Some(hnd) => {
+                            let hook_failures = hnd.destroy().await?;
+                            // Belt-and-braces: a dead actor (self-terminated
+                            // but not yet evicted) reads as `Ok` above, and
+                            // may have died *without* deleting its record
+                            // (its own delete failed). Remove any leftover;
+                            // `NotFound` is the normal already-deleted case.
+                            if let Err(e) = handle.delete().await
+                                && e.kind() != NotFound
+                            {
+                                return Err(e);
+                            }
+                            Ok(Some(hook_failures))
+                        }
+                        None => {
+                            handle.delete().await?;
+                            Ok(Some(Vec::new()))
+                        }
+                    }
+                })
+                .await;
+            },
+            span,
+        ));
+        // Finished tasks leave the set on their own; their join
+        // handles leave it here, so the set holds only the live ones.
+        while let Some(joined) = self.teardowns.try_join_next() {
+            log_teardown_join(joined);
+        }
+    }
+}
+
+impl BoxManager {
+    /// Why a reap of `id` is refused (BOX-019), or `None` when the reap can
+    /// go on. A box that is not `stopped` or `exited`, or whose resume is
+    /// in flight, is refused. An unknown id, and a shutdown, answer `None`:
+    /// [`Self::delete_box`] refuses them with its own error.
+    async fn reap_refusal(
+        &self,
+        id: SessionId,
+    ) -> Result<Option<BoxManagerError>, BoxManagerError> {
+        use boxes::core::record::RecordState;
+        if self.in_shutdown.is_cancelled() {
+            return Ok(None);
+        }
+        let Some(handle) = self.store.find(RecordPredicate::Id(id)).await? else {
+            return Ok(None);
+        };
+        let state = handle
+            .record()
+            .await?
+            .state()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        let resuming = self.name_claims.contains_key(&id);
+        Ok(match state {
+            RecordState::Stopped(_) | RecordState::Exited(_) if resuming => Some(
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, ResumePending(id)),
+            ),
+            RecordState::Stopped(_) | RecordState::Exited(_) => None,
+            RecordState::Running => Some(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Box `{}` is running, so it was not removed. \
+                         A forced removal stops the box first and then removes it.",
+                    id.as_ref()
+                ),
+            )),
+            RecordState::Pending | RecordState::Materializing => Some(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Box `{}` is still being created, so it was not removed. \
+                     Only a stopped or exited box can be removed.",
+                    id.as_ref()
+                ),
+            )),
+        })
+    }
+}
+
+/// The name row a reap hands over: the reaped box and the name it held.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) struct NameHandOver {
+    /// The manager key of the reaped box.
+    reaped: SessionId,
+    /// The reaped box's `box_id`, for the daemon log.
+    reaped_box: SessionId,
+    /// The name whose row the reaped box held before its teardown.
+    name: String,
+}
+
+/// The retained box that takes the row of `name` after the reap of
+/// `reaped` (NET-012, NET-128), among `records`: the running holder, else
+/// the most recent creation, which is the greatest UUIDv7 id. This is the
+/// order of `boxes::resolve_on_host` and the store's `find_by_name`. Only a
+/// box with a network that owns a name is a holder.
+#[cfg(target_os = "linux")]
+fn name_successor(records: &[boxes::Record], reaped: SessionId, name: &str) -> Option<SessionId> {
+    use boxes::core::record::RecordState;
+    let holders = || {
+        records.iter().filter(|record| {
+            record.id != reaped
+                && matches!(
+                    record.network,
+                    boxes::NetworkMode::HostNet | boxes::NetworkMode::OwnIp
+                )
+                && crate::box_actor::registry_name(record).eq_ignore_ascii_case(name)
+        })
+    };
+    let running = holders()
+        .filter(|record| matches!(record.state(), Ok(RecordState::Running)))
+        .map(|record| record.id)
+        .min();
+    running.or_else(|| {
+        holders()
+            .filter(|record| {
+                matches!(
+                    record.state(),
+                    Ok(RecordState::Stopped(_) | RecordState::Exited(_))
+                )
+            })
+            .map(|record| record.id)
+            .max()
+    })
+}
+
+/// What a reap that went on answers: the hook failures of the destroy,
+/// and the name whose row the box held before the destroy.
+#[derive(Debug)]
+pub(crate) struct ReapEnd {
+    /// The destroy's answer, as [`ManagerMessage::DeleteSession`] gives it.
+    hook_failures: Option<Vec<String>>,
+    /// The box's name, when it held the name's row in the hostname
+    /// registry before the destroy.
+    held_name: Option<String>,
+}
+
+impl BoxManager {
+    /// The reap half of [`ManagerMessage::ReapEnded`]: notes whether the
+    /// box holds its name's row, and then destroys it as
+    /// [`Self::delete_box`] does.
+    async fn reap_ended(&mut self, id: SessionId, r: Responder<ReapEnd>) {
+        #[cfg(target_os = "linux")]
+        let held_name = self.held_name(id).await;
+        #[cfg(not(target_os = "linux"))]
+        let held_name = None;
+        let (send, recv) = Responder::channel();
+        self.delete_box(id, false, send).await;
+        let span = tracing::Span::current();
+        self.teardowns.spawn(tracing::Instrument::instrument(
+            async move {
+                r.handle(async move {
+                    let hook_failures = recv.await.unwrap_or_else(|_| {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionRefused,
+                            minimald_rpc::SHUTDOWN_REFUSAL,
+                        ))
+                    })?;
+                    Ok(ReapEnd {
+                        hook_failures,
+                        held_name,
+                    })
+                })
+                .await;
+            },
+            span,
+        ));
+        while let Some(joined) = self.teardowns.try_join_next() {
+            log_teardown_join(joined);
+        }
+    }
+
+    /// The destroy that [`ManagerMessage::DeleteSession`] asks for: as
+    /// [`Self::delete_box`], and then, when the destroyed box held its
+    /// name's row, the row goes to the next retained box with that name, as
+    /// a reap hands it over (BOX-019, NET-012). The destroy answers after
+    /// both. The `destroy` span records the box that took the row as
+    /// `successor`, or `none`.
+    async fn destroy_box(
+        &mut self,
+        id: SessionId,
+        only_if_unfinalized: bool,
+        r: Responder<Option<Vec<String>>>,
+    ) {
+        let span = tracing::info_span!(
+            "destroy",
+            session_id = %id,
+            successor = tracing::field::Empty,
+        );
+        #[cfg(target_os = "linux")]
+        let held = self.held_name_of_box(id).await;
+        #[cfg(not(target_os = "linux"))]
+        let held: Option<(SessionId, String)> = None;
+        let Some((destroyed_box, name)) = held else {
+            span.record("successor", tracing::field::display("none"));
+            tracing::Instrument::instrument(self.delete_box(id, only_if_unfinalized, r), span)
+                .await;
+            return;
+        };
+        let (send, recv) = Responder::channel();
+        tracing::Instrument::instrument(
+            self.delete_box(id, only_if_unfinalized, send),
+            span.clone(),
+        )
+        .await;
+        let manager = self.weak_self.clone();
+        // Not on `teardowns`: the handover is a message to this manager, and
+        // a shutdown that waits on `teardowns` reads no message meanwhile.
+        crate::traced::spawn(tracing::Instrument::instrument(
+            async move {
+                let answer = recv.await.unwrap_or_else(|_| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        minimald_rpc::SHUTDOWN_REFUSAL,
+                    ))
+                });
+                // Only a destroyed box gives up its row: `Ok(None)` is a box
+                // that was kept, and an error left the box as it is.
+                let destroyed = matches!(answer, Ok(Some(_)));
+                let successor = match manager.upgrade() {
+                    #[cfg(target_os = "linux")]
+                    Some(manager) if destroyed => {
+                        manager.hand_over_name(id, destroyed_box, &name).await
+                    }
+                    _ => None,
+                };
+                let shown = successor.map_or_else(|| "none".to_string(), |s| s.to_string());
+                tracing::Span::current().record("successor", tracing::field::display(&shown));
+                if destroyed {
+                    tracing::info!(
+                        box_id = %destroyed_box,
+                        session_name = &name,
+                        successor = %shown,
+                        "destroy: the destroyed box held the name's row; \
+                         the successor holds it now (none: no box does)"
+                    );
+                }
+                r.handle(async { answer }).await;
+            },
+            span,
+        ));
+    }
+
+    /// The `box_id` and name of box `id`, when the box holds that name's
+    /// row in the hostname registry.
+    #[cfg(target_os = "linux")]
+    async fn held_name_of_box(&self, id: SessionId) -> Option<(SessionId, String)> {
+        let handle = self.store.find(RecordPredicate::Id(id)).await.ok()??;
+        let record = handle.record().await.ok()?;
+        let name = crate::box_actor::registry_name(&record);
+        self.hostnames
+            .read()
+            .expect("hostname registry lock poisoned")
+            .name_held_by(id, &name)
+            .then(|| (record.box_id.unwrap_or(id), name))
+    }
+
+    /// The name of box `id`, when the box holds that name's row in the
+    /// hostname registry.
+    #[cfg(target_os = "linux")]
+    async fn held_name(&self, id: SessionId) -> Option<String> {
+        let handle = self.store.find(RecordPredicate::Id(id)).await.ok()??;
+        let record = handle.record().await.ok()?;
+        let name = crate::box_actor::registry_name(&record);
+        self.hostnames
+            .read()
+            .expect("hostname registry lock poisoned")
+            .name_held_by(id, &name)
+            .then_some(name)
+    }
+
+    /// The manager half of a reap's name handover. The reaped box's row
+    /// goes first: its teardown withdraws it, and a teardown that ran
+    /// without an actor leaves it, so it is withdrawn here. Then the
+    /// successor is picked among the retained boxes that are not being
+    /// removed, and takes the row. Both steps run in one message, so no
+    /// other message of the manager lands between them. Answers with the
+    /// box that took the row, or `None` when no box did.
+    #[cfg(target_os = "linux")]
+    async fn hand_over_reaped_name(&mut self, hand_over: NameHandOver) -> Option<SessionId> {
+        let NameHandOver {
+            reaped,
+            reaped_box,
+            name,
+        } = hand_over;
+        {
+            let mut registry = self
+                .hostnames
+                .write()
+                .expect("hostname registry lock poisoned");
+            let left = registry.name_held_by(reaped, &name);
+            if left {
+                registry.withdraw_own_name(reaped, &name);
+            }
+            tracing::info!(
+                box_id = %reaped_box,
+                session_id = %reaped,
+                session_name = &name,
+                withdrawn_here = left,
+                action = "name-released",
+                "reap: the removed box no longer holds the name"
+            );
+        }
+        let tearing_down = self
+            .tearing_down
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut records = Vec::new();
+        let read: Result<(), BoxManagerError> = async {
+            for handle in self.store.handles().await? {
+                if !tearing_down.contains(handle.id()) {
+                    records.push(handle.record().await?);
+                }
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = read {
+            tracing::warn!(
+                box_id = %reaped_box,
+                session_name = &name,
+                %error,
+                "reap: the records cannot be read; the name is not handed over"
+            );
+            return None;
+        }
+        let Some(successor) = name_successor(&records, reaped, &name) else {
+            tracing::info!(
+                box_id = %reaped_box,
+                session_name = &name,
+                "reap: no retained box has the name; it answers nothing"
+            );
+            return None;
+        };
+        self.hand_over_name(successor).await.then_some(successor)
+    }
+
+    /// Registers the name row of the retained box `successor`, after a
+    /// reap removed the box that held it (NET-012). A box with a live actor
+    /// is registered here, and a stopped or exited one is marked stopped
+    /// (NET-128). A box with no actor gets one, and its bring-up registers
+    /// the name as a resume's bring-up does. Answers whether `successor`
+    /// holds the row afterwards.
+    #[cfg(target_os = "linux")]
+    async fn hand_over_name(&mut self, successor: SessionId) -> bool {
+        use boxes::core::record::RecordState;
+        let removing = self
+            .tearing_down
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&successor);
+        if removing {
+            tracing::info!(
+                session_id = %successor,
+                "reap: the next holder of the name is being removed; the name is not handed over"
+            );
+            return false;
+        }
+        let handle = match self.store.find(RecordPredicate::Id(successor)).await {
+            Ok(Some(handle)) => handle,
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %successor,
+                    %error,
+                    "reap: the next holder of the name cannot be found; the name is not handed over"
+                );
+                return false;
+            }
+        };
+        let record = match handle.record().await {
+            Ok(record) => record,
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %successor,
+                    %error,
+                    "reap: the record of the next holder of the name cannot be read; \
+                     the name is not handed over"
+                );
+                return false;
+            }
+        };
+        let name = crate::box_actor::registry_name(&record);
+        if self
+            .name_claims
+            .iter()
+            .any(|(id, held)| *id != successor && held.eq_ignore_ascii_case(&name))
+        {
+            tracing::info!(
+                session_id = %successor,
+                session_name = &name,
+                "reap: a resume of a box with the name is in flight; it registers the name"
+            );
+            return false;
+        }
+        {
+            let registry = self
+                .hostnames
+                .read()
+                .expect("hostname registry lock poisoned");
+            if registry.name_held_by(successor, &name) {
+                return true;
+            }
+            if let Some(owner) = registry.hostname_held_by_another(successor, &name) {
+                tracing::info!(
+                    session_id = %successor,
+                    session_name = &name,
+                    owner,
+                    "reap: another box took the name since the reap; the name is not handed over"
+                );
+                return false;
+            }
+        }
+        let ended = matches!(
+            record.state(),
+            Ok(RecordState::Stopped(_) | RecordState::Exited(_))
+        );
+        if self.running.contains_key(&successor) {
+            let mut registry = self
+                .hostnames
+                .write()
+                .expect("hostname registry lock poisoned");
+            let registered = match record.network {
+                boxes::NetworkMode::HostNet => {
+                    registry.register_host_net(successor, &name);
+                    true
+                }
+                boxes::NetworkMode::OwnIp => registry
+                    .register_own_ip(
+                        successor,
+                        &name,
+                        crate::net::switch::declared_request_ports(Some(&record.policy)),
+                    )
+                    .is_some(),
+                _ => false,
+            };
+            if !registered {
+                tracing::info!(
+                    session_id = %successor,
+                    session_name = &name,
+                    "reap: the next holder of the name has no published address; \
+                     the name is not handed over"
+                );
+                return false;
+            }
+            if ended {
+                registry.mark_stopped(successor);
+            }
+        } else {
+            match BoxActor::run(self.session_config(handle)).await {
+                Ok(hnd) => {
+                    self.running.insert(successor, hnd);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %successor,
+                        %error,
+                        "reap: the next holder of the name did not come up; \
+                         the name is not handed over"
+                    );
+                    return false;
+                }
+            }
+        }
+        tracing::info!(
+            box_id = %record.box_id.unwrap_or(successor),
+            session_id = %successor,
+            session_name = &name,
+            ended,
+            action = "name-handed-over",
+            "reap: the name now answers for the next box that holds it"
+        );
+        true
+    }
+}
+
+/// How long a forced reap waits for a resume in flight to end.
+const REAP_RESUME_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How often a forced reap checks whether the resume it waits for ended.
+const REAP_RESUME_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The refusal of a reap of a `stopped` or `exited` box whose resume is in
+/// flight (BOX-019, BOX-025).
+#[derive(Debug)]
+struct ResumePending(SessionId);
+
+impl std::fmt::Display for ResumePending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Box `{}` is resuming, so it was not removed. \
+             Remove it again after the resume ends.",
+            self.0.as_ref()
+        )
+    }
+}
+
+impl std::error::Error for ResumePending {}
+
+/// Whether `error` is the [`ResumePending`] refusal.
+fn is_resume_pending(error: &BoxManagerError) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<ResumePending>())
 }
 
 /// Deletes a record whose create failed before its id reached the caller.
@@ -2438,6 +4758,7 @@ mod create_stamp_tests {
             box_id: None,
             box_addresses: None,
             hooks_enabled: true,
+            ends_with_run: false,
             attrs: [
                 ("parent".to_string(), SessionId::mint().to_string()),
                 ("box_type".to_string(), "task".to_string()),
@@ -2596,6 +4917,162 @@ mod create_stamp_tests {
         assert_eq!(
             record(&mngr, id).await.project_root,
             Some(paths::HostAbsPath::try_new("/home/dev/proj/sub").unwrap())
+        );
+    }
+}
+
+/// [`BoxManagerHandle::ended_box`] against a delete in flight (BOX-017).
+#[cfg(test)]
+mod ended_box_tests {
+    use super::*;
+    use boxes::wire::primitives::{
+        WireHookScript, WireLifecycleHook, WireProvenancedHook, WireSource,
+    };
+    use boxes::wire::request::WireContribution;
+    use tempfile::TempDir;
+
+    fn daemon_abs(p: &std::path::Path) -> DaemonAbsPath {
+        DaemonAbsPath::try_new(p.to_str().unwrap()).unwrap()
+    }
+
+    /// A manager over fresh state and cache directories, its boxes on the
+    /// mock launcher.
+    async fn manager() -> (TempDir, TempDir, BoxManagerHandle) {
+        let state = TempDir::new().unwrap();
+        let cache = TempDir::new().unwrap();
+        let switch = Arc::new(Mutex::new(crate::net::SwitchClient::new(
+            "/nonexistent/gvproxy",
+            state.path().join("gvproxy"),
+        )));
+        let mctx_config = mctx::ConfigBuilder::new()
+            .with_cache_dir(cache.path())
+            .with_state_dir(state.path())
+            .with_daemon_id("test".to_string())
+            .build()
+            .unwrap();
+        let daemon_ctx = Arc::new(mctx::DaemonContext::init(mctx_config).unwrap());
+        let mngr = BoxManager::init(
+            daemon_abs(state.path()),
+            daemon_abs(cache.path()),
+            daemon_ctx,
+            switch,
+            false,
+        )
+        .await
+        .unwrap();
+        (state, cache, mngr)
+    }
+
+    fn config(name: &str) -> minimald_rpc::BoxConfig {
+        minimald_rpc::BoxConfig {
+            name: Some(name.to_string()),
+            project_path: paths::HostAbsPath::try_new("/proj").unwrap(),
+            network: boxes::NetworkMode::default(),
+            policy: Default::default(),
+            task_addresses: Vec::new(),
+            box_id: None,
+            box_addresses: None,
+            hooks_enabled: true,
+            ends_with_run: false,
+            attrs: Default::default(),
+            sealed_deliveries: Vec::new(),
+            root_certificate: None,
+            creating_verb: minimald_rpc::CreatingVerb::Session,
+            project_root: None,
+        }
+    }
+
+    /// Creates the box `name` and activates it with the `on_destroy` hook
+    /// `body`.
+    async fn active_box(mngr: &BoxManagerHandle, name: &str, body: String) -> SessionId {
+        let id = mngr.create_session(config(name), None).await.unwrap();
+        let handle = mngr
+            .get_session(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the new box resolves");
+        let contribution = WireContribution {
+            lifecycle_hooks: vec![WireProvenancedHook {
+                hook: WireLifecycleHook {
+                    on_destroy: Some(WireHookScript::Inline {
+                        body,
+                        timeout_secs: 60,
+                    }),
+                    ..Default::default()
+                },
+                source: WireSource::UserLoadout {
+                    name: "test".to_string(),
+                },
+            }],
+            ..Default::default()
+        };
+        assert!(
+            handle
+                .configure_loadout(contribution)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        handle.finalize().await.unwrap();
+        id
+    }
+
+    /// A delete that has started hides the box from `ended_box`, as it
+    /// does from every other read: the read hands out no paths of a box
+    /// that the delete is about to remove.
+    ///
+    /// The delete message goes into the manager's mailbox ahead of the
+    /// read, with no wait for its answer. The mailbox is served in order,
+    /// one message at a time, and the delete puts the box in the
+    /// tearing-down set before the manager takes the next message. So the
+    /// read lands after the delete has started: inside its window, or
+    /// after it removed the record. A stopped box's delete has no hook
+    /// that a test can hold open, because no actor hosts an ended box.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ended_box_refuses_a_box_whose_delete_has_started() {
+        let (_state, _cache, mngr) = manager().await;
+        let id = active_box(&mngr, "ended", "true".to_string()).await;
+        mngr.stop_box_with_grace(id, false, std::time::Duration::from_secs(5))
+            .await
+            .expect("the stop succeeds");
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while mngr.running_count().await != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the stopped box's actor did not end");
+        let ended = mngr
+            .ended_box(id)
+            .await
+            .unwrap()
+            .expect("a stopped box with no delete in flight is served");
+        assert!(
+            std::path::Path::new(ended.paths.working.as_str()).exists(),
+            "the stopped box keeps its files"
+        );
+
+        let (send, deleted) = Responder::channel();
+        mngr.sender
+            .send(ManagerMessage::DeleteSession(id, false, send))
+            .await
+            .expect("the manager takes the delete");
+        assert!(
+            mngr.ended_box(id).await.unwrap().is_none(),
+            "a box whose delete has started hands out no paths"
+        );
+
+        deleted
+            .await
+            .expect("the manager answers the delete")
+            .expect("the delete succeeds");
+        assert!(mngr.ended_box(id).await.unwrap().is_none());
+        assert!(
+            mngr.get_record(BoxKeyPredicate::Id(id))
+                .await
+                .unwrap()
+                .is_none(),
+            "the delete removed the record"
         );
     }
 }

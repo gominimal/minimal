@@ -98,6 +98,7 @@ use minimald_rpc::ZoneAnswererStatus;
 use serde::{Deserialize, Serialize};
 
 use boxes::core::zone_answer::{self, ZoneRow, ZoneView};
+use switch::loopback::RangeProbe;
 
 use crate::box_registry::{BoxRegistry, canonical_box_name, is_host_answerable};
 
@@ -107,8 +108,8 @@ use crate::box_registry::{BoxRegistry, canonical_box_name, is_host_answerable};
 /// it.
 const COMPONENT: &str = "zone-answerer";
 
-/// The machine's answerer port: the next one after the egress (`:7654`) and
-/// mTLS (`:7655`) proxies, mirroring the native daemon's own default
+/// The machine's answerer port, above the hostname proxy on `:7654`,
+/// mirroring the native daemon's own default
 /// (`ANSWERER_PORT` in minimald's `net/answerer.rs`) — `minvmd` does not
 /// depend on the daemon, so the value is pinned here beside the one it
 /// mirrors, and the e2e lane names it in the resolver command it builds.
@@ -120,7 +121,7 @@ const COMPONENT: &str = "zone-answerer";
 pub const DEFAULT_ANSWERER_PORT: u16 = 7656;
 
 /// The interim answerer channel socket's file name inside a state dir's
-/// provider-instance dir. Deliberately beside [`crate::control`]'s
+/// host dir. Deliberately beside [`crate::control`]'s
 /// `control.sock` rather than in the `paths` crate: this name only means
 /// something where two VM host daemons share a machine.
 pub const CHANNEL_SOCK_FILE: &str = "answerer.sock";
@@ -192,6 +193,17 @@ const MAX_REQUEST_LINE: usize = 64 * 1024;
 /// that a live answerer sees no chatter, short enough that a channel that
 /// came up while the node idled is found within half a minute.
 const PORT_RECHECK: Duration = Duration::from_secs(30);
+
+/// How long a node that finds the answerer port held waits for the holder's
+/// interim channel before it names the port as held with no channel
+/// (minimal#2629): two VM host daemons that start together race, and the
+/// one that loses the port's bind can look for the channel before the
+/// winner has bound it. The winner binds the channel right after the port,
+/// so the bound only has to cover that gap on a loaded host; a holder with
+/// no channel at all (a native daemon, a foreign process) is named after
+/// it. It is also how long the control socket's status read keeps saying
+/// `starting` for a node whose first publish has not been acknowledged.
+const HOLDER_CHANNEL_WAIT: Duration = Duration::from_secs(3);
 
 /// The machine-global channel socket the installed answerer service's unit
 /// holds (NET-122's host service): one per host, whatever any node's state
@@ -437,6 +449,12 @@ struct PublishRequest {
 struct AllocateRequest {
     /// The box's name, as the node's registry holds it.
     allocate: String,
+    /// The address the box was created at, when a resume asks: the book
+    /// hands it back while no other box holds it, without reading the
+    /// range, so a resume never moves the box ([`AddressBook::allocate_keeping_at`]).
+    /// An answerer that predates the field ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    keep: Option<Ipv4Addr>,
 }
 
 /// A node's release of a box's published address: the box is gone, so the
@@ -589,12 +607,29 @@ struct AddressHolder {
 /// answer TTL the zone serves: until it passes, a host resolver may still
 /// hold the old name's answer, and a client connecting by it must not reach
 /// a different box. Only the box that held it may take it back early.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct AddressBook {
     held: BTreeMap<Ipv4Addr, AddressHolder>,
     /// Released addresses still inside their quarantine: who held each and
     /// when it was released.
     released: BTreeMap<Ipv4Addr, (AddressHolder, Instant)>,
+    /// The probe [`Self::allocate`] runs over the box range before it hands
+    /// a fresh address: [`switch::loopback::probe`] in production.
+    range_probe: fn() -> RangeProbe,
+    /// Whether the last probe read the box range absent: the interim
+    /// episode its warning is logged once for.
+    range_absent: bool,
+}
+
+impl Default for AddressBook {
+    fn default() -> Self {
+        Self {
+            held: BTreeMap::new(),
+            released: BTreeMap::new(),
+            range_probe: HOST_RANGE_PROBE,
+            range_absent: false,
+        }
+    }
 }
 
 /// How long a released box address stays out of allocation: the positive
@@ -608,19 +643,75 @@ fn in_box_range(address: Ipv4Addr) -> bool {
     first <= address && address <= last
 }
 
+/// The range probe a default [`AddressBook`] runs. Unit tests run on hosts
+/// that may lack the range aliases (macOS without the lo0 aliases), so their
+/// books read the range present; the tests of the interim inject their own.
+#[cfg(not(test))]
+const HOST_RANGE_PROBE: fn() -> RangeProbe = switch::loopback::probe;
+#[cfg(test)]
+const HOST_RANGE_PROBE: fn() -> RangeProbe = || RangeProbe {
+    bound: 1,
+    probed: 1,
+    first_failure: None,
+};
+
 impl AddressBook {
-    /// [`Self::allocate_at`], now.
+    /// [`Self::allocate_keeping`] with no address to keep.
+    #[cfg(test)]
     fn allocate(&mut self, node: &str, name: &str) -> Result<Ipv4Addr, String> {
-        self.allocate_at(node, name, Instant::now())
+        self.allocate_keeping(node, name, None)
+    }
+
+    /// [`Self::allocate_keeping_at`], now, with the book's own range probe.
+    fn allocate_keeping(
+        &mut self,
+        node: &str,
+        name: &str,
+        keep: Option<Ipv4Addr>,
+    ) -> Result<Ipv4Addr, String> {
+        let probe = self.range_probe;
+        self.allocate_keeping_at(node, name, keep, Instant::now(), probe)
+    }
+
+    /// [`Self::allocate_keeping_at`] with no address to keep.
+    #[cfg(test)]
+    fn allocate_at(
+        &mut self,
+        node: &str,
+        name: &str,
+        now: Instant,
+        range_probe: impl FnOnce() -> RangeProbe,
+    ) -> Result<Ipv4Addr, String> {
+        self.allocate_keeping_at(node, name, None, now, range_probe)
     }
 
     /// The address `name` of `node` holds, or the lowest free one whose
-    /// quarantine has passed by `now`, recorded against them. Idempotent
-    /// per box; a box re-registered inside its old address's quarantine
-    /// gets that address back. When every free address is still
-    /// quarantined, the allocation fails naming when the first one frees —
-    /// it never hands an address out early.
-    fn allocate_at(&mut self, node: &str, name: &str, now: Instant) -> Result<Ipv4Addr, String> {
+    /// quarantine has passed by `now`, recorded against them. Idempotent per box; a box re-registered
+    /// inside its old address's quarantine gets that address back. When
+    /// every free address is still quarantined, the allocation fails
+    /// naming when the first one frees — it never hands an address out
+    /// early. A fresh address is handed out only when `range_probe` reads
+    /// the whole box range present (NET-123): a range the host carries
+    /// none or only part of hands the caller the 127.0.0.1 interim
+    /// instead, recorded nowhere, so a name it publishes always answers
+    /// where something listens. A box's own address, held or quarantined,
+    /// comes back without the probe, so its address never moves under it.
+    /// A probe refused for any reason other than an absent address refuses
+    /// the allocation.
+    ///
+    /// `keep` is the address a resumed box was created at. The book can
+    /// hold no record of it, as after an answerer restart. It comes back
+    /// without the probe too, when it is in the box range and no other box
+    /// holds it or released it inside its quarantine. A taken one is not
+    /// kept, and the allocation goes on as for a fresh box.
+    fn allocate_keeping_at(
+        &mut self,
+        node: &str,
+        name: &str,
+        keep: Option<Ipv4Addr>,
+        now: Instant,
+        range_probe: impl FnOnce() -> RangeProbe,
+    ) -> Result<Ipv4Addr, String> {
         if let Some((address, _)) = self
             .held
             .iter()
@@ -638,7 +729,14 @@ impl AddressBook {
             .released
             .iter()
             .find(|(_, (was, _))| *was == holder)
-            .map(|(address, _)| *address);
+            .map(|(address, _)| *address)
+            .or_else(|| {
+                keep.filter(|address| {
+                    in_box_range(*address)
+                        && !self.held.contains_key(address)
+                        && !self.released.contains_key(address)
+                })
+            });
         let (first, last) = switch::box_loopback_interior();
         let free = own.or_else(|| {
             (u32::from(first)..=u32::from(last))
@@ -675,6 +773,38 @@ impl AddressBook {
                 ),
             });
         };
+        if own.is_none() {
+            let probe = range_probe();
+            if !probe.present() {
+                if let Some((address, kind)) = probe.first_failure
+                    && kind != io::ErrorKind::AddrNotAvailable
+                {
+                    return Err(format!(
+                        "this host could not check that it can listen on the box range: \
+                         {address} refused the bind ({kind:?})"
+                    ));
+                }
+                if !self.range_absent {
+                    tracing::warn!(
+                        component = COMPONENT,
+                        probe = %probe.summary(),
+                        "this host cannot bind the whole box address range; boxes get the \
+                         127.0.0.1 interim until the range aliases are installed"
+                    );
+                    self.range_absent = true;
+                }
+                return Ok(Ipv4Addr::LOCALHOST);
+            }
+            if self.range_absent {
+                tracing::info!(
+                    component = COMPONENT,
+                    probe = %probe.summary(),
+                    "this host binds the whole box address range again; new boxes get \
+                     addresses out of it"
+                );
+                self.range_absent = false;
+            }
+        }
         self.released.remove(&free);
         self.held.insert(free, holder);
         Ok(free)
@@ -965,8 +1095,8 @@ impl RegisteredTables {
     }
 
     /// Hands `name` of `node` a box address (see [`AddressBook::allocate`]).
-    fn allocate(&self, node: &str, name: &str) -> Result<Ipv4Addr, String> {
-        self.book().allocate(node, name)
+    fn allocate(&self, node: &str, name: &str, keep: Option<Ipv4Addr>) -> Result<Ipv4Addr, String> {
+        self.book().allocate_keeping(node, name, keep)
     }
 
     /// Releases the box address `name` of `node` holds.
@@ -2035,28 +2165,29 @@ fn accept_publish(
     let publish = match parse_node_line(line) {
         Ok(NodeLine::Publish(publish)) => Ok(publish),
         Ok(NodeLine::Allocate(request)) => {
-            let reply = match registered.allocate(node, &box_zone_name(&request.allocate)) {
-                Ok(address) => {
-                    tracing::info!(
-                        component = COMPONENT,
-                        node = %node,
-                        name = %request.allocate,
-                        %address,
-                        "handed a box its published address"
-                    );
-                    RegistrationReply::allocated(address)
-                }
-                Err(reason) => {
-                    tracing::warn!(
-                        component = COMPONENT,
-                        node = %node,
-                        name = %request.allocate,
-                        %reason,
-                        "could not hand a box a published address"
-                    );
-                    RegistrationReply::refused(reason)
-                }
-            };
+            let reply =
+                match registered.allocate(node, &box_zone_name(&request.allocate), request.keep) {
+                    Ok(address) => {
+                        tracing::info!(
+                            component = COMPONENT,
+                            node = %node,
+                            name = %request.allocate,
+                            %address,
+                            "handed a box its published address"
+                        );
+                        RegistrationReply::allocated(address)
+                    }
+                    Err(reason) => {
+                        tracing::warn!(
+                            component = COMPONENT,
+                            node = %node,
+                            name = %request.allocate,
+                            %reason,
+                            "could not hand a box a published address"
+                        );
+                        RegistrationReply::refused(reason)
+                    }
+                };
             return reply_or_end(stream, connection, registered, &reply);
         }
         Ok(NodeLine::Release(request)) => {
@@ -2201,9 +2332,14 @@ impl Registration {
     /// Asks the answerer for box `name`'s published address over the held
     /// connection. The outer error is the connection's (the caller
     /// reconnects); the inner one is the answerer's refusal.
-    fn allocate(&mut self, name: &str) -> io::Result<Result<Ipv4Addr, String>> {
+    fn allocate(
+        &mut self,
+        name: &str,
+        keep: Option<Ipv4Addr>,
+    ) -> io::Result<Result<Ipv4Addr, String>> {
         let reply = self.request(&AllocateRequest {
             allocate: name.to_string(),
+            keep,
         })?;
         Ok(if reply.ok {
             reply
@@ -2452,6 +2588,15 @@ pub struct AnswererStatus(Arc<AnswererShared>);
 #[derive(Debug)]
 struct AnswererShared {
     status: Mutex<ZoneAnswererStatus>,
+    /// Whether the status is a verdict the status read may report: set by
+    /// the node's first acknowledged publish (or its hosting), or by the
+    /// acquisition when it gives up on a first publish past its bound.
+    /// Until then the read reports `starting`, so a registration still in
+    /// flight never reads as a failure.
+    settled: AtomicBool,
+    /// When the acquisition began its first publish: the start of the
+    /// bound past which an error it surfaces settles the status.
+    acquiring_since: Mutex<Option<Instant>>,
     hosting: AtomicBool,
     commands: Mutex<Option<std::sync::mpsc::Sender<HandoverCommand>>>,
 }
@@ -2469,6 +2614,8 @@ enum HandoverCommand {
     Allocate {
         /// The box's registry name.
         name: String,
+        /// The address a resumed box was created at, kept while it is free.
+        keep: Option<Ipv4Addr>,
         /// Where the address (or the refusal) goes.
         reply: std::sync::mpsc::Sender<Result<Ipv4Addr, String>>,
     },
@@ -2662,6 +2809,8 @@ impl AnswererStatus {
     pub fn starting() -> Self {
         Self(Arc::new(AnswererShared {
             status: Mutex::new(ZoneAnswererStatus::Starting),
+            settled: AtomicBool::new(false),
+            acquiring_since: Mutex::new(None),
             hosting: AtomicBool::new(false),
             commands: Mutex::new(None),
         }))
@@ -2680,11 +2829,67 @@ impl AnswererStatus {
     /// The acquisition loop's own writer: called at every pass, with the
     /// state that pass left the machine's answerer in.
     pub(crate) fn set(&self, status: ZoneAnswererStatus) {
+        // A publish the answerer acknowledged, or this daemon holding the
+        // port, settles the status for good.
+        let acknowledged = matches!(
+            status,
+            ZoneAnswererStatus::Holder { .. }
+                | ZoneAnswererStatus::Registered { .. }
+                | ZoneAnswererStatus::ManagerHeld { .. }
+        );
         *self
             .0
             .status
             .lock()
             .expect("the answerer status lock is never held across a panic") = status;
+        if acknowledged {
+            self.settle();
+        }
+    }
+
+    /// Lets the status read report the state the loop last wrote, before
+    /// any publish was acknowledged: the acquisition gave up on its first
+    /// publish past its bound, so the state it wrote is a verdict.
+    pub(crate) fn settle(&self) {
+        self.0.settled.store(true, Ordering::SeqCst);
+    }
+
+    /// Marks the start of the acquisition's first publish.
+    fn begin_acquiring(&self) {
+        *self
+            .0
+            .acquiring_since
+            .lock()
+            .expect("the answerer status lock is never held across a panic") = Some(Instant::now());
+    }
+
+    /// Settles the status when the first publish has been in flight for
+    /// [`HOLDER_CHANNEL_WAIT`] or longer: an error surfaced inside the bound
+    /// can still be a channel that is starting, an error past it is a
+    /// verdict.
+    fn settle_past_bound(&self) {
+        let since = *self
+            .0
+            .acquiring_since
+            .lock()
+            .expect("the answerer status lock is never held across a panic");
+        if since.is_none_or(|since| since.elapsed() >= HOLDER_CHANNEL_WAIT) {
+            self.settle();
+        }
+    }
+
+    /// The state the control socket's status read reports: `starting` until
+    /// the node's first publish is acknowledged or the acquisition gives up
+    /// on it, then the state the loop last wrote. An activation that reads
+    /// it while the node's registration is still in flight is told nothing,
+    /// never a failure.
+    #[must_use]
+    pub fn reported(&self) -> ZoneAnswererStatus {
+        if self.0.settled.load(Ordering::SeqCst) {
+            self.get()
+        } else {
+            ZoneAnswererStatus::Starting
+        }
     }
 
     /// Marks whether this daemon hosts the interim (or is inside a release
@@ -2729,6 +2934,17 @@ impl AnswererStatus {
     /// The reason no address was handed out: no answerer reachable, the
     /// range exhausted, or no answer in time.
     pub fn allocate(&self, name: &str) -> Result<Ipv4Addr, String> {
+        self.allocate_keeping(name, None)
+    }
+
+    /// [`Self::allocate`] for a resumed box created at `keep`: the answerer
+    /// hands `keep` back while no other box holds it, even where the host
+    /// cannot bind the box range now, so a resume never moves the box.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::allocate`].
+    pub fn allocate_keeping(&self, name: &str, keep: Option<Ipv4Addr>) -> Result<Ipv4Addr, String> {
         let Some(sender) = self.sender() else {
             return Err(NO_ANSWERER.to_string());
         };
@@ -2736,6 +2952,7 @@ impl AnswererStatus {
         if sender
             .send(HandoverCommand::Allocate {
                 name: name.to_string(),
+                keep,
                 reply: reply_to,
             })
             .is_err()
@@ -2790,8 +3007,26 @@ impl AnswererStatus {
     #[must_use]
     pub fn allocating_for_tests_with(
         node: &str,
+        hold_reply: impl FnMut() -> Option<std::sync::mpsc::Receiver<()>> + Send + 'static,
+        on_release: impl FnMut(&str, Option<Ipv4Addr>) + Send + 'static,
+    ) -> Self {
+        Self::allocating_for_tests_probed(node, hold_reply, on_release, || RangeProbe {
+            bound: 1,
+            probed: 1,
+            first_failure: None,
+        })
+    }
+
+    /// [`Self::allocating_for_tests_with`] whose book reads the box range
+    /// with `range_probe` before each fresh address, so a test can stand in
+    /// for a host that lacks the range aliases, or gains them mid-test.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn allocating_for_tests_probed(
+        node: &str,
         mut hold_reply: impl FnMut() -> Option<std::sync::mpsc::Receiver<()>> + Send + 'static,
         mut on_release: impl FnMut(&str, Option<Ipv4Addr>) + Send + 'static,
+        mut range_probe: impl FnMut() -> RangeProbe + Send + 'static,
     ) -> Self {
         let status = Self::starting();
         let commands = status.attach_commands();
@@ -2800,8 +3035,14 @@ impl AnswererStatus {
             let mut book = AddressBook::default();
             while let Ok(command) = commands.recv() {
                 match command {
-                    HandoverCommand::Allocate { name, reply } => {
-                        let answer = book.allocate(&node, &box_zone_name(&name));
+                    HandoverCommand::Allocate { name, keep, reply } => {
+                        let answer = book.allocate_keeping_at(
+                            &node,
+                            &box_zone_name(&name),
+                            keep,
+                            Instant::now(),
+                            &mut range_probe,
+                        );
                         match hold_reply() {
                             Some(gate) => {
                                 std::thread::spawn(move || {
@@ -2927,6 +3168,26 @@ fn acquire_loop_at(registry: BoxRegistry, port: u16, channel: PathBuf, status: A
     acquire(registry, port, &paths, crate::state::vm_name(), &status);
 }
 
+/// [`acquire_loop_at`] as the node `node`, for the tests that run two
+/// nodes at once and must tell them apart.
+#[cfg(test)]
+fn acquire_loop_as(
+    registry: BoxRegistry,
+    port: u16,
+    channel: PathBuf,
+    node: &str,
+    status: AnswererStatus,
+) {
+    private_test_dir(&channel);
+    let paths = ChannelPaths {
+        global: channel.with_file_name("no-global-channel.sock"),
+        marker: channel.with_file_name("no-install-marker"),
+        interim: channel,
+        release_window: RELEASE_WINDOW,
+    };
+    acquire(registry, port, &paths, node, &status);
+}
+
 /// What woke the acquisition's wait ([`wait_for_wake`]): a table change (a
 /// row that must be re-published), the held connection's end (the
 /// answerer's side went), or the cadence bound.
@@ -3024,7 +3285,8 @@ fn wait_out_wake(
 /// connection survived.
 fn serve_over_channel(registration: &mut Registration, command: HandoverCommand) -> bool {
     match command {
-        HandoverCommand::Allocate { name, reply } => match registration.allocate(&name) {
+        HandoverCommand::Allocate { name, keep, reply } => match registration.allocate(&name, keep)
+        {
             Ok(result) => {
                 let _ = reply.send(result);
                 true
@@ -3051,6 +3313,7 @@ fn serve_over_channel(registration: &mut Registration, command: HandoverCommand)
 /// unrelated later failure warns on its own.
 fn surface_error(status: &AnswererStatus, port: u16, erroring: &mut bool, why: &str) {
     status.set(ZoneAnswererStatus::PortHeldNoChannel { port });
+    status.settle_past_bound();
     if *erroring {
         tracing::debug!(
             component = COMPONENT,
@@ -3118,6 +3381,7 @@ fn acquire(
     // the window before the answerer is decided.
     let mut pings = registry.subscribe_table_pings();
     let commands = status.attach_commands();
+    status.begin_acquiring();
     let mut held: Option<Registration> = None;
     // The once-only start info line: the first publish that lands says
     // which answerer the rows went to, whatever the passes before it
@@ -3289,20 +3553,144 @@ fn acquire(
             // interim channel), so nothing here can answer or allocate. A
             // loud error naming the port, the holder and the remedy — every
             // box registration fails with it until the port frees.
+            //
+            // Unless the holder is a node that started beside this one and
+            // won the port's bind: it binds its interim channel right
+            // after the port, so wait a bounded window for that channel
+            // and register into it (minimal#2629) before naming the port
+            // as held with no channel.
             Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
-                let why = channelless_holder_error(port, hook_port_holder(port));
-                surface_error(status, port, &mut erroring, &why);
-                wait_refusing(&pings, &commands, PORT_RECHECK, &why);
+                match await_holder_channel(
+                    &registry,
+                    &paths.interim,
+                    node,
+                    &mut pings,
+                    &commands,
+                    HOLDER_CHANNEL_WAIT,
+                ) {
+                    Ok((published, queued)) => {
+                        retry = CHANNEL_RETRY;
+                        erroring = false;
+                        held_status = registered_status(&published.holder, port);
+                        status.set(held_status.clone());
+                        warn_refused(node, published.refused);
+                        if !published_once {
+                            published_once = true;
+                            announce_publish(&published.holder, port, &paths.interim, node);
+                        }
+                        let mut registration = published.registration;
+                        let mut alive = true;
+                        for command in queued {
+                            if alive {
+                                alive = serve_over_channel(&mut registration, command);
+                            } else {
+                                refuse_command(command, NO_ANSWERER);
+                            }
+                        }
+                        if !alive {
+                            surface_error(
+                                status,
+                                port,
+                                &mut erroring,
+                                "the answerer channel failed while serving a box address \
+                                 request",
+                            );
+                            continue;
+                        }
+                        held = wait_out_wake(
+                            &mut pings,
+                            &commands,
+                            registration,
+                            status,
+                            port,
+                            &mut erroring,
+                        );
+                    }
+                    Err((queued, last)) => {
+                        let why = channelless_holder_error(port, hook_port_holder(port));
+                        for command in queued {
+                            refuse_command(command, &why);
+                        }
+                        // The node gave up on the holder's channel: the
+                        // state below is a verdict, not a registration in
+                        // flight.
+                        status.settle();
+                        surface_error(
+                            status,
+                            port,
+                            &mut erroring,
+                            &format!(
+                                "{why} (waited {} s for an answerer channel at {} beside the \
+                                 port; last attempt: {last})",
+                                HOLDER_CHANNEL_WAIT.as_secs(),
+                                paths.interim.display()
+                            ),
+                        );
+                        wait_refusing(&pings, &commands, PORT_RECHECK, &why);
+                    }
+                }
             }
             Err(error) => {
                 let why = format!(
                     "could not listen on 127.0.0.1:{port}, which box names are answered on: \
                      {error}; free the port, then try again"
                 );
+                status.settle();
                 surface_error(status, port, &mut erroring, &why);
                 wait_refusing(&pings, &commands, PORT_RECHECK, &why);
             }
         }
+    }
+}
+
+/// Waits up to `bound` for the interim channel of the node that holds the
+/// answerer port, and publishes this table into it once it answers. The
+/// node that won the port's bind binds that channel right after it, so a
+/// node that lost the bind to a node starting beside it registers here
+/// instead of naming the port as held with no channel.
+///
+/// Box address requests that arrive inside the window are queued, never
+/// refused: they are returned with the publish, for the caller to serve
+/// over the new connection, or with the last attempt's error when the
+/// window runs out. A handover request is a no-op here, since this node
+/// hosts nothing.
+fn await_holder_channel(
+    registry: &BoxRegistry,
+    channel: &Path,
+    node: &str,
+    pings: &mut std::sync::mpsc::Receiver<()>,
+    commands: &std::sync::mpsc::Receiver<HandoverCommand>,
+    bound: Duration,
+) -> Result<(Published, Vec<HandoverCommand>), (Vec<HandoverCommand>, io::Error)> {
+    let deadline = Instant::now() + bound;
+    let mut queued = Vec::new();
+    loop {
+        while let Ok(command) = commands.try_recv() {
+            match command {
+                command @ (HandoverCommand::Allocate { .. }
+                | HandoverCommand::ReleaseAddress { .. }) => queued.push(command),
+                other => refuse_command(other, NO_ANSWERER),
+            }
+        }
+        // The publish carries the whole table as it stands now, so a
+        // change pinged before it is in it.
+        while pings.try_recv().is_ok() {}
+        let error = match connect_and_publish(channel, node, zone_rows(registry)) {
+            Ok(published) => return Ok((published, queued)),
+            Err(error) => error,
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err((queued, error));
+        }
+        tracing::debug!(
+            component = COMPONENT,
+            node = %node,
+            channel = %channel.display(),
+            %error,
+            "the answerer port is held and the holder's channel did not answer yet; waiting"
+        );
+        std::thread::sleep(remaining.min(CHANNEL_RETRY));
     }
 }
 
@@ -3380,6 +3768,7 @@ fn host_interim(
             component = COMPONENT,
             listener = %addr,
             port,
+            node = %node,
             channel = %paths.interim.display(),
             status = "serving",
             "no answerer service is installed and no interim channel answers; this \
@@ -3448,8 +3837,8 @@ fn host_interim(
                 }
                 // The interim is the answerer: its own boxes are handed
                 // addresses from the same book its channel's nodes are.
-                Ok(HandoverCommand::Allocate { name, reply }) => {
-                    let _ = reply.send(registered.allocate(node, &box_zone_name(&name)));
+                Ok(HandoverCommand::Allocate { name, keep, reply }) => {
+                    let _ = reply.send(registered.allocate(node, &box_zone_name(&name), keep));
                 }
                 Ok(HandoverCommand::ReleaseAddress { name }) => {
                     registered.release_address(node, &box_zone_name(&name));
@@ -4589,12 +4978,12 @@ mod tests {
         let registered = RegisteredTables::new();
         registered.claim_own("a-node", &rows);
         assert_eq!(
-            registered.allocate("a-node", &box_zone_name("web")),
+            registered.allocate("a-node", &box_zone_name("web"), None),
             Ok(web.loopback_addr()),
             "the dormant creation's address is claimed for its own name"
         );
         let peer = registered
-            .allocate("a-node", &box_zone_name("peer"))
+            .allocate("a-node", &box_zone_name("peer"), None)
             .expect("a fresh name draws an address");
         assert_ne!(peer, web.loopback_addr());
     }
@@ -4687,6 +5076,124 @@ mod tests {
             .map(|(_, row)| row.address)
             .collect();
         assert_eq!(held, vec![Some(live)], "the zone answers the live box");
+    }
+
+    // NET-027 (minimal#2629): a second VM host daemon that finds the
+    // answerer port held waits for the holder's channel and registers into
+    // it, and two daemons that start together end with exactly one holder.
+    #[test]
+    fn second_vm_registers_into_the_running_holder() {
+        // ── the race, held open: the port is bound and the holder's channel
+        // is not yet, the window a losing node used to read as a port held
+        // with no channel.
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
+        let channel = dir.path().join(CHANNEL_SOCK_FILE);
+        let hold = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("the hold binds loopback");
+        let port = hold.local_addr().expect("the hold names its port").port();
+        let (registry, web) = web_registry();
+        let status = AnswererStatus::starting();
+        let probe = status.clone();
+        let node_channel = channel.clone();
+        std::thread::Builder::new()
+            .name("test-zone-late-channel".to_string())
+            .spawn(move || acquire_loop_as(registry, port, node_channel, "vm-second", status))
+            .expect("the node's thread spawns");
+        let channel_at = Instant::now() + HOLDER_CHANNEL_WAIT / 3;
+        while Instant::now() < channel_at {
+            assert_eq!(
+                probe.get(),
+                ZoneAnswererStatus::Starting,
+                "a node waiting on the holder's channel names no failure"
+            );
+            assert_eq!(probe.reported(), ZoneAnswererStatus::Starting);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let tables = Arc::new(RegisteredTables::new());
+        hold_channel(
+            &channel,
+            Arc::clone(&tables),
+            None,
+            // SAFETY: geteuid only reads the process's own uid.
+            unsafe { libc::geteuid() },
+        )
+        .expect("the holder's channel binds beside the port");
+        assert_eq!(
+            await_status(|| probe.reported(), "the node never registered"),
+            ZoneAnswererStatus::Registered { port },
+            "the node registers into the holder's channel once it answers"
+        );
+        let rows: Vec<_> = tables.rows().into_iter().map(|(_, row)| row).collect();
+        assert!(
+            rows.iter()
+                .any(|row| row.name == "web.min.internal" && row.address == Some(web)),
+            "the node's box rows are held by the holder: {rows:?}"
+        );
+        drop(hold);
+
+        // ── two daemons started together: exactly one holds the port, the
+        // other registers into it, and both daemons' box names answer.
+        for round in 0..3 {
+            let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
+            let channel = dir.path().join(CHANNEL_SOCK_FILE);
+            let free = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("the probe binds");
+            let port = free.local_addr().expect("the probe names its port").port();
+            drop(free);
+            let (first, first_web) = web_registry();
+            let second = BoxRegistry::new(SUBNET);
+            second.register_node_namespace(7654);
+            let second_web = Ipv4Addr::new(127, 0, 64, 11);
+            second.register(BoxRegistration::new(
+                "peer",
+                Ipv4Addr::new(100, 64, 0, 11),
+                second_web,
+            ));
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let mut probes = Vec::new();
+            for (node, registry) in [("vm-default", first), ("vm-named", second)] {
+                let status = AnswererStatus::starting();
+                probes.push(status.clone());
+                let start = Arc::clone(&start);
+                let channel = channel.clone();
+                std::thread::Builder::new()
+                    .name(format!("test-zone-{node}"))
+                    .spawn(move || {
+                        start.wait();
+                        acquire_loop_as(registry, port, channel, node, status);
+                    })
+                    .expect("the node's thread spawns");
+            }
+            let states: Vec<_> = probes
+                .iter()
+                .map(|probe| await_status(|| probe.reported(), "a node never settled"))
+                .collect();
+            let holders = states
+                .iter()
+                .filter(|state| **state == ZoneAnswererStatus::Holder { port })
+                .count();
+            let registered = states
+                .iter()
+                .filter(|state| **state == ZoneAnswererStatus::Registered { port })
+                .count();
+            assert_eq!(
+                (holders, registered),
+                (1, 1),
+                "round {round}: exactly one node holds the port and the other registers: \
+                 {states:?}"
+            );
+            for (name, address) in [
+                ("web.min.internal.", first_web),
+                ("peer.min.internal.", second_web),
+            ] {
+                let reply = await_answer(
+                    || {
+                        query(port, name, RecordType::A)
+                            .filter(|reply| reply.metadata.response_code == ResponseCode::NoError)
+                    },
+                    "a node's box name never answered",
+                );
+                assert_eq!(a_answer(&reply), address, "round {round}: {name}");
+            }
+        }
     }
 
     /// A port held by a process with no channel — a native minimald, a
@@ -5949,8 +6456,12 @@ mod tests {
         );
         let t0 = Instant::now();
         let mut book = AddressBook::default();
-        let a = book.allocate_at("node-a", "a", t0).expect(".2");
-        let b = book.allocate_at("node-a", "b", t0).expect(".3");
+        let a = book
+            .allocate_at("node-a", "a", t0, range_present)
+            .expect(".2");
+        let b = book
+            .allocate_at("node-a", "b", t0, range_present)
+            .expect(".3");
         assert_eq!(
             (a, b),
             (Ipv4Addr::new(127, 0, 64, 2), Ipv4Addr::new(127, 0, 64, 3))
@@ -5960,7 +6471,7 @@ mod tests {
         assert_eq!(book.release_at("node-a", "a", t0), Some(a));
         let inside = (t0 + ttl).checked_sub(Duration::from_millis(1)).unwrap();
         let c = book
-            .allocate_at("node-b", "c", inside)
+            .allocate_at("node-b", "c", inside, range_present)
             .expect("a fresh address");
         assert_eq!(
             c,
@@ -5980,12 +6491,12 @@ mod tests {
         );
         let after_a = t0 + ttl;
         assert_eq!(
-            book.allocate_at("node-b", "d", after_a),
+            book.allocate_at("node-b", "d", after_a, range_present),
             Ok(a),
             "the lowest address whose quarantine has passed"
         );
         let e = book
-            .allocate_at("node-b", "e", after_a)
+            .allocate_at("node-b", "e", after_a, range_present)
             .expect("the next fresh one");
         assert_eq!(
             e,
@@ -5996,7 +6507,7 @@ mod tests {
         // The box that held a quarantined address may take it back.
         assert_eq!(book.release_at("node-a", "b", after_a), Some(b));
         assert_eq!(
-            book.allocate_at("node-a", "b", after_a),
+            book.allocate_at("node-a", "b", after_a, range_present),
             Ok(b),
             "a box re-registered gets its own address back"
         );
@@ -6006,22 +6517,223 @@ mod tests {
         let mut full = AddressBook::default();
         let (first, last) = switch::box_loopback_interior();
         for (index, _) in (u32::from(first)..=u32::from(last)).enumerate() {
-            full.allocate_at("node-a", &format!("box{index}"), t0)
+            full.allocate_at("node-a", &format!("box{index}"), t0, range_present)
                 .expect("the range holds it");
         }
         let freed = full.release_at("node-a", "box0", t0).expect("box0 held .2");
         let refused = full
-            .allocate_at("node-b", "late", t0 + Duration::from_secs(10))
+            .allocate_at(
+                "node-b",
+                "late",
+                t0 + Duration::from_secs(10),
+                range_present,
+            )
             .expect_err("nothing is free outside the quarantine");
         assert!(
             refused.contains("released in the last 15 s") && refused.contains("frees in 5 s"),
             "the refusal names the quarantine and the wait: {refused}"
         );
         assert_eq!(
-            full.allocate_at("node-b", "late", t0 + ttl),
+            full.allocate_at("node-b", "late", t0 + ttl, range_present),
             Ok(freed),
             "once the TTL has passed the address is handed out"
         );
+    }
+
+    /// A host that cannot bind the box range is never handed a dead
+    /// address: the allocation answers the 127.0.0.1 interim instead and
+    /// records nothing, so the hand never collides with a later one and a
+    /// re-ask redraws. Driven on an injected bindability probe, no sleeps.
+    #[test]
+    fn an_unbindable_host_is_handed_the_interim_and_the_book_stays_empty() {
+        let now = Instant::now();
+        let mut book = AddressBook::default();
+        assert_eq!(
+            book.allocate_at("node-a", "web", now, range_absent),
+            Ok(Ipv4Addr::LOCALHOST),
+            "a host that cannot bind the range gets the interim"
+        );
+        assert!(
+            book.held.is_empty() && book.released.is_empty(),
+            "the interim hand records nothing"
+        );
+        for name in ["api", "db", "worker"] {
+            assert_eq!(
+                book.allocate_at("node-a", name, now, range_absent),
+                Ok(Ipv4Addr::LOCALHOST),
+                "every box of an unbindable host shares the interim"
+            );
+        }
+        assert_eq!(
+            book.allocate_at("node-a", "web", now, range_absent),
+            Ok(Ipv4Addr::LOCALHOST),
+            "the interim hand is idempotent per box"
+        );
+        assert!(
+            book.held.is_empty() && book.released.is_empty(),
+            "repeated interim hands never exhaust or quarantine"
+        );
+    }
+
+    /// The box range as a host whose `lo0` carries every alias reads it.
+    fn range_present() -> RangeProbe {
+        switch::loopback::probe_over(switch::loopback::range_hosts(), |_| Ok(()))
+    }
+
+    /// The box range as a host whose `lo0` carries none of the aliases (a
+    /// stock macOS before `min finalize-install`) reads it.
+    fn range_absent() -> RangeProbe {
+        switch::loopback::probe_over(switch::loopback::range_hosts(), |_| {
+            Err(io::ErrorKind::AddrNotAvailable.into())
+        })
+    }
+
+    /// The interim hand is only a stand-in for a box created while the
+    /// host lacks the range: once the host binds the range again (the
+    /// aliases have arrived) a NEW box gets a range address. The box created
+    /// at the interim keeps 127.0.0.1: its resume never asks the book
+    /// (`control::resume_reply`, proved by
+    /// `control::tests::an_interim_box_keeps_the_interim_across_a_resume`).
+    #[test]
+    fn a_host_that_becomes_bindable_hands_out_range_addresses_again() {
+        let now = Instant::now();
+        let mut book = AddressBook::default();
+        assert_eq!(
+            book.allocate_at("node-a", "web", now, range_absent),
+            Ok(Ipv4Addr::LOCALHOST),
+            "before the aliases arrive the interim stands in"
+        );
+        let api = book
+            .allocate_at("node-a", "api", now, range_present)
+            .expect("the range answers once the host binds it");
+        assert!(
+            in_box_range(api),
+            "a new box gets an address out of the range: {api}"
+        );
+        assert_eq!(
+            book.allocate_at("node-a", "api", now, range_absent),
+            Ok(api),
+            "a re-ask hands back the recorded address"
+        );
+    }
+
+    /// The probe's verdict is whole-range (`switch::loopback`): a host
+    /// that carries only some of the aliases reads absent and hands the
+    /// interim, even when the address the book would pick is one it carries,
+    /// consistent with `min list` advising `min finalize-install`.
+    #[test]
+    fn a_partial_alias_set_is_handed_the_interim() {
+        let mut book = AddressBook::default();
+        let partial = || {
+            switch::loopback::probe_over(switch::loopback::range_hosts(), |address| {
+                if address.octets()[3] < 128 {
+                    Ok(())
+                } else {
+                    Err(io::ErrorKind::AddrNotAvailable.into())
+                }
+            })
+        };
+        assert_eq!(
+            book.allocate_at("node-a", "web", Instant::now(), partial),
+            Ok(Ipv4Addr::LOCALHOST),
+            "a partial alias set reads as absent"
+        );
+        assert!(book.held.is_empty() && book.released.is_empty());
+    }
+
+    /// A box's own address comes back without the probe: one it holds, and
+    /// one it released inside the quarantine, even when the host has since
+    /// lost the range. Its address never moves under it.
+    #[test]
+    fn a_box_gets_its_own_address_back_without_the_probe() {
+        let t0 = Instant::now();
+        let mut book = AddressBook::default();
+        let web = book
+            .allocate_at("node-a", "web", t0, range_present)
+            .expect("the range binds");
+        assert_eq!(
+            book.allocate_at("node-a", "web", t0, range_absent),
+            Ok(web),
+            "a held address is handed back as it stands"
+        );
+        assert_eq!(book.release_at("node-a", "web", t0), Some(web));
+        assert_eq!(
+            book.allocate_at("node-a", "web", t0, range_absent),
+            Ok(web),
+            "a quarantined own address is handed back too"
+        );
+    }
+
+    /// A resumed box asks to keep the address it was created at. A book
+    /// with no record of it, as after a restart, hands it back without the
+    /// probe and records it, even where the host lacks the range. A kept
+    /// address another box holds is not handed out: that ask is a fresh
+    /// one, and it gets the interim.
+    #[test]
+    fn a_resume_keeps_its_address_in_a_book_with_no_record_of_it() {
+        let mut book = AddressBook::default();
+        let (first, _) = switch::box_loopback_interior();
+        let kept = Ipv4Addr::from(u32::from(first) + 3);
+        assert_eq!(
+            book.allocate_keeping_at("node-a", "web", Some(kept), Instant::now(), range_absent),
+            Ok(kept),
+            "the box's own address comes back without the probe"
+        );
+        assert_eq!(
+            book.allocate_at("node-a", "web", Instant::now(), range_absent),
+            Ok(kept),
+            "and it is recorded against the box"
+        );
+        assert_eq!(
+            book.allocate_keeping_at("node-b", "api", Some(kept), Instant::now(), range_absent),
+            Ok(Ipv4Addr::LOCALHOST),
+            "an address another box holds is not kept"
+        );
+        assert_eq!(
+            book.allocate_keeping_at(
+                "node-a",
+                "db",
+                Some(Ipv4Addr::new(127, 0, 0, 9)),
+                Instant::now(),
+                range_absent
+            ),
+            Ok(Ipv4Addr::LOCALHOST),
+            "an address outside the box range is not kept"
+        );
+    }
+
+    /// A probe refused for a reason other than an absent address refuses
+    /// the allocation and names the refusal, rather than moving the box to
+    /// the shared 127.0.0.1. Nothing is recorded.
+    #[test]
+    fn a_probe_error_refuses_the_allocation() {
+        let mut book = AddressBook::default();
+        let refused = book
+            .allocate_at("node-a", "web", Instant::now(), || {
+                switch::loopback::probe_over(switch::loopback::range_hosts(), |_| {
+                    Err(io::ErrorKind::PermissionDenied.into())
+                })
+            })
+            .expect_err("a probe error is not an absent range");
+        assert!(
+            refused.contains("could not check that it can listen on the box range")
+                && refused.contains("127.0.64.1 refused the bind (PermissionDenied)"),
+            "the refusal names the address the probe was refused at: {refused}"
+        );
+        assert!(book.held.is_empty() && book.released.is_empty());
+    }
+
+    /// A default book reads the range with the probe it was built with.
+    /// Under test that probe reads the range present, so the service-path
+    /// tests hand distinct range addresses on hosts without the aliases.
+    #[test]
+    fn a_default_book_allocates_through_its_own_probe() {
+        let mut book = AddressBook::default();
+        assert!(in_box_range(
+            book.allocate("node-a", "web").expect("present")
+        ));
+        book.range_probe = range_absent;
+        assert_eq!(book.allocate("node-a", "api"), Ok(Ipv4Addr::LOCALHOST));
     }
 
     /// Box addresses are host-global (design §7.1): the answerer hands
@@ -6185,7 +6897,7 @@ mod tests {
             .expect("node d connects")
             .registration;
         let d_box = leaving
-            .allocate("box")
+            .allocate("box", None)
             .expect("the channel serves node d")
             .expect("node d's box is handed an address");
         drop(leaving);
@@ -6195,7 +6907,7 @@ mod tests {
             .expect("node e connects")
             .registration;
         let e_box = arriving
-            .allocate("box")
+            .allocate("box", None)
             .expect("the channel serves node e")
             .expect("node e's box is handed an address");
         assert_ne!(

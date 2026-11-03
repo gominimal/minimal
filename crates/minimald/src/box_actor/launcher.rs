@@ -59,6 +59,7 @@ impl BoxActor {
         &mut self,
         session: BoxHandle,
         record: &Record,
+        spec: box_runtime::LaunchSpec,
         attach_env: box_runtime::AttachEnv,
         phase: LaunchPhase,
         for_hooks: bool,
@@ -156,6 +157,9 @@ impl BoxActor {
                 .to_path_buf(),
             // BEP-011: the root the record holds, for a box that gets one.
             root_certificate: box_runtime::launch_root_certificate(record),
+            // The spec the box starts from; its entrypoint is the launch's
+            // first process.
+            spec,
         })
     }
 
@@ -173,6 +177,7 @@ impl BoxActor {
         &mut self,
         _session: BoxHandle,
         record: &Record,
+        spec: box_runtime::LaunchSpec,
         _attach_env: box_runtime::AttachEnv,
         _phase: LaunchPhase,
         _for_hooks: bool,
@@ -202,7 +207,7 @@ impl BoxActor {
         // that is not host-address keeps the plain mock — its verdict is
         // decided on address leases, never on the host's cgroup tree, so
         // there is no per-box outcome for its launches to record.
-        let mut launcher = if record.network == boxes::NetworkMode::HostNet {
+        let launcher = if record.network == boxes::NetworkMode::HostNet {
             let fact = crate::box_runtime::host_ip_enforcement_fact();
             let placement = if crate::box_runtime::fact_places_a_leaf(fact.cause) {
                 minimald_rpc::HostIpEnforcement::PerBox
@@ -213,6 +218,11 @@ impl BoxActor {
         } else {
             box_runtime::MockLauncher::default()
         };
+        // The spec the actor handed over, recorded so a test can see it,
+        // and handed on: the mock starts its entrypoint as the real
+        // launcher does.
+        launch_spec_seam::observe(record.id, spec.clone());
+        let mut launcher = launcher.and_spec(spec);
         // A listen plan a test seeded ([`listen_plan_seam`]) rides the
         // mock's `Launched` the way the launch's own gathered plan rides a
         // real one — and a launch a test seeded no plan for starts no

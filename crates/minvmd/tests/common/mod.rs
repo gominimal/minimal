@@ -69,7 +69,7 @@ pub fn kill_group(child: &mut Child) {
 /// variable nor `MINVMD_E2E=1` is set).
 ///
 /// Under `MINVMD_E2E=1` the switch comes from `MINVMD_GVPROXY_BIN` when set,
-/// else from `scripts/fetch-gvproxy.sh` into a per-version cache, and in every
+/// else from `scripts/fetch-gvproxy.sh` into a per-digest cache, and in every
 /// case its SHA-256 must match `vendor/gvproxy/gvproxy.lock`. Outside E2E an
 /// unpinned `MINVMD_GVPROXY_BIN` is used as given.
 pub fn gvproxy_bin() -> Option<PathBuf> {
@@ -152,16 +152,24 @@ impl GvproxyLock {
     }
 }
 
-/// The pinned gvproxy in a per-version cache under `$RUNNER_TEMP` (else the
-/// system temp dir), fetched by `scripts/fetch-gvproxy.sh` when absent. The
-/// fetch lands in a unique temp file renamed into place, so concurrent test
-/// processes never see a partial binary.
+/// The pinned gvproxy in a cache under `$RUNNER_TEMP` (else the system temp
+/// dir), fetched by `scripts/fetch-gvproxy.sh` when absent.
 fn fetch_cached(workspace: &Path, lock: &GvproxyLock) -> PathBuf {
-    let dir = std::env::var_os("RUNNER_TEMP")
+    let root = std::env::var_os("RUNNER_TEMP")
         .filter(|v| !v.is_empty())
         .map_or_else(std::env::temp_dir, PathBuf::from)
-        .join("minimal-gvproxy")
-        .join(&lock.version);
+        .join("minimal-gvproxy");
+    fetch_cached_in(&root, workspace, lock)
+}
+
+/// [`fetch_cached`] with its cache root explicit. The cache is keyed on the
+/// asset's pinned digest, not on `version`: a patched build keeps the
+/// upstream version, so a switch cached under an earlier pin of the same
+/// version is fetched again rather than run as if it were the new pin. The
+/// fetch lands in a unique temp file renamed into place, so concurrent test
+/// processes never see a partial binary.
+pub fn fetch_cached_in(root: &Path, workspace: &Path, lock: &GvproxyLock) -> PathBuf {
+    let dir = root.join(format!("{}-{}", lock.asset, lock.sha256));
     let dest = dir.join("gvproxy");
     let executable = std::fs::metadata(&dest)
         .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)

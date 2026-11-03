@@ -240,7 +240,7 @@ pub(crate) async fn destroy_box(
             // (`host_ip`); the same destroy releases it, best-effort the same
             // way.
             let control_sock =
-                vm_host_control_sock(daemon_provider_kind(global), global.minimal_dir.as_deref());
+                vm_host_control_sock(daemon_host_kind(global), global.minimal_dir.as_deref());
             withdraw_box_row(control_sock.clone(), name, box_addresses, None).await;
             release_held_box_name(control_sock, id, name, box_addresses).await;
         }
@@ -274,7 +274,7 @@ pub(crate) async fn destroy_box(
 /// own path — best-effort guest Shutdown over the bridge socket (5 s connect
 /// deadline, so a wedged guest cannot stall this recovery), then SIGTERM to
 /// the VMM, SIGKILL after the 5 s grace, then `Stopped` — run against the
-/// provider dir the CLI resolved for *this* VM, then waited on until minvmd
+/// host dir the CLI resolved for *this* VM, then waited on until minvmd
 /// has released the VM's alive lock.
 ///
 /// The lifecycle file cannot be that wait: the stop writes `Stopped` itself,
@@ -304,14 +304,14 @@ pub(crate) async fn stop_wedged_vm_from_host(
     minimal_dir: Option<PathBuf>,
     quiesce_guest: bool,
 ) -> Result<(), anyhow::Error> {
-    let provider_dir = client::resolve_provider_dir(minimal_dir.as_deref(), true)
+    let host_dir = client::resolve_host_dir(minimal_dir.as_deref(), true)
         .context("resolving the VM's provider dir for a host-side stop")?;
 
     // The stop sleep-polls the VMM's exit and the wait polls the alive lock,
     // so both go on the blocking pool rather than stalling an async worker
     // (rust-coding-standards: no blocking in an async context).
     let outcome = tokio::task::spawn_blocking(move || {
-        let state_dir = minvmd::state::StateDir::new(provider_dir.clone())
+        let state_dir = minvmd::state::StateDir::new(host_dir.clone())
             .context("opening the VM's state dir for a host-side stop")?;
         let state = state_dir
             .effective_state()
@@ -328,7 +328,7 @@ pub(crate) async fn stop_wedged_vm_from_host(
                 stop_command()
             );
         }
-        let outcome = minvmd::cmd::stop::stop_at(provider_dir, quiesce_guest)
+        let outcome = minvmd::cmd::stop::stop_at(host_dir, quiesce_guest)
             .context("stopping the VM from the host")?;
         wait_for_alive_lock_released(&state_dir, HOST_STOP_RELEASE_WAIT)?;
         Ok(outcome)
@@ -407,7 +407,7 @@ pub(crate) fn wedged_vm_unreachable(
 ) -> anyhow::Error {
     // Same cheap state-file read as `cmd_stop`'s liveness probe; a state that
     // cannot be read leaves the `--force` hint.
-    let booting = client::resolve_provider_dir(minimal_dir, true)
+    let booting = client::resolve_host_dir(minimal_dir, true)
         .ok()
         .and_then(|dir| minvmd::state::StateDir::new(dir).ok())
         .and_then(|state_dir| state_dir.read_state().ok())

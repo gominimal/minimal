@@ -484,6 +484,14 @@ impl Env {
     /// helper), assembles the rootfs, and spawns the command
     /// channel actor.
     pub async fn build(mut ctx: Context, mut graph: Graph, args: EnvArgs) -> std::io::Result<Self> {
+        // NET-155: the leaf the launcher created for this box places every
+        // package build this env starts — the missing packages below and the
+        // in-box installs later — so the box's egress verdict decides what
+        // they reach. It replaces any leaf the context carried, because the
+        // launch's leaf is the one the box runs in now.
+        if let Some(leaf) = args.classifier_leaf.clone() {
+            ctx = ctx.with_classifier_leaf(leaf);
+        }
         // Resolve the requested package names to top-levels, then ensure the
         // helper's dependencies (`bash`, `socat`) are present.
         graph.top_levels = args
@@ -507,6 +515,23 @@ impl Env {
             .all(|bsr| cache.read_dir(&graph.spec_hash(bsr)).is_ok());
         if !all_built {
             tracing::trace!("missing local packages, building session env");
+            match ctx.classifier_leaf() {
+                Some(leaf) => tracing::info!(
+                    box_name = %args.name,
+                    leaf = %leaf.dir().display(),
+                    "starting the box's missing package builds in the box's classifier leaf",
+                ),
+                None if ctx.box_network().is_some() => tracing::info!(
+                    box_name = %args.name,
+                    "starting the box's missing package builds on the box's own network, \
+                     under the box's egress rules",
+                ),
+                None => tracing::info!(
+                    box_name = %args.name,
+                    "starting the box's missing package builds in the daemon's own cgroup, \
+                     with no per-box egress enforcement, because the box has none",
+                ),
+            }
             ctx.build_graph(&graph, false, None)
                 .await
                 .map_err(err_to_io)?;
@@ -612,6 +637,7 @@ impl Env {
         // names the leaf it entered on its launch log line. `None` on a host
         // that places no box: the config above is the whole story, exactly as
         // it was before the classifier existed.
+        let classifier_leaf = args.classifier_leaf.clone();
         let config = match args.classifier_leaf {
             Some(leaf) => config.with_classifier_leaf(leaf),
             None => config,
@@ -677,6 +703,7 @@ impl Env {
             home: args.home.clone(),
             has_packages: transitives.keys().copied().collect(),
             box_id,
+            classifier_leaf,
             session_id: args.session_id,
             ot: args.ot.clone(),
             session: args.session.clone(),
@@ -1447,6 +1474,10 @@ struct BoxChannel {
     /// in one, else the session's name — so the daemon's own fetches are
     /// recorded with the box that asked for them.
     box_id: String,
+    /// The box's classifier leaf (NET-155): the in-box patched build runs in
+    /// it, so the box's egress verdict decides what the build can reach.
+    /// `None` on a host that places no box.
+    classifier_leaf: Option<ClassifierLeaf>,
     /// The owning session's id ([`EnvArgs::with_session_id`]); `None` for
     /// an env built without one (tests).
     session_id: Option<boxes::SessionId>,
@@ -1523,6 +1554,7 @@ const CHANNEL_METHODS: &[&str] = &[
     "build",
     "materialize",
     "net-expose",
+    "net-expose-public",
 ];
 
 /// The `method` a helper request is recorded under: the text before its
@@ -1630,6 +1662,13 @@ impl BoxChannel {
                 self.expose_port(stream, port).await;
                 None
             }
+            // `<port>` or nothing: the box's own `min net expose --public
+            // [<port>]` (NET-145). No public surface exists on this host, so
+            // the request is refused and nothing is published.
+            Some(("net-expose-public", port)) => {
+                self.refuse_public_expose(stream, port);
+                None
+            }
             // A new arm above also goes in `CHANNEL_METHODS`, or its span
             // records `other`.
             _ => {
@@ -1700,6 +1739,25 @@ impl BoxChannel {
         // fetch is recorded as the daemon's own node-plane fetch, made for
         // the box that asked — so the one walk feeds both.
         let scope = install_scope(&new_graph, pkgs);
+        // NET-155: `Env::build` placed this context in the box's leaf, so
+        // the builds this install starts follow the box's egress verdict.
+        match self.ctx.classifier_leaf() {
+            Some(leaf) => tracing::info!(
+                box_name = %self.name,
+                leaf = %leaf.dir().display(),
+                "starting an in-box install's package builds in the box's classifier leaf",
+            ),
+            None if self.ctx.box_network().is_some() => tracing::info!(
+                box_name = %self.name,
+                "starting an in-box install's package builds on the box's own network, \
+                 under the box's egress rules",
+            ),
+            None => tracing::info!(
+                box_name = %self.name,
+                "starting an in-box install's package builds in the daemon's own cgroup, \
+                 with no per-box egress enforcement, because the box has none",
+            ),
+        }
         let progress = crate::sandbox_progress::SandboxProgress::new(
             self.ctx.op_tracker(),
             Some(scope.clone()),
@@ -1807,7 +1865,10 @@ impl BoxChannel {
     /// leave from (where it stands in one), the host the daemon fetches the
     /// configured remote cache from, and each package in the install's scope
     /// spelled the way `min search` spells it, with its upstream version
-    /// when the graph knows one.
+    /// when the graph knows one. It also says whether the install's web
+    /// sources are fetched in the box's classifier leaf (NET-155). Those are
+    /// the box's traffic and are not recorded. A `gs://` source, and a web
+    /// source of a box with no leaf, leave from the daemon and are recorded.
     fn fetch_record(
         &self,
         graph: &Graph,
@@ -1836,6 +1897,9 @@ impl BoxChannel {
                 &self.ctx.daemon_context().config().remote_cache_url(),
             ),
             objects,
+            // NET-155: the install's web sources are fetched in the box's
+            // leaf when it has one, so they are the box's traffic.
+            sources_placed: self.ctx.classifier_leaf().is_some(),
         }
     }
 
@@ -1937,6 +2001,10 @@ impl BoxChannel {
         let mut build_graph = graph.clone();
         build_graph.top_levels = vec![bsr];
 
+        let tapped = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        // NET-155: an own-address box has no leaf. Its build attaches to the
+        // box's own network, which the box's context carries.
+        let box_network = ctx.box_network().cloned();
         let result: std::io::Result<()> = async {
             let remote_storage = ctx.remote_storage().await.map_err(err_to_io)?;
             let remote_cache = if ctx.use_remote_cache() {
@@ -1954,12 +2022,43 @@ impl BoxChannel {
 
             let cache = ctx.local_cache();
             let (stdout_writer, stderr_writer) = StreamWriter::pair(stream)?;
+            // NET-155: the build runs in the box's own leaf, or on the own-
+            // address box's network, so the box's egress verdict decides what
+            // it can reach. A box with neither has no per-box enforcement,
+            // and its build runs in the daemon's own cgroup.
+            match &self.classifier_leaf {
+                Some(leaf) => tracing::info!(
+                    box_name = %self.name,
+                    package = %pkg_name,
+                    leaf = %leaf.dir().display(),
+                    "starting a package build for a box in the box's classifier leaf",
+                ),
+                None if box_network.is_some() => tracing::info!(
+                    box_name = %self.name,
+                    package = %pkg_name,
+                    leaf = "none",
+                    "starting a package build for a box on the box's own network, \
+                     under the box's egress rules",
+                ),
+                None => tracing::info!(
+                    box_name = %self.name,
+                    package = %pkg_name,
+                    leaf = "none",
+                    "starting a package build for a box in the daemon's own cgroup, \
+                     with no per-box egress enforcement, because the box has none",
+                ),
+            }
             let res = op::PatchedBuild {
                 spec: &bsr,
                 remote_fetcher: &remote_storage,
-                stdout_writer: Some(Box::new(stdout_writer)),
-                stderr_writer: Some(Box::new(stderr_writer)),
+                stdout_writer: Some(Box::new(LineTap::new(stdout_writer, tapped.clone()))),
+                stderr_writer: Some(Box::new(LineTap::new(stderr_writer, tapped.clone()))),
                 remote_cache: remote_cache.as_ref(),
+                classifier_leaf: self.classifier_leaf.clone(),
+                box_network: match &self.classifier_leaf {
+                    Some(_) => None,
+                    None => box_network.clone(),
+                },
             }
             .run(&op::Options {
                 cache,
@@ -1979,6 +2078,20 @@ impl BoxChannel {
         .await;
 
         if let Err(e) = result {
+            // NET-155: a build the box's rules refused names the destination
+            // and the box before the build's own error.
+            let lines = tapped
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(refusal) = patched_build_refusal(
+                build_denies_all(self.classifier_leaf.as_ref(), box_network.as_ref()),
+                pkg_name,
+                &self.name,
+                &e.to_string(),
+                lines.iter().map(String::as_str),
+            ) {
+                let _ = writeln!(stream, "error: {refusal}");
+            }
             let _ = writeln!(stream, "error: {e}");
             return;
         }
@@ -2350,9 +2463,10 @@ impl BoxChannel {
                     // and `min session rename` has moved on from it by the
                     // time a later request lands. The record's network mode
                     // decides which way forward is open. A host-address
-                    // box's port needs no exposing at all, which is the goal
-                    // met rather than an error, so it is a plain message and
-                    // the helper exits 0.
+                    // box's port needs no exposing at all, and a port the
+                    // box's own listening process has published already is
+                    // published: each is the goal met rather than an error,
+                    // so it is a plain message and the helper exits 0.
                     crate::net::policy::ExposeFailure::Refused(refusal) => {
                         let (box_name, network) = match session.record().await {
                             Ok(record) => (
@@ -2365,6 +2479,7 @@ impl BoxChannel {
                         if matches!(
                             refusal,
                             crate::net::policy::ExposeRefusal::NeedsNoExposing { .. }
+                                | crate::net::policy::ExposeRefusal::ListenPublished { .. }
                         ) {
                             format!("msg:{text}")
                         } else {
@@ -2383,6 +2498,30 @@ impl BoxChannel {
                 let _ = writeln!(stream, "{line}");
             }
         }
+    }
+
+    /// Refuses the box's `min net expose --public [<port>]` (NET-145): this
+    /// host has no public surface, so nothing is published, neither locally
+    /// nor publicly. The request is never handed to the session, so no
+    /// mapping can result from it. One info line names the box, the port as
+    /// given (empty when none was given), the outcome and the reason.
+    fn refuse_public_expose(&self, stream: &mut UnixStream, port: &str) {
+        tracing::info!(
+            name = %self.name,
+            port = %port,
+            outcome = "refused: public exposure",
+            reason = %format_args!("public exposure is not available on this host"),
+            "dynamic ingress expose"
+        );
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the reply channel is best-effort: a peer may be gone before the reply \
+                      lands, and there is nowhere to report that to"
+        )]
+        let _ = writeln!(
+            stream,
+            "error: public exposure is not available on this host. Nothing was published."
+        );
     }
 
     /// Writes an [`mctx::Error`] to the client as `msg:` lines (preserving its
@@ -2750,6 +2889,295 @@ impl tokio::io::AsyncWrite for StreamWriter {
     ) -> Poll<Result<(), std::io::Error>> {
         Poll::Ready(Ok(()))
     }
+}
+
+/// How many output lines of one build [`LineTap`] keeps.
+const TAPPED_LINES: usize = 64;
+
+/// The most bytes of one unfinished line [`LineTap`] holds. Past this bound
+/// it keeps only the tail, so output that never ends a line stays bounded.
+const TAPPED_LINE_BYTES: usize = 4096;
+
+/// A writer that passes every byte to `inner` and keeps the last
+/// [`TAPPED_LINES`] lines in `lines` (NET-155), so a build that fails can say
+/// what it could not reach. A `\n` or a `\r` ends a line, so a progress meter
+/// that redraws with `\r` gives lines too. The text after the last line end
+/// is kept as a line when the tap shuts down or is dropped.
+pub(crate) struct LineTap<W> {
+    inner: W,
+    buf: Vec<u8>,
+    lines: Arc<Mutex<std::collections::VecDeque<String>>>,
+}
+
+impl<W> LineTap<W> {
+    pub(crate) fn new(inner: W, lines: Arc<Mutex<std::collections::VecDeque<String>>>) -> Self {
+        Self {
+            inner,
+            buf: Vec::new(),
+            lines,
+        }
+    }
+
+    /// How many bytes of an unfinished line the tap holds.
+    #[cfg(test)]
+    pub(crate) fn pending(&self) -> usize {
+        self.buf.len()
+    }
+
+    fn keep(&self, line: &[u8]) {
+        if line.is_empty() {
+            return;
+        }
+        let line = String::from_utf8_lossy(line).into_owned();
+        let mut lines = self
+            .lines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if lines.len() == TAPPED_LINES {
+            lines.pop_front();
+        }
+        lines.push_back(line);
+    }
+
+    /// Keeps the text after the last line end as a line.
+    fn flush_line(&mut self) {
+        let rest = std::mem::take(&mut self.buf);
+        self.keep(&rest);
+    }
+}
+
+impl<W> Drop for LineTap<W> {
+    fn drop(&mut self) {
+        self.flush_line();
+    }
+}
+
+impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for LineTap<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        let this = &mut *self;
+        let written = match Pin::new(&mut this.inner).poll_write(cx, buf) {
+            Poll::Ready(Ok(n)) => n,
+            other => return other,
+        };
+        this.buf.extend_from_slice(&buf[..written]);
+        if let Some(last) = this.buf.iter().rposition(|&b| b == b'\n' || b == b'\r') {
+            let done: Vec<u8> = this.buf.drain(..=last).collect();
+            for line in done.split(|&b| b == b'\n' || b == b'\r') {
+                this.keep(line);
+            }
+        }
+        if this.buf.len() > TAPPED_LINE_BYTES {
+            let cut = this.buf.len() - TAPPED_LINE_BYTES;
+            this.buf.drain(..cut);
+        }
+        Poll::Ready(Ok(written))
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        self.flush_line();
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// The destination a failed build's output says it could not reach
+/// (NET-155), read from the last lines the build printed, newest first, so
+/// the failure that ended the build wins over an earlier tolerated one. It
+/// knows the failure lines of `curl` and `wget`, which also cover `git` over
+/// HTTPS: a host it could not resolve, or a host and port it could not
+/// connect to. It also knows the line a build writes when it could not
+/// fetch a web source it declares, and names the host the download could
+/// not connect to, or the source's host when the line names none.
+/// `None` when no line names a destination.
+pub(crate) fn refused_destination<'a>(lines: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let word = |rest: &str| -> Option<String> {
+        let host: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
+            .collect();
+        let host = host.trim_end_matches(['.', ':']);
+        (!host.is_empty()).then(|| host.to_string())
+    };
+    let lines: Vec<&str> = lines.into_iter().collect();
+    lines.into_iter().rev().find_map(|line| {
+        // A web source the build declares, fetched in the box's leaf:
+        // `could not fetch the source https://example.com/a.tar.gz: ...`
+        // Only a connection the download could not open names a
+        // destination. A bad hash or a failed extract is no refusal.
+        // The download names the host it could not connect to, which is
+        // the host a redirect sent it to. The source's own host stands in
+        // only when that text names no host.
+        if let Some(rest) = line.strip_prefix(WEB_SOURCE_FAILURE) {
+            let (_, connect) = rest.split_once(WEB_SOURCE_CONNECT_FAILURE)?;
+            return connect_host(connect).or_else(|| source_host(rest));
+        }
+        // curl: `Could not resolve host: example.com`
+        if let Some((_, rest)) = line.split_once("Could not resolve host: ") {
+            return word(rest);
+        }
+        // curl: `Failed to connect to example.com port 443 after 3 ms: ...`
+        if let Some((_, rest)) = line.split_once("Failed to connect to ") {
+            let host = word(rest)?;
+            let port = rest
+                .split_once(" port ")
+                .map(|(_, p)| {
+                    p.chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect::<String>()
+                })
+                .filter(|p| !p.is_empty());
+            return Some(match port {
+                Some(port) => format!("{host}:{port}"),
+                None => host,
+            });
+        }
+        // wget: `Resolving example.com (example.com)... failed: ...`
+        if let Some(rest) = line.strip_prefix("Resolving ")
+            && line.contains("... failed")
+        {
+            return word(rest);
+        }
+        // wget: `Connecting to example.com (example.com)|1.2.3.4|:443... failed: ...`
+        if let Some(rest) = line.strip_prefix("Connecting to ")
+            && line.contains("... failed")
+        {
+            let host = word(rest)?;
+            let port = rest
+                .rsplit_once("|:")
+                .map(|(_, p)| {
+                    p.chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect::<String>()
+                })
+                .filter(|p| !p.is_empty());
+            return Some(match port {
+                Some(port) if !host.ends_with(&format!(":{port}")) => format!("{host}:{port}"),
+                _ => host,
+            });
+        }
+        None
+    })
+}
+
+/// How the line starts that a package build writes when it could not fetch
+/// a web source it declares (NET-155). `op`'s spec build writes it, followed
+/// by the source's URL.
+const WEB_SOURCE_FAILURE: &str = "could not fetch the source ";
+
+/// What the error of a web-source fetch says when the download could not
+/// open a connection to the source. `common`'s placed download writes it,
+/// followed by the host and the port.
+const WEB_SOURCE_CONNECT_FAILURE: &str = "could not connect to ";
+
+/// The host in the `<host>:<port>: <error>` text that follows
+/// [`WEB_SOURCE_CONNECT_FAILURE`], without the port. `None` when the text
+/// names no host and port.
+fn connect_host(rest: &str) -> Option<String> {
+    let addr = rest.split_once(": ").map_or(rest, |(a, _)| a);
+    let addr = addr.split_whitespace().next()?;
+    let (host, port) = addr.rsplit_once(':')?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    (!host.is_empty() && !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()))
+        .then(|| host.to_ascii_lowercase())
+}
+
+/// The host of the URL `rest` starts with: the authority after the scheme,
+/// without a user name or a port. `None` when `rest` starts with no URL.
+fn source_host(rest: &str) -> Option<String> {
+    let (_, after) = rest.split_once("://")?;
+    let authority = after.split(['/', '?', '#', ' ']).next()?;
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, a)| a);
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split_once(']').map(|(h, _)| h)?,
+        None => authority.split(':').next()?,
+    };
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// Whether the egress rules a box's package build runs under admit no
+/// destination (NET-155): the build runs in the deny subtree of the
+/// classifier tree, or on the network of an own-address box whose rules
+/// admit nothing. A build with neither runs under no rules of the box.
+pub(crate) fn build_denies_all(
+    leaf: Option<&ClassifierLeaf>,
+    network: Option<&op::BuildNetwork>,
+) -> bool {
+    match leaf {
+        Some(leaf) => leaf.is_deny(),
+        None => network.is_some_and(op::BuildNetwork::denies_all),
+    }
+}
+
+/// The error line for an in-box patched build that the egress rules of its
+/// box refused (NET-155), or `None` when the refusal is not the rules'.
+/// `failure` is the build's own error. The error of a patched build names no
+/// package, so the refusal holds only when that error itself carries the
+/// destination [`refused_destination`] reads from `lines`. A build that
+/// tolerated a failed download and then failed for another reason is left
+/// with its own error.
+pub(crate) fn patched_build_refusal<'a>(
+    denies_all: bool,
+    package: &str,
+    box_name: &str,
+    failure: &str,
+    lines: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    let lines: Vec<&str> = lines.into_iter().collect();
+    let destination = refused_destination(lines.iter().copied())?;
+    let host = destination
+        .rsplit_once(':')
+        .filter(|(h, p)| !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        .map_or(destination.as_str(), |(h, _)| h);
+    if !failure.contains(host) {
+        return None;
+    }
+    egress_refusal(denies_all, package, box_name, lines)
+}
+
+/// The error line for a package build that the egress rules of its box
+/// refused (NET-155), or `None` when the refusal is not the rules'.
+/// `denies_all` is [`build_denies_all`]'s answer for the build. A box whose
+/// rules admit no destination is refused every one, so any destination
+/// outside the box zone that its build could not reach was refused by the
+/// box's rules. Any other box's failures are left as the build reported them.
+pub(crate) fn egress_refusal<'a>(
+    denies_all: bool,
+    package: &str,
+    box_name: &str,
+    lines: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    if !denies_all {
+        return None;
+    }
+    let destination = refused_destination(lines)?;
+    // Box-zone names are not subject to egress rules, so a failure to
+    // resolve or reach one is not a refusal by the box's rules.
+    let host = destination
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let zone_apex = boxes::core::zone_answer::ZONE_APEX;
+    if host == zone_apex || host.ends_with(&format!(".{zone_apex}")) {
+        return None;
+    }
+    Some(format!(
+        "the build of {package} could not reach {destination}: \
+         the egress rules of box {box_name} do not allow it"
+    ))
 }
 
 #[cfg(test)]
@@ -3540,6 +3968,7 @@ exit $rc
                 .unwrap(),
             has_packages: HashSet::new(),
             box_id: "a session in a test".to_string(),
+            classifier_leaf: None,
             session_id: None,
             ot: None,
             session,
@@ -3615,6 +4044,49 @@ exit $rc
             vec!["error: session is gone"],
             "a numeric port is routed to the session that owns the channel"
         );
+    }
+
+    /// NET-145: the box's `min net expose --public [<port>]` arrives as its
+    /// own request, with or without a port, and is refused with the plain
+    /// line the helper prints before it exits 1. The session is never asked,
+    /// so nothing is published: the dangling session handle here would
+    /// answer `session is gone` if it were. The info line names the box, the
+    /// port as given and the outcome.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expose_public_refused_without_public_surface() {
+        let capture = crate::test_harness::captured_log();
+        let (_state, _rootfs, _cwd, mut chan) = setup_channel();
+        for request in ["net-expose-public%3000", "net-expose-public%"] {
+            let (mut ours, theirs) = UnixStream::pair().unwrap();
+            #[expect(
+                clippy::large_futures,
+                reason = "the handle future carries the harness's whole channel; the test \
+                          awaits it to completion"
+            )]
+            chan.handle(request, &mut ours).await;
+            drop(ours);
+            assert_eq!(
+                read_lines(&theirs),
+                vec![
+                    "error: public exposure is not available on this host. Nothing was published."
+                ],
+                "{request}: the public request is refused, and the session is not asked"
+            );
+        }
+        assert_eq!(
+            super::channel_method("net-expose-public%3000"),
+            "net-expose-public"
+        );
+        let logged = capture.contents();
+        let lines: Vec<&str> = logged
+            .lines()
+            .filter(|line| {
+                line.contains("dynamic ingress expose")
+                    && line.contains("outcome=\"refused: public exposure\"")
+            })
+            .collect();
+        assert_eq!(lines.len(), 2, "one line per request, got: {logged}");
+        assert!(lines[0].contains("port=3000"), "{}", lines[0]);
     }
 
     /// NET-044's observability for the paths no session actor ever saw — the
@@ -4120,6 +4592,40 @@ exit $rc
         );
     }
 
+    /// A port the box's own listening process published already is the goal
+    /// met, not a refusal: the reply says where the port answers and that
+    /// the publication lasts while the process listens, as a plain `msg:`
+    /// line, so the helper exits 0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expose_reply_on_a_listen_published_port_is_a_plain_message() {
+        let server = crate::test_harness::TestServer::new().await;
+        let mut client = server.connect().await;
+        let manager = server.state.sessions_manager().await;
+        let listener = crate::box_actor::tests::listening_socket();
+        let port = crate::box_actor::tests::port_of(&listener);
+        let loopback = std::net::Ipv4Addr::new(127, 0, 64, 86);
+        let (handle, gate, _served) = crate::box_actor::tests::box_with_listen_plan(
+            &mut client,
+            &manager,
+            "web",
+            std::net::Ipv4Addr::new(100, 64, 128, 86),
+            loopback,
+            (port, port),
+        )
+        .await;
+        crate::box_actor::tests::soon(|| gate.admits_tcp(port)).await;
+        assert_eq!(
+            expose_reply(&handle, "web", port).await,
+            vec![format!(
+                "msg:port {port} is published already at {loopback}:{port}, because a \
+                 process in this box is listening on it. It is unpublished when that \
+                 process stops listening on it."
+            )],
+        );
+        handle.stop().await;
+        drop(listener);
+    }
+
     /// NET-043's host-side-only boundary: the dynamic ingress stance and
     /// range are create inputs, and nothing a process inside the box can
     /// send sets or widens them. The in-box expose request carries a port
@@ -4215,7 +4721,8 @@ exit $rc
         assert_eq!(
             read_lines(&theirs),
             vec![
-                "error: port 4200 is outside this box's declared dynamic range 3000-3999"
+                "error: port 4200 is outside this box's --dynamic-range 3000-3999. Nothing \
+                 was published."
                     .to_string()
             ],
             "the out-of-range request is refused with its own typed error"

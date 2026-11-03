@@ -246,6 +246,11 @@ jobs:
               # 143), and minvmd last, demanding the static libkrun the step
               # above staged so a stub build can never ship. See the script's
               # header for the full rationale and its env knobs.
+              env:
+                  # The GitHub App's client secret, compiled into `min` for the
+                  # browser sign-in; a build without it offers only the device
+                  # flow. Scoped to this step so no other step sees it.
+                  MINIMAL_GITHUB_APP_CLIENT_SECRET: ${{ secrets.MINIMAL_GITHUB_APP_CLIENT_SECRET }}
               run: scripts/dist-build.sh x86_64-unknown-linux-musl
             - name: Rename binaries with platform suffix
               # download-artifact merge-multiple flattens every artifact into one
@@ -380,6 +385,11 @@ jobs:
               # one cargo invocation per package so the fat-LTO links run one
               # at a time — recollapsing them is what got this job SIGTERMed
               # (exit 143) on the 16 GB runner.
+              env:
+                  # The GitHub App's client secret, compiled into `min` for the
+                  # browser sign-in; a build without it offers only the device
+                  # flow. Scoped to this step so no other step sees it.
+                  MINIMAL_GITHUB_APP_CLIENT_SECRET: ${{ secrets.MINIMAL_GITHUB_APP_CLIENT_SECRET }}
               run: scripts/dist-build.sh aarch64-unknown-linux-musl
             - name: Rename binaries with platform suffix
               # Platform-suffixed so download-artifact's merge-multiple basename
@@ -454,10 +464,11 @@ jobs:
         # which only the signing Mac holds; the other fleet Macs carry the base
         # labels only (docs/internal/macos-runner-setup.md).
         runs-on: [self-hosted, macOS, ARM64, minimal-signing]
-        # 60, not 45: the build takes about 15 minutes, and the notarization
-        # step below waits on Apple's notary service for three submissions
-        # (minvmd, min, and the app bundle minzoned ships in).
-        timeout-minutes: 60
+        # 75, not 45: the build takes about 15 minutes plus the bep build,
+        # and the notarization step below waits on Apple's notary service
+        # for four submissions (minvmd, min, and the app bundles bep and
+        # minzoned ship in).
+        timeout-minutes: 75
         needs: [assert-version]
         if: vars.RUN_MACOS_CI != 'false'
         env:
@@ -500,6 +511,11 @@ jobs:
               # Separate cargo invocation from minvmd above, so its default
               # `libkrun` feature can't unify into the CLI (which opts out via
               # default-features = false). Gated next.
+              env:
+                  # The GitHub App's client secret, compiled into `min` for the
+                  # browser sign-in; a build without it offers only the device
+                  # flow. Scoped to this step so no other step sees it.
+                  MINIMAL_GITHUB_APP_CLIENT_SECRET: ${{ secrets.MINIMAL_GITHUB_APP_CLIENT_SECRET }}
               run: cargo build --release --locked -p minimal --bin min
             - name: Verify minimal links only system libraries
               # The CLI calls no libkrun (it spawns minvmd as a subprocess), so
@@ -522,6 +538,16 @@ jobs:
               run: |
                   cargo build --release --locked -p minzoned --bin minzoned
                   scripts/check-zoned-links.sh target/release/minzoned
+            - name: Build release bep binary
+              # The Box Egress Proxy minvmd starts beside gvproxy at boot; it
+              # ships beside minvmd so an installed minvmd finds it (#2498).
+              # Its own invocation, like minimal and minzoned above.
+              env:
+                  # The same client secret as `min`, compiled into the proxy:
+                  # a browser-flow sign-in renews at the proxy only with it.
+                  # Scoped to this step so no other step sees it.
+                  MINIMAL_GITHUB_APP_CLIENT_SECRET: ${{ secrets.MINIMAL_GITHUB_APP_CLIENT_SECRET }}
+              run: cargo build --release --locked -p bep --bin bep
             - name: Rename binaries with platform suffix
               # download-artifact merge-multiple flattens on basename, so the uploaded
               # file must already carry the platform-suffixed name the release job expects.
@@ -549,10 +575,39 @@ jobs:
                     echo "::error::packaging/macos/Info.plist names the bundle '$bundle_id', but min verifies minzoned as '$MINIMAL_ZONED_IDENTIFIER'" >&2
                     exit 1
                   fi
+            - name: Assemble the bep app bundle
+              # bep ships inside bep.app, never as a bare file: a release bep
+              # keeps its keys in the Secure Enclave, under the keychain
+              # access group 3G47C5HY64.dev.minimal.bep (#2812). macOS grants
+              # that group only to a program signed with the
+              # keychain-access-groups entitlement, and honours the
+              # entitlement only when the bundle's embedded provisioning
+              # profile authorises it (scripts/build-bep-bundle.sh). The
+              # profile is the Developer ID profile for the App ID
+              # dev.minimal.bep, held base64 in MACOS_BEP_PROVISION_PROFILE.
+              #
+              # `build-bep-bundle.sh check-profile` checks the profile before
+              # it is used: its team, its application identifier, its
+              # keychain access groups and its expiry.
+              env:
+                  BEP_PROFILE: ${{ secrets.MACOS_BEP_PROVISION_PROFILE }}
+              run: |
+                  if [ -z "$BEP_PROFILE" ]; then
+                    echo "::error::repository secret MACOS_BEP_PROVISION_PROFILE is not set" >&2
+                    exit 1
+                  fi
+                  profile="$RUNNER_TEMP/bep.provisionprofile"
+                  # The runner persists: remove the profile however the step ends.
+                  trap 'rm -f "$profile"' EXIT
+                  printf '%s' "$BEP_PROFILE" | base64 -D >"$profile"
+                  scripts/build-bep-bundle.sh check-profile "$profile" "$MINIMAL_ZONED_TEAMID"
+
+                  scripts/build-bep-bundle.sh assemble target/release/bep "$profile" \
+                    target/release/bep.app "${MINIMAL_RELEASE_VERSION:-0.0.0}"
             - name: Codesign binaries with Developer ID
-              # Sign the two shipped Mach-O binaries and the minzoned app
+              # Sign the three shipped Mach-O binaries and the minzoned app
               # bundle with the Developer ID Application identity held in the
-              # runner's signing keychain. For the two binaries this is the
+              # runner's signing keychain. For the three binaries this is the
               # LAST mutation before upload; the bundle is stapled after it is
               # notarized, which adds a file its signature does not cover.
               # Hardened runtime (--options runtime) + a secure --timestamp so the
@@ -575,6 +630,16 @@ jobs:
                   codesign --force --timestamp --options runtime \
                     --sign "$IDENTITY" \
                     target/release/minimal-macos-arm64
+                  # bep: the keychain entitlement its Secure Enclave keys
+                  # need, which the embedded provisioning profile authorises,
+                  # and the identifier of its App ID. Signing the bundle signs
+                  # its program and seals Info.plist and the profile. No
+                  # --deep: the bundle holds one program and no nested code.
+                  codesign --force --timestamp --options runtime \
+                    --identifier dev.minimal.bep \
+                    --entitlements packaging/macos/bep/bep.entitlements \
+                    --sign "$IDENTITY" \
+                    target/release/bep.app
                   # minzoned: no entitlements at all (no hypervisor, no
                   # disable-library-validation, no dyld environment, no JIT),
                   # and an explicit identifier, the one `min` checks it by.
@@ -589,6 +654,19 @@ jobs:
 
                   codesign --verify --strict --verbose=2 target/release/minvmd-macos-arm64
                   codesign --verify --strict --verbose=2 target/release/minimal-macos-arm64
+                  codesign --verify --strict --verbose=2 \
+                    -R "=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"$MINIMAL_ZONED_TEAMID\" and identifier \"dev.minimal.bep\"" \
+                    target/release/bep.app
+                  # The signature carries the keychain access group, or the
+                  # bep it ships cannot reach its keys. Read that key itself:
+                  # the application identifier holds the same string.
+                  ents="$RUNNER_TEMP/bep.entitlements.plist"
+                  codesign -d --entitlements - --xml target/release/bep.app >"$ents"
+                  group=$(plutil -extract keychain-access-groups.0 raw -o - "$ents")
+                  if [ "$group" != "$MINIMAL_ZONED_TEAMID.dev.minimal.bep" ]; then
+                    echo "::error::bep.app is signed with keychain access group '$group', not '$MINIMAL_ZONED_TEAMID.dev.minimal.bep'" >&2
+                    exit 1
+                  fi
                   # The exact designated requirement the session advisory and
                   # the privileged step verify the answerer's bundle against.
                   codesign --verify --strict --verbose=2 \
@@ -611,7 +689,8 @@ jobs:
               # No staple for minvmd and min: the release ships each as a bare
               # Mach-O file, and stapler cannot attach a ticket to one (only to
               # an .app, a .pkg or a .dmg). Gatekeeper looks the ticket up
-              # online instead. The app bundle is stapled in the next step.
+              # online instead. The two app bundles are stapled in the steps
+              # after the uploads.
               #
               # The credentials are a notarytool keychain profile stored in the
               # signing keychain; the repository variable MACOS_NOTARY_PROFILE
@@ -632,6 +711,7 @@ jobs:
                   mkdir -p "$work"
                   for f in target/release/minvmd-macos-arm64 \
                            target/release/minimal-macos-arm64 \
+                           target/release/bep.app \
                            target/release/Minimal.app; do
                     name=$(basename "$f")
                     zip="$work/$name.zip"
@@ -670,6 +750,55 @@ jobs:
               with:
                   name: minimal-macos-arm64
                   path: target/release/minimal-macos-arm64
+                  retention-days: 7
+            - name: Staple and flatten the bep app bundle
+              # The same staple, flatten and rebuild check as the minzoned
+              # bundle below (scripts/build-bep-bundle.sh): the flat files are
+              # the names scripts/stage-release.sh installs under bin/bep.app.
+              run: |
+                  app=target/release/bep.app
+                  flat=target/release/bep-flat
+                  requirement="=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"$MINIMAL_ZONED_TEAMID\" and identifier \"dev.minimal.bep\""
+
+                  stapled=
+                  for _ in 1 2 3 4 5; do
+                    if xcrun stapler staple "$app"; then
+                      stapled=yes
+                      break
+                    fi
+                    sleep 15
+                  done
+                  if [ -z "$stapled" ]; then
+                    echo "::error::stapler could not staple the notarization ticket to $app" >&2
+                    exit 1
+                  fi
+                  xcrun stapler validate "$app"
+                  codesign --verify --strict --verbose=2 -R "$requirement" "$app"
+
+                  rm -rf "$flat"
+                  scripts/build-bep-bundle.sh flatten "$app" "$flat"
+                  ls -l "$flat"
+                  for name in bep-macos-arm64-CodeSignature bep-macos-arm64-ticket; do
+                    if [ ! -f "$flat/$name" ]; then
+                      echo "::error::the flattened bep bundle has no $name: the bundle is not signed and stapled" >&2
+                      exit 1
+                    fi
+                  done
+
+                  rebuilt="$RUNNER_TEMP/bep-rebuilt"
+                  rm -rf "$rebuilt"
+                  scripts/build-bep-bundle.sh unflatten "$flat" "$rebuilt/bep.app"
+                  codesign --verify --strict --verbose=2 -R "$requirement" "$rebuilt/bep.app"
+                  xcrun stapler validate "$rebuilt/bep.app"
+                  rm -rf "$rebuilt"
+            - name: Upload the bep app bundle's files
+              # One artifact, one flat file per bundle file, like the minzoned
+              # bundle's below.
+              uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+              with:
+                  name: bep-macos-arm64
+                  path: target/release/bep-flat/
+                  if-no-files-found: error
                   retention-days: 7
             - name: Staple and flatten the minzoned app bundle
               # Staple the notarization ticket to the bundle, so macOS can

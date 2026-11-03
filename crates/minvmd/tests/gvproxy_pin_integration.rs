@@ -38,6 +38,63 @@ fn outside_e2e_without_a_gvproxy_the_harness_skips() {
     assert_eq!(resolve_gvproxy(false, None, &workspace_root()), None);
 }
 
+/// The switch cache is keyed on the pinned digest: a binary cached under an
+/// earlier pin of the same `version` is not reused, and the new pin's switch
+/// is fetched beside it.
+#[test]
+fn a_switch_cached_under_an_earlier_pin_is_fetched_again() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let workspace = tempfile::tempdir().expect("creating a stub workspace");
+    let cache = tempfile::tempdir().expect("creating a cache root");
+    let scripts = workspace.path().join("scripts");
+    std::fs::create_dir_all(&scripts).expect("creating the stub scripts dir");
+    let script = scripts.join("fetch-gvproxy.sh");
+    // A stub fetch that writes the bytes `switch` names to its destination.
+    let stub_fetch = |switch: &str| {
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf '%s' '{switch}' > \"$1\"\nchmod +x \"$1\"\n"),
+        )
+        .expect("writing the stub fetch script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("making the stub fetch script executable");
+    };
+    let pin = |sha256: &str| common::GvproxyLock {
+        version: "v0.9.0".to_owned(),
+        asset: "gvproxy-linux-amd64",
+        sha256: sha256.to_owned(),
+    };
+
+    stub_fetch("unpatched switch");
+    let earlier = common::fetch_cached_in(cache.path(), workspace.path(), &pin("aaaa"));
+    assert_eq!(
+        std::fs::read_to_string(&earlier).expect("reading the earlier switch"),
+        "unpatched switch"
+    );
+
+    stub_fetch("patched switch");
+    let current = common::fetch_cached_in(cache.path(), workspace.path(), &pin("bbbb"));
+    assert_ne!(
+        earlier, current,
+        "a new pin of the same version gets its own cache entry"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&current).expect("reading the current switch"),
+        "patched switch",
+        "the switch cached under the earlier pin was fetched again, not reused"
+    );
+
+    // The same pin again reuses its cached switch without a fetch.
+    stub_fetch("a fetch that must not run");
+    let again = common::fetch_cached_in(cache.path(), workspace.path(), &pin("bbbb"));
+    assert_eq!(again, current);
+    assert_eq!(
+        std::fs::read_to_string(&again).expect("reading the cached switch"),
+        "patched switch"
+    );
+}
+
 /// The fetch path end to end: downloads the pinned binary (network) unless
 /// the cache already holds it, then checks its digest.
 #[test]

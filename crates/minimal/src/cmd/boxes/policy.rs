@@ -74,6 +74,42 @@ pub fn print_classifier_advisory(
     }
 }
 
+/// The words `min session policy` and `min ls` both print for a box's
+/// egress posture (T110), so the two surfaces cannot drift. A default is
+/// marked as one. A declared deny-all is not, because the box chose it. A
+/// declaration with rules of its own reads as `declared rules`, the rows
+/// `min session policy` lists under it.
+#[must_use]
+pub fn egress_posture_words(posture: minimald_rpc::EgressPosture) -> &'static str {
+    match posture {
+        minimald_rpc::EgressPosture::DenyAllDefault => "deny-all (default)",
+        minimald_rpc::EgressPosture::AllowAllDefault => "allow-all (default)",
+        minimald_rpc::EgressPosture::DenyAll => "deny-all",
+        minimald_rpc::EgressPosture::DeclaredRules => "declared rules",
+        minimald_rpc::EgressPosture::NoNetwork => "no network",
+    }
+}
+
+/// The EGRESS cell `min ls` prints for a box (T110): the posture in
+/// [`egress_posture_words`]' words, with `; per-box enforcement none`
+/// appended for a host-address box this host cannot decide per box, the
+/// fact `min session policy` prints as its `per-box enforcement` row. A
+/// posture the daemon did not report prints `-`.
+#[must_use]
+pub fn egress_posture_cell(
+    posture: Option<minimald_rpc::EgressPosture>,
+    host_ip_enforcement: Option<boxes::HostIpEnforcement>,
+) -> String {
+    let Some(posture) = posture else {
+        return "-".to_string();
+    };
+    let words = egress_posture_words(posture);
+    match host_ip_enforcement {
+        Some(boxes::HostIpEnforcement::None) => format!("{words}; per-box enforcement none"),
+        _ => words.to_string(),
+    }
+}
+
 /// Render a session's effective policy as its rules: the egress the gate
 /// enforces (NET-074/NET-075) — a declared section's dimensions each
 /// resolved to its list or its default (`allow-all`; `deny subnets` reads
@@ -154,7 +190,8 @@ pub fn format_policy(
         return Ok(());
     }
     writeln!(out, "egress")?;
-    if let Some(label) = effective.egress.summary_label() {
+    let posture = minimald_rpc::EgressPosture::of(&effective.egress, network);
+    if posture != minimald_rpc::EgressPosture::DeclaredRules {
         // A verdict by name rather than as rows: the defaults marked as
         // defaults, and the declared deny-all section unmarked — every list
         // empty would render as blankness, which reads as nothing, the one
@@ -162,8 +199,8 @@ pub fn format_policy(
         // nothing"). The mark is the difference between a verdict the box
         // chose and the one the rollout chose for it, and the JSON document
         // carries the same distinction as `source`. The label is the
-        // `boxes` crate's, shared with the TUI's detail pane.
-        writeln!(out, "  {label}")?;
+        // posture's own words, shared with `min ls` (T110).
+        writeln!(out, "  {}", egress_posture_words(posture))?;
     } else if let boxes::EffectiveEgress::Declared(egress) = &effective.egress {
         write_rules(out, "subnets", egress.allow_subnets.as_ref(), "allow-all")?;
         write_rules(
@@ -249,7 +286,7 @@ pub fn format_policy(
                 out,
                 "  {}  {}",
                 entry.category().as_str(),
-                entry.endpoints().join(", ")
+                baseline.display_endpoints(entry).join(", ")
             )?;
         }
     }
@@ -716,7 +753,7 @@ pub fn write_policy_json_noting(
                     .iter()
                     .map(|entry| PolicyBaselineEntryJson {
                         category: entry.category().as_str(),
-                        endpoints: entry.endpoints().to_vec(),
+                        endpoints: baseline.display_endpoints(entry),
                     })
                     .collect(),
             })
@@ -896,22 +933,28 @@ async fn box_policy_json_inputs(
 > {
     ensure_daemon(global)
         .map_err(|error| PolicyJsonFailure::DaemonUnreachable(format!("{error:#}")))?;
-    let mut client = connect_daemon(global)
+    let client = connect_daemon(global)
         .await
         .map_err(|error| PolicyJsonFailure::DaemonUnreachable(format!("{error:#}")))?;
 
     // The record the ingress key is gated on, resolved through the same
-    // lookup the text walk uses, with the failure kinds told apart where
-    // they can be: an RPC the daemon never answered is no daemon to ask;
-    // a lookup that answered with nothing is the not-found itself.
-    let resp = get_session_record(&mut client, box_name)
+    // lookup the text walk uses — on the VM that owns the name (NET-058) —
+    // with the failure kinds told apart where they can be: an RPC the daemon
+    // never answered is no daemon to ask; a lookup that answered with
+    // nothing, or a box on a stopped VM, is the not-found itself.
+    let example = format!("session policy {box_name} -o json");
+    let (mut client, record) = resolve_box_on_any_vm(global, client, box_name, &example)
         .await
-        .map_err(|error| match error.downcast_ref::<AmbiguousIdPrefix>() {
-            Some(ambiguous) => PolicyJsonFailure::SessionNotFound(ambiguous.to_string()),
-            None => PolicyJsonFailure::DaemonUnreachable(format!("{error:#}")),
+        .map_err(|error| {
+            if error.downcast_ref::<BoxNotFound>().is_some()
+                || error.downcast_ref::<AmbiguousIdPrefix>().is_some()
+                || error.downcast_ref::<AmbiguousBoxName>().is_some()
+            {
+                PolicyJsonFailure::SessionNotFound(error.to_string())
+            } else {
+                PolicyJsonFailure::DaemonUnreachable(format!("{error:#}"))
+            }
         })?;
-    let record = named_record(resp.record, box_name)
-        .map_err(|error| PolicyJsonFailure::SessionNotFound(error.to_string()))?;
     // By the resolved id, as the text walk does.
     let box_id = &record.id.to_string();
 
@@ -980,7 +1023,7 @@ pub(crate) async fn box_policy_as_json(
     // rendering keys it (see the comment in [`cmd_session_policy`]): the
     // backend this command actually talks to, with no fabric named for the
     // native daemon's per-daemon switch.
-    let fabric = (daemon_provider_kind(global) == paths::ProviderKind::Minvmd)
+    let fabric = (daemon_host_kind(global) == paths::HostKind::Minvmd)
         .then_some(switch::SwitchSubnet::default());
     let mut out = std::io::stdout();
     write_policy_json_noting(

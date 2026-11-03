@@ -95,9 +95,9 @@ impl Cli {
 
     /// Returns the path to the directory containing sockets/info about this daemon for clients.
     pub fn client_instance_dir(&self) -> DaemonAbsPath {
-        paths::provider_instance_dir(
+        paths::host_dir(
             &self.minimal_state_dir(),
-            paths::ProviderKind::Minimald,
+            paths::HostKind::Minimald,
             self.instance_num(),
         )
     }
@@ -125,7 +125,7 @@ impl Cli {
                         .to_string(),
                 ),
             ],
-            paths::provider_instance_name(paths::ProviderKind::Minimald, self.instance_num()),
+            paths::host_name(paths::HostKind::Minimald, self.instance_num()),
         )
     }
 
@@ -1114,7 +1114,7 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
     // Adopt any pre-split `providers/local-<N>` dir into the kind-tagged scheme
     // before resolving our own instance dir, so an upgraded daemon reuses its
     // existing state instead of orphaning it.
-    paths::migrate_legacy_provider_dirs(&cli.minimal_state_dir());
+    paths::migrate_legacy_host_dirs(&cli.minimal_state_dir());
 
     // The host-key path lives under the instance dir; ensure it exists for
     // both the UDS and vsock paths.
@@ -1129,16 +1129,15 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
     // instance's socket.
     //
     // As the microVM's pid-1 the lock lives on the /run tmpfs, not the
-    // provider dir: the provider dir sits on the persistent data volume, and
+    // host dir: the host dir sits on the persistent data volume, and
     // a lifetime-held write fd there pins the volume busy through the
     // shutdown quiesce (R2.1), leaving a dirty ext4 journal on every clean
     // stop. Nothing outside this boot reads the guest's lock (the host probes
-    // its own provider dir), so boot-ephemeral tmpfs is the honest home for
+    // its own host dir), so boot-ephemeral tmpfs is the honest home for
     // it. Keyed on being the VM init — pid-1 owns its /run — NOT on the
     // `--vsock` flag: a native (possibly non-root) `--vsock` daemon may not
-    // be able to write /run at all and keeps the provider-dir lock.
-    let instance_name =
-        paths::provider_instance_name(paths::ProviderKind::Minimald, cli.instance_num());
+    // be able to write /run at all and keeps the host-dir lock.
+    let instance_name = paths::host_name(paths::HostKind::Minimald, cli.instance_num());
     let instance_lock_path = if is_minimal_microvm() {
         DaemonAbsPath::try_new(format!("/run/minimald-{instance_name}.lock"))
             .expect("static /run lock path is absolute")
@@ -1164,7 +1163,7 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
         .set_len(0)
         .and_then(|()| writeln!(&*instance_guard, "{}", std::process::id()));
 
-    // Native minimald and minvmd now own distinct provider dirs
+    // Native minimald and minvmd now own distinct host dirs
     // (`local-minimald<N>` vs `local-minvmd<N>`), so they no longer share a
     // socket. This stays as a defensive guard for the unusual case of a minvmd
     // instance pointed at *this* dir: don't steal a live VM's ssh.sock.
@@ -1223,7 +1222,7 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
             std::env::var(EGRESS_DENY_ALL_OPT_OUT_ENV).ok().as_deref(),
         ),
         // Live: the create gate probes this process on every create
-        // (NET-141). The preflight below switches it off under
+        // (NET-143). The preflight below switches it off under
         // `MINIMALD_USERNS_GATE=off`.
         user_namespace_gate: minimald::server::UsernsGate::Live,
     };
@@ -1254,7 +1253,7 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
     // this process's own privileges and AppArmor label are what the kernel
     // will check. On a restricted host (stock Ubuntu 24.04+ with an
     // unconfined daemon) that denial otherwise surfaces only when the first
-    // attach dies writing /proc/self/uid_map. The create gate (NET-141)
+    // attach dies writing /proc/self/uid_map. The create gate (NET-143)
     // refuses every session with the cause and the remedy before allocating
     // anything, re-probing on each create so a remedy applied to the running
     // host takes effect without a restart; this start-up read only warns

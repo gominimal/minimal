@@ -242,6 +242,7 @@ impl From<orchestrator::Error> for Error {
             } // TODO: better error
             orchestrator::Error::Sandbox(e) => Self::Other(anyhow::anyhow!(e)), // TODO: better error
             orchestrator::Error::Plan(graph, e) => Self::Plan(Box::new((graph, e))),
+            e @ orchestrator::Error::DanglingCacheHit(_) => Self::Other(anyhow::anyhow!("{e}")),
         }
     }
 }

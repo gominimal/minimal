@@ -478,7 +478,9 @@ maybe_remove_finalize_install() {
         _ns_paths="$_ns_files"
         _ns_chan="$_fi_root/Library/Application Support/minimal/run/answerer.sock"
     else
-        _ns_files="/etc/systemd/system/minzoned.socket /etc/systemd/system/minzoned.service /usr/local/lib/minimal/minzoned"
+        # minzone0-link.service is the boot unit that re-creates the link at
+        # every boot. Its enable link goes with it, before the daemon-reload.
+        _ns_files="/etc/systemd/system/minzoned.socket /etc/systemd/system/minzoned.service /usr/local/lib/minimal/minzoned /etc/systemd/system/minzone0-link.service /etc/systemd/system/multi-user.target.wants/minzone0-link.service"
         _ns_paths="$_ns_files /sys/class/net/minzone0"
         _ns_chan="$_fi_root/run/minimal/answerer.sock"
     fi
@@ -818,14 +820,18 @@ do_uninstall() {
         # before the data prefix can, and the completion dirs (plus their
         # parents, which the installer may have created) are shared with other
         # tools so, like bin, they are only ever rmdir'd-if-empty. The macOS
-        # app bundle's directories (bin/Minimal.app) go innermost first, so
-        # the bin dir can empty out after them.
+        # app bundles' directories (bin/Minimal.app, bin/bep.app) go
+        # innermost first, so the bin dir can empty out after them.
         for d in "$init_dir" \
                  "$bindir/Minimal.app/Contents/MacOS" \
                  "$bindir/Minimal.app/Contents/Resources" \
                  "$bindir/Minimal.app/Contents/_CodeSignature" \
                  "$bindir/Minimal.app/Contents" \
                  "$bindir/Minimal.app" \
+                 "$bindir/bep.app/Contents/MacOS" \
+                 "$bindir/bep.app/Contents/_CodeSignature" \
+                 "$bindir/bep.app/Contents" \
+                 "$bindir/bep.app" \
                  "$(resolve_prefix data)/apparmor/tunables" \
                  "$(resolve_prefix data)/apparmor" \
                  "$bash_comp_dir" "${bash_comp_dir%/*}" \
