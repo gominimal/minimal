@@ -485,10 +485,10 @@ box that holds it returns to `running`. These terms follow the decision in
   verify:   cargo nextest run -p minimal ls_lists_boxes_on_stopped_vm
   <!-- S7a, S7b; ubiquitous; a box whose VM is stopped still exists and still holds its name and files, so leaving it out of the listing hides state the user must act on to start or destroy it -->
 
-- **NET-058** WHEN `min box attach`, `min box exec`, `min box show --network`, `min box rm` or `min net forward` names a box THE SYSTEM SHALL resolve the VM that holds the box from the box name, without a global flag.
+- **NET-058** WHEN `min session attach`, `min session exec`, `min session policy`, `min session destroy` or `min net forward` names a box THE SYSTEM SHALL resolve the VM that holds the box from the box name, without a global flag.
   tier:     T0
   verify:   cargo nextest run -p minimal box_name_resolves_vm_without_flag
-  <!-- S7b/AC1; prose 37; event-driven; the parent binds with one VM as with several, so the two refusals below bind whatever number of VMs runs; the statement names the host-side commands that take a box name, in the box CLI's spellings (BCLI); BCLI-042's aliases `min session attach`, `min session exec`, `min session policy` and `min session destroy` resolve the same way while their window lasts; `min net expose` runs inside the box and names no box; `min stop` takes no box name -->
+  <!-- S7b/AC1; prose 37; event-driven; the parent binds with one VM as with several, so the two refusals below bind whatever number of VMs runs; the statement names today's host-side commands that take a box name, which `box_name_resolves_vm_without_flag` exercises; the box CLI (BCLI) gives them successors, `min box attach`, `min box exec`, `min box show --network` and `min box rm`, and BCLI-042 keeps the old spellings as aliases for a window, so the statement moves to the `min box` forms when BCLI's tasks ship them; `min net expose` runs inside the box and names no box; `min stop` takes no box name -->
   - IF a command names a box that no VM holds THEN THE SYSTEM SHALL say that no VM holds a box of that name and name the `--vm` flag.
     tier:   T0
     verify: cargo nextest run -p minimal unknown_box_names_vm_flag
