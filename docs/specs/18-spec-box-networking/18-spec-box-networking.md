@@ -483,10 +483,10 @@ box that holds it returns to `running`. These terms follow the decision in
   verify:   cargo nextest run -p minimal ls_lists_boxes_on_stopped_vm
   <!-- S7a, S7b; ubiquitous; a box whose VM is stopped still exists and still holds its name and files, so leaving it out of the listing hides state the user must act on to start or destroy it -->
 
-- **NET-058** WHILE two VMs run, WHEN attach, exec, a task run, `min net forward` or `min net expose` names a box THE SYSTEM SHALL resolve the VM from the box name without a global flag.
+- **NET-058** WHEN attach, exec, a task run, `min net forward` or `min net expose` names a box THE SYSTEM SHALL resolve the VM that holds the box from the box name, without a global flag.
   tier:     T0
   verify:   cargo nextest run -p minimal box_name_resolves_vm_without_flag
-  <!-- S7b/AC1; prose 37; state+event; every host-side command that takes a box name: `min session attach`, `min session policy`, `min session exec`, `min session run`, `min session destroy`, `min stop`, `min net forward`; `min net expose` runs inside the box, where its VM is already known -->
+  <!-- S7b/AC1; prose 37; event-driven; the parent binds with one VM as with several, so the two refusals below bind whatever number of VMs runs; every host-side command that takes a box name: `min session attach`, `min session policy`, `min session exec`, `min session run`, `min session destroy`, `min stop`, `min net forward`; `min net expose` runs inside the box, where its VM is already known -->
   - IF a command names a box that no running VM holds THEN THE SYSTEM SHALL say that no running VM holds a box of that name and name the `--vm` flag.
     tier:   T0
     verify: cargo nextest run -p minimal unknown_box_names_vm_flag
@@ -745,7 +745,7 @@ box that holds it returns to `running`. These terms follow the decision in
   verify:   cargo nextest run -p minvmd host_alias_admits_baseline_for_node_plane_only
   <!-- S10a; design §7.1 and §5.1; state+unwanted; the node-plane baseline set (NET-130) keeps the daemon's registry and cache fetches working, and only the node-plane identity carries it; the test sends one flow to a baseline destination at the alias from the node-plane identity, admitted, and the same flow from the host-address cohort, refused (NET-156) -->
 
-- **NET-159** THE SYSTEM SHALL take the host exposures of a box host from the `[host-exposures]` table of the client's `config.toml` alone, where each entry names one exposure, its host-loopback port and its protocol.
+- **NET-159** THE SYSTEM SHALL take the host exposures of a box host from the `[host-exposures]` table of the client's `config.toml` alone, where each entry names one exposure, its host-loopback port and its protocol, and an entry that names no protocol is `tcp`.
   tier:     T0
   verify:   cargo nextest run -p minvmd host_exposures_read_from_client_config
   <!-- S10a; design v0.9.2 §7.1 (gominimal/arch#110 ruling, gominimal/arch#155): the host's half of an exposure; user or organization configuration beside `[secret-store-rules]`, `[loadout-file-rules]` and `[package-file-rules]`; one table per user per machine, because an exposure is a fact about the host's loopback that every VM and native node on the host shares; the protocol defaults to `tcp`; ubiquitous; this closes the HIGH open question this document carried on what configures a host exposure -->
@@ -754,18 +754,21 @@ box that holds it returns to `running`. These terms follow the decision in
     verify: cargo nextest run -p boxes project_host_exposures_ignored_with_warning
     <!-- S10a; design v0.9.2 §7.1 and architecture AT7: a cloned repository cannot open the host's loopback to its boxes; unwanted; `min` prints the warning when it expands the spec; the exact text goes in the task and the test that pins it -->
 
-- **NET-160** WHILE the box host is VM-backed, IF a flow from a box targets the host-gateway alias at a configured host exposure, and the box's `egress.allow_dns_hosts` does not name `host.min.internal`, and its `egress.allow_subnets` does not cover the alias THEN THE SYSTEM SHALL refuse the flow.
+- **NET-160** WHILE the box host is VM-backed or the box is an own-address box, IF a flow from a box targets the host-gateway alias at a configured host exposure, and the box's `egress.allow_dns_hosts` does not name `host.min.internal`, and its `egress.allow_subnets` does not cover the alias THEN THE SYSTEM SHALL refuse the flow.
   tier:     T0
   verify:   cargo nextest run -p minvmd host_alias_exposure_needs_the_box_to_name_the_host
-  <!-- S10a; design v0.9.2 §7.1: the box's half of an exposure, with no new key; reach needs both halves, the host's exposure (NET-159) and the box's egress rule; a box-zone name in `allow_dns_hosts` governs reach, not resolution, so the name resolves whatever the list says (NET-072); coverage of the alias by `allow_subnets` stays the fall-through, so an allow-all box reaches an exposure as it reaches a sibling box, but the documented spelling is the name; the host-address cohort decides by the union of its live boxes' rules (design §4.3 rule 2); state+unwanted -->
+  verify:   cargo nextest run -p minimald native_own_ip_host_exposure_needs_the_box_to_name_the_host
+  <!-- S10a; design v0.9.2 §7.1: the box's half of an exposure, with no new key; reach needs both halves, the host's exposure (NET-159) and the box's egress rule; a box-zone name in `allow_dns_hosts` governs reach, not resolution, so the name resolves whatever the list says (NET-072); coverage of the alias by `allow_subnets` stays the fall-through, so an allow-all box reaches an exposure as it reaches a sibling box, but the documented spelling is the name; the host-address cohort decides by the union of its live boxes' rules (design §4.3 rule 2); on a native host the rule binds an own-address box, and a native host-address box shares the host's network namespace, so the table is not applied to it and the §4.1 classifier under its own rules bounds its loopback reach (design §7.1 Lanes, NET-079); state+unwanted -->
 
-- **NET-161** WHILE the box host is VM-backed, WHEN the `[host-exposures]` table changes THE SYSTEM SHALL decide each later flow to the host-gateway alias by the changed table.
+- **NET-161** WHILE the box host is VM-backed or the box is an own-address box, WHEN the `[host-exposures]` table changes THE SYSTEM SHALL decide each later flow to the host-gateway alias by the changed table.
   tier:     T0
   verify:   cargo nextest run -p minvmd host_alias_admits_a_port_the_current_table_opens
+  verify:   cargo nextest run -p minimald native_own_ip_follows_the_current_host_exposures_table
   <!-- S10a; design v0.9.2 §7.1: the host-side creator and helper read the table as the current table for each decision, so an exposure added after a box was created is reachable at once by each box that names the host; state+event; the test adds an entry and removes it, and checks one later flow after each change -->
   - WHEN a change to the `[host-exposures]` table removes an exposure THE SYSTEM SHALL end each established flow to that exposure.
     tier:   T0
     verify: cargo nextest run -p minvmd host_exposure_removal_ends_established_flows
+    verify: cargo nextest run -p minimald native_own_ip_exposure_removal_ends_established_flows
     <!-- S10a; design v0.9.2 §7.1: a removed exposure is revoked and its established flows end, the revocation discipline of the parity bullet in the other direction; event-driven -->
 
 - **NET-162** IF an entry of the `[host-exposures]` table names a port that a Minimal listener holds, such as the box-name answerer, the hostname proxy, the node-local Box Egress Proxy or a node-plane baseline endpoint at the host-gateway alias, THEN THE SYSTEM SHALL refuse that entry when it loads the table and name the listener that holds the port.
