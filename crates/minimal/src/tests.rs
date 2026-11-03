@@ -293,6 +293,9 @@ fn every_daemon_connection_is_classified() {
             // gates the selected one.
             "cmd/mod.rs::resolve_box_on_any_vm = gated",
             "cmd/net.rs::cmd_net_forward = gated",
+            // `min net forward` on a box another VM holds: the session poll's
+            // connection to that VM, gated before the loop (NET-058).
+            "cmd/net.rs::poll_client_for = gated",
             // `min secret set` asks the egress proxy on its control socket to
             // re-certify its root (#2746). The proxy is not the daemon, and
             // the rule is already saved before the ask, so a skew can
@@ -3733,6 +3736,43 @@ async fn exec_fall_through_hands_off_the_owning_vm() {
             "{verb}: the hand-off runs over the owning VM's socket"
         );
     }
+}
+
+/// NET-058's forward half: `min net forward` on a box another VM holds polls
+/// that VM for its session, not the selected one. The selected VM does not
+/// hold the box, so a poll there closed the forward on its first tick.
+#[tokio::test]
+async fn forward_polls_owning_vm() {
+    let (state, default_vm, alpha) = two_vms().await;
+    let api = create_box_on(&default_vm, "api").await;
+    let web = create_box_on(&alpha, "web").await;
+    let (client, selected) = selected_client(state.path()).await;
+    let owning = state.path().join("providers/local-minvmd0/alpha/ssh.sock");
+
+    let mut poll = cmd::poll_client_for(client, &selected, &owning)
+        .await
+        .expect("the owning VM's daemon answers");
+    let listed = cmd::list_sessions_version_gated(&mut poll)
+        .await
+        .expect("the poll's list succeeds");
+    assert!(
+        listed.sessions.iter().any(|s| s.id == web),
+        "the poll reaches alpha, which holds 'web'"
+    );
+    assert!(
+        !listed.sessions.iter().any(|s| s.id == api),
+        "the poll does not ask the selected VM"
+    );
+
+    // A box on the selected VM keeps the selected VM's connection.
+    let (client, selected) = selected_client(state.path()).await;
+    let mut poll = cmd::poll_client_for(client, &selected, &selected)
+        .await
+        .expect("the selected VM keeps its connection");
+    let listed = cmd::list_sessions_version_gated(&mut poll)
+        .await
+        .expect("the poll's list succeeds");
+    assert!(listed.sessions.iter().any(|s| s.id == api));
 }
 
 /// The resolution path gets the same treatment as the listing: a stopped
