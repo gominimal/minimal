@@ -2921,10 +2921,12 @@ pub struct BoxRegistry {
     /// name it registered under: the collision check
     /// ([`Self::holds_box_id`]) reads it beside the rows, and the in-VM
     /// daemon's mint ask finds the id by that name
-    /// ([`Self::host_ip_id_for`]). An id stays here until the VM host
-    /// daemon restarts. The mint never draws the same UUIDv7 twice, so a
-    /// kept id never refuses a new box.
-    host_ip_ids: Arc<Mutex<BTreeMap<BoxId, String>>>,
+    /// ([`Self::host_ip_id_for`]). The name goes when the box retires or
+    /// when a later registration takes the name, so an ended box's id never
+    /// answers a new box's ask. The id itself stays until the VM host
+    /// daemon restarts, for the collision check. The mint never draws the
+    /// same UUIDv7 twice, so a kept id never refuses a new box.
+    host_ip_ids: Arc<Mutex<HostIpIds>>,
     /// The held names reloaded from [`HELD_NAMES_FILE`] that no hold has
     /// re-made since, each with when it was reloaded: dropped once
     /// [`HELD_NAME_RECONFIRM_BOUND`] has passed
@@ -3456,7 +3458,7 @@ impl BoxRegistry {
             stopped: Arc::new(RwLock::new(BTreeSet::new())),
             held_names: Arc::new(RwLock::new(BTreeMap::new())),
             host_ip_boxes: Arc::new(RwLock::new(HostIpBoxes::default())),
-            host_ip_ids: Arc::new(Mutex::new(BTreeMap::new())),
+            host_ip_ids: Arc::new(Mutex::new(HostIpIds::default())),
             unconfirmed_holds: Arc::new(Mutex::new(BTreeMap::new())),
             table_pings: Arc::new(Mutex::new(Vec::new())),
             withdrawal_reports: reports,
@@ -4607,13 +4609,17 @@ impl BoxRegistry {
             );
             return Err(AllocationError::CollidingBoxId { id });
         }
-        self.host_ip_id_set().insert(id, name.to_owned());
+        let mut ids = self.host_ip_id_set();
+        ids.ids.insert(id);
+        // A later registration under the name replaces the earlier one:
+        // the in-VM create that follows it is for the latest.
+        ids.by_name.insert(name.to_owned(), id);
         Ok(id)
     }
 
-    /// The map of minted `host_ip` box ids to their registration names
-    /// ([`Self::host_ip_ids`]).
-    fn host_ip_id_set(&self) -> MutexGuard<'_, BTreeMap<BoxId, String>> {
+    /// The minted `host_ip` box ids and the registration names that still
+    /// answer them ([`Self::host_ip_ids`]).
+    fn host_ip_id_set(&self) -> MutexGuard<'_, HostIpIds> {
         self.host_ip_ids
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -4623,22 +4629,29 @@ impl BoxRegistry {
     /// ([`Self::register_host_ip_box`]).
     #[must_use]
     pub fn holds_host_ip_id(&self, id: BoxId) -> bool {
-        self.host_ip_id_set().contains_key(&id)
+        self.host_ip_id_set().ids.contains(&id)
+    }
+
+    /// Whether a live `host_ip` registration name still answers `id`
+    /// ([`Self::host_ip_id_for`]): the box has not retired, and no later
+    /// registration took its name.
+    #[must_use]
+    pub fn host_ip_id_is_named(&self, id: BoxId) -> bool {
+        self.host_ip_id_set()
+            .by_name
+            .values()
+            .any(|named| *named == id)
     }
 
     /// The id the latest `host_ip` registration under `name` minted
     /// ([`Self::register_host_ip_box`], BEP-082), so the box's record takes
-    /// the id its grants are sealed under. A UUIDv7 sorts by its mint time,
-    /// so the greatest id under the name is the latest registration. `None`
-    /// when no `host_ip` registration used the name: a `host_ip` box with
-    /// no credentialed upstream registers nothing.
+    /// the id its grants are sealed under. `None` when no live `host_ip`
+    /// registration uses the name: a `host_ip` box with no credentialed
+    /// upstream registers nothing, and a retired box's name is withdrawn
+    /// ([`Self::retire_host_ip_box`]).
     #[must_use]
     pub fn host_ip_id_for(&self, name: &str) -> Option<BoxId> {
-        self.host_ip_id_set()
-            .iter()
-            .rev()
-            .find(|(_, registered)| registered.as_str() == name)
-            .map(|(id, _)| *id)
+        self.host_ip_id_set().by_name.get(name).copied()
     }
 
     /// [`Self::register_client_box_at`] with the freshly minted `id` it
@@ -4882,7 +4895,7 @@ impl BoxRegistry {
         if self.creations().all().any(|creation| creation.id() == id) {
             return Ok(Some(IdHolder::KeptCreation));
         }
-        if self.host_ip_id_set().contains_key(&id) {
+        if self.host_ip_id_set().ids.contains(&id) {
             return Ok(Some(IdHolder::HostIpBox));
         }
         if self
@@ -6282,6 +6295,21 @@ impl BoxRegistry {
             self.node_mirror.set_published(count > 0);
         }
         drop(resident);
+        // The box ended, so its registration name no longer answers a mint
+        // ask: a later box under the name is a new creation. The id stays
+        // for the collision check (BEP-082).
+        let id = session_id.to_bytes();
+        let mut ids = self.host_ip_id_set();
+        let named_before = ids.by_name.len();
+        ids.by_name.retain(|_, named| *named != id);
+        let name_withdrawn = ids.by_name.len() != named_before;
+        drop(ids);
+        if name_withdrawn {
+            tracing::info!(
+                session = %session_id,
+                "withdrew the host_ip box's registration name"
+            );
+        }
         if removed {
             tracing::info!(
                 session = %session_id,
@@ -7221,6 +7249,16 @@ impl HostIpBoxRules {
     pub fn resolves_names(&self) -> bool {
         !self.dns_hosts.is_empty()
     }
+}
+
+/// The ids minted for `host_ip` boxes ([`BoxRegistry::register_host_ip_box`],
+/// BEP-082). `ids` holds every id the daemon minted, for the collision
+/// check. `by_name` holds the id each live registration name answers: one
+/// entry for each name, withdrawn when the box retires.
+#[derive(Debug, Default)]
+struct HostIpIds {
+    ids: BTreeSet<BoxId>,
+    by_name: BTreeMap<String, BoxId>,
 }
 
 /// The resident `host_ip` boxes ([`BoxRegistry::admit_host_ip_box`]) and the

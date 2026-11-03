@@ -1443,8 +1443,8 @@ static CLAIMED_ROW_BOX_IDS: std::sync::Mutex<
 /// repeat ask that carries the same token: a retry of one create. `false`
 /// when another create took the id, or when the ask or the claim carries
 /// no token, because then nothing proves the two asks are one create. The
-/// map keeps only ids whose row still stands or that a `host_ip`
-/// registration minted, so it never outgrows the registry.
+/// map keeps only ids whose row still stands or that a live `host_ip`
+/// registration name answers, so it never outgrows the registry.
 fn claim_row_box_id(boxes: &BoxRegistry, box_id: minimald_rpc::BoxId, token: Option<&str>) -> bool {
     let standing: std::collections::BTreeSet<minimald_rpc::BoxId> = boxes
         .table()
@@ -1455,7 +1455,7 @@ fn claim_row_box_id(boxes: &BoxRegistry, box_id: minimald_rpc::BoxId, token: Opt
     let mut claimed = CLAIMED_ROW_BOX_IDS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    claimed.retain(|id, _| standing.contains(id) || boxes.holds_host_ip_id(id.to_bytes()));
+    claimed.retain(|id, _| standing.contains(id) || boxes.host_ip_id_is_named(id.to_bytes()));
     match claimed.entry(box_id) {
         std::collections::btree_map::Entry::Vacant(entry) => {
             entry.insert(token.map(str::to_owned));
@@ -4204,10 +4204,11 @@ mod tests {
     /// create only: a retry with the same token gets it again, and an ask
     /// with another token is refused. A name with no registration takes a
     /// fresh mint, because a `host_ip` box with no grant registers nothing.
+    /// After the box retires, its name takes a fresh mint too.
     #[test]
     fn host_ip_box_record_takes_the_registration_id() {
         let dir = tempfile::TempDir::new().expect("temp dir");
-        let (sock_path, _server, _registry, _answerer, _proxy_publish) =
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
             spawn_server(dir.path()).expect("server binds");
         let request = RegisterBoxRequest {
             host_ip: true,
@@ -4264,6 +4265,29 @@ mod tests {
                 );
             }
             other => panic!("a name with no registration takes a fresh mint, got {other:?}"),
+        }
+        // The box ends: its retire withdraws the name, so a later box under
+        // the name with no registration of its own takes a fresh id, not the
+        // ended box's claimed one.
+        let session = boxes::SessionId::from_bytes(registered.to_bytes());
+        registry.retire_host_ip_box(session);
+        assert_eq!(registry.host_ip_id_for("agent"), None);
+        assert!(
+            registry.holds_host_ip_id(registered.to_bytes()),
+            "the ended box's id stays for the collision check"
+        );
+        match ask("agent", "create-b") {
+            BoxControlReply::BoxIdMinted { minted_box_id } => {
+                assert_ne!(
+                    minted_box_id, registered,
+                    "a box after the retire is a new creation"
+                );
+                assert_eq!(
+                    AsRef::<uuid::Uuid>::as_ref(&minted_box_id).get_version_num(),
+                    7
+                );
+            }
+            other => panic!("a retired box's name takes a fresh mint, got {other:?}"),
         }
     }
 
