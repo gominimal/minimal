@@ -2917,11 +2917,14 @@ pub struct BoxRegistry {
     host_ip_boxes: Arc<RwLock<HostIpBoxes>>,
     /// The ids minted for `host_ip` boxes ([`Self::register_host_ip_box`],
     /// BEP-082), shared by every clone. A `host_ip` box has no row in the
-    /// address table, so this set is the record of its id: the collision
-    /// check ([`Self::holds_box_id`]) reads it beside the rows. An id stays
-    /// here until the VM host daemon restarts. The mint never draws the
-    /// same UUIDv7 twice, so a kept id never refuses a new box.
-    host_ip_ids: Arc<Mutex<BTreeSet<BoxId>>>,
+    /// address table, so this map is the record of its id, each with the
+    /// name it registered under: the collision check
+    /// ([`Self::holds_box_id`]) reads it beside the rows, and the in-VM
+    /// daemon's mint ask finds the id by that name
+    /// ([`Self::host_ip_id_for`]). An id stays here until the VM host
+    /// daemon restarts. The mint never draws the same UUIDv7 twice, so a
+    /// kept id never refuses a new box.
+    host_ip_ids: Arc<Mutex<BTreeMap<BoxId, String>>>,
     /// The held names reloaded from [`HELD_NAMES_FILE`] that no hold has
     /// re-made since, each with when it was reloaded: dropped once
     /// [`HELD_NAME_RECONFIRM_BOUND`] has passed
@@ -3453,7 +3456,7 @@ impl BoxRegistry {
             stopped: Arc::new(RwLock::new(BTreeSet::new())),
             held_names: Arc::new(RwLock::new(BTreeMap::new())),
             host_ip_boxes: Arc::new(RwLock::new(HostIpBoxes::default())),
-            host_ip_ids: Arc::new(Mutex::new(BTreeSet::new())),
+            host_ip_ids: Arc::new(Mutex::new(BTreeMap::new())),
             unconfirmed_holds: Arc::new(Mutex::new(BTreeMap::new())),
             table_pings: Arc::new(Mutex::new(Vec::new())),
             withdrawal_reports: reports,
@@ -4604,12 +4607,13 @@ impl BoxRegistry {
             );
             return Err(AllocationError::CollidingBoxId { id });
         }
-        self.host_ip_id_set().insert(id);
+        self.host_ip_id_set().insert(id, name.to_owned());
         Ok(id)
     }
 
-    /// The set of minted `host_ip` box ids ([`Self::host_ip_ids`]).
-    fn host_ip_id_set(&self) -> MutexGuard<'_, BTreeSet<BoxId>> {
+    /// The map of minted `host_ip` box ids to their registration names
+    /// ([`Self::host_ip_ids`]).
+    fn host_ip_id_set(&self) -> MutexGuard<'_, BTreeMap<BoxId, String>> {
         self.host_ip_ids
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -4619,7 +4623,22 @@ impl BoxRegistry {
     /// ([`Self::register_host_ip_box`]).
     #[must_use]
     pub fn holds_host_ip_id(&self, id: BoxId) -> bool {
-        self.host_ip_id_set().contains(&id)
+        self.host_ip_id_set().contains_key(&id)
+    }
+
+    /// The id the latest `host_ip` registration under `name` minted
+    /// ([`Self::register_host_ip_box`], BEP-082), so the box's record takes
+    /// the id its grants are sealed under. A UUIDv7 sorts by its mint time,
+    /// so the greatest id under the name is the latest registration. `None`
+    /// when no `host_ip` registration used the name: a `host_ip` box with
+    /// no credentialed upstream registers nothing.
+    #[must_use]
+    pub fn host_ip_id_for(&self, name: &str) -> Option<BoxId> {
+        self.host_ip_id_set()
+            .iter()
+            .rev()
+            .find(|(_, registered)| registered.as_str() == name)
+            .map(|(id, _)| *id)
     }
 
     /// [`Self::register_client_box_at`] with the freshly minted `id` it
@@ -4863,7 +4882,7 @@ impl BoxRegistry {
         if self.creations().all().any(|creation| creation.id() == id) {
             return Ok(Some(IdHolder::KeptCreation));
         }
-        if self.host_ip_id_set().contains(&id) {
+        if self.host_ip_id_set().contains_key(&id) {
             return Ok(Some(IdHolder::HostIpBox));
         }
         if self

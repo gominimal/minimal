@@ -931,6 +931,14 @@ pub struct MintBoxIdRequest {
     /// (or none) for a claimed row is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub create_token: Option<String>,
+    /// The creation name of a `host_ip` box: a box that leaves the VM from
+    /// the node's own address and has no switch address. The VM host daemon
+    /// answers with the id the box's `host_ip` registration minted under
+    /// that name, so the record and the sealed grants name one id
+    /// (BEP-082). A name with no registration takes a fresh mint. `None`
+    /// from an older in-VM daemon, and for every other box.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_ip_name: Option<String>,
 }
 
 /// A name to hold in the host's zone without a row behind it
@@ -3962,6 +3970,12 @@ mod mint_box_id_tests {
             BoxControlRequest::MintBoxId(MintBoxIdRequest {
                 switch_address: Some(std::net::Ipv4Addr::new(100, 64, 0, 7)),
                 create_token: Some("create-1".to_string()),
+                host_ip_name: None,
+            }),
+            BoxControlRequest::MintBoxId(MintBoxIdRequest {
+                switch_address: None,
+                create_token: Some("create-2".to_string()),
+                host_ip_name: Some("agent".to_string()),
             }),
         ] {
             let line = serde_json_lenient::to_string(&request).unwrap();
@@ -3975,6 +3989,14 @@ mod mint_box_id_tests {
         .unwrap();
         assert!(!bare.contains("switch_address"), "{bare}");
         assert!(!bare.contains("create_token"), "{bare}");
+        assert!(!bare.contains("host_ip_name"), "{bare}");
+        // An older in-VM daemon's ask carries no name, and decodes as none.
+        let older: BoxControlRequest =
+            serde_json_lenient::from_str(r#"{"verb":"mint_box_id","create_token":"c"}"#).unwrap();
+        let BoxControlRequest::MintBoxId(older) = older else {
+            panic!("decoded as another verb: {older:?}");
+        };
+        assert_eq!(older.host_ip_name, None);
 
         let reply = BoxControlReply::BoxIdMinted {
             minted_box_id: BoxId::mint(),

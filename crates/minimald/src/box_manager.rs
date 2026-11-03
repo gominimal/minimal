@@ -3302,8 +3302,22 @@ impl BoxManager {
         let mut config = config;
         let client_box_id = config.box_id.take();
         let switch_address = config.box_addresses.as_ref().map(|a| a.switch_address);
+        // BEP-082: a `host_ip` box has no row, and its registration minted
+        // its id under the box's name. The ask names it, so the record takes
+        // the id its grants are sealed under. A `host_ip` box with no grant
+        // registered nothing, and the VM host daemon mints a fresh id.
+        let host_ip_name = (matches!(config.network, boxes::NetworkMode::HostNet)
+            && config.box_addresses.is_none())
+        .then(|| config.name.clone())
+        .flatten();
         let control = crate::box_actor::switch_control_of(&self.net_switch).await;
-        let minted = match crate::net::listeners::mint_box_id(&control, switch_address).await {
+        let minted = match crate::net::listeners::mint_box_id(
+            &control,
+            switch_address,
+            host_ip_name.clone(),
+        )
+        .await
+        {
             None => None,
             Some(Ok(minted)) => Some(minted),
             Some(Err(error)) => {
@@ -3335,6 +3349,7 @@ impl BoxManager {
             tracing::info!(
                 box_id = %minted,
                 ?switch_address,
+                ?host_ip_name,
                 client_box_id = ?client_box_id,
                 "took the box id the VM host daemon minted; the request's box id is ignored"
             );

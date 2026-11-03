@@ -436,14 +436,19 @@ pub(crate) async fn host_row_standing(
 /// it makes one token and sends it on every attempt, so a retry of the same
 /// create after a lost or late reply gets the same id. Another create that
 /// asks for a claimed row is refused, and that create fails closed.
+/// `host_ip_name` is the creation name of a `host_ip` box, which has no
+/// row: the host answers with the id the box's registration minted under
+/// that name (BEP-082), and a fresh id when no registration used it.
 pub(crate) async fn mint_box_id(
     control: &ControlChannel,
     switch_address: Option<Ipv4Addr>,
+    host_ip_name: Option<String>,
 ) -> Option<io::Result<minimald_rpc::BoxId>> {
     let channel = box_report_channel(control)?;
     let request = minimald_rpc::BoxControlRequest::MintBoxId(minimald_rpc::MintBoxIdRequest {
         switch_address,
         create_token: Some(uuid::Uuid::new_v4().simple().to_string()),
+        host_ip_name,
     });
     let deadline = tokio::time::Instant::now() + REPORT_DEADLINE;
     let mut last = io::Error::new(io::ErrorKind::TimedOut, "the deadline passed");

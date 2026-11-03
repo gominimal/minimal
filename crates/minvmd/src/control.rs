@@ -1355,9 +1355,33 @@ fn mint_box_id_reply(
     boxes: &BoxRegistry,
     request: &minimald_rpc::MintBoxIdRequest,
 ) -> BoxControlReply {
-    let (box_id, source) = match request.switch_address {
-        None => (crate::bep_attach::mint_record_box_id(), "fresh"),
-        Some(switch_address) => {
+    let host_ip_id = request
+        .host_ip_name
+        .as_deref()
+        .filter(|_| request.switch_address.is_none())
+        .and_then(|name| boxes.host_ip_id_for(name).map(|id| (name, id)));
+    let (box_id, source) = match (request.switch_address, host_ip_id) {
+        // BEP-082: a `host_ip` box has no row. Its registration minted its
+        // id under its name, and the proxy seals its grants under that id,
+        // so the record takes it too. The id goes to one create only, as a
+        // row's id does.
+        (None, Some((name, id))) => {
+            let box_id = minimald_rpc::BoxId::from_bytes(id);
+            if !claim_row_box_id(boxes, box_id, request.create_token.as_deref()) {
+                tracing::warn!(
+                    host_ip_name = %name,
+                    %box_id,
+                    "refused a box id mint: the host_ip registration's id already went to \
+                     an in-VM create"
+                );
+                return BoxControlReply::Error {
+                    error: format!("the box registered as {name} already has a session"),
+                };
+            }
+            (box_id, "host_ip registration")
+        }
+        (None, None) => (crate::bep_attach::mint_record_box_id(), "fresh"),
+        (Some(switch_address), _) => {
             let row_id = boxes
                 .table()
                 .by_source(switch_address.octets())
@@ -1393,6 +1417,7 @@ fn mint_box_id_reply(
     tracing::info!(
         box_id = %box_id,
         switch_address = ?request.switch_address,
+        host_ip_name = ?request.host_ip_name,
         source,
         "minted the box id for an in-VM create"
     );
@@ -1408,12 +1433,13 @@ static CLAIMED_ROW_BOX_IDS: std::sync::Mutex<
     std::collections::BTreeMap<minimald_rpc::BoxId, Option<String>>,
 > = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
-/// Claims `box_id`, a row's id, for the in-VM create that `token` names.
-/// `true` for the first ask, and for a repeat ask that carries the same
-/// token: a retry of one create. `false` when another create took the id,
-/// or when the ask or the claim carries no token, because then nothing
-/// proves the two asks are one create. The map keeps only ids whose row
-/// still stands, so it never outgrows the table.
+/// Claims `box_id`, a row's id or a `host_ip` registration's id, for the
+/// in-VM create that `token` names. `true` for the first ask, and for a
+/// repeat ask that carries the same token: a retry of one create. `false`
+/// when another create took the id, or when the ask or the claim carries
+/// no token, because then nothing proves the two asks are one create. The
+/// map keeps only ids whose row still stands or that a `host_ip`
+/// registration minted, so it never outgrows the registry.
 fn claim_row_box_id(boxes: &BoxRegistry, box_id: minimald_rpc::BoxId, token: Option<&str>) -> bool {
     let standing: std::collections::BTreeSet<minimald_rpc::BoxId> = boxes
         .table()
@@ -1424,7 +1450,7 @@ fn claim_row_box_id(boxes: &BoxRegistry, box_id: minimald_rpc::BoxId, token: Opt
     let mut claimed = CLAIMED_ROW_BOX_IDS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    claimed.retain(|id, _| standing.contains(id));
+    claimed.retain(|id, _| standing.contains(id) || boxes.holds_host_ip_id(id.to_bytes()));
     match claimed.entry(box_id) {
         std::collections::btree_map::Entry::Vacant(entry) => {
             entry.insert(token.map(str::to_owned));
@@ -4152,6 +4178,72 @@ mod tests {
         assert_eq!(registry.table().rows().len(), 1);
     }
 
+    /// BEP-082: a `host_ip` box's record takes the id its registration
+    /// minted, so the record and the sealed grants name one id. The in-VM
+    /// daemon's mint ask names the box's creation name. The id goes to one
+    /// create only: a retry with the same token gets it again, and an ask
+    /// with another token is refused. A name with no registration takes a
+    /// fresh mint, because a `host_ip` box with no grant registers nothing.
+    #[test]
+    fn host_ip_box_record_takes_the_registration_id() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, _registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let request = RegisterBoxRequest {
+            host_ip: true,
+            hold: false,
+            credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
+            task_slots: minimald_rpc::TASK_SLOTS_PER_BOX,
+            ..box_request("agent")
+        };
+        let registered = match register(&sock_path, &request).expect("answered") {
+            BoxControlReply::BoxIdMinted { minted_box_id } => minted_box_id,
+            other => panic!("a host_ip registration is answered with a box id, got {other:?}"),
+        };
+        let guest = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        let ask = |name: &str, token: &str| {
+            control(
+                &guest,
+                &BoxControlRequest::MintBoxId(minimald_rpc::MintBoxIdRequest {
+                    switch_address: None,
+                    create_token: Some(token.to_owned()),
+                    host_ip_name: Some(name.to_owned()),
+                }),
+            )
+            .expect("the mint is answered")
+        };
+        let minted = BoxControlReply::BoxIdMinted {
+            minted_box_id: registered,
+        };
+        assert_eq!(
+            ask("agent", "create-a"),
+            minted,
+            "the record takes the registration's id"
+        );
+        assert_eq!(
+            ask("agent", "create-a"),
+            minted,
+            "a retry of the same create gets the same id"
+        );
+        match ask("agent", "create-b") {
+            BoxControlReply::Error { error } => assert!(
+                error.contains("the box registered as agent already has a session"),
+                "{error}"
+            ),
+            other => panic!("the registration's id goes to one create only, got {other:?}"),
+        }
+        match ask("ungranted", "create-c") {
+            BoxControlReply::BoxIdMinted { minted_box_id } => {
+                assert_ne!(minted_box_id, registered, "a name with no registration is fresh");
+                assert_eq!(
+                    AsRef::<uuid::Uuid>::as_ref(&minted_box_id).get_version_num(),
+                    7
+                );
+            }
+            other => panic!("a name with no registration takes a fresh mint, got {other:?}"),
+        }
+    }
+
     /// NET-138 over the control socket: a registration that asks for task
     /// slots is handed one task address per slot — capped at
     /// [`minimald_rpc::TASK_SLOTS_PER_BOX`] — each from the hand-out run and
@@ -5826,6 +5918,7 @@ mod tests {
                 &BoxControlRequest::MintBoxId(minimald_rpc::MintBoxIdRequest {
                     switch_address,
                     create_token: token.map(str::to_owned),
+                    host_ip_name: None,
                 }),
             )
             .expect("the mint is answered")
