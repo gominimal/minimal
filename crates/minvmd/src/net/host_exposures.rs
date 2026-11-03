@@ -194,38 +194,51 @@ impl HostExposures {
 
     /// The exposures the current table opens. The handle re-reads the file
     /// first when the recheck interval passed and the file's stat changed.
+    /// The stat and the read run outside the lock, so a slow disk stalls
+    /// only the frame that found the recheck due, never the other callers.
     #[must_use]
     pub(crate) fn current(&self) -> Arc<[HostExposure]> {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
         let Some(path) = &self.inner.path else {
-            return Arc::clone(&state.ports);
+            return Arc::clone(&self.lock().ports);
         };
-        let now = Instant::now();
-        let due = state
-            .checked
-            .is_none_or(|checked| now.duration_since(checked) >= self.inner.recheck);
-        if due {
+        let (first, known) = {
+            let mut state = self.lock();
+            let now = Instant::now();
+            let due = state
+                .checked
+                .is_none_or(|checked| now.duration_since(checked) >= self.inner.recheck);
+            if !due {
+                return Arc::clone(&state.ports);
+            }
+            // Mark the check as taken before the IO, so the callers that
+            // come in the meantime keep the current table and do not stat.
             let first = state.checked.is_none();
             state.checked = Some(now);
-            let current = stamp(path);
-            if first || current != state.stamp {
-                let ports: Arc<[HostExposure]> = read_table(path).into();
-                if first || ports != state.ports {
-                    tracing::info!(
-                        config = %path.display(),
-                        host_exposure_ports = %render(&ports),
-                        "read the host exposures for host.min.internal"
-                    );
-                }
-                state.ports = ports;
-                state.stamp = current;
-            }
+            (first, state.stamp.clone())
+        };
+        let current = stamp(path);
+        if !first && current == known {
+            return Arc::clone(&self.lock().ports);
         }
-        Arc::clone(&state.ports)
+        let ports: Arc<[HostExposure]> = read_table(path).into();
+        let mut state = self.lock();
+        if first || ports != state.ports {
+            tracing::info!(
+                config = %path.display(),
+                host_exposure_ports = %render(&ports),
+                "read the host exposures for host.min.internal"
+            );
+        }
+        state.ports = Arc::clone(&ports);
+        state.stamp = current;
+        ports
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The current table as the daemon log spells it: one `proto/port` term

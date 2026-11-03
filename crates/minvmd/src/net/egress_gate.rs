@@ -614,11 +614,12 @@ impl<'a> AliasOpenings<'a> {
         };
         let within =
             |ranges: &[(u16, u16)]| ranges.iter().any(|&(lo, hi)| lo <= port && port <= hi);
-        if within(self.baseline.alias_ports()) {
+        if protocol == baseline::ALIAS_FETCH_PROTOCOL && within(self.baseline.alias_ports()) {
             // The baseline set's ports at the alias are the node plane's
             // alone. A box row or the cohort is refused there, even when a
-            // table entry names the port (design §7.1).
-            return self.row == AliasRow::Node && protocol == baseline::ALIAS_FETCH_PROTOCOL;
+            // table entry names the port (design §7.1). Another protocol at
+            // the same port is not a baseline fetch, so the table decides it.
+            return self.row == AliasRow::Node;
         }
         if self.row != AliasRow::Node
             && host_exposures::LISTENER_PORTS
@@ -16801,6 +16802,16 @@ mod tests {
                     row,
                 }),
                 "an entry at a baseline port never opens it to the {row:?} row"
+            );
+        }
+        // A UDP entry at the baseline's TCP port is not a baseline fetch,
+        // so the table decides it like any other port.
+        let udp_exposed =
+            exposed.with_host_exposure(vec![crate::net::host_exposures::HostExposure::udp(443)]);
+        for marked in [false, true] {
+            assert!(
+                alias_verdict(&table, &udp_exposed, node, marked, 17, 443).is_ok(),
+                "a UDP exposure at a baseline TCP port is open to the node and the cohort"
             );
         }
         assert_eq!(
