@@ -352,13 +352,13 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
   - WHEN `min box attach <box> --exec <exec-id>` names a live PTY exec in the box THE SYSTEM SHALL re-attach the caller's terminal to that exec as BOX-149 defines. It SHALL resolve the exec id against the live exec ids BOX-159 returns.
     tier:   T0
     verify: cargo nextest run -p minimal box_attach_exec_reattaches_live_pty_exec
-  - IF the exec id does not name an exec in the box THEN THE SYSTEM SHALL fail with exit 4, naming the exec id.
+  - IF the exec id does not name an exec of the box, live or ended, THEN THE SYSTEM SHALL fail with exit 4, naming the exec id. This check comes first. The ended-exec refusal comes next, and the no-PTY refusal last.
     tier:   T0
     verify: cargo nextest run -p minimal box_attach_exec_unknown_id_exit4_names_id
-  - IF the exec id names an exec that did not request a PTY THEN THE SYSTEM SHALL fail with exit 2, naming `min box logs <box> --exec <exec-id>`.
+  - IF the exec id names a live exec that did not request a PTY THEN THE SYSTEM SHALL fail with exit 2, naming `min box logs <box> --exec <exec-id>`.
     tier:   T0
     verify: cargo nextest run -p minimal box_attach_exec_non_pty_exit2_names_logs
-  - IF the exec id names an exec that ended THEN THE SYSTEM SHALL fail with exit 4, naming `min box logs <box> --exec <exec-id>` and `min box wait <box> --exec <exec-id>`.
+  - IF the exec id names an exec that ended, with or without a PTY, THEN THE SYSTEM SHALL fail with exit 4, naming `min box logs <box> --exec <exec-id>` and `min box wait <box> --exec <exec-id>`.
     tier:   T0
     verify: cargo nextest run -p minimal box_attach_exec_ended_exit4_names_logs_and_wait
   - WHEN `min box attach` runs with no address THE SYSTEM SHALL attach to the current project's running box whose spec sets `pty_enabled`. Without one, it SHALL attach to the project's only retained box whose spec sets `pty_enabled`, and resume it as BCLI-007 does. The project root BOX-001 records identifies the project's boxes.
