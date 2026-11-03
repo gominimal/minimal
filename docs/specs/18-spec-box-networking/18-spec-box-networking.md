@@ -626,6 +626,16 @@ box that holds it returns to `running`. These terms follow the decision in
   verify:   cargo nextest run -p minimald box_zone_connection_enforced_at_connect
   <!-- S8c/AC3; prose 46; event-driven -->
 
+- **NET-163** WHEN a box's `egress.allow_dns_hosts` names a box-zone name THE SYSTEM SHALL admit the box's flows to the address the name answers with, under the target box's ingress rules.
+  tier:     T0
+  verify:   cargo nextest run -p minimald zone_name_in_allow_dns_hosts_admits_the_named_box
+  verify:   cargo nextest run -p minvmd zone_name_rule_admits_sibling_lease_under_its_ingress
+  <!-- S8c/AC3; design v0.9.2 §7.1 (gominimal/arch#110 ruling, 2026-10-30): a box-zone name in `allow_dns_hosts` admits the address the name answers with, for `<name>.min.internal` the sibling's lease under the sibling's ingress, as for `host.min.internal` the host-gateway alias at the exposed ports (NET-160); the entry governs reach alone, and resolution stays unconditional (NET-072); the name is the box's name as the architecture's Addressing defines it, the entry name unless `[box] name` or `--name` sets one, so two entries can name each other before either box exists; names are per host, not per project, so the rule matches the box that holds the name on the host; CIDR coverage of the plane stays the fall-through and is never the documented spelling (gominimal/inbox#586); event-driven; settles gominimal/inbox#867, #777 and #1144 on this side -->
+  - IF a box's `egress.allow_dns_hosts` names a box-zone name `<name>` and a flow from the box targets a parallel instance `<name>-<n>` that no entry of the list names THEN THE SYSTEM SHALL refuse the flow.
+    tier:   T0
+    verify: cargo nextest run -p minimald zone_name_rule_does_not_cover_a_parallel_instance
+    <!-- S8c/AC3; design v0.9.2 §7.1 and architecture Addressing (`run` and `--new` create `<name>-<n>`); exact names, never a prefix; unwanted -->
+
 - **NET-074** WHERE the deny-all default is in force and the opt-out flag is not set, WHEN a box is created with an `egress` section, or an own-address box with none, THE SYSTEM SHALL give each destination allow list the expanded section leaves absent, `allow_subnets` and `allow_dns_hosts`, no reach in that dimension, so that an own-address box with no `egress` section reaches no external address.
   tier:     T0
   verify:   cargo nextest run -p minimald own_ip_default_deny_all
@@ -748,7 +758,7 @@ box that holds it returns to `running`. These terms follow the decision in
 - **NET-159** THE SYSTEM SHALL take the host exposures of a box host from the `[host-exposures]` table of the client's `config.toml` alone, where each entry names one exposure, its host-loopback port and its protocol, and an entry that names no protocol is `tcp`.
   tier:     T0
   verify:   cargo nextest run -p minvmd host_exposures_read_from_client_config
-  <!-- S10a; design v0.9.2 §7.1 (gominimal/arch#110 ruling, gominimal/arch#155): the host's half of an exposure; user or organization configuration beside `[secret-store-rules]`, `[loadout-file-rules]` and `[package-file-rules]`; one table per user per machine, because an exposure is a fact about the host's loopback that every VM and native node on the host shares; the protocol defaults to `tcp`; ubiquitous; this closes the HIGH open question this document carried on what configures a host exposure -->
+  <!-- S10a; design v0.9.2 §7.1 (gominimal/arch#110 ruling, gominimal/arch#155): the host's half of an exposure; user or organization configuration beside `[secret-store-rules]`, `[loadout-file-rules]` and `[package-file-rules]`; one table per user per machine, because an exposure is a fact about the host's loopback that every VM and native node on the host shares; the protocol defaults to `tcp`; ubiquitous; this closes the HIGH open question this document carried on what configures a host exposure; `MINVMD_HOST_EXPOSURE_PORTS` ([#2331](https://github.com/gominimal/minimal/pull/2331)) is a temporary override, removed in the work that lands the table -->
   - IF a project `minimal.toml` carries a `[host-exposures]` section THEN THE SYSTEM SHALL ignore the section and warn that a project file cannot configure a host exposure.
     tier:   T0
     verify: cargo nextest run -p boxes project_host_exposures_ignored_with_warning
@@ -775,6 +785,10 @@ box that holds it returns to `running`. These terms follow the decision in
   tier:     T0
   verify:   cargo nextest run -p minvmd host_exposure_on_minimal_listener_port_refused
   <!-- S10a; design v0.9.2 §7.1: Minimal's own listeners are never exposures, the fixed-deny pattern that `[secret-store-rules]` applies to Minimal's own infrastructure; a node-plane baseline endpoint at the alias is infrastructure for the node-plane identity alone (NET-158); unwanted; the refusal must say which entry it refused and which listener holds the port; it goes where the loader reports, the host's log for the VM host daemon and `min`'s output when it reads the table at expansion; the design names a `min host show` that lists exposures, which no command provides yet, so this requirement does not bind that surface -->
+  - WHILE the `[host-exposures]` table holds an entry, WHEN a Minimal listener binds the entry's port THE SYSTEM SHALL refuse each later flow from a box to that port at the host-gateway alias and record in a log on the host that the listener shadows the entry.
+    tier:   T0
+    verify: cargo nextest run -p minvmd host_exposure_shadowed_by_a_later_minimal_listener
+    <!-- S10a; design v0.9.2 §7.1: the exclusion holds for the entry's lifetime, decided at each flow ahead of the exposure openings, as the switch's own services already are; state+event; the log record names the entry and the listener; a log record, not a message for the user; the design also names `min host show` and the session-start line as surfaces that report a shadowed entry, and this requirement binds neither: no command provides `min host show` yet, and a line before the box shell on an interactive attach is not readable (AGENTS.md, user-facing text) -->
 
 - **NET-157** WHILE the box host is VM-backed, WHEN the system refuses an own-address box's egress THE SYSTEM SHALL record the refusal in a log on the host, outside the VM.
   tier:     T0
