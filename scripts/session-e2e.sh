@@ -14089,11 +14089,8 @@ if len(r) >= 8 and r[0:2] == b"\x5e\x32" and r[2] & 0x80:
 #                repository through it (BEP-062, BEP-015).
 #   fail_closed  With the proxy stopped, the A lookup of each steered name a
 #                box above holds is answered SERVFAIL (BEP-062).
-# A lane without the live proxy records the whole case NOT RUN. Admission refuses
-# `dns` steering with a credentialed upstream until the proxy takes a direct
-# TLS connection (#2805). Until then the case records a KNOWN GAP that cites
-# #2805, with that refusal. When #2805 lands, the refusal becomes a hard
-# failure. The stored value is never printed.
+# A lane without the live proxy records the whole case NOT RUN. Any admission
+# refusal of a box here is a hard failure. The stored value is never printed.
 proof_bep_dns_steering_through_the_box_zone_resolver() {
   echo "::group::DNS steering through the box-zone resolver: store upstream and GitHub through the proxy, SERVFAIL while it is down"
   local bz_case=bep_dns_steering_through_the_box_zone_resolver
@@ -14149,9 +14146,7 @@ proof_bep_dns_steering_through_the_box_zone_resolver() {
   }
 
   # Activates the box named $2 from GRANT_SEED_DIR with egress to the names
-  # after it, and prints its id. Returns 3 when admission refuses dns
-  # steering with a credentialed upstream (#2805), and records why in
-  # $WORK/$bz_case.refused. Any other refusal fails: after bep_live_gate the
+  # after it, and prints its id. Any refusal fails: after bep_live_gate the
   # host is minvmd and the box is own_ip, so its switch resolves box names.
   bz_activate() { # $1 leg, $2 name, $3... egress names
     local ba_leg="$1" ba_name="$2" ba_out ba_flags=() ba_h
@@ -14163,11 +14158,6 @@ proof_bep_dns_steering_through_the_box_zone_resolver() {
       printf '%s\n' "$ba_out" | tail -n1 | tr -d '\r'
       return 0
     }
-    if grep -q 'does not yet take a direct TLS connection' "$WORK/$bz_case.$ba_leg.activate.err" 2>/dev/null; then
-      echo "admission refuses steering = \"dns\" for a box with a credentialed upstream: the proxy takes no direct TLS connection yet (#2805)" \
-        >"$WORK/$bz_case.refused"
-      return 3
-    fi
     echo "::error::'min session activate' of the dns-steered box $ba_name failed" >&2
     echo "--- stdout ---" >&2; printf '%s\n' "$ba_out" >&2
     echo "--- stderr ---" >&2; grep -vF -- "${bz_value:-no value}" "$WORK/$bz_case.$ba_leg.activate.err" >&2 2>/dev/null || true
@@ -14271,14 +14261,6 @@ print(rcode, an, addr)' "$dq_b64"
   BZ_STORE_SID="$(bz_activate store e2e-bep-dns-store "$bz_host")"
   bz_status=$?
   rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
-  if [ "$bz_status" = 3 ]; then
-    BZ_STORE_SID=""
-    known_gap "$bz_case" "$(cat "$WORK/$bz_case.refused")"
-    bz_cleanup
-    rm -f "${WORK:?}/${bz_case:?}".*
-    echo "::endgroup::"
-    return 0
-  fi
   [ "$bz_status" = 0 ] || bz_fail
   mnl session exec "$BZ_STORE_SID" 'test -x /usr/bin/socat && test -x /usr/bin/base64' >/dev/null 2>&1 || {
     echo "::error::the dns-steered store box has no /usr/bin/socat or /usr/bin/base64 (both launcher baseline packages)"
@@ -14337,12 +14319,7 @@ print(rcode, an, addr)' "$dq_b64"
     bz_status=$?
     rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
   fi
-  if [ "$bz_status" = 3 ]; then
-    # The same #2805 refusal the store leg handles, met by the grant box.
-    BZ_GIT_SID=""
-    known_gap "$bz_case/git" "$(cat "$WORK/$bz_case.refused")"
-    bz_summary="${bz_summary}git: KNOWN GAP ($(cat "$WORK/$bz_case.refused"))"$'\n'
-  elif [ "$bz_status" = 1 ]; then
+  if [ "$bz_status" = 1 ]; then
     bz_fail
   elif [ "$bz_status" = 0 ]; then
     [ -n "$BZ_GIT_SID" ] || { echo "::error::'min session activate' of the dns-steered grant box printed no box id"; bz_fail; }
@@ -18484,7 +18461,8 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
   # annotation stream, and the lane's annotation is all this case's
   # failure is read by from outside. socat's exit names what the box
   # saw; the ARP entry says whether the switch's peer answered
-  # resolution at all; the cross-probe to an unlistened port isolates
+  # resolution at all; the cross-probe to an unlistened port (444, since
+  # BEP-080 opens 443 at the proxy's address to a laned box) isolates
   # the box-to-peer path from the pool's listener (a RST there means the
   # path is fine and the failure is at :8118's accept or the delivery's
   # dial); the daemon's own lines name any refusal with its reason.
@@ -18508,15 +18486,15 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
     else
       echo "::error::box $label's ARP entry for $proxy_ip: unreadable (session exec failed)"
     fi
-    if mnl session exec "$sid" "/usr/bin/socat /dev/null TCP:$proxy_ip:443,connect-timeout=5" \
+    if mnl session exec "$sid" "/usr/bin/socat /dev/null TCP:$proxy_ip:444,connect-timeout=5" \
         >/dev/null 2>"$WORK/bep-box-$box-cross.err"; then
       cross="$(tr '\n' ' ' <"$WORK/bep-box-$box-cross.err" 2>/dev/null | tail -c 300)"
-      echo "::error::box $label's cross-probe to $proxy_ip:443 (unlistened) completed instead of being reset — unexpected; stderr: ${cross:-<empty>}"
+      echo "::error::box $label's cross-probe to $proxy_ip:444 (unlistened) completed instead of being reset — unexpected; stderr: ${cross:-<empty>}"
     elif grep -q 'Connection refused' "$WORK/bep-box-$box-cross.err" 2>/dev/null; then
-      echo "::error::box $label's cross-probe to $proxy_ip:443 got the peer's RST — the box-to-peer path answers; the failure is at the pool's :$proxy_port listener or the delivery's dial to the stand-in"
+      echo "::error::box $label's cross-probe to $proxy_ip:444 got the peer's RST — the box-to-peer path answers; the failure is at the pool's :$proxy_port listener or the delivery's dial to the stand-in"
     else
       cross="$(tr '\n' ' ' <"$WORK/bep-box-$box-cross.err" 2>/dev/null | tail -c 300)"
-      echo "::error::box $label's cross-probe to $proxy_ip:443 was not reset either — the box-to-peer path itself is down in this daemon; stderr: ${cross:-<empty>}"
+      echo "::error::box $label's cross-probe to $proxy_ip:444 was not reset either — the box-to-peer path itself is down in this daemon; stderr: ${cross:-<empty>}"
     fi
   }
 
@@ -19026,29 +19004,30 @@ proof_deny_all_box_reaches_proxy_and_no_other_host_port() {
     fi
   done
 
-  # And no other port at the lane's own address: TCP to 443 at the proxy's
-  # address — a port the proxy's listener does not bind, so the declaration
-  # never admitted it — is the box's own 0.0.0.0/0's to refuse again, on
-  # both legs (the relay's lane arm and the gate's read the listener, not
-  # the address), so the connect runs out its window with no reset, exactly
-  # as the host alias did. The lane's narrowing, pinned end to end: what
-  # the declaration opened is the proxy's listener, not its address.
+  # And no other port at the lane's own address: TCP to 444 at the proxy's
+  # address — a port the lane never opens, since it opens the proxy's
+  # listener port and TCP 443 only (BEP-080) — is the box's own
+  # 0.0.0.0/0's to refuse again, on both legs (the relay's lane arm and
+  # the gate's read those two ports, not the address), so the connect runs
+  # out its window with no reset, exactly as the host alias did. The
+  # lane's narrowing, pinned end to end: what the declaration opened is
+  # the proxy's listener port and 443, not its address.
   probe_start_ms="$(now_ms)"
   mnl session exec "$lane_sid" \
-    "/usr/bin/socat /dev/null TCP:$proxy_ip:443,connect-timeout=8" \
+    "/usr/bin/socat /dev/null TCP:$proxy_ip:444,connect-timeout=8" \
     >/dev/null 2>"$WORK/cred-lane-other-port.err" && {
-    echo "::error::the deny-all lane box reached the proxy's address at port 443 — the lane opens the proxy's listener, never its address"
+    echo "::error::the deny-all lane box reached the proxy's address at port 444 — the lane opens the proxy's listener port and TCP 443 only (BEP-080), never its address"
     cat "$WORK/cred-lane-other-port.err" 2>/dev/null || true
     cred_fail
   }
   probe_ms=$(( $(now_ms) - probe_start_ms ))
   if grep -qE 'Connection refused|No route to host|unreachable' "$WORK/cred-lane-other-port.err" 2>/dev/null; then
-    echo "::error::the deny-all lane box's connection to the proxy's address at port 443 was actively rejected, not dropped — a port the lane never opened is the box's own rules' to decide, on both legs"
+    echo "::error::the deny-all lane box's connection to the proxy's address at port 444 was actively rejected, not dropped — the lane opens the proxy's listener port and TCP 443 only (BEP-080), so port 444 is the box's own rules' to decide, on both legs"
     cat "$WORK/cred-lane-other-port.err" 2>/dev/null || true
     cred_fail
   fi
   if [ "$probe_ms" -lt 5000 ]; then
-    echo "::error::the deny-all lane box's connection to the proxy's address at port 443 failed in ${probe_ms}ms — a fast failure is a reject, not the silent drop being asserted"
+    echo "::error::the deny-all lane box's connection to the proxy's address at port 444 failed in ${probe_ms}ms — a fast failure is a reject, not the silent drop being asserted"
     cat "$WORK/cred-lane-other-port.err" 2>/dev/null || true
     cred_fail
   fi
