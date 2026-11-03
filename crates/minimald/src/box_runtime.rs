@@ -1439,10 +1439,16 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                     // repeat it here, where it is attributable, for the same
                     // reason the pty/step path does.
                     let exit = self.process.exit_reason();
+                    // A kill from the daemon can lose the race to this reap:
+                    // it is queued, but the process is reaped here before
+                    // `step` takes it. The daemon asked for the end, so the
+                    // entrypoint's own return does not end the box (BOX-038).
+                    let requested = self.kill_queued();
                     tracing::info!(
                         session_id = %self.session_id,
                         session = %self.session_name,
                         exit_code,
+                        requested,
                         abnormal = exit.as_ref().is_some_and(ExitReason::is_abnormal),
                         exit_reason = exit.as_ref().map_or("", |r| r.reason.as_str()),
                         "session process exited; reaped by the host loop",
@@ -1466,7 +1472,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                     break Ok(HostExit {
                         code: exit_code,
                         reason: exit,
-                        requested: false,
+                        requested,
                     });
                 }
                 Ok(None) => {}
@@ -1586,6 +1592,26 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         }
 
         result
+    }
+
+    /// Whether a kill from the daemon waits in the mailbox. Called once the
+    /// process is reaped and the loop ends, so it drains the mailbox: the
+    /// loop takes no message after this, and the other messages drop as
+    /// they do when the host ends.
+    fn kill_queued(&mut self) -> bool {
+        let mut killed = false;
+        while let Ok(msg) = self.receiver.try_recv() {
+            if let Message::Kill(for_shutdown) = msg {
+                tracing::info!(
+                    session_id = %self.session_id,
+                    session = %self.session_name,
+                    for_shutdown,
+                    "session host killed on request; the process was already reaped",
+                );
+                killed = true;
+            }
+        }
+        killed
     }
 
     /// Logs a pty-master failure and stashes it for [`Self::mainloop`] to hand
