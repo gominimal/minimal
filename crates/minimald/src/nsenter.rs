@@ -807,13 +807,20 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
     // under.
     let socket_family_filter = injection_socket_filter(args.seal_none_box, &args.join);
 
+    // A tty exec hands the shim the slave side of its PTY as stdin. The
+    // injected process then makes that PTY its controlling terminal, so job
+    // control, `/dev/tty` and a hangup at the PTY's close reach it
+    // (BOX-149). Read here, before the fork, and copied into the child.
+    // SAFETY: `isatty` only queries the descriptor.
+    let take_terminal = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
+
     // SAFETY: the closures run in the forked child between `fork` and `exec`,
     // where only async-signal-safe calls are legal. `signal`, `alarm`,
-    // `setpgid`, `prctl` and the raw `seccomp` syscall are on that list, and
-    // the closures allocate nothing
-    // and capture only a static reference.
+    // `setpgid`, `setsid`, `ioctl`, `prctl` and the raw `seccomp` syscall are
+    // on that list, and the closures allocate nothing
+    // and capture only a static reference and a `bool`.
     unsafe {
-        cmd.pre_exec(|| {
+        cmd.pre_exec(move || {
             // Undo what the shim's own termination handling (installed before
             // the spawn) left in this forked copy: the handlers, and an alarm
             // a handler running here before this point could have armed, which
@@ -830,7 +837,13 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
             // session's PID namespace, so the group ids the session's shell
             // already assigned do not help it name "the shim's child and its
             // descendants" for a later group kill.
-            if libc::setpgid(0, 0) == -1 {
+            //
+            // A tty exec leads a new session instead, which also makes it the
+            // leader of a new process group, and takes its PTY as the
+            // session's controlling terminal.
+            if take_terminal {
+                lead_session_on_terminal()?;
+            } else if libc::setpgid(0, 0) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
             // Tie the injected process's lifetime to this shim's. Nothing else
@@ -1035,6 +1048,29 @@ unsafe fn kill_group(pgid: i32) {
     unsafe {
         libc::kill(-pgid, libc::SIGKILL);
     }
+}
+
+/// Makes the calling process the leader of a new session, and so of a new
+/// process group (pid == pgid == sid), and makes the terminal on its stdin
+/// the session's controlling terminal. A tty exec runs on its PTY as a
+/// login shell runs on its terminal.
+///
+/// # Safety
+///
+/// Call it in a forked child before `exec`: it makes only the
+/// async-signal-safe calls `setsid(2)` and `ioctl(2)`.
+pub(crate) unsafe fn lead_session_on_terminal() -> std::io::Result<()> {
+    // SAFETY: `setsid` takes no arguments. It fails only for a process that
+    // already leads a group, which a freshly forked child never does.
+    if unsafe { libc::setsid() } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `TIOCSCTTY` with `0` takes the terminal only if no other
+    // session holds it, and writes through no pointer.
+    if unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY, 0) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Send the injected group its one SIGTERM, if the group is published and no

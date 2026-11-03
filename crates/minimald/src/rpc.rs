@@ -1440,6 +1440,80 @@ async fn serve_stop_box(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), C
         .await
 }
 
+/// An RPC to stop one exec in a running box (BOX-151). The exec's process
+/// group gets SIGTERM, a wait, then SIGKILL. The box and its other execs
+/// keep running. The answer comes when the exec has ended.
+pub(crate) struct StopExec;
+
+/// The request for a [`StopExec`] RPC.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) struct StopExecRequest {
+    /// The box the exec runs in.
+    #[serde(rename = "box")]
+    pub(crate) box_id: SessionId,
+    /// The exec's id, as its start answered it.
+    pub(crate) exec_id: String,
+}
+
+/// The response for a [`StopExec`] RPC: how the exec ended.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) struct StopExecResponse {
+    /// The exec's exit code. `None` when a signal ended it.
+    #[serde(default)]
+    pub(crate) exit_code: Option<i32>,
+    /// Why the exec ended, as its `exec_exited` event spells it.
+    pub(crate) reason: String,
+}
+
+impl OneshotSshRpc for StopExec {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "StopExec");
+    type Request<'a> = StopExecRequest;
+    type Response = Errorable<StopExecResponse>;
+}
+
+/// `StopExec`: ends one exec and leaves its box running (BOX-151).
+async fn serve_stop_exec(c: RuChannel<Msg>) -> Result<(), ConnectionError> {
+    StopExec
+        .handle_channel(c, async |req: StopExecRequest| {
+            Ok(stop_exec_answer(req.box_id, &req.exec_id).await)
+        })
+        .await
+}
+
+/// The `StopExec` answer for exec `exec_id` in box `box_id`.
+pub(crate) async fn stop_exec_answer(
+    box_id: SessionId,
+    exec_id: &str,
+) -> Errorable<StopExecResponse> {
+    let Ok(id) = minimald_rpc::exec::ExecId::parse(exec_id) else {
+        tracing::warn!(%box_id, exec_id, "exec stop refused: not an exec id");
+        return Errorable::Err {
+            error: format!("{} is not an exec id.", exec_id.trim()),
+        };
+    };
+    match crate::exec::stop_exec(box_id, &id).await {
+        Some(exit) => {
+            tracing::info!(
+                %box_id,
+                exec_id = %id,
+                exit_code = exit.code,
+                reason = exit.reason.name(),
+                "exec stop: the exec ended"
+            );
+            Errorable::Ok(StopExecResponse {
+                exit_code: exit.code,
+                reason: exit.reason.name().to_string(),
+            })
+        }
+        None => {
+            tracing::warn!(%box_id, exec_id = %id, "exec stop refused: no such exec in the box");
+            Errorable::Err {
+                error: format!("box {box_id} has no exec {id}."),
+            }
+        }
+    }
+}
+
 /// The `StopBox` answer for how a stop ended: the record's exit code and
 /// ending signal, and whether the box already exited before the stop.
 pub(crate) fn stop_box_response(
@@ -3358,6 +3432,7 @@ pub async fn handle_ssh_rpc(
         | RenameSession::NAME
         | DestroySession::NAME
         | minimald_rpc::StopBox::NAME
+        | StopExec::NAME
         | minimald_rpc::ReapBox::NAME
         | minimald_rpc::PruneBoxes::NAME
         | minimald_rpc::ListBoxes::NAME
@@ -3443,6 +3518,7 @@ pub async fn handle_ssh_rpc(
         RenameSession::NAME => serve!(serve_rename_session(s, channel)),
         DestroySession::NAME => serve!(serve_destroy_session(s, channel)),
         minimald_rpc::StopBox::NAME => serve!(serve_stop_box(s, channel)),
+        StopExec::NAME => serve!(serve_stop_exec(channel)),
         minimald_rpc::ReapBox::NAME => serve!(serve_reap_box(s, channel)),
         minimald_rpc::PruneBoxes::NAME => serve!(serve_prune_boxes(s, channel)),
         minimald_rpc::ListBoxes::NAME => serve!(serve_list_boxes(s, channel)),

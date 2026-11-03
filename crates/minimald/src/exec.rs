@@ -297,6 +297,33 @@ pub(crate) async fn handle_exec(
             });
             return Ok(());
         }
+        // BOX-153: a box whose stored spec sets `[io] exec_enabled = false`
+        // takes no command, in any mode.
+        let disabled = match ExecBox::of(&session_handle).instrument(span.clone()).await {
+            Ok(exec_box) => exec_box.exec_disabled(),
+            Err(e) => {
+                tracing::warn!(%session_id, error = %e, "execution request rejected: the box is gone");
+                session.channel_failure(id)?;
+                return Ok(());
+            }
+        };
+        if disabled {
+            tracing::warn!(
+                parent: &span,
+                %session_id,
+                "execution request refused: the box's spec sets io.exec_enabled = false"
+            );
+            let label = record
+                .name
+                .clone()
+                .unwrap_or_else(|| session_id.to_string());
+            let message = exec_disabled_message(&label);
+            session.channel_success(id)?;
+            spawn(async move {
+                answer_exec(channel, b"", message.as_bytes(), EXEC_DISABLED_STATUS).await;
+            });
+            return Ok(());
+        }
         let exec_id = mint_exec_id();
         span.record("exec_id", exec_id.as_str());
         span.record("exec_mode", mode.name());
@@ -464,6 +491,14 @@ pub(crate) async fn handle_exec(
     Ok(())
 }
 
+/// The exit status of an exec that the box's spec refuses (BOX-153).
+pub(crate) const EXEC_DISABLED_STATUS: u32 = 5;
+
+/// The refusal of an exec into a box whose spec turns exec off (BOX-153).
+pub(crate) fn exec_disabled_message(box_label: &str) -> String {
+    format!("box {box_label} does not run commands: its spec sets [io] exec_enabled = false.\n")
+}
+
 /// Runs an attached `min://exec`: an argv in the box with no shell, its stdio
 /// on the channel's pipes, under its own timeout when it has one (BOX-149).
 /// Its events and its end name its exec id.
@@ -490,11 +525,16 @@ async fn run_attached_exec(
             None
         }
     };
+    let facts = ExecFacts {
+        principal: conn_username.clone(),
+        argv: argv.clone(),
+    };
     if let Some(exec_box) = &exec_box {
         exec_box.write_event(
             boxes::events::BoxEventType::ExecStarted,
             &exec_id,
             ExecMode::Attached,
+            &facts,
             None,
         );
     }
@@ -529,6 +569,7 @@ async fn run_attached_exec(
             boxes::events::BoxEventType::ExecExited,
             &exec_id,
             ExecMode::Attached,
+            &facts,
             Some(exit),
         );
     }
@@ -564,6 +605,10 @@ async fn start_and_answer(session: BoxHandle, channel: Channel<Msg>, request: Ma
         conn_username,
         extra_env,
     } = request;
+    let facts = ExecFacts {
+        principal: conn_username.clone(),
+        argv: argv.clone(),
+    };
     let started = async {
         let exec_box = ExecBox::of(&session).await?;
         let host = session
@@ -581,6 +626,7 @@ async fn start_and_answer(session: BoxHandle, channel: Channel<Msg>, request: Ma
                 exec_box,
                 timeout,
                 winsize,
+                facts,
             },
             command,
             true,
