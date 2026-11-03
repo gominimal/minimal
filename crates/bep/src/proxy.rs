@@ -466,10 +466,13 @@ impl Proxy {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        // One deadline covers the first byte and the rest of the head, so
+        // HEAD_TIMEOUT stays the whole time the box has to send it.
+        let head_deadline = tokio::time::Instant::now() + HEAD_TIMEOUT;
         // BEP-080: a connection that opens with a TLS handshake record is a
         // box whose `dns` steering sent it here as the upstream itself.
         let mut first = [0u8; 1];
-        let read = match tokio::time::timeout(HEAD_TIMEOUT, stream.read(&mut first)).await {
+        let read = match tokio::time::timeout_at(head_deadline, stream.read(&mut first)).await {
             Err(_) => return Ended::Closed("head_timeout"),
             Ok(Err(_)) => return Ended::Closed("box_read"),
             Ok(Ok(read)) => read,
@@ -478,12 +481,12 @@ impl Proxy {
         if read == 1 && first[0] == TLS_HANDSHAKE_RECORD {
             return self.direct_tls(box_id, port, stream).await;
         }
-        let (request, rest) = match tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut stream)).await
-        {
-            Err(_) => return Ended::Closed("head_timeout"),
-            Ok(Err(reason)) => return self.refuse_head(&mut stream, &reason).await,
-            Ok(Ok(head)) => head,
-        };
+        let (request, rest) =
+            match tokio::time::timeout_at(head_deadline, read_head(&mut stream)).await {
+                Err(_) => return Ended::Closed("head_timeout"),
+                Ok(Err(reason)) => return self.refuse_head(&mut stream, &reason).await,
+                Ok(Ok(head)) => head,
+            };
         if let Some(word) = tunnel_refusal(&request) {
             // BEP-029: a tunnel request outside the admitted set is an
             // audited `off_module` refusal, though its answer stays `501`.
@@ -1803,6 +1806,28 @@ pub(crate) mod tests {
         )
         .await
         .expect("the flow ends when the upstream closes");
+    }
+
+    // HEAD_TIMEOUT is the whole time a box has to send its first request
+    // head. A box that sends the first byte just before the limit, and
+    // never completes the head, is closed HEAD_TIMEOUT after its
+    // connection arrived, not HEAD_TIMEOUT after that first byte.
+    #[tokio::test(start_paused = true)]
+    async fn head_split_after_its_first_byte_times_out_at_head_timeout_total() {
+        let h = harness().await;
+        let start = tokio::time::Instant::now();
+        let mut stream = box_connection(&h.proxy);
+        tokio::time::sleep(HEAD_TIMEOUT.checked_sub(Duration::from_secs(1)).unwrap()).await;
+        stream.write_all(b"G").await.unwrap();
+        stream.write_all(b"ET / HTTP/1.1\r\n").await.unwrap();
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).await.unwrap();
+        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= HEAD_TIMEOUT && elapsed < HEAD_TIMEOUT + Duration::from_secs(1),
+            "the connection closed after {elapsed:?}"
+        );
     }
 
     /// The credential the admitting redeemer gives.
