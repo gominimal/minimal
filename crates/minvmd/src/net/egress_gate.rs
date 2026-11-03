@@ -6150,10 +6150,6 @@ fn gate_verdict(
     row_verdict(summary, l4, table, baseline, pins, src)
 }
 
-/// The TCP port at the Box Egress Proxy's address that a `host_ip` cohort
-/// reaches while its lane is open, beside the listener port (BEP-083).
-const HOST_IP_PROXY_TLS_PORT: u16 = 443;
-
 /// The tracing target of [`log_marked_decision`]'s line, so a harness can
 /// turn on that one debug line without the gate's other debug output.
 pub(crate) const MARKED_DECISION_TARGET: &str = "minvmd::egress_gate::marked";
@@ -6238,7 +6234,7 @@ fn log_marked_decision(
 /// members' declarations. While one member declares a credentialed
 /// upstream, two ports at the proxy's address are admitted
 /// ([`GateAdmit::ProxyLane`]): the proxy's listener port, and TCP 443
-/// ([`HOST_IP_PROXY_TLS_PORT`]). UDP 443 and every other port at that
+/// ([`egress::PROXY_DIRECT_TLS_PORT`]). UDP 443 and every other port at that
 /// address still drop. While no member declares one, every frame to the
 /// proxy's address drops under [`PROXY_LANE_RULE`].
 ///
@@ -6281,13 +6277,8 @@ fn host_ip_verdict(
             .count();
         let listener = egress::ProxyListener::at(dst);
         // BEP-083: the cohort lane opens the listener and TCP 443 at the
-        // proxy's address. The shared `proxy_lane_admits` stays the
-        // listener's alone, because an own-address box's direct TLS is
-        // BEP-080's.
-        let tls = declaring > 0
-            && summary.protocol() == Some(egress::IPPROTO_TCP)
-            && dst_port == HOST_IP_PROXY_TLS_PORT;
-        let admitted = egress::proxy_lane_admits(declaring > 0, listener, summary) || tls;
+        // proxy's address, through the one lane predicate every leg shares.
+        let admitted = egress::proxy_lane_admits(declaring > 0, listener, summary);
         tracing::debug!(
             source = %Ipv4Addr::from(src),
             destination = %Ipv4Addr::from(dst),
