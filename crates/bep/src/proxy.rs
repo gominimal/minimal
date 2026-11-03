@@ -70,7 +70,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::{LazyConfigAcceptor, TlsAcceptor, TlsConnector};
 use tracing::Instrument as _;
 
-use crate::audit::{AuditLog, Decision, Kind, Mapping, Outcome};
+use crate::audit::{AuditLog, Decision, Kind, Mapping, NO_SNI, Outcome};
 use crate::ca::{Ca, CaError, CaKey, Leaf};
 use crate::forward::{self, Flow, HalfEnd, Redeemer, Unwired, UpstreamError, Validated};
 use crate::http::{self, CloseReason, Parse};
@@ -713,8 +713,8 @@ impl Proxy {
             Err(_) => return Ended::Closed("box_tls_timeout"),
         };
         let host = start.client_hello().server_name().map(normal_host);
-        // No SNI names no host: the record carries the port alone.
-        let authority = format!("{}:{port}", host.as_deref().unwrap_or_default());
+        // No SNI names no host: the record says so, at the port.
+        let authority = format!("{}:{port}", host.as_deref().unwrap_or(NO_SNI));
         tracing::Span::current().record("authority", authority.as_str());
         tracing::debug!(
             entry = ENTRY_DIRECT_TLS,
@@ -1982,7 +1982,12 @@ pub(crate) mod tests {
                     Outcome::Refuse,
                     Some(OFF_MODULE)
                 ),
-                (subject.as_str(), ":443", Outcome::Refuse, Some(OFF_MODULE)),
+                (
+                    subject.as_str(),
+                    "(no SNI):443",
+                    Outcome::Refuse,
+                    Some(OFF_MODULE)
+                ),
             ]
         );
     }
