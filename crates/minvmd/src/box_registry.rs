@@ -6254,6 +6254,26 @@ impl BoxRegistry {
         Ok(())
     }
 
+    /// Records the whole-range probe's verdict on the node's mirror
+    /// ([`NodeMirror::set_range_probe`]) and pings the table when the
+    /// mirrored address changed. A failing probe then republishes the
+    /// host-address names as NODATA at once (NET-129), and a passing one
+    /// republishes the node's address, never a recheck interval later.
+    pub fn set_node_range_probe(&self, passes: bool) {
+        let before = self.node_mirror.mirrored_address();
+        self.node_mirror.set_range_probe(passes);
+        let after = self.node_mirror.mirrored_address();
+        if before != after {
+            tracing::debug!(
+                ?before,
+                ?after,
+                range_passes = passes,
+                "the node's mirrored address changed on a range probe verdict"
+            );
+            self.ping();
+        }
+    }
+
     /// Takes one listen notice from the in-VM daemon ([`NodeMirror::notice`])
     /// with this node's host-address boxes' residency as the gate: while
     /// no host-address box is published, a listening notice binds nothing.

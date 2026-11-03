@@ -2669,9 +2669,10 @@ fn log_host_address_answer_changes(answers: &BTreeMap<String, HostAddressAnswer>
 }
 
 /// `registry`'s zone view with each running host-address box's held name
-/// answering its node's address (NET-129), the view both this host's own
-/// answers and its publishes come from.
-fn own_zone_view(registry: &BoxRegistry) -> ZoneView {
+/// answering its node's address (NET-129), the view this host's own
+/// answers, its publishes and the zone-table dump ([`crate::diag`]) come
+/// from.
+pub(crate) fn own_zone_view(registry: &BoxRegistry) -> ZoneView {
     own_zone_view_with(registry, &host_address_answers(registry))
 }
 
@@ -7727,12 +7728,42 @@ mod tests {
         assert_eq!(row.address, Some(node));
         assert!(row.live && row.node_address, "{row:?}");
 
-        registry.node_mirror().set_range_probe(false);
+        // The zone-table dump reads the same view, so it shows the
+        // address a lookup answers.
+        let dumped = own_zone_view(&registry);
+        let dumped_row = dumped
+            .rows()
+            .find(|(name, _)| *name == "web.min.internal")
+            .map(|(_, row)| row.address);
+        assert_eq!(
+            dumped_row,
+            Some(Some(node)),
+            "the dump disagrees with a lookup"
+        );
+
+        // A failing probe republishes at once: a table ping arrives, so the
+        // installed service drops the node's address with no recheck wait.
+        let pings = registry.subscribe_table_pings();
+        registry.set_node_range_probe(false);
+        assert!(
+            pings.try_recv().is_ok(),
+            "a failing range probe pinged no table change"
+        );
         assert_nodata(
             &ask_a(&answerer, "web"),
             "a failing range probe unbinds, so the name answers NODATA",
         );
-        registry.node_mirror().set_range_probe(true);
+        while pings.try_recv().is_ok() {}
+        registry.set_node_range_probe(false);
+        assert!(
+            pings.try_recv().is_err(),
+            "a repeated failing verdict changed nothing, yet pinged"
+        );
+        registry.set_node_range_probe(true);
+        assert!(
+            pings.try_recv().is_ok(),
+            "a passing range probe pinged no table change"
+        );
         assert_eq!(a_answer(&ask_a(&answerer, "web")), node);
 
         assert!(registry.retire_host_ip_box(web));
