@@ -327,6 +327,121 @@ pub(crate) struct Launched<P, G> {
     pub(super) start_gate: Option<sandbox::StartGate>,
 }
 
+/// The box's output log as its host writes it (BOX-155): every byte the
+/// box's entrypoint writes to its terminal, appended from the start of the
+/// launch. The host writes the log before it hands the same bytes to an
+/// attached client, so a client is a second reader. When a client leaves,
+/// the log already has everything it saw and everything after it.
+///
+/// The file is [`boxes::store::LOG_FILE`] beside the box's record. No path
+/// mounted into the box reaches it, and only the daemon's user can open it
+/// (BOX-164). The open does not follow a symlink, so a link planted where
+/// the log goes is refused and is not written through.
+///
+/// The log holds at most [`boxes::store::LOG_CAP`] bytes. Past the cap it
+/// keeps [`boxes::store::LOG_DROPPED`] and the newest output, and the box
+/// runs on (see [`boxes::store::LogWriter`]).
+pub(crate) struct BoxOutputLog {
+    /// `None` when the box has no log: its workspace is not in the store
+    /// (a test host), or a write failed.
+    writer: Option<boxes::store::LogWriter>,
+    path: Option<paths::DaemonAbsPath>,
+    session_id: boxes::SessionId,
+}
+
+impl BoxOutputLog {
+    /// Opens the log of the box whose workspace is `paths.working`, for
+    /// appends, before the launch starts the entrypoint. A box whose
+    /// workspace is not in the store has no log.
+    ///
+    /// # Errors
+    ///
+    /// The open's error for a box in the store, after the daemon log names
+    /// the path and the error. The box does not start without its log.
+    pub(crate) fn open(session_id: boxes::SessionId, paths: &BoxPaths) -> io::Result<Self> {
+        let Some(dir) = boxes::store::BoxDir::for_tree(&paths.working) else {
+            tracing::debug!(
+                box_id = %session_id,
+                workspace = %paths.working.as_str(),
+                "no output log: the box's workspace is not in the box store"
+            );
+            return Ok(Self {
+                writer: None,
+                path: None,
+                session_id,
+            });
+        };
+        let path = dir.log_path();
+        let writer = Self::open_path(&path)
+            .and_then(|file| boxes::store::LogWriter::new(path.clone(), file));
+        match writer {
+            Ok(writer) => {
+                tracing::info!(
+                    box_id = %session_id,
+                    log_path = %path.as_str(),
+                    cap_bytes = boxes::store::LOG_CAP,
+                    "logging the box's output from its start"
+                );
+                Ok(Self {
+                    writer: Some(writer),
+                    path: Some(path),
+                    session_id,
+                })
+            }
+            Err(e) => {
+                tracing::warn!(
+                    box_id = %session_id,
+                    log_path = %path.as_str(),
+                    error = %e,
+                    "refused to open the box's output log"
+                );
+                Err(e)
+            }
+        }
+    }
+
+    /// Opens `path` owner-only, for reads and appends, without following a
+    /// symlink. Anything there that is not a regular file is refused. The
+    /// reads are the cap's: it copies the newest bytes out of this file.
+    fn open_path(path: &paths::DaemonAbsPath) -> io::Result<std::fs::File> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path.as_utf8_path())?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the log path is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+
+    /// Appends `bytes` to the log. A write that fails goes to the daemon
+    /// log with the path and the error, and the log stops there: a log
+    /// with a hole in it is not complete, so nothing more is written.
+    pub(crate) fn write(&mut self, bytes: &[u8]) {
+        let Some(writer) = self.writer.as_mut() else {
+            return;
+        };
+        if let Err(e) = writer.write(bytes) {
+            tracing::warn!(
+                box_id = %self.session_id,
+                log_path = %self.path.as_ref().map_or("", |p| p.as_str()),
+                error = %e,
+                dropped_bytes = bytes.len(),
+                "refused a write to the box's output log; the log stops here"
+            );
+            self.writer = None;
+        }
+    }
+}
+
 /// Packages every session sandbox gets unconditionally, regardless of
 /// the client's contribution: `base` for the shell, `coreutils` for
 /// `ls`/`cat`/etc, and `socat` for the `min` command bridge (the

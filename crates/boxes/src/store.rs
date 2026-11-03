@@ -338,7 +338,7 @@ impl DiskBox {
     /// `NotFound` if the box's directory does not exist, and an I/O error
     /// if the file cannot be read or written.
     pub fn append_event(&self, event: &BoxEvent) -> Result<(), std::io::Error> {
-        append_event_at(self.events_path().as_utf8_path(), event)
+        append_event_line(&self.events_path(), self.key.id(), event)
     }
 
     /// The transcript file of the exec `exec_id` in this box, beside its
@@ -374,13 +374,532 @@ impl DiskBox {
     /// box's events stops once this is false (BOX-162).
     #[must_use]
     pub fn is_retained(&self) -> bool {
-        let root = self.root_path();
-        let root = root.as_utf8_path();
-        let tombstone = root
-            .parent()
-            .map(|sessions| sessions.join(tombstone_name(self.key.dir_key.as_str())));
+        self.dir().is_retained()
+    }
+
+    /// The path of the box's output log, [`LOG_FILE`], beside its record
+    /// (BOX-155). Like the events file, no path mounted into the box
+    /// reaches it (BOX-164). A test pins the literal to [`LOG_FILE`].
+    pub fn log_path(&self) -> DaemonAbsPath {
+        self.dir().log_path()
+    }
+
+    /// The box's directory, for a writer or reader outside the store.
+    #[must_use]
+    pub fn dir(&self) -> BoxDir {
+        BoxDir {
+            root: self.root_path(),
+        }
+    }
+}
+
+/// The name of the file beside `record.json` that holds the box's output
+/// log (BOX-155): every byte its entrypoint wrote to its terminal, from
+/// each start, whether or not a client was attached. Only the daemon
+/// writes it (BOX-164).
+pub const LOG_FILE: &str = "output.log";
+
+/// The name of the directory beside `record.json` that the box sees as its
+/// workspace. Its parent is the box's directory.
+const TREE_DIR: &str = "tree";
+
+/// The directory that holds a box's record, as code outside the store sees
+/// it: the box's runtime, which knows only the paths mounted into the box,
+/// and a reader that knows only the box's id.
+///
+/// The files this names, `record.json`, [`EVENTS_FILE`](crate::events::EVENTS_FILE)
+/// and [`LOG_FILE`], sit in this directory itself. The box sees only the
+/// `tree`, `home`, `cache`, `patches` and `hooks` directories under it, so
+/// no process inside the box can open them (BOX-041, BOX-164).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoxDir {
+    root: DaemonAbsPath,
+}
+
+impl BoxDir {
+    /// The box directory whose workspace is `tree`, as
+    /// [`BoxObject::workspace_path`] names it. `None` when `tree` is not
+    /// named `tree`, or has no parent: no box's workspace is then known,
+    /// so nothing is written beside it.
+    #[must_use]
+    pub fn for_tree(tree: &DaemonAbsPath) -> Option<Self> {
+        if tree.file_name() != Some(TREE_DIR) {
+            return None;
+        }
+        tree.parent().map(|root| Self { root })
+    }
+
+    /// The directory of the retained box `id` under the daemon state
+    /// directory `minimal_dir`, found through the store's index on disk.
+    /// The index is replaced by a rename, so a read sees a whole one.
+    /// `None` when no indexed box has `id`, when the record in the
+    /// indexed directory names another box, and when the box is reaped or
+    /// its delete has begun.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the index or the record exists but cannot be read.
+    pub fn find(
+        minimal_dir: &DaemonAbsPath,
+        id: &SessionId,
+    ) -> Result<Option<Self>, std::io::Error> {
+        let sessions = sub_path!(minimal_dir, "sessions");
+        let index: Index = match std::fs::File::open(sessions.as_utf8_path().join("index.json")) {
+            Ok(file) => serde_json_lenient::from_reader(file)?,
+            Err(e) if e.kind() == NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let Some(short) = index.short_by_id(id) else {
+            return Ok(None);
+        };
+        if !is_valid_short(short) {
+            return Ok(None);
+        }
+        let dir = Self {
+            root: sessions.sub_path_unchecked(short),
+        };
+        match dir.record() {
+            Ok(record) if record.id == *id => Ok(dir.is_retained().then_some(dir)),
+            Ok(_) => Ok(None),
+            Err(e) if e.kind() == NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The path of the box's output log, [`LOG_FILE`].
+    pub fn log_path(&self) -> DaemonAbsPath {
+        sub_path!(self.root, "output.log")
+    }
+
+    /// The path of the box's events file,
+    /// [`EVENTS_FILE`](crate::events::EVENTS_FILE).
+    pub fn events_path(&self) -> DaemonAbsPath {
+        sub_path!(self.root, "events.jsonl")
+    }
+
+    /// Reads the box's record from disk.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` once the box is reaped, and an I/O error if the record
+    /// cannot be read or parsed.
+    pub fn record(&self) -> Result<Record, std::io::Error> {
+        let file = std::fs::File::open(self.root.as_utf8_path().join("record.json"))?;
+        Ok(serde_json_lenient::from_reader(file)?)
+    }
+
+    /// Whether the box's record is still retained: its `record.json` is on
+    /// disk and no delete of its directory has begun.
+    #[must_use]
+    pub fn is_retained(&self) -> bool {
+        let root = self.root.as_utf8_path();
+        let tombstone = match (root.parent(), root.file_name()) {
+            (Some(sessions), Some(short)) => Some(sessions.join(tombstone_name(short))),
+            _ => None,
+        };
         root.join("record.json").exists() && !tombstone.is_some_and(|t| t.exists())
     }
+
+    /// Writes one lifecycle event of type `kind` for the box, stamped now
+    /// with the id and parent its record on disk names (BOX-040), with the
+    /// same lock and torn-line repair as [`DiskBox::append_event`]. For a
+    /// writer that holds no [`DiskBox`]: the box's runtime, which records
+    /// `detached` (BOX-016).
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` once the box is reaped, and an I/O error if the record
+    /// cannot be read or the event cannot be appended.
+    pub fn append_event(
+        &self,
+        kind: crate::events::BoxEventType,
+    ) -> Result<BoxEvent, std::io::Error> {
+        let record = self.record()?;
+        let event = BoxEvent::for_record(&record, kind);
+        append_event_line(&self.events_path(), &record.id, &event)?;
+        Ok(event)
+    }
+
+    /// Reads at most `max` bytes of the box's output log from byte
+    /// `offset` (BOX-155). A box with no log yet reads as empty.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the log exists but cannot be read.
+    pub fn read_log_from(&self, offset: u64, max: usize) -> Result<Vec<u8>, std::io::Error> {
+        use std::io::{Read as _, Seek as _};
+
+        let mut file = match open_log_for_read(&self.log_path()) {
+            Ok(file) => file,
+            Err(e) if e.kind() == NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        let mut buf = Vec::new();
+        file.take(max as u64).read_to_end(&mut buf)?;
+        Ok(buf)
+    }
+}
+
+/// The most bytes a box's output log holds on disk: 8 MiB, the same cap
+/// as an exec's transcript. A box that writes more keeps running. Its log
+/// then drops the oldest bytes and keeps the newest, so a box that writes
+/// without end does not fill the daemon's state directory.
+///
+/// So a box that writes more than 8 MiB loses the start of its log. This
+/// departs from docs/architecture.md line 473, which says the log is
+/// complete from the box's start. The design does not state this bound
+/// yet. <https://github.com/gominimal/arch/issues/159> decides it.
+pub const LOG_CAP: u64 = 8 * 1024 * 1024;
+
+/// The first line of a log that dropped its oldest bytes.
+pub const LOG_DROPPED: &[u8] = b"[older output was dropped. Only the newest output is kept.]\n";
+
+/// How many bytes of output a log keeps when it drops its oldest bytes
+/// under `cap`: half the cap, less the [`LOG_DROPPED`] line before them.
+fn log_kept(cap: u64) -> u64 {
+    (cap / 2).saturating_sub(LOG_DROPPED.len() as u64)
+}
+
+/// Opens the log at `path` for a read without following a symbolic link.
+/// The path must name a regular file, and the file opened must be that
+/// same file, so a link or a swap at the path is refused. (The crate has
+/// no `O_NOFOLLOW`, so the open compares the device and inode instead.)
+fn open_log_for_read(path: &DaemonAbsPath) -> Result<std::fs::File, std::io::Error> {
+    let not_regular = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the log path is not a regular file",
+        )
+    };
+    let link = std::fs::symlink_metadata(path.as_utf8_path())?;
+    if !link.file_type().is_file() {
+        return Err(not_regular());
+    }
+    let file = std::fs::File::open(path.as_utf8_path())?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || file_id(&opened) != file_id(&link) {
+        return Err(not_regular());
+    }
+    Ok(file)
+}
+
+/// The device and inode of a file, which tell two files apart.
+#[cfg(unix)]
+fn file_id(meta: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt as _;
+    (meta.dev(), meta.ino())
+}
+
+/// No device and inode off unix: every file reads as the same one, so a
+/// rotation is not seen and the reader keeps its file.
+#[cfg(not(unix))]
+fn file_id(_meta: &std::fs::Metadata) -> (u64, u64) {
+    (0, 0)
+}
+
+/// A box's output log as the daemon writes it: never more than
+/// [`LOG_CAP`] bytes at rest.
+///
+/// Past 8 MiB, [`LOG_CAP`] drops the start of the box's output. This
+/// departs from docs/architecture.md line 473, which says the log is
+/// complete from the box's start.
+/// <https://github.com/gominimal/arch/issues/159> decides the bound.
+///
+/// A write that takes the file past the cap is appended first. Then the
+/// file is replaced with [`LOG_DROPPED`] and the newest bytes of the old
+/// file, half the cap in all. The new file is written beside the old one
+/// and renamed over it, so a reader that has the old file open still reads
+/// the whole of it. [`LogReader`] reads across that replacement.
+#[derive(Debug)]
+pub struct LogWriter {
+    path: DaemonAbsPath,
+    file: std::fs::File,
+    len: u64,
+    cap: u64,
+}
+
+impl LogWriter {
+    /// Writes the log at `path` through `file`, which the caller opened for
+    /// reads and appends at that path, under the cap [`LOG_CAP`].
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the file's length cannot be read.
+    pub fn new(path: DaemonAbsPath, file: std::fs::File) -> Result<Self, std::io::Error> {
+        let len = file.metadata()?.len();
+        Ok(Self {
+            path,
+            file,
+            len,
+            cap: LOG_CAP,
+        })
+    }
+
+    /// The same writer under a different cap, for a test that does not
+    /// write [`LOG_CAP`] bytes. The reader must use the same cap.
+    #[must_use]
+    pub fn with_cap(mut self, cap: u64) -> Self {
+        self.cap = cap;
+        self
+    }
+
+    /// Appends `bytes`, and drops the oldest bytes if the file is then
+    /// past the cap.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the append or the replacement fails.
+    pub fn write(&mut self, bytes: &[u8]) -> Result<(), std::io::Error> {
+        use std::io::Write as _;
+
+        self.file.write_all(bytes)?;
+        self.len += bytes.len() as u64;
+        if self.len > self.cap {
+            self.drop_oldest()?;
+        }
+        Ok(())
+    }
+
+    /// Replaces the file with [`LOG_DROPPED`] and the newest bytes of the
+    /// file, half the cap in all.
+    fn drop_oldest(&mut self) -> Result<(), std::io::Error> {
+        use std::io::{Read as _, Seek as _, Write as _};
+
+        let keep = log_kept(self.cap).min(self.len);
+        let mut tail = Vec::with_capacity(LOG_DROPPED.len() + usize::try_from(keep).unwrap_or(0));
+        tail.extend_from_slice(LOG_DROPPED);
+        self.file.seek(std::io::SeekFrom::Start(self.len - keep))?;
+        (&mut self.file).take(keep).read_to_end(&mut tail)?;
+
+        let next_path = self.path.as_utf8_path().with_extension("log.next");
+        match std::fs::remove_file(&next_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == NotFound => {}
+            Err(e) => return Err(e),
+        }
+        let mut options = std::fs::OpenOptions::new();
+        // `create_new` refuses anything already at the path, a link too.
+        options.read(true).append(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut next = options.open(&next_path)?;
+        next.write_all(&tail)?;
+        std::fs::rename(&next_path, self.path.as_utf8_path())?;
+        tracing::info!(
+            log_path = %self.path.as_str(),
+            dropped_after = self.len,
+            kept = tail.len(),
+            "a box's output log reached its cap and dropped its oldest bytes"
+        );
+        self.file = next;
+        self.len = tail.len() as u64;
+        Ok(())
+    }
+}
+
+/// A box's output log in the bytes the reader gets back from
+/// [`LogReader::read`]: `data` starts at byte `offset` of the log file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogChunk {
+    pub offset: u64,
+    pub data: Vec<u8>,
+}
+
+/// A read of a box's output log that carries on across the times the
+/// [`LogWriter`] drops the oldest bytes (BOX-155).
+///
+/// The reader keeps its file open. An offset is a byte of the file it
+/// has open. When the writer replaces the file, the reader first reads
+/// the old file to its end, then moves to the new file:
+///
+/// - When the new file starts with [`LOG_DROPPED`] and the bytes the old
+///   file ended with, the reader already sent those bytes. It goes on from
+///   the byte after them, so no byte is sent twice.
+/// - Otherwise the writer replaced the file more than once since the
+///   reader moved. The reader reads the new file from its first byte, so
+///   the [`LOG_DROPPED`] line marks the output it never saw.
+///
+/// The offset of a chunk read from the new file is smaller than the end of
+/// the old one, because the new file is half the cap.
+#[derive(Debug)]
+pub struct LogReader {
+    path: DaemonAbsPath,
+    file: Option<std::fs::File>,
+    offset: u64,
+    cap: u64,
+}
+
+impl LogReader {
+    /// A read of `dir`'s log from byte `offset` of the file at the path
+    /// now, under the cap [`LOG_CAP`]. Nothing is opened until the first
+    /// [`Self::read`].
+    #[must_use]
+    pub fn new(dir: &BoxDir, offset: u64) -> Self {
+        Self {
+            path: dir.log_path(),
+            file: None,
+            offset,
+            cap: LOG_CAP,
+        }
+    }
+
+    /// The same reader under a different cap, the cap of its writer.
+    #[must_use]
+    pub fn with_cap(mut self, cap: u64) -> Self {
+        self.cap = cap;
+        self
+    }
+
+    /// The byte of the open file that the next read starts at.
+    #[must_use]
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Reads at most `max` bytes from where the last read stopped. An
+    /// empty chunk means the log has no more bytes now. A box with no log
+    /// yet reads as empty.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the log cannot be read, and `InvalidInput` if the
+    /// path is not a regular file. A log that is gone, because the box is
+    /// reaped, reads as empty once the open file is read to its end.
+    pub fn read(&mut self, max: usize) -> Result<LogChunk, std::io::Error> {
+        loop {
+            let Some(file) = self.file.as_mut() else {
+                match open_log_for_read(&self.path) {
+                    Ok(file) => self.file = Some(file),
+                    Err(e) if e.kind() == NotFound => return Ok(self.empty()),
+                    Err(e) => return Err(e),
+                }
+                continue;
+            };
+            let data = read_at(file, self.offset, max as u64)?;
+            if !data.is_empty() {
+                let chunk = LogChunk {
+                    offset: self.offset,
+                    data,
+                };
+                self.offset += chunk.data.len() as u64;
+                return Ok(chunk);
+            }
+            let current = match open_log_for_read(&self.path) {
+                Ok(current) => current,
+                // The box is reaped. Its open file was read to its end.
+                Err(e) if e.kind() == NotFound => return Ok(self.empty()),
+                Err(e) => return Err(e),
+            };
+            if file_id(&current.metadata()?) == file_id(&file.metadata()?) {
+                return Ok(self.empty());
+            }
+            // The writer replaced the file. The old one is no longer
+            // written, but a write can land before the replacement and
+            // after the read above: read it to its end first.
+            let data = read_at(file, self.offset, max as u64)?;
+            if !data.is_empty() {
+                let chunk = LogChunk {
+                    offset: self.offset,
+                    data,
+                };
+                self.offset += chunk.data.len() as u64;
+                return Ok(chunk);
+            }
+            let resume = self.resume_in(&current)?;
+            tracing::debug!(
+                log_path = %self.path.as_str(),
+                old_end = self.offset,
+                resume,
+                "a read of a box's output log moved to the replaced file"
+            );
+            self.file = Some(current);
+            self.offset = resume;
+        }
+    }
+
+    /// The byte of `next`, the file that replaced the open one, to go on
+    /// from: past the bytes the open file ended with, when `next` starts
+    /// with them, and 0 otherwise.
+    fn resume_in(&mut self, next: &std::fs::File) -> Result<u64, std::io::Error> {
+        // Compared in steps, so the reader holds no more than two steps.
+        const STEP: u64 = 64 * 1024;
+        let Some(old) = self.file.as_mut() else {
+            return Ok(0);
+        };
+        let keep = log_kept(self.cap).min(self.offset);
+        let mark = LOG_DROPPED.len() as u64;
+        let mut next = next.try_clone()?;
+        if read_at(&mut next, 0, mark)? != LOG_DROPPED {
+            return Ok(0);
+        }
+        let mut at = 0;
+        while at < keep {
+            let n = STEP.min(keep - at);
+            let kept = read_at(&mut next, mark + at, n)?;
+            let seen = read_at(old, self.offset - keep + at, n)?;
+            if kept.len() as u64 != n || kept != seen {
+                return Ok(0);
+            }
+            at += n;
+        }
+        Ok(mark + keep)
+    }
+
+    fn empty(&self) -> LogChunk {
+        LogChunk {
+            offset: self.offset,
+            data: Vec::new(),
+        }
+    }
+}
+
+/// Reads at most `max` bytes of `file` from byte `offset`.
+fn read_at(file: &mut std::fs::File, offset: u64, max: u64) -> Result<Vec<u8>, std::io::Error> {
+    use std::io::{Read as _, Seek as _};
+
+    file.seek(std::io::SeekFrom::Start(offset))?;
+    let mut buf = Vec::new();
+    file.take(max).read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+/// The body of [`DiskBox::append_event`] and [`BoxDir::append_event`]:
+/// appends `event` as one line to the events file at `events_path`.
+fn append_event_line(
+    events_path: &DaemonAbsPath,
+    box_id: &SessionId,
+    event: &BoxEvent,
+) -> Result<(), std::io::Error> {
+    use std::io::Write as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(events_path.as_utf8_path())?;
+    // Held until `file` drops after `sync_data`: the length, the cut and
+    // the write below are one step for every other appender.
+    file.lock()?;
+    let len = file.metadata()?.len();
+    let complete = complete_len(&mut file, len)?;
+    if complete < len {
+        file.set_len(complete)?;
+        tracing::warn!(
+            box_id = %box_id,
+            dropped_bytes = len - complete,
+            events_path = %events_path.as_str(),
+            "cut a torn last line from a box's events file before an append"
+        );
+    }
+    file.write_all(&event.to_line()?)?;
+    file.sync_data()
 }
 
 /// [`DiskBox::append_event`] for the events file at `events_path`, for a
@@ -1769,6 +2288,178 @@ mod tests {
 
         loader.delete(&key).unwrap();
         assert!(!record_dir.join(SPEC_FILE).exists());
+    }
+
+    /// BOX-155, BOX-164: the box's output log sits beside its record, the
+    /// box directory a runtime finds from the workspace is the store's own,
+    /// and a reader finds it by id until the box is deleted.
+    #[test]
+    fn box_dir_names_the_log_beside_the_record() {
+        use crate::events::BoxEventType;
+
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let object = loader.get(&key).unwrap();
+        let record_dir = root
+            .as_utf8_path()
+            .join("sessions")
+            .join(key.dir_key.as_str());
+
+        assert_eq!(object.log_path().as_utf8_path(), record_dir.join(LOG_FILE));
+        assert_eq!(
+            BoxDir::for_tree(&object.workspace_path()),
+            Some(object.dir())
+        );
+        assert_eq!(BoxDir::for_tree(&object.home_path()), None);
+        assert_eq!(
+            BoxDir::find(&root, &key.session_id).unwrap(),
+            Some(object.dir())
+        );
+        assert_eq!(BoxDir::find(&root, &SessionId::mint()).unwrap(), None);
+
+        std::fs::write(record_dir.join(LOG_FILE), b"hello\r\nworld").unwrap();
+        assert_eq!(
+            object.dir().read_log_from(0, 64).unwrap(),
+            b"hello\r\nworld"
+        );
+        assert_eq!(object.dir().read_log_from(7, 3).unwrap(), b"wor");
+
+        let event = object.dir().append_event(BoxEventType::Detached).unwrap();
+        assert_eq!(event.box_id, key.session_id);
+        assert_eq!(event.parent, object.record().parent);
+        assert_eq!(object.read_events_from(0).unwrap().events, [event]);
+
+        loader.delete(&key).unwrap();
+        assert!(!record_dir.join(LOG_FILE).exists());
+        assert_eq!(BoxDir::find(&root, &key.session_id).unwrap(), None);
+    }
+
+    /// BOX-164: a read of a box's log does not follow a link planted where
+    /// the log goes, and refuses what is not a regular file.
+    #[cfg(unix)]
+    #[test]
+    fn log_read_refuses_a_link_at_the_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = loader_dir(&tmp);
+        let mut loader = DiskLoader::new(root).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let dir = loader.get(&key).unwrap().dir();
+        let target = tmp.path().join("secret");
+        std::fs::write(&target, b"secret").unwrap();
+        std::os::unix::fs::symlink(&target, dir.log_path().as_utf8_path()).unwrap();
+
+        let err = dir.read_log_from(0, 64).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+        let err = LogReader::new(&dir, 0).read(64).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+
+        std::fs::remove_file(dir.log_path().as_utf8_path()).unwrap();
+        std::fs::create_dir(dir.log_path().as_utf8_path()).unwrap();
+        let err = dir.read_log_from(0, 64).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+    }
+
+    /// A writer and a reader over one box's log under a small cap.
+    fn capped_log(cap: u64) -> (tempfile::TempDir, BoxDir, LogWriter) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = loader_dir(&tmp);
+        let mut loader = DiskLoader::new(root).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let dir = loader.get(&key).unwrap().dir();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(dir.log_path().as_utf8_path())
+            .unwrap();
+        let writer = LogWriter::new(dir.log_path(), file).unwrap().with_cap(cap);
+        (tmp, dir, writer)
+    }
+
+    /// Every chunk the reader has now, joined.
+    fn drain(reader: &mut LogReader) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let chunk = reader.read(7).unwrap();
+            if chunk.data.is_empty() {
+                return out;
+            }
+            out.extend_from_slice(&chunk.data);
+        }
+    }
+
+    /// BOX-155: past the cap the log keeps the drop mark and the newest
+    /// output, and is never larger than the cap. A reader that keeps up
+    /// reads every byte once, across each replacement.
+    #[test]
+    fn capped_log_keeps_the_newest_and_a_reader_sees_each_byte_once() {
+        let cap = 256;
+        let (_tmp, dir, mut writer) = capped_log(cap);
+        let mut reader = LogReader::new(&dir, 0).with_cap(cap);
+        let mut written = Vec::new();
+        let mut read = Vec::new();
+        for i in 0..200 {
+            let line = format!("line {i:04}\n");
+            writer.write(line.as_bytes()).unwrap();
+            written.extend_from_slice(line.as_bytes());
+            let len = std::fs::metadata(dir.log_path().as_utf8_path())
+                .unwrap()
+                .len();
+            assert!(len <= cap, "the log is {len} bytes, past the cap {cap}");
+            read.extend_from_slice(&drain(&mut reader));
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&read),
+            String::from_utf8_lossy(&written),
+            "a reader that keeps up reads each byte once, in order"
+        );
+
+        let log = dir.read_log_from(0, usize::MAX).unwrap();
+        assert!(
+            log.starts_with(LOG_DROPPED),
+            "{}",
+            String::from_utf8_lossy(&log)
+        );
+        assert!(
+            written.ends_with(&log[LOG_DROPPED.len()..]),
+            "the log holds the newest output"
+        );
+    }
+
+    /// A reader that falls behind by more than one replacement gets the
+    /// drop mark where its output has a gap, and no byte twice.
+    #[test]
+    fn capped_log_reader_behind_two_drops_sees_the_mark_and_no_repeat() {
+        let cap = 256;
+        let (_tmp, dir, mut writer) = capped_log(cap);
+        let mut reader = LogReader::new(&dir, 0).with_cap(cap);
+        let mut written = Vec::new();
+        let mut read = Vec::new();
+        for i in 0..10 {
+            let line = format!("line {i:04}\n");
+            writer.write(line.as_bytes()).unwrap();
+            written.extend_from_slice(line.as_bytes());
+        }
+        read.extend_from_slice(&drain(&mut reader));
+        for i in 10..200 {
+            let line = format!("line {i:04}\n");
+            writer.write(line.as_bytes()).unwrap();
+            written.extend_from_slice(line.as_bytes());
+        }
+        read.extend_from_slice(&drain(&mut reader));
+
+        let text = String::from_utf8_lossy(&read).into_owned();
+        let mark = String::from_utf8_lossy(LOG_DROPPED).into_owned();
+        let (before, after) = text.split_once(&mark).expect("the gap is marked");
+        assert!(written.starts_with(before.as_bytes()), "{text}");
+        assert!(written.ends_with(after.as_bytes()), "{text}");
+        let lines: Vec<&str> = text.lines().filter(|l| l.starts_with("line ")).collect();
+        let mut sorted = lines.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(lines, sorted, "no line twice, in order: {text}");
     }
 
     /// BOX-149: an exec's transcript lives beside the record, outside every

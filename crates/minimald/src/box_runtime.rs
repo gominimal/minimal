@@ -65,6 +65,10 @@ pub(crate) struct HostExit {
     pub(crate) code: i32,
     /// How the process ended. `None` when the backend gave no account.
     pub(crate) reason: Option<ExitReason>,
+    /// Whether a kill from the daemon ended the host. `false` when the
+    /// entrypoint returned, or ended, with no kill asked for: only that end
+    /// ends the box (BOX-038).
+    pub(crate) requested: bool,
 }
 
 /// The state of the session process.
@@ -104,6 +108,14 @@ pub(crate) struct Host<P: BoxProcess, G: BoxGuard> {
     pending_pty_err: Option<std::io::Error>,
     /// The master-side fd of the Pty.
     master: AsyncFd<std::fs::File>,
+    /// The box's output log (BOX-155). Every read from the master lands
+    /// here first, whether or not a binding is attached, so the attached
+    /// client is a second reader and the log is complete after it leaves.
+    output_log: BoxOutputLog,
+    /// The box's directory beside its mounts, handed to each binding so it
+    /// can record `detached` when its client leaves (BOX-016). `None` for a
+    /// host whose workspace is not in the box store (tests).
+    box_dir: Option<boxes::store::BoxDir>,
     /// Various attributes about the running terminal.
     attrs: HostAttrs,
 
@@ -224,6 +236,11 @@ pub(crate) struct Host<P: BoxProcess, G: BoxGuard> {
     // handed to each binding for its shell-exit prompt.
     holds_host_row: bool,
 
+    // Whether the box ends when its entrypoint returns (see
+    // [`HostParams::ends_with_entrypoint`]), handed to each binding so a
+    // shell exit there raises no prompt.
+    ends_with_entrypoint: bool,
+
     // The per-channel session-key chord matcher: the negotiated leader chord
     // that enters command mode, the detach/forward subcommand keys, the bell
     // flag, plus the command-mode state and the pending split-candidate
@@ -267,6 +284,12 @@ pub(crate) struct HostParams {
     /// box is registered, so its host-side row ends with this host's shell
     /// (NET-138). The shell-exit prompt words its Keep item for that.
     pub holds_host_row: bool,
+    /// Whether the box ends when its entrypoint returns: its spec sets
+    /// `lifetime = "until_complete"` (BOX-038). The daemon ends such a box
+    /// whether or not a client is attached, so a shell exit raises no
+    /// shell-exit prompt. A box that runs until it is stopped keeps the
+    /// prompt, because the box outlives its shell.
+    pub ends_with_entrypoint: bool,
     pub session_id: boxes::SessionId,
     pub composition: Option<Arc<boxes::core::compose::Composition>>,
     pub connection_env: ConnectionEnv,
@@ -1203,6 +1226,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             delta,
             archives_dir,
             holds_host_row,
+            ends_with_entrypoint,
             session_id,
             composition,
             connection_env,
@@ -1218,6 +1242,11 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         // Kept before `launch` consumes `paths`.
         let hooks_dir = paths.hooks.clone();
         let workspace_dir = paths.working.clone();
+        // Opened before the launch, so the first byte the entrypoint writes
+        // has a log to land in (BOX-155). A box in the store whose log
+        // cannot be opened does not start: its log would not be complete.
+        let output_log = BoxOutputLog::open(session_id, &paths)?;
+        let box_dir = boxes::store::BoxDir::for_tree(&paths.working);
         // Kept for `write_connection_env`, which rewrites the per-attach env
         // (TERM included) into the session's home on every reattach.
         let home_dir = paths.home.clone();
@@ -1316,6 +1345,8 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             process,
             pending_pty_err: None,
             master,
+            output_log,
+            box_dir,
             // The launch decided the box's egress verdict posture before
             // anything was reserved; the attributes carry that decision so
             // the session can say which it runs under (design §7.2's
@@ -1346,6 +1377,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             session_name,
             archives_dir,
             holds_host_row,
+            ends_with_entrypoint,
             connection_env,
             home_dir,
             seal_injection,
@@ -1416,21 +1448,17 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                         "session process exited; reaped by the host loop",
                     );
                     // The process was reaped here before the pty surfaced its
-                    // death as an `EIO`. Still notify the attached binding so the
-                    // shell-exit prompt renders (and a "delete" choice can tear
-                    // the session down); otherwise the binding only observes the
-                    // host drop and silently detaches. Without this the prompt is
-                    // lost whenever `try_wait` wins the race against the master's
-                    // `EIO`.
+                    // death as an `EIO`. Still notify the attached binding, so
+                    // it tells the client the box ended rather than reporting
+                    // a lost host. The box itself ends from the daemon, with
+                    // or without a client (BOX-038): the actor reads this
+                    // loop's `HostExit`.
                     //
                     // The race is structurally one-sided: `step` parks in a
                     // `select!` on the master read, and a dying process closes
                     // every slave fd, so the `EIO` normally lands before this
                     // poll comes round again — which makes this the safety net
-                    // rather than the common path. It still has to hold: a
-                    // `step` that wakes for some other reason first can reach
-                    // here, and then this is the only thing that raises a
-                    // prompt at all.
+                    // rather than the common path.
                     self.notify_remote_teardown(TeardownCause {
                         pty_err: None,
                         exit: exit.clone(),
@@ -1438,6 +1466,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                     break Ok(HostExit {
                         code: exit_code,
                         reason: exit,
+                        requested: false,
                     });
                 }
                 Ok(None) => {}
@@ -1459,7 +1488,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                 // Everything here is gated on a stashed pty error, so a
                 // deliberate kill stays silent: `Message::Kill` also returns
                 // `Err` from `step`, but a destroy or a daemon shutdown either
-                // wants no prompt at all or has already sent its own teardown.
+                // wants no farewell at all or has already sent its own teardown.
                 let mut pending = self.pending_pty_err.take();
                 // Read before `take_if` below can empty `pending`: with no
                 // stashed pty error, the only way `step` errs is
@@ -1486,7 +1515,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                 // only session-attributed line a *detached* death produces:
                 // hakoniwa's own account is logged from the process handle,
                 // which has no span and so names no session, and the binding's
-                // prompt line never happens with nothing attached.
+                // farewell line never happens with nothing attached.
                 //
                 // A requested teardown is logged at info: its SIGKILL reaps
                 // with the same abnormal reason an OOM kill does, and a warn
@@ -1520,7 +1549,11 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                         exit: exit.clone(),
                     });
                 }
-                break code.map(|code| HostExit { code, reason: exit });
+                break code.map(|code| HostExit {
+                    code,
+                    reason: exit,
+                    requested,
+                });
             }
         };
 
@@ -1586,7 +1619,8 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
     }
 
     /// Notifies the attached binding that the session is going away, so it
-    /// tears down and raises the shell-exit prompt.
+    /// tears down and closes the client's channel. No prompt follows: the box
+    /// ends from the daemon whether or not a client is attached (BOX-038).
     ///
     /// Called once the process has been reaped, from either route into
     /// teardown: the loop's own `try_wait` (no pty error) or a pty failure
@@ -1617,14 +1651,12 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                 ),
                 // The documented best-effort drop, made visible: the binding
                 // never learns why it is going away, so it falls through to
-                // `HostGone` and detaches silently without a prompt — which is
-                // exactly the "my session just disappeared" report, and has the
-                // same user-visible shape as a healthy detach.
+                // `HostGone`. The box still ends from the daemon.
                 Err(e) => tracing::warn!(
                     session_id = %self.session_id,
                     error = %e,
                     "could not hand the teardown to the binding; \
-                     no shell-exit prompt will render",
+                     the client is told the host is gone",
                 ),
             },
             None => tracing::debug!(
@@ -1871,6 +1903,9 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                     Ok(Ok(n)) => {
                         let b = &self.stdout_buf[..n];
                         self.attrs.stdout_last = Some(SystemTime::now());
+                        // The log first: a client is a second reader, and
+                        // the log has these bytes whatever the client does.
+                        self.output_log.write(b);
                         self.parser.process(b);
                         // Never an awaited send: this arm runs only while the
                         // mailbox has a free slot, and nothing else fills it
@@ -2143,6 +2178,8 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             self.session_name.clone(),
             self.archives_dir.clone(),
             self.holds_host_row,
+            self.ends_with_entrypoint,
+            self.box_dir.clone(),
         )
         .await;
 

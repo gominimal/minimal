@@ -2115,3 +2115,53 @@ fn reap_and_prune_requests_round_trip() {
     assert_eq!(ReapBox::NAME, "minimald-v1-ReapBox");
     assert_eq!(PruneBoxes::NAME, "minimald-v1-PruneBoxes");
 }
+
+/// BOX-155: a log read's request and every update line survive the wire,
+/// raw terminal bytes included.
+#[test]
+fn read_log_request_round_trips() {
+    let id = SessionId::mint();
+    for (offset, follow) in [(0, false), (4096, true)] {
+        let req = ReadLogRequest { id, offset, follow };
+        let bytes = serde_json_lenient::to_vec(&req).unwrap();
+        let back: ReadLogRequest = serde_json_lenient::from_slice(&bytes).unwrap();
+        assert_eq!(back, req);
+    }
+    // A client that sends only the id reads the whole log without following.
+    let bare = format!(r#"{{"id":"{id}"}}"#);
+    let back: ReadLogRequest = serde_json_lenient::from_str(&bare).unwrap();
+    assert_eq!(back.offset, 0);
+    assert!(!back.follow);
+
+    let updates = [
+        ReadLogUpdate::Output {
+            offset: 0,
+            data: b"\x1b[1mbold\x1b[0m\r\n\xff\x00".to_vec(),
+        },
+        ReadLogUpdate::Output {
+            offset: 12,
+            data: Vec::new(),
+        },
+        ReadLogUpdate::Done { offset: 12 },
+        ReadLogUpdate::Reaped,
+        ReadLogUpdate::Failed {
+            error: "the log cannot be read".to_string(),
+        },
+    ];
+    for update in updates {
+        let line = serde_json_lenient::to_string(&update).unwrap();
+        assert!(!line.contains('\n'), "one update is one line: {line}");
+        let back: ReadLogUpdate = serde_json_lenient::from_str(&line).unwrap();
+        assert_eq!(
+            back.is_terminal(),
+            !matches!(update, ReadLogUpdate::Output { .. })
+        );
+        assert_eq!(back, update);
+    }
+    let output = serde_json_lenient::to_string(&ReadLogUpdate::Output {
+        offset: 0,
+        data: b"hi".to_vec(),
+    })
+    .unwrap();
+    assert!(output.contains(r#""data":"6869""#), "{output}");
+}
