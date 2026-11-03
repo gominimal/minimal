@@ -299,25 +299,34 @@ pub(crate) async fn handle_exec(
         }
         // BOX-153: a box whose stored spec sets `[io] exec_enabled = false`
         // takes no command, in any mode.
-        let disabled = match ExecBox::of(&session_handle).instrument(span.clone()).await {
-            Ok(exec_box) => exec_box.exec_disabled(),
+        let gate = match ExecBox::of(&session_handle).instrument(span.clone()).await {
+            Ok(exec_box) => exec_box.exec_gate(),
             Err(e) => {
                 tracing::warn!(%session_id, error = %e, "execution request rejected: the box is gone");
                 session.channel_failure(id)?;
                 return Ok(());
             }
         };
-        if disabled {
-            tracing::warn!(
-                parent: &span,
-                %session_id,
-                "execution request refused: the box's spec sets io.exec_enabled = false"
-            );
+        if gate != ExecGate::Enabled {
             let label = record
                 .name
                 .clone()
                 .unwrap_or_else(|| session_id.to_string());
-            let message = exec_disabled_message(&label);
+            let message = if gate == ExecGate::Disabled {
+                tracing::warn!(
+                    parent: &span,
+                    %session_id,
+                    "execution request refused: the box's spec sets io.exec_enabled = false"
+                );
+                exec_disabled_message(&label)
+            } else {
+                tracing::warn!(
+                    parent: &span,
+                    %session_id,
+                    "execution request refused: the box's stored spec cannot be read"
+                );
+                exec_spec_unreadable_message(&label)
+            };
             session.channel_success(id)?;
             spawn(async move {
                 answer_exec(channel, b"", message.as_bytes(), EXEC_DISABLED_STATUS).await;
@@ -497,6 +506,14 @@ pub(crate) const EXEC_DISABLED_STATUS: u32 = 5;
 /// The refusal of an exec into a box whose spec turns exec off (BOX-153).
 pub(crate) fn exec_disabled_message(box_label: &str) -> String {
     format!("box {box_label} does not run commands: its spec sets [io] exec_enabled = false.\n")
+}
+
+/// The refusal of an exec into a box whose stored spec cannot be read or
+/// parsed, so the exec gate fails closed (BOX-153).
+pub(crate) fn exec_spec_unreadable_message(box_label: &str) -> String {
+    format!(
+        "box {box_label} does not run commands: its stored spec cannot be read, so the daemon cannot check [io] exec_enabled.\n"
+    )
 }
 
 /// Runs an attached `min://exec`: an argv in the box with no shell, its stdio

@@ -3912,23 +3912,36 @@ wait"#;
     }
 
     /// BOX-153: only `io.exec_enabled = false` in the stored spec turns
-    /// exec off. No spec, no key, `true`, or bytes that are not JSON leave
-    /// it on.
+    /// exec off. No spec, no key, or `true` leave it on. Bytes that are not
+    /// JSON, or a spec that cannot be read, refuse: the gate fails closed.
     #[test]
     fn exec_disabled_reads_only_a_false_exec_enabled() {
+        use super::super::ExecGate;
         let disk = box_on_disk();
-        assert!(!disk.exec_box.exec_disabled(), "no stored spec");
+        assert_eq!(
+            disk.exec_box.exec_gate(),
+            ExecGate::Enabled,
+            "no stored spec"
+        );
         let spec = disk.exec_box.dir.join(boxes::store::SPEC_FILE);
-        for (text, disabled) in [
-            (r#"{"v":0,"io":{"exec_enabled":false}}"#, true),
-            (r#"{"v":0,"io":{"exec_enabled":true}}"#, false),
-            (r#"{"v":0,"io":{"pty_enabled":true}}"#, false),
-            (r#"{"v":0}"#, false),
-            ("not json", false),
+        for (text, gate) in [
+            (r#"{"v":0,"io":{"exec_enabled":false}}"#, ExecGate::Disabled),
+            (r#"{"v":0,"io":{"exec_enabled":true}}"#, ExecGate::Enabled),
+            (r#"{"v":0,"io":{"pty_enabled":true}}"#, ExecGate::Enabled),
+            (r#"{"v":0}"#, ExecGate::Enabled),
+            ("not json", ExecGate::SpecUnreadable),
         ] {
             std::fs::write(&spec, text).unwrap();
-            assert_eq!(disk.exec_box.exec_disabled(), disabled, "{text}");
+            assert_eq!(disk.exec_box.exec_gate(), gate, "{text}");
         }
+        // A spec path that is a directory reads as an error, not as absent.
+        std::fs::remove_file(&spec).unwrap();
+        std::fs::create_dir(&spec).unwrap();
+        assert_eq!(
+            disk.exec_box.exec_gate(),
+            ExecGate::SpecUnreadable,
+            "unreadable spec"
+        );
     }
 }
 

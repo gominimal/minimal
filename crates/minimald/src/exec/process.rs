@@ -1050,22 +1050,32 @@ impl ExecBox {
         Ok(Self { record, dir })
     }
 
-    /// Whether the spec stored beside the box's record sets
-    /// `io.exec_enabled = false` (BOX-153). It reads only that key, as the
-    /// PTY check of a resume reads `io.pty_enabled`. A box with no stored
-    /// spec, a spec without the key, or bytes that are not a JSON object
-    /// take commands.
-    pub(crate) fn exec_disabled(&self) -> bool {
+    /// Whether the spec stored beside the box's record lets the box run
+    /// commands (BOX-153). It reads only `io.exec_enabled`, as the PTY
+    /// check of a resume reads `io.pty_enabled`. A box with no stored spec,
+    /// or a spec without a `false` key, takes commands. The gate fails
+    /// closed: a stored spec that cannot be read or does not parse refuses.
+    pub(crate) fn exec_gate(&self) -> ExecGate {
         match std::fs::read(self.dir.join(boxes::store::SPEC_FILE)) {
-            Ok(bytes) => stored_spec_disables_exec(&bytes),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Ok(bytes) => match stored_spec_disables_exec(&bytes) {
+                Some(true) => ExecGate::Disabled,
+                Some(false) => ExecGate::Enabled,
+                None => {
+                    tracing::warn!(
+                        box_id = %self.record.id,
+                        "exec: the box's stored spec does not parse; exec refused"
+                    );
+                    ExecGate::SpecUnreadable
+                }
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => ExecGate::Enabled,
             Err(error) => {
                 tracing::warn!(
                     box_id = %self.record.id,
                     %error,
-                    "exec: could not read the box's stored spec; exec stays enabled"
+                    "exec: could not read the box's stored spec; exec refused"
                 );
-                false
+                ExecGate::SpecUnreadable
             }
         }
     }
@@ -1124,12 +1134,27 @@ impl ExecBox {
     }
 }
 
+/// What the stored spec says about exec (BOX-153).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecGate {
+    /// The box takes commands.
+    Enabled,
+    /// The spec sets `io.exec_enabled = false`.
+    Disabled,
+    /// A stored spec exists but cannot be read or parsed, so the gate
+    /// refuses.
+    SpecUnreadable,
+}
+
 /// Whether the spec `bytes` set `io.exec_enabled = false` (BOX-153).
-pub(crate) fn stored_spec_disables_exec(bytes: &[u8]) -> bool {
-    serde_json_lenient::from_slice::<serde_json_lenient::Value>(bytes)
-        .ok()
-        .and_then(|spec| spec.get("io")?.get("exec_enabled")?.as_bool())
-        == Some(false)
+/// `None` when the bytes do not parse as JSON.
+pub(crate) fn stored_spec_disables_exec(bytes: &[u8]) -> Option<bool> {
+    let spec = serde_json_lenient::from_slice::<serde_json_lenient::Value>(bytes).ok()?;
+    Some(
+        spec.get("io")
+            .and_then(|io| io.get("exec_enabled")?.as_bool())
+            == Some(false),
+    )
 }
 
 /// Who ran an exec and what it ran, as its events carry them (BOX-152).
