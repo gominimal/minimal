@@ -30,9 +30,12 @@ impl HostCapacity {
     #[must_use]
     pub fn probe() -> Self {
         let logical_cores = crate::cmd::host_logical_cores();
-        let mut sys = sysinfo::System::new();
-        sys.refresh_memory();
-        let total_mib = u32::try_from(sys.total_memory() / (1024 * 1024)).unwrap_or(u32::MAX);
+        // An unsupported platform reports no memory, as sysinfo 0.39 did.
+        let total_bytes = sysinfo::System::new().map_or(0, |mut sys| {
+            sys.refresh_memory();
+            sys.total_memory()
+        });
+        let total_mib = u32::try_from(total_bytes / (1024 * 1024)).unwrap_or(u32::MAX);
         Self {
             logical_cores,
             total_mib,

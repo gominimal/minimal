@@ -350,7 +350,7 @@ fn detect_resource_pool() -> Option<ResourcePool> {
         .get()
         .try_into()
         .ok()?;
-    let mut system = sysinfo::System::new();
+    let mut system = sysinfo::System::new().ok()?;
     system.refresh_memory();
     let memory_bytes = system.total_memory();
 

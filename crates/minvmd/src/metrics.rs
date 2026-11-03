@@ -44,7 +44,7 @@ pub fn sample(pid: u32) -> Option<VmMetrics> {
     let pid = Pid::from_u32(pid);
     let targets = ProcessesToUpdate::Some(&[pid]);
 
-    let mut sys = System::new();
+    let mut sys = System::new().ok()?;
     // First refresh seeds the CPU baseline; the process must exist now.
     sys.refresh_processes(targets, true);
     sys.process(pid)?;
