@@ -68,7 +68,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
   verify:   cargo nextest run -p minimal prune_off_tty_needs_yes
 
 - **BCLI-006** THE SYSTEM SHALL report the disk held by each stopped or exited box in `min box show` and the sum in `min box prune --dry-run`.
-  <!-- ubiquitous; BOX-021 has no dry run and BOX-159 returns no disk figure, so both halves wait on BOX amendments (Rollout) -->
+  <!-- ubiquitous; BOX-021 has no dry run and BOX-159 returns no disk figure, so both halves wait on the BOX amendments gominimal/minimal#2834 tracks (Rollout) -->
   tier:     T0
   verify:   cargo nextest run -p minimal show_and_prune_dry_run_report_disk
 
@@ -121,7 +121,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     tier:   T0
     verify: cargo nextest run -p minimal box_wait_orphaned_stopped_record_returns_137
   - IF `min box wait --timeout <d>` reaches `<d>` before the box ends THEN THE SYSTEM SHALL return 124 and emit a machine-mode error with `code = "timeout"`. It SHALL leave the box running.
-    <!-- unwanted; the GNU `timeout` convention the architecture's 124 row borrows; that row names only the box's own timeout (Open questions) -->
+    <!-- unwanted; the GNU `timeout` convention the architecture's 124 row borrows; that row names only the box's own timeout (gominimal/arch#160, Open questions) -->
     tier:   T0
     verify: cargo nextest run -p minimal box_wait_timeout_flag_returns_124_box_runs_on
 
@@ -342,7 +342,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
 - **BCLI-068** WHEN `min box attach <box>` runs without `--exec` against a box whose spec sets `pty_enabled` THE SYSTEM SHALL re-attach the caller's terminal to the box's PTY.
   tier:     T0
   verify:   cargo nextest run -p minimal box_attach_reattaches_pty_box
-  - IF `min box attach` runs without a client TTY THEN THE SYSTEM SHALL fail with exit 2.
+  - IF `min box attach` runs without a client TTY THEN THE SYSTEM SHALL fail with exit 2. It SHALL fail before it resumes the box (BCLI-007), so the box's state and events stay unchanged.
     <!-- unwanted; the architecture's `min box attach` paragraph and design principle 3 -->
     tier:   T0
     verify: cargo nextest run -p minimal box_attach_without_tty_exit2
@@ -379,11 +379,11 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     <!-- unwanted; a PTY exec can run in any box, not only the one the bare form finds -->
     tier:   T0
     verify: cargo nextest run -p minimal box_attach_exec_without_box_exit2
-  - WHEN an attach ends because the caller detaches or the box's entrypoint exits THE SYSTEM SHALL return 0 as its exit code.
+  - WHEN the caller detaches, or the box's entrypoint exits on its own, THE SYSTEM SHALL end the attach with exit code 0.
     <!-- event-driven; this covers `min box attach` and `min session attach`, with or without `--exec` -->
     tier:   T0
     verify: cargo nextest run -p minimal attach_detach_or_entrypoint_exit_returns_0
-  - IF the daemon ends an attach from the other side THEN THE SYSTEM SHALL exit with 254 after one stderr line that names the cause. The other side is a stop or removal of the box, or another client that takes its PTY.
+  - IF the daemon ends an attach from the other side THEN THE SYSTEM SHALL exit with 254 after one stderr line that names the cause. The other side is a stop or removal of the box, or another client that takes its PTY. A stop or removal gives 254 although it also ends the entrypoint.
     tier:   T0
     verify: cargo nextest run -p minimal attach_ended_from_other_side_notice_exit254
   - IF the connection to the box's host fails during an attach THEN THE SYSTEM SHALL fail with exit 7 naming the host.
@@ -425,7 +425,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
   tier:     T0
   verify:   cargo nextest run -p minimal box_cp_reads_stopped_box_as_box_017
 
-- **BCLI-042** THE SYSTEM SHALL accept each old spelling below as a hidden alias for one release. Each alias SHALL print one stderr hint naming the replacement after the command ends, and leave `-o json` output unchanged. `session activate` maps to `session start` as its sub-bullets state. `session destroy` maps to `box rm --force`, with or without `--force`. `session exec` maps to `box exec`. One command argument runs as the box's shell `-c '<argument>'`, as today, and the hint names `min box exec <box> -- sh -c '…'`. `session rename` maps to `box rename`. `session policy` maps to `box show --network`, with its `-o`. `session hooks` maps to `box spec <box>`, and its `--json` to `-o json`. `task run --keep` maps to `task run`, which ignores `--keep`, and `task run --path <dir>` to the global `-C <dir>`. Bare `stop` maps to `host stop` on the local host today's `min stop` stops, with the global flags passed through unchanged. Without `--force`, the alias refuses while boxes run on that host, as `min stop` does today. With `--force`, it maps to `host stop --force`.
+- **BCLI-042** THE SYSTEM SHALL accept each old spelling below as a hidden alias until its window ends. Each alias SHALL print one stderr hint naming the replacement after the command ends, and leave `-o json` output unchanged. `session activate` maps to `session start` as its sub-bullets state. `session destroy` maps to `box rm --force`, with or without `--force`. `session exec` maps to `box exec`. One command argument runs as the box's shell `-c '<argument>'`, as today, and the hint names `min box exec <box> -- sh -c '…'`. `session rename` maps to `box rename`. `session policy` maps to `box show --network`, with its `-o`. `session hooks <name>` resolves `<name>` as a box address (BCLI-002) and maps to `box spec <box-id>` for that box, never to an entry of the same name. Its `--json` maps to `-o json`. `task run --keep` maps to `task run`, which ignores `--keep`, and `task run --path <dir>` to the global `-C <dir>`. Bare `stop` maps to `host stop` on the local host today's `min stop` stops, with the global flags passed through unchanged. Without `--force`, the alias refuses while boxes run on that host, as `min stop` does today. With `--force`, it maps to `host stop --force`.
   <!-- the mapping follows epic S12. `session destroy` maps to the forced reap (BOX-019) so a live box is still stopped and removed and BEP-043's revoke-on-destroy fires; a bare `session rm` of a running box is refused (BCLI-004). `session hooks` maps to the hook rows of `box spec <box>` (BCLI-022), since the record `box show` renders holds no hooks. A bare `session attach` is no alias: it is BCLI-032's permanent form -->
   tier:     T0
   verify:   cargo nextest run -p minimal legacy_session_verbs_alias_with_hint
@@ -448,7 +448,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
     <!-- unwanted; an alias never drops a flag, so a flag a later release adds to an old spelling is refused until a mapping names it -->
     tier:   T0
     verify: cargo nextest run -p minimal alias_unmapped_flag_exit2_names_flag
-  - IF a caller uses an alias after its one-release window THEN THE SYSTEM SHALL fail with exit 2 and the same hint. This applies to every alias of BCLI-042 and BCLI-046.
+  - IF a caller uses an alias after its window ends THEN THE SYSTEM SHALL fail with exit 2 and the same hint. An alias's window ends one release after every requirement and script that the Rollout lists for it uses the new spelling. This applies to every alias of BCLI-042 and BCLI-046.
     tier:   T0
     verify: cargo nextest run -p minimal aliases_exit2_after_grace_release
 
@@ -530,7 +530,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
 
 **A secret is never rendered, in any output mode.** BCLI-063 is T1, with a property over every output mode and every secret-bearing field. The invariant is a universal. One example test leaves every untested mode free to leak.
 
-**Old spellings hint for one release, then fail.** This spec takes the architecture's command tree verbatim, apart from the daily shortcuts. It adds `min box rename`, `min box attach` (BCLI-068), `min box exec --timeout` (BCLI-053), `--name` on the create verbs (BCLI-069) and `min host stop`. It also adds `min box prune --dry-run` (BCLI-006) and the create-time `--network` and `--ingress` overrides (BCLI-024). `min box spec <entry>` accepts those overrides too, so the pre-flight render is what the daemon receives (BCLI-021). The architecture has every one of them (gominimal/arch#117, gominimal/arch#124). The architecture's `min box prune` has no `--stopped` (gominimal/arch#112), so BCLI-061 does not accept it. `session destroy` maps to `box rm --force`, because the forced reap still stops a live session and removes it, and BEP-043's revoke-on-destroy still fires. A plain `session rm` refuses a running box (BCLI-004). `session policy` stays reachable as an alias of `box show --network` (BCLI-025). That successor shows NET-061's effective egress and the exposures of the draft GWI-003. Every old spelling stays as a hidden alias for one release, and prints one hint naming its replacement. The release after, it fails with exit 2 and the same hint (BCLI-042, BCLI-046). The old spellings are the session verbs except `session run`, `task run --keep`, bare `min stop`, and the `local-minimald` provider value. Bare `min stop` maps to `min host stop` because today it stops the daemon. During its window the alias keeps today's refusal while boxes run, so a script that relied on that refusal never stops running boxes.
+**Old spellings hint for one release, then fail.** This spec takes the architecture's command tree verbatim, apart from the daily shortcuts. It adds `min box rename`, `min box attach` (BCLI-068), `min box exec --timeout` (BCLI-053), `--name` on the create verbs (BCLI-069) and `min host stop`. It also adds `min box prune --dry-run` (BCLI-006) and the create-time `--network` and `--ingress` overrides (BCLI-024). `min box spec <entry>` accepts those overrides too, so the pre-flight render is what the daemon receives (BCLI-021). The architecture has every one of them (gominimal/arch#117, gominimal/arch#124). The architecture's `min box prune` has no `--stopped` (gominimal/arch#112), so BCLI-061 does not accept it. `session destroy` maps to `box rm --force`, because the forced reap still stops a live session and removes it, and BEP-043's revoke-on-destroy still fires. A plain `session rm` refuses a running box (BCLI-004). `session policy` stays reachable as an alias of `box show --network` (BCLI-025). That successor shows NET-061's effective egress and the exposures of the draft GWI-003. Every old spelling stays as a hidden alias, and prints one hint naming its replacement. Its window ends one release after every requirement and script that the Rollout lists for it uses the new spelling. After that, it fails with exit 2 and the same hint (BCLI-042, BCLI-046). The old spellings are the session verbs except `session run`, `task run --keep`, bare `min stop`, and the `local-minimald` provider value. Bare `min stop` maps to `min host stop` because today it stops the daemon. During its window the alias keeps today's refusal while boxes run, so a script that relied on that refusal never stops running boxes.
 
 **`session activate` keeps its behaviour through the window, and an alias never drops a flag.** Today `min session activate` attaches only under `--attach`, and it succeeds off a TTY. `min session start` attaches a PTY box by default, and refuses off a TTY without `--detach` (BCLI-029). So the alias maps a plain `activate` to `start --detach`, and `activate --attach` to `start`. Every script and end-to-end setup that calls `activate` then keeps working until the alias expires. Each of today's `activate` flags keeps its meaning through a mapping (BCLI-042). A flag with no mapping fails with exit 2. A silent drop of `--deny-all-egress` starts the box with egress open, which is the failure that rule prevents. A second `activate` under a name a running box holds gets BOX-163's refusal, as it does today, and the alias adds no `--new`. `session hooks` maps to `box spec <box>`, which lists each hook with the loadout or project that declared it (BCLI-022). The record that `box show` renders does not hold hooks.
 
@@ -574,7 +574,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
 
 **BCLI-074 needs a restart operation that BOX does not define.** BCLI-074 drives the restart of a box whose spec sets `lifetime = "until_stopped"`. BOX resumes only a box whose spec sets `pty_enabled` (BOX-025, BOX-030). Its Non-goals send the `until_stopped` rules to the Agent Box epic gominimal/inbox#678. BCLI-074 needs a daemon operation that restarts an `until_stopped` box, and so do the hints of BCLI-009 and BCLI-068 that name `min box restart <box>`. That operation comes from an amendment to `docs/specs/29-spec-box-local-first` in its own PR, tracked by gominimal/minimal#2761. BCLI-074 and those hints depend on it.
 
-**BCLI-006 needs a dry run and a disk figure that BOX does not define.** `min box prune --dry-run` needs a prune that lists what it matches and the disk each box holds, and reaps nothing. BOX-021 defines no such mode. gominimal/minimal#2834 tracks that mode and the BOX-021 amendment that names it. The `min box show` half needs the disk a stopped or exited box holds, and the record BOX-159 returns has no such figure. A BOX-159 amendment adds it. BCLI-006 depends on both.
+**BCLI-006 needs a dry run and a disk figure that BOX does not define.** `min box prune --dry-run` needs a prune that lists what it matches and the disk each box holds, and reaps nothing. BOX-021 defines no such mode. gominimal/minimal#2834 tracks that mode and the BOX-021 amendment that names it. The `min box show` half needs the disk a stopped or exited box holds, and the record BOX-159 returns has no such figure. The same issue tracks the BOX-159 amendment that adds it. The figure counts what a reap frees and excludes Box Volumes, which a reap leaves in place (BVOL-008). BCLI-006 depends on gominimal/minimal#2834.
 
 **Merged requirements and scripts cite spellings BCLI-042 and BCLI-046 remove.** These requirements on main cite an old spelling:
 
@@ -585,14 +585,14 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
 - `min session exec`: a NET-015 sub-bullet and TEL-031.
 - Bare `min stop`: TEL-011, and the installer's R5.5. The installer, `scripts/install.sh`, runs `min stop` and matches its refusal for live sessions by message. Without that match it runs `min stop --force`. The end-to-end scripts `scripts/session-e2e.sh`, `scripts/stress-session-e2e.sh` and `scripts/bulk-upload-e2e.sh`, and the installer's tests in `scripts/install_test.sh`, call `min stop` too.
 
-BCLI-042's sub-bullet expires each BCLI-042 or BCLI-046 alias after the release that accepted it. That expiry takes effect only once every requirement listed for the alias cites the new spelling. Each script listed for the alias must call the new spelling first too. So the installer changes first. Once bare `min stop` fails, an installer that still calls it does not see the refusal it matches. It then force-stops every upgrade.
+BCLI-042's sub-bullet ends an alias's window one release after the requirements and scripts listed for it below use the new spelling. So the installer changes first. Once bare `min stop` fails, an installer that still calls it does not see the refusal it matches. It then force-stops every upgrade.
 
 The same NET-015 sub-bullet also cites `min session run`, which BCLI-066 refuses at once, with no alias window. A task runs as its own box, not inside a session, so NET-015 must cite `min task run` before the release that contains BCLI-066.
 
 ## Open questions
 
 - [NEEDS CLARIFICATION (MEDIUM): nesting has no owner. The BOX Non-goals name gominimal/inbox#568, which closed as a duplicate, and gominimal/inbox#572 closed as not planned. `min box wait --parent` and `--parent self` wait on whichever spec or epic takes nesting up.]
-- [NEEDS CLARIFICATION (MEDIUM): `min box sync`, `min box port`, `min box add`, `min host create|pause|resume|rm` and `min provider show|add|rm|login|use` have no owner. The architecture names them, BPA defines the provider operations under the host and provider verbs, and BPA names this spec for the grammar. An issue that schedules these verbs is their destination.]
-- [NEEDS CLARIFICATION (MEDIUM): the architecture's grammar has no `--no-hooks` and no `--sync`. BCLI-042 keeps both on `min session activate` for its window only. After it, nothing disables a box's lifecycle hooks at creation. The lifecycle-hooks spec and the architecture decide whether `min box start` takes such a flag.]
-- [NEEDS CLARIFICATION (LOW): the architecture's 124 row names only a box that its own `timeout` ended. BCLI-013 returns 124 when `min box wait --timeout` elapses too, with the box still running, the GNU `timeout` convention. The architecture's exit-code table has to state this case.]
+- [NEEDS CLARIFICATION (MEDIUM): `min box sync`, `min box port`, `min box add`, `min host create|pause|resume|rm` and `min provider show|add|rm|login|use` have no owner. The architecture names them, BPA defines the provider operations under the host and provider verbs, and BPA names this spec for the grammar. gominimal/minimal#2868 decides which spec owns each verb and schedules them.]
+- [NEEDS CLARIFICATION (MEDIUM): the architecture's grammar has no `--no-hooks` and no `--sync`. BCLI-042 keeps both on `min session activate` for its window only. After it, nothing disables a box's lifecycle hooks at creation. The architecture decides whether `min box start` takes such a flag in gominimal/arch#161, and the lifecycle-hooks spec follows it.]
+- [NEEDS CLARIFICATION (LOW): the architecture's 124 row names only a box that its own `timeout` ended. BCLI-013 returns 124 when `min box wait --timeout` elapses too, with the box still running, the GNU `timeout` convention. The architecture's exit-code table has to state this case (gominimal/arch#160).]
 - [NEEDS CLARIFICATION (LOW): `min box spec` tries a directory before an entry name (BCLI-021, BCLI-022). So a bare name cannot reach an entry that shares its name with a directory here. One fix moves the path form to `--repo-dir`, with a one-release alias. Another gives the entry form a marker that a path cannot carry. Until someone picks one, the directory comes first.]
