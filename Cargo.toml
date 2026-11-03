@@ -45,7 +45,7 @@ package.license = "Apache-2.0"
 # Minimum supported Rust version, verified by the nightly `msrv` job
 # (`cargo hack check --rust-version`). Every crate inherits this via
 # `rust-version.workspace = true`; bump here, in one place, when the floor moves.
-# 1.95 is the dependency-driven floor (sysinfo 0.39 requires rustc 1.95); no
+# 1.95 is the dependency-driven floor (sysinfo 0.40 requires rustc 1.95); no
 # resolved dependency requires newer. The build toolchain pin is 1.97.0.
 package.rust-version = "1.95"
 # The DECLARED next release. The `version` crate builds every dev version on
@@ -227,7 +227,7 @@ smallvec = {version = "1.15", features = ["serde"]}
 # adapters — the frames arrive over the shuttle's channels, not a host
 # interface.
 smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp", "socket-icmp", "iface-max-addr-count-4"] }
-sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+sysinfo = { version = "0.40", default-features = false, features = ["system"] }
 tar = "0.4"
 tempfile = "3.27"
 tokio = { version = "1.53", features = ["full"] }
