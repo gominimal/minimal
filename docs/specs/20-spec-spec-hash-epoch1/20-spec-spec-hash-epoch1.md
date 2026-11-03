@@ -277,7 +277,13 @@ build-infra operator. Release manager.
     property: encode({Av: B}) != encode({A: vB})
 
 - **EPOCH-014** WHEN the system computes a container key THE SYSTEM SHALL
-  enter each member package by its key under the container's epoch.
+  enter each member package by its key under the container's epoch. A
+  container's epoch is the one the producing side is configured to seal
+  at: the same value that selects the spec and subset encoders, epoch 1
+  once the flip has moved it (EPOCH-015 derives the key under the epoch-1
+  context). Before the flip a container key is an epoch-0 key; no index
+  records one today, and the epoch-0 container witness (EPOCH-013) is a
+  property of that encoding, not of a stored key.
   tier:     T1
   verify:   cargo nextest run -p graph epoch1_container_members_by_key
   property: for all containers c, members m of c: the member bytes of
@@ -506,11 +512,12 @@ reuses them.
 
 - **Deploy:** the client that reads the epoch from an index goes out in a
   release first (EPOCH-009, EPOCH-012). An older client refuses an epoch-1
-  index. Then the producing side flips at one config-plumbed call site. The
+  index. Then the producing side flips: one config value moves the three
+  encoder call sites (spec, subset, container) together, so no container
+  or subset stays on epoch 0 behind a flipped spec site (EPOCH-014). The
   producing side is build infrastructure, remote execution and the hosts
   that seal new indices. Consumers never flip. They follow the epoch their
-  pinned index declares. The container call site flips with the producing
-  side (EPOCH-014). The root index reseals under epoch 1 in the same cycle
+  pinned index declares. The root index reseals under epoch 1 in the same cycle
   that seals the first epoch-1 snapshot. Until it does, the snapshot's
   root-index fallback is withheld (EPOCH-012). No lookup unions the two
   epochs, and for a client at or after the reading release the flip shows
@@ -520,7 +527,7 @@ reuses them.
   container with a member of another epoch is refused (EPOCH-014). Both
   end when the sideloads and the container's members reseal under epoch 1,
   which the producing side does in the same cycle as the root index: one
-  call site, one flip. A client before the reading release refuses the
+  config value, one flip. A client before the reading release refuses the
   first epoch-1 index as any unknown epoch (EPOCH-009), which is why the
   reading release ships first and the flip waits until the fleet is on
   it. The catalog
