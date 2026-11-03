@@ -4654,6 +4654,21 @@ impl BoxRegistry {
         self.host_ip_id_set().by_name.get(name).copied()
     }
 
+    /// Withdraws the `host_ip` registration name `name` while it still
+    /// answers `id`: the creator's activation failed after it registered,
+    /// so no box will retire under the name ([`Self::retire_host_ip_box`]).
+    /// A name a later registration took answers another id and stays. The
+    /// id stays for the collision check (BEP-082). Returns whether the name
+    /// was withdrawn.
+    pub fn withdraw_host_ip_name(&self, name: &str, id: BoxId) -> bool {
+        let mut ids = self.host_ip_id_set();
+        if ids.by_name.get(name) != Some(&id) {
+            return false;
+        }
+        ids.by_name.remove(name);
+        true
+    }
+
     /// [`Self::register_client_box_at`] with the freshly minted `id` it
     /// creates the box as: the one door the collision checks guard, split
     /// out so a test can drive a colliding mint.

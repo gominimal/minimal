@@ -1060,6 +1060,12 @@ fn serve_request(
             let reply = registration_reply(boxes, answerer, order, request);
             write_reply(stream, &reply)
         }
+        (BoxControlRequest::Withdraw(request), ControlDoor::Host)
+            if host_ip_withdrawal(&request).is_some() =>
+        {
+            let reply = order.apply(|| withdraw_host_ip_name(boxes, &request));
+            write_reply(stream, &reply)
+        }
         (BoxControlRequest::Withdraw(request), ControlDoor::Host) => {
             let reply = order.apply(|| {
                 let (name, switch_address) = (request.name.clone(), request.switch_address);
@@ -2248,6 +2254,46 @@ fn withdraw_box(
             }
         }
     }
+}
+
+/// The id a withdrawal names when it withdraws a `host_ip` registration
+/// (BEP-082): a `host_ip` box has no address pair, so its creator sends
+/// the unspecified pair and the id the registration handed back.
+fn host_ip_withdrawal(request: &WithdrawBoxRequest) -> Option<minimald_rpc::BoxId> {
+    (request.switch_address.is_unspecified() && request.loopback_address.is_unspecified())
+        .then_some(request.box_id)
+        .flatten()
+}
+
+/// Withdraw the `host_ip` registration name an activation that failed
+/// after it registered leaves behind, so a later box under the name takes
+/// a fresh id. The reply echoes the unspecified pair, as a row
+/// withdrawal echoes its own. A name that no longer answers the id is the
+/// goal state already holding: the box retired, or a later registration
+/// took the name.
+fn withdraw_host_ip_name(boxes: &BoxRegistry, request: &WithdrawBoxRequest) -> BoxControlReply {
+    if let Some(id) = host_ip_withdrawal(request) {
+        let box_id = id.to_string();
+        if boxes.withdraw_host_ip_name(&request.name, id.to_bytes()) {
+            tracing::info!(
+                box = %request.name,
+                box_id = %box_id,
+                network = "host_ip",
+                "withdrew the host_ip box's registration name; a later box under the name \
+                 takes a fresh id"
+            );
+        } else {
+            tracing::debug!(
+                box = %request.name,
+                box_id = %box_id,
+                "no host_ip registration name answers the withdrawn id; already withdrawn"
+            );
+        }
+    }
+    BoxControlReply::Addresses(BoxAddresses {
+        switch_address: request.switch_address,
+        loopback_address: request.loopback_address,
+    })
 }
 
 /// Hold a `host_ip` box's name in the host's zone with no row behind it,
@@ -4288,6 +4334,50 @@ mod tests {
                 );
             }
             other => panic!("a retired box's name takes a fresh mint, got {other:?}"),
+        }
+
+        // An activation that fails after it registered withdraws the name
+        // with the id it was handed: no box retires under the name, and a
+        // later box under it takes a fresh id. A withdrawal with another id
+        // leaves the name.
+        let failed = match register(&sock_path, &request).expect("answered") {
+            BoxControlReply::BoxIdMinted { minted_box_id } => minted_box_id,
+            other => panic!("a host_ip registration is answered with a box id, got {other:?}"),
+        };
+        let withdraw = |box_id| {
+            control(
+                &sock_path,
+                &BoxControlRequest::Withdraw(WithdrawBoxRequest {
+                    name: "agent".to_string(),
+                    switch_address: Ipv4Addr::UNSPECIFIED,
+                    loopback_address: Ipv4Addr::UNSPECIFIED,
+                    box_id: Some(box_id),
+                }),
+            )
+            .expect("the withdrawal is answered")
+        };
+        let unspecified = BoxControlReply::Addresses(BoxAddresses {
+            switch_address: Ipv4Addr::UNSPECIFIED,
+            loopback_address: Ipv4Addr::UNSPECIFIED,
+        });
+        assert_eq!(withdraw(registered), unspecified);
+        assert_eq!(
+            registry.host_ip_id_for("agent"),
+            Some(failed.to_bytes()),
+            "a withdrawal with another id leaves the name"
+        );
+        assert_eq!(withdraw(failed), unspecified);
+        assert_eq!(registry.host_ip_id_for("agent"), None);
+        assert!(
+            registry.holds_host_ip_id(failed.to_bytes()),
+            "the withdrawn box's id stays for the collision check"
+        );
+        match ask("agent", "create-d") {
+            BoxControlReply::BoxIdMinted { minted_box_id } => assert_ne!(
+                minted_box_id, failed,
+                "a box after a failed activation is a new creation"
+            ),
+            other => panic!("a withdrawn name takes a fresh mint, got {other:?}"),
         }
     }
 
