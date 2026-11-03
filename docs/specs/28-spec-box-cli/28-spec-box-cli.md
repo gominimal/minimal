@@ -584,11 +584,11 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
 **Merged requirements and scripts cite spellings BCLI-042 and BCLI-046 remove.** These requirements and scripts on main use an old spelling. `scripts/session-e2e.sh` is the VM lane's session proof, and BCLI-049's verify line runs it. Each alias it calls stays open until it moves:
 
 - `min session activate`: NET-018, NET-020, NET-035, NET-040, NET-049, NET-051 and NET-122, the last in a sub-bullet's comment. A BOX-001 sub-bullet cites it too. The installer's closing card names `min session activate --attach .` (`docs/specs/07-spec-installer`, R10.4). The lifecycle-hooks spec cites `min session activate --no-hooks` (`docs/specs/11-spec-lifecycle-hooks`). Scripts: `scripts/session-e2e.sh`, `scripts/bulk-upload-e2e.sh`, `scripts/stress-session-e2e.sh` and `scripts/kernel-bump-review.sh`.
-- `min session policy`: NET-044, NET-061, NET-075, NET-130 (in a sub-bullet's comment), NET-140 and NET-146, and BEP-085's comment. The draft GWI-003 cites it too. Script: `scripts/session-e2e.sh`.
+- `min session policy`: NET-044, NET-058, NET-061, NET-075, NET-130 (in a sub-bullet's comment), NET-140, NET-146 and a NET-160 sub-bullet's comment, and BEP-085's comment. The draft GWI-003 cites it too. Script: `scripts/session-e2e.sh`.
 - `min session hooks`: the lifecycle-hooks spec. Script: `scripts/session-e2e.sh`.
 - `min session rename`: no requirement. Script: `scripts/session-e2e.sh`.
-- `min session destroy`: BEP-043. Scripts: `scripts/session-e2e.sh`, and `scripts/bulk-upload-e2e.sh`, whose cleanup runs `session destroy --all --force`.
-- `min session exec`: a NET-015 sub-bullet and TEL-031. Script: `scripts/session-e2e.sh`.
+- `min session destroy`: NET-058 and BEP-043. Scripts: `scripts/session-e2e.sh`, and `scripts/bulk-upload-e2e.sh`, whose cleanup runs `session destroy --all --force`.
+- `min session exec`: NET-058, a NET-015 sub-bullet and TEL-031. Script: `scripts/session-e2e.sh`.
 - Bare `min stop`: TEL-011, and the installer's R5.5. The installer, `scripts/install.sh`, runs `min stop` and matches its refusal for live sessions by message. Without that match it runs `min stop --force`. The end-to-end scripts `scripts/session-e2e.sh`, `scripts/stress-session-e2e.sh` and `scripts/bulk-upload-e2e.sh`, and the installer's tests in `scripts/install_test.sh`, call `min stop` too.
 
 BCLI-042's sub-bullet ends an alias's window one release after the requirements and scripts listed for it above use the new spelling. So the installer changes first. Once bare `min stop` fails, an installer that still calls it does not see the refusal it matches. It then force-stops every upgrade.
