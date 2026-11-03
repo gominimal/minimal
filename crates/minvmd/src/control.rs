@@ -4105,11 +4105,6 @@ mod tests {
         }
     }
 
-    /// NET-138 over the control socket: a registration that asks for task
-    /// slots is handed one task address per slot — capped at
-    /// [`minimald_rpc::TASK_SLOTS_PER_BOX`] — each from the hand-out run and
-    /// each a published row of the box's, carrying its id; the creator's
-    /// withdrawal of the box takes them with it.
     /// BEP-082: a `host_ip` registration is answered with a box id and no
     /// address. Each registration is a new creation with its own id, the
     /// same name included, and none of them puts a row in the address
@@ -4157,6 +4152,11 @@ mod tests {
         assert_eq!(registry.table().rows().len(), 1);
     }
 
+    /// NET-138 over the control socket: a registration that asks for task
+    /// slots is handed one task address per slot — capped at
+    /// [`minimald_rpc::TASK_SLOTS_PER_BOX`] — each from the hand-out run and
+    /// each a published row of the box's, carrying its id; the creator's
+    /// withdrawal of the box takes them with it.
     #[test]
     fn task_addresses_registered_with_box_and_handed() {
         let dir = tempfile::TempDir::new().expect("temp dir");

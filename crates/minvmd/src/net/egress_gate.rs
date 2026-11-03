@@ -6146,6 +6146,10 @@ fn gate_verdict(
     row_verdict(summary, l4, table, baseline, pins, src)
 }
 
+/// The TCP port at the Box Egress Proxy's address that a `host_ip` cohort
+/// reaches while its lane is open, beside the listener port (BEP-083).
+const HOST_IP_PROXY_TLS_PORT: u16 = 443;
+
 /// The decision for a box-marked frame from the node address under the
 /// in-force baseline (NET-085, design §4.3 rule 2): admitted when one
 /// resident `host_ip` box's rules admit it, and dropped under
@@ -6159,9 +6163,11 @@ fn gate_verdict(
 /// the names the resident boxes declared. The Box Egress Proxy's listener is
 /// decided by the cohort's lane (BEP-083): the union of the resident
 /// members' declarations. While one member declares a credentialed
-/// upstream, the listener ports are admitted ([`GateAdmit::ProxyLane`]).
-/// While none does, every frame to the proxy's address drops under
-/// [`PROXY_LANE_RULE`].
+/// upstream, two ports at the proxy's address are admitted
+/// ([`GateAdmit::ProxyLane`]): the proxy's listener port, and TCP 443
+/// ([`HOST_IP_PROXY_TLS_PORT`]). UDP 443 and every other port at that
+/// address still drop. While no member declares one, every frame to the
+/// proxy's address drops under [`PROXY_LANE_RULE`].
 fn host_ip_verdict(
     summary: &FrameSummary,
     l4: Option<&dns_pins::L4Packet>,
@@ -6190,7 +6196,14 @@ fn host_ip_verdict(
             .filter(|rules| rules.declares_credentialed_upstream())
             .count();
         let listener = egress::ProxyListener::at(dst);
-        let admitted = egress::proxy_lane_admits(declaring > 0, listener, summary);
+        // BEP-083: the cohort lane opens the listener and TCP 443 at the
+        // proxy's address. The shared `proxy_lane_admits` stays the
+        // listener's alone, because an own-address box's direct TLS is
+        // BEP-080's.
+        let tls = declaring > 0
+            && summary.protocol() == Some(egress::IPPROTO_TCP)
+            && dst_port == HOST_IP_PROXY_TLS_PORT;
+        let admitted = egress::proxy_lane_admits(declaring > 0, listener, summary) || tls;
         tracing::debug!(
             source = %Ipv4Addr::from(src),
             destination = %Ipv4Addr::from(dst),
@@ -16227,14 +16240,6 @@ mod tests {
         ));
     }
 
-    /// The node address carries two senders: the guest daemon and every
-    /// `host_ip` box, the default network mode. The guest's classifier
-    /// writes the sender's cgroup into the frame as the box mark. A marked
-    /// frame at the node address is decided by the resident `host_ip`
-    /// boxes' rules, which the host-side client registered, so a default
-    /// session keeps its outbound network (NET-107). Root in the guest can
-    /// write the mark too, so with no `host_ip` box resident the same frame
-    /// drops (NET-085).
     /// A box-marked TCP frame from the node address to the Box Egress
     /// Proxy's address at `port`, decided by the gate.
     fn host_ip_cohort_to_proxy(
@@ -16243,10 +16248,22 @@ mod tests {
         pins: &dns_pins::DnsPins,
         port: u16,
     ) -> Result<GateAdmit, GateDrop> {
+        host_ip_cohort_to_proxy_over(table, baseline, pins, 6, port)
+    }
+
+    /// A box-marked frame of IP protocol `proto` from the node address to
+    /// the Box Egress Proxy's address at `port`, decided by the gate.
+    fn host_ip_cohort_to_proxy_over(
+        table: &BoxTable,
+        baseline: &NodePlaneBaseline,
+        pins: &dns_pins::DnsPins,
+        proto: u8,
+        port: u16,
+    ) -> Result<GateAdmit, GateDrop> {
         let node = SUBNET.daemon_ip().octets();
         let proxy = SUBNET.box_egress_proxy_address().octets();
         let frame =
-            boxes::core::egress::summarize(&box_cohort_frame(ipv4_frame(node, 6, proxy, port)));
+            boxes::core::egress::summarize(&box_cohort_frame(ipv4_frame(node, proto, proxy, port)));
         assert!(frame.box_cohort_marked());
         gate_verdict(&frame, None, table, baseline, pins, &ReplyTables::new())
     }
@@ -16254,9 +16271,9 @@ mod tests {
     /// BEP-083: the `host_ip` cohort's lane to the proxy's listener is the
     /// union of its resident members' declarations. While one member
     /// declares a credentialed upstream, a cohort frame to the listener
-    /// port passes, whatever the other members declare. A frame to another
-    /// port at the proxy's address still drops: the lane opens the listener
-    /// alone.
+    /// port and to TCP 443 at the proxy's address passes, whatever the
+    /// other members declare. UDP 443 and a frame to another port at the
+    /// proxy's address still drop: the lane opens those two ports alone.
     #[test]
     fn host_ip_cohort_reaches_proxy_while_a_member_declares_a_lane() {
         let registry = BoxRegistry::new(SUBNET);
@@ -16274,18 +16291,31 @@ mod tests {
             Ok(GateAdmit::ProxyLane),
             "a cohort frame reaches the listener while a member declares a lane"
         );
+        assert_eq!(
+            host_ip_cohort_to_proxy(&table, &baseline, &pins, 443),
+            Ok(GateAdmit::ProxyLane),
+            "a cohort frame reaches TCP 443 at the proxy while a member declares a lane"
+        );
+        assert!(
+            matches!(
+                host_ip_cohort_to_proxy_over(&table, &baseline, &pins, 17, 443),
+                Err(GateDrop::ProxyLane { dst_port: 443, .. })
+            ),
+            "the lane opens TCP 443, never UDP 443"
+        );
         assert!(
             matches!(
                 host_ip_cohort_to_proxy(&table, &baseline, &pins, 22),
                 Err(GateDrop::ProxyLane { dst_port: 22, .. })
             ),
-            "the lane opens the listener port alone"
+            "the lane opens the listener port and TCP 443 alone"
         );
     }
 
     /// BEP-083: with no resident member that declares a credentialed
     /// upstream, the cohort's lane is closed. A cohort frame to the proxy's
-    /// listener drops under [`PROXY_LANE_RULE`], before any member's egress
+    /// listener or to TCP 443 at the proxy's address drops under
+    /// [`PROXY_LANE_RULE`], before any member's egress
     /// rules are read, so an allow-all member opens nothing there. When the
     /// last declaring member is retired, the lane closes again.
     #[test]
@@ -16309,10 +16339,24 @@ mod tests {
             lane_drop,
             "an allow-all member with no lane does not open the listener"
         );
+        let tls_drop = Err(GateDrop::ProxyLane {
+            src: node,
+            dst: proxy,
+            dst_port: 443,
+        });
+        assert_eq!(
+            host_ip_cohort_to_proxy(&table, &baseline, &pins, 443),
+            tls_drop,
+            "an allow-all member with no lane does not open TCP 443 at the proxy"
+        );
         let grant = boxes::SessionId::mint();
         assert!(registry.admit_host_ip_box_with_lane(grant, None, true));
         assert_eq!(
             host_ip_cohort_to_proxy(&table, &baseline, &pins, super::egress::PROXY_LISTENER_PORT),
+            Ok(GateAdmit::ProxyLane)
+        );
+        assert_eq!(
+            host_ip_cohort_to_proxy(&table, &baseline, &pins, 443),
             Ok(GateAdmit::ProxyLane)
         );
         assert!(registry.retire_host_ip_box(grant));
@@ -16321,8 +16365,21 @@ mod tests {
             lane_drop,
             "the lane closes when the last declaring member ends"
         );
+        assert_eq!(
+            host_ip_cohort_to_proxy(&table, &baseline, &pins, 443),
+            tls_drop,
+            "TCP 443 at the proxy closes when the last declaring member ends"
+        );
     }
 
+    /// The node address carries two senders: the guest daemon and every
+    /// `host_ip` box, the default network mode. The guest's classifier
+    /// writes the sender's cgroup into the frame as the box mark. A marked
+    /// frame at the node address is decided by the resident `host_ip`
+    /// boxes' rules, which the host-side client registered, so a default
+    /// session keeps its outbound network (NET-107). Root in the guest can
+    /// write the mark too, so with no `host_ip` box resident the same frame
+    /// drops (NET-085).
     #[test]
     fn box_marked_node_frame_decided_by_resident_host_ip_boxes() {
         let registry = BoxRegistry::new(SUBNET);
