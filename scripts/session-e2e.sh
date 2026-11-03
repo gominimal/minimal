@@ -207,6 +207,11 @@
 #                                    host-address boxes answer the node's
 #                                    one address and a port each binds
 #                                    opens there
+#   host_address_names_and_host_alias
+#                                    a host_ip box opens by name at the
+#                                    node's address on a VM lane; on a
+#                                    native lane host.min.internal and
+#                                    127.0.0.1 reach the same host listener
 #   native_answerer_survives_session_stop
 #                                    NET-122's host service on a native
 #                                    host (T90): the advisory's command run
@@ -462,6 +467,8 @@ PROXY_OWN_SEED_DIR="" # its own-address box's seed; removed on teardown
 PROXY_HOST_DIR="" # the host-loopback dir that proof serves; removed on teardown
 PROXY_HOST_SRV_PID="" # the host-loopback server it starts; killed on teardown
 PROXY_UNEXPOSED_SRV_PID="" # its listener at a port outside the host exposure; killed on teardown
+HAN_HOST_SRV_PID="" # the host-address names case's host listener; killed on teardown
+HAN_HOST_DIR=""     # the directory it serves; removed on teardown
 PAR_SEED_DIR="" # seeded by the proxy-parity proof below; removed on teardown
 PAR_OWN_SEED_DIR="" # its own-address target box's seed; removed on teardown
 PAR_CALLER_SEED_DIR="" # its denied-caller box's seed; removed on teardown
@@ -1101,6 +1108,10 @@ teardown() {
   if [ -n "$PROXY_HOST_SRV_PID" ]; then
     kill "$PROXY_HOST_SRV_PID" 2>/dev/null || true
   fi
+  if [ -n "$HAN_HOST_SRV_PID" ]; then
+    kill "$HAN_HOST_SRV_PID" 2>/dev/null || true
+  fi
+  [ -n "$HAN_HOST_DIR" ] && rm -rf "$HAN_HOST_DIR"
   if [ -n "$PROXY_UNEXPOSED_SRV_PID" ]; then
     kill "$PROXY_UNEXPOSED_SRV_PID" 2>/dev/null || true
   fi
@@ -9060,6 +9071,240 @@ for row in json.load(open(sys.argv[1])):
   done
 
   echo "native min.internal resolution from the VM host daemon's answerer OK (min ls names the VM host daemon, the host row and a live box answer at 127.0.0.1:$host_answerer_port, the destroyed box's name withdraws to NXDOMAIN, unknown names NXDOMAIN, two host-address boxes answer the node's one address and open their ports there, or NODATA where the host lacks the reserved range)"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
+# Host-address boxes by name, and the host by its alias, end to end (T118).
+#
+# A VM-backed lane: a `host_ip` box answers at its name. The VM host daemon's
+# answerer answers the name with the node's reserved-range address (NET-129),
+# the VM host mirrors the box's bind there (T117), and a request to the name
+# at that address opens the box's page with no proxy setting.
+#
+# A native lane: a `host_ip` box shares the host's namespace, so
+# `host.min.internal` routes to the host loopback (NET-003). The case checks
+# the name against the documented host literal, 127.0.0.1: the box resolves
+# the name to it, and both URLs fetch the same marker from a host listener.
+#
+# Observability: each lookup, the address it answered, each request and its
+# status print as they happen. Diagnostics: at the end, and on a failure,
+# the case prints the VM host daemon's mirrored-bind records and every
+# daemon log line about the deprecated literal host address, in log order.
+# A native host-address box never crosses a switch relay, so the literal's
+# deprecation notice (NET-004) is printed when present and never asserted.
+proof_host_address_names_and_host_alias() {
+  echo "::group::host-address boxes by name, and host.min.internal (NET-003, NET-129)"
+  local han_name=e2e-han-host han_port=18093 han_host_port=18094
+  local han_sid han_ls han_dns_port han_reply han_addr han_status han_out han_range
+  local han_body han_code han_i
+  local han_marker="HAN_HOST_LOOPBACK_OK"
+
+  # The log lines a person reads when this case fails: the mirrored binds
+  # from the VM host daemon's log, then the deprecated-literal notices from
+  # whichever daemon log this host can read. Each in its log's own order.
+  han_print_logs() {
+    echo "--- VM host daemon: mirrored-bind records (in order) ---"
+    minvmd_log_lines "host-address box's bind" | tail -n 20 || true
+    echo "--- daemon logs: deprecated literal host address (in order) ---"
+    {
+      minvmd_log_lines 'deprecated literal host address' || true
+      if hook_log_readable; then
+        find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f \
+          -exec grep -h -- 'deprecated literal host address' {} + 2>/dev/null || true
+      fi
+    } | tail -n 20
+  }
+  han_fail() {
+    han_print_logs
+    echo "--- min ls ---"; mnl ls 2>&1 || true
+    mnl session destroy --force "$han_name" >/dev/null 2>&1 || true
+    fail
+  }
+
+  if [ -n "$E2E_VM" ]; then
+    if ! command -v dig >/dev/null 2>&1; then
+      echo "::error::a VM lane must have dig to read what the answerer answers for a box name"
+      fail
+    fi
+    # The mirror's records are INFO, and this harness runs the daemons at
+    # warn. Take the VM down and let the one command that autospawns it carry
+    # minvmd at info, as the answerer case does.
+    mnl stop --force >/dev/null 2>&1 || true
+    if ! RUST_LOG="warn,minvmd=info" mnl ls >/dev/null 2>&1; then
+      echo "::error::'min ls' could not bring this VM lane's daemon up"
+      fail
+    fi
+    han_dns_port=""
+    for _ in $(seq 1 40); do
+      han_ls="$(mnl ls 2>/dev/null || true)"
+      han_dns_port="$(printf '%s\n' "$han_ls" | grep -- 'DNS SERVICE' \
+        | sed -n 's/.*box names on 127\.0\.0\.1:\([0-9][0-9]*\).*/\1/p' | head -n1)"
+      [ -n "$han_dns_port" ] && break
+      sleep 0.5
+    done
+    if [ -z "$han_dns_port" ]; then
+      echo "::error::min ls names no answerer port on 127.0.0.1 for this VM's box names"
+      echo "--- min ls ---"; printf '%s\n' "${han_ls:-}"
+      fail
+    fi
+    echo "answerer: 127.0.0.1:$han_dns_port (from min ls)"
+    # The node's binds are mirrored only while the host carries the reserved
+    # range: all of 127/8 on Linux, and on macOS only after
+    # `min finalize-install` aliased it onto lo0.
+    if [ "$(uname -s)" = Darwin ] \
+        && [ "$(ifconfig lo0 2>/dev/null | grep -c -- '127\.0\.64\.')" != 254 ]; then
+      han_range=absent
+    else
+      han_range=present
+    fi
+  fi
+
+  # shellcheck disable=SC2086
+  han_sid="$(cd "$PROJECT_DIR" && mnl session activate . --name "$han_name" --network host_ip ${E2E_ACTIVATE_ARGS:-} \
+    2>"$WORK/han-activate.err")" \
+    || { echo "::error::could not activate the host-address box $han_name"
+         echo "--- activate stderr ---"; cat "$WORK/han-activate.err" 2>/dev/null || true
+         fail; }
+  han_sid="$(printf '%s\n' "$han_sid" | tail -n1 | tr -d '\r')"
+  echo "activated $han_name ($han_sid) with --network host_ip"
+
+  # A host whose boxes cannot run (a sandboxed developer host) can only skip
+  # on a native developer run. On CI or a VM lane it is a lane fault.
+  if ! mnl session exec "$han_sid" 'true' >"$WORK/han-execgate.err" 2>&1 \
+     && ! { sleep 1; mnl session exec "$han_sid" 'true' >"$WORK/han-execgate.err" 2>&1; }; then
+    if [ -z "${CI:-}" ] && [ -z "$E2E_VM" ]; then
+      mnl session destroy --force "$han_sid" >/dev/null 2>&1 || true
+      not_run host_address_names_and_host_alias "this host cannot run a box sandbox: $(head -n1 "$WORK/han-execgate.err" 2>/dev/null || true)"
+      echo "::endgroup::"
+      return 0
+    fi
+    echo "::error::this lane cannot run a box sandbox, so nothing in a box can be checked"
+    echo "  (exec: $(head -n1 "$WORK/han-execgate.err" 2>/dev/null || true))"
+    han_fail
+  fi
+
+  if [ -n "$E2E_VM" ]; then
+    # ---- VM lane: the box answers at its name ------------------------------
+    mnl session exec "$han_sid" \
+      "body=$han_name; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/http200" \
+      >/dev/null 2>"$WORK/han-responder.err" \
+      || { echo "::error::could not write $han_name's in-box page"; cat "$WORK/han-responder.err" 2>/dev/null || true; han_fail; }
+    mnl session exec "$han_sid" \
+      "nohup /usr/bin/socat TCP-LISTEN:$han_port,reuseaddr,fork SYSTEM:\"cat /home/http200\" >/dev/null 2>&1 &" \
+      >/dev/null 2>>"$WORK/han-responder.err" \
+      || { echo "::error::could not start $han_name's in-box listener on port $han_port"; cat "$WORK/han-responder.err" 2>/dev/null || true; han_fail; }
+    echo "$han_name listens on port $han_port"
+
+    han_addr=""
+    han_status=""
+    for _ in $(seq 1 60); do
+      han_reply="$(dig +time=2 +tries=1 +noall +comments +answer "@127.0.0.1" -p "$han_dns_port" \
+        "$han_name.min.internal" A 2>/dev/null || true)"
+      han_status="$(printf '%s\n' "$han_reply" | sed -En 's/.*status: ([A-Z]+).*/\1/p' | head -n1)"
+      han_addr="$(printf '%s\n' "$han_reply" | awk '$4 == "A" { print $5; exit }')"
+      [ -n "$han_addr" ] && break
+      [ "$han_range" = absent ] && [ "$han_status" = NOERROR ] && break
+      sleep 0.5
+    done
+    echo "lookup: $han_name.min.internal A at 127.0.0.1:$han_dns_port -> status ${han_status:-no reply}, address ${han_addr:-none}"
+
+    if [ "$han_range" = absent ]; then
+      if [ "$han_status" != NOERROR ] || [ -n "$han_addr" ]; then
+        echo "::error::without the reserved range on lo0, $han_name.min.internal must answer NODATA (NOERROR, no address)"
+        echo "--- dig ---"; printf '%s\n' "$han_reply"
+        han_fail
+      fi
+      mnl session destroy --force "$han_sid" >/dev/null 2>&1 || true
+      not_run host_address_names_and_host_alias "lo0 does not carry 127.0.64.0/24, so the name answers NODATA; run 'min finalize-install' to open boxes by name"
+      echo "::endgroup::"
+      return 0
+    fi
+    if [ -z "$han_addr" ]; then
+      echo "::error::$han_name.min.internal answered no address after 30 s"
+      echo "--- dig ---"; printf '%s\n' "$han_reply"
+      han_fail
+    fi
+    case "$han_addr" in
+      127.0.64.*) ;;
+      *)
+        echo "::error::$han_name.min.internal answered $han_addr, not the node's address in 127.0.64.0/24"
+        han_fail
+        ;;
+    esac
+
+    han_body=""
+    han_code=""
+    for _ in $(seq 1 60); do
+      han_out="$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy \
+        curl -sS --noproxy '*' --max-time 5 -w '\n%{http_code}' \
+        --resolve "$han_name.min.internal:$han_port:$han_addr" \
+        "http://$han_name.min.internal:$han_port/" 2>"$WORK/han-curl.err" || true)"
+      han_code="$(printf '%s\n' "$han_out" | tail -n1)"
+      han_body="$(printf '%s\n' "$han_out" | sed '$d')"
+      [ "$han_code" = 200 ] && [ "$han_body" = "$han_name" ] && break
+      sleep 0.5
+    done
+    echo "request: GET http://$han_name.min.internal:$han_port/ at $han_addr -> status ${han_code:-none}, body '${han_body}'"
+    if [ "$han_code" != 200 ] || [ "$han_body" != "$han_name" ]; then
+      echo "::error::http://$han_name.min.internal:$han_port/ did not open $han_name's page at $han_addr with no proxy setting"
+      echo "--- curl stderr ---"; cat "$WORK/han-curl.err" 2>/dev/null || true
+      han_fail
+    fi
+    if [ -z "$(minvmd_log_lines "mirrored a host-address box's bind at the node's address" | grep -F -- "$han_port" | tail -n1)" ]; then
+      echo "::error::the VM host daemon's log has no mirrored-bind record for port $han_port, though the request reached the box"
+      han_fail
+    fi
+    echo "$han_name opens by name at the node's address $han_addr"
+  else
+    # ---- native lane: host.min.internal against the documented literal -----
+    HAN_HOST_DIR="$(hook_mktemp /tmp/mnlhan.XXXXXX)"
+    printf '%s\n' "$han_marker" > "$HAN_HOST_DIR/marker"
+    ( cd "$HAN_HOST_DIR" && exec python3 -m http.server "$han_host_port" --bind 127.0.0.1 ) \
+      >/dev/null 2>"$WORK/han-hostsrv.err" &
+    HAN_HOST_SRV_PID=$!
+    for han_i in $(seq 1 40); do
+      [ "$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' \
+        "http://127.0.0.1:$han_host_port/marker" 2>/dev/null || true)" = 200 ] && break
+      [ "$han_i" = 40 ] && {
+        echo "::error::the host listener never answered on 127.0.0.1:$han_host_port"
+        cat "$WORK/han-hostsrv.err" 2>/dev/null || true
+        han_fail
+      }
+      sleep 0.25
+    done
+    echo "host listener: 127.0.0.1:$han_host_port serves $han_marker"
+
+    han_addr="$(mnl session exec "$han_sid" "getent ahostsv4 host.min.internal" 2>"$WORK/han-getent.err" \
+      | awk 'NR == 1 { print $1 }' | tr -d '\r')" || true
+    echo "lookup: host.min.internal in $han_name -> ${han_addr:-none}"
+    if [ "${han_addr:-}" != 127.0.0.1 ]; then
+      echo "::error::host.min.internal resolved to '${han_addr:-none}' in a native host-address box, not the documented host literal 127.0.0.1"
+      echo "--- getent stderr ---"; cat "$WORK/han-getent.err" 2>/dev/null || true
+      han_fail
+    fi
+
+    for han_i in "host.min.internal" "127.0.0.1"; do
+      han_out="$(mnl session exec "$han_sid" \
+        "curl -sS --noproxy '*' --max-time 10 -w '\n%{http_code} %{remote_ip}' http://$han_i:$han_host_port/marker" \
+        2>"$WORK/han-alias.err" | tr -d '\r')" || true
+      han_code="$(printf '%s\n' "$han_out" | tail -n1)"
+      han_body="$(printf '%s\n' "$han_out" | sed '$d' | head -n1)"
+      echo "request: GET http://$han_i:$han_host_port/marker from $han_name -> status ${han_code%% *}, address ${han_code#* }, body '${han_body}'"
+      if [ "$han_code" != "200 127.0.0.1" ] || [ "$han_body" != "$han_marker" ]; then
+        echo "::error::http://$han_i:$han_host_port/marker from the host-address box did not reach the host listener at 127.0.0.1"
+        echo "--- exec stderr ---"; cat "$WORK/han-alias.err" 2>/dev/null || true
+        han_fail
+      fi
+    done
+    kill "$HAN_HOST_SRV_PID" 2>/dev/null || true
+    HAN_HOST_SRV_PID=""
+    echo "host.min.internal and 127.0.0.1 reach the same host listener from $han_name"
+  fi
+
+  mnl session destroy --force "$han_sid" >/dev/null 2>&1 || true
+  han_print_logs
+  echo "host-address names and host alias OK"
   echo "::endgroup::"
 }
 
@@ -29967,6 +30212,7 @@ case "${1:-}" in
     fi
     proof_native_resolution_without_proxy_env
     proof_native_resolution_from_host_answerer_on_vm_host
+    proof_host_address_names_and_host_alias
     proof_box_name_resolves_natively_without_proxy
     # The answerer-service proof installs a root-run unit; a macOS lane runs
     # it only under the privileged opt-in (no macOS CI lane has the
@@ -30056,6 +30302,7 @@ case "${1:-}" in
     | vm_host_row_read_tracks_create_and_destroy \
     | network_posture_from_stock_install | native_resolution_without_proxy_env \
     | native_resolution_from_host_answerer_on_vm_host \
+    | host_address_names_and_host_alias \
     | local_range_reserved_by_privileged_step \
     | box_name_resolves_natively_without_proxy \
     | answerer_survives_session_stop | native_answerer_survives_session_stop \
@@ -30128,6 +30375,7 @@ case "${1:-}" in
     echo "         vm_host_row_read_tracks_create_and_destroy"
     echo "         network_posture_from_stock_install native_resolution_without_proxy_env"
     echo "         native_resolution_from_host_answerer_on_vm_host"
+    echo "         host_address_names_and_host_alias"
     echo "         local_range_reserved_by_privileged_step"
     echo "         box_name_resolves_natively_without_proxy"
     echo "         answerer_survives_session_stop native_answerer_survives_session_stop"
