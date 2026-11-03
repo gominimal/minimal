@@ -21,8 +21,10 @@
 //! - The notice goes to stderr, only when stderr is a terminal, once per
 //!   new pointer. stdout belongs to the command's own output.
 //! - Off switches, any one wins: `[telemetry] enabled = false` in the user
-//!   config, `MINIMAL_TELEMETRY` falsy, `DO_NOT_TRACK` set, or `CI` set
-//!   (CI installs `min` per job and would mint an install id each time).
+//!   config or the organization's, `MINIMAL_TELEMETRY` falsy,
+//!   `OTEL_SDK_DISABLED=true` (D9: it turns off everything), `DO_NOT_TRACK`
+//!   set, or `CI` set (CI installs `min` per job and would mint an install
+//!   id each time).
 //! - On by default until 1.0. The first run with a terminal says so on
 //!   stderr and makes no request; the request waits for a later command.
 //!   An install whose commands are a script's or an agent's (no terminal)
@@ -106,16 +108,27 @@ fn off(global: &GlobalArgs) -> Option<UpdateDisabledReason> {
     })
 }
 
-/// What the user config says. A missing config is the default, on. A config
-/// that exists but cannot be read or parsed turns the check off: it may well
-/// carry `enabled = false` next to the typo, and a check that is skipped
-/// until the file is fixed costs nothing. The check never fails the command
-/// either way; the config's own error prints where the config is used.
+/// What the config files say: the user's `config.toml` and the
+/// organization's (`/etc/minimal/config.toml`), either of which turns the
+/// check off (D9 has the setting user- or organization-scoped; a user file
+/// cannot turn on what the administrator turned off). A missing file is the
+/// default, on. A file that exists but cannot be read or parsed turns the
+/// check off: it may well carry `enabled = false` next to the typo, and a
+/// check that is skipped until the file is fixed costs nothing.
+///
+/// Read directly and silently, not through [`crate::config`]'s readers:
+/// those print an organization file's error and its refused store rules on
+/// stderr, which is right where the config is used and wrong before every
+/// command (`min ls`, and `min proxy`, whose stderr is ssh's). The check
+/// never fails the command; the file's own error prints where it is used.
 fn config_state(global: &GlobalArgs) -> ConfigState {
-    match crate::config::read_client_config(global) {
-        Ok(c) if c.telemetry.enabled => ConfigState::Enabled,
-        Ok(_) => ConfigState::Disabled,
-        Err(_) => ConfigState::Unreadable,
+    use boxes::client::config::{ORGANIZATION_CONFIG_PATH, read_config_or_default};
+    let user = crate::config::resolve_minimal_config_dir(global).join("config.toml");
+    let read = |path: &Path| read_config_or_default(path).map(|c| c.telemetry.enabled);
+    match (read(&user), read(Path::new(ORGANIZATION_CONFIG_PATH))) {
+        (Ok(true), Ok(true)) => ConfigState::Enabled,
+        (Ok(_), Ok(_)) => ConfigState::Disabled,
+        _ => ConfigState::Unreadable,
     }
 }
 

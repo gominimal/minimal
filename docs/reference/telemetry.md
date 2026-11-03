@@ -246,7 +246,7 @@ With telemetry off, that file is the only change to `min bug`.
 Once a day, the first `min` command makes one request to
 `https://update.minimal.dev/v1/<channel>/<key>` and caches the answer. A
 later command then prints one line on stderr, once per new release, naming
-the channel's current release and the command that updates your install:
+the channel's current release and pointing here for the update steps:
 
 ```
 min 0.7.1: the stable channel is now at 0.7.2. How to update: https://docs.minimal.dev/reference/telemetry#update-check
@@ -277,21 +277,38 @@ other edge Workers.
 and the switch that stops it, if one is set. `min update-check` with no
 flag makes the request now and prints the answer.
 
+**Updating.** An install made by the installer updates by running the
+installer again for your channel; it replaces the binaries in place and
+keeps your sessions, loadouts and settings:
+
+```shell
+curl --proto "=https" --tlsv1.2 -fsSL https://go.minimal.dev/stable | sh
+```
+
+Use `unstable` or `nightly` in place of `stable` for those channels. An
+install made with `--version` is pinned and gets no notice; run the
+installer with the version you want. An install from a package manager
+updates through that package manager.
+
 **Turning the check off**, any one of these:
 
 | switch | where |
 |---|---|
-| `[telemetry]` `enabled = false` | `config.toml` in the config directory (`min dirs`) |
+| `[telemetry]` `enabled = false` | `config.toml` in the config directory (`min dirs`), or `/etc/minimal/config.toml` for every user of the machine; either turns it off |
 | `MINIMAL_TELEMETRY=0` | environment (`false`, `no` and `off` also count) |
+| `OTEL_SDK_DISABLED=true` | environment: turns off everything, this included |
 | `DO_NOT_TRACK=1` | environment, the cross-tool convention |
 | `CI` set | environment: a CI job that installs `min` is not an install to count |
 
 An install's first `min` command never makes the request. The first command
 with a terminal prints a one-line disclosure of the above, even when earlier
 commands were a script's (the installer's own setup call, an agent), and the
-request waits for a later command. Installs from a package manager see that
-line instead of the installer's closing card. A `config.toml` that exists but
-does not parse turns the check off until it is fixed.
+request waits for a later command. The installer's closing card carries the
+same disclosure for every install, `--version` ones included, so an install
+whose commands never have a terminal has read it there. Installs from a
+package manager see the terminal line instead of the card. A `config.toml`
+that exists but does not parse, yours or the organization's, turns the check
+off until it is fixed.
 
 At 1.0 the default flips to off.
 

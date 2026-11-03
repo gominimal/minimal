@@ -8,9 +8,10 @@ use mlog::otel::Flag;
 /// What turned the check off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateDisabledReason {
-    /// `[telemetry] enabled = false` in the user config.
+    /// `[telemetry] enabled = false` in the user config or the
+    /// organization's (`/etc/minimal/config.toml`): either turns it off.
     Config,
-    /// The user config exists but could not be read or parsed: the check
+    /// A config file exists but could not be read or parsed: the check
     /// fails closed until it is fixed, and says so rather than claiming a
     /// setting the file may not hold.
     ConfigUnreadable,
@@ -25,10 +26,13 @@ pub enum UpdateDisabledReason {
 impl std::fmt::Display for UpdateDisabledReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UpdateDisabledReason::Config => f.write_str("[telemetry] enabled = false in config.toml"),
-            UpdateDisabledReason::ConfigUnreadable => {
-                f.write_str("a config.toml that could not be read or parsed (the check stays off until it is fixed)")
+            UpdateDisabledReason::Config => {
+                f.write_str("[telemetry] enabled = false in config.toml (yours or /etc/minimal/config.toml)")
             }
+            UpdateDisabledReason::ConfigUnreadable => f.write_str(
+                "a config.toml (yours or /etc/minimal/config.toml) that could not be read or parsed \
+                 (the check stays off until it is fixed)",
+            ),
             UpdateDisabledReason::Env(name) => write!(f, "{name} in the environment"),
             UpdateDisabledReason::MinimalDir => f.write_str("--minimal-dir (an alternate state directory is not counted)"),
         }
@@ -36,8 +40,10 @@ impl std::fmt::Display for UpdateDisabledReason {
 }
 
 /// The switch that turns the check off, if any. `DO_NOT_TRACK` (the
-/// cross-tool convention) and `CI` win on presence; `MINIMAL_TELEMETRY`
-/// turns it off when falsy (`0`, `false`, `no`, `off`; a truthy value is the
+/// cross-tool convention) and `CI` win on presence; `OTEL_SDK_DISABLED`
+/// when it is `true` (any case, as mlog reads it: the architecture's D9 has
+/// it turn off everything, the check included); `MINIMAL_TELEMETRY` turns
+/// it off when falsy (`0`, `false`, `no`, `off`; a truthy value is the
 /// OpenTelemetry opt-in and says nothing here); then the config.
 pub fn off_switch(
     config: ConfigState,
@@ -49,6 +55,9 @@ pub fn off_switch(
     }
     if set("CI") {
         return Some(UpdateDisabledReason::Env("CI"));
+    }
+    if var("OTEL_SDK_DISABLED").is_some_and(|v| v.eq_ignore_ascii_case("true")) {
+        return Some(UpdateDisabledReason::Env("OTEL_SDK_DISABLED"));
     }
     // the same reading of a boolean-ish variable as the telemetry switches
     // (`0`, `false`, `no`, `off`, any case): one parser for every switch
@@ -63,13 +72,14 @@ pub fn off_switch(
     }
 }
 
-/// What the user config says about the check.
+/// What the config files say about the check: the user's and the
+/// organization's, read together, the stricter winning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigState {
-    /// Missing, or present with the check on (the default).
+    /// Both missing, or present with the check on (the default).
     Enabled,
-    /// `[telemetry] enabled = false`.
+    /// `[telemetry] enabled = false` in either.
     Disabled,
-    /// Present but not readable or not parsable.
+    /// One is present but not readable or not parsable.
     Unreadable,
 }

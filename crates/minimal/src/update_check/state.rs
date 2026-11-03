@@ -163,7 +163,13 @@ pub fn due(state: &State, now: u64) -> bool {
 /// Takes the lock that keeps two concurrent invocations from both spawning
 /// a check: `O_EXCL` on [`LOCK_FILE`]. A lock older than [`LOCK_STALE`] is a
 /// dead child's and is taken over. The child releases it ([`release_lock`]).
+/// The directory is made first: on a fresh install nothing has created
+/// `<state>/minimal` yet, and a lock that cannot exist would read as held
+/// on every run.
 pub fn acquire_lock(path: &Path) -> bool {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
     let try_create = || {
         std::fs::OpenOptions::new()
             .write(true)

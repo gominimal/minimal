@@ -61,6 +61,59 @@ fn the_switches_each_turn_it_off_in_order() {
     );
 }
 
+/// D9: `OTEL_SDK_DISABLED=true` turns off everything, the check included.
+/// Read as mlog reads it: `true` in any case, and no other value.
+#[test]
+fn otel_sdk_disabled_turns_the_check_off_too() {
+    for v in ["true", "TRUE", "True"] {
+        assert_eq!(
+            off_switch(ConfigState::Enabled, env(&[("OTEL_SDK_DISABLED", v)])),
+            Some(UpdateDisabledReason::Env("OTEL_SDK_DISABLED")),
+            "{v:?}"
+        );
+    }
+    for v in ["1", "yes", "false", ""] {
+        assert_eq!(
+            off_switch(ConfigState::Enabled, env(&[("OTEL_SDK_DISABLED", v)])),
+            None,
+            "{v:?} is not the veto, as in mlog"
+        );
+    }
+}
+
+/// The child is muted signal by signal, never by a veto: with the parent
+/// opted in and an endpoint set, the child's environment exports nothing
+/// and spools nothing (mlog's own reading of it), and names none of the
+/// check's switches, so the child still makes its request.
+#[test]
+fn the_child_is_muted_without_a_veto() {
+    let parent = [
+        ("MINIMAL_TELEMETRY", "1"),
+        (
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "http://collector.example:4318",
+        ),
+        ("MINIMAL_OTEL_SPOOL", "1"),
+    ];
+    let child = |n: &str| {
+        request::CHILD_MUTE
+            .iter()
+            .chain(parent.iter())
+            .find(|(k, _)| *k == n)
+            .map(|(_, v)| (*v).to_string())
+    };
+    let exports = mlog::otel::guest_exports(child);
+    assert!(!exports.spool, "{exports:?}");
+    assert!(exports.traces.url.is_none(), "{exports:?}");
+    assert!(exports.logs.url.is_none(), "{exports:?}");
+    let as_os = |n: &str| child(n).map(OsString::from);
+    assert_eq!(
+        off_switch(ConfigState::Enabled, as_os),
+        None,
+        "the mute is not one of the check's switches"
+    );
+}
+
 #[test]
 fn the_build_key_is_the_embedded_hash_else_the_version() {
     assert_eq!(build_key("0.8.0-dev.198.ge8f53f6e"), "e8f53f6e");
@@ -286,6 +339,26 @@ fn the_lock_is_exclusive_until_stale() {
     assert!(acquire_lock(&lock), "released");
 }
 
+/// A fresh install has no `<state>/minimal` yet: the first command makes
+/// it and mints the id, rather than reading a lock it cannot create as held
+/// on every run.
+#[test]
+fn a_missing_state_dir_is_made_not_a_dead_end() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().join("state").join("minimal");
+    let path = dir.join(STATE_FILE);
+    assert!(acquire_lock(&dir.join(LOCK_FILE)));
+    release_lock(&dir.join(LOCK_FILE));
+    std::fs::remove_dir_all(tmp.path().join("state")).unwrap();
+    let state = claim_install_id(&dir, &path).expect("minted in a directory that did not exist");
+    assert!(state.install_id.is_some());
+    assert_eq!(
+        read_state(&path).install_id,
+        state.install_id,
+        "and written"
+    );
+}
+
 #[test]
 fn the_disclosure_is_owed_on_the_first_terminal_run_whatever_came_before() {
     let fresh = State::default();
@@ -452,7 +525,7 @@ fn a_pinned_install_is_never_told_and_the_notice_waits_for_a_plain_command() {
 }
 
 #[test]
-fn the_notice_names_the_pointer_and_the_upgrade_path() {
+fn the_notice_names_the_pointer_and_the_docs_page() {
     let install = Install {
         channel: "stable".into(),
         method: "installer".into(),
@@ -483,7 +556,7 @@ fn the_notice_names_the_pointer_and_the_upgrade_path() {
 }
 
 #[test]
-fn the_request_carries_the_eight_fields_and_nothing_more() {
+fn the_request_carries_the_six_fields_and_nothing_more() {
     let install = Install {
         channel: "stable".into(),
         method: "installer".into(),

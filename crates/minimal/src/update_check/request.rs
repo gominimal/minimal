@@ -32,8 +32,23 @@ pub(super) fn endpoint() -> String {
         .unwrap_or_else(|| ENDPOINT.to_string())
 }
 
+/// The environment the detached child gets on top of the parent's: its
+/// telemetry muted signal by signal, so it exports and spools nothing of
+/// its own under the parent's opt-in (an integration test reading the
+/// parent's spool would see a stranger's `cmd` span; a collector would
+/// count a trace nobody ran). The `MINIMAL_` names win over the plain ones
+/// in mlog, so nothing the user set turns them back on. The vetoes are not
+/// used for this: `OTEL_SDK_DISABLED=true` and `MINIMAL_TELEMETRY=0` are
+/// switches of the check itself, and a child that set either on itself
+/// would stop its own request.
+pub(super) const CHILD_MUTE: [(&str, &str); 3] = [
+    ("MINIMAL_OTEL_TRACES_EXPORTER", "none"),
+    ("MINIMAL_OTEL_LOGS_EXPORTER", "none"),
+    ("MINIMAL_OTEL_SPOOL", "0"),
+];
+
 /// The detached child: this binary, `update-check --background`, its own
-/// process group, null stdio, never waited on. Whether it was spawned.
+/// process group, null stdio. Whether it was spawned.
 pub(super) fn spawn_background(global: &GlobalArgs) -> bool {
     use std::os::unix::process::CommandExt as _;
     let Ok(exe) = std::env::current_exe() else {
@@ -46,23 +61,25 @@ pub(super) fn spawn_background(global: &GlobalArgs) -> bool {
     if let Some(d) = &global.config_dir {
         cmd.arg("--config-dir").arg(d);
     }
-    // The child is bookkeeping, not a command of the user's: it must not
-    // export or spool telemetry of its own under the parent's opt-in (an
-    // integration test reading the parent's spool would see a stranger's
-    // `cmd` span; a collector would count a trace nobody ran).
-    // `OTEL_SDK_DISABLED` is the veto mlog honours ahead of the opt-in; the
-    // check's own switch (`MINIMAL_TELEMETRY=0`) is left alone, since that
-    // would stop the check itself.
-    cmd.env("OTEL_SDK_DISABLED", "true")
+    cmd.envs(CHILD_MUTE)
         .env_remove(minimald_rpc::trace::TRACEPARENT_ENV)
         .args(["update-check", "--background"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .process_group(0);
-    // Not waited on: a child that outlives a short command is reparented;
-    // one that outlives a long one is reaped with it.
-    cmd.spawn().is_ok()
+    let Ok(mut child) = cmd.spawn() else {
+        return false;
+    };
+    // Reaped by a thread of its own, so a long command (an attach, a task)
+    // does not carry a `<defunct>` entry for the two seconds the check
+    // takes. A short command exits first; the child is then init's to reap.
+    let _ = std::thread::Builder::new()
+        .name("update-check-reap".into())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+    true
 }
 
 /// The endpoint's answer.

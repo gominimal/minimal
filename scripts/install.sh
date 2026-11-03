@@ -1728,9 +1728,18 @@ say "  $mark ${b}min init$rst                          ${dim}declare this projec
 say "  $mark ${b}min$rst                               ${dim}build the sandbox and step inside$rst"
 say ""
 say "  ${dim}docs.minimal.dev   $sep   discord.com/invite/qgX8sm6X7G$rst"
-# A channel install is told when its channel moves on (inbox#589); a pinned
-# one is not, so it gets no line.
-[ -z "${target:-}" ] || say "  ${dim}min checks for a newer $target release once a day; docs.minimal.dev/reference/telemetry#update-check$rst"
+# The update check's disclosure (inbox#589), for every install: this card is
+# the only one an install without a terminal (an agent's, a script's) reads,
+# so it says what is sent and names the switch. A channel install is told
+# when its channel moves on; a pinned (--version) one is counted but never
+# told, since no channel pointer applies to it.
+if [ -n "${target:-}" ]; then
+    say "  ${dim}min checks once a day for a newer $target release, sending its channel, version, OS,$rst"
+else
+    say "  ${dim}min reports this install once a day (no release notices for --version), sending its version, OS,$rst"
+fi
+say "  ${dim}architecture and a random install id to update.minimal.dev. Off: MINIMAL_TELEMETRY=0$rst"
+say "  ${dim}docs.minimal.dev/reference/telemetry#update-check$rst"
 say ""
 }
 

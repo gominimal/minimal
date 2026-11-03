@@ -669,6 +669,8 @@ case_install() {
     want_ok "install.toml is recorded for uninstall (R6.1b)" \
         record_has install-metadata "$_im" "$H1/xdg-state/minimal/installed"
     want_ok "the card points at the update check's docs (R6.1b)" grep -q "reference/telemetry#update-check" "$OUT"
+    want_ok "the card says what the check sends (R6.1b)" grep -q "install id to update.minimal.dev" "$OUT"
+    want_ok "the card names the check's off switch (R6.1b)" grep -q "MINIMAL_TELEMETRY=0" "$OUT"
     # Nothing on a redirected stream may carry terminal escapes (R10.1): this
     # output is a file, so a stray SGR here would land in every CI log. `run` sets a
     # terminal-like TERM, so what this pins is the `[ -t 2 ]` half of the guard:
@@ -1379,6 +1381,8 @@ case_target_validation() {
     want_ok "--version names the version, not a target (R2.5)" grep -q "version.*v1" "$OUT"
     want_ok "--version records a pinned install, never notified (R6.1b)" \
         grep -qx 'channel = "pinned"' "$HV/xdg-state/minimal/install.toml"
+    want_ok "--version is told the install is counted (R6.1b)" grep -q "no release notices for --version" "$OUT"
+    want_ok "--version is told what is sent and the switch (R6.1b)" grep -q "MINIMAL_TELEMETRY=0" "$OUT"
     HV2="$root/hv2"; mkdir -p "$HV2"
     run versioneq "$HV2" --force-stop --version=v1
     check 0 "$rc" "--version=VER with another flag installs (R2.5)"

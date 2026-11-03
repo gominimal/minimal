@@ -47,9 +47,10 @@ pub struct Config {
     )]
     pub secret_store_rules: StoreRules,
     /// `[telemetry]` section: the daily update check's switch
-    /// (gominimal/inbox#589) and the keys the opt-in export (spec 25) will
-    /// read. All of them are accepted now: the file is `deny_unknown_fields`,
-    /// so a key added later would fail to parse on an older binary.
+    /// (gominimal/inbox#589), `enabled` alone. The export keys of spec 25
+    /// get a typed table when gominimal/arch#101 defines them; until then
+    /// any other key is refused, as everywhere in this file. Read from the
+    /// user file and from the organization's, either turning the check off.
     #[serde(default)]
     pub telemetry: TelemetryConfig,
 }
