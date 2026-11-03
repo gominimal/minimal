@@ -268,8 +268,6 @@ async fn shutdown_rpc_returns_even_if_the_initiating_client_lingers() {
     drop(client);
 }
 
-/// A connection that connects and never sends its SSH id line must not
-/// stall the accept loop: a second connection completes a full handshake
 /// `min` probes the daemon's socket before every command by connecting
 /// and hanging up without an SSH id line; that is not a failed handshake
 /// and must not be logged as one (333k WARNs a week in the lab hid the
@@ -304,6 +302,8 @@ async fn a_peer_that_hangs_up_before_the_ssh_id_is_not_a_handshake_failure() {
     let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
 }
 
+/// A connection that connects and never sends its SSH id line must not
+/// stall the accept loop: a second connection completes a full handshake
 /// and a `GetVersion` RPC while the silent one is still open.
 #[tokio::test]
 async fn silent_client_does_not_stall_the_accept_loop() {
