@@ -2231,6 +2231,11 @@ impl HostnameRegistry {
     /// exists, but the node's own listener at that port must not answer for a
     /// dead box. A box on its own address keeps answering A — the address
     /// answers for it alone, and the lookup says where the box would be.
+    ///
+    /// On a VM node (`on_switch`) a host-address box answers `None`: the VM
+    /// host answers its name with the node's address while the box runs
+    /// and the host mirrors the node's binds there (NET-129). The host
+    /// decides that answer, so the in-VM daemon reports none.
     fn zone_answer(&self, route: &Route, node: &[Ipv4Addr]) -> Option<Ipv4Addr> {
         let Some(id) = self
             .by_session
@@ -2239,6 +2244,9 @@ impl HostnameRegistry {
         else {
             return route.zone_address(node);
         };
+        if self.on_switch && self.host_net.contains(&id) {
+            return None;
+        }
         let address = self
             .own_published
             .get(&id)
@@ -3943,9 +3951,10 @@ mod tests {
             vm.zone_entry("web.min.internal", &[]),
             ZoneEntry::Held {
                 owner: "web".to_string(),
-                address: Some(node),
+                address: None,
             },
-            "a host-address box answers with its node's published address"
+            "the in-VM daemon reports no address: the VM host answers the name with \
+             the node's address while the box runs and its binds are mirrored"
         );
         let route = vm
             .resolve("web.min.internal:8080")
@@ -3992,12 +4001,11 @@ mod tests {
         reg.set_node_address(node);
 
         assert_eq!(
-            reg.zone_entry("shared.min.internal", &[]),
-            ZoneEntry::Held {
-                owner: "shared".to_string(),
-                address: Some(node),
-            },
-            "the host-address box answers the node's granted address, not the interim it opened on"
+            reg.resolve("shared.min.internal:8080")
+                .expect("a host-address box's name routes")
+                .address(),
+            node,
+            "the host-address box routes at the node's granted address, not the interim it opened on"
         );
         assert_eq!(
             reg.resolve("shared.min.internal:8080")

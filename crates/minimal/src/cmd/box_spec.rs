@@ -67,8 +67,8 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
     // BEP-057: every host is un-enrolled today.
     // Interim: only BEP-057, BEP-009 (from `--network`) and BEP-017 are
     // previewed here; the full exit-3 set is gominimal/minimal#2445.
-    // BEP-017 and its `dns` interim (#2805): the resolver fact is the one
-    // creation reads, so the two agree.
+    // BEP-017: the resolver fact is the one creation reads, so the two
+    // agree.
     let host = HostFacts {
         full_breadth_acknowledged: inputs.acknowledged,
         box_zone_resolver: inputs.box_zone_resolver,
@@ -90,7 +90,6 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
                     | BepRefusal::BrokerScopeNotGithub { .. }
                     | BepRefusal::NoNetworkWithGrant { .. }
                     | BepRefusal::NoResolver { .. }
-                    | BepRefusal::DnsWithoutDirectTls
             )
         })
         .collect();

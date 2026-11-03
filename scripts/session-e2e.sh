@@ -203,7 +203,10 @@
 #                                    NET-124..128/138 on a VM-backed lane:
 #                                    this VM's host daemon answers the zone on
 #                                    the host loopback and the in-VM daemon
-#                                    owns no answerer
+#                                    owns no answerer; NET-129: two
+#                                    host-address boxes answer the node's
+#                                    one address and a port each binds
+#                                    opens there
 #   native_answerer_survives_session_stop
 #                                    NET-122's host service on a native
 #                                    host (T90): the advisory's command run
@@ -8660,6 +8663,11 @@ proof_native_resolution_without_proxy_env() {
 #         VM's would be refused by construction);
 #       - an unknown name, answered NXDOMAIN with the zone's SOA (NET-126),
 #         not dropped.
+#       - two host-address boxes' names, both answering the node's one
+#         reserved-range address (NET-129), and a port each box binds
+#         opening at that address with no proxy setting. A macOS host
+#         whose lo0 lacks the reserved range mirrors no bind, so there
+#         both names must answer NODATA instead.
 #
 # A VM lane that cannot produce the answers FAILS, not skips: this case is the
 # box zone's whole story on those lanes.
@@ -8932,7 +8940,126 @@ for row in json.load(open(sys.argv[1])):
   fi
   echo "an unknown box name answers NXDOMAIN (the SOA-carrying negative)"
 
-  echo "native min.internal resolution from the VM host daemon's answerer OK (min ls names the VM host daemon, the host row and a live box answer at 127.0.0.1:$host_answerer_port, the destroyed box's name withdraws to NXDOMAIN, unknown names NXDOMAIN)"
+  # NET-129 on a VM host: two host-address boxes on this VM answer their
+  # names with the node's ONE reserved-range address, and a port each box
+  # binds opens at that address with no proxy setting — the host mirrors the
+  # node's binds there. The address is the node's, not the host loopback: a
+  # VM node's host-address boxes are never mirrored onto 127.0.0.1. Each box
+  # serves its own page on its own port, so the port, not the address, says
+  # which box answered.
+  local ha_names=(e2e-answerer-ha1 e2e-answerer-ha2) ha_ports=(18091 18092)
+  local ha_i ha_name ha_port ha_sid ha_reply ha_addr ha_node="" ha_body ha_range ha_status
+  # The node's binds are mirrored only while the host carries the whole
+  # reserved range. Linux has all of 127.0.0.0/8 on lo. A macOS host has
+  # it only after `min finalize-install` aliased it onto lo0, and without
+  # it the mirror never opens, so a host-address name answers NODATA.
+  if [ "$(uname -s)" = Darwin ] \
+      && [ "$(ifconfig lo0 2>/dev/null | grep -c -- '127\.0\.64\.')" != 254 ]; then
+    ha_range=absent
+    echo "host: lo0 does not carry the reserved range, so the node's binds are not mirrored and a host-address name must answer NODATA"
+  else
+    ha_range=present
+  fi
+  for ha_i in 0 1; do
+    ha_name="${ha_names[$ha_i]}"
+    # shellcheck disable=SC2086
+    ha_sid="$(cd "$PROJECT_DIR" && mnl session activate . --name "$ha_name" --network host_ip ${E2E_ACTIVATE_ARGS:-} \
+      2>"$WORK/answerer-ha-activate.err")" \
+      || { echo "::error::could not activate the host-address box $ha_name"
+           echo "--- activate stderr ---"; cat "$WORK/answerer-ha-activate.err" 2>/dev/null || true
+           fail; }
+    ha_sid="$(printf '%s\n' "$ha_sid" | tail -n1 | tr -d '\r')"
+    ha_port="${ha_ports[$ha_i]}"
+    mnl session exec "$ha_sid" \
+      "body=$ha_name; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/http200" \
+      >/dev/null 2>"$WORK/answerer-ha-responder.err" \
+      || { echo "::error::could not write $ha_name's in-box responder"; cat "$WORK/answerer-ha-responder.err" 2>/dev/null || true; fail; }
+    mnl session exec "$ha_sid" \
+      "nohup /usr/bin/socat TCP-LISTEN:$ha_port,reuseaddr,fork SYSTEM:\"cat /home/http200\" >/dev/null 2>&1 &" \
+      >/dev/null 2>>"$WORK/answerer-ha-responder.err" \
+      || { echo "::error::could not start $ha_name's in-box responder on port $ha_port"; cat "$WORK/answerer-ha-responder.err" 2>/dev/null || true; fail; }
+  done
+  if [ "$ha_range" = absent ]; then
+    # NET-128/NET-129 without the range: the name is held (NOERROR, not
+    # NXDOMAIN) and carries no address, because no bind is mirrored.
+    for ha_name in "${ha_names[@]}"; do
+      ha_status=""
+      for _ in $(seq 1 60); do
+        ha_reply="$(dig +time=2 +tries=1 +noall +comments +answer "@127.0.0.1" -p "$host_answerer_port" \
+          "$ha_name.min.internal" A 2>/dev/null || true)"
+        ha_status="$(printf '%s\n' "$ha_reply" | sed -En 's/.*status: ([A-Z]+).*/\1/p' | head -n1)"
+        [ "$ha_status" = NOERROR ] && break
+        sleep 0.5
+      done
+      ha_addr="$(printf '%s\n' "$ha_reply" | awk '$4 == "A" { print $5; exit }')"
+      if [ "$ha_status" != NOERROR ] || [ -n "$ha_addr" ]; then
+        echo "::error::without the reserved range the host-address box $ha_name.min.internal must answer NODATA (NOERROR, no address); got status '${ha_status:-no reply}' and address '${ha_addr:-none}'"
+        echo "--- dig ---"; printf '%s\n' "$ha_reply"
+        echo "--- min ls ---"; mnl ls 2>&1 || true
+        fail
+      fi
+      echo "$ha_name.min.internal answers NODATA: the node's binds are not mirrored without the reserved range"
+    done
+  fi
+  for ha_i in 0 1; do
+    [ "$ha_range" = present ] || break
+    ha_name="${ha_names[$ha_i]}"
+    ha_addr=""
+    for _ in $(seq 1 60); do
+      ha_reply="$(dig +time=2 +tries=1 +noall +answer "@127.0.0.1" -p "$host_answerer_port" \
+        "$ha_name.min.internal" A 2>/dev/null || true)"
+      ha_addr="$(printf '%s\n' "$ha_reply" | awk '$4 == "A" { print $5; exit }')"
+      [ -n "$ha_addr" ] && break
+      sleep 0.5
+    done
+    if [ -z "$ha_addr" ]; then
+      echo "::error::the host-address box $ha_name.min.internal answers no address at 127.0.0.1:$host_answerer_port after 30 s"
+      echo "--- dig (comments) ---"
+      dig +time=2 +tries=1 "@127.0.0.1" -p "$host_answerer_port" "$ha_name.min.internal" A 2>&1 || true
+      echo "--- min ls ---"; mnl ls 2>&1 || true
+      fail
+    fi
+    case "$ha_addr" in
+      127.0.64.*) ;;
+      *)
+        echo "::error::$ha_name.min.internal answers $ha_addr, not an address of the reserved range 127.0.64.0/24 the node's binds are mirrored at"
+        fail
+        ;;
+    esac
+    if [ -z "$ha_node" ]; then
+      ha_node="$ha_addr"
+    elif [ "$ha_addr" != "$ha_node" ]; then
+      echo "::error::the two host-address boxes on this VM answer different addresses ($ha_node and $ha_addr); both must answer the node's one address"
+      fail
+    fi
+    echo "$ha_name.min.internal answers the node's address $ha_addr"
+  done
+  for ha_i in 0 1; do
+    [ "$ha_range" = present ] || break
+    ha_name="${ha_names[$ha_i]}"
+    ha_port="${ha_ports[$ha_i]}"
+    ha_body=""
+    for _ in $(seq 1 60); do
+      ha_body="$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy \
+        curl -sS --noproxy '*' --max-time 5 \
+        --resolve "$ha_name.min.internal:$ha_port:$ha_node" \
+        "http://$ha_name.min.internal:$ha_port/" 2>"$WORK/answerer-ha-curl.err" || true)"
+      [ "$ha_body" = "$ha_name" ] && break
+      sleep 0.5
+    done
+    if [ "$ha_body" != "$ha_name" ]; then
+      echo "::error::http://$ha_name.min.internal:$ha_port/ at the node's address $ha_node did not open $ha_name's page with no proxy setting (got: '${ha_body}')"
+      echo "--- curl stderr ---"; cat "$WORK/answerer-ha-curl.err" 2>/dev/null || true
+      echo "--- min ls ---"; mnl ls 2>&1 || true
+      fail
+    fi
+    echo "http://$ha_name.min.internal:$ha_port/ opens $ha_name's page at $ha_node with no proxy setting"
+  done
+  for ha_name in "${ha_names[@]}"; do
+    mnl session destroy --force "$ha_name" >/dev/null 2>&1 || true
+  done
+
+  echo "native min.internal resolution from the VM host daemon's answerer OK (min ls names the VM host daemon, the host row and a live box answer at 127.0.0.1:$host_answerer_port, the destroyed box's name withdraws to NXDOMAIN, unknown names NXDOMAIN, two host-address boxes answer the node's one address and open their ports there, or NODATA where the host lacks the reserved range)"
   echo "::endgroup::"
 }
 
@@ -13962,11 +14089,8 @@ if len(r) >= 8 and r[0:2] == b"\x5e\x32" and r[2] & 0x80:
 #                repository through it (BEP-062, BEP-015).
 #   fail_closed  With the proxy stopped, the A lookup of each steered name a
 #                box above holds is answered SERVFAIL (BEP-062).
-# A lane without the live proxy records the whole case NOT RUN. Admission refuses
-# `dns` steering with a credentialed upstream until the proxy takes a direct
-# TLS connection (#2805). Until then the case records a KNOWN GAP that cites
-# #2805, with that refusal. When #2805 lands, the refusal becomes a hard
-# failure. The stored value is never printed.
+# A lane without the live proxy records the whole case NOT RUN. Any admission
+# refusal of a box here is a hard failure. The stored value is never printed.
 proof_bep_dns_steering_through_the_box_zone_resolver() {
   echo "::group::DNS steering through the box-zone resolver: store upstream and GitHub through the proxy, SERVFAIL while it is down"
   local bz_case=bep_dns_steering_through_the_box_zone_resolver
@@ -14022,9 +14146,7 @@ proof_bep_dns_steering_through_the_box_zone_resolver() {
   }
 
   # Activates the box named $2 from GRANT_SEED_DIR with egress to the names
-  # after it, and prints its id. Returns 3 when admission refuses dns
-  # steering with a credentialed upstream (#2805), and records why in
-  # $WORK/$bz_case.refused. Any other refusal fails: after bep_live_gate the
+  # after it, and prints its id. Any refusal fails: after bep_live_gate the
   # host is minvmd and the box is own_ip, so its switch resolves box names.
   bz_activate() { # $1 leg, $2 name, $3... egress names
     local ba_leg="$1" ba_name="$2" ba_out ba_flags=() ba_h
@@ -14036,11 +14158,6 @@ proof_bep_dns_steering_through_the_box_zone_resolver() {
       printf '%s\n' "$ba_out" | tail -n1 | tr -d '\r'
       return 0
     }
-    if grep -q 'does not yet take a direct TLS connection' "$WORK/$bz_case.$ba_leg.activate.err" 2>/dev/null; then
-      echo "admission refuses steering = \"dns\" for a box with a credentialed upstream: the proxy takes no direct TLS connection yet (#2805)" \
-        >"$WORK/$bz_case.refused"
-      return 3
-    fi
     echo "::error::'min session activate' of the dns-steered box $ba_name failed" >&2
     echo "--- stdout ---" >&2; printf '%s\n' "$ba_out" >&2
     echo "--- stderr ---" >&2; grep -vF -- "${bz_value:-no value}" "$WORK/$bz_case.$ba_leg.activate.err" >&2 2>/dev/null || true
@@ -14144,14 +14261,6 @@ print(rcode, an, addr)' "$dq_b64"
   BZ_STORE_SID="$(bz_activate store e2e-bep-dns-store "$bz_host")"
   bz_status=$?
   rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
-  if [ "$bz_status" = 3 ]; then
-    BZ_STORE_SID=""
-    known_gap "$bz_case" "$(cat "$WORK/$bz_case.refused")"
-    bz_cleanup
-    rm -f "${WORK:?}/${bz_case:?}".*
-    echo "::endgroup::"
-    return 0
-  fi
   [ "$bz_status" = 0 ] || bz_fail
   mnl session exec "$BZ_STORE_SID" 'test -x /usr/bin/socat && test -x /usr/bin/base64' >/dev/null 2>&1 || {
     echo "::error::the dns-steered store box has no /usr/bin/socat or /usr/bin/base64 (both launcher baseline packages)"
@@ -14210,12 +14319,7 @@ print(rcode, an, addr)' "$dq_b64"
     bz_status=$?
     rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
   fi
-  if [ "$bz_status" = 3 ]; then
-    # The same #2805 refusal the store leg handles, met by the grant box.
-    BZ_GIT_SID=""
-    known_gap "$bz_case/git" "$(cat "$WORK/$bz_case.refused")"
-    bz_summary="${bz_summary}git: KNOWN GAP ($(cat "$WORK/$bz_case.refused"))"$'\n'
-  elif [ "$bz_status" = 1 ]; then
+  if [ "$bz_status" = 1 ]; then
     bz_fail
   elif [ "$bz_status" = 0 ]; then
     [ -n "$BZ_GIT_SID" ] || { echo "::error::'min session activate' of the dns-steered grant box printed no box id"; bz_fail; }
@@ -18357,7 +18461,8 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
   # annotation stream, and the lane's annotation is all this case's
   # failure is read by from outside. socat's exit names what the box
   # saw; the ARP entry says whether the switch's peer answered
-  # resolution at all; the cross-probe to an unlistened port isolates
+  # resolution at all; the cross-probe to an unlistened port (444, since
+  # BEP-080 opens 443 at the proxy's address to a laned box) isolates
   # the box-to-peer path from the pool's listener (a RST there means the
   # path is fine and the failure is at :8118's accept or the delivery's
   # dial); the daemon's own lines name any refusal with its reason.
@@ -18381,15 +18486,15 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
     else
       echo "::error::box $label's ARP entry for $proxy_ip: unreadable (session exec failed)"
     fi
-    if mnl session exec "$sid" "/usr/bin/socat /dev/null TCP:$proxy_ip:443,connect-timeout=5" \
+    if mnl session exec "$sid" "/usr/bin/socat /dev/null TCP:$proxy_ip:444,connect-timeout=5" \
         >/dev/null 2>"$WORK/bep-box-$box-cross.err"; then
       cross="$(tr '\n' ' ' <"$WORK/bep-box-$box-cross.err" 2>/dev/null | tail -c 300)"
-      echo "::error::box $label's cross-probe to $proxy_ip:443 (unlistened) completed instead of being reset — unexpected; stderr: ${cross:-<empty>}"
+      echo "::error::box $label's cross-probe to $proxy_ip:444 (unlistened) completed instead of being reset — unexpected; stderr: ${cross:-<empty>}"
     elif grep -q 'Connection refused' "$WORK/bep-box-$box-cross.err" 2>/dev/null; then
-      echo "::error::box $label's cross-probe to $proxy_ip:443 got the peer's RST — the box-to-peer path answers; the failure is at the pool's :$proxy_port listener or the delivery's dial to the stand-in"
+      echo "::error::box $label's cross-probe to $proxy_ip:444 got the peer's RST — the box-to-peer path answers; the failure is at the pool's :$proxy_port listener or the delivery's dial to the stand-in"
     else
       cross="$(tr '\n' ' ' <"$WORK/bep-box-$box-cross.err" 2>/dev/null | tail -c 300)"
-      echo "::error::box $label's cross-probe to $proxy_ip:443 was not reset either — the box-to-peer path itself is down in this daemon; stderr: ${cross:-<empty>}"
+      echo "::error::box $label's cross-probe to $proxy_ip:444 was not reset either — the box-to-peer path itself is down in this daemon; stderr: ${cross:-<empty>}"
     fi
   }
 
@@ -18899,29 +19004,30 @@ proof_deny_all_box_reaches_proxy_and_no_other_host_port() {
     fi
   done
 
-  # And no other port at the lane's own address: TCP to 443 at the proxy's
-  # address — a port the proxy's listener does not bind, so the declaration
-  # never admitted it — is the box's own 0.0.0.0/0's to refuse again, on
-  # both legs (the relay's lane arm and the gate's read the listener, not
-  # the address), so the connect runs out its window with no reset, exactly
-  # as the host alias did. The lane's narrowing, pinned end to end: what
-  # the declaration opened is the proxy's listener, not its address.
+  # And no other port at the lane's own address: TCP to 444 at the proxy's
+  # address — a port the lane never opens, since it opens the proxy's
+  # listener port and TCP 443 only (BEP-080) — is the box's own
+  # 0.0.0.0/0's to refuse again, on both legs (the relay's lane arm and
+  # the gate's read those two ports, not the address), so the connect runs
+  # out its window with no reset, exactly as the host alias did. The
+  # lane's narrowing, pinned end to end: what the declaration opened is
+  # the proxy's listener port and 443, not its address.
   probe_start_ms="$(now_ms)"
   mnl session exec "$lane_sid" \
-    "/usr/bin/socat /dev/null TCP:$proxy_ip:443,connect-timeout=8" \
+    "/usr/bin/socat /dev/null TCP:$proxy_ip:444,connect-timeout=8" \
     >/dev/null 2>"$WORK/cred-lane-other-port.err" && {
-    echo "::error::the deny-all lane box reached the proxy's address at port 443 — the lane opens the proxy's listener, never its address"
+    echo "::error::the deny-all lane box reached the proxy's address at port 444 — the lane opens the proxy's listener port and TCP 443 only (BEP-080), never its address"
     cat "$WORK/cred-lane-other-port.err" 2>/dev/null || true
     cred_fail
   }
   probe_ms=$(( $(now_ms) - probe_start_ms ))
   if grep -qE 'Connection refused|No route to host|unreachable' "$WORK/cred-lane-other-port.err" 2>/dev/null; then
-    echo "::error::the deny-all lane box's connection to the proxy's address at port 443 was actively rejected, not dropped — a port the lane never opened is the box's own rules' to decide, on both legs"
+    echo "::error::the deny-all lane box's connection to the proxy's address at port 444 was actively rejected, not dropped — the lane opens the proxy's listener port and TCP 443 only (BEP-080), so port 444 is the box's own rules' to decide, on both legs"
     cat "$WORK/cred-lane-other-port.err" 2>/dev/null || true
     cred_fail
   fi
   if [ "$probe_ms" -lt 5000 ]; then
-    echo "::error::the deny-all lane box's connection to the proxy's address at port 443 failed in ${probe_ms}ms — a fast failure is a reject, not the silent drop being asserted"
+    echo "::error::the deny-all lane box's connection to the proxy's address at port 444 failed in ${probe_ms}ms — a fast failure is a reject, not the silent drop being asserted"
     cat "$WORK/cred-lane-other-port.err" 2>/dev/null || true
     cred_fail
   fi

@@ -608,7 +608,7 @@ fn node_mirror_pass(
     allocate: impl FnOnce() -> Result<std::net::Ipv4Addr, String>,
 ) -> Option<String> {
     let mirror = boxes.node_mirror();
-    mirror.set_range_probe(probe.present());
+    boxes.set_node_range_probe(probe.present());
     if !probe.present() || mirror.address().is_some() {
         return None;
     }

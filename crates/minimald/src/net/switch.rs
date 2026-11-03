@@ -4640,7 +4640,7 @@ pub(crate) mod tests {
         // port at the proxy's address and UDP to the listener's own port
         // are the address's own drop, ahead of the rules — which deny them
         // here anyway — so only the ARP sentinel behind them comes through.
-        let other_port = egress_tcp_frame(LEASE, proxy, 443);
+        let other_port = egress_tcp_frame(LEASE, proxy, 444);
         let other_proto = udp_frame(LEASE, 40000, proxy, listener);
         let sentinel = arp_frame(LEASE);
         harness.box_end.write_all(&other_port).unwrap();
