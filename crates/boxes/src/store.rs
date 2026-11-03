@@ -11,6 +11,7 @@ use paths::{DaemonAbsPath, DaemonRelPath, sub_path};
 
 use crate::{
     Record, SESSION_BOX_TYPE, SessionId,
+    box_name::NamedBox,
     core::zone_answer::{HOST_ROW_LABEL, NODE_ROW_LABEL},
     events::{BoxEvent, DecodedEvents, decode_lines},
 };
@@ -106,9 +107,12 @@ pub trait Loader {
     /// the store does not enforce state-machine transitions (e.g.
     /// `Pending` → `Active`), that policy belongs in higher layers.
     ///
-    /// If `record.name` differs from the on-disk name, the name
-    /// index is remapped; a name collision with a *different* session
-    /// surfaces as `AlreadyExists`.
+    /// If `record.name` differs from the on-disk name, the index's alias
+    /// for the id is replaced. A name is shared by any number of records,
+    /// and held by at most one running one (BOX-004): a new name that a
+    /// *different* running session holds, or a record that starts running
+    /// again while another running session holds its name, surfaces as
+    /// `AlreadyExists`.
     ///
     /// # Errors
     ///
@@ -116,14 +120,18 @@ pub trait Loader {
     /// - `NotFound` if `key` is stale — its short is no longer in the
     ///   index (e.g. the session was deleted after the caller obtained
     ///   the key). Prevents silent resurrection of removed sessions.
-    /// - `AlreadyExists` if `record.name` is taken by a different session.
+    /// - `AlreadyExists` if `record.name` is held by a different running
+    ///   session, as above.
+    /// - `InvalidInput` if `record.name` changes to `self` or to an
+    ///   invalid name.
     /// - Other I/O errors from writing the record or flushing the index.
     fn save(&mut self, key: &Self::Key, record: &Record) -> Result<(), std::io::Error>;
 
-    /// Renames the session with the given key.
-    ///
-    /// Sugar for `get` → mutate `name` → [`Self::save`]; see `save`
-    /// for the underlying write semantics.
+    /// Renames the session with the given key (BOX-010): `get` → mutate
+    /// `name` → [`Self::save`], then a `renamed` event that carries the
+    /// old and new names. Only the alias changes: the id, the spec, the
+    /// filesystem and the earlier events stay as they were. See `save` for
+    /// the underlying write semantics.
     ///
     /// # Errors
     ///
@@ -132,9 +140,13 @@ pub trait Loader {
     /// - `NotFound` if `key` is stale (same as [`Self::save`]); the
     ///   internal `get` may also surface `NotFound` when the record
     ///   file is gone.
-    /// - `AlreadyExists` if a *different* session already has the
-    ///   requested name; renaming to the session's current name is a
-    ///   no-op.
+    /// - `AlreadyExists` if a *running* session other than this one holds
+    ///   the requested name, and `InvalidInput` for the reserved name
+    ///   `self`. A stopped or exited session's name is free. Renaming to
+    ///   the session's current name is a no-op and records no event.
+    ///
+    /// A failure to write the renamed event after the new name is saved is
+    /// logged, and the rename still returns `Ok`.
     fn rename(&mut self, key: &Self::Key, new_name: String) -> Result<(), std::io::Error>;
 
     /// Deletes the session with the given key, dropping its index entries and
@@ -326,32 +338,14 @@ impl DiskBox {
     /// `NotFound` if the box's directory does not exist, and an I/O error
     /// if the file cannot be read or written.
     pub fn append_event(&self, event: &BoxEvent) -> Result<(), std::io::Error> {
-        use std::io::Write as _;
+        append_event_line(&self.events_path(), self.key.id(), event)
+    }
 
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true).append(true).create(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let mut file = options.open(self.events_path().as_utf8_path())?;
-        // Held until `file` drops after `sync_data`: the length, the cut and
-        // the write below are one step for every other appender.
-        file.lock()?;
-        let len = file.metadata()?.len();
-        let complete = complete_len(&mut file, len)?;
-        if complete < len {
-            file.set_len(complete)?;
-            tracing::warn!(
-                box_id = %self.key.id(),
-                dropped_bytes = len - complete,
-                events_path = %self.events_path().as_str(),
-                "cut a torn last line from a box's events file before an append"
-            );
-        }
-        file.write_all(&event.to_line()?)?;
-        file.sync_data()
+    /// The transcript file of the exec `exec_id` in this box, beside its
+    /// record (BOX-149). See [`exec_transcript_path`].
+    #[must_use]
+    pub fn exec_transcript_path(&self, exec_id: &str) -> camino::Utf8PathBuf {
+        exec_transcript_path(self.root_path().as_utf8_path(), exec_id)
     }
 
     /// Reads the box's events file from byte `offset` (BOX-162): every
@@ -380,13 +374,587 @@ impl DiskBox {
     /// box's events stops once this is false (BOX-162).
     #[must_use]
     pub fn is_retained(&self) -> bool {
-        let root = self.root_path();
-        let root = root.as_utf8_path();
-        let tombstone = root
-            .parent()
-            .map(|sessions| sessions.join(tombstone_name(self.key.dir_key.as_str())));
+        self.dir().is_retained()
+    }
+
+    /// The path of the box's output log, [`LOG_FILE`], beside its record
+    /// (BOX-155). Like the events file, no path mounted into the box
+    /// reaches it (BOX-164). A test pins the literal to [`LOG_FILE`].
+    pub fn log_path(&self) -> DaemonAbsPath {
+        self.dir().log_path()
+    }
+
+    /// The box's directory, for a writer or reader outside the store.
+    #[must_use]
+    pub fn dir(&self) -> BoxDir {
+        BoxDir {
+            root: self.root_path(),
+        }
+    }
+}
+
+/// The name of the file beside `record.json` that holds the box's output
+/// log (BOX-155): every byte its entrypoint wrote to its terminal, from
+/// each start, whether or not a client was attached. Only the daemon
+/// writes it (BOX-164).
+pub const LOG_FILE: &str = "output.log";
+
+/// The name of the directory beside `record.json` that the box sees as its
+/// workspace. Its parent is the box's directory.
+const TREE_DIR: &str = "tree";
+
+/// The directory that holds a box's record, as code outside the store sees
+/// it: the box's runtime, which knows only the paths mounted into the box,
+/// and a reader that knows only the box's id.
+///
+/// The files this names, `record.json`, [`EVENTS_FILE`](crate::events::EVENTS_FILE)
+/// and [`LOG_FILE`], sit in this directory itself. The box sees only the
+/// `tree`, `home`, `cache`, `patches` and `hooks` directories under it, so
+/// no process inside the box can open them (BOX-041, BOX-164).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoxDir {
+    root: DaemonAbsPath,
+}
+
+impl BoxDir {
+    /// The box directory whose workspace is `tree`, as
+    /// [`BoxObject::workspace_path`] names it. `None` when `tree` is not
+    /// named `tree`, or has no parent: no box's workspace is then known,
+    /// so nothing is written beside it.
+    #[must_use]
+    pub fn for_tree(tree: &DaemonAbsPath) -> Option<Self> {
+        if tree.file_name() != Some(TREE_DIR) {
+            return None;
+        }
+        tree.parent().map(|root| Self { root })
+    }
+
+    /// The directory of the retained box `id` under the daemon state
+    /// directory `minimal_dir`, found through the store's index on disk.
+    /// The index is replaced by a rename, so a read sees a whole one.
+    /// `None` when no indexed box has `id`, when the record in the
+    /// indexed directory names another box, and when the box is reaped or
+    /// its delete has begun.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the index or the record exists but cannot be read.
+    pub fn find(
+        minimal_dir: &DaemonAbsPath,
+        id: &SessionId,
+    ) -> Result<Option<Self>, std::io::Error> {
+        let sessions = sub_path!(minimal_dir, "sessions");
+        let index: Index = match std::fs::File::open(sessions.as_utf8_path().join("index.json")) {
+            Ok(file) => serde_json_lenient::from_reader(file)?,
+            Err(e) if e.kind() == NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let Some(short) = index.short_by_id(id) else {
+            return Ok(None);
+        };
+        if !is_valid_short(short) {
+            return Ok(None);
+        }
+        let dir = Self {
+            root: sessions.sub_path_unchecked(short),
+        };
+        match dir.record() {
+            Ok(record) if record.id == *id => Ok(dir.is_retained().then_some(dir)),
+            Ok(_) => Ok(None),
+            Err(e) if e.kind() == NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The path of the box's output log, [`LOG_FILE`].
+    pub fn log_path(&self) -> DaemonAbsPath {
+        sub_path!(self.root, "output.log")
+    }
+
+    /// The path of the box's events file,
+    /// [`EVENTS_FILE`](crate::events::EVENTS_FILE).
+    pub fn events_path(&self) -> DaemonAbsPath {
+        sub_path!(self.root, "events.jsonl")
+    }
+
+    /// Reads the box's record from disk.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` once the box is reaped, and an I/O error if the record
+    /// cannot be read or parsed.
+    pub fn record(&self) -> Result<Record, std::io::Error> {
+        let file = std::fs::File::open(self.root.as_utf8_path().join("record.json"))?;
+        Ok(serde_json_lenient::from_reader(file)?)
+    }
+
+    /// Whether the box's record is still retained: its `record.json` is on
+    /// disk and no delete of its directory has begun.
+    #[must_use]
+    pub fn is_retained(&self) -> bool {
+        let root = self.root.as_utf8_path();
+        let tombstone = match (root.parent(), root.file_name()) {
+            (Some(sessions), Some(short)) => Some(sessions.join(tombstone_name(short))),
+            _ => None,
+        };
         root.join("record.json").exists() && !tombstone.is_some_and(|t| t.exists())
     }
+
+    /// Writes one lifecycle event of type `kind` for the box, stamped now
+    /// with the id and parent its record on disk names (BOX-040), with the
+    /// same lock and torn-line repair as [`DiskBox::append_event`]. For a
+    /// writer that holds no [`DiskBox`]: the box's runtime, which records
+    /// `detached` (BOX-016).
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` once the box is reaped, and an I/O error if the record
+    /// cannot be read or the event cannot be appended.
+    pub fn append_event(
+        &self,
+        kind: crate::events::BoxEventType,
+    ) -> Result<BoxEvent, std::io::Error> {
+        let record = self.record()?;
+        let event = BoxEvent::for_record(&record, kind);
+        append_event_line(&self.events_path(), &record.id, &event)?;
+        Ok(event)
+    }
+
+    /// Reads at most `max` bytes of the box's output log from byte
+    /// `offset` (BOX-155). A box with no log yet reads as empty.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the log exists but cannot be read.
+    pub fn read_log_from(&self, offset: u64, max: usize) -> Result<Vec<u8>, std::io::Error> {
+        use std::io::{Read as _, Seek as _};
+
+        let mut file = match open_log_for_read(&self.log_path()) {
+            Ok(file) => file,
+            Err(e) if e.kind() == NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        let mut buf = Vec::new();
+        file.take(max as u64).read_to_end(&mut buf)?;
+        Ok(buf)
+    }
+}
+
+/// The most bytes a box's output log holds on disk: 8 MiB, the same cap
+/// as an exec's transcript. A box that writes more keeps running. Its log
+/// then drops the oldest bytes and keeps the newest, so a box that writes
+/// without end does not fill the daemon's state directory.
+///
+/// So a box that writes more than 8 MiB loses the start of its log. This
+/// departs from docs/architecture.md line 473, which says the log is
+/// complete from the box's start. The design does not state this bound
+/// yet. <https://github.com/gominimal/arch/issues/159> decides it.
+pub const LOG_CAP: u64 = 8 * 1024 * 1024;
+
+/// The first line of a log that dropped its oldest bytes.
+pub const LOG_DROPPED: &[u8] = b"[older output was dropped. Only the newest output is kept.]\n";
+
+/// How many bytes of output a log keeps when it drops its oldest bytes
+/// under `cap`: half the cap, less the [`LOG_DROPPED`] line before them.
+fn log_kept(cap: u64) -> u64 {
+    (cap / 2).saturating_sub(LOG_DROPPED.len() as u64)
+}
+
+/// Opens the log at `path` for a read without following a symbolic link.
+/// The path must name a regular file, and the file opened must be that
+/// same file, so a link or a swap at the path is refused. (The crate has
+/// no `O_NOFOLLOW`, so the open compares the device and inode instead.)
+fn open_log_for_read(path: &DaemonAbsPath) -> Result<std::fs::File, std::io::Error> {
+    let not_regular = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the log path is not a regular file",
+        )
+    };
+    let link = std::fs::symlink_metadata(path.as_utf8_path())?;
+    if !link.file_type().is_file() {
+        return Err(not_regular());
+    }
+    let file = std::fs::File::open(path.as_utf8_path())?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || file_id(&opened) != file_id(&link) {
+        return Err(not_regular());
+    }
+    Ok(file)
+}
+
+/// The device and inode of a file, which tell two files apart.
+#[cfg(unix)]
+fn file_id(meta: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt as _;
+    (meta.dev(), meta.ino())
+}
+
+/// No device and inode off unix: every file reads as the same one, so a
+/// rotation is not seen and the reader keeps its file.
+#[cfg(not(unix))]
+fn file_id(_meta: &std::fs::Metadata) -> (u64, u64) {
+    (0, 0)
+}
+
+/// A box's output log as the daemon writes it: never more than
+/// [`LOG_CAP`] bytes at rest.
+///
+/// Past 8 MiB, [`LOG_CAP`] drops the start of the box's output. This
+/// departs from docs/architecture.md line 473, which says the log is
+/// complete from the box's start.
+/// <https://github.com/gominimal/arch/issues/159> decides the bound.
+///
+/// A write that takes the file past the cap is appended first. Then the
+/// file is replaced with [`LOG_DROPPED`] and the newest bytes of the old
+/// file, half the cap in all. The new file is written beside the old one
+/// and renamed over it, so a reader that has the old file open still reads
+/// the whole of it. [`LogReader`] reads across that replacement.
+#[derive(Debug)]
+pub struct LogWriter {
+    path: DaemonAbsPath,
+    file: std::fs::File,
+    len: u64,
+    cap: u64,
+}
+
+impl LogWriter {
+    /// Writes the log at `path` through `file`, which the caller opened for
+    /// reads and appends at that path, under the cap [`LOG_CAP`].
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the file's length cannot be read.
+    pub fn new(path: DaemonAbsPath, file: std::fs::File) -> Result<Self, std::io::Error> {
+        let len = file.metadata()?.len();
+        Ok(Self {
+            path,
+            file,
+            len,
+            cap: LOG_CAP,
+        })
+    }
+
+    /// The same writer under a different cap, for a test that does not
+    /// write [`LOG_CAP`] bytes. The reader must use the same cap.
+    #[must_use]
+    pub fn with_cap(mut self, cap: u64) -> Self {
+        self.cap = cap;
+        self
+    }
+
+    /// Appends `bytes`, and drops the oldest bytes if the file is then
+    /// past the cap.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the append or the replacement fails.
+    pub fn write(&mut self, bytes: &[u8]) -> Result<(), std::io::Error> {
+        use std::io::Write as _;
+
+        self.file.write_all(bytes)?;
+        self.len += bytes.len() as u64;
+        if self.len > self.cap {
+            self.drop_oldest()?;
+        }
+        Ok(())
+    }
+
+    /// Replaces the file with [`LOG_DROPPED`] and the newest bytes of the
+    /// file, half the cap in all.
+    fn drop_oldest(&mut self) -> Result<(), std::io::Error> {
+        use std::io::{Read as _, Seek as _, Write as _};
+
+        let keep = log_kept(self.cap).min(self.len);
+        let mut tail = Vec::with_capacity(LOG_DROPPED.len() + usize::try_from(keep).unwrap_or(0));
+        tail.extend_from_slice(LOG_DROPPED);
+        self.file.seek(std::io::SeekFrom::Start(self.len - keep))?;
+        (&mut self.file).take(keep).read_to_end(&mut tail)?;
+
+        let next_path = self.path.as_utf8_path().with_extension("log.next");
+        match std::fs::remove_file(&next_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == NotFound => {}
+            Err(e) => return Err(e),
+        }
+        let mut options = std::fs::OpenOptions::new();
+        // `create_new` refuses anything already at the path, a link too.
+        options.read(true).append(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut next = options.open(&next_path)?;
+        next.write_all(&tail)?;
+        std::fs::rename(&next_path, self.path.as_utf8_path())?;
+        tracing::info!(
+            log_path = %self.path.as_str(),
+            dropped_after = self.len,
+            kept = tail.len(),
+            "a box's output log reached its cap and dropped its oldest bytes"
+        );
+        self.file = next;
+        self.len = tail.len() as u64;
+        Ok(())
+    }
+}
+
+/// A box's output log in the bytes the reader gets back from
+/// [`LogReader::read`]: `data` starts at byte `offset` of the log file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogChunk {
+    pub offset: u64,
+    pub data: Vec<u8>,
+}
+
+/// A read of a box's output log that carries on across the times the
+/// [`LogWriter`] drops the oldest bytes (BOX-155).
+///
+/// The reader keeps its file open. An offset is a byte of the file it
+/// has open. When the writer replaces the file, the reader first reads
+/// the old file to its end, then moves to the new file:
+///
+/// - When the new file starts with [`LOG_DROPPED`] and the bytes the old
+///   file ended with, the reader already sent those bytes. It goes on from
+///   the byte after them, so no byte is sent twice.
+/// - Otherwise the writer replaced the file more than once since the
+///   reader moved. The reader reads the new file from its first byte, so
+///   the [`LOG_DROPPED`] line marks the output it never saw.
+///
+/// The offset of a chunk read from the new file is smaller than the end of
+/// the old one, because the new file is half the cap.
+#[derive(Debug)]
+pub struct LogReader {
+    path: DaemonAbsPath,
+    file: Option<std::fs::File>,
+    offset: u64,
+    cap: u64,
+}
+
+impl LogReader {
+    /// A read of `dir`'s log from byte `offset` of the file at the path
+    /// now, under the cap [`LOG_CAP`]. Nothing is opened until the first
+    /// [`Self::read`].
+    #[must_use]
+    pub fn new(dir: &BoxDir, offset: u64) -> Self {
+        Self {
+            path: dir.log_path(),
+            file: None,
+            offset,
+            cap: LOG_CAP,
+        }
+    }
+
+    /// The same reader under a different cap, the cap of its writer.
+    #[must_use]
+    pub fn with_cap(mut self, cap: u64) -> Self {
+        self.cap = cap;
+        self
+    }
+
+    /// The byte of the open file that the next read starts at.
+    #[must_use]
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Reads at most `max` bytes from where the last read stopped. An
+    /// empty chunk means the log has no more bytes now. A box with no log
+    /// yet reads as empty.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error if the log cannot be read, and `InvalidInput` if the
+    /// path is not a regular file. A log that is gone, because the box is
+    /// reaped, reads as empty once the open file is read to its end.
+    pub fn read(&mut self, max: usize) -> Result<LogChunk, std::io::Error> {
+        loop {
+            let Some(file) = self.file.as_mut() else {
+                match open_log_for_read(&self.path) {
+                    Ok(file) => self.file = Some(file),
+                    Err(e) if e.kind() == NotFound => return Ok(self.empty()),
+                    Err(e) => return Err(e),
+                }
+                continue;
+            };
+            let data = read_at(file, self.offset, max as u64)?;
+            if !data.is_empty() {
+                let chunk = LogChunk {
+                    offset: self.offset,
+                    data,
+                };
+                self.offset += chunk.data.len() as u64;
+                return Ok(chunk);
+            }
+            let current = match open_log_for_read(&self.path) {
+                Ok(current) => current,
+                // The box is reaped. Its open file was read to its end.
+                Err(e) if e.kind() == NotFound => return Ok(self.empty()),
+                Err(e) => return Err(e),
+            };
+            if file_id(&current.metadata()?) == file_id(&file.metadata()?) {
+                return Ok(self.empty());
+            }
+            // The writer replaced the file. The old one is no longer
+            // written, but a write can land before the replacement and
+            // after the read above: read it to its end first.
+            let data = read_at(file, self.offset, max as u64)?;
+            if !data.is_empty() {
+                let chunk = LogChunk {
+                    offset: self.offset,
+                    data,
+                };
+                self.offset += chunk.data.len() as u64;
+                return Ok(chunk);
+            }
+            let resume = self.resume_in(&current)?;
+            tracing::debug!(
+                log_path = %self.path.as_str(),
+                old_end = self.offset,
+                resume,
+                "a read of a box's output log moved to the replaced file"
+            );
+            self.file = Some(current);
+            self.offset = resume;
+        }
+    }
+
+    /// The byte of `next`, the file that replaced the open one, to go on
+    /// from: past the bytes the open file ended with, when `next` starts
+    /// with them, and 0 otherwise.
+    fn resume_in(&mut self, next: &std::fs::File) -> Result<u64, std::io::Error> {
+        // Compared in steps, so the reader holds no more than two steps.
+        const STEP: u64 = 64 * 1024;
+        let Some(old) = self.file.as_mut() else {
+            return Ok(0);
+        };
+        let keep = log_kept(self.cap).min(self.offset);
+        let mark = LOG_DROPPED.len() as u64;
+        let mut next = next.try_clone()?;
+        if read_at(&mut next, 0, mark)? != LOG_DROPPED {
+            return Ok(0);
+        }
+        let mut at = 0;
+        while at < keep {
+            let n = STEP.min(keep - at);
+            let kept = read_at(&mut next, mark + at, n)?;
+            let seen = read_at(old, self.offset - keep + at, n)?;
+            if kept.len() as u64 != n || kept != seen {
+                return Ok(0);
+            }
+            at += n;
+        }
+        Ok(mark + keep)
+    }
+
+    fn empty(&self) -> LogChunk {
+        LogChunk {
+            offset: self.offset,
+            data: Vec::new(),
+        }
+    }
+}
+
+/// Reads at most `max` bytes of `file` from byte `offset`.
+fn read_at(file: &mut std::fs::File, offset: u64, max: u64) -> Result<Vec<u8>, std::io::Error> {
+    use std::io::{Read as _, Seek as _};
+
+    file.seek(std::io::SeekFrom::Start(offset))?;
+    let mut buf = Vec::new();
+    file.take(max).read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+/// The body of [`DiskBox::append_event`] and [`BoxDir::append_event`]:
+/// appends `event` as one line to the events file at `events_path`.
+fn append_event_line(
+    events_path: &DaemonAbsPath,
+    box_id: &SessionId,
+    event: &BoxEvent,
+) -> Result<(), std::io::Error> {
+    use std::io::Write as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(events_path.as_utf8_path())?;
+    // Held until `file` drops after `sync_data`: the length, the cut and
+    // the write below are one step for every other appender.
+    file.lock()?;
+    let len = file.metadata()?.len();
+    let complete = complete_len(&mut file, len)?;
+    if complete < len {
+        file.set_len(complete)?;
+        tracing::warn!(
+            box_id = %box_id,
+            dropped_bytes = len - complete,
+            events_path = %events_path.as_str(),
+            "cut a torn last line from a box's events file before an append"
+        );
+    }
+    file.write_all(&event.to_line()?)?;
+    file.sync_data()
+}
+
+/// [`DiskBox::append_event`] for the events file at `events_path`, for a
+/// writer that holds the box's state directory but not its [`DiskBox`]. The
+/// same lock, cut and sync apply, so the two kinds of writer never
+/// interleave.
+///
+/// # Errors
+///
+/// `NotFound` if the box's directory does not exist, and an I/O error if
+/// the file cannot be read or written.
+pub fn append_event_at(
+    events_path: &camino::Utf8Path,
+    event: &BoxEvent,
+) -> Result<(), std::io::Error> {
+    use std::io::Write as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(events_path)?;
+    // Held until `file` drops after `sync_data`: the length, the cut and
+    // the write below are one step for every other appender.
+    file.lock()?;
+    let len = file.metadata()?.len();
+    let complete = complete_len(&mut file, len)?;
+    if complete < len {
+        file.set_len(complete)?;
+        tracing::warn!(
+            box_id = %event.box_id,
+            dropped_bytes = len - complete,
+            events_path = %events_path,
+            "cut a torn last line from a box's events file before an append"
+        );
+    }
+    file.write_all(&event.to_line()?)?;
+    file.sync_data()
+}
+
+/// The directory beside `record.json` that holds the box's exec
+/// transcripts (BOX-149). No path mounted into the box reaches it.
+pub const EXECS_DIR: &str = "execs";
+
+/// The transcript file of the exec `exec_id` in the box whose state
+/// directory is `box_dir`: `<box_dir>/execs/<exec_id>.log`. The file holds
+/// what the exec wrote, stdout and stderr together, in the order it wrote
+/// them. A box's delete removes its whole directory, so a transcript reads
+/// back by its exec id until the box is reaped.
+#[must_use]
+pub fn exec_transcript_path(box_dir: &camino::Utf8Path, exec_id: &str) -> camino::Utf8PathBuf {
+    box_dir.join(EXECS_DIR).join(format!("{exec_id}.log"))
 }
 
 /// The length of `file` up to and including its last `\n`, or 0 if it has
@@ -447,25 +1015,37 @@ impl BoxObject for DiskBox {
     }
 }
 
+/// The store's index. Every map in it is keyed on the box's short
+/// directory name or on its id, never on its name (BOX-143): a name is an
+/// alias that many retained records can share (BOX-004).
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 struct Index {
     short_to_id: BTreeMap<String, SessionId>,
-    name_to_id: BTreeMap<String, SessionId>,
+    /// Each named box's current alias, keyed on its id. An index written
+    /// before names were shared carries a `name_to_id` map instead, which
+    /// is ignored: the first open rebuilds this map from the records.
+    #[serde(default)]
+    names: BTreeMap<SessionId, String>,
 }
 
 impl Index {
     pub fn insert(&mut self, short: String, id: SessionId, name: Option<String>) {
         self.short_to_id.insert(short, id);
-        if let Some(name) = name {
-            self.name_to_id.insert(name, id);
-        }
+        self.set_name(id, name);
     }
 
-    /// Removes a session's entries from both the short and name indexes.
-    pub fn remove(&mut self, short: &str, name: Option<&str>) {
-        self.short_to_id.remove(short);
-        if let Some(name) = name {
-            self.name_to_id.remove(name);
+    /// Sets or clears the alias of the box `id`.
+    fn set_name(&mut self, id: SessionId, name: Option<String>) {
+        match name {
+            Some(name) => self.names.insert(id, name),
+            None => self.names.remove(&id),
+        };
+    }
+
+    /// Removes a session's entries from both the short and name maps.
+    pub fn remove(&mut self, short: &str) {
+        if let Some(id) = self.short_to_id.remove(short) {
+            self.names.remove(&id);
         }
     }
 
@@ -474,38 +1054,13 @@ impl Index {
         self.short_to_id.iter()
     }
 
-    /// Returns the session ID corresponding to the given session name, if known.
-    pub fn find_by_name<S: AsRef<str>>(&self, name: S) -> Option<&SessionId> {
-        self.name_to_id.get(name.as_ref())
-    }
-
-    /// Returns the session ID whose name folds to `name` under ASCII
-    /// case-insensitivity, if any. Session names are unique under the same
-    /// fold the box hostname uses, so a name that differs from an existing
-    /// one only by letter case is a collision.
-    pub fn find_by_name_folded<S: AsRef<str>>(&self, name: S) -> Option<&SessionId> {
-        let name = name.as_ref();
-        self.name_to_id
+    /// The ids of the boxes whose alias folds to `name` under ASCII case,
+    /// as hostnames do.
+    fn ids_named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = SessionId> + 'a {
+        self.names
             .iter()
-            .find(|(existing, _)| existing.eq_ignore_ascii_case(name))
-            .map(|(_, id)| id)
-    }
-
-    /// Returns the session ID whose name folds to `name`, only when exactly
-    /// one indexed name does. Sessions written before names were made unique
-    /// under case folding can still sit side by side on disk (`Case-R` and
-    /// `case-r`); a lookup that folds to both is ambiguous and resolves to
-    /// neither rather than picking one.
-    fn find_by_name_folded_unique(&self, name: &str) -> Option<&SessionId> {
-        let mut matches = self
-            .name_to_id
-            .iter()
-            .filter(|(existing, _)| existing.eq_ignore_ascii_case(name))
-            .map(|(_, id)| id);
-        match (matches.next(), matches.next()) {
-            (Some(id), None) => Some(id),
-            _ => None,
-        }
+            .filter(move |(_, alias)| alias.eq_ignore_ascii_case(name))
+            .map(|(id, _)| *id)
     }
 
     /// Returns the session ID corresponding to the given short name, if known.
@@ -523,10 +1078,7 @@ impl Index {
 
     /// Returns the name corresponding to the given session ID, if it has one.
     pub fn name_by_id(&self, id: &SessionId) -> Option<&String> {
-        self.name_to_id
-            .iter()
-            .find(|(_name, iter_id)| *iter_id == id)
-            .map(|(name, _)| name)
+        self.names.get(id)
     }
 }
 
@@ -603,6 +1155,21 @@ fn classify_record_for_reconcile(
         old_name: index_name,
         new_name: record.name,
     })
+}
+
+/// Logs a loaded record whose `reason` this build does not know (BOX-011).
+/// The record loads with the reason as written, and a save keeps it, so
+/// the log line is the one place the daemon says it cannot read the
+/// ending.
+fn log_unknown_reason(record: &Record) {
+    if let Some(reason @ crate::core::record::StoredReason::Unknown(_)) = &record.reason {
+        tracing::warn!(
+            session_id = %record.id,
+            status = ?record.status,
+            reason = reason.as_str(),
+            "loaded a box record with a reason this build does not know; kept as written",
+        );
+    }
 }
 
 /// Enumerate the immediate session subdirectories under `sessions_dir`.
@@ -748,10 +1315,9 @@ impl DiskLoader {
                 continue;
             }
             if record.id != indexed_id {
+                self.index.names.remove(&indexed_id);
                 self.index.short_to_id.insert(short.clone(), record.id);
-                if let Some(name) = &record.name {
-                    self.index.name_to_id.insert(name.clone(), record.id);
-                }
+                self.index.set_name(record.id, record.name.clone());
                 *changed = true;
             }
             tracing::info!(
@@ -846,9 +1412,8 @@ impl DiskLoader {
             // An index entry may linger if delete crashed before flushing
             // the index. The record is gone, so look up the name from the
             // current in-memory index.
-            if let Some(id) = self.index.short_to_id.get(&short).copied() {
-                let name = self.index.name_by_id(&id).cloned();
-                self.index.remove(&short, name.as_deref());
+            if self.index.short_to_id.contains_key(&short) {
+                self.index.remove(&short);
                 *changed = true;
             }
         }
@@ -881,8 +1446,7 @@ impl DiskLoader {
                         id = %id,
                         "dropping dangling index entry (record.json missing or unparseable)",
                     );
-                    let name = self.index.name_by_id(&id).cloned();
-                    self.index.remove(&short, name.as_deref());
+                    self.index.remove(&short);
                     *changed = true;
                 }
                 ReconcileFix::Skip { reason } => {
@@ -903,12 +1467,7 @@ impl DiskLoader {
                         new_name = ?new_name,
                         "reconciling index entry's name with record.json (rename-crash recovery)",
                     );
-                    if let Some(old) = &old_name {
-                        self.index.name_to_id.remove(old);
-                    }
-                    if let Some(new) = new_name {
-                        self.index.name_to_id.insert(new, id);
-                    }
+                    self.index.set_name(id, new_name);
                     *changed = true;
                 }
             }
@@ -916,8 +1475,9 @@ impl DiskLoader {
     }
 
     /// Pass C: re-index orphan records (record.json present, no index
-    /// entry, not already reaped). Orphans whose `name` collides with
-    /// an existing index entry are skipped and logged.
+    /// entry, not already reaped). A running orphan whose `name` a running
+    /// indexed box holds is skipped and logged (BOX-004). A stopped or
+    /// exited orphan shares its name with any other record.
     fn heal_reindex_orphans(
         &mut self,
         session_dirs: &[(String, std::path::PathBuf)],
@@ -953,15 +1513,32 @@ impl DiskLoader {
                 continue;
             }
             if let Some(name) = &record.name
-                && self.index.find_by_name_folded(name).is_some()
+                && crate::box_name::holds_name(record.status)
             {
-                tracing::warn!(
-                    short = %short,
-                    name = %name,
-                    "orphan record's name collides with an existing index entry; \
-                     leaving orphan unindexed for manual triage",
-                );
-                continue;
+                match self.running_holder(name, None) {
+                    Ok(None) => {}
+                    Ok(Some(holder)) => {
+                        tracing::warn!(
+                            short = %short,
+                            name = %name,
+                            holder = %holder.id,
+                            holder_name = %holder.name,
+                            "orphan record's name is held by a running box; \
+                             leaving orphan unindexed for manual triage",
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            short = %short,
+                            name = %name,
+                            error = %e,
+                            "could not check whether a running box holds the orphan \
+                             record's name; leaving orphan unindexed for manual triage",
+                        );
+                        continue;
+                    }
+                }
             }
             tracing::info!(
                 short = %short,
@@ -1052,6 +1629,96 @@ impl DiskLoader {
             )),
         }
     }
+
+    /// Reads the record filed under `short`.
+    fn read_record(&self, short: &str) -> Result<Record, std::io::Error> {
+        let record_file = self
+            .minimal_dir
+            .as_utf8_path()
+            .join("sessions")
+            .join(short)
+            .join("record.json");
+        Ok(serde_json_lenient::from_reader(std::fs::File::open(
+            record_file,
+        )?)?)
+    }
+
+    /// The name facts of every indexed box whose alias folds to `name`,
+    /// read from their records. The index finds the ids, and the records
+    /// give each box's current name and state. A record that is gone
+    /// since the index listed it belongs to no box and is skipped.
+    ///
+    /// # Errors
+    ///
+    /// Any other error reading one of the records: a record that cannot
+    /// be read can belong to a running box that holds the name.
+    pub fn boxes_named(&self, name: &str) -> Result<Vec<NamedBox>, std::io::Error> {
+        let mut found = Vec::new();
+        for id in self.index.ids_named(name) {
+            let Some(short) = self.index.short_by_id(&id) else {
+                continue;
+            };
+            let record = match self.read_record(short) {
+                Ok(record) => record,
+                Err(e) if e.kind() == NotFound => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        box_id = %id,
+                        name,
+                        error = %e,
+                        "could not read a box record while matching a name",
+                    );
+                    return Err(e);
+                }
+            };
+            if let Some(named) = NamedBox::from_record(&record) {
+                found.push(named);
+            }
+        }
+        Ok(found)
+    }
+
+    /// The running box other than `except` that holds a name folding to
+    /// `name` (BOX-004), or `None`.
+    ///
+    /// # Errors
+    ///
+    /// The error of [`Self::boxes_named`].
+    pub fn running_holder(
+        &self,
+        name: &str,
+        except: Option<SessionId>,
+    ) -> Result<Option<NamedBox>, std::io::Error> {
+        let named = self.boxes_named(name)?;
+        let holder = crate::box_name::running_holder(&named, name, except).cloned();
+        if let Some(holder) = &holder {
+            tracing::debug!(
+                name,
+                holder = %holder.id,
+                candidates = ?named.iter().map(|b| (b.id, b.state_word())).collect::<Vec<_>>(),
+                "a running box holds the name",
+            );
+        }
+        Ok(holder)
+    }
+}
+
+/// The refusal of a creation or resume whose name a running box holds.
+fn held_name_error(name: &str, holder: &NamedBox) -> std::io::Error {
+    tracing::info!(
+        name,
+        holder = %holder.id,
+        holder_name = %holder.name,
+        "refused a name: a running box holds it",
+    );
+    std::io::Error::new(
+        AlreadyExists,
+        format!(
+            "a running session named `{}` already exists (session names are \
+             case-insensitive)",
+            holder.name
+        ),
+    )
 }
 
 /// Session names that collide with infrastructure names once the daemon
@@ -1157,18 +1824,12 @@ impl DiskLoader {
         }
         if let Some(name) = &record.name {
             validate_session_name(name)?;
-            if let Some(existing_id) = self.index.find_by_name_folded(name) {
-                let existing = self
-                    .index
-                    .name_by_id(existing_id)
-                    .map_or(name.as_str(), String::as_str);
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    format!(
-                        "a session named `{existing}` already exists \
-                         (session names are case-insensitive)"
-                    ),
-                ));
+            // BOX-004: only a running box holds a name. A stopped or exited
+            // box keeps its name and leaves it free for this one.
+            if crate::box_name::holds_name(record.status)
+                && let Some(holder) = self.running_holder(name, None)?
+            {
+                return Err(held_name_error(name, &holder));
             }
         }
 
@@ -1220,14 +1881,14 @@ impl Loader for DiskLoader {
             session_id: *id,
         }))
     }
+    /// BOX-005: the running box of that name, else the most recently
+    /// created box of that name, else `None`. The answer is the box's key,
+    /// so a caller holds the id, not the name.
     fn find_by_name<S: AsRef<str>>(&self, name: S) -> Result<Option<Self::Key>, std::io::Error> {
         let name = name.as_ref();
-        let uuid = self
-            .index
-            .find_by_name(name)
-            .or_else(|| self.index.find_by_name_folded_unique(name));
-        match uuid {
-            Some(uuid) => self.find_by_id(uuid),
+        let named = self.boxes_named(name)?;
+        match crate::box_name::resolve_on_host(&named, name) {
+            Some(id) => self.find_by_id(&id),
             None => Ok(None),
         }
     }
@@ -1245,6 +1906,7 @@ impl Loader for DiskLoader {
             .join(&short)
             .join("record.json");
         let record: Record = serde_json_lenient::from_reader(std::fs::File::open(record_file)?)?;
+        log_unknown_reason(&record);
         Ok(DiskBox {
             minimal_state_dir: self.minimal_dir.clone(),
             key: key.clone(),
@@ -1276,33 +1938,39 @@ impl Loader for DiskLoader {
         let old_name = self.index.name_by_id(&id).cloned();
         let new_name = record.name.clone();
 
-        // Validate a newly-assigned name at the character level before the
-        // uniqueness check. Gate on an actual change so re-saving an unchanged
-        // record (e.g. a status promotion) never re-validates a name.
         if old_name != new_name
             && let Some(name) = &new_name
         {
+            // BOX-010: a new name is refused when it is `self` or a running
+            // box on this host holds it, whatever state this box is in.
+            // Same-id same-name is a no-op, not a collision.
+            let named = self.boxes_named(name)?;
+            crate::box_name::check_rename(&named, id, name).map_err(|refusal| {
+                tracing::info!(
+                    box_id = %id,
+                    name,
+                    candidates = ?named.iter().map(|b| (b.id, b.state_word())).collect::<Vec<_>>(),
+                    %refusal,
+                    "refused a new name for a box",
+                );
+                std::io::Error::from(refusal)
+            })?;
+            // Validate a newly-assigned name at the character level. Gate on
+            // an actual change so re-saving an unchanged record (e.g. a
+            // status promotion) never re-validates a name.
             validate_session_name(name)?;
-        }
-
-        // Collision check: if the new name folds to a *different*
-        // session's name, refuse. Same-id same-name is a no-op, not a
-        // collision.
-        if let Some(name) = &new_name
-            && let Some(other_id) = self.index.find_by_name_folded(name).copied()
-            && other_id != id
+        } else if let Some(name) = &new_name
+            && crate::box_name::holds_name(record.status)
+            && self.index.ids_named(name).any(|other| other != id)
+            && !self
+                .read_record(&short)
+                .is_ok_and(|old| crate::box_name::holds_name(old.status))
         {
-            let existing = self
-                .index
-                .name_by_id(&other_id)
-                .map_or(name.as_str(), String::as_str);
-            return Err(std::io::Error::new(
-                AlreadyExists,
-                format!(
-                    "a session named `{existing}` already exists \
-                     (session names are case-insensitive)"
-                ),
-            ));
+            // BOX-004, BOX-025: a box that starts running again takes its
+            // name back only when no other running box holds it.
+            if let Some(holder) = self.running_holder(name, Some(id))? {
+                return Err(held_name_error(name, &holder));
+            }
         }
 
         // Atomic record write (temp + renameat2).
@@ -1310,12 +1978,7 @@ impl Loader for DiskLoader {
 
         // Only mutate the in-memory index after the on-disk write succeeds.
         if old_name != new_name {
-            if let Some(old) = &old_name {
-                self.index.name_to_id.remove(old);
-            }
-            if let Some(new) = new_name {
-                self.index.name_to_id.insert(new, id);
-            }
+            self.index.set_name(id, new_name);
             self.flush_index()?;
         }
 
@@ -1323,9 +1986,36 @@ impl Loader for DiskLoader {
     }
 
     fn rename(&mut self, key: &Self::Key, new_name: String) -> Result<(), std::io::Error> {
-        let mut record = self.get(key)?.record;
-        record.name = Some(new_name);
-        self.save(key, &record)
+        let object = self.get(key)?;
+        let old_name = object.record.name.clone();
+        if old_name.as_deref() == Some(new_name.as_str()) {
+            return Ok(());
+        }
+        let mut record = object.record.clone();
+        record.name = Some(new_name.clone());
+        self.save(key, &record)?;
+        // BOX-010: the rename changed the alias and nothing else. The event
+        // carries both names, and is keyed on the box's id like every other.
+        let mut event = BoxEvent::for_record(&record, crate::events::BoxEventType::Renamed);
+        event.data = crate::box_name::renamed_event_data(old_name.as_deref(), &new_name);
+        // The new name is already saved. A failed event write does not undo
+        // it, so the rename still succeeds, as on the actor path.
+        match object.append_event(&event) {
+            Ok(()) => tracing::info!(
+                box_id = %record.id,
+                old_name = ?old_name,
+                new_name = %new_name,
+                "renamed a box",
+            ),
+            Err(error) => tracing::warn!(
+                box_id = %record.id,
+                old_name = ?old_name,
+                new_name = %new_name,
+                %error,
+                "rename: could not write the renamed event",
+            ),
+        }
+        Ok(())
     }
 
     fn delete(&mut self, key: &Self::Key) -> Result<(), std::io::Error> {
@@ -1334,11 +2024,6 @@ impl Loader for DiskLoader {
         // deindex and `remove_dir_all` the *unrelated* session that inherited
         // the short. `live_short` returns `NotFound` in that case.
         let short = self.live_short(key)?;
-        // Discover the name index entry from the index itself, not by reading
-        // the record: index cleanup must not depend on the on-disk tree still
-        // existing, or a half-deleted session (dir gone, index entries left)
-        // could never be scrubbed.
-        let name = self.index.name_by_id(key.id()).cloned();
 
         let sessions_root = self.minimal_dir.as_utf8_path().join("sessions");
         let session_dir = sessions_root.join(&short);
@@ -1360,7 +2045,10 @@ impl Loader for DiskLoader {
         // index is the source of truth for `keys()`, so removing it first means
         // a crash mid-delete can only ever orphan a directory (invisible and
         // harmless), never leave a key pointing at a removed tree.
-        self.index.remove(&short, name.as_deref());
+        // Index cleanup reads only the index, not the record, so a
+        // half-deleted session (dir gone, index entries left) can still be
+        // scrubbed.
+        self.index.remove(&short);
         self.flush_index()?;
 
         match std::fs::remove_dir_all(&session_dir) {
@@ -1512,6 +2200,9 @@ mod tests {
                 None,
             ),
             status: BoxState::default(),
+            reason: None,
+            exit_code: None,
+            signal: None,
             // Deliberately the non-default shapes: `hooks_enabled: false`
             // and a present `box_addresses` are both serde defaults to
             // `None`/`true`, so a fixture using those would round-trip
@@ -1532,6 +2223,9 @@ mod tests {
             box_id: None,
             host_row_bound: true,
             bound_ports: std::collections::BTreeSet::new(),
+            // Non-default for the same reason: `false` is its serde default, and
+            // a dropped marker would strand a run box on resume (NET-131).
+            ends_with_run: true,
             sealed_deliveries: Vec::new(),
             root_certificate: None,
             // Set, so a field dropped on write shows up as a diff: `None` is
@@ -1594,6 +2288,204 @@ mod tests {
 
         loader.delete(&key).unwrap();
         assert!(!record_dir.join(SPEC_FILE).exists());
+    }
+
+    /// BOX-155, BOX-164: the box's output log sits beside its record, the
+    /// box directory a runtime finds from the workspace is the store's own,
+    /// and a reader finds it by id until the box is deleted.
+    #[test]
+    fn box_dir_names_the_log_beside_the_record() {
+        use crate::events::BoxEventType;
+
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let object = loader.get(&key).unwrap();
+        let record_dir = root
+            .as_utf8_path()
+            .join("sessions")
+            .join(key.dir_key.as_str());
+
+        assert_eq!(object.log_path().as_utf8_path(), record_dir.join(LOG_FILE));
+        assert_eq!(
+            BoxDir::for_tree(&object.workspace_path()),
+            Some(object.dir())
+        );
+        assert_eq!(BoxDir::for_tree(&object.home_path()), None);
+        assert_eq!(
+            BoxDir::find(&root, &key.session_id).unwrap(),
+            Some(object.dir())
+        );
+        assert_eq!(BoxDir::find(&root, &SessionId::mint()).unwrap(), None);
+
+        std::fs::write(record_dir.join(LOG_FILE), b"hello\r\nworld").unwrap();
+        assert_eq!(
+            object.dir().read_log_from(0, 64).unwrap(),
+            b"hello\r\nworld"
+        );
+        assert_eq!(object.dir().read_log_from(7, 3).unwrap(), b"wor");
+
+        let event = object.dir().append_event(BoxEventType::Detached).unwrap();
+        assert_eq!(event.box_id, key.session_id);
+        assert_eq!(event.parent, object.record().parent);
+        assert_eq!(object.read_events_from(0).unwrap().events, [event]);
+
+        loader.delete(&key).unwrap();
+        assert!(!record_dir.join(LOG_FILE).exists());
+        assert_eq!(BoxDir::find(&root, &key.session_id).unwrap(), None);
+    }
+
+    /// BOX-164: a read of a box's log does not follow a link planted where
+    /// the log goes, and refuses what is not a regular file.
+    #[cfg(unix)]
+    #[test]
+    fn log_read_refuses_a_link_at_the_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = loader_dir(&tmp);
+        let mut loader = DiskLoader::new(root).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let dir = loader.get(&key).unwrap().dir();
+        let target = tmp.path().join("secret");
+        std::fs::write(&target, b"secret").unwrap();
+        std::os::unix::fs::symlink(&target, dir.log_path().as_utf8_path()).unwrap();
+
+        let err = dir.read_log_from(0, 64).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+        let err = LogReader::new(&dir, 0).read(64).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+
+        std::fs::remove_file(dir.log_path().as_utf8_path()).unwrap();
+        std::fs::create_dir(dir.log_path().as_utf8_path()).unwrap();
+        let err = dir.read_log_from(0, 64).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+    }
+
+    /// A writer and a reader over one box's log under a small cap.
+    fn capped_log(cap: u64) -> (tempfile::TempDir, BoxDir, LogWriter) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = loader_dir(&tmp);
+        let mut loader = DiskLoader::new(root).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let dir = loader.get(&key).unwrap().dir();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(dir.log_path().as_utf8_path())
+            .unwrap();
+        let writer = LogWriter::new(dir.log_path(), file).unwrap().with_cap(cap);
+        (tmp, dir, writer)
+    }
+
+    /// Every chunk the reader has now, joined.
+    fn drain(reader: &mut LogReader) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let chunk = reader.read(7).unwrap();
+            if chunk.data.is_empty() {
+                return out;
+            }
+            out.extend_from_slice(&chunk.data);
+        }
+    }
+
+    /// BOX-155: past the cap the log keeps the drop mark and the newest
+    /// output, and is never larger than the cap. A reader that keeps up
+    /// reads every byte once, across each replacement.
+    #[test]
+    fn capped_log_keeps_the_newest_and_a_reader_sees_each_byte_once() {
+        let cap = 256;
+        let (_tmp, dir, mut writer) = capped_log(cap);
+        let mut reader = LogReader::new(&dir, 0).with_cap(cap);
+        let mut written = Vec::new();
+        let mut read = Vec::new();
+        for i in 0..200 {
+            let line = format!("line {i:04}\n");
+            writer.write(line.as_bytes()).unwrap();
+            written.extend_from_slice(line.as_bytes());
+            let len = std::fs::metadata(dir.log_path().as_utf8_path())
+                .unwrap()
+                .len();
+            assert!(len <= cap, "the log is {len} bytes, past the cap {cap}");
+            read.extend_from_slice(&drain(&mut reader));
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&read),
+            String::from_utf8_lossy(&written),
+            "a reader that keeps up reads each byte once, in order"
+        );
+
+        let log = dir.read_log_from(0, usize::MAX).unwrap();
+        assert!(
+            log.starts_with(LOG_DROPPED),
+            "{}",
+            String::from_utf8_lossy(&log)
+        );
+        assert!(
+            written.ends_with(&log[LOG_DROPPED.len()..]),
+            "the log holds the newest output"
+        );
+    }
+
+    /// A reader that falls behind by more than one replacement gets the
+    /// drop mark where its output has a gap, and no byte twice.
+    #[test]
+    fn capped_log_reader_behind_two_drops_sees_the_mark_and_no_repeat() {
+        let cap = 256;
+        let (_tmp, dir, mut writer) = capped_log(cap);
+        let mut reader = LogReader::new(&dir, 0).with_cap(cap);
+        let mut written = Vec::new();
+        let mut read = Vec::new();
+        for i in 0..10 {
+            let line = format!("line {i:04}\n");
+            writer.write(line.as_bytes()).unwrap();
+            written.extend_from_slice(line.as_bytes());
+        }
+        read.extend_from_slice(&drain(&mut reader));
+        for i in 10..200 {
+            let line = format!("line {i:04}\n");
+            writer.write(line.as_bytes()).unwrap();
+            written.extend_from_slice(line.as_bytes());
+        }
+        read.extend_from_slice(&drain(&mut reader));
+
+        let text = String::from_utf8_lossy(&read).into_owned();
+        let mark = String::from_utf8_lossy(LOG_DROPPED).into_owned();
+        let (before, after) = text.split_once(&mark).expect("the gap is marked");
+        assert!(written.starts_with(before.as_bytes()), "{text}");
+        assert!(written.ends_with(after.as_bytes()), "{text}");
+        let lines: Vec<&str> = text.lines().filter(|l| l.starts_with("line ")).collect();
+        let mut sorted = lines.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(lines, sorted, "no line twice, in order: {text}");
+    }
+
+    /// BOX-149: an exec's transcript lives beside the record, outside every
+    /// directory the box sees, and the box's delete removes it.
+    #[test]
+    fn exec_transcripts_live_beside_the_record_until_the_box_is_reaped() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let object = loader.get(&key).unwrap();
+        let record_dir = loader_dir(&tmp)
+            .as_utf8_path()
+            .join("sessions")
+            .join(key.dir_key.as_str());
+
+        let id = "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f4a5b";
+        let transcript = object.exec_transcript_path(id);
+        assert_eq!(
+            transcript,
+            record_dir.join(EXECS_DIR).join(format!("{id}.log"))
+        );
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, b"out\n").unwrap();
+
+        loader.delete(&key).unwrap();
+        assert!(!transcript.exists());
     }
 
     /// BOX-040, BOX-162: events append beside the record, outside every
@@ -1964,12 +2856,16 @@ mod tests {
         let mut lower = sample_record();
         lower.name = Some("Case-X".to_string());
         let lower_key = loader.create(lower).unwrap();
-        // Plant the legacy case-only duplicate the create path now refuses.
-        loader.index.name_to_id.remove("Case-X");
+        // Plant the legacy case-only duplicate the create path now refuses,
+        // in the record and in the index.
+        let mut planted = loader.get(&lower_key).unwrap().record;
+        planted.name = Some("case-r".to_string());
+        loader
+            .write_record(&short_of(&lower_key), &planted)
+            .unwrap();
         loader
             .index
-            .name_to_id
-            .insert("case-r".to_string(), lower_key.session_id);
+            .set_name(lower_key.session_id, Some("case-r".to_string()));
 
         assert_eq!(loader.find_by_name("Case-R").unwrap(), Some(upper_key));
         assert_eq!(loader.find_by_name("case-r").unwrap(), Some(lower_key));
@@ -2807,6 +3703,139 @@ mod tests {
         assert_eq!(loader.get(&key).unwrap().record().status, BoxState::Active,);
     }
 
+    // BOX-011: a record saved stopped or exited loads in the same state,
+    // with the reason, exit code and signal of how the box ended.
+    #[test]
+    fn record_stores_stopped_and_exited_with_their_ending() {
+        use crate::core::record::{ExitEnding, RecordState, StopEnding};
+
+        let endings = [
+            RecordState::Exited(ExitEnding::Exit { exit_code: 3 }),
+            RecordState::Exited(ExitEnding::Timeout),
+            RecordState::Exited(ExitEnding::Oom),
+            RecordState::Stopped(StopEnding::ExitedFirst { exit_code: 0 }),
+            RecordState::Stopped(StopEnding::Signalled { signal: 15 }),
+            RecordState::Stopped(StopEnding::AtDaemonStart),
+        ];
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let mut keys = Vec::new();
+        for (n, ending) in endings.iter().enumerate() {
+            let mut record = sample_record();
+            record.name = Some(format!("ended-{n}"));
+            let key = loader.create(record).unwrap();
+            let mut ended = loader.get(&key).unwrap().record().clone();
+            ended.set_state(*ending);
+            loader.save(&key, &ended).unwrap();
+            keys.push(key);
+        }
+
+        // A fresh loader reads the records from disk, not from memory.
+        let loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        for (key, ending) in keys.iter().zip(endings) {
+            let record = loader.get(key).unwrap().record().clone();
+            assert_eq!(record.state(), Ok(ending), "{ending:?}");
+            assert_eq!(record.exit_code, ending.exit_code(), "{ending:?}");
+            assert_eq!(record.signal, ending.signal(), "{ending:?}");
+
+            let written: serde_json_lenient::Value = serde_json_lenient::from_slice(
+                &std::fs::read(
+                    loader_dir(&tmp)
+                        .as_utf8_path()
+                        .join("sessions")
+                        .join(loader.live_short(key).unwrap())
+                        .join("record.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(written["status"], ending.name(), "{ending:?}");
+            assert_eq!(
+                written["reason"],
+                ending
+                    .reason()
+                    .map(crate::core::record::EndReason::name)
+                    .unwrap(),
+                "{ending:?}"
+            );
+            assert_eq!(
+                written
+                    .get("exit_code")
+                    .and_then(serde_json_lenient::Value::as_i64),
+                ending.exit_code().map(i64::from),
+                "{ending:?}"
+            );
+            assert_eq!(
+                written
+                    .get("signal")
+                    .and_then(serde_json_lenient::Value::as_i64),
+                ending.signal().map(i64::from),
+                "{ending:?}"
+            );
+        }
+
+        // Back to running clears the ending from the record.
+        let mut loader = loader;
+        let mut running = loader.get(&keys[0]).unwrap().record().clone();
+        running.set_state(RecordState::Running);
+        loader.save(&keys[0], &running).unwrap();
+        let read = loader.get(&keys[0]).unwrap().record().clone();
+        assert_eq!(read.state(), Ok(RecordState::Running));
+        assert_eq!(
+            (read.reason, read.exit_code, read.signal),
+            (None, None, None)
+        );
+    }
+
+    // BOX-011: a reason this build does not know loads, reads as an
+    // unreadable ending rather than as a guess, and saves as written.
+    #[test]
+    fn unknown_reason_loads_as_written() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+        let id = SessionId::mint();
+        let mut raw = serde_json_lenient::to_value(Record {
+            id,
+            name: Some("evicted".to_string()),
+            ..sample_record()
+        })
+        .unwrap();
+        raw["status"] = serde_json_lenient::json!("exited");
+        raw["reason"] = serde_json_lenient::json!("evicted");
+        raw["exit_code"] = serde_json_lenient::json!(143);
+        write_raw_record(&root, "0e0e0", &raw);
+
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader.find_by_id(&id).unwrap().expect("record is indexed");
+        let record = loader.get(&key).unwrap().record().clone();
+        assert_eq!(record.status, BoxState::Exited);
+        assert_eq!(
+            record.reason,
+            Some(crate::core::record::StoredReason::Unknown(
+                "evicted".to_string()
+            ))
+        );
+        assert_eq!(record.exit_code, Some(143));
+        assert_eq!(
+            record.state(),
+            Err(crate::core::record::UnreadableEnding {
+                state: "exited",
+                reason: Some("evicted".to_string()),
+                exit_code: Some(143),
+                signal: None,
+            })
+        );
+
+        loader.save(&key, &record).unwrap();
+        let written: serde_json_lenient::Value = serde_json_lenient::from_slice(
+            &std::fs::read(session_dir_path(&root, "0e0e0").join("record.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(written["status"], "exited");
+        assert_eq!(written["reason"], "evicted");
+        assert_eq!(written["exit_code"], 143);
+    }
+
     #[test]
     fn save_can_change_name_and_updates_index() {
         let tmp = TempDir::new().unwrap();
@@ -3502,5 +4531,527 @@ mod tests {
             loader.store_delta_baseline(&key, b"{}").unwrap_err().kind(),
             ErrorKind::NotFound
         );
+    }
+
+    // ---- Box names: one name, many records (BOX-004, BOX-005, BOX-010,
+    // BOX-143) ----
+
+    use crate::core::record::{ExitEnding, RecordState, StopEnding};
+    use proptest::prelude::*;
+
+    /// A running record named `name`.
+    fn named(name: &str) -> Record {
+        let mut record = sample_record();
+        record.name = Some(name.to_string());
+        record.set_state(RecordState::Running);
+        record
+    }
+
+    /// Puts the box at `key` in `state` through the store.
+    fn set_state(loader: &mut DiskLoader, key: &DiskBoxKey, state: RecordState) {
+        let mut record = loader.get(key).unwrap().record;
+        record.set_state(state);
+        loader.save(key, &record).unwrap();
+    }
+
+    fn stopped() -> RecordState {
+        RecordState::Stopped(StopEnding::Signalled { signal: 15 })
+    }
+
+    fn exited() -> RecordState {
+        RecordState::Exited(ExitEnding::Exit { exit_code: 0 })
+    }
+
+    /// Every retained record of the store, read through it.
+    fn all_records(loader: &DiskLoader) -> Vec<(DiskBoxKey, Record)> {
+        loader
+            .keys()
+            .map(|key| {
+                let record = loader.get(&key).unwrap().record;
+                (key, record)
+            })
+            .collect()
+    }
+
+    /// The events of the box at `key`, in file order.
+    fn events_of(loader: &DiskLoader, key: &DiskBoxKey) -> Vec<BoxEvent> {
+        loader.get(key).unwrap().read_events_from(0).unwrap().events
+    }
+
+    /// BOX-004: no two running records share a name under ASCII case.
+    fn assert_running_names_unique(loader: &DiskLoader) {
+        let running: Vec<String> = all_records(loader)
+            .into_iter()
+            .filter(|(_, r)| crate::box_name::holds_name(r.status))
+            .filter_map(|(_, r)| r.name.map(|n| n.to_ascii_lowercase()))
+            .collect();
+        let unique: BTreeSet<&String> = running.iter().collect();
+        assert_eq!(unique.len(), running.len(), "running names: {running:?}");
+    }
+
+    /// One operation on one host's boxes. A box is picked by its position
+    /// among the retained records, modulo their count.
+    #[derive(Debug, Clone)]
+    enum NameOp {
+        Create { name: usize, fresh: bool },
+        Stop(usize),
+        Exit(usize),
+        Resume(usize),
+        Rename(usize, usize),
+        Reap(usize),
+    }
+
+    /// Names that collide under ASCII case, plus the reserved `self`,
+    /// which only a rename asks for.
+    const NAME_POOL: [&str; 4] = ["dev", "Dev", "web", "self"];
+
+    fn name_op() -> impl Strategy<Value = NameOp> {
+        prop_oneof![
+            (0..3usize, any::<bool>()).prop_map(|(name, fresh)| NameOp::Create { name, fresh }),
+            any::<usize>().prop_map(NameOp::Stop),
+            any::<usize>().prop_map(NameOp::Exit),
+            any::<usize>().prop_map(NameOp::Resume),
+            (any::<usize>(), 0..NAME_POOL.len()).prop_map(|(i, n)| NameOp::Rename(i, n)),
+            any::<usize>().prop_map(NameOp::Reap),
+        ]
+    }
+
+    /// The running record other than `except` whose name folds to `name`.
+    fn model_holder(
+        loader: &DiskLoader,
+        name: &str,
+        except: Option<SessionId>,
+    ) -> Option<SessionId> {
+        all_records(loader)
+            .into_iter()
+            .find(|(key, r)| {
+                Some(*key.id()) != except
+                    && crate::box_name::holds_name(r.status)
+                    && r.name
+                        .as_deref()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(name))
+            })
+            .map(|(key, _)| *key.id())
+    }
+
+    /// Applies `op`, and checks its outcome against what BOX-004, BOX-010
+    /// and BOX-163 allow.
+    fn apply_name_op(loader: &mut DiskLoader, op: &NameOp) {
+        let retained = all_records(loader);
+        let pick = |i: usize| retained.get(i % retained.len().max(1)).cloned();
+        match *op {
+            NameOp::Create { name, fresh } => {
+                let base = NAME_POOL[name];
+                let name = if fresh {
+                    // BOX-163: the smallest `n` no retained record uses.
+                    let n = (1..=retained.len() + 1)
+                        .find(|n| {
+                            !retained.iter().any(|(_, r)| {
+                                r.name.as_deref().is_some_and(|got| {
+                                    got.eq_ignore_ascii_case(&format!("{base}-{n}"))
+                                })
+                            })
+                        })
+                        .unwrap();
+                    format!("{base}-{n}")
+                } else {
+                    base.to_string()
+                };
+                let holder = model_holder(loader, &name, None);
+                let got = loader.create(named(&name));
+                match holder {
+                    Some(_) => assert_eq!(
+                        got.unwrap_err().kind(),
+                        ErrorKind::AlreadyExists,
+                        "a running box holds `{name}`"
+                    ),
+                    None => {
+                        got.unwrap_or_else(|e| panic!("`{name}` is free: {e}"));
+                    }
+                }
+            }
+            NameOp::Stop(i) | NameOp::Exit(i) => {
+                let Some((key, record)) = pick(i) else { return };
+                if crate::box_name::holds_name(record.status) {
+                    let state = if matches!(op, NameOp::Stop(_)) {
+                        stopped()
+                    } else {
+                        exited()
+                    };
+                    set_state(loader, &key, state);
+                }
+            }
+            NameOp::Resume(i) => {
+                let Some((key, mut record)) = pick(i) else {
+                    return;
+                };
+                if crate::box_name::holds_name(record.status) {
+                    return;
+                }
+                let name = record.name.clone().unwrap();
+                let holder = model_holder(loader, &name, Some(*key.id()));
+                record.set_state(RecordState::Running);
+                let got = loader.save(&key, &record);
+                assert_eq!(
+                    got.is_err(),
+                    holder.is_some(),
+                    "resume of `{name}`: {got:?}"
+                );
+            }
+            NameOp::Rename(i, n) => {
+                let Some((key, record)) = pick(i) else { return };
+                let new_name = NAME_POOL[n];
+                let refused = new_name == "self"
+                    || (record.name.as_deref() != Some(new_name)
+                        && model_holder(loader, new_name, Some(*key.id())).is_some());
+                let got = loader.rename(&key, new_name.to_string());
+                assert_eq!(got.is_err(), refused, "rename to `{new_name}`: {got:?}");
+            }
+            NameOp::Reap(i) => {
+                let Some((key, record)) = pick(i) else { return };
+                if !crate::box_name::holds_name(record.status) {
+                    loader.delete(&key).unwrap();
+                }
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        /// BOX-004: over every sequence of create, stop, exit, resume,
+        /// rename and reap on one host, no two running boxes share a name,
+        /// and a name held only by a stopped or exited box is reusable.
+        #[test]
+        fn name_unique_among_running_on_host_reusable_after_stop(
+            ops in prop::collection::vec(name_op(), 1..24),
+        ) {
+            let tmp = TempDir::new().unwrap();
+            let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+            for op in &ops {
+                apply_name_op(&mut loader, op);
+                assert_running_names_unique(&loader);
+            }
+            // The invariant holds for the index a later start reads.
+            drop(loader);
+            let loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+            assert_running_names_unique(&loader);
+        }
+    }
+
+    /// BOX-004 by example: a stopped or exited box keeps its name, and a
+    /// new box reuses it. Resuming the first while the second runs is
+    /// refused.
+    #[test]
+    fn name_unique_among_running_on_host_reusable_after_stop_by_example() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let first = loader.create(named("dev")).unwrap();
+        assert_eq!(
+            loader.create(named("DEV")).unwrap_err().kind(),
+            ErrorKind::AlreadyExists
+        );
+        set_state(&mut loader, &first, stopped());
+        let second = loader.create(named("dev")).unwrap();
+        set_state(&mut loader, &second, exited());
+        let third = loader.create(named("dev")).unwrap();
+        for key in [&first, &second, &third] {
+            assert_eq!(loader.get(key).unwrap().record.name.as_deref(), Some("dev"));
+        }
+        let mut resumed = loader.get(&first).unwrap().record;
+        resumed.set_state(RecordState::Running);
+        let err = loader.save(&first, &resumed).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(loader.get(&first).unwrap().record.status, BoxState::Stopped);
+    }
+
+    /// BOX-005, the task's proof: two boxes named `dev` are retained, and
+    /// the running one answers. With none running, the latest answers.
+    #[test]
+    fn unqualified_name_resolves_running_else_latest() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        assert_eq!(loader.find_by_name("dev").unwrap(), None);
+
+        let older = loader.create(named("dev")).unwrap();
+        set_state(&mut loader, &older, stopped());
+        let newer = loader.create(named("dev")).unwrap();
+        // The newer box runs: it answers.
+        assert_eq!(loader.find_by_name("dev").unwrap(), Some(newer.clone()));
+
+        // Only the older box runs: it answers, though it is not the latest.
+        set_state(&mut loader, &newer, exited());
+        set_state(&mut loader, &older, RecordState::Running);
+        assert_eq!(loader.find_by_name("dev").unwrap(), Some(older.clone()));
+        assert_eq!(loader.find_by_name("DEV").unwrap(), Some(older.clone()));
+
+        // None runs: the most recently created answers.
+        set_state(&mut loader, &older, stopped());
+        assert_eq!(loader.find_by_name("dev").unwrap(), Some(newer.clone()));
+
+        // A stopped `Dev` does not hide a running `dev`: case folds
+        // first, and the running box answers for either case.
+        let upper = loader.create(named("Dev")).unwrap();
+        set_state(&mut loader, &upper, stopped());
+        set_state(&mut loader, &older, RecordState::Running);
+        assert_eq!(loader.find_by_name("Dev").unwrap(), Some(older.clone()));
+        assert_eq!(loader.find_by_name("dev").unwrap(), Some(older.clone()));
+
+        // None runs: the exact case breaks the tie, then the latest wins.
+        set_state(&mut loader, &older, stopped());
+        assert_eq!(loader.find_by_name("Dev").unwrap(), Some(upper));
+        assert_eq!(loader.find_by_name("dev").unwrap(), Some(newer.clone()));
+
+        // The answer survives a restart, which rebuilds the index.
+        drop(loader);
+        let loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        assert_eq!(loader.find_by_name("dev").unwrap(), Some(newer));
+    }
+
+    /// An index written before names were shared keyed its names on the
+    /// name. A start reads it, drops that map, and rebuilds the names from
+    /// the records.
+    #[test]
+    fn unqualified_name_resolves_running_else_latest_after_a_legacy_index() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader.create(named("dev")).unwrap();
+        drop(loader);
+        let index_file = root.as_utf8_path().join("sessions/index.json");
+        let legacy = format!(
+            r#"{{"short_to_id":{{"{}":"{}"}},"name_to_id":{{"dev":"{}"}}}}"#,
+            short_of(&key),
+            key.id(),
+            key.id()
+        );
+        std::fs::write(&index_file, legacy).unwrap();
+
+        let loader = DiskLoader::new(root).unwrap();
+        assert_eq!(loader.find_by_name("dev").unwrap(), Some(key));
+        let rewritten = std::fs::read_to_string(&index_file).unwrap();
+        assert!(!rewritten.contains("name_to_id"), "{rewritten}");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        /// BOX-010: a successful rename leaves the id, the spec and the
+        /// filesystem path as they were, keeps every earlier event, and
+        /// appends exactly one `renamed` event with the old and new names.
+        #[test]
+        fn rename_changes_only_alias_and_records_event(
+            names in prop::collection::vec(0..3usize, 1..8),
+            stop_first in any::<bool>(),
+        ) {
+            let pool = ["dev", "web", "api"];
+            let tmp = TempDir::new().unwrap();
+            let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+            let key = loader.create(named("start")).unwrap();
+            let object = loader.get(&key).unwrap();
+            object.store_spec(br#"{"box":{"name":"start"}}"#).unwrap();
+            object
+                .append_event(&BoxEvent::for_record(
+                    object.record(),
+                    crate::events::BoxEventType::Created,
+                ))
+                .unwrap();
+            if stop_first {
+                set_state(&mut loader, &key, stopped());
+            }
+            for n in names {
+                let before = loader.get(&key).unwrap();
+                let events_before = events_of(&loader, &key);
+                let new_name = pool[n];
+                loader.rename(&key, new_name.to_string()).unwrap();
+                let after = loader.get(&key).unwrap();
+                let events_after = events_of(&loader, &key);
+
+                prop_assert_eq!(after.record().id, before.record().id);
+                prop_assert_eq!(after.key(), before.key());
+                prop_assert_eq!(after.load_spec().unwrap(), before.load_spec().unwrap());
+                prop_assert_eq!(after.workspace_path(), before.workspace_path());
+                prop_assert_eq!(after.record().name.as_deref(), Some(new_name));
+                let mut unaliased = after.record().clone();
+                unaliased.name.clone_from(&before.record().name);
+                prop_assert_eq!(&unaliased, before.record());
+
+                prop_assert_eq!(&events_after[..events_before.len()], &events_before[..]);
+                let added = &events_after[events_before.len()..];
+                if before.record().name.as_deref() == Some(new_name) {
+                    // A rename to the current name changes nothing.
+                    prop_assert!(added.is_empty());
+                } else {
+                    prop_assert_eq!(added.len(), 1);
+                    prop_assert_eq!(added[0].kind, crate::events::BoxEventType::Renamed);
+                    prop_assert_eq!(added[0].box_id, *key.id());
+                    prop_assert_eq!(
+                        &added[0].data,
+                        &crate::box_name::renamed_event_data(
+                            before.record().name.as_deref(),
+                            new_name,
+                        )
+                    );
+                }
+            }
+        }
+    }
+
+    /// BOX-010: a rename to a name a running box on the host holds, or to
+    /// `self`, is refused with exit 2, naming the holder or `self`. The
+    /// box, its name and its events stay as they were. A name only a
+    /// stopped box keeps is free.
+    #[test]
+    fn rename_to_running_held_name_or_self_refused_exit2_names_holder() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+        let holder = loader.create(named("dev")).unwrap();
+        let renamed = loader.create(named("web")).unwrap();
+        let retained = loader.create(named("api")).unwrap();
+        set_state(&mut loader, &retained, stopped());
+        let records_before = all_records(&loader);
+        let events_before = events_of(&loader, &renamed);
+
+        // Held by a running box, under any case, and whatever state the
+        // renamed box is in.
+        for (state, new_name) in [(RecordState::Running, "dev"), (stopped(), "DEV")] {
+            set_state(&mut loader, &renamed, state);
+            let err = loader.rename(&renamed, new_name.to_string()).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+            let refusal = err
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<crate::box_name::RenameRefusal>())
+                .expect("the refusal travels in the error");
+            assert_eq!(refusal.exit_code(), 2);
+            assert_eq!(
+                refusal,
+                &crate::box_name::RenameRefusal::HeldByRunning {
+                    name: new_name.to_string(),
+                    holder: *holder.id(),
+                    holder_name: "dev".to_string(),
+                }
+            );
+            let text = err.to_string();
+            assert!(text.contains(&holder.id().to_string()), "{text}");
+            assert!(text.contains("`dev`"), "{text}");
+        }
+        set_state(&mut loader, &renamed, RecordState::Running);
+
+        // `self`, in any case.
+        for reserved in ["self", "SELF"] {
+            let err = loader.rename(&renamed, reserved.to_string()).unwrap_err();
+            let refusal = err
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<crate::box_name::RenameRefusal>())
+                .expect("the refusal travels in the error");
+            assert_eq!(refusal, &crate::box_name::RenameRefusal::Reserved);
+            assert_eq!(refusal.exit_code(), 2);
+            assert!(err.to_string().contains("`self`"), "{err}");
+        }
+
+        // Nothing changed: every record and the renamed box's events.
+        assert_eq!(all_records(&loader), records_before);
+        assert_eq!(events_of(&loader, &renamed), events_before);
+
+        // A name only a stopped box keeps is free.
+        loader.rename(&renamed, "api".to_string()).unwrap();
+        assert_eq!(loader.find_by_name("api").unwrap(), Some(renamed));
+    }
+
+    /// One operation on box ids for `nothing_keys_on_box_name`.
+    #[derive(Debug, Clone)]
+    enum KeyOp {
+        Create(usize),
+        Rename(usize, usize),
+        Stop(usize),
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        /// BOX-143: every record, event and index entry is keyed on the box
+        /// id. An id-addressed read gives the same box before and after any
+        /// rename, and a name lookup finds a box only by its current alias.
+        #[test]
+        fn nothing_keys_on_box_name(
+            ops in prop::collection::vec(
+                prop_oneof![
+                    (0..3usize).prop_map(KeyOp::Create),
+                    (any::<usize>(), 0..3usize).prop_map(|(i, n)| KeyOp::Rename(i, n)),
+                    any::<usize>().prop_map(KeyOp::Stop),
+                ],
+                1..16,
+            ),
+        ) {
+            let pool = ["dev", "web", "api"];
+            let tmp = TempDir::new().unwrap();
+            let root = loader_dir(&tmp);
+            let mut loader = DiskLoader::new(root.clone()).unwrap();
+            // Every box ever created, by id, with its directory.
+            let mut boxes: Vec<(DiskBoxKey, DaemonAbsPath)> = Vec::new();
+            for op in ops {
+                match op {
+                    KeyOp::Create(n) => {
+                        let Ok(key) = loader.create(named(pool[n])) else { continue };
+                        let object = loader.get(&key).unwrap();
+                        object
+                            .append_event(&BoxEvent::for_record(
+                                object.record(),
+                                crate::events::BoxEventType::Created,
+                            ))
+                            .unwrap();
+                        boxes.push((key, object.workspace_path()));
+                    }
+                    KeyOp::Rename(i, n) if !boxes.is_empty() => {
+                        let key = boxes[i % boxes.len()].0.clone();
+                        let _ = loader.rename(&key, pool[n].to_string());
+                    }
+                    KeyOp::Stop(i) if !boxes.is_empty() => {
+                        let key = boxes[i % boxes.len()].0.clone();
+                        set_state(&mut loader, &key, stopped());
+                    }
+                    KeyOp::Rename(..) | KeyOp::Stop(_) => {}
+                }
+                for (key, workspace) in &boxes {
+                    // Id-addressed reads give this box, whatever its name.
+                    prop_assert_eq!(loader.find_by_id(key.id()).unwrap(), Some(key.clone()));
+                    let object = loader.get(key).unwrap();
+                    prop_assert_eq!(&object.record().id, key.id());
+                    prop_assert_eq!(&object.workspace_path(), workspace);
+                    for event in events_of(&loader, key) {
+                        prop_assert_eq!(&event.box_id, key.id());
+                    }
+                    // A name lookup finds a box only under its current alias.
+                    let current = object.record().name.clone().unwrap();
+                    for name in pool {
+                        if let Some(found) = loader.find_by_name(name).unwrap() {
+                            let alias = loader.get(&found).unwrap().record.name.unwrap();
+                            prop_assert!(alias.eq_ignore_ascii_case(name));
+                            if &found == key {
+                                prop_assert!(current.eq_ignore_ascii_case(name));
+                            }
+                        }
+                    }
+                }
+            }
+            // The index on disk keys every map on a short or a box id. A store
+            // that never filed a box has written no index.
+            let Ok(bytes) = std::fs::read(root.as_utf8_path().join("sessions/index.json")) else {
+                prop_assert!(boxes.is_empty());
+                return Ok(());
+            };
+            let index: serde_json_lenient::Value = serde_json_lenient::from_slice(&bytes).unwrap();
+            let maps = index.as_object().unwrap();
+            for (field, map) in maps {
+                for map_key in map.as_object().unwrap().keys() {
+                    prop_assert!(
+                        is_valid_short(map_key) || SessionId::parse_str(map_key).is_ok(),
+                        "index map `{}` is keyed on `{}`",
+                        field,
+                        map_key
+                    );
+                }
+            }
+        }
     }
 }

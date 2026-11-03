@@ -1,10 +1,10 @@
-//! Daemon-facing RPC for the TUI: provider discovery, refresh, and the
+//! Daemon-facing RPC for the TUI: host discovery, refresh, and the
 //! session actions, all over the [`minimal_client`] transport.
 //!
-//! A "provider" is a reachable daemon socket: the host `minimald`'s own, plus
-//! one per VM on the `minvmd` microVM backend — the default VM's and every
-//! named VM's, each under its own state dir. On Linux all of them can be up
-//! at once; on macOS only the VM side exists.
+//! A host is a box host reached through its daemon socket: the native
+//! `minimald`'s own, plus one per VM on the `minvmd` microVM backend — the
+//! default VM's and every named VM's, each under its own state dir. On Linux
+//! all of them can be up at once; on macOS only the VM side exists.
 
 use std::path::{Path, PathBuf};
 
@@ -26,38 +26,38 @@ use minimald_rpc::{
 /// backstop for the CLI and background tasks.
 const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Per-attempt deadline when (re)connecting a provider mid-run. Connect
+/// Per-attempt deadline when (re)connecting a host mid-run. Connect
 /// retries absorb ~2s on their own; anything longer is a wedged acceptor
 /// and the next rediscovery pass will try again.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 
-/// The provider kinds in probe order: `false` resolves the host `minimald`'s
+/// The host kinds in probe order: `false` resolves the host `minimald`'s
 /// own socket, `true` the microVM backend's — which is one socket *per VM*
 /// (see [`probe_candidates`]), not one.
 const PROBES: &[bool] = &[false, true];
 
-/// The sidebar group label the host `minimald`'s provider carries.
+/// The sidebar group label the native `minimald`'s host carries.
 const HOST_LABEL: &str = "host";
 
-/// The sidebar group label the default VM's provider carries. A named VM's
+/// The sidebar group label the default VM's host carries. A named VM's
 /// group carries the VM's own name; the default VM keeps this one because
 /// it is the identity every saved dashboard state has ever recorded
-/// ([`state::DashState`]) and the one `provider_rank` orders first among VMs.
+/// ([`state::DashState`]) and the one `host_rank` orders first among VMs.
 const DEFAULT_VM_LABEL: &str = "vm";
 
-/// The sidebar label a VM's provider group carries: the VM's own name, so
+/// The sidebar label a VM's host group carries: the VM's own name, so
 /// two VMs show as two groups an operator can tell apart. The default VM
 /// keeps its historic label (see [`DEFAULT_VM_LABEL`]).
 ///
 /// A VM whose own name *is* one of the two reserved labels — `host` and
-/// `vm` are both valid VM names — would take the identity of the provider
+/// `vm` are both valid VM names — would take the identity of the host
 /// that label already belongs to: the dashboard keys its refresh, attach,
 /// and saved state by label alone, and [`connect_missing`] skips any
-/// candidate whose label a connected provider carries, so the VM's boxes
-/// would never reach the provider list. Such a name is escaped into the
+/// candidate whose label a connected host carries, so the VM's boxes
+/// would never reach the host list. Such a name is escaped into the
 /// VM side's own namespace (`vm:host`, `vm:vm`), which no VM name can
 /// spell — [`paths::validate_vm_name`] admits no colon — so no two
-/// providers ever share a label.
+/// hosts ever share a label.
 fn vm_label(vm: &str) -> String {
     if vm == paths::DEFAULT_VM_NAME {
         DEFAULT_VM_LABEL.to_string()
@@ -69,7 +69,7 @@ fn vm_label(vm: &str) -> String {
 }
 
 /// A reachable daemon the TUI lists sessions from.
-pub struct Provider {
+pub struct Host {
     /// Sidebar group label: `host` for the host daemon, `vm` for the default
     /// VM, a named VM's own name for each of those — except a name that
     /// would collide with one of those two identities, which is namespaced
@@ -81,17 +81,15 @@ pub struct Provider {
     pub client: Client,
 }
 
-impl std::fmt::Debug for Provider {
+impl std::fmt::Debug for Host {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Provider")
-            .field("label", &self.label)
-            .finish()
+        f.debug_struct("Host").field("label", &self.label).finish()
     }
 }
 
-/// The data one refresh pulls from a provider.
+/// The data one refresh pulls from a host.
 #[derive(Debug, Clone)]
-pub struct ProviderData {
+pub struct HostData {
     pub label: String,
     pub version: String,
     pub sessions: Vec<minimald_rpc::ListSessionsEntry>,
@@ -138,14 +136,14 @@ fn push_candidate(candidates: &mut Vec<(String, PathBuf)>, label: String, sock: 
 
 /// Probe both known socket paths and connect to each reachable daemon.
 /// Sockets that don't exist are skipped without a connect attempt, so
-/// discovery never pays the connect-retry delay for a down provider.
+/// discovery never pays the connect-retry delay for a down host.
 ///
 /// Each connection is version-gated like `min ls`'s: the dashboard's create
 /// path (`activate`) is a multi-step mutation, and opening on a skewed pair
 /// is refused before the TUI takes over the terminal. The override var
 /// downgrades each refusal to a warning, as everywhere else.
-pub async fn discover(minimal_dir: Option<&Path>) -> Result<Vec<Provider>, anyhow::Error> {
-    let mut providers = Vec::new();
+pub async fn discover(minimal_dir: Option<&Path>) -> Result<Vec<Host>, anyhow::Error> {
+    let mut hosts = Vec::new();
     for (label, sock) in probe_candidates(minimal_dir) {
         if !sock.exists() {
             continue;
@@ -158,7 +156,7 @@ pub async fn discover(minimal_dir: Option<&Path>) -> Result<Vec<Provider>, anyho
             }
         };
         match minimal_client::ensure_version_match(&mut client).await {
-            Ok(()) => providers.push(Provider {
+            Ok(()) => hosts.push(Host {
                 label,
                 sock,
                 client,
@@ -166,17 +164,17 @@ pub async fn discover(minimal_dir: Option<&Path>) -> Result<Vec<Provider>, anyho
             Err(e) => return Err(e.context(format!("provider {label}"))),
         }
     }
-    Ok(providers)
+    Ok(hosts)
 }
 
-/// Connect to any canonical provider not already served, so a daemon that
+/// Connect to any canonical host not already served, so a daemon that
 /// (re)appears mid-run joins the dashboard. Each attempt is bounded by
 /// [`CONNECT_TIMEOUT`] so a wedged acceptor can't stall the UI loop. A
-/// provider whose build is skewed is skipped with a warning rather than
-/// joined, but never fails the loop for the providers already listed.
-pub async fn connect_missing(providers: &mut Vec<Provider>, minimal_dir: Option<&Path>) {
+/// host whose build is skewed is skipped with a warning rather than
+/// joined, but never fails the loop for the hosts already listed.
+pub async fn connect_missing(hosts: &mut Vec<Host>, minimal_dir: Option<&Path>) {
     for (label, sock) in probe_candidates(minimal_dir) {
-        if providers.iter().any(|p| p.label == label || p.sock == sock) {
+        if hosts.iter().any(|p| p.label == label || p.sock == sock) {
             continue;
         }
         if !sock.exists() {
@@ -193,8 +191,8 @@ pub async fn connect_missing(providers: &mut Vec<Provider>, minimal_dir: Option<
                 continue;
             }
         };
-        // Version-gated like `discover`, but a skewed provider that appears
-        // mid-run must not kill the dashboard the other providers are still
+        // Version-gated like `discover`, but a skewed host that appears
+        // mid-run must not kill the dashboard the other hosts are still
         // serving, so the refusal skips it — the warning it logged is the
         // operator's cue to `min stop --force` and reopen.
         if let Err(e) = minimal_client::ensure_version_match(&mut client).await {
@@ -202,7 +200,7 @@ pub async fn connect_missing(providers: &mut Vec<Provider>, minimal_dir: Option<
             continue;
         }
         tracing::info!(provider = label, "provider connected");
-        providers.push(Provider {
+        hosts.push(Host {
             label,
             sock,
             client,
@@ -225,20 +223,20 @@ where
         .map_err(|_| anyhow::anyhow!("{} RPC timed out after {RPC_TIMEOUT:?}", R::NAME))?
 }
 
-/// Re-fetch the version string and session list for one provider.
-pub async fn refresh(provider: &mut Provider) -> Result<ProviderData, anyhow::Error> {
-    let version = timed::<GetVersion>(&mut provider.client, ())
+/// Re-fetch the version string and session list for one host.
+pub async fn refresh(host: &mut Host) -> Result<HostData, anyhow::Error> {
+    let version = timed::<GetVersion>(&mut host.client, ())
         .await
         .context("GetVersion RPC failed")?;
-    let mut sessions = timed::<ListSessions>(&mut provider.client, ())
+    let mut sessions = timed::<ListSessions>(&mut host.client, ())
         .await
         .context("ListSessions RPC failed")?
         .sessions;
     // The daemon cannot probe git (on macOS it runs in the minvmd guest),
     // so fill each session's git context host-side before rendering.
     minimal_client::fill_git_info(&mut sessions).await;
-    Ok(ProviderData {
-        label: provider.label.clone(),
+    Ok(HostData {
+        label: host.label.clone(),
         version: version.version,
         sessions,
     })
@@ -256,15 +254,15 @@ pub async fn refresh(provider: &mut Provider) -> Result<ProviderData, anyhow::Er
 /// `GetEffectiveSessionPolicy` refuses the subsystem, and that is the case
 /// this keeps visible.
 pub async fn fetch_detail(
-    provider: &mut Provider,
+    host: &mut Host,
     id: SessionId,
 ) -> Result<(Option<boxes::Record>, Result<EffectiveBoxPolicy, String>), anyhow::Error> {
-    let record = timed::<GetSessionRecord>(&mut provider.client, GetSessionRecordRequest::Id(id))
+    let record = timed::<GetSessionRecord>(&mut host.client, GetSessionRecordRequest::Id(id))
         .await
         .context("GetSessionRecord RPC failed")?
         .record;
     let policy = match timed::<GetEffectiveSessionPolicy>(
-        &mut provider.client,
+        &mut host.client,
         GetEffectiveSessionPolicyRequest::Id(id),
     )
     .await
@@ -280,10 +278,10 @@ pub async fn fetch_detail(
 /// Snapshot the session's live terminal screen. `Ok(None)` when the session
 /// has no running host (the daemon answers "session is not active").
 pub async fn fetch_screen(
-    provider: &mut Provider,
+    host: &mut Host,
     id: SessionId,
 ) -> Result<Option<minimald_rpc::ScreenSnapshot>, anyhow::Error> {
-    let resp = timed::<minimald_rpc::GetSessionScreen>(&mut provider.client, id)
+    let resp = timed::<minimald_rpc::GetSessionScreen>(&mut host.client, id)
         .await
         .context("GetSessionScreen RPC failed")?;
     Ok(resp.ok())
@@ -298,8 +296,8 @@ async fn hold_box_name(sock: &Path, name: &str, id: SessionId, hold: bool) {
 }
 
 /// The session's record, best-effort: `None` when it cannot be read.
-pub async fn record_of(provider: &mut Provider, id: SessionId) -> Option<boxes::Record> {
-    timed::<GetSessionRecord>(&mut provider.client, GetSessionRecordRequest::Id(id))
+pub async fn record_of(host: &mut Host, id: SessionId) -> Option<boxes::Record> {
+    timed::<GetSessionRecord>(&mut host.client, GetSessionRecordRequest::Id(id))
         .await
         .ok()
         .and_then(|resp| resp.record)
@@ -337,6 +335,30 @@ pub async fn prepare_attach(
     record: Option<boxes::Record>,
 ) -> anyhow::Result<Option<boxes::BoxAddresses>> {
     minimal_client::box_registration::resume_box_row(sock, record.as_ref()).await?;
+    // A `host_ip` box's egress, re-admitted as `min session attach` re-admits
+    // it: a VM host daemon that restarted holds none, and its gate then drops
+    // the box's frames outside the VM (NET-085). Idempotent. The record was
+    // read before the admit, so a session destroyed in between has its rules
+    // retired here once a second lookup finds it gone.
+    if let Some(record) = record.as_ref()
+        && record.network == NetworkMode::HostNet
+        && crate::host_ip_box_with_vm_host(
+            minimal_client::box_registration::vm_host_control_sock(sock),
+            record.id,
+            record.policy.egress.clone(),
+            true,
+        )
+        .await
+        && let Ok(None) = crate::attached_box_record(sock, record.id).await
+    {
+        crate::host_ip_box_with_vm_host(
+            minimal_client::box_registration::vm_host_control_sock(sock),
+            record.id,
+            None,
+            false,
+        )
+        .await;
+    }
     Ok(record.and_then(|record| record.box_addresses))
 }
 
@@ -345,6 +367,16 @@ pub async fn prepare_attach(
 /// registered is withdrawn with the pair off its record, and a `host_ip`
 /// box's zone hold is released. A session that held neither owes nothing.
 async fn settle_destroyed_box(sock: &Path, id: SessionId, record: &boxes::Record) {
+    // A `host_ip` box's egress goes with its session, named or not (NET-085).
+    if record.network == NetworkMode::HostNet && record.box_addresses.is_none() {
+        crate::host_ip_box_with_vm_host(
+            minimal_client::box_registration::vm_host_control_sock(sock),
+            id,
+            None,
+            false,
+        )
+        .await;
+    }
     let Some(name) = record.name.as_deref() else {
         return;
     };
@@ -358,10 +390,10 @@ async fn settle_destroyed_box(sock: &Path, id: SessionId, record: &boxes::Record
 /// Destroys the session, then withdraws the row its box registered or
 /// releases the zone hold a `host_ip` box's name kept, as `min session
 /// destroy` does.
-pub async fn destroy(provider: &mut Provider, id: SessionId) -> Result<(), anyhow::Error> {
-    let record = record_of(provider, id).await;
+pub async fn destroy(host: &mut Host, id: SessionId) -> Result<(), anyhow::Error> {
+    let record = record_of(host, id).await;
     match timed::<DestroySession>(
-        &mut provider.client,
+        &mut host.client,
         DestroySessionRequest {
             id,
             only_if_unfinalized: false,
@@ -372,7 +404,7 @@ pub async fn destroy(provider: &mut Provider, id: SessionId) -> Result<(), anyho
     {
         Errorable::Ok(_) => {
             if let Some(record) = record {
-                settle_destroyed_box(&provider.sock, id, &record).await;
+                settle_destroyed_box(&host.sock, id, &record).await;
             }
             Ok(())
         }
@@ -382,14 +414,10 @@ pub async fn destroy(provider: &mut Provider, id: SessionId) -> Result<(), anyho
 
 /// Renames the session; a `host_ip` box's zone hold moves with the name, as
 /// `min session rename` moves it.
-pub async fn rename(
-    provider: &mut Provider,
-    id: SessionId,
-    new_name: &str,
-) -> Result<(), anyhow::Error> {
-    let record = record_of(provider, id).await;
+pub async fn rename(host: &mut Host, id: SessionId, new_name: &str) -> Result<(), anyhow::Error> {
+    let record = record_of(host, id).await;
     match timed::<RenameSession>(
-        &mut provider.client,
+        &mut host.client,
         RenameSessionRequest {
             id,
             new_name: new_name.to_string(),
@@ -401,9 +429,9 @@ pub async fn rename(
         Errorable::Ok(_) => {
             if let Some(record) = record.filter(crate::holds_name) {
                 if let Some(old_name) = record.name.as_deref() {
-                    hold_box_name(&provider.sock, old_name, id, false).await;
+                    hold_box_name(&host.sock, old_name, id, false).await;
                 }
-                hold_box_name(&provider.sock, new_name, id, true).await;
+                hold_box_name(&host.sock, new_name, id, true).await;
             }
             Ok(())
         }
@@ -419,7 +447,7 @@ pub async fn rename(
 /// the next daemon restart.
 ///
 /// Connects its own client so it can run as a background task without
-/// borrowing the provider's connection. A `ConfigureLoadout` that comes back
+/// borrowing the host's connection. A `ConfigureLoadout` that comes back
 /// `Pending` (items needing interactive policy gating) aborts the session
 /// and tells the user to run `min session activate` instead — the TUI has
 /// no gating wizard yet.
@@ -509,6 +537,16 @@ pub async fn activate(
     }
     let id = created.id;
     let egress_deny_all_default = undeclared_own_ip && deny_all_default_binds(&created);
+    // A `host_ip` box's egress, admitted on the VM host daemon before the box
+    // runs anything, as `min session activate` admits it (NET-085). The guard
+    // retires it if the flow below fails.
+    let mut host_ip_residency = crate::HostIpResidency::admit(
+        minimal_client::box_registration::vm_host_control_sock(sock),
+        id,
+        request.config.network,
+        request.config.policy.egress.as_ref(),
+    )
+    .await;
 
     // The registration's lease is held across the flow and committed only
     // once the session is active: until then a dashboard that dies leaves
@@ -593,9 +631,12 @@ pub async fn activate(
     // its name and be reaped at the next daemon restart anyway.
     match flow {
         Ok((package_check_skipped, upload)) => {
+            if let Some(residency) = host_ip_residency.as_mut() {
+                residency.keep();
+            }
             // The session is active: a `host_ip` box holds its name in the
             // zone (NODATA) the way `min session activate` holds it, read
-            // off the record so an autogen name is the one held.
+            // off the record so the name the daemon gave is the one held.
             if let Ok(resp) = client
                 .oneshot_rpc::<GetSessionRecord>(GetSessionRecordRequest::Id(id))
                 .await
@@ -670,15 +711,17 @@ type CreateFuture<'c> = std::pin::Pin<
 
 /// The dashboard's `CreateSession` with an own-address box's registration
 /// around it, as `min session activate` makes them (T66): on a VM-backed
-/// host — `sock` in a VM host's provider dir, with its control socket
+/// host — `sock` in a VM host's host dir, with its control socket
 /// beside it ([`vm_host_control_sock`](minimal_client::box_registration::vm_host_control_sock)) — the
 /// box registers first, through the client library the CLI registers
 /// through, and the create carries the addresses the registration handed
 /// back, since the in-VM daemon refuses an own-address box with none. A
-/// box the form left unnamed is named first the way the CLI names one,
-/// because the row is registered under the name, and an autogen name that
-/// collides with a live row or session is re-minted within the CLI's
-/// budget. Every failure after the row exists withdraws it, with its id.
+/// box the form left unnamed that registers takes the default session
+/// entry's name, because the row is registered under the name and the
+/// daemon must give the box the same one (BOX-163). Nothing mints a name:
+/// a name that a live row or a running box holds refuses the create,
+/// naming the holder. Every failure after the row exists withdraws it,
+/// with its id.
 /// On a native host, or for a box that is not own-address, this is the
 /// plain create it always was. `create` sends the create request on
 /// `client`.
@@ -688,70 +731,69 @@ async fn create_registering<C: Send>(
     client: &mut C,
     mut create: impl for<'c> FnMut(&'c mut C, BoxConfig) -> CreateFuture<'c>,
 ) -> anyhow::Result<(minimald_rpc::CreateSessionResponse, BoxRow)> {
-    use minimal_client::box_name::{autogen_session_name, random_hex4, should_retry_autogen};
     use minimal_client::box_registration::{
-        control_sock_beside, register_box_beside_reminting_autogen, vm_host_control_sock,
+        control_sock_beside, register_box_beside, vm_host_control_sock,
     };
     let control_sock = control_sock_beside(sock);
     let registers = config.network == NetworkMode::OwnIp && vm_host_control_sock(sock).is_some();
-    let project_dir = config.project_path.as_utf8_path().to_path_buf();
-    let mint = || autogen_session_name(&project_dir, &random_hex4());
-    let autogen = registers && config.name.is_none();
-    if autogen {
-        config.name = Some(mint());
+    if registers && config.name.is_none() {
+        config.name = Some(mfile::spec::DEFAULT_SESSION_ENTRY.to_string());
     }
-    let mut attempts = 0u32;
+    tracing::info!(
+        requested_name = ?config.name,
+        registers,
+        "dashboard create: the request carries only the form's name or the entry's"
+    );
     let mut row = BoxRow {
         control_sock,
         name: None,
         registration: None,
     };
-    loop {
-        if let Some(name) = config.name.as_mut() {
-            row.registration = register_box_beside_reminting_autogen(
-                sock,
-                config.network,
-                name,
-                &config.policy,
-                autogen,
-                &mut attempts,
-                &mint,
-            )
-            .await?;
-        }
-        row.name.clone_from(&config.name);
-        config.box_addresses = row
-            .registration
-            .as_ref()
-            .map(|registration| registration.addresses);
-        config.task_addresses = row
-            .registration
-            .as_ref()
-            .map(|registration| registration.task_addresses.clone())
-            .unwrap_or_default();
-        config.box_id = row
-            .registration
-            .as_ref()
-            .and_then(|registration| registration.box_id);
-        let error = match create(client, config.clone()).await {
-            Ok(Errorable::Ok(created)) => return Ok((created, row)),
-            Ok(Errorable::Err { error }) => error,
-            // A transport failure abandons the create and the row its
-            // registration bought: no session holds the pair.
-            Err(error) => {
-                row.withdraw().await;
-                return Err(error);
-            }
-        };
-        // The row the attempt bought is left behind with it: its creator
-        // withdraws it, and a retry re-registers under the re-minted name.
-        row.withdraw().await;
-        if !should_retry_autogen(autogen, attempts, &error) {
-            return Err(anyhow::anyhow!(error));
-        }
-        attempts += 1;
-        row.registration = None;
-        config.name = Some(mint());
+    if let Some(name) = config.name.as_deref() {
+        row.registration =
+            match register_box_beside(sock, config.network, name, &config.policy).await {
+                Ok(registered) => registered,
+                // BOX-163: a live row holds the name. Refuse as the CLI does,
+                // with the held spelling and the next step, not the raw text.
+                Err(error) => {
+                    let Some(held) = error
+                        .downcast_ref::<minimal_client::box_registration::NameAlreadyHeld>()
+                        .map(|refused| refused.held.clone())
+                    else {
+                        return Err(error);
+                    };
+                    return Err(crate::cmd::registration_held_name_refusal(
+                        name, &held, None,
+                    ));
+                }
+            };
+    }
+    row.name.clone_from(&config.name);
+    config.box_addresses = row
+        .registration
+        .as_ref()
+        .map(|registration| registration.addresses);
+    config.task_addresses = row
+        .registration
+        .as_ref()
+        .map(|registration| registration.task_addresses.clone())
+        .unwrap_or_default();
+    // The id the VM host daemon minted stays on the row, for the
+    // withdrawal. The create relays none: the in-VM daemon takes the id
+    // from the VM host daemon alone (BOX-002).
+    config.box_id = None;
+    let created = create(client, config).await;
+    if let Ok(Errorable::Ok(created)) = created {
+        return Ok((created, row));
+    }
+    // A failed create abandons the row its registration bought: no session
+    // holds the pair. A held name keeps the reply's text, which names the
+    // holder.
+    row.withdraw().await;
+    match created {
+        Ok(Errorable::Err { error }) => Err(anyhow::anyhow!(error)),
+        Err(error) => Err(error),
+        Ok(Errorable::Ok(_)) => unreachable!("a created box returned above"),
     }
 }
 
@@ -843,12 +885,12 @@ mod tests {
         })
     }
 
-    /// A VM host's provider dir inside `dir` — the dir a dashboard's ssh
+    /// A VM host's host dir inside `dir` — the dir a dashboard's ssh
     /// socket and the VM host daemon's control socket share.
-    fn vm_provider_dir(dir: &tempfile::TempDir) -> std::path::PathBuf {
-        let provider = dir.path().join("providers").join("local-minvmd0");
-        std::fs::create_dir_all(&provider).unwrap();
-        provider
+    fn vm_host_dir(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let host_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        host_dir
     }
 
     /// NET-074 from the dashboard: the deny-all default binds a bare
@@ -891,15 +933,16 @@ mod tests {
 
     /// T66 from the dashboard: an own-address create on a VM-backed host
     /// registers the box first, through the client library the CLI
-    /// registers through — under a name minted the CLI's way, since the form
-    /// left it unnamed and the row is registered under the name — and the
+    /// registers through — under the default session entry's name, since
+    /// the form left it unnamed and the row is registered under the name,
+    /// never a minted `<dir>-<hex>` name (BOX-163) — and the
     /// create carries the addresses the registration handed back, never
     /// none (the in-VM daemon refuses an own-address box with none).
     #[tokio::test]
     async fn tui_own_ip_create_registers_and_hands_addresses() {
         let dir = tempfile::TempDir::new().unwrap();
-        let provider = vm_provider_dir(&dir);
-        let ssh_sock = provider.join("ssh.sock");
+        let host_dir = vm_host_dir(&dir);
+        let ssh_sock = host_dir.join("ssh.sock");
         let box_id = minimald_rpc::BoxId::from_bytes([7; 16]);
         let handed = minimald_rpc::RegisteredBox {
             switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
@@ -908,7 +951,7 @@ mod tests {
             task_addresses: Vec::new(),
         };
         let server = fake_vm_host(
-            &provider.join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
+            &host_dir.join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
             vec![minimald_rpc::BoxControlReply::Registered(handed.clone())],
         );
         let mut sent = Vec::new();
@@ -932,10 +975,10 @@ mod tests {
             panic!("a registration is carried by the register verb");
         };
         assert!(request.hold, "the create holds its registration as a lease");
-        assert!(
-            request.name.starts_with("web-app-"),
-            "an unnamed box is registered under the CLI's autogen name: {}",
-            request.name
+        assert_eq!(
+            request.name,
+            mfile::spec::DEFAULT_SESSION_ENTRY,
+            "an unnamed box is registered under the entry's name, not a minted one"
         );
 
         let [config] = sent.as_slice() else {
@@ -954,6 +997,7 @@ mod tests {
             }),
             "the create carries the handed addresses"
         );
+        assert_eq!(config.box_id, None, "the create relays no box id");
         let registration = row.registration.as_ref().expect("the row is the create's");
         assert_eq!(registration.box_id, Some(box_id));
         assert!(
@@ -969,14 +1013,14 @@ mod tests {
     #[tokio::test]
     async fn tui_activation_registers_task_slots_for_own_ip_box() {
         let dir = tempfile::TempDir::new().unwrap();
-        let provider = vm_provider_dir(&dir);
-        let ssh_sock = provider.join("ssh.sock");
+        let host_dir = vm_host_dir(&dir);
+        let ssh_sock = host_dir.join("ssh.sock");
         let task_addresses = vec![
             std::net::Ipv4Addr::new(100, 64, 0, 3),
             std::net::Ipv4Addr::new(100, 64, 0, 4),
         ];
         let server = fake_vm_host(
-            &provider.join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
+            &host_dir.join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
             vec![minimald_rpc::BoxControlReply::Registered(
                 minimald_rpc::RegisteredBox {
                     switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
@@ -1025,15 +1069,15 @@ mod tests {
     #[tokio::test]
     async fn tui_own_ip_create_failure_withdraws_the_row() {
         let dir = tempfile::TempDir::new().unwrap();
-        let provider = vm_provider_dir(&dir);
-        let ssh_sock = provider.join("ssh.sock");
+        let host_dir = vm_host_dir(&dir);
+        let ssh_sock = host_dir.join("ssh.sock");
         let box_id = minimald_rpc::BoxId::from_bytes([9; 16]);
         let addresses = boxes::BoxAddresses {
             switch_address: std::net::Ipv4Addr::new(100, 64, 0, 3),
             loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 1),
         };
         let server = fake_vm_host(
-            &provider.join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
+            &host_dir.join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
             vec![
                 minimald_rpc::BoxControlReply::Registered(minimald_rpc::RegisteredBox {
                     switch_address: addresses.switch_address,
@@ -1085,10 +1129,10 @@ mod tests {
     #[tokio::test]
     async fn tui_own_ip_create_refused_registration_creates_nothing() {
         let dir = tempfile::TempDir::new().unwrap();
-        let provider = vm_provider_dir(&dir);
-        let ssh_sock = provider.join("ssh.sock");
+        let host_dir = vm_host_dir(&dir);
+        let ssh_sock = host_dir.join("ssh.sock");
         let server = fake_vm_host(
-            &provider.join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
+            &host_dir.join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
             vec![minimald_rpc::BoxControlReply::Error {
                 error: "the switch's address plan is exhausted".to_string(),
             }],
@@ -1122,15 +1166,15 @@ mod tests {
     #[tokio::test]
     async fn tui_own_ip_create_on_a_native_host_registers_nothing() {
         let dir = tempfile::TempDir::new().unwrap();
-        let provider = dir.path().join("providers").join("local-minimald0");
-        std::fs::create_dir_all(&provider).unwrap();
+        let host_dir = dir.path().join("providers").join("local-minimald0");
+        std::fs::create_dir_all(&host_dir).unwrap();
         let _answerer_door = std::os::unix::net::UnixListener::bind(
-            provider.join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
+            host_dir.join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
         )
         .unwrap();
         let mut sent = Vec::new();
         let (_, row) = create_registering(
-            &provider.join("ssh.sock"),
+            &host_dir.join("ssh.sock"),
             own_ip_config(dir.path(), None),
             &mut sent,
             |sent, config| {
@@ -1203,6 +1247,9 @@ mod tests {
                 quic443: None,
             },
             status: boxes::BoxState::default(),
+            reason: None,
+            exit_code: None,
+            signal: None,
             hooks_enabled: true,
             box_addresses,
             task_addresses: Vec::new(),
@@ -1210,6 +1257,7 @@ mod tests {
             box_id: None,
             host_row_bound: false,
             bound_ports: std::collections::BTreeSet::new(),
+            ends_with_run: false,
             sealed_deliveries: Vec::new(),
             root_certificate: None,
             box_type: None,
@@ -1263,6 +1311,9 @@ mod tests {
                 quic443: None,
             },
             status: boxes::BoxState::default(),
+            reason: None,
+            exit_code: None,
+            signal: None,
             hooks_enabled: true,
             task_addresses: Vec::new(),
             box_addresses: Some(handed),
@@ -1270,6 +1321,7 @@ mod tests {
             box_id: None,
             host_row_bound: false,
             bound_ports: std::collections::BTreeSet::new(),
+            ends_with_run: false,
             sealed_deliveries: Vec::new(),
             root_certificate: None,
             box_type: None,
@@ -1333,9 +1385,9 @@ mod tests {
     #[test]
     fn probes_every_named_vm() {
         let dir = tempfile::tempdir().unwrap();
-        let provider = dir.path().join("providers/local-minvmd0");
+        let host_dir = dir.path().join("providers/local-minvmd0");
         for vm in ["alpha", "beta"] {
-            std::fs::create_dir_all(provider.join(vm)).unwrap();
+            std::fs::create_dir_all(host_dir.join(vm)).unwrap();
         }
         let candidates = probe_candidates(Some(dir.path()));
         let label_at = |sock: &std::path::Path| -> Option<String> {
@@ -1345,13 +1397,13 @@ mod tests {
                 .map(|(label, _)| label.clone())
         };
         assert_eq!(
-            label_at(&provider.join("ssh.sock")).as_deref(),
+            label_at(&host_dir.join("ssh.sock")).as_deref(),
             Some("vm"),
             "the default VM is probed under its historic label: {candidates:?}"
         );
         for vm in ["alpha", "beta"] {
             assert_eq!(
-                label_at(&provider.join(vm).join("ssh.sock")).as_deref(),
+                label_at(&host_dir.join(vm).join("ssh.sock")).as_deref(),
                 Some(vm),
                 "{vm} has a state dir, so its socket is probed: {candidates:?}"
             );
@@ -1370,17 +1422,17 @@ mod tests {
     /// group those labels already belong to: the dashboard keys its
     /// refresh, attach, and saved state by label alone, and
     /// [`connect_missing`] skips any candidate whose label a connected
-    /// provider carries, so a verbatim label would keep the VM's boxes
-    /// from ever reaching the provider list once the host daemon (or the
+    /// host carries, so a verbatim label would keep the VM's boxes
+    /// from ever reaching the host list once the host daemon (or the
     /// default VM) is connected. The escape is the VM side's namespace,
     /// which no VM name can spell, so both keep their own candidate and
     /// every candidate keeps a label no other candidate carries.
     #[test]
     fn vms_named_for_the_reserved_labels_keep_their_own_candidates() {
         let dir = tempfile::tempdir().unwrap();
-        let provider = dir.path().join("providers/local-minvmd0");
+        let host_dir = dir.path().join("providers/local-minvmd0");
         for vm in ["host", "vm"] {
-            std::fs::create_dir_all(provider.join(vm)).unwrap();
+            std::fs::create_dir_all(host_dir.join(vm)).unwrap();
         }
         let candidates = probe_candidates(Some(dir.path()));
         let label_at = |sock: &std::path::Path| -> Option<String> {
@@ -1390,17 +1442,17 @@ mod tests {
                 .map(|(label, _)| label.clone())
         };
         assert_eq!(
-            label_at(&provider.join("ssh.sock")).as_deref(),
+            label_at(&host_dir.join("ssh.sock")).as_deref(),
             Some("vm"),
             "the default VM keeps its own historic label: {candidates:?}"
         );
         assert_eq!(
-            label_at(&provider.join("host").join("ssh.sock")).as_deref(),
+            label_at(&host_dir.join("host").join("ssh.sock")).as_deref(),
             Some("vm:host"),
             "a VM named `host` must not take the host daemon's label: {candidates:?}"
         );
         assert_eq!(
-            label_at(&provider.join("vm").join("ssh.sock")).as_deref(),
+            label_at(&host_dir.join("vm").join("ssh.sock")).as_deref(),
             Some("vm:vm"),
             "a VM named `vm` must not take the default VM's label: {candidates:?}"
         );
@@ -1421,7 +1473,7 @@ mod version_gate_tests {
     /// The dashboard opens three daemon connections, and #1251's gate reached
     /// none of them. `activate` and the two discovery connections are all
     /// gated now — the dashboard opens on the same terms `min ls` does, and a
-    /// provider that reappears mid-run with a skewed build joins only under
+    /// host that reappears mid-run with a skewed build joins only under
     /// the override.
     ///
     /// Asserted as an inventory rather than a count, so adding, removing, or
@@ -1444,7 +1496,7 @@ mod version_gate_tests {
     /// ahead of them.
     ///
     /// `refresh` still calls `GetVersion`, and must: the sidebar renders each
-    /// provider's build. That is a display fetch on the idle loop, not a gate
+    /// host's build. That is a display fetch on the idle loop, not a gate
     /// on the create path.
     #[test]
     fn the_dashboard_activation_makes_no_version_round_trip() {

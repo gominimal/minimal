@@ -339,6 +339,17 @@ impl BoxActor {
                     .write()
                     .expect("hostname registry lock poisoned");
                 reg.register_host_net(record.id, &name);
+                // NET-070: the hostname proxy decides a host-address box's
+                // request by its own egress rules. The box holds no switch
+                // lease, so the proxy finds these facts by the box that owns
+                // the connecting socket (`caller_owning`).
+                reg.register_caller(
+                    record.id,
+                    &name,
+                    &record.policy,
+                    subnet,
+                    hostname_proxy_port,
+                );
             }
             _ => {}
         }
@@ -651,15 +662,41 @@ impl BoxActor {
             .hostnames
             .write()
             .expect("hostname registry lock poisoned");
-        reg.deregister(&registry_name(&record));
+        // The registry keys its rows by name alone, so withdraw only a row
+        // registered to this box. Another box can hold the same name: one
+        // whose name is derived from the same project basename, or one a
+        // restart resumed while this box came up only to be destroyed.
+        let name = registry_name(&record);
+        if reg.name_held_by(record.id, &name) {
+            reg.deregister(&name);
+        }
     }
 
     /// Renames the session: persists the new name through the record handle
     /// (a name collision surfaces as the store's `AlreadyExists`), relinks
     /// the PTask hostname so `<new>.min.internal` routes and the old name
-    /// stops (R3.6).
+    /// stops (R3.6), and records a `renamed` event with both names
+    /// (BOX-010).
+    ///
+    /// A rename to `self`, or to a name a running box on this host holds,
+    /// is refused and changes nothing: the store makes the holder check,
+    /// and its refusal names the holder. The refusal's `exit_code()` is 2,
+    /// but this method returns an `io::Error`, so the code reaches only the
+    /// daemon log. The RPC reply and `min rename` do not carry it yet.
     pub(super) async fn rename(&mut self, new_name: String) -> Result<(), std::io::Error> {
         let record = self.record.record().await?;
+
+        // BOX-010: `self` is refused before the route is touched.
+        if let Err(refusal) = boxes::box_name::check_rename(&[], record.id, &new_name) {
+            tracing::info!(
+                box_id = %record.id,
+                new_name = %new_name,
+                exit_code = refusal.exit_code(),
+                %refusal,
+                "rename refused",
+            );
+            return Err(refusal.into());
+        }
 
         // Renaming to the name the session already has is an error, not a
         // no-op: `save` deliberately treats same-id same-name as a no-op (a
@@ -697,6 +734,33 @@ impl BoxActor {
         )
         .await;
 
+        match &written {
+            Ok(()) => self.record_renamed(&record, &new_name).await,
+            Err(error) => {
+                // The store logged the holder and the candidates it read.
+                // Any other error (record write, index flush) is a failure,
+                // not a refusal.
+                match error
+                    .get_ref()
+                    .and_then(|e| e.downcast_ref::<boxes::box_name::RenameRefusal>())
+                {
+                    Some(refusal) => tracing::info!(
+                        box_id = %record.id,
+                        new_name = %new_name,
+                        exit_code = refusal.exit_code(),
+                        %error,
+                        "rename refused",
+                    ),
+                    None => tracing::warn!(
+                        box_id = %record.id,
+                        new_name = %new_name,
+                        %error,
+                        "rename failed",
+                    ),
+                }
+            }
+        }
+
         // Forward the new name to the running host so the shell's
         // `$MINIMAL_SESSION_NAME` is republished through the per-attach
         // environment channel. Best-effort: the record-side rename has
@@ -711,5 +775,41 @@ impl BoxActor {
         }
 
         written
+    }
+
+    /// Writes the `renamed` event of a rename that the store accepted
+    /// (BOX-010): the box's id, its parent, and its old and new names. The
+    /// record already carries the new name, so a missing event is logged
+    /// and does not undo the rename.
+    async fn record_renamed(&self, before: &Record, new_name: &str) {
+        let object = match self.record.object().await {
+            Ok(object) => object,
+            Err(error) => {
+                tracing::warn!(
+                    box_id = %before.id,
+                    %error,
+                    "rename: could not open the box to write the renamed event",
+                );
+                return;
+            }
+        };
+        let data = boxes::box_name::renamed_event_data(before.name.as_deref(), new_name);
+        match crate::box_manager::write_box_event(
+            &object,
+            boxes::events::BoxEventType::Renamed,
+            data,
+        ) {
+            Ok(_) => tracing::info!(
+                box_id = %before.id,
+                old_name = ?before.name,
+                new_name,
+                "renamed a box",
+            ),
+            Err(error) => tracing::warn!(
+                box_id = %before.id,
+                %error,
+                "rename: could not write the renamed event",
+            ),
+        }
     }
 }

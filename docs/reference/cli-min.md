@@ -53,6 +53,33 @@ JSON. When the daemon reports a shared resource pool, the table is headed
 by a `RESOURCE POOL:` line (CPU cores, memory, and the number of sessions
 sharing them); `--raw` omits it.
 
+The table has the columns `SESSION ID`, `NAME`, `ADDRESS`, `STATUS`,
+`EGRESS`, `TITLE`, `LAST ACTIVITY` and `PROJECT PATH`. `ADDRESS` is the
+host loopback address where the box's ports answer. A box with an address of
+its own shows that address. A box at the shared fallback shows `127.0.0.1`.
+The column shows `-` when the daemon does not report an address. An older
+daemon does not report it.
+
+`EGRESS` is the box's egress posture, in the words `min session policy`
+prints for it:
+
+| `EGRESS` | `egress_posture` in `--json` | Meaning |
+|---|---|---|
+| `deny-all (default)` | `deny_all_default` | The box does not declare egress, and the default denies every external address |
+| `allow-all (default)` | `allow_all_default` | The box does not declare egress, and the default allows every address: the operator opt-out, or a box without an address of its own |
+| `deny-all` | `deny_all` | The box declares egress that admits nothing |
+| `declared rules` | `declared_rules` | The box declares egress rules of its own. `min session policy` lists them |
+| `no network` | `no_network` | A `--network none` box. It has no network, so no egress posture applies |
+
+A host-address box on a host that cannot decide egress per box adds
+`; per-box enforcement none` to the posture. `min session policy` prints the
+same fact as its `per-box enforcement` row. The column shows `-` when the
+daemon does not report a posture.
+
+With `--json`, each session entry has the address under `loopback_address`
+and the posture under `egress_posture`. The entry omits a key when the daemon
+does not report that value.
+
 Another box at the same shared loopback address can hold a port this box
 declares, and this box does not forward it. The list prints one stderr line
 per such port after the table:
@@ -488,6 +515,27 @@ first line; `--json` emits the full records.
 Answered from the persisted composition, so it works after a daemon restart
 and for a session nobody is attached to.
 
+### `box spec`
+
+```
+min box spec [--network <none|host_ip|own_ip>] [PATH]
+```
+
+Shows how the box that the project at `PATH` declares reaches GitHub through
+the local Box Egress Proxy. `PATH` defaults to `--repo-dir`, or to the current
+directory. The rows are the proxy's root certificate fingerprint, each secret
+with its hosts, the steering mode, and the UDP 443 stance.
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--network <none\|host_ip\|own_ip>` | | The network mode of the box to show, with the same values and the same default (`host_ip`) as `min session activate --network` |
+
+The command refuses a box spec, with exit 3, where `min session activate` with
+the same `--network` value refuses it for the same reason. For example, on a
+VM-backed host, `min box spec --network own_ip` accepts `steering = "both"`.
+With no `--network` flag, it refuses that spec because a `host_ip` box has no
+box DNS resolver, and `min session activate` with no flag refuses it too.
+
 ### `net forward`
 
 ```
@@ -543,18 +591,53 @@ min finalize-install [--show [--script | --json]] [--undo]
 The installer runs without privilege. Anything on this host that needs root
 is left for this command, which runs it in one `sudo` call. Until it runs,
 the hostname proxy serves box names. The host line that
-`min session activate` prints says where the box name resolves:
-`names: <box>.min.internal opens through the HTTP proxy at 127.0.0.1:<port>`
-while the proxy serves the names, or
-`names: <box>.min.internal resolves on this machine; open it through the HTTP proxy at 127.0.0.1:<port>`
-once this host resolves the zone natively. Native names resolve to a reserved
-local address. A browser opens the box through the hostname proxy, which
-keeps serving. While any item is not done, the
-line ends with `; finish setup: min finalize-install`. When the proxy failed
+`min session activate` prints says how the box name opens. While the proxy
+serves the names, the line is
+`names: <box>.min.internal opens through the HTTP proxy at 127.0.0.1:<port>`.
+Once this host resolves the zone natively, the line has one of two forms. The
+first form is for a box with its own reserved local address:
+
+```text
+names: <box>.min.internal opens at its name on this machine; the HTTP proxy at 127.0.0.1:<port> opens it too
+```
+
+The second form is for a box at the `127.0.0.1` fallback:
+
+```text
+names: <box>.min.internal resolves on this machine; open it through the HTTP proxy at 127.0.0.1:<port>
+```
+
+The `BOX NAMES` row of `min ls` states the same words. While any item is not
+done, the line ends with `; finish setup: min finalize-install`. When the proxy failed
 to bind, the cause replaces the resolution and the box stays named:
 `names: <box>.min.internal: the hostname proxy is not serving: <cause>`, with
 the same clause after it when it applies. A session
 start never prints or runs the privileged step.
+
+On macOS, a box opens at its name directly once `min finalize-install` has
+run. A port that the box publishes, by `--ingress` at activate or by
+`min net expose` inside the box, opens at `http://<box>.min.internal:<port>`
+in the default profile of Safari, Chrome or Firefox. A browser profile that
+resolves names through DNS over HTTPS does not resolve box names. The box then
+stands at its own reserved local address, the address that its name resolves
+to. Before `min finalize-install` runs, the box stands at `127.0.0.1`, and
+the same URL opens through the hostname proxy at the `127.0.0.1:<port>` that
+the host line names. The hostname proxy keeps serving
+after the step, and it refuses a port that the box did not publish, the same
+as a direct connection.
+
+An activation refuses a declared `--ingress` host port that something on this
+machine already holds, and leaves no box behind. The refusal names the port
+and its holder, and suggests the next port up:
+
+```
+Port 8080 is already in use on this machine by box web.
+Choose another host port in --ingress (for example --ingress 8081:8080) or in [network] ingress in minimal.toml.
+```
+
+When the holder is not a box, the first line ends with
+`by another program on this machine.` Before `min finalize-install` runs,
+every box shares `127.0.0.1`, so two boxes cannot declare the same host port.
 
 The script holds only what this host is missing from:
 
@@ -658,6 +741,30 @@ daemon running).
 
 `stop` stays bare at the top level — a deliberate exception to the
 `min <noun> <verb>` convention: it acts on the daemon, not on any session.
+
+### `auth login` (alias: `min login`)
+
+```
+min auth login [--device]
+min login [--device]
+```
+
+Signs in to GitHub and keeps the sign-in in the host keychain. It opens
+GitHub in your browser. With `--device`, or in a build with no browser
+sign-in, it prints a code to enter at github.com. The token stays in the host
+keychain and is never written to a file.
+
+The browser sign-in ends on a page that states the outcome. After a sign-in,
+`min auth login` names the accounts that have an installation of the Minimal
+GitHub App. With no installation, it gives the install URL,
+`https://github.com/apps/gominimal/installations/new`, where you choose the
+repositories your boxes can reach. The browser page links there too. The
+browser sign-in then waits up to 5 minutes for the installation, and Ctrl-C
+stops the wait. The sign-in is already saved. If the wait ends without an
+installation, `min auth login` gives the install URL again.
+
+`min login` is the same command as `min auth login`. It takes the same flags
+and prints the same prompts.
 
 ### `loadout list` (alias: `ls`)
 

@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use boxes::core::bep::{
     ActivationRefused, ActivationSpec, BepRefusal, BepSettings, BepWarning, HostFacts, Quic443,
-    SecretGrant, SecretGrants, Steering, StoreAction, StoreReference, StoreRules, refusals,
+    SecretGrant, SecretGrants, Steering, StoreAction, StoreRules, refusals, store_references,
 };
 
 use crate::{BoxSpecArgs, GlobalArgs};
@@ -33,6 +33,13 @@ pub(crate) struct SpecInputs<'a> {
     /// Whether the client configuration sets the full-breadth
     /// acknowledgement.
     pub acknowledged: bool,
+    /// The box's network mode, from `min box spec --network`, the same
+    /// mode `min session activate --network` gives the box it creates.
+    pub network: boxes::NetworkMode,
+    /// Whether this host's switch resolves the box's steered names, the
+    /// same host fact the box's creation reads (BEP-017):
+    /// `host_resolves_box_names` for this host and [`Self::network`].
+    pub box_zone_resolver: bool,
     /// The GitHub module's upstream hosts.
     pub github_hosts: &'a [&'a str],
     /// The client's `[secret-store-rules]`, merged and with refused rules
@@ -58,21 +65,34 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
     }
 
     // BEP-057: every host is un-enrolled today.
-    // Interim: only BEP-057 is previewed here; the full exit-3 set is gominimal/minimal#2445.
+    // Interim: only BEP-057, BEP-009 (from `--network`) and BEP-017 are
+    // previewed here; the full exit-3 set is gominimal/minimal#2445.
+    // BEP-017 and its `dns` interim (#2805): the resolver fact is the one
+    // creation reads, so the two agree.
     let host = HostFacts {
         full_breadth_acknowledged: inputs.acknowledged,
+        box_zone_resolver: inputs.box_zone_resolver,
         ..HostFacts::LOCAL
     };
     let egress = None;
     let spec = ActivationSpec {
-        network: boxes::NetworkMode::OwnIp,
+        network: inputs.network,
         egress,
         bep: inputs.bep,
         secrets: inputs.secrets,
     };
     let narrow: Vec<BepRefusal> = refusals(&spec, host, inputs.github_hosts)
         .into_iter()
-        .filter(|refusal| matches!(refusal, BepRefusal::NarrowScopesUnenrolled { .. }))
+        .filter(|refusal| {
+            matches!(
+                refusal,
+                BepRefusal::NarrowScopesUnenrolled { .. }
+                    | BepRefusal::BrokerScopeNotGithub { .. }
+                    | BepRefusal::NoNetworkWithGrant { .. }
+                    | BepRefusal::NoResolver { .. }
+                    | BepRefusal::DnsWithoutDirectTls
+            )
+        })
         .collect();
     if !narrow.is_empty() {
         return Err(ActivationRefused { refusals: narrow }.into());
@@ -115,27 +135,29 @@ pub(crate) fn render(inputs: &SpecInputs<'_>, out: &mut dyn std::io::Write) -> a
                 )?;
             }
         }
-        for scope in grant.scopes.iter().filter(|s| !s.starts_with("github:")) {
-            // BEP-038, BEP-063: the authorities the matching rule registers
-            // are the upstream the store handle carries.
-            // A deny rule never redeems the reference, whatever upstream it
-            // keeps, so the row says it is denied and lists no authorities.
-            match StoreReference::parse(name, scope).rule(inputs.store_rules) {
-                Some(rule) if rule.action == Some(StoreAction::Deny) => writeln!(
-                    out,
-                    "store  {scope}  {name}  denied by its rule in [secret-store-rules] in config.toml"
-                )?,
-                Some(rule) if !rule.upstream.is_empty() => writeln!(
-                    out,
-                    "store  {scope}  {name}  upstream {}",
-                    rule.upstream.join(", ")
-                )?,
-                Some(_) => writeln!(out, "store  {scope}  {name}  no upstream registered")?,
-                None => writeln!(
-                    out,
-                    "store  {scope}  {name}  no rule in [secret-store-rules] in config.toml"
-                )?,
-            }
+    }
+    for reference in store_references(inputs.secrets) {
+        // BEP-038, BEP-063: the authorities the matching rule registers
+        // are the upstream the store handle carries.
+        // A deny rule never redeems the reference, whatever upstream it
+        // keeps, so the row says it is denied and lists no authorities.
+        let item = reference.item();
+        let name = reference.grant;
+        match reference.rule(inputs.store_rules) {
+            Some(rule) if rule.action == Some(StoreAction::Deny) => writeln!(
+                out,
+                "store  {item}  {name}  denied by its rule in [secret-store-rules] in config.toml"
+            )?,
+            Some(rule) if !rule.upstream.is_empty() => writeln!(
+                out,
+                "store  {item}  {name}  upstream {}",
+                rule.upstream.join(", ")
+            )?,
+            Some(_) => writeln!(out, "store  {item}  {name}  no upstream registered")?,
+            None => writeln!(
+                out,
+                "store  {item}  {name}  no rule in [secret-store-rules] in config.toml"
+            )?,
         }
     }
 
@@ -188,6 +210,7 @@ pub(crate) fn root_fingerprint(path: Option<&Path>) -> Option<String> {
 pub(crate) fn cmd_box_spec(global: &GlobalArgs, args: BoxSpecArgs) -> anyhow::Result<()> {
     let project = args
         .path
+        .clone()
         .or_else(|| global.repo_dir.clone())
         .unwrap_or_else(|| PathBuf::from("."));
     let session = match mfile::File::from_dir_recursive(&project) {
@@ -229,6 +252,7 @@ pub(crate) fn cmd_box_spec(global: &GlobalArgs, args: BoxSpecArgs) -> anyhow::Re
         .iter()
         .map(|authority| authority.host)
         .collect();
+    let (network, box_zone_resolver) = preview_host(crate::daemon_host_kind(global), &args);
     let mut stdout = std::io::stdout().lock();
     render(
         &SpecInputs {
@@ -237,12 +261,30 @@ pub(crate) fn cmd_box_spec(global: &GlobalArgs, args: BoxSpecArgs) -> anyhow::Re
             quic443,
             secrets: &secrets,
             acknowledged,
+            network,
+            box_zone_resolver,
             github_hosts: &github_hosts,
             store_rules: &store_rules,
         },
         &mut stdout,
     )?;
     stdout.flush().context("failed to write to stdout")
+}
+
+/// The network and the host fact the preview reads, for a host of `kind`:
+/// the box's `--network` mode, and whether the switch resolves that box's
+/// names. Creation reads the same fact for the same mode, so `min box spec
+/// --network <mode>` refuses what `min session activate --network <mode>`
+/// refuses.
+pub(crate) fn preview_host(
+    kind: paths::HostKind,
+    args: &BoxSpecArgs,
+) -> (boxes::NetworkMode, bool) {
+    let network: boxes::NetworkMode = args.network.into();
+    (
+        network,
+        super::box_verbs::host_resolves_box_names(kind, network),
+    )
 }
 
 #[cfg(test)]
@@ -263,6 +305,15 @@ mod tests {
             scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
             mode: None,
         }
+    }
+
+    /// A store reference as a box spec writes it: `source = "store"` with
+    /// `store` and `id`.
+    fn store_grant(store: &str, id: &str) -> SecretGrant {
+        toml::from_str(&format!(
+            "source = \"store\"\nstore = \"{store}\"\nid = \"{id}\""
+        ))
+        .expect("a store reference parses")
     }
 
     fn proxy_env() -> BepSettings {
@@ -286,6 +337,10 @@ mod tests {
                 quic443,
                 secrets,
                 acknowledged,
+                // An own-address box on the VM host, whose switch resolves
+                // box names (BEP-017).
+                network: boxes::NetworkMode::OwnIp,
+                box_zone_resolver: true,
                 github_hosts: HOSTS,
                 store_rules: &StoreRules::new(),
             },
@@ -298,7 +353,8 @@ mod tests {
     /// matching rule registers, and only a rule for the same store matches.
     #[test]
     fn box_spec_lists_store_references_with_their_authorities() {
-        let secrets = SecretGrants::from([("CLAUDE".to_string(), grant(&["keychain:claude"]))]);
+        let secrets =
+            SecretGrants::from([("CLAUDE".to_string(), store_grant("keychain", "claude"))]);
         let rule = |store: &str| boxes::core::bep::StoreRuleConfig {
             store: Some(store.to_string()),
             upstream: vec![
@@ -319,6 +375,8 @@ mod tests {
                     quic443: None,
                     secrets: &secrets,
                     acknowledged: false,
+                    network: boxes::NetworkMode::OwnIp,
+                    box_zone_resolver: false,
                     github_hosts: HOSTS,
                     store_rules: rules,
                 },
@@ -332,7 +390,7 @@ mod tests {
         let text = render_with(&rules);
         assert!(
             text.contains(
-                "store  keychain:claude  CLAUDE  upstream api.anthropic.com, \
+                "store  claude  CLAUDE  upstream api.anthropic.com, \
                  console.anthropic.com:8443\n"
             ),
             "{text}"
@@ -343,7 +401,7 @@ mod tests {
         let text = render_with(&other);
         assert!(
             text.contains(
-                "store  keychain:claude  CLAUDE  no rule in [secret-store-rules] in config.toml\n"
+                "store  claude  CLAUDE  no rule in [secret-store-rules] in config.toml\n"
             ),
             "{text}"
         );
@@ -354,12 +412,79 @@ mod tests {
         let text = render_with(&StoreRules::from([("claude".to_string(), denied)]));
         assert!(
             text.contains(
-                "store  keychain:claude  CLAUDE  denied by its rule in [secret-store-rules] in \
+                "store  claude  CLAUDE  denied by its rule in [secret-store-rules] in \
                  config.toml\n"
             ),
             "{text}"
         );
         assert!(!text.contains("api.anthropic.com"), "{text}");
+
+        // A rule with no store is a rule for the keychain.
+        let mut native = rule("keychain");
+        native.store = None;
+        let text = render_with(&StoreRules::from([("claude".to_string(), native)]));
+        assert!(
+            text.contains("store  claude  CLAUDE  upstream api.anthropic.com"),
+            "{text}"
+        );
+
+        // A reference in another store names the store.
+        let secrets = SecretGrants::from([("CLAUDE".to_string(), store_grant("vault", "claude"))]);
+        let mut out = Vec::new();
+        render(
+            &SpecInputs {
+                root_fingerprint: Some("abc123"),
+                bep: &proxy_env(),
+                quic443: None,
+                secrets: &secrets,
+                acknowledged: false,
+                network: boxes::NetworkMode::OwnIp,
+                box_zone_resolver: false,
+                github_hosts: HOSTS,
+                store_rules: &other,
+            },
+            &mut out,
+        )
+        .expect("renders");
+        let text = String::from_utf8(out).expect("utf-8");
+        assert!(
+            text.contains("store  vault:claude  CLAUDE  upstream api.anthropic.com"),
+            "{text}"
+        );
+
+        // A broker scope is not a store reference. The preview refuses it,
+        // as box creation does.
+        let secrets = SecretGrants::from([
+            ("CLAUDE".to_string(), store_grant("vault", "claude")),
+            ("OLD".to_string(), grant(&["claude"])),
+        ]);
+        let mut out = Vec::new();
+        let error = render(
+            &SpecInputs {
+                root_fingerprint: Some("abc123"),
+                bep: &proxy_env(),
+                quic443: None,
+                secrets: &secrets,
+                acknowledged: false,
+                network: boxes::NetworkMode::OwnIp,
+                box_zone_resolver: false,
+                github_hosts: HOSTS,
+                store_rules: &other,
+            },
+            &mut out,
+        )
+        .expect_err("the old spelling is refused");
+        let refused = error
+            .downcast_ref::<ActivationRefused>()
+            .expect("an activation refusal");
+        assert_eq!(
+            refused.refusals,
+            vec![BepRefusal::BrokerScopeNotGithub {
+                grant: "OLD".into(),
+                scope: "claude".into(),
+            }]
+        );
+        assert!(out.is_empty(), "no rows before the refusal");
     }
 
     /// BEP-038: the root fingerprint, the upstream hosts per grant, the
@@ -368,7 +493,7 @@ mod tests {
     fn box_spec_renders_ca_upstreams_steering_and_references() {
         let secrets = SecretGrants::from([
             ("GH_TOKEN".to_string(), grant(&["github:user-token"])),
-            ("NPM_TOKEN".to_string(), grant(&["keychain:npm"])),
+            ("NPM_TOKEN".to_string(), store_grant("keychain", "npm")),
         ]);
         let text = rendered(&secrets, &proxy_env(), None, false).expect("renders");
         assert_eq!(
@@ -376,7 +501,7 @@ mod tests {
             "root CA  certificate SHA256:abc123\n\
              grant  github:user-token  full  GH_TOKEN  hosts github.com, api.github.com, \
              uploads.github.com, codeload.github.com\n\
-             store  keychain:npm  NPM_TOKEN  no rule in [secret-store-rules] in config.toml\n\
+             store  npm  NPM_TOKEN  no rule in [secret-store-rules] in config.toml\n\
              steering  proxy_env\n\
              quic443  allowed (HTTP/3 bypasses the proxy)\n"
         );
@@ -392,6 +517,8 @@ mod tests {
                 quic443: None,
                 secrets: &secrets,
                 acknowledged: false,
+                network: boxes::NetworkMode::OwnIp,
+                box_zone_resolver: false,
                 github_hosts: HOSTS,
                 store_rules: &StoreRules::new(),
             },
@@ -456,6 +583,8 @@ mod tests {
                 quic443: None,
                 secrets: &secrets,
                 acknowledged: false,
+                network: boxes::NetworkMode::OwnIp,
+                box_zone_resolver: false,
                 github_hosts: HOSTS,
                 store_rules: &StoreRules::new(),
             },
@@ -506,16 +635,16 @@ mod tests {
     fn box_spec_flags_allowed_quic_stance_on_grant_box() {
         let secrets = SecretGrants::from([("GH_TOKEN".to_string(), grant(&["github:user-token"]))]);
         let flag = "quic443  allowed (HTTP/3 bypasses the proxy)";
-        let dns = BepSettings {
-            steering: Some(Steering::Dns),
+        let both = BepSettings {
+            steering: Some(Steering::Both),
             ..BepSettings::default()
         };
         let cases = [
             (proxy_env(), None, true),
             (proxy_env(), Some(Quic443::Auto), true),
-            (dns.clone(), Some(Quic443::Allow), true),
-            (dns.clone(), None, false),
-            (dns, Some(Quic443::Auto), false),
+            (both.clone(), Some(Quic443::Allow), true),
+            (both.clone(), None, false),
+            (both, Some(Quic443::Auto), false),
             (proxy_env(), Some(Quic443::Block), false),
         ];
         for (bep, quic443, flagged) in cases {

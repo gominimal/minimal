@@ -1,4 +1,4 @@
-//! The proxy's audit log (BEP-039, BEP-040, BEP-041, BEP-048).
+//! The proxy's audit log (BEP-039, BEP-040, BEP-041, BEP-048, BEP-049).
 //!
 //! The log is JSONL under the proxy's state directory: one line for each
 //! decision, in the `min/v1` audit schema. The proxy is the log's only
@@ -19,8 +19,9 @@
 //! The first record of a log carries the all-zero hash (BEP-048). The hash
 //! covers the whole previous line, its own `previous_hash` included. The
 //! chain functions ([`line_hash`], [`Record::from_decision`],
-//! [`Record::to_line`]) are pure over bytes, and separate from the file
-//! writer [`AuditLog`].
+//! [`Record::to_line`]) and the verifier ([`verify_segment`]) are pure over
+//! bytes, and separate from the file writer [`AuditLog`]. [`verify_dir`]
+//! runs the verifier over every segment, for `min doctor` (BEP-049).
 //!
 //! [`AuditLog::open`] opens the file for append only, never for write or
 //! truncate, so it cannot modify or remove an existing record (BEP-041).
@@ -250,6 +251,111 @@ pub fn head_hash(contents: impl AsRef<[u8]>) -> String {
         .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
         .find(|line| !line.is_empty())
         .map_or_else(|| ZERO_HASH.to_owned(), line_hash)
+}
+
+/// The bytes that open the last field of every record line. [`Record`]
+/// declares `previous_hash` last, so its line ends in this prefix, the
+/// 64-character hash, and `"}`.
+const PREVIOUS_HASH_FIELD: &[u8] = b"\"previous_hash\":\"";
+
+/// The `previous_hash` that the record line `line` carries, or `None` when
+/// `line` does not end in that field. It reads only the line's end, so it
+/// is pure over bytes and needs no JSON parser.
+pub fn carried_hash(line: &[u8]) -> Option<&[u8]> {
+    let body = line.strip_suffix(b"\"}")?;
+    let split = body.len().checked_sub(64)?;
+    let (head, hash) = body.split_at(split);
+    head.ends_with(PREVIOUS_HASH_FIELD).then_some(hash)
+}
+
+/// The outcome of [`verify_segment`] over one run of lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainCheck {
+    /// Every line carries the hash of the line before it. `head` is the hash
+    /// the next line must carry: the last line's hash, or `start` when there
+    /// is no line. `records` counts the lines.
+    Verified {
+        head: Option<String>,
+        records: usize,
+    },
+    /// The line at `record`, counted from 1, does not carry the hash of the
+    /// line before it, or carries no hash. A record before it was changed
+    /// or removed, or this record was.
+    Broken { record: usize },
+}
+
+/// Verifies the hash chain of `contents`, the bytes of one segment (BEP-049).
+///
+/// `start` is the hash the first record must carry: [`ZERO_HASH`] for the
+/// first segment of a log, or the previous segment's head. With `None`,
+/// the first record's own `previous_hash` is the start, because the
+/// segment before it is gone. A last line without its newline never formed
+/// a record (the writer cuts it), so it is not checked. The chain hashes
+/// each line as [`line_hash`] and [`head_hash`] do, with a trailing `\r`
+/// cut.
+///
+/// What the chain detects is a record that was changed or removed and
+/// whose successors still carry the old hashes. An edit followed by a
+/// recomputation of every later hash, and the change or removal of the
+/// last record, verify.
+pub fn verify_segment(start: Option<&str>, contents: impl AsRef<[u8]>) -> ChainCheck {
+    verify_segment_with(start, contents.as_ref(), |line| line_hash(line))
+}
+
+/// [`verify_segment`] with `hash` in place of [`line_hash`]. A proof harness
+/// passes a model of the hash, because no bounded check can show SHA-256
+/// free of collisions.
+pub fn verify_segment_with(
+    start: Option<&str>,
+    contents: &[u8],
+    hash: impl Fn(&[u8]) -> String,
+) -> ChainCheck {
+    let complete = contents
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(&contents[..0], |n| &contents[..n]);
+    let lines: Vec<&[u8]> = complete
+        .split(|&b| b == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .filter(|line| !line.is_empty())
+        .collect();
+    match verify_lines_with(
+        start.map(|s| s.as_bytes().to_vec()),
+        &lines,
+        |line| carried_hash(line).map(<[u8]>::to_vec),
+        |line| hash(line).into_bytes(),
+    ) {
+        Ok((head, records)) => ChainCheck::Verified {
+            // Every head is `start` or a value of `hash`, so it is UTF-8.
+            head: head.map(|h| String::from_utf8_lossy(&h).into_owned()),
+            records,
+        },
+        Err(record) => ChainCheck::Broken { record },
+    }
+}
+
+/// The chain rule over records already split into `lines`, apart from any
+/// byte scan. Each line must carry, as `carried` reads it, the `hash` of
+/// the line before it, and the first line must carry `start` when there is
+/// one. Returns the head and the count of lines, or the 1-based number of
+/// the first line that breaks the chain.
+fn verify_lines_with<L, H: Eq>(
+    start: Option<H>,
+    lines: &[L],
+    carried: impl Fn(&L) -> Option<H>,
+    hash: impl Fn(&L) -> H,
+) -> Result<(Option<H>, usize), usize> {
+    let mut expected = start;
+    for (k, line) in lines.iter().enumerate() {
+        let Some(found) = carried(line) else {
+            return Err(k + 1);
+        };
+        if expected.as_ref().is_some_and(|hash| *hash != found) {
+            return Err(k + 1);
+        }
+        expected = Some(hash(line));
+    }
+    Ok((expected, lines.len()))
 }
 
 /// The `kind` of a [`QuarantineRecord`].
@@ -1038,6 +1144,187 @@ pub fn segments(dir: impl AsRef<Path>) -> io::Result<Vec<PathBuf>> {
         .collect())
 }
 
+/// The outcome of [`verify_dir`] over every segment of a log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogCheck {
+    /// The segments the check read, oldest first. On a break, the last one
+    /// is the segment that breaks.
+    pub segments: Vec<PathBuf>,
+    /// The records that verified, across every segment.
+    pub records: usize,
+    /// Where the chain breaks: the segment, and the record in it, counted
+    /// from 1. `None` when the whole log verifies.
+    pub broken: Option<(PathBuf, usize)>,
+    /// The segments, other than segment 0, where the chain starts again
+    /// with no hash to carry on from, because the segments before them are
+    /// missing. A prune and a deletion both leave one.
+    pub restarts: Vec<PathBuf>,
+}
+
+/// Verifies the hash chain of every segment of the log in `dir`, oldest
+/// first (BEP-049). Segment 0 starts at [`ZERO_HASH`]. A segment starts at
+/// the head of the segment before it. The oldest surviving segment, when
+/// it is not segment 0, starts the chain again, because a rotation pruned
+/// the segments before it.
+///
+/// A gap in the numbers after a surviving segment is a prune only when
+/// that segment holds a revocation record: [`prune`] removes every older
+/// segment except one that holds a revocation, and keeps the newest ones
+/// whole. So after a segment without a revocation, the next segment must
+/// carry its head, gap or not, and a deleted segment there breaks the
+/// chain. After a segment with a revocation, the segment past the gap
+/// starts the chain again. A missing directory is an empty log that
+/// verifies.
+///
+/// A segment's last line counts here only when it parses as a revocation
+/// record. A line with a successor counts as it does for [`prune`], because
+/// the chain checks its bytes ([`bytes_hold_parsed_revocation`]).
+///
+/// A gap that a quarantine left verifies when its quarantine records lead
+/// the chain across it, as [`verify_chain`] checks them
+/// ([`AuditLog::quarantine_unreadable`]).
+///
+/// Residual: a gap after a revocation segment, and a missing run of the
+/// oldest segments, look the same whether [`prune`] or a person removed the
+/// segments. The chain carries no record of a prune, so this check cannot
+/// tell the two apart. It lists every segment where the chain starts again
+/// in [`LogCheck::restarts`], so the caller can say so. A log removed whole
+/// reads as an empty log. Both are the T31 residual, with an edit followed
+/// by recomputation and the removal of the last record.
+pub fn verify_dir(dir: impl AsRef<Path>) -> io::Result<LogCheck> {
+    let mut check = LogCheck {
+        segments: Vec::new(),
+        records: 0,
+        broken: None,
+        restarts: Vec::new(),
+    };
+    let dir = dir.as_ref();
+    let mut read = Vec::new();
+    for (n, path) in numbered_segments(dir)? {
+        let contents = fs::read(&path)?;
+        read.push((n, path, contents));
+    }
+    // The previous segment's number, head, and whether it holds a
+    // revocation record.
+    let mut previous: Option<(u64, Option<String>, bool)> = None;
+    for (i, (n, path, contents)) in read.iter().enumerate() {
+        let n = *n;
+        let gap = previous
+            .as_ref()
+            .is_some_and(|(m, _, _)| m.checked_add(1) != Some(n));
+        let start = match &previous {
+            _ if n == 0 => Some(ZERO_HASH.to_owned()),
+            Some((m, head, _)) if m.checked_add(1) == Some(n) => head.clone(),
+            Some((_, head, false)) => head.clone(),
+            _ => None,
+        };
+        if start.is_none() {
+            check.restarts.push(path.clone());
+        }
+        check.segments.push(path.clone());
+        let mut outcome = verify_segment(start.as_deref(), contents);
+        // A quarantine moves a segment out and leaves a gap, with records
+        // that lead the chain across it.
+        if gap
+            && outcome == (ChainCheck::Broken { record: 1 })
+            && quarantine_bridges(dir, &read[i - 1..])?
+        {
+            outcome = verify_segment(None, contents);
+        }
+        match outcome {
+            ChainCheck::Verified { head, records } => {
+                check.records += records;
+                previous = Some((n, head, bytes_hold_parsed_revocation(contents)));
+            }
+            ChainCheck::Broken { record } => {
+                check.records += record - 1;
+                check.broken = Some((path.clone(), record));
+                break;
+            }
+        }
+    }
+    Ok(check)
+}
+
+/// Whether quarantine records lead the chain across the gap between the
+/// first two segments of `from`, as [`verify_segments`] checks it with the
+/// segments under [`QUARANTINE_DIR`]. `from` runs from the segment before
+/// the gap to the newest segment, because a quarantine record comes after
+/// the gap it bridges.
+fn quarantine_bridges(dir: &Path, from: &[(u64, PathBuf, Vec<u8>)]) -> io::Result<bool> {
+    let mut moved = Vec::new();
+    for (_, path) in numbered_segments(&dir.join(QUARANTINE_DIR))? {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        moved.push((name, fs::read(&path)?));
+    }
+    // `from[1]` is the segment after the gap.
+    if from.len() < 2 || moved.is_empty() {
+        return Ok(false);
+    }
+    let segments: Vec<(PathBuf, Vec<u8>)> = from
+        .iter()
+        .map(|(_, path, bytes)| (path.clone(), bytes.clone()))
+        .collect();
+    // An error anywhere bridges nothing, unless the quarantine records
+    // provably lead the chain across this gap. Then the error is unrelated
+    // to the gap, and the segments past it report it themselves.
+    Ok(match verify_segments(&segments, &moved) {
+        Ok(_) => true,
+        Err(_) => gap_bridged(from, &moved),
+    })
+}
+
+/// Whether [`QuarantineRecord`]s lead the chain across the gap between
+/// `from[0]` and `from[1]`, checked on their own: from the hash of the
+/// last line of `from[0]` to the `previous_hash` of the first line of
+/// `from[1]`. Each record on the way must sit in `from[1]` or later, name
+/// a segment numbered between the two, and agree with that segment under
+/// [`QUARANTINE_DIR`] in `moved`. Pure.
+fn gap_bridged(from: &[(u64, PathBuf, Vec<u8>)], moved: &[(String, Vec<u8>)]) -> bool {
+    let [(before, _, before_bytes), (after, _, after_bytes), ..] = from else {
+        return false;
+    };
+    let Some(expected) = complete_lines(before_bytes).last().map(line_hash) else {
+        return false;
+    };
+    let first = complete_lines(after_bytes).next().map(classify);
+    let Some(found) = first.as_ref().and_then(Line::previous_hash) else {
+        return false;
+    };
+    let records: Vec<(u64, QuarantineRecord)> = from[1..]
+        .iter()
+        .flat_map(|(_, _, bytes)| complete_lines(bytes).map(classify))
+        .filter_map(|line| match line {
+            Line::Quarantine(record) => Some(record),
+            _ => None,
+        })
+        .filter_map(|record| {
+            let number = segment_number(&record.segment)?;
+            let agrees = moved.iter().any(|(name, bytes)| {
+                *name == record.segment && moved_segment_matches(&record, bytes)
+            });
+            (agrees && number > *before && number < *after).then_some((number, record))
+        })
+        .collect();
+    let mut at = expected;
+    let mut past = *before;
+    // Each step moves to a higher segment number, so the walk ends.
+    while let Some((number, record)) = records
+        .iter()
+        .find(|(number, record)| *number > past && record.from_hash == at)
+    {
+        at.clone_from(&record.final_hash);
+        past = *number;
+        if at == found {
+            return true;
+        }
+    }
+    false
+}
+
 /// Every segment of the log in `dir` with its number, oldest first.
 fn numbered_segments(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
     let entries = match fs::read_dir(dir) {
@@ -1089,6 +1376,37 @@ fn holds_revocation(path: &Path) -> io::Result<bool> {
         Line::Corrupt | Line::OtherKind { .. } => true,
         Line::Quarantine(_) => false,
     }))
+}
+
+/// Whether the bytes of one segment, whose chain verified, can excuse a gap
+/// after it in [`verify_dir`].
+///
+/// A line with a successor in the segment carries the bytes the writer
+/// wrote, because the successor carries its hash. So it counts as
+/// [`holds_revocation`] counts it, and a corrupt line or a record of a kind
+/// this bep does not know excuses a gap, as it keeps the segment in
+/// [`prune`]. Only the last complete line has no successor to check it. It
+/// counts only when it parses as a revocation record, so an edit of that
+/// line to a corrupt line or to another kind cannot excuse a gap. An edit
+/// of `revocation` to another kind reads as such a record.
+///
+/// Residual: [`prune`] also keeps a segment whose last line is corrupt or a
+/// record of an unknown kind. When the writer wrote that line and a prune
+/// left a gap after it, [`verify_dir`] reports a break that is none.
+fn bytes_hold_parsed_revocation(bytes: &[u8]) -> bool {
+    let mut lines = complete_lines(bytes).peekable();
+    while let Some(raw) = lines.next() {
+        let last = lines.peek().is_none();
+        let counts = match classify(raw) {
+            Line::Record(record) => record.kind == Kind::Revocation,
+            Line::Corrupt | Line::OtherKind { .. } => !last,
+            Line::Quarantine(_) => false,
+        };
+        if counts {
+            return true;
+        }
+    }
+    false
 }
 
 /// Where the chain of a log stops verifying.
@@ -1891,6 +2209,48 @@ mod tests {
         );
     }
 
+    // BEP-049, BEP-068: `verify_dir` follows the quarantine records across
+    // the gap that a quarantine of a middle segment leaves.
+    #[test]
+    fn verify_dir_crosses_a_quarantined_segment() {
+        let dir = TempDir::new();
+        let audit = dir.0.join("audit");
+        let mut log = AuditLog::open_dir(&audit, rotation(1, 16, 60)).unwrap();
+        for _ in 0..3 {
+            log.append(&admit()).unwrap();
+        }
+        drop(log);
+        let middle = audit.join(segment_name(1));
+        let mut file = OpenOptions::new().append(true).open(&middle).unwrap();
+        file.write_all(b"not a record\n").unwrap();
+        drop(file);
+
+        let mut log = AuditLog::open_dir(&audit, rotation(1, 16, 60)).unwrap();
+        assert_eq!(log.quarantine_unreadable().unwrap().len(), 1);
+        log.append(&admit()).unwrap();
+        drop(log);
+        assert!(!middle.exists());
+        assert!(verify_chain(&audit).unwrap().is_ok());
+        let check = verify_dir(&audit).unwrap();
+        assert_eq!(check.broken, None, "{check:?}");
+        assert!(check.restarts.is_empty(), "{check:?}");
+
+        // A record before the gap that no longer parses, its
+        // `previous_hash` kept, is not excused by the quarantine.
+        let first = audit.join(segment_name(0));
+        let kept = fs::read(&first).unwrap();
+        let mut garbled = b"x".to_vec();
+        garbled.extend_from_slice(&kept);
+        fs::write(&first, &garbled).unwrap();
+        assert!(verify_dir(&audit).unwrap().broken.is_some());
+        fs::write(&first, &kept).unwrap();
+        assert_eq!(verify_dir(&audit).unwrap().broken, None);
+
+        // A segment deleted with no quarantine record still breaks.
+        fs::remove_file(audit.join(segment_name(2))).unwrap();
+        assert!(verify_dir(&audit).unwrap().broken.is_some());
+    }
+
     // BEP-049, BEP-068: a quarantine record bridges a gap only between two
     // segments, and only with the moved segment under `quarantine/`.
     #[test]
@@ -1967,6 +2327,57 @@ mod tests {
             ),
         );
         assert!(verify_chain(&audit).unwrap().is_err());
+    }
+
+    // BEP-049, BEP-068: a chain error past line 1 of the segment after a
+    // gap bridges nothing when no quarantine record leads across the gap,
+    // even with files under `quarantine/`.
+    #[test]
+    fn deleted_segment_with_error_past_the_gap_still_breaks() {
+        let dir = TempDir::new();
+        let audit = dir.0.join("audit");
+        // A bound of one byte: each record after the first opens a segment.
+        let mut log = AuditLog::open_dir(&audit, rotation(1, 16, 60)).unwrap();
+        let first = log.append(&admit()).unwrap();
+        for _ in 0..3 {
+            log.append(&admit()).unwrap();
+        }
+        drop(log);
+        fs::remove_file(audit.join(segment_name(1))).unwrap();
+        // The first line past the gap carries the hash before the gap, in
+        // a field order the byte check does not read. So the chain error
+        // sits at line 1 of the next segment, not at the gap.
+        let after = audit.join(segment_name(2));
+        let restated = format!(
+            "{{\"schema\":\"{SCHEMA}\",\"kind\":\"future\",\"previous_hash\":\"{}\",\"x\":1}}\n",
+            line_hash(first.to_line())
+        );
+        fs::write(&after, &restated).unwrap();
+        fs::create_dir_all(audit.join(QUARANTINE_DIR)).unwrap();
+        fs::write(
+            audit.join(QUARANTINE_DIR).join(segment_name(9)),
+            "unrelated\n",
+        )
+        .unwrap();
+
+        let from: Vec<(u64, PathBuf, Vec<u8>)> = numbered_segments(&audit)
+            .unwrap()
+            .into_iter()
+            .map(|(n, path)| {
+                let bytes = fs::read(&path).unwrap();
+                (n, path, bytes)
+            })
+            .collect();
+        let segments: Vec<(PathBuf, Vec<u8>)> = from
+            .iter()
+            .map(|(_, path, bytes)| (path.clone(), bytes.clone()))
+            .collect();
+        let err = verify_segments(&segments, &[]).unwrap_err();
+        assert_eq!(err.segment, audit.join(segment_name(3)), "{err:?}");
+        assert!(!quarantine_bridges(&audit, &from).unwrap());
+
+        let check = verify_dir(&audit).unwrap();
+        assert_eq!(check.broken, Some((after, 1)), "{check:?}");
     }
 
     // BEP-068: a quarantine that fails part way moves no segment it did
@@ -2334,6 +2745,300 @@ mod tests {
                     prop_assert!(!contents.as_bytes().windows(body.len()).any(|w| w == &body[..]));
                 }
             }
+        }
+    }
+
+    /// The lines of a log of `decisions`, chained from the zero hash, each
+    /// without its newline.
+    fn chained_lines(decisions: &[Decision]) -> Vec<String> {
+        let mut head = ZERO_HASH.to_owned();
+        decisions
+            .iter()
+            .map(|decision| {
+                let line = Record::from_decision(decision, &head).to_line();
+                head = line_hash(&line);
+                line
+            })
+            .collect()
+    }
+
+    fn joined(lines: &[Vec<u8>]) -> Vec<u8> {
+        lines
+            .iter()
+            .flat_map(|l| l.iter().copied().chain(*b"\n"))
+            .collect()
+    }
+
+    proptest! {
+        // BEP-049: a chain built by the writer's construction verifies, and
+        // altering or removing one record that has a successor, without
+        // recomputing the hashes that follow, fails verification.
+        #[test]
+        fn prop_audit_chain_detects_unrecomputed_edit(
+            decisions in proptest::collection::vec(decision_strategy(), 2..8),
+            pick in any::<prop::sample::Index>(),
+            at in any::<prop::sample::Index>(),
+            mask in 1u8..=255,
+            remove in any::<bool>(),
+        ) {
+            let lines: Vec<Vec<u8>> = chained_lines(&decisions)
+                .into_iter()
+                .map(String::into_bytes)
+                .collect();
+            let whole = joined(&lines);
+            let verified = verify_segment(Some(ZERO_HASH), &whole);
+            prop_assert_eq!(
+                verified,
+                ChainCheck::Verified {
+                    head: Some(head_hash(&whole)),
+                    records: lines.len(),
+                }
+            );
+
+            // Only a record with a successor: the last one is the residual.
+            let i = pick.index(lines.len() - 1);
+            let mut edited = lines.clone();
+            if remove {
+                edited.remove(i);
+            } else {
+                let j = at.index(edited[i].len());
+                let byte = edited[i][j] ^ mask;
+                prop_assume!(byte != b'\n');
+                edited[i][j] = byte;
+            }
+            match verify_segment(Some(ZERO_HASH), joined(&edited)) {
+                ChainCheck::Broken { record } => prop_assert!(record == i + 1 || record == i + 2),
+                verified => prop_assert!(false, "the edit at record {} verified: {:?}", i + 1, verified),
+            }
+        }
+    }
+
+    /// A torn last line and the segments of a rotated log: the chain runs on
+    /// across segments, and a break names its segment and record.
+    #[test]
+    fn audit_chain_verifies_across_segments_and_names_the_break() {
+        let dir = TempDir::new();
+        let path = dir.log();
+        let log_dir = path.parent().unwrap().join("segments");
+        let rotation = Rotation {
+            bound: 1,
+            ..Rotation::default()
+        };
+        let mut log = AuditLog::open_dir(&log_dir, rotation).unwrap();
+        for _ in 0..4 {
+            log.append(&admit()).unwrap();
+        }
+        drop(log);
+        let check = verify_dir(&log_dir).unwrap();
+        assert_eq!(check.broken, None);
+        assert_eq!(check.records, 4);
+        assert!(check.segments.len() > 1, "the log rotated: {check:?}");
+
+        // Remove the second segment's record: the third segment's first
+        // record carries a hash that no longer matches.
+        let second = check.segments[1].clone();
+        fs::write(&second, b"").unwrap();
+        let check = verify_dir(&log_dir).unwrap();
+        assert_eq!(check.broken, Some((check.segments[2].clone(), 1)));
+    }
+
+    /// A gap after a segment without a revocation is a deleted segment, and
+    /// breaks the chain. A gap that a prune leaves after a kept revocation
+    /// segment verifies.
+    #[test]
+    fn audit_chain_breaks_at_a_deleted_middle_segment() {
+        let dir = TempDir::new();
+        let log_dir = dir.log().parent().unwrap().join("gaps");
+        let mut log = AuditLog::open_dir(&log_dir, rotation(1, usize::MAX, 3600)).unwrap();
+        log.append(&revocation("box-a")).unwrap();
+        for _ in 0..5 {
+            log.append(&admit()).unwrap();
+        }
+        drop(log);
+        let all = segments(&log_dir).unwrap();
+        assert!(all.len() >= 5, "the log rotated: {all:?}");
+
+        // A prune keeps the revocation segment and the newest two.
+        let removed = prune(
+            &log_dir,
+            &rotation(1, 2, 3600),
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        assert!(!removed.is_empty(), "the prune removed segments");
+        let kept = segments(&log_dir).unwrap();
+        assert_eq!(kept[0], all[0]);
+        let check = verify_dir(&log_dir).unwrap();
+        assert_eq!(check.broken, None, "{check:?}");
+        // The segment past the gap starts the chain again, and the check
+        // says so.
+        let past_gap = kept[1].clone();
+        assert_eq!(check.restarts, vec![past_gap], "{check:?}");
+
+        // Deleting a middle segment of a log without a revocation leaves a
+        // gap after a segment that a prune removes, so the chain breaks.
+        let dir2 = TempDir::new();
+        let log_dir2 = dir2.log().parent().unwrap().join("deleted");
+        let mut log = AuditLog::open_dir(&log_dir2, rotation(1, usize::MAX, 3600)).unwrap();
+        for _ in 0..4 {
+            log.append(&admit()).unwrap();
+        }
+        drop(log);
+        let all = segments(&log_dir2).unwrap();
+        fs::remove_file(&all[1]).unwrap();
+        let check = verify_dir(&log_dir2).unwrap();
+        assert_eq!(check.broken, Some((all[2].clone(), 1)), "{check:?}");
+        assert!(check.restarts.is_empty(), "{check:?}");
+
+        // A revocation record garbled so that it no longer parses, its
+        // `previous_hash` kept, does not excuse a deleted segment after it.
+        let dir3 = TempDir::new();
+        let log_dir3 = dir3.log().parent().unwrap().join("garbled");
+        let mut log = AuditLog::open_dir(&log_dir3, rotation(1, usize::MAX, 3600)).unwrap();
+        log.append(&revocation("box-a")).unwrap();
+        for _ in 0..3 {
+            log.append(&admit()).unwrap();
+        }
+        drop(log);
+        let all = segments(&log_dir3).unwrap();
+        let first = fs::read_to_string(&all[0]).unwrap();
+        let garbled = first.replace("\"kind\":\"revocation\"", "\"kind\":\"revocatio\"");
+        assert_ne!(first, garbled, "the record carries its kind");
+        fs::write(&all[0], garbled).unwrap();
+        fs::remove_file(&all[1]).unwrap();
+        let check = verify_dir(&log_dir3).unwrap();
+        assert_eq!(check.broken, Some((all[2].clone(), 1)), "{check:?}");
+    }
+
+    /// A corrupt line, or a record of a kind this bep does not know, keeps
+    /// its segment in a prune. With a successor in the segment, the chain
+    /// checks its bytes, so it excuses the gap that the prune leaves after
+    /// the segment, as a revocation does.
+    #[test]
+    fn verify_dir_crosses_a_gap_after_an_unreadable_line_with_a_successor() {
+        let schema = format!("\"schema\":\"{SCHEMA}\"");
+        let unreadable = [
+            // Corrupt: a kind that is not a string.
+            (format!("{schema},\"kind\":7"), "corrupt"),
+            // A kind this bep does not know.
+            (format!("{schema},\"kind\":\"future_kind\""), "future"),
+        ];
+        for (replacement, name) in unreadable {
+            let dir = TempDir::new();
+            let log_dir = dir.log().parent().unwrap().join(name);
+            fs::create_dir_all(&log_dir).unwrap();
+            let line = Record::from_decision(&admit(), ZERO_HASH).to_line();
+            let first = line.replacen(&format!("{schema},\"kind\":\"decision\""), &replacement, 1);
+            assert_ne!(first, line, "the line carries its schema and kind");
+            assert!(!matches!(classify(first.as_bytes()), Line::Record(_)));
+            let second = Record::from_decision(&admit(), &line_hash(&first)).to_line();
+            fs::write(
+                log_dir.join(segment_name(0)),
+                format!("{first}\n{second}\n"),
+            )
+            .unwrap();
+            // A prune removed segment 1. Segment 2 starts from a hash that
+            // is not the head of segment 0.
+            let other = "1".repeat(64);
+            let third = Record::from_decision(&admit(), &other).to_line();
+            fs::write(log_dir.join(segment_name(2)), format!("{third}\n")).unwrap();
+            let check = verify_dir(&log_dir).unwrap();
+            assert_eq!(check.broken, None, "{name}: {check:?}");
+            assert_eq!(check.restarts, vec![log_dir.join(segment_name(2))]);
+
+            // As the last line of its segment, the same line has no
+            // successor to check it, and does not excuse the gap.
+            fs::write(log_dir.join(segment_name(0)), format!("{first}\n")).unwrap();
+            let check = verify_dir(&log_dir).unwrap();
+            assert_eq!(
+                check.broken,
+                Some((log_dir.join(segment_name(2)), 1)),
+                "{name}: {check:?}"
+            );
+        }
+    }
+}
+
+/// The audit chain's harnesses (BEP-049). The chain rule runs over
+/// `verify_lines_with` with a model line and a model hash that is free of
+/// collisions over the lines it sees. The byte rule that reads the carried
+/// hash runs over `carried_hash` with fixed offsets. No harness has a
+/// symbolic offset or a symbolic buffer length.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::{PREVIOUS_HASH_FIELD, carried_hash, verify_lines_with};
+
+    const MAX_RECORDS: usize = 3;
+    /// A model line: its payload and the code it carries as `previous_hash`.
+    type Line = (u8, u8);
+    /// The model hash of a line that is not an original line.
+    const OTHER: u8 = 0xFF;
+
+    /// An edit to or a removal of any record with a successor breaks the
+    /// chain. `verify_segment_with` maps the `Err` to `ChainCheck::Broken`.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn kani_audit_chain_detects_edit() {
+        let n: usize = kani::any();
+        kani::assume((2..=MAX_RECORDS).contains(&n));
+        // Line k carries the code of line k - 1, which is k. Line 0
+        // carries 0, the model of the zero hash.
+        let originals: [Line; MAX_RECORDS] = [(kani::any(), 0), (kani::any(), 1), (kani::any(), 2)];
+        // Collision-free over the original lines: line k hashes to k + 1,
+        // and any other line to a code that no line carries.
+        let hash = |l: &Line| {
+            if *l == originals[0] {
+                1
+            } else if *l == originals[1] {
+                2
+            } else if n > 2 && *l == originals[2] {
+                3
+            } else {
+                OTHER
+            }
+        };
+        let carried = |l: &Line| Some(l.1);
+        assert!(verify_lines_with(Some(0), &originals[..n], carried, hash).is_ok());
+
+        // `i < n - 1`, not `i + 1 < n`: a free `i` overflows `i + 1`.
+        let i: usize = kani::any();
+        kani::assume(i < n - 1);
+        let mut lines = originals;
+        let len = if kani::any() {
+            // Remove line i: shift its successors down by one.
+            if i == 0 {
+                lines[0] = lines[1];
+            }
+            if i <= 1 {
+                lines[1] = lines[2];
+            }
+            n - 1
+        } else {
+            // Edit line i: its payload, its carried field, or both.
+            let edited: Line = kani::any();
+            kani::assume(edited != originals[i]);
+            lines[i] = edited;
+            n
+        };
+        assert!(verify_lines_with(Some(0), &lines[..len], carried, hash).is_err());
+    }
+
+    /// One record line: two bytes, the field, the 64-digit hash and `"}`.
+    const LINE: usize = 2 + PREVIOUS_HASH_FIELD.len() + 64 + 2;
+
+    /// `carried_hash` returns the 64 bytes before the closing `"}` exactly
+    /// when the line ends in `"}` and the field opens those 64 bytes.
+    #[kani::proof]
+    #[kani::unwind(18)]
+    fn kani_carried_hash_reads_the_field() {
+        let line: [u8; LINE] = kani::any();
+        let well_formed = line[83..] == *b"\"}" && line[2..19] == *PREVIOUS_HASH_FIELD;
+        // Compare where the result points, not its 64 bytes.
+        let found = carried_hash(&line).map(|h| (h.as_ptr(), h.len()));
+        if well_formed {
+            assert!(found == Some((line[19..83].as_ptr(), 64)));
+        } else {
+            assert!(found.is_none());
         }
     }
 }

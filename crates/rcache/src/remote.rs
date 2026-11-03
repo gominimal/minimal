@@ -21,14 +21,25 @@ use reqwest::{Client, Error as ReqwestError};
 /// An error from operations with the remote cache.
 #[derive(Debug)]
 pub enum Error<BE: std::fmt::Debug> {
-    /// An error occurred with the fetcher backend.
+    /// The backend failed while sending a request or reading its response:
+    /// a transport failure, retried as transient.
     Backend(BE),
+    /// The backend could not build the request at all (a URL it cannot
+    /// represent, a client that would not construct): deterministic, so it is
+    /// never retried.
+    Request(BE),
     /// An I/O error occurred.
     IO(std::io::Error),
     /// An error occurred interacting with the local cache.
     Cache(lcache::CacheErr),
-    /// A remote object was not found.
-    NotFound,
+    /// The remote cache has no artifact for `object`: a spec the index does
+    /// not list, or an index hit whose artifact the store no longer has.
+    NotFound {
+        /// Which identifier `object` is: the spec hash an index was asked
+        /// for, or the artifact file a store was asked for.
+        what: &'static str,
+        object: String,
+    },
     /// An error occurred unpacking an archive.
     ArchiveError(archive::ArchiveError),
     /// The sha256 hash that was requested differed from what was written/downloaded.
@@ -39,11 +50,33 @@ pub enum Error<BE: std::fmt::Debug> {
     Config(String),
     /// A fetch returned an error status.
     Fetch { status: usize },
+    /// The remote was repeatedly asked for `object` but stayed unavailable
+    /// (`status` is the HTTP status code when the remote answered, `None`
+    /// when the connection itself failed).
+    Unavailable {
+        object: String,
+        status: Option<usize>,
+    },
 }
 
 impl<BE: std::fmt::Debug> std::fmt::Display for Error<BE> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+        match self {
+            Error::NotFound { what, object } => {
+                write!(f, "the remote cache has no artifact for {what} {object}")
+            }
+            Error::Unavailable { object, status } => match status {
+                Some(status) => write!(
+                    f,
+                    "cache server could not serve {object} (HTTP {status}); try again shortly"
+                ),
+                None => write!(
+                    f,
+                    "cache server was unreachable for {object}; try again shortly"
+                ),
+            },
+            _ => write!(f, "{:?}", self),
+        }
     }
 }
 
@@ -88,6 +121,45 @@ const INDEX_EXPIRY_SECONDS: u64 = 5 * 60; // how long a fetch of the remote inde
 pub const DEFAULT_FETCH_RETRIES: u32 = 3;
 /// First retry delay; doubles with each subsequent retry.
 const FETCH_BACKOFF_BASE: Duration = Duration::from_millis(500);
+
+/// The retry policy, in one place: `once` is tried until it succeeds, fails
+/// in a way `is_transient` does not cover, or has failed `retries` more
+/// times than the first attempt, with the bounded exponential backoff
+/// (`FETCH_BACKOFF_BASE` doubling per attempt) between tries. `what` names
+/// the object in the log. The caller decides what a spent retry budget
+/// means (the index reports `Unavailable`; an artifact surfaces the error).
+async fn retrying_transient<T, E, Fut>(
+    what: &str,
+    retries: u32,
+    is_transient: impl Fn(&E) -> bool,
+    mut once: impl FnMut() -> Fut,
+) -> Result<T, E>
+where
+    E: std::fmt::Display,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match once().await {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt <= retries && is_transient(&e) => {
+                let delay = FETCH_BACKOFF_BASE * 2u32.pow(attempt - 1);
+                tracing::warn!(
+                    "fetching {what} failed (attempt {attempt} of {}): {e}; retrying in {delay:?}",
+                    retries + 1,
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(e) => {
+                if attempt > 1 {
+                    tracing::warn!("fetching {what} failed after {attempt} attempts: {e}");
+                }
+                return Err(e);
+            }
+        }
+    }
+}
 
 /// Which index object a [`RemoteCache`] reader loads. The choice is made by
 /// the caller (see `mfile::File::cache_config`); this layer only executes it.
@@ -489,7 +561,9 @@ impl RemoteCache<AnyBackend> {
 
 impl<B: FetchBackend> RemoteCache<B> {
     /// Creates a new remote cache based on the given backend and URL, loading
-    /// the index object selected by `source`.
+    /// the index object selected by `source`. Transient fetch failures are
+    /// retried with the same bounded exponential backoff as
+    /// [`Self::materialize`] before surfacing as [`Error::Unavailable`].
     pub async fn new(
         backend: B,
         url: B::Url,
@@ -561,9 +635,68 @@ impl<B: FetchBackend> RemoteCache<B> {
         }
 
         let fetch_start = Instant::now();
-        let index_req = backend.get(url.join(source.object()).unwrap())?;
-
         let fetch_op = OpTracker::new_with_root(&ot).with_op(Operation::FetchIndex);
+        // Boxed: this retry loop adds one more layer to the future of every
+        // command that opens the cache, and inlined it tips `min`'s command
+        // dispatch over rustc's query depth limit (128) when the layout of
+        // that future is computed (`cmd/mod.rs`, the `run_command` box).
+        // Pinned on the heap, the loop's state is a pointer in the caller's
+        // state, and the depth stops here.
+        let (index, gcs_generation) = Box::pin(async {
+            let fetched = retrying_transient(
+                source.object(),
+                DEFAULT_FETCH_RETRIES,
+                Self::is_transient,
+                || Self::fetch_index_once(&backend, &url, &source, index_dir.as_deref(), &fetch_op),
+            )
+            .await;
+            match fetched {
+                Ok(pair) => Ok(pair),
+                // The same class of failure artifact downloads already
+                // survive: report it in terms of what was fetched, not
+                // the raw transport error.
+                Err(e) if Self::is_transient(&e) => {
+                    let status = match &e {
+                        Error::Fetch { status } => Some(*status),
+                        _ => None,
+                    };
+                    Err(Error::Unavailable {
+                        object: source.object().to_string(),
+                        status,
+                    })
+                }
+                Err(e) => Err(e),
+            }
+        })
+        .await?;
+        tracing::debug!(
+            "Fetched remote-index in {}ms",
+            fetch_start.elapsed().as_millis()
+        );
+
+        Ok(Self {
+            backend,
+            index,
+            dir: index_dir,
+            base: url,
+            ot,
+            gcs_generation,
+            fetch_retries: DEFAULT_FETCH_RETRIES,
+        })
+    }
+
+    /// One attempt at fetching and parsing the index object selected by
+    /// `source`. Retry policy lives in [`Self::new`].
+    async fn fetch_index_once(
+        backend: &B,
+        url: &B::Url,
+        source: &IndexSource,
+        index_dir: Option<&std::path::Path>,
+        fetch_op: &OpTracker,
+    ) -> Result<(IndexFile, Option<i64>), Error<<B::Response as FetchResponse>::Error>> {
+        let index_req = backend
+            .get(url.join(source.object()).unwrap())
+            .map_err(Error::Request)?;
 
         // TODO: Gotta be a better way to stream it into [IndexFile].
         let mut index_resp = backend.execute(index_req).await?;
@@ -573,11 +706,11 @@ impl<B: FetchBackend> RemoteCache<B> {
         // compare-and-swap against the root index object, so a snapshot's
         // generation must never seed that path: None forces into_writer
         // to refetch the root.
-        let gcs_generation = match &source {
+        let gcs_generation = match source {
             IndexSource::Root => index_resp.generation(),
             IndexSource::Snapshot { .. } => None,
         };
-        let index = match (index_resp.status_code(), &source) {
+        let index = match (index_resp.status_code(), source) {
             (404, IndexSource::Root) => IndexFile::default(),
             (404, IndexSource::Snapshot { object }) => {
                 return Err(Error::SnapshotMissing {
@@ -588,10 +721,7 @@ impl<B: FetchBackend> RemoteCache<B> {
             // an error page is not an index, and an empty error body would
             // "parse" as an empty index, masking the outage.
             (status, _) if !index_resp.is_success() => {
-                return Err(match index_resp.error_for_status() {
-                    Err(e) => Error::Backend(e),
-                    Ok(_) => Error::Fetch { status },
-                });
+                return Err(Error::Fetch { status });
             }
             _ => {
                 // Progress total only; a plain-HTTPS backend may omit
@@ -611,8 +741,12 @@ impl<B: FetchBackend> RemoteCache<B> {
                 // mid-record as a shorter index — which the local write below
                 // would then launder into a well-formed (but incomplete) copy.
                 if !(buffer.len() as u64).is_multiple_of(crate::index_file::WIRE_RECORD_LEN) {
+                    // A body that ends mid-record is a cut-off response, the
+                    // same class of failure as a transport error: it is
+                    // `UnexpectedEof`, which the retry loop treats as
+                    // transient, not the `InvalidData` a malformed index is.
                     return Err(Error::IO(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
+                        std::io::ErrorKind::UnexpectedEof,
                         "fetched index length is not a whole number of records",
                     )));
                 }
@@ -621,7 +755,7 @@ impl<B: FetchBackend> RemoteCache<B> {
 
                 // Best-effort local caching, via temp file + rename so a crash
                 // or concurrent reader never observes a partial file.
-                if let Some(index_dir) = index_dir.as_ref() {
+                if let Some(index_dir) = index_dir {
                     let write_atomic = || -> std::io::Result<()> {
                         let mut tmp = tempfile::NamedTempFile::new_in(index_dir)?;
                         index.write_to(tmp.as_file_mut())?;
@@ -636,20 +770,7 @@ impl<B: FetchBackend> RemoteCache<B> {
                 index
             }
         };
-        tracing::debug!(
-            "Fetched remote-index in {}ms",
-            fetch_start.elapsed().as_millis()
-        );
-
-        Ok(Self {
-            backend,
-            index,
-            dir: index_dir,
-            base: url,
-            ot,
-            gcs_generation,
-            fetch_retries: DEFAULT_FETCH_RETRIES,
-        })
+        Ok((index, gcs_generation))
     }
 
     /// Sets how many times a transient artifact-fetch failure (transport
@@ -679,20 +800,43 @@ impl<B: FetchBackend> RemoteCache<B> {
         sha256: [u8; 32],
         op: &OpTracker,
     ) -> Result<std::fs::File, Error<<B::Response as FetchResponse>::Error>> {
-        let req = self.backend.get(
-            self.base
-                .join(&format!("{}.zst", hex::encode(sha256)))
-                .unwrap(),
-        )?;
+        let req = self
+            .backend
+            .get(
+                self.base
+                    .join(&format!("{}.zst", hex::encode(sha256)))
+                    .unwrap(),
+            )
+            .map_err(Error::Request)?;
 
         let mut resp = self.backend.execute(req).await?;
+        // An index hit whose object is gone (inbox#535): the index said the
+        // artifact exists and the store says it does not. That is a normal
+        // state of this architecture, not an outage: a snapshot index keeps
+        // every record forever, and the store's retention deletes cold
+        // objects out from under them. It is a miss, reported as one, and
+        // not retried; the warning is the divergence signal an operator
+        // watches, since a burst of it against the root index means someone
+        // deleted objects the root still names.
+        if resp.status_code() == 404 {
+            let object = format!("{}.zst", hex::encode(sha256));
+            tracing::warn!(
+                kind = "dangling_hit",
+                object = %object,
+                "the remote cache lists an artifact the store no longer has; it is a miss"
+            );
+            return Err(Error::NotFound {
+                what: "artifact file",
+                object,
+            });
+        }
         // An error status must not reach the hasher: an error page is not an
         // artifact, and hashing it reports corruption where there is none.
+        // Classified as the index path classifies it: `Fetch { status }`, so
+        // `is_transient` retries a 5xx and leaves a 4xx alone on both paths.
         if !resp.is_success() {
-            let status = resp.status_code();
-            return Err(match resp.error_for_status() {
-                Err(e) => Error::Backend(e),
-                Ok(_) => Error::Fetch { status },
+            return Err(Error::Fetch {
+                status: resp.status_code(),
             });
         }
         // Progress total only; tolerate a missing Content-Length (see above).
@@ -717,17 +861,25 @@ impl<B: FetchBackend> RemoteCache<B> {
         Ok(tar_file)
     }
 
-    /// Failures worth retrying: transport errors, error statuses, and hash
-    /// mismatches. A mismatch on a 200 is deliberately transient: the
-    /// observed mirror failure mode is a complete response carrying wrong
-    /// bytes, gone on refetch. Persistent corruption pays the backoff and
-    /// then surfaces as the same loud HashMismatch. Local I/O errors and a
-    /// spec absent from the index are not retried.
+    /// Whether a fetch failure is worth another try. Retried: a transport
+    /// failure (`Backend`, from sending the request or reading the response),
+    /// a status the remote may well answer differently next time (`Fetch`
+    /// with a 5xx or 429), and a hash mismatch on a 200, which is the
+    /// observed mirror failure mode (a complete response with wrong bytes,
+    /// gone on refetch; persistent corruption pays the backoff and then
+    /// surfaces as the same loud `HashMismatch`). Not retried: a request that
+    /// could not be built (`Request`), a 4xx, which is an answer and comes
+    /// back the same way every time, local I/O errors, and a spec or snapshot
+    /// the index does not have. Both the index path and the artifact path
+    /// classify an error status as `Fetch { status }`, so the rule is one.
     fn is_transient(e: &Error<<B::Response as FetchResponse>::Error>) -> bool {
-        matches!(
-            e,
-            Error::Backend(_) | Error::Fetch { .. } | Error::HashMismatch { .. }
-        )
+        match e {
+            Error::Backend(_) | Error::HashMismatch { .. } => true,
+            Error::Fetch { status } => *status >= 500 || *status == 429,
+            // A response cut off mid-record (the whole-record check above).
+            Error::IO(e) => e.kind() == std::io::ErrorKind::UnexpectedEof,
+            _ => false,
+        }
     }
 
     /// Download the given spec hash into the local cache. Transient fetch
@@ -740,30 +892,26 @@ impl<B: FetchBackend> RemoteCache<B> {
         cache: &Cache<LocalDir>,
         span_name: &str,
     ) -> Result<(Duration, PendingDir), Error<<B::Response as FetchResponse>::Error>> {
-        let sha256: [u8; 32] = self.index.sha256(spec_hash).ok_or(Error::NotFound)?;
+        let sha256: [u8; 32] = self
+            .index
+            .sha256(spec_hash)
+            .ok_or_else(|| Error::NotFound {
+                what: "spec hash",
+                object: spec_hash.0.to_hex().to_string(),
+            })?;
 
         let materialize_op = OpTracker::new_with_root(&self.ot).with_op(Operation::FetchPkg {
             name: span_name.to_string(),
         });
 
         let start = Instant::now();
-        let mut attempt = 0u32;
-        let mut tar_file = loop {
-            attempt += 1;
-            match self.fetch_verified(sha256, &materialize_op).await {
-                Ok(f) => break f,
-                Err(e) if attempt <= self.fetch_retries && Self::is_transient(&e) => {
-                    let delay = FETCH_BACKOFF_BASE * 2u32.pow(attempt - 1);
-                    tracing::warn!(
-                        "fetching {} failed (attempt {attempt} of {}): {e}; retrying in {delay:?}",
-                        hex::encode(sha256),
-                        self.fetch_retries + 1,
-                    );
-                    tokio::time::sleep(delay).await;
-                }
-                Err(e) => return Err(e),
-            }
-        };
+        let mut tar_file = retrying_transient(
+            &hex::encode(sha256),
+            self.fetch_retries,
+            Self::is_transient,
+            || self.fetch_verified(sha256, &materialize_op),
+        )
+        .await?;
 
         tar_file
             .seek(std::io::SeekFrom::Start(0))
@@ -1371,9 +1519,12 @@ mod tests {
         let err = RemoteCache::new_any_https(&base, None, None, source)
             .await
             .unwrap_err();
+        // A cut-off body is a transient failure: it is retried like a
+        // transport error, and when every attempt comes back cut off the
+        // index is reported unavailable, never accepted as a shorter one.
         assert!(
-            matches!(&err, Error::IO(e) if e.kind() == std::io::ErrorKind::InvalidData),
-            "expected InvalidData, got {err:?}"
+            matches!(&err, Error::Unavailable { status: None, .. }),
+            "expected Unavailable after retries, got {err:?}"
         );
     }
 
@@ -1401,9 +1552,160 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, Error::Backend(_)),
-            "expected Backend error, got {err:?}"
+            matches!(
+                &err,
+                Error::Unavailable {
+                    object,
+                    status: Some(500),
+                } if object == INDEX_FILENAME
+            ),
+            "expected Unavailable(500), got {err:?}"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn index_fetch_retries_transient_5xx_then_succeeds() {
+        let spec_hash = SpecHash::from_bytes([0x07; 32]);
+        let sha256: [u8; 32] = [0x42; 32];
+        let mut responses = std::collections::HashMap::new();
+        responses.insert(
+            format!("mock://cache/{INDEX_FILENAME}"),
+            index_bytes_for(&spec_hash, sha256),
+        );
+        // One 500, then the script empties and the good static copy serves.
+        let backend = MockBackend::new(responses).script(
+            &format!("mock://cache/{INDEX_FILENAME}"),
+            vec![(500, b"error page".to_vec())],
+        );
+        let calls = backend.calls.clone();
+
+        let rc = RemoteCache::new(
+            backend,
+            MockUrl("mock://cache".to_string()),
+            None,
+            None,
+            IndexSource::Root,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rc.sha256(&spec_hash), Some(sha256));
+        // 500 then 200: the outage was ridden out, not surfaced.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn index_fetch_exhausts_retries_with_clear_error() {
+        let (spec_hash, sha256) = (SpecHash::from_bytes([0x07; 32]), [0x42; 32]);
+        let mut responses = std::collections::HashMap::new();
+        responses.insert(
+            format!("mock://cache/{INDEX_FILENAME}"),
+            index_bytes_for(&spec_hash, sha256),
+        );
+        // More scripted 500s than attempts: retries must run out, not loop.
+        let backend = MockBackend::new(responses).script(
+            &format!("mock://cache/{INDEX_FILENAME}"),
+            vec![
+                (500, b"error page".to_vec()),
+                (500, b"error page".to_vec()),
+                (500, b"error page".to_vec()),
+                (500, b"error page".to_vec()),
+            ],
+        );
+        let calls = backend.calls.clone();
+
+        let err = RemoteCache::new(
+            backend,
+            MockUrl("mock://cache".to_string()),
+            None,
+            None,
+            IndexSource::Root,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::Unavailable {
+                    object,
+                    status: Some(500),
+                } if object == INDEX_FILENAME
+            ),
+            "expected Unavailable(500), got {err:?}"
+        );
+        // Initial attempt + DEFAULT_FETCH_RETRIES retries.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    /// A 4xx is the remote's answer, not an outage: one call, no backoff, and
+    /// the status itself surfaces rather than "try again shortly".
+    #[tokio::test(start_paused = true)]
+    async fn index_fetch_4xx_is_not_retried() {
+        let (spec_hash, sha256) = (SpecHash::from_bytes([0x07; 32]), [0x42; 32]);
+        let mut responses = std::collections::HashMap::new();
+        responses.insert(
+            format!("mock://cache/{INDEX_FILENAME}"),
+            index_bytes_for(&spec_hash, sha256),
+        );
+        let backend = MockBackend::new(responses).script(
+            &format!("mock://cache/{INDEX_FILENAME}"),
+            vec![(403, b"forbidden".to_vec()), (403, b"forbidden".to_vec())],
+        );
+        let calls = backend.calls.clone();
+
+        let err = RemoteCache::new(
+            backend,
+            MockUrl("mock://cache".to_string()),
+            None,
+            None,
+            IndexSource::Root,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::Fetch { status: 403 }),
+            "expected Fetch(403), got {err:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a refusal is not retried"
+        );
+    }
+
+    /// inbox#535: an index hit whose artifact object is gone is a miss, not a
+    /// failure: `NotFound`, after one attempt, so the caller falls back to a
+    /// local build the way it does for a spec the index never had.
+    #[tokio::test(start_paused = true)]
+    async fn materialize_dangling_index_hit_is_a_miss() {
+        let (spec_hash, art_url, responses) = artifact_fixture();
+        let backend = MockBackend::new(responses).script(
+            &art_url,
+            vec![(404, b"gone".to_vec()), (404, b"gone".to_vec())],
+        );
+        let calls = backend.calls.clone();
+        let rc = RemoteCache::new(
+            backend,
+            MockUrl("mock://cache".to_string()),
+            None,
+            None,
+            IndexSource::Root,
+        )
+        .await
+        .unwrap();
+        assert!(rc.exists(&spec_hash), "the index names it: a hit");
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = lcache::Cache::at_dir(tmp.path()).unwrap();
+
+        let err = rc
+            .materialize(&spec_hash, &cache, "dangling")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::NotFound { .. }),
+            "a dangling hit is a miss, got {err:?}"
+        );
+        // The index fetch, then one artifact attempt: a gone object is not retried.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -1575,7 +1877,7 @@ mod tests {
             .materialize(&SpecHash::from_bytes([0x11; 32]), &cache, "absent")
             .await
             .unwrap_err();
-        assert!(matches!(err, Error::NotFound), "got {err:?}");
+        assert!(matches!(err, Error::NotFound { .. }), "got {err:?}");
         // Only the index fetch: an absent spec is deterministic, no attempts.
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }

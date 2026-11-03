@@ -407,8 +407,8 @@ impl Drop for SwitchRelay {
 /// daemon's own relay passes its own address. `subnet` is the switch's subnet —
 /// the subnet gvproxy was configured with — from which a gated relay derives
 /// the resolver address its egress carve-out is keyed to (NET-079) and the
-/// deprecated host-alias literal it notices (NET-004); the daemon relay ignores
-/// it.
+/// host alias it decides the deprecated literal as (NET-004); the daemon relay
+/// ignores it.
 ///
 /// Spawns the relay's two background tasks — tap→switch and switch→tap — and
 /// returns a [`SwitchRelay`] handle whose lifetime keeps the attachment alive.
@@ -600,13 +600,25 @@ fn node_dns_layer(subnet: SwitchSubnet, lease: Ipv4Addr) -> DnsGate {
         "node",
         None,
         compiled_egress(None, subnet, lease, None),
-        egress::InfrastructureDenySet::new(
-            subnet.dns_server().octets(),
-            subnet.host_alias().octets(),
-        ),
+        infrastructure_deny_set(subnet),
         subnet.host_alias().octets(),
         Arc::new(PolicyWarnLimiter::new()),
     )
+}
+
+/// The rebinding deny set for one switch: its resolver and host alias, and
+/// on a carved switch the documented host literal too. That switch maps the
+/// literal to the host loopback, so the literal is one of its own addresses
+/// and the set always refuses it, like the alias.
+fn infrastructure_deny_set(subnet: SwitchSubnet) -> egress::InfrastructureDenySet {
+    let set = egress::InfrastructureDenySet::new(
+        subnet.dns_server().octets(),
+        subnet.host_alias().octets(),
+    );
+    match subnet.documented_host_literal() {
+        Some(literal) => set.with_host_literal(literal.octets()),
+        None => set,
+    }
 }
 
 /// The daemon's own relay, carrying the node's DNS layer
@@ -644,9 +656,10 @@ where
 /// `/connect`-upgraded switch stream split into `sock_rx`/`sock_tx`.
 ///
 /// `subnet` is the switch this relay is attached to — the subnet the switch was
-/// configured with — and a gated relay derives NET-004's deprecated host-alias
-/// literal from it, so the notice always watches the address this switch (and
-/// no other) NATs to the host's loopback. `lease` is the relay's lease on that
+/// configured with — and a gated relay decides NET-004's deprecated literal as
+/// that switch's own host alias when the switch maps it so, while the notice
+/// watches the literal alone, never the alias the name resolves to. `lease` is
+/// the relay's lease on that
 /// switch, the one source its frames may carry (NET-084), checked on the egress
 /// leg whatever the gate. Shared by the DM2 UDS path ([`attach_to_switch`]) and
 /// the DM1/3/4 vsock path ([`attach_to_switch_vsock`]); the relay loops are
@@ -899,10 +912,19 @@ where
         // deprecation is about the destination, not about whether the box's
         // policy admits it.
         if let Some(notice) = &notice
-            && is_legacy_host_literal(&buf[..n], notice.alias)
+            && is_legacy_host_literal(&buf[..n], notice.literal)
         {
             notice.emit();
         }
+        // NET-004: on a switch carved from the default block the literal is a
+        // second spelling of the switch's own alias, which the switch maps to
+        // the same host loopback. The verdict decides the literal as the alias
+        // it stands for, so the old spelling grants nothing the name does not.
+        let alias_summary = notice
+            .as_ref()
+            .and_then(|notice| notice.as_switch_alias(&buf[..n]))
+            .map(|frame| egress::summarize(&frame));
+        let verdict_summary = alias_summary.as_ref().unwrap_or(&summary);
         // BEP-018: UDP to port 443 that the box may not send is rejected
         // with an ICMP port unreachable written back into the box, never
         // dropped in silence, so a QUIC client falls back to TCP at once.
@@ -932,7 +954,7 @@ where
         // so the box cannot mint this admission.
         if let Some(gate) = &gate
             && !gate.reply_admits_frame(&buf[..n])
-            && let FrameVerdict::Drop(reason) = egress::verdict(&summary, &gate.egress)
+            && let FrameVerdict::Drop(reason) = egress::verdict(verdict_summary, &gate.egress)
         {
             // NET-066, with design §5.3's conntrack-aware retention: an
             // address the box resolved from a name its policy allowed is
@@ -955,14 +977,30 @@ where
                     gate.dns.admits_flow(dst, pkt.as_ref(), Instant::now())
                 });
             if !pinned {
-                gate.limiter.warn(
+                let remote = drop_remote(&summary);
+                let transport = drop_transport(&reason);
+                // The VM host daemon keeps its own record of the refused
+                // flow, outside the VM: reported only when the drop line
+                // fires, so under the same rate limit, never per frame.
+                if gate.limiter.warn(
                     &gate.label,
                     Direction::Egress,
-                    drop_remote(&summary),
-                    drop_transport(&reason),
+                    remote,
+                    transport,
                     None,
                     reason.rule(),
-                );
+                ) {
+                    let destination = match remote {
+                        Some(SocketAddr::V4(destination)) => Some(destination),
+                        _ => None,
+                    };
+                    crate::net::listeners::report_refused_egress(
+                        reject.lease,
+                        destination,
+                        &transport.to_string(),
+                        reason.rule(),
+                    );
+                }
                 continue;
             }
         }
@@ -1088,7 +1126,8 @@ pub(crate) const HOST_MIN_INTERNAL: &str = zone_answer::HOST_ROW_NAME;
 const LEGACY_HOST_RULE: &str = "legacy-host-literal";
 
 /// True when an Ethernet II frame is an IPv4 packet addressed to `alias` —
-/// NET-004's deprecated literal host address, default-deny on a box relay.
+/// NET-004's deprecated literal host address, decided as the switch's own
+/// host alias on a box relay.
 /// Any protocol counts: the notice is about the destination address, not the
 /// transport, and not the name the address was resolved from, which a frame
 /// does not carry.
@@ -1100,15 +1139,21 @@ fn is_legacy_host_literal(frame: &[u8], alias: Ipv4Addr) -> bool {
 }
 
 /// Emits NET-004's deprecation notice on the egress relay leg: when a session
-/// box sends frames to the literal host-alias address, the relay says so —
-/// rate-limited, naming the box and [`HOST_MIN_INTERNAL`] — instead of letting
-/// the verdict drop them silently.
+/// box sends frames to the documented literal host address, the relay says
+/// so — rate-limited, naming the box and [`HOST_MIN_INTERNAL`].
 struct LegacyHostNotice {
     /// The box's switch IP — the relay gate's label, the same identity the
     /// policy warnings name; logged here as `switch_addr`.
     label: String,
-    /// The literal address the notice watches for.
-    alias: Ipv4Addr,
+    /// The literal address the notice watches for: the documented
+    /// `100.64.255.254`, the default subnet's host alias, whatever switch the
+    /// relay is attached to.
+    literal: Ipv4Addr,
+    /// The attached switch's own host alias — what `host.min.internal`
+    /// resolves to there — when the switch maps the literal as a second
+    /// spelling of it ([`SwitchSubnet::documented_host_literal`]). `None` when
+    /// the literal is the switch's own alias, or the switch does not map it.
+    switch_alias: Option<Ipv4Addr>,
     /// The session gate's limiter, shared so one relay keeps one clock: its
     /// keys keep the notice's line independent of any policy warning's (the
     /// notice logs under its own rule key).
@@ -1118,15 +1163,36 @@ struct LegacyHostNotice {
 impl LegacyHostNotice {
     /// Builds the notice from the relay's session gate, which carries the
     /// box's session label, and the subnet of the switch the relay is attached
-    /// to, whose host alias is the deprecated literal — never a hardcoded
-    /// default, so a custom-subnet switch's literal is watched too. The gate's
-    /// limiter is shared, not the whole gate: the notice is egress-side.
+    /// to. The notice watches the documented literal, never the switch's own
+    /// alias: on a carved `/24` that alias is what `host.min.internal`
+    /// resolves to, and a frame to the supported name is not deprecated. The
+    /// gate's limiter is shared, not the whole gate: the notice is egress-side.
     fn for_gate(gate: &BoxGate, subnet: SwitchSubnet) -> Self {
+        let literal = super::DEFAULT_SUBNET.host_alias();
         Self {
             label: gate.label.clone(),
-            alias: subnet.host_alias(),
+            literal,
+            switch_alias: subnet
+                .documented_host_literal()
+                .map(|_| subnet.host_alias()),
             limiter: Arc::clone(&gate.limiter),
         }
+    }
+
+    /// A copy of `frame` addressed to the switch's own host alias, when the
+    /// frame goes to the literal and the switch maps the literal to that
+    /// alias: the frame the egress verdict decides in its place. `None`
+    /// otherwise, and the frame is decided as it is. Only the verdict reads
+    /// the copy, so its IPv4 checksum is left as it was.
+    fn as_switch_alias(&self, frame: &[u8]) -> Option<Vec<u8>> {
+        let alias = self.switch_alias?;
+        if !is_legacy_host_literal(frame, self.literal) {
+            return None;
+        }
+        let mut copy = frame.to_vec();
+        copy.get_mut(ETH_HDR + 16..ETH_HDR + 20)?
+            .copy_from_slice(&alias.octets());
+        Some(copy)
     }
 
     /// Logs the notice if the rate limiter allows. Returns whether it fired.
@@ -1137,9 +1203,9 @@ impl LegacyHostNotice {
         {
             return false;
         }
-        tracing::info!(
+        tracing::warn!(
             switch_addr = %self.label,
-            deprecated = %self.alias,
+            deprecated = %self.literal,
             replacement = HOST_MIN_INTERNAL,
             "connection to the deprecated literal host address; \
              use host.min.internal instead"
@@ -1466,6 +1532,17 @@ fn credential_module_hosts() -> Vec<&'static str> {
         .collect()
 }
 
+/// The names a `dns` or `both` box's lookups are steered for: the GitHub
+/// module's hosts, and the host of each store-rule upstream the box's
+/// policy carries (BEP-062).
+fn steered_hosts(policy: &boxes::BoxPolicy) -> Vec<&str> {
+    let mut hosts = credential_module_hosts();
+    if let Some(declaration) = policy.credentialed_upstream.as_ref() {
+        hosts.extend(declaration.store_upstream_hosts());
+    }
+    hosts
+}
+
 impl BoxGate {
     /// Builds a gate from a session's whole policy: the declared internal ports
     /// per transport (TCP and UDP separately) drive the inbound half, the
@@ -1516,10 +1593,7 @@ impl BoxGate {
         // with the DNS gate below — so a name's admission and a frame's
         // verdict can never disagree about what the box declared.
         let rules = compiled_egress(Some(policy), subnet, lease, hostname_proxy_port);
-        let infrastructure = egress::InfrastructureDenySet::new(
-            subnet.dns_server().octets(),
-            subnet.host_alias().octets(),
-        );
+        let infrastructure = infrastructure_deny_set(subnet);
         let limiter = Arc::new(PolicyWarnLimiter::new());
         // One DNS gate per box, sharing the limiter, the resolver address
         // the egress rules already resolved from `subnet` (NET-079's
@@ -1536,7 +1610,7 @@ impl BoxGate {
         )
         .with_steering(
             policy,
-            &credential_module_hosts(),
+            &steered_hosts(policy),
             subnet.box_egress_proxy_address(),
             listener,
         );
@@ -2163,6 +2237,31 @@ impl BoxGate {
         self.terminate_port(port)
     }
 
+    /// The TCP ports this gate admits because the box published them at
+    /// runtime: the listen-published ones (NET-016) and the explicitly
+    /// exposed ones (NET-044), without the declared set. The hostname
+    /// registry reads this when it resolves the box's name, so the proxy
+    /// forwards exactly the runtime ports a direct connection reaches
+    /// (NET-069, NET-071). A runtime port is the same number outside and
+    /// inside the box, so the set needs no translation.
+    pub(crate) fn runtime_published_tcp(&self) -> BTreeSet<u16> {
+        let mut ports: BTreeSet<u16> = self
+            .listen_published
+            .lock()
+            .expect("gate listen-published lock poisoned")
+            .iter()
+            .copied()
+            .collect();
+        ports.extend(
+            self.exposed
+                .lock()
+                .expect("gate exposed lock poisoned")
+                .iter()
+                .copied(),
+        );
+        ports
+    }
+
     /// Whether this gate admits a new inbound TCP connection to `port` —
     /// the declared ports (NET-121), the listen-published ones (NET-016)
     /// and the explicitly exposed ones (NET-044) together: the one
@@ -2775,9 +2874,12 @@ pub struct Refusal {
 ///
 /// The caller's declaration comes first, in the order a direct connection
 /// meets the two: its frame clears the caller's own egress gate before the
-/// target's ingress gate ever sees it (NET-070). The target's declaration is
-/// the port gate [`Route::upstream`](crate::net::dns::Route::upstream) already
-/// applies — a port its ingress does not publish routes nowhere.
+/// target's ingress gate ever sees it (NET-070). The target's half is the
+/// port gate [`Route::upstream`](crate::net::dns::Route::upstream) already
+/// applies over the target's published set: the declared ports and the ports
+/// it published at runtime ([`BoxGate::runtime_published_tcp`], read into
+/// the route when its name resolved). A port in neither routes nowhere, and
+/// is refused with the rule a direct connection's drop carries.
 #[must_use]
 pub fn proxied_request_verdict(
     caller: Option<&crate::net::dns::Caller>,
@@ -6445,9 +6547,9 @@ pub(crate) mod tests {
     /// a relay without a gate, notice nothing.
     #[test]
     fn legacy_host_literal_routes_with_deprecation() {
-        // The literal is the attached switch's host alias — the address its
-        // nat table routes to the host's loopback. Routing is the existing nat
-        // table's job; what is new is the notice.
+        // The literal is the default subnet's host alias — the address the
+        // default switch's nat table routes to the host's loopback, and the
+        // one a carved switch maps there beside its own alias.
         let alias = SwitchSubnet::default().host_alias();
         assert_eq!(alias, Ipv4Addr::new(100, 64, 255, 254));
 
@@ -6459,32 +6561,13 @@ pub(crate) mod tests {
             None,
         );
         let notice = LegacyHostNotice::for_gate(&gate, SwitchSubnet::default());
-        assert_eq!(notice.alias, alias, "the notice watches the switch's alias");
-
-        // The alias comes from the switch the relay is attached to, never a
-        // hardcoded default: a custom-subnet switch's literal is the one
-        // noticed, and the default alias is not.
-        let custom = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 24).unwrap();
-        let custom_notice = LegacyHostNotice::for_gate(
-            &BoxGate::for_session(
-                "10.0.0.9".into(),
-                Ipv4Addr::new(10, 0, 0, 9),
-                &boxes::BoxPolicy::default(),
-                custom,
-                None,
-            ),
-            custom,
+        assert_eq!(notice.literal, alias, "the notice watches the literal");
+        // On the default switch the literal is the switch's own alias, so the
+        // verdict decides the frame as it is.
+        assert_eq!(
+            notice.as_switch_alias(&udp_frame(SRC, 40000, alias, 53)),
+            None
         );
-        assert_eq!(custom_notice.alias, custom.host_alias());
-        assert_ne!(custom_notice.alias, alias);
-        assert!(is_legacy_host_literal(
-            &udp_frame(SRC, 40000, custom.host_alias(), 53),
-            custom_notice.alias
-        ));
-        assert!(!is_legacy_host_literal(
-            &udp_frame(SRC, 40000, alias, 53),
-            custom_notice.alias
-        ));
 
         // A frame to the literal is noticed; one to the gateway is not; a
         // truncated frame and a non-IPv4 ethertype are not.
@@ -6535,6 +6618,117 @@ pub(crate) mod tests {
         assert!(
             notice.emit(),
             "a policy warning must not suppress the deprecation notice"
+        );
+    }
+
+    /// NET-004 with §5.3: on a carved `/24` the documented literal is one of
+    /// the switch's own addresses, so the rebinding deny set refuses it, a
+    /// box-zone answer included. The default subnet's set is unchanged.
+    #[test]
+    fn rebinding_refuses_documented_literal_on_a_carved_switch() {
+        let literal = [100, 64, 255, 254];
+        let carved = SwitchSubnet::new(Ipv4Addr::new(100, 64, 3, 0), 24).unwrap();
+        let set = infrastructure_deny_set(carved);
+        assert_eq!(
+            egress::rebinding_admits(literal, true, None, None, &set),
+            Err(egress::RebindingRefusal::Infrastructure),
+            "a box-zone answer of the literal is refused on a carved switch"
+        );
+        // A sibling's lease on the same switch is still admitted.
+        egress::rebinding_admits([100, 64, 3, 9], true, None, None, &set).unwrap();
+        assert_eq!(
+            infrastructure_deny_set(SwitchSubnet::default()),
+            egress::InfrastructureDenySet::new(
+                SwitchSubnet::default().dns_server().octets(),
+                SwitchSubnet::default().host_alias().octets(),
+            ),
+        );
+    }
+
+    /// NET-004 on a `/24` switch carved from the default block: the notice
+    /// watches the documented literal, never the switch's own alias, which is
+    /// what `host.min.internal` resolves to there. A frame to the literal is
+    /// decided as a frame to that alias, so the egress verdict is the same for
+    /// both spellings. A switch outside the default block still notices the
+    /// literal, and does not decide it as its alias.
+    #[test]
+    fn relay_notices_documented_literal_not_the_switch_alias() {
+        let literal = Ipv4Addr::new(100, 64, 255, 254);
+        let carved = SwitchSubnet::new(Ipv4Addr::new(100, 64, 3, 0), 24).unwrap();
+        let switch_alias = carved.host_alias();
+        assert_eq!(switch_alias, Ipv4Addr::new(100, 64, 3, 254));
+        let lease = Ipv4Addr::new(100, 64, 3, 9);
+        let src = lease;
+
+        for policy in [
+            // Allow-all: box-to-host reach is still default-deny.
+            boxes::BoxPolicy::default(),
+            // Deny-all.
+            boxes::BoxPolicy {
+                egress: Some(boxes::EgressPolicy {
+                    allow_protocols: None,
+                    allow_subnets: None,
+                    allow_dns_hosts: None,
+                    deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+                }),
+                ingress: None,
+                credentialed_upstream: None,
+                quic443: None,
+            },
+        ] {
+            let gate = BoxGate::for_session(lease.to_string(), lease, &policy, carved, None);
+            let notice = LegacyHostNotice::for_gate(&gate, carved);
+            assert_eq!(notice.literal, literal);
+
+            // The supported name's address is never called deprecated.
+            assert!(!is_legacy_host_literal(
+                &udp_frame(src, 40000, switch_alias, 53),
+                notice.literal
+            ));
+            assert!(is_legacy_host_literal(
+                &udp_frame(src, 40000, literal, 53),
+                notice.literal
+            ));
+
+            // The verdict for the literal is the verdict for the alias.
+            for port in [22, 80, 8080] {
+                let to_literal = egress_tcp_frame(src, literal, port);
+                let to_alias = egress_tcp_frame(src, switch_alias, port);
+                let decided = notice
+                    .as_switch_alias(&to_literal)
+                    .expect("a carved switch decides the literal as its alias");
+                assert_eq!(&decided[30..34], &switch_alias.octets());
+                assert_eq!(
+                    egress::verdict(&egress::summarize(&decided), &gate.egress),
+                    egress::verdict(&egress::summarize(&to_alias), &gate.egress),
+                    "port {port}"
+                );
+                // A frame to the alias itself is decided as it is.
+                assert_eq!(notice.as_switch_alias(&to_alias), None);
+            }
+        }
+
+        // A switch outside the default block notices the same literal, and
+        // does not stand it for its own alias.
+        let custom = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 24).unwrap();
+        let notice = LegacyHostNotice::for_gate(
+            &BoxGate::for_session(
+                "10.0.0.9".into(),
+                Ipv4Addr::new(10, 0, 0, 9),
+                &boxes::BoxPolicy::default(),
+                custom,
+                None,
+            ),
+            custom,
+        );
+        assert_eq!(notice.literal, literal);
+        assert!(!is_legacy_host_literal(
+            &udp_frame(Ipv4Addr::new(10, 0, 0, 9), 40000, custom.host_alias(), 53),
+            notice.literal
+        ));
+        assert_eq!(
+            notice.as_switch_alias(&egress_tcp_frame(Ipv4Addr::new(10, 0, 0, 9), literal, 80)),
+            None
         );
     }
 
@@ -7401,6 +7595,7 @@ pub(crate) mod tests {
                         mode: None,
                     },
                 )]),
+                store_upstreams: Vec::new(),
             }),
             quic443: None,
         }
@@ -7838,6 +8033,159 @@ pub(crate) mod tests {
 
             crate::net::listeners::clear_vm_report_door_for_tests(&control_sock);
             door_task.abort();
+        }
+
+        /// BEP-062: a `dns`-steered box with a store reference, whose
+        /// policy carries its accepted rule's upstream, resolves that
+        /// upstream to the proxy's address while the proxy listens, and gets
+        /// SERVFAIL while it does not. A name no rule names is not steered.
+        #[tokio::test]
+        async fn store_authority_of_a_dns_box_resolves_to_the_proxy() {
+            let capture = crate::test_harness::captured_log();
+            let dir = tempfile::tempdir().expect("temp dir");
+            let control_sock = dir.path().join("gvproxy.sock");
+            let door = dir.path().join("guest-control.sock");
+            let listening = Arc::new(AtomicBool::new(false));
+            let door_task = proxy_door(&door, Arc::clone(&listening));
+            crate::net::listeners::seed_vm_report_door_for_tests(&control_sock, &door);
+
+            // The policy the create request carries for a box whose store
+            // reference a rule for `api.openai.com:443` accepted.
+            let mut policy = steered_policy();
+            if let Some(egress) = policy.egress.as_mut() {
+                egress
+                    .allow_dns_hosts
+                    .get_or_insert_with(Vec::new)
+                    .extend(["api.openai.com".to_string(), "example.com".to_string()]);
+            }
+            policy.credentialed_upstream = Some(boxes::CredentialedUpstream {
+                store_upstreams: vec!["api.openai.com:443".to_string()],
+                ..boxes::CredentialedUpstream::default()
+            });
+            let lease = Ipv4Addr::new(100, 64, 0, 21);
+            let gate = BoxGate::for_session_steered(
+                lease.to_string(),
+                lease,
+                &policy,
+                SwitchSubnet::default(),
+                None,
+                ProxyListenerState::for_switch(&ControlChannel::Unix(control_sock.clone())),
+            );
+
+            let reply = lookup_until(&gate, "api.openai.com.", ResponseCode::ServFail).await;
+            assert!(
+                addresses(&reply).is_empty(),
+                "SERVFAIL carries no address while the proxy is down"
+            );
+
+            listening.store(true, Ordering::Release);
+            let reply = lookup_until(&gate, "api.openai.com.", ResponseCode::NoError).await;
+            assert_eq!(
+                addresses(&reply),
+                vec![SwitchSubnet::default().box_egress_proxy_address()],
+                "the rule's upstream resolves to the proxy, never a real address"
+            );
+            let reply = lookup(&gate, "github.com.");
+            assert_eq!(
+                addresses(&reply),
+                vec![SwitchSubnet::default().box_egress_proxy_address()],
+                "the GitHub module's hosts stay steered beside the store upstream"
+            );
+            let query = crate::net::dns_gate::tests::dns_query("example.com.", RecordType::A);
+            let resolver = SocketAddrV4::new(SwitchSubnet::default().dns_server(), 53);
+            assert!(
+                gate.dns.intercept_query(&resolver, &query).is_none(),
+                "a name no rule names is forwarded, not steered"
+            );
+            let logged = capture.contents();
+            for expected in ["name=api.openai.com", "session_id=100.64.0.21"] {
+                assert!(
+                    logged.contains(expected),
+                    "the log carries {expected:?}: {logged}"
+                );
+            }
+
+            listening.store(false, Ordering::Release);
+            lookup_until(&gate, "api.openai.com.", ResponseCode::ServFail).await;
+
+            crate::net::listeners::clear_vm_report_door_for_tests(&control_sock);
+            door_task.abort();
+        }
+
+        /// BEP-062: a GitHub grant box with `steering = "dns"` or `"both"`,
+        /// its gate built as the VM host's attach builds it. While the
+        /// host reports the proxy's listener live, github.com resolves to
+        /// the proxy's address on the switch. While it is down, the lookup
+        /// is SERVFAIL. It never carries a real address.
+        #[tokio::test]
+        async fn a_dns_steered_grant_box_resolves_the_module_through_the_switch() {
+            use boxes::core::bep::{BepSettings, GrantSource};
+            for (index, steering) in [Steering::Dns, Steering::Both].into_iter().enumerate() {
+                let dir = tempfile::tempdir().expect("temp dir");
+                let control_sock = dir.path().join("gvproxy.sock");
+                let door = dir.path().join("guest-control.sock");
+                let listening = Arc::new(AtomicBool::new(false));
+                let door_task = proxy_door(&door, Arc::clone(&listening));
+                crate::net::listeners::seed_vm_report_door_for_tests(&control_sock, &door);
+
+                // The policy the create request carries for a box whose
+                // `minimal.toml` declares a broker GitHub grant.
+                let mut policy = steered_policy();
+                policy.credentialed_upstream = Some(boxes::CredentialedUpstream {
+                    bep: BepSettings {
+                        steering: Some(steering),
+                        ..BepSettings::default()
+                    },
+                    secrets: [(
+                        "GH_TOKEN".to_string(),
+                        SecretGrant {
+                            source: GrantSource::Broker,
+                            scopes: vec!["github:user-token".to_string()],
+                            mode: None,
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                    store_upstreams: Vec::new(),
+                });
+                let lease = Ipv4Addr::new(100, 64, 0, 30 + u8::try_from(index).expect("small"));
+                // The attach's own construction (`gvproxy_network.rs`).
+                let gate = BoxGate::for_session_steered(
+                    lease.to_string(),
+                    lease,
+                    &policy,
+                    SwitchSubnet::default(),
+                    None,
+                    ProxyListenerState::for_switch(&ControlChannel::Unix(control_sock.clone())),
+                );
+                let proxy = SwitchSubnet::default().box_egress_proxy_address();
+
+                let down = lookup_until(&gate, "github.com.", ResponseCode::ServFail).await;
+                assert!(
+                    addresses(&down).is_empty(),
+                    "{steering:?}: no address while down"
+                );
+
+                listening.store(true, Ordering::Release);
+                for name in ["github.com.", "api.github.com."] {
+                    let live = lookup_until(&gate, name, ResponseCode::NoError).await;
+                    assert_eq!(
+                        addresses(&live),
+                        vec![proxy],
+                        "{steering:?}: {name} resolves to the proxy, never a real address"
+                    );
+                }
+
+                listening.store(false, Ordering::Release);
+                let down = lookup_until(&gate, "github.com.", ResponseCode::ServFail).await;
+                assert!(
+                    addresses(&down).is_empty(),
+                    "{steering:?}: fails closed again"
+                );
+
+                crate::net::listeners::clear_vm_report_door_for_tests(&control_sock);
+                door_task.abort();
+            }
         }
 
         /// BEP-062: a native host runs no proxy and has no VM host daemon to

@@ -72,6 +72,22 @@
 //! queries REFUSED first, as the precision copy honest clients meet; this
 //! is the deciding copy, outside the VM.
 //!
+//! ## The node plane's own lookups (NET-130, NET-085)
+//!
+//! The node-plane baseline set names the registry and the cache by host
+//! name ([`crate::net::baseline`]), and a name is not an address. So the
+//! table holds one more entry, for the in-VM daemon's own address, once the
+//! gate adopts an in-force baseline ([`DnsPins::adopt_baseline`]): its names
+//! are the baseline's named endpoints, and each answer the node plane's own
+//! lookups receive for one of them pins against that entry, under the same
+//! three reply conditions, the same window, the same per-name cap and the
+//! same flow retention a box's pins hold. The answers pass the same
+//! rebinding intersection, with the baseline's subnet endpoints as the
+//! allowance, so an answer inside the host or the fabric never pins. Every
+//! pin and every re-pin says so at `info`, naming the entry, the addresses
+//! and the lookup's source. The node entry is the node's for the VM's
+//! lifetime: no relay retires the node's address.
+//!
 //! ## Lifetime
 //!
 //! An entry is born from its row, keyed by the row's switch address, and
@@ -112,6 +128,7 @@ use hickory_proto::rr::{Name, RData, RecordType};
 use switch::SwitchSubnet;
 
 use crate::box_registry::{BoxRecord, BoxTable};
+use crate::net::baseline::{BaselineCategory, BaselineEntry, NodeBaselinePhase, NodePlaneBaseline};
 use crate::net::drop_limiter::DropLimiter;
 
 /// Ethernet II header length: destination MAC (6) + source MAC (6) +
@@ -403,6 +420,53 @@ struct QueryKey {
     name: String,
 }
 
+/// The node plane's grant, adopted from an in-force baseline: the names its
+/// own lookups may pin, each with the baseline entries that name it, and the
+/// subnet endpoints the rebinding intersection reads as the allowance.
+/// Carried behind an `Arc` so the node's entry can prove it was built from
+/// the grant the table holds now ([`DnsPins::adopt_baseline`]).
+struct NodePlaneNames {
+    /// The in-VM daemon's own address: the one row this grant applies to.
+    node_addr: [u8; 4],
+    /// The baseline's named endpoints, normalized, each with the categories
+    /// that name it.
+    names: HashMap<String, Vec<BaselineCategory>>,
+    /// The baseline's subnet endpoints: the allowance an answer inside
+    /// private space must fall in to pin.
+    allow: Vec<egress::Ipv4Cidr>,
+    /// The entries the grant was adopted from, compared at each adoption so
+    /// an unchanged baseline keeps the node's pins.
+    entries: Vec<BaselineEntry>,
+}
+
+impl NodePlaneNames {
+    /// The grant an in-force baseline gives the node plane's own lookups.
+    fn of(baseline: &NodePlaneBaseline) -> Self {
+        Self {
+            node_addr: baseline.node_addr(),
+            names: baseline.named_endpoints().into_iter().collect(),
+            allow: baseline
+                .rules()
+                .allow_subnets()
+                .map(<[egress::Ipv4Cidr]>::to_vec)
+                .unwrap_or_default(),
+            entries: baseline.entries().to_vec(),
+        }
+    }
+
+    /// The entries that name `name`, as the pin line spells them
+    /// (`registry,cache`), or `None` for a name no entry names.
+    fn entries_naming(&self, name: &str) -> Option<String> {
+        self.names.get(name).map(|categories| {
+            categories
+                .iter()
+                .map(|category| category.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+    }
+}
+
 /// One box's host-side admission state, built from its row and keyed by the
 /// row's switch address: the names the row declared (normalized to the form
 /// DNS names are matched in), the infrastructure deny set its answers are
@@ -442,6 +506,12 @@ struct BoxPins {
     /// admitted it — the per-name cap counts by owner — and the instant its
     /// window ends.
     admitted: Mutex<HashMap<[u8; 4], Admission>>,
+    /// The node plane's grant, for the entry built for the in-VM daemon's
+    /// own row once the gate adopted an in-force baseline: its names join
+    /// [`Self::names`], its subnets are the rebinding allowance, and every
+    /// pin it takes is logged against the entry that named it. `None` for
+    /// every box's entry.
+    node_plane: Option<Arc<NodePlaneNames>>,
     /// The box's flow table: the flows it opened through a pin — established
     /// while the window held, retained past it until the flow ends, each
     /// with the instant its last frame rode it (the idle bound's clock) —
@@ -487,13 +557,26 @@ impl BoxPins {
     /// Builds one box's admission state from its row and the switch's
     /// address plan — the names the row declared, the infrastructure set the
     /// intersection subtracts, and the tables the replies fill.
-    fn built(record: &Arc<BoxRecord>, subnet: SwitchSubnet) -> Self {
+    ///
+    /// `node_plane` is the node plane's grant when `record` is the in-VM
+    /// daemon's own row and the gate adopted an in-force baseline: its names
+    /// join the row's own.
+    fn built(
+        record: &Arc<BoxRecord>,
+        subnet: SwitchSubnet,
+        node_plane: Option<Arc<NodePlaneNames>>,
+    ) -> Self {
         Self {
             record: Arc::clone(record),
             names: record
                 .allow_dns_hosts()
                 .iter()
                 .map(|host| normalized(host))
+                .chain(
+                    node_plane
+                        .iter()
+                        .flat_map(|grant| grant.names.keys().cloned()),
+                )
                 .collect(),
             infrastructure: InfrastructureDenySet::new(
                 record.egress().resolver(),
@@ -501,6 +584,7 @@ impl BoxPins {
             ),
             outstanding: Mutex::new(HashMap::new()),
             admitted: Mutex::new(HashMap::new()),
+            node_plane,
             flows: Mutex::new(FlowTable::new()),
             at_cap_admitted: AtomicU64::new(0),
             sweeps: AtomicU64::new(0),
@@ -696,10 +780,17 @@ impl BoxPins {
         // carve-out — an ordinary name is the only kind that can pin here —
         // so the same answer is refused like any other that resolved into
         // the plane, and the reach is the same: none.
+        // The node plane's own names are the baseline's grant, not the
+        // node row's: their allowance is the baseline's subnet endpoints, so
+        // an answer in private space pins only where an entry names it.
+        let allow = match &self.node_plane {
+            Some(grant) if grant.names.contains_key(&asked) => Some(grant.allow.as_slice()),
+            _ => self.record.egress().allow_subnets(),
+        };
         let split = egress::rebinding_intersection(
             &answers,
             false,
-            self.record.egress().allow_subnets(),
+            allow,
             self.record.egress().deny_subnets(),
             &self.infrastructure,
         );
@@ -752,6 +843,7 @@ impl BoxPins {
             .filter(|admission| &*admission.name == name)
             .count();
         let mut admitted_now = Vec::new();
+        let mut refreshed = 0usize;
         let mut over_cap = Vec::new();
         for address in addresses {
             if let Some(existing) = admitted.get_mut(address) {
@@ -759,6 +851,7 @@ impl BoxPins {
                 // under whichever owner first admitted the address.
                 existing.expires = expires;
                 admitted_now.push(*address);
+                refreshed += 1;
                 continue;
             }
             if held >= DNS_MAX_ADDRESSES_PER_NAME {
@@ -796,6 +889,42 @@ impl BoxPins {
         if admitted_now.is_empty() {
             return;
         }
+        let addresses: Vec<Ipv4Addr> = admitted_now.iter().copied().map(Ipv4Addr::from).collect();
+        // The node plane's own lookup for a baseline entry: one line per pin
+        // and per re-pin, naming the entry, the addresses, the lookup's
+        // source and the resolver that answered it — the line a bundle's
+        // daemon log reads the node plane's reach by.
+        if let Some(entry) = self
+            .node_plane
+            .as_ref()
+            .and_then(|grant| grant.entries_naming(name))
+        {
+            let source = self.record.switch_addr();
+            let resolver = Ipv4Addr::from(self.record.egress().resolver());
+            let window_secs = DNS_ADMISSION_WINDOW.as_secs();
+            if refreshed == admitted_now.len() {
+                tracing::info!(
+                    entry = %entry,
+                    name,
+                    ?addresses,
+                    lookup_source = %source,
+                    resolver = %resolver,
+                    window_secs,
+                    "re-pinned a node-plane baseline entry's addresses from the node's own lookup"
+                );
+            } else {
+                tracing::info!(
+                    entry = %entry,
+                    name,
+                    ?addresses,
+                    lookup_source = %source,
+                    resolver = %resolver,
+                    window_secs,
+                    "pinned a node-plane baseline entry's addresses from the node's own lookup"
+                );
+            }
+            return;
+        }
         if !self.logged_first_pin.swap(true, Ordering::Relaxed) {
             tracing::info!(
                 switch_addr = %self.record.switch_addr(),
@@ -806,7 +935,6 @@ impl BoxPins {
                  lookups received"
             );
         }
-        let addresses: Vec<Ipv4Addr> = admitted_now.iter().copied().map(Ipv4Addr::from).collect();
         tracing::debug!(
             switch_addr = %self.record.switch_addr(),
             namespace = %self.record.name(),
@@ -984,6 +1112,18 @@ struct Inner {
     /// logged again. Cleared beside the entries at [`DnsPins::retire`],
     /// the same lifetime.
     refused: Mutex<HashMap<[u8; 4], Arc<BoxRecord>>>,
+    /// The node plane's grant, adopted from the gate's in-force baseline
+    /// ([`DnsPins::adopt_baseline`]): `None` until one is adopted, and
+    /// `None` again for an announced baseline, whose node row decides the
+    /// node plane instead.
+    node_plane: Mutex<Option<Arc<NodePlaneNames>>>,
+    /// The resident `host_ip` boxes' entry (NET-085): built from the
+    /// registry's record of their declared names
+    /// ([`BoxTable::host_ip_cohort`]), fed by the node address's own
+    /// lookups, and read only for a box-marked frame. Kept apart from the
+    /// node row's entry, so a pin a box's name took never admits the node
+    /// plane's own frames, and a baseline pin never admits a box's.
+    host_ip: Mutex<Option<Arc<BoxPins>>>,
     /// How many frames the gate admitted because a live pin named the
     /// destination (the observability counter: what the host-side decision
     /// passed).
@@ -1005,6 +1145,8 @@ impl DnsPins {
                 subnet,
                 boxes: Mutex::new(HashMap::new()),
                 refused: Mutex::new(HashMap::new()),
+                node_plane: Mutex::new(None),
+                host_ip: Mutex::new(None),
                 admitted_by_pin: AtomicU64::new(0),
                 refused_for_want_of_pin: AtomicU64::new(0),
             }),
@@ -1030,7 +1172,8 @@ impl DnsPins {
     /// make, and a forged reply wearing whatever address the row named
     /// would pin through it.
     fn entry(&self, record: &Arc<BoxRecord>) -> Option<Arc<BoxPins>> {
-        if record.allow_dns_hosts().is_empty() {
+        let node_plane = self.node_plane_of(record);
+        if record.allow_dns_hosts().is_empty() && node_plane.is_none() {
             return None;
         }
         let plan_resolver = self.inner.subnet.dns_server().octets();
@@ -1044,14 +1187,78 @@ impl DnsPins {
             .boxes
             .lock()
             .expect("the admission table's lock is held only across this lookup");
+        let same_grant = |entry: &BoxPins| match (&entry.node_plane, &node_plane) {
+            (None, None) => true,
+            (Some(held), Some(now)) => Arc::ptr_eq(held, now),
+            _ => false,
+        };
         match boxes.get(&key) {
-            Some(entry) if Arc::ptr_eq(&entry.record, record) => Some(Arc::clone(entry)),
+            Some(entry) if Arc::ptr_eq(&entry.record, record) && same_grant(entry) => {
+                Some(Arc::clone(entry))
+            }
             _ => {
-                let entry = Arc::new(BoxPins::built(record, self.inner.subnet));
+                let entry = Arc::new(BoxPins::built(record, self.inner.subnet, node_plane));
                 boxes.insert(key, Arc::clone(&entry));
                 Some(entry)
             }
         }
+    }
+
+    /// The node plane's grant for `record`: the adopted grant when `record`
+    /// is the in-VM daemon's own row, `None` for every other row.
+    fn node_plane_of(&self, record: &Arc<BoxRecord>) -> Option<Arc<NodePlaneNames>> {
+        self.inner
+            .node_plane
+            .lock()
+            .expect("the node-plane grant's lock is held only across this read")
+            .as_ref()
+            .filter(|grant| grant.node_addr == record.switch_addr().octets())
+            .map(Arc::clone)
+    }
+
+    /// Adopts the gate's node-plane baseline: in force, its named endpoints
+    /// become the names the node plane's own lookups pin against, each
+    /// against the entry that named it (NET-130); announced, the node plane
+    /// pins nothing, because its interim row decides it. An unchanged
+    /// baseline keeps the grant the node's pins were taken under, and a
+    /// changed one replaces it, so the node's next lookup starts a fresh
+    /// entry and no address an old entry named survives the change.
+    pub(crate) fn adopt_baseline(&self, baseline: &NodePlaneBaseline) {
+        let mut held = self
+            .inner
+            .node_plane
+            .lock()
+            .expect("the node-plane grant's lock is held only across this update");
+        if baseline.phase() != NodeBaselinePhase::InForce {
+            *held = None;
+            return;
+        }
+        if held.as_ref().is_some_and(|grant| {
+            grant.node_addr == baseline.node_addr() && grant.entries == baseline.entries()
+        }) {
+            return;
+        }
+        *held = Some(Arc::new(NodePlaneNames::of(baseline)));
+    }
+
+    /// The in-force arm's pin check for a frame from the in-VM daemon's own
+    /// address: whether a live pin the node plane's own lookups took for a
+    /// baseline entry names `dst`, or the flow such a pin established still
+    /// holds it. The baseline is adopted first, so the gate's decision and
+    /// the pins always read the same grant. A table with no node row pins
+    /// nothing for the node, and the frame is refused.
+    pub(crate) fn admits_node_frame(
+        &self,
+        table: &BoxTable,
+        baseline: &NodePlaneBaseline,
+        dst: [u8; 4],
+        pkt: Option<&L4Packet>,
+        now: Instant,
+    ) -> bool {
+        self.adopt_baseline(baseline);
+        table
+            .by_source(baseline.node_addr())
+            .is_some_and(|record| self.admits_frame(&record, dst, pkt, now))
     }
 
     /// Says a refused row's resolver mismatch, once per row: the row whose
@@ -1112,6 +1319,11 @@ impl DnsPins {
         if pkt.src.port() != DNS_PORT {
             return;
         }
+        if *pkt.dst.ip() == table.subnet().daemon_ip()
+            && let Some(entry) = self.host_ip_entry(table)
+        {
+            entry.observe(pkt, datagram, limiter, now);
+        }
         let Some(record) = table.by_source(pkt.dst.ip().octets()) else {
             return;
         };
@@ -1132,17 +1344,30 @@ impl DnsPins {
     /// leg keeps. A query over TCP is never recorded — the UDP datagram is
     /// the one DNS path v1 carries and the one a reply can pin by — and a
     /// query from a source no row holds records nothing either.
+    ///
+    /// `box_cohort_marked` is the query frame's own mark. A query from the
+    /// node address records into exactly one entry, so the name split
+    /// matches the address split (NET-085): a marked query into the
+    /// resident `host_ip` boxes' entry, and an unmarked one into the node
+    /// row's entry. A reply pins only in the entry that recorded its query.
     pub(crate) fn observe_query(
         &self,
         table: &BoxTable,
         pkt: &L4Packet,
         datagram: &[u8],
+        box_cohort_marked: bool,
         now: Instant,
     ) {
         if pkt.proto != IPPROTO_UDP
             || pkt.dst.port() != DNS_PORT
             || pkt.dst.ip().octets() != table.gateway()
         {
+            return;
+        }
+        if *pkt.src.ip() == table.subnet().daemon_ip() && box_cohort_marked {
+            if let Some(entry) = self.host_ip_entry(table) {
+                entry.record_query(pkt, datagram, now);
+            }
             return;
         }
         let Some(record) = table.by_source(pkt.src.ip().octets()) else {
@@ -1152,6 +1377,62 @@ impl DnsPins {
             return;
         };
         entry.record_query(pkt, datagram, now);
+    }
+
+    /// The resident `host_ip` boxes' entry, built from the registry's
+    /// record of their declared names on first sight and rebuilt when that
+    /// record changes: a box that leaves takes its names' pins with it.
+    /// `None` when no resident box declared a DNS host, or when the
+    /// record's resolver is not the plan's own.
+    fn host_ip_entry(&self, table: &BoxTable) -> Option<Arc<BoxPins>> {
+        let mut held = self
+            .inner
+            .host_ip
+            .lock()
+            .expect("the host_ip entry's lock is held only across this lookup");
+        let Some(record) = table.host_ip_cohort() else {
+            *held = None;
+            return None;
+        };
+        let plan_resolver = self.inner.subnet.dns_server().octets();
+        if record.egress().resolver() != plan_resolver {
+            *held = None;
+            drop(held);
+            self.refuse_resolver(&record, plan_resolver);
+            return None;
+        }
+        match held.as_ref() {
+            Some(entry) if Arc::ptr_eq(&entry.record, &record) => Some(Arc::clone(entry)),
+            _ => {
+                let entry = Arc::new(BoxPins::built(&record, self.inner.subnet, None));
+                *held = Some(Arc::clone(&entry));
+                Some(entry)
+            }
+        }
+    }
+
+    /// The pin arm for a box-marked frame from the node address (NET-085):
+    /// whether a live pin a resident `host_ip` box's declared name took
+    /// names `dst`, or the flow such a pin established still holds it.
+    /// Counted with every other pin decision.
+    pub(crate) fn admits_host_ip_frame(
+        &self,
+        table: &BoxTable,
+        dst: [u8; 4],
+        pkt: Option<&L4Packet>,
+        now: Instant,
+    ) -> bool {
+        let admitted = self
+            .host_ip_entry(table)
+            .is_some_and(|entry| entry.admits(dst, pkt, now));
+        if admitted {
+            self.inner.admitted_by_pin.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.inner
+                .refused_for_want_of_pin
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        admitted
     }
 
     /// The verdict's pin arm: whether the gate may lift the row's
@@ -1377,7 +1658,9 @@ pub(crate) mod tests {
     use std::time::{Duration, Instant};
 
     use boxes::EgressPolicy;
-    use boxes::core::egress::{DNS_ADMISSION_WINDOW, DNS_FLOW_IDLE_CAP, DNS_MAX_FLOWS_PER_BOX};
+    use boxes::core::egress::{
+        DNS_ADMISSION_WINDOW, DNS_FLOW_IDLE_CAP, DNS_MAX_ADDRESSES_PER_NAME, DNS_MAX_FLOWS_PER_BOX,
+    };
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
     use hickory_proto::rr::rdata::svcb::{IpHint, SvcParamKey, SvcParamValue};
     use hickory_proto::rr::rdata::{A, AAAA, CNAME, HTTPS, SVCB};
@@ -1386,6 +1669,7 @@ pub(crate) mod tests {
 
     use super::{DnsPins, IPPROTO_TCP, TCP_FIN, deny_all_refusal, udp_datagram};
     use crate::box_registry::{BoxRegistration, BoxRegistry, BoxTable};
+    use crate::net::baseline::{DAEMON_CACHE_ENDPOINT, NodePlaneBaseline};
     use crate::net::drop_limiter::DropLimiter;
 
     /// The address plan every registry below is built for — the same plan the
@@ -1585,6 +1869,19 @@ pub(crate) mod tests {
     /// sockets: from the box, on its lookup's own source port, to the plan's
     /// resolver, in the datagram shape the relay hands the table.
     fn lookup(pins: &DnsPins, table: &BoxTable, lease: [u8; 4], name: &str, now: Instant) {
+        lookup_marked(pins, table, lease, name, false, now);
+    }
+
+    /// [`lookup`] with the query frame's box-cohort mark spelled out: a
+    /// marked query from the node address is a resident `host_ip` box's.
+    fn lookup_marked(
+        pins: &DnsPins,
+        table: &BoxTable,
+        lease: [u8; 4],
+        name: &str,
+        marked: bool,
+        now: Instant,
+    ) {
         let query = udp_payload_frame(
             Ipv4Addr::from(lease),
             40000,
@@ -1594,7 +1891,7 @@ pub(crate) mod tests {
         );
         let (pkt, datagram) = udp_datagram(&query)
             .expect("the test's query frame parses as the egress leg parses it");
-        pins.observe_query(table, &pkt, datagram, now);
+        pins.observe_query(table, &pkt, datagram, marked, now);
     }
 
     /// Observes one reply the switch returned toward `lease`, answering
@@ -1670,6 +1967,368 @@ pub(crate) mod tests {
     ) {
         lookup(pins, table, lease, name, now);
         observe_datagram(pins, table, lease, reply, limiter, now);
+    }
+
+    /// Drives one of the node plane's own lookups — the in-VM daemon's query
+    /// from its own address to the plan's resolver, then the reply the
+    /// resolver returned toward it — through both legs of the table, after
+    /// adopting `baseline` the way the gate does at VM start.
+    pub(crate) fn node_resolves(
+        pins: &DnsPins,
+        table: &BoxTable,
+        baseline: &NodePlaneBaseline,
+        name: &str,
+        answers: &[Ipv4Addr],
+        now: Instant,
+    ) {
+        pins.adopt_baseline(baseline);
+        let node = baseline.node_addr();
+        lookup(pins, table, node, name, now);
+        observe(pins, table, node, name, answers, &DropLimiter::new(), now);
+    }
+
+    /// Drives one lookup a resident `host_ip` box makes from the node
+    /// address: the query leaves box-marked, and the reply returns to the
+    /// node address.
+    fn host_ip_resolves(
+        pins: &DnsPins,
+        table: &BoxTable,
+        name: &str,
+        answers: &[Ipv4Addr],
+        now: Instant,
+    ) {
+        let node = SUBNET.daemon_ip().octets();
+        lookup_marked(pins, table, node, name, true, now);
+        observe(pins, table, node, name, answers, &DropLimiter::new(), now);
+    }
+
+    /// NET-085: a resident `host_ip` box's declared names pin in an entry
+    /// of their own, fed by the node address's lookups. Its pins admit a
+    /// box-marked frame and never the node plane's own frames, a baseline
+    /// pin never admits a box-marked frame, and the box's retire takes its
+    /// pins with it.
+    #[test]
+    fn host_ip_box_names_pin_apart_from_the_node_plane() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        let pins = DnsPins::new(SUBNET);
+        let now = Instant::now();
+        let session = boxes::SessionId::mint();
+        assert!(registry.admit_host_ip_box(
+            session,
+            Some(&EgressPolicy {
+                allow_protocols: None,
+                allow_subnets: Some(Vec::new()),
+                allow_dns_hosts: Some(vec!["example.com".to_string()]),
+                deny_subnets: None,
+            }),
+        ));
+        let site = Ipv4Addr::new(203, 0, 113, 50);
+        assert!(
+            !pins.admits_host_ip_frame(&table, site.octets(), None, now),
+            "nothing is pinned before a lookup"
+        );
+        host_ip_resolves(&pins, &table, "example.com", &[site], now);
+        assert!(
+            pins.admits_host_ip_frame(&table, site.octets(), None, now),
+            "the box's declared name pins its answer for a box-marked frame"
+        );
+        assert!(
+            !pins.admits_node_frame(&table, &baseline, site.octets(), None, now),
+            "a box's name never admits the node plane's own frames"
+        );
+        let cache = Ipv4Addr::new(203, 0, 113, 10);
+        node_resolves(
+            &pins,
+            &table,
+            &baseline,
+            DAEMON_CACHE_ENDPOINT,
+            &[cache],
+            now,
+        );
+        assert!(pins.admits_node_frame(&table, &baseline, cache.octets(), None, now));
+        assert!(
+            !pins.admits_host_ip_frame(&table, cache.octets(), None, now),
+            "a baseline pin never admits a box-marked frame"
+        );
+        assert!(registry.retire_host_ip_box(session));
+        assert!(
+            !pins.admits_host_ip_frame(&table, site.octets(), None, now),
+            "a retired box's pins go with it"
+        );
+    }
+
+    /// NET-085: an attach re-admits its `host_ip` box with the rules the set
+    /// already holds. That changes nothing: the cohort record stays the same
+    /// `Arc`, so a pin another resident box took under it stays.
+    #[test]
+    fn host_ip_readmit_with_equal_rules_keeps_the_cohort_pins() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        let table = registry.table();
+        let pins = DnsPins::new(SUBNET);
+        let now = Instant::now();
+        let policy = |host: &str| EgressPolicy {
+            allow_protocols: None,
+            allow_subnets: Some(Vec::new()),
+            allow_dns_hosts: Some(vec![host.to_string()]),
+            deny_subnets: None,
+        };
+        let box_a = boxes::SessionId::mint();
+        let box_b = boxes::SessionId::mint();
+        assert!(registry.admit_host_ip_box(box_a, Some(&policy("a.example.com"))));
+        assert!(registry.admit_host_ip_box(box_b, Some(&policy("b.example.com"))));
+        let site = Ipv4Addr::new(203, 0, 113, 60);
+        host_ip_resolves(&pins, &table, "b.example.com", &[site], now);
+        assert!(pins.admits_host_ip_frame(&table, site.octets(), None, now));
+        let before = table.host_ip_cohort().expect("both boxes declare a name");
+
+        assert!(registry.admit_host_ip_box(box_a, Some(&policy("a.example.com"))));
+        let after = table.host_ip_cohort().expect("both boxes declare a name");
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "a re-admit with equal rules keeps the cohort record"
+        );
+        assert!(
+            pins.admits_host_ip_frame(&table, site.octets(), None, now),
+            "a re-admit with equal rules keeps the other box's pin"
+        );
+
+        assert!(registry.admit_host_ip_box(box_a, Some(&policy("c.example.com"))));
+        let changed = table.host_ip_cohort().expect("both boxes declare a name");
+        assert!(
+            !Arc::ptr_eq(&before, &changed),
+            "a re-admit with other rules rebuilds the cohort record"
+        );
+    }
+
+    /// NET-085: the node address's lookups split by the query frame's mark,
+    /// the same way its frames split. A marked query for a baseline name
+    /// never pins for the node plane, and an unmarked query for a name a
+    /// resident `host_ip` box declared never pins for that box.
+    #[test]
+    fn node_address_queries_pin_only_in_the_entry_their_mark_names() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        let pins = DnsPins::new(SUBNET);
+        let now = Instant::now();
+        assert!(registry.admit_host_ip_box(
+            boxes::SessionId::mint(),
+            Some(&EgressPolicy {
+                allow_protocols: None,
+                allow_subnets: Some(Vec::new()),
+                allow_dns_hosts: Some(vec!["example.com".to_string()]),
+                deny_subnets: None,
+            }),
+        ));
+        pins.adopt_baseline(&baseline);
+        let cache = Ipv4Addr::new(203, 0, 113, 10);
+        host_ip_resolves(&pins, &table, DAEMON_CACHE_ENDPOINT, &[cache], now);
+        assert!(
+            !pins.admits_node_frame(&table, &baseline, cache.octets(), None, now),
+            "a marked query for a baseline name never pins for the node plane"
+        );
+        let site = Ipv4Addr::new(203, 0, 113, 50);
+        node_resolves(&pins, &table, &baseline, "example.com", &[site], now);
+        assert!(
+            !pins.admits_host_ip_frame(&table, site.octets(), None, now),
+            "an unmarked query for a host_ip box's name never pins for that box"
+        );
+    }
+
+    /// NET-130 and NET-085's node-plane half: the node plane's own lookups
+    /// for a baseline entry pin the addresses they resolved to against that
+    /// entry, and nothing else does. Before any lookup no address admits;
+    /// after the daemon's own lookup of the cache's name, its answers do and
+    /// only they; a name no entry names pins nothing, an answer inside
+    /// private space pins nothing, a reply to no query pins nothing, a box's
+    /// lookup of the same name pins nothing for the node, and the pins hold
+    /// for the shared window under the shared per-name cap. Every pin and
+    /// every re-pin is one `info` line naming the entry, the addresses and
+    /// the lookup's source.
+    #[test]
+    fn baseline_entry_pins_the_daemon_lookup_answers() {
+        let (log, _guard) = crate::net::egress_gate::test_support::capture_log();
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        // A box that declared the same name: its pins are its own.
+        dns_box(
+            &registry,
+            "weather",
+            LEASE,
+            vec![DAEMON_CACHE_ENDPOINT.to_string()],
+            Vec::new(),
+        );
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        let pins = DnsPins::new(SUBNET);
+        let now = Instant::now();
+        let node_admits = |dst: Ipv4Addr, at: Instant| {
+            pins.admits_node_frame(&table, &baseline, dst.octets(), None, at)
+        };
+        let cache = Ipv4Addr::new(203, 0, 113, 10);
+
+        // Nothing is pinned before the node's own lookup.
+        assert!(
+            !node_admits(cache, now),
+            "no address is pinned before a lookup"
+        );
+
+        // The daemon's own lookup of the cache's name pins its answers, and
+        // only them.
+        node_resolves(
+            &pins,
+            &table,
+            &baseline,
+            DAEMON_CACHE_ENDPOINT,
+            &[cache],
+            now,
+        );
+        assert!(node_admits(cache, now), "the lookup's answer is pinned");
+        assert!(
+            !node_admits(Ipv4Addr::new(203, 0, 113, 11), now),
+            "an address the answer did not name is not pinned"
+        );
+        wait_for_line(&log, "pinned a node-plane baseline entry's addresses");
+        let logged = log.contents();
+        assert!(
+            logged.contains("entry=cache")
+                && logged.contains("addresses=[203.0.113.10]")
+                && logged.contains("lookup_source=100.64.255.253")
+                && logged.contains(&format!("resolver={}", SUBNET.dns_server())),
+            "the pin line names the entry, the addresses and the lookup's source, got: {logged}"
+        );
+
+        // The same lookup again re-pins, and says so.
+        node_resolves(
+            &pins,
+            &table,
+            &baseline,
+            DAEMON_CACHE_ENDPOINT,
+            &[cache],
+            now,
+        );
+        assert!(
+            log.contents()
+                .contains("re-pinned a node-plane baseline entry's addresses"),
+            "a re-pin is logged, got: {}",
+            log.contents()
+        );
+
+        // A name no entry names pins nothing for the node.
+        let other = Ipv4Addr::new(198, 51, 100, 20);
+        node_resolves(&pins, &table, &baseline, "example.com", &[other], now);
+        assert!(
+            !node_admits(other, now),
+            "a name no entry names pins nothing"
+        );
+
+        // An answer in private space is the rebinding intersection's refusal.
+        let private = Ipv4Addr::new(10, 1, 2, 3);
+        node_resolves(
+            &pins,
+            &table,
+            &baseline,
+            DAEMON_CACHE_ENDPOINT,
+            &[private],
+            now,
+        );
+        assert!(!node_admits(private, now), "a private answer never pins");
+
+        // A reply that answers no query of the node's pins nothing.
+        let unasked = Ipv4Addr::new(203, 0, 113, 30);
+        observe(
+            &pins,
+            &table,
+            baseline.node_addr(),
+            DAEMON_CACHE_ENDPOINT,
+            &[unasked],
+            &DropLimiter::new(),
+            now,
+        );
+        assert!(
+            !node_admits(unasked, now),
+            "an unsolicited reply pins nothing"
+        );
+
+        // A box's lookup of the same name pins for the box, never the node.
+        let boxed = Ipv4Addr::new(203, 0, 113, 40);
+        resolve(
+            &pins,
+            &table,
+            LEASE,
+            DAEMON_CACHE_ENDPOINT,
+            &[boxed],
+            &DropLimiter::new(),
+            now,
+        );
+        assert!(
+            !node_admits(boxed, now),
+            "a box's answer is not the node's pin"
+        );
+
+        // The shared window: past it, the pin admits no new flow.
+        assert!(
+            !node_admits(cache, now + DNS_ADMISSION_WINDOW),
+            "the pin holds for the shared window and no longer"
+        );
+
+        // The shared per-name cap: answers past it are refused.
+        let many: Vec<Ipv4Addr> = (1..=40).map(|n| Ipv4Addr::new(198, 51, 100, n)).collect();
+        let later = now + DNS_ADMISSION_WINDOW + Duration::from_secs(1);
+        node_resolves(
+            &pins,
+            &table,
+            &baseline,
+            DAEMON_CACHE_ENDPOINT,
+            &many,
+            later,
+        );
+        let pinned = many
+            .iter()
+            .filter(|addr| node_admits(**addr, later))
+            .count();
+        assert_eq!(pinned, DNS_MAX_ADDRESSES_PER_NAME, "the per-name cap holds");
+
+        // An announced baseline pins nothing: the node row decides there.
+        let announced = NodePlaneBaseline::built_in(SUBNET).announced();
+        pins.adopt_baseline(&announced);
+        let fresh = Ipv4Addr::new(203, 0, 113, 50);
+        lookup(
+            &pins,
+            &table,
+            baseline.node_addr(),
+            DAEMON_CACHE_ENDPOINT,
+            later,
+        );
+        observe(
+            &pins,
+            &table,
+            baseline.node_addr(),
+            DAEMON_CACHE_ENDPOINT,
+            &[fresh],
+            &DropLimiter::new(),
+            later,
+        );
+        pins.adopt_baseline(&baseline);
+        assert!(
+            !node_admits(fresh, later),
+            "a lookup under an announced baseline pins nothing for the node"
+        );
+    }
+
+    /// Panics unless `log` holds `needle`: the table logs synchronously, so
+    /// the line is there by the time the call that wrote it returns.
+    fn wait_for_line(log: &crate::net::egress_gate::test_support::CaptureWriter, needle: &str) {
+        let logged = log.contents();
+        assert!(
+            logged.contains(needle),
+            "expected `{needle}` in the log, got: {logged}"
+        );
     }
 
     /// The table admits exactly the answers the box's own lookup received,

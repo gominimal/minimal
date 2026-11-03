@@ -10,7 +10,7 @@ use anyhow::{Context as _, Result, bail};
 
 use crate::cmd::{DEFAULT_VM_RAM_MIB, DEFAULT_VM_VCPUS, env_ram_mib, env_vcpus};
 use crate::config::ResourceConfig;
-use crate::state::provider_dir;
+use crate::state::host_dir;
 
 /// Minimum guest RAM in MiB; below this the guest cannot reach userspace (see
 /// [`crate::cmd::DEFAULT_VM_RAM_MIB`]).
@@ -110,8 +110,8 @@ pub fn run_set(vcpus: Option<u8>, ram_mib: Option<u32>) -> Result<()> {
 
     let warnings = validate_resources(vcpus, ram_mib, HostCapacity::probe())?;
 
-    let dir = provider_dir();
-    // `StateDir::new` creates the provider dir (a `config set` can precede any
+    let dir = host_dir();
+    // `StateDir::new` creates the host dir (a `config set` can precede any
     // lifecycle command, so it may not exist yet). Serialize the whole
     // read-modify-write under the shared lifecycle lock so two concurrent
     // `config set`s cannot lose one field's update to a last-writer-wins rename.
@@ -144,7 +144,7 @@ pub fn run_set(vcpus: Option<u8>, ram_mib: Option<u32>) -> Result<()> {
 /// Run `minvmd config show`: print the effective configuration and each value's
 /// source (`env` / `config` / `default`).
 pub fn run_show(json: bool) -> Result<()> {
-    let cfg = ResourceConfig::read(&provider_dir()).context("reading resource config")?;
+    let cfg = ResourceConfig::read(&host_dir()).context("reading resource config")?;
     let vcpus = crate::cmd::effective_vcpus();
     let ram_mib = crate::cmd::effective_ram_mib();
     let vcpus_source = source(env_vcpus().is_some(), cfg.vcpus.is_some());

@@ -374,6 +374,17 @@ min_net() {
 
     case "$subcmd" in
         expose)
+            # `--public` is its own request, never a port string. The
+            # daemon answers it, with or without a port.
+            if [[ "$1" == "--public" ]]; then
+                shift
+                if __min_is_help_flag "$1"; then
+                    __min_usage expose
+                    return 0
+                fi
+                __min_rpc "net-expose-public" "$1"
+                return
+            fi
             local port="$1"
             if __min_is_help_flag "$port"; then
                 __min_usage expose

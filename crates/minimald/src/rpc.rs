@@ -150,23 +150,54 @@ async fn serve_list_sessions(
             // listing.
             let in_microvm = s.in_microvm().await;
             let fact = crate::box_runtime::host_ip_enforcement_fact();
-            let enforcement = futures::future::join_all(infos.iter().map(|i| async {
-                let record = mngr
-                    .get_record(BoxKeyPredicate::Id(i.id))
+            let opt_out = s.deny_all_opt_out().await;
+            let records = futures::future::join_all(infos.iter().map(|i| async {
+                mngr.get_record(BoxKeyPredicate::Id(i.id))
                     .await
                     .ok()
-                    .flatten();
-                record.map(|record| {
-                    crate::box_runtime::displayed_host_ip_enforcement(
-                        in_microvm,
-                        record.network,
-                        classifier::verdict_of(record.policy.egress.as_ref()),
-                        &fact,
-                        record.host_ip_enforcement,
-                    )
-                })
+                    .flatten()
             }))
             .await;
+            let enforcement: Vec<_> = records
+                .iter()
+                .map(|record| {
+                    record.as_ref().map(|record| {
+                        crate::box_runtime::displayed_host_ip_enforcement(
+                            in_microvm,
+                            record.network,
+                            classifier::verdict_of(record.policy.egress.as_ref()),
+                            &fact,
+                            record.host_ip_enforcement,
+                        )
+                    })
+                })
+                .collect();
+            // T110: each box's address and egress posture, from its record
+            // and the hostname registry. A box with no fact for a field
+            // leaves it `None`, so the listing shows `-` rather than an
+            // invented value.
+            let box_networks: std::collections::BTreeMap<_, _> = infos
+                .iter()
+                .zip(&records)
+                .map(|(i, record)| {
+                    (
+                        i.id,
+                        box_network_facts(&mngr, i.id, record.as_ref(), opt_out, in_microvm),
+                    )
+                })
+                .collect();
+            tracing::info!(
+                boxes = infos.len(),
+                with_address = box_networks
+                    .values()
+                    .filter(|f| f.loopback_address.is_some())
+                    .count(),
+                with_posture = box_networks
+                    .values()
+                    .filter(|f| f.egress_posture.is_some())
+                    .count(),
+                "listed boxes with their address and egress posture"
+            );
             Ok(ListSessionsResponse {
                 daemon_version: Some(OWN_VERSION.to_string()),
                 hostname_routing_unavailable: s.proxy_unavailable().await,
@@ -174,6 +205,7 @@ async fn serve_list_sessions(
                 zone_answerer_port,
                 answerer_bound: zone_answerer_port.is_some(),
                 resource_pool,
+                box_networks,
                 // `git` is left `None`: the daemon cannot probe it — on
                 // macOS it runs in the minvmd guest, where the host's
                 // project paths do not exist and git is not on PATH. The
@@ -212,6 +244,82 @@ async fn serve_list_sessions(
             })
         })
         .await
+}
+
+/// The address a host-address box reports in the listing (T110): the
+/// node's address, except in a microVM whose node address is still
+/// `127.0.0.1`, where the box reports none.
+fn host_address_loopback(node: std::net::Ipv4Addr, in_microvm: bool) -> Option<std::net::Ipv4Addr> {
+    (!in_microvm || node != std::net::Ipv4Addr::LOCALHOST).then_some(node)
+}
+
+/// Whether a listed box stands on the `127.0.0.1` fallback (T110). A
+/// host-address box's node address can be `127.0.0.1` too, so only an
+/// own-address or `none` box at `127.0.0.1` is at the fallback. A
+/// host-address box whose address is withheld (a VM node not yet granted
+/// its address) is reached only through the proxy, so it reads as the
+/// fallback too (design §7.1). Any other box with no address reports none.
+fn box_at_fallback(
+    host_address: bool,
+    loopback_address: Option<std::net::Ipv4Addr>,
+) -> Option<bool> {
+    match loopback_address {
+        None => host_address.then_some(true),
+        Some(address) => Some(!host_address && address == std::net::Ipv4Addr::LOCALHOST),
+    }
+}
+
+/// One box's network facts as the listing reports them (T110). The address
+/// is the host loopback address its ports answer at: the node's address for
+/// a host-address box, and for an own-address or `none` box the address its
+/// publish holds (NET-010, or the `127.0.0.1` interim where the range is
+/// absent), else the loopback address its registration was handed. The
+/// posture is the effective egress `GetEffectiveSessionPolicy` resolves for
+/// the same record ([`effective_policy_reply`]). A box whose record cannot
+/// be read reports no posture, and one that publishes nowhere reports no
+/// address. In a microVM, a host-address box reports no address while the
+/// node's address is still `127.0.0.1`: the answerer has not granted the
+/// node its address yet, and a VM node's host-address boxes are never
+/// mirrored onto `127.0.0.1` (design §7.1).
+fn box_network_facts(
+    mngr: &crate::box_manager::BoxManagerHandle,
+    id: SessionId,
+    record: Option<&boxes::Record>,
+    opt_out: bool,
+    in_microvm: bool,
+) -> minimald_rpc::BoxNetworkFacts {
+    let host_address = matches!(
+        record.map(|record| record.network),
+        Some(boxes::NetworkMode::HostNet)
+    );
+    let loopback_address = {
+        let registry = mngr.hostnames();
+        let routes = registry.read().expect("hostname registry lock poisoned");
+        if host_address {
+            host_address_loopback(routes.node_address(), in_microvm)
+        } else {
+            routes.published_own_address(id).or_else(|| {
+                record
+                    .and_then(|record| record.box_addresses)
+                    .map(|addresses| addresses.loopback_address)
+            })
+        }
+    };
+    let at_fallback = box_at_fallback(host_address, loopback_address);
+    let egress_posture = record.map(|record| {
+        let effective = effective_policy_reply(
+            &record.policy,
+            record.network,
+            boxes::EGRESS_DEFAULT_PHASE,
+            opt_out,
+        );
+        minimald_rpc::EgressPosture::of(&effective.egress, record.network)
+    });
+    minimald_rpc::BoxNetworkFacts {
+        loopback_address,
+        egress_posture,
+        at_fallback,
+    }
 }
 
 /// The ports a box's attach yields because a sibling at the same shared
@@ -443,10 +551,18 @@ async fn serve_create_session(
             // beside the record before the box starts.
             let spec = req.spec.take();
             let has_spec = spec.is_some();
-            Ok(match mngr
-                .create_box_with_spec(req.config, spec, ssh_username, creator)
-                .await
-            {
+            // BOX-163: a fresh instance is named `<name>-<n>` and is never
+            // refused for a held name. Any other create takes `<name>`, and
+            // a running box that holds it refuses the create.
+            let fresh_instance = req.fresh_instance;
+            let created = if fresh_instance {
+                mngr.create_fresh_box_with_spec(req.config, spec, ssh_username, creator)
+                    .await
+            } else {
+                mngr.create_box_with_spec(req.config, spec, ssh_username, creator)
+                    .await
+            };
+            Ok(match created {
                 Ok(id) => {
                     // Tag the session to this connection so it is reaped if
                     // the client drops before finalizing it (e.g. Ctrl-C at
@@ -462,6 +578,7 @@ async fn serve_create_session(
                         egress_allow_dns_hosts = egress_counts.allow_dns_hosts,
                         egress_deny_subnets = egress_counts.deny_subnets,
                         spec_stored = has_spec,
+                        fresh_instance,
                         "session created"
                     );
                     // NET-079's observability: one info line per create
@@ -490,11 +607,23 @@ async fn serve_create_session(
                     // NET-123: the session-start loopback probe, before any
                     // of this session's names publish. Its interim flag on
                     // the reply is what tells the client to surface the
-                    // naming advisory again (NET-122). NET-018 reads the
+                    // naming advisory again (NET-122). On a VM-backed daemon
+                    // the guest's own `lo` always carries the range, so the
+                    // forwarder walks the host's loopback instead, and the
+                    // flag is the host's verdict. NET-018 reads the
                     // answerer's half straight off the state, not off this
-                    // probe: the range the probe covers is the guest's on a
-                    // VM-backed host, so it is not the reply's fact to read.
-                    let interim_loopback = session_start_loopback_probe(&id).await.interim();
+                    // probe.
+                    #[cfg(target_os = "linux")]
+                    let walked = mngr
+                        .session_start_range_walk()
+                        .await
+                        .map(|answer| session_start_range_walk_line(&id, &answer));
+                    #[cfg(not(target_os = "linux"))]
+                    let walked: Option<bool> = None;
+                    let interim_loopback = match walked {
+                        Some(interim) => interim,
+                        None => session_start_loopback_probe(&id).await.interim(),
+                    };
                     let hostname_proxy_port = s.hostname_proxy_port().await;
                     let zone_answerer_port = s.zone_answerer_port().await;
                     Errorable::Ok(minimald_rpc::CreateSessionResponse {
@@ -521,8 +650,23 @@ async fn serve_create_session(
                             .map(|enforcement| enforcement.machine_str().to_string()),
                     })
                 }
+                // BOX-163: a running box holds the name. The reply names the
+                // holder, so the client can say who holds it and exit 2.
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {
-                    error: "A session with that name already exists".to_string(),
+                    error: match held_name_refusal(&e) {
+                        Some(refusal) => {
+                            tracing::info!(
+                                name = %refusal.name,
+                                holder = ?refusal.holder,
+                                holder_name = %refusal.holder_name,
+                                fresh_instance,
+                                "create refused: a running box holds the name; \
+                                 the reply names the holder"
+                            );
+                            refusal.to_string()
+                        }
+                        None => "A session with that name already exists".to_string(),
+                    },
                 },
                 // R2.1: a policy/network-mode mismatch is rejected at
                 // declaration time and surfaced as a clean typed error rather
@@ -535,6 +679,12 @@ async fn serve_create_session(
                 // could not be honoured — and what to type instead — rather
                 // than reading a transport failure off the activate.
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Errorable::Err {
+                    error: e.to_string(),
+                },
+                // BOX-002: a create minvmd gave no id is refused with a
+                // reply. The internal arm below closes the channel, and the
+                // client then reads an empty reply with no cause in it.
+                Err(e) if crate::box_manager::BoxIdNotMinted::is(&e) => Errorable::Err {
                     error: e.to_string(),
                 },
                 Err(e) => return Err(ConnectionError::Internal(e.to_string())),
@@ -674,6 +824,40 @@ async fn session_start_loopback_probe(session_id: &SessionId) -> crate::net::loo
     probe
 }
 
+/// The session-start line of a VM-backed daemon (NET-123): the same record
+/// [`session_start_loopback_probe`] writes, over the forwarder's walk of the
+/// host's loopback, with whether this start walked and how many boxes the
+/// landing moved off the `127.0.0.1` interim. Returns the reply's interim
+/// flag.
+#[cfg(target_os = "linux")]
+fn session_start_range_walk_line(
+    session_id: &SessionId,
+    answer: &crate::box_manager::RangeWalkAnswer,
+) -> bool {
+    let probe = &answer.probe;
+    // A walk that got no answer over a present verdict keeps that verdict,
+    // so the box publishes in the range and the surface is the range's.
+    let interim = probe.interim() && !answer.kept_present;
+    let surface = if answer.kept_present {
+        "reserved-range"
+    } else {
+        probe.surface()
+    };
+    tracing::info!(
+        session_id = %session_id,
+        via = "forwarder",
+        walked = answer.walked,
+        moved_off_interim = answer.moved,
+        verdict_kept = answer.kept_present,
+        probe = %probe.summary(),
+        surface = %surface,
+        first_failure = ?probe.first_failure,
+        interim_loopback = interim,
+        "session-start loopback probe picked the publish surface"
+    );
+    interim
+}
+
 /// How long [`log_live_name_surface`] lets the proxy's driver finish
 /// recording its port before the line names the proxy's state: the two
 /// listeners start together and normally land within milliseconds of one
@@ -748,7 +932,7 @@ async fn settled_proxy_port(state: &ServerStateHandle) -> Option<u16> {
 }
 
 /// The answerer control socket's file name, beside the daemon's identity
-/// dir (its provider instance dir) — the native door the answerer's
+/// dir (its host dir) — the native door the answerer's
 /// handover verbs knock on, the counterpart of the VM host daemon's
 /// `control.sock` (its `minvmd` control module's socket of the same
 /// name): one door per daemon, in a dir only this operator (and root)
@@ -773,7 +957,7 @@ const CONTROL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// else: this daemon's boxes register over RPC channels, not over this
 /// door, so every box verb is refused as a wrong-door ask.
 ///
-/// The socket lives in the daemon's identity dir (its provider instance
+/// The socket lives in the daemon's identity dir (its host
 /// dir, the dir its node id is), at [`ANSWERER_CONTROL_SOCK_FILE`], bound
 /// before the answerer's acquisition starts so a control surface is
 /// there whatever the acquisition decides; a daemon with no identity dir
@@ -939,6 +1123,8 @@ async fn serve_answerer_control(
                 | BoxControlRequest::Withdraw(_)
                 | BoxControlRequest::HoldBoxName(_)
                 | BoxControlRequest::ReleaseBoxName(_)
+                | BoxControlRequest::AdmitHostIpBox(_)
+                | BoxControlRequest::RetireHostIpBox(_)
                 | BoxControlRequest::AdmitPort(_)
                 | BoxControlRequest::WithdrawPort(_)
                 | BoxControlRequest::ReadRow(_)
@@ -947,7 +1133,12 @@ async fn serve_answerer_control(
                 | BoxControlRequest::SubscribeAsks(_)
                 | BoxControlRequest::ResumeBox(_)
                 | BoxControlRequest::RowStanding(_)
-                | BoxControlRequest::ProxyListening => BoxControlReply::Error {
+                | BoxControlRequest::ProxyListening
+                | BoxControlRequest::ProxyPorts
+                | BoxControlRequest::MintBoxId(_)
+                | BoxControlRequest::ReportExposeDecision(_)
+                | BoxControlRequest::ReportRefusedEgress(_)
+                | BoxControlRequest::ListenNotice(_) => BoxControlReply::Error {
                     error: "the native daemon's control socket answers only the answerer \
                             verbs; boxes register over the daemon's RPC channels"
                         .to_string(),
@@ -1168,6 +1359,19 @@ async fn serve_finalize_session(
         .await
 }
 
+/// The wire refusal of a create whose name a running box holds
+/// (BOX-163), when the manager's `AlreadyExists` carries its holder.
+fn held_name_refusal(error: &std::io::Error) -> Option<minimald_rpc::HeldNameRefusal> {
+    let refusal = error
+        .get_ref()?
+        .downcast_ref::<crate::box_manager::HeldNameRefusal>()?;
+    Some(minimald_rpc::HeldNameRefusal {
+        name: refusal.name.clone(),
+        holder: Some(refusal.holder),
+        holder_name: refusal.holder_name.clone(),
+    })
+}
+
 /// `RenameSession`: resolves the session's actor (spinning it up from
 /// disk if needed) and lets it persist the new name and relink its
 /// PTask hostname. A name collision surfaces as the store's
@@ -1203,6 +1407,120 @@ async fn serve_rename_session(
                     error: e.to_string(),
                 }),
             }
+        })
+        .await
+}
+
+/// `StopBox`: stops the running box and keeps its record (BOX-013,
+/// BOX-018). Answers how the box ended, as the record now stores it. A
+/// stop that the entrypoint's return beat answers that the box already
+/// exited, with the exit's code (BOX-038).
+async fn serve_stop_box(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), ConnectionError> {
+    minimald_rpc::StopBox
+        .handle_channel(c, async |req: minimald_rpc::StopBoxRequest| {
+            let mngr = s.sessions_manager().await;
+            match mngr.stop_box(req.id, req.force).await {
+                Ok(answer) => {
+                    let response = stop_box_response(answer);
+                    tracing::info!(
+                        session_id = %req.id,
+                        force = req.force,
+                        outcome = answer.outcome(),
+                        exit_code = response.exit_code,
+                        signal = response.signal,
+                        "session stopped"
+                    );
+                    Ok(Errorable::Ok(response))
+                }
+                Err(e) => Ok(Errorable::Err {
+                    error: e.to_string(),
+                }),
+            }
+        })
+        .await
+}
+
+/// The `StopBox` answer for how a stop ended: the record's exit code and
+/// ending signal, and whether the box already exited before the stop.
+pub(crate) fn stop_box_response(
+    answer: crate::box_manager::StopAnswer,
+) -> minimald_rpc::StopBoxResponse {
+    let state = answer.state();
+    minimald_rpc::StopBoxResponse {
+        exit_code: state.exit_code(),
+        signal: state.signal(),
+        already_exited: matches!(answer, crate::box_manager::StopAnswer::AlreadyExited(_)),
+    }
+}
+
+/// `ReapBox`: deletes one box's record, events and files (BOX-019,
+/// BOX-045). A running box is refused unless the request forces the reap.
+async fn serve_reap_box(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), ConnectionError> {
+    minimald_rpc::ReapBox
+        .handle_channel(c, async |req: minimald_rpc::ReapBoxRequest| {
+            let mngr = s.sessions_manager().await;
+            Ok(match mngr.reap_box(req.id, req.force).await {
+                Ok(reply) => Errorable::Ok(reply),
+                Err(e) => Errorable::Err {
+                    error: e.to_string(),
+                },
+            })
+        })
+        .await
+}
+
+/// `PruneBoxes`: reaps every stopped or exited box that matches the
+/// request's selectors, and answers with what it reaped (BOX-021).
+async fn serve_prune_boxes(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), ConnectionError> {
+    minimald_rpc::PruneBoxes
+        .handle_channel(c, async |req: minimald_rpc::PruneBoxesRequest| {
+            let mngr = s.sessions_manager().await;
+            let older_than = req.older_than_secs.map(std::time::Duration::from_secs);
+            Ok(match mngr.prune_boxes(older_than, req.parent).await {
+                Ok(reply) => Errorable::Ok(reply),
+                Err(e) => Errorable::Err {
+                    error: format!("The stopped and exited boxes were not removed: {e}"),
+                },
+            })
+        })
+        .await
+}
+
+/// `ListBoxes`: every retained box record on this host, in any state,
+/// optionally scoped to one project root (BOX-158).
+async fn serve_list_boxes(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), ConnectionError> {
+    minimald_rpc::ListBoxes
+        .handle_channel(c, async |req: minimald_rpc::ListBoxesRequest| {
+            let mngr = s.sessions_manager().await;
+            Ok(match mngr.list_boxes(req.project_root.as_ref()).await {
+                Ok(boxes) => Errorable::Ok(minimald_rpc::ListBoxesResponse { boxes }),
+                Err(e) => Errorable::Err {
+                    error: format!("The box records could not be read: {e}"),
+                },
+            })
+        })
+        .await
+}
+
+/// `ShowBox`: one box record with its state, identity and live execs
+/// (BOX-159).
+async fn serve_show_box(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), ConnectionError> {
+    minimald_rpc::ShowBox
+        .handle_channel(c, async |req: minimald_rpc::ShowBoxRequest| {
+            let mngr = s.sessions_manager().await;
+            Ok(match mngr.show_box(req.id).await {
+                Ok(Some(reply)) => Errorable::Ok(reply),
+                Ok(None) => Errorable::Err {
+                    error: format!(
+                        "{} `{}`",
+                        minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                        req.id.as_ref()
+                    ),
+                },
+                Err(e) => Errorable::Err {
+                    error: format!("The box record could not be read: {e}"),
+                },
+            })
         })
         .await
 }
@@ -2002,6 +2320,184 @@ async fn read_events_stream(
 async fn write_events_update(
     c: &mut RuChannel<Msg>,
     update: &minimald_rpc::ReadEventsUpdate,
+) -> Result<(), ConnectionError> {
+    let mut line = serde_json_lenient::to_vec(update)?;
+    line.push(b'\n');
+    c.data_bytes(line).await?;
+    Ok(())
+}
+
+/// The most bytes of a box's log one `Output` line carries.
+const LOG_CHUNK: usize = 64 * 1024;
+
+/// How often a followed read of a box's log looks for new output and for
+/// the box's reap. The host appends to the log with no wake-up to send.
+const LOG_FOLLOW_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Serves [`READ_LOG_SUBSYSTEM`](minimald_rpc::READ_LOG_SUBSYSTEM): one
+/// box's output log from the requested byte, then, for a follower, each new
+/// chunk until the box is reaped or the client closes the channel
+/// (BOX-155). The log is found by the box's id alone, so a stopped box's
+/// log reads the same as a running one's. A refusal before the first chunk,
+/// such as an unknown id, leaves the payload stream empty and says why on
+/// extended data, the same split as [`serve_read_events`].
+async fn serve_read_log(
+    s: ServerStateHandle,
+    mut c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    match read_log_stream(&s, &mut c).await {
+        Ok(()) => {
+            let _ = c.eof().await;
+            let _ = c.close().await;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = c.extended_data_bytes(1, e.to_string()).await;
+            let _ = c.close().await;
+            Err(e)
+        }
+    }
+}
+
+/// Reads the request, then streams the box's log. The `Err` arm is for a
+/// refusal before the first chunk, and for a channel that breaks.
+async fn read_log_stream(
+    s: &ServerStateHandle,
+    c: &mut RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    use minimald_rpc::{ReadLogRequest, ReadLogUpdate};
+
+    let req: ReadLogRequest = read_channel_request(c).await?;
+    let state_dir = s.minimal_state_dir().await;
+    let refuse = |refusal: String| {
+        tracing::info!(
+            box_id = %req.id,
+            follow = req.follow,
+            refusal = %refusal,
+            "refused a read of a box's log"
+        );
+        ConnectionError::Internal(refusal)
+    };
+    // The store calls below are blocking file reads. Each runs on the
+    // blocking pool, so a slow disk does not hold a runtime worker.
+    let found = {
+        let id = req.id;
+        crate::traced::spawn_blocking(move || boxes::store::BoxDir::find(&state_dir, &id))
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+    };
+    let dir = match found {
+        Ok(Some(dir)) => dir,
+        Ok(None) => {
+            return Err(refuse(format!(
+                "{} `{}`",
+                minimald_rpc::UNKNOWN_SESSION_ID_LEAD,
+                req.id.as_ref()
+            )));
+        }
+        Err(e) => {
+            return Err(refuse(format!(
+                "the log of box {} could not be found: {e}",
+                req.id
+            )));
+        }
+    };
+    tracing::info!(
+        box_id = %req.id,
+        offset = req.offset,
+        follow = req.follow,
+        log_path = %dir.log_path().as_str(),
+        "reading a box's log"
+    );
+
+    let failed = |e: std::io::Error| {
+        tracing::warn!(box_id = %req.id, error = %e, "a read of a box's log failed");
+        ReadLogUpdate::Failed {
+            error: format!("the log of box {} could not be read: {e}", req.id),
+        }
+    };
+    // One reader for the whole stream, so a drop of the log's oldest
+    // bytes during the read sends no byte twice (see `LogReader`).
+    let mut reader = Some(boxes::store::LogReader::new(&dir, req.offset));
+    loop {
+        // Everything written so far, in chunks.
+        loop {
+            match read_log_chunk(&mut reader).await {
+                Ok(chunk) if chunk.data.is_empty() => break,
+                Ok(boxes::store::LogChunk { offset, data }) => {
+                    write_log_update(c, &ReadLogUpdate::Output { offset, data }).await?;
+                }
+                Err(e) => return write_log_update(c, &failed(e)).await,
+            }
+        }
+        if !req.follow {
+            let offset = reader.as_ref().map_or(0, boxes::store::LogReader::offset);
+            return write_log_update(c, &ReadLogUpdate::Done { offset }).await;
+        }
+        if !is_box_retained(&dir).await {
+            // Output written after the read above and before the reap is
+            // still sent: the stream ends on the first empty read after the
+            // box is gone.
+            match read_log_chunk(&mut reader).await {
+                Ok(chunk) if chunk.data.is_empty() => {
+                    tracing::info!(box_id = %req.id, "a followed box was reaped; ending the read of its log");
+                    return write_log_update(c, &ReadLogUpdate::Reaped).await;
+                }
+                Ok(boxes::store::LogChunk { offset, data }) => {
+                    write_log_update(c, &ReadLogUpdate::Output { offset, data }).await?;
+                    continue;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return write_log_update(c, &ReadLogUpdate::Reaped).await;
+                }
+                Err(e) => return write_log_update(c, &failed(e)).await,
+            }
+        }
+        tokio::select! {
+            () = tokio::time::sleep(LOG_FOLLOW_POLL) => {}
+            msg = c.wait() => match msg {
+                None | Some(russh::ChannelMsg::Close) => {
+                    tracing::info!(box_id = %req.id, "the reader closed a followed read of a box's log");
+                    return Ok(());
+                }
+                Some(_) => {}
+            },
+        }
+    }
+}
+
+/// Reads the next chunk of up to [`LOG_CHUNK`] bytes through `reader`, on
+/// the blocking pool. The reader moves to the pool and back. A read whose
+/// task fails loses the reader, and every read after it fails.
+async fn read_log_chunk(
+    reader: &mut Option<boxes::store::LogReader>,
+) -> std::io::Result<boxes::store::LogChunk> {
+    let Some(mut taken) = reader.take() else {
+        return Err(std::io::Error::other("the earlier read of the log failed"));
+    };
+    let (taken, chunk) = crate::traced::spawn_blocking(move || {
+        let chunk = taken.read(LOG_CHUNK);
+        (taken, chunk)
+    })
+    .await
+    .map_err(std::io::Error::other)?;
+    *reader = Some(taken);
+    chunk
+}
+
+/// Whether the box `dir` holds is still retained, checked on the blocking
+/// pool. A failed check counts as retained, so the next poll asks again.
+async fn is_box_retained(dir: &boxes::store::BoxDir) -> bool {
+    let dir = dir.clone();
+    crate::traced::spawn_blocking(move || dir.is_retained())
+        .await
+        .unwrap_or(true)
+}
+
+/// Writes one newline-delimited JSON log update.
+async fn write_log_update(
+    c: &mut RuChannel<Msg>,
+    update: &minimald_rpc::ReadLogUpdate,
 ) -> Result<(), ConnectionError> {
     let mut line = serde_json_lenient::to_vec(update)?;
     line.push(b'\n');
@@ -2861,6 +3357,11 @@ pub async fn handle_ssh_rpc(
         | FinalizeSession::NAME
         | RenameSession::NAME
         | DestroySession::NAME
+        | minimald_rpc::StopBox::NAME
+        | minimald_rpc::ReapBox::NAME
+        | minimald_rpc::PruneBoxes::NAME
+        | minimald_rpc::ListBoxes::NAME
+        | minimald_rpc::ShowBox::NAME
         | Shutdown::NAME
         | AbortSession::NAME
         | GetSessionPolicy::NAME
@@ -2876,7 +3377,8 @@ pub async fn handle_ssh_rpc(
         | STREAM_WORKSPACE_HOOK_SCRIPTS
         | minimald_rpc::DIAG_BUNDLE_SUBSYSTEM
         | minimald_rpc::CLEAN_CACHE_SUBSYSTEM
-        | minimald_rpc::READ_EVENTS_SUBSYSTEM => {
+        | minimald_rpc::READ_EVENTS_SUBSYSTEM
+        | minimald_rpc::READ_LOG_SUBSYSTEM => {
             let mut conn_lock = c.lock().await;
             let c_hnd = match conn_lock.take(id) {
                 None => {
@@ -2940,6 +3442,11 @@ pub async fn handle_ssh_rpc(
         FinalizeSession::NAME => serve!(serve_finalize_session(s, channel)),
         RenameSession::NAME => serve!(serve_rename_session(s, channel)),
         DestroySession::NAME => serve!(serve_destroy_session(s, channel)),
+        minimald_rpc::StopBox::NAME => serve!(serve_stop_box(s, channel)),
+        minimald_rpc::ReapBox::NAME => serve!(serve_reap_box(s, channel)),
+        minimald_rpc::PruneBoxes::NAME => serve!(serve_prune_boxes(s, channel)),
+        minimald_rpc::ListBoxes::NAME => serve!(serve_list_boxes(s, channel)),
+        minimald_rpc::ShowBox::NAME => serve!(serve_show_box(s, channel)),
         Shutdown::NAME => serve!(serve_shutdown(s, channel)),
         AbortSession::NAME => serve!(serve_abort_session(s, channel)),
         GetSessionPolicy::NAME => serve!(serve_get_session_policy(s, channel)),
@@ -2966,6 +3473,7 @@ pub async fn handle_ssh_rpc(
         }
         minimald_rpc::CLEAN_CACHE_SUBSYSTEM => serve!(serve_clean_cache(s, channel)),
         minimald_rpc::READ_EVENTS_SUBSYSTEM => serve!(serve_read_events(s, channel)),
+        minimald_rpc::READ_LOG_SUBSYSTEM => serve!(serve_read_log(s, channel)),
         _ => unreachable!(),
     };
 
@@ -3089,5 +3597,331 @@ mod trace_tests {
         assert_eq!(actors.len(), 1, "{actors:?}");
         assert!(!actors[0].closed, "the actor lives on");
         assert!(actors[0].parent.is_none(), "the actor's span is a root");
+    }
+}
+
+/// BOX-163 over the wire: what a `CreateSession` reply says when a running
+/// box holds the name, and how a fresh instance is named.
+#[cfg(test)]
+mod create_naming_tests {
+    use boxes::SessionId;
+    use minimald_rpc::{CreateSession, CreateSessionRequest, Errorable, HeldNameRefusal};
+
+    use crate::box_manager::BoxKeyPredicate;
+    use crate::test_harness::{TestClient, TestServer, create_session_req};
+
+    /// A create with no name on the request and a task spec whose entry is
+    /// `entry`, so the daemon names the box from the entry.
+    fn entry_req(entry: &str, fresh_instance: bool) -> CreateSessionRequest {
+        let mut request = create_session_req("unused", "/tmp");
+        request.config.name = None;
+        let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
+        spec.box_type = boxes::TASK_BOX_TYPE.to_string();
+        spec.pty_enabled = false;
+        spec.entry = entry.to_string();
+        request.spec = Some(serde_json_lenient::to_value(&spec).expect("a spec serializes"));
+        request.fresh_instance = fresh_instance;
+        request
+    }
+
+    async fn create(client: &mut TestClient, request: &CreateSessionRequest) -> SessionId {
+        match client.call::<CreateSession>(request).await {
+            Errorable::Ok(created) => created.id,
+            Errorable::Err { error } => panic!("the create is refused: {error}"),
+        }
+    }
+
+    async fn name_of(server: &TestServer, id: SessionId) -> Option<String> {
+        server
+            .state
+            .sessions_manager()
+            .await
+            .get_record(BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the created record is filed")
+            .name
+    }
+
+    /// A create under a name a running box holds is refused, and the
+    /// reply names the holder for the client to print and exit 2 on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_session_reply_names_the_holder_of_a_held_name() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let holder = create(&mut client, &entry_req("dev", false)).await;
+        assert_eq!(name_of(&server, holder).await.as_deref(), Some("dev"));
+
+        let error = match client
+            .call::<CreateSession>(&create_session_req("dev", "/tmp"))
+            .await
+        {
+            Errorable::Err { error } => error,
+            Errorable::Ok(created) => panic!("a held name is not refused: {created:?}"),
+        };
+        let refusal = HeldNameRefusal::from_error(&error)
+            .unwrap_or_else(|| panic!("the reply names the holder: {error}"));
+        assert_eq!(
+            refusal,
+            HeldNameRefusal {
+                name: "dev".to_string(),
+                holder: Some(holder),
+                holder_name: "dev".to_string(),
+            }
+        );
+        assert_eq!(HeldNameRefusal::EXIT_CODE, 2);
+        assert!(error.contains(&holder.to_string()), "{error}");
+        assert!(
+            error.contains(&format!("min session rename {holder} <new-name>")),
+            "the refusal names the next step: {error}"
+        );
+        assert_eq!(
+            HeldNameRefusal::from_error("A session with that name already exists"),
+            None,
+            "any other error is not a held-name refusal"
+        );
+    }
+
+    /// A fresh instance takes `<name>-<n>`, with the smallest `n` that no
+    /// retained record uses, while a running box holds `<name>`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_session_fresh_instance_takes_the_smallest_unused_suffix() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let dev = create(&mut client, &entry_req("dev", false)).await;
+        let first = create(&mut client, &entry_req("dev", true)).await;
+        let second = create(&mut client, &entry_req("dev", true)).await;
+        assert_eq!(name_of(&server, dev).await.as_deref(), Some("dev"));
+        assert_eq!(name_of(&server, first).await.as_deref(), Some("dev-1"));
+        assert_eq!(name_of(&server, second).await.as_deref(), Some("dev-2"));
+
+        // A fresh instance with no running holder still takes a suffix.
+        let web = create(&mut client, &entry_req("web", true)).await;
+        assert_eq!(name_of(&server, web).await.as_deref(), Some("web-1"));
+    }
+
+    /// A task entry that is not a DNS label, such as `build_all`, names a
+    /// fresh instance with a valid label, not a refused create.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_session_fresh_instance_maps_the_entry_onto_a_label() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let build = create(&mut client, &entry_req("build_all", true)).await;
+        assert_eq!(
+            name_of(&server, build).await.as_deref(),
+            Some("build-all-1")
+        );
+        let lint = create(&mut client, &entry_req("CI.Lint", true)).await;
+        assert_eq!(name_of(&server, lint).await.as_deref(), Some("ci-lint-1"));
+    }
+}
+
+/// BOX-155 and BOX-164 over the wire: a box's log reads back by id, and a
+/// write from inside the box reaches neither the log nor the record.
+#[cfg(test)]
+mod read_log_tests {
+    use boxes::SessionId;
+    use boxes::store::{BoxDir, LOG_FILE};
+    use minimald_rpc::{CreateSession, Errorable, ReadLogRequest, ReadLogUpdate};
+    use paths::DaemonAbsPath;
+
+    use crate::box_actor::BoxPaths;
+    use crate::box_runtime::BoxOutputLog;
+    use crate::test_harness::{TestClient, TestServer, captured_log, create_session_req};
+
+    /// Reads the box's log over [`READ_LOG_SUBSYSTEM`](minimald_rpc::READ_LOG_SUBSYSTEM)
+    /// without following: every update line, and the extended data.
+    async fn read_log(client: &mut TestClient, id: SessionId) -> (Vec<ReadLogUpdate>, String) {
+        use tokio::io::AsyncWriteExt as _;
+
+        let mut channel = client
+            .open_subsystem(minimald_rpc::READ_LOG_SUBSYSTEM, &[])
+            .await;
+        let req = ReadLogRequest {
+            id,
+            offset: 0,
+            follow: false,
+        };
+        let mut writer = channel.make_writer();
+        writer
+            .write_all(&serde_json_lenient::to_vec(&req).unwrap())
+            .await
+            .unwrap();
+        drop(writer);
+        channel.eof().await.unwrap();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while let Some(msg) = channel.wait().await {
+                match msg {
+                    russh::ChannelMsg::Data { data } => out.extend_from_slice(&data),
+                    russh::ChannelMsg::ExtendedData { data, .. } => err.extend_from_slice(&data),
+                    russh::ChannelMsg::Close => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the read answers in time");
+        let updates = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json_lenient::from_str(line).expect("each line is an update"))
+            .collect();
+        (updates, String::from_utf8_lossy(&err).into_owned())
+    }
+
+    /// The directories mounted into the box whose directory is `dir`.
+    fn box_paths(dir: &BoxDir) -> BoxPaths {
+        let root = dir.log_path().parent().unwrap();
+        BoxPaths {
+            working: paths::sub_path!(root, "tree"),
+            cache: paths::sub_path!(root, "cache"),
+            home: paths::sub_path!(root, "home"),
+            patches: paths::sub_path!(root, "patches"),
+            hooks: paths::sub_path!(root, "hooks"),
+        }
+    }
+
+    fn visible(paths: &BoxPaths) -> [&DaemonAbsPath; 5] {
+        [
+            &paths.working,
+            &paths.cache,
+            &paths.home,
+            &paths.patches,
+            &paths.hooks,
+        ]
+    }
+
+    async fn create(client: &mut TestClient, name: &str) -> SessionId {
+        match client
+            .call::<CreateSession>(&create_session_req(name, "/tmp"))
+            .await
+        {
+            Errorable::Ok(created) => created.id,
+            Errorable::Err { error } => panic!("the create is refused: {error}"),
+        }
+    }
+
+    /// BOX-164, placement and refusal: the log, the record and the events
+    /// sit outside every directory the box sees. A log, a record, a spec or
+    /// an events file written into those directories, as root inside the
+    /// box can, is not the box's: the log reads back only what the daemon
+    /// wrote, and the record is unchanged. A link planted where a log goes
+    /// is refused, not written through, and the daemon log names the
+    /// refusal. No process runs inside a box here. The proof that uid 0
+    /// inside a real sandbox cannot write is the `_root_integration` test
+    /// that #2661 owns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_box_root_cannot_write_record_or_log() {
+        let capture = captured_log();
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let id = create(&mut client, "guarded").await;
+        let state = server.state.minimal_state_dir().await;
+        let dir = BoxDir::find(&state, &id)
+            .unwrap()
+            .expect("the created box has a directory");
+        let paths = box_paths(&dir);
+        let record = dir.record().unwrap();
+        let spec_path = dir
+            .log_path()
+            .parent()
+            .unwrap()
+            .as_utf8_path()
+            .join("spec.json");
+        let spec = std::fs::read(&spec_path).ok();
+
+        for daemon_file in [dir.log_path(), dir.events_path()] {
+            for seen in visible(&paths) {
+                assert!(
+                    !daemon_file.starts_with(seen),
+                    "{} is inside {}, which the box sees",
+                    daemon_file.as_str(),
+                    seen.as_str()
+                );
+            }
+        }
+
+        // The daemon writes the box's output.
+        let mut log = BoxOutputLog::open(id, &paths).expect("the daemon opens the box's log");
+        log.write(b"from the daemon\r\n");
+
+        // Root inside the box writes everywhere it can reach.
+        let mut forged = record.clone();
+        forged.exit_code = Some(9);
+        forged.parent = Some(SessionId::mint());
+        let forged = serde_json_lenient::to_vec(&forged).unwrap();
+        for seen in visible(&paths) {
+            let seen = seen.as_utf8_path();
+            std::fs::create_dir_all(seen).unwrap();
+            for name in [LOG_FILE, boxes::events::EVENTS_FILE, "spec.json"] {
+                std::fs::write(seen.join(name), b"forged\n").unwrap();
+            }
+            std::fs::write(seen.join("record.json"), &forged).unwrap();
+        }
+        log.write(b"still the daemon\r\n");
+
+        let (updates, err) = read_log(&mut client, id).await;
+        let expected = b"from the daemon\r\nstill the daemon\r\n".to_vec();
+        let len = expected.len() as u64;
+        assert_eq!(
+            updates,
+            [
+                ReadLogUpdate::Output {
+                    offset: 0,
+                    data: expected
+                },
+                ReadLogUpdate::Done { offset: len },
+            ],
+            "only what the daemon wrote reads back (stderr: {err})"
+        );
+        assert_eq!(dir.record().unwrap(), record, "the record is unchanged");
+        assert_eq!(
+            std::fs::read(&spec_path).ok(),
+            spec,
+            "the spec is unchanged"
+        );
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(dir.log_path().as_utf8_path())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "only the daemon's user can open the log"
+            );
+        }
+
+        // A link where a second box's log goes is refused, not followed.
+        let linked = create(&mut client, "linked").await;
+        let linked_dir = BoxDir::find(&state, &linked).unwrap().unwrap();
+        let linked_paths = box_paths(&linked_dir);
+        std::fs::create_dir_all(linked_paths.working.as_utf8_path()).unwrap();
+        let target = linked_paths.working.as_utf8_path().join("target");
+        std::fs::write(&target, b"").unwrap();
+        std::os::unix::fs::symlink(&target, linked_dir.log_path().as_utf8_path()).unwrap();
+        assert!(
+            BoxOutputLog::open(linked, &linked_paths).is_err(),
+            "a box whose log is refused does not get a log"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"",
+            "the link was not written through"
+        );
+        let logged = capture.contents();
+        assert!(
+            logged.contains("refused to open the box's output log")
+                && logged.contains(linked_dir.log_path().as_str()),
+            "the daemon log names the refused log: {logged}"
+        );
+
+        // A read of a box no record names is refused before any update.
+        let unknown = SessionId::mint();
+        let (updates, err) = read_log(&mut client, unknown).await;
+        assert!(updates.is_empty(), "{updates:?}");
+        assert!(err.contains(minimald_rpc::UNKNOWN_SESSION_ID_LEAD), "{err}");
     }
 }

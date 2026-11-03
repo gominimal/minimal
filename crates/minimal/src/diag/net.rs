@@ -47,7 +47,7 @@ impl Stage {
     }
 }
 
-/// A staged connection-health record for one provider's daemon socket.
+/// A staged connection-health record for one host's daemon socket.
 ///
 /// Reaching the daemon has four steps, each a prerequisite for the next:
 /// `stat()` the socket file, `connect()`, complete the SSH handshake + auth,
@@ -163,15 +163,15 @@ pub async fn probe_socket(sock_path: &Path) -> (SocketProbe, Option<crate::clien
     (probe, Some(client))
 }
 
-/// Records `probe` as `providers/<provider>/socket-probe.json`.
+/// Records `probe` as `providers/<host>/socket-probe.json`.
 pub async fn add_probe(
     w: &mut BundleWriter,
-    provider: &str,
+    host: &str,
     probe: &SocketProbe,
 ) -> Result<(), anyhow::Error> {
     let json = serde_json_lenient::to_vec_pretty(probe).context("serializing socket probe")?;
     w.add_bytes(
-        &format!("providers/{provider}/socket-probe.json"),
+        &format!("providers/{host}/socket-probe.json"),
         &json,
         Redaction::None,
     )

@@ -275,7 +275,7 @@ fn the_guest_daemons_records_reach_the_host_spool_and_endpoint_over_vsock() {
         "no endpoint or header reached the guest: {cmdline}"
     );
     // The console capture goes where the VMM child puts it: `MINVMD_BOOT_LOG`
-    // when set (the KVM lane sets it for every harness), else the provider
+    // when set (the KVM lane sets it for every harness), else the host
     // directory's `boot.log`.
     let boot_log_path = std::env::var_os("MINVMD_BOOT_LOG")
         .filter(|v| !v.is_empty())

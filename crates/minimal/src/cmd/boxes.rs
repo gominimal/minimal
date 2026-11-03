@@ -17,8 +17,12 @@ mod exec;
 mod hooks;
 #[path = "boxes/lifecycle.rs"]
 mod lifecycle;
+#[path = "boxes/list.rs"]
+mod list;
 #[path = "boxes/policy.rs"]
 mod policy;
+#[path = "boxes/show.rs"]
+mod show;
 #[path = "boxes/vm_host.rs"]
 mod vm_host;
 
@@ -27,5 +31,7 @@ pub use create::*;
 pub(crate) use exec::*;
 pub(crate) use hooks::*;
 pub(crate) use lifecycle::*;
+pub use list::*;
 pub use policy::*;
+pub use show::*;
 pub(crate) use vm_host::*;

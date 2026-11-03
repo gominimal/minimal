@@ -137,6 +137,12 @@ pub struct LocalBackend<SF: SourceFetcher + 'static> {
     pub(crate) log_sink: Option<mpsc::UnboundedSender<BuildEvent>>,
     pub(crate) ot: Option<OpTracker>,
     pub(crate) cancel: tokio_util::sync::CancellationToken,
+    /// The classifier leaf of the box these builds run for, if any
+    /// (NET-155). Every spec build this backend schedules runs in it.
+    pub(crate) classifier_leaf: Option<sandbox::config::ClassifierLeaf>,
+    /// The network of the own-address box these builds run for, if any
+    /// (NET-155). Every spec build this backend schedules attaches to it.
+    pub(crate) box_network: Option<op::BuildNetwork>,
 }
 
 impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
@@ -221,6 +227,8 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
                 cpu_weight: Some(
                     ((3 * cost + 60 + depended_on_by * cost.max(1) * 25) as u64).min(10000),
                 ),
+                classifier_leaf: shared.backend.classifier_leaf.clone(),
+                box_network: shared.backend.box_network.clone(),
             };
 
             let res = b
@@ -297,21 +305,29 @@ impl<SF: SourceFetcher> Backend for LocalBackend<SF> {
                     .ok();
                 });
 
-                let (fetch_time, pending_dir) = remote_cache
+                match remote_cache
                     .materialize(&spec_hash, &shared.cache, build.name.as_str())
                     .await
-                    .map_err(|e| Error::Other(e.into()))?;
-
-                Ok(Either::Left((
-                    pending_dir,
-                    EntryMeta {
-                        inner: MetaInner::Spec(build.name.clone()),
-                        fetched: true,
-                        fetch_ms: Some(fetch_time.as_millis() as usize),
-                        origin: Some(build.from.as_ref().clone()),
-                        ..Default::default()
-                    },
-                )))
+                {
+                    Ok((fetch_time, pending_dir)) => Ok(Either::Left((
+                        pending_dir,
+                        EntryMeta {
+                            inner: MetaInner::Spec(build.name.clone()),
+                            fetched: true,
+                            fetch_ms: Some(fetch_time.as_millis() as usize),
+                            origin: Some(build.from.as_ref().clone()),
+                            ..Default::default()
+                        },
+                    ))),
+                    // A dangling index hit: the index lists an artifact the
+                    // store no longer has. rcache has logged it
+                    // (`kind = "dangling_hit"`); it is a miss, not a failure,
+                    // but this deliverable is a cache fill with no build to
+                    // fall back on, so the orchestrator hands the spec back
+                    // for a re-plan that treats it as uncached.
+                    Err(rcache::Error::NotFound { .. }) => Err(Error::DanglingCacheHit(vec![bsr])),
+                    Err(e) => Err(Error::Other(anyhow::anyhow!("{}: {e}", build.name))),
+                }
             } else {
                 Err(Error::Cache(CacheErr::NotFound))
             };
@@ -402,6 +418,8 @@ impl<SF: SourceFetcher> LocalBackend<SF> {
         log_sink: Option<mpsc::UnboundedSender<BuildEvent>>,
         ot: Option<OpTracker>,
         cancel: tokio_util::sync::CancellationToken,
+        classifier_leaf: Option<sandbox::config::ClassifierLeaf>,
+        box_network: Option<op::BuildNetwork>,
     ) -> Result<Orchestrator<Self>, Error> {
         Ok(Orchestrator {
             backend: LocalBackend::<SF> {
@@ -413,11 +431,25 @@ impl<SF: SourceFetcher> LocalBackend<SF> {
                 num_concurrent_builds,
                 ot,
                 cancel,
+                classifier_leaf,
+                box_network,
             },
             graph,
             cache,
             daemon_id,
         })
+    }
+
+    /// The classifier leaf every spec build of this backend runs in, if the
+    /// builds run for a box (NET-155).
+    pub fn classifier_leaf(&self) -> Option<&sandbox::config::ClassifierLeaf> {
+        self.classifier_leaf.as_ref()
+    }
+
+    /// The network every spec build of this backend attaches to, if the
+    /// builds run for an own-address box (NET-155).
+    pub fn box_network(&self) -> Option<&op::BuildNetwork> {
+        self.box_network.as_ref()
     }
 
     /// Executes a local build with the orchestrator.

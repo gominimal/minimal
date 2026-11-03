@@ -1,5 +1,9 @@
 //! The minimal CLI which pairs/talks-with minimald.
 
+// The in-process daemon's async bodies are deep: rustc's default query depth (128)
+// overflows computing their layout (`queries overflow the depth limit!`), as the
+// daemon crates themselves already declare.
+#![recursion_limit = "256"]
 use std::io::IsTerminal as _;
 use std::io::Write as _;
 use std::process::ExitCode;
@@ -190,7 +194,9 @@ async fn run() -> ExitCode {
 }
 
 /// The exit code a failed run ends with, from the architecture's reserved
-/// codes ("Exit codes"): 3 when the activation refused the box spec
+/// codes ("Exit codes"): 2 when a running box holds the name a create
+/// asked for (`minimald_rpc::HeldNameRefusal`), 3 when the activation
+/// refused the box spec
 /// (`boxes::core::bep::ActivationRefused`) or found the project's
 /// `minimal.toml` invalid (`minimal::ProjectFileInvalid`) or a GitHub
 /// grant undeliverable (`minimal::GrantNotDelivered`), 7 when the VM host could not
@@ -203,6 +209,10 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     // BEP-008/009/010/017/056: a box spec refused at activation.
     if let Some(refused) = e.downcast_ref::<boxes::core::bep::ActivationRefused>() {
         return refused.exit_code();
+    }
+    // BOX-163: a create under a name a running box holds.
+    if e.downcast_ref::<minimald_rpc::HeldNameRefusal>().is_some() {
+        return minimald_rpc::HeldNameRefusal::EXIT_CODE;
     }
     // An invalid project `minimal.toml` refuses the activation with exit 3.
     if e.downcast_ref::<minimal::ProjectFileInvalid>().is_some() {
@@ -290,6 +300,23 @@ fn machine_mode_answer(e: &anyhow::Error) -> MachineModeAnswer {
             refused.code(),
             format!("{e:#}"),
             "on the host, run `min box audit <box>`".to_string(),
+        ));
+    }
+    // BEP-003, Gatehouse §6.2: a refused activation with a defined error
+    // answers with that error and its next step.
+    if let Some((code, hint)) = e
+        .downcast_ref::<boxes::core::bep::ActivationRefused>()
+        .and_then(|refused| {
+            refused
+                .refusals
+                .iter()
+                .find_map(|refusal| Some((refusal.code()?, refusal.next_step()?)))
+        })
+    {
+        return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
+            code,
+            format!("{e:#}"),
+            hint,
         ));
     }
     if e.downcast_ref::<minimal::OutputWriteError>().is_some() {
@@ -710,6 +737,49 @@ mod tests {
                 other => panic!("an unmapped failure is still an object, got {other:?}"),
             }
         }
+    }
+
+    // BEP-003, Gatehouse §6.2: a refused grant box reads as its defined
+    // error under `-o json`, with the refusal's next step as the hint.
+    #[test]
+    fn machine_mode_names_the_grant_refusal_code() {
+        use boxes::core::bep::{ActivationRefused, BepRefusal, ProxyAbsence};
+        let answer = |refusal: BepRefusal| match machine_mode_answer(&anyhow::Error::new(
+            ActivationRefused {
+                refusals: vec![refusal],
+            },
+        )) {
+            MachineModeAnswer::Object(failure) => failure,
+            other => panic!("a refusal is an object, got {other:?}"),
+        };
+        let grants = vec!["GH_TOKEN".to_owned()];
+
+        let failure = answer(BepRefusal::SignInRequired {
+            grants: grants.clone(),
+        });
+        assert_eq!(failure.code(), "github_sign_in_required");
+        assert_eq!(
+            failure.hint(),
+            "run `min auth login`, then create the box again"
+        );
+        assert!(failure.message().contains("Run `min auth login`"));
+
+        let failure = answer(BepRefusal::UnenrolledNode {
+            grants,
+            stored: false,
+            cause: ProxyAbsence::NotInstalled { path: None },
+        });
+        assert_eq!(failure.code(), "gatehouse_unenrolled_node");
+        assert_eq!(
+            failure.hint(),
+            "to create the box without the grant, remove GH_TOKEN from [session.secrets] \
+             in minimal.toml"
+        );
+
+        // A refusal with no defined error stays `unspecified`.
+        let failure = answer(BepRefusal::SteeringOffWithProxyEnv);
+        assert_eq!(failure.code(), "unspecified");
+        assert!(failure.hint().is_empty());
     }
 
     /// An `unspecified` object carries no hint key at all.

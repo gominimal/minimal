@@ -1,7 +1,22 @@
-# gvproxy (gvisor-tap-vsock) pinned pre-built release, verified by SHA-256.
+# gvproxy (gvisor-tap-vsock), built from the pinned source plus every patch in
+# vendor/gvproxy/patches/ applied in sorted order, by scripts/build-gvproxy.sh.
+# scripts/fetch-gvproxy.sh builds an asset and checks it against its digest
+# here. The build is reproducible (CGO_ENABLED=0, -mod=vendor, -trimpath,
+# -buildvcs=false, fixed ldflags), so every host produces these bytes.
 # Source: https://github.com/containers/gvisor-tap-vsock/releases/tag/v0.9.0
-# Digests are the upstream-published sha256sums for each release asset.
+# `commit` is the resolved commit of `version` at pin time. The build fetches
+# the commit, so a moved or deleted tag cannot change what we build.
 version=v0.9.0
-gvproxy-linux-amd64=95c0ee5b5e5d401094ed58ac2f984ba5e935c2cb416c8752329fcfacb721aa9a
-gvproxy-linux-arm64=c1ea864636182a774235c8866c70f2a0223dfcd4f08d24e37a7e82d9882beb9c
-gvproxy-darwin=e2a6825ba789fe588828b418c09aaf16525dec6d8cb2d16c94e72535dd4606be
+commit=6dbb5d4fa0033356c72a201346f8350594229868
+# The Go toolchain the build uses, with the SHA-256 of each host's release
+# archive from https://go.dev/dl/.
+go=1.26.10
+go-linux-amd64=ccfe7ae822d2c2f41f4fe7c956199967a4dac22d0ee0d2b2bfdb440aab3b20c5
+go-linux-arm64=3f4227ce7b206a513e794f1393adb473a07b46e94d18bd15d1c684bbb7319797
+go-darwin-arm64=0b5183492292ada170f9b561a834863808dd02edba599e4ad0e89899330020b3
+# The SHA-256 of each carried patch. A patch that differs stops the build.
+patch.0001-forwarder-unexpose-closes-accepted-connections.patch=65aa05c143c7c14b49bf841081105ee70b318eee2c985377bee549b7f0c92fd2
+# The SHA-256 of each asset the build produces. gvproxy-darwin is darwin-arm64.
+gvproxy-linux-amd64=cd19eca4b3a3701cfd3f56679d3c1e41471c50ef64e86cf461f21bf8cc6fb961
+gvproxy-linux-arm64=c95440ab28913141c6f527acb2aac20158ee48af045aecf878aa43cc0b46765b
+gvproxy-darwin=0ae6ac0e211062ada9bb4dc0d4ceb36aaab569177d69addc4ccdec51c1472f01
