@@ -204,6 +204,33 @@ enum Next<M> {
     Exit(Option<box_runtime::HostExit>),
 }
 
+/// Whether `msg` is handled ahead of an entrypoint exit that is already in.
+/// A stop or a destroy ends the box as it asked, so the exit is then
+/// nobody's. Every other message waits for the exit to end the box first,
+/// so an attach or an exec queued beside it never relaunches the entrypoint
+/// (BOX-038).
+fn goes_before_exit(msg: &BoxMessage) -> bool {
+    matches!(
+        msg,
+        BoxMessage::Stop(_) | BoxMessage::StopBox { .. } | BoxMessage::Destroy(_)
+    )
+}
+
+/// The exit that `watch` already holds, taking the watch: `Some(None)` when
+/// the loop ended with no exit to read, `None` when the loop still runs or
+/// nothing is watched.
+fn ready_entrypoint_exit(
+    watch: &mut Option<EntrypointWatch>,
+) -> Option<Option<box_runtime::HostExit>> {
+    let ready = match watch.as_mut()?.try_recv() {
+        Ok(exit) => Some(exit),
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed) => None,
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return None,
+    };
+    *watch = None;
+    Some(ready)
+}
+
 /// The exit `watch` receives, or never when nothing is watched.
 async fn next_entrypoint_exit(
     watch: &mut Option<EntrypointWatch>,
@@ -1500,8 +1527,25 @@ impl BoxActor {
                 msg = self.receiver.recv() => Next::Message(msg),
                 exit = next_entrypoint_exit(&mut self.entrypoint_watch) => Next::Exit(exit),
             };
-            let (msg, caller) = match next {
-                Next::Message(Some(msg)) => msg,
+            let ((msg, caller), ended) = match next {
+                Next::Message(Some(queued)) => {
+                    // An exit already in ends the box before any message
+                    // that is not a stop or a destroy. The message then
+                    // finds the box exited: an attach resumes it, and an
+                    // exec is refused.
+                    let mut ended = None;
+                    if !goes_before_exit(&queued.0)
+                        && let Some(exit) = ready_entrypoint_exit(&mut self.entrypoint_watch)
+                    {
+                        if let Some(exit) = exit
+                            && let ControlFlow::Break(t) = self.end_on_entrypoint_return(exit).await
+                        {
+                            ended = Some(t);
+                        }
+                        self.publish_host();
+                    }
+                    (queued, ended)
+                }
                 Next::Message(None) => break,
                 Next::Exit(exit) => {
                     self.entrypoint_watch = None;
@@ -1533,6 +1577,14 @@ impl BoxActor {
                 break;
             }
             self.publish_host();
+            // The box ended before the message. Unless the message resumed
+            // it, no actor hosts an ended box (#2393).
+            if let Some(t) = ended
+                && !self.has_live_host()
+            {
+                teardown = t;
+                break;
+            }
         }
         if matches!(teardown, Teardown::SelfInitiated) {
             let session_id = *self.record.id();

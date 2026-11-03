@@ -16196,6 +16196,84 @@ async fn until_complete_ends_on_entrypoint_return_without_client_records_exited(
     assert_eq!(exited.data["exit_code"], 0);
 }
 
+// BOX-038: an exec's `EnsureHost` is already queued when the entrypoint of
+// an `until_complete` box returns. The exit wins: the box ends `exited`
+// with its code and an `exited` event, and the exec is refused, so the
+// entrypoint is not launched again behind the record's back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn until_complete_ends_on_entrypoint_return_without_client_before_queued_ensure_host() {
+    use boxes::core::record::{ExitEnding, RecordState};
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_session(&mut client).await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session launches a headless host");
+    let started_before = {
+        let mut events = manager.box_events(session_id).await.unwrap();
+        events
+            .read_new()
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == boxes::events::BoxEventType::Started)
+            .count()
+    };
+
+    // The actor is held while the entrypoint returns and the exec's
+    // `EnsureHost` queues, so both are waiting when it wakes.
+    let release = handle.hold_for_test().await;
+    host.feed_stdin(format!("{}\n", crate::box_runtime::MOCK_EXIT_LINE).into_bytes())
+        .await;
+    tokio::time::timeout(Duration::from_secs(10), host.closed())
+        .await
+        .expect("the host ends with its entrypoint");
+    let queued = {
+        let handle = handle.clone();
+        crate::traced::spawn(async move { handle.ensure_host("tester".to_string()).await })
+    };
+    handle.until_queued(1).await;
+    drop(release);
+
+    let ensured = tokio::time::timeout(Duration::from_secs(10), queued)
+        .await
+        .expect("the queued exec is answered")
+        .unwrap();
+    assert!(
+        ensured.is_err(),
+        "the queued exec launched a host in an exited box"
+    );
+
+    let record = record_once_exited(&manager, session_id).await;
+    assert_eq!(
+        record.state().unwrap(),
+        RecordState::Exited(ExitEnding::Exit { exit_code: 0 })
+    );
+    let mut events = manager.box_events(session_id).await.unwrap();
+    let events = events.read_new().unwrap();
+    let exited = events
+        .iter()
+        .find(|e| e.kind == boxes::events::BoxEventType::Exited)
+        .expect("the end records an exited event");
+    assert_eq!(exited.data["reason"], "exit");
+    assert_eq!(exited.data["exit_code"], 0);
+    let started_after = events
+        .iter()
+        .filter(|e| e.kind == boxes::events::BoxEventType::Started)
+        .count();
+    assert_eq!(
+        started_after, started_before,
+        "the entrypoint started again after it returned"
+    );
+}
+
 // BOX-038: the host is gone once the entrypoint returns, so a write of the
 // exited record that fails at first is retried, and the box still ends as
 // exited with its code and its event.

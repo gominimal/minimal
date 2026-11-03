@@ -1266,6 +1266,29 @@ impl BoxActor {
             if record.status != BoxState::Active {
                 return Err(AttachError::SessionPending);
             }
+            // An ended box is resumed only by an attach (BOX-025). A host
+            // launched here would run its entrypoint again behind the
+            // record's back.
+            if let Ok(
+                state @ (boxes::core::record::RecordState::Stopped(_)
+                | boxes::core::record::RecordState::Exited(_)),
+            ) = record.state()
+            {
+                return Err(AttachError::ResumeRefused(
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "box {} is {}. Only a running box can run a command.",
+                            record
+                                .name
+                                .clone()
+                                .unwrap_or_else(|| self.record.id().to_string()),
+                            state.name()
+                        ),
+                    ),
+                    2,
+                ));
+            }
             // Attach's refusal, for the same reason: neither the host a
             // later launch left in the slot nor a fresh one would hold the
             // registered box's host-side row.
