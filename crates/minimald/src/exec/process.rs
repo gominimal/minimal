@@ -1109,7 +1109,10 @@ impl ExecBox {
         event.data.insert(
             exec_data::ARGV.into(),
             serde_json_lenient::Value::Array(
-                facts.argv.iter().map(|w| w.as_str().into()).collect(),
+                scrubbed_argv(&facts.argv)
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
             ),
         );
         if let Some(exit) = exit {
@@ -1147,14 +1150,40 @@ pub(crate) enum ExecGate {
 }
 
 /// Whether the spec `bytes` set `io.exec_enabled = false` (BOX-153).
-/// `None` when the bytes do not parse as JSON.
+/// `None` when the bytes do not parse as a JSON object.
 pub(crate) fn stored_spec_disables_exec(bytes: &[u8]) -> Option<bool> {
     let spec = serde_json_lenient::from_slice::<serde_json_lenient::Value>(bytes).ok()?;
+    if !spec.is_object() {
+        return None;
+    }
     Some(
         spec.get("io")
             .and_then(|io| io.get("exec_enabled")?.as_bool())
             == Some(false),
     )
+}
+
+/// An exec's argv as its events store it (BOX-152): each word with its
+/// credential-shaped tokens masked, as the exec's log lines mask them, and
+/// the word after a long flag that names a secret (`--password x`) masked
+/// whole. The events file is on disk and every events reader sees it.
+pub(crate) fn scrubbed_argv(argv: &[String]) -> Vec<String> {
+    let mut previous: Option<&str> = None;
+    argv.iter()
+        .map(|word| {
+            let secret_value = previous.is_some_and(|flag| {
+                flag.starts_with("--")
+                    && !flag.contains('=')
+                    && diagnostics::redact::is_sensitive_key(flag)
+            }) && !word.starts_with('-');
+            previous = Some(word);
+            if secret_value {
+                format!("<redacted:len={}>", word.len())
+            } else {
+                diagnostics::redact::scrub_secrets(word).into_owned()
+            }
+        })
+        .collect()
 }
 
 /// Who ran an exec and what it ran, as its events carry them (BOX-152).
@@ -1336,13 +1365,19 @@ async fn supervise_managed_exec(
     if let Some(feed) = feed {
         feed.abort();
     }
-    // A tty pump stops at the drain. A detached pump keeps on, so the
-    // transcript still gets what a descendant writes after the exit.
+    // The pump stops at the drain, in every mode. A descendant that keeps
+    // the terminal or the pipe open must not hold the pump, its descriptor
+    // and its transcript file for the daemon's life. The pump waits in the
+    // runtime, not in a blocking thread, so the abort ends it.
     if tokio::time::timeout(TERMINAL_DRAIN, &mut pump)
         .await
         .is_err()
-        && entry.mode == ExecMode::Tty
     {
+        tracing::info!(
+            exec_id = %entry.id,
+            mode = entry.mode.name(),
+            "exec: output still open after the exit; the transcript stops here"
+        );
         pump.abort();
     }
     let code = status.unwrap_or_else(|error| {
@@ -1367,12 +1402,13 @@ async fn supervise_managed_exec(
     entry.finish(exit);
 }
 
-/// The stop of every managed exec that still runs, by its id (BOX-151).
+/// The stop of every exec that still runs, by its id (BOX-151): a tty or a
+/// detached exec, and an attached one.
 /// The supervisor of the exec removes its token when the exec ends.
 static STOPS: std::sync::LazyLock<std::sync::Mutex<BTreeMap<ExecId, CancellationToken>>> =
     std::sync::LazyLock::new(Default::default);
 
-fn register_stop(id: &ExecId) -> CancellationToken {
+pub(crate) fn register_stop(id: &ExecId) -> CancellationToken {
     let token = CancellationToken::new();
     STOPS
         .lock()
@@ -1381,7 +1417,7 @@ fn register_stop(id: &ExecId) -> CancellationToken {
     token
 }
 
-fn forget_stop(id: &ExecId) {
+pub(crate) fn forget_stop(id: &ExecId) {
     STOPS.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
 }
 
@@ -1621,6 +1657,8 @@ pub struct TimedBoxExec {
     pub timeout: Option<Duration>,
     /// Set when the timeout ended the exec, for its `exec_exited` reason.
     pub timed_out: Arc<AtomicBool>,
+    /// Fires when a stop of the exec's id ends it (BOX-151).
+    pub stop: CancellationToken,
 }
 
 impl Exec for TimedBoxExec {
@@ -1635,6 +1673,7 @@ impl Exec for TimedBoxExec {
             inner,
             timeout,
             timed_out,
+            stop,
         } = self;
         inner
             .exec(session)
@@ -1643,6 +1682,8 @@ impl Exec for TimedBoxExec {
                     inner,
                     deadline: timeout_deadline(timeout),
                     timed_out: Arc::clone(&timed_out),
+                    stop: stop.clone(),
+                    stopped: false,
                 })
             })
             .boxed()
@@ -1656,12 +1697,16 @@ pub(crate) fn timeout_deadline(timeout: Option<Duration>) -> Option<tokio::time:
     timeout.and_then(|t| tokio::time::Instant::now().checked_add(t))
 }
 
-/// A [`Process`] that [`Process::start_kill`]s itself at its deadline.
+/// A [`Process`] that [`Process::start_kill`]s itself at its deadline, or
+/// when a stop of its exec fires.
 #[derive(Debug)]
 pub struct TimedProcess<P> {
     pub(super) inner: P,
     pub(super) deadline: Option<tokio::time::Instant>,
     pub(super) timed_out: Arc<AtomicBool>,
+    pub(super) stop: CancellationToken,
+    /// Set once the stop asked the process to end.
+    pub(super) stopped: bool,
 }
 
 impl<P: Process> Process for TimedProcess<P> {
@@ -1674,21 +1719,40 @@ impl<P: Process> Process for TimedProcess<P> {
     }
 
     // Cancel-safe: the deadline is fixed at the spawn, the inner `wait` is
-    // cancel-safe, and `timed_out` is set before the next await point.
+    // cancel-safe, and `timed_out` and `stopped` are set before the next
+    // await point.
     async fn wait(&mut self) -> io::Result<Option<i32>> {
-        if let Some(deadline) = self.deadline
-            && !self.timed_out.load(Ordering::SeqCst)
-        {
-            match tokio::time::timeout_at(deadline, self.inner.wait()).await {
-                Ok(status) => return status,
-                Err(_elapsed) => {
+        if !self.timed_out.load(Ordering::SeqCst) && !self.stopped {
+            let deadline = self.deadline;
+            let stop = self.stop.clone();
+            let at_deadline = async move {
+                match deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                status = self.inner.wait() => return status,
+                () = at_deadline => {
                     self.timed_out.store(true, Ordering::SeqCst);
                     tracing::info!("exec: the command ran past its timeout; stopping it");
                     if let Err(error) = self.inner.start_kill() {
                         tracing::warn!(%error, "exec: failed to stop the command at its timeout");
                     }
                 }
+                () = stop.cancelled() => {
+                    self.stopped = true;
+                    tracing::info!("exec: a stop of the exec asked the command to end");
+                    if let Err(error) = self.inner.start_kill() {
+                        tracing::warn!(%error, "exec: failed to stop the command");
+                    }
+                }
             }
+        }
+        if self.stopped {
+            let status = wait_after_stop(&mut self.inner).await;
+            tracing::info!("exec stopped");
+            return status;
         }
         if self.timed_out.load(Ordering::SeqCst) {
             // The timeout ended the exec, so its status is the timeout's,

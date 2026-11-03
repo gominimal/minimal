@@ -555,6 +555,27 @@ async fn run_attached_exec(
             None,
         );
     }
+    // BOX-151: an attached exec is known by its id while it runs, so a stop
+    // or a wait by that id finds it. It has no transcript. The path only
+    // ties the entry to the box's directory, which a reap removes.
+    let entry = exec_box.as_ref().map(|exec_box| {
+        let transcript = boxes::store::exec_transcript_path(&exec_box.dir, exec_id.as_str());
+        if let Some(dir) = transcript.parent()
+            && let Err(error) = std::fs::create_dir_all(dir)
+        {
+            tracing::warn!(%exec_id, %error, "exec: could not create the box's execs directory");
+        }
+        let entry = Arc::new(ExecEntry::new(
+            exec_id.clone(),
+            exec_box.record.id,
+            ExecMode::Attached,
+            transcript,
+            None,
+        ));
+        register_exec(Arc::clone(&entry));
+        entry
+    });
+    let stop = register_stop(&exec_id);
     let timed_out = Arc::new(AtomicBool::new(false));
     let task = ExecTask {
         conn,
@@ -569,9 +590,11 @@ async fn run_attached_exec(
             },
             timeout,
             timed_out: Arc::clone(&timed_out),
+            stop,
         },
     };
     let status = task.run(channel).await;
+    forget_stop(&exec_id);
     let reason = if timed_out.load(Ordering::SeqCst) {
         ExecExitReason::Timeout
     } else {
@@ -589,6 +612,9 @@ async fn run_attached_exec(
             &facts,
             Some(exit),
         );
+    }
+    if let Some(entry) = &entry {
+        entry.finish(exit);
     }
     tracing::info!(
         %exec_id,

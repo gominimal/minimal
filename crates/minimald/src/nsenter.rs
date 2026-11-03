@@ -948,7 +948,19 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
     // pid stays allocated and still names the group, so neither a handler nor
     // the grace period below can target a recycled group. The handlers return
     // (they only record and signal), so an interrupted wait is resumed.
+    //
+    // A tty exec leads its own session, and a shell on its PTY puts each job
+    // in a process group of its own. The handler's SIGTERM reaches only the
+    // leader's group, so this flow sends the session's other groups theirs
+    // as soon as it sees the termination (BOX-151).
+    let mut session_termed = false;
     loop {
+        if take_terminal && !session_termed && TERM_SIGNAL.load(Ordering::SeqCst) != 0 {
+            session_termed = true;
+            if let Some(proc_dir) = &proc_dir {
+                signal_session(proc_dir, pgid, libc::SIGTERM, Some(pgid));
+            }
+        }
         // SAFETY: `waitid` writes only into `info`, a zeroed `siginfo_t` we own.
         let observed = unsafe {
             let mut info: libc::siginfo_t = std::mem::zeroed();
@@ -977,21 +989,34 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
     block_termination_signals();
     let terminated_by = TERM_SIGNAL.load(Ordering::SeqCst);
     if terminated_by != 0 {
+        if take_terminal
+            && !session_termed
+            && !GRACE_EXPIRED.load(Ordering::SeqCst)
+            && let Some(proc_dir) = &proc_dir
+        {
+            signal_session(proc_dir, pgid, libc::SIGTERM, Some(pgid));
+        }
         // The usual shape: the leader died of the SIGTERM while a member it
         // forked traps or ignores it. Hold the leader as a zombie, so the pgid
         // stays allocated, until the grace period runs out (the SIGALRM
         // handler sets the flag and has already SIGKILLed the group) or the
         // group has no live member left. Then SIGKILL whatever remains.
         while !GRACE_EXPIRED.load(Ordering::SeqCst)
-            && proc_dir
-                .as_ref()
-                .is_none_or(|proc_dir| group_has_live_member(proc_dir, pgid))
+            && proc_dir.as_ref().is_none_or(|proc_dir| {
+                group_has_live_member(proc_dir, pgid)
+                    || (take_terminal && session_has_live_member(proc_dir, pgid))
+            })
         {
             std::thread::sleep(GROUP_POLL);
         }
         // SAFETY: `pgid` names the group this shim spawned, which its unreaped
         // leader keeps from being recycled.
         unsafe { kill_group(pgid) };
+        // A tty exec: every job of its session, in whatever group, ends too.
+        // The unreaped leader keeps the session id from being recycled.
+        if take_terminal && let Some(proc_dir) = &proc_dir {
+            signal_session(proc_dir, pgid, libc::SIGKILL, None);
+        }
     }
 
     // Disarm: no alarm left to fire, and from here the handlers are no-ops so
@@ -1177,6 +1202,74 @@ fn block_termination_signals() {
 /// scan that cannot be made answers `true`, which only costs the early exit:
 /// the grace period then runs to its end.
 fn group_has_live_member(proc_dir: &std::fs::File, pgid: libc::pid_t) -> bool {
+    let mut live = false;
+    let scanned = scan_live_processes(proc_dir, |_, member| {
+        live = member.pgrp == pgid;
+        live
+    });
+    live || !scanned
+}
+
+/// Whether the session `sid` has a member that is still running, read as
+/// [`group_has_live_member`] reads a group. A scan that cannot be made
+/// answers `true`.
+pub(crate) fn session_has_live_member(proc_dir: &std::fs::File, sid: libc::pid_t) -> bool {
+    if sid <= 1 {
+        return false;
+    }
+    let mut live = false;
+    let scanned = scan_live_processes(proc_dir, |_, member| {
+        live = member.session == sid;
+        live
+    });
+    live || !scanned
+}
+
+/// Sends `signal` to every live process of the session `sid` under
+/// `proc_dir`, in every process group of it, except the members of
+/// `skip_group`. A tty exec leads its own session, and a shell with job
+/// control puts each job in a group of its own, so a group kill does not
+/// reach them (BOX-151). A process that calls `setsid(2)` leaves the
+/// session and is not signalled. Any `sid <= 1` is a no-op.
+///
+/// The caller must keep the session leader unreaped, so the session id
+/// cannot be recycled while the scan runs.
+pub(crate) fn signal_session(
+    proc_dir: &std::fs::File,
+    sid: libc::pid_t,
+    signal: libc::c_int,
+    skip_group: Option<libc::pid_t>,
+) {
+    if sid <= 1 {
+        return;
+    }
+    scan_live_processes(proc_dir, |pid, member| {
+        if member.session == sid
+            && Some(member.pgrp) != skip_group
+            && let Ok(pid) = libc::pid_t::try_from(pid)
+        {
+            // SAFETY: `kill(2)` has no Rust-side invariants. ESRCH means the
+            // process ended since the scan read it.
+            unsafe { libc::kill(pid, signal) };
+        }
+        false
+    });
+}
+
+/// The fields of a `/proc/<pid>/stat` line that the group and session
+/// scans read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcMember {
+    pgrp: libc::pid_t,
+    session: libc::pid_t,
+}
+
+/// Calls `visit` with every process under `proc_dir` that is not a zombie,
+/// until `visit` answers `true`. False when the scan cannot be made.
+fn scan_live_processes(
+    proc_dir: &std::fs::File,
+    mut visit: impl FnMut(u32, ProcMember) -> bool,
+) -> bool {
     // A fresh open file description for every scan: a `dup` would share the
     // directory offset the previous scan left at the end.
     // SAFETY: `openat` on a directory fd this function borrows, with a static
@@ -1189,7 +1282,7 @@ fn group_has_live_member(proc_dir: &std::fs::File, pgid: libc::pid_t) -> bool {
         )
     };
     if fd < 0 {
-        return true;
+        return false;
     }
     // SAFETY: `fd` is an open directory this function owns; on success
     // `fdopendir` takes it over and `closedir` below closes it.
@@ -1197,9 +1290,8 @@ fn group_has_live_member(proc_dir: &std::fs::File, pgid: libc::pid_t) -> bool {
     if dir.is_null() {
         // SAFETY: `fdopendir` failed, so `fd` is still ours to close.
         unsafe { libc::close(fd) };
-        return true;
+        return false;
     }
-    let mut live = false;
     loop {
         // SAFETY: `dir` is the open stream above, used by this thread only.
         let entry = unsafe { libc::readdir(dir) };
@@ -1212,22 +1304,21 @@ fn group_has_live_member(proc_dir: &std::fs::File, pgid: libc::pid_t) -> bool {
         let Some(pid) = name.to_str().ok().and_then(|n| n.parse::<u32>().ok()) else {
             continue;
         };
-        if is_live_member(proc_dir, pid, pgid) {
-            live = true;
+        if let Some(member) = live_member(proc_dir, pid)
+            && visit(pid, member)
+        {
             break;
         }
     }
     // SAFETY: `dir` came from `fdopendir` above and is closed exactly once.
     unsafe { libc::closedir(dir) };
-    live
+    true
 }
 
-/// Whether `pid` (under `proc_dir`) is in group `pgid` and not a zombie. A
-/// process that is gone, or whose `stat` cannot be read, is not.
-fn is_live_member(proc_dir: &std::fs::File, pid: u32, pgid: libc::pid_t) -> bool {
-    let Ok(path) = std::ffi::CString::new(format!("{pid}/stat")) else {
-        return false;
-    };
+/// The group and session of `pid` (under `proc_dir`), if it is not a
+/// zombie. A process that is gone, or whose `stat` cannot be read, is none.
+fn live_member(proc_dir: &std::fs::File, pid: u32) -> Option<ProcMember> {
+    let path = std::ffi::CString::new(format!("{pid}/stat")).ok()?;
     // SAFETY: `openat` on a directory fd this function borrows and a
     // NUL-terminated path it owns; the result is checked before use.
     let fd = unsafe {
@@ -1238,30 +1329,40 @@ fn is_live_member(proc_dir: &std::fs::File, pid: u32, pgid: libc::pid_t) -> bool
         )
     };
     if fd < 0 {
-        return false;
+        return None;
     }
     // SAFETY: `fd` was just opened and nothing else owns it.
     let mut file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
     let mut stat = String::new();
-    if std::io::Read::read_to_string(&mut file, &mut stat).is_err() {
-        return false;
-    }
-    stat_is_live_member(&stat, pgid)
+    std::io::Read::read_to_string(&mut file, &mut stat).ok()?;
+    stat_live_member(&stat)
 }
 
 /// Whether a `/proc/<pid>/stat` line names a process in group `pgid` that is
-/// not a zombie. The fields after the parenthesised comm, which may itself
-/// contain `)`, start: state ppid pgrp.
+/// not a zombie.
+#[cfg(test)]
 fn stat_is_live_member(stat: &str, pgid: libc::pid_t) -> bool {
-    let Some((_, after_comm)) = stat.rsplit_once(')') else {
-        return false;
-    };
+    stat_live_member(stat).is_some_and(|member| member.pgrp == pgid)
+}
+
+/// The group and session a `/proc/<pid>/stat` line names, if the process is
+/// not a zombie. The fields after the parenthesised comm, which may itself
+/// contain `)`, start: state ppid pgrp session.
+fn stat_live_member(stat: &str) -> Option<ProcMember> {
+    let (_, after_comm) = stat.rsplit_once(')')?;
     let mut fields = after_comm.split_whitespace();
-    let (Some(state), Some(_ppid), Some(pgrp)) = (fields.next(), fields.next(), fields.next())
+    let (Some(state), Some(_ppid), Some(pgrp), Some(session)) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
     else {
-        return false;
+        return None;
     };
-    pgrp.parse::<libc::pid_t>() == Ok(pgid) && !matches!(state, "Z" | "X")
+    if matches!(state, "Z" | "X") {
+        return None;
+    }
+    Some(ProcMember {
+        pgrp: pgrp.parse().ok()?,
+        session: session.parse().ok()?,
+    })
 }
 
 /// Maps a failed `spawn` to the shell's exit-code and message conventions:
