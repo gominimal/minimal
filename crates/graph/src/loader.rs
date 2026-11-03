@@ -42,6 +42,7 @@ struct Loader {
 
 impl Loader {
     /// upserts the specified build ref, returning the new or already-existing BSR.
+    #[tracing::instrument(level = "debug", skip_all, err(Debug))]
     fn load(&self, br: &builds::BuildRef) -> Result<BuildSpecRef, Error> {
         if let BuildRef::Upstream { name } = br {
             return match self.into_graph.borrow().by_name(name) {
@@ -55,6 +56,7 @@ impl Loader {
     }
 
     /// upserts the specified layer idx, returning the new or already-existing BSR.
+    #[tracing::instrument(level = "debug", skip_all, err(Debug))]
     fn load_idx(&self, idx: &generational_arena::Index) -> Result<BuildSpecRef, Error> {
         // Fast path: already loaded.
         if let Some(bsr) = self.resolved.borrow().get(idx) {
@@ -79,6 +81,7 @@ impl Loader {
         Ok(bsr)
     }
 
+    #[tracing::instrument(level = "info", skip_all, err(Debug))]
     fn load_toplevels(&mut self) -> Result<Vec<BuildSpecRef>, Error> {
         self.from
             .top_levels

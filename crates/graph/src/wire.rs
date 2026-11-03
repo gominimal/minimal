@@ -245,6 +245,7 @@ impl<W: Write> GraphWriter<W> {
     }
 
     /// Writes tag + varint(len) + payload, hashing the entire frame.
+    #[tracing::instrument(level = "trace", skip_all, err)]
     fn write_record(&mut self, tag: u8, payload: &[u8]) -> Result<(), WireError> {
         let (vbuf, vlen) = varint_bytes(payload.len() as u64);
 
@@ -262,6 +263,7 @@ impl<W: Write> GraphWriter<W> {
     }
 
     /// Serialises the entire graph into the underlying writer.
+    #[tracing::instrument(level = "info", skip_all, err)]
     pub fn write_graph(mut self, graph: &Graph) -> Result<(), WireError> {
         // ── Header ──
         let header = HeaderRecord {
