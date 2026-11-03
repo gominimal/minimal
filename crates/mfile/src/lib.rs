@@ -1530,12 +1530,14 @@ impl File {
             // BEP-037: a project cannot set secret-store rules. The table is
             // ignored with its own warning, not the generic unknown-field one.
             boxes::core::bep::warn_project_store_rules(self.extra.keys().map(String::as_str));
+            // NET-159: a project cannot open host ports to its boxes. The
+            // table is ignored with its own warning, as the store rules are.
+            boxes::core::egress::warn_project_host_exposures(self.extra.keys().map(String::as_str));
             let mut unknown = Vec::new();
-            for key in self
-                .extra
-                .keys()
-                .filter(|key| *key != boxes::core::bep::STORE_RULES_TABLE)
-            {
+            for key in self.extra.keys().filter(|key| {
+                *key != boxes::core::bep::STORE_RULES_TABLE
+                    && *key != boxes::core::egress::HOST_EXPOSURES_TABLE
+            }) {
                 match misplaced_top_level_key(key) {
                     Some(correct) => tracing::warn!(
                         "{key} is unknown at the top level of {MFILE_NAME}; did you mean {correct}?"
