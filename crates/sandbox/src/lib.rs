@@ -250,17 +250,6 @@ impl<C: Channel> Sandbox<C> {
             }
         }
         hardlink_dir_contents(&base_dir.join("synth"), &rootfs)?;
-        {
-            let (same, differ) = common::link_collisions();
-            let (same, differ) = (same - collisions_before.0, differ - collisions_before.1);
-            if same + differ > 0 {
-                tracing::info!(
-                    same,
-                    differ,
-                    "rootfs: paths shipped by more than one layer; the first-linked file stays"
-                );
-            }
-        }
 
         // MINIMAL_INTERNAL_CS_BUILD bundle: when the env var is "1"
         // AND the convention path exists on host, hardlink that
@@ -283,6 +272,18 @@ impl<C: Channel> Sandbox<C> {
             let cs_mirror = Path::new("/root/.cache/minimal/cs-mirror");
             if cs_mirror.exists() {
                 hardlink_dir_contents(cs_mirror, &rootfs)?;
+            }
+        }
+        // After the CS mirror, so the summary counts its collisions too.
+        {
+            let (same, differ) = common::link_collisions();
+            let (same, differ) = (same - collisions_before.0, differ - collisions_before.1);
+            if same + differ > 0 {
+                tracing::info!(
+                    same,
+                    differ,
+                    "rootfs: paths shipped by more than one layer; the first-linked file stays"
+                );
             }
         }
         tracing::trace!("rootfs hardlinking took {:?}", hardlinking_start.elapsed());
@@ -313,11 +314,21 @@ impl<C: Channel> Sandbox<C> {
                                 Ok(()) => Ok(()),
                                 Err(e) => {
                                     if e.kind() == std::io::ErrorKind::AlreadyExists {
-                                        tracing::debug!(
-                                            "Not linking {} => {}, already exists",
-                                            p.display(),
-                                            dest.display()
-                                        );
+                                        // Same rule as the rootfs layers: quiet
+                                        // when the two match, a WARN when they
+                                        // differ.
+                                        match common::link_collision_difference(p, dest) {
+                                            None => tracing::debug!(
+                                                "Not linking {} => {}, already exists (same file)",
+                                                p.display(),
+                                                dest.display()
+                                            ),
+                                            Some(why) => tracing::warn!(
+                                                "Not linking {} => {}, already exists ({why}; the first-linked file stays)",
+                                                p.display(),
+                                                dest.display()
+                                            ),
+                                        }
                                         Ok(())
                                     } else {
                                         Err(e)
