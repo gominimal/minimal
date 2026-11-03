@@ -257,7 +257,7 @@ pub fn spawn_guest_telemetry_door(control_sock_path: &Path) -> io::Result<PathBu
     crate::sock::prepare_socket_dir(&sock_path)?;
     if let Some(parent) = sock_path.parent() {
         crate::sock::restrict_owned_dir(parent)?;
-        crate::sock::verify_provider_dir_ownership(parent)?;
+        crate::sock::verify_host_dir_ownership(parent)?;
     }
     crate::sock::remove_stale_socket(&sock_path)?;
     let listener = UnixListener::bind(&sock_path)?;
@@ -290,7 +290,8 @@ fn accept_loop(listener: UnixListener, vm: &str, forward: &SyncSender<(Signal, V
         match stream {
             Ok(stream) => {
                 if crate::control::peer_uid(&stream)
-                    // The VMM child dials as `minimal-vmm` (BEP-047).
+                    // The VMM child dials as `minimal-vmm` (formerly BEP-047,
+                    // gominimal/inbox#1184).
                     .and_then(crate::control::check_guest_peer_uid)
                     .is_err()
                 {

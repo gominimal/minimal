@@ -122,6 +122,9 @@ fn record_with(mode: boxes::NetworkMode) -> boxes::Record {
         task_addresses: Vec::new(),
         box_addresses: None,
         status: boxes::BoxState::Active,
+        reason: None,
+        exit_code: None,
+        signal: None,
         hooks_enabled: true,
         // No launch ever minted these records, so none has recorded its
         // outcome on one.
@@ -129,6 +132,8 @@ fn record_with(mode: boxes::NetworkMode) -> boxes::Record {
         box_id: None,
         host_row_bound: false,
         bound_ports: std::collections::BTreeSet::new(),
+        // No run ever minted these records, so none ends with one.
+        ends_with_run: false,
         sealed_deliveries: Vec::new(),
         root_certificate: None,
         box_type: None,
@@ -626,6 +631,40 @@ async fn bridge_round_trips_stdio_and_propagates_exit_code() {
     assert_eq!(err, b"err!");
 
     assert!(!ctrl.was_killed());
+}
+
+/// BOX-149: an attached exec that its own timeout ends gives its channel
+/// exit status 124, the same as a wait on a detached one.
+#[tokio::test(start_paused = true)]
+async fn attached_exec_timeout_sends_status_124() {
+    use futures::StreamExt as _;
+
+    let (stream, MockEndpoints { ctrl, .. }) = build_mock();
+    let timed_out = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = std::sync::Arc::clone(&timed_out);
+    let stream = stream.map(move |spawned| {
+        spawned.map(|inner| super::TimedProcess {
+            inner,
+            deadline: Some(tokio::time::Instant::now() + std::time::Duration::from_secs(1)),
+            timed_out: std::sync::Arc::clone(&flag),
+        })
+    });
+    let (_client_stdin, mut bridge_stdin) = duplex(64);
+    let (mut bridge_stdout, _client_stdout) = duplex(64);
+    let (mut bridge_stderr, _client_stderr) = duplex(64);
+    let status = bridge(
+        "test",
+        stream,
+        &mut bridge_stdin,
+        &mut bridge_stdout,
+        &mut bridge_stderr,
+        client_lost(),
+        super::UnreadStdin::Discard,
+    )
+    .await;
+    assert!(ctrl.was_killed(), "the timeout stopped the command");
+    assert!(timed_out.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(status, 124, "the channel exit status of a timed-out exec");
 }
 
 /// A child that stops reading stdin must not stop the bridge from
@@ -1625,6 +1664,9 @@ fn fresh_daemon() -> &'static std::sync::atomic::AtomicUsize {
 fn fresh_progress() -> &'static tokio::sync::Notify {
     Box::leak(Box::new(tokio::sync::Notify::new()))
 }
+fn fresh_registry() -> &'static super::ExecRegistry {
+    Box::leak(Box::new(std::sync::Mutex::new(Vec::new())))
+}
 fn unlimited() -> super::HeldInputLimits {
     super::HeldInputLimits {
         per_exec: usize::MAX,
@@ -1634,6 +1676,10 @@ fn unlimited() -> super::HeldInputLimits {
         stall: std::time::Duration::from_millis(300),
         starved: std::time::Duration::from_millis(900),
         unstarted: std::time::Duration::from_secs(5),
+        // One byte: the tests above this helper's introduction are about
+        // the bounds, not the drain; the drain tests set their own.
+        quantum: 1,
+        registry: fresh_registry(),
     }
 }
 fn held_with(
@@ -1971,10 +2017,11 @@ async fn an_end_while_the_command_is_starting_ends_the_exec_at_once() {
 }
 
 /// An exec holding nothing at the daemon bound waits for the others, but
-/// not past `starved`: when the budget stays full (its holders read just
-/// enough never to stall, or, here, never at all while not at a bound
-/// themselves), the waiting exec ends with the daemon-bound reason
-/// instead of parking its connection for good. The holder is untouched.
+/// not past `starved`: when the budget stays full of a holder that *is*
+/// draining (it reads a quantum per window while its client keeps it
+/// topped up: a busy daemon, not a hoarder), the waiting exec ends with the
+/// daemon-bound reason instead of parking its connection for good. The
+/// holder is untouched: it is doing nothing wrong.
 #[tokio::test]
 async fn an_exec_starved_at_the_daemon_bound_ends_after_the_ceiling() {
     use std::time::Duration;
@@ -1989,11 +2036,292 @@ async fn an_exec_starved_at_the_daemon_bound_ends_after_the_ceiling() {
         stall: Duration::from_millis(300),
         starved: Duration::from_millis(1500),
         unstarted: Duration::from_secs(5),
+        quantum: 50,
+        registry: fresh_registry(),
     };
     let mut pumps = Vec::new();
     for _ in 0..2 {
         let (msg_tx, msgs) = msg_stream();
         let (held, stdin_r) = held_with(limits);
+        let (end_tx, end_rx) = tokio::sync::watch::channel(None);
+        tokio::spawn(super::pump_channel_input(
+            msgs,
+            std::sync::Arc::clone(&held),
+            end_tx,
+        ));
+        pumps.push((msg_tx, stdin_r, end_rx, held));
+    }
+    for p in &pumps {
+        p.3.command_started();
+    }
+    // 250 held, so the holder's reads never make room for the waiter's
+    // 150: the budget stays full.
+    pumps[0].0.send(data(250, 1)).unwrap();
+    assert!(
+        until(5, || daemon_held.load(std::sync::atomic::Ordering::Acquire)
+            == 250)
+        .await
+    );
+    // The holder drains 60 bytes every 100 ms (a quantum and more per
+    // window) and its client sends 60 more each time: the budget stays
+    // full of input that is being read.
+    let (holder_tx, mut holder_stdin) = (
+        pumps[0].0.clone(),
+        std::mem::replace(&mut pumps[0].1, {
+            let (_, r) = held_with(limits);
+            r
+        }),
+    );
+    let churn = tokio::spawn(async move {
+        let mut buf = [0u8; 60];
+        loop {
+            let _ = holder_stdin.read_exact(&mut buf).await;
+            holder_tx.send(data(60, 1)).unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+    pumps[1].0.send(data(150, 1)).unwrap(); // starved: the budget is the first's
+    tokio::time::sleep(limits.stall * 3).await;
+    assert!(
+        pumps[1].2.borrow().is_none(),
+        "past the stall, but inside the ceiling: still waiting"
+    );
+    timeout(Duration::from_secs(10), pumps[1].2.changed())
+        .await
+        .expect("a starved exec is ended at the ceiling")
+        .unwrap();
+    assert_eq!(
+        *pumps[1].2.borrow(),
+        Some(super::ExecEnd::InputHeldOver(super::HeldBound::Daemon))
+    );
+    churn.abort();
+    assert!(
+        pumps[0].2.borrow().is_none(),
+        "a draining holder is untouched"
+    );
+    assert!(
+        pumps[0].3.held_bytes() >= 190,
+        "it still holds what it was reading"
+    );
+}
+
+/// #2238: a command at its cap that reads one byte per window is not
+/// reading; the window restarts on a quantum, so it is ended within one
+/// window like a command that reads nothing.
+#[tokio::test]
+async fn a_trickle_reader_at_its_cap_is_ended_within_a_window() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let limits = super::HeldInputLimits {
+        per_exec: 200,
+        quantum: 50,
+        stall: Duration::from_millis(300),
+        ..unlimited()
+    };
+    let (msg_tx, msgs) = msg_stream();
+    let (held, mut stdin_r) = held_with(limits);
+    let (end_tx, mut end_rx) = tokio::sync::watch::channel(None);
+    tokio::spawn(super::pump_channel_input(
+        msgs,
+        std::sync::Arc::clone(&held),
+        end_tx,
+    ));
+    held.command_started();
+    for _ in 0..3 {
+        msg_tx.send(data(100, 7)).unwrap(); // the third waits at the cap
+    }
+    let trickle = tokio::spawn(async move {
+        let mut byte = [0u8; 1];
+        loop {
+            let _ = stdin_r.read(&mut byte).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    let ended = timeout(Duration::from_secs(5), end_rx.changed()).await;
+    trickle.abort();
+    ended
+        .expect("a trickle reader is ended within a window")
+        .unwrap();
+    assert_eq!(
+        *end_rx.borrow(),
+        Some(super::ExecEnd::InputHeldOver(super::HeldBound::Exec))
+    );
+}
+
+/// #2238's trickle again, in small chunks: a client that feeds one byte per
+/// channel message while the command reads one byte per window gets each
+/// chunk in after one read. The wait at the bound must span chunks, or the
+/// exec at its cap is never ended.
+#[tokio::test]
+async fn a_trickle_reader_fed_one_byte_chunks_is_still_ended() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let limits = super::HeldInputLimits {
+        per_exec: 200,
+        quantum: 50,
+        stall: Duration::from_millis(300),
+        ..unlimited()
+    };
+    let (msg_tx, msgs) = msg_stream();
+    let (held, mut stdin_r) = held_with(limits);
+    let (end_tx, mut end_rx) = tokio::sync::watch::channel(None);
+    tokio::spawn(super::pump_channel_input(
+        msgs,
+        std::sync::Arc::clone(&held),
+        end_tx,
+    ));
+    held.command_started();
+    for _ in 0..200 {
+        msg_tx.send(data(1, 7)).unwrap(); // to the cap, one byte at a time
+    }
+    // The client is ahead of the command: one-byte chunks already wait
+    // behind the cap, so each read lets one in and the next is refused at
+    // once. A feeder on the reader's own period raced it instead, and only
+    // queued chunks when it happened to run ahead, so the window filled
+    // late or not at all (a timeout about one run in twelve on `main`).
+    // A hundred chunks outlast the 5 s timeout at one read per 50 ms.
+    for _ in 0..100 {
+        msg_tx.send(data(1, 7)).unwrap();
+    }
+    let trickle = tokio::spawn(async move {
+        let mut byte = [0u8; 1];
+        loop {
+            let _ = stdin_r.read(&mut byte).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    let ended = timeout(Duration::from_secs(5), end_rx.changed()).await;
+    trickle.abort();
+    ended
+        .expect("a trickle reader fed in one-byte chunks is ended within a window")
+        .unwrap();
+    assert_eq!(
+        *end_rx.borrow(),
+        Some(super::ExecEnd::InputHeldOver(super::HeldBound::Exec))
+    );
+}
+
+/// The other side of the quantum: a command at its cap that reads a
+/// quantum or more per window is reading, and is never ended; it works
+/// through everything held.
+#[tokio::test]
+async fn a_reader_draining_a_quantum_per_window_is_never_ended() {
+    use std::time::Duration;
+
+    let limits = super::HeldInputLimits {
+        per_exec: 200,
+        quantum: 50,
+        stall: Duration::from_millis(300),
+        ..unlimited()
+    };
+    let (msg_tx, msgs) = msg_stream();
+    let (held, mut stdin_r) = held_with(limits);
+    let (end_tx, end_rx) = tokio::sync::watch::channel(None);
+    tokio::spawn(super::pump_channel_input(
+        msgs,
+        std::sync::Arc::clone(&held),
+        end_tx,
+    ));
+    held.command_started();
+    for _ in 0..3 {
+        msg_tx.send(data(100, 7)).unwrap();
+    }
+    let mut got = 0usize;
+    let mut buf = [0u8; 25];
+    while got < 300 {
+        got += stdin_r.read(&mut buf).await.unwrap(); // 25 bytes per 100 ms: 75 a window
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        end_rx.borrow().is_none(),
+        "a reader draining a quantum per window is never ended"
+    );
+    assert_eq!(held.held_bytes(), 0);
+}
+
+/// A holder whose command has not started is under its own `unstarted`
+/// grace and is never another exec's victim: the starved exec waits its
+/// ceiling out and ends itself, as before.
+#[tokio::test]
+async fn an_unstarted_holder_is_not_a_victim() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let daemon_held = fresh_daemon();
+    let limits = super::HeldInputLimits {
+        per_exec: usize::MAX,
+        daemon: 300,
+        daemon_held,
+        daemon_progress: fresh_progress(),
+        stall: Duration::from_millis(300),
+        starved: Duration::from_millis(600),
+        unstarted: Duration::from_secs(30),
+        quantum: 50,
+        registry: fresh_registry(),
+    };
+    let mut pumps = Vec::new();
+    for _ in 0..2 {
+        let (msg_tx, msgs) = msg_stream();
+        let (held, stdin_r) = held_with(limits);
+        let (end_tx, end_rx) = tokio::sync::watch::channel(None);
+        tokio::spawn(super::pump_channel_input(
+            msgs,
+            std::sync::Arc::clone(&held),
+            end_tx,
+        ));
+        pumps.push((msg_tx, stdin_r, end_rx, held));
+    }
+    // Only the waiter's command runs; the holder's is still starting.
+    pumps[1].3.command_started();
+    pumps[0].0.send(data(200, 1)).unwrap();
+    assert!(
+        until(5, || daemon_held.load(std::sync::atomic::Ordering::Acquire)
+            == 200)
+        .await
+    );
+    pumps[1].0.send(data(150, 1)).unwrap(); // starved by an unstarted holder
+    timeout(Duration::from_secs(10), pumps[1].2.changed())
+        .await
+        .expect("the starved exec ends itself at the ceiling")
+        .unwrap();
+    assert_eq!(
+        *pumps[1].2.borrow(),
+        Some(super::ExecEnd::InputHeldOver(super::HeldBound::Daemon))
+    );
+    assert!(
+        pumps[0].2.borrow().is_none(),
+        "the unstarted holder is untouched"
+    );
+    assert_eq!(pumps[0].3.held_bytes(), 200);
+}
+
+/// #2238's daemon half: the exec that would cross the daemon's budget
+/// while holding nothing is not the one at fault. After its wait, the
+/// largest holder that read none of what it owed over the window is the
+/// one ended, and the waiting exec gets its input.
+#[tokio::test]
+async fn a_starved_exec_ends_the_holder_that_is_not_draining() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let daemon_held = fresh_daemon();
+    let limits = super::HeldInputLimits {
+        per_exec: usize::MAX,
+        daemon: 300,
+        daemon_held,
+        daemon_progress: fresh_progress(),
+        stall: Duration::from_millis(300),
+        starved: Duration::from_millis(600),
+        unstarted: Duration::from_secs(5),
+        quantum: 50,
+        registry: fresh_registry(),
+    };
+    let mut pumps = Vec::new();
+    for _ in 0..2 {
+        let (msg_tx, msgs) = msg_stream();
+        let (held, stdin_r) = held_with(limits); // nobody reads
         let (end_tx, end_rx) = tokio::sync::watch::channel(None);
         tokio::spawn(super::pump_channel_input(
             msgs,
@@ -2012,21 +2340,23 @@ async fn an_exec_starved_at_the_daemon_bound_ends_after_the_ceiling() {
         .await
     );
     pumps[1].0.send(data(150, 1)).unwrap(); // starved: the budget is the first's
-    tokio::time::sleep(limits.stall * 3).await;
-    assert!(
-        pumps[1].2.borrow().is_none(),
-        "past the stall, but inside the ceiling: still waiting"
-    );
-    timeout(Duration::from_secs(10), pumps[1].2.changed())
+    timeout(Duration::from_secs(10), pumps[0].2.changed())
         .await
-        .expect("a starved exec is ended at the ceiling")
+        .expect("the holder that is not draining is the one ended")
         .unwrap();
     assert_eq!(
-        *pumps[1].2.borrow(),
+        *pumps[0].2.borrow(),
         Some(super::ExecEnd::InputHeldOver(super::HeldBound::Daemon))
     );
-    assert!(pumps[0].2.borrow().is_none(), "the holder is untouched");
-    assert_eq!(pumps[0].3.held_bytes(), 200);
+    assert!(
+        until(5, || pumps[1].3.held_bytes() == 150).await,
+        "the waiting exec gets its input once the holder is ended"
+    );
+    assert!(
+        pumps[1].2.borrow().is_none(),
+        "the waiting exec is not ended"
+    );
+    assert_eq!(daemon_held.load(std::sync::atomic::Ordering::Acquire), 150);
 }
 
 /// The per-exec stall counts this exec's own reads only. Another exec
@@ -2095,6 +2425,8 @@ async fn the_daemon_budget_makes_an_exec_holding_nothing_wait_for_the_others() {
         // longer than this test's waits: it is about the wait, not its end
         starved: Duration::from_secs(60),
         unstarted: Duration::from_secs(5),
+        quantum: 1,
+        registry: fresh_registry(),
     };
     let mut pumps = Vec::new();
     for _ in 0..2 {
@@ -2602,6 +2934,694 @@ async fn echo_process_writes_text_and_exits_zero() {
     let mut err = Vec::new();
     client_stderr.read_to_end(&mut err).await.unwrap();
     assert!(err.is_empty(), "echo should produce no stderr: {err:?}");
+}
+
+/// Execs the daemon starts under an id (BOX-149), run against a box record
+/// in a temp store. The harness has no box sandbox to join, so `command` is
+/// the argv itself, spawned on this host; the box host's join is pinned
+/// separately, in `exec_runs_argv_unshelled_in_box_namespaces_and_cgroup`.
+#[cfg(target_os = "linux")]
+mod managed {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use boxes::events::{BoxEvent, BoxEventType};
+    use boxes::store::{BoxObject as _, DiskBoxKey, DiskLoader, Loader as _};
+    use minimald_rpc::exec::{ExecId, ExecMode};
+    use tokio::io::AsyncReadExt as _;
+
+    use super::super::{
+        AttachEnd, ExecBox, ExecEntry, ExecExitReason, ManagedStart, SESSION_SHELL, exec_argv,
+        find_exec, mint_exec_id, read_exec_output, relay_terminal, start_managed_exec,
+        start_managed_exec_within, timeout_deadline,
+    };
+
+    /// A running box's record in a temp store, and the [`ExecBox`] an exec
+    /// in it gets.
+    struct DiskExecBox {
+        _tmp: tempfile::TempDir,
+        loader: DiskLoader,
+        key: DiskBoxKey,
+        exec_box: ExecBox,
+    }
+
+    fn box_on_disk() -> DiskExecBox {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut loader =
+            DiskLoader::new(paths::DaemonAbsPath::try_new(tmp.path().to_str().unwrap()).unwrap())
+                .unwrap();
+        let key = loader
+            .create(super::record_with(boxes::NetworkMode::HostNet))
+            .unwrap();
+        let object = loader.get(&key).unwrap();
+        let dir = object
+            .events_path()
+            .as_utf8_path()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let exec_box = ExecBox {
+            record: object.record().clone(),
+            dir,
+        };
+        DiskExecBox {
+            _tmp: tmp,
+            loader,
+            key,
+            exec_box,
+        }
+    }
+
+    impl DiskExecBox {
+        /// Starts `argv` in `mode`, as the daemon starts it in the box.
+        fn start(
+            &self,
+            mode: ExecMode,
+            argv: &[&str],
+            timeout: Option<Duration>,
+            graceful: bool,
+        ) -> Arc<ExecEntry> {
+            let (program, args) = exec_argv(argv.iter().map(|w| (*w).to_string()).collect());
+            let mut command = std::process::Command::new(program);
+            command.args(args);
+            start_managed_exec(
+                ManagedStart {
+                    id: mint_exec_id(),
+                    mode,
+                    exec_box: self.exec_box.clone(),
+                    timeout,
+                    winsize: (24, 80),
+                },
+                command,
+                graceful,
+            )
+            .expect("the exec starts")
+        }
+
+        async fn output(&self, id: &ExecId) -> String {
+            let mut bytes = Vec::new();
+            read_exec_output(&self.exec_box.dir, id)
+                .unwrap()
+                .expect("the box keeps the exec's transcript")
+                .copy_to(&mut bytes)
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+
+        fn events(&self) -> Vec<BoxEvent> {
+            self.loader
+                .get(&self.key)
+                .unwrap()
+                .read_events_from(0)
+                .unwrap()
+                .events
+        }
+
+        fn exec_events(&self, id: &ExecId) -> Vec<BoxEvent> {
+            self.events()
+                .into_iter()
+                .filter(|e| e.data.get("exec_id").and_then(|v| v.as_str()) == Some(id.as_str()))
+                .collect()
+        }
+    }
+
+    /// Reads `out` until what it read holds `needle`, for at most 10 s.
+    async fn read_until(out: &mut tokio::io::DuplexStream, seen: &mut String, needle: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut buf = [0u8; 4096];
+        while !seen.contains(needle) {
+            let n = tokio::time::timeout_at(deadline, out.read(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("{needle:?} never arrived; read {seen:?}"))
+                .unwrap();
+            assert_ne!(n, 0, "the attach closed before {needle:?}; read {seen:?}");
+            seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+    }
+
+    /// BOX-149: the argv runs as given. The words reach the box host's
+    /// injection unchanged after its `--`, with no shell before them, and
+    /// the injection joins the box's namespaces (through the pidfd of its
+    /// leader) and its cgroup leaf. Run, the words print as data, nothing
+    /// expands them, and the exit code comes back.
+    #[tokio::test]
+    async fn exec_runs_argv_unshelled_in_box_namespaces_and_cgroup() {
+        let words = ["printf", "%s|", "a b", "$HOME", "*", "; echo injected"];
+        let (program, args) = exec_argv(words.map(String::from).to_vec());
+        assert_eq!(program, words[0]);
+        assert_eq!(args, words[1..]);
+
+        // The same join the box host builds for an exec (box_runtime's
+        // `command_in_session_env`), against a stand-in box leader.
+        let leaf =
+            sandbox::config::ClassifierLeaf::new("/sys/fs/cgroup/minimald.slice/boxes/allow/b");
+        let shim = tempfile::NamedTempFile::new().unwrap();
+        let mut leader = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let built = crate::nsenter::Injection::new(leader.id(), &program, &args)
+            .with_shim(shim.path())
+            .with_classifier_leaf(leaf.clone())
+            .command();
+        let _ = leader.kill();
+        let _ = leader.wait();
+        let argv: Vec<String> = built
+            .expect("the injection builds")
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let dashdash = argv.iter().position(|a| a == "--").expect("{argv:?}");
+        assert_eq!(argv[dashdash + 1..], words, "{argv:?}");
+        assert!(
+            !argv.iter().any(|a| a == SESSION_SHELL || a == "-c"),
+            "no shell stands before the words: {argv:?}"
+        );
+        assert!(argv.iter().any(|a| a == "--pidfd"), "{argv:?}");
+        let at = argv
+            .iter()
+            .position(|a| a == "--classifier-leaf")
+            .expect("the exec joins the box's cgroup leaf");
+        assert_eq!(std::path::Path::new(&argv[at + 1]), leaf.dir());
+
+        let disk = box_on_disk();
+        let entry = disk.start(ExecMode::Detached, &words, None, false);
+        assert_eq!(entry.wait().await.code, Some(0));
+        assert_eq!(disk.output(&entry.id).await, "a b|$HOME|*|; echo injected|");
+
+        let failing = disk.start(ExecMode::Detached, &["sh", "-c", "exit 7"], None, false);
+        let exit = failing.wait().await;
+        assert_eq!(exit.code, Some(7));
+        assert_eq!(exit.status(), 7);
+    }
+
+    /// BOX-149: every exec gets a UUIDv7 id, whatever its mode: the id the
+    /// daemon mints for each, and the id a tty and a detached exec start
+    /// under, which finds the exec in its box and in no other.
+    #[tokio::test]
+    async fn every_exec_gets_uuidv7_id() {
+        let minted: Vec<ExecId> = (0..64).map(|_| mint_exec_id()).collect();
+        for id in &minted {
+            let uuid = uuid::Uuid::parse_str(id.as_str()).unwrap();
+            assert_eq!(uuid.get_version_num(), 7, "{id}");
+            assert_eq!(uuid.get_variant(), uuid::Variant::RFC4122, "{id}");
+        }
+        let unique: std::collections::BTreeSet<_> = minted.iter().collect();
+        assert_eq!(unique.len(), minted.len());
+
+        let disk = box_on_disk();
+        let box_id = disk.exec_box.record.id;
+        for mode in [ExecMode::Tty, ExecMode::Detached] {
+            let entry = disk.start(mode, &["true"], None, false);
+            let uuid = uuid::Uuid::parse_str(entry.id.as_str()).unwrap();
+            assert_eq!(uuid.get_version_num(), 7, "{mode:?}");
+            assert_eq!(entry.mode, mode);
+            assert!(find_exec(box_id, &entry.id).is_some(), "{mode:?}");
+            assert!(find_exec(boxes::SessionId::mint(), &entry.id).is_none());
+            entry.wait().await;
+            let started = disk.exec_events(&entry.id);
+            assert_eq!(started[0].kind, BoxEventType::ExecStarted);
+            assert_eq!(started[0].data["mode"], mode.name());
+        }
+    }
+
+    /// BOX-149: a tty exec gets a terminal and returns at once with its id.
+    /// A client attaches by the id, sees the terminal, and goes away while
+    /// the exec runs on. A later attach by the same id resumes it: it
+    /// replays what the terminal wrote, takes input, and ends with the
+    /// exec's exit. The transcript keeps all of it for a read by the id.
+    #[tokio::test]
+    async fn exec_tty_returns_reattachable_id_and_keeps_transcript() {
+        let disk = box_on_disk();
+        let entry = disk.start(
+            ExecMode::Tty,
+            &[
+                "sh",
+                "-c",
+                r#"if [ -t 0 ] && [ -t 1 ]; then echo TTY-YES; fi; read line; echo "got:$line""#,
+            ],
+            None,
+            false,
+        );
+        let found = find_exec(disk.exec_box.record.id, &entry.id).expect("the id finds the exec");
+
+        // First attach: the client sees the terminal, then goes away.
+        let (typed, msgs) = super::msg_stream();
+        let (mut client, mut server) = tokio::io::duplex(1 << 16);
+        let first = tokio::spawn({
+            let found = Arc::clone(&found);
+            async move { relay_terminal(&found, msgs, &mut server).await }
+        });
+        let mut seen = String::new();
+        read_until(&mut client, &mut seen, "TTY-YES").await;
+        drop(typed);
+        assert_eq!(first.await.unwrap().unwrap(), AttachEnd::ClientGone);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), entry.wait())
+                .await
+                .is_err(),
+            "the exec runs on after its client goes away"
+        );
+
+        // Second attach: the replay, then input, then the exit.
+        let (typed, msgs) = super::msg_stream();
+        let (mut client, mut server) = tokio::io::duplex(1 << 16);
+        let second = tokio::spawn({
+            let found = Arc::clone(&found);
+            async move { relay_terminal(&found, msgs, &mut server).await }
+        });
+        let mut seen = String::new();
+        read_until(&mut client, &mut seen, "TTY-YES").await;
+        typed
+            .send(russh::ChannelMsg::Data {
+                data: b"hello\n".to_vec().into(),
+            })
+            .unwrap();
+        read_until(&mut client, &mut seen, "got:hello").await;
+        match second.await.unwrap().unwrap() {
+            AttachEnd::Exited(exit) => assert_eq!(exit.code, Some(0)),
+            other => panic!("the attach ends with the exec, got {other:?}"),
+        }
+
+        let transcript = disk.output(&entry.id).await;
+        assert!(transcript.contains("TTY-YES"), "{transcript:?}");
+        assert!(transcript.contains("got:hello"), "{transcript:?}");
+        let events = disk.exec_events(&entry.id);
+        assert_eq!(events[0].data["pty"], true);
+    }
+
+    /// BOX-149: a tty exec whose program never reads its terminal holds no
+    /// more of what a client types than the exec's cap. Past the cap the
+    /// input is dropped. When the exec ends, what it held leaves the daemon's
+    /// count.
+    #[tokio::test]
+    async fn exec_tty_unread_input_is_held_within_the_cap() {
+        const CAP: usize = 64 * 1024;
+        let limits = super::super::HeldInputLimits {
+            per_exec: CAP,
+            ..super::unlimited()
+        };
+        let daemon_held = limits.daemon_held;
+        let disk = box_on_disk();
+        let words = ["sh", "-c", "stty raw -echo; echo READY; exec sleep 60"];
+        let (program, args) = exec_argv(words.map(String::from).to_vec());
+        let mut command = std::process::Command::new(program);
+        command.args(args);
+        let entry = start_managed_exec_within(
+            ManagedStart {
+                id: mint_exec_id(),
+                mode: ExecMode::Tty,
+                exec_box: disk.exec_box.clone(),
+                timeout: Some(Duration::from_secs(3)),
+                winsize: (24, 80),
+            },
+            command,
+            false,
+            limits,
+        )
+        .expect("the exec starts");
+
+        let (typed, msgs) = super::msg_stream();
+        let (mut client, mut server) = tokio::io::duplex(1 << 16);
+        let attach = tokio::spawn({
+            let entry = Arc::clone(&entry);
+            async move { relay_terminal(&entry, msgs, &mut server).await }
+        });
+        let mut seen = String::new();
+        read_until(&mut client, &mut seen, "READY").await;
+        // Sixteen times the cap, in chunks of an SSH packet's size.
+        let chunk = vec![b'x'; 32 * 1024];
+        for _ in 0..16 * CAP / chunk.len() {
+            typed
+                .send(russh::ChannelMsg::Data {
+                    data: chunk.clone().into(),
+                })
+                .unwrap();
+        }
+        // The relay takes the messages in order: once it sees the close, it
+        // offered every chunk to the terminal.
+        typed.send(russh::ChannelMsg::Close).unwrap();
+        let end = tokio::time::timeout(Duration::from_secs(10), attach)
+            .await
+            .expect("the attach takes every chunk, then the close");
+        assert_eq!(end.unwrap().unwrap(), AttachEnd::ClientGone);
+
+        let held = entry.held_input();
+        assert!(held <= CAP, "the terminal holds {held} bytes, past the cap");
+        assert!(
+            held >= CAP / 2,
+            "the program reads nothing, so the input is held: {held} bytes"
+        );
+        let counted = daemon_held.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(counted <= CAP, "the daemon counts {counted} bytes");
+
+        tokio::time::timeout(Duration::from_secs(20), entry.wait())
+            .await
+            .expect("the timeout ends the exec");
+        assert_eq!(
+            daemon_held.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the end releases what the terminal held"
+        );
+        drop(client);
+    }
+
+    /// BOX-149: an exec id belongs to the box it started in. Sent to another
+    /// box, each lookup that attach, output and wait make by the id finds
+    /// nothing, while the exec runs and after it ended. `min://exec/attach`
+    /// and `min://exec/wait` find the exec with `find_exec` under the box the
+    /// request came to. `min://exec/output` reads the transcript in that
+    /// box's directory, and a wait with no live exec reads that box's events.
+    #[tokio::test]
+    async fn exec_id_from_one_box_is_refused_in_another() {
+        let a = box_on_disk();
+        let b = box_on_disk();
+        let (a_id, b_id) = (a.exec_box.record.id, b.exec_box.record.id);
+        assert_ne!(a_id, b_id);
+        let entry = a.start(
+            ExecMode::Tty,
+            &["sh", "-c", "echo FROM-A; exec sleep 60"],
+            Some(Duration::from_secs(2)),
+            false,
+        );
+        let found = find_exec(a_id, &entry.id).expect("box A finds its exec");
+
+        // While it runs: attach and wait find no live exec in box B.
+        assert!(find_exec(b_id, &entry.id).is_none(), "attach and wait");
+        let (_typed, msgs) = super::msg_stream();
+        let (_client, mut server) = tokio::io::duplex(1 << 16);
+        let attach = tokio::spawn({
+            let found = Arc::clone(&found);
+            async move { relay_terminal(&found, msgs, &mut server).await }
+        });
+        assert!(
+            read_exec_output(&b.exec_box.dir, &entry.id)
+                .unwrap()
+                .is_none(),
+            "output"
+        );
+        assert!(
+            super::super::stored_exec_exit(&b.exec_box.dir, &entry.id).is_none(),
+            "wait"
+        );
+
+        tokio::time::timeout(Duration::from_secs(20), entry.wait())
+            .await
+            .expect("the timeout ends the exec");
+        attach.abort();
+
+        // After the end: box B still has no exec, output or exit for the id.
+        assert!(find_exec(b_id, &entry.id).is_none(), "attach and wait");
+        assert!(
+            read_exec_output(&b.exec_box.dir, &entry.id)
+                .unwrap()
+                .is_none(),
+            "output"
+        );
+        assert!(
+            super::super::stored_exec_exit(&b.exec_box.dir, &entry.id).is_none(),
+            "wait"
+        );
+        // Box A has all three.
+        assert!(find_exec(a_id, &entry.id).is_some());
+        assert!(a.output(&entry.id).await.contains("FROM-A"));
+        assert!(super::super::stored_exec_exit(&a.exec_box.dir, &entry.id).is_some());
+    }
+
+    /// BOX-149: a timeout too far out for the clock is no deadline. The
+    /// exec starts, runs to its end, and nothing panics after the spawn.
+    #[tokio::test]
+    async fn exec_timeout_past_the_clock_is_no_deadline() {
+        for huge in [Duration::from_secs(u64::MAX), Duration::MAX] {
+            assert!(timeout_deadline(Some(huge)).is_none(), "{huge:?}");
+        }
+        assert!(timeout_deadline(None).is_none());
+        let soon = timeout_deadline(Some(Duration::from_secs(1))).expect("a deadline");
+        assert!(soon > tokio::time::Instant::now());
+
+        let disk = box_on_disk();
+        let entry = disk.start(
+            ExecMode::Detached,
+            &["sh", "-c", "echo done"],
+            Some(Duration::from_secs(u64::MAX)),
+            false,
+        );
+        let exit = tokio::time::timeout(Duration::from_secs(10), entry.wait())
+            .await
+            .expect("the exec ends");
+        assert_eq!(exit.code, Some(0));
+        assert_eq!(exit.reason, ExecExitReason::Exited);
+        assert_eq!(disk.output(&entry.id).await, "done\n");
+    }
+
+    /// BOX-149: a detached exec gets a closed stdin at creation and returns
+    /// at once with its id. Its stdout and stderr read back by the id, and
+    /// a wait by the id returns its exit code, again after it ended.
+    #[tokio::test]
+    async fn exec_detach_closes_stdin_captures_logs_and_wait_returns_code() {
+        let disk = box_on_disk();
+        let entry = disk.start(
+            ExecMode::Detached,
+            &[
+                "sh",
+                "-c",
+                "if read x; then echo STDIN-OPEN; else echo STDIN-CLOSED; fi; echo out; echo err >&2; exit 3",
+            ],
+            None,
+            false,
+        );
+        let found = find_exec(disk.exec_box.record.id, &entry.id).expect("the id finds the exec");
+        let exit = tokio::time::timeout(Duration::from_secs(10), found.wait())
+            .await
+            .expect("the exec ends");
+        assert_eq!(exit.code, Some(3));
+        assert_eq!(exit.reason, ExecExitReason::Exited);
+        assert_eq!(found.wait().await.code, Some(3), "the exit code is kept");
+
+        let output = disk.output(&entry.id).await;
+        assert_eq!(output, "STDIN-CLOSED\nout\nerr\n");
+
+        let events = disk.exec_events(&entry.id);
+        let kinds: Vec<_> = events.iter().map(|e| e.kind).collect();
+        assert_eq!(kinds, [BoxEventType::ExecStarted, BoxEventType::ExecExited]);
+        assert_eq!(events[1].data["exit_code"], 3);
+        assert_eq!(events[1].data["reason"], "exited");
+    }
+
+    /// BOX-149: a command that writes past the transcript cap keeps running
+    /// to its end. Its transcript is never larger than the cap, and it holds
+    /// the newest output: the last line the command wrote.
+    #[tokio::test]
+    async fn exec_transcript_past_cap_keeps_newest_output_within_cap() {
+        let disk = box_on_disk();
+        // About 20 MiB of numbered lines, more than twice the cap.
+        let entry = disk.start(ExecMode::Detached, &["seq", "1", "3000000"], None, false);
+        let exit = tokio::time::timeout(Duration::from_secs(60), entry.wait())
+            .await
+            .expect("the exec ends");
+        assert_eq!(exit.code, Some(0), "the command runs to its end");
+
+        let transcript = boxes::store::exec_transcript_path(&disk.exec_box.dir, entry.id.as_str());
+        let len = std::fs::metadata(&transcript).unwrap().len();
+        assert!(
+            len <= super::super::TRANSCRIPT_CAP,
+            "the transcript is {len} bytes, past the cap"
+        );
+        let output = disk.output(&entry.id).await;
+        assert_eq!(
+            output.len() as u64,
+            len,
+            "the read gives the whole transcript"
+        );
+        assert!(
+            output.starts_with("[older output was dropped. Only the newest output is kept.]\n"),
+            "the transcript says it dropped output: {:?}",
+            &output[..80]
+        );
+        assert!(
+            output.ends_with("\n2999999\n3000000\n"),
+            "the newest output is kept"
+        );
+        assert!(!output.contains("\n1\n"), "the oldest output is dropped");
+    }
+
+    /// BOX-149: an exec's own timeout ends the exec as a stop does: SIGTERM,
+    /// a wait, then SIGKILL for a command that ignores SIGTERM. Its
+    /// `exec_exited` event says `timeout`, and the box is still running:
+    /// its record is unchanged and it has no `exited` event.
+    #[tokio::test]
+    async fn exec_own_timeout_ends_exec_reason_timeout_box_keeps_running() {
+        let disk = box_on_disk();
+        let timeout = Duration::from_secs(1);
+        let begun = Instant::now();
+        let entry = disk.start(
+            ExecMode::Detached,
+            &["sh", "-c", "trap '' TERM; echo started; exec sleep 60"],
+            Some(timeout),
+            true,
+        );
+        let exit = tokio::time::timeout(Duration::from_secs(30), entry.wait())
+            .await
+            .expect("the timeout ends the exec");
+        let took = begun.elapsed();
+        assert_eq!(exit.reason, ExecExitReason::Timeout);
+        assert_eq!(exit.status(), 124, "a timed-out exec exits 124");
+        assert!(took >= timeout, "{took:?}");
+        // The SIGTERM was ignored, so the SIGKILL after the wait ended it.
+        assert!(
+            took >= crate::nsenter::SHIM_ESCALATION,
+            "the SIGKILL waits out the grace: {took:?}"
+        );
+        assert!(took < Duration::from_secs(25), "{took:?}");
+        assert_eq!(disk.output(&entry.id).await, "started\n");
+
+        let events = disk.exec_events(&entry.id);
+        let exited = events
+            .iter()
+            .find(|e| e.kind == BoxEventType::ExecExited)
+            .expect("an exec_exited event");
+        assert_eq!(exited.data["reason"], "timeout");
+
+        let record = disk.loader.get(&disk.key).unwrap().record().clone();
+        assert_eq!(record.status, boxes::BoxState::Active);
+        assert!(
+            !disk.events().iter().any(|e| e.kind == BoxEventType::Exited),
+            "the box did not end"
+        );
+    }
+
+    /// BOX-149: a wait on a detached exec that a daemon before a restart
+    /// started reads the exit from the box's stored `exec_exited` event.
+    #[test]
+    fn stored_exec_exit_reads_the_exit_after_a_restart() {
+        let disk = box_on_disk();
+        let ended = mint_exec_id();
+        let timed_out = mint_exec_id();
+        let unknown = mint_exec_id();
+        let exit_box = disk.exec_box.record.id;
+        for (id, code, reason) in [
+            (&ended, Some(7), ExecExitReason::Exited),
+            (&timed_out, None, ExecExitReason::Timeout),
+        ] {
+            disk.exec_box
+                .write_event(BoxEventType::ExecStarted, id, ExecMode::Detached, None);
+            disk.exec_box.write_event(
+                BoxEventType::ExecExited,
+                id,
+                ExecMode::Detached,
+                Some(super::super::ExecExit { code, reason }),
+            );
+            assert!(find_exec(exit_box, id).is_none(), "no live entry holds it");
+        }
+        let dir = &disk.exec_box.dir;
+
+        let exit = super::super::stored_exec_exit(dir, &ended).expect("the stored exit");
+        assert_eq!(exit.code, Some(7));
+        assert_eq!(exit.reason, ExecExitReason::Exited);
+        assert_eq!(exit.status(), 7);
+
+        let exit = super::super::stored_exec_exit(dir, &timed_out).expect("the stored exit");
+        assert_eq!(exit.reason, ExecExitReason::Timeout);
+        assert_eq!(exit.status(), 124);
+
+        assert!(super::super::stored_exec_exit(dir, &unknown).is_none());
+    }
+
+    /// The refusal for a box that is not running names its state as
+    /// `min ls` prints it.
+    #[test]
+    fn the_not_running_refusal_names_the_state() {
+        for (status, word) in [
+            (boxes::BoxState::Pending, "pending"),
+            (boxes::BoxState::Materializing, "materializing"),
+            (boxes::BoxState::Stopped, "stopped"),
+            (boxes::BoxState::Exited, "exited"),
+        ] {
+            assert_eq!(
+                super::super::not_running_message("web", status),
+                format!("box web is {word}. Only a running box can run a command.\n"),
+            );
+        }
+    }
+
+    /// A command that neither ends nor takes the stop at its timeout.
+    struct StuckProcess {
+        kills: usize,
+    }
+
+    impl super::super::Process for StuckProcess {
+        type Stdin = tokio::io::Sink;
+        type Stdout = tokio::io::Empty;
+        type Stderr = tokio::io::Empty;
+
+        fn take_stdio(&mut self) -> Option<(Self::Stdin, Self::Stdout, Self::Stderr)> {
+            None
+        }
+
+        async fn wait(&mut self) -> std::io::Result<Option<i32>> {
+            std::future::pending().await
+        }
+
+        fn start_kill(&mut self) -> std::io::Result<()> {
+            self.kills += 1;
+            Err(std::io::Error::from_raw_os_error(libc::EPERM))
+        }
+    }
+
+    // BOX-149: an exec that survives its stop still ends, so a wait returns.
+    #[tokio::test(start_paused = true)]
+    async fn exec_timeout_ends_even_when_the_stop_fails() {
+        let mut process = StuckProcess { kills: 0 };
+        let (status, reason) =
+            super::super::wait_with_timeout(&mut process, Some(std::time::Duration::from_secs(1)))
+                .await;
+        assert_eq!(reason, ExecExitReason::Timeout);
+        assert_eq!(
+            status.expect_err("a stuck command gives an error").kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        assert_eq!(process.kills, 2, "the stop, then a last SIGKILL");
+    }
+
+    // BOX-149: the exec map does not keep an ended exec of a reaped box.
+    #[test]
+    fn ended_exec_of_a_reaped_box_is_not_found() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let box_dir = camino::Utf8Path::from_path(tmp.path()).expect("utf-8 temp path");
+        let id = mint_exec_id();
+        let transcript = boxes::store::exec_transcript_path(box_dir, id.as_str());
+        std::fs::create_dir_all(transcript.parent().expect("execs dir")).expect("execs dir");
+        let box_id = boxes::SessionId::mint();
+        let entry = std::sync::Arc::new(ExecEntry::new(
+            id.clone(),
+            box_id,
+            ExecMode::Detached,
+            transcript.clone(),
+            None,
+        ));
+        super::super::register_exec(std::sync::Arc::clone(&entry));
+        entry.finish(super::super::ExecExit {
+            code: Some(0),
+            reason: ExecExitReason::Exited,
+        });
+        assert!(
+            find_exec(box_id, &id).is_some(),
+            "the box still has its directory"
+        );
+        std::fs::remove_dir_all(transcript.parent().expect("execs dir")).expect("reap");
+        assert!(find_exec(box_id, &id).is_none(), "the box was reaped");
+        // The next exec's registration drops the reaped entry from the map.
+        let next = std::sync::Arc::new(ExecEntry::new(
+            mint_exec_id(),
+            box_id,
+            ExecMode::Detached,
+            transcript,
+            None,
+        ));
+        super::super::register_exec(next);
+        assert_eq!(std::sync::Arc::strong_count(&entry), 1);
+    }
 }
 
 mod end_to_end {
@@ -3260,6 +4280,74 @@ mod end_to_end {
             !stderr.contains("unsupported"),
             "the argv form must be routed to the session, not refused, got {stderr:?}",
         );
+    }
+
+    /// BOX-149: a command sent to a box that is not running is refused
+    /// with exit 2, and the refusal names the box's state. Nothing runs:
+    /// the marker a run on the daemon would leave is absent.
+    #[tokio::test]
+    async fn exec_into_non_running_box_refused_exit2_names_state() {
+        use minimald_rpc::exec::{ExecMode, ExecSpec};
+        use minimald_rpc::{CreateSession, Errorable, StopBox, StopBoxRequest};
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let marker = daemon_marker("not-running");
+        let _ = std::fs::remove_file(&marker);
+        let touch = vec!["touch".to_string(), marker.display().to_string()];
+
+        // A box still being created: its record is pending.
+        let pending = client
+            .call::<CreateSession>(&create_session_req("exec-pending", "/tmp"))
+            .await
+            .unwrap()
+            .id;
+        // A box that ran and was stopped.
+        let stopped = fresh_session(&mut client).await;
+        match client
+            .call::<StopBox>(&StopBoxRequest {
+                id: stopped,
+                force: true,
+            })
+            .await
+        {
+            Errorable::Ok(_) => {}
+            Errorable::Err { error } => panic!("StopBox failed: {error}"),
+        }
+
+        for (session_id, state) in [(pending, "pending"), (stopped, "stopped")] {
+            let session_str = session_id.to_string();
+            for request in [
+                ExecRequest::Argv(touch.clone()),
+                ExecRequest::Shell(format!("touch {}", marker.display())),
+                ExecRequest::Exec(ExecSpec {
+                    argv: touch.clone(),
+                    mode: ExecMode::Detached,
+                    timeout_secs: None,
+                }),
+            ] {
+                let out = client
+                    .exec(
+                        &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                        false,
+                        &request.encode(),
+                        &[],
+                    )
+                    .await
+                    .expect("the refusal is reported over the channel");
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                assert_eq!(out.exit_status, Some(2), "{request:?}: {stderr:?}");
+                assert!(
+                    stderr.contains(&format!("is {state}.")),
+                    "{request:?}: the refusal names the state, got {stderr:?}"
+                );
+                assert!(
+                    out.stdout.is_empty(),
+                    "{request:?}: no exec id for a refusal"
+                );
+                assert!(!marker.exists(), "{request:?}: nothing ran");
+            }
+        }
     }
 
     /// An argv naming no program is refused rather than guessed at.

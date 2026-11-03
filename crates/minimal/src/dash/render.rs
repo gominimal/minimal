@@ -130,22 +130,22 @@ fn render_sidebar(model: &mut Model, frame: &mut Frame, area: Rect) {
     for (i, row) in rows.iter().enumerate() {
         let selected = i == model.cursor;
         let line = match row {
-            Row::ProviderHeader(p) => {
-                let provider = &model.providers[*p];
-                let arrow = if provider.collapsed { "▸" } else { "▼" };
+            Row::HostHeader(p) => {
+                let host = &model.hosts[*p];
+                let arrow = if host.collapsed { "▸" } else { "▼" };
                 // The dot is the group's health mark: green while the last
                 // refresh reached the daemon, red once it drops.
-                let (status, dot) = match provider.reachable {
-                    true => (format!("v{}", provider.version), Color::Green),
+                let (status, dot) = match host.reachable {
+                    true => (format!("v{}", host.version), Color::Green),
                     false => ("unreachable".to_string(), Color::Red),
                 };
                 let status = pad_truncate(
                     &status,
-                    inner_width.saturating_sub(UnicodeWidthStr::width(provider.label.as_str()) + 7),
+                    inner_width.saturating_sub(UnicodeWidthStr::width(host.label.as_str()) + 7),
                 );
                 Line::from(vec![
                     Span::styled(
-                        format!("{arrow} {}  ", provider.label),
+                        format!("{arrow} {}  ", host.label),
                         Style::default().add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(status, Style::default().fg(Color::Gray)),
@@ -978,12 +978,12 @@ mod tests {
         }
     }
 
-    fn provider_view(
+    fn host_view(
         label: &str,
         collapsed: bool,
         sessions: Vec<minimald_rpc::ListSessionsEntry>,
-    ) -> crate::dash::app::ProviderView {
-        crate::dash::app::ProviderView {
+    ) -> crate::dash::app::HostView {
+        crate::dash::app::HostView {
             label: label.to_string(),
             version: "0.1".to_string(),
             collapsed,
@@ -992,12 +992,12 @@ mod tests {
         }
     }
 
-    fn sidebar_model(providers: Vec<crate::dash::app::ProviderView>) -> Model {
+    fn sidebar_model(hosts: Vec<crate::dash::app::HostView>) -> Model {
         let now = chrono::DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z")
             .unwrap()
             .to_utc();
         let mut model = Model::new(now);
-        model.providers = providers;
+        model.hosts = hosts;
         model
     }
 
@@ -1022,7 +1022,7 @@ mod tests {
         let sessions = (0..30)
             .map(|n| sess_entry(n, &format!("s{n:02}")))
             .collect();
-        let mut model = sidebar_model(vec![provider_view("host", false, sessions)]);
+        let mut model = sidebar_model(vec![host_view("host", false, sessions)]);
         // Rows: one header + 30 sessions; a short pane can't show them all.
         model.cursor = model.visible_rows().len() - 1;
         let out = draw_sidebar(&mut model, 40, 16);
@@ -1044,22 +1044,18 @@ mod tests {
     /// editing", so the bar is the observable edit state.
     #[test]
     fn render_sidebar_shows_the_filter_edit_cursor_while_editing() {
-        let mut model = sidebar_model(vec![provider_view(
-            "host",
-            false,
-            vec![sess_entry(1, "api")],
-        )]);
+        let mut model = sidebar_model(vec![host_view("host", false, vec![sess_entry(1, "api")])]);
         model.filter.editing = true;
         model.filter.input = "web".to_string();
         let out = draw_sidebar(&mut model, 40, 12);
         assert!(out.contains("web▏"), "filter edit cursor missing:\n{out}");
     }
 
-    /// A collapsed provider renders its `▸` arrow and drops its session rows
+    /// A collapsed host renders its `▸` arrow and drops its session rows
     /// from the sidebar entirely.
     #[test]
-    fn render_sidebar_collapses_a_provider_hiding_its_sessions() {
-        let mut model = sidebar_model(vec![provider_view(
+    fn render_sidebar_collapses_a_host_hiding_its_sessions() {
+        let mut model = sidebar_model(vec![host_view(
             "host",
             true,
             vec![sess_entry(1, "hidden-sess")],
@@ -1075,7 +1071,7 @@ mod tests {
     /// The Policy pane's text for one session with this mode and policy.
     fn policy_text(network: boxes::NetworkMode, policy: boxes::BoxPolicy) -> String {
         let key = SessionKey {
-            provider: "host".to_string(),
+            host: "host".to_string(),
             id: sid(1),
         };
         let record = boxes::Record {
@@ -1086,6 +1082,9 @@ mod tests {
             network,
             policy: policy.clone(),
             status: boxes::BoxState::Active,
+            reason: None,
+            exit_code: None,
+            signal: None,
             hooks_enabled: true,
             task_addresses: Vec::new(),
             box_addresses: None,
@@ -1093,6 +1092,7 @@ mod tests {
             box_id: None,
             host_row_bound: false,
             bound_ports: std::collections::BTreeSet::new(),
+            ends_with_run: false,
             sealed_deliveries: Vec::new(),
             root_certificate: None,
             box_type: None,

@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
-# Download the pinned gvproxy (gvisor-tap-vsock) release binary and verify its
-# SHA-256 against vendor/gvproxy/gvproxy.lock. No build, no Go toolchain.
-# minimald spawns this binary as the per-host switch.
+# Provide the pinned gvproxy (gvisor-tap-vsock) switch binary and verify its
+# SHA-256 against vendor/gvproxy/gvproxy.lock. minimald spawns this binary as
+# the per-host switch.
+#
+# The switch is built from the pinned source plus vendor/gvproxy/patches/ by
+# scripts/build-gvproxy.sh, not downloaded: the upstream release leaves a
+# withdrawn port's accepted connections open. The build is reproducible, so
+# its result must match the lock's digest for the asset.
 #
 # The asset defaults to the host platform's binary; pass an explicit asset name
-# (2nd arg) to fetch a different platform's binary regardless of the host arch —
+# (2nd arg) to build a different platform's binary regardless of the host arch —
 # the release job uses this to pack every platform's gvproxy from one runner.
 #
 # Usage: scripts/fetch-gvproxy.sh [dest-path] [asset]
@@ -36,20 +41,19 @@ sha256_of() {
 }
 
 # A binary already at the destination is kept only while it is the pinned one:
-# after the lock moves, the copy an earlier run left behind is fetched again
+# after the lock moves, the copy an earlier run left behind is built again
 # rather than run as if it were the new pin.
 if [ -x "$out" ] && [ "$(sha256_of "$out")" = "$want" ]; then
   echo "fetch-gvproxy: ${asset} ${ver} already at ${out}"
   exit 0
 fi
 
-url="https://github.com/containers/gvisor-tap-vsock/releases/download/${ver}/${asset}"
-echo "fetch-gvproxy: downloading ${url}"
-# Fetched beside the destination and renamed over it, so a switch still running
+echo "fetch-gvproxy: building ${asset} ${ver} from the pinned source"
+# Built beside the destination and renamed over it, so a switch still running
 # from the old copy keeps its own file.
 tmp="${out}.fetch.$$"
 trap 'rm -f "$tmp"' EXIT
-curl -fsSL "$url" -o "$tmp"
+"${here}/build-gvproxy.sh" "$tmp" "$asset"
 
 got="$(sha256_of "$tmp")"
 if [ "$got" != "$want" ]; then

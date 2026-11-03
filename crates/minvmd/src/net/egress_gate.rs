@@ -415,6 +415,32 @@ impl QueueDirection {
 /// simply is not one the host published.
 const UNKNOWN_SOURCE_RULE: &str = "egress-unknown-source";
 
+/// The rule name for a frame from the in-VM daemon's own address, under the
+/// in-force node-plane baseline, toward an address no baseline entry pinned
+/// (NET-085, NET-130), or toward a pinned address at another protocol or
+/// port: the node plane reaches the addresses its own lookups resolved a
+/// registry or cache name to at TCP 443, the entries' subnets, the host
+/// alias at the configured host exposures, the resolver and the boxes'
+/// leases, and nothing else.
+const NODE_PLANE_UNPINNED_RULE: &str = "egress-node-plane-unpinned";
+
+/// The IP protocol a pinned baseline address is reached over: TCP alone,
+/// because the registry and the cache the daemon fetches from serve HTTPS
+/// (`https://github.com/gominimal/pkgs`, `https://cache.minimal.dev/`). A
+/// pin names an address, and a registry or cache name often resolves to a
+/// shared CDN address, so without this bound the pin would open that address
+/// at every protocol and port. QUIC is not admitted: carrying it would be a
+/// stated choice that adds UDP here. An endpoint spelled as a subnet is the
+/// deployment's own allowance and is decided by the set's compiled rules,
+/// without this bound.
+const NODE_PLANE_FETCH_PROTOCOL: u8 = egress::IPPROTO_TCP;
+
+/// The ports a pinned baseline address is reached at, over
+/// [`NODE_PLANE_FETCH_PROTOCOL`]: the HTTPS port the daemon's registry and
+/// cache fetches use. Any other port to a pinned address is
+/// [`NODE_PLANE_UNPINNED_RULE`]'s drop, the same as an address no pin names.
+const NODE_PLANE_FETCH_PORTS: [u16; 1] = [443];
+
 /// The rule name for a frame headed to the switch's own address — the plan's
 /// gateway — that is not a resolver query: TCP or UDP to the resolver's port
 /// is the one carve-out the frame rules admit there, and everything else —
@@ -519,8 +545,14 @@ static INFRASTRUCTURE_RANGES: LazyLock<InfrastructureRanges> = LazyLock::new(|| 
 /// Whether `dst` lies in the infrastructure deny set as the host frame rule
 /// holds it ([`INFRASTRUCTURE_RULE`]): a fixed range; the host alias, which
 /// is default-deny at every port for a box row (design §7.1, NET-062) when
-/// `refuse_host_alias` says so; the fabric plane
-/// outside `own_block`, the subnet the gate's rows live in — a frame to a
+/// `refuse_host_alias` says so, and for the node row's frames too outside
+/// the host exposures `host_exposure` carries — the inclusive port ranges
+/// the deployment configured, empty unless it named ports, matched against
+/// `transport_port`, the TCP or UDP destination port, `None` for any other
+/// frame. Box rows stay refused at a configured exposure too: the design
+/// holds an exposure as local reach under the box's egress rules (§7.1),
+/// and that reach is not built yet; the refusal fails closed, and
+/// gominimal/inbox#1144 owns the gap. The fabric plane outside `own_block`, the subnet the gate's rows live in — a frame to a
 /// sibling or to the daemon inside the node's own block is local reach,
 /// decided by the row's CIDR rules and the target's ingress, never by this
 /// rule, and the gateway inside it is the control-surface rule's; or RFC
@@ -543,14 +575,19 @@ static INFRASTRUCTURE_RANGES: LazyLock<InfrastructureRanges> = LazyLock::new(|| 
 /// of every box that shares the guest root namespace (a host-address box,
 /// the default network mode), and those reach the host alias as own-block
 /// local reach until the in-force baseline, which names the alias as its
-/// registry and cache endpoint, decides the node plane instead. This
-/// mirrors the shared verdict, whose own-address refusal is attached to box
-/// relays only, never to the daemon relay.
+/// registry and cache endpoint, decides the node plane instead. Announced,
+/// that reach is scoped: the alias is opened at the configured host
+/// exposures alone, and a node-row frame to any other port, or with no TCP
+/// or UDP port, is this rule's drop. This mirrors the shared verdict,
+/// whose own-address refusal is attached to box relays only, never to the
+/// daemon relay.
 fn infrastructure_destination(
     dst: [u8; 4],
+    transport_port: Option<u16>,
     own_block: SwitchSubnet,
     allow: Option<&[Ipv4Cidr]>,
     refuse_host_alias: bool,
+    host_exposure: &[(u16, u16)],
 ) -> bool {
     let ranges = &*INFRASTRUCTURE_RANGES;
     if ranges.fixed.iter().any(|cidr| cidr.contains(dst)) {
@@ -559,8 +596,16 @@ fn infrastructure_destination(
     // The host alias is default-deny (design §7.1, NET-062): a box reaches
     // the host only through a declared exposure, never by addressing the
     // alias directly, so the alias is refused under this rule at every port
-    // whatever the row's rules would say about it.
-    if refuse_host_alias && dst == own_block.host_alias().octets() {
+    // whatever the row's rules would say about it. The node row's frames
+    // — the host-address boxes the interim row carries — reach the alias at
+    // the configured host exposures alone, and only over TCP or UDP: a frame
+    // with no transport port (ICMP reads as port 0) fails the opening closed.
+    let exposed = transport_port.is_some_and(|port| {
+        host_exposure
+            .iter()
+            .any(|&(lo, hi)| lo <= port && port <= hi)
+    });
+    if dst == own_block.host_alias().octets() && (refuse_host_alias || !exposed) {
         return true;
     }
     let in_own_block = (u32::from_be_bytes(dst) & u32::from(own_block.netmask()))
@@ -1033,6 +1078,7 @@ impl EgressGate {
             switch_socket = %switch_sock.display(),
             unregistered_sources = "dropped",
             undeclared_box_default = phase.as_str(),
+            host_exposure_ports = %baseline.render_host_exposure(),
             "host-side egress gate listening",
         );
         // The node-plane baseline set the gate decides the in-VM daemon's own
@@ -1040,11 +1086,15 @@ impl EgressGate {
         // bundle's daemon log tail holds to see which categories the node
         // plane may reach and under which posture the gate decides them
         // (NET-130).
+        // The pins the node plane's own lookups take are adopted here, from
+        // the same baseline the gate decides by, so the two never disagree.
+        pins.adopt_baseline(&baseline);
         tracing::info!(
             baseline = %baseline.render(),
             node_addr = %Ipv4Addr::from(baseline.node_addr()),
             node_baseline_phase = baseline.phase().as_str(),
-            "node-plane baseline set at the gate",
+            "node-plane baseline set at the gate; each entry's addresses are pinned from the \
+             node's own lookups",
         );
         // One limiter for the whole gate: a guest that reconnects must not
         // reset the rate window its drops are counted in.
@@ -1054,6 +1104,14 @@ impl EgressGate {
         // not of the connection that carried it — the publish and the
         // teardown that retracts it arrive on different connections.
         let forwards = Arc::new(PublishedForwards::new());
+        // The node's mirrored binds go through this ledger too (NET-138), so
+        // the gate tracks their connections and admits the node's replies.
+        table.attach_mirror_ledger(MirrorLedger {
+            forwards: Arc::downgrade(&forwards),
+            replies: replies.clone(),
+            switch_sock: switch_sock.clone(),
+            runtime: tokio::runtime::Handle::current(),
+        });
         // Subscribed before the accept loop starts, so no row withdrawn
         // while the gate serves escapes the revoker. The revoker and the
         // accept loop live as long as the VM, each in a span of its own that
@@ -1419,6 +1477,7 @@ async fn serve_connection(
                 limiter,
                 replies,
                 &forwards,
+                &switch_sock,
                 handshake_timeout,
                 phase,
             )
@@ -1844,7 +1903,8 @@ async fn relay_control(
     table: BoxTable,
     limiter: Arc<DropLimiter>,
     replies: ReplyTables,
-    forwards: &PublishedForwards,
+    forwards: &Arc<PublishedForwards>,
+    switch_sock: &std::path::Path,
     drain_timeout: Duration,
     phase: UnregisteredSourcePhase,
 ) {
@@ -1890,18 +1950,141 @@ async fn relay_control(
                 return;
             }
         };
-    let decision = match decide_control_request(verb, &request, &table, phase, forwards) {
-        Ok(decision) => decision,
-        Err(refused) => {
-            // Refused, and said so at the frame drops' cadence: a guest can
-            // attempt a publish on a fresh connection as cheaply as it can
-            // send a frame, and the refusal must not become the flood. The
-            // connection's halves come down with the return — nothing was
-            // written on, so gvproxy never saw the request, and the guest's
-            // read of its own side ends it.
-            refuse_request(&limiter, &refused);
+    // One round of the guest daemon's loopback range probe is decided by the
+    // probe's own bounds, never by a row ([`range_probe_listener`]). The
+    // guest is untrusted here, so a round binds only at a range address no
+    // box holds, one round at a time, and no longer than [`RANGE_PROBE_HOLD`]:
+    // an expose at a held address is answered as held and never relayed, a
+    // second outstanding round is refused, and a release names only the
+    // round outstanding. A round's relay takes no ledger note.
+    //
+    // A request naming a listener a round can bind takes the probe turn for
+    // the rest of this exchange, so its classification, its ledger note and
+    // its write are one step against every other such request and against
+    // the gate's own release of a round.
+    let _probe_turn = if names_probe_listener(verb, &request) {
+        Some(forwards.probe_turn.lock().await)
+    } else {
+        None
+    };
+    let mut probe_round = None;
+    // What an admitted round writes to the switch: the request rebuilt from
+    // the fields the gate checked, never the guest's bytes
+    // ([`canonical_probe_request`]).
+    let mut probe_spoken = None;
+    let probe = range_probe_listener(verb, &request);
+    if let Some(listener) = probe
+        && !probe_body_is_strict(verb, &request)
+    {
+        // A probe-shaped body with a key the gate's shape check does not
+        // read: unknown, repeated, or a case variant gvproxy's decoder would
+        // take for one of the probe's fields. Refused with an answer, never
+        // relayed.
+        refuse_request(
+            &limiter,
+            &RefusedRequest {
+                rule: RANGE_PROBE_RULE,
+                addr: Some(listener.0),
+                what: Some(format!("port {}", listener.1)),
+                reason: "a loopback range probe round carried a key beyond its own fields"
+                    .to_string(),
+            },
+        );
+        answer_unrelayed(
+            &mut guest,
+            &mut guest_tx,
+            &probe_malformed_answer(),
+            drain_timeout,
+        )
+        .await;
+        return;
+    }
+    let decision = match probe {
+        Some(listener) if !range_address_held(&table, forwards, listener.0) => {
+            probe_spoken = Some(canonical_probe_request(verb, listener));
+            if verb == ControlVerb::Expose {
+                match forwards.begin_probe(listener) {
+                    Ok(generation) => {
+                        tokio::spawn(
+                            release_probe_after_hold(
+                                switch_sock.to_path_buf(),
+                                Arc::downgrade(forwards),
+                                generation,
+                            )
+                            .in_current_span(),
+                        );
+                        probe_round = Some(generation);
+                    }
+                    Err(held) => {
+                        refuse_request(
+                            &limiter,
+                            &RefusedRequest {
+                                rule: RANGE_PROBE_RULE,
+                                addr: Some(listener.0),
+                                what: Some(format!("port {}", listener.1)),
+                                reason: format!(
+                                    "another loopback range probe round is still bound at {}",
+                                    forward_revoke::listener_local(held.0, held.1)
+                                ),
+                            },
+                        );
+                        answer_unrelayed(
+                            &mut guest,
+                            &mut guest_tx,
+                            &probe_refused_answer(),
+                            drain_timeout,
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            } else {
+                match forwards.outstanding_probe() {
+                    Some((held, generation)) if held == listener => probe_round = Some(generation),
+                    // No round of the probe is bound at this listener, so the
+                    // release has nothing to take: answered as the switch
+                    // answers one that stood, and never relayed.
+                    _ => {
+                        answer_unrelayed(
+                            &mut guest,
+                            &mut guest_tx,
+                            forward_revoke::bound_answer(),
+                            drain_timeout,
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+            tracing::debug!(?verb, "relaying a loopback range probe round");
+            None
+        }
+        Some(_) if verb == ControlVerb::Expose => {
+            // A box holds the address. The round is answered as the switch
+            // answers a listener already held, which the walk counts as
+            // present, and never relayed.
+            answer_unrelayed(
+                &mut guest,
+                &mut guest_tx,
+                &forward_revoke::held_answer(),
+                drain_timeout,
+            )
+            .await;
             return;
         }
+        _ => match decide_control_request(verb, &request, &table, phase, forwards) {
+            Ok(decision) => Some(decision),
+            Err(refused) => {
+                // Refused, and said so at the frame drops' cadence: a guest
+                // can attempt a publish on a fresh connection as cheaply as
+                // it can send a frame, and the refusal must not become the
+                // flood. The connection's halves come down with the return —
+                // nothing was written on, so gvproxy never saw the request,
+                // and the guest's read of its own side ends it.
+                refuse_request(&limiter, &refused);
+                return;
+            }
+        },
     };
     // A publish's two ends go to the ledger before the request is written
     // on: the listener it is applied at, for a later retraction's
@@ -1938,8 +2121,8 @@ async fn relay_control(
     // not written on either: the switch refuses a second expose of a
     // listener it holds, and the daemon fails the attach on any refused
     // bind. The gate answers it as bound, which it is.
-    let noted = match (verb, forward_listener(verb, &request)) {
-        (ControlVerb::Expose, Some(listener)) => {
+    let noted = match (verb, forward_listener(verb, &request), &decision) {
+        (ControlVerb::Expose, Some(listener), Some(decision)) => {
             match (published_inside(&request), published_protocol(&request)) {
                 (Some(inside), Some(proto)) => {
                     let addr = decision.request.switch_addr();
@@ -2031,9 +2214,13 @@ async fn relay_control(
     };
     // Admitted: the head and body are forwarded together, in one write, so
     // the request gvproxy sees is exactly the request the guest sent and
-    // exactly the request the table admitted.
-    let mut spoken = head;
-    spoken.extend_from_slice(&request);
+    // exactly the request the table admitted. A probe round is the
+    // exception: it is written as the gate rebuilt it from what it checked.
+    let spoken = probe_spoken.unwrap_or_else(|| {
+        let mut spoken = head;
+        spoken.extend_from_slice(&request);
+        spoken
+    });
     if let Err(error) = switch.write_all(&spoken).await {
         tracing::warn!(%error, "egress gate could not forward an admitted control request");
         if let Some(listener) = noted {
@@ -2041,10 +2228,12 @@ async fn relay_control(
         }
         return;
     }
-    if decision.applied == Applied::Interim {
+    if let Some(decision) = &decision
+        && decision.applied == Applied::Interim
+    {
         // The interim's admission is the one publish the gate applies whose
         // reach no row bounds, and the host must be able to see it pass.
-        warn_interim_publish(&limiter, &decision);
+        warn_interim_publish(&limiter, decision);
         // And the lease it named is one the guest daemon vouched for while
         // no row held it, whatever the request published: the fact the
         // live-lease drop line reads ([`PublishedForwards::lease_live_at`]).
@@ -2164,6 +2353,14 @@ async fn relay_control(
         if !forwards.still_published(addr, inside, proto) {
             replies.end_port_at(addr, proto, inside);
         }
+    }
+    // A probe round's expose the switch refused bound nothing, and a release
+    // the switch answered stood: either way the round is over. A round left
+    // unanswered stays accounted, and its hold releases it.
+    if let (Some(generation), Some(&status)) = (probe_round, answered.get())
+        && (200..300).contains(&status) == (verb == ControlVerb::Unexpose)
+    {
+        forwards.end_probe(generation);
     }
 }
 
@@ -2441,6 +2638,28 @@ struct PublishedForwards {
     /// the state a reset for it is built from: what the box's end terminates
     /// once its forwards are unbound ([`revoke_box_forwards`], design §7.1).
     flows: ForwardedFlows,
+    /// The guest daemon's outstanding loopback range probe round, if any
+    /// (#2748): at most one at a time per gate, from its admitted expose
+    /// until its unexpose stands ([`Self::begin_probe`]).
+    probe: Mutex<ProbeSlot>,
+    /// The turn every control request naming a listener a probe round can
+    /// bind takes, from its classification through the switch's answer, and
+    /// the turn the gate's own release of a round takes
+    /// ([`names_probe_listener`]). One at a time, a probe's release can never
+    /// be decided against a ledger an ordinary publish of the same listener
+    /// is still changing, nor unbind a forward that publish bound.
+    probe_turn: tokio::sync::Mutex<()>,
+}
+
+/// The gate's account of the range probe ([`PublishedForwards::probe`]).
+#[derive(Debug, Default)]
+struct ProbeSlot {
+    /// The round bound or binding now, with the generation it was admitted
+    /// under.
+    outstanding: Option<(Listener, u64)>,
+    /// The next round's generation, so a release meant for an ended round
+    /// never ends a later one.
+    next: u64,
 }
 
 /// A forwarder listener: its loopback address and port.
@@ -2528,7 +2747,67 @@ impl PublishedForwards {
             handed: Mutex::new(Vec::new()),
             vouched: Mutex::new(Vec::new()),
             flows: ForwardedFlows::default(),
+            probe: Mutex::new(ProbeSlot::default()),
+            probe_turn: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Admits one range probe round at `listener`, returning its generation,
+    /// or the listener of the round still outstanding: at most one round is
+    /// bound at a time, as the guest daemon's walk binds and releases one
+    /// address after another.
+    fn begin_probe(&self, listener: Listener) -> Result<u64, Listener> {
+        let mut slot = self.lock_probe();
+        if let Some((held, _)) = slot.outstanding {
+            return Err(held);
+        }
+        slot.next += 1;
+        let generation = slot.next;
+        slot.outstanding = Some((listener, generation));
+        Ok(generation)
+    }
+
+    /// The outstanding round, if any, and its generation.
+    fn outstanding_probe(&self) -> Option<(Listener, u64)> {
+        self.lock_probe().outstanding
+    }
+
+    /// The listener of round `generation` while it is still outstanding.
+    fn probe_listener(&self, generation: u64) -> Option<Listener> {
+        self.lock_probe()
+            .outstanding
+            .filter(|(_, held)| *held == generation)
+            .map(|(listener, _)| listener)
+    }
+
+    /// Ends round `generation`: its expose bound nothing, or its unexpose
+    /// stood. A later round is left alone.
+    fn end_probe(&self, generation: u64) {
+        let mut slot = self.lock_probe();
+        if slot.outstanding.is_some_and(|(_, held)| held == generation) {
+            slot.outstanding = None;
+        }
+    }
+
+    /// Whether an applied or waiting publish's listener is bound at the
+    /// loopback address `addr`.
+    fn holds_loopback_address(&self, addr: [u8; 4]) -> bool {
+        let applied = self.lock();
+        applied
+            .iter()
+            .any(|(listener, _, _, _, _)| listener.0 == addr)
+            || self
+                .lock_waiting()
+                .iter()
+                .any(|waiting| waiting.listener.0 == addr)
+    }
+
+    /// The range probe's account.
+    fn lock_probe(&self) -> MutexGuard<'_, ProbeSlot> {
+        self.probe.lock().expect(
+            "the probe slot's lock is held only across a lookup or an update, never \
+             across a panic",
+        )
     }
 
     /// Every applied publish at the box address `addr`: what the box's end
@@ -3357,6 +3636,178 @@ async fn terminate_flows(
     }
 }
 
+/// The gate's publish ledger as the node's mirror reaches it (NET-138). A
+/// mirrored bind is a forward like a box's publish: its listener is the
+/// node's reserved-range address on the host, and it dials the node's own
+/// switch address at the same port. Noted in the ledger, the gate tracks
+/// the connections it carries and admits the node's replies on them. Its
+/// unbind takes that port's connections and resets them at the switch.
+///
+/// The gate attaches one to its table when it starts
+/// ([`BoxTable::attach_mirror_ledger`]). It holds the ledger weakly, so a
+/// gate that stopped is a ledger the mirror can no longer note in.
+#[derive(Clone)]
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+pub(crate) struct MirrorLedger {
+    forwards: std::sync::Weak<PublishedForwards>,
+    replies: ReplyTables,
+    switch_sock: PathBuf,
+    runtime: tokio::runtime::Handle,
+}
+
+impl std::fmt::Debug for MirrorLedger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MirrorLedger")
+            .field("gate_running", &(self.forwards.strong_count() > 0))
+            .field("switch_sock", &self.switch_sock)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why [`MirrorLedger::note_bind`] noted nothing.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum MirrorLedgerRefused {
+    /// The gate stopped, so nothing tracks the forward's connections.
+    #[error("the egress gate is not running")]
+    GateStopped,
+    /// Another address holds the listener in the ledger.
+    #[error("the listener {0} is held for another address")]
+    HeldElsewhere(String),
+    /// The ledger is at its bound.
+    #[error("{0}")]
+    Full(String),
+}
+
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+impl MirrorLedger {
+    /// Notes the mirrored bind of `port` at `listener`, dialling `node` at
+    /// the same port, before the switch is asked for it. Returns whether
+    /// the note is new: `false` when the ledger already held it.
+    ///
+    /// # Errors
+    ///
+    /// [`MirrorLedgerRefused`] when the gate stopped, another address
+    /// holds the listener, or the ledger is full.
+    pub(crate) fn note_bind(
+        &self,
+        listener: Ipv4Addr,
+        port: u16,
+        node: Ipv4Addr,
+    ) -> Result<bool, MirrorLedgerRefused> {
+        self.note_forward(listener, port, node, port)
+    }
+
+    /// Notes a forward from `port` at `listener` that dials `node` at
+    /// `inside`, before the switch is asked for it. [`Self::note_bind`] is
+    /// the case where `inside` is `port`. Returns whether the note is new:
+    /// `false` when the ledger already held this same forward.
+    ///
+    /// # Errors
+    ///
+    /// [`MirrorLedgerRefused`] when the gate stopped, a forward to another
+    /// address or inside port holds the listener, or the ledger is full.
+    pub(crate) fn note_forward(
+        &self,
+        listener: Ipv4Addr,
+        port: u16,
+        node: Ipv4Addr,
+        inside: u16,
+    ) -> Result<bool, MirrorLedgerRefused> {
+        let forwards = self
+            .forwards
+            .upgrade()
+            .ok_or(MirrorLedgerRefused::GateStopped)?;
+        let key = (listener.octets(), port);
+        let mut applied = forwards.lock();
+        if let Some((_, at, held_inside, _, _)) =
+            applied.iter().find(|(held, _, _, _, _)| *held == key)
+        {
+            return if *at == node.octets() && *held_inside == inside {
+                Ok(false)
+            } else {
+                Err(MirrorLedgerRefused::HeldElsewhere(
+                    forward_revoke::listener_local(key.0, key.1),
+                ))
+            };
+        }
+        PublishedForwards::push_applied(
+            &mut applied,
+            key,
+            node.octets(),
+            inside,
+            egress::IPPROTO_TCP,
+            Applied::Row,
+        )
+        .map(|()| true)
+        .map_err(|full| MirrorLedgerRefused::Full(full.to_string()))
+    }
+
+    /// Drops the note of the mirrored bind of `port` at `listener` when it
+    /// still dials `node`, with the reply-flow records it opened.
+    pub(crate) fn forget_bind(&self, listener: Ipv4Addr, port: u16, node: Ipv4Addr) {
+        let Some(forwards) = self.forwards.upgrade() else {
+            return;
+        };
+        let key = (listener.octets(), port);
+        if forwards.address_of(key) == Some(node.octets())
+            && let Some((addr, inside, proto)) = forwards.note_retracted(key)
+            && !forwards.still_published(addr, inside, proto)
+        {
+            self.replies.end_port_at(addr, proto, inside);
+        }
+    }
+
+    /// Takes the connections the gate tracks at `node` and `port` and
+    /// resets them at the switch, in a task of the gate's runtime. Returns
+    /// how many it took. The resets' outcome is logged by that task.
+    pub(crate) fn reset_port(&self, node: Ipv4Addr, port: u16) -> usize {
+        let Some(forwards) = self.forwards.upgrade() else {
+            return 0;
+        };
+        let flows = forwards.flows.take_at_port(node.octets(), port);
+        let taken = flows.len();
+        if taken > 0 {
+            let switch_sock = self.switch_sock.clone();
+            self.runtime.spawn(async move {
+                terminate_flows(&switch_sock, node, &flows).await;
+            });
+        }
+        taken
+    }
+}
+
+/// A ledger attached to `table` for a test, with nothing else of a gate
+/// running: the strong end of the [`MirrorLedger`] it leaves there. Must be
+/// made within a tokio runtime, as the gate is.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct TestMirrorLedger {
+    forwards: Arc<PublishedForwards>,
+}
+
+#[cfg(test)]
+impl TestMirrorLedger {
+    pub(crate) fn attach(table: &BoxTable, switch_sock: PathBuf) -> Self {
+        let forwards = Arc::new(PublishedForwards::new());
+        table.attach_mirror_ledger(MirrorLedger {
+            forwards: Arc::downgrade(&forwards),
+            replies: ReplyTables::new(),
+            switch_sock,
+            runtime: tokio::runtime::Handle::current(),
+        });
+        Self { forwards }
+    }
+
+    /// The address the ledger's forward at `listener` and `port` dials,
+    /// when one is noted.
+    pub(crate) fn dials(&self, listener: Ipv4Addr, port: u16) -> Option<Ipv4Addr> {
+        self.forwards
+            .address_of((listener.octets(), port))
+            .map(Ipv4Addr::from)
+    }
+}
+
 /// Decides one control request against the host-side table (NET-081's
 /// publish half, applied at relay level): summarize the request the verb and
 /// body ask the switch for, decide it with the pure decision
@@ -3679,6 +4130,241 @@ struct DnsRecordBody {
 /// — and a request wider than the summary holds is refused rather than
 /// truncated, because a truncated request is a different request.
 const MAX_ZONE_RECORDS: usize = MAX_REQUEST_RECORDS;
+
+/// The listener a control request names when it has the exact shape of one
+/// round of the guest daemon's loopback range probe (NET-123): the expose
+/// that binds [`switch::loopback::RANGE_PROBE_PORT`] at one address of the
+/// reserved local range, tcp, toward [`switch::loopback::RANGE_PROBE_REMOTE`],
+/// which is never dialed, or the unexpose that releases it. `None` for any
+/// other request, which the row decision decides.
+///
+/// The guest cannot see the host's loopback, so it asks the forwarder to bind
+/// there, and the answer is the range verdict its publishes follow. No row
+/// holds the probe's placeholder remote, so the row decision would refuse
+/// every round, and the guest would read the range as absent while this host
+/// answers its boxes' names inside it (#2748). The shape alone admits
+/// nothing: the guest is untrusted here, so [`relay_control`] bounds what a
+/// probe may bind ([`PublishedForwards::begin_probe`],
+/// [`range_address_held`], [`RANGE_PROBE_HOLD`]).
+fn range_probe_listener(verb: ControlVerb, body: &[u8]) -> Option<Listener> {
+    // Read as a plain object, keyed as written, a repeated key's last value
+    // winning as it does in gvproxy's decoder, so a body that would bind as a
+    // probe round there is recognised as one here, and the strict read that
+    // follows ([`probe_body_is_strict`]) refuses it if it carries anything
+    // beyond the round's own fields.
+    let value: serde_json_lenient::Value = serde_json_lenient::from_slice(body).ok()?;
+    let field = |name: &str| value.get(name).and_then(serde_json_lenient::Value::as_str);
+    match verb {
+        ControlVerb::Expose if field("remote")? != switch::loopback::RANGE_PROBE_REMOTE => {
+            return None;
+        }
+        ControlVerb::Expose | ControlVerb::Unexpose => {}
+        ControlVerb::DnsAdd => return None,
+    }
+    let listener = loopback_listener(field("local")?).ok()?;
+    (field("protocol")? == "tcp"
+        && listener.1 == switch::loopback::RANGE_PROBE_PORT
+        && in_reserved_local_range(Ipv4Addr::from(listener.0)))
+    .then_some(listener)
+}
+
+/// A range probe round's expose body, read strictly: exactly these fields,
+/// once each, spelled exactly. gvproxy's Go decoder matches keys without
+/// regard to case and lets a repeated key win, so a body carrying anything
+/// else could bind there what the gate never checked.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProbeExposeBody {
+    local: String,
+    remote: String,
+    protocol: String,
+}
+
+/// A range probe round's unexpose body, read as strictly as
+/// [`ProbeExposeBody`].
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProbeUnexposeBody {
+    local: String,
+    protocol: String,
+}
+
+/// Whether a probe-shaped body carries its own fields and nothing else:
+/// no unknown key, no key twice, no case variant of one.
+fn probe_body_is_strict(verb: ControlVerb, body: &[u8]) -> bool {
+    match verb {
+        ControlVerb::Expose => serde_json_lenient::from_slice::<ProbeExposeBody>(body).is_ok(),
+        ControlVerb::Unexpose => serde_json_lenient::from_slice::<ProbeUnexposeBody>(body).is_ok(),
+        ControlVerb::DnsAdd => false,
+    }
+}
+
+/// The request an admitted range probe round writes to the switch, built
+/// from the listener the gate checked and the probe's own constants, in the
+/// guest daemon's own spelling: gvproxy sees exactly what the gate decided,
+/// whatever bytes the guest sent.
+fn canonical_probe_request(verb: ControlVerb, listener: Listener) -> Vec<u8> {
+    let local = forward_revoke::listener_local(listener.0, listener.1);
+    let protocol = "tcp".to_string();
+    let (path, body) = match verb {
+        ControlVerb::Unexpose => (
+            "/services/forwarder/unexpose",
+            serde_json_lenient::to_vec(&ProbeUnexposeBody { local, protocol }),
+        ),
+        _ => (
+            "/services/forwarder/expose",
+            serde_json_lenient::to_vec(&ProbeExposeBody {
+                local,
+                remote: switch::loopback::RANGE_PROBE_REMOTE.to_string(),
+                protocol,
+            }),
+        ),
+    };
+    let body = body.expect("three strings always serialize");
+    let mut request = format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(&body);
+    request
+}
+
+/// The answer to a probe-shaped round the gate refuses for a key beyond its
+/// own fields: an HTTP refusal, so the guest reads a refusal, never a fault
+/// of the channel.
+fn probe_malformed_answer() -> Vec<u8> {
+    const BODY: &str = "a loopback range probe round carried a key beyond its own fields";
+    format!(
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\n\
+         Content-Length: {}\r\n\r\n{BODY}\n",
+        BODY.len() + 1
+    )
+    .into_bytes()
+}
+
+/// Whether a control request names a listener a range probe round can bind:
+/// the probe port at an address of the reserved range, whatever else the
+/// request is. Every such request takes [`PublishedForwards::probe_turn`].
+fn names_probe_listener(verb: ControlVerb, body: &[u8]) -> bool {
+    forward_listener(verb, body).is_some_and(|listener| {
+        listener.1 == switch::loopback::RANGE_PROBE_PORT
+            && in_reserved_local_range(Ipv4Addr::from(listener.0))
+    })
+}
+
+/// Whether a box holds the loopback address `addr`: a row registered at it,
+/// or an applied or waiting publish whose listener is bound there. A range
+/// probe never binds at such an address, so it can never squat a port a box
+/// declares there or skew what the box's own forwards hold. The host bound
+/// or granted the address for that box, so the probe's round is answered as
+/// held, which the walk counts as present (NET-123).
+fn range_address_held(table: &BoxTable, forwards: &PublishedForwards, addr: [u8; 4]) -> bool {
+    forwards.holds_loopback_address(addr)
+        || table
+            .rows()
+            .iter()
+            .any(|row| row.loopback_addr().octets() == addr)
+}
+
+/// How long one range probe round may stay bound before the gate releases it
+/// itself ([`release_probe_after_hold`]). The guest daemon releases each
+/// round the moment it answers, within its own one-second round budget, so
+/// only a guest that never releases its round meets this bound.
+#[cfg(not(test))]
+const RANGE_PROBE_HOLD: Duration = Duration::from_secs(5);
+/// [`RANGE_PROBE_HOLD`] for the gate's own tests: long enough for a test's
+/// release to arrive first, short enough to wait out.
+#[cfg(test)]
+const RANGE_PROBE_HOLD: Duration = Duration::from_secs(2);
+
+/// The rule a refused range probe round is logged under.
+const RANGE_PROBE_RULE: &str = "egress-range-probe";
+
+/// The answer to a range probe round the gate refuses because another round
+/// is still outstanding: an HTTP refusal, so the guest reads the forwarder's
+/// refusal it reads for an address that does not bind, never a fault of the
+/// channel.
+fn probe_refused_answer() -> Vec<u8> {
+    const BODY: &str = "another loopback range probe round is still bound";
+    format!(
+        "HTTP/1.1 409 Conflict\r\nContent-Type: text/plain; charset=utf-8\r\n\
+         Content-Length: {}\r\n\r\n{BODY}\n",
+        BODY.len() + 1
+    )
+    .into_bytes()
+}
+
+/// How many times the gate asks the switch to release a round the guest
+/// left bound before it gives up ([`release_probe_after_hold`]).
+const RANGE_PROBE_RELEASE_ATTEMPTS: usize = 3;
+
+/// Releases the range probe round `generation` once [`RANGE_PROBE_HOLD`] has
+/// passed, if the guest has not released it: a guest that binds a round and
+/// never unexposes it holds the probe port at that address no longer than
+/// the bound. The round stays accounted until the switch answers its
+/// release, unbound or never bound, so a release the switch does not answer
+/// is asked again a hold later, [`RANGE_PROBE_RELEASE_ATTEMPTS`] times in all.
+/// After the last failure the round stays outstanding, and with it the gate
+/// admits no other round, failing closed. The task holds the gate's ledger
+/// only weakly, and ends with the gate.
+async fn release_probe_after_hold(
+    switch_sock: PathBuf,
+    forwards: std::sync::Weak<PublishedForwards>,
+    generation: u64,
+) {
+    for attempt in 1..=RANGE_PROBE_RELEASE_ATTEMPTS {
+        tokio::time::sleep(RANGE_PROBE_HOLD).await;
+        let Some(forwards) = forwards.upgrade() else {
+            return;
+        };
+        let _turn = forwards.probe_turn.lock().await;
+        let Some(listener) = forwards.probe_listener(generation) else {
+            return;
+        };
+        // A box's publish holds the listener now. Its forward could bind only
+        // once the round's was gone, so it is the box's, never the round's,
+        // and it stays.
+        if forwards.protocol_of(listener).is_some() {
+            forwards.end_probe(generation);
+            return;
+        }
+        let local = forward_revoke::listener_local(listener.0, listener.1);
+        match forward_revoke::unexpose(&switch_sock, &local, "tcp", forward_revoke::REVOKE_TIMEOUT)
+            .await
+        {
+            Ok(_) => {
+                forwards.end_probe(generation);
+                tracing::warn!(
+                    rule_matched = RANGE_PROBE_RULE,
+                    %local,
+                    "released a loopback range probe round the guest left bound past its hold"
+                );
+                return;
+            }
+            Err(error) if attempt == RANGE_PROBE_RELEASE_ATTEMPTS => {
+                tracing::error!(
+                    rule_matched = RANGE_PROBE_RULE,
+                    %local,
+                    %error,
+                    attempts = attempt,
+                    "gave up releasing a loopback range probe round the guest left bound; \
+                     it stays accounted, and the gate admits no other round"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    rule_matched = RANGE_PROBE_RULE,
+                    %local,
+                    %error,
+                    attempt,
+                    "releasing a loopback range probe round failed; asking again"
+                );
+            }
+        }
+    }
+}
 
 /// Summarizes an expose request into a [`SwitchRequest`]: the remote is the
 /// switch address the forwarder dials and the address the publish is at; the
@@ -4345,6 +5031,19 @@ async fn relay_frames_to_switch(
                 }
                 continue;
             }
+            Err(GateDrop::NodePlaneUnpinned { src, dst, dst_port }) => {
+                limiter.warn_node_plane_unpinned(src, dst, dst_port);
+                continue;
+            }
+            Err(GateDrop::HostIpUnbounded {
+                src,
+                dst,
+                dst_port,
+                resident,
+            }) => {
+                limiter.warn_host_ip_unbounded(src, dst, dst_port, resident);
+                continue;
+            }
             Err(GateDrop::Verdict(reason @ DropReason::UndeclaredSubnet { dst, .. })) => {
                 // The row's own rules refused the destination, and the line
                 // names it beside the source and the rule: the destination
@@ -4378,7 +5077,9 @@ async fn relay_frames_to_switch(
         // frameless and unpublishable for the rest of the VM's life, over a
         // shuttle close its control path rode out.
         let src = match admitted {
-            GateAdmit::Baseline | GateAdmit::Row | GateAdmit::ProxyLane => summary.source(),
+            GateAdmit::Baseline | GateAdmit::Row | GateAdmit::ProxyLane | GateAdmit::HostIpBox => {
+                summary.source()
+            }
         };
         if let Some(src) = src
             && src != baseline.node_addr()
@@ -4464,7 +5165,13 @@ async fn relay_frames_to_switch(
         // the resolver's port — and only for a frame the queue took, which
         // is why this sits after the enqueue.
         if let Some((query, datagram)) = dns {
-            pins.observe_query(table, &query, datagram, Instant::now());
+            pins.observe_query(
+                table,
+                &query,
+                datagram,
+                summary.box_cohort_marked(),
+                Instant::now(),
+            );
         }
     }
 }
@@ -4614,7 +5321,19 @@ enum GateAdmit {
     /// the row's own fact; nothing the guest says grants one, and nothing in
     /// it opens the address's other ports or protocols.
     ProxyLane,
+    /// A resident `host_ip` box's rules admitted a frame from the node
+    /// address that wears the box mark (NET-085, design §4.3 rule 2). The
+    /// guest's table marks a `host_ip` box's connections, and root in the
+    /// guest can mark any frame, so the mark only says which rules decide
+    /// the frame: the union of the resident `host_ip` boxes' rules, which
+    /// the host-side client registered ([`BoxTable::host_ip_boxes`]).
+    HostIpBox,
 }
+
+/// The rule a box-marked frame from the node address drops under when no
+/// resident `host_ip` box's rules admit it, or when no `host_ip` box is
+/// resident: the rate-limit key and the drop line's `rule_matched`.
+pub(crate) const HOST_IP_BOXES_RULE: &str = "egress-host-ip-boxes";
 
 /// How long a bare SYN the ingress leg delivered at a port no publish dials
 /// stays refusable ([`ReplyTables::observe_refusable`]): the refusal follows
@@ -5172,16 +5891,104 @@ fn reply_tuple_of(pkt: &dns_pins::L4Packet) -> egress::FlowTuple {
     )
 }
 
+/// The in-force node-plane decision for a frame from the in-VM daemon's own
+/// address (NET-085, NET-130). The frame is admitted to:
+///
+/// - an address the node plane's own lookups pinned for a baseline entry's
+///   name, or a flow such a pin established ([`dns_pins::DnsPins::admits_node_frame`]),
+///   at [`NODE_PLANE_FETCH_PROTOCOL`] and [`NODE_PLANE_FETCH_PORTS`] only;
+/// - a subnet a baseline entry names, and the resolver carve-out, both by the
+///   set's compiled rules;
+/// - the host alias at the configured host exposures, over TCP or UDP;
+/// - a box's lease the registry holds, which the target box's ingress
+///   decides on the switch's side, the reach the node's hostname proxy and
+///   its answers to the boxes ride.
+///
+/// Everything else is refused. The infrastructure deny set is decided first,
+/// the Box Egress Proxy's address is refused because no category names it,
+/// and a destination no rule admits and no pin names is
+/// [`NODE_PLANE_UNPINNED_RULE`]'s drop.
+fn node_plane_verdict(
+    summary: &FrameSummary,
+    l4: Option<&dns_pins::L4Packet>,
+    table: &BoxTable,
+    baseline: &NodePlaneBaseline,
+    pins: &dns_pins::DnsPins,
+) -> Result<GateAdmit, GateDrop> {
+    let Some(src) = summary.source() else {
+        return Err(GateDrop::Verdict(family_drop(summary.family())));
+    };
+    // ARP and every frame with no destination address: the set's verdict
+    // decides them, the way a row's decides a box's.
+    let Some(dst) = summary.destination() else {
+        return match egress::verdict(summary, baseline.rules()) {
+            FrameVerdict::Admit => Ok(GateAdmit::Baseline),
+            FrameVerdict::Drop(reason) => Err(GateDrop::Verdict(reason)),
+        };
+    };
+    let dst_port = summary.destination_port();
+    let subnet = table.subnet();
+    if dst == subnet.box_egress_proxy_address().octets() {
+        return Err(GateDrop::ProxyLane { src, dst, dst_port });
+    }
+    let transport_port = matches!(
+        summary.protocol(),
+        Some(egress::IPPROTO_TCP | egress::IPPROTO_UDP)
+    )
+    .then_some(dst_port);
+    if infrastructure_destination(
+        dst,
+        transport_port,
+        subnet,
+        baseline.rules().allow_subnets(),
+        false,
+        baseline.host_exposure_ports(),
+    ) {
+        return Err(GateDrop::Infrastructure { src, dst, dst_port });
+    }
+    // Past the infrastructure check, the alias is at a configured host
+    // exposure: the one opening the alias has.
+    if dst == subnet.host_alias().octets() {
+        return Ok(GateAdmit::Baseline);
+    }
+    // A box's lease: the target's ingress decides it on the switch's side.
+    if dst != src
+        && table
+            .by_source(dst)
+            .is_some_and(|record| record.switch_addr().octets() == dst)
+    {
+        return Ok(GateAdmit::Baseline);
+    }
+    match egress::verdict(summary, baseline.rules()) {
+        FrameVerdict::Admit => Ok(GateAdmit::Baseline),
+        FrameVerdict::Drop(DropReason::UndeclaredSubnet { .. })
+            if summary.protocol() == Some(NODE_PLANE_FETCH_PROTOCOL)
+                && NODE_PLANE_FETCH_PORTS.contains(&dst_port)
+                && pins.admits_node_frame(table, baseline, dst, l4, Instant::now()) =>
+        {
+            Ok(GateAdmit::Baseline)
+        }
+        FrameVerdict::Drop(DropReason::UndeclaredSubnet { .. }) => {
+            Err(GateDrop::NodePlaneUnpinned { src, dst, dst_port })
+        }
+        FrameVerdict::Drop(reason) => Err(GateDrop::Verdict(reason)),
+    }
+}
+
 /// The gate's admit-or-drop decision for one frame summary against the
 /// host-side table (NET-081): pure — a function of the summary, the table,
 /// the baseline set, the phase, the DNS admission table and the reply-flow
 /// tables, nothing else — and deliberately separate from the relay loop that
 /// applies it, the same discipline the shared verdict keeps.
 ///
-/// The frame's source address is the whole of the routing: the node plane's
-/// own address is decided by the baseline set ([`NodePlaneBaseline`], the
-/// helper's enumeration of the categories the in-VM daemon's traffic may
-/// reach, NET-130), the published namespace that holds any other source
+/// The frame's source address is the routing, with one split at the node
+/// address: the node plane's own frames there are decided by the baseline
+/// set ([`NodePlaneBaseline`], the helper's enumeration of the categories
+/// the in-VM daemon's traffic may reach, NET-130), and a frame the guest's
+/// classifier marked as a box's (`BOX_COHORT_DSCP`, written from the
+/// sender's cgroup) is decided by the union of the resident `host_ip`
+/// boxes' rules ([`host_ip_verdict`]), never by the node row. The
+/// published namespace that holds any other source
 /// supplies the rules its frames are decided by, and an address neither
 /// covers is the phase's to decide — [`UnregisteredSourcePhase`] carries what
 /// that means and why. The node plane is decided before the table because the
@@ -5248,17 +6055,6 @@ fn gate_verdict(
     let Some(src) = summary.source() else {
         return Err(GateDrop::Verdict(family_drop(summary.family())));
     };
-    // The node plane's own frames, when the baseline is in force: the shared
-    // verdict against the enumeration's compiled set — the lease it is keyed
-    // to is the daemon's own address, so the check above and the lease agree
-    // on who may wear it. Announced, the interim node row keeps deciding the
-    // node plane, and the fall-through reaches it below.
-    if baseline.phase() == NodeBaselinePhase::InForce && src == baseline.node_addr() {
-        return match egress::verdict(summary, baseline.rules()) {
-            FrameVerdict::Admit => Ok(GateAdmit::Baseline),
-            FrameVerdict::Drop(reason) => Err(GateDrop::Verdict(reason)),
-        };
-    }
     // NET-040's answer half: a frame whose five-tuple exactly reverses a live
     // inbound flow this gate's ingress leg recorded — the connection a
     // published port received, delivered by this gate itself — passes
@@ -5323,6 +6119,146 @@ fn gate_verdict(
             return Err(GateDrop::SwitchControlSurface { src, dst_port });
         }
     }
+    // The node plane's own frames, when the baseline is in force (NET-085,
+    // NET-130): decided by the baseline set, never by the interim node row.
+    // The arm sits after the reply record, so the answers to connections the
+    // node's published ports received still pass, and after the
+    // control-surface check, so the switch's own ports stay refused.
+    // The node address is not the node plane's alone: a host-address box,
+    // the default network mode, leaves from it too. What tells them apart
+    // is the sender's cgroup, which the guest's classifier writes into the
+    // frame as `BOX_COHORT_DSCP` for a connection a box opened and clears
+    // on every other packet. An unmarked frame is the daemon's own, and the
+    // baseline set decides it, so a guest whose classifier never loaded
+    // fails closed to the baseline.
+    // The mark is no proof of a box: root in the guest can write it on any
+    // frame (NET-085). So a marked frame is decided by the union of the
+    // resident `host_ip` boxes' rules, which the host-side client
+    // registered, and dropped when no `host_ip` box is resident (design
+    // §4.3 rule 2). The node row never decides it. A process that writes
+    // the mark reaches only what a resident box's own rules admit.
+    if baseline.phase() == NodeBaselinePhase::InForce && src == baseline.node_addr() {
+        if summary.box_cohort_marked() {
+            return host_ip_verdict(summary, l4, table, baseline, pins, src);
+        }
+        return node_plane_verdict(summary, l4, table, baseline, pins);
+    }
+    row_verdict(summary, l4, table, baseline, pins, src)
+}
+
+/// The decision for a box-marked frame from the node address under the
+/// in-force baseline (NET-085, design §4.3 rule 2): admitted when one
+/// resident `host_ip` box's rules admit it, and dropped under
+/// [`HOST_IP_BOXES_RULE`] otherwise, and always when no `host_ip` box is
+/// resident.
+///
+/// Each resident box decides the frame the way a row decides its own: the
+/// infrastructure deny set first, with the box's own `allow_subnets` as the
+/// RFC 1918 allowance and the node's own block reach a `host_ip` box keeps,
+/// then the box's compiled rules, then the DNS admission table's pins for
+/// the names the resident boxes declared. The Box Egress Proxy's listener is
+/// decided by the node row's lane declaration, as it was for every frame the
+/// node row carried, because the proxy's attachment for the node address is
+/// the node row's.
+fn host_ip_verdict(
+    summary: &FrameSummary,
+    l4: Option<&dns_pins::L4Packet>,
+    table: &BoxTable,
+    baseline: &NodePlaneBaseline,
+    pins: &dns_pins::DnsPins,
+    src: [u8; 4],
+) -> Result<GateAdmit, GateDrop> {
+    let dst = summary.destination();
+    let dst_port = summary.destination_port();
+    let unbounded = |resident: usize| GateDrop::HostIpUnbounded {
+        src,
+        dst: dst.unwrap_or_default(),
+        dst_port,
+        resident,
+    };
+    let resident = table.host_ip_boxes();
+    if resident.is_empty() {
+        return Err(unbounded(0));
+    }
+    if let Some(dst) = dst
+        && dst == table.subnet().box_egress_proxy_address().octets()
+    {
+        let declared = table
+            .by_source(src)
+            .is_some_and(|record| record.declares_credentialed_upstream());
+        let listener = egress::ProxyListener::at(dst);
+        if egress::proxy_lane_admits(declared, listener, summary) {
+            return Ok(GateAdmit::ProxyLane);
+        }
+        return Err(GateDrop::ProxyLane { src, dst, dst_port });
+    }
+    let transport_port = matches!(
+        summary.protocol(),
+        Some(egress::IPPROTO_TCP | egress::IPPROTO_UDP)
+    )
+    .then_some(dst_port);
+    let mut infrastructure = false;
+    // Whether a name-resolving box left the frame to the pins. The pins are
+    // one shared cohort entry, so the gate asks them once, after the loop,
+    // and the frame counts once.
+    let mut ask_pins = false;
+    for rules in &resident {
+        if let Some(dst) = dst
+            && infrastructure_destination(
+                dst,
+                transport_port,
+                table.subnet(),
+                rules.egress().allow_subnets(),
+                false,
+                baseline.host_exposure_ports(),
+            )
+        {
+            infrastructure = true;
+            continue;
+        }
+        match egress::verdict(summary, rules.egress()) {
+            FrameVerdict::Admit => return Ok(GateAdmit::HostIpBox),
+            FrameVerdict::Drop(DropReason::UndeclaredSubnet { .. }) if rules.resolves_names() => {
+                ask_pins = true;
+            }
+            FrameVerdict::Drop(_) => {}
+        }
+    }
+    if ask_pins && pins.admits_host_ip_frame(table, dst.unwrap_or_default(), l4, Instant::now()) {
+        return Ok(GateAdmit::HostIpBox);
+    }
+    // Every resident box refused the frame. A destination every box's
+    // check put in the infrastructure set keeps that drop's own rule, so
+    // the line a host reads names the set rather than the boxes' rules.
+    if infrastructure
+        && let Some(dst) = dst
+        && resident.iter().all(|rules| {
+            infrastructure_destination(
+                dst,
+                transport_port,
+                table.subnet(),
+                rules.egress().allow_subnets(),
+                false,
+                baseline.host_exposure_ports(),
+            )
+        })
+    {
+        return Err(GateDrop::Infrastructure { src, dst, dst_port });
+    }
+    Err(unbounded(resident.len()))
+}
+
+/// The rest of [`gate_verdict`]'s order for a frame the node-plane arm did
+/// not decide: the source's row, then the infrastructure set, then the proxy
+/// lane, then the row's rules, then the pin arm.
+fn row_verdict(
+    summary: &FrameSummary,
+    l4: Option<&dns_pins::L4Packet>,
+    table: &BoxTable,
+    baseline: &NodePlaneBaseline,
+    pins: &dns_pins::DnsPins,
+    src: [u8; 4],
+) -> Result<GateAdmit, GateDrop> {
     // No namespace holds the source — NET-081's failure case, held
     // unconditionally, under no phase (NET-085, T89 #1925): an address no
     // namespace holds never leaves the VM, toward every destination alike,
@@ -5364,15 +6300,39 @@ fn gate_verdict(
     // The host-alias refusal is a box row's alone: the node namespace's
     // row, keyed to the daemon's own address, carries the host-address
     // boxes' frames, whose `host.min.internal` resolves to the alias, and
-    // keeps own-block local reach to it until the in-force baseline (which
-    // returned above) decides the node plane.
+    // keeps own-block local reach to it while the baseline is announced
+    // (in force, the node-plane arm above returned first, with the same
+    // scoping). That reach is scoped by the baseline's configured host
+    // exposures, which the arm below reads for every row: the box rows'
+    // refusal stands at every port, and the node row's outside the
+    // exposures.
     let box_row = src != table.subnet().daemon_ip().octets();
+    // A non-first IPv4 fragment carries no readable L4 port — `summarize`
+    // reports destination port 0 for it — so it fails the exposure match
+    // and the gate drops it, never admits it: a fragmented UDP datagram to
+    // an exposed port dies at its later fragments. Reviewer ask
+    // (CodeRabbit, PR #2331) was to associate later fragments with their
+    // admitted first fragment, or defer the port check to reassembly.
+    // Declined: the verdict path is stateless and allocation-free by
+    // design — every input comes from the one frame being judged — and
+    // fragment association would add per-flow state here (or reassembly
+    // elsewhere) to recover a packet whose failure mode is a drop, not an
+    // exposure: deny-by-default keeps the safe direction. The in-force
+    // node-plane arm reads the exposures the same way, with the same
+    // fragment case.
+    let transport_port = matches!(
+        summary.protocol(),
+        Some(egress::IPPROTO_TCP | egress::IPPROTO_UDP)
+    )
+    .then(|| summary.destination_port());
     if let Some(dst) = summary.destination()
         && infrastructure_destination(
             dst,
+            transport_port,
             table.subnet(),
             record.egress().allow_subnets(),
             box_row,
+            baseline.host_exposure_ports(),
         )
     {
         return Err(GateDrop::Infrastructure {
@@ -5408,9 +6368,8 @@ fn gate_verdict(
     // protocol, neither of which the declaration ever opened, and the node
     // row under the announced baseline, which is the allow-all the in-force
     // enumeration replaces.
-    // The in-force baseline set needs no arm of its own: it never admits
-    // the address for any category, so its compiled rules refuse the frame
-    // where they refuse any undeclared destination.
+    // Under the in-force baseline the node plane never reaches this arm:
+    // its own arm above refuses the address under the same rule.
     if let Some(dst) = summary.destination()
         && dst == table.subnet().box_egress_proxy_address().octets()
     {
@@ -5532,6 +6491,31 @@ enum GateDrop {
         /// The port the frame named there, `0` when it carried none.
         dst_port: u16,
     },
+    /// The frame wore the in-VM daemon's own address under the in-force
+    /// baseline and named a destination no baseline entry pinned and no
+    /// other node-plane opening admits ([`NODE_PLANE_UNPINNED_RULE`]).
+    NodePlaneUnpinned {
+        /// The daemon's own address, the source the frame wore.
+        src: [u8; 4],
+        /// The destination no pin named.
+        dst: [u8; 4],
+        /// The port the frame named there, `0` when it carried none.
+        dst_port: u16,
+    },
+    /// The frame wore the node's own address and the box mark, and no
+    /// resident `host_ip` box's rules admit it: the box mark is no proof of
+    /// a box, so nothing else may (NET-085, [`HOST_IP_BOXES_RULE`]).
+    HostIpUnbounded {
+        /// The node's own address, the source the frame wore.
+        src: [u8; 4],
+        /// The destination no resident box admits, `0.0.0.0` for a frame
+        /// with none.
+        dst: [u8; 4],
+        /// The port the frame named there, `0` when it carried none.
+        dst_port: u16,
+        /// How many `host_ip` boxes were resident: `0` when none was.
+        resident: usize,
+    },
 }
 
 impl GateDrop {
@@ -5545,6 +6529,8 @@ impl GateDrop {
             Self::UnregisteredSource { .. } => UNREGISTERED_SOURCE_RULE,
             Self::SwitchControlSurface { .. } => SWITCH_CONTROL_RULE,
             Self::ProxyLane { .. } => PROXY_LANE_RULE,
+            Self::NodePlaneUnpinned { .. } => NODE_PLANE_UNPINNED_RULE,
+            Self::HostIpUnbounded { .. } => HOST_IP_BOXES_RULE,
         }
     }
 }
@@ -5814,6 +6800,91 @@ impl DropLimiter {
                     rule_matched = UNREGISTERED_LIVE_LEASE_RULE,
                     "dropped frames from more distinct live leases than the gate keeps a \
                      window per source for; one line per rule covers the rest",
+                );
+                true
+            }
+        }
+    }
+
+    /// Emits the drop's line for one box-marked frame from the node address
+    /// that no resident `host_ip` box admits ([`HOST_IP_BOXES_RULE`]): the
+    /// same rate limit every drop's line answers to, naming the address,
+    /// the destination, the port and how many `host_ip` boxes were
+    /// resident, so a bundle's reader can tell a frame no box admits from
+    /// one sent while no `host_ip` box ran. Returns whether a line was
+    /// written.
+    fn warn_host_ip_unbounded(
+        &self,
+        src: [u8; 4],
+        dst: [u8; 4],
+        dst_port: u16,
+        resident: usize,
+    ) -> bool {
+        match self.should_warn_at(Some(src), HOST_IP_BOXES_RULE, Instant::now()) {
+            WarnDecision::Silent => false,
+            WarnDecision::Named if resident == 0 => {
+                tracing::warn!(
+                    source = %Ipv4Addr::from(src),
+                    destination = %Ipv4Addr::from(dst),
+                    port = %if dst_port == 0 { "none".to_string() } else { dst_port.to_string() },
+                    resident_host_ip_boxes = resident,
+                    rule_matched = HOST_IP_BOXES_RULE,
+                    "dropped a box-marked frame from the node address: no host_ip box is \
+                     resident, so no box's rules admit it",
+                );
+                true
+            }
+            WarnDecision::Named => {
+                tracing::warn!(
+                    source = %Ipv4Addr::from(src),
+                    destination = %Ipv4Addr::from(dst),
+                    port = %if dst_port == 0 { "none".to_string() } else { dst_port.to_string() },
+                    resident_host_ip_boxes = resident,
+                    rule_matched = HOST_IP_BOXES_RULE,
+                    "dropped a box-marked frame from the node address toward a destination \
+                     no resident host_ip box's rules admit",
+                );
+                true
+            }
+            WarnDecision::Overflow => {
+                tracing::warn!(
+                    rule_matched = HOST_IP_BOXES_RULE,
+                    "dropped box-marked frames from more distinct source addresses than the \
+                     gate keeps a window per source for; one line per rule covers the rest",
+                );
+                true
+            }
+        }
+    }
+
+    /// Emits the drop's line for one node-plane frame refused for want of a
+    /// pin ([`NODE_PLANE_UNPINNED_RULE`]): the same rate limit every drop's
+    /// line answers to, naming the daemon's address, the destination and the
+    /// port, so a bundle's reader learns which reach the node plane was
+    /// refused and that no baseline entry's lookup had pinned it. Returns
+    /// whether a line was written.
+    fn warn_node_plane_unpinned(&self, src: [u8; 4], dst: [u8; 4], dst_port: u16) -> bool {
+        match self.should_warn_at(Some(src), NODE_PLANE_UNPINNED_RULE, Instant::now()) {
+            WarnDecision::Silent => false,
+            WarnDecision::Named => {
+                tracing::warn!(
+                    source = %Ipv4Addr::from(src),
+                    destination = %Ipv4Addr::from(dst),
+                    port = %if dst_port == 0 { "none".to_string() } else { dst_port.to_string() },
+                    rule_matched = NODE_PLANE_UNPINNED_RULE,
+                    "dropped a node-plane frame leaving the VM toward an address no baseline \
+                     entry pinned, or toward a pinned address at a port other than TCP 443; \
+                     the node plane reaches the registry and the cache at TCP 443 on the \
+                     addresses its own lookups resolved them to",
+                );
+                true
+            }
+            WarnDecision::Overflow => {
+                tracing::warn!(
+                    rule_matched = NODE_PLANE_UNPINNED_RULE,
+                    "dropped node-plane frames toward unpinned addresses from more distinct \
+                     source addresses than the gate keeps a window per source for; one line \
+                     per rule covers the rest",
                 );
                 true
             }
@@ -6659,6 +7730,13 @@ pub(crate) mod test_support {
         frame
     }
 
+    /// `frame` as the guest's classifier leaves a box's packet: the IPv4
+    /// DSCP field set to [`boxes::core::egress::BOX_COHORT_DSCP`].
+    pub(crate) fn box_cohort_frame(mut frame: Vec<u8>) -> Vec<u8> {
+        frame[15] = boxes::core::egress::BOX_COHORT_DSCP << 2;
+        frame
+    }
+
     /// An Ethernet II ARP frame announcing `spa` as its sender protocol
     /// address — the address an ARP frame's source is read from.
     pub(crate) fn arp_frame(spa: [u8; 4]) -> Vec<u8> {
@@ -6708,23 +7786,24 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::test_support::{
-        CaptureWriter, DEADLINE, arp_frame, capture_log, connect_control, connect_over,
-        expect_frame, expect_silence, expect_teardown, expose_request, gate_connected,
-        gate_connected_with_phase, gate_over, gate_over_control, gate_over_shipped, gate_over_with,
-        gate_over_with_node_baseline, ipv4_frame, ipv6_frame, read_within, send_frame,
-        unexpose_request, wait_for_log,
+        CaptureWriter, DEADLINE, arp_frame, box_cohort_frame, capture_log, connect_control,
+        connect_over, expect_frame, expect_silence, expect_teardown, expose_request,
+        gate_connected, gate_connected_with_phase, gate_over, gate_over_control, gate_over_shipped,
+        gate_over_with, gate_over_with_node_baseline, ipv4_frame, ipv6_frame, read_within,
+        send_frame, unexpose_request, wait_for_log,
     };
     use super::{
         AcceptFailure, CONNECT_REQUEST, CONTROL_VERBS, ControlVerb, DropLimiter, EgressGate,
-        GateAdmit, GateDrop, GuestSource, GuestSpeak, HANDSHAKE_TIMEOUT, MALFORMED_PUBLISH_RULE,
-        MAX_HEAD, MAX_LIVE_RELAYS, MAX_NAMED_TARGET, PROXY_LANE_RULE, PublishedForwards, Record,
-        ReplyTables, UNDECLARED_PUBLISH_RECORD_RULE, UNDECLARED_RETRACT_RULE,
-        UNKNOWN_PUBLISH_ADDRESS_RULE, UNREGISTERED_LIVE_LEASE_RULE, UNREGISTERED_PUBLISH_RULE,
-        UNREGISTERED_SOURCE_PHASE, UNREGISTERED_SOURCE_RULE, UnregisteredSourcePhase, WarnDecision,
-        accept_loop, dns_pins, gate_verdict, max_frame, render_record, serve_connection,
+        FrameSummary, GateAdmit, GateDrop, GuestSource, GuestSpeak, HANDSHAKE_TIMEOUT,
+        HOST_IP_BOXES_RULE, MALFORMED_PUBLISH_RULE, MAX_HEAD, MAX_LIVE_RELAYS, MAX_NAMED_TARGET,
+        PublishedForwards, Record, ReplyTables, UNDECLARED_PUBLISH_RECORD_RULE,
+        UNDECLARED_RETRACT_RULE, UNKNOWN_PUBLISH_ADDRESS_RULE, UNREGISTERED_LIVE_LEASE_RULE,
+        UNREGISTERED_PUBLISH_RULE, UNREGISTERED_SOURCE_PHASE, UNREGISTERED_SOURCE_RULE,
+        UnregisteredSourcePhase, WarnDecision, accept_loop, dns_pins, gate_verdict, max_frame,
+        render_record, serve_connection,
     };
     use crate::box_registry::{BoxRegistration, BoxRegistry, BoxTable};
-    use crate::net::baseline::{BaselineCategory, NodeBaselinePhase, NodePlaneBaseline};
+    use crate::net::baseline::{NodeBaselinePhase, NodePlaneBaseline};
     use crate::net::drop_limiter::{DROP_WARN_MAX_TRACKED_PAIRS, DROP_WARN_MIN_INTERVAL};
 
     /// The default switch subnet, the plan every registry below is built for.
@@ -8754,7 +9833,8 @@ mod tests {
     /// is refused without a flow behind it, and so is a frame from the
     /// answerer port the record's tuple never named. The resolver carve-out
     /// is unchanged — a UDP query to the resolver's port still falls through
-    /// to the row's rules and passes, whatever the table holds.
+    /// to the node-plane baseline set's rules and passes, whatever the table
+    /// holds.
     #[test]
     fn gate_verdict_refuses_gateway_dial_from_admitted_port_without_inbound_flow() {
         let registry = BoxRegistry::new(SUBNET);
@@ -8897,8 +9977,8 @@ mod tests {
         );
         assert_eq!(
             decide(&replies, &query),
-            Ok(GateAdmit::Row),
-            "the resolver carve-out falls through to the row's rules, as before"
+            Ok(GateAdmit::Baseline),
+            "the resolver carve-out falls through to the node-plane baseline set's rules"
         );
     }
 
@@ -11813,10 +12893,9 @@ mod tests {
     /// is on no lane — its baseline set is the enumeration of the categories
     /// NET-130 admits, and no category names the proxy. So the set never
     /// admits the address: with the baseline in force a node frame to the
-    /// proxy is dropped by the compiled set like any other undeclared
-    /// destination, and while the interim allow-all node row still decides
-    /// the node plane, that row declares no lane either, so the proxy rule
-    /// drops it there too — the shipped arm and the flip hold one posture.
+    /// proxy is the proxy rule's drop, and under the announced baseline the
+    /// interim node row declares no lane either, so the proxy rule drops it
+    /// there too. Either posture holds one refusal.
     #[test]
     fn baseline_set_never_admits_the_proxy_address() {
         let registry = BoxRegistry::new(SUBNET);
@@ -11834,8 +12913,7 @@ mod tests {
             for endpoint in entry.endpoints() {
                 let address = endpoint
                     .split_once('/')
-                    .expect("an endpoint is spelled `a.b.c.d/n`")
-                    .0;
+                    .map_or(endpoint.as_str(), |(a, _)| a);
                 assert_ne!(
                     address,
                     Ipv4Addr::from(proxy).to_string(),
@@ -11846,36 +12924,27 @@ mod tests {
             }
         }
 
-        // In force: the node's frame to the proxy is decided by the compiled
-        // set — and refused, at the proxy's port and over UDP too, because
-        // the address is inside no category's endpoints.
-        let in_force = baseline.clone().in_force();
+        // In force, the shipped posture: the node's frame to the proxy is
+        // refused under the proxy rule, at the proxy's port and over UDP too.
+        assert_eq!(baseline.phase(), NodeBaselinePhase::InForce);
         for (proto, port) in [(6, 8118), (17, 8118)] {
             let frame = boxes::core::egress::summarize(&ipv4_frame(node, proto, proxy, port));
-            match gate_verdict(&frame, None, &table, &in_force, &pins, &ReplyTables::new()) {
-                Ok(GateAdmit::Baseline) => panic!(
-                    "the baseline set admitted the proxy's address at proto {proto} port {port}"
+            assert!(
+                matches!(
+                    gate_verdict(&frame, None, &table, &baseline, &pins, &ReplyTables::new()),
+                    Err(GateDrop::ProxyLane { .. })
                 ),
-                Ok(admitted) => panic!(
-                    "the in-force gate admitted a node frame to the proxy by another way: \
-                     {admitted:?}"
-                ),
-                Err(drop) => assert!(
-                    drop.rule() != PROXY_LANE_RULE,
-                    "the in-force set refuses the proxy's address as an undeclared \
-                     destination, not by the lane rule, got {}",
-                    drop.rule(),
-                ),
-            }
+                "the in-force set refuses the proxy's address at proto {proto} port {port}"
+            );
         }
 
-        // Announced, the shipped interim: the node row — allow-all, and the
-        // row that decides the node plane until the flip — declares no lane,
-        // so the proxy rule drops the same frame. Either posture, no reach.
+        // Announced: the node row — allow-all — declares no lane, so the
+        // proxy rule drops the same frame. Either posture, no reach.
+        let announced = baseline.clone().announced();
         let frame = boxes::core::egress::summarize(&ipv4_frame(node, 6, proxy, 8118));
         assert!(
             matches!(
-                gate_verdict(&frame, None, &table, &baseline, &pins, &ReplyTables::new()),
+                gate_verdict(&frame, None, &table, &announced, &pins, &ReplyTables::new()),
                 Err(GateDrop::ProxyLane { .. })
             ),
             "the interim node row carries no lane, so its frame to the proxy is the proxy \
@@ -14418,13 +15487,13 @@ mod tests {
     /// attempt, grouped by spoofed source, in the gate's drop-line shape, so
     /// the bound a spoof bought can be read straight off the output.
     ///
-    /// Where the shipped posture differs from the bound's shape the test
-    /// pins both arms, the way the relay tests do: while the node baseline
-    /// is announced the node row is allow-all — the gap the baseline
-    /// phase's flip (#1786) closes. An in-plan source no row holds is not a
-    /// posture any more (NET-085): it drops under the unregistered rule in
-    /// every list, the frame half having no interim, so the record's two
-    /// halves vary the baseline alone.
+    /// The shipped posture is the in-force baseline: a spoof of the node's
+    /// own address reaches the addresses the node plane's own lookups pinned
+    /// for a baseline entry, the resolver, and nothing else. The announced
+    /// arm, the allow-all node row the flip closed, is pinned beside it so
+    /// the gap it was stays visible. An in-plan source no row holds drops
+    /// under the unregistered rule in every list (NET-085), so the record's
+    /// two halves vary the baseline alone.
     #[test]
     fn spoofed_source_bounded_to_resident_union() {
         /// One spoofed attempt as the record holds it: the frame wore, and
@@ -14455,6 +15524,9 @@ mod tests {
             /// The row's declared credentialed lane admitted the frame at
             /// the proxy's address (NET-134): the admission no rules made.
             AdmittedByProxyLane,
+            /// A resident `host_ip` box's rules admitted a box-marked frame
+            /// from the node address.
+            AdmittedByHostIpBox,
             /// The gate dropped the frame, by the rule whose name the drop
             /// warning carries.
             Dropped(&'static str),
@@ -14502,6 +15574,7 @@ mod tests {
                     Ok(GateAdmit::Row) if src == baseline.node_addr() => Verdict::AdmittedByNodeRow,
                     Ok(GateAdmit::Row) => Verdict::AdmittedByRow,
                     Ok(GateAdmit::ProxyLane) => Verdict::AdmittedByProxyLane,
+                    Ok(GateAdmit::HostIpBox) => Verdict::AdmittedByHostIpBox,
                     Err(drop) => Verdict::Dropped(drop.rule()),
                 };
             Attempt {
@@ -14540,11 +15613,12 @@ mod tests {
         // attempt is decided by the rows and the baseline set.
         let pins = dns_pins::DnsPins::new(SUBNET);
         let node = baseline.node_addr();
-        // The node-baseline posture this build ships: announced, the
-        // allow-all node row. The frame half's own posture has no arms
-        // (NET-085) — an unregistered in-plan source drops in every list —
-        // so the record's second list varies the baseline alone.
-        let shipped = NodeBaselinePhase::Announced;
+        // The node-baseline posture this build ships: in force. The frame
+        // half's own posture has no arms (NET-085) — an unregistered in-plan
+        // source drops in every list — so the record's second list varies
+        // the baseline alone.
+        let shipped = NodeBaselinePhase::InForce;
+        assert_eq!(baseline.phase(), shipped);
         let resolver = SUBNET.dns_server().octets();
         let web_only = [10, 1, 2, 3];
         let db_only = [192, 0, 2, 5];
@@ -14554,32 +15628,26 @@ mod tests {
         // is a destination, this is a source, and the two share nothing but a
         // TEST-NET spelling — one is not where the other goes.
         let out_of_plan_src = [198, 51, 100, 7];
-        // The node plane's own endpoint, read off the enumeration the way the
-        // helper spells it (`a.b.c.d/n`), not hardcoded: the in-force bound's
-        // admitted destination is the set's, not this test's.
-        let baseline_endpoint = baseline
-            .entries()
-            .iter()
-            .find(|entry| entry.category() == BaselineCategory::Registry)
-            .expect("the enumeration carries the registry")
-            .endpoints()
-            .first()
-            .expect("the registry carries an endpoint")
-            .split_once('/')
-            .expect("an endpoint is spelled `a.b.c.d/n`")
-            .0
-            .parse::<Ipv4Addr>()
-            .expect("an endpoint's address parses")
-            .octets();
+        // The node plane's own endpoint: the address its own lookup of the
+        // cache's name resolved to, pinned against the baseline's entry the
+        // way the gate's ingress leg pins it.
+        let baseline_endpoint = [203, 0, 113, 10];
+        dns_pins::tests::node_resolves(
+            &pins,
+            &table,
+            &baseline,
+            crate::net::baseline::DAEMON_CACHE_ENDPOINT,
+            &[Ipv4Addr::from(baseline_endpoint)],
+            std::time::Instant::now(),
+        );
 
         // Every spoofed attempt, decided and recorded: the tuples are
         // (baseline posture, source, protocol, destination, port), and each
         // is summarized, decided by [`gate_verdict`], and recorded exactly
-        // as the gate's relay would hand the frame over. The in-force world
-        // is the one the baseline flip creates — the compiled baseline set
-        // binding beside the rows — built here so the in-force arms have
-        // their proof before the flip lands.
-        let baseline_in_force = baseline.clone().in_force();
+        // as the gate's relay would hand the frame over. The announced world
+        // is the one the flip closed — the allow-all node row — kept so the
+        // gap stays pinned beside its replacement.
+        let baseline_announced = baseline.clone().announced();
         let shipped_attempts: Vec<Attempt> = [
             // web's address, spoofed: decided by web's own row — the lab
             // subnet over TCP, the resolver carve-out — and nowhere else, not
@@ -14603,10 +15671,10 @@ mod tests {
             (shipped, [100, 64, 0, 11], 6, web_only, 80),
             (shipped, [100, 64, 0, 11], 17, resolver, 53),
             (shipped, [100, 64, 0, 11], 6, resolver, 53),
-            // The node plane's own address, shipped: the allow-all interim
-            // node row admits even the outside destination — the gap the
-            // baseline phase's flip (#1786) closes, into the in-force arm
-            // the in-force list pins. The node row stands in for the
+            // The node plane's own address, shipped: bounded by the baseline
+            // set, decided beside the boxes' rows, so a spoof of the
+            // daemon's address buys the pinned endpoint and the resolver,
+            // not a box's row and not the outside. The node row stands in for the
             // `host_ip` cohort's identity today (NET-078: outside the box
             // host the cohort is one source), so a spoof of it exercises the
             // row a cohort-wide identity will be decided by; once the cohort
@@ -14615,6 +15683,9 @@ mod tests {
             // `host_ip` members, and that a revoked member's destinations no
             // longer admit.
             (shipped, node, 6, outside, 443),
+            (shipped, node, 6, baseline_endpoint, 443),
+            (shipped, node, 6, web_only, 80),
+            (shipped, node, 17, resolver, 53),
             // An in-plan address no row holds: dropped under the
             // unregistered rule, under no phase — NET-085's drop is the
             // frame half's unconditional posture, so this list and the
@@ -14627,28 +15698,31 @@ mod tests {
         .into_iter()
         .map(|(_, src, proto, dst, port)| decide(&table, &baseline, &pins, src, proto, dst, port))
         .collect();
-        let in_force_attempts: Vec<Attempt> = [
-            // The node plane's own address, under the in-force baseline set:
-            // bounded by the enumeration, decided beside the boxes' rows, and
-            // so a spoof of the daemon's address buys the set, not a box's
-            // row.
-            (NodeBaselinePhase::InForce, node, 6, baseline_endpoint, 443),
-            (NodeBaselinePhase::InForce, node, 6, web_only, 80),
-            (NodeBaselinePhase::InForce, node, 6, outside, 443),
-            // The unrowed in-plan source under the in-force baseline: the
+        let announced_attempts: Vec<Attempt> = [
+            // The node plane's own address under the announced baseline: the
+            // allow-all interim node row admits even the outside
+            // destination, the gap the in-force arm closed.
+            (NodeBaselinePhase::Announced, node, 6, outside, 443),
+            // The unrowed in-plan source under the announced baseline: the
             // same unregistered drop the shipped list pins — the baseline's
             // phase does not reach the frame half either (NET-085).
-            (NodeBaselinePhase::InForce, stray, 6, web_only, 80),
-            (NodeBaselinePhase::InForce, out_of_plan_src, 6, web_only, 80),
+            (NodeBaselinePhase::Announced, stray, 6, web_only, 80),
+            (
+                NodeBaselinePhase::Announced,
+                out_of_plan_src,
+                6,
+                web_only,
+                80,
+            ),
         ]
         .into_iter()
         .map(|(_, src, proto, dst, port)| {
-            decide(&table, &baseline_in_force, &pins, src, proto, dst, port)
+            decide(&table, &baseline_announced, &pins, src, proto, dst, port)
         })
         .collect();
         let attempts: Vec<Attempt> = shipped_attempts
             .into_iter()
-            .chain(in_force_attempts)
+            .chain(announced_attempts)
             .collect();
 
         // The record, one line per attempt, grouped by spoofed source, in
@@ -14688,21 +15762,16 @@ mod tests {
         // spoofed frame lands inside the union — a resident box's declared
         // subnet over its declared protocol, or the resolver carve-out every
         // row and the baseline set share — and the baseline set's admit is
-        // inside the enumeration's endpoints (or the same carve-out). The
-        // two interim arms are the documented gaps, asserted as such below,
-        // so they are not bound here but named.
+        // an address the node plane's own lookup pinned (or the same
+        // carve-out). The announced node row is the documented gap, asserted
+        // as such below, so it is not bound here but named.
         let in_union = |dst: [u8; 4], proto: u8, port: u16| {
             let web = Ipv4Cidr::parse("10.0.0.0/8").expect("web's subnet parses");
             let db = Ipv4Cidr::parse("192.0.2.0/24").expect("db's subnet parses");
             (proto == 6 && (web.contains(dst) || db.contains(dst)))
                 || (proto == 17 && dst == resolver && port == 53)
         };
-        let baseline_set: Vec<Ipv4Cidr> = baseline
-            .entries()
-            .iter()
-            .flat_map(|entry| entry.endpoints().iter())
-            .map(|endpoint| Ipv4Cidr::parse(endpoint).expect("a baseline endpoint parses"))
-            .collect();
+        let baseline_set = [baseline_endpoint];
         for attempt in &attempts {
             match attempt.verdict {
                 Verdict::AdmittedByRow => assert!(
@@ -14713,21 +15782,86 @@ mod tests {
                     attempt.port,
                 ),
                 Verdict::AdmittedByBaseline => assert!(
-                    baseline_set.iter().any(|cidr| cidr.contains(attempt.dst))
+                    baseline_set.contains(&attempt.dst)
                         || (attempt.proto == 17 && attempt.dst == resolver && attempt.port == 53),
                     "a spoof wearing the node's address reached {}:{} outside the baseline set",
                     Ipv4Addr::from(attempt.dst),
                     attempt.port,
                 ),
-                // The shipped allow-all node row's admits are the gap,
-                // pinned to its in-force replacement by the verdict lookups
+                // The announced allow-all node row's admits are the gap,
+                // pinned beside its in-force replacement by the verdict lookups
                 // below. A proxy-lane admit is none of this test's attempts
                 // — no attempt names the proxy's address — and the arm
                 // keeps the match exhaustive for the ones that will.
-                Verdict::AdmittedByNodeRow | Verdict::AdmittedByProxyLane | Verdict::Dropped(_) => {
-                }
+                Verdict::AdmittedByNodeRow
+                | Verdict::AdmittedByProxyLane
+                | Verdict::AdmittedByHostIpBox
+                | Verdict::Dropped(_) => {}
             }
         }
+
+        // The box-marked spoof (NET-085): root in the VM writes the box mark
+        // on a frame from the node address. The mark proves no box, so the
+        // union of the resident `host_ip` boxes' rules decides the frame,
+        // never the node row and never the baseline set. With no `host_ip`
+        // box resident, every marked frame drops, the pinned baseline
+        // endpoint included.
+        let marked = |dst: [u8; 4], port: u16| {
+            let frame =
+                boxes::core::egress::summarize(&box_cohort_frame(ipv4_frame(node, 6, dst, port)));
+            assert!(frame.box_cohort_marked());
+            gate_verdict(&frame, None, &table, &baseline, &pins, &ReplyTables::new())
+        };
+        let unbounded = |dst: [u8; 4], resident: usize| GateDrop::HostIpUnbounded {
+            src: node,
+            dst,
+            dst_port: 443,
+            resident,
+        };
+        for dst in [outside, baseline_endpoint] {
+            assert_eq!(
+                marked(dst, 443),
+                Err(unbounded(dst, 0)),
+                "a marked spoof to {} with no host_ip box resident drops under \
+                 {HOST_IP_BOXES_RULE}",
+                Ipv4Addr::from(dst),
+            );
+        }
+        // One `host_ip` box resident, admitting TCP to TEST-NET-2 alone: a
+        // marked frame there passes under the box's rules, and a marked
+        // spoof anywhere else drops, the outside and the baseline endpoint
+        // both.
+        let session = boxes::SessionId::mint();
+        let host_ip_reach = [198, 51, 100, 9];
+        assert!(registry.admit_host_ip_box(
+            session,
+            Some(&EgressPolicy {
+                allow_protocols: Some(vec![boxes::IpProto::Tcp]),
+                allow_subnets: Some(vec!["198.51.100.0/24".to_string()]),
+                allow_dns_hosts: None,
+                deny_subnets: None,
+            }),
+        ));
+        assert_eq!(
+            marked(host_ip_reach, 443),
+            Ok(GateAdmit::HostIpBox),
+            "a marked frame a resident host_ip box admits passes"
+        );
+        for dst in [outside, baseline_endpoint] {
+            assert_eq!(
+                marked(dst, 443),
+                Err(unbounded(dst, 1)),
+                "a marked spoof to {} that no resident host_ip box admits drops",
+                Ipv4Addr::from(dst),
+            );
+        }
+        // The box leaves: its reach goes with it.
+        assert!(registry.retire_host_ip_box(session));
+        assert_eq!(
+            marked(host_ip_reach, 443),
+            Err(unbounded(host_ip_reach, 0)),
+            "a retired host_ip box's rules admit nothing"
+        );
 
         // The universal the table makes cheap, beside the membership loop
         // above — NET-085 as a bound, not a list. Two halves:
@@ -14859,32 +15993,39 @@ mod tests {
             Verdict::Dropped("egress-undeclared-subnet"),
         );
 
-        // The node plane's own address, under the in-force set: the
-        // enumeration's endpoint admitted, everything else dropped — the
+        // The node plane's own address, under the in-force set: the pinned
+        // endpoint and the resolver admitted, everything else dropped — the
         // bound a spoof of the daemon's address buys, beside the boxes' rows.
+        // web's subnet is private space, so the infrastructure rule refuses
+        // it before the pins are asked; the outside address is refused for
+        // want of a pin.
         assert_eq!(
-            verdict_of(NodeBaselinePhase::InForce, node, 6, baseline_endpoint, 443),
+            verdict_of(shipped, node, 6, baseline_endpoint, 443),
             Verdict::AdmittedByBaseline,
         );
         assert_eq!(
-            verdict_of(NodeBaselinePhase::InForce, node, 6, web_only, 80),
-            Verdict::Dropped("egress-undeclared-subnet"),
+            verdict_of(shipped, node, 17, resolver, 53),
+            Verdict::AdmittedByBaseline,
         );
         assert_eq!(
-            verdict_of(NodeBaselinePhase::InForce, node, 6, outside, 443),
-            Verdict::Dropped("egress-undeclared-subnet"),
+            verdict_of(shipped, node, 6, web_only, 80),
+            Verdict::Dropped("egress-infrastructure-destination"),
+        );
+        assert_eq!(
+            verdict_of(shipped, node, 6, outside, 443),
+            Verdict::Dropped("egress-node-plane-unpinned"),
         );
 
-        // The allow-all node row's arm, with the in-force arm it becomes: the
-        // node row admits the outside destination today, and the baseline
-        // phase's flip (#1786) turns it into the drop above. The unrowed
+        // The allow-all node row's arm, with the in-force arm that replaced
+        // it: the announced node row admits the outside destination, and the
+        // in-force arm turns it into the drop above. The unrowed
         // in-plan source drops under the unregistered rule under both
         // baseline postures — NET-085's drop is unconditional, so no arm
         // waits on a flip for it — and the out-of-plan source stays rule
         // 0's under both, so nothing borrows the plan's infrastructure as a
         // source.
         assert_eq!(
-            verdict_of(shipped, node, 6, outside, 443),
+            verdict_of(NodeBaselinePhase::Announced, node, 6, outside, 443),
             Verdict::AdmittedByNodeRow,
         );
         assert_eq!(
@@ -14892,7 +16033,7 @@ mod tests {
             Verdict::Dropped("egress-unregistered-source"),
         );
         assert_eq!(
-            verdict_of(NodeBaselinePhase::InForce, stray, 6, web_only, 80),
+            verdict_of(NodeBaselinePhase::Announced, stray, 6, web_only, 80),
             Verdict::Dropped("egress-unregistered-source"),
         );
         assert_eq!(
@@ -14900,7 +16041,13 @@ mod tests {
             Verdict::Dropped("egress-unknown-source"),
         );
         assert_eq!(
-            verdict_of(NodeBaselinePhase::InForce, out_of_plan_src, 6, web_only, 80),
+            verdict_of(
+                NodeBaselinePhase::Announced,
+                out_of_plan_src,
+                6,
+                web_only,
+                80
+            ),
             Verdict::Dropped("egress-unknown-source"),
         );
 
@@ -14923,71 +16070,273 @@ mod tests {
         ));
     }
 
-    /// The shipped arm of the node-plane decision: the phase this build
-    /// ships is announced, and a frame wearing the in-VM daemon's own
-    /// address is decided by the run path's allow-all interim node row —
-    /// the row [`BoxRegistry::register_node_namespace`] publishes, the way
-    /// the run path registers it at boot — yielding [`GateAdmit::Row`] from
-    /// that row, never [`GateAdmit::Baseline`]. The baseline set's arm is
-    /// the store-surface configuration's to switch on (#1786), and the
-    /// in-force arm's proof is
-    /// [`unenrolled_baseline_set_from_helper_enumeration`]'s.
+    /// NET-085 and NET-130, the shipped arm of the node-plane decision: the
+    /// phase this build ships is in force, and a frame wearing the in-VM
+    /// daemon's own address is admitted only to an address a baseline
+    /// entry's lookup pinned, the resolver carve-out, the host alias at a
+    /// configured exposure and a box's lease — never by the interim node
+    /// row. Everything else is the drop for want of a pin, the
+    /// infrastructure drop or the proxy rule's.
     #[test]
-    fn node_plane_source_decided_by_the_node_row_while_announced() {
+    fn node_plane_frame_admitted_only_to_pinned_baseline_address() {
         let registry = BoxRegistry::new(SUBNET);
-        // The run path's own registration: the allow-all interim node row at
-        // the daemon's address, registered at VM boot (cmd/run.rs) with the
-        // proxy port the boot line hands the guest daemon.
+        // The run path's own registration: the interim node row at the
+        // daemon's address, registered at VM boot with the proxy port the
+        // boot line hands the guest daemon — the row whose allow-all the
+        // in-force arm no longer consults.
         registry.register_node_namespace(7654);
+        // A resident own-address box, whose lease the node's hostname proxy
+        // dials.
+        registry.register(
+            BoxRegistration::new("web", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080]),
+        );
         let table = registry.table();
-        // Built without [`NodePlaneBaseline::in_force`], so this is the
-        // phase the build ships.
-        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        let baseline = NodePlaneBaseline::built_in(SUBNET).with_host_exposure(vec![(4200, 4200)]);
         assert_eq!(
             baseline.phase(),
-            NodeBaselinePhase::Announced,
-            "the shipped posture is announced, the arm this test pins"
+            NodeBaselinePhase::InForce,
+            "the shipped posture is in force, the arm this test pins"
         );
-        // The pin table, empty as the run path hands it: the node row
-        // declares no names.
         let pins = dns_pins::DnsPins::new(SUBNET);
-
-        // A node-plane frame to a destination no category of the enumeration
-        // names — the public store the shipped cache URL resolves to. The
-        // interim node row decides it, and the row allows all, so the frame
-        // is admitted by [`GateAdmit::Row`]: the enumeration's compiled set,
-        // which admits no such destination, decided nothing here.
-        let summarize = boxes::core::egress::summarize;
-        let node_frame = summarize(&ipv4_frame(
-            SUBNET.daemon_ip().octets(),
-            6,
-            [8, 8, 8, 8],
-            443,
-        ));
-        assert_eq!(
+        let node = SUBNET.daemon_ip().octets();
+        let decide = |proto: u8, dst: [u8; 4], port: u16| {
             gate_verdict(
-                &node_frame,
+                &boxes::core::egress::summarize(&ipv4_frame(node, proto, dst, port)),
+                None,
+                &table,
+                &baseline,
+                &pins,
+                &ReplyTables::new(),
+            )
+        };
+        let cache = [203, 0, 113, 10];
+
+        // Before the node's own lookup, the cache's address is not pinned:
+        // the frame is the drop for want of a pin, whatever the node row's
+        // allow-all would have said.
+        assert_eq!(
+            decide(6, cache, 443),
+            Err(GateDrop::NodePlaneUnpinned {
+                src: node,
+                dst: cache,
+                dst_port: 443
+            }),
+            "an address no lookup pinned is refused"
+        );
+
+        // The resolver carve-out: the node resolves its entries' names.
+        assert_eq!(
+            decide(17, SUBNET.dns_server().octets(), 53),
+            Ok(GateAdmit::Baseline),
+            "the node reaches the resolver"
+        );
+
+        // The node's own lookup of the cache's name pins the answer, and the
+        // frame to it is admitted by the baseline set.
+        dns_pins::tests::node_resolves(
+            &pins,
+            &table,
+            &baseline,
+            crate::net::baseline::DAEMON_CACHE_ENDPOINT,
+            &[Ipv4Addr::from(cache)],
+            Instant::now(),
+        );
+        assert_eq!(
+            decide(6, cache, 443),
+            Ok(GateAdmit::Baseline),
+            "the pinned address is admitted"
+        );
+        // The pin opens the address at TCP 443 alone: another TCP port, UDP
+        // to the same port, and ICMP are the drop for want of a pin, so a
+        // shared address a registry name resolves to is not open at every
+        // port.
+        for (proto, port) in [(6, 22), (6, 80), (17, 443), (1, 0)] {
+            assert_eq!(
+                decide(proto, cache, port),
+                Err(GateDrop::NodePlaneUnpinned {
+                    src: node,
+                    dst: cache,
+                    dst_port: port
+                }),
+                "the pinned address is refused at protocol {proto} port {port}"
+            );
+        }
+
+        // A neighbour of the pinned address, and a public address no lookup
+        // named, stay refused for want of a pin.
+        for dst in [[203, 0, 113, 11], [8, 8, 8, 8]] {
+            assert!(
+                matches!(decide(6, dst, 443), Err(GateDrop::NodePlaneUnpinned { .. })),
+                "{} is refused: no baseline entry pinned it",
+                Ipv4Addr::from(dst)
+            );
+        }
+        // A name no entry names pins nothing for the node.
+        let other = [198, 51, 100, 20];
+        dns_pins::tests::node_resolves(
+            &pins,
+            &table,
+            &baseline,
+            "example.com",
+            &[Ipv4Addr::from(other)],
+            Instant::now(),
+        );
+        assert!(
+            matches!(
+                decide(6, other, 443),
+                Err(GateDrop::NodePlaneUnpinned { .. })
+            ),
+            "a lookup of a name no entry names admits nothing"
+        );
+
+        // The host alias at a configured exposure is admitted, and at any
+        // other port it is the infrastructure drop.
+        let alias = SUBNET.host_alias().octets();
+        assert_eq!(decide(6, alias, 4200), Ok(GateAdmit::Baseline));
+        assert!(matches!(
+            decide(6, alias, 443),
+            Err(GateDrop::Infrastructure { dst, .. }) if dst == alias
+        ));
+
+        // A resident box's lease: the target's ingress decides it.
+        assert_eq!(decide(6, LEASE, 8080), Ok(GateAdmit::Baseline));
+
+        // Private space and the switch's own ports stay refused.
+        assert!(matches!(
+            decide(6, [10, 1, 2, 3], 443),
+            Err(GateDrop::Infrastructure { .. })
+        ));
+        assert!(matches!(
+            decide(6, SUBNET.dns_server().octets(), 80),
+            Err(GateDrop::SwitchControlSurface { .. })
+        ));
+    }
+
+    /// The node address carries two senders: the guest daemon and every
+    /// `host_ip` box, the default network mode. The guest's classifier
+    /// writes the sender's cgroup into the frame as the box mark. A marked
+    /// frame at the node address is decided by the resident `host_ip`
+    /// boxes' rules, which the host-side client registered, so a default
+    /// session keeps its outbound network (NET-107). Root in the guest can
+    /// write the mark too, so with no `host_ip` box resident the same frame
+    /// drops (NET-085).
+    #[test]
+    fn box_marked_node_frame_decided_by_resident_host_ip_boxes() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        assert_eq!(baseline.phase(), NodeBaselinePhase::InForce);
+        let pins = dns_pins::DnsPins::new(SUBNET);
+        let node = SUBNET.daemon_ip().octets();
+        let outside = [8, 8, 8, 8];
+        let frame = box_cohort_frame(ipv4_frame(node, 6, outside, 443));
+        let summary = boxes::core::egress::summarize(&frame);
+        assert!(summary.box_cohort_marked());
+        let decide = |summary: &FrameSummary| {
+            gate_verdict(summary, None, &table, &baseline, &pins, &ReplyTables::new())
+        };
+        assert_eq!(
+            decide(&summary),
+            Err(GateDrop::HostIpUnbounded {
+                src: node,
+                dst: outside,
+                dst_port: 443,
+                resident: 0,
+            }),
+            "with no host_ip box resident, a marked frame drops under {HOST_IP_BOXES_RULE}"
+        );
+        // A `host_ip` box with no `egress` section: the default leaves a box
+        // that shares the node's address allow-all, so its marked frame to
+        // the outside passes under its rules.
+        let session = boxes::SessionId::mint();
+        assert!(registry.admit_host_ip_box(session, None));
+        assert_eq!(
+            decide(&summary),
+            Ok(GateAdmit::HostIpBox),
+            "a marked frame at the node address is the resident host_ip boxes' to decide"
+        );
+        // The box's verdict still keeps the floors every row keeps: the
+        // link-local metadata service and the switch's own ports stay
+        // refused.
+        let metadata = box_cohort_frame(ipv4_frame(node, 6, [169, 254, 169, 254], 80));
+        assert!(matches!(
+            gate_verdict(
+                &boxes::core::egress::summarize(&metadata),
                 None,
                 &table,
                 &baseline,
                 &pins,
                 &ReplyTables::new()
             ),
-            Ok(GateAdmit::Row),
-            "announced, the interim node row decides the node plane's frames — \
-             never the baseline set"
-        );
+            Err(GateDrop::Infrastructure { .. })
+        ));
+        let control = box_cohort_frame(ipv4_frame(node, 6, SUBNET.dns_server().octets(), 80));
+        assert!(matches!(
+            gate_verdict(
+                &boxes::core::egress::summarize(&control),
+                None,
+                &table,
+                &baseline,
+                &pins,
+                &ReplyTables::new()
+            ),
+            Err(GateDrop::SwitchControlSurface { .. })
+        ));
     }
 
-    /// The host alias's default-deny is a box row's alone (design §7.1,
-    /// NET-062). Announced, the interim node row at the daemon's address
-    /// carries the frames of every box sharing the guest root namespace — a
-    /// host-address box, the default network mode, whose `host.min.internal`
-    /// resolves to the alias — so a node-plane frame to the alias is
-    /// own-block local reach the row admits, while the same frame from a box
-    /// lease, even an allow-all one, is the infrastructure drop.
+    /// The daemon's own frame at the node address carries no box mark, and
+    /// the baseline set still judges it: an address no baseline entry
+    /// pinned is refused. A DSCP value other than the box mark is not a box
+    /// either, so the baseline decides a frame the guest left unmarked.
     #[test]
-    fn host_alias_refused_for_box_rows_but_not_the_announced_node_row() {
+    fn daemon_frame_at_node_address_still_judged_by_baseline() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        let pins = dns_pins::DnsPins::new(SUBNET);
+        let node = SUBNET.daemon_ip().octets();
+        let outside = [8, 8, 8, 8];
+        let mut other_dscp = ipv4_frame(node, 6, outside, 443);
+        other_dscp[15] = 0b10_1110 << 2;
+        for frame in [ipv4_frame(node, 6, outside, 443), other_dscp] {
+            let summary = boxes::core::egress::summarize(&frame);
+            assert!(!summary.box_cohort_marked());
+            assert_eq!(
+                gate_verdict(
+                    &summary,
+                    None,
+                    &table,
+                    &baseline,
+                    &pins,
+                    &ReplyTables::new()
+                ),
+                Err(GateDrop::NodePlaneUnpinned {
+                    src: node,
+                    dst: outside,
+                    dst_port: 443
+                }),
+                "the daemon's own frame is the baseline's to decide"
+            );
+        }
+    }
+
+    /// The host alias's default-deny is a box row's alone, and the node
+    /// plane's reach through it is scoped by the configured host exposures
+    /// (design §7.1, NET-062). The daemon's address carries the frames of
+    /// every box sharing the guest root namespace — a host-address box, the
+    /// default network mode, whose `host.min.internal` resolves to the
+    /// alias — and the in-force baseline decides them. The built-in baseline
+    /// carries no exposure, so the alias is closed at every port until a
+    /// deployment names ports; with a list, a node-plane TCP or UDP frame to
+    /// the alias is admitted by the baseline set inside the list's ranges, edges included, and the infrastructure drop outside them,
+    /// while an ICMP frame, which carries no port, is refused even by a list
+    /// spanning every port. The same frames from a box lease, even an
+    /// allow-all one, are the infrastructure drop whatever the port.
+    #[test]
+    fn host_alias_refused_for_box_rows_and_scoped_by_the_exposures_for_the_node_row() {
         let registry = BoxRegistry::new(SUBNET);
         registry.register_node_namespace(7654);
         registry.register(
@@ -14995,53 +16344,113 @@ mod tests {
                 .with_admitted_ports([8080]),
         );
         let table = registry.table();
-        let baseline = NodePlaneBaseline::built_in(SUBNET);
-        assert_eq!(baseline.phase(), NodeBaselinePhase::Announced);
+        let built_in = NodePlaneBaseline::built_in(SUBNET);
+        assert_eq!(built_in.phase(), NodeBaselinePhase::InForce);
         let pins = dns_pins::DnsPins::new(SUBNET);
         let summarize = boxes::core::egress::summarize;
         let alias = SUBNET.host_alias().octets();
+        let node = SUBNET.daemon_ip().octets();
 
-        let node_frame = summarize(&ipv4_frame(SUBNET.daemon_ip().octets(), 6, alias, 18081));
-        assert_eq!(
+        let verdict = |src: [u8; 4], proto: u8, port: u16, baseline: &NodePlaneBaseline| {
             gate_verdict(
-                &node_frame,
+                &summarize(&ipv4_frame(src, proto, alias, port)),
                 None,
                 &table,
-                &baseline,
+                baseline,
                 &pins,
-                &ReplyTables::new()
-            ),
-            Ok(GateAdmit::Row),
-            "the announced node row keeps own-block reach to the host alias"
+                &ReplyTables::new(),
+            )
+        };
+        let refused = |result: Result<GateAdmit, GateDrop>| matches!(result, Err(GateDrop::Infrastructure { dst, .. }) if dst == alias);
+
+        assert!(
+            refused(verdict(node, 6, 8080, &built_in)),
+            "with no configured exposure the alias is closed to the node plane at every port"
         );
 
-        let box_frame = summarize(&ipv4_frame(LEASE, 6, alias, 18081));
+        let exposed = built_in
+            .clone()
+            .with_host_exposure(vec![(3000, 3999), (8080, 8080)]);
         assert!(
-            matches!(
-                gate_verdict(
-                    &box_frame,
-                    None,
-                    &table,
-                    &baseline,
-                    &pins,
-                    &ReplyTables::new()
-                ),
-                Err(GateDrop::Infrastructure { dst, .. }) if dst == alias
-            ),
-            "a box row's frame to the host alias is the infrastructure drop"
+            refused(verdict(node, 6, 2999, &exposed)),
+            "the port below a range's low edge is the infrastructure drop"
         );
+        for port in [3000, 3999, 8080] {
+            assert_eq!(
+                verdict(node, 6, port, &exposed),
+                Ok(GateAdmit::Baseline),
+                "the node plane reaches the host alias at exposed port {port}"
+            );
+        }
+        assert!(
+            refused(verdict(node, 6, 18081, &exposed)),
+            "the node plane's frame to the host alias outside the exposures is the infrastructure drop"
+        );
+        assert_eq!(
+            verdict(node, 17, 8080, &exposed),
+            Ok(GateAdmit::Baseline),
+            "a UDP frame reaches the host alias at an exposed port"
+        );
+        assert!(
+            refused(verdict(LEASE, 6, 8080, &exposed)),
+            "a box row's frame to the host alias is the infrastructure drop at an exposed port"
+        );
+
+        let every_port = built_in.with_host_exposure(vec![(0, u16::MAX)]);
+        assert!(
+            refused(verdict(node, 1, 0, &every_port)),
+            "an ICMP frame carries no port and never matches an exposure"
+        );
+    }
+
+    /// The in-force arm opens the host alias at the configured host
+    /// exposures and nowhere else: the registry and the cache are named
+    /// endpoints now, so no fetch port is held open on the alias, and with
+    /// no exposure TCP at 443 is the infrastructure drop. With 443 exposed,
+    /// TCP and UDP pass, and a frame with no transport port — ICMP, or GRE
+    /// whose bytes read as 443 — never matches the exposure.
+    #[test]
+    fn in_force_baseline_opens_the_alias_at_the_host_exposures_alone() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        let table = registry.table();
+        let built_in = NodePlaneBaseline::built_in(SUBNET);
+        let pins = dns_pins::DnsPins::new(SUBNET);
+        let node = built_in.node_addr();
+        let alias = SUBNET.host_alias().octets();
+        let decide = |proto: u8, baseline: &NodePlaneBaseline| {
+            let summary = boxes::core::egress::summarize(&ipv4_frame(node, proto, alias, 443));
+            gate_verdict(&summary, None, &table, baseline, &pins, &ReplyTables::new())
+        };
+        let refused = |result: Result<GateAdmit, GateDrop>| matches!(result, Err(GateDrop::Infrastructure { dst, dst_port: 443, .. }) if dst == alias);
+
+        assert!(
+            refused(decide(6, &built_in)),
+            "with no exposure, TCP at 443 on the alias is the infrastructure drop"
+        );
+        let exposed = built_in.clone().with_host_exposure(vec![(443, 443)]);
+        assert_eq!(decide(6, &exposed), Ok(GateAdmit::Baseline));
+        assert_eq!(decide(17, &exposed), Ok(GateAdmit::Baseline));
+        for (proto, name) in [(1u8, "ICMP"), (47, "GRE")] {
+            assert!(
+                refused(decide(proto, &exposed)),
+                "{name} to alias:443 is the infrastructure drop, in force"
+            );
+        }
     }
 
     /// NET-130, un-enrolled, at the gate: the node-plane baseline set comes
     /// from the helper's enumeration, and the gate decides the daemon's own
     /// frames by it **beside** the boxes' rows — a deny-all box's row does not
-    /// clip the daemon's own registry and cache fetches (NET-080), decided
-    /// before the table is consulted — and a destination the enumeration does
-    /// not name is dropped: the gap the announced phase covers until the
-    /// node plane's store surfaces are configured (`NodeBaselinePhase`).
+    /// clip the daemon's own registry and cache fetches (NET-080) — through
+    /// the relay's two legs: the daemon's own lookup of the cache's name
+    /// reaches the switch, the reply pins its answer on the way back, and the
+    /// fetch to that address is admitted, while an address no lookup pinned
+    /// is dropped with a line naming the drop for want of a pin.
     #[tokio::test]
     async fn unenrolled_baseline_set_from_helper_enumeration() {
         let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
         // A deny-all box: no declared subnets, so nothing but the resolver
         // carve-out passes its row — the box the node plane's own fetches
         // must not be bound by.
@@ -15054,39 +16463,36 @@ mod tests {
                     deny_subnets: None,
                 }),
         );
-        let baseline = NodePlaneBaseline::built_in(SUBNET).in_force();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
         let node_addr = baseline.node_addr();
-        let registry_endpoint = baseline
-            .entries()
-            .iter()
-            .find(|entry| entry.category() == BaselineCategory::Registry)
-            .expect("the enumeration carries the registry")
-            .endpoints()
-            .first()
-            .expect("the registry carries an endpoint")
-            .split_once('/')
-            .expect("an endpoint is spelled `a.b.c.d/n`")
-            .0
-            .parse::<Ipv4Addr>()
-            .expect("an endpoint's address parses")
-            .octets();
+        let cache_name = crate::net::baseline::DAEMON_CACHE_ENDPOINT;
+        let cache_addr = Ipv4Addr::new(203, 0, 113, 10);
         let mut h =
             gate_over_with_node_baseline(registry, UNREGISTERED_SOURCE_PHASE, baseline).await;
 
-        // VM start says what the node plane may reach, one term per category:
-        // the line a diagnostic bundle's daemon log tail carries.
+        // VM start says what the node plane may reach, one term per category,
+        // and that the set is in force: the line a diagnostic bundle's daemon
+        // log tail carries. No interim rides beside it: a box-marked frame
+        // from the node address is the resident host_ip boxes' to decide.
         wait_for_log(&h.log, "node-plane baseline set").await;
         let logged = h.log.contents();
-        for category in ["registry=", "cache="] {
+        for term in [
+            "registry=github.com",
+            "cache=cache.minimal.dev",
+            "node_baseline_phase=\"in force\"",
+            "node_addr=100.64.255.253",
+        ] {
             assert!(
-                logged.contains(category),
-                "the start-up line names the baseline entries by category, got: {logged}"
+                logged.contains(term),
+                "the start-up line carries {term}, got: {logged}"
             );
         }
-        assert!(
-            logged.contains("node_addr=100.64.255.253"),
-            "the start-up line names the in-VM daemon's own address, got: {logged}"
-        );
+        for gone in ["box_marked_node_frames", "can still bypass"] {
+            assert!(
+                !logged.contains(gone),
+                "the start-up line names no interim ({gone}), got: {logged}"
+            );
+        }
 
         // The box's own frame, to somewhere its deny-all declaration does not
         // name: dropped, where it stands. The marker behind it is the one
@@ -15102,27 +16508,116 @@ mod tests {
             "the deny-all box's undeclared frame never reached the switch; the marker did"
         );
 
-        // The node plane's own frame, to the enumeration's registry endpoint:
-        // decided by the baseline set beside the box's row — admitted, and
-        // the switch sees it exactly as it was sent.
-        let node_frame = ipv4_frame(node_addr, 6, registry_endpoint, 443);
-        send_frame(&mut h.guest, &node_frame).await;
-        let seen = expect_frame(&mut h.switch).await;
+        // Before the daemon's own lookup the cache's address is not pinned:
+        // the fetch is dropped, and the marker behind it — the daemon's own
+        // query for the cache's name, the resolver carve-out — arrives.
+        let early_fetch = ipv4_frame(node_addr, 6, cache_addr.octets(), 443);
+        send_frame(&mut h.guest, &early_fetch).await;
+        let query = dns_pins::tests::udp_payload_frame(
+            Ipv4Addr::from(node_addr),
+            40000,
+            SUBNET.dns_server(),
+            53,
+            &dns_pins::tests::dns_query(cache_name),
+        );
+        send_frame(&mut h.guest, &query).await;
         assert_eq!(
-            seen, node_frame,
+            expect_frame(&mut h.switch).await,
+            query,
+            "the unpinned fetch never reached the switch; the daemon's own query did"
+        );
+        wait_for_log(&h.log, "egress-node-plane-unpinned").await;
+        let logged = h.log.contents();
+        assert!(
+            logged.contains("source=100.64.255.253")
+                && logged.contains("destination=203.0.113.10")
+                && logged.contains("no baseline entry pinned"),
+            "the drop line names a node-plane frame refused for want of a pin, got: {logged}"
+        );
+
+        // The resolver's reply, on its way back to the daemon, pins the
+        // answer against the cache's entry.
+        let reply = dns_pins::tests::udp_payload_frame(
+            SUBNET.dns_server(),
+            53,
+            Ipv4Addr::from(node_addr),
+            40000,
+            &dns_pins::tests::dns_response(cache_name, &[cache_addr]),
+        );
+        send_frame(&mut h.switch, &reply).await;
+        assert_eq!(
+            expect_frame(&mut h.guest).await,
+            reply,
+            "the reply reaches the daemon in full"
+        );
+        wait_for_log(&h.log, "pinned a node-plane baseline entry's addresses").await;
+        let logged = h.log.contents();
+        assert!(
+            logged.contains("entry=cache")
+                && logged.contains("addresses=[203.0.113.10]")
+                && logged.contains("lookup_source=100.64.255.253"),
+            "the pin line names the entry, the addresses and the lookup's source, got: {logged}"
+        );
+
+        // The daemon's own fetch, to the address its lookup pinned: admitted
+        // beside the deny-all box's row, exactly as it was sent.
+        let fetch = ipv4_frame(node_addr, 6, cache_addr.octets(), 443);
+        send_frame(&mut h.guest, &fetch).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            fetch,
             "the daemon's own fetch reaches the switch as it was sent"
         );
 
-        // To an address no category names — the public store the guest
-        // daemon's shipped cache URL resolves to, whose serving addresses no
-        // subnet list this tree can name — the set says no.
-        let out_of_set = ipv4_frame(node_addr, 6, [8, 8, 8, 8], 443);
-        let node_marker = ipv4_frame(node_addr, 6, registry_endpoint, 444);
-        send_frame(&mut h.guest, &out_of_set).await;
-        send_frame(&mut h.guest, &node_marker).await;
-        let seen = expect_frame(&mut h.switch).await;
+        // The registry's leg: the package source repository a box launch
+        // git-fetches before its package graph exists. The daemon's own
+        // lookup of the registry's name pins its answer against the registry
+        // entry, and the fetch to it is admitted — the fetch whose drop hung
+        // a box launch inside the VM.
+        let registry_name = crate::net::baseline::DAEMON_REGISTRY_ENDPOINT;
+        let registry_addr = Ipv4Addr::new(203, 0, 113, 20);
+        let registry_query = dns_pins::tests::udp_payload_frame(
+            Ipv4Addr::from(node_addr),
+            40001,
+            SUBNET.dns_server(),
+            53,
+            &dns_pins::tests::dns_query(registry_name),
+        );
+        send_frame(&mut h.guest, &registry_query).await;
         assert_eq!(
-            seen, node_marker,
+            expect_frame(&mut h.switch).await,
+            registry_query,
+            "the daemon's own query for the registry's name reaches the switch"
+        );
+        let registry_reply = dns_pins::tests::udp_payload_frame(
+            SUBNET.dns_server(),
+            53,
+            Ipv4Addr::from(node_addr),
+            40001,
+            &dns_pins::tests::dns_response(registry_name, &[registry_addr]),
+        );
+        send_frame(&mut h.switch, &registry_reply).await;
+        assert_eq!(
+            expect_frame(&mut h.guest).await,
+            registry_reply,
+            "the registry's reply reaches the daemon in full"
+        );
+        wait_for_log(&h.log, "entry=registry").await;
+        let registry_fetch = ipv4_frame(node_addr, 6, registry_addr.octets(), 443);
+        send_frame(&mut h.guest, &registry_fetch).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            registry_fetch,
+            "the daemon's own fetch from the registry reaches the switch as it was sent"
+        );
+
+        // To an address no lookup pinned, the set says no.
+        let out_of_set = ipv4_frame(node_addr, 6, [8, 8, 8, 8], 443);
+        send_frame(&mut h.guest, &out_of_set).await;
+        send_frame(&mut h.guest, &fetch).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            fetch,
             "the daemon's out-of-set frame never reached the switch; the marker did"
         );
         expect_silence(&mut h.switch).await;
@@ -15489,6 +16984,438 @@ mod tests {
             Err(_) => panic!("the gate left the switch side hanging"),
         }
         expect_teardown(&mut guest).await;
+    }
+
+    /// #2748: one round of the guest daemon's loopback range probe reaches
+    /// the switch, its bind and its release both, though no row holds the
+    /// probe's placeholder remote. Refused, every round would read as a fault
+    /// of the channel, and the guest would land the range absent while this
+    /// host answers its boxes' names inside it.
+    #[tokio::test]
+    async fn a_range_probe_round_reaches_the_switch_with_no_row_behind_it() {
+        let h = gate_connected(BoxRegistry::new(SUBNET)).await;
+        relayed_and_answered(&h, &probe_round("127.0.64.1", true)).await;
+        relayed_and_answered(&h, &probe_round("127.0.64.1", false)).await;
+    }
+
+    /// One range probe round's control request, as the guest daemon's walk
+    /// spells it: the expose that binds the probe port at `address`, or the
+    /// unexpose that releases it.
+    fn probe_round(address: &str, expose: bool) -> Vec<u8> {
+        let local = format!("{address}:{}", switch::loopback::RANGE_PROBE_PORT);
+        let (path, body) = if expose {
+            (
+                "/services/forwarder/expose",
+                format!(
+                    r#"{{"local":"{local}","remote":"{}","protocol":"tcp"}}"#,
+                    switch::loopback::RANGE_PROBE_REMOTE
+                ),
+            )
+        } else {
+            (
+                "/services/forwarder/unexpose",
+                format!(r#"{{"local":"{local}","protocol":"tcp"}}"#),
+            )
+        };
+        control_request(path, &body)
+    }
+
+    /// A control request in the guest daemon's own spelling
+    /// (`post_json_within`, `crates/minimald/src/net/policy.rs`).
+    fn control_request(path: &str, body: &str) -> Vec<u8> {
+        let mut request = format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
+        )
+        .into_bytes();
+        request.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+        request.extend_from_slice(body.as_bytes());
+        request
+    }
+
+    /// #2748: gvproxy's Go decoder matches a key without regard to case and
+    /// lets a repeated key win, so a probe-shaped body with any key beyond the
+    /// round's own fields could bind there what the gate never checked. Each
+    /// is refused with an HTTP refusal and never relayed.
+    #[tokio::test]
+    async fn a_probe_round_with_a_key_beyond_its_own_fields_is_refused() {
+        let h = gate_connected(BoxRegistry::new(SUBNET)).await;
+        let port = switch::loopback::RANGE_PROBE_PORT;
+        let remote = switch::loopback::RANGE_PROBE_REMOTE;
+        for body in [
+            format!(
+                r#"{{"local":"127.0.64.5:{port}","remote":"{remote}","protocol":"tcp","LOCAL":"0.0.0.0:2222","REMOTE":"10.0.0.1:22"}}"#
+            ),
+            format!(
+                r#"{{"local":"0.0.0.0:2222","local":"127.0.64.5:{port}","remote":"{remote}","protocol":"tcp"}}"#
+            ),
+            format!(
+                r#"{{"local":"127.0.64.5:{port}","remote":"{remote}","protocol":"tcp","extra":1}}"#
+            ),
+        ] {
+            let refused =
+                answered_unrelayed(&h, &control_request("/services/forwarder/expose", &body)).await;
+            assert!(
+                refused.starts_with("HTTP/1.1 400 "),
+                "{body} is refused with an HTTP refusal, got: {refused}"
+            );
+        }
+        let release = format!(r#"{{"local":"127.0.64.5:{port}","protocol":"tcp","Local":"x"}}"#);
+        let refused = answered_unrelayed(
+            &h,
+            &control_request("/services/forwarder/unexpose", &release),
+        )
+        .await;
+        assert!(
+            refused.starts_with("HTTP/1.1 400 "),
+            "a release with a case variant is refused too, got: {refused}"
+        );
+        // No round was admitted by any of them.
+        relayed_and_answered(&h, &probe_round("127.0.64.5", true)).await;
+    }
+
+    /// #2748: an admitted round reaches the switch as the gate rebuilt it from
+    /// the fields it checked, never as the guest's own bytes.
+    #[tokio::test]
+    async fn an_admitted_probe_round_is_relayed_as_its_canonical_request() {
+        let h = gate_connected(BoxRegistry::new(SUBNET)).await;
+        let port = switch::loopback::RANGE_PROBE_PORT;
+        // The round's own fields, in another order and spacing, under a
+        // different head.
+        let body = format!(
+            r#"{{ "protocol": "tcp", "remote": "{}", "local": "127.0.64.5:{port}" }}"#,
+            switch::loopback::RANGE_PROBE_REMOTE
+        );
+        let mut sent = b"POST /services/forwarder/expose HTTP/1.1\r\nHost: x\r\n".to_vec();
+        sent.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+        sent.extend_from_slice(body.as_bytes());
+        let canonical = probe_round("127.0.64.5", true);
+        assert_ne!(sent, canonical);
+        assert_eq!(
+            canonical,
+            super::canonical_probe_request(super::ControlVerb::Expose, ([127, 0, 64, 5], port)),
+            "the gate's canonical request is the guest daemon's own spelling"
+        );
+
+        let (mut guest, mut switch) = connect_control(&h).await;
+        guest.write_all(&sent).await.expect("writing the round");
+        let mut spoken = vec![0u8; canonical.len()];
+        read_within(&mut switch, &mut spoken).await;
+        assert_eq!(
+            String::from_utf8_lossy(&spoken),
+            String::from_utf8_lossy(&canonical),
+            "the switch reads the canonical request, not the guest's bytes"
+        );
+    }
+
+    /// Speaks `request` on a fresh control connection and answers it from
+    /// the switch with 200 once it arrives whole, as gvproxy answers a bind
+    /// or a release that stood.
+    async fn relayed_and_answered(h: &super::test_support::GateHarness, request: &[u8]) {
+        let (mut guest, mut switch) = connect_control(h).await;
+        guest.write_all(request).await.expect("writing the round");
+        let mut spoken = vec![0u8; request.len()];
+        read_within(&mut switch, &mut spoken).await;
+        assert_eq!(spoken, request, "the round reached the switch whole");
+        let answer = super::forward_revoke::bound_answer();
+        switch
+            .write_all(answer)
+            .await
+            .expect("writing gvproxy's answer");
+        let mut seen = vec![0u8; answer.len()];
+        read_within(&mut guest, &mut seen).await;
+        assert_eq!(seen, answer, "the answer reaches the guest verbatim");
+    }
+
+    /// Speaks `request` on a fresh control connection, reads the answer the
+    /// gate gives it itself, and checks nothing of it reached the switch.
+    async fn answered_unrelayed(h: &super::test_support::GateHarness, request: &[u8]) -> String {
+        let (mut guest, mut switch) = connect_control(h).await;
+        guest.write_all(request).await.expect("writing the round");
+        let mut answer = Vec::new();
+        let mut chunk = [0u8; 256];
+        while !String::from_utf8_lossy(&answer).contains("\r\n\r\n") {
+            let n = tokio::time::timeout(DEADLINE, guest.read(&mut chunk))
+                .await
+                .expect("the gate answers within the deadline")
+                .expect("reading the gate's answer");
+            assert!(n > 0, "the gate closed without answering");
+            answer.extend_from_slice(&chunk[..n]);
+        }
+        drop(guest);
+        let mut probe = [0u8; 1];
+        match tokio::time::timeout(DEADLINE, switch.read(&mut probe)).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => panic!("{n} byte(s) of an unrelayed round reached the switch"),
+            Ok(Err(e)) => panic!("reading the switch end failed: {e}"),
+            Err(_) => panic!("the gate left the switch side hanging"),
+        }
+        String::from_utf8_lossy(&answer).into_owned()
+    }
+
+    /// #2748, the probe's bound: one round at a time. While a round is bound,
+    /// a second round's expose is refused with an HTTP refusal the guest
+    /// reads as an address that does not bind, never relayed. A release
+    /// names only the round outstanding: one of any other listener is
+    /// answered as done and never relayed. Once the round is released, the
+    /// next one is relayed.
+    #[tokio::test]
+    async fn a_second_outstanding_range_probe_round_is_refused() {
+        let h = gate_connected(BoxRegistry::new(SUBNET)).await;
+        relayed_and_answered(&h, &probe_round("127.0.64.1", true)).await;
+
+        let refused = answered_unrelayed(&h, &probe_round("127.0.64.2", true)).await;
+        assert!(
+            refused.starts_with("HTTP/1.1 409 "),
+            "a second round is refused with an HTTP refusal, got: {refused}"
+        );
+        wait_for_log(&h.log, super::RANGE_PROBE_RULE).await;
+        let other = answered_unrelayed(&h, &probe_round("127.0.64.2", false)).await;
+        assert!(
+            other.starts_with("HTTP/1.1 200 "),
+            "a release of a listener no round holds is answered as done, got: {other}"
+        );
+
+        relayed_and_answered(&h, &probe_round("127.0.64.1", false)).await;
+        relayed_and_answered(&h, &probe_round("127.0.64.2", true)).await;
+    }
+
+    /// #2748, the probe's bound: a round at an address a box holds is never
+    /// relayed, so the probe never binds the port at another box's address
+    /// or skews what its forwards hold. It is answered as a held listener,
+    /// which the walk counts as present: the host bound or granted that
+    /// address for the box.
+    #[tokio::test]
+    async fn a_range_probe_round_at_a_boxs_address_is_answered_held_and_not_relayed() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(BoxRegistration::new(
+            "web",
+            Ipv4Addr::from(LEASE),
+            Ipv4Addr::new(127, 0, 64, 9),
+        ));
+        let h = gate_connected(registry).await;
+        let held = answered_unrelayed(&h, &probe_round("127.0.64.9", true)).await;
+        assert!(
+            held.starts_with("HTTP/1.1 500 ") && held.contains("proxy already running"),
+            "the round is answered as a held listener, got: {held}"
+        );
+        // A round elsewhere is still relayed.
+        relayed_and_answered(&h, &probe_round("127.0.64.10", true)).await;
+    }
+
+    /// #2748, the probe's bound: a round the guest binds and never releases
+    /// is released by the gate itself once its hold has passed, and the next
+    /// round is admitted.
+    #[tokio::test]
+    async fn a_range_probe_round_left_bound_is_released_after_its_hold() {
+        let h = gate_connected(BoxRegistry::new(SUBNET)).await;
+        relayed_and_answered(&h, &probe_round("127.0.64.1", true)).await;
+
+        let (mut release, _) = tokio::time::timeout(
+            super::RANGE_PROBE_HOLD + DEADLINE,
+            h.switch_listener.accept(),
+        )
+        .await
+        .expect("the gate dials the switch to release the round")
+        .expect("accepting the gate's release");
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 512];
+        while !String::from_utf8_lossy(&request).contains(r#""protocol":"tcp"}"#) {
+            let n = tokio::time::timeout(DEADLINE, release.read(&mut chunk))
+                .await
+                .expect("the unexpose arrives within the deadline")
+                .expect("reading the unexpose");
+            assert!(n > 0, "the gate closed before its unexpose was whole");
+            request.extend_from_slice(&chunk[..n]);
+        }
+        let request = String::from_utf8_lossy(&request);
+        assert!(
+            request.starts_with("POST /services/forwarder/unexpose HTTP/1.1\r\n")
+                && request.ends_with(&format!(
+                    r#"{{"local":"127.0.64.1:{}","protocol":"tcp"}}"#,
+                    switch::loopback::RANGE_PROBE_PORT
+                )),
+            "the gate releases the round it admitted, got: {request}"
+        );
+        release
+            .write_all(super::forward_revoke::bound_answer())
+            .await
+            .expect("answering the release");
+        drop(release);
+        wait_for_log(&h.log, "left bound past its hold").await;
+        relayed_and_answered(&h, &probe_round("127.0.64.2", true)).await;
+    }
+
+    /// The gate's release of a round leaves a listener alone once a box's
+    /// publish holds it: that forward could bind only after the round's was
+    /// gone, so it is the box's. The round ends without the switch being
+    /// asked anything. Every request naming the probe port at a range
+    /// address takes the probe turn, whatever else it is.
+    #[tokio::test]
+    async fn the_hold_never_releases_a_listener_a_box_now_holds() {
+        use super::{ControlVerb, PublishedForwards, names_probe_listener};
+        let port = switch::loopback::RANGE_PROBE_PORT;
+        let forwards = std::sync::Arc::new(PublishedForwards::new());
+        let listener = ([127, 0, 64, 7], port);
+        let generation = forwards
+            .begin_probe(listener)
+            .expect("no round is outstanding");
+        forwards
+            .note_published(
+                listener,
+                LEASE,
+                port,
+                super::egress::IPPROTO_TCP,
+                boxes::core::switch_request::Applied::Row,
+            )
+            .expect("the ledger has room");
+        // No switch listens at this path: a release that dialed it would fail
+        // and ask again until the bound below.
+        let dir = TempDir::new().unwrap();
+        tokio::time::timeout(
+            super::RANGE_PROBE_HOLD * 3,
+            super::release_probe_after_hold(
+                dir.path().join("no-switch.sock"),
+                std::sync::Arc::downgrade(&forwards),
+                generation,
+            ),
+        )
+        .await
+        .expect("the release ends without asking the switch");
+        assert_eq!(forwards.outstanding_probe(), None, "the round is over");
+
+        let box_publish =
+            format!(r#"{{"local":"127.0.64.7:{port}","remote":"100.64.0.9:80","protocol":"tcp"}}"#);
+        assert!(names_probe_listener(
+            ControlVerb::Expose,
+            box_publish.as_bytes()
+        ));
+        let elsewhere = r#"{"local":"127.0.64.7:8080","remote":"100.64.0.9:80","protocol":"tcp"}"#;
+        assert!(!names_probe_listener(
+            ControlVerb::Expose,
+            elsewhere.as_bytes()
+        ));
+    }
+
+    /// The gate's release of a round is bounded: it ends with the gate, and a
+    /// switch that never answers is asked [`super::RANGE_PROBE_RELEASE_ATTEMPTS`]
+    /// times, after which the round stays accounted and no other is admitted.
+    #[tokio::test]
+    async fn the_holds_release_ends_with_the_gate_and_gives_up_bounded() {
+        use super::PublishedForwards;
+        let dir = TempDir::new().unwrap();
+        let listener = ([127, 0, 64, 7], switch::loopback::RANGE_PROBE_PORT);
+
+        // The gate is gone: the release ends without asking anything.
+        let forwards = std::sync::Arc::new(PublishedForwards::new());
+        let generation = forwards
+            .begin_probe(listener)
+            .expect("no round is outstanding");
+        let gone = std::sync::Arc::downgrade(&forwards);
+        drop(forwards);
+        tokio::time::timeout(
+            super::RANGE_PROBE_HOLD * 2,
+            super::release_probe_after_hold(dir.path().join("no-switch.sock"), gone, generation),
+        )
+        .await
+        .expect("the release ends with the gate");
+
+        // No switch answers: the release gives up after its attempts, and the
+        // round stays accounted.
+        let forwards = std::sync::Arc::new(PublishedForwards::new());
+        let generation = forwards
+            .begin_probe(listener)
+            .expect("no round is outstanding");
+        let attempts = u32::try_from(super::RANGE_PROBE_RELEASE_ATTEMPTS).unwrap();
+        tokio::time::timeout(
+            super::RANGE_PROBE_HOLD * (attempts + 2),
+            super::release_probe_after_hold(
+                dir.path().join("no-switch.sock"),
+                std::sync::Arc::downgrade(&forwards),
+                generation,
+            ),
+        )
+        .await
+        .expect("the release gives up after a bounded number of attempts");
+        assert_eq!(
+            forwards.outstanding_probe(),
+            Some((listener, generation)),
+            "a round the switch never confirmed released stays accounted"
+        );
+        assert!(
+            forwards.begin_probe(([127, 0, 64, 8], listener.1)).is_err(),
+            "and no other round is admitted"
+        );
+    }
+
+    /// The probe's shape is exact: an address of the reserved range, the probe
+    /// port, tcp, and for the expose the placeholder remote. Anything else is
+    /// not a round, and the row decision decides it. An address is held when a
+    /// row is registered at it or a publish's listener is bound there.
+    #[test]
+    fn the_range_probe_rule_reads_only_the_probes_own_shape() {
+        use super::{ControlVerb, PublishedForwards, range_address_held, range_probe_listener};
+        let port = switch::loopback::RANGE_PROBE_PORT;
+        let remote = switch::loopback::RANGE_PROBE_REMOTE;
+        let expose = |local: &str, remote: &str, protocol: &str| {
+            format!(r#"{{"local":"{local}","remote":"{remote}","protocol":"{protocol}"}}"#)
+        };
+        let round = format!("127.0.64.7:{port}");
+        assert_eq!(
+            range_probe_listener(
+                ControlVerb::Expose,
+                expose(&round, remote, "tcp").as_bytes()
+            ),
+            Some(([127, 0, 64, 7], port))
+        );
+        assert_eq!(
+            range_probe_listener(
+                ControlVerb::Unexpose,
+                format!(r#"{{"local":"{round}","protocol":"tcp"}}"#).as_bytes()
+            ),
+            Some(([127, 0, 64, 7], port))
+        );
+        for (local, remote, protocol) in [
+            (format!("127.0.0.1:{port}"), remote, "tcp"),
+            (format!("127.0.64.7:{}", port + 1), remote, "tcp"),
+            (round.clone(), "100.64.0.9:1", "tcp"),
+            (round.clone(), remote, "udp"),
+        ] {
+            assert_eq!(
+                range_probe_listener(
+                    ControlVerb::Expose,
+                    expose(&local, remote, protocol).as_bytes()
+                ),
+                None,
+                "{local} {remote} {protocol} is not a probe round"
+            );
+        }
+
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(BoxRegistration::new(
+            "web",
+            Ipv4Addr::from(LEASE),
+            Ipv4Addr::new(127, 0, 64, 9),
+        ));
+        let table = registry.table();
+        let forwards = PublishedForwards::new();
+        assert!(!range_address_held(&table, &forwards, [127, 0, 64, 7]));
+        assert!(
+            range_address_held(&table, &forwards, [127, 0, 64, 9]),
+            "a row's own loopback address is held"
+        );
+        forwards
+            .note_published(
+                ([127, 0, 64, 7], 8080),
+                LEASE,
+                8080,
+                super::egress::IPPROTO_TCP,
+                boxes::core::switch_request::Applied::Row,
+            )
+            .expect("the ledger has room");
+        assert!(
+            range_address_held(&table, &forwards, [127, 0, 64, 7]),
+            "an address a publish's listener is bound at is held"
+        );
     }
 
     /// The two accepted spellings are the daemon's own, and a `local`
@@ -16582,14 +18509,21 @@ mod tests {
         let mut h = gate_over(registry).await;
 
         // Node-plane traffic on the relay — the in-VM daemon's own frames,
-        // admitted by the node's row — beside the box's declared frame, the
+        // admitted by the node-plane baseline set — beside the box's declared frame, the
         // traffic the same connection attributes to it.
-        let node_frame = ipv4_frame(SUBNET.daemon_ip().octets(), 6, [10, 1, 2, 3], 80);
+        // The node's frame is one the in-force baseline set admits: its own
+        // lookup, through the resolver carve-out.
+        let node_frame = ipv4_frame(
+            SUBNET.daemon_ip().octets(),
+            17,
+            SUBNET.dns_server().octets(),
+            53,
+        );
         send_frame(&mut h.guest, &node_frame).await;
         assert_eq!(
             expect_frame(&mut h.switch).await,
             node_frame,
-            "the node's frame reaches the switch by its row"
+            "the node's frame reaches the switch by the node-plane baseline set"
         );
         let box_frame = ipv4_frame(LEASE, 6, [10, 1, 2, 3], 80);
         send_frame(&mut h.guest, &box_frame).await;
@@ -16620,7 +18554,7 @@ mod tests {
         );
 
         // And the reach survives: the node's next connection carries its
-        // frames again, admitted by the row no report retired.
+        // frames again, decided for the row no report retired.
         let (mut guest, mut switch) = connect_over(&h).await;
         send_frame(&mut guest, &node_frame).await;
         assert_eq!(
@@ -16655,12 +18589,19 @@ mod tests {
 
         // One node-sourced frame, one lease-run frame, both admitted — the
         // traffic the relay attributes to the connection that carried it.
-        let node_frame = ipv4_frame(SUBNET.daemon_ip().octets(), 6, [10, 1, 2, 3], 80);
+        // The node's frame is one the in-force baseline set admits: its own
+        // lookup, through the resolver carve-out.
+        let node_frame = ipv4_frame(
+            SUBNET.daemon_ip().octets(),
+            17,
+            SUBNET.dns_server().octets(),
+            53,
+        );
         send_frame(&mut h.guest, &node_frame).await;
         assert_eq!(
             expect_frame(&mut h.switch).await,
             node_frame,
-            "the node's frame reaches the switch by its row"
+            "the node's frame reaches the switch by the node-plane baseline set"
         );
         let box_frame = ipv4_frame(LEASE, 6, [10, 1, 2, 3], 80);
         send_frame(&mut h.guest, &box_frame).await;
@@ -17619,5 +19560,87 @@ mod tests {
                 "the guard's drop cancelled the task"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod mirror_tests {
+    use std::net::Ipv4Addr;
+    use std::time::Instant;
+
+    use super::forward_revoke::TcpSegment;
+    use super::{PublishedForwards, egress};
+
+    const NODE: Ipv4Addr = Ipv4Addr::new(192, 168, 127, 2);
+    const LISTENER: Ipv4Addr = Ipv4Addr::new(127, 0, 64, 40);
+
+    /// A segment the switch's stack sends toward the node at `port`.
+    fn toward_node(port: u16, peer_port: u16) -> TcpSegment {
+        TcpSegment {
+            dst_mac: [2, 0, 0, 0, 0, 2],
+            src_mac: [2, 0, 0, 0, 0, 1],
+            src: [192, 168, 127, 254],
+            dst: NODE.octets(),
+            src_port: peer_port,
+            dst_port: port,
+            seq: 1000,
+            ack: 2000,
+            flags: egress::TCP_ACK,
+            advance: 0,
+        }
+    }
+
+    // NET-138: a mirrored bind is noted in the gate's ledger at the node's
+    // switch address, so the gate tracks its connections. Its unbind takes
+    // and resets the connections at that port, and no other port's.
+    #[tokio::test]
+    async fn mirror_unbind_resets_tracked_flows() {
+        let forwards = std::sync::Arc::new(PublishedForwards::new());
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let ledger = super::MirrorLedger {
+            forwards: std::sync::Arc::downgrade(&forwards),
+            replies: super::ReplyTables::new(),
+            switch_sock: dir.path().join("no-switch.sock"),
+            runtime: tokio::runtime::Handle::current(),
+        };
+        assert_eq!(ledger.note_bind(LISTENER, 8080, NODE), Ok(true));
+        assert_eq!(ledger.note_bind(LISTENER, 8080, NODE), Ok(false));
+        assert_eq!(ledger.note_bind(LISTENER, 9090, NODE), Ok(true));
+        assert!(
+            forwards.inside_published(NODE.octets(), 8080),
+            "the gate admits the node's replies on a mirrored port"
+        );
+        assert!(
+            ledger
+                .note_bind(LISTENER, 8080, Ipv4Addr::new(192, 168, 127, 9))
+                .is_err(),
+            "a listener noted for the node is not another address's"
+        );
+
+        let now = Instant::now();
+        forwards
+            .flows
+            .observe_toward_box(&toward_node(8080, 50_001), now);
+        forwards
+            .flows
+            .observe_toward_box(&toward_node(8080, 50_002), now);
+        forwards
+            .flows
+            .observe_toward_box(&toward_node(9090, 50_003), now);
+
+        ledger.forget_bind(LISTENER, 8080, NODE);
+        assert!(!forwards.inside_published(NODE.octets(), 8080));
+        assert_eq!(
+            ledger.reset_port(NODE, 8080),
+            2,
+            "the unbind resets both connections at its port"
+        );
+        assert_eq!(ledger.reset_port(NODE, 8080), 0, "none is left at the port");
+        assert!(forwards.inside_published(NODE.octets(), 9090));
+        assert_eq!(
+            forwards.flows.take_at(NODE.octets()).len(),
+            1,
+            "the other port's connection is left"
+        );
     }
 }

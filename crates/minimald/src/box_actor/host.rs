@@ -4,7 +4,7 @@ use super::*;
 /// loop so teardown can be awaited on destroy.
 pub(super) type LaunchedHost = (
     box_runtime::HostHandle,
-    JoinHandle<Result<i32, std::io::Error>>,
+    JoinHandle<Result<box_runtime::HostExit, std::io::Error>>,
 );
 
 /// The root-owned helper the privileged step installs (BEP-018). It adds
@@ -305,9 +305,9 @@ impl Drop for AbortLoopOnDrop {
 /// aborted loop leaves nothing here, because the stop that aborts it leaves
 /// the cohort itself.
 pub(super) fn watch_quic443_exit(
-    task: JoinHandle<Result<i32, std::io::Error>>,
+    task: JoinHandle<Result<box_runtime::HostExit, std::io::Error>>,
     exit: Quic443Exit,
-) -> JoinHandle<Result<i32, std::io::Error>> {
+) -> JoinHandle<Result<box_runtime::HostExit, std::io::Error>> {
     let mut abort_loop = AbortLoopOnDrop(Some(task.abort_handle()));
     // The watcher lives as long as the loop it watches: its own root, as the
     // loop has.
@@ -334,6 +334,63 @@ pub(super) fn watch_quic443_exit(
             Err(error) => Err(std::io::Error::other(error)),
         }
     })
+}
+
+/// The actor's end of an [`watch_entrypoint_exit`] watch: it receives how
+/// the watched host's runtime loop ended, once, when it ends with an exit.
+pub(super) type EntrypointWatch = tokio::sync::oneshot::Receiver<box_runtime::HostExit>;
+
+/// Whether a box ends when its entrypoint returns (BOX-038): its spec sets
+/// `lifetime = "until_complete"`. A box with no stored spec reads as one,
+/// as a spec stored without `box.lifetime` does.
+pub(super) fn ends_with_entrypoint(spec: Option<&mfile::spec::BoxSpec>) -> bool {
+    spec.is_none_or(|spec| spec.lifetime == mfile::spec::Lifetime::UntilComplete)
+}
+
+/// Watches a host's runtime loop `task` for the box's actor. When the loop
+/// ends, the watch receives its [`box_runtime::HostExit`], and the actor
+/// decides from it whether the box ends.
+///
+/// This is the one way a box ends without a request (BOX-015, BOX-038):
+/// its entrypoint returns. Nothing here, or anywhere in the daemon, ends a
+/// box because it is idle or because its clients went away. A client that
+/// detaches or drops leaves the entrypoint running, and the loop with it.
+///
+/// The handle it returns stands in for `task`, as [`watch_quic443_exit`]'s
+/// does: it yields the loop's result, and an abort of it aborts the loop.
+pub(super) fn watch_entrypoint_exit(
+    task: JoinHandle<Result<box_runtime::HostExit, std::io::Error>>,
+    box_id: boxes::SessionId,
+) -> (
+    JoinHandle<Result<box_runtime::HostExit, std::io::Error>>,
+    EntrypointWatch,
+) {
+    let (watch_tx, watch) = tokio::sync::oneshot::channel();
+    let mut abort_loop = AbortLoopOnDrop(Some(task.abort_handle()));
+    let root = tracing::info_span!(
+        parent: None,
+        "session.host.entrypoint_exit",
+        box_id = %box_id,
+    );
+    let watched = crate::traced::spawn_detached(root, async move {
+        let result = task.await;
+        abort_loop.disarm();
+        if let Ok(Ok(exit)) = &result {
+            // The actor may be gone, or may hold a later launch's watch: the
+            // exit is then nobody's to act on.
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "an actor that dropped the watch has nothing to end"
+            )]
+            let _ = watch_tx.send(exit.clone());
+        }
+        match result {
+            Ok(result) => result,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => Err(std::io::Error::other(error)),
+        }
+    });
+    (watched, watch)
 }
 
 /// Where in the session lifecycle a host launch is happening, which decides
@@ -484,7 +541,7 @@ impl BoxActor {
     /// end of `Host::mainloop` can still run once the loop drains.
     pub(super) async fn kill_and_stop_loop(
         host: &box_runtime::HostHandle,
-        task: &mut JoinHandle<Result<i32, std::io::Error>>,
+        task: &mut JoinHandle<Result<box_runtime::HostExit, std::io::Error>>,
         for_shutdown: bool,
     ) {
         let killed = host.kill(for_shutdown).await.is_ok();
@@ -756,6 +813,19 @@ impl BoxActor {
         phase: LaunchPhase,
         for_hooks: bool,
     ) -> Result<(Option<Channel<Msg>>, LaunchedHost), AttachError> {
+        // BOX-013: a stop ended the box's processes and could not set its
+        // record to `stopped`. The record still says running, so no launch
+        // starts new processes in the box before the retried stop.
+        if let Some(ending) = self.unrecorded_stop {
+            tracing::warn!(
+                box_id = %self.record.id(),
+                ending = ?ending,
+                "launch refused: a stop ended the box and its record is not stopped yet"
+            );
+            return Err(AttachError::LaunchRecordUnwritable(std::io::Error::other(
+                "a stop ended this session's processes, and its stopped state is not saved yet",
+            )));
+        }
         // Taken first, so a confirmation never outlives the launch it was
         // read for, whichever way that launch ends.
         let rejoins_row = std::mem::take(&mut self.relaunch_row_confirmed) && !for_hooks;
@@ -781,8 +851,35 @@ impl BoxActor {
             record.id,
             &box_runtime::launch_deliveries(&record),
         );
+        // The box starts from its stored spec. The actor keeps its hold, so
+        // the next launch reads the same spec. A stored spec that cannot be
+        // read refuses the launch, as a resume of it is refused: the box's
+        // first process cannot be decided without it.
+        let spec = self.held_spec().await.map_err(|error| {
+            AttachError::SpawnFailed(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "{error} Destroy it with `min session destroy {name}`, then start a new \
+                     one with `min session activate`.",
+                    name = registry_name(&record),
+                ),
+            ))
+        })?;
+        // Interim: `run_by_exec` is `true` on every launch, so every launch,
+        // a hook launch and an attach included, starts the shell, and a task
+        // box does not start its spec's argv. `min task run` sends the task's
+        // run over the exec channel, so the shell keeps the task to one run.
+        // Flip condition: T43 (#2405) moves a task's run from the exec
+        // channel to the box's entrypoint, and removes this constant.
+        let spec = box_runtime::LaunchSpec {
+            spec,
+            run_by_exec: true,
+        };
+        // Read before the launcher takes the spec: the host hands it to each
+        // binding, which raises no shell-exit prompt for a box that ends.
+        let ends_with_entrypoint = ends_with_entrypoint(spec.spec.as_deref());
         let launcher = self
-            .session_launcher(session_hnd, &record, attach_env, phase, for_hooks)
+            .session_launcher(session_hnd, &record, spec, attach_env, phase, for_hooks)
             .await?;
         // Where the shell-exit prompt's save-then-delete lane archives the
         // changed files. Daemon-side and session-independent; created on
@@ -816,6 +913,17 @@ impl BoxActor {
                 .expect("hostname registry lock poisoned")
                 .mark_held_ports_bound(record.id)
         });
+        // NET-070: a resumed box stays `stopped` until its host's loop calls
+        // `mark_running`, and the launch can start its processes before that.
+        // The launch mark counts the box as live from here, so the hostname
+        // proxy looks up who owns a connection from the node's address.
+        // The launch number guards the stop mark: a host loop that this
+        // launch replaces cannot mark this launch's box stopped.
+        let host_launch = self
+            .hostnames
+            .write()
+            .expect("hostname registry lock poisoned")
+            .begin_host_launch(record.id);
         let spawn = Box::pin(box_runtime::Host::spawn(
             launcher,
             box_runtime::HostParams {
@@ -832,6 +940,7 @@ impl BoxActor {
                 // network registration is restored on its next attach or exec
                 // (NET-138).
                 holds_host_row: record.box_addresses.is_some(),
+                ends_with_entrypoint,
                 session_id: record.id,
                 // The host runs attach and detach itself: it owns the terminal
                 // they write to and the process whose namespaces they join.
@@ -845,6 +954,7 @@ impl BoxActor {
                 name_marker: Some(box_runtime::NameMarker::new(
                     Arc::clone(&self.hostnames),
                     record.id,
+                    host_launch,
                 )),
             },
         ));
@@ -857,6 +967,12 @@ impl BoxActor {
             None => (None, spawn.await),
         };
         let (host, task, host_ip_enforcement) = spawned.map_err(|e| {
+            // A failed spawn reaches no host loop, so nothing else ends the
+            // launch mark (NET-070).
+            self.hostnames
+                .write()
+                .expect("hostname registry lock poisoned")
+                .end_host_launch(record.id);
             AttachError::SpawnFailed(with_userns_hint(e, userns_spawn_hint().as_deref()))
         })?;
         // The confirmation was a read, not a reservation: the VM host daemon
@@ -945,6 +1061,10 @@ impl BoxActor {
             ),
             None => task,
         };
+        // BOX-038: the actor reads how this launch's loop ends. A later
+        // launch replaces the watch, so an earlier loop never ends the box.
+        let (task, watch) = watch_entrypoint_exit(task, record.id);
+        self.entrypoint_watch = Some(watch);
         // A write that fails costs only the restart's memory of who bound
         // the port, never this launch: said, and the box is handed back.
         #[cfg(target_os = "linux")]
@@ -1073,6 +1193,54 @@ impl BoxActor {
         Ok(())
     }
 
+    /// The spec stored beside this box's record, read by the first launch
+    /// and then held by the actor. `None` for a box filed with no spec: that
+    /// box starts its shell, as every box did before its spec named an
+    /// entrypoint.
+    ///
+    /// # Errors
+    ///
+    /// A stored spec this daemon cannot read, or a failed read of the store.
+    /// The launch is refused, and the error is not held.
+    pub(super) async fn held_spec(&mut self) -> std::io::Result<Option<Arc<mfile::spec::BoxSpec>>> {
+        if let Some(held) = &self.held_spec {
+            return Ok(held.clone());
+        }
+        let stored = match self.record.object().await {
+            Ok(object) => object.load_spec(),
+            Err(error) => Err(error),
+        };
+        // An error is not held: the next launch reads the store again.
+        let spec = match stored {
+            Ok(Some(bytes)) => match box_runtime::stored_spec(&bytes) {
+                Ok(spec) => Some(Arc::new(spec)),
+                Err(error) => {
+                    tracing::warn!(
+                        box_id = %self.record.id(),
+                        %error,
+                        "launch: the stored spec cannot be read; the launch is refused"
+                    );
+                    return Err(error);
+                }
+            },
+            // A box filed with no spec starts its shell.
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(
+                    box_id = %self.record.id(),
+                    %error,
+                    "launch: reading the stored spec failed; the launch is refused"
+                );
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    "The settings it was created with cannot be read.",
+                ));
+            }
+        };
+        self.held_spec = Some(spec.clone());
+        Ok(spec)
+    }
+
     /// Hands back this session's host, launching one if none is running.
     ///
     /// Unlike [`Self::attach`] there is no channel: the host is minted with
@@ -1097,6 +1265,29 @@ impl BoxActor {
                 .map_err(AttachError::LoadoutFailed)?;
             if record.status != BoxState::Active {
                 return Err(AttachError::SessionPending);
+            }
+            // An ended box is resumed only by an attach (BOX-025). A host
+            // launched here would run its entrypoint again behind the
+            // record's back.
+            if let Ok(
+                state @ (boxes::core::record::RecordState::Stopped(_)
+                | boxes::core::record::RecordState::Exited(_)),
+            ) = record.state()
+            {
+                return Err(AttachError::ResumeRefused(
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "box {} is {}. Only a running box can run a command.",
+                            record
+                                .name
+                                .clone()
+                                .unwrap_or_else(|| self.record.id().to_string()),
+                            state.name()
+                        ),
+                    ),
+                    2,
+                ));
             }
             // Attach's refusal, for the same reason: neither the host a
             // later launch left in the slot nor a fresh one would hold the
@@ -1384,6 +1575,348 @@ impl BoxActor {
     }
 }
 
+/// The daemon's grace period between a stop's SIGTERM and its SIGKILL
+/// (BOX-013). The daemon has no setting for it yet.
+pub(crate) const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How often a stop checks, inside its grace period, whether the box ended.
+const STOP_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The name of a signal a stop sends, for the log.
+fn stop_signal_name(signal: i32) -> &'static str {
+    match signal {
+        libc::SIGTERM => "SIGTERM",
+        libc::SIGKILL => "SIGKILL",
+        _ => "signal",
+    }
+}
+
+/// What a stop's signals did to the box (BOX-013).
+#[derive(Debug)]
+pub(crate) struct StopOutcome {
+    /// How the box ended, as its record stores it.
+    pub(crate) ending: boxes::core::record::StopEnding,
+    /// The signals the stop sent, in order.
+    pub(crate) sent: Vec<i32>,
+    /// The host's runtime loop, when it did not end inside
+    /// [`HOST_PROBE_TIMEOUT`] after the last signal. The caller stops it.
+    pub(crate) unfinished: Option<JoinHandle<Result<box_runtime::HostExit, std::io::Error>>>,
+}
+
+/// Sends a stop's signals to every process in the box (BOX-013), and reads
+/// how the entrypoint ended from the host loop `entrypoint`, which ends when
+/// the entrypoint does.
+///
+/// A graceful stop sends SIGTERM, waits up to `grace` for the box to have no
+/// process left, then sends SIGKILL to the processes still running. A forced
+/// stop sends SIGKILL at once. A graceful stop that finds `forced` set, at
+/// its start or in its grace period, ends the grace and sends SIGKILL at
+/// once: a forced stop sent meanwhile sets it. The ending stores the signal
+/// that the entrypoint ended after, unless the entrypoint exited with a
+/// status of its own. `processes` is `None` when the host did not name its
+/// container: the stop then signals nothing itself, and the caller's host
+/// kill ends the box.
+///
+/// In a real box the entrypoint is the init of the box's PID namespace. The
+/// kernel delivers SIGTERM from the daemon's namespace to that init only
+/// when the init has a handler for it. An entrypoint without a SIGTERM
+/// handler, such as a plain shell, keeps running through the grace period.
+/// The SIGKILL then ends it, and the ending stores SIGKILL. BOX-013 asks for
+/// that order: SIGTERM, the grace period, then SIGKILL to what still runs.
+pub(crate) async fn stop_box_processes(
+    box_id: boxes::SessionId,
+    processes: Option<box_runtime::BoxProcesses>,
+    mut entrypoint: JoinHandle<Result<box_runtime::HostExit, std::io::Error>>,
+    force: bool,
+    grace: std::time::Duration,
+    forced: &std::sync::atomic::AtomicBool,
+) -> StopOutcome {
+    use boxes::core::record::StopEnding;
+
+    let signal = |signal: i32| -> usize {
+        let reached = processes.map_or(0, |p| p.signal(signal));
+        tracing::info!(
+            box_id = %box_id,
+            signal = stop_signal_name(signal),
+            signal_number = signal,
+            processes = reached,
+            "stop: signalled every process in the box"
+        );
+        reached
+    };
+    let left = || processes.map_or(0, |p| p.pids().len());
+
+    // `Some(None)`: the entrypoint ended before the stop sent a signal.
+    // `Some(Some(s))`: it ended after the signal `s`.
+    let mut ended_after: Option<Option<i32>> = entrypoint.is_finished().then_some(None);
+    let mut sent = Vec::new();
+    let forced_now = || forced.load(std::sync::atomic::Ordering::SeqCst);
+    if force || forced_now() {
+        signal(libc::SIGKILL);
+        sent.push(libc::SIGKILL);
+    } else {
+        signal(libc::SIGTERM);
+        sent.push(libc::SIGTERM);
+        let deadline = tokio::time::Instant::now() + grace;
+        loop {
+            if ended_after.is_none() && entrypoint.is_finished() {
+                ended_after = Some(Some(libc::SIGTERM));
+            }
+            if ended_after.is_some() && left() == 0 {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            if forced_now() {
+                tracing::info!(
+                    box_id = %box_id,
+                    "stop: a forced stop arrived; the grace period ends now"
+                );
+                break;
+            }
+            tokio::time::sleep(STOP_POLL).await;
+        }
+        let still_running = left();
+        tracing::info!(
+            box_id = %box_id,
+            grace_ms = u64::try_from(grace.as_millis()).unwrap_or(u64::MAX),
+            entrypoint_ended = ended_after.is_some(),
+            still_running,
+            "stop: the grace period is over"
+        );
+        if ended_after.is_none() || still_running > 0 {
+            if ended_after.is_none() && entrypoint.is_finished() {
+                ended_after = Some(Some(libc::SIGTERM));
+            }
+            signal(libc::SIGKILL);
+            sent.push(libc::SIGKILL);
+        }
+    }
+
+    let last = sent.last().copied().unwrap_or(libc::SIGKILL);
+    let mut unfinished = None;
+    // The entrypoint's own exit status, from the reaped reason. The exit
+    // code alone cannot say it: `hakoniwa` reports 125 both for a signalled
+    // container and for an entrypoint that exits 125 itself.
+    let exit_status = match tokio::time::timeout(HOST_PROBE_TIMEOUT, &mut entrypoint).await {
+        Ok(Ok(Ok(exit))) => {
+            tracing::info!(
+                box_id = %box_id,
+                code = exit.code,
+                exit_code = exit.reason.as_ref().and_then(|r| r.exit_code),
+                reason = exit.reason.as_ref().map_or("", |r| r.reason.as_str()),
+                "stop: the host loop reaped the entrypoint"
+            );
+            exit.reason.and_then(|r| r.exit_code)
+        }
+        Ok(Ok(Err(error))) => {
+            tracing::warn!(box_id = %box_id, %error, "stop: the host loop ended on an error");
+            None
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(box_id = %box_id, %error, "stop: the host loop task failed");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                box_id = %box_id,
+                "stop: the host loop did not end after the last signal; the host is killed"
+            );
+            unfinished = Some(entrypoint);
+            None
+        }
+    };
+    let ending = match (ended_after.unwrap_or(Some(last)), exit_status) {
+        (_, Some(status)) => StopEnding::ExitedFirst { exit_code: status },
+        (Some(signal), None) => StopEnding::Signalled { signal },
+        // It ended before the stop, and no signal of this daemon ended it.
+        (None, _) => StopEnding::AtDaemonStart,
+    };
+    StopOutcome {
+        ending,
+        sent,
+        unfinished,
+    }
+}
+
+/// The `data` of the `exited` event a stop records (BOX-013): the reason,
+/// and the exit code or the signal the record stores.
+pub(crate) fn stopped_event_data(
+    ending: boxes::core::record::StopEnding,
+) -> boxes::events::EventData {
+    let state = boxes::core::record::RecordState::Stopped(ending);
+    let mut data = boxes::events::EventData::new();
+    data.insert("reason".to_string(), "stopped".into());
+    if let Some(code) = state.exit_code() {
+        data.insert("exit_code".to_string(), code.into());
+    }
+    if let Some(signal) = state.signal() {
+        data.insert("signal".to_string(), signal.into());
+    }
+    data
+}
+
+impl BoxActor {
+    /// Stops the box and keeps its record (BOX-013): signals every process
+    /// in it, tears its host down, sets the record to `stopped` with how the
+    /// entrypoint ended, and records an `exited` event. One `box.stop` span
+    /// covers the whole stop and carries the ending signal.
+    pub(super) async fn stop_box(
+        &mut self,
+        force: bool,
+        grace: std::time::Duration,
+    ) -> Result<boxes::core::record::StopEnding, std::io::Error> {
+        let box_id = *self.record.id();
+        let span = tracing::info_span!(
+            "box.stop",
+            box_id = %box_id,
+            force,
+            grace_ms = u64::try_from(grace.as_millis()).unwrap_or(u64::MAX),
+            ending_signal = tracing::field::Empty,
+            ending_exit_code = tracing::field::Empty,
+        );
+        let stopped =
+            tracing::Instrument::instrument(self.stop_box_inner(force, grace), span.clone()).await;
+        if let Ok(ending) = &stopped {
+            let state = boxes::core::record::RecordState::Stopped(*ending);
+            if let Some(signal) = state.signal() {
+                span.record("ending_signal", signal);
+            }
+            if let Some(code) = state.exit_code() {
+                span.record("ending_exit_code", code);
+            }
+        }
+        stopped
+    }
+
+    async fn stop_box_inner(
+        &mut self,
+        force: bool,
+        grace: std::time::Duration,
+    ) -> Result<boxes::core::record::StopEnding, std::io::Error> {
+        let box_id = *self.record.id();
+        tracing::info!(box_id = %box_id, force, "stop: requested");
+        let launched = match &mut self.inner {
+            BoxInner::Active { host, .. } => host.take(),
+            BoxInner::Draft { .. } => None,
+        };
+        self.publish_host();
+        let ending = match (self.unrecorded_stop, launched) {
+            // An earlier stop ended the processes and could not write the
+            // record. This one writes how they ended then. `launch_host`
+            // refuses while that ending is unrecorded, so no host is here.
+            (Some(ending), None) => {
+                tracing::info!(
+                    box_id = %box_id,
+                    ending = ?ending,
+                    "stop: the processes ended in an earlier stop; writing its record"
+                );
+                ending
+            }
+            // A host is in the slot: whether or not an earlier stop left an
+            // unrecorded ending, its processes run now. This stop signals
+            // them, and the record keeps how they ended.
+            (_, Some((host, task))) => {
+                let container_pid = probe_host(host.get_attrs())
+                    .await
+                    .and_then(|attrs| attrs.container_pid);
+                if container_pid.is_none() {
+                    tracing::warn!(
+                        box_id = %box_id,
+                        "stop: the host did not name its container; the host kill ends the box"
+                    );
+                }
+                let outcome = stop_box_processes(
+                    box_id,
+                    container_pid.map(box_runtime::BoxProcesses::of_container),
+                    task,
+                    force,
+                    grace,
+                    &self.weak_self.3,
+                )
+                .await;
+                tracing::info!(
+                    box_id = %box_id,
+                    signals = ?outcome
+                        .sent
+                        .iter()
+                        .map(|s| stop_signal_name(*s))
+                        .collect::<Vec<_>>(),
+                    ending = ?outcome.ending,
+                    "stop: the box's processes ended"
+                );
+                if let Some(mut task) = outcome.unfinished {
+                    Self::kill_and_stop_loop(&host, &mut task, false).await;
+                }
+                outcome.ending
+            }
+            (None, None) => {
+                tracing::info!(box_id = %box_id, "stop: the box has no process to signal");
+                boxes::core::record::StopEnding::AtDaemonStart
+            }
+        };
+        // The box is signalled: a forced stop that set the flag meanwhile
+        // has had its effect, and the next stop starts without it.
+        self.weak_self
+            .3
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        // The host is gone: this takes down what ran beside it, as every
+        // other stop does.
+        self.stop_running(false).await;
+
+        // The `stopped` record is the step a stop cannot skip. A failed
+        // read or write keeps the ending on the actor and returns the error,
+        // and the actor keeps hosting the box for a retried stop.
+        self.unrecorded_stop = Some(ending);
+        if let Err(error) = self.write_stopped_record(ending).await {
+            tracing::warn!(
+                box_id = %box_id,
+                %error,
+                "stop: the processes ended, but the record could not be set to stopped"
+            );
+            return Err(error);
+        }
+        self.unrecorded_stop = None;
+        let state = boxes::core::record::RecordState::Stopped(ending);
+        tracing::info!(
+            box_id = %box_id,
+            exit_code = state.exit_code(),
+            signal = state.signal(),
+            "stop: set the record to stopped"
+        );
+        // The record already says `stopped`, so a failed event write is
+        // logged and the stop still answers with its ending.
+        let event = match self.record.object().await {
+            Ok(object) => crate::box_manager::write_box_event(
+                &object,
+                boxes::events::BoxEventType::Exited,
+                stopped_event_data(ending),
+            )
+            .map(drop),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = event {
+            tracing::warn!(
+                box_id = %box_id,
+                %error,
+                "stop: the record is stopped, but its exited event could not be written"
+            );
+        }
+        Ok(ending)
+    }
+
+    /// Sets the box's record to `stopped` with `ending`.
+    async fn write_stopped_record(
+        &self,
+        ending: boxes::core::record::StopEnding,
+    ) -> Result<(), std::io::Error> {
+        let mut record = self.record.record().await?;
+        record.set_state(boxes::core::record::RecordState::Stopped(ending));
+        self.record.write(record).await
+    }
+}
+
 #[cfg(test)]
 mod quic443_cohort_tests {
     use super::{join_quic443_cohort, leave_quic443_cohort, quic443_placement_refused};
@@ -1407,12 +1940,16 @@ mod quic443_cohort_tests {
             box_addresses: None,
             hooks_enabled: true,
             status: boxes::BoxState::default(),
+            reason: None,
+            exit_code: None,
+            signal: None,
             host_ip_enforcement: Some(HostIpEnforcement::PerBox),
             box_id: None,
             host_row_bound: false,
             bound_ports: std::collections::BTreeSet::new(),
             sealed_deliveries: Vec::new(),
             root_certificate: None,
+            ends_with_run: false,
             box_type: None,
             parent: None,
             project_root: None,
@@ -1685,7 +2222,11 @@ mod quic443_cohort_tests {
             let task = crate::traced::spawn(async move {
                 let code = exited.await.unwrap_or(137);
                 assert!(code >= 0, "the host loop panics");
-                Ok(code)
+                Ok(crate::box_runtime::HostExit {
+                    code,
+                    reason: None,
+                    requested: false,
+                })
             });
             let watched = watch_quic443_exit(
                 task,
@@ -1711,7 +2252,7 @@ mod quic443_cohort_tests {
         // the shell's code, and the block lifts with no Stop.
         moves.kill(200);
         strict_exit.send(0).unwrap();
-        assert_eq!(strict_task.await.unwrap().unwrap(), 0);
+        assert_eq!(strict_task.await.unwrap().unwrap().code, 0);
         assert!(!cohort.lock().unwrap().blocked(), "the block lifted");
         assert_eq!(cohort.lock().unwrap().blocking_members().count(), 0);
         assert_eq!(moves.where_is(100), plain_leaf, "UDP 443 leaves again");

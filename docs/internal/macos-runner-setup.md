@@ -241,5 +241,6 @@ Mac. At the time of writing, these change what the Macs run:
   `brew tap` and `brew install` on whichever Mac takes it, so with this change
   every fleet Mac needs Homebrew. The job also leaves a Homebrew tap on the
   machine.
-- **The CI `e2e` waits for the KVM lane on pull requests:** fewer jobs reach
-  the Macs. Nothing to install.
+- **The CI `e2e` no longer waits for the KVM lane on pull requests:** the
+  fleet has more than one Mac now. The e2e starts when its build jobs finish,
+  so more jobs reach the Macs. Nothing to install.

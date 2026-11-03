@@ -71,9 +71,16 @@ The release artifacts redistribute two Apache-2.0 components, pinned in
   release links it statically into the `minvmd` binary
   (`scripts/build-libkrun-linux.sh`).
 - gvproxy v0.9.0 from gvisor-tap-vsock
-  (`vendor/gvproxy/gvproxy.lock`), the upstream pre-built binaries,
+  (`vendor/gvproxy/gvproxy.lock`), built from source with the patch in
+  `vendor/gvproxy/patches/` applied (`scripts/build-gvproxy.sh`),
   https://github.com/containers/gvisor-tap-vsock. Both the macOS
   (darwin/arm64) and the Linux (amd64, arm64) releases distribute it.
+  The patch
+  `0001-forwarder-unexpose-closes-accepted-connections.patch` changes
+  `pkg/services/forwarder/ports.go` and adds
+  `pkg/services/forwarder/unexpose_test.go`. Each of the two files
+  carries a notice at its top that says we changed it, as section 4(b)
+  of Apache-2.0 asks.
 
 Apache-2.0 redistribution requires us to keep the license and notices.
 The root `NOTICE` file attributes both components.

@@ -18,29 +18,29 @@ use chrono::{DateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::dash::filter;
-use crate::dash::rpc::{self, ProviderData};
+use crate::dash::rpc::{self, HostData};
 use crate::dash::state::{self, DashState};
 
 /// How often the session list refreshes.
 const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// How often the driver attempts to (re)connect missing providers, so a
+/// How often the driver attempts to (re)connect missing hosts, so a
 /// daemon restarted after startup rejoins the dashboard.
 const REDISCOVERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Identifies a session in the model: its provider's label plus its
+/// Identifies a session in the model: its host's label plus its
 /// daemon-assigned id. The label — not a list index — is the identity, so
-/// a provider dropping out of one refresh can't re-index every key onto
+/// a host dropping out of one refresh can't re-index every key onto
 /// the wrong daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SessionKey {
-    pub provider: String,
+    pub host: String,
     pub id: SessionId,
 }
 
-/// A provider group in the sidebar.
+/// A host group in the sidebar.
 #[derive(Debug, Clone)]
-pub struct ProviderView {
+pub struct HostView {
     pub label: String,
     pub version: String,
     pub collapsed: bool,
@@ -120,10 +120,10 @@ pub type ScreenFetch = Result<Option<minimald_rpc::ScreenSnapshot>, String>;
 pub enum Msg {
     Key(KeyEvent),
     Tick,
-    /// A refresh pass: every reachable provider's data, plus the labels of
-    /// providers whose connection failed mid-run.
+    /// A refresh pass: every reachable host's data, plus the labels of
+    /// hosts whose connection failed mid-run.
     Refreshed {
-        ok: Vec<ProviderData>,
+        ok: Vec<HostData>,
         failed: Vec<String>,
     },
     /// Detail-pane data for a session.
@@ -134,7 +134,7 @@ pub enum Msg {
     ActionDone(Result<String, String>),
     /// A create completed; the new session gets focused after the refresh.
     Created {
-        provider: String,
+        host: String,
         id: SessionId,
         /// What the tree upload did, for the status line.
         upload: crate::WorkspaceUpload,
@@ -179,14 +179,14 @@ enum CreateOutcome {
 /// Side effects [`update`] asks the driver to run.
 #[derive(Debug)]
 pub enum Effect {
-    /// Re-list every provider.
+    /// Re-list every host.
     Refresh,
     FetchDetail(SessionKey),
     FetchScreen(SessionKey),
     Destroy(SessionKey),
     Rename(SessionKey, String),
     Create {
-        provider: String,
+        host: String,
         name: Option<String>,
         path: String,
         network: NetworkMode,
@@ -208,7 +208,7 @@ pub enum Effect {
 /// One line in the flattened sidebar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Row {
-    ProviderHeader(usize),
+    HostHeader(usize),
     Session(SessionKey),
 }
 
@@ -216,7 +216,7 @@ pub enum Row {
 /// it, and neither talks to a daemon directly.
 #[derive(Debug)]
 pub struct Model {
-    pub providers: Vec<ProviderView>,
+    pub hosts: Vec<HostView>,
     /// Index into [`Model::visible_rows`].
     pub cursor: usize,
     /// Sidebar scroll offset (a row index), adjusted at render time to
@@ -262,7 +262,7 @@ pub struct FilterState {
 impl Model {
     pub fn new(now: DateTime<Utc>) -> Self {
         Self {
-            providers: Vec::new(),
+            hosts: Vec::new(),
             cursor: 0,
             scroll: 0,
             filter: FilterState::default(),
@@ -280,17 +280,17 @@ impl Model {
     }
 
     /// The flattened sidebar rows after collapsing and filtering, in render
-    /// order. Provider grouping is preserved under a filter; a provider with
+    /// order. Host grouping is preserved under a filter; a host with
     /// no matching sessions keeps its header (so the group structure stays
     /// visible while narrowing).
     pub fn visible_rows(&self) -> Vec<Row> {
         let mut rows = Vec::new();
-        for (p, provider) in self.providers.iter().enumerate() {
-            rows.push(Row::ProviderHeader(p));
-            if provider.collapsed {
+        for (p, host) in self.hosts.iter().enumerate() {
+            rows.push(Row::HostHeader(p));
+            if host.collapsed {
                 continue;
             }
-            let mut matched: Vec<_> = provider
+            let mut matched: Vec<_> = host
                 .sessions
                 .iter()
                 .filter_map(|entry| {
@@ -310,7 +310,7 @@ impl Model {
             }
             rows.extend(matched.into_iter().map(|(_, id)| {
                 Row::Session(SessionKey {
-                    provider: provider.label.clone(),
+                    host: host.label.clone(),
                     id,
                 })
             }));
@@ -333,9 +333,9 @@ impl Model {
 
     /// Look up a session's list entry by key.
     pub fn entry(&self, key: &SessionKey) -> Option<&minimald_rpc::ListSessionsEntry> {
-        self.providers
+        self.hosts
             .iter()
-            .find(|p| p.label == key.provider)?
+            .find(|p| p.label == key.host)?
             .sessions
             .iter()
             .find(|e| e.id == key.id)
@@ -352,7 +352,7 @@ impl Model {
 
     /// Clamp the cursor into the visible row range. When the filter narrows
     /// the list under the cursor, land on the first visible session row (a
-    /// provider header is a poor focus — it shows no detail pane).
+    /// host header is a poor focus — it shows no detail pane).
     pub fn clamp_cursor(&mut self) {
         let rows = self.visible_rows();
         if rows.is_empty() || self.cursor >= rows.len() {
@@ -415,11 +415,11 @@ impl Model {
         }
     }
 
-    /// The provider label + session id of the current focus, for the state
+    /// The host label + session id of the current focus, for the state
     /// file.
     fn focus_for_state(&self) -> Option<(String, SessionId)> {
         let key = self.focused()?;
-        Some((key.provider, key.id))
+        Some((key.host, key.id))
     }
 }
 
@@ -437,9 +437,9 @@ pub fn network_mode_label(mode: NetworkMode) -> &'static str {
     mode.word()
 }
 
-/// The canonical sidebar order for provider groups; unknown labels sort
+/// The canonical sidebar order for host groups; unknown labels sort
 /// last, alphabetically.
-fn provider_rank(label: &str) -> u8 {
+fn host_rank(label: &str) -> u8 {
     match label {
         "host" => 0,
         "vm" => 1,
@@ -463,26 +463,24 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
         }
         Msg::Refreshed { ok, failed } => {
             model.now = Utc::now();
-            // Upsert providers by label: one whose refresh failed keeps its
+            // Upsert hosts by label: one whose refresh failed keeps its
             // slot (marked unreachable, sessions cleared) instead of
             // dropping out and re-indexing every session key onto the wrong
             // daemon.
-            let focused_before = model.focused().map(|key| (key.provider.clone(), key.id));
-            let mut views: HashMap<String, ProviderView> = model
-                .providers
+            let focused_before = model.focused().map(|key| (key.host.clone(), key.id));
+            let mut views: HashMap<String, HostView> = model
+                .hosts
                 .drain(..)
                 .map(|v| (v.label.clone(), v))
                 .collect();
             for data in ok {
-                let view = views
-                    .entry(data.label.clone())
-                    .or_insert_with(|| ProviderView {
-                        label: data.label.clone(),
-                        version: String::new(),
-                        collapsed: false,
-                        reachable: true,
-                        sessions: Vec::new(),
-                    });
+                let view = views.entry(data.label.clone()).or_insert_with(|| HostView {
+                    label: data.label.clone(),
+                    version: String::new(),
+                    collapsed: false,
+                    reachable: true,
+                    sessions: Vec::new(),
+                });
                 view.version = data.version;
                 view.sessions = data.sessions;
                 view.reachable = true;
@@ -493,10 +491,10 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
                     view.sessions.clear();
                 }
             }
-            model.providers = views.into_values().collect();
-            model.providers.sort_by(|a, b| {
-                provider_rank(&a.label)
-                    .cmp(&provider_rank(&b.label))
+            model.hosts = views.into_values().collect();
+            model.hosts.sort_by(|a, b| {
+                host_rank(&a.label)
+                    .cmp(&host_rank(&b.label))
                     .then_with(|| a.label.cmp(&b.label))
             });
 
@@ -506,14 +504,14 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             // Restore the pending focus (startup's last-session memory, or a
             // freshly created session) if it still exists; otherwise keep
             // the previously focused session when it survives the refresh,
-            // else fall back to the first session row — row 0 is a provider
+            // else fall back to the first session row — row 0 is a host
             // header, where d/r are dead keys.
             let focus_target = model.pending_focus.take().or(focused_before);
             if let Some((label, id)) = focus_target {
                 let target = model.visible_rows().iter().position(|row| {
                     matches!(row, Row::Session(key)
                             if key.id == id
-                                && key.provider == label)
+                                && key.host == label)
                 });
                 model.cursor = target.unwrap_or_else(|| {
                     model
@@ -526,11 +524,11 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             model.clamp_cursor();
             // Keep detail/screen caches only for sessions that still exist.
             let live: std::collections::HashSet<SessionKey> = model
-                .providers
+                .hosts
                 .iter()
                 .flat_map(|pv| {
                     pv.sessions.iter().map(|e| SessionKey {
-                        provider: pv.label.clone(),
+                        host: pv.label.clone(),
                         id: e.id,
                     })
                 })
@@ -567,7 +565,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             vec![Effect::Refresh]
         }
         Msg::Created {
-            provider,
+            host,
             id,
             upload,
             package_check_skipped,
@@ -578,7 +576,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
                 package_check_skipped,
                 egress_deny_all_default,
             ));
-            model.pending_focus = Some((provider, id));
+            model.pending_focus = Some((host, id));
             vec![Effect::Refresh]
         }
         Msg::Key(key) => update_key(model, key),
@@ -683,9 +681,9 @@ fn update_key(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
             on_focus_change(model)
         }
         (KeyCode::Enter, _) => match model.cursor_row() {
-            Some(Row::ProviderHeader(p)) => {
-                if let Some(provider) = model.providers.get_mut(p) {
-                    provider.collapsed = !provider.collapsed;
+            Some(Row::HostHeader(p)) => {
+                if let Some(host) = model.hosts.get_mut(p) {
+                    host.collapsed = !host.collapsed;
                 }
                 model.clamp_cursor();
                 Vec::new()
@@ -875,33 +873,31 @@ fn update_modal(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
                     model.action = Some(Action::Create(form));
                 }
                 (KeyCode::Enter, CreateField::Network) => {
-                    // Create on the provider the user is pointing at: the
-                    // focused session's provider, or the provider whose
+                    // Create on the host the user is pointing at: the
+                    // focused session's host, or the host whose
                     // group header the cursor sits on.
                     let label = match model.cursor_row() {
-                        Some(Row::Session(key)) => Some(key.provider),
-                        Some(Row::ProviderHeader(p)) => {
-                            model.providers.get(p).map(|pv| pv.label.clone())
-                        }
+                        Some(Row::Session(key)) => Some(key.host),
+                        Some(Row::HostHeader(p)) => model.hosts.get(p).map(|pv| pv.label.clone()),
                         None => None,
                     };
-                    let Some(provider) = label else {
+                    let Some(host) = label else {
                         model.status = Some("no provider to create on".to_string());
                         model.action = Some(Action::Create(form));
                         return Vec::new();
                     };
                     if !model
-                        .providers
+                        .hosts
                         .iter()
-                        .any(|pv| pv.label == provider && pv.reachable)
+                        .any(|pv| pv.label == host && pv.reachable)
                     {
-                        model.status = Some(format!("error: provider '{provider}' is unreachable"));
+                        model.status = Some(format!("error: provider '{host}' is unreachable"));
                         model.action = Some(Action::Create(form));
                         return Vec::new();
                     }
                     model.action = None;
                     return vec![Effect::Create {
-                        provider,
+                        host,
                         name: match form.name.trim() {
                             "" => None,
                             n => Some(n.to_string()),
@@ -1063,7 +1059,7 @@ fn show_pending_confirm(model: &mut Model, pending: &mut VecDeque<PendingConfirm
     true
 }
 
-/// Entry point for `min dash`: discover providers, then drive the
+/// Entry point for `min dash`: discover hosts, then drive the
 /// Elm loop until the user quits.
 pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
     if !std::io::IsTerminal::is_terminal(&std::io::stdout())
@@ -1078,7 +1074,7 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
     // Gated before the terminal is taken over, so a skewed daemon refuses the
     // dashboard the same way it refuses `min ls` — plain message, terminal
     // untouched.
-    let mut providers = rpc::discover(opts.minimal_dir.as_deref()).await?;
+    let mut hosts = rpc::discover(opts.minimal_dir.as_deref()).await?;
     // The create task resolves each session's activation inputs through the
     // CLI's helper; it needs a `GlobalArgs` carrying the same directory
     // overrides the dashboard was launched with (the other fields do not
@@ -1184,8 +1180,7 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                 }
                 // Attach suspends the TUI around a blocking ssh child; it
                 // needs the terminal guard, so it can't live in exec_effect.
-                Effect::Attach(key) => match providers.iter_mut().find(|p| p.label == key.provider)
-                {
+                Effect::Attach(key) => match hosts.iter_mut().find(|p| p.label == key.host) {
                     Some(p) => {
                         let sock = p.sock.clone();
                         let box_name = model.entry(&key).and_then(|entry| entry.name.clone());
@@ -1234,18 +1229,18 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                     }
                     None => {
                         model.status =
-                            Some(format!("error: provider '{}' is unreachable", key.provider));
+                            Some(format!("error: provider '{}' is unreachable", key.host));
                     }
                 },
                 // Create runs the upload+compose flow on a background task
                 // with its own connection, so the UI keeps redrawing (the
                 // status line shows progress).
                 Effect::Create {
-                    provider,
+                    host,
                     name,
                     path,
                     network,
-                } => match providers.iter().find(|p| p.label == provider) {
+                } => match hosts.iter().find(|p| p.label == host) {
                     Some(p) => {
                         let sock = p.sock.clone();
                         let tx = bg_tx.clone();
@@ -1367,7 +1362,7 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                                     package_check_skipped,
                                     egress_deny_all_default,
                                 })) => Msg::Created {
-                                    provider,
+                                    host,
                                     id,
                                     upload,
                                     package_check_skipped,
@@ -1382,12 +1377,12 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
                         });
                     }
                     None => {
-                        model.status = Some(format!("error: provider '{provider}' is unreachable"));
+                        model.status = Some(format!("error: provider '{host}' is unreachable"));
                     }
                 },
                 other => {
                     if let Some(follow_up) = exec_effect(
-                        &mut providers,
+                        &mut hosts,
                         other,
                         opts.minimal_dir.as_deref(),
                         &mut last_rediscovery,
@@ -1418,13 +1413,13 @@ pub async fn run(opts: DashOptions) -> Result<(), anyhow::Error> {
 /// Persist the last-focused session. Called on quit and on explicit
 /// selection (Enter on a session row) rather than every key press.
 fn save_state(model: &Model, minimal_dir: Option<&std::path::Path>) {
-    let (provider, id) = match model.focus_for_state() {
+    let (host, id) = match model.focus_for_state() {
         Some(f) => f,
         None => return,
     };
     let state = DashState {
         last_session_id: Some(id.to_string()),
-        last_provider: Some(provider),
+        last_provider: Some(host),
     };
     if let Err(e) = state::save(minimal_dir, &state) {
         tracing::warn!(error = %e, "failed to write dash-state.json");
@@ -1434,7 +1429,7 @@ fn save_state(model: &Model, minimal_dir: Option<&std::path::Path>) {
 /// Execute one effect against the daemon connections, producing the
 /// follow-up message for [`update`].
 async fn exec_effect(
-    providers: &mut Vec<rpc::Provider>,
+    hosts: &mut Vec<rpc::Host>,
     effect: Effect,
     minimal_dir: Option<&std::path::Path>,
     last_rediscovery: &mut std::time::Instant,
@@ -1445,13 +1440,13 @@ async fn exec_effect(
             // join, throttled so a wedged acceptor can't stall the loop.
             if last_rediscovery.elapsed() >= REDISCOVERY_INTERVAL {
                 *last_rediscovery = std::time::Instant::now();
-                rpc::connect_missing(providers, minimal_dir).await;
+                rpc::connect_missing(hosts, minimal_dir).await;
             }
-            let mut ok = Vec::with_capacity(providers.len());
+            let mut ok = Vec::with_capacity(hosts.len());
             let mut failed = Vec::new();
             let mut i = 0;
-            while i < providers.len() {
-                match rpc::refresh(&mut providers[i]).await {
+            while i < hosts.len() {
+                match rpc::refresh(&mut hosts[i]).await {
                     Ok(d) => {
                         ok.push(d);
                         i += 1;
@@ -1459,9 +1454,9 @@ async fn exec_effect(
                     Err(e) => {
                         // A failed refresh means a dead connection: drop it
                         // so the rediscovery pass can rebuild it, and mark
-                        // the provider unreachable in the model rather than
+                        // the host unreachable in the model rather than
                         // re-indexing its sessions onto another daemon.
-                        let gone = providers.remove(i);
+                        let gone = hosts.remove(i);
                         tracing::warn!(provider = gone.label, error = %e, "refresh failed; dropping the connection");
                         failed.push(gone.label.to_string());
                     }
@@ -1470,8 +1465,8 @@ async fn exec_effect(
             Some(Msg::Refreshed { ok, failed })
         }
         Effect::FetchDetail(key) => {
-            let provider = providers.iter_mut().find(|p| p.label == key.provider)?;
-            match rpc::fetch_detail(provider, key.id).await {
+            let host = hosts.iter_mut().find(|p| p.label == key.host)?;
+            match rpc::fetch_detail(host, key.id).await {
                 Ok((record, policy)) => {
                     let (policy, policy_error) = match policy {
                         Ok(policy) => (Some(policy), None),
@@ -1493,29 +1488,29 @@ async fn exec_effect(
             }
         }
         Effect::FetchScreen(key) => {
-            let provider = providers.iter_mut().find(|p| p.label == key.provider)?;
-            let fetch = rpc::fetch_screen(provider, key.id)
+            let host = hosts.iter_mut().find(|p| p.label == key.host)?;
+            let fetch = rpc::fetch_screen(host, key.id)
                 .await
                 .map_err(|e| format!("{e:#}"));
             Some(Msg::ScreenLoaded(key, fetch))
         }
         Effect::Destroy(key) => {
-            let result = match providers.iter_mut().find(|p| p.label == key.provider) {
-                Some(provider) => rpc::destroy(provider, key.id)
+            let result = match hosts.iter_mut().find(|p| p.label == key.host) {
+                Some(host) => rpc::destroy(host, key.id)
                     .await
                     .map(|()| "session destroyed".to_string())
                     .map_err(|e| format!("{e:#}")),
-                None => Err(format!("provider '{}' is unreachable", key.provider)),
+                None => Err(format!("provider '{}' is unreachable", key.host)),
             };
             Some(Msg::ActionDone(result))
         }
         Effect::Rename(key, new_name) => {
-            let result = match providers.iter_mut().find(|p| p.label == key.provider) {
-                Some(provider) => rpc::rename(provider, key.id, &new_name)
+            let result = match hosts.iter_mut().find(|p| p.label == key.host) {
+                Some(host) => rpc::rename(host, key.id, &new_name)
                     .await
                     .map(|()| format!("renamed to {new_name}"))
                     .map_err(|e| format!("{e:#}")),
-                None => Err(format!("provider '{}' is unreachable", key.provider)),
+                None => Err(format!("provider '{}' is unreachable", key.host)),
             };
             Some(Msg::ActionDone(result))
         }
@@ -1660,15 +1655,15 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dash::rpc::ProviderData;
+    use crate::dash::rpc::HostData;
 
     fn id(n: u128) -> SessionId {
         SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012x}")).unwrap()
     }
 
-    fn skey(provider: &str, n: u128) -> SessionKey {
+    fn skey(host: &str, n: u128) -> SessionKey {
         SessionKey {
-            provider: provider.to_string(),
+            host: host.to_string(),
             id: id(n),
         }
     }
@@ -1690,15 +1685,15 @@ mod tests {
         }
     }
 
-    fn provider(label: &str, sessions: Vec<minimald_rpc::ListSessionsEntry>) -> ProviderData {
-        ProviderData {
+    fn host(label: &str, sessions: Vec<minimald_rpc::ListSessionsEntry>) -> HostData {
+        HostData {
             label: label.to_string(),
             version: "0.1".to_string(),
             sessions,
         }
     }
 
-    fn model_with(providers: Vec<ProviderData>) -> Model {
+    fn model_with(hosts: Vec<HostData>) -> Model {
         let now = DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z")
             .unwrap()
             .to_utc();
@@ -1706,7 +1701,7 @@ mod tests {
         update(
             &mut model,
             Msg::Refreshed {
-                ok: providers,
+                ok: hosts,
                 failed: Vec::new(),
             },
         );
@@ -1726,7 +1721,7 @@ mod tests {
         update(
             &mut model,
             Msg::Created {
-                provider: "host".to_string(),
+                host: "host".to_string(),
                 id: id(1),
                 upload: crate::WorkspaceUpload::Uploaded,
                 package_check_skipped: false,
@@ -1746,7 +1741,7 @@ mod tests {
         update(
             &mut model,
             Msg::Created {
-                provider: "host".to_string(),
+                host: "host".to_string(),
                 id: id(2),
                 upload: crate::WorkspaceUpload::Uploaded,
                 package_check_skipped: false,
@@ -1766,7 +1761,7 @@ mod tests {
             update(
                 &mut model,
                 Msg::Created {
-                    provider: "host".to_string(),
+                    host: "host".to_string(),
                     id: id(3),
                     upload,
                     package_check_skipped: false,
@@ -1796,16 +1791,16 @@ mod tests {
         );
     }
 
-    fn two_providers() -> Model {
+    fn two_hosts() -> Model {
         model_with(vec![
-            provider("host", vec![entry(1, Some("api-staging")), entry(2, None)]),
-            provider("vm", vec![entry_at(3, Some("bench"), "/src/bench")]),
+            host("host", vec![entry(1, Some("api-staging")), entry(2, None)]),
+            host("vm", vec![entry_at(3, Some("bench"), "/src/bench")]),
         ])
     }
 
     #[test]
     fn q_quits_and_saves_state() {
-        let mut model = two_providers();
+        let mut model = two_hosts();
         let effects = update(&mut model, key(KeyCode::Char('q')));
         assert!(model.quit);
         assert!(effects.iter().any(|e| matches!(e, Effect::SaveState)));
@@ -1813,7 +1808,7 @@ mod tests {
 
     #[test]
     fn arrow_keys_move_the_cursor_with_bounds() {
-        let mut model = two_providers();
+        let mut model = two_hosts();
         // Rows: host header, api-staging, (unnamed), vm header, bench.
         assert_eq!(model.cursor, 0);
         update(&mut model, key(KeyCode::Down));
@@ -1833,24 +1828,24 @@ mod tests {
 
     #[test]
     fn enter_on_a_header_toggles_collapse() {
-        let mut model = two_providers();
+        let mut model = two_hosts();
         update(&mut model, key(KeyCode::Enter));
-        assert!(model.providers[0].collapsed);
+        assert!(model.hosts[0].collapsed);
         // Collapsing hides the host's sessions from the row list.
         assert_eq!(model.visible_rows().len(), 3);
         update(&mut model, key(KeyCode::Enter));
-        assert!(!model.providers[0].collapsed);
+        assert!(!model.hosts[0].collapsed);
     }
 
     #[test]
     fn filter_narrows_and_esc_clears() {
-        let mut model = two_providers();
+        let mut model = two_hosts();
         update(&mut model, key(KeyCode::Char('/')));
         assert!(model.filter.editing);
         for c in "bench".chars() {
             update(&mut model, key(KeyCode::Char(c)));
         }
-        // Only the vm provider's "bench" session matches; headers stay.
+        // Only the vm host's "bench" session matches; headers stay.
         let rows = model.visible_rows();
         let sessions: Vec<_> = rows
             .iter()
@@ -1865,7 +1860,7 @@ mod tests {
 
     #[test]
     fn esc_clears_an_applied_filter_and_is_otherwise_a_no_op() {
-        let mut model = two_providers();
+        let mut model = two_hosts();
         // Apply a filter, then leave the editing mode (Enter keeps input).
         update(&mut model, key(KeyCode::Char('/')));
         for c in "bench".chars() {
@@ -1875,7 +1870,7 @@ mod tests {
         assert!(!model.filter.editing);
         assert_eq!(model.filter.input, "bench");
         // Focus "bench": the only session row left by the filter (both
-        // provider headers stay visible, so it sits at row 2).
+        // host headers stay visible, so it sits at row 2).
         update(&mut model, key(KeyCode::Down));
         update(&mut model, key(KeyCode::Down));
         assert_eq!(model.focused(), Some(skey("vm", 3)));
@@ -1899,14 +1894,14 @@ mod tests {
 
     #[test]
     fn cursor_clamps_to_first_visible_row_when_filtered_out() {
-        let mut model = two_providers();
+        let mut model = two_hosts();
         // Focus "bench" (last row).
         for _ in 0..4 {
             update(&mut model, key(KeyCode::Down));
         }
         assert_eq!(model.cursor, 4);
         // Filter it out: the cursor lands on the first visible session row
-        // (a provider header would show no detail pane).
+        // (a host header would show no detail pane).
         update(&mut model, key(KeyCode::Char('/')));
         for c in "api".chars() {
             update(&mut model, key(KeyCode::Char(c)));
@@ -1916,7 +1911,7 @@ mod tests {
 
     #[test]
     fn refresh_keeps_the_cursor_on_the_same_session() {
-        let mut model = two_providers();
+        let mut model = two_hosts();
         update(&mut model, key(KeyCode::Down));
         assert_eq!(model.focused().map(|k| k.id), Some(id(1)));
         // A refresh that inserts a new session above the focused one must
@@ -1925,7 +1920,7 @@ mod tests {
             &mut model,
             Msg::Refreshed {
                 ok: vec![
-                    provider(
+                    host(
                         "host",
                         vec![
                             entry(9, Some("new")),
@@ -1933,7 +1928,7 @@ mod tests {
                             entry(2, None),
                         ],
                     ),
-                    provider("vm", vec![entry(3, Some("bench"))]),
+                    host("vm", vec![entry(3, Some("bench"))]),
                 ],
                 failed: Vec::new(),
             },
@@ -1952,8 +1947,8 @@ mod tests {
             &mut model,
             Msg::Refreshed {
                 ok: vec![
-                    provider("host", vec![entry(1, Some("api-staging"))]),
-                    provider("vm", vec![entry(3, Some("bench"))]),
+                    host("host", vec![entry(1, Some("api-staging"))]),
+                    host("vm", vec![entry(3, Some("bench"))]),
                 ],
                 failed: Vec::new(),
             },
@@ -1971,18 +1966,18 @@ mod tests {
         update(
             &mut model,
             Msg::Refreshed {
-                ok: vec![provider("host", vec![entry(1, Some("api"))])],
+                ok: vec![host("host", vec![entry(1, Some("api"))])],
                 failed: Vec::new(),
             },
         );
-        // The fallback is the first session row, not row 0 (a provider
+        // The fallback is the first session row, not row 0 (a host
         // header, where d/r are dead keys).
         assert_eq!(model.focused(), Some(skey("host", 1)));
     }
 
     #[test]
     fn destroy_flow_prompts_then_effects() {
-        let mut model = two_providers();
+        let mut model = two_hosts();
         update(&mut model, key(KeyCode::Down));
         update(&mut model, key(KeyCode::Char('d')));
         assert!(matches!(
@@ -2005,7 +2000,7 @@ mod tests {
 
     #[test]
     fn rename_prefills_and_submits() {
-        let mut model = two_providers();
+        let mut model = two_hosts();
         update(&mut model, key(KeyCode::Down));
         update(&mut model, key(KeyCode::Char('r')));
         assert!(matches!(
@@ -2023,7 +2018,7 @@ mod tests {
 
     #[test]
     fn rename_with_unchanged_name_sends_nothing() {
-        let mut model = two_providers();
+        let mut model = two_hosts();
         update(&mut model, key(KeyCode::Down));
         update(&mut model, key(KeyCode::Char('r')));
         let effects = update(&mut model, key(KeyCode::Enter));
@@ -2036,7 +2031,7 @@ mod tests {
 
     #[test]
     fn create_form_submits_on_last_field() {
-        let mut model = two_providers();
+        let mut model = two_hosts();
         update(&mut model, key(KeyCode::Char('n')));
         assert!(matches!(model.action, Some(Action::Create(_))));
         update(&mut model, key(KeyCode::Enter)); // name -> path
@@ -2058,7 +2053,7 @@ mod tests {
     #[test]
     fn create_upload_confirm_answers_y_n_and_esc() {
         let answer = |code: KeyCode| {
-            let mut model = two_providers();
+            let mut model = two_hosts();
             model.action = Some(Action::ConfirmCreateUpload {
                 token: 7,
                 root: "/srv/data".to_string(),
@@ -2086,7 +2081,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
             KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
         ] {
-            let mut model = two_providers();
+            let mut model = two_hosts();
             model.action = Some(Action::ConfirmCreateUpload {
                 token: 7,
                 root: "/srv/data".to_string(),
@@ -2105,7 +2100,7 @@ mod tests {
     /// answered, so neither task's reply is dropped.
     #[test]
     fn pending_upload_confirms_queue_behind_an_open_modal() {
-        let mut model = two_providers();
+        let mut model = two_hosts();
         let (tx1, _rx1) = tokio::sync::oneshot::channel();
         let (tx2, _rx2) = tokio::sync::oneshot::channel();
         let mut pending = VecDeque::from([
@@ -2152,7 +2147,7 @@ mod tests {
             }),
             visual_bell: None,
         });
-        let mut model = model_with(vec![provider("host", vec![with_bell])]);
+        let mut model = model_with(vec![host("host", vec![with_bell])]);
         // Focus the session (row 1) — the bell was already in the attrs at
         // focus time, so it's acknowledged and doesn't light the indicator.
         update(&mut model, key(KeyCode::Down));
@@ -2161,7 +2156,7 @@ mod tests {
 
     #[test]
     fn focusing_fetches_detail_once() {
-        let mut model = two_providers();
+        let mut model = two_hosts();
         let effects = update(&mut model, key(KeyCode::Down));
         assert!(
             effects
@@ -2180,7 +2175,7 @@ mod tests {
 
     #[test]
     fn a_failed_policy_fetch_is_retried() {
-        let mut model = two_providers();
+        let mut model = two_hosts();
         update(&mut model, key(KeyCode::Down));
         // The policy fetch failed (an older daemon, a transient error): the
         // failure is shown but not cached as the session's answer.
@@ -2223,7 +2218,7 @@ mod tests {
             visual_bell: None,
         });
         // Refreshed overwrites `now` with the wall clock; pin it back.
-        let mut model = model_with(vec![provider("host", vec![hot])]);
+        let mut model = model_with(vec![host("host", vec![hot])]);
         model.now = now;
         assert_eq!(model.indicator(&skey("host", 1)), "◐");
     }
@@ -2241,19 +2236,19 @@ mod tests {
             audible_bell: None,
             visual_bell: None,
         });
-        let mut model = model_with(vec![provider("host", vec![waiting])]);
+        let mut model = model_with(vec![host("host", vec![waiting])]);
         model.now = now;
         assert_eq!(model.indicator(&skey("host", 1)), "○");
     }
 
     #[test]
     fn indicator_blank_when_idle() {
-        let model = two_providers();
+        let model = two_hosts();
         assert_eq!(model.indicator(&skey("host", 1)), "");
     }
     #[test]
     fn tick_fetches_the_focused_sessions_screen() {
-        let mut model = two_providers();
+        let mut model = two_hosts();
         update(&mut model, key(KeyCode::Down));
         let effects = update(&mut model, Msg::Tick);
         assert!(effects.iter().any(|e| matches!(e, Effect::Refresh)));
@@ -2268,7 +2263,7 @@ mod tests {
     /// reach the bare-key bindings.
     #[test]
     fn ctrl_chords_do_not_reach_the_bare_key_bindings() {
-        let mut model = two_providers();
+        let mut model = two_hosts();
         update(&mut model, key(KeyCode::Down));
         for code in [KeyCode::Char('d'), KeyCode::Char('r'), KeyCode::Char('n')] {
             let effects = update(
@@ -2286,39 +2281,39 @@ mod tests {
         assert!(model.quit);
     }
 
-    /// A failed refresh keeps the provider's slot (marked unreachable)
+    /// A failed refresh keeps the host's slot (marked unreachable)
     /// instead of dropping it and re-indexing every session key onto the
     /// surviving daemon.
     #[test]
-    fn a_failed_refresh_marks_the_provider_unreachable() {
-        let mut model = two_providers();
+    fn a_failed_refresh_marks_the_host_unreachable() {
+        let mut model = two_hosts();
         update(
             &mut model,
             Msg::Refreshed {
-                ok: vec![provider("host", vec![entry(1, Some("api-staging"))])],
+                ok: vec![host("host", vec![entry(1, Some("api-staging"))])],
                 failed: vec!["vm".to_string()],
             },
         );
         let vm = model
-            .providers
+            .hosts
             .iter()
             .find(|p| p.label == "vm")
             .expect("the vm slot must survive its failed refresh");
         assert!(!vm.reachable);
         assert!(vm.sessions.is_empty());
-        // The host's sessions still resolve to the host provider by label.
+        // The host's sessions still resolve to the `host` group by label.
         assert_eq!(model.entry(&skey("host", 1)).map(|e| e.id), Some(id(1)));
     }
 
-    /// A provider that comes back rejoins with its sessions and is marked
+    /// A host that comes back rejoins with its sessions and is marked
     /// reachable again.
     #[test]
-    fn a_reconnected_provider_rejoins() {
-        let mut model = two_providers();
+    fn a_reconnected_host_rejoins() {
+        let mut model = two_hosts();
         update(
             &mut model,
             Msg::Refreshed {
-                ok: vec![provider("host", vec![entry(1, Some("api-staging"))])],
+                ok: vec![host("host", vec![entry(1, Some("api-staging"))])],
                 failed: vec!["vm".to_string()],
             },
         );
@@ -2326,30 +2321,30 @@ mod tests {
             &mut model,
             Msg::Refreshed {
                 ok: vec![
-                    provider("host", vec![entry(1, Some("api-staging"))]),
-                    provider("vm", vec![entry(3, Some("bench"))]),
+                    host("host", vec![entry(1, Some("api-staging"))]),
+                    host("vm", vec![entry(3, Some("bench"))]),
                 ],
                 failed: Vec::new(),
             },
         );
-        let vm = model.providers.iter().find(|p| p.label == "vm").unwrap();
+        let vm = model.hosts.iter().find(|p| p.label == "vm").unwrap();
         assert!(vm.reachable);
         assert_eq!(model.entry(&skey("vm", 3)).map(|e| e.id), Some(id(3)));
         // Canonical group order is preserved after the rejoin.
-        let labels: Vec<&str> = model.providers.iter().map(|p| p.label.as_str()).collect();
+        let labels: Vec<&str> = model.hosts.iter().map(|p| p.label.as_str()).collect();
         assert_eq!(labels, ["host", "vm"]);
     }
 
-    /// Opening the create form from a provider's group header targets THAT
-    /// provider, not the first one in the list.
+    /// Opening the create form from a host's group header targets THAT
+    /// host, not the first one in the list.
     #[test]
-    fn create_from_a_provider_header_targets_that_provider() {
-        let mut model = two_providers();
+    fn create_from_a_host_header_targets_that_host() {
+        let mut model = two_hosts();
         // Rows: host header, api-staging, (unnamed), vm header, bench.
         for _ in 0..3 {
             update(&mut model, key(KeyCode::Down));
         }
-        assert!(matches!(model.cursor_row(), Some(Row::ProviderHeader(1))));
+        assert!(matches!(model.cursor_row(), Some(Row::HostHeader(1))));
         update(&mut model, key(KeyCode::Char('n')));
         update(&mut model, key(KeyCode::Enter)); // name -> path
         update(&mut model, key(KeyCode::Enter)); // path -> network
@@ -2357,20 +2352,20 @@ mod tests {
         assert!(
             effects
                 .iter()
-                .any(|e| matches!(e, Effect::Create { provider, .. } if provider == "vm")),
+                .any(|e| matches!(e, Effect::Create { host, .. } if host == "vm")),
             "expected a create targeted at vm, got {effects:?}"
         );
     }
 
-    /// Creating on a provider marked unreachable fails loudly instead of
+    /// Creating on a host marked unreachable fails loudly instead of
     /// silently targeting another daemon.
     #[test]
-    fn create_on_an_unreachable_provider_errors() {
-        let mut model = two_providers();
+    fn create_on_an_unreachable_host_errors() {
+        let mut model = two_hosts();
         update(
             &mut model,
             Msg::Refreshed {
-                ok: vec![provider("host", vec![entry(1, Some("api-staging"))])],
+                ok: vec![host("host", vec![entry(1, Some("api-staging"))])],
                 failed: vec!["vm".to_string()],
             },
         );
@@ -2378,7 +2373,7 @@ mod tests {
         for _ in 0..2 {
             update(&mut model, key(KeyCode::Down));
         }
-        assert!(matches!(model.cursor_row(), Some(Row::ProviderHeader(_))));
+        assert!(matches!(model.cursor_row(), Some(Row::HostHeader(_))));
         update(&mut model, key(KeyCode::Char('n')));
         update(&mut model, key(KeyCode::Enter));
         update(&mut model, key(KeyCode::Enter));

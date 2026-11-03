@@ -249,6 +249,17 @@ impl HostHandle {
         (Self { sender }, WedgedMailbox(receiver))
     }
 
+    /// Resolves once the host's runtime loop has dropped its mailbox, so a
+    /// send from here on finds the channel closed.
+    ///
+    /// Awaiting an aborted loop task is not always enough for that: the
+    /// task a caller holds can be a watcher that stands in for the loop
+    /// (`box_actor`'s `watch_quic443_exit`), and aborting the watcher only
+    /// asks the loop to abort.
+    pub(crate) async fn closed(&self) {
+        self.sender.closed().await;
+    }
+
     /// A handle to a host that answers every attrs probe at once (with
     /// default attrs) and ignores everything else: a live host, as far as a
     /// listing can tell.
@@ -551,4 +562,9 @@ pub struct HostAttrs {
     /// launch. Nothing for a none box or an own-IP box, whose verdicts are
     /// decided on address leases rather than the host's cgroup tree.
     pub(crate) host_ip_enforcement: Option<HostIpEnforcement>,
+
+    /// The pid of the box's container supervisor, which a stop signals the
+    /// box's processes from (BOX-013). `None` only for attrs no host
+    /// reported.
+    pub(crate) container_pid: Option<u32>,
 }

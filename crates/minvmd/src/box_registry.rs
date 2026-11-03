@@ -998,13 +998,16 @@ pub struct ClientBoxSpec {
 /// new registration takes its name; a row withdrawn at the end of its
 /// detach grace or its resume bound leaves the creation **dormant**
 /// (`standing: false`) for its creator to resume
-/// ([`BoxRegistry::resume_client_box`]). A creation, standing or dormant,
+/// ([`BoxRegistry::resume_client_box`]). A new registration under a
+/// dormant creation's name takes the name (BOX-004) and leaves the dormant
+/// creation **superseded** ([`Creations`]): still kept, still resumable by
+/// its box id once no live row holds the name. A creation, standing or dormant,
 /// keeps its addresses reserved: its switch and task addresses stay out of
 /// the hand-out book — taken again from a fresh book at reload — and its
 /// published loopback address stays the answerer's
 /// link for its name, so a resume finds every address its box was created
-/// with. Its creator's withdrawal releases them all. There is at most one
-/// creation per box name.
+/// with. Its creator's withdrawal releases them all. At most one creation
+/// per box name is the name's own; the others under it are superseded.
 ///
 /// The file format: one JSON object per creation in
 /// [`RegistryFile::boxes`], its fields named as here.
@@ -1068,8 +1071,51 @@ impl Creation {
     }
 }
 
+/// The client boxes' creations ([`Creation`]) a registry keeps. Each name
+/// has at most one creation of its own, keyed by the name's
+/// [`canonical_box_name`] form: the map this derefs to. `superseded`
+/// holds the dormant creations whose name a newer registration took
+/// (BOX-004). Each keeps its addresses and its box id, so its creator can
+/// resume it by that id once no live row holds the name, or withdraw it.
+#[derive(Debug, Default)]
+struct Creations {
+    by_name: BTreeMap<String, Creation>,
+    superseded: Vec<Creation>,
+}
+
+impl Creations {
+    /// Every kept creation: each name's own, then the superseded ones.
+    fn all(&self) -> impl Iterator<Item = &Creation> {
+        self.by_name.values().chain(self.superseded.iter())
+    }
+
+    /// Whether any kept creation, superseded ones included, is under the
+    /// name whose canonical form is `key`.
+    fn holds_name(&self, key: &str) -> bool {
+        self.by_name.contains_key(key)
+            || self
+                .superseded
+                .iter()
+                .any(|creation| canonical_box_name(&creation.name) == key)
+    }
+}
+
+impl std::ops::Deref for Creations {
+    type Target = BTreeMap<String, Creation>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.by_name
+    }
+}
+
+impl std::ops::DerefMut for Creations {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.by_name
+    }
+}
+
 /// The persisted registry ([`REGISTRY_FILE`]): its format version, then
-/// every creation the registry keeps.
+/// every creation the registry keeps, superseded ones included.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RegistryFile {
@@ -1154,6 +1200,53 @@ fn read_registry_file(path: &std::path::Path) -> Option<Vec<Creation>> {
         Ok(file) => Some(file.boxes),
         Err(error) => set_aside_registry_file(path, &error.to_string()),
     }
+}
+
+/// One box a VM's persisted registry ([`REGISTRY_FILE`]) holds: its name
+/// and its box id, as [`persisted_box_names`] reads them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedBox {
+    /// The box's name, as its creator registered it.
+    pub name: String,
+    /// The box's id.
+    pub id: minimald_rpc::BoxId,
+}
+
+/// Reads the boxes a VM's state dir `state_dir` holds in its persisted
+/// registry ([`REGISTRY_FILE`]), each one's name and id, with no daemon
+/// running: what the CLI reads for a stopped VM (NET-148, NET-152).
+///
+/// Read-only, unlike [`read_registry_file`]: a file that is missing, that
+/// cannot be read, that does not parse, or that is of another version than
+/// [`REGISTRY_FILE_VERSION`] reads as no boxes, and it is never written,
+/// renamed or set aside. The daemon that owns the file decides what to do
+/// with it on its next start. Each box id is listed once, in file order.
+#[must_use]
+pub fn persisted_box_names(state_dir: &std::path::Path) -> Vec<PersistedBox> {
+    #[derive(serde::Deserialize)]
+    struct Version {
+        version: u32,
+    }
+    let path = state_dir.join(REGISTRY_FILE);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Vec::new();
+    };
+    match serde_json_lenient::from_slice::<Version>(&bytes) {
+        Ok(Version { version }) if version == REGISTRY_FILE_VERSION => {}
+        _ => return Vec::new(),
+    }
+    let Ok(file) = serde_json_lenient::from_slice::<RegistryFile>(&bytes) else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::new();
+    file.boxes
+        .into_iter()
+        .filter(|creation| seen.insert(creation.box_id))
+        .map(|creation| PersistedBox {
+            name: creation.name,
+            id: creation.box_id,
+        })
+        .collect()
 }
 
 /// Renames the unusable registry file at `path` aside, to the same name
@@ -1729,8 +1822,7 @@ impl Drop for RegistrationClaim {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ResumeError {
     /// The registry keeps no creation under the name: the box was never
-    /// registered on this host, its creator withdrew it, or a newer
-    /// registration took the name.
+    /// registered on this host, or its creator withdrew it.
     #[error("no box {name:?} is registered on this host to resume")]
     NoCreation {
         /// The name the resume presented.
@@ -2818,6 +2910,11 @@ pub struct BoxRegistry {
     /// frees only that session's hold, never a newer session's under the
     /// same name.
     held_names: Arc<RwLock<BTreeMap<String, Option<boxes::SessionId>>>>,
+    /// The resident `host_ip` boxes' compiled egress, by session
+    /// ([`Self::admit_host_ip_box`], NET-085), shared by every clone and
+    /// every [`BoxTable`]: the union the gate decides a box-marked frame
+    /// from the node address by.
+    host_ip_boxes: Arc<RwLock<HostIpBoxes>>,
     /// The held names reloaded from [`HELD_NAMES_FILE`] that no hold has
     /// re-made since, each with when it was reloaded: dropped once
     /// [`HELD_NAME_RECONFIRM_BOUND`] has passed
@@ -2913,7 +3010,7 @@ pub struct BoxRegistry {
     /// inside the row lock when both are held — a creation is inserted,
     /// ended, and marked dormant under the same write of the row lock
     /// that publishes or removes its row — and never the other way round.
-    creations: Arc<Mutex<BTreeMap<String, Creation>>>,
+    creations: Arc<Mutex<Creations>>,
     /// Where the creations are persisted ([`Self::persisting_to`]), when
     /// this registry persists at all: the supervisor's does, in its VM's
     /// state dir; a test's need not.
@@ -2932,7 +3029,18 @@ pub struct BoxRegistry {
     /// sets `None`, and only the daemon's start path sets the socket
     /// ([`Self::with_proxy_control`]).
     proxy_control: Option<Arc<std::path::PathBuf>>,
+    /// The node row's mirrored binds for the host-address boxes
+    /// ([`NodeMirror`], NET-138), shared by every clone.
+    node_mirror: Arc<NodeMirror>,
+    /// The running egress gate's publish ledger, as the node mirror's
+    /// binder notes its binds in it ([`BoxTable::attach_mirror_ledger`]).
+    /// `None` until a gate starts. Shared by every clone and every table.
+    mirror_ledger: MirrorLedgerSlot,
 }
+
+/// Where the running egress gate leaves its ledger for the node mirror's
+/// binder ([`crate::net::egress_gate::MirrorLedger`]).
+pub(crate) type MirrorLedgerSlot = Arc<RwLock<Option<crate::net::egress_gate::MirrorLedger>>>;
 
 /// The Box Egress Proxy's control socket, under the home directory.
 const PROXY_CONTROL_SOCKET: &str = ".minimal/bep/control.sock";
@@ -3173,7 +3281,7 @@ impl BoxRegistry {
             .collect();
         ids.extend(
             self.creations()
-                .values()
+                .all()
                 .map(|creation| box_id_hex(creation.id())),
         );
         ids.into_iter().collect()
@@ -3289,6 +3397,7 @@ impl Clone for BoxRegistry {
             rows: self.rows.clone(),
             stopped: Arc::clone(&self.stopped),
             held_names: Arc::clone(&self.held_names),
+            host_ip_boxes: Arc::clone(&self.host_ip_boxes),
             unconfirmed_holds: Arc::clone(&self.unconfirmed_holds),
             table_pings: Arc::clone(&self.table_pings),
             withdrawal_reports: self.withdrawal_reports.clone(),
@@ -3312,6 +3421,8 @@ impl Clone for BoxRegistry {
             persist_turn: Arc::clone(&self.persist_turn),
             row_epoch: Arc::clone(&self.row_epoch),
             proxy_control: self.proxy_control.clone(),
+            node_mirror: Arc::clone(&self.node_mirror),
+            mirror_ledger: Arc::clone(&self.mirror_ledger),
         }
     }
 }
@@ -3330,6 +3441,7 @@ impl BoxRegistry {
             rows: Arc::new(RwLock::new(BTreeMap::new())),
             stopped: Arc::new(RwLock::new(BTreeSet::new())),
             held_names: Arc::new(RwLock::new(BTreeMap::new())),
+            host_ip_boxes: Arc::new(RwLock::new(HostIpBoxes::default())),
             unconfirmed_holds: Arc::new(Mutex::new(BTreeMap::new())),
             table_pings: Arc::new(Mutex::new(Vec::new())),
             withdrawal_reports: reports,
@@ -3351,11 +3463,13 @@ impl BoxRegistry {
             egress_default_phase: crate::net::egress_gate::UNREGISTERED_SOURCE_PHASE
                 .into_sessions_phase(),
             egress_deny_all_opt_out: false,
-            creations: Arc::new(Mutex::new(BTreeMap::new())),
+            creations: Arc::new(Mutex::new(Creations::default())),
             persisted_at: None,
             persist_turn: Arc::new(Mutex::new(())),
             row_epoch: Arc::new(AtomicU64::new(0)),
             proxy_control: None,
+            node_mirror: Arc::new(NodeMirror::new(subnet.daemon_ip())),
+            mirror_ledger: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -3475,7 +3589,7 @@ impl BoxRegistry {
         let others_in_flight = generations
             .get(key)
             .map_or(0, |entry| entry.in_flight.saturating_sub(own));
-        if row_holds || others_in_flight > 0 || self.creations().contains_key(key) {
+        if row_holds || others_in_flight > 0 || self.creations().holds_name(key) {
             return false;
         }
         release();
@@ -3583,10 +3697,14 @@ impl BoxRegistry {
         loaded.sort_by_key(|creation| !creation.standing);
         for mut creation in loaded {
             let key = canonical_box_name(&creation.name);
-            if self.creations().contains_key(&key) {
+            // A second creation under a name is a superseded one (BOX-004)
+            // when it is dormant: it is kept, resumable by its box id. Two
+            // standing creations under one name cannot both have a row.
+            let superseded = self.creations().contains_key(&key);
+            if superseded && creation.standing {
                 tracing::warn!(
                     box = %creation.name,
-                    "the persisted box registry names a box twice; reloading the first only"
+                    "the persisted box registry names a running box twice; reloading the first only"
                 );
                 continue;
             }
@@ -3596,7 +3714,13 @@ impl BoxRegistry {
             // moment or an older run — would put two boxes at it, and the
             // one that resumes second would find its address held by the
             // first, as a duplicate switch address would.
-            if let Some(holder) = held_loopbacks.get(&creation.loopback_address) {
+            // A superseded creation can share its loopback address with the
+            // creation that took its name: the answerer keys that address by
+            // the name, and only one of them can have a row at a time.
+            if let Some(holder) = held_loopbacks
+                .get(&creation.loopback_address)
+                .filter(|holder: &&String| canonical_box_name(holder) != key)
+            {
                 tracing::warn!(
                     box = %creation.name,
                     held = %holder,
@@ -3617,10 +3741,16 @@ impl BoxRegistry {
                 );
                 continue;
             }
+            held_loopbacks
+                .entry(creation.loopback_address)
+                .or_insert_with(|| creation.name.clone());
+            if superseded {
+                self.creations().superseded.push(creation);
+                continue;
+            }
             if creation.standing {
                 creation.standing = self.reinstate(&creation, now);
             }
-            held_loopbacks.insert(creation.loopback_address, creation.name.clone());
             self.creations().insert(key, creation);
         }
         self.persist();
@@ -3692,7 +3822,7 @@ impl BoxRegistry {
         }
     }
 
-    fn creations(&self) -> MutexGuard<'_, BTreeMap<String, Creation>> {
+    fn creations(&self) -> MutexGuard<'_, Creations> {
         self.creations
             .lock()
             .expect("the creations' lock is never held across a panic")
@@ -3708,7 +3838,7 @@ impl BoxRegistry {
     #[must_use]
     pub fn dormant_creation_rows(&self) -> Vec<(String, Ipv4Addr)> {
         self.creations()
-            .values()
+            .all()
             .filter(|creation| !creation.standing)
             .map(|creation| (zone_name(&creation.name), creation.loopback_address))
             .collect()
@@ -3728,7 +3858,7 @@ impl BoxRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let file = RegistryFile {
             version: REGISTRY_FILE_VERSION,
-            boxes: self.creations().values().cloned().collect(),
+            boxes: self.creations().all().cloned().collect(),
         };
         if let Err(error) = write_registry_file(path, &file) {
             tracing::warn!(
@@ -4135,11 +4265,32 @@ impl BoxRegistry {
         // new epoch finds them ([`BoxTable::carry`]).
         self.row_epoch.fetch_add(1, Ordering::Release);
         let created = creation.is_some();
-        if let Some(creation) = creation {
-            self.creations()
-                .insert(canonical_box_name(&creation.name), creation);
-        }
+        // BOX-004: a registration under a dormant creation's name takes the
+        // name over. The creation it replaces is superseded, not ended: it
+        // keeps its addresses and its id, so its creator can resume it by
+        // that id once no live row holds the name. A superseded creation
+        // that resumes is the name's own again.
+        let replaced = creation.and_then(|creation| {
+            let id = creation.id();
+            let mut creations = self.creations();
+            creations.superseded.retain(|kept| kept.id() != id);
+            let old = creations
+                .insert(canonical_box_name(&creation.name), creation)
+                .filter(|old| old.id() != id && !old.standing)?;
+            let replaced = (old.name.clone(), old.id());
+            creations.superseded.push(old);
+            Some(replaced)
+        });
         drop(rows);
+        if let Some((name, old_id)) = &replaced {
+            tracing::info!(
+                box = %name,
+                replaced = %crate::bep_attach::BoxIdText(old_id),
+                by = %crate::bep_attach::BoxIdText(&record.box_id()),
+                "a new box took over a stopped box's name; the stopped box keeps its creation \
+                 and its addresses, and resumes by its box id once no running box holds the name"
+            );
+        }
         if created {
             self.persist();
         }
@@ -4282,6 +4433,14 @@ impl BoxRegistry {
         }
         if rowless {
             self.persist();
+        }
+        // The node's own row ended, by any path that removes it: its
+        // mirrored binds end with it (NET-138's node end).
+        if removed
+            .as_deref()
+            .is_some_and(|record| record.name() == NODE_NAMESPACE && !record.is_task_row())
+        {
+            self.node_mirror.end_node();
         }
         removed
     }
@@ -4641,11 +4800,7 @@ impl BoxRegistry {
             return Ok(Some(IdHolder::LiveRow));
         }
         drop(rows);
-        if self
-            .creations()
-            .values()
-            .any(|creation| creation.id() == id)
-        {
+        if self.creations().all().any(|creation| creation.id() == id) {
             return Ok(Some(IdHolder::KeptCreation));
         }
         if self
@@ -4696,30 +4851,24 @@ impl BoxRegistry {
         }
     }
 
-    /// The name a live row or a kept creation holds that `name` folds to,
-    /// in its own spelling, or `None` when none folds to it. The answerer
-    /// allocates a published address by the name's canonical form
-    /// ([`canonical_box_name`]), so two live rows
-    /// under folded-equal names would share one address; this is the check
-    /// that keeps the live set one row per folded name. A dormant creation
-    /// holds its name too ([`Creation`]): its creator may still resume it,
-    /// and a registration under the name would replace it.
+    /// The name a live row holds that `name` folds to, in its own
+    /// spelling, or `None` when none folds to it. The answerer allocates a
+    /// published address by the name's canonical form
+    /// ([`canonical_box_name`]), so two live rows under folded-equal names
+    /// would share one address; this is the check that keeps the live set
+    /// one row per folded name. A dormant creation holds no name (BOX-004):
+    /// its box stopped, and a registration under the name takes the name
+    /// over ([`Self::try_register`]). The replaced creation is superseded,
+    /// not ended: it keeps its addresses and its box id, so its box can
+    /// still resume once no live row holds the name.
     fn held_name_for(&self, name: &str) -> Option<String> {
         let asked = canonical_box_name(name);
-        let rows = self
-            .rows
+        self.rows
             .read()
-            .expect("the row lock is never held across a panic, so it cannot be poisoned");
-        let live = rows
+            .expect("the row lock is never held across a panic, so it cannot be poisoned")
             .values()
             .find(|record| canonical_box_name(record.name()) == asked)
-            .map(|record| record.name().to_string());
-        drop(rows);
-        live.or_else(|| {
-            self.creations()
-                .get(&asked)
-                .map(|creation| creation.name.clone())
-        })
+            .map(|record| record.name().to_string())
     }
 
     /// Withdraws the client box's row when the pair `(name, switch_addr,
@@ -4793,13 +4942,25 @@ impl BoxRegistry {
             let ended = {
                 let mut creations = self.creations();
                 let key = canonical_box_name(name);
-                let proven = creations.get(&key).is_some_and(|creation| {
+                let proves = |creation: &Creation| {
                     !creation.standing
                         && creation.switch_address == switch_addr
                         && creation.loopback_address == loopback_addr
                         && box_id.is_none_or(|asked| asked == creation.id())
-                });
-                if proven { creations.remove(&key) } else { None }
+                };
+                if creations.get(&key).is_some_and(proves) {
+                    creations.remove(&key)
+                } else {
+                    // A superseded creation (BOX-004) ends the same way:
+                    // its creator destroyed the stopped box.
+                    creations
+                        .superseded
+                        .iter()
+                        .position(|creation| {
+                            canonical_box_name(&creation.name) == key && proves(creation)
+                        })
+                        .map(|at| creations.superseded.remove(at))
+                }
             };
             drop(rows);
             // Its addresses were reserved for it while it was dormant; they
@@ -4896,9 +5057,15 @@ impl BoxRegistry {
     ) -> Result<Creation, ResumeError> {
         let creations = self.creations();
         let creation = box_id
-            .and_then(|asked| creations.values().find(|creation| creation.id() == asked))
+            .and_then(|asked| creations.all().find(|creation| creation.id() == asked))
             .or_else(|| creations.get(&canonical_box_name(name)))
             .cloned();
+        let superseded = creation.as_ref().is_some_and(|creation| {
+            creations
+                .superseded
+                .iter()
+                .any(|kept| kept.id() == creation.id())
+        });
         drop(creations);
         let Some(creation) = creation else {
             return Err(ResumeError::NoCreation {
@@ -4920,6 +5087,17 @@ impl BoxRegistry {
                 held_box_id: creation.id(),
                 asked_box_id: asked,
             });
+        }
+        // BOX-004: a superseded creation's name went to a newer box. Its
+        // box resumes only while no live row holds the name; a resume
+        // now would put two running boxes under one name.
+        if superseded && let Some(held) = self.held_name_for(&creation.name) {
+            tracing::info!(
+                box = %creation.name,
+                box_id = %crate::bep_attach::BoxIdText(&creation.id()),
+                "refused the resume of a stopped box: a running box holds its name"
+            );
+            return Err(AllocationError::NameAlreadyHeld { held }.into());
         }
         Ok(creation)
     }
@@ -5847,14 +6025,1114 @@ impl BoxRegistry {
     pub fn table(&self) -> BoxTable {
         BoxTable {
             rows: Arc::clone(&self.rows),
+            host_ip_boxes: Arc::clone(&self.host_ip_boxes),
             subnet: self.subnet,
             withdrawal_reports: self.withdrawal_reports.clone(),
             row_withdrawals: Arc::clone(&self.row_withdrawals),
             revoking: Arc::clone(&self.revoking),
             row_epoch: Arc::clone(&self.row_epoch),
+            mirror_ledger: Arc::clone(&self.mirror_ledger),
+        }
+    }
+
+    /// Holds a resident `host_ip` box's egress for the gate (NET-085): the
+    /// session's policy, filled under this registry's egress default the
+    /// way the guest daemon fills it, and compiled with the node's own
+    /// address as its lease, the one source a `host_ip` box's frames carry.
+    /// A second admit for the same session with rules equal to the held
+    /// ones changes nothing and logs nothing: the cohort record, and so
+    /// every resident box's pins and flows, stay. A second admit with other
+    /// rules replaces the first. Returns `true`: the gate holds the box's
+    /// rules once this returns.
+    ///
+    /// A real change of the resident set rebuilds the cohort record: a
+    /// box admitted with new or changed rules, or a box retired
+    /// ([`Self::retire_host_ip_box`]). The pin table then starts a new
+    /// entry, so every resident box's name pins and retained flows go, and
+    /// each box gets them back when it resolves its names again.
+    ///
+    /// The policy is the host-side client's, carried over the host's
+    /// control socket, never anything the guest says. One info line names
+    /// the session and the count of resident boxes.
+    ///
+    /// Only a client of this host retires the rules
+    /// ([`Self::retire_host_ip_box`]). Four cases leave them in
+    /// `host_ip_boxes` while the box has no live process:
+    ///
+    /// - A destroy that no client of this host issues, such as the in-VM
+    ///   daemon's reap. The rules stay until the VM host daemon restarts.
+    /// - A retire that fails. The rules stay until the VM host daemon
+    ///   restarts.
+    /// - A box that the in-VM daemon sets to `stopped` at its start
+    ///   (`stop_orphaned_running_records` in `minimald`'s `box_manager`,
+    ///   BOX-154). The rules stay in the union while no process runs.
+    /// - A box that an attach leaves `stopped` or `exited` through Keep
+    ///   (`HostIpResidency::keep` in the `min` CLI). The rules stay until
+    ///   the box is destroyed.
+    ///
+    /// In each case the union the gate decides a box-marked frame by can
+    /// include a box that is not live. A resume (BOX-025) does not admit a
+    /// box again. After a VM host daemon restart, a resumed `host_ip` box
+    /// gets no egress until it is created again.
+    /// <https://github.com/gominimal/minimal/issues/2747> owns closing these
+    /// cases.
+    pub fn admit_host_ip_box(
+        &self,
+        session_id: boxes::SessionId,
+        declared: Option<&EgressPolicy>,
+    ) -> bool {
+        let policy = match boxes::effective_egress(
+            declared,
+            boxes::NetworkMode::HostNet,
+            self.egress_default_phase,
+            self.egress_deny_all_opt_out,
+        ) {
+            boxes::EffectiveEgress::Declared(policy) => Some(policy),
+            boxes::EffectiveEgress::DenyAll => Some(EgressPolicy::deny_all()),
+            boxes::EffectiveEgress::AllowAll => None,
+        };
+        let node = self.subnet.daemon_ip().octets();
+        let resolver = self.subnet.dns_server().octets();
+        let rules = HostIpBoxRules {
+            session_id,
+            egress: EgressRules::from_policy(policy.as_ref(), resolver, node),
+            dns_hosts: policy
+                .as_ref()
+                .and_then(|policy| policy.allow_dns_hosts.clone())
+                .unwrap_or_default(),
+            allow_subnets: policy
+                .as_ref()
+                .and_then(|policy| policy.allow_subnets.clone()),
+        };
+        let mut resident = self
+            .host_ip_boxes
+            .write()
+            .expect("the resident host_ip boxes' lock is never held across a panic");
+        if resident
+            .boxes
+            .get(&session_id)
+            .is_some_and(|held| **held == rules)
+        {
+            // An attach re-admits with the rules the set already holds. The
+            // cohort record stays the same `Arc`, so the pins and flows every
+            // resident box took under it stay too.
+            return true;
+        }
+        resident.boxes.insert(session_id, Arc::new(rules));
+        resident.cohort = HostIpBoxes::cohort_record(&resident.boxes, self.subnet);
+        let count = resident.boxes.len();
+        // Under the resident set's lock, so the mirror's flag follows the
+        // set in order (NET-138).
+        let was_published = self.node_mirror.set_published(true);
+        drop(resident);
+        // The first box since the last one ended binds the ports the guest
+        // still holds as listening (NET-138).
+        if !was_published {
+            self.node_mirror.bind_held();
+        }
+        tracing::info!(
+            session = %session_id,
+            resident_host_ip_boxes = count,
+            "holding the host_ip box's egress rules; box-marked frames from the node \
+             address are decided by the resident boxes' rules"
+        );
+        true
+    }
+
+    /// Drops the egress [`Self::admit_host_ip_box`] holds for a session:
+    /// its box stopped or was destroyed, so its rules admit nothing from
+    /// now on. A session the set does not hold is the goal state already
+    /// holding. Returns whether a box's rules were dropped.
+    pub fn retire_host_ip_box(&self, session_id: boxes::SessionId) -> bool {
+        let mut resident = self
+            .host_ip_boxes
+            .write()
+            .expect("the resident host_ip boxes' lock is never held across a panic");
+        let removed = resident.boxes.remove(&session_id).is_some();
+        if removed {
+            resident.cohort = HostIpBoxes::cohort_record(&resident.boxes, self.subnet);
+        }
+        let count = resident.boxes.len();
+        if removed {
+            // Under the resident set's lock, so the mirror's flag follows
+            // the set in order (NET-138).
+            self.node_mirror.set_published(count > 0);
+        }
+        drop(resident);
+        if removed {
+            tracing::info!(
+                session = %session_id,
+                resident_host_ip_boxes = count,
+                "dropped the host_ip box's egress rules"
+            );
+            // The last host-address box ended: no box shares the node's
+            // namespace any more, so nothing the mirror binds has a
+            // listener behind it (NET-138's box end). The mirror checks
+            // the flag again under its own lock, so a box published since
+            // keeps its binds.
+            if count == 0 {
+                self.node_mirror.end_binds(MirrorEnd::BoxEnd);
+            }
+        }
+        removed
+    }
+
+    /// Sets the binder the node's mirror binds with ([`MirrorBinder`]):
+    /// the host-side party that opens a listener at the node's address on
+    /// the host and undoes it. Returns `self`, for the caller's chain. A
+    /// registry with no binder holds every notice and binds nothing.
+    #[must_use]
+    pub fn with_mirror_binder(self, binder: Arc<dyn MirrorBinder>) -> Self {
+        self.node_mirror.set_binder(binder);
+        self
+    }
+
+    /// The node row's mirror ([`NodeMirror`]).
+    pub fn node_mirror(&self) -> &NodeMirror {
+        &self.node_mirror
+    }
+
+    /// Opens the node's mirror at `address`, the reserved-range address the
+    /// host allocated for this node (NET-129, NET-138). The address must be
+    /// in the run of the reserved local range the answerer hands out
+    /// ([`switch::box_loopback_interior`]), so `127.0.0.1`, the wildcard and
+    /// the answerer's own `.1` are refused, and it must not be a box row's
+    /// published loopback address. A changed address undoes every bind at the old
+    /// one first.
+    ///
+    /// # Errors
+    ///
+    /// [`MirrorAddressRefused`] names why the address cannot hold the
+    /// node's binds. The mirror keeps its earlier address, if it had one.
+    pub fn open_node_mirror(&self, address: Ipv4Addr) -> Result<(), MirrorAddressRefused> {
+        // The run the answerer hands addresses out of: the range's `.1` is
+        // the answerer's own, so the node's binds never open there.
+        let (first, last) = switch::box_loopback_interior();
+        if !(first..=last).contains(&address) {
+            return Err(MirrorAddressRefused::OutsideReservedRange(address));
+        }
+        let held_by_a_row = self
+            .rows
+            .read()
+            .expect("the row lock is never held across a panic, so it cannot be poisoned")
+            .values()
+            .any(|record| record.loopback_addr() == address);
+        if held_by_a_row {
+            return Err(MirrorAddressRefused::HeldByAnotherNamespace(address));
+        }
+        self.node_mirror.open(address);
+        Ok(())
+    }
+
+    /// Takes one listen notice from the in-VM daemon ([`NodeMirror::notice`])
+    /// with this node's host-address boxes' residency as the gate: while
+    /// no host-address box is published, a listening notice binds nothing.
+    /// A listening notice for one of the node's infrastructure ports
+    /// ([`crate::control::guest_infrastructure_ports`]) is refused here, so
+    /// no caller can reach a bind without that check.
+    pub fn mirror_notice(&self, notice: minimald_rpc::ListenNotice) -> MirrorOutcome {
+        let infrastructure = crate::control::guest_infrastructure_ports(self);
+        self.node_mirror
+            .notice(notice, &infrastructure, Instant::now())
+    }
+}
+
+/// The working cap on listening notices the node's mirror takes per
+/// trailing second (NET-138): 20. A stop notice is never counted or
+/// refused, because it can only narrow what the host binds.
+pub const MIRROR_NOTICES_PER_SECOND: usize = 20;
+
+/// The trailing window [`MIRROR_NOTICES_PER_SECOND`] counts over.
+const MIRROR_NOTICE_WINDOW: Duration = Duration::from_secs(1);
+
+/// The working cap on the ports the node's mirror holds at once, bound or
+/// waiting for its bind (NET-138): 64. A listening notice for a new port
+/// past it is refused as capped.
+pub const MIRRORED_BINDS_CAP: usize = 64;
+
+/// The host-side party that makes the node's mirrored binds: it opens a
+/// TCP listener at the node's address on the host that forwards to the
+/// same port at the guest node, and undoes it.
+pub trait MirrorBinder: Send + Sync + std::fmt::Debug {
+    /// Binds `port` at `address` on the host, at that port only.
+    ///
+    /// # Errors
+    ///
+    /// [`MirrorBindError::Occupied`] when something on the host already
+    /// holds the port at the address. The binder never tries another port
+    /// or another address.
+    fn bind(&self, address: Ipv4Addr, port: u16) -> Result<(), MirrorBindError>;
+
+    /// Undoes the bind of `port` at `address`. When the undo stands, it
+    /// also resets the connections the bind still carries, and says how
+    /// many it reset.
+    fn unbind(&self, address: Ipv4Addr, port: u16) -> MirrorUnbind;
+}
+
+/// What a [`MirrorBinder::unbind`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MirrorUnbind {
+    /// The bind is undone, and `connections_reset` connections it carried
+    /// were reset.
+    Undone {
+        /// How many tracked connections the undo reset.
+        connections_reset: usize,
+    },
+    /// The host refused the undo. The bind can still stand.
+    Refused(String),
+    /// The host did not answer the undo. The bind can still stand.
+    Unanswered(String),
+}
+
+/// Why a [`MirrorBinder`] made no bind.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MirrorBindError {
+    /// Something on the host already holds the port at the address.
+    #[error("the host port is already in use")]
+    Occupied,
+    /// The bind failed for another reason.
+    #[error("{0}")]
+    Failed(String),
+    /// The host did not answer the bind. The calls after it in the same
+    /// change wait for the next retry, so a stalled host costs one wait.
+    #[error("{0}")]
+    Unanswered(String),
+}
+
+/// Why [`BoxRegistry::open_node_mirror`] refused an address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum MirrorAddressRefused {
+    /// The address is not in the run of the reserved local range that
+    /// boxes take addresses from: the wildcard, `127.0.0.1`, the range's
+    /// `.1`, or any other address.
+    #[error("{0} is not an address of the reserved local range that boxes use")]
+    OutsideReservedRange(Ipv4Addr),
+    /// A box row publishes at the address.
+    #[error("{0} is the published address of a box")]
+    HeldByAnotherNamespace(Ipv4Addr),
+}
+
+/// What the node's mirror did with one listen notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirrorOutcome {
+    /// The port is bound at the node's address.
+    Bound,
+    /// The port is held, and binds once the range probe passes and the
+    /// node's address is open.
+    Waiting,
+    /// The bind is undone, or was never made.
+    Unbound,
+    /// Something on the host already holds the port at the node's address.
+    /// Nothing was bound, at that port or any other.
+    Collided,
+    /// The port is one the VM host provisioned for the guest's own
+    /// services. Nothing was bound.
+    RefusedInfrastructure,
+    /// The notice rate or the bind cap refused the notice.
+    Capped,
+    /// No host-address box is published on the node.
+    NoHostAddressBox,
+    /// The binder failed for a reason other than a held port.
+    BindFailed,
+    /// The notice named port 0, which no listener holds. A bind there
+    /// takes whatever port the host picks, so nothing was bound.
+    PortZero,
+}
+
+impl MirrorOutcome {
+    /// The outcome as the audit lines name it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bound => "bound",
+            Self::Waiting => "waiting",
+            Self::Unbound => "unbound",
+            Self::Collided => "collided",
+            Self::RefusedInfrastructure => "refused-infrastructure",
+            Self::Capped => "capped",
+            Self::NoHostAddressBox => "no-host-address-box",
+            Self::BindFailed => "bind-failed",
+            Self::PortZero => "port-zero",
         }
     }
 }
+
+/// What ended the node's mirrored binds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirrorEnd {
+    /// The last host-address box ended.
+    BoxEnd,
+    /// The node's own row ended.
+    NodeEnd,
+    /// The range probe stopped passing.
+    RangeProbeFailed,
+    /// The node's address changed.
+    AddressChanged,
+}
+
+impl MirrorEnd {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::BoxEnd => "box-end",
+            Self::NodeEnd => "node-end",
+            Self::RangeProbeFailed => "range-probe-failed",
+            Self::AddressChanged => "address-changed",
+        }
+    }
+}
+
+/// The node row's mirrored binds (NET-138, NET-129). A host-address box
+/// shares the guest node's namespace, so on a VM-backed host its listeners
+/// are reachable on the host only when the host binds the same port at the
+/// node's own reserved-range address and forwards it in. The in-VM daemon
+/// tells the host which ports listen ([`minimald_rpc::ListenNotice`]): a
+/// port and a state, never an address. So the host decides the address
+/// alone: the node's allocated reserved-range address, never `127.0.0.1`,
+/// a wildcard or another namespace's address.
+///
+/// The rules the mirror keeps:
+///
+/// * A bind is made only while the whole-range probe passes
+///   ([`Self::set_range_probe`]) and the node's address is open
+///   ([`BoxRegistry::open_node_mirror`]). Before that, a listening port is
+///   held and bound when both hold.
+/// * A port that is already in use on the host is a collision. It is
+///   recorded ([`Self::collisions`]) for the surfaces that list it, and
+///   never moved to another port or address.
+/// * A stop notice, the last host-address box's end and the node's end
+///   undo the bind. The binder resets the connections it carries. An undo
+///   the host refused or did not answer is owed, and retried before every
+///   later change and on every probe verdict ([`Self::set_range_probe`]).
+/// * The last host-address box's end keeps the held ports: the guest
+///   sends a stop notice for each one that closes. The next box's
+///   publication binds the ones still held, so a port a new box listens
+///   on within one guest poll is bound with no new notice.
+/// * A bind that a probe pass or a new box's publication made and that
+///   failed stays held, and every probe verdict retries it.
+/// * Every refusal is a warn line. [`MIRROR_NOTICES_PER_SECOND`] bounds how
+///   many a guest can cause.
+/// * [`MIRROR_NOTICES_PER_SECOND`] and [`MIRRORED_BINDS_CAP`] bound what
+///   the guest can make the host do. Each notice the rate drops counts in
+///   [`Self::notices_dropped_by_rate`].
+///
+/// Every bind and unbind is an info line, and every refusal a warn line,
+/// on the `host_table` span. Each names the node, the address, the port
+/// and the outcome, and never a box.
+#[derive(Debug)]
+pub struct NodeMirror {
+    /// The node's switch address: the node's name in every audit line.
+    node: Ipv4Addr,
+    /// Serialises every change to the mirror, with the binder calls it
+    /// makes, so the binds the host holds follow the decisions in order.
+    /// It is always taken before `state` and never while `state` is held.
+    turn: Mutex<()>,
+    /// What the mirror holds. It is held only to read or decide, and never
+    /// across a binder call, so a slow switch stalls no reader and no
+    /// caller that only records a fact here.
+    state: Mutex<MirrorState>,
+    dropped_by_rate: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct MirrorState {
+    /// The node's allocated reserved-range address, once open.
+    address: Option<Ipv4Addr>,
+    /// Whether the whole-range probe passes.
+    range_passes: bool,
+    /// Whether a host-address box is published on the node. The registry
+    /// sets it under the resident boxes' lock ([`Self::set_published`]),
+    /// and a listening notice reads it under this lock, so a notice and
+    /// the last box's end cannot pass each other.
+    published: bool,
+    binder: Option<Arc<dyn MirrorBinder>>,
+    /// The ports a listening notice holds: bound or waiting.
+    wanted: BTreeSet<u16>,
+    /// The ports bound at `address`.
+    bound: BTreeSet<u16>,
+    /// The ports whose bind collided with a holder on the host, each with
+    /// the time its first collision was seen. A port leaves the map when it
+    /// binds, when its listener stops, or when the binds end.
+    collided: BTreeMap<u16, Instant>,
+    /// The undone binds whose undo the host refused or did not answer, by
+    /// port, with the address each stands at. Each is retried before the
+    /// next change's calls.
+    unbind_owed: BTreeMap<u16, Ipv4Addr>,
+    /// When each listening notice in the trailing window arrived.
+    notices: VecDeque<Instant>,
+}
+
+impl MirrorState {
+    /// The address and binder a bind needs now: both set and the range
+    /// probe passing.
+    fn bind_target(&self) -> Option<(Ipv4Addr, Arc<dyn MirrorBinder>)> {
+        match (self.address, self.range_passes, self.binder.clone()) {
+            (Some(address), true, Some(binder)) => Some((address, binder)),
+            _ => None,
+        }
+    }
+}
+
+/// The binder calls one change decided, made after the state lock is
+/// released and under the mirror's turn.
+#[derive(Debug, Default)]
+struct MirrorCalls {
+    unbinds: Vec<(Arc<dyn MirrorBinder>, Ipv4Addr, u16, &'static str)>,
+    binds: Vec<(Arc<dyn MirrorBinder>, Ipv4Addr, u16)>,
+}
+
+impl NodeMirror {
+    fn new(node: Ipv4Addr) -> Self {
+        Self {
+            node,
+            turn: Mutex::new(()),
+            state: Mutex::new(MirrorState::default()),
+            dropped_by_rate: AtomicU64::new(0),
+        }
+    }
+
+    fn span(&self) -> tracing::Span {
+        tracing::info_span!("host_table", node = %self.node)
+    }
+
+    fn lock(&self) -> MutexGuard<'_, MirrorState> {
+        self.state
+            .lock()
+            .expect("the node mirror's lock is never held across a panic")
+    }
+
+    fn take_turn(&self) -> MutexGuard<'_, ()> {
+        self.turn
+            .lock()
+            .expect("the node mirror's turn is never held across a panic")
+    }
+
+    fn set_binder(&self, binder: Arc<dyn MirrorBinder>) {
+        self.lock().binder = Some(binder);
+    }
+
+    /// Records whether a host-address box is published on the node, and
+    /// returns whether one was. The registry calls it under the resident
+    /// boxes' lock, so the flag follows the resident set in order. It makes
+    /// no binder call: [`Self::bind_held`] makes them after the lock.
+    fn set_published(&self, published: bool) -> bool {
+        std::mem::replace(&mut self.lock().published, published)
+    }
+
+    /// Binds every held port while a host-address box is published: the
+    /// first box's publication after the last one ended.
+    fn bind_held(&self) {
+        let _span = self.span().entered();
+        let _turn = self.take_turn();
+        let calls = Self::bind_wanted(&self.lock());
+        self.run(calls);
+    }
+
+    /// The node's address the mirror binds at, once open.
+    pub fn address(&self) -> Option<Ipv4Addr> {
+        self.lock().address
+    }
+
+    /// The ports bound at the node's address.
+    pub fn bound_ports(&self) -> Vec<u16> {
+        self.lock().bound.iter().copied().collect()
+    }
+
+    /// The ports whose bind collided with a holder on the host, recorded on
+    /// the node and logged. The host control socket's read-only
+    /// `mirror_collisions` verb answers them, and `min ls` and
+    /// `min session activate` show them.
+    pub fn collisions(&self) -> Vec<u16> {
+        self.lock().collided.keys().copied().collect()
+    }
+
+    /// [`Self::collisions`] with the time each port's first collision was
+    /// seen. A port that collides again keeps its first time.
+    pub fn collisions_since(&self) -> Vec<(u16, Instant)> {
+        self.lock()
+            .collided
+            .iter()
+            .map(|(port, since)| (*port, *since))
+            .collect()
+    }
+
+    /// How many listening notices the rate cap dropped on this node.
+    pub fn notices_dropped_by_rate(&self) -> u64 {
+        self.dropped_by_rate.load(Ordering::Relaxed)
+    }
+
+    /// Records the whole-range probe's verdict. A passing verdict binds the
+    /// held ports that are not bound, a repeated pass included, so a bind
+    /// that failed is retried. A failing one undoes every bind and keeps
+    /// the ports held, so the next pass binds them again. Either verdict
+    /// retries the owed undos first.
+    pub fn set_range_probe(&self, passes: bool) {
+        let _span = self.span().entered();
+        let _turn = self.take_turn();
+        let mut state = self.lock();
+        state.range_passes = passes;
+        let calls = if passes {
+            Self::bind_wanted(&state)
+        } else {
+            Self::unbind_all(&mut state, MirrorEnd::RangeProbeFailed, false)
+        };
+        drop(state);
+        self.run(calls);
+    }
+
+    fn open(&self, address: Ipv4Addr) {
+        let _span = self.span().entered();
+        let _turn = self.take_turn();
+        let mut state = self.lock();
+        if state.address == Some(address) {
+            return;
+        }
+        let mut calls = Self::unbind_all(&mut state, MirrorEnd::AddressChanged, false);
+        state.address = Some(address);
+        calls.binds = Self::bind_wanted(&state).binds;
+        drop(state);
+        self.run(calls);
+    }
+
+    /// Undoes every bind. [`MirrorEnd::NodeEnd`] also forgets every held
+    /// port, because the node's processes are gone. Any other end keeps
+    /// them: the guest sends a stop notice for each one that closes, and
+    /// the next box's publication binds the rest ([`Self::bind_held`]).
+    /// For [`MirrorEnd::BoxEnd`] it does nothing when a host-address box is
+    /// published again by the time it runs, because that box's binds stand.
+    pub fn end_binds(&self, end: MirrorEnd) {
+        let _span = self.span().entered();
+        let _turn = self.take_turn();
+        let mut state = self.lock();
+        if end == MirrorEnd::BoxEnd && state.published {
+            return;
+        }
+        let calls = Self::unbind_all(&mut state, end, end == MirrorEnd::NodeEnd);
+        drop(state);
+        self.run(calls);
+    }
+
+    /// The node's end: every bind undone and the address closed.
+    pub fn end_node(&self) {
+        let _span = self.span().entered();
+        let _turn = self.take_turn();
+        let mut state = self.lock();
+        let calls = Self::unbind_all(&mut state, MirrorEnd::NodeEnd, true);
+        // The unbinds name the address they undo, so it closes now.
+        state.address = None;
+        drop(state);
+        self.run(calls);
+    }
+
+    /// Takes one listen notice that arrived at `now`. A listening notice
+    /// binds only while a host-address box is published on the node. A
+    /// listening notice for a port in `infrastructure`, the ports the VM
+    /// host provisioned for the guest's own services, is refused on the
+    /// host's authority, whatever the notice says. Every listening notice
+    /// spends the notice rate, a refused one included.
+    pub fn notice(
+        &self,
+        notice: minimald_rpc::ListenNotice,
+        infrastructure: &BTreeSet<u16>,
+        now: Instant,
+    ) -> MirrorOutcome {
+        let _span = self.span().entered();
+        let _turn = self.take_turn();
+        let port = notice.port;
+        let mut state = self.lock();
+        if notice.state == minimald_rpc::ListenState::Stopped {
+            state.wanted.remove(&port);
+            state.collided.remove(&port);
+            let mut calls = MirrorCalls::default();
+            if state.bound.remove(&port)
+                && let (Some(address), Some(binder)) = (state.address, state.binder.clone())
+            {
+                calls.unbinds.push((binder, address, port, "stop-notice"));
+            }
+            drop(state);
+            self.run(calls);
+            return MirrorOutcome::Unbound;
+        }
+        while state
+            .notices
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) >= MIRROR_NOTICE_WINDOW)
+        {
+            state.notices.pop_front();
+        }
+        if state.notices.len() >= MIRROR_NOTICES_PER_SECOND {
+            let dropped = self.dropped_by_rate.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::warn!(
+                node = %self.node,
+                address = ?state.address,
+                port,
+                outcome = MirrorOutcome::Capped.as_str(),
+                reason = "notice-rate",
+                notices_dropped_by_rate = dropped,
+                per_second = MIRROR_NOTICES_PER_SECOND,
+                "refused a mirrored bind at the node's address"
+            );
+            return MirrorOutcome::Capped;
+        }
+        state.notices.push_back(now);
+        // Checked after the rate cap, so the cap bounds the warn lines a
+        // guest that repeats a forged notice can cause.
+        if infrastructure.contains(&port) {
+            self.warn_refused(
+                &state,
+                port,
+                MirrorOutcome::RefusedInfrastructure,
+                "guest-infrastructure-port",
+            );
+            return MirrorOutcome::RefusedInfrastructure;
+        }
+        if port == 0 {
+            // A bind at port 0 takes a port the host picks, which moves the
+            // listener to another port. No listener holds port 0.
+            self.warn_refused(&state, port, MirrorOutcome::PortZero, "port-zero");
+            return MirrorOutcome::PortZero;
+        }
+        if !state.published {
+            self.warn_refused(&state, port, MirrorOutcome::NoHostAddressBox, "no-cohort");
+            return MirrorOutcome::NoHostAddressBox;
+        }
+        if state.bound.contains(&port) {
+            return MirrorOutcome::Bound;
+        }
+        if !state.wanted.contains(&port) && state.wanted.len() >= MIRRORED_BINDS_CAP {
+            self.warn_refused(&state, port, MirrorOutcome::Capped, "bind-cap");
+            return MirrorOutcome::Capped;
+        }
+        state.wanted.insert(port);
+        let Some((address, binder)) = state.bind_target() else {
+            self.info_waiting(&state, port);
+            return MirrorOutcome::Waiting;
+        };
+        drop(state);
+        // The owed undos go first, as in every change ([`Self::run`]).
+        let outcome = if self.retry_owed(&[(address, port)]) {
+            self.bind(&binder, address, port).0
+        } else {
+            MirrorOutcome::BindFailed
+        };
+        if matches!(outcome, MirrorOutcome::Collided | MirrorOutcome::BindFailed) {
+            // The reply refuses the notice, so the guest holds the port as
+            // owed and sends it again. The mirror does not hold it: it is
+            // not counted against the cap, and a later probe pass does not
+            // bind a port that no notice holds. The turn is still held, so
+            // no other change ran since the bind.
+            self.lock().wanted.remove(&port);
+        }
+        outcome
+    }
+
+    /// The binds that make every held port bound, or none while the mirror
+    /// cannot bind or no host-address box is published.
+    fn bind_wanted(state: &MirrorState) -> MirrorCalls {
+        let mut calls = MirrorCalls::default();
+        if state.published
+            && let Some((address, binder)) = state.bind_target()
+        {
+            calls.binds = state
+                .wanted
+                .difference(&state.bound)
+                .map(|port| (Arc::clone(&binder), address, *port))
+                .collect();
+        }
+        calls
+    }
+
+    /// Forgets every bind and returns the unbinds that undo them.
+    fn unbind_all(state: &mut MirrorState, end: MirrorEnd, forget: bool) -> MirrorCalls {
+        let bound = std::mem::take(&mut state.bound);
+        state.collided.clear();
+        if forget {
+            state.wanted.clear();
+        }
+        let mut calls = MirrorCalls::default();
+        if let (Some(address), Some(binder)) = (state.address, state.binder.clone()) {
+            calls.unbinds = bound
+                .into_iter()
+                .map(|port| (Arc::clone(&binder), address, port, end.as_str()))
+                .collect();
+        }
+        calls
+    }
+
+    /// Makes the binder calls one change decided: the owed undos first,
+    /// then the unbinds, then the binds. The caller holds the turn and not
+    /// the state lock. Once the host leaves one call unanswered, the calls
+    /// after it wait: an unbind is owed, and a bind stays held for the next
+    /// probe verdict. So a stalled host costs one change one wait.
+    fn run(&self, calls: MirrorCalls) {
+        let binding: Vec<(Ipv4Addr, u16)> = calls
+            .binds
+            .iter()
+            .map(|(_, address, port)| (*address, *port))
+            .collect();
+        let mut answered = self.retry_owed(&binding);
+        for (binder, address, port, reason) in calls.unbinds {
+            if !answered {
+                self.lock().unbind_owed.insert(port, address);
+                continue;
+            }
+            answered = self.unbind(&binder, address, port, reason);
+        }
+        for (binder, address, port) in calls.binds {
+            if !answered {
+                tracing::debug!(
+                    node = %self.node,
+                    %address,
+                    port,
+                    "left a mirrored bind for the next retry: the host did not answer an \
+                     earlier call"
+                );
+                continue;
+            }
+            answered = self.bind(&binder, address, port).1;
+        }
+    }
+
+    /// Retries every owed undo, except one for a bind in `binding`: that
+    /// bind is wanted again, so its undo is moot. Returns `false` when the
+    /// host left a call unanswered. The caller holds the turn and not the
+    /// state lock.
+    fn retry_owed(&self, binding: &[(Ipv4Addr, u16)]) -> bool {
+        let (owed, binder) = {
+            let mut state = self.lock();
+            state
+                .unbind_owed
+                .retain(|port, address| !binding.contains(&(*address, *port)));
+            let Some(binder) = state.binder.clone() else {
+                return true;
+            };
+            (std::mem::take(&mut state.unbind_owed), binder)
+        };
+        let mut answered = true;
+        for (port, address) in owed {
+            if !answered {
+                self.lock().unbind_owed.insert(port, address);
+                continue;
+            }
+            answered = self.unbind(&binder, address, port, "retry");
+        }
+        answered
+    }
+
+    /// Undoes the bind of `port` at `address` and logs what the host did.
+    /// An undo the host refused or did not answer is owed. Returns `false`
+    /// when the host did not answer.
+    fn unbind(
+        &self,
+        binder: &Arc<dyn MirrorBinder>,
+        address: Ipv4Addr,
+        port: u16,
+        reason: &str,
+    ) -> bool {
+        match binder.unbind(address, port) {
+            MirrorUnbind::Undone { connections_reset } => {
+                tracing::info!(
+                    node = %self.node,
+                    %address,
+                    port,
+                    outcome = MirrorOutcome::Unbound.as_str(),
+                    reason,
+                    connections_reset,
+                    "undid a mirrored bind at the node's address"
+                );
+                true
+            }
+            MirrorUnbind::Refused(error) => {
+                self.lock().unbind_owed.insert(port, address);
+                tracing::warn!(
+                    node = %self.node,
+                    %address,
+                    port,
+                    outcome = "unbind-refused",
+                    reason,
+                    %error,
+                    "the host refused to undo a mirrored bind at the node's address; the \
+                     bind can still stand, and the undo is retried"
+                );
+                true
+            }
+            MirrorUnbind::Unanswered(error) => {
+                self.lock().unbind_owed.insert(port, address);
+                tracing::warn!(
+                    node = %self.node,
+                    %address,
+                    port,
+                    outcome = "unbind-unanswered",
+                    reason,
+                    %error,
+                    "the host did not answer the undo of a mirrored bind at the node's \
+                     address; the bind can still stand, and the undo is retried"
+                );
+                false
+            }
+        }
+    }
+
+    /// Binds `port` at `address` and records the outcome. Returns it, and
+    /// `false` when the host did not answer. The caller holds the turn and
+    /// not the state lock, so the state the bind was decided under is the
+    /// state it commits to.
+    fn bind(
+        &self,
+        binder: &Arc<dyn MirrorBinder>,
+        address: Ipv4Addr,
+        port: u16,
+    ) -> (MirrorOutcome, bool) {
+        let result = binder.bind(address, port);
+        let mut state = self.lock();
+        match result {
+            Ok(()) => {
+                state.bound.insert(port);
+                state.collided.remove(&port);
+                drop(state);
+                tracing::info!(
+                    node = %self.node,
+                    %address,
+                    port,
+                    outcome = MirrorOutcome::Bound.as_str(),
+                    "mirrored a host-address box's bind at the node's address"
+                );
+                (MirrorOutcome::Bound, true)
+            }
+            Err(MirrorBindError::Occupied) => {
+                state.collided.entry(port).or_insert_with(Instant::now);
+                self.warn_refused(&state, port, MirrorOutcome::Collided, "port-in-use");
+                (MirrorOutcome::Collided, true)
+            }
+            Err(MirrorBindError::Failed(error)) => {
+                drop(state);
+                self.warn_bind_failed(address, port, &error);
+                (MirrorOutcome::BindFailed, true)
+            }
+            Err(MirrorBindError::Unanswered(error)) => {
+                // The host may have bound it all the same, so an undo is
+                // owed. A later bind of the same port makes it moot
+                // ([`Self::retry_owed`]).
+                state.unbind_owed.insert(port, address);
+                drop(state);
+                self.warn_bind_failed(address, port, &error);
+                (MirrorOutcome::BindFailed, false)
+            }
+        }
+    }
+
+    // One warn line per refusal (NET-138's observability terms). The
+    // per-node notice rate cap bounds how many reach this line.
+    fn warn_bind_failed(&self, address: Ipv4Addr, port: u16, error: &str) {
+        tracing::warn!(
+            node = %self.node,
+            %address,
+            port,
+            outcome = MirrorOutcome::BindFailed.as_str(),
+            %error,
+            "could not mirror a host-address box's bind at the node's address"
+        );
+    }
+
+    fn info_waiting(&self, state: &MirrorState, port: u16) {
+        tracing::info!(
+            node = %self.node,
+            address = ?state.address,
+            port,
+            outcome = MirrorOutcome::Waiting.as_str(),
+            range_probe_passes = state.range_passes,
+            "holding a mirrored bind until the range probe passes at the node's address"
+        );
+    }
+
+    /// Logs a refusal as a warn line, each time. The per-node notice rate
+    /// cap bounds how many notices reach a refusal.
+    fn warn_refused(&self, state: &MirrorState, port: u16, outcome: MirrorOutcome, reason: &str) {
+        tracing::warn!(
+            node = %self.node,
+            address = ?state.address,
+            port,
+            outcome = outcome.as_str(),
+            reason,
+            "refused a mirrored bind at the node's address"
+        );
+    }
+}
+
+/// A [`MirrorBinder`] for the tests: it opens a real TCP listener at the
+/// port it is asked for, so a port another socket holds collides as it
+/// does on a host, and records every call it took with the address the
+/// mirror asked for. The listener itself is on `127.0.0.1`, because a host
+/// without the reserved range's aliases (a stock macOS host) cannot bind
+/// the range's addresses.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct TestMirrorBinder {
+    listeners: Mutex<BTreeMap<(Ipv4Addr, u16), std::net::TcpListener>>,
+    pub(crate) calls: Mutex<Vec<(&'static str, Ipv4Addr, u16)>>,
+}
+
+#[cfg(test)]
+impl TestMirrorBinder {
+    /// The calls taken, in order: `("bind" | "unbind", address, port)`.
+    pub(crate) fn calls(&self) -> Vec<(&'static str, Ipv4Addr, u16)> {
+        self.calls.lock().expect("the test binder's lock").clone()
+    }
+
+    /// The listeners open now.
+    pub(crate) fn open(&self) -> Vec<(Ipv4Addr, u16)> {
+        self.listeners
+            .lock()
+            .expect("the test binder's lock")
+            .keys()
+            .copied()
+            .collect()
+    }
+}
+
+#[cfg(test)]
+impl MirrorBinder for TestMirrorBinder {
+    fn bind(&self, address: Ipv4Addr, port: u16) -> Result<(), MirrorBindError> {
+        self.calls
+            .lock()
+            .expect("the test binder's lock")
+            .push(("bind", address, port));
+        match std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+            Ok(listener) => {
+                self.listeners
+                    .lock()
+                    .expect("the test binder's lock")
+                    .insert((address, port), listener);
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                Err(MirrorBindError::Occupied)
+            }
+            Err(error) => Err(MirrorBindError::Failed(error.to_string())),
+        }
+    }
+
+    fn unbind(&self, address: Ipv4Addr, port: u16) -> MirrorUnbind {
+        self.calls
+            .lock()
+            .expect("the test binder's lock")
+            .push(("unbind", address, port));
+        self.listeners
+            .lock()
+            .expect("the test binder's lock")
+            .remove(&(address, port));
+        MirrorUnbind::Undone {
+            connections_reset: 0,
+        }
+    }
+}
+
+/// One resident `host_ip` box's egress, compiled on the host
+/// ([`BoxRegistry::admit_host_ip_box`], NET-085): the rules a box-marked
+/// frame from the node address is decided by, beside every other resident
+/// box's.
+#[derive(Debug, PartialEq, Eq)]
+pub struct HostIpBoxRules {
+    session_id: boxes::SessionId,
+    egress: EgressRules,
+    dns_hosts: Vec<String>,
+    allow_subnets: Option<Vec<String>>,
+}
+
+impl HostIpBoxRules {
+    /// The session the box runs as.
+    #[must_use]
+    pub fn session_id(&self) -> boxes::SessionId {
+        self.session_id
+    }
+
+    /// The box's compiled egress rules, leased to the node's own address.
+    #[must_use]
+    pub fn egress(&self) -> &EgressRules {
+        &self.egress
+    }
+
+    /// Whether the box declared DNS hosts: its undeclared destinations are
+    /// then the host-side DNS admission table's to decide.
+    #[must_use]
+    pub fn resolves_names(&self) -> bool {
+        !self.dns_hosts.is_empty()
+    }
+}
+
+/// The resident `host_ip` boxes ([`BoxRegistry::admit_host_ip_box`]) and the
+/// one row-shaped record their declared names pin under.
+#[derive(Debug, Default)]
+struct HostIpBoxes {
+    boxes: BTreeMap<boxes::SessionId, Arc<HostIpBoxRules>>,
+    /// The record the host-side DNS admission table pins the resident
+    /// boxes' declared names under: every resident box's DNS hosts and
+    /// allowed subnets, keyed to the node's own address. `None` when no
+    /// resident box declared a DNS host, so nothing can pin for them.
+    /// Rebuilt on every change, so a pin taken for a box that left never
+    /// outlives the record it was taken under.
+    cohort: Option<Arc<BoxRecord>>,
+}
+
+impl HostIpBoxes {
+    /// The pin record for `boxes`: `None` when no box declared a DNS host.
+    fn cohort_record(
+        boxes: &BTreeMap<boxes::SessionId, Arc<HostIpBoxRules>>,
+        subnet: SwitchSubnet,
+    ) -> Option<Arc<BoxRecord>> {
+        let mut dns_hosts: Vec<String> = Vec::new();
+        let mut allow_subnets: Vec<String> = Vec::new();
+        for rules in boxes.values().filter(|rules| rules.resolves_names()) {
+            for host in &rules.dns_hosts {
+                if !dns_hosts.contains(host) {
+                    dns_hosts.push(host.clone());
+                }
+            }
+            for subnet in rules.allow_subnets.iter().flatten() {
+                if !allow_subnets.contains(subnet) {
+                    allow_subnets.push(subnet.clone());
+                }
+            }
+        }
+        if dns_hosts.is_empty() {
+            return None;
+        }
+        let node = subnet.daemon_ip();
+        let policy = EgressPolicy {
+            allow_subnets: Some(allow_subnets.clone()),
+            allow_dns_hosts: Some(dns_hosts.clone()),
+            allow_protocols: None,
+            deny_subnets: None,
+        };
+        Some(Arc::new(BoxRecord {
+            name: HOST_IP_COHORT_NAME.to_string(),
+            box_id: crate::bep_attach::mint_box_id(),
+            switch_addr: node,
+            loopback_addr: node,
+            admitted_ports: Vec::new(),
+            declared_names: Vec::new(),
+            egress: EgressRules::from_policy(
+                Some(&policy),
+                subnet.dns_server().octets(),
+                node.octets(),
+            ),
+            resolves_names: true,
+            dns_hosts,
+            deny_all: false,
+            credentialed_upstream: false,
+            dynamic_ingress: DynamicIngress::Deny,
+            dynamic_range: None,
+            runtime_ports: Mutex::new(RowRuntime::default()),
+            egress_allow_list: allow_subnets,
+            attributed: AtomicBool::new(false),
+            liveness: Mutex::new(RowLiveness::default()),
+            task_row_of: None,
+            task_addrs: Vec::new(),
+        }))
+    }
+}
+
+/// The name the resident `host_ip` boxes' pin record carries in the DNS
+/// admission table's log lines.
+const HOST_IP_COHORT_NAME: &str = "host_ip boxes";
 
 /// The run of published loopback addresses a box may take inside `slice`:
 /// the slice clamped to the reserved local range's interior. The range's
@@ -5963,14 +7241,36 @@ fn in_reserved_local_range(addr: Ipv4Addr) -> bool {
 #[derive(Debug, Clone)]
 pub struct BoxTable {
     rows: Arc<RwLock<Rows>>,
+    host_ip_boxes: Arc<RwLock<HostIpBoxes>>,
     subnet: SwitchSubnet,
     withdrawal_reports: std::sync::mpsc::Sender<WithdrawalReport>,
     row_withdrawals: RowWithdrawals,
     revoking: Arc<Revoking>,
     row_epoch: Arc<AtomicU64>,
+    mirror_ledger: MirrorLedgerSlot,
 }
 
 impl BoxTable {
+    /// Leaves the egress gate's publish ledger for the node mirror's binder
+    /// (NET-138). The gate calls it when it starts, and a later gate's
+    /// ledger replaces an earlier one's.
+    pub(crate) fn attach_mirror_ledger(&self, ledger: crate::net::egress_gate::MirrorLedger) {
+        *self
+            .mirror_ledger
+            .write()
+            .expect("the mirror ledger slot is never held across a panic") = Some(ledger);
+    }
+
+    /// The running egress gate's publish ledger, where the node mirror's
+    /// binder notes each bind (NET-138). `None` while no gate runs.
+    #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+    pub(crate) fn mirror_ledger(&self) -> Option<crate::net::egress_gate::MirrorLedger> {
+        self.mirror_ledger
+            .read()
+            .expect("the mirror ledger slot is never held across a panic")
+            .clone()
+    }
+
     /// Subscribes to row withdrawals: the receiver gets the switch address
     /// of every row the registry removes from here on, whichever path
     /// removed it (the drainer's grace sweep, [`BoxRegistry::withdraw`] or
@@ -6158,6 +7458,33 @@ impl BoxTable {
     pub fn is_allocatable(&self, src: [u8; 4]) -> bool {
         let addr = u32::from(Ipv4Addr::from(src));
         self.subnet.first_ptask() <= addr && addr <= self.subnet.last_ptask()
+    }
+
+    /// The resident `host_ip` boxes' rules, in session order: the union a
+    /// box-marked frame from the node address is decided by (NET-085).
+    /// Empty when no `host_ip` box is resident, and the gate then drops
+    /// every such frame.
+    #[must_use]
+    pub fn host_ip_boxes(&self) -> Vec<Arc<HostIpBoxRules>> {
+        self.host_ip_boxes
+            .read()
+            .expect("the resident host_ip boxes' lock is never held across a panic")
+            .boxes
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// The record the resident `host_ip` boxes' declared names pin under in
+    /// the DNS admission table, keyed to the node's own address. `None`
+    /// when no resident box declared a DNS host.
+    #[must_use]
+    pub fn host_ip_cohort(&self) -> Option<Arc<BoxRecord>> {
+        self.host_ip_boxes
+            .read()
+            .expect("the resident host_ip boxes' lock is never held across a panic")
+            .cohort
+            .clone()
     }
 
     /// Every published row, in switch-address order.
@@ -7328,6 +8655,65 @@ mod tests {
         BoxRegistry::new(SUBNET).persisting_to(dir.path().join(REGISTRY_FILE))
     }
 
+    /// NET-148, NET-152: a VM's persisted box records read without a daemon
+    /// — each box's name and id — and a file of another version, or one that
+    /// does not parse, reads as no boxes and is left exactly as it was.
+    #[test]
+    fn persisted_box_names_read_without_a_daemon() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        assert!(
+            persisted_box_names(dir.path()).is_empty(),
+            "a VM with no file holds no boxes"
+        );
+        let registry = persisted_registry(&dir);
+        let web = registry
+            .register_client_box(client_spec("web"))
+            .expect("the plan has an address for the box");
+        let api = registry
+            .register_client_box(client_spec("api"))
+            .expect("the plan has an address for another box");
+        drop(registry);
+
+        let mut read = persisted_box_names(dir.path());
+        read.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(
+            read,
+            vec![
+                PersistedBox {
+                    name: "api".to_string(),
+                    id: minimald_rpc::BoxId::from_bytes(api.box_id()),
+                },
+                PersistedBox {
+                    name: "web".to_string(),
+                    id: minimald_rpc::BoxId::from_bytes(web.box_id()),
+                },
+            ],
+            "each persisted box, by name and id"
+        );
+
+        let path = dir.path().join(REGISTRY_FILE);
+        for unusable in [
+            r#"{"version": 99, "boxes": []}"#.as_bytes(),
+            b"not json at all".as_slice(),
+        ] {
+            std::fs::write(&path, unusable).expect("write the unusable file");
+            assert!(
+                persisted_box_names(dir.path()).is_empty(),
+                "an unusable file reads as no boxes"
+            );
+            assert_eq!(
+                std::fs::read(&path).expect("the file is still there"),
+                unusable,
+                "and is never written or set aside"
+            );
+            let set_aside = std::fs::read_dir(dir.path())
+                .expect("list the state dir")
+                .map(|entry| entry.expect("an entry").file_name())
+                .any(|name| name.to_string_lossy().contains("unusable"));
+            assert!(!set_aside, "a read never sets the file aside");
+        }
+    }
+
     /// NET-138: the client boxes' registrations persist host-side, and a
     /// registry started over the file reinstates each standing row — its
     /// name, both addresses, its box id and its compiled rules — awaiting
@@ -8059,36 +9445,117 @@ mod tests {
         );
     }
 
-    /// NET-138: a dormant creation holds its name — a registration under
-    /// it, in any spelling that folds to it, is refused rather than taking
-    /// the name its creator may still resume — until its creator destroys
-    /// it.
+    /// BOX-004: a dormant creation is a stopped box, and it holds no name.
+    /// A registration under the name, in any spelling that folds to it,
+    /// takes the name over: it gets a row of its own under a new id. The
+    /// stopped box keeps its creation and its addresses. Its resume by its
+    /// box id is refused while the new box's row stands, and is accepted
+    /// once that row is withdrawn. A later zone hold of the name takes over
+    /// the stopped box's hold too.
     #[test]
-    fn a_dormant_creation_holds_its_name() {
+    fn reuse_of_a_stopped_name_takes_over_its_hold() {
+        let (log, _guard) = crate::net::egress_gate::test_support::capture_log();
         let registry = BoxRegistry::new(SUBNET);
+        let stopped = boxes::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
+            .expect("a session id");
+        let reused = boxes::SessionId::parse_str("00000000-0000-4000-8000-000000000002")
+            .expect("a session id");
         let web = registry
             .register_client_box(client_spec("web"))
             .expect("the plan has an address for the box");
+        assert!(registry.hold_box_name("web", Some(stopped)));
         assert!(registry.withdraw(web.switch_addr()).is_some());
         assert!(registry.row_by_name("web").is_none(), "the row is gone");
-        for asked in ["web", "WEB"] {
-            assert_eq!(
-                registry
-                    .register_client_box(client_spec(asked))
-                    .map(|row| row.box_id()),
-                Err(AllocationError::NameAlreadyHeld {
-                    held: "web".to_string()
-                }),
-                "{asked} folds to the dormant creation's name"
-            );
-        }
+
+        let new = registry
+            .register_client_box(client_spec("WEB"))
+            .expect("a stopped box's name is free for a new box");
+        assert_ne!(new.box_id(), web.box_id(), "the new box has its own id");
         assert_eq!(
-            registry.withdraw_client_box("web", web.switch_addr(), web.loopback_addr(), None),
-            Ok(None)
+            registry
+                .row_by_name("web")
+                .expect("the new box's row stands")
+                .box_id(),
+            new.box_id()
         );
-        registry
-            .register_client_box(client_spec("web"))
-            .expect("a destroyed creation holds no name");
+        assert!(
+            registry.live_box_ids().contains(&box_id_hex(web.box_id())),
+            "the stopped box's creation is kept"
+        );
+        assert!(
+            log.contents()
+                .contains("a new box took over a stopped box's name"),
+            "the log says the name was taken over: {}",
+            log.contents()
+        );
+
+        let resume = || {
+            let claim = registry.begin_registration("web");
+            registry.resume_client_box(
+                "web",
+                web.switch_addr(),
+                web.loopback_addr(),
+                Some(web.box_id()),
+                web.loopback_addr(),
+                claim.generation(),
+            )
+        };
+        assert_eq!(
+            registry
+                .resumable(
+                    "web",
+                    web.switch_addr(),
+                    web.loopback_addr(),
+                    Some(web.box_id())
+                )
+                .map(|_| ()),
+            Err(ResumeError::Allocation(AllocationError::NameAlreadyHeld {
+                held: "WEB".to_string()
+            })),
+            "the stopped box does not resume while the new box's row stands"
+        );
+        assert_eq!(
+            resume().map(|row| row.box_id()),
+            Err(ResumeError::Allocation(AllocationError::NameAlreadyHeld {
+                held: "WEB".to_string()
+            })),
+            "the refusal names the running box that holds the name"
+        );
+        assert_eq!(
+            registry
+                .row_by_name("web")
+                .expect("the new box's row is untouched")
+                .box_id(),
+            new.box_id()
+        );
+
+        assert!(
+            !registry.hold_box_name("WEB", Some(reused)),
+            "the new box's hold takes the stopped box's hold over"
+        );
+        assert!(
+            registry.release_held_name("web", Some(reused)),
+            "the hold is the new box's now"
+        );
+
+        assert!(registry.withdraw(new.switch_addr()).is_some());
+        let resumed = resume().expect("the stopped box resumes once no row holds its name");
+        assert_eq!(resumed.box_id(), web.box_id(), "under its own id");
+        assert_eq!(resumed.switch_addr(), web.switch_addr());
+        assert_eq!(resumed.loopback_addr(), web.loopback_addr());
+        assert!(
+            registry.live_box_ids().contains(&box_id_hex(new.box_id())),
+            "the new box, stopped now, keeps its creation in turn"
+        );
+        assert_eq!(
+            registry.withdraw_client_box("WEB", new.switch_addr(), new.loopback_addr(), None),
+            Ok(None),
+            "the new box's creator can destroy its stopped box"
+        );
+        assert!(
+            !registry.live_box_ids().contains(&box_id_hex(new.box_id())),
+            "the destroy ends the new box's creation"
+        );
     }
 
     /// NET-138: a resume naming the box's id finds its creation whatever the
@@ -9276,7 +10743,14 @@ mod tests {
         // proves the whole lot was decided before the comparison.
         let undeclared = ipv4_frame(lease, 6, [203, 0, 113, 7], 443);
         let unknown = ipv4_frame([100, 64, 0, 99], 6, [10, 1, 2, 3], 80);
-        let node_frame = ipv4_frame(SUBNET.daemon_ip().octets(), 6, [10, 1, 2, 3], 80);
+        // The node's frame is one the in-force baseline set admits: its
+        // own lookup, through the resolver carve-out.
+        let node_frame = ipv4_frame(
+            SUBNET.daemon_ip().octets(),
+            17,
+            SUBNET.dns_server().octets(),
+            53,
+        );
         let foreign_arp = arp_frame([203, 0, 113, 7]);
         let marker = ipv4_frame(lease, 6, [10, 1, 2, 3], 80);
         for frame in [&undeclared, &unknown, &node_frame, &foreign_arp] {
@@ -9290,7 +10764,7 @@ mod tests {
         assert_eq!(
             expect_frame(&mut harness.switch).await,
             node_frame,
-            "the node namespace's frame is decided by its own row"
+            "the node namespace's frame is decided by the node-plane baseline set"
         );
         assert_eq!(
             expect_frame(&mut harness.switch).await,
@@ -9597,7 +11071,14 @@ mod tests {
         // that proves the whole lot was decided before the comparison.
         let undeclared = ipv4_frame(lease, 6, [203, 0, 113, 7], 443);
         let unknown = ipv4_frame([100, 64, 0, 99], 6, [10, 1, 2, 3], 80);
-        let node_frame = ipv4_frame(SUBNET.daemon_ip().octets(), 6, [10, 1, 2, 3], 80);
+        // The node's frame is one the in-force baseline set admits: its
+        // own lookup, through the resolver carve-out.
+        let node_frame = ipv4_frame(
+            SUBNET.daemon_ip().octets(),
+            17,
+            SUBNET.dns_server().octets(),
+            53,
+        );
         let foreign_arp = arp_frame([203, 0, 113, 7]);
         let marker = ipv4_frame(lease, 6, [10, 1, 2, 3], 80);
         for frame in [&undeclared, &unknown, &node_frame, &foreign_arp] {
@@ -9611,7 +11092,7 @@ mod tests {
         assert_eq!(
             expect_frame(&mut harness.switch).await,
             node_frame,
-            "the node namespace's frame is decided by its own row"
+            "the node namespace's frame is decided by the node-plane baseline set"
         );
         assert_eq!(
             expect_frame(&mut harness.switch).await,
@@ -10913,5 +12394,476 @@ mod tests {
                 .expect_err("the record still holds the id"),
             AllocationError::CollidingBoxId { id }
         );
+    }
+
+    /// The node's reserved-range address the mirror tests open at: a host
+    /// of the reserved local range that no row publishes.
+    fn mirror_address() -> Ipv4Addr {
+        switch::loopback::range_hosts()
+            .nth(200)
+            .expect("the reserved range has more than 200 hosts")
+    }
+
+    /// A registry whose node mirror binds through a [`TestMirrorBinder`],
+    /// with the node's row registered, the mirror open at
+    /// [`mirror_address`], and one `host_ip` box resident.
+    fn mirror_registry(range_passes: bool) -> (BoxRegistry, Arc<TestMirrorBinder>) {
+        let binder = Arc::new(TestMirrorBinder::default());
+        let registry = BoxRegistry::new(SUBNET)
+            .with_mirror_binder(Arc::clone(&binder) as Arc<dyn MirrorBinder>);
+        registry.register_node_namespace(7654);
+        registry
+            .open_node_mirror(mirror_address())
+            .expect("a reserved-range address no row holds opens the mirror");
+        registry.node_mirror().set_range_probe(range_passes);
+        assert!(registry.admit_host_ip_box(mirror_session(1), None));
+        (registry, binder)
+    }
+
+    fn mirror_session(n: u8) -> boxes::SessionId {
+        boxes::SessionId::parse_str(&format!("00000000-0000-4000-8000-0000000000{n:02}"))
+            .expect("a session id")
+    }
+
+    fn listening(port: u16) -> minimald_rpc::ListenNotice {
+        minimald_rpc::ListenNotice {
+            port,
+            state: minimald_rpc::ListenState::Listening,
+        }
+    }
+
+    fn stopped(port: u16) -> minimald_rpc::ListenNotice {
+        minimald_rpc::ListenNotice {
+            port,
+            state: minimald_rpc::ListenState::Stopped,
+        }
+    }
+
+    /// A free TCP port on this host, released before return.
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .and_then(|listener| listener.local_addr())
+            .expect("a free port")
+            .port()
+    }
+
+    /// NET-138: while a host-address box is published, the node's mirror
+    /// admits a bind at any port, unfiltered by the box's declaration, at
+    /// the node's own reserved-range address and nowhere else. Before any
+    /// host-address box is published, and after the last one ends, a
+    /// notice binds nothing. A stop notice, the last box's end and the
+    /// node's end each undo the bind.
+    #[test]
+    fn host_address_mirrored_binds_admitted_unfiltered() {
+        let (registry, binder) = mirror_registry(true);
+        let node = mirror_address();
+        let ports = [free_port(), free_port(), free_port()];
+        for port in ports {
+            assert_eq!(
+                registry.mirror_notice(listening(port)),
+                MirrorOutcome::Bound,
+                "port {port} is admitted without a declaration naming it"
+            );
+        }
+        let mut expected: Vec<(Ipv4Addr, u16)> = ports.iter().map(|port| (node, *port)).collect();
+        expected.sort_unstable();
+        assert_eq!(
+            binder.open(),
+            expected,
+            "every bind is at the node's address"
+        );
+        assert!(
+            binder
+                .calls()
+                .iter()
+                .all(|(_, address, _)| *address == node),
+            "the mirror never binds at another address"
+        );
+        // A repeated notice is the goal state holding.
+        assert_eq!(
+            registry.mirror_notice(listening(ports[0])),
+            MirrorOutcome::Bound
+        );
+        assert_eq!(binder.calls().len(), ports.len());
+
+        // A stop notice undoes the bind.
+        assert_eq!(
+            registry.mirror_notice(stopped(ports[0])),
+            MirrorOutcome::Unbound
+        );
+        assert!(!binder.open().contains(&(node, ports[0])));
+
+        // A second resident box keeps the binds when the first one ends.
+        assert!(registry.admit_host_ip_box(mirror_session(2), None));
+        assert!(registry.retire_host_ip_box(mirror_session(1)));
+        assert_eq!(binder.open().len(), 2);
+        // The last box's end undoes every bind, and a later notice binds
+        // nothing while no host-address box is published.
+        assert!(registry.retire_host_ip_box(mirror_session(2)));
+        assert!(
+            binder.open().is_empty(),
+            "the last box's end undoes every bind"
+        );
+        assert_eq!(
+            registry.mirror_notice(listening(ports[1])),
+            MirrorOutcome::NoHostAddressBox
+        );
+        assert!(binder.open().is_empty());
+
+        // The next box's publication binds the ports the guest still holds
+        // as listening, with no new notice: a new box can listen on the same
+        // port within one guest poll, and the guest then sends nothing.
+        assert!(registry.admit_host_ip_box(mirror_session(1), None));
+        let mut held = vec![(node, ports[1]), (node, ports[2])];
+        held.sort_unstable();
+        assert_eq!(binder.open(), held);
+
+        // The node's end undoes the binds and closes the address. The row
+        // leaves the way production removes it: the drainer withdraws it
+        // once its relay ended and its grace passed.
+        assert_eq!(
+            registry.mirror_notice(listening(ports[1])),
+            MirrorOutcome::Bound
+        );
+        registry.spawn_withdrawal_drainer(|_| {});
+        let node_row = registry
+            .table()
+            .by_source(SUBNET.daemon_ip().octets())
+            .expect("the node's row stands");
+        relay_carried_and_ended(&registry, &[&node_row]);
+        wait_until(|| node_row.is_detached(), "the node's row detaches");
+        registry.advance_clock(DETACH_GRACE);
+        wait_until(
+            || binder.open().is_empty(),
+            "the drainer's withdrawal of the node's row undoes every bind",
+        );
+        assert!(
+            registry
+                .table()
+                .by_source(SUBNET.daemon_ip().octets())
+                .is_none()
+        );
+        assert_eq!(registry.node_mirror().address(), None);
+    }
+
+    /// A [`MirrorBinder`] that reads the mirror's state from inside every
+    /// call. It deadlocks if the mirror calls it with its state lock held.
+    #[derive(Debug, Default)]
+    struct ReentrantBinder {
+        registry: std::sync::OnceLock<BoxRegistry>,
+        seen: Mutex<Vec<Vec<u16>>>,
+    }
+
+    impl MirrorBinder for ReentrantBinder {
+        fn bind(&self, _: Ipv4Addr, _: u16) -> Result<(), MirrorBindError> {
+            let registry = self.registry.get().expect("the registry is set");
+            let bound = registry.node_mirror().bound_ports();
+            self.seen.lock().expect("the seen lock").push(bound);
+            Ok(())
+        }
+
+        fn unbind(&self, _: Ipv4Addr, _: u16) -> MirrorUnbind {
+            let registry = self.registry.get().expect("the registry is set");
+            let bound = registry.node_mirror().bound_ports();
+            self.seen.lock().expect("the seen lock").push(bound);
+            MirrorUnbind::Undone {
+                connections_reset: 0,
+            }
+        }
+    }
+
+    /// NET-138: the mirror makes every binder call with its state lock
+    /// released, so a slow switch stalls no reader of the mirror.
+    #[test]
+    fn mirror_calls_the_binder_without_its_state_lock() {
+        let binder = Arc::new(ReentrantBinder::default());
+        let registry = BoxRegistry::new(SUBNET)
+            .with_mirror_binder(Arc::clone(&binder) as Arc<dyn MirrorBinder>);
+        binder
+            .registry
+            .set(registry.clone())
+            .expect("the registry is set once");
+        registry.register_node_namespace(7654);
+        registry
+            .open_node_mirror(mirror_address())
+            .expect("the mirror opens");
+        registry.node_mirror().set_range_probe(true);
+        assert!(registry.admit_host_ip_box(mirror_session(1), None));
+        assert_eq!(
+            registry.mirror_notice(listening(18_080)),
+            MirrorOutcome::Bound
+        );
+        assert!(registry.retire_host_ip_box(mirror_session(1)));
+        assert!(registry.node_mirror().bound_ports().is_empty());
+        assert_eq!(
+            *binder.seen.lock().expect("the seen lock"),
+            vec![Vec::<u16>::new(), Vec::<u16>::new()],
+            "the bind ran before it was recorded, and the unbind after it was forgotten"
+        );
+    }
+
+    /// NET-138: the node's mirror opens only at a reserved-range address
+    /// that no box row publishes at: never `127.0.0.1`, never the wildcard.
+    #[test]
+    fn mirror_opens_only_at_the_nodes_reserved_range_address() {
+        let registry = BoxRegistry::new(SUBNET);
+        assert_eq!(
+            registry.open_node_mirror(Ipv4Addr::LOCALHOST),
+            Err(MirrorAddressRefused::OutsideReservedRange(
+                Ipv4Addr::LOCALHOST
+            ))
+        );
+        assert_eq!(
+            registry.open_node_mirror(Ipv4Addr::UNSPECIFIED),
+            Err(MirrorAddressRefused::OutsideReservedRange(
+                Ipv4Addr::UNSPECIFIED
+            ))
+        );
+        // The range's `.1` is the answerer's, never the node's.
+        let answerer = switch::loopback::range_hosts()
+            .next()
+            .expect("the reserved range's first host");
+        assert_eq!(
+            registry.open_node_mirror(answerer),
+            Err(MirrorAddressRefused::OutsideReservedRange(answerer))
+        );
+        let row_address = switch::loopback::range_hosts()
+            .nth(3)
+            .expect("a reserved-range host");
+        registry.register(BoxRegistration::new(
+            "web",
+            Ipv4Addr::new(100, 64, 0, 9),
+            row_address,
+        ));
+        assert_eq!(
+            registry.open_node_mirror(row_address),
+            Err(MirrorAddressRefused::HeldByAnotherNamespace(row_address))
+        );
+        assert_eq!(registry.node_mirror().address(), None);
+        assert_eq!(registry.open_node_mirror(mirror_address()), Ok(()));
+        assert_eq!(registry.node_mirror().address(), Some(mirror_address()));
+    }
+
+    /// NET-138: the node's mirror makes no bind until the whole-range probe
+    /// passes. A notice before that holds the port, the pass binds it, and
+    /// a failed probe undoes the bind until the next pass.
+    #[test]
+    fn mirror_binds_nothing_before_the_range_probe_passes() {
+        let (registry, binder) = mirror_registry(false);
+        let node = mirror_address();
+        let port = free_port();
+        assert_eq!(
+            registry.mirror_notice(listening(port)),
+            MirrorOutcome::Waiting
+        );
+        assert!(binder.calls().is_empty(), "no bind before the probe passes");
+
+        registry.node_mirror().set_range_probe(true);
+        assert_eq!(
+            binder.open(),
+            vec![(node, port)],
+            "the pass binds the held port"
+        );
+
+        registry.node_mirror().set_range_probe(false);
+        assert!(binder.open().is_empty(), "a failed probe undoes the bind");
+        assert_eq!(
+            registry.mirror_notice(listening(port)),
+            MirrorOutcome::Waiting
+        );
+        assert!(binder.open().is_empty());
+
+        registry.node_mirror().set_range_probe(true);
+        assert_eq!(binder.open(), vec![(node, port)]);
+
+        // A mirror with no address open binds nothing either, whatever the
+        // probe says.
+        let unopened = Arc::new(TestMirrorBinder::default());
+        let registry = BoxRegistry::new(SUBNET)
+            .with_mirror_binder(Arc::clone(&unopened) as Arc<dyn MirrorBinder>);
+        registry.node_mirror().set_range_probe(true);
+        assert!(registry.admit_host_ip_box(mirror_session(1), None));
+        assert_eq!(
+            registry.mirror_notice(listening(port)),
+            MirrorOutcome::Waiting
+        );
+        assert!(unopened.calls().is_empty());
+    }
+
+    /// NET-138: a host port already held at the node's address is a
+    /// collision. The mirror records it for the surfaces that list it, and
+    /// never tries another port or another address.
+    #[test]
+    fn mirror_reports_an_occupied_host_port_and_never_remaps() {
+        let (registry, binder) = mirror_registry(true);
+        let node = mirror_address();
+        // The test binder's listeners stand on `127.0.0.1`, so the holder
+        // does too ([`TestMirrorBinder`]).
+        let holder =
+            std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a holder on the host");
+        let port = holder.local_addr().expect("the holder's address").port();
+
+        assert_eq!(
+            registry.mirror_notice(listening(port)),
+            MirrorOutcome::Collided
+        );
+        assert_eq!(
+            binder.calls(),
+            vec![("bind", node, port)],
+            "one bind, at the noticed port and the node's address only"
+        );
+        assert!(binder.open().is_empty());
+        assert_eq!(registry.node_mirror().collisions(), vec![port]);
+        assert!(registry.node_mirror().bound_ports().is_empty());
+        // The refused notice holds nothing: a probe pass binds nothing at
+        // the port, and the guest sends the notice again.
+        registry.node_mirror().set_range_probe(false);
+        registry.node_mirror().set_range_probe(true);
+        assert_eq!(
+            binder.calls().len(),
+            1,
+            "a refused notice is not bound later"
+        );
+
+        // Once the holder is gone, the next notice binds the same port.
+        drop(holder);
+        assert_eq!(
+            registry.mirror_notice(listening(port)),
+            MirrorOutcome::Bound
+        );
+        assert_eq!(binder.open(), vec![(node, port)]);
+        assert!(registry.node_mirror().collisions().is_empty());
+
+        // A bind a probe pass makes for a held port and that collides
+        // stays held, and the next verdict retries it at the same port.
+        let (registry, binder) = mirror_registry(false);
+        let holder =
+            std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a holder on the host");
+        let port = holder.local_addr().expect("the holder's address").port();
+        assert_eq!(
+            registry.mirror_notice(listening(port)),
+            MirrorOutcome::Waiting
+        );
+        registry.node_mirror().set_range_probe(true);
+        assert_eq!(registry.node_mirror().collisions(), vec![port]);
+        assert!(binder.open().is_empty());
+        drop(holder);
+        registry.node_mirror().set_range_probe(true);
+        assert_eq!(binder.open(), vec![(node, port)]);
+        assert!(
+            binder
+                .calls()
+                .iter()
+                .all(|(_, at, held)| *at == node && *held == port),
+            "the retry binds the same port at the same address"
+        );
+    }
+
+    /// A [`TestMirrorBinder`] whose host refuses the first `refusals`
+    /// undos, as a switch that answers an error does.
+    #[derive(Debug, Default)]
+    struct RefusingBinder {
+        inner: TestMirrorBinder,
+        refusals: AtomicU32,
+    }
+
+    impl MirrorBinder for RefusingBinder {
+        fn bind(&self, address: Ipv4Addr, port: u16) -> Result<(), MirrorBindError> {
+            self.inner.bind(address, port)
+        }
+
+        fn unbind(&self, address: Ipv4Addr, port: u16) -> MirrorUnbind {
+            let refused = self
+                .refusals
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok();
+            if refused {
+                return MirrorUnbind::Refused("HTTP 500".to_string());
+            }
+            self.inner.unbind(address, port)
+        }
+    }
+
+    /// NET-138: an undo the host refused is owed, and the mirror retries
+    /// it with its next change, so the bind does not outlive its listener.
+    #[test]
+    fn mirror_retries_an_undo_the_host_refused() {
+        let binder = Arc::new(RefusingBinder {
+            refusals: AtomicU32::new(1),
+            ..RefusingBinder::default()
+        });
+        let registry = BoxRegistry::new(SUBNET)
+            .with_mirror_binder(Arc::clone(&binder) as Arc<dyn MirrorBinder>);
+        registry.register_node_namespace(7654);
+        registry
+            .open_node_mirror(mirror_address())
+            .expect("the mirror opens");
+        registry.node_mirror().set_range_probe(true);
+        assert!(registry.admit_host_ip_box(mirror_session(1), None));
+        let port = free_port();
+        assert_eq!(
+            registry.mirror_notice(listening(port)),
+            MirrorOutcome::Bound
+        );
+        assert_eq!(
+            registry.mirror_notice(stopped(port)),
+            MirrorOutcome::Unbound
+        );
+        assert_eq!(
+            binder.inner.open(),
+            vec![(mirror_address(), port)],
+            "the refused undo leaves the bind standing"
+        );
+        registry.node_mirror().set_range_probe(true);
+        assert!(
+            binder.inner.open().is_empty(),
+            "the next change retries the undo"
+        );
+    }
+
+    /// NET-138: the per-node caps, at their working values. Listening
+    /// notices past the rate are dropped and counted, a stop notice is
+    /// never refused, and a new port past the bind cap is refused.
+    #[test]
+    fn mirror_caps_notices_and_binds() {
+        let (registry, binder) = mirror_registry(false);
+        let mirror = registry.node_mirror();
+        let start = Instant::now();
+        for port in 0..MIRROR_NOTICES_PER_SECOND {
+            let port = 20_000 + u16::try_from(port).expect("a small count");
+            assert_eq!(
+                mirror.notice(listening(port), &BTreeSet::new(), start),
+                MirrorOutcome::Waiting
+            );
+        }
+        assert_eq!(
+            mirror.notice(listening(30_000), &BTreeSet::new(), start),
+            MirrorOutcome::Capped
+        );
+        assert_eq!(mirror.notices_dropped_by_rate(), 1);
+        assert_eq!(
+            mirror.notice(stopped(20_000), &BTreeSet::new(), start),
+            MirrorOutcome::Unbound,
+            "a stop notice is never refused by the rate"
+        );
+
+        let mut at = start + MIRROR_NOTICE_WINDOW;
+        let mut port = 40_000;
+        while mirror.notice(listening(port), &BTreeSet::new(), at) == MirrorOutcome::Waiting {
+            port += 1;
+            at += MIRROR_NOTICE_WINDOW;
+        }
+        assert_eq!(
+            mirror.notice(listening(port), &BTreeSet::new(), at + MIRROR_NOTICE_WINDOW),
+            MirrorOutcome::Capped,
+            "a new port past the bind cap is refused"
+        );
+        assert_eq!(
+            usize::from(port - 40_000) + MIRROR_NOTICES_PER_SECOND - 1,
+            MIRRORED_BINDS_CAP
+        );
+        assert!(binder.calls().is_empty());
     }
 }

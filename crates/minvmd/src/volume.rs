@@ -47,7 +47,7 @@ pub fn volume_bytes() -> u64 {
 ///
 /// [`DATA_VOLUME_PATH_ENV`] overrides it explicitly (used verbatim); otherwise
 /// the image lives beside the instance's socket and locks as
-/// `<provider dir>/data-vol.raw`, so it survives clean restarts and follows
+/// `<host dir>/data-vol.raw`, so it survives clean restarts and follows
 /// the same `--minimal-state-dir` / `XDG_STATE_HOME` resolution — isolating
 /// an instance isolates its writable image too (double-attaching one image
 /// corrupts it).
@@ -56,12 +56,12 @@ pub fn resolve_data_volume_path() -> PathBuf {
     std::env::var_os(DATA_VOLUME_PATH_ENV)
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| data_volume_path_in(&crate::state::provider_dir()))
+        .unwrap_or_else(|| data_volume_path_in(&crate::state::host_dir()))
 }
 
-/// `<provider dir>/data-vol.raw`. Pure, for unit testing.
-fn data_volume_path_in(provider_dir: &Path) -> PathBuf {
-    provider_dir.join("data-vol.raw")
+/// `<host dir>/data-vol.raw`. Pure, for unit testing.
+fn data_volume_path_in(host_dir: &Path) -> PathBuf {
+    host_dir.join("data-vol.raw")
 }
 
 /// Failure modes of [`ensure_sparse_raw`].
@@ -170,8 +170,9 @@ fn create_sparse_raw(path: &Path, size_bytes: u64) -> Result<(), VolumeError> {
             source,
         })?;
     }
-    // 0600, never the mode the umask gives (BEP-047): only the VM user
-    // opens the data disk, and `min diag` reads only its size.
+    // 0600, never the mode the umask gives (formerly BEP-047,
+    // gominimal/inbox#1184): only the VM user opens the data disk, and
+    // `min diag` reads only its size.
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -271,7 +272,8 @@ mod tests {
         p
     }
 
-    /// BEP-047: the data volume is created 0600 whatever the umask gives.
+    /// Formerly BEP-047 (gominimal/inbox#1184): the data volume is created
+    /// 0600 whatever the umask gives.
     #[test]
     fn data_volume_is_created_owner_only() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -345,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn data_volume_path_sits_in_provider_dir() {
+    fn data_volume_path_sits_in_host_dir() {
         assert_eq!(
             data_volume_path_in(Path::new("/state/minimal/providers/local-minvmd0")),
             PathBuf::from("/state/minimal/providers/local-minvmd0/data-vol.raw"),

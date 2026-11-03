@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// The persisted TUI state. Stores only a session id and provider label —
+/// The persisted TUI state. Stores only a session id and host label —
 /// no credentials, no secrets.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DashState {

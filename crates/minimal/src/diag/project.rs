@@ -153,6 +153,11 @@ fn resolve(cwd: &Path, repo_dir: Option<&Path>) -> Result<Project, String> {
             // is the diagnostic; the offending text is not this collector's
             // to publish.
             mfile::Error::Format(_) => format!("the {name} {searched} is not valid TOML"),
+            // A bad link table names the file and quotes the user's table
+            // header, so it gets the same reduction.
+            mfile::Error::LinkConfig { .. } => {
+                format!("the {name} {searched} has an invalid [upstream] or sideload table")
+            }
             e => format!("the {name} {searched} could not be read: {e}"),
         }
     })?;

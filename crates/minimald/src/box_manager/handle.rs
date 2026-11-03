@@ -25,6 +25,11 @@ pub struct BoxManagerHandle {
     /// through the actor mainloop.
     #[cfg(target_os = "linux")]
     pub(super) hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+    /// The forwarder-conducted range walk of a microVM daemon, set at init
+    /// when the daemon publishes through the host's forwarder. Empty on a
+    /// native daemon, whose own loopback is its publish surface.
+    #[cfg(target_os = "linux")]
+    pub(super) range_walk: Arc<std::sync::OnceLock<Arc<super::RangeWalk>>>,
     /// The actor's lease book, held only for the one test seam below: a test
     /// that needs this daemon to be in the state a daemon whose deferred
     /// probe is still walking holds its book in. Production callers reach
@@ -49,6 +54,9 @@ pub struct WeakBoxManagerHandle {
     /// keep the actor alive (only live senders do).
     #[cfg(target_os = "linux")]
     pub(super) hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+    /// Mirrors [`BoxManagerHandle::range_walk`].
+    #[cfg(target_os = "linux")]
+    pub(super) range_walk: Arc<std::sync::OnceLock<Arc<super::RangeWalk>>>,
     /// Mirrors [`BoxManagerHandle::loopback`], for the same reason: the test seam
     /// must survive an upgrade.
     #[cfg(all(test, target_os = "linux"))]
@@ -65,6 +73,8 @@ impl WeakBoxManagerHandle {
             in_shutdown: self.in_shutdown.clone(),
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
+            #[cfg(target_os = "linux")]
+            range_walk: Arc::clone(&self.range_walk),
             #[cfg(all(test, target_os = "linux"))]
             loopback: Arc::clone(&self.loopback),
         })
@@ -141,6 +151,8 @@ impl BoxManagerHandle {
             in_shutdown: self.in_shutdown.clone(),
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&self.hostnames),
+            #[cfg(target_os = "linux")]
+            range_walk: Arc::clone(&self.range_walk),
             #[cfg(all(test, target_os = "linux"))]
             loopback: Arc::clone(&self.loopback),
         }
@@ -174,6 +186,48 @@ impl BoxManagerHandle {
             .set_range_verdict(crate::net::dns::RangeVerdict::Pending);
         self.loopback
             .reset_hand_verdict_deadline(crate::net::dns::HAND_VERDICT_WAIT.as_millis() as u64);
+    }
+
+    /// The session-start range walk (NET-123) of a daemon that publishes
+    /// through the host's forwarder: the forwarder walks the reserved local
+    /// range again at every session start, whatever verdict landed last,
+    /// and lands what it finds. A present landing moves every box that
+    /// stands at the `127.0.0.1` interim onto its range address, the same
+    /// present arm [`Self::land_range_verdict`] runs. So a host that gained
+    /// the range after the daemon started (`min finalize-install`)
+    /// publishes the next box in the range, without a VM restart. An absent
+    /// landing after a present one moves every box in the range onto the
+    /// interim, because the range can go away under a running VM.
+    ///
+    /// `None` on a native daemon: its own loopback is the publish surface,
+    /// and the create handler's local bind probe is the honest one there.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn session_start_range_walk(&self) -> Option<super::RangeWalkAnswer> {
+        let walk = Arc::clone(self.range_walk.get()?);
+        Some(walk.session_start().await)
+    }
+
+    /// Makes this daemon a forwarder-walking one whose walk is `walk`, a
+    /// stand-in for the host forwarder's bind of the reserved local range.
+    /// The create handler then asks [`Self::session_start_range_walk`], as
+    /// it does on a microVM daemon, and the stand-in decides the verdict.
+    ///
+    /// Test-only: a production daemon gets its walk from its switch
+    /// transport at init. Panics if a walk is already installed.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn install_range_walk_standin(
+        &self,
+        walk: impl Fn() -> crate::net::loopback::RangeProbe + Send + Sync + 'static,
+    ) {
+        let walk = super::RangeWalk::new(
+            super::RangeWalkSource::StandIn(Arc::new(walk)),
+            Arc::clone(&self.loopback),
+            Arc::clone(&self.hostnames),
+        );
+        assert!(
+            self.range_walk.set(Arc::new(walk)).is_ok(),
+            "a range walk is already installed on this daemon"
+        );
     }
 
     /// Lands a range verdict with the arms the deferred walk runs when it
@@ -388,6 +442,22 @@ impl BoxManagerHandle {
             .sender
             .send(ManagerMessage::GetSession(pred, send))
             .await;
+        recv.await.expect("corresponding sessions manager is dead")
+    }
+
+    /// The handle of the session's live actor, if it has one. Never starts
+    /// an actor. See [`ManagerMessage::GetRunning`].
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn running_session(
+        &self,
+        id: SessionId,
+    ) -> Result<Option<BoxHandle>, BoxManagerError> {
+        let (send, recv) = Responder::channel();
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "a send that fails drops the responder, and the recv below reports it"
+        )]
+        let _ = self.sender.send(ManagerMessage::GetRunning(id, send)).await;
         recv.await.expect("corresponding sessions manager is dead")
     }
 

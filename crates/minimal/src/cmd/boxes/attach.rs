@@ -26,44 +26,67 @@ pub(crate) fn box_announce_label(id: &boxes::SessionId, name: Option<&str>) -> S
     }
 }
 
-/// Resolve a named attach target to its record and the socket the hand-off
-/// runs over — the target `min session attach` lands in when the name alone
-/// decides where to look (NET-058).
+/// Resolve a named box to its record and the socket the hand-off runs over:
+/// the target `min session attach`, `min session exec`, `min session run` and
+/// `min net forward` land in when the name alone decides where to look
+/// (NET-058). `verb` leads the one line that says which VM the box was found
+/// on ("Attaching to", "Running in", ...).
 ///
-/// The selected VM's daemon is asked first (`client`, reached over `sock`):
-/// the common case — a box on the VM the operator is already on — costs
-/// nothing beyond the one lookup the command always made, and its answer is
-/// gated on the reply that lookup was already making. When that daemon does
+/// The selected VM's daemon is asked first (`client`, reached over `sock`),
+/// and its answer is gated on the reply that lookup was already making. On a
+/// host with several VMs and no `--vm`, a hit there is checked against every
+/// VM, and a name a second VM also holds is an ambiguity
+/// ([`ensure_selected_holds_box_alone`]). When that daemon does
 /// not know the name, [`crate::attach::resolve_box_vm`] resolves the VM that owns it
 /// across every VM's socket, so no global flag is needed to reach a box on
 /// another VM — the resolution gates the owning daemon on the very reply that
 /// named the box, so a skewed VM cannot be reached through it. Nothing found
 /// anywhere returns the selected VM's own error — the "no session found" it
 /// computed, or its skew — as the more useful of the two answers.
+pub(crate) async fn resolve_named_box_version_gated(
+    global: &GlobalArgs,
+    client: &mut client::Client,
+    sock: std::path::PathBuf,
+    name: &str,
+    verb: &str,
+    example: &str,
+) -> Result<(boxes::Record, std::path::PathBuf), anyhow::Error> {
+    match resolve_session_version_gated(client, name).await {
+        Ok(record) => {
+            // A second VM that holds the name makes it ambiguous. The check
+            // runs before the attach touches the terminal.
+            ensure_selected_holds_box_alone(global, name, &record).await?;
+            Ok((record, sock))
+        }
+        Err(selected) => {
+            // Every refusal here — the miss, a box on a stopped VM, an
+            // ambiguous name — is made before the attach touches the
+            // terminal, so it prints on the terminal as the user left it.
+            let resolved = resolve_box_on_another_vm(global, name, example, selected).await?;
+            // The operator never chose the VM the way they chose the
+            // session, so tell them which one they're landing in.
+            if should_announce_box(global) {
+                eprintln!(
+                    "{verb} session {} on VM {}",
+                    box_announce_label(&resolved.record.id, resolved.record.name.as_deref()),
+                    resolved.vm
+                );
+            }
+            Ok((resolved.record, resolved.sock))
+        }
+    }
+}
+
+/// [`resolve_named_box_version_gated`] for `min session attach`: the attach
+/// target, announced as one.
 pub(crate) async fn resolve_attach_target_version_gated(
     global: &GlobalArgs,
     client: &mut client::Client,
     sock: std::path::PathBuf,
     name: &str,
 ) -> Result<(boxes::Record, std::path::PathBuf), anyhow::Error> {
-    match resolve_session_version_gated(client, name).await {
-        Ok(record) => Ok((record, sock)),
-        Err(selected) => match crate::attach::resolve_box_vm(global, name).await? {
-            Some(resolved) => {
-                // The operator never chose the VM the way they chose the
-                // session, so tell them which one they're landing in.
-                if should_announce_box(global) {
-                    eprintln!(
-                        "Attaching to session {} on VM {}",
-                        box_announce_label(&resolved.record.id, resolved.record.name.as_deref()),
-                        resolved.vm
-                    );
-                }
-                Ok((resolved.record, resolved.sock))
-            }
-            None => Err(selected),
-        },
-    }
+    let example = format!("session attach {name}");
+    resolve_named_box_version_gated(global, client, sock, name, "Attaching to", &example).await
 }
 
 /// Resolve a session to attach to when the user supplied no explicit session
@@ -198,7 +221,7 @@ pub(crate) fn ensure_interactive_attach_tty(stdin_is_tty: bool) -> Result<(), an
 /// (exec ssh, or exit with the attach's status) that [`run`] finishes once
 /// the command's `cmd` span has ended, so callers return it untouched.
 pub(crate) async fn box_via_ssh(
-    kind: paths::ProviderKind,
+    kind: paths::HostKind,
     sock: &std::path::Path,
     id: boxes::SessionId,
     wire: Option<String>,
@@ -270,10 +293,17 @@ pub(crate) async fn box_via_ssh(
                 stdin_is_tty,
                 crate::attach::TerminalUnwind::arm,
                 |ssh| {
-                    minimal_client::attach::run_interactive_attach(
-                        ssh,
+                    // A terminal the relay could not take was never changed,
+                    // so a failure here owes it nothing; the marker tells
+                    // `interactive_attach` so.
+                    let real = minimal_client::tty_relay::RealTty::acquire()
+                        .context(crate::attach::TerminalNotTaken)?;
+                    mark_relay_not_started(
                         subscribe_host_asks(host_asks)
                             .map(minimal_client::attach::HostAsks::into_hook),
+                        |hook| {
+                            minimal_client::attach::run_interactive_attach_on(ssh, real, Some(hook))
+                        },
                     )
                 },
             )
@@ -393,7 +423,7 @@ fn subscribe_host_asks(
 /// VM-backed host only. Whether the attach subscribes for it is decided
 /// from its record ([`host_asks_target`]).
 pub(crate) fn host_asks_box(global: &GlobalArgs, name: Option<&str>) -> Option<String> {
-    (daemon_provider_kind(global) == paths::ProviderKind::Minvmd)
+    (daemon_host_kind(global) == paths::HostKind::Minvmd)
         .then_some(name)
         .flatten()
         .map(str::to_string)
@@ -406,6 +436,45 @@ async fn kill_ssh(child: &mut tokio::process::Child) {
     if let Err(e) = child.kill().await {
         tracing::debug!(error = %e, "ssh kill failed; it had already exited");
     }
+}
+
+/// Run the relay with a suspend hook that records that the relay started,
+/// and mark a failure that came before it with
+/// [`crate::attach::RelayNotStarted`].
+///
+/// The relay calls its suspend hook only once `Relay::start` returned: ssh
+/// runs on the pty and the real terminal is in raw mode. Every failure of
+/// `Relay::start` comes before ssh's output can reach the real terminal, and
+/// the relay put back what it changed, so the attach owes the terminal no
+/// unwind. `inner` is the caller's own hook, if any, and runs as before.
+///
+/// The hook runs on a thread of its own, so a relay that started and then
+/// failed at once can return before the hook records it. Then the guard
+/// stands down, though the relay restored the termios. The only such
+/// failure is the wait on ssh's exit.
+pub(crate) fn mark_relay_not_started(
+    inner: Option<minimal_client::tty_relay::SuspendHook>,
+    run: impl FnOnce(
+        minimal_client::tty_relay::SuspendHook,
+    ) -> Result<std::process::ExitStatus, anyhow::Error>,
+) -> Result<std::process::ExitStatus, anyhow::Error> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let started = Arc::new(AtomicBool::new(false));
+    let hook_started = Arc::clone(&started);
+    let hook: minimal_client::tty_relay::SuspendHook = Box::new(move |handle| {
+        hook_started.store(true, Ordering::Release);
+        if let Some(inner) = inner {
+            inner(handle);
+        }
+    });
+    run(hook).map_err(|e| {
+        if started.load(Ordering::Acquire) {
+            e
+        } else {
+            anyhow::Error::new(crate::attach::RelayNotStarted(e))
+        }
+    })
 }
 
 /// The interactive attach, from the terminal check to ssh's exit code.
@@ -426,6 +495,15 @@ async fn kill_ssh(child: &mut tokio::process::Child) {
 /// only process left that can still reach the tty. So the guard stays
 /// armed for the duration and is stood down only once ssh's exit proves
 /// the daemon was alive and speaking: see `crate::attach::client_must_unwind`.
+///
+/// A relay that fails once it holds the terminal ends `min session attach`
+/// with an error, which `main` prints after this returns. The relay put the
+/// attach-start termios back before it returned, and the guard writes its
+/// unwind as it drops here, so the error lands on a restored terminal and
+/// stays on screen after the exit. Only a relay that never took the
+/// terminal ([`crate::attach::TerminalNotTaken`]) or never started ssh's
+/// session on it ([`crate::attach::RelayNotStarted`]) stands the guard
+/// down, because nothing of the session reached the terminal.
 pub(crate) fn interactive_attach<W: std::io::Write>(
     ssh: std::process::Command,
     stdin_is_tty: bool,
@@ -437,10 +515,19 @@ pub(crate) fn interactive_attach<W: std::io::Write>(
     let status = match relay(ssh) {
         Ok(status) => status,
         Err(e) => {
-            // ssh never ran (or the relay never took the terminal), so
-            // nothing of the session reached the terminal and there is
-            // nothing to put back.
-            unwind.disarm();
+            // The relay never took the terminal, or never started ssh's
+            // session on it, so nothing of the session reached it and there
+            // is nothing to put back. Any other failure came after the
+            // session started, and the session may have left its modes set:
+            // the guard writes the unwind as it drops, before the error is
+            // printed.
+            if e.downcast_ref::<crate::attach::TerminalNotTaken>()
+                .is_some()
+                || e.downcast_ref::<crate::attach::RelayNotStarted>().is_some()
+            {
+                unwind.disarm();
+            }
+            drop(unwind);
             return Err(e).context("failed to run ssh");
         }
     };
@@ -511,7 +598,7 @@ mod tests {
     }
 
     /// A host-side ask stand: the real VM host daemon's control server and
-    /// guest door over a real registry, in a provider dir the CLI resolves
+    /// guest door over a real registry, in a host dir the CLI resolves
     /// the control socket in (NET-045).
     struct AskStand {
         _dir: tempfile::TempDir,
@@ -524,9 +611,9 @@ mod tests {
     impl AskStand {
         fn start() -> Self {
             let dir = tempfile::TempDir::new().unwrap();
-            let provider_dir = dir.path().join("providers").join("local-minvmd0");
-            std::fs::create_dir_all(&provider_dir).unwrap();
-            let control = provider_dir.join("control.sock");
+            let host_dir = dir.path().join("providers").join("local-minvmd0");
+            std::fs::create_dir_all(&host_dir).unwrap();
+            let control = host_dir.join("control.sock");
             let registry = minvmd::box_registry::BoxRegistry::new(switch::SwitchSubnet::default());
             let answerer =
                 minvmd::net::answerer::AnswererStatus::allocating_for_tests("ask-test-node");
@@ -572,7 +659,7 @@ mod tests {
                 quic443: None,
             };
             register_box_for_activation(
-                paths::ProviderKind::Minvmd,
+                paths::HostKind::Minvmd,
                 self.global.minimal_dir.as_deref(),
                 NetworkMode::OwnIp,
                 name,

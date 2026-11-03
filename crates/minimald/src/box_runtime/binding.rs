@@ -135,9 +135,13 @@ pub(super) enum MainloopExitReason {
     HostGone,
     /// The client detached.
     Detach,
+    /// The client went away without a detach: it closed its channel, or
+    /// its connection dropped.
+    ClientLost,
     /// Another connection attached, superseding this one.
     Superceded,
-    /// The session process ended; the shell-exit prompt was raised.
+    /// The session process ended. The shell-exit prompt follows only for a
+    /// box that outlives its entrypoint.
     ProcessExited,
     /// The daemon is shutting down.
     Shutdown,
@@ -153,7 +157,8 @@ impl MainloopExitReason {
     /// can tell the two apart.
     pub(super) fn exit_status(&self) -> u32 {
         match self {
-            Self::Detach | Self::ProcessExited => 0,
+            // Nobody reads the status of a lost client; 0 as for a detach.
+            Self::Detach | Self::ClientLost | Self::ProcessExited => 0,
             Self::HostGone | Self::Superceded | Self::Shutdown => DAEMON_ENDED_EXIT_STATUS,
             Self::Shed => SHED_EXIT_STATUS,
         }
@@ -392,6 +397,10 @@ pub(super) struct Binding {
     /// the shell-exit prompt's Keep item says the session cannot be
     /// attached to again.
     holds_host_row: bool,
+    /// Whether the box ends when its entrypoint returns (see
+    /// [`HostParams::ends_with_entrypoint`]). The daemon then ends the box,
+    /// so a shell exit raises no shell-exit prompt (BOX-038).
+    ends_with_entrypoint: bool,
     /// Cancelled by the host when it sheds this binding (see
     /// [`Host::shed_binding`]). A separate signal rather than a
     /// [`BindingMsg`], because a binding is shed exactly when its mailbox is
@@ -399,6 +408,10 @@ pub(super) struct Binding {
     /// client, so the binding still reaches its exit path and closes the
     /// channel.
     shed: CancellationToken,
+    /// The box's directory, where this binding records `detached` when its
+    /// client leaves and the box runs on (BOX-016). `None` for a host whose
+    /// workspace is not in the box store (tests).
+    box_dir: Option<boxes::store::BoxDir>,
 }
 
 /// What the host keeps of an attached binding: its mailbox, its task, and
@@ -466,6 +479,8 @@ impl Binding {
         name: String,
         archives_dir: std::path::PathBuf,
         holds_host_row: bool,
+        ends_with_entrypoint: bool,
+        box_dir: Option<boxes::store::BoxDir>,
     ) -> BindingSlot {
         let (tx, rx) = mpsc::channel(4);
         let shed = CancellationToken::new();
@@ -480,7 +495,9 @@ impl Binding {
             name,
             archives_dir,
             holds_host_row,
+            ends_with_entrypoint,
             shed: shed.clone(),
+            box_dir,
         };
 
         // The channel id ties every line this binding logs back to the
@@ -525,9 +542,6 @@ impl Binding {
         let (mut rs, ws) = self.channel.split();
         let mut w = ws.make_writer();
 
-        // Reading from the remote stops once it sends EOF;
-        // the loop lives on to keep forwarding stdout.
-        let mut remote_open = true;
         // The asks whose dialogs this loop's head renders one at a time
         // (NET-045), stashed by the select arm below because a dialog needs
         // the channel halves the select's own futures are borrowing.
@@ -708,8 +722,15 @@ impl Binding {
             }
             tokio::select! {
                 // Remote (ssh channel) => session stdin.
-                res = rs.wait(), if remote_open => match res {
-                    None => remote_open = false,
+                // An EOF from the client ends its input only. The loop
+                // reads on, to forward stdout and to see the close.
+                res = rs.wait() => match res {
+                    // The client closed its channel, or its connection
+                    // dropped: nothing reads this terminal any more. russh
+                    // forwards a close as `Close` and then ends the stream.
+                    // BOX-015: only this binding ends. The box keeps
+                    // running, and its entrypoint's return or a stop ends it.
+                    None | Some(russh::ChannelMsg::Close) => break MainloopExitReason::ClientLost,
                     Some(msg) => {
                         match msg {
                             russh::ChannelMsg::Data{ data } => {
@@ -825,6 +846,17 @@ impl Binding {
         // which runs its own hooks instead.
         let session_outlives_us = match exit_reason {
             MainloopExitReason::HostGone => false,
+            // BOX-038: the entrypoint returned, and the daemon ends the box
+            // whether or not a client is attached. Nothing is left to keep
+            // or delete, so no prompt asks, and no detach hook runs: the box
+            // did not outlive this binding.
+            MainloopExitReason::ProcessExited if self.ends_with_entrypoint => {
+                tracing::info!(
+                    session = %self.name,
+                    "the box's entrypoint returned; the box ends, so no shell-exit prompt"
+                );
+                false
+            }
             MainloopExitReason::ProcessExited => {
                 let disposition = Self::shell_exit_prompt(
                     self.delta.as_ref(),
@@ -843,6 +875,10 @@ impl Binding {
                 disposition == ExitDisposition::Kept
             }
             MainloopExitReason::Detach => true,
+            // A lost client left a box that runs on, as a detach does, so
+            // its `on_detach` hooks run and agree with the `detached` event
+            // below. Unlike a shed, the hooks write to no client terminal.
+            MainloopExitReason::ClientLost => true,
             // NOT on supercede, however much it looks like a departure.
             // `Host::attach` sends the teardown and then awaits this
             // binding's join handle — from inside the host's own message
@@ -875,6 +911,16 @@ impl Binding {
             control.detached().await;
         }
 
+        // BOX-016: a client that left a box that runs on is recorded as a
+        // `detached` event, whether it chose to leave, went away, or was
+        // shed because it stopped reading.
+        if matches!(
+            exit_reason,
+            MainloopExitReason::Detach | MainloopExitReason::ClientLost | MainloopExitReason::Shed
+        ) {
+            Self::record_detached(self.box_dir.as_ref(), &exit_reason);
+        }
+
         let notice = match exit_reason {
             MainloopExitReason::Shed => Some(SHED_NOTICE),
             MainloopExitReason::HostGone => Some(HOST_GONE_NOTICE),
@@ -896,6 +942,33 @@ impl Binding {
         let _ = ws.eof().await;
         let _ = ws.exit_status(exit_reason.exit_status()).await;
         let _ = ws.close().await; // needed to release the remote
+    }
+
+    /// Writes the box's `detached` event (BOX-016), and logs it with the
+    /// reason the client left. A box whose record is gone has nothing to
+    /// record into, and a failed write goes to the log. An associated fn,
+    /// because [`Self::run`] has moved the channel out of `self`.
+    fn record_detached(dir: Option<&boxes::store::BoxDir>, reason: &MainloopExitReason) {
+        let Some(dir) = dir else {
+            return;
+        };
+        match dir.append_event(boxes::events::BoxEventType::Detached) {
+            Ok(event) => tracing::info!(
+                box_id = %event.box_id,
+                parent = %event.parent.map_or_else(|| "none".to_string(), |p| p.to_string()),
+                event_type = event.kind.name(),
+                ts = event.ts,
+                reason = ?reason,
+                events_path = %dir.events_path().as_str(),
+                "wrote a box event"
+            ),
+            Err(e) => tracing::warn!(
+                reason = ?reason,
+                events_path = %dir.events_path().as_str(),
+                error = %e,
+                "could not write the box's detached event"
+            ),
+        }
     }
 
     /// The save half of the shell-exit prompt's save-then-delete lane:
@@ -969,7 +1042,7 @@ impl Binding {
                     exit_reason = cause.exit.as_ref().map_or("", |r| r.reason.as_str()),
                     exit_code = ?cause.exit.as_ref().map(|r| r.code),
                     shown = !notices.is_empty(),
-                    "raising the shell-exit prompt",
+                    "the session process ended; tearing the attach down",
                 );
                 // `\r\n`: the remote terminal is in raw mode, so a bare
                 // newline stair-steps off the right margin.

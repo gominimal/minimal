@@ -97,6 +97,14 @@ pub enum Command {
     Run(RunArgs),
     /// Print important directories and file paths for debugging
     Dirs,
+    /// Check this host for problems: today, that no record of the audit log
+    /// was changed or removed
+    ///
+    /// Exits 0 when the audit log verifies or audit files are missing, and 6
+    /// when a record was changed or removed.
+    // BEP-049: whole-log verification of the audit chain is a `min doctor`
+    // check, never a `min box audit` flag.
+    Doctor,
     /// Collect a diagnostic bundle (logs, state, config) to send to the
     /// minimal dev team.
     ///
@@ -121,14 +129,14 @@ pub enum Command {
     Auth(AuthArgs),
     /// Store, list and remove the secrets that boxes reference by name
     Secret(SecretArgs),
-    /// Print that there is nothing to mint
+    // NET-109: `min login` is the alias for `min auth login`, so it takes
+    // the same arguments and runs the same sign-in.
+    /// Sign in to GitHub (the same as min auth login)
     ///
-    /// The HTTPS reverse proxy this verb once served is retired, so it
-    /// issues nothing and writes nothing to disk. The verb stays as the
-    /// future home of the sign-in that replaces it.
-    #[command(verbatim_doc_comment)]
-    #[command(hide = true)]
-    Login(LoginArgs),
+    /// Opens GitHub in your browser. With `--device`, or in a build with no
+    /// browser sign-in, prints a code to enter at github.com instead. The
+    /// token is kept in the host keychain and never written to a file.
+    Login(AuthLoginArgs),
     // `init`, `add`, and `update` are deliberate exceptions to the
     // `<noun> <verb>` convention (documented in docs/reference/cli.md): they
     // are passthroughs to the project-configuration commands of the same name
@@ -418,6 +426,30 @@ pub enum BoxCommand {
     /// admitted or refused, each secret minted for the box, and the box's
     /// revocation. A removed box's records stay readable by its id
     Audit(BoxAuditArgs),
+    /// List the boxes of the current project, in any state: their id,
+    /// name, type, parent, project and state, with how a stopped or exited
+    /// box ended. `--all` lists every box on this host
+    List(BoxListArgs),
+    /// Show one box: its id, name, type, parent, project, state, how it
+    /// ended and the identity it runs under
+    Show(BoxShowArgs),
+}
+
+// BOX-158 (BCLI-001): `min box list [--all]`.
+#[derive(Debug, Args)]
+pub struct BoxListArgs {
+    /// List every box on this host, not only the boxes of the current
+    /// project
+    #[arg(long)]
+    pub all: bool,
+}
+
+// BOX-159 (BCLI-003): `min box show <box>`.
+#[derive(Debug, Args)]
+pub struct BoxShowArgs {
+    /// The box: its id, the start of its id, or its name, as `min box list`
+    /// prints them
+    pub target: String,
 }
 
 // BEP-042: `min box audit <box|self> | --parent <box|self> [-o jsonl] [--follow]`.
@@ -453,6 +485,17 @@ pub struct BoxSpecArgs {
     /// The project directory whose minimal.toml declares the box
     /// (default: --repo-dir, or the current directory)
     pub path: Option<PathBuf>,
+    // The same flag as `min session activate --network`, from the same
+    // definition, so the preview is of the box that activation creates.
+    #[arg(
+        long,
+        value_name = NETWORK_VALUE_NAME,
+        value_parser = parse_network_mode,
+        default_value = NETWORK_DEFAULT,
+        help = NETWORK_HELP,
+        long_help = NETWORK_LONG_HELP
+    )]
+    pub network: CliNetworkMode,
 }
 
 #[derive(Debug, Args)]
@@ -646,7 +689,7 @@ impl GlobalArgs {
         matches!(self.provider, Some(Provider::LocalMinvmd))
     }
 
-    /// Publish `--vm` as this process's VM name so every provider dir the
+    /// Publish `--vm` as this process's VM name so every host dir the
     /// command resolves — socket, state dir, autospawn — names the same VM
     /// (NET-052). Called once at dispatch, before any path resolution; the
     /// default VM is untouched when the flag is absent (NET-053).
@@ -697,20 +740,15 @@ pub struct ActivateArgs {
     /// are otherwise skipped without a prompt.
     #[arg(long, value_enum)]
     pub sync: Option<SyncMode>,
-    /// Network mode for the session: `none` gives the session no network
-    /// (every socket it opens to a destination outside itself fails),
-    /// `host_ip` shares the host's network namespace (the default), and
-    /// `own_ip` gives the session its own IP address, so `--ingress` can
-    /// publish ports; unless the host opts out, an `own_ip` session with
-    /// no egress rules can reach no external address.
-    ///
-    /// The hyphenated spellings `no-net`, `host-net`, and `own-ip` are still
-    /// accepted, but each prints a one-line hint naming the current spelling.
+    // The `--network` flag is shared with `min box spec`, so the two
+    // cannot drift: see [`NETWORK_HELP`].
     #[arg(
         long,
-        value_name = "none|host_ip|own_ip",
+        value_name = NETWORK_VALUE_NAME,
         value_parser = parse_network_mode,
-        default_value = "host_ip"
+        default_value = NETWORK_DEFAULT,
+        help = NETWORK_HELP,
+        long_help = NETWORK_LONG_HELP
     )]
     pub network: CliNetworkMode,
     /// Static ingress port mapping `EXT:INT[/PROTO]` (PROTO = tcp|udp, default
@@ -810,7 +848,7 @@ pub struct ActivateArgs {
     pub attach: bool,
 }
 
-/// Which daemon backend ("provider") hosts sessions.
+/// Which daemon backend (box host) serves sessions, as `--provider` names it.
 ///
 /// On Linux the default is the host-native daemon (DM2); `local-minvmd` runs
 /// `minimald` inside the minvmd microVM (DM1) instead. On macOS minvmd is the
@@ -843,6 +881,38 @@ pub enum CliNetworkMode {
     HostNet,
     OwnIp,
 }
+
+/// The `--network` value name, shared by `min session activate` and
+/// `min box spec`.
+pub(crate) const NETWORK_VALUE_NAME: &str = "none|host_ip|own_ip";
+
+/// The `--network` default, shared by `min session activate` and `min box
+/// spec`, so a preview with no flag is of a box created with no flag.
+pub(crate) const NETWORK_DEFAULT: &str = "host_ip";
+
+/// The first paragraph of the `--network` help, as a literal so that
+/// [`NETWORK_LONG_HELP`] can extend it.
+macro_rules! network_help {
+    () => {
+        "Network mode for the session: `none` gives the session no network (every socket it \
+         opens to a destination outside itself fails), `host_ip` shares the host's network \
+         namespace (the default), and `own_ip` gives the session its own IP address, so \
+         `--ingress` can publish ports; unless the host opts out, an `own_ip` session with no \
+         egress rules can reach no external address"
+    };
+}
+
+/// The `--network` short help, shared by `min session activate` and `min
+/// box spec`.
+pub(crate) const NETWORK_HELP: &str = network_help!();
+
+/// The `--network` long help: the short help and the legacy spellings.
+pub(crate) const NETWORK_LONG_HELP: &str = concat!(
+    network_help!(),
+    ".\n\n",
+    "The hyphenated spellings `no-net`, `host-net`, and `own-ip` are still accepted, but each \
+     prints a one-line hint naming the current spelling."
+);
 
 /// Parses the `--network <none|host_ip|own_ip>` value (NET-037). The
 /// hyphenated spellings `no-net`, `host-net`, and `own-ip` predate the
@@ -1100,6 +1170,14 @@ pub struct FinalizeInstallArgs {
     /// Remove everything the step installed on this host (with --show --script, print the removal script instead)
     #[arg(long)]
     pub undo: bool,
+    /// The two contiguous connection-mark bits that egress enforcement uses, in hex (for example 0x0c000000). Use it when another firewall rule already uses the default bits. The boot service keeps the value
+    #[arg(
+        long,
+        value_name = "MASK",
+        value_parser = crate::cmd::parse_ct_mark_mask,
+        conflicts_with = "undo"
+    )]
+    pub ct_mark_mask: Option<u32>,
 }
 
 #[derive(Debug, Args)]
@@ -1300,10 +1378,6 @@ pub struct SecretRmArgs {
     #[arg(long)]
     pub store: Option<String>,
 }
-
-/// Arguments for `min login`.
-#[derive(Debug, Args)]
-pub struct LoginArgs {}
 
 /// Arguments for the hidden `min complete-session-str`.
 #[derive(Debug, Args)]
