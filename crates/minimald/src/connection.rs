@@ -141,6 +141,13 @@ pub struct Connection {
     /// any other exit, when the connection itself drops.
     liveness: Option<Arc<()>>,
 
+    /// Set when the peer asks for the ssh-userauth service, the first thing
+    /// any client does once key exchange is done. `run_stream` returns after
+    /// the id exchange with key exchange still running in russh's own task,
+    /// so this is how the accept loop tells a failed key exchange from a
+    /// session that ended.
+    past_kex: bool,
+
     serv: ServerStateHandle,
 }
 
@@ -167,6 +174,7 @@ impl Connection {
             channels: BTreeMap::new(),
             created_sessions: Vec::new(),
             liveness: Some(Arc::new(())),
+            past_kex: false,
             serv,
         })));
 
@@ -235,6 +243,11 @@ impl ConnectionHandle {
         std::mem::take(&mut self.0.lock().await.created_sessions)
     }
 
+    /// Whether the peer got past key exchange (see [`Connection::past_kex`]).
+    pub async fn past_kex(&self) -> bool {
+        self.0.lock().await.past_kex
+    }
+
     /// Ends this connection's liveness: its sessions stop counting it as a
     /// live creator from here on, even if a stray handle clone outlives the
     /// teardown. Called last at connection teardown, once the unfinalized
@@ -287,6 +300,11 @@ pub struct ConnectionHandler(ConnectionHandle);
 
 impl russh::server::Handler for ConnectionHandler {
     type Error = ConnectionError;
+
+    async fn authentication_banner(&mut self) -> Result<Option<String>, Self::Error> {
+        self.0.lock().await.past_kex = true;
+        Ok(None)
+    }
 
     async fn auth_none(&mut self, user: &str) -> Result<russh::server::Auth, Self::Error> {
         let mut s = self.0.lock().await;

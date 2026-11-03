@@ -1365,12 +1365,31 @@ impl Server {
                                 return;
                             }
                         };
-                    handshake_span.record("outcome", "session");
+                    // `run_stream` returns once the SSH ids are exchanged; key
+                    // exchange still runs inside `session_fut`. The outcome
+                    // says only that much until the session ends.
+                    handshake_span.record("outcome", "id_exchanged");
                     // Log session errors instead of silently dropping the
                     // spawned future, so a failed handshake is visible on any
                     // transport.
-                    match session_fut.await {
+                    let ended = session_fut.await;
+                    let past_kex = conn_hnd.past_kex().await;
+                    let outcome = if past_kex {
+                        "session"
+                    } else if ended.as_ref().is_err_and(|e| !closed_by_peer(e)) {
+                        "handshake_failed"
+                    } else {
+                        "closed_before_auth"
+                    };
+                    handshake_span.record("outcome", outcome);
+                    match ended {
                         Ok(()) => tracing::info!("connection closed"),
+                        // A peer that sent its id and then failed key exchange
+                        // failed its handshake, as one that failed before the
+                        // id did.
+                        Err(e) if !past_kex && !closed_by_peer(&e) => {
+                            tracing::warn!(error = %e, "SSH handshake failed; dropping connection");
+                        }
                         Err(e) => {
                             // Abrupt hangups are how the CLI's oneshot RPC
                             // connections and Ctrl-C'd attaches normally end;
