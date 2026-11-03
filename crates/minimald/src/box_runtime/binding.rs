@@ -534,29 +534,38 @@ impl Binding {
         (tx, crate::traced::spawn_detached(span, binding.run()), shed)
     }
 
+    /// What `to_host` still holds when the client is lost, handed to the
+    /// host's stdin queue in order, each entry once a slot is reserved for
+    /// it, within one second in all. A client that sends and then closes at
+    /// once (a paste piped in, then EOF) has its last chunk queued here while
+    /// `select!` picks the close as readily as the slot; dropped with the
+    /// loop, that chunk went missing about half the time. The host is still
+    /// reading (only the client is gone), so the wait is short; the bound is
+    /// for a host that is not, and what it cuts off is what was lost before.
+    async fn drain_queued_stdin(
+        tx: &mpsc::Sender<StdinMsg>,
+        generation: u64,
+        to_host: &mut VecDeque<StdinMsgKind>,
+    ) {
+        let drain = async {
+            while !to_host.is_empty() {
+                let Ok(permit) = tx.reserve().await else {
+                    break;
+                };
+                let Some(kind) = to_host.pop_front() else {
+                    break;
+                };
+                permit.send(StdinMsg::new(generation, kind));
+            }
+        };
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), drain).await;
+    }
+
     /// What a channel message means to the host's stdin, if anything:
     /// keystrokes, a pty request, a resize. Window adjusts (one per burst of
     /// bytes forwarded, v. noisy) and duplicates of pre-attach requests the
     /// connection handler already answered (russh buffers them into the
     /// taken channel) mean nothing here.
-    /// What `to_host` still holds when the client is lost: offered to the
-    /// host's stdin queue without waiting, in order, until a slot is not
-    /// there. A client that sends and then closes at once (a paste piped
-    /// in, then EOF) has its last chunk queued here while `select!` picks
-    /// the close as readily as the slot; dropped with the loop, that chunk
-    /// went missing about half the time.
-    fn flush_queued_stdin(
-        tx: &mpsc::Sender<StdinMsg>,
-        generation: u64,
-        to_host: &mut VecDeque<StdinMsgKind>,
-    ) {
-        while let Some(kind) = to_host.pop_front() {
-            if tx.try_send(StdinMsg::new(generation, kind)).is_err() {
-                break;
-            }
-        }
-    }
-
     fn stdin_kind(msg: russh::ChannelMsg) -> Option<StdinMsgKind> {
         match msg {
             russh::ChannelMsg::Data { data } => Some(StdinMsgKind::Bytes(data)),
@@ -811,10 +820,7 @@ impl Binding {
                     // forwards a close as `Close` and then ends the stream.
                     // BOX-015: only this binding ends. The box keeps
                     // running, and its entrypoint's return or a stop ends it.
-                    None | Some(russh::ChannelMsg::Close) => {
-                        Self::flush_queued_stdin(&self.stdin_tx, self.generation, &mut to_host);
-                        break MainloopExitReason::ClientLost;
-                    }
+                    None | Some(russh::ChannelMsg::Close) => break MainloopExitReason::ClientLost,
                     // Past the host's EOF nothing drains `to_host`: what
                     // arrives is read and dropped, so the queue cannot fill
                     // to `DRAIN_STASH` and stop this arm from reading, which
@@ -869,10 +875,7 @@ impl Binding {
                                     res = rs.wait(), if to_host.len() < DRAIN_STASH => match res {
                                         // The client left mid-write: nothing
                                         // reads the rest (BOX-015, as above).
-                                        None | Some(russh::ChannelMsg::Close) => {
-                                            Self::flush_queued_stdin(&self.stdin_tx, self.generation, &mut to_host);
-                                            break Some(MainloopExitReason::ClientLost);
-                                        }
+                                        None | Some(russh::ChannelMsg::Close) => break Some(MainloopExitReason::ClientLost),
                                         // Dropped past the host's EOF, as above.
                                         Some(msg) => if !input_closed && let Some(kind) = Self::stdin_kind(msg) {
                                             to_host.push_back(kind);
@@ -938,6 +941,14 @@ impl Binding {
         };
 
         tracing::info!(reason = ?exit_reason, "binding leaving mainloop");
+
+        // The input the lost client sent before closing, which the loop had
+        // queued but not yet handed to the host (see `drain_queued_stdin`).
+        // The slot wait is dropped first: it belongs to the loop's turn.
+        drop(slot);
+        if matches!(exit_reason, MainloopExitReason::ClientLost) && !to_host.is_empty() {
+            Self::drain_queued_stdin(&self.stdin_tx, self.generation, &mut to_host).await;
+        }
 
         // Whether the session outlives this binding, and so should run its
         // `on_detach` hooks. `HostGone` leaves no session to detach from,
