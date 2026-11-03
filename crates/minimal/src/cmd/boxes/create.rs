@@ -1411,6 +1411,35 @@ enum UploadPlan {
     },
 }
 
+/// The refusal when the VM gave a `host_ip` grant box an id other than the
+/// one its registration minted (BEP-082).
+const REGISTERED_ID_MISMATCH: &str = "No box was created. The VM gave the new box an id \
+     other than the one reserved for it. Run the command again.";
+
+/// Checks that the box the daemon created carries the id a `host_ip`
+/// registration minted, byte for byte (BEP-082). A box with no `host_ip`
+/// registration, or a registration with no id, has nothing to check.
+fn ensure_registered_id(
+    registered: Option<&minimal_client::box_registration::RegisteredWithVmHost>,
+    created: boxes::SessionId,
+) -> anyhow::Result<()> {
+    let Some(minted) = registered
+        .filter(|registration| registration.host_ip)
+        .and_then(|registration| registration.box_id)
+    else {
+        return Ok(());
+    };
+    if minted.to_bytes() == created.to_bytes() {
+        return Ok(());
+    }
+    tracing::warn!(
+        registered_box_id = %minted,
+        created_box_id = %created,
+        "refused a host_ip box whose record id is not its registration's id"
+    );
+    Err(anyhow::anyhow!(REGISTERED_ID_MISMATCH))
+}
+
 pub(crate) async fn activate_box(
     global: &GlobalArgs,
     args: ActivateArgs,
@@ -1950,6 +1979,22 @@ pub(crate) async fn activate_box(
             if let Err(error) = ensure_version_reported(created.daemon_version.as_deref()) {
                 // A skewed daemon's refusal abandons the unfinalized session and its
                 // row; the withdrawal rides out with the error (T66).
+                withdraw_box_row(
+                    control_sock.clone(),
+                    box_name.as_deref(),
+                    request.config.box_addresses,
+                    registered
+                        .as_ref()
+                        .and_then(|registration| registration.box_id),
+                )
+                .await;
+                return Err(error);
+            }
+            // BEP-082: a `host_ip` grant box's grants are sealed under the id
+            // its registration minted. A record under another id is a box
+            // the proxy cannot serve, so the activation ends fail-closed, as
+            // the version check above does.
+            if let Err(error) = ensure_registered_id(registered.as_ref(), created.id) {
                 withdraw_box_row(
                     control_sock.clone(),
                     box_name.as_deref(),
@@ -3160,6 +3205,39 @@ mod tests {
             !attachments.holds_id(id.to_bytes()),
             "the withdrawn box's id is held by no attachment"
         );
+    }
+
+    /// BEP-082: a `host_ip` grant box whose record takes another id than
+    /// its registration's is refused with this text. A matching id, a box
+    /// with no `host_ip` registration, and a registration with no id pass.
+    #[test]
+    fn host_ip_grant_box_with_another_id_is_refused() {
+        let minted = minimald_rpc::BoxId::from_bytes(*b"0123456789abcdef");
+        let registration =
+            |host_ip: bool, box_id| minimal_client::box_registration::RegisteredWithVmHost {
+                addresses: boxes::BoxAddresses {
+                    switch_address: std::net::Ipv4Addr::UNSPECIFIED,
+                    loopback_address: std::net::Ipv4Addr::UNSPECIFIED,
+                },
+                host_ip,
+                box_id,
+                task_addresses: Vec::new(),
+                lease: None,
+            };
+        let same = boxes::SessionId::from_bytes(minted.to_bytes());
+        let other = boxes::SessionId::from_bytes(*b"fedcba9876543210");
+        let host_ip = registration(true, Some(minted));
+        assert!(ensure_registered_id(Some(&host_ip), same).is_ok());
+        let refused = ensure_registered_id(Some(&host_ip), other)
+            .expect_err("another id ends the activation");
+        assert_eq!(
+            refused.to_string(),
+            "No box was created. The VM gave the new box an id other than the one \
+             reserved for it. Run the command again."
+        );
+        assert!(ensure_registered_id(None, other).is_ok());
+        assert!(ensure_registered_id(Some(&registration(true, None)), other).is_ok());
+        assert!(ensure_registered_id(Some(&registration(false, Some(minted))), other).is_ok());
     }
 
     /// BEP-082: a GitHub grant box with `--network host_ip` on a VM host
