@@ -4479,8 +4479,7 @@ async fn shutdown_without_force_refuses_while_a_session_is_live() {
 /// A session whose shell has exited still holds its host (the slot
 /// outlives the process), but nothing runs there for an unforced shutdown
 /// to interrupt, so it must not refuse. Driven the way the session e2e
-/// meets it: exit the shell, keep the session at the exit prompt, then
-/// stop the daemon.
+/// meets it: exit the shell, which ends the box, then stop the daemon.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_without_force_proceeds_once_a_sessions_shell_has_exited() {
     let server = TestServer::new().await;
@@ -4503,44 +4502,26 @@ async fn shutdown_without_force_proceeds_once_a_sessions_shell_has_exited() {
         }
     }
 
-    // Exit the shell and take the prompt's default (keep): the session
-    // survives, its host gone.
+    // Exit the shell: the box ends with it, its record kept, and no prompt
+    // holds the channel open (BOX-038).
     channel
         .data_bytes(format!("{}\n", crate::box_runtime::MOCK_EXIT_LINE).into_bytes())
         .await
         .unwrap();
-    let mut answered = false;
-    let mut prompt_out = Vec::new();
-    while let Ok(msg) =
-        tokio::time::timeout(std::time::Duration::from_secs(10), channel.wait()).await
-    {
-        match msg {
-            Some(russh::ChannelMsg::Data { data }) => {
-                prompt_out.extend_from_slice(&data);
-                if !answered
-                    && String::from_utf8_lossy(&prompt_out)
-                        .contains(crate::box_runtime::SHELL_EXIT_PROMPT)
-                {
-                    channel.data_bytes(b"\r".to_vec()).await.unwrap();
-                    answered = true;
-                }
-            }
-            Some(_) => {}
-            None => break,
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), channel.wait()).await {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => panic!("channel stayed open 10s after the shell exited"),
         }
     }
-    assert!(
-        answered,
-        "expected the session-exit prompt to render; got: {:?}",
-        String::from_utf8_lossy(&prompt_out)
-    );
 
     let mngr = server.state.sessions_manager().await;
     let session = mngr
         .get_session(BoxKeyPredicate::Id(session_id))
         .await
         .unwrap()
-        .expect("keep leaves the session in place");
+        .expect("an ended box keeps its record");
     // The host loop winds down after the channel closes; bounded wait.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     while session.is_busy().await {

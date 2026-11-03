@@ -197,6 +197,50 @@ enum Teardown {
     SelfInitiated,
 }
 
+/// What woke the actor's mainloop: a message, or the end of the watched
+/// host's runtime loop (`None` when the loop ended with no exit to read).
+enum Next<M> {
+    Message(Option<M>),
+    Exit(Option<box_runtime::HostExit>),
+}
+
+/// Whether `msg` is handled ahead of an entrypoint exit that is already in.
+/// A stop or a destroy ends the box as it asked, so the exit is then
+/// nobody's. Every other message waits for the exit to end the box first,
+/// so an attach or an exec queued beside it never relaunches the entrypoint
+/// (BOX-038).
+fn goes_before_exit(msg: &BoxMessage) -> bool {
+    matches!(
+        msg,
+        BoxMessage::Stop(_) | BoxMessage::StopBox { .. } | BoxMessage::Destroy(_)
+    )
+}
+
+/// The exit that `watch` already holds, taking the watch: `Some(None)` when
+/// the loop ended with no exit to read, `None` when the loop still runs or
+/// nothing is watched.
+fn ready_entrypoint_exit(
+    watch: &mut Option<EntrypointWatch>,
+) -> Option<Option<box_runtime::HostExit>> {
+    let ready = match watch.as_mut()?.try_recv() {
+        Ok(exit) => Some(exit),
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed) => None,
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return None,
+    };
+    *watch = None;
+    Some(ready)
+}
+
+/// The exit `watch` receives, or never when nothing is watched.
+async fn next_entrypoint_exit(
+    watch: &mut Option<EntrypointWatch>,
+) -> Option<box_runtime::HostExit> {
+    match watch {
+        Some(watch) => watch.await.ok(),
+        None => std::future::pending().await,
+    }
+}
+
 enum BoxMessage {
     GetPaths(oneshot::Sender<BoxPaths>),
     MakeContext(oneshot::Sender<Result<mctx::Context, String>>),
@@ -614,6 +658,11 @@ pub struct BoxActor {
     /// replaces it with the spec it restarts from.
     held_spec: Option<Option<Arc<mfile::spec::BoxSpec>>>,
 
+    /// How the latest launch's runtime loop ends, read by the mainloop
+    /// (BOX-038). Each launch replaces it, so only the host in the slot can
+    /// end the box. `None` before the first launch and after the watch fired.
+    entrypoint_watch: Option<EntrypointWatch>,
+
     /// Whether this daemon opted out of the deny-all egress default
     /// (NET-077), threaded from the server config: the launcher resolves
     /// this session's effective egress (NET-074) against it, and the task
@@ -709,6 +758,8 @@ impl BoxActor {
             relaunch_row_confirmed: false,
             // Read from the store by the first launch.
             held_spec: None,
+            // No launch yet, so no loop to watch.
+            entrypoint_watch: None,
             // Forwards are registered as their channels open; a session
             // starts with none.
             forwards: Vec::new(),
@@ -1468,7 +1519,45 @@ impl BoxActor {
         let mut teardown = Teardown::ManagerInitiated;
         let _clear_slot = ClearSlotOnExit(Arc::clone(&self.host_slot));
         self.publish_host();
-        while let Some((msg, caller)) = self.receiver.recv().await {
+        loop {
+            // Messages first: a stop or a destroy queued beside an exit
+            // ends the box as it asked, and the exit is then nobody's.
+            let next = tokio::select! {
+                biased;
+                msg = self.receiver.recv() => Next::Message(msg),
+                exit = next_entrypoint_exit(&mut self.entrypoint_watch) => Next::Exit(exit),
+            };
+            let ((msg, caller), ended) = match next {
+                Next::Message(Some(queued)) => {
+                    // An exit already in ends the box before any message
+                    // that is not a stop or a destroy. The message then
+                    // finds the box exited: an attach resumes it, and an
+                    // exec is refused.
+                    let mut ended = None;
+                    if !goes_before_exit(&queued.0)
+                        && let Some(exit) = ready_entrypoint_exit(&mut self.entrypoint_watch)
+                    {
+                        if let Some(exit) = exit
+                            && let ControlFlow::Break(t) = self.end_on_entrypoint_return(exit).await
+                        {
+                            ended = Some(t);
+                        }
+                        self.publish_host();
+                    }
+                    (queued, ended)
+                }
+                Next::Message(None) => break,
+                Next::Exit(exit) => {
+                    self.entrypoint_watch = None;
+                    let Some(exit) = exit else { continue };
+                    if let ControlFlow::Break(t) = self.end_on_entrypoint_return(exit).await {
+                        teardown = t;
+                        break;
+                    }
+                    self.publish_host();
+                    continue;
+                }
+            };
             // Opened now, a child of the sender's ids (see
             // `traced::Receiver::recv`), so compose, graph resolution and
             // checkouts nest under the RPC that asked for them.
@@ -1488,6 +1577,14 @@ impl BoxActor {
                 break;
             }
             self.publish_host();
+            // The box ended before the message. Unless the message resumed
+            // it, no actor hosts an ended box (#2393).
+            if let Some(t) = ended
+                && !self.has_live_host()
+            {
+                teardown = t;
+                break;
+            }
         }
         if matches!(teardown, Teardown::SelfInitiated) {
             let session_id = *self.record.id();
@@ -1498,6 +1595,149 @@ impl BoxActor {
                 manager.evict(session_id).await;
             }
         }
+    }
+
+    /// Ends the box when its entrypoint returned on its own (BOX-038): sets
+    /// the record to `exited` with the entrypoint's exit code, records an
+    /// `exited` event with `reason = "exit"`, and ends the actor. The daemon
+    /// does this whether or not a client is attached.
+    ///
+    /// Changes nothing when a kill from the daemon ended the loop, when the
+    /// spec keeps the box until it is stopped, or when the record is not
+    /// running: a hook-only host of an ended box is one.
+    async fn end_on_entrypoint_return(
+        &mut self,
+        exit: box_runtime::HostExit,
+    ) -> ControlFlow<Teardown> {
+        let box_id = *self.record.id();
+        let exit_code = exit
+            .reason
+            .as_ref()
+            .and_then(|r| r.exit_code)
+            .unwrap_or(exit.code);
+        if exit.requested {
+            tracing::debug!(box_id = %box_id, "the host ended on a kill; the box is not ended here");
+            return ControlFlow::Continue(());
+        }
+        if self.has_live_host() || self.unrecorded_stop.is_some() {
+            return ControlFlow::Continue(());
+        }
+        let ends = match self.held_spec().await {
+            Ok(spec) => host::ends_with_entrypoint(spec.as_deref()),
+            Err(error) => {
+                tracing::warn!(
+                    box_id = %box_id,
+                    %error,
+                    "the entrypoint returned, but the box's spec could not be read; the box is not ended"
+                );
+                false
+            }
+        };
+        if !ends {
+            tracing::info!(
+                box_id = %box_id,
+                exit_code,
+                "the entrypoint returned; the box runs until it is stopped"
+            );
+            return ControlFlow::Continue(());
+        }
+        match self.record.record().await {
+            Ok(record) if record.status == BoxState::Active => {}
+            Ok(_) => return ControlFlow::Continue(()),
+            Err(error) => {
+                tracing::warn!(
+                    box_id = %box_id,
+                    %error,
+                    "the entrypoint returned, but the record could not be read; the box is not ended"
+                );
+                return ControlFlow::Continue(());
+            }
+        }
+
+        // The loop already ended: what is left of the host goes, and what
+        // ran beside it comes down as a stop takes it down.
+        if let BoxInner::Active { host, .. } = &mut self.inner {
+            drop(host.take());
+        }
+        self.publish_host();
+        self.stop_running(false).await;
+        self.mark_name_stopped().await;
+
+        // The host is gone and the watch is cleared, so this is the one
+        // chance to record the exit: a failed write is retried with a short
+        // backoff before the box is left running with nothing in it.
+        let ending = boxes::core::record::ExitEnding::Exit { exit_code };
+        let mut attempt = 0u32;
+        let written = loop {
+            attempt += 1;
+            let written = async {
+                #[cfg(test)]
+                if exit_record_seam::fail_this_write(&box_id) {
+                    return Err(std::io::Error::other("injected exit-record write failure"));
+                }
+                let mut record = self.record.record().await?;
+                record.set_state(boxes::core::record::RecordState::Exited(ending));
+                self.record.write(record).await
+            }
+            .await;
+            match written {
+                Ok(()) => break Ok(()),
+                Err(error) if attempt < EXIT_RECORD_WRITE_ATTEMPTS => {
+                    tracing::warn!(
+                        box_id = %box_id,
+                        exit_code,
+                        attempt,
+                        %error,
+                        "the entrypoint returned, but the record could not be set to exited; retrying"
+                    );
+                    tokio::time::sleep(EXIT_RECORD_RETRY_BACKOFF * attempt).await;
+                }
+                Err(error) => break Err(error),
+            }
+        };
+        if let Err(error) = written {
+            // The record stays running with no host. The actor keeps hosting
+            // the box, as a failed stop does, so a `min stop` can still set
+            // the record and end the actor.
+            tracing::error!(
+                box_id = %box_id,
+                exit_code,
+                attempts = attempt,
+                %error,
+                "the entrypoint returned, but the record could not be set to exited"
+            );
+            return ControlFlow::Continue(());
+        }
+        tracing::info!(
+            box_id = %box_id,
+            exit_code,
+            reason = boxes::core::record::EndReason::Exit.name(),
+            "box exited: its entrypoint returned"
+        );
+        let mut data = boxes::events::EventData::new();
+        data.insert(
+            "reason".to_string(),
+            boxes::core::record::EndReason::Exit.name().into(),
+        );
+        data.insert("exit_code".to_string(), exit_code.into());
+        let event = match self.record.object().await {
+            Ok(object) => crate::box_manager::write_box_event(
+                &object,
+                boxes::events::BoxEventType::Exited,
+                data,
+            )
+            .map(drop),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = event {
+            tracing::warn!(
+                box_id = %box_id,
+                %error,
+                "the record is exited, but its exited event could not be written"
+            );
+        }
+        // No actor hosts an ended box (#2393), as after a stop.
+        ControlFlow::Break(Teardown::SelfInitiated)
     }
 
     /// Handles a specific message recieved by the session.
@@ -1931,6 +2171,47 @@ pub(crate) mod launch_publish_seam {
             .as_ref()
             .and_then(|observed| observed.get(&id).cloned())
             .unwrap_or_default()
+    }
+}
+
+/// How many times the end of a box tries to write its `exited` record.
+const EXIT_RECORD_WRITE_ATTEMPTS: u32 = 5;
+/// The wait before the next exited-record write, multiplied by the attempt.
+const EXIT_RECORD_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Fails the next `n` exited-record writes of one box, so a test can pin the
+/// retry in `end_on_entrypoint_return`. Keyed by box id, as
+/// [`launch_record_seam`] is.
+#[cfg(test)]
+pub(crate) mod exit_record_seam {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use boxes::SessionId;
+
+    static FAILING: Mutex<Option<HashMap<SessionId, u32>>> = Mutex::new(None);
+
+    /// Makes the next `n` exited-record writes for `id` fail.
+    pub(crate) fn fail_next_writes(id: SessionId, n: u32) {
+        FAILING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(id, n);
+    }
+
+    /// Whether this write for `id` fails, using up one injected failure.
+    pub(super) fn fail_this_write(id: &SessionId) -> bool {
+        let mut failing = FAILING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match failing.as_mut().and_then(|f| f.get_mut(id)) {
+            Some(left) if *left > 0 => {
+                *left -= 1;
+                true
+            }
+            _ => false,
+        }
     }
 }
 

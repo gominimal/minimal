@@ -201,6 +201,7 @@ async fn a_shell_exit_reaches_the_binding_with_the_reaped_exit_reason() {
             delta: None,
             archives_dir: std::env::temp_dir(),
             holds_host_row: false,
+            ends_with_entrypoint: false,
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -261,6 +262,7 @@ async fn a_stalled_binding_does_not_wedge_the_host_loop() {
             delta: None,
             archives_dir: std::env::temp_dir(),
             holds_host_row: false,
+            ends_with_entrypoint: false,
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -411,6 +413,7 @@ impl FloodedAttach {
                 delta: None,
                 archives_dir: std::env::temp_dir(),
                 holds_host_row: false,
+                ends_with_entrypoint: false,
                 session_id: boxes::SessionId::nil(),
                 composition: None,
                 connection_env: ConnectionEnv::new(),
@@ -666,6 +669,7 @@ async fn a_shell_exit_hands_the_binding_the_codes_that_leave_mouse_mode() {
             delta: None,
             archives_dir: std::env::temp_dir(),
             holds_host_row: false,
+            ends_with_entrypoint: false,
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -729,6 +733,7 @@ async fn unwind_codes_narrow_to_what_the_screen_actually_set() {
             delta: None,
             archives_dir: std::env::temp_dir(),
             holds_host_row: false,
+            ends_with_entrypoint: false,
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -780,6 +785,7 @@ async fn a_kill_tells_the_binding_nothing() {
             delta: None,
             archives_dir: std::env::temp_dir(),
             holds_host_row: false,
+            ends_with_entrypoint: false,
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -823,6 +829,7 @@ async fn reap_log_host(name: &str) -> (Host<MockProcess, ()>, HostHandle) {
             delta: None,
             archives_dir: std::env::temp_dir(),
             holds_host_row: false,
+            ends_with_entrypoint: false,
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -1298,6 +1305,7 @@ async fn get_attrs_tracks_title_and_io_times() {
             delta: None,
             archives_dir: std::env::temp_dir(),
             holds_host_row: false,
+            ends_with_entrypoint: false,
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -1376,6 +1384,7 @@ async fn kill_tears_down_host_and_reaps_process() {
             delta: None,
             archives_dir: std::env::temp_dir(),
             holds_host_row: false,
+            ends_with_entrypoint: false,
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -1482,6 +1491,7 @@ async fn exit_releases_the_network() {
             delta: None,
             archives_dir: std::env::temp_dir(),
             holds_host_row: false,
+            ends_with_entrypoint: false,
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -1538,6 +1548,7 @@ async fn detach_keystroke_holds_the_session_and_network() {
             delta: None,
             archives_dir: std::env::temp_dir(),
             holds_host_row: false,
+            ends_with_entrypoint: false,
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -1641,6 +1652,7 @@ async fn stale_binding_generation_input_is_discarded() {
             delta: None,
             archives_dir: std::env::temp_dir(),
             holds_host_row: false,
+            ends_with_entrypoint: false,
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -1779,6 +1791,7 @@ async fn hook_injections_carry_the_session_s_none_box_seal() {
                 delta: None,
                 archives_dir: std::env::temp_dir(),
                 holds_host_row: false,
+                ends_with_entrypoint: false,
                 session_id: boxes::SessionId::nil(),
                 composition: Some(bare_composition()),
                 connection_env: ConnectionEnv::new(),
@@ -6398,6 +6411,7 @@ async fn ask_expose_without_a_binding_answers_no_one() {
             delta: None,
             archives_dir: std::env::temp_dir(),
             holds_host_row: false,
+            ends_with_entrypoint: false,
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env: ConnectionEnv::new(),
@@ -7072,6 +7086,7 @@ async fn sealed_value_is_placed_in_its_grant_variable_only() {
             delta: None,
             archives_dir: std::env::temp_dir(),
             holds_host_row: false,
+            ends_with_entrypoint: false,
             session_id: boxes::SessionId::nil(),
             composition: None,
             connection_env,
@@ -7616,6 +7631,73 @@ async fn launcher_starts_session_and_task_entrypoints_from_spec() {
     );
 }
 
+/// Builds a mock host whose box ends when its entrypoint returns, with no
+/// client bound to it.
+async fn until_complete_host() -> (Host<MockProcess, ()>, HostHandle) {
+    Host::build(
+        MockLauncher::default(),
+        HostParams {
+            name: "test-session".to_string(),
+            username: "user".to_string(),
+            paths: test_paths(),
+            sz: DEFAULT_SIZE,
+            channel: None,
+            control: None,
+            delta: None,
+            archives_dir: std::env::temp_dir(),
+            holds_host_row: false,
+            ends_with_entrypoint: true,
+            session_id: boxes::SessionId::nil(),
+            composition: None,
+            connection_env: ConnectionEnv::new(),
+            #[cfg(target_os = "linux")]
+            name_marker: None,
+        },
+    )
+    .await
+    .expect("failed to build host")
+}
+
+// BOX-038: with no client attached, the entrypoint's return ends the host's
+// loop by itself, and the loop says the entrypoint ended it, not a kill. The
+// box's actor ends the box from that account. A kill from the daemon ends
+// the loop too, and says so, so a stop or a replacement never reads as the
+// entrypoint's own return.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn until_complete_ends_on_entrypoint_return_without_client() {
+    let (host, _handle) = until_complete_host().await;
+    assert!(host.remote.is_none(), "no client is bound to the host");
+    let stdin = host.remote_tx.clone();
+    let task = crate::traced::spawn(host.run());
+    stdin
+        .send(stdin_bytes(format!("{MOCK_EXIT_LINE}\n").into_bytes()))
+        .await
+        .expect("failed to send exit line");
+    let exit = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the loop ends when the entrypoint returns, with no client attached")
+        .expect("host task should not panic")
+        .expect("the loop reaps the entrypoint");
+    assert_eq!(exit.code, 0, "the entrypoint exited 0: {exit:?}");
+    assert!(
+        !exit.requested,
+        "the entrypoint returned on its own, and no kill was asked for: {exit:?}"
+    );
+
+    let (host, handle) = until_complete_host().await;
+    let task = crate::traced::spawn(host.run());
+    handle.kill(false).await.expect("the host takes the kill");
+    let killed = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the loop ends on a kill")
+        .expect("host task should not panic")
+        .expect("the loop reaps the killed entrypoint");
+    assert!(
+        killed.requested,
+        "a kill from the daemon is not the entrypoint's return: {killed:?}"
+    );
+}
+
 /// A box filed in a real store under a temp dir, so its host writes the
 /// box's log and its bindings write the box's events beside a real record.
 struct StoredBox {
@@ -7672,6 +7754,7 @@ impl StoredBox {
             delta: None,
             archives_dir: std::env::temp_dir(),
             holds_host_row: false,
+            ends_with_entrypoint: false,
             session_id: self.id,
             composition: None,
             connection_env: ConnectionEnv::new(),
