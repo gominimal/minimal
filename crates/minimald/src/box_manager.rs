@@ -3302,14 +3302,9 @@ impl BoxManager {
         let mut config = config;
         let client_box_id = config.box_id.take();
         let switch_address = config.box_addresses.as_ref().map(|a| a.switch_address);
-        // BEP-082: a `host_ip` box has no row, and its registration minted
-        // its id under the box's name. The ask names it, so the record takes
-        // the id its grants are sealed under. A `host_ip` box with no grant
-        // registered nothing, and the VM host daemon mints a fresh id.
-        let host_ip_name = (matches!(config.network, boxes::NetworkMode::HostNet)
-            && config.box_addresses.is_none())
-        .then(|| config.name.clone())
-        .flatten();
+        // BEP-082: a `host_ip` grant box has no row, and its registration
+        // minted its id under the box's name. See `host_ip_mint_name`.
+        let host_ip_name = host_ip_mint_name(&config);
         let control = crate::box_actor::switch_control_of(&self.net_switch).await;
         let minted = match crate::net::listeners::mint_box_id(
             &control,
@@ -4877,6 +4872,78 @@ impl Drop for TearingDown {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.id);
+    }
+}
+
+/// The name a box's id mint asks the VM host daemon to answer from a
+/// registration (BEP-082), or `None` for a fresh mint.
+///
+/// Only a `host_ip` box with no box addresses and a declared credentialed
+/// upstream registered under its name, so only that box sends the name.
+/// A `host_ip` box with no grant registered nothing. If it sent its name, it
+/// could take the id of another live box that registered the same name.
+fn host_ip_mint_name(config: &minimald_rpc::BoxConfig) -> Option<String> {
+    let grant_box = matches!(config.network, boxes::NetworkMode::HostNet)
+        && config.box_addresses.is_none()
+        && config.policy.credentialed_upstream.is_some();
+    if grant_box { config.name.clone() } else { None }
+}
+
+#[cfg(test)]
+mod host_ip_mint_name_tests {
+    use super::host_ip_mint_name;
+    use std::net::Ipv4Addr;
+
+    fn config(network: boxes::NetworkMode) -> minimald_rpc::BoxConfig {
+        minimald_rpc::BoxConfig {
+            name: Some("agent".to_string()),
+            project_path: paths::HostAbsPath::try_new("/work/project").unwrap(),
+            network,
+            policy: Default::default(),
+            task_addresses: Vec::new(),
+            box_id: None,
+            box_addresses: None,
+            hooks_enabled: true,
+            ends_with_run: false,
+            attrs: Default::default(),
+            sealed_deliveries: Vec::new(),
+            root_certificate: None,
+            creating_verb: minimald_rpc::CreatingVerb::Session,
+            project_root: None,
+        }
+    }
+
+    fn with_upstream(mut config: minimald_rpc::BoxConfig) -> minimald_rpc::BoxConfig {
+        config.policy.credentialed_upstream = Some(boxes::CredentialedUpstream::default());
+        config
+    }
+
+    // BEP-082: a `host_ip` box with no grant registered nothing, so its
+    // mint is a fresh one.
+    #[test]
+    fn host_ip_box_record_takes_the_registration_id_only_with_a_grant() {
+        assert_eq!(
+            host_ip_mint_name(&config(boxes::NetworkMode::HostNet)),
+            None
+        );
+    }
+
+    // BEP-082: a `host_ip` grant box asks for the id its registration minted.
+    #[test]
+    fn host_ip_box_record_takes_the_registration_id_of_a_grant_box() {
+        let config = with_upstream(config(boxes::NetworkMode::HostNet));
+        assert_eq!(host_ip_mint_name(&config), Some("agent".to_string()));
+    }
+
+    // BEP-082: a box with addresses takes its id from its row, never a name.
+    #[test]
+    fn host_ip_box_record_takes_the_registration_id_never_for_a_row_box() {
+        let mut config = with_upstream(config(boxes::NetworkMode::HostNet));
+        config.box_addresses = Some(minimald_rpc::BoxAddresses {
+            switch_address: Ipv4Addr::new(100, 64, 0, 21),
+            loopback_address: Ipv4Addr::new(127, 0, 0, 21),
+        });
+        assert_eq!(host_ip_mint_name(&config), None);
     }
 }
 
