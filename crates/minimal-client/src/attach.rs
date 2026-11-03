@@ -1565,12 +1565,11 @@ mod tests {
     }
 
     /// BEP-083: the admit of a `host_ip` box carries its lane declaration,
-    /// and returns only once the VM host daemon answered it. The caller
-    /// admits before it starts the box's first process, so the gate holds
-    /// the box's rules and its lane when that process sends its first
-    /// frame.
+    /// and returns only once the VM host daemon answered it. This test does
+    /// not check the admit's order against the create: `activate_box` in
+    /// the `minimal` crate sends the admit after the create returns.
     #[test]
-    fn host_ip_admission_precedes_the_first_process() {
+    fn host_ip_admission_carries_the_lane_and_waits_for_the_answer() {
         use std::io::{BufRead as _, Write as _};
         use std::sync::atomic::{AtomicBool, Ordering};
 

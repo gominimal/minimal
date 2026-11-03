@@ -305,6 +305,11 @@ impl RegisteredWithVmHost {
     }
 }
 
+/// The refusal when the VM host daemon answers a `host_ip` registration
+/// with an address row: that daemon is older than `host_ip` registration.
+const HOST_IP_REGISTRATION_UNSUPPORTED: &str = "the VM host daemon is older than host_ip box \
+     registration. It answered with a box address and no box id. The registration did not happen";
+
 /// Registers an own-address box with the VM host daemon over its control
 /// socket (T66), returning what it handed back.
 pub async fn register_box_with_vm_host(
@@ -321,6 +326,16 @@ pub async fn register_box_with_vm_host(
         // The answer a daemon this build boots beside sends: the addresses
         // beside the id the published row holds, on the connection a held
         // registration keeps as its lease.
+        // An older daemon answers a `host_ip` request as an own-address
+        // registration: it allocated an address row and minted no box id
+        // for the `host_ip` box. That registration is refused here, never
+        // recorded as an own-address box.
+        minimald_rpc::BoxControlReply::Registered(_)
+        | minimald_rpc::BoxControlReply::Addresses(_)
+            if host_ip =>
+        {
+            Err(anyhow::anyhow!(HOST_IP_REGISTRATION_UNSUPPORTED))
+        }
         minimald_rpc::BoxControlReply::Registered(web) => Ok(RegisteredWithVmHost {
             addresses: boxes::BoxAddresses {
                 switch_address: web.switch_address,
@@ -1146,5 +1161,64 @@ mod tests {
             .expect("the refusal is typed through its context");
         assert_eq!(held.held, "Dev");
         assert!(format!("{error:#}").contains("a box named Dev already exists"));
+    }
+
+    /// A VM host daemon older than `host_ip` registration answers a
+    /// `host_ip` request as an own-address one. The client refuses that
+    /// answer and never records the box as an own-address box.
+    #[tokio::test]
+    async fn an_older_vm_host_reply_to_a_host_ip_registration_is_refused() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+        let replies = [
+            minimald_rpc::BoxControlReply::Registered(minimald_rpc::RegisteredBox {
+                switch_address: PAIR.switch_address,
+                loopback_address: PAIR.loopback_address,
+                box_id: minimald_rpc::BoxId::from_bytes([7; 16]),
+                task_addresses: Vec::new(),
+            }),
+            minimald_rpc::BoxControlReply::Addresses(PAIR),
+        ];
+        for reply in replies {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sock_path = dir.path().join("control.sock");
+            let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+            let line = serde_json_lenient::to_string(&reply).unwrap();
+            let daemon = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = tokio::io::BufReader::new(stream);
+                let mut request = String::new();
+                stream.read_line(&mut request).await.unwrap();
+                stream
+                    .get_mut()
+                    .write_all(format!("{line}\n").as_bytes())
+                    .await
+                    .unwrap();
+            });
+            let request = minimald_rpc::RegisterBoxRequest {
+                name: "grant".to_string(),
+                ingress_ports: Vec::new(),
+                egress: None,
+                credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
+                hold: false,
+                task_slots: 0,
+                host_ip: true,
+            };
+            let outcome = register_box_with_vm_host(&sock_path, request).await;
+            daemon.await.unwrap();
+            let error = match outcome {
+                Ok(registered) => panic!(
+                    "{reply:?}: an older daemon's answer is refused, got host_ip {}",
+                    registered.host_ip
+                ),
+                Err(error) => error,
+            };
+            assert!(
+                format!("{error:#}").contains("older than host_ip box registration"),
+                "{reply:?}: {error:#}"
+            );
+        }
     }
 }
