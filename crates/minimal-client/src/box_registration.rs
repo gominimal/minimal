@@ -482,8 +482,10 @@ pub async fn register_box_with_vm_host(
 ///
 /// Always quiet when it owes nothing: a session that registered no box — a
 /// native host, a host-ip box sharing the node's own row, a refused
-/// registration — withdraws nothing and says nothing. In particular it
-/// never releases a held `host_ip` name: an activation that failed holds
+/// registration — withdraws nothing and says nothing. A `host_ip` box that
+/// registered (BEP-082) has no row, but its creator passes the id the
+/// registration handed back, and the withdrawal removes its registration
+/// name. It never releases a held `host_ip` name: an activation that failed holds
 /// none (the hold is made only once the session is active), and the name
 /// may be a live session's — a refused held name is exactly that — so
 /// only the destroy of the session that held it releases it. A withdrawal
@@ -503,8 +505,17 @@ pub async fn withdraw_box_row(
     box_id: Option<minimald_rpc::BoxId>,
 ) {
     let Some(name) = name else { return };
-    let Some(addresses) = box_addresses else {
-        return;
+    // A `host_ip` registration has no address pair, only the id it handed
+    // back (BEP-082). Its creator withdraws the registration name with the
+    // unspecified pair and that id, so a later box under the name takes a
+    // fresh id. With neither, there is nothing to withdraw.
+    let addresses = match (box_addresses, box_id) {
+        (Some(addresses), _) => addresses,
+        (None, Some(_)) => boxes::BoxAddresses {
+            switch_address: std::net::Ipv4Addr::UNSPECIFIED,
+            loopback_address: std::net::Ipv4Addr::UNSPECIFIED,
+        },
+        (None, None) => return,
     };
     let Some(sock_path) = control_sock else {
         tracing::warn!(
@@ -1001,6 +1012,52 @@ mod tests {
             "the runtime's shutdown waited {:?} on the abandoned exchange",
             started.elapsed()
         );
+    }
+
+    /// BEP-082: an activation that fails after a `host_ip` registration has
+    /// no address pair, only the id the registration handed back. Its
+    /// withdrawal sends the unspecified pair and that id, so the daemon
+    /// withdraws the registration name.
+    #[tokio::test]
+    async fn a_failed_host_ip_activation_withdraws_its_registration_name() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+        let unspecified = boxes::BoxAddresses {
+            switch_address: std::net::Ipv4Addr::UNSPECIFIED,
+            loopback_address: std::net::Ipv4Addr::UNSPECIFIED,
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let sock_path = dir.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let line =
+            serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::Addresses(unspecified))
+                .unwrap();
+        let daemon = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = tokio::io::BufReader::new(stream);
+            let mut request = String::new();
+            stream.read_line(&mut request).await.unwrap();
+            stream
+                .get_mut()
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .unwrap();
+            request
+        });
+        let id = minimald_rpc::BoxId::from_bytes([9; 16]);
+        withdraw_box_row(Some(sock_path), Some("grant"), None, Some(id)).await;
+        let sent = daemon.await.unwrap();
+        let request: minimald_rpc::BoxControlRequest =
+            serde_json_lenient::from_str(sent.trim()).unwrap();
+        match request {
+            minimald_rpc::BoxControlRequest::Withdraw(withdrawal) => {
+                assert_eq!(withdrawal.name, "grant");
+                assert!(withdrawal.switch_address.is_unspecified());
+                assert!(withdrawal.loopback_address.is_unspecified());
+                assert_eq!(withdrawal.box_id, Some(id));
+            }
+            other => panic!("the activation withdraws its registration, got {other:?}"),
+        }
     }
 
     /// The registration's lease is held across the finalize — the daemon
