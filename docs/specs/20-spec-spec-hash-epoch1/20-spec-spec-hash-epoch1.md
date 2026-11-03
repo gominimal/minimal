@@ -151,7 +151,9 @@ build-infra operator. Release manager.
     class 8's witness pair (z, -z): encode(z) == encode(-z)
   harness:  kani_epoch1_witness_refutations, one harness per witness class
     of the epoch-0 defect catalog (nine), each over its concrete witness,
-    unwind 9 (the witnesses' strings are at most 8 bytes); class 7's
+    unwind 9 for classes 1 to 8 (their witnesses' strings are at most 8
+    bytes) and unwind 33 for class 9 (its witness pair carries a 32-byte
+    parent key, the same loop EPOCH-001 bounds); class 7's
     harness encodes under both index widths in one run, since one platform
     cannot witness the other
 
@@ -416,8 +418,9 @@ consumer half (EPOCH-012) then waits on client-side Sigstore verification.
 
 EPOCH-012 selects the epoch through the pinned index and never through a
 global setting. That keeps historical pins valid through the flip, with
-no dual publishing. The producing side moves together at one
-config-plumbed site, and consumers follow their indices. An index that
+no dual publishing. The producing side has three encoder call
+sites (spec, subset, container) behind one config value, and they move
+together; consumers follow their indices. An index that
 declares a lower epoch than the one a pin's commit was sealed with is not a
 downgrade the keyspace permits. It is an index substitution. A pin names a
 commit, and the commit names its index object. Replacing that object is
