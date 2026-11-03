@@ -7761,6 +7761,31 @@ async fn daemon_kill_racing_reap_is_not_a_natural_exit() {
     );
 }
 
+// BOX-038: a pty error can be stashed before a kill from the daemon arrives.
+// The kill still ends the box, so the loop reports the end as requested, not
+// as the entrypoint's own return.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_kill_racing_reap_is_not_a_natural_exit_after_pty_error() {
+    let capture = captured_log();
+    let (mut host, handle) = until_complete_host().await;
+    host.record_pty_err(PtyOp::Read, std::io::Error::from_raw_os_error(libc::EIO));
+    handle.kill(false).await.expect("the kill is queued");
+    let exit = tokio::time::timeout(Duration::from_secs(10), crate::traced::spawn(host.run()))
+        .await
+        .expect("the loop ends on the kill")
+        .expect("host task should not panic")
+        .expect("the loop reaps the killed entrypoint");
+    assert!(
+        exit.requested,
+        "a kill after a stashed pty error is the daemon's end: {exit:?}"
+    );
+    let logged = capture.contents();
+    assert!(
+        logged.contains("session process reaped after requested teardown"),
+        "the reap is logged as a requested teardown:\n{logged}"
+    );
+}
+
 /// A box filed in a real store under a temp dir, so its host writes the
 /// box's log and its bindings write the box's events beside a real record.
 struct StoredBox {
