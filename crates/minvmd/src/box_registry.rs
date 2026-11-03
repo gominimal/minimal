@@ -6148,9 +6148,16 @@ impl BoxRegistry {
         if newly_resident {
             self.ping();
         }
+        // The mirror's state beside the count, so a host can read whether the
+        // node's binds were mirrored when the set changed (NET-129).
+        let mirrored = self
+            .node_mirror
+            .mirrored_address()
+            .map_or_else(|| "none".to_string(), |address| address.to_string());
         tracing::info!(
             session = %session_id,
             resident_host_ip_boxes = count,
+            mirrored_address = %mirrored,
             "holding the host_ip box's egress rules; box-marked frames from the node \
              address are decided by the resident boxes' rules"
         );
