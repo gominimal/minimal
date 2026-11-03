@@ -631,6 +631,25 @@ async fn monitor_switch_datapath(
 /// (the process has already exited); other errors are logged via
 /// `tracing::warn!`.
 #[cfg(target_os = "linux")]
+/// The environment variable that listed the host exposures before the
+/// `[host-exposures]` table of the client `config.toml` replaced it.
+const RETIRED_HOST_EXPOSURE_ENV: &str = "MINVMD_HOST_EXPOSURE_PORTS";
+
+/// Logs a warning when the retired host-exposure variable is set. `minvmd`
+/// ignores its value, and only the `[host-exposures]` table opens a port.
+fn warn_retired_host_exposure_env(value: Option<std::ffi::OsString>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    tracing::warn!(
+        variable = RETIRED_HOST_EXPOSURE_ENV,
+        value = %value.to_string_lossy(),
+        "ignored MINVMD_HOST_EXPOSURE_PORTS: host.min.internal opens only the ports \
+         that the [host-exposures] table of the client config.toml lists"
+    );
+    true
+}
+
 fn signal_via_pidfd(pidfd: &OwnedFd, signal: libc::c_int, signal_name: &str) {
     // SAFETY: syscall(SYS_pidfd_send_signal, pidfd, sig, 0, 0) is the
     // pidfd_send_signal(2) syscall with a null siginfo_t (equivalent to kill(2));
@@ -802,6 +821,10 @@ impl HostGvproxy {
         // ports in `[host-exposures]` — are the live table: the gate reads
         // it again when the file changes, so an added entry opens its port
         // and a removed one closes it, with no restart (NET-158).
+        // The retired variable no longer opens a port. Say so in the daemon
+        // log, so an operator who still sets it sees why the alias stays
+        // closed at its ports (NET-158).
+        warn_retired_host_exposure_env(std::env::var_os(RETIRED_HOST_EXPOSURE_ENV));
         let baseline = NodePlaneBaseline::built_in(subnet)
             .with_host_exposures(host_exposures::HostExposures::client_config());
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1042,6 +1065,12 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use tracing_subscriber::fmt::MakeWriter;
+
+    #[test]
+    fn retired_host_exposure_env_is_warned_when_set() {
+        assert!(!warn_retired_host_exposure_env(None));
+        assert!(warn_retired_host_exposure_env(Some("8080".into())));
+    }
 
     fn spawn_sleep() -> Child {
         // A long-lived child to stand in for gvproxy in supervision tests.
