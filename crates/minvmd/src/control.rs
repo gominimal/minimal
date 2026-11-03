@@ -4234,7 +4234,10 @@ mod tests {
         }
         match ask("ungranted", "create-c") {
             BoxControlReply::BoxIdMinted { minted_box_id } => {
-                assert_ne!(minted_box_id, registered, "a name with no registration is fresh");
+                assert_ne!(
+                    minted_box_id, registered,
+                    "a name with no registration is fresh"
+                );
                 assert_eq!(
                     AsRef::<uuid::Uuid>::as_ref(&minted_box_id).get_version_num(),
                     7
