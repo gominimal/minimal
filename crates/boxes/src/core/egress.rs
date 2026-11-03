@@ -33,7 +33,8 @@
 //!   port, is admitted under any declaration including deny-all (NET-079,
 //!   NET-134), because a box that cannot resolve cannot use an allow list
 //!   of names either; the Box Egress Proxy's **listener** — TCP to the
-//!   listener's own port — is admitted for a box that declared a
+//!   listener's own port, and TCP to port 443 for a `dns`-steered box's
+//!   direct TLS (BEP-080) — is admitted for a box that declared a
 //!   credentialed upstream (NET-134), because the proxy is that lane's
 //!   infrastructure — the one destination a box reaches by declaring the
 //!   upstream, never by allowing its address; and every other frame to the
@@ -119,6 +120,14 @@ pub const PROXY_LISTENER_PORT: u16 = 8118;
 /// rules, by the one lane predicate both legs of the frame's path share
 /// ([`proxy_lane_admits`]).
 pub const PROXY_LISTENER_PROTOCOL: u8 = 6;
+
+/// The port a `dns`-steered box opens TLS on at the proxy's address: the
+/// box resolver gives a credentialed name that address, and the box dials
+/// it as the upstream itself (BEP-080). The lane admits TCP at this port
+/// beside [`PROXY_LISTENER_PORT`], and only for a box that declared a
+/// credentialed upstream. UDP to it stays the address's drop, because the
+/// proxy has no QUIC listener.
+pub const PROXY_DIRECT_TLS_PORT: u16 = 443;
 
 /// The DSCP value a VM guest's classifier writes on every IPv4 packet of a
 /// connection a box's cgroup opened, so the host-side gate can tell a box's
@@ -1098,13 +1107,15 @@ pub fn foreign_source(summary: &FrameSummary, lease: [u8; 4]) -> Option<DropReas
 /// port, protocol) triple the listener is — never the address alone
 /// (design §5.3's port-scoped opening): a frame to the address at any
 /// other port, over any other protocol, or from a box that declared no
-/// lane, is every other leg's refusal.
+/// lane, is every other leg's refusal. The one other port is
+/// [`PROXY_DIRECT_TLS_PORT`], over the listener's protocol: the proxy takes
+/// a `dns`-steered box's direct TLS there (BEP-080).
 #[must_use]
 pub fn proxy_lane_admits(declared: bool, listener: ProxyListener, summary: &FrameSummary) -> bool {
     declared
         && summary.dst == Some(listener.addr)
         && summary.proto == Some(listener.proto)
-        && summary.dst_port == listener.port
+        && (summary.dst_port == listener.port || summary.dst_port == PROXY_DIRECT_TLS_PORT)
 }
 
 /// The admit-or-drop decision for one frame summary against one box's rules
@@ -2531,6 +2542,56 @@ mod tests {
         );
     }
 
+    /// BEP-080: the lane admits TCP 443 at the proxy's address beside the
+    /// listener's port, for the direct TLS a `dns`-steered box opens there,
+    /// and nothing else. UDP 443 there stays rejected, and a box that
+    /// declared no lane reaches neither port.
+    #[test]
+    fn proxy_lane_admits_tls_443_and_listener_port_only() {
+        const PROXY: [u8; 4] = [100, 64, 255, 252];
+        let laned = deny_all().with_credentialed_upstream(PROXY);
+        assert!(
+            admits(&ipv4_frame(IPPROTO_TCP, PROXY, PROXY_LISTENER_PORT), &laned),
+            "TCP to the proxy's listener is admitted for a laned box"
+        );
+        // BEP-080: TCP 443 at the proxy's address is the lane's too, for
+        // the direct TLS a `dns`-steered box opens there.
+        assert!(
+            admits(
+                &ipv4_frame(IPPROTO_TCP, PROXY, PROXY_DIRECT_TLS_PORT),
+                &laned
+            ),
+            "TCP 443 at the proxy's address is admitted for a laned box"
+        );
+        assert!(
+            !admits(
+                &ipv4_frame(IPPROTO_UDP, PROXY, PROXY_DIRECT_TLS_PORT),
+                &laned
+            ),
+            "UDP 443 at the proxy's address stays rejected"
+        );
+        assert!(
+            !admits(
+                &ipv4_frame(IPPROTO_TCP, PROXY, PROXY_DIRECT_TLS_PORT),
+                &deny_all().with_box_egress_proxy(PROXY)
+            ),
+            "a box that declared no lane does not reach port 443 at the proxy's address"
+        );
+        for port in [80, 444, 8080, 8443] {
+            assert!(
+                !admits(&ipv4_frame(IPPROTO_TCP, PROXY, port), &laned),
+                "TCP {port} at the proxy's address is not the lane's"
+            );
+        }
+        assert!(
+            !admits(
+                &ipv4_frame(IPPROTO_TCP, [203, 0, 113, 7], PROXY_DIRECT_TLS_PORT),
+                &laned
+            ),
+            "TCP 443 to an outside destination stays denied"
+        );
+    }
+
     /// NET-134: the Box Egress Proxy's **listener** is a declared lane's
     /// infrastructure — the one destination admitted beside the rules,
     /// granted by the box's own declaration where the resolver carve-out is
@@ -2562,8 +2623,8 @@ mod tests {
         // port are both the address's own drop below, ahead of the deny
         // rules — the address is infrastructure whatever the box declared.
         assert!(
-            !admits(&ipv4_frame(IPPROTO_TCP, PROXY, 443), &laned),
-            "the lane holds the listener's port only, not the address"
+            !admits(&ipv4_frame(IPPROTO_TCP, PROXY, 444), &laned),
+            "the lane holds the listener's port and 443 only, not the address"
         );
         assert!(
             !admits(&ipv4_frame(IPPROTO_TCP, PROXY, 8080), &laned),
@@ -2604,7 +2665,7 @@ mod tests {
         // The drop is the address's own, ahead of the rules and named the
         // way the host-side gate names it — a deny-all box's frame to
         // another port at the address is this drop, not the deny's.
-        let other_port = ipv4_frame(IPPROTO_TCP, PROXY, 443);
+        let other_port = ipv4_frame(IPPROTO_TCP, PROXY, 444);
         assert_eq!(
             verdict(&summarize(&other_port), &laned),
             FrameVerdict::Drop(DropReason::UncredentialedProxyDestination {
@@ -2626,7 +2687,7 @@ mod tests {
             ("an allow-all box that declared the lane", &allow_all_laned),
             ("an allow-all box that declared no lane", &allow_all_unlaned),
         ] {
-            let tcp_other_port = ipv4_frame(IPPROTO_TCP, PROXY, 443);
+            let tcp_other_port = ipv4_frame(IPPROTO_TCP, PROXY, 444);
             assert_eq!(
                 verdict(&summarize(&tcp_other_port), rules),
                 FrameVerdict::Drop(DropReason::UncredentialedProxyDestination {
@@ -2849,7 +2910,7 @@ mod tests {
             ),
             "the credentialed lane's listener opens beside a deny-all, set attached"
         );
-        let other_port = ipv4_frame(IPPROTO_TCP, BEP_PEER, 443);
+        let other_port = ipv4_frame(IPPROTO_TCP, BEP_PEER, 444);
         assert_eq!(
             verdict(&summarize(&other_port), &laned),
             FrameVerdict::Drop(DropReason::UncredentialedProxyDestination {
@@ -3914,7 +3975,7 @@ mod kani_proofs {
     use super::{
         DNS_PORT, DynamicIngress, ETH_HDR, ETHERTYPE_IPV4, EgressRules, FrameFamily, FrameVerdict,
         IPPROTO_UDP, InfrastructureDenySet, IngressRules, IpProto, Ipv4Cidr, ListenVerdict,
-        rebinding_admits, rebinding_intersection, summarize, verdict,
+        PROXY_DIRECT_TLS_PORT, rebinding_admits, rebinding_intersection, summarize, verdict,
     };
 
     /// One dimension's rules under every declaration the compile can
@@ -4114,7 +4175,8 @@ mod kani_proofs {
                     && rules.proxy.is_some_and(|listener| {
                         proto == listener.proto
                             && dst == listener.addr
-                            && summary.destination_port() == listener.port
+                            && (summary.destination_port() == listener.port
+                                || summary.destination_port() == PROXY_DIRECT_TLS_PORT)
                     });
                 // NET-134's other arm: every frame to the proxy's address
                 // the lane did not admit, dropped ahead of the rules — the

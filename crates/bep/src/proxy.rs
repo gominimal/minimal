@@ -20,6 +20,17 @@
 //! - A head that is not HTTP/1.1 is refused. A flow that opens with the
 //!   HTTP/2 prior-knowledge preface is closed (BEP-074).
 //!
+//! A box whose steering is `dns` reaches the proxy as the upstream itself:
+//! the box resolver gives a credentialed name the proxy's address, and the
+//! box opens TLS to it on port 443. A connection whose first byte opens a
+//! TLS handshake record takes its authority from the ClientHello's SNI at
+//! the port the box connected to, and then enters the same admission,
+//! termination, substitution and egress re-check as a CONNECT to that
+//! authority (BEP-080). A ClientHello with no SNI, or with an SNI outside
+//! the admitted set, is closed and the audit log records it `off_module`.
+//! The span's `entry` field says which form a connection took: `connect`
+//! or `direct_tls`.
+//!
 //! The admitted set is the union of the configured modules' host sets and
 //! the registered store authorities ([`Admission`]). A CONNECT or an
 //! absolute-form request outside it is refused, and the audit log records
@@ -56,10 +67,10 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
-use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tokio_rustls::{LazyConfigAcceptor, TlsAcceptor, TlsConnector};
 use tracing::Instrument as _;
 
-use crate::audit::{AuditLog, Decision, Kind, Mapping, Outcome};
+use crate::audit::{AuditLog, Decision, Kind, Mapping, NO_SNI, Outcome};
 use crate::ca::{Ca, CaError, CaKey, Leaf};
 use crate::forward::{self, Flow, HalfEnd, Redeemer, Unwired, UpstreamError, Validated};
 use crate::http::{self, CloseReason, Parse};
@@ -76,6 +87,17 @@ pub const OFF_MODULE: &str = "off_module";
 
 /// The audit marker of a plain HTTP request to a credentialed host.
 pub const UPSTREAM_NOT_TLS: &str = "upstream_not_tls";
+
+/// The entry form of a box connection that opened with a CONNECT head.
+pub const ENTRY_CONNECT: &str = "connect";
+
+/// The entry form of a box connection that opened with a TLS ClientHello,
+/// as `dns` steering sends it to port 443 (BEP-080).
+pub const ENTRY_DIRECT_TLS: &str = "direct_tls";
+
+/// The content type of a TLS handshake record, the first byte of a
+/// ClientHello.
+const TLS_HANDSHAKE_RECORD: u8 = 0x16;
 
 /// How long a box's connection has to send its first request head.
 pub const HEAD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -345,7 +367,8 @@ impl fmt::Debug for Proxy {
 }
 
 /// The `box_connection` span of one box connection. It carries the box id,
-/// the authority the box asked for, the upstream's validation outcome, the
+/// the entry form (`connect` or `direct_tls`), the authority the box asked
+/// for, the upstream's validation outcome, the
 /// last substitution decision, whether an admission was cohort-attributed,
 /// and the outcome. When a store reference is redeemed it also carries the
 /// `store` and the `identifier`, with the names the audit record uses
@@ -356,6 +379,7 @@ pub(crate) fn connection_span(box_id: &str, source: &dyn std::fmt::Display) -> t
         "box_connection",
         box_id = %box_id,
         source = %source,
+        entry = tracing::field::Empty,
         authority = tracing::field::Empty,
         upstream_tls = tracing::field::Empty,
         substitution = tracing::field::Empty,
@@ -429,7 +453,8 @@ impl Proxy {
         let box_id = delivery.box_id_text();
         let span = connection_span(&box_id, &delivery.source);
         async {
-            let outcome = self.serve_inner(&box_id, stream).await;
+            let port = delivery.destination.port();
+            let outcome = self.serve_inner(&box_id, port, stream).await;
             tracing::Span::current().record("outcome", outcome.word());
             tracing::debug!(outcome = outcome.word(), "box connection ended");
         }
@@ -437,16 +462,31 @@ impl Proxy {
         .await;
     }
 
-    async fn serve_inner<S>(&self, box_id: &str, mut stream: S) -> Ended
+    async fn serve_inner<S>(&self, box_id: &str, port: u16, mut stream: S) -> Ended
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let (request, rest) = match tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut stream)).await
-        {
+        // One deadline covers the first byte and the rest of the head, so
+        // HEAD_TIMEOUT stays the whole time the box has to send it.
+        let head_deadline = tokio::time::Instant::now() + HEAD_TIMEOUT;
+        // BEP-080: a connection that opens with a TLS handshake record is a
+        // box whose `dns` steering sent it here as the upstream itself.
+        let mut first = [0u8; 1];
+        let read = match tokio::time::timeout_at(head_deadline, stream.read(&mut first)).await {
             Err(_) => return Ended::Closed("head_timeout"),
-            Ok(Err(reason)) => return self.refuse_head(&mut stream, &reason).await,
-            Ok(Ok(head)) => head,
+            Ok(Err(_)) => return Ended::Closed("box_read"),
+            Ok(Ok(read)) => read,
         };
+        let mut stream = Prefixed::new(first[..read].to_vec(), stream);
+        if read == 1 && first[0] == TLS_HANDSHAKE_RECORD {
+            return self.direct_tls(box_id, port, stream).await;
+        }
+        let (request, rest) =
+            match tokio::time::timeout_at(head_deadline, read_head(&mut stream)).await {
+                Err(_) => return Ended::Closed("head_timeout"),
+                Ok(Err(reason)) => return self.refuse_head(&mut stream, &reason).await,
+                Ok(Ok(head)) => head,
+            };
         if let Some(word) = tunnel_refusal(&request) {
             // BEP-029: a tunnel request outside the admitted set is an
             // audited `off_module` refusal, though its answer stays `501`.
@@ -596,6 +636,7 @@ impl Proxy {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        tracing::Span::current().record("entry", ENTRY_CONNECT);
         tracing::Span::current().record("authority", target);
         let Some((host, port)) = split_authority(target) else {
             respond(
@@ -608,77 +649,17 @@ impl Proxy {
             return Ended::Refused("connect_target");
         };
         let authority = format!("{host}:{port}");
+        tracing::debug!(entry = ENTRY_CONNECT, authority, "box connection entered");
         // BEP-029, and BEP-031's port discipline: the authority is admitted
         // only as `host:port`.
         if !self.admission.admits(&host, port) {
             return self.off_module(box_id, &mut stream, &authority).await;
         }
-        let server = match self.server_config(&host) {
-            Ok(server) => server,
-            Err(err) => {
-                tracing::warn!(host, error = %err, "no leaf certificate for an admitted host");
-                respond(
-                    &mut stream,
-                    502,
-                    "Bad Gateway",
-                    &format!("The Box Egress Proxy did not get a certificate for {host}."),
-                )
-                .await;
-                return Ended::Refused("leaf");
-            }
-        };
-        let dialed = tokio::time::timeout(HANDSHAKE_TIMEOUT, self.dial_upstream(&host, port))
-            .await
-            .unwrap_or_else(|_| {
-                Err(UpstreamError::Unreachable(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "the connection timed out",
-                )))
-            });
-        let upstream = match dialed {
-            Ok(upstream) => {
-                tracing::Span::current().record("upstream_tls", "valid");
-                upstream
-            }
-            Err(err @ (UpstreamError::Invalid(_) | UpstreamError::Handshake(_))) => {
-                // BEP-055: nothing goes on a leg that did not validate.
-                let (outcome, log, reason) = if matches!(err, UpstreamError::Invalid(_)) {
-                    (
-                        "invalid",
-                        "the upstream certificate did not validate",
-                        "the server's certificate did not validate against this computer's trusted certificates",
-                    )
-                } else {
-                    (
-                        "handshake_failed",
-                        "the upstream TLS handshake failed",
-                        "the TLS handshake with the server failed",
-                    )
-                };
-                tracing::Span::current().record("upstream_tls", outcome);
-                tracing::warn!(authority, error = %err, "{log}");
-                self.audit_refusal(box_id, &authority, forward::UPSTREAM_TLS_INVALID);
-                respond(
-                    &mut stream,
-                    502,
-                    "Bad Gateway",
-                    &format!(
-                        "The Box Egress Proxy refused the connection to {authority}, because {reason}."
-                    ),
-                )
-                .await;
-                return Ended::Refused(forward::UPSTREAM_TLS_INVALID);
-            }
-            Err(UpstreamError::Unreachable(err)) => {
-                tracing::warn!(authority, error = %err, "the upstream connection failed");
-                respond(
-                    &mut stream,
-                    502,
-                    "Bad Gateway",
-                    &format!("The Box Egress Proxy did not connect to {authority}: {err}."),
-                )
-                .await;
-                return Ended::Refused("upstream_connect");
+        let (server, upstream) = match self.open_upstream(box_id, &host, port).await {
+            Ok(opened) => opened,
+            Err(failed) => {
+                respond(&mut stream, 502, "Bad Gateway", &failed.answer).await;
+                return failed.ended;
             }
         };
         if stream
@@ -705,12 +686,148 @@ impl Proxy {
                 return Ended::Closed("box_tls_timeout");
             }
         };
+        self.relay_flow(box_id, host, port, boxed, upstream).await
+    }
+
+    /// BEP-080: a box connection that opens with a TLS ClientHello. The
+    /// authority is the SNI at the port the box connected to, and it enters
+    /// the same admission, termination, substitution and egress re-check a
+    /// CONNECT to that authority enters. A refusal closes the connection,
+    /// because a TLS client reads no HTTP answer.
+    async fn direct_tls<S>(&self, box_id: &str, port: u16, stream: S) -> Ended
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        tracing::Span::current().record("entry", ENTRY_DIRECT_TLS);
+        let hello = tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream),
+        )
+        .await;
+        let start = match hello {
+            Ok(Ok(start)) => start,
+            Ok(Err(err)) => {
+                tracing::info!(error = %err, "the box's ClientHello did not parse");
+                return Ended::Refused("box_tls_handshake");
+            }
+            Err(_) => return Ended::Closed("box_tls_timeout"),
+        };
+        let host = start.client_hello().server_name().map(normal_host);
+        // No SNI names no host: the record says so, at the port.
+        let authority = format!("{}:{port}", host.as_deref().unwrap_or(NO_SNI));
+        tracing::Span::current().record("authority", authority.as_str());
+        tracing::debug!(
+            entry = ENTRY_DIRECT_TLS,
+            authority,
+            "box connection entered"
+        );
+        let Some(host) = host.filter(|host| self.admission.admits(host, port)) else {
+            // BEP-029: nothing is dialed for an authority outside the set.
+            self.audit_refusal(box_id, &authority, OFF_MODULE);
+            return Ended::Refused(OFF_MODULE);
+        };
+        let (server, upstream) = match self.open_upstream(box_id, &host, port).await {
+            Ok(opened) => opened,
+            Err(failed) => return failed.ended,
+        };
+        // BEP-073: the box's leg offers `http/1.1` alone.
+        let accepted = tokio::time::timeout(HANDSHAKE_TIMEOUT, start.into_stream(server)).await;
+        let boxed = match accepted {
+            Ok(Ok(tls)) => tls,
+            Ok(Err(err)) => {
+                tracing::info!(authority, error = %err, "the box's TLS handshake failed");
+                return Ended::Refused("box_tls_handshake");
+            }
+            Err(_) => {
+                tracing::info!(authority, "the box's TLS handshake timed out");
+                return Ended::Closed("box_tls_timeout");
+            }
+        };
+        self.relay_flow(box_id, host, port, boxed, upstream).await
+    }
+
+    /// The leaf for an admitted `host` and a validated upstream leg to
+    /// `host:port`. A failure carries the answer a CONNECT gets.
+    async fn open_upstream(
+        &self,
+        box_id: &str,
+        host: &str,
+        port: u16,
+    ) -> Result<(Arc<ServerConfig>, Validated<UpstreamTls>), Failed> {
+        let authority = format!("{host}:{port}");
+        let server = match self.server_config(host) {
+            Ok(server) => server,
+            Err(err) => {
+                tracing::warn!(host, error = %err, "no leaf certificate for an admitted host");
+                return Err(Failed {
+                    ended: Ended::Refused("leaf"),
+                    answer: format!("The Box Egress Proxy did not get a certificate for {host}."),
+                });
+            }
+        };
+        let dialed = tokio::time::timeout(HANDSHAKE_TIMEOUT, self.dial_upstream(host, port))
+            .await
+            .unwrap_or_else(|_| {
+                Err(UpstreamError::Unreachable(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the connection timed out",
+                )))
+            });
+        match dialed {
+            Ok(upstream) => {
+                tracing::Span::current().record("upstream_tls", "valid");
+                Ok((server, upstream))
+            }
+            Err(err @ (UpstreamError::Invalid(_) | UpstreamError::Handshake(_))) => {
+                // BEP-055: nothing goes on a leg that did not validate.
+                let (outcome, log, reason) = if matches!(err, UpstreamError::Invalid(_)) {
+                    (
+                        "invalid",
+                        "the upstream certificate did not validate",
+                        "the server's certificate did not validate against this computer's trusted certificates",
+                    )
+                } else {
+                    (
+                        "handshake_failed",
+                        "the upstream TLS handshake failed",
+                        "the TLS handshake with the server failed",
+                    )
+                };
+                tracing::Span::current().record("upstream_tls", outcome);
+                tracing::warn!(authority, error = %err, "{log}");
+                self.audit_refusal(box_id, &authority, forward::UPSTREAM_TLS_INVALID);
+                Err(Failed {
+                    ended: Ended::Refused(forward::UPSTREAM_TLS_INVALID),
+                    answer: format!(
+                        "The Box Egress Proxy refused the connection to {authority}, because {reason}."
+                    ),
+                })
+            }
+            Err(UpstreamError::Unreachable(err)) => {
+                tracing::warn!(authority, error = %err, "the upstream connection failed");
+                Err(Failed {
+                    ended: Ended::Refused("upstream_connect"),
+                    answer: format!("The Box Egress Proxy did not connect to {authority}: {err}."),
+                })
+            }
+        }
+    }
+
+    /// Relays a terminated box flow to its validated upstream leg.
+    async fn relay_flow<B>(
+        &self,
+        box_id: &str,
+        host: String,
+        port: u16,
+        boxed: B,
+        upstream: Validated<UpstreamTls>,
+    ) -> Ended
+    where
+        B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let flow = Flow::new(
             box_id,
-            redeem::Authority {
-                host: host.clone(),
-                port,
-            },
+            redeem::Authority { host, port },
             Arc::clone(&self.audit),
             Arc::clone(&self.redeemer),
             upstream.proof(),
@@ -726,7 +843,7 @@ impl Proxy {
         &self,
         host: &str,
         port: u16,
-    ) -> Result<Validated<tokio_rustls::client::TlsStream<TcpStream>>, UpstreamError> {
+    ) -> Result<Validated<UpstreamTls>, UpstreamError> {
         let resolver = Arc::clone(&self.resolver);
         let name = host.to_owned();
         let addrs = tokio::task::spawn_blocking(move || resolver.resolve(&name, port))
@@ -761,6 +878,16 @@ impl Proxy {
         servers.insert(host.to_owned(), (Instant::now(), Arc::clone(&config)));
         Ok(config)
     }
+}
+
+/// The upstream leg's TLS stream.
+type UpstreamTls = tokio_rustls::client::TlsStream<TcpStream>;
+
+/// An upstream leg that did not open: how the connection ends, and the
+/// answer a CONNECT gets for it.
+struct Failed {
+    ended: Ended,
+    answer: String,
 }
 
 /// How one box connection ended, for the span.
@@ -1088,7 +1215,6 @@ pub(crate) mod tests {
     use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, SigningKey as _};
     use rustls::pki_types::ServerName;
     use tokio::net::{TcpListener, UnixStream};
-    use tokio_rustls::LazyConfigAcceptor;
     use zeroize::Zeroizing;
 
     use super::*;
@@ -1680,5 +1806,189 @@ pub(crate) mod tests {
         )
         .await
         .expect("the flow ends when the upstream closes");
+    }
+
+    // HEAD_TIMEOUT is the whole time a box has to send its first request
+    // head. A box that sends the first byte just before the limit, and
+    // never completes the head, is closed HEAD_TIMEOUT after its
+    // connection arrived, not HEAD_TIMEOUT after that first byte.
+    #[tokio::test(start_paused = true)]
+    async fn head_split_after_its_first_byte_times_out_at_head_timeout_total() {
+        let h = harness().await;
+        let start = tokio::time::Instant::now();
+        let mut stream = box_connection(&h.proxy);
+        tokio::time::sleep(HEAD_TIMEOUT.checked_sub(Duration::from_secs(1)).unwrap()).await;
+        stream.write_all(b"G").await.unwrap();
+        stream.write_all(b"ET / HTTP/1.1\r\n").await.unwrap();
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).await.unwrap();
+        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= HEAD_TIMEOUT && elapsed < HEAD_TIMEOUT + Duration::from_secs(1),
+            "the connection closed after {elapsed:?}"
+        );
+    }
+
+    /// The credential the admitting redeemer gives.
+    const REAL: &str = "ghs_real_credential";
+
+    /// A redeemer whose box declares the GitHub host set as its egress. It
+    /// admits every sealed value as [`REAL`].
+    struct AdmitsGithub;
+
+    impl Redeemer for AdmitsGithub {
+        fn egress(&self, box_id: &str) -> Vec<redeem::Authority<String>> {
+            DeclaresGithub.egress(box_id)
+        }
+
+        fn redeem(
+            &self,
+            _box_id: &str,
+            _authority: &redeem::Authority<String>,
+            _request: &redeem::RequestAuthority<String>,
+            _sealed: &str,
+        ) -> forward::Verdict {
+            forward::Verdict::Admit {
+                credential: Zeroizing::new(REAL.to_owned()),
+                identifier: "github:member".to_owned(),
+                mapping: Mapping::ModuleUnmapped,
+                renewed: false,
+                marker: None,
+                cohort_attributed: false,
+            }
+        }
+    }
+
+    /// A box connection that `dns` steering sent to the proxy's port 443.
+    fn direct_tls_connection(proxy: &Arc<Proxy>) -> tokio::io::DuplexStream {
+        let mut delivery = delivery();
+        delivery.destination.set_port(443);
+        let (ours, theirs) = tokio::io::duplex(64 * 1024);
+        let proxy = Arc::clone(proxy);
+        tokio::spawn(async move { proxy.serve(delivery, theirs).await });
+        ours
+    }
+
+    // BEP-080: a box that opens TLS to the proxy on port 443, with no
+    // CONNECT, is routed by its SNI. The upstream leg is dialed for that
+    // name, the box's leg is terminated under the interception root, and
+    // the sealed value is substituted.
+    #[tokio::test]
+    async fn direct_tls_on_443_routes_by_sni() {
+        use base64::Engine as _;
+
+        let upstream = upstream().await;
+        let (leaves, root) = interception_ca();
+        let resolver = Arc::new(To(upstream.addr, AtomicUsize::new(0)));
+        let audit = Arc::new(Mutex::new(Vec::<Decision>::new()));
+        let proxy = Arc::new(
+            Proxy::new(
+                Admission::new(&[GITHUB], [("vault.example.com", 443)]),
+                leaves,
+                upstream.roots.clone(),
+                resolver.clone(),
+                audit.clone(),
+            )
+            .unwrap()
+            .with_redeemer(Arc::new(AdmitsGithub)),
+        );
+
+        let name = ServerName::try_from("api.github.com").unwrap();
+        let mut tls = box_tls(&root, &[b"h2", ALPN_HTTP11])
+            .connect(name, direct_tls_connection(&proxy))
+            .await
+            .expect("the box's direct TLS completes under the interception root");
+        assert_eq!(tls.get_ref().1.alpn_protocol(), Some(ALPN_HTTP11));
+
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!(r#"{{"typ":"{}"}}"#, crate::seal::TYP));
+        let sealed = format!("{header}..aXY.Y3Q.dGFn");
+        tls.write_all(
+            format!(
+                "GET /user HTTP/1.1\r\nHost: api.github.com\r\nAuthorization: Bearer {sealed}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let answer = response_head(&mut tls).await;
+        assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
+
+        // The SNI chose the upstream, and the upstream got the credential.
+        assert_eq!(resolver.1.load(Ordering::SeqCst), 1);
+        let heads = upstream.heads.lock().unwrap().clone();
+        assert_eq!(heads.len(), 1, "{heads:?}");
+        assert!(heads[0].starts_with("GET /user HTTP/1.1\r\n"), "{heads:?}");
+        assert!(heads[0].contains(&format!("Bearer {REAL}")), "{heads:?}");
+        assert!(!heads[0].contains(&sealed), "{heads:?}");
+
+        // The audit record names the authority the SNI routed to.
+        let records = audit.lock().unwrap();
+        assert!(
+            records.iter().any(|d| d.authority == "api.github.com:443"
+                && d.outcome == Outcome::Admit
+                && d.box_id == "42".repeat(16)),
+            "{records:?}"
+        );
+    }
+
+    // BEP-080 with BEP-029: a ClientHello with an SNI outside the module
+    // host sets and the registered store authorities, or with no SNI, is
+    // closed, nothing is dialed, and the audit log records it `off_module`.
+    #[tokio::test]
+    async fn direct_tls_without_admitted_sni_is_refused_off_module() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = AuditLog::open(dir.path().join(segment_name(0))).unwrap();
+        let (h, _) = harness_with(Arc::new(Mutex::new(log))).await;
+
+        let names = [
+            ServerName::try_from("example.com").unwrap(),
+            // An address as the name: the client sends no SNI.
+            ServerName::IpAddress(Ipv4Addr::new(10, 0, 2, 3).into()),
+        ];
+        for name in names {
+            let refused = tokio::time::timeout(
+                Duration::from_secs(10),
+                box_tls(&h.root, &[ALPN_HTTP11])
+                    .connect(name.clone(), direct_tls_connection(&h.proxy)),
+            )
+            .await
+            .expect("the proxy closes the connection");
+            assert!(refused.is_err(), "the box's TLS to {name:?} completed");
+        }
+        assert_eq!(h.resolver.1.load(Ordering::SeqCst), 0);
+
+        // What `min box audit <box>` reads.
+        let entries = LogReader::new(dir.path()).read_new().unwrap().entries;
+        let records: Vec<_> = entries
+            .iter()
+            .map(|e| {
+                (
+                    e.record.subject.as_str(),
+                    e.record.upstream.as_str(),
+                    e.record.decision,
+                    e.record.marker.as_deref(),
+                )
+            })
+            .collect();
+        let subject = "42".repeat(16);
+        assert_eq!(
+            records,
+            [
+                (
+                    subject.as_str(),
+                    "example.com:443",
+                    Outcome::Refuse,
+                    Some(OFF_MODULE)
+                ),
+                (
+                    subject.as_str(),
+                    "(no SNI):443",
+                    Outcome::Refuse,
+                    Some(OFF_MODULE)
+                ),
+            ]
+        );
     }
 }
