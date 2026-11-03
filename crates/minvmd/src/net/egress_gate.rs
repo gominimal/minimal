@@ -6373,8 +6373,10 @@ fn row_verdict(
     if let Some(dst) = summary.destination()
         && dst == table.subnet().box_egress_proxy_address().octets()
     {
-        // minvmd is the one crate that sees both spellings of the listener's port.
+        // minvmd is the one crate that sees both spellings of the listener's
+        // port and of the direct TLS port.
         const _: () = assert!(egress::PROXY_LISTENER_PORT == switch::bep_host::PROXY_PORT);
+        const _: () = assert!(egress::PROXY_DIRECT_TLS_PORT == switch::bep_host::PROXY_TLS_PORT);
         let listener = egress::ProxyListener::at(dst);
         if egress::proxy_lane_admits(record.declares_credentialed_upstream(), listener, summary) {
             return Ok(GateAdmit::ProxyLane);
