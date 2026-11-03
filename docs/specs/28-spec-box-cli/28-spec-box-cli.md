@@ -233,7 +233,7 @@ The box model is `docs/specs/29-spec-box-local-first` (BOX): the record, the spe
   - IF `min box start` or `min session start` runs off a TTY without `--detach` for an entry whose spec sets `pty_enabled` THEN THE SYSTEM SHALL fail with exit 2 naming `--detach`. It SHALL fail before it creates the box, and create nothing.
     tier:   T0
     verify: cargo nextest run -p minimal start_off_tty_exit2_names_detach
-  - WHERE `min box start` or `min session start` returns without attaching THE SYSTEM SHALL close the box's stdin at creation. For an entry whose spec does not set `pty_enabled`, it SHALL print one stderr hint. The hint SHALL name `min box run` for wired stdio, and `min box logs` and `min box wait` for the output and exit code.
+  - WHERE `min box start` or `min session start` returns unattached and the spec does not set `pty_enabled` THE SYSTEM SHALL close the box's stdin at creation. It SHALL print one stderr hint. The hint SHALL name `min box run` for wired stdio, and `min box logs` and `min box wait` for the output and exit code. A `pty_enabled` box keeps its terminal input for a later attach (BCLI-068).
     tier:   T0
     verify: cargo nextest run -p minimal unattached_start_closes_stdin_and_hints_run_logs_wait
 
