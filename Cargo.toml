@@ -149,7 +149,7 @@ either = { version = "1.17", default-features = false }
 flate2 = "1.1"
 futures = "0.3"
 generational-arena = {version = "0.2", features = ["serde"] }
-getrandom = "0.3"
+getrandom = "0.4"
 google-cloud-gax = "1.13"
 google-cloud-auth = "1.15"
 google-cloud-storage = "1.17"
@@ -167,7 +167,7 @@ indicatif = "0.18"
 indoc = "^2.0"
 inquire = { version = "0.9", default-features = false, features = ["crossterm", "fuzzy"] }
 insta = "1.48"
-jaq-all = "0.3.0"
+jaq-all = "0.4.0"
 json-subscriber = "0.3"
 libc = "0.2"
 lzma-rs = "0.3"
@@ -210,14 +210,14 @@ prost-types = "0.14"
 # Property testing (dev-dependency only; NET-071 proxy parity is the first consumer).
 proptest = "1"
 resolv-conf = "0.7"
-russh = { version = "0.64", default-features = false, features = ["aws-lc-rs", "flate2"] }
+russh = { version = "0.65", default-features = false, features = ["aws-lc-rs", "flate2"] }
 russh-sftp = "2.4"
 serde_json = { version = "1" }
 serde_json_lenient = { version = "0.2" }
 serial_test = "4"
 sha2 = "0.11"
 shlex = "2.0"
-size = "0.5"
+size = "0.6"
 smallvec = {version = "1.15", features = ["serde"]}
 # The userspace TCP/IP stack the Box Egress Proxy's host leg runs over
 # (`net::bep_host` in `minvmd`): Ethernet medium, IPv4, and the TCP/UDP/ICMP
