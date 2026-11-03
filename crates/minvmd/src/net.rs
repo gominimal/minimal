@@ -97,6 +97,7 @@ pub use shuttle::{VSOCK_GVPROXY_SHUTTLE_PORT, resolve_gate_sock, resolve_switch_
 #[cfg_attr(not(minvmd_libkrun), allow(unused_imports))]
 pub(crate) use stale_gvproxy::reap_stale_gvproxy;
 mod baseline;
+pub(crate) mod host_exposures;
 pub use baseline::{NodeBaselinePhase, NodePlaneBaseline};
 pub use switch::bep_host::{BepBoxSource, BepWire};
 pub use switch::{BepDevice, BepDeviceEnds, BepHost, BepPeer};
@@ -797,11 +798,12 @@ impl HostGvproxy {
         // by it, beside the boxes' rows; announced — the shipped posture —
         // the allow-all interim node row still does, and the gate's
         // start-up line names the posture deciding. The host exposures the
-        // alias is opened at for the node row — none unless the deployment
-        // names ports — are read from the daemon's environment here, on each
-        // spawn, an unparseable list failing it.
+        // alias is opened at — none unless the client `config.toml` names
+        // ports in `[host-exposures]` — are the live table: the gate reads
+        // it again when the file changes, so an added entry opens its port
+        // and a removed one closes it, with no restart (NET-158).
         let baseline = NodePlaneBaseline::built_in(subnet)
-            .with_host_exposure(baseline::host_exposure_ports_from_env()?);
+            .with_host_exposures(host_exposures::HostExposures::client_config());
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<io::Result<u32>>();
 
