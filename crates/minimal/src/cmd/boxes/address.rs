@@ -493,9 +493,11 @@ pub(crate) async fn box_host_client(
     host: &crate::cmd::list::LocalHost,
 ) -> Result<client::Client, anyhow::Error> {
     if host.selected {
-        return connect_box_host(host).await.map_err(|failure| match failure {
-            BoxHostConnect::Unreachable(e) | BoxHostConnect::Skew(e) => e,
-        });
+        return connect_box_host(host)
+            .await
+            .map_err(|failure| match failure {
+                BoxHostConnect::Unreachable(e) | BoxHostConnect::Skew(e) => e,
+            });
     }
     match probe_other_host(host).await? {
         Some(client) => Ok(client),
