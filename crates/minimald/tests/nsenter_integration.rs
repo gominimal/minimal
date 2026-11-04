@@ -380,3 +380,144 @@ fn killing_the_shim_kills_the_injected_process() {
         "the injected process outlived the shim that was killed"
     );
 }
+
+/// The fields of `/proc/<pid>/stat` after the parenthesised comm: state,
+/// ppid, pgrp, session, tty_nr, tpgid, and the rest. `None` once `pid` is
+/// gone.
+fn stat_fields(pid: u32) -> Option<Vec<String>> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, rest) = stat.rsplit_once(')')?;
+    Some(rest.split_whitespace().map(str::to_string).collect())
+}
+
+/// The children of `pid`, from `/proc/<pid>/task/<pid>/children`.
+fn children_of(pid: u32) -> Vec<u32> {
+    std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|word| word.parse().ok())
+        .collect()
+}
+
+/// A tty exec runs the real shim with the slave side of a PTY as its stdin.
+/// The injected process leads a new session and takes that PTY as its
+/// controlling terminal (BOX-149), so the shim's spawn must not fail on
+/// `TIOCSCTTY`. A shell with job control then puts a background job in a
+/// process group of its own, and the shim's stop still ends that job,
+/// through the session (BOX-151).
+#[test]
+#[ignore = "unshares namespaces; gated on MINIMALD_NSENTER_TEST"]
+fn tty_exec_pty_is_controlling_terminal_and_a_stop_ends_its_jobs() {
+    use std::os::fd::{FromRawFd as _, OwnedFd};
+    use std::os::unix::fs::MetadataExt as _;
+
+    if !gated() {
+        return;
+    }
+
+    let mut sandboxed = sandbox(false);
+    let leader = session_leader_pid(sandboxed.id()).expect("resolving the session program's pid");
+
+    let mut master_fd: libc::c_int = -1;
+    let mut slave_fd: libc::c_int = -1;
+    // SAFETY: `openpty` writes two descriptors into the two out-params. The
+    // name, termios and winsize pointers may be null.
+    let rc = unsafe {
+        libc::openpty(
+            &raw mut master_fd,
+            &raw mut slave_fd,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
+    // SAFETY: `openpty` succeeded, so both descriptors are open and owned
+    // by nothing else.
+    let (master, slave) = unsafe {
+        (
+            OwnedFd::from_raw_fd(master_fd),
+            OwnedFd::from_raw_fd(slave_fd),
+        )
+    };
+    let slave_rdev = std::fs::File::from(slave.try_clone().unwrap())
+        .metadata()
+        .unwrap()
+        .rdev();
+
+    // The job ignores SIGTERM and SIGHUP, so only the shim's session kill
+    // ends it. The master stays open to the end, so no hangup does.
+    let mut shim = Injection::new(
+        leader,
+        "/bin/sh",
+        ["-c", "set -m; trap '' TERM HUP; sleep 600 & wait"],
+    )
+    .with_shim(shim())
+    .command()
+    .expect("building the injected command")
+    .stdin(std::process::Stdio::from(slave.try_clone().unwrap()))
+    .stdout(std::process::Stdio::from(slave.try_clone().unwrap()))
+    .stderr(std::process::Stdio::from(slave))
+    .spawn()
+    .expect("spawning the injected command on a tty");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let (shell, job) = loop {
+        if let Ok(shell) = session_leader_pid(shim.id())
+            && let Some(&job) = children_of(shell).first()
+        {
+            break (shell, job);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the shim never started the shell and its job"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+
+    let shell_stat = stat_fields(shell).expect("the shell runs");
+    let job_stat = stat_fields(job).expect("the job runs");
+    assert_eq!(
+        shell_stat[3],
+        shell.to_string(),
+        "the shell leads its own session"
+    );
+    assert_eq!(
+        shell_stat[4],
+        slave_rdev.to_string(),
+        "the PTY is the session's controlling terminal"
+    );
+    assert_eq!(
+        job_stat[3], shell_stat[3],
+        "the job is in the shell's session"
+    );
+    assert_ne!(
+        job_stat[2], shell_stat[2],
+        "job control put the job in a process group of its own"
+    );
+
+    // SAFETY: `kill(2)` has no Rust-side invariants. The shim is unreaped.
+    let shim_pid = libc::pid_t::try_from(shim.id()).unwrap();
+    assert_eq!(unsafe { libc::kill(shim_pid, libc::SIGTERM) }, 0);
+    shim.wait().expect("reaping the shim");
+
+    let deadline = std::time::Instant::now()
+        + minimald::nsenter::SHIM_ESCALATION
+        + std::time::Duration::from_secs(10);
+    let mut alive = true;
+    while std::time::Instant::now() < deadline {
+        if !still_running(job) {
+            alive = false;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    drop(master);
+    let _ = sandboxed.kill();
+    let _ = sandboxed.wait();
+    assert!(
+        !alive,
+        "the background job outlived the stop of its tty exec"
+    );
+}

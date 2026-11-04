@@ -271,11 +271,20 @@ fn every_daemon_connection_is_classified() {
             // the race's loser just reports what the daemon said — so the
             // harness connection carries no gate to record.
             "cmd/boxes/lifecycle.rs::a_destroy_of_an_already_destroyed_session_reports_it = ungated",
+            // Not a product path: the stop and remove tests' own connection
+            // to the harness daemon, the same as the destroy-race test.
+            "cmd/boxes/lifecycle.rs::daemon_with_boxes = ungated",
             // A read-only lookup around an attach the gated `cmd_attach`
             // already made: it reads the box's pair before, and asks whether
             // the session is gone after, to withdraw its row or release a
             // `host_ip` name hold, and which live session holds a name a
             // re-hold took over; it builds nothing a skew could half-make.
+            // `min box list` reaches every local host, split as `min ls`
+            // splits it: the selected host is the one this process ensured,
+            // so it keeps the gate. The others are probed ungated, so a
+            // skewed host still lists the boxes an operator needs to see.
+            "cmd/boxes/list.rs::list_other_host = ungated",
+            "cmd/boxes/list.rs::list_selected_host = gated",
             "cmd/boxes/vm_host.rs::box_record_by = ungated",
             "cmd/list.rs::cmd_bare = gated",
             // `min ls` reaches past the selected VM, and the two halves carry
