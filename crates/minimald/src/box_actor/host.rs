@@ -1303,12 +1303,11 @@ impl BoxActor {
                 .record()
                 .await
                 .map_err(AttachError::LoadoutFailed)?;
-            if record.status != BoxState::Active {
-                return Err(AttachError::SessionPending);
-            }
             // An ended box is resumed only by an attach (BOX-025). A host
             // launched here would run its entrypoint again behind the
-            // record's back.
+            // record's back. Checked before the `Active` gate below: an
+            // ended box is not `Active` either, and the gate's refusal says
+            // the box is still activating, which an ended box is not.
             if let Ok(
                 state @ (boxes::core::record::RecordState::Stopped(_)
                 | boxes::core::record::RecordState::Exited(_)),
@@ -1328,6 +1327,9 @@ impl BoxActor {
                     ),
                     2,
                 ));
+            }
+            if record.status != BoxState::Active {
+                return Err(AttachError::SessionPending);
             }
             // Attach's refusal, for the same reason: neither the host a
             // later launch left in the slot nor a fresh one would hold the

@@ -16466,6 +16466,88 @@ async fn until_complete_ends_on_entrypoint_return_without_client_task_run_return
     );
 }
 
+// BOX-038, BOX-025, T43: a run against a task box whose entrypoint already
+// returned is refused because the box exited, not because it is still
+// activating. The two refusals tell the user different things: a box that
+// is activating can take the run after its activation, and an exited box
+// cannot. A run against a box that is still activating keeps the
+// activation refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn until_complete_ends_on_entrypoint_return_without_client_then_a_run_reads_exited() {
+    use crate::test_harness::create_session_req;
+    use minimald_rpc::CreateSession;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_task_box(&mut client, &["/bin/sh", "-c", "exit 0"]).await;
+    let first = tokio::time::timeout(
+        Duration::from_secs(30),
+        client.exec(
+            &[(crate::MINIMAL_SESSION_ID_ENV, &id.to_string())],
+            false,
+            &task_box_run_request(),
+            b"",
+        ),
+    )
+    .await
+    .expect("the run ends when the entrypoint returns")
+    .expect("the daemon takes the run");
+    assert_eq!(first.exit_status, Some(0), "{first:?}");
+    let manager = server.state.sessions_manager().await;
+    record_once_exited(&manager, id).await;
+
+    // The exec layer's own refusal of the second run.
+    let second = tokio::time::timeout(
+        Duration::from_secs(30),
+        client.exec(
+            &[(crate::MINIMAL_SESSION_ID_ENV, &id.to_string())],
+            false,
+            &task_box_run_request(),
+            b"",
+        ),
+    )
+    .await
+    .expect("the refusal is immediate")
+    .expect("the daemon answers the run");
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert_ne!(second.exit_status, Some(0), "an exited box ran: {second:?}");
+    assert!(
+        stderr.contains("is exited") && !stderr.contains("still being activated"),
+        "the refusal names the exited box: {stderr:?}"
+    );
+
+    // The actor's refusal, read from a handle.
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("an exited box resolves");
+    match handle.ensure_host("tester".to_string()).await {
+        Err(crate::box_actor::AttachError::ResumeRefused(error, _)) => {
+            assert!(error.to_string().contains("is exited"), "{error}");
+        }
+        Err(other) => panic!("an exited box was refused for another reason: {other}"),
+        Ok(_) => panic!("an exited box launched a host"),
+    }
+
+    // A box that is still activating: created, and never configured.
+    let draft = client
+        .call::<CreateSession>(&create_session_req("activating", "/uwu"))
+        .await
+        .unwrap()
+        .id;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(draft))
+        .await
+        .unwrap()
+        .expect("an activating box resolves");
+    match handle.ensure_host("tester".to_string()).await {
+        Err(crate::box_actor::AttachError::SessionPending) => {}
+        Err(other) => panic!("an activating box was refused for another reason: {other}"),
+        Ok(_) => panic!("an activating box launched a host"),
+    }
+}
+
 // BOX-015, T43: the client of a task run goes away while the box's
 // entrypoint runs. The run stops relaying, and the box runs on: the
 // entrypoint is not launched again, the record still runs, and no
