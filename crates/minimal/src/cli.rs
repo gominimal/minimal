@@ -428,20 +428,40 @@ pub enum BoxCommand {
     Audit(BoxAuditArgs),
     /// List the boxes of the current project, in any state: their id,
     /// name, type, parent, project and state, with how a stopped or exited
-    /// box ended. `--all` lists every box on this host
+    /// box ended, and the provider and host each box runs on. `--all`
+    /// lists the boxes of every project
     List(BoxListArgs),
     /// Show one box: its id, name, type, parent, project, state, how it
-    /// ended and the identity it runs under
+    /// ended, the identity it runs under, and its provider and host
     Show(BoxShowArgs),
+    /// Stop a running box and keep it: its record, its events and its
+    /// files stay until `min box rm` removes them. `--force` kills every
+    /// process in the box at once, with no grace period
+    Stop(BoxStopArgs),
+    /// Remove a stopped or exited box: its record, its events and its
+    /// files. A running box is refused unless `--force` is given, which
+    /// stops the box at once and then removes it
+    Rm(BoxRmArgs),
 }
 
-// BOX-158 (BCLI-001): `min box list [--all]`.
+// BOX-158 (BCLI-001, BCLI-051): `min box list [--all] [-o json]`.
 #[derive(Debug, Args)]
 pub struct BoxListArgs {
-    /// List every box on this host, not only the boxes of the current
+    /// List the boxes of every project, not only the boxes of the current
     /// project
     #[arg(long)]
     pub all: bool,
+    /// Write the boxes as a JSON array, one object for each box, and
+    /// nothing else
+    #[arg(short = 'o', long = "output", value_enum)]
+    pub output: Option<BoxListOutputFormat>,
+}
+
+/// The rendering `min box list` writes, beside the table default.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum BoxListOutputFormat {
+    /// One JSON array of box objects
+    Json,
 }
 
 // BOX-159 (BCLI-003): `min box show <box>`.
@@ -450,6 +470,28 @@ pub struct BoxShowArgs {
     /// The box: its id, the start of its id, or its name, as `min box list`
     /// prints them
     pub target: String,
+}
+
+// BOX-013 (BCLI-059): `min box stop <box> [--force]`.
+#[derive(Debug, Args)]
+pub struct BoxStopArgs {
+    /// The box: its id, the start of its id, or its name, as `min box list`
+    /// prints them
+    pub target: String,
+    /// Kill every process in the box at once, with no grace period
+    #[arg(long)]
+    pub force: bool,
+}
+
+// BOX-019 (BCLI-060, BCLI-004): `min box rm <box> [--force]`.
+#[derive(Debug, Args)]
+pub struct BoxRmArgs {
+    /// The box: its id, the start of its id, or its name, as `min box list`
+    /// prints them
+    pub target: String,
+    /// Remove a running box too: stop it at once, then remove it
+    #[arg(long)]
+    pub force: bool,
 }
 
 // BEP-042: `min box audit <box|self> | --parent <box|self> [-o jsonl] [--follow]`.
