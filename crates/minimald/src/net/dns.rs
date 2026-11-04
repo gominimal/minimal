@@ -99,10 +99,11 @@ pub fn is_zone_name(name: &str) -> bool {
 ///
 /// A state built by [`Self::for_switch`] refreshes itself: it asks the VM
 /// host daemon over the switch's control channel
-/// ([`super::listeners::proxy_listening`]), and a read that finds the last
-/// answer older than [`PROXY_LISTENER_CACHE`] starts the next ask. The read
-/// never waits for the ask: it answers from the last answer. A host that
-/// cannot be asked, a native host among them, answers down.
+/// ([`super::listeners::proxy_listening`]) every [`PROXY_LISTENER_CACHE`],
+/// whether or not anything reads it, so a proxy that stopped while no box
+/// looked anything up is already down at the next lookup. A read never
+/// waits for an ask: it answers from the last answer. A host that cannot be
+/// asked, a native host among them, answers down.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ProxyListenerState {
     live: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -111,10 +112,11 @@ pub(crate) struct ProxyListenerState {
     source: Option<std::sync::Arc<ListenerSource>>,
 }
 
-/// How long one answer about the proxy's listener stands before a read
-/// asks again. Short, so a proxy that stops listening fails its steered
-/// names closed within seconds.
-pub(crate) const PROXY_LISTENER_CACHE: Duration = Duration::from_secs(2);
+/// How long one answer about the proxy's listener stands before the next
+/// ask. Short, because a steered name answers from the last answer: this
+/// bounds how long a proxy that stopped listening still gets its address
+/// handed out (BEP-062).
+pub(crate) const PROXY_LISTENER_CACHE: Duration = Duration::from_millis(250);
 
 /// Where a [`ProxyListenerState`] asks, and when it last asked.
 #[derive(Debug)]
@@ -141,7 +143,8 @@ impl ProxyListenerState {
     }
 
     /// A new state that asks the VM host daemon over `control`. The first
-    /// ask starts at once when a runtime runs.
+    /// ask starts at once when a runtime runs, and the asks repeat for as
+    /// long as the state lives.
     #[must_use]
     pub(crate) fn asking(control: super::policy::ControlChannel) -> Self {
         let state = Self {
@@ -153,7 +156,34 @@ impl ProxyListenerState {
             })),
         };
         state.refresh_if_stale();
+        state.keep_asking();
         state
+    }
+
+    /// Ask again every [`PROXY_LISTENER_CACHE`] until the state is dropped.
+    /// Without a runtime to run on, only reads start an ask.
+    fn keep_asking(&self) {
+        let Some(source) = &self.source else {
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let source = std::sync::Arc::downgrade(source);
+        let live = std::sync::Arc::clone(&self.live);
+        crate::traced::spawn(async move {
+            loop {
+                tokio::time::sleep(PROXY_LISTENER_CACHE).await;
+                let Some(source) = source.upgrade() else {
+                    return;
+                };
+                let state = Self {
+                    live: std::sync::Arc::clone(&live),
+                    source: Some(source),
+                };
+                state.refresh_if_stale();
+            }
+        });
     }
 
     /// The state every gate on the switch at `control` shares: built and

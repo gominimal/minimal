@@ -14495,7 +14495,10 @@ if len(r) >= 8 and r[0:2] == b"\x5e\x32" and r[2] & 0x80:
     print(r[3] & 0x0f, int.from_bytes(r[6:8], "big"))' "$b64"
   }
 
-  # Leg 1: the steered A lookup fails closed.
+  # Leg 1: the steered A lookup fails closed. The relay asks minvmd about
+  # the listener every 250 ms and minvmd checks it every 200 ms, so a second
+  # covers both. One lookup, no retry: a stale answer fails the case.
+  sleep 1
   ds_ans="$(ds_dns api.github.com 1)"
   echo "A api.github.com with the proxy down -> rcode and answers: ${ds_ans:-no reply}"
   if [ "${ds_ans%% *}" = 2 ]; then

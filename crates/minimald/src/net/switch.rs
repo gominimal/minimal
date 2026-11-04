@@ -8051,7 +8051,7 @@ pub(crate) mod tests {
         /// Looks `name` up until the relay answers it with `rcode`, past the
         /// listener state's cache, and answers that reply.
         async fn lookup_until(gate: &BoxGate, name: &str, rcode: ResponseCode) -> Message {
-            let deadline = tokio::time::Instant::now() + crate::net::dns::PROXY_LISTENER_CACHE * 5;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
             loop {
                 let reply = lookup(gate, name);
                 if reply.metadata.response_code == rcode {
@@ -8129,8 +8129,8 @@ pub(crate) mod tests {
             )));
             lookup_until(&gate, "github.com.", ResponseCode::ServFail).await;
 
-            // The lookups themselves ask the host again once the last answer
-            // is stale: nothing but the proxy's own flag changes here.
+            // The state asks the host again on its own: nothing but the
+            // proxy's own flag changes here.
             listening.store(true, Ordering::Release);
             let reply = lookup_until(&gate, "github.com.", ResponseCode::NoError).await;
             assert_eq!(
@@ -8147,6 +8147,34 @@ pub(crate) mod tests {
 
             listening.store(false, Ordering::Release);
             lookup_until(&gate, "github.com.", ResponseCode::ServFail).await;
+
+            crate::net::listeners::clear_vm_report_door_for_tests(&control_sock);
+            door_task.abort();
+        }
+
+        /// BEP-062: a proxy that stops while no box looks anything up is
+        /// already down at the next lookup, so that one lookup fails closed.
+        #[tokio::test]
+        async fn the_first_lookup_after_an_idle_stop_fails_closed() {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let control_sock = dir.path().join("gvproxy.sock");
+            let door = dir.path().join("guest-control.sock");
+            let listening = Arc::new(AtomicBool::new(true));
+            let door_task = proxy_door(&door, Arc::clone(&listening));
+            crate::net::listeners::seed_vm_report_door_for_tests(&control_sock, &door);
+
+            let gate = steered_box_gate(ProxyListenerState::for_switch(&ControlChannel::Unix(
+                control_sock.clone(),
+            )));
+            lookup_until(&gate, "github.com.", ResponseCode::NoError).await;
+
+            listening.store(false, Ordering::Release);
+            tokio::time::sleep(crate::net::dns::PROXY_LISTENER_CACHE * 8).await;
+            assert_eq!(
+                lookup(&gate, "github.com.").metadata.response_code,
+                ResponseCode::ServFail,
+                "the first lookup after the idle stop"
+            );
 
             crate::net::listeners::clear_vm_report_door_for_tests(&control_sock);
             door_task.abort();
