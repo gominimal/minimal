@@ -622,8 +622,7 @@ impl<'a> AliasOpenings<'a> {
     }
 
     /// The openings for one box row, whose exposures need the box to name
-    /// the host (NET-160). An undeclared `allow_subnets` allows every
-    /// subnet but names nothing, so it does not cover the alias.
+    /// the host (NET-160).
     fn for_box(baseline: &'a NodePlaneBaseline, table: &'a BoxTable, record: &BoxRecord) -> Self {
         let alias = table.subnet().host_alias().octets();
         Self {
@@ -631,7 +630,7 @@ impl<'a> AliasOpenings<'a> {
                 || record
                     .egress()
                     .allow_subnets()
-                    .is_some_and(|list| list.iter().any(|cidr| cidr.contains(alias))),
+                    .is_none_or(|list| list.iter().any(|cidr| cidr.contains(alias))),
             ..Self::new(AliasRow::Box, baseline, table)
         }
     }
@@ -16622,17 +16621,6 @@ mod tests {
         }
     }
 
-    /// An egress section that names the host by `host.min.internal` and
-    /// leaves every subnet allowed, the box's half of an exposure (NET-160).
-    fn names_the_host() -> EgressPolicy {
-        EgressPolicy {
-            allow_protocols: None,
-            allow_subnets: None,
-            allow_dns_hosts: Some(vec!["host.min.internal".to_string()]),
-            deny_subnets: None,
-        }
-    }
-
     /// The gate's verdict for one frame `src` sends to the host alias, with
     /// the box mark when `marked`.
     fn alias_verdict(
@@ -16673,15 +16661,16 @@ mod tests {
         registry.register_node_namespace(7654);
         registry.register(
             BoxRegistration::new("bare", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
-                .with_admitted_ports([8080])
-                .with_egress_policy(names_the_host()),
+                .with_admitted_ports([8080]),
         );
         let locked = [100, 64, 0, 11];
         registry.register(
             BoxRegistration::new("locked", Ipv4Addr::from(locked), Ipv4Addr::LOCALHOST)
                 .with_egress_policy(EgressPolicy {
+                    allow_protocols: None,
+                    allow_subnets: None,
+                    allow_dns_hosts: None,
                     deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
-                    ..names_the_host()
                 }),
         );
         let laned = [100, 64, 0, 12];
@@ -16709,7 +16698,7 @@ mod tests {
             assert_eq!(
                 alias_verdict(&table, &exposed, LEASE, false, 6, port),
                 Ok(GateAdmit::Row),
-                "a box that names the host reaches the alias at exposed port {port}"
+                "an allow-all box reaches the alias at exposed port {port}"
             );
         }
         assert_eq!(
@@ -16927,8 +16916,7 @@ mod tests {
         let registry = BoxRegistry::new(SUBNET);
         registry.register(
             BoxRegistration::new("bare", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
-                .with_admitted_ports([8080])
-                .with_egress_policy(names_the_host()),
+                .with_admitted_ports([8080]),
         );
         let table = registry.table();
         let baseline = NodePlaneBaseline::built_in(SUBNET).with_host_exposures(
@@ -16978,8 +16966,7 @@ mod tests {
         let registry = BoxRegistry::new(SUBNET);
         registry.register(
             BoxRegistration::new("bare", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
-                .with_admitted_ports([8080])
-                .with_egress_policy(names_the_host()),
+                .with_admitted_ports([8080]),
         );
         let table = registry.table();
         let baseline = NodePlaneBaseline::built_in(SUBNET).with_host_exposures(
@@ -17029,9 +17016,7 @@ mod tests {
     /// A box reaches a host exposure only when it names the host: by
     /// `host.min.internal` in `egress.allow_dns_hosts`, or by an
     /// `allow_subnets` that covers the alias (NET-160). A box that does
-    /// neither is the `host-alias` drop at the exposure, and so is a box
-    /// with no egress section, whose undeclared `allow_subnets` names
-    /// nothing. Naming the host
+    /// neither is the `host-alias` drop at the exposure. Naming the host
     /// opens the exposures alone, never another port at the alias.
     #[test]
     fn host_alias_exposure_needs_the_box_to_name_the_host() {
@@ -17047,14 +17032,6 @@ mod tests {
         let named = [100, 64, 0, 11];
         let covered = [100, 64, 0, 12];
         let dotted = [100, 64, 0, 13];
-        // A box with no egress section allows every subnet, but names
-        // nothing: an undeclared `allow_subnets` does not cover the alias.
-        let undeclared = [100, 64, 0, 14];
-        registry.register(BoxRegistration::new(
-            "undeclared",
-            Ipv4Addr::from(undeclared),
-            Ipv4Addr::LOCALHOST,
-        ));
         for (name, addr, egress) in [
             (
                 "unnamed",
@@ -17078,6 +17055,14 @@ mod tests {
                     .with_egress_policy(egress),
             );
         }
+        // A box with no egress section is allow-all: its undeclared
+        // `allow_subnets` covers the alias, as it covers a sibling box.
+        let undeclared = [100, 64, 0, 14];
+        registry.register(BoxRegistration::new(
+            "undeclared",
+            Ipv4Addr::from(undeclared),
+            Ipv4Addr::LOCALHOST,
+        ));
         let table = registry.table();
         let exposed = NodePlaneBaseline::built_in(SUBNET)
             .with_host_exposure(vec![crate::net::host_exposures::HostExposure::tcp(5432)]);
@@ -17093,12 +17078,8 @@ mod tests {
         );
         assert_eq!(
             alias_verdict(&table, &exposed, undeclared, false, 6, 5432),
-            Err(GateDrop::HostAlias {
-                src: undeclared,
-                dst_port: 5432,
-                row: AliasRow::Box,
-            }),
-            "a box with no egress section never reaches the exposure"
+            Ok(GateAdmit::Row),
+            "a box with no egress section reaches the exposure as it reaches a sibling"
         );
         for (src, what) in [
             (named, "by name"),
@@ -17165,10 +17146,11 @@ mod tests {
         .unwrap();
         let registry = BoxRegistry::new(SUBNET);
         registry.register_node_namespace(drawn);
-        registry.register(
-            BoxRegistration::new("bare", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
-                .with_egress_policy(names_the_host()),
-        );
+        registry.register(BoxRegistration::new(
+            "bare",
+            Ipv4Addr::from(LEASE),
+            Ipv4Addr::LOCALHOST,
+        ));
         let table = registry.table();
         let alias = Ipv4Addr::from(SUBNET.host_alias().octets());
         let baseline = NodePlaneBaseline::built_in(SUBNET)
@@ -17252,10 +17234,11 @@ mod tests {
         )
         .unwrap();
         let registry = BoxRegistry::new(SUBNET);
-        registry.register(
-            BoxRegistration::new("bare", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
-                .with_egress_policy(names_the_host()),
-        );
+        registry.register(BoxRegistration::new(
+            "bare",
+            Ipv4Addr::from(LEASE),
+            Ipv4Addr::LOCALHOST,
+        ));
         let baseline = NodePlaneBaseline::built_in(SUBNET).with_host_exposures(
             crate::net::host_exposures::HostExposures::at(config, Duration::ZERO),
         );
