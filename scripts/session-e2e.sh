@@ -13489,7 +13489,7 @@ proof_bep_destroyed_box_values_refused_within_60s() {
   echo "::group::min session destroy: a value copied from the box is refused within 60 s"
   local dv_case=bep_destroyed_box_values_refused_within_60s
   local dv_web=e2e-bep-revoke-web dv_other=e2e-bep-revoke-other
-  local dv_value dv_try dv_count=0 dv_out
+  local dv_value dv_try dv_count=0 dv_out dv_web_id
   bep_live_gate "$dv_case" || { echo "::endgroup::"; return 0; }
 
   # Not local: dv_cleanup reads them.
@@ -13509,6 +13509,8 @@ proof_bep_destroyed_box_values_refused_within_60s() {
   dv_value="$(bep_revoke_copy_value "$dv_case" "$DV_SID")" || dv_fail
   echo "web: 'gh api user' answered, and GH_TOKEN holds a sealed value (${#dv_value} characters)"
 
+  # A removed box answers to its id only.
+  dv_web_id="$DV_SID"
   if ! mnl session destroy --force "$DV_SID" </dev/null >/dev/null 2>"$WORK/$dv_case.destroy.err"; then
     echo "::error::'min session destroy' of the box web failed"
     cat "$WORK/$dv_case.destroy.err" 2>/dev/null || true
@@ -13519,7 +13521,7 @@ proof_bep_destroyed_box_values_refused_within_60s() {
   # The revocation record, within 60 s of the destroy.
   for dv_try in $(seq 1 12); do
     [ "$dv_try" -gt 1 ] && sleep 5
-    mnl box audit "$dv_web" -o jsonl </dev/null >"$WORK/$dv_case.audit" 2>"$WORK/$dv_case.audit.err" \
+    mnl box audit "$dv_web_id" -o jsonl </dev/null >"$WORK/$dv_case.audit" 2>"$WORK/$dv_case.audit.err" \
       || continue
     dv_count="$(bep_revoke_count "$WORK/$dv_case.audit" revocation)"
     [ "$dv_count" -ge 1 ] && break
@@ -13538,10 +13540,10 @@ proof_bep_destroyed_box_values_refused_within_60s() {
     echo "::error::'gh api user' in the second box succeeded with the value copied from the destroyed box web"
     dv_fail
   fi
-  if ! mnl box audit "$dv_other" -o jsonl </dev/null >"$WORK/$dv_case.audit2" 2>&1 \
+  if ! mnl box audit "$dv_other" -o jsonl </dev/null >"$WORK/$dv_case.audit2" 2>"$WORK/$dv_case.audit2.err" \
     || ! dv_out="$(bep_slice_jsonl_check "$WORK/$dv_case.audit2" cross_box)"; then
     echo "::error::'min box audit $dv_other' shows no refusal of the copied value: $dv_out"
-    cat "$WORK/$dv_case.audit2" 2>/dev/null || true
+    cat "$WORK/$dv_case.audit2" "$WORK/$dv_case.audit2.err" 2>/dev/null || true
     dv_fail
   fi
   echo "copied value in the second box after the destroy: 'gh api user' failed, and min box audit shows $dv_out"
@@ -13697,7 +13699,7 @@ proof_bep_destroy_with_proxy_down_refuses_by_attachment() {
   # This reads the real home, which no earlier subshell export changes.
   # shellcheck disable=SC2031
   local pd_control="$HOME/.minimal/bep/control.sock"
-  local pd_value pd_pids pd_try pd_count pd_out pd_id
+  local pd_value pd_pids pd_try pd_count pd_out pd_id pd_web_id
   bep_live_gate "$pd_case" || { echo "::endgroup::"; return 0; }
 
   # Not local: pd_cleanup reads them.
@@ -13735,6 +13737,8 @@ proof_bep_destroy_with_proxy_down_refuses_by_attachment() {
   BEP_LIVE_DAEMON=""
   echo "the proxy is down"
 
+  # A removed box answers to its id only.
+  pd_web_id="$PD_SID"
   if ! mnl session destroy --force "$PD_SID" </dev/null >/dev/null 2>"$WORK/$pd_case.destroy.err"; then
     echo "::error::'min session destroy' of the box web failed with the proxy down: the destroy must complete"
     cat "$WORK/$pd_case.destroy.err" 2>/dev/null || true
@@ -13762,16 +13766,16 @@ proof_bep_destroy_with_proxy_down_refuses_by_attachment() {
     echo "::error::'gh api user' in a new box succeeded with the value copied from the destroyed box web"
     pd_fail
   fi
-  if ! mnl box audit "$pd_probe" -o jsonl </dev/null >"$WORK/$pd_case.audit2" 2>&1 \
+  if ! mnl box audit "$pd_probe" -o jsonl </dev/null >"$WORK/$pd_case.audit2" 2>"$WORK/$pd_case.audit2.err" \
     || ! pd_out="$(bep_slice_jsonl_check "$WORK/$pd_case.audit2" cross_box)"; then
     echo "::error::'min box audit $pd_probe' shows no refusal of the copied value: $pd_out"
-    cat "$WORK/$pd_case.audit2" 2>/dev/null || true
+    cat "$WORK/$pd_case.audit2" "$WORK/$pd_case.audit2.err" 2>/dev/null || true
     pd_fail
   fi
   echo "copied value in a new box: 'gh api user' failed, and min box audit shows $pd_out"
 
   # No revocation was recorded: the refusal is the withdrawn attachment's.
-  if ! mnl box audit "$pd_web" -o jsonl </dev/null >"$WORK/$pd_case.audit" 2>"$WORK/$pd_case.audit.err"; then
+  if ! mnl box audit "$pd_web_id" -o jsonl </dev/null >"$WORK/$pd_case.audit" 2>"$WORK/$pd_case.audit.err"; then
     echo "::error::'min box audit $pd_web' failed"
     cat "$WORK/$pd_case.audit.err" 2>/dev/null || true
     pd_fail
