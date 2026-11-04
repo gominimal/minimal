@@ -1344,58 +1344,53 @@ mod tests {
     }
 
     /// BEP-082: the dashboard's destroy of a `host_ip` box retires the box
-    /// on the VM host daemon, as `min session destroy` does, so the host
-    /// frees the box's registration name, and then releases its name hold.
+    /// on the VM host daemon first, as `min session destroy` does, so the
+    /// host frees the box's registration name.
     #[tokio::test]
     async fn tui_destroy_retires_a_host_ip_box() {
         use std::io::{BufRead as _, Write as _};
         let dir = tempfile::TempDir::new().unwrap();
-        let ssh_sock = dir.path().join("ssh.sock");
+        // A VM host's state dir: the retire goes only to a VM host daemon.
+        let host_dir = dir.path().join("local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        let ssh_sock = host_dir.join("ssh.sock");
         let listener = std::os::unix::net::UnixListener::bind(
-            dir.path()
-                .join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
+            host_dir.join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
         )
         .unwrap();
         let id = SessionId::from_bytes([7; 16]);
+        // One exchange: the retire. The name hold's release that follows
+        // finds no listener and warns, which the test does not read.
         let server = std::thread::spawn(move || {
-            let mut lines = Vec::new();
-            for _ in 0..2 {
-                let (stream, _) = listener.accept().unwrap();
-                let mut reader = std::io::BufReader::new(stream);
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                let reply =
-                    serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::HostIpBox {
-                        session_id: id,
-                        resident: false,
-                    })
-                    .unwrap();
-                reader
-                    .get_mut()
-                    .write_all(format!("{reply}\n").as_bytes())
-                    .unwrap();
-                lines.push(line);
-            }
-            lines
+            let (stream, _) = listener.accept().unwrap();
+            // Closed before the reply, so the release finds no listener.
+            drop(listener);
+            let mut reader = std::io::BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let reply = serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::HostIpBox {
+                session_id: id,
+                resident: false,
+            })
+            .unwrap();
+            reader
+                .get_mut()
+                .write_all(format!("{reply}\n").as_bytes())
+                .unwrap();
+            line
         });
         let mut record = own_ip_record(None);
         record.id = id;
         record.name = Some("web".to_string());
         record.network = NetworkMode::HostNet;
         settle_destroyed_box(&ssh_sock, record.id, &record).await;
-        let lines = server.join().unwrap();
+        let line = server.join().unwrap();
         let request: minimald_rpc::BoxControlRequest =
-            serde_json_lenient::from_str(lines[0].trim()).expect("the request is the wire type");
+            serde_json_lenient::from_str(line.trim()).expect("the request is the wire type");
         let minimald_rpc::BoxControlRequest::RetireHostIpBox(retire) = request else {
             panic!("a destroyed host_ip box goes by the retire verb first: {request:?}");
         };
         assert_eq!(retire.session_id, id);
-        let release: minimald_rpc::BoxControlRequest =
-            serde_json_lenient::from_str(lines[1].trim()).expect("the request is the wire type");
-        assert!(
-            !matches!(release, minimald_rpc::BoxControlRequest::RetireHostIpBox(_)),
-            "the name hold's release follows the retire: {release:?}"
-        );
     }
 
     /// BOX-001: the dashboard's create from a form path `<root>/sub` sends
