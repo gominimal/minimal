@@ -5,10 +5,8 @@
 // daemon crates themselves already declare.
 #![recursion_limit = "256"]
 use std::io::IsTerminal as _;
-use std::io::Write as _;
 use std::process::ExitCode;
 
-use anyhow::Context as _;
 use clap::{CommandFactory as _, Parser};
 use minimal::{ExecArgs, PolicyArgs, PolicyOutputFormat};
 use tracing_subscriber::fmt::format::{FormatEvent, Writer};
@@ -158,39 +156,57 @@ async fn run() -> ExitCode {
     // the bound cuts off is in the spool already.
     mlog::otel::shutdown(mlog::otel::CLI_EXIT_FLUSH);
     if let Err(e) = result {
-        // A task's non-zero exit (`min task run`) is a status to relay, not
-        // an error to print — the task's own output already streamed through
-        // (the git-remote helper's ExitCode precedent).
-        if let Some(&minimal::task::TaskExit(code)) = e.downcast_ref::<minimal::task::TaskExit>() {
-            return ExitCode::from(code);
-        }
-        // A machine-output run answers its failure with the one
-        // `min/v1/error` object a client parses: the emitter below, keyed
-        // on the output mode the run was under rather than on the command,
-        // so the mechanism is one, shared by every command that takes
-        // `-o json` — each fails its walk into the generic
-        // [`minimal::MachineModeFailure`] payload, which is all this path
-        // downcasts. The object is the contract, so there is no second,
-        // plain-text line to print for the same failure, only the non-zero
-        // status.
-        if output_mode {
-            match machine_mode_answer(&e) {
-                MachineModeAnswer::Quiet => return ExitCode::from(141),
-                MachineModeAnswer::Object(failure) => {
-                    emit_machine_mode_error(&failure);
-                    return ExitCode::from(failure_exit_code(&e));
-                }
-            }
-        }
-        // A reader that went away (`min version | head -1`) is not an error
-        // worth reporting: exit quietly with the shell's SIGPIPE convention.
-        if quiet_on_closed_pipe && is_broken_pipe(&e) {
-            return ExitCode::from(141);
-        }
-        eprintln!("error: {e:#}");
-        return ExitCode::from(failure_exit_code(&e));
+        return answer_failure(
+            &e,
+            output_mode,
+            quiet_on_closed_pipe,
+            &mut std::io::stderr(),
+        );
     }
     ExitCode::SUCCESS
+}
+
+/// How a failed run ends: the exit code, and what goes to `stderr`. The run's
+/// stdout is not a parameter, so a failure writes nothing there.
+#[expect(
+    clippy::let_underscore_must_use,
+    reason = "a closed stderr has no reader left to tell; the exit status is \
+              the failure's answer either way"
+)]
+fn answer_failure(
+    e: &anyhow::Error,
+    machine_mode: bool,
+    quiet_on_closed_pipe: bool,
+    stderr: &mut dyn std::io::Write,
+) -> ExitCode {
+    // A task's non-zero exit (`min task run`) is a status to relay, not
+    // an error to print — the task's own output already streamed through
+    // (the git-remote helper's ExitCode precedent).
+    if let Some(&minimal::task::TaskExit(code)) = e.downcast_ref::<minimal::task::TaskExit>() {
+        return ExitCode::from(code);
+    }
+    // A machine-output run answers its failure with the one
+    // `min/v1/error` object a client parses (BCLI-033), written by the
+    // shared output writer, keyed on the output mode the run was under
+    // rather than on the command. The object is the contract, so there is
+    // no second, plain-text line to print for the same failure, only the
+    // non-zero status.
+    if machine_mode {
+        return match machine_mode_answer(e) {
+            MachineModeAnswer::Quiet => ExitCode::from(141),
+            MachineModeAnswer::Object(failure) => {
+                emit_machine_mode_error(stderr, &failure);
+                ExitCode::from(failure_exit_code(e))
+            }
+        };
+    }
+    // A reader that went away (`min version | head -1`) is not an error
+    // worth reporting: exit quietly with the shell's SIGPIPE convention.
+    if quiet_on_closed_pipe && is_broken_pipe(e) {
+        return ExitCode::from(141);
+    }
+    let _ = writeln!(stderr, "error: {e:#}");
+    ExitCode::from(failure_exit_code(e))
 }
 
 /// The exit code a failed run ends with, from the architecture's reserved
@@ -466,66 +482,38 @@ fn machine_output_mode(cli: &minimal::Cli) -> bool {
         Some(minimal::Command::Box(minimal::BoxArgs {
             command: minimal::BoxCommand::Audit(args),
         })) => args.output == Some(minimal::BoxAuditOutputFormat::Jsonl),
+        // Architecture line 383: a `min box list -o json` failure is one
+        // `min/v1/error` object (BCLI-001).
+        Some(minimal::Command::Box(minimal::BoxArgs {
+            command: minimal::BoxCommand::List(args),
+        })) => args.output.is_some(),
         _ => false,
     }
 }
 
-/// The schema stamp of the machine-mode error object — the same kind of
-/// stamp a document carries, on the object a failure answers with.
-const MACHINE_ERROR_SCHEMA: &str = "min/v1/error";
-
-/// The shape of the one `min/v1/error` object.
-#[derive(serde::Serialize)]
-struct MachineModeErrorDoc<'a> {
-    schema: &'static str,
-    code: &'a str,
-    message: &'a str,
-    /// Omitted when nothing about the failure names a remedy (`unspecified`).
-    #[serde(skip_serializing_if = "str::is_empty")]
-    hint: &'a str,
-}
-
-/// The machine-mode error object, encoded: the schema stamp, the `code` a
-/// script branches on, the message, and the hint — nothing else on the
-/// line, and no line beside it.
+/// The machine-mode error object, encoded as one line by the shared output
+/// writer: the `min/v1/error` stamp, the `code` a script branches on, the
+/// message, and the hint — nothing else on the line, and no line beside it.
+#[cfg(test)]
 fn machine_mode_error_line(failure: &minimal::MachineModeFailure) -> anyhow::Result<String> {
-    let object = MachineModeErrorDoc {
-        schema: MACHINE_ERROR_SCHEMA,
-        code: failure.code(),
-        message: failure.message(),
-        hint: failure.hint(),
-    };
-    serde_json_lenient::to_string(&object).context("encoding the machine-mode error object")
+    Ok(minimal::output::error_line(failure)?)
 }
 
 /// The machine-mode error emitter: writes the one `min/v1/error` object on
 /// stderr, the only thing the mode puts there on any failure, so a client
-/// parses a failure the same way it parses the document. Keyed on the
-/// output mode the failed run was under (the gate in the error path
-/// above), and generic over the payload: a command that takes `-o json`
-/// fails its walk into [`minimal::MachineModeFailure`] — carried through
-/// the `anyhow` chain, the way [`minimal::task::TaskExit`] is — and needs
-/// nothing else; the walk's own kinds name the code, message and hint, and
-/// this turns them into the object. `min ls --json` and its kin are
-/// untouched: their failure stays the plain-text line it always was.
+/// parses a failure the same way it parses the document. A command that
+/// takes `-o json` fails its walk into [`minimal::MachineModeFailure`] —
+/// carried through the `anyhow` chain, the way [`minimal::task::TaskExit`]
+/// is — and needs nothing else. `min ls --json` and its kin are untouched:
+/// their failure stays the plain-text line it always was.
 #[expect(
     clippy::let_underscore_must_use,
     reason = "a closed stderr has no reader left to tell; the exit status is \
               the failure's answer either way"
 )]
-fn emit_machine_mode_error(failure: &minimal::MachineModeFailure) {
-    let mut err = std::io::stderr();
-    match machine_mode_error_line(failure) {
-        // One object, one line — and a fallback the mode never wants, for
-        // an encode that cannot happen: the exit code is non-zero either
-        // way.
-        Ok(line) => {
-            let _ = writeln!(err, "{line}");
-        }
-        Err(error) => {
-            let _ = writeln!(err, "error: {error:#}");
-        }
-    }
+fn emit_machine_mode_error(stderr: &mut dyn std::io::Write, failure: &minimal::MachineModeFailure) {
+    // One object, one line. The exit code is non-zero either way.
+    let _ = minimal::output::write_error(stderr, failure);
 }
 
 #[cfg(test)]
@@ -782,17 +770,64 @@ mod tests {
         assert!(failure.hint().is_empty());
     }
 
-    /// An `unspecified` object carries no hint key at all.
+    /// An `unspecified` object still carries the `hint` key, empty, so
+    /// every error object has `code`, `message` and `hint` (BCLI-033).
     #[test]
-    fn machine_mode_error_line_omits_an_empty_hint() {
+    fn machine_mode_error_line_keeps_an_empty_hint() {
         let line = machine_mode_error_line(&minimal::MachineModeFailure::new(
             "unspecified",
             "boom".to_string(),
             String::new(),
         ))
         .unwrap();
-        assert!(!line.contains("hint"), "got {line}");
+        assert!(line.contains(r#""hint":"""#), "got {line}");
         assert!(line.contains(r#""code":"unspecified""#), "got {line}");
+    }
+
+    /// BCLI-033: a failure under a machine output mode is one `min/v1/error`
+    /// object on stderr with `code`, `message` and `hint`, and no
+    /// plain-text line. The text mode keeps its `error:` line. Both end
+    /// with the same exit code.
+    #[test]
+    fn machine_mode_error_object_on_stderr() {
+        let failures = [
+            anyhow::Error::new(minimal::MachineModeFailure::new(
+                "not_found",
+                "no box matches 'gone'".to_string(),
+                "`min box list` lists the boxes there are".to_string(),
+            )),
+            anyhow::anyhow!("the daemon went away"),
+        ];
+        for e in &failures {
+            let mut stderr = Vec::new();
+            let code = answer_failure(e, true, false, &mut stderr);
+            assert_eq!(code, ExitCode::from(1));
+            let text = String::from_utf8(stderr).unwrap();
+            assert_eq!(text.lines().count(), 1, "one object, one line: {text}");
+            assert!(!text.contains("error:"), "no text line beside it: {text}");
+            let object: serde_json_lenient::Value = serde_json_lenient::from_str(&text).unwrap();
+            assert_eq!(object["schema"], "min/v1/error", "{text}");
+            for key in ["code", "message", "hint"] {
+                assert!(object[key].is_string(), "{key} is present: {text}");
+            }
+
+            let mut stderr = Vec::new();
+            let code = answer_failure(e, false, false, &mut stderr);
+            assert_eq!(code, ExitCode::from(1));
+            let text = String::from_utf8(stderr).unwrap();
+            assert!(
+                text.starts_with("error: "),
+                "text mode keeps its line: {text}"
+            );
+        }
+        let object: serde_json_lenient::Value = {
+            let mut stderr = Vec::new();
+            answer_failure(&failures[0], true, false, &mut stderr);
+            serde_json_lenient::from_slice(&stderr).unwrap()
+        };
+        assert_eq!(object["code"], "not_found");
+        assert_eq!(object["message"], "no box matches 'gone'");
+        assert_eq!(object["hint"], "`min box list` lists the boxes there are");
     }
 
     #[test]
@@ -839,6 +874,20 @@ mod tests {
                         output,
                         follow: false,
                     }),
+                })),
+            };
+            assert_eq!(machine_output_mode(&cli), machine);
+        }
+
+        // `min box list -o json` is a machine mode, its table form is not.
+        for (output, machine) in [
+            (Some(minimal::BoxListOutputFormat::Json), true),
+            (None, false),
+        ] {
+            let cli = minimal::Cli {
+                global_args: minimal::GlobalArgs::default(),
+                command: Some(Command::Box(minimal::BoxArgs {
+                    command: minimal::BoxCommand::List(minimal::BoxListArgs { all: false, output }),
                 })),
             };
             assert_eq!(machine_output_mode(&cli), machine);
