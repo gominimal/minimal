@@ -347,6 +347,14 @@
 #                                    at the host-side gate (NET-155, NET-085),
 #                                    and each refusal's record is read back
 #                                    from the host's logs
+#   host_ip_rules_follow_the_running_box
+#                                    NET-085, VM host: root in the VM
+#                                    wearing the node's address and the box
+#                                    mark reaches what only a host_ip box's
+#                                    rules allow while it runs, loses that
+#                                    reach within 30 s of a stop that
+#                                    retires nothing on the host, and
+#                                    regains it after a resume
 #   host_ip_deny_all
 #                                    NET-079 end to end, both halves: on a
 #                                    host that decides per box, a deny-all
@@ -395,7 +403,8 @@ case "${1:-}" in
     | unpublished_port_refused_on_vm_host | proxy_sees_boxes_by_address \
     | vm_host_row_read_tracks_create_and_destroy \
     | answerer_survives_session_stop \
-    | escapes_and_builds_stay_inside_box_rules)
+    | escapes_and_builds_stay_inside_box_rules \
+    | host_ip_rules_follow_the_running_box)
     E2E_VM="${E2E_VM:-1}"
     if [ -z "${E2E_MINIMAL_ARGS:-}" ]; then
       E2E_MINIMAL_ARGS="--provider local-minvmd"
@@ -538,6 +547,7 @@ ESU_LISTEN_PORT="" # the port the listener binds; this proof's own band
 EBR_SEED_DIR="" # the escapes-and-builds proof's seed; removed on teardown
 EBR_LISTENER_PID="" # its host listener; killed on teardown
 EBR_LISTEN_PORT="" # the port the listener binds, beside the escape-union band
+HRF_SEED_DIR="" # the host_ip rules proof's seed; removed on teardown
 EBR_EXPECTED="" # the record the leg in progress expects; printed on failure
 NET080_SEED_DIR="" # seeded by the daemon-fetch proof below; removed on teardown
 # The classifier tree+table the daemon-fetch proof installs when the lane has
@@ -1230,6 +1240,7 @@ teardown() {
   fi
   # The escapes-and-builds proof's seed and listener, for the same reasons.
   [ -n "$EBR_SEED_DIR" ] && rm -rf "$EBR_SEED_DIR"
+  [ -n "$HRF_SEED_DIR" ] && rm -rf "$HRF_SEED_DIR"
   if [ -n "$EBR_LISTENER_PID" ]; then
     kill "$EBR_LISTENER_PID" 2>/dev/null || true
   fi
@@ -20880,6 +20891,9 @@ TCP_ACK = 0x10
 SPOOF_ISN = 0x00501001
 SPOOF_RESEND = 0.5
 GATEWAY_MAC = bytes.fromhex("5a94efe40cdd")
+# The IPv4 TOS byte every TCP frame carries: the DSCP field shifted left two
+# bits. --dscp sets it. 0 is a frame with no mark.
+IP_TOS = 0
 
 
 def octets(ip):
@@ -20929,7 +20943,7 @@ def tcp_frame(src_mac, src_ip, src_port, dst_ip, dst_port, seq, ack, flags, payl
     )
     segment = segment[:16] + struct.pack("!H", tcp_checksum(src_ip, dst_ip, segment)) + segment[18:]
     header = struct.pack(
-        "!BBHHHBBH4s4s", 0x45, 0x00, 20 + len(segment), 0x0001, 0x0000, 64, 6, 0,
+        "!BBHHHBBH4s4s", 0x45, IP_TOS, 20 + len(segment), 0x0001, 0x0000, 64, 6, 0,
         octets(src_ip), octets(dst_ip),
     )
     header = header[:10] + struct.pack("!H", ipv4_checksum(header)) + header[12:]
@@ -21097,12 +21111,19 @@ def main():
     parser.add_argument("--marker", required=True)
     parser.add_argument("--deadline", type=float, required=True)
     parser.add_argument("--claim", choices=["yes", "no"], default="yes")
+    # The DSCP value the frames carry, such as the box mark the guest's
+    # classifier writes (0b110111, BOX_COHORT_DSCP), and the source port,
+    # so each of a run of probes opens a new flow. 0 keeps the default.
+    parser.add_argument("--dscp", type=int, default=0)
+    parser.add_argument("--src-port", type=int, default=0)
     args = parser.parse_args()
+    global IP_TOS
+    IP_TOS = (args.dscp & 0x3F) << 2
     flow = {
         "src": args.src,
         "dst": args.dst,
         "dst_port": args.port,
-        "src_port": 40000 + octets(args.src)[3],
+        "src_port": args.src_port or 40000 + octets(args.src)[3],
         "marker": args.marker,
     }
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -21911,6 +21932,256 @@ attempt=root in the VM, source $ebr_node (the node's address) toward $ebr_build_
   rm -rf "$EBR_SEED_DIR"
   EBR_SEED_DIR=""
   echo "escapes and builds stay inside the box's rules OK (no box reached the RPC listener over vsock, and a vsock socket refused inside the box has no host-side record; the deny-all box's build and two frames wearing the node's address each reached nothing outside the box's rules and the baseline set, each with its gate record). NET-085 NET-139 NET-155"
+  echo "::endgroup::"
+}
+
+# NET-085 on the VM host, end to end: a host_ip box's rules leave the
+# host-side gate when the VM stops the box with no client retire, and come
+# back when a resume runs the box again. One host_ip box with no egress
+# section is the only resident host_ip box: the case respawns the daemon
+# pair first, and a fresh VM host daemon holds no other box's rules
+# (gominimal/minimal#3015). So whatever a box-marked frame from the node's
+# address reaches, only that box's rules allow it.
+#
+# The escapee is the escape-union case's spoofer, read out of this script.
+# It speaks the shuttle protocol at the gate's landing edge and wears the
+# node's own address and the box mark (the DSCP value the guest's classifier
+# writes for a box's connection, BOX_COHORT_DSCP). It sends one SYN per
+# probe, each from a new source port, toward a TEST-NET-2 address on 443.
+# The gate's answer to a SYN that wears the node's address goes to the
+# guest, not to the spoofer, so the case reads the gate's own decision: the
+# debug line "decided a box-marked frame" for the probe's source port, under
+# the target the case turns on (minvmd::egress_gate::marked). The arms:
+#
+#   * the box runs: the probe is admitted, by the box's own rules;
+#   * `min box stop`, which retires nothing on the host: within 30 s the
+#     VM host daemon's reconcile reads the in-VM daemon's session list, drops
+#     the box's rules, and the same probe is dropped. The case allows 5 s
+#     beyond the 30 s timer for the session-list read and the probe itself;
+#   * `min session attach` resumes the box (BOX-025): the same probe is
+#     admitted again.
+#
+# Each arm's failure prints the decisions and the reconcile lines it read.
+proof_host_ip_rules_follow_the_running_box() {
+  local hrf_sid="" hrf_node="" hrf_line="" hrf_log0="" hrf_log0_lines=0
+  local hrf_verdict="" hrf_port=41000 hrf_start=0 hrf_elapsed=0 hrf_rows=""
+  local hrf_gate_sock="" hrf_name="e2e-hrf" hrf_dst="198.51.100.9"
+  local hrf_shown="" hrf_state="" hrf_bound=35
+  echo "::group::a stopped host_ip box's rules leave the VM host's gate, and a resume restores them (NET-085)"
+
+  if [ "$min_daemon" != minvmd ] && [ -z "$E2E_VM" ]; then
+    echo "host_ip rules proof SKIPPED (this run's daemon is minimald: a native host has no VM host gate — the proof runs where the CLI is VM-backed)"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ "$(uname -s)" = Linux ] && { [ ! -e /dev/kvm ] || [ ! -w /dev/kvm ]; }; then
+    not_run host_ip_rules_follow_the_running_box "no writable /dev/kvm: a Linux VM boots on KVM and this host has none — the case drives a VM-backed host, and no VM means no host-side gate to read"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    echo "::error::no MINVMD_GVPROXY_BIN on this VM-backed run: the switch binary the host-side egress gate stands beside is missing, so the host_ip rules proof has no gate to read its decisions from"
+    fail
+  fi
+
+  hrf_gate_sock="$XDG_STATE_HOME/minimal/providers/local-minvmd0/gvproxy-gate.sock"
+  HRF_EXPECTED="the host_ip box's activate"
+
+  # The VM host daemon's file log, scoped to the lines written after the
+  # snapshot below.
+  hrf_host_log() {
+    find "$XDG_STATE_HOME/minimal/logs" -maxdepth 1 -name 'minvmd.log*' -type f 2>/dev/null \
+      | sort -r | head -n1
+  }
+  hrf_case_log() {
+    local f
+    f="$(hrf_host_log)"
+    [ -n "$f" ] || return 0
+    if [ "$f" = "$hrf_log0" ] && [ "$hrf_log0_lines" -gt 0 ]; then
+      tail -n +"$((hrf_log0_lines + 1))" "$f" 2>/dev/null
+    else
+      cat "$f" 2>/dev/null
+    fi
+  }
+  hrf_fail() {
+    echo "--- what this arm expected ---"
+    echo "  $HRF_EXPECTED"
+    echo "--- the VM host daemon log searched ---"
+    echo "  $(hrf_host_log) (lines after $hrf_log0_lines of ${hrf_log0:-no earlier file})"
+    echo "--- this case's box-marked decisions ---"
+    hrf_case_log | grep -F 'decided a box-marked frame' | tail -n 20 || true
+    echo "--- this case's host_ip reconcile lines ---"
+    hrf_case_log | grep -e "host_ip box's egress rules" -e "in-VM daemon's session list" || true
+    echo "--- the arms so far ---"
+    printf '%s\n' "$hrf_rows" | sed '/^$/d; s/^/  /'
+    fail
+  }
+  # The gate's decision for one source port: admitted or dropped. The file
+  # log is JSON ("verdict":"admitted"), a console line is text
+  # (verdict=admitted), so match both. Waits up to 5 s for the line.
+  hrf_decision() {
+    local line=""
+    for _ in $(seq 1 20); do
+      line="$(hrf_case_log | grep -F 'decided a box-marked frame' \
+        | grep -E "source_port(=|\":)$1([^0-9]|\$)" | tail -n1)"
+      [ -n "$line" ] && break
+      sleep 0.25
+    done
+    [ -n "$line" ] || return 1
+    printf '%s\n' "$line" | sed -nE 's/.*verdict(=|":")([a-z]+).*/\2/p'
+  }
+  # One probe from a new source port. Leaves the gate's verdict in
+  # hrf_verdict, or "none" when no decision line came.
+  hrf_probe() {
+    hrf_port=$((hrf_port + 1))
+    if ! python3 "$WORK/hrf-spoofer.py" --gate "$hrf_gate_sock" \
+        --src "$hrf_node" --dst "$hrf_dst" --port 443 \
+        --marker hrf-probe --deadline 1 --claim no --dscp 55 \
+        --src-port "$hrf_port" >"$WORK/hrf-spoof.out" 2>"$WORK/hrf-spoof.err"; then
+      echo "::error::the spoofer could not speak to the gate at $hrf_gate_sock"
+      cat "$WORK/hrf-spoof.out" "$WORK/hrf-spoof.err" 2>/dev/null || true
+      hrf_fail
+    fi
+    hrf_verdict="$(hrf_decision "$hrf_port")" || hrf_verdict="none"
+    [ -n "$hrf_verdict" ] || hrf_verdict="none"
+  }
+  # Probes once a second until the verdict is $1 or $hrf_bound seconds
+  # pass. Leaves the seconds it took in hrf_elapsed.
+  hrf_probe_until() {
+    hrf_start=$SECONDS
+    while :; do
+      hrf_probe
+      hrf_elapsed=$((SECONDS - hrf_start))
+      [ "$hrf_verdict" = "$1" ] && return 0
+      [ "$hrf_elapsed" -ge "$hrf_bound" ] && return 1
+      sleep 1
+    done
+  }
+
+  awk '/ESU_SPOOFER_EOF/ { if (grab) exit; grab = 1; next } grab' \
+    "$ROOT/scripts/session-e2e.sh" > "$WORK/hrf-spoofer.py"
+  if ! grep -q '^def spoofed_flow' "$WORK/hrf-spoofer.py"; then
+    echo "::error::the escape-union case's spoofer could not be read out of this script into $WORK/hrf-spoofer.py"
+    hrf_fail
+  fi
+
+  HRF_SEED_DIR="$(hook_mktemp /tmp/mnlhrf.XXXXXX)"
+  hook_seed_preamble > "$HRF_SEED_DIR/minimal.toml"
+  mkdir "$HRF_SEED_DIR/.git"
+
+  # Snapshot the log, then respawn the daemon pair under a filter that keeps
+  # the reconcile's INFO lines and turns on the gate's marked-frame
+  # decisions. A fresh VM host daemon holds no earlier box's host_ip rules.
+  hrf_log0="$(hrf_host_log)"
+  hrf_log0_lines=0
+  if [ -n "$hrf_log0" ]; then
+    hrf_log0_lines="$(wc -l <"$hrf_log0" 2>/dev/null)" || hrf_log0_lines=0
+  fi
+  mnl stop --force >/dev/null 2>&1 || true
+  minvmd stop >/dev/null 2>&1 || true
+
+  hrf_sid="$(cd "$HRF_SEED_DIR" \
+    && RUST_LOG="warn,minvmd=info,minvmd::egress_gate::marked=debug" \
+      mnl session activate . --no-prompt --name "$hrf_name" --network host_ip \
+      </dev/null 2>"$WORK/hrf-activate.err")" || {
+    echo "::error::'min session activate --network host_ip' failed for $hrf_name"
+    cat "$WORK/hrf-activate.err" 2>/dev/null || true
+    hrf_fail
+  }
+  hrf_sid="$(printf '%s\n' "$hrf_sid" | tail -n1 | tr -d '\r')"
+  # A session's box launches on its first exec, not at the activate.
+  if ! mnl session exec "$hrf_sid" 'true' >"$WORK/hrf-exec.err" 2>&1; then
+    echo "::error::the first exec in $hrf_name ($hrf_sid) failed: the box this case is about cannot be driven"
+    cat "$WORK/hrf-exec.err" 2>/dev/null || true
+    hrf_fail
+  fi
+
+  HRF_EXPECTED="the VM host daemon's 'node-plane baseline set at the gate' record naming node_addr"
+  for _ in $(seq 1 40); do
+    hrf_line="$(hrf_case_log | grep -F 'node-plane baseline set at the gate' | tail -n1)"
+    [ -n "$hrf_line" ] && break
+    sleep 0.25
+  done
+  hrf_node="$(printf '%s\n' "$hrf_line" | sed -n 's/.*"node_addr":"\([0-9.]*\)".*/\1/p')"
+  if [ -z "$hrf_node" ]; then
+    echo "::error::the VM host daemon's log does not name the node's address"
+    hrf_fail
+  fi
+  echo "box $hrf_name: $hrf_sid, --network host_ip, no egress section; the node's address: $hrf_node"
+
+  # ---- the box runs: its rules admit the probe.
+  HRF_EXPECTED="a box-marked SYN from $hrf_node toward $hrf_dst:443 admitted while $hrf_name runs"
+  if ! hrf_probe_until admitted; then
+    echo "::error::while $hrf_name runs, a box-marked frame from the node's address toward $hrf_dst:443 was not admitted (last verdict: $hrf_verdict after ${hrf_elapsed} s): the case has no reach for the stop to take away"
+    mnl session policy "$hrf_sid" 2>&1 || true
+    hrf_fail
+  fi
+  hrf_rows="$hrf_rows
+arm=running verdict=$hrf_verdict source_port=$hrf_port"
+  echo "running: a box-marked frame from $hrf_node toward $hrf_dst:443 was admitted by $hrf_name's rules"
+
+  # ---- the stop, with no client retire: the reconcile drops the rules.
+  if ! mnl box stop "$hrf_name" >"$WORK/hrf-stop.out" 2>"$WORK/hrf-stop.err"; then
+    echo "::error::'min box stop $hrf_name' failed"
+    cat "$WORK/hrf-stop.out" "$WORK/hrf-stop.err" 2>/dev/null || true
+    hrf_fail
+  fi
+  hrf_shown="$(mnl box show "$hrf_name" </dev/null 2>&1)" || hrf_shown=""
+  hrf_state="$(printf '%s\n' "$hrf_shown" | sed -n 's/^State: *//p' | tr -d '\r')"
+  echo "min box stop $hrf_name -> state '${hrf_state:-<none>}'"
+  HRF_EXPECTED="the same probe dropped within 30 s of 'min box stop $hrf_name' (the reconcile timer), with ${hrf_bound} s allowed for the read and the probe"
+  if ! hrf_probe_until dropped; then
+    echo "::error::$hrf_bound s after 'min box stop $hrf_name', a box-marked frame from the node's address toward $hrf_dst:443 was still not dropped (last verdict: $hrf_verdict): the stopped box's rules stayed in the gate's union"
+    hrf_fail
+  fi
+  hrf_rows="$hrf_rows
+arm=stopped verdict=$hrf_verdict source_port=$hrf_port after=${hrf_elapsed}s"
+  HRF_EXPECTED="the VM host daemon's reconcile line for $hrf_sid ('dropped the host_ip box's egress rules')"
+  hrf_line="$(hrf_case_log | grep -F "dropped the host_ip box's egress rules" \
+    | grep -F "$hrf_sid" | tail -n1)"
+  if [ -z "$hrf_line" ]; then
+    echo "::error::the probe was dropped, but the VM host daemon's log has no reconcile line that drops $hrf_sid"
+    hrf_fail
+  fi
+  echo "stopped: the same probe was dropped ${hrf_elapsed} s after the stop; reconcile: $hrf_line"
+
+  # ---- the resume: the box runs again, and its rules come back.
+  # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+  if ! E2E_PTY_COMMANDS="echo HRF_RESUMED" E2E_PTY_DETACH=1 \
+      python3 "$ROOT/scripts/e2e-attach-pty.py" - min ${E2E_MINIMAL_ARGS:-} session attach "$hrf_name" \
+      >"$WORK/hrf-resume.out" 2>"$WORK/hrf-resume.err"; then
+    echo "::error::'min session attach $hrf_name' did not resume the stopped box"
+    cat "$WORK/hrf-resume.out" "$WORK/hrf-resume.err" 2>/dev/null || true
+    hrf_fail
+  fi
+  hrf_state=""
+  for _ in $(seq 1 20); do
+    hrf_shown="$(mnl box show "$hrf_name" </dev/null 2>&1)" || hrf_shown=""
+    hrf_state="$(printf '%s\n' "$hrf_shown" | sed -n 's/^State: *//p' | tr -d '\r')"
+    [ "$hrf_state" = running ] && break
+    sleep 0.5
+  done
+  if [ "$hrf_state" != running ]; then
+    echo "::error::'min session attach $hrf_name' did not leave the box running (state '${hrf_state:-<none>}')"
+    printf '%s\n' "$hrf_shown"
+    hrf_fail
+  fi
+  HRF_EXPECTED="the same probe admitted again within ${hrf_bound} s of the resume"
+  if ! hrf_probe_until admitted; then
+    echo "::error::$hrf_bound s after the resume, a box-marked frame from the node's address toward $hrf_dst:443 was still not admitted (last verdict: $hrf_verdict): the resumed box's rules did not come back"
+    hrf_fail
+  fi
+  hrf_rows="$hrf_rows
+arm=resumed verdict=$hrf_verdict source_port=$hrf_port after=${hrf_elapsed}s"
+  echo "resumed: the same probe was admitted again ${hrf_elapsed} s after the resume"
+
+  echo "each arm's verdict at the host-side gate:"
+  printf '%s\n' "$hrf_rows" | sed '/^$/d; s/^/  /'
+  mnl session destroy --force "$hrf_sid" >"$WORK/hrf-destroy.out" 2>"$WORK/hrf-destroy.err" \
+    || { echo "::error::destroying $hrf_name failed"; cat "$WORK/hrf-destroy.err" 2>/dev/null || true; hrf_fail; }
+  rm -rf "$HRF_SEED_DIR"
+  HRF_SEED_DIR=""
+  echo "host_ip rules follow the running box OK (root in the VM wearing the node's address and the box mark reached what only $hrf_name's rules allow while it ran, lost that reach within 30 s of a stop that retired nothing on the host, and regained it after a resume). NET-085"
   echo "::endgroup::"
 }
 
@@ -30491,6 +30762,8 @@ case "${1:-}" in
     # Beside the escape-union proof, for the same reason: it stops the daemon
     # pair and autospawns a fresh one under its own record filter.
     proof_escapes_and_builds_stay_inside_box_rules
+    # Beside them, for the same reason.
+    proof_host_ip_rules_follow_the_running_box
     # Second-to-last on purpose, for the same reasons the daemon-fetch proof
     # below is last: it installs its own host classifier tree and table (its
     # own, removed before it returns) and respawns the daemon pair under its
@@ -30542,6 +30815,7 @@ case "${1:-}" in
     | published_proxy_routes_from_host \
     | escape_reaches_only_declared_union \
     | escapes_and_builds_stay_inside_box_rules \
+    | host_ip_rules_follow_the_running_box \
     | host_ip_deny_all \
     | daemon_fetch_under_deny_all_host_address_box \
     | bep_second_box_needs_no_sign_in \
@@ -30615,6 +30889,7 @@ case "${1:-}" in
     echo "         published_proxy_routes_from_host"
     echo "         escape_reaches_only_declared_union"
     echo "         escapes_and_builds_stay_inside_box_rules"
+    echo "         host_ip_rules_follow_the_running_box"
     echo "         host_ip_deny_all"
     echo "         daemon_fetch_under_deny_all_host_address_box"
     echo "         bep_second_box_needs_no_sign_in"
