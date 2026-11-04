@@ -4059,8 +4059,8 @@ wait"#;
             assert_eq!(events[1].data[exec_data::EXIT_CODE], code, "{mode:?}");
         }
 
-        // The events file is on disk and every events reader sees it, so
-        // the argv it stores has its secrets masked.
+        // The events store the argv exactly as the request sent it. The
+        // read gate on the events protects it. Only the daemon log masks it.
         let argv = [
             "true",
             "-H",
@@ -4074,20 +4074,7 @@ wait"#;
         let events = disk.exec_events(&entry.id);
         assert_eq!(events.len(), 2);
         for event in &events {
-            let stored = event.data[exec_data::ARGV].to_string();
-            assert!(!stored.contains("ghp_FAKETOKEN"), "{stored}");
-            assert!(!stored.contains("hunter2"), "{stored}");
-            assert_eq!(
-                event.data[exec_data::ARGV],
-                serde_json_lenient::json!([
-                    "true",
-                    "-H",
-                    "Authorization: Bearer <redacted:len=13>",
-                    "--password",
-                    "<redacted:len=7>",
-                    "https://x/",
-                ])
-            );
+            assert_eq!(event.data[exec_data::ARGV], serde_json_lenient::json!(argv));
         }
     }
 

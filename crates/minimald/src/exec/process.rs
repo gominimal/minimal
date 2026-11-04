@@ -1109,10 +1109,7 @@ impl ExecBox {
         event.data.insert(
             exec_data::ARGV.into(),
             serde_json_lenient::Value::Array(
-                scrubbed_argv(&facts.argv)
-                    .into_iter()
-                    .map(Into::into)
-                    .collect(),
+                facts.argv.iter().map(|word| word.as_str().into()).collect(),
             ),
         );
         if let Some(exit) = exit {
@@ -1161,29 +1158,6 @@ pub(crate) fn stored_spec_disables_exec(bytes: &[u8]) -> Option<bool> {
             .and_then(|io| io.get("exec_enabled")?.as_bool())
             == Some(false),
     )
-}
-
-/// An exec's argv as its events store it (BOX-152): each word with its
-/// credential-shaped tokens masked, as the exec's log lines mask them, and
-/// the word after a long flag that names a secret (`--password x`) masked
-/// whole. The events file is on disk and every events reader sees it.
-pub(crate) fn scrubbed_argv(argv: &[String]) -> Vec<String> {
-    let mut previous: Option<&str> = None;
-    argv.iter()
-        .map(|word| {
-            let secret_value = previous.is_some_and(|flag| {
-                flag.starts_with("--")
-                    && !flag.contains('=')
-                    && diagnostics::redact::is_sensitive_key(flag)
-            }) && !word.starts_with('-');
-            previous = Some(word);
-            if secret_value {
-                format!("<redacted:len={}>", word.len())
-            } else {
-                diagnostics::redact::scrub_secrets(word).into_owned()
-            }
-        })
-        .collect()
 }
 
 /// Who ran an exec and what it ran, as its events carry them (BOX-152).
