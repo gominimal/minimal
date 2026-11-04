@@ -25,15 +25,16 @@
 //! - `#[ignore]` + `MINVMD_E2E=1`: skipped unless explicitly enabled.
 //! - `MINVMD_KERNEL_PATH`, `MINVMD_ROOTFS_PATH`, `MINVMD_INITRAMFS` must point to
 //!   the kernel, generic rootfs, and minimald initramfs cpio.
-//! - `MINVMD_GVPROXY_BIN` must point to the host gvproxy switch: `just test-vm`
-//!   fetches it and exports this variable.
+//! - The gvproxy switch, from `common::gvproxy_bin`: `MINVMD_GVPROXY_BIN`
+//!   when set, else under `MINVMD_E2E=1` the pinned switch, fetched into a
+//!   per-digest cache. A VM lane needs no export, so the proof runs there.
 //!
 //! A missing precondition is reported as a skip, one stderr line of the form
 //! `SKIPPED: hostname_allowlist_toolchain_completes: <reason>`, and the test
 //! returns; it never claims a pass without the switch. A lane that exports
 //! `MINVMD_VM_LANE` has declared itself a VM lane, and there the same missing
-//! precondition panics instead of skipping, so the lane cannot go green on an
-//! unexported switch binary.
+//! precondition panics instead of skipping. The test prints the switch binary
+//! it boots with, so the lane's log names it.
 //!
 //! The test writes each tool's exit status and the boot-log admissions/drops
 //! that arrived during it, so a stalled fetch names the host that was not
@@ -93,18 +94,15 @@ const MINIMAL_SESSION_ID_ENV: &str = "MINIMAL_SESSION_ID";
 /// Host-side boot-console path. `std::env::var_os` result is empty-safe.
 const MINVMD_BOOT_LOG_ENV: &str = "MINVMD_BOOT_LOG";
 
-/// Host-side gvproxy path env.
-const MINVMD_GVPROXY_BIN_ENV: &str = "MINVMD_GVPROXY_BIN";
-
 /// Set by a lane that declares itself a VM lane: a missing precondition then
 /// fails the test instead of skipping it.
 const MINVMD_VM_LANE_ENV: &str = "MINVMD_VM_LANE";
 
 /// A precondition is missing. Under `MINVMD_VM_LANE` that is a failure: the
 /// lane declared itself a VM lane and `lane_fault` says what it did not
-/// provide. Otherwise print the skip line carrying `skip_reason` and return
-/// `false` so the test returns early.
-fn skip_or_fail_lane(skip_reason: &str, lane_fault: &str) -> bool {
+/// provide. Otherwise print the skip line carrying `skip_reason`, and the
+/// caller returns early.
+fn skip_or_fail_lane(skip_reason: &str, lane_fault: &str) {
     if std::env::var_os(MINVMD_VM_LANE_ENV).is_some() {
         panic!(
             "hostname_allowlist_toolchain_completes: {MINVMD_VM_LANE_ENV} is set: the lane \
@@ -112,21 +110,22 @@ fn skip_or_fail_lane(skip_reason: &str, lane_fault: &str) -> bool {
         );
     }
     eprintln!("SKIPPED: hostname_allowlist_toolchain_completes: {skip_reason}");
-    false
 }
 
 /// Guest log filter that promotes the DNS-gate admission lines to debug.
 const GUEST_LOG_FILTER: &str = "info,minimald::net::dns_gate=debug";
 
-/// Returns true if the e2e suite is enabled (`MINVMD_E2E=1`), asserting the
-/// required env vars are present when so. Skips quietly when gvproxy is not
-/// available, because an own-IP boot without it has no host-side switch.
-fn e2e_enabled() -> bool {
+/// The gvproxy switch to boot with when the e2e suite is enabled
+/// (`MINVMD_E2E=1`), asserting the required env vars are present when so.
+/// Under `MINVMD_E2E=1`, `common::gvproxy_bin` fetches the pinned switch or
+/// panics, so the proof never skips for want of an exported switch.
+fn e2e_enabled() -> Option<PathBuf> {
     if std::env::var("MINVMD_E2E").as_deref() != Ok("1") {
-        return skip_or_fail_lane(
+        skip_or_fail_lane(
             "MINVMD_E2E != 1; the VM harness is opt-in",
             "did not opt into the VM harness (MINVMD_E2E != 1)",
         );
+        return None;
     }
     for var in &[
         "MINVMD_KERNEL_PATH",
@@ -138,13 +137,18 @@ fn e2e_enabled() -> bool {
             "egress_allowlist_integration: {var} must be set when MINVMD_E2E=1"
         );
     }
-    if std::env::var_os(MINVMD_GVPROXY_BIN_ENV).is_none() {
-        return skip_or_fail_lane(
-            "MINVMD_GVPROXY_BIN is not set; the host switch is required (see #1809)",
-            "exported no switch binary (MINVMD_GVPROXY_BIN is not set)",
+    let Some(gvproxy) = common::gvproxy_bin() else {
+        skip_or_fail_lane(
+            "no gvproxy switch; the host switch is required (see #1809)",
+            "provided no gvproxy switch",
         );
-    }
-    true
+        return None;
+    };
+    eprintln!(
+        "egress_allowlist_integration: gvproxy switch at {}",
+        gvproxy.display()
+    );
+    Some(gvproxy)
 }
 
 /// A booted minimald guest VM, stopped on drop.
@@ -155,6 +159,8 @@ struct Guest {
     control_sock: PathBuf,
     boot_log_path: PathBuf,
     boot_log_offset: usize,
+    /// The host gvproxy switch every `minvmd` call hands the supervisor.
+    gvproxy: PathBuf,
     _state: TempDir,
 }
 
@@ -164,7 +170,7 @@ impl Drop for Guest {
         // supervisor (and its gvproxy) whose state dir the `TempDir` then
         // unlinks out from under it. Bounded, so a wedged daemon cannot hang
         // the teardown either.
-        let _ = minvmd(self._state.path(), &["stop"]);
+        let _ = minvmd(self._state.path(), &self.gvproxy, &["stop"]);
     }
 }
 
@@ -172,7 +178,7 @@ impl Drop for Guest {
 /// [`SUBPROC_TIMEOUT`]. The env the VM needs (`MINVMD_VM_OWN_IP`, the guest
 /// `RUST_LOG`, `MINVMD_GVPROXY_BIN`) is inherited by the detached supervisor
 /// and its VMM child, so it is set here on every call.
-fn minvmd(state: &Path, args: &[&str]) -> Output {
+fn minvmd(state: &Path, gvproxy: &Path, args: &[&str]) -> Output {
     let mut cmd = Command::new(minvmd_bin());
     cmd.args(args)
         // HOME too, not just XDG_STATE_HOME, as belt-and-braces: any
@@ -181,6 +187,7 @@ fn minvmd(state: &Path, args: &[&str]) -> Output {
         .env("HOME", state)
         .env("XDG_STATE_HOME", state)
         .env("MINVMD_VM_OWN_IP", "1")
+        .env("MINVMD_GVPROXY_BIN", gvproxy)
         // `--timeout` bounds only the detach poll; the VMM parent's guest
         // READY wait reads this env (60 s default), and a cold boot can
         // spend 40-70 s before pid-1, so pin it here rather than rely on
@@ -190,9 +197,6 @@ fn minvmd(state: &Path, args: &[&str]) -> Output {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(gvproxy) = std::env::var_os(MINVMD_GVPROXY_BIN_ENV) {
-        cmd.env(MINVMD_GVPROXY_BIN_ENV, gvproxy);
-    }
     let mut child = cmd.spawn().expect("spawning minvmd");
     let deadline = Instant::now() + SUBPROC_TIMEOUT;
     loop {
@@ -218,7 +222,7 @@ impl Guest {
     /// (`minvmd run --detach`, which spawns the host gvproxy switch before the
     /// VMM child) and polls `status --json` until Running. Panics past the
     /// deadlines, quoting the supervisor's `run.log`.
-    fn boot() -> Guest {
+    fn boot(gvproxy: PathBuf) -> Guest {
         let state = short_state_dir();
         let host_dir = state.path().join("minimal/providers/local-minvmd0");
         let sock_path = host_dir.join("ssh.sock");
@@ -232,6 +236,7 @@ impl Guest {
         // the caller); the rootfs stays generic.
         let run = minvmd(
             state.path(),
+            &gvproxy,
             &["run", "--detach", "--timeout", DETACH_TIMEOUT_SECS],
         );
         let guest = Guest {
@@ -239,6 +244,7 @@ impl Guest {
             control_sock,
             boot_log_path,
             boot_log_offset: 0,
+            gvproxy,
             _state: state,
         };
         assert!(
@@ -252,7 +258,11 @@ impl Guest {
 
         let deadline = Instant::now() + RUNNING_TIMEOUT;
         loop {
-            let status = json(&minvmd(guest._state.path(), &["status", "--json"]));
+            let status = json(&minvmd(
+                guest._state.path(),
+                &guest.gvproxy,
+                &["status", "--json"],
+            ));
             if status.get("state").is_some_and(|s| s == "running")
                 && status.get("vmm_pid").is_some_and(|p| p.is_number())
             {
@@ -353,10 +363,10 @@ impl russh::client::Handler for ClientHandler {
 #[serial]
 #[ignore = "gated MINVMD_E2E=1; requires own-IP VM with libkrun + images + gvproxy + network"]
 async fn hostname_allowlist_toolchain_completes() {
-    if !e2e_enabled() {
+    let Some(gvproxy) = e2e_enabled() else {
         return;
-    }
-    let mut guest = Guest::boot();
+    };
+    let mut guest = Guest::boot(gvproxy);
 
     // Wait for post-READY startup to settle before driving SSH.
     tokio::time::sleep(Duration::from_millis(1000)).await;
