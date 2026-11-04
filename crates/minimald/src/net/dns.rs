@@ -607,6 +607,22 @@ impl Route {
         let addr = self.address();
         is_host_answerable(addr, node).then_some(addr)
     }
+
+    /// Whether a listener on this node makes `port` reachable by this
+    /// host-address route's name (NET-071), read from the daemon's own
+    /// `/proc/net/tcp` and `/proc/net/tcp6`. `None` for every route that is
+    /// not a host-address one: those carry their own port gate. A port that
+    /// only a `127.0.0.1` listener holds is [`ListenerReach::LoopbackOnly`],
+    /// on a native daemon and inside a VM alike, so the proxy never reaches
+    /// a host service on loopback by a box's name. This reads `/proc`, so an
+    /// async caller runs it on the blocking pool.
+    #[must_use]
+    pub fn host_address_listener(&self, port: u16) -> Option<ListenerReach> {
+        if self.declared.is_some() {
+            return None;
+        }
+        Some(read_listener_reach(port, self.address()))
+    }
 }
 
 /// The declared ports of an applied external→internal map: its keys.
@@ -3533,9 +3549,198 @@ fn listen_local_v4(line: &str, v6: bool) -> Option<Ipv4Addr> {
     ))
 }
 
+/// What the listeners on this node say about one port of a host-address
+/// route (NET-071), as [`Route::host_address_listener`] reads them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenerReach {
+    /// A listener holds the port at `0.0.0.0`, `::`, an address that is not
+    /// loopback, or the route's own address when that is not `127.0.0.1`. A
+    /// request to the port by the box's name reaches the box.
+    Reachable,
+    /// Every listener that holds the port holds it at a loopback address
+    /// that is not the route's own, such as `127.0.0.1`. Such a listener can
+    /// be a host service, so a request by the box's name never reaches it.
+    LoopbackOnly,
+    /// No listener holds the port, or the socket tables cannot be read. A
+    /// request forwards and its dial fails as it did before this check.
+    NoListener,
+}
+
+/// The local address and port of one `TCP_LISTEN` row of the kernel's socket
+/// table, or `None` for any other row. `v6` says the row is from the `tcp6`
+/// table, whose address is four little-endian 32-bit words.
+fn listener_local(line: &str, v6: bool) -> Option<(IpAddr, u16)> {
+    let mut fields = line.split_whitespace();
+    fields.next()?;
+    let local = fields.next()?;
+    let _remote = fields.next()?;
+    if fields.next()? != "0A" {
+        return None;
+    }
+    let (address, port) = local.split_once(':')?;
+    let port = u16::from_str_radix(port, 16).ok()?;
+    let address = if v6 {
+        if address.len() != 32 {
+            return None;
+        }
+        let mut octets = [0u8; 16];
+        for (index, chunk) in octets.chunks_mut(4).enumerate() {
+            let word = u32::from_str_radix(address.get(index * 8..index * 8 + 8)?, 16).ok()?;
+            chunk.copy_from_slice(&word.swap_bytes().to_be_bytes());
+        }
+        let v6 = std::net::Ipv6Addr::from(octets);
+        v6.to_ipv4_mapped()
+            .map_or(IpAddr::V6(v6), IpAddr::V4)
+    } else {
+        if address.len() != 8 {
+            return None;
+        }
+        IpAddr::V4(Ipv4Addr::from(
+            u32::from_str_radix(address, 16).ok()?.swap_bytes(),
+        ))
+    };
+    Some((address, port))
+}
+
+/// The [`ListenerReach`] of `port` from the text of the kernel's socket
+/// tables, each with whether it is the `tcp6` table. `own` is the address the
+/// route answers at: a listener there is the box's own, unless `own` is
+/// `127.0.0.1`, which host services share.
+fn listener_reach<'a>(
+    tables: impl IntoIterator<Item = (&'a str, bool)>,
+    port: u16,
+    own: Ipv4Addr,
+) -> ListenerReach {
+    let mut loopback = false;
+    for (text, v6) in tables {
+        for line in text.lines().skip(1) {
+            let Some((address, listened)) = listener_local(line, v6) else {
+                continue;
+            };
+            if listened != port {
+                continue;
+            }
+            let is_own = own != Ipv4Addr::LOCALHOST && address == IpAddr::V4(own);
+            if address.is_unspecified() || !address.is_loopback() || is_own {
+                return ListenerReach::Reachable;
+            }
+            loopback = true;
+        }
+    }
+    if loopback {
+        ListenerReach::LoopbackOnly
+    } else {
+        ListenerReach::NoListener
+    }
+}
+
+/// The [`ListenerReach`] of `port` from this daemon's own `/proc/net/tcp`
+/// and `/proc/net/tcp6`: the node's network namespace on a native daemon,
+/// and the guest's inside a VM, where the proxy dials the box's listeners.
+fn read_listener_reach(port: u16, own: Ipv4Addr) -> ListenerReach {
+    let tables: Vec<(String, bool)> = [("/proc/net/tcp", false), ("/proc/net/tcp6", true)]
+        .into_iter()
+        .filter_map(|(path, v6)| match std::fs::read_to_string(path) {
+            Ok(text) => Some((text, v6)),
+            Err(error) => {
+                tracing::debug!(
+                    component = "dns-proxy",
+                    table = path,
+                    %error,
+                    "cannot read a socket table for the loopback-only listener check"
+                );
+                None
+            }
+        })
+        .collect();
+    listener_reach(
+        tables.iter().map(|(text, v6)| (text.as_str(), *v6)),
+        port,
+        own,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NET-071: a host-address route reads its port's listeners from the
+    /// kernel's socket tables. A port that only a `127.0.0.1` listener holds
+    /// is loopback-only. A port that a `0.0.0.0`, `::` or non-loopback
+    /// listener holds is reachable. The table text is the kernel's own shape,
+    /// and the live half reads this process's `/proc/net/tcp`.
+    #[test]
+    fn loopback_only_listener_read_from_proc_net_tcp() {
+        let header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+        let row = |local: &str, state: &str| {
+            format!(
+                "   0: {local} 00000000:0000 {state} 00000000:00000000 00:00000000 00000000  1000        0 12345 1 0 20 4 30 10 -1\n"
+            )
+        };
+        // 127.0.0.1:8080 and 0.0.0.0:9090 listen; 10.0.0.5:7070 listens; an
+        // established socket at 127.0.0.1:6060 is no listener.
+        let v4 = format!(
+            "{header}{}{}{}{}",
+            row("0100007F:1F90", "0A"),
+            row("00000000:2382", "0A"),
+            row("0500000A:1B9E", "0A"),
+            row("0100007F:17AC", "01"),
+        );
+        // ::1:5050 listens; :: listens at 4040; ::ffff:127.0.0.1 at 3030.
+        let v6 = format!(
+            "{header}{}{}{}",
+            row("00000000000000000000000001000000:13BA", "0A"),
+            row("00000000000000000000000000000000:0FC8", "0A"),
+            row("0000000000000000FFFF00000100007F:0BD6", "0A"),
+        );
+        let tables = || [(v4.as_str(), false), (v6.as_str(), true)];
+        let node = Ipv4Addr::LOCALHOST;
+        assert_eq!(listener_reach(tables(), 8080, node), ListenerReach::LoopbackOnly);
+        assert_eq!(listener_reach(tables(), 9090, node), ListenerReach::Reachable);
+        assert_eq!(listener_reach(tables(), 7070, node), ListenerReach::Reachable);
+        assert_eq!(listener_reach(tables(), 6060, node), ListenerReach::NoListener);
+        assert_eq!(listener_reach(tables(), 5050, node), ListenerReach::LoopbackOnly);
+        assert_eq!(listener_reach(tables(), 4040, node), ListenerReach::Reachable);
+        assert_eq!(listener_reach(tables(), 3030, node), ListenerReach::LoopbackOnly);
+        assert_eq!(listener_reach(tables(), 1, node), ListenerReach::NoListener);
+        // A node address in the reserved range is the box's own: a listener
+        // there is reachable, and a 127.0.0.1 one is still loopback-only.
+        let own = format!("{header}{}", row("0500007F:1F90", "0A"));
+        assert_eq!(
+            listener_reach([(own.as_str(), false)], 8080, Ipv4Addr::new(127, 0, 0, 5)),
+            ListenerReach::Reachable
+        );
+        assert_eq!(
+            listener_reach(tables(), 8080, Ipv4Addr::new(127, 0, 0, 5)),
+            ListenerReach::LoopbackOnly
+        );
+
+        // Live: this process's own listeners, read from `/proc/net/tcp`.
+        let route = Route::loopback("web", Ipv4Addr::LOCALHOST, None);
+        let loopback = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let loopback_port = loopback.local_addr().unwrap().port();
+        assert_eq!(
+            route.host_address_listener(loopback_port),
+            Some(ListenerReach::LoopbackOnly),
+            "a port only a 127.0.0.1 listener holds is loopback-only"
+        );
+        let wildcard = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let wildcard_port = wildcard.local_addr().unwrap().port();
+        assert_eq!(
+            route.host_address_listener(wildcard_port),
+            Some(ListenerReach::Reachable),
+            "a port a 0.0.0.0 listener holds is reachable"
+        );
+        drop(loopback);
+        assert_eq!(
+            route.host_address_listener(loopback_port),
+            Some(ListenerReach::NoListener),
+            "a port nothing listens on is not refused, only unreachable"
+        );
+        // An own-address route carries its own port gate.
+        let own_ip = Route::loopback("own", Ipv4Addr::LOCALHOST, Some(BTreeSet::new()));
+        assert_eq!(own_ip.host_address_listener(wildcard_port), None);
+    }
 
     /// NET-070's socket-owner lookup, step by step. The cgroup a process
     /// reports names its box when it runs in a classifier leaf, in either
