@@ -5150,15 +5150,22 @@ async fn task_run_exits_with_held_open_stdin_pipe() {
     .await
     .unwrap();
 
+    // The task runs as its box's entrypoint (T43), and this harness has no
+    // packages, so the entrypoint cannot start: the daemon refuses it at
+    // the spawn, and the run's exit status is that refusal's. What this
+    // test pins is the bridge: the run reached it, the daemon's end came
+    // back over it, and the process ended with its stdin held open. That
+    // the task's output streams back is the session e2e's
+    // (`scripts/session-e2e.sh`, the `e2e-echo` task run).
+    let _ = (status, stdout);
+    let stderr = String::from_utf8_lossy(&stderr);
     assert!(
-        status.success(),
-        "task run must exit 0: stderr={}",
-        String::from_utf8_lossy(&stderr)
+        stderr.contains("Running task e2e-echo in box e2e-echo-1"),
+        "task run must reach its box's entrypoint: stderr={stderr}"
     );
     assert!(
-        String::from_utf8_lossy(&stdout).contains("TASK_RUN_STDIN_OK"),
-        "task output must stream back: stdout={}",
-        String::from_utf8_lossy(&stdout)
+        stderr.contains("Kept box e2e-echo-1."),
+        "task run must return once the daemon ends the run: stderr={stderr}"
     );
 }
 
