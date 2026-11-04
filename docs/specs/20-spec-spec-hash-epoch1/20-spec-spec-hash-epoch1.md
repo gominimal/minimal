@@ -14,8 +14,9 @@ updated: 2026-10-30
 ## Context
 
 The cache key is a hash of an encoding that is not prefix-free. Nine
-collision-witness classes exist. Each is a pair of distinct specs with
-identical keys, which gives a constrained cache-poisoning primitive. The
+collision-witness classes exist. Seven are a pair of distinct specs with
+identical keys, which gives a constrained cache-poisoning primitive; two
+(7 and 8) are the converse, one spec with more than one key. The
 same defect puts dependency order into the hash, so a recipe that reorders
 its dependencies forces spurious rebuilds. The encoder's shape also
 prevents a machine check, which blocks the formal-methods program at its
@@ -296,9 +297,10 @@ build-infra operator. Release manager.
     tier:   T0
     verify: cargo nextest run -p rcache container_with_a_member_of_another_epoch_is_refused
 
-- **EPOCH-015** WHEN the system computes a container key THE SYSTEM SHALL
-  derive it under the epoch-1 context from the container's canonical
-  encoding, 32 bytes wide, as EPOCH-005 derives a spec key.
+- **EPOCH-015** WHEN the system computes a container key for a container
+  whose epoch is 1 (EPOCH-014) THE SYSTEM SHALL derive it under the epoch-1
+  context from the container's canonical encoding, 32 bytes wide, as
+  EPOCH-005 derives a spec key.
   tier:     T1
   verify:   cargo nextest run -p graph epoch1_container_key_derivation
   property: for all containers c: key(c) == blake3_derive_key(epoch-1
