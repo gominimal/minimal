@@ -234,9 +234,9 @@ pub type SharedVerdict = fn(Option<&super::dns::Caller>, &super::dns::Route, u16
 pub type SocketOwner = fn(SocketAddrV4, SocketAddrV4) -> super::dns::ConnectingOwner;
 
 /// Names the owners of many connections from the node's address in one
-/// pass: one answer for each `(peer, local)` pair, in order. A test hook
-/// ([`Router::with_socket_owners`]). Without it, the shared walk asks the
-/// [`SocketOwner`] once per pair ([`owners_one_by_one`]).
+/// pass: one answer for each `(peer, local)` pair, in order. The production
+/// lookup is [`super::dns::connecting_boxes`], which reads the socket tables
+/// once and walks `/proc/*/fd` once for all the pairs.
 pub type SocketOwners = fn(&[(SocketAddrV4, SocketAddrV4)]) -> Vec<super::dns::ConnectingOwner>;
 
 /// How many of one walk's per-pair owner lookups run at once, when the
@@ -244,8 +244,9 @@ pub type SocketOwners = fn(&[(SocketAddrV4, SocketAddrV4)]) -> Vec<super::dns::C
 const OWNER_LOOKUPS: usize = 4;
 
 /// The owners of `pairs` from `owner`, one pair at a time, on at most
-/// [`OWNER_LOOKUPS`] threads. The production lookup reads the socket tables
-/// and `/proc` for each pair, so a walk of many pairs costs one pass each.
+/// [`OWNER_LOOKUPS`] threads. Only a test that replaces the lookup with
+/// [`Router::with_socket_owner`] asks one pair at a time. Production asks
+/// [`super::dns::connecting_boxes`] for every pair at once.
 fn owners_one_by_one(
     owner: SocketOwner,
     pairs: &[(SocketAddrV4, SocketAddrV4)],
@@ -313,6 +314,8 @@ struct OwnerWalk {
     /// The connections waiting on the next walk, whether a walk task runs,
     /// and when the last walk started.
     state: std::sync::Mutex<OwnerWalkState>,
+    /// How many walks ran, for the debug line each walk logs.
+    walks: std::sync::atomic::AtomicUsize,
 }
 
 /// What a shared walk asks for the owners of its connections.
@@ -335,6 +338,7 @@ impl OwnerWalk {
     fn new() -> Self {
         Self {
             state: std::sync::Mutex::new(OwnerWalkState::default()),
+            walks: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -416,8 +420,12 @@ impl OwnerWalk {
             })
             .await
             .unwrap_or_default();
+            let walk = 1 + self
+                .walks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::debug!(
                 component = "dns-proxy",
+                walk,
                 connections = batch.len(),
                 "walked /proc once for the owners of proxied connections from the node's address"
             );
@@ -439,7 +447,9 @@ pub struct Router<T> {
     /// Names the box that owns a connection from the node's address (see
     /// [`SocketOwner`]).
     owner: SocketOwner,
-    /// The batch owner lookup that replaces [`Self::owner`] in a test.
+    /// Names the owners of every connection of a shared walk at once (see
+    /// [`SocketOwners`]). `None` only in a test that asks [`Self::owner`]
+    /// one connection at a time.
     owners: Option<SocketOwners>,
     /// The shared owner walk every clone of this router asks (see
     /// [`OwnerWalk`]).
@@ -470,7 +480,7 @@ impl<T: HostRoute> Router<T> {
             table,
             verdict,
             owner: super::dns::connecting_box,
-            owners: None,
+            owners: Some(super::dns::connecting_boxes),
             walk: Arc::new(OwnerWalk::new()),
         }
     }
@@ -482,6 +492,7 @@ impl<T: HostRoute> Router<T> {
     #[must_use]
     pub(crate) fn with_socket_owner(mut self, owner: SocketOwner) -> Self {
         self.owner = owner;
+        self.owners = None;
         self
     }
 
@@ -4801,9 +4812,9 @@ mod tests {
     }
 
     /// A registry with two host-address boxes, `hostbox` (deny-all) and
-    /// `openbox` (no egress rules), and a router whose batch owner lookup is
-    /// `owners`.
-    fn two_host_box_router(owners: SocketOwners) -> Router<RwLock<HostnameRegistry>> {
+    /// `openbox` (no egress rules), and a router with the production owner
+    /// lookup.
+    fn two_host_box_router() -> Router<RwLock<HostnameRegistry>> {
         let subnet = SwitchSubnet::default();
         let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, true);
         let deny_all = BoxPolicy {
@@ -4826,7 +4837,7 @@ mod tests {
             reg.register_host_net(id, name);
             reg.register_caller(id, name, &policy, subnet, None);
         }
-        Router::new(Arc::new(RwLock::new(reg)), proxied_request_verdict).with_socket_owners(owners)
+        Router::new(Arc::new(RwLock::new(reg)), proxied_request_verdict)
     }
 
     /// The owner of each connection by its peer's address, after one slow
@@ -4834,7 +4845,6 @@ mod tests {
     fn slow_walk_owners(
         pairs: &[(SocketAddrV4, SocketAddrV4)],
     ) -> Vec<crate::net::dns::ConnectingOwner> {
-        SLOW_WALKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(400));
         pairs
             .iter()
@@ -4849,9 +4859,6 @@ mod tests {
             .collect()
     }
 
-    /// How many times [`slow_walk_owners`] walked.
-    static SLOW_WALKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
     fn caller_name(lookup: &CallerLookup) -> String {
         match lookup {
             CallerLookup::Box(caller) => caller.name().to_string(),
@@ -4861,16 +4868,80 @@ mod tests {
         }
     }
 
-    /// NET-070: a host-address box that opens many connections at once does
-    /// not hold another box's owner lookup. Concurrent connections share one
-    /// walk, at most one a second, so a burst of 63 connections from one box
-    /// and one from another box are all named in a few walks, well inside
-    /// the wait bound, though each walk is slow. With a walk per connection
-    /// on four slots, the other box's lookup waited 16 walks, past the bound,
-    /// and its request was refused.
+    /// NET-070: a burst of connections from the node's address does not
+    /// hold another connection's owner lookup, on the production path. The
+    /// router is [`Router::new`]'s, so every walk asks
+    /// [`crate::net::dns::connecting_boxes`] and reads the kernel's socket
+    /// tables and `/proc`. 63 real connections from one address and one from
+    /// another share a few walks, and every one is answered inside the wait
+    /// bound. The test process runs in no box's classifier leaf, so the
+    /// kernel names no box for any of them. The test after this one names
+    /// two boxes with a slow batch lookup.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn burst_of_connections_does_not_starve_other_boxes_lookups() {
-        let router = two_host_box_router(slow_walk_owners);
+        let router = two_host_box_router();
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let target = listener.local_addr().unwrap();
+        let mut clients = Vec::new();
+        let mut accepted = Vec::new();
+        for from in std::iter::repeat_n(HOST_BOX_ADDR, 63).chain([OPEN_HOST_BOX_ADDR]) {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket
+                .bind(SocketAddr::V4(SocketAddrV4::new(from, 0)))
+                .unwrap();
+            clients.push(socket.connect(target).await.unwrap());
+            let (stream, SocketAddr::V4(peer)) = listener.accept().await.unwrap() else {
+                panic!("an IPv4 listener accepts IPv4 peers");
+            };
+            let local = stream_local(&stream);
+            accepted.push((stream, peer, local));
+        }
+        let (_, other_peer, other_local) = accepted.pop().unwrap();
+        let burst: Vec<_> = accepted
+            .iter()
+            .map(|(_, peer, local)| {
+                let (router, peer, local) = (router.clone(), *peer, *local);
+                crate::traced::spawn(async move { router.caller_for(peer, local).await })
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let other = router.caller_for(other_peer, other_local).await;
+        assert_eq!(
+            caller_name(&other),
+            "no box",
+            "the other connection is named"
+        );
+        assert!(
+            started.elapsed() < OWNER_LOOKUP_WAIT,
+            "the other connection's lookup is answered inside the wait bound"
+        );
+        for lookup in burst {
+            assert_eq!(caller_name(&lookup.await.unwrap()), "no box");
+        }
+        let walks = router.walk.walks.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(walks <= 3, "64 connections share walks, got {walks} walks");
+        drop(clients);
+    }
+
+    /// The accepting side's local address of `stream`, as the proxy passes
+    /// it to [`Router::caller_for`].
+    fn stream_local(stream: &tokio::net::TcpStream) -> Option<SocketAddr> {
+        stream.local_addr().ok()
+    }
+
+    /// NET-070, with a slow batch lookup that names two boxes: a
+    /// host-address box that opens many connections at once does not hold
+    /// another box's owner lookup. Concurrent connections share one walk, at
+    /// most one a second, so a burst of 63 connections from one box and one
+    /// from another box are all named in a few walks, well inside the wait
+    /// bound, though each walk is slow. With a walk per connection on four
+    /// slots, the other box's lookup waited 16 walks, past the bound, and its
+    /// request was refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn burst_from_one_box_does_not_starve_another_box_with_a_slow_walk() {
+        let router = two_host_box_router().with_socket_owners(slow_walk_owners);
         let local = Some(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080)));
         let burst: Vec<_> = (0..63u16)
             .map(|n| {
@@ -4894,7 +4965,7 @@ mod tests {
         for lookup in burst {
             assert_eq!(caller_name(&lookup.await.unwrap()), "hostbox");
         }
-        let walks = SLOW_WALKS.load(std::sync::atomic::Ordering::SeqCst);
+        let walks = router.walk.walks.load(std::sync::atomic::Ordering::Relaxed);
         assert!(walks <= 3, "64 connections share walks, got {walks} walks");
     }
 
@@ -4910,7 +4981,7 @@ mod tests {
             let id = SessionId::parse_str(OPEN_HOST_BOX).unwrap();
             vec![crate::net::dns::ConnectingOwner::Box(id); pairs.len()]
         }
-        let router = two_host_box_router(slow_owners);
+        let router = two_host_box_router().with_socket_owners(slow_owners);
         let local = Some(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080)));
         let spawn = |port: u16| {
             let router = router.clone();
@@ -4947,7 +5018,7 @@ mod tests {
             let id = SessionId::parse_str(OPEN_HOST_BOX).unwrap();
             vec![crate::net::dns::ConnectingOwner::Box(id); pairs.len()]
         }
-        let router = two_host_box_router(slow_owners);
+        let router = two_host_box_router().with_socket_owners(slow_owners);
         let local = Some(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080)));
         let spawn = |port: u16| {
             let router = router.clone();
