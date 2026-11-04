@@ -367,9 +367,16 @@ pub(crate) async fn rehold_held_name_before_attach(
         true,
     )
     .await
-        && let Ok(None) = attached_box_record(sock, id).await
     {
-        host_ip_box_with_vm_host(control_sock_beside(sock), id, None, false).await;
+        if let Ok(None) = attached_box_record(sock, id).await {
+            host_ip_box_with_vm_host(control_sock_beside(sock), id, None, false).await;
+        } else {
+            tracing::info!(
+                session = %id,
+                box = record.name.as_deref().unwrap_or("<unnamed>"),
+                "admitted the resumed host_ip box's egress on the VM host daemon again"
+            );
+        }
     }
     if record.box_addresses.is_some() {
         return;
@@ -531,9 +538,49 @@ impl HostIpResidency {
 impl Drop for HostIpResidency {
     fn drop(&mut self) {
         if !self.kept {
-            minimal_client::attach::host_ip_box_at(&self.control_sock, self.id, None, false);
+            retire_host_ip_box_retrying(&self.control_sock, self.id, HOST_IP_RETIRE_BACKOFF);
         }
     }
+}
+
+/// How many times a failed `host_ip` retire is sent again (NET-085).
+const HOST_IP_RETIRE_RETRIES: u32 = 3;
+
+/// The wait before the first retry of a failed `host_ip` retire. Each
+/// retry after it waits twice as long as the one before.
+const HOST_IP_RETIRE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Retires a `host_ip` box's egress policy on the VM host daemon whose
+/// control socket is `control_sock`, and sends the retire again up to
+/// [`HOST_IP_RETIRE_RETRIES`] times when an exchange fails, with a backoff
+/// that starts at `backoff` and doubles (NET-085). A retire that never
+/// lands leaves the box's rules in the gate's union until the VM host
+/// daemon restarts, so one lost exchange is not the last word. Blocking.
+/// Each failed attempt is a warn line with its attempt number. Returns
+/// whether a retire was answered.
+fn retire_host_ip_box_retrying(
+    control_sock: &std::path::Path,
+    id: boxes::SessionId,
+    backoff: std::time::Duration,
+) -> bool {
+    let attempts = HOST_IP_RETIRE_RETRIES + 1;
+    let mut wait = backoff;
+    for attempt in 1..=attempts {
+        if minimal_client::attach::host_ip_box_at(control_sock, id, None, false) {
+            return true;
+        }
+        tracing::warn!(
+            session = %id,
+            attempt,
+            attempts,
+            "the host_ip box's egress retire failed on attempt {attempt} of {attempts}"
+        );
+        if attempt < attempts {
+            std::thread::sleep(wait);
+            wait = wait.saturating_mul(2);
+        }
+    }
+    false
 }
 
 /// Holds or releases a `host_ip` box's name on the VM host daemon, by
@@ -2009,6 +2056,117 @@ mod tests {
         };
         assert_eq!(request.name, "web");
         assert_eq!(request.session_id, Some(id));
+    }
+
+    /// NET-085: a retire whose exchange with the VM host daemon fails is
+    /// sent again, so a box whose first retire was lost still leaves the
+    /// gate's union. The stand-in drops the first two retires unanswered
+    /// and answers the third.
+    #[tokio::test]
+    async fn failed_host_ip_retire_is_retried() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+        let dir = tempfile::TempDir::new().unwrap();
+        let control_sock = dir.path().join(minvmd::control::CONTROL_SOCK_FILE);
+        let listener = tokio::net::UnixListener::bind(&control_sock).unwrap();
+        let retires = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let seen = std::sync::Arc::clone(&retires);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let mut lines = tokio::io::BufReader::new(stream);
+                let mut line = String::new();
+                if lines.read_line(&mut line).await.is_err() {
+                    continue;
+                }
+                let Ok(minimald_rpc::BoxControlRequest::RetireHostIpBox(retire)) =
+                    serde_json_lenient::from_str(line.trim())
+                else {
+                    continue;
+                };
+                let attempt = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if attempt < 3 {
+                    // The exchange fails: the connection closes unanswered.
+                    continue;
+                }
+                let answer =
+                    serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::HostIpBox {
+                        session_id: retire.session_id,
+                        resident: false,
+                    })
+                    .unwrap();
+                let mut writer = lines.into_inner();
+                let _ = writer.write_all(format!("{answer}\n").as_bytes()).await;
+            }
+        });
+
+        let id = boxes::SessionId::nil();
+        let residency = HostIpResidency {
+            control_sock: control_sock.clone(),
+            id,
+            kept: false,
+        };
+        tokio::task::spawn_blocking(move || drop(residency))
+            .await
+            .unwrap();
+        assert_eq!(
+            retires.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "two failed retires, then the one that lands"
+        );
+
+        // A retire that never lands stops after the retries.
+        let gone = dir.path().join("gone.sock");
+        let answered = tokio::task::spawn_blocking(move || {
+            retire_host_ip_box_retrying(&gone, id, std::time::Duration::from_millis(1))
+        })
+        .await
+        .unwrap();
+        assert!(!answered, "no VM host daemon, no retire answered");
+    }
+
+    /// NET-085: a VM host daemon that restarted holds no `host_ip` box's
+    /// policy, so a resumed box is admitted again, with its own rules,
+    /// before the attach or the exec runs in it.
+    #[tokio::test]
+    async fn resume_readmits_host_ip_box() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ssh_sock = dir.path().join("ssh.sock");
+        // A fresh stand-in: the restarted VM host daemon, with no admits.
+        let (_, residency) = fake_vm_host_with_residency(
+            dir.path().join(minvmd::control::CONTROL_SOCK_FILE),
+            r#"{"name":"web","held":true}"#.to_string(),
+        )
+        .await;
+        let server = minimald::test_harness::TestServer::new().await;
+        server.listen_on_uds(&ssh_sock).await;
+        let project = tempfile::TempDir::new().unwrap();
+        let mut daemon = server.connect().await;
+        let id = minimald::test_harness::create_configured_session(
+            &mut daemon,
+            "web",
+            project.path().to_str().unwrap(),
+        )
+        .await;
+        let record = attached_box_record(&ssh_sock, id)
+            .await
+            .expect("the lookup does not fail")
+            .expect("the session's record is read");
+        assert_eq!(record.network, boxes::NetworkMode::HostNet);
+
+        // The attach's resume, in the order `min session attach` makes it.
+        resume_box_row(&ssh_sock, Some(&record))
+            .await
+            .expect("a host_ip box has no row to ask back");
+        rehold_held_name_before_attach(paths::HostKind::Minvmd, &ssh_sock, id, Some(&record)).await;
+
+        let residency = residency.lock().unwrap();
+        assert!(
+            matches!(
+                residency.as_slice(),
+                [minimald_rpc::BoxControlRequest::AdmitHostIpBox(admit)]
+                    if admit.session_id == id && admit.egress == record.policy.egress
+            ),
+            "one admit for the resumed box, with its own rules: {residency:?}"
+        );
     }
 
     /// The native daemon holds no names: its control socket answers only
