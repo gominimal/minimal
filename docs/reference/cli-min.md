@@ -180,11 +180,10 @@ allow-all addresses: the box reaches every address directly, and the names
 bound nothing. Activation does not warn about it. Add `--allow-subnets` to
 bound the addresses there.
 
-Known issue: own-address boxes take their addresses from 100.64.0.0/10.
-Some VPNs, such as Tailscale, use the same range. While such a VPN is up, a
-box's connections to addresses the VPN routes in that range can fail. No
-setting changes the range a box uses. A box started with `--network host_ip`
-uses the host's own addresses and is not affected.
+Known issue: own-address boxes take their addresses from 100.64.0.0/16,
+a block inside 100.64.0.0/10. Some VPNs, such as Tailscale, use addresses in
+100.64.0.0/10. While such a VPN is up, a box's connections to addresses the
+VPN routes in 100.64.0.0/16 can fail. No setting changes the range a box uses.
 
 Activating a path that already has a session is allowed, but warns: `min` names
 the existing session and creates a second one anyway. With two sessions on one
