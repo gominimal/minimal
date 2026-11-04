@@ -2035,7 +2035,11 @@ impl BepPeer {
     /// of firing on every clean stop (1.9k a week in the lab, one per stop).
     pub async fn shutdown(mut self) {
         drop(self.stop.take());
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), &mut self.poll_task).await;
+        if let Ok(Err(err)) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), &mut self.poll_task).await
+        {
+            tracing::warn!(%err, "BEP poll task ended with a join error");
+        }
         // Drop does the rest: a thread that did not finish in time is left to
         // the abort, as before.
     }
