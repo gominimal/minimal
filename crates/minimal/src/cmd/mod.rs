@@ -50,8 +50,10 @@ pub use secret::{cmd_secret_list, cmd_secret_rm, cmd_secret_set};
 pub use session::*;
 
 pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
-    // The verb, the box id the command resolved, and the outcome go on the
-    // root span (BCLI-033 observability), so one span tells what ran.
+    // The verb and the outcome go on the root span (BCLI-033
+    // observability), so one span tells what ran. `box_id` stays empty
+    // until a command records the id it resolved, through
+    // `output::record_box_id`. No command calls it yet.
     let root = tracing::info_span!(
         "cmd",
         verb = command_verb(cli.command.as_ref()),
@@ -91,28 +93,6 @@ pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
     match run_in_root(root, Box::pin(run_command(cli))).await? {
         None => Ok(()),
         Some(handoff) => Err(handoff.finish()),
-    }
-}
-
-/// The box a run names on its command line, as the user typed it (an id,
-/// the start of one, or a name), for the root span's `box_id` field. `None`
-/// for a command that names no box, or leaves it to a default.
-fn named_box(command: Option<&Command>) -> Option<&str> {
-    match command? {
-        Command::Session(SessionArgs { command }) => match command {
-            SessionCommand::Attach(a) => a.session.as_deref(),
-            SessionCommand::Exec(a) => Some(&a.session),
-            SessionCommand::Destroy(a) => a.session.as_deref(),
-            SessionCommand::Rename(a) => Some(&a.session),
-            SessionCommand::Policy(a) => Some(&a.session),
-            _ => None,
-        },
-        Command::Box(BoxArgs { command }) => match command {
-            BoxCommand::Show(a) => Some(&a.target),
-            BoxCommand::Audit(a) => a.target.as_deref().or(a.parent.as_deref()),
-            _ => None,
-        },
-        _ => None,
     }
 }
 
@@ -263,6 +243,23 @@ fn die_of(signal: nix::sys::signal::Signal) -> ! {
     std::process::exit(128_i32.saturating_add(signal as i32))
 }
 
+/// Holds the root span in [`output::set_root_span`]'s slot, and empties
+/// the slot on drop, on every exit path.
+struct RootSpanSlot;
+
+impl RootSpanSlot {
+    fn hold(root: &tracing::Span) -> Self {
+        output::set_root_span(Some(root));
+        Self
+    }
+}
+
+impl Drop for RootSpanSlot {
+    fn drop(&mut self) {
+        output::set_root_span(None);
+    }
+}
+
 /// Run `command` inside `root`, end `root`, and return the command's
 /// [`Handoff`], if it made one. Any other error is returned as is.
 ///
@@ -275,7 +272,9 @@ where
 {
     use tracing::Instrument as _;
     let span = root.clone();
-    output::set_root_span(Some(&span));
+    // The guard empties the root-span slot when it drops, so a panic or a
+    // cancelled future does not keep the span open.
+    let slot = RootSpanSlot::hold(&span);
     let result = command.instrument(root).await;
     let outcome = match &result {
         Ok(()) => "ok",
@@ -284,7 +283,7 @@ where
     };
     span.record("outcome", outcome);
     // Release every handle on the span, so it closes here.
-    output::set_root_span(None);
+    drop(slot);
     drop(span);
     match result {
         Ok(()) => Ok(None),
@@ -319,11 +318,6 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
     // once per invocation, before any command resolves a host dir, so an
     // upgraded CLI finds an existing instance rather than orphaning it.
     client::migrate_legacy_host_dirs(cli.global_args.minimal_dir.as_deref());
-    // The root span's `box_id` gets the box the command names, as typed. A
-    // command that resolves it to an id can record that over it.
-    if let Some(named) = named_box(cli.command.as_ref()) {
-        output::record_box_id(named);
-    }
 
     match cli.command {
         // A bare `min` (no subcommand) resolves-or-creates a session in a
@@ -1835,30 +1829,5 @@ mod handoff_tests {
         .unwrap_err();
         assert_eq!(format!("{err:#}"), "no session found");
         assert_eq!(closed_names(&closed), ["cmd", "cmd"]);
-    }
-}
-
-#[cfg(test)]
-mod named_box_tests {
-    use super::named_box;
-    use crate::Cli;
-    use clap::Parser as _;
-
-    fn named(args: &[&str]) -> Option<String> {
-        let cli = Cli::try_parse_from(args).expect("the command line parses");
-        named_box(cli.command.as_ref()).map(str::to_owned)
-    }
-
-    /// The root span's `box_id` gets the box a command names, and nothing
-    /// for a command that names none.
-    #[test]
-    fn root_span_box_id_is_the_named_box() {
-        assert_eq!(named(&["min", "box", "show", "b1"]).as_deref(), Some("b1"));
-        assert_eq!(
-            named(&["min", "session", "exec", "s1", "true"]).as_deref(),
-            Some("s1")
-        );
-        assert_eq!(named(&["min", "box", "list"]), None);
-        assert_eq!(named(&["min", "version"]), None);
     }
 }
