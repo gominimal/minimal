@@ -163,7 +163,7 @@ __min_rpc() {
                     printf '\r\033[K'
                     bar_open=0
                 fi
-                echo "$rest"
+                printf '%s\n' "$rest"
                 ;;
             err)
                 # A line for stderr: the task's own stderr and min's notes
@@ -172,7 +172,7 @@ __min_rpc() {
                     printf '\r\033[K'
                     bar_open=0
                 fi
-                echo "$rest" >&2
+                printf '%s\n' "$rest" >&2
                 ;;
             set_env)
                 local varname="${rest%%:*}"
@@ -193,7 +193,7 @@ __min_rpc() {
                     printf '\r\033[K'
                     bar_open=0
                 fi
-                echo "error:$rest" >&2
+                printf 'error:%s\n' "$rest" >&2
                 error="true"
                 # A `run` refusal is followed by the `exit:` line that gives
                 # its exit code. Read on to it.
@@ -202,7 +202,7 @@ __min_rpc() {
                 fi
                 ;;
         esac
-    done < <(echo "${prefix}${method}%${data}" | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock)
+    done < <(printf '%s\n' "${prefix}${method}%${data}" | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock)
 
     if [[ "$bar_open" -eq 1 ]]; then
         printf '\r\033[K'
