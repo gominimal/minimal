@@ -12924,6 +12924,12 @@ bep_live_gate() {
       return 1
     fi
   fi
+  # Here, not in the lane default: an earlier case can replace RUST_LOG, and
+  # the live cases and their own restarts read `bep serve`'s records in bep.log.
+  case ",${RUST_LOG:-}," in
+    *,bep=info,*) ;;
+    *) export RUST_LOG="${RUST_LOG:+$RUST_LOG,}bep=info" ;;
+  esac
   if [ "$BEP_LIVE_DAEMON" != 1 ]; then
     unset MINVMD_BEP_STUB
     mnl stop --force >/dev/null 2>&1 || true
@@ -13621,7 +13627,7 @@ proof_bep_store_reference_end_to_end() {
     echo "::error::'min secret list' printed the stored value"
     sr_fail
   fi
-  if ! printf '%s\n' "$sr_out" | grep -F -- "$sr_id" | grep -qF -- "$sr_host"; then
+  if ! printf '%s\n' "$sr_out" | grep -F -A2 -- "$sr_id" | grep -qE -- "^ +upstream: +$sr_host\$"; then
     echo "::error::'min secret list' has no row for $sr_id with the upstream $sr_host"
     echo "--- min secret list ---"; printf '%s\n' "$sr_out"
     sr_fail
@@ -13868,7 +13874,7 @@ proof_bep_destroyed_box_values_refused_within_60s() {
   echo "::group::min session destroy: a value copied from the box is refused within 60 s"
   local dv_case=bep_destroyed_box_values_refused_within_60s
   local dv_web=e2e-bep-revoke-web dv_other=e2e-bep-revoke-other
-  local dv_value dv_try dv_count=0 dv_out
+  local dv_value dv_try dv_count=0 dv_out dv_web_id
   bep_live_gate "$dv_case" || { echo "::endgroup::"; return 0; }
 
   # Not local: dv_cleanup reads them.
@@ -13888,6 +13894,8 @@ proof_bep_destroyed_box_values_refused_within_60s() {
   dv_value="$(bep_revoke_copy_value "$dv_case" "$DV_SID")" || dv_fail
   echo "web: 'gh api user' answered, and GH_TOKEN holds a sealed value (${#dv_value} characters)"
 
+  # A removed box answers to its id only.
+  dv_web_id="$DV_SID"
   if ! mnl session destroy --force "$DV_SID" </dev/null >/dev/null 2>"$WORK/$dv_case.destroy.err"; then
     echo "::error::'min session destroy' of the box web failed"
     cat "$WORK/$dv_case.destroy.err" 2>/dev/null || true
@@ -13898,18 +13906,18 @@ proof_bep_destroyed_box_values_refused_within_60s() {
   # The revocation record, within 60 s of the destroy.
   for dv_try in $(seq 1 12); do
     [ "$dv_try" -gt 1 ] && sleep 5
-    mnl box audit "$dv_web" -o jsonl </dev/null >"$WORK/$dv_case.audit" 2>"$WORK/$dv_case.audit.err" \
+    mnl box audit "$dv_web_id" -o jsonl </dev/null >"$WORK/$dv_case.audit" 2>"$WORK/$dv_case.audit.err" \
       || continue
     dv_count="$(bep_revoke_count "$WORK/$dv_case.audit" revocation)"
     [ "$dv_count" -ge 1 ] && break
   done
   if [ "$dv_count" != 1 ]; then
-    echo "::error::'min box audit $dv_web' shows $dv_count revocation records 60 s after the destroy, not 1"
-    echo "--- min box audit $dv_web -o jsonl ---"; cat "$WORK/$dv_case.audit" 2>/dev/null || true
+    echo "::error::'min box audit $dv_web_id' shows $dv_count revocation records 60 s after the destroy, not 1"
+    echo "--- min box audit $dv_web_id -o jsonl ---"; cat "$WORK/$dv_case.audit" 2>/dev/null || true
     cat "$WORK/$dv_case.audit.err" 2>/dev/null || true
     dv_fail
   fi
-  echo "min box audit $dv_web: 1 revocation record within 60 s of the destroy"
+  echo "min box audit $dv_web_id: 1 revocation record within 60 s of the destroy"
 
   # The copied value, from the second box, after the destroy.
   if mnl session exec "$DV_SID2" sh -c "GH_TOKEN='$dv_value' timeout 60 gh api user --jq .login" \
@@ -13917,10 +13925,10 @@ proof_bep_destroyed_box_values_refused_within_60s() {
     echo "::error::'gh api user' in the second box succeeded with the value copied from the destroyed box web"
     dv_fail
   fi
-  if ! mnl box audit "$dv_other" -o jsonl </dev/null >"$WORK/$dv_case.audit2" 2>&1 \
+  if ! mnl box audit "$dv_other" -o jsonl </dev/null >"$WORK/$dv_case.audit2" 2>"$WORK/$dv_case.audit2.err" \
     || ! dv_out="$(bep_slice_jsonl_check "$WORK/$dv_case.audit2" cross_box)"; then
     echo "::error::'min box audit $dv_other' shows no refusal of the copied value: $dv_out"
-    cat "$WORK/$dv_case.audit2" 2>/dev/null || true
+    cat "$WORK/$dv_case.audit2" "$WORK/$dv_case.audit2.err" 2>/dev/null || true
     dv_fail
   fi
   echo "copied value in the second box after the destroy: 'gh api user' failed, and min box audit shows $dv_out"
@@ -14076,7 +14084,7 @@ proof_bep_destroy_with_proxy_down_refuses_by_attachment() {
   # This reads the real home, which no earlier subshell export changes.
   # shellcheck disable=SC2031
   local pd_control="$HOME/.minimal/bep/control.sock"
-  local pd_value pd_pids pd_try pd_count pd_out pd_id
+  local pd_value pd_pids pd_try pd_count pd_out pd_id pd_web_id
   bep_live_gate "$pd_case" || { echo "::endgroup::"; return 0; }
 
   # Not local: pd_cleanup reads them.
@@ -14114,6 +14122,8 @@ proof_bep_destroy_with_proxy_down_refuses_by_attachment() {
   BEP_LIVE_DAEMON=""
   echo "the proxy is down"
 
+  # A removed box answers to its id only.
+  pd_web_id="$PD_SID"
   if ! mnl session destroy --force "$PD_SID" </dev/null >/dev/null 2>"$WORK/$pd_case.destroy.err"; then
     echo "::error::'min session destroy' of the box web failed with the proxy down: the destroy must complete"
     cat "$WORK/$pd_case.destroy.err" 2>/dev/null || true
@@ -14141,27 +14151,27 @@ proof_bep_destroy_with_proxy_down_refuses_by_attachment() {
     echo "::error::'gh api user' in a new box succeeded with the value copied from the destroyed box web"
     pd_fail
   fi
-  if ! mnl box audit "$pd_probe" -o jsonl </dev/null >"$WORK/$pd_case.audit2" 2>&1 \
+  if ! mnl box audit "$pd_probe" -o jsonl </dev/null >"$WORK/$pd_case.audit2" 2>"$WORK/$pd_case.audit2.err" \
     || ! pd_out="$(bep_slice_jsonl_check "$WORK/$pd_case.audit2" cross_box)"; then
     echo "::error::'min box audit $pd_probe' shows no refusal of the copied value: $pd_out"
-    cat "$WORK/$pd_case.audit2" 2>/dev/null || true
+    cat "$WORK/$pd_case.audit2" "$WORK/$pd_case.audit2.err" 2>/dev/null || true
     pd_fail
   fi
   echo "copied value in a new box: 'gh api user' failed, and min box audit shows $pd_out"
 
   # No revocation was recorded: the refusal is the withdrawn attachment's.
-  if ! mnl box audit "$pd_web" -o jsonl </dev/null >"$WORK/$pd_case.audit" 2>"$WORK/$pd_case.audit.err"; then
-    echo "::error::'min box audit $pd_web' failed"
+  if ! mnl box audit "$pd_web_id" -o jsonl </dev/null >"$WORK/$pd_case.audit" 2>"$WORK/$pd_case.audit.err"; then
+    echo "::error::'min box audit $pd_web_id' failed"
     cat "$WORK/$pd_case.audit.err" 2>/dev/null || true
     pd_fail
   fi
   pd_count="$(bep_revoke_count "$WORK/$pd_case.audit" revocation)"
   if [ "$pd_count" != 0 ]; then
-    echo "::error::'min box audit $pd_web' shows $pd_count revocation records, though the proxy was down at the destroy"
+    echo "::error::'min box audit $pd_web_id' shows $pd_count revocation records, though the proxy was down at the destroy"
     pd_fail
   fi
   pd_id="$(bep_revoke_count "$WORK/$pd_case.audit" decision)"
-  echo "min box audit $pd_web: $pd_id decision records and no revocation record"
+  echo "min box audit $pd_web_id: $pd_id decision records and no revocation record"
 
   pd_cleanup
   rm -f "${WORK:?}/${pd_case:?}".*
@@ -15220,9 +15230,8 @@ print(rcode, an, addr)' "$dq_b64"
 # records NOT RUN with the gate it misses. On a lane that runs no leg, the
 # whole walk is NOT RUN.
 #   store     (BEP-032) `bep serve` holds the client's [secret-store-rules]
-#             at its start. The injection of a store value into a box's
-#             request is NOT RUN until a box can carry a store handle
-#             (#2525): today no box creation mints one.
+#             at its start. bep_store_reference_end_to_end proves the
+#             injection of a store value into a box's request.
 #   key       (BEP-063, BEP-067, BEP-070) runs only with
 #             E2E_BEP_KEY_REPLACE=1. The manual macOS lane runs it
 #             (#2500). A grant box A answers 'gh api user'. The case
@@ -15293,8 +15302,9 @@ rt_bep_bin() {
 
 # The proxy's log lines after line $1, that contain $2.
 rt_bep_log_since() {
+  # bep.log carries colour codes, which split `kid=` from its value.
   tail -n +"$(( $1 + 1 ))" "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null \
-    | grep -F -- "$2" || true
+    | sed $'s/\033\\[[0-9;]*m//g' | grep -F -- "$2" || true
 }
 rt_bep_log_lines() {
   wc -l <"$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null | tr -d ' ' || echo 0
@@ -15321,8 +15331,7 @@ PY
 rt_leg_store() {
   local st_leg="$RT_CASE/store" st_line
   bep_live_gate "$st_leg" || return 0
-  st_line="$(grep -h 'holds the secret-store rules of the client configuration' \
-    "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null | tail -n1)"
+  st_line="$(rt_bep_log_since 0 'holds the secret-store rules of the client configuration' | tail -n1)"
   if [ -z "$st_line" ]; then
     echo "::error::the Box Egress Proxy log has no line that says it holds the client's secret-store rules: 'bep serve' did not read them at its start"
     tail -40 "$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log" 2>/dev/null || true
@@ -15331,7 +15340,6 @@ rt_leg_store() {
   echo "$st_leg: the proxy read the client's secret-store rules at its start: ${st_line##*INFO }"
   echo "$st_leg/rules: PASS (bep serve holds the client's secret-store rules)"
   RT_RAN="$RT_RAN store"
-  not_run "$st_leg/injection" "no box carries a store handle yet, so no request can redeem one (#2525)"
 }
 
 rt_leg_key() {
@@ -16272,10 +16280,9 @@ proof_bep_conditions_closed_end_to_end() {
 #     [secret-store-rules] while the proxy runs turns the proxy's 403 for its
 #     host into an admitted CONNECT, with the same `bep serve` process
 #     (BEP-032).
-#   * bep_r3_config_dir_rule_reaches_bep_serve: NOT RUN on every lane. Box
-#     creation mints no store handle yet (#2525), so no `min` command reaches
-#     the --config-dir rule check. Its unit tests in crates/minimal/src/mint.rs
-#     pin the check.
+#   * bep_r3_config_dir_rule_reaches_bep_serve: a store rule that only a
+#     `min --config-dir` override holds is one `bep serve` does not read, so
+#     box creation refuses to mint its store handle (BEP-032).
 # The four proxy cases need the live proxy gate (bep_live_gate): macOS, the
 # VM host daemon with gvproxy, and a GitHub sign-in.
 R3_SPEC="docs/specs/24-spec-box-egress-proxy/24-spec-box-egress-proxy.md"
@@ -16744,12 +16751,47 @@ proof_bep_r3_widened_store_rule_without_restart() {
 }
 
 proof_bep_r3_config_dir_rule_reaches_bep_serve() {
-  # Box creation mints no store handle yet: the sealed member list has no
-  # store kind (#2525). So no min command reaches the check that refuses a
-  # --config-dir rule bep serve does not read. Its unit tests in
-  # crates/minimal/src/mint.rs pin it until then.
-  not_run bep_r3_config_dir_rule_reaches_bep_serve \
-    "box creation mints no store handle yet (#2525), so no min command reaches the --config-dir store rule check"
+  echo "::group::a store rule only --config-dir holds: box creation refuses to mint its handle (BEP-032)"
+  local cd_case=bep_r3_config_dir_rule_reaches_bep_serve
+  local cd_name=e2e-bep-config-dir cd_id="e2e-config-dir-$$" cd_dir cd_out
+  local cd_want="min did not mint a store handle for $cd_id: bep serve reads store rules from"
+  bep_live_gate "$cd_case" || { echo "::endgroup::"; return 0; }
+
+  cd_dir="$(hook_mktemp /tmp/mnlconfigdir.XXXXXX)"
+  mkdir "$cd_dir/minimal"
+  [ -f "$XDG_CONFIG_HOME/minimal/config.toml" ] \
+    && cp "$XDG_CONFIG_HOME/minimal/config.toml" "$cd_dir/minimal/config.toml"
+  printf '\n[secret-store-rules.%s]\nupstream = ["%s"]\nheader = "Authorization"\nprefix = "Bearer "\n' \
+    "$cd_id" "$R3_STORE_HOST" >>"$cd_dir/minimal/config.toml"
+  GRANT_SEED_DIR="$(hook_mktemp /tmp/mnlconfigdirseed.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = ["base", "coreutils", "ca-certificates"]\n'
+    printf '\n[session.secrets.E2E_STORE_KEY]\nsource = "store"\nstore = "keychain"\nid = "%s"\n' "$cd_id"
+    printf '\n[session.network.bep]\nsteering = "proxy_env"\n'
+  } > "$GRANT_SEED_DIR/minimal.toml"
+  mkdir "$GRANT_SEED_DIR/.git"
+
+  if cd_out="$(cd "$GRANT_SEED_DIR" && mnl --config-dir "$cd_dir" session activate . --no-prompt \
+    --name "$cd_name" --network own_ip --credentialed-upstream --allow-dns-hosts "$R3_STORE_HOST" \
+    </dev/null 2>&1)"; then
+    echo "::error::'min --config-dir session activate' made a box from a store rule bep serve does not read"
+    printf '%s\n' "$cd_out"
+    mnl session destroy --force "$cd_name" >/dev/null 2>&1 || true
+    rm -rf "${cd_dir:?}" "${GRANT_SEED_DIR:?}"
+    GRANT_SEED_DIR=""
+    fail
+  fi
+  rm -rf "${cd_dir:?}" "${GRANT_SEED_DIR:?}"
+  GRANT_SEED_DIR=""
+  mnl session destroy --force "$cd_name" >/dev/null 2>&1 || true
+  if [[ "$cd_out" != *"$cd_want"* ]]; then
+    echo "::error::'min --config-dir session activate' failed without saying bep serve does not read the rule"
+    printf '%s\n' "$cd_out"
+    fail
+  fi
+  echo "--config-dir store rule OK (box creation refused to mint the handle, and named the file bep serve reads)"
+  echo "::endgroup::"
 }
 
 proof_bep_round_three_conditions_closed() {
