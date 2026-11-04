@@ -616,14 +616,33 @@ impl BoxActor {
             .as_std_path()
             .to_path_buf();
         // How the VM host names this box when its copy of the record
-        // arrives (NET-046). A box with a switch reports by the route its
-        // listen watcher registered, and that route wins when it exists. A
-        // box with no route, a box with no switch among them, reports by its
-        // box id over this box's control channel. The key is always given,
-        // so no failure to read the box record can drop the host's copy.
-        let host_key = crate::audit::HostReportKey {
-            box_id: Some(*self.record.id()),
-            control: Some(self.switch_control().await),
+        // arrives (NET-046). A box with a switch address reports only by the
+        // route its listen watcher registered. A box with no switch address
+        // has no such route, so its report carries the box id and goes over
+        // this box's control channel. When the box record cannot be read,
+        // the switch address this box reported decides, so a box with no
+        // switch still reports by id.
+        let no_switch = match self.record.record().await {
+            Ok(record) => record.box_addresses.is_none(),
+            Err(error) => {
+                let no_switch = self.reported_switch_address.is_none();
+                tracing::debug!(
+                    name = %box_name,
+                    port,
+                    %error,
+                    no_switch,
+                    "the box record could not be read; the reported switch address decides the host report key"
+                );
+                no_switch
+            }
+        };
+        let host_key = if no_switch {
+            crate::audit::HostReportKey {
+                box_id: Some(*self.record.id()),
+                control: Some(self.switch_control().await),
+            }
+        } else {
+            crate::audit::HostReportKey::default()
         };
         // An allow that stands is recorded before anything else is said
         // about it, and only a recorded one is answered as published
