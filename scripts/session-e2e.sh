@@ -22533,6 +22533,43 @@ proof_min_internal_names_through_proxy() {
     echo "NET-160: $PROXY_HOST_ALIAS:$PROXY_HOST_PORT reached and $PROXY_HOST_ALIAS:$PROXY_UNEXPOSED_PORT refused from the own-address box (curl exit $proxy_own_closed_rc) OK"
 
     mnl session destroy --force "$PROXY_OWN_SID" >/dev/null 2>&1 || true
+
+    # NET-004 on a box that does not name the host: its allow_subnets
+    # (TEST-NET-1 alone) does not cover the alias and its egress names no
+    # host.min.internal, so it has no half of an exposure. Its own relay
+    # drops the connect at the exposed port under the host-alias rule: no
+    # answer and no reset until the timeout. The relay runs in the guest
+    # daemon on every switch lane, so its log line is pinned by the
+    # switch.rs unit test (own_ip_box_exposure_passes_the_guest_relay).
+    PROXY_OWN_SID="$(cd "$PROXY_OWN_SEED_DIR" && mnl session activate . --no-prompt \
+      --name "$PROXY_OWN_NAME-silent" --network own_ip --allow-subnets 192.0.2.0/24 \
+      2>"$WORK/proxy-own-silent.err")" || {
+      echo "::error::'min session activate --network own_ip --allow-subnets 192.0.2.0/24' failed"
+      echo "--- stderr ---"; cat "$WORK/proxy-own-silent.err" 2>/dev/null || true
+      fail
+    }
+    PROXY_OWN_SID="$(printf '%s\n' "$PROXY_OWN_SID" | tail -n1 | tr -d '\r')"
+    proxy_alias_start_ms="$(now_ms)"
+    mnl session exec "$PROXY_OWN_SID" \
+      "/usr/bin/socat /dev/null TCP:$PROXY_HOST_ALIAS:$PROXY_HOST_PORT,connect-timeout=10" \
+      >/dev/null 2>"$WORK/proxy-alias-silent.err" && {
+      echo "::error::NET-004: the own-address box that does not name the host completed a connection to the host alias $PROXY_HOST_ALIAS:$PROXY_HOST_PORT"
+      fail
+    }
+    proxy_alias_elapsed_ms=$(( $(now_ms) - proxy_alias_start_ms ))
+    echo "NET-004: connect $PROXY_HOST_ALIAS:$PROXY_HOST_PORT from the own-address box that does not name the host -> elapsed=${proxy_alias_elapsed_ms}ms socat: $(tail -n1 "$WORK/proxy-alias-silent.err" 2>/dev/null)"
+    if grep -q 'Connection refused' "$WORK/proxy-alias-silent.err" 2>/dev/null; then
+      echo "::error::NET-004: the connection to the host alias was reset — the frame got past the box's relay, which must drop it silently"
+      cat "$WORK/proxy-alias-silent.err" 2>/dev/null || true
+      fail
+    fi
+    if [ "$proxy_alias_elapsed_ms" -lt 5000 ]; then
+      echo "::error::NET-004: the connection to the host alias failed in ${proxy_alias_elapsed_ms}ms — a fast failure, not the silent drop being asserted"
+      cat "$WORK/proxy-alias-silent.err" 2>/dev/null || true
+      fail
+    fi
+
+    mnl session destroy --force "$PROXY_OWN_SID" >/dev/null 2>&1 || true
   else
     echo "own-address half SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch)"
   fi
