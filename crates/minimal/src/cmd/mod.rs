@@ -1361,11 +1361,19 @@ impl ActivationInterrupt {
 /// by the pair off the record, or a `host_ip` box's name by the id its
 /// registration handed back (`slot`). A `host_ip` record has no pair, so
 /// the id is what withdraws its name (BEP-082).
+///
+/// A `host_ip` box is retired first. The handler exits the process, so
+/// the activation's `HostIpResidency` never drops. Without this retire,
+/// the box's rules and its lane declaration stay in the host gate's
+/// union (NET-085, BEP-083).
 async fn withdraw_interrupted_box(
     control_sock: Option<PathBuf>,
     record: &boxes::Record,
     slot: &std::sync::OnceLock<minimald_rpc::BoxId>,
 ) {
+    if record.network == boxes::NetworkMode::HostNet {
+        retire_host_ip_box_with_vm_host(control_sock.clone(), record.id).await;
+    }
     withdraw_box_row(
         control_sock,
         record.name.as_deref(),
@@ -1567,23 +1575,51 @@ mod tests {
     /// BEP-082: a Ctrl-C during a `host_ip` activation withdraws the box's
     /// name with the id its registration handed back, as the activation's
     /// failure paths do. The record has no address pair, so without the id
-    /// the handler withdraws nothing and the host keeps the name.
+    /// the handler withdraws nothing and the host keeps the name. The box
+    /// is retired first: the handler exits the process, so nothing else
+    /// takes its rules and its lane declaration out of the host gate.
     #[tokio::test]
     async fn interrupted_host_ip_activation_withdraws_its_name_by_id() {
         use std::io::{BufRead as _, Write as _};
         let dir = tempfile::TempDir::new().unwrap();
         let control_sock = dir.path().join("control.sock");
         let listener = std::os::unix::net::UnixListener::bind(&control_sock).unwrap();
+        // Accepts each exchange and answers it by its verb, until the
+        // withdrawal, which is the handler's last exchange.
         let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut reader = std::io::BufReader::new(stream);
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            reader
-                .get_mut()
-                .write_all(b"{\"switch_address\":\"0.0.0.0\",\"loopback_address\":\"0.0.0.0\"}\n")
-                .unwrap();
-            line
+            let mut requests = Vec::new();
+            loop {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let request: minimald_rpc::BoxControlRequest =
+                    serde_json_lenient::from_str(line.trim())
+                        .expect("the request is the wire type");
+                let (answer, last) = match &request {
+                    minimald_rpc::BoxControlRequest::RetireHostIpBox(retire) => (
+                        serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::HostIpBox {
+                            session_id: retire.session_id,
+                            resident: false,
+                        })
+                        .unwrap(),
+                        false,
+                    ),
+                    _ => (
+                        "{\"switch_address\":\"0.0.0.0\",\"loopback_address\":\"0.0.0.0\"}"
+                            .to_string(),
+                        true,
+                    ),
+                };
+                reader
+                    .get_mut()
+                    .write_all(format!("{answer}\n").as_bytes())
+                    .unwrap();
+                requests.push(request);
+                if last {
+                    return requests;
+                }
+            }
         });
         let minted = minimald_rpc::BoxId::from_bytes(*b"0123456789abcdef");
         let guard = super::ActivationInterrupt {
@@ -1623,11 +1659,18 @@ mod tests {
             attrs: Default::default(),
         };
         super::withdraw_interrupted_box(Some(control_sock), &record, &guard.host_ip_box_id).await;
-        let line = server.join().unwrap();
-        let request: minimald_rpc::BoxControlRequest =
-            serde_json_lenient::from_str(line.trim()).expect("the request is the wire type");
-        let minimald_rpc::BoxControlRequest::Withdraw(request) = request else {
-            panic!("the name goes by the withdraw verb: {request:?}");
+        let requests = server.join().unwrap();
+        let [retire, withdraw] =
+            <[_; 2]>::try_from(requests).expect("the handler sends a retire, then a withdrawal");
+        let minimald_rpc::BoxControlRequest::RetireHostIpBox(retire) = retire else {
+            panic!("the box is retired before its name is withdrawn: {retire:?}");
+        };
+        assert_eq!(
+            retire.session_id, record.id,
+            "the retire is for the aborted box"
+        );
+        let minimald_rpc::BoxControlRequest::Withdraw(request) = withdraw else {
+            panic!("the name goes by the withdraw verb: {withdraw:?}");
         };
         assert_eq!(request.name, "web");
         assert_eq!(
