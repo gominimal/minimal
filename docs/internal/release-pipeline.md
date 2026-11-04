@@ -16,10 +16,17 @@ Users install whatever their channel points at.
 ## Cut a stable release
 
 Follow these steps in order. The examples use version `X.Y.Z`, commit
-`<commit>`, and branch `release/<branch>`. Replace them with your values. For
-a new release, `<branch>` is the version, as in `release/0.7.0`. A hotfix uses
-the branch of the release that it fixes. See
-[Release a hotfix](#release-a-hotfix).
+`<commit>`, and release line `release/X.Y.x`, such as `release/0.7.x`. Replace
+them with your values.
+
+A release takes one of two paths:
+
+- A minor release cuts a new release line from `main`. Follow every step.
+- A patch is staged from the existing line, with no new branch. See
+  [Stage a patch](#stage-a-patch).
+
+The [release manager runbook](https://github.com/gominimal/release-ops/blob/main/RUNBOOK.md)
+says who does this work and when. This page says how.
 
 ### Before you start
 
@@ -28,9 +35,9 @@ the branch of the release that it fixes. See
   approve your own run.
 - A version number is permanent. After step 4 stages `X.Y.Z`, that number
   always means that build. To release a later fix, bump `package.version` in
-  a PR and cut the next version.
+  a PR and stage the next version.
 - A release runs on a branch that outlives one build. Fixes merge into
-  `release/<branch>` by PR while `main` keeps moving. Each release candidate
+  `release/X.Y.x` by PR while `main` keeps moving. Each release candidate
   uses up its own version number, such as `X.Y.Z-rc1`, because a staged
   number is permanent.
 - A release candidate stops after step 6. Only the final version goes on to
@@ -56,7 +63,7 @@ just check-version
 
 Do not push a `v*` tag. The promotion in step 7 creates the tag.
 
-### 2. Give the commit a branch
+### 2. Cut the release line
 
 GitHub starts a manual workflow run on a branch or a tag, not on a commit
 hash. Push a branch that points at the commit, even when the commit is the
@@ -64,21 +71,26 @@ tip of `main`. A run on `main` builds the commit that `main` points at when
 the run starts, and `main` can move between steps 3 and 4.
 
 ```sh
-git push origin <commit>:refs/heads/release/<branch>
+git push origin <commit>:refs/heads/release/X.Y.x
 ```
 
-The branch name must start with `release/`. CI runs the required checks on
+Only a repository admin can create a branch under `release/`, so ask one to
+push it. The branch name must start with `release/`. CI runs the required checks on
 pushes and PRs to `main` and `release/**` only. Without those checks, step 4
 refuses each fix that merges into the branch.
 
 Keep the branch after the release. It carries the fixes that go into the
-release while `main` moves on, and each hotfix for the release goes out from
-it. Step 8 brings its fixes back to `main`.
+release while `main` moves on, and each patch on the line goes out from it.
+Step 8 brings its fixes back to `main`.
+
+Before step 7, open a PR on `main` that bumps `package.version` to the next
+minor. After the `vX.Y.0` tag exists, the version check fails on `main` until
+its version is above that tag.
 
 ### 3. Rehearse the release run
 
 ```sh
-gh workflow run release.yml --ref release/<branch> -f versioned=true -f dry_run=true
+gh workflow run release.yml --ref release/X.Y.x -f versioned=true -f dry_run=true
 ```
 
 A dry run builds, signs, and smoke-tests everything. It uploads
@@ -93,14 +105,14 @@ that merges after the dry run gets staged without a rehearsal.
 Make sure that the branch still points at the commit that the dry run built:
 
 ```sh
-git fetch origin release/<branch>
+git fetch origin release/X.Y.x
 git rev-parse FETCH_HEAD
 ```
 
 If the branch moved, run step 3 again. Then stage:
 
 ```sh
-gh workflow run release.yml --ref release/<branch> -f versioned=true -f dry_run=false
+gh workflow run release.yml --ref release/X.Y.x -f versioned=true -f dry_run=false
 ```
 
 When the run passes, it did these things:
@@ -125,16 +137,16 @@ Make sure that the smoke record exists:
 curl -fsS https://storage.googleapis.com/minimal-one/versions/X.Y.Z/smoked
 ```
 
-No channel points at the staged release, so write a private pointer to
-install it the way a user does. Any name made of `A-Za-z0-9._-` works. You
-need write access to the bucket, and anyone who knows the name can install
-from it. Delete the pointer when you finish.
+No channel points at the staged release, so install it by version. This needs
+no access to the bucket, so anyone on the team can run it:
 
 ```sh
-scripts/set-channel.sh --channel rc --version X.Y.Z --bucket gs://minimal-one
-curl -fsSL https://storage.googleapis.com/minimal-one/versions/X.Y.Z/install.sh | sh -s -- rc
-gcloud storage rm gs://minimal-one/rc
+curl -fsSL https://storage.googleapis.com/minimal-one/versions/X.Y.Z/install.sh | sh -s -- --version X.Y.Z
 ```
+
+Use this command to soak the build until the promotion. A problem that blocks
+the promotion needs a fix on the line and a new version, because a staged
+number is permanent.
 
 ### 6. Check minimal-skills against the staged build
 
@@ -144,7 +156,8 @@ Check its claims against the staged version `X.Y.Z`, before the promotion,
 so that a fix can still go in before users get the build. Run its evals, and
 file each place where minimal-skills and the running build disagree in
 [`gominimal/inbox`](https://github.com/gominimal/inbox). The repository keeps
-its own `release/vX.Y.Z` branch.
+one `release/vX.Y.0` branch for each release line, such as `release/v0.7.0`.
+The release manager creates it when the line is cut.
 
 A release candidate stops here.
 
@@ -179,26 +192,26 @@ on the same run.
 
 ### 8. Forward port the release branch
 
-Bring the fixes that merged into `release/<branch>` back to `main`. `main`
-moves while a release is out, so a port that waits costs more than one that
+After each promotion to stable, bring the fixes that merged into
+`release/X.Y.x` back to `main`. `main` moves while a release is out, so a port that waits costs more than one that
 does not. Compare the branch, not the tag. A fix can merge into the branch
 after the tag, and the tag does not contain it.
 
 The promotion created the tag on GitHub, so fetch it with the branch. The
-explicit refspecs write `origin/main` and `origin/release/<branch>` in any
+explicit refspecs write `origin/main` and `origin/release/X.Y.x` in any
 clone. `--force` replaces a stale local tag of the same name. If the second
 command prints `branch already on main`, there is nothing to port and nothing
 to merge. Skip to the tag check at the end of this step:
 
 ```sh
-git fetch --force origin main:refs/remotes/origin/main release/<branch>:refs/remotes/origin/release/<branch> tag vX.Y.Z
-git merge-base --is-ancestor origin/release/<branch> origin/main && echo "branch already on main"
+git fetch --force origin main:refs/remotes/origin/main release/X.Y.x:refs/remotes/origin/release/X.Y.x tag vX.Y.Z
+git merge-base --is-ancestor origin/release/X.Y.x origin/main && echo "branch already on main"
 ```
 
 List the branch commits that have no identical patch on `main`:
 
 ```sh
-git cherry -v origin/main origin/release/<branch> | grep '^+'
+git cherry -v origin/main origin/release/X.Y.x | grep '^+'
 ```
 
 The list holds the version bumps, and also each cherry-pick whose conflicts
@@ -219,39 +232,51 @@ lacks, so merge only after `main` has every fix in the list:
 
 ```sh
 git switch -c chore/merge-back-X.Y.Z origin/main
-git merge -s ours origin/release/<branch> -m "Merge branch 'release/<branch>' into main"
+git merge -s ours origin/release/X.Y.x -m "Merge branch 'release/X.Y.x' into main"
 ```
 
 Push the branch and open a PR. The PR must go in as a merge commit, because
-the other merge buttons drop the link to the branch and its tag. This
-repository turns off **Create a merge commit**, so an admin turns it on in
-the repository settings and merges the PR with it. The admin then turns it
-off again. Then check that the tag is on `main`:
+the other merge buttons drop the link to the branch and its tag. The merge
+queue squashes every PR, so this PR cannot go through it. Until this step is
+automated, someone on the bypass list of the `main` ruleset does these things:
+
+1. Turns on **Create a merge commit** in the repository settings.
+2. Merges the PR outside the queue, with a merge commit.
+3. Turns the setting off again.
+
+Then check that the tag is on `main`:
 
 ```sh
 git fetch origin main:refs/remotes/origin/main
 git merge-base --is-ancestor vX.Y.Z origin/main && echo "tag on main"
 ```
 
-### Release a hotfix
+### Stage a patch
 
-A hotfix is the next version of a release, cut from the branch of that
-release. `<branch>` stays the version of the first release on the branch: a
-fix for 0.7.0 goes out from `release/0.7.0`. It does not use step 1 or step
-2. A second release candidate, and the final version after the candidates,
-go out from the branch in the same way. Do these steps:
+A patch is the next version on a release line. It needs no new branch, and it
+does not use step 1 or step 2. The weekly patch and an emergency fix both take
+this path. A second release candidate, and the final version after the
+candidates, go out from the line in the same way.
 
-1. Land the fix and the `package.version` bump on `release/<branch>` by PR.
+Only the newest line gets patches. The version check refuses a version below
+the newest `v*` tag, so a line stops when the next minor ships.
+
+Do these steps:
+
+1. Land each fix on `main` first, then cherry-pick it to `release/X.Y.x` by
+   PR. Title the PR `fix:`, because a `feat:` or breaking subject on the line
+   requires a minor and fails the version check. Land the `package.version`
+   bump by PR if the line is not already on the next patch.
 2. Check that the five required checks from step 1 are green on the branch
    tip, and check the version there:
 
    ```sh
-   git fetch origin release/<branch>
+   git fetch origin release/X.Y.x
    git switch --detach FETCH_HEAD
    just check-version
    ```
 
-3. Follow steps 3 to 6 with `--ref release/<branch>`. For the final version,
+3. Follow steps 3 to 6 with `--ref release/X.Y.x`. For the final version,
    also follow steps 7 and 8. A release candidate stops after step 6.
 
 ### Roll back
@@ -333,7 +358,8 @@ checks it for builds outside this pipeline.
 The `assert-version` job reads `package.version` for a versioned run. It
 refuses a version that already has a tag. It also runs
 [`scripts/next-version.sh --check`](../../scripts/next-version.sh), the same
-check that runs on every PR. That script reads the full commit messages since
+check that runs in the `package_version` test on PRs that reach the Rust test
+lanes. That script reads the full commit messages since
 the last release tag. A `feat:` commit requires a minor bump. A breaking
 change under any type also requires a minor bump, and appears first in the
 notes. At 0.x it does not bump the major version. Anything else requires a
