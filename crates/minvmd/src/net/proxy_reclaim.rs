@@ -1,5 +1,5 @@
 //! The hostname proxy's preferred port, taken back while the VM runs
-//! (NET-150, NET-151).
+//! (NET-150, NET-151), and a held port published once it frees (NET-021).
 //!
 //! A start that found the preferred proxy port held hands the guest a
 //! substitute, and the proxy serves there. This module watches the preferred
@@ -8,6 +8,11 @@
 //! reservation and asks the host switch to publish `127.0.0.1:<preferred>` to
 //! the guest proxy's own port. The substitute keeps serving, so a browser
 //! pointed at either port reaches the proxy, and the VM does not restart.
+//!
+//! A start that found no port to serve on at all starts the VM with its
+//! proxy down. The held-port watcher ([`spawn_held_port_watcher`]) retries
+//! that port with backoff and publishes it with the same checks, so the
+//! proxy serves once the port frees, and the VM does not restart.
 //!
 //! The assignment's own log line lives here too ([`log_proxy_port_assignment`]):
 //! the line that says the proxy is on a substitute port, and the line that
@@ -196,6 +201,108 @@ pub(crate) fn spawn_reclaim_watcher<R: Send + 'static>(
                     tracing::debug!(preferred, substitute, error = %why, "reclaim publish failed");
                 }
             }
+        }
+    });
+    watcher
+}
+
+/// The held-port watcher's retry schedule (NET-021): the first retry waits
+/// `initial`, each later one doubles the wait, and no wait passes `max`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HeldPortBackoff {
+    pub(crate) initial: Duration,
+    pub(crate) max: Duration,
+}
+
+impl Default for HeldPortBackoff {
+    /// One second first, then up to 30 s: a person who frees the port waits
+    /// at most half a minute, and a port held all day costs two probes a
+    /// minute.
+    fn default() -> Self {
+        Self {
+            initial: Duration::from_secs(1),
+            max: Duration::from_secs(30),
+        }
+    }
+}
+
+impl HeldPortBackoff {
+    /// The wait before retry `attempt`, counted from zero.
+    pub(crate) fn delay(&self, attempt: u32) -> Duration {
+        self.initial
+            .saturating_mul(2u32.saturating_pow(attempt.min(16)))
+            .min(self.max)
+    }
+}
+
+/// Records that the proxy serves on `port` after a start that left it down
+/// (NET-022): the port goes on the served list, and the down cause goes, so
+/// `min ls` stops naming it. The status cell clears only an unconfirmed
+/// cause ([`crate::control::ProxyPublishStatus::confirm`]), so the held
+/// cause is first replaced by an unconfirmed one on the same port. That
+/// is true for the instant between the two calls: the switch publishes the
+/// port, and nothing has confirmed it yet.
+pub(crate) fn mark_serving(status: &crate::control::ProxyPublishStatus, port: u16) {
+    status.set_serving(port);
+    status.set_unconfirmed(port);
+    status.confirm(port);
+}
+
+/// Starts the held-port watcher on its own thread (NET-021). The VM started
+/// with its proxy down because another program held `port`. The watcher
+/// retries the port on the `backoff` schedule. Each retry is one
+/// [`reclaim_once`] attempt that publishes `127.0.0.1:<port>` to the guest
+/// proxy's own `port`. Each retry that fails logs one debug line. On
+/// success the watcher holds the reservation, calls `recovered` with the
+/// port, logs one info line with the time it waited, and stops.
+pub(crate) fn spawn_held_port_watcher<R: Send + 'static>(
+    port: u16,
+    backoff: HeldPortBackoff,
+    mut take: impl FnMut(u16) -> Option<R> + Send + 'static,
+    mut publish: impl FnMut(u16, u16) -> Result<(), String> + Send + 'static,
+    recovered: impl FnOnce(u16) + Send + 'static,
+) -> ReclaimWatcher<R> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let held = Arc::new(Mutex::new(None));
+    let watcher = ReclaimWatcher {
+        stop: Arc::clone(&stop),
+        held: Arc::clone(&held),
+    };
+    let vm_scope = crate::telemetry::vm_task("proxy.port.held");
+    std::thread::spawn(move || {
+        let _vm_scope = vm_scope.entered();
+        let started = std::time::Instant::now();
+        let mut attempt: u32 = 0;
+        while !stop.load(Ordering::Acquire) {
+            std::thread::sleep(backoff.delay(attempt));
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+            attempt = attempt.saturating_add(1);
+            let failure = match reclaim_once(port, port, &mut take, &mut publish) {
+                ReclaimAttempt::Reclaimed(reservation) => {
+                    *held
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reservation);
+                    recovered(port);
+                    tracing::info!(
+                        port,
+                        attempts = attempt,
+                        waited_secs = started.elapsed().as_secs(),
+                        "the hostname proxy is serving after its port freed"
+                    );
+                    return;
+                }
+                ReclaimAttempt::Held => "the port is still held".to_string(),
+                ReclaimAttempt::PublishFailed(why) => why,
+            };
+            tracing::debug!(
+                port,
+                attempt,
+                error = %failure,
+                next_retry = ?backoff.delay(attempt),
+                "the hostname proxy's port is not published yet; retrying"
+            );
         }
     });
     watcher
@@ -499,6 +606,105 @@ mod tests {
         assert!(take(7654).is_none());
         // Only the probe after the confirm reached `take`.
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    // NET-021: the held-port watcher waits 1 s first, doubles the wait, and
+    // never waits past 30 s.
+    #[test]
+    fn held_port_backoff_doubles_from_one_second_to_thirty() {
+        let backoff = HeldPortBackoff::default();
+        let waits: Vec<u64> = (0..8).map(|n| backoff.delay(n).as_secs()).collect();
+        assert_eq!(waits, vec![1, 2, 4, 8, 16, 30, 30, 30]);
+        assert_eq!(backoff.delay(u32::MAX), Duration::from_secs(30));
+    }
+
+    // NET-021, NET-022: a VM that started with its proxy down on a held
+    // port publishes nothing while the port stays held. Once the holder
+    // exits, the watcher takes the reservation, asks the switch to publish
+    // `127.0.0.1:<port>` to the guest proxy's own port, and clears the
+    // down cause, so the status read reports the port as serving.
+    #[test]
+    fn proxy_publishes_once_the_held_port_frees() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ports_dir = dir.path().join("ports");
+        std::fs::create_dir(&ports_dir).expect("ports dir");
+        let switch_sock = dir.path().join("switch.sock");
+        let requests = fake_switch(&switch_sock);
+
+        let holder =
+            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind holder");
+        let port = holder.local_addr().expect("holder addr").port();
+        let node = std::net::Ipv4Addr::new(192, 168, 127, 2);
+
+        let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+        let _entered = runtime.enter();
+        let registry = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
+        let ledger = crate::net::egress_gate::TestMirrorLedger::attach(
+            &registry.table(),
+            switch_sock.clone(),
+        );
+
+        let status = crate::control::ProxyPublishStatus::new();
+        status.set_down(
+            port,
+            minimald_rpc::ProxyDownCause::PortHeldAfterStart {
+                holder: Some("pid 4242 (python3)".to_string()),
+            },
+        );
+        let recorded = status.clone();
+        {
+            let watcher = spawn_held_port_watcher(
+                port,
+                HeldPortBackoff {
+                    initial: Duration::from_millis(20),
+                    max: Duration::from_millis(50),
+                },
+                crate::cmd::run::proxy_reclaim_check(ports_dir.clone()),
+                crate::cmd::run::proxy_reclaim_publisher(
+                    switch_sock.clone(),
+                    node,
+                    registry.table(),
+                ),
+                move |port| mark_serving(&recorded, port),
+            );
+
+            // Held: several retries pass and the switch hears nothing.
+            assert!(
+                requests.recv_timeout(Duration::from_millis(400)).is_err(),
+                "the watcher published a port another process holds"
+            );
+            assert!(!watcher.reclaimed());
+            assert!(
+                status.down().is_some(),
+                "the cause stays while the port is held"
+            );
+            assert!(status.serving_ports().is_empty());
+
+            // Free the port: the next retry publishes it.
+            drop(holder);
+            let expose = requests
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the watcher asks the switch to publish the freed port");
+            assert!(
+                expose.ends_with(&format!(
+                    r#"{{"local":"127.0.0.1:{port}","remote":"{node}:{port}","protocol":"tcp"}}"#
+                )),
+                "{expose}"
+            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while status.down().is_some() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(watcher.reclaimed());
+            assert_eq!(status.down(), None, "the recovery clears the cause");
+            assert_eq!(status.serving_ports(), vec![port]);
+            assert_eq!(
+                ledger.dials(std::net::Ipv4Addr::LOCALHOST, port),
+                Some(node)
+            );
+            assert!(requests.recv_timeout(Duration::from_millis(200)).is_err());
+            drop(watcher);
+        }
     }
 
     #[test]
