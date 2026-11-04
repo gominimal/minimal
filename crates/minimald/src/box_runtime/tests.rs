@@ -8243,3 +8243,106 @@ async fn box_output_logged_from_start_complete_after_disconnect() {
     handle.kill(true).await.expect("kill should reach the host");
     let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
 }
+
+/// NET-046: an `ask` box with no switch address, on a VM host, is refused as
+/// not attached, and the VM host daemon still hears the decision. No audit
+/// route names a box with no switch, so the report carries the box's id in
+/// place of a switch address, over the box's own control channel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_switch_box_reports_expose_decision_by_id() {
+    use crate::test_harness::unwrap_ready;
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+        FinalizeSessionRequest,
+    };
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let mut request = crate::box_actor::tests::dynamic_ingress_session_req(
+        "web",
+        ASK_SWITCH,
+        ASK_LOOPBACK,
+        Some(boxes::DynamicIngress::Ask),
+        Some((3000, 3999)),
+    );
+    // The VM host handed this box no switch address.
+    request.config.box_addresses = None;
+    let id = client.call::<CreateSession>(&request).await.unwrap().id;
+    unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    match client
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
+        .await
+    {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+    }
+    let handle = server
+        .state
+        .sessions_manager()
+        .await
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the web box should resolve");
+    // The ask needs a host to route to, so the box launches one first.
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the ask box launches its host");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    // The switch's control channel is VM-shaped: its door is the stand-in.
+    let door_sock = sock.with_file_name("no-switch-door.sock");
+    let (door, mut reports, replies) = fake_report_door(&door_sock).await;
+    crate::net::listeners::seed_vm_report_door_for_tests(&sock, &door_sock);
+
+    match handle.expose_dynamic(3000).await {
+        Err(crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::NotAttached,
+        )) => {}
+        other => panic!("a box with no switch address is refused as not attached: {other:?}"),
+    }
+
+    let report = tokio::time::timeout(Duration::from_secs(10), reports.recv())
+        .await
+        .expect("the refusal is reported to the VM host daemon")
+        .expect("the report door stand-in lives");
+    replies
+        .send(minimald_rpc::BoxControlReply::Audited { audited: true })
+        .expect("the report door stand-in lives");
+    door.abort();
+    crate::net::listeners::clear_vm_report_door_for_tests(&sock);
+    assert_eq!(
+        report,
+        minimald_rpc::BoxControlRequest::ReportExposeDecision(minimald_rpc::ExposeDecisionReport {
+            switch_address: None,
+            box_id: Some(id),
+            port: 3000,
+            decision: boxes::DynamicIngress::Ask,
+            decided_by: minimald_rpc::ExposeDecidedBy::Daemon,
+            outcome: minimald_rpc::ExposeDecisionOutcome::Refused,
+        }),
+        "a box with no switch is named to the host by its id"
+    );
+
+    // The local record lands as it always did.
+    let records = audit_records(&server.state.minimal_state_dir().await).await;
+    assert_eq!(records.len(), 1, "one request is one decision: {records:?}");
+    assert_eq!(records[0]["box"], "web");
+    assert_eq!(records[0]["outcome"], "refused");
+}
