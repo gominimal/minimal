@@ -213,6 +213,12 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
     // once per invocation, before any command resolves a host dir, so an
     // upgraded CLI finds an existing instance rather than orphaning it.
     client::migrate_legacy_host_dirs(cli.global_args.minimal_dir.as_deref());
+    // NET-109: delete the retired proxy's certificate files once after an
+    // upgrade. The log records each deletion. Nothing prints.
+    let config_dir = crate::config::resolve_minimal_config_dir(&cli.global_args);
+    for path in paths::remove_retired_proxy_credentials(&config_dir) {
+        tracing::info!(path = %path.display(), "removed retired proxy certificate file");
+    }
 
     match cli.command {
         // A bare `min` (no subcommand) resolves-or-creates a session in a
