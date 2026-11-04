@@ -20,6 +20,7 @@ use std::io::{IsTerminal as _, Read as _};
 
 use anyhow::{Context as _, bail};
 use tokio::io::AsyncWriteExt as _;
+use tracing::Instrument as _;
 
 use crate::{GlobalArgs, RunArgs, TaskRunArgs};
 
@@ -75,6 +76,52 @@ fn task_run_request(
         args: args.to_vec(),
         cwd,
     }
+}
+
+/// The exec request of a task run whose task is its box's entrypoint (T43).
+/// The daemon starts the entrypoint, relays its output and returns its exit
+/// code. The task's arguments ride the entrypoint's argv, not the request,
+/// and the run owns no box: the box ends when its entrypoint returns, and
+/// keeps its record (BOX-038).
+fn entrypoint_run_request(task: &str) -> minimald_rpc::exec::ExecRequest {
+    minimald_rpc::exec::ExecRequest::TaskRun {
+        task: task.to_string(),
+        owns_box: false,
+        args: Vec::new(),
+        cwd: String::new(),
+    }
+}
+
+/// The spec of the task box a run creates (BOX-068): the declared task's
+/// spec, with the arguments the user typed after the task name appended to
+/// its entrypoint, `min task run <task> <args...>`. `None` for an
+/// interactive task, whose type denies a terminal.
+fn task_box_spec(
+    task: &str,
+    declared: &mfile::Task,
+    flags: mfile::spec::SpecFlags,
+    args: &[String],
+) -> Option<mfile::spec::BoxSpec> {
+    let mut spec = mfile::spec::BoxSpec::for_task(task, declared, flags)?;
+    if let mfile::spec::Entrypoint::Exec(argv) = &mut spec.entrypoint {
+        argv.extend(args.iter().cloned());
+    }
+    Some(spec)
+}
+
+/// Asks the daemon to run the entrypoint of task box `id`, and returns the
+/// channel that relays it: the task's output, then its exit code.
+/// `task_env` holds the task's variables, resolved against this shell, for
+/// the in-box `min task run` to read.
+pub(crate) async fn open_task_box_run(
+    client: &mut crate::client::Client,
+    id: boxes::SessionId,
+    task: &str,
+    task_env: &minimald_rpc::taskenv::TaskEnv,
+) -> Result<russh::Channel<russh::client::Msg>, anyhow::Error> {
+    client
+        .open_session_exec_channel(id, &entrypoint_run_request(task).encode(), task_env)
+        .await
 }
 
 /// The invocation directory relative to the upload root, `/`-separated:
@@ -671,10 +718,20 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // box uses. The client invents no name.
     request.config.name = None;
     request.fresh_instance = true;
-    // The box ends with this run unless `--keep` retains it: marked at
-    // create, so a daemon restart before or during the run destroys it
-    // rather than resuming it (NET-131).
-    request.config.ends_with_run = !args.keep;
+    // The task box runs its task as its entrypoint and keeps its record
+    // when the task returns (BOX-038). Only an interactive task, which has
+    // no spec, runs over the exec channel: its box ends with this run
+    // unless `--keep` retains it, marked at create, so a daemon restart
+    // before or during the run destroys it rather than resuming it
+    // (NET-131).
+    let spec = task_box_spec(
+        &args.task,
+        &declared,
+        crate::spec_flags(&request),
+        &args.args,
+    );
+    let entrypoint_runs = spec.is_some();
+    request.config.ends_with_run = !args.keep && !entrypoint_runs;
     // Refused by a daemon of another build before it allocates anything;
     // `None` under the skew override.
     request.must_match_version = minimal_client::version_assertion();
@@ -682,10 +739,8 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     request.config.creating_verb = minimald_rpc::CreatingVerb::Task;
     // BOX-068: the declared task's spec, with this command's settings. An
     // interactive task sends none: the task type denies a terminal.
-    if let Some(spec) =
-        mfile::spec::BoxSpec::for_task(&args.task, &declared, crate::spec_flags(&request))
-    {
-        crate::put_spec(&mut request, &spec)?;
+    if let Some(spec) = &spec {
+        crate::put_spec(&mut request, spec)?;
     } else {
         // With no spec to name it, the request carries the entry's name,
         // cleaned as the daemon cleans a spec's entry.
@@ -908,6 +963,50 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     drop(interrupt_guard);
     let run_guard = arm_task_run_interrupt(global, id, session_name.clone(), args.keep);
 
+    if entrypoint_runs {
+        eprintln!("Running task {} in box {session_name}...", args.task);
+        // One span for the run, from the request to the exit code.
+        let span = tracing::info_span!("task_run", box_id = %id, task = %args.task);
+        let outcome = async {
+            match open_task_box_run(&mut client, id, &args.task, &task_env).await {
+                Ok(channel) => {
+                    let outcome = bridge_exec(channel).await;
+                    if outcome.is_ok() {
+                        eprintln!("{}", crate::kept_box_line(&session_name));
+                    }
+                    outcome
+                }
+                // The exec never started, so no entrypoint ran: the box is
+                // removed, as the client always removed it.
+                Err(e) => {
+                    crate::best_effort_destroy(&mut client, id, false).await;
+                    Err(e)
+                }
+            }
+        }
+        .instrument(span.clone())
+        .await;
+        span.in_scope(|| {
+            tracing::info!(exit = ?outcome.as_ref().ok().copied().flatten(), "task run ended");
+        });
+        if let Some(residency) = host_ip_residency.as_mut() {
+            residency.keep();
+        }
+        // The box ended: it holds no name a running box needs.
+        release_task_name_hold(
+            crate::vm_host_control_sock(
+                crate::daemon_host_kind(global),
+                global.minimal_dir.as_deref(),
+            ),
+            id,
+            &session_name,
+            false,
+        )
+        .await;
+        drop(run_guard);
+        return exit_outcome(outcome?);
+    }
+
     eprintln!("Running task {} in session {session_name}...", args.task);
 
     let outcome = match client
@@ -983,6 +1082,60 @@ pub(crate) async fn release_task_name_hold(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // BOX-038, T43: `min task run` creates a task box whose entrypoint is
+    // the task, with the typed arguments on its argv. The run asks the
+    // daemon for that entrypoint, owns no box, and returns the code the
+    // daemon relays as its own. The box is kept, and the run says how to
+    // remove it. The daemon half, which runs the entrypoint and relays its
+    // code, needs the mock launcher of `minimald`'s own tests:
+    // `until_complete_ends_on_entrypoint_return_without_client_*` there.
+    #[test]
+    fn task_run_returns_the_entrypoint_exit_code() {
+        // An interactive task has no spec, so it keeps the exec path.
+        let interactive = mfile::Task {
+            interactive: true,
+            ..mfile::Task::default()
+        };
+        assert!(task_box_spec("sh", &interactive, Default::default(), &[]).is_none());
+
+        // The arguments ride the entrypoint's argv.
+        let spec = task_box_spec(
+            "check",
+            &mfile::Task::default(),
+            mfile::spec::SpecFlags::default(),
+            &["--fast".to_string()],
+        )
+        .expect("a task that is not interactive has a spec");
+        assert_eq!(
+            spec.entrypoint,
+            mfile::spec::Entrypoint::Exec(
+                ["min", "task", "run", "check", "--fast"]
+                    .map(String::from)
+                    .to_vec()
+            )
+        );
+        // The run sends no arguments and owns no box.
+        assert_eq!(
+            entrypoint_run_request("check"),
+            minimald_rpc::exec::ExecRequest::TaskRun {
+                task: "check".to_string(),
+                owns_box: false,
+                args: vec![],
+                cwd: String::new(),
+            }
+        );
+
+        // The code the daemon relays is the run's: 0 is success, and any
+        // other code is the process's exit code.
+        assert!(exit_outcome(Some(0)).is_ok());
+        let err = exit_outcome(Some(7)).unwrap_err();
+        assert_eq!(err.downcast_ref::<TaskExit>(), Some(&TaskExit(7)));
+        assert_eq!(
+            crate::kept_box_line("check-1"),
+            "Kept box check-1. Remove it with min box rm check-1."
+        );
+    }
 
     /// The hidden `min run` redirect names both canonical forms — the host
     /// `min task run <task>` and the in-box

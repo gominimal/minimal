@@ -513,6 +513,13 @@ where
     }
 }
 
+/// The line `min task run` prints when its task returns (T43). The task
+/// box ended with its task and keeps its record, so the line names the box
+/// and the command that removes it.
+pub(crate) fn kept_box_line(name: &str) -> String {
+    format!("Kept box {name}. Remove it with min box rm {name}.")
+}
+
 /// The refusal of `min box rm` for a running box without `--force`
 /// (BCLI-004, BOX-019). `target` is the box as the user named it.
 #[derive(Debug, Clone, PartialEq, Eq)]
