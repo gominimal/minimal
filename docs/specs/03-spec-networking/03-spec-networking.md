@@ -347,7 +347,7 @@ management)
   loopback port (R3.1/R3.3 routing; the daemon is not on the switch).
   Only HTTP and WebSocket traffic is proxied; raw TCP/UDP is not available via
   this path (UC2b option B).
-  Superseded: no HTTPS reverse proxy ships, and `minimal login` issues no
+  Superseded: Minimal has no HTTPS reverse proxy, and `minimal login` issues no
   client certificate ([spec 18 NET-109](../18-spec-box-networking/18-spec-box-networking.md)).
 - **R4.5**: Authentication failures (invalid cert, failed OIDC, unrecognised peer)
   shall be logged via `tracing::warn!` with structured fields and shall not reveal
@@ -369,7 +369,7 @@ management)
   `LocalForward`-style TCP tunnel to a service reachable from within the named
   `OwnIp` PTask, authenticated by the same credentials used for re-attach. This
   path requires no WireGuard configuration and carries TCP only.
-  Superseded: no `min ssh-forward` ships ([spec 18 NET-109](../18-spec-box-networking/18-spec-box-networking.md)).
+  Superseded: Minimal has no `min ssh-forward` ([spec 18 NET-109](../18-spec-box-networking/18-spec-box-networking.md)).
 
 **Proof Artifacts:**
 
@@ -469,7 +469,7 @@ get out. The fallback supports TCP only and does not deliver the hostname-driven
 browser access of the mesh path, but it preserves authenticated remote service
 access in restricted environments.
 
-Superseded: SSH port-forwarding does not ship
+Superseded: Minimal has no SSH port-forwarding
 ([spec 18 NET-109](../18-spec-box-networking/18-spec-box-networking.md)).
 
 ## Repository Standards
@@ -520,7 +520,7 @@ Superseded: SSH port-forwarding does not ship
    `minimald` (client installs trust anchor via `minimal login`) or ACME with a
    real DNS name? The self-signed path works for private teams; ACME requires a
    public-facing `minimald` with a DNS name.
-   Superseded: no HTTPS reverse proxy ships, so no certificate is issued
+   Superseded: Minimal has no HTTPS reverse proxy, so it needs no certificate
    ([spec 18 NET-109](../18-spec-box-networking/18-spec-box-networking.md)).
 
 ## Technical Considerations
