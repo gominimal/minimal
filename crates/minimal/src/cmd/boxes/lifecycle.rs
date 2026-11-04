@@ -588,29 +588,42 @@ pub async fn cmd_box_stop(global: &GlobalArgs, args: BoxStopArgs) -> Result<(), 
     ensure_daemon(global)?;
     let hosts = crate::cmd::list::local_hosts(global)?;
     let mut out = std::io::stdout().lock();
-    let id = stop_box_on_hosts(hosts, &mut out, &args.target, args.force).await?;
+    let stopped = stop_box_on_hosts(hosts, &mut out, &args.target, args.force).await?;
     // A stopped box is not live, so the VM host daemon retires its
     // `host_ip` egress rules. The row and the name hold stay until the box
     // is removed. An attach admits the rules again. Best-effort: a box of
     // another mode has no rules, and no VM host daemon means nothing to do.
-    let control_sock =
-        vm_host_control_sock(daemon_host_kind(global), global.minimal_dir.as_deref());
-    host_ip_box_with_vm_host(control_sock, id, None, false).await;
+    // The retire goes to the VM that keeps the box, which need not be the
+    // selected one.
+    let control_sock = box_host_control_sock(&stopped.host);
+    host_ip_box_with_vm_host(control_sock, stopped.box_id, None, false).await;
     Ok(())
 }
 
 /// Resolves the address `target` over `hosts` and stops that box on the
-/// host that keeps it, forced under `force`. Returns the id of the box.
+/// host that keeps it, forced under `force`. Returns the box and its host.
 pub(crate) async fn stop_box_on_hosts(
     hosts: Vec<crate::cmd::list::LocalHost>,
     out: &mut impl std::io::Write,
     target: &str,
     force: bool,
-) -> Result<boxes::SessionId, anyhow::Error> {
-    let ResolvedBox { host, box_id } = resolve_box_on_hosts(hosts, target, "box stop").await?;
-    let mut client = box_host_client(&host).await?;
-    stop_listed_box(&mut client, out, box_id, target, force).await?;
-    Ok(box_id)
+) -> Result<ResolvedBox, anyhow::Error> {
+    let resolved = resolve_box_on_hosts(hosts, target, "box stop").await?;
+    let mut client = gated_box_host_client(&resolved.host).await?;
+    stop_listed_box(&mut client, out, resolved.box_id, target, force).await?;
+    Ok(resolved)
+}
+
+/// The control socket of the VM host daemon that serves `host`, for the
+/// cleanup after a stop or a removal. A native host has none.
+pub(crate) fn box_host_control_sock(
+    host: &crate::cmd::list::LocalHost,
+) -> Option<std::path::PathBuf> {
+    if host.provider == crate::cmd::list::LOCAL_MINVMD_PROVIDER {
+        control_sock_beside(&host.sock)
+    } else {
+        None
+    }
 }
 
 /// Stops the box `id`, which the address `target` resolved to, as BOX-013
@@ -661,12 +674,12 @@ fn write_stop_line(
 pub async fn cmd_box_rm(global: &GlobalArgs, args: BoxRmArgs) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
     let hosts = crate::cmd::list::local_hosts(global)?;
-    let removed = rm_box_on_hosts(hosts, &args.target, args.force).await?;
+    let (host, removed) = rm_box_on_hosts(hosts, &args.target, args.force).await?;
     // The box is gone. Its creator withdraws the row on the VM host
     // daemon, or releases the name the zone held, as `destroy_box` does.
-    // Both are best-effort and warn on failure.
-    let control_sock =
-        vm_host_control_sock(daemon_host_kind(global), global.minimal_dir.as_deref());
+    // Both are best-effort and warn on failure. Both go to the VM that
+    // kept the box, which need not be the selected one.
+    let control_sock = box_host_control_sock(&host);
     let name = removed.name.as_deref();
     withdraw_box_row(control_sock.clone(), name, removed.box_addresses, None).await;
     release_held_box_name(control_sock, removed.id, name, removed.box_addresses).await;
@@ -685,15 +698,17 @@ pub(crate) struct RemovedBox {
 }
 
 /// Resolves the address `target` over `hosts` and reaps that box on the
-/// host that keeps it, as [`rm_listed_box`] does.
+/// host that keeps it, as [`rm_listed_box`] does. Returns that host and
+/// the box it reaped.
 pub(crate) async fn rm_box_on_hosts(
     hosts: Vec<crate::cmd::list::LocalHost>,
     target: &str,
     force: bool,
-) -> Result<RemovedBox, anyhow::Error> {
+) -> Result<(crate::cmd::list::LocalHost, RemovedBox), anyhow::Error> {
     let ResolvedBox { host, box_id } = resolve_box_on_hosts(hosts, target, "box rm").await?;
-    let mut client = box_host_client(&host).await?;
-    rm_listed_box(&mut client, box_id, target, force).await
+    let mut client = gated_box_host_client(&host).await?;
+    let removed = rm_listed_box(&mut client, box_id, target, force).await?;
+    Ok((host, removed))
 }
 
 /// Reaps the box `id`, which the address `target` resolved to, as BOX-019

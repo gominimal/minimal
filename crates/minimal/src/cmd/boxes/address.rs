@@ -525,6 +525,20 @@ pub(crate) async fn box_host_client(
     }
 }
 
+/// A client on the daemon of `host` for a verb that changes a box, such as
+/// `min box stop` and `min box rm`. Every host has its build checked, not
+/// only the selected host, so a daemon outside the supported window gets no
+/// change.
+pub(crate) async fn gated_box_host_client(
+    host: &crate::cmd::list::LocalHost,
+) -> Result<client::Client, anyhow::Error> {
+    let mut client = box_host_client(host).await?;
+    if !host.selected {
+        client::ensure_version_match(&mut client).await?;
+    }
+    Ok(client)
+}
+
 /// A client on the selected host's daemon, gated as `min box list` gates
 /// the selected host: connect with the retry window, then assert the
 /// daemon's build.
