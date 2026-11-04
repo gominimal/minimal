@@ -29621,8 +29621,12 @@ while True:
       echo "--- supervisor log ---"; cat "$tw_alpha/run.log" 2>/dev/null || true
       fail ;;
   esac
+  # The start checks the configured port itself and logs it as a skipped
+  # candidate while it is held. Only a candidate line for another port means
+  # the VM host daemon drew a substitute.
   tw_pin_skip="$(two_vm_log_since "$tw_log" "$tw_log_lines" \
-    | grep -F -- 'skipped a node-port candidate' || true)"
+    | grep -F -- 'skipped a node-port candidate' \
+    | grep -vE -- "candidate_port\"?[:=]$tw_held([^0-9]|\$)" || true)"
   if [ -n "$tw_pin_skip" ]; then
     echo "::error::the VM host daemon drew another port for the configured port $tw_held: $tw_pin_skip (NET-021)"
     fail
