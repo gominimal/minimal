@@ -488,6 +488,11 @@ fn machine_output_mode(cli: &minimal::Cli) -> bool {
         Some(minimal::Command::Box(minimal::BoxArgs {
             command: minimal::BoxCommand::Audit(args),
         })) => args.output == Some(minimal::BoxAuditOutputFormat::Jsonl),
+        // Architecture line 383: a `min box list -o json` failure is one
+        // `min/v1/error` object (BCLI-001).
+        Some(minimal::Command::Box(minimal::BoxArgs {
+            command: minimal::BoxCommand::List(args),
+        })) => args.output.is_some(),
         _ => false,
     }
 }
@@ -875,6 +880,20 @@ mod tests {
                         output,
                         follow: false,
                     }),
+                })),
+            };
+            assert_eq!(machine_output_mode(&cli), machine);
+        }
+
+        // `min box list -o json` is a machine mode, its table form is not.
+        for (output, machine) in [
+            (Some(minimal::BoxListOutputFormat::Json), true),
+            (None, false),
+        ] {
+            let cli = minimal::Cli {
+                global_args: minimal::GlobalArgs::default(),
+                command: Some(Command::Box(minimal::BoxArgs {
+                    command: minimal::BoxCommand::List(minimal::BoxListArgs { all: false, output }),
                 })),
             };
             assert_eq!(machine_output_mode(&cli), machine);
