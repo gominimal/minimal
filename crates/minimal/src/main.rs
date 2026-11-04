@@ -160,6 +160,7 @@ async fn run() -> ExitCode {
             &e,
             output_mode,
             quiet_on_closed_pipe,
+            minimal::hosts::failed_run_alias_hint(),
             &mut std::io::stderr(),
         );
     }
@@ -177,12 +178,16 @@ fn answer_failure(
     e: &anyhow::Error,
     machine_mode: bool,
     quiet_on_closed_pipe: bool,
+    alias_hint: Option<&str>,
     stderr: &mut dyn std::io::Write,
 ) -> ExitCode {
     // A task's non-zero exit (`min task run`) is a status to relay, not
     // an error to print — the task's own output already streamed through
     // (the git-remote helper's ExitCode precedent).
     if let Some(&minimal::task::TaskExit(code)) = e.downcast_ref::<minimal::task::TaskExit>() {
+        if let Some(hint) = alias_hint {
+            let _ = writeln!(stderr, "{hint}");
+        }
         return ExitCode::from(code);
     }
     // A machine-output run answers its failure with the one
@@ -195,6 +200,12 @@ fn answer_failure(
         return match machine_mode_answer(e) {
             MachineModeAnswer::Quiet => ExitCode::from(141),
             MachineModeAnswer::Object(failure) => {
+                // BCLI-042: an old spelling's hint is the object's `hint`
+                // field, with no separate line.
+                let failure = match alias_hint {
+                    Some(hint) => failure.with_alias_hint(hint),
+                    None => failure,
+                };
                 emit_machine_mode_error(stderr, &failure);
                 ExitCode::from(failure_exit_code(e))
             }
@@ -206,6 +217,9 @@ fn answer_failure(
         return ExitCode::from(141);
     }
     let _ = writeln!(stderr, "error: {e:#}");
+    if let Some(hint) = alias_hint {
+        let _ = writeln!(stderr, "{hint}");
+    }
     ExitCode::from(failure_exit_code(e))
 }
 
@@ -837,7 +851,7 @@ mod tests {
         ];
         for e in &failures {
             let mut stderr = Vec::new();
-            let code = answer_failure(e, true, false, &mut stderr);
+            let code = answer_failure(e, true, false, None, &mut stderr);
             assert_eq!(code, ExitCode::from(1));
             let text = String::from_utf8(stderr).unwrap();
             assert_eq!(text.lines().count(), 1, "one object, one line: {text}");
@@ -849,7 +863,7 @@ mod tests {
             }
 
             let mut stderr = Vec::new();
-            let code = answer_failure(e, false, false, &mut stderr);
+            let code = answer_failure(e, false, false, None, &mut stderr);
             assert_eq!(code, ExitCode::from(1));
             let text = String::from_utf8(stderr).unwrap();
             assert!(
@@ -859,12 +873,34 @@ mod tests {
         }
         let object: serde_json_lenient::Value = {
             let mut stderr = Vec::new();
-            answer_failure(&failures[0], true, false, &mut stderr);
+            answer_failure(&failures[0], true, false, None, &mut stderr);
             serde_json_lenient::from_slice(&stderr).unwrap()
         };
         assert_eq!(object["code"], "not_found");
         assert_eq!(object["message"], "no box matches 'gone'");
         assert_eq!(object["hint"], "`min box list` lists the boxes there are");
+    }
+
+    /// BCLI-042, BCLI-046: an old spelling's hint on a failed run is the
+    /// error object's `hint` field in a machine output mode, with no
+    /// separate line. The text mode prints it after its `error:` line.
+    #[test]
+    fn alias_hint_is_the_error_objects_hint() {
+        let hint = "local-minimald is now called local.";
+        let e = anyhow::anyhow!("the daemon went away");
+        let mut stderr = Vec::new();
+        answer_failure(&e, true, false, Some(hint), &mut stderr);
+        let text = String::from_utf8(stderr).unwrap();
+        assert_eq!(text.lines().count(), 1, "one object, one line: {text}");
+        let object: serde_json_lenient::Value = serde_json_lenient::from_str(&text).unwrap();
+        assert_eq!(object["hint"], hint);
+
+        let mut stderr = Vec::new();
+        answer_failure(&e, false, false, Some(hint), &mut stderr);
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            format!("error: the daemon went away\n{hint}\n")
+        );
     }
 
     #[test]
@@ -1141,7 +1177,7 @@ mod tests {
         assert_eq!(failure_exit_code(&e), 2);
 
         let mut stderr = Vec::new();
-        let code = answer_failure(&e, false, false, &mut stderr);
+        let code = answer_failure(&e, false, false, None, &mut stderr);
         assert_eq!(code, ExitCode::from(2));
         assert_eq!(
             String::from_utf8(stderr).unwrap(),
@@ -1150,7 +1186,7 @@ mod tests {
         );
 
         let mut stderr = Vec::new();
-        let code = answer_failure(&e, true, false, &mut stderr);
+        let code = answer_failure(&e, true, false, None, &mut stderr);
         assert_eq!(code, ExitCode::from(2));
         let object: serde_json_lenient::Value = serde_json_lenient::from_slice(&stderr).unwrap();
         assert_eq!(object["schema"], "min/v1/error");
