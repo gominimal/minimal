@@ -276,6 +276,12 @@ fn every_daemon_connection_is_classified() {
             // the session is gone after, to withdraw its row or release a
             // `host_ip` name hold, and which live session holds a name a
             // re-hold took over; it builds nothing a skew could half-make.
+            // `min box list` reaches every local host, split as `min ls`
+            // splits it: the selected host is the one this process ensured,
+            // so it keeps the gate. The others are probed ungated, so a
+            // skewed host still lists the boxes an operator needs to see.
+            "cmd/boxes/list.rs::list_other_host = ungated",
+            "cmd/boxes/list.rs::list_selected_host = gated",
             "cmd/boxes/vm_host.rs::box_record_by = ungated",
             "cmd/list.rs::cmd_bare = gated",
             // `min ls` reaches past the selected VM, and the two halves carry
