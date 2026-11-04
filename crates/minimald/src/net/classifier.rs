@@ -8451,6 +8451,9 @@ mod tests {
         /// Whether the two save tools report the nf_tables backend; the
         /// legacy one otherwise.
         nf_tables: bool,
+        /// Whether `nft -a --debug=netlink list ruleset` fails, as on an
+        /// nft that cannot print the netlink form.
+        netlink_fails: bool,
     }
 
     /// The stand-in host tools in `dir`, for the install's conflict scan:
@@ -8474,12 +8477,16 @@ mod tests {
             format!(
                 "#!/bin/sh\n\
                  if [ \"$1 $2\" = 'list ruleset' ]; then cat '{}'; exit 0; fi\n\
-                 if [ \"$*\" = '-a --debug=netlink list ruleset' ]; then cat '{}'; exit 0; fi\n\
+                 if [ \"$*\" = '-a --debug=netlink list ruleset' ]; then {}; fi\n\
                  if [ \"$1\" = -j ]; then exit 1; fi\n\
                  cat >/dev/null\n\
                  exit 0\n",
                 listing.display(),
-                annotated.display()
+                if tools.netlink_fails {
+                    "exit 1".to_string()
+                } else {
+                    format!("cat '{}'; exit 0", annotated.display())
+                }
             ),
         )];
         let backend = if tools.nf_tables {
@@ -8526,6 +8533,7 @@ mod tests {
                 v4: legacy,
                 v6: "",
                 nf_tables: false,
+                netlink_fails: false,
             },
         );
     }
@@ -8850,6 +8858,7 @@ mod tests {
             v4: TAILSCALE_CONNMARK_SAVE,
             v6: TAILSCALE_CONNMARK_SAVE,
             nf_tables: true,
+            netlink_fails: false,
         });
         assert!(
             installed,
@@ -8864,6 +8873,7 @@ mod tests {
             v4: "",
             v6: "",
             nf_tables: true,
+            netlink_fails: false,
         });
         assert!(!installed, "an unlisted CONNMARK is refused: {text}");
         for family in ["ip", "ip6"] {
@@ -8905,6 +8915,7 @@ mod tests {
                 v4,
                 v6,
                 nf_tables: true,
+                netlink_fails: false,
             });
             assert_eq!(
                 !installed, refused,
@@ -8925,6 +8936,42 @@ mod tests {
             }
         }
 
+        // An nft that cannot print the netlink form leaves the plain
+        // listing: Tailscale's libxtables text is decoded from its mask, and
+        // a CONNMARK libxtables could not translate is found by its text.
+        let (installed, text) = run(&HostTools {
+            ruleset: tailscale_text,
+            annotated: None,
+            v4: "",
+            v6: "",
+            nf_tables: true,
+            netlink_fails: true,
+        });
+        assert!(
+            installed,
+            "without the netlink form, Tailscale's rules still install: {text}"
+        );
+        let plain = untranslated_connmark_annotated("ip");
+        let plain = plain
+            .split("\n\n")
+            .nth(1)
+            .expect("the text half")
+            .replace(" # handle 4", "")
+            .replace(" { # handle 1", " {")
+            .replace(" { # handle 2", " {");
+        let (installed, text) = run(&HostTools {
+            ruleset: &plain,
+            annotated: None,
+            v4: "",
+            v6: "",
+            nf_tables: true,
+            netlink_fails: true,
+        });
+        assert!(
+            !installed && text.contains("table ip mangle, chain OUTPUT: counter packets 0 bytes 0 xt target \"CONNMARK\" (an iptables rule whose masks iptables-save did not list)"),
+            "without the netlink form, an untranslated CONNMARK with no listing is refused: {text}"
+        );
+
         // An IPv6-only CONNMARK with only an IPv4 listing is not covered.
         let annotated = untranslated_connmark_annotated("ip6");
         let saved =
@@ -8935,6 +8982,7 @@ mod tests {
             v4: &saved,
             v6: "",
             nf_tables: true,
+            netlink_fails: false,
         });
         assert!(
             !installed && text.contains("table ip6 mangle, chain OUTPUT: counter packets 0 bytes 0 xt target \"CONNMARK\" (an iptables rule whose masks iptables-save did not list)"),

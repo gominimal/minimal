@@ -1321,12 +1321,21 @@ ct_mark_conflicts_in() {
         # table. Where none does, a CONNMARK is refused whatever its nft
         # text says: this step cannot see which bits it keeps, so it fails
         # closed, as if the rule wrote every bit.
-        / # handle [0-9]+$/ && family != "" {
-            handle = $NF
-            key = family " " tname " " chain " " handle
-            if (key in xt) {
+        # The netlink form names the target by the handle of the rule. Without
+        # it, the nft text still names a CONNMARK libxtables could not
+        # translate ("xt target CONNMARK"); one it could translate is
+        # decoded from that text below, which is exact for it because
+        # libxtables prints a masked save only when its two masks agree.
+        family != "" && (/ # handle [0-9]+$/ || /xt target "?CONNMARK/) {
+            target = ""
+            if ($0 ~ / # handle [0-9]+$/) {
+                key = family " " tname " " chain " " $NF
+                if (key in xt) target = xt[key]
+            }
+            if (target == "" && $0 ~ /xt target "?CONNMARK/) target = "CONNMARK"
+            if (target != "") {
                 if ((family " " tname) in covered) next
-                if (xt[key] == "CONNMARK") {
+                if (target == "CONNMARK") {
                     line = $0
                     sub(/^[ \t]+/, "", line)
                     sub(/ # handle [0-9]+$/, "", line)
@@ -1495,9 +1504,12 @@ scan_ct_mark_conflicts() {
     host_ruleset="$listing"
     # The same listing with each rule's handle and its netlink form. nft
     # may write the netlink lines and the text to different streams, so
-    # both are read.
+    # both are read; a line of neither kind matches no rule of the scan.
+    # An nft that cannot print the netlink form leaves the scan the plain
+    # listing: an xt CONNMARK is then found by its text alone
+    # (ct_mark_conflicts_in), as the scan did before it read netlink.
     if ! annotated="$(nft -a --debug=netlink list ruleset 2>&1)"; then
-        die "cannot read this host's ruleset with \`nft -a --debug=netlink list ruleset\` to check the ct-mark bits $mask_hex: refusing to load a classification over a ruleset this step cannot see"
+        annotated="$listing"
     fi
     local xt_rules covered="" family saver saved hits
     xt_rules="$(printf '%s\n' "$annotated" | xt_target_rules_in)"
