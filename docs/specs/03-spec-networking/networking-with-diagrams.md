@@ -608,6 +608,8 @@ For "I just want to open this in a browser, no client install":
 - Authentication is either an **mTLS client cert** (issued by `minimal login`
   for the laptop's identity, stored in the OS keychain) or an **OIDC redirect**
   flow (browser bounces through the org's IdP and gets a session cookie).
+  Superseded: Minimal has no HTTPS reverse proxy, and `minimal login` issues no
+  client certificate ([spec 18 NET-109](../18-spec-box-networking/18-spec-box-networking.md)).
 - After auth, minimald reverse-proxies the request into its gvproxy switch to
   the target PTask, using the same hostname-routing already used by UC2a.
 - Same policy plane as option A (per-PTask ingress permissions checked at
