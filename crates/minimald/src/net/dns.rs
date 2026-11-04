@@ -3717,13 +3717,15 @@ fn listen_local_v4(line: &str, v6: bool) -> Option<Ipv4Addr> {
 /// route (NET-071), as [`Route::host_address_listener`] reads them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListenerReach {
-    /// A listener holds the port at `0.0.0.0`, `::`, an address that is not
-    /// loopback, or the dial address when that is not `127.0.0.1`. A request
-    /// to the port by the box's name reaches the box.
+    /// A listener holds the port at `0.0.0.0`, `::`, or the dial address
+    /// when that is not `127.0.0.1`, and the dial reaches it. A request to
+    /// the port by the box's name reaches the box.
     Reachable,
-    /// A listener holds the port at `127.0.0.1`, and no listener that makes
-    /// it [`ListenerReach::Reachable`] does. Such a listener can be a host
-    /// service, so the proxy refuses the request and never dials it.
+    /// A listener holds the port at `127.0.0.1`, and either the proxy dials
+    /// `127.0.0.1`, where the kernel gives the connection to that listener,
+    /// or no listener that makes it [`ListenerReach::Reachable`] does. Such
+    /// a listener can be a host service, so the proxy refuses the request
+    /// and never dials it.
     LoopbackOnly,
     /// No listener holds the port at an address the dial reaches. A request
     /// forwards and its dial fails as it did before this check.
@@ -3775,16 +3777,26 @@ fn listener_local(line: &str, v6: bool) -> Option<(IpAddr, u16)> {
 
 /// The [`ListenerReach`] of `port` from the text of the kernel's socket
 /// tables, each with whether it is the `tcp6` table. `dial` is the address
-/// the proxy connects to: a listener there is the box's own, unless `dial` is
-/// `127.0.0.1`, which host services share. A listener at any other loopback
-/// address, such as `::1` or `127.0.0.2`, is one the dial never reaches, so
-/// it counts as no listener.
+/// the proxy connects to. The kernel gives a connection to the listener at
+/// the exact dial address before a wildcard one, so the verdict follows the
+/// listener the dial reaches, never the order of the rows:
+///
+/// - When `dial` is `127.0.0.1`, which host services share, any listener
+///   there makes the port loopback-only, even beside a `0.0.0.0` or `::`
+///   listener (`SO_REUSEPORT`, or `IPV6_V6ONLY` on the `::` one).
+/// - A listener at `dial`, when `dial` is not `127.0.0.1`, is the box's own.
+/// - A listener at `0.0.0.0` or `::` is reachable.
+/// - A listener at any other address, loopback or not, such as `::1`,
+///   `127.0.0.2` or `10.0.0.5`, is one the dial never reaches. It counts as
+///   no listener, so it can never make a `127.0.0.1` listener reachable.
 fn listener_reach<'a>(
     tables: impl IntoIterator<Item = (&'a str, bool)>,
     port: u16,
     dial: Ipv4Addr,
 ) -> ListenerReach {
     let mut loopback = false;
+    let mut at_dial = false;
+    let mut wildcard = false;
     for (text, v6) in tables {
         for line in text.lines().skip(1) {
             let Some((address, listened)) = listener_local(line, v6) else {
@@ -3793,16 +3805,20 @@ fn listener_reach<'a>(
             if listened != port {
                 continue;
             }
-            let at_dial = dial != Ipv4Addr::LOCALHOST && address == IpAddr::V4(dial);
-            if address.is_unspecified() || !address.is_loopback() || at_dial {
-                return ListenerReach::Reachable;
-            }
-            if address == IpAddr::V4(Ipv4Addr::LOCALHOST) {
+            if address.is_unspecified() {
+                wildcard = true;
+            } else if address == IpAddr::V4(Ipv4Addr::LOCALHOST) {
                 loopback = true;
+            } else if address == IpAddr::V4(dial) {
+                at_dial = true;
             }
         }
     }
-    if loopback {
+    if dial == Ipv4Addr::LOCALHOST && loopback {
+        ListenerReach::LoopbackOnly
+    } else if at_dial || wildcard {
+        ListenerReach::Reachable
+    } else if loopback {
         ListenerReach::LoopbackOnly
     } else {
         ListenerReach::NoListener
@@ -3854,8 +3870,10 @@ mod tests {
     /// NET-071: a host-address route reads its port's listeners from the
     /// kernel's socket tables, at the address the proxy dials. A port that
     /// only a `127.0.0.1` listener holds is loopback-only. A port that a
-    /// `0.0.0.0`, `::` or non-loopback listener holds is reachable. A table
-    /// that cannot be read refuses, never forwards. The table text is the
+    /// `0.0.0.0` or `::` listener holds is reachable, unless a `127.0.0.1`
+    /// one that the dial reaches first also holds it. A listener at another
+    /// specific address never counts. A table that cannot be read refuses,
+    /// never forwards. The table text is the
     /// kernel's own shape, and the live half reads this process's
     /// `/proc/net/tcp`.
     #[test]
@@ -3894,9 +3912,11 @@ mod tests {
             listener_reach(tables(), 9090, node),
             ListenerReach::Reachable
         );
+        // A listener at a specific address that is not the dial address is
+        // one the dial never reaches.
         assert_eq!(
             listener_reach(tables(), 7070, node),
-            ListenerReach::Reachable
+            ListenerReach::NoListener
         );
         assert_eq!(
             listener_reach(tables(), 6060, node),
@@ -3943,6 +3963,36 @@ mod tests {
         );
         assert_eq!(
             listener_reach([(both.as_str(), false)], 8080, Ipv4Addr::LOCALHOST),
+            ListenerReach::LoopbackOnly
+        );
+        // A box listener at another address never makes a 127.0.0.1 host
+        // service on the same port reachable, in either row order. Nor does
+        // a wildcard listener beside it, since the dial reaches the
+        // 127.0.0.1 one first.
+        for rows in [
+            ["0500000A:1F90", "0100007F:1F90"],
+            ["0100007F:1F90", "0500000A:1F90"],
+            ["00000000:1F90", "0100007F:1F90"],
+            ["0100007F:1F90", "00000000:1F90"],
+        ] {
+            let table = format!("{header}{}{}", row(rows[0], "0A"), row(rows[1], "0A"));
+            assert_eq!(
+                listener_reach([(table.as_str(), false)], 8080, Ipv4Addr::LOCALHOST),
+                ListenerReach::LoopbackOnly,
+                "{rows:?}"
+            );
+        }
+        let v6only = format!(
+            "{header}{}",
+            row("00000000000000000000000000000000:1F90", "0A")
+        );
+        let host = format!("{header}{}", row("0100007F:1F90", "0A"));
+        assert_eq!(
+            listener_reach(
+                [(host.as_str(), false), (v6only.as_str(), true)],
+                8080,
+                Ipv4Addr::LOCALHOST
+            ),
             ListenerReach::LoopbackOnly
         );
 

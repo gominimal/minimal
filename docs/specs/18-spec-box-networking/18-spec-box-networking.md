@@ -611,7 +611,7 @@ box that holds it returns to `running`. These terms follow the decision in
   - IF a request through the hostname proxy targets a host-address box's port that a listener holds only at 127.0.0.1 THEN THE SYSTEM SHALL refuse it and tell the user to bind the port to 0.0.0.0.
     tier:   T0
     verify: cargo nextest run -p minimald proxy_refuses_loopback_only_host_address_port
-    <!-- unwanted; a host-address box shares loopback with its host, so a 127.0.0.1 listener can be a host service; the proxy reads the listeners from the daemon's own /proc/net/tcp, on a native daemon and inside a VM alike, and refuses before it dials; a port that a 0.0.0.0, :: or non-loopback listener holds is forwarded, and a port that nothing holds is unreachable, not refused -->
+    <!-- unwanted; a host-address box shares loopback with its host, so a 127.0.0.1 listener can be a host service; the proxy reads the listeners from the daemon's own /proc/net/tcp, on a native daemon and inside a VM alike, and refuses before it dials; a port that a 0.0.0.0 or :: listener holds is forwarded, unless a 127.0.0.1 listener also holds it, since a dial to 127.0.0.1 reaches that one first; a listener at another specific address never makes the port reachable, and a port that nothing holds is unreachable, not refused -->
 
 - **NET-135** THE SYSTEM SHALL route through the hostname proxy only HTTP/1.1 requests and CONNECT tunnels, and close a connection that opens with the HTTP/2 prior-knowledge preface.
   tier:     T0
