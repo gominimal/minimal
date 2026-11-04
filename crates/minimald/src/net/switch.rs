@@ -5103,9 +5103,17 @@ pub(crate) mod tests {
             ),
             "the refusal's audit line, in the one shared format: {logged}"
         );
-        assert!(
-            !logged.contains("network policy violation"),
-            "a refused connection's audit is the shared line, not the drop limiter's: {logged}"
+        // NET-073: beside the audit line, the refusal is the ingress
+        // violation a proxied request to the same port says.
+        assert_eq!(
+            logged
+                .lines()
+                .filter(|line| line.contains("network policy violation")
+                    && line.contains("direction=ingress")
+                    && line.contains("dst_port=9999"))
+                .count(),
+            1,
+            "a refused connection says one ingress violation line: {logged}"
         );
     }
 
