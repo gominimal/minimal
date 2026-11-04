@@ -428,20 +428,32 @@ pub enum BoxCommand {
     Audit(BoxAuditArgs),
     /// List the boxes of the current project, in any state: their id,
     /// name, type, parent, project and state, with how a stopped or exited
-    /// box ended. `--all` lists every box on this host
+    /// box ended, and the provider and host each box runs on. `--all`
+    /// lists the boxes of every project
     List(BoxListArgs),
     /// Show one box: its id, name, type, parent, project, state, how it
-    /// ended and the identity it runs under
+    /// ended, the identity it runs under, and its provider and host
     Show(BoxShowArgs),
 }
 
-// BOX-158 (BCLI-001): `min box list [--all]`.
+// BOX-158 (BCLI-001, BCLI-051): `min box list [--all] [-o json]`.
 #[derive(Debug, Args)]
 pub struct BoxListArgs {
-    /// List every box on this host, not only the boxes of the current
+    /// List the boxes of every project, not only the boxes of the current
     /// project
     #[arg(long)]
     pub all: bool,
+    /// Write the boxes as a JSON array, one object for each box, and
+    /// nothing else
+    #[arg(short = 'o', long = "output", value_enum)]
+    pub output: Option<BoxListOutputFormat>,
+}
+
+/// The rendering `min box list` writes, beside the table default.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum BoxListOutputFormat {
+    /// One JSON array of box objects
+    Json,
 }
 
 // BOX-159 (BCLI-003): `min box show <box>`.
