@@ -6656,11 +6656,14 @@ async fn unqualified_name_with_unreachable_host_exit7_names_host() {
         "{message}"
     );
     // A qualified address on a host that does not answer names that host.
+    // Its host is named, so the next step is only to ask that host again.
     let (message, code) = refused("local-minvmd/beta.local-minvmd0/web", &listings);
     assert_eq!(code, 7);
-    assert!(
-        message.starts_with("Could not reach host beta.local-minvmd0."),
-        "{message}"
+    assert_eq!(
+        message,
+        "Could not reach host beta.local-minvmd0. \
+         Box local-minvmd/beta.local-minvmd0/web is on that host if it exists. \
+         Run the command again when the host answers."
     );
 
     // The selected host that does not connect is named the same way, and
@@ -6682,6 +6685,135 @@ async fn unqualified_name_with_unreachable_host_exit7_names_host() {
             "{message}"
         );
     }
+}
+
+/// A daemon on a fresh socket with a configured box for each name in
+/// `names`, and the unselected local host `host` that it serves.
+async fn address_daemon(
+    host: &str,
+    names: &[&str],
+) -> (
+    minimald::test_harness::TestServer,
+    tempfile::TempDir,
+    tempfile::TempDir,
+    LocalHost,
+) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let sock = dir.path().join("ssh.sock");
+    let server = minimald::test_harness::TestServer::new().await;
+    server.listen_on_uds(&sock).await;
+    let project = tempfile::TempDir::new().unwrap();
+    let mut daemon = server.connect().await;
+    for name in names {
+        minimald::test_harness::create_configured_session(
+            &mut daemon,
+            name,
+            project.path().to_str().unwrap(),
+        )
+        .await;
+    }
+    let mut local = address_host(LOCAL_MINVMD_PROVIDER, host, false);
+    local.sock = sock;
+    (server, dir, project, local)
+}
+
+/// The box address refusal in `err`, as the command prints it, with the
+/// exit code the binary ends with.
+fn address_refusal(err: &anyhow::Error) -> (String, u8) {
+    let refusal = err
+        .downcast_ref::<BoxAddressRefusal>()
+        .unwrap_or_else(|| panic!("a box address refusal: {err:#}"));
+    (refusal.to_string(), refusal.exit_code())
+}
+
+/// The state `host` lists for its box named `name`.
+async fn address_state(host: &LocalHost, name: &str) -> String {
+    let mut client = client::Client::connect(&host.sock).await.unwrap();
+    list_box_records(&mut client, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.name.as_deref() == Some(name))
+        .expect("the box is listed")
+        .state
+}
+
+/// BCLI-002: `min box stop` and `min box rm` refuse a name that boxes on
+/// two hosts hold with exit 2, list each box, and change neither box.
+#[tokio::test]
+async fn ambiguous_name_across_hosts_exit2_lists_candidates_for_stop_and_rm() {
+    let (_a, _ad, _ap, alpha) = address_daemon("alpha.local-minvmd0", &["web"]).await;
+    let (_b, _bd, _bp, beta) = address_daemon("beta.local-minvmd0", &["web"]).await;
+    let hosts = vec![alpha.clone(), beta.clone()];
+
+    let mut out = Vec::new();
+    let stop = cmd::stop_box_on_hosts(hosts.clone(), &mut out, "web", false)
+        .await
+        .expect_err("stop refuses the name");
+    let rm = cmd::rm_box_on_hosts(hosts, "web", true)
+        .await
+        .expect_err("rm refuses the name");
+    for err in [stop, rm] {
+        let (message, code) = address_refusal(&err);
+        assert_eq!(code, 2, "{message}");
+        assert!(
+            message.starts_with("web matches boxes on more than one host:\n"),
+            "{message}"
+        );
+        assert!(
+            message.contains("local-minvmd/alpha.local-minvmd0/web  running")
+                && message.contains("local-minvmd/beta.local-minvmd0/web  running"),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("Name one as provider/host/name."),
+            "{message}"
+        );
+    }
+    assert!(out.is_empty(), "a refused stop prints nothing on stdout");
+    assert_eq!(address_state(&alpha, "web").await, "running");
+    assert_eq!(address_state(&beta, "web").await, "running");
+
+    // A qualified address picks the box on its host.
+    let mut out = Vec::new();
+    cmd::stop_box_on_hosts(
+        vec![alpha.clone(), beta.clone()],
+        &mut out,
+        "local-minvmd/beta.local-minvmd0/web",
+        false,
+    )
+    .await
+    .expect("the qualified stop succeeds");
+    assert_eq!(address_state(&beta, "web").await, "stopped");
+    assert_eq!(address_state(&alpha, "web").await, "running");
+}
+
+/// BCLI-002: `min box stop` and `min box rm` refuse an unqualified name
+/// with exit 7 while a host does not answer, and name that host.
+#[tokio::test]
+async fn unqualified_name_with_unreachable_host_exit7_names_host_for_stop_and_rm() {
+    let (_a, _ad, _ap, alpha) = address_daemon("alpha.local-minvmd0", &["web"]).await;
+    // The selected host has no daemon at its socket, so it does not connect.
+    let down = address_host(LOCAL_MINVMD_PROVIDER, "beta.local-minvmd0", true);
+    let hosts = vec![alpha.clone(), down];
+
+    let stop = cmd::stop_box_on_hosts(hosts.clone(), &mut Vec::new(), "web", false)
+        .await
+        .expect_err("stop refuses the name");
+    let rm = cmd::rm_box_on_hosts(hosts, "web", true)
+        .await
+        .expect_err("rm refuses the name");
+    for err in [stop, rm] {
+        let (message, code) = address_refusal(&err);
+        assert_eq!(code, 7, "{message}");
+        assert_eq!(
+            message,
+            "Could not reach host beta.local-minvmd0. Box web can be on that host, \
+             so no box was chosen. Run the command again when the host answers, \
+             or name the box as provider/host/name."
+        );
+    }
+    assert_eq!(address_state(&alpha, "web").await, "running");
 }
 
 /// BCLI-064: an address that names no box fails with exit 4 and names

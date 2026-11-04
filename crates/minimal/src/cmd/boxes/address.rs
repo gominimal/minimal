@@ -143,6 +143,17 @@ impl std::fmt::Display for BoxAddressRefusal {
                 "More than one box has an id that starts with `{start}`. Give more of the id."
             ),
             Self::Unreachable { address, hosts } => {
+                // A qualified address names its host, so the only next step
+                // is to ask that host again.
+                if let (BoxAddress::Qualified { .. }, [host]) =
+                    (parse_box_address(address), hosts.as_slice())
+                {
+                    return write!(
+                        f,
+                        "Could not reach host {host}. Box {address} is on that host \
+                         if it exists. Run the command again when the host answers."
+                    );
+                }
                 if let [host] = hosts.as_slice() {
                     write!(
                         f,
@@ -408,7 +419,16 @@ pub(crate) async fn resolve_box_on_local_hosts(
     address: &str,
     verb: &'static str,
 ) -> Result<ResolvedBox, anyhow::Error> {
-    let mut hosts = crate::cmd::list::local_hosts(global)?;
+    let hosts = crate::cmd::list::local_hosts(global)?;
+    resolve_box_on_hosts(hosts, address, verb).await
+}
+
+/// [`resolve_box_on_local_hosts`] over the local `hosts` it read.
+pub(crate) async fn resolve_box_on_hosts(
+    mut hosts: Vec<crate::cmd::list::LocalHost>,
+    address: &str,
+    verb: &'static str,
+) -> Result<ResolvedBox, anyhow::Error> {
     if let BoxAddress::Qualified { provider, host, .. } = parse_box_address(address) {
         hosts.retain(|h| h.provider == provider && h.host == host);
     }

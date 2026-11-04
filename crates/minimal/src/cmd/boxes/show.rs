@@ -44,8 +44,9 @@ pub async fn cmd_box_show(global: &GlobalArgs, args: BoxShowArgs) -> Result<(), 
 /// The id of the box `target` names in one host's `listing`, as
 /// [`match_on_host`] finds it, except that a full id that is not listed is
 /// still given back. When no box matches, the refusal names `host` and ends
-/// with `remedy`. This is the single-host lookup that `min box stop` and
-/// `min box rm` use.
+/// with `remedy`. This is the single-host lookup `min box show` used before
+/// it resolved over every host, kept for the listing tests that pin it.
+#[cfg(test)]
 pub(crate) fn find_listed_box(
     listing: &[minimald_rpc::BoxListingEntry],
     target: &str,
@@ -69,6 +70,7 @@ pub(crate) fn find_listed_box(
 /// [`find_listed_box`] gives on `host`. With several hosts, the box can be
 /// on another VM, so the refusal names `--vm`. A named VM's host is
 /// `<name>.<base>`, as `ssh_host_alias` names it.
+#[cfg(test)]
 pub(crate) fn not_found_remedy(host: &str, several_hosts: bool) -> String {
     if !several_hosts {
         return "Run `min box list --all` to see the boxes on this host.".to_owned();
