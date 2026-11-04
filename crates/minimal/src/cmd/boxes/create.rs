@@ -1413,8 +1413,8 @@ enum UploadPlan {
 
 /// The refusal when the VM gave a `host_ip` grant box an id other than the
 /// one its registration minted (BEP-082).
-const REGISTERED_ID_MISMATCH: &str = "No box was created. The VM gave the new box an id \
-     other than the one reserved for it. Run the command again.";
+const REGISTERED_ID_MISMATCH: &str = "No session was created. The VM gave the new session \
+     an id other than the one reserved for it. Run the command again.";
 
 /// Checks that the box the daemon created carries the id a `host_ip`
 /// registration minted, byte for byte (BEP-082). A box with no `host_ip`
@@ -2355,6 +2355,15 @@ pub(crate) async fn activate_box(
     // prompt tears it down instead of orphaning it in `Pending` — see
     // [`ActivationInterrupt`]. Disarmed once the session is `Active`.
     let interrupt_guard = arm_activation_interrupt(global, id);
+    // A `host_ip` box has no pair on its record, so a Ctrl-C withdraws its
+    // name by the id its registration handed back (BEP-082).
+    if let Some(box_id) = registered
+        .as_ref()
+        .filter(|registration| registration.host_ip)
+        .and_then(|registration| registration.box_id)
+    {
+        interrupt_guard.withdraw_host_ip_name_as(box_id);
+    }
 
     // Upload the project directory to the daemon so the session
     // workspace holds the user's files — `ConfigureLoadout`'s compose
@@ -3232,8 +3241,8 @@ mod tests {
             .expect_err("another id ends the activation");
         assert_eq!(
             refused.to_string(),
-            "No box was created. The VM gave the new box an id other than the one \
-             reserved for it. Run the command again."
+            "No session was created. The VM gave the new session an id other than the \
+             one reserved for it. Run the command again."
         );
         assert!(ensure_registered_id(None, other).is_ok());
         assert!(ensure_registered_id(Some(&registration(true, None)), other).is_ok());

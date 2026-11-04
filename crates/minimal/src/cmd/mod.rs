@@ -1341,6 +1341,38 @@ pub(crate) async fn upload_and_finalize(
 /// tears it down.
 pub(crate) struct ActivationInterrupt {
     task: tokio::task::JoinHandle<()>,
+    /// The id a `host_ip` registration handed back, which the handler's
+    /// withdrawal carries ([`Self::withdraw_host_ip_name_as`]).
+    host_ip_box_id: std::sync::Arc<std::sync::OnceLock<minimald_rpc::BoxId>>,
+}
+
+impl ActivationInterrupt {
+    /// Gives the handler the id a `host_ip` registration handed back. A
+    /// `host_ip` record carries no address pair, so without the id a
+    /// Ctrl-C withdraws nothing, and the host keeps the box's name until
+    /// its bound expires. With it, the handler withdraws the name as the
+    /// activation's own failure paths do (BEP-082).
+    pub(crate) fn withdraw_host_ip_name_as(&self, box_id: minimald_rpc::BoxId) {
+        let _ = self.host_ip_box_id.set(box_id);
+    }
+}
+
+/// The Ctrl-C handler's withdrawal for the aborted box's `record`: its row
+/// by the pair off the record, or a `host_ip` box's name by the id its
+/// registration handed back (`slot`). A `host_ip` record has no pair, so
+/// the id is what withdraws its name (BEP-082).
+async fn withdraw_interrupted_box(
+    control_sock: Option<PathBuf>,
+    record: &boxes::Record,
+    slot: &std::sync::OnceLock<minimald_rpc::BoxId>,
+) {
+    withdraw_box_row(
+        control_sock,
+        record.name.as_deref(),
+        record.box_addresses,
+        slot.get().copied(),
+    )
+    .await;
 }
 
 impl Drop for ActivationInterrupt {
@@ -1363,6 +1395,8 @@ pub(crate) fn arm_activation_interrupt(
     // flag would leave exactly that host's box row published.
     let control_sock =
         vm_host_control_sock(daemon_host_kind(global), global.minimal_dir.as_deref());
+    let host_ip_box_id = std::sync::Arc::new(std::sync::OnceLock::new());
+    let withdrawal_id = std::sync::Arc::clone(&host_ip_box_id);
     let task = tokio::spawn(async move {
         // Only the first Ctrl-C is intercepted; a second falls through to
         // the default disposition so a wedged cleanup can still be killed.
@@ -1391,18 +1425,15 @@ pub(crate) fn arm_activation_interrupt(
                 .oneshot_rpc::<AbortSession>(AbortSessionRequest { id: session_id })
                 .await;
             if let Some(record) = row {
-                withdraw_box_row(
-                    control_sock,
-                    record.name.as_deref(),
-                    record.box_addresses,
-                    None,
-                )
-                .await;
+                withdraw_interrupted_box(control_sock, &record, &withdrawal_id).await;
             }
         }
         std::process::exit(130);
     });
-    ActivationInterrupt { task }
+    ActivationInterrupt {
+        task,
+        host_ip_box_id,
+    }
 }
 
 /// The user-facing text for a session that could not be composed, by
@@ -1532,6 +1563,80 @@ impl SessionRpc {
 #[cfg(test)]
 mod tests {
     use crate::{SessionRpc, session_rpc_failed};
+
+    /// BEP-082: a Ctrl-C during a `host_ip` activation withdraws the box's
+    /// name with the id its registration handed back, as the activation's
+    /// failure paths do. The record has no address pair, so without the id
+    /// the handler withdraws nothing and the host keeps the name.
+    #[tokio::test]
+    async fn interrupted_host_ip_activation_withdraws_its_name_by_id() {
+        use std::io::{BufRead as _, Write as _};
+        let dir = tempfile::TempDir::new().unwrap();
+        let control_sock = dir.path().join("control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&control_sock).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            reader
+                .get_mut()
+                .write_all(b"{\"switch_address\":\"0.0.0.0\",\"loopback_address\":\"0.0.0.0\"}\n")
+                .unwrap();
+            line
+        });
+        let minted = minimald_rpc::BoxId::from_bytes(*b"0123456789abcdef");
+        let guard = super::ActivationInterrupt {
+            task: tokio::spawn(async {}),
+            host_ip_box_id: std::sync::Arc::new(std::sync::OnceLock::new()),
+        };
+        guard.withdraw_host_ip_name_as(minted);
+        let record = boxes::Record {
+            id: boxes::SessionId::from_bytes(minted.to_bytes()),
+            name: Some("web".to_string()),
+            username: None,
+            project_path: paths::HostAbsPath::try_new("/p").unwrap(),
+            network: boxes::NetworkMode::HostNet,
+            policy: boxes::BoxPolicy {
+                egress: None,
+                ingress: None,
+                credentialed_upstream: None,
+                quic443: None,
+            },
+            status: boxes::BoxState::default(),
+            reason: None,
+            exit_code: None,
+            signal: None,
+            hooks_enabled: true,
+            box_addresses: None,
+            task_addresses: Vec::new(),
+            host_ip_enforcement: None,
+            box_id: None,
+            host_row_bound: false,
+            bound_ports: std::collections::BTreeSet::new(),
+            ends_with_run: false,
+            sealed_deliveries: Vec::new(),
+            root_certificate: None,
+            box_type: None,
+            parent: None,
+            project_root: None,
+            attrs: Default::default(),
+        };
+        super::withdraw_interrupted_box(Some(control_sock), &record, &guard.host_ip_box_id).await;
+        let line = server.join().unwrap();
+        let request: minimald_rpc::BoxControlRequest =
+            serde_json_lenient::from_str(line.trim()).expect("the request is the wire type");
+        let minimald_rpc::BoxControlRequest::Withdraw(request) = request else {
+            panic!("the name goes by the withdraw verb: {request:?}");
+        };
+        assert_eq!(request.name, "web");
+        assert_eq!(
+            request.box_id,
+            Some(minted),
+            "the withdrawal carries the id"
+        );
+        assert_eq!(request.switch_address, std::net::Ipv4Addr::UNSPECIFIED);
+    }
 
     /// An RPC refused because the daemon was shutting down — the `min stop`
     /// race — surfaces as plain language, not the raw RPC chain. The
