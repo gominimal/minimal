@@ -234,7 +234,10 @@ fn answer_failure(
 /// grant undeliverable (`minimal::GrantNotDelivered`), 7 when the VM host could not
 /// be reached to register or resume an own-address box's row (provider/host
 /// unreachable, #1790), 8 when the host refused the registration for want
-/// of addresses (insufficient resources), and 1, the unspecified error,
+/// of addresses (insufficient resources), the code a box address refusal
+/// carries (`minimal::BoxAddressRefusal`: 2 when a name matches boxes on
+/// more than one host, 4 when the address names no box, 7 when a host did
+/// not answer the lookup), and 1, the unspecified error,
 /// for everything else — a refusal the host answered included. Both
 /// output modes end with the same code.
 fn failure_exit_code(e: &anyhow::Error) -> u8 {
@@ -267,6 +270,10 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
         .is_some()
     {
         return 8;
+    }
+    // BCLI-002, BCLI-064: a box address that names no single box.
+    if let Some(refused) = e.downcast_ref::<minimal::BoxAddressRefusal>() {
+        return refused.exit_code();
     }
     1
 }
@@ -986,6 +993,36 @@ mod tests {
             1,
             "one object, one line, nothing else: {line}"
         );
+    }
+
+    #[test]
+    fn box_address_refusals_exit_with_their_codes() {
+        let address = |s: &str| s.to_owned();
+        for (refusal, code) in [
+            (
+                minimal::BoxAddressRefusal::NotFound {
+                    address: address("web"),
+                },
+                4,
+            ),
+            (
+                minimal::BoxAddressRefusal::Unreachable {
+                    address: address("web"),
+                    hosts: vec![address("beta.local-minvmd0")],
+                },
+                7,
+            ),
+            (
+                minimal::BoxAddressRefusal::Ambiguous {
+                    name: address("web"),
+                    candidates: Vec::new(),
+                },
+                2,
+            ),
+        ] {
+            let err = anyhow::Error::from(refusal).context("showing the box");
+            assert_eq!(failure_exit_code(&err), code, "{err:#}");
+        }
     }
 
     /// #1790: a VM host that could not be reached ends the run with 7 —
