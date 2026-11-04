@@ -1067,7 +1067,7 @@ fn serve_request(
                 // The box is gone: its audit window ends, and the count of
                 // the records it suppressed lands now.
                 if matches!(reply, BoxControlReply::Addresses(_)) {
-                    flush_guest_audit(audit_path, &name, switch_address);
+                    flush_guest_audit(audit_path, &name, GuestAuditKey::Switch(switch_address));
                 }
                 reply
             });
@@ -1125,7 +1125,15 @@ fn serve_request(
             write_reply(stream, &reply)
         }
         (BoxControlRequest::ReleaseBoxName(request), ControlDoor::Host) => {
-            let reply = order.apply(|| release_box_name(boxes, &request.name, request.session_id));
+            let reply = order.apply(|| {
+                let reply = release_box_name(boxes, &request.name, request.session_id);
+                // A box with no switch ends with its hold: its audit window,
+                // filed by its box id, ends here too (NET-046).
+                if let Some(session_id) = request.session_id {
+                    flush_guest_audit(audit_path, &request.name, GuestAuditKey::Box(session_id));
+                }
+                reply
+            });
             write_reply(stream, &reply)
         }
         // A `host_ip` box's policy changes no zone table, so it takes no
@@ -1147,7 +1155,18 @@ fn serve_request(
             )
         }
         (BoxControlRequest::RetireHostIpBox(request), ControlDoor::Host) => {
+            // Name the box before it leaves the resident set, for the
+            // suppressed-count line its audit window can still owe.
+            let box_name = no_switch_box_name(boxes, request.session_id)
+                .unwrap_or_else(|| request.session_id.to_string());
             boxes.retire_host_ip_box(request.session_id);
+            // A host-address box has no switch: its audit window, filed by
+            // its box id, ends with it (NET-046).
+            flush_guest_audit(
+                audit_path,
+                &box_name,
+                GuestAuditKey::Box(request.session_id),
+            );
             write_reply(
                 stream,
                 &BoxControlReply::HostIpBox {
@@ -2695,25 +2714,20 @@ fn take_guest_audit(
     }
 }
 
-/// Ends a withdrawn box's audit window. The window is forgotten, so a later
-/// box at the same address starts a fresh one. The count of the records it
-/// suppressed is written now: a box that stops reporting opens no later
-/// window, so without this flush that count is never written.
-fn flush_guest_audit(audit_path: &Path, box_name: &str, switch_address: Ipv4Addr) {
+/// Ends a box's audit window when the box is gone: a withdrawn row, by its
+/// switch address, or a box with no switch, by its box id. The window is
+/// forgotten, so a later box under the same key starts a fresh one. The
+/// count of the records it suppressed is written now: a box that stops
+/// reporting opens no later window, so without this flush that count is
+/// never written, and the window, which the trim keeps while it holds a
+/// count, stays in the table.
+fn flush_guest_audit(audit_path: &Path, box_name: &str, key: GuestAuditKey) {
     let window = GUEST_AUDIT_WINDOWS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(&(
-            audit_path.to_path_buf(),
-            GuestAuditKey::Switch(switch_address),
-        ));
+        .remove(&(audit_path.to_path_buf(), key));
     if let Some(window) = window {
-        append_suppressed_audit(
-            audit_path,
-            box_name,
-            GuestAuditKey::Switch(switch_address),
-            window.suppressed,
-        );
+        append_suppressed_audit(audit_path, box_name, key, window.suppressed);
     }
 }
 
@@ -8232,6 +8246,66 @@ mod tests {
             suppressed[0].get("switch_address").is_none(),
             "a box with no switch has no row key to record: {suppressed:?}"
         );
+
+        // A box with no switch that ends writes the count its window still
+        // holds, and its window leaves the table. A host-address box ends
+        // when it retires, and a named one also when its hold is released.
+        let window_held = |box_id| {
+            GUEST_AUDIT_WINDOWS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&(audit_path.clone(), GuestAuditKey::Box(box_id)))
+        };
+        let suppressed_for = |box_id: boxes::SessionId| {
+            host_audit_records(&guest)
+                .into_iter()
+                .filter(|record| {
+                    record["event"] == "audit_suppressed" && record["box_id"] == box_id.simple()
+                })
+                .collect::<Vec<_>>()
+        };
+        // The unnamed box wrote two records: fill the rest of its cap, and
+        // pass it once.
+        for port in 2..=(GUEST_AUDIT_RECORDS_PER_WINDOW as u16) {
+            report(Some(unnamed), 7000 + port);
+        }
+        assert!(window_held(unnamed));
+        assert!(suppressed_for(unnamed).is_empty());
+        control(
+            &sock_path,
+            &BoxControlRequest::RetireHostIpBox(minimald_rpc::RetireHostIpBoxRequest {
+                session_id: unnamed,
+            }),
+        )
+        .expect("the retire is answered");
+        let flushed = suppressed_for(unnamed);
+        assert_eq!(flushed.len(), 1, "the retire writes the count: {flushed:?}");
+        assert_eq!(flushed[0]["box"], unnamed.to_string());
+        assert_eq!(flushed[0]["suppressed"], 1);
+        assert!(!window_held(unnamed), "the retired box's window is gone");
+
+        // The named box's new window holds one record: fill its cap, and
+        // pass it once.
+        for port in 1..=(GUEST_AUDIT_RECORDS_PER_WINDOW as u16) {
+            report(Some(named), 8000 + port);
+        }
+        control(
+            &sock_path,
+            &BoxControlRequest::ReleaseBoxName(HoldBoxNameRequest {
+                name: "api".to_string(),
+                session_id: Some(named),
+            }),
+        )
+        .expect("the release is answered");
+        let flushed = suppressed_for(named);
+        assert_eq!(
+            flushed.len(),
+            2,
+            "the release writes the count: {flushed:?}"
+        );
+        assert_eq!(flushed[1]["box"], "api");
+        assert_eq!(flushed[1]["suppressed"], 1);
+        assert!(!window_held(named), "the released box's window is gone");
 
         // An older guest's report: a switch address, and no box id.
         let old = parse_request(
