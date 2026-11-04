@@ -951,6 +951,10 @@ box that holds it returns to `running`. These terms follow the decision in
   tier:     T0
   verify:   cargo nextest run -p minimal retired_surfaces_absent
   <!-- S18/AC1; prose 70; ubiquitous; retires the surface, not a verb: `min login` is the GitHub sign-in, the alias for `min auth login` the Box Egress Proxy document binds; identity-plane certificates for remote attach are CRA's -->
+  - WHEN `min` runs on a host whose Minimal config directory holds the retired proxy's `client.pem`, `client.key` or `ca.pem` THE SYSTEM SHALL delete them, recording each deletion in the log and printing nothing.
+    tier:   T0
+    verify: cargo nextest run -p paths retired_proxy_credentials_removed_from_config_dir
+    <!-- S17; event-driven; the CLI runs the removal beside the legacy host-dir migration on every command, so the first command after an upgrade deletes the files and later commands find nothing to delete -->
 
 - **NET-110** THE SYSTEM SHALL serve SSH direct-tcpip channel requests in release builds.
   tier:     T0
