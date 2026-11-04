@@ -6480,8 +6480,10 @@ fn local_provider_and_host_names() {
     );
     let state = state_with_host_dirs(&[
         "local-minimald1",
+        "local-minimald01",
         "local-minimald0",
         "local-minvmd0",
+        "local-minvmd00",
         "local-minvmd0/alpha",
         "local-minvmd0/Not_A_VM",
         "local-minvmd0/guest",

@@ -116,7 +116,10 @@ pub fn host_for_dir_name(dir_name: &str) -> Option<(LocalProvider, u32, String)>
         if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
-        rest.parse().ok()
+        // A number with a leading zero is no instance: `local-minimald01`
+        // would name the same host as `local-minimald1`.
+        let n: u32 = rest.parse().ok()?;
+        (n.to_string() == rest).then_some(n)
     };
     if let Some(rest) = dir_name.strip_prefix("local-minimald") {
         let n = parse(rest)?;
@@ -165,7 +168,15 @@ pub fn local_hosts(minimal_dir: Option<&Path>) -> std::io::Result<Vec<LocalHost>
         };
         if let Some((provider, instance, name)) = host_for_dir_name(&file_name) {
             if provider == LocalProvider::LocalMinvmd {
-                hosts.extend(named_vms(&entry.path(), instance)?);
+                // One unreadable VM host directory hides its named VMs
+                // only, never the other hosts.
+                match named_vms(&entry.path(), instance) {
+                    Ok(vms) => hosts.extend(vms),
+                    Err(e) => tracing::debug!(
+                        dir = %entry.path().display(),
+                        "named VMs not read: {e:#}"
+                    ),
+                }
             }
             hosts.push(LocalHost {
                 name,
