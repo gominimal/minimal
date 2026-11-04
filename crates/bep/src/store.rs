@@ -635,7 +635,12 @@ fn entry_admits(entry: &str, proxy: &str) -> bool {
             && !index.is_empty()
         {
             let path = rest.strip_suffix(" (OK)").unwrap_or(rest);
-            listed |= path == proxy;
+            // The dump prints a bundled proxy as its bundle: the `.app`
+            // directory that holds the binary the resolver hands us.
+            listed |= path == proxy
+                || proxy
+                    .strip_prefix(path)
+                    .is_some_and(|tail| tail.starts_with("/Contents/MacOS/"));
         }
     }
     decrypt && listed
@@ -1395,6 +1400,71 @@ mod tests {
             assert!(err.to_string().contains("is not a name a secret can have"));
         }
         keychain_add_line("claude", b"v", proxy).expect("valid");
+    }
+
+    // An installed proxy runs from a bundle, and `security -T` records the
+    // bundle: `dump-keychain -a` then prints the bundle's path, with the
+    // designated-requirement line under it, and never the inner binary. A
+    // listing must still admit the bundle's own proxy, and neither a
+    // directory on its path nor another bundle.
+    #[test]
+    fn secret_item_acl_admits_a_bundled_proxy() {
+        let proxy = Path::new("/Users/me/.local/bin/bep.app/Contents/MacOS/bep");
+        let dump = "keychain: \"/Users/me/Library/Keychains/login.keychain-db\"
+class: \"genp\"
+attributes:
+    \"acct\"<blob>=\"claude\"
+    \"svce\"<blob>=\"dev.minimal.secret\"
+access: 1 entries
+    entry 0:
+        authorizations (6): decrypt derive export_clear export_wrapped mac sign
+        don't-require-password
+        description: Minimal secret claude
+        applications (1):
+            0: /Users/me/.local/bin/bep.app (OK)
+            requirement: identifier \"dev.minimal.bep\" and anchor apple generic and certificate leaf[subject.CN] = \"Minimal\"
+keychain: \"/Users/me/Library/Keychains/login.keychain-db\"
+class: \"genp\"
+attributes:
+    \"acct\"<blob>=\"other\"
+    \"svce\"<blob>=\"dev.minimal.secret\"
+access: 1 entries
+    entry 0:
+        authorizations (6): decrypt derive export_clear export_wrapped mac sign
+        don't-require-password
+        description: Minimal secret other
+        applications (1):
+            0: /Applications/Other.app (OK)
+keychain: \"/Users/me/Library/Keychains/login.keychain-db\"
+class: \"genp\"
+attributes:
+    \"acct\"<blob>=\"partial\"
+    \"svce\"<blob>=\"dev.minimal.secret\"
+access: 1 entries
+    entry 0:
+        authorizations (6): decrypt derive export_clear export_wrapped mac sign
+        don't-require-password
+        description: Minimal secret partial
+        applications (1):
+            0: /Users/me/.local/bin (OK)
+";
+        assert_eq!(
+            parse_dump(dump, proxy),
+            vec![
+                ItemInfo {
+                    id: "claude".into(),
+                    proxy_access: true
+                },
+                ItemInfo {
+                    id: "other".into(),
+                    proxy_access: false
+                },
+                ItemInfo {
+                    id: "partial".into(),
+                    proxy_access: false
+                },
+            ]
+        );
     }
 
     /// The BEP-051 leg on a real keychain: set, list, set again and remove
