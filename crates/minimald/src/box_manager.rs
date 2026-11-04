@@ -1015,7 +1015,7 @@ fn box_listing_entry(record: &boxes::Record, pty_enabled: bool) -> minimald_rpc:
 /// `io.pty_enabled`, as the PTY check of a resume reads it (BOX-030). A box
 /// filed with no spec has only its Box Type to go by, and a session has a
 /// terminal, as the resume reads it too.
-fn record_has_pty(record: &boxes::Record, stored_spec: Option<&[u8]>) -> bool {
+pub(crate) fn record_has_pty(record: &boxes::Record, stored_spec: Option<&[u8]>) -> bool {
     match stored_spec {
         Some(bytes) => crate::box_runtime::stored_spec_sets_pty(bytes),
         None => record
