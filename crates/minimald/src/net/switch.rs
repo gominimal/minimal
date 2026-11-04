@@ -1602,7 +1602,17 @@ pub struct BoxGate {
     host_protocols: Option<Vec<u8>>,
     /// The flows this box opened to a host exposure, so a segment of one
     /// whose exposure was removed ends the flow (NET-161).
-    host_flows: Mutex<HashMap<HostFlowKey, Instant>>,
+    host_flows: Mutex<HashMap<HostFlowKey, HostFlow>>,
+}
+
+/// What the gate holds for one flow to a host exposure.
+#[derive(Debug, Clone, Copy)]
+struct HostFlow {
+    /// When a frame of the flow was last admitted.
+    seen: Instant,
+    /// Whether a FIN went either way. A closing flow stays tracked, so a
+    /// removal still ends it, but the sweep at the bound drops it first.
+    closing: bool,
 }
 
 /// One flow from a box to a host exposure: the protocol, the box's port and
@@ -2068,6 +2078,7 @@ impl BoxGate {
             .is_none_or(|list| list.contains(&pkt.proto));
         if opens && self.names_host && declared {
             if self.record_host_flow(key) {
+                self.observe_host_flow_flags(key, &pkt);
                 return HostAliasVerdict::Admit;
             }
             // NET-161: an untracked flow gets no reset on removal, so the
@@ -2110,6 +2121,7 @@ impl BoxGate {
         }
         let holder = self.minimal_listener_at(pkt.proto, port);
         if holder.is_none() && table.current().opens(pkt.proto, port) {
+            self.observe_host_flow_flags(key, &pkt);
             return HostAliasVerdict::Admit;
         }
         if pkt.is_tcp() && pkt.carries_ack() && !pkt.carries_reset() {
@@ -2155,23 +2167,60 @@ impl BoxGate {
     }
 
     /// Tracks `key` and says whether it is tracked. A new flow past
-    /// [`HOST_FLOWS_PER_BOX`] is not, once idle flows are dropped.
+    /// [`HOST_FLOWS_PER_BOX`] is not, once closing and idle flows are
+    /// dropped.
     fn record_host_flow(&self, key: HostFlowKey) -> bool {
         let now = Instant::now();
         let mut flows = self
             .host_flows
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if flows.len() >= HOST_FLOWS_PER_BOX && !flows.contains_key(&key) {
-            flows.retain(|_, seen| {
-                now.saturating_duration_since(*seen) < egress::REPLY_TCP_IDLE_CAP
+        if let Some(flow) = flows.get_mut(&key) {
+            flow.seen = now;
+            return true;
+        }
+        if flows.len() >= HOST_FLOWS_PER_BOX {
+            // NET-161: a closed flow holds no place, so short connections
+            // never fill the bound while the table opens the port.
+            flows.retain(|_, flow| {
+                !flow.closing
+                    && now.saturating_duration_since(flow.seen) < egress::REPLY_TCP_IDLE_CAP
             });
             if flows.len() >= HOST_FLOWS_PER_BOX {
                 return false;
             }
         }
-        flows.insert(key, now);
+        flows.insert(
+            key,
+            HostFlow {
+                seen: now,
+                closing: false,
+            },
+        );
         true
+    }
+
+    /// Follows an admitted TCP segment of the tracked flow `key`, either
+    /// way. A reset ends the flow, so its entry goes. A FIN marks the flow
+    /// closing: the last ACK still finds it, and the sweep at the bound
+    /// drops it. A bare SYN on the same ports is a new flow, which is open.
+    fn observe_host_flow_flags(&self, key: HostFlowKey, pkt: &L4Packet) {
+        if !pkt.is_tcp() {
+            return;
+        }
+        let mut flows = self
+            .host_flows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pkt.carries_reset() {
+            flows.remove(&key);
+        } else if let Some(flow) = flows.get_mut(&key) {
+            if pkt.tcp_flags & refusal::TCP_FIN != 0 {
+                flow.closing = true;
+            } else if pkt.is_bare_syn() {
+                flow.closing = false;
+            }
+        }
     }
 
     fn tracks_host_flow(&self, key: HostFlowKey) -> bool {
@@ -5598,6 +5647,51 @@ pub(crate) mod tests {
         assert!(reaches_switch(&mut harness, &tracked).await);
         let late = host_flow_segment(SocketAddrV4::new(LEASE, 42000), host, SYN, 7000, 0);
         assert!(!reaches_switch(&mut harness, &late).await);
+    }
+
+    /// NET-161's flow bound counts the flows that are still open. A box
+    /// that opens and closes more short connections than the bound holds,
+    /// some closed with FINs and some with a reset, still opens the next
+    /// flow to a port the table opens.
+    #[test]
+    fn native_own_ip_closed_host_flows_do_not_fill_the_flow_bound() {
+        const FIN: u8 = refusal::TCP_FIN;
+        let dir = tempfile::tempdir().unwrap();
+        let table = host_exposures_in(dir.path(), "[host-exposures.web]\nport = 8080\n");
+        let named = host_exposure_policy(Some(vec!["host.min.internal"]), Vec::new());
+        let subnet = SwitchSubnet::default();
+        let gate = BoxGate::for_session(LEASE.to_string(), LEASE, &named, subnet, None);
+        gate.use_host_exposures(table);
+        let host = SocketAddrV4::new(subnet.host_alias(), 8080);
+        let egress = |frame: &[u8]| gate.host_alias_egress(&egress::summarize(frame), frame);
+
+        for n in 0..=HOST_FLOWS_PER_BOX {
+            let client = SocketAddrV4::new(LEASE, 10000 + u16::try_from(n).unwrap());
+            let syn = host_flow_segment(client, host, SYN, 1000, 0);
+            assert_eq!(egress(&syn), HostAliasVerdict::Admit, "flow {n} opens");
+            if n % 2 == 0 {
+                // The box closes first, the host closes too, and the box's
+                // last ACK still finds the flow.
+                let fin = host_flow_segment(client, host, FIN | ACK, 1001, 5001);
+                assert_eq!(egress(&fin), HostAliasVerdict::Admit);
+                let host_fin = host_flow_segment(host, client, FIN | ACK, 5001, 1002);
+                assert_eq!(gate.host_alias_ingress(&host_fin), HostAliasVerdict::Admit);
+                let last = host_flow_segment(client, host, ACK, 1002, 5002);
+                assert_eq!(egress(&last), HostAliasVerdict::Admit);
+            } else {
+                // The host refuses the connection with a reset.
+                let reset = host_flow_segment(host, client, RST | ACK, 0, 1001);
+                assert_eq!(gate.host_alias_ingress(&reset), HostAliasVerdict::Admit);
+                assert!(!gate.tracks_host_flow((IPPROTO_TCP, client.port(), 8080)));
+            }
+        }
+
+        let next = host_flow_segment(SocketAddrV4::new(LEASE, 42000), host, SYN, 7000, 0);
+        assert_eq!(
+            egress(&next),
+            HostAliasVerdict::Admit,
+            "closed flows hold no place under the bound"
+        );
     }
 
     /// NET-161's removal clause on a switch carved from the default block:
