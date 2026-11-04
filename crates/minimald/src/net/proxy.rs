@@ -205,6 +205,15 @@ impl HostRoute for std::sync::RwLock<HostnameRegistry> {
     }
 }
 
+/// The rule a loopback-only refusal names in its `network policy violation`
+/// line (NET-071).
+pub const LOOPBACK_ONLY_LISTENER_RULE: &str = "loopback-only listener";
+
+/// The body of a loopback-only refusal (NET-071): a request by a host-address
+/// box's name to a port that only a 127.0.0.1 listener holds.
+pub const LOOPBACK_ONLY_LISTENER_REASON: &str =
+    "The box listens on this port at 127.0.0.1 only. Bind it to 0.0.0.0 to reach it by name.";
+
 /// The admit-or-drop decision every proxied request is put to before the
 /// proxy dials anything (NET-069, NET-070, NET-071) — the relay's own verdict,
 /// [`super::switch::proxied_request_verdict`], so the hostname-routing surface
@@ -735,6 +744,35 @@ where
             return write_refusal_status(&mut client, "403 Forbidden", reason).await;
         }
     };
+    // NET-071: a host-address box shares loopback with the host, so a port
+    // that only a 127.0.0.1 listener holds can be a host service. It is
+    // refused here, before anything is dialed, so a box's name never reaches
+    // it. The socket tables are read on the blocking pool.
+    let probe = route.clone();
+    let reach = crate::traced::spawn_blocking(move || probe.host_address_listener(port))
+        .await
+        .ok()
+        .flatten();
+    if reach == Some(super::dns::ListenerReach::LoopbackOnly) {
+        tracing::warn!(
+            component = "dns-proxy",
+            host,
+            session = route.session(),
+            caller = caller.as_ref().map_or("none", super::dns::Caller::name),
+            port,
+            route_source = super::dns::RouteSource::Ungated.as_str(),
+            direction = %Direction::Ingress,
+            remote_addr = "none",
+            proto = "tcp",
+            dst_port = port,
+            rule_matched = LOOPBACK_ONLY_LISTENER_RULE,
+            reason = LOOPBACK_ONLY_LISTENER_REASON,
+            status = "403 Forbidden",
+            "network policy violation"
+        );
+        return write_refusal_status(&mut client, "403 Forbidden", LOOPBACK_ONLY_LISTENER_REASON)
+            .await;
+    }
     // One line per admitted request, naming why the target's route carries
     // the port: its declaration, a runtime publish, or a host-address box
     // that gates nothing. At `info`, so the daemon's default filter keeps
@@ -1662,14 +1700,16 @@ fn log_refusal(host: Option<&str>, reason: &str, status: &str) {
     }
 }
 
-/// Spawns a one-shot loopback backend that answers every connection with a
-/// fixed `200 OK` and closes, returning the port it listens on. Test-only:
+/// Spawns a one-shot backend that answers every connection with a fixed
+/// `200 OK` and closes, returning the port it listens on. It listens at
+/// `0.0.0.0`, as a host-address box must for its name to reach it (NET-071),
+/// and the proxy dials it on loopback. Test-only:
 /// this module's own tests use it for the routes a request names, and the
 /// rpc module's tests use it to drive one request through the daemon's own
 /// proxy (NET-019's daemon-side proof).
 #[cfg(test)]
 pub(crate) async fn spawn_backend() -> u16 {
-    let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let backend = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
     let port = backend.local_addr().unwrap().port();
     crate::traced::spawn(async move {
         while let Ok((mut sock, _)) = backend.accept().await {
@@ -1960,6 +2000,75 @@ mod tests {
         );
     }
 
+    /// NET-071: a request by a host-address box's name to a port that only a
+    /// `127.0.0.1` listener holds is refused `403 Forbidden` before anything
+    /// is dialed. The body tells the user to bind the port to `0.0.0.0`, and
+    /// the `network policy violation` line names the rule. The listener never
+    /// sees a connection, so a host service on loopback is never reached by a
+    /// box's name. The same port at `0.0.0.0` is forwarded.
+    #[tokio::test]
+    async fn proxy_refuses_loopback_only_host_address_port() {
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let host_service = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let host_port = host_service.local_addr().unwrap().port();
+
+        let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, false);
+        reg.register_host_net(SessionId::nil(), "web");
+        let router = Router::new(Arc::new(reg), proxied_request_verdict);
+        let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        crate::traced::spawn(serve(proxy, router));
+
+        let refused = proxy_get(proxy_addr, &format!("web.min.internal:{host_port}")).await;
+        assert!(
+            refused.starts_with("HTTP/1.1 403 Forbidden"),
+            "a loopback-only port is refused, got: {refused}"
+        );
+        assert!(
+            refused.ends_with(LOOPBACK_ONLY_LISTENER_REASON),
+            "the refusal's body tells the user to bind to 0.0.0.0, got: {refused}"
+        );
+        assert_eq!(
+            LOOPBACK_ONLY_LISTENER_REASON,
+            "The box listens on this port at 127.0.0.1 only. Bind it to 0.0.0.0 to reach it by name."
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), host_service.accept())
+                .await
+                .is_err(),
+            "the proxy never dials the 127.0.0.1 listener"
+        );
+
+        // The same box's port at 0.0.0.0 is forwarded.
+        let backend = spawn_backend().await;
+        let forwarded = proxy_get(proxy_addr, &format!("web.min.internal:{backend}")).await;
+        assert!(
+            forwarded.contains("200 OK"),
+            "a port a 0.0.0.0 listener holds is forwarded, got: {forwarded}"
+        );
+
+        drop(_guard);
+        let logged = buf.contents();
+        let line = logged
+            .lines()
+            .find(|line| line.contains("network policy violation"))
+            .unwrap_or_else(|| panic!("a refusal line is logged, got: {logged}"));
+        assert!(
+            line.contains(r#"rule_matched="loopback-only listener""#),
+            "the refusal line names the rule, got: {line}"
+        );
+        assert!(
+            line.contains(r#"session="web""#) && line.contains(&format!("port={host_port}")),
+            "the refusal line names the box and the port, got: {line}"
+        );
+    }
+
     /// NET-002: the deprecated three-label name still routes to the same entry
     /// as the two-label one, and each request to it emits the deprecation info
     /// line naming the two-label form.
@@ -2123,12 +2232,17 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test(start_paused = true)]
     async fn proxy_answers_504_when_the_upstream_dial_stalls() {
+        // At 0.0.0.0, as a host-address box must listen to be reached by
+        // name (NET-071), and dialed on loopback.
         let stalled = TcpSocket::new_v4().unwrap();
         stalled
-            .bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
             .unwrap();
         let stalled = stalled.listen(0).unwrap();
-        let stalled_addr = stalled.local_addr().unwrap();
+        let stalled_addr = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            stalled.local_addr().unwrap().port(),
+        );
 
         // Fill the accept queue (nothing accepts) until a dial stalls. These
         // are blocking std dials on real time, untouched by the paused clock.
@@ -2580,7 +2694,7 @@ mod tests {
     #[tokio::test]
     async fn forward_proxy_rewrites_absolute_form_target_to_origin_form() {
         // A backend that records the request head it received, then answers 200.
-        let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let backend = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
         let backend_port = backend.local_addr().unwrap().port();
         let received = Arc::new(Mutex::new(Vec::new()));
         let received_bg = Arc::clone(&received);
@@ -2633,7 +2747,7 @@ mod tests {
     /// URI authority, and the upstream receives the origin-form request line.
     #[tokio::test]
     async fn absolute_form_uri_authority_overrides_host_header() {
-        let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let backend = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
         let backend_port = backend.local_addr().unwrap().port();
         let received = Arc::new(Mutex::new(Vec::new()));
         let received_bg = Arc::clone(&received);
@@ -3056,7 +3170,7 @@ mod tests {
     /// rather than the client getting an empty, reset connection.
     #[tokio::test]
     async fn bare_lf_response_is_passed_through_when_the_upstream_closes() {
-        let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let backend = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
         let backend_port = backend.local_addr().unwrap().port();
         crate::traced::spawn(async move {
             let (mut sock, _) = backend.accept().await.unwrap();
@@ -3087,7 +3201,7 @@ mod tests {
     #[tokio::test]
     async fn proxy_adds_connection_close_when_upstream_omits_it() {
         // A backend that answers without a `Connection` header.
-        let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let backend = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
         let backend_port = backend.local_addr().unwrap().port();
         crate::traced::spawn(async move {
             while let Ok((mut sock, _)) = backend.accept().await {
@@ -3133,7 +3247,7 @@ mod tests {
     async fn proxy_passes_websocket_upgrade_through() {
         // A backend that answers a websocket upgrade with `101` and then
         // echoes back whatever the client sends after the upgrade.
-        let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let backend = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
         let backend_port = backend.local_addr().unwrap().port();
         crate::traced::spawn(async move {
             while let Ok((mut sock, _)) = backend.accept().await {
@@ -3223,7 +3337,7 @@ mod tests {
         answer_on: &'static [u8],
         interim: bool,
     ) -> (u16, Arc<Mutex<Vec<u8>>>) {
-        let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let backend = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
         let port = backend.local_addr().unwrap().port();
         let received = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&received);
@@ -3467,7 +3581,7 @@ mod tests {
     /// port is a listener nothing answers on, returning the response, the
     /// log lines, and whether the proxy dialed the box at all.
     async fn drive_toward_unanswered_box(head: impl Fn(u16) -> String) -> (String, String, bool) {
-        let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let upstream = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
         let port = upstream.local_addr().unwrap().port();
         let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, false);
         reg.register_host_net(SessionId::nil(), "web");
@@ -5640,11 +5754,11 @@ mod tests {
         (buf, guard)
     }
 
-    /// Spawns a loopback backend that records every request head it receives
+    /// Spawns a backend at `0.0.0.0` that records every request head it receives
     /// and answers each connection with `200 OK`, returning the port it
     /// listens on and the shared buffer the heads land in.
     async fn spawn_recording_backend() -> (u16, Arc<Mutex<Vec<u8>>>) {
-        let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let backend = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
         let port = backend.local_addr().unwrap().port();
         let received = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&received);
