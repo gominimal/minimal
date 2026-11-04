@@ -7151,17 +7151,20 @@ mod tests {
         });
 
         // The refusal closes without reading the request line, so a
-        // client's write can lose the race to the close (a broken pipe):
-        // the reply already written is still read. `None` is a connection
-        // whose reply could not be read at all.
+        // client's write can lose the race to the close: Linux reports
+        // that lost write as a broken pipe, macOS as a socket that is
+        // not connected. The reply already written is still read.
+        // `None` is a connection whose reply could not be read at all.
         let control_past_cap = |request: &BoxControlRequest| -> Option<BoxControlReply> {
             let mut stream = TestStream::connect(&sock_path).expect("socket accepts");
             let mut line = serde_json_lenient::to_string(request).expect("request serializes");
             line.push('\n');
             if let Err(error) = stream.write_all(line.as_bytes()) {
-                assert_eq!(
-                    error.kind(),
-                    std::io::ErrorKind::BrokenPipe,
+                assert!(
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::NotConnected
+                    ),
                     "write: {error}"
                 );
             }
