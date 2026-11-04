@@ -83,17 +83,21 @@ const HEAD_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// the client would wait out the kernel's SYN retries (about two minutes).
 const UPSTREAM_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How many socket owner lookups (each a walk of `/proc`) run at once across
-/// the daemon, for connections to the proxy from the node's address (NET-070).
-const OWNER_LOOKUPS: usize = 4;
+/// How often, at most, the proxy walks `/proc` for the owners of the
+/// connections from the node's address (NET-070). Every connection that waits
+/// when a walk starts is answered by that walk.
+const OWNER_WALK_INTERVAL: Duration = Duration::from_secs(1);
 
-/// The slots [`OWNER_LOOKUPS`] counts, shared by every listener the daemon
-/// runs, so the blocking pool never holds more than that many walks.
-static OWNER_LOOKUP_SLOTS: tokio::sync::Semaphore =
-    tokio::sync::Semaphore::const_new(OWNER_LOOKUPS);
+/// How many connections can wait on the shared owner walk at once. A
+/// connection past this is refused as a caller the proxy cannot name, so a
+/// burst from one box holds at most this many waiting, and every one of them
+/// is answered by the next walk. The proxy cannot tell which box opened a
+/// connection before the walk names it, so while one box holds every place,
+/// another box's connection is refused until the next walk takes the batch.
+const OWNER_LOOKUP_WAITING: usize = 64;
 
-/// How long a connection waits for an owner lookup slot before the proxy
-/// stops waiting and refuses it as a caller it cannot name.
+/// How long a connection waits for the shared owner walk to answer it before
+/// the proxy stops waiting and refuses it as a caller it cannot name.
 const OWNER_LOOKUP_WAIT: Duration = Duration::from_secs(5);
 
 /// The host-side lookup the proxy performs for each request: a `Host:`-header
@@ -229,6 +233,53 @@ pub type SharedVerdict = fn(Option<&super::dns::Caller>, &super::dns::Route, u16
 /// tables and the holder's cgroup.
 pub type SocketOwner = fn(SocketAddrV4, SocketAddrV4) -> super::dns::ConnectingOwner;
 
+/// Names the owners of many connections from the node's address in one
+/// pass: one answer for each `(peer, local)` pair, in order. The production
+/// lookup is [`super::dns::connecting_boxes`], which reads the socket tables
+/// once and walks `/proc/*/fd` once for all the pairs.
+pub type SocketOwners = fn(&[(SocketAddrV4, SocketAddrV4)]) -> Vec<super::dns::ConnectingOwner>;
+
+/// How many of one walk's per-pair owner lookups run at once, when the
+/// lookup names one connection at a time.
+const OWNER_LOOKUPS: usize = 4;
+
+/// The owners of `pairs` from `owner`, one pair at a time, on at most
+/// [`OWNER_LOOKUPS`] threads. Only a test that replaces the lookup with
+/// [`Router::with_socket_owner`] asks one pair at a time. Production asks
+/// [`super::dns::connecting_boxes`] for every pair at once.
+fn owners_one_by_one(
+    owner: SocketOwner,
+    pairs: &[(SocketAddrV4, SocketAddrV4)],
+) -> Vec<super::dns::ConnectingOwner> {
+    if pairs.len() <= 1 {
+        return pairs
+            .iter()
+            .map(|(peer, local)| owner(*peer, *local))
+            .collect();
+    }
+    let chunk = pairs.len().div_ceil(OWNER_LOOKUPS);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = pairs
+            .chunks(chunk)
+            .map(|part| {
+                scope.spawn(move || {
+                    part.iter()
+                        .map(|(peer, local)| owner(*peer, *local))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| vec![super::dns::ConnectingOwner::Unknown; chunk])
+            })
+            .collect()
+    })
+}
+
 /// Who a proxied connection came from, named when the proxy accepts it.
 enum CallerLookup {
     /// A box, with the egress rules its request is put to.
@@ -239,6 +290,151 @@ enum CallerLookup {
     /// name while a host-address box is live. It can be that box's, so the
     /// proxy refuses it rather than leave it ungated.
     Unattributed,
+    /// A connection from the node's address that got no owner lookup: it
+    /// came while [`OWNER_LOOKUP_WAITING`] connections waited on the shared
+    /// walk, or the walk did not answer in time. `waiting` is how many
+    /// connections waited then. The proxy refuses it as
+    /// [`Self::Unattributed`].
+    NoLookup { waiting: usize },
+}
+
+/// The connections waiting on the next shared owner walk, each with the
+/// channel its answer goes back on.
+type Waiting = Vec<(
+    SocketAddrV4,
+    SocketAddrV4,
+    tokio::sync::oneshot::Sender<super::dns::ConnectingOwner>,
+)>;
+
+/// The shared owner walk (NET-070): one task walks `/proc` for every
+/// connection waiting when it starts, at most once each
+/// [`OWNER_WALK_INTERVAL`], so concurrent connections share one walk instead
+/// of a walk each.
+struct OwnerWalk {
+    /// The connections waiting on the next walk, whether a walk task runs,
+    /// and when the last walk started.
+    state: std::sync::Mutex<OwnerWalkState>,
+    /// How many walks ran, for the debug line each walk logs.
+    walks: std::sync::atomic::AtomicUsize,
+}
+
+/// What a shared walk asks for the owners of its connections.
+#[derive(Clone, Copy)]
+enum OwnerSource {
+    /// One connection at a time ([`owners_one_by_one`]).
+    One(SocketOwner),
+    /// Every connection of the walk at once.
+    Batch(SocketOwners),
+}
+
+#[derive(Default)]
+struct OwnerWalkState {
+    waiting: Waiting,
+    walking: bool,
+    last_walk: Option<tokio::time::Instant>,
+}
+
+impl OwnerWalk {
+    fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(OwnerWalkState::default()),
+            walks: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, OwnerWalkState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The owner of the connection from `peer` to `local`, from the next
+    /// shared walk. `Err(waiting)` when the connection got no answer: it
+    /// came while [`OWNER_LOOKUP_WAITING`] connections waited, or no walk
+    /// answered it within [`OWNER_LOOKUP_WAIT`]. `waiting` counts the
+    /// connections that waited on the walk then.
+    async fn lookup(
+        self: &Arc<Self>,
+        owner: OwnerSource,
+        peer: SocketAddrV4,
+        local: SocketAddrV4,
+    ) -> Result<super::dns::ConnectingOwner, usize> {
+        let answer = {
+            let mut state = self.state();
+            // A connection that timed out or went away dropped its receiver.
+            // Its entry no longer holds a place under the cap.
+            state.waiting.retain(|(_, _, tx)| !tx.is_closed());
+            if state.waiting.len() >= OWNER_LOOKUP_WAITING {
+                return Err(state.waiting.len());
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            state.waiting.push((peer, local, tx));
+            if !state.walking {
+                state.walking = true;
+                // The walk answers other connections than this one, so it
+                // outlives this connection's request.
+                crate::traced::spawn_detached(
+                    tracing::debug_span!(parent: None, "proxy.owner_walk"),
+                    Arc::clone(self).walk(owner),
+                );
+            }
+            rx
+        };
+        match tokio::time::timeout(OWNER_LOOKUP_WAIT, answer).await {
+            Ok(Ok(found)) => Ok(found),
+            _ => Err(self.state().waiting.len()),
+        }
+    }
+
+    /// The walk task: while connections wait, waits out the rest of
+    /// [`OWNER_WALK_INTERVAL`] since the last walk, then takes every waiting
+    /// connection and answers them all from one pass on the blocking pool.
+    async fn walk(self: Arc<Self>, owner: OwnerSource) {
+        loop {
+            let last = self.state().last_walk;
+            if let Some(last) = last {
+                tokio::time::sleep_until(last + OWNER_WALK_INTERVAL).await;
+            }
+            let batch = {
+                let mut state = self.state();
+                if state.waiting.is_empty() {
+                    state.walking = false;
+                    return;
+                }
+                state.last_walk = Some(tokio::time::Instant::now());
+                let mut batch = std::mem::take(&mut state.waiting);
+                // No walk work for a connection that stopped waiting.
+                batch.retain(|(_, _, tx)| !tx.is_closed());
+                batch
+            };
+            if batch.is_empty() {
+                continue;
+            }
+            let pairs: Vec<(SocketAddrV4, SocketAddrV4)> = batch
+                .iter()
+                .map(|(peer, local, _)| (*peer, *local))
+                .collect();
+            let found = crate::traced::spawn_blocking(move || match owner {
+                OwnerSource::One(owner) => owners_one_by_one(owner, &pairs),
+                OwnerSource::Batch(owners) => owners(&pairs),
+            })
+            .await
+            .unwrap_or_default();
+            let walk = 1 + self
+                .walks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::debug!(
+                component = "dns-proxy",
+                walk,
+                connections = batch.len(),
+                "walked /proc once for the owners of proxied connections from the node's address"
+            );
+            let unknown = std::iter::repeat(super::dns::ConnectingOwner::Unknown);
+            for ((_, _, tx), owner) in batch.into_iter().zip(found.into_iter().chain(unknown)) {
+                let _ = tx.send(owner);
+            }
+        }
+    }
 }
 
 /// The shared routing core: maps an HTTP authority (`host` or `host:port`) to
@@ -251,6 +447,13 @@ pub struct Router<T> {
     /// Names the box that owns a connection from the node's address (see
     /// [`SocketOwner`]).
     owner: SocketOwner,
+    /// Names the owners of every connection of a shared walk at once (see
+    /// [`SocketOwners`]). `None` only in a test that asks [`Self::owner`]
+    /// one connection at a time.
+    owners: Option<SocketOwners>,
+    /// The shared owner walk every clone of this router asks (see
+    /// [`OwnerWalk`]).
+    walk: Arc<OwnerWalk>,
 }
 
 // Manual `Clone` so a `Router` is cheap to hand to each connection task without
@@ -261,6 +464,8 @@ impl<T> Clone for Router<T> {
             table: Arc::clone(&self.table),
             verdict: self.verdict,
             owner: self.owner,
+            owners: self.owners,
+            walk: Arc::clone(&self.walk),
         }
     }
 }
@@ -275,6 +480,8 @@ impl<T: HostRoute> Router<T> {
             table,
             verdict,
             owner: super::dns::connecting_box,
+            owners: Some(super::dns::connecting_boxes),
+            walk: Arc::new(OwnerWalk::new()),
         }
     }
 
@@ -285,6 +492,16 @@ impl<T: HostRoute> Router<T> {
     #[must_use]
     pub(crate) fn with_socket_owner(mut self, owner: SocketOwner) -> Self {
         self.owner = owner;
+        self.owners = None;
+        self
+    }
+
+    /// Replaces the socket-owner lookup with one that names every
+    /// connection of a shared walk in one pass. A test hook.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_socket_owners(mut self, owners: SocketOwners) -> Self {
+        self.owners = Some(owners);
         self
     }
 
@@ -358,25 +575,27 @@ impl<T: HostRoute> Router<T> {
         let Some(SocketAddr::V4(local)) = local else {
             return CallerLookup::Unattributed;
         };
-        // Each lookup walks `/proc` on the blocking pool, so at most
-        // OWNER_LOOKUPS of them run at once, daemon-wide. A connection that
-        // waits past OWNER_LOOKUP_WAIT for a slot is not attributed, and its
-        // request is refused: a burst of connections cannot fill the pool,
-        // and it cannot open the gate either.
-        let Ok(Ok(_slot)) =
-            tokio::time::timeout(OWNER_LOOKUP_WAIT, OWNER_LOOKUP_SLOTS.acquire()).await
-        else {
-            tracing::debug!(
-                component = "dns-proxy",
-                %peer,
-                "no owner lookup slot came free for a proxied connection from the node's address"
-            );
-            return CallerLookup::Unattributed;
+        let source = self
+            .owners
+            .map_or(OwnerSource::One(self.owner), OwnerSource::Batch);
+        // Concurrent connections share one walk of `/proc`, at most one a
+        // second, and at most OWNER_LOOKUP_WAITING connections wait on it. A
+        // connection past that, or one the walk does not answer within
+        // OWNER_LOOKUP_WAIT, is not attributed, and its request is refused:
+        // a burst of connections cannot fill the blocking pool, cannot hold
+        // another box's lookup past the next walk, and cannot open the gate.
+        let found = match self.walk.lookup(source, peer, local).await {
+            Ok(found) => found,
+            Err(waiting) => {
+                tracing::debug!(
+                    component = "dns-proxy",
+                    %peer,
+                    waiting,
+                    "no owner lookup answered a proxied connection from the node's address"
+                );
+                return CallerLookup::NoLookup { waiting };
+            }
         };
-        let owner = self.owner;
-        let found = crate::traced::spawn_blocking(move || owner(peer, local))
-            .await
-            .unwrap_or(super::dns::ConnectingOwner::Unknown);
         let box_id = match found {
             super::dns::ConnectingOwner::Box(box_id) => box_id,
             super::dns::ConnectingOwner::NoBox => return CallerLookup::NoBox,
@@ -685,11 +904,16 @@ where
     let caller = match lookup {
         CallerLookup::Box(caller) => Some(caller),
         CallerLookup::NoBox => None,
-        CallerLookup::Unattributed => {
+        lookup @ (CallerLookup::Unattributed | CallerLookup::NoLookup { .. }) => {
             let reason = "the proxy cannot tell which box opened this connection";
+            let waiting = match lookup {
+                CallerLookup::NoLookup { waiting } => Some(waiting),
+                _ => None,
+            };
             tracing::warn!(
                 component = "dns-proxy",
                 host,
+                waiting_lookups = ?waiting,
                 session = route.session(),
                 caller = "unknown",
                 peer = ?peer,
@@ -4585,6 +4809,240 @@ mod tests {
             !table.read().unwrap().has_unleased_callers(),
             "the current host's stop mark marks the box stopped"
         );
+    }
+
+    /// A registry with two host-address boxes, `hostbox` (deny-all) and
+    /// `openbox` (no egress rules), and a router with the production owner
+    /// lookup.
+    fn two_host_box_router() -> Router<RwLock<HostnameRegistry>> {
+        let subnet = SwitchSubnet::default();
+        let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, true);
+        let deny_all = BoxPolicy {
+            egress: Some(EgressPolicy::deny_all()),
+            ingress: None,
+            credentialed_upstream: None,
+            quic443: None,
+        };
+        let no_rules = BoxPolicy {
+            egress: None,
+            ingress: None,
+            credentialed_upstream: None,
+            quic443: None,
+        };
+        for (id, name, policy) in [
+            (HOST_BOX, "hostbox", deny_all),
+            (OPEN_HOST_BOX, "openbox", no_rules),
+        ] {
+            let id = SessionId::parse_str(id).unwrap();
+            reg.register_host_net(id, name);
+            reg.register_caller(id, name, &policy, subnet, None);
+        }
+        Router::new(Arc::new(RwLock::new(reg)), proxied_request_verdict)
+    }
+
+    /// The owner of each connection by its peer's address, after one slow
+    /// pass: a walk that costs 400 ms whatever it answers.
+    fn slow_walk_owners(
+        pairs: &[(SocketAddrV4, SocketAddrV4)],
+    ) -> Vec<crate::net::dns::ConnectingOwner> {
+        std::thread::sleep(Duration::from_millis(400));
+        pairs
+            .iter()
+            .map(|(peer, _)| {
+                let id = if *peer.ip() == OPEN_HOST_BOX_ADDR {
+                    OPEN_HOST_BOX
+                } else {
+                    HOST_BOX
+                };
+                crate::net::dns::ConnectingOwner::Box(SessionId::parse_str(id).unwrap())
+            })
+            .collect()
+    }
+
+    fn caller_name(lookup: &CallerLookup) -> String {
+        match lookup {
+            CallerLookup::Box(caller) => caller.name().to_string(),
+            CallerLookup::NoBox => "no box".to_string(),
+            CallerLookup::Unattributed => "unattributed".to_string(),
+            CallerLookup::NoLookup { waiting } => format!("no lookup, {waiting} waiting"),
+        }
+    }
+
+    /// NET-070: a burst of connections from the node's address does not
+    /// hold another connection's owner lookup, on the production path. The
+    /// router is [`Router::new`]'s, so every walk asks
+    /// [`crate::net::dns::connecting_boxes`] and reads the kernel's socket
+    /// tables and `/proc`. 63 real connections from one address and one from
+    /// another share a few walks, and every one is answered inside the wait
+    /// bound. The test process runs in no box's classifier leaf, so the
+    /// kernel names no box for any of them. The test after this one names
+    /// two boxes with a slow batch lookup.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn burst_of_connections_does_not_starve_other_boxes_lookups() {
+        let router = two_host_box_router();
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let target = listener.local_addr().unwrap();
+        let mut clients = Vec::new();
+        let mut accepted = Vec::new();
+        for from in std::iter::repeat_n(HOST_BOX_ADDR, 63).chain([OPEN_HOST_BOX_ADDR]) {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket
+                .bind(SocketAddr::V4(SocketAddrV4::new(from, 0)))
+                .unwrap();
+            clients.push(socket.connect(target).await.unwrap());
+            let (stream, SocketAddr::V4(peer)) = listener.accept().await.unwrap() else {
+                panic!("an IPv4 listener accepts IPv4 peers");
+            };
+            let local = stream_local(&stream);
+            accepted.push((stream, peer, local));
+        }
+        let (_, other_peer, other_local) = accepted.pop().unwrap();
+        let burst: Vec<_> = accepted
+            .iter()
+            .map(|(_, peer, local)| {
+                let (router, peer, local) = (router.clone(), *peer, *local);
+                crate::traced::spawn(async move { router.caller_for(peer, local).await })
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let other = router.caller_for(other_peer, other_local).await;
+        assert_eq!(
+            caller_name(&other),
+            "no box",
+            "the other connection is named"
+        );
+        assert!(
+            started.elapsed() < OWNER_LOOKUP_WAIT,
+            "the other connection's lookup is answered inside the wait bound"
+        );
+        for lookup in burst {
+            assert_eq!(caller_name(&lookup.await.unwrap()), "no box");
+        }
+        let walks = router.walk.walks.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(walks <= 3, "64 connections share walks, got {walks} walks");
+        drop(clients);
+    }
+
+    /// The accepting side's local address of `stream`, as the proxy passes
+    /// it to [`Router::caller_for`].
+    fn stream_local(stream: &tokio::net::TcpStream) -> Option<SocketAddr> {
+        stream.local_addr().ok()
+    }
+
+    /// NET-070, with a slow batch lookup that names two boxes: a
+    /// host-address box that opens many connections at once does not hold
+    /// another box's owner lookup. Concurrent connections share one walk, at
+    /// most one a second, so a burst of 63 connections from one box and one
+    /// from another box are all named in a few walks, well inside the wait
+    /// bound, though each walk is slow. With a walk per connection on four
+    /// slots, the other box's lookup waited 16 walks, past the bound, and its
+    /// request was refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn burst_from_one_box_does_not_starve_another_box_with_a_slow_walk() {
+        let router = two_host_box_router().with_socket_owners(slow_walk_owners);
+        let local = Some(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080)));
+        let burst: Vec<_> = (0..63u16)
+            .map(|n| {
+                let router = router.clone();
+                crate::traced::spawn(async move {
+                    router
+                        .caller_for(SocketAddrV4::new(HOST_BOX_ADDR, 40_000 + n), local)
+                        .await
+                })
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let other = router
+            .caller_for(SocketAddrV4::new(OPEN_HOST_BOX_ADDR, 50_000), local)
+            .await;
+        assert_eq!(caller_name(&other), "openbox", "the other box is named");
+        assert!(
+            started.elapsed() < OWNER_LOOKUP_WAIT,
+            "the other box's lookup is answered inside the wait bound"
+        );
+        for lookup in burst {
+            assert_eq!(caller_name(&lookup.await.unwrap()), "hostbox");
+        }
+        let walks = router.walk.walks.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(walks <= 3, "64 connections share walks, got {walks} walks");
+    }
+
+    /// The shared walk holds at most 64 waiting connections. One more,
+    /// while a walk runs and 64 wait, is refused at once as a caller the
+    /// proxy cannot name, and the refusal counts the 64 that waited.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owner_lookup_past_the_waiting_cap_is_refused() {
+        fn slow_owners(
+            pairs: &[(SocketAddrV4, SocketAddrV4)],
+        ) -> Vec<crate::net::dns::ConnectingOwner> {
+            std::thread::sleep(Duration::from_millis(1500));
+            let id = SessionId::parse_str(OPEN_HOST_BOX).unwrap();
+            vec![crate::net::dns::ConnectingOwner::Box(id); pairs.len()]
+        }
+        let router = two_host_box_router().with_socket_owners(slow_owners);
+        let local = Some(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080)));
+        let spawn = |port: u16| {
+            let router = router.clone();
+            crate::traced::spawn(async move {
+                router
+                    .caller_for(SocketAddrV4::new(OPEN_HOST_BOX_ADDR, port), local)
+                    .await
+            })
+        };
+        // The first connection starts a walk, which takes it and runs.
+        let first = spawn(40_000);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let waiting: Vec<_> = (1..=64u16).map(|n| spawn(40_000 + n)).collect();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let refused = router
+            .caller_for(SocketAddrV4::new(OPEN_HOST_BOX_ADDR, 50_000), local)
+            .await;
+        assert_eq!(caller_name(&refused), "no lookup, 64 waiting");
+        assert_eq!(caller_name(&first.await.unwrap()), "openbox");
+        for lookup in waiting {
+            assert_eq!(caller_name(&lookup.await.unwrap()), "openbox");
+        }
+    }
+
+    /// A connection that stops waiting frees its place under the cap. With
+    /// a walk running and 64 waiting connections gone, one more connection
+    /// is not refused, and the next walk names it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owner_lookups_that_stop_waiting_free_the_cap() {
+        fn slow_owners(
+            pairs: &[(SocketAddrV4, SocketAddrV4)],
+        ) -> Vec<crate::net::dns::ConnectingOwner> {
+            std::thread::sleep(Duration::from_millis(1500));
+            let id = SessionId::parse_str(OPEN_HOST_BOX).unwrap();
+            vec![crate::net::dns::ConnectingOwner::Box(id); pairs.len()]
+        }
+        let router = two_host_box_router().with_socket_owners(slow_owners);
+        let local = Some(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080)));
+        let spawn = |port: u16| {
+            let router = router.clone();
+            crate::traced::spawn(async move {
+                router
+                    .caller_for(SocketAddrV4::new(OPEN_HOST_BOX_ADDR, port), local)
+                    .await
+            })
+        };
+        let first = spawn(40_000);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let gone: Vec<_> = (1..=64u16).map(|n| spawn(40_000 + n)).collect();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        for lookup in &gone {
+            lookup.abort();
+        }
+        for lookup in gone {
+            let _ = lookup.await;
+        }
+        let next = router
+            .caller_for(SocketAddrV4::new(OPEN_HOST_BOX_ADDR, 50_000), local)
+            .await;
+        assert_eq!(caller_name(&next), "openbox");
+        assert_eq!(caller_name(&first.await.unwrap()), "openbox");
     }
 
     /// NET-070's verify line: a request through the hostname proxy from a
