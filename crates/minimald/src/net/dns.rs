@@ -3479,7 +3479,7 @@ pub fn connecting_box(peer: SocketAddrV4, local: SocketAddrV4) -> ConnectingOwne
 
 /// [`connecting_box`], with the box that runs in a PID namespace named by
 /// `box_in_namespace`.
-fn connecting_box_with(
+pub(crate) fn connecting_box_with(
     peer: SocketAddrV4,
     local: SocketAddrV4,
     box_in_namespace: impl Fn((u64, u64)) -> Option<SessionId>,
