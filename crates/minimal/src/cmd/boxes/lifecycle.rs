@@ -1,4 +1,6 @@
 //! `min session destroy`, `stop` and `rename`: the box lifecycle helpers.
+//! `min box stop` (BOX-013, BCLI-059) and `min box rm` (BOX-019, BCLI-060,
+//! BCLI-004) live here too.
 
 use super::*;
 
@@ -511,6 +513,267 @@ where
     }
 }
 
+/// The refusal of `min box rm` for a running box without `--force`
+/// (BCLI-004, BOX-019). `target` is the box as the user named it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoxRunningRefusal {
+    pub(crate) target: String,
+}
+
+impl BoxRunningRefusal {
+    /// The exit code `min box rm` ends with on this refusal.
+    pub const EXIT_CODE: u8 = 2;
+
+    /// The refusal for the box the user named `target`.
+    pub fn new(target: impl Into<String>) -> Self {
+        Self {
+            target: target.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for BoxRunningRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let target = &self.target;
+        write!(
+            f,
+            "{target} is running. Stop it with min box stop {target}, \
+             or remove it now with min box rm {target} --force."
+        )
+    }
+}
+
+impl std::error::Error for BoxRunningRefusal {}
+
+/// The daemon's text when a reap that is not forced finds the box running
+/// (`box_manager`'s reap gate). The client checks the state from the
+/// listing first, so this answer arrives only when the box started in
+/// between.
+const DAEMON_RUNNING_REAP: &str = "is running, so it was not removed.";
+
+/// Whether a `ReapBox` error is the daemon's answer that the box is running,
+/// which `min box rm` without `--force` maps to [`BoxRunningRefusal`].
+fn reap_error_is_running(force: bool, error: &str) -> bool {
+    !force && error.contains(DAEMON_RUNNING_REAP)
+}
+
+/// The `StopBox` request for `min box stop`: the graceful stop of BOX-013,
+/// or its forced stop under `--force`.
+pub(crate) fn box_stop_request(id: boxes::SessionId, force: bool) -> minimald_rpc::StopBoxRequest {
+    minimald_rpc::StopBoxRequest { id, force }
+}
+
+/// The `ReapBox` request for `min box rm`: the reap of BOX-019, or its
+/// forced reap under `--force`.
+pub(crate) fn box_rm_request(id: boxes::SessionId, force: bool) -> minimald_rpc::ReapBoxRequest {
+    minimald_rpc::ReapBoxRequest { id, force }
+}
+
+/// The error for a daemon answer to a verb on box `id`, named `target`.
+fn box_rpc_error(id: boxes::SessionId, error: String) -> anyhow::Error {
+    if error.starts_with(minimald_rpc::UNKNOWN_SESSION_ID_LEAD) {
+        anyhow::anyhow!(
+            "No box has the id `{id}`. Run `min box list --all` to see the boxes on this host."
+        )
+    } else {
+        anyhow::anyhow!("{error}")
+    }
+}
+
+/// `min box stop <box> [--force]`: stops the box and keeps its record.
+pub async fn cmd_box_stop(global: &GlobalArgs, args: BoxStopArgs) -> Result<(), anyhow::Error> {
+    ensure_daemon(global)?;
+    let lookup = BoxLookup::selected(global, "min box stop")?;
+    let mut client = connect_daemon(global).await?;
+    let mut out = std::io::stdout().lock();
+    let id = stop_listed_box(&mut client, &mut out, &lookup, &args.target, args.force).await?;
+    // A stopped box is not live, so the VM host daemon retires its
+    // `host_ip` egress rules. The row and the name hold stay until the box
+    // is removed. An attach admits the rules again. Best-effort: a box of
+    // another mode has no rules, and no VM host daemon means nothing to do.
+    let control_sock =
+        vm_host_control_sock(daemon_host_kind(global), global.minimal_dir.as_deref());
+    host_ip_box_with_vm_host(control_sock, id, None, false).await;
+    Ok(())
+}
+
+/// The host a lifecycle verb looks a box up on, and the next step its
+/// not-found refusal gives. The lookup reads the host this process
+/// selected, the one `connect_daemon` reaches, as `min box show` does.
+#[derive(Debug, Clone)]
+pub(crate) struct BoxLookup {
+    pub(crate) host: String,
+    pub(crate) remedy: String,
+}
+
+impl BoxLookup {
+    /// The lookup for `verb` (`min box stop`, `min box rm`) on the selected
+    /// local host.
+    fn selected(global: &GlobalArgs, verb: &str) -> Result<Self, anyhow::Error> {
+        let hosts = crate::cmd::list::local_hosts(global)?;
+        let several_hosts = hosts.len() > 1;
+        let host = hosts
+            .into_iter()
+            .find(|host| host.selected)
+            .context("No local host is selected")?;
+        Ok(Self::on(host.host, several_hosts, verb))
+    }
+
+    /// The lookup for `verb` on `host`. With several hosts the box can be
+    /// on another VM, so the refusal names `--vm`, as `min box show`'s
+    /// refusal does. A named VM's host is `<name>.<base>`.
+    pub(crate) fn on(host: String, several_hosts: bool, verb: &str) -> Self {
+        let remedy = if several_hosts {
+            let base = host.rsplit('.').next().unwrap_or(&host);
+            format!(
+                "Run `min box list --all` to see the boxes on every host. \
+                 For a box on host <name>.{base}, run `{verb}` again with `--vm <name>`."
+            )
+        } else {
+            not_found_remedy(&host, false)
+        };
+        Self { host, remedy }
+    }
+}
+
+/// Resolves `target` among the boxes the host lists and stops it, as
+/// BOX-013 defines, forced under `force`. Writes one line to `out`, and
+/// returns the id of the box it stopped.
+pub(crate) async fn stop_listed_box(
+    client: &mut client::Client,
+    out: &mut impl std::io::Write,
+    lookup: &BoxLookup,
+    target: &str,
+    force: bool,
+) -> Result<boxes::SessionId, anyhow::Error> {
+    use minimald_rpc::{Errorable, StopBox};
+
+    // A box name is not scoped to a project, so the lookup reads every box.
+    let listing = list_box_records(client, None).await?;
+    let id = find_listed_box(&listing, target, &lookup.host, &lookup.remedy)?;
+    crate::output::record_box_id(&id.to_string());
+    let stopped = match client
+        .oneshot_rpc::<StopBox>(box_stop_request(id, force))
+        .await
+        .context("StopBox RPC failed")?
+    {
+        Errorable::Ok(stopped) => stopped,
+        Errorable::Err { error } => return Err(box_rpc_error(id, error)),
+    };
+    write_stop_line(out, target, &stopped)?;
+    Ok(id)
+}
+
+/// The one line `min box stop` prints for the daemon's answer `stopped`.
+fn write_stop_line(
+    out: &mut impl std::io::Write,
+    target: &str,
+    stopped: &minimald_rpc::StopBoxResponse,
+) -> std::io::Result<()> {
+    if stopped.already_exited {
+        tracing::info!(r#box = target, "the box exited before the stop");
+        writeln!(
+            out,
+            "{target} exited before the stop, so the stop changed nothing."
+        )
+    } else {
+        writeln!(out, "Stopped {target}.")
+    }
+}
+
+/// `min box rm <box> [--force]`: removes the box. A running box without
+/// `--force` is refused on stderr with exit 2 (BCLI-004): the refusal
+/// returns as a [`BoxRunningRefusal`], and the process maps it to its exit
+/// code.
+pub async fn cmd_box_rm(global: &GlobalArgs, args: BoxRmArgs) -> Result<(), anyhow::Error> {
+    ensure_daemon(global)?;
+    let lookup = BoxLookup::selected(global, "min box rm")?;
+    let mut client = connect_daemon(global).await?;
+    let removed = rm_listed_box(&mut client, &lookup, &args.target, args.force).await?;
+    // The box is gone. Its creator withdraws the row on the VM host
+    // daemon, or releases the name the zone held, as `destroy_box` does.
+    // Both are best-effort and warn on failure.
+    let control_sock =
+        vm_host_control_sock(daemon_host_kind(global), global.minimal_dir.as_deref());
+    let name = removed.name.as_deref();
+    withdraw_box_row(control_sock.clone(), name, removed.box_addresses, None).await;
+    release_held_box_name(control_sock, removed.id, name, removed.box_addresses).await;
+    // The line goes last, so a closed stdout cannot skip the cleanup above.
+    writeln!(std::io::stdout().lock(), "Removed {}.", args.target)?;
+    Ok(())
+}
+
+/// A box that `rm_listed_box` reaped: what its creator needs to retire
+/// the row or the name hold the box leaves on the VM host daemon.
+#[derive(Debug)]
+pub(crate) struct RemovedBox {
+    pub(crate) id: boxes::SessionId,
+    pub(crate) name: Option<String>,
+    pub(crate) box_addresses: Option<boxes::BoxAddresses>,
+}
+
+/// Resolves `target` among the boxes the host lists and reaps it, as
+/// BOX-019 defines, forced under `force`. Without `force`, a running box
+/// is refused with [`BoxRunningRefusal`]. Prints nothing on stdout: the
+/// caller prints the line after its cleanup.
+pub(crate) async fn rm_listed_box(
+    client: &mut client::Client,
+    lookup: &BoxLookup,
+    target: &str,
+    force: bool,
+) -> Result<RemovedBox, anyhow::Error> {
+    use minimald_rpc::{Errorable, ReapBox};
+
+    // A box name is not scoped to a project, so the lookup reads every box.
+    let listing = list_box_records(client, None).await?;
+    let id = find_listed_box(&listing, target, &lookup.host, &lookup.remedy)?;
+    crate::output::record_box_id(&id.to_string());
+    let running = listing
+        .iter()
+        .any(|entry| entry.box_id == id && entry.state == "running");
+    let refusal = || anyhow::Error::new(BoxRunningRefusal::new(target));
+    if running && !force {
+        return Err(refusal());
+    }
+    // The record carries the pair the box's registration handed back,
+    // which the withdrawal after the reap presents. A record the daemon
+    // cannot answer reaps the box all the same.
+    let box_addresses = get_session_record(client, &id.to_string())
+        .await
+        .ok()
+        .and_then(|resp| resp.record)
+        .and_then(|record| record.box_addresses);
+    let name = listing
+        .iter()
+        .find(|entry| entry.box_id == id)
+        .and_then(|entry| entry.name.clone());
+    let reaped = match client
+        .oneshot_rpc::<ReapBox>(box_rm_request(id, force))
+        .await
+        .context("ReapBox RPC failed")?
+    {
+        Errorable::Ok(reaped) => reaped,
+        Errorable::Err { error } if reap_error_is_running(force, &error) => {
+            return Err(refusal());
+        }
+        Errorable::Err { error } => return Err(box_rpc_error(id, error)),
+    };
+    // A failed `on_destroy` hook does not stop the reap, so it is a
+    // warning: the box is gone either way.
+    for failure in &reaped.hook_failures {
+        let (head, output) = failure.split_once('\n').unwrap_or((failure, ""));
+        eprintln!("warning: on_destroy hook {head}. The box was removed anyway.");
+        if !output.is_empty() {
+            eprintln!("{output}");
+        }
+    }
+    Ok(RemovedBox {
+        id,
+        name,
+        box_addresses,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,6 +818,218 @@ mod tests {
         assert!(
             err.to_string().contains("web is already destroyed"),
             "the error names the session: {err}"
+        );
+    }
+
+    /// The lookup the tests resolve boxes with: one native host.
+    fn lookup() -> BoxLookup {
+        BoxLookup::on("local0".to_owned(), false, "min box stop")
+    }
+
+    // A box the host does not list is refused with the host and the next
+    // step, and with several hosts the step names the verb and `--vm`.
+    #[test]
+    fn lookup_refusal_names_host_and_verb() {
+        let err = find_listed_box(&[], "nope", &lookup().host, &lookup().remedy).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "No box has the name or id `nope` on host local0. \
+             Run `min box list --all` to see the boxes on this host."
+        );
+        let several = BoxLookup::on("dev.local-minvmd0".to_owned(), true, "min box rm");
+        assert_eq!(
+            several.remedy,
+            "Run `min box list --all` to see the boxes on every host. \
+             For a box on host <name>.local-minvmd0, run `min box rm` again with `--vm <name>`."
+        );
+    }
+
+    /// A daemon on a fresh socket, with a client connected to it, and a
+    /// configured box for each name in `names`.
+    async fn daemon_with_boxes(
+        names: &[&str],
+    ) -> (
+        minimald::test_harness::TestServer,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        client::Client,
+    ) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ssh_sock = dir.path().join("ssh.sock");
+        let server = minimald::test_harness::TestServer::new().await;
+        server.listen_on_uds(&ssh_sock).await;
+        let project = tempfile::TempDir::new().unwrap();
+        let mut daemon = server.connect().await;
+        for name in names {
+            minimald::test_harness::create_configured_session(
+                &mut daemon,
+                name,
+                project.path().to_str().unwrap(),
+            )
+            .await;
+        }
+        let client = client::Client::connect(&ssh_sock).await.unwrap();
+        (server, dir, project, client)
+    }
+
+    /// The state the host lists for the box named `name`, or `None` when
+    /// the host keeps no box of that name.
+    async fn listed_state(client: &mut client::Client, name: &str) -> Option<String> {
+        list_box_records(client, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.name.as_deref() == Some(name))
+            .map(|entry| entry.state)
+    }
+
+    /// The daemon's log lines for the stop it served of box `id` with
+    /// `force`. The daemon logs each stop it served with its `force` flag.
+    fn served_stops(log: &str, id: boxes::SessionId, force: bool) -> usize {
+        log.lines()
+            .filter(|line| {
+                line.contains("session stopped")
+                    && line.contains(&format!("session_id={id}"))
+                    && line.contains(&format!("force={force}"))
+            })
+            .count()
+    }
+
+    // BCLI-059: `min box stop` stops the box as BOX-013 defines, and asks
+    // for the forced stop under `--force`.
+    #[tokio::test]
+    async fn box_stop_stops_as_box_013_force_forces() {
+        let log = minimald::test_harness::captured_log();
+        let (_server, _dir, _project, mut client) = daemon_with_boxes(&["web", "api"]).await;
+        assert_eq!(
+            listed_state(&mut client, "web").await.as_deref(),
+            Some("running")
+        );
+
+        let mut out = Vec::new();
+        let web = stop_listed_box(&mut client, &mut out, &lookup(), "web", false)
+            .await
+            .expect("the graceful stop succeeds");
+        assert_eq!(String::from_utf8(out).unwrap(), "Stopped web.\n");
+        assert_eq!(
+            listed_state(&mut client, "web").await.as_deref(),
+            Some("stopped")
+        );
+
+        let mut out = Vec::new();
+        let api = stop_listed_box(&mut client, &mut out, &lookup(), "api", true)
+            .await
+            .expect("the forced stop succeeds");
+        assert_eq!(String::from_utf8(out).unwrap(), "Stopped api.\n");
+        // A stopped box keeps its record until it is removed.
+        assert_eq!(
+            listed_state(&mut client, "api").await.as_deref(),
+            Some("stopped")
+        );
+
+        // The daemon served a graceful stop of `web` and a forced stop of
+        // `api`, and no other stop of either.
+        let log = log.contents();
+        assert_eq!(served_stops(&log, web, false), 1, "{log}");
+        assert_eq!(served_stops(&log, web, true), 0, "{log}");
+        assert_eq!(served_stops(&log, api, true), 1, "{log}");
+        assert_eq!(served_stops(&log, api, false), 0, "{log}");
+
+        // A box that exited before the stop reached it: the daemon answers
+        // `already_exited`, and the line says the stop changed nothing.
+        let mut out = Vec::new();
+        write_stop_line(
+            &mut out,
+            "web",
+            &minimald_rpc::StopBoxResponse {
+                exit_code: Some(0),
+                signal: None,
+                already_exited: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "web exited before the stop, so the stop changed nothing.\n"
+        );
+    }
+
+    // BCLI-060: `min box rm` reaps the box as BOX-019 defines, and asks for
+    // the forced reap under `--force`.
+    #[tokio::test]
+    async fn box_rm_reaps_as_box_019_force_forces() {
+        let (_server, _dir, _project, mut client) = daemon_with_boxes(&["web", "api"]).await;
+
+        // A stopped box is removed without `--force`.
+        stop_listed_box(&mut client, &mut Vec::new(), &lookup(), "web", false)
+            .await
+            .expect("the stop succeeds");
+        let removed = rm_listed_box(&mut client, &lookup(), "web", false)
+            .await
+            .expect("a stopped box is removed");
+        // The caller retires the row or name hold by this name.
+        assert_eq!(removed.name.as_deref(), Some("web"));
+        assert_eq!(listed_state(&mut client, "web").await, None);
+
+        // A running box is removed under `--force`.
+        assert_eq!(
+            listed_state(&mut client, "api").await.as_deref(),
+            Some("running")
+        );
+        let removed = rm_listed_box(&mut client, &lookup(), "api", true)
+            .await
+            .expect("a forced removal of a running box succeeds");
+        assert_eq!(removed.name.as_deref(), Some("api"));
+        assert_eq!(listed_state(&mut client, "api").await, None);
+    }
+
+    // BCLI-004: `min box rm` of a running box without `--force` is refused
+    // with exit 2, naming `--force`, and the box keeps running.
+    #[tokio::test]
+    async fn rm_running_box_refuses_naming_force() {
+        let (_server, _dir, _project, mut client) = daemon_with_boxes(&["web"]).await;
+
+        let err = rm_listed_box(&mut client, &lookup(), "web", false)
+            .await
+            .expect_err("a running box is refused without --force");
+        let refusal = err
+            .downcast_ref::<BoxRunningRefusal>()
+            .expect("the refusal is typed");
+        assert_eq!(
+            refusal.to_string(),
+            "web is running. Stop it with min box stop web, \
+             or remove it now with min box rm web --force."
+        );
+        assert_eq!(
+            listed_state(&mut client, "web").await.as_deref(),
+            Some("running")
+        );
+
+        // A box that starts between the listing and the reap gets the
+        // daemon's own answer. Send the unforced reap straight to the daemon
+        // and check that the client maps that answer to the same refusal.
+        let id = list_box_records(&mut client, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.name.as_deref() == Some("web"))
+            .expect("web is listed")
+            .box_id;
+        let answer = client
+            .oneshot_rpc::<minimald_rpc::ReapBox>(box_rm_request(id, false))
+            .await
+            .expect("the ReapBox RPC answers");
+        let minimald_rpc::Errorable::Err { error } = answer else {
+            panic!("the daemon refuses an unforced reap of a running box");
+        };
+        assert!(
+            reap_error_is_running(false, &error),
+            "the daemon's running-box answer maps to the refusal: {error}"
+        );
+        assert!(!reap_error_is_running(true, &error));
+        assert_eq!(
+            listed_state(&mut client, "web").await.as_deref(),
+            Some("running")
         );
     }
 }
