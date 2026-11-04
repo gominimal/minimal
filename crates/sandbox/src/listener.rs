@@ -1,6 +1,6 @@
 use std::io::{BufRead, BufReader};
-use std::path::Path;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -198,7 +198,12 @@ mod tests {
         let mut channel = Recording::default();
         let shutdown = AtomicBool::new(false);
         tracing::subscriber::with_default(Arc::clone(&capture), || {
-            assert!(serve_connection(server, &mut channel, &shutdown, Path::new("/")));
+            assert!(serve_connection(
+                server,
+                &mut channel,
+                &shutdown,
+                Path::new("/")
+            ));
         });
         let logged = capture.0.lock().unwrap().clone();
         (channel.0, logged)
@@ -212,7 +217,10 @@ mod tests {
         let (lines, logged) = serve(request);
         assert_eq!(lines, ["run%/workbench\x1elint\x1eAPI_TOKEN=s3cr3t-value"]);
         assert!(logged.contains("listener received a request"), "{logged}");
-        assert!(!logged.contains("s3cr3t-value"), "the trace leaked: {logged}");
+        assert!(
+            !logged.contains("s3cr3t-value"),
+            "the trace leaked: {logged}"
+        );
         assert!(!logged.contains("API_TOKEN"), "the trace leaked: {logged}");
     }
 

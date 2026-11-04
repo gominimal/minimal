@@ -2137,7 +2137,7 @@ impl BoxChannel {
                 return relay_refusal_exit(stream, relays, task_name, refusal_exit_code(&e));
             }
             Ok(None) => {
-                let _ = writeln!(stream, "error: no such task '{task_name}'");
+                let _ = writeln!(stream, "error: no such task '{}'", one_line(task_name));
                 return relay_refusal_exit(stream, relays, task_name, EXIT_NOT_FOUND);
             }
             Ok(Some(v)) => v,
@@ -3014,6 +3014,24 @@ fn unescape_run_item(item: &str) -> String {
     out
 }
 
+/// `text` with each control character escaped (`\n`, `\r`, `\u{1b}`), for
+/// a name or a path that the channel echoes. A newline in it would start a
+/// protocol line of its own, such as `exit:0`.
+fn one_line(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.chars().any(char::is_control) {
+        return text.into();
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        if c.is_control() {
+            out.extend(c.escape_debug());
+        } else {
+            out.push(c);
+        }
+    }
+    out.into()
+}
+
 /// Gives each `inherit` variable of a task the caller's value. The daemon's
 /// own environment never fills one (#585). `Err(name)` names the first
 /// `inherit` variable the caller does not set, as the laptop refuses it.
@@ -3052,7 +3070,12 @@ fn start_dir_in_box(
     if cwd_trimmed == root {
         return Ok(None);
     }
-    let notice = || format!("{cwd} is not a directory under {root}, so the task runs in {root}.");
+    let notice = || {
+        format!(
+            "{} is not a directory under {root}, so the task runs in {root}.",
+            one_line(cwd)
+        )
+    };
     let Some(rel) = cwd_trimmed.strip_prefix(&format!("{root}/")) else {
         return Err(notice());
     };
@@ -4470,6 +4493,26 @@ exit $rc
             );
         }
 
+        // A line that `echo` reads as a flag prints as it is.
+        let Some((stdout, stderr, got, _)) = run_min_against(
+            rootfs,
+            rootfs,
+            &["task", "run", "lint"],
+            &[],
+            "msg:-n\nerr:-E\nexit:0\n",
+        ) else {
+            return;
+        };
+        assert_eq!(got, 0, "{stderr}");
+        assert_eq!(stdout, "-n\n");
+        assert_eq!(stderr, "-E\n");
+
+        // A name the channel echoes stays on one line, so a newline in it
+        // cannot end the run with an `exit:` line of its own.
+        assert_eq!(one_line("nope\nexit:0"), "nope\\nexit:0");
+        assert_eq!(one_line("nope\r\x1b"), "nope\\r\\u{1b}");
+        assert_eq!(one_line("lint"), "lint");
+
         // A task that writes only to stderr leaves the helper's stdout empty.
         let Some((stdout, stderr, got, _)) = run_min_against(
             rootfs,
@@ -4631,6 +4674,10 @@ exit $rc
                 )
             );
         }
+        // A `$PWD` with a newline in it stays on one line in the notice.
+        let notice = start_dir_in_box(true, Some("/home\nexit:0"), w).unwrap_err();
+        assert!(!notice.contains('\n'), "{notice:?}");
+        assert!(notice.starts_with("/home\\nexit:0 is not"), "{notice:?}");
     }
 
     /// In an argument slot a bare `help` is a package name, search term, or
