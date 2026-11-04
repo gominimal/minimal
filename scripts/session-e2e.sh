@@ -75,6 +75,9 @@
 # case name below is runnable by itself.
 #   lifecycle                        cold activate → list → warm → destroy
 #   session_exec                     `min session exec` in the session's namespaces
+#   exec_reattach                    a terminal and a detached min://exec lose
+#                                    their client; the exec id re-attaches the
+#                                    terminal and reads the output again
 #   session_rename                   `min session rename`; rename-to-self refused
 #   session_outbound_request         an outbound request from inside the session (NET-107)
 #   own_ip                           `--network own_ip` tap + switch attach
@@ -1620,6 +1623,114 @@ if grep -q "Error: Other(" "$WORK/exec-missing.err"; then
   fail
 fi
 echo "session exec proof OK"
+echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
+# Exec by id, end to end (T32): a terminal exec and a detached exec run in the
+# shared box. The client of each goes away, and the exec id alone brings it
+# back: `min://exec/attach <id>` replays the terminal and takes input again,
+# `min://exec/wait <id>` and `min://exec/output <id>` read the detached exec.
+# `min` has no command for these requests yet, so the proof sends them over a
+# plain `ssh`, built from the transport `min session setup-zed --print` gives
+# (its ProxyCommand onto the daemon socket, the box selector, the host key).
+proof_exec_reattach() {
+echo "::group::exec by id proof (min://exec terminal and detached, client dropped)"
+proof_shared_session
+local entry host user opts er_ssh tty_id det_id att1 att1_pid out2 rc det_out det_again i want
+entry="$(mnl session setup-zed "$sid" --print 2>"$WORK/exec-reattach-zed.err")" || {
+  echo "::error::'min session setup-zed $sid --print' failed"
+  echo "--- stderr ---"; cat "$WORK/exec-reattach-zed.err" 2>/dev/null || true
+  fail
+}
+host="$(printf '%s' "$entry" | jq -r .host)"
+user="$(printf '%s' "$entry" | jq -r .username)"
+opts=()
+while IFS= read -r i; do opts+=("$i"); done < <(printf '%s' "$entry" | jq -r '.args[]')
+er_ssh=(ssh -F /dev/null -T -o BatchMode=yes -o ConnectTimeout=30 "${opts[@]}" "$user@$host")
+
+# A terminal exec: its start answers with the id, and the client is gone.
+# shellcheck disable=SC2016 # $a and $b expand in the box, not here.
+tty_id="$("${er_ssh[@]}" 'min://exec {"argv":["sh","-c","read a; echo got:$a; sleep 3; echo while-away; read b; echo got:$b"],"mode":"tty"}' \
+  2>"$WORK/exec-reattach-tty.err" </dev/null | tr -d '\r' | tail -n1)"
+if ! printf '%s' "$tty_id" | grep -Eqx '[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}'; then
+  echo "::error::a terminal min://exec did not answer with an exec id: '$tty_id'"
+  echo "--- stderr ---"; cat "$WORK/exec-reattach-tty.err" 2>/dev/null || true
+  fail
+fi
+echo "terminal exec: $tty_id"
+
+# First client: attach by the id, type a line, see the answer, then drop.
+att1="$WORK/exec-reattach-attach1.out"
+{ printf 'one\n'; sleep 30; } | "${er_ssh[@]}" "min://exec/attach $tty_id" >"$att1" 2>&1 &
+att1_pid=$!
+for i in $(seq 1 100); do
+  grep -q 'got:one' "$att1" 2>/dev/null && break
+  sleep 0.1
+done
+kill "$att1_pid" 2>/dev/null || true
+wait "$att1_pid" 2>/dev/null || true
+if ! grep -q 'got:one' "$att1"; then
+  echo "::error::the first attach to exec $tty_id never showed the answer to its input"
+  echo "--- attach output ---"; cat "$att1" 2>/dev/null || true
+  fail
+fi
+
+# No client now. The exec writes on. A second client, with the id alone,
+# gets the replay, types again, and ends with the exec's exit.
+sleep 4
+out2="$(printf 'two\n' | timeout 30 "${er_ssh[@]}" "min://exec/attach $tty_id" 2>&1 | tr -d '\r')"
+rc=${PIPESTATUS[1]}
+for want in got:one while-away got:two; do
+  if ! printf '%s' "$out2" | grep -q "$want"; then
+    echo "::error::the re-attach to exec $tty_id did not show '$want' (exit $rc)"
+    echo "--- re-attach output ---"; printf '%s\n' "$out2"
+    fail
+  fi
+done
+if [ "$rc" -ne 0 ]; then
+  echo "::error::the re-attach to exec $tty_id exited $rc (expected the exec's 0)"
+  echo "--- re-attach output ---"; printf '%s\n' "$out2"
+  fail
+fi
+
+# A detached exec: its start answers with the id, and the client is gone.
+det_id="$("${er_ssh[@]}" 'min://exec {"argv":["sh","-c","echo detached-early; sleep 2; echo detached-late"],"mode":"detached"}' \
+  2>"$WORK/exec-reattach-det.err" </dev/null | tr -d '\r' | tail -n1)"
+if ! printf '%s' "$det_id" | grep -Eqx '[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}'; then
+  echo "::error::a detached min://exec did not answer with an exec id: '$det_id'"
+  echo "--- stderr ---"; cat "$WORK/exec-reattach-det.err" 2>/dev/null || true
+  fail
+fi
+echo "detached exec: $det_id"
+timeout 30 "${er_ssh[@]}" "min://exec/wait $det_id" </dev/null >/dev/null 2>"$WORK/exec-reattach-wait.err"
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  echo "::error::'min://exec/wait $det_id' exited $rc (expected the exec's 0)"
+  echo "--- stderr ---"; cat "$WORK/exec-reattach-wait.err" 2>/dev/null || true
+  fail
+fi
+det_out="$("${er_ssh[@]}" "min://exec/output $det_id" </dev/null 2>"$WORK/exec-reattach-out.err")"
+det_again="$("${er_ssh[@]}" "min://exec/output $det_id" </dev/null 2>>"$WORK/exec-reattach-out.err")"
+if [ "$det_out" != "$(printf 'detached-early\ndetached-late')" ] || [ "$det_again" != "$det_out" ]; then
+  echo "::error::'min://exec/output $det_id' did not read the detached exec's output twice the same"
+  echo "--- first read ---"; printf '%s\n' "$det_out"
+  echo "--- second read ---"; printf '%s\n' "$det_again"
+  echo "--- stderr ---"; cat "$WORK/exec-reattach-out.err" 2>/dev/null || true
+  fail
+fi
+
+# The daemon log names the exec id at each attach and each drop. The log is
+# on this host only when the daemon is (see hook_log_readable).
+if hook_log_readable; then
+  if [ -z "$(hook_log_has "$tty_id")" ]; then
+    echo "::error::the daemon log never names terminal exec $tty_id"
+    fail
+  fi
+else
+  not_run exec_reattach_daemon_log "the daemon log is inside the VM on this lane"
+fi
+echo "exec by id proof OK"
 echo "::endgroup::"
 }
 
@@ -29915,6 +30026,7 @@ case "${1:-}" in
   "")
     proof_lifecycle
     proof_session_exec
+    proof_exec_reattach
     proof_session_rename
     proof_session_outbound_request
     proof_own_ip
@@ -30029,7 +30141,7 @@ case "${1:-}" in
     # rely on the lane's daemon or the host's packet filter as it found them.
     proof_daemon_fetch_under_deny_all_host_address_box
     ;;
-  lifecycle | session_exec | session_rename | session_outbound_request | own_ip | own_ip_egress_declared_and_enforced | task_run | task_network_inherits_session | hooks \
+  lifecycle | session_exec | exec_reattach | session_rename | session_outbound_request | own_ip | own_ip_egress_declared_and_enforced | task_run | task_network_inherits_session | hooks \
     | skip_scaffold | tty_relay | sandbox | restart | fresh_install_own_ip_ingress_publishes_loopback \
     | own_ip_box_registers_with_the_vm_host_without_a_provider_flag \
     | vm_host_row_read_tracks_create_and_destroy \
@@ -30101,7 +30213,7 @@ case "${1:-}" in
   *)
     echo "usage: $0 [case]"
     echo "  no argument: every proof, in the whole-lane order"
-    echo "  cases: lifecycle session_exec session_rename session_outbound_request own_ip own_ip_egress_declared_and_enforced task_run task_network_inherits_session hooks"
+    echo "  cases: lifecycle session_exec exec_reattach session_rename session_outbound_request own_ip own_ip_egress_declared_and_enforced task_run task_network_inherits_session hooks"
     echo "         skip_scaffold tty_relay sandbox restart fresh_install_own_ip_ingress_publishes_loopback"
     echo "         own_ip_box_registers_with_the_vm_host_without_a_provider_flag"
     echo "         vm_host_row_read_tracks_create_and_destroy"
