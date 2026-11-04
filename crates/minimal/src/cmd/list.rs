@@ -571,11 +571,9 @@ fn provider_for(kind: paths::HostKind) -> &'static str {
 /// The name of the host whose daemon serves `sock`. The native daemon is
 /// `local0`. A VM is named by the ssh host alias of its host dir.
 ///
-/// Residual: a named VM prints as `<vm>.local-minvmd0`, its ssh host
-/// alias. BCLI-046 names a VM host by its daemon instance
-/// (`local-minvmd0..N`), and owns the final name. This name flips when the
-/// task that delivers BCLI-046 numbers the VM instances. That task is
-/// <https://github.com/gominimal/minimal/issues/2900>.
+/// A named VM prints as `<vm>.local-minvmd0`, its ssh host alias.
+/// `min host list|show` names the same host the same way
+/// (`cmd/hosts.rs::named_vms`), so one host has one name on both.
 fn host_name_for(kind: paths::HostKind, sock: &std::path::Path) -> String {
     let alias = sock.parent().and_then(paths::ssh_host_alias);
     match kind {
