@@ -1014,6 +1014,11 @@ struct Published {
     holder: String,
     /// The rows the answerer refused, with their reasons.
     refused: Vec<RefusedRow>,
+    /// The rows the publish carried: the held publish's diff baseline.
+    carried: Vec<RegisteredRow>,
+    /// The registry generation the carried rows stood at (0 when the rows
+    /// were not read from a registry).
+    generation: u64,
 }
 
 /// What a connect the channel socket's own mode refused means: the
@@ -1086,35 +1091,90 @@ async fn connect_and_publish(
     }
     let holder = reply.holder.unwrap_or(DAEMON_HOLDER.to_string());
     let mut registration = Registration { stream };
-    let refused = registration.send(rows).await?;
+    let refused = registration.send(rows.clone()).await?;
     Ok(Published {
         registration,
         holder,
         refused,
+        carried: rows,
+        generation: 0,
     })
 }
 
-/// The registry's whole zone table as the channel's rows: the same rows
-/// the serving decision would answer a lookup from, address gate and
-/// stopped-shared fold already applied by
-/// [`HostnameRegistry::zone_table`] — the node's own addresses travel
-/// empty today, exactly as [`ZoneAnswerer::zone_view`] passes them, so
-/// what publishes is what answers. Read from behind the daemon's
-/// `RwLock`, poison recovery matching the serving side's read of the same
-/// lock: a panicked writer's half-state is answered as it stands, never
-/// silently retired.
-fn zone_rows_of(registry: &Arc<std::sync::RwLock<HostnameRegistry>>) -> Vec<RegisteredRow> {
-    let rows = match registry.read() {
-        Ok(guard) => guard.zone_table(&[]),
-        Err(poisoned) => poisoned.into_inner().zone_table(&[]),
+/// [`connect_and_publish`] with the registry's table as it stands, read
+/// with its generation: the ack records that generation as the installed
+/// answerer's, and the published rows become the held publish's baseline.
+async fn connect_and_publish_observed(
+    channel: &std::path::Path,
+    node: &str,
+    registry: &Arc<std::sync::RwLock<HostnameRegistry>>,
+) -> io::Result<Published> {
+    let (generation, rows) = observed_rows_of(registry);
+    let started = tokio::time::Instant::now();
+    let mut published = connect_and_publish(channel, node, rows).await?;
+    published.generation = generation;
+    acknowledged_publish(
+        registry,
+        generation,
+        published.carried.len(),
+        started.elapsed(),
+    );
+    Ok(published)
+}
+
+/// The registry's whole zone table as the channel's rows, with the
+/// generation it stands at ([`HostnameRegistry::observe_zone`]): the same
+/// rows the serving decision would answer a lookup from, address gate and
+/// stopped-shared fold already applied by [`HostnameRegistry::zone_table`],
+/// so what publishes is what answers. Takes the write lock for the moment
+/// the table is compared. Poison recovery matches the serving side's read
+/// of the same lock: a panicked writer's half-state is answered as it
+/// stands, never silently retired.
+fn observed_rows_of(
+    registry: &Arc<std::sync::RwLock<HostnameRegistry>>,
+) -> (u64, Vec<RegisteredRow>) {
+    let (generation, rows) = match registry.write() {
+        Ok(mut guard) => guard.observe_zone(),
+        Err(poisoned) => poisoned.into_inner().observe_zone(),
     };
-    rows.into_iter()
+    let rows = rows
+        .into_iter()
         .map(|row| RegisteredRow {
             name: row.name,
             address: row.address,
             live: true,
         })
-        .collect()
+        .collect();
+    (generation, rows)
+}
+
+/// The registry's acknowledgement handle, read behind its lock.
+fn publish_track_of(
+    registry: &Arc<std::sync::RwLock<HostnameRegistry>>,
+) -> crate::net::dns::ZonePublishTrack {
+    match registry.read() {
+        Ok(guard) => guard.zone_publish_track(),
+        Err(poisoned) => poisoned.into_inner().zone_publish_track(),
+    }
+}
+
+/// Records that the installed answerer acknowledged a publish of the table
+/// at `generation`, and says so in one debug line: the generation, the row
+/// count and how long the acknowledgement took.
+fn acknowledged_publish(
+    registry: &Arc<std::sync::RwLock<HostnameRegistry>>,
+    generation: u64,
+    rows: usize,
+    took: Duration,
+) {
+    publish_track_of(registry).acknowledge(generation);
+    tracing::debug!(
+        component = COMPONENT,
+        generation,
+        rows,
+        acknowledged_ms = took.as_millis(),
+        "the answerer acknowledged a publish of the zone table"
+    );
 }
 
 /// This daemon's node id: the canonical identity dir the daemon runs under
@@ -1592,6 +1652,8 @@ async fn acquire_at(
 ) {
     let manager = state.sessions_manager().await;
     let registry = manager.hostnames();
+    let track = publish_track_of(&registry);
+    track.set_publishing(paths.marker.exists());
     let identity_dir = match state.daemon_identity_dir().await {
         Some(dir) => std::path::PathBuf::from(dir.as_str()),
         None => std::path::PathBuf::from(state.minimal_state_dir().await.as_str()),
@@ -1608,11 +1670,15 @@ async fn acquire_at(
 
     loop {
         if shutdown.is_cancelled() {
+            track.set_publishing(false);
             return;
         }
         // ── the publish arm, fresh. The installed service first, decided
         // by its marker: its channel or nothing.
         let installed = paths.marker.exists();
+        // A name change waits for the installed answerer's ack only while
+        // there is one to publish into (NET-011, NET-012).
+        track.set_publishing(installed);
         let channel = &paths.channel;
         // A socket at the channel path with no install marker is not the
         // installed service's channel — a corpse's leftover or a foreign
@@ -1630,14 +1696,13 @@ async fn acquire_at(
                  service is installed (no install marker); treating the path as absent"
             );
         }
-        let rows = zone_rows_of(&registry);
         let attempt = if stale_global_socket {
             Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "no install marker beside the channel path",
             ))
         } else {
-            connect_and_publish(channel, &node, rows).await
+            connect_and_publish_observed(channel, &node, &registry).await
         };
         match attempt {
             Ok(published) => {
@@ -1680,6 +1745,8 @@ async fn acquire_at(
                     &registry,
                     &mut commands,
                     published.registration,
+                    published.carried,
+                    published.generation,
                     &status,
                     &node,
                     &mut erroring,
@@ -1828,26 +1895,36 @@ async fn wait_out_commands(
 }
 
 /// Keeps one publish held: the connection's end (peeked per wake slice), a
-/// table change (diff-poll on the [`CONNECTION_POLL`] cadence, since the
-/// registry has no change ping and the diff is one small read), the
-/// [`PORT_RECHECK`] bound (a full re-publish), a handover command (a
+/// table change (a ping when a name change waits for its ack, and a
+/// diff-poll on the [`CONNECTION_POLL`] cadence for every other change),
+/// the [`PORT_RECHECK`] bound (a full re-publish), a handover command (a
 /// no-op while publishing — there is no interim to release), or the
 /// shutdown. Returns whether the connection is still held — `false` is the
 /// withdrawal, and the registration drops with the return: the
 /// connection's end is the whole withdrawal.
+///
+/// The diff baseline is `carried`, the rows the first publish sent at
+/// `carried_generation`, never a fresh read: a row registered while the
+/// first publish was in flight differs from it, so it goes out at the next
+/// wake rather than at the recheck.
+#[expect(clippy::too_many_arguments, reason = "the loop's own state, threaded")]
 async fn hold_the_publish(
     registry: &Arc<std::sync::RwLock<HostnameRegistry>>,
     commands: &mut mpsc::Receiver<HandoverCommand>,
     mut registration: Registration,
+    carried: Vec<RegisteredRow>,
+    carried_generation: u64,
     status: &AnswererStatus,
     node: &str,
     erroring: &mut bool,
     shutdown: &CancellationToken,
 ) -> bool {
-    let mut last = zone_rows_of(registry);
+    let track = publish_track_of(registry);
+    track.acknowledge(carried_generation);
+    let mut last = carried;
     let mut recheck_at = tokio::time::Instant::now() + PORT_RECHECK;
     loop {
-        tokio::select! {
+        let sent = tokio::select! {
             biased;
             _ = shutdown.cancelled() => {
                 return false;
@@ -1857,27 +1934,14 @@ async fn hold_the_publish(
                     return false;
                 };
                 refuse_command(command);
+                continue;
             }
             _ = tokio::time::sleep_until(recheck_at) => {
-                let rows = zone_rows_of(registry);
-                match registration.send(rows.clone()).await {
-                    Ok(refused) => {
-                        warn_refused(node, &refused);
-                        last = rows;
-                        recheck_at = tokio::time::Instant::now() + PORT_RECHECK;
-                    }
-                    Err(error) => {
-                        surface_channel_lost(
-                            status,
-                            erroring,
-                            &format!(
-                                "the answerer's end of the channel closed while holding the \
-                                 publish (a service restart): {error}"
-                            ),
-                        );
-                        return false;
-                    }
-                }
+                recheck_at = tokio::time::Instant::now() + PORT_RECHECK;
+                send_observed(registry, &mut registration, node, &mut last, true).await
+            }
+            () = track.changed() => {
+                send_observed(registry, &mut registration, node, &mut last, false).await
             }
             _ = tokio::time::sleep(CONNECTION_POLL) => {
                 // One peeked byte per slice: the connection's end is
@@ -1892,24 +1956,45 @@ async fn hold_the_publish(
                     );
                     return false;
                 }
-                let rows = zone_rows_of(registry);
-                if rows != last {
-                    if let Err(error) = registration.send(rows.clone()).await {
-                        surface_channel_lost(
-                            status,
-                            erroring,
-                            &format!(
-                                "the answerer's end of the channel closed while holding the \
-                                 publish (a service restart): {error}"
-                            ),
-                        );
-                        return false;
-                    }
-                    last = rows;
-                }
+                send_observed(registry, &mut registration, node, &mut last, false).await
             }
+        };
+        if let Err(error) = sent {
+            surface_channel_lost(
+                status,
+                erroring,
+                &format!(
+                    "the answerer's end of the channel closed while holding the \
+                     publish (a service restart): {error}"
+                ),
+            );
+            return false;
         }
     }
+}
+
+/// Sends the registry's table over the held publish when it differs from
+/// `last`, or always with `force`, and records the generation the ack
+/// covers. A table equal to `last` is already what the answerer holds, so
+/// its generation counts as acknowledged without a send.
+async fn send_observed(
+    registry: &Arc<std::sync::RwLock<HostnameRegistry>>,
+    registration: &mut Registration,
+    node: &str,
+    last: &mut Vec<RegisteredRow>,
+    force: bool,
+) -> io::Result<()> {
+    let (generation, rows) = observed_rows_of(registry);
+    if !force && rows == *last {
+        publish_track_of(registry).acknowledge(generation);
+        return Ok(());
+    }
+    let started = tokio::time::Instant::now();
+    let refused = registration.send(rows.clone()).await?;
+    warn_refused(node, &refused);
+    acknowledged_publish(registry, generation, rows.len(), started.elapsed());
+    *last = rows;
+    Ok(())
 }
 
 /// How a release window ended.
@@ -2124,6 +2209,7 @@ async fn host_the_interim(
                                     // client.
                                     *erroring = false;
                                     status.set_hosting(false);
+                                    publish_track_of(registry).set_publishing(true);
                                     warn_refused(node, &published.refused);
                                     announce_publish(
                                         &published.holder,
@@ -2153,6 +2239,8 @@ async fn host_the_interim(
                                         registry,
                                         commands,
                                         published.registration,
+                                        published.carried,
+                                        published.generation,
                                         status,
                                         node,
                                         erroring,
@@ -2258,7 +2346,7 @@ async fn release_window(
         if paths.marker.exists() {
             let attempt = tokio::time::timeout(
                 remaining,
-                connect_and_publish(&paths.channel, node, zone_rows_of(registry)),
+                connect_and_publish_observed(&paths.channel, node, registry),
             )
             .await;
             if let Ok(Ok(published)) = attempt {
@@ -3012,120 +3100,7 @@ mod tests {
         Message::from_vec(&buf[..len]).expect("the answerer's reply decodes")
     }
 
-    /// The manager-held answerer's channel half, as a test stands in for
-    /// the installed service: it holds no UDP port (the test's daemon
-    /// hosts nothing, and the hook port staying free is the proof),
-    /// answers the hello with `service` as the holder, and acks and
-    /// records every publish it is sent — the witness the publish
-    /// contract's assertions read.
-    struct FakeServiceHandle {
-        /// The row sets the service was published, in the order they came.
-        publishes: Arc<Mutex<Vec<Vec<RegisteredRow>>>>,
-        /// Stops the service's accept loop (its connections close with it).
-        stop: CancellationToken,
-        /// The connections the service holds — the daemon's publish rides
-        /// one — so a stop can end them: the connection's end is the whole
-        /// withdrawal, the one event a stop must produce for the daemon.
-        connections: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
-    }
-
-    impl FakeServiceHandle {
-        /// The row sets the service was published, in the order they came.
-        fn publishes(&self) -> Vec<Vec<RegisteredRow>> {
-            self.publishes.lock().unwrap().clone()
-        }
-
-        /// Stops standing in for the service: the accept loop ends, and
-        /// every connection it held is dropped — the service's end of the
-        /// channel, which is what a service stopping is to the daemon
-        /// holding a publish there.
-        fn stop(&self) {
-            self.stop.cancel();
-            for connection in self.connections.lock().unwrap().drain(..) {
-                connection.abort();
-            }
-        }
-    }
-
-    /// Stands in for the installed answerer service at `channel`: binds the
-    /// channel's listener on the calling task (so the daemon's first
-    /// connect finds it there, never racing the service up), then serves
-    /// hellos and publishes forever.
-    fn fake_manager_held_service(channel: std::path::PathBuf) -> FakeServiceHandle {
-        let listener =
-            tokio::net::UnixListener::bind(&channel).expect("the service's channel listener binds");
-        let publishes: Arc<Mutex<Vec<Vec<RegisteredRow>>>> = Arc::new(Mutex::new(Vec::new()));
-        let publishes_loop = Arc::clone(&publishes);
-        let stop = CancellationToken::new();
-        let stop_task = stop.clone();
-        let connections: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> =
-            Arc::new(Mutex::new(Vec::new()));
-        let connections_loop = Arc::clone(&connections);
-        crate::traced::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = stop_task.cancelled() => return,
-                    accepted = listener.accept() => {
-                        let Ok((stream, _)) = accepted else { return };
-                        let publishes = Arc::clone(&publishes_loop);
-                        let connection = crate::traced::spawn(async move {
-                            let mut stream = stream;
-                            let mut saw_hello = false;
-                            loop {
-                                let Ok(Some(line)) = read_reply_line(&mut stream).await else {
-                                    return;
-                                };
-                                if !saw_hello {
-                                    saw_hello = true;
-                                    let hello: Hello = serde_json_lenient::from_str(&line)
-                                        .expect("the daemon's hello parses");
-                                    assert_eq!(
-                                        hello.version, CHANNEL_PROTOCOL_VERSION,
-                                        "the daemon speaks the channel's protocol version"
-                                    );
-                                    assert!(
-                                        hello.node.contains("#native"),
-                                        "the daemon's node id names what it runs as: {}",
-                                        hello.node
-                                    );
-                                    let _ = write_line(
-                                        &mut stream,
-                                        &RegistrationReply {
-                                            ok: true,
-                                            error: None,
-                                            refused: Vec::new(),
-                                            holder: Some(SERVICE_HOLDER.to_string()),
-                                        },
-                                    )
-                                    .await;
-                                    continue;
-                                }
-                                let request: PublishRequest = serde_json_lenient::from_str(&line)
-                                    .expect("the daemon's publish parses");
-                                publishes.lock().unwrap().push(request.rows);
-                                let _ = write_line(
-                                    &mut stream,
-                                    &RegistrationReply {
-                                        ok: true,
-                                        error: None,
-                                        refused: Vec::new(),
-                                        holder: None,
-                                    },
-                                )
-                                .await;
-                            }
-                        });
-                        connections_loop.lock().unwrap().push(connection);
-                    }
-                }
-            }
-        });
-        FakeServiceHandle {
-            publishes,
-            stop,
-            connections,
-        }
-    }
+    use super::stand_in::{FakeServiceHandle, fake_manager_held_service};
 
     /// Asks the control socket at `sock` one `verb` and reads the one reply
     /// the door answers with — the wire the install step's ask travels on,
@@ -4212,5 +4187,463 @@ mod tests {
         );
 
         end(task, &shutdown);
+    }
+
+    /// Waits up to `bound` for the stand-in's held rows to answer `name`
+    /// as `wanted`, and says how long it took.
+    async fn await_answer(
+        service: &FakeServiceHandle,
+        name: &str,
+        wanted: Option<Option<Ipv4Addr>>,
+        bound: Duration,
+    ) -> Duration {
+        let started = tokio::time::Instant::now();
+        loop {
+            if service.answer(name) == wanted {
+                return started.elapsed();
+            }
+            assert!(
+                started.elapsed() < bound,
+                "the installed answerer never answered {name} as {wanted:?} within {bound:?}: \
+                 it holds {:?}",
+                service.publishes().last()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The daemon side of a stand-in installed answerer whose first publish
+    /// is held unacknowledged until `gate` is notified: returns once that
+    /// first publish has reached the service.
+    async fn drive_gated(
+        server: &crate::test_harness::TestServer,
+        gate: Arc<tokio::sync::Notify>,
+    ) -> (
+        FakeServiceHandle,
+        std::thread::JoinHandle<()>,
+        CancellationToken,
+        AnswererStatus,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().expect("a tempdir for the channel and the marker");
+        let channel = dir.path().join("answerer.sock");
+        let marker = dir.path().join("minzoned.socket");
+        std::fs::write(&marker, b"[Socket]\nListenDatagram=127.0.0.1:17656\n")
+            .expect("the install marker is written");
+        let service = super::stand_in::fake_manager_held_service_gated(channel.clone(), Some(gate));
+        let status = AnswererStatus::starting();
+        let shutdown = CancellationToken::new();
+        let task = drive(
+            server.state.clone(),
+            free_udp_port(),
+            status.clone(),
+            AnswererPaths {
+                channel,
+                marker,
+                release_window: RELEASE_WINDOW,
+            },
+            shutdown.clone(),
+            CaptureWriter::default(),
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while service.publishes().is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the daemon's first publish never reached the service"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (service, task, shutdown, status, dir)
+    }
+
+    /// NET-011: a row registered while the daemon's first publish is still
+    /// waiting for its ack goes out at the next slice, not at the 30 s
+    /// recheck. The held publish diffs against the rows the first publish
+    /// carried, so the row is a change it sends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn row_registered_during_first_publish_reaches_answerer() {
+        let server = crate::test_harness::TestServer::new().await;
+        let registry = server.state.sessions_manager().await.hostnames();
+        registry
+            .write()
+            .expect("the registry lock is held")
+            .register_host_net(SessionId::nil(), "web");
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (service, task, shutdown, _status, _dir) =
+            drive_gated(&server, Arc::clone(&gate)).await;
+        assert_eq!(
+            service.answer("api.min.internal"),
+            None,
+            "the first publish was read before the second row existed"
+        );
+
+        // Registered with no waiter, so no ping: only the held publish's
+        // own diff can carry it.
+        registry
+            .write()
+            .expect("the registry lock is held")
+            .register_host_net(SessionId::mint(), "api");
+        gate.notify_one();
+
+        let took = await_answer(
+            &service,
+            "api.min.internal",
+            Some(Some(Ipv4Addr::LOCALHOST)),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            took < PORT_RECHECK,
+            "the row waited for the recheck: {took:?}"
+        );
+
+        service.stop();
+        end(task, &shutdown);
+    }
+
+    /// NET-011: a registration's waiter resolves only once the installed
+    /// answerer acknowledged the row, so the name answers there the moment
+    /// the wait returns. That holds for a box registered while the daemon's
+    /// first publish is in flight, and for one registered after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn activated_box_name_answers_at_installed_answerer_on_return() {
+        let server = crate::test_harness::TestServer::new().await;
+        let registry = server.state.sessions_manager().await.hostnames();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (service, task, shutdown, status, _dir) = drive_gated(&server, Arc::clone(&gate)).await;
+
+        // The first box, while the first publish waits for its ack.
+        let waiter = {
+            let mut reg = registry.write().expect("the registry lock is held");
+            reg.register_host_net(SessionId::nil(), "web");
+            reg.zone_change_waiter()
+        };
+        let released = {
+            let gate = Arc::clone(&gate);
+            crate::traced::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                gate.notify_one();
+            })
+        };
+        assert!(
+            waiter.wait(Duration::from_secs(5)).await,
+            "the first box's registration was acknowledged"
+        );
+        assert_eq!(
+            service.answer("web.min.internal"),
+            Some(Some(Ipv4Addr::LOCALHOST)),
+            "the first box's name answers at the installed answerer on return"
+        );
+        released.await.expect("the gate task ends");
+        await_status_is(
+            &status,
+            minimald_rpc::ZoneAnswererStatus::ManagerHeld { port: 17656 },
+            "published into the manager-held answerer",
+        )
+        .await;
+
+        // A later box, with the publish held.
+        let waiter = {
+            let mut reg = registry.write().expect("the registry lock is held");
+            reg.register_host_net(SessionId::mint(), "api");
+            reg.zone_change_waiter()
+        };
+        assert!(
+            waiter.wait(Duration::from_secs(2)).await,
+            "the later box's registration was acknowledged inside the bound"
+        );
+        assert_eq!(
+            service.answer("api.min.internal"),
+            Some(Some(Ipv4Addr::LOCALHOST)),
+            "the later box's name answers at the installed answerer on return"
+        );
+
+        service.stop();
+        end(task, &shutdown);
+    }
+
+    /// NET-012: a withdrawal's waiter resolves only once the installed
+    /// answerer acknowledged a table without the row, so the name is
+    /// NXDOMAIN there the moment the wait returns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn destroyed_box_name_is_nxdomain_at_installed_answerer_on_return() {
+        let server = crate::test_harness::TestServer::new().await;
+        let registry = server.state.sessions_manager().await.hostnames();
+        let stand_in = super::stand_in::InstalledStandIn::start(server.state.clone()).await;
+
+        let waiter = {
+            let mut reg = registry.write().expect("the registry lock is held");
+            reg.register_host_net(SessionId::nil(), "web");
+            reg.zone_change_waiter()
+        };
+        assert!(waiter.wait(Duration::from_secs(2)).await);
+        assert_eq!(
+            stand_in.service.answer("web.min.internal"),
+            Some(Some(Ipv4Addr::LOCALHOST)),
+            "the name answers while the box lives"
+        );
+
+        let waiter = {
+            let mut reg = registry.write().expect("the registry lock is held");
+            reg.deregister("web");
+            reg.zone_change_waiter()
+        };
+        assert!(
+            waiter.wait(Duration::from_secs(2)).await,
+            "the withdrawal was acknowledged inside the bound"
+        );
+        assert_eq!(
+            stand_in.service.answer("web.min.internal"),
+            None,
+            "the destroyed box's name is NXDOMAIN at the installed answerer on return"
+        );
+    }
+
+    /// With no installed answerer to publish into, the daemon's own table
+    /// is what answers, so a waiter resolves at once.
+    #[test]
+    fn name_change_waiter_resolves_at_once_without_an_installed_answerer() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime builds");
+        let mut registry = registry(false);
+        let waiter = registry.zone_change_waiter();
+        assert!(runtime.block_on(waiter.wait(Duration::ZERO)));
+    }
+}
+
+/// The installed answerer service, stood in for by tests: a channel that
+/// acknowledges and records every publish, and a daemon acquisition that
+/// publishes into it.
+#[cfg(test)]
+pub(crate) mod stand_in {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    /// The manager-held answerer's channel half, as a test stands in for
+    /// the installed service: it holds no UDP port (the test's daemon
+    /// hosts nothing, and the hook port staying free is the proof),
+    /// answers the hello with `service` as the holder, and acks and
+    /// records every publish it is sent — the witness the publish
+    /// contract's assertions read.
+    pub(crate) struct FakeServiceHandle {
+        /// The row sets the service was published, in the order they came.
+        publishes: Arc<Mutex<Vec<Vec<RegisteredRow>>>>,
+        /// Stops the service's accept loop (its connections close with it).
+        stop: CancellationToken,
+        /// The connections the service holds — the daemon's publish rides
+        /// one — so a stop can end them: the connection's end is the whole
+        /// withdrawal, the one event a stop must produce for the daemon.
+        connections: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    }
+
+    impl FakeServiceHandle {
+        /// What a lookup of `name` gets from the rows the service holds now,
+        /// its newest acknowledged publish: `None` for NXDOMAIN (no row),
+        /// `Some(address)` for a held name, with no address for NODATA.
+        pub(crate) fn answer(&self, name: &str) -> Option<Option<Ipv4Addr>> {
+            self.publishes
+                .lock()
+                .unwrap()
+                .last()?
+                .iter()
+                .find(|row| row.name == name)
+                .map(|row| row.address)
+        }
+
+        /// The row sets the service was published, in the order they came.
+        pub(super) fn publishes(&self) -> Vec<Vec<RegisteredRow>> {
+            self.publishes.lock().unwrap().clone()
+        }
+
+        /// Stops standing in for the service: the accept loop ends, and
+        /// every connection it held is dropped — the service's end of the
+        /// channel, which is what a service stopping is to the daemon
+        /// holding a publish there.
+        pub(crate) fn stop(&self) {
+            self.stop.cancel();
+            for connection in self.connections.lock().unwrap().drain(..) {
+                connection.abort();
+            }
+        }
+    }
+
+    /// Stands in for the installed answerer service at `channel`: binds the
+    /// channel's listener on the calling task (so the daemon's first
+    /// connect finds it there, never racing the service up), then serves
+    /// hellos and publishes forever.
+    pub(crate) fn fake_manager_held_service(channel: std::path::PathBuf) -> FakeServiceHandle {
+        fake_manager_held_service_gated(channel, None)
+    }
+
+    /// [`fake_manager_held_service`] whose first publish is recorded at once but
+    /// acknowledged only once `first_ack` is notified, when a gate is given: the
+    /// window in which a daemon's first publish is in flight.
+    pub(crate) fn fake_manager_held_service_gated(
+        channel: std::path::PathBuf,
+        first_ack: Option<Arc<tokio::sync::Notify>>,
+    ) -> FakeServiceHandle {
+        let listener =
+            tokio::net::UnixListener::bind(&channel).expect("the service's channel listener binds");
+        let publishes: Arc<Mutex<Vec<Vec<RegisteredRow>>>> = Arc::new(Mutex::new(Vec::new()));
+        let publishes_loop = Arc::clone(&publishes);
+        let stop = CancellationToken::new();
+        let stop_task = stop.clone();
+        let connections: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let connections_loop = Arc::clone(&connections);
+        // Taken by the first publish of any connection, so only that one waits.
+        let first_ack = Arc::new(Mutex::new(first_ack));
+        crate::traced::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = stop_task.cancelled() => return,
+                    accepted = listener.accept() => {
+                        let Ok((stream, _)) = accepted else { return };
+                        let publishes = Arc::clone(&publishes_loop);
+                        let first_ack = Arc::clone(&first_ack);
+                        let connection = crate::traced::spawn(async move {
+                            let mut stream = stream;
+                            let mut saw_hello = false;
+                            loop {
+                                let Ok(Some(line)) = read_reply_line(&mut stream).await else {
+                                    return;
+                                };
+                                if !saw_hello {
+                                    saw_hello = true;
+                                    let hello: Hello = serde_json_lenient::from_str(&line)
+                                        .expect("the daemon's hello parses");
+                                    assert_eq!(
+                                        hello.version, CHANNEL_PROTOCOL_VERSION,
+                                        "the daemon speaks the channel's protocol version"
+                                    );
+                                    assert!(
+                                        hello.node.contains("#native"),
+                                        "the daemon's node id names what it runs as: {}",
+                                        hello.node
+                                    );
+                                    let _ = write_line(
+                                        &mut stream,
+                                        &RegistrationReply {
+                                            ok: true,
+                                            error: None,
+                                            refused: Vec::new(),
+                                            holder: Some(SERVICE_HOLDER.to_string()),
+                                        },
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                let request: PublishRequest = serde_json_lenient::from_str(&line)
+                                    .expect("the daemon's publish parses");
+                                publishes.lock().unwrap().push(request.rows);
+                                let gate = first_ack.lock().unwrap().take();
+                                if let Some(gate) = gate {
+                                    gate.notified().await;
+                                }
+                                let _ = write_line(
+                                    &mut stream,
+                                    &RegistrationReply {
+                                        ok: true,
+                                        error: None,
+                                        refused: Vec::new(),
+                                        holder: None,
+                                    },
+                                )
+                                .await;
+                            }
+                        });
+                        connections_loop.lock().unwrap().push(connection);
+                    }
+                }
+            }
+        });
+        FakeServiceHandle {
+            publishes,
+            stop,
+            connections,
+        }
+    }
+
+    /// A daemon publishing into a stand-in installed answerer: the service,
+    /// the install marker beside its channel, and the daemon's acquisition
+    /// on a thread of its own. Dropping it ends both.
+    pub(crate) struct InstalledStandIn {
+        /// The stand-in service.
+        pub(crate) service: FakeServiceHandle,
+        shutdown: CancellationToken,
+        task: Option<std::thread::JoinHandle<()>>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl InstalledStandIn {
+        /// Starts the service and `state`'s acquisition against it, and
+        /// waits until the daemon's publish is held.
+        pub(crate) async fn start(state: crate::server::ServerStateHandle) -> Self {
+            let dir = tempfile::tempdir().expect("a tempdir for the channel and the marker");
+            let channel = dir.path().join("answerer.sock");
+            let marker = dir.path().join("minzoned.socket");
+            std::fs::write(&marker, b"[Socket]\nListenDatagram=127.0.0.1:17656\n")
+                .expect("the install marker is written");
+            let service = fake_manager_held_service(channel.clone());
+            let status = AnswererStatus::starting();
+            let shutdown = CancellationToken::new();
+            let hook_port = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+                .and_then(|socket| socket.local_addr())
+                .expect("a free UDP port")
+                .port();
+            let paths = AnswererPaths {
+                channel,
+                marker,
+                release_window: RELEASE_WINDOW,
+            };
+            let task = {
+                let status = status.clone();
+                let shutdown = shutdown.clone();
+                std::thread::Builder::new()
+                    .name("the stand-in acquisition".to_string())
+                    .spawn(move || {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("the acquisition's own runtime builds");
+                        let local = tokio::task::LocalSet::new();
+                        local.block_on(&runtime, async move {
+                            acquire_at(state, hook_port, status, paths, shutdown).await;
+                        });
+                    })
+                    .expect("the acquisition's thread spawns")
+            };
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while !matches!(
+                status.get(),
+                minimald_rpc::ZoneAnswererStatus::ManagerHeld { .. }
+            ) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the daemon never published into the stand-in: {:?}",
+                    status.get()
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Self {
+                service,
+                shutdown,
+                task: Some(task),
+                _dir: dir,
+            }
+        }
+    }
+
+    impl Drop for InstalledStandIn {
+        fn drop(&mut self) {
+            self.shutdown.cancel();
+            if let Some(task) = self.task.take() {
+                let _ = task.join();
+            }
+            self.service.stop();
+        }
     }
 }
