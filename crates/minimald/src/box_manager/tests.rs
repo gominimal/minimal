@@ -5072,3 +5072,157 @@ async fn stop_racing_natural_end_answers_already_exited() {
         "the daemon log names the race outcome:\n{logged}"
     );
 }
+
+/// A classifier tree laid out the way the privileged step installs it, with
+/// a mount table that covers it with `nsdelegate`: every fact the decision
+/// reads off the tree, so the probe's reading (a stand-in) is the one input
+/// it still needs. The guard keeps the tree alive.
+fn stand_in_classifier_tree() -> (TempDir, std::path::PathBuf, String) {
+    let tree = TempDir::new().expect("a temp dir standing in for the classifier tree");
+    let root = tree.path().to_path_buf();
+    for verdict in [
+        sandbox::config::Verdict::Deny,
+        sandbox::config::Verdict::Allow,
+    ] {
+        let subtree = root
+            .join(sandbox::classifier::BOXES_DIR)
+            .join(verdict.dir_name());
+        std::fs::create_dir_all(&subtree).expect("the step makes the subtree");
+        for file in ["cgroup.procs", "cgroup.threads", "cgroup.subtree_control"] {
+            std::fs::write(subtree.join(file), "").expect("the step makes the subtree's files");
+        }
+    }
+    std::fs::create_dir_all(root.join(sandbox::classifier::TABLE_MARKER))
+        .expect("the step writes the table's marker");
+    std::fs::create_dir_all(root.join("ct-mark-mask-0x30000000"))
+        .expect("the step records the ct-mark mask beside the marker");
+    let mountinfo = format!(
+        "35 30 0:26 / {} rw,relatime shared:2 - cgroup2 cgroup2 rw,nsdelegate\n",
+        root.display()
+    );
+    (tree, root, mountinfo)
+}
+
+/// NET-079: a host-address create re-reads the host's classifier fact when
+/// the stored one says the probe could not read the table — the read a
+/// daemon takes before it stands in its own leaf — so the create answers
+/// over the host as it is now. A deny-all box is then created over
+/// `per_box`, and a narrowing declaration is refused naming only the rule
+/// it declared. Any other stored cause, and any other mode's create, is
+/// answered from the stored fact with no re-read.
+// The guard spans the awaited creates on purpose: the fact, the reading
+// stand-in and the tree stand-in are process-global.
+#[expect(
+    clippy::await_holding_lock,
+    reason = "the fact is process-global, so the guard must span the awaited \
+              creates it is set for"
+)]
+#[tokio::test]
+async fn host_ip_create_rereads_a_stale_unreadable_fact() {
+    use crate::net::classifier::{Cause, Decision, Reading};
+    let _fact_window = crate::box_runtime::PROBE_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let (_state, _cache, mngr) = manager().await;
+    let capture = crate::test_harness::captured_log();
+    let (tree, root, mountinfo) = stand_in_classifier_tree();
+    *CREATE_CLASSIFIER_TREE_STANDIN
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some((root, mountinfo));
+    // The table refuses, as a loaded table does once the daemon is placed.
+    crate::box_runtime::install_classifier_reading_standin(Reading::Refused(Vec::new()));
+    let host_ip = |name: &str, egress: boxes::EgressPolicy| {
+        let mut config = sample_config();
+        config.name = Some(name.to_string());
+        config.network = boxes::NetworkMode::HostNet;
+        config.policy = boxes::BoxPolicy::new(Some(egress), None);
+        config
+    };
+
+    // The stale start-up read: the probe could not read the table.
+    crate::box_runtime::set_host_ip_enforcement_fact(&Decision::undecidable(
+        Cause::ProbeUnreadable,
+    ));
+    mngr.create_session(
+        host_ip("stale-deny-all", boxes::EgressPolicy::deny_all()),
+        None,
+    )
+    .await
+    .expect("a deny-all host-address box is created over the re-read fact");
+    let fact = crate::box_runtime::host_ip_enforcement_fact();
+    assert!(
+        fact.can_decide_per_box() && fact.cause.is_none(),
+        "the create re-read the host and found it decides per box"
+    );
+
+    // The same stale fact, and a box started with `--allow-subnets` alone:
+    // the re-read says the host decides per box, so the create refuses the
+    // narrowing, and names only the rule the box declared.
+    crate::box_runtime::set_host_ip_enforcement_fact(&Decision::undecidable(
+        Cause::ProbeUnreadable,
+    ));
+    let refused = mngr
+        .create_session(
+            host_ip(
+                "stale-allow-subnets",
+                boxes::EgressPolicy {
+                    allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                    ..Default::default()
+                },
+            ),
+            None,
+        )
+        .await
+        .expect_err("a per-box host refuses a narrowing it cannot enforce");
+    assert_eq!(refused.kind(), ErrorKind::InvalidInput);
+    let words = refused.to_string();
+    assert!(
+        words.contains("allow_subnets") && !words.contains("allow_dns_hosts"),
+        "the refusal names only the declared rule: {words}"
+    );
+
+    // Any other stored cause is answered as stored: no re-read.
+    crate::box_runtime::set_host_ip_enforcement_fact(&Decision::undecidable(
+        Cause::TableNotEffective,
+    ));
+    mngr.create_session(
+        host_ip("stored-cause", boxes::EgressPolicy::deny_all()),
+        None,
+    )
+    .await
+    .expect("a create over a stored cause is not refused at create");
+    assert_eq!(
+        crate::box_runtime::host_ip_enforcement_fact().cause,
+        Some(Cause::TableNotEffective),
+        "a create over any other cause does not re-read the host"
+    );
+
+    // An own-address create never re-reads the host-address fact.
+    crate::box_runtime::set_host_ip_enforcement_fact(&Decision::undecidable(
+        Cause::ProbeUnreadable,
+    ));
+    let mut own = sample_config();
+    own.name = Some("own-address".to_string());
+    own.network = boxes::NetworkMode::OwnIp;
+    mngr.create_session(own, None)
+        .await
+        .expect("an own-address box is created");
+    assert_eq!(
+        crate::box_runtime::host_ip_enforcement_fact().cause,
+        Some(Cause::ProbeUnreadable),
+        "an own-address create does not re-read the host"
+    );
+
+    let logged = capture.contents();
+    assert!(
+        logged.contains("reread=true") && logged.contains("reread=false"),
+        "each host-address create logs whether it re-read the fact:\n{logged}"
+    );
+
+    *CREATE_CLASSIFIER_TREE_STANDIN
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = None;
+    crate::box_runtime::clear_classifier_reading_standin();
+    crate::box_runtime::clear_host_ip_enforcement_fact();
+    drop(tree);
+}
