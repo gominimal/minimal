@@ -215,8 +215,20 @@ pub fn read_host_exposures(path: &Path) -> Result<HostExposures, HostExposuresEr
 }
 
 /// What identifies one version of the file: a changed file has a changed
-/// stamp. `None` is a file that does not exist.
-type Stamp = Option<(SystemTime, u64, u64)>;
+/// stamp. The change time is in it because a write always sets it, and a
+/// restore of an older modification time (`touch -r`) does not reset it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    modified: SystemTime,
+    len: u64,
+    dev: u64,
+    ino: u64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+/// The stamp of the file, `None` for a file that does not exist.
+type Stamp = Option<FileStamp>;
 
 /// How close to a read a modification time must be for the stamp alone not
 /// to prove the file unchanged. An edit inside one timestamp tick that keeps
@@ -225,14 +237,18 @@ type Stamp = Option<(SystemTime, u64, u64)>;
 const RACY_WINDOW: Duration = Duration::from_secs(2);
 
 /// Whether a file with stamp `stamp`, read at `read_at`, can have changed
-/// since without a change to its stamp.
-fn racy(stamp: Stamp, read_at: SystemTime) -> bool {
-    let Some((modified, _, _)) = stamp else {
+/// since without a change to its stamp. A modification time after the read
+/// (a clock that stepped back, or a future mtime) proves nothing about the
+/// tick, so it is racy until `confirmed`: one more read found the same stamp
+/// and the same text. Without that, every lookup reads the whole file again.
+fn racy(stamp: Stamp, read_at: SystemTime, confirmed: bool) -> bool {
+    let Some(stamp) = stamp else {
         return false;
     };
-    !read_at
-        .duration_since(modified)
-        .is_ok_and(|age| age >= RACY_WINDOW)
+    match read_at.duration_since(stamp.modified) {
+        Ok(age) => age < RACY_WINDOW,
+        Err(_) => !confirmed,
+    }
 }
 
 /// What one read of the file found.
@@ -252,6 +268,8 @@ enum Body {
 struct Loaded {
     stamp: Stamp,
     read_at: SystemTime,
+    /// A read after this one's found the same stamp and the same text.
+    confirmed: bool,
     body: Body,
     table: Arc<HostExposures>,
 }
@@ -259,7 +277,14 @@ struct Loaded {
 fn stamp(path: &Path) -> Stamp {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::metadata(path).ok()?;
-    Some((meta.modified().ok()?, meta.len(), meta.ino()))
+    Some(FileStamp {
+        modified: meta.modified().ok()?,
+        len: meta.len(),
+        dev: meta.dev(),
+        ino: meta.ino(),
+        ctime: meta.ctime(),
+        ctime_nsec: meta.ctime_nsec(),
+    })
 }
 
 /// The `[host-exposures]` table of one `config.toml`, read again each time
@@ -288,7 +313,8 @@ impl HostExposuresFile {
     }
 
     /// The current table. The file is read again when its modification
-    /// time, length or inode changed since the last read, or when its
+    /// time, change time, length, device or inode changed since the last
+    /// read, or when its
     /// modification time is too close to the last read to prove it
     /// unchanged. A read that finds what the last one found keeps the table,
     /// the same `Arc`, and logs nothing. A table that does not read is an
@@ -302,7 +328,7 @@ impl HostExposuresFile {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(loaded) = state.as_ref()
             && loaded.stamp == now
-            && !racy(loaded.stamp, loaded.read_at)
+            && !racy(loaded.stamp, loaded.read_at, loaded.confirmed)
         {
             return Arc::clone(&loaded.table);
         }
@@ -315,6 +341,7 @@ impl HostExposuresFile {
         if let Some(loaded) = state.as_mut()
             && loaded.body == body
         {
+            loaded.confirmed = loaded.stamp == now;
             loaded.stamp = now;
             loaded.read_at = read_at;
             return Arc::clone(&loaded.table);
@@ -363,6 +390,7 @@ impl HostExposuresFile {
         *state = Some(Loaded {
             stamp: now,
             read_at,
+            confirmed: false,
             body,
             table: Arc::clone(&table),
         });
@@ -469,5 +497,67 @@ mod tests {
         let table = file.current();
         assert!(!table.opens(6, 8080), "the removed port is closed");
         assert!(table.opens(6, 8081), "the new port is open");
+    }
+
+    /// An edit that keeps the length and restores an old modification time,
+    /// as `touch -r` does, still changes the change time, so it is read.
+    #[test]
+    fn an_edit_that_restores_an_old_mtime_is_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        let set_old = |path: &Path| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        };
+        std::fs::write(&path, "[host-exposures.web]\nport = 8080\n").unwrap();
+        set_old(&path);
+        let file = HostExposuresFile::new(path.clone());
+        assert!(file.current().opens(6, 8080));
+        // Some kernels keep a coarse change time, so let one tick pass.
+        std::thread::sleep(Duration::from_millis(50));
+        std::fs::write(&path, "[host-exposures.web]\nport = 8081\n").unwrap();
+        set_old(&path);
+        let table = file.current();
+        assert!(!table.opens(6, 8080), "the removed port is closed");
+        assert!(table.opens(6, 8081), "the new port is open");
+    }
+
+    /// A modification time after the read is racy for one more read only.
+    /// When that read finds the same stamp and text, the stamp is proof.
+    #[test]
+    fn a_future_mtime_is_proof_after_one_confirming_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[host-exposures.web]\nport = 8080\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(3600))
+            .unwrap();
+        let file = HostExposuresFile::new(path);
+        let first = file.current();
+        let confirmed = |file: &HostExposuresFile| {
+            file.state
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|loaded| loaded.confirmed)
+        };
+        assert!(!confirmed(&file), "the first read proves nothing");
+        assert!(Arc::ptr_eq(&first, &file.current()));
+        assert!(confirmed(&file), "the second read confirms the stamp");
+        let loaded = file.state.lock().unwrap().as_ref().unwrap().read_at;
+        assert!(Arc::ptr_eq(&first, &file.current()));
+        assert_eq!(
+            file.state.lock().unwrap().as_ref().unwrap().read_at,
+            loaded,
+            "a confirmed stamp is not read again"
+        );
     }
 }
