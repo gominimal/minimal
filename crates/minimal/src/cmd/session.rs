@@ -309,16 +309,21 @@ pub async fn cmd_session_policy(
             // carry — and it has no host-side gate the set would describe —
             // so that arm passes `None` and the block is left out rather
             // than printed from a plan the session does not attach to.
-            let fabric = (daemon_host_kind(global) == paths::HostKind::Minvmd)
-                .then_some(switch::SwitchSubnet::default());
+            let host_kind = daemon_host_kind(global);
+            let fabric =
+                (host_kind == paths::HostKind::Minvmd).then_some(switch::SwitchSubnet::default());
+            // NET-160: the host exposures row turns on the host kind itself,
+            // not on `fabric`.
+            let native_host = host_kind == paths::HostKind::Minimald;
             let mut out = std::io::stdout();
-            format_policy(
+            format_policy_on_host(
                 &mut out,
                 &policy,
                 record.network,
                 host_ip_enforcement,
                 &shared_port_collisions,
                 fabric,
+                native_host,
             )?;
             write_live_ingress(&mut out, &live)?;
             if let Some(facts) = &facts {
