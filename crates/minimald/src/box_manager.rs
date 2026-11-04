@@ -133,6 +133,9 @@ fn create_classifier_tree() -> (std::path::PathBuf, Option<String>) {
 /// host changing (a daemon not yet placed in its leaf at start reads so),
 /// so the create re-reads the host rather than answer from a stale read.
 /// A re-read that does not run keeps the stored fact.
+// The create lines carry the fact as `host_fact`, never as
+// `host_ip_enforcement`: that field marks the per-launch classifier record,
+// and readers of the log take every line with it as a launch decision.
 async fn create_host_ip_fact(
     network: boxes::NetworkMode,
     session_name: &str,
@@ -145,7 +148,7 @@ async fn create_host_ip_fact(
         tracing::info!(
             session_name,
             reread = false,
-            host_ip_enforcement = %stored.enforcement.machine_str(),
+            host_fact = %stored.enforcement.machine_str(),
             "host-address create answered from the stored classifier fact"
         );
         return stored;
@@ -163,7 +166,7 @@ async fn create_host_ip_fact(
             tracing::info!(
                 session_name,
                 reread = true,
-                host_ip_enforcement = %fact.enforcement.machine_str(),
+                host_fact = %fact.enforcement.machine_str(),
                 cause = decision.cause().map(crate::net::classifier::Cause::detail),
                 "host-address create re-read the classifier fact the start-up \
                  probe could not read"
