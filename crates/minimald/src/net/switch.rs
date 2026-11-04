@@ -62,6 +62,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use client_config::host_exposures::HostExposuresFile;
+
 use super::dns_gate::DnsGate;
 use super::policy::{Direction, PolicyWarnLimiter, Proto};
 use super::{DEFAULT_MTU, PtaskLease, SwitchSubnet};
@@ -439,8 +441,23 @@ pub async fn attach_to_switch(
     let mut sock = UnixStream::connect(api_sock).await?;
     sock.write_all(CONNECT_REQUEST).await?;
     let (sock_rx, sock_tx) = sock.into_split();
+    // NET-160, NET-161: a local-socket attach is the native host's own-address
+    // box. Its relay is the only leg between the box and the host alias, so it
+    // decides the alias by the user's `[host-exposures]` table. A vsock attach
+    // runs in a VM guest, where the VM host daemon applies the host's table.
+    if let Some(gate) = &gate {
+        gate.use_host_exposures(Arc::clone(&NATIVE_HOST_EXPOSURES));
+    }
     spawn_relay(tap_fd, sock_rx, sock_tx, gate, false, lease, subnet)
 }
+
+/// The native host's `[host-exposures]` table: the one in the client's
+/// `config.toml`, read again when the file changes (NET-159, NET-161).
+static NATIVE_HOST_EXPOSURES: LazyLock<Arc<HostExposuresFile>> = LazyLock::new(|| {
+    Arc::new(HostExposuresFile::new(
+        paths::minimal_config_dir_with_override(None).join("config.toml"),
+    ))
+});
 
 /// Attaches `tap_fd` to the **host** gvproxy switch over AF_VSOCK (DM1/3/4) and
 /// starts relaying frames between them.
@@ -952,8 +969,21 @@ where
         // the box's next connection nowhere; the lease check above still
         // governs every frame; and no frame the box sends can open a record,
         // so the box cannot mint this admission.
+        // NET-160, NET-161: on a native host the host alias is decided by
+        // the current `[host-exposures]` table and the box's own rules,
+        // ahead of the egress rules, which open no port there.
+        let host_alias = match &gate {
+            Some(gate) if !gate.reply_admits_frame(&buf[..n]) => {
+                gate.host_alias_egress(verdict_summary, &buf[..n])
+            }
+            Some(_) => HostAliasVerdict::Admit,
+            None => HostAliasVerdict::NotHostAlias,
+        };
+        if host_alias == HostAliasVerdict::Refuse {
+            continue;
+        }
         if let Some(gate) = &gate
-            && !gate.reply_admits_frame(&buf[..n])
+            && host_alias == HostAliasVerdict::NotHostAlias
             && let FrameVerdict::Drop(reason) = egress::verdict(verdict_summary, &gate.egress)
         {
             // NET-066, with design §5.3's conntrack-aware retention: an
@@ -1520,6 +1550,99 @@ pub struct BoxGate {
     /// The rate limit on the debug line each rejected UDP 443 datagram
     /// writes.
     quic443_log: Quic443RejectLog,
+    /// The switch's host alias, the address `host.min.internal` answers.
+    host_alias: Ipv4Addr,
+    /// The host's `[host-exposures]` table, set on a native attach alone
+    /// (NET-160). Unset, the alias is decided by the egress rules, which
+    /// open no port there.
+    host_exposures: std::sync::OnceLock<Arc<HostExposuresFile>>,
+    /// The box's half of a host exposure (NET-160): its
+    /// `egress.allow_dns_hosts` names `host.min.internal`, or its
+    /// `egress.allow_subnets` covers the alias, and its `deny_subnets` does
+    /// not.
+    names_host: bool,
+    /// The flows this box opened to a host exposure, so a segment of one
+    /// whose exposure was removed ends the flow (NET-161).
+    host_flows: Mutex<HashMap<HostFlowKey, Instant>>,
+}
+
+/// One flow from a box to a host exposure: the protocol, the box's port and
+/// the exposure's port.
+type HostFlowKey = (u8, u16, u16);
+
+/// The most host-exposure flows one gate tracks. A flow past the bound is
+/// still decided per frame. It is only not reset when its exposure is
+/// removed.
+const HOST_FLOWS_PER_BOX: usize = 1024;
+
+/// The rule a host-alias refusal names in its log line (NET-160).
+pub(crate) const HOST_ALIAS_RULE: &str = "host-alias";
+
+/// What the host's table says about one frame to or from the host alias.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostAliasVerdict {
+    /// The frame does not concern a host exposure: the other checks decide.
+    NotHostAlias,
+    /// The frame is admitted: the table opens its port and the box names the
+    /// host.
+    Admit,
+    /// The frame is refused.
+    Refuse,
+}
+
+/// A reset that ends one host-exposure flow (NET-161), from `src` to `dst`
+/// at sequence number `seq`. `along` is whether the reset travels the way
+/// `frame` did, which decides the order of the link addresses.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "`frame` parsed as IPv4 TCP, so it carries its 14-byte Ethernet header"
+)]
+fn host_flow_reset(
+    frame: &[u8],
+    src: SocketAddrV4,
+    dst: SocketAddrV4,
+    seq: u32,
+    along: bool,
+) -> Vec<u8> {
+    let mut first = [0u8; 6];
+    let mut second = [0u8; 6];
+    first.copy_from_slice(&frame[0..6]);
+    second.copy_from_slice(&frame[6..12]);
+    let (eth_dst, eth_src) = if along {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    refusal::tcp_reset_frame(eth_dst, eth_src, src, dst, seq, 0, false)
+}
+
+/// Whether `policy` holds the box's half of a host exposure (NET-160).
+fn names_host_alias(
+    policy: &boxes::BoxPolicy,
+    rules: &egress::EgressRules,
+    alias: Ipv4Addr,
+) -> bool {
+    let alias = alias.octets();
+    if rules
+        .deny_subnets()
+        .is_some_and(|deny| deny.iter().any(|cidr| cidr.contains(alias)))
+    {
+        return false;
+    }
+    let named = policy
+        .egress
+        .as_ref()
+        .and_then(|egress| egress.allow_dns_hosts.as_ref())
+        .is_some_and(|hosts| {
+            hosts.iter().any(|host| {
+                host.trim_end_matches('.')
+                    .eq_ignore_ascii_case(HOST_MIN_INTERNAL)
+            })
+        });
+    let covered = rules
+        .allow_subnets()
+        .is_none_or(|allow| allow.iter().any(|cidr| cidr.contains(alias)));
+    named || covered
 }
 
 /// The names a credentialed box's lookups are steered for: the GitHub
@@ -1593,6 +1716,7 @@ impl BoxGate {
         // with the DNS gate below — so a name's admission and a frame's
         // verdict can never disagree about what the box declared.
         let rules = compiled_egress(Some(policy), subnet, lease, hostname_proxy_port);
+        let names_host = names_host_alias(policy, &rules, subnet.host_alias());
         let infrastructure = infrastructure_deny_set(subnet);
         let limiter = Arc::new(PolicyWarnLimiter::new());
         // One DNS gate per box, sharing the limiter, the resolver address
@@ -1673,7 +1797,132 @@ impl BoxGate {
             quic443_blocked,
             proxy: subnet.box_egress_proxy_address(),
             quic443_log: Quic443RejectLog::default(),
+            host_alias: subnet.host_alias(),
+            host_exposures: std::sync::OnceLock::new(),
+            names_host,
+            host_flows: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Decides the host alias by `table` from now on (NET-160). The first
+    /// table set wins.
+    pub(crate) fn use_host_exposures(&self, table: Arc<HostExposuresFile>) {
+        let _ = self.host_exposures.set(table);
+    }
+
+    /// NET-160, NET-161: the egress leg's decision on a frame to the host
+    /// alias. A frame is admitted when the current table opens its port and
+    /// protocol and the box names the host. A refused segment of a flow the
+    /// gate admitted before ends that flow, with a reset each way.
+    fn host_alias_egress(&self, summary: &FrameSummary, frame: &[u8]) -> HostAliasVerdict {
+        let Some(table) = self.host_exposures.get() else {
+            return HostAliasVerdict::NotHostAlias;
+        };
+        if summary.destination() != Some(self.host_alias.octets()) {
+            return HostAliasVerdict::NotHostAlias;
+        }
+        let Some(pkt) = parse_ipv4_l4(frame).filter(|pkt| pkt.is_tcp() || pkt.is_udp()) else {
+            return HostAliasVerdict::NotHostAlias;
+        };
+        let port = pkt.dst.port();
+        let key = (pkt.proto, pkt.src.port(), port);
+        let opens = table.current().opens(pkt.proto, port);
+        if opens && self.names_host {
+            self.record_host_flow(key);
+            return HostAliasVerdict::Admit;
+        }
+        // The flow stays tracked, so each later frame of it either way is
+        // refused too, and is not taken for a reply on the ingress leg.
+        if self.tracks_host_flow(key) && pkt.is_tcp() && pkt.carries_ack() && !pkt.carries_reset() {
+            // The box's segment did not reach the host: the host expects
+            // its sequence number, and the box expects the host's next
+            // segment at its acknowledgement number.
+            self.send_reset(host_flow_reset(frame, pkt.src, pkt.dst, pkt.seq, true));
+            self.send_box_reset(host_flow_reset(frame, pkt.dst, pkt.src, pkt.ack, false));
+        }
+        self.refuse_host_alias(Direction::Egress, pkt.proto, port, opens);
+        HostAliasVerdict::Refuse
+    }
+
+    /// NET-161: the ingress leg's decision on a frame from the host alias.
+    /// Only a flow the box opened to an exposure is decided here. When its
+    /// exposure is gone, the frame is refused and the flow ends.
+    fn host_alias_ingress(&self, frame: &[u8]) -> HostAliasVerdict {
+        let Some(table) = self.host_exposures.get() else {
+            return HostAliasVerdict::NotHostAlias;
+        };
+        let Some(pkt) = parse_ipv4_l4(frame).filter(|pkt| *pkt.src.ip() == self.host_alias) else {
+            return HostAliasVerdict::NotHostAlias;
+        };
+        let port = pkt.src.port();
+        let key = (pkt.proto, pkt.dst.port(), port);
+        if !self.tracks_host_flow(key) {
+            return HostAliasVerdict::NotHostAlias;
+        }
+        if table.current().opens(pkt.proto, port) {
+            return HostAliasVerdict::Admit;
+        }
+        if pkt.is_tcp() && pkt.carries_ack() && !pkt.carries_reset() {
+            // The host's segment did not reach the box: the box expects its
+            // sequence number, and the host expects the box's next segment
+            // at its acknowledgement number.
+            self.send_box_reset(host_flow_reset(frame, pkt.src, pkt.dst, pkt.seq, true));
+            self.send_reset(host_flow_reset(frame, pkt.dst, pkt.src, pkt.ack, false));
+        }
+        self.refuse_host_alias(Direction::Ingress, pkt.proto, port, false);
+        HostAliasVerdict::Refuse
+    }
+
+    /// Says a host-alias refusal, once per box per interval: the box, the
+    /// exposure's port, and whether the table or the box's rules refused it.
+    fn refuse_host_alias(&self, direction: Direction, proto: u8, port: u16, table_opens: bool) {
+        if self
+            .limiter
+            .should_warn_at(&self.label, HOST_ALIAS_RULE, Instant::now())
+        {
+            let refused_by = if table_opens {
+                "box egress rules"
+            } else {
+                "host-exposures table"
+            };
+            tracing::warn!(
+                session_id = %self.label,
+                %direction,
+                remote_addr = %SocketAddrV4::new(self.host_alias, port),
+                proto = %Proto::from_ipproto(match proto {
+                    IPPROTO_UDP => boxes::IpProto::Udp,
+                    _ => boxes::IpProto::Tcp,
+                }),
+                dst_port = port,
+                rule_matched = HOST_ALIAS_RULE,
+                refused_by,
+                "network policy violation"
+            );
+        }
+    }
+
+    fn record_host_flow(&self, key: HostFlowKey) {
+        let now = Instant::now();
+        let mut flows = self
+            .host_flows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if flows.len() >= HOST_FLOWS_PER_BOX && !flows.contains_key(&key) {
+            flows.retain(|_, seen| {
+                now.saturating_duration_since(*seen) < egress::REPLY_TCP_IDLE_CAP
+            });
+            if flows.len() >= HOST_FLOWS_PER_BOX {
+                return;
+            }
+        }
+        flows.insert(key, now);
+    }
+
+    fn tracks_host_flow(&self, key: HostFlowKey) -> bool {
+        self.host_flows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&key)
     }
 
     /// Whether the box's resolved `quic443` stance blocks UDP to port 443.
@@ -3491,6 +3740,13 @@ where
         {
             continue;
         }
+        // NET-161: a frame of a flow the box opened to a host exposure is
+        // refused once the exposure is gone from the table, and the flow ends.
+        if let Some(gate) = &gate
+            && gate.host_alias_ingress(&frame[..n]) == HostAliasVerdict::Refuse
+        {
+            continue;
+        }
         if let Some(gate) = &gate
             && let Some((proto, dst_port, src)) = gate.inbound_drop(&frame[..n])
         {
@@ -4579,6 +4835,246 @@ pub(crate) mod tests {
             .expect("the relay still forwards declared reach")
             .expect("the switch side stays open");
         assert_eq!(seen, sibling);
+    }
+
+    /// A `[host-exposures]` table read from a `config.toml` in `dir`, which
+    /// holds `body`.
+    fn host_exposures_in(dir: &Path, body: &str) -> Arc<HostExposuresFile> {
+        let path = dir.join("config.toml");
+        std::fs::write(&path, body).unwrap();
+        Arc::new(HostExposuresFile::new(path))
+    }
+
+    /// A deny-all box (`allow_subnets` empty) that names `hosts` in its
+    /// `egress.allow_dns_hosts`, or that declares `subnets` in place of the
+    /// empty list.
+    fn host_exposure_policy(hosts: Option<Vec<&str>>, subnets: Vec<&str>) -> boxes::BoxPolicy {
+        boxes::BoxPolicy {
+            egress: Some(boxes::EgressPolicy {
+                allow_protocols: None,
+                allow_subnets: Some(subnets.into_iter().map(str::to_string).collect()),
+                allow_dns_hosts: hosts.map(|hosts| hosts.into_iter().map(str::to_string).collect()),
+                deny_subnets: None,
+            }),
+            ingress: None,
+            credentialed_upstream: None,
+            quic443: None,
+        }
+    }
+
+    /// The box `policy` describes on a native relay that decides the host
+    /// alias by `table`.
+    fn native_relay_with_table(
+        policy: &boxes::BoxPolicy,
+        table: &Arc<HostExposuresFile>,
+    ) -> RelayHarness {
+        let table = Arc::clone(table);
+        spawn_test_relay_with(policy, move |gate| gate.use_host_exposures(table))
+    }
+
+    /// Writes `frame` and then an ARP sentinel at the box end, and says
+    /// whether `frame` reached the switch ahead of the sentinel.
+    async fn reaches_switch(harness: &mut RelayHarness, frame: &[u8]) -> bool {
+        let sentinel = arp_frame(LEASE);
+        harness.box_end.write_all(frame).unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
+        if first == sentinel {
+            return false;
+        }
+        assert_eq!(first, frame, "a forwarded frame is forwarded verbatim");
+        let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
+        assert_eq!(next, sentinel);
+        true
+    }
+
+    /// A TCP segment between `src` and `dst` with `flags` and the sequence
+    /// pair `seq`, `ack`.
+    fn host_flow_segment(
+        src: SocketAddrV4,
+        dst: SocketAddrV4,
+        flags: u8,
+        seq: u32,
+        ack: u32,
+    ) -> Vec<u8> {
+        let mut frame = egress_tcp_segment(*src.ip(), src.port(), *dst.ip(), dst.port(), flags);
+        frame[38..42].copy_from_slice(&seq.to_be_bytes());
+        frame[42..46].copy_from_slice(&ack.to_be_bytes());
+        frame
+    }
+
+    /// Asserts `frame` is a bare reset from `src` to `dst` at `seq`.
+    fn assert_host_flow_reset(frame: &[u8], src: SocketAddrV4, dst: SocketAddrV4, seq: u32) {
+        let reset = refusal::classify(frame).expect("the reset parses as TCP");
+        assert_eq!((reset.src, reset.dst), (src, dst), "the reset's addressing");
+        assert!(reset.carries_reset(), "the frame is a reset");
+        assert_eq!(
+            reset.seq, seq,
+            "the reset lands at the peer's expected sequence"
+        );
+    }
+
+    /// NET-160 on a native own-address box: a port the table opens is
+    /// reached only by a box whose rules name the host, by
+    /// `allow_dns_hosts` or by an `allow_subnets` that covers the alias. A
+    /// box that names neither is refused at the same port, and so is every
+    /// box at a port the table does not open. Each refusal is a log line
+    /// with the rule, the box, the port and what refused it.
+    #[tokio::test]
+    async fn native_own_ip_host_exposure_needs_the_box_to_name_the_host() {
+        let capture = crate::test_harness::captured_log();
+        let dir = tempfile::tempdir().unwrap();
+        let table = host_exposures_in(dir.path(), "[host-exposures.db]\nport = 5432\n");
+        let alias = SwitchSubnet::default().host_alias();
+
+        let named = host_exposure_policy(Some(vec!["host.min.internal"]), Vec::new());
+        let mut harness = native_relay_with_table(&named, &table);
+        assert!(
+            reaches_switch(&mut harness, &egress_tcp_frame(LEASE, alias, 5432)).await,
+            "a box that names the host reaches the exposed port"
+        );
+        assert!(
+            !reaches_switch(&mut harness, &egress_tcp_frame(LEASE, alias, 5433)).await,
+            "the alias is closed at a port the table does not open"
+        );
+        let udp = udp_frame(LEASE, 40000, alias, 5432);
+        assert!(
+            !reaches_switch(&mut harness, &udp).await,
+            "an entry with no proto opens TCP alone"
+        );
+        let logged = capture.contents();
+        assert!(
+            logged.contains("refused_by=\"host-exposures table\""),
+            "the refusal names the table: {logged}"
+        );
+        drop(harness);
+
+        let covering = host_exposure_policy(None, vec!["100.64.255.254/32"]);
+        let mut harness = native_relay_with_table(&covering, &table);
+        assert!(
+            reaches_switch(&mut harness, &egress_tcp_frame(LEASE, alias, 5432)).await,
+            "an allow_subnets that covers the alias names the host"
+        );
+        drop(harness);
+
+        let silent = host_exposure_policy(Some(vec!["example.com"]), Vec::new());
+        let mut harness = native_relay_with_table(&silent, &table);
+        assert!(
+            !reaches_switch(&mut harness, &egress_tcp_frame(LEASE, alias, 5432)).await,
+            "a box that does not name the host never reaches the exposure"
+        );
+        let logged = capture.contents();
+        for expected in [
+            "rule_matched=\"host-alias\"",
+            "refused_by=\"box egress rules\"",
+            "session_id=100.64.0.9",
+            "remote_addr=100.64.255.254:5432",
+        ] {
+            assert!(
+                logged.contains(expected),
+                "missing {expected:?} in: {logged}"
+            );
+        }
+    }
+
+    /// NET-161 on a native own-address box: each flow to the alias is
+    /// decided by the table as the file holds it at that moment. A port is
+    /// closed before its entry exists, open once the entry is added, and
+    /// closed again once it is removed.
+    #[tokio::test]
+    async fn native_own_ip_follows_the_current_host_exposures_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = host_exposures_in(dir.path(), "# no host exposures\n");
+        let alias = SwitchSubnet::default().host_alias();
+        let named = host_exposure_policy(Some(vec!["HOST.MIN.INTERNAL."]), Vec::new());
+        let mut harness = native_relay_with_table(&named, &table);
+        let connect = |src_port| egress_tcp_segment(LEASE, src_port, alias, 8080, SYN);
+
+        assert!(
+            !reaches_switch(&mut harness, &connect(41000)).await,
+            "no entry, no reach"
+        );
+        std::fs::write(
+            table.path(),
+            "[host-exposures.web]\nport = 8080\nproto = \"tcp\"\n",
+        )
+        .unwrap();
+        assert!(
+            reaches_switch(&mut harness, &connect(41001)).await,
+            "an added entry opens the port to the next flow"
+        );
+        std::fs::write(table.path(), "# the web exposure is gone\n").unwrap();
+        assert!(
+            !reaches_switch(&mut harness, &connect(41002)).await,
+            "a removed entry closes the port to the next flow"
+        );
+    }
+
+    /// NET-161's removal clause on a native own-address box: once an
+    /// exposure leaves the table, a flow the box established to it ends.
+    /// The next segment either way is not delivered, and a reset goes to
+    /// each end at the sequence number that end expects.
+    #[tokio::test]
+    async fn native_own_ip_exposure_removal_ends_established_flows() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = host_exposures_in(dir.path(), "[host-exposures.web]\nport = 8080\n");
+        let alias = SwitchSubnet::default().host_alias();
+        let named = host_exposure_policy(Some(vec!["host.min.internal"]), Vec::new());
+        let mut harness = native_relay_with_table(&named, &table);
+        let host = SocketAddrV4::new(alias, 8080);
+        let first = SocketAddrV4::new(LEASE, 41000);
+        let second = SocketAddrV4::new(LEASE, 41001);
+
+        // Two flows open and carry a segment each way while the entry stands.
+        for (port, client) in [(1000, first), (3000, second)] {
+            let syn = host_flow_segment(client, host, SYN, port, 0);
+            assert!(reaches_switch(&mut harness, &syn).await);
+            let syn_ack = host_flow_segment(host, client, SYN | ACK, 5000, port + 1);
+            deliver_inbound(&mut harness, &syn_ack).await;
+            assert_delivered(&mut harness, &syn_ack).await;
+            let ack = host_flow_segment(client, host, ACK, port + 1, 5001);
+            assert!(reaches_switch(&mut harness, &ack).await);
+        }
+
+        std::fs::write(table.path(), "# the web exposure is gone\n").unwrap();
+
+        // The box speaks first on the first flow: its segment stays on the
+        // box's side, the host gets a reset at the box's sequence number
+        // and the box one at the host's.
+        let data = host_flow_segment(first, host, ACK | 0x08, 1001, 5001);
+        harness.box_end.write_all(&data).unwrap();
+        let to_host =
+            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+                .await
+                .expect("the host is sent a reset")
+                .unwrap();
+        assert_host_flow_reset(&to_host, first, host, 1001);
+        let to_box = crate::net::dns_gate::tests::read_box_frame(&harness)
+            .await
+            .expect("the box is sent a reset");
+        assert_host_flow_reset(&to_box, host, first, 5001);
+
+        // The host speaks first on the second flow: the same two resets, and
+        // the host's segment never reaches the box.
+        let reply = host_flow_segment(host, second, ACK | 0x08, 5001, 3001);
+        deliver_inbound(&mut harness, &reply).await;
+        let to_box = crate::net::dns_gate::tests::read_box_frame(&harness)
+            .await
+            .expect("the box is sent a reset");
+        assert_host_flow_reset(&to_box, host, second, 5001);
+        let to_host =
+            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+                .await
+                .expect("the host is sent a reset")
+                .unwrap();
+        assert_host_flow_reset(&to_host, second, host, 3001);
+        assert_not_delivered(&mut harness).await;
     }
 
     /// NET-134 on the relay leg, the first of the two a box's frame must

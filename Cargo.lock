@@ -4258,6 +4258,7 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
+ "client-config",
  "common",
  "constcat",
  "decode",
