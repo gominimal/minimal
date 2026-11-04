@@ -4187,6 +4187,7 @@ dependencies = [
  "ot",
  "p256",
  "paths",
+ "proptest",
  "ratatui",
  "reqwest",
  "russh",

@@ -607,6 +607,28 @@ impl Route {
         let addr = self.address();
         is_host_answerable(addr, node).then_some(addr)
     }
+
+    /// Whether a listener on this node makes `port` reachable by this
+    /// host-address route's name (NET-071), read from the daemon's own
+    /// `/proc/net/tcp` and `/proc/net/tcp6`. `None` for every route that is
+    /// not a host-address one: those carry their own port gate. A port that
+    /// only a `127.0.0.1` listener holds is [`ListenerReach::LoopbackOnly`],
+    /// on a native daemon and inside a VM alike, so the proxy never reaches
+    /// a host service on loopback by a box's name. The listeners are judged
+    /// at the address the proxy dials ([`Route::upstream`]), which inside a
+    /// VM is the guest's `127.0.0.1`, not the route's address. This reads
+    /// `/proc`, so an async caller runs it on the blocking pool.
+    #[must_use]
+    pub fn host_address_listener(&self, port: u16) -> Option<ListenerReach> {
+        if self.declared.is_some() {
+            return None;
+        }
+        let dial = match &self.target {
+            Target::Loopback { address, dial } => dial.unwrap_or(*address),
+            Target::Lease { .. } => return None,
+        };
+        Some(read_listener_reach(PROC_NET_TCP_TABLES, port, dial))
+    }
 }
 
 /// The declared ports of an applied external→internal map: its keys.
@@ -947,6 +969,124 @@ pub struct HostnameRegistry {
     /// gateway, the host alias, the daemon) — so a peer at a reserved address
     /// is never misread as a box.
     by_lease: HashMap<Ipv4Addr, SessionId>,
+    /// The zone table's change count and the installed answerer's
+    /// acknowledgement of it (NET-011, NET-012): what lets a registration
+    /// return only once the name answers there.
+    zone_track: ZoneTrack,
+}
+
+/// What the installed answerer has acknowledged of this registry's zone
+/// table: whether this daemon publishes into one at all, and the newest
+/// table generation one of its acks covered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ZoneAckState {
+    /// Whether this daemon publishes into an installed answerer. While it
+    /// does not, the daemon's own table is what answers, so every waiter
+    /// resolves at once.
+    publishing: bool,
+    /// The newest generation an acknowledged publish carried.
+    acknowledged: u64,
+}
+
+/// The registry's count of zone-table changes: one generation per change
+/// of the rows a lookup is answered from, found by comparing the table
+/// with the one last observed.
+#[derive(Debug)]
+struct ZoneTrack {
+    /// The current generation.
+    generation: u64,
+    /// The table as last observed, at `generation`.
+    observed: Vec<ZoneRow>,
+    /// The acknowledgement state, shared with the publish.
+    acks: std::sync::Arc<tokio::sync::watch::Sender<ZoneAckState>>,
+    /// Pinged when a waiter is handed out for a generation the installed
+    /// answerer has not acknowledged, so the held publish sends it at once.
+    changed: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl Default for ZoneTrack {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            observed: Vec::new(),
+            acks: std::sync::Arc::new(tokio::sync::watch::Sender::new(ZoneAckState::default())),
+            changed: std::sync::Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+}
+
+/// The publish's half of [`ZoneTrack`]: held outside the registry's lock,
+/// so an acknowledgement never takes it.
+#[derive(Debug, Clone)]
+pub struct ZonePublishTrack {
+    acks: std::sync::Arc<tokio::sync::watch::Sender<ZoneAckState>>,
+    changed: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl ZonePublishTrack {
+    /// Says whether this daemon publishes into an installed answerer. Set
+    /// to `false`, every waiter resolves at once.
+    pub fn set_publishing(&self, publishing: bool) {
+        self.acks.send_if_modified(|state| {
+            let modified = state.publishing != publishing;
+            state.publishing = publishing;
+            modified
+        });
+    }
+
+    /// Records that the installed answerer acknowledged a publish of the
+    /// table at `generation`, resolving every waiter at or below it.
+    pub fn acknowledge(&self, generation: u64) {
+        self.acks.send_if_modified(|state| {
+            let modified = generation > state.acknowledged;
+            state.acknowledged = state.acknowledged.max(generation);
+            modified
+        });
+    }
+
+    /// The newest generation the installed answerer acknowledged.
+    #[must_use]
+    pub fn acknowledged(&self) -> u64 {
+        self.acks.borrow().acknowledged
+    }
+
+    /// Resolves when a waiter is handed out for a generation not yet
+    /// acknowledged. One ping is kept if nothing waits for it.
+    pub async fn changed(&self) {
+        self.changed.notified().await;
+    }
+}
+
+/// A wait for the installed answerer to acknowledge one zone-table
+/// generation ([`HostnameRegistry::zone_change_waiter`]).
+#[derive(Debug)]
+pub struct ZoneChangeWaiter {
+    generation: u64,
+    acks: tokio::sync::watch::Receiver<ZoneAckState>,
+}
+
+impl ZoneChangeWaiter {
+    /// The generation this waiter waits for.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Waits, at most `bound`, for the installed answerer to acknowledge
+    /// this waiter's generation. Resolves at once when this daemon
+    /// publishes into no installed answerer. `false` is a wait that ran
+    /// past its bound.
+    pub async fn wait(mut self, bound: Duration) -> bool {
+        let generation = self.generation;
+        let waited = tokio::time::timeout(
+            bound,
+            self.acks
+                .wait_for(|state| !state.publishing || state.acknowledged >= generation),
+        )
+        .await;
+        // A closed channel means the registry is gone: nothing waits on it.
+        !matches!(waited, Err(_elapsed))
+    }
 }
 
 /// The `<host-id>` labels one daemon answers for: its own instance id, and
@@ -993,6 +1133,7 @@ impl HostnameRegistry {
             host_net: HashSet::new(),
             attaching: HashSet::new(),
             by_lease: HashMap::new(),
+            zone_track: ZoneTrack::default(),
         }
     }
 
@@ -2307,6 +2448,45 @@ impl HostnameRegistry {
         rows.sort_unstable_by(|a, b| a.name.cmp(&b.name));
         rows
     }
+
+    /// The zone table with the generation it stands at: the generation
+    /// moves on by one when the table differs from the one last observed.
+    /// A publish carries the generation it read, so its ack says how far
+    /// the installed answerer has caught up.
+    pub fn observe_zone(&mut self) -> (u64, Vec<ZoneRow>) {
+        let table = self.zone_table(&[]);
+        let track = &mut self.zone_track;
+        if table != track.observed {
+            track.generation += 1;
+            track.observed.clone_from(&table);
+        }
+        (track.generation, table)
+    }
+
+    /// A waiter for the installed answerer to acknowledge the table as it
+    /// stands now (NET-011, NET-012). Take it under the same write lock as
+    /// the change it waits for. When the generation is not yet
+    /// acknowledged, the held publish is woken to send it at once.
+    pub fn zone_change_waiter(&mut self) -> ZoneChangeWaiter {
+        let (generation, _) = self.observe_zone();
+        let track = &self.zone_track;
+        if generation > track.acks.borrow().acknowledged {
+            track.changed.notify_one();
+        }
+        ZoneChangeWaiter {
+            generation,
+            acks: track.acks.subscribe(),
+        }
+    }
+
+    /// The publish's handle on the acknowledgement state.
+    #[must_use]
+    pub fn zone_publish_track(&self) -> ZonePublishTrack {
+        ZonePublishTrack {
+            acks: std::sync::Arc::clone(&self.zone_track.acks),
+            changed: std::sync::Arc::clone(&self.zone_track.changed),
+        }
+    }
 }
 
 /// Extracts the host of a `Host:` header, stripping an optional `:port` suffix.
@@ -3533,9 +3713,357 @@ fn listen_local_v4(line: &str, v6: bool) -> Option<Ipv4Addr> {
     ))
 }
 
+/// What the listeners on this node say about one port of a host-address
+/// route (NET-071), as [`Route::host_address_listener`] reads them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenerReach {
+    /// A listener holds the port at `0.0.0.0`, `::`, or the dial address
+    /// when that is not `127.0.0.1`, and the dial reaches it. A request to
+    /// the port by the box's name reaches the box.
+    Reachable,
+    /// A listener holds the port at `127.0.0.1`, and either the proxy dials
+    /// `127.0.0.1`, where the kernel gives the connection to that listener,
+    /// or no listener that makes it [`ListenerReach::Reachable`] does. Such
+    /// a listener can be a host service, so the proxy refuses the request
+    /// and never dials it.
+    LoopbackOnly,
+    /// No listener holds the port at an address the dial reaches. A request
+    /// forwards and its dial fails as it did before this check.
+    NoListener,
+    /// The daemon cannot read its socket tables, so it cannot tell whether a
+    /// `127.0.0.1` listener holds the port. The proxy refuses the request:
+    /// the check fails closed, never open.
+    Unreadable,
+}
+
+/// The socket tables [`Route::host_address_listener`] reads, each with
+/// whether it is the `tcp6` table.
+const PROC_NET_TCP_TABLES: &[(&str, bool)] = &[("/proc/net/tcp", false), ("/proc/net/tcp6", true)];
+
+/// The local address and port of one `TCP_LISTEN` row of the kernel's socket
+/// table, or `None` for any other row. `v6` says the row is from the `tcp6`
+/// table, whose address is four little-endian 32-bit words.
+fn listener_local(line: &str, v6: bool) -> Option<(IpAddr, u16)> {
+    let mut fields = line.split_whitespace();
+    fields.next()?;
+    let local = fields.next()?;
+    let _remote = fields.next()?;
+    if fields.next()? != "0A" {
+        return None;
+    }
+    let (address, port) = local.split_once(':')?;
+    let port = u16::from_str_radix(port, 16).ok()?;
+    let address = if v6 {
+        if address.len() != 32 {
+            return None;
+        }
+        let mut octets = [0u8; 16];
+        for (index, chunk) in octets.chunks_mut(4).enumerate() {
+            let word = u32::from_str_radix(address.get(index * 8..index * 8 + 8)?, 16).ok()?;
+            chunk.copy_from_slice(&word.swap_bytes().to_be_bytes());
+        }
+        let v6 = std::net::Ipv6Addr::from(octets);
+        v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4)
+    } else {
+        if address.len() != 8 {
+            return None;
+        }
+        IpAddr::V4(Ipv4Addr::from(
+            u32::from_str_radix(address, 16).ok()?.swap_bytes(),
+        ))
+    };
+    Some((address, port))
+}
+
+/// The [`ListenerReach`] of `port` from the text of the kernel's socket
+/// tables, each with whether it is the `tcp6` table. `dial` is the address
+/// the proxy connects to. The kernel gives a connection to the listener at
+/// the exact dial address before a wildcard one, so the verdict follows the
+/// listener the dial reaches, never the order of the rows:
+///
+/// - When `dial` is `127.0.0.1`, which host services share, any listener
+///   there makes the port loopback-only, even beside a `0.0.0.0` or `::`
+///   listener (`SO_REUSEPORT`, or `IPV6_V6ONLY` on the `::` one).
+/// - A listener at `dial`, when `dial` is not `127.0.0.1`, is the box's own.
+/// - A listener at `0.0.0.0` or `::` is reachable.
+/// - A listener at any other address, loopback or not, such as `::1`,
+///   `127.0.0.2` or `10.0.0.5`, is one the dial never reaches. It counts as
+///   no listener, so it can never make a `127.0.0.1` listener reachable.
+fn listener_reach<'a>(
+    tables: impl IntoIterator<Item = (&'a str, bool)>,
+    port: u16,
+    dial: Ipv4Addr,
+) -> ListenerReach {
+    let mut loopback = false;
+    let mut at_dial = false;
+    let mut wildcard = false;
+    for (text, v6) in tables {
+        for line in text.lines().skip(1) {
+            let Some((address, listened)) = listener_local(line, v6) else {
+                continue;
+            };
+            if listened != port {
+                continue;
+            }
+            if address.is_unspecified() {
+                wildcard = true;
+            } else if address == IpAddr::V4(Ipv4Addr::LOCALHOST) {
+                loopback = true;
+            } else if address == IpAddr::V4(dial) {
+                at_dial = true;
+            }
+        }
+    }
+    if dial == Ipv4Addr::LOCALHOST && loopback {
+        ListenerReach::LoopbackOnly
+    } else if at_dial || wildcard {
+        ListenerReach::Reachable
+    } else if loopback {
+        ListenerReach::LoopbackOnly
+    } else {
+        ListenerReach::NoListener
+    }
+}
+
+/// The [`ListenerReach`] of `port` from the socket tables at `paths`, each
+/// with whether it is the `tcp6` table: this daemon's own `/proc/net/tcp` and
+/// `/proc/net/tcp6` in production, the node's network namespace on a native
+/// daemon and the guest's inside a VM, where the proxy dials the box's
+/// listeners. A `tcp6` table that does not exist is a kernel without IPv6,
+/// and holds no listener. Any other table that cannot be read is
+/// [`ListenerReach::Unreadable`], and the read error is logged.
+fn read_listener_reach(paths: &[(&str, bool)], port: u16, dial: Ipv4Addr) -> ListenerReach {
+    let mut tables: Vec<(String, bool)> = Vec::with_capacity(paths.len());
+    for &(path, v6) in paths {
+        match std::fs::read_to_string(path) {
+            Ok(text) => tables.push((text, v6)),
+            Err(error) if v6 && error.kind() == std::io::ErrorKind::NotFound => {
+                tracing::debug!(
+                    component = "dns-proxy",
+                    table = path,
+                    "no IPv6 socket table, so no IPv6 listener to check"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    component = "dns-proxy",
+                    table = path,
+                    port,
+                    %error,
+                    "cannot read a socket table for the loopback-only listener check"
+                );
+                return ListenerReach::Unreadable;
+            }
+        }
+    }
+    listener_reach(
+        tables.iter().map(|(text, v6)| (text.as_str(), *v6)),
+        port,
+        dial,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NET-071: a host-address route reads its port's listeners from the
+    /// kernel's socket tables, at the address the proxy dials. A port that
+    /// only a `127.0.0.1` listener holds is loopback-only. A port that a
+    /// `0.0.0.0` or `::` listener holds is reachable, unless a `127.0.0.1`
+    /// one that the dial reaches first also holds it. A listener at another
+    /// specific address never counts. A table that cannot be read refuses,
+    /// never forwards. The table text is the
+    /// kernel's own shape, and the live half reads this process's
+    /// `/proc/net/tcp`.
+    #[test]
+    fn loopback_only_listener_read_from_proc_net_tcp() {
+        let header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+        let row = |local: &str, state: &str| {
+            format!(
+                "   0: {local} 00000000:0000 {state} 00000000:00000000 00:00000000 00000000  1000        0 12345 1 0 20 4 30 10 -1\n"
+            )
+        };
+        // 127.0.0.1:8080 and 0.0.0.0:9090 listen; 10.0.0.5:7070 listens; an
+        // established socket at 127.0.0.1:6060 is no listener.
+        let v4 = format!(
+            "{header}{}{}{}{}{}",
+            row("0100007F:1F90", "0A"),
+            row("00000000:2382", "0A"),
+            row("0500000A:1B9E", "0A"),
+            row("0100007F:17AC", "01"),
+            row("0200007F:07E4", "0A"),
+        );
+        // ::1:5050 listens; :: listens at 4040; ::ffff:127.0.0.1 at 3030.
+        // 127.0.0.2:2020 listens in the v4 table below.
+        let v6 = format!(
+            "{header}{}{}{}",
+            row("00000000000000000000000001000000:13BA", "0A"),
+            row("00000000000000000000000000000000:0FC8", "0A"),
+            row("0000000000000000FFFF00000100007F:0BD6", "0A"),
+        );
+        let tables = || [(v4.as_str(), false), (v6.as_str(), true)];
+        let node = Ipv4Addr::LOCALHOST;
+        assert_eq!(
+            listener_reach(tables(), 8080, node),
+            ListenerReach::LoopbackOnly
+        );
+        assert_eq!(
+            listener_reach(tables(), 9090, node),
+            ListenerReach::Reachable
+        );
+        // A listener at a specific address that is not the dial address is
+        // one the dial never reaches.
+        assert_eq!(
+            listener_reach(tables(), 7070, node),
+            ListenerReach::NoListener
+        );
+        assert_eq!(
+            listener_reach(tables(), 6060, node),
+            ListenerReach::NoListener
+        );
+        // A loopback listener at another address than 127.0.0.1 is one the
+        // dial never reaches, so the refusal's "127.0.0.1" is never false.
+        assert_eq!(
+            listener_reach(tables(), 5050, node),
+            ListenerReach::NoListener
+        );
+        assert_eq!(
+            listener_reach(tables(), 2020, node),
+            ListenerReach::NoListener
+        );
+        assert_eq!(
+            listener_reach(tables(), 4040, node),
+            ListenerReach::Reachable
+        );
+        assert_eq!(
+            listener_reach(tables(), 3030, node),
+            ListenerReach::LoopbackOnly
+        );
+        assert_eq!(listener_reach(tables(), 1, node), ListenerReach::NoListener);
+        // A dial address in the reserved range is the box's own: a listener
+        // there is reachable, and a 127.0.0.1 one is still loopback-only.
+        let own = format!("{header}{}", row("0500007F:1F90", "0A"));
+        let node_address = Ipv4Addr::new(127, 0, 0, 5);
+        assert_eq!(
+            listener_reach([(own.as_str(), false)], 8080, node_address),
+            ListenerReach::Reachable
+        );
+        assert_eq!(
+            listener_reach(tables(), 8080, node_address),
+            ListenerReach::LoopbackOnly
+        );
+        // Inside a VM the proxy dials 127.0.0.1, not the node's address. A
+        // listener at the node's address does not make a 127.0.0.1 host
+        // service on the same port reachable.
+        let both = format!(
+            "{header}{}{}",
+            row("0500007F:1F90", "0A"),
+            row("0100007F:1F90", "0A")
+        );
+        assert_eq!(
+            listener_reach([(both.as_str(), false)], 8080, Ipv4Addr::LOCALHOST),
+            ListenerReach::LoopbackOnly
+        );
+        // A box listener at another address never makes a 127.0.0.1 host
+        // service on the same port reachable, in either row order. Nor does
+        // a wildcard listener beside it, since the dial reaches the
+        // 127.0.0.1 one first.
+        for rows in [
+            ["0500000A:1F90", "0100007F:1F90"],
+            ["0100007F:1F90", "0500000A:1F90"],
+            ["00000000:1F90", "0100007F:1F90"],
+            ["0100007F:1F90", "00000000:1F90"],
+        ] {
+            let table = format!("{header}{}{}", row(rows[0], "0A"), row(rows[1], "0A"));
+            assert_eq!(
+                listener_reach([(table.as_str(), false)], 8080, Ipv4Addr::LOCALHOST),
+                ListenerReach::LoopbackOnly,
+                "{rows:?}"
+            );
+        }
+        let v6only = format!(
+            "{header}{}",
+            row("00000000000000000000000000000000:1F90", "0A")
+        );
+        let host = format!("{header}{}", row("0100007F:1F90", "0A"));
+        assert_eq!(
+            listener_reach(
+                [(host.as_str(), false), (v6only.as_str(), true)],
+                8080,
+                Ipv4Addr::LOCALHOST
+            ),
+            ListenerReach::LoopbackOnly
+        );
+
+        // A table that cannot be read fails closed. A missing tcp6 table is
+        // a kernel without IPv6, and the tcp table alone decides.
+        let dir = tempfile::tempdir().unwrap();
+        let v4_path = dir.path().join("tcp");
+        std::fs::write(&v4_path, &v4).unwrap();
+        let v4_path = v4_path.to_str().unwrap();
+        let missing = dir.path().join("missing");
+        let missing = missing.to_str().unwrap();
+        assert_eq!(
+            read_listener_reach(&[(missing, false), (v4_path, true)], 8080, node),
+            ListenerReach::Unreadable,
+            "an unreadable tcp table refuses"
+        );
+        assert_eq!(
+            read_listener_reach(
+                &[(v4_path, false), (dir.path().to_str().unwrap(), true)],
+                8080,
+                node
+            ),
+            ListenerReach::Unreadable,
+            "a tcp6 table that exists and cannot be read refuses"
+        );
+        assert_eq!(
+            read_listener_reach(&[(v4_path, false), (missing, true)], 8080, node),
+            ListenerReach::LoopbackOnly,
+            "a missing tcp6 table leaves the tcp table to decide"
+        );
+
+        // Live: this process's own listeners, read from `/proc/net/tcp`.
+        let route = Route::loopback("web", Ipv4Addr::LOCALHOST, None);
+        let loopback = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let loopback_port = loopback.local_addr().unwrap().port();
+        assert_eq!(
+            route.host_address_listener(loopback_port),
+            Some(ListenerReach::LoopbackOnly),
+            "a port only a 127.0.0.1 listener holds is loopback-only"
+        );
+        let wildcard = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let wildcard_port = wildcard.local_addr().unwrap().port();
+        assert_eq!(
+            route.host_address_listener(wildcard_port),
+            Some(ListenerReach::Reachable),
+            "a port a 0.0.0.0 listener holds is reachable"
+        );
+        drop(loopback);
+        assert_eq!(
+            route.host_address_listener(loopback_port),
+            Some(ListenerReach::NoListener),
+            "a port nothing listens on is not refused, only unreachable"
+        );
+        // A VM node's route answers at the node's address and dials the
+        // guest's 127.0.0.1. Its listeners are judged at 127.0.0.1.
+        let mut vm_route = Route::loopback("web", node_address, None);
+        if let Target::Loopback { dial, .. } = &mut vm_route.target {
+            *dial = Some(Ipv4Addr::LOCALHOST);
+        }
+        let host_service = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let shared_port = host_service.local_addr().unwrap().port();
+        let _at_node = std::net::TcpListener::bind((node_address, shared_port)).unwrap();
+        assert_eq!(
+            vm_route.host_address_listener(shared_port),
+            Some(ListenerReach::LoopbackOnly),
+            "a listener at the node's address does not hide the 127.0.0.1 one the proxy dials"
+        );
+        // An own-address route carries its own port gate.
+        let own_ip = Route::loopback("own", Ipv4Addr::LOCALHOST, Some(BTreeSet::new()));
+        assert_eq!(own_ip.host_address_listener(wildcard_port), None);
+    }
 
     /// NET-070's socket-owner lookup, step by step. The cgroup a process
     /// reports names its box when it runs in a classifier leaf, in either
