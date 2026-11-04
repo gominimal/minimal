@@ -11216,6 +11216,13 @@ while True:
       fail
       ;;
   esac
+  case "$recover_activate_err" in
+    *"warning: the hostname proxy is not serving"*)
+      echo "::error::activate printed the old stderr warning line beside its names: line (NET-020)"
+      echo "--- activate stderr ---"; printf '%s\n' "$recover_activate_err"
+      fail
+      ;;
+  esac
   recover_cause_count="$(grep -c -F -- 'the hostname proxy is not serving' "$WORK/recover-activate.err" 2>/dev/null || true)"
   if [ "${recover_cause_count:-0}" != 1 ]; then
     echo "::error::activate printed the hostname proxy's cause ${recover_cause_count:-0} times, not once (NET-020)"
