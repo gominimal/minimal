@@ -78,6 +78,9 @@
 #   exec_reattach                    a terminal and a detached min://exec lose
 #                                    their client; the exec id re-attaches the
 #                                    terminal and reads the output again
+#   box_exec                         `min box exec`: plain with its exit code,
+#                                    -t on a pty and off one, --detach,
+#                                    --timeout 124, a stopped box refused
 #   session_rename                   `min session rename`; rename-to-self refused
 #   session_outbound_request         an outbound request from inside the session (NET-107)
 #   own_ip                           `--network own_ip` tap + switch attach
@@ -1669,15 +1672,16 @@ echo "::endgroup::"
 # `min://exec/wait <id>` and `min://exec/output <id>` read the detached exec.
 # An exec runs its argv unshelled, in the box's namespaces, cgroup and working
 # directory, and this case checks each of them against a shell exec.
-# `min` has no command for these requests yet, so the proof sends them over a
-# plain `ssh`, built from the transport `min session setup-zed --print` gives
-# (its ProxyCommand onto the daemon socket, the box selector, the host key).
-# This route is interim. The case moves to `min box exec -t|--detach` with
-# https://github.com/gominimal/minimal/issues/3012, and to
+# `min box exec -t|--detach` starts an exec from the CLI, and the
+# `box_exec` case (proof_box_exec) proves it end to end. `min` has no command
+# yet for the re-attach, the wait or the output by id, so this proof sends
+# its requests over a plain `ssh`, built from the transport `min session
+# setup-zed --print` gives (its ProxyCommand onto the daemon socket, the box
+# selector, the host key). This route is interim. The case moves to
 # `min box attach|wait|logs|stop --exec` with
-# https://github.com/gominimal/minimal/issues/2913 (BCLI T16). This case moves
-# to those commands when those issues close. One span over the drop and the
-# re-attach is https://github.com/gominimal/minimal/issues/2978.
+# https://github.com/gominimal/minimal/issues/2913 (BCLI T16). One span over
+# the drop and the re-attach is
+# https://github.com/gominimal/minimal/issues/2978.
 proof_exec_reattach() {
 echo "::group::exec by id proof (min://exec terminal and detached, client dropped)"
 proof_shared_session
@@ -1863,6 +1867,204 @@ else
   not_run exec_reattach_daemon_log "the daemon log is inside the VM on this lane"
 fi
 echo "exec by id proof OK"
+echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
+# `min box exec`, end to end (BCLI-053): the CLI runs a command in the
+# running shared box, and exits with the command's exit code.
+#   1. Plain: the argv runs unshelled, its stdout reaches stdout, and `min`
+#      exits with the command's 7.
+#   2. `-t` on a real pty (scripts/e2e-attach-pty.py): the command sees a
+#      terminal on stdin and stdout, and its 7 passes through. `-t` with
+#      stdin from a pipe exits 2 with the no-terminal refusal, and starts
+#      nothing.
+#   3. `--detach`: only the exec id prints on stdout, and `min` returns
+#      while the command runs on. Its end is read over plain `ssh`, as
+#      proof_exec_reattach reads a detached exec, until `min box wait
+#      --exec` and `min box logs --exec` land
+#      (https://github.com/gominimal/minimal/issues/2845).
+#   4. `--timeout 1s` ends a longer command, and `min` exits 124.
+#   5. A stopped box: exit 2, and the refusal names the state.
+# A step this host cannot run is reported with `not_run`.
+proof_box_exec() {
+echo "::group::box exec proof (min box exec: plain, -t, --detach, --timeout, stopped box)"
+proof_shared_session
+local be_uuid out rc t0 t1 entry host user opts be_ssh det_id det_out marker
+local stop_sid shown state i listed
+be_uuid='[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}'
+
+# 1. Plain exec. The argv passes through literally: no shell splits,
+# expands or globs it.
+# shellcheck disable=SC2016 # $HOME must reach the box as text.
+out="$(mnl box exec "$sid" -- printf '%s|' 'a b' '$HOME' '*' </dev/null 2>"$WORK/box-exec-argv.err")" || {
+  echo "::error::'min box exec $sid -- printf ...' failed"
+  echo "--- stdout ---"; printf '%s\n' "$out"
+  echo "--- stderr ---"; cat "$WORK/box-exec-argv.err" 2>/dev/null || true
+  fail
+}
+# shellcheck disable=SC2016 # the literal $HOME is the expected output.
+if [ "$out" != 'a b|$HOME|*|' ]; then
+  echo "::error::'min box exec' did not run its argv unshelled: expected 'a b|\$HOME|*|', got '$out'"
+  fail
+fi
+out="$(mnl box exec "$sid" -- sh -c 'echo BOX_EXEC_OUT; exit 7' </dev/null 2>"$WORK/box-exec-code.err")"
+rc=$?
+if [ "$rc" -ne 7 ] || [ "$out" != BOX_EXEC_OUT ]; then
+  echo "::error::'min box exec $sid -- sh -c \"echo BOX_EXEC_OUT; exit 7\"' exited $rc with stdout '$out' (expected 7 and 'BOX_EXEC_OUT')"
+  echo "--- stderr ---"; cat "$WORK/box-exec-code.err" 2>/dev/null || true
+  fail
+fi
+echo "plain exec: the argv ran unshelled, its stdout arrived, and min exited with its 7"
+
+# 2. `-t` on a real pty. The command checks its own stdin and stdout, and
+# sleeps so the driver's typed newline lands while it runs.
+if command -v python3 >/dev/null 2>&1; then
+  # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+  out="$(E2E_PTY_COMMANDS='' E2E_PTY_EXPECT_EXIT=7 \
+    python3 "$ROOT/scripts/e2e-attach-pty.py" - \
+    min ${E2E_MINIMAL_ARGS:-} box exec "$sid" -t -- \
+    sh -c 'if test -t 0 && test -t 1; then echo BOX_EXEC_TTY_YES; else echo BOX_EXEC_TTY_NO; fi; sleep 3; exit 7' \
+    2>"$WORK/box-exec-tty.err")" || {
+    echo "::error::'min box exec $sid -t' on a pty did not exit with the command's 7"
+    echo "--- transcript ---"; printf '%s\n' "$out"
+    echo "--- stderr ---"; cat "$WORK/box-exec-tty.err" 2>/dev/null || true
+    fail
+  }
+  if [[ "$out" != *BOX_EXEC_TTY_YES* ]]; then
+    echo "::error::the command of 'min box exec -t' did not see a terminal on stdin and stdout"
+    echo "--- transcript ---"; printf '%s\n' "$out"
+    fail
+  fi
+  if ! printf '%s' "$out" | tr -d '\r' | grep -Eq "$be_uuid"; then
+    echo "::error::'min box exec -t' did not print the exec id on its terminal"
+    echo "--- transcript ---"; printf '%s\n' "$out"
+    fail
+  fi
+  echo "-t: the command saw a terminal, the exec id printed, and min exited with its 7"
+else
+  not_run box_exec_tty "python3 is not on PATH, and the -t step drives a real pty through scripts/e2e-attach-pty.py"
+fi
+
+# `-t` with stdin from a pipe refuses, and nothing starts: the command
+# would leave a marker file in the box.
+marker="/tmp/e2e-box-exec-tty-$$"
+printf '' | mnl box exec "$sid" -t -- touch "$marker" >"$WORK/box-exec-notty.out" 2>"$WORK/box-exec-notty.err"
+rc=$?
+if [ "$rc" -ne 2 ] || ! grep -Fq -- "-t needs a terminal" "$WORK/box-exec-notty.err"; then
+  echo "::error::'min box exec $sid -t' with stdin from a pipe exited $rc (expected 2 and the no-terminal refusal on stderr)"
+  echo "--- stdout ---"; cat "$WORK/box-exec-notty.out" 2>/dev/null || true
+  echo "--- stderr ---"; cat "$WORK/box-exec-notty.err" 2>/dev/null || true
+  fail
+fi
+mnl box exec "$sid" -- test -e "$marker" </dev/null >/dev/null 2>"$WORK/box-exec-notty-check.err"
+rc=$?
+if [ "$rc" -ne 1 ]; then
+  echo "::error::after the refused 'min box exec -t', 'test -e $marker' in the box exited $rc (expected 1: the refused command must not run)"
+  echo "--- stderr ---"; cat "$WORK/box-exec-notty-check.err" 2>/dev/null || true
+  fail
+fi
+echo "-t off a terminal: exit 2, the refusal on stderr, and nothing ran"
+
+# 3. `--detach`: the exec id alone on stdout, and min returns before the
+# command ends.
+t0=$(now_ms)
+out="$(mnl box exec "$sid" --detach -- sh -c 'sleep 3; echo detach-late; exit 7' </dev/null 2>"$WORK/box-exec-detach.err")"
+rc=$?
+t1=$(now_ms)
+det_id="$(printf '%s' "$out" | tr -d '\r')"
+if [ "$rc" -ne 0 ] || ! printf '%s' "$det_id" | grep -Eqx "$be_uuid"; then
+  echo "::error::'min box exec $sid --detach' exited $rc and printed '$out' on stdout (expected 0 and one exec id)"
+  echo "--- stderr ---"; cat "$WORK/box-exec-detach.err" 2>/dev/null || true
+  fail
+fi
+if [ $((t1 - t0)) -ge 3000 ]; then
+  echo "::error::'min box exec --detach' returned after $((t1 - t0))ms, not before its 3 s command ended"
+  fail
+fi
+echo "detached exec: $det_id (min returned in $((t1 - t0))ms)"
+entry="$(mnl session setup-zed "$sid" --print 2>"$WORK/box-exec-zed.err")" || {
+  echo "::error::'min session setup-zed $sid --print' failed"
+  echo "--- stderr ---"; cat "$WORK/box-exec-zed.err" 2>/dev/null || true
+  fail
+}
+host="$(printf '%s' "$entry" | jq -r .host)"
+user="$(printf '%s' "$entry" | jq -r .username)"
+opts=()
+while IFS= read -r i; do opts+=("$i"); done < <(printf '%s' "$entry" | jq -r '.args[]')
+be_ssh=(ssh -F /dev/null -T -o BatchMode=yes -o ConnectTimeout=30 "${opts[@]}" "$user@$host")
+timeout 30 "${be_ssh[@]}" "min://exec/wait $det_id" </dev/null >/dev/null 2>"$WORK/box-exec-wait.err"
+rc=$?
+if [ "$rc" -ne 7 ]; then
+  echo "::error::'min://exec/wait $det_id' exited $rc (expected the detached command's 7)"
+  echo "--- stderr ---"; cat "$WORK/box-exec-wait.err" 2>/dev/null || true
+  fail
+fi
+det_out="$("${be_ssh[@]}" "min://exec/output $det_id" </dev/null 2>"$WORK/box-exec-output.err" | tr -d '\r')"
+if [ "$det_out" != detach-late ]; then
+  echo "::error::the detached command did not run on after min returned: its output is '$det_out' (expected 'detach-late')"
+  echo "--- stderr ---"; cat "$WORK/box-exec-output.err" 2>/dev/null || true
+  fail
+fi
+echo "--detach: the command ran on after min returned, and ended with its 7"
+
+# 4. `--timeout`: a command that outlives it ends, and min exits 124.
+t0=$(now_ms)
+mnl box exec "$sid" --timeout 1s -- sleep 30 </dev/null >/dev/null 2>"$WORK/box-exec-timeout.err"
+rc=$?
+t1=$(now_ms)
+if [ "$rc" -ne 124 ] || [ $((t1 - t0)) -ge 20000 ]; then
+  echo "::error::'min box exec $sid --timeout 1s -- sleep 30' exited $rc after $((t1 - t0))ms (expected 124, well before 30 s)"
+  echo "--- stderr ---"; cat "$WORK/box-exec-timeout.err" 2>/dev/null || true
+  fail
+fi
+echo "--timeout 1s: the command ended, and min exited 124 after $((t1 - t0))ms"
+
+# 5. A stopped box refuses with exit 2 and names its state. The box is
+# its own, so the shared box keeps running for the cases after this one.
+# shellcheck disable=SC2086
+out="$(cd "$PROJECT_DIR" && mnl session activate . --name e2e-box-exec-stopped ${E2E_ACTIVATE_ARGS:-} 2>"$WORK/box-exec-stop-activate.err")" || {
+  echo "::error::activation of the box for the stopped-box exec failed"
+  echo "--- stderr ---"; cat "$WORK/box-exec-stop-activate.err" 2>/dev/null || true
+  fail
+}
+stop_sid="$(printf '%s\n' "$out" | tail -n1 | tr -d '\r')"
+mnl box stop "$stop_sid" </dev/null >"$WORK/box-exec-stop.out" 2>&1 || {
+  echo "::error::'min box stop $stop_sid' failed"
+  cat "$WORK/box-exec-stop.out" 2>/dev/null || true
+  fail
+}
+for i in $(seq 1 20); do
+  shown="$(mnl box show "$stop_sid" </dev/null 2>&1)" || shown=""
+  state="$(printf '%s\n' "$shown" | sed -n 's/^State: *//p' | tr -d '\r')"
+  [ "$state" = stopped ] && break
+  sleep 0.5
+done
+if [ "$state" != stopped ]; then
+  echo "::error::box $stop_sid is '${state:-<none>}' after 'min box stop' (expected stopped)"
+  echo "--- min box show $stop_sid ---"; printf '%s\n' "$shown"
+  fail
+fi
+mnl box exec "$stop_sid" -- true </dev/null >"$WORK/box-exec-stopped.out" 2>"$WORK/box-exec-stopped.err"
+rc=$?
+if [ "$rc" -ne 2 ] || ! grep -Fq "$stop_sid is stopped. Only a running box can run a command." "$WORK/box-exec-stopped.err"; then
+  echo "::error::'min box exec' into the stopped box $stop_sid exited $rc (expected 2 and a refusal that names the state 'stopped')"
+  echo "--- stdout ---"; cat "$WORK/box-exec-stopped.out" 2>/dev/null || true
+  echo "--- stderr ---"; cat "$WORK/box-exec-stopped.err" 2>/dev/null || true
+  fail
+fi
+mnl box rm "$stop_sid" </dev/null >"$WORK/box-exec-rm.out" 2>&1 || {
+  echo "::error::'min box rm $stop_sid' failed"
+  cat "$WORK/box-exec-rm.out" 2>/dev/null || true
+  fail
+}
+listed="$(mnl ls --raw 2>/dev/null || true)"
+if printf '%s\n' "$listed" | grep -Fqx "$stop_sid"; then
+  echo "::error::box $stop_sid is still listed after 'min box rm'"
+  fail
+fi
+echo "stopped box: exit 2, and the refusal names the state"
+echo "box exec proof OK"
 echo "::endgroup::"
 }
 
@@ -30818,6 +31020,7 @@ case "${1:-}" in
     proof_lifecycle
     proof_session_exec
     proof_exec_reattach
+    proof_box_exec
     proof_session_rename
     proof_session_outbound_request
     proof_own_ip
@@ -30934,7 +31137,7 @@ case "${1:-}" in
     # rely on the lane's daemon or the host's packet filter as it found them.
     proof_daemon_fetch_under_deny_all_host_address_box
     ;;
-  lifecycle | session_exec | exec_reattach | session_rename | session_outbound_request | own_ip | own_ip_egress_declared_and_enforced | task_run | task_network_inherits_session | hooks \
+  lifecycle | session_exec | exec_reattach | box_exec | session_rename | session_outbound_request | own_ip | own_ip_egress_declared_and_enforced | task_run | task_network_inherits_session | hooks \
     | skip_scaffold | tty_relay | sandbox | restart | fresh_install_own_ip_ingress_publishes_loopback \
     | own_ip_box_registers_with_the_vm_host_without_a_provider_flag \
     | vm_host_row_read_tracks_create_and_destroy \
@@ -31008,7 +31211,7 @@ case "${1:-}" in
   *)
     echo "usage: $0 [case]"
     echo "  no argument: every proof, in the whole-lane order"
-    echo "  cases: lifecycle session_exec exec_reattach session_rename session_outbound_request own_ip own_ip_egress_declared_and_enforced task_run task_network_inherits_session hooks"
+    echo "  cases: lifecycle session_exec exec_reattach box_exec session_rename session_outbound_request own_ip own_ip_egress_declared_and_enforced task_run task_network_inherits_session hooks"
     echo "         skip_scaffold tty_relay sandbox restart fresh_install_own_ip_ingress_publishes_loopback"
     echo "         own_ip_box_registers_with_the_vm_host_without_a_provider_flag"
     echo "         vm_host_row_read_tracks_create_and_destroy"
