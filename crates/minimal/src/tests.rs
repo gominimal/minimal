@@ -6598,6 +6598,65 @@ async fn host_list_name_and_state() {
     );
 }
 
+/// BCLI-047: a VM host directory that cannot be read keeps its host in
+/// `min host list`, and the list and `min host show` say its named VMs
+/// were not read, in place of hiding them.
+#[tokio::test]
+async fn host_list_name_and_state_notes_unread_vms() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let state = state_with_host_dirs(&["local-minvmd0/alpha"]);
+    let vm_host = state.path().join("providers/local-minvmd0");
+    let note = format!(
+        "The named VMs of local-minvmd0 are not listed, because {} cannot be read: denied.",
+        vm_host.display()
+    );
+    let host = cmd::hosts::LocalHost {
+        name: "local-minvmd0".into(),
+        provider: cmd::hosts::LocalProvider::LocalMinvmd,
+        instance: 0,
+        vm: None,
+        dir: vm_host.clone(),
+        unread_vms: Some("denied".into()),
+    };
+    assert_eq!(cmd::hosts::unread_vm_notes(&[host]), [note]);
+
+    std::fs::set_permissions(&vm_host, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let readable = std::fs::read_dir(&vm_host).is_ok();
+    let restore =
+        || std::fs::set_permissions(&vm_host, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if readable {
+        // Root reads the directory whatever its mode, so nothing fails here.
+        restore();
+        return;
+    }
+    let mut out = Vec::new();
+    let listed = cmd::hosts::cmd_host_list(&host_globals(state.path()), &mut out).await;
+    let shown = cmd::hosts::cmd_host_show(
+        &host_globals(state.path()),
+        &crate::cli::HostShowArgs {
+            host: "alpha.local-minvmd0".into(),
+        },
+        &mut Vec::new(),
+    )
+    .await;
+    restore();
+    listed.expect("host list runs");
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("\nlocal-minvmd0    local-minvmd   "),
+        "{text}"
+    );
+    assert!(
+        text.contains("The named VMs of local-minvmd0 are not listed, because"),
+        "{text}"
+    );
+    let err = format!("{:#}", shown.expect_err("an unread VM is no host"));
+    assert!(
+        err.contains("The named VMs of local-minvmd0 are not listed"),
+        "{err}"
+    );
+}
+
 /// BCLI-048: `min host show <host>` adds the host-side socket path and the
 /// daemon version. A stopped host has no version to show, and a name no
 /// host has is refused with the command that lists them.

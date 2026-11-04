@@ -98,6 +98,10 @@ pub struct LocalHost {
     pub vm: Option<String>,
     /// The host's state directory.
     pub dir: PathBuf,
+    /// Why the named VMs in this VM host directory were not read, when its
+    /// directory could not be listed. `None` when they were read, or when
+    /// the host holds no named VMs.
+    pub unread_vms: Option<String>,
 }
 
 impl LocalHost {
@@ -167,15 +171,20 @@ pub fn local_hosts(minimal_dir: Option<&Path>) -> std::io::Result<Vec<LocalHost>
             continue;
         };
         if let Some((provider, instance, name)) = host_for_dir_name(&file_name) {
+            let mut unread_vms = None;
             if provider == LocalProvider::LocalMinvmd {
                 // One unreadable VM host directory hides its named VMs
-                // only, never the other hosts.
+                // only, never the other hosts. The host keeps the reason,
+                // so `min host list` and `min host show` can say so.
                 match named_vms(&entry.path(), instance) {
                     Ok(vms) => hosts.extend(vms),
-                    Err(e) => tracing::debug!(
-                        dir = %entry.path().display(),
-                        "named VMs not read: {e:#}"
-                    ),
+                    Err(e) => {
+                        tracing::debug!(
+                            dir = %entry.path().display(),
+                            "named VMs not read: {e:#}"
+                        );
+                        unread_vms = Some(e.to_string());
+                    }
                 }
             }
             hosts.push(LocalHost {
@@ -184,6 +193,7 @@ pub fn local_hosts(minimal_dir: Option<&Path>) -> std::io::Result<Vec<LocalHost>
                 instance,
                 vm: None,
                 dir: entry.path(),
+                unread_vms,
             });
         }
     }
@@ -219,9 +229,28 @@ fn named_vms(host_dir: &Path, instance: u32) -> std::io::Result<Vec<LocalHost>> 
             instance,
             vm: Some(vm),
             dir: entry.path(),
+            unread_vms: None,
         });
     }
     Ok(vms)
+}
+
+/// One line for each VM host whose named VMs were not read: the host, the
+/// directory that could not be read, and why. `min host list` prints them
+/// after its table, and `min host show` after its refusal.
+#[must_use]
+pub fn unread_vm_notes(hosts: &[LocalHost]) -> Vec<String> {
+    hosts
+        .iter()
+        .filter_map(|h| {
+            let reason = h.unread_vms.as_ref()?;
+            Some(format!(
+                "The named VMs of {} are not listed, because {} cannot be read: {reason}.",
+                h.name,
+                h.dir.display()
+            ))
+        })
+        .collect()
 }
 
 /// Whether a host's daemon answers.
@@ -372,6 +401,9 @@ pub async fn cmd_host_list(global: &GlobalArgs, out: &mut dyn Write) -> anyhow::
         .collect();
     writeln!(out, "{:<16} {:<14} STATE", "HOST", "PROVIDER")?;
     output::write_objects(out, OutputMode::Text, &rows)?;
+    for note in unread_vm_notes(&hosts) {
+        writeln!(out, "{note}")?;
+    }
     Ok(())
 }
 
@@ -389,10 +421,15 @@ pub async fn cmd_host_show(
 ) -> anyhow::Result<()> {
     let hosts = local_hosts(global.minimal_dir.as_deref())?;
     let Some(host) = hosts.iter().find(|h| h.name == args.host) else {
-        anyhow::bail!(
+        let mut msg = format!(
             "no local host is named '{}'. Run `min host list` to see the local hosts.",
             args.host
         );
+        for note in unread_vm_notes(&hosts) {
+            msg.push('\n');
+            msg.push_str(&note);
+        }
+        anyhow::bail!(msg);
     };
     let (state, daemon_version) = probe_host(host).await;
     let detail = HostDetail {
