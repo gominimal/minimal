@@ -6801,6 +6801,128 @@ fn provider_list_all_shows_local_providers() {
     );
 }
 
+/// NET-020: a native daemon whose reply carries the routing cause gets it on
+/// the `HOSTNAME PROXY` row of `min ls`, on stdout, once. The cause names
+/// the recovery and the command to re-run, and no `warning:` prefix rides
+/// on it: `min ls` writes nothing to stderr for it any more.
+#[test]
+fn ls_native_routing_cause_on_proxy_row() {
+    let reason = "the daemon could not bind 127.0.0.1:7654: Address in use (os error 98). \
+                  Remedy: free the listen address";
+    let mut resp = listing_of(&[("web", None, None)]);
+    resp.hostname_routing_unavailable = Some(reason.to_string());
+    resp.answerer_bound = true;
+    let render = |resp: &minimald_rpc::ListSessionsResponse,
+                  surface: Option<crate::resolver::LiveSurface>| {
+        let mut out = Vec::new();
+        cmd::format_ls_with_proxy_ports_on(
+            &mut out,
+            &LsArgs {
+                raw: false,
+                json: false,
+            },
+            resp,
+            surface,
+            None,
+            &[],
+            crate::resolver::HostInstall::default(),
+        )
+        .expect("rendering the listing");
+        String::from_utf8(out).expect("the listing is UTF-8")
+    };
+    let expected = format!(
+        "HOSTNAME PROXY:  the hostname proxy is not serving: {reason}. Minimal retries on \
+         its own. Run `min ls` again to check."
+    );
+    for surface in [
+        None,
+        Some(crate::resolver::LiveSurface::Proxy),
+        Some(crate::resolver::LiveSurface::Native),
+    ] {
+        let text = render(&resp, surface.clone());
+        let rows: Vec<&str> = text
+            .lines()
+            .filter(|line| line.starts_with("HOSTNAME PROXY:"))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![expected.as_str()],
+            "surface {surface:?}:\n{text}"
+        );
+        assert_eq!(
+            text.matches(reason).count(),
+            1,
+            "the cause prints once:\n{text}"
+        );
+        assert!(!text.contains("warning:"), "no warning prefix:\n{text}");
+    }
+
+    // A healthy daemon prints no cause row.
+    resp.hostname_routing_unavailable = None;
+    assert!(!render(&resp, None).contains("not serving"));
+
+    // `--json` and `--raw` carry no cause row.
+    resp.hostname_routing_unavailable = Some(reason.to_string());
+    for (raw, json) in [(true, false), (false, true)] {
+        let mut out = Vec::new();
+        cmd::format_ls_with_proxy_ports_on(
+            &mut out,
+            &LsArgs { raw, json },
+            &resp,
+            None,
+            None,
+            &[],
+            crate::resolver::HostInstall::default(),
+        )
+        .expect("rendering the listing");
+        let text = String::from_utf8(out).expect("the listing is UTF-8");
+        assert!(!text.contains("HOSTNAME PROXY:"), "machine output:\n{text}");
+    }
+}
+
+/// NET-020: at activate the daemon's cause rides the one `names:` line, in
+/// place of how to open the box, and no warning line of its own prints
+/// beside it. The line is the only text the activation prints for it, so
+/// the cause appears once.
+#[test]
+fn activate_prints_routing_cause_once() {
+    let reason = "the daemon could not bind 127.0.0.1:7654: Address in use (os error 98). \
+                  Remedy: free the listen address";
+    let cause = crate::resolver::host_line_proxy_cause(None, Some(reason));
+    for surface in [
+        crate::resolver::LiveSurface::Proxy,
+        crate::resolver::LiveSurface::Native,
+    ] {
+        let line = crate::resolver::host_line_beside(
+            "web",
+            &surface,
+            None,
+            crate::resolver::HostInstall::default(),
+            cause.as_deref(),
+            true,
+        );
+        assert!(
+            line.contains(&format!(
+                "names: web.min.internal: the hostname proxy is not serving: {reason}"
+            )),
+            "the cause replaces the resolution clause, got: {line}"
+        );
+        assert_eq!(line.matches(reason).count(), 1, "once, got: {line}");
+        assert!(!line.contains("warning:"), "no warning prefix, got: {line}");
+        assert!(
+            !line.contains("opens through the HTTP proxy at"),
+            "a down proxy is never the route, got: {line}"
+        );
+    }
+    // The activation path no longer prints a standalone warning: the
+    // function that wrote it is gone, so no stderr line can repeat it.
+    let source = include_str!("cmd/boxes/create.rs");
+    assert!(
+        !source.contains("warn_if_hostname_routing_down("),
+        "activate prints the cause only on its names: line"
+    );
+}
+
 /// One `min box` command the end-to-end test below ran: its spelling, and
 /// the stdout, stderr and exit code the command ends with.
 struct BoxCommandRun {
