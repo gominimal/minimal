@@ -246,7 +246,7 @@
 #                                    serving beside native DNS, and a destroy
 #                                    answering NXDOMAIN while the sibling box
 #                                    keeps its own address and page
-#   hostnames_recover_and_two_daemons_route NET-020..027 warning, recovery,
+#   hostnames_recover_and_two_daemons_route NET-020..027 cause, recovery,
 #                                   two daemons on one machine routing
 #   retired_surfaces_gone            NET-109/110: the retired surfaces are gone,
 #                                    and a direct-tcpip forward relays for real
@@ -404,18 +404,19 @@ case "${1:-}" in
 esac
 
 # The host exposure the VM-backed daemon opens host.min.internal at. minvmd
-# closes the alias at every port unless MINVMD_HOST_EXPOSURE_PORTS lists
-# ports, and it reads the list from its own environment at each VM boot, so
-# the export must precede the first `min` call, whose autospawn inherits it.
-# The list is the one port NET-003 reaches the host's loopback at from a
-# host-address box (the proxy proof's PROXY_HOST_PORT) and nothing wider:
-# the same proof asserts the alias stays refused at an unlisted port, and
-# own-address boxes stay refused at every port, listed or not. A native
-# daemon has no alias gate and ignores the variable.
+# closes the alias at every port unless the [host-exposures] table of the
+# client config.toml opens ports. The table is written into the hermetic
+# XDG_CONFIG_HOME below, before the first `min` call, whose autospawn hands
+# minvmd that config dir. The table is the one port NET-003 reaches the
+# host's loopback at from a host-address box (the proxy proof's
+# PROXY_HOST_PORT) and nothing wider: the same proof asserts the alias stays
+# refused at a port outside the table, and own-address boxes stay refused at
+# every port, in the table or not. That own-address refusal is a current
+# limit: the design lets an own-address box that declares the name reach an
+# exposure, and https://github.com/gominimal/minimal/issues/2990 (T154)
+# tracks the guest half. A native daemon has no alias gate and
+# ignores the table.
 E2E_HOST_EXPOSURE_PORT=18081
-if [ -n "$E2E_VM" ]; then
-  export MINVMD_HOST_EXPOSURE_PORTS="$E2E_HOST_EXPOSURE_PORT"
-fi
 
 # The non-baseline package the sandbox proof adds and then runs. It must be a
 # real upstream package that is genuinely ABSENT from a fresh shell-stack
@@ -713,6 +714,11 @@ fi
 # orientation banner (built-in `default` loadout). An operator's own
 # `default_loadouts`/`default.toml` must not leak into the canonical proof.
 export XDG_CONFIG_HOME="$WORK/config"
+if [ -n "$E2E_VM" ]; then
+  mkdir -p "$XDG_CONFIG_HOME/minimal"
+  printf '[host-exposures]\ne2e = { proto = "tcp", port = %s }\n' "$E2E_HOST_EXPOSURE_PORT" \
+    >>"$XDG_CONFIG_HOME/minimal/config.toml"
+fi
 
 # The CLI's tracing layer writes to STDOUT (ot::StdoutWriter, minimal/src/
 # main.rs), so at the default level the autospawn INFO lines interleave with
@@ -11331,11 +11337,12 @@ proof_native_answerer_survives_session_stop() {
 #      occupies 127.0.0.1:<pin> before the daemon starts, the daemon comes
 #      up pinned to that port (--hostname-proxy-port), and both activate
 #      and `min ls` must say what failed, whose fault it is, and what
-#      clears it — the daemon's bind report, remedy included.
+#      clears it — the daemon's bind report, remedy included — once each:
+#      activate on its `names:` line, `min ls` on its HOSTNAME PROXY row.
 #   B. Recovery without a restart (NET-021, NET-022). Free the port; the
-#      daemon's own retry loop binds it, `min ls` stops warning and starts
-#      printing the listening line on the SAME daemon process — asserted
-#      by pid continuity, because a restart would clear the warning too.
+#      daemon's own retry loop binds it, `min ls` stops naming the cause and
+#      prints the listening line on the SAME daemon process — asserted
+#      by pid continuity, because a restart would clear the cause too.
 #      The daemon log carries the pair the retry leaves: the unavailable
 #      warns with their next-retry schedule, then the recovered/serving
 #      infos that say the listener is back.
@@ -11662,39 +11669,53 @@ while True:
          fail; }
   recover_sid="$(printf '%s\n' "$recover_sid" | tail -n1 | tr -d '\r')"
 
+  # NET-020: activate prints the cause once, on its `names:` line, in place
+  # of the line's resolution clause. No warning line of its own.
   recover_activate_err="$(cat "$WORK/recover-activate.err" 2>/dev/null || true)"
-  case "$recover_activate_err" in
-    *"warning: the hostname proxy is not serving"*"could not bind 127.0.0.1:$RECOVER_PIN"*"Remedy: free the listen address"*) ;;
+  recover_names_line="$(grep -F -- 'names: ' "$WORK/recover-activate.err" 2>/dev/null | head -n1 || true)"
+  case "$recover_names_line" in
+    "names: "*": the hostname proxy is not serving: "*"could not bind 127.0.0.1:$RECOVER_PIN"*"Remedy: free the listen address"*) ;;
     *)
-      echo "::error::activate against the held port did not warn with the reason and the remedy (NET-020)"
+      echo "::error::activate against the held port did not name the reason and the remedy on its names: line (NET-020)"
       echo "--- activate stderr ---"; cat "$WORK/recover-activate.err" 2>/dev/null || true
       fail
       ;;
   esac
-  if ! grep -F -q -- 'min session activate' "$WORK/recover-activate.err" \
-     || ! grep -F -q -- 'again to check' "$WORK/recover-activate.err"; then
-    echo "::error::the activate warning's recovery sentence does not name the command it rode on (NET-020)"
-    echo "--- activate stderr ---"; cat "$WORK/recover-activate.err" 2>/dev/null || true
-    fail
-  fi
-  echo "activate warned:"; sed 's/^/  /' "$WORK/recover-activate.err"
-
-  recover_ls_out="$(mnl ls 2>&1)"
-  case "$recover_ls_out" in
-    *"warning: the hostname proxy is not serving"*"could not bind 127.0.0.1:$RECOVER_PIN"*"Remedy: free the listen address"*) ;;
-    *)
-      echo "::error::min ls against the held port did not warn with the reason and the remedy (NET-020)"
-      echo "--- min ls output ---"; printf '%s\n' "$recover_ls_out"
+  case "$recover_activate_err" in
+    *"warning: the hostname proxy is not serving"*)
+      echo "::error::activate printed the old stderr warning line beside its names: line (NET-020)"
+      echo "--- activate stderr ---"; printf '%s\n' "$recover_activate_err"
       fail
       ;;
   esac
-  if ! printf '%s\n' "$recover_ls_out" | grep -F -q -- 'again to check' \
-     || ! printf '%s\n' "$recover_ls_out" | grep -F -q -- 'min ls'; then
-    echo "::error::the ls warning's recovery sentence does not name the command it rode on (NET-020)"
-    echo "--- min ls output ---"; printf '%s\n' "$recover_ls_out"
+  recover_cause_count="$(grep -c -F -- 'the hostname proxy is not serving' "$WORK/recover-activate.err" 2>/dev/null || true)"
+  if [ "${recover_cause_count:-0}" != 1 ]; then
+    echo "::error::activate printed the hostname proxy's cause ${recover_cause_count:-0} times, not once (NET-020)"
+    echo "--- activate stderr ---"; cat "$WORK/recover-activate.err" 2>/dev/null || true
     fail
   fi
-  printf '%s\n' "$recover_ls_out" | grep -F -- 'warning: the hostname proxy is not serving' | sed 's/^/  /'
+  echo "activate named the cause once:"; printf '%s\n' "$recover_names_line" | sed 's/^/  /'
+
+  # NET-020: `min ls` prints the cause on its HOSTNAME PROXY row, on stdout,
+  # and nothing about it on stderr.
+  recover_ls_out="$(mnl ls 2>"$WORK/recover-ls.err")"
+  recover_proxy_row="$(printf '%s\n' "$recover_ls_out" | grep -F -- 'HOSTNAME PROXY:' \
+    | grep -F -- 'not serving' | head -n1 || true)"
+  case "$recover_proxy_row" in
+    "HOSTNAME PROXY:  the hostname proxy is not serving: "*"could not bind 127.0.0.1:$RECOVER_PIN"*"Remedy: free the listen address"*"Minimal retries on its own. Run \`min ls\` again to check.") ;;
+    *)
+      echo "::error::min ls against the held port did not name the reason and the remedy on its HOSTNAME PROXY row (NET-020)"
+      echo "--- min ls stdout ---"; printf '%s\n' "$recover_ls_out"
+      echo "--- min ls stderr ---"; cat "$WORK/recover-ls.err" 2>/dev/null || true
+      fail
+      ;;
+  esac
+  if grep -F -q -- 'the hostname proxy is not serving' "$WORK/recover-ls.err" 2>/dev/null; then
+    echo "::error::min ls printed the hostname proxy's cause on stderr as well as on its HOSTNAME PROXY row (NET-020)"
+    echo "--- min ls stderr ---"; cat "$WORK/recover-ls.err" 2>/dev/null || true
+    fail
+  fi
+  printf '%s\n' "$recover_proxy_row" | sed 's/^/  /'
 
   # The daemon log's own record: the warn the retry left, with its status
   # and next-retry schedule (the file log is JSON lines).
@@ -11752,7 +11773,7 @@ while True:
       | grep -oE '127\.0\.0\.1:[0-9]+' | head -n1 | cut -d: -f2 || true)"
     if [ "$recover_port_now" = "$RECOVER_PIN" ]; then
       case "$recover_ls_after" in
-        *"warning: the hostname proxy is not serving"*) ;; # serving but still warning: keep polling
+        *"the hostname proxy is not serving"*) ;; # the row still names the cause: keep polling
         *) recover_cleared=1; break ;;
       esac
     fi
@@ -22189,7 +22210,7 @@ proof_min_internal_names_through_proxy() {
   #    a minimald — a dev box serving its own sessions — has it taken: this
   #    run's daemon retries with backoff and never owns the port, and every
   #    probe through the proxy would reach a daemon that knows nothing about
-  #    this run's boxes. `min ls` carries exactly that warning, so the warning
+  #    this run's boxes. `min ls` names that cause on its HOSTNAME PROXY row, so the row
   #    IS the gate. It gets a few seconds to clear first — the whole-lane run
   #    restarts the daemon just above, and the stop-race with the proof before
   #    this one must not read as a conflict — then degrades to the one name
@@ -22198,7 +22219,7 @@ proof_min_internal_names_through_proxy() {
   for proxy_bind_try in 1 2 3 4 5; do
     proxy_ls_out="$(mnl ls 2>&1)"
     case "$proxy_ls_out" in
-      *"warning: the hostname proxy is not serving"*) proxy_bind_taken=1 ;;
+      *"the hostname proxy is not serving"*) proxy_bind_taken=1 ;;
       *) proxy_bind_taken=0; break ;;
     esac
     [ "$proxy_bind_try" = 5 ] || sleep 3
@@ -22339,8 +22360,8 @@ proof_min_internal_names_through_proxy() {
 
   # ---- the host exposure is the only opening (design §7.1) ----------------
   # A VM host's gate opens host.min.internal at the listed exposure alone
-  # (MINVMD_HOST_EXPOSURE_PORTS, exported at the top), so the same box, the
-  # same alias, at a port outside the list must not reach the host, even
+  # (the [host-exposures] table written at the top), so the same box, the
+  # same alias, at a port outside the table must not reach the host, even
   # with a host-loopback listener answering there. A native host-address box
   # shares the host's namespace, with no alias gate to assert.
   if [ -n "$E2E_VM" ]; then
@@ -22380,7 +22401,7 @@ proof_min_internal_names_through_proxy() {
     case "$proxy_unexposed_rc" in
       7 | 28) ;;
       0)
-        echo "::error::the host-address box reached the host through host.min.internal at port $PROXY_UNEXPOSED_PORT, outside MINVMD_HOST_EXPOSURE_PORTS=$MINVMD_HOST_EXPOSURE_PORTS"
+        echo "::error::the host-address box reached the host through host.min.internal at port $PROXY_UNEXPOSED_PORT, outside the [host-exposures] table, which opens port $E2E_HOST_EXPOSURE_PORT alone"
         fail
         ;;
       *)
@@ -22680,7 +22701,7 @@ proof_own_ip_deny_all_box_answers_published_port() {
   for da_bind_try in 1 2 3 4 5; do
     da_ls_out="$(mnl ls 2>&1)"
     case "$da_ls_out" in
-      *"warning: the hostname proxy is not serving"*) da_bind_taken=1 ;;
+      *"the hostname proxy is not serving"*) da_bind_taken=1 ;;
       *) da_bind_taken=0; break ;;
     esac
     [ "$da_bind_try" = 5 ] || sleep 3
@@ -23213,7 +23234,7 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     for po_try in 1 2 3 4 5; do
       po_ls="$(mnl ls 2>&1)"
       case "$po_ls" in
-        *"warning: the hostname proxy is not serving"*) po_bind_taken=1 ;;
+        *"the hostname proxy is not serving"*) po_bind_taken=1 ;;
         *) po_bind_taken=0; break ;;
       esac
       [ "$po_try" = 5 ] || sleep 3
@@ -26776,7 +26797,7 @@ proof_proxy_refuses_like_direct() {
   for par_bind_try in 1 2 3 4 5; do
     par_ls_out="$(mnl ls 2>&1)"
     case "$par_ls_out" in
-      *"warning: the hostname proxy is not serving"*) par_bind_taken=1 ;;
+      *"the hostname proxy is not serving"*) par_bind_taken=1 ;;
       *) par_bind_taken=0; break ;;
     esac
     [ "$par_bind_try" = 5 ] || sleep 3
