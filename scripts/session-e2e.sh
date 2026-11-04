@@ -24472,32 +24472,51 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     kill -9 "$PO_TASK_PID" 2>/dev/null || true
     PO_TASK_PID=""
     echo "run: SIGKILLed the client while the command still ran — the box's end must key on the command's exit, not on the client"
+    # The box ends when its command exits, and keeps its record (BOX-038):
+    # NET-131's "end the box" is the box leaving `running`, not leaving the
+    # listing. So the wait reads the box's state the way `box_exited_check`
+    # does — the `State:` and `Exit code:` lines of `min box show` — and
+    # passes on an ended state (`exited`, or `stopped`), never while the box
+    # is still `running`. The task is `echo; sleep 5`, and the daemon keeps
+    # the entrypoint alive through the client's death, so its exit code is 0.
     po_box_ended=""
     po_task_ls=""
+    po_task_state=""
+    po_task_code=""
+    po_task_show=""
     for _ in $(seq 1 90); do
       po_task_ls_now="$(mnl ls 2>/dev/null)"
       # An EMPTY listing is no answer at all: an `mnl ls` that answers nothing
-      # — the daemon momentarily busy destroying the very box this wait reads,
-      # say — reads as "no box listed" to the glob, which would green the
-      # NET-131 assertion below without ever observing the delist. Only a
-      # listing that says something counts as a verdict, so an empty one
-      # leaves it untouched and keeps the last listing that did answer for the
-      # failure arm.
+      # — the daemon momentarily busy ending the very box this wait reads,
+      # say — is no verdict on the box's state. Only a listing that says
+      # something counts, so an empty one leaves the state unread and keeps
+      # the last listing that did answer for the failure arm.
       if [ -n "$po_task_ls_now" ]; then
         po_task_ls="$po_task_ls_now"
-        if [[ "$po_task_ls_now" != *e2e-port-run-[0-9]* ]]; then
-          po_box_ended=1
-          break
-        fi
+        po_task_show="$(mnl box show "$po_task_box" </dev/null 2>&1)" || po_task_show=""
+        po_task_state="$(printf '%s\n' "$po_task_show" | sed -n 's/^State: *//p' | tr -d '\r')"
+        po_task_code="$(printf '%s\n' "$po_task_show" | sed -n 's/^Exit code: *//p' | tr -d '\r')"
+        case "$po_task_state" in
+          exited|stopped)
+            po_box_ended=1
+            break
+            ;;
+        esac
       fi
       sleep 1
     done
     if [ -z "$po_box_ended" ]; then
       echo "::error::the run's box is STILL listed after its command exited — a box created for a run must end with its run's command, never with its client (NET-131)"
       echo "--- min ls (the last listing that answered) ---"; printf '%s\n' "${po_task_ls:-<min ls never answered a listing this wait could read>}"
+      echo "--- min box show $po_task_box (state '${po_task_state:-<none>}') ---"; printf '%s\n' "$po_task_show"
       fail
     fi
-    echo "run: the box ended with its run's command — the end keyed on the exit, not on the client's death (NET-131)"
+    if [ "$po_task_code" != 0 ]; then
+      echo "::error::the run's box ended as $po_task_state with exit code '${po_task_code:-<none>}', not its task's 0 — the box's exit code must be its run's command's (BOX-038)"
+      echo "--- min box show $po_task_box ---"; printf '%s\n' "$po_task_show"
+      fail
+    fi
+    echo "run: the box ended with its run's command as $po_task_state, exit code $po_task_code — the end keyed on the exit, not on the client's death (NET-131)"
     # The daemon-side end's own record, where the lane can read it: one line
     # naming the session, the run and the exit its box ended with — at info
     # under the module this half pinned the daemon to above, whatever filter
@@ -24521,7 +24540,7 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     fi
     rm -rf "$PO_TASK_SEED_DIR"; PO_TASK_SEED_DIR=""
     po_run_restore_log
-    echo "run half OK (box created for the run, delisted when the run's command exited — the client died mid-command and the end keyed on the exit)"
+    echo "run half OK (box created for the run, ended with its record kept when the run's command exited — the client died mid-command and the end keyed on the exit)"
   }
   po_run_half
 
