@@ -297,6 +297,10 @@ fn every_daemon_connection_is_classified() {
             "cmd/boxes/list.rs::list_other_host = ungated",
             "cmd/boxes/list.rs::list_selected_host = gated",
             "cmd/boxes/vm_host.rs::box_record_by = ungated",
+            // `min host list|show` probes each local host for its state and
+            // daemon version. It only reads, and it must show a skewed
+            // daemon's version, so it must work when the pair is skewed.
+            "cmd/hosts.rs::probe_host = ungated",
             "cmd/list.rs::cmd_bare = gated",
             // `min ls` reaches past the selected VM, and the two halves carry
             // the gate differently (see `ls_listings`): the selected VM is the
@@ -369,6 +373,9 @@ fn every_daemon_connection_is_classified() {
             "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy = ungated",
             "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy = ungated",
             "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy_until_the_creation_fails = ungated",
+            // Not a product path: the host show test's own connection to
+            // the harness daemon, to read the version it expects.
+            "tests.rs::host_show_socket_and_version = ungated",
             "tests.rs::local_member_is_a_sign_in_reference_expiring_with_the_root = ungated",
             // Not a product path, and not the daemon: the audit test submits
             // a revocation to a test Box Egress Proxy's control socket.
@@ -6448,6 +6455,364 @@ async fn ls_reports_every_proxy_port() {
     let request = server.await.expect("the server ends");
     assert_eq!(request.trim(), r#"{"verb":"proxy_ports"}"#);
     assert!(cmd::vm_host_proxy_ports_at(None).await.is_empty());
+}
+
+/// A state dir with the given `providers/<dir>` host directories.
+fn state_with_host_dirs(dirs: &[&str]) -> tempfile::TempDir {
+    let state = tempfile::tempdir().expect("a temp minimal state dir");
+    for dir in dirs {
+        std::fs::create_dir_all(state.path().join("providers").join(dir)).expect("the host dir");
+    }
+    state
+}
+
+/// Globals that resolve every path under `state`.
+fn host_globals(state: &std::path::Path) -> GlobalArgs {
+    GlobalArgs {
+        minimal_dir: Some(state.to_path_buf()),
+        ..GlobalArgs::default()
+    }
+}
+
+/// A stale socket file at `sock`, with nothing listening on it: what a
+/// stopped daemon leaves behind.
+fn stale_socket(sock: &std::path::Path) {
+    let listener = std::os::unix::net::UnixListener::bind(sock).expect("the socket path binds");
+    drop(listener);
+}
+
+/// BCLI-046: the well-known local providers are `local`, `local-minvmd` and
+/// `local-box`, and each host is named after its daemon instance. A named
+/// VM nested in a VM host is a host of its own, named by its ssh host alias.
+/// A directory that is no daemon instance, or no valid VM name, is no host.
+#[test]
+fn local_provider_and_host_names() {
+    use cmd::hosts::{LocalProvider, local_hosts};
+    assert_eq!(
+        LocalProvider::ALL.map(LocalProvider::name),
+        ["local", "local-minvmd", "local-box"]
+    );
+    let state = state_with_host_dirs(&[
+        "local-minimald1",
+        "local-minimald01",
+        "local-minimald0",
+        "local-minvmd0",
+        "local-minvmd00",
+        "local-minvmd0/alpha",
+        "local-minvmd0/Not_A_VM",
+        "local-minvmd0/guest",
+        "local-minvmd0/default",
+        "local-minimald0/beta",
+        "remote-x",
+        "local-minimald",
+    ]);
+    let hosts = local_hosts(Some(state.path())).expect("the hosts read");
+    let named: Vec<_> = hosts
+        .iter()
+        .map(|h| (h.name.as_str(), h.provider.name()))
+        .collect();
+    assert_eq!(
+        named,
+        [
+            ("local0", "local"),
+            ("local1", "local"),
+            ("local-minvmd0", "local-minvmd"),
+            ("alpha.local-minvmd0", "local-minvmd"),
+        ]
+    );
+    assert_eq!(
+        hosts[0].socket(),
+        state.path().join("providers/local-minimald0/ssh.sock")
+    );
+    assert_eq!(
+        hosts[3].socket(),
+        state.path().join("providers/local-minvmd0/alpha/ssh.sock")
+    );
+
+    use clap::Parser as _;
+    let cli = Cli::try_parse_from(["min", "--provider", "local", "ls"]).unwrap();
+    assert_eq!(cli.global_args.provider, Some(Provider::Local));
+    assert!(!cli.global_args.use_minvmd());
+}
+
+/// BCLI-046: `--provider local-minimald` reads as `local`, prints its hint,
+/// and no longer shows among the values `--provider` offers.
+#[test]
+fn local_minimald_alias_reads_as_local() {
+    use clap::Parser as _;
+    use clap::ValueEnum as _;
+    let mut cli = Cli::try_parse_from(["min", "--provider", "local-minimald", "ls"]).unwrap();
+    let hint = cmd::hosts::read_provider_alias(&mut cli.global_args);
+    assert_eq!(hint, Some("local-minimald is now called local."));
+    assert_eq!(cli.global_args.provider, Some(Provider::Local));
+    assert!(!cli.global_args.use_minvmd());
+
+    for provider in ["local", "local-minvmd"] {
+        let mut cli = Cli::try_parse_from(["min", "--provider", provider, "ls"]).unwrap();
+        assert_eq!(
+            cmd::hosts::read_provider_alias(&mut cli.global_args),
+            None,
+            "{provider} is no alias"
+        );
+    }
+    let mut cli = Cli::try_parse_from(["min", "ls"]).unwrap();
+    assert_eq!(cmd::hosts::read_provider_alias(&mut cli.global_args), None);
+
+    let shown: Vec<String> = Provider::value_variants()
+        .iter()
+        .filter_map(Provider::to_possible_value)
+        .filter(|v| !v.is_hide_set())
+        .map(|v| v.get_name().to_owned())
+        .collect();
+    assert_eq!(shown, ["local", "local-minvmd"]);
+
+    // A failed run in a machine output mode carries the hint in the error
+    // object's `hint` field, after any hint the failure has.
+    let hint = "local-minimald is now called local.";
+    let failure = MachineModeFailure::new("not_found", "no box 'x'".into(), String::new());
+    assert_eq!(failure.with_alias_hint(hint).hint(), hint);
+    let failure = MachineModeFailure::new("not_found", "no box 'x'".into(), "run `min ls`".into());
+    assert_eq!(
+        failure.with_alias_hint(hint).hint(),
+        "run `min ls`. local-minimald is now called local."
+    );
+}
+
+/// BCLI-047: `min host list` renders each local host with its name and
+/// state: a daemon that answers is running, a stale socket is stopped.
+#[tokio::test]
+async fn host_list_name_and_state() {
+    let state = state_with_host_dirs(&["local-minimald0", "local-minvmd0"]);
+    let server = minimald::test_harness::TestServer::new().await;
+    server
+        .listen_on_uds(&state.path().join("providers/local-minimald0/ssh.sock"))
+        .await;
+    stale_socket(&state.path().join("providers/local-minvmd0/ssh.sock"));
+
+    let mut out = Vec::new();
+    cmd::hosts::cmd_host_list(&host_globals(state.path()), &mut out)
+        .await
+        .expect("host list runs");
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(
+        text,
+        "HOST             PROVIDER       STATE\n\
+         local0           local          running\n\
+         local-minvmd0    local-minvmd   stopped\n"
+    );
+
+    let empty = tempfile::tempdir().unwrap();
+    let mut out = Vec::new();
+    cmd::hosts::cmd_host_list(&host_globals(empty.path()), &mut out)
+        .await
+        .expect("host list runs with no host");
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "No local host on this machine yet.\n"
+    );
+}
+
+/// BCLI-047: a VM host directory that cannot be read keeps its host in
+/// `min host list`, and the list and `min host show` say its named VMs
+/// were not read, in place of hiding them.
+#[tokio::test]
+async fn host_list_name_and_state_notes_unread_vms() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let state = state_with_host_dirs(&["local-minvmd0/alpha"]);
+    let vm_host = state.path().join("providers/local-minvmd0");
+    let note = format!(
+        "The named VMs of local-minvmd0 are not listed, because {} cannot be read: denied.",
+        vm_host.display()
+    );
+    let host = cmd::hosts::LocalHost {
+        name: "local-minvmd0".into(),
+        provider: cmd::hosts::LocalProvider::LocalMinvmd,
+        instance: 0,
+        vm: None,
+        dir: vm_host.clone(),
+        unread_vms: Some("denied".into()),
+    };
+    assert_eq!(cmd::hosts::unread_vm_notes(&[host]), [note]);
+
+    std::fs::set_permissions(&vm_host, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let readable = std::fs::read_dir(&vm_host).is_ok();
+    let restore =
+        || std::fs::set_permissions(&vm_host, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if readable {
+        // Root reads the directory whatever its mode, so nothing fails here.
+        restore();
+        return;
+    }
+    let mut out = Vec::new();
+    let listed = cmd::hosts::cmd_host_list(&host_globals(state.path()), &mut out).await;
+    let shown = cmd::hosts::cmd_host_show(
+        &host_globals(state.path()),
+        &crate::cli::HostShowArgs {
+            host: "alpha.local-minvmd0".into(),
+        },
+        &mut Vec::new(),
+    )
+    .await;
+    restore();
+    listed.expect("host list runs");
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("\nlocal-minvmd0    local-minvmd   "),
+        "{text}"
+    );
+    assert!(
+        text.contains("The named VMs of local-minvmd0 are not listed, because"),
+        "{text}"
+    );
+    let err = format!("{:#}", shown.expect_err("an unread VM is no host"));
+    assert!(
+        err.contains("The named VMs of local-minvmd0 are not listed"),
+        "{err}"
+    );
+}
+
+/// BCLI-048: `min host show <host>` adds the host-side socket path and the
+/// daemon version. A stopped host has no version to show, and a name no
+/// host has is refused with the command that lists them.
+#[tokio::test]
+async fn host_show_socket_and_version() {
+    let state = state_with_host_dirs(&["local-minimald0", "local-minvmd0"]);
+    let sock = state.path().join("providers/local-minimald0/ssh.sock");
+    let server = minimald::test_harness::TestServer::new().await;
+    server.listen_on_uds(&sock).await;
+    let version = {
+        let mut client = client::Client::connect(&sock).await.expect("connect");
+        client
+            .oneshot_rpc::<minimald_rpc::GetVersion>(())
+            .await
+            .expect("GetVersion")
+            .long_version
+    };
+    let stopped_sock = state.path().join("providers/local-minvmd0/ssh.sock");
+    stale_socket(&stopped_sock);
+    let global = host_globals(state.path());
+
+    let mut out = Vec::new();
+    let args = HostShowArgs {
+        host: "local0".to_owned(),
+    };
+    cmd::hosts::cmd_host_show(&global, &args, &mut out)
+        .await
+        .expect("host show runs");
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        format!(
+            "Host:            local0\n\
+             Provider:        local\n\
+             State:           running\n\
+             Socket:          {}\n\
+             Daemon version:  {version}\n",
+            sock.display()
+        )
+    );
+
+    let mut out = Vec::new();
+    let args = HostShowArgs {
+        host: "local-minvmd0".to_owned(),
+    };
+    cmd::hosts::cmd_host_show(&global, &args, &mut out)
+        .await
+        .expect("host show runs on a stopped host");
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("State:           stopped\n"), "{text}");
+    assert!(
+        text.contains(&format!("Socket:          {}\n", stopped_sock.display())),
+        "{text}"
+    );
+    assert!(
+        text.contains("Daemon version:  unknown, because the daemon is not running\n"),
+        "{text}"
+    );
+
+    // A daemon that does not answer can still run, so the text does not say
+    // that it is not running.
+    let unanswered = cmd::hosts::HostDetail {
+        name: "local-minvmd0".to_owned(),
+        provider: "local-minvmd",
+        state: cmd::hosts::HostState::Unreachable,
+        socket: stopped_sock.clone(),
+        daemon_version: None,
+    };
+    let mut out = Vec::new();
+    cmd::output::Rendered::text(&unanswered, &mut out).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("State:           not responding\n"), "{text}");
+    assert!(
+        text.contains("Daemon version:  unknown, because the daemon did not answer\n"),
+        "{text}"
+    );
+
+    let args = HostShowArgs {
+        host: "local-minimald0".to_owned(),
+    };
+    let err = cmd::hosts::cmd_host_show(&global, &args, &mut Vec::new())
+        .await
+        .expect_err("the state dir name is no host name");
+    assert_eq!(
+        err.to_string(),
+        "no local host is named 'local-minimald0'. Run `min host list` to see the local hosts."
+    );
+}
+
+/// BCLI-052: `min provider list --all` lists every well-known local provider
+/// present on the machine: a provider with a host, and `local-box` only in a
+/// box. Without `--all` it lists the provider the command selects.
+#[test]
+fn provider_list_all_shows_local_providers() {
+    let state = state_with_host_dirs(&["local-minimald0", "local-minvmd0", "local-minvmd1"]);
+    let global = host_globals(state.path());
+
+    let mut out = Vec::new();
+    cmd::hosts::provider_list(&global, true, false, &mut out).expect("provider list runs");
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "PROVIDER       HOSTS\n\
+         local          local0\n\
+         local-minvmd   local-minvmd0, local-minvmd1\n"
+    );
+
+    let mut out = Vec::new();
+    cmd::hosts::provider_list(&global, true, true, &mut out).expect("provider list runs");
+    assert!(
+        String::from_utf8(out)
+            .unwrap()
+            .ends_with("local-box      -\n"),
+        "local-box is present in a box"
+    );
+
+    let vm_only = state_with_host_dirs(&["local-minvmd0"]);
+    let mut out = Vec::new();
+    cmd::hosts::provider_list(&host_globals(vm_only.path()), true, false, &mut out)
+        .expect("provider list runs");
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "PROVIDER       HOSTS\n\
+         local-minvmd   local-minvmd0\n"
+    );
+
+    let mut vm_global = host_globals(state.path());
+    vm_global.provider = Some(Provider::LocalMinvmd);
+    let mut out = Vec::new();
+    cmd::hosts::provider_list(&vm_global, false, false, &mut out).expect("provider list runs");
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "PROVIDER       HOSTS\n\
+         local-minvmd   local-minvmd0, local-minvmd1\n"
+    );
+
+    let empty = tempfile::tempdir().unwrap();
+    let mut out = Vec::new();
+    cmd::hosts::provider_list(&host_globals(empty.path()), true, false, &mut out)
+        .expect("provider list runs");
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "No local provider on this machine yet.\n"
+    );
 }
 
 /// One local host for the box address tests.

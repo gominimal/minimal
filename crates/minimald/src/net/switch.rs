@@ -472,6 +472,11 @@ pub async fn attach_to_switch_vsock(
 ) -> io::Result<SwitchRelay> {
     let sock = connect_switch_vsock(cid, port).await?;
     let announce = gate.is_some();
+    // NET-160: the VM host daemon's gate decides this box's frames past the
+    // relay, against the current `[host-exposures]` table.
+    if let Some(gate) = &gate {
+        gate.mark_host_gated();
+    }
     let (sock_rx, sock_tx) = tokio::io::split(sock);
     spawn_relay(tap_fd, sock_rx, sock_tx, gate, announce, lease, subnet)
 }
@@ -954,7 +959,8 @@ where
         // so the box cannot mint this admission.
         if let Some(gate) = &gate
             && !gate.reply_admits_frame(&buf[..n])
-            && let FrameVerdict::Drop(reason) = egress::verdict(verdict_summary, &gate.egress)
+            && let FrameVerdict::Drop(reason) =
+                egress::verdict(verdict_summary, gate.relay_egress())
         {
             // NET-066, with design §5.3's conntrack-aware retention: an
             // address the box resolved from a name its policy allowed is
@@ -979,6 +985,7 @@ where
             if !pinned {
                 let remote = drop_remote(&summary);
                 let transport = drop_transport(&reason);
+                let rule = gate.drop_rule(&reason);
                 // The VM host daemon keeps its own record of the refused
                 // flow, outside the VM: reported only when the drop line
                 // fires, so under the same rate limit, never per frame.
@@ -988,7 +995,7 @@ where
                     remote,
                     transport,
                     None,
-                    reason.rule(),
+                    rule,
                 ) {
                     let destination = match remote {
                         Some(SocketAddr::V4(destination)) => Some(destination),
@@ -998,7 +1005,7 @@ where
                         reject.lease,
                         destination,
                         &transport.to_string(),
-                        reason.rule(),
+                        rule,
                     );
                 }
                 continue;
@@ -1486,6 +1493,20 @@ pub struct BoxGate {
     /// resolver the carve-out is keyed to, and its lease (NET-084) — decided
     /// by `boxes::core::egress`.
     egress: egress::EgressRules,
+    /// The same rules with the host alias passed on to the VM host daemon's
+    /// gate (NET-160), for a box that names `host.min.internal` or whose
+    /// `allow_subnets` covers the alias. `None` for every other box. The
+    /// relay decides by these only once the box attaches over the host's
+    /// vsock shuttle ([`Self::host_gated`]), where that gate reads the
+    /// current `[host-exposures]` table. A native relay never does.
+    egress_host_gated: Option<egress::EgressRules>,
+    /// Whether this box's relay attached over the host's vsock shuttle,
+    /// so a gate on the VM host decides its frames past the relay. Set
+    /// once, at the attach ([`attach_to_switch_vsock`]).
+    host_gated: AtomicBool,
+    /// The host alias on this box's switch: the relay names a drop there
+    /// by the `host-alias` rule, the name the VM host daemon's gate uses.
+    host_alias: [u8; 4],
     /// The box's compiled ingress rules — its declared internal ports, the
     /// permit range and the dynamic stance — the shared decision a
     /// listen-published port is published by ([`Self::listen_verdict`],
@@ -1593,6 +1614,8 @@ impl BoxGate {
         // with the DNS gate below — so a name's admission and a frame's
         // verdict can never disagree about what the box declared.
         let rules = compiled_egress(Some(policy), subnet, lease, hostname_proxy_port);
+        let egress_host_gated = names_host(policy.egress.as_ref(), subnet)
+            .then(|| compiled_egress_host_gated(Some(policy), subnet, lease, hostname_proxy_port));
         let infrastructure = infrastructure_deny_set(subnet);
         let limiter = Arc::new(PolicyWarnLimiter::new());
         // One DNS gate per box, sharing the limiter, the resolver address
@@ -1663,6 +1686,9 @@ impl BoxGate {
             label,
             limiter,
             egress: rules,
+            egress_host_gated,
+            host_gated: AtomicBool::new(false),
+            host_alias: subnet.host_alias().octets(),
             // The ingress half of the same compilation discipline: the
             // listener watcher asks this gate, so both it and the inbound
             // leg read the one decision the shared module holds (NET-016).
@@ -1673,6 +1699,35 @@ impl BoxGate {
             quic443_blocked,
             proxy: subnet.box_egress_proxy_address(),
             quic443_log: Quic443RejectLog::default(),
+        }
+    }
+
+    /// Marks this gate's relay as attached over the host's vsock shuttle:
+    /// the VM host daemon's gate decides its frames past the relay
+    /// (NET-160).
+    pub(crate) fn mark_host_gated(&self) {
+        self.host_gated.store(true, Ordering::Relaxed);
+    }
+
+    /// The rules the relay decides this box's frames by: the ones that pass
+    /// the host alias on, when the box names the host and its relay crosses
+    /// the VM host daemon's gate, and the box's own compilation otherwise.
+    fn relay_egress(&self) -> &egress::EgressRules {
+        match &self.egress_host_gated {
+            Some(rules) if self.host_gated.load(Ordering::Relaxed) => rules,
+            _ => &self.egress,
+        }
+    }
+
+    /// The rule the relay names a drop by: `host-alias` for the switch's own
+    /// drop at the host alias, as the VM host daemon's gate names it, and
+    /// the verdict's own rule otherwise.
+    fn drop_rule(&self, reason: &DropReason) -> &'static str {
+        match reason {
+            DropReason::InfrastructureDestination { dst, .. } if *dst == self.host_alias => {
+                HOST_ALIAS_RULE
+            }
+            _ => reason.rule(),
         }
     }
 
@@ -2749,6 +2804,19 @@ pub fn compiled_egress(
     lease: Ipv4Addr,
     hostname_proxy_port: Option<u16>,
 ) -> egress::EgressRules {
+    compile_egress(policy, subnet, lease, hostname_proxy_port, false)
+}
+
+/// The one compilation behind [`compiled_egress`] and
+/// [`compiled_egress_host_gated`]. `pass_host_alias` passes the host alias
+/// on to the VM host daemon's gate (NET-160).
+fn compile_egress(
+    policy: Option<&boxes::BoxPolicy>,
+    subnet: SwitchSubnet,
+    lease: Ipv4Addr,
+    hostname_proxy_port: Option<u16>,
+    pass_host_alias: bool,
+) -> egress::EgressRules {
     let rules = egress::EgressRules::from_policy(
         policy.and_then(|policy| policy.egress.as_ref()),
         subnet.dns_server().octets(),
@@ -2765,10 +2833,53 @@ pub fn compiled_egress(
         subnet.daemon_ip().octets(),
         proxy,
     );
-    rules.with_switch_own_addresses(match hostname_proxy_port {
+    let own = match hostname_proxy_port {
         Some(port) => own.with_hostname_proxy_port(port),
         None => own,
+    };
+    rules.with_switch_own_addresses(match pass_host_alias {
+        true => own.with_host_alias_passed_on(),
+        false => own,
     })
+}
+
+/// The rule name for a drop at the host alias, `host.min.internal`: the
+/// name the VM host daemon's gate refuses the same flow with.
+const HOST_ALIAS_RULE: &str = "host-alias";
+
+/// Whether a box's egress names the host (NET-160): `host.min.internal` in
+/// `allow_dns_hosts`, or an `allow_subnets` that covers `subnet`'s host
+/// alias. No egress declaration admits every address, the alias included.
+/// The same predicate the VM host daemon's gate decides a box row by.
+fn names_host(policy: Option<&boxes::EgressPolicy>, subnet: SwitchSubnet) -> bool {
+    let Some(policy) = policy else {
+        return true;
+    };
+    let by_name = policy.allow_dns_hosts.iter().flatten().any(|host| {
+        host.trim_end_matches('.')
+            .eq_ignore_ascii_case(zone_answer::HOST_ROW_NAME)
+    });
+    let alias = subnet.host_alias().octets();
+    let by_subnet = policy.allow_subnets.as_ref().is_none_or(|list| {
+        list.iter()
+            .filter_map(|cidr| egress::Ipv4Cidr::parse(cidr))
+            .any(|cidr| cidr.contains(alias))
+    });
+    by_name || by_subnet
+}
+
+/// [`compiled_egress`], with the host alias passed on to the VM host
+/// daemon's gate (NET-160): the rules a box that names the host is decided
+/// by on a relay whose frames cross that gate. The gate reads the current
+/// `[host-exposures]` table, and this leg cannot, so it refuses no TCP or
+/// UDP port at the alias by itself.
+fn compiled_egress_host_gated(
+    policy: Option<&boxes::BoxPolicy>,
+    subnet: SwitchSubnet,
+    lease: Ipv4Addr,
+    hostname_proxy_port: Option<u16>,
+) -> egress::EgressRules {
+    compile_egress(policy, subnet, lease, hostname_proxy_port, true)
 }
 
 /// The egress verdict a direct TCP connection from a box whose own frames are
@@ -4450,6 +4561,93 @@ pub(crate) mod tests {
             .expect("the relay survives a dropped frame")
             .expect("the switch side stays open");
         assert_eq!(next, sentinel);
+    }
+
+    /// NET-160 on the guest relay: on a VM host the relay cannot read the
+    /// host's `[host-exposures]` table, so an own-address box that names
+    /// `host.min.internal` has its frame to the host alias passed on to the
+    /// VM host daemon's gate, which decides it against the current table.
+    /// The box's `allow_subnets` does not cover the alias, so the name alone
+    /// carries it. A box that does not name the host stays refused on this
+    /// leg, under the `host-alias` rule the VM host daemon's gate uses. The
+    /// same naming box on a native relay, with no gate past it, stays
+    /// refused too.
+    #[tokio::test]
+    async fn own_ip_box_exposure_passes_the_guest_relay() {
+        let capture = crate::test_harness::captured_log();
+        let alias = SwitchSubnet::default().host_alias();
+        let policy = |hosts: Option<Vec<String>>| boxes::BoxPolicy {
+            egress: Some(boxes::EgressPolicy {
+                allow_protocols: None,
+                allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                allow_dns_hosts: hosts,
+                deny_subnets: None,
+            }),
+            ingress: None,
+            credentialed_upstream: None,
+            quic443: None,
+        };
+        let naming = policy(Some(vec!["host.min.internal".to_string()]));
+        let silent = policy(Some(vec!["github.com".to_string()]));
+        let to_alias = egress_tcp_frame(LEASE, alias, 18081);
+        let sentinel = arp_frame(LEASE);
+
+        // The naming box on a VM host: its frame to the alias reaches the
+        // switch, where the VM host daemon's gate decides it.
+        let mut vm_naming = spawn_test_relay_with(&naming, |gate| gate.mark_host_gated());
+        vm_naming.box_end.write_all(&to_alias).unwrap();
+        let seen = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut vm_naming.switch))
+            .await
+            .expect("the frame to the alias is passed on")
+            .expect("the switch side stays open");
+        assert_eq!(
+            seen, to_alias,
+            "a box that names the host passes the guest relay"
+        );
+        // Over UDP as well, since an exposure can name either protocol.
+        let udp_to_alias = udp_frame(LEASE, 40000, alias, 18082);
+        vm_naming.box_end.write_all(&udp_to_alias).unwrap();
+        let seen = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut vm_naming.switch))
+            .await
+            .expect("the datagram to the alias is passed on")
+            .expect("the switch side stays open");
+        assert_eq!(seen, udp_to_alias);
+
+        // A box that does not name the host, on the same VM host: refused
+        // here, and the sentinel is the first frame through.
+        let mut vm_silent = spawn_test_relay_with(&silent, |gate| gate.mark_host_gated());
+        vm_silent.box_end.write_all(&to_alias).unwrap();
+        vm_silent.box_end.write_all(&sentinel).unwrap();
+        let seen = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut vm_silent.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
+        assert_eq!(
+            seen, sentinel,
+            "a box that does not name the host stays refused"
+        );
+
+        // The naming box on a native relay: no gate past it reads a table,
+        // so the alias stays refused.
+        let mut native = spawn_test_relay_with(&naming, |_| {});
+        native.box_end.write_all(&to_alias).unwrap();
+        native.box_end.write_all(&sentinel).unwrap();
+        let seen = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut native.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
+        assert_eq!(seen, sentinel, "a native relay passes nothing on");
+
+        // The refusal line names the rule the VM host daemon's gate uses.
+        let logged = capture.contents();
+        assert!(
+            logged.contains("rule_matched=\"host-alias\""),
+            "the refusal names the host-alias rule: {logged}"
+        );
+        assert!(
+            logged.contains("remote_addr=100.64.255.254:18081"),
+            "the refusal names the alias and the port: {logged}"
+        );
     }
 
     /// NET-062's sub-clause on the native relay — the only leg a native

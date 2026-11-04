@@ -88,6 +88,12 @@ pub enum Command {
     Net(NetArgs),
     /// Box subcommands: show what a box will get
     Box(BoxArgs),
+    /// Host subcommands: the daemons on this machine that run boxes
+    #[command(visible_alias = "hosts")]
+    Host(HostArgs),
+    /// Provider subcommands: the kinds of local host this machine runs
+    #[command(visible_alias = "providers")]
+    Provider(ProviderArgs),
     /// Finish the install on this host: every privileged step it still needs, in one run (`--show` names them, `--show --script` prints the script, `--undo` removes them)
     FinalizeInstall(FinalizeInstallArgs),
     /// Muscle-memory catch for the in-box `min run <task>`: always errors,
@@ -384,6 +390,18 @@ impl MachineModeFailure {
     pub fn hint(&self) -> &str {
         &self.hint
     }
+
+    /// The failure with an old-spelling hint added to its `hint` field, so
+    /// the error object carries it and no separate line prints (BCLI-042).
+    #[must_use]
+    pub fn with_alias_hint(mut self, alias_hint: &str) -> Self {
+        self.hint = if self.hint.is_empty() {
+            alias_hint.to_owned()
+        } else {
+            format!("{}. {alias_hint}", self.hint)
+        };
+        self
+    }
 }
 
 impl std::fmt::Display for MachineModeFailure {
@@ -449,6 +467,53 @@ pub enum BoxCommand {
     /// files. A running box is never removed. `--older-than` and `--parent`
     /// narrow what is removed. Off a terminal, `--yes` is required
     Prune(BoxPruneArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct HostArgs {
+    #[command(subcommand)]
+    pub command: HostCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HostCommand {
+    /// List the local hosts: each daemon on this machine that runs boxes,
+    /// with its provider and whether it is running
+    #[command(visible_alias = "ls")]
+    List,
+    /// Show one local host: its provider, whether it is running, the socket
+    /// `min` connects to and the daemon version
+    Show(HostShowArgs),
+}
+
+// BCLI-048: `min host show <host>`.
+#[derive(Debug, Args)]
+pub struct HostShowArgs {
+    /// The host, as `min host list` prints it (`local0`, `local-minvmd0`)
+    pub host: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ProviderArgs {
+    #[command(subcommand)]
+    pub command: ProviderCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProviderCommand {
+    /// List the provider this command selects, with its hosts. `--all`
+    /// lists every local provider on this machine
+    #[command(visible_alias = "ls")]
+    List(ProviderListArgs),
+}
+
+// BCLI-052: `min provider list [--all]`.
+#[derive(Debug, Args)]
+pub struct ProviderListArgs {
+    /// List every local provider on this machine, not only the one this
+    /// command selects
+    #[arg(long)]
+    pub all: bool,
 }
 
 // BOX-158 (BCLI-001, BCLI-051): `min box list [--all] [-o json]`.
@@ -754,9 +819,10 @@ pub struct GlobalArgs {
     pub config_dir: Option<PathBuf>,
     /// Select the daemon backend that hosts sessions.
     ///
-    /// On Linux, `local-minimald` (the default) runs minimald on the host;
+    /// On Linux, `local` (the default) runs minimald on the host;
     /// `local-minvmd` runs it inside the minvmd microVM. No effect on macOS,
-    /// where minvmd is the only backend.
+    /// where minvmd is the only backend. `min provider list --all` lists the
+    /// providers on this machine.
     #[arg(long, global = true, value_name = "PROVIDER")]
     pub provider: Option<Provider>,
     /// Skip interactive prompts that need a terminal.
@@ -771,7 +837,7 @@ pub struct GlobalArgs {
     ///
     /// A named VM keeps its own state directory, socket, and in-VM daemon
     /// under a per-name subdirectory of the provider dir, so several VMs can
-    /// run side by side on one host. Refused on the native `local-minimald`
+    /// run side by side on one host. Refused on the native `local`
     /// backend, which hosts no VMs — named VMs need
     /// `--provider local-minvmd` — and no effect on the default VM's paths
     /// when the name is `default` or omitted.
@@ -953,9 +1019,14 @@ pub struct ActivateArgs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Provider {
     /// Linux: run minimald natively on the host (the default).
-    LocalMinimald,
+    Local,
     /// Run minimald inside the minvmd microVM.
     LocalMinvmd,
+    /// The old name of `local`.
+    // BCLI-046: read as `local` for one release, with a hint on stderr
+    // after the command ends.
+    #[value(hide = true)]
+    LocalMinimald,
 }
 
 /// Configuration for file sync during activation.

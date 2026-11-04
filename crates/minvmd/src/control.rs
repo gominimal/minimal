@@ -1060,6 +1060,12 @@ fn serve_request(
             let reply = registration_reply(boxes, answerer, order, request);
             write_reply(stream, &reply)
         }
+        (BoxControlRequest::Withdraw(request), ControlDoor::Host)
+            if host_ip_withdrawal(&request).is_some() =>
+        {
+            let reply = order.apply(|| withdraw_host_ip_name(boxes, &request));
+            write_reply(stream, &reply)
+        }
         (BoxControlRequest::Withdraw(request), ControlDoor::Host) => {
             let reply = order.apply(|| {
                 let (name, switch_address) = (request.name.clone(), request.switch_address);
@@ -1145,7 +1151,11 @@ fn serve_request(
         // must never say what a marked frame may reach (NET-085), nor that
         // its box is running.
         (BoxControlRequest::AdmitHostIpBox(request), ControlDoor::Host) => {
-            let resident = boxes.admit_host_ip_box(request.session_id, request.egress.as_ref());
+            let resident = boxes.admit_host_ip_box_with_lane(
+                request.session_id,
+                request.egress.as_ref(),
+                request.credentialed_upstream,
+            );
             write_reply(
                 stream,
                 &BoxControlReply::HostIpBox {
@@ -1375,9 +1385,33 @@ fn mint_box_id_reply(
     boxes: &BoxRegistry,
     request: &minimald_rpc::MintBoxIdRequest,
 ) -> BoxControlReply {
-    let (box_id, source) = match request.switch_address {
-        None => (crate::bep_attach::mint_record_box_id(), "fresh"),
-        Some(switch_address) => {
+    let host_ip_id = request
+        .host_ip_name
+        .as_deref()
+        .filter(|_| request.switch_address.is_none())
+        .and_then(|name| boxes.host_ip_id_for(name).map(|id| (name, id)));
+    let (box_id, source) = match (request.switch_address, host_ip_id) {
+        // BEP-082: a `host_ip` box has no row. Its registration minted its
+        // id under its name, and the proxy seals its grants under that id,
+        // so the record takes it too. The id goes to one create only, as a
+        // row's id does.
+        (None, Some((name, id))) => {
+            let box_id = minimald_rpc::BoxId::from_bytes(id);
+            if !claim_row_box_id(boxes, box_id, request.create_token.as_deref()) {
+                tracing::warn!(
+                    host_ip_name = %name,
+                    %box_id,
+                    "refused a box id mint: the host_ip registration's id already went to \
+                     an in-VM create"
+                );
+                return BoxControlReply::Error {
+                    error: format!("the box registered as {name} already has a session"),
+                };
+            }
+            (box_id, "host_ip registration")
+        }
+        (None, None) => (crate::bep_attach::mint_record_box_id(), "fresh"),
+        (Some(switch_address), _) => {
             let row_id = boxes
                 .table()
                 .by_source(switch_address.octets())
@@ -1413,6 +1447,7 @@ fn mint_box_id_reply(
     tracing::info!(
         box_id = %box_id,
         switch_address = ?request.switch_address,
+        host_ip_name = ?request.host_ip_name,
         source,
         "minted the box id for an in-VM create"
     );
@@ -1428,12 +1463,13 @@ static CLAIMED_ROW_BOX_IDS: std::sync::Mutex<
     std::collections::BTreeMap<minimald_rpc::BoxId, Option<String>>,
 > = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
-/// Claims `box_id`, a row's id, for the in-VM create that `token` names.
-/// `true` for the first ask, and for a repeat ask that carries the same
-/// token: a retry of one create. `false` when another create took the id,
-/// or when the ask or the claim carries no token, because then nothing
-/// proves the two asks are one create. The map keeps only ids whose row
-/// still stands, so it never outgrows the table.
+/// Claims `box_id`, a row's id or a `host_ip` registration's id, for the
+/// in-VM create that `token` names. `true` for the first ask, and for a
+/// repeat ask that carries the same token: a retry of one create. `false`
+/// when another create took the id, or when the ask or the claim carries
+/// no token, because then nothing proves the two asks are one create. The
+/// map keeps only ids whose row still stands or that a live `host_ip`
+/// registration name answers, so it never outgrows the registry.
 fn claim_row_box_id(boxes: &BoxRegistry, box_id: minimald_rpc::BoxId, token: Option<&str>) -> bool {
     let standing: std::collections::BTreeSet<minimald_rpc::BoxId> = boxes
         .table()
@@ -1444,7 +1480,7 @@ fn claim_row_box_id(boxes: &BoxRegistry, box_id: minimald_rpc::BoxId, token: Opt
     let mut claimed = CLAIMED_ROW_BOX_IDS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    claimed.retain(|id, _| standing.contains(id));
+    claimed.retain(|id, _| standing.contains(id) || boxes.host_ip_id_is_named(id.to_bytes()));
     match claimed.entry(box_id) {
         std::collections::btree_map::Entry::Vacant(entry) => {
             entry.insert(token.map(str::to_owned));
@@ -1464,6 +1500,11 @@ fn registration_reply(
     order: &Arc<ApplyOrder>,
     request: RegisterBoxRequest,
 ) -> BoxControlReply {
+    // A `host_ip` box leaves the VM from the node's own address (BEP-082):
+    // it gets a box id and no address, so the answerer is not asked.
+    if request.host_ip {
+        return order.apply(move || register_host_ip_box(boxes, &request));
+    }
     // The published address is asked of the answerer before the
     // ticket: the allocation can wait out a handover, and no turn
     // is held across it.
@@ -2066,6 +2107,8 @@ fn register_box(
                 loopback_address = %record.loopback_addr(),
                 task_addresses = ?record.task_addrs(),
                 egress = %declared_egress,
+                network = "own_ip",
+                switch_address_allocated = true,
                 "registered box with the VM host daemon; addresses allocated"
             );
             BoxControlReply::Registered(RegisteredBox {
@@ -2101,6 +2144,40 @@ fn register_box(
                     "box registration refused"
                 );
             }
+            BoxControlReply::Error {
+                error: error.to_string(),
+            }
+        }
+    }
+}
+
+/// Register a `host_ip` box (BEP-082): mint its id, with no switch address
+/// and no row in the address table, and answer with the id alone. The id
+/// takes the collision check an own-address box's id takes. A held
+/// registration holds nothing here: the box has no row for a lease to
+/// withdraw, so the reply is written and the connection closes.
+fn register_host_ip_box(boxes: &BoxRegistry, request: &RegisterBoxRequest) -> BoxControlReply {
+    match boxes.register_host_ip_box(&request.name) {
+        Ok(id) => {
+            tracing::info!(
+                box = %request.name,
+                box_id = %crate::bep_attach::BoxIdText(&id),
+                network = "host_ip",
+                switch_address_allocated = false,
+                credentialed_upstream = request.credentialed_upstream.is_some(),
+                "registered box with the VM host daemon; a host_ip box gets an id and no address"
+            );
+            BoxControlReply::BoxIdMinted {
+                minted_box_id: minimald_rpc::BoxId::from_bytes(id),
+            }
+        }
+        Err(error) => {
+            tracing::debug!(
+                box = %request.name,
+                network = "host_ip",
+                error = %error,
+                "box registration refused"
+            );
             BoxControlReply::Error {
                 error: error.to_string(),
             }
@@ -2196,6 +2273,46 @@ fn withdraw_box(
             }
         }
     }
+}
+
+/// The id a withdrawal names when it withdraws a `host_ip` registration
+/// (BEP-082): a `host_ip` box has no address pair, so its creator sends
+/// the unspecified pair and the id the registration handed back.
+fn host_ip_withdrawal(request: &WithdrawBoxRequest) -> Option<minimald_rpc::BoxId> {
+    (request.switch_address.is_unspecified() && request.loopback_address.is_unspecified())
+        .then_some(request.box_id)
+        .flatten()
+}
+
+/// Withdraw the `host_ip` registration name an activation that failed
+/// after it registered leaves behind, so a later box under the name takes
+/// a fresh id. The reply echoes the unspecified pair, as a row
+/// withdrawal echoes its own. A name that no longer answers the id is the
+/// goal state already holding: the box retired, or a later registration
+/// took the name.
+fn withdraw_host_ip_name(boxes: &BoxRegistry, request: &WithdrawBoxRequest) -> BoxControlReply {
+    if let Some(id) = host_ip_withdrawal(request) {
+        let box_id = id.to_string();
+        if boxes.withdraw_host_ip_name(&request.name, id.to_bytes()) {
+            tracing::info!(
+                box = %request.name,
+                box_id = %box_id,
+                network = "host_ip",
+                "withdrew the host_ip box's registration name; a later box under the name \
+                 takes a fresh id"
+            );
+        } else {
+            tracing::debug!(
+                box = %request.name,
+                box_id = %box_id,
+                "no host_ip registration name answers the withdrawn id; already withdrawn"
+            );
+        }
+    }
+    BoxControlReply::Addresses(BoxAddresses {
+        switch_address: request.switch_address,
+        loopback_address: request.loopback_address,
+    })
 }
 
 /// Hold a `host_ip` box's name in the host's zone with no row behind it,
@@ -4222,6 +4339,252 @@ mod tests {
         }
     }
 
+    /// BEP-082: a `host_ip` registration is answered with a box id and no
+    /// address. Each registration is a new creation with its own id, and
+    /// none of them puts a row in the address table. A held registration
+    /// holds no lease: the reply is written and the connection closes.
+    /// BOX-163 parity: a second registration of a live name is refused with
+    /// the held-name text, and after the box retires the name registers
+    /// again under a fresh id.
+    #[test]
+    fn host_ip_box_registration_mints_a_creation_unique_id() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let host_ip = |hold: bool| RegisterBoxRequest {
+            host_ip: true,
+            hold,
+            credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
+            task_slots: minimald_rpc::TASK_SLOTS_PER_BOX,
+            ..box_request("agent")
+        };
+        let minted = |reply: BoxControlReply| match reply {
+            BoxControlReply::BoxIdMinted { minted_box_id } => minted_box_id,
+            other => panic!("a host_ip registration is answered with a box id, got {other:?}"),
+        };
+        let first = minted(register(&sock_path, &host_ip(false)).expect("answered"));
+        match register(&sock_path, &host_ip(true)).expect("answered") {
+            BoxControlReply::Error { error } => assert_eq!(
+                error,
+                AllocationError::NameAlreadyHeld {
+                    held: "agent".to_string()
+                }
+                .to_string(),
+                "a live registration keeps its name"
+            ),
+            other => panic!("a second registration of a live name is refused, got {other:?}"),
+        }
+        assert_eq!(
+            registry.host_ip_id_for("agent"),
+            Some(first.to_bytes()),
+            "the refusal leaves the name with the first registration"
+        );
+        registry.retire_host_ip_box(boxes::SessionId::from_bytes(first.to_bytes()));
+        let second = minted(register(&sock_path, &host_ip(true)).expect("answered"));
+        assert_ne!(first, second, "each creation gets its own id");
+        assert_eq!(registry.host_ip_id_for("agent"), Some(second.to_bytes()));
+        // An admitted box keeps its name past the unadmitted bound.
+        assert!(registry.admit_host_ip_box_with_lane(
+            boxes::SessionId::from_bytes(second.to_bytes()),
+            None,
+            true,
+        ));
+        registry.advance_clock(
+            crate::box_registry::HOST_IP_UNADMITTED_NAME_BOUND + std::time::Duration::from_secs(1),
+        );
+        assert!(
+            matches!(
+                register(&sock_path, &host_ip(true)).expect("answered"),
+                BoxControlReply::Error { .. }
+            ),
+            "an admitted box's name is not taken over"
+        );
+        assert_eq!(registry.host_ip_id_for("agent"), Some(second.to_bytes()));
+        // A creator that died between its register and its box's admission
+        // leaves a name nothing withdraws. Past the bound, a new
+        // registration under the name takes it with a fresh id.
+        let scout = |hold: bool| RegisterBoxRequest {
+            name: "scout".to_string(),
+            ..host_ip(hold)
+        };
+        let orphan = minted(register(&sock_path, &scout(false)).expect("answered"));
+        assert!(
+            matches!(
+                register(&sock_path, &scout(false)).expect("answered"),
+                BoxControlReply::Error { .. }
+            ),
+            "inside the bound an unadmitted name is still held"
+        );
+        registry.advance_clock(
+            crate::box_registry::HOST_IP_UNADMITTED_NAME_BOUND + std::time::Duration::from_secs(1),
+        );
+        let fresh = minted(register(&sock_path, &scout(false)).expect("answered"));
+        assert_ne!(orphan, fresh, "the new creation gets its own id");
+        assert_eq!(registry.host_ip_id_for("scout"), Some(fresh.to_bytes()));
+        assert!(
+            registry.holds_host_ip_id(orphan.to_bytes()),
+            "the orphan's id stays for the collision check"
+        );
+        for id in [first, second] {
+            assert!(
+                registry.holds_host_ip_id(id.to_bytes()),
+                "the registry records {id}"
+            );
+        }
+        assert!(
+            registry.table().rows().is_empty(),
+            "a host_ip registration puts no row in the address table"
+        );
+        assert_eq!(
+            registry.live_switch_addrs(),
+            0,
+            "a host_ip registration draws no switch address"
+        );
+        // An own-address registration after them is unchanged: it gets
+        // its own row, under an id that is neither host_ip id.
+        let web = handed(register(&sock_path, &box_request("web")).expect("answered"));
+        assert_ne!(web.box_id, first);
+        assert_ne!(web.box_id, second);
+        assert_eq!(registry.table().rows().len(), 1);
+    }
+
+    /// BEP-082: a `host_ip` box's record takes the id its registration
+    /// minted, so the record and the sealed grants name one id. The in-VM
+    /// daemon's mint ask names the box's creation name. The id goes to one
+    /// create only: a retry with the same token gets it again, and an ask
+    /// with another token is refused. A name with no registration takes a
+    /// fresh mint, because a `host_ip` box with no grant registers nothing.
+    /// After the box retires, its name takes a fresh mint too.
+    #[test]
+    fn host_ip_box_record_takes_the_registration_id() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let request = RegisterBoxRequest {
+            host_ip: true,
+            hold: false,
+            credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
+            task_slots: minimald_rpc::TASK_SLOTS_PER_BOX,
+            ..box_request("agent")
+        };
+        let registered = match register(&sock_path, &request).expect("answered") {
+            BoxControlReply::BoxIdMinted { minted_box_id } => minted_box_id,
+            other => panic!("a host_ip registration is answered with a box id, got {other:?}"),
+        };
+        let guest = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        let ask = |name: &str, token: &str| {
+            control(
+                &guest,
+                &BoxControlRequest::MintBoxId(minimald_rpc::MintBoxIdRequest {
+                    switch_address: None,
+                    create_token: Some(token.to_owned()),
+                    host_ip_name: Some(name.to_owned()),
+                }),
+            )
+            .expect("the mint is answered")
+        };
+        let minted = BoxControlReply::BoxIdMinted {
+            minted_box_id: registered,
+        };
+        assert_eq!(
+            ask("agent", "create-a"),
+            minted,
+            "the record takes the registration's id"
+        );
+        assert_eq!(
+            ask("agent", "create-a"),
+            minted,
+            "a retry of the same create gets the same id"
+        );
+        match ask("agent", "create-b") {
+            BoxControlReply::Error { error } => assert!(
+                error.contains("the box registered as agent already has a session"),
+                "{error}"
+            ),
+            other => panic!("the registration's id goes to one create only, got {other:?}"),
+        }
+        match ask("ungranted", "create-c") {
+            BoxControlReply::BoxIdMinted { minted_box_id } => {
+                assert_ne!(
+                    minted_box_id, registered,
+                    "a name with no registration is fresh"
+                );
+                assert_eq!(
+                    AsRef::<uuid::Uuid>::as_ref(&minted_box_id).get_version_num(),
+                    7
+                );
+            }
+            other => panic!("a name with no registration takes a fresh mint, got {other:?}"),
+        }
+        // The box ends: its retire withdraws the name, so a later box under
+        // the name with no registration of its own takes a fresh id, not the
+        // ended box's claimed one.
+        let session = boxes::SessionId::from_bytes(registered.to_bytes());
+        registry.retire_host_ip_box(session);
+        assert_eq!(registry.host_ip_id_for("agent"), None);
+        assert!(
+            registry.holds_host_ip_id(registered.to_bytes()),
+            "the ended box's id stays for the collision check"
+        );
+        match ask("agent", "create-b") {
+            BoxControlReply::BoxIdMinted { minted_box_id } => {
+                assert_ne!(
+                    minted_box_id, registered,
+                    "a box after the retire is a new creation"
+                );
+                assert_eq!(
+                    AsRef::<uuid::Uuid>::as_ref(&minted_box_id).get_version_num(),
+                    7
+                );
+            }
+            other => panic!("a retired box's name takes a fresh mint, got {other:?}"),
+        }
+
+        // An activation that fails after it registered withdraws the name
+        // with the id it was handed: no box retires under the name, and a
+        // later box under it takes a fresh id. A withdrawal with another id
+        // leaves the name.
+        let failed = match register(&sock_path, &request).expect("answered") {
+            BoxControlReply::BoxIdMinted { minted_box_id } => minted_box_id,
+            other => panic!("a host_ip registration is answered with a box id, got {other:?}"),
+        };
+        let withdraw = |box_id| {
+            control(
+                &sock_path,
+                &BoxControlRequest::Withdraw(WithdrawBoxRequest {
+                    name: "agent".to_string(),
+                    switch_address: Ipv4Addr::UNSPECIFIED,
+                    loopback_address: Ipv4Addr::UNSPECIFIED,
+                    box_id: Some(box_id),
+                }),
+            )
+            .expect("the withdrawal is answered")
+        };
+        let unspecified = BoxControlReply::Addresses(BoxAddresses {
+            switch_address: Ipv4Addr::UNSPECIFIED,
+            loopback_address: Ipv4Addr::UNSPECIFIED,
+        });
+        assert_eq!(withdraw(registered), unspecified);
+        assert_eq!(
+            registry.host_ip_id_for("agent"),
+            Some(failed.to_bytes()),
+            "a withdrawal with another id leaves the name"
+        );
+        assert_eq!(withdraw(failed), unspecified);
+        assert_eq!(registry.host_ip_id_for("agent"), None);
+        assert!(
+            registry.holds_host_ip_id(failed.to_bytes()),
+            "the withdrawn box's id stays for the collision check"
+        );
+        match ask("agent", "create-d") {
+            BoxControlReply::BoxIdMinted { minted_box_id } => assert_ne!(
+                minted_box_id, failed,
+                "a box after a failed activation is a new creation"
+            ),
+            other => panic!("a withdrawn name takes a fresh mint, got {other:?}"),
+        }
+    }
+
     /// NET-138 over the control socket: a registration that asks for task
     /// slots is handed one task address per slot — capped at
     /// [`minimald_rpc::TASK_SLOTS_PER_BOX`] — each from the hand-out run and
@@ -4244,6 +4607,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: u8::MAX,
+                    host_ip: false,
                 },
             )
             .expect("the registration is answered"),
@@ -4319,6 +4683,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("first registration is answered"),
@@ -4390,6 +4755,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("second registration is answered"),
@@ -4435,6 +4801,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("server still serves after a refused request"),
@@ -4551,6 +4918,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("the registration is answered"),
@@ -4627,6 +4995,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("the registration is answered"),
@@ -4755,6 +5124,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("the marker box is registered"),
@@ -5022,6 +5392,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("a registration still answers around the read"),
@@ -5602,6 +5973,7 @@ mod tests {
                     dynamic_allowed_range: Some((3000, 3999)),
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("the registration is answered"),
@@ -5805,6 +6177,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("the registration is answered"),
@@ -5874,6 +6247,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("the registration is answered"),
@@ -5885,6 +6259,7 @@ mod tests {
                 &BoxControlRequest::MintBoxId(minimald_rpc::MintBoxIdRequest {
                     switch_address,
                     create_token: token.map(str::to_owned),
+                    host_ip_name: None,
                 }),
             )
             .expect("the mint is answered")
@@ -5989,6 +6364,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("the registration is answered"),
@@ -6066,6 +6442,7 @@ mod tests {
             dynamic_allowed_range: None,
             hold: false,
             task_slots: 0,
+            host_ip: false,
         };
         let web = handed(register(&sock_path, &request("web")).expect("registered"));
         assert_eq!(
@@ -6140,6 +6517,7 @@ mod tests {
             dynamic_allowed_range: None,
             hold: false,
             task_slots: 0,
+            host_ip: false,
         };
         let web = handed(register(&sock_path, &request("web")).expect("registered"));
         assert!(
@@ -6224,6 +6602,7 @@ mod tests {
                     dynamic_allowed_range: Some((3000, 3999)),
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("the registration is answered"),
@@ -6315,6 +6694,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("the registration is answered"),
@@ -6438,6 +6818,7 @@ mod tests {
                         dynamic_allowed_range: Some((ASK_PORT, ASK_PORT + 999)),
                         hold: false,
                         task_slots: 0,
+                        host_ip: false,
                     },
                 )
                 .expect("the registration is answered"),
@@ -7231,6 +7612,7 @@ mod tests {
                 dynamic_allowed_range: None,
                 hold: false,
                 task_slots: 0,
+                host_ip: false,
             },
         )
         .expect("the second connection is served");
@@ -7354,6 +7736,7 @@ mod tests {
                     dynamic_allowed_range: Some((3000, 3999)),
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("the registration is answered"),
@@ -7653,6 +8036,7 @@ mod tests {
             dynamic_allowed_range: None,
             hold: false,
             task_slots: 0,
+            host_ip: false,
         }
     }
 
@@ -7884,6 +8268,7 @@ mod tests {
         let request = BoxControlRequest::Register(RegisterBoxRequest {
             hold: true,
             task_slots: 0,
+            host_ip: false,
             ..box_request(name)
         });
         let mut line = serde_json_lenient::to_string(&request).expect("the request serializes");
@@ -8033,6 +8418,7 @@ mod tests {
                     dynamic_allowed_range: Some((3000, 3999)),
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("the registration is answered"),
