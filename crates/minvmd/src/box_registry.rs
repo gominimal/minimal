@@ -5923,10 +5923,16 @@ impl BoxRegistry {
             &revocation_addrs(daemon_ip, Ipv4Addr::LOCALHOST),
             REVOCATION_WAIT,
         );
-        self.try_register(
+        let node = self.try_register(
             BoxRegistration::new(NODE_NAMESPACE, daemon_ip, Ipv4Addr::LOCALHOST)
                 .with_admitted_ports([proxy_port]),
-        )
+        )?;
+        // The node's own listeners now include its hostname proxy port, so
+        // the mirror leaves it out, a port it held before included
+        // (NET-138: a node listener is never mirrored).
+        self.node_mirror
+            .set_node_own(&crate::control::guest_infrastructure_ports(self));
+        Ok(node)
     }
 
     /// [`Self::try_register_node_namespace`] for a test whose node address
@@ -6136,7 +6142,9 @@ impl BoxRegistry {
         let count = resident.boxes.len();
         // Under the resident set's lock, so the mirror's flag follows the
         // set in order (NET-138).
-        let was_published = self.node_mirror.set_published(true);
+        let was_published = self
+            .node_mirror
+            .set_published(resident.boxes.keys().copied().collect());
         drop(resident);
         // The first box since the last one ended binds the ports the guest
         // still holds as listening (NET-138).
@@ -6181,7 +6189,8 @@ impl BoxRegistry {
         if removed {
             // Under the resident set's lock, so the mirror's flag follows
             // the set in order (NET-138).
-            self.node_mirror.set_published(count > 0);
+            self.node_mirror
+                .set_published(resident.boxes.keys().copied().collect());
         }
         drop(resident);
         if removed {
@@ -6281,6 +6290,7 @@ impl BoxRegistry {
     /// ([`crate::control::guest_infrastructure_ports`]) is refused here, so
     /// no caller can reach a bind without that check.
     pub fn mirror_notice(&self, notice: minimald_rpc::ListenNotice) -> MirrorOutcome {
+        // NET-138: the node's own listeners are never mirrored.
         let infrastructure = crate::control::guest_infrastructure_ports(self);
         self.node_mirror
             .notice(notice, &infrastructure, Instant::now())
@@ -6458,6 +6468,11 @@ impl MirrorEnd {
 ///   on within one guest poll is bound with no new notice.
 /// * A bind that a probe pass or a new box's publication made and that
 ///   failed stays held, and every probe verdict retries it.
+/// * A port of the node's own listeners, the ones the VM host provisioned
+///   for the guest's own services and the node's hostname proxy port, is
+///   never bound ([`Self::set_node_own`]). The mirror binds only the
+///   host-address boxes' listeners. A port that becomes the node's own
+///   after a notice held it is unbound and forgotten.
 /// * Every refusal is a warn line. [`MIRROR_NOTICES_PER_SECOND`] bounds how
 ///   many a guest can cause.
 /// * [`MIRROR_NOTICES_PER_SECOND`] and [`MIRRORED_BINDS_CAP`] bound what
@@ -6466,7 +6481,9 @@ impl MirrorEnd {
 ///
 /// Every bind and unbind is an info line, and every refusal a warn line,
 /// on the `host_table` span. Each names the node, the address, the port
-/// and the outcome, and never a box.
+/// and the outcome. A bind also names the host-address boxes published
+/// on the node: they share its namespace, so the bind is theirs. Each
+/// listener of the node's own that the mirror leaves out is a debug line.
 #[derive(Debug)]
 pub struct NodeMirror {
     /// The node's switch address: the node's name in every audit line.
@@ -6488,11 +6505,15 @@ struct MirrorState {
     address: Option<Ipv4Addr>,
     /// Whether the whole-range probe passes.
     range_passes: bool,
-    /// Whether a host-address box is published on the node. The registry
-    /// sets it under the resident boxes' lock ([`Self::set_published`]),
-    /// and a listening notice reads it under this lock, so a notice and
+    /// The host-address boxes published on the node. The registry sets
+    /// them under the resident boxes' lock ([`Self::set_published`]),
+    /// and a listening notice reads them under this lock, so a notice and
     /// the last box's end cannot pass each other.
-    published: bool,
+    cohort: Vec<boxes::SessionId>,
+    /// The ports of the node's own listeners, on the host's authority
+    /// ([`crate::control::guest_infrastructure_ports`]). The mirror never
+    /// binds one of them.
+    node_own: BTreeSet<u16>,
     binder: Option<Arc<dyn MirrorBinder>>,
     /// The ports a listening notice holds: bound or waiting.
     wanted: BTreeSet<u16>,
@@ -6511,6 +6532,19 @@ struct MirrorState {
 }
 
 impl MirrorState {
+    /// Whether a host-address box is published on the node.
+    fn published(&self) -> bool {
+        !self.cohort.is_empty()
+    }
+
+    /// The published host-address boxes, for an audit line.
+    fn cohort_names(&self) -> String {
+        self.cohort
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
     /// The address and binder a bind needs now: both set and the range
     /// probe passing.
     fn bind_target(&self) -> Option<(Ipv4Addr, Arc<dyn MirrorBinder>)> {
@@ -6559,12 +6593,57 @@ impl NodeMirror {
         self.lock().binder = Some(binder);
     }
 
-    /// Records whether a host-address box is published on the node, and
-    /// returns whether one was. The registry calls it under the resident
-    /// boxes' lock, so the flag follows the resident set in order. It makes
+    /// Records the host-address boxes published on the node, and returns
+    /// whether one was before. The registry calls it under the resident
+    /// boxes' lock, so the set follows the resident set in order. It makes
     /// no binder call: [`Self::bind_held`] makes them after the lock.
-    fn set_published(&self, published: bool) -> bool {
-        std::mem::replace(&mut self.lock().published, published)
+    fn set_published(&self, cohort: Vec<boxes::SessionId>) -> bool {
+        let mut state = self.lock();
+        let was = state.published();
+        state.cohort = cohort;
+        was
+    }
+
+    /// Records the ports of the node's own listeners, the ones the VM host
+    /// provisioned for the guest's own services and the node's hostname
+    /// proxy port. The mirror never binds one of them. A held one is
+    /// forgotten, and a bound one is undone.
+    pub fn set_node_own(&self, ports: &BTreeSet<u16>) {
+        let _span = self.span().entered();
+        let _turn = self.take_turn();
+        let calls = self.leave_out_node_own(&mut self.lock(), ports);
+        self.run(calls);
+    }
+
+    /// Records `ports` as the node's own, and forgets each held port among
+    /// them. Returns the unbinds that undo the bound ones. The caller holds
+    /// the turn.
+    fn leave_out_node_own(&self, state: &mut MirrorState, ports: &BTreeSet<u16>) -> MirrorCalls {
+        state.node_own.clone_from(ports);
+        let own: Vec<u16> = state.wanted.intersection(ports).copied().collect();
+        let mut calls = MirrorCalls::default();
+        for port in own {
+            state.wanted.remove(&port);
+            state.collided.remove(&port);
+            if state.bound.remove(&port)
+                && let (Some(address), Some(binder)) = (state.address, state.binder.clone())
+            {
+                calls
+                    .unbinds
+                    .push((binder, address, port, "node-own-listener"));
+            }
+            self.debug_left_out(state, port);
+        }
+        calls
+    }
+
+    fn debug_left_out(&self, state: &MirrorState, port: u16) {
+        tracing::debug!(
+            node = %self.node,
+            address = ?state.address,
+            port,
+            "left a listener of the node's own unmirrored at the node's address"
+        );
     }
 
     /// Binds every held port while a host-address box is published: the
@@ -6660,7 +6739,7 @@ impl NodeMirror {
         let _span = self.span().entered();
         let _turn = self.take_turn();
         let mut state = self.lock();
-        if end == MirrorEnd::BoxEnd && state.published {
+        if end == MirrorEnd::BoxEnd && state.published() {
             return;
         }
         let calls = Self::unbind_all(&mut state, end, end == MirrorEnd::NodeEnd);
@@ -6696,6 +6775,15 @@ impl NodeMirror {
         let _turn = self.take_turn();
         let port = notice.port;
         let mut state = self.lock();
+        // The host's own view of the node's listeners comes first, so a
+        // port that became the node's own since an earlier notice is
+        // undone before anything else.
+        let own = self.leave_out_node_own(&mut state, infrastructure);
+        if !own.unbinds.is_empty() {
+            drop(state);
+            self.run(own);
+            state = self.lock();
+        }
         if notice.state == minimald_rpc::ListenState::Stopped {
             state.wanted.remove(&port);
             state.collided.remove(&port);
@@ -6733,7 +6821,8 @@ impl NodeMirror {
         state.notices.push_back(now);
         // Checked after the rate cap, so the cap bounds the warn lines a
         // guest that repeats a forged notice can cause.
-        if infrastructure.contains(&port) {
+        if state.node_own.contains(&port) {
+            self.debug_left_out(&state, port);
             self.warn_refused(
                 &state,
                 port,
@@ -6748,7 +6837,7 @@ impl NodeMirror {
             self.warn_refused(&state, port, MirrorOutcome::PortZero, "port-zero");
             return MirrorOutcome::PortZero;
         }
-        if !state.published {
+        if !state.published() {
             self.warn_refused(&state, port, MirrorOutcome::NoHostAddressBox, "no-cohort");
             return MirrorOutcome::NoHostAddressBox;
         }
@@ -6786,12 +6875,13 @@ impl NodeMirror {
     /// cannot bind or no host-address box is published.
     fn bind_wanted(state: &MirrorState) -> MirrorCalls {
         let mut calls = MirrorCalls::default();
-        if state.published
+        if state.published()
             && let Some((address, binder)) = state.bind_target()
         {
             calls.binds = state
                 .wanted
                 .difference(&state.bound)
+                .filter(|port| !state.node_own.contains(port))
                 .map(|port| (Arc::clone(&binder), address, *port))
                 .collect();
         }
@@ -6945,12 +7035,14 @@ impl NodeMirror {
             Ok(()) => {
                 state.bound.insert(port);
                 state.collided.remove(&port);
+                let host_address_boxes = state.cohort_names();
                 drop(state);
                 tracing::info!(
                     node = %self.node,
                     %address,
                     port,
                     outcome = MirrorOutcome::Bound.as_str(),
+                    %host_address_boxes,
                     "mirrored a host-address box's bind at the node's address"
                 );
                 (MirrorOutcome::Bound, true)
@@ -12602,6 +12694,73 @@ mod tests {
                 .is_none()
         );
         assert_eq!(registry.node_mirror().address(), None);
+    }
+
+    /// NET-138: a listener of the node's own in the host-address namespace,
+    /// such as the hostname proxy or the in-VM daemon's sockets, is never
+    /// mirrored at the node's address. A port the mirror held before the
+    /// node claimed it is undone, and no later probe pass or box
+    /// publication binds it again. A host-address box's bind stands.
+    #[test]
+    fn node_own_listener_never_mirrored() {
+        let binder = Arc::new(TestMirrorBinder::default());
+        let registry = BoxRegistry::new(SUBNET)
+            .with_mirror_binder(Arc::clone(&binder) as Arc<dyn MirrorBinder>);
+        registry
+            .open_node_mirror(mirror_address())
+            .expect("a reserved-range address no row holds opens the mirror");
+        registry.node_mirror().set_range_probe(true);
+        assert!(registry.admit_host_ip_box(mirror_session(1), None));
+        let node = mirror_address();
+        let proxy = free_port();
+        let web = free_port();
+
+        // Before the node's row stands, the host does not know the proxy
+        // port is the node's own, so a notice for it binds.
+        assert_eq!(
+            registry.mirror_notice(listening(proxy)),
+            MirrorOutcome::Bound
+        );
+        assert_eq!(registry.mirror_notice(listening(web)), MirrorOutcome::Bound);
+
+        // The node's row claims the port for its hostname proxy: the bind is
+        // undone, and the box's bind stands.
+        registry.register_node_namespace(proxy);
+        assert_eq!(binder.open(), vec![(node, web)]);
+        assert_eq!(registry.node_mirror().bound_ports(), vec![web]);
+
+        // A notice for the node's own listeners binds nothing: the hostname
+        // proxy and the in-VM daemon's own sockets.
+        for port in [proxy, crate::net::answerer::DEFAULT_ANSWERER_PORT] {
+            assert_eq!(
+                registry.mirror_notice(listening(port)),
+                MirrorOutcome::RefusedInfrastructure,
+                "port {port} is the node's own"
+            );
+        }
+
+        // A probe pass and the next box's publication bind the held ports
+        // again, and never the node's own.
+        registry.node_mirror().set_range_probe(true);
+        assert!(registry.retire_host_ip_box(mirror_session(1)));
+        assert!(binder.open().is_empty());
+        assert!(registry.admit_host_ip_box(mirror_session(2), None));
+        assert_eq!(binder.open(), vec![(node, web)]);
+        assert!(
+            binder
+                .calls()
+                .iter()
+                .filter(|(call, _, port)| *call == "bind" && *port == proxy)
+                .count()
+                == 1,
+            "the proxy port was bound once, before the node claimed it: {:?}",
+            binder.calls()
+        );
+        assert!(
+            !binder.calls().iter().any(|(call, _, port)| *call == "bind"
+                && *port == crate::net::answerer::DEFAULT_ANSWERER_PORT),
+            "the in-VM daemon's socket is never bound"
+        );
     }
 
     /// A [`MirrorBinder`] that reads the mirror's state from inside every
