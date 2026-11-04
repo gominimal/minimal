@@ -766,6 +766,13 @@ pub struct RegisterBoxRequest {
     /// registers none.
     #[serde(default)]
     pub task_slots: u8,
+    /// Whether the box is a `host_ip` box (BEP-082). The host mints a box
+    /// id for it and allocates no address: it has no row in the address
+    /// table, and the reply is [`BoxControlReply::BoxIdMinted`]. `false`,
+    /// the default and what a client that predates the field sends, is an
+    /// own-address registration.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host_ip: bool,
 }
 
 /// The one line a held registration's client writes on the lease
@@ -924,6 +931,14 @@ pub struct MintBoxIdRequest {
     /// (or none) for a claimed row is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub create_token: Option<String>,
+    /// The creation name of a `host_ip` box: a box that leaves the VM from
+    /// the node's own address and has no switch address. The VM host daemon
+    /// answers with the id the box's `host_ip` registration minted under
+    /// that name, so the record and the sealed grants name one id
+    /// (BEP-082). A name with no registration takes a fresh mint. `None`
+    /// from an older in-VM daemon, and for every other box.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_ip_name: Option<String>,
 }
 
 /// A name to hold in the host's zone without a row behind it
@@ -963,6 +978,12 @@ pub struct HostIpBoxRequest {
     /// request's policy carries. The host fills it under its own phase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress: Option<EgressPolicy>,
+    /// Whether the box declares a credentialed upstream (BEP-083): `true`
+    /// opens the cohort's lane to the Box Egress Proxy's listener while the
+    /// box is resident. `false`, the default and what a client that
+    /// predates the field sends, declares no lane.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub credentialed_upstream: bool,
 }
 
 /// The session whose `host_ip` box left the VM host's resident set
@@ -2038,8 +2059,9 @@ pub enum BoxControlReply {
         audited: bool,
     },
     /// The mint verb's answer (BOX-002): the id the VM host daemon minted
-    /// for the box the in-VM daemon is about to create. `minted_box_id` is
-    /// required — the marker that keeps this document from decoding as any
+    /// for the box the in-VM daemon is about to create. It is also the
+    /// answer to a `host_ip` registration ([`RegisterBoxRequest::host_ip`]):
+    /// the box's id, with no address. `minted_box_id` is required — the marker that keeps this document from decoding as any
     /// other reply.
     BoxIdMinted {
         /// The box's id. The in-VM daemon files the box's record under it.
@@ -3973,6 +3995,12 @@ mod mint_box_id_tests {
             BoxControlRequest::MintBoxId(MintBoxIdRequest {
                 switch_address: Some(std::net::Ipv4Addr::new(100, 64, 0, 7)),
                 create_token: Some("create-1".to_string()),
+                host_ip_name: None,
+            }),
+            BoxControlRequest::MintBoxId(MintBoxIdRequest {
+                switch_address: None,
+                create_token: Some("create-2".to_string()),
+                host_ip_name: Some("agent".to_string()),
             }),
         ] {
             let line = serde_json_lenient::to_string(&request).unwrap();
@@ -3986,6 +4014,14 @@ mod mint_box_id_tests {
         .unwrap();
         assert!(!bare.contains("switch_address"), "{bare}");
         assert!(!bare.contains("create_token"), "{bare}");
+        assert!(!bare.contains("host_ip_name"), "{bare}");
+        // An older in-VM daemon's ask carries no name, and decodes as none.
+        let older: BoxControlRequest =
+            serde_json_lenient::from_str(r#"{"verb":"mint_box_id","create_token":"c"}"#).unwrap();
+        let BoxControlRequest::MintBoxId(older) = older else {
+            panic!("decoded as another verb: {older:?}");
+        };
+        assert_eq!(older.host_ip_name, None);
 
         let reply = BoxControlReply::BoxIdMinted {
             minted_box_id: BoxId::mint(),

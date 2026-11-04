@@ -2117,6 +2117,62 @@ fn reap_and_prune_requests_round_trip() {
     assert_eq!(PruneBoxes::NAME, "minimald-v1-PruneBoxes");
 }
 
+/// BEP-082, BEP-083: the admit of a `host_ip` box carries whether the box
+/// declares a credentialed upstream, and a host_ip registration says it is
+/// one. A line from a client that predates either field reads as no lane
+/// and as an own-address registration.
+#[test]
+fn host_ip_box_request_carries_the_lane_declaration() {
+    let session_id = boxes::SessionId::mint();
+    let declaring = BoxControlRequest::AdmitHostIpBox(HostIpBoxRequest {
+        session_id,
+        egress: None,
+        credentialed_upstream: true,
+    });
+    let line = serde_json_lenient::to_string(&declaring).unwrap();
+    assert!(line.contains(r#""credentialed_upstream":true"#), "{line}");
+    let back: BoxControlRequest = serde_json_lenient::from_str(&line).unwrap();
+    assert_eq!(back, declaring);
+
+    // A request with no lane leaves the field out, so the line an older
+    // host reads is the line it always read.
+    let silent = HostIpBoxRequest {
+        session_id,
+        egress: None,
+        credentialed_upstream: false,
+    };
+    let line = serde_json_lenient::to_string(&silent).unwrap();
+    assert!(!line.contains("credentialed_upstream"), "{line}");
+
+    // An older client's admit has no field: it declares no lane.
+    let mut older = serde_json_lenient::to_value(&declaring).unwrap();
+    older
+        .as_object_mut()
+        .unwrap()
+        .remove("credentialed_upstream");
+    let BoxControlRequest::AdmitHostIpBox(read) =
+        serde_json_lenient::from_value::<BoxControlRequest>(older).unwrap()
+    else {
+        panic!("an admit line reads as an admit");
+    };
+    assert!(!read.credentialed_upstream);
+
+    // An older client's registration has no `host_ip` field: it is an
+    // own-address registration.
+    let register = serde_json_lenient::from_str::<RegisterBoxRequest>(r#"{"name":"web"}"#).unwrap();
+    assert!(!register.host_ip);
+    let host_ip = RegisterBoxRequest {
+        host_ip: true,
+        ..register
+    };
+    let line = serde_json_lenient::to_string(&host_ip).unwrap();
+    assert!(line.contains(r#""host_ip":true"#), "{line}");
+    assert_eq!(
+        serde_json_lenient::from_str::<RegisterBoxRequest>(&line).unwrap(),
+        host_ip
+    );
+}
+
 /// BOX-155: a log read's request and every update line survive the wire,
 /// raw terminal bytes included.
 #[test]
