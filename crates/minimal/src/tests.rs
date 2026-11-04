@@ -266,6 +266,10 @@ fn every_daemon_connection_is_classified() {
             "cmd/boxes/address.rs::connect_box_host = gated",
             "cmd/boxes/address.rs::probe_other_host = ungated",
             "cmd/boxes/address.rs::read_host_boxes = ungated",
+            // A read-only look at a box after `min box attach` ended, to say
+            // why the host ended it. The attach itself went through the
+            // address resolution above, and the read builds nothing.
+            "cmd/boxes/attach.rs::box_after_attach = ungated",
             // Test-only: the BEP-032 store mint test registers a box with a
             // proxy control socket it serves itself, so no daemon is involved.
             "cmd/boxes/create.rs::box_creation_seals_a_store_member_per_accepted_rule = ungated",
