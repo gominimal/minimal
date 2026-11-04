@@ -85,21 +85,41 @@ async fn list_host_boxes(
     scope: Option<paths::HostAbsPath>,
 ) -> Result<Vec<minimald_rpc::BoxListingEntry>, HostRead> {
     if host.selected {
-        let read = async {
-            let mut client = client::Client::connect(&host.sock).await.with_context(|| {
-                format!("Failed to connect to the daemon at {}", host.sock.display())
-            })?;
-            client::ensure_version_match(&mut client).await?;
-            list_box_records(&mut client, scope).await
-        };
-        return read.await.map_err(HostRead::Selected);
+        list_selected_host(&host.sock, scope)
+            .await
+            .map_err(HostRead::Selected)
+    } else {
+        list_other_host(&host.sock, scope)
+            .await
+            .map_err(HostRead::Unreachable)
     }
+}
+
+/// The records of the selected host, gated as `min ls` gates its selected
+/// VM: connect with the retry window, then assert the daemon's build.
+async fn list_selected_host(
+    sock: &std::path::Path,
+    scope: Option<paths::HostAbsPath>,
+) -> Result<Vec<minimald_rpc::BoxListingEntry>, anyhow::Error> {
+    let mut client = client::Client::connect(sock)
+        .await
+        .with_context(|| format!("Failed to connect to the daemon at {}", sock.display()))?;
+    client::ensure_version_match(&mut client).await?;
+    list_box_records(&mut client, scope).await
+}
+
+/// The records of a host this process did not start, probed ungated as
+/// `min ls` probes its other VMs. A host that is not running gives none.
+async fn list_other_host(
+    sock: &std::path::Path,
+    scope: Option<paths::HostAbsPath>,
+) -> Result<Vec<minimald_rpc::BoxListingEntry>, anyhow::Error> {
     #[expect(
         clippy::map_err_ignore,
         reason = "the elapsed marker carries nothing the message lacks"
     )]
     let read = tokio::time::timeout(client::PROBE_TIMEOUT, async {
-        let mut client = match client::Client::probe(&host.sock).await {
+        let mut client = match client::Client::probe(sock).await {
             Ok(client) => client,
             Err(client::ProbeRefusal::NotRunning) => return Ok(Vec::new()),
             Err(client::ProbeRefusal::Unreachable(e)) => return Err(e),
@@ -110,12 +130,11 @@ async fn list_host_boxes(
     .map_err(|_| {
         anyhow::anyhow!(
             "daemon at {} did not answer within {:?}",
-            host.sock.display(),
+            sock.display(),
             client::PROBE_TIMEOUT
         )
     });
     read.and_then(|records| records)
-        .map_err(HostRead::Unreachable)
 }
 
 /// The project root that a scoped listing sends for `dir`: the root a
