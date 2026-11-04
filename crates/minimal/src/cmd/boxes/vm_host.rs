@@ -311,10 +311,12 @@ pub(crate) async fn release_held_name_after_attach(
 /// a persisted registry failed to carry, its write a warn line — may be
 /// gone by the time the attach lands; the re-hold is idempotent, so it
 /// remakes the hold and the name answers NODATA through the attach
-/// either way. Only a named `host_ip` session without a box row needs
-/// it: a box that registered a row owns its name through the row, which
-/// `resume_box_row` re-sends, and a `none` or `own_ip` session holds
-/// nothing.
+/// either way. Only a named `host_ip` or `none` session without a box
+/// row needs it: a box that registered a row owns its name through the
+/// row, which `resume_box_row` re-sends, and an `own_ip` session holds
+/// nothing. A `none` box's hold is the host's record of its box id, so a
+/// hold lost to a restart leaves the host refusing its expose decision
+/// reports (NET-046). Only a `host_ip` box has egress to re-admit.
 ///
 /// The record was read before the hold, so a destroy another client
 /// issues in between can release the session's holds first and leave
@@ -347,7 +349,8 @@ pub(crate) async fn rehold_held_name_before_attach(
     let Some(record) = record else {
         return;
     };
-    if record.network != boxes::NetworkMode::HostNet {
+    let host_net = record.network == boxes::NetworkMode::HostNet;
+    if !host_net && !holds_name(record) {
         return;
     }
     // The box's egress, re-admitted before the attach or the exec for the
@@ -360,13 +363,15 @@ pub(crate) async fn rehold_held_name_before_attach(
     // The session is looked up again once the admit is made, and a session
     // gone by then has its rules retired, as the name re-hold below undoes
     // its hold. A destroy that lands after that lookup retires them itself.
-    if host_ip_box_with_vm_host(
-        control_sock_beside(sock),
-        id,
-        record.policy.egress.clone(),
-        true,
-    )
-    .await
+    // A `none` box has no egress to admit, so only its name is re-held.
+    if host_net
+        && host_ip_box_with_vm_host(
+            control_sock_beside(sock),
+            id,
+            record.policy.egress.clone(),
+            true,
+        )
+        .await
     {
         match attached_box_record(sock, id).await {
             Ok(None) => {
@@ -413,8 +418,8 @@ pub(crate) async fn rehold_held_name_before_attach(
 
 /// The undo of a re-hold made for session `id`, found gone since, from the
 /// lookup of its name (`by_name`): the session to send the verb for and
-/// whether the verb is a hold. A live `host_ip` session without a row that
-/// answers to the name now is handed the hold back; no such session, and
+/// whether the verb is a hold. A live session that holds its name
+/// ([`holds_name`]) and answers to the name now is handed the hold back; no such session, and
 /// the hold is released by `id`. A lookup that failed tells neither, so
 /// nothing is undone (`None`): a release there could take the name from a
 /// live session, and a hold left standing blocks nothing.
@@ -422,20 +427,23 @@ fn rehold_undo(
     id: boxes::SessionId,
     by_name: anyhow::Result<Option<boxes::Record>>,
 ) -> Option<(boxes::SessionId, bool)> {
-    let taken_over_by = by_name.ok()?.filter(|other| {
-        other.id != id
-            && other.network == boxes::NetworkMode::HostNet
-            && other.box_addresses.is_none()
-    });
+    let taken_over_by = by_name
+        .ok()?
+        .filter(|other| other.id != id && holds_name(other));
     Some(taken_over_by.map_or((id, false), |other| (other.id, true)))
 }
 
 /// Whether this box holds its name at the VM host instead of registering
 /// an address there. A `host_ip` box uses the host's own address, so the
 /// host only reserves the name for it (a lookup returns no address), and
-/// the record carries no `box_addresses`.
+/// the record carries no `box_addresses`. A `none` box holds its name too
+/// (NET-046): the hold is the host's one record of its box id, which the
+/// in-VM daemon's expose decision report names.
 pub(crate) fn holds_name(record: &boxes::Record) -> bool {
-    record.network == boxes::NetworkMode::HostNet && record.box_addresses.is_none()
+    matches!(
+        record.network,
+        boxes::NetworkMode::HostNet | boxes::NetworkMode::NoNet
+    ) && record.box_addresses.is_none()
 }
 
 /// Withdraws a box's host row (T66) on the VM host daemon beside `sock`,
@@ -2150,6 +2158,52 @@ mod tests {
         };
         assert_eq!(request.name, "web");
         assert_eq!(request.session_id, Some(id));
+    }
+
+    /// NET-046: a named `none` box's hold is the VM host's record of its
+    /// box id, so an attach or exec re-holds it after a VM host daemon
+    /// restart, as a `host_ip` box's is. A `none` box has no egress, so
+    /// nothing is re-admitted for it.
+    #[tokio::test]
+    async fn an_attach_reholds_a_none_box_name_and_admits_no_egress() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ssh_sock = dir.path().join("ssh.sock");
+        let (requests, residency) = fake_vm_host_with_residency(
+            dir.path().join(minvmd::control::CONTROL_SOCK_FILE),
+            r#"{"name":"web","held":false}"#.to_string(),
+        )
+        .await;
+        let server = minimald::test_harness::TestServer::new().await;
+        server.listen_on_uds(&ssh_sock).await;
+        let project = tempfile::TempDir::new().unwrap();
+        let mut daemon = server.connect().await;
+        let id = minimald::test_harness::create_configured_session(
+            &mut daemon,
+            "web",
+            project.path().to_str().unwrap(),
+        )
+        .await;
+        let mut record = attached_box_record(&ssh_sock, id)
+            .await
+            .expect("the lookup does not fail")
+            .expect("the session's record is read");
+        record.network = boxes::NetworkMode::NoNet;
+        assert!(record.box_addresses.is_none());
+
+        rehold_held_name_before_attach(paths::HostKind::Minvmd, &ssh_sock, id, Some(&record)).await;
+        let seen = requests.lock().unwrap();
+        assert_eq!(seen.len(), 1, "one hold, one request");
+        let minimald_rpc::BoxControlRequest::HoldBoxName(request) =
+            serde_json_lenient::from_str(&seen[0]).expect("the request is the wire type")
+        else {
+            panic!("the re-hold is carried by the hold verb");
+        };
+        assert_eq!(request.name, "web");
+        assert_eq!(request.session_id, Some(id));
+        assert!(
+            residency.lock().unwrap().is_empty(),
+            "a `none` box has no egress to re-admit"
+        );
     }
 
     /// A stand-in VM host daemon at `control_sock` that answers `host_ip`
