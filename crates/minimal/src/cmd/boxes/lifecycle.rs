@@ -641,14 +641,34 @@ pub async fn cmd_box_rm(global: &GlobalArgs, args: BoxRmArgs) -> Result<(), anyh
     let mut client = connect_daemon(global).await?;
     let mut out = std::io::stdout().lock();
     match rm_listed_box(&mut client, &mut out, &args.target, args.force).await {
+        Ok(removed) => {
+            // The box is gone. Its creator withdraws the row on the VM host
+            // daemon, or releases the name the zone held, as `destroy_box`
+            // does. Both are best-effort and warn on failure.
+            let control_sock =
+                vm_host_control_sock(daemon_host_kind(global), global.minimal_dir.as_deref());
+            let name = removed.name.as_deref();
+            withdraw_box_row(control_sock.clone(), name, removed.box_addresses, None).await;
+            release_held_box_name(control_sock, removed.id, name, removed.box_addresses).await;
+            Ok(())
+        }
         Err(e) if e.downcast_ref::<BoxRunningRefusal>().is_some() => {
             // The refusal prints as it is, and the command ends with its
             // own exit code: the process reads the code from a `TaskExit`.
             eprintln!("{e}");
             Err(crate::task::TaskExit(BoxRunningRefusal::EXIT_CODE).into())
         }
-        other => other,
+        Err(e) => Err(e),
     }
+}
+
+/// A box that `rm_listed_box` reaped: what its creator needs to retire
+/// the row or the name hold the box leaves on the VM host daemon.
+#[derive(Debug)]
+pub(crate) struct RemovedBox {
+    pub(crate) id: boxes::SessionId,
+    pub(crate) name: Option<String>,
+    pub(crate) box_addresses: Option<boxes::BoxAddresses>,
 }
 
 /// Resolves `target` among the boxes the host lists and reaps it, as
@@ -659,7 +679,7 @@ pub(crate) async fn rm_listed_box(
     out: &mut impl std::io::Write,
     target: &str,
     force: bool,
-) -> Result<(), anyhow::Error> {
+) -> Result<RemovedBox, anyhow::Error> {
     use minimald_rpc::{Errorable, ReapBox};
 
     // A box name is not scoped to a project, so the lookup reads every box.
@@ -683,6 +703,18 @@ pub(crate) async fn rm_listed_box(
     if running && !force {
         return Err(refusal());
     }
+    // The record carries the pair the box's registration handed back,
+    // which the withdrawal after the reap presents. A record the daemon
+    // cannot answer reaps the box all the same.
+    let box_addresses = get_session_record(client, &id.to_string())
+        .await
+        .ok()
+        .and_then(|resp| resp.record)
+        .and_then(|record| record.box_addresses);
+    let name = listing
+        .iter()
+        .find(|entry| entry.box_id == id)
+        .and_then(|entry| entry.name.clone());
     let reaped = match client
         .oneshot_rpc::<ReapBox>(box_rm_request(id, force))
         .await
@@ -708,7 +740,11 @@ pub(crate) async fn rm_listed_box(
             eprintln!("{output}");
         }
     }
-    Ok(())
+    Ok(RemovedBox {
+        id,
+        name,
+        box_addresses,
+    })
 }
 
 #[cfg(test)]
@@ -850,9 +886,11 @@ mod tests {
             .await
             .expect("the stop succeeds");
         let mut out = Vec::new();
-        rm_listed_box(&mut client, &mut out, "web", false)
+        let removed = rm_listed_box(&mut client, &mut out, "web", false)
             .await
             .expect("a stopped box is removed");
+        // The caller retires the row or name hold by this name.
+        assert_eq!(removed.name.as_deref(), Some("web"));
         assert_eq!(String::from_utf8(out).unwrap(), "Removed web.\n");
         assert_eq!(listed_state(&mut client, "web").await, None);
 
