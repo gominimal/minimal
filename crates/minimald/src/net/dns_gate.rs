@@ -401,8 +401,12 @@ pub(crate) struct DnsGate {
     /// warnings emit through: one limiter and one warn log per session
     /// gate, but not one bucket — the drops key their rate limit by rule
     /// alone, this gate's refusals by rule and name
-    /// ([`PolicyWarnLimiter::warn_dns_refusal`]).
+    /// ([`PolicyWarnLimiter::warn_dns_refusal`]). The REFUSED warning for an
+    /// unmatched name does not use it: see [`Self::refused`].
     limiter: Arc<PolicyWarnLimiter>,
+    /// The REFUSED warning's window (NET-141): each refused name is logged
+    /// once a window, up to a bound of names per box.
+    refused: Mutex<RefusedNames>,
     /// The names this box's queries are steered to the Box Egress Proxy for
     /// (BEP-062, BEP-078), or `None` when the box's steering is not `dns`
     /// or `both`. Set by [`Self::with_steering`].
@@ -429,29 +433,99 @@ const STEERED_TTL: u32 = 30;
 /// The rate-limit key prefix of the SERVFAIL warning for a steered name.
 const STEERED_SERVFAIL_RULE: &str = "bep-steered-servfail";
 
-/// The rate-limit key prefix of the REFUSED warning for a name a box's allow
-/// list does not match (NET-141).
-const UNMATCHED_REFUSED_RULE: &str = "dns-unmatched-refused";
+/// The window over which the REFUSED warning logs each refused name once
+/// (NET-141): the same minute the frame-drop warnings use.
+const UNMATCHED_REFUSED_WINDOW: Duration = Duration::from_secs(60);
 
-/// How many rate-limit keys the REFUSED warning spreads a box's names over.
-/// The box chooses the names, and the limiter never evicts a key, so the
-/// key holds a bucket of the name, not the name: a box that asks for many
-/// names grows the limiter by this many keys at most.
-const UNMATCHED_REFUSED_BUCKETS: u64 = 256;
+/// How many distinct refused names one box logs in one window. The box
+/// chooses the names, so the set of names already logged is bounded: a name
+/// past the bound is counted, and the count is one line when the window ends.
+const UNMATCHED_REFUSED_NAMES: usize = 256;
 
-/// The rate-limit key of the REFUSED warning for `name`: one of
-/// [`UNMATCHED_REFUSED_BUCKETS`] keys, picked by a hash with a key random to
-/// this daemon, so a box cannot pick names that collide with another name.
-/// Two names that share a bucket share one line a minute.
-fn unmatched_refused_key(name: &str) -> String {
-    use std::hash::BuildHasher;
-    static HASHER: std::sync::OnceLock<std::collections::hash_map::RandomState> =
-        std::sync::OnceLock::new();
-    let bucket = HASHER
-        .get_or_init(std::collections::hash_map::RandomState::new)
-        .hash_one(name)
-        % UNMATCHED_REFUSED_BUCKETS;
-    format!("{UNMATCHED_REFUSED_RULE}:{bucket}")
+/// What the REFUSED warning does for one refused name.
+#[derive(Debug, PartialEq, Eq)]
+enum RefusedLine {
+    /// The first refusal of this name in the window: log the name.
+    Log,
+    /// The name was logged in this window already.
+    Repeat,
+    /// The window holds [`UNMATCHED_REFUSED_NAMES`] names already: the
+    /// refusal is counted, not logged.
+    PastBound,
+}
+
+/// One box's REFUSED-warning window: the names logged since `start`, and
+/// how many refusals came for names past the bound.
+#[derive(Debug)]
+struct RefusedNames {
+    /// The box's label, the `session_id` of the count line.
+    label: String,
+    start: Instant,
+    logged: HashSet<String>,
+    past_bound: u64,
+}
+
+impl RefusedNames {
+    fn new(label: &str, now: Instant) -> Self {
+        Self {
+            label: label.to_string(),
+            start: now,
+            logged: HashSet::new(),
+            past_bound: 0,
+        }
+    }
+
+    /// Decides the line for a refusal of `name` at `now`. When `now` is past
+    /// the window, the window starts again, and the count of the window that
+    /// ended is returned beside the decision when it is not zero.
+    fn refuse(&mut self, name: &str, now: Instant) -> (RefusedLine, Option<u64>) {
+        let mut ended = None;
+        if now.duration_since(self.start) >= UNMATCHED_REFUSED_WINDOW {
+            ended = self.restart(now);
+        }
+        let line = if self.logged.contains(name) {
+            RefusedLine::Repeat
+        } else if self.logged.len() < UNMATCHED_REFUSED_NAMES {
+            self.logged.insert(name.to_string());
+            RefusedLine::Log
+        } else {
+            self.past_bound += 1;
+            RefusedLine::PastBound
+        };
+        (line, ended)
+    }
+
+    /// Starts a new window at `now`, and returns the count of refusals past
+    /// the bound in the window that ended, when it is not zero.
+    fn restart(&mut self, now: Instant) -> Option<u64> {
+        let ended = std::mem::take(&mut self.past_bound);
+        self.logged.clear();
+        self.start = now;
+        (ended > 0).then_some(ended)
+    }
+}
+
+impl Drop for RefusedNames {
+    /// The count of the last window is logged when the box's gate goes, so
+    /// a box that stops asking still has its count in the log.
+    fn drop(&mut self) {
+        if self.past_bound > 0 {
+            warn_refused_past_bound(&self.label, self.past_bound);
+        }
+    }
+}
+
+/// The one line per window that counts the refusals for names past the
+/// per-box bound (NET-141).
+fn warn_refused_past_bound(label: &str, count: u64) {
+    tracing::warn!(
+        component = COMPONENT,
+        session_id = %label,
+        refused_not_logged = count,
+        name_bound = UNMATCHED_REFUSED_NAMES,
+        "answered REFUSED for more names than the per-box log bound in one minute; \
+         these refusals were counted, not logged by name"
+    );
 }
 
 /// A DNS wire name in the form the allowlist matches: ASCII-lowercased,
@@ -514,6 +588,7 @@ impl DnsGate {
             flow_idle_cap: FLOW_IDLE_CAP,
             label: label.to_string(),
             limiter,
+            refused: Mutex::new(RefusedNames::new(label, Instant::now())),
             steering: None,
         }
     }
@@ -789,15 +864,19 @@ impl DnsGate {
     }
 
     /// The refusal's one rate-limited line (NET-141): the box and the name it
-    /// asked for that its allow list does not match. Keyed by a bucket of
-    /// the name ([`unmatched_refused_key`]), so a burst for one name does not
-    /// silence most others, and the limiter's keys stay bounded.
+    /// asked for that its allow list does not match. Each name is logged
+    /// once a window ([`RefusedNames`]), so a burst for one name does not
+    /// silence any other name, and the names held stay bounded per box.
     fn warn_refused(&self, name: &str, rtype: RecordType) {
-        let key = unmatched_refused_key(name);
-        if self
-            .limiter
-            .should_warn_at(&self.label, &key, Instant::now())
-        {
+        let (line, ended) = self
+            .refused
+            .lock()
+            .expect("refused-names mutex poisoned")
+            .refuse(name, Instant::now());
+        if let Some(count) = ended {
+            warn_refused_past_bound(&self.label, count);
+        }
+        if line == RefusedLine::Log {
             tracing::warn!(
                 component = COMPONENT,
                 session_id = %self.label,
@@ -3113,19 +3192,11 @@ pub(crate) mod tests {
             assert_eq!(reply.metadata.response_code, ResponseCode::Refused);
         }
         assert_eq!(lines("refused-once.example"), 1, "one line for the burst");
-        // The key is a bucket of the name under a hasher random to the
-        // process, so a fixed second name shares the first one's bucket on
-        // one run in 256. Pick a second name the hasher puts in another
-        // bucket, so the leg is about two keys, every run.
-        let first = unmatched_refused_key("refused-once.example");
-        let other = (0..)
-            .map(|n| format!("refused-other{n}.example"))
-            .find(|name| unmatched_refused_key(name) != first)
-            .expect("some name falls in another of the 256 buckets");
+        let other = "refused-other.example";
         let reply = reply_to(&gate, &format!("{other}."), RecordType::A);
         assert_eq!(reply.metadata.response_code, ResponseCode::Refused);
         assert_eq!(
-            lines(&other),
+            lines(other),
             1,
             "a second name is not silenced by the first"
         );
@@ -4071,17 +4142,63 @@ pub(crate) mod tests {
         }
     }
 
-    /// The REFUSED warning's rate-limit keys stay bounded whatever names a
-    /// box asks for, and one name always maps to one key (NET-141).
+    /// Every refused name is logged, however many names a box asks for
+    /// up to the bound: names that a hash of 256 buckets put together no
+    /// longer share one line a minute (NET-141).
     #[test]
-    fn unmatched_name_refusal_keys_stay_bounded() {
-        let keys: std::collections::HashSet<String> = (0..10_000)
-            .map(|n| unmatched_refused_key(&format!("name-{n}.example.com")))
+    fn refused_names_sharing_a_bucket_each_logged() {
+        let capture = captured_log();
+        let gate = gate_for(&github_only_egress());
+        // More names than the old 256 buckets, so some names share a bucket
+        // on every run, and within the per-box bound of names.
+        let names: Vec<String> = (0..UNMATCHED_REFUSED_NAMES)
+            .map(|n| format!("refused-many{n}.example"))
             .collect();
-        assert!(keys.len() as u64 <= UNMATCHED_REFUSED_BUCKETS);
+        for name in &names {
+            let reply = reply_to(&gate, &format!("{name}."), RecordType::A);
+            assert_eq!(reply.metadata.response_code, ResponseCode::Refused);
+        }
+        let log = capture.contents();
+        for name in &names {
+            let count = log
+                .lines()
+                .filter(|line| {
+                    line.contains("answered REFUSED for a name the box's allow_dns_hosts")
+                        && line.contains(&format!("name={name} "))
+                })
+                .count();
+            assert_eq!(count, 1, "{name} is logged once");
+        }
+    }
+
+    /// The window holds at most the bound of names: a name past it is
+    /// counted, not logged, and the count is one line when the window ends.
+    /// A name already logged stays a repeat, and a new window logs again.
+    #[test]
+    fn refused_names_past_the_bound_are_counted_once_a_window() {
+        let t0 = Instant::now();
+        let mut window = RefusedNames::new("box", t0);
+        for n in 0..UNMATCHED_REFUSED_NAMES {
+            assert_eq!(
+                window.refuse(&format!("n{n}"), t0),
+                (RefusedLine::Log, None)
+            );
+        }
+        assert_eq!(window.refuse("n0", t0), (RefusedLine::Repeat, None));
+        for n in 0..10 {
+            assert_eq!(
+                window.refuse(&format!("past{n}"), t0),
+                (RefusedLine::PastBound, None)
+            );
+        }
+        assert!(window.logged.len() <= UNMATCHED_REFUSED_NAMES);
+        let later = t0 + UNMATCHED_REFUSED_WINDOW;
+        assert_eq!(window.refuse("n0", later), (RefusedLine::Log, Some(10)));
+        assert_eq!(window.refuse("n1", later), (RefusedLine::Log, None));
         assert_eq!(
-            unmatched_refused_key("example.com"),
-            unmatched_refused_key("example.com")
+            window.refuse("n0", later + UNMATCHED_REFUSED_WINDOW),
+            (RefusedLine::Log, None),
+            "a window with no refusal past the bound writes no count"
         );
     }
 }
