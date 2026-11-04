@@ -1091,10 +1091,13 @@ where
                 if !boxes.holds_host_ip_boxes() {
                     continue;
                 }
+                // Taken before the read, so a box a client admits while the
+                // list is in flight is not dropped on a list that predates it.
+                let mark = boxes.host_ip_admit_mark();
                 match read_guest() {
                     Ok(guest) => {
                         failing = false;
-                        boxes.reconcile_host_ip_boxes(&guest, trigger);
+                        boxes.reconcile_host_ip_boxes(&guest, mark, trigger);
                     }
                     Err(error) if !failing => {
                         failing = true;

@@ -6118,6 +6118,12 @@ impl BoxRegistry {
             .host_ip_boxes
             .write()
             .expect("the resident host_ip boxes' lock is never held across a panic");
+        // Every admit, a repeated one too, is newer than any session list
+        // read before it: a reconcile of that list leaves this box alone
+        // ([`Self::reconcile_host_ip_boxes`]).
+        resident.admits += 1;
+        let admit = resident.admits;
+        resident.admitted_at.insert(session_id, admit);
         if resident
             .boxes
             .get(&session_id)
@@ -6178,6 +6184,7 @@ impl BoxRegistry {
         // Rules a reconcile set aside go too: a destroyed box is never
         // admitted again ([`Self::reconcile_host_ip_boxes`]).
         resident.dormant.remove(&session_id);
+        resident.admitted_at.remove(&session_id);
         let removed = resident.boxes.remove(&session_id).is_some();
         if removed {
             resident.cohort = HostIpBoxes::cohort_record(&resident.boxes, self.subnet);
@@ -6224,12 +6231,17 @@ impl BoxRegistry {
     /// client admitted: a box the host never admitted gains nothing, so a
     /// guest that lies can drop its own boxes' egress but never widen it.
     ///
+    /// `mark` is [`Self::host_ip_admit_mark`], taken before the list was
+    /// read. A box a client admitted after the mark keeps its rules for
+    /// this pass: the list can predate the box, or its resume.
+    ///
     /// One info line per box dropped or admitted again, naming the box, its
     /// state in the guest and the trigger. A pass that changes nothing logs
     /// nothing.
     pub fn reconcile_host_ip_boxes(
         &self,
         guest: &BTreeMap<boxes::SessionId, boxes::BoxState>,
+        mark: HostIpAdmitMark,
         trigger: HostIpReconcileTrigger,
     ) -> HostIpReconcile {
         let mut outcome = HostIpReconcile::default();
@@ -6241,6 +6253,12 @@ impl BoxRegistry {
             .boxes
             .keys()
             .filter(|session| !guest.get(session).copied().is_some_and(guest_runs))
+            .filter(|session| {
+                resident
+                    .admitted_at
+                    .get(session)
+                    .is_none_or(|admit| *admit <= mark.0)
+            })
             .copied()
             .collect();
         for session in gone {
@@ -6269,6 +6287,14 @@ impl BoxRegistry {
         resident
             .dormant
             .retain(|session, _| guest.contains_key(session));
+        let HostIpBoxes {
+            boxes: held,
+            dormant,
+            admitted_at,
+            ..
+        } = &mut *resident;
+        admitted_at
+            .retain(|session, _| held.contains_key(session) || dormant.contains_key(session));
         if outcome.is_empty() {
             return outcome;
         }
@@ -6308,6 +6334,18 @@ impl BoxRegistry {
             self.node_mirror.end_binds(MirrorEnd::BoxEnd);
         }
         outcome
+    }
+
+    /// The client admits so far. Take it before reading the in-VM daemon's
+    /// session list, and hand it to [`Self::reconcile_host_ip_boxes`] with
+    /// that list.
+    #[must_use]
+    pub fn host_ip_admit_mark(&self) -> HostIpAdmitMark {
+        let resident = self
+            .host_ip_boxes
+            .read()
+            .expect("the resident host_ip boxes' lock is never held across a panic");
+        HostIpAdmitMark(resident.admits)
     }
 
     /// Whether any `host_ip` box's rules are held, resident or set aside:
@@ -7335,6 +7373,12 @@ impl std::fmt::Display for HostIpReconcileTrigger {
     }
 }
 
+/// The count of client admits of `host_ip` boxes at one moment
+/// ([`BoxRegistry::host_ip_admit_mark`]). A reconcile leaves alone a box a
+/// client admitted after the mark its session list was read under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostIpAdmitMark(u64);
+
 /// The boxes one reconcile changed, in session order.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct HostIpReconcile {
@@ -7383,6 +7427,11 @@ struct HostIpBoxes {
     /// ([`BoxRegistry::reconcile_host_ip_boxes`]). They admit nothing here.
     /// A box the guest reports running again moves back into `boxes`.
     dormant: BTreeMap<boxes::SessionId, Arc<HostIpBoxRules>>,
+    /// The count of client admits so far ([`BoxRegistry::host_ip_admit_mark`]).
+    admits: u64,
+    /// The admit count at each held box's last client admit, resident or
+    /// set aside.
+    admitted_at: BTreeMap<boxes::SessionId, u64>,
     /// The record the host-side DNS admission table pins the resident
     /// boxes' declared names under: every resident box's DNS hosts and
     /// allowed subnets, keyed to the node's own address. `None` when no
@@ -13296,7 +13345,11 @@ mod tests {
             (exited_box, boxes::BoxState::Exited),
             (live_box, boxes::BoxState::Active),
         ]);
-        let outcome = registry.reconcile_host_ip_boxes(&guest, HostIpReconcileTrigger::Timer);
+        let outcome = registry.reconcile_host_ip_boxes(
+            &guest,
+            registry.host_ip_admit_mark(),
+            HostIpReconcileTrigger::Timer,
+        );
         assert_eq!(outcome.dropped, vec![stopped_box, exited_box, reaped_box]);
         assert!(outcome.admitted.is_empty());
         assert_eq!(resident_sessions(&registry), vec![live_box]);
@@ -13304,20 +13357,49 @@ mod tests {
         // The same list again changes nothing.
         assert!(
             registry
-                .reconcile_host_ip_boxes(&guest, HostIpReconcileTrigger::BoxEvent)
+                .reconcile_host_ip_boxes(
+                    &guest,
+                    registry.host_ip_admit_mark(),
+                    HostIpReconcileTrigger::BoxEvent
+                )
                 .is_empty()
         );
 
         // The last running box goes: the union is empty, so the gate drops
         // every box-marked frame.
         let guest = BTreeMap::from([(live_box, boxes::BoxState::Stopped)]);
-        let outcome = registry.reconcile_host_ip_boxes(&guest, HostIpReconcileTrigger::BoxEvent);
+        let outcome = registry.reconcile_host_ip_boxes(
+            &guest,
+            registry.host_ip_admit_mark(),
+            HostIpReconcileTrigger::BoxEvent,
+        );
         assert_eq!(outcome.dropped, vec![live_box]);
         assert!(resident_sessions(&registry).is_empty());
         assert!(registry.table().host_ip_cohort().is_none());
 
         // A client retire also forgets the rules a reconcile set aside.
         assert!(!registry.retire_host_ip_box(live_box));
+        assert!(!registry.holds_host_ip_boxes());
+
+        // A list read before a client admit predates the box: that pass
+        // leaves the box's rules alone, and the next list decides.
+        let created = mirror_session(5);
+        let mark = registry.host_ip_admit_mark();
+        let stale = BTreeMap::new();
+        assert!(registry.admit_host_ip_box(created, Some(&one_subnet_policy())));
+        assert!(
+            registry
+                .reconcile_host_ip_boxes(&stale, mark, HostIpReconcileTrigger::BoxEvent)
+                .is_empty(),
+            "a box admitted after the list read survives that pass"
+        );
+        assert_eq!(resident_sessions(&registry), vec![created]);
+        let outcome = registry.reconcile_host_ip_boxes(
+            &stale,
+            registry.host_ip_admit_mark(),
+            HostIpReconcileTrigger::Timer,
+        );
+        assert_eq!(outcome.dropped, vec![created]);
         assert!(!registry.holds_host_ip_boxes());
     }
 
@@ -13333,7 +13415,11 @@ mod tests {
         let held = registry.table().host_ip_boxes()[0].egress().clone();
 
         let stopped = BTreeMap::from([(resumed, boxes::BoxState::Stopped)]);
-        let outcome = registry.reconcile_host_ip_boxes(&stopped, HostIpReconcileTrigger::Timer);
+        let outcome = registry.reconcile_host_ip_boxes(
+            &stopped,
+            registry.host_ip_admit_mark(),
+            HostIpReconcileTrigger::Timer,
+        );
         assert_eq!(outcome.dropped, vec![resumed, reaped]);
         assert!(resident_sessions(&registry).is_empty());
         assert!(registry.holds_host_ip_boxes());
@@ -13342,7 +13428,11 @@ mod tests {
             (resumed, boxes::BoxState::Active),
             (reaped, boxes::BoxState::Active),
         ]);
-        let outcome = registry.reconcile_host_ip_boxes(&running, HostIpReconcileTrigger::BoxEvent);
+        let outcome = registry.reconcile_host_ip_boxes(
+            &running,
+            registry.host_ip_admit_mark(),
+            HostIpReconcileTrigger::BoxEvent,
+        );
         assert_eq!(outcome.admitted, vec![resumed]);
         assert!(outcome.dropped.is_empty());
         assert_eq!(
