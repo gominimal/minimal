@@ -109,6 +109,16 @@ fn task_box_spec(
     Some(spec)
 }
 
+/// The spec a run creates its box with: the task box's `spec`, or `None`
+/// for a `--keep` run. A task box ends when its entrypoint returns
+/// (BOX-038), and only a running box can run a command. So a `--keep` box,
+/// which `min session run` and an attach use after the task, is created
+/// with no spec, as an interactive task's is: it runs a shell, and the task
+/// runs over the exec channel.
+fn run_spec(spec: Option<mfile::spec::BoxSpec>, keep: bool) -> Option<mfile::spec::BoxSpec> {
+    spec.filter(|_| !keep)
+}
+
 /// Asks the daemon to run the entrypoint of task box `id`, and returns the
 /// channel that relays it: the task's output, then its exit code.
 /// `task_env` holds the task's variables, resolved against this shell, for
@@ -719,16 +729,21 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     request.config.name = None;
     request.fresh_instance = true;
     // The task box runs its task as its entrypoint and keeps its record
-    // when the task returns (BOX-038). Only an interactive task, which has
-    // no spec, runs over the exec channel: its box ends with this run
+    // when the task returns (BOX-038). An interactive task, which has no
+    // spec, and a `--keep` run take the exec channel. A `--keep` box must
+    // still run after the task, so `min session run` and an attach can use
+    // it, and a task box ends with its task. Its box ends with this run
     // unless `--keep` retains it, marked at create, so a daemon restart
     // before or during the run destroys it rather than resuming it
     // (NET-131).
-    let spec = task_box_spec(
-        &args.task,
-        &declared,
-        crate::spec_flags(&request),
-        &args.args,
+    let spec = run_spec(
+        task_box_spec(
+            &args.task,
+            &declared,
+            crate::spec_flags(&request),
+            &args.args,
+        ),
+        args.keep,
     );
     let entrypoint_runs = spec.is_some();
     request.config.ends_with_run = !args.keep && !entrypoint_runs;
@@ -1115,6 +1130,10 @@ mod tests {
                     .to_vec()
             )
         );
+        // A `--keep` run creates no task box: its box must still run after
+        // the task, and a task box ends with its task.
+        assert!(run_spec(Some(spec.clone()), false).is_some());
+        assert!(run_spec(Some(spec.clone()), true).is_none());
         // The run sends no arguments and owns no box.
         assert_eq!(
             entrypoint_run_request("check"),
