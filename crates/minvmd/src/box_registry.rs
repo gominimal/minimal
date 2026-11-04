@@ -190,6 +190,15 @@ const HELD_NAMES_FILE_VERSION: u32 = 1;
 /// restart with an attach to get there through a slow boot.
 pub const HELD_NAME_RECONFIRM_BOUND: Duration = RESUME_ATTACH_BOUND;
 
+/// How long a `host_ip` registration name stands while no box is admitted
+/// under its id ([`BoxRegistry::register_host_ip_box`]). A `host_ip`
+/// registration holds no connection, so a creator that dies between its
+/// register and its box's admission leaves the name with nothing to
+/// withdraw it. Past this bound a new registration under the name takes it.
+/// The bound is [`RESUME_ATTACH_BOUND`]'s: the in-VM create and the
+/// admission that follows it come inside one slow boot.
+pub const HOST_IP_UNADMITTED_NAME_BOUND: Duration = RESUME_ATTACH_BOUND;
+
 /// One relay's end, as the host reports it: the switch addresses whose
 /// relayed traffic that connection carried, each with the id of the box
 /// whose row it attributed them to, for the registry to detach by. The id
@@ -4592,7 +4601,9 @@ impl BoxRegistry {
     /// The errors of [`Self::holds_box_id`], and
     /// [`AllocationError::CollidingBoxId`] when a record holds the id, and
     /// [`AllocationError::NameAlreadyHeld`] when a live `host_ip`
-    /// registration holds the name.
+    /// registration holds the name. A registration whose box is not
+    /// admitted ([`Self::admit_host_ip_box_with_lane`]) is live for
+    /// [`HOST_IP_UNADMITTED_NAME_BOUND`] from its register.
     pub fn register_host_ip_box(&self, name: &str) -> Result<BoxId, AllocationError> {
         self.register_host_ip_box_as(name, crate::bep_attach::mint_box_id())
     }
@@ -4611,6 +4622,14 @@ impl BoxRegistry {
             );
             return Err(AllocationError::CollidingBoxId { id });
         }
+        let now = self.now();
+        // The resident set's read lock is taken before the ids' lock, and
+        // held across the check, so an admission cannot land between the
+        // check and the replace. No path takes the two the other way round.
+        let resident = self
+            .host_ip_boxes
+            .read()
+            .expect("the resident host_ip boxes' lock is never held across a panic");
         let mut ids = self.host_ip_id_set();
         // BOX-163 parity: a live registration keeps its name until its box
         // retires or its creator withdraws it. A second registration under
@@ -4618,21 +4637,43 @@ impl BoxRegistry {
         // takes the name from the first. The check and the insert run under
         // one lock, so two registrations cannot both take the name.
         let asked = canonical_box_name(name);
-        if let Some(held) = ids
+        if let Some((held, named)) = ids
             .by_name
-            .keys()
-            .find(|named| canonical_box_name(named) == asked)
-            .cloned()
+            .iter()
+            .find(|(named, _)| canonical_box_name(named) == asked)
+            .map(|(held, named)| (held.clone(), *named))
         {
-            tracing::warn!(
+            // A registration holds no connection, so a creator that died
+            // before its box was admitted leaves nothing to withdraw the
+            // name. Once no box is admitted under the id and the bound has
+            // passed, the name is free for a new creation.
+            let admitted = resident
+                .boxes
+                .contains_key(&boxes::SessionId::from_bytes(named.id));
+            let stale = !admitted
+                && now.saturating_duration_since(named.since) >= HOST_IP_UNADMITTED_NAME_BOUND;
+            if !stale {
+                tracing::warn!(
+                    asked = %name,
+                    held = %held,
+                    admitted,
+                    "refused a host_ip box registration whose name a live registration already holds"
+                );
+                return Err(AllocationError::NameAlreadyHeld { held });
+            }
+            ids.by_name.remove(&held);
+            tracing::info!(
                 asked = %name,
                 held = %held,
-                "refused a host_ip box registration whose name a live registration already holds"
+                stale_box_id = %crate::bep_attach::BoxIdText(&named.id),
+                bound = ?HOST_IP_UNADMITTED_NAME_BOUND,
+                "withdrew a host_ip registration name no box was admitted under within the bound"
             );
-            return Err(AllocationError::NameAlreadyHeld { held });
         }
+        drop(resident);
         ids.ids.insert(id);
-        ids.by_name.insert(name.to_owned(), id);
+        ids.by_name
+            .insert(name.to_owned(), HostIpName { id, since: now });
         Ok(id)
     }
 
@@ -4659,7 +4700,7 @@ impl BoxRegistry {
         self.host_ip_id_set()
             .by_name
             .values()
-            .any(|named| *named == id)
+            .any(|named| named.id == id)
     }
 
     /// The id the live `host_ip` registration under `name` minted
@@ -4670,7 +4711,10 @@ impl BoxRegistry {
     /// ([`Self::retire_host_ip_box`]).
     #[must_use]
     pub fn host_ip_id_for(&self, name: &str) -> Option<BoxId> {
-        self.host_ip_id_set().by_name.get(name).copied()
+        self.host_ip_id_set()
+            .by_name
+            .get(name)
+            .map(|named| named.id)
     }
 
     /// Withdraws the `host_ip` registration name `name` while it still
@@ -4681,7 +4725,7 @@ impl BoxRegistry {
     /// was withdrawn.
     pub fn withdraw_host_ip_name(&self, name: &str, id: BoxId) -> bool {
         let mut ids = self.host_ip_id_set();
-        if ids.by_name.get(name) != Some(&id) {
+        if ids.by_name.get(name).map(|named| named.id) != Some(id) {
             return false;
         }
         ids.by_name.remove(name);
@@ -6335,7 +6379,7 @@ impl BoxRegistry {
         let id = session_id.to_bytes();
         let mut ids = self.host_ip_id_set();
         let named_before = ids.by_name.len();
-        ids.by_name.retain(|_, named| *named != id);
+        ids.by_name.retain(|_, named| named.id != id);
         let name_withdrawn = ids.by_name.len() != named_before;
         drop(ids);
         if name_withdrawn {
@@ -7292,7 +7336,15 @@ impl HostIpBoxRules {
 #[derive(Debug, Default)]
 struct HostIpIds {
     ids: BTreeSet<BoxId>,
-    by_name: BTreeMap<String, BoxId>,
+    by_name: BTreeMap<String, HostIpName>,
+}
+
+/// The id a live `host_ip` registration name answers, and when the name
+/// was registered ([`HOST_IP_UNADMITTED_NAME_BOUND`]).
+#[derive(Debug, Clone, Copy)]
+struct HostIpName {
+    id: BoxId,
+    since: Instant,
 }
 
 /// The resident `host_ip` boxes ([`BoxRegistry::admit_host_ip_box`]) and the

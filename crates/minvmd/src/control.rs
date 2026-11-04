@@ -4241,6 +4241,48 @@ mod tests {
         let second = minted(register(&sock_path, &host_ip(true)).expect("answered"));
         assert_ne!(first, second, "each creation gets its own id");
         assert_eq!(registry.host_ip_id_for("agent"), Some(second.to_bytes()));
+        // An admitted box keeps its name past the unadmitted bound.
+        assert!(registry.admit_host_ip_box_with_lane(
+            boxes::SessionId::from_bytes(second.to_bytes()),
+            None,
+            true,
+        ));
+        registry.advance_clock(
+            crate::box_registry::HOST_IP_UNADMITTED_NAME_BOUND + std::time::Duration::from_secs(1),
+        );
+        assert!(
+            matches!(
+                register(&sock_path, &host_ip(true)).expect("answered"),
+                BoxControlReply::Error { .. }
+            ),
+            "an admitted box's name is not taken over"
+        );
+        assert_eq!(registry.host_ip_id_for("agent"), Some(second.to_bytes()));
+        // A creator that died between its register and its box's admission
+        // leaves a name nothing withdraws. Past the bound, a new
+        // registration under the name takes it with a fresh id.
+        let scout = |hold: bool| RegisterBoxRequest {
+            name: "scout".to_string(),
+            ..host_ip(hold)
+        };
+        let orphan = minted(register(&sock_path, &scout(false)).expect("answered"));
+        assert!(
+            matches!(
+                register(&sock_path, &scout(false)).expect("answered"),
+                BoxControlReply::Error { .. }
+            ),
+            "inside the bound an unadmitted name is still held"
+        );
+        registry.advance_clock(
+            crate::box_registry::HOST_IP_UNADMITTED_NAME_BOUND + std::time::Duration::from_secs(1),
+        );
+        let fresh = minted(register(&sock_path, &scout(false)).expect("answered"));
+        assert_ne!(orphan, fresh, "the new creation gets its own id");
+        assert_eq!(registry.host_ip_id_for("scout"), Some(fresh.to_bytes()));
+        assert!(
+            registry.holds_host_ip_id(orphan.to_bytes()),
+            "the orphan's id stays for the collision check"
+        );
         for id in [first, second] {
             assert!(
                 registry.holds_host_ip_id(id.to_bytes()),
