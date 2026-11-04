@@ -24,6 +24,35 @@ pub(super) fn promote_interim_to_hand(
     }
 }
 
+/// How long a name change waits for the installed answerer to acknowledge
+/// it before the activate or the destroy returns without it.
+#[cfg(target_os = "linux")]
+const NAME_CHANGE_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Waits, bounded by [`NAME_CHANGE_BOUND`], for the installed answerer to
+/// acknowledge a box name's `change`. A wait past the bound says so in one
+/// warn line naming the box, and returns.
+#[cfg(target_os = "linux")]
+async fn await_name_change(
+    waiter: crate::net::dns::ZoneChangeWaiter,
+    session_id: boxes::SessionId,
+    name: &str,
+    change: &str,
+) {
+    let generation = waiter.generation();
+    if !waiter.wait(NAME_CHANGE_BOUND).await {
+        tracing::warn!(
+            session_id = %session_id,
+            session_name = name,
+            generation,
+            change,
+            bound_ms = NAME_CHANGE_BOUND.as_millis(),
+            "the installed answerer did not acknowledge this box name change in time; \
+             returning without it"
+        );
+    }
+}
+
 impl BoxActor {
     /// Register this session's PTask hostname (R3.1/R3.6). A HostNet PTask's
     /// listeners are on host loopback. An OwnIp PTask routes once the attach
@@ -111,6 +140,9 @@ impl BoxActor {
             _ => settled_port,
         };
         let mut shared_port_collisions = Vec::new();
+        // The registry generation this registration left the zone at, taken
+        // under the same write lock as the change (NET-011).
+        let mut name_change = None;
         match record.network {
             boxes::NetworkMode::OwnIp => {
                 // NET-010/NET-011: finalize publishes the box's declaration
@@ -332,6 +364,7 @@ impl BoxActor {
                 // address, so `register_own_ip` leaves the name absent and
                 // the attach path fails the box with the same fact.
                 reg.register_own_ip(record.id, &name, declared);
+                name_change = Some(reg.zone_change_waiter());
             }
             boxes::NetworkMode::HostNet => {
                 let mut reg = self
@@ -350,8 +383,16 @@ impl BoxActor {
                     subnet,
                     hostname_proxy_port,
                 );
+                name_change = Some(reg.zone_change_waiter());
             }
             _ => {}
+        }
+        // NET-011: the activating finalize returns once the installed
+        // answerer serves the name. Only the registration that may wait
+        // (`wait_for_verdict`) waits: the others run inside the manager's
+        // message handling, where a wait parks every other session.
+        if wait_for_verdict && let Some(waiter) = name_change {
+            await_name_change(waiter, record.id, &name, "registration").await;
         }
         // The cross-record collision report, at the moment the design puts it
         // (NET-010, design §7.1: cross-node collisions are reported at session
@@ -623,6 +664,11 @@ impl BoxActor {
     #[cfg(target_os = "linux")]
     pub(super) async fn deregister_hostname(&self, for_good: bool) {
         let record = self.record.record().await.unwrap();
+        let name = registry_name(&record);
+        // NET-012: a destroy returns once the installed answerer has dropped
+        // the name. The waiter is taken under the write lock of the last
+        // change, and waited for with no lock held.
+        let mut name_change = None;
         if for_good {
             // NET-010: the destroyed box's publish is withdrawn first, and the
             // grant it held returns to the host's pool — the grant the
@@ -652,23 +698,28 @@ impl BoxActor {
                         "a shared-address port passes to the earliest-created box still publishing it"
                     );
                 }
+                name_change = Some(reg.zone_change_waiter());
             }
-            self.release_loopback_address(&record, &registry_name(&record));
+            self.release_loopback_address(&record, &name);
         }
-        if !self.owns_hostname_route(&record) {
-            return;
+        if self.owns_hostname_route(&record) {
+            let mut reg = self
+                .hostnames
+                .write()
+                .expect("hostname registry lock poisoned");
+            // The registry keys its rows by name alone, so withdraw only a row
+            // registered to this box. Another box can hold the same name: one
+            // whose name is derived from the same project basename, or one a
+            // restart resumed while this box came up only to be destroyed.
+            if reg.name_held_by(record.id, &name) {
+                reg.deregister(&name);
+            }
+            if for_good {
+                name_change = Some(reg.zone_change_waiter());
+            }
         }
-        let mut reg = self
-            .hostnames
-            .write()
-            .expect("hostname registry lock poisoned");
-        // The registry keys its rows by name alone, so withdraw only a row
-        // registered to this box. Another box can hold the same name: one
-        // whose name is derived from the same project basename, or one a
-        // restart resumed while this box came up only to be destroyed.
-        let name = registry_name(&record);
-        if reg.name_held_by(record.id, &name) {
-            reg.deregister(&name);
+        if let Some(waiter) = name_change {
+            await_name_change(waiter, record.id, &name, "withdrawal").await;
         }
     }
 
