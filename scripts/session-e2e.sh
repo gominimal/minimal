@@ -740,8 +740,7 @@ export RUST_LOG="${RUST_LOG:-warn,minimald::exec=info}"
 # (plan, watcher start, sockets seen, verdicts, admissions) must ride this
 # default to reach the guest at all. Widened only when nothing was set by hand.
 if [ -n "${E2E_VM:-}" ] && [ "$RUST_LOG" = "warn,minimald::exec=info" ]; then
-  # bep=info: the live proxy cases read `bep serve`'s INFO records in bep.log.
-  export RUST_LOG="$RUST_LOG,minimald::net::listeners=debug,minimald::net::provider=debug,minimald::box_runtime=debug,bep=info"
+  export RUST_LOG="$RUST_LOG,minimald::net::listeners=debug,minimald::net::provider=debug,minimald::box_runtime=debug"
 fi
 
 # Millisecond clock: GNU date on Linux; macOS `date` has no %N, use perl.
@@ -12546,6 +12545,12 @@ bep_live_gate() {
       return 1
     fi
   fi
+  # Here, not in the lane default: an earlier case can replace RUST_LOG, and
+  # the live cases and their own restarts read `bep serve`'s records in bep.log.
+  case ",${RUST_LOG:-}," in
+    *,bep=info,*) ;;
+    *) export RUST_LOG="${RUST_LOG:+$RUST_LOG,}bep=info" ;;
+  esac
   if [ "$BEP_LIVE_DAEMON" != 1 ]; then
     unset MINVMD_BEP_STUB
     mnl stop --force >/dev/null 2>&1 || true
@@ -13528,12 +13533,12 @@ proof_bep_destroyed_box_values_refused_within_60s() {
     [ "$dv_count" -ge 1 ] && break
   done
   if [ "$dv_count" != 1 ]; then
-    echo "::error::'min box audit $dv_web' shows $dv_count revocation records 60 s after the destroy, not 1"
-    echo "--- min box audit $dv_web -o jsonl ---"; cat "$WORK/$dv_case.audit" 2>/dev/null || true
+    echo "::error::'min box audit $dv_web_id' shows $dv_count revocation records 60 s after the destroy, not 1"
+    echo "--- min box audit $dv_web_id -o jsonl ---"; cat "$WORK/$dv_case.audit" 2>/dev/null || true
     cat "$WORK/$dv_case.audit.err" 2>/dev/null || true
     dv_fail
   fi
-  echo "min box audit $dv_web: 1 revocation record within 60 s of the destroy"
+  echo "min box audit $dv_web_id: 1 revocation record within 60 s of the destroy"
 
   # The copied value, from the second box, after the destroy.
   if mnl session exec "$DV_SID2" sh -c "GH_TOKEN='$dv_value' timeout 60 gh api user --jq .login" \
@@ -13777,17 +13782,17 @@ proof_bep_destroy_with_proxy_down_refuses_by_attachment() {
 
   # No revocation was recorded: the refusal is the withdrawn attachment's.
   if ! mnl box audit "$pd_web_id" -o jsonl </dev/null >"$WORK/$pd_case.audit" 2>"$WORK/$pd_case.audit.err"; then
-    echo "::error::'min box audit $pd_web' failed"
+    echo "::error::'min box audit $pd_web_id' failed"
     cat "$WORK/$pd_case.audit.err" 2>/dev/null || true
     pd_fail
   fi
   pd_count="$(bep_revoke_count "$WORK/$pd_case.audit" revocation)"
   if [ "$pd_count" != 0 ]; then
-    echo "::error::'min box audit $pd_web' shows $pd_count revocation records, though the proxy was down at the destroy"
+    echo "::error::'min box audit $pd_web_id' shows $pd_count revocation records, though the proxy was down at the destroy"
     pd_fail
   fi
   pd_id="$(bep_revoke_count "$WORK/$pd_case.audit" decision)"
-  echo "min box audit $pd_web: $pd_id decision records and no revocation record"
+  echo "min box audit $pd_web_id: $pd_id decision records and no revocation record"
 
   pd_cleanup
   rm -f "${WORK:?}/${pd_case:?}".*
