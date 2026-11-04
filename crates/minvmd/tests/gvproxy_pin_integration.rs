@@ -110,3 +110,89 @@ fn e2e_provisions_the_pinned_gvproxy() {
         bin.display()
     );
 }
+
+/// The env var the switch path comes in on, built so this file's own source
+/// does not hold the literal the guard below looks for.
+const GVPROXY_ENV: &str = concat!("MINVMD_", "GVPROXY_BIN");
+
+/// Whether `source` reads [`GVPROXY_ENV`] with `std::env::var` or `var_os`,
+/// either by the literal or through a `const` that holds it. Whitespace is
+/// removed first, so a call split over lines still matches. Setting the
+/// variable on a child (`.env(..)`) is not a read.
+fn reads_gvproxy_env(source: &str) -> bool {
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    let literal = format!("\"{GVPROXY_ENV}\"");
+    let mut names = vec![literal.clone()];
+    // `const NAME: &str = "MINVMD_GVPROXY_BIN";`, one declaration a line.
+    for line in source.lines() {
+        let decl = line.trim_start();
+        let decl = decl.strip_prefix("pub ").unwrap_or(decl);
+        if let Some((name, value)) = decl
+            .strip_prefix("const ")
+            .and_then(|rest| rest.split_once(':'))
+            && value.replace(char::is_whitespace, "") == format!("&str={literal};")
+        {
+            names.push(name.trim().to_owned());
+        }
+    }
+    names.iter().any(|name| {
+        ["var(", "var_os("].iter().any(|call| {
+            [")", ","]
+                .iter()
+                .any(|end| flat.contains(&format!("{call}{name}{end}")))
+        })
+    })
+}
+
+/// Every VM harness takes the gvproxy switch from `common::gvproxy_bin`, which
+/// fetches the pinned switch on a VM lane. A harness that reads the variable
+/// itself skips there, because the lanes do not export it.
+#[test]
+fn vm_harnesses_take_the_switch_from_the_common_helper() {
+    // The detector itself, on the shapes a harness can take.
+    assert!(reads_gvproxy_env(&format!(
+        "std::env::var_os(\n    \"{GVPROXY_ENV}\",\n)"
+    )));
+    assert!(reads_gvproxy_env(&format!(
+        "const GV: &str = \"{GVPROXY_ENV}\";\nlet x = std::env::var(GV);"
+    )));
+    assert!(!reads_gvproxy_env(&format!(
+        "cmd.env(\"{GVPROXY_ENV}\", gvproxy);\nlet g = common::gvproxy_bin();"
+    )));
+
+    let dir = workspace_root().join("crates/minvmd/tests");
+    let this_file = std::path::Path::new(file!())
+        .file_name()
+        .expect("file!() names a file")
+        .to_owned();
+    let mut checked = Vec::new();
+    let mut offenders = Vec::new();
+    for entry in
+        std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
+    {
+        let path = entry.expect("reading a tests dir entry").path();
+        if path.extension().is_none_or(|ext| ext != "rs")
+            || path.file_name() == Some(this_file.as_os_str())
+        {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+        if reads_gvproxy_env(&source) {
+            offenders.push(path.display().to_string());
+        }
+        checked.push(path);
+    }
+    assert!(
+        checked
+            .iter()
+            .any(|p| p.ends_with("egress_allowlist_integration.rs")),
+        "the guard found no harnesses under {}: checked {checked:?}",
+        dir.display()
+    );
+    assert!(
+        offenders.is_empty(),
+        "these harnesses read {GVPROXY_ENV} themselves; take the switch from \
+         common::gvproxy_bin() instead: {offenders:?}"
+    );
+}
