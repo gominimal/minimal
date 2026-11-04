@@ -190,6 +190,15 @@ const HELD_NAMES_FILE_VERSION: u32 = 1;
 /// restart with an attach to get there through a slow boot.
 pub const HELD_NAME_RECONFIRM_BOUND: Duration = RESUME_ATTACH_BOUND;
 
+/// How long a `host_ip` registration name stands while no box is admitted
+/// under its id ([`BoxRegistry::register_host_ip_box`]). A `host_ip`
+/// registration holds no connection, so a creator that dies between its
+/// register and its box's admission leaves the name with nothing to
+/// withdraw it. Past this bound a new registration under the name takes it.
+/// The bound is [`RESUME_ATTACH_BOUND`]'s: the in-VM create and the
+/// admission that follows it come inside one slow boot.
+pub const HOST_IP_UNADMITTED_NAME_BOUND: Duration = RESUME_ATTACH_BOUND;
+
 /// One relay's end, as the host reports it: the switch addresses whose
 /// relayed traffic that connection carried, each with the id of the box
 /// whose row it attributed them to, for the registry to detach by. The id
@@ -2915,6 +2924,18 @@ pub struct BoxRegistry {
     /// every [`BoxTable`]: the union the gate decides a box-marked frame
     /// from the node address by.
     host_ip_boxes: Arc<RwLock<HostIpBoxes>>,
+    /// The ids minted for `host_ip` boxes ([`Self::register_host_ip_box`],
+    /// BEP-082), shared by every clone. A `host_ip` box has no row in the
+    /// address table, so this map is the record of its id, each with the
+    /// name it registered under: the collision check
+    /// ([`Self::holds_box_id`]) reads it beside the rows, and the in-VM
+    /// daemon's mint ask finds the id by that name
+    /// ([`Self::host_ip_id_for`]). The name goes when the box retires or
+    /// when a later registration takes the name, so an ended box's id never
+    /// answers a new box's ask. The id itself stays until the VM host
+    /// daemon restarts, for the collision check. The mint never draws the
+    /// same UUIDv7 twice, so a kept id never refuses a new box.
+    host_ip_ids: Arc<Mutex<HostIpIds>>,
     /// The held names reloaded from [`HELD_NAMES_FILE`] that no hold has
     /// re-made since, each with when it was reloaded: dropped once
     /// [`HELD_NAME_RECONFIRM_BOUND`] has passed
@@ -3138,6 +3159,8 @@ enum IdHolder {
     KeptCreation,
     /// The proxy's attachment table.
     Attachment,
+    /// A `host_ip` box's minted id ([`BoxRegistry::register_host_ip_box`]).
+    HostIpBox,
     /// A revocation record the proxy retains.
     RevocationRecord,
     /// A revocation record in the proxy's audit log, read with no proxy
@@ -3157,6 +3180,7 @@ impl IdHolder {
             IdHolder::LiveRow => "live row",
             IdHolder::KeptCreation => "kept creation",
             IdHolder::Attachment => "attachment",
+            IdHolder::HostIpBox => "host_ip box",
             IdHolder::RevocationRecord => "revocation record",
             IdHolder::AuditedRevocation { .. } => "revocation record in the audit log",
         }
@@ -3398,6 +3422,7 @@ impl Clone for BoxRegistry {
             stopped: Arc::clone(&self.stopped),
             held_names: Arc::clone(&self.held_names),
             host_ip_boxes: Arc::clone(&self.host_ip_boxes),
+            host_ip_ids: Arc::clone(&self.host_ip_ids),
             unconfirmed_holds: Arc::clone(&self.unconfirmed_holds),
             table_pings: Arc::clone(&self.table_pings),
             withdrawal_reports: self.withdrawal_reports.clone(),
@@ -3442,6 +3467,7 @@ impl BoxRegistry {
             stopped: Arc::new(RwLock::new(BTreeSet::new())),
             held_names: Arc::new(RwLock::new(BTreeMap::new())),
             host_ip_boxes: Arc::new(RwLock::new(HostIpBoxes::default())),
+            host_ip_ids: Arc::new(Mutex::new(HostIpIds::default())),
             unconfirmed_holds: Arc::new(Mutex::new(BTreeMap::new())),
             table_pings: Arc::new(Mutex::new(Vec::new())),
             withdrawal_reports: reports,
@@ -4562,6 +4588,152 @@ impl BoxRegistry {
         )
     }
 
+    /// Mints the box id of a `host_ip` box (BEP-082): the box leaves the VM
+    /// from the node's own address, so it gets no switch address and no row
+    /// in the address table. The id is recorded in [`Self::host_ip_ids`].
+    /// The id takes the collision check an own-address box's id takes
+    /// ([`Self::holds_box_id`]): live rows, kept creations, attachments and
+    /// the proxy's revocation records. A colliding mint is refused, never
+    /// re-minted.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::holds_box_id`], and
+    /// [`AllocationError::CollidingBoxId`] when a record holds the id, and
+    /// [`AllocationError::NameAlreadyHeld`] when a live `host_ip`
+    /// registration holds the name. A registration whose box is not
+    /// admitted ([`Self::admit_host_ip_box_with_lane`]) is live for
+    /// [`HOST_IP_UNADMITTED_NAME_BOUND`] from its register.
+    pub fn register_host_ip_box(&self, name: &str) -> Result<BoxId, AllocationError> {
+        self.register_host_ip_box_as(name, crate::bep_attach::mint_box_id())
+    }
+
+    /// [`Self::register_host_ip_box`] with the freshly minted `id`, split
+    /// out so a test can drive a colliding mint.
+    fn register_host_ip_box_as(&self, name: &str, id: BoxId) -> Result<BoxId, AllocationError> {
+        if let Some(holder) = self.holds_box_id(id)? {
+            tracing::warn!(
+                box = %name,
+                box_id = %crate::bep_attach::BoxIdText(&id),
+                held_by = holder.as_str(),
+                "refused a host_ip box registration whose id is already held: the check \
+                 reads live rows, kept creations, attachments and the proxy's revocation \
+                 records"
+            );
+            return Err(AllocationError::CollidingBoxId { id });
+        }
+        let now = self.now();
+        // The resident set's read lock is taken before the ids' lock, and
+        // held across the check, so an admission cannot land between the
+        // check and the replace. No path takes the two the other way round.
+        let resident = self
+            .host_ip_boxes
+            .read()
+            .expect("the resident host_ip boxes' lock is never held across a panic");
+        let mut ids = self.host_ip_id_set();
+        // BOX-163 parity: a live registration keeps its name until its box
+        // retires or its creator withdraws it. A second registration under
+        // the name is refused as an own-address row's is, and it never
+        // takes the name from the first. The check and the insert run under
+        // one lock, so two registrations cannot both take the name.
+        let asked = canonical_box_name(name);
+        if let Some((held, named)) = ids
+            .by_name
+            .iter()
+            .find(|(named, _)| canonical_box_name(named) == asked)
+            .map(|(held, named)| (held.clone(), *named))
+        {
+            // A registration holds no connection, so a creator that died
+            // before its box was admitted leaves nothing to withdraw the
+            // name. Once no box is admitted under the id and the bound has
+            // passed, the name is free for a new creation.
+            // A box a reconcile set aside is stopped, not ended: it keeps
+            // its name for its resume (NET-085).
+            let session = boxes::SessionId::from_bytes(named.id);
+            let admitted =
+                resident.boxes.contains_key(&session) || resident.dormant.contains_key(&session);
+            let stale = !admitted
+                && now.saturating_duration_since(named.since) >= HOST_IP_UNADMITTED_NAME_BOUND;
+            if !stale {
+                tracing::warn!(
+                    asked = %name,
+                    held = %held,
+                    admitted,
+                    "refused a host_ip box registration whose name a live registration already holds"
+                );
+                return Err(AllocationError::NameAlreadyHeld { held });
+            }
+            ids.by_name.remove(&held);
+            tracing::info!(
+                asked = %name,
+                held = %held,
+                stale_box_id = %crate::bep_attach::BoxIdText(&named.id),
+                bound = ?HOST_IP_UNADMITTED_NAME_BOUND,
+                "withdrew a host_ip registration name no box was admitted under within the bound"
+            );
+        }
+        drop(resident);
+        ids.ids.insert(id);
+        ids.by_name
+            .insert(name.to_owned(), HostIpName { id, since: now });
+        Ok(id)
+    }
+
+    /// The minted `host_ip` box ids and the registration names that still
+    /// answer them ([`Self::host_ip_ids`]).
+    fn host_ip_id_set(&self) -> MutexGuard<'_, HostIpIds> {
+        self.host_ip_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether `id` is a `host_ip` box id this registry minted
+    /// ([`Self::register_host_ip_box`]).
+    #[must_use]
+    pub fn holds_host_ip_id(&self, id: BoxId) -> bool {
+        self.host_ip_id_set().ids.contains(&id)
+    }
+
+    /// Whether a live `host_ip` registration name still answers `id`
+    /// ([`Self::host_ip_id_for`]): the box has not retired, and its creator
+    /// did not withdraw the name.
+    #[must_use]
+    pub fn host_ip_id_is_named(&self, id: BoxId) -> bool {
+        self.host_ip_id_set()
+            .by_name
+            .values()
+            .any(|named| named.id == id)
+    }
+
+    /// The id the live `host_ip` registration under `name` minted
+    /// ([`Self::register_host_ip_box`], BEP-082), so the box's record takes
+    /// the id its grants are sealed under. `None` when no live `host_ip`
+    /// registration uses the name: a `host_ip` box with no credentialed
+    /// upstream registers nothing, and a retired box's name is withdrawn
+    /// ([`Self::retire_host_ip_box`]).
+    #[must_use]
+    pub fn host_ip_id_for(&self, name: &str) -> Option<BoxId> {
+        self.host_ip_id_set()
+            .by_name
+            .get(name)
+            .map(|named| named.id)
+    }
+
+    /// Withdraws the `host_ip` registration name `name` while it still
+    /// answers `id`: the creator's activation failed after it registered,
+    /// so no box will retire under the name ([`Self::retire_host_ip_box`]).
+    /// A name a later registration took answers another id and stays. The
+    /// id stays for the collision check (BEP-082). Returns whether the name
+    /// was withdrawn.
+    pub fn withdraw_host_ip_name(&self, name: &str, id: BoxId) -> bool {
+        let mut ids = self.host_ip_id_set();
+        if ids.by_name.get(name).map(|named| named.id) != Some(id) {
+            return false;
+        }
+        ids.by_name.remove(name);
+        true
+    }
+
     /// [`Self::register_client_box_at`] with the freshly minted `id` it
     /// creates the box as: the one door the collision checks guard, split
     /// out so a test can drive a colliding mint.
@@ -4802,6 +4974,9 @@ impl BoxRegistry {
         drop(rows);
         if self.creations().all().any(|creation| creation.id() == id) {
             return Ok(Some(IdHolder::KeptCreation));
+        }
+        if self.host_ip_id_set().ids.contains(&id) {
+            return Ok(Some(IdHolder::HostIpBox));
         }
         if self
             .attachments
@@ -6091,6 +6266,20 @@ impl BoxRegistry {
         session_id: boxes::SessionId,
         declared: Option<&EgressPolicy>,
     ) -> bool {
+        self.admit_host_ip_box_with_lane(session_id, declared, false)
+    }
+
+    /// [`Self::admit_host_ip_box`] for a box that says whether it declares
+    /// a credentialed upstream (BEP-083). The cohort's lane to the Box
+    /// Egress Proxy's listener is open while one resident member declares
+    /// one
+    /// ([`HostIpBoxRules::declares_credentialed_upstream`]).
+    pub fn admit_host_ip_box_with_lane(
+        &self,
+        session_id: boxes::SessionId,
+        declared: Option<&EgressPolicy>,
+        credentialed_upstream: bool,
+    ) -> bool {
         let policy = match boxes::effective_egress(
             declared,
             boxes::NetworkMode::HostNet,
@@ -6105,6 +6294,7 @@ impl BoxRegistry {
         let resolver = self.subnet.dns_server().octets();
         let rules = HostIpBoxRules {
             session_id,
+            credentialed_upstream,
             egress: EgressRules::from_policy(policy.as_ref(), resolver, node),
             dns_hosts: policy
                 .as_ref()
@@ -6165,6 +6355,7 @@ impl BoxRegistry {
         tracing::info!(
             session = %session_id,
             resident_host_ip_boxes = count,
+            credentialed_upstream,
             mirrored_address = %mirrored,
             "holding the host_ip box's egress rules; box-marked frames from the node \
              address are decided by the resident boxes' rules"
@@ -6197,6 +6388,21 @@ impl BoxRegistry {
                 .set_published(resident.boxes.keys().copied().collect());
         }
         drop(resident);
+        // The box ended, so its registration name no longer answers a mint
+        // ask: a later box under the name is a new creation. The id stays
+        // for the collision check (BEP-082).
+        let id = session_id.to_bytes();
+        let mut ids = self.host_ip_id_set();
+        let named_before = ids.by_name.len();
+        ids.by_name.retain(|_, named| named.id != id);
+        let name_withdrawn = ids.by_name.len() != named_before;
+        drop(ids);
+        if name_withdrawn {
+            tracing::info!(
+                session = %session_id,
+                "withdrew the host_ip box's registration name"
+            );
+        }
         if removed {
             tracing::info!(
                 session = %session_id,
@@ -6245,6 +6451,9 @@ impl BoxRegistry {
         trigger: HostIpReconcileTrigger,
     ) -> HostIpReconcile {
         let mut outcome = HostIpReconcile::default();
+        // The boxes the guest destroyed: their registration names go, as
+        // a retire's do ([`Self::retire_host_ip_box`]).
+        let mut ended: Vec<boxes::SessionId> = Vec::new();
         let mut resident = self
             .host_ip_boxes
             .write()
@@ -6267,6 +6476,8 @@ impl BoxRegistry {
                 // resume can bring it back, so nothing is set aside.
                 if guest.contains_key(&session) {
                     resident.dormant.insert(session, rules);
+                } else {
+                    ended.push(session);
                 }
                 outcome.dropped.push(session);
             }
@@ -6284,6 +6495,13 @@ impl BoxRegistry {
             }
         }
         // A set-aside box the guest no longer lists was destroyed there.
+        ended.extend(
+            resident
+                .dormant
+                .keys()
+                .filter(|session| !guest.contains_key(session))
+                .copied(),
+        );
         resident
             .dormant
             .retain(|session, _| guest.contains_key(session));
@@ -6295,6 +6513,13 @@ impl BoxRegistry {
         } = &mut *resident;
         admitted_at
             .retain(|session, _| held.contains_key(session) || dormant.contains_key(session));
+        if !ended.is_empty() {
+            // The resident set's lock is taken before the ids' lock, as on
+            // the register path.
+            let mut ids = self.host_ip_id_set();
+            ids.by_name
+                .retain(|_, named| !ended.contains(&boxes::SessionId::from_bytes(named.id)));
+        }
         if outcome.is_empty() {
             return outcome;
         }
@@ -7328,6 +7553,9 @@ impl MirrorBinder for TestMirrorBinder {
 #[derive(Debug, PartialEq, Eq)]
 pub struct HostIpBoxRules {
     session_id: boxes::SessionId,
+    /// Whether the box declares a credentialed upstream (BEP-083): the
+    /// lane bit the cohort's lane is the union of.
+    credentialed_upstream: bool,
     egress: EgressRules,
     dns_hosts: Vec<String>,
     allow_subnets: Option<Vec<String>>,
@@ -7338,6 +7566,12 @@ impl HostIpBoxRules {
     #[must_use]
     pub fn session_id(&self) -> boxes::SessionId {
         self.session_id
+    }
+
+    /// Whether the box declares a credentialed upstream (BEP-083).
+    #[must_use]
+    pub fn declares_credentialed_upstream(&self) -> bool {
+        self.credentialed_upstream
     }
 
     /// The box's compiled egress rules, leased to the node's own address.
@@ -7415,6 +7649,32 @@ fn guest_state_name(state: Option<boxes::BoxState>) -> &'static str {
         Some(boxes::BoxState::Stopped) => "stopped",
         Some(boxes::BoxState::Exited) => "exited",
     }
+}
+
+/// The ids minted for `host_ip` boxes ([`BoxRegistry::register_host_ip_box`],
+/// BEP-082). `ids` holds every id the daemon minted, for the collision
+/// check. `by_name` holds the id each live registration name answers: one
+/// entry for each name, withdrawn when the box retires.
+///
+/// `ids` never shrinks, on purpose. A `host_ip` box has no row, so after it
+/// ends no live row holds its id, and a revocation record holds it only if
+/// the proxy revoked a grant. The set is what keeps an ended box's id out
+/// of a later mint's reach ([`BoxRegistry::holds_box_id`]). Its bound is
+/// one 16-byte id for each `host_ip` registration since the VM host daemon
+/// started: a million registrations cost about 16 MB. A restart clears it,
+/// and the proxy's revocation records then carry the ids that still matter.
+#[derive(Debug, Default)]
+struct HostIpIds {
+    ids: BTreeSet<BoxId>,
+    by_name: BTreeMap<String, HostIpName>,
+}
+
+/// The id a live `host_ip` registration name answers, and when the name
+/// was registered ([`HOST_IP_UNADMITTED_NAME_BOUND`]).
+#[derive(Debug, Clone, Copy)]
+struct HostIpName {
+    id: BoxId,
+    since: Instant,
 }
 
 /// The resident `host_ip` boxes ([`BoxRegistry::admit_host_ip_box`]) and the
@@ -13444,6 +13704,56 @@ mod tests {
             registry.table().host_ip_boxes()[0].egress(),
             &held,
             "the box rejoins with the rules the host client admitted"
+        );
+    }
+
+    /// NET-085 with BEP-082: a box a reconcile set aside because it stopped
+    /// keeps its registration name for its resume. A box the guest no
+    /// longer lists ended there, so its name goes, as a retire's does.
+    #[test]
+    fn host_ip_rules_retired_when_guest_no_longer_runs_box_withdraws_only_an_ended_name() {
+        let registry = BoxRegistry::new(SUBNET);
+        let id = registry
+            .register_host_ip_box("held")
+            .expect("a fresh name registers");
+        let session = boxes::SessionId::from_bytes(id);
+        assert!(registry.admit_host_ip_box(session, Some(&one_subnet_policy())));
+
+        let stopped = BTreeMap::from([(session, boxes::BoxState::Stopped)]);
+        let outcome = registry.reconcile_host_ip_boxes(
+            &stopped,
+            registry.host_ip_admit_mark(),
+            HostIpReconcileTrigger::Timer,
+        );
+        assert_eq!(outcome.dropped, vec![session]);
+        assert_eq!(
+            registry.host_ip_id_for("held"),
+            Some(id),
+            "a stopped box keeps its name"
+        );
+        assert!(matches!(
+            registry.register_host_ip_box("held"),
+            Err(AllocationError::NameAlreadyHeld { .. })
+        ));
+
+        let outcome = registry.reconcile_host_ip_boxes(
+            &BTreeMap::new(),
+            registry.host_ip_admit_mark(),
+            HostIpReconcileTrigger::BoxEvent,
+        );
+        assert!(
+            outcome.is_empty(),
+            "a set-aside box leaves no union to drop"
+        );
+        assert!(!registry.holds_host_ip_boxes());
+        assert_eq!(
+            registry.host_ip_id_for("held"),
+            None,
+            "an ended box's name goes"
+        );
+        assert!(
+            registry.holds_host_ip_id(id),
+            "the id stays for the collision check"
         );
     }
 }

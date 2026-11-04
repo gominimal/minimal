@@ -1424,6 +1424,35 @@ enum UploadPlan {
     },
 }
 
+/// The refusal when the VM gave a `host_ip` grant box an id other than the
+/// one its registration minted (BEP-082).
+const REGISTERED_ID_MISMATCH: &str = "No session was created. The VM gave the new session \
+     an id other than the one reserved for it. Run the command again.";
+
+/// Checks that the box the daemon created carries the id a `host_ip`
+/// registration minted, byte for byte (BEP-082). A box with no `host_ip`
+/// registration, or a registration with no id, has nothing to check.
+fn ensure_registered_id(
+    registered: Option<&minimal_client::box_registration::RegisteredWithVmHost>,
+    created: boxes::SessionId,
+) -> anyhow::Result<()> {
+    let Some(minted) = registered
+        .filter(|registration| registration.host_ip)
+        .and_then(|registration| registration.box_id)
+    else {
+        return Ok(());
+    };
+    if minted.to_bytes() == created.to_bytes() {
+        return Ok(());
+    }
+    tracing::warn!(
+        registered_box_id = %minted,
+        created_box_id = %created,
+        "refused a host_ip box whose record id is not its registration's id"
+    );
+    Err(anyhow::anyhow!(REGISTERED_ID_MISMATCH))
+}
+
 pub(crate) async fn activate_box(
     global: &GlobalArgs,
     args: ActivateArgs,
@@ -1789,6 +1818,9 @@ pub(crate) async fn activate_box(
     // row of its own — its name is held in the zone instead (NODATA) once
     // the session is active, below — and a `none` box, or a native daemon
     // with no box table, registers nothing and attaches as it always has.
+    // A `host_ip` box that declares a credentialed upstream registers for
+    // its box id alone (BEP-082): the host mints the id and hands it no
+    // address, and the proxy serves the box's grants under that id.
     // A registration that cannot be made ends the activation here, with its
     // cause: no session exists yet to clean up, and a box that went on to
     // create unregistered would run with no host-side row to decide its
@@ -1841,7 +1873,14 @@ pub(crate) async fn activate_box(
             // The registration is the client's record of the box: the addresses
             // the create carries, and the id the host minted for it (NET-133).
             // The id stays here: the create relays none (BOX-002).
-            carry_registration(&mut request.config, registered.as_ref());
+            // A `host_ip` registration has an id and no row, so it carries
+            // no addresses onto the create.
+            carry_registration(
+                &mut request.config,
+                registered
+                    .as_ref()
+                    .filter(|registration| !registration.host_ip),
+            );
             Ok::<_, anyhow::Error>(registered)
         })
         .await?;
@@ -1964,6 +2003,22 @@ pub(crate) async fn activate_box(
                 .await;
                 return Err(error);
             }
+            // BEP-082: a `host_ip` grant box's grants are sealed under the id
+            // its registration minted. A record under another id is a box
+            // the proxy cannot serve, so the activation ends fail-closed, as
+            // the version check above does.
+            if let Err(error) = ensure_registered_id(registered.as_ref(), created.id) {
+                withdraw_box_row(
+                    control_sock.clone(),
+                    box_name.as_deref(),
+                    request.config.box_addresses,
+                    registered
+                        .as_ref()
+                        .and_then(|registration| registration.box_id),
+                )
+                .await;
+                return Err(error);
+            }
             Ok::<_, anyhow::Error>(created)
         })
         .await?;
@@ -1983,12 +2038,15 @@ pub(crate) async fn activate_box(
     // box runs anything (NET-085): the host gate decides every frame the box
     // sends from the node's own address by the admitted policies, and drops
     // a box's frames that none admits. The guard retires it unless the
-    // session outlives this activation.
-    let mut host_ip_residency = HostIpResidency::admit(
+    // session outlives this activation. The admit carries the box's lane
+    // declaration (BEP-083), so a grant box reaches the proxy's listener
+    // from its first process on.
+    let mut host_ip_residency = HostIpResidency::admit_declaring(
         control_sock.clone(),
         id,
         request.config.network,
         request.config.policy.egress.as_ref(),
+        request.config.policy.credentialed_upstream.is_some(),
     )
     .await;
     ActivationStep::ReportStart
@@ -2314,6 +2372,15 @@ pub(crate) async fn activate_box(
     // prompt tears it down instead of orphaning it in `Pending` — see
     // [`ActivationInterrupt`]. Disarmed once the session is `Active`.
     let interrupt_guard = arm_activation_interrupt(global, id);
+    // A `host_ip` box has no pair on its record, so a Ctrl-C withdraws its
+    // name by the id its registration handed back (BEP-082).
+    if let Some(box_id) = registered
+        .as_ref()
+        .filter(|registration| registration.host_ip)
+        .and_then(|registration| registration.box_id)
+    {
+        interrupt_guard.withdraw_host_ip_name_as(box_id);
+    }
 
     // Upload the project directory to the daemon so the session
     // workspace holds the user's files — `ConfigureLoadout`'s compose
@@ -3171,6 +3238,128 @@ mod tests {
         assert!(
             !attachments.holds_id(id.to_bytes()),
             "the withdrawn box's id is held by no attachment"
+        );
+    }
+
+    /// BEP-082: a `host_ip` grant box whose record takes another id than
+    /// its registration's is refused with this text. A matching id, a box
+    /// with no `host_ip` registration, and a registration with no id pass.
+    #[test]
+    fn host_ip_grant_box_with_another_id_is_refused() {
+        let minted = minimald_rpc::BoxId::from_bytes(*b"0123456789abcdef");
+        let registration =
+            |host_ip: bool, box_id| minimal_client::box_registration::RegisteredWithVmHost {
+                addresses: boxes::BoxAddresses {
+                    switch_address: std::net::Ipv4Addr::UNSPECIFIED,
+                    loopback_address: std::net::Ipv4Addr::UNSPECIFIED,
+                },
+                host_ip,
+                box_id,
+                task_addresses: Vec::new(),
+                lease: None,
+            };
+        let same = boxes::SessionId::from_bytes(minted.to_bytes());
+        let other = boxes::SessionId::from_bytes(*b"fedcba9876543210");
+        let host_ip = registration(true, Some(minted));
+        assert!(ensure_registered_id(Some(&host_ip), same).is_ok());
+        let refused = ensure_registered_id(Some(&host_ip), other)
+            .expect_err("another id ends the activation");
+        assert_eq!(
+            refused.to_string(),
+            "No session was created. The VM gave the new session an id other than the \
+             one reserved for it. Run the command again."
+        );
+        assert!(ensure_registered_id(None, other).is_ok());
+        assert!(ensure_registered_id(Some(&registration(true, None)), other).is_ok());
+        assert!(ensure_registered_id(Some(&registration(false, Some(minted))), other).is_ok());
+    }
+
+    /// BEP-082: a GitHub grant box with `--network host_ip` on a VM host
+    /// registers for a box id, with no address and no row in the host's
+    /// address table. With that id the proxy serves it, so the grant check
+    /// gives its id and its `host_ip` stance, not the refusal that says no
+    /// proxy serves boxes on this machine. A `host_ip` box that declares no
+    /// credentialed upstream registers nothing.
+    #[tokio::test]
+    async fn host_ip_grant_box_on_vm_host_is_not_refused_as_unserved() {
+        use minimal_client::box_registration::register_box_for_activation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let host_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        let sock_path = host_dir.join("control.sock");
+        let registry = minvmd::box_registry::BoxRegistry::new(switch::SwitchSubnet::default());
+        let _server = minvmd::control::spawn(
+            sock_path.clone(),
+            registry.clone(),
+            minvmd::net::answerer::AnswererStatus::allocating_for_tests("host-ip-grant-node"),
+            minvmd::control::ProxyPublishStatus::default(),
+        )
+        .expect("the control server binds its socket");
+
+        let grant_policy = boxes::BoxPolicy {
+            credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
+            ..boxes::BoxPolicy::default()
+        };
+        let registered = register_box_for_activation(
+            paths::HostKind::Minvmd,
+            Some(dir.path()),
+            boxes::NetworkMode::HostNet,
+            "agent",
+            &grant_policy,
+        )
+        .await
+        .expect("the control server answers the registration")
+        .expect("a host_ip grant box on a VM host registers");
+        assert!(registered.host_ip);
+        assert_eq!(registered.row_addresses(), None, "the box has no row");
+        assert!(registered.lease.is_none(), "no row, so no lease to hold");
+        let id = registered.box_id.expect("the host minted an id");
+        assert!(registry.holds_host_ip_id(id.to_bytes()));
+        assert!(
+            registry.table().rows().is_empty(),
+            "the registration put no row in the address table"
+        );
+
+        let facts = proxy_box_facts(
+            &["GH_TOKEN".to_owned()],
+            &[],
+            Some(id.to_string()),
+            boxes::NetworkMode::HostNet,
+        )
+        .expect("a host_ip grant box with an id is served");
+        assert_eq!(
+            facts,
+            Some((id.to_string(), bep::boxes::Stance::HostIp)),
+            "the grant is served under the minted id and the host_ip stance"
+        );
+
+        // A host_ip box that declares no upstream needs no id.
+        assert!(
+            register_box_for_activation(
+                paths::HostKind::Minvmd,
+                Some(dir.path()),
+                boxes::NetworkMode::HostNet,
+                "plain",
+                &boxes::BoxPolicy::default(),
+            )
+            .await
+            .expect("nothing to register is no failure")
+            .is_none()
+        );
+        // With no id, the refusal still prints: no proxy serves the box.
+        let refused = proxy_box_facts(
+            &["GH_TOKEN".to_owned()],
+            &[],
+            None,
+            boxes::NetworkMode::HostNet,
+        )
+        .expect_err("no box id, so no proxy serves the box");
+        assert!(
+            refused
+                .to_string()
+                .starts_with("Cannot create the box: it declares the GitHub grant GH_TOKEN, and "),
+            "{refused}"
         );
     }
 
