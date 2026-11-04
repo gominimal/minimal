@@ -1463,6 +1463,10 @@ pub(crate) struct StopExecResponse {
     pub(crate) exit_code: Option<i32>,
     /// Why the exec ended, as its `exec_exited` event spells it.
     pub(crate) reason: String,
+    /// Set when the exec had already ended before the stop, so the stop
+    /// sent no signal.
+    #[serde(default)]
+    pub(crate) already_ended: bool,
 }
 
 impl OneshotSshRpc for StopExec {
@@ -1472,16 +1476,20 @@ impl OneshotSshRpc for StopExec {
 }
 
 /// `StopExec`: ends one exec and leaves its box running (BOX-151).
-async fn serve_stop_exec(c: RuChannel<Msg>) -> Result<(), ConnectionError> {
+async fn serve_stop_exec(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), ConnectionError> {
     StopExec
         .handle_channel(c, async |req: StopExecRequest| {
-            Ok(stop_exec_answer(req.box_id, &req.exec_id).await)
+            let state_dir = s.minimal_state_dir().await;
+            Ok(stop_exec_answer(&state_dir, req.box_id, &req.exec_id).await)
         })
         .await
 }
 
-/// The `StopExec` answer for exec `exec_id` in box `box_id`.
+/// The `StopExec` answer for exec `exec_id` in box `box_id`. The daemon's
+/// state directory `state_dir` holds the box's events, which answer for an
+/// exec that a daemon before a restart started.
 pub(crate) async fn stop_exec_answer(
+    state_dir: &paths::DaemonAbsPath,
     box_id: SessionId,
     exec_id: &str,
 ) -> Errorable<StopExecResponse> {
@@ -1491,18 +1499,39 @@ pub(crate) async fn stop_exec_answer(
             error: format!("{} is not an exec id.", exec_id.trim()),
         };
     };
-    match crate::exec::stop_exec(box_id, &id).await {
-        Some(exit) => {
+    // The box's events are read only for an exec with no live entry, so
+    // the stop of a live exec does not wait on the disk.
+    let answer = match crate::exec::stop_exec(box_id, &id).await {
+        Some(answer) => Some(answer),
+        None => match stored_exec_stop(state_dir, box_id, &id).await {
+            Ok(answer) => answer,
+            Err(error) => {
+                tracing::warn!(%box_id, exec_id = %id, %error, "exec stop: could not read the box's events");
+                return Errorable::Err {
+                    error: format!(
+                        "The events of box {box_id} could not be read, so the end of exec {id} is not known: {error}"
+                    ),
+                };
+            }
+        },
+    };
+    match answer {
+        Some(crate::exec::ExecStopAnswer {
+            exit,
+            already_ended,
+        }) => {
             tracing::info!(
                 %box_id,
                 exec_id = %id,
                 exit_code = exit.code,
                 reason = exit.reason.name(),
+                already_ended,
                 "exec stop: the exec ended"
             );
             Errorable::Ok(StopExecResponse {
                 exit_code: exit.code,
                 reason: exit.reason.name().to_string(),
+                already_ended,
             })
         }
         None => {
@@ -1512,6 +1541,36 @@ pub(crate) async fn stop_exec_answer(
             }
         }
     }
+}
+
+/// The stop answer for exec `id` of box `box_id` when this daemon holds no
+/// entry for it: how the box's events record its end. `None` when the box
+/// or its events record no end of that exec. An error when the box's
+/// index or record cannot be read.
+async fn stored_exec_stop(
+    state_dir: &paths::DaemonAbsPath,
+    box_id: SessionId,
+    id: &minimald_rpc::exec::ExecId,
+) -> std::io::Result<Option<crate::exec::ExecStopAnswer>> {
+    let state_dir = state_dir.clone();
+    let id = id.clone();
+    let found = crate::traced::spawn_blocking(move || {
+        let dir = boxes::store::BoxDir::find(&state_dir, &box_id)?;
+        Ok::<_, std::io::Error>(dir.and_then(|dir| {
+            let events = dir.events_path();
+            let exit = crate::exec::stored_exec_exit(events.as_utf8_path().parent()?, &id);
+            if exit.is_some() {
+                tracing::info!(exec_id = %id, %box_id, "exec stop: the box's events record that the exec already ended");
+            }
+            exit
+        }))
+    })
+    .await
+    .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+    Ok(found?.map(|exit| crate::exec::ExecStopAnswer {
+        exit,
+        already_ended: true,
+    }))
 }
 
 /// The `StopBox` answer for how a stop ended: the record's exit code and
@@ -3518,7 +3577,7 @@ pub async fn handle_ssh_rpc(
         RenameSession::NAME => serve!(serve_rename_session(s, channel)),
         DestroySession::NAME => serve!(serve_destroy_session(s, channel)),
         minimald_rpc::StopBox::NAME => serve!(serve_stop_box(s, channel)),
-        StopExec::NAME => serve!(serve_stop_exec(channel)),
+        StopExec::NAME => serve!(serve_stop_exec(s, channel)),
         minimald_rpc::ReapBox::NAME => serve!(serve_reap_box(s, channel)),
         minimald_rpc::PruneBoxes::NAME => serve!(serve_prune_boxes(s, channel)),
         minimald_rpc::ListBoxes::NAME => serve!(serve_list_boxes(s, channel)),

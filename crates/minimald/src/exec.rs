@@ -546,18 +546,13 @@ async fn run_attached_exec(
         principal: conn_username.clone(),
         argv: argv.clone(),
     };
-    if let Some(exec_box) = &exec_box {
-        exec_box.write_event(
-            boxes::events::BoxEventType::ExecStarted,
-            &exec_id,
-            ExecMode::Attached,
-            &facts,
-            None,
-        );
-    }
     // BOX-151: an attached exec is known by its id while it runs, so a stop
     // or a wait by that id finds it. It has no transcript. The path only
     // ties the entry to the box's directory, which a reap removes.
+    // The stop is registered before the entry, and both before
+    // `exec_started`. A stop of the id that a follower of the events sees
+    // first then finds the exec and ends it (BOX-151).
+    let stop = register_stop(&exec_id);
     let entry = exec_box.as_ref().map(|exec_box| {
         let transcript = boxes::store::exec_transcript_path(&exec_box.dir, exec_id.as_str());
         if let Some(dir) = transcript.parent()
@@ -575,7 +570,15 @@ async fn run_attached_exec(
         register_exec(Arc::clone(&entry));
         entry
     });
-    let stop = register_stop(&exec_id);
+    if let Some(exec_box) = &exec_box {
+        exec_box.write_event(
+            boxes::events::BoxEventType::ExecStarted,
+            &exec_id,
+            ExecMode::Attached,
+            &facts,
+            None,
+        );
+    }
     let timed_out = Arc::new(AtomicBool::new(false));
     let task = ExecTask {
         conn,

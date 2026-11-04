@@ -1122,6 +1122,10 @@ impl ExecBox {
                 .data
                 .insert(exec_data::REASON.into(), exit.reason.name().into());
         }
+        #[cfg(test)]
+        if kind == boxes::events::BoxEventType::ExecStarted {
+            stop_at_start::observe(self.record.id, id);
+        }
         let path = self.dir.join(boxes::events::EVENTS_FILE);
         if let Err(error) = boxes::store::append_event_at(&path, &event) {
             tracing::warn!(
@@ -1271,6 +1275,10 @@ pub(super) fn start_managed_exec_within(
         }
         ExecMode::Detached | ExecMode::Attached => (None, None),
     };
+    // The stop is registered before the entry, and both before
+    // `exec_started`. A stop of the id that a follower of the events sees
+    // first then finds the exec and ends it (BOX-151).
+    let stop = register_stop(&id);
     let entry = Arc::new(ExecEntry::new(
         id.clone(),
         exec_box.record.id,
@@ -1279,7 +1287,6 @@ pub(super) fn start_managed_exec_within(
         terminal,
     ));
     register_exec(Arc::clone(&entry));
-    let stop = register_stop(&id);
     exec_box.write_event(
         boxes::events::BoxEventType::ExecStarted,
         &id,
@@ -1395,27 +1402,92 @@ pub(crate) fn forget_stop(id: &ExecId) {
     STOPS.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
 }
 
-/// Stops the exec `id` of the box `box_id` and waits for its end (BOX-151):
-/// SIGTERM to its process group, a wait, then SIGKILL, through
-/// [`Process::start_kill`] of the injection shim. Only that exec ends. The
-/// box and its other execs keep running. An exec that already ended
-/// answers with its exit. `None` when this daemon started no exec `id` in
-/// that box.
-pub(crate) async fn stop_exec(box_id: SessionId, id: &ExecId) -> Option<ExecExit> {
+/// How a stop of one exec ended (BOX-151).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExecStopAnswer {
+    /// How the exec ended.
+    pub(crate) exit: ExecExit,
+    /// Set when the exec had already ended before the stop, so the stop
+    /// sent no signal.
+    pub(crate) already_ended: bool,
+}
+
+/// Fires the stop of the exec `id` of the box `box_id` (BOX-151). Answers
+/// the exec's entry, and whether a stop token was still there to fire.
+/// `None` when this daemon holds no entry for that exec.
+fn fire_stop(box_id: SessionId, id: &ExecId) -> Option<(Arc<ExecEntry>, bool)> {
     let entry = find_exec(box_id, id)?;
     let token = STOPS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(id)
         .cloned();
-    match token {
+    let fired = match token {
         Some(token) => {
             tracing::info!(exec_id = %id, %box_id, "exec stop requested");
             token.cancel();
+            true
         }
-        None => tracing::info!(exec_id = %id, %box_id, "exec stop: the exec already ended"),
+        None => {
+            tracing::info!(exec_id = %id, %box_id, "exec stop: the exec already ended");
+            false
+        }
+    };
+    Some((entry, fired))
+}
+
+/// Stops the exec `id` of the box `box_id` and waits for its end (BOX-151):
+/// SIGTERM to its process group, a wait, then SIGKILL, through
+/// [`Process::start_kill`] of the injection shim. Only that exec ends. The
+/// box and its other execs keep running. An exec that already ended
+/// answers with its exit. `None` when this daemon holds no entry for exec
+/// `id` in that box. The caller then reads the box's events for an exec
+/// that a daemon before a restart started, with [`stored_exec_exit`].
+pub(crate) async fn stop_exec(box_id: SessionId, id: &ExecId) -> Option<ExecStopAnswer> {
+    let (entry, fired) = fire_stop(box_id, id)?;
+    Some(ExecStopAnswer {
+        exit: entry.wait().await,
+        already_ended: !fired,
+    })
+}
+
+/// A test hook that stops an exec at the earliest point its id is
+/// observable: when its `exec_started` event is written (BOX-151).
+#[cfg(test)]
+pub(crate) mod stop_at_start {
+    use super::*;
+
+    /// The boxes whose execs the hook stops, and for each exec it saw,
+    /// whether the stop found the exec and fired.
+    static ARMED: std::sync::LazyLock<
+        std::sync::Mutex<BTreeMap<SessionId, BTreeMap<ExecId, bool>>>,
+    > = std::sync::LazyLock::new(Default::default);
+
+    /// Stops every exec of `box_id` as its `exec_started` is written.
+    pub(crate) fn arm(box_id: SessionId) {
+        ARMED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(box_id, BTreeMap::new());
     }
-    Some(entry.wait().await)
+
+    /// The execs of `box_id` the hook saw, and whether each stop fired.
+    pub(crate) fn seen(box_id: SessionId) -> BTreeMap<ExecId, bool> {
+        ARMED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&box_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(super) fn observe(box_id: SessionId, id: &ExecId) {
+        let mut armed = ARMED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(seen) = armed.get_mut(&box_id) {
+            let fired = matches!(fire_stop(box_id, id), Some((_, true)));
+            seen.insert(id.clone(), fired);
+        }
+    }
 }
 
 /// Waits for `process` as [`wait_with_timeout`] does, and ends it when

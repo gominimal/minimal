@@ -3844,6 +3844,8 @@ wait"#;
         .await
         .expect("the stop ends the exec")
         .expect("the stop finds the exec");
+        assert!(!exit.already_ended, "the stop ended a running exec");
+        let exit = exit.exit;
         assert_eq!(exit.code, None, "a signal ended the exec");
         assert_eq!(
             std::fs::read_to_string(&term).unwrap_or_default(),
@@ -3882,7 +3884,8 @@ wait"#;
         let again = super::super::stop_exec(box_id, &entry.id)
             .await
             .expect("the ended exec is still known");
-        assert_eq!(again, exit);
+        assert_eq!(again.exit, exit);
+        assert!(again.already_ended, "the second stop sent no signal");
         // An exec of another box is not found.
         assert!(
             super::super::stop_exec(boxes::SessionId::mint(), &other.id)
@@ -3890,6 +3893,88 @@ wait"#;
                 .is_none()
         );
         super::super::stop_exec(box_id, &other.id).await;
+    }
+
+    /// BOX-151: a stop at the earliest point an exec's id is observable,
+    /// as its `exec_started` event is written, finds the exec and ends it.
+    /// The stop is registered before the event, in every managed mode.
+    #[tokio::test]
+    async fn stop_exec_ends_process_group_at_the_first_sight_of_a_managed_exec() {
+        for mode in [ExecMode::Detached, ExecMode::Tty] {
+            let disk = box_on_disk();
+            let box_id = disk.exec_box.record.id;
+            super::super::stop_at_start::arm(box_id);
+            let entry = disk.start(mode, &["sleep", "600"], None, false);
+            let seen = super::super::stop_at_start::seen(box_id);
+            assert_eq!(
+                seen.get(&entry.id),
+                Some(&true),
+                "{mode:?}: the stop at exec_started found the exec: {seen:?}"
+            );
+            let exit = tokio::time::timeout(Duration::from_secs(10), entry.wait())
+                .await
+                .unwrap_or_else(|_| panic!("{mode:?}: the stop ended the exec"));
+            assert_eq!(exit.code, None, "{mode:?}: a signal ended the exec");
+        }
+    }
+
+    /// BOX-151: a stop of an exec that a daemon before a restart started
+    /// answers from the box's stored `exec_exited` event that the exec
+    /// already ended, with its code. Only an id that no event names gets
+    /// the "no exec" answer.
+    #[tokio::test]
+    async fn stop_exec_ends_process_group_or_answers_a_stored_end() {
+        let disk = box_on_disk();
+        let box_id = disk.exec_box.record.id;
+        let state_dir = paths::DaemonAbsPath::try_new(disk._tmp.path().to_str().unwrap()).unwrap();
+        let ended = mint_exec_id();
+        let facts = ExecFacts::default();
+        disk.exec_box.write_event(
+            BoxEventType::ExecStarted,
+            &ended,
+            ExecMode::Detached,
+            &facts,
+            None,
+        );
+        disk.exec_box.write_event(
+            BoxEventType::ExecExited,
+            &ended,
+            ExecMode::Detached,
+            &facts,
+            Some(super::super::ExecExit {
+                code: Some(7),
+                reason: ExecExitReason::Exited,
+            }),
+        );
+        assert!(
+            find_exec(box_id, &ended).is_none(),
+            "no live entry holds it"
+        );
+
+        let answer = crate::rpc::stop_exec_answer(&state_dir, box_id, ended.as_str()).await;
+        assert_eq!(
+            answer,
+            minimald_rpc::Errorable::Ok(crate::rpc::StopExecResponse {
+                exit_code: Some(7),
+                reason: "exited".to_string(),
+                already_ended: true,
+            })
+        );
+
+        let unknown = mint_exec_id();
+        let answer = crate::rpc::stop_exec_answer(&state_dir, box_id, unknown.as_str()).await;
+        assert!(
+            matches!(&answer, minimald_rpc::Errorable::Err { error } if error.contains("has no exec")),
+            "{answer:?}"
+        );
+        // The stored end of one box does not answer for another box.
+        let answer =
+            crate::rpc::stop_exec_answer(&state_dir, boxes::SessionId::mint(), ended.as_str())
+                .await;
+        assert!(
+            matches!(&answer, minimald_rpc::Errorable::Err { error } if error.contains("has no exec")),
+            "{answer:?}"
+        );
     }
 
     /// BOX-151: a tty exec leads its own session, and a shell with job
@@ -4925,6 +5010,7 @@ mod end_to_end {
             .expect("the box is live");
         let exec_box = super::super::ExecBox::of(&handle).await.unwrap();
         let events_path = exec_box.dir.join(boxes::events::EVENTS_FILE);
+        let state_dir = server.state.minimal_state_dir().await;
 
         let session_str = session_id.to_string();
         let request = ExecRequest::Exec(ExecSpec {
@@ -4970,7 +5056,7 @@ mod end_to_end {
 
         let answer = tokio::time::timeout(
             crate::nsenter::SHIM_ESCALATION + std::time::Duration::from_secs(10),
-            crate::rpc::stop_exec_answer(session_id, &exec_id),
+            crate::rpc::stop_exec_answer(&state_dir, session_id, &exec_id),
         )
         .await
         .expect("the stop ends the exec");
@@ -4985,10 +5071,62 @@ mod end_to_end {
             .expect("the channel reports the end");
 
         let unknown = super::super::mint_exec_id();
-        let answer = crate::rpc::stop_exec_answer(session_id, unknown.as_str()).await;
+        let answer = crate::rpc::stop_exec_answer(&state_dir, session_id, unknown.as_str()).await;
         assert!(
             matches!(&answer, minimald_rpc::Errorable::Err { error } if error.contains("has no exec")),
             "{answer:?}"
+        );
+        assert_eq!(
+            handle.record().await.unwrap().status,
+            boxes::BoxState::Active,
+            "the box keeps running"
+        );
+    }
+
+    /// BOX-151: a stop of a live attached exec at the earliest point its id
+    /// is observable, as its `exec_started` event is written, finds the
+    /// exec and ends it. The client sees the end, and the box runs on.
+    #[tokio::test]
+    async fn stop_exec_ends_process_group_at_the_first_sight_of_an_attached_exec() {
+        use minimald_rpc::exec::{ExecMode, ExecSpec};
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+        let handle = server
+            .state
+            .sessions_manager()
+            .await
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("the box is live");
+        super::super::stop_at_start::arm(session_id);
+
+        let session_str = session_id.to_string();
+        let request = ExecRequest::Exec(ExecSpec {
+            argv: vec!["sleep".to_string(), "600".to_string()],
+            mode: ExecMode::Attached,
+            timeout_secs: None,
+        });
+        tokio::time::timeout(
+            crate::nsenter::SHIM_ESCALATION + std::time::Duration::from_secs(10),
+            client.exec(
+                &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                false,
+                &request.encode(),
+                &[],
+            ),
+        )
+        .await
+        .expect("the stop at exec_started ends the exec")
+        .expect("the channel reports the end");
+
+        let seen = super::super::stop_at_start::seen(session_id);
+        assert_eq!(seen.len(), 1, "one exec started: {seen:?}");
+        assert!(
+            seen.values().all(|fired| *fired),
+            "the stop at exec_started found the exec: {seen:?}"
         );
         assert_eq!(
             handle.record().await.unwrap().status,
