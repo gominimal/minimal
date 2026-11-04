@@ -30,6 +30,7 @@ pub(crate) use attach::*;
 pub use create::*;
 pub(crate) use exec::*;
 pub(crate) use hooks::*;
+pub use lifecycle::BoxRunningRefusal;
 pub(crate) use lifecycle::*;
 pub use list::*;
 pub use policy::*;
