@@ -1,6 +1,7 @@
 //! `min session destroy`, `stop` and `rename`: the box lifecycle helpers.
-//! `min box stop` (BOX-013, BCLI-059) and `min box rm` (BOX-019, BCLI-060,
-//! BCLI-004) live here too.
+//! `min box stop` (BOX-013, BCLI-059), `min box rm` (BOX-019, BCLI-060,
+//! BCLI-004), `min box rename` (BOX-010, BCLI-058) and `min box prune`
+//! (BOX-021, BCLI-061, BCLI-005) live here too.
 
 use super::*;
 
@@ -772,6 +773,300 @@ pub(crate) async fn rm_listed_box(
     })
 }
 
+/// The daemon's refusal of a rename (BOX-010): a running box on the host
+/// holds the name, or the name is reserved. The text is the daemon's, and
+/// names the holder. `min box rename` ends with exit 2 on it (BCLI-058).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoxRenameRefusal {
+    pub(crate) message: String,
+}
+
+impl BoxRenameRefusal {
+    /// The exit code `min box rename` ends with on this refusal.
+    pub const EXIT_CODE: u8 = 2;
+
+    /// The lead of the daemon's text when a running box holds the name, as
+    /// `boxes::box_name::RenameRefusal::HeldByRunning` spells it.
+    const HELD_LEAD: &'static str = "The running session `";
+
+    /// The refusal a `RenameSession` error carries, or `None` when the
+    /// error is any other failure.
+    fn from_error(error: &str) -> Option<Self> {
+        let reserved = boxes::box_name::RenameRefusal::Reserved.to_string();
+        let held = error.starts_with(Self::HELD_LEAD) && error.contains(" holds the name `");
+        (held || error == reserved).then(|| Self {
+            message: error.to_owned(),
+        })
+    }
+}
+
+impl std::fmt::Display for BoxRenameRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for BoxRenameRefusal {}
+
+/// `min box rename <box> <name>`: renames the box as BOX-010 defines.
+/// `<box>` is a box address, looked up on every local host.
+pub async fn cmd_box_rename(global: &GlobalArgs, args: BoxRenameArgs) -> Result<(), anyhow::Error> {
+    ensure_daemon(global)?;
+    let hosts = crate::cmd::list::local_hosts(global)?;
+    let resolved = resolve_box_on_hosts(hosts, &args.target, "box rename").await?;
+    let mut client = gated_box_host_client(&resolved.host).await?;
+    // The record says whether the box holds its name in the VM host's zone,
+    // which the hold then moves to the new name.
+    let record = get_session_record(&mut client, &resolved.box_id.to_string())
+        .await
+        .ok()
+        .and_then(|resp| resp.record);
+    let mut out = std::io::stdout().lock();
+    rename_listed_box(
+        &mut client,
+        &mut out,
+        resolved.box_id,
+        &args.target,
+        &args.new_name,
+    )
+    .await?;
+    if let Some(record) = record.filter(holds_name) {
+        let control_sock = box_host_control_sock(&resolved.host);
+        release_held_box_name(
+            control_sock.clone(),
+            record.id,
+            record.name.as_deref(),
+            None,
+        )
+        .await;
+        hold_box_name_with_vm_host(control_sock, &args.new_name, Some(record.id), true).await;
+    }
+    Ok(())
+}
+
+/// Renames the box `id`, which the address `target` resolved to, to
+/// `new_name`, as BOX-010 defines. Writes one line to `out`. The daemon's
+/// refusal returns as a [`BoxRenameRefusal`].
+pub(crate) async fn rename_listed_box(
+    client: &mut client::Client,
+    out: &mut impl std::io::Write,
+    id: boxes::SessionId,
+    target: &str,
+    new_name: &str,
+) -> Result<(), anyhow::Error> {
+    use minimald_rpc::{Errorable, RenameSession, RenameSessionRequest};
+
+    crate::output::record_box_id(&id.to_string());
+    let answer = client
+        .oneshot_rpc::<RenameSession>(RenameSessionRequest {
+            id,
+            new_name: new_name.to_owned(),
+        })
+        .await
+        .context("RenameSession RPC failed")?;
+    match answer {
+        Errorable::Ok(_) => {
+            tracing::info!(verb = "box rename", box_id = %id, outcome = "renamed");
+            writeln!(out, "Renamed {target} to {new_name}.")?;
+            Ok(())
+        }
+        Errorable::Err { error } => {
+            tracing::info!(verb = "box rename", box_id = %id, outcome = "refused", "{error}");
+            match BoxRenameRefusal::from_error(&error) {
+                Some(refusal) => Err(refusal.into()),
+                None => Err(box_rpc_error(target, error)),
+            }
+        }
+    }
+}
+
+/// The refusal of `min box prune` off a terminal without `--yes`
+/// (BCLI-005). It ends the command with exit 2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PruneNeedsYes;
+
+impl PruneNeedsYes {
+    /// The exit code `min box prune` ends with on this refusal.
+    pub const EXIT_CODE: u8 = 2;
+}
+
+impl std::fmt::Display for PruneNeedsYes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "Prune removes boxes. Pass --yes to confirm, or --dry-run to see what it would remove.",
+        )
+    }
+}
+
+impl std::error::Error for PruneNeedsYes {}
+
+/// How `min box prune` proceeds past its confirmation gate.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PruneGate {
+    /// Prune without asking: `--yes`.
+    Proceed,
+    /// Ask on the terminal first, default No.
+    Confirm,
+}
+
+/// Decides whether `min box prune` prunes, asks, or refuses with
+/// [`PruneNeedsYes`]. Off a terminal, or under `--no-input`, nothing can
+/// answer the question, so only `--yes` prunes.
+pub(crate) fn prune_gate(
+    yes: bool,
+    no_input: bool,
+    stdin_is_terminal: bool,
+) -> Result<PruneGate, PruneNeedsYes> {
+    match (yes, !no_input && stdin_is_terminal) {
+        (true, _) => Ok(PruneGate::Proceed),
+        (false, true) => Ok(PruneGate::Confirm),
+        (false, false) => Err(PruneNeedsYes),
+    }
+}
+
+/// The `PruneBoxes` request for `min box prune`: BOX-021's `older-than`
+/// selector for `--older-than`, and its `parent` selector for `--parent`,
+/// which the caller resolved to the box `parent`.
+pub(crate) fn box_prune_request(
+    older_than: Option<std::time::Duration>,
+    parent: Option<boxes::SessionId>,
+) -> minimald_rpc::PruneBoxesRequest {
+    minimald_rpc::PruneBoxesRequest {
+        older_than_secs: older_than.map(|age| age.as_secs()),
+        parent,
+    }
+}
+
+/// `min box prune [--older-than <d>] [--parent <box>] [--yes]`: removes
+/// the stopped and exited boxes that match, as BOX-021 defines. With
+/// `--parent`, only the host that keeps that box is pruned. Without it,
+/// every local host that is running is pruned.
+pub async fn cmd_box_prune(global: &GlobalArgs, args: BoxPruneArgs) -> Result<(), anyhow::Error> {
+    let gate = prune_gate(args.yes, global.no_input, std::io::stdin().is_terminal())
+        .inspect_err(|_| tracing::info!(verb = "box prune", outcome = "refused", "no --yes"))?;
+    if gate == PruneGate::Confirm {
+        let question = match &args.parent {
+            Some(parent) => format!("Remove every stopped or exited child box of {parent}?"),
+            None => "Remove every stopped or exited box?".to_owned(),
+        };
+        if !confirm(&question, false)? {
+            tracing::info!(verb = "box prune", outcome = "declined");
+            println!("Nothing was removed.");
+            return Ok(());
+        }
+    }
+    ensure_daemon(global)?;
+    let hosts = crate::cmd::list::local_hosts(global)?;
+    let (hosts, parent) = match &args.parent {
+        Some(parent) => {
+            let resolved = resolve_box_on_hosts(hosts, parent, "box prune").await?;
+            (vec![resolved.host], Some(resolved.box_id))
+        }
+        None => (hosts, None),
+    };
+    let request = box_prune_request(args.older_than, parent);
+    let mut out = std::io::stdout().lock();
+    let (mut reaped, mut failed) = (0usize, 0usize);
+    for host in hosts {
+        let client = if host.selected || parent.is_some() {
+            Some(gated_box_host_client(&host).await?)
+        } else {
+            match client::Client::probe(&host.sock).await {
+                Ok(mut client) => {
+                    client::ensure_version_match(&mut client).await?;
+                    Some(client)
+                }
+                Err(client::ProbeRefusal::NotRunning) => None,
+                Err(client::ProbeRefusal::Unreachable(e)) => {
+                    return Err(e.context(format!("Could not reach host {}.", host.host)));
+                }
+            }
+        };
+        let Some(mut client) = client else { continue };
+        let pruned = prune_host(&mut client, &host, &mut out, request.clone()).await?;
+        reaped += pruned.0;
+        failed += pruned.1;
+    }
+    tracing::info!(verb = "box prune", reaped, failed, outcome = "pruned");
+    if failed > 0 {
+        bail!(
+            "Prune could not remove {failed} of {} boxes.",
+            reaped + failed
+        );
+    }
+    if reaped == 0 {
+        writeln!(
+            out,
+            "No stopped or exited box matched, so nothing was removed."
+        )?;
+    }
+    Ok(())
+}
+
+/// Prunes the host `client` serves with `request`, writes one line for each
+/// box it removed to `out` and one line for each it did not to stderr, and
+/// retires the row or the name hold each removed box leaves on the VM host
+/// daemon. Returns how many boxes it removed and how many it did not.
+pub(crate) async fn prune_host(
+    client: &mut client::Client,
+    host: &crate::cmd::list::LocalHost,
+    out: &mut impl std::io::Write,
+    request: minimald_rpc::PruneBoxesRequest,
+) -> Result<(usize, usize), anyhow::Error> {
+    use minimald_rpc::{Errorable, PruneBoxes};
+
+    // The records of the boxes a prune can remove carry the pair each box's
+    // registration handed back, which the withdrawal after the prune
+    // presents. The prune reaps the boxes all the same without them.
+    let mut addresses = std::collections::HashMap::new();
+    if host.provider == crate::cmd::list::LOCAL_MINVMD_PROVIDER {
+        for entry in list_box_records(client, None).await.unwrap_or_default() {
+            if entry.state == "stopped" || entry.state == "exited" {
+                let record = get_session_record(client, &entry.box_id.to_string())
+                    .await
+                    .ok()
+                    .and_then(|resp| resp.record);
+                addresses.insert(entry.box_id, record.and_then(|r| r.box_addresses));
+            }
+        }
+    }
+    let pruned = match client
+        .oneshot_rpc::<PruneBoxes>(request)
+        .await
+        .context("PruneBoxes RPC failed")?
+    {
+        Errorable::Ok(pruned) => pruned,
+        Errorable::Err { error } => bail!("{error}"),
+    };
+    let control_sock = box_host_control_sock(host);
+    for entry in &pruned.reaped {
+        let name = entry.name.as_deref();
+        let box_addresses = addresses.get(&entry.box_id).copied().flatten();
+        withdraw_box_row(control_sock.clone(), name, box_addresses, None).await;
+        release_held_box_name(control_sock.clone(), entry.box_id, name, box_addresses).await;
+    }
+    write_prune_lines(out, &pruned)?;
+    Ok((pruned.reaped.len(), pruned.failed.len()))
+}
+
+/// The lines `min box prune` prints for one host's answer `pruned`: one on
+/// `out` for each box it removed, and one on stderr for each it did not.
+fn write_prune_lines(
+    out: &mut impl std::io::Write,
+    pruned: &minimald_rpc::PruneBoxesResponse,
+) -> std::io::Result<()> {
+    for entry in &pruned.reaped {
+        match &entry.name {
+            Some(name) => writeln!(out, "Removed {name} ({}).", entry.box_id)?,
+            None => writeln!(out, "Removed {}.", entry.box_id)?,
+        }
+    }
+    for failure in &pruned.failed {
+        eprintln!("Could not remove {}: {}", failure.box_id, failure.error);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1014,6 +1309,172 @@ mod tests {
         assert_eq!(
             listed_state(&mut client, "web").await.as_deref(),
             Some("running")
+        );
+    }
+
+    // BCLI-058: `min box rename` renames the box as BOX-010 defines. A name
+    // a running box holds is refused with exit 2, and the refusal names the
+    // holder. The reserved name `self` is refused too.
+    #[tokio::test]
+    async fn box_rename_renames_as_box_010() {
+        let log = minimald::test_harness::captured_log();
+        let (_server, _dir, _project, mut client) = daemon_with_boxes(&["web", "api"]).await;
+
+        let web = listed_id(&mut client, "web").await;
+        let mut out = Vec::new();
+        rename_listed_box(&mut client, &mut out, web, "web", "front")
+            .await
+            .expect("the rename succeeds");
+        assert_eq!(String::from_utf8(out).unwrap(), "Renamed web to front.\n");
+        assert_eq!(listed_state(&mut client, "web").await, None);
+        assert_eq!(listed_id(&mut client, "front").await, web);
+        assert!(
+            log.contents().contains("renamed a box"),
+            "{}",
+            log.contents()
+        );
+
+        // The running box `front` holds the name, so `api` cannot take it.
+        let api = listed_id(&mut client, "api").await;
+        let mut out = Vec::new();
+        let err = rename_listed_box(&mut client, &mut out, api, "api", "front")
+            .await
+            .expect_err("a held name is refused");
+        let refusal = err
+            .downcast_ref::<BoxRenameRefusal>()
+            .unwrap_or_else(|| panic!("the refusal is typed: {err:#}"));
+        assert_eq!(BoxRenameRefusal::EXIT_CODE, 2);
+        let text = refusal.to_string();
+        assert!(text.contains(&web.to_string()), "names the holder: {text}");
+        assert!(text.contains("`front`"), "names the holder: {text}");
+        assert!(out.is_empty());
+        assert_eq!(listed_id(&mut client, "api").await, api);
+
+        // `self` is reserved.
+        let err = rename_listed_box(&mut client, &mut Vec::new(), api, "api", "self")
+            .await
+            .expect_err("`self` is refused");
+        assert!(err.downcast_ref::<BoxRenameRefusal>().is_some(), "{err:#}");
+
+        // Any other daemon error is not the refusal.
+        assert_eq!(
+            BoxRenameRefusal::from_error("session is already named `api`"),
+            None
+        );
+    }
+
+    // BCLI-061: `min box prune` asks for BOX-021's prune, with the
+    // `older-than` selector for `--older-than` and the `parent` selector for
+    // `--parent`. A running box is never removed.
+    #[tokio::test]
+    async fn box_prune_flags_map_to_box_021_selectors() {
+        // The flags map to the selectors.
+        let parent = boxes::SessionId::from_bytes([7; 16]);
+        let age = crate::cli::parse_box_age("7d").unwrap();
+        assert_eq!(age.as_secs(), 7 * 86_400);
+        assert_eq!(
+            box_prune_request(Some(age), Some(parent)),
+            minimald_rpc::PruneBoxesRequest {
+                older_than_secs: Some(7 * 86_400),
+                parent: Some(parent),
+            }
+        );
+        assert_eq!(
+            box_prune_request(None, None),
+            minimald_rpc::PruneBoxesRequest::default()
+        );
+        for (arg, secs) in [("12h", 43_200), ("30m", 1_800), ("90s", 90), ("0d", 0)] {
+            assert_eq!(crate::cli::parse_box_age(arg).unwrap().as_secs(), secs);
+        }
+        for bad in ["", "7", "d", "7y", "-1d", "1.5h"] {
+            let err = crate::cli::parse_box_age(bad).expect_err(bad);
+            assert!(err.contains("such as 7d, 12h, 30m or 90s"), "{err}");
+        }
+
+        let (_server, dir, _project, mut client) = daemon_with_boxes(&["web", "api", "db"]).await;
+        let host = crate::cmd::list::LocalHost {
+            provider: crate::cmd::list::LOCAL_PROVIDER,
+            host: "local0".to_owned(),
+            sock: dir.path().join("ssh.sock"),
+            selected: true,
+        };
+        let web = listed_id(&mut client, "web").await;
+        let api = listed_id(&mut client, "api").await;
+        for id in [web, api] {
+            stop_listed_box(&mut client, &mut Vec::new(), id, "box", false)
+                .await
+                .expect("the stop succeeds");
+        }
+
+        // The boxes stopped just now, so an hour's age matches none.
+        let mut out = Vec::new();
+        let pruned = prune_host(
+            &mut client,
+            &host,
+            &mut out,
+            box_prune_request(Some(std::time::Duration::from_secs(3_600)), None),
+        )
+        .await
+        .expect("the prune succeeds");
+        assert_eq!(pruned, (0, 0));
+        assert!(out.is_empty());
+
+        // No box is a child of `db`, so its parent selector matches none.
+        let db = listed_id(&mut client, "db").await;
+        let pruned = prune_host(
+            &mut client,
+            &host,
+            &mut Vec::new(),
+            box_prune_request(None, Some(db)),
+        )
+        .await
+        .expect("the prune succeeds");
+        assert_eq!(pruned, (0, 0));
+        assert_eq!(
+            listed_state(&mut client, "web").await.as_deref(),
+            Some("stopped")
+        );
+
+        // With no selector, every stopped box goes, and the running one stays.
+        let mut out = Vec::new();
+        let pruned = prune_host(&mut client, &host, &mut out, box_prune_request(None, None))
+            .await
+            .expect("the prune succeeds");
+        assert_eq!(pruned, (2, 0));
+        let mut lines: Vec<String> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        lines.sort();
+        let mut want = vec![
+            format!("Removed api ({api})."),
+            format!("Removed web ({web})."),
+        ];
+        want.sort();
+        assert_eq!(lines, want);
+        assert_eq!(listed_state(&mut client, "web").await, None);
+        assert_eq!(listed_state(&mut client, "api").await, None);
+        assert_eq!(
+            listed_state(&mut client, "db").await.as_deref(),
+            Some("running")
+        );
+    }
+
+    // BCLI-005: off a terminal, or under `--no-input`, `min box prune`
+    // without `--yes` is refused with exit 2, naming `--yes`. On a terminal
+    // it asks, and `--yes` prunes without asking.
+    #[test]
+    fn prune_off_tty_needs_yes() {
+        assert_eq!(prune_gate(false, false, false), Err(PruneNeedsYes));
+        assert_eq!(prune_gate(false, true, true), Err(PruneNeedsYes));
+        assert_eq!(prune_gate(false, false, true), Ok(PruneGate::Confirm));
+        assert_eq!(prune_gate(true, false, false), Ok(PruneGate::Proceed));
+        assert_eq!(prune_gate(true, true, true), Ok(PruneGate::Proceed));
+        assert_eq!(PruneNeedsYes::EXIT_CODE, 2);
+        assert_eq!(
+            PruneNeedsYes.to_string(),
+            "Prune removes boxes. Pass --yes to confirm, or --dry-run to see what it would remove."
         );
     }
 }

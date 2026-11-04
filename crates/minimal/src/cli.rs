@@ -442,6 +442,13 @@ pub enum BoxCommand {
     /// files. A running box is refused unless `--force` is given, which
     /// stops the box at once and then removes it
     Rm(BoxRmArgs),
+    /// Give a box a new name. The box keeps its id, its state and its
+    /// files. A name that a running box on the same host holds is refused
+    Rename(BoxRenameArgs),
+    /// Remove every stopped or exited box: its record, its events and its
+    /// files. A running box is never removed. `--older-than` and `--parent`
+    /// narrow what is removed. Off a terminal, `--yes` is required
+    Prune(BoxPruneArgs),
 }
 
 // BOX-158 (BCLI-001, BCLI-051): `min box list [--all] [-o json]`.
@@ -492,6 +499,54 @@ pub struct BoxRmArgs {
     /// Remove a running box too: stop it at once, then remove it
     #[arg(long)]
     pub force: bool,
+}
+
+// BOX-010 (BCLI-058): `min box rename <box> <name>`.
+#[derive(Debug, Args)]
+pub struct BoxRenameArgs {
+    /// The box: its id, the start of its id, or its name, as `min box list`
+    /// prints them
+    pub target: String,
+    /// The new name for the box
+    pub new_name: String,
+}
+
+// BOX-021 (BCLI-061, BCLI-005): `min box prune [--older-than <d>]
+// [--parent <box>] [--yes]`.
+#[derive(Debug, Args)]
+pub struct BoxPruneArgs {
+    /// Remove only the boxes that stopped or exited at least this long ago.
+    /// Takes a whole number of days, hours, minutes or seconds, such as
+    /// `7d`, `12h`, `30m` or `90s`
+    #[arg(long, value_name = "AGE", value_parser = parse_box_age)]
+    pub older_than: Option<std::time::Duration>,
+    /// Remove only the child boxes of this box: its id, the start of its
+    /// id, or its name
+    #[arg(long, value_name = "BOX")]
+    pub parent: Option<String>,
+    /// Remove the boxes without asking first
+    #[arg(long, short)]
+    pub yes: bool,
+}
+
+/// Parses the `--older-than` age of `min box prune`: a whole number with a
+/// `d`, `h`, `m` or `s` unit.
+pub(crate) fn parse_box_age(arg: &str) -> Result<std::time::Duration, String> {
+    let units: [(char, u64); 4] = [('d', 86_400), ('h', 3_600), ('m', 60), ('s', 1)];
+    let invalid = || {
+        format!(
+            "`{arg}` is not an age. Use a whole number of days, hours, minutes or \
+             seconds, such as 7d, 12h, 30m or 90s."
+        )
+    };
+    let unit = arg.chars().last().ok_or_else(invalid)?;
+    let (_, scale) = units
+        .iter()
+        .find(|(suffix, _)| *suffix == unit)
+        .ok_or_else(invalid)?;
+    let count: u64 = arg[..arg.len() - 1].parse().map_err(|_| invalid())?;
+    let secs = count.checked_mul(*scale).ok_or_else(invalid)?;
+    Ok(std::time::Duration::from_secs(secs))
 }
 
 // BEP-042: `min box audit <box|self> | --parent <box|self> [-o jsonl] [--follow]`.
