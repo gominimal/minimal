@@ -123,23 +123,24 @@ fn reads_gvproxy_env(source: &str) -> bool {
     let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
     let literal = format!("\"{GVPROXY_ENV}\"");
     let mut names = vec![literal.clone()];
-    // `const NAME: &str = "MINVMD_GVPROXY_BIN";` with its whitespace removed.
-    let mut rest = flat.as_str();
-    while let Some(at) = rest.find(&format!(":&str={literal};")) {
-        let head = &rest[..at];
-        let name = head
-            .rsplit(|c: char| !(c.is_alphanumeric() || c == '_'))
-            .next()
-            .unwrap_or_default();
-        if head.ends_with(&format!("const{name}")) && !name.is_empty() {
-            names.push(name.to_owned());
+    // `const NAME: &str = "MINVMD_GVPROXY_BIN";`, one declaration a line.
+    for line in source.lines() {
+        let decl = line.trim_start();
+        let decl = decl.strip_prefix("pub ").unwrap_or(decl);
+        if let Some((name, value)) = decl
+            .strip_prefix("const ")
+            .and_then(|rest| rest.split_once(':'))
+            && value.replace(char::is_whitespace, "") == format!("&str={literal};")
+        {
+            names.push(name.trim().to_owned());
         }
-        rest = &rest[at + 1..];
     }
     names.iter().any(|name| {
-        ["var(", "var_os("]
-            .iter()
-            .any(|call| flat.contains(&format!("{call}{name})")))
+        ["var(", "var_os("].iter().any(|call| {
+            [")", ","]
+                .iter()
+                .any(|end| flat.contains(&format!("{call}{name}{end}")))
+        })
     })
 }
 
