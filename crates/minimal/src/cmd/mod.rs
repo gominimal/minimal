@@ -26,6 +26,7 @@ mod box_spec;
 mod box_verbs;
 mod doctor;
 mod finalize_install;
+pub mod hosts;
 mod list;
 mod net;
 pub mod output;
@@ -49,7 +50,10 @@ pub use project::*;
 pub use secret::{cmd_secret_list, cmd_secret_rm, cmd_secret_set};
 pub use session::*;
 
-pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
+pub async fn run(mut cli: Cli) -> Result<(), anyhow::Error> {
+    // BCLI-046: `--provider local-minimald` reads as `local`. Its hint
+    // prints after the command ends, never before an attached shell.
+    let alias_hint = hosts::read_provider_alias(&mut cli.global_args);
     // The verb and the outcome go on the root span (BCLI-033
     // observability), so one span tells what ran. `box_id` stays empty
     // until a command records the id it resolved, through
@@ -90,7 +94,11 @@ pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
     }
     // Boxed: inlined, this dispatch match's deepest arm overruns rustc's
     // query depth (128) when computing the future's layout.
-    match run_in_root(root, Box::pin(run_command(cli))).await? {
+    let result = run_in_root(root, Box::pin(run_command(cli))).await;
+    if let Some(hint) = alias_hint {
+        eprintln!("{hint}");
+    }
+    match result? {
         None => Ok(()),
         Some(handoff) => Err(handoff.finish()),
     }
@@ -123,6 +131,13 @@ fn command_verb(command: Option<&Command>) -> &'static str {
             BoxCommand::Audit(_) => "box audit",
             BoxCommand::List(_) => "box list",
             BoxCommand::Show(_) => "box show",
+        },
+        Some(Command::Host(HostArgs { command })) => match command {
+            HostCommand::List => "host list",
+            HostCommand::Show(_) => "host show",
+        },
+        Some(Command::Provider(ProviderArgs { command })) => match command {
+            ProviderCommand::List(_) => "provider list",
         },
         Some(Command::Net(_)) => "net forward",
         Some(Command::FinalizeInstall(_)) => "finalize-install",
@@ -356,6 +371,19 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             BoxCommand::Audit(args) => box_audit::cmd_box_audit(&cli.global_args, args).await,
             BoxCommand::List(args) => cmd_box_list(&cli.global_args, args).await,
             BoxCommand::Show(args) => cmd_box_show(&cli.global_args, args).await,
+        },
+        Some(Command::Host(HostArgs { command })) => match command {
+            HostCommand::List => {
+                hosts::cmd_host_list(&cli.global_args, &mut std::io::stdout()).await
+            }
+            HostCommand::Show(args) => {
+                hosts::cmd_host_show(&cli.global_args, &args, &mut std::io::stdout()).await
+            }
+        },
+        Some(Command::Provider(ProviderArgs { command })) => match command {
+            ProviderCommand::List(args) => {
+                hosts::cmd_provider_list(&cli.global_args, &args, &mut std::io::stdout())
+            }
         },
         Some(Command::Net(NetArgs {
             command: NetCommand::Forward(args),
