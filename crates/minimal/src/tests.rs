@@ -6586,6 +6586,12 @@ async fn box_first_slice_list_show_stop_rm_end_to_end() {
         .collect();
     assert_eq!(row.first(), Some(&id.as_str()), "{transcript}");
     assert_eq!(row.get(1), Some(&"web"), "{transcript}");
+    let type_column = header.iter().position(|column| *column == "TYPE");
+    assert_eq!(
+        type_column.and_then(|column| row.get(column)),
+        Some(&boxes::SESSION_BOX_TYPE),
+        "the TYPE cell\n{transcript}"
+    );
     assert!(row.contains(&"running"), "{transcript}");
     assert_eq!(
         row.get(row.len().wrapping_sub(2)),
@@ -6617,6 +6623,7 @@ async fn box_first_slice_list_show_stop_rm_end_to_end() {
     for line in [
         format!("ID: {id}"),
         "Name: web".to_owned(),
+        format!("Type: {}", boxes::SESSION_BOX_TYPE),
         "State: running".to_owned(),
         "Provider: local".to_owned(),
         format!("Host: {}", host.host),
@@ -6668,17 +6675,13 @@ async fn box_first_slice_list_show_stop_rm_end_to_end() {
     );
 
     // `min box rm web` of the stopped box: removed without `--force`, and
-    // the listing no longer has it.
-    let rm = async |out: &mut Vec<u8>| {
-        let mut client = connect_daemon(&global).await?;
-        rm_listed_box(&mut client, &lookup("min box rm"), "web", false).await?;
-        std::io::Write::write_all(out, b"Removed web.\n")?;
-        Ok(())
-    };
+    // the listing no longer has it. The `Removed web.` line is not checked
+    // here: `cmd_box_rm` writes it to the process's stdout after its
+    // cleanup, and `rm_listed_box`, which this step runs, prints nothing.
     let exit = run_box_command(&mut runs, "rm", "min box rm web".into(), &id, rm).await;
     let transcript = box_transcript(&runs);
     assert_eq!(exit, 0, "{transcript}");
-    assert_eq!(runs[5].stdout, "Removed web.\n", "{transcript}");
+    assert_eq!(runs[5].stdout, "", "{transcript}");
     let exit = run_box_command(&mut runs, "list", "min box list --all".into(), &id, list).await;
     let transcript = box_transcript(&runs);
     assert_eq!(exit, 0, "{transcript}");
@@ -6688,14 +6691,21 @@ async fn box_first_slice_list_show_stop_rm_end_to_end() {
         "{transcript}"
     );
 
-    // One `box_verb` span for each verb covers the same box.
+    // Each run of a verb has its own `box_verb` span over the same box:
+    // one `ran` event inside the span for each run. The box id in the
+    // span keeps other tests' spans in the shared log out of the count.
     let log = log.contents();
     for verb in ["list", "show", "stop", "rm"] {
         let span = format!("box_verb{{verb=\"{verb}\" box_id=\"{id}\"}}");
-        assert!(
-            log.lines()
-                .any(|line| line.contains(&span) && line.contains("ran")),
-            "no {span} span\n{transcript}\n{log}"
-        );
+        let event = format!("min box {verb} ran");
+        let spans = log
+            .lines()
+            .filter(|line| line.contains(&span) && line.contains(&event))
+            .count();
+        let ran = runs
+            .iter()
+            .filter(|run| run.command.starts_with(&format!("min box {verb} ")))
+            .count();
+        assert_eq!(spans, ran, "{span} spans\n{transcript}\n{log}");
     }
 }
