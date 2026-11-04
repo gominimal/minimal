@@ -8019,14 +8019,9 @@ async fn attach_detach_or_entrypoint_exit_returns_0() {
     let mut exited = ending_entry("exited");
     exited.reason = Some("exit".to_owned());
     exited.exit_code = Some(0);
-    // The shell-exit prompt keeps a box whose entrypoint exited first.
-    let mut kept = ending_entry("stopped");
-    kept.reason = Some("stopped".to_owned());
-    kept.exit_code = Some(0);
     for after in [
         BoxAfterAttach::Listed(ending_entry("running")),
         BoxAfterAttach::Listed(exited),
-        BoxAfterAttach::Listed(kept),
         // The shell-exit prompt can delete the box the user chose to.
         BoxAfterAttach::Gone,
         BoxAfterAttach::HostSilent,
@@ -8128,13 +8123,33 @@ async fn attach_ended_from_other_side_notice_exit254() {
     );
     assert_eq!(
         line(BoxAfterAttach::HostSilent),
-        "Detached: host local0 shut down."
+        "Detached: host local0 shut down or stopped answering."
     );
     let mut exited = ending_entry("exited");
+    exited.reason = Some("exit".to_owned());
     exited.exit_code = Some(3);
     assert_eq!(
         line(BoxAfterAttach::Listed(exited)),
-        "Detached: web is exited (exit 3)."
+        "Detached: web exited with code 3."
+    );
+    let mut timed_out = ending_entry("exited");
+    timed_out.reason = Some("timeout".to_owned());
+    assert_eq!(
+        line(BoxAfterAttach::Listed(timed_out)),
+        "Detached: web ran past its timeout and ended."
+    );
+    // A stop whose entrypoint exited on its SIGTERM records the
+    // entrypoint's own code. The daemon reports 0 for it, and it is still
+    // a stop.
+    let mut stopped = ending_entry("stopped");
+    stopped.reason = Some("stopped".to_owned());
+    stopped.exit_code = Some(0);
+    assert_eq!(
+        attach_ending(&target, 0, &BoxAfterAttach::Listed(stopped)),
+        Ok(AttachEnding {
+            code: 254,
+            notice: Some("Detached: web was stopped.".to_owned())
+        })
     );
     assert_eq!(
         attach_ending(&target, 254, &BoxAfterAttach::Unread),
@@ -8144,6 +8159,49 @@ async fn attach_ended_from_other_side_notice_exit254() {
         }),
         "a host that answered with an error proves no cause"
     );
+}
+
+/// BCLI-068: the daemon closes the attach's channel before it writes the
+/// stopped record, so the first read after the attach still sees the box
+/// running. The command reads again until the record says why, and a stop
+/// still ends with 254 and its line, whether the daemon reported 254 or 0.
+#[tokio::test]
+async fn attach_ended_from_other_side_notice_exit254_before_the_record() {
+    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    alpha.create("web", Some(true)).await;
+    let hosts = vec![alpha.host.clone()];
+
+    for reported in [254, 0] {
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
+        let attach = box_attach_on_hosts(
+            hosts.clone(),
+            Some("web"),
+            None,
+            true,
+            async move |_: &BoxAttachTarget| {
+                // The channel closed: the stop has not written the record.
+                let _ = closed_tx.send(());
+                Ok(reported)
+            },
+        );
+        let stop = async {
+            closed_rx.await.expect("the attach ran");
+            // Let the command's first read see the box running.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            alpha.stop("web").await;
+        };
+        let (ending, ()) = tokio::join!(attach, stop);
+        assert_eq!(
+            ending.expect("the attach ends"),
+            AttachEnding {
+                code: 254,
+                notice: Some("Detached: web was stopped.".to_owned())
+            },
+            "reported {reported}"
+        );
+        let mut daemon = alpha.server.connect().await;
+        resume_for_attach_test(&mut daemon, &alpha.host).await;
+    }
 }
 
 /// Starts the stopped box `web` on `host` again by its resume, so the

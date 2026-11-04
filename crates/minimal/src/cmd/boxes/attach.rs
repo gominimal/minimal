@@ -796,10 +796,13 @@ where
     let code = attach(&target).await.inspect_err(|err| {
         tracing::info!(verb = "box attach", box_id = %target.box_id, outcome = "error", "{err:#}");
     })?;
-    let after = if matches!(code, 0 | DAEMON_ENDED_ATTACH | SSH_CONNECTION_FAILED) {
-        box_after_attach(&target.host, target.box_id).await
-    } else {
-        BoxAfterAttach::Unread
+    let after = match code {
+        0 => box_after_attach_settled(&target.host, target.box_id, ENTRYPOINT_END_SETTLE).await,
+        DAEMON_ENDED_ATTACH => {
+            box_after_attach_settled(&target.host, target.box_id, DAEMON_END_SETTLE).await
+        }
+        SSH_CONNECTION_FAILED => box_after_attach(&target.host, target.box_id).await,
+        _ => BoxAfterAttach::Unread,
     };
     match attach_ending(&target, code, &after) {
         Ok(ending) => {
@@ -986,14 +989,59 @@ pub(crate) async fn box_after_attach(
     read.unwrap_or(BoxAfterAttach::HostSilent)
 }
 
+/// How long the read after an attach that ended with 0 waits for a box
+/// that still reads `running` to leave it. A stop can end the entrypoint,
+/// and the attach with it, before the daemon writes the stopped record: it
+/// writes the record once it reaps the entrypoint. A detach leaves the box
+/// running, so this bound is also what every detach waits.
+pub(crate) const ENTRYPOINT_END_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How long the read after an attach the daemon ended (254) waits for a box
+/// that still reads `running` to leave it. A stop or a removal closes the
+/// channel before the daemon writes the record. A box that still runs at
+/// the bound lost its terminal to another attach.
+pub(crate) const DAEMON_END_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often the settled read asks the host again.
+const SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// What `host` says of box `id` once an attach to it ended, read again
+/// until the box no longer reads `running` or `settle` is over. The channel
+/// of an attach can close before the record says why (see
+/// [`DAEMON_END_SETTLE`]), so one read straight after the attach can see a
+/// box that a stop is about to record as stopped.
+pub(crate) async fn box_after_attach_settled(
+    host: &crate::cmd::list::LocalHost,
+    id: boxes::SessionId,
+    settle: std::time::Duration,
+) -> BoxAfterAttach {
+    let deadline = tokio::time::Instant::now() + settle;
+    let mut reads = 0u32;
+    loop {
+        let after = box_after_attach(host, id).await;
+        reads += 1;
+        let running = matches!(&after, BoxAfterAttach::Listed(entry) if entry.state == "running");
+        if !running || tokio::time::Instant::now() >= deadline {
+            tracing::debug!(
+                box_id = %id,
+                reads,
+                still_running = running,
+                "read the box after the attach"
+            );
+            return after;
+        }
+        tokio::time::sleep(SETTLE_POLL).await;
+    }
+}
+
 /// How an attach that ended with ssh's `code` ends the command, from what
 /// the host said of the box afterwards.
 ///
 /// A daemon that ended the attach reports 254, and the line names why: the
 /// box was stopped or removed, another terminal attached to it, or its host
-/// shut down. A stop also ends the entrypoint, which the daemon reports as
-/// 0, so a box that is `stopped` with no exit code of its own ends with 254
-/// too. ssh's own 255 against a host that does not answer is a lost
+/// shut down or stopped answering. A stop can also end the entrypoint, which
+/// the daemon reports as 0, so a box that is `stopped` ends with 254 too,
+/// whatever exit code its entrypoint recorded. ssh's own 255 against a host that does not answer is a lost
 /// connection, exit 7. Every other code is the code: 0 for a detach or an
 /// entrypoint that exited.
 pub(crate) fn attach_ending(
@@ -1022,19 +1070,33 @@ pub(crate) fn attach_ending(
         (DAEMON_ENDED_ATTACH, BoxAfterAttach::Listed(entry)) if entry.state == "running" => {
             ended(format!("Detached: another terminal attached to {label}."))
         }
-        (DAEMON_ENDED_ATTACH, BoxAfterAttach::Listed(entry)) => {
-            ended(format!("Detached: {label} is {}.", box_state_label(entry)))
-        }
+        (DAEMON_ENDED_ATTACH, BoxAfterAttach::Listed(entry)) => ended(ended_box_line(label, entry)),
         (DAEMON_ENDED_ATTACH, BoxAfterAttach::Gone) => {
             ended(format!("Detached: {label} was removed."))
         }
         (DAEMON_ENDED_ATTACH, BoxAfterAttach::HostSilent) => {
-            ended(format!("Detached: host {} shut down.", target.host.host))
+            // The host did not answer the read: it shut down, its daemon
+            // stopped, or it cannot be reached.
+            ended(format!(
+                "Detached: host {} shut down or stopped answering.",
+                target.host.host
+            ))
         }
-        (0, BoxAfterAttach::Listed(entry)) if stopped(entry) && entry.exit_code.is_none() => {
+        (0, BoxAfterAttach::Listed(entry)) if stopped(entry) => {
             ended(format!("Detached: {label} was stopped."))
         }
         _ => Ok(AttachEnding { code, notice: None }),
+    }
+}
+
+/// The line for a box the daemon ended the attach of that is neither
+/// running nor stopped.
+fn ended_box_line(label: &str, entry: &minimald_rpc::BoxListingEntry) -> String {
+    match (entry.exit_code, entry.reason.as_deref()) {
+        (Some(code), _) => format!("Detached: {label} exited with code {code}."),
+        (None, Some("timeout")) => format!("Detached: {label} ran past its timeout and ended."),
+        (None, Some("oom")) => format!("Detached: {label} ran out of memory and ended."),
+        _ => format!("Detached: {label} is {}.", box_state_label(entry)),
     }
 }
 
