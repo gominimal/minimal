@@ -1114,12 +1114,23 @@ pub enum ExposeDecisionOutcome {
 ///
 /// Fixed and size-bounded like the port reports: the row key, the port, and
 /// three closed enums. The box is named by the host from the row at
-/// `switch_address`, never by a string the guest sends. A report keyed at
-/// no row is refused and leaves no record.
+/// `switch_address`, never by a string the guest sends. A box with no
+/// switch has no row key, so its report carries its box id instead, and
+/// the host names the box from what it holds under that id. A report keyed
+/// at no box the host holds is refused and leaves no record.
+///
+/// Both keys are serde-defaulted, so an older guest's report, which always
+/// carries a switch address and never a box id, still reads.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExposeDecisionReport {
-    /// The switch address of the row the decision is about.
-    pub switch_address: std::net::Ipv4Addr,
+    /// The switch address of the row the decision is about. `None` for a
+    /// box with no switch, which [`Self::box_id`] names instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_address: Option<std::net::Ipv4Addr>,
+    /// The box the decision is about, by its id. The host reads it only
+    /// when the report carries no switch address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub box_id: Option<BoxId>,
     /// The port the box asked to publish.
     pub port: u16,
     /// The decision the box's `dynamic_ingress` setting made.
