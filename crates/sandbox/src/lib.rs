@@ -44,6 +44,15 @@ mod listener;
 pub trait Channel: Send {
     // Return true to close the connection.
     fn handle(&mut self, stream: &mut UnixStream, line: &str, rootfs: &Path);
+
+    /// Handles a request line that was not valid UTF-8. `line` is its lossy
+    /// decode, with each invalid byte replaced by U+FFFD, and `raw` is the
+    /// line as the box sent it, so a channel can tell which values held an
+    /// invalid byte. The default handles `line` as [`Channel::handle`] does.
+    fn handle_lossy(&mut self, stream: &mut UnixStream, line: &str, raw: &[u8], rootfs: &Path) {
+        let _ = raw;
+        self.handle(stream, line, rootfs);
+    }
 }
 
 impl Channel for () {

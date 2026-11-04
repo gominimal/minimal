@@ -75,6 +75,9 @@
 # case name below is runnable by itself.
 #   lifecycle                        cold activate → list → warm → destroy
 #   session_exec                     `min session exec` in the session's namespaces
+#   exec_reattach                    a terminal and a detached min://exec lose
+#                                    their client; the exec id re-attaches the
+#                                    terminal and reads the output again
 #   session_rename                   `min session rename`; rename-to-self refused
 #   session_outbound_request         an outbound request from inside the session (NET-107)
 #   own_ip                           `--network own_ip` tap + switch attach
@@ -207,6 +210,11 @@
 #                                    host-address boxes answer the node's
 #                                    one address and a port each binds
 #                                    opens there
+#   host_address_names_and_host_alias
+#                                    a host_ip box opens by name at the
+#                                    node's address on a VM lane; on a
+#                                    native lane host.min.internal and
+#                                    127.0.0.1 reach the same host listener
 #   native_answerer_survives_session_stop
 #                                    NET-122's host service on a native
 #                                    host (T90): the advisory's command run
@@ -462,6 +470,8 @@ PROXY_OWN_SEED_DIR="" # its own-address box's seed; removed on teardown
 PROXY_HOST_DIR="" # the host-loopback dir that proof serves; removed on teardown
 PROXY_HOST_SRV_PID="" # the host-loopback server it starts; killed on teardown
 PROXY_UNEXPOSED_SRV_PID="" # its listener at a port outside the host exposure; killed on teardown
+HAN_HOST_SRV_PID="" # the host-address names case's host listener; killed on teardown
+HAN_HOST_DIR=""     # the directory it serves; removed on teardown
 PAR_SEED_DIR="" # seeded by the proxy-parity proof below; removed on teardown
 PAR_OWN_SEED_DIR="" # its own-address target box's seed; removed on teardown
 PAR_CALLER_SEED_DIR="" # its denied-caller box's seed; removed on teardown
@@ -1101,6 +1111,10 @@ teardown() {
   if [ -n "$PROXY_HOST_SRV_PID" ]; then
     kill "$PROXY_HOST_SRV_PID" 2>/dev/null || true
   fi
+  if [ -n "$HAN_HOST_SRV_PID" ]; then
+    kill "$HAN_HOST_SRV_PID" 2>/dev/null || true
+  fi
+  [ -n "$HAN_HOST_DIR" ] && rm -rf "$HAN_HOST_DIR"
   if [ -n "$PROXY_UNEXPOSED_SRV_PID" ]; then
     kill "$PROXY_UNEXPOSED_SRV_PID" 2>/dev/null || true
   fi
@@ -1620,6 +1634,210 @@ if grep -q "Error: Other(" "$WORK/exec-missing.err"; then
   fail
 fi
 echo "session exec proof OK"
+echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
+# Exec by id, end to end (T32): a terminal exec and a detached exec run in the
+# shared box. The client of each goes away, and the exec id alone brings it
+# back: `min://exec/attach <id>` replays the terminal and takes input again,
+# `min://exec/wait <id>` and `min://exec/output <id>` read the detached exec.
+# An exec runs its argv unshelled, in the box's namespaces, cgroup and working
+# directory, and this case checks each of them against a shell exec.
+# `min` has no command for these requests yet, so the proof sends them over a
+# plain `ssh`, built from the transport `min session setup-zed --print` gives
+# (its ProxyCommand onto the daemon socket, the box selector, the host key).
+# This route is interim. `min box exec -t|--detach` comes with
+# https://github.com/gominimal/minimal/issues/2905 (BCLI T15), and
+# `min box attach|wait|logs|stop --exec` with
+# https://github.com/gominimal/minimal/issues/2913 (BCLI T16). This case moves
+# to those commands when those issues close. One span over the drop and the
+# re-attach is https://github.com/gominimal/minimal/issues/2978.
+proof_exec_reattach() {
+echo "::group::exec by id proof (min://exec terminal and detached, client dropped)"
+proof_shared_session
+local entry host user opts er_ssh tty_id det_id att1 att1_pid fifo out2 rc det_out det_again i want
+local sh_ns ex_ns ex_cwd sh_cg ex_cg argv_out n_att n_drop
+entry="$(mnl session setup-zed "$sid" --print 2>"$WORK/exec-reattach-zed.err")" || {
+  echo "::error::'min session setup-zed $sid --print' failed"
+  echo "--- stderr ---"; cat "$WORK/exec-reattach-zed.err" 2>/dev/null || true
+  fail
+}
+host="$(printf '%s' "$entry" | jq -r .host)"
+user="$(printf '%s' "$entry" | jq -r .username)"
+opts=()
+while IFS= read -r i; do opts+=("$i"); done < <(printf '%s' "$entry" | jq -r '.args[]')
+er_ssh=(ssh -F /dev/null -T -o BatchMode=yes -o ConnectTimeout=30 "${opts[@]}" "$user@$host")
+
+# A detached exec of an argv, unshelled: start it, wait for its exit, and
+# print its output. $1 names the step, $2 is the argv as a JSON array, and
+# $3 is the exit code the exec must give. It reports a failure on stderr
+# and returns non-zero, because `fail` in a command substitution ends only
+# the subshell.
+er_detached() {
+  local id rc
+  id="$("${er_ssh[@]}" "min://exec {\"argv\":$2,\"mode\":\"detached\"}" \
+    2>"$WORK/exec-reattach-$1.err" </dev/null | tr -d '\r' | tail -n1)"
+  if ! printf '%s' "$id" | grep -Eqx '[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}'; then
+    echo "::error::a detached min://exec ($1) did not answer with an exec id: '$id'" >&2
+    echo "--- stderr ---" >&2; cat "$WORK/exec-reattach-$1.err" >&2 2>/dev/null || true
+    return 1
+  fi
+  timeout 30 "${er_ssh[@]}" "min://exec/wait $id" </dev/null >/dev/null 2>>"$WORK/exec-reattach-$1.err"
+  rc=$?
+  if [ "$rc" -ne "$3" ]; then
+    echo "::error::'min://exec/wait $id' ($1) exited $rc (expected the exec's $3)" >&2
+    echo "--- stderr ---" >&2; cat "$WORK/exec-reattach-$1.err" >&2 2>/dev/null || true
+    return 1
+  fi
+  "${er_ssh[@]}" "min://exec/output $id" </dev/null 2>>"$WORK/exec-reattach-$1.err" | tr -d '\r'
+}
+
+# The argv passes through literally: no shell splits, expands or globs it.
+# shellcheck disable=SC2016 # $HOME must reach the exec as text.
+argv_out="$(er_detached argv '["printf","%s|","a b","$HOME","*"]' 0)" || fail
+# shellcheck disable=SC2016 # the literal $HOME is the expected output.
+if [ "$argv_out" != 'a b|$HOME|*|' ]; then
+  echo "::error::an unshelled exec argv did not pass through literally: expected 'a b|\$HOME|*|', got '$argv_out'"
+  fail
+fi
+
+# The namespaces and the working directory are the box's: an unshelled
+# readlink sees the same mnt, pid, net and uts namespaces as a shell exec in
+# the same box, and its cwd is /workbench.
+sh_ns="$(mnl session exec "$sid" 'readlink /proc/self/ns/mnt /proc/self/ns/pid /proc/self/ns/net /proc/self/ns/uts' 2>"$WORK/exec-reattach-shns.err")" || {
+  echo "::error::'min session exec $sid readlink /proc/self/ns/...' failed"
+  echo "--- stderr ---"; cat "$WORK/exec-reattach-shns.err" 2>/dev/null || true
+  fail
+}
+ex_ns="$(er_detached ns '["readlink","/proc/self/ns/mnt","/proc/self/ns/pid","/proc/self/ns/net","/proc/self/ns/uts","/proc/self/cwd"]' 0)" || fail
+ex_cwd="$(printf '%s\n' "$ex_ns" | sed -n 5p)"
+ex_ns="$(printf '%s\n' "$ex_ns" | sed -n 1,4p)"
+if [ "$(printf '%s\n' "$sh_ns" | wc -l)" -ne 4 ] || [ "$ex_ns" != "$sh_ns" ]; then
+  echo "::error::an unshelled exec did not run in the box's namespaces"
+  echo "--- shell exec ---"; printf '%s\n' "$sh_ns"
+  echo "--- unshelled exec ---"; printf '%s\n' "$ex_ns"
+  fail
+fi
+if [ "$ex_cwd" != "/workbench" ]; then
+  echo "::error::an unshelled exec ran in '$ex_cwd' (expected /workbench)"
+  fail
+fi
+
+# The cgroup is the box's leaf: the one the box's own init (pid 1 in the
+# box's pid namespace) is in, and the one a shell exec is in.
+sh_cg="$(mnl session exec "$sid" 'cat /proc/1/cgroup; cat /proc/self/cgroup' 2>"$WORK/exec-reattach-shcg.err")" || {
+  echo "::error::'min session exec $sid cat /proc/1/cgroup' failed"
+  echo "--- stderr ---"; cat "$WORK/exec-reattach-shcg.err" 2>/dev/null || true
+  fail
+}
+ex_cg="$(er_detached cgroup '["cat","/proc/self/cgroup"]' 0)" || fail
+if [ -z "$ex_cg" ] || [ "$sh_cg" != "$(printf '%s\n%s' "$ex_cg" "$ex_cg")" ]; then
+  echo "::error::an unshelled exec is not in the box's cgroup leaf"
+  echo "--- box init, then shell exec ---"; printf '%s\n' "$sh_cg"
+  echo "--- unshelled exec ---"; printf '%s\n' "$ex_cg"
+  fail
+fi
+
+# A terminal exec: its start answers with the id, and the client is gone.
+# shellcheck disable=SC2016 # $a and $b expand in the box, not here.
+tty_id="$("${er_ssh[@]}" 'min://exec {"argv":["sh","-c","read a; echo got:$a; sleep 1; echo while-away; read b; echo got:$b; exit 7"],"mode":"tty"}' \
+  2>"$WORK/exec-reattach-tty.err" </dev/null | tr -d '\r' | tail -n1)"
+if ! printf '%s' "$tty_id" | grep -Eqx '[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}'; then
+  echo "::error::a terminal min://exec did not answer with an exec id: '$tty_id'"
+  echo "--- stderr ---"; cat "$WORK/exec-reattach-tty.err" 2>/dev/null || true
+  fail
+fi
+echo "terminal exec: $tty_id"
+
+# First client: attach by the id, type a line, see the answer, then drop.
+# Its stdin is a fifo that this shell holds open, so the client stays until
+# it is killed, and nothing else holds the job.
+att1="$WORK/exec-reattach-attach1.out"
+fifo="$WORK/exec-reattach-attach1.in"
+rm -f "$fifo"; mkfifo "$fifo"
+"${er_ssh[@]}" "min://exec/attach $tty_id" <"$fifo" >"$att1" 2>&1 &
+att1_pid=$!
+exec 9>"$fifo"
+printf 'one\n' >&9
+for i in $(seq 1 100); do
+  grep -q 'got:one' "$att1" 2>/dev/null && break
+  sleep 0.1
+done
+kill "$att1_pid" 2>/dev/null || true
+wait "$att1_pid" 2>/dev/null || true
+exec 9>&-
+rm -f "$fifo"
+if ! grep -q 'got:one' "$att1"; then
+  echo "::error::the first attach to exec $tty_id never showed the answer to its input"
+  echo "--- attach output ---"; cat "$att1" 2>/dev/null || true
+  fail
+fi
+
+# No client now. The exec writes on. A second client, with the id alone,
+# gets the replay, types again, and ends with the exec's exit code.
+printf 'two\n' | timeout 30 "${er_ssh[@]}" "min://exec/attach $tty_id" \
+  >"$WORK/exec-reattach-attach2.out" 2>&1
+rc=$?
+out2="$(tr -d '\r' <"$WORK/exec-reattach-attach2.out")"
+for want in got:one while-away got:two; do
+  if ! printf '%s' "$out2" | grep -q "$want"; then
+    echo "::error::the re-attach to exec $tty_id did not show '$want' (exit $rc)"
+    echo "--- re-attach output ---"; printf '%s\n' "$out2"
+    fail
+  fi
+done
+if [ "$rc" -ne 7 ]; then
+  echo "::error::the re-attach to exec $tty_id exited $rc (expected the exec's 7)"
+  echo "--- re-attach output ---"; printf '%s\n' "$out2"
+  fail
+fi
+
+# A detached exec: its start answers with the id, and the client is gone.
+det_id="$("${er_ssh[@]}" 'min://exec {"argv":["sh","-c","echo detached-early; sleep 2; echo detached-late; exit 7"],"mode":"detached"}' \
+  2>"$WORK/exec-reattach-det.err" </dev/null | tr -d '\r' | tail -n1)"
+if ! printf '%s' "$det_id" | grep -Eqx '[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}'; then
+  echo "::error::a detached min://exec did not answer with an exec id: '$det_id'"
+  echo "--- stderr ---"; cat "$WORK/exec-reattach-det.err" 2>/dev/null || true
+  fail
+fi
+echo "detached exec: $det_id"
+timeout 30 "${er_ssh[@]}" "min://exec/wait $det_id" </dev/null >/dev/null 2>"$WORK/exec-reattach-wait.err"
+rc=$?
+if [ "$rc" -ne 7 ]; then
+  echo "::error::'min://exec/wait $det_id' exited $rc (expected the exec's 7)"
+  echo "--- stderr ---"; cat "$WORK/exec-reattach-wait.err" 2>/dev/null || true
+  fail
+fi
+det_out="$("${er_ssh[@]}" "min://exec/output $det_id" </dev/null 2>"$WORK/exec-reattach-out.err")"
+det_again="$("${er_ssh[@]}" "min://exec/output $det_id" </dev/null 2>>"$WORK/exec-reattach-out.err")"
+if [ "$det_out" != "$(printf 'detached-early\ndetached-late')" ] || [ "$det_again" != "$det_out" ]; then
+  echo "::error::'min://exec/output $det_id' did not read the detached exec's output twice the same"
+  echo "--- first read ---"; printf '%s\n' "$det_out"
+  echo "--- second read ---"; printf '%s\n' "$det_again"
+  echo "--- stderr ---"; cat "$WORK/exec-reattach-out.err" 2>/dev/null || true
+  fail
+fi
+
+# The daemon log names the exec id at each attach and each drop: two
+# attaches (the first client and the re-attach) and one drop (the first
+# client). The log is on this host only when the daemon is (see
+# hook_log_readable).
+if hook_log_readable; then
+  n_att="$(find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f \
+    -exec grep -h -- "$tty_id" {} + 2>/dev/null \
+    | grep -c "a client attached to the exec's terminal")"
+  n_drop="$(find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f \
+    -exec grep -h -- "$tty_id" {} + 2>/dev/null \
+    | grep -c "the attached client went away")"
+  if [ "$n_att" -lt 2 ] || [ "$n_drop" -lt 1 ]; then
+    echo "::error::the daemon log names terminal exec $tty_id at $n_att attaches and $n_drop drops (expected 2 and 1)"
+    fail
+  fi
+else
+  not_run exec_reattach_daemon_log "the daemon log is inside the VM on this lane"
+fi
+echo "exec by id proof OK"
 echo "::endgroup::"
 }
 
@@ -9060,6 +9278,247 @@ for row in json.load(open(sys.argv[1])):
   done
 
   echo "native min.internal resolution from the VM host daemon's answerer OK (min ls names the VM host daemon, the host row and a live box answer at 127.0.0.1:$host_answerer_port, the destroyed box's name withdraws to NXDOMAIN, unknown names NXDOMAIN, two host-address boxes answer the node's one address and open their ports there, or NODATA where the host lacks the reserved range)"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
+# Host-address boxes by name, and the host by its alias, end to end (T118).
+#
+# A VM-backed lane: a `host_ip` box answers at its name. The VM host daemon's
+# answerer answers the name with the node's reserved-range address (NET-129),
+# the VM host mirrors the box's bind there (T117), and a request to the name
+# at that address opens the box's page with no proxy setting.
+#
+# A native lane: a `host_ip` box shares the host's namespace, so
+# `host.min.internal` routes to the host loopback (NET-003). The case checks
+# the name against the documented host literal, 127.0.0.1: the box resolves
+# the name to it, and both URLs fetch the same marker from a host listener.
+#
+# Observability: each lookup, the address it answered, each request and its
+# status print as they happen. Diagnostics: at the end, and on a failure,
+# the case prints the VM host daemon's mirrored-bind records and every
+# daemon log line about the deprecated literal host address, in log order.
+# A native host-address box never crosses a switch relay, so the literal's
+# deprecation notice (NET-004) is printed when present and never asserted.
+proof_host_address_names_and_host_alias() {
+  echo "::group::host-address boxes by name, and host.min.internal (NET-003, NET-129)"
+  local han_name=e2e-han-host han_port=18093 han_host_port=18094
+  local han_sid han_ls han_dns_port han_reply han_addr han_status han_out han_range
+  local han_body han_code han_i han_mirror_rec
+  local han_marker="HAN_HOST_LOOPBACK_OK"
+
+  # The log lines a person reads when this case fails: the mirrored binds
+  # from the VM host daemon's log, then the deprecated-literal notices from
+  # whichever daemon log this host can read. Each in its log's own order.
+  han_print_logs() {
+    echo "--- VM host daemon: mirrored-bind records (in order) ---"
+    minvmd_log_lines "host-address box's bind" | tail -n 20 || true
+    echo "--- daemon logs: deprecated literal host address (in order) ---"
+    {
+      minvmd_log_lines 'deprecated literal host address' || true
+      if hook_log_readable; then
+        find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f \
+          -exec grep -h -- 'deprecated literal host address' {} + 2>/dev/null || true
+      fi
+    } | tail -n 20
+  }
+  han_fail() {
+    han_print_logs
+    echo "--- min ls ---"; mnl ls 2>&1 || true
+    mnl session destroy --force "$han_name" >/dev/null 2>&1 || true
+    fail
+  }
+
+  if [ -n "$E2E_VM" ]; then
+    if ! command -v dig >/dev/null 2>&1; then
+      echo "::error::a VM lane must have dig to read what the answerer answers for a box name"
+      fail
+    fi
+    # The mirror's records are INFO, and this harness runs the daemons at
+    # warn. Take the VM down and let the one command that autospawns it carry
+    # minvmd at info, as the answerer case does.
+    mnl stop --force >/dev/null 2>&1 || true
+    if ! RUST_LOG="warn,minvmd=info" mnl ls >/dev/null 2>&1; then
+      echo "::error::'min ls' could not bring this VM lane's daemon up"
+      fail
+    fi
+    han_dns_port=""
+    for _ in $(seq 1 40); do
+      han_ls="$(mnl ls 2>/dev/null || true)"
+      han_dns_port="$(printf '%s\n' "$han_ls" | grep -- 'DNS SERVICE' \
+        | sed -n 's/.*box names on 127\.0\.0\.1:\([0-9][0-9]*\).*/\1/p' | head -n1)"
+      [ -n "$han_dns_port" ] && break
+      sleep 0.5
+    done
+    if [ -z "$han_dns_port" ]; then
+      echo "::error::min ls names no answerer port on 127.0.0.1 for this VM's box names"
+      echo "--- min ls ---"; printf '%s\n' "${han_ls:-}"
+      fail
+    fi
+    echo "answerer: 127.0.0.1:$han_dns_port (from min ls)"
+    # The node's binds are mirrored only while the host carries the reserved
+    # range: all of 127/8 on Linux, and on macOS only after
+    # `min finalize-install` aliased it onto lo0.
+    if [ "$(uname -s)" = Darwin ] \
+        && [ "$(ifconfig lo0 2>/dev/null | grep -c -- '127\.0\.64\.')" != 254 ]; then
+      han_range=absent
+    else
+      han_range=present
+    fi
+  fi
+
+  # shellcheck disable=SC2086
+  han_sid="$(cd "$PROJECT_DIR" && mnl session activate . --name "$han_name" --network host_ip ${E2E_ACTIVATE_ARGS:-} \
+    2>"$WORK/han-activate.err")" \
+    || { echo "::error::could not activate the host-address box $han_name"
+         echo "--- activate stderr ---"; cat "$WORK/han-activate.err" 2>/dev/null || true
+         fail; }
+  han_sid="$(printf '%s\n' "$han_sid" | tail -n1 | tr -d '\r')"
+  echo "activated $han_name ($han_sid) with --network host_ip"
+
+  # A host whose boxes cannot run (a sandboxed developer host) can only skip
+  # on a native developer run. On CI or a VM lane it is a lane fault.
+  if ! mnl session exec "$han_sid" 'true' >"$WORK/han-execgate.err" 2>&1 \
+     && ! { sleep 1; mnl session exec "$han_sid" 'true' >"$WORK/han-execgate.err" 2>&1; }; then
+    if [ -z "${CI:-}" ] && [ -z "$E2E_VM" ]; then
+      mnl session destroy --force "$han_sid" >/dev/null 2>&1 || true
+      not_run host_address_names_and_host_alias "this host cannot run a box sandbox: $(head -n1 "$WORK/han-execgate.err" 2>/dev/null || true)"
+      echo "::endgroup::"
+      return 0
+    fi
+    echo "::error::this lane cannot run a box sandbox, so nothing in a box can be checked"
+    echo "  (exec: $(head -n1 "$WORK/han-execgate.err" 2>/dev/null || true))"
+    han_fail
+  fi
+
+  if [ -n "$E2E_VM" ]; then
+    # ---- VM lane: the box answers at its name ------------------------------
+    mnl session exec "$han_sid" \
+      "body=$han_name; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/http200" \
+      >/dev/null 2>"$WORK/han-responder.err" \
+      || { echo "::error::could not write $han_name's in-box page"; cat "$WORK/han-responder.err" 2>/dev/null || true; han_fail; }
+    mnl session exec "$han_sid" \
+      "nohup /usr/bin/socat TCP-LISTEN:$han_port,reuseaddr,fork SYSTEM:\"cat /home/http200\" >/dev/null 2>&1 &" \
+      >/dev/null 2>>"$WORK/han-responder.err" \
+      || { echo "::error::could not start $han_name's in-box listener on port $han_port"; cat "$WORK/han-responder.err" 2>/dev/null || true; han_fail; }
+    echo "$han_name listens on port $han_port"
+
+    han_addr=""
+    han_status=""
+    for _ in $(seq 1 60); do
+      han_reply="$(dig +time=2 +tries=1 +noall +comments +answer "@127.0.0.1" -p "$han_dns_port" \
+        "$han_name.min.internal" A 2>/dev/null || true)"
+      han_status="$(printf '%s\n' "$han_reply" | sed -En 's/.*status: ([A-Z]+).*/\1/p' | head -n1)"
+      han_addr="$(printf '%s\n' "$han_reply" | awk '$4 == "A" { print $5; exit }')"
+      [ -n "$han_addr" ] && break
+      [ "$han_range" = absent ] && [ "$han_status" = NOERROR ] && break
+      sleep 0.5
+    done
+    echo "lookup: $han_name.min.internal A at 127.0.0.1:$han_dns_port -> status ${han_status:-no reply}, address ${han_addr:-none}"
+
+    if [ "$han_range" = absent ]; then
+      if [ "$han_status" != NOERROR ] || [ -n "$han_addr" ]; then
+        echo "::error::without the reserved range on lo0, $han_name.min.internal must answer NODATA (NOERROR, no address)"
+        echo "--- dig ---"; printf '%s\n' "$han_reply"
+        han_fail
+      fi
+      mnl session destroy --force "$han_sid" >/dev/null 2>&1 || true
+      not_run host_address_names_and_host_alias "lo0 does not carry 127.0.64.0/24, so the name answers NODATA; run 'min finalize-install' to open boxes by name"
+      echo "::endgroup::"
+      return 0
+    fi
+    if [ -z "$han_addr" ]; then
+      echo "::error::$han_name.min.internal answered no address after 30 s"
+      echo "--- dig ---"; printf '%s\n' "$han_reply"
+      han_fail
+    fi
+    case "$han_addr" in
+      127.0.64.*) ;;
+      *)
+        echo "::error::$han_name.min.internal answered $han_addr, not the node's address in 127.0.64.0/24"
+        han_fail
+        ;;
+    esac
+
+    han_body=""
+    han_code=""
+    for _ in $(seq 1 60); do
+      han_out="$(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy \
+        curl -sS --noproxy '*' --max-time 5 -w '\n%{http_code}' \
+        --resolve "$han_name.min.internal:$han_port:$han_addr" \
+        "http://$han_name.min.internal:$han_port/" 2>"$WORK/han-curl.err" || true)"
+      han_code="$(printf '%s\n' "$han_out" | tail -n1)"
+      han_body="$(printf '%s\n' "$han_out" | sed '$d')"
+      [ "$han_code" = 200 ] && [ "$han_body" = "$han_name" ] && break
+      sleep 0.5
+    done
+    echo "request: GET http://$han_name.min.internal:$han_port/ at $han_addr -> status ${han_code:-none}, body '${han_body}'"
+    if [ "$han_code" != 200 ] || [ "$han_body" != "$han_name" ]; then
+      echo "::error::http://$han_name.min.internal:$han_port/ did not open $han_name's page at $han_addr with no proxy setting"
+      echo "--- curl stderr ---"; cat "$WORK/han-curl.err" 2>/dev/null || true
+      han_fail
+    fi
+    # One record must carry the address the name answered, this exact port,
+    # and the bound outcome, so the mirror is proved at that address.
+    han_mirror_rec="$(minvmd_log_lines "mirrored a host-address box's bind at the node's address" \
+      | grep -F -- "\"address\":\"$han_addr\"" \
+      | grep -E -- "\"port\":${han_port}[,}]" \
+      | grep -F -- '"outcome":"bound"' | tail -n1)"
+    if [ -z "$han_mirror_rec" ]; then
+      echo "::error::the VM host daemon's log has no bound mirrored-bind record at $han_addr port $han_port, though the request reached the box"
+      han_fail
+    fi
+    echo "mirrored bind: $han_mirror_rec"
+    echo "$han_name opens by name at the node's address $han_addr"
+  else
+    # ---- native lane: host.min.internal against the documented literal -----
+    HAN_HOST_DIR="$(hook_mktemp /tmp/mnlhan.XXXXXX)"
+    printf '%s\n' "$han_marker" > "$HAN_HOST_DIR/marker"
+    ( cd "$HAN_HOST_DIR" && exec python3 -m http.server "$han_host_port" --bind 127.0.0.1 ) \
+      >/dev/null 2>"$WORK/han-hostsrv.err" &
+    HAN_HOST_SRV_PID=$!
+    for han_i in $(seq 1 40); do
+      [ "$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' \
+        "http://127.0.0.1:$han_host_port/marker" 2>/dev/null || true)" = 200 ] && break
+      [ "$han_i" = 40 ] && {
+        echo "::error::the host listener never answered on 127.0.0.1:$han_host_port"
+        cat "$WORK/han-hostsrv.err" 2>/dev/null || true
+        han_fail
+      }
+      sleep 0.25
+    done
+    echo "host listener: 127.0.0.1:$han_host_port serves $han_marker"
+
+    han_addr="$(mnl session exec "$han_sid" "getent ahostsv4 host.min.internal" 2>"$WORK/han-getent.err" \
+      | awk 'NR == 1 { print $1 }' | tr -d '\r')" || true
+    echo "lookup: host.min.internal in $han_name -> ${han_addr:-none}"
+    if [ "${han_addr:-}" != 127.0.0.1 ]; then
+      echo "::error::host.min.internal resolved to '${han_addr:-none}' in a native host-address box, not the documented host literal 127.0.0.1"
+      echo "--- getent stderr ---"; cat "$WORK/han-getent.err" 2>/dev/null || true
+      han_fail
+    fi
+
+    for han_i in "host.min.internal" "127.0.0.1"; do
+      han_out="$(mnl session exec "$han_sid" \
+        "curl -sS --noproxy '*' --max-time 10 -w '\n%{http_code} %{remote_ip}' http://$han_i:$han_host_port/marker" \
+        2>"$WORK/han-alias.err" | tr -d '\r')" || true
+      han_code="$(printf '%s\n' "$han_out" | tail -n1)"
+      han_body="$(printf '%s\n' "$han_out" | sed '$d' | head -n1)"
+      echo "request: GET http://$han_i:$han_host_port/marker from $han_name -> status ${han_code%% *}, address ${han_code#* }, body '${han_body}'"
+      if [ "$han_code" != "200 127.0.0.1" ] || [ "$han_body" != "$han_marker" ]; then
+        echo "::error::http://$han_i:$han_host_port/marker from the host-address box did not reach the host listener at 127.0.0.1"
+        echo "--- exec stderr ---"; cat "$WORK/han-alias.err" 2>/dev/null || true
+        han_fail
+      fi
+    done
+    kill "$HAN_HOST_SRV_PID" 2>/dev/null || true
+    HAN_HOST_SRV_PID=""
+    echo "host.min.internal and 127.0.0.1 reach the same host listener from $han_name"
+  fi
+
+  mnl session destroy --force "$han_sid" >/dev/null 2>&1 || true
+  han_print_logs
+  echo "host-address names and host alias OK"
   echo "::endgroup::"
 }
 
@@ -29915,6 +30374,7 @@ case "${1:-}" in
   "")
     proof_lifecycle
     proof_session_exec
+    proof_exec_reattach
     proof_session_rename
     proof_session_outbound_request
     proof_own_ip
@@ -29946,6 +30406,7 @@ case "${1:-}" in
     fi
     proof_native_resolution_without_proxy_env
     proof_native_resolution_from_host_answerer_on_vm_host
+    proof_host_address_names_and_host_alias
     proof_box_name_resolves_natively_without_proxy
     # The answerer-service proof installs a root-run unit; a macOS lane runs
     # it only under the privileged opt-in (no macOS CI lane has the
@@ -30029,12 +30490,13 @@ case "${1:-}" in
     # rely on the lane's daemon or the host's packet filter as it found them.
     proof_daemon_fetch_under_deny_all_host_address_box
     ;;
-  lifecycle | session_exec | session_rename | session_outbound_request | own_ip | own_ip_egress_declared_and_enforced | task_run | task_network_inherits_session | hooks \
+  lifecycle | session_exec | exec_reattach | session_rename | session_outbound_request | own_ip | own_ip_egress_declared_and_enforced | task_run | task_network_inherits_session | hooks \
     | skip_scaffold | tty_relay | sandbox | restart | fresh_install_own_ip_ingress_publishes_loopback \
     | own_ip_box_registers_with_the_vm_host_without_a_provider_flag \
     | vm_host_row_read_tracks_create_and_destroy \
     | network_posture_from_stock_install | native_resolution_without_proxy_env \
     | native_resolution_from_host_answerer_on_vm_host \
+    | host_address_names_and_host_alias \
     | local_range_reserved_by_privileged_step \
     | box_name_resolves_natively_without_proxy \
     | answerer_survives_session_stop | native_answerer_survives_session_stop \
@@ -30101,12 +30563,13 @@ case "${1:-}" in
   *)
     echo "usage: $0 [case]"
     echo "  no argument: every proof, in the whole-lane order"
-    echo "  cases: lifecycle session_exec session_rename session_outbound_request own_ip own_ip_egress_declared_and_enforced task_run task_network_inherits_session hooks"
+    echo "  cases: lifecycle session_exec exec_reattach session_rename session_outbound_request own_ip own_ip_egress_declared_and_enforced task_run task_network_inherits_session hooks"
     echo "         skip_scaffold tty_relay sandbox restart fresh_install_own_ip_ingress_publishes_loopback"
     echo "         own_ip_box_registers_with_the_vm_host_without_a_provider_flag"
     echo "         vm_host_row_read_tracks_create_and_destroy"
     echo "         network_posture_from_stock_install native_resolution_without_proxy_env"
     echo "         native_resolution_from_host_answerer_on_vm_host"
+    echo "         host_address_names_and_host_alias"
     echo "         local_range_reserved_by_privileged_step"
     echo "         box_name_resolves_natively_without_proxy"
     echo "         answerer_survives_session_stop native_answerer_survives_session_stop"

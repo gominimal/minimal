@@ -3781,6 +3781,121 @@ mod managed {
         assert!(!output.contains("late"), "the pump ended: {output:?}");
     }
 
+    /// T32, end to end in the daemon: a terminal exec and a detached exec
+    /// run in a box. The client of each goes away, and only the exec id is
+    /// left. A new lookup by that id attaches to the terminal again: it
+    /// replays what the exec wrote, including what it wrote with no client,
+    /// takes input, and ends with the exec's exit. The detached exec's
+    /// output reads by its id, and reads again the same.
+    #[tokio::test]
+    async fn terminal_exec_reattached_by_id_after_client_drop() {
+        let disk = box_on_disk();
+        let box_id = disk.exec_box.record.id;
+
+        let tty_id = {
+            let entry = disk.start(
+                ExecMode::Tty,
+                &[
+                    "sh",
+                    "-c",
+                    r#"read a; echo "got:$a"; sleep 1; echo while-away; read b; echo "got:$b""#,
+                ],
+                None,
+                false,
+            );
+            entry.id.clone()
+        };
+        let detached_id = {
+            let entry = disk.start(
+                ExecMode::Detached,
+                &[
+                    "sh",
+                    "-c",
+                    "echo detached-early; sleep 1; echo detached-late",
+                ],
+                None,
+                false,
+            );
+            entry.id.clone()
+        };
+
+        // First client: attach by id, type a line, see the answer, go away.
+        let found = find_exec(box_id, &tty_id).expect("the id finds the terminal exec");
+        let (typed, msgs) = super::msg_stream();
+        let (mut client, mut server) = tokio::io::duplex(1 << 16);
+        let first = tokio::spawn({
+            let found = Arc::clone(&found);
+            async move { relay_terminal(&found, msgs, &mut server).await }
+        });
+        typed
+            .send(russh::ChannelMsg::Data {
+                data: b"one\n".to_vec().into(),
+            })
+            .unwrap();
+        let mut seen = String::new();
+        read_until(&mut client, &mut seen, "got:one").await;
+        drop(typed);
+        drop(client);
+        assert_eq!(first.await.unwrap().unwrap(), AttachEnd::ClientGone);
+        drop(found);
+
+        // No client now. The exec writes on, and its id still finds it.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let found = find_exec(box_id, &tty_id).expect("the id finds the exec after the drop");
+        assert_eq!(found.mode, ExecMode::Tty);
+
+        // Second client, by the id alone: the replay holds what the exec
+        // wrote with no client, then input reaches it, then it exits.
+        let (typed, msgs) = super::msg_stream();
+        let (mut client, mut server) = tokio::io::duplex(1 << 16);
+        let second = tokio::spawn({
+            let found = Arc::clone(&found);
+            async move { relay_terminal(&found, msgs, &mut server).await }
+        });
+        let mut seen = String::new();
+        read_until(&mut client, &mut seen, "while-away").await;
+        assert!(seen.contains("got:one"), "the replay: {seen:?}");
+        typed
+            .send(russh::ChannelMsg::Data {
+                data: b"two\n".to_vec().into(),
+            })
+            .unwrap();
+        read_until(&mut client, &mut seen, "got:two").await;
+        match tokio::time::timeout(Duration::from_secs(10), second)
+            .await
+            .expect("the attach ends with the exec")
+            .unwrap()
+            .unwrap()
+        {
+            AttachEnd::Exited(exit) => assert_eq!(exit.code, Some(0)),
+            other => panic!("the attach ends with the exec, got {other:?}"),
+        }
+        let transcript = disk.output(&tty_id).await;
+        for line in ["got:one", "while-away", "got:two"] {
+            assert!(transcript.contains(line), "{line}: {transcript:?}");
+        }
+
+        // The detached exec: its client is gone, and its id reads its output.
+        let detached = find_exec(box_id, &detached_id).expect("the id finds the detached exec");
+        let exit = tokio::time::timeout(Duration::from_secs(10), detached.wait())
+            .await
+            .expect("the detached exec ends by itself");
+        assert_eq!(exit.code, Some(0));
+        let first_read = disk.output(&detached_id).await;
+        assert_eq!(first_read, "detached-early\ndetached-late\n");
+        assert_eq!(disk.output(&detached_id).await, first_read, "a read again");
+
+        // Each exec's events name its own id, start and exit.
+        for id in [&tty_id, &detached_id] {
+            let kinds: Vec<_> = disk.exec_events(id).into_iter().map(|e| e.kind).collect();
+            assert!(
+                kinds.contains(&BoxEventType::ExecStarted),
+                "{id}: {kinds:?}"
+            );
+            assert!(kinds.contains(&BoxEventType::ExecExited), "{id}: {kinds:?}");
+        }
+    }
+
     /// BOX-151: a stop ends one exec. The exec's process gets SIGTERM
     /// (here a stand-in for the injection shim, which ends its process
     /// group on SIGTERM), and the whole group is gone after it. The stop
