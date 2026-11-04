@@ -1306,16 +1306,21 @@ ct_mark_conflicts_in() {
             # --save-mark with no --mask or --ctmask. An nft `ct mark set`
             # is decoded whole by ct_set_writes, so the 0x values its value
             # names are not scanned again below: the mask of an "and" names
-            # the bits the write keeps, not the ones it uses.
-            scan = line
-            if (match(line, /ct mark set /)) {
-                nt = split(substr(line, RSTART + RLENGTH), toks, /[ \t]+/)
+            # the bits the write keeps, not the ones it uses. A rule can
+            # carry more than one statement, so every `ct mark set` on the
+            # line is decoded, each from where the last value ended.
+            scan = ""
+            rest = line
+            while (match(rest, /ct mark set /)) {
+                scan = scan " " substr(rest, 1, RSTART - 1)
+                nt = split(substr(rest, RSTART + RLENGTH), toks, /[ \t]+/)
                 ct_set_writes(toks, nt)
                 if (wall) whole = 1
                 if (wa || wb) hit = 1
-                scan = substr(line, 1, RSTART - 1)
-                for (k = stop; k <= nt; k++) scan = scan " " toks[k]
+                rest = ""
+                for (k = stop; k <= nt; k++) rest = rest " " toks[k]
             }
+            scan = scan " " rest
             if (line ~ /CONNMARK/) {
                 for (i = 1; i < NF; i++) {
                     if ($i == "--set-mark" || $i == "--set-xmark") {

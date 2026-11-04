@@ -8648,6 +8648,19 @@ mod tests {
             // default bits conflicts and one beside them does not.
             ("mark and 0x30000000", true, false),
             ("mark and 0x00ff0000", false, false),
+            // A rule with two statements: each `ct mark set` is decoded,
+            // so a later write is not hidden behind a masked one.
+            ("mark and 0x00ff0000 ct mark set meta mark", true, true),
+            (
+                "mark and 0x00ff0000 ct mark set mark and 0x30000000",
+                true,
+                false,
+            ),
+            (
+                "mark and 0x00ff0000 ct mark set ct mark and 0xffffffcf",
+                false,
+                false,
+            ),
             // A native save keeping every bit outside 0x00ff0000.
             (
                 "ct mark & 0xff00ffff | meta mark & 0x00ff0000",
