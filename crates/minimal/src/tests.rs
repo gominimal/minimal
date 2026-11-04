@@ -6432,3 +6432,261 @@ async fn ls_reports_every_proxy_port() {
     assert_eq!(request.trim(), r#"{"verb":"proxy_ports"}"#);
     assert!(cmd::vm_host_proxy_ports_at(None).await.is_empty());
 }
+
+/// One local host for the box address tests.
+fn address_host(provider: &'static str, host: &str, selected: bool) -> LocalHost {
+    LocalHost {
+        provider,
+        host: host.to_owned(),
+        sock: std::path::PathBuf::from(format!("/nonexistent/{host}/ssh.sock")),
+        selected,
+    }
+}
+
+/// One box record for the box address tests.
+fn address_entry(id: &str, name: &str, state: &str) -> minimald_rpc::BoxListingEntry {
+    minimald_rpc::BoxListingEntry {
+        box_id: boxes::SessionId::parse_str(id).expect("a valid box id"),
+        name: Some(name.to_owned()),
+        box_type: Some("session".to_owned()),
+        parent: None,
+        project_root: None,
+        state: state.to_owned(),
+        reason: None,
+        exit_code: None,
+        signal: None,
+    }
+}
+
+/// A host that answered with `boxes`.
+fn answered(host: LocalHost, boxes: Vec<minimald_rpc::BoxListingEntry>) -> HostListing {
+    HostListing {
+        host,
+        boxes: Ok(boxes),
+    }
+}
+
+/// The refusal an address resolves to, as the command prints it, with the
+/// exit code the binary ends with.
+fn refused(address: &str, listings: &[HostListing]) -> (String, u8) {
+    let refusal = resolve_box_address(address, listings).expect_err("the address must be refused");
+    let code = refusal.exit_code();
+    // The binary finds the refusal through the error chain it travels in.
+    let err = anyhow::Error::from(refusal).context("looking up the box");
+    let found = err
+        .downcast_ref::<BoxAddressRefusal>()
+        .expect("the refusal stays findable under context");
+    (found.to_string(), code)
+}
+
+/// BCLI-002: a box address is an id, a name, or `provider/host/name`, and
+/// each form finds the box on whichever local host keeps it.
+#[test]
+fn box_address_accepts_id_name_and_qualified() {
+    let alpha = address_host(LOCAL_MINVMD_PROVIDER, "alpha.local-minvmd0", true);
+    let beta = address_host(LOCAL_MINVMD_PROVIDER, "beta.local-minvmd0", false);
+    let web = address_entry("0199f000-0000-7000-8000-000000000001", "web", "running");
+    let db = address_entry("0199f100-0000-7000-8000-000000000002", "db", "exited");
+    let web_beta = address_entry("0199f200-0000-7000-8000-000000000003", "web", "stopped");
+    let listings = [
+        answered(alpha.clone(), vec![web.clone()]),
+        answered(beta.clone(), vec![db.clone(), web_beta.clone()]),
+    ];
+    let resolve = |address: &str| resolve_box_address(address, &listings).expect(address);
+
+    // A full id finds its box on the host that lists it.
+    let by_id = resolve(&db.box_id.to_string());
+    assert_eq!((by_id.box_id, by_id.host), (db.box_id, beta.clone()));
+    // A unique start of an id does too.
+    assert_eq!(resolve("0199f1").box_id, db.box_id);
+    // A name finds the box on another host, compared without case.
+    let by_name = resolve("DB");
+    assert_eq!((by_name.box_id, by_name.host), (db.box_id, beta.clone()));
+    // A name a running box holds on one host and a stopped box holds on
+    // another resolves to the running box.
+    assert_eq!(resolve("web").box_id, web.box_id);
+    // `provider/host/name` picks the box on that host.
+    let qualified = resolve("local-minvmd/beta.local-minvmd0/web");
+    assert_eq!(
+        (qualified.box_id, qualified.host),
+        (web_beta.box_id, beta.clone())
+    );
+    // The last part of a qualified address can be an id.
+    assert_eq!(
+        resolve(&format!("local-minvmd/alpha.local-minvmd0/{}", web.box_id)).box_id,
+        web.box_id
+    );
+    // A qualified address reads only its own host, so an unreachable host
+    // elsewhere does not stop it.
+    let partial = [
+        answered(alpha, vec![web.clone()]),
+        HostListing {
+            host: beta,
+            boxes: Err("connection refused".to_owned()),
+        },
+    ];
+    assert_eq!(
+        resolve_box_address("local-minvmd/alpha.local-minvmd0/web", &partial)
+            .expect("the qualified address resolves")
+            .box_id,
+        web.box_id
+    );
+    // A name with a slash in the wrong place is not a qualified address.
+    assert_eq!(
+        parse_box_address("a/b"),
+        BoxAddress::Unqualified("a/b"),
+        "two parts are not provider/host/name"
+    );
+}
+
+/// BCLI-002, BOX-005: a name that running boxes on two hosts hold is
+/// refused with exit 2, and the refusal lists each box with its host.
+#[test]
+fn ambiguous_name_across_hosts_exit2_lists_candidates() {
+    let listings = [
+        answered(
+            address_host(LOCAL_MINVMD_PROVIDER, "alpha.local-minvmd0", true),
+            vec![address_entry(
+                "0199f000-0000-7000-8000-000000000001",
+                "web",
+                "running",
+            )],
+        ),
+        answered(
+            address_host(LOCAL_MINVMD_PROVIDER, "beta.local-minvmd0", false),
+            vec![address_entry(
+                "0199f200-0000-7000-8000-000000000003",
+                "web",
+                "running",
+            )],
+        ),
+    ];
+    let (message, code) = refused("web", &listings);
+    assert_eq!(code, 2);
+    assert_eq!(
+        message,
+        "web matches boxes on more than one host:\n\
+         \x20 local-minvmd/alpha.local-minvmd0/web  running  0199f000-0000-7000-8000-000000000001\n\
+         \x20 local-minvmd/beta.local-minvmd0/web  running  0199f200-0000-7000-8000-000000000003\n\
+         Name one as provider/host/name."
+    );
+}
+
+/// BCLI-002, BOX-005: a name that only stopped or exited boxes on two
+/// hosts hold is refused with exit 2, and the refusal lists each box with
+/// its host and state.
+#[test]
+fn retained_name_across_hosts_exit2_lists_host_and_state() {
+    let mut exited = address_entry("0199f000-0000-7000-8000-000000000001", "web", "exited");
+    exited.exit_code = Some(0);
+    let listings = [
+        answered(address_host(LOCAL_PROVIDER, "local0", true), vec![exited]),
+        answered(
+            address_host(LOCAL_PROVIDER, "local1", false),
+            vec![address_entry(
+                "0199f200-0000-7000-8000-000000000003",
+                "web",
+                "stopped",
+            )],
+        ),
+    ];
+    let (message, code) = refused("web", &listings);
+    assert_eq!(code, 2);
+    assert_eq!(
+        message,
+        "web matches boxes on more than one host:\n\
+         \x20 local/local0/web  exited (exit 0)  0199f000-0000-7000-8000-000000000001\n\
+         \x20 local/local1/web  stopped  0199f200-0000-7000-8000-000000000003\n\
+         Name one as provider/host/name."
+    );
+}
+
+/// BCLI-002: a host that does not answer while an unqualified name
+/// resolves fails the lookup with exit 7 and names each such host. A
+/// match on a host that answered is not chosen.
+#[test]
+fn unqualified_name_with_unreachable_host_exit7_names_host() {
+    let silent = |host: &str| HostListing {
+        host: address_host(LOCAL_MINVMD_PROVIDER, host, false),
+        boxes: Err("did not answer".to_owned()),
+    };
+    let listings = [
+        answered(
+            address_host(LOCAL_MINVMD_PROVIDER, "alpha.local-minvmd0", true),
+            vec![address_entry(
+                "0199f000-0000-7000-8000-000000000001",
+                "web",
+                "running",
+            )],
+        ),
+        silent("beta.local-minvmd0"),
+    ];
+    let (message, code) = refused("web", &listings);
+    assert_eq!(code, 7);
+    assert_eq!(
+        message,
+        "Could not reach host beta.local-minvmd0. Box web can be on that host, \
+         so no box was chosen. Run the command again when the host answers, \
+         or name the box as provider/host/name."
+    );
+
+    // Two hosts that do not answer are both named.
+    let two = [
+        listings[0].clone(),
+        silent("beta.local-minvmd0"),
+        silent("gamma.local-minvmd0"),
+    ];
+    let (message, code) = refused("web", &two);
+    assert_eq!(code, 7);
+    assert!(
+        message.starts_with(
+            "Could not reach hosts beta.local-minvmd0, gamma.local-minvmd0. \
+             Box web can be on one of them"
+        ),
+        "{message}"
+    );
+    // A qualified address on a host that does not answer names that host.
+    let (message, code) = refused("local-minvmd/beta.local-minvmd0/web", &listings);
+    assert_eq!(code, 7);
+    assert!(
+        message.starts_with("Could not reach host beta.local-minvmd0."),
+        "{message}"
+    );
+}
+
+/// BCLI-064: an address that names no box fails with exit 4 and names
+/// the address, in every form.
+#[test]
+fn unknown_box_address_exit4_names_address() {
+    let listings = [
+        answered(
+            address_host(LOCAL_MINVMD_PROVIDER, "alpha.local-minvmd0", true),
+            vec![address_entry(
+                "0199f000-0000-7000-8000-000000000001",
+                "web",
+                "running",
+            )],
+        ),
+        answered(
+            address_host(LOCAL_MINVMD_PROVIDER, "beta.local-minvmd0", false),
+            vec![],
+        ),
+    ];
+    for address in [
+        "no-such-box",
+        "0199ffff-0000-7000-8000-000000000009",
+        "local-minvmd/beta.local-minvmd0/web",
+        "local-minvmd/no-such-host/web",
+        "local/alpha.local-minvmd0/web",
+    ] {
+        let (message, code) = refused(address, &listings);
+        assert_eq!(code, 4, "{address}");
+        assert_eq!(
+            message,
+            format!(
+                "No box named {address}. \
+                 Run `min box list --all` to see the boxes on every host."
+            )
+        );
+    }
+}
