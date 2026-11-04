@@ -296,6 +296,9 @@ fn every_daemon_connection_is_classified() {
             // `min host list|show` probes each local host for its state and
             // daemon version. It only reads, and it must show a skewed
             // daemon's version, so it must work when the pair is skewed.
+            // `min host stop` stops the daemon, as `min stop` does: the
+            // remedy the version check names, so it is never gated by it.
+            "cmd/hosts.rs::cmd_host_stop = ungated",
             "cmd/hosts.rs::probe_host = ungated",
             "cmd/list.rs::cmd_bare = gated",
             // `min ls` reaches past the selected VM, and the two halves carry
@@ -372,6 +375,9 @@ fn every_daemon_connection_is_classified() {
             // Not a product path: the host show test's own connection to
             // the harness daemon, to read the version it expects.
             "tests.rs::host_show_socket_and_version = ungated",
+            // Not a product path: the host stop test's own connection to the
+            // harness daemon, to list the boxes it expects stopped.
+            "tests.rs::host_stop_force_forces_boxes_and_daemon = ungated",
             "tests.rs::local_member_is_a_sign_in_reference_expiring_with_the_root = ungated",
             // Not a product path, and not the daemon: the audit test submits
             // a revocation to a test Box Egress Proxy's control socket.
@@ -6752,6 +6758,90 @@ async fn host_show_socket_and_version() {
     assert_eq!(
         err.to_string(),
         "no local host is named 'local-minimald0'. Run `min host list` to see the local hosts."
+    );
+}
+
+/// BCLI-049: `min host stop --force` force-stops each running box on the
+/// host, then stops its daemon. Each box gets the forced stop, and none the
+/// graceful one. The daemon then refuses box work, because it is shutting
+/// down. The last line says what stopped.
+#[tokio::test]
+async fn host_stop_force_forces_boxes_and_daemon() {
+    let log = minimald::test_harness::captured_log();
+    let state = state_with_host_dirs(&["local-minimald0"]);
+    let sock = state.path().join("providers/local-minimald0/ssh.sock");
+    let server = minimald::test_harness::TestServer::new().await;
+    server.listen_on_uds(&sock).await;
+    let project = tempfile::TempDir::new().unwrap();
+    let mut daemon = server.connect().await;
+    for name in ["web", "api"] {
+        minimald::test_harness::create_configured_session(
+            &mut daemon,
+            name,
+            project.path().to_str().unwrap(),
+        )
+        .await;
+    }
+    let ids: Vec<(String, boxes::SessionId)> = {
+        let mut client = client::Client::connect(&sock).await.expect("connect");
+        list_box_records(&mut client, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.name.unwrap_or_default(), entry.box_id))
+            .collect()
+    };
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert!(!server.state.sessions_manager().await.is_shutting_down());
+
+    let mut out = Vec::new();
+    let args = HostStopArgs {
+        host: "local0".to_owned(),
+        force: true,
+    };
+    cmd::hosts::cmd_host_stop(&host_globals(state.path()), &args, &mut out)
+        .await
+        .expect("host stop --force runs");
+    let text = String::from_utf8(out).unwrap();
+    let mut lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines.pop(),
+        Some("Stopped 2 boxes and the daemon on local0."),
+        "{text}"
+    );
+    lines.sort_unstable();
+    assert_eq!(lines, ["Stopped api.", "Stopped web."], "{text}");
+
+    // Each box got the forced stop of BOX-013, and no graceful one.
+    let log = log.contents();
+    let served = |id: boxes::SessionId, force: bool| {
+        log.lines()
+            .filter(|line| {
+                line.contains("session stopped")
+                    && line.contains(&format!("session_id={id}"))
+                    && line.contains(&format!("force={force}"))
+            })
+            .count()
+    };
+    for (name, id) in &ids {
+        assert_eq!(served(*id, true), 1, "{name}: {log}");
+        assert_eq!(served(*id, false), 0, "{name}: {log}");
+    }
+
+    // The daemon is shutting down.
+    assert!(
+        server.state.sessions_manager().await.is_shutting_down(),
+        "the daemon is shutting down after host stop"
+    );
+
+    // A VM host's line names its VM too, and one box is one box.
+    assert_eq!(
+        cmd::hosts::host_stop_summary(1, "local-minvmd0", true),
+        "Stopped 1 box, the daemon and its VM on local-minvmd0."
+    );
+    assert_eq!(
+        cmd::hosts::host_stop_summary(3, "local-minvmd0", true),
+        "Stopped 3 boxes, the daemon and its VM on local-minvmd0."
     );
 }
 

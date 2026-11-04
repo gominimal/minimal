@@ -308,35 +308,7 @@ pub(crate) async fn stop_wedged_vm_from_host(
 ) -> Result<(), anyhow::Error> {
     let host_dir = client::resolve_host_dir(minimal_dir.as_deref(), true)
         .context("resolving the VM's provider dir for a host-side stop")?;
-
-    // The stop sleep-polls the VMM's exit and the wait polls the alive lock,
-    // so both go on the blocking pool rather than stalling an async worker
-    // (rust-coding-standards: no blocking in an async context).
-    let outcome = tokio::task::spawn_blocking(move || {
-        let state_dir = minvmd::state::StateDir::new(host_dir.clone())
-            .context("opening the VM's state dir for a host-side stop")?;
-        let state = state_dir
-            .effective_state()
-            .context("reading the VM's state for a host-side stop")?;
-        // Checked first: the VM going down on its own (or a dead supervisor's
-        // stale state being repaired by the read above) since the caller's
-        // liveness probe is the goal state, not a boot to wait out.
-        if !state.lifecycle.is_active() {
-            return Ok(minvmd::cmd::stop::HostStop::NothingSignalled);
-        }
-        if state.lifecycle == minvmd::lifecycle::Lifecycle::Starting || state.vmm_pid.is_none() {
-            anyhow::bail!(
-                "the VM is still booting; retry `{}` once it is up",
-                stop_command()
-            );
-        }
-        let outcome = minvmd::cmd::stop::stop_at(host_dir, quiesce_guest)
-            .context("stopping the VM from the host")?;
-        wait_for_alive_lock_released(&state_dir, HOST_STOP_RELEASE_WAIT)?;
-        Ok(outcome)
-    })
-    .await
-    .context("the host-side stop of the VM panicked")??;
+    let outcome = stop_vm_from_host_at(host_dir, quiesce_guest, stop_command()).await?;
 
     // stderr, so it survives the `>/dev/null` every scripted caller wraps
     // `stop` in. The loss caveat is only true of a guest that was killed: one
@@ -351,6 +323,42 @@ pub(crate) async fn stop_wedged_vm_from_host(
         HostStop::GuestUnacknowledged => eprintln!("{UNACKNOWLEDGED_STOP_CAVEAT}"),
     }
     Ok(())
+}
+
+/// Stop the VM whose state directory is `host_dir` from this machine, as
+/// `minvmd stop` does, then wait until minvmd releases the VM's alive lock.
+/// `retry` is the command a VM that is still booting is told to run again.
+/// [`stop_wedged_vm_from_host`] and `min host stop --force` share it.
+pub(crate) async fn stop_vm_from_host_at(
+    host_dir: PathBuf,
+    quiesce_guest: bool,
+    retry: String,
+) -> Result<minvmd::cmd::stop::HostStop, anyhow::Error> {
+    // The stop sleep-polls the VMM's exit and the wait polls the alive lock,
+    // so both go on the blocking pool rather than stalling an async worker
+    // (rust-coding-standards: no blocking in an async context).
+    tokio::task::spawn_blocking(move || {
+        let state_dir = minvmd::state::StateDir::new(host_dir.clone())
+            .context("opening the VM's state dir for a host-side stop")?;
+        let state = state_dir
+            .effective_state()
+            .context("reading the VM's state for a host-side stop")?;
+        // Checked first: the VM going down on its own (or a dead supervisor's
+        // stale state being repaired by the read above) since the caller's
+        // liveness probe is the goal state, not a boot to wait out.
+        if !state.lifecycle.is_active() {
+            return Ok(minvmd::cmd::stop::HostStop::NothingSignalled);
+        }
+        if state.lifecycle == minvmd::lifecycle::Lifecycle::Starting || state.vmm_pid.is_none() {
+            anyhow::bail!("the VM is still booting; retry `{retry}` once it is up");
+        }
+        let outcome = minvmd::cmd::stop::stop_at(host_dir, quiesce_guest)
+            .context("stopping the VM from the host")?;
+        wait_for_alive_lock_released(&state_dir, HOST_STOP_RELEASE_WAIT)?;
+        Ok(outcome)
+    })
+    .await
+    .context("the host-side stop of the VM panicked")?
 }
 
 /// What `min stop --force` says after killing a VM whose guest did not
@@ -510,6 +518,121 @@ where
                 Err(rpc_err)
             }
         }
+    }
+}
+
+/// Stop the daemon of the host named `host`, over `client`, for
+/// `min host stop` (BCLI-049). `vm_dir` is the VM's state directory when
+/// the host is a VM host, and `None` for a native daemon.
+///
+/// Without `force`, the daemon gets the clean `Shutdown` that `min stop`
+/// sends, with the same drain budget on a VM. The call then waits until
+/// the VM is down. With `force`, the `Shutdown` skips the busy-box check and
+/// the drain budget. A VM is then stopped from this machine without a wait
+/// for its own shutdown. A guest that acknowledged has already drained its
+/// boxes and quiesced its volume, so it is not asked again.
+pub(crate) async fn shut_down_host_daemon(
+    mut client: client::Client,
+    host: &str,
+    vm_dir: Option<PathBuf>,
+    force: bool,
+) -> Result<(), anyhow::Error> {
+    use minimald_rpc::{Shutdown, ShutdownRequest, ShutdownResponse};
+    let force_command = format!("min host stop {host} --force");
+    let drain_budget = if vm_dir.is_some() && !force {
+        minvmd::cmd::stop::GUEST_SHUTDOWN_TIMEOUT.saturating_sub(client::RPC_TIMEOUT)
+    } else {
+        std::time::Duration::ZERO
+    };
+    let resp = client
+        .oneshot_rpc_with_hook_budget::<Shutdown>(ShutdownRequest { force }, drain_budget)
+        .await
+        .context("Shutdown RPC failed");
+    // The daemon holds its shutdown open for a drain grace while a client is
+    // still attached, and this is that client.
+    drop(client);
+    tracing::debug!(host, force, answer = ?resp.as_ref().ok(), "host daemon Shutdown answered");
+    let busy = || {
+        anyhow::anyhow!(
+            "the daemon on {host} did not stop, because a box on it is still busy. \
+             Run `{force_command}` to stop it anyway."
+        )
+    };
+    let Some(vm_dir) = vm_dir else {
+        return match resp? {
+            ShutdownResponse::ShuttingDown => Ok(()),
+            ShutdownResponse::SessionsLive => Err(busy()),
+        };
+    };
+    if force {
+        let acknowledged = matches!(resp, Ok(ShutdownResponse::ShuttingDown));
+        if let Err(e) = &resp {
+            tracing::debug!(
+                host,
+                "forced Shutdown failed, stopping the VM from this machine: {e:#}"
+            );
+        }
+        let outcome = stop_vm_from_host_at(vm_dir, false, force_command).await?;
+        if !acknowledged && outcome == minvmd::cmd::stop::HostStop::GuestUnacknowledged {
+            eprintln!("{UNACKNOWLEDGED_STOP_CAVEAT}");
+        }
+        return Ok(());
+    }
+    let stopped = || async {
+        let dir = vm_dir.clone();
+        tokio::task::spawn_blocking(move || wait_for_vm_stopped_at(&dir, HOST_STOP_RELEASE_WAIT))
+            .await
+            .unwrap_or(false)
+    };
+    match resp {
+        Ok(ShutdownResponse::ShuttingDown) => {
+            if stopped().await {
+                Ok(())
+            } else {
+                bail!(
+                    "the VM of {host} is still shutting down after {}s. \
+                     Run `{force_command}` to stop it from this machine.",
+                    HOST_STOP_RELEASE_WAIT.as_secs()
+                )
+            }
+        }
+        Ok(ShutdownResponse::SessionsLive) => Err(busy()),
+        // On a VM the daemon is the guest's pid-1, so a shutdown that worked
+        // can take the reply down with it. A VM that is down is the goal.
+        Err(rpc_err) if stopped().await => {
+            tracing::debug!(
+                host,
+                "the Shutdown reply was lost, but the VM stopped: {rpc_err:#}"
+            );
+            Ok(())
+        }
+        Err(rpc_err) => Err(rpc_err.context(format!(
+            "the daemon on {host} did not stop. \
+             Run `{force_command}` to stop its VM from this machine."
+        ))),
+    }
+}
+
+/// Whether the VM whose state directory is `dir` is down within `timeout`.
+/// A state that cannot be read is no proof that it stopped.
+fn wait_for_vm_stopped_at(dir: &std::path::Path, timeout: std::time::Duration) -> bool {
+    let Ok(state_dir) = minvmd::state::StateDir::new(dir.to_path_buf()) else {
+        return false;
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match state_dir.effective_state() {
+            Ok(state) if !state.lifecycle.is_active() => return true,
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!(dir = %dir.display(), "VM state not read: {e:#}");
+                return false;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 

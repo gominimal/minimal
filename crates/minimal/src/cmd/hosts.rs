@@ -9,15 +9,19 @@
 //! a host is named after its daemon instance: `local0..N` for the native
 //! daemons (state directory `local-minimald<N>`), `local-minvmd0..N` for the
 //! VM host daemons.
+//!
+//! BCLI-049: `min host stop <host>` stops each running box on the host,
+//! then its daemon, and its VM on a VM host.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use anyhow::Context as _;
 use serde::Serialize;
 
 use super::output::{self, ObjectType, OutputMode, Rendered};
 use crate::client;
-use crate::{GlobalArgs, HostShowArgs, Provider, ProviderListArgs};
+use crate::{GlobalArgs, HostShowArgs, HostStopArgs, Provider, ProviderListArgs};
 
 /// The hint `--provider local-minimald` prints on stderr after the command
 /// ends (BCLI-046).
@@ -420,17 +424,7 @@ pub async fn cmd_host_show(
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     let hosts = local_hosts(global.minimal_dir.as_deref())?;
-    let Some(host) = hosts.iter().find(|h| h.name == args.host) else {
-        let mut msg = format!(
-            "no local host is named '{}'. Run `min host list` to see the local hosts.",
-            args.host
-        );
-        for note in unread_vm_notes(&hosts) {
-            msg.push('\n');
-            msg.push_str(&note);
-        }
-        anyhow::bail!(msg);
-    };
+    let host = named_host(&hosts, &args.host)?;
     let (state, daemon_version) = probe_host(host).await;
     let detail = HostDetail {
         name: host.name.clone(),
@@ -441,6 +435,125 @@ pub async fn cmd_host_show(
     };
     output::write_object(out, OutputMode::Text, &detail)?;
     Ok(())
+}
+
+/// The local host named `name`, or the refusal that names `min host list`.
+fn named_host<'a>(hosts: &'a [LocalHost], name: &str) -> anyhow::Result<&'a LocalHost> {
+    if let Some(host) = hosts.iter().find(|h| h.name == name) {
+        return Ok(host);
+    }
+    let mut msg =
+        format!("no local host is named '{name}'. Run `min host list` to see the local hosts.");
+    for note in unread_vm_notes(hosts) {
+        msg.push('\n');
+        msg.push_str(&note);
+    }
+    anyhow::bail!(msg)
+}
+
+/// The line `min host stop` prints once the boxes and the daemon of `host`
+/// are stopped. `vm` is true for a VM host, whose VM stops with its daemon.
+#[must_use]
+pub fn host_stop_summary(stopped_boxes: usize, host: &str, vm: bool) -> String {
+    let boxes = if stopped_boxes == 1 { "box" } else { "boxes" };
+    if vm {
+        format!("Stopped {stopped_boxes} {boxes}, the daemon and its VM on {host}.")
+    } else {
+        format!("Stopped {stopped_boxes} {boxes} and the daemon on {host}.")
+    }
+}
+
+/// `min host stop <host> [--force]` (BCLI-049): stops each running box on
+/// the host as `min box stop` does, then the daemon, and its VM on a VM
+/// host. `--force` force-stops each box, and stops the daemon without a
+/// wait for its clean shutdown. A host whose daemon is down is the goal
+/// state: the command says so and exits 0.
+///
+/// # Errors
+///
+/// No local host has that name, the daemon does not answer, a box or the
+/// daemon does not stop, or `out` fails.
+pub async fn cmd_host_stop(
+    global: &GlobalArgs,
+    args: &HostStopArgs,
+    mut out: &mut dyn Write,
+) -> anyhow::Result<()> {
+    let hosts = local_hosts(global.minimal_dir.as_deref())?;
+    let host = named_host(&hosts, &args.host)?;
+    let vm_dir = (host.provider == LocalProvider::LocalMinvmd).then(|| host.dir.clone());
+    let (state, _) = probe_host(host).await;
+    tracing::debug!(host = %host.name, ?state, force = args.force, "host stop");
+    if state == HostState::Stopped {
+        writeln!(out, "{} is not running.", host.name)?;
+        return Ok(());
+    }
+    // Ungated: as for `min stop`, stopping a daemon of another version is
+    // the remedy the version check itself names.
+    let mut client = match client::Client::connect(&host.socket()).await {
+        Ok(client) => client,
+        Err(e) => return host_unreachable(host, vm_dir, args.force, e, out).await,
+    };
+    let listed = super::list_box_records(&mut client, None)
+        .await
+        .with_context(|| format!("the boxes on {} were not listed", host.name))?;
+    let mut stopped = 0;
+    for entry in listed.iter().filter(|e| e.state == "running") {
+        let target = entry
+            .name
+            .clone()
+            .unwrap_or_else(|| entry.box_id.to_string());
+        super::stop_listed_box(&mut client, &mut out, entry.box_id, &target, args.force)
+            .await
+            .with_context(|| {
+                format!(
+                    "the daemon on {} was not stopped, because {target} did not stop",
+                    host.name
+                )
+            })?;
+        stopped += 1;
+    }
+    let vm = vm_dir.is_some();
+    super::shut_down_host_daemon(client, &host.name, vm_dir, args.force).await?;
+    writeln!(out, "{}", host_stop_summary(stopped, &host.name, vm))?;
+    Ok(())
+}
+
+/// `min host stop` for a host whose daemon does not answer. With `--force`
+/// on a VM host, the VM is stopped from this machine. Otherwise the command
+/// fails, and on a VM host it names `--force`.
+async fn host_unreachable(
+    host: &LocalHost,
+    vm_dir: Option<PathBuf>,
+    force: bool,
+    cause: anyhow::Error,
+    out: &mut dyn Write,
+) -> anyhow::Result<()> {
+    let force_command = format!("min host stop {} --force", host.name);
+    match vm_dir {
+        Some(dir) if force => {
+            tracing::debug!(host = %host.name, "daemon unreachable, stopping the VM from this machine: {cause:#}");
+            let outcome = super::stop_vm_from_host_at(dir, true, force_command).await?;
+            use minvmd::cmd::stop::HostStop;
+            match outcome {
+                HostStop::NothingSignalled => writeln!(out, "{} is not running.", host.name)?,
+                HostStop::GuestAcknowledged => {
+                    writeln!(out, "Stopped the daemon and its VM on {}.", host.name)?;
+                }
+                HostStop::GuestUnacknowledged => writeln!(
+                    out,
+                    "The daemon on {} did not answer, so its VM was stopped from this machine. \
+                     Its boxes ended without their stop steps.",
+                    host.name
+                )?,
+            }
+            Ok(())
+        }
+        Some(_) => Err(cause.context(format!(
+            "the daemon on {} does not answer. Run `{force_command}` to stop its VM from this machine.",
+            host.name
+        ))),
+        None => Err(cause.context(format!("the daemon on {} does not answer.", host.name))),
+    }
 }
 
 /// `min provider list [--all]` (BCLI-052). Without `--all`, the provider
