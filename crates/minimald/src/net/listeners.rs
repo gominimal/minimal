@@ -898,7 +898,8 @@ pub(crate) fn report_expose_decision(
     send_host_audit(
         channel,
         minimald_rpc::BoxControlRequest::ReportExposeDecision(minimald_rpc::ExposeDecisionReport {
-            switch_address,
+            switch_address: Some(switch_address),
+            box_id: None,
             port,
             decision,
             decided_by,

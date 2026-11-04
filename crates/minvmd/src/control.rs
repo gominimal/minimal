@@ -2555,11 +2555,17 @@ struct ExposeDecisionAudit {
     /// Who asserted this record: always `guest`. The in-VM daemon reported
     /// it, and the host did not observe it.
     reported_by: &'static str,
-    /// The box the decision was about, from the row.
+    /// The box the decision was about, from the row, or from what the
+    /// host holds under the box id for a box with no switch.
     #[serde(rename = "box")]
     box_name: String,
-    /// The row key the report named.
-    switch_address: Ipv4Addr,
+    /// The row key the report named; absent for a box with no switch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    switch_address: Option<Ipv4Addr>,
+    /// The box id the report named a box with no switch by; absent when
+    /// the row key named the box.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    box_id: Option<String>,
     /// The port the box asked to publish.
     port: u16,
     /// The decision the box's `dynamic_ingress` setting made.
@@ -2682,37 +2688,69 @@ fn clamp_guest_text(text: &str) -> String {
 }
 
 /// Serves the in-VM daemon's expose decision report (NET-046): one record
-/// in the host's audit log, the box named from the row at the report's
-/// switch address. A report at no row is refused and writes nothing.
+/// in the host's audit log. The box is named from the row at the report's
+/// switch address, or, for a box with no switch, from what the host holds
+/// under the report's box id ([`no_switch_box_name`]). A report that names
+/// no box the host holds is refused and writes nothing.
 fn audit_expose_decision(
     boxes: &BoxRegistry,
     audit_path: &Path,
     request: &minimald_rpc::ExposeDecisionReport,
 ) -> BoxControlReply {
-    let Some(record) = boxes.table().by_source(request.switch_address.octets()) else {
-        tracing::debug!(
-            switch_address = %request.switch_address,
-            "refused an expose decision report at an address no row holds"
-        );
-        return BoxControlReply::Error {
-            error: format!("no box is registered at {}", request.switch_address),
-        };
+    // The key the record and the per-box cap are filed under: the row's
+    // switch address, or the node's own address for a box with no switch,
+    // the address a `host_ip` box's frames carry (NET-085).
+    let (box_name, cap_key, box_id) = match (request.switch_address, request.box_id) {
+        (Some(switch_address), _) => {
+            let Some(record) = boxes.table().by_source(switch_address.octets()) else {
+                tracing::debug!(
+                    %switch_address,
+                    "refused an expose decision report at an address no row holds"
+                );
+                return BoxControlReply::Error {
+                    error: format!("no box is registered at {switch_address}"),
+                };
+            };
+            tracing::debug!(
+                box = %record.name(),
+                %switch_address,
+                key = "switch_address",
+                "found the expose decision report's box by its switch address"
+            );
+            (record.name().to_string(), switch_address, None)
+        }
+        (None, Some(box_id)) => {
+            let Some(box_name) = no_switch_box_name(boxes, box_id) else {
+                tracing::debug!(
+                    %box_id,
+                    "refused an expose decision report for a box id the host holds nothing for"
+                );
+                return BoxControlReply::Error {
+                    error: format!("no box with id {box_id} is known to the VM host"),
+                };
+            };
+            tracing::debug!(
+                box = %box_name,
+                %box_id,
+                key = "box_id",
+                "found the expose decision report's box by its box id"
+            );
+            (box_name, boxes.subnet().daemon_ip(), Some(box_id))
+        }
+        (None, None) => {
+            tracing::debug!("refused an expose decision report that names no box");
+            return BoxControlReply::Error {
+                error: "the expose decision report names no box".to_string(),
+            };
+        }
     };
-    let admission = admit_guest_audit(
-        audit_path,
-        request.switch_address,
-        None,
-        std::time::Instant::now(),
-    );
-    let audited = take_guest_audit(
-        audit_path,
-        record.name(),
-        request.switch_address,
-        &admission,
-    );
+    let admission = admit_guest_audit(audit_path, cap_key, None, std::time::Instant::now());
+    let audited = take_guest_audit(audit_path, &box_name, cap_key, &admission);
     if audited {
         tracing::info!(
-            box = %record.name(),
+            box = %box_name,
+            switch_address = ?request.switch_address,
+            box_id = ?box_id,
             port = request.port,
             decision = ?request.decision,
             decided_by = ?request.decided_by,
@@ -2726,8 +2764,11 @@ fn audit_expose_decision(
                 ts: unix_now_secs(),
                 event: "expose_decision",
                 reported_by: "guest",
-                box_name: record.name().to_string(),
+                box_name,
                 switch_address: request.switch_address,
+                // The 32 lowercase hex form every audit record spells a box
+                // id in ([`AskAudit::with_facts`]).
+                box_id: box_id.map(|box_id| box_id.simple()),
                 port: request.port,
                 decision: request.decision,
                 decided_by: request.decided_by,
@@ -2736,6 +2777,34 @@ fn audit_expose_decision(
         );
     }
     BoxControlReply::Audited { audited }
+}
+
+/// The name of the box a report with no switch address names by `box_id`
+/// (NET-046): a row filed under the id, a name held for it (a named
+/// `host_ip` box), or a resident `host_ip` box, which has no name the host
+/// holds and is named by its id. `None` when the host holds nothing under
+/// the id.
+fn no_switch_box_name(boxes: &BoxRegistry, box_id: minimald_rpc::BoxId) -> Option<String> {
+    let table = boxes.table();
+    if let Some(record) = table
+        .rows()
+        .into_iter()
+        .find(|record| record.box_id() == box_id.to_bytes())
+    {
+        return Some(record.name().to_string());
+    }
+    if let Some((name, _)) = boxes
+        .held_name_owners()
+        .into_iter()
+        .find(|(_, owner)| *owner == Some(box_id))
+    {
+        return Some(name);
+    }
+    table
+        .host_ip_boxes()
+        .iter()
+        .any(|rules| rules.session_id() == box_id)
+        .then(|| box_id.to_string())
 }
 
 /// Serves the in-VM daemon's refused egress report: one record per refused
@@ -3590,6 +3659,21 @@ fn record_ask_answer(
                 dismissed = ended.dismissed,
                 "recorded the attached client's answer to a pending ask; the first answer wins"
             );
+            // A yes admits the port into the row (NET-045), so it gets the
+            // same admission record an allow-decided expose does (NET-046).
+            if let minimald_rpc::AskAdmitOutcome::Admitted { port, proto, .. } = ended.outcome {
+                append_audit_line(
+                    audit_path,
+                    &AdmittedPortAudit {
+                        ts: unix_now_secs(),
+                        box_name: ended.facts.name.clone(),
+                        switch_address: ended.facts.switch_address,
+                        port,
+                        proto,
+                        source: PortReportSource::Ask,
+                    },
+                );
+            }
             if let Some(offered) = &ended.offered_next {
                 log_and_audit_offer(audit_path, offered);
             }
@@ -6850,10 +6934,10 @@ mod tests {
             );
         }
         let box_id = format!(r#""box_id":"{}""#, web.box_id.simple());
-        for line in audit
-            .lines()
-            .filter(|line| !line.contains("refused_unknown_id"))
-        {
+        // The yes also writes an admission record, which is not an ask line.
+        for line in audit.lines().filter(|line| {
+            line.contains(r#""event":"ask""#) && !line.contains("refused_unknown_id")
+        }) {
             assert!(
                 line.contains(&box_id) && line.contains(r#""proto":"tcp""#),
                 "each ask line names the box id and the protocol: {line}"
@@ -7931,7 +8015,8 @@ mod tests {
             let reply = control(
                 &guest,
                 &BoxControlRequest::ReportExposeDecision(minimald_rpc::ExposeDecisionReport {
-                    switch_address: web.switch_address,
+                    switch_address: Some(web.switch_address),
+                    box_id: None,
                     port,
                     decision,
                     decided_by: minimald_rpc::ExposeDecidedBy::BoxPolicy,
@@ -7944,7 +8029,8 @@ mod tests {
         let stray = control(
             &guest,
             &BoxControlRequest::ReportExposeDecision(minimald_rpc::ExposeDecisionReport {
-                switch_address: Ipv4Addr::new(192, 0, 2, 1),
+                switch_address: Some(Ipv4Addr::new(192, 0, 2, 1)),
+                box_id: None,
                 port: 3000,
                 decision: boxes::DynamicIngress::Allow,
                 decided_by: minimald_rpc::ExposeDecidedBy::BoxPolicy,
@@ -7960,7 +8046,8 @@ mod tests {
         let wrong_door = control(
             &sock_path,
             &BoxControlRequest::ReportExposeDecision(minimald_rpc::ExposeDecisionReport {
-                switch_address: web.switch_address,
+                switch_address: Some(web.switch_address),
+                box_id: None,
                 port: 3001,
                 decision: boxes::DynamicIngress::Allow,
                 decided_by: minimald_rpc::ExposeDecidedBy::BoxPolicy,
@@ -7985,6 +8072,154 @@ mod tests {
         assert_eq!(records[1]["reported_by"], "guest");
         assert_eq!(records[1]["decision"], "allow");
         assert_eq!(records[1]["outcome"], "published");
+    }
+
+    /// NET-046 for a box with no switch: its report carries its box id in
+    /// place of a row key, and the host names the box from what it holds
+    /// under that id. A held name names a named `host_ip` box, and a
+    /// resident `host_ip` box with no held name is named by its id. A report
+    /// for an id the host holds nothing for, or one that names no box, is
+    /// refused and writes nothing. An older guest's report, which always
+    /// carries a switch address and never a box id, still reads.
+    #[test]
+    fn expose_decision_recorded_for_no_switch_box() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let guest = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        let named =
+            boxes::SessionId::parse_str("00000000-0000-4000-8000-0000000000a1").expect("a box id");
+        let unnamed =
+            boxes::SessionId::parse_str("00000000-0000-4000-8000-0000000000a2").expect("a box id");
+        let unknown =
+            boxes::SessionId::parse_str("00000000-0000-4000-8000-0000000000a3").expect("a box id");
+        registry.hold_box_name("api", Some(named));
+        assert!(registry.admit_host_ip_box(named, None));
+        assert!(registry.admit_host_ip_box(unnamed, None));
+
+        let report = |box_id: Option<boxes::SessionId>, port: u16| {
+            control(
+                &guest,
+                &BoxControlRequest::ReportExposeDecision(minimald_rpc::ExposeDecisionReport {
+                    switch_address: None,
+                    box_id,
+                    port,
+                    decision: boxes::DynamicIngress::Deny,
+                    decided_by: minimald_rpc::ExposeDecidedBy::BoxPolicy,
+                    outcome: minimald_rpc::ExposeDecisionOutcome::Refused,
+                }),
+            )
+            .expect("the report is answered")
+        };
+        assert_eq!(
+            report(Some(named), 4000),
+            BoxControlReply::Audited { audited: true }
+        );
+        assert_eq!(
+            report(Some(unnamed), 4001),
+            BoxControlReply::Audited { audited: true }
+        );
+        let stray = report(Some(unknown), 4002);
+        assert!(
+            matches!(stray, BoxControlReply::Error { .. }),
+            "a report for an id the host holds nothing for is refused: {stray:?}"
+        );
+        let keyless = report(None, 4003);
+        assert!(
+            matches!(keyless, BoxControlReply::Error { .. }),
+            "a report that names no box is refused: {keyless:?}"
+        );
+
+        let records: Vec<_> = host_audit_records(&guest)
+            .into_iter()
+            .filter(|record| record["event"] == "expose_decision")
+            .collect();
+        assert_eq!(records.len(), 2, "one record per known box: {records:?}");
+        assert_eq!(records[0]["box"], "api");
+        assert_eq!(records[0]["box_id"], named.simple());
+        assert_eq!(records[0]["port"], 4000);
+        assert_eq!(records[0]["decision"], "deny");
+        assert_eq!(records[0]["outcome"], "refused");
+        assert_eq!(records[0]["reported_by"], "guest");
+        assert!(
+            records[0].get("switch_address").is_none(),
+            "a box with no switch has no row key to record: {records:?}"
+        );
+        assert_eq!(records[1]["box"], unnamed.to_string());
+        assert_eq!(records[1]["box_id"], unnamed.simple());
+        assert_eq!(records[1]["port"], 4001);
+
+        // An older guest's report: a switch address, and no box id.
+        let old = parse_request(
+            r#"{"verb":"report_expose_decision","switch_address":"100.64.128.9","port":3000,"decision":"allow","decided_by":"box-policy","outcome":"published"}"#,
+        )
+        .expect("an older guest's report still reads");
+        let BoxControlRequest::ReportExposeDecision(old) = old else {
+            panic!("the line is an expose decision report");
+        };
+        assert_eq!(old.switch_address, Some(Ipv4Addr::new(100, 64, 128, 9)));
+        assert_eq!(old.box_id, None);
+    }
+
+    /// NET-046 under `ask`: an attached client's yes admits the port, and
+    /// the host's audit log gets the same admission record an
+    /// allow-decided expose writes, its source `ask`. A no admits nothing
+    /// and writes no admission record.
+    #[test]
+    fn ask_yes_writes_admission_line() {
+        let host = AskHost::start();
+        let web = host.register_ask_box("web");
+        let mut client = attach_client(&host, &web);
+
+        let mut guest = guest_ask(&host, &web, ASK_PORT);
+        let offer = expect_offer(&mut client);
+        assert_eq!(
+            host.answer(offer.ask_id, AskAnswer::Yes),
+            BoxControlReply::AskAnswerRecorded {
+                ask_id: offer.ask_id,
+                recorded: true
+            }
+        );
+        assert!(matches!(
+            expect_outcome(&mut guest),
+            AskAdmitOutcome::Admitted { .. }
+        ));
+        assert!(matches!(
+            client.next(),
+            BoxControlReply::PendingAskDismissed { .. }
+        ));
+
+        let mut refused_guest = guest_ask(&host, &web, ASK_PORT + 1);
+        let offer = expect_offer(&mut client);
+        assert_eq!(
+            host.answer(offer.ask_id, AskAnswer::No),
+            BoxControlReply::AskAnswerRecorded {
+                ask_id: offer.ask_id,
+                recorded: true
+            }
+        );
+        assert_eq!(
+            refused(expect_outcome(&mut refused_guest)),
+            AskRefused::Denied
+        );
+
+        let admissions: Vec<_> = host_audit_records(&host.guest)
+            .into_iter()
+            .filter(|record| record.get("source").is_some())
+            .collect();
+        assert_eq!(
+            admissions.len(),
+            1,
+            "a yes writes one admission record and a no writes none: {admissions:?}"
+        );
+        assert_eq!(admissions[0]["box"], "web");
+        assert_eq!(admissions[0]["port"], ASK_PORT);
+        assert_eq!(admissions[0]["proto"], "tcp");
+        assert_eq!(admissions[0]["source"], "ask");
+        assert_eq!(
+            admissions[0]["switch_address"],
+            web.switch_address.to_string()
+        );
     }
 
     /// A refused own-address egress flow the in-VM daemon reports lands in
@@ -8063,7 +8298,8 @@ mod tests {
         let expose = control(
             &guest,
             &BoxControlRequest::ReportExposeDecision(minimald_rpc::ExposeDecisionReport {
-                switch_address: web.switch_address,
+                switch_address: Some(web.switch_address),
+                box_id: None,
                 port: 4000,
                 decision: boxes::DynamicIngress::Deny,
                 decided_by: minimald_rpc::ExposeDecidedBy::BoxPolicy,
