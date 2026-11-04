@@ -13,14 +13,17 @@ pub async fn cmd_box_show(global: &GlobalArgs, args: BoxShowArgs) -> Result<(), 
     ensure_daemon(global)?;
     // The box is looked up on the host this process selected, the one
     // `connect_daemon` reaches.
-    let host = crate::cmd::list::local_hosts(global)?
+    let hosts = crate::cmd::list::local_hosts(global)?;
+    let several_hosts = hosts.len() > 1;
+    let host = hosts
         .into_iter()
         .find(|host| host.selected)
         .context("No local host is selected")?;
+    let remedy = not_found_remedy(&host.host, several_hosts);
     let mut client = connect_daemon(global).await?;
     // A box name is not scoped to a project, so the lookup reads every box.
     let listing = list_box_records(&mut client, None).await?;
-    let id = find_listed_box(&listing, &args.target).inspect_err(|err| {
+    let id = find_listed_box(&listing, &args.target, &host.host, &remedy).inspect_err(|err| {
         tracing::info!(verb = "box show", outcome = "not found", "{err:#}");
     })?;
     let shown = match client
@@ -31,9 +34,7 @@ pub async fn cmd_box_show(global: &GlobalArgs, args: BoxShowArgs) -> Result<(), 
         Errorable::Ok(shown) => shown,
         Errorable::Err { error } if error.starts_with(minimald_rpc::UNKNOWN_SESSION_ID_LEAD) => {
             tracing::info!(verb = "box show", box_id = %id, outcome = "not found");
-            bail!(
-                "No box has the id `{id}`. Run `min box list --all` to see the boxes on this host."
-            )
+            bail!("No box has the id `{id}` on host {}. {remedy}", host.host)
         }
         Errorable::Err { error } => {
             tracing::info!(verb = "box show", box_id = %id, outcome = "error", "{error}");
@@ -53,9 +54,12 @@ pub async fn cmd_box_show(global: &GlobalArgs, args: BoxShowArgs) -> Result<(), 
 /// compares it. Several boxes can hold one name over time, so a name
 /// resolves to the running box that holds it, else to the most recent
 /// creation, which is the greatest id.
+/// When no box matches, the refusal names `host` and ends with `remedy`.
 pub(crate) fn find_listed_box(
     listing: &[minimald_rpc::BoxListingEntry],
     target: &str,
+    host: &str,
+    remedy: &str,
 ) -> Result<boxes::SessionId, anyhow::Error> {
     if let Ok(id) = boxes::SessionId::parse_str(target) {
         return Ok(id);
@@ -89,9 +93,22 @@ pub(crate) fn find_listed_box(
             return Ok(first.box_id);
         }
     }
-    bail!(
-        "No box has the name or id `{target}`. \
-         Run `min box list --all` to see the boxes on this host."
+    bail!("No box has the name or id `{target}` on host {host}. {remedy}")
+}
+
+/// The next step a not-found refusal of `min box show` gives on `host`.
+/// `min box show` reads only the selected host, but `min box list --all`
+/// lists every local host. With several hosts, the box can be on another
+/// VM, so the refusal names `--vm`. A named VM's host is
+/// `<name>.<base>`, as `ssh_host_alias` names it.
+pub(crate) fn not_found_remedy(host: &str, several_hosts: bool) -> String {
+    if !several_hosts {
+        return "Run `min box list --all` to see the boxes on this host.".to_owned();
+    }
+    let base = host.rsplit('.').next().unwrap_or(host);
+    format!(
+        "Run `min box list --all` to see the boxes on every host. \
+         For a box on host <name>.{base}, run `min box show` again with `--vm <name>`."
     )
 }
 

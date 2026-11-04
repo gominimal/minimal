@@ -481,7 +481,8 @@ Live execs: exec-1
         );
 
         // The argument to `min box show` finds the box the listing prints.
-        let find = |arg: &str| find_listed_box(&listing, arg);
+        let remedy = not_found_remedy("local0", false);
+        let find = |arg: &str| find_listed_box(&listing, arg, "local0", &remedy);
         assert_eq!(find("kept-session").unwrap(), stopped.box_id);
         assert_eq!(find(&task.box_id.to_string()).unwrap(), task.box_id);
         assert_eq!(find("0199e0b0").unwrap(), restarted.box_id);
@@ -495,8 +496,20 @@ Live execs: exec-1
         let missing = find("no-such-box").unwrap_err().to_string();
         assert_eq!(
             missing,
-            "No box has the name or id `no-such-box`. \
+            "No box has the name or id `no-such-box` on host local0. \
              Run `min box list --all` to see the boxes on this host."
+        );
+        // With several hosts, the box can be on another VM, so the
+        // refusal names `--vm`.
+        let several = not_found_remedy("dev.local-minvmd0", true);
+        let elsewhere = find_listed_box(&listing, "no-such-box", "dev.local-minvmd0", &several)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            elsewhere,
+            "No box has the name or id `no-such-box` on host dev.local-minvmd0. \
+             Run `min box list --all` to see the boxes on every host. \
+             For a box on host <name>.local-minvmd0, run `min box show` again with `--vm <name>`."
         );
         // A start that runs past the first dash matches without the dash,
         // and a name matches ignoring case.
@@ -510,9 +523,15 @@ Live execs: exec-1
         let live = reused("0199e0d0-0000-7000-8000-000000000008", "running");
         let latest = reused("0199e0d0-0000-7000-8000-000000000009", "stopped");
         let ended = [older.clone(), newer.clone()];
-        assert_eq!(find_listed_box(&ended, "reused").unwrap(), newer.box_id);
+        assert_eq!(
+            find_listed_box(&ended, "reused", "local0", &remedy).unwrap(),
+            newer.box_id
+        );
         let with_live = [older, live.clone(), latest];
-        assert_eq!(find_listed_box(&with_live, "reused").unwrap(), live.box_id);
+        assert_eq!(
+            find_listed_box(&with_live, "reused", "local0", &remedy).unwrap(),
+            live.box_id
+        );
         // The daemon treats names that differ only in case as one name, so
         // a running `Dev` holds the name `dev` over a stopped `dev`.
         let stopped_dev = entry(
@@ -528,7 +547,10 @@ Live execs: exec-1
             "running",
         );
         let cased = [running_dev.clone(), stopped_dev];
-        assert_eq!(find_listed_box(&cased, "dev").unwrap(), running_dev.box_id);
+        assert_eq!(
+            find_listed_box(&cased, "dev", "local0", &remedy).unwrap(),
+            running_dev.box_id
+        );
         // An id that is not listed still goes to the daemon, which answers
         // for it.
         let unlisted = "0199e0ff-0000-7000-8000-000000000009";
