@@ -22424,9 +22424,9 @@ proof_min_internal_names_through_proxy() {
     hook_seed_preamble > "$PROXY_OWN_SEED_DIR/minimal.toml"
     mkdir "$PROXY_OWN_SEED_DIR/.git"
     # Rules open to every address: with no egress section the box would get
-    # the deny-all default (NET-074), which drops the NET-004 connect below
-    # on its own, so the leg would pass whatever the infrastructure deny set
-    # did. With 0.0.0.0/0 that set is the only thing left to drop it.
+    # the deny-all default (NET-074), which refuses the host alias below.
+    # 0.0.0.0/0 covers the alias, which is the box's half of a host
+    # exposure (NET-160), so the VM host gate decides the NET-004 fetches.
     PROXY_OWN_SID="$(cd "$PROXY_OWN_SEED_DIR" && mnl session activate . --no-prompt \
       --name "$PROXY_OWN_NAME" --network own_ip --allow-subnets 0.0.0.0/0 \
       --ingress "$PROXY_OWN_EXTERNAL_PORT:$PROXY_BOX_PORT" 2>"$WORK/proxy-own.err")" || {
@@ -22494,64 +22494,43 @@ proof_min_internal_names_through_proxy() {
       fail
     fi
 
-    # NET-004: the deprecated literal itself. Box→host reach over the alias
-    # is default-deny except configured host exposures (design §7.1), and
-    # an own-address box gets none — not even PROXY_HOST_PORT, the one this
-    # run lists for host-address boxes — so the box's own relay drops the
-    # connect — though
-    # its egress rules admit every address (0.0.0.0/0 above), so the drop
-    # is the infrastructure deny set's and not the deny-all default's: no
-    # answer and no reset until the timeout, and the relay names the drop
-    # under the infrastructure deny set's rule. The deprecation notice is
-    # not asserted: the relay emits it only for a frame its verdict admits,
-    # and the alias admits none without an exposure. TODO(host-exposure):
-    # the positive reach arm comes back with a configured exposure
-    # (gominimal/inbox#867); the notice on a drop is gominimal/inbox#868.
-    #
-    # The relay runs in the daemon, and every lane that has a switch
-    # (MINVMD_GVPROXY_BIN, the gate around this half) also runs with
-    # E2E_VM=1 — the justfile's `e2e-env` and the KVM lane set the pair
-    # together — so the `hook_log_readable` branch below is UNREACHABLE FROM
-    # CI: it serves developer runs only, a host driving a native daemon
-    # against a switch by hand. The switch lanes CI does run assert the
-    # silent drop, whose log line the switch.rs unit tests pin.
-    proxy_alias_before="$(proxy_daemon_log_lines)"
-    proxy_alias_start_ms="$(now_ms)"
-    mnl session exec "$PROXY_OWN_SID" \
-      "/usr/bin/socat /dev/null TCP:$PROXY_HOST_ALIAS:$PROXY_HOST_PORT,connect-timeout=10" \
-      >/dev/null 2>"$WORK/proxy-alias.err" && {
-      echo "::error::NET-004: the own-address box completed a connection to the host alias $PROXY_HOST_ALIAS:$PROXY_HOST_PORT, which an own-address box must never reach"
-      fail
-    }
-    proxy_alias_elapsed_ms=$(( $(now_ms) - proxy_alias_start_ms ))
-    echo "NET-004: connect $PROXY_HOST_ALIAS:$PROXY_HOST_PORT from the own-address box -> elapsed=${proxy_alias_elapsed_ms}ms socat: $(tail -n1 "$WORK/proxy-alias.err" 2>/dev/null)"
-    if grep -q 'Connection refused' "$WORK/proxy-alias.err" 2>/dev/null; then
-      echo "::error::NET-004: the connection to the host alias was reset — the frame got past the box's relay, which must drop it silently"
-      cat "$WORK/proxy-alias.err" 2>/dev/null || true
+    # NET-004 and NET-160 on a VM host: the deprecated literal itself, at
+    # the one port the [host-exposures] table opens. Reach needs both
+    # halves. The host's half is the exposure. The box's half is its egress
+    # rule, and 0.0.0.0/0 above covers the alias, so the box's own relay
+    # passes the connect on and the VM host gate admits it at the exposure.
+    # The same box at a port outside the table stays refused by that gate,
+    # with the unexposed listener still answering on the host loopback.
+    # Every lane that has a switch also runs with E2E_VM=1, so that
+    # listener is up. A box that does not name the host is refused by its
+    # own relay under the host-alias rule, which the switch.rs unit tests
+    # pin (own_ip_box_exposure_passes_the_guest_relay).
+    proxy_own_alias_out="$(mnl session exec "$PROXY_OWN_SID" \
+      "curl -sS --max-time 8 http://$PROXY_HOST_ALIAS:$PROXY_HOST_PORT/marker; echo \"exposed_rc=\$?\"; curl -sS --max-time 8 -o /dev/null http://$PROXY_HOST_ALIAS:$PROXY_UNEXPOSED_PORT/marker; echo \"closed_rc=\$?\"" \
+      2>"$WORK/proxy-alias.err" || true)"
+    printf '%s\n' "$proxy_own_alias_out" >"$WORK/proxy-alias.out"
+    proxy_own_exposed_rc="$(sed -n 's/^.*exposed_rc=\([0-9]*\)$/\1/p' "$WORK/proxy-alias.out" | head -n1)"
+    proxy_own_closed_rc="$(sed -n 's/^closed_rc=\([0-9]*\)$/\1/p' "$WORK/proxy-alias.out" | tail -n1)"
+    if [ "$proxy_own_exposed_rc" != "0" ] || [[ "$proxy_own_alias_out" != *"$PROXY_HOST_MARKER"* ]]; then
+      echo "::error::NET-160: the own-address box, whose allow_subnets covers the host alias, did not fetch the marker from $PROXY_HOST_ALIAS at the exposed port $PROXY_HOST_PORT (curl exit '${proxy_own_exposed_rc:-none}')"
+      echo "--- exec stdout ---"; cat "$WORK/proxy-alias.out" 2>/dev/null || true
+      echo "--- exec stderr ---"; cat "$WORK/proxy-alias.err" 2>/dev/null || true
       fail
     fi
-    if [ "$proxy_alias_elapsed_ms" -lt 5000 ]; then
-      echo "::error::NET-004: the connection to the host alias failed in ${proxy_alias_elapsed_ms}ms — a fast failure, not the silent drop being asserted"
-      cat "$WORK/proxy-alias.err" 2>/dev/null || true
-      fail
-    fi
-    if hook_log_readable; then
-      proxy_alias_drop=""
-      for _ in $(seq 1 10); do
-        proxy_alias_drop="$(proxy_daemon_log_since "$proxy_alias_before" \
-          | grep -F -- 'egress-infrastructure-destination' \
-          | grep -F -- "$PROXY_HOST_ALIAS:$PROXY_HOST_PORT" | tail -n1)"
-        [ -n "$proxy_alias_drop" ] && break
-        sleep 0.25
-      done
-      if [ -z "$proxy_alias_drop" ]; then
-        echo "::error::the box's egress relay did not log the dropped connection to the host alias under 'egress-infrastructure-destination'"
+    case "$proxy_own_closed_rc" in
+      7 | 28) ;;
+      0)
+        echo "::error::the own-address box reached the host alias at port $PROXY_UNEXPOSED_PORT, outside the [host-exposures] table, which opens port $E2E_HOST_EXPOSURE_PORT alone"
         fail
-      fi
-      echo "daemon log: $proxy_alias_drop"
-    else
-      echo "NET-004 drop line: (guest-side daemon log on this lane; its emission is pinned by the switch.rs unit tests)"
-    fi
+        ;;
+      *)
+        echo "::error::the own-address box's fetch from the host alias at port $PROXY_UNEXPOSED_PORT failed with curl exit '${proxy_own_closed_rc:-none}', not a refused connection (7) or a timeout (28)"
+        echo "--- exec stdout ---"; cat "$WORK/proxy-alias.out" 2>/dev/null || true
+        echo "--- exec stderr ---"; cat "$WORK/proxy-alias.err" 2>/dev/null || true
+        fail
+        ;;
+    esac
+    echo "NET-160: $PROXY_HOST_ALIAS:$PROXY_HOST_PORT reached and $PROXY_HOST_ALIAS:$PROXY_UNEXPOSED_PORT refused from the own-address box (curl exit $proxy_own_closed_rc) OK"
 
     mnl session destroy --force "$PROXY_OWN_SID" >/dev/null 2>&1 || true
   else
