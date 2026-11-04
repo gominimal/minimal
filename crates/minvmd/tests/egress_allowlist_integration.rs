@@ -389,19 +389,30 @@ async fn hostname_allowlist_toolchain_completes() {
     // NET-068's toolchain: git clone, npm install, pip install, and a container
     // pull. The hostname-only allowlist must admit every host these four tools
     // contact, and each must exit 0.
+    //
+    // Each tool runs under the box's own `timeout`, shorter than
+    // EXEC_TIMEOUT, so a stalled tool still returns its stderr to the log
+    // instead of the harness dropping it. git traces its connects, so a
+    // stall names the address and port git dialled.
     let tools = [
         (
             "git",
-            "git clone --depth 1 https://github.com/octocat/Hello-World /tmp/hello-world",
+            "GIT_TRACE=1 GIT_CURL_VERBOSE=1 timeout 50 \
+             git clone --depth 1 https://github.com/octocat/Hello-World /tmp/hello-world",
         ),
         (
             "npm",
-            "mkdir -p /tmp/npm-stub && cd /tmp/npm-stub && npm install is-odd --prefix .",
+            "mkdir -p /tmp/npm-stub && cd /tmp/npm-stub && \
+             timeout 50 npm install is-odd --prefix .",
         ),
-        ("pip", "pip3 install --target /tmp/pip-stub requests"),
+        (
+            "pip",
+            "timeout 50 pip3 install --target /tmp/pip-stub requests",
+        ),
         (
             "skopeo",
-            "skopeo --insecure-policy copy docker://docker.io/library/hello-world dir:/tmp/hw",
+            "timeout 50 skopeo --insecure-policy copy \
+             docker://docker.io/library/hello-world dir:/tmp/hw",
         ),
     ];
 
@@ -448,11 +459,44 @@ async fn hostname_allowlist_toolchain_completes() {
         }
     }
 
+    if !failures.is_empty() {
+        // Print where the box's processes run and what they can dial: the
+        // cgroup names the classifier cohort (`deny` or `allow`) the exec
+        // landed in, and the loopback listeners and proxy variables name
+        // what a stalled tool connects to.
+        let probe = minimald_rpc::exec::ExecRequest::Shell(BOX_PROBE.to_string()).encode();
+        match tokio::time::timeout(
+            EXEC_TIMEOUT,
+            run_session_exec(&guest.sock_path, session_id, &probe),
+        )
+        .await
+        {
+            Ok(Ok((stdout, stderr, exit))) => eprintln!(
+                "egress_allowlist_integration: box probe exit={exit:?}\n\
+                 --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+            ),
+            Ok(Err(e)) => eprintln!("egress_allowlist_integration: box probe failed: {e}"),
+            Err(_) => eprintln!(
+                "egress_allowlist_integration: box probe timed out after {EXEC_TIMEOUT:?}"
+            ),
+        }
+    }
+
     assert!(
         failures.is_empty(),
         "hostname-only allowlist toolchain operations failed: {failures:?}"
     );
 }
+
+/// The shell the harness runs in the box after a tool fails: the exec's
+/// cgroup, its proxy and git variables, git's configuration with the file
+/// each value comes from, and the box's IPv4 TCP sockets (state `0A` is a
+/// listener, ports in hex).
+const BOX_PROBE: &str = "echo '--- cgroup ---'; cat /proc/self/cgroup; \
+    echo '--- env ---'; env | grep -i -e proxy -e '^GIT' | sort; \
+    echo '--- git config ---'; git config --list --show-origin; \
+    echo '--- /proc/net/tcp ---'; cat /proc/net/tcp; \
+    echo '--- resolv.conf ---'; cat /etc/resolv.conf";
 
 /// Project file to upload into the session workspace. Its `[session]` packages
 /// provide the toolchain binaries the test execs; `[upstream]` points at the
