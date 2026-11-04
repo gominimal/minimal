@@ -1556,10 +1556,16 @@ pub struct BoxGate {
     /// host loopback as its alias (NET-004): on a carved switch a host
     /// segment can come from either address.
     host_literal: Option<Ipv4Addr>,
-    /// Minimal's own listeners at the host alias (NET-162). A port one of
-    /// them holds is never an exposure. Each flow reads the current list,
-    /// ahead of the table's openings.
-    minimal_listeners: Mutex<Vec<MinimalListener>>,
+    /// Minimal's own listeners at the host alias (NET-162), the one
+    /// daemon-wide registry. A port one of them holds is never an exposure.
+    /// Each flow reads the current registry, ahead of the table's openings,
+    /// so a listener that binds after the gate is built shadows an entry
+    /// from the moment it binds.
+    minimal_listeners: Arc<MinimalListeners>,
+    /// The hostname proxy's port this box's rules are compiled with. It is
+    /// held for this gate beside the registry, so the gate never opens the
+    /// port its own interim opening names.
+    compiled_proxy_port: Option<u16>,
     /// The `(protocol, port, listener)` triples the log already named as
     /// shadowing an entry of the table, so each is said once.
     shadow_reported: Mutex<HashSet<(u8, u16, &'static str)>>,
@@ -1596,6 +1602,9 @@ pub(crate) const HOST_ALIAS_RULE: &str = "host-alias";
 pub(crate) const HOSTNAME_PROXY_LISTENER: &str = "the hostname proxy";
 /// The box-name answerer, as the daemon log names it (NET-162).
 pub(crate) const ANSWERER_LISTENER: &str = "the box-name answerer";
+/// A forwarder that publishes a box port on the host's loopback, as the
+/// daemon log names it (NET-162).
+pub(crate) const PUBLISHED_BOX_PORT_LISTENER: &str = "a published box port";
 
 /// One of Minimal's own listeners on the host's loopback, which the native
 /// host alias reaches (NET-162).
@@ -1615,20 +1624,95 @@ impl MinimalListener {
     }
 }
 
-/// The listeners a native gate starts with: the hostname proxy at the port
-/// the box's rules are compiled with, and the box-name answerer at its port.
-fn seeded_minimal_listeners(hostname_proxy_port: Option<u16>) -> Vec<MinimalListener> {
-    let mut held = vec![MinimalListener {
-        port: super::answerer::ANSWERER_PORT,
-        protocol: None,
-        name: ANSWERER_LISTENER,
-    }];
-    held.extend(hostname_proxy_port.map(|port| MinimalListener {
-        port,
-        protocol: None,
-        name: HOSTNAME_PROXY_LISTENER,
-    }));
-    held
+/// The daemon's registry of Minimal's own listeners on the host's loopback,
+/// which the native host alias reaches (NET-162). Every gate reads the one
+/// registry at each flow, and each listener writes it when it binds.
+#[derive(Debug)]
+pub(crate) struct MinimalListeners {
+    held: Mutex<Vec<MinimalListener>>,
+}
+
+/// The registry every gate of this daemon reads.
+static DAEMON_MINIMAL_LISTENERS: LazyLock<Arc<MinimalListeners>> =
+    LazyLock::new(|| Arc::new(MinimalListeners::seeded()));
+
+impl MinimalListeners {
+    /// A registry that holds the box-name answerer's default port. The
+    /// answerer binds that port unless it is told another one, and the
+    /// daemon adds the port it records ([`Self::hold`]).
+    pub(crate) fn seeded() -> Self {
+        Self {
+            held: Mutex::new(vec![MinimalListener {
+                port: super::answerer::ANSWERER_PORT,
+                protocol: None,
+                name: ANSWERER_LISTENER,
+            }]),
+        }
+    }
+
+    /// The registry of this daemon.
+    pub(crate) fn daemon() -> Arc<Self> {
+        Arc::clone(&DAEMON_MINIMAL_LISTENERS)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<MinimalListener>> {
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Records that `listener` holds its port from now on, for the life of
+    /// the daemon. Each later flow to that port at the alias is refused,
+    /// whatever the table says.
+    pub(crate) fn hold(&self, listener: MinimalListener) {
+        let mut held = self.lock();
+        if !held.contains(&listener) {
+            held.push(listener);
+        }
+    }
+
+    /// Records that `listener` holds its port until the returned hold is
+    /// dropped: a forwarder holds its port from the bind until it unbinds.
+    pub(crate) fn hold_while(self: &Arc<Self>, listener: MinimalListener) -> MinimalListenerHold {
+        self.lock().push(listener);
+        MinimalListenerHold {
+            registry: Arc::clone(self),
+            listener,
+        }
+    }
+
+    /// The name of the listener that holds `port` for `protocol`, when one
+    /// does.
+    pub(crate) fn holder(&self, protocol: u8, port: u16) -> Option<&'static str> {
+        self.lock()
+            .iter()
+            .find(|listener| listener.holds(protocol, port))
+            .map(|listener| listener.name)
+    }
+}
+
+/// One listener's place in a [`MinimalListeners`] registry. Dropping it
+/// removes the listener from the registry.
+#[derive(Debug)]
+pub(crate) struct MinimalListenerHold {
+    registry: Arc<MinimalListeners>,
+    listener: MinimalListener,
+}
+
+impl MinimalListenerHold {
+    /// The port the hold keeps.
+    pub(crate) fn port(&self) -> u16 {
+        self.listener.port
+    }
+}
+
+impl Drop for MinimalListenerHold {
+    fn drop(&mut self) {
+        let mut held = self.registry.lock();
+        if let Some(at) = held.iter().position(|listener| *listener == self.listener) {
+            held.swap_remove(at);
+        }
+    }
 }
 
 /// What the host's table says about one frame to or from the host alias.
@@ -1868,7 +1952,8 @@ impl BoxGate {
             quic443_log: Quic443RejectLog::default(),
             host_alias: subnet.host_alias(),
             host_literal: subnet.documented_host_literal(),
-            minimal_listeners: Mutex::new(seeded_minimal_listeners(hostname_proxy_port)),
+            minimal_listeners: MinimalListeners::daemon(),
+            compiled_proxy_port: hostname_proxy_port,
             shadow_reported: Mutex::new(HashSet::new()),
             host_exposures: std::sync::OnceLock::new(),
             names_host,
@@ -1883,32 +1968,14 @@ impl BoxGate {
         let _ = self.host_exposures.set(table);
     }
 
-    /// Records that one of Minimal's own listeners holds `listener.port`
-    /// from now on (NET-162). Each later flow to that port at the alias is
-    /// refused, whatever the table says.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "no native listener binds a new port after the gate is built yet"
-        )
-    )]
-    pub(crate) fn hold_minimal_listener(&self, listener: MinimalListener) {
-        self.minimal_listeners
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(listener);
-    }
-
     /// The name of Minimal's own listener that holds `port` for `protocol`
-    /// at the alias, when one does (NET-162).
+    /// at the alias, when one does (NET-162): one in the daemon's registry,
+    /// or the hostname proxy at the port this gate's rules are compiled
+    /// with.
     fn minimal_listener_at(&self, protocol: u8, port: u16) -> Option<&'static str> {
         self.minimal_listeners
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .find(|listener| listener.holds(protocol, port))
-            .map(|listener| listener.name)
+            .holder(protocol, port)
+            .or_else(|| (self.compiled_proxy_port == Some(port)).then_some(HOSTNAME_PROXY_LISTENER))
     }
 
     /// Says once, for each listener and port, that one of Minimal's own
@@ -5352,7 +5419,8 @@ pub(crate) mod tests {
             dir.path(),
             &format!(
                 "[host-exposures]\nzone = {{ port = {answerer} }}\n\
-                 proxy = {{ port = 9000 }}\ndb = {{ port = 5432 }}\n"
+                 proxy = {{ port = 9000 }}\ndb = {{ port = 5432 }}\n\
+                 moved = {{ port = 47053 }}\n"
             ),
         );
         let alias = SwitchSubnet::default().host_alias();
@@ -5370,6 +5438,17 @@ pub(crate) mod tests {
         assert!(
             reaches_switch(&mut harness, &egress_tcp_frame(LEASE, alias, 5432)).await,
             "an entry no listener holds still opens its port"
+        );
+        // The answerer can bind a port other than its default. The daemon
+        // records the port it binds, and the default stays held too.
+        let _moved = MinimalListeners::daemon().hold_while(MinimalListener {
+            port: 47053,
+            protocol: None,
+            name: ANSWERER_LISTENER,
+        });
+        assert!(
+            !reaches_switch(&mut harness, &udp_frame(LEASE, 40001, alias, 47053)).await,
+            "an entry at the port the answerer recorded opens nothing"
         );
         let logged = capture.contents();
         for expected in [
@@ -5421,11 +5500,11 @@ pub(crate) mod tests {
     async fn native_own_ip_exposure_shadowed_by_a_later_minimal_listener() {
         let capture = crate::test_harness::captured_log();
         let dir = tempfile::tempdir().unwrap();
-        let table = host_exposures_in(dir.path(), "[host-exposures.web]\nport = 8080\n");
+        let table = host_exposures_in(dir.path(), "[host-exposures.web]\nport = 47080\n");
         let alias = SwitchSubnet::default().host_alias();
         let named = host_exposure_policy(Some(vec!["host.min.internal"]), Vec::new());
         let mut harness = native_relay_with_table(&named, &table);
-        let host = SocketAddrV4::new(alias, 8080);
+        let host = SocketAddrV4::new(alias, 47080);
         let client = SocketAddrV4::new(LEASE, 41000);
 
         let syn = host_flow_segment(client, host, SYN, 1000, 0);
@@ -5437,9 +5516,12 @@ pub(crate) mod tests {
         deliver_inbound(&mut harness, &syn_ack).await;
         assert_delivered(&mut harness, &syn_ack).await;
 
-        let gate = harness.gate.clone().expect("the native relay holds a gate");
-        gate.hold_minimal_listener(MinimalListener {
-            port: 8080,
+        // The hostname proxy binds the entry's port after the gate is
+        // built: the daemon records it in the one registry every gate reads.
+        // The port is one no other test holds, since the registry is the
+        // daemon's.
+        let hold = MinimalListeners::daemon().hold_while(MinimalListener {
+            port: 47080,
             protocol: None,
             name: HOSTNAME_PROXY_LISTENER,
         });
@@ -5469,13 +5551,19 @@ pub(crate) mod tests {
             "refused_by=\"the hostname proxy\"",
             "holder=\"the hostname proxy\"",
             "entry=web",
-            "port=8080",
+            "port=47080",
         ] {
             assert!(
                 logged.contains(expected),
                 "missing {expected:?} in: {logged}"
             );
         }
+        drop(hold);
+        let after = host_flow_segment(SocketAddrV4::new(LEASE, 41002), host, SYN, 3000, 0);
+        assert!(
+            reaches_switch(&mut harness, &after).await,
+            "the entry opens its port again once the listener lets it go"
+        );
     }
 
     /// NET-134 on the relay leg, the first of the two a box's frame must
