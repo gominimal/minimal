@@ -4163,8 +4163,17 @@ async fn name_registered_at_finalize() {
     let switch = std::net::Ipv4Addr::new(100, 64, 128, 9);
     let capture = crate::test_harness::captured_log();
     let server = TestServer::new().await;
+    // The installed box-name service, stood in for: the finalize returns
+    // only once it answers the name.
+    let stand_in =
+        crate::net::answerer::stand_in::InstalledStandIn::start(server.state.clone()).await;
     let mut client = server.connect().await;
     let id = finalize_handed_own_ip_session(&mut client, "web", switch, handed).await;
+    assert_eq!(
+        stand_in.service.answer("web.min.internal"),
+        Some(Some(handed)),
+        "the name answers at the installed answerer the moment the finalize returns"
+    );
 
     // No attach has happened — the name is held at the handed address.
     let (owner, address) = zone_answer_for(&server, "web.min.internal")
@@ -4479,6 +4488,10 @@ async fn name_answers_without_attached_client() {
 async fn destroyed_box_name_is_nxdomain() {
     let handed = std::net::Ipv4Addr::new(127, 0, 64, 9);
     let server = TestServer::new().await;
+    // The installed box-name service, stood in for: the destroy returns
+    // only once it no longer answers the name.
+    let stand_in =
+        crate::net::answerer::stand_in::InstalledStandIn::start(server.state.clone()).await;
     let mut client = server.connect().await;
     let id = finalize_handed_own_ip_session(
         &mut client,
@@ -4494,6 +4507,11 @@ async fn destroyed_box_name_is_nxdomain() {
         address, handed,
         "the box's name answers at the hand while it lives"
     );
+    assert_eq!(
+        stand_in.service.answer("web.min.internal"),
+        Some(Some(handed)),
+        "the installed answerer answers the name while the box lives"
+    );
 
     use minimald_rpc::{DestroySession, DestroySessionRequest, Errorable};
     match client
@@ -4506,6 +4524,11 @@ async fn destroyed_box_name_is_nxdomain() {
         Errorable::Ok(_) => {}
         Errorable::Err { error } => panic!("DestroySession failed: {error}"),
     }
+    assert_eq!(
+        stand_in.service.answer("web.min.internal"),
+        None,
+        "the name is NXDOMAIN at the installed answerer the moment the destroy returns"
+    );
 
     // The name is gone: a later lookup is told NXDOMAIN, not a stale address.
     assert_eq!(
