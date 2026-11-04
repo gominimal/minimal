@@ -544,6 +544,12 @@ impl std::error::Error for BoxRunningRefusal {}
 /// between.
 const DAEMON_RUNNING_REAP: &str = "is running, so it was not removed.";
 
+/// Whether a `ReapBox` error is the daemon's answer that the box is running,
+/// which `min box rm` without `--force` maps to [`BoxRunningRefusal`].
+fn reap_error_is_running(force: bool, error: &str) -> bool {
+    !force && error.contains(DAEMON_RUNNING_REAP)
+}
+
 /// The `StopBox` request for `min box stop`: the graceful stop of BOX-013,
 /// or its forced stop under `--force`.
 pub(crate) fn box_stop_request(id: boxes::SessionId, force: bool) -> minimald_rpc::StopBoxRequest {
@@ -683,7 +689,7 @@ pub(crate) async fn rm_listed_box(
         .context("ReapBox RPC failed")?
     {
         Errorable::Ok(reaped) => reaped,
-        Errorable::Err { error } if !force && error.contains(DAEMON_RUNNING_REAP) => {
+        Errorable::Err { error } if reap_error_is_running(force, &error) => {
             return Err(refusal());
         }
         Errorable::Err { error } => {
@@ -883,6 +889,33 @@ mod tests {
         );
         assert_eq!(BoxRunningRefusal::EXIT_CODE, 2);
         assert!(out.is_empty(), "the refusal writes nothing to stdout");
+        assert_eq!(
+            listed_state(&mut client, "web").await.as_deref(),
+            Some("running")
+        );
+
+        // A box that starts between the listing and the reap gets the
+        // daemon's own answer. Send the unforced reap straight to the daemon
+        // and check that the client maps that answer to the same refusal.
+        let id = list_box_records(&mut client, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.name.as_deref() == Some("web"))
+            .expect("web is listed")
+            .box_id;
+        let answer = client
+            .oneshot_rpc::<minimald_rpc::ReapBox>(box_rm_request(id, false))
+            .await
+            .expect("the ReapBox RPC answers");
+        let minimald_rpc::Errorable::Err { error } = answer else {
+            panic!("the daemon refuses an unforced reap of a running box");
+        };
+        assert!(
+            reap_error_is_running(false, &error),
+            "the daemon's running-box answer maps to the refusal: {error}"
+        );
+        assert!(!reap_error_is_running(true, &error));
         assert_eq!(
             listed_state(&mut client, "web").await.as_deref(),
             Some("running")
