@@ -1596,6 +1596,19 @@ impl BoxLauncher for SandboxLauncher {
             } else {
                 None
             };
+            // NET-070: a host-address box's program waits at a gate of its
+            // own until the launch records the box's PID namespace, so no
+            // connection it opens reaches the hostname proxy unattributed.
+            // A hook launch needs none: its gate holds the program until the
+            // first attach, after the launch returns.
+            let namespace_gate = if matches!(network_mode, NetworkMode::HostNet) && !for_hooks {
+                Some(
+                    env.hold_start(&mut container)
+                        .map_err(|e| io::Error::other(format!("start gate: {e}")))?,
+                )
+            } else {
+                None
+            };
 
             let pty = Pty::open(sz).map_err(|e| io::Error::other(format!("pty open: {e}")))?;
 
@@ -1713,14 +1726,23 @@ impl BoxLauncher for SandboxLauncher {
             // `command`/`container` no longer borrow `env`, so it can be moved
             // into the host to keep its backing files alive.
             drop(container);
-            Ok::<_, io::Error>((env, master, process, tty_path, late_notice_fd, start_gate))
+            Ok::<_, io::Error>((
+                env,
+                master,
+                process,
+                tty_path,
+                late_notice_fd,
+                start_gate,
+                namespace_gate,
+            ))
         }
         .await;
 
-        let (env, master, process, tty_path, late_notice_fd, start_gate) = match build_and_spawn {
-            Ok(parts) => parts,
-            Err(e) => return Err(e),
-        };
+        let (env, master, process, tty_path, late_notice_fd, start_gate, namespace_gate) =
+            match build_and_spawn {
+                Ok(parts) => parts,
+                Err(e) => return Err(e),
+            };
 
         // From here the process exists, so every way out of this function
         // has to account for it — including the one no `return` covers, a
@@ -1769,6 +1791,19 @@ impl BoxLauncher for SandboxLauncher {
                     "placing the session's supervisor in its classifier leaf",
                 ),
             }
+        }
+
+        // NET-070: the hostname proxy names a host-address box's connection by
+        // its PID namespace when no holder runs in a classifier leaf.
+        // A box with no namespace of its own looks like a process outside
+        // every box to the proxy, which a routing surface must never allow,
+        // so the launch fails closed: the `Err` drops `process` first, which
+        // reaps the box before its program leaves the gate.
+        if matches!(network_mode, NetworkMode::HostNet) {
+            require_host_address_box_namespace(session_id, process.get_mut().id())?;
+        }
+        if let Some(gate) = namespace_gate {
+            gate.release();
         }
 
         // Step 3 (post-spawn): hand the process to the provider, which wires its
