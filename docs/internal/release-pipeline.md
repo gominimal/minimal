@@ -253,13 +253,13 @@ git merge-base --is-ancestor vX.Y.Z origin/main && echo "tag on main"
 
 ### Stage a patch
 
-A patch is the next version on a release line. It needs no new branch, and it
-does not use step 1 or step 2. The weekly patch and an emergency fix both take
+A patch is the next version on a release line. It does not need a new branch,
+and it does not use step 1 or step 2. The weekly patch and an emergency fix both take
 this path. A second release candidate, and the final version after the
 candidates, go out from the line in the same way.
 
 Only the newest line gets patches. The version check refuses a version below
-the newest `v*` tag, so a line stops when the next minor ships.
+the newest `v*` tag, so a line stops when the next minor is promoted.
 
 Do these steps:
 
