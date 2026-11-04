@@ -409,10 +409,7 @@ async fn listings_across_vms(
     global: &GlobalArgs,
     strict: bool,
 ) -> Result<Vec<VmListing>, anyhow::Error> {
-    let mut vms = client::enumerate_vm_sockets(global.minimal_dir.as_deref(), global.use_minvmd())?;
-    if let Some(pinned) = global.vm.as_deref() {
-        vms.retain(|vm| vm.vm == pinned);
-    }
+    let vms = vm_sockets_in_scope(global)?;
     let selected = client::vm_name();
     let mut listings = Vec::new();
     for vm in vms {
@@ -486,6 +483,110 @@ async fn listings_across_vms(
         });
     }
     Ok(listings)
+}
+
+/// Every VM's socket the CLI can see, narrowed to the VM an explicit `--vm`
+/// names: the set of hosts `min ls` and `min box list` both walk. The
+/// native backend enumerates nothing, and its callers fall back to the one
+/// socket it serves.
+fn vm_sockets_in_scope(global: &GlobalArgs) -> Result<Vec<client::VmSocket>, anyhow::Error> {
+    let mut vms = client::enumerate_vm_sockets(global.minimal_dir.as_deref(), global.use_minvmd())?;
+    if let Some(pinned) = global.vm.as_deref() {
+        vms.retain(|vm| vm.vm == pinned);
+    }
+    Ok(vms)
+}
+
+/// The provider that serves the native daemons on this machine.
+pub(crate) const LOCAL_PROVIDER: &str = "local";
+
+/// The provider that serves the VMs on this machine.
+pub(crate) const LOCAL_MINVMD_PROVIDER: &str = "local-minvmd";
+
+/// One local host a box listing reads: the provider that serves it, its
+/// name, and the socket its daemon serves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocalHost {
+    /// `local` for a native daemon, `local-minvmd` for a VM.
+    pub provider: &'static str,
+    /// The host's name: `local0` for the native daemon, `local-minvmd0`
+    /// for the default VM and `<vm>.local-minvmd0` for a named VM, as its
+    /// ssh host alias names it.
+    pub host: String,
+    /// The socket the host's daemon serves.
+    pub sock: std::path::PathBuf,
+    /// Whether this is the host this process selected, which
+    /// [`ensure_daemon`] starts.
+    pub selected: bool,
+}
+
+/// The local hosts `min box list` reads, in the order `min ls` walks them:
+/// every VM in scope, else the one socket the native backend serves.
+pub(crate) fn local_hosts(global: &GlobalArgs) -> Result<Vec<LocalHost>, anyhow::Error> {
+    let vms = vm_sockets_in_scope(global)?;
+    let fallback = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
+        .context("Failed to resolve daemon socket path")?;
+    Ok(local_hosts_from(
+        client::client_host_kind(global.use_minvmd()),
+        vms,
+        fallback,
+        client::vm_name(),
+    ))
+}
+
+/// [`local_hosts`] over what it read: the host kind, the VMs in scope, the
+/// socket the selected daemon serves, and the selected VM's name.
+pub(crate) fn local_hosts_from(
+    kind: paths::HostKind,
+    vms: Vec<client::VmSocket>,
+    fallback: std::path::PathBuf,
+    selected: &str,
+) -> Vec<LocalHost> {
+    if vms.is_empty() {
+        return vec![LocalHost {
+            provider: provider_for(kind),
+            host: host_name_for(kind, &fallback),
+            sock: fallback,
+            selected: true,
+        }];
+    }
+    vms.into_iter()
+        .map(|vm| LocalHost {
+            provider: provider_for(kind),
+            host: host_name_for(kind, &vm.sock),
+            selected: vm.vm == selected,
+            sock: vm.sock,
+        })
+        .collect()
+}
+
+/// The well-known local provider that serves a host of `kind`.
+fn provider_for(kind: paths::HostKind) -> &'static str {
+    match kind {
+        paths::HostKind::Minimald => LOCAL_PROVIDER,
+        paths::HostKind::Minvmd => LOCAL_MINVMD_PROVIDER,
+    }
+}
+
+/// The name of the host whose daemon serves `sock`. The native daemon is
+/// `local0`. A VM is named by the ssh host alias of its host dir.
+fn host_name_for(kind: paths::HostKind, sock: &std::path::Path) -> String {
+    let alias = sock.parent().and_then(paths::ssh_host_alias);
+    match kind {
+        paths::HostKind::Minimald => {
+            // The state dir names the native instance `local-minimald<N>`.
+            // The provider names that host `local<N>`.
+            let prefix = paths::host_name(kind, 0);
+            let prefix = prefix.trim_end_matches('0');
+            alias
+                .and_then(|name| {
+                    name.strip_prefix(prefix)
+                        .map(|n| format!("{LOCAL_PROVIDER}{n}"))
+                })
+                .unwrap_or_else(|| format!("{LOCAL_PROVIDER}0"))
+        }
+        paths::HostKind::Minvmd => alias.unwrap_or_else(|| paths::host_name(kind, 0)),
+    }
 }
 
 /// The selected daemon's `ListSessions` reply, from its socket, gated as `min
@@ -1772,6 +1873,64 @@ pub(crate) fn format_memory(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::status_label;
+
+    // BCLI-051: the walk over the local hosts names the provider and the
+    // host of each one, so `min box list` prints the host of every box.
+    #[test]
+    fn list_shows_host_per_box() {
+        use std::path::PathBuf;
+        let providers = PathBuf::from("/state/minimal/providers");
+        let vm = |name: &str, dir: PathBuf| super::client::VmSocket {
+            vm: name.to_string(),
+            sock: dir.join(paths::SSH_SOCK_FILE),
+        };
+        let default_dir = providers.join("local-minvmd0");
+        let alpha_dir = default_dir.join("alpha");
+        let hosts = super::local_hosts_from(
+            paths::HostKind::Minvmd,
+            vec![
+                vm(paths::DEFAULT_VM_NAME, default_dir.clone()),
+                vm("alpha", alpha_dir.clone()),
+            ],
+            default_dir.join(paths::SSH_SOCK_FILE),
+            "alpha",
+        );
+        let named: Vec<(&str, &str, bool)> = hosts
+            .iter()
+            .map(|host| (host.provider, host.host.as_str(), host.selected))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("local-minvmd", "local-minvmd0", false),
+                ("local-minvmd", "alpha.local-minvmd0", true),
+            ]
+        );
+        assert_eq!(hosts[1].sock, alpha_dir.join(paths::SSH_SOCK_FILE));
+
+        // The native backend enumerates no VM, so its one daemon is the
+        // host, named by its instance.
+        for (instance, expected) in [(0, "local0"), (3, "local3")] {
+            let sock = providers
+                .join(paths::host_name(paths::HostKind::Minimald, instance))
+                .join(paths::SSH_SOCK_FILE);
+            let hosts = super::local_hosts_from(
+                paths::HostKind::Minimald,
+                Vec::new(),
+                sock.clone(),
+                paths::DEFAULT_VM_NAME,
+            );
+            assert_eq!(
+                hosts,
+                [super::LocalHost {
+                    provider: "local",
+                    host: expected.to_string(),
+                    sock,
+                    selected: true,
+                }]
+            );
+        }
+    }
 
     // BOX-011: `min ls` labels each state with its BOX-011 name.
     #[test]
