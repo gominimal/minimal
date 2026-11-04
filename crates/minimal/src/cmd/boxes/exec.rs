@@ -1,5 +1,5 @@
-//! `min session exec` and `min session run`: relaying the remote command's
-//! output and exit code.
+//! `min box exec`: runs a command in a running box, and relays the
+//! command's output and exit code.
 
 use super::*;
 
@@ -86,8 +86,10 @@ pub(crate) enum TtyAttach {
         sock: std::path::PathBuf,
         id: boxes::SessionId,
     },
-    /// Through an exec channel, with this process's stdio as pipes: the
-    /// path for a stdin that is not a terminal.
+    /// Through an exec channel, with the caller's stdio as pipes. Only the
+    /// scripted tests take it: `min box exec -t` refuses a stdin that is not
+    /// a terminal.
+    #[cfg(test)]
     Pipes,
 }
 
@@ -146,11 +148,12 @@ impl ExecChannels for HostChannels<'_> {
             .open_session_exec_channel(id, wire, &minimald_rpc::taskenv::TaskEnv::default())
             .await
             .map_err(|error| {
-                // The daemon refuses the channel for a box it no longer
-                // has, or cannot reach.
-                tracing::warn!(%id, "the host refused the exec channel: {error:#}");
+                // The open fails when the daemon refuses the channel, and
+                // when the connection to it fails. The text says only that
+                // the channel did not open.
+                tracing::warn!(%id, "the exec channel did not open: {error:#}");
                 anyhow::anyhow!(
-                    "The host of {target} refused to run the command. \
+                    "Could not open a channel to {target} to run the command. \
                      Run `min box show {target}` to see the box."
                 )
             })
@@ -162,19 +165,21 @@ impl ExecChannels for HostChannels<'_> {
 pub async fn cmd_box_exec(global: &GlobalArgs, args: BoxExecArgs) -> Result<(), anyhow::Error> {
     use minimald_rpc::exec::ExecMode;
 
-    ensure_daemon(global)?;
-    let hosts = crate::cmd::list::local_hosts(global)?;
     let request = BoxExecRequest::from_args(args);
     let stdin_is_tty = std::io::stdin().is_terminal();
+    // `-t` without a terminal starts nothing: no daemon, no lookup.
+    refuse_tty_without_terminal(&request, stdin_is_tty)?;
+    ensure_daemon(global)?;
+    let hosts = crate::cmd::list::local_hosts(global)?;
     // A terminal on stdin is never pumped. An attached command does not
     // read it, as `min task run` does not: a read from a background job
     // would stop this process with SIGTTOU's sibling, SIGTTIN. With `-t`
     // the terminal attach reads it itself, and a pump thread started
     // before it would keep a blocking read and take the first keystroke.
     let input = match request.mode {
-        ExecMode::Detached => None,
-        ExecMode::Attached | ExecMode::Tty if stdin_is_tty => None,
-        ExecMode::Attached | ExecMode::Tty => Some(stdin_pump()),
+        ExecMode::Detached | ExecMode::Tty => None,
+        ExecMode::Attached if stdin_is_tty => None,
+        ExecMode::Attached => Some(stdin_pump()),
     };
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
@@ -193,6 +198,27 @@ pub async fn cmd_box_exec(global: &GlobalArgs, args: BoxExecArgs) -> Result<(), 
     } else {
         Err(Handoff::Exit(code).into())
     }
+}
+
+/// Refuses `min box exec -t` when stdin is not a terminal (exit 2). The
+/// refusal comes before the box resolves, so nothing resumes or starts.
+fn refuse_tty_without_terminal(
+    request: &BoxExecRequest,
+    terminal: bool,
+) -> Result<(), anyhow::Error> {
+    if request.mode != minimald_rpc::exec::ExecMode::Tty || terminal {
+        return Ok(());
+    }
+    let refusal = BoxExecRefusal::NoTerminal {
+        target: request.target.clone(),
+    };
+    tracing::info!(
+        verb = "box exec",
+        mode = request.mode.name(),
+        outcome = refusal.outcome(),
+        "{refusal}"
+    );
+    Err(refusal.into())
 }
 
 /// This process's stdin as chunks, read on a detached thread as `min task
@@ -220,8 +246,9 @@ fn stdin_pump() -> tokio::sync::mpsc::Receiver<Vec<u8>> {
 
 /// Resolves the box `request` names over `hosts`, runs the command there as
 /// BOX-149 defines, and returns the exit code to end with. The command's
-/// output goes to `out` and `err`. A tty exec reaches this process's
-/// terminal when `terminal` is set, else its pipes. A refusal returns as a
+/// output goes to `out` and `err`. A tty exec attaches this process's
+/// terminal, and is refused before the box resolves when `terminal` is
+/// not set. A refusal returns as a
 /// [`BoxExecRefusal`], and an exec that its own timeout ended as a
 /// [`BoxExecTimedOut`]. The verb, the box id and the outcome go on the
 /// command's span.
@@ -238,9 +265,10 @@ where
     O: tokio::io::AsyncWrite + Unpin,
     E: tokio::io::AsyncWrite + Unpin,
 {
+    refuse_tty_without_terminal(request, terminal)?;
     let resolved = resolve_box_on_hosts(hosts, &request.target, "box exec").await?;
     crate::output::record_box_id(&resolved.box_id.to_string());
-    let ran = exec_in_resolved_box(&resolved, kind, request, terminal, input, out, err).await;
+    let ran = exec_in_resolved_box(&resolved, kind, request, input, out, err).await;
     record_exec_outcome(resolved.box_id, request, &ran);
     ran
 }
@@ -278,7 +306,6 @@ async fn exec_in_resolved_box<O, E>(
     resolved: &ResolvedBox,
     kind: paths::HostKind,
     request: &BoxExecRequest,
-    terminal: bool,
     input: ExecInput,
     out: &mut O,
     err: &mut E,
@@ -309,13 +336,10 @@ where
         id,
         target: &request.target,
     };
-    let attach = if terminal {
-        TtyAttach::Terminal {
-            sock: sock.to_path_buf(),
-            id,
-        }
-    } else {
-        TtyAttach::Pipes
+    // A tty exec reached here only with a terminal on stdin.
+    let attach = TtyAttach::Terminal {
+        sock: sock.to_path_buf(),
+        id,
     };
     exec_over(&mut channels, request, attach, input, out, err).await
 }
@@ -348,7 +372,10 @@ where
             let status = relayed_status(target, relayed, err).await?;
             // The daemon ends an attached exec at its timeout with 124 and
             // says nothing more. Only a run that asked for a timeout, and
-            // lasted that long, ended at it.
+            // lasted that long, ended at it. An attached exec cannot learn
+            // its exec id, so it cannot ask the daemon as the tty path does:
+            // a command that itself exits 124 after `--timeout` reads as a
+            // timeout.
             if let Some(secs) = request.timeout_secs
                 && status == i32::from(BoxExecTimedOut::EXIT_CODE)
                 && started.elapsed() >= std::time::Duration::from_secs(secs)
@@ -374,6 +401,7 @@ where
             err.flush().await?;
             let attach_wire = minimald_rpc::exec::ExecRequest::ExecAttach(exec_id.clone()).encode();
             let status = match attach {
+                #[cfg(test)]
                 TtyAttach::Pipes => {
                     let channel = channels.open(&attach_wire).await?;
                     let relayed = relay_box_channel(channel, input, out, err, false).await?;
@@ -504,13 +532,25 @@ fn reads_as_refusal(chunk: &[u8]) -> bool {
             || text.contains(SPEC_UNREADABLE_MARK))
 }
 
+/// The state word in the daemon's text `box <label> is <state>. Only a
+/// running box can run a command.`, or `None` when it cannot be read. Then
+/// the daemon's text goes to stderr unchanged.
+fn not_running_state(text: &str) -> Option<String> {
+    let head = text.strip_prefix("box ")?.strip_suffix(NOT_RUNNING_TAIL)?;
+    let (_, state) = head.trim_end().strip_suffix('.')?.rsplit_once(" is ")?;
+    let word = !state.is_empty() && state.chars().all(|c| c.is_ascii_alphabetic() || c == '-');
+    word.then(|| state.to_owned())
+}
+
 /// The refusal that the daemon's exit `status` and its held stderr `held`
 /// make, for the box the user named `target`. `None` for anything else.
 fn exec_refusal(target: &str, status: u32, held: &[u8]) -> Option<BoxExecRefusal> {
     let text = String::from_utf8_lossy(held);
     let target = target.to_owned();
     match status {
-        2 if text.ends_with(NOT_RUNNING_TAIL) => Some(BoxExecRefusal::NotRunning { target }),
+        2 if text.ends_with(NOT_RUNNING_TAIL) => {
+            not_running_state(&text).map(|state| BoxExecRefusal::NotRunning { target, state })
+        }
         5 if text.contains(EXEC_DISABLED_MARK) => Some(BoxExecRefusal::ExecDisabled { target }),
         5 if text.contains(SPEC_UNREADABLE_MARK) => Some(BoxExecRefusal::SpecUnreadable { target }),
         _ => None,

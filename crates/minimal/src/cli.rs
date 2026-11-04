@@ -549,15 +549,23 @@ pub(crate) fn parse_exec_timeout(raw: &str) -> Result<u64, String> {
     }
 }
 
-/// Why `min box exec` ran no command in the box: the box is not running
-/// (BOX-149, exit 2), or its spec turns exec off (BOX-153, exit 5).
-/// `target` is the box as the user named it.
+/// Why `min box exec` ran no command in the box: `-t` without a terminal
+/// (exit 2), the box is not running (BOX-149, exit 2), or its spec turns
+/// exec off (BOX-153, exit 5). `target` is the box as the user named it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BoxExecRefusal {
+    /// `-t` ran with a stdin that is not a terminal, so nothing started.
+    /// Exit 2.
+    NoTerminal {
+        /// The box as the user named it.
+        target: String,
+    },
     /// The box is not running. Exit 2.
     NotRunning {
         /// The box as the user named it.
         target: String,
+        /// The box's state as its host names it, such as `stopped`.
+        state: String,
     },
     /// The box's spec sets `[io] exec_enabled = false`. Exit 5.
     ExecDisabled {
@@ -577,7 +585,7 @@ impl BoxExecRefusal {
     #[must_use]
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::NotRunning { .. } => 2,
+            Self::NoTerminal { .. } | Self::NotRunning { .. } => 2,
             Self::ExecDisabled { .. } | Self::SpecUnreadable { .. } => 5,
         }
     }
@@ -586,6 +594,7 @@ impl BoxExecRefusal {
     #[must_use]
     pub fn outcome(&self) -> &'static str {
         match self {
+            Self::NoTerminal { .. } => "no terminal",
             Self::NotRunning { .. } => "not running",
             Self::ExecDisabled { .. } => "exec disabled",
             Self::SpecUnreadable { .. } => "spec unreadable",
@@ -596,7 +605,17 @@ impl BoxExecRefusal {
 impl std::fmt::Display for BoxExecRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotRunning { target } => write!(f, "{target} is not running."),
+            Self::NoTerminal { target } => write!(
+                f,
+                "Did not run the command in {target}: -t needs a terminal on stdin, \
+                 and stdin is not a terminal. Run `min box exec` from a terminal, \
+                 or run it without -t."
+            ),
+            // BOX-149, BCLI-053: the refusal names the box's state.
+            Self::NotRunning { target, state } => write!(
+                f,
+                "{target} is {state}. Only a running box can run a command."
+            ),
             Self::ExecDisabled { target } => write!(
                 f,
                 "{target} does not allow exec (its spec sets [io] exec_enabled = false)."

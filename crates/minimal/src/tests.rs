@@ -7399,21 +7399,32 @@ fn box_exec_request(target: &str, flags: &[&str], argv: &[&str]) -> cmd::BoxExec
     }
 }
 
-/// Runs `min box exec` for `request` against the harness daemon of `host`.
-async fn run_box_exec_on_host(host: &ExecHost, request: &cmd::BoxExecRequest) -> ExecRun {
+/// Runs `min box exec` for `request` against the harness daemon of `host`,
+/// with a terminal on stdin when `terminal` is set.
+async fn run_box_exec_on_host_with(
+    host: &ExecHost,
+    request: &cmd::BoxExecRequest,
+    terminal: bool,
+) -> ExecRun {
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let result = cmd::box_exec_on_hosts(
         local_hosts(&host.global).expect("the local hosts"),
         cmd::daemon_host_kind(&host.global),
         request,
-        false,
+        terminal,
         None,
         &mut stdout,
         &mut stderr,
     )
     .await;
     ExecRun::of(result, &stdout, &stderr)
+}
+
+/// [`run_box_exec_on_host_with`] with a terminal on stdin. Each refusal
+/// these runs meet comes before a `-t` exec attaches.
+async fn run_box_exec_on_host(host: &ExecHost, request: &cmd::BoxExecRequest) -> ExecRun {
+    run_box_exec_on_host_with(host, request, true).await
 }
 
 /// What one scripted exec channel answers: after `delay`, these messages,
@@ -7605,7 +7616,7 @@ async fn box_exec_runs_command_and_exits_with_its_code() {
         assert_eq!(run.exit, 2, "{flags:?}\n{run}");
         assert_eq!(
             run.message().as_deref(),
-            Some("web is not running."),
+            Some("web is stopped. Only a running box can run a command."),
             "{flags:?}\n{run}"
         );
         assert_eq!(run.stdout, "", "{flags:?}\n{run}");
@@ -7625,6 +7636,43 @@ async fn box_exec_runs_command_and_exits_with_its_code() {
             .count();
         assert_eq!(events, 3, "one `{outcome}` event for each mode\n{log}");
     }
+}
+
+// BCLI-053: `min box exec -t` with a stdin that is not a terminal is refused
+// with exit 2 before the box resolves. The refusal says why and what to do,
+// and no exec starts in the box.
+#[tokio::test]
+async fn box_exec_tty_prints_exec_id_to_stderr_only_on_a_terminal() {
+    let log = minimald::test_harness::captured_log();
+    let host = exec_host().await;
+    let marker = tempfile::tempdir().expect("a temp dir");
+    let marker = marker.path().join("exec-ran");
+    let touch = marker.to_str().expect("a UTF-8 path");
+    for flags in [&["-t"][..], &["--tty"]] {
+        let request = box_exec_request("web", flags, &["touch", touch]);
+        let run = run_box_exec_on_host_with(&host, &request, false).await;
+        assert_eq!(run.exit, 2, "{flags:?}\n{run}");
+        assert_eq!(
+            run.message().as_deref(),
+            Some(
+                "Did not run the command in web: -t needs a terminal on stdin, \
+                 and stdin is not a terminal. Run `min box exec` from a terminal, \
+                 or run it without -t."
+            ),
+            "{flags:?}\n{run}"
+        );
+        assert_eq!(run.stdout, "", "{flags:?}\n{run}");
+        assert_eq!(run.stderr, "", "{flags:?}: no exec id, no output\n{run}");
+        assert!(!marker.exists(), "{flags:?}: nothing ran\n{run}");
+    }
+    let log = log.contents();
+    let refused = log
+        .lines()
+        .filter(|line| {
+            line.contains("verb=\"box exec\"") && line.contains("outcome=\"no terminal\"")
+        })
+        .count();
+    assert_eq!(refused, 2, "one `no terminal` event for each run\n{log}");
 }
 
 // BCLI-053: `min box exec -t` starts BOX-149's terminal exec, prints its

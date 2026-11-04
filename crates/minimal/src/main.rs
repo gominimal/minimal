@@ -224,8 +224,8 @@ fn answer_failure(
 /// carries (`minimal::BoxAddressRefusal`: 2 when a name matches boxes on
 /// more than one host, 4 when the address names no box, 7 when a host did
 /// not answer the lookup), the code a `min box exec` refusal carries
-/// (`minimal::BoxExecRefusal`: 2 when the box is not running, 5 when its
-/// spec turns exec off), 124 when an exec ran past its own timeout
+/// (`minimal::BoxExecRefusal`: 2 for `-t` without a terminal or a box that
+/// is not running, 5 when its spec turns exec off), 124 when an exec ran past its own timeout
 /// (`minimal::BoxExecTimedOut`), and 1, the unspecified error,
 /// for everything else — a refusal the host answered included. Both
 /// output modes end with the same code.
@@ -264,8 +264,8 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     if let Some(refused) = e.downcast_ref::<minimal::BoxAddressRefusal>() {
         return refused.exit_code();
     }
-    // BCLI-053: `min box exec` into a box that is not running (2), or whose
-    // spec turns exec off (5).
+    // BCLI-053: `min box exec -t` without a terminal, or into a box that is
+    // not running (2), or whose spec turns exec off (5).
     if let Some(refused) = e.downcast_ref::<minimal::BoxExecRefusal>() {
         return refused.exit_code();
     }
@@ -1043,8 +1043,15 @@ mod tests {
         let target = "web".to_string();
         for (refusal, code) in [
             (
+                minimal::BoxExecRefusal::NoTerminal {
+                    target: target.clone(),
+                },
+                2,
+            ),
+            (
                 minimal::BoxExecRefusal::NotRunning {
                     target: target.clone(),
+                    state: "stopped".to_string(),
                 },
                 2,
             ),
