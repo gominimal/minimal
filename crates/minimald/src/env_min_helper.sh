@@ -119,6 +119,7 @@ __min_rpc() {
     local data="$@"
 
     local error="false"
+    local relayed=""
     local env_pairs=()
     local bar_open=0
     # The exec that runs this helper hands the box its TRACEPARENT (the exec
@@ -162,7 +163,16 @@ __min_rpc() {
                     printf '\r\033[K'
                     bar_open=0
                 fi
-                echo "$rest"
+                printf '%s\n' "$rest"
+                ;;
+            err)
+                # A line for stderr: the task's own stderr and min's notes
+                # about the run, so stdout carries only the task's output.
+                if [[ "$bar_open" -eq 1 ]]; then
+                    printf '\r\033[K'
+                    bar_open=0
+                fi
+                printf '%s\n' "$rest" >&2
                 ;;
             set_env)
                 local varname="${rest%%:*}"
@@ -173,17 +183,26 @@ __min_rpc() {
             done)
                 break
                 ;;
+            exit)
+                # The task's own exit code, which this command exits with.
+                relayed="$rest"
+                break
+                ;;
             error)
                 if [[ "$bar_open" -eq 1 ]]; then
                     printf '\r\033[K'
                     bar_open=0
                 fi
-                echo "error:$rest" >&2
+                printf 'error:%s\n' "$rest" >&2
                 error="true"
-                break
+                # A `run` refusal is followed by the `exit:` line that gives
+                # its exit code. Read on to it.
+                if [[ "$method" != "run" ]]; then
+                    break
+                fi
                 ;;
         esac
-    done < <(echo "${prefix}${method}%${data}" | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock)
+    done < <(printf '%s\n' "${prefix}${method}%${data}" | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock)
 
     if [[ "$bar_open" -eq 1 ]]; then
         printf '\r\033[K'
@@ -195,9 +214,58 @@ __min_rpc() {
         echo "  export ${env_pairs[*]}"
     fi
 
+    if [[ "$relayed" =~ ^[0-9]{1,3}$ ]] && (( 10#$relayed <= 255 )); then
+        return "$((10#$relayed))"
+    fi
+    # A `run` always ends with an `exit:` line. A stream that ends without
+    # one is a failure of min, not of the task, so it exits 125.
+    if [[ "$method" == "run" ]]; then
+        if [[ "$error" != "true" ]]; then
+            echo "error: the connection closed before the task reported its exit status" >&2
+        fi
+        return 125
+    fi
     if [[ "$error" == "true" ]]; then
         return 1
     fi
+}
+
+# Escapes one item of a `run` request into `__min_item`: a backslash, a
+# newline, a carriage return and the two separators each become a backslash
+# pair, so the request stays on one line. The daemon's `unescape_run_item`
+# reverses it.
+__min_run_item() {
+    local bs='\'
+    local v="$1"
+    v="${v//"$bs"/"$bs$bs"}"
+    v="${v//$'\n'/"${bs}n"}"
+    v="${v//$'\r'/"${bs}c"}"
+    v="${v//$'\x1f'/"${bs}u"}"
+    v="${v//$'\x1e'/"${bs}r"}"
+    __min_item="$v"
+}
+
+# Writes the data of a `run` request: `$PWD`, then the task name and each
+# argument, then each exported variable as NAME=value. A 0x1e byte separates
+# the three groups and a 0x1f byte separates the items in a group.
+__min_run_request() {
+    local us=$'\x1f' rs=$'\x1e'
+    local __min_item out sep="" arg name
+    __min_run_item "$PWD"
+    out="$__min_item$rs"
+    for arg in "$@"; do
+        __min_run_item "$arg"
+        out+="$sep$__min_item"
+        sep="$us"
+    done
+    out+="$rs"
+    sep=""
+    while IFS= read -r name; do
+        __min_run_item "$name=${!name}"
+        out+="$sep$__min_item"
+        sep="$us"
+    done < <(compgen -e 2>/dev/null)
+    printf '%s' "$out"
 }
 
 min_search() {
@@ -279,7 +347,7 @@ min_run() {
         __min_usage task
         return 0
     fi
-    __min_rpc "run" "$@"
+    __min_rpc "run" "$(__min_run_request "$@")"
 }
 
 min_task() {

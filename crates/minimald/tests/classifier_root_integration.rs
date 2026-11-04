@@ -513,7 +513,7 @@ fn push_dec4(buf: &mut [u8], at: &mut usize, n: libc::c_int) {
 /// `fork` and its `_exit`, where only async-signal-safe calls belong — the
 /// same discipline the probe's own child keeps, because the process that
 /// forked it may hold threads the child must not run code against. It
-/// waits for the proof's placement ack, binds its loopback listener after
+/// waits for the proof's placement ack, binds its 0.0.0.0 listener after
 /// the placement (every socket the backend owns is made inside the leaf
 /// its process was placed in, the way a box's processes' sockets are),
 /// reports the port it bound, answers the hostname proxy's connection,
@@ -548,8 +548,10 @@ unsafe fn backend_child_role(report: libc::c_int, target_port: u16) -> ! {
     let mut on: libc::sockaddr_in = unsafe { std::mem::zeroed() };
     on.sin_family = libc::AF_INET as libc::sa_family_t;
     on.sin_port = 0u16.to_be();
+    // 0.0.0.0, not 127.0.0.1: the hostname proxy refuses a host-address
+    // port that only a 127.0.0.1 listener holds (NET-071).
     on.sin_addr = libc::in_addr {
-        s_addr: u32::from_ne_bytes(Ipv4Addr::LOCALHOST.octets()),
+        s_addr: u32::from_ne_bytes(Ipv4Addr::UNSPECIFIED.octets()),
     };
     // SAFETY: `bind(2)` reads the `sockaddr_in` filled in above.
     let bound = unsafe {
@@ -900,7 +902,7 @@ fn the_installers_table_refuses_the_probe_over_a_scratch_tree() {
 }
 
 /// NET-079, live over the loaded table: a deny-all host-address box with a
-/// loopback listener answers a request through the hostname proxy, while
+/// 0.0.0.0 listener answers a request through the hostname proxy, while
 /// the same box's own outbound connect is refused with EHOSTUNREACH — the
 /// live half of the lib's `deny_all_host_ip_box_answers_the_proxy`, whose
 /// request runs against no table at all. The backend is a forked child
