@@ -953,11 +953,6 @@ mod tests {
         );
     }
 
-    /// #1790: a VM host that could not be reached ends the run with 7 —
-    /// provider/host unreachable — found through every context the
-    /// activation adds over it, and a machine-mode run answers it with the
-    /// `host_unreachable` object and the same code. Any other failure stays
-    /// the unspecified error, 1, in both modes.
     #[test]
     fn box_address_refusals_exit_with_their_codes() {
         let address = |s: &str| s.to_owned();
@@ -988,6 +983,11 @@ mod tests {
         }
     }
 
+    /// #1790: a VM host that could not be reached ends the run with 7 —
+    /// provider/host unreachable — found through every context the
+    /// activation adds over it, and a machine-mode run answers it with the
+    /// `host_unreachable` object and the same code. Any other failure stays
+    /// the unspecified error, 1, in both modes.
     #[test]
     fn host_unreachable_exits_7_in_both_output_modes() {
         let unreachable = minimal_client::box_registration::HostUnreachable::over(
