@@ -8170,13 +8170,26 @@ pub(crate) mod tests {
             let control_sock = dir.path().join("gvproxy.sock");
             let door = dir.path().join("guest-control.sock");
             let listening = Arc::new(AtomicBool::new(true));
-            let door_task = proxy_door(&door, Arc::clone(&listening));
+            let asks = Arc::new(AtomicUsize::new(0));
+            let door_task = counting_proxy_door(&door, Arc::clone(&listening), Arc::clone(&asks));
             crate::net::listeners::seed_vm_report_door_for_tests(&control_sock, &door);
 
             let listener =
                 ProxyListenerState::for_switch(&ControlChannel::Unix(control_sock.clone()));
             let gate = steered_box_gate(listener.clone());
             lookup_until(&gate, "github.com.", ResponseCode::NoError).await;
+
+            // The last lookup can leave one ask behind, and that ask alone
+            // would see the stop. Two more can only be the state's own.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let seen = asks.load(Ordering::Acquire);
+            while asks.load(Ordering::Acquire) < seen + 2 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the state did not keep asking with no lookups"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
 
             listening.store(false, Ordering::Release);
             // Wait on the state's own asks: a lookup here would start one,
