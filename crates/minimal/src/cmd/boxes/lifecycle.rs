@@ -937,6 +937,30 @@ pub(crate) fn box_prune_request(
     }
 }
 
+/// The question `min box prune` asks on a terminal. It names each
+/// selector the person passed, so it never claims more than the prune
+/// removes. The age prints in the largest whole unit `--older-than` takes.
+pub(crate) fn prune_question(
+    older_than: Option<std::time::Duration>,
+    parent: Option<&str>,
+) -> String {
+    let what = match parent {
+        Some(parent) => format!("child box of {parent}"),
+        None => "box".to_owned(),
+    };
+    match older_than {
+        Some(age) => {
+            let secs = age.as_secs();
+            let (n, unit) = [(86_400, 'd'), (3_600, 'h'), (60, 'm')]
+                .into_iter()
+                .find(|(size, _)| secs > 0 && secs % size == 0)
+                .map_or((secs, 's'), |(size, unit)| (secs / size, unit));
+            format!("Remove every {what} that stopped or exited at least {n}{unit} ago?")
+        }
+        None => format!("Remove every stopped or exited {what}?"),
+    }
+}
+
 /// `min box prune [--older-than <d>] [--parent <box>] [--yes]`: removes
 /// the stopped and exited boxes that match, as BOX-021 defines. With
 /// `--parent`, only the host that keeps that box is pruned. Without it,
@@ -945,10 +969,7 @@ pub async fn cmd_box_prune(global: &GlobalArgs, args: BoxPruneArgs) -> Result<()
     let gate = prune_gate(args.yes, global.no_input, std::io::stdin().is_terminal())
         .inspect_err(|_| tracing::info!(verb = "box prune", outcome = "refused", "no --yes"))?;
     if gate == PruneGate::Confirm {
-        let question = match &args.parent {
-            Some(parent) => format!("Remove every stopped or exited child box of {parent}?"),
-            None => "Remove every stopped or exited box?".to_owned(),
-        };
+        let question = prune_question(args.older_than, args.parent.as_deref());
         if !confirm(&question, false)? {
             tracing::info!(verb = "box prune", outcome = "declined");
             println!("Nothing was removed.");
@@ -1382,6 +1403,23 @@ mod tests {
         assert_eq!(
             box_prune_request(None, None),
             minimald_rpc::PruneBoxesRequest::default()
+        );
+        // The terminal question names every selector it was given.
+        assert_eq!(
+            prune_question(None, None),
+            "Remove every stopped or exited box?"
+        );
+        assert_eq!(
+            prune_question(None, Some("api")),
+            "Remove every stopped or exited child box of api?"
+        );
+        assert_eq!(
+            prune_question(Some(age), None),
+            "Remove every box that stopped or exited at least 7d ago?"
+        );
+        assert_eq!(
+            prune_question(crate::cli::parse_box_age("90s").ok(), Some("api")),
+            "Remove every child box of api that stopped or exited at least 90s ago?"
         );
         for (arg, secs) in [("12h", 43_200), ("30m", 1_800), ("90s", 90), ("0d", 0)] {
             assert_eq!(crate::cli::parse_box_age(arg).unwrap().as_secs(), secs);
