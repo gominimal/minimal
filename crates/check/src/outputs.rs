@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -436,9 +436,7 @@ impl crate::GraphBasedChecker for OutputsFreeOfDetbuild {
             Some(b) => *b,
             None => return Ok(result), // skip: nothing to check against
         };
-        // Only what the scan needs leaves the guard (the graph itself stays
-        // where it is: cloning it per package would scale with packages times
-        // graph size).
+        // Copy out what the scan needs, so the guard drops before the scan.
         let scan = DetbuildScan {
             name: graph.get(&bsr).unwrap().name.clone(),
             globs: graph
@@ -467,7 +465,7 @@ impl crate::GraphBasedChecker for OutputsFreeOfDetbuild {
 }
 
 /// One package's scan: what names its cached build, its name and output
-/// globs, the caches, and the cancel token. Built under the graph's guard,
+/// globs, the cache, and the cancel token. Built under the graph's guard,
 /// run on the blocking pool without it.
 struct DetbuildScan {
     name: String,
@@ -478,10 +476,14 @@ struct DetbuildScan {
 }
 
 impl DetbuildScan {
-    /// Skip without a cached build (and for the exempt package); otherwise
-    /// pass, or fail naming every output that contains the needle.
+    /// Skip for the exempt package, without reading anything, and for a
+    /// package with no cached build; otherwise pass, or fail naming every
+    /// output that contains the needle.
     fn verdict(&self, mut result: CheckResult) -> Result<CheckResult, Error> {
         crate::bail_if_cancelled(&self.cancel)?;
+        if self.name == DETBUILD_PACKAGE {
+            return Ok(result);
+        }
         // No cached build is a skip; a cache that cannot be read is an
         // error, never a silent pass over an output that exists.
         let cached_build = match self.cache.read_dir(&self.spec_hash) {
@@ -495,43 +497,39 @@ impl DetbuildScan {
             }
         };
         result.verdict = CheckVerdict::Pass;
-        if self.name == DETBUILD_PACKAGE {
-            return Ok(result);
-        }
         let root = cached_build.path();
-        for path in self.outputs_naming_detbuild(root)? {
+        for path in self.files_naming_detbuild(self.output_files(root)?)? {
             result.verdict = CheckVerdict::Fail;
-            // User-facing (AGENTS.md): the situation, then one next step the
-            // user can run as written; the flag is `mip check`'s.
-            result.err.push(format!(
-                "{} contains the text `libdetbuild`. The build wrote the name of its build-time \
-                 library into this output, and the package must not ship it. Remove the reference \
-                 from the output, or skip this check with `--skip-checkers \"{NO_DETBUILD_CHECK}\"`.",
-                path.strip_prefix(root).unwrap_or(&path).display()
+            result.err.push(detbuild_leak_message(
+                path.strip_prefix(root).unwrap_or(&path),
             ));
         }
         Ok(result)
     }
 
-    /// The output files, under every output glob, that contain the needle:
-    /// each file once, however many globs name it, in path order. The walk
-    /// does not follow a symlinked directory: this scan reads whatever the
-    /// build produced, and a loop in it (`a -> .`) must not walk forever.
-    fn outputs_naming_detbuild(&self, root: &Path) -> Result<Vec<PathBuf>, Error> {
-        let mut files = std::collections::BTreeSet::new();
+    /// The output files under every output glob: each file once, however
+    /// many globs name it, in path order. The walk does not follow a
+    /// symlinked directory, so a loop in an output (`a -> .`) ends.
+    fn output_files(&self, root: &Path) -> Result<BTreeSet<PathBuf>, Error> {
+        let mut files = BTreeSet::new();
         for glob in &self.globs {
             crate::bail_if_cancelled(&self.cancel)?;
             let matched = common::match_files_for_glob_no_follow(root, glob)
                 .map_err(|e| Error::Other(anyhow!("{e}")))?;
             files.extend(matched);
         }
+        Ok(files)
+    }
+
+    /// The files among `files` that contain the needle. A read that stops
+    /// for a cancellation is `Error::Cancelled`, never a clean file.
+    fn files_naming_detbuild(&self, files: BTreeSet<PathBuf>) -> Result<Vec<PathBuf>, Error> {
         let stop = || self.cancel.is_cancelled();
         files
             .into_iter()
             .map(|path| match file_contains(&path, DETBUILD_NEEDLE, &stop) {
                 Ok(Some(true)) => Ok(Some(path)),
                 Ok(Some(false)) => Ok(None),
-                // the read stopped because the check was cancelled: report that, never a clean file
                 Ok(None) => {
                     crate::bail_if_cancelled(&self.cancel)?;
                     Err(Error::Other(anyhow!(
@@ -546,14 +544,25 @@ impl DetbuildScan {
     }
 }
 
-/// Whether `path` contains `needle`: the file read in 64 KiB chunks (outputs
-/// can be large and are not read whole), each searched with `memmem`, with
-/// `needle.len() - 1` bytes carried between chunks so a match that straddles
-/// a boundary is seen. The standard library has no streaming substring
-/// search; this is the usual chunk-and-overlap over the library's. `stop`
-/// is asked before every chunk: a cancelled check leaves a large file mid-way
-/// with `None`, distinct from any read error (an `EINTR` from the read is an
-/// error of its own kind, never a cancellation).
+/// What a package author reads for one output that names the shim: what the
+/// leak does to the people who run the package, and the fix. It names no
+/// skip flag: the `detbuild` package is exempt in code, and skipping this
+/// check for any other package ships the leak.
+fn detbuild_leak_message(output: &Path) -> String {
+    format!(
+        "{} contains the text `libdetbuild`. The build wrote the name of its build-time \
+         preload library into this output. A program started through this file can load that \
+         library, and then its random numbers come from a fixed seed, so any key it makes can \
+         be guessed. Rebuilding with a fix does not change a key made before it. Change the \
+         package's build so that this output does not name the library.",
+        output.display()
+    )
+}
+
+/// Whether `path` contains `needle`: the file read in 64 KiB chunks, each
+/// searched with `memmem`, with `needle.len() - 1` bytes carried between
+/// chunks so a match that straddles a boundary is seen. `stop` is asked
+/// before every chunk; once it returns true the read ends with `None`.
 fn file_contains(
     path: &Path,
     needle: &[u8],
@@ -745,13 +754,27 @@ mod tests {
         file: &str,
         contents: &[u8],
     ) {
+        staged_build(ctx, graph, pkg, |root| {
+            std::fs::write(root.join(file), contents).expect("write output file");
+        })
+        .await;
+    }
+
+    /// Stage one finalized build: a `bin/` directory, then whatever `fill`
+    /// writes under the build's root.
+    async fn staged_build(
+        ctx: &CheckCtx,
+        graph: &Arc<RwLock<Graph>>,
+        pkg: &str,
+        fill: impl FnOnce(&std::path::Path),
+    ) {
         let spec_hash = {
             let g = graph.read().await;
             g.spec_hash(g.by_name(pkg).expect("pkg in graph"))
         };
         let pending = ctx.cache.write_dir(&spec_hash).expect("write cache dir");
         std::fs::create_dir_all(pending.path().join("bin")).expect("bin dir");
-        std::fs::write(pending.path().join(file), contents).expect("write output file");
+        fill(pending.path());
         pending
             .finalize(EntryMeta {
                 inner: MetaInner::Spec(pkg.to_string()),
@@ -810,8 +833,21 @@ LD_PRELOAD=/usr/lib/minimal/libdetbuild.so exec /usr/bin/real \"$@\"
             result.err
         );
         assert!(
-            result.err[0].contains(&format!("--skip-checkers \"{NO_DETBUILD_CHECK}\"")),
-            "the message names the skip flag: {:?}",
+            result.err[0].contains("any key it makes can be guessed"),
+            "the message says what the leak does: {:?}",
+            result.err
+        );
+        assert!(
+            result.err[0].ends_with(
+                "Change the package's build so that this output does not name the library."
+            ),
+            "the message ends on the fix: {:?}",
+            result.err
+        );
+        // `min check` refuses the flag, and skipping ships the leak.
+        assert!(
+            !result.err[0].contains("--skip"),
+            "the message names no skip flag: {:?}",
             result.err
         );
 
@@ -871,7 +907,8 @@ LD_PRELOAD=/usr/lib/minimal/libdetbuild.so exec /usr/bin/real \"$@\"
         std::fs::remove_dir_all(&tmpdir).expect("cleanup test tmp dir");
     }
 
-    /// The `detbuild` package ships the library itself and is exempt.
+    /// The `detbuild` package ships the library itself and is exempt: the
+    /// check skips it without reading its output.
     #[tokio::test]
     async fn no_detbuild_exempts_the_detbuild_package() {
         let tmpdir = make_tmp_dir("detbuild_self");
@@ -892,9 +929,139 @@ LD_PRELOAD=/usr/lib/minimal/libdetbuild.so exec /usr/bin/real \"$@\"
             .await
             .expect("check should not error");
         assert!(
-            matches!(result.verdict, CheckVerdict::Pass),
+            matches!(result.verdict, CheckVerdict::Skip),
             "got {:?}",
             result.verdict
+        );
+
+        std::fs::remove_dir_all(&tmpdir).expect("cleanup test tmp dir");
+    }
+
+    /// A cancelled check never reports a file it stopped reading as clean:
+    /// the files are listed, the token fires, and the reads end in
+    /// `Error::Cancelled`, not in an empty list of leaks.
+    #[tokio::test]
+    async fn no_detbuild_a_cancelled_read_is_never_clean() {
+        let tmpdir = make_tmp_dir("detbuild_cancel");
+        let ctx = make_ctx(&tmpdir, vec![]);
+        let graph = pkg_with_bin_output("cancelled");
+        staged_build_with_file(&ctx, &graph, "cancelled", "bin/x", b"libdetbuild").await;
+        let scan = {
+            let g = graph.read().await;
+            DetbuildScan {
+                name: "cancelled".into(),
+                globs: vec!["bin/*".into()],
+                spec_hash: g.spec_hash(g.by_name("cancelled").unwrap()),
+                cache: ctx.cache.clone(),
+                cancel: tokio_util::sync::CancellationToken::new(),
+            }
+        };
+        let root = scan.cache.read_dir(&scan.spec_hash).expect("cached build");
+        let files = scan.output_files(root.path()).expect("walk");
+        assert_eq!(files.len(), 1, "{files:?}");
+
+        scan.cancel.cancel();
+        let got = scan.files_naming_detbuild(files);
+        assert!(matches!(got, Err(Error::Cancelled)), "got {got:?}");
+
+        std::fs::remove_dir_all(&tmpdir).expect("cleanup test tmp dir");
+    }
+
+    /// A read that `stop` ends after the first chunk returns `None`, even
+    /// though the needle sits in the second chunk.
+    #[test]
+    fn file_contains_stops_between_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big");
+        let mut bytes = vec![b'x'; 1 << 16];
+        bytes.extend_from_slice(b"libdetbuild");
+        std::fs::write(&path, &bytes).unwrap();
+        let asked = std::cell::Cell::new(0);
+        let stop = || {
+            asked.set(asked.get() + 1);
+            asked.get() > 1
+        };
+        assert_eq!(file_contains(&path, DETBUILD_NEEDLE, &stop).unwrap(), None);
+        assert_eq!(
+            file_contains(&path, DETBUILD_NEEDLE, &|| false).unwrap(),
+            Some(true)
+        );
+    }
+
+    /// A cache that fails to read for a reason other than a missing entry is
+    /// an error that names the package and prints the cause once.
+    #[tokio::test]
+    async fn no_detbuild_reports_a_cache_read_error_with_its_cause() {
+        let tmpdir = make_tmp_dir("detbuild_cache_err");
+        let ctx = make_ctx(&tmpdir, vec![]);
+        let graph = pkg_with_bin_output("unreadable");
+        let hex = {
+            let g = graph.read().await;
+            g.spec_hash(g.by_name("unreadable").unwrap()).0.to_hex()
+        };
+        // Entries live at <cache>/<first two hex digits>/<rest>: a file where
+        // that first directory belongs fails the read with ENOTDIR.
+        let blocker = tmpdir.join(&hex.as_str()[..2]);
+        std::fs::write(&blocker, b"").expect("write blocker");
+        let cause = std::fs::canonicalize(blocker.join(&hex.as_str()[2..])).unwrap_err();
+
+        let guard = graph.read().await;
+        let err = OutputsFreeOfDetbuild
+            .check(&ctx, "unreadable".to_string(), &tmpdir, guard, None)
+            .await
+            .expect_err("an unreadable cache is an error, never a skip");
+        assert_eq!(
+            err.to_string(),
+            format!("reading the cached build of unreadable: i/o error: {cause}")
+        );
+
+        std::fs::remove_dir_all(&tmpdir).expect("cleanup test tmp dir");
+    }
+
+    /// Two output globs that both name a leaking file report it once, and a
+    /// symlink loop in the output (`loop -> .`, `bin/up -> ..`) ends the walk
+    /// instead of descending until the kernel's link limit.
+    #[tokio::test]
+    async fn no_detbuild_reports_each_file_once_across_a_symlink_loop() {
+        let tmpdir = make_tmp_dir("detbuild_loop");
+        let ctx = make_ctx(&tmpdir, vec![]);
+        let graph = graph_with_pkg(
+            r#"
+            let {BuildSpec, OutputData, ..} = import "minimal.ncl" in
+            {
+                name = "looped",
+                build_deps = [],
+                cmd = "",
+                outputs = {
+                    bin = {glob = "bin/*"} | OutputData,
+                    all = {glob = "**/*"} | OutputData,
+                },
+            } | BuildSpec
+            "#,
+        );
+        staged_build(&ctx, &graph, "looped", |root| {
+            std::fs::write(root.join("bin/wrapped"), b"LD_PRELOAD=libdetbuild.so")
+                .expect("write output file");
+            std::os::unix::fs::symlink(".", root.join("loop")).expect("loop link");
+            std::os::unix::fs::symlink("..", root.join("bin/up")).expect("up link");
+        })
+        .await;
+
+        let guard = graph.read().await;
+        let result = OutputsFreeOfDetbuild
+            .check(&ctx, "looped".to_string(), &tmpdir, guard, None)
+            .await
+            .expect("check should not error");
+        assert!(
+            matches!(result.verdict, CheckVerdict::Fail),
+            "{:?}",
+            result.verdict
+        );
+        assert_eq!(result.err.len(), 1, "one file, one error: {:?}", result.err);
+        assert!(
+            result.err[0].starts_with("bin/wrapped contains"),
+            "{:?}",
+            result.err
         );
 
         std::fs::remove_dir_all(&tmpdir).expect("cleanup test tmp dir");
