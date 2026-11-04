@@ -1331,11 +1331,13 @@ async fn guest_deny_all_box_answers_inbound_through_the_proxy() {
 
     const SERVE_PORT: u16 = 8412;
     // One-shot server in the deny-all box: bind, accept one, answer, exit.
+    // It binds 0.0.0.0: the hostname proxy refuses a host-address port that
+    // only a 127.0.0.1 listener holds (NET-071).
     let server_cmd = format!(
         "python3 -c 'import socket\n\
          s = socket.socket()\n\
          s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n\
-         s.bind((\"127.0.0.1\", {SERVE_PORT}))\n\
+         s.bind((\"0.0.0.0\", {SERVE_PORT}))\n\
          s.listen(1)\n\
          s.settimeout(20)\n\
          c, _ = s.accept()\n\
