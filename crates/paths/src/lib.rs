@@ -1578,9 +1578,15 @@ mod tests {
         assert!(config.join("config.toml").exists(), "other config is kept");
 
         // A second run finds nothing left to remove.
-        assert!(remove_retired_proxy_credentials(config).is_empty());
+        assert_eq!(
+            remove_retired_proxy_credentials(config),
+            Vec::<std::path::PathBuf>::new()
+        );
         // A config dir that does not exist is not an error.
-        assert!(remove_retired_proxy_credentials(&config.join("absent")).is_empty());
+        assert_eq!(
+            remove_retired_proxy_credentials(&config.join("absent")),
+            Vec::<std::path::PathBuf>::new()
+        );
     }
 
     #[test]
