@@ -278,6 +278,9 @@ fn every_daemon_connection_is_classified() {
             // the race's loser just reports what the daemon said — so the
             // harness connection carries no gate to record.
             "cmd/boxes/lifecycle.rs::a_destroy_of_an_already_destroyed_session_reports_it = ungated",
+            // Not a product path: the stop and remove tests' own connection
+            // to the harness daemon, the same as the destroy-race test.
+            "cmd/boxes/lifecycle.rs::daemon_with_boxes = ungated",
             // A read-only lookup around an attach the gated `cmd_attach`
             // already made: it reads the box's pair before, and asks whether
             // the session is gone after, to withdraw its row or release a

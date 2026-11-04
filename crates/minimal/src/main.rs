@@ -211,7 +211,9 @@ fn answer_failure(
 
 /// The exit code a failed run ends with, from the architecture's reserved
 /// codes ("Exit codes"): 2 when a running box holds the name a create
-/// asked for (`minimald_rpc::HeldNameRefusal`), 3 when the activation
+/// asked for (`minimald_rpc::HeldNameRefusal`) or a removal without
+/// `--force` finds the box running (`minimal::BoxRunningRefusal`), 3 when
+/// the activation
 /// refused the box spec
 /// (`boxes::core::bep::ActivationRefused`) or found the project's
 /// `minimal.toml` invalid (`minimal::ProjectFileInvalid`) or a GitHub
@@ -228,6 +230,10 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     // BEP-008/009/010/017/056: a box spec refused at activation.
     if let Some(refused) = e.downcast_ref::<boxes::core::bep::ActivationRefused>() {
         return refused.exit_code();
+    }
+    // BCLI-004: `min box rm` of a running box without `--force`.
+    if e.downcast_ref::<minimal::BoxRunningRefusal>().is_some() {
+        return minimal::BoxRunningRefusal::EXIT_CODE;
     }
     // BOX-163: a create under a name a running box holds.
     if e.downcast_ref::<minimald_rpc::HeldNameRefusal>().is_some() {
@@ -1046,6 +1052,30 @@ mod tests {
         };
         let e = anyhow::Error::new(refused).context("activating the session");
         assert_eq!(failure_exit_code(&e), 3);
+    }
+
+    /// BCLI-004: `min box rm` of a running box without `--force` ends with
+    /// exit 2 in both output modes. The text mode prints the refusal, which
+    /// names `--force`, on stderr.
+    #[test]
+    fn rm_running_box_refuses_naming_force_with_exit_2() {
+        let e = anyhow::Error::new(minimal::BoxRunningRefusal::new("web"));
+        assert_eq!(failure_exit_code(&e), 2);
+
+        let mut stderr = Vec::new();
+        let code = answer_failure(&e, false, false, &mut stderr);
+        assert_eq!(code, ExitCode::from(2));
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "error: web is running. Stop it with min box stop web, \
+             or remove it now with min box rm web --force.\n"
+        );
+
+        let mut stderr = Vec::new();
+        let code = answer_failure(&e, true, false, &mut stderr);
+        assert_eq!(code, ExitCode::from(2));
+        let object: serde_json_lenient::Value = serde_json_lenient::from_slice(&stderr).unwrap();
+        assert_eq!(object["schema"], "min/v1/error");
     }
 
     /// Exit codes: an invalid project `minimal.toml` ends the run with
