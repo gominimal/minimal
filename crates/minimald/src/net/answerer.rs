@@ -339,8 +339,23 @@ impl<T: Zone> ZoneAnswerer<T> {
     /// lookup's view: held, with the address to tell or without one, and live,
     /// because everything this registry knows about a stopped namespace it
     /// has already folded into that address.
+    ///
+    /// The host's own name (NET-003's host half) comes first:
+    /// `host.min.internal` at the host loopback, held by the answerer itself,
+    /// as the VM host daemon's answerer holds it. The registry is not asked
+    /// for it, so a box named `host` cannot take the host's name.
     fn zone_view(&self, asked: &str) -> zone_answer::ZoneView {
         let mut view = zone_answer::ZoneView::new();
+        if asked.eq_ignore_ascii_case(zone_answer::HOST_ROW_NAME) {
+            view.hold(
+                zone_answer::HOST_ROW_NAME,
+                zone_answer::ZoneRow {
+                    address: Some(Ipv4Addr::LOCALHOST),
+                    live: true,
+                },
+            );
+            return view;
+        }
         if let ZoneEntry::Held { address, .. } = self
             .zone
             // The node's own addresses travel empty today (see
@@ -2047,6 +2062,8 @@ async fn host_the_interim(
             port = hook_port,
             channel = %paths.channel.display(),
             status = "serving",
+            host_row = %format_args!("{}={}", zone_answer::HOST_ROW_NAME, Ipv4Addr::LOCALHOST),
+            rows = "the host row, then the box registry's rows",
             "no answerer service is installed and the machine-global channel is absent; this \
              native daemon holds the host loopback answerer port itself as the \
              single-operator interim: the box zone answers here, from this \
@@ -2745,6 +2762,57 @@ mod tests {
         .expect("the apex is answered");
         assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
         assert!(reply.answers.is_empty());
+    }
+
+    /// NET-003's host half on a native host: the interim answerer answers
+    /// `host.min.internal` at the host loopback, as the VM host daemon's
+    /// answerer does, in any letter case. The row is the answerer's own, so
+    /// a box registered as `host` at another address cannot take it, and the
+    /// row stays on this machine (NET-006).
+    #[test]
+    fn interim_answerer_answers_host_min_internal_at_loopback() {
+        let mut reg = registry(false);
+        reg.publish_own_address(
+            SessionId::nil(),
+            "host",
+            Ipv4Addr::new(127, 0, 0, 9),
+            std::collections::BTreeSet::new(),
+        );
+        let native = answerer(reg, AnswerScope::Native);
+        for name in ["host.min.internal.", "HOST.Min.Internal."] {
+            let reply = exchange(&native, on_host(), &encode_query(name, RecordType::A))
+                .expect("the host row is answered");
+            assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+            assert!(reply.metadata.authoritative, "for {name}");
+            let [answer] = &reply.answers[..] else {
+                panic!("{name} must carry exactly one answer")
+            };
+            assert_eq!(
+                answer.data,
+                RData::A(A(Ipv4Addr::LOCALHOST)),
+                "{name} answers the host loopback, not the box named host"
+            );
+        }
+
+        // A non-A lookup on the host row is NODATA: the name is held.
+        let reply = exchange(
+            &native,
+            on_host(),
+            &encode_query("host.min.internal.", RecordType::AAAA),
+        )
+        .expect("the host row is answered");
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        assert!(reply.answers.is_empty());
+
+        // Off the machine the host row is silent, like every zone name.
+        assert!(
+            native
+                .respond(
+                    off_host(),
+                    &encode_query("host.min.internal.", RecordType::A)
+                )
+                .is_none()
+        );
     }
 
     /// NET-124's sub-requirement: every negative — NODATA and NXDOMAIN —
