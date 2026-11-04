@@ -616,29 +616,14 @@ impl BoxActor {
             .as_std_path()
             .to_path_buf();
         // How the VM host names this box when its copy of the record
-        // arrives (NET-046): a box with no switch has no audit route by
-        // switch address, so its report carries the box id and goes over
-        // this box's control channel. A box with a switch reports by the
-        // route its listen watcher registered, as before.
-        let no_switch = match self.record.record().await {
-            Ok(record) => record.box_addresses.is_none(),
-            Err(error) => {
-                tracing::debug!(
-                    name = %box_name,
-                    port,
-                    %error,
-                    "the box record could not be read; the decision is not reported by box id"
-                );
-                false
-            }
-        };
-        let host_key = if no_switch {
-            crate::audit::HostReportKey {
-                box_id: Some(*self.record.id()),
-                control: Some(self.switch_control().await),
-            }
-        } else {
-            crate::audit::HostReportKey::default()
+        // arrives (NET-046). A box with a switch reports by the route its
+        // listen watcher registered, and that route wins when it exists. A
+        // box with no route, a box with no switch among them, reports by its
+        // box id over this box's control channel. The key is always given,
+        // so no failure to read the box record can drop the host's copy.
+        let host_key = crate::audit::HostReportKey {
+            box_id: Some(*self.record.id()),
+            control: Some(self.switch_control().await),
         };
         // An allow that stands is recorded before anything else is said
         // about it, and only a recorded one is answered as published
