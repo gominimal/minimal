@@ -1216,6 +1216,74 @@ ct_mark_conflicts_in() {
             }
             return v
         }
+        # A number as either listing spells one: 0x hexadecimal or decimal.
+        # -1 for anything else.
+        function num(s) {
+            if (s ~ /^0[xX][0-9a-fA-F]+$/) return hex(substr(s, 3))
+            if (s ~ /^[0-9]+$/) return s + 0
+            return -1
+        }
+        # ct_set_writes — which of the two bits a `ct mark set` statement
+        # can change, decoded from its value: the tokens t[1..n] after "ct
+        # mark set". It sets wa and wb for the two bits, wall when it
+        # writes every bit (no mask avoids it), and stop to the index of
+        # the first token past the value. Only what a write can change is
+        # counted, so a value that keeps a bit is no use of it:
+        #   - a value read from the ct mark itself keeps every bit, then
+        #     "and K" (or "&") can change the bits outside K, and "or V",
+        #     "xor V" ("|", "^") the bits of V, where V is a constant or a
+        #     packet mark under a mask ("meta mark & M"; with no mask, every
+        #     bit);
+        #   - "mark and 0xM", the bare "mark" spelled with a word, is how
+        #     nft prints an iptables-nft CONNMARK --save-mark --nfmask 0xM
+        #     --ctmask 0xM through libxtables: libxt_CONNMARK prints that
+        #     spelling only when the two masks are equal, and the kernel
+        #     keeps every connection-mark bit outside --ctmask, so it changes
+        #     the bits of M alone. nft prints a native packet-mark read as
+        #     "meta mark" and an AND as "&", so this spelling is never one;
+        #   - any other value (a constant, "meta mark", "meta mark & M",
+        #     the bare "mark" CONNMARK --save-mark with no masks) replaces
+        #     the whole connection mark, every bit of it;
+        #   - a shift or a parenthesis is not decoded, and counts as a use
+        #     of both bits.
+        function ct_set_writes(t, n,   i, j, v) {
+            wa = 0; wb = 0; wall = 0; stop = n + 1
+            if (t[1] == "mark" && t[2] == "and" && t[3] ~ /^0[xX][0-9a-fA-F]+$/ &&
+                t[4] !~ /^(and|or|xor|&|\||\^|<<|>>)$/) {
+                v = hex(substr(t[3], 3))
+                wa = bit(v, a); wb = bit(v, b); stop = 4
+                return
+            }
+            if (!(t[1] == "ct" && t[2] == "mark")) { wall = 1; return }
+            i = 3
+            while (i <= n) {
+                if (t[i] == "and" || t[i] == "&") {
+                    v = num(t[i + 1])
+                    if (v < 0) { wa = 1; wb = 1; return }
+                    if (!bit(v, a)) wa = 1
+                    if (!bit(v, b)) wb = 1
+                    i += 2
+                } else if (t[i] == "or" || t[i] == "|" || t[i] == "xor" || t[i] == "^") {
+                    j = 0
+                    if (t[i + 1] == "meta" && t[i + 2] == "mark") j = i + 3
+                    else if (t[i + 1] == "mark") j = i + 2
+                    if (j) {
+                        v = (t[j] == "and" || t[j] == "&") ? num(t[j + 1]) : -1
+                        if (v < 0) { wall = 1; return }
+                        i = j + 2
+                    } else {
+                        v = num(t[i + 1])
+                        if (v < 0) { wa = 1; wb = 1; return }
+                        i += 2
+                    }
+                    if (bit(v, a)) wa = 1
+                    if (bit(v, b)) wb = 1
+                } else if (t[i] ~ /^(<<|>>|\(|\))$/) {
+                    wa = 1; wb = 1; return
+                } else break
+            }
+            stop = i
+        }
         # A table header names whose rules follow: everything until the next
         # header belongs to it, and this step replacing its own table is not
         # a host it must refuse to install over.
@@ -1232,12 +1300,21 @@ ct_mark_conflicts_in() {
             if ($1 == "-A") chain = $2
             # A write with no explicit mask sets every bit of the connection
             # mark, whatever value it writes, so it overlaps every mask: an
-            # nft `ct mark set` whose value is not a read of the ct mark
-            # itself (`ct mark set meta mark`, `ct mark set 0x1`), a CONNMARK
+            # nft `ct mark set` whose value replaces the mark (`ct mark set
+            # meta mark`, `ct mark set 0x1`; see ct_set_writes), a CONNMARK
             # --set-mark or --set-xmark with no "/mask", and a CONNMARK
-            # --save-mark with no --mask or --ctmask.
+            # --save-mark with no --mask or --ctmask. An nft `ct mark set`
+            # is decoded whole by ct_set_writes, so the 0x values its value
+            # names are not scanned again below: the mask of an "and" names
+            # the bits the write keeps, not the ones it uses.
+            scan = line
             if (match(line, /ct mark set /)) {
-                if (substr(line, RSTART + RLENGTH) !~ /^ct mark( |$)/) whole = 1
+                nt = split(substr(line, RSTART + RLENGTH), toks, /[ \t]+/)
+                ct_set_writes(toks, nt)
+                if (wall) whole = 1
+                if (wa || wb) hit = 1
+                scan = substr(line, 1, RSTART - 1)
+                for (k = stop; k <= nt; k++) scan = scan " " toks[k]
             }
             if (line ~ /CONNMARK/) {
                 for (i = 1; i < NF; i++) {
@@ -1252,7 +1329,7 @@ ct_mark_conflicts_in() {
                 }
             }
             if (whole) hit = 1
-            rest = line
+            rest = scan
             while (match(rest, /0[xX][0-9a-fA-F]+/)) {
                 v = hex(substr(rest, RSTART + 2, RLENGTH - 2))
                 if (v >= 0 && (bit(v, a) || bit(v, b))) hit = 1

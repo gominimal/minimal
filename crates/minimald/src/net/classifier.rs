@@ -8584,6 +8584,119 @@ mod tests {
         );
     }
 
+    /// Tailscale's connmark rules for its rp_filter workaround, as
+    /// tailscaled 1.104.2 installs them through iptables-nft in the ip and
+    /// ip6 mangle tables (gominimal/inbox#1201): `iptables-save` spells
+    /// them with both masks, and `nft list ruleset` prints the CONNMARK
+    /// targets through libxtables, which drops the --ctmask. The OUTPUT
+    /// lines are the ones a host printed in that issue.
+    const TAILSCALE_CONNMARK_NFT: &str = "table ip mangle {\n\
+         \tchain PREROUTING {\n\
+         \t\ttype filter hook prerouting priority mangle; policy accept;\n\
+         \t\tct state related,established ct mark and 0xff0000 != 0x0 counter packets 0 bytes 0 meta mark set ct mark and 0xff0000\n\
+         \t}\n\
+         \tchain OUTPUT {\n\
+         \t\ttype route hook output priority mangle; policy accept;\n\
+         \t\tct state new meta mark & 0x00ff0000 != 0x00000000 counter packets 39900 bytes 3116800 ct mark set mark and 0xff0000\n\
+         \t}\n\
+         }\n\
+         table ip6 mangle {\n\
+         \tchain PREROUTING {\n\
+         \t\ttype filter hook prerouting priority mangle; policy accept;\n\
+         \t\tct state related,established ct mark and 0xff0000 != 0x0 counter packets 0 bytes 0 meta mark set ct mark and 0xff0000\n\
+         \t}\n\
+         \tchain OUTPUT {\n\
+         \t\ttype route hook output priority mangle; policy accept;\n\
+         \t\tct state new meta mark & 0x00ff0000 != 0x00000000 counter packets 0 bytes 0 ct mark set mark and 0xff0000\n\
+         \t}\n\
+         }\n";
+
+    /// [`TAILSCALE_CONNMARK_NFT`]'s IPv4 half as `iptables-save` prints it.
+    const TAILSCALE_CONNMARK_SAVE: &str = "*mangle\n\
+         :PREROUTING ACCEPT [0:0]\n\
+         :OUTPUT ACCEPT [0:0]\n\
+         -A PREROUTING -m conntrack --ctstate RELATED,ESTABLISHED -m connmark ! --mark 0x0/0xff0000 -j CONNMARK --restore-mark --nfmask 0xff0000 --ctmask 0xff0000\n\
+         -A OUTPUT -m conntrack --ctstate NEW -m mark ! --mark 0x0/0xff0000 -j CONNMARK --save-mark --nfmask 0xff0000 --ctmask 0xff0000\n\
+         COMMIT\n";
+
+    /// NET-079: a connection-mark write is decoded with its masks, so only
+    /// the bits it can change conflict. Tailscale's masked save and restore
+    /// change the bits 0x00ff0000 alone, and the install goes ahead over
+    /// them under the default mask; a mask inside 0x00ff0000 is still
+    /// refused for the range they use.
+    #[test]
+    fn install_decodes_masked_ct_mark_writes() {
+        let mount = standin_mount();
+        let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+        host_ruleset_tools(
+            tools.path(),
+            TAILSCALE_CONNMARK_NFT,
+            TAILSCALE_CONNMARK_SAVE,
+        );
+        let installed = run_install_with(&mount, &[], tools.path());
+        assert!(
+            installed.status.success(),
+            "Tailscale's masked connmark rules do not block the install: {}",
+            said(&installed)
+        );
+
+        // The same rules conflict with bits inside the range they write.
+        let mount = standin_mount();
+        let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+        host_ruleset_tools(
+            tools.path(),
+            TAILSCALE_CONNMARK_NFT,
+            TAILSCALE_CONNMARK_SAVE,
+        );
+        let refused = run_install_with(&mount, &["--ct-mark-mask", "0x00030000"], tools.path());
+        assert!(
+            !refused.status.success(),
+            "a mask inside Tailscale's range is refused: {}",
+            said(&refused)
+        );
+
+        // Each nft value against the default bits 0x30000000: whether the
+        // install is refused, and whether it says no mask avoids the rule.
+        for (value, refused, whole) in [
+            // A native save keeping every bit outside 0x00ff0000.
+            (
+                "ct mark & 0xff00ffff | meta mark & 0x00ff0000",
+                false,
+                false,
+            ),
+            // An AND that keeps the default bits changes only bits 4 and 5.
+            ("ct mark and 0xffffffcf", false, false),
+            // An AND that clears the default bits.
+            ("ct mark & 0xcfffffff", true, false),
+            // An OR with a packet mark under no mask.
+            ("ct mark | meta mark", true, true),
+            // A native packet-mark read under a mask still replaces the rest.
+            ("meta mark & 0x00ff0000", true, true),
+            // CONNMARK --save-mark with no masks, through libxtables.
+            ("mark", true, true),
+        ] {
+            let mount = standin_mount();
+            let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+            host_ruleset_tools(
+                tools.path(),
+                &format!("table inet other {{\n\tchain c {{\n\t\tct mark set {value}\n\t}}\n}}\n"),
+                "",
+            );
+            let ran = run_install_with(&mount, &[], tools.path());
+            let text = said(&ran);
+            assert_eq!(
+                !ran.status.success(),
+                refused,
+                "`ct mark set {value}` refused: {text}"
+            );
+            assert_eq!(
+                text.contains("writes every bit of the connection mark"),
+                whole,
+                "`ct mark set {value}` writes every bit: {text}"
+            );
+        }
+    }
+
     /// NET-079: `--ct-mark-mask` refuses a mask in a range a well-known
     /// component classes with, naming the range and the component, and
     /// names `min finalize-install --ct-mark-mask <mask>` for two other bits.
