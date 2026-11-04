@@ -922,6 +922,11 @@ impl ListenPlan {
     /// same port. `state_dir` is the daemon's state directory, the one the
     /// runtime expose path audits its decisions under, so both surfaces'
     /// records land in the one log.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the plan is built once per launch from facts only the launch holds; \
+                  a builder would add a type for one call site"
+    )]
     #[must_use]
     pub fn new(
         box_name: String,
