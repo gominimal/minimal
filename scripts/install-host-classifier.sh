@@ -1507,10 +1507,19 @@ scan_ct_mark_conflicts() {
     # both are read; a line of neither kind matches no rule of the scan.
     # An nft that cannot print the netlink form leaves the scan the plain
     # listing: an xt CONNMARK is then found by its text alone
-    # (ct_mark_conflicts_in), as the scan did before it read netlink.
+    # (ct_mark_conflicts_in), as the scan did before it read netlink. So
+    # does an annotated listing that carries no table the plain one does:
+    # the scan never reads less than the plain listing shows.
     if ! annotated="$(nft -a --debug=netlink list ruleset 2>&1)"; then
         annotated="$listing"
     fi
+    case "$listing" in
+        *"table "*)
+            case "$annotated" in
+                *"table "*) ;;
+                *) annotated="$listing" ;;
+            esac ;;
+    esac
     local xt_rules covered="" family saver saved hits
     xt_rules="$(printf '%s\n' "$annotated" | xt_target_rules_in)"
     conflicting=""
