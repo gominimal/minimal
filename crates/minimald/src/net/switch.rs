@@ -1954,6 +1954,21 @@ impl BoxGate {
         if pkt.carries_reset() {
             return false;
         }
+        // NET-073: a direct connection to a port the box did not publish is
+        // the same ingress violation a hostname-proxy request to it is, so it
+        // says the same `network policy violation` line, through the gate's
+        // limiter: once per box, rule and window (R2.7), beside the refusal
+        // audit's line below, which stays the reset channel's account.
+        if class == refusal::UNPUBLISHED_PORT {
+            self.limiter.warn(
+                &self.label,
+                Direction::Ingress,
+                Some(SocketAddr::V4(pkt.src)),
+                Proto::Tcp,
+                Some(pkt.dst.port()),
+                class.rule,
+            );
+        }
         // Build before charging: a segment the gate can build nothing for — a
         // flow the gate holds no tail for, whose numbers are its sender's
         // claim — is answered with nothing on the wire, but its refusal is
@@ -5580,6 +5595,89 @@ pub(crate) mod tests {
         assert_tcp_checksum_verifies_on_the_wire(reset);
     }
 
+    /// NET-073: a direct connection refused at a port the box did not publish
+    /// says the `network policy violation` line a hostname-proxy refusal says
+    /// — direction ingress, the box, the port and the rule — beside the
+    /// refusal audit's line, once per box, rule and window: a second SYN in
+    /// the same window to another unpublished port says no second line. A
+    /// revoked port's refusal stays the audit's alone.
+    #[test]
+    fn direct_unpublished_port_logs_policy_violation() {
+        let capture = crate::test_harness::CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let gate = BoxGate::for_session(
+            LEASE.to_string(),
+            LEASE,
+            &declared_ingress_80(),
+            SwitchSubnet::default(),
+            None,
+        );
+        let _resets = gate.take_resets().expect("the reset channel is taken once");
+
+        let syn = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, PEER, 9999);
+        let syn_pkt = parse_ipv4_l4(&syn).expect("the SYN parses");
+        assert!(gate.refuse_tcp_segment(&syn, &syn_pkt, refusal::UNPUBLISHED_PORT));
+
+        let logged = capture.contents();
+        let violations: Vec<&str> = logged
+            .lines()
+            .filter(|line| line.contains("network policy violation"))
+            .collect();
+        assert_eq!(violations.len(), 1, "one violation line: {logged}");
+        for expected in [
+            "session_id=\"100.64.0.9\"",
+            "direction=ingress",
+            "remote_addr=100.64.0.5:",
+            "proto=tcp",
+            "dst_port=9999",
+            "rule_matched=\"no ingress mapping\"",
+        ] {
+            assert!(
+                violations[0].contains(expected),
+                "missing {expected:?} in: {logged}"
+            );
+        }
+        assert!(
+            logged.contains("reason=\"no listener is published for the port\""),
+            "the refusal audit's line still stands beside it: {logged}"
+        );
+
+        // The same rule inside the window: the limiter holds it to one line.
+        let again = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, PEER, 9998);
+        let again_pkt = parse_ipv4_l4(&again).expect("the SYN parses");
+        gate.refuse_tcp_segment(&again, &again_pkt, refusal::UNPUBLISHED_PORT);
+        assert_eq!(
+            capture
+                .contents()
+                .matches("network policy violation")
+                .count(),
+            1,
+            "one line per box, rule and window: {}",
+            capture.contents()
+        );
+
+        // A revoked port is not this requirement's: its audit line alone.
+        gate.revoke_port(80);
+        let revoked = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, PEER, 80);
+        let revoked_pkt = parse_ipv4_l4(&revoked).expect("the SYN parses");
+        gate.refuse_tcp_segment(&revoked, &revoked_pkt, refusal::REVOKED_PORT);
+        assert_eq!(
+            capture
+                .contents()
+                .matches("network policy violation")
+                .count(),
+            1,
+            "a revoked port's refusal says no violation line: {}",
+            capture.contents()
+        );
+    }
+
     /// The gate's two reset shapes (NET-014, NET-121, RFC 793 §3.4), and the
     /// one non-shape a spoofing peer must find: a reset is built only from
     /// state the gate holds. A bare SYN is refused the way a kernel refuses a
@@ -6330,11 +6428,22 @@ pub(crate) mod tests {
         // connect-time one under the source's label — the source's own leg
         // refused the same frame above and said no second line for it, one
         // refusal being one line through the limiter the two share — and the
-        // target's ingress one, through the shared refusal audit.
+        // target's ingress one, which says the limiter's line under the
+        // target's label beside the shared refusal audit's.
         assert_eq!(
             logged.matches("network policy violation").count(),
+            2,
+            "the connect-time refusal and the ingress refusal each say one: {logged}"
+        );
+        assert_eq!(
+            logged
+                .lines()
+                .filter(|line| line.contains("network policy violation")
+                    && line.contains("direction=ingress")
+                    && line.contains("dst_port=9999"))
+                .count(),
             1,
-            "the connect-time refusal alone says the limiter's line: {logged}"
+            "the unpublished port's refusal is an ingress violation: {logged}"
         );
         assert_eq!(
             logged.matches("address=100.64.0.11 port=9999").count(),
