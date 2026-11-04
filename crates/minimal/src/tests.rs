@@ -281,10 +281,10 @@ fn every_daemon_connection_is_classified() {
             // `min box prune` probes each host it did not select and checks
             // its build before the prune, so a daemon outside the supported
             // window removes nothing.
-            "cmd/boxes/lifecycle.rs::cmd_box_prune = gated",
             // Not a product path: the stop and remove tests' own connection
             // to the harness daemon, the same as the destroy-race test.
             "cmd/boxes/lifecycle.rs::daemon_with_boxes = ungated",
+            "cmd/boxes/lifecycle.rs::prune_hosts = gated",
             // A read-only lookup around an attach the gated `cmd_attach`
             // already made: it reads the box's pair before, and asks whether
             // the session is gone after, to withdraw its row or release a

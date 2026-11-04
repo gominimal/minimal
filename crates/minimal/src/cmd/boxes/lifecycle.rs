@@ -987,35 +987,107 @@ pub async fn cmd_box_prune(global: &GlobalArgs, args: BoxPruneArgs) -> Result<()
     };
     let request = box_prune_request(args.older_than, parent);
     let mut out = std::io::stdout().lock();
-    let (mut reaped, mut failed) = (0usize, 0usize);
+    let tally = prune_hosts(hosts, parent.is_some(), request, &mut out).await?;
+    tracing::info!(
+        verb = "box prune",
+        reaped = tally.reaped,
+        failed = tally.failed,
+        failed_hosts = tally.failed_hosts.len(),
+        outcome = "pruned"
+    );
+    finish_prune(&tally, &mut out, &mut std::io::stderr().lock())
+}
+
+/// What `min box prune` did across its hosts: how many boxes it removed and
+/// did not, how many hosts it pruned, and each host it could not prune with
+/// the reason.
+#[derive(Debug, Default)]
+pub(crate) struct PruneTally {
+    pub reaped: usize,
+    pub failed: usize,
+    pub pruned_hosts: usize,
+    pub failed_hosts: Vec<(String, anyhow::Error)>,
+}
+
+/// Prunes each host in `hosts` with `request`. A host that fails does not
+/// stop the prune: its error goes in the tally and the next host is pruned.
+/// A host that is not selected is probed first, and one that is not running
+/// is skipped. Only a write to `out` that fails ends the walk.
+pub(crate) async fn prune_hosts(
+    hosts: Vec<crate::cmd::list::LocalHost>,
+    by_parent: bool,
+    request: minimald_rpc::PruneBoxesRequest,
+    out: &mut impl std::io::Write,
+) -> Result<PruneTally, anyhow::Error> {
+    let mut tally = PruneTally::default();
     for host in hosts {
-        let client = if host.selected || parent.is_some() {
-            Some(gated_box_host_client(&host).await?)
+        let client = if host.selected || by_parent {
+            gated_box_host_client(&host).await.map(Some)
         } else {
             match client::Client::probe(&host.sock).await {
-                Ok(mut client) => {
-                    client::ensure_version_match(&mut client).await?;
-                    Some(client)
-                }
-                Err(client::ProbeRefusal::NotRunning) => None,
-                Err(client::ProbeRefusal::Unreachable(e)) => {
-                    return Err(e.context(format!("Could not reach host {}.", host.host)));
-                }
+                Ok(mut client) => client::ensure_version_match(&mut client)
+                    .await
+                    .map(|()| Some(client)),
+                Err(client::ProbeRefusal::NotRunning) => Ok(None),
+                Err(client::ProbeRefusal::Unreachable(e)) => Err(e),
             }
         };
-        let Some(mut client) = client else { continue };
-        let pruned = prune_host(&mut client, &host, &mut out, request.clone()).await?;
-        reaped += pruned.0;
-        failed += pruned.1;
+        let pruned = match client {
+            Ok(None) => continue,
+            Ok(Some(mut client)) => prune_host(&mut client, &host, out, request.clone()).await,
+            Err(e) => Err(e),
+        };
+        match pruned {
+            Ok((reaped, failed)) => {
+                tally.reaped += reaped;
+                tally.failed += failed;
+                tally.pruned_hosts += 1;
+            }
+            Err(e) => {
+                tracing::warn!(verb = "box prune", host = %host.host, error = %format!("{e:#}"), "host prune failed");
+                tally.failed_hosts.push((host.host, e));
+            }
+        }
     }
-    tracing::info!(verb = "box prune", reaped, failed, outcome = "pruned");
-    if failed > 0 {
-        bail!(
-            "Prune could not remove {failed} of {} boxes.",
-            reaped + failed
-        );
+    Ok(tally)
+}
+
+/// Ends `min box prune` from its `tally`: one line on `err` for each host it
+/// could not prune, then an error that counts the boxes and the hosts that
+/// failed. With no failure and nothing removed, it says so on `out`.
+pub(crate) fn finish_prune(
+    tally: &PruneTally,
+    out: &mut impl std::io::Write,
+    err: &mut impl std::io::Write,
+) -> Result<(), anyhow::Error> {
+    for (host, e) in &tally.failed_hosts {
+        writeln!(err, "Could not prune host {host}: {e:#}")?;
     }
-    if reaped == 0 {
+    let plural =
+        |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let mut summary = Vec::new();
+    if tally.failed > 0 {
+        summary.push(format!(
+            "Prune could not remove {} of {}.",
+            tally.failed,
+            plural(tally.reaped + tally.failed, "box", "boxes")
+        ));
+    }
+    if !tally.failed_hosts.is_empty() {
+        summary.push(format!(
+            "Prune failed on {} of {}.",
+            tally.failed_hosts.len(),
+            plural(
+                tally.pruned_hosts + tally.failed_hosts.len(),
+                "host",
+                "hosts"
+            )
+        ));
+    }
+    if !summary.is_empty() {
+        bail!("{}", summary.join(" "));
+    }
+    if tally.reaped == 0 {
         writeln!(
             out,
             "No stopped or exited box matched, so nothing was removed."
@@ -1497,6 +1569,75 @@ mod tests {
             listed_state(&mut client, "db").await.as_deref(),
             Some("running")
         );
+    }
+
+    // BCLI-061: a host that `min box prune` cannot prune does not stop the
+    // prune. The other hosts are still pruned, the failed host is named with
+    // its reason, and the command ends with an error that counts it.
+    #[tokio::test]
+    async fn box_prune_goes_on_past_a_failed_host() {
+        let (_server, dir, _project, mut client) = daemon_with_boxes(&["web", "db"]).await;
+        let web = listed_id(&mut client, "web").await;
+        stop_listed_box(&mut client, &mut Vec::new(), web, "box", false)
+            .await
+            .expect("the stop succeeds");
+
+        // A host whose socket accepts and then closes: its probe fails.
+        let broken_sock = dir.path().join("broken.sock");
+        let listener = tokio::net::UnixListener::bind(&broken_sock).unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        let hosts = vec![
+            crate::cmd::list::LocalHost {
+                provider: crate::cmd::list::LOCAL_PROVIDER,
+                host: "broken0".to_owned(),
+                sock: broken_sock,
+                selected: false,
+            },
+            crate::cmd::list::LocalHost {
+                provider: crate::cmd::list::LOCAL_PROVIDER,
+                host: "local0".to_owned(),
+                sock: dir.path().join("ssh.sock"),
+                selected: true,
+            },
+        ];
+
+        let mut out = Vec::new();
+        let tally = prune_hosts(hosts, false, box_prune_request(None, None), &mut out)
+            .await
+            .expect("only a write to out can end the walk");
+        assert_eq!((tally.reaped, tally.failed, tally.pruned_hosts), (1, 0, 1));
+        assert_eq!(tally.failed_hosts.len(), 1);
+        assert_eq!(tally.failed_hosts[0].0, "broken0");
+        assert_eq!(
+            String::from_utf8(out.clone()).unwrap(),
+            format!("Removed web ({web}).\n")
+        );
+        assert_eq!(listed_state(&mut client, "web").await, None);
+        assert_eq!(
+            listed_state(&mut client, "db").await.as_deref(),
+            Some("running")
+        );
+
+        let mut err = Vec::new();
+        let summary = finish_prune(&tally, &mut out, &mut err).expect_err("a host failed");
+        let err = String::from_utf8(err).unwrap();
+        assert!(err.starts_with("Could not prune host broken0: "), "{err}");
+        assert_eq!(err.lines().count(), 1, "{err}");
+        assert_eq!(summary.to_string(), "Prune failed on 1 of 2 hosts.");
+
+        // The box count says "box" for one.
+        let one_failed = PruneTally {
+            failed: 1,
+            pruned_hosts: 1,
+            ..PruneTally::default()
+        };
+        let summary =
+            finish_prune(&one_failed, &mut Vec::new(), &mut Vec::new()).expect_err("a box failed");
+        assert_eq!(summary.to_string(), "Prune could not remove 1 of 1 box.");
     }
 
     // BCLI-005: off a terminal, or under `--no-input`, `min box prune`
