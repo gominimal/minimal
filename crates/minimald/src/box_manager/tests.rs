@@ -3224,6 +3224,8 @@ async fn show_returns_record_state_identity_and_live_execs() {
             reason: Some("stopped".to_string()),
             exit_code: Some(3),
             signal: None,
+            // A session filed with no spec has a terminal.
+            pty_enabled: true,
         }
     );
     assert_eq!(shown.identity, minimald_rpc::BoxIdentity::None);
@@ -3278,6 +3280,53 @@ async fn show_box_finds_a_box_by_the_id_list_prints() {
         .unwrap()
         .expect("the record id still finds the box");
     assert_eq!(by_record_id.record.box_id, box_id);
+}
+
+/// BCLI-068: the listing and the read carry whether the box's stored spec
+/// sets `io.pty_enabled`. A spec that sets it is a terminal box, one that
+/// clears it is not, and a session filed with no spec has a terminal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn box_listing_and_show_carry_pty_enabled() {
+    let (_state, _cache, mngr) = manager().await;
+    let spec = |pty: bool| serde_json_lenient::json!({"v": 1, "io": {"pty_enabled": pty}});
+    let terminal = mngr
+        .create_box_with_spec(
+            rooted_config("terminal", "/home/dev/proj"),
+            Some(spec(true)),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let headless = mngr
+        .create_box_with_spec(
+            rooted_config("headless", "/home/dev/proj"),
+            Some(spec(false)),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let unspecced = mngr
+        .create_session(rooted_config("unspecced", "/home/dev/proj"), None)
+        .await
+        .unwrap();
+
+    let listing = mngr.list_boxes(None).await.unwrap();
+    for (id, pty) in [(terminal, true), (headless, false), (unspecced, true)] {
+        let listed = listing
+            .iter()
+            .find(|entry| entry.box_id == id)
+            .unwrap_or_else(|| panic!("the listing holds {id}"));
+        assert_eq!(listed.pty_enabled, pty, "listing: {listed:?}");
+        let shown = mngr
+            .show_box(id)
+            .await
+            .unwrap()
+            .expect("the box is retained");
+        assert_eq!(shown.record.pty_enabled, pty, "read: {:?}", shown.record);
+        assert_eq!(&shown.record, listed, "the read and the listing agree");
+    }
 }
 
 /// Creates an `Active` box through the whole create flow a client drives,

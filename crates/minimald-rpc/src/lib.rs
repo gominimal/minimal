@@ -2728,6 +2728,11 @@ pub struct BoxListingEntry {
     /// The number of the signal that ended a stopped box.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal: Option<i32>,
+    /// Whether the box's stored spec sets `io.pty_enabled`, so a client can
+    /// attach a terminal to it (BCLI-068). A daemon that predates the field
+    /// sends none, and the box reads as one with no terminal.
+    #[serde(default)]
+    pub pty_enabled: bool,
 }
 
 /// The response for a [`ListBoxes`] RPC.
@@ -3861,6 +3866,7 @@ mod box_listing_tests {
             reason: None,
             exit_code: None,
             signal: None,
+            pty_enabled: true,
         }
     }
 
@@ -3913,6 +3919,14 @@ mod box_listing_tests {
             Errorable::Ok(back) => assert_eq!(back, show),
             Errorable::Err { error } => panic!("the read reply read back as an error: {error}"),
         }
+        // BCLI-068: a record from a daemon that predates `pty_enabled`
+        // reads as a box with no terminal.
+        let older: BoxListingEntry = serde_json_lenient::from_str(&format!(
+            r#"{{"box_id":"{}","state":"running"}}"#,
+            show.record.box_id
+        ))
+        .unwrap();
+        assert!(!older.pty_enabled);
         // The identity none serialises with the name BOX-140 reports.
         assert_eq!(
             serde_json_lenient::to_string(&BoxIdentity::None).unwrap(),

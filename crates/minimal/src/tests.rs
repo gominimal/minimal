@@ -6468,6 +6468,7 @@ fn address_entry(id: &str, name: &str, state: &str) -> minimald_rpc::BoxListingE
         reason: None,
         exit_code: None,
         signal: None,
+        pty_enabled: true,
     }
 }
 
