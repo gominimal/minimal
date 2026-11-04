@@ -10935,8 +10935,8 @@ proof_native_names_answer_on_time() {
 
   local nnat_channel=/run/minimal/answerer.sock
   local nnat_base="$XDG_STATE_HOME/minimal"
-  local nnat_log_filter="warn,minimald::rpc=info,minimald::net::answerer=info"
-  local nnat_port="" nnat_closed_port=18193
+  local nnat_log_filter="warn,minimald::rpc=info,minimald::net::answerer=info,minimald::net::switch=debug"
+  local nnat_port="" nnat_closed_port=18193 nnat_open_port=18194
   NNAT_ADDR=""
 
   if [ -e /etc/systemd/system/minzoned.socket ] || [ -e "$nnat_channel" ] \
@@ -11089,7 +11089,12 @@ proof_native_names_answer_on_time() {
   nnat_a_sid="$(nnat_activate "$nnat_a_name" --allow-subnets 100.64.0.0/10 --allow-protocols tcp)" || fail
   nnat_t="$(now_ms)"
   nnat_on_time "$nnat_a_name.min.internal" A "$nnat_t" "the first activate after the daemon start"
-  nnat_b_sid="$(nnat_activate "$nnat_b_name")" || fail
+  # Box b is the target of beat 4. It carries the same zone rules as box a,
+  # and one published port, the shape the NET-072/073 proof refuses fast.
+  # A target with no rules leaves the box-zone conjunction nothing to admit,
+  # so the SYN is dropped to curl's timeout, not refused.
+  nnat_b_sid="$(nnat_activate "$nnat_b_name" --allow-subnets 100.64.0.0/10 --allow-protocols tcp \
+    --ingress "$nnat_open_port:$nnat_open_port")" || fail
   nnat_t="$(now_ms)"
   nnat_on_time "$nnat_b_name.min.internal" A "$nnat_t" "the second box's activate"
 
@@ -11122,6 +11127,9 @@ proof_native_names_answer_on_time() {
   echo "  connect from $nnat_a_name to $nnat_b_name.min.internal:$nnat_closed_port (not published): curl exit $nnat_rc after ${nnat_ms} ms: $(tr '\n' ' ' < "$WORK/nnat-closed.err" 2>/dev/null)"
   if [ "$nnat_rc" -ne 7 ] || [ "$nnat_ms" -ge 6000 ]; then
     echo "::error::the connect to the unpublished port was not refused fast (expected curl exit 7 well inside 6 s)"
+    echo "--- daemon log: box-zone decisions and policy violations (tail) ---"
+    nnat_lines 'box-zone connection decided at connect' | tail -n 5
+    nnat_lines 'network policy violation' | tail -n 5
     fail
   fi
   if ! nnat_wait_more 'network policy violation' "$nnat_viol_before"; then
