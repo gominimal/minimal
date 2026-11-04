@@ -1411,6 +1411,9 @@ mod trust_store {
 struct ChannelRequest {
     /// The single request line read by the listener (`method%data`).
     line: String,
+    /// The line as the box sent it, when it was not valid UTF-8 and `line`
+    /// is its lossy decode. `None` for a valid line.
+    raw: Option<Vec<u8>>,
     /// An owned clone of the client connection, written to by the handler.
     stream: UnixStream,
 }
@@ -1426,6 +1429,16 @@ struct BridgeChannel {
 
 impl sandbox::Channel for BridgeChannel {
     fn handle(&mut self, stream: &mut UnixStream, line: &str, _rootfs: &Path) {
+        self.forward(stream, line, None);
+    }
+
+    fn handle_lossy(&mut self, stream: &mut UnixStream, line: &str, raw: &[u8], _rootfs: &Path) {
+        self.forward(stream, line, Some(raw.to_vec()));
+    }
+}
+
+impl BridgeChannel {
+    fn forward(&mut self, stream: &mut UnixStream, line: &str, raw: Option<Vec<u8>>) {
         let stream = match stream.try_clone() {
             Ok(s) => s,
             Err(e) => {
@@ -1438,6 +1451,7 @@ impl sandbox::Channel for BridgeChannel {
         // commands behind, which doesn't happen for interactive `min` use.
         if let Err(e) = self.tx.blocking_send(ChannelRequest {
             line: line.to_string(),
+            raw,
             stream,
         }) {
             let mut stream = e.0.stream;
@@ -1584,19 +1598,35 @@ fn loggable_request(line: &str) -> std::borrow::Cow<'_, str> {
 impl BoxChannel {
     /// Drives the actor until the bridge (and thus all senders) is dropped.
     async fn run(mut self) {
-        while let Some(ChannelRequest { line, mut stream }) = self.rx.recv().await {
+        while let Some(ChannelRequest {
+            line,
+            raw,
+            mut stream,
+        }) = self.rx.recv().await
+        {
             tracing::trace!("session channel handling: {}", loggable_request(&line));
             let (span, line) = channel_request_span(&line, &self.box_id, self.session_id);
             // Boxed: the handler's future is large (every subcommand's state in
             // one `async fn`) and it is awaited once per request, not per byte.
-            tracing::Instrument::instrument(Box::pin(self.handle(line, &mut stream)), span).await;
+            tracing::Instrument::instrument(
+                Box::pin(self.handle_raw(line, raw.as_deref(), &mut stream)),
+                span,
+            )
+            .await;
             // `stream` is dropped here, closing the connection so the client's
             // `socat` reads EOF and the `min` helper's read loop terminates.
         }
     }
 
-    /// Dispatches a single `method%data` request line.
+    /// Dispatches a single valid `method%data` request line.
+    #[cfg(test)]
     async fn handle(&mut self, line: &str, stream: &mut UnixStream) {
+        self.handle_raw(line, None, stream).await;
+    }
+
+    /// Dispatches a single `method%data` request line. `raw` is the line as
+    /// the box sent it when `line` is its lossy decode.
+    async fn handle_raw(&mut self, line: &str, raw: Option<&[u8]>, stream: &mut UnixStream) {
         let add_dep = match line.split_once('%') {
             Some(("add-transient", pkgs)) => match self.parse_pkgs_line(pkgs) {
                 Err(n) => {
@@ -1651,7 +1681,11 @@ impl BoxChannel {
                 None
             }
             Some(("run", request)) => {
-                self.run_task(stream, TaskRunRequest::parse(request)).await;
+                let mut request = TaskRunRequest::parse(request);
+                if let Some(data) = raw.and_then(run_data_bytes) {
+                    request.mark_invalid_bytes(data);
+                }
+                self.run_task(stream, request).await;
                 None
             }
             Some(("build", args)) => {
@@ -2143,6 +2177,13 @@ impl BoxChannel {
             Ok(Some(v)) => v,
         };
 
+        // BCLI-010 (T62): the laptop refuses an argument that is not valid
+        // UTF-8 before the task runs, so the in-box run does as well.
+        if relays && request.invalid_arg {
+            let _ = writeln!(stream, "{}", invalid_arg_refusal(task_name));
+            return relay_refusal_exit(stream, relays, task_name, EXIT_USAGE);
+        }
+
         let parsed_args = if !task.args.is_empty() {
             let parsed = match &request.args {
                 TaskRunArgs::Line(line) => task.args.parse(line),
@@ -2166,14 +2207,14 @@ impl BoxChannel {
 
         // The caller's own values for the task's `inherit` variables. The
         // daemon's environment is not the caller's, so it never fills one.
-        // A variable the caller does not set refuses the run, with the text
-        // the laptop's `min task run` prints for it.
-        if relays && let Err(name) = inherit_from_caller(&mut task.vars, &request.env) {
-            let _ = writeln!(
-                stream,
-                "error: task '{task_name}' declares `env_vars.{name} = {{ inherit = true }}`, \
-                 but {name} is not set in this shell; export it before running the task"
-            );
+        // A variable the caller does not set, or sets to a value that is not
+        // valid UTF-8, refuses the run with the text the laptop's `min task
+        // run` prints for both.
+        if relays
+            && let Err(name) =
+                inherit_from_caller(&mut task.vars, &request.env, &request.invalid_env)
+        {
+            let _ = writeln!(stream, "{}", inherit_refusal(task_name, &name));
             return relay_refusal_exit(stream, relays, task_name, EXIT_USAGE);
         }
         let start_dir = match start_dir_in_box(
@@ -2951,6 +2992,10 @@ struct TaskRunRequest {
     cwd: Option<String>,
     /// The caller's exported environment.
     env: BTreeMap<String, String>,
+    /// The names in `env` whose value held a byte that is not valid UTF-8.
+    invalid_env: BTreeSet<String>,
+    /// Whether an argument after the task name held such a byte.
+    invalid_arg: bool,
 }
 
 impl TaskRunRequest {
@@ -2964,6 +3009,8 @@ impl TaskRunRequest {
                 args: TaskRunArgs::Line(args.to_string()),
                 cwd: None,
                 env: BTreeMap::new(),
+                invalid_env: BTreeSet::new(),
+                invalid_arg: false,
             };
         };
         let (argv, env) = rest.split_once(RUN_GROUP_SEP).unwrap_or((rest, ""));
@@ -2983,6 +3030,37 @@ impl TaskRunRequest {
             args: TaskRunArgs::Argv(argv.collect()),
             cwd: Some(unescape_run_item(cwd)),
             env,
+            invalid_env: BTreeSet::new(),
+            invalid_arg: false,
+        }
+    }
+
+    /// Records which args and env values held a byte that is not valid
+    /// UTF-8. `data` is the raw form of the data [`TaskRunRequest::parse`]
+    /// read. The separators and escapes are ASCII, so an item is invalid
+    /// exactly when its raw bytes are.
+    fn mark_invalid_bytes(&mut self, data: &[u8]) {
+        if !self.relays_exit() {
+            return;
+        }
+        let group_sep = RUN_GROUP_SEP as u8;
+        let item_sep = RUN_ITEM_SEP as u8;
+        let mut groups = data.splitn(3, |b| *b == group_sep);
+        let _cwd = groups.next();
+        let argv = groups.next().unwrap_or_default();
+        let env = groups.next().unwrap_or_default();
+        self.invalid_arg = argv
+            .split(|b| *b == item_sep)
+            .skip(1)
+            .any(|item| std::str::from_utf8(item).is_err());
+        for item in env.split(|b| *b == item_sep) {
+            if std::str::from_utf8(item).is_ok() {
+                continue;
+            }
+            let item = unescape_run_item(&String::from_utf8_lossy(item));
+            if let Some((name, _)) = item.split_once('=') {
+                self.invalid_env.insert(name.to_string());
+            }
         }
     }
 
@@ -2990,6 +3068,41 @@ impl TaskRunRequest {
     fn relays_exit(&self) -> bool {
         matches!(self.args, TaskRunArgs::Argv(_))
     }
+}
+
+/// The data after `run%` in a raw request line, past an optional
+/// `traceparent%<id>%` prefix. `None` when the line is not a `run` request.
+fn run_data_bytes(raw: &[u8]) -> Option<&[u8]> {
+    fn split_pct(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+        let at = bytes.iter().position(|b| *b == b'%')?;
+        Some((&bytes[..at], &bytes[at + 1..]))
+    }
+    let (mut method, mut rest) = split_pct(raw)?;
+    if method == b"traceparent" {
+        (_, rest) = split_pct(rest)?;
+        (method, rest) = split_pct(rest)?;
+    }
+    (method == b"run").then_some(rest)
+}
+
+/// The refusal for an `inherit` variable the caller does not set, or sets
+/// to a value that is not valid UTF-8. The laptop's `min task run` prints
+/// the same text for both (`crates/minimal/src/task.rs`).
+fn inherit_refusal(task: &str, name: &str) -> String {
+    let task = one_line(task);
+    let name = one_line(name);
+    format!(
+        "error: task '{task}' declares `env_vars.{name} = {{ inherit = true }}`, \
+         but {name} is not set in this shell; export it before running the task"
+    )
+}
+
+/// The refusal for an argument that is not valid UTF-8.
+fn invalid_arg_refusal(task: &str) -> String {
+    format!(
+        "error: an argument for task '{}' is not valid UTF-8, so the task did not run",
+        one_line(task)
+    )
 }
 
 /// Reverses the helper's escapes: `\\`, `\n` (newline), `\c` (carriage
@@ -3034,18 +3147,24 @@ fn one_line(text: &str) -> std::borrow::Cow<'_, str> {
 
 /// Gives each `inherit` variable of a task the caller's value. The daemon's
 /// own environment never fills one (#585). `Err(name)` names the first
-/// `inherit` variable the caller does not set, as the laptop refuses it.
+/// `inherit` variable the caller does not set, or sets to a value in
+/// `invalid` (one that held a byte that is not valid UTF-8), as the laptop
+/// refuses both. A name in `invalid` that the task does not declare is
+/// ignored.
 fn inherit_from_caller(
     vars: &mut BTreeMap<String, EnvVarValue>,
     caller: &BTreeMap<String, String>,
+    invalid: &BTreeSet<String>,
 ) -> Result<(), String> {
     for (name, value) in vars.iter_mut() {
         if !matches!(value, EnvVarValue::Inherit) {
             continue;
         }
         match caller.get(name) {
-            Some(caller_value) => *value = EnvVarValue::Value(caller_value.clone()),
-            None => return Err(name.clone()),
+            Some(caller_value) if !invalid.contains(name) => {
+                *value = EnvVarValue::Value(caller_value.clone());
+            }
+            _ => return Err(name.clone()),
         }
     }
     Ok(())
@@ -4625,14 +4744,17 @@ exit $rc
             ("NOT_SET_BY_CALLER".to_string(), EnvVarValue::Inherit),
         ]);
         assert_eq!(
-            inherit_from_caller(&mut vars, &parsed.env),
+            inherit_from_caller(&mut vars, &parsed.env, &parsed.invalid_env),
             Err("NOT_SET_BY_CALLER".to_string())
         );
         let mut vars = BTreeMap::from([
             ("CALLER_TOKEN".to_string(), EnvVarValue::Inherit),
             ("FIXED".to_string(), EnvVarValue::Value("v".to_string())),
         ]);
-        assert_eq!(inherit_from_caller(&mut vars, &parsed.env), Ok(()));
+        assert_eq!(
+            inherit_from_caller(&mut vars, &parsed.env, &parsed.invalid_env),
+            Ok(())
+        );
         assert_eq!(
             vars,
             BTreeMap::from([
@@ -4678,6 +4800,128 @@ exit $rc
         let notice = start_dir_in_box(true, Some("/home\nexit:0"), w).unwrap_err();
         assert!(!notice.contains('\n'), "{notice:?}");
         assert!(notice.starts_with("/home\\nexit:0 is not"), "{notice:?}");
+
+        // Bytes that are not valid UTF-8: a declared `inherit` value that
+        // held one refuses the run with the laptop's text, as does an
+        // argument. An undeclared variable that held one is ignored.
+        let raw = b"traceparent%00-ab-cd-01%run%/workbench\x1elint\x1fok\x1fbad\xff\x1e\
+                    TOKEN=caf\xe9\x1fOTHER=\xfe\x1fFINE=v";
+        let data = run_data_bytes(raw).unwrap();
+        let mut parsed = TaskRunRequest::parse(&String::from_utf8_lossy(data));
+        parsed.mark_invalid_bytes(data);
+        assert!(parsed.invalid_arg);
+        assert_eq!(
+            parsed.invalid_env,
+            BTreeSet::from(["TOKEN".to_string(), "OTHER".to_string()])
+        );
+        assert_eq!(run_data_bytes(b"search%x\xff"), None);
+        let mut vars = BTreeMap::from([
+            ("TOKEN".to_string(), EnvVarValue::Inherit),
+            ("FINE".to_string(), EnvVarValue::Inherit),
+        ]);
+        assert_eq!(
+            inherit_from_caller(&mut vars, &parsed.env, &parsed.invalid_env),
+            Err("TOKEN".to_string())
+        );
+        let mut vars = BTreeMap::from([("FINE".to_string(), EnvVarValue::Inherit)]);
+        assert_eq!(
+            inherit_from_caller(&mut vars, &parsed.env, &parsed.invalid_env),
+            Ok(())
+        );
+        assert_eq!(
+            inherit_refusal("lint", "TOKEN"),
+            "error: task 'lint' declares `env_vars.TOKEN = { inherit = true }`, \
+             but TOKEN is not set in this shell; export it before running the task"
+        );
+        assert_eq!(
+            invalid_arg_refusal("lint"),
+            "error: an argument for task 'lint' is not valid UTF-8, so the task did not run"
+        );
+        let mut valid_args = TaskRunRequest::parse("/workbench\x1elint\x1fok\x1eFINE=v");
+        valid_args.mark_invalid_bytes(b"/workbench\x1elint\x1fok\x1eFINE=v");
+        assert!(!valid_args.invalid_arg);
+        assert!(valid_args.invalid_env.is_empty());
+    }
+
+    /// A project whose `needs-token` task inherits `TOKEN` from the caller.
+    fn inherit_task_repo() -> TempDir {
+        let repo = tempdir().unwrap();
+        let pkgs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../mctx/testdata/fakepkgs");
+        std::fs::write(
+            repo.path().join("minimal.toml"),
+            format!(
+                "[upstream]\ndir = {:?}\n\n\
+                 [tasks.needs-token]\npackages = [\"uroot\"]\nexec = \"/bbin/true\"\n\
+                 env_vars.TOKEN = {{ inherit = true }}\n",
+                pkgs.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        repo
+    }
+
+    /// Hands `raw` to a channel over the project at `repo`, as the listener
+    /// does for a line that was not valid UTF-8, and returns its reply.
+    async fn handle_lossy_line(repo: &Path, raw: &[u8]) -> String {
+        let (_state, _rootfs, _cwd, mut chan) =
+            setup_channel_in(crate::box_actor::WeakBoxHandle::dangling(), "web", repo);
+        let (mut ours, mut theirs) = UnixStream::pair().unwrap();
+        let line = String::from_utf8_lossy(raw).into_owned();
+        chan.handle_raw(&line, Some(raw), &mut ours).await;
+        drop(ours);
+        let mut reply = String::new();
+        std::io::Read::read_to_string(&mut theirs, &mut reply).unwrap();
+        reply
+    }
+
+    // BCLI-010 (T62): a declared `inherit` value with a byte that is not
+    // valid UTF-8 refuses the run with exit 2, as the laptop does.
+    #[tokio::test]
+    async fn task_run_refuses_an_inherit_value_that_is_not_utf8() {
+        let repo = inherit_task_repo();
+        let reply = handle_lossy_line(
+            repo.path(),
+            b"run%/workbench\x1eneeds-token\x1eTOKEN=caf\xe9",
+        )
+        .await;
+        assert_eq!(
+            reply,
+            "error: task 'needs-token' declares `env_vars.TOKEN = { inherit = true }`, \
+             but TOKEN is not set in this shell; export it before running the task\nexit:2\n"
+        );
+    }
+
+    // BCLI-010 (T62): an argument with a byte that is not valid UTF-8
+    // refuses the run with exit 2.
+    #[tokio::test]
+    async fn task_run_refuses_an_argument_that_is_not_utf8() {
+        let repo = inherit_task_repo();
+        let reply = handle_lossy_line(
+            repo.path(),
+            b"run%/workbench\x1eneeds-token\x1fcaf\xe9\x1eTOKEN=v",
+        )
+        .await;
+        assert_eq!(
+            reply,
+            "error: an argument for task 'needs-token' is not valid UTF-8, \
+             so the task did not run\nexit:2\n"
+        );
+    }
+
+    // BCLI-010 (T62): an exported variable that the task does not declare
+    // neither refuses nor drops the run, whatever bytes it holds.
+    #[tokio::test]
+    async fn task_run_ignores_an_undeclared_value_that_is_not_utf8() {
+        let repo = inherit_task_repo();
+        let reply = handle_lossy_line(
+            repo.path(),
+            b"run%/workbench\x1eneeds-token\x1eTOKEN=v\x1fOTHER=caf\xe9",
+        )
+        .await;
+        assert!(!reply.contains("not valid UTF-8"), "{reply}");
+        assert!(!reply.contains("is not set in this shell"), "{reply}");
+        // The run reaches the box: the test's box is gone, so it ends there.
+        assert_eq!(reply, "error: session is gone\nexit:125\n");
     }
 
     /// In an argument slot a bare `help` is a package name, search term, or
@@ -4728,6 +4972,20 @@ exit $rc
         session: crate::box_actor::WeakBoxHandle,
         name: &str,
     ) -> (TempDir, TempDir, TempDir, BoxChannel) {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        setup_channel_in(
+            session,
+            name,
+            &manifest_dir.join("../mctx/testdata/fakerepo"),
+        )
+    }
+
+    /// [`setup_channel_with`] for the project at `repo`.
+    fn setup_channel_in(
+        session: crate::box_actor::WeakBoxHandle,
+        name: &str,
+        repo: &Path,
+    ) -> (TempDir, TempDir, TempDir, BoxChannel) {
         let cwd = tempdir().unwrap();
         let state = tempdir().unwrap();
         let home = tempdir().unwrap();
@@ -4735,7 +4993,7 @@ exit $rc
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let config = ConfigBuilder::new()
             .with_state_dir(state.path().to_path_buf())
-            .with_repo_dir(manifest_dir.join("../mctx/testdata/fakerepo"))
+            .with_repo_dir(repo.to_path_buf())
             .with_stdlib_dir(manifest_dir.join("../stdlib/minimal-ncl"))
             .with_no_fetch(true)
             .build()

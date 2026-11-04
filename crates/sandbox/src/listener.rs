@@ -81,7 +81,8 @@ impl<C: Channel + Send> Listener<C> {
 ///
 /// The line is read as bytes and decoded lossily, so a non-UTF-8 byte (in an
 /// exported variable or a path the request carries) does not drop the
-/// request. The trace log gets only the line's length: a request can carry
+/// request. A line that was not valid UTF-8 goes to [`Channel::handle_lossy`]
+/// with its raw bytes, so the channel can refuse a value that held one. The trace log gets only the line's length: a request can carry
 /// the caller's environment, secrets included, and the channel logs its own
 /// redacted form.
 fn serve_connection<C: Channel>(
@@ -111,11 +112,18 @@ fn serve_connection<C: Channel>(
                     raw.pop();
                 }
             }
-            let line = String::from_utf8_lossy(&raw);
             tracing::trace!(bytes = raw.len(), "listener received a request");
-            if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                channel.handle(&mut stream2, &line, rootfs)
-            })) {
+            if let Err(panic) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || match std::str::from_utf8(&raw) {
+                        Ok(line) => channel.handle(&mut stream2, line, rootfs),
+                        Err(_) => {
+                            let line = String::from_utf8_lossy(&raw);
+                            channel.handle_lossy(&mut stream2, &line, &raw, rootfs);
+                        }
+                    },
+                ))
+            {
                 tracing::error!("channel handler panicked: {:?}", panic);
             };
         }
@@ -147,13 +155,18 @@ mod tests {
 
     use super::*;
 
-    /// A channel that keeps each line it is handed.
+    /// A channel that keeps each line it is handed, and the raw bytes of
+    /// each line that was not valid UTF-8.
     #[derive(Default)]
-    struct Recording(Vec<String>);
+    struct Recording(Vec<String>, Vec<Vec<u8>>);
 
     impl Channel for Recording {
         fn handle(&mut self, _stream: &mut UnixStream, line: &str, _rootfs: &Path) {
             self.0.push(line.to_string());
+        }
+        fn handle_lossy(&mut self, stream: &mut UnixStream, line: &str, raw: &[u8], rootfs: &Path) {
+            self.1.push(raw.to_vec());
+            self.handle(stream, line, rootfs);
         }
     }
 
@@ -191,6 +204,12 @@ mod tests {
     /// Sends `request` over a socket pair and serves it on this thread,
     /// returning the lines the channel got and the trace output.
     fn serve(request: &[u8]) -> (Vec<String>, String) {
+        let (lines, _, logged) = serve_raw(request);
+        (lines, logged)
+    }
+
+    /// As [`serve`], with the raw bytes of each lossy line as well.
+    fn serve_raw(request: &[u8]) -> (Vec<String>, Vec<Vec<u8>>, String) {
         let (mut client, server) = UnixStream::pair().unwrap();
         client.write_all(request).unwrap();
         drop(client);
@@ -206,7 +225,7 @@ mod tests {
             ));
         });
         let logged = capture.0.lock().unwrap().clone();
-        (channel.0, logged)
+        (channel.0, channel.1, logged)
     }
 
     // BCLI-010 (T62): a `run` request carries the caller's environment, so
@@ -229,5 +248,22 @@ mod tests {
     fn listener_serves_a_request_with_a_non_utf8_value() {
         let (lines, _) = serve(b"run%/workbench\x1elint\x1eNAME=caf\xe9\r\n");
         assert_eq!(lines, ["run%/workbench\x1elint\x1eNAME=caf\u{fffd}"]);
+    }
+
+    // BCLI-010 (T62): the channel learns which bytes were not valid UTF-8,
+    // so it can refuse a declared `inherit` value or an argument that held
+    // one. A valid line carries no raw bytes.
+    #[test]
+    fn listener_tells_the_channel_which_bytes_were_not_utf8() {
+        let (lines, raw, _) = serve_raw(b"run%/workbench\x1elint\x1fcaf\xe9\x1eNAME=v\n");
+        assert_eq!(lines, ["run%/workbench\x1elint\x1fcaf\u{fffd}\x1eNAME=v"]);
+        assert_eq!(
+            raw,
+            [b"run%/workbench\x1elint\x1fcaf\xe9\x1eNAME=v".to_vec()]
+        );
+
+        let (lines, raw, _) = serve_raw("run%/workbench\x1elint\x1eNAME=caf\u{e9}\n".as_bytes());
+        assert_eq!(lines, ["run%/workbench\x1elint\x1eNAME=caf\u{e9}"]);
+        assert!(raw.is_empty(), "{raw:?}");
     }
 }
