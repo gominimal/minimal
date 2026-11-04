@@ -28,6 +28,7 @@ mod doctor;
 mod finalize_install;
 mod list;
 mod net;
+pub mod output;
 mod project;
 mod secret;
 mod session;
@@ -49,8 +50,15 @@ pub use secret::{cmd_secret_list, cmd_secret_rm, cmd_secret_set};
 pub use session::*;
 
 pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
+    // The verb and the outcome go on the root span (BCLI-033
+    // observability), so one span tells what ran. `box_id` stays empty
+    // until a command records the id it resolved, through
+    // `output::record_box_id`. No command calls it yet.
     let root = tracing::info_span!(
         "cmd",
+        verb = command_verb(cli.command.as_ref()),
+        box_id = tracing::field::Empty,
+        outcome = tracing::field::Empty,
         trace_id = tracing::field::Empty,
         span_id = tracing::field::Empty,
         parent_span_id = tracing::field::Empty,
@@ -85,6 +93,72 @@ pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
     match run_in_root(root, Box::pin(run_command(cli))).await? {
         None => Ok(()),
         Some(handoff) => Err(handoff.finish()),
+    }
+}
+
+/// The verb a run dispatches, as the user typed it (`box show`,
+/// `session policy`), for the root span's `verb` field.
+fn command_verb(command: Option<&Command>) -> &'static str {
+    match command {
+        None => "min",
+        Some(Command::Ls(_)) => "ls",
+        Some(Command::Stop(_)) => "stop",
+        Some(Command::Session(SessionArgs { command })) => match command {
+            SessionCommand::List(_) => "session list",
+            SessionCommand::Activate(_) => "session activate",
+            SessionCommand::Attach(_) => "session attach",
+            SessionCommand::Exec(_) => "session exec",
+            SessionCommand::Run(_) => "session run",
+            SessionCommand::Destroy(_) => "session destroy",
+            SessionCommand::Rename(_) => "session rename",
+            SessionCommand::Policy(_) => "session policy",
+            SessionCommand::SetupZed(_) => "session setup-zed",
+            SessionCommand::Hooks(_) => "session hooks",
+        },
+        Some(Command::Loadout(_)) => "loadout list",
+        Some(Command::Task(_)) => "task run",
+        Some(Command::Run(_)) => "run",
+        Some(Command::Box(BoxArgs { command })) => match command {
+            BoxCommand::Spec(_) => "box spec",
+            BoxCommand::Audit(_) => "box audit",
+            BoxCommand::List(_) => "box list",
+            BoxCommand::Show(_) => "box show",
+        },
+        Some(Command::Net(_)) => "net forward",
+        Some(Command::FinalizeInstall(_)) => "finalize-install",
+        Some(Command::Dirs) => "dirs",
+        Some(Command::Doctor) => "doctor",
+        Some(Command::Bug(_)) => "bug",
+        Some(Command::Diag(diag::DiagArgs { command })) => match command {
+            diag::DiagCommand::Collect(_) => "diag collect",
+            diag::DiagCommand::Upload(_) => "diag upload",
+            diag::DiagCommand::Delete(_) => "diag delete",
+        },
+        #[cfg(feature = "remote-access")]
+        Some(Command::Mesh(_)) => "mesh",
+        Some(Command::Proxy(_)) => "proxy",
+        Some(Command::Auth(AuthArgs { command })) => match command {
+            AuthCommand::Login(_) => "auth login",
+            AuthCommand::Status => "auth status",
+            AuthCommand::Logout => "auth logout",
+        },
+        Some(Command::Secret(SecretArgs { command })) => match command {
+            SecretCommand::Set(_) => "secret set",
+            SecretCommand::List(_) => "secret list",
+            SecretCommand::Rm(_) => "secret rm",
+        },
+        Some(Command::Login(_)) => "login",
+        Some(Command::Version) => "version",
+        #[cfg(debug_assertions)]
+        Some(Command::Spin(_)) => "spin",
+        #[cfg(debug_assertions)]
+        Some(Command::DebugAnswererCommand) => "debug-answerer-command",
+        Some(Command::Init(_)) => "init",
+        Some(Command::Add(_)) => "add",
+        Some(Command::Update(_)) => "update",
+        Some(Command::CompleteSessionStr(_)) => "complete-session-str",
+        Some(Command::Completions(_)) => "completions",
+        Some(Command::Dash) => "dash",
     }
 }
 
@@ -169,6 +243,23 @@ fn die_of(signal: nix::sys::signal::Signal) -> ! {
     std::process::exit(128_i32.saturating_add(signal as i32))
 }
 
+/// Holds the root span in [`output::set_root_span`]'s slot, and empties
+/// the slot on drop, on every exit path.
+struct RootSpanSlot;
+
+impl RootSpanSlot {
+    fn hold(root: &tracing::Span) -> Self {
+        output::set_root_span(Some(root));
+        Self
+    }
+}
+
+impl Drop for RootSpanSlot {
+    fn drop(&mut self) {
+        output::set_root_span(None);
+    }
+}
+
 /// Run `command` inside `root`, end `root`, and return the command's
 /// [`Handoff`], if it made one. Any other error is returned as is.
 ///
@@ -180,7 +271,21 @@ where
     F: std::future::Future<Output = Result<(), anyhow::Error>>,
 {
     use tracing::Instrument as _;
-    match command.instrument(root).await {
+    let span = root.clone();
+    // The guard empties the root-span slot when it drops, so a panic or a
+    // cancelled future does not keep the span open.
+    let slot = RootSpanSlot::hold(&span);
+    let result = command.instrument(root).await;
+    let outcome = match &result {
+        Ok(()) => "ok",
+        Err(e) if e.is::<Handoff>() => "handoff",
+        Err(_) => "error",
+    };
+    span.record("outcome", outcome);
+    // Release every handle on the span, so it closes here.
+    drop(slot);
+    drop(span);
+    match result {
         Ok(()) => Ok(None),
         Err(e) => match e.downcast::<Handoff>() {
             Ok(handoff) => Ok(Some(handoff)),
