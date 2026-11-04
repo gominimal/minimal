@@ -1,4 +1,6 @@
-use super::state::{claim_install_id, new_install_id, record_disclosed, valid_install_id, ClaimFailed};
+use super::state::{
+    ClaimFailed, claim_install_id, new_install_id, record_disclosed, valid_install_id,
+};
 use super::*;
 use std::ffi::OsString;
 use std::time::SystemTime;
@@ -258,7 +260,10 @@ fn a_first_run_claims_one_id_and_keeps_what_was_written_meanwhile() {
     // the lock held by another command: no mint, no clobber
     std::fs::write(dir.join(LOCK_FILE), b"").unwrap();
     std::fs::remove_file(&path).unwrap();
-    assert!(matches!(claim_install_id(dir, &path), Err(ClaimFailed::Locked)));
+    assert!(matches!(
+        claim_install_id(dir, &path),
+        Err(ClaimFailed::Locked)
+    ));
     assert!(!path.exists(), "nothing written while the lock is held");
     std::fs::remove_file(dir.join(LOCK_FILE)).unwrap();
     // a state file that cannot be written is told apart from the lock: the
@@ -269,7 +274,10 @@ fn a_first_run_claims_one_id_and_keeps_what_was_written_meanwhile() {
         Err(ClaimFailed::NotSaved { path, .. }) => assert_eq!(path, blocked.join(STATE_FILE)),
         other => panic!("expected NotSaved, got {other:?}"),
     }
-    assert!(!dir.join(LOCK_FILE).exists(), "the lock is released after a failed write");
+    assert!(
+        !dir.join(LOCK_FILE).exists(),
+        "the lock is released after a failed write"
+    );
     // a child's answer lands between the read and the disclosure write
     let state = claim_install_id(dir, &path).unwrap();
     record_answer(&path, Some(("stable".into(), "0.7.2".into())));

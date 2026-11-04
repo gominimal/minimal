@@ -216,7 +216,12 @@ pub(super) fn claim_install_id(dir: &Path, state_path: &Path) -> Result<State, C
         }
     };
     release_lock(&lock);
-    written.map(|()| state).map_err(|err| ClaimFailed::NotSaved { path: state_path.to_path_buf(), err })
+    written
+        .map(|()| state)
+        .map_err(|err| ClaimFailed::NotSaved {
+            path: state_path.to_path_buf(),
+            err,
+        })
 }
 
 /// Why [`claim_install_id`] minted nothing: the two are told apart because
@@ -227,17 +232,27 @@ pub(super) enum ClaimFailed {
     Locked,
     /// The state file could not be written (a read-only or full directory):
     /// the same again next time, so the message names the file.
-    NotSaved { path: std::path::PathBuf, err: std::io::Error },
+    NotSaved {
+        path: std::path::PathBuf,
+        err: std::io::Error,
+    },
 }
 
 impl std::fmt::Display for ClaimFailed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Locked => {
-                write!(f, "another min command is minting the install id or checking now; run this again")
+                write!(
+                    f,
+                    "another min command is minting the install id or checking now; run this again"
+                )
             }
             Self::NotSaved { path, err } => {
-                write!(f, "the install id could not be saved to {}: {err}", path.display())
+                write!(
+                    f,
+                    "the install id could not be saved to {}: {err}",
+                    path.display()
+                )
             }
         }
     }
