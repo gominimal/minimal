@@ -2014,10 +2014,8 @@ pub(crate) async fn activate_box(
                     )
                 );
             }
-            warn_if_hostname_routing_down(
-                created.hostname_routing_unavailable.as_deref(),
-                "min session activate",
-            );
+            // NET-020: no warning line of its own. The `names:` line below
+            // carries the cause in place of its resolution clause, once.
             // NET-122/NET-123/NET-138: the naming lines, printed once per session
             // start — after the create, and re-surfaced when the daemon reports this
             // session at the 127.0.0.1 interim because its session-start bind
@@ -2242,6 +2240,12 @@ pub(crate) async fn activate_box(
                 // it is not mirrored onto `127.0.0.1` and only the proxy
                 // reaches it, which `min ls` reads as the fallback as well.
                 let at_own_address = !created.interim_loopback;
+                if proxy_cause.is_some() {
+                    tracing::debug!(
+                        surface = "min session activate names: line",
+                        "printed the hostname-routing cause"
+                    );
+                }
                 eprintln!(
                     "{}",
                     crate::resolver::host_line_beside(
