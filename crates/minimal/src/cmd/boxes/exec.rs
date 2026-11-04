@@ -455,14 +455,14 @@ where
             let mut to_channel = channel.input();
             // Both results are dropped: the command can end before it reads
             // all of its input, and the channel loop below sees that.
-            Some(tokio::spawn(async move {
+            Some(AbortOnDrop(tokio::spawn(async move {
                 while let Some(chunk) = rx.recv().await {
                     if to_channel.write_all(&chunk).await.is_err() {
                         break;
                     }
                 }
                 let _ = to_channel.shutdown().await;
-            }))
+            })))
         }
     };
     let mut held = Vec::new();
@@ -494,10 +494,17 @@ where
             _ => {}
         }
     }
-    if let Some(pump) = pump {
-        pump.abort();
-    }
+    drop(pump);
     Ok(Relayed { status, held })
+}
+
+/// Aborts the stdin task when the relay returns, on every path out of it.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Writes the held stderr to `err`, and empties it.

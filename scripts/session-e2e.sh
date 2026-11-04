@@ -1653,8 +1653,8 @@ echo "::endgroup::"
 # `min` has no command for these requests yet, so the proof sends them over a
 # plain `ssh`, built from the transport `min session setup-zed --print` gives
 # (its ProxyCommand onto the daemon socket, the box selector, the host key).
-# This route is interim. `min box exec -t|--detach` comes with
-# https://github.com/gominimal/minimal/issues/2905 (BCLI T15), and
+# This route is interim. The case moves to `min box exec -t|--detach` with
+# https://github.com/gominimal/minimal/issues/3012, and to
 # `min box attach|wait|logs|stop --exec` with
 # https://github.com/gominimal/minimal/issues/2913 (BCLI T16). This case moves
 # to those commands when those issues close. One span over the drop and the

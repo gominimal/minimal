@@ -607,9 +607,9 @@ impl std::fmt::Display for BoxExecRefusal {
         match self {
             Self::NoTerminal { target } => write!(
                 f,
-                "Did not run the command in {target}: -t needs a terminal on stdin, \
-                 and stdin is not a terminal. Run `min box exec` from a terminal, \
-                 or run it without -t."
+                "Did not run the command in {target}: -t needs a terminal. \
+                 Stdin is not a terminal. Run `min box exec {target} -- <command>` \
+                 without -t, or run it from a terminal."
             ),
             // BOX-149, BCLI-053: the refusal names the box's state.
             Self::NotRunning { target, state } => write!(

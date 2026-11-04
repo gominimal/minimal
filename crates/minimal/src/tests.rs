@@ -7642,7 +7642,7 @@ async fn box_exec_runs_command_and_exits_with_its_code() {
 // with exit 2 before the box resolves. The refusal says why and what to do,
 // and no exec starts in the box.
 #[tokio::test]
-async fn box_exec_tty_prints_exec_id_to_stderr_only_on_a_terminal() {
+async fn box_exec_tty_refuses_without_a_terminal() {
     let log = minimald::test_harness::captured_log();
     let host = exec_host().await;
     let marker = tempfile::tempdir().expect("a temp dir");
@@ -7655,9 +7655,9 @@ async fn box_exec_tty_prints_exec_id_to_stderr_only_on_a_terminal() {
         assert_eq!(
             run.message().as_deref(),
             Some(
-                "Did not run the command in web: -t needs a terminal on stdin, \
-                 and stdin is not a terminal. Run `min box exec` from a terminal, \
-                 or run it without -t."
+                "Did not run the command in web: -t needs a terminal. \
+                 Stdin is not a terminal. Run `min box exec web -- <command>` \
+                 without -t, or run it from a terminal."
             ),
             "{flags:?}\n{run}"
         );
