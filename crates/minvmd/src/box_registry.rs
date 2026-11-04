@@ -6085,6 +6085,7 @@ impl BoxRegistry {
     /// the rules the reconcile set aside. After a VM host daemon restart
     /// nothing is set aside, so a resumed `host_ip` box gets no egress
     /// until a client admits it again.
+    /// <https://github.com/gominimal/minimal/issues/3015> owns that case.
     pub fn admit_host_ip_box(
         &self,
         session_id: boxes::SessionId,
