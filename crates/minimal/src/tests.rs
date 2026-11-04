@@ -6470,8 +6470,16 @@ fn ls_native_routing_cause_on_proxy_row() {
             .lines()
             .filter(|line| line.starts_with("HOSTNAME PROXY:"))
             .collect();
-        assert_eq!(rows, vec![expected.as_str()], "surface {surface:?}:\n{text}");
-        assert_eq!(text.matches(reason).count(), 1, "the cause prints once:\n{text}");
+        assert_eq!(
+            rows,
+            vec![expected.as_str()],
+            "surface {surface:?}:\n{text}"
+        );
+        assert_eq!(
+            text.matches(reason).count(),
+            1,
+            "the cause prints once:\n{text}"
+        );
         assert!(!text.contains("warning:"), "no warning prefix:\n{text}");
     }
 

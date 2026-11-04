@@ -1075,7 +1075,11 @@ pub(crate) fn format_ls_with_proxy_ports_on(
                 surface = "min ls HOSTNAME PROXY row",
                 "printed the hostname-routing cause"
             );
-            writeln!(out, "HOSTNAME PROXY:  {}", hostname_routing_cause_row(reason))?;
+            writeln!(
+                out,
+                "HOSTNAME PROXY:  {}",
+                hostname_routing_cause_row(reason)
+            )?;
         }
         // NET-018: say which of the two surfaces is live — the one verdict
         // both verbs share ([`resolver::live_name_surfaces`]) — and end the
