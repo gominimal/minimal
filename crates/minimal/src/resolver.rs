@@ -5063,6 +5063,22 @@ pub fn install_clause(unfinished: bool) -> &'static str {
     }
 }
 
+/// `line` with the install pointer after it while this host's install is
+/// unfinished (NET-018, NET-122), the same on both verbs. A line that ends
+/// a sentence, such as the held-port cause, gets the pointer as a sentence
+/// of its own. Any other line gets [`install_clause`]. A finished host
+/// gets the line unchanged.
+#[must_use]
+pub fn with_install_pointer(line: String, unfinished: bool) -> String {
+    if !unfinished {
+        line
+    } else if line.ends_with('.') {
+        format!("{line} Finish setup: min finalize-install")
+    } else {
+        format!("{line}{}", install_clause(true))
+    }
+}
+
 /// The one host line a session start prints (NET-018), naming the box:
 /// `names: ` and then how the box name opens on this host, in the words
 /// [`box_name_opens`] gives the `min ls` BOX NAMES row too. Where native
@@ -5117,10 +5133,7 @@ pub fn host_line_beside(
         Some(cause) => format!("{name}: the hostname proxy is not serving: {cause}"),
         None => box_name_opens(&name, surface, proxy_port, at_own_address),
     };
-    format!(
-        "names: {names}{}",
-        install_clause(install_unfinished(surface, host))
-    )
+    with_install_pointer(format!("names: {names}"), install_unfinished(surface, host))
 }
 
 /// How a box name opens on this host (T110): the one statement the
@@ -6148,7 +6161,7 @@ mod tests {
             down,
             "names: web.min.internal: the hostname proxy is not serving: another program on \
              this machine holds 127.0.0.1:7654. It starts serving by itself when the port \
-             is free.; finish setup: min finalize-install"
+             is free. Finish setup: min finalize-install"
         );
         // NET-020 in both forms: the cause the start reads beside its
         // verdict replaces the resolution half whether the verdict was the
@@ -6187,7 +6200,7 @@ mod tests {
             native_down_open,
             "names: web.min.internal: the hostname proxy is not serving: another program on \
              this machine holds 127.0.0.1:7654. It starts serving by itself when the port \
-             is free.; finish setup: min finalize-install"
+             is free. Finish setup: min finalize-install"
         );
         // A native daemon's own report — no VM sibling — is the cause in the
         // daemon's words, and a Proxy verdict beside it never claims a port.
@@ -7325,11 +7338,13 @@ exit 0
                     for at_own_address in [true, false] {
                         let activate =
                             host_line_beside("web", &surface, port, host, None, at_own_address);
-                        let row = format!(
-                            "{}{}",
+                        let row = with_install_pointer(
                             name_surface_line_at(surface.clone(), port, at_own_address),
-                            install_clause(install_unfinished(&surface, host))
+                            install_unfinished(&surface, host),
                         );
+                        // The install pointer never follows a full stop as
+                        // a clause: after a sentence it is a sentence.
+                        assert!(!activate.contains(".;"), "{activate}");
                         assert_eq!(
                             activate,
                             format!("names: {}", row.replace("<box>", "web")),
@@ -7645,7 +7660,7 @@ exit 0
             );
             assert_eq!(
                 unfinished,
-                format!("names: web.min.internal: {sentence}; finish setup: min finalize-install")
+                format!("names: web.min.internal: {sentence} Finish setup: min finalize-install")
             );
             for line in [&sentence, &names, &unfinished] {
                 assert!(

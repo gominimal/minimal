@@ -1199,15 +1199,15 @@ pub(crate) fn format_ls_with_proxy_ports_on(
         if let Some(surface) = surface {
             writeln!(
                 out,
-                "BOX NAMES:       {}{}",
-                crate::resolver::name_surface_line_at(
-                    surface.clone(),
-                    serving_proxy_port,
-                    boxes_at_own_address(resp),
+                "BOX NAMES:       {}",
+                crate::resolver::with_install_pointer(
+                    crate::resolver::name_surface_line_at(
+                        surface.clone(),
+                        serving_proxy_port,
+                        boxes_at_own_address(resp),
+                    ),
+                    crate::resolver::install_unfinished(&surface, host),
                 ),
-                crate::resolver::install_clause(crate::resolver::install_unfinished(
-                    &surface, host
-                )),
             )?;
         }
         if resp.hostname_proxy_port.is_some()
@@ -1734,15 +1734,15 @@ pub(crate) fn format_ls_across_vms_with_proxy_ports_on(
             if let Some(surface) = surface {
                 writeln!(
                     out,
-                    "BOX NAMES:       {vm:<width$} {}{}",
-                    crate::resolver::name_surface_line_at(
-                        surface.clone(),
-                        serving_proxy_port,
-                        boxes_at_own_address(&listing.resp),
+                    "BOX NAMES:       {vm:<width$} {}",
+                    crate::resolver::with_install_pointer(
+                        crate::resolver::name_surface_line_at(
+                            surface.clone(),
+                            serving_proxy_port,
+                            boxes_at_own_address(&listing.resp),
+                        ),
+                        crate::resolver::install_unfinished(&surface, host),
                     ),
-                    crate::resolver::install_clause(crate::resolver::install_unfinished(
-                        &surface, host
-                    )),
                     vm = listing.vm,
                     width = VM_COLUMN_WIDTH,
                 )?;
