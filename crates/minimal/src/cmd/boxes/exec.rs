@@ -166,13 +166,14 @@ pub async fn cmd_box_exec(global: &GlobalArgs, args: BoxExecArgs) -> Result<(), 
     let hosts = crate::cmd::list::local_hosts(global)?;
     let request = BoxExecRequest::from_args(args);
     let stdin_is_tty = std::io::stdin().is_terminal();
-    // A terminal on stdin is not read for an attached command, as `min task
-    // run` does not read it: a read from a background job would stop this
-    // process with SIGTTOU's sibling, SIGTTIN. `-t` is the way to type to
-    // the command.
+    // A terminal on stdin is never pumped. An attached command does not
+    // read it, as `min task run` does not: a read from a background job
+    // would stop this process with SIGTTOU's sibling, SIGTTIN. With `-t`
+    // the terminal attach reads it itself, and a pump thread started
+    // before it would keep a blocking read and take the first keystroke.
     let input = match request.mode {
         ExecMode::Detached => None,
-        ExecMode::Attached if stdin_is_tty => None,
+        ExecMode::Attached | ExecMode::Tty if stdin_is_tty => None,
         ExecMode::Attached | ExecMode::Tty => Some(stdin_pump()),
     };
     let mut stdout = tokio::io::stdout();
