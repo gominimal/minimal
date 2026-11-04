@@ -3091,11 +3091,25 @@ const EXIT_MIN_FAILURE: u8 = 125;
 const EXIT_CONFIG: u8 = 3;
 
 /// The code a refused run exits with for the error that refused it: a
-/// configuration error is [`EXIT_CONFIG`], and any other error is a failure
-/// of `min` itself.
+/// configuration error (a package layer included) is [`EXIT_CONFIG`], a
+/// missing package, profile or stack is [`EXIT_NOT_FOUND`], and any other
+/// error is a failure of `min` itself.
 fn refusal_exit_code(e: &Error) -> u8 {
     match e {
         Error::Config(_) | Error::Format(_) | Error::MFile(_) => EXIT_CONFIG,
+        Error::Graph(g) => match **g {
+            graph::Error::Decode(_)
+            | graph::Error::ConflictingPackage { .. }
+            | graph::Error::ConflictingProfile { .. }
+            | graph::Error::ConflictingStack { .. }
+            | graph::Error::ConflictingContainer { .. }
+            | graph::Error::UpstreamNotPinned { .. }
+            | graph::Error::NoSuchOutput { .. } => EXIT_CONFIG,
+            graph::Error::NoSuchPkg { .. }
+            | graph::Error::NoSuchProfile { .. }
+            | graph::Error::NoSuchStack { .. } => EXIT_NOT_FOUND,
+            graph::Error::Fetch(_) => EXIT_MIN_FAILURE,
+        },
         _ => EXIT_MIN_FAILURE,
     }
 }
@@ -4335,13 +4349,23 @@ exit $rc
     }
 
     /// BCLI-010 (T62): a refusal for a project configuration error exits 3,
-    /// and any other refusal exits 125.
+    /// a missing package exits 4, and any other refusal exits 125.
     #[test]
     fn refusal_exit_code_gives_a_config_error_exit_3() {
         let config = Error::Config(mctx::ConfigError::InvalidRemoteCacheUrl(String::new()));
         assert_eq!(refusal_exit_code(&config), 3);
         let other = Error::Other(anyhow::anyhow!("no sandbox"));
         assert_eq!(refusal_exit_code(&other), 125);
+        let conflict = Error::Graph(Box::new(graph::Error::ConflictingStack {
+            name: "dev".into(),
+        }));
+        assert_eq!(refusal_exit_code(&conflict), 3);
+        let missing = Error::Graph(Box::new(graph::Error::NoSuchPkg {
+            name: "nope".into(),
+        }));
+        assert_eq!(refusal_exit_code(&missing), 4);
+        let fetch = Error::Graph(Box::new(graph::Error::Fetch("offline".into())));
+        assert_eq!(refusal_exit_code(&fetch), 125);
     }
 
     /// The channel's trace log never carries a `run` request's environment.
