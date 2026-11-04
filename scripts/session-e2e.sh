@@ -380,6 +380,11 @@
 #                                    deny-all, `min add` inside it, and the
 #                                    daemon's own fetch recorded as node-plane
 #                                    traffic naming the box and the package
+#   host_stop_stops_boxes_then_daemon_and_vm
+#                                    BCLI-049 on a VM-backed lane: `min host
+#                                    stop` on the VM host stops each running
+#                                    box, then the daemon and its VM, and
+#                                    each box stays listed as stopped
 #
 # Usage: scripts/session-e2e.sh [case]
 set -uo pipefail # not -e: capture failures so we can dump diagnostics
@@ -406,7 +411,8 @@ case "${1:-}" in
     | unpublished_port_refused_on_vm_host | proxy_sees_boxes_by_address \
     | vm_host_row_read_tracks_create_and_destroy \
     | answerer_survives_session_stop \
-    | escapes_and_builds_stay_inside_box_rules)
+    | escapes_and_builds_stay_inside_box_rules \
+    | host_stop_stops_boxes_then_daemon_and_vm)
     E2E_VM="${E2E_VM:-1}"
     if [ -z "${E2E_MINIMAL_ARGS:-}" ]; then
       E2E_MINIMAL_ARGS="--provider local-minvmd"
@@ -30811,6 +30817,90 @@ while True:
 }
 
 # ---------------------------------------------------------------------------
+# `min host stop` stops the boxes first (BCLI-049), on a VM-backed lane: the
+# daemon is the guest's pid-1, so the VM must go down with it. Two running
+# boxes on the VM host, then `min host stop <host>`:
+#
+#   * it exits 0, prints `Stopped <box>.` for each box, then
+#     "Stopped 2 boxes, the daemon and its VM on <host>."
+#   * `minvmd status` reads the VM as stopped (exit 1).
+#   * the next `min box show` boots the VM again, and each box is listed
+#     as stopped: the stop kept the records.
+#
+# Diagnostics: each step prints the command it ran and its exit status. The
+# command's stdout and stderr stay in $WORK/host-stop, and a failure prints
+# them.
+proof_host_stop_stops_boxes_then_daemon_and_vm() {
+  local hs_case=host_stop_stops_boxes_then_daemon_and_vm
+  if [ -z "$E2E_VM" ]; then
+    not_run "$hs_case" "native lane: the VM host's stop is this case's subject"
+    return 0
+  fi
+  echo "::group::min host stop stops the boxes, then the daemon and its VM (BCLI-049)"
+  local hs_dir="$WORK/host-stop" hs_b="e2e-host-stop-b" hs_host hs_out hs_rc hs_b_id hs_box hs_state
+  mkdir -p "$hs_dir"
+  proof_shared_session
+  hs_b_id="$(cd "$PROJECT_DIR" && mnl session activate . --name "$hs_b" 2>"$hs_dir/activate-b.err" | tail -n1 | tr -d '\r')"
+  if [ -z "$hs_b_id" ]; then
+    echo "::error::the second box for the host stop did not start"
+    cat "$hs_dir/activate-b.err" 2>/dev/null || true
+    fail
+  fi
+
+  # The VM host the boxes run on: the first running local-minvmd row.
+  mnl host list >"$hs_dir/host-list.out" 2>"$hs_dir/host-list.err" || true
+  hs_host="$(awk '$2 == "local-minvmd" && $3 == "running" { print $1; exit }' "$hs_dir/host-list.out")"
+  if [ -z "$hs_host" ]; then
+    echo "::error::'min host list' shows no running local-minvmd host"
+    cat "$hs_dir/host-list.out" "$hs_dir/host-list.err" 2>/dev/null || true
+    fail
+  fi
+
+  hs_rc=0
+  mnl host stop "$hs_host" >"$hs_dir/stop.out" 2>"$hs_dir/stop.err" </dev/null || hs_rc=$?
+  hs_out="$(tr -d '\r' <"$hs_dir/stop.out")"
+  echo "run: min host stop $hs_host -> exit $hs_rc"
+  if [ "$hs_rc" -ne 0 ] \
+     || ! printf '%s\n' "$hs_out" | grep -qxF "Stopped $SESSION_NAME." \
+     || ! printf '%s\n' "$hs_out" | grep -qxF "Stopped $hs_b." \
+     || [ "$(printf '%s\n' "$hs_out" | tail -n1)" != "Stopped 2 boxes, the daemon and its VM on $hs_host." ]; then
+    echo "::error::'min host stop $hs_host' did not stop both boxes, then the daemon and its VM"
+    echo "--- stdout ---"; printf '%s\n' "$hs_out"
+    echo "--- stderr ---"; cat "$hs_dir/stop.err" 2>/dev/null || true
+    fail
+  fi
+  echo "check: $(printf '%s\n' "$hs_out" | tail -n1)"
+
+  # The VM went down with its daemon. `minvmd status` exits 1 when stopped.
+  hs_rc=0
+  minvmd status >/dev/null 2>&1 || hs_rc=$?
+  if [ "$hs_rc" -ne 1 ]; then
+    echo "::error::the VM is not stopped after 'min host stop $hs_host' ('minvmd status' exited $hs_rc, expected 1)"
+    fail
+  fi
+  echo "check: minvmd status reads the VM as stopped"
+
+  # The stop kept each record: the next command boots the VM again, and
+  # each box is listed as stopped.
+  for hs_box in "$SESSION_NAME" "$hs_b"; do
+    hs_state="$(mnl box show "$hs_box" </dev/null 2>"$hs_dir/show-$hs_box.err" \
+      | sed -n 's/^State: *//p' | tr -d '\r')"
+    if [ "$hs_state" != stopped ]; then
+      echo "::error::box $hs_box is not listed as stopped after the host stop (state '${hs_state:-<none>}')"
+      cat "$hs_dir/show-$hs_box.err" 2>/dev/null || true
+      fail
+    fi
+    echo "check: $hs_box: State: stopped"
+  done
+
+  mnl box rm --force "$hs_b" >/dev/null 2>&1 || true
+  mnl box rm --force "$SESSION_NAME" >/dev/null 2>&1 || true
+  sid=""
+  echo "$hs_case OK (both boxes stopped, then the daemon and its VM; the records kept as stopped)"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
 # Dispatch on the first argument: every proof in today's order when none is
 # given, or exactly the named one. The names are the proof functions' suffixes.
 case "${1:-}" in
@@ -31002,7 +31092,8 @@ case "${1:-}" in
     | bep_round_three_conditions_closed \
     | bep_ahm_audit_by_id_and_name | bep_ahm_parent_merges_children \
     | bep_ahm_relayed_response_has_no_alt_svc | bep_ahm_missing_proxy_refused \
-    | bep_audit_http_and_messages_closed)
+    | bep_audit_http_and_messages_closed \
+    | host_stop_stops_boxes_then_daemon_and_vm)
     "proof_$1"
     ;;
   *)
@@ -31065,6 +31156,7 @@ case "${1:-}" in
     echo "         bep_ahm_audit_by_id_and_name bep_ahm_parent_merges_children"
     echo "         bep_ahm_relayed_response_has_no_alt_svc bep_ahm_missing_proxy_refused"
     echo "         bep_audit_http_and_messages_closed"
+    echo "         host_stop_stops_boxes_then_daemon_and_vm"
     exit 2
     ;;
 esac
