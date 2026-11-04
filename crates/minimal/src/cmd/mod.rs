@@ -54,6 +54,11 @@ pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
         trace_id = tracing::field::Empty,
         span_id = tracing::field::Empty,
         parent_span_id = tracing::field::Empty,
+        // Recorded by the verbs that act on one box (`min box stop`,
+        // `min box rm`): the verb, the box id it resolved and its outcome.
+        verb = tracing::field::Empty,
+        box_id = tracing::field::Empty,
+        outcome = tracing::field::Empty,
     );
     // A caller may run `min` inside its own trace (a CI job, a test
     // harness, or a script in a session, whose daemon put the exec's
@@ -245,6 +250,8 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             BoxCommand::Audit(args) => box_audit::cmd_box_audit(&cli.global_args, args).await,
             BoxCommand::List(args) => cmd_box_list(&cli.global_args, args).await,
             BoxCommand::Show(args) => cmd_box_show(&cli.global_args, args).await,
+            BoxCommand::Stop(args) => cmd_box_stop(&cli.global_args, args).await,
+            BoxCommand::Rm(args) => cmd_box_rm(&cli.global_args, args).await,
         },
         Some(Command::Net(NetArgs {
             command: NetCommand::Forward(args),
