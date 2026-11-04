@@ -2706,11 +2706,11 @@ pub(crate) async fn activate_box(
     // switch row, so the hold is the host's one record of its box id, and
     // the in-VM daemon's expose decision report names the box by that id.
     // Its name answers NODATA, as a `host_ip` box's does while it is not
-    // resident. `min session destroy` releases it like any hold with no
-    // row. The dashboard's destroy and `min session rename` still test
-    // `holds_name` (vm_host.rs), which is true only for a `host_ip` box,
-    // so they neither release nor move a `none` box's hold. An unnamed
-    // `none` box holds nothing, and the host refuses its report.
+    // resident. `min session destroy` and the dashboard's destroy release
+    // it, `min session rename` moves it, and an attach or exec re-holds it
+    // after a VM host daemon restart, because `holds_name` (vm_host.rs) is
+    // true for a `none` box as for a `host_ip` box. An unnamed `none` box
+    // holds nothing, and the host refuses its report.
     ActivationStep::HoldName
         .run(async {
             if holds_name_with_vm_host(kind, request.config.network)
