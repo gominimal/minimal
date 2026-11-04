@@ -100,6 +100,92 @@ pub(crate) fn refused_unenforceable_creates() -> u64 {
     REFUSED_UNENFORCEABLE_CREATES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The classifier tree and mount table a host-address create re-reads the
+/// host over, standing in for the real tree and the daemon's own mount table
+/// in a test that built a tree of its own. `None` in every production path.
+#[cfg(test)]
+pub(crate) static CREATE_CLASSIFIER_TREE_STANDIN: std::sync::Mutex<
+    Option<(std::path::PathBuf, String)>,
+> = std::sync::Mutex::new(None);
+
+/// The tree and mount table a create's re-read answers over: the constant
+/// tree every launch reads and the daemon's own mount table, read live
+/// (`None`), unless a test stood a tree in.
+fn create_classifier_tree() -> (std::path::PathBuf, Option<String>) {
+    #[cfg(test)]
+    if let Some((root, mountinfo)) = CREATE_CLASSIFIER_TREE_STANDIN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+    {
+        return (root, Some(mountinfo));
+    }
+    (
+        std::path::PathBuf::from(sandbox::classifier::TREE_ROOT),
+        None,
+    )
+}
+
+/// The host's classifier fact a create answers over (NET-079). Another
+/// mode's box reads the node fact as it stands. A host-address create reads
+/// it too, unless the stored fact says the probe could not read the table:
+/// that is the one cause a later read can clear without anything on the
+/// host changing (a daemon not yet placed in its leaf at start reads so),
+/// so the create re-reads the host rather than answer from a stale read.
+/// A re-read that does not run keeps the stored fact.
+// The create lines carry the fact as `host_fact`, never as
+// `host_ip_enforcement`: that field marks the per-launch classifier record,
+// and readers of the log take every line with it as a launch decision.
+async fn create_host_ip_fact(
+    network: boxes::NetworkMode,
+    session_name: &str,
+) -> crate::box_runtime::HostIpEnforcementFact {
+    let stored = crate::box_runtime::host_ip_enforcement_fact();
+    if !matches!(network, boxes::NetworkMode::HostNet) {
+        return stored;
+    }
+    if stored.cause != Some(crate::net::classifier::Cause::ProbeUnreadable) {
+        tracing::info!(
+            session_name,
+            reread = false,
+            host_fact = %stored.enforcement.machine_str(),
+            "host-address create answered from the stored classifier fact"
+        );
+        return stored;
+    }
+    let (root, mountinfo) = create_classifier_tree();
+    match crate::box_runtime::re_read_classifier_fact(
+        root,
+        mountinfo,
+        crate::guest::is_microvm_daemon(),
+    )
+    .await
+    {
+        Ok((_, decision)) => {
+            let fact = crate::box_runtime::host_ip_enforcement_fact();
+            tracing::info!(
+                session_name,
+                reread = true,
+                host_fact = %fact.enforcement.machine_str(),
+                cause = decision.cause().map(crate::net::classifier::Cause::detail),
+                "host-address create re-read the classifier fact the start-up \
+                 probe could not read"
+            );
+            fact
+        }
+        Err(e) => {
+            tracing::warn!(
+                session_name,
+                reread = false,
+                error = %e,
+                "host-address create could not re-read the classifier fact, \
+                 so it answers from the stored one"
+            );
+            stored
+        }
+    }
+}
+
 /// Assemble a [`boxes::Record`] from the out-of-band session
 /// config and the SSH-supplied username, then validate its policy.
 /// Returns `Err(io::InvalidInput)` if the policy is incompatible
@@ -3210,9 +3296,10 @@ impl BoxManager {
         // declaration naming rules its classifier cannot enforce — a denied
         // range, a narrowing allow list — and refuses it here, before
         // anything is allocated: no record, no id, no name held, no actor
-        // spawned. The host's state is the daemon's one node fact, read
-        // exactly as the create response reads it — a create is not a place
-        // that decides a box, so it re-probes nothing itself — and the
+        // spawned. The host's state is the daemon's one node fact, as
+        // [`create_host_ip_fact`] returns it: the stored fact, except that
+        // a host-address create re-reads the host when the stored fact says
+        // the start-up probe could not read the table. The gate asks the
         // same `can_decide_per_box` the launch that follows re-reads for
         // its own gate; a host that cannot decide per box answers `false`
         // and the create falls through to the exception whole — the box is
@@ -3220,9 +3307,17 @@ impl BoxManager {
         // on this ground. Own-address boxes are untouched here: their
         // declarations are enforced on the address the box holds, so the
         // gate is the host-address mode's alone.
+        let host_ip_fact = create_host_ip_fact(
+            config.network,
+            config
+                .name
+                .as_deref()
+                .unwrap_or(crate::rpc::ANONYMOUS_SESSION),
+        )
+        .await;
         if let Some(rules) = crate::net::classifier::refuses_unenforceable_declaration(
             config.network,
-            crate::box_runtime::host_ip_enforcement_fact().can_decide_per_box(),
+            host_ip_fact.can_decide_per_box(),
             config.policy.egress.as_ref(),
         ) {
             let refusal = crate::net::classifier::unenforceable_declaration_refusal(&rules);
