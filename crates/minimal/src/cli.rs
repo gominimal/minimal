@@ -442,6 +442,10 @@ pub enum BoxCommand {
     /// files. A running box is refused unless `--force` is given, which
     /// stops the box at once and then removes it
     Rm(BoxRmArgs),
+    /// Run a command in a running box and exit with the command's exit
+    /// code. `-t` gives the command a terminal, and `--detach` starts it
+    /// and returns its exec id
+    Exec(BoxExecArgs),
 }
 
 // BOX-158 (BCLI-001, BCLI-051): `min box list [--all] [-o json]`.
@@ -493,6 +497,174 @@ pub struct BoxRmArgs {
     #[arg(long)]
     pub force: bool,
 }
+
+// BOX-149 (BCLI-053): `min box exec <box> [-t|--detach] [--timeout <d>] -- <cmd>`.
+#[derive(Debug, Args)]
+pub struct BoxExecArgs {
+    /// The box: its id, the start of its id, or its name, as `min box list`
+    /// prints them
+    pub target: String,
+    /// Give the command a terminal and connect this terminal to it. The
+    /// command's exec id is printed on stderr
+    #[arg(short = 't', long = "tty", conflicts_with = "detach")]
+    pub tty: bool,
+    /// Start the command and return at once. Only the command's exec id is
+    /// printed, on stdout
+    #[arg(long)]
+    pub detach: bool,
+    /// Stop the command when it runs for longer than this: a number of
+    /// seconds, or a number followed by s, m or h, such as 30s, 5m or 1h.
+    /// The command then ends with exit code 124
+    #[arg(long, value_name = "DURATION", value_parser = parse_exec_timeout)]
+    pub timeout: Option<u64>,
+    /// The command and its arguments, after `--`. The command runs as these
+    /// words, with no shell
+    #[arg(last = true, required = true, num_args = 1.., value_name = "COMMAND")]
+    pub command: Vec<String>,
+}
+
+/// Reads a `min box exec --timeout` value as whole seconds: a number of
+/// seconds, or a number followed by `s`, `m` or `h`. Zero is refused, as the
+/// daemon refuses a timeout of zero seconds (BOX-149).
+pub(crate) fn parse_exec_timeout(raw: &str) -> Result<u64, String> {
+    let refused = || {
+        format!(
+            "'{raw}' is not a timeout. Give a whole number of seconds, minutes or hours \
+             that is more than zero, such as 30s, 5m or 1h."
+        )
+    };
+    let (digits, scale) = match raw.char_indices().last() {
+        Some((at, 's')) => (&raw[..at], 1),
+        Some((at, 'm')) => (&raw[..at], 60),
+        Some((at, 'h')) => (&raw[..at], 3600),
+        _ => (raw, 1),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(refused());
+    }
+    let count: u64 = digits.parse().map_err(|_| refused())?;
+    match count.checked_mul(scale) {
+        Some(secs) if secs > 0 => Ok(secs),
+        _ => Err(refused()),
+    }
+}
+
+/// Why `min box exec` ran no command in the box: the box is not running
+/// (BOX-149, exit 2), or its spec turns exec off (BOX-153, exit 5).
+/// `target` is the box as the user named it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoxExecRefusal {
+    /// The box is not running. Exit 2.
+    NotRunning {
+        /// The box as the user named it.
+        target: String,
+    },
+    /// The box's spec sets `[io] exec_enabled = false`. Exit 5.
+    ExecDisabled {
+        /// The box as the user named it.
+        target: String,
+    },
+    /// The box's spec cannot be read, so exec stays off. Exit 5.
+    SpecUnreadable {
+        /// The box as the user named it.
+        target: String,
+    },
+}
+
+impl BoxExecRefusal {
+    /// The exit code `min box exec` ends with on this refusal, from the
+    /// architecture's exit-code table: 2 for the state, 5 for the spec.
+    #[must_use]
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::NotRunning { .. } => 2,
+            Self::ExecDisabled { .. } | Self::SpecUnreadable { .. } => 5,
+        }
+    }
+
+    /// The outcome the command's tracing event records.
+    #[must_use]
+    pub fn outcome(&self) -> &'static str {
+        match self {
+            Self::NotRunning { .. } => "not running",
+            Self::ExecDisabled { .. } => "exec disabled",
+            Self::SpecUnreadable { .. } => "spec unreadable",
+        }
+    }
+}
+
+impl std::fmt::Display for BoxExecRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotRunning { target } => write!(f, "{target} is not running."),
+            Self::ExecDisabled { target } => write!(
+                f,
+                "{target} does not allow exec (its spec sets [io] exec_enabled = false)."
+            ),
+            Self::SpecUnreadable { target } => write!(
+                f,
+                "{target} does not allow exec: its spec cannot be read, so exec stays off."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BoxExecRefusal {}
+
+/// A command in a box that ran past its own timeout and was stopped
+/// (BOX-149, BCLI-053). `min box exec` and the wait for an exec end with
+/// exit 124 on it, and a machine-mode run answers it with `code =
+/// "timeout"`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoxExecTimedOut {
+    message: String,
+    hint: String,
+}
+
+impl BoxExecTimedOut {
+    /// The exit code, as `timeout(1)` gives it.
+    pub const EXIT_CODE: u8 = 124;
+
+    /// The `code` of the machine-mode error object.
+    pub const CODE: &'static str = "timeout";
+
+    /// The command `min box exec` ran in `target` with `--timeout`, after
+    /// `secs` seconds.
+    #[must_use]
+    pub fn exec(target: &str, secs: u64) -> Self {
+        Self {
+            message: format!(
+                "The command in {target} ran for longer than its timeout of {secs}s and was stopped."
+            ),
+            hint: "Run the command again with a longer --timeout.".to_string(),
+        }
+    }
+
+    /// The exec `exec_id` in `target`, as a wait for it found it.
+    #[must_use]
+    pub fn waited(target: &str, exec_id: &str) -> Self {
+        Self {
+            message: format!(
+                "Exec {exec_id} in {target} ran for longer than its timeout and was stopped."
+            ),
+            hint: String::new(),
+        }
+    }
+
+    /// The hint of the machine-mode error object.
+    #[must_use]
+    pub fn hint(&self) -> &str {
+        &self.hint
+    }
+}
+
+impl std::fmt::Display for BoxExecTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for BoxExecTimedOut {}
 
 // BEP-042: `min box audit <box|self> | --parent <box|self> [-o jsonl] [--follow]`.
 #[derive(Debug, Args)]

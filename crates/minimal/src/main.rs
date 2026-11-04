@@ -223,7 +223,10 @@ fn answer_failure(
 /// of addresses (insufficient resources), the code a box address refusal
 /// carries (`minimal::BoxAddressRefusal`: 2 when a name matches boxes on
 /// more than one host, 4 when the address names no box, 7 when a host did
-/// not answer the lookup), and 1, the unspecified error,
+/// not answer the lookup), the code a `min box exec` refusal carries
+/// (`minimal::BoxExecRefusal`: 2 when the box is not running, 5 when its
+/// spec turns exec off), 124 when an exec ran past its own timeout
+/// (`minimal::BoxExecTimedOut`), and 1, the unspecified error,
 /// for everything else — a refusal the host answered included. Both
 /// output modes end with the same code.
 fn failure_exit_code(e: &anyhow::Error) -> u8 {
@@ -260,6 +263,15 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     // BCLI-002, BCLI-064: a box address that names no single box.
     if let Some(refused) = e.downcast_ref::<minimal::BoxAddressRefusal>() {
         return refused.exit_code();
+    }
+    // BCLI-053: `min box exec` into a box that is not running (2), or whose
+    // spec turns exec off (5).
+    if let Some(refused) = e.downcast_ref::<minimal::BoxExecRefusal>() {
+        return refused.exit_code();
+    }
+    // BCLI-053: an exec that its own timeout ended.
+    if e.downcast_ref::<minimal::BoxExecTimedOut>().is_some() {
+        return minimal::BoxExecTimedOut::EXIT_CODE;
     }
     1
 }
@@ -348,6 +360,14 @@ fn machine_mode_answer(e: &anyhow::Error) -> MachineModeAnswer {
             hint,
         ));
     }
+    // BCLI-053: an exec that its own timeout ended is `timeout`.
+    if let Some(timed_out) = e.downcast_ref::<minimal::BoxExecTimedOut>() {
+        return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
+            minimal::BoxExecTimedOut::CODE,
+            format!("{e:#}"),
+            timed_out.hint().to_string(),
+        ));
+    }
     if e.downcast_ref::<minimal::OutputWriteError>().is_some() {
         return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
             "output_failed",
@@ -381,7 +401,8 @@ impl std::io::Write for DashLog {
 /// Whether the command's stdout is a data contract that tracing must not
 /// pollute, so its logs go to stderr instead. The `completions` handlers emit a
 /// shell shim on stdout, `session exec` carries only the exec'd
-/// command's output, and `task run` / `session run` stream the task's stdout —
+/// command's output, `box exec` carries the command's output or its exec
+/// id, and `task run` / `session run` stream the task's stdout —
 /// a log line in any of them would be read as content. A bare `min` (no subcommand) is
 /// one too: its non-TTY twin promises an empty stdout to pipelines, and its
 /// interactive activate path prints only the session id there. So is
@@ -402,6 +423,9 @@ fn stdout_is_data_contract(command: &Option<minimal::Command>) -> bool {
                 })
                 | minimal::Command::Task(minimal::TaskArgs {
                     command: minimal::TaskCommand::Run(_),
+                })
+                | minimal::Command::Box(minimal::BoxArgs {
+                    command: minimal::BoxCommand::Exec(_),
                 })
         )
     )
