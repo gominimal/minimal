@@ -1,13 +1,23 @@
 //! The client's `[host-exposures]` table: the ports on the host's loopback
 //! that boxes can reach at `host.min.internal` (NET-159, NET-161).
 //!
-//! Each entry names one exposure:
+//! Each entry names one exposure, in either TOML spelling of a table:
 //!
 //! ```toml
 //! [host-exposures.postgres]
 //! port = 5432
 //! proto = "tcp"   # optional, `tcp` when absent
+//!
+//! [host-exposures]
+//! vite = { port = 5173 }
 //! ```
+//!
+//! This is the one reader of the table. The native session daemon and the
+//! VM host daemon both read it here, so a bad entry is handled one way: an
+//! entry that is not a table with a port from 1 to 65535 and an optional
+//! `proto` of `tcp` or `udp` is skipped, the other entries stand, and the
+//! daemon log names the skipped entry. A file that does not parse, or a
+//! `host-exposures` key that is not a table, opens no exposure.
 //!
 //! [`HostExposuresFile`] holds the table of one `config.toml` and reads it
 //! again when the file changes, so each decision reads the current table.
@@ -18,6 +28,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
+
+/// The key of the table in `config.toml`.
+pub const HOST_EXPOSURES_TABLE: &str = "host-exposures";
 
 /// The transport of one host exposure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Deserialize)]
@@ -45,17 +58,29 @@ impl ExposureProto {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostExposure {
-    /// The port on the host's loopback.
+    /// The port on the host's loopback, never 0.
     pub port: u16,
     /// The transport. `tcp` when the entry names none.
     #[serde(default)]
     pub proto: ExposureProto,
 }
 
+/// One entry the reader skipped because it is not an exposure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedEntry {
+    /// The entry's name.
+    pub name: String,
+    /// The entry's value, as TOML.
+    pub value: String,
+    /// Why it is not an exposure.
+    pub reason: String,
+}
+
 /// The whole `[host-exposures]` table, by entry name.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HostExposures {
     entries: BTreeMap<String, HostExposure>,
+    skipped: Vec<SkippedEntry>,
 }
 
 impl HostExposures {
@@ -85,6 +110,12 @@ impl HostExposures {
             .iter()
             .map(|(name, entry)| (name.as_str(), entry))
     }
+
+    /// The entries the reader skipped, by name.
+    #[must_use]
+    pub fn skipped(&self) -> &[SkippedEntry] {
+        &self.skipped
+    }
 }
 
 /// A `[host-exposures]` table that was not read.
@@ -98,57 +129,70 @@ pub enum HostExposuresError {
         /// The read error.
         source: std::io::Error,
     },
-    /// The file, or its `[host-exposures]` table, does not parse.
-    #[error("{path}: the [host-exposures] table is not valid: {source}")]
+    /// The file does not parse as TOML.
+    #[error("{path} is not valid TOML: {source}")]
     Parse {
         /// The file.
         path: PathBuf,
         /// The parse error.
         source: toml::de::Error,
     },
-    /// An entry names port 0.
-    #[error("{path}: [host-exposures.{name}] names port 0")]
-    PortZero {
+    /// The `host-exposures` key holds a value that is not a table.
+    #[error("{path}: host-exposures is not a table")]
+    NotATable {
         /// The file.
         path: PathBuf,
-        /// The entry.
-        name: String,
     },
 }
 
-/// The one part of `config.toml` this module reads. Every other section is
-/// ignored here, and the config's own reader checks it.
-#[derive(Deserialize)]
-struct TableOnly {
-    #[serde(default, rename = "host-exposures")]
-    host_exposures: BTreeMap<String, HostExposure>,
+/// One entry's value as an exposure, or why it is not one.
+fn entry_exposure(value: &toml::Value) -> Result<HostExposure, String> {
+    let entry: HostExposure = value
+        .clone()
+        .try_into()
+        .map_err(|error| error.to_string())?;
+    if entry.port == 0 {
+        return Err("port 0 is not a port".to_string());
+    }
+    Ok(entry)
 }
 
 /// Parses the `[host-exposures]` table out of the text of a `config.toml`.
-/// `path` names the file in an error.
+/// `path` names the file in an error. Every other section is ignored here,
+/// and the config's own reader checks it. An entry that is not an exposure
+/// is skipped, and [`HostExposures::skipped`] lists it.
 ///
 /// # Errors
 ///
-/// [`HostExposuresError::Parse`] when the text or the table does not parse,
-/// and [`HostExposuresError::PortZero`] when an entry names port 0.
+/// [`HostExposuresError::Parse`] when the text does not parse, and
+/// [`HostExposuresError::NotATable`] when `host-exposures` is not a table.
 pub fn parse_host_exposures(text: &str, path: &Path) -> Result<HostExposures, HostExposuresError> {
-    let table: TableOnly = toml::from_str(text).map_err(|source| HostExposuresError::Parse {
+    let doc: toml::Table = toml::from_str(text).map_err(|source| HostExposuresError::Parse {
         path: path.to_path_buf(),
         source,
     })?;
-    if let Some((name, _)) = table
-        .host_exposures
-        .iter()
-        .find(|(_, entry)| entry.port == 0)
-    {
-        return Err(HostExposuresError::PortZero {
+    let Some(table) = doc.get(HOST_EXPOSURES_TABLE) else {
+        return Ok(HostExposures::default());
+    };
+    let Some(table) = table.as_table() else {
+        return Err(HostExposuresError::NotATable {
             path: path.to_path_buf(),
-            name: name.clone(),
         });
+    };
+    let mut exposures = HostExposures::default();
+    for (name, value) in table {
+        match entry_exposure(value) {
+            Ok(entry) => {
+                exposures.entries.insert(name.clone(), entry);
+            }
+            Err(reason) => exposures.skipped.push(SkippedEntry {
+                name: name.clone(),
+                value: value.to_string(),
+                reason,
+            }),
+        }
     }
-    Ok(HostExposures {
-        entries: table.host_exposures,
-    })
+    Ok(exposures)
 }
 
 /// Reads the `[host-exposures]` table of the `config.toml` at `path`. A
@@ -191,13 +235,24 @@ fn racy(stamp: Stamp, read_at: SystemTime) -> bool {
         .is_ok_and(|age| age >= RACY_WINDOW)
 }
 
-/// One read of the file: its stamp, when it was read, its text (`None` for
-/// a missing file or a failed read) and the table it holds.
+/// What one read of the file found.
+#[derive(Debug, PartialEq, Eq)]
+enum Body {
+    /// No file.
+    Missing,
+    /// The file exists and the read failed, with the error.
+    Unread(String),
+    /// The file's text, whether or not it parses.
+    Text(String),
+}
+
+/// One read of the file: its stamp, when it was read, what it held and the
+/// table it gave.
 #[derive(Debug)]
 struct Loaded {
     stamp: Stamp,
     read_at: SystemTime,
-    text: Option<String>,
+    body: Body,
     table: Arc<HostExposures>,
 }
 
@@ -235,9 +290,10 @@ impl HostExposuresFile {
     /// The current table. The file is read again when its modification
     /// time, length or inode changed since the last read, or when its
     /// modification time is too close to the last read to prove it
-    /// unchanged. A read whose text is the same keeps the table. A table
-    /// that does not read is an empty one, so a broken file opens no
-    /// exposure, and the failure is logged.
+    /// unchanged. A read that finds what the last one found keeps the table,
+    /// the same `Arc`, and logs nothing. A table that does not read is an
+    /// empty one, so a broken file opens no exposure. The log says each
+    /// failure and each skipped entry once for each new version of the file.
     pub fn current(&self) -> Arc<HostExposures> {
         let now = stamp(&self.path);
         let mut state = self
@@ -251,34 +307,52 @@ impl HostExposuresFile {
             return Arc::clone(&loaded.table);
         }
         let read_at = SystemTime::now();
-        let text = match std::fs::read_to_string(&self.path) {
-            Ok(text) => Ok(Some(text)),
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(source) => Err(HostExposuresError::Io {
-                path: self.path.clone(),
-                source,
-            }),
+        let body = match std::fs::read_to_string(&self.path) {
+            Ok(text) => Body::Text(text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Body::Missing,
+            Err(error) => Body::Unread(error.to_string()),
         };
-        if let (Some(loaded), Ok(text)) = (state.as_mut(), &text)
-            && loaded.text == *text
+        if let Some(loaded) = state.as_mut()
+            && loaded.body == body
         {
             loaded.stamp = now;
             loaded.read_at = read_at;
             return Arc::clone(&loaded.table);
         }
-        let parsed = text.and_then(|text| {
-            let table = match &text {
-                Some(body) => parse_host_exposures(body, &self.path)?,
-                None => HostExposures::default(),
-            };
-            Ok((text, table))
-        });
-        let (text, table) = match parsed {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                tracing::warn!(%error, "host exposures not loaded; no port is exposed");
-                (None, HostExposures::default())
+        let table = match &body {
+            Body::Missing => HostExposures::default(),
+            Body::Unread(error) => {
+                tracing::warn!(
+                    config = %self.path.display(),
+                    %error,
+                    "could not read the client config, so host.min.internal has no host exposure"
+                );
+                HostExposures::default()
             }
+            Body::Text(text) => match parse_host_exposures(text, &self.path) {
+                Ok(table) => {
+                    for skipped in table.skipped() {
+                        tracing::warn!(
+                            config = %self.path.display(),
+                            table = HOST_EXPOSURES_TABLE,
+                            entry = %skipped.name,
+                            value = %skipped.value,
+                            reason = %skipped.reason,
+                            "skipped a host exposure that is not {{ proto = \"tcp\" or \"udp\", \
+                             port = 1 to 65535 }}"
+                        );
+                    }
+                    table
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "could not parse the client config, so host.min.internal has no host \
+                         exposure"
+                    );
+                    HostExposures::default()
+                }
+            },
         };
         tracing::debug!(
             path = %self.path.display(),
@@ -289,7 +363,7 @@ impl HostExposuresFile {
         *state = Some(Loaded {
             stamp: now,
             read_at,
-            text,
+            body,
             table: Arc::clone(&table),
         });
         table
@@ -311,18 +385,35 @@ mod tests {
         assert!(!table.opens(17, 5432));
         assert!(table.opens(17, 5353));
         assert!(!table.opens(6, 5353));
+        let inline = "[host-exposures]\nvite = { port = 5173 }\n";
+        let table = parse_host_exposures(inline, Path::new("config.toml")).unwrap();
+        assert!(table.opens(6, 5173), "the inline spelling reads the same");
     }
 
+    /// A bad entry is skipped and named, and the good entries beside it
+    /// stand. A file that does not parse, or a key that is not a table, is
+    /// an error.
     #[test]
-    fn a_bad_entry_is_refused() {
+    fn a_bad_entry_is_skipped() {
         let path = Path::new("config.toml");
-        assert!(parse_host_exposures("[host-exposures.x]\nport = 0\n", path).is_err());
-        assert!(
-            parse_host_exposures("[host-exposures.x]\nport = 1\nproto = \"icmp\"\n", path).is_err()
-        );
-        assert!(
-            parse_host_exposures("[host-exposures.x]\nport = 1\nhost = \"a\"\n", path).is_err()
-        );
+        let table = parse_host_exposures(
+            "[host-exposures]\n\
+             good = { port = 8080 }\n\
+             zero = { port = 0 }\n\
+             icmp = { port = 1, proto = \"icmp\" }\n\
+             extra = { port = 1, host = \"a\" }\n\
+             big = { port = 70000 }\n\
+             bare = 8080\n",
+            path,
+        )
+        .unwrap();
+        assert_eq!(table.len(), 1);
+        assert!(table.opens(6, 8080));
+        let mut skipped: Vec<&str> = table.skipped().iter().map(|s| s.name.as_str()).collect();
+        skipped.sort_unstable();
+        assert_eq!(skipped, ["bare", "big", "extra", "icmp", "zero"]);
+        assert!(parse_host_exposures("host-exposures = 8080\n", path).is_err());
+        assert!(parse_host_exposures("not toml [", path).is_err());
     }
 
     #[test]
@@ -340,6 +431,22 @@ mod tests {
         assert!(file.current().is_empty());
         std::fs::write(&path, "[host-exposures.web\n").unwrap();
         assert!(file.current().is_empty(), "a broken file exposes nothing");
+    }
+
+    /// A broken file read again with the same text keeps the table it gave,
+    /// so the parse and its log line do not repeat for each frame.
+    #[test]
+    fn a_broken_file_is_parsed_once_for_each_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[host-exposures.web\n").unwrap();
+        let file = HostExposuresFile::new(path);
+        let first = file.current();
+        assert!(first.is_empty());
+        assert!(
+            Arc::ptr_eq(&first, &file.current()),
+            "the same broken text keeps its table"
+        );
     }
 
     #[test]

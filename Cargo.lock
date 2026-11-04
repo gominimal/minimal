@@ -4358,6 +4358,7 @@ dependencies = [
  "camino",
  "clap",
  "clap_complete",
+ "client-config",
  "fd-lock",
  "hickory-proto",
  "libc",
