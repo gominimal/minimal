@@ -137,13 +137,9 @@ fn e2e_enabled() -> Option<PathBuf> {
             "egress_allowlist_integration: {var} must be set when MINVMD_E2E=1"
         );
     }
-    let Some(gvproxy) = common::gvproxy_bin() else {
-        skip_or_fail_lane(
-            "no gvproxy switch; the host switch is required (see #1809)",
-            "provided no gvproxy switch",
-        );
-        return None;
-    };
+    // Under MINVMD_E2E=1, gvproxy_bin returns the switch or panics.
+    let gvproxy =
+        common::gvproxy_bin().expect("gvproxy_bin returns the switch or panics when MINVMD_E2E=1");
     eprintln!(
         "egress_allowlist_integration: gvproxy switch at {}",
         gvproxy.display()
