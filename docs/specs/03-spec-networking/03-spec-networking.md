@@ -347,14 +347,19 @@ management)
   loopback port (R3.1/R3.3 routing; the daemon is not on the switch).
   Only HTTP and WebSocket traffic is proxied; raw TCP/UDP is not available via
   this path (UC2b option B).
+  Superseded: no HTTPS reverse proxy ships, and `minimal login` issues no
+  client certificate ([spec 18 NET-109](../18-spec-box-networking/18-spec-box-networking.md)).
 - **R4.5**: Authentication failures (invalid cert, failed OIDC, unrecognised peer)
   shall be logged via `tracing::warn!` with structured fields and shall not reveal
   internal topology (switch IPs, PTask names) to the caller.
+  Superseded with R4.4 ([spec 18 NET-109](../18-spec-box-networking/18-spec-box-networking.md)).
 - **R4.6**: `minimald` shall expose a `minimal mesh status` RPC returning the
   current mesh state: own public key, connected peer list (name + last-handshake),
   advertised subnets.
+  Moves to the mesh spec, MRF ([#1420](https://github.com/gominimal/minimal/issues/1420)).
 - **R4.7**: WireGuard and HTTPS proxy code shall be conditionally compiled behind
   a feature flag and shall not affect binary size or startup time when unconfigured.
+  Moves to the mesh spec, MRF ([#1420](https://github.com/gominimal/minimal/issues/1420)).
 - **R4.8**: `minimal mesh join`, `minimal mesh leave`, and `minimal mesh status`
   shall be documented with examples in the CLI help text.
 - **R4.9**: `minimald` shall expose SSH port-forwarding (using the `russh` SSH
@@ -364,6 +369,7 @@ management)
   `LocalForward`-style TCP tunnel to a service reachable from within the named
   `OwnIp` PTask, authenticated by the same credentials used for re-attach. This
   path requires no WireGuard configuration and carries TCP only.
+  Superseded: no `min ssh-forward` ships ([spec 18 NET-109](../18-spec-box-networking/18-spec-box-networking.md)).
 
 **Proof Artifacts:**
 
@@ -463,6 +469,9 @@ get out. The fallback supports TCP only and does not deliver the hostname-driven
 browser access of the mesh path, but it preserves authenticated remote service
 access in restricted environments.
 
+Superseded: SSH port-forwarding does not ship
+([spec 18 NET-109](../18-spec-box-networking/18-spec-box-networking.md)).
+
 ## Repository Standards
 
 - Workspace conventions from `CLAUDE.md`: workspace-pinned deps; `cargo fmt &&
@@ -511,6 +520,8 @@ access in restricted environments.
    `minimald` (client installs trust anchor via `minimal login`) or ACME with a
    real DNS name? The self-signed path works for private teams; ACME requires a
    public-facing `minimald` with a DNS name.
+   Superseded: no HTTPS reverse proxy ships, so no certificate is issued
+   ([spec 18 NET-109](../18-spec-box-networking/18-spec-box-networking.md)).
 
 ## Technical Considerations
 
