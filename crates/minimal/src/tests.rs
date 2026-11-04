@@ -7770,6 +7770,29 @@ async fn box_cp_reads_stopped_box_as_box_017() {
         "only notes.txt and copied.txt"
     );
 
+    // A directory fails after the temporary file exists. The error says
+    // the path is a directory, and the temporary file is gone.
+    let dir = box_cp_on_hosts(
+        local_hosts(&global).unwrap(),
+        "web:/workbench",
+        local.path(),
+    )
+    .await
+    .expect_err("a directory is not a file");
+    assert_eq!(
+        format!("{dir:#}"),
+        format!(
+            "/workbench in box web is a directory, and min box cp copies one file. \
+             Run `min box cp web:/workbench/<file> {}`.",
+            local.path().join("workbench").display()
+        )
+    );
+    let names: Vec<_> = std::fs::read_dir(local.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names.len(), 2, "only notes.txt and copied.txt: {names:?}");
+
     let refused = box_cp_on_hosts(local_hosts(&global).unwrap(), "notes.txt", local.path())
         .await
         .expect_err("a source with no box");

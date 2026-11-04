@@ -344,26 +344,52 @@ async fn copy_box_file(
                 anyhow::anyhow!("Box {address} does not allow reading {path}.")
             }
             client::BoxFileError::Unavailable(_) | client::BoxFileError::Refused(_) => {
-                anyhow::anyhow!(
-                    "Could not read {path} from box {address}. \
-                     Run `min box show {address}` to check that the box still exists."
-                )
+                anyhow::anyhow!("Could not open {path} in box {address}.")
             }
         }
     })?;
 
-    let partial = PartialFile::beside(target);
-    let mut out = tokio::fs::File::create(&partial.path)
-        .await
-        .with_context(|| format!("Could not write {}", target.display()))?;
+    // A new file with a random name beside `target`. It is created with
+    // O_EXCL, so it never follows a link or truncates a file already there.
+    // It is removed on drop unless it was renamed into place.
+    let dir = match target.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => std::path::Path::new("."),
+    };
+    let name = target
+        .file_name()
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+    let prefix = format!(".{name}.min-cp-");
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(&prefix);
+    // The umask applies to this mode, as it does to `File::create`, so the
+    // copy gets the default mode and not the 0600 of a temporary file.
+    #[cfg(unix)]
+    builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o666));
+    let (out, partial) = builder
+        .tempfile_in(dir)
+        .with_context(|| format!("Could not write {}", target.display()))?
+        .into_parts();
+    let mut out = tokio::fs::File::from_std(out);
+
+    // An open directory fails only at the first read, so ask first. A
+    // metadata call that fails leaves the answer to the read.
+    if file.metadata().await.is_ok_and(|meta| meta.is_dir()) {
+        bail!(
+            "{path} in box {address} is a directory, and min box cp copies one file. \
+             Run `min box cp {address}:{}/<file> {}`.",
+            path.trim_end_matches('/'),
+            target.display()
+        );
+    }
+
     let mut buf = vec![0_u8; 64 * 1024];
     let mut copied = 0_u64;
     loop {
         let n = file.read(&mut buf).await.map_err(|e| {
             tracing::warn!(verb = "box cp", box_id = %box_id, path, copied, "read the file in the box: {e}");
             anyhow::anyhow!(
-                "Could not read all of {path} from box {address}, so min did not write {}. \
-                 Run `min box show {address}` to check that the box still exists.",
+                "Could not read all of {path} from box {address}, so min did not write {}.",
                 target.display()
             )
         })?;
@@ -382,40 +408,8 @@ async fn copy_box_file(
     // The conversation is done either way. A close that fails changes
     // nothing about the bytes already read.
     drop(file.shutdown().await);
-    tokio::fs::rename(&partial.path, target)
-        .await
+    partial
+        .persist(target)
         .with_context(|| format!("Could not write {}", target.display()))?;
-    partial.keep();
     Ok(copied)
-}
-
-/// A temporary file beside the destination of `min box cp`, removed when
-/// it drops unless [`Self::keep`] says it was renamed into place.
-struct PartialFile {
-    path: std::path::PathBuf,
-    kept: bool,
-}
-
-impl PartialFile {
-    /// A hidden name in the directory of `target`, unique to this process.
-    fn beside(target: &std::path::Path) -> Self {
-        let name = target
-            .file_name()
-            .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
-        let path = target.with_file_name(format!(".{name}.min-cp-{}", std::process::id()));
-        Self { path, kept: false }
-    }
-
-    fn keep(mut self) {
-        self.kept = true;
-    }
-}
-
-impl Drop for PartialFile {
-    fn drop(&mut self) {
-        if !self.kept {
-            // Nothing to do if the file was never created.
-            drop(std::fs::remove_file(&self.path));
-        }
-    }
 }
