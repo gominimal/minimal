@@ -79,18 +79,26 @@ pub enum ExecRequest {
     Argv(Vec<String>),
     /// Run a task the session's project declares.
     ///
-    /// `owns_box` is the run's claim on the session it was created for
-    /// (NET-131): when it is set, the daemon ends the session once this
-    /// task's exit status is on the wire, whether or not the client that
-    /// started the run is still there. `min task run` sets it — its session
-    /// exists for the run and nothing else; `min session run` leaves it
-    /// unset — its box is an attachable session someone else keeps. A
-    /// payload without the marker parses as `owns_box: false`, which is
-    /// also what a client from before the flag sends.
+    /// On a task box whose spec names this task as its entry, with no
+    /// `args` and no `cwd`, the daemon runs the box's entrypoint, the
+    /// in-box `min task run`, and relays its output and its exit code
+    /// (T43). The task's arguments ride the entrypoint's argv. `min task
+    /// run` sends this form, with `owns_box` unset: the box ends when its
+    /// entrypoint returns and keeps its record.
+    ///
+    /// `owns_box` is the older request, kept for one release: the run's
+    /// claim on the session it was created for (NET-131). When it is set,
+    /// the daemon ends the session once this task's exit status is on the
+    /// wire, whether or not the client that started the run is still
+    /// there. A `min task run` from before T43 sets it. `min session run`
+    /// leaves it unset: its box is an attachable session someone else
+    /// keeps. A payload without the marker parses as `owns_box: false`,
+    /// which is also what a client from before the flag sends.
     TaskRun {
         /// The task name, as the client typed it; the daemon trims it.
         task: String,
         /// The run owns its box: the daemon ends the session with the run.
+        /// Only a client from before T43 sets it on a task box's run.
         owns_box: bool,
         /// The task's declared arguments, as the client typed them after the
         /// task name. Empty when the client sent none — an older `min`, or a

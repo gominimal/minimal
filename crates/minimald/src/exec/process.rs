@@ -826,10 +826,11 @@ impl TaskEntrypointBox {
         });
 
         let (reader, writer) = tokio::io::duplex(64 * 1024);
-        let relay =
-            spawn(relay_entrypoint_log(host, self.dir, offset, writer).instrument(span.clone()));
+        let relay = spawn(
+            relay_entrypoint_log(host, self.dir.clone(), offset, writer).instrument(span.clone()),
+        );
         Ok(EntrypointProcess {
-            session,
+            record_dir: self.dir.clone(),
             box_id,
             box_name,
             task: exec.task,
@@ -913,7 +914,9 @@ fn strip_terminal_cr(bytes: &[u8], held_cr: &mut bool) -> Vec<u8> {
 /// kill of the run, stops the relay, and the box runs on (BOX-015). The
 /// box ends when its entrypoint returns (BOX-038), and keeps its record.
 pub struct EntrypointProcess {
-    session: BoxHandle,
+    /// Where the box's record is read from once the entrypoint ends: the
+    /// box's actor stops with the box, so its handle answers no more.
+    record_dir: boxes::store::BoxDir,
     box_id: SessionId,
     box_name: String,
     task: String,
@@ -930,7 +933,10 @@ impl EntrypointProcess {
         use boxes::core::record::{ExitEnding, RecordState, StopEnding};
         let deadline = tokio::time::Instant::now() + ENTRYPOINT_RECORD_WAIT;
         loop {
-            let record = self.session.record().await?;
+            let dir = self.record_dir.clone();
+            let record = crate::traced::spawn_blocking(move || dir.record())
+                .await
+                .map_err(io::Error::other)??;
             let code = match record.state() {
                 Ok(RecordState::Exited(ExitEnding::Exit { exit_code }))
                 | Ok(RecordState::Stopped(StopEnding::ExitedFirst { exit_code })) => {

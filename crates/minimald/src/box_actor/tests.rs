@@ -16357,6 +16357,189 @@ async fn until_complete_exit_record_write_retries_after_failure() {
     );
 }
 
+/// Creates and finalizes a task box for task `check` whose entrypoint is
+/// `argv`, as `min task run` creates one (T43), and returns its id.
+async fn create_task_box(client: &mut TestClient, argv: &[&str]) -> SessionId {
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+        FinalizeSessionRequest,
+    };
+    let mut spec = mfile::spec::BoxSpec::for_task(
+        "check",
+        &mfile::Task::default(),
+        mfile::spec::SpecFlags::default(),
+    )
+    .expect("a task that is not interactive has a spec");
+    spec.entrypoint = mfile::spec::Entrypoint::Exec(argv.iter().map(ToString::to_string).collect());
+    let mut req = crate::test_harness::create_session_req("check", "/tmp");
+    req.config.creating_verb = minimald_rpc::CreatingVerb::Task;
+    req.spec = Some(serde_json_lenient::to_value(&spec).expect("a spec serializes"));
+    let id = client.call::<CreateSession>(&req).await.unwrap().id;
+    crate::test_harness::unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    match client
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
+        .await
+    {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+    }
+    id
+}
+
+/// The exec request `min task run` sends for a task box (T43).
+fn task_box_run_request() -> String {
+    minimald_rpc::exec::ExecRequest::TaskRun {
+        task: "check".to_string(),
+        owns_box: false,
+        args: vec![],
+        cwd: String::new(),
+    }
+    .encode()
+}
+
+// BOX-038, T43: a task run on a task box starts the box's entrypoint and
+// relays it: the entrypoint's output, then its exit code. The box ends
+// when the entrypoint returns, and keeps its record as `exited` with the
+// code. The daemon log names the box and the code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn until_complete_ends_on_entrypoint_return_without_client_task_run_returns_its_code() {
+    use boxes::core::record::{ExitEnding, RecordState};
+
+    let log = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_task_box(&mut client, &["/bin/sh", "-c", "echo task-ran; exit 7"]).await;
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        client.exec(
+            &[(crate::MINIMAL_SESSION_ID_ENV, &id.to_string())],
+            false,
+            &task_box_run_request(),
+            b"",
+        ),
+    )
+    .await
+    .expect("the run ends when the entrypoint returns")
+    .expect("the daemon takes the run");
+    assert_eq!(
+        outcome.exit_status,
+        Some(7),
+        "{outcome:?}: {}",
+        log.contents()
+    );
+    let stdout = String::from_utf8_lossy(&outcome.stdout);
+    assert!(
+        stdout.contains("task-ran\n") && !stdout.contains('\r'),
+        "the run relays the entrypoint's output as it wrote it: {stdout:?}"
+    );
+
+    let manager = server.state.sessions_manager().await;
+    let record = record_once_exited(&manager, id).await;
+    assert_eq!(
+        record.state().unwrap(),
+        RecordState::Exited(ExitEnding::Exit { exit_code: 7 })
+    );
+    assert!(
+        manager
+            .get_record(crate::box_manager::BoxKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .is_some(),
+        "the box keeps its record"
+    );
+    let log = log.contents();
+    assert!(
+        log.contains("task box ended") && log.contains(&id.to_string()),
+        "the daemon log names the task box and its code: {log}"
+    );
+}
+
+// BOX-015, T43: the client of a task run goes away while the box's
+// entrypoint runs. The run stops relaying, and the box runs on: the
+// entrypoint is not launched again, the record still runs, and no
+// `exited` event is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_never_stops_for_idle_or_client_loss_of_a_task_run() {
+    let log = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_task_box(&mut client, &["/bin/sleep", "600"]).await;
+
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves");
+    let run = crate::traced::spawn(async move {
+        client
+            .exec(
+                &[(crate::MINIMAL_SESSION_ID_ENV, &id.to_string())],
+                false,
+                &task_box_run_request(),
+                b"",
+            )
+            .await
+    });
+    // The run starts the entrypoint and relays it.
+    let relaying = tokio::time::timeout(Duration::from_secs(10), async {
+        while !log
+            .contents()
+            .contains("task box: the run relays the box's entrypoint")
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(relaying.is_ok(), "the run relays the box's entrypoint");
+
+    // The client goes away: its channel and its connection drop. Then
+    // nothing reaches the box for a while.
+    run.abort();
+    let _ = run.await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the box still runs");
+    assert!(host.is_alive(), "the entrypoint runs on");
+    let launches = log
+        .contents()
+        .matches("launching the box's entrypoint from its spec")
+        .count();
+    assert_eq!(launches, 1, "the entrypoint was launched once");
+    let record = manager
+        .get_record(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box keeps its record");
+    assert_eq!(
+        record.state().unwrap(),
+        boxes::core::record::RecordState::Running
+    );
+    let mut events = manager.box_events(id).await.unwrap();
+    let events = events.read_new().unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.kind == boxes::events::BoxEventType::Exited),
+        "no exited event for a box nothing ended: {events:?}"
+    );
+}
+
 // BOX-015: neither a client that goes away nor time with nothing to do
 // stops a box. The client's channel and connection close, the box sits
 // idle, and its entrypoint still runs, with the record still running and
