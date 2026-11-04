@@ -94,6 +94,28 @@ pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
     }
 }
 
+/// The box a run names on its command line, as the user typed it (an id,
+/// the start of one, or a name), for the root span's `box_id` field. `None`
+/// for a command that names no box, or leaves it to a default.
+fn named_box(command: Option<&Command>) -> Option<&str> {
+    match command? {
+        Command::Session(SessionArgs { command }) => match command {
+            SessionCommand::Attach(a) => a.session.as_deref(),
+            SessionCommand::Exec(a) => Some(&a.session),
+            SessionCommand::Destroy(a) => a.session.as_deref(),
+            SessionCommand::Rename(a) => Some(&a.session),
+            SessionCommand::Policy(a) => Some(&a.session),
+            _ => None,
+        },
+        Command::Box(BoxArgs { command }) => match command {
+            BoxCommand::Show(a) => Some(&a.target),
+            BoxCommand::Audit(a) => a.target.as_deref().or(a.parent.as_deref()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// The verb a run dispatches, as the user typed it (`box show`,
 /// `session policy`), for the root span's `verb` field.
 fn command_verb(command: Option<&Command>) -> &'static str {
@@ -297,6 +319,11 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
     // once per invocation, before any command resolves a host dir, so an
     // upgraded CLI finds an existing instance rather than orphaning it.
     client::migrate_legacy_host_dirs(cli.global_args.minimal_dir.as_deref());
+    // The root span's `box_id` gets the box the command names, as typed. A
+    // command that resolves it to an id can record that over it.
+    if let Some(named) = named_box(cli.command.as_ref()) {
+        output::record_box_id(named);
+    }
 
     match cli.command {
         // A bare `min` (no subcommand) resolves-or-creates a session in a
@@ -1808,5 +1835,30 @@ mod handoff_tests {
         .unwrap_err();
         assert_eq!(format!("{err:#}"), "no session found");
         assert_eq!(closed_names(&closed), ["cmd", "cmd"]);
+    }
+}
+
+#[cfg(test)]
+mod named_box_tests {
+    use super::named_box;
+    use crate::Cli;
+    use clap::Parser as _;
+
+    fn named(args: &[&str]) -> Option<String> {
+        let cli = Cli::try_parse_from(args).expect("the command line parses");
+        named_box(cli.command.as_ref()).map(str::to_owned)
+    }
+
+    /// The root span's `box_id` gets the box a command names, and nothing
+    /// for a command that names none.
+    #[test]
+    fn root_span_box_id_is_the_named_box() {
+        assert_eq!(named(&["min", "box", "show", "b1"]).as_deref(), Some("b1"));
+        assert_eq!(
+            named(&["min", "session", "exec", "s1", "true"]).as_deref(),
+            Some("s1")
+        );
+        assert_eq!(named(&["min", "box", "list"]), None);
+        assert_eq!(named(&["min", "version"]), None);
     }
 }
