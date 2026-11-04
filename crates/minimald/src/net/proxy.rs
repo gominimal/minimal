@@ -210,7 +210,9 @@ impl HostRoute for std::sync::RwLock<HostnameRegistry> {
 pub const LOOPBACK_ONLY_LISTENER_RULE: &str = "loopback-only listener";
 
 /// The body of a loopback-only refusal (NET-071): a request by a host-address
-/// box's name to a port that only a 127.0.0.1 listener holds.
+/// box's name to a port that only a 127.0.0.1 listener holds. Only a listener
+/// at exactly `127.0.0.1` gives this verdict, so the address it names is the
+/// one the code read.
 pub const LOOPBACK_ONLY_LISTENER_REASON: &str =
     "The box listens on this port at 127.0.0.1 only. Bind it to 0.0.0.0 to reach it by name.";
 
@@ -747,12 +749,37 @@ where
     // NET-071: a host-address box shares loopback with the host, so a port
     // that only a 127.0.0.1 listener holds can be a host service. It is
     // refused here, before anything is dialed, so a box's name never reaches
-    // it. The socket tables are read on the blocking pool.
+    // it. The socket tables are read on the blocking pool. A check that
+    // cannot run refuses the request with 502, as a failed dial does: the
+    // check fails closed, never open.
     let probe = route.clone();
-    let reach = crate::traced::spawn_blocking(move || probe.host_address_listener(port))
-        .await
-        .ok()
-        .flatten();
+    let reach = match crate::traced::spawn_blocking(move || probe.host_address_listener(port)).await
+    {
+        Ok(reach) => reach,
+        Err(error) => {
+            tracing::warn!(
+                component = "dns-proxy",
+                host,
+                session = route.session(),
+                port,
+                %error,
+                status = "502 Bad Gateway",
+                "the loopback-only listener check did not finish; refusing the request"
+            );
+            return write_status(&mut client, "502 Bad Gateway").await;
+        }
+    };
+    if reach == Some(super::dns::ListenerReach::Unreadable) {
+        tracing::warn!(
+            component = "dns-proxy",
+            host,
+            session = route.session(),
+            port,
+            status = "502 Bad Gateway",
+            "cannot read the socket tables for the loopback-only listener check; refusing the request"
+        );
+        return write_status(&mut client, "502 Bad Gateway").await;
+    }
     if reach == Some(super::dns::ListenerReach::LoopbackOnly) {
         tracing::warn!(
             component = "dns-proxy",
