@@ -6658,6 +6658,13 @@ async fn unqualified_name_with_unreachable_host_exit7_names_host() {
         ),
         "{message}"
     );
+    assert!(
+        message.ends_with(
+            "Run the command again when the hosts answer, \
+             or name the box as provider/host/name."
+        ),
+        "{message}"
+    );
     // A qualified address on a host that does not answer names that host.
     // Its host is named, so the next step is only to ask that host again.
     let (message, code) = refused("local-minvmd/beta.local-minvmd0/web", &listings);

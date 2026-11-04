@@ -158,21 +158,18 @@ impl std::fmt::Display for BoxAddressRefusal {
                     write!(
                         f,
                         "Could not reach host {host}. Box {address} can be on that host, \
-                         so no box was chosen."
-                    )?;
+                         so no box was chosen. Run the command again when the host answers, \
+                         or name the box as provider/host/name."
+                    )
                 } else {
                     write!(
                         f,
                         "Could not reach hosts {}. Box {address} can be on one of them, \
-                         so no box was chosen.",
+                         so no box was chosen. Run the command again when the hosts answer, \
+                         or name the box as provider/host/name.",
                         hosts.join(", ")
-                    )?;
+                    )
                 }
-                write!(
-                    f,
-                    " Run the command again when the host answers, \
-                     or name the box as provider/host/name."
-                )
             }
             Self::NotFound { address } => write!(
                 f,

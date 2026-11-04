@@ -44,8 +44,7 @@ pub async fn cmd_box_show(global: &GlobalArgs, args: BoxShowArgs) -> Result<(), 
 /// The id of the box `target` names in one host's `listing`, as
 /// [`match_on_host`] finds it, except that a full id that is not listed is
 /// still given back. When no box matches, the refusal names `host` and ends
-/// with `remedy`. This is the single-host lookup `min box show` used before
-/// it resolved over every host, kept for the listing tests that pin it.
+/// with `remedy`.
 #[cfg(test)]
 pub(crate) fn find_listed_box(
     listing: &[minimald_rpc::BoxListingEntry],
