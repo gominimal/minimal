@@ -82,13 +82,14 @@ fn task_run_request(
 /// The daemon starts the entrypoint, relays its output and returns its exit
 /// code. The task's arguments ride the entrypoint's argv, not the request,
 /// and the run owns no box: the box ends when its entrypoint returns, and
-/// keeps its record (BOX-038).
-fn entrypoint_run_request(task: &str) -> minimald_rpc::exec::ExecRequest {
+/// keeps its record (BOX-038). `cwd` is as for [`task_run_request`]: the
+/// entrypoint starts there, for a task that declares `inherit_cwd`.
+fn entrypoint_run_request(task: &str, cwd: &str) -> minimald_rpc::exec::ExecRequest {
     minimald_rpc::exec::ExecRequest::TaskRun {
         task: task.to_string(),
         owns_box: false,
         args: Vec::new(),
-        cwd: String::new(),
+        cwd: cwd.to_string(),
     }
 }
 
@@ -122,15 +123,17 @@ fn run_spec(spec: Option<mfile::spec::BoxSpec>, keep: bool) -> Option<mfile::spe
 /// Asks the daemon to run the entrypoint of task box `id`, and returns the
 /// channel that relays it: the task's output, then its exit code.
 /// `task_env` holds the task's variables, resolved against this shell, for
-/// the in-box `min task run` to read.
+/// the in-box `min task run` to read. `cwd` is where the entrypoint starts,
+/// relative to the uploaded tree (see [`task_run_cwd`]). Empty is the root.
 pub(crate) async fn open_task_box_run(
     client: &mut crate::client::Client,
     id: boxes::SessionId,
     task: &str,
+    cwd: &str,
     task_env: &minimald_rpc::taskenv::TaskEnv,
 ) -> Result<russh::Channel<russh::client::Msg>, anyhow::Error> {
     client
-        .open_session_exec_channel(id, &entrypoint_run_request(task).encode(), task_env)
+        .open_session_exec_channel(id, &entrypoint_run_request(task, cwd).encode(), task_env)
         .await
 }
 
@@ -983,7 +986,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         // One span for the run, from the request to the exit code.
         let span = tracing::info_span!("task_run", box_id = %id, task = %args.task);
         let outcome = async {
-            match open_task_box_run(&mut client, id, &args.task, &task_env).await {
+            match open_task_box_run(&mut client, id, &args.task, &task_cwd, &task_env).await {
                 Ok(channel) => {
                     let outcome = bridge_exec(channel).await;
                     if outcome.is_ok() {
@@ -1136,7 +1139,7 @@ mod tests {
         assert!(run_spec(Some(spec.clone()), true).is_none());
         // The run sends no arguments and owns no box.
         assert_eq!(
-            entrypoint_run_request("check"),
+            entrypoint_run_request("check", ""),
             minimald_rpc::exec::ExecRequest::TaskRun {
                 task: "check".to_string(),
                 owns_box: false,
@@ -1144,6 +1147,14 @@ mod tests {
                 cwd: String::new(),
             }
         );
+        // An `inherit_cwd` task's directory rides the request, where the
+        // daemon starts the entrypoint.
+        let minimald_rpc::exec::ExecRequest::TaskRun { cwd, .. } =
+            entrypoint_run_request("check", "sub/inner")
+        else {
+            panic!("a task run request");
+        };
+        assert_eq!(cwd, "sub/inner");
 
         // The code the daemon relays is the run's: 0 is success, and any
         // other code is the process's exit code.
