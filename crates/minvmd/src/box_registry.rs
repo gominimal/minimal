@@ -7425,6 +7425,14 @@ impl HostIpBoxRules {
 /// BEP-082). `ids` holds every id the daemon minted, for the collision
 /// check. `by_name` holds the id each live registration name answers: one
 /// entry for each name, withdrawn when the box retires.
+///
+/// `ids` never shrinks, on purpose. A `host_ip` box has no row, so after it
+/// ends no live row holds its id, and a revocation record holds it only if
+/// the proxy revoked a grant. The set is what keeps an ended box's id out
+/// of a later mint's reach ([`BoxRegistry::holds_box_id`]). Its bound is
+/// one 16-byte id for each `host_ip` registration since the VM host daemon
+/// started: a million registrations cost about 16 MB. A restart clears it,
+/// and the proxy's revocation records then carry the ids that still matter.
 #[derive(Debug, Default)]
 struct HostIpIds {
     ids: BTreeSet<BoxId>,
