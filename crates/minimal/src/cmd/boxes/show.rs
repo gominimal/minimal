@@ -15,7 +15,7 @@ pub async fn cmd_box_show(global: &GlobalArgs, args: BoxShowArgs) -> Result<(), 
     ensure_daemon(global)?;
     let ResolvedBox { host, box_id: id } =
         resolve_box_on_local_hosts(global, &args.target, "box show").await?;
-    let mut client = connect_box_host(&host).await?;
+    let mut client = box_host_client(&host).await?;
     let shown = match client
         .oneshot_rpc::<ShowBox>(ShowBoxRequest { id })
         .await

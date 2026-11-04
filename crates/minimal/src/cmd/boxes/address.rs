@@ -401,8 +401,8 @@ pub(crate) fn newest_named<'a>(
 
 /// Resolves `address` over the local hosts for `verb`, and records the
 /// verb, the box id and the outcome. A qualified address asks only its own
-/// host. The selected host's failure ends the command, as it does for
-/// `min box list`.
+/// host. A version skew on the selected host ends the command, as it does
+/// for `min box list`. A host that does not answer is named in the refusal.
 pub(crate) async fn resolve_box_on_local_hosts(
     global: &GlobalArgs,
     address: &str,
@@ -442,15 +442,22 @@ pub(crate) async fn resolve_box_on_local_hosts(
 }
 
 /// Every box record one host keeps. The selected host is reached with the
-/// retry window and its build checked, and its failure is the outer error.
-/// Another host is probed, and gives no records when it is not running. Its
-/// failure to answer is the inner error.
-async fn read_host_boxes(
+/// retry window and its build checked. A version skew there is the outer
+/// error. A connect or listing failure on any host is the inner error, so
+/// the resolver names that host. Another host is probed, and gives no
+/// records when it is not running.
+pub(crate) async fn read_host_boxes(
     host: &crate::cmd::list::LocalHost,
 ) -> Result<Result<Vec<minimald_rpc::BoxListingEntry>, String>, anyhow::Error> {
     if host.selected {
-        let mut client = connect_box_host(host).await?;
-        return list_box_records(&mut client, None).await.map(Ok);
+        let mut client = match connect_box_host(host).await {
+            Ok(client) => client,
+            Err(BoxHostConnect::Unreachable(e)) => return Ok(Err(format!("{e:#}"))),
+            Err(BoxHostConnect::Skew(e)) => return Err(e),
+        };
+        return Ok(list_box_records(&mut client, None)
+            .await
+            .map_err(|e| format!("{e:#}")));
     }
     let read = tokio::time::timeout(client::PROBE_TIMEOUT, async {
         let mut client = match client::Client::probe(&host.sock).await {
@@ -472,21 +479,55 @@ async fn read_host_boxes(
     }))
 }
 
+/// Why the selected host gave no client.
+pub(crate) enum BoxHostConnect {
+    /// The daemon did not connect.
+    Unreachable(anyhow::Error),
+    /// The daemon connected, and its build is outside the supported window.
+    Skew(anyhow::Error),
+}
+
 /// A client on the daemon of `host`: the selected host with the retry
 /// window and its build checked, another host probed.
-pub(crate) async fn connect_box_host(
+pub(crate) async fn box_host_client(
     host: &crate::cmd::list::LocalHost,
 ) -> Result<client::Client, anyhow::Error> {
     if host.selected {
-        let mut client = client::Client::connect(&host.sock).await.with_context(|| {
-            format!("Failed to connect to the daemon at {}", host.sock.display())
-        })?;
-        client::ensure_version_match(&mut client).await?;
-        return Ok(client);
+        return connect_box_host(host).await.map_err(|failure| match failure {
+            BoxHostConnect::Unreachable(e) | BoxHostConnect::Skew(e) => e,
+        });
     }
+    match probe_other_host(host).await? {
+        Some(client) => Ok(client),
+        None => bail!("Host {} is not running.", host.host),
+    }
+}
+
+/// A client on the selected host's daemon, gated as `min box list` gates
+/// the selected host: connect with the retry window, then assert the
+/// daemon's build.
+async fn connect_box_host(
+    host: &crate::cmd::list::LocalHost,
+) -> Result<client::Client, BoxHostConnect> {
+    let mut client = client::Client::connect(&host.sock)
+        .await
+        .with_context(|| format!("Failed to connect to the daemon at {}", host.sock.display()))
+        .map_err(BoxHostConnect::Unreachable)?;
+    client::ensure_version_match(&mut client)
+        .await
+        .map_err(BoxHostConnect::Skew)?;
+    Ok(client)
+}
+
+/// A client on a host this process did not select, probed ungated as
+/// `min box list` probes its other hosts. A host that is not running gives
+/// no client.
+async fn probe_other_host(
+    host: &crate::cmd::list::LocalHost,
+) -> Result<Option<client::Client>, anyhow::Error> {
     match client::Client::probe(&host.sock).await {
-        Ok(client) => Ok(client),
-        Err(client::ProbeRefusal::NotRunning) => bail!("Host {} is not running.", host.host),
+        Ok(client) => Ok(Some(client)),
+        Err(client::ProbeRefusal::NotRunning) => Ok(None),
         Err(client::ProbeRefusal::Unreachable(e)) => {
             Err(e.context(format!("Could not reach host {}.", host.host)))
         }

@@ -259,6 +259,13 @@ fn every_daemon_connection_is_classified() {
             // the same ride-along shape `resolve_session_version_gated` uses.
             "attach.rs::box_record_on = gated",
             "cmd/admin.rs::cmd_version = ungated",
+            // A box address reaches every local host, split as `min box
+            // list` splits it: the selected host is the one this process
+            // ensured, so it keeps the gate. The others are probed ungated,
+            // so a skewed host still answers which boxes it holds.
+            "cmd/boxes/address.rs::connect_box_host = gated",
+            "cmd/boxes/address.rs::probe_other_host = ungated",
+            "cmd/boxes/address.rs::read_host_boxes = ungated",
             // Test-only: the BEP-032 store mint test registers a box with a
             // proxy control socket it serves itself, so no daemon is involved.
             "cmd/boxes/create.rs::box_creation_seals_a_store_member_per_accepted_rule = ungated",
@@ -6604,8 +6611,8 @@ fn retained_name_across_hosts_exit2_lists_host_and_state() {
 /// BCLI-002: a host that does not answer while an unqualified name
 /// resolves fails the lookup with exit 7 and names each such host. A
 /// match on a host that answered is not chosen.
-#[test]
-fn unqualified_name_with_unreachable_host_exit7_names_host() {
+#[tokio::test]
+async fn unqualified_name_with_unreachable_host_exit7_names_host() {
     let silent = |host: &str| HostListing {
         host: address_host(LOCAL_MINVMD_PROVIDER, host, false),
         boxes: Err("did not answer".to_owned()),
@@ -6652,6 +6659,26 @@ fn unqualified_name_with_unreachable_host_exit7_names_host() {
         message.starts_with("Could not reach host beta.local-minvmd0."),
         "{message}"
     );
+
+    // The selected host that does not connect is named the same way, and
+    // only a version skew there ends the command with its own error.
+    let selected = address_host(LOCAL_MINVMD_PROVIDER, "alpha.local-minvmd0", true);
+    let boxes = read_host_boxes(&selected)
+        .await
+        .expect("a connect failure is not the outer error");
+    assert!(boxes.is_err(), "the selected host has no daemon to answer");
+    let down = [HostListing {
+        host: selected,
+        boxes,
+    }];
+    for address in ["web", "local-minvmd/alpha.local-minvmd0/web"] {
+        let (message, code) = refused(address, &down);
+        assert_eq!(code, 7, "{address}");
+        assert!(
+            message.starts_with("Could not reach host alpha.local-minvmd0."),
+            "{message}"
+        );
+    }
 }
 
 /// BCLI-064: an address that names no box fails with exit 4 and names
