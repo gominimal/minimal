@@ -4288,6 +4288,21 @@ exit $rc
         };
         assert_eq!(got, 1, "{stderr}");
         assert!(stderr.contains("no such task nope"), "{stderr}");
+
+        // A stream that ends with no `exit:` line, as when the connection
+        // drops mid-task, is a failure, not a success.
+        for reply in ["msg:task output\n", "msg:task output\ndone:\n", ""] {
+            let Some((_, stderr, got, _)) =
+                run_min_against(rootfs, rootfs, &["task", "run", "lint"], &[], reply)
+            else {
+                return;
+            };
+            assert_eq!(got, 1, "{reply:?}: {stderr}");
+            assert!(
+                stderr.contains("the connection closed before the task reported its exit status"),
+                "{reply:?}: {stderr}"
+            );
+        }
     }
 
     /// BOX-015 (T62): the request `min task run` sends carries the caller's

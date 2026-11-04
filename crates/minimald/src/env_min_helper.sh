@@ -207,6 +207,12 @@ __min_rpc() {
     if [[ "$relayed" =~ ^[0-9]{1,3}$ ]] && (( 10#$relayed <= 255 )); then
         return "$((10#$relayed))"
     fi
+    # A `run` always ends with an `exit:` or an `error:` line. A stream that
+    # ends without one lost its connection, so the task's status is unknown.
+    if [[ "$method" == "run" ]]; then
+        echo "error: the connection closed before the task reported its exit status" >&2
+        return 1
+    fi
 }
 
 # Escapes one item of a `run` request into `__min_item`: a backslash, a
