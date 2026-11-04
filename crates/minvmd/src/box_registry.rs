@@ -6074,27 +6074,17 @@ impl BoxRegistry {
     /// control socket, never anything the guest says. One info line names
     /// the session and the count of resident boxes.
     ///
-    /// Only a client of this host retires the rules
-    /// ([`Self::retire_host_ip_box`]). Four cases leave them in
-    /// `host_ip_boxes` while the box has no live process:
-    ///
-    /// - A destroy that no client of this host issues, such as the in-VM
-    ///   daemon's reap. The rules stay until the VM host daemon restarts.
-    /// - A retire that fails. The rules stay until the VM host daemon
-    ///   restarts.
-    /// - A box that the in-VM daemon sets to `stopped` at its start
-    ///   (`stop_orphaned_running_records` in `minimald`'s `box_manager`,
-    ///   BOX-154). The rules stay in the union while no process runs.
-    /// - A box that an attach leaves `stopped` or `exited` through Keep
-    ///   (`HostIpResidency::keep` in the `min` CLI). The rules stay until
-    ///   the box is destroyed.
-    ///
-    /// In each case the union the gate decides a box-marked frame by can
-    /// include a box that is not live. A resume (BOX-025) does not admit a
-    /// box again. After a VM host daemon restart, a resumed `host_ip` box
-    /// gets no egress until it is created again.
-    /// <https://github.com/gominimal/minimal/issues/2747> owns closing these
-    /// cases.
+    /// A client of this host retires the rules
+    /// ([`Self::retire_host_ip_box`]). A reconcile against the in-VM
+    /// daemon's session list ([`Self::reconcile_host_ip_boxes`]) also drops
+    /// them from the union when the VM no longer runs the box: a reap, a
+    /// stop no client issued, a box the in-VM daemon found with no process
+    /// (BOX-154), or a box an attach left `stopped` or `exited` through
+    /// Keep. Until that reconcile runs, the union can include a box that is
+    /// not live. A box the VM runs again (BOX-025) rejoins the union with
+    /// the rules the reconcile set aside. After a VM host daemon restart
+    /// nothing is set aside, so a resumed `host_ip` box gets no egress
+    /// until a client admits it again.
     pub fn admit_host_ip_box(
         &self,
         session_id: boxes::SessionId,
@@ -6137,6 +6127,9 @@ impl BoxRegistry {
             // resident box took under it stay too.
             return true;
         }
+        // A client's admit supersedes any rules a reconcile set aside for
+        // the session: the client's are the ones it holds now.
+        resident.dormant.remove(&session_id);
         let newly_resident = resident.boxes.insert(session_id, Arc::new(rules)).is_none();
         resident.cohort = HostIpBoxes::cohort_record(&resident.boxes, self.subnet);
         let count = resident.boxes.len();
@@ -6181,6 +6174,9 @@ impl BoxRegistry {
             .host_ip_boxes
             .write()
             .expect("the resident host_ip boxes' lock is never held across a panic");
+        // Rules a reconcile set aside go too: a destroyed box is never
+        // admitted again ([`Self::reconcile_host_ip_boxes`]).
+        resident.dormant.remove(&session_id);
         let removed = resident.boxes.remove(&session_id).is_some();
         if removed {
             resident.cohort = HostIpBoxes::cohort_record(&resident.boxes, self.subnet);
@@ -6211,6 +6207,117 @@ impl BoxRegistry {
             self.ping();
         }
         removed
+    }
+
+    /// Brings the resident `host_ip` boxes in line with what the in-VM
+    /// daemon runs (NET-085). `guest` is the in-VM daemon's session list,
+    /// as each session's state. A resident box the guest does not report
+    /// running leaves the union the gate decides box-marked frames by: the
+    /// in-VM daemon reaped it, stopped it, or found it with no process, and
+    /// no client of this host retired it. Its rules are set aside, not
+    /// dropped. A set-aside box the guest reports running again (a resume)
+    /// rejoins the union with those rules. A set-aside box the guest no
+    /// longer lists at all is forgotten.
+    ///
+    /// The guest's list only ever narrows the union to the rules a host
+    /// client admitted: a box the host never admitted gains nothing, so a
+    /// guest that lies can drop its own boxes' egress but never widen it.
+    ///
+    /// One info line per box dropped or admitted again, naming the box, its
+    /// state in the guest and the trigger. A pass that changes nothing logs
+    /// nothing.
+    pub fn reconcile_host_ip_boxes(
+        &self,
+        guest: &BTreeMap<boxes::SessionId, boxes::BoxState>,
+        trigger: HostIpReconcileTrigger,
+    ) -> HostIpReconcile {
+        let mut outcome = HostIpReconcile::default();
+        let mut resident = self
+            .host_ip_boxes
+            .write()
+            .expect("the resident host_ip boxes' lock is never held across a panic");
+        let gone: Vec<boxes::SessionId> = resident
+            .boxes
+            .keys()
+            .filter(|session| !guest.get(session).copied().is_some_and(guest_runs))
+            .copied()
+            .collect();
+        for session in gone {
+            if let Some(rules) = resident.boxes.remove(&session) {
+                // A box the guest no longer lists is destroyed there: no
+                // resume can bring it back, so nothing is set aside.
+                if guest.contains_key(&session) {
+                    resident.dormant.insert(session, rules);
+                }
+                outcome.dropped.push(session);
+            }
+        }
+        let back: Vec<boxes::SessionId> = resident
+            .dormant
+            .keys()
+            .filter(|session| guest.get(session).copied().is_some_and(guest_runs))
+            .copied()
+            .collect();
+        for session in back {
+            if let Some(rules) = resident.dormant.remove(&session) {
+                resident.boxes.insert(session, rules);
+                outcome.admitted.push(session);
+            }
+        }
+        // A set-aside box the guest no longer lists was destroyed there.
+        resident
+            .dormant
+            .retain(|session, _| guest.contains_key(session));
+        if outcome.is_empty() {
+            return outcome;
+        }
+        resident.cohort = HostIpBoxes::cohort_record(&resident.boxes, self.subnet);
+        let count = resident.boxes.len();
+        // Under the resident set's lock, so the mirror's flag follows the
+        // set in order (NET-138).
+        let was_published = self
+            .node_mirror
+            .set_published(resident.boxes.keys().copied().collect());
+        drop(resident);
+        for session in &outcome.dropped {
+            tracing::info!(
+                session = %session,
+                guest_state = guest_state_name(guest.get(session).copied()),
+                trigger = %trigger,
+                resident_host_ip_boxes = count,
+                "dropped the host_ip box's egress rules: the VM no longer runs the box"
+            );
+        }
+        for session in &outcome.admitted {
+            tracing::info!(
+                session = %session,
+                guest_state = guest_state_name(guest.get(session).copied()),
+                trigger = %trigger,
+                resident_host_ip_boxes = count,
+                "holding the host_ip box's egress rules again: the VM runs the box again"
+            );
+        }
+        if !outcome.admitted.is_empty() && !was_published {
+            self.node_mirror.bind_held();
+        }
+        // The resident set changed, so the held names' answers did too
+        // (NET-129).
+        self.ping();
+        if count == 0 {
+            self.node_mirror.end_binds(MirrorEnd::BoxEnd);
+        }
+        outcome
+    }
+
+    /// Whether any `host_ip` box's rules are held, resident or set aside:
+    /// a reconcile has nothing to do while this is `false`.
+    #[must_use]
+    pub fn holds_host_ip_boxes(&self) -> bool {
+        let resident = self
+            .host_ip_boxes
+            .read()
+            .expect("the resident host_ip boxes' lock is never held across a panic");
+        !resident.boxes.is_empty() || !resident.dormant.is_empty()
     }
 
     /// Sets the binder the node's mirror binds with ([`MirrorBinder`]):
@@ -7208,11 +7315,73 @@ impl HostIpBoxRules {
     }
 }
 
+/// What started a reconcile of the resident `host_ip` boxes
+/// ([`BoxRegistry::reconcile_host_ip_boxes`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostIpReconcileTrigger {
+    /// A box event the guest report door saw.
+    BoxEvent,
+    /// The periodic timer.
+    Timer,
+}
+
+impl std::fmt::Display for HostIpReconcileTrigger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::BoxEvent => "box_event",
+            Self::Timer => "timer",
+        })
+    }
+}
+
+/// The boxes one reconcile changed, in session order.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct HostIpReconcile {
+    /// The boxes whose rules left the union.
+    pub dropped: Vec<boxes::SessionId>,
+    /// The boxes whose rules joined the union again.
+    pub admitted: Vec<boxes::SessionId>,
+}
+
+impl HostIpReconcile {
+    /// Whether the reconcile changed nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.dropped.is_empty() && self.admitted.is_empty()
+    }
+}
+
+/// Whether the guest's state for a box means a process can run in it:
+/// `active` (the stored spelling of running), or a create still in flight.
+fn guest_runs(state: boxes::BoxState) -> bool {
+    match state {
+        boxes::BoxState::Active | boxes::BoxState::Pending | boxes::BoxState::Materializing => true,
+        boxes::BoxState::Stopped | boxes::BoxState::Exited => false,
+    }
+}
+
+/// The guest's state for a box, as a reconcile's log line names it.
+fn guest_state_name(state: Option<boxes::BoxState>) -> &'static str {
+    match state {
+        None => "absent",
+        Some(boxes::BoxState::Pending) => "pending",
+        Some(boxes::BoxState::Materializing) => "materializing",
+        Some(boxes::BoxState::Active) => "running",
+        Some(boxes::BoxState::Stopped) => "stopped",
+        Some(boxes::BoxState::Exited) => "exited",
+    }
+}
+
 /// The resident `host_ip` boxes ([`BoxRegistry::admit_host_ip_box`]) and the
 /// one row-shaped record their declared names pin under.
 #[derive(Debug, Default)]
 struct HostIpBoxes {
     boxes: BTreeMap<boxes::SessionId, Arc<HostIpBoxRules>>,
+    /// The rules of boxes a reconcile dropped from the union because the
+    /// guest reported them stopped or exited
+    /// ([`BoxRegistry::reconcile_host_ip_boxes`]). They admit nothing here.
+    /// A box the guest reports running again moves back into `boxes`.
+    dormant: BTreeMap<boxes::SessionId, Arc<HostIpBoxRules>>,
     /// The record the host-side DNS admission table pins the resident
     /// boxes' declared names under: every resident box's DNS hosts and
     /// allowed subnets, keyed to the node's own address. `None` when no
@@ -13082,5 +13251,108 @@ mod tests {
             MIRRORED_BINDS_CAP
         );
         assert!(binder.calls().is_empty());
+    }
+
+    /// A policy that admits one documentation subnet, the reach only the
+    /// box declared.
+    fn one_subnet_policy() -> EgressPolicy {
+        EgressPolicy {
+            allow_subnets: Some(vec!["203.0.113.0/24".to_string()]),
+            allow_dns_hosts: None,
+            allow_protocols: None,
+            deny_subnets: None,
+        }
+    }
+
+    fn resident_sessions(registry: &BoxRegistry) -> Vec<boxes::SessionId> {
+        registry
+            .table()
+            .host_ip_boxes()
+            .iter()
+            .map(|rules| rules.session_id())
+            .collect()
+    }
+
+    /// NET-085: a `host_ip` box the in-VM daemon stops, exits or reaps,
+    /// with no client of this host retiring it, leaves the union the gate
+    /// decides box-marked frames by. A box the guest still runs stays.
+    #[test]
+    fn host_ip_rules_retired_when_guest_no_longer_runs_box() {
+        let registry = BoxRegistry::new(SUBNET);
+        let (stopped_box, exited_box, reaped_box, live_box) = (
+            mirror_session(1),
+            mirror_session(2),
+            mirror_session(3),
+            mirror_session(4),
+        );
+        for session in [stopped_box, exited_box, reaped_box, live_box] {
+            assert!(registry.admit_host_ip_box(session, Some(&one_subnet_policy())));
+        }
+        assert!(registry.holds_host_ip_boxes());
+
+        let guest = BTreeMap::from([
+            (stopped_box, boxes::BoxState::Stopped),
+            (exited_box, boxes::BoxState::Exited),
+            (live_box, boxes::BoxState::Active),
+        ]);
+        let outcome = registry.reconcile_host_ip_boxes(&guest, HostIpReconcileTrigger::Timer);
+        assert_eq!(outcome.dropped, vec![stopped_box, exited_box, reaped_box]);
+        assert!(outcome.admitted.is_empty());
+        assert_eq!(resident_sessions(&registry), vec![live_box]);
+
+        // The same list again changes nothing.
+        assert!(
+            registry
+                .reconcile_host_ip_boxes(&guest, HostIpReconcileTrigger::BoxEvent)
+                .is_empty()
+        );
+
+        // The last running box goes: the union is empty, so the gate drops
+        // every box-marked frame.
+        let guest = BTreeMap::from([(live_box, boxes::BoxState::Stopped)]);
+        let outcome = registry.reconcile_host_ip_boxes(&guest, HostIpReconcileTrigger::BoxEvent);
+        assert_eq!(outcome.dropped, vec![live_box]);
+        assert!(resident_sessions(&registry).is_empty());
+        assert!(registry.table().host_ip_cohort().is_none());
+
+        // A client retire also forgets the rules a reconcile set aside.
+        assert!(!registry.retire_host_ip_box(live_box));
+        assert!(!registry.holds_host_ip_boxes());
+    }
+
+    /// NET-085 with BOX-025: a box a reconcile dropped because it stopped
+    /// rejoins the union with its own rules once the guest runs it again.
+    /// A box the guest stopped listing is forgotten and never comes back.
+    #[test]
+    fn host_ip_box_running_again_is_readmitted() {
+        let registry = BoxRegistry::new(SUBNET);
+        let (resumed, reaped) = (mirror_session(1), mirror_session(2));
+        assert!(registry.admit_host_ip_box(resumed, Some(&one_subnet_policy())));
+        assert!(registry.admit_host_ip_box(reaped, None));
+        let held = registry.table().host_ip_boxes()[0].egress().clone();
+
+        let stopped = BTreeMap::from([(resumed, boxes::BoxState::Stopped)]);
+        let outcome = registry.reconcile_host_ip_boxes(&stopped, HostIpReconcileTrigger::Timer);
+        assert_eq!(outcome.dropped, vec![resumed, reaped]);
+        assert!(resident_sessions(&registry).is_empty());
+        assert!(registry.holds_host_ip_boxes());
+
+        let running = BTreeMap::from([
+            (resumed, boxes::BoxState::Active),
+            (reaped, boxes::BoxState::Active),
+        ]);
+        let outcome = registry.reconcile_host_ip_boxes(&running, HostIpReconcileTrigger::BoxEvent);
+        assert_eq!(outcome.admitted, vec![resumed]);
+        assert!(outcome.dropped.is_empty());
+        assert_eq!(
+            resident_sessions(&registry),
+            vec![resumed],
+            "a box the guest stopped listing is not admitted again on the guest's word"
+        );
+        assert_eq!(
+            registry.table().host_ip_boxes()[0].egress(),
+            &held,
+            "the box rejoins with the rules the host client admitted"
+        );
     }
 }

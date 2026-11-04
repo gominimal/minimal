@@ -601,6 +601,7 @@ pub fn spawn(
                 ControlDoor::Host,
                 &audit_path,
                 MAX_CONTROL_CONNECTIONS,
+                &HostIpReconcileNudge::default(),
             )
         })
 }
@@ -665,6 +666,12 @@ pub fn spawn_guest_reports_door_with_proxy(
     let listener = UnixListener::bind(&sock_path)?;
     crate::sock::enforce_socket_permissions(&sock_path)?;
     let audit_path = audit_log_path(&sock_path);
+    // The in-VM daemon's RPC bridge sits beside the control socket, as the
+    // stop path finds it (NET-085).
+    let reconcile = spawn_host_ip_reconcile(
+        boxes.clone(),
+        control_sock_path.with_file_name(paths::SSH_SOCK_FILE),
+    )?;
     tracing::info!(
         sock = %sock_path.display(),
         vsock_port = minimald_rpc::VM_HOST_BOX_REPORT_PORT,
@@ -683,6 +690,7 @@ pub fn spawn_guest_reports_door_with_proxy(
                 ControlDoor::GuestReports,
                 &audit_path,
                 MAX_CONTROL_CONNECTIONS,
+                &reconcile,
             )
         })
         // The door's bound path is the handle the caller pairs with the
@@ -721,6 +729,7 @@ fn accept_loop(
     door: ControlDoor,
     audit_path: &Path,
     cap: usize,
+    reconcile: &HostIpReconcileNudge,
 ) {
     let connections = Arc::new(crate::box_registry::ConnectionGauge::default());
     let order = Arc::new(ApplyOrder::default());
@@ -750,6 +759,7 @@ fn accept_loop(
                 let bep_listening = bep_listening.clone();
                 let audit_path = audit_path.to_path_buf();
                 let order = Arc::clone(&order);
+                let reconcile = reconcile.clone();
                 if let Err(error) = std::thread::Builder::new()
                     .name("minvmd-control-conn".to_string())
                     .spawn(move || {
@@ -763,6 +773,7 @@ fn accept_loop(
                             door,
                             &audit_path,
                             &order,
+                            &reconcile,
                         ) {
                             tracing::debug!(error = %error, "box control connection failed");
                         }
@@ -790,6 +801,7 @@ fn serve_connection(
     door: ControlDoor,
     audit_path: &Path,
     order: &Arc<ApplyOrder>,
+    reconcile: &HostIpReconcileNudge,
 ) -> std::io::Result<()> {
     let mut stream = stream;
     stream.set_read_timeout(Some(REGISTER_READ_TIMEOUT))?;
@@ -848,6 +860,12 @@ fn serve_connection(
             return write_reply(&mut stream, &BoxControlReply::Error { error });
         }
     };
+    // A box event on the guest door asks the host_ip reconcile to read the
+    // in-VM daemon's session list (NET-085). The nudge carries nothing the
+    // guest says: the list it reads decides, and only narrows the union.
+    if door == ControlDoor::GuestReports && is_guest_box_event(&request) {
+        reconcile.nudge();
+    }
     if root_peer && !root_may_ask(&request) {
         tracing::warn!(
             peer_uid = uid,
@@ -974,6 +992,134 @@ fn serve_connection(
         drain_until_peer_closes(&mut stream);
     }
     served
+}
+
+/// Whether a guest-door request is a box event: a box created, or a
+/// listener in a box opened or closed. A box that stops or is reaped
+/// closes its listeners, so each such end reaches the reconcile soon. The
+/// reads and the ask and decision reports are not box events.
+fn is_guest_box_event(request: &BoxControlRequest) -> bool {
+    matches!(
+        request,
+        BoxControlRequest::MintBoxId(_)
+            | BoxControlRequest::ListenNotice(_)
+            | BoxControlRequest::AdmitPort(_)
+            | BoxControlRequest::WithdrawPort(_)
+    )
+}
+
+/// How often the `host_ip` reconcile reads the in-VM daemon's session list
+/// with no box event to prompt it (NET-085).
+const HOST_IP_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The least time between two reconcile reads, so a guest that floods its
+/// door with box events costs one session list a second at most.
+const HOST_IP_RECONCILE_MIN_GAP: Duration = Duration::from_secs(1);
+
+/// The connect and the exchange bounds of one session-list read.
+const GUEST_LIST_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const GUEST_LIST_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The guest door's handle on the `host_ip` reconcile thread
+/// ([`spawn_host_ip_reconcile`]). A nudge asks for one reconcile soon. Nudges
+/// that arrive before it runs fold into it. The default handle is inert:
+/// the host door's.
+#[derive(Debug, Clone, Default)]
+struct HostIpReconcileNudge(Option<std::sync::mpsc::SyncSender<()>>);
+
+impl HostIpReconcileNudge {
+    fn nudge(&self) {
+        if let Some(sender) = &self.0 {
+            // A full channel is a reconcile already asked for.
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "a full or closed channel needs no second nudge"
+            )]
+            let _ = sender.try_send(());
+        }
+    }
+}
+
+/// Starts the thread that keeps the resident `host_ip` boxes in line with
+/// the in-VM daemon (NET-085): on each nudge from the guest door and every
+/// [`HOST_IP_RECONCILE_INTERVAL`], it reads the daemon's session list over
+/// `guest_rpc_sock` and hands it to
+/// [`BoxRegistry::reconcile_host_ip_boxes`]. A read that fails changes
+/// nothing: a failed read is no evidence that a box ended.
+fn spawn_host_ip_reconcile(
+    boxes: BoxRegistry,
+    guest_rpc_sock: PathBuf,
+) -> std::io::Result<HostIpReconcileNudge> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("minvmd-host-ip-reconcile".to_string())
+        .spawn(move || {
+            let mut last: Option<std::time::Instant> = None;
+            let mut failing = false;
+            loop {
+                let trigger = match receiver.recv_timeout(HOST_IP_RECONCILE_INTERVAL) {
+                    Ok(()) => crate::box_registry::HostIpReconcileTrigger::BoxEvent,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        crate::box_registry::HostIpReconcileTrigger::Timer
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                };
+                if let Some(at) = last
+                    && let Some(wait) = HOST_IP_RECONCILE_MIN_GAP.checked_sub(at.elapsed())
+                {
+                    std::thread::sleep(wait);
+                }
+                while receiver.try_recv().is_ok() {}
+                last = Some(std::time::Instant::now());
+                if !boxes.holds_host_ip_boxes() {
+                    continue;
+                }
+                match read_guest_box_states(&guest_rpc_sock) {
+                    Ok(guest) => {
+                        failing = false;
+                        boxes.reconcile_host_ip_boxes(&guest, trigger);
+                    }
+                    Err(error) if !failing => {
+                        failing = true;
+                        tracing::warn!(
+                            error = %format!("{error:#}"),
+                            trigger = %trigger,
+                            "could not read the in-VM daemon's session list; the host_ip \
+                             boxes' egress rules stay as they are until a read succeeds"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::debug!(error = %format!("{error:#}"), "session list read failed again");
+                    }
+                }
+            }
+        })?;
+    Ok(HostIpReconcileNudge(Some(sender)))
+}
+
+/// The in-VM daemon's sessions, as each one's state.
+fn read_guest_box_states(
+    guest_rpc_sock: &Path,
+) -> anyhow::Result<std::collections::BTreeMap<boxes::SessionId, boxes::BoxState>> {
+    let listing = crate::rpc_client::call_oneshot_blocking::<minimald_rpc::ListSessions>(
+        guest_rpc_sock,
+        (),
+        GUEST_LIST_CONNECT_TIMEOUT,
+        GUEST_LIST_RPC_TIMEOUT,
+        None,
+    )?;
+    Ok(guest_box_states(&listing))
+}
+
+/// The state of each session in a listing.
+fn guest_box_states(
+    listing: &minimald_rpc::ListSessionsResponse,
+) -> std::collections::BTreeMap<boxes::SessionId, boxes::BoxState> {
+    listing
+        .sessions
+        .iter()
+        .map(|entry| (entry.id, entry.status))
+        .collect()
 }
 
 /// Wait for the peer's close on a guest-door connection whose reply was
@@ -7267,6 +7413,7 @@ mod tests {
                 ControlDoor::Host,
                 &audit_path,
                 1,
+                &HostIpReconcileNudge::default(),
             )
         });
 
