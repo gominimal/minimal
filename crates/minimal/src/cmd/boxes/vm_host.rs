@@ -368,14 +368,19 @@ pub(crate) async fn rehold_held_name_before_attach(
     )
     .await
     {
-        if let Ok(None) = attached_box_record(sock, id).await {
-            host_ip_box_with_vm_host(control_sock_beside(sock), id, None, false).await;
-        } else {
-            tracing::info!(
+        match attached_box_record(sock, id).await {
+            Ok(None) => {
+                host_ip_box_with_vm_host(control_sock_beside(sock), id, None, false).await;
+            }
+            // Only a session still there was admitted for good. This runs
+            // on every attach and exec, not only after a resume, so the
+            // line says admitted and claims no resume.
+            Ok(Some(_)) => tracing::info!(
                 session = %id,
                 box = record.name.as_deref().unwrap_or("<unnamed>"),
-                "admitted the resumed host_ip box's egress on the VM host daemon again"
-            );
+                "admitted the host_ip box's egress on the VM host daemon"
+            ),
+            Err(_) => {}
         }
     }
     if record.box_addresses.is_some() {
