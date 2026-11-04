@@ -1574,9 +1574,8 @@ pub struct BoxGate {
 /// the exposure's port.
 type HostFlowKey = (u8, u16, u16);
 
-/// The most host-exposure flows one gate tracks. A flow past the bound is
-/// still decided per frame. It is only not reset when its exposure is
-/// removed.
+/// The most host-exposure flows one gate tracks. A new flow past the bound
+/// is refused, so every admitted flow is one that a removal can end.
 const HOST_FLOWS_PER_BOX: usize = 1024;
 
 /// The rule a host-alias refusal names in its log line (NET-160).
@@ -1853,8 +1852,13 @@ impl BoxGate {
             .as_ref()
             .is_none_or(|list| list.contains(&pkt.proto));
         if opens && self.names_host && declared {
-            self.record_host_flow(key);
-            return HostAliasVerdict::Admit;
+            if self.record_host_flow(key) {
+                return HostAliasVerdict::Admit;
+            }
+            // NET-161: an untracked flow gets no reset on removal, so the
+            // gate does not admit it.
+            self.refuse_host_alias(Direction::Egress, pkt.proto, port, "host flow limit");
+            return HostAliasVerdict::Refuse;
         }
         // The flow stays tracked, so each later frame of it either way is
         // refused too, and is not taken for a reply on the ingress leg.
@@ -1865,7 +1869,12 @@ impl BoxGate {
             self.send_reset(host_flow_reset(frame, pkt.src, pkt.dst, pkt.seq, true));
             self.send_box_reset(host_flow_reset(frame, pkt.dst, pkt.src, pkt.ack, false));
         }
-        self.refuse_host_alias(Direction::Egress, pkt.proto, port, opens);
+        let refused_by = if opens {
+            "box egress rules"
+        } else {
+            "host-exposures table"
+        };
+        self.refuse_host_alias(Direction::Egress, pkt.proto, port, refused_by);
         HostAliasVerdict::Refuse
     }
 
@@ -1894,22 +1903,24 @@ impl BoxGate {
             self.send_box_reset(host_flow_reset(frame, pkt.src, pkt.dst, pkt.seq, true));
             self.send_reset(host_flow_reset(frame, pkt.dst, pkt.src, pkt.ack, false));
         }
-        self.refuse_host_alias(Direction::Ingress, pkt.proto, port, false);
+        self.refuse_host_alias(Direction::Ingress, pkt.proto, port, "host-exposures table");
         HostAliasVerdict::Refuse
     }
 
     /// Says a host-alias refusal, once per box per interval: the box, the
-    /// exposure's port, and whether the table or the box's rules refused it.
-    fn refuse_host_alias(&self, direction: Direction, proto: u8, port: u16, table_opens: bool) {
+    /// exposure's port, and what refused it: the table, the box's rules or
+    /// the gate's flow limit.
+    fn refuse_host_alias(
+        &self,
+        direction: Direction,
+        proto: u8,
+        port: u16,
+        refused_by: &'static str,
+    ) {
         if self
             .limiter
             .should_warn_at(&self.label, HOST_ALIAS_RULE, Instant::now())
         {
-            let refused_by = if table_opens {
-                "box egress rules"
-            } else {
-                "host-exposures table"
-            };
             tracing::warn!(
                 session_id = %self.label,
                 %direction,
@@ -1926,7 +1937,9 @@ impl BoxGate {
         }
     }
 
-    fn record_host_flow(&self, key: HostFlowKey) {
+    /// Tracks `key` and says whether it is tracked. A new flow past
+    /// [`HOST_FLOWS_PER_BOX`] is not, once idle flows are dropped.
+    fn record_host_flow(&self, key: HostFlowKey) -> bool {
         let now = Instant::now();
         let mut flows = self
             .host_flows
@@ -1937,10 +1950,11 @@ impl BoxGate {
                 now.saturating_duration_since(*seen) < egress::REPLY_TCP_IDLE_CAP
             });
             if flows.len() >= HOST_FLOWS_PER_BOX {
-                return;
+                return false;
             }
         }
         flows.insert(key, now);
+        true
     }
 
     fn tracks_host_flow(&self, key: HostFlowKey) -> bool {
@@ -5126,6 +5140,20 @@ pub(crate) mod tests {
                 .unwrap();
         assert_host_flow_reset(&to_host, second, host, 3001);
         assert_not_delivered(&mut harness).await;
+
+        // A new flow past the bound is refused, since a removal could not
+        // end a flow the gate does not track.
+        std::fs::write(table.path(), "[host-exposures.web]\nport = 8080\n").unwrap();
+        let gate = harness.gate.clone().expect("the native relay holds a gate");
+        // The two flows above already hold two places.
+        for port in 0..HOST_FLOWS_PER_BOX - 2 {
+            let port = u16::try_from(port).unwrap() + 10000;
+            assert!(gate.record_host_flow((IPPROTO_TCP, port, 8080)));
+        }
+        let tracked = host_flow_segment(SocketAddrV4::new(LEASE, 10000), host, SYN, 7000, 0);
+        assert!(reaches_switch(&mut harness, &tracked).await);
+        let late = host_flow_segment(SocketAddrV4::new(LEASE, 42000), host, SYN, 7000, 0);
+        assert!(!reaches_switch(&mut harness, &late).await);
     }
 
     /// NET-134 on the relay leg, the first of the two a box's frame must
