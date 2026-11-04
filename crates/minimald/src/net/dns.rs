@@ -101,15 +101,22 @@ pub fn is_zone_name(name: &str) -> bool {
 /// host daemon over the switch's control channel
 /// ([`super::listeners::proxy_listening`]) every [`PROXY_LISTENER_CACHE`],
 /// whether or not anything reads it, so a proxy that stopped while no box
-/// looked anything up is already down at the next lookup. A read never
-/// waits for an ask: it answers from the last answer. A host that cannot be
-/// asked, a native host among them, answers down.
+/// looked anything up is already down at the next lookup. The asks end with
+/// the switch's last gate. A read never waits for an ask: it answers from
+/// the last answer. A host that cannot be asked, a native host among them,
+/// answers down.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ProxyListenerState {
-    live: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Where the state asks, or `None` for a state only [`Self::set_live`]
-    /// writes.
-    source: Option<std::sync::Arc<ListenerSource>>,
+    shared: std::sync::Arc<SharedListener>,
+}
+
+/// What every clone of a [`ProxyListenerState`] reads and writes.
+#[derive(Debug, Default)]
+struct SharedListener {
+    live: std::sync::atomic::AtomicBool,
+    /// Where the state asks, or `None` for a state only
+    /// [`ProxyListenerState::set_live`] writes.
+    source: Option<ListenerSource>,
 }
 
 /// How long one answer about the proxy's listener stands before the next
@@ -130,9 +137,10 @@ struct ListenerSource {
     asking: std::sync::atomic::AtomicBool,
 }
 
-/// The one listener state of each switch, by its control channel.
+/// The one listener state of each switch, by its control channel. Held
+/// weakly: the gates own a state, so it ends with the switch's last gate.
 static SWITCH_LISTENERS: std::sync::LazyLock<
-    std::sync::Mutex<HashMap<String, ProxyListenerState>>,
+    std::sync::Mutex<HashMap<String, std::sync::Weak<SharedListener>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 impl ProxyListenerState {
@@ -148,58 +156,63 @@ impl ProxyListenerState {
     #[must_use]
     pub(crate) fn asking(control: super::policy::ControlChannel) -> Self {
         let state = Self {
-            live: std::sync::Arc::default(),
-            source: Some(std::sync::Arc::new(ListenerSource {
-                control,
-                asked: std::sync::Mutex::new(None),
-                asking: std::sync::atomic::AtomicBool::new(false),
-            })),
+            shared: std::sync::Arc::new(SharedListener {
+                live: std::sync::atomic::AtomicBool::new(false),
+                source: Some(ListenerSource {
+                    control,
+                    asked: std::sync::Mutex::new(None),
+                    asking: std::sync::atomic::AtomicBool::new(false),
+                }),
+            }),
         };
         state.refresh_if_stale();
         state.keep_asking();
         state
     }
 
-    /// Ask again every [`PROXY_LISTENER_CACHE`] until the state is dropped.
-    /// Without a runtime to run on, only reads start an ask.
+    /// Ask again every [`PROXY_LISTENER_CACHE`] until the last clone of the
+    /// state is dropped. Without a runtime to run on, only reads start an
+    /// ask.
     fn keep_asking(&self) {
-        let Some(source) = &self.source else {
-            return;
-        };
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
-        let source = std::sync::Arc::downgrade(source);
-        let live = std::sync::Arc::clone(&self.live);
-        crate::traced::spawn(async move {
-            loop {
-                tokio::time::sleep(PROXY_LISTENER_CACHE).await;
-                let Some(source) = source.upgrade() else {
-                    return;
-                };
-                let state = Self {
-                    live: std::sync::Arc::clone(&live),
-                    source: Some(source),
-                };
-                state.refresh_if_stale();
-            }
-        });
+        let shared = std::sync::Arc::downgrade(&self.shared);
+        crate::traced::spawn_detached(
+            tracing::info_span!(parent: None, "net.proxy_listener"),
+            async move {
+                loop {
+                    tokio::time::sleep(PROXY_LISTENER_CACHE).await;
+                    let Some(shared) = shared.upgrade() else {
+                        return;
+                    };
+                    Self { shared }.refresh_if_stale();
+                }
+            },
+        );
     }
 
     /// The state every gate on the switch at `control` shares: built and
-    /// asked at the first box's attach, and handed to every later one.
+    /// asked at the attach of a box that finds no gate on the switch, and
+    /// handed to every box that attaches while one stands. A state built
+    /// after the last gate went reads down until its first answer, as the
+    /// first box's does.
     #[must_use]
     pub(crate) fn for_switch(control: &super::policy::ControlChannel) -> Self {
         let key = match control {
             super::policy::ControlChannel::Unix(path) => format!("unix:{}", path.display()),
             super::policy::ControlChannel::Vsock { cid, port } => format!("vsock:{cid}:{port}"),
         };
-        SWITCH_LISTENERS
+        let mut listeners = SWITCH_LISTENERS
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(key)
-            .or_insert_with(|| Self::asking(control.clone()))
-            .clone()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        listeners.retain(|_, shared| shared.strong_count() > 0);
+        if let Some(shared) = listeners.get(&key).and_then(std::sync::Weak::upgrade) {
+            return Self { shared };
+        }
+        let state = Self::asking(control.clone());
+        listeners.insert(key, std::sync::Arc::downgrade(&state.shared));
+        state
     }
 
     /// Whether the listener is live now, by the last answer. A read that
@@ -207,14 +220,21 @@ impl ProxyListenerState {
     #[must_use]
     pub(crate) fn is_live(&self) -> bool {
         self.refresh_if_stale();
-        self.live.load(std::sync::atomic::Ordering::Acquire)
+        self.shared.live.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The last answer, without starting an ask: a test can wait for an
+    /// answer this way and leave the asking to the state.
+    #[cfg(test)]
+    pub(crate) fn last_answer(&self) -> bool {
+        self.shared.live.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Start an ask when the last one is older than [`PROXY_LISTENER_CACHE`]
     /// and none is in flight. Without a runtime to run the ask on, the
     /// state keeps its last answer.
     fn refresh_if_stale(&self) {
-        let Some(source) = &self.source else {
+        let Some(source) = &self.shared.source else {
             return;
         };
         if tokio::runtime::Handle::try_current().is_err() {
@@ -249,8 +269,8 @@ impl ProxyListenerState {
     /// cannot be asked or does not answer. Returns the recorded answer. A
     /// state with nowhere to ask keeps its last answer.
     pub(crate) async fn refresh(&self) -> bool {
-        let Some(source) = &self.source else {
-            return self.live.load(std::sync::atomic::Ordering::Acquire);
+        let Some(source) = &self.shared.source else {
+            return self.shared.live.load(std::sync::atomic::Ordering::Acquire);
         };
         // The guard clears `asking` however the ask ends. A task dropped or
         // panicking mid-ask would otherwise leave `asking` set, and no later
@@ -274,7 +294,10 @@ impl ProxyListenerState {
     /// writes one info line, so the log shows when steered names start to
     /// resolve to the proxy again. Returns whether the state changed.
     pub(crate) fn set_live(&self, live: bool) -> bool {
-        let was = self.live.swap(live, std::sync::atomic::Ordering::AcqRel);
+        let was = self
+            .shared
+            .live
+            .swap(live, std::sync::atomic::Ordering::AcqRel);
         if live && !was {
             tracing::info!(
                 component = "dns-gate",
@@ -6744,12 +6767,14 @@ mod tests {
         super::super::listeners::seed_vm_report_door_for_tests(&control_sock, &door);
 
         let state = ProxyListenerState {
-            live: std::sync::Arc::default(),
-            source: Some(std::sync::Arc::new(ListenerSource {
-                control: super::super::policy::ControlChannel::Unix(control_sock.clone()),
-                asked: std::sync::Mutex::new(None),
-                asking: std::sync::atomic::AtomicBool::new(true),
-            })),
+            shared: std::sync::Arc::new(SharedListener {
+                live: std::sync::atomic::AtomicBool::new(false),
+                source: Some(ListenerSource {
+                    control: super::super::policy::ControlChannel::Unix(control_sock.clone()),
+                    asked: std::sync::Mutex::new(None),
+                    asking: std::sync::atomic::AtomicBool::new(true),
+                }),
+            }),
         };
         state.set_live(true);
         let ask = tokio::time::timeout(Duration::from_millis(50), state.refresh()).await;
@@ -6758,15 +6783,16 @@ mod tests {
             "the silent door holds the ask past the timeout"
         );
 
-        let source = state.source.as_ref().expect("the state has a source");
+        let source = state
+            .shared
+            .source
+            .as_ref()
+            .expect("the state has a source");
         assert!(
             !source.asking.load(std::sync::atomic::Ordering::Acquire),
             "the dropped ask clears asking"
         );
-        assert!(
-            !state.live.load(std::sync::atomic::Ordering::Acquire),
-            "the dropped ask records down"
-        );
+        assert!(!state.last_answer(), "the dropped ask records down");
         super::super::listeners::clear_vm_report_door_for_tests(&control_sock);
     }
 }

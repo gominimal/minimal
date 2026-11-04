@@ -7948,7 +7948,7 @@ pub(crate) mod tests {
         use hickory_proto::op::{Message, ResponseCode};
         use hickory_proto::rr::{RData, RecordType};
         use std::net::SocketAddrV4;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
         /// A `dns`-steered box (no steering declared resolves to `dns`) that
         /// allows the GitHub module's names.
@@ -8013,6 +8013,15 @@ pub(crate) mod tests {
             door: &std::path::Path,
             listening: Arc<AtomicBool>,
         ) -> tokio::task::JoinHandle<()> {
+            counting_proxy_door(door, listening, Arc::default())
+        }
+
+        /// [`proxy_door`], counting each read it answers in `asks`.
+        fn counting_proxy_door(
+            door: &std::path::Path,
+            listening: Arc<AtomicBool>,
+            asks: Arc<AtomicUsize>,
+        ) -> tokio::task::JoinHandle<()> {
             use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
             let listener =
                 tokio::net::UnixListener::bind(door).expect("bind the report door stand-in");
@@ -8032,6 +8041,7 @@ pub(crate) mod tests {
                     )
                     .expect("the report door's request line parses");
                     assert_eq!(request, minimald_rpc::BoxControlRequest::ProxyListening);
+                    asks.fetch_add(1, Ordering::AcqRel);
                     let mut reply = serde_json_lenient::to_string(
                         &minimald_rpc::BoxControlReply::ProxyListening {
                             listening: listening.load(Ordering::Acquire),
@@ -8163,18 +8173,66 @@ pub(crate) mod tests {
             let door_task = proxy_door(&door, Arc::clone(&listening));
             crate::net::listeners::seed_vm_report_door_for_tests(&control_sock, &door);
 
-            let gate = steered_box_gate(ProxyListenerState::for_switch(&ControlChannel::Unix(
-                control_sock.clone(),
-            )));
+            let listener =
+                ProxyListenerState::for_switch(&ControlChannel::Unix(control_sock.clone()));
+            let gate = steered_box_gate(listener.clone());
             lookup_until(&gate, "github.com.", ResponseCode::NoError).await;
 
             listening.store(false, Ordering::Release);
-            tokio::time::sleep(crate::net::dns::PROXY_LISTENER_CACHE * 8).await;
+            // Wait on the state's own asks: a lookup here would start one,
+            // and the lookup below would no longer be the first.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while listener.last_answer() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the state did not learn of the stop on its own"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             assert_eq!(
                 lookup(&gate, "github.com.").metadata.response_code,
                 ResponseCode::ServFail,
                 "the first lookup after the idle stop"
             );
+
+            crate::net::listeners::clear_vm_report_door_for_tests(&control_sock);
+            door_task.abort();
+        }
+
+        /// The asks end with the switch's last gate, and the next box on the
+        /// switch starts them again.
+        #[tokio::test]
+        async fn the_listener_asks_end_with_the_switchs_last_gate() {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let control_sock = dir.path().join("gvproxy.sock");
+            let door = dir.path().join("guest-control.sock");
+            let asks = Arc::new(AtomicUsize::new(0));
+            let door_task =
+                counting_proxy_door(&door, Arc::new(AtomicBool::new(true)), Arc::clone(&asks));
+            crate::net::listeners::seed_vm_report_door_for_tests(&control_sock, &door);
+            let control = ControlChannel::Unix(control_sock.clone());
+
+            let gate = steered_box_gate(ProxyListenerState::for_switch(&control));
+            lookup_until(&gate, "github.com.", ResponseCode::NoError).await;
+            drop(gate);
+
+            // An ask in flight may land after the drop, so wait for a quiet
+            // spell long enough to hold several asks.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let before = asks.load(Ordering::Acquire);
+                tokio::time::sleep(crate::net::dns::PROXY_LISTENER_CACHE * 4).await;
+                if asks.load(Ordering::Acquire) == before {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the state still asks with no gate on the switch"
+                );
+            }
+
+            let gate = steered_box_gate(ProxyListenerState::for_switch(&control));
+            lookup_until(&gate, "github.com.", ResponseCode::NoError).await;
 
             crate::net::listeners::clear_vm_report_door_for_tests(&control_sock);
             door_task.abort();
