@@ -7394,10 +7394,16 @@ async fn box_cp_reads_stopped_box_as_box_017() {
         .await
         .expect_err("a file the box does not have");
     assert!(
-        format!("{missing:#}").starts_with("Could not copy gone.txt out of box web"),
+        format!("{missing:#}") == "Box web has no file gone.txt.",
         "{missing:#}"
     );
     assert!(!local.path().join("gone.txt").exists());
+    // A failed copy leaves no temporary file beside the destination either.
+    assert_eq!(
+        std::fs::read_dir(local.path()).unwrap().count(),
+        2,
+        "only notes.txt and copied.txt"
+    );
 
     let refused = box_cp_on_hosts(local_hosts(&global).unwrap(), "notes.txt", local.path())
         .await

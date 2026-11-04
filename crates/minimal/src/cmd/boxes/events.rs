@@ -69,11 +69,11 @@ pub(crate) async fn box_events_on_hosts(
     out: &mut dyn std::io::Write,
     err: &mut dyn std::io::Write,
 ) -> Result<(), anyhow::Error> {
-    let address = match (&args.target, &args.parent) {
-        (_, Some(parent)) => parent.as_str(),
-        (Some(target), None) => target.as_str(),
-        (None, None) => bail!("Name a box: run `min box events <box>`."),
-    };
+    let address = args
+        .parent
+        .as_deref()
+        .or(args.target.as_deref())
+        .expect("the box_or_parent group makes clap require a box or --parent");
     let mode = match args.output {
         Some(BoxEventsOutputFormat::Jsonl) => OutputMode::Jsonl,
         None => OutputMode::Text,
@@ -82,9 +82,21 @@ pub(crate) async fn box_events_on_hosts(
     crate::output::record_box_id(&resolved.box_id.to_string());
     let mut client = box_host_client(&resolved.host).await?;
 
-    let ids = if args.parent.is_some() {
+    // Each stream with the name its errors call the box by: the address the
+    // person typed, or a child's name, or its id when it has none.
+    let ids: Vec<(boxes::BoxId, String)> = if args.parent.is_some() {
         let listing = list_box_records(&mut client, None).await?;
-        let children = child_boxes(&listing, resolved.box_id);
+        let children: Vec<_> = child_boxes(&listing, resolved.box_id)
+            .into_iter()
+            .map(|id| {
+                let name = listing
+                    .iter()
+                    .find(|entry| entry.box_id == id)
+                    .and_then(|entry| entry.name.clone())
+                    .unwrap_or_else(|| id.to_string());
+                (id, name)
+            })
+            .collect();
         if children.is_empty() {
             tracing::info!(verb = "box events", box_id = %resolved.box_id, outcome = "no children");
             writeln!(
@@ -96,12 +108,22 @@ pub(crate) async fn box_events_on_hosts(
         }
         children
     } else {
-        vec![resolved.box_id]
+        vec![(resolved.box_id, address.to_owned())]
     };
 
     let mut reads = Vec::with_capacity(ids.len());
-    for id in &ids {
-        reads.push((*id, client.read_box_events(*id, args.follow).await?));
+    for (id, label) in &ids {
+        let lines = client
+            .read_box_events(*id, args.follow)
+            .await
+            .map_err(|e| {
+                tracing::warn!(verb = "box events", box_id = %id, "open the events read: {e:#}");
+                anyhow::anyhow!(
+                    "Could not read the events of box {label}. \
+                     Run `min box show {label}` to check that the box still exists."
+                )
+            })?;
+        reads.push((label.clone(), lines));
     }
     let written = if args.follow {
         follow_events(reads, mode, out).await
@@ -117,8 +139,8 @@ pub(crate) async fn box_events_on_hosts(
 /// order the listing gives them.
 pub(crate) fn child_boxes(
     listing: &[minimald_rpc::BoxListingEntry],
-    parent: boxes::SessionId,
-) -> Vec<boxes::SessionId> {
+    parent: boxes::BoxId,
+) -> Vec<boxes::BoxId> {
     listing
         .iter()
         .filter(|entry| entry.parent == Some(parent))
@@ -136,35 +158,78 @@ pub(crate) fn merge_events(
     merged
 }
 
-/// The next update of the read of box `id`, or `None` once it ended. A
-/// `Failed` update and a stream the daemon ends early are errors.
+/// The next update of the read of the box `label` names, or `None` once it
+/// ended. A `Failed` update and a stream that ends early are errors, which
+/// name the box by `label`. The detail goes to the log.
 async fn next_event(
-    id: boxes::SessionId,
+    label: &str,
     lines: &mut client::SubsystemLines,
 ) -> Result<Option<boxes::events::BoxEvent>, anyhow::Error> {
-    let Some(line) = lines.next_line().await? else {
-        bail!("The daemon closed the events of box {id} before it sent all of them.");
+    let line = match lines.next_line().await {
+        Ok(Some(line)) => line,
+        Ok(None) => {
+            tracing::warn!(
+                verb = "box events",
+                box_name = label,
+                "the events read ended early"
+            );
+            bail!(
+                "The events of box {label} stopped before the last one arrived. \
+                 Run `min box events {label}` to read them again."
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                verb = "box events",
+                box_name = label,
+                "read an events line: {e:#}"
+            );
+            bail!(
+                "Could not read the events of box {label}. \
+                 Run `min box show {label}` to check that the box still exists."
+            );
+        }
     };
-    let update: ReadEventsUpdate = serde_json_lenient::from_str(&line)
-        .with_context(|| format!("the daemon sent an events line this min cannot read: {line}"))?;
+    let update: ReadEventsUpdate = match serde_json_lenient::from_str(&line) {
+        Ok(update) => update,
+        Err(e) => {
+            tracing::warn!(
+                verb = "box events",
+                box_name = label,
+                line,
+                "decode an events line: {e}"
+            );
+            bail!("An event of box {label} is in a form this version of min cannot read.");
+        }
+    };
     match update {
         ReadEventsUpdate::Event { event } => Ok(Some(event)),
         ReadEventsUpdate::Done | ReadEventsUpdate::Reaped => Ok(None),
-        ReadEventsUpdate::Failed { error } => bail!("{error}"),
+        ReadEventsUpdate::Failed { error } => {
+            tracing::warn!(
+                verb = "box events",
+                box_name = label,
+                "the events read failed: {error}"
+            );
+            bail!(
+                "Could not read the events of box {label}. \
+                 Run `min box show {label}` to check that the box still exists."
+            )
+        }
     }
 }
 
 /// Reads each stream to its end, then writes the events of all of them in
 /// time order.
 async fn replay_events(
-    reads: Vec<(boxes::SessionId, client::SubsystemLines)>,
+    reads: Vec<(String, client::SubsystemLines)>,
     mode: OutputMode,
     out: &mut dyn std::io::Write,
 ) -> Result<(), anyhow::Error> {
     let mut streams = Vec::with_capacity(reads.len());
-    for (id, mut lines) in reads {
+    for (label, mut lines) in reads {
         let mut events = Vec::new();
-        while let Some(event) = next_event(id, &mut lines).await? {
+        while let Some(event) = next_event(&label, &mut lines).await? {
             events.push(event);
         }
         streams.push(events);
@@ -180,17 +245,17 @@ async fn replay_events(
 /// box kept, then each new one, until every followed box is removed or the
 /// command is interrupted.
 async fn follow_events(
-    reads: Vec<(boxes::SessionId, client::SubsystemLines)>,
+    reads: Vec<(String, client::SubsystemLines)>,
     mode: OutputMode,
     out: &mut dyn std::io::Write,
 ) -> Result<(), anyhow::Error> {
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     let mut readers = tokio::task::JoinSet::new();
-    for (id, mut lines) in reads {
+    for (label, mut lines) in reads {
         let tx = tx.clone();
         readers.spawn(async move {
             loop {
-                let next = next_event(id, &mut lines).await;
+                let next = next_event(&label, &mut lines).await;
                 let end = !matches!(next, Ok(Some(_)));
                 if tx.send(next).await.is_err() || end {
                     return;
@@ -239,7 +304,8 @@ pub(crate) async fn box_cp_on_hosts(
     let target = if destination.is_dir() {
         let Some(name) = std::path::Path::new(path).file_name() else {
             bail!(
-                "`{path}` does not name a file. Run `min box cp {address}:<path>/<file> <local>`."
+                "`{path}` does not name a file. Run `min box cp {address}:<path>/<file> {}`.",
+                destination.display()
             );
         };
         destination.join(name)
@@ -247,16 +313,7 @@ pub(crate) async fn box_cp_on_hosts(
         destination.to_path_buf()
     };
     let mut client = box_host_client(&resolved.host).await?;
-    let copied = async {
-        let bytes = client
-            .read_box_file(resolved.box_id, path)
-            .await
-            .with_context(|| format!("Could not copy {path} out of box {address}"))?;
-        std::fs::write(&target, &bytes)
-            .with_context(|| format!("Could not write {}", target.display()))?;
-        Ok::<_, anyhow::Error>(bytes.len())
-    }
-    .await;
+    let copied = copy_box_file(&mut client, resolved.box_id, address, path, &target).await;
     match &copied {
         Ok(bytes) => {
             tracing::info!(verb = "box cp", box_id = %resolved.box_id, bytes, outcome = "ok");
@@ -266,4 +323,99 @@ pub(crate) async fn box_cp_on_hosts(
         }
     }
     copied.map(|_| target)
+}
+
+/// Streams the file at `path` in the box `box_id`, which the person named
+/// `address`, into `target`. The bytes go to a temporary file beside
+/// `target`, which is renamed into place only when the whole file arrived,
+/// so a failed copy leaves no file at `target`. Returns the bytes copied.
+async fn copy_box_file(
+    client: &mut client::Client,
+    box_id: boxes::BoxId,
+    address: &str,
+    path: &str,
+    target: &std::path::Path,
+) -> Result<u64, anyhow::Error> {
+    let mut file = client.open_box_file(box_id, path).await.map_err(|e| {
+        tracing::warn!(verb = "box cp", box_id = %box_id, path, "open the file in the box: {e}");
+        match e {
+            client::BoxFileError::NotFound => anyhow::anyhow!("Box {address} has no file {path}."),
+            client::BoxFileError::PermissionDenied => {
+                anyhow::anyhow!("Box {address} does not allow reading {path}.")
+            }
+            client::BoxFileError::Unavailable(_) | client::BoxFileError::Refused(_) => {
+                anyhow::anyhow!(
+                    "Could not read {path} from box {address}. \
+                     Run `min box show {address}` to check that the box still exists."
+                )
+            }
+        }
+    })?;
+
+    let partial = PartialFile::beside(target);
+    let mut out = tokio::fs::File::create(&partial.path)
+        .await
+        .with_context(|| format!("Could not write {}", target.display()))?;
+    let mut buf = vec![0_u8; 64 * 1024];
+    let mut copied = 0_u64;
+    loop {
+        let n = file.read(&mut buf).await.map_err(|e| {
+            tracing::warn!(verb = "box cp", box_id = %box_id, path, copied, "read the file in the box: {e}");
+            anyhow::anyhow!(
+                "Could not read all of {path} from box {address}, so min did not write {}. \
+                 Run `min box show {address}` to check that the box still exists.",
+                target.display()
+            )
+        })?;
+        let Some(chunk) = buf.get(..n).filter(|chunk| !chunk.is_empty()) else {
+            break;
+        };
+        out.write_all(chunk)
+            .await
+            .with_context(|| format!("Could not write {}", target.display()))?;
+        copied += n as u64;
+    }
+    out.flush()
+        .await
+        .with_context(|| format!("Could not write {}", target.display()))?;
+    drop(out);
+    // The conversation is done either way. A close that fails changes
+    // nothing about the bytes already read.
+    drop(file.shutdown().await);
+    tokio::fs::rename(&partial.path, target)
+        .await
+        .with_context(|| format!("Could not write {}", target.display()))?;
+    partial.keep();
+    Ok(copied)
+}
+
+/// A temporary file beside the destination of `min box cp`, removed when
+/// it drops unless [`Self::keep`] says it was renamed into place.
+struct PartialFile {
+    path: std::path::PathBuf,
+    kept: bool,
+}
+
+impl PartialFile {
+    /// A hidden name in the directory of `target`, unique to this process.
+    fn beside(target: &std::path::Path) -> Self {
+        let name = target
+            .file_name()
+            .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+        let path = target.with_file_name(format!(".{name}.min-cp-{}", std::process::id()));
+        Self { path, kept: false }
+    }
+
+    fn keep(mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for PartialFile {
+    fn drop(&mut self) {
+        if !self.kept {
+            // Nothing to do if the file was never created.
+            drop(std::fs::remove_file(&self.path));
+        }
+    }
 }

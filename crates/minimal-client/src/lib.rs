@@ -1043,7 +1043,7 @@ impl Client {
     /// because a bare refusal does not close the channel.
     pub async fn open_box_subsystem(
         &mut self,
-        box_id: boxes::SessionId,
+        box_id: boxes::BoxId,
         subsystem: &str,
     ) -> Result<russh::Channel<russh::client::Msg>, anyhow::Error> {
         let mut channel = self
@@ -1088,7 +1088,7 @@ impl Client {
     /// JSON update for each line until the daemon ends the stream.
     pub async fn stream_box_subsystem(
         &mut self,
-        box_id: boxes::SessionId,
+        box_id: boxes::BoxId,
         subsystem: &str,
         request: &[u8],
     ) -> Result<SubsystemLines, anyhow::Error> {
@@ -1114,7 +1114,7 @@ impl Client {
     /// Each line of the reply is one JSON [`minimald_rpc::ReadEventsUpdate`].
     pub async fn read_box_events(
         &mut self,
-        box_id: boxes::SessionId,
+        box_id: boxes::BoxId,
         follow: bool,
     ) -> Result<SubsystemLines, anyhow::Error> {
         let request = minimald_rpc::ReadEventsRequest { id: box_id, follow };
@@ -1123,23 +1123,47 @@ impl Client {
             .await
     }
 
-    /// Reads the file at `path` in the box `box_id` over the box's `sftp`
-    /// subsystem. A stopped or exited box is served from its retained
-    /// files (BOX-017). A relative `path` is below the box's home.
-    pub async fn read_box_file(
+    /// Opens the file at `path` in the box `box_id` for reading, over the
+    /// box's `sftp` subsystem. A stopped or exited box is served from its
+    /// retained files (BOX-017). A relative `path` is below the box's home.
+    ///
+    /// The returned file streams its contents, so a large file is never
+    /// held in memory. It keeps the sftp conversation open until it drops.
+    ///
+    /// # Errors
+    ///
+    /// [`BoxFileError`] says whether the box's files were not served at
+    /// all, or the open of `path` was refused, and why.
+    pub async fn open_box_file(
         &mut self,
-        box_id: boxes::SessionId,
+        box_id: boxes::BoxId,
         path: &str,
-    ) -> Result<Vec<u8>, anyhow::Error> {
-        let channel = self.open_box_subsystem(box_id, "sftp").await?;
+    ) -> Result<russh_sftp::client::fs::File, BoxFileError> {
+        let channel = self
+            .open_box_subsystem(box_id, "sftp")
+            .await
+            .map_err(BoxFileError::Unavailable)?;
         let sftp = russh_sftp::client::SftpSession::new(channel.into_stream())
             .await
-            .context("start the sftp conversation")?;
-        let read = sftp.read(path).await;
-        // The conversation is done either way; a close that fails changes
-        // nothing about the read.
-        drop(sftp.close().await);
-        read.with_context(|| format!("read {path}"))
+            .context("start the sftp conversation")
+            .map_err(BoxFileError::Unavailable)?;
+        // The file holds its own reference to the conversation, so dropping
+        // `sftp` here does not end it.
+        sftp.open(path).await.map_err(|e| match e {
+            russh_sftp::client::error::Error::Status(status)
+                if status.status_code == russh_sftp::protocol::StatusCode::NoSuchFile =>
+            {
+                BoxFileError::NotFound
+            }
+            russh_sftp::client::error::Error::Status(status)
+                if status.status_code == russh_sftp::protocol::StatusCode::PermissionDenied =>
+            {
+                BoxFileError::PermissionDenied
+            }
+            other => {
+                BoxFileError::Refused(anyhow::Error::new(other).context(format!("open {path}")))
+            }
+        })
     }
 
     /// Requests the daemon's diagnostic bundle (`min bug`): sends `req` on the
@@ -1277,9 +1301,35 @@ const DAEMON_ERROR_MAX: usize = 64 * 1024;
 /// usable truncated bundle into a total loss.
 const TRUNCATED_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
-/// Appends `data` to the daemon's error message, bounded: a daemon streaming
-/// only extended data must not balloon the CLI past the bound the archive
-/// itself respects.
+/// Why [`Client::open_box_file`] could not open a file in a box.
+#[derive(Debug)]
+pub enum BoxFileError {
+    /// The box host did not serve the box's files: the box is gone, or the
+    /// connection or the sftp conversation failed. The error carries the
+    /// detail, for the log.
+    Unavailable(anyhow::Error),
+    /// The box has no file at the path.
+    NotFound,
+    /// The box does not let the file be read.
+    PermissionDenied,
+    /// The box's file server refused the open for another reason. The
+    /// error carries the detail, for the log.
+    Refused(anyhow::Error),
+}
+
+impl std::fmt::Display for BoxFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(e) => write!(f, "the box's files were not served: {e:#}"),
+            Self::NotFound => f.write_str("no such file"),
+            Self::PermissionDenied => f.write_str("permission denied"),
+            Self::Refused(e) => write!(f, "the open was refused: {e:#}"),
+        }
+    }
+}
+
+impl std::error::Error for BoxFileError {}
+
 /// The reply of a subsystem channel, read one line at a time. See
 /// [`Client::stream_box_subsystem`].
 pub struct SubsystemLines {
@@ -1336,6 +1386,9 @@ impl SubsystemLines {
     }
 }
 
+/// Appends `data` to the daemon's error message, bounded: a daemon streaming
+/// only extended data must not balloon the CLI past the bound the archive
+/// itself respects.
 fn append_daemon_error(buf: &mut Vec<u8>, data: &[u8]) {
     let room = DAEMON_ERROR_MAX.saturating_sub(buf.len());
     buf.extend_from_slice(&data[..room.min(data.len())]);
