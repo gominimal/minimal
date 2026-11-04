@@ -68,7 +68,7 @@ impl BoxExecRequest {
     }
 
     /// The exec form the daemon reads off the channel.
-    fn wire(&self) -> String {
+    pub(crate) fn wire(&self) -> String {
         minimald_rpc::exec::ExecRequest::Exec(minimald_rpc::exec::ExecSpec {
             argv: self.argv.clone(),
             mode: self.mode,
@@ -81,9 +81,12 @@ impl BoxExecRequest {
 /// How a tty exec's terminal reaches this client once the exec started.
 pub(crate) enum TtyAttach {
     /// Through `ssh -tt` on this process's terminal, with the terminal relay
-    /// `min session attach` uses.
-    Terminal,
-    /// Through the daemon channel, with this process's stdio as pipes: the
+    /// `min session attach` uses, to the box `id` on the daemon at `sock`.
+    Terminal {
+        sock: std::path::PathBuf,
+        id: boxes::SessionId,
+    },
+    /// Through an exec channel, with this process's stdio as pipes: the
     /// path for a stdin that is not a terminal.
     Pipes,
 }
@@ -91,6 +94,68 @@ pub(crate) enum TtyAttach {
 /// The bytes a caller sends to the command's stdin. `None` closes the
 /// command's stdin at once.
 pub(crate) type ExecInput = Option<tokio::sync::mpsc::Receiver<Vec<u8>>>;
+
+/// One exec channel to a box, as the relay reads and writes it.
+pub(crate) trait ExecChannel {
+    /// The next message from the daemon, or `None` once the channel closed.
+    async fn wait(&mut self) -> Option<russh::ChannelMsg>;
+    /// Ends the command's stdin.
+    async fn eof(&mut self) -> Result<(), anyhow::Error>;
+    /// A writer to the command's stdin.
+    fn input(&self) -> std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>;
+}
+
+impl ExecChannel for russh::Channel<russh::client::Msg> {
+    async fn wait(&mut self) -> Option<russh::ChannelMsg> {
+        russh::Channel::wait(self).await
+    }
+
+    async fn eof(&mut self) -> Result<(), anyhow::Error> {
+        russh::Channel::eof(self)
+            .await
+            .context("close the command's stdin")
+    }
+
+    fn input(&self) -> std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>> {
+        Box::pin(self.make_writer())
+    }
+}
+
+/// Opens the exec channels of one box.
+pub(crate) trait ExecChannels {
+    /// The channel type.
+    type Channel: ExecChannel;
+    /// Opens a channel that carries the exec form `wire` to the box.
+    async fn open(&mut self, wire: &str) -> Result<Self::Channel, anyhow::Error>;
+}
+
+/// The exec channels of the box `id` on the daemon `client` reaches.
+/// `target` is the box as the user named it.
+struct HostChannels<'a> {
+    client: client::Client,
+    id: boxes::SessionId,
+    target: &'a str,
+}
+
+impl ExecChannels for HostChannels<'_> {
+    type Channel = russh::Channel<russh::client::Msg>;
+
+    async fn open(&mut self, wire: &str) -> Result<Self::Channel, anyhow::Error> {
+        let (id, target) = (self.id, self.target);
+        self.client
+            .open_session_exec_channel(id, wire, &minimald_rpc::taskenv::TaskEnv::default())
+            .await
+            .map_err(|error| {
+                // The daemon refuses the channel for a box it no longer
+                // has, or cannot reach.
+                tracing::warn!(%id, "the host refused the exec channel: {error:#}");
+                anyhow::anyhow!(
+                    "The host of {target} refused to run the command. \
+                     Run `min box show {target}` to see the box."
+                )
+            })
+    }
+}
 
 /// `min box exec <box> [-t|--detach] [--timeout <d>] -- <cmd>`: runs the
 /// command in the box and exits with the command's exit code (BCLI-053).
@@ -110,18 +175,13 @@ pub async fn cmd_box_exec(global: &GlobalArgs, args: BoxExecArgs) -> Result<(), 
         ExecMode::Attached if stdin_is_tty => None,
         ExecMode::Attached | ExecMode::Tty => Some(stdin_pump()),
     };
-    let attach = if stdin_is_tty {
-        TtyAttach::Terminal
-    } else {
-        TtyAttach::Pipes
-    };
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
     let code = box_exec_on_hosts(
         hosts,
         daemon_host_kind(global),
         &request,
-        attach,
+        stdin_is_tty,
         input,
         &mut stdout,
         &mut stderr,
@@ -159,16 +219,16 @@ fn stdin_pump() -> tokio::sync::mpsc::Receiver<Vec<u8>> {
 
 /// Resolves the box `request` names over `hosts`, runs the command there as
 /// BOX-149 defines, and returns the exit code to end with. The command's
-/// output goes to `out` and `err`. A detached exec writes only its exec id
-/// to `out`, and a tty exec writes its exec id to `err` first. A refusal
-/// returns as a [`BoxExecRefusal`], and an exec that its own timeout ended
-/// as a [`BoxExecTimedOut`]. The verb, the box id and the outcome go on
-/// the command's span.
+/// output goes to `out` and `err`. A tty exec reaches this process's
+/// terminal when `terminal` is set, else its pipes. A refusal returns as a
+/// [`BoxExecRefusal`], and an exec that its own timeout ended as a
+/// [`BoxExecTimedOut`]. The verb, the box id and the outcome go on the
+/// command's span.
 pub(crate) async fn box_exec_on_hosts<O, E>(
     hosts: Vec<crate::cmd::list::LocalHost>,
     kind: paths::HostKind,
     request: &BoxExecRequest,
-    attach: TtyAttach,
+    terminal: bool,
     input: ExecInput,
     out: &mut O,
     err: &mut E,
@@ -179,12 +239,22 @@ where
 {
     let resolved = resolve_box_on_hosts(hosts, &request.target, "box exec").await?;
     crate::output::record_box_id(&resolved.box_id.to_string());
-    let ran = exec_in_resolved_box(&resolved, kind, request, attach, input, out, err).await;
+    let ran = exec_in_resolved_box(&resolved, kind, request, terminal, input, out, err).await;
+    record_exec_outcome(resolved.box_id, request, &ran);
+    ran
+}
+
+/// The event that records how `min box exec` ended in the box `box_id`.
+pub(crate) fn record_exec_outcome(
+    box_id: boxes::SessionId,
+    request: &BoxExecRequest,
+    ran: &Result<i32, anyhow::Error>,
+) {
     let mode = request.mode.name();
-    match &ran {
+    match ran {
         Ok(code) => tracing::info!(
             verb = "box exec",
-            box_id = %resolved.box_id,
+            box_id = %box_id,
             mode,
             exit_code = code,
             outcome = "ran",
@@ -197,16 +267,9 @@ where
             } else {
                 "error"
             };
-            tracing::info!(
-                verb = "box exec",
-                box_id = %resolved.box_id,
-                mode,
-                outcome,
-                "{error:#}"
-            );
+            tracing::info!(verb = "box exec", box_id = %box_id, mode, outcome, "{error:#}");
         }
     }
-    ran
 }
 
 /// [`box_exec_on_hosts`] once the address resolved to `resolved`.
@@ -214,7 +277,7 @@ async fn exec_in_resolved_box<O, E>(
     resolved: &ResolvedBox,
     kind: paths::HostKind,
     request: &BoxExecRequest,
-    attach: TtyAttach,
+    terminal: bool,
     input: ExecInput,
     out: &mut O,
     err: &mut E,
@@ -223,15 +286,15 @@ where
     O: tokio::io::AsyncWrite + Unpin,
     E: tokio::io::AsyncWrite + Unpin,
 {
-    use minimald_rpc::exec::ExecMode;
-
     let sock = resolved.host.sock.as_path();
     let id = resolved.box_id;
     // A VM-backed box gets its row and its name hold back before the
     // command runs, as `min session exec` does before its ssh exec.
     let record = match control_sock_beside(sock).filter(|control| control.exists()) {
         Some(_) => attached_box_record(sock, id).await.unwrap_or_else(|error| {
-            tracing::warn!("could not read the box's record ({error:#}); its box row is not asked back first");
+            tracing::warn!(
+                "could not read the box's record ({error:#}); its box row is not asked back first"
+            );
             None
         }),
         None => None,
@@ -239,13 +302,49 @@ where
     minimal_client::box_registration::resume_box_row(sock, record.as_ref()).await?;
     rehold_held_name_before_attach(kind, sock, id, record.as_ref()).await;
 
-    let mut client = gated_box_host_client(&resolved.host).await?;
+    let client = gated_box_host_client(&resolved.host).await?;
+    let mut channels = HostChannels {
+        client,
+        id,
+        target: &request.target,
+    };
+    let attach = if terminal {
+        TtyAttach::Terminal {
+            sock: sock.to_path_buf(),
+            id,
+        }
+    } else {
+        TtyAttach::Pipes
+    };
+    exec_over(&mut channels, request, attach, input, out, err).await
+}
+
+/// Runs `request` over the exec `channels` of its box (BOX-149): attached,
+/// with the command's stdio relayed; detached, with only the exec id on
+/// `out`; or with a terminal, the exec id on `err` and then the command's
+/// output on `out`. Returns the exit code to end with.
+pub(crate) async fn exec_over<C, O, E>(
+    channels: &mut C,
+    request: &BoxExecRequest,
+    attach: TtyAttach,
+    input: ExecInput,
+    out: &mut O,
+    err: &mut E,
+) -> Result<i32, anyhow::Error>
+where
+    C: ExecChannels,
+    O: tokio::io::AsyncWrite + Unpin,
+    E: tokio::io::AsyncWrite + Unpin,
+{
+    use minimald_rpc::exec::ExecMode;
+
+    let target = request.target.as_str();
     let started = std::time::Instant::now();
-    let channel = open_box_channel(&mut client, id, &request.target, &request.wire()).await?;
+    let channel = channels.open(&request.wire()).await?;
     match request.mode {
         ExecMode::Attached => {
             let relayed = relay_box_channel(channel, input, out, err, true).await?;
-            let status = relayed_status(&request.target, relayed, err).await?;
+            let status = relayed_status(target, relayed, err).await?;
             // The daemon ends an attached exec at its timeout with 124 and
             // says nothing more. Only a run that asked for a timeout, and
             // lasted that long, ended at it.
@@ -253,23 +352,20 @@ where
                 && status == i32::from(BoxExecTimedOut::EXIT_CODE)
                 && started.elapsed() >= std::time::Duration::from_secs(secs)
             {
-                return Err(BoxExecTimedOut::exec(&request.target, secs).into());
+                return Err(BoxExecTimedOut::exec(target, secs).into());
             }
             Ok(status)
         }
-        ExecMode::Detached => {
-            let exec_id = started_exec_id(&request.target, channel, err).await?;
-            match exec_id {
-                Ok(exec_id) => {
-                    out.write_all(format!("{exec_id}\n").as_bytes()).await?;
-                    out.flush().await?;
-                    Ok(0)
-                }
-                Err(status) => Ok(status),
+        ExecMode::Detached => match started_exec_id(target, channel, err).await? {
+            Ok(exec_id) => {
+                out.write_all(format!("{exec_id}\n").as_bytes()).await?;
+                out.flush().await?;
+                Ok(0)
             }
-        }
+            Err(status) => Ok(status),
+        },
         ExecMode::Tty => {
-            let exec_id = match started_exec_id(&request.target, channel, err).await? {
+            let exec_id = match started_exec_id(target, channel, err).await? {
                 Ok(exec_id) => exec_id,
                 Err(status) => return Ok(status),
             };
@@ -278,45 +374,24 @@ where
             let attach_wire = minimald_rpc::exec::ExecRequest::ExecAttach(exec_id.clone()).encode();
             let status = match attach {
                 TtyAttach::Pipes => {
-                    let channel =
-                        open_box_channel(&mut client, id, &request.target, &attach_wire).await?;
+                    let channel = channels.open(&attach_wire).await?;
                     let relayed = relay_box_channel(channel, input, out, err, false).await?;
-                    relayed_status(&request.target, relayed, err).await?
+                    relayed_status(target, relayed, err).await?
                 }
-                TtyAttach::Terminal => {
+                TtyAttach::Terminal { sock, id } => {
                     drop(input);
-                    attach_exec_terminal(sock, id, &attach_wire).await?
+                    attach_exec_terminal(&sock, id, &attach_wire).await?
                 }
             };
             // The attach ends with 124 for an exec that its timeout ended,
-            // or for a command that exited 124. The exec's stored end tells
-            // them apart.
+            // and for a command that exited 124. The exec's stored end
+            // tells them apart.
             if request.timeout_secs.is_some() && status == i32::from(BoxExecTimedOut::EXIT_CODE) {
-                return wait_box_exec(&mut client, id, &request.target, &exec_id, err).await;
+                return wait_exec_over(channels, target, &exec_id, err).await;
             }
             Ok(status)
         }
     }
-}
-
-/// Opens the channel that carries `wire` to the box `id`. A daemon that
-/// refuses the channel no longer has the box, or cannot run in it.
-async fn open_box_channel(
-    client: &mut client::Client,
-    id: boxes::SessionId,
-    target: &str,
-    wire: &str,
-) -> Result<russh::Channel<russh::client::Msg>, anyhow::Error> {
-    client
-        .open_session_exec_channel(id, wire, &minimald_rpc::taskenv::TaskEnv::default())
-        .await
-        .map_err(|error| {
-            tracing::warn!(%id, "the host refused the exec channel: {error:#}");
-            anyhow::anyhow!(
-                "The host of {target} refused to run the command. \
-                 Run `min box show {target}` to see the box."
-            )
-        })
 }
 
 /// What a channel relay saw: the exit status, and the stderr it held back
@@ -330,24 +405,25 @@ pub(crate) struct Relayed {
 /// to `out`, its stderr to `err`. With `hold_refusal`, a first stderr chunk
 /// that reads as the daemon's refusal is held back, so the caller can print
 /// the refusal in its own words. Any later output releases it.
-pub(crate) async fn relay_box_channel<O, E>(
-    mut channel: russh::Channel<russh::client::Msg>,
+async fn relay_box_channel<C, O, E>(
+    mut channel: C,
     input: ExecInput,
     out: &mut O,
     err: &mut E,
     hold_refusal: bool,
 ) -> Result<Relayed, anyhow::Error>
 where
+    C: ExecChannel,
     O: tokio::io::AsyncWrite + Unpin,
     E: tokio::io::AsyncWrite + Unpin,
 {
     let pump = match input {
         None => {
-            channel.eof().await.context("close the command's stdin")?;
+            channel.eof().await?;
             None
         }
         Some(mut rx) => {
-            let mut to_channel = channel.make_writer();
+            let mut to_channel = channel.input();
             // Both results are dropped: the command can end before it reads
             // all of its input, and the channel loop below sees that.
             Some(tokio::spawn(async move {
@@ -368,7 +444,9 @@ where
             russh::ChannelMsg::Data { data } => {
                 release_held(&mut held, err).await?;
                 seen_output = true;
-                out.write_all(&data).await.context("write the command's stdout")?;
+                out.write_all(&data)
+                    .await
+                    .context("write the command's stdout")?;
                 out.flush().await.context("write the command's stdout")?;
             }
             russh::ChannelMsg::ExtendedData { data, ext: 1 } => {
@@ -376,7 +454,9 @@ where
                     held.extend_from_slice(&data);
                 } else {
                     release_held(&mut held, err).await?;
-                    err.write_all(&data).await.context("write the command's stderr")?;
+                    err.write_all(&data)
+                        .await
+                        .context("write the command's stderr")?;
                     err.flush().await.context("write the command's stderr")?;
                 }
                 seen_output = true;
@@ -397,7 +477,9 @@ where
     E: tokio::io::AsyncWrite + Unpin,
 {
     if !held.is_empty() {
-        err.write_all(held).await.context("write the command's stderr")?;
+        err.write_all(held)
+            .await
+            .context("write the command's stderr")?;
         err.flush().await.context("write the command's stderr")?;
         held.clear();
     }
@@ -437,7 +519,11 @@ fn exec_refusal(target: &str, status: u32, held: &[u8]) -> Option<BoxExecRefusal
 /// The exit code a relayed channel ends with, or the refusal its held
 /// stderr makes. Held stderr that makes no refusal is the command's own,
 /// and goes to `err`. A channel that closed with no status ends with 1.
-async fn relayed_status<E>(target: &str, relayed: Relayed, err: &mut E) -> Result<i32, anyhow::Error>
+async fn relayed_status<E>(
+    target: &str,
+    relayed: Relayed,
+    err: &mut E,
+) -> Result<i32, anyhow::Error>
 where
     E: tokio::io::AsyncWrite + Unpin,
 {
@@ -457,12 +543,13 @@ where
 /// The exec id a tty or a detached exec start answered on `channel`, or
 /// the exit code of a start that ran nothing. The daemon's own words for
 /// a failed start go to `err`.
-async fn started_exec_id<E>(
+async fn started_exec_id<C, E>(
     target: &str,
-    channel: russh::Channel<russh::client::Msg>,
+    channel: C,
     err: &mut E,
 ) -> Result<Result<minimald_rpc::exec::ExecId, i32>, anyhow::Error>
 where
+    C: ExecChannel,
     E: tokio::io::AsyncWrite + Unpin,
 {
     let mut answer = Vec::new();
@@ -477,23 +564,26 @@ where
     Ok(Ok(exec_id))
 }
 
-/// Waits for the exec `exec_id` in the box `id` to end and returns its exit
-/// code, as BOX-149's wait gives it. An exec that its own timeout ended
-/// returns as a [`BoxExecTimedOut`]. The daemon's other words go to `err`.
-pub(crate) async fn wait_box_exec<E>(
-    client: &mut client::Client,
-    id: boxes::SessionId,
+/// Waits for the exec `exec_id` in the box of `channels` to end and returns
+/// its exit code, as BOX-149's wait gives it: the wait that `min box exec
+/// -t` makes for a 124, and that `min box wait <box> --exec <id>` makes. An
+/// exec that its own timeout ended returns as a [`BoxExecTimedOut`]. The
+/// daemon's other words go to `err`.
+pub(crate) async fn wait_exec_over<C, E>(
+    channels: &mut C,
     target: &str,
     exec_id: &minimald_rpc::exec::ExecId,
     err: &mut E,
 ) -> Result<i32, anyhow::Error>
 where
+    C: ExecChannels,
     E: tokio::io::AsyncWrite + Unpin,
 {
     let wire = minimald_rpc::exec::ExecRequest::ExecWait(exec_id.clone()).encode();
-    let channel = open_box_channel(client, id, target, &wire).await?;
+    let channel = channels.open(&wire).await?;
     let mut said = Vec::new();
-    let relayed = relay_box_channel(channel, None, &mut tokio::io::sink(), &mut said, false).await?;
+    let relayed =
+        relay_box_channel(channel, None, &mut tokio::io::sink(), &mut said, false).await?;
     let status = relayed_status(target, relayed, &mut said).await?;
     // The daemon's `timeout_message` says why a wait ended with 124.
     if status == i32::from(BoxExecTimedOut::EXIT_CODE)

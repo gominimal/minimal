@@ -1013,6 +1013,53 @@ mod tests {
         }
     }
 
+    /// BCLI-053: an exec that its own timeout ended ends the run with 124
+    /// in both output modes, and a machine-mode run answers it with the
+    /// `timeout` object. The exec refusals end with 2 and 5.
+    #[test]
+    fn exec_timeout_returns_124_from_exec_and_wait_exec_in_machine_mode() {
+        for timed_out in [
+            minimal::BoxExecTimedOut::exec("web", 30),
+            minimal::BoxExecTimedOut::waited("web", "0190a3c4-0000-7000-8000-000000000000"),
+        ] {
+            let e = anyhow::Error::new(timed_out.clone());
+            assert_eq!(failure_exit_code(&e), 124);
+            match machine_mode_answer(&e) {
+                MachineModeAnswer::Object(failure) => {
+                    assert_eq!(failure.code(), "timeout");
+                    assert_eq!(failure.message(), timed_out.to_string());
+                    assert_eq!(failure.hint(), timed_out.hint());
+                }
+                MachineModeAnswer::Quiet => panic!("a timeout is an error object"),
+            }
+            let mut stderr = Vec::new();
+            assert_eq!(
+                answer_failure(&e, true, false, &mut stderr),
+                ExitCode::from(124)
+            );
+            let line = String::from_utf8(stderr).unwrap();
+            assert!(line.contains(r#""code":"timeout""#), "{line}");
+        }
+        let target = "web".to_string();
+        for (refusal, code) in [
+            (
+                minimal::BoxExecRefusal::NotRunning {
+                    target: target.clone(),
+                },
+                2,
+            ),
+            (
+                minimal::BoxExecRefusal::ExecDisabled {
+                    target: target.clone(),
+                },
+                5,
+            ),
+            (minimal::BoxExecRefusal::SpecUnreadable { target }, 5),
+        ] {
+            assert_eq!(failure_exit_code(&anyhow::Error::new(refusal)), code);
+        }
+    }
+
     /// #1790: a VM host that could not be reached ends the run with 7 —
     /// provider/host unreachable — found through every context the
     /// activation adds over it, and a machine-mode run answers it with the
