@@ -929,6 +929,109 @@ fn declared_by(packages: &BTreeMap<String, String>, declared: &str, task: &str) 
     }
 }
 
+/// A patch path in the session home that passes through a symbolic link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SymlinkedPatch {
+    /// The link, relative to the home: the patch path itself or a parent.
+    pub(crate) link: PathBuf,
+    /// Where the link points, when it could be read.
+    pub(crate) target: Option<PathBuf>,
+}
+
+/// Finds the first symbolic link on `path` below `home`, walking one
+/// component at a time without following any link (inbox#1129).
+///
+/// The rule is no links at all, not no escapes: a link that stays inside the
+/// home is refused too, because the sandbox resolves the mount point through
+/// it against a different root than the bind source. A path outside `home`
+/// is not the box's to change and is not checked. The walk stops at the first
+/// component that does not exist: a read-write patch creates the rest, and
+/// nothing below a missing directory can be a link yet.
+///
+/// The check runs before the sandbox mounts, so a box that swaps a directory
+/// for a link in between is not caught here. It closes the case the lab
+/// reproduces, a link the box made before the task was asked for.
+pub(crate) fn find_symlinked_patch(
+    home: &Path,
+    path: &Path,
+) -> std::io::Result<Option<SymlinkedPatch>> {
+    let Ok(rel) = path.strip_prefix(home) else {
+        return Ok(None);
+    };
+    let mut at = home.to_path_buf();
+    let mut link = PathBuf::new();
+    for component in rel.components() {
+        at.push(component);
+        link.push(component);
+        match std::fs::symlink_metadata(&at) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Ok(Some(SymlinkedPatch {
+                    link,
+                    target: std::fs::read_link(&at).ok(),
+                }));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(None)
+}
+
+/// The refusal for a patch through a symbolic link: the patch as declared,
+/// who declared it, the link and its target, and the one way out.
+pub(crate) fn symlinked_patch_refusal(found: &SymlinkedPatch, declared: &str, by: &str) -> String {
+    let link = found.link.display();
+    let target = found
+        .target
+        .as_ref()
+        .map(|t| format!(" to `{}`", t.display()))
+        .unwrap_or_default();
+    format!(
+        "refused the patch `{declared}` from {by}: `~/{link}` in the session's home is a \
+         symbolic link{target}. A patch is never mounted through a symbolic link. Replace \
+         `~/{link}` in the session with a real directory or file."
+    )
+}
+
+/// Refuses the first patch whose path in the session home passes through a
+/// symbolic link, naming the patch as it was declared (inbox#1129).
+fn refuse_symlinked_patches(
+    home: &Path,
+    fs_mappings: &[common::FsMapping],
+    declarations: &BTreeMap<String, Vec<DeclaredMapping<'_>>>,
+    packages: &BTreeMap<String, String>,
+    task: &str,
+) -> Result<(), Error> {
+    for mapping in fs_mappings {
+        let path = Path::new(&mapping.host_path);
+        let found = find_symlinked_patch(home, path).map_err(|e| {
+            Error::IO(
+                "checking a patch path for symbolic links",
+                path.to_path_buf(),
+                e,
+            )
+        })?;
+        let Some(found) = found else { continue };
+        let declared = declarations
+            .get(&mapping.host_path)
+            .and_then(|d| d.first())
+            .map_or(mapping.host_path.as_str(), |d| d.declared.as_str());
+        let by = declared_by(packages, declared, task);
+        tracing::warn!(
+            task,
+            patch = declared,
+            link = %found.link.display(),
+            "refusing a patch through a symbolic link in the session home"
+        );
+        return Err(Error::Other(anyhow::anyhow!(
+            "{}",
+            symlinked_patch_refusal(&found, declared, &by)
+        )));
+    }
+    Ok(())
+}
+
 /// One declared patch entry that shares an expanded host path with
 /// possibly other entries. A directory mapping and a file mapping can
 /// expand to the same path — `Config::validate` processes directories
@@ -1132,6 +1235,24 @@ impl<'a> Env<'a> {
                 declarations.entry(expanded).or_default().push(mapping);
                 declarations
             });
+
+        // A box owns its home, so code it runs can turn any path there into a
+        // symbolic link. The sandbox follows such a link for the bind source
+        // and resolves the mount point through it as well, so a patch through
+        // a link is mounted somewhere other than where it was declared, or the
+        // task fails to start with nothing said (inbox#1129). Only a session
+        // home is the box's; an ambient home is the invoking user's own.
+        if matches!(args.home, PatchHome::Session(_))
+            && let Some(home) = home.as_deref()
+        {
+            refuse_symlinked_patches(
+                home,
+                &fs_mappings,
+                &declarations,
+                &fs_mapping_packages,
+                args.name,
+            )?;
+        }
 
         let mut config = apply_wd_layout(
             sandbox::config::Config::new(args.name),
@@ -1438,6 +1559,130 @@ mod tests {
     /// that only the task's own `patch` table names falls back to the task.
     /// The attribution is what makes a failure to map `~/.claude.json`
     /// actionable — the path alone doesn't say who asked for it (#1204).
+    /// A home with a plain directory, a final link, a link through a parent
+    /// and a link that stays inside the home (inbox#1129).
+    fn linked_home() -> TempDir {
+        let home = tempdir().unwrap();
+        let h = home.path();
+        std::fs::create_dir_all(h.join("plain/inner")).unwrap();
+        std::os::unix::fs::symlink("/etc", h.join("e810")).unwrap();
+        std::os::unix::fs::symlink("/tmp", h.join("l810")).unwrap();
+        std::fs::create_dir(h.join("real")).unwrap();
+        std::os::unix::fs::symlink(h.join("real"), h.join("h810")).unwrap();
+        home
+    }
+
+    #[test]
+    fn a_plain_directory_patch_is_not_refused() {
+        let home = linked_home();
+        let h = home.path();
+        assert_eq!(find_symlinked_patch(h, &h.join("plain")).unwrap(), None);
+        assert_eq!(
+            find_symlinked_patch(h, &h.join("plain/inner")).unwrap(),
+            None
+        );
+        assert_eq!(
+            find_symlinked_patch(h, &h.join("plain/missing/deeper")).unwrap(),
+            None,
+            "a path that does not exist yet has no link on it"
+        );
+        assert_eq!(
+            find_symlinked_patch(h, Path::new("/etc/hostname")).unwrap(),
+            None,
+            "a path outside the home is not the box's and is not checked"
+        );
+    }
+
+    #[test]
+    fn a_final_component_symlink_is_refused() {
+        let home = linked_home();
+        let h = home.path();
+        assert_eq!(
+            find_symlinked_patch(h, &h.join("e810")).unwrap(),
+            Some(SymlinkedPatch {
+                link: "e810".into(),
+                target: Some("/etc".into())
+            })
+        );
+    }
+
+    #[test]
+    fn a_symlinked_parent_is_refused() {
+        let home = linked_home();
+        let h = home.path();
+        let found = find_symlinked_patch(h, &h.join("l810/out810p-1")).unwrap();
+        assert_eq!(
+            found,
+            Some(SymlinkedPatch {
+                link: "l810".into(),
+                target: Some("/tmp".into())
+            }),
+            "the link named is the parent, not the patch path"
+        );
+    }
+
+    #[test]
+    fn a_symlink_inside_the_home_is_still_refused() {
+        let home = linked_home();
+        let h = home.path();
+        let found = find_symlinked_patch(h, &h.join("h810")).unwrap();
+        assert_eq!(
+            found.map(|f| f.link),
+            Some(PathBuf::from("h810")),
+            "the rule is no links, not no escapes"
+        );
+    }
+
+    #[test]
+    fn the_refusal_names_the_patch_and_the_link() {
+        let found = SymlinkedPatch {
+            link: "l810".into(),
+            target: Some("/tmp".into()),
+        };
+        assert_eq!(
+            symlinked_patch_refusal(&found, "~/l810/out810p-1", "task `parent`"),
+            "refused the patch `~/l810/out810p-1` from task `parent`: `~/l810` in the session's \
+             home is a symbolic link to `/tmp`. A patch is never mounted through a symbolic \
+             link. Replace `~/l810` in the session with a real directory or file."
+        );
+    }
+
+    #[test]
+    fn refuse_symlinked_patches_names_the_declaration() {
+        let home = linked_home();
+        let h = home.path();
+        let patches = EnvPatches {
+            dir: [
+                ("~/plain".to_string(), mfile::PatchSetting::ReadOnly),
+                (
+                    "~/l810/out810p-1".to_string(),
+                    mfile::PatchSetting::ReadWrite,
+                ),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let mappings = patches.to_fs_mappings(Some(h)).unwrap();
+        let declared = "~/l810/out810p-1".to_string();
+        let declarations = BTreeMap::from([(
+            format!("{}/l810/out810p-1", h.display()),
+            vec![DeclaredMapping {
+                declared: &declared,
+                is_file: false,
+                read_only: false,
+            }],
+        )]);
+        let err = refuse_symlinked_patches(h, &mappings, &declarations, &BTreeMap::new(), "parent")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("refused the patch `~/l810/out810p-1` from task `parent`")
+                && err.contains("`~/l810`")
+                && err.contains("symbolic link"),
+            "got: {err}"
+        );
+    }
+
     #[test]
     fn declared_by_names_the_package_then_the_task() {
         let packages =
