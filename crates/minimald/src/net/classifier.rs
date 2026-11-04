@@ -8439,36 +8439,95 @@ mod tests {
         assert_eq!(moves.where_is(60), homes[0]);
     }
 
-    /// A stand-in `nft` and `iptables-save` in `dir`, for the install's
-    /// conflict scan: `nft list ruleset` prints `ruleset`, `iptables-save`
-    /// prints `legacy`, a JSON listing fails as it does over no table, and
-    /// a load reads its transaction and succeeds.
-    fn host_ruleset_tools(dir: &Path, ruleset: &str, legacy: &str) {
+    /// What the stand-in host tools print for the install's conflict scan.
+    struct HostTools<'a> {
+        /// `nft list ruleset`.
+        ruleset: &'a str,
+        /// `nft -a --debug=netlink list ruleset`; `ruleset` when `None`.
+        annotated: Option<&'a str>,
+        /// `iptables-save`, and `ip6tables-save` (empty for none).
+        v4: &'a str,
+        v6: &'a str,
+        /// Whether the two save tools report the nf_tables backend; the
+        /// legacy one otherwise.
+        nf_tables: bool,
+    }
+
+    /// The stand-in host tools in `dir`, for the install's conflict scan:
+    /// `nft list ruleset` and its annotated form print what `tools` says, a
+    /// JSON listing fails as it does over no table, and a load reads its
+    /// transaction and succeeds. `iptables-save` and `ip6tables-save` print
+    /// their listings and name their backend for `--version`, and the
+    /// `-nft-save` pair answers for the nf_tables backend alone, so no real
+    /// tool on the test host's PATH is read.
+    fn host_tools(dir: &Path, tools: &HostTools<'_>) {
         use std::os::unix::fs::PermissionsExt;
-        let listing = dir.join("ruleset");
-        let saved = dir.join("legacy");
-        std::fs::write(&listing, ruleset).expect("writing the stand-in ruleset");
-        std::fs::write(&saved, legacy).expect("writing the stand-in iptables-save listing");
-        let nft = dir.join("nft");
-        std::fs::write(
-            &nft,
+        let file = |name: &str, body: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, body).expect("writing a stand-in listing");
+            path
+        };
+        let listing = file("ruleset", tools.ruleset);
+        let annotated = file("annotated", tools.annotated.unwrap_or(tools.ruleset));
+        let mut written = vec![(
+            "nft".to_string(),
             format!(
                 "#!/bin/sh\n\
                  if [ \"$1 $2\" = 'list ruleset' ]; then cat '{}'; exit 0; fi\n\
+                 if [ \"$*\" = '-a --debug=netlink list ruleset' ]; then cat '{}'; exit 0; fi\n\
                  if [ \"$1\" = -j ]; then exit 1; fi\n\
                  cat >/dev/null\n\
                  exit 0\n",
-                listing.display()
+                listing.display(),
+                annotated.display()
             ),
-        )
-        .expect("writing the stand-in nft");
-        let save = dir.join("iptables-save");
-        std::fs::write(&save, format!("#!/bin/sh\ncat '{}'\n", saved.display()))
-            .expect("writing the stand-in iptables-save");
-        for tool in [nft, save] {
+        )];
+        let backend = if tools.nf_tables {
+            "nf_tables"
+        } else {
+            "legacy"
+        };
+        for (stem, body) in [("iptables", tools.v4), ("ip6tables", tools.v6)] {
+            let saved = file(&format!("{stem}-listing"), body);
+            written.push((
+                format!("{stem}-save"),
+                format!(
+                    "#!/bin/sh\n\
+                     if [ \"$1\" = --version ]; then echo '{stem}-save v1.8.11 ({backend})'; exit 0; fi\n\
+                     cat '{}'\n",
+                    saved.display()
+                ),
+            ));
+            written.push((
+                format!("{stem}-nft-save"),
+                if tools.nf_tables {
+                    format!("#!/bin/sh\ncat '{}'\n", saved.display())
+                } else {
+                    "#!/bin/sh\nexit 1\n".to_string()
+                },
+            ));
+        }
+        for (name, body) in written {
+            let tool = dir.join(name);
+            std::fs::write(&tool, body).expect("writing a stand-in tool");
             std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755))
                 .expect("the stand-in tool is executable");
         }
+    }
+
+    /// [`host_tools`] over `ruleset` with no netlink form, and a legacy
+    /// `iptables-save` that prints `legacy`.
+    fn host_ruleset_tools(dir: &Path, ruleset: &str, legacy: &str) {
+        host_tools(
+            dir,
+            &HostTools {
+                ruleset,
+                annotated: None,
+                v4: legacy,
+                v6: "",
+                nf_tables: false,
+            },
+        );
     }
 
     /// The install's whole output, stdout and stderr, for the assertions.
@@ -8703,6 +8762,184 @@ mod tests {
                 "`ct mark set {value}` writes every bit: {text}"
             );
         }
+    }
+
+    /// One family's mangle table as `nft -a --debug=netlink list ruleset`
+    /// prints Tailscale's connmark rules through iptables-nft: the netlink
+    /// form first, where the CONNMARK is an xt compat target, then the text
+    /// with each rule's handle. The OUTPUT block is the dump a host printed
+    /// on gominimal/inbox#1201.
+    fn tailscale_annotated(family: &str) -> String {
+        format!(
+            "# Warning: table {family} mangle is managed by iptables-nft, do not touch!\n\
+             {family} mangle PREROUTING 3\n\
+             \x20 [ match name conntrack rev 3 ]\n\
+             \x20 [ match name connmark rev 1 ]\n\
+             \x20 [ counter pkts 0 bytes 0 ]\n\
+             \x20 [ target name CONNMARK rev 2 ]\n\
+             \n\
+             {family} mangle OUTPUT 4\n\
+             \x20 [ match name conntrack rev 3 ]\n\
+             \x20 [ meta load mark => reg 1 ]\n\
+             \x20 [ bitwise reg 1 = ( reg 1 & 0x00ff0000 ) ^ 0x00000000 ]\n\
+             \x20 [ cmp neq reg 1 0x00000000 ]\n\
+             \x20 [ counter pkts 42812 bytes 3343056 ]\n\
+             \x20 [ target name CONNMARK rev 2 ]\n\
+             \n\
+             table {family} mangle {{ # handle 1\n\
+             \tchain PREROUTING {{ # handle 1\n\
+             \t\ttype filter hook prerouting priority mangle; policy accept;\n\
+             \t\tct state related,established ct mark and 0xff0000 != 0x0 counter packets 0 bytes 0 meta mark set ct mark and 0xff0000 # handle 3\n\
+             \t}}\n\
+             \tchain OUTPUT {{ # handle 2\n\
+             \t\ttype route hook output priority mangle; policy accept;\n\
+             \t\tct state new meta mark & 0x00ff0000 != 0x00000000 counter packets 42812 bytes 3343056 ct mark set mark and 0xff0000 # handle 4\n\
+             \t}}\n\
+             }}\n"
+        )
+    }
+
+    /// One family's mangle OUTPUT with a single CONNMARK that libxtables
+    /// cannot translate, as `nft -a --debug=netlink list ruleset` prints it.
+    fn untranslated_connmark_annotated(family: &str) -> String {
+        format!(
+            "{family} mangle OUTPUT 4\n\
+             \x20 [ counter pkts 0 bytes 0 ]\n\
+             \x20 [ target name CONNMARK rev 2 ]\n\
+             \n\
+             table {family} mangle {{ # handle 1\n\
+             \tchain OUTPUT {{ # handle 2\n\
+             \t\ttype route hook output priority mangle; policy accept;\n\
+             \t\tcounter packets 0 bytes 0 xt target \"CONNMARK\" # handle 4\n\
+             \t}}\n\
+             }}\n"
+        )
+    }
+
+    /// A mangle OUTPUT as iptables-save prints it, holding `rule`.
+    fn mangle_output_save(rule: &str) -> String {
+        format!("*mangle\n:OUTPUT ACCEPT [0:0]\n-A OUTPUT {rule}\nCOMMIT\n")
+    }
+
+    /// NET-079: a rule iptables-nft wrote is an xt compat target in the
+    /// kernel, and its nft text is libxtables' display of it, so the scan
+    /// reads its masks from the nf_tables iptables-save and ip6tables-save
+    /// listings. Tailscale's rules, v4 and v6, install; a CONNMARK that
+    /// libxtables cannot translate is decoded from its saved masks, in
+    /// either family; and a CONNMARK no listing shows is refused.
+    #[test]
+    fn install_reads_xt_connmark_masks_from_iptables_save() {
+        let tailscale = format!(
+            "{}{}",
+            tailscale_annotated("ip"),
+            tailscale_annotated("ip6")
+        );
+        let tailscale_text = TAILSCALE_CONNMARK_NFT;
+        let run = |tools: &HostTools<'_>| {
+            let mount = standin_mount();
+            let dir = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+            host_tools(dir.path(), tools);
+            let ran = run_install_with(&mount, &[], dir.path());
+            let text = said(&ran);
+            (ran.status.success(), text)
+        };
+
+        let (installed, text) = run(&HostTools {
+            ruleset: tailscale_text,
+            annotated: Some(&tailscale),
+            v4: TAILSCALE_CONNMARK_SAVE,
+            v6: TAILSCALE_CONNMARK_SAVE,
+            nf_tables: true,
+        });
+        assert!(
+            installed,
+            "Tailscale's xt CONNMARK rules, read from iptables-save and ip6tables-save, do not block the install: {text}"
+        );
+
+        // With no iptables-save listing, the scan cannot see which bits a
+        // CONNMARK keeps, and refuses it in both families.
+        let (installed, text) = run(&HostTools {
+            ruleset: tailscale_text,
+            annotated: Some(&tailscale),
+            v4: "",
+            v6: "",
+            nf_tables: true,
+        });
+        assert!(!installed, "an unlisted CONNMARK is refused: {text}");
+        for family in ["ip", "ip6"] {
+            assert!(
+                text.contains(&format!(
+                    "table {family} mangle, chain OUTPUT: ct state new meta mark & 0x00ff0000 != 0x00000000 counter packets 42812 bytes 3343056 ct mark set mark and 0xff0000 (an iptables rule whose masks iptables-save did not list)"
+                )),
+                "the refusal names the {family} rule without its handle: {text}"
+            );
+        }
+        assert!(
+            text.contains(
+                "refusing to install over an iptables CONNMARK rule whose masks this step cannot read, so it may write the bits this install uses. Install iptables with its nf_tables backend, so that iptables-save and ip6tables-save list the rule, then run min finalize-install again."
+            ),
+            "the refusal names the listing as the remedy: {text}"
+        );
+
+        // A CONNMARK libxtables cannot translate (nfmask != ctmask), read
+        // from its saved masks: refused when its --ctmask covers the
+        // default bits 0x30000000, installed when it does not.
+        for (family, ctmask, refused) in [
+            ("ip", "0x30ff0000", true),
+            ("ip", "0x00ffff00", false),
+            ("ip6", "0x30ff0000", true),
+            ("ip6", "0x00ffff00", false),
+        ] {
+            let annotated = untranslated_connmark_annotated(family);
+            let saved = mangle_output_save(&format!(
+                "-j CONNMARK --save-mark --nfmask 0xff0000 --ctmask {ctmask}"
+            ));
+            let (v4, v6) = if family == "ip" {
+                (saved.as_str(), "")
+            } else {
+                ("", saved.as_str())
+            };
+            let (installed, text) = run(&HostTools {
+                ruleset: "",
+                annotated: Some(&annotated),
+                v4,
+                v6,
+                nf_tables: true,
+            });
+            assert_eq!(
+                !installed, refused,
+                "a {family} CONNMARK with --ctmask {ctmask} refused: {text}"
+            );
+            if refused {
+                let saver = if family == "ip" {
+                    "iptables"
+                } else {
+                    "ip6tables"
+                };
+                assert!(
+                    text.contains(&format!(
+                        "{saver} table mangle, chain OUTPUT: -A OUTPUT -j CONNMARK --save-mark --nfmask 0xff0000 --ctmask {ctmask}"
+                    )) && text.contains("refusing to install over another ct-mark user"),
+                    "the refusal names the saved rule and a mask to choose: {text}"
+                );
+            }
+        }
+
+        // An IPv6-only CONNMARK with only an IPv4 listing is not covered.
+        let annotated = untranslated_connmark_annotated("ip6");
+        let saved =
+            mangle_output_save("-j CONNMARK --save-mark --nfmask 0xff0000 --ctmask 0x00ffff00");
+        let (installed, text) = run(&HostTools {
+            ruleset: "",
+            annotated: Some(&annotated),
+            v4: &saved,
+            v6: "",
+            nf_tables: true,
+        });
+        assert!(
+            !installed && text.contains("table ip6 mangle, chain OUTPUT: counter packets 0 bytes 0 xt target \"CONNMARK\" (an iptables rule whose masks iptables-save did not list)"),
+            "an IPv6 CONNMARK with no ip6tables-save listing is refused: {text}"
+        );
     }
 
     /// NET-079: `--ct-mark-mask` refuses a mask in a range a well-known
