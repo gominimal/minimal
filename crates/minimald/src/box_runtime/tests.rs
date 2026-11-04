@@ -8244,10 +8244,12 @@ async fn box_output_logged_from_start_complete_after_disconnect() {
     let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
 }
 
-/// NET-046: an `ask` box with no switch address, on a VM host, is refused as
-/// not attached, and the VM host daemon still hears the decision. No audit
-/// route names a box with no switch, so the report carries the box's id in
-/// place of a switch address, over the box's own control channel.
+/// NET-046: a box with no switch address, on a VM host, asks to publish a
+/// port, is refused, and the VM host daemon still hears the decision. On a
+/// microVM the box with no switch is a `none` box: an `own_ip` box with no
+/// handed addresses is refused at create. No audit route names a box with no
+/// switch, so the report carries the box's id in place of a switch address,
+/// over the box's own control channel.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_switch_box_reports_expose_decision_by_id() {
     use crate::test_harness::unwrap_ready;
@@ -8257,15 +8259,20 @@ async fn no_switch_box_reports_expose_decision_by_id() {
     };
     let server = TestServer::new().await;
     let mut client = server.connect().await;
-    let mut request = crate::box_actor::tests::dynamic_ingress_session_req(
+    // A `none` box that declares no `dynamic_ingress`: the deny-all default
+    // decides its request.
+    let request = minimald_rpc::CreateSessionRequest::new(
         "web",
-        ASK_SWITCH,
-        ASK_LOOPBACK,
-        Some(boxes::DynamicIngress::Ask),
-        Some((3000, 3999)),
+        paths::HostAbsPath::try_new("/uwu").unwrap(),
+        boxes::NetworkMode::NoNet,
+        boxes::BoxPolicy {
+            egress: None,
+            ingress: None,
+            credentialed_upstream: None,
+            quic443: None,
+        },
     );
-    // The VM host handed this box no switch address.
-    request.config.box_addresses = None;
+    assert!(request.config.box_addresses.is_none());
     let id = client.call::<CreateSession>(&request).await.unwrap().id;
     unwrap_ready(
         client
@@ -8294,11 +8301,6 @@ async fn no_switch_box_reports_expose_decision_by_id() {
         .await
         .unwrap()
         .expect("the web box should resolve");
-    // The ask needs a host to route to, so the box launches one first.
-    handle
-        .ensure_host("tester".to_string())
-        .await
-        .expect("the ask box launches its host");
     let sock = handle
         .net_switch()
         .await
@@ -8313,9 +8315,9 @@ async fn no_switch_box_reports_expose_decision_by_id() {
 
     match handle.expose_dynamic(3000).await {
         Err(crate::net::policy::ExposeFailure::Refused(
-            crate::net::policy::ExposeRefusal::NotAttached,
+            crate::net::policy::ExposeRefusal::DeniedByPolicy,
         )) => {}
-        other => panic!("a box with no switch address is refused as not attached: {other:?}"),
+        other => panic!("a box that declares no dynamic ingress is refused: {other:?}"),
     }
 
     let report = tokio::time::timeout(Duration::from_secs(10), reports.recv())
@@ -8333,8 +8335,8 @@ async fn no_switch_box_reports_expose_decision_by_id() {
             switch_address: None,
             box_id: Some(id),
             port: 3000,
-            decision: boxes::DynamicIngress::Ask,
-            decided_by: minimald_rpc::ExposeDecidedBy::Daemon,
+            decision: boxes::DynamicIngress::Deny,
+            decided_by: minimald_rpc::ExposeDecidedBy::BoxPolicy,
             outcome: minimald_rpc::ExposeDecisionOutcome::Refused,
         }),
         "a box with no switch is named to the host by its id"
