@@ -1956,10 +1956,10 @@ async fn ensure_host_launches_an_unattached_host_and_then_reuses_it() {
     );
 }
 
-// T42: the actor reads the spec stored at creation, hands it to every
+// T42, T43: the actor reads the spec stored at creation, hands it to every
 // launcher it builds, and keeps its own hold, so a relaunch starts the box
-// from the same spec without reading the store again. Each launch says that
-// an exec carries the box's run, and the launcher then holds the shell.
+// from the same spec without reading the store again. A launch for hooks
+// holds the shell. Every other launch starts the spec's argv.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actor_hands_stored_spec_to_launcher_and_keeps_hold() {
     use minimald_rpc::{
@@ -1972,7 +1972,8 @@ async fn actor_hands_stored_spec_to_launcher_and_keeps_hold() {
 
     let mut spec = mfile::spec::BoxSpec::for_session(None, mfile::spec::SpecFlags::default());
     spec.lifetime = mfile::spec::Lifetime::UntilStopped;
-    spec.entrypoint = mfile::spec::Entrypoint::Exec(vec!["/bin/echo".to_string()]);
+    spec.entrypoint =
+        mfile::spec::Entrypoint::Exec(vec!["/bin/sleep".to_string(), "600".to_string()]);
     let mut req = crate::test_harness::create_session_req("spec-hold", "/tmp");
     req.spec = Some(serde_json_lenient::to_value(&spec).expect("a spec serializes"));
     let session_id = client.call::<CreateSession>(&req).await.unwrap().id;
@@ -2016,14 +2017,26 @@ async fn actor_hands_stored_spec_to_launcher_and_keeps_hold() {
     assert_eq!(*held, spec, "the stored spec, not a default");
     // Every launch, not only the exec's: a hook launch or an attach can come
     // before the exec that runs the box's command.
+    let argv = crate::box_runtime::LaunchEntrypoint::Argv {
+        program: "/bin/sleep".to_string(),
+        args: vec!["600".to_string()],
+    };
     for launch in &first {
-        assert!(launch.run_by_exec, "an exec carries the box's run");
+        let expected = if launch.for_hooks {
+            crate::box_runtime::LaunchEntrypoint::Shell
+        } else {
+            argv.clone()
+        };
         assert_eq!(
             launch.entrypoint().unwrap(),
-            crate::box_runtime::LaunchEntrypoint::Shell,
-            "the exec runs the box's command, so the launch holds the shell"
+            expected,
+            "a hook launch holds the shell, and any other starts the argv"
         );
     }
+    assert!(
+        !first.last().unwrap().for_hooks,
+        "the exec's launch is not a hook launch"
+    );
 
     // End the host, and have the next exec launch another one.
     host.kill(false).await.expect("the host takes the kill");
@@ -2043,7 +2056,11 @@ async fn actor_hands_stored_spec_to_launcher_and_keeps_hold() {
     let launches = crate::box_actor::launch_spec_seam::observed(session_id);
     assert_eq!(launches.len(), first.len() + 1, "one more launch");
     let relaunch = launches.last().unwrap();
-    assert!(relaunch.run_by_exec, "the relaunch holds the shell too");
+    assert_eq!(
+        relaunch.entrypoint().unwrap(),
+        argv,
+        "the relaunch starts the argv too"
+    );
     let relaunch = relaunch.spec.clone().expect("a spec");
     assert!(
         std::sync::Arc::ptr_eq(&relaunch, &held),

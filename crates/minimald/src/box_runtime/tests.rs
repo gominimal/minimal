@@ -7527,9 +7527,9 @@ fn launcher_starts_session_and_task_entrypoints_from_spec_without_logging_args()
     assert_eq!(LaunchEntrypoint::Shell.arg_count(), 0);
 }
 
-// T42: one launcher reads the box's first process from its spec. A
+// T42, T43: one launcher reads the box's first process from its spec. A
 // session's spec starts its login shell. A task's spec starts its argv,
-// unless an exec carries the box's run, because that exec runs the task.
+// except on a launch minted only for hooks, which holds the shell.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn launcher_starts_session_and_task_entrypoints_from_spec() {
     use mfile::spec::{BoxSpec, Entrypoint, SpecFlags};
@@ -7541,7 +7541,7 @@ async fn launcher_starts_session_and_task_entrypoints_from_spec() {
         BoxSpec::for_task("lint", &task, SpecFlags::default())
             .expect("a task that is not interactive has a spec"),
     );
-    let launch = |spec: Option<Arc<BoxSpec>>, run_by_exec: bool| LaunchSpec { spec, run_by_exec };
+    let launch = |spec: Option<Arc<BoxSpec>>, for_hooks: bool| LaunchSpec { spec, for_hooks };
 
     // The decision, for every kind of launch.
     assert_eq!(
@@ -7559,7 +7559,7 @@ async fn launcher_starts_session_and_task_entrypoints_from_spec() {
     assert_eq!(
         launch(Some(task.clone()), true).entrypoint().unwrap(),
         LaunchEntrypoint::Shell,
-        "an exec carries the task's run, so the box holds its shell"
+        "a hook launch holds the shell, so the task does not run before its hooks"
     );
     assert_eq!(
         launch(None, false).entrypoint().unwrap(),
@@ -8118,7 +8118,7 @@ async fn box_output_logged_from_start_complete_after_disconnect_past_cap_keeps_n
     spec.entrypoint = Entrypoint::Exec(vec!["/bin/sh".to_string(), "-c".to_string(), script]);
     let launcher = MockLauncher::default().and_spec(LaunchSpec {
         spec: Some(Arc::new(spec)),
-        run_by_exec: false,
+        for_hooks: false,
     });
     let (host, handle) = Host::build(launcher, stored.params())
         .await
@@ -8176,7 +8176,7 @@ async fn box_output_logged_from_start_complete_after_disconnect() {
     spec.entrypoint = Entrypoint::Exec(vec!["/bin/sh".to_string(), "-c".to_string(), script]);
     let launcher = MockLauncher::default().and_spec(LaunchSpec {
         spec: Some(Arc::new(spec)),
-        run_by_exec: false,
+        for_hooks: false,
     });
     let (host, handle) = Host::build(launcher, stored.params())
         .await

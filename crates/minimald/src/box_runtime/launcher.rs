@@ -155,16 +155,12 @@ pub(crate) struct LaunchSpec {
     /// The spec stored beside the box's record (BOX-068). `None` for a box
     /// filed with no spec: a client that predates it, or the dashboard.
     pub(crate) spec: Option<std::sync::Arc<mfile::spec::BoxSpec>>,
-    /// Whether an exec runs the command the box is for. When it is set, the
-    /// launch starts the shell, whatever entrypoint the spec names.
-    ///
-    /// Interim: the box's actor sets this to `true` on every launch, a hook
-    /// launch and an attach included. `min task run` sends a task's run
-    /// over the exec channel, so a task box starts the shell and not its
-    /// spec's argv, and the task runs once. Flip condition: T43 (#2405)
-    /// moves a task's run from the exec channel to the box's entrypoint,
-    /// and removes the constant.
-    pub(crate) run_by_exec: bool,
+    /// Whether the launch is minted only for lifecycle hooks. A hook
+    /// launch starts the shell, whatever entrypoint the spec names: the
+    /// hooks need the box, and a task's argv must not run before its
+    /// activate hooks end. Every other launch starts the spec's
+    /// entrypoint, so a task box runs its task as its first process (T43).
+    pub(crate) for_hooks: bool,
 }
 
 /// The first process a launch starts, as [`LaunchSpec::entrypoint`]
@@ -202,7 +198,7 @@ impl LaunchEntrypoint {
 impl LaunchSpec {
     /// The one place a launch decides its box's first process (T42):
     ///
-    /// - a box with no spec, and a box whose run an exec carries, start the
+    /// - a box with no spec, and a launch minted only for hooks, start the
     ///   shell;
     /// - otherwise the spec's entrypoint: the shell, or its argv.
     ///
@@ -219,7 +215,7 @@ impl LaunchSpec {
         };
         match &spec.entrypoint {
             mfile::spec::Entrypoint::Shell => Ok(LaunchEntrypoint::Shell),
-            mfile::spec::Entrypoint::Exec(_) if self.run_by_exec => Ok(LaunchEntrypoint::Shell),
+            mfile::spec::Entrypoint::Exec(_) if self.for_hooks => Ok(LaunchEntrypoint::Shell),
             mfile::spec::Entrypoint::Exec(argv) => {
                 let Some((program, args)) = argv.split_first() else {
                     return Err(io::Error::new(

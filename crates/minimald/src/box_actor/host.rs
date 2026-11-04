@@ -336,6 +336,50 @@ pub(super) fn watch_quic443_exit(
     })
 }
 
+/// The variables a task run hands the next entrypoint launch of its box
+/// (T43). `min task run` resolves a task's `env_vars` against the caller's
+/// shell and sends them on the run's exec channel. The box's entrypoint is
+/// the in-box `min task run`, which fills the task's `inherit` variables
+/// from its own environment, so the values must reach the launch that
+/// starts it. The exec stages them here by box id, and the next
+/// [`BoxActor::ensure_host`] of the box takes them, whether it launches or
+/// not, so no value outlives the run it was sent for.
+///
+/// Interim: a seam beside the actor, because the actor's `EnsureHost`
+/// message carries no environment. The values move into that message
+/// when it gains one.
+pub(crate) mod entrypoint_env {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+
+    /// The variables staged for one box.
+    type Vars = Vec<(String, String)>;
+
+    static STAGED: LazyLock<Mutex<HashMap<boxes::SessionId, Vars>>> = LazyLock::new(Mutex::default);
+
+    /// Stages `vars` for the next entrypoint launch of box `id`, in place
+    /// of any staged before.
+    pub(crate) fn stage(id: boxes::SessionId, vars: Vars) {
+        let mut staged = STAGED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if vars.is_empty() {
+            staged.remove(&id);
+        } else {
+            staged.insert(id, vars);
+        }
+    }
+
+    /// Takes what is staged for box `id`: empty when nothing is.
+    pub(crate) fn take(id: &boxes::SessionId) -> Vars {
+        STAGED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id)
+            .unwrap_or_default()
+    }
+}
+
 /// The actor's end of an [`watch_entrypoint_exit`] watch: it receives how
 /// the watched host's runtime loop ended, once, when it ends with an exit.
 pub(super) type EntrypointWatch = tokio::sync::oneshot::Receiver<box_runtime::HostExit>;
@@ -865,16 +909,10 @@ impl BoxActor {
                 ),
             ))
         })?;
-        // Interim: `run_by_exec` is `true` on every launch, so every launch,
-        // a hook launch and an attach included, starts the shell, and a task
-        // box does not start its spec's argv. `min task run` sends the task's
-        // run over the exec channel, so the shell keeps the task to one run.
-        // Flip condition: T43 (#2405) moves a task's run from the exec
-        // channel to the box's entrypoint, and removes this constant.
-        let spec = box_runtime::LaunchSpec {
-            spec,
-            run_by_exec: true,
-        };
+        // A hook launch holds the shell. Every other launch starts the
+        // spec's entrypoint, so a task box runs its task as its first
+        // process, and the box ends when that process returns (BOX-038).
+        let spec = box_runtime::LaunchSpec { spec, for_hooks };
         // Read before the launcher takes the spec: the host hands it to each
         // binding, which raises no shell-exit prompt for a box that ends.
         let ends_with_entrypoint = ends_with_entrypoint(spec.spec.as_deref());
@@ -1257,7 +1295,9 @@ impl BoxActor {
         session_hnd: BoxHandle,
         conn_username: String,
     ) -> Result<box_runtime::HostHandle, AttachError> {
-        {
+        // Taken first, so a staged value never waits for a later launch.
+        let staged_env = entrypoint_env::take(self.record.id());
+        let holds_host_row = {
             let record = self
                 .record
                 .record()
@@ -1295,7 +1335,8 @@ impl BoxActor {
             if self.host_row_lost(&record).await {
                 return Err(AttachError::BoxHostRowEnded);
             }
-        }
+            record.box_addresses.is_some()
+        };
 
         let running = match &self.inner {
             BoxInner::Draft { .. } => return Err(AttachError::SessionPending),
@@ -1305,14 +1346,42 @@ impl BoxActor {
             BoxInner::Active { .. } => None,
         };
         if let Some(host) = running {
-            // Same claim as the launch below, for a host this call did not
-            // mint: an exec is about to run in this sandbox, so a later
-            // attach must not replace the shell out from under it. Without
-            // this, a host minted for lifecycle hooks stays `Hooks` through
-            // every exec that reuses it, and the first interactive attach
-            // would respawn it — killing a command that is still running.
-            self.host_origin = HostOrigin::Exec;
-            return Ok(host);
+            // A hook launch holds the shell, never the spec's argv. A box
+            // whose entrypoint is an argv, a task box, replaces that shell
+            // with its entrypoint here, or the task never runs. A box that
+            // holds a host-side row keeps it, as an attach keeps it.
+            let replace = self.host_origin == HostOrigin::Hooks && self.starts_argv().await;
+            if replace && !holds_host_row {
+                tracing::info!(
+                    box_id = %self.record.id(),
+                    "replacing the hook-launched shell with the box's entrypoint"
+                );
+                if let BoxInner::Active {
+                    host: slot @ Some(_),
+                    ..
+                } = &mut self.inner
+                {
+                    let (handle, mut join) = slot.take().expect("matched on Some");
+                    Self::kill_and_stop_loop(&handle, &mut join, false).await;
+                }
+            } else {
+                if replace {
+                    tracing::warn!(
+                        box_id = %self.record.id(),
+                        "kept the hook-launched shell: replacing it would end the box's \
+                         host-side row, so the box's entrypoint does not start"
+                    );
+                }
+                // Same claim as the launch below, for a host this call did
+                // not mint: an exec is about to run in this sandbox, so a
+                // later attach must not replace the shell out from under
+                // it. Without this, a host minted for lifecycle hooks stays
+                // `Hooks` through every exec that reuses it, and the first
+                // interactive attach would respawn it — killing a command
+                // that is still running.
+                self.host_origin = HostOrigin::Exec;
+                return Ok(host);
+            }
         }
 
         let (_, launched) = self
@@ -1320,7 +1389,10 @@ impl BoxActor {
                 session_hnd,
                 conn_username,
                 UNATTACHED_WIN_SIZE,
-                box_runtime::AttachEnv::default(),
+                box_runtime::AttachEnv {
+                    inherited: Vec::new(),
+                    connection: staged_env,
+                },
                 None,
                 LaunchPhase::Attached,
                 false,
@@ -1337,6 +1409,23 @@ impl BoxActor {
         self.host_origin = HostOrigin::Exec;
         self.publish_host();
         Ok(host)
+    }
+
+    /// Whether a launch of this box that is not for hooks starts an argv,
+    /// not the shell: the spec names an argv entrypoint. A spec that cannot
+    /// be read says no here, and the launch refuses it.
+    async fn starts_argv(&mut self) -> bool {
+        let Ok(spec) = self.held_spec().await else {
+            return false;
+        };
+        let launch = box_runtime::LaunchSpec {
+            spec,
+            for_hooks: false,
+        };
+        matches!(
+            launch.entrypoint(),
+            Ok(box_runtime::LaunchEntrypoint::Argv { .. })
+        )
     }
 
     pub(super) async fn mint_session_host(
