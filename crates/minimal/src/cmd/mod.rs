@@ -57,7 +57,7 @@ pub async fn run(mut cli: Cli) -> Result<(), anyhow::Error> {
     // The verb and the outcome go on the root span (BCLI-033
     // observability), so one span tells what ran. `box_id` stays empty
     // until a command records the id it resolved, through
-    // `output::record_box_id`. No command calls it yet.
+    // `output::record_box_id`.
     let root = tracing::info_span!(
         "cmd",
         verb = command_verb(cli.command.as_ref()),
@@ -138,6 +138,8 @@ fn command_verb(command: Option<&Command>) -> &'static str {
             BoxCommand::Audit(_) => "box audit",
             BoxCommand::List(_) => "box list",
             BoxCommand::Show(_) => "box show",
+            BoxCommand::Stop(_) => "box stop",
+            BoxCommand::Rm(_) => "box rm",
         },
         Some(Command::Host(HostArgs { command })) => match command {
             HostCommand::List => "host list",
@@ -378,6 +380,8 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             BoxCommand::Audit(args) => box_audit::cmd_box_audit(&cli.global_args, args).await,
             BoxCommand::List(args) => cmd_box_list(&cli.global_args, args).await,
             BoxCommand::Show(args) => cmd_box_show(&cli.global_args, args).await,
+            BoxCommand::Stop(args) => cmd_box_stop(&cli.global_args, args).await,
+            BoxCommand::Rm(args) => cmd_box_rm(&cli.global_args, args).await,
         },
         Some(Command::Host(HostArgs { command })) => match command {
             HostCommand::List => {
