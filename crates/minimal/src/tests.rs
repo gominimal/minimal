@@ -7011,14 +7011,21 @@ fn box_transcript(runs: &[BoxCommandRun]) -> String {
 
 /// The stderr and the exit code a `min box` command ends with for
 /// `result`: nothing and 0 on success, else the error and the code
-/// `main` maps it to (2 for the running-box refusal, 1 for the rest).
+/// `main` maps it to (2 for the running-box refusal, the refusal's own
+/// code for a box address refusal, 1 for the rest).
 fn box_command_ending(result: &Result<(), anyhow::Error>) -> (String, u8) {
     match result {
         Ok(()) => (String::new(), 0),
         Err(err) if err.downcast_ref::<BoxRunningRefusal>().is_some() => {
             (format!("{err:#}"), BoxRunningRefusal::EXIT_CODE)
         }
-        Err(err) => (format!("{err:#}"), 1),
+        // BCLI-002, BCLI-064: the code `main` gives a box address refusal.
+        Err(err) => {
+            let exit = err
+                .downcast_ref::<BoxAddressRefusal>()
+                .map_or(1, BoxAddressRefusal::exit_code);
+            (format!("{err:#}"), exit)
+        }
     }
 }
 
@@ -7252,5 +7259,285 @@ async fn box_first_slice_list_show_stop_rm_end_to_end() {
             .filter(|run| run.command.starts_with(&format!("min box {verb} ")))
             .count();
         assert_eq!(spans, ran, "{span} spans\n{transcript}\n{log}");
+    }
+}
+
+/// Runs one step of the address end-to-end test below inside its own
+/// `box_address_step` span, and records the command with its output in
+/// `runs`. The step number keeps each run's span apart in the log.
+async fn run_address_step<F>(
+    runs: &mut Vec<BoxCommandRun>,
+    box_id: &str,
+    command: String,
+    step: F,
+) -> u8
+where
+    F: AsyncFnOnce(&mut Vec<u8>) -> Result<(), anyhow::Error>,
+{
+    use tracing::Instrument as _;
+
+    let span = tracing::info_span!("box_address_step", step = runs.len(), box_id);
+    let mut stdout = Vec::new();
+    let result = step(&mut stdout).instrument(span).await;
+    let (stderr, exit) = box_command_ending(&result);
+    runs.push(BoxCommandRun {
+        command,
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr,
+        exit,
+    });
+    exit
+}
+
+// The address and machine-output slice end to end (BCLI-002, BCLI-033,
+// BCLI-063, BCLI-064): one box over a harness daemon on the native host's
+// socket. `min box show|stop|rm` take its id, its name and
+// provider/host/name. An address that names no box ends with exit 4, and
+// an unqualified name while a host does not answer ends with exit 7. Each
+// `-o json` box object carries its `min/v1/box` schema, and a secret
+// renders only as its reference. A failed step prints every command run so
+// far, with its stdout, stderr and exit code.
+#[tokio::test]
+async fn box_address_and_json_output_end_to_end() {
+    use crate::output::{ObjectType, OutputMode, Rendered, Secret};
+    use minimald_rpc::{Errorable, ShowBox, ShowBoxRequest};
+
+    let log = minimald::test_harness::captured_log();
+    let state = tempfile::tempdir().expect("a temp minimal state dir");
+    let global = GlobalArgs {
+        repo_dir: None,
+        minimal_dir: Some(state.path().to_path_buf()),
+        config_dir: None,
+        provider: Some(Provider::LocalMinimald),
+        no_input: true,
+        vm: None,
+    };
+    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
+        .expect("the native daemon's socket path");
+    std::fs::create_dir_all(sock.parent().expect("the socket has a dir"))
+        .expect("the native daemon's state dir");
+    let server = minimald::test_harness::TestServer::new().await;
+    server.listen_on_uds(&sock).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let mut daemon = server.connect().await;
+    let id = minimald::test_harness::create_configured_session(
+        &mut daemon,
+        "web",
+        project.path().to_str().expect("a UTF-8 project path"),
+    )
+    .await
+    .to_string();
+
+    let host = local_hosts(&global)
+        .expect("the local hosts")
+        .into_iter()
+        .find(|host| host.selected)
+        .expect("the native host is selected");
+    let qualified = format!("{}/{}/web", host.provider, host.host);
+    let mut runs = Vec::new();
+
+    // `min box show <address>`: the record of the box the address names.
+    let show = async |address: &str, out: &mut Vec<u8>| {
+        let hosts = local_hosts(&global)?;
+        let ResolvedBox { host, box_id } = resolve_box_on_hosts(hosts, address, "box show").await?;
+        let mut client = box_host_client(&host).await?;
+        let shown = match client
+            .oneshot_rpc::<ShowBox>(ShowBoxRequest { id: box_id })
+            .await?
+        {
+            Errorable::Ok(shown) => shown,
+            Errorable::Err { error } => anyhow::bail!("{error}"),
+        };
+        render_box_show(out, &shown, host.provider, &host.host)?;
+        Ok(())
+    };
+
+    // The id, the name and provider/host/name each show the same box.
+    for address in [id.as_str(), "web", qualified.as_str()] {
+        let step = async |out: &mut Vec<u8>| show(address, out).await;
+        let command = format!("min box show {address}");
+        let exit = run_address_step(&mut runs, &id, command, step).await;
+        let transcript = box_transcript(&runs);
+        assert_eq!(exit, 0, "{transcript}");
+        let shown = &runs.last().expect("the step ran").stdout;
+        for line in [format!("ID: {id}"), "Name: web".to_owned()] {
+            assert!(
+                shown
+                    .lines()
+                    .any(|shown| shown.split_whitespace().eq(line.split_whitespace())),
+                "no `{line}` line\n{transcript}"
+            );
+        }
+    }
+
+    // `min box show no-such-box`: exit 4, and the refusal names the
+    // address.
+    let missing = async |out: &mut Vec<u8>| show("no-such-box", out).await;
+    let command = "min box show no-such-box".to_owned();
+    let exit = run_address_step(&mut runs, &id, command, missing).await;
+    let transcript = box_transcript(&runs);
+    assert_eq!(exit, 4, "{transcript}");
+    let run = runs.last().expect("the step ran");
+    assert!(
+        run.stderr.contains("No box named no-such-box."),
+        "{transcript}"
+    );
+    assert_eq!(run.stdout, "", "{transcript}");
+
+    // `min box show web` while the selected VM host does not answer: exit
+    // 7, the refusal names that host, and no box is chosen although the
+    // native host has one named web.
+    let mut native = host.clone();
+    native.selected = false;
+    let down = LocalHost {
+        provider: LOCAL_MINVMD_PROVIDER,
+        host: "beta.local-minvmd0".to_owned(),
+        sock: state.path().join("no-vm").join("ssh.sock"),
+        selected: true,
+    };
+    let unreachable = async |out: &mut Vec<u8>| {
+        let _ = out;
+        resolve_box_on_hosts(vec![native.clone(), down.clone()], "web", "box show").await?;
+        Ok(())
+    };
+    let command = "min box show web --vm beta".to_owned();
+    let exit = run_address_step(&mut runs, &id, command, unreachable).await;
+    let transcript = box_transcript(&runs);
+    assert_eq!(exit, 7, "{transcript}");
+    let run = runs.last().expect("the step ran");
+    assert!(
+        run.stderr
+            .contains("Could not reach host beta.local-minvmd0. Box web can be on that host"),
+        "{transcript}"
+    );
+    assert_eq!(run.stdout, "", "{transcript}");
+
+    // `min box list -o json`: every object carries the `min/v1/box`
+    // schema, with the box's id, name, provider and host.
+    let list_json = async |out: &mut Vec<u8>| {
+        let mut client = connect_daemon(&global).await?;
+        let listed: Vec<ListedBox> = list_box_records(&mut client, None)
+            .await?
+            .into_iter()
+            .map(|record| ListedBox {
+                provider: host.provider.to_string(),
+                host: host.host.clone(),
+                record,
+            })
+            .collect();
+        render_box_list_json(out, &listed)?;
+        Ok(())
+    };
+    let command = "min box list --all -o json".to_owned();
+    let exit = run_address_step(&mut runs, &id, command, list_json).await;
+    let transcript = box_transcript(&runs);
+    assert_eq!(exit, 0, "{transcript}");
+    let objects: Vec<serde_json_lenient::Value> =
+        serde_json_lenient::from_str(&runs.last().expect("the step ran").stdout)
+            .unwrap_or_else(|e| panic!("one JSON array: {e}\n{transcript}"));
+    assert_eq!(objects.len(), 1, "{transcript}");
+    for object in &objects {
+        assert_eq!(
+            object["schema"],
+            ObjectType::Box.schema(),
+            "the schema stamp\n{transcript}"
+        );
+    }
+    assert_eq!(objects[0]["id"], id.as_str(), "{transcript}");
+    assert_eq!(objects[0]["name"], "web", "{transcript}");
+    assert_eq!(objects[0]["provider"], host.provider, "{transcript}");
+    assert_eq!(objects[0]["host"], host.host.as_str(), "{transcript}");
+
+    // A secret renders only as its reference, in every output mode.
+    #[derive(serde::Serialize)]
+    struct BoxSecret {
+        name: &'static str,
+        secret: Secret,
+    }
+    impl Rendered for BoxSecret {
+        const TYPE: ObjectType = ObjectType::Box;
+        fn text(&self, out: &mut dyn std::io::Write) -> std::io::Result<()> {
+            writeln!(out, "{}: {}", self.name, self.secret)
+        }
+    }
+    let object = BoxSecret {
+        name: "web",
+        secret: Secret::with_value("env:API_TOKEN", "s3cr3t-value"),
+    };
+    for mode in OutputMode::ALL {
+        let mut out = Vec::new();
+        crate::output::write_object(&mut out, mode, &object).expect("the object renders");
+        let text = String::from_utf8(out).expect("the output is UTF-8");
+        assert!(!text.contains("s3cr3t-value"), "{mode:?}: {text}");
+        assert!(text.contains("env:API_TOKEN"), "{mode:?}: {text}");
+        if mode.is_machine() {
+            let value: serde_json_lenient::Value =
+                serde_json_lenient::from_str(&text).expect("one JSON object");
+            assert_eq!(value["schema"], ObjectType::Box.schema(), "{text}");
+            assert_eq!(value["secret"]["ref"], "env:API_TOKEN", "{text}");
+        }
+    }
+
+    // `min box stop <id>` and `min box rm provider/host/name`: the
+    // changing verbs take the same addresses.
+    let stop = async |out: &mut Vec<u8>| {
+        stop_box_on_hosts(local_hosts(&global)?, out, &id, false).await?;
+        Ok(())
+    };
+    let command = format!("min box stop {id}");
+    let exit = run_address_step(&mut runs, &id, command, stop).await;
+    let transcript = box_transcript(&runs);
+    assert_eq!(exit, 0, "{transcript}");
+    let rm = async |out: &mut Vec<u8>| {
+        let _ = out;
+        rm_box_on_hosts(local_hosts(&global)?, &qualified, false).await?;
+        Ok(())
+    };
+    let command = format!("min box rm {qualified}");
+    let exit = run_address_step(&mut runs, &id, command, rm).await;
+    let transcript = box_transcript(&runs);
+    assert_eq!(exit, 0, "{transcript}");
+
+    // The removed box is not found by its id any more.
+    let gone = async |out: &mut Vec<u8>| show(&id, out).await;
+    let command = format!("min box show {id}");
+    let exit = run_address_step(&mut runs, &id, command, gone).await;
+    let transcript = box_transcript(&runs);
+    assert_eq!(exit, 4, "{transcript}");
+
+    // Each command that resolves an address logs one resolution inside
+    // its step's span: the host it reached for a resolved address, or the
+    // outcome of a refused one.
+    let log = log.contents();
+    let resolutions = |step: usize, outcome: &str| {
+        let span = format!("box_address_step{{step={step} box_id=\"{id}\"}}");
+        log.lines()
+            .filter(|line| line.contains(&span) && line.contains(outcome))
+            .collect::<Vec<_>>()
+    };
+    let expected = [
+        (0, "outcome=\"resolved\""),
+        (1, "outcome=\"resolved\""),
+        (2, "outcome=\"resolved\""),
+        (3, "outcome=\"not found\""),
+        (4, "outcome=\"host unreachable\""),
+        (6, "outcome=\"resolved\""),
+        (7, "outcome=\"resolved\""),
+        (8, "outcome=\"not found\""),
+    ];
+    for (step, outcome) in expected {
+        let lines = resolutions(step, outcome);
+        assert_eq!(
+            lines.len(),
+            1,
+            "step {step} ({}): one `{outcome}` resolution\n{transcript}\n{log}",
+            runs[step].command
+        );
+        if outcome.contains("resolved") {
+            assert!(
+                lines[0].contains(&format!("host={}", host.host)),
+                "step {step}: the host it reached\n{log}"
+            );
+        }
     }
 }
