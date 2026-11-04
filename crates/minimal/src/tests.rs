@@ -7258,3 +7258,63 @@ async fn box_first_slice_list_show_stop_rm_end_to_end() {
         assert_eq!(spans, ran, "{span} spans\n{transcript}\n{log}");
     }
 }
+
+/// A session record carrying `mode` and `box_addresses`, with everything
+/// else at its default.
+fn hold_record(
+    mode: boxes::NetworkMode,
+    box_addresses: Option<boxes::BoxAddresses>,
+) -> boxes::Record {
+    boxes::Record {
+        id: boxes::SessionId::nil(),
+        name: Some("web".to_string()),
+        username: None,
+        project_path: paths::HostAbsPath::try_new("/tmp/project").unwrap(),
+        network: mode,
+        policy: boxes::BoxPolicy::default(),
+        task_addresses: Vec::new(),
+        box_addresses,
+        status: boxes::BoxState::Active,
+        reason: None,
+        exit_code: None,
+        signal: None,
+        hooks_enabled: true,
+        host_ip_enforcement: None,
+        box_id: None,
+        host_row_bound: false,
+        bound_ports: std::collections::BTreeSet::new(),
+        ends_with_run: false,
+        sealed_deliveries: Vec::new(),
+        root_certificate: None,
+        box_type: None,
+        parent: None,
+        project_root: None,
+        attrs: Default::default(),
+    }
+}
+
+/// NET-046: a named `none` box holds its name on the VM host, so the
+/// paths that release or move a hold treat it as a `host_ip` box. The
+/// dashboard's destroy (`dash/rpc.rs`) releases a hold only for a record
+/// `holds_name` accepts, and `min session rename` and the dashboard's
+/// rename move a hold only for such a record. An own-address box owns
+/// its name through its row, and holds nothing.
+#[test]
+fn none_box_hold_is_released_by_destroy_and_moved_by_rename() {
+    assert!(
+        crate::holds_name(&hold_record(boxes::NetworkMode::NoNet, None)),
+        "the dashboard's destroy releases a `none` box's hold, and a rename moves it"
+    );
+    assert!(
+        crate::holds_name(&hold_record(boxes::NetworkMode::HostNet, None)),
+        "a `host_ip` box's hold is released and moved as before"
+    );
+    let row = boxes::BoxAddresses {
+        switch_address: std::net::Ipv4Addr::new(10, 0, 0, 2),
+        loopback_address: std::net::Ipv4Addr::new(127, 0, 0, 2),
+    };
+    assert!(
+        !crate::holds_name(&hold_record(boxes::NetworkMode::NoNet, Some(row))),
+        "a box with a row owns its name through the row"
+    );
+}
