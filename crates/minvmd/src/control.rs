@@ -2460,11 +2460,41 @@ struct GuestAuditWindow {
     flows: HashSet<String>,
 }
 
-/// The audit windows, by the audit log they write to and the box's row
-/// key. The log is part of the key so that two doors in one process (the
-/// tests) never share a cap.
+/// The key one box's audit window is filed under: the row's switch
+/// address, or the box id for a box with no switch. Every box with no switch
+/// shares the node's own address, so that address is never a key: one such
+/// box would spend the cap of all of them (NET-046).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum GuestAuditKey {
+    /// A box with a row, by the row's switch address.
+    Switch(Ipv4Addr),
+    /// A box with no switch, by its box id.
+    Box(minimald_rpc::BoxId),
+}
+
+impl GuestAuditKey {
+    /// The switch address, for a box with a row.
+    fn switch_address(self) -> Option<Ipv4Addr> {
+        match self {
+            Self::Switch(switch_address) => Some(switch_address),
+            Self::Box(_) => None,
+        }
+    }
+
+    /// The box id, for a box with no switch.
+    fn box_id(self) -> Option<minimald_rpc::BoxId> {
+        match self {
+            Self::Switch(_) => None,
+            Self::Box(box_id) => Some(box_id),
+        }
+    }
+}
+
+/// The audit windows, by the audit log they write to and the box's key. The
+/// log is part of the key so that two doors in one process (the tests)
+/// never share a cap.
 static GUEST_AUDIT_WINDOWS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<(PathBuf, Ipv4Addr), GuestAuditWindow>>,
+    std::sync::Mutex<std::collections::HashMap<(PathBuf, GuestAuditKey), GuestAuditWindow>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// What the per-box cap says about one report.
@@ -2485,14 +2515,14 @@ enum GuestAuditAdmission {
 /// expose decision, each of which is its own record).
 fn admit_guest_audit(
     audit_path: &Path,
-    switch_address: Ipv4Addr,
+    key: GuestAuditKey,
     flow: Option<String>,
     now: std::time::Instant,
 ) -> GuestAuditAdmission {
     let mut windows = GUEST_AUDIT_WINDOWS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let key = (audit_path.to_path_buf(), switch_address);
+    let key = (audit_path.to_path_buf(), key);
     if windows.len() >= GUEST_AUDIT_TRACKED && !windows.contains_key(&key) {
         windows.retain(|_, window| {
             now.duration_since(window.opened) < GUEST_AUDIT_WINDOW || window.suppressed > 0
@@ -2611,26 +2641,27 @@ struct SuppressedAudit {
     /// The box whose records were suppressed.
     #[serde(rename = "box")]
     box_name: String,
-    /// The box's row key.
-    switch_address: Ipv4Addr,
+    /// The box's row key; absent for a box with no switch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    switch_address: Option<Ipv4Addr>,
+    /// The box id, for a box with no switch; absent when the row key names
+    /// the box.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    box_id: Option<String>,
     /// How many records the cap suppressed in the window that ended.
     suppressed: u64,
 }
 
 /// Writes the line that counts `suppressed` records for the box, when
 /// there are any.
-fn append_suppressed_audit(
-    audit_path: &Path,
-    box_name: &str,
-    switch_address: Ipv4Addr,
-    suppressed: u64,
-) {
+fn append_suppressed_audit(audit_path: &Path, box_name: &str, key: GuestAuditKey, suppressed: u64) {
     if suppressed == 0 {
         return;
     }
     tracing::warn!(
         box = %box_name,
-        %switch_address,
+        switch_address = ?key.switch_address(),
+        box_id = ?key.box_id(),
         suppressed,
         "the box's audit reports passed the host's cap; records were suppressed"
     );
@@ -2640,7 +2671,8 @@ fn append_suppressed_audit(
             ts: unix_now_secs(),
             event: "audit_suppressed",
             box_name: box_name.to_string(),
-            switch_address,
+            switch_address: key.switch_address(),
+            box_id: key.box_id().map(|box_id| box_id.simple()),
             suppressed,
         },
     );
@@ -2651,12 +2683,12 @@ fn append_suppressed_audit(
 fn take_guest_audit(
     audit_path: &Path,
     box_name: &str,
-    switch_address: Ipv4Addr,
+    key: GuestAuditKey,
     admission: &GuestAuditAdmission,
 ) -> bool {
     match admission {
         GuestAuditAdmission::Write { suppressed } => {
-            append_suppressed_audit(audit_path, box_name, switch_address, *suppressed);
+            append_suppressed_audit(audit_path, box_name, key, *suppressed);
             true
         }
         GuestAuditAdmission::Repeat | GuestAuditAdmission::Suppressed => false,
@@ -2671,9 +2703,17 @@ fn flush_guest_audit(audit_path: &Path, box_name: &str, switch_address: Ipv4Addr
     let window = GUEST_AUDIT_WINDOWS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(&(audit_path.to_path_buf(), switch_address));
+        .remove(&(
+            audit_path.to_path_buf(),
+            GuestAuditKey::Switch(switch_address),
+        ));
     if let Some(window) = window {
-        append_suppressed_audit(audit_path, box_name, switch_address, window.suppressed);
+        append_suppressed_audit(
+            audit_path,
+            box_name,
+            GuestAuditKey::Switch(switch_address),
+            window.suppressed,
+        );
     }
 }
 
@@ -2697,9 +2737,9 @@ fn audit_expose_decision(
     audit_path: &Path,
     request: &minimald_rpc::ExposeDecisionReport,
 ) -> BoxControlReply {
-    // The key the record and the per-box cap are filed under: the row's
-    // switch address, or the node's own address for a box with no switch,
-    // the address a `host_ip` box's frames carry (NET-085).
+    // The key the per-box cap is filed under: the row's switch address, or
+    // the box id for a box with no switch. Boxes with no switch all share
+    // the node's own address, so that address cannot keep their caps apart.
     let (box_name, cap_key, box_id) = match (request.switch_address, request.box_id) {
         (Some(switch_address), _) => {
             let Some(record) = boxes.table().by_source(switch_address.octets()) else {
@@ -2717,7 +2757,11 @@ fn audit_expose_decision(
                 key = "switch_address",
                 "found the expose decision report's box by its switch address"
             );
-            (record.name().to_string(), switch_address, None)
+            (
+                record.name().to_string(),
+                GuestAuditKey::Switch(switch_address),
+                None,
+            )
         }
         (None, Some(box_id)) => {
             let Some(box_name) = no_switch_box_name(boxes, box_id) else {
@@ -2735,7 +2779,7 @@ fn audit_expose_decision(
                 key = "box_id",
                 "found the expose decision report's box by its box id"
             );
-            (box_name, boxes.subnet().daemon_ip(), Some(box_id))
+            (box_name, GuestAuditKey::Box(box_id), Some(box_id))
         }
         (None, None) => {
             tracing::debug!("refused an expose decision report that names no box");
@@ -2833,14 +2877,14 @@ fn audit_refused_egress(
     let flow = format!("{destination}/{proto}/{rule}");
     let admission = admit_guest_audit(
         audit_path,
-        request.switch_address,
+        GuestAuditKey::Switch(request.switch_address),
         Some(flow),
         std::time::Instant::now(),
     );
     let audited = take_guest_audit(
         audit_path,
         record.name(),
-        request.switch_address,
+        GuestAuditKey::Switch(request.switch_address),
         &admission,
     );
     if audited {
@@ -8149,6 +8193,46 @@ mod tests {
         assert_eq!(records[1]["box_id"], unnamed.simple());
         assert_eq!(records[1]["port"], 4001);
 
+        // Each box with no switch has its own cap window: one box that
+        // passes its cap never suppresses the record of another. The box
+        // wrote one record above, so this fills the rest of its cap.
+        for port in 1..(GUEST_AUDIT_RECORDS_PER_WINDOW as u16) {
+            report(Some(named), 5000 + port);
+        }
+        assert_eq!(
+            report(Some(named), 6000),
+            BoxControlReply::Audited { audited: false },
+            "the flooding box passed its own cap"
+        );
+        assert_eq!(
+            report(Some(unnamed), 6001),
+            BoxControlReply::Audited { audited: true },
+            "another box with no switch still gets its record"
+        );
+
+        // The count line for a box with no switch names its box id.
+        let audit_path = audit_log_path(&guest);
+        let later = std::time::Instant::now() + GUEST_AUDIT_WINDOW;
+        let admission = admit_guest_audit(&audit_path, GuestAuditKey::Box(named), None, later);
+        assert_eq!(admission, GuestAuditAdmission::Write { suppressed: 1 });
+        assert!(take_guest_audit(
+            &audit_path,
+            "api",
+            GuestAuditKey::Box(named),
+            &admission
+        ));
+        let suppressed: Vec<_> = host_audit_records(&guest)
+            .into_iter()
+            .filter(|record| record["event"] == "audit_suppressed")
+            .collect();
+        assert_eq!(suppressed.len(), 1, "one count line: {suppressed:?}");
+        assert_eq!(suppressed[0]["box"], "api");
+        assert_eq!(suppressed[0]["box_id"], named.simple());
+        assert!(
+            suppressed[0].get("switch_address").is_none(),
+            "a box with no switch has no row key to record: {suppressed:?}"
+        );
+
         // An older guest's report: a switch address, and no box id.
         let old = parse_request(
             r#"{"verb":"report_expose_decision","switch_address":"100.64.128.9","port":3000,"decision":"allow","decided_by":"box-policy","outcome":"published"}"#,
@@ -8325,7 +8409,7 @@ mod tests {
         let later = std::time::Instant::now() + GUEST_AUDIT_WINDOW;
         let admission = admit_guest_audit(
             &audit_path,
-            web.switch_address,
+            GuestAuditKey::Switch(web.switch_address),
             Some("later".to_string()),
             later,
         );
@@ -8333,7 +8417,7 @@ mod tests {
         assert!(take_guest_audit(
             &audit_path,
             "web",
-            web.switch_address,
+            GuestAuditKey::Switch(web.switch_address),
             &admission
         ));
         let suppressed: Vec<_> = host_audit_records(&guest)
