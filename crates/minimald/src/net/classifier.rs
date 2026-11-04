@@ -143,7 +143,9 @@ impl UnenforceableRule {
 /// `deny_subnets` entry (a partial refusal the deny subtree does not spell)
 /// and every present `allow_*` list in a declaration that is not the
 /// deny-all shape (a narrowing the allow subtree has no rule to enforce)
-/// names a rule this host decides nothing for. An absent section and the
+/// names a rule this host decides nothing for, except an empty destination
+/// list beside a non-empty one: that list grants and narrows nothing, so it
+/// names no rule. An absent section and the
 /// deny-all shape name nothing — the first is placed under `allow` exactly
 /// as the allow-all it is, and the second is the one shape the deny
 /// subtree enforces; a `deny_subnets` entry over the deny-all shape
@@ -4308,7 +4310,8 @@ mod tests {
             "a denied range is one unenforceable rule, named with its entry"
         );
 
-        // Every entry is a rule, and every present `allow_*` list is one,
+        // Every entry is a rule, and every present `allow_*` list is one
+        // (an empty destination list beside a non-empty one is not),
         // denied ranges first and the lists in the declaration's own field
         // order — the same order a person typed them in.
         let narrowing = boxes::EgressPolicy {
@@ -6760,7 +6763,6 @@ mod tests {
                 Some(&allow_list),
             ),
             Some(vec![
-                UnenforceableRule::AllowSubnets,
                 UnenforceableRule::AllowDnsHosts,
                 UnenforceableRule::AllowProtocols,
             ]),
