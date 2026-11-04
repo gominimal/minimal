@@ -125,6 +125,8 @@ fn command_verb(command: Option<&Command>) -> &'static str {
             BoxCommand::Show(_) => "box show",
             BoxCommand::Stop(_) => "box stop",
             BoxCommand::Rm(_) => "box rm",
+            BoxCommand::Events(_) => "box events",
+            BoxCommand::Cp(_) => "box cp",
         },
         Some(Command::Net(_)) => "net forward",
         Some(Command::FinalizeInstall(_)) => "finalize-install",
@@ -360,6 +362,8 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             BoxCommand::Show(args) => cmd_box_show(&cli.global_args, args).await,
             BoxCommand::Stop(args) => cmd_box_stop(&cli.global_args, args).await,
             BoxCommand::Rm(args) => cmd_box_rm(&cli.global_args, args).await,
+            BoxCommand::Events(args) => cmd_box_events(&cli.global_args, args).await,
+            BoxCommand::Cp(args) => cmd_box_cp(&cli.global_args, args).await,
         },
         Some(Command::Net(NetArgs {
             command: NetCommand::Forward(args),
