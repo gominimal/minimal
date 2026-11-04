@@ -403,7 +403,10 @@ esac
 # host's loopback at from a host-address box (the proxy proof's
 # PROXY_HOST_PORT) and nothing wider: the same proof asserts the alias stays
 # refused at a port outside the table, and own-address boxes stay refused at
-# every port, in the table or not. A native daemon has no alias gate and
+# every port, in the table or not. That own-address refusal is a current
+# limit: the design lets an own-address box that declares the name reach an
+# exposure, and https://github.com/gominimal/minimal/issues/2990 (T154)
+# tracks the guest half. A native daemon has no alias gate and
 # ignores the table.
 E2E_HOST_EXPOSURE_PORT=18081
 
