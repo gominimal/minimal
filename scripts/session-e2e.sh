@@ -11361,9 +11361,9 @@ proof_native_answerer_survives_session_stop() {
 #   3. `host.min.internal` answers 127.0.0.1 on the host, from the service
 #      and through the host's own resolver.
 #   4. The first box connects to a port the second box did not publish, at
-#      the address the service answered for its name. The connect is refused
-#      fast, and the daemon log carries a new `network policy violation`
-#      line for that port.
+#      the second box's switch address. The connect is refused fast, and the
+#      daemon log carries a new `network policy violation` line with
+#      `direction=ingress` and that port as `dst_port`.
 #   5. The second box's name answers NXDOMAIN on the first lookup made after
 #      `min session destroy` returns.
 #
@@ -11575,9 +11575,6 @@ proof_native_names_answer_on_time() {
     --ingress "$nnat_open_port:$nnat_open_port")" || fail
   nnat_t="$(now_ms)"
   nnat_on_time "$nnat_b_name.min.internal" A "$nnat_t" "the second box's activate"
-  # Beat 4 connects to box b by this address, not by name: a lookup from
-  # inside a box is not this case's proof (gominimal/minimal#3001).
-  local nnat_b_addr="$NNAT_ADDR"
 
   # ---- 3. host.min.internal from the host -----------------------------------
   # No step comes before this lookup that it must answer on time after, so
@@ -11599,8 +11596,39 @@ proof_native_names_answer_on_time() {
   echo "3. host.min.internal answers 127.0.0.1 on the host"
 
   # ---- 4. an unpublished port: refused and logged ---------------------------
+  # Beat 4 dials box b at its switch address, the 100.64.x.x lease. The name
+  # answers the box's loopback address, and a SYN to that never crosses the
+  # switch gate, which writes the line. It is not a lookup from inside a box
+  # either: that is not this case's proof (gominimal/minimal#3001). A
+  # session rootfs has no iproute2, so the address is read from
+  # /proc/net/fib_trie (each local address is a `|-- A.B.C.D` line followed
+  # by `/32 host LOCAL`).
+  local nnat_b_addr
+  if ! mnl session exec "$nnat_b_sid" sh -c 'cat /proc/net/fib_trie' \
+      >"$WORK/nnat-b-fib.out" 2>"$WORK/nnat-b-fib.err"; then
+    echo "::error::could not read /proc/net/fib_trie from $nnat_b_name"
+    cat "$WORK/nnat-b-fib.err" 2>/dev/null || true
+    fail
+  fi
+  nnat_b_addr="$(awk '/\|--/ { addr = $2 }
+                      /\/32 host LOCAL/ && addr ~ /^100\./ { print addr; exit }' "$WORK/nnat-b-fib.out")"
+  if [ -z "$nnat_b_addr" ]; then
+    echo "::error::could not find $nnat_b_name's switch address (100.64.x.x) in /proc/net/fib_trie"
+    echo "--- fib_trie ---"; cat "$WORK/nnat-b-fib.out" 2>/dev/null || true
+    fail
+  fi
+  echo "  $nnat_b_name's switch address: $nnat_b_addr"
+  # Only an ingress violation for the closed port counts. Other violation
+  # lines (an egress-ipv6 drop, say) can land in the same window. The fields
+  # match the file log's JSON (`"dst_port":18193`) and the text form
+  # (`dst_port=18193`) alike.
+  nnat_ingress_lines() {
+    nnat_lines 'network policy violation' \
+      | grep -E 'direction("?:"?|=)ingress' \
+      | grep -E "dst_port(\"?:\"?|=)$nnat_closed_port([^0-9]|\$)" || true
+  }
   local nnat_viol_before nnat_rc nnat_ms nnat_new
-  nnat_viol_before="$(nnat_count 'network policy violation')"
+  nnat_viol_before="$(nnat_ingress_lines | wc -l)"
   nnat_t="$(now_ms)"
   mnl session exec "$nnat_a_sid" \
     "curl -sS --max-time 8 -o /dev/null 'http://$nnat_b_addr:$nnat_closed_port/'" \
@@ -11615,20 +11643,22 @@ proof_native_names_answer_on_time() {
     nnat_lines 'network policy violation' | tail -n 5
     fail
   fi
-  if ! nnat_wait_more 'network policy violation' "$nnat_viol_before"; then
-    echo "::error::the daemon log has no new 'network policy violation' line for the refused connect"
+  local _i nnat_seen=""
+  for _i in $(seq 1 60); do
+    if [ "$(nnat_ingress_lines | wc -l)" -gt "$nnat_viol_before" ]; then
+      nnat_seen=1
+      break
+    fi
+    sleep 0.5
+  done
+  if [ -z "$nnat_seen" ]; then
+    echo "::error::the daemon log has no new 'network policy violation' line with direction=ingress and dst_port $nnat_closed_port"
+    echo "--- daemon log: policy violations (tail) ---"
     nnat_lines 'network policy violation' | tail -n 5
     fail
   fi
-  nnat_new="$(nnat_lines 'network policy violation' | tail -n 1)"
+  nnat_new="$(nnat_ingress_lines | tail -n 1)"
   echo "  daemon log line matched: $nnat_new"
-  case "$nnat_new" in
-    *"$nnat_closed_port"*) ;;
-    *)
-      echo "::error::the new 'network policy violation' line does not name port $nnat_closed_port"
-      fail
-      ;;
-  esac
   echo "4. the refused connect to an unpublished port is logged as a policy violation"
 
   # ---- 5. a destroyed box's name is gone when destroy returns ---------------
