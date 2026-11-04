@@ -46,6 +46,33 @@ pub struct Config {
         skip_serializing_if = "std::collections::BTreeMap::is_empty"
     )]
     pub secret_store_rules: StoreRules,
+    /// `[host-exposures]` section: the host ports `minvmd` opens at
+    /// `host.min.internal`. `minvmd` reads and checks the entries. The
+    /// client keeps them as written, so a file that has the table parses.
+    #[serde(
+        default,
+        rename = "host-exposures",
+        skip_serializing_if = "HostExposuresTable::is_empty"
+    )]
+    pub host_exposures: HostExposuresTable,
+}
+
+/// The `[host-exposures]` table as written, one entry per name. `minvmd`
+/// owns its form and skips an entry it does not accept.
+#[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct HostExposuresTable(pub toml::Table);
+
+// A TOML value compares by value. A NaN float is the one value not equal to
+// itself, and no exposure entry holds one.
+impl Eq for HostExposuresTable {}
+
+impl HostExposuresTable {
+    /// Whether the table has no entry.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 /// The `[secrets]` section.
@@ -440,6 +467,26 @@ mod tests {
         let path = write_file(dir.path(), "config.toml", "");
         let cfg = read_config_file(&path).unwrap();
         assert_eq!(cfg, Config::default());
+    }
+
+    /// A `[host-exposures]` table parses, so the client still reads a file
+    /// that opens a host port for `minvmd`. The client keeps an entry it
+    /// does not accept as well, because `minvmd` decides each entry.
+    #[test]
+    fn read_config_file_keeps_host_exposures() {
+        let dir = TempDir::new().unwrap();
+        let path = write_file(
+            dir.path(),
+            "config.toml",
+            indoc::indoc! {r#"
+                [host-exposures]
+                postgres = { proto = "tcp", port = 5432 }
+                legacy = 8080
+            "#},
+        );
+        let cfg = read_config_file(&path).unwrap();
+        assert_eq!(cfg.host_exposures.0.len(), 2);
+        assert!(cfg.host_exposures.0.contains_key("postgres"));
     }
 
     /// A missing `[loadouts]` section deserializes to the default
