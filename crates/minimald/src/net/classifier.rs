@@ -172,10 +172,21 @@ pub(crate) fn unenforceable_rules(
             .flatten()
             .map(|entry| UnenforceableRule::DenySubnets(entry.clone())),
     );
-    if section.allow_subnets.is_some() {
+    // An empty destination list beside a non-empty one grants nothing and
+    // narrows nothing: it is the list the in-force default fills in for a
+    // box that declared only the other one (`boxes::effective_egress`). It
+    // names no rule, so the launch, which reads the resolved section, and
+    // the create, which reads the declared one, name the same rules, and a
+    // refusal names only the flags the box was started with. The deny-all
+    // shape, both lists present and empty, returned above.
+    let declares = |list: &Option<Vec<String>>| list.as_ref().is_some_and(|l| !l.is_empty());
+    let names_a_rule = |list: &Option<Vec<String>>, other: &Option<Vec<String>>| {
+        list.is_some() && (declares(list) || !declares(other))
+    };
+    if names_a_rule(&section.allow_subnets, &section.allow_dns_hosts) {
         rules.push(UnenforceableRule::AllowSubnets);
     }
-    if section.allow_dns_hosts.is_some() {
+    if names_a_rule(&section.allow_dns_hosts, &section.allow_subnets) {
         rules.push(UnenforceableRule::AllowDnsHosts);
     }
     if section.allow_protocols.is_some() {
@@ -4492,6 +4503,84 @@ mod tests {
         assert!(
             words.chars().count() < 300,
             "a one-rule refusal stays a sentence, not a wall: {words}"
+        );
+    }
+
+    /// NET-079: the launch reads the section the in-force default resolved,
+    /// which fills in the destination list a box left absent as present and
+    /// empty, while the create reads the section as declared. Both name the
+    /// same rules, and only the flags the box was started with: a box
+    /// started with `--allow-subnets` alone is never refused naming
+    /// `allow_dns_hosts`, and one started with `--allow-dns-hosts` alone is
+    /// never refused naming `allow_subnets`.
+    #[test]
+    fn launch_refusal_names_only_declared_rules() {
+        let resolve = |declared: &boxes::EgressPolicy| match boxes::effective_egress(
+            Some(declared),
+            boxes::NetworkMode::HostNet,
+            boxes::EgressDefaultPhase::InForce,
+            false,
+        ) {
+            boxes::EffectiveEgress::Declared(section) => section,
+            other => panic!("a declared section resolves as declared, got {other:?}"),
+        };
+
+        let subnets_only = boxes::EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            ..Default::default()
+        };
+        let resolved = resolve(&subnets_only);
+        assert_eq!(
+            resolved.allow_dns_hosts,
+            Some(Vec::new()),
+            "the in-force default fills the absent name list in as empty"
+        );
+        assert_eq!(
+            unenforceable_rules(Some(&resolved)),
+            vec![UnenforceableRule::AllowSubnets],
+            "the launch names the one flag the box was started with"
+        );
+        assert_eq!(
+            unenforceable_rules(Some(&resolved)),
+            unenforceable_rules(Some(&subnets_only)),
+            "the launch and the create name the same rules"
+        );
+        let words = unenforceable_declaration_words(&unenforceable_rules(Some(&resolved)));
+        assert!(
+            words.contains("allow_subnets") && !words.contains("allow_dns_hosts"),
+            "the refusal names only the rule the box declared: {words}"
+        );
+
+        let names_only = boxes::EgressPolicy {
+            allow_dns_hosts: Some(vec!["example.com".to_string()]),
+            ..Default::default()
+        };
+        let resolved = resolve(&names_only);
+        assert_eq!(
+            unenforceable_rules(Some(&resolved)),
+            vec![UnenforceableRule::AllowDnsHosts],
+            "the launch names the one flag the box was started with"
+        );
+        assert_eq!(
+            unenforceable_rules(Some(&resolved)),
+            unenforceable_rules(Some(&names_only)),
+            "the launch and the create name the same rules"
+        );
+
+        // A denied range beside an allow list is still named in full, and
+        // the filled-in empty list still names nothing.
+        let subnets_and_denies = boxes::EgressPolicy {
+            allow_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+            deny_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            unenforceable_rules(Some(&resolve(&subnets_and_denies))),
+            vec![
+                UnenforceableRule::DenySubnets("10.0.0.0/8".to_string()),
+                UnenforceableRule::AllowSubnets,
+            ],
+            "every declared rule is named, and no filled-in one"
         );
     }
 
