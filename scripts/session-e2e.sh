@@ -11360,9 +11360,10 @@ proof_native_answerer_survives_session_stop() {
 #      the same.
 #   3. `host.min.internal` answers 127.0.0.1 on the host, from the service
 #      and through the host's own resolver.
-#   4. The first box connects to a port the second box did not publish. The
-#      connect is refused fast, and the daemon log carries a new
-#      `network policy violation` line for that port.
+#   4. The first box connects to a port the second box did not publish, at
+#      the address the service answered for its name. The connect is refused
+#      fast, and the daemon log carries a new `network policy violation`
+#      line for that port.
 #   5. The second box's name answers NXDOMAIN on the first lookup made after
 #      `min session destroy` returns.
 #
@@ -11574,6 +11575,9 @@ proof_native_names_answer_on_time() {
     --ingress "$nnat_open_port:$nnat_open_port")" || fail
   nnat_t="$(now_ms)"
   nnat_on_time "$nnat_b_name.min.internal" A "$nnat_t" "the second box's activate"
+  # Beat 4 connects to box b by this address, not by name: a lookup from
+  # inside a box is not this case's proof (gominimal/minimal#3001).
+  local nnat_b_addr="$NNAT_ADDR"
 
   # ---- 3. host.min.internal from the host -----------------------------------
   # No step comes before this lookup that it must answer on time after, so
@@ -11599,25 +11603,11 @@ proof_native_names_answer_on_time() {
   nnat_viol_before="$(nnat_count 'network policy violation')"
   nnat_t="$(now_ms)"
   mnl session exec "$nnat_a_sid" \
-    "curl -sS --max-time 8 -o /dev/null 'http://$nnat_b_name.min.internal:$nnat_closed_port/'" \
+    "curl -sS --max-time 8 -o /dev/null 'http://$nnat_b_addr:$nnat_closed_port/'" \
     >"$WORK/nnat-closed.out" 2>"$WORK/nnat-closed.err"
   nnat_rc=$?
   nnat_ms=$(( $(now_ms) - nnat_t ))
-  echo "  connect from $nnat_a_name to $nnat_b_name.min.internal:$nnat_closed_port (not published): curl exit $nnat_rc after ${nnat_ms} ms: $(tr '\n' ' ' < "$WORK/nnat-closed.err" 2>/dev/null)"
-  if [ "$nnat_rc" -eq 6 ]; then
-    # A zone name needs no egress entry: the relay's DNS gate forwards a
-    # zone A to the switch's resolver, which answers it from the name every
-    # own-IP attach registers there. So a failed lookup here is not the
-    # case's setup. Print what the box got and the daemon's registration
-    # warnings, so the run shows where the name went missing.
-    echo "::error::$nnat_a_name could not resolve $nnat_b_name.min.internal from inside the box (curl exit 6), so the connect was never made"
-    echo "--- $nnat_a_name: /etc/resolv.conf and getent ahostsv4 $nnat_b_name.min.internal ---"
-    mnl session exec "$nnat_a_sid" \
-      "cat /etc/resolv.conf; getent ahostsv4 '$nnat_b_name.min.internal'; echo getent exit \$?" 2>&1 || true
-    echo "--- daemon log: name registrations on the switch that failed ---"
-    nnat_lines 'registering *.min.internal name on gvproxy' | tail -n 5
-    fail
-  fi
+  echo "  connect from $nnat_a_name to $nnat_b_name at $nnat_b_addr:$nnat_closed_port (not published): curl exit $nnat_rc after ${nnat_ms} ms: $(tr '\n' ' ' < "$WORK/nnat-closed.err" 2>/dev/null)"
   if [ "$nnat_rc" -ne 7 ] || [ "$nnat_ms" -ge 6000 ]; then
     echo "::error::the connect to the unpublished port was not refused fast (expected curl exit 7 well inside 6 s)"
     echo "--- daemon log: box-zone decisions and policy violations (tail) ---"
