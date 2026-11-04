@@ -1587,8 +1587,29 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     // held after all.
     // Only a report the running boot sent counts: its own generation, or —
     // from a guest too old to echo one — none.
+    // NET-021: a late refusal starts the held-port watcher, as a start that
+    // found the port held does. These slots hold the port's reservation and
+    // that watcher for the VM's life, because the supervisor returns only
+    // when the VM stops. The report thread releases the reservation first, so
+    // the watcher's own check can take it again when the port frees.
+    let late_reservation = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let late_watcher = std::sync::Arc::new(std::sync::Mutex::new(None));
     if let Some((port, generation)) = unconfirmed_port {
         let proxy_publish = proxy_publish.clone();
+        *late_reservation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = node_port.reservation.take();
+        let late_reservation = std::sync::Arc::clone(&late_reservation);
+        let late_watcher = std::sync::Arc::clone(&late_watcher);
+        let held_switch = reclaim_switch_sock
+            .clone()
+            .filter(|_| _gvproxy.is_some())
+            .map(|switch_sock| {
+                (
+                    proxy_reclaim_check(ports_dir.clone()),
+                    proxy_reclaim_publisher(switch_sock, boxes.subnet().daemon_ip(), boxes.table()),
+                )
+            });
         // The watcher's lines carry `vm` through a span of its own: it may
         // outlive READY, and keeping the start phase's span would keep that
         // phase from exporting (`telemetry::vm_task`).
@@ -1624,6 +1645,28 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
                             "the guest's late report says the hostname proxy's port is held"
                         );
                         proxy_publish.set_down(port, ProxyDownCause::PortHeldAfterStart { holder });
+                        let Some((check, publisher)) = held_switch else {
+                            return;
+                        };
+                        drop(
+                            late_reservation
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .take(),
+                        );
+                        let recorded = proxy_publish.clone();
+                        *late_watcher
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(crate::net::proxy_reclaim::spawn_held_port_watcher(
+                                port,
+                                crate::net::proxy_reclaim::HeldPortBackoff::default(),
+                                check,
+                                publisher,
+                                move |port| {
+                                    crate::net::proxy_reclaim::mark_serving(&recorded, port)
+                                },
+                            ));
                         return;
                     }
                     _ => {}
