@@ -100,7 +100,7 @@ pub async fn run(mut cli: Cli) -> Result<(), anyhow::Error> {
     // stderr carries one object only (BCLI-042).
     if let Some(hint) = alias_hint {
         if result.is_ok() {
-            eprintln!("{hint}");
+            let _ = writeln!(std::io::stderr(), "{hint}");
         } else {
             hosts::defer_alias_hint_to_failure(hint);
         }

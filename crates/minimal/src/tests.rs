@@ -6631,7 +6631,7 @@ async fn host_show_socket_and_version() {
              Provider:        local\n\
              State:           running\n\
              Socket:          {}\n\
-             Daemon version:  minimald {version}\n",
+             Daemon version:  {version}\n",
             sock.display()
         )
     );

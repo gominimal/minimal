@@ -303,7 +303,7 @@ impl Rendered for HostDetail {
         writeln!(out, "State:           {}", self.state.label())?;
         writeln!(out, "Socket:          {}", self.socket.display())?;
         match (&self.daemon_version, self.state) {
-            (Some(version), _) => writeln!(out, "Daemon version:  minimald {version}"),
+            (Some(version), _) => writeln!(out, "Daemon version:  {version}"),
             (None, HostState::Stopped) => writeln!(
                 out,
                 "Daemon version:  unknown, because the daemon is not running"

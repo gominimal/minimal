@@ -1062,7 +1062,7 @@ mod tests {
         assert_eq!(failure_exit_code(&e), 2);
 
         let mut stderr = Vec::new();
-        let code = answer_failure(&e, false, false, &mut stderr);
+        let code = answer_failure(&e, false, false, None, &mut stderr);
         assert_eq!(code, ExitCode::from(2));
         assert_eq!(
             String::from_utf8(stderr).unwrap(),
@@ -1071,7 +1071,7 @@ mod tests {
         );
 
         let mut stderr = Vec::new();
-        let code = answer_failure(&e, true, false, &mut stderr);
+        let code = answer_failure(&e, true, false, None, &mut stderr);
         assert_eq!(code, ExitCode::from(2));
         let object: serde_json_lenient::Value = serde_json_lenient::from_slice(&stderr).unwrap();
         assert_eq!(object["schema"], "min/v1/error");
