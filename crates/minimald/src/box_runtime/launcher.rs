@@ -1771,6 +1771,12 @@ impl BoxLauncher for SandboxLauncher {
             }
         }
 
+        // NET-070: the hostname proxy names a host-address box's connection by
+        // its PID namespace when no holder runs in a classifier leaf.
+        if matches!(network_mode, NetworkMode::HostNet) {
+            record_host_address_box_namespace(session_id, process.get_mut().id());
+        }
+
         // Step 3 (post-spawn): hand the process to the provider, which wires its
         // namespace onto the switch; a tap the sandbox layer built travels here
         // inside `Spawned`.
