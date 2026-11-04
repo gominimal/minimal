@@ -1105,7 +1105,7 @@ mod tests {
         let e = anyhow::Error::new(minimal::PruneNeedsYes);
         assert_eq!(failure_exit_code(&e), 2);
         let mut stderr = Vec::new();
-        let code = answer_failure(&e, false, false, &mut stderr);
+        let code = answer_failure(&e, false, false, None, &mut stderr);
         assert_eq!(code, ExitCode::from(2));
         assert_eq!(
             String::from_utf8(stderr).unwrap(),
