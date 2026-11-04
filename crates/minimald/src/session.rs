@@ -4360,11 +4360,7 @@ impl Session {
     /// ended, or when the registry no longer publishes the box at `to`,
     /// since the move is read after other changes may have landed.
     #[cfg(target_os = "linux")]
-    async fn move_exposed_ports(
-        &mut self,
-        from: std::net::Ipv4Addr,
-        to: std::net::Ipv4Addr,
-    ) {
+    async fn move_exposed_ports(&mut self, from: std::net::Ipv4Addr, to: std::net::Ipv4Addr) {
         if !self.has_live_host() || self.live_ingress.is_detached() {
             return;
         }
