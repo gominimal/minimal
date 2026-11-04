@@ -1631,13 +1631,22 @@ echo "::endgroup::"
 # shared box. The client of each goes away, and the exec id alone brings it
 # back: `min://exec/attach <id>` replays the terminal and takes input again,
 # `min://exec/wait <id>` and `min://exec/output <id>` read the detached exec.
+# An exec runs its argv unshelled, in the box's namespaces, cgroup and working
+# directory, and this case checks each of them against a shell exec.
 # `min` has no command for these requests yet, so the proof sends them over a
 # plain `ssh`, built from the transport `min session setup-zed --print` gives
 # (its ProxyCommand onto the daemon socket, the box selector, the host key).
+# This route is interim. `min box exec -t|--detach` comes with
+# https://github.com/gominimal/minimal/issues/2905 (BCLI T15), and
+# `min box attach|wait|logs|stop --exec` with
+# https://github.com/gominimal/minimal/issues/2913 (BCLI T16). This case moves
+# to those commands when those issues close. One span over the drop and the
+# re-attach is https://github.com/gominimal/minimal/issues/2978.
 proof_exec_reattach() {
 echo "::group::exec by id proof (min://exec terminal and detached, client dropped)"
 proof_shared_session
-local entry host user opts er_ssh tty_id det_id att1 att1_pid out2 rc det_out det_again i want
+local entry host user opts er_ssh tty_id det_id att1 att1_pid fifo out2 rc det_out det_again i want
+local sh_ns ex_ns ex_cwd sh_cg ex_cg argv_out n_att n_drop
 entry="$(mnl session setup-zed "$sid" --print 2>"$WORK/exec-reattach-zed.err")" || {
   echo "::error::'min session setup-zed $sid --print' failed"
   echo "--- stderr ---"; cat "$WORK/exec-reattach-zed.err" 2>/dev/null || true
@@ -1649,9 +1658,79 @@ opts=()
 while IFS= read -r i; do opts+=("$i"); done < <(printf '%s' "$entry" | jq -r '.args[]')
 er_ssh=(ssh -F /dev/null -T -o BatchMode=yes -o ConnectTimeout=30 "${opts[@]}" "$user@$host")
 
+# A detached exec of an argv, unshelled: start it, wait for its exit, and
+# print its output. $1 names the step, $2 is the argv as a JSON array, and
+# $3 is the exit code the exec must give. It reports a failure on stderr
+# and returns non-zero, because `fail` in a command substitution ends only
+# the subshell.
+er_detached() {
+  local id rc
+  id="$("${er_ssh[@]}" "min://exec {\"argv\":$2,\"mode\":\"detached\"}" \
+    2>"$WORK/exec-reattach-$1.err" </dev/null | tr -d '\r' | tail -n1)"
+  if ! printf '%s' "$id" | grep -Eqx '[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}'; then
+    echo "::error::a detached min://exec ($1) did not answer with an exec id: '$id'" >&2
+    echo "--- stderr ---" >&2; cat "$WORK/exec-reattach-$1.err" >&2 2>/dev/null || true
+    return 1
+  fi
+  timeout 30 "${er_ssh[@]}" "min://exec/wait $id" </dev/null >/dev/null 2>>"$WORK/exec-reattach-$1.err"
+  rc=$?
+  if [ "$rc" -ne "$3" ]; then
+    echo "::error::'min://exec/wait $id' ($1) exited $rc (expected the exec's $3)" >&2
+    echo "--- stderr ---" >&2; cat "$WORK/exec-reattach-$1.err" >&2 2>/dev/null || true
+    return 1
+  fi
+  "${er_ssh[@]}" "min://exec/output $id" </dev/null 2>>"$WORK/exec-reattach-$1.err" | tr -d '\r'
+}
+
+# The argv passes through literally: no shell splits, expands or globs it.
+# shellcheck disable=SC2016 # $HOME must reach the exec as text.
+argv_out="$(er_detached argv '["printf","%s|","a b","$HOME","*"]' 0)" || fail
+# shellcheck disable=SC2016 # the literal $HOME is the expected output.
+if [ "$argv_out" != 'a b|$HOME|*|' ]; then
+  echo "::error::an unshelled exec argv did not pass through literally: expected 'a b|\$HOME|*|', got '$argv_out'"
+  fail
+fi
+
+# The namespaces and the working directory are the box's: an unshelled
+# readlink sees the same mnt, pid, net and uts namespaces as a shell exec in
+# the same box, and its cwd is /workbench.
+sh_ns="$(mnl session exec "$sid" 'readlink /proc/self/ns/mnt /proc/self/ns/pid /proc/self/ns/net /proc/self/ns/uts' 2>"$WORK/exec-reattach-shns.err")" || {
+  echo "::error::'min session exec $sid readlink /proc/self/ns/...' failed"
+  echo "--- stderr ---"; cat "$WORK/exec-reattach-shns.err" 2>/dev/null || true
+  fail
+}
+ex_ns="$(er_detached ns '["readlink","/proc/self/ns/mnt","/proc/self/ns/pid","/proc/self/ns/net","/proc/self/ns/uts","/proc/self/cwd"]' 0)" || fail
+ex_cwd="$(printf '%s\n' "$ex_ns" | sed -n 5p)"
+ex_ns="$(printf '%s\n' "$ex_ns" | sed -n 1,4p)"
+if [ "$(printf '%s\n' "$sh_ns" | wc -l)" -ne 4 ] || [ "$ex_ns" != "$sh_ns" ]; then
+  echo "::error::an unshelled exec did not run in the box's namespaces"
+  echo "--- shell exec ---"; printf '%s\n' "$sh_ns"
+  echo "--- unshelled exec ---"; printf '%s\n' "$ex_ns"
+  fail
+fi
+if [ "$ex_cwd" != "/workbench" ]; then
+  echo "::error::an unshelled exec ran in '$ex_cwd' (expected /workbench)"
+  fail
+fi
+
+# The cgroup is the box's leaf: the one the box's own init (pid 1 in the
+# box's pid namespace) is in, and the one a shell exec is in.
+sh_cg="$(mnl session exec "$sid" 'cat /proc/1/cgroup; cat /proc/self/cgroup' 2>"$WORK/exec-reattach-shcg.err")" || {
+  echo "::error::'min session exec $sid cat /proc/1/cgroup' failed"
+  echo "--- stderr ---"; cat "$WORK/exec-reattach-shcg.err" 2>/dev/null || true
+  fail
+}
+ex_cg="$(er_detached cgroup '["cat","/proc/self/cgroup"]' 0)" || fail
+if [ -z "$ex_cg" ] || [ "$sh_cg" != "$(printf '%s\n%s' "$ex_cg" "$ex_cg")" ]; then
+  echo "::error::an unshelled exec is not in the box's cgroup leaf"
+  echo "--- box init, then shell exec ---"; printf '%s\n' "$sh_cg"
+  echo "--- unshelled exec ---"; printf '%s\n' "$ex_cg"
+  fail
+fi
+
 # A terminal exec: its start answers with the id, and the client is gone.
 # shellcheck disable=SC2016 # $a and $b expand in the box, not here.
-tty_id="$("${er_ssh[@]}" 'min://exec {"argv":["sh","-c","read a; echo got:$a; sleep 3; echo while-away; read b; echo got:$b"],"mode":"tty"}' \
+tty_id="$("${er_ssh[@]}" 'min://exec {"argv":["sh","-c","read a; echo got:$a; sleep 1; echo while-away; read b; echo got:$b; exit 7"],"mode":"tty"}' \
   2>"$WORK/exec-reattach-tty.err" </dev/null | tr -d '\r' | tail -n1)"
 if ! printf '%s' "$tty_id" | grep -Eqx '[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}'; then
   echo "::error::a terminal min://exec did not answer with an exec id: '$tty_id'"
@@ -1661,15 +1740,23 @@ fi
 echo "terminal exec: $tty_id"
 
 # First client: attach by the id, type a line, see the answer, then drop.
+# Its stdin is a fifo that this shell holds open, so the client stays until
+# it is killed, and nothing else holds the job.
 att1="$WORK/exec-reattach-attach1.out"
-{ printf 'one\n'; sleep 30; } | "${er_ssh[@]}" "min://exec/attach $tty_id" >"$att1" 2>&1 &
+fifo="$WORK/exec-reattach-attach1.in"
+rm -f "$fifo"; mkfifo "$fifo"
+"${er_ssh[@]}" "min://exec/attach $tty_id" <"$fifo" >"$att1" 2>&1 &
 att1_pid=$!
+exec 9>"$fifo"
+printf 'one\n' >&9
 for i in $(seq 1 100); do
   grep -q 'got:one' "$att1" 2>/dev/null && break
   sleep 0.1
 done
 kill "$att1_pid" 2>/dev/null || true
 wait "$att1_pid" 2>/dev/null || true
+exec 9>&-
+rm -f "$fifo"
 if ! grep -q 'got:one' "$att1"; then
   echo "::error::the first attach to exec $tty_id never showed the answer to its input"
   echo "--- attach output ---"; cat "$att1" 2>/dev/null || true
@@ -1677,8 +1764,7 @@ if ! grep -q 'got:one' "$att1"; then
 fi
 
 # No client now. The exec writes on. A second client, with the id alone,
-# gets the replay, types again, and ends with the exec's exit.
-sleep 4
+# gets the replay, types again, and ends with the exec's exit code.
 printf 'two\n' | timeout 30 "${er_ssh[@]}" "min://exec/attach $tty_id" \
   >"$WORK/exec-reattach-attach2.out" 2>&1
 rc=$?
@@ -1690,14 +1776,14 @@ for want in got:one while-away got:two; do
     fail
   fi
 done
-if [ "$rc" -ne 0 ]; then
-  echo "::error::the re-attach to exec $tty_id exited $rc (expected the exec's 0)"
+if [ "$rc" -ne 7 ]; then
+  echo "::error::the re-attach to exec $tty_id exited $rc (expected the exec's 7)"
   echo "--- re-attach output ---"; printf '%s\n' "$out2"
   fail
 fi
 
 # A detached exec: its start answers with the id, and the client is gone.
-det_id="$("${er_ssh[@]}" 'min://exec {"argv":["sh","-c","echo detached-early; sleep 2; echo detached-late"],"mode":"detached"}' \
+det_id="$("${er_ssh[@]}" 'min://exec {"argv":["sh","-c","echo detached-early; sleep 2; echo detached-late; exit 7"],"mode":"detached"}' \
   2>"$WORK/exec-reattach-det.err" </dev/null | tr -d '\r' | tail -n1)"
 if ! printf '%s' "$det_id" | grep -Eqx '[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}'; then
   echo "::error::a detached min://exec did not answer with an exec id: '$det_id'"
@@ -1707,8 +1793,8 @@ fi
 echo "detached exec: $det_id"
 timeout 30 "${er_ssh[@]}" "min://exec/wait $det_id" </dev/null >/dev/null 2>"$WORK/exec-reattach-wait.err"
 rc=$?
-if [ "$rc" -ne 0 ]; then
-  echo "::error::'min://exec/wait $det_id' exited $rc (expected the exec's 0)"
+if [ "$rc" -ne 7 ]; then
+  echo "::error::'min://exec/wait $det_id' exited $rc (expected the exec's 7)"
   echo "--- stderr ---"; cat "$WORK/exec-reattach-wait.err" 2>/dev/null || true
   fail
 fi
@@ -1722,11 +1808,19 @@ if [ "$det_out" != "$(printf 'detached-early\ndetached-late')" ] || [ "$det_agai
   fail
 fi
 
-# The daemon log names the exec id at each attach and each drop. The log is
-# on this host only when the daemon is (see hook_log_readable).
+# The daemon log names the exec id at each attach and each drop: two
+# attaches (the first client and the re-attach) and one drop (the first
+# client). The log is on this host only when the daemon is (see
+# hook_log_readable).
 if hook_log_readable; then
-  if [ -z "$(hook_log_has "$tty_id")" ]; then
-    echo "::error::the daemon log never names terminal exec $tty_id"
+  n_att="$(find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f \
+    -exec grep -h -- "$tty_id" {} + 2>/dev/null \
+    | grep -c "a client attached to the exec's terminal")"
+  n_drop="$(find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f \
+    -exec grep -h -- "$tty_id" {} + 2>/dev/null \
+    | grep -c "the attached client went away")"
+  if [ "$n_att" -lt 2 ] || [ "$n_drop" -lt 1 ]; then
+    echo "::error::the daemon log names terminal exec $tty_id at $n_att attaches and $n_drop drops (expected 2 and 1)"
     fail
   fi
 else
