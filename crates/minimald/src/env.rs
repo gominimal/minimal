@@ -1571,11 +1571,21 @@ fn channel_method(request: &str) -> &'static str {
         .unwrap_or("other")
 }
 
+/// A request line safe to log: a `run` request carries the caller's
+/// exported environment, secrets included, as its last group, so that group
+/// is cut.
+fn loggable_request(line: &str) -> std::borrow::Cow<'_, str> {
+    match line.match_indices(RUN_GROUP_SEP).nth(1) {
+        Some((at, _)) => format!("{}<environment redacted>", &line[..=at]).into(),
+        None => line.into(),
+    }
+}
+
 impl BoxChannel {
     /// Drives the actor until the bridge (and thus all senders) is dropped.
     async fn run(mut self) {
         while let Some(ChannelRequest { line, mut stream }) = self.rx.recv().await {
-            tracing::trace!("session channel handling: {line}");
+            tracing::trace!("session channel handling: {}", loggable_request(&line));
             let (span, line) = channel_request_span(&line, &self.box_id, self.session_id);
             // Boxed: the handler's future is large (every subcommand's state in
             // one `async fn`) and it is awaited once per request, not per byte.
@@ -2114,16 +2124,17 @@ impl BoxChannel {
         // BCLI-010 (T62): a relaying helper prints `err:` lines on stderr,
         // and an older one prints only `msg:` lines.
         let note_tag = if relays { "err" } else { "msg" };
-        let (mut ctx, graph, _) = if let Ok(v) = self.refresh_tagged(stream, note_tag).await {
-            v
-        } else {
-            return relay_refusal_exit(stream, relays, task_name, EXIT_MIN_FAILURE);
+        let (mut ctx, graph, _) = match self.refresh_tagged(stream, note_tag).await {
+            Ok(v) => v,
+            Err(e) => {
+                return relay_refusal_exit(stream, relays, task_name, refusal_exit_code(&e));
+            }
         };
 
         let (mut task, mut graph) = match ctx.task(graph, task_name) {
             Err(e) => {
                 Self::write_error_tagged(&e, stream, note_tag);
-                return relay_refusal_exit(stream, relays, task_name, EXIT_MIN_FAILURE);
+                return relay_refusal_exit(stream, relays, task_name, refusal_exit_code(&e));
             }
             Ok(None) => {
                 let _ = writeln!(stream, "error: no such task '{task_name}'");
@@ -2264,7 +2275,7 @@ impl BoxChannel {
         }
         if let Err(e) = result {
             Self::write_error_tagged(&e, stream, note_tag);
-            relay_refusal_exit(stream, relays, task_name, EXIT_MIN_FAILURE);
+            relay_refusal_exit(stream, relays, task_name, refusal_exit_code(&e));
         }
     }
 
@@ -2618,26 +2629,27 @@ impl BoxChannel {
         &mut self,
         stream: &mut UnixStream,
     ) -> Result<(Context, Graph, HashSet<BuildSpecRef>), ()> {
-        self.refresh_tagged(stream, "msg").await
+        self.refresh_tagged(stream, "msg").await.map_err(|_| ())
     }
 
-    /// [`Self::refresh`] with a failure's report lines sent under `tag`.
+    /// [`Self::refresh`] with a failure's report lines sent under `tag`. A
+    /// failure comes back as the `Error` it reported.
     async fn refresh_tagged(
         &mut self,
         stream: &mut UnixStream,
         tag: &str,
-    ) -> Result<(Context, Graph, HashSet<BuildSpecRef>), ()> {
-        let error = |e: &Error, stream: &mut UnixStream| {
-            Self::write_error_tagged(e, stream, tag);
-            Err(())
+    ) -> Result<(Context, Graph, HashSet<BuildSpecRef>), Error> {
+        let error = |e: Error, stream: &mut UnixStream| {
+            Self::write_error_tagged(&e, stream, tag);
+            Err(e)
         };
 
         let mut ctx = match self.ctx.cloned_reinit() {
-            Err(e) => return error(&e, stream),
+            Err(e) => return error(e, stream),
             Ok(ctx) => ctx,
         };
         let mut graph = match ctx.graph_from_all_packages() {
-            Err(e) => return error(&e, stream),
+            Err(e) => return error(e, stream),
             Ok(g) => g,
         };
 
@@ -2645,12 +2657,12 @@ impl BoxChannel {
         let no_such = |name: String| Error::Graph(Box::new(graph::Error::NoSuchPkg { name }));
         let new_top_levels: Vec<BuildSpecRef> =
             match Self::remap_refs(&self.graph, &graph, &self.graph.top_levels) {
-                Err(name) => return error(&no_such(name), stream),
+                Err(name) => return error(no_such(name), stream),
                 Ok(v) => v,
             };
         let new_has_packages: HashSet<BuildSpecRef> =
             match Self::remap_refs(&self.graph, &graph, &self.has_packages) {
-                Err(name) => return error(&no_such(name), stream),
+                Err(name) => return error(no_such(name), stream),
                 Ok(v) => v,
             };
         graph.top_levels = new_top_levels;
@@ -3074,6 +3086,19 @@ const EXIT_USAGE: u8 = 2;
 /// The code `min task run` exits with when `min` itself fails, before or
 /// around the task.
 const EXIT_MIN_FAILURE: u8 = 125;
+/// The code `min task run` exits with when the project configuration
+/// (`minimal.toml` or a package file) is not valid.
+const EXIT_CONFIG: u8 = 3;
+
+/// The code a refused run exits with for the error that refused it: a
+/// configuration error is [`EXIT_CONFIG`], and any other error is a failure
+/// of `min` itself.
+fn refusal_exit_code(e: &Error) -> u8 {
+    match e {
+        Error::Config(_) | Error::Format(_) | Error::MFile(_) => EXIT_CONFIG,
+        _ => EXIT_MIN_FAILURE,
+    }
+}
 
 /// Ends a refused run with `exit:<code>` for a helper that relays exit
 /// codes. An older helper stops at the `error:` line and gets nothing more.
@@ -4309,6 +4334,28 @@ exit $rc
         ))
     }
 
+    /// BCLI-010 (T62): a refusal for a project configuration error exits 3,
+    /// and any other refusal exits 125.
+    #[test]
+    fn refusal_exit_code_gives_a_config_error_exit_3() {
+        let config = Error::Config(mctx::ConfigError::InvalidRemoteCacheUrl(String::new()));
+        assert_eq!(refusal_exit_code(&config), 3);
+        let other = Error::Other(anyhow::anyhow!("no sandbox"));
+        assert_eq!(refusal_exit_code(&other), 125);
+    }
+
+    /// The channel's trace log never carries a `run` request's environment.
+    #[test]
+    fn loggable_request_cuts_the_run_environment() {
+        let line = "run%/w\u{1e}lint\u{1f}a\u{1e}TOKEN=secret\u{1f}HOME=/h";
+        let logged = loggable_request(line);
+        assert_eq!(
+            logged,
+            "run%/w\u{1e}lint\u{1f}a\u{1e}<environment redacted>"
+        );
+        assert_eq!(loggable_request("run%lint a b"), "run%lint a b");
+    }
+
     /// BCLI-010 (T62): `min task run`, a task box's entrypoint, exits with
     /// the code the channel relays for the task, and the channel relays the
     /// task's own code.
@@ -4366,6 +4413,7 @@ exit $rc
                 "err:report\nerror: sandbox command failed.\nexit:125\n",
                 125,
             ),
+            ("err:report\nerror: sandbox command failed.\nexit:3\n", 3),
             // A refusal with no `exit:` line, as an older daemon sends.
             ("error: no such task nope\n", 125),
         ] {
