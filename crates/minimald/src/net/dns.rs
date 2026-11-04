@@ -969,6 +969,124 @@ pub struct HostnameRegistry {
     /// gateway, the host alias, the daemon) — so a peer at a reserved address
     /// is never misread as a box.
     by_lease: HashMap<Ipv4Addr, SessionId>,
+    /// The zone table's change count and the installed answerer's
+    /// acknowledgement of it (NET-011, NET-012): what lets a registration
+    /// return only once the name answers there.
+    zone_track: ZoneTrack,
+}
+
+/// What the installed answerer has acknowledged of this registry's zone
+/// table: whether this daemon publishes into one at all, and the newest
+/// table generation one of its acks covered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ZoneAckState {
+    /// Whether this daemon publishes into an installed answerer. While it
+    /// does not, the daemon's own table is what answers, so every waiter
+    /// resolves at once.
+    publishing: bool,
+    /// The newest generation an acknowledged publish carried.
+    acknowledged: u64,
+}
+
+/// The registry's count of zone-table changes: one generation per change
+/// of the rows a lookup is answered from, found by comparing the table
+/// with the one last observed.
+#[derive(Debug)]
+struct ZoneTrack {
+    /// The current generation.
+    generation: u64,
+    /// The table as last observed, at `generation`.
+    observed: Vec<ZoneRow>,
+    /// The acknowledgement state, shared with the publish.
+    acks: std::sync::Arc<tokio::sync::watch::Sender<ZoneAckState>>,
+    /// Pinged when a waiter is handed out for a generation the installed
+    /// answerer has not acknowledged, so the held publish sends it at once.
+    changed: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl Default for ZoneTrack {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            observed: Vec::new(),
+            acks: std::sync::Arc::new(tokio::sync::watch::Sender::new(ZoneAckState::default())),
+            changed: std::sync::Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+}
+
+/// The publish's half of [`ZoneTrack`]: held outside the registry's lock,
+/// so an acknowledgement never takes it.
+#[derive(Debug, Clone)]
+pub struct ZonePublishTrack {
+    acks: std::sync::Arc<tokio::sync::watch::Sender<ZoneAckState>>,
+    changed: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl ZonePublishTrack {
+    /// Says whether this daemon publishes into an installed answerer. Set
+    /// to `false`, every waiter resolves at once.
+    pub fn set_publishing(&self, publishing: bool) {
+        self.acks.send_if_modified(|state| {
+            let modified = state.publishing != publishing;
+            state.publishing = publishing;
+            modified
+        });
+    }
+
+    /// Records that the installed answerer acknowledged a publish of the
+    /// table at `generation`, resolving every waiter at or below it.
+    pub fn acknowledge(&self, generation: u64) {
+        self.acks.send_if_modified(|state| {
+            let modified = generation > state.acknowledged;
+            state.acknowledged = state.acknowledged.max(generation);
+            modified
+        });
+    }
+
+    /// The newest generation the installed answerer acknowledged.
+    #[must_use]
+    pub fn acknowledged(&self) -> u64 {
+        self.acks.borrow().acknowledged
+    }
+
+    /// Resolves when a waiter is handed out for a generation not yet
+    /// acknowledged. One ping is kept if nothing waits for it.
+    pub async fn changed(&self) {
+        self.changed.notified().await;
+    }
+}
+
+/// A wait for the installed answerer to acknowledge one zone-table
+/// generation ([`HostnameRegistry::zone_change_waiter`]).
+#[derive(Debug)]
+pub struct ZoneChangeWaiter {
+    generation: u64,
+    acks: tokio::sync::watch::Receiver<ZoneAckState>,
+}
+
+impl ZoneChangeWaiter {
+    /// The generation this waiter waits for.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Waits, at most `bound`, for the installed answerer to acknowledge
+    /// this waiter's generation. Resolves at once when this daemon
+    /// publishes into no installed answerer. `false` is a wait that ran
+    /// past its bound.
+    pub async fn wait(mut self, bound: Duration) -> bool {
+        let generation = self.generation;
+        let waited = tokio::time::timeout(
+            bound,
+            self.acks
+                .wait_for(|state| !state.publishing || state.acknowledged >= generation),
+        )
+        .await;
+        // A closed channel means the registry is gone: nothing waits on it.
+        !matches!(waited, Err(_elapsed))
+    }
 }
 
 /// The `<host-id>` labels one daemon answers for: its own instance id, and
@@ -1015,6 +1133,7 @@ impl HostnameRegistry {
             host_net: HashSet::new(),
             attaching: HashSet::new(),
             by_lease: HashMap::new(),
+            zone_track: ZoneTrack::default(),
         }
     }
 
@@ -2328,6 +2447,45 @@ impl HostnameRegistry {
             .collect();
         rows.sort_unstable_by(|a, b| a.name.cmp(&b.name));
         rows
+    }
+
+    /// The zone table with the generation it stands at: the generation
+    /// moves on by one when the table differs from the one last observed.
+    /// A publish carries the generation it read, so its ack says how far
+    /// the installed answerer has caught up.
+    pub fn observe_zone(&mut self) -> (u64, Vec<ZoneRow>) {
+        let table = self.zone_table(&[]);
+        let track = &mut self.zone_track;
+        if table != track.observed {
+            track.generation += 1;
+            track.observed.clone_from(&table);
+        }
+        (track.generation, table)
+    }
+
+    /// A waiter for the installed answerer to acknowledge the table as it
+    /// stands now (NET-011, NET-012). Take it under the same write lock as
+    /// the change it waits for. When the generation is not yet
+    /// acknowledged, the held publish is woken to send it at once.
+    pub fn zone_change_waiter(&mut self) -> ZoneChangeWaiter {
+        let (generation, _) = self.observe_zone();
+        let track = &self.zone_track;
+        if generation > track.acks.borrow().acknowledged {
+            track.changed.notify_one();
+        }
+        ZoneChangeWaiter {
+            generation,
+            acks: track.acks.subscribe(),
+        }
+    }
+
+    /// The publish's handle on the acknowledgement state.
+    #[must_use]
+    pub fn zone_publish_track(&self) -> ZonePublishTrack {
+        ZonePublishTrack {
+            acks: std::sync::Arc::clone(&self.zone_track.acks),
+            changed: std::sync::Arc::clone(&self.zone_track.changed),
+        }
     }
 }
 
