@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
 
@@ -174,6 +174,33 @@ pub fn read_host_exposures(path: &Path) -> Result<HostExposures, HostExposuresEr
 /// stamp. `None` is a file that does not exist.
 type Stamp = Option<(SystemTime, u64, u64)>;
 
+/// How close to a read a modification time must be for the stamp alone not
+/// to prove the file unchanged. An edit inside one timestamp tick that keeps
+/// the length keeps the stamp too, and some filesystems tick once in two
+/// seconds.
+const RACY_WINDOW: Duration = Duration::from_secs(2);
+
+/// Whether a file with stamp `stamp`, read at `read_at`, can have changed
+/// since without a change to its stamp.
+fn racy(stamp: Stamp, read_at: SystemTime) -> bool {
+    let Some((modified, _, _)) = stamp else {
+        return false;
+    };
+    !read_at
+        .duration_since(modified)
+        .is_ok_and(|age| age >= RACY_WINDOW)
+}
+
+/// One read of the file: its stamp, when it was read, its text (`None` for
+/// a missing file or a failed read) and the table it holds.
+#[derive(Debug)]
+struct Loaded {
+    stamp: Stamp,
+    read_at: SystemTime,
+    text: Option<String>,
+    table: Arc<HostExposures>,
+}
+
 fn stamp(path: &Path) -> Stamp {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::metadata(path).ok()?;
@@ -185,7 +212,7 @@ fn stamp(path: &Path) -> Stamp {
 #[derive(Debug)]
 pub struct HostExposuresFile {
     path: PathBuf,
-    state: Mutex<(Option<Stamp>, Arc<HostExposures>)>,
+    state: Mutex<Option<Loaded>>,
 }
 
 impl HostExposuresFile {
@@ -195,7 +222,7 @@ impl HostExposuresFile {
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
-            state: Mutex::new((None, Arc::new(HostExposures::default()))),
+            state: Mutex::new(None),
         }
     }
 
@@ -206,23 +233,51 @@ impl HostExposuresFile {
     }
 
     /// The current table. The file is read again when its modification
-    /// time, length or inode changed since the last read. A table that does
-    /// not read is an empty one, so a broken file opens no exposure, and
-    /// the failure is logged.
+    /// time, length or inode changed since the last read, or when its
+    /// modification time is too close to the last read to prove it
+    /// unchanged. A read whose text is the same keeps the table. A table
+    /// that does not read is an empty one, so a broken file opens no
+    /// exposure, and the failure is logged.
     pub fn current(&self) -> Arc<HostExposures> {
         let now = stamp(&self.path);
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.0 == Some(now) {
-            return Arc::clone(&state.1);
+        if let Some(loaded) = state.as_ref()
+            && loaded.stamp == now
+            && !racy(loaded.stamp, loaded.read_at)
+        {
+            return Arc::clone(&loaded.table);
         }
-        let table = match read_host_exposures(&self.path) {
-            Ok(table) => table,
+        let read_at = SystemTime::now();
+        let text = match std::fs::read_to_string(&self.path) {
+            Ok(text) => Ok(Some(text)),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(HostExposuresError::Io {
+                path: self.path.clone(),
+                source,
+            }),
+        };
+        if let (Some(loaded), Ok(text)) = (state.as_mut(), &text)
+            && loaded.text == *text
+        {
+            loaded.stamp = now;
+            loaded.read_at = read_at;
+            return Arc::clone(&loaded.table);
+        }
+        let parsed = text.and_then(|text| {
+            let table = match &text {
+                Some(body) => parse_host_exposures(body, &self.path)?,
+                None => HostExposures::default(),
+            };
+            Ok((text, table))
+        });
+        let (text, table) = match parsed {
+            Ok(parsed) => parsed,
             Err(error) => {
                 tracing::warn!(%error, "host exposures not loaded; no port is exposed");
-                HostExposures::default()
+                (None, HostExposures::default())
             }
         };
         tracing::debug!(
@@ -230,8 +285,14 @@ impl HostExposuresFile {
             entries = table.len(),
             "host exposures table reloaded"
         );
-        *state = (Some(now), Arc::new(table));
-        Arc::clone(&state.1)
+        let table = Arc::new(table);
+        *state = Some(Loaded {
+            stamp: now,
+            read_at,
+            text,
+            table: Arc::clone(&table),
+        });
+        table
     }
 }
 
@@ -279,5 +340,27 @@ mod tests {
         assert!(file.current().is_empty());
         std::fs::write(&path, "[host-exposures.web\n").unwrap();
         assert!(file.current().is_empty(), "a broken file exposes nothing");
+    }
+
+    #[test]
+    fn an_edit_that_keeps_the_stamp_is_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[host-exposures.web]\nport = 8080\n").unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let file = HostExposuresFile::new(path.clone());
+        assert!(file.current().opens(6, 8080));
+        // The same length and inode, and the modification time put back:
+        // an edit inside one timestamp tick.
+        std::fs::write(&path, "[host-exposures.web]\nport = 8081\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        let table = file.current();
+        assert!(!table.opens(6, 8080), "the removed port is closed");
+        assert!(table.opens(6, 8081), "the new port is open");
     }
 }

@@ -1561,6 +1561,10 @@ pub struct BoxGate {
     /// `egress.allow_subnets` covers the alias, and its `deny_subnets` does
     /// not.
     names_host: bool,
+    /// The protocols the box's `egress.allow_protocols` declares, by wire
+    /// number. `None` declares every protocol. A host exposure is reached
+    /// only over a declared protocol, as every other destination is.
+    host_protocols: Option<Vec<u8>>,
     /// The flows this box opened to a host exposure, so a segment of one
     /// whose exposure was removed ends the flow (NET-161).
     host_flows: Mutex<HashMap<HostFlowKey, Instant>>,
@@ -1643,6 +1647,22 @@ fn names_host_alias(
         .allow_subnets()
         .is_none_or(|allow| allow.iter().any(|cidr| cidr.contains(alias)));
     named || covered
+}
+
+/// The wire numbers of the protocols the box's `egress.allow_protocols`
+/// declares. `None` is a box that declares no list, so every protocol.
+fn declared_protocols(policy: &boxes::BoxPolicy) -> Option<Vec<u8>> {
+    let list = policy.egress.as_ref()?.allow_protocols.as_ref()?;
+    // A host exposure is TCP or UDP, so no other protocol is kept.
+    Some(
+        list.iter()
+            .filter_map(|proto| match proto {
+                boxes::IpProto::Tcp => Some(6),
+                boxes::IpProto::Udp => Some(IPPROTO_UDP),
+                _ => None,
+            })
+            .collect(),
+    )
 }
 
 /// The names a credentialed box's lookups are steered for: the GitHub
@@ -1800,6 +1820,7 @@ impl BoxGate {
             host_alias: subnet.host_alias(),
             host_exposures: std::sync::OnceLock::new(),
             names_host,
+            host_protocols: declared_protocols(policy),
             host_flows: Mutex::new(HashMap::new()),
         }
     }
@@ -1827,7 +1848,11 @@ impl BoxGate {
         let port = pkt.dst.port();
         let key = (pkt.proto, pkt.src.port(), port);
         let opens = table.current().opens(pkt.proto, port);
-        if opens && self.names_host {
+        let declared = self
+            .host_protocols
+            .as_ref()
+            .is_none_or(|list| list.contains(&pkt.proto));
+        if opens && self.names_host && declared {
             self.record_host_flow(key);
             return HostAliasVerdict::Admit;
         }
@@ -4981,6 +5006,32 @@ pub(crate) mod tests {
                 "missing {expected:?} in: {logged}"
             );
         }
+        drop(harness);
+
+        // The box's `allow_protocols` holds at the alias too: a box that
+        // names the host but declares TCP alone does not reach a UDP
+        // exposure.
+        let udp_dir = tempfile::tempdir().unwrap();
+        let udp_table = host_exposures_in(
+            udp_dir.path(),
+            "[host-exposures.dns]\nport = 5353\nproto = \"udp\"\n",
+        );
+        let mut tcp_only = host_exposure_policy(Some(vec!["host.min.internal"]), Vec::new());
+        if let Some(egress) = tcp_only.egress.as_mut() {
+            egress.allow_protocols = Some(vec![boxes::IpProto::Tcp]);
+        }
+        let mut harness = native_relay_with_table(&tcp_only, &udp_table);
+        assert!(
+            !reaches_switch(&mut harness, &udp_frame(LEASE, 40000, alias, 5353)).await,
+            "a box that declares TCP alone does not reach a UDP exposure"
+        );
+        drop(harness);
+        let named = host_exposure_policy(Some(vec!["host.min.internal"]), Vec::new());
+        let mut harness = native_relay_with_table(&named, &udp_table);
+        assert!(
+            reaches_switch(&mut harness, &udp_frame(LEASE, 40000, alias, 5353)).await,
+            "a box that declares every protocol reaches the UDP exposure"
+        );
     }
 
     /// NET-161 on a native own-address box: each flow to the alias is
