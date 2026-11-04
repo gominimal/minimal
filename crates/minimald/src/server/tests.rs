@@ -741,7 +741,11 @@ async fn spawn_backend_saying(body: &'static str) -> u16 {
         let bind = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
         bind.local_addr().unwrap().port()
     };
-    spawn_backend_on(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port), body).await;
+    spawn_backend_on(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+        body,
+    )
+    .await;
     port
 }
 

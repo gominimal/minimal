@@ -3589,8 +3589,7 @@ fn listener_local(line: &str, v6: bool) -> Option<(IpAddr, u16)> {
             chunk.copy_from_slice(&word.swap_bytes().to_be_bytes());
         }
         let v6 = std::net::Ipv6Addr::from(octets);
-        v6.to_ipv4_mapped()
-            .map_or(IpAddr::V6(v6), IpAddr::V4)
+        v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4)
     } else {
         if address.len() != 8 {
             return None;
@@ -3695,13 +3694,34 @@ mod tests {
         );
         let tables = || [(v4.as_str(), false), (v6.as_str(), true)];
         let node = Ipv4Addr::LOCALHOST;
-        assert_eq!(listener_reach(tables(), 8080, node), ListenerReach::LoopbackOnly);
-        assert_eq!(listener_reach(tables(), 9090, node), ListenerReach::Reachable);
-        assert_eq!(listener_reach(tables(), 7070, node), ListenerReach::Reachable);
-        assert_eq!(listener_reach(tables(), 6060, node), ListenerReach::NoListener);
-        assert_eq!(listener_reach(tables(), 5050, node), ListenerReach::LoopbackOnly);
-        assert_eq!(listener_reach(tables(), 4040, node), ListenerReach::Reachable);
-        assert_eq!(listener_reach(tables(), 3030, node), ListenerReach::LoopbackOnly);
+        assert_eq!(
+            listener_reach(tables(), 8080, node),
+            ListenerReach::LoopbackOnly
+        );
+        assert_eq!(
+            listener_reach(tables(), 9090, node),
+            ListenerReach::Reachable
+        );
+        assert_eq!(
+            listener_reach(tables(), 7070, node),
+            ListenerReach::Reachable
+        );
+        assert_eq!(
+            listener_reach(tables(), 6060, node),
+            ListenerReach::NoListener
+        );
+        assert_eq!(
+            listener_reach(tables(), 5050, node),
+            ListenerReach::LoopbackOnly
+        );
+        assert_eq!(
+            listener_reach(tables(), 4040, node),
+            ListenerReach::Reachable
+        );
+        assert_eq!(
+            listener_reach(tables(), 3030, node),
+            ListenerReach::LoopbackOnly
+        );
         assert_eq!(listener_reach(tables(), 1, node), ListenerReach::NoListener);
         // A node address in the reserved range is the box's own: a listener
         // there is reachable, and a 127.0.0.1 one is still loopback-only.
