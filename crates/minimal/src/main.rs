@@ -261,6 +261,10 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     if let Some(refused) = e.downcast_ref::<minimal::BoxAddressRefusal>() {
         return refused.exit_code();
     }
+    // BCLI-068: `min box attach` refused, or its connection failed.
+    if let Some(refused) = e.downcast_ref::<minimal::BoxAttachRefusal>() {
+        return refused.exit_code();
+    }
     1
 }
 

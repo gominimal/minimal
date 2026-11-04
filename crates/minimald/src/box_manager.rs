@@ -973,10 +973,7 @@ fn unknown_box(id: SessionId) -> BoxManagerError {
 /// ending is not a row of the BOX-011 table reports its status with the
 /// stored `reason`, `exit_code` and `signal` as they are.
 /// `pty_enabled` is whether the box has a terminal ([`record_has_pty`]).
-fn box_listing_entry(
-    record: &boxes::Record,
-    pty_enabled: bool,
-) -> minimald_rpc::BoxListingEntry {
+fn box_listing_entry(record: &boxes::Record, pty_enabled: bool) -> minimald_rpc::BoxListingEntry {
     let (state, reason, exit_code, signal) = match record.state() {
         Ok(state) => (
             state.name(),

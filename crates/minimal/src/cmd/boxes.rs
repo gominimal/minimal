@@ -30,6 +30,7 @@ mod vm_host;
 
 pub(crate) use address::*;
 pub use address::{AddressCandidate, BoxAddressRefusal};
+pub use attach::BoxAttachRefusal;
 pub(crate) use attach::*;
 pub use create::*;
 pub(crate) use exec::*;

@@ -1,5 +1,6 @@
-//! `min session attach`: resolving the target, the ssh hand-off and the
-//! host asks the attach answers.
+//! `min session attach` and `min box attach`: resolving the target, the
+//! ssh hand-off, the host asks the attach answers, and how the attach
+//! ended.
 
 use super::*;
 use minimal_client::box_registration::resume_box_row;
@@ -537,6 +538,504 @@ pub(crate) fn interactive_attach<W: std::io::Write>(
     let code = exit_code_of(status);
     drop(unwind);
     Ok(code)
+}
+
+// `min box attach [<box>]` (BCLI-068): find the box, refuse what cannot be
+// attached, hand the terminal to the box over ssh, and end with a code a
+// script can read.
+
+/// The exit status a daemon reports for an attach it ended: the box went
+/// away, another client took its terminal, or the daemon shut down. The
+/// daemon's binding sends it as `DAEMON_ENDED_EXIT_STATUS`.
+pub(crate) const DAEMON_ENDED_ATTACH: i32 = 254;
+
+/// The exit status ssh gives when its connection fails.
+pub(crate) const SSH_CONNECTION_FAILED: i32 = 255;
+
+/// Why `min box attach` attached to nothing, or how its attach failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoxAttachRefusal {
+    /// stdin is not a terminal. Exit 2.
+    NoTerminal,
+    /// The named box is running and has no terminal. Exit 2.
+    NoTerminalInBox {
+        /// The box as the caller named it.
+        address: String,
+    },
+    /// With no box named, more than one of the project's boxes can be
+    /// attached. Exit 2.
+    Ambiguous {
+        /// Each box that can be attached.
+        candidates: Vec<AddressCandidate>,
+    },
+    /// With no box named, no box of the project has a terminal. Exit 4.
+    NoCandidate,
+    /// With no box named, a host did not answer the lookup. Exit 7.
+    Unreachable {
+        /// Each host that did not answer.
+        hosts: Vec<String>,
+    },
+    /// The connection to the box's host failed during the attach. Exit 7.
+    ConnectionLost {
+        /// The host of the box.
+        host: String,
+        /// The box, as the messages name it.
+        address: String,
+    },
+}
+
+impl BoxAttachRefusal {
+    /// The exit code the command ends with, from the architecture's
+    /// reserved codes: 2 for a usage error, 4 for not found, 7 for an
+    /// unreachable host.
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::NoTerminal | Self::NoTerminalInBox { .. } | Self::Ambiguous { .. } => 2,
+            Self::NoCandidate => 4,
+            Self::Unreachable { .. } | Self::ConnectionLost { .. } => 7,
+        }
+    }
+
+    /// The outcome the command's tracing event records.
+    fn outcome(&self) -> &'static str {
+        match self {
+            Self::NoTerminal => "no client terminal",
+            Self::NoTerminalInBox { .. } => "box has no terminal",
+            Self::Ambiguous { .. } => "ambiguous",
+            Self::NoCandidate => "no candidate",
+            Self::Unreachable { .. } => "host unreachable",
+            Self::ConnectionLost { .. } => "connection lost",
+        }
+    }
+}
+
+impl std::fmt::Display for BoxAttachRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoTerminal => write!(
+                f,
+                "Cannot attach: stdin is not a terminal. Run `min box attach` from a terminal."
+            ),
+            Self::NoTerminalInBox { address } => write!(
+                f,
+                "Box {address} has no terminal to attach to. \
+                 Run `min box logs {address}` to see its output."
+            ),
+            Self::Ambiguous { candidates } => {
+                writeln!(f, "More than one box in this project has a terminal:")?;
+                for c in candidates {
+                    let name = if c.name.is_empty() {
+                        c.box_id.to_string()
+                    } else {
+                        c.name.clone()
+                    };
+                    writeln!(
+                        f,
+                        "  {}/{}/{}  {}  {}",
+                        c.provider, c.host, name, c.state, c.box_id
+                    )?;
+                }
+                write!(f, "Name one with `min box attach <box>`.")
+            }
+            Self::NoCandidate => write!(
+                f,
+                "No box with a terminal in this project. Start one with min box start."
+            ),
+            Self::Unreachable { hosts } => {
+                let (noun, verb) = if hosts.len() == 1 {
+                    ("host", "answers")
+                } else {
+                    ("hosts", "answer")
+                };
+                write!(
+                    f,
+                    "Could not reach {noun} {}, so no box was chosen. \
+                     Run the command again when the {noun} {verb}, \
+                     or name the box as provider/host/name.",
+                    hosts.join(", ")
+                )
+            }
+            Self::ConnectionLost { host, address } => write!(
+                f,
+                "The connection to host {host} failed during the attach. \
+                 Run `min box attach {address}` to attach again."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BoxAttachRefusal {}
+
+/// The box `min box attach` attaches to, and the host that keeps it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BoxAttachTarget {
+    /// The host that keeps the box.
+    pub host: crate::cmd::list::LocalHost,
+    /// The box's id.
+    pub box_id: boxes::SessionId,
+    /// The box's name, when it has one.
+    pub name: Option<String>,
+    /// The box as the messages name it: the address the caller gave, else
+    /// the box's name, else its id.
+    pub label: String,
+}
+
+/// How an attach ended: the code the command exits with, and the one
+/// stderr line that names why the daemon ended it, if it did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AttachEnding {
+    /// The exit code.
+    pub code: i32,
+    /// The line printed before the exit.
+    pub notice: Option<String>,
+}
+
+/// What the box's host said of the box once the attach ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BoxAfterAttach {
+    /// The host keeps the box, in this state.
+    Listed(minimald_rpc::BoxListingEntry),
+    /// The host keeps no such box.
+    Gone,
+    /// The host did not answer.
+    HostSilent,
+    /// The host answered with an error, or nobody asked it.
+    Unread,
+}
+
+/// Refuses an attach from a caller with no terminal on stdin. It runs
+/// before any lookup, so the box is not resumed and its state and events
+/// do not change.
+pub(crate) fn ensure_box_attach_tty(stdin_is_tty: bool) -> Result<(), BoxAttachRefusal> {
+    if stdin_is_tty {
+        Ok(())
+    } else {
+        tracing::info!(verb = "box attach", outcome = "no client terminal");
+        Err(BoxAttachRefusal::NoTerminal)
+    }
+}
+
+/// Attaches this terminal to a box: the box `args.target` names, else the
+/// current project's box with a terminal (BCLI-068). Ends with the code
+/// the attach ended with: 0 for a detach or an entrypoint that exited, 254
+/// after one line that names why the daemon ended the attach.
+pub async fn cmd_box_attach(global: &GlobalArgs, args: BoxAttachArgs) -> Result<(), anyhow::Error> {
+    let stdin_is_tty = std::io::stdin().is_terminal();
+    ensure_box_attach_tty(stdin_is_tty)?;
+    let scope = match args.target {
+        Some(_) => None,
+        None => {
+            let cwd = crate::attach::cwd_host_path(global)?;
+            Some(box_list_scope(cwd.as_ref())?)
+        }
+    };
+    ensure_daemon(global)?;
+    let hosts = crate::cmd::list::local_hosts(global)?;
+    let kind = daemon_host_kind(global);
+    let ending = box_attach_on_hosts(
+        hosts,
+        args.target.as_deref(),
+        scope.as_ref(),
+        stdin_is_tty,
+        async |target: &BoxAttachTarget| {
+            let host_asks = host_asks_box(global, target.name.as_deref());
+            ssh_exit_code(
+                box_via_ssh(
+                    kind,
+                    &target.host.sock,
+                    target.box_id,
+                    None,
+                    global.config_dir.as_deref(),
+                    host_asks.as_deref(),
+                )
+                .await,
+            )
+        },
+    )
+    .await?;
+    if let Some(notice) = &ending.notice {
+        eprintln!("{notice}");
+    }
+    Err(Handoff::Exit(ending.code).into())
+}
+
+/// The exit code an attach through [`box_via_ssh`] ended with: the code of
+/// its exit hand-off. Any other error is the error.
+pub(crate) fn ssh_exit_code(attached: Result<(), anyhow::Error>) -> Result<i32, anyhow::Error> {
+    match attached {
+        Ok(()) => Ok(0),
+        Err(e) => match e.downcast_ref::<Handoff>() {
+            Some(Handoff::Exit(code)) => Ok(*code),
+            _ => Err(e),
+        },
+    }
+}
+
+/// `min box attach` over the local `hosts`: refuses a caller with no
+/// terminal, finds the box ([`box_attach_target`]), runs `attach` on it,
+/// and reads how the attach ended ([`attach_ending`]). `scope` is the
+/// current project's root, which the bare form reads.
+pub(crate) async fn box_attach_on_hosts<A>(
+    hosts: Vec<crate::cmd::list::LocalHost>,
+    address: Option<&str>,
+    scope: Option<&paths::HostAbsPath>,
+    stdin_is_tty: bool,
+    attach: A,
+) -> Result<AttachEnding, anyhow::Error>
+where
+    A: AsyncFnOnce(&BoxAttachTarget) -> Result<i32, anyhow::Error>,
+{
+    ensure_box_attach_tty(stdin_is_tty)?;
+    let target = box_attach_target(hosts, address, scope).await?;
+    tracing::info!(
+        verb = "box attach",
+        box_id = %target.box_id,
+        host = %target.host.host,
+        outcome = "attaching"
+    );
+    let code = attach(&target).await.inspect_err(|err| {
+        tracing::info!(verb = "box attach", box_id = %target.box_id, outcome = "error", "{err:#}");
+    })?;
+    let after = if matches!(code, 0 | DAEMON_ENDED_ATTACH | SSH_CONNECTION_FAILED) {
+        box_after_attach(&target.host, target.box_id).await
+    } else {
+        BoxAfterAttach::Unread
+    };
+    match attach_ending(&target, code, &after) {
+        Ok(ending) => {
+            tracing::info!(
+                verb = "box attach",
+                box_id = %target.box_id,
+                exit = ending.code,
+                outcome = if ending.notice.is_some() { "ended by the host" } else { "ended" },
+                "attach ended"
+            );
+            Ok(ending)
+        }
+        Err(refusal) => {
+            tracing::info!(
+                verb = "box attach",
+                box_id = %target.box_id,
+                outcome = refusal.outcome(),
+                "{refusal}"
+            );
+            Err(refusal.into())
+        }
+    }
+}
+
+/// The box an attach goes to. A named box is resolved as every `min box`
+/// verb resolves an address, and a running box with no terminal is
+/// refused. With no box named, the current project's running box with a
+/// terminal is the one, else its only stopped or exited box with a
+/// terminal, which the attach resumes. Every host must answer that lookup.
+pub(crate) async fn box_attach_target(
+    hosts: Vec<crate::cmd::list::LocalHost>,
+    address: Option<&str>,
+    scope: Option<&paths::HostAbsPath>,
+) -> Result<BoxAttachTarget, anyhow::Error> {
+    use minimald_rpc::{Errorable, ShowBox, ShowBoxRequest};
+
+    let Some(address) = address else {
+        let mut listings = Vec::with_capacity(hosts.len());
+        for host in hosts {
+            let boxes = read_host_boxes(&host).await?;
+            listings.push(HostListing { host, boxes });
+        }
+        return project_attach_target(&listings, scope).map_err(|refusal| {
+            tracing::info!(
+                verb = "box attach",
+                outcome = refusal.outcome(),
+                "{refusal}"
+            );
+            refusal.into()
+        });
+    };
+    let ResolvedBox { host, box_id } = resolve_box_on_hosts(hosts, address, "box attach").await?;
+    let mut client = box_host_client(&host).await?;
+    let shown = match client
+        .oneshot_rpc::<ShowBox>(ShowBoxRequest { id: box_id })
+        .await
+        .context("ShowBox RPC failed")?
+    {
+        Errorable::Ok(shown) => shown,
+        Errorable::Err { error } if error.starts_with(minimald_rpc::UNKNOWN_SESSION_ID_LEAD) => {
+            // The box was removed after the address resolved.
+            tracing::info!(verb = "box attach", box_id = %box_id, outcome = "not found");
+            return Err(BoxAddressRefusal::NotFound {
+                address: address.to_owned(),
+            }
+            .into());
+        }
+        Errorable::Err { error } => bail!("{error}"),
+    };
+    // A stopped or exited box with no terminal goes on to the attach, where
+    // the host refuses its restart.
+    if !shown.record.pty_enabled && shown.record.state == "running" {
+        let refusal = BoxAttachRefusal::NoTerminalInBox {
+            address: address.to_owned(),
+        };
+        tracing::info!(verb = "box attach", box_id = %box_id, outcome = refusal.outcome());
+        return Err(refusal.into());
+    }
+    Ok(BoxAttachTarget {
+        host,
+        box_id,
+        name: shown.record.name,
+        label: address.to_owned(),
+    })
+}
+
+/// The bare form's choice over what each host answered: of the boxes of
+/// the project at `scope` that have a terminal, the one running box, else
+/// the one stopped or exited box. A host that did not answer chooses
+/// nothing, because the box can be on that host.
+pub(crate) fn project_attach_target(
+    listings: &[HostListing],
+    scope: Option<&paths::HostAbsPath>,
+) -> Result<BoxAttachTarget, BoxAttachRefusal> {
+    let silent: Vec<String> = listings
+        .iter()
+        .filter(|l| l.boxes.is_err())
+        .map(|l| l.host.host.clone())
+        .collect();
+    if !silent.is_empty() {
+        return Err(BoxAttachRefusal::Unreachable { hosts: silent });
+    }
+    let candidates: Vec<(&HostListing, &minimald_rpc::BoxListingEntry)> = listings
+        .iter()
+        .filter_map(|l| l.boxes.as_ref().ok().map(|boxes| (l, boxes)))
+        .flat_map(|(l, boxes)| boxes.iter().map(move |e| (l, e)))
+        .filter(|(_, e)| e.pty_enabled && e.project_root.as_ref() == scope)
+        .collect();
+    let in_state = |states: &[&str]| -> Vec<_> {
+        candidates
+            .iter()
+            .filter(|(_, e)| states.contains(&e.state.as_str()))
+            .copied()
+            .collect()
+    };
+    let running = in_state(&["running"]);
+    let chosen = if running.is_empty() {
+        in_state(&["stopped", "exited"])
+    } else {
+        running
+    };
+    match chosen.as_slice() {
+        [] => Err(BoxAttachRefusal::NoCandidate),
+        [(listing, entry)] => Ok(BoxAttachTarget {
+            host: listing.host.clone(),
+            box_id: entry.box_id,
+            name: entry.name.clone(),
+            label: entry
+                .name
+                .clone()
+                .unwrap_or_else(|| entry.box_id.to_string()),
+        }),
+        several => Err(BoxAttachRefusal::Ambiguous {
+            candidates: several
+                .iter()
+                .map(|(l, e)| AddressCandidate {
+                    provider: l.host.provider.to_owned(),
+                    host: l.host.host.clone(),
+                    name: e.name.clone().unwrap_or_default(),
+                    state: box_state_label(e),
+                    box_id: e.box_id,
+                })
+                .collect(),
+        }),
+    }
+}
+
+/// What `host` says of box `id` once an attach to it ended. The host is
+/// probed once, under the probe bound, so a host that went down does not
+/// hold the exit.
+pub(crate) async fn box_after_attach(
+    host: &crate::cmd::list::LocalHost,
+    id: boxes::SessionId,
+) -> BoxAfterAttach {
+    use minimald_rpc::{Errorable, ShowBox, ShowBoxRequest};
+
+    let read = tokio::time::timeout(client::PROBE_TIMEOUT, async {
+        let mut client = match client::Client::probe(&host.sock).await {
+            Ok(client) => client,
+            Err(client::ProbeRefusal::NotRunning) => return BoxAfterAttach::HostSilent,
+            Err(client::ProbeRefusal::Unreachable(e)) => {
+                tracing::debug!(host = %host.host, "the host did not answer after the attach: {e:#}");
+                return BoxAfterAttach::HostSilent;
+            }
+        };
+        match client.oneshot_rpc::<ShowBox>(ShowBoxRequest { id }).await {
+            Ok(Errorable::Ok(shown)) => BoxAfterAttach::Listed(shown.record),
+            Ok(Errorable::Err { error })
+                if error.starts_with(minimald_rpc::UNKNOWN_SESSION_ID_LEAD) =>
+            {
+                BoxAfterAttach::Gone
+            }
+            Ok(Errorable::Err { error }) => {
+                tracing::debug!(host = %host.host, "could not read the box after the attach: {error}");
+                BoxAfterAttach::Unread
+            }
+            Err(e) => {
+                tracing::debug!(host = %host.host, "the host did not answer after the attach: {e:#}");
+                BoxAfterAttach::HostSilent
+            }
+        }
+    })
+    .await;
+    read.unwrap_or(BoxAfterAttach::HostSilent)
+}
+
+/// How an attach that ended with ssh's `code` ends the command, from what
+/// the host said of the box afterwards.
+///
+/// A daemon that ended the attach reports 254, and the line names why: the
+/// box was stopped or removed, another terminal attached to it, or its host
+/// shut down. A stop also ends the entrypoint, which the daemon reports as
+/// 0, so a box that is `stopped` with no exit code of its own ends with 254
+/// too. ssh's own 255 against a host that does not answer is a lost
+/// connection, exit 7. Every other code is the code: 0 for a detach or an
+/// entrypoint that exited.
+pub(crate) fn attach_ending(
+    target: &BoxAttachTarget,
+    code: i32,
+    after: &BoxAfterAttach,
+) -> Result<AttachEnding, BoxAttachRefusal> {
+    let label = &target.label;
+    let ended = |line: String| {
+        Ok(AttachEnding {
+            code: DAEMON_ENDED_ATTACH,
+            notice: Some(line),
+        })
+    };
+    let stopped = |entry: &minimald_rpc::BoxListingEntry| entry.state == "stopped";
+    match (code, after) {
+        (SSH_CONNECTION_FAILED, BoxAfterAttach::HostSilent) => {
+            Err(BoxAttachRefusal::ConnectionLost {
+                host: target.host.host.clone(),
+                address: label.clone(),
+            })
+        }
+        (DAEMON_ENDED_ATTACH, BoxAfterAttach::Listed(entry)) if stopped(entry) => {
+            ended(format!("Detached: {label} was stopped."))
+        }
+        (DAEMON_ENDED_ATTACH, BoxAfterAttach::Listed(entry)) if entry.state == "running" => {
+            ended(format!("Detached: another terminal attached to {label}."))
+        }
+        (DAEMON_ENDED_ATTACH, BoxAfterAttach::Listed(entry)) => {
+            ended(format!("Detached: {label} is {}.", box_state_label(entry)))
+        }
+        (DAEMON_ENDED_ATTACH, BoxAfterAttach::Gone) => {
+            ended(format!("Detached: {label} was removed."))
+        }
+        (DAEMON_ENDED_ATTACH, BoxAfterAttach::HostSilent) => {
+            ended(format!("Detached: host {} shut down.", target.host.host))
+        }
+        (0, BoxAfterAttach::Listed(entry)) if stopped(entry) && entry.exit_code.is_none() => {
+            ended(format!("Detached: {label} was stopped."))
+        }
+        _ => Ok(AttachEnding { code, notice: None }),
+    }
 }
 
 #[cfg(test)]
