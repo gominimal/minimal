@@ -284,15 +284,18 @@ pub async fn cmd_host_list(global: &GlobalArgs, out: &mut dyn Write) -> anyhow::
         writeln!(out, "No local host on this machine yet.")?;
         return Ok(());
     }
-    let mut rows = Vec::with_capacity(hosts.len());
-    for host in &hosts {
-        let (state, _) = probe_host(host).await;
-        rows.push(HostRow {
+    // Probe every host at once, so N unresponsive hosts cost one
+    // `PROBE_TIMEOUT`, not N of them.
+    let states = futures::future::join_all(hosts.iter().map(probe_host)).await;
+    let rows: Vec<HostRow> = hosts
+        .iter()
+        .zip(states)
+        .map(|(host, (state, _))| HostRow {
             name: host.name.clone(),
             provider: host.provider.name(),
             state,
-        });
-    }
+        })
+        .collect();
     writeln!(out, "{:<16} {:<14} STATE", "HOST", "PROVIDER")?;
     output::write_objects(out, OutputMode::Text, &rows)?;
     Ok(())
