@@ -4179,7 +4179,10 @@ pub(crate) mod tests {
         let t0 = Instant::now();
         let mut window = RefusedNames::new("box", t0);
         for n in 0..UNMATCHED_REFUSED_NAMES {
-            assert_eq!(window.refuse(&format!("n{n}"), t0), (RefusedLine::Log, None));
+            assert_eq!(
+                window.refuse(&format!("n{n}"), t0),
+                (RefusedLine::Log, None)
+            );
         }
         assert_eq!(window.refuse("n0", t0), (RefusedLine::Repeat, None));
         for n in 0..10 {
