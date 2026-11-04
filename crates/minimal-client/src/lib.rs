@@ -575,8 +575,15 @@ impl Client {
                 );
             }
 
-            serde_json_lenient::from_slice(&resp_buf)
-                .with_context(|| decode_context(R::NAME, &resp_buf))
+            let response: R::Response = serde_json_lenient::from_slice(&resp_buf)
+                .with_context(|| decode_context(R::NAME, &resp_buf))?;
+            // Most RPCs answer a refusal as `Errorable::Err` inside a decoded
+            // response; the caller still gets it as a response, and the span
+            // is marked failed.
+            if daemon_refused(&resp_buf) {
+                tracing::Span::current().record("otel.status_code", "ERROR");
+            }
+            Ok(response)
         };
 
         let result = tokio::time::timeout(timeout, rpc)
@@ -1189,6 +1196,19 @@ fn append_daemon_error(buf: &mut Vec<u8>, data: &[u8]) {
 /// pathological body can't become the whole error message.
 const DECODE_EXCERPT_MAX: usize = 1024;
 
+/// Whether an RPC response body is an `Errorable::Err`: an object whose only
+/// field is a string `error`. `Errorable` is untagged, so the body's shape
+/// is the only mark of a refusal a generic caller can read.
+fn daemon_refused(body: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Refusal {
+        #[expect(dead_code, reason = "only the shape is checked")]
+        error: String,
+    }
+    serde_json_lenient::from_slice::<Refusal>(body).is_ok()
+}
+
 /// Context for a response that wouldn't decode, quoting the daemon's reply
 /// verbatim.
 ///
@@ -1641,6 +1661,26 @@ pub async fn fill_git_info(entries: &mut [minimald_rpc::ListSessionsEntry]) {
 mod tests {
     use super::{Client, resolve_host_dir, resolve_socket_path};
     use std::path::Path;
+
+    /// An `Errorable::Err` body is a refusal, which marks the RPC's span
+    /// failed; a successful response, one with an `error` field among
+    /// others, or one whose `error` is not a string is not.
+    #[test]
+    fn an_errorable_err_body_is_a_refusal() {
+        use minimald_rpc::Errorable;
+        let err: Errorable<String> = Errorable::Err {
+            error: "the daemon is shutting down".to_owned(),
+        };
+        assert!(super::daemon_refused(
+            &serde_json_lenient::to_vec(&err).unwrap()
+        ));
+        assert!(!super::daemon_refused(
+            br#"{"version":"v","long_version":"v","stdlib_version":"s"}"#
+        ));
+        assert!(!super::daemon_refused(br#"{"error":"x","id":1}"#));
+        assert!(!super::daemon_refused(br#"{"error":null}"#));
+        assert!(!super::daemon_refused(b"null"));
+    }
 
     /// The daemon-error accumulator is bounded: a daemon that sprays extended
     /// data on stream 1 (during a diagnostic download or a workspace upload)
