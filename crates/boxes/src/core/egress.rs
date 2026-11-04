@@ -2197,9 +2197,51 @@ impl Default for ReplyFlows {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Host exposures: the client's `[host-exposures]` table (NET-159).
+// ---------------------------------------------------------------------------
+
+/// The client configuration table that holds the host exposures. Only the
+/// client `config.toml` sets it. A project cannot (NET-159).
+pub const HOST_EXPOSURES_TABLE: &str = "host-exposures";
+
+/// The warning for a project `minimal.toml` with a `[host-exposures]`
+/// table (NET-159).
+pub const PROJECT_HOST_EXPOSURES_IGNORED: &str = "minimal.toml has a [host-exposures] table. \
+     A project cannot open host ports to its boxes, so the table is ignored. Put the table in \
+     your own config.toml instead. Run `min dirs` to find that file.";
+
+/// Whether a project file's unknown keys hold a `[host-exposures]` table,
+/// which the reader ignores with [`PROJECT_HOST_EXPOSURES_IGNORED`]
+/// (NET-159). Logs that warning once when they do.
+pub fn warn_project_host_exposures<'a>(keys: impl IntoIterator<Item = &'a str>) -> bool {
+    let found = keys.into_iter().any(|key| key == HOST_EXPOSURES_TABLE);
+    if found {
+        tracing::warn!("{PROJECT_HOST_EXPOSURES_IGNORED}");
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NET-159: a project's `[host-exposures]` table is found among the
+    /// project's unknown keys, and the warning says it is ignored.
+    #[test]
+    fn project_host_exposures_ignored_with_warning() {
+        assert!(warn_project_host_exposures([
+            "session",
+            HOST_EXPOSURES_TABLE
+        ]));
+        assert!(!warn_project_host_exposures(["session", "host-exposure"]));
+        assert_eq!(
+            PROJECT_HOST_EXPOSURES_IGNORED,
+            "minimal.toml has a [host-exposures] table. A project cannot open host ports to \
+             its boxes, so the table is ignored. Put the table in your own config.toml \
+             instead. Run `min dirs` to find that file."
+        );
+    }
 
     /// The switch gateway's address, the resolver every rule set below is
     /// keyed to (the default switch subnet's gateway).
