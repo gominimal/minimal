@@ -3296,18 +3296,17 @@ impl BoxManager {
         // declaration naming rules its classifier cannot enforce — a denied
         // range, a narrowing allow list — and refuses it here, before
         // anything is allocated: no record, no id, no name held, no actor
-        // spawned. The host's state is the daemon's one node fact, read
-        // exactly as the create response reads it — a create is not a place
-        // that decides a box, so it re-probes nothing itself — and the
+        // spawned. The host's state is the daemon's one node fact, as
+        // [`create_host_ip_fact`] returns it: the stored fact, except that
+        // a host-address create re-reads the host when the stored fact says
+        // the start-up probe could not read the table. The gate asks the
         // same `can_decide_per_box` the launch that follows re-reads for
         // its own gate; a host that cannot decide per box answers `false`
         // and the create falls through to the exception whole — the box is
         // created, runs unenforced and is recorded as such, never refused
         // on this ground. Own-address boxes are untouched here: their
         // declarations are enforced on the address the box holds, so the
-        // gate is the host-address mode's alone. A stored fact that says
-        // the start-up probe could not read the table is re-read first
-        // ([`create_host_ip_fact`]), so the create does not answer from it.
+        // gate is the host-address mode's alone.
         let host_ip_fact = create_host_ip_fact(
             config.network,
             config
