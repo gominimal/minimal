@@ -4225,6 +4225,7 @@ dependencies = [
  "ot",
  "paths",
  "russh",
+ "russh-sftp",
  "serde",
  "serde_json_lenient",
  "tempfile",
