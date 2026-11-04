@@ -5126,6 +5126,21 @@ async fn host_ip_create_rereads_a_stale_unreadable_fact() {
     let (_state, _cache, mngr) = manager().await;
     let capture = crate::test_harness::captured_log();
     let (tree, root, mountinfo) = stand_in_classifier_tree();
+    // Resets the process-global stand-ins and the fact on every exit, a
+    // failed assert included, before the fact window's lock is released.
+    // The tree drops after the reset, so no stand-in names a removed path.
+    struct ResetStandins(Option<TempDir>);
+    impl Drop for ResetStandins {
+        fn drop(&mut self) {
+            *CREATE_CLASSIFIER_TREE_STANDIN
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = None;
+            crate::box_runtime::clear_classifier_reading_standin();
+            crate::box_runtime::clear_host_ip_enforcement_fact();
+            drop(self.0.take());
+        }
+    }
+    let _reset = ResetStandins(Some(tree));
     *CREATE_CLASSIFIER_TREE_STANDIN
         .lock()
         .unwrap_or_else(|p| p.into_inner()) = Some((root, mountinfo));
@@ -5218,11 +5233,4 @@ async fn host_ip_create_rereads_a_stale_unreadable_fact() {
         logged.contains("reread=true") && logged.contains("reread=false"),
         "each host-address create logs whether it re-read the fact:\n{logged}"
     );
-
-    *CREATE_CLASSIFIER_TREE_STANDIN
-        .lock()
-        .unwrap_or_else(|p| p.into_inner()) = None;
-    crate::box_runtime::clear_classifier_reading_standin();
-    crate::box_runtime::clear_host_ip_enforcement_fact();
-    drop(tree);
 }
