@@ -97,8 +97,8 @@ impl Exec for TaskExec {
 impl TaskExec {
     /// The older task path: the task runs in a sandbox of its own, beside
     /// the box. Kept for one release, for a client that sends its task's
-    /// arguments or its directory on the request, as a `min` from before
-    /// T43 does.
+    /// arguments on the request, as a `min` from before T43 does, and for
+    /// a box that is not a task box.
     fn sandboxed(self, session: BoxHandle) -> BoxStream<'static, io::Result<TaskProcess>> {
         // 1-slot request/response channels: the producer only spawns
         // the next child once the consumer pulls. Dropping a
@@ -748,14 +748,16 @@ pub(super) struct TaskEntrypointBox {
 /// The task box `exec` runs in, when its entrypoint is the task: a box of
 /// the task type whose stored spec names this task as its entry and an
 /// argv as its entrypoint. `None` sends the request down the older path:
-/// a request that carries the task's arguments or a directory (a client
-/// from before T43 sends them there, not in the spec), a box of another
-/// type, or a box with no spec that can be read.
+/// a request that carries the task's arguments (a client from before T43
+/// sends them there, not in the spec), a box of another type, or a box
+/// with no spec that can be read. A request's directory is no reason for
+/// the older path: the entrypoint starts there (see
+/// [`TaskEntrypointBox::start`]).
 pub(super) async fn task_entrypoint_box(
     exec: &TaskExec,
     session: &BoxHandle,
 ) -> Option<TaskEntrypointBox> {
-    if !exec.args.is_empty() || !exec.cwd.is_empty() {
+    if !exec.args.is_empty() {
         return None;
     }
     let paths = session.paths().await.ok()?;
@@ -807,7 +809,21 @@ impl TaskEntrypointBox {
         let offset = std::fs::metadata(self.dir.log_path().as_utf8_path())
             .map(|meta| meta.len())
             .unwrap_or(0);
-        crate::box_actor::entrypoint_env::stage(box_id, exec.env.into_iter().collect());
+        // `inherit_cwd`: the client sends a directory only for a task that
+        // declares it. The entrypoint starts there, so the in-box `min task
+        // run` reads it as its `$PWD`. A directory that is not in the
+        // uploaded tree starts the entrypoint at the root, with a notice.
+        let working = session.paths().await?.working;
+        let (start_dir, start_notice) =
+            match task_start_dir(true, &exec.cwd, working.as_utf8_path().as_std_path()) {
+                Ok(dir) => (dir, None),
+                Err(notice) => (None, Some(notice)),
+            };
+        crate::box_actor::entrypoint_env::stage(
+            box_id,
+            exec.env.into_iter().collect(),
+            start_dir.clone(),
+        );
         let username = self
             .record
             .username
@@ -821,11 +837,15 @@ impl TaskEntrypointBox {
         span.in_scope(|| {
             tracing::info!(
                 drop_env = exec.drop_env.len(),
+                start_dir = ?start_dir,
                 "task box: the run relays the box's entrypoint"
             );
         });
 
-        let (reader, writer) = tokio::io::duplex(64 * 1024);
+        let (reader, mut writer) = tokio::io::duplex(64 * 1024);
+        if let Some(notice) = start_notice {
+            writer.write_all(notice.as_bytes()).await?;
+        }
         let relay = spawn(
             relay_entrypoint_log(host, self.dir.clone(), offset, writer).instrument(span.clone()),
         );

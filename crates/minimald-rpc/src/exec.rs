@@ -80,11 +80,11 @@ pub enum ExecRequest {
     /// Run a task the session's project declares.
     ///
     /// On a task box whose spec names this task as its entry, with no
-    /// `args` and no `cwd`, the daemon runs the box's entrypoint, the
-    /// in-box `min task run`, and relays its output and its exit code
-    /// (T43). The task's arguments ride the entrypoint's argv. `min task
-    /// run` sends this form, with `owns_box` unset: the box ends when its
-    /// entrypoint returns and keeps its record.
+    /// `args`, the daemon runs the box's entrypoint, the in-box `min task
+    /// run`, and relays its output and its exit code (T43). The task's
+    /// arguments ride the entrypoint's argv. The entrypoint starts in `cwd`.
+    /// `min task run` sends this form, with `owns_box` unset: the box ends
+    /// when its entrypoint returns and keeps its record.
     ///
     /// `owns_box` is the older request, kept for one release: the run's
     /// claim on the session it was created for (NET-131). When it is set,

@@ -355,28 +355,42 @@ pub(crate) mod entrypoint_env {
     /// The variables staged for one box.
     type Vars = Vec<(String, String)>;
 
-    static STAGED: LazyLock<Mutex<HashMap<boxes::SessionId, Vars>>> = LazyLock::new(Mutex::default);
+    /// What one run stages for its box's entrypoint launch: the variables,
+    /// and the directory in the box where the entrypoint starts. `None`
+    /// starts it at the root of the tree.
+    type Staged = (Vars, Option<String>);
 
-    /// Stages `vars` for the next entrypoint launch of box `id`, in place
-    /// of any staged before.
-    pub(crate) fn stage(id: boxes::SessionId, vars: Vars) {
+    static STAGED: LazyLock<Mutex<HashMap<boxes::SessionId, Staged>>> =
+        LazyLock::new(Mutex::default);
+
+    /// Stages `vars` and `start_dir` for the next entrypoint launch of box
+    /// `id`, in place of any staged before.
+    pub(crate) fn stage(id: boxes::SessionId, vars: Vars, start_dir: Option<String>) {
         let mut staged = STAGED
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if vars.is_empty() {
+        if vars.is_empty() && start_dir.is_none() {
             staged.remove(&id);
         } else {
-            staged.insert(id, vars);
+            staged.insert(id, (vars, start_dir));
         }
     }
 
-    /// Takes what is staged for box `id`: empty when nothing is.
+    /// Takes what is staged for box `id`, as the launch's connection
+    /// variables. A staged directory rides among them under
+    /// [`crate::box_runtime::START_DIR_KEY`], which the launch takes out
+    /// and starts the entrypoint in. Empty when nothing is staged.
     pub(crate) fn take(id: &boxes::SessionId) -> Vars {
-        STAGED
+        let (mut vars, start_dir) = STAGED
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(id)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        vars.retain(|(name, _)| name != crate::box_runtime::START_DIR_KEY);
+        if let Some(dir) = start_dir {
+            vars.push((crate::box_runtime::START_DIR_KEY.to_string(), dir));
+        }
+        vars
     }
 }
 
@@ -890,11 +904,14 @@ impl BoxActor {
             record.id,
             &box_runtime::launch_proxy_env(&record, subnet),
         );
-        let connection_env = box_runtime::place_launch_deliveries(
+        let mut connection_env = box_runtime::place_launch_deliveries(
             &mut attach_env,
             record.id,
             &box_runtime::launch_deliveries(&record),
         );
+        // A task run's start directory is for this launch alone. The host
+        // never layers it onto what it runs later.
+        connection_env.remove(box_runtime::START_DIR_KEY);
         // The box starts from its stored spec. The actor keeps its hold, so
         // the next launch reads the same spec. A stored spec that cannot be
         // read refuses the launch, as a resume of it is refused: the box's

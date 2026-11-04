@@ -237,6 +237,12 @@ impl LaunchSpec {
     }
 }
 
+/// The connection-variable name under which a task run stages the
+/// directory its box's entrypoint starts in (`inherit_cwd`). A launch takes
+/// it out before the environment is built, so it never reaches the box.
+/// The `:` keeps it apart from any variable name a task can declare.
+pub(crate) const START_DIR_KEY: &str = "minimal:start-dir";
+
 /// Where a command should start in a session, and with what environment.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct BoxEnvironment {
@@ -1487,6 +1493,13 @@ impl BoxLauncher for SandboxLauncher {
         // follow any that the composition sets. A count that is not a
         // number adds no pairs, so the pairs the box set stay as they are.
         let mut connection = attach_env.connection;
+        // A task run's start directory rides the connection variables (see
+        // [`START_DIR_KEY`]). Only an argv entrypoint starts there.
+        let start_dir = connection
+            .iter()
+            .rposition(|(key, _)| key == START_DIR_KEY)
+            .map(|at| connection.remove(at).1);
+        connection.retain(|(key, _)| key != START_DIR_KEY);
         let git_config_count = composition_vars
             .iter()
             .chain(&connection)
@@ -1684,9 +1697,18 @@ impl BoxLauncher for SandboxLauncher {
                 // The argv runs in the same environment the shell gets.
                 // `SHELL` and `PS1` stay as composed: no shell of the
                 // daemon's choosing runs here for them to describe.
-                LaunchEntrypoint::Argv { program, args } => env
-                    .command(&container, program, args.iter().map(String::as_str))
-                    .map_err(|e| io::Error::other(format!("build command: {e}")))?,
+                LaunchEntrypoint::Argv { program, args } => {
+                    let mut command = env
+                        .command(&container, program, args.iter().map(String::as_str))
+                        .map_err(|e| io::Error::other(format!("build command: {e}")))?;
+                    // `inherit_cwd`: the in-box `min task run` reads its
+                    // `$PWD`, so the argv starts where the client ran.
+                    if let Some(dir) = &start_dir {
+                        command.current_dir(dir);
+                        command.env("PWD", dir);
+                    }
+                    command
+                }
             };
             command.stdin(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
             command.stdout(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
