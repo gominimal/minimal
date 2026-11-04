@@ -156,7 +156,7 @@ Check its claims against the staged version `X.Y.Z`, before the promotion,
 so that a fix can still go in before users get the build. Run its evals, and
 file each place where minimal-skills and the running build disagree in
 [`gominimal/inbox`](https://github.com/gominimal/inbox). The repository keeps
-one `release/vX.Y.0` branch for each release line, such as `release/v0.7.0`.
+one `release/vX.Y.x` branch for each release line.
 The release manager creates it when the line is cut.
 
 A release candidate stops here.
