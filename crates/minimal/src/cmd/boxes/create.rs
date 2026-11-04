@@ -3813,13 +3813,6 @@ mod tests {
         assert_eq!(refused.exit_code(), 3);
     }
 
-    /// BEP-017, BEP-062, BEP-080: a GitHub grant box with `dns` steering,
-    /// declared or by default, or with `both`, is created where the VM
-    /// host's switch resolves its names, and `min box spec` shows it. On a
-    /// native host, and for a `host_ip` box, both are refused for the
-    /// missing resolver. For every
-    /// case, `min box spec` refuses exactly when creation does, with the
-    /// same text.
     /// NET-046: a `none` box on a VM host holds its name with the host, as
     /// a `host_ip` box does, so the host can name it by its box id.
     #[test]
@@ -3844,6 +3837,13 @@ mod tests {
         ));
     }
 
+    /// BEP-017, BEP-062, BEP-080: a GitHub grant box with `dns` steering,
+    /// declared or by default, or with `both`, is created where the VM
+    /// host's switch resolves its names, and `min box spec` shows it. On a
+    /// native host, and for a `host_ip` box, both are refused for the
+    /// missing resolver. For every
+    /// case, `min box spec` refuses exactly when creation does, with the
+    /// same text.
     #[test]
     fn dns_steering_is_admitted_where_the_switch_resolves_boxes() {
         use boxes::core::bep::Steering;
