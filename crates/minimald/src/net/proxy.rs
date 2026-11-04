@@ -91,7 +91,9 @@ const OWNER_WALK_INTERVAL: Duration = Duration::from_secs(1);
 /// How many connections can wait on the shared owner walk at once. A
 /// connection past this is refused as a caller the proxy cannot name, so a
 /// burst from one box holds at most this many waiting, and every one of them
-/// is answered by the next walk, together with any other box's connection.
+/// is answered by the next walk. The proxy cannot tell which box opened a
+/// connection before the walk names it, so while one box holds every place,
+/// another box's connection is refused until the next walk takes the batch.
 const OWNER_LOOKUP_WAITING: usize = 64;
 
 /// How long a connection waits for the shared owner walk to answer it before
@@ -355,6 +357,9 @@ impl OwnerWalk {
     ) -> Result<super::dns::ConnectingOwner, usize> {
         let answer = {
             let mut state = self.state();
+            // A connection that timed out or went away dropped its receiver.
+            // Its entry no longer holds a place under the cap.
+            state.waiting.retain(|(_, _, tx)| !tx.is_closed());
             if state.waiting.len() >= OWNER_LOOKUP_WAITING {
                 return Err(state.waiting.len());
             }
@@ -393,8 +398,14 @@ impl OwnerWalk {
                     return;
                 }
                 state.last_walk = Some(tokio::time::Instant::now());
-                std::mem::take(&mut state.waiting)
+                let mut batch = std::mem::take(&mut state.waiting);
+                // No walk work for a connection that stopped waiting.
+                batch.retain(|(_, _, tx)| !tx.is_closed());
+                batch
             };
+            if batch.is_empty() {
+                continue;
+            }
             let pairs: Vec<(SocketAddrV4, SocketAddrV4)> = batch
                 .iter()
                 .map(|(peer, local, _)| (*peer, *local))
@@ -4922,6 +4933,45 @@ mod tests {
         for lookup in waiting {
             assert_eq!(caller_name(&lookup.await.unwrap()), "openbox");
         }
+    }
+
+    /// A connection that stops waiting frees its place under the cap. With
+    /// a walk running and 64 waiting connections gone, one more connection
+    /// is not refused, and the next walk names it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owner_lookups_that_stop_waiting_free_the_cap() {
+        fn slow_owners(
+            pairs: &[(SocketAddrV4, SocketAddrV4)],
+        ) -> Vec<crate::net::dns::ConnectingOwner> {
+            std::thread::sleep(Duration::from_millis(1500));
+            let id = SessionId::parse_str(OPEN_HOST_BOX).unwrap();
+            vec![crate::net::dns::ConnectingOwner::Box(id); pairs.len()]
+        }
+        let router = two_host_box_router(slow_owners);
+        let local = Some(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080)));
+        let spawn = |port: u16| {
+            let router = router.clone();
+            crate::traced::spawn(async move {
+                router
+                    .caller_for(SocketAddrV4::new(OPEN_HOST_BOX_ADDR, port), local)
+                    .await
+            })
+        };
+        let first = spawn(40_000);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let gone: Vec<_> = (1..=64u16).map(|n| spawn(40_000 + n)).collect();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        for lookup in &gone {
+            lookup.abort();
+        }
+        for lookup in gone {
+            let _ = lookup.await;
+        }
+        let next = router
+            .caller_for(SocketAddrV4::new(OPEN_HOST_BOX_ADDR, 50_000), local)
+            .await;
+        assert_eq!(caller_name(&next), "openbox");
+        assert_eq!(caller_name(&first.await.unwrap()), "openbox");
     }
 
     /// NET-070's verify line: a request through the hostname proxy from a
