@@ -173,6 +173,31 @@ pub fn format_policy(
     shared_port_collisions: &[minimald_rpc::SharedPortCollision],
     fabric: Option<switch::SwitchSubnet>,
 ) -> Result<(), anyhow::Error> {
+    format_policy_on_host(
+        out,
+        effective,
+        network,
+        host_ip_enforcement,
+        shared_port_collisions,
+        fabric,
+        false,
+    )
+}
+
+/// [`format_policy`], told whether the box runs on a native host.
+/// `native_host` is the caller's fact about the daemon it talks to (the
+/// host kind), never derived from `fabric`: `fabric` names a switch plan
+/// and says nothing about the host. On a native host a host-address box
+/// prints a row that says the host exposures do not apply to it (NET-160).
+pub fn format_policy_on_host(
+    out: &mut impl std::io::Write,
+    effective: &boxes::EffectiveBoxPolicy,
+    network: boxes::NetworkMode,
+    host_ip_enforcement: Option<boxes::HostIpEnforcement>,
+    shared_port_collisions: &[minimald_rpc::SharedPortCollision],
+    fabric: Option<switch::SwitchSubnet>,
+    native_host: bool,
+) -> Result<(), anyhow::Error> {
     // A none box has no network, so it can carry no egress or ingress
     // declaration at all — nothing the blocks print would describe anything
     // real (the same case the TUI's detail pane replaces with this note).
@@ -258,6 +283,18 @@ pub fn format_policy(
             out,
             "  {}",
             boxes::CredentialedUpstream::policy_row(network)
+        )?;
+    }
+    // NET-160: a host-address box on a native host runs in the host's own
+    // network namespace, so no gate applies the host exposures table to it
+    // (design §7.1 Lanes, NET-079). The row says so in place of a list of
+    // exposures. `native_host` is the caller's host kind. On a VM-backed
+    // host the box sits behind the host-side gate, and the row is not
+    // printed.
+    if network == boxes::NetworkMode::HostNet && native_host {
+        writeln!(
+            out,
+            "  host exposures  not applied: this box shares the host's network"
         )?;
     }
     // The node-plane baseline set, beside the box's rules (NET-130): the
@@ -1457,6 +1494,55 @@ mod tests {
         assert!(
             !rendered.contains("per-box enforcement"),
             "no state reported means no row, got: {rendered}"
+        );
+    }
+
+    /// NET-160: a host-address box on a native host shares the host's
+    /// network namespace, so the host exposures table is not applied to
+    /// it, and the view says so. A host that is not native, with or
+    /// without a fabric named, and an own-address box print no such row.
+    #[test]
+    fn native_host_ip_network_view_says_host_exposures_do_not_apply() {
+        const ROW: &str = "  host exposures  not applied: this box shares the host's network\n";
+        let policy = EffectiveBoxPolicy {
+            egress: EffectiveEgress::AllowAll,
+            ingress: None,
+            credentialed_upstream: None,
+        };
+        let render = |network, fabric, native_host| {
+            let mut out = Vec::new();
+            format_policy_on_host(&mut out, &policy, network, None, &[], fabric, native_host)
+                .unwrap();
+            String::from_utf8(out).unwrap()
+        };
+
+        let native = render(NetworkMode::HostNet, None, true);
+        assert!(
+            native.contains(ROW),
+            "a native host-address box must say exposures do not apply, got: {native}"
+        );
+
+        let vm = render(
+            NetworkMode::HostNet,
+            Some(switch::SwitchSubnet::default()),
+            false,
+        );
+        assert!(
+            !vm.contains("host exposures"),
+            "a VM-backed host-address box prints no such row, got: {vm}"
+        );
+
+        // No fabric named does not make the host native.
+        let unnamed = render(NetworkMode::HostNet, None, false);
+        assert!(
+            !unnamed.contains("host exposures"),
+            "a box not on a native host prints no such row, got: {unnamed}"
+        );
+
+        let own = render(NetworkMode::OwnIp, None, true);
+        assert!(
+            !own.contains("host exposures"),
+            "an own-address box prints no such row, got: {own}"
         );
     }
 
