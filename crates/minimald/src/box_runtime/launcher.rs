@@ -1773,8 +1773,15 @@ impl BoxLauncher for SandboxLauncher {
 
         // NET-070: the hostname proxy names a host-address box's connection by
         // its PID namespace when no holder runs in a classifier leaf.
-        if matches!(network_mode, NetworkMode::HostNet) {
-            record_host_address_box_namespace(session_id, process.get_mut().id());
+        // A box with no namespace of its own looks like a process outside
+        // every box to the proxy on a host without the classifier.
+        if matches!(network_mode, NetworkMode::HostNet)
+            && !record_host_address_box_namespace(session_id, process.get_mut().id())
+        {
+            tracing::warn!(
+                session = %session_label,
+                "recorded no PID namespace for the host-address box; on a host without the classifier, the hostname proxy cannot attribute its connections to it"
+            );
         }
 
         // Step 3 (post-spawn): hand the process to the provider, which wires its

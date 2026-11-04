@@ -1100,8 +1100,46 @@ pub(crate) fn host_address_box_in_namespace(namespace: (u64, u64)) -> Option<box
 
 /// The `(device, inode)` of process `pid`'s PID namespace, or `None` when
 /// `/proc` does not show it to this daemon.
+#[cfg(test)]
 pub(crate) fn pid_namespace_of(pid: u32) -> Option<(u64, u64)> {
     namespace_id(std::path::Path::new(&format!("/proc/{pid}/ns/pid")))
+}
+
+/// The deepest PID namespace nesting the kernel allows, plus the daemon's own.
+const MAX_PID_NAMESPACE_DEPTH: usize = 33;
+
+/// The `(device, inode)` of process `pid`'s PID namespace and of each of its
+/// parents, innermost first, up to the daemon's own (NET-070). A process in a
+/// box that makes a nested PID namespace (`unshare -p`, a container in the
+/// box) runs in a namespace no box recorded. Its box's namespace is one of
+/// the parents, so the owner lookup checks each of them. `None` when `/proc`
+/// does not show the namespace or the kernel refuses to name a parent.
+pub(crate) fn pid_namespaces_of(pid: u32) -> Option<Vec<(u64, u64)>> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::fs::MetadataExt as _;
+    // `_IO(0xb7, 0x2)` from `<linux/nsfs.h>`.
+    const NS_GET_PARENT: u32 = 0xb702;
+    let mut current = std::fs::File::open(format!("/proc/{pid}/ns/pid")).ok()?;
+    let mut lineage = Vec::new();
+    loop {
+        let meta = current.metadata().ok()?;
+        lineage.push((meta.dev(), meta.ino()));
+        if lineage.len() > MAX_PID_NAMESPACE_DEPTH {
+            return None;
+        }
+        // SAFETY: `current` is an open namespace file for the whole call,
+        // and `NS_GET_PARENT` takes no argument.
+        // The request is `c_ulong` on glibc and `c_int` on musl.
+        let parent = unsafe { libc::ioctl(current.as_raw_fd(), NS_GET_PARENT as _) };
+        if parent < 0 {
+            // EPERM: the parent lies outside the daemon's own namespace, or
+            // there is none. The walk is complete.
+            return (std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+                .then_some(lineage);
+        }
+        // SAFETY: the ioctl returned a new descriptor that nothing else owns.
+        current = unsafe { std::fs::File::from_raw_fd(parent) };
+    }
 }
 
 #[cfg(test)]

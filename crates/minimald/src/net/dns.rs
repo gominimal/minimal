@@ -3501,11 +3501,11 @@ pub(crate) fn connecting_box_with(
         // so it counts as unreadable.
         owner_of_holders(holders.into_iter().map(|pid| {
             let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
-            let namespace = crate::box_runtime::pid_namespace_of(pid);
+            let namespaces = crate::box_runtime::pid_namespaces_of(pid);
             if !holds_socket(pid, inode) {
                 return None;
             }
-            holder_box(&cgroup, namespace, &box_in_namespace)
+            holder_box(&cgroup, namespaces.as_deref(), &box_in_namespace)
         }))
     }
     #[cfg(not(target_os = "linux"))]
@@ -3588,7 +3588,7 @@ fn connecting_boxes_with(
                                 .cgroup
                                 .as_deref()
                                 .filter(|_| holder.still.contains(inode))?;
-                            holder_box(cgroup, holder.namespace, &box_in_namespace)
+                            holder_box(cgroup, holder.namespaces.as_deref(), &box_in_namespace)
                         }),
                 )
             })
@@ -3615,8 +3615,9 @@ struct Holder {
     still: Vec<u64>,
     /// Its `/proc/<pid>/cgroup`, or `None` when that read failed.
     cgroup: Option<String>,
-    /// Its PID namespace, or `None` when that read failed.
-    namespace: Option<(u64, u64)>,
+    /// Its PID namespace and each parent, innermost first, or `None` when
+    /// that read failed.
+    namespaces: Option<Vec<(u64, u64)>>,
 }
 
 /// The processes that hold a descriptor for any socket in `wanted`, by pid,
@@ -3650,7 +3651,7 @@ fn socket_holders_of(wanted: &BTreeSet<u64>) -> Option<BTreeMap<u32, Holder>> {
                 return None;
             }
             let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok();
-            let namespace = crate::box_runtime::pid_namespace_of(pid);
+            let namespaces = crate::box_runtime::pid_namespaces_of(pid);
             let still = held_by(pid);
             Some((
                 pid,
@@ -3658,7 +3659,7 @@ fn socket_holders_of(wanted: &BTreeSet<u64>) -> Option<BTreeMap<u32, Holder>> {
                     held,
                     still,
                     cgroup,
-                    namespace,
+                    namespaces,
                 },
             ))
         })
@@ -3754,7 +3755,7 @@ enum HolderBox {
     /// The holder runs in this box's classifier leaf.
     Leaf(SessionId),
     /// The holder runs in no classifier leaf, and in the PID namespace of
-    /// this running host-address box.
+    /// this running host-address box or in one nested inside it.
     Namespace(SessionId),
     /// The holder runs in no classifier leaf and in no box's PID namespace,
     /// as the developer's browser does.
@@ -3762,19 +3763,26 @@ enum HolderBox {
 }
 
 /// The box a holder runs in, from its `/proc/<pid>/cgroup` and its PID
-/// namespace (NET-070). A classifier leaf names its box first. A holder in no
-/// leaf is put to its PID namespace, by `box_in_namespace`. `None` when the
-/// holder is in no leaf and its namespace could not be read: the owner is
-/// then unknown, and the proxy refuses the connection.
+/// namespaces, innermost first (NET-070). A classifier leaf names its box
+/// first. A holder in no leaf is put to the first of its namespaces that
+/// `box_in_namespace` names, so a holder in a namespace nested inside a box's
+/// is that box's. `None` when the holder is in no leaf and its namespaces
+/// could not be read: the owner is then unknown, and the proxy refuses the
+/// connection.
 fn holder_box(
     cgroup: &str,
-    namespace: Option<(u64, u64)>,
+    namespaces: Option<&[(u64, u64)]>,
     box_in_namespace: impl Fn((u64, u64)) -> Option<SessionId>,
 ) -> Option<HolderBox> {
     if let Some(id) = box_in_cgroup(cgroup) {
         return Some(HolderBox::Leaf(id));
     }
-    Some(box_in_namespace(namespace?).map_or(HolderBox::Outside, HolderBox::Namespace))
+    Some(
+        namespaces?
+            .iter()
+            .find_map(|namespace| box_in_namespace(*namespace))
+            .map_or(HolderBox::Outside, HolderBox::Namespace),
+    )
 }
 
 /// The owner of a socket from the boxes its holders run in (NET-070). Each
@@ -4314,14 +4322,14 @@ mod tests {
         let in_box = |id: &str| {
             holder_box(
                 &format!("0::/minimal/boxes/deny/{id}\n"),
-                Some((1, 1)),
+                Some(&[(1, 1)]),
                 |_| None,
             )
         };
         let outside = || {
             holder_box(
                 "0::/user.slice/user-1000.slice/session-1.scope\n",
-                Some((1, 1)),
+                Some(&[(1, 1)]),
                 |_| None,
             )
         };
@@ -4365,11 +4373,16 @@ mod tests {
         let in_a = |namespace: (u64, u64)| (namespace == (7, 7)).then_some(a);
 
         assert_eq!(
-            holder_box(unplaced, Some((7, 7)), in_a),
+            holder_box(unplaced, Some(&[(7, 7)]), in_a),
             Some(HolderBox::Namespace(a))
         );
         assert_eq!(
-            holder_box(unplaced, Some((8, 8)), in_a),
+            holder_box(unplaced, Some(&[(9, 9), (7, 7), (1, 1)]), in_a),
+            Some(HolderBox::Namespace(a)),
+            "a namespace nested inside a box's is that box's"
+        );
+        assert_eq!(
+            holder_box(unplaced, Some(&[(9, 9), (8, 8), (1, 1)]), in_a),
             Some(HolderBox::Outside)
         );
         assert_eq!(
@@ -4412,6 +4425,13 @@ mod tests {
         if cfg!(target_os = "linux") {
             let own = crate::box_runtime::pid_namespace_of(std::process::id())
                 .expect("this process's namespace is readable");
+            assert_eq!(
+                crate::box_runtime::pid_namespaces_of(std::process::id())
+                    .expect("this process's namespaces are readable")
+                    .first(),
+                Some(&own),
+                "the walk starts at the process's own namespace"
+            );
             let in_own = |namespace: (u64, u64)| (namespace == own).then_some(a);
             assert_eq!(
                 connecting_box_with(peer, local, in_own),
