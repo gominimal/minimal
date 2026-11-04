@@ -8134,8 +8134,9 @@ mod tests {
 
     /// NET-046 for a box with no switch: its report carries its box id in
     /// place of a row key, and the host names the box from what it holds
-    /// under that id. A held name names a named `host_ip` box, and a
-    /// resident `host_ip` box with no held name is named by its id. A report
+    /// under that id. A `none` box is named by the name `min` holds for it
+    /// at create, over the host's door, and a resident `host_ip` box with no
+    /// held name is named by its id. A report
     /// for an id the host holds nothing for, or one that names no box, is
     /// refused and writes nothing. An older guest's report, which always
     /// carries a switch address and never a box id, still reads.
@@ -8151,8 +8152,22 @@ mod tests {
             boxes::SessionId::parse_str("00000000-0000-4000-8000-0000000000a2").expect("a box id");
         let unknown =
             boxes::SessionId::parse_str("00000000-0000-4000-8000-0000000000a3").expect("a box id");
-        registry.hold_box_name("api", Some(named));
-        assert!(registry.admit_host_ip_box(named, None));
+        // `named` is a `none` box: `min` holds its name at create, over the
+        // host's door, and that hold is all the host holds for it.
+        assert_eq!(
+            control(
+                &sock_path,
+                &BoxControlRequest::HoldBoxName(HoldBoxNameRequest {
+                    name: "api".to_string(),
+                    session_id: Some(named),
+                }),
+            )
+            .expect("the hold is answered"),
+            BoxControlReply::NameHeld {
+                name: "api".to_string(),
+                held: true,
+            }
+        );
         assert!(registry.admit_host_ip_box(unnamed, None));
 
         let report = |box_id: Option<boxes::SessionId>, port: u16| {
@@ -8162,8 +8177,9 @@ mod tests {
                     switch_address: None,
                     box_id,
                     port,
-                    decision: boxes::DynamicIngress::Deny,
-                    decided_by: minimald_rpc::ExposeDecidedBy::BoxPolicy,
+                    // An `ask` box with nobody attached, refused closed.
+                    decision: boxes::DynamicIngress::Ask,
+                    decided_by: minimald_rpc::ExposeDecidedBy::Daemon,
                     outcome: minimald_rpc::ExposeDecisionOutcome::Refused,
                 }),
             )
@@ -8196,7 +8212,8 @@ mod tests {
         assert_eq!(records[0]["box"], "api");
         assert_eq!(records[0]["box_id"], named.simple());
         assert_eq!(records[0]["port"], 4000);
-        assert_eq!(records[0]["decision"], "deny");
+        assert_eq!(records[0]["decision"], "ask");
+        assert_eq!(records[0]["decided_by"], "daemon");
         assert_eq!(records[0]["outcome"], "refused");
         assert_eq!(records[0]["reported_by"], "guest");
         assert!(
