@@ -1679,8 +1679,10 @@ fi
 # No client now. The exec writes on. A second client, with the id alone,
 # gets the replay, types again, and ends with the exec's exit.
 sleep 4
-out2="$(printf 'two\n' | timeout 30 "${er_ssh[@]}" "min://exec/attach $tty_id" 2>&1 | tr -d '\r')"
-rc=${PIPESTATUS[1]}
+printf 'two\n' | timeout 30 "${er_ssh[@]}" "min://exec/attach $tty_id" \
+  >"$WORK/exec-reattach-attach2.out" 2>&1
+rc=$?
+out2="$(tr -d '\r' <"$WORK/exec-reattach-attach2.out")"
 for want in got:one while-away got:two; do
   if ! printf '%s' "$out2" | grep -q "$want"; then
     echo "::error::the re-attach to exec $tty_id did not show '$want' (exit $rc)"
