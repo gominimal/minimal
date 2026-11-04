@@ -8,7 +8,8 @@
 //! out-of-zone names at the switch's resolver (the interim NET-079 carve-out
 //! admitted the gateway's port 53 whole) now meets a listener that answers
 //! every name outside the box zone NXDOMAIN instead, citing the same
-//! root-owned SOA as the relay: nothing outside the machine is asked. In-zone questions are refused unless every one of them is a type-A
+//! root-owned SOA as the relay: nothing outside the machine is asked.
+//! In-zone questions are refused unless every one of them is a type-A
 //! question for a name the switch's resolver answers itself
 //! ([`answered_on_the_switch`], NET-079), and those — the zone's own A
 //! records, `host.min.internal` among them — are forwarded to the switch
@@ -18,7 +19,7 @@
 //! answers a zone name the switch would send upstream with NXDOMAIN
 //! (NET-006), while the guest's table steers lookups here only from a
 //! deny-all box, whose every question outside the switch's own zone match is
-//! refused regardless. The listener does not consult the box zone
+//! answered NXDOMAIN regardless. The listener does not consult the box zone
 //! (`boxes::core::zone_answer`): on a VM host the zone is the VM host
 //! daemon's to serve (NET-138), so an in-guest listener answering zone
 //! names itself would answer stale.
@@ -242,8 +243,8 @@ fn parse(datagram: &[u8]) -> Option<Message> {
 /// deny_all guard is the caller: any question naming something outside the
 /// switch's own zone match is answered NXDOMAIN citing the root-owned SOA —
 /// the apex and a zone suffix not in exact lowercase among them, both of
-/// which the gateway would send upstream. What is left is in-zone, and refused empty (NET-136, NET-006)
-/// unless every question is a type-A question for a name the switch answers
+/// which the gateway would send upstream. What is left is in-zone, and
+/// refused empty (NET-136, NET-006) unless every question is a type-A question for a name the switch answers
 /// itself (NET-079) — the zone's A records, which the listener forwards to
 /// the gateway alone.
 fn decide(query: &Message) -> Decision {
@@ -444,11 +445,11 @@ mod tests {
         crate::net::dns_gate::tests::assert_cites_root_soa(&reply);
     }
 
-    /// REFUSED covers every record type outside the zone: the carve-out the
+    /// NXDOMAIN covers every record type outside the zone: the carve-out the
     /// interim design admitted (the gateway on port 53) answered out-of-zone
     /// AAAA and TXT alike from off the machine.
     #[test]
-    fn out_of_zone_non_a_is_refused() {
+    fn out_of_zone_non_a_is_nxdomain() {
         for rtype in [RecordType::AAAA, RecordType::TXT] {
             let query = query_of(&[("example.com.".to_string(), rtype)]);
             assert_decision(
@@ -459,12 +460,12 @@ mod tests {
         }
     }
 
-    /// The apex, and a zone suffix not in exact lowercase, are refused:
+    /// The apex, and a zone suffix not in exact lowercase, are NXDOMAIN:
     /// both name the zone in a form the switch's resolver would send
     /// upstream, so neither is the listener's to forward — deliberately
     /// narrower than the relay's NXDOMAIN leg, which answers them by name.
     #[test]
-    fn apex_and_non_lowercase_suffix_are_refused() {
+    fn apex_and_non_lowercase_suffix_are_nxdomain() {
         for name in ["min.internal.", "x.MIN.INTERNAL."] {
             let query = query_of(&[(name.to_string(), RecordType::A)]);
             assert_decision(
@@ -751,8 +752,8 @@ mod tests {
     /// names below the apex forward, and the match is
     /// [`answered_on_the_switch`] verbatim, case included — a name whose
     /// zone suffix is not the exact lowercase form the switch answers is
-    /// not the switch's to answer, so the listener refuses it rather than
-    /// forward what the gateway would send upstream.
+    /// not the switch's to answer, so the listener answers it NXDOMAIN
+    /// rather than forward what the gateway would send upstream.
     #[test]
     fn zone_match_is_the_switchs_own() {
         let query = query_of(&[
@@ -768,7 +769,7 @@ mod tests {
         assert_decision(
             &cased,
             Decision::OutOfZone,
-            "a zone suffix not in the exact lowercase form is refused",
+            "a zone suffix not in the exact lowercase form is NXDOMAIN",
         );
     }
 
