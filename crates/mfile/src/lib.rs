@@ -3164,6 +3164,34 @@ mod tests {
         }
     }
 
+    /// NET-159: a project's top-level `[host-exposures]` table is ignored
+    /// with its own warning, once, not the generic unknown-field one.
+    #[test]
+    fn project_host_exposures_are_ignored_with_warning() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MFILE_NAME),
+            "[host-exposures.web]\nport = 8080\n",
+        )
+        .unwrap();
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        File::from_dir(dir.path()).expect("the file still reads");
+        drop(guard);
+        let out = capture.contents();
+        assert_eq!(
+            out.matches(boxes::core::egress::PROJECT_HOST_EXPOSURES_IGNORED)
+                .count(),
+            1,
+            "{out}"
+        );
+        assert_eq!(count_unknown_warnings(&capture), 0, "{out}");
+    }
+
     fn count_unknown_warnings(capture: &CaptureWriter) -> usize {
         capture
             .contents()
