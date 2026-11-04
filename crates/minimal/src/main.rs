@@ -1070,7 +1070,7 @@ mod tests {
             }
             let mut stderr = Vec::new();
             assert_eq!(
-                answer_failure(&e, true, false, &mut stderr),
+                answer_failure(&e, true, false, None, &mut stderr),
                 ExitCode::from(124)
             );
             let line = String::from_utf8(stderr).unwrap();
