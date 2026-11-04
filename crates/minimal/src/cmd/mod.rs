@@ -53,7 +53,7 @@ pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
     // The verb and the outcome go on the root span (BCLI-033
     // observability), so one span tells what ran. `box_id` stays empty
     // until a command records the id it resolved, through
-    // `output::record_box_id`. No command calls it yet.
+    // `output::record_box_id`.
     let root = tracing::info_span!(
         "cmd",
         verb = command_verb(cli.command.as_ref()),
@@ -62,11 +62,6 @@ pub async fn run(cli: Cli) -> Result<(), anyhow::Error> {
         trace_id = tracing::field::Empty,
         span_id = tracing::field::Empty,
         parent_span_id = tracing::field::Empty,
-        // Recorded by the verbs that act on one box (`min box stop`,
-        // `min box rm`): the verb, the box id it resolved and its outcome.
-        verb = tracing::field::Empty,
-        box_id = tracing::field::Empty,
-        outcome = tracing::field::Empty,
     );
     // A caller may run `min` inside its own trace (a CI job, a test
     // harness, or a script in a session, whose daemon put the exec's
@@ -128,6 +123,8 @@ fn command_verb(command: Option<&Command>) -> &'static str {
             BoxCommand::Audit(_) => "box audit",
             BoxCommand::List(_) => "box list",
             BoxCommand::Show(_) => "box show",
+            BoxCommand::Stop(_) => "box stop",
+            BoxCommand::Rm(_) => "box rm",
         },
         Some(Command::Net(_)) => "net forward",
         Some(Command::FinalizeInstall(_)) => "finalize-install",
