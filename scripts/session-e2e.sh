@@ -217,6 +217,17 @@
 #                                    still answers after A's session and
 #                                    daemon stop; NOT RUN without root, on
 #                                    macOS, or on a VM lane
+#   native_names_answer_on_time
+#                                    T145 on a native host with the box-name
+#                                    service installed: a new box's name
+#                                    answers at once after activate, first
+#                                    box after a daemon start and a second;
+#                                    NXDOMAIN at once after destroy;
+#                                    host.min.internal is 127.0.0.1 on the
+#                                    host; a refused connect to an
+#                                    unpublished port is a policy-violation
+#                                    line in the daemon log; NOT RUN
+#                                    without root, a switch, or on a VM lane
 #   local_range_reserved_by_privileged_step
 #                                    NET-123's macOS half: the advisory's one
 #                                    command installs the boot-time range unit;
@@ -455,6 +466,8 @@ ASR_REVERT_LINK="" # the link that proof's advisory pointed the host resolver at
 NASR_SEED_DIR="" # seeded by the native answerer-service proof below; removed on teardown
 NASR_STATE2_DIR="" # that proof's second native node's state base; stopped on teardown
 NASR_REVERT_LINK="" # the link that proof's advisory pointed the host resolver at; reverted on teardown
+NNAT_SEED_DIR="" # seeded by the on-time names proof below; removed on teardown
+NNAT_REVERT_LINK="" # the link that proof's setup script pointed the host resolver at; reverted on teardown
 BN_API_SEED_DIR="" # its second box's seed; removed on teardown
 BN_REVERT_LINK="" # the link that proof pointed the host resolver at; reverted on teardown
 PROXY_SEED_DIR="" # seeded by the min.internal proxy proof; removed on teardown
@@ -1068,6 +1081,12 @@ teardown() {
   if [ -n "$NASR_REVERT_LINK" ]; then
     sudo -n resolvectl revert "$NASR_REVERT_LINK" >/dev/null 2>&1 || true
     sudo -n ip link del "$NASR_REVERT_LINK" >/dev/null 2>&1 || true
+  fi
+  # The on-time names proof's seed and resolver link, the same way.
+  [ -n "$NNAT_SEED_DIR" ] && rm -rf "$NNAT_SEED_DIR"
+  if [ -n "$NNAT_REVERT_LINK" ]; then
+    sudo -n resolvectl revert "$NNAT_REVERT_LINK" >/dev/null 2>&1 || true
+    sudo -n ip link del "$NNAT_REVERT_LINK" >/dev/null 2>&1 || true
   fi
   range_teardown_unit
   # Every proof that runs the advisory as root also installs the answerer
@@ -10860,6 +10879,295 @@ proof_native_answerer_survives_session_stop() {
     fail
   fi
   echo "native answerer survives session stop OK (interim, handover, second node, session and daemon stop — each printed)"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
+# Native Linux names answer on time, end to end (T145). On a native host with
+# the box-name service installed, every lookup is made at once, with no wait
+# before it, and timed from the moment the command before it returned:
+#
+#   1. The setup script `min finalize-install --show --script` prints is run
+#      as root, so the manager-held answerer serves the zone. The daemon is
+#      then stopped, so the next activate starts a fresh one.
+#   2. The first box after that daemon start answers its name on the first
+#      lookup made after `min session activate` returns. A second box does
+#      the same.
+#   3. `host.min.internal` answers 127.0.0.1 on the host, from the service
+#      and through the host's own resolver.
+#   4. The first box connects to a port the second box did not publish. The
+#      connect is refused fast, and the daemon log carries a new
+#      `network policy violation` line for that port.
+#   5. The second box's name answers NXDOMAIN on the first lookup made after
+#      `min session destroy` returns.
+#
+# Each lookup prints its name, its answer and its latency. When a lookup is
+# late, the case keeps asking for 20 s only to print when the answer came,
+# then fails. Native Linux lanes with passwordless sudo and a switch only;
+# the others record the case as NOT RUN. Every host change is undone here
+# and again by the EXIT trap.
+proof_native_names_answer_on_time() {
+  local nnat_case=native_names_answer_on_time
+  if [ -n "$E2E_VM" ]; then
+    not_run "$nnat_case" "VM-backed lane: the native daemon runs in the guest"
+    return 0
+  fi
+  if [ "$(uname -s)" != Linux ]; then
+    not_run "$nnat_case" "no native daemon on $(uname -s)"
+    return 0
+  fi
+  if ! sudo -n true >/dev/null 2>&1; then
+    not_run "$nnat_case" "no passwordless sudo: the setup script must run as root"
+    return 0
+  fi
+  if [ -z "$E2E_NATIVE_SWITCH" ]; then
+    not_run "$nnat_case" "no switch staged for own-IP boxes (E2E_NATIVE_SWITCH is empty)"
+    return 0
+  fi
+  local nnat_tool
+  for nnat_tool in systemctl resolvectl ip dig getent; do
+    if ! command -v "$nnat_tool" >/dev/null 2>&1; then
+      not_run "$nnat_case" "this host has no $nnat_tool, which installing and reading the service needs"
+      return 0
+    fi
+  done
+  echo "::group::native Linux names answer on time, end to end (T145)"
+
+  local nnat_channel=/run/minimal/answerer.sock
+  local nnat_base="$XDG_STATE_HOME/minimal"
+  local nnat_log_filter="warn,minimald::rpc=info,minimald::net::answerer=info"
+  local nnat_port="" nnat_closed_port=18193
+  NNAT_ADDR=""
+
+  if [ -e /etc/systemd/system/minzoned.socket ] || [ -e "$nnat_channel" ] \
+     || [ -e /usr/local/lib/minimal/minzoned ]; then
+    echo "removing a leftover answerer service from a prior run"
+    ANSWERER_SERVICE_CHANNEL="$nnat_channel"
+    answerer_service_teardown
+  fi
+
+  # The count of daemon log lines that carry a phrase, over every file log
+  # in the state dir: read before and after the step that must add one.
+  nnat_count() {
+    local f n=0 c
+    while IFS= read -r f; do
+      [ -f "$f" ] || continue
+      c="$(grep -cF -- "$1" "$f" 2>/dev/null || true)"
+      n=$((n + ${c:-0}))
+    done < <(find "$nnat_base/logs" -name 'minimald.log*' -type f 2>/dev/null | sort)
+    echo "$n"
+  }
+  nnat_lines() {
+    find "$nnat_base/logs" -name 'minimald.log*' -type f 2>/dev/null | sort \
+      | while IFS= read -r f; do grep -F -- "$1" "$f" 2>/dev/null; done
+  }
+  nnat_wait_more() {
+    # $1: phrase. $2: the count before. Polls 30 s.
+    local _i
+    for _i in $(seq 1 60); do
+      [ "$(nnat_count "$1")" -gt "$2" ] && return 0
+      sleep 0.5
+    done
+    return 1
+  }
+  nnat_dump_log() {
+    echo "--- minimald zone-answerer lines (tail) ---"
+    nnat_lines 'zone-answerer' | tail -n 12
+  }
+  # One lookup at the service, made at once. $1: name. $2: A or NXDOMAIN.
+  # $3: the time (ms) the step before it returned. $4: that step, for the
+  # line. Sets NNAT_ADDR to the A answer. A late answer fails the case.
+  nnat_on_time() {
+    local name="$1" want="$2" since="$3" step="$4" reply status addr ms ok=""
+    reply="$(dig +time=1 +tries=1 @127.0.0.1 -p "$nnat_port" "$name" A 2>&1 || true)"
+    ms=$(( $(now_ms) - since ))
+    status="$(printf '%s\n' "$reply" | sed -n 's/.*status: \([A-Z]*\).*/\1/p' | head -n1)"
+    addr="$(printf '%s\n' "$reply" | awk '$4 == "A" { print $5; exit }')"
+    echo "  lookup $name A at 127.0.0.1:$nnat_port, ${ms} ms after $step returned: status ${status:-none}, answer ${addr:-none}"
+    case "$want" in
+      A) [ "$status" = NOERROR ] && [ -n "$addr" ] && ok=1 ;;
+      NXDOMAIN) [ "$status" = NXDOMAIN ] && ok=1 ;;
+    esac
+    if [ -n "$ok" ]; then
+      NNAT_ADDR="$addr"
+      return 0
+    fi
+    echo "::error::$name did not answer $want on the first lookup after $step returned"
+    printf '%s\n' "$reply" | sed 's/^/    /'
+    local _i
+    for _i in $(seq 1 40); do
+      sleep 0.5
+      reply="$(dig +time=1 +tries=1 @127.0.0.1 -p "$nnat_port" "$name" A 2>/dev/null || true)"
+      status="$(printf '%s\n' "$reply" | sed -n 's/.*status: \([A-Z]*\).*/\1/p' | head -n1)"
+      addr="$(printf '%s\n' "$reply" | awk '$4 == "A" { print $5; exit }')"
+      if { [ "$want" = A ] && [ -n "$addr" ]; } || { [ "$want" = NXDOMAIN ] && [ "$status" = NXDOMAIN ]; }; then
+        echo "  $name answered $want $(( $(now_ms) - since )) ms after $step returned (late)"
+        break
+      fi
+    done
+    nnat_dump_log
+    fail
+  }
+  nnat_activate() {
+    # $1: name. Further args go to activate. Prints the session id.
+    local name="$1" sid err="$WORK/nnat-$1-activate.err"
+    shift
+    if ! sid="$(cd "$NNAT_SEED_DIR" && RUST_LOG="$nnat_log_filter" mnl session activate . \
+        --no-prompt --name "$name" --network own_ip "$@" 2>"$err")"; then
+      echo "::error::'min session activate --network own_ip' of $name failed" >&2
+      switch_spawn_fault "$err" >&2 || true
+      echo "--- stderr ---" >&2; cat "$err" >&2 2>/dev/null || true
+      return 1
+    fi
+    printf '%s\n' "$sid" | tail -n1 | tr -d '\r'
+  }
+
+  asr_answerer_ready
+  NNAT_SEED_DIR="$(hook_mktemp /tmp/mnlnnat.XXXXXX)"
+  hook_seed_preamble > "$NNAT_SEED_DIR/minimal.toml"
+  mkdir "$NNAT_SEED_DIR/.git"
+
+  # ---- 1. the box-name service installed ------------------------------------
+  local nnat_hosts_before
+  nnat_hosts_before="$(nnat_count 'holds the host loopback answerer port itself')"
+  native_switch_daemon
+  mnl stop --force >/dev/null 2>&1 || true
+  if ! RUST_LOG="$nnat_log_filter" mnl ls >/dev/null 2>"$WORK/nnat-up.err"; then
+    echo "::error::'min ls' could not bring the daemon up"
+    cat "$WORK/nnat-up.err" 2>/dev/null || true
+    fail
+  fi
+  if ! nnat_wait_more 'holds the host loopback answerer port itself' "$nnat_hosts_before"; then
+    echo "::error::the daemon never held the answerer port, so the port the service takes over is unknown"
+    nnat_dump_log
+    fail
+  fi
+  nnat_port="$(nnat_lines 'holds the host loopback answerer port itself' \
+    | tail -n1 | sed -n 's/.*"port":\([0-9][0-9]*\).*/\1/p')"
+  [ -n "$nnat_port" ] || nnat_port=7656
+  local nnat_setup="$WORK/nnat-setup.out" nnat_cmd
+  mnl finalize-install --show --script >"$nnat_setup" 2>"$nnat_setup.note" || true
+  nnat_cmd="$(setup_script_from "$nnat_setup")"
+  case "$nnat_cmd" in
+    *minzoned*) ;;
+    *)
+      echo "::error::'min finalize-install --show --script' printed no script that installs the box-name service"
+      echo "--- stdout ---"; cat "$nnat_setup" 2>/dev/null || true
+      echo "--- stderr ---"; cat "$nnat_setup.note" 2>/dev/null || true
+      fail
+      ;;
+  esac
+  NNAT_REVERT_LINK="$(printf '%s\n' "$nnat_cmd" | sed -n 's/.*resolvectl dns \([^ ][^ ]*\) .*/\1/p' | head -n1)"
+  ANSWERER_SERVICE_CHANNEL="$(answerer_channel_of "$nnat_cmd")"
+  [ -n "$ANSWERER_SERVICE_CHANNEL" ] || ANSWERER_SERVICE_CHANNEL="$nnat_channel"
+  local nnat_service_before
+  nnat_service_before="$(nnat_count 'the manager-held answerer service')"
+  setup_classifier_note "$nnat_setup"
+  # shellcheck disable=SC2024 # the output files are this user's, not root's
+  if ! sudo -n sh "$nnat_setup" >"$WORK/nnat-cmd.out" 2>"$WORK/nnat-cmd.err"; then
+    echo "::error::the setup script did not run"
+    cat "$WORK/nnat-cmd.out" "$WORK/nnat-cmd.err" 2>/dev/null || true
+    nnat_dump_log
+    fail
+  fi
+  if ! nnat_wait_more 'the manager-held answerer service' "$nnat_service_before"; then
+    echo "::error::the daemon never became a client of the box-name service"
+    nnat_dump_log
+    fail
+  fi
+  if ! systemctl is-active --quiet minzoned.socket; then
+    echo "::error::the box-name service socket unit is not active after the setup script"
+    systemctl status minzoned.socket 2>&1 | tail -n 15 || true
+    fail
+  fi
+  echo "1. the box-name service serves 127.0.0.1:$nnat_port"
+
+  # ---- 2. a new box's name answers when activate returns --------------------
+  mnl stop --force >/dev/null 2>&1 || true
+  echo "2. stopped the daemon: the next activate starts a fresh one"
+  local nnat_t nnat_a_sid nnat_b_sid nnat_a_name=e2e-nnat-a nnat_b_name=e2e-nnat-b
+  nnat_a_sid="$(nnat_activate "$nnat_a_name" --allow-subnets 100.64.0.0/10 --allow-protocols tcp)" || fail
+  nnat_t="$(now_ms)"
+  nnat_on_time "$nnat_a_name.min.internal" A "$nnat_t" "the first activate after the daemon start"
+  nnat_b_sid="$(nnat_activate "$nnat_b_name")" || fail
+  nnat_t="$(now_ms)"
+  nnat_on_time "$nnat_b_name.min.internal" A "$nnat_t" "the second box's activate"
+
+  # ---- 3. host.min.internal from the host -----------------------------------
+  nnat_t="$(now_ms)"
+  nnat_on_time host.min.internal A "$nnat_t" "the second box's lookup"
+  if [ "$NNAT_ADDR" != 127.0.0.1 ]; then
+    echo "::error::host.min.internal answered $NNAT_ADDR at the service, not 127.0.0.1"
+    fail
+  fi
+  local nnat_host_resolved
+  nnat_host_resolved="$(getent ahostsv4 host.min.internal 2>/dev/null | awk '{ print $1; exit }')"
+  echo "  getent ahostsv4 host.min.internal (the host's own resolver): ${nnat_host_resolved:-none}"
+  if [ "$nnat_host_resolved" != 127.0.0.1 ]; then
+    echo "::error::the host's resolver does not answer host.min.internal with 127.0.0.1"
+    resolvectl query host.min.internal 2>&1 || true
+    fail
+  fi
+  echo "3. host.min.internal answers 127.0.0.1 on the host"
+
+  # ---- 4. an unpublished port: refused and logged ---------------------------
+  local nnat_viol_before nnat_rc nnat_ms nnat_new
+  nnat_viol_before="$(nnat_count 'network policy violation')"
+  nnat_t="$(now_ms)"
+  mnl session exec "$nnat_a_sid" \
+    "curl -sS --max-time 8 -o /dev/null 'http://$nnat_b_name.min.internal:$nnat_closed_port/'" \
+    >"$WORK/nnat-closed.out" 2>"$WORK/nnat-closed.err"
+  nnat_rc=$?
+  nnat_ms=$(( $(now_ms) - nnat_t ))
+  echo "  connect from $nnat_a_name to $nnat_b_name.min.internal:$nnat_closed_port (not published): curl exit $nnat_rc after ${nnat_ms} ms: $(tr '\n' ' ' < "$WORK/nnat-closed.err" 2>/dev/null)"
+  if [ "$nnat_rc" -ne 7 ] || [ "$nnat_ms" -ge 6000 ]; then
+    echo "::error::the connect to the unpublished port was not refused fast (expected curl exit 7 well inside 6 s)"
+    fail
+  fi
+  if ! nnat_wait_more 'network policy violation' "$nnat_viol_before"; then
+    echo "::error::the daemon log has no new 'network policy violation' line for the refused connect"
+    nnat_lines 'network policy violation' | tail -n 5
+    fail
+  fi
+  nnat_new="$(nnat_lines 'network policy violation' | tail -n 1)"
+  echo "  daemon log line matched: $nnat_new"
+  case "$nnat_new" in
+    *"$nnat_closed_port"*) ;;
+    *)
+      echo "::error::the new 'network policy violation' line does not name port $nnat_closed_port"
+      fail
+      ;;
+  esac
+  echo "4. the refused connect to an unpublished port is logged as a policy violation"
+
+  # ---- 5. a destroyed box's name is gone when destroy returns ---------------
+  if ! mnl session destroy --force "$nnat_b_sid" >"$WORK/nnat-destroy.out" 2>&1; then
+    echo "::error::'min session destroy' of $nnat_b_name failed"
+    cat "$WORK/nnat-destroy.out" 2>/dev/null || true
+    fail
+  fi
+  nnat_t="$(now_ms)"
+  nnat_on_time "$nnat_b_name.min.internal" NXDOMAIN "$nnat_t" "destroy"
+  echo "5. $nnat_b_name.min.internal is NXDOMAIN when destroy returns"
+
+  # ---- cleanup: the host as found -------------------------------------------
+  mnl session destroy --force "$nnat_a_sid" >/dev/null 2>&1 || true
+  mnl stop --force >/dev/null 2>&1 || true
+  answerer_service_teardown
+  if [ -n "$NNAT_REVERT_LINK" ]; then
+    sudo -n resolvectl revert "$NNAT_REVERT_LINK" >/dev/null 2>&1 || true
+    if sudo -n ip link del "$NNAT_REVERT_LINK" >/dev/null 2>&1; then
+      NNAT_REVERT_LINK=""
+    else
+      echo "::warning::could not remove the dedicated link $NNAT_REVERT_LINK"
+    fi
+  fi
+  rm -rf "$NNAT_SEED_DIR"; NNAT_SEED_DIR=""
+  if ! setup_classifier_teardown; then
+    echo "::error::the classifier install the setup script made could not be removed"
+    fail
+  fi
+  echo "native names answer on time OK (each lookup, its answer and its latency printed above)"
   echo "::endgroup::"
 }
 
@@ -29956,6 +30264,7 @@ case "${1:-}" in
       not_run answerer_survives_session_stop "no privileged LaunchDaemon install on this lane"
     fi
     proof_native_answerer_survives_session_stop
+    proof_native_names_answer_on_time
     proof_hostnames_recover_and_two_daemons_route
     proof_min_internal_names_through_proxy
     proof_own_ip_deny_all_box_answers_published_port
@@ -30038,6 +30347,7 @@ case "${1:-}" in
     | local_range_reserved_by_privileged_step \
     | box_name_resolves_natively_without_proxy \
     | answerer_survives_session_stop | native_answerer_survives_session_stop \
+    | native_names_answer_on_time \
     | hostnames_recover_and_two_daemons_route \
     | min_internal_names_through_proxy | own_ip_deny_all_box_answers_published_port \
     | port_publishes_on_listen_and_box_outlives_client \
@@ -30110,6 +30420,7 @@ case "${1:-}" in
     echo "         local_range_reserved_by_privileged_step"
     echo "         box_name_resolves_natively_without_proxy"
     echo "         answerer_survives_session_stop native_answerer_survives_session_stop"
+    echo "         native_names_answer_on_time"
     echo "         fresh_linux_kvm_activate_local_minvmd fresh_arm64_kvm_activate_local_minvmd"
     echo "         linux_stock_install_runs_vm_boxes"
     echo "         hostnames_recover_and_two_daemons_route"
