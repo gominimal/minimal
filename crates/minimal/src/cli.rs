@@ -921,8 +921,9 @@ pub struct ActivateArgs {
     pub deny_all_egress: bool,
     /// Let the box reach the Box Egress Proxy, whatever its
     /// `--allow-*`/`--deny-*` rules say. Without this flag, everything the
-    /// box sends to the proxy's address is dropped. Takes effect only with
-    /// `--network own_ip`.
+    /// box sends to the proxy's address is dropped. Takes effect with
+    /// `--network own_ip`, and with `--network host_ip` on a host that runs
+    /// boxes in a VM.
     #[arg(long)]
     pub credentialed_upstream: bool,
     /// Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml`.
