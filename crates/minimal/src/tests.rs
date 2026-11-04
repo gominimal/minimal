@@ -6435,3 +6435,267 @@ async fn ls_reports_every_proxy_port() {
     assert_eq!(request.trim(), r#"{"verb":"proxy_ports"}"#);
     assert!(cmd::vm_host_proxy_ports_at(None).await.is_empty());
 }
+
+/// One `min box` command the end-to-end test below ran: its spelling, and
+/// the stdout, stderr and exit code the command ends with.
+struct BoxCommandRun {
+    command: String,
+    stdout: String,
+    stderr: String,
+    exit: u8,
+}
+
+impl std::fmt::Display for BoxCommandRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "$ {}", self.command)?;
+        writeln!(f, "exit: {}", self.exit)?;
+        writeln!(f, "stdout:\n{}", self.stdout)?;
+        writeln!(f, "stderr:\n{}", self.stderr)
+    }
+}
+
+/// The transcript of every command the end-to-end test ran so far, for its
+/// failure messages.
+fn box_transcript(runs: &[BoxCommandRun]) -> String {
+    runs.iter().map(ToString::to_string).collect()
+}
+
+/// The stderr and the exit code a `min box` command ends with for
+/// `result`: nothing and 0 on success, else the error and the code
+/// `main` maps it to (2 for the running-box refusal, 1 for the rest).
+fn box_command_ending(result: &Result<(), anyhow::Error>) -> (String, u8) {
+    match result {
+        Ok(()) => (String::new(), 0),
+        Err(err) if err.downcast_ref::<BoxRunningRefusal>().is_some() => {
+            (format!("{err:#}"), BoxRunningRefusal::EXIT_CODE)
+        }
+        Err(err) => (format!("{err:#}"), 1),
+    }
+}
+
+/// Runs one `min box <verb>` step inside its own `box_verb` span, and
+/// records the command with its output in `runs`.
+async fn run_box_command<F>(
+    runs: &mut Vec<BoxCommandRun>,
+    verb: &'static str,
+    command: String,
+    box_id: &str,
+    step: F,
+) -> u8
+where
+    F: AsyncFnOnce(&mut Vec<u8>) -> Result<(), anyhow::Error>,
+{
+    use tracing::Instrument as _;
+
+    let span = tracing::info_span!("box_verb", verb, box_id);
+    let mut stdout = Vec::new();
+    let result = async {
+        let result = step(&mut stdout).await;
+        let (_, exit) = box_command_ending(&result);
+        tracing::info!(exit, "min box {verb} ran");
+        result
+    }
+    .instrument(span)
+    .await;
+    let (stderr, exit) = box_command_ending(&result);
+    runs.push(BoxCommandRun {
+        command,
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr,
+        exit,
+    });
+    exit
+}
+
+// The first slice end to end (BCLI-001, BCLI-003, BCLI-004, BCLI-051,
+// BCLI-059, BCLI-060): `min box list|show|stop|rm` of one box over a
+// harness daemon that the native host's socket serves. Each step resolves
+// the host and connects as the command does, and renders what the command
+// prints. A failed step prints every command run so far, with its stdout,
+// stderr and exit code.
+#[tokio::test]
+async fn box_first_slice_list_show_stop_rm_end_to_end() {
+    use minimald_rpc::{Errorable, ShowBox, ShowBoxRequest};
+
+    let log = minimald::test_harness::captured_log();
+    let state = tempfile::tempdir().expect("a temp minimal state dir");
+    let global = GlobalArgs {
+        repo_dir: None,
+        minimal_dir: Some(state.path().to_path_buf()),
+        config_dir: None,
+        provider: Some(Provider::LocalMinimald),
+        no_input: true,
+        vm: None,
+    };
+    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
+        .expect("the native daemon's socket path");
+    std::fs::create_dir_all(sock.parent().expect("the socket has a dir"))
+        .expect("the native daemon's state dir");
+    let server = minimald::test_harness::TestServer::new().await;
+    server.listen_on_uds(&sock).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let mut daemon = server.connect().await;
+    let id = minimald::test_harness::create_configured_session(
+        &mut daemon,
+        "web",
+        project.path().to_str().expect("a UTF-8 project path"),
+    )
+    .await
+    .to_string();
+
+    let host = local_hosts(&global)
+        .expect("the local hosts")
+        .into_iter()
+        .find(|host| host.selected)
+        .expect("the native host is selected");
+    let mut runs = Vec::new();
+
+    // `min box list --all`: the box's id, name, type, state, provider
+    // and host.
+    let list = async |out: &mut Vec<u8>| {
+        let mut client = connect_daemon(&global).await?;
+        let listed: Vec<ListedBox> = list_box_records(&mut client, None)
+            .await?
+            .into_iter()
+            .map(|record| ListedBox {
+                provider: host.provider.to_string(),
+                host: host.host.clone(),
+                record,
+            })
+            .collect();
+        render_box_list(out, &listed, false)?;
+        Ok(())
+    };
+    let exit = run_box_command(&mut runs, "list", "min box list --all".into(), &id, list).await;
+    let transcript = box_transcript(&runs);
+    assert_eq!(exit, 0, "{transcript}");
+    let listing = &runs[0].stdout;
+    let mut lines = listing.lines();
+    let header: Vec<&str> = lines
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect();
+    for column in ["ID", "NAME", "TYPE", "STATE", "PROVIDER", "HOST"] {
+        assert!(header.contains(&column), "no {column} column\n{transcript}");
+    }
+    let row: Vec<&str> = lines
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect();
+    assert_eq!(row.first(), Some(&id.as_str()), "{transcript}");
+    assert_eq!(row.get(1), Some(&"web"), "{transcript}");
+    assert!(row.contains(&"running"), "{transcript}");
+    assert_eq!(
+        row.get(row.len().wrapping_sub(2)),
+        Some(&"local"),
+        "{transcript}"
+    );
+    assert_eq!(row.last(), Some(&host.host.as_str()), "{transcript}");
+    assert_eq!(lines.next(), None, "one box, one row\n{transcript}");
+
+    // `min box show web`: the record with its state and identity, and the
+    // provider and host.
+    let show = async |out: &mut Vec<u8>| {
+        let mut client = connect_daemon(&global).await?;
+        let listing = list_box_records(&mut client, None).await?;
+        let remedy = not_found_remedy(&host.host, false);
+        let id = find_listed_box(&listing, "web", &host.host, &remedy)?;
+        let shown = match client.oneshot_rpc::<ShowBox>(ShowBoxRequest { id }).await? {
+            Errorable::Ok(shown) => shown,
+            Errorable::Err { error } => anyhow::bail!("{error}"),
+        };
+        render_box_show(out, &shown, host.provider, &host.host)?;
+        Ok(())
+    };
+    let shown_running = run_box_command(&mut runs, "show", "min box show web".into(), &id, show);
+    let exit = shown_running.await;
+    let transcript = box_transcript(&runs);
+    assert_eq!(exit, 0, "{transcript}");
+    let shown = &runs[1].stdout;
+    for line in [
+        format!("ID: {id}"),
+        "Name: web".to_owned(),
+        "State: running".to_owned(),
+        "Provider: local".to_owned(),
+        format!("Host: {}", host.host),
+    ] {
+        assert!(
+            shown
+                .lines()
+                .any(|shown| shown.split_whitespace().eq(line.split_whitespace())),
+            "no `{line}` line\n{transcript}"
+        );
+    }
+    assert!(shown.contains("Identity"), "{transcript}");
+
+    let lookup = |verb: &str| BoxLookup::on(host.host.clone(), false, verb);
+
+    // `min box rm web` of the running box: refused with exit 2, naming
+    // `--force`, and the box keeps running.
+    let rm = async |out: &mut Vec<u8>| {
+        let _ = out;
+        let mut client = connect_daemon(&global).await?;
+        rm_listed_box(&mut client, &lookup("min box rm"), "web", false).await?;
+        Ok(())
+    };
+    let exit = run_box_command(&mut runs, "rm", "min box rm web".into(), &id, rm).await;
+    let transcript = box_transcript(&runs);
+    assert_eq!(exit, 2, "{transcript}");
+    assert!(runs[2].stderr.contains("--force"), "{transcript}");
+    assert_eq!(runs[2].stdout, "", "{transcript}");
+
+    // `min box stop web`: the box stops and keeps its record.
+    let stop = async |out: &mut Vec<u8>| {
+        let mut client = connect_daemon(&global).await?;
+        stop_listed_box(&mut client, out, &lookup("min box stop"), "web", false).await?;
+        Ok(())
+    };
+    let exit = run_box_command(&mut runs, "stop", "min box stop web".into(), &id, stop).await;
+    let transcript = box_transcript(&runs);
+    assert_eq!(exit, 0, "{transcript}");
+    assert_eq!(runs[3].stdout, "Stopped web.\n", "{transcript}");
+    let exit = run_box_command(&mut runs, "show", "min box show web".into(), &id, show).await;
+    let transcript = box_transcript(&runs);
+    assert_eq!(exit, 0, "{transcript}");
+    assert!(
+        runs[4]
+            .stdout
+            .lines()
+            .any(|line| line.split_whitespace().take(2).eq(["State:", "stopped"])),
+        "the stopped box keeps its record\n{transcript}"
+    );
+
+    // `min box rm web` of the stopped box: removed without `--force`, and
+    // the listing no longer has it.
+    let rm = async |out: &mut Vec<u8>| {
+        let mut client = connect_daemon(&global).await?;
+        rm_listed_box(&mut client, &lookup("min box rm"), "web", false).await?;
+        std::io::Write::write_all(out, b"Removed web.\n")?;
+        Ok(())
+    };
+    let exit = run_box_command(&mut runs, "rm", "min box rm web".into(), &id, rm).await;
+    let transcript = box_transcript(&runs);
+    assert_eq!(exit, 0, "{transcript}");
+    assert_eq!(runs[5].stdout, "Removed web.\n", "{transcript}");
+    let exit = run_box_command(&mut runs, "list", "min box list --all".into(), &id, list).await;
+    let transcript = box_transcript(&runs);
+    assert_eq!(exit, 0, "{transcript}");
+    assert_eq!(
+        runs[6].stdout,
+        format!("{EMPTY_HOST_LIST}\n"),
+        "{transcript}"
+    );
+
+    // One `box_verb` span for each verb covers the same box.
+    let log = log.contents();
+    for verb in ["list", "show", "stop", "rm"] {
+        let span = format!("box_verb{{verb=\"{verb}\" box_id=\"{id}\"}}");
+        assert!(
+            log.lines()
+                .any(|line| line.contains(&span) && line.contains("ran")),
+            "no {span} span\n{transcript}\n{log}"
+        );
+    }
+}
