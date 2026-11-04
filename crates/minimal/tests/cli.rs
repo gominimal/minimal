@@ -3493,10 +3493,11 @@ async fn hold_proxy_port_and_start_retry(
     (held, retry)
 }
 
-/// NET-020: with the proxy port occupied, both `min ls` and `min session
-/// activate` print the failure's reason and the remedy for it, and say the
-/// daemon recovers on its own. Driven through the compiled binary so the
-/// assertion is on what the user actually sees.
+/// NET-020: with the proxy port occupied, `min ls` prints the failure's
+/// reason and remedy on its HOSTNAME PROXY row, and says the daemon recovers
+/// on its own. `min session activate` prints the cause once, on its `names:`
+/// line. Driven through the compiled binary so the assertion is on what the
+/// user actually sees.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn listener_failure_reported_with_remedy() {
@@ -3504,28 +3505,32 @@ async fn listener_failure_reported_with_remedy() {
     let (held, retry) = hold_proxy_port_and_start_retry(&daemon.server.state).await;
     let reason = wait_for_routing_failure(&args).await;
 
-    let ls_stderr = run_min_stderr(&args, &["ls"]).await;
-    assert!(
-        ls_stderr.contains("warning: the hostname proxy is not serving"),
-        "ls must warn about hostname routing, got: {ls_stderr}"
+    // `min ls` names the cause on its HOSTNAME PROXY row, on stdout, and
+    // says nothing about it on stderr.
+    let ls = run_min(&args, &["ls"]).await;
+    let ls_stdout = String::from_utf8_lossy(&ls.stdout).into_owned();
+    let ls_stderr = String::from_utf8_lossy(&ls.stderr).into_owned();
+    let row = format!(
+        "HOSTNAME PROXY:  the hostname proxy is not serving: {reason}. Minimal retries on \
+         its own. Run `min ls` again to check."
     );
     assert!(
-        ls_stderr.contains(&reason),
-        "ls must print the daemon's reason, got: {ls_stderr}"
+        ls_stdout.lines().any(|line| line == row),
+        "ls must name the cause on its HOSTNAME PROXY row, got: {ls_stdout}"
     );
     assert!(
-        ls_stderr.contains("Remedy"),
-        "ls must print the remedy, got: {ls_stderr}"
+        reason.contains("Remedy"),
+        "the daemon's reason carries the remedy, got: {reason}"
+    );
+    assert_eq!(
+        ls_stdout.matches(&reason).count(),
+        1,
+        "ls names the cause once, got: {ls_stdout}"
     );
     assert!(
-        ls_stderr.contains("retries"),
-        "ls must say the daemon recovers on its own, got: {ls_stderr}"
+        !ls_stderr.contains("hostname proxy is not serving"),
+        "ls prints the cause on stdout only, got stderr: {ls_stderr}"
     );
-    assert!(
-        ls_stderr.contains("run `min ls` again to check"),
-        "ls must name the command its warning rides on, got: {ls_stderr}"
-    );
-
     // `min session activate` prints the same report on its path.
     let project = tempfile::TempDir::new().unwrap();
     std::fs::create_dir(project.path().join(".git")).unwrap();
@@ -3548,21 +3553,16 @@ async fn listener_failure_reported_with_remedy() {
         ],
     )
     .await;
+    // The cause prints once, on the `names:` line below, and no warning
+    // line of its own repeats it.
     assert!(
-        activate_stderr.contains("warning: the hostname proxy is not serving"),
-        "activate must warn about hostname routing, got: {activate_stderr}"
+        !activate_stderr.contains("warning: the hostname proxy is not serving"),
+        "activate prints no separate warning, got: {activate_stderr}"
     );
-    assert!(
-        activate_stderr.contains(&reason),
-        "activate must print the daemon's reason, got: {activate_stderr}"
-    );
-    assert!(
-        activate_stderr.contains("Remedy"),
-        "activate must print the remedy, got: {activate_stderr}"
-    );
-    assert!(
-        activate_stderr.contains("run `min session activate` again to check"),
-        "activate must name the command its warning rides on, got: {activate_stderr}"
+    assert_eq!(
+        activate_stderr.matches(&reason).count(),
+        1,
+        "activate names the cause once, got: {activate_stderr}"
     );
     // NET-020 on the one host line: the cause replaces the resolution half,
     // so the line never claims a route through a proxy that is not serving.
@@ -3590,10 +3590,10 @@ async fn ls_warning_clears_on_recovery() {
     let (held, retry) = hold_proxy_port_and_start_retry(&daemon.server.state).await;
     let _reason = wait_for_routing_failure(&args).await;
 
-    let before = run_min_stderr(&args, &["ls"]).await;
+    let before = String::from_utf8_lossy(&run_min(&args, &["ls"]).await.stdout).into_owned();
     assert!(
-        before.contains("warning: the hostname proxy is not serving"),
-        "ls must warn while the port is held, got: {before}"
+        before.contains("HOSTNAME PROXY:  the hostname proxy is not serving"),
+        "ls must name the cause while the port is held, got: {before}"
     );
 
     // Free the port: the startup retry binds (a native daemon has no
@@ -3604,9 +3604,14 @@ async fn ls_warning_clears_on_recovery() {
         .expect("the startup retry must finish once the port frees")
         .expect("the startup retry must not panic");
 
-    let after = run_min_stderr(&args, &["ls"]).await;
+    let after = run_min(&args, &["ls"]).await;
+    let after = format!(
+        "{}{}",
+        String::from_utf8_lossy(&after.stdout),
+        String::from_utf8_lossy(&after.stderr)
+    );
     assert!(
-        !after.contains("warning: the hostname proxy is not serving"),
+        !after.contains("the hostname proxy is not serving"),
         "the warning must clear without a daemon restart, got: {after}"
     );
 }

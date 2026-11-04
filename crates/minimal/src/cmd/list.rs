@@ -679,27 +679,6 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
 
     let listings = ls_listings(global).await?;
 
-    // On stderr, and outside the formatters: every output mode should carry a
-    // fault this severe — `--raw` most of all, since a script parsing bare ids
-    // is exactly what will go on using hostnames that no longer resolve — and
-    // stdout stays clean for the parser either way. With more than one VM
-    // listed the fault is per daemon, so each warning names the VM it is on;
-    // one listing keeps the single-VM wording every consumer of `min ls` has
-    // always read.
-    for listing in &listings {
-        if let Some(reason) = listing.resp.hostname_routing_unavailable.as_deref() {
-            if listings.len() == 1 {
-                warn_if_hostname_routing_down(Some(reason), "min ls");
-            } else {
-                eprintln!(
-                    "VM {}: {}",
-                    listing.vm,
-                    hostname_routing_warning(reason, "min ls")
-                );
-            }
-        }
-    }
-
     // NET-018's verdict — which surface a box name resolves through on
     // this host — from the one function both verbs share (`resolver`), one
     // verdict per VM. The verdict is the VM's, not the host's alone: each
@@ -1011,40 +990,18 @@ pub fn shared_port_collision_lines(listings: &[VmListing]) -> Vec<String> {
         .collect()
 }
 
-/// The warning `min ls` and `min session activate` print when the daemon
-/// reports hostname routing down: the daemon's reason and remedy for the
-/// failed bind or publish, plus what recovery looks like from here — the
-/// daemon retries with backoff and clears the warning on its own once the
-/// listener recovers (NET-020, NET-022). `command` names the command the
-/// warning rides on: re-running it shows the warning while the listener is
-/// still down and nothing once it has recovered, so the recovery sentence
-/// tells the user to re-run the command they are already in, not some other
-/// one. Pure, so tests can assert the wording without capturing stderr.
+/// The `HOSTNAME PROXY` row's text when the daemon reports hostname routing
+/// down and no proxy-down sibling names a cause of its own (NET-020): the
+/// daemon's reason and remedy for the failed bind or publish, and what
+/// recovery looks like from here. The daemon retries with backoff and clears
+/// its report once the listener recovers (NET-022), so the row tells the
+/// user to re-run `min ls`. Pure, so tests can assert the wording.
 #[must_use]
-pub fn hostname_routing_warning(reason: &str, command: &str) -> String {
+pub fn hostname_routing_cause_row(reason: &str) -> String {
     format!(
-        "warning: the hostname proxy is not serving: {reason}. Minimal \
-         retries on its own; run `{command}` again to check."
+        "the hostname proxy is not serving: {reason}. Minimal retries on its \
+         own. Run `min ls` again to check."
     )
-}
-
-/// Tells the user that `<name>.local.min.internal` will not resolve, and why,
-/// and what clears it.
-///
-/// The daemon keeps serving without its host-side proxy, so nothing else the
-/// user sees is different: sessions activate, exec works, the list prints. The
-/// only other trace is a `warn!` in the daemon log, which is not where someone
-/// watching curl fail is looking (gominimal/inbox#560). The daemon's report
-/// carries the reason and the remedy for the cause (a held port, a failed
-/// publish); the recovery is the daemon's job now — it retries with backoff
-/// and the warning goes away by itself, so the remedy says to check again
-/// rather than to restart anything. `command` names the command this runs
-/// from, so the recovery sentence fits it — `min ls` on the list, `min
-/// session activate` at activation.
-pub(crate) fn warn_if_hostname_routing_down(reason: Option<&str>, command: &str) {
-    if let Some(reason) = reason {
-        eprintln!("{}", hostname_routing_warning(reason, command));
-    }
 }
 
 /// The VM a session-start line names, as a fact about the backend kind: the
@@ -1215,6 +1172,21 @@ pub(crate) fn format_ls_with_proxy_ports_on(
         // merely silent, prints nothing here.
         if let Some(line) = &proxy_down_line {
             writeln!(out, "HOSTNAME PROXY:  {line}")?;
+        } else if proxy_down.is_none()
+            && let Some(reason) = resp.hostname_routing_unavailable.as_deref()
+        {
+            // NET-020: the daemon's own cause takes the row that names the
+            // listener, on stdout, once. A proxy-down sibling names its own
+            // cause above or on the BOX NAMES row, so it wins.
+            tracing::debug!(
+                surface = "min ls HOSTNAME PROXY row",
+                "printed the hostname-routing cause"
+            );
+            writeln!(
+                out,
+                "HOSTNAME PROXY:  {}",
+                hostname_routing_cause_row(reason)
+            )?;
         }
         // NET-018: say which of the two surfaces is live — the one verdict
         // both verbs share ([`resolver::live_name_surfaces`]) — and end the
@@ -1731,6 +1703,23 @@ pub(crate) fn format_ls_across_vms_with_proxy_ports_on(
                     "HOSTNAME PROXY:  {vm:<width$} {line}",
                     vm = listing.vm,
                     width = VM_COLUMN_WIDTH,
+                )?;
+                facts += 1;
+            } else if proxy_down.is_none()
+                && let Some(reason) = listing.resp.hostname_routing_unavailable.as_deref()
+            {
+                // NET-020: this VM's daemon names its own cause on its row.
+                tracing::debug!(
+                    surface = "min ls HOSTNAME PROXY row",
+                    vm = %listing.vm,
+                    "printed the hostname-routing cause"
+                );
+                writeln!(
+                    out,
+                    "HOSTNAME PROXY:  {vm:<width$} {row}",
+                    vm = listing.vm,
+                    width = VM_COLUMN_WIDTH,
+                    row = hostname_routing_cause_row(reason),
                 )?;
                 facts += 1;
             }
