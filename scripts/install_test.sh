@@ -2606,6 +2606,10 @@ if [ "$1" = "list" ] && [ "$2" = "ruleset" ]; then
     cat "${NFT_RULESET:-/dev/null}"
     exit 0
 fi
+if [ "$*" = "-a --debug=netlink list ruleset" ]; then
+    cat "${NFT_RULESET:-/dev/null}"
+    exit 0
+fi
 [ "$1" = "list" ] && exit 1
 exit 0
 STUB
