@@ -606,7 +606,7 @@ box that holds it returns to `running`. These terms follow the decision in
 - **NET-071** THE SYSTEM SHALL apply the hostname proxy's ingress and egress refusals to host-address and own-address targets alike.
   tier:     T1
   verify:   cargo nextest run -p minimald proxy_parity_across_network_modes
-  property: for every network mode, every rule set, and every request, the hostname proxy's verdict equals the direct connection's verdict
+  property: for every network mode, every rule set, and every request, the hostname proxy's verdict equals the direct connection's verdict, except on a host that cannot decide a host-address box's egress per box, where the proxy refuses what the caller's egress rules deny or what it cannot attribute, and the box's direct connections run unenforced
   <!-- S8c/AC2; prose 45; ubiquitous; the verdict, not the HTTP status, is what equals the direct connection's: a refused verdict reads 403 Forbidden naming the reason; an admitted request whose upstream refuses the connection or times out reads 502 Bad Gateway, in every network mode; the one exception to parity: on a host that cannot decide a host-address box's egress per box, the proxy still refuses that box's request when its rules deny the target or when the proxy cannot attribute it, while its direct connections run unenforced -->
   - IF a request through the hostname proxy targets a host-address box's port that a listener holds only at 127.0.0.1 THEN THE SYSTEM SHALL refuse it and tell the user to bind the port to 0.0.0.0.
     tier:   T0
