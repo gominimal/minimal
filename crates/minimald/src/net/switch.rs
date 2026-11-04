@@ -1699,13 +1699,6 @@ pub(crate) struct MinimalListenerHold {
     listener: MinimalListener,
 }
 
-impl MinimalListenerHold {
-    /// The port the hold keeps.
-    pub(crate) fn port(&self) -> u16 {
-        self.listener.port
-    }
-}
-
 impl Drop for MinimalListenerHold {
     fn drop(&mut self) {
         let mut held = self.registry.lock();
@@ -1776,9 +1769,12 @@ fn names_host_alias(
                     .eq_ignore_ascii_case(HOST_MIN_INTERNAL)
             })
         });
+    // An absent `allow_subnets` grants nothing (NET-074): allow-all is
+    // written out as `0.0.0.0/0`, so only a list that holds the alias covers
+    // it. A box with no egress rules does not name the host.
     let covered = rules
         .allow_subnets()
-        .is_none_or(|allow| allow.iter().any(|cidr| cidr.contains(alias)));
+        .is_some_and(|allow| allow.iter().any(|cidr| cidr.contains(alias)));
     named || covered
 }
 
@@ -5211,6 +5207,37 @@ pub(crate) mod tests {
         assert!(
             reaches_switch(&mut harness, &egress_tcp_frame(LEASE, alias, 5432)).await,
             "an allow_subnets that covers the alias names the host"
+        );
+        drop(harness);
+
+        // An absent list grants nothing, and allow-all is written out: a box
+        // with no egress rules, or with no `allow_subnets`, does not name
+        // the host.
+        let no_egress = boxes::BoxPolicy {
+            egress: None,
+            ..host_exposure_policy(None, Vec::new())
+        };
+        let mut harness = native_relay_with_table(&no_egress, &table);
+        assert!(
+            !reaches_switch(&mut harness, &egress_tcp_frame(LEASE, alias, 5432)).await,
+            "a box with no egress rules never reaches the exposure"
+        );
+        drop(harness);
+        let mut no_subnets = host_exposure_policy(None, Vec::new());
+        if let Some(egress) = no_subnets.egress.as_mut() {
+            egress.allow_subnets = None;
+        }
+        let mut harness = native_relay_with_table(&no_subnets, &table);
+        assert!(
+            !reaches_switch(&mut harness, &egress_tcp_frame(LEASE, alias, 5432)).await,
+            "a box with no allow_subnets never reaches the exposure"
+        );
+        drop(harness);
+        let allow_all = host_exposure_policy(None, vec!["0.0.0.0/0"]);
+        let mut harness = native_relay_with_table(&allow_all, &table);
+        assert!(
+            reaches_switch(&mut harness, &egress_tcp_frame(LEASE, alias, 5432)).await,
+            "an allow-all box written out reaches the exposure"
         );
         drop(harness);
 

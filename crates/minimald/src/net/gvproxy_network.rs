@@ -22,10 +22,7 @@ use tokio::sync::Mutex;
 
 use crate::net::dns;
 use crate::net::policy::{ControlChannel, PortForwarder};
-use crate::net::switch::{
-    BoxGate, MinimalListener, MinimalListenerHold, MinimalListeners, PUBLISHED_BOX_PORT_LISTENER,
-    SwitchRelay,
-};
+use crate::net::switch::{BoxGate, SwitchRelay};
 use crate::net::{PtaskLease, SwitchClient};
 
 /// The own-IP attachment guard. Returned by [`complete_own_ip_attach`] and torn
@@ -62,12 +59,6 @@ struct OwnIpAttach {
     /// stops, each able to unbind its port and end its connections. Removed
     /// on teardown. Empty when no ingress was configured.
     exposed: Vec<PortForwarder>,
-    /// The ports of `exposed` bound at `127.0.0.1`, where the native host
-    /// alias lands, held in the daemon's registry of Minimal's own
-    /// listeners until their forwarder unbinds (NET-162). So no
-    /// `[host-exposures]` entry opens a box's published port to another
-    /// box without a rule of its own.
-    held_ports: std::sync::Mutex<Vec<MinimalListenerHold>>,
     /// The lease this guard's attach holds — its address at its epoch —
     /// passed to `detach` so the lease is released with the count (T66),
     /// handed or drawn alike: a lease's life is its attachment's.
@@ -94,7 +85,6 @@ impl OwnIpAttach {
             switch,
             control,
             mut exposed,
-            held_ports,
             runtime_ingress,
             lease,
         } = self;
@@ -122,8 +112,6 @@ impl OwnIpAttach {
         // allocator.
         drop(relay);
         drop(exposed);
-        // The forwards are unbound, so their ports are no longer Minimal's.
-        drop(held_ports);
         if let Err(e) = switch.lock().await.detach(lease).await {
             tracing::warn!(error = %e, "detaching OwnIp PTask from switch on session end");
         }
@@ -215,18 +203,10 @@ impl OwnIpGuard {
             .map(|forwarder| forwarder.internal_port())
             .collect();
         let mut last_err = None;
-        for forwarder in &matching {
+        for forwarder in matching {
             if let Err(e) = forwarder.revoke(&attach.control, &keep_admitted).await {
                 last_err = Some(e);
             }
-        }
-        // A port stays held while any of its forwarders is still bound.
-        if matching.iter().all(|forwarder| forwarder.is_revoked()) {
-            attach
-                .held_ports
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .retain(|hold| hold.port() != external_port);
         }
         match last_err {
             Some(e) => Err(e),
@@ -483,8 +463,6 @@ async fn finish_own_ip_attach(
         (None, _) => Vec::new(),
     };
 
-    let held_ports = hold_loopback_ports(&exposed);
-
     // One info line per bound forwarder (NET-040, NET-121): the host address
     // it is reachable at, the port, and the session it belongs to — so the
     // daemon log tail (and the `min bug` bundle carrying it) shows each
@@ -582,32 +560,10 @@ async fn finish_own_ip_attach(
             switch: Arc::clone(switch),
             control,
             exposed,
-            held_ports: std::sync::Mutex::new(held_ports),
             lease,
             runtime_ingress,
         }),
     })
-}
-
-/// Holds each port of `exposed` that a forwarder bound at `127.0.0.1` in the
-/// daemon's registry of Minimal's own listeners (NET-162). The native host
-/// alias lands on `127.0.0.1`, so a host exposure at such a port would give
-/// one box reach to another box's port without a rule of its own. Both
-/// protocols are held, as the forward's protocol is not read here.
-fn hold_loopback_ports(exposed: &[PortForwarder]) -> Vec<MinimalListenerHold> {
-    let registry = MinimalListeners::daemon();
-    exposed
-        .iter()
-        .filter_map(PortForwarder::host_port)
-        .filter(|(host, _)| host.parse() == Ok(std::net::Ipv4Addr::LOCALHOST))
-        .map(|(_, port)| {
-            registry.hold_while(MinimalListener {
-                port,
-                protocol: None,
-                name: PUBLISHED_BOX_PORT_LISTENER,
-            })
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -2130,13 +2086,18 @@ mod tests {
         .await
         .expect("the attach completes at the handed address");
         let _ = collect_until(&mut events_rx, "/services/dns/add", 1).await;
-        for (protocol, port) in [(TCP, 47180), (UDP, 47180), (TCP, 47190)] {
+        for port in [47180, 47190] {
             assert_eq!(
-                registry.holder(protocol, port),
+                registry.holder(TCP, port),
                 Some(crate::net::switch::PUBLISHED_BOX_PORT_LISTENER),
                 "the bound forward holds {port}"
             );
         }
+        assert_eq!(
+            registry.holder(UDP, 47180),
+            None,
+            "a TCP forward holds its port for TCP only"
+        );
 
         guard
             .revoke_ingress(47180)
