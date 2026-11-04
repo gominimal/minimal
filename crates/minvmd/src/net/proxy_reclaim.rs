@@ -237,15 +237,10 @@ impl HeldPortBackoff {
 
 /// Records that the proxy serves on `port` after a start that left it down
 /// (NET-022): the port goes on the served list, and the down cause goes, so
-/// `min ls` stops naming it. The status cell clears only an unconfirmed
-/// cause ([`crate::control::ProxyPublishStatus::confirm`]), so the held
-/// cause is first replaced by an unconfirmed one on the same port. That
-/// is true for the instant between the two calls: the switch publishes the
-/// port, and nothing has confirmed it yet.
+/// `min ls` stops naming it.
 pub(crate) fn mark_serving(status: &crate::control::ProxyPublishStatus, port: u16) {
     status.set_serving(port);
-    status.set_unconfirmed(port);
-    status.confirm(port);
+    status.clear_down(port);
 }
 
 /// Starts the held-port watcher on its own thread (NET-021). The VM started
