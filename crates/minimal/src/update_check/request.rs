@@ -141,11 +141,7 @@ pub async fn cmd_update_check(
         // re-reading the file (as the per-command hook does): an id that was
         // not written, or one written over another command's, would count
         // the install twice.
-        state = super::state::claim_install_id(&dir, &state_path).ok_or_else(|| {
-            anyhow::anyhow!(
-                "another min command is minting the install id or checking now; run this again"
-            )
-        })?;
+        state = super::state::claim_install_id(&dir, &state_path).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
     let id = state
         .install_id

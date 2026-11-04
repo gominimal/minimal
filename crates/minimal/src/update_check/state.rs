@@ -202,10 +202,10 @@ pub(super) fn new_install_id() -> String {
 /// command wrote meanwhile is put back. `None` when the lock is held (the
 /// other command is minting, or has spawned the check; this command does
 /// nothing and the next one finds the id) or the write failed.
-pub(super) fn claim_install_id(dir: &Path, state_path: &Path) -> Option<State> {
+pub(super) fn claim_install_id(dir: &Path, state_path: &Path) -> Result<State, ClaimFailed> {
     let lock = dir.join(super::LOCK_FILE);
     if !acquire_lock(&lock) {
-        return None;
+        return Err(ClaimFailed::Locked);
     }
     let mut state = read_state(state_path);
     let written = match state.install_id {
@@ -216,7 +216,31 @@ pub(super) fn claim_install_id(dir: &Path, state_path: &Path) -> Option<State> {
         }
     };
     release_lock(&lock);
-    written.ok().map(|()| state)
+    written.map(|()| state).map_err(|err| ClaimFailed::NotSaved { path: state_path.to_path_buf(), err })
+}
+
+/// Why [`claim_install_id`] minted nothing: the two are told apart because
+/// only one of them is cured by running the command again.
+#[derive(Debug)]
+pub(super) enum ClaimFailed {
+    /// Another command holds the spawn lock (it is minting or checking).
+    Locked,
+    /// The state file could not be written (a read-only or full directory):
+    /// the same again next time, so the message names the file.
+    NotSaved { path: std::path::PathBuf, err: std::io::Error },
+}
+
+impl std::fmt::Display for ClaimFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Locked => {
+                write!(f, "another min command is minting the install id or checking now; run this again")
+            }
+            Self::NotSaved { path, err } => {
+                write!(f, "the install id could not be saved to {}: {err}", path.display())
+            }
+        }
+    }
 }
 
 /// Records that the disclosure was printed. Re-read and one field changed,

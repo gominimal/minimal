@@ -201,8 +201,8 @@ pub fn before_command(global: &GlobalArgs, command: &Option<crate::cli::Command>
     let first_run = state.install_id.is_none();
     if first_run {
         match claim_install_id(&dir, &state_path) {
-            Some(claimed) => state = claimed,
-            None => return,
+            Ok(claimed) => state = claimed,
+            Err(_) => return,
         }
     }
     let visible = leaves_the_notice_visible(command);
