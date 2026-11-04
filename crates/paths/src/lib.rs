@@ -495,6 +495,27 @@ pub fn minimal_config_dir_with_override(over: Option<&Path>) -> std::path::PathB
     }
 }
 
+/// The certificate files the retired HTTPS reverse proxy left in the config
+/// directory: the daemon-issued client certificate, its key, and the CA.
+pub const RETIRED_PROXY_CREDENTIAL_FILES: [&str; 3] = ["client.pem", "client.key", "ca.pem"];
+
+/// Deletes the retired HTTPS reverse proxy's certificate files
+/// ([`RETIRED_PROXY_CREDENTIAL_FILES`]) from `config_dir`, and returns the
+/// path of each file it removed.
+///
+/// Best-effort and idempotent: a file that is absent is skipped, and a file
+/// it cannot remove is left for the next run. It prints nothing. This crate
+/// has no logger, so the caller logs one line for each returned path.
+// NET-109: the proxy that issued these files is gone, so nothing reads them.
+#[must_use]
+pub fn remove_retired_proxy_credentials(config_dir: &Path) -> Vec<std::path::PathBuf> {
+    RETIRED_PROXY_CREDENTIAL_FILES
+        .iter()
+        .map(|name| config_dir.join(name))
+        .filter(|path| std::fs::remove_file(path).is_ok())
+        .collect()
+}
+
 /// Return `$XDG_CONFIG_HOME` if it's set to an absolute path. Matches the
 /// spec: [XDG Base Directory Specification, "XDG_CONFIG_HOME"](https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html)
 /// says relative paths are invalid and should be ignored.
@@ -1533,6 +1554,40 @@ pub trait Translator<Src: Realm, Dst: Realm> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_proxy_credentials_removed_from_config_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path();
+        for name in RETIRED_PROXY_CREDENTIAL_FILES {
+            std::fs::write(config.join(name), "pem").unwrap();
+        }
+        std::fs::write(config.join("config.toml"), "").unwrap();
+
+        let mut removed = remove_retired_proxy_credentials(config);
+        removed.sort();
+        let mut expected: Vec<_> = RETIRED_PROXY_CREDENTIAL_FILES
+            .iter()
+            .map(|name| config.join(name))
+            .collect();
+        expected.sort();
+        assert_eq!(removed, expected);
+        for name in RETIRED_PROXY_CREDENTIAL_FILES {
+            assert!(!config.join(name).exists(), "{name} is still present");
+        }
+        assert!(config.join("config.toml").exists(), "other config is kept");
+
+        // A second run finds nothing left to remove.
+        assert_eq!(
+            remove_retired_proxy_credentials(config),
+            Vec::<std::path::PathBuf>::new()
+        );
+        // A config dir that does not exist is not an error.
+        assert_eq!(
+            remove_retired_proxy_credentials(&config.join("absent")),
+            Vec::<std::path::PathBuf>::new()
+        );
+    }
 
     #[test]
     fn abs_path_rejects_relative_input() {
