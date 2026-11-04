@@ -39,7 +39,7 @@
 //! ([`crate::net::egress_gate`]). The set never decides a marked frame, and
 //! the node row never does either.
 
-use crate::net::host_exposures::{HostExposure, HostExposures, PortRange};
+use crate::net::host_exposures::{Holder, HostExposure, HostExposures, PortRange};
 use boxes::core::egress::{EgressRules, Ipv4Cidr};
 use std::sync::Arc;
 use switch::SwitchSubnet;
@@ -407,12 +407,14 @@ impl NodePlaneBaseline {
         named
     }
 
-    /// The host exposures the current table opens at the alias, each a
-    /// protocol and a port: empty unless the client `config.toml` names
-    /// entries in `[host-exposures]`. The gate reads them for every row.
+    /// The host exposures the current table opens at the alias while the
+    /// listeners in `held` hold their ports, each a protocol and a port:
+    /// empty unless the client `config.toml` names entries in
+    /// `[host-exposures]`. The gate reads them at each flow (NET-161,
+    /// NET-162).
     #[must_use]
-    pub(crate) fn host_exposure_ports(&self) -> Arc<[HostExposure]> {
-        self.host_exposure.current()
+    pub(crate) fn host_exposure_ports(&self, held: &[Holder]) -> Arc<[HostExposure]> {
+        self.host_exposure.current(held)
     }
 
     /// The ports the set's own endpoints open at the host alias, over
@@ -866,18 +868,18 @@ mod tests {
     fn baseline_carries_the_configured_host_exposures() {
         let built_in = NodePlaneBaseline::built_in(SUBNET);
         assert!(
-            built_in.host_exposure_ports().is_empty(),
+            built_in.host_exposure_ports(&[]).is_empty(),
             "the built-in enumeration carries no host exposure"
         );
         let re_exposed = built_in.with_host_exposure(vec![HostExposure::tcp(8080)]);
         assert_eq!(
-            &*re_exposed.host_exposure_ports(),
+            &*re_exposed.host_exposure_ports(&[]),
             &[HostExposure::tcp(8080)],
             "the builder sets the list"
         );
         let cleared = re_exposed.with_host_exposure(vec![]);
         assert!(
-            cleared.host_exposure_ports().is_empty(),
+            cleared.host_exposure_ports(&[]).is_empty(),
             "a cleared list is carried empty"
         );
     }

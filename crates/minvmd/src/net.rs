@@ -820,10 +820,10 @@ impl HostGvproxy {
         // alias is opened at — none unless the client `config.toml` names
         // ports in `[host-exposures]` — are the live table: the gate reads
         // it again when the file changes, so an added entry opens its port
-        // and a removed one closes it, with no restart (NET-158).
+        // and a removed one closes it, with no restart (NET-161).
         // The retired variable no longer opens a port. Say so in the daemon
         // log, so an operator who still sets it sees why the alias stays
-        // closed at its ports (NET-158).
+        // closed at its ports (NET-159).
         warn_retired_host_exposure_env(std::env::var_os(RETIRED_HOST_EXPOSURE_ENV));
         let baseline = NodePlaneBaseline::built_in(subnet)
             .with_host_exposures(host_exposures::HostExposures::client_config());
