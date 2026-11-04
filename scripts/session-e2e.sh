@@ -11441,14 +11441,21 @@ proof_native_names_answer_on_time() {
   }
   # One lookup at the service, made at once. $1: name. $2: A or NXDOMAIN.
   # $3: the time (ms) the step before it returned. $4: that step, for the
-  # line. Sets NNAT_ADDR to the A answer. A late answer fails the case.
+  # line, or empty for a lookup that no step comes before: its time is then
+  # the lookup's own round trip. Sets NNAT_ADDR to the A answer. A late
+  # answer fails the case.
   nnat_on_time() {
-    local name="$1" want="$2" since="$3" step="$4" reply status addr ms ok=""
+    local name="$1" want="$2" since="$3" step="$4" reply status addr ms ok="" when
     reply="$(dig +time=1 +tries=1 @127.0.0.1 -p "$nnat_port" "$name" A 2>&1 || true)"
     ms=$(( $(now_ms) - since ))
     status="$(printf '%s\n' "$reply" | sed -n 's/.*status: \([A-Z]*\).*/\1/p' | head -n1)"
     addr="$(printf '%s\n' "$reply" | awk '$4 == "A" { print $5; exit }')"
-    echo "  lookup $name A at 127.0.0.1:$nnat_port, ${ms} ms after $step returned: status ${status:-none}, answer ${addr:-none}"
+    if [ -n "$step" ]; then
+      when="${ms} ms after $step returned"
+    else
+      when="answered in ${ms} ms"
+    fi
+    echo "  lookup $name A at 127.0.0.1:$nnat_port, $when: status ${status:-none}, answer ${addr:-none}"
     case "$want" in
       A) [ "$status" = NOERROR ] && [ -n "$addr" ] && ok=1 ;;
       NXDOMAIN) [ "$status" = NXDOMAIN ] && ok=1 ;;
@@ -11457,7 +11464,7 @@ proof_native_names_answer_on_time() {
       NNAT_ADDR="$addr"
       return 0
     fi
-    echo "::error::$name did not answer $want on the first lookup after $step returned"
+    echo "::error::$name did not answer $want on the first lookup${step:+ after $step returned}"
     printf '%s\n' "$reply" | sed 's/^/    /'
     local _i
     for _i in $(seq 1 40); do
@@ -11466,7 +11473,7 @@ proof_native_names_answer_on_time() {
       status="$(printf '%s\n' "$reply" | sed -n 's/.*status: \([A-Z]*\).*/\1/p' | head -n1)"
       addr="$(printf '%s\n' "$reply" | awk '$4 == "A" { print $5; exit }')"
       if { [ "$want" = A ] && [ -n "$addr" ]; } || { [ "$want" = NXDOMAIN ] && [ "$status" = NXDOMAIN ]; }; then
-        echo "  $name answered $want $(( $(now_ms) - since )) ms after $step returned (late)"
+        echo "  $name answered $want $(( $(now_ms) - since )) ms after ${step:+$step returned}${step:-the first lookup began} (late)"
         break
       fi
     done
@@ -11507,9 +11514,14 @@ proof_native_names_answer_on_time() {
     nnat_dump_log
     fail
   fi
-  nnat_port="$(nnat_lines 'holds the host loopback answerer port itself' \
-    | tail -n1 | sed -n 's/.*"port":\([0-9][0-9]*\).*/\1/p')"
-  [ -n "$nnat_port" ] || nnat_port=7656
+  local nnat_hold_line
+  nnat_hold_line="$(nnat_lines 'holds the host loopback answerer port itself' | tail -n1)"
+  nnat_port="$(printf '%s\n' "$nnat_hold_line" | sed -n 's/.*"port":\([0-9][0-9]*\).*/\1/p')"
+  if [ -z "$nnat_port" ]; then
+    echo "::error::the daemon log line for the answerer port names no port the case can read, so every lookup below would ask an unknown port"
+    echo "  line: $nnat_hold_line"
+    fail
+  fi
   local nnat_setup="$WORK/nnat-setup.out" nnat_cmd
   mnl finalize-install --show --script >"$nnat_setup" 2>"$nnat_setup.note" || true
   nnat_cmd="$(setup_script_from "$nnat_setup")"
@@ -11564,8 +11576,10 @@ proof_native_names_answer_on_time() {
   nnat_on_time "$nnat_b_name.min.internal" A "$nnat_t" "the second box's activate"
 
   # ---- 3. host.min.internal from the host -----------------------------------
+  # No step comes before this lookup that it must answer on time after, so
+  # its printed time is the lookup's own round trip.
   nnat_t="$(now_ms)"
-  nnat_on_time host.min.internal A "$nnat_t" "the second box's lookup"
+  nnat_on_time host.min.internal A "$nnat_t" ""
   if [ "$NNAT_ADDR" != 127.0.0.1 ]; then
     echo "::error::host.min.internal answered $NNAT_ADDR at the service, not 127.0.0.1"
     fail
@@ -11590,6 +11604,20 @@ proof_native_names_answer_on_time() {
   nnat_rc=$?
   nnat_ms=$(( $(now_ms) - nnat_t ))
   echo "  connect from $nnat_a_name to $nnat_b_name.min.internal:$nnat_closed_port (not published): curl exit $nnat_rc after ${nnat_ms} ms: $(tr '\n' ' ' < "$WORK/nnat-closed.err" 2>/dev/null)"
+  if [ "$nnat_rc" -eq 6 ]; then
+    # A zone name needs no egress entry: the relay's DNS gate forwards a
+    # zone A to the switch's resolver, which answers it from the name every
+    # own-IP attach registers there. So a failed lookup here is not the
+    # case's setup. Print what the box got and the daemon's registration
+    # warnings, so the run shows where the name went missing.
+    echo "::error::$nnat_a_name could not resolve $nnat_b_name.min.internal from inside the box (curl exit 6), so the connect was never made"
+    echo "--- $nnat_a_name: /etc/resolv.conf and getent ahostsv4 $nnat_b_name.min.internal ---"
+    mnl session exec "$nnat_a_sid" \
+      "cat /etc/resolv.conf; getent ahostsv4 '$nnat_b_name.min.internal'; echo getent exit \$?" 2>&1 || true
+    echo "--- daemon log: name registrations on the switch that failed ---"
+    nnat_lines 'registering *.min.internal name on gvproxy' | tail -n 5
+    fail
+  fi
   if [ "$nnat_rc" -ne 7 ] || [ "$nnat_ms" -ge 6000 ]; then
     echo "::error::the connect to the unpublished port was not refused fast (expected curl exit 7 well inside 6 s)"
     echo "--- daemon log: box-zone decisions and policy violations (tail) ---"
