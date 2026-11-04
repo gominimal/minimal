@@ -165,6 +165,15 @@ __min_rpc() {
                 fi
                 echo "$rest"
                 ;;
+            err)
+                # A line for stderr: the task's own stderr and min's notes
+                # about the run, so stdout carries only the task's output.
+                if [[ "$bar_open" -eq 1 ]]; then
+                    printf '\r\033[K'
+                    bar_open=0
+                fi
+                echo "$rest" >&2
+                ;;
             set_env)
                 local varname="${rest%%:*}"
                 local varval="${rest#*:}"
@@ -186,7 +195,11 @@ __min_rpc() {
                 fi
                 echo "error:$rest" >&2
                 error="true"
-                break
+                # A `run` refusal is followed by the `exit:` line that gives
+                # its exit code. Read on to it.
+                if [[ "$method" != "run" ]]; then
+                    break
+                fi
                 ;;
         esac
     done < <(echo "${prefix}${method}%${data}" | socat -,ignoreeof UNIX-CONNECT:/run/minenv_sock)
@@ -201,16 +214,18 @@ __min_rpc() {
         echo "  export ${env_pairs[*]}"
     fi
 
-    if [[ "$error" == "true" ]]; then
-        return 1
-    fi
     if [[ "$relayed" =~ ^[0-9]{1,3}$ ]] && (( 10#$relayed <= 255 )); then
         return "$((10#$relayed))"
     fi
-    # A `run` always ends with an `exit:` or an `error:` line. A stream that
-    # ends without one lost its connection, so the task's status is unknown.
+    # A `run` always ends with an `exit:` line. A stream that ends without
+    # one is a failure of min, not of the task, so it exits 125.
     if [[ "$method" == "run" ]]; then
-        echo "error: the connection closed before the task reported its exit status" >&2
+        if [[ "$error" != "true" ]]; then
+            echo "error: the connection closed before the task reported its exit status" >&2
+        fi
+        return 125
+    fi
+    if [[ "$error" == "true" ]]; then
         return 1
     fi
 }
