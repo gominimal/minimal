@@ -8622,8 +8622,8 @@ mod tests {
     /// NET-079: a connection-mark write is decoded with its masks, so only
     /// the bits it can change conflict. Tailscale's masked save and restore
     /// change the bits 0x00ff0000 alone, and the install goes ahead over
-    /// them under the default mask; a mask inside 0x00ff0000 is still
-    /// refused for the range they use.
+    /// them under the default mask, and the same spelling over the default
+    /// bits is a conflict the scan names.
     #[test]
     fn install_decodes_masked_ct_mark_writes() {
         let mount = standin_mount();
@@ -8640,24 +8640,14 @@ mod tests {
             said(&installed)
         );
 
-        // The same rules conflict with bits inside the range they write.
-        let mount = standin_mount();
-        let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
-        host_ruleset_tools(
-            tools.path(),
-            TAILSCALE_CONNMARK_NFT,
-            TAILSCALE_CONNMARK_SAVE,
-        );
-        let refused = run_install_with(&mount, &["--ct-mark-mask", "0x00030000"], tools.path());
-        assert!(
-            !refused.status.success(),
-            "a mask inside Tailscale's range is refused: {}",
-            said(&refused)
-        );
-
         // Each nft value against the default bits 0x30000000: whether the
         // install is refused, and whether it says no mask avoids the rule.
         for (value, refused, whole) in [
+            // CONNMARK --save-mark with equal masks, through libxtables:
+            // it changes the bits of its mask alone, so a mask over the
+            // default bits conflicts and one beside them does not.
+            ("mark and 0x30000000", true, false),
+            ("mark and 0x00ff0000", false, false),
             // A native save keeping every bit outside 0x00ff0000.
             (
                 "ct mark & 0xff00ffff | meta mark & 0x00ff0000",
@@ -8688,6 +8678,11 @@ mod tests {
                 !ran.status.success(),
                 refused,
                 "`ct mark set {value}` refused: {text}"
+            );
+            assert_eq!(
+                text.contains("already uses the ct-mark bits"),
+                refused,
+                "`ct mark set {value}` is named by the conflict scan: {text}"
             );
             assert_eq!(
                 text.contains("writes every bit of the connection mark"),
