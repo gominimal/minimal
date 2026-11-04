@@ -3490,6 +3490,143 @@ pub fn connecting_box(peer: SocketAddrV4, local: SocketAddrV4) -> ConnectingOwne
     }
 }
 
+/// The owners of many connections to this host at once (NET-070): one
+/// answer for each `(peer, local)` pair, in order, as [`connecting_box`]
+/// gives it for that pair alone. It reads each socket table once and walks
+/// `/proc/*/fd` once for every pair, so its cost does not grow with the
+/// number of pairs as a [`connecting_box`] call for each pair does. The
+/// proxy's shared owner walk asks it for every connection that waits.
+///
+/// Each holder found in the walk then has its cgroup read and its `fd`
+/// directory read again, once for each holder and not once for each pair. A
+/// pid that exited and was reused between the two reads names another
+/// process's cgroup, so it counts as unreadable, as in [`connecting_box`].
+#[must_use]
+pub fn connecting_boxes(pairs: &[(SocketAddrV4, SocketAddrV4)]) -> Vec<ConnectingOwner> {
+    #[cfg(target_os = "linux")]
+    {
+        let on_node: Vec<bool> = pairs
+            .iter()
+            .map(|(peer, _)| node_holds_address(*peer.ip()))
+            .collect();
+        if !on_node.contains(&true) {
+            return vec![ConnectingOwner::OffNode; pairs.len()];
+        }
+        let tables: Vec<String> = ["/proc/net/tcp", "/proc/net/tcp6"]
+            .iter()
+            .filter_map(|table| std::fs::read_to_string(table).ok())
+            .collect();
+        let inodes: Vec<Option<u64>> = pairs
+            .iter()
+            .zip(&on_node)
+            .map(|((peer, local), on_node)| {
+                if !on_node {
+                    return None;
+                }
+                let (ours, theirs) = (socket_table_keys(*peer), socket_table_keys(*local));
+                tables
+                    .iter()
+                    .find_map(|text| socket_row_inode(text, &ours, &theirs))
+            })
+            .collect();
+        let wanted: BTreeSet<u64> = inodes.iter().flatten().copied().collect();
+        let holders = if wanted.is_empty() {
+            Some(BTreeMap::new())
+        } else {
+            socket_holders_of(&wanted)
+        };
+        on_node
+            .iter()
+            .zip(&inodes)
+            .map(|(on_node, inode)| {
+                if !on_node {
+                    return ConnectingOwner::OffNode;
+                }
+                let (Some(inode), Some(holders)) = (inode, holders.as_ref()) else {
+                    return ConnectingOwner::Unknown;
+                };
+                owner_of_holders(
+                    holders
+                        .values()
+                        .filter(|holder| holder.held.contains(inode))
+                        .map(|holder| {
+                            holder
+                                .cgroup
+                                .clone()
+                                .filter(|_| holder.still.contains(inode))
+                        }),
+                )
+            })
+            .collect()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        pairs
+            .iter()
+            .map(|(peer, local)| connecting_box(*peer, *local))
+            .collect()
+    }
+}
+
+/// One process that holds a descriptor for a wanted socket, as
+/// [`socket_holders_of`] found it.
+#[cfg(target_os = "linux")]
+struct Holder {
+    /// The wanted sockets it held in the walk.
+    held: Vec<u64>,
+    /// The wanted sockets it held on a second read of its `fd` directory,
+    /// after its cgroup read. A socket in `held` and not here counts as
+    /// unreadable for this holder, as [`connecting_box`] checks.
+    still: Vec<u64>,
+    /// Its `/proc/<pid>/cgroup`, or `None` when that read failed.
+    cgroup: Option<String>,
+}
+
+/// The processes that hold a descriptor for any socket in `wanted`, by pid,
+/// from one walk of `/proc/*/fd`. `None` when `/proc` cannot be read.
+#[cfg(target_os = "linux")]
+fn socket_holders_of(wanted: &BTreeSet<u64>) -> Option<BTreeMap<u32, Holder>> {
+    let held_by = |pid: u32| -> Vec<u64> {
+        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+            return Vec::new();
+        };
+        fds.flatten()
+            .filter_map(|fd| {
+                let link = std::fs::read_link(fd.path()).ok()?;
+                let inode = link
+                    .to_str()?
+                    .strip_prefix("socket:[")?
+                    .strip_suffix(']')?
+                    .parse::<u64>()
+                    .ok()?;
+                wanted.contains(&inode).then_some(inode)
+            })
+            .collect()
+    };
+    let holders = std::fs::read_dir("/proc")
+        .ok()?
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
+        .filter_map(|pid| {
+            let held = held_by(pid);
+            if held.is_empty() {
+                return None;
+            }
+            let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok();
+            let still = held_by(pid);
+            Some((
+                pid,
+                Holder {
+                    held,
+                    still,
+                    cgroup,
+                },
+            ))
+        })
+        .collect();
+    Some(holders)
+}
+
 /// Whether `ip` is an address this node holds: a loopback address, or one
 /// a socket can bind to. A bind to port 0 fails with `EADDRNOTAVAIL` for an
 /// address no interface holds. A host that permits non-local binds
@@ -4167,6 +4304,53 @@ mod tests {
         // A test process runs in no box's leaf, so it is no box.
         assert_eq!(connecting_box(peer, local), ConnectingOwner::NoBox);
         drop(client);
+    }
+
+    /// The batch lookup gives each pair the answer [`connecting_box`] gives
+    /// it alone, in order: live connections from this process are no box's,
+    /// an off-node peer is off the node, and a pair in no socket table has
+    /// no owner (NET-070).
+    #[test]
+    fn connecting_boxes_names_each_pair_as_connecting_box_does() {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let SocketAddr::V4(local) = listener.local_addr().unwrap() else {
+            panic!("an IPv4 listener");
+        };
+        let mut held = Vec::new();
+        let mut pairs = Vec::new();
+        for _ in 0..3 {
+            let client = std::net::TcpStream::connect(local).unwrap();
+            let (accepted, SocketAddr::V4(peer)) = listener.accept().unwrap() else {
+                panic!("an IPv4 connection");
+            };
+            held.push((client, accepted));
+            pairs.push((peer, local));
+        }
+        pairs.insert(
+            1,
+            (SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 40000), local),
+        );
+        // No socket connects from this port to the listener.
+        pairs.push((SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1), local));
+        let one_by_one: Vec<_> = pairs
+            .iter()
+            .map(|(peer, local)| connecting_box(*peer, *local))
+            .collect();
+        assert_eq!(connecting_boxes(&pairs), one_by_one);
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                one_by_one,
+                [
+                    ConnectingOwner::NoBox,
+                    ConnectingOwner::OffNode,
+                    ConnectingOwner::NoBox,
+                    ConnectingOwner::NoBox,
+                    ConnectingOwner::Unknown,
+                ]
+            );
+        }
+        assert!(connecting_boxes(&[]).is_empty());
+        drop(held);
     }
 
     /// A peer at an address this node does not hold is off the node, with no

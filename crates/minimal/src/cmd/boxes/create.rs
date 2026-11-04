@@ -349,6 +349,19 @@ fn refuse_unhonourable_grants(
     Ok(plan.warnings)
 }
 
+/// Whether the activation holds the box's name on the VM host daemon once
+/// the box is active. A `host_ip` box holds it for the zone (NET-128). A
+/// `none` box holds it so the host can name the box by its id when the
+/// in-VM daemon reports an expose decision (NET-046). An own-address box
+/// has a row, and a native host has no VM host daemon.
+pub(crate) fn holds_name_with_vm_host(kind: paths::HostKind, network: boxes::NetworkMode) -> bool {
+    kind == paths::HostKind::Minvmd
+        && matches!(
+            network,
+            boxes::NetworkMode::HostNet | boxes::NetworkMode::NoNet
+        )
+}
+
 /// Whether a box with `network` on a host of `kind` has its lookups go
 /// through a switch that steers the credential module's names (BEP-017,
 /// BEP-062). This is a host fact and does not read the steering. On the VM
@@ -2059,10 +2072,8 @@ pub(crate) async fn activate_box(
                     )
                 );
             }
-            warn_if_hostname_routing_down(
-                created.hostname_routing_unavailable.as_deref(),
-                "min session activate",
-            );
+            // NET-020: no warning line of its own. The `names:` line below
+            // carries the cause in place of its resolution clause, once.
             // NET-122/NET-123/NET-138: the naming lines, printed once per session
             // start — after the create, and re-surfaced when the daemon reports this
             // session at the 127.0.0.1 interim because its session-start bind
@@ -2287,6 +2298,12 @@ pub(crate) async fn activate_box(
                 // it is not mirrored onto `127.0.0.1` and only the proxy
                 // reaches it, which `min ls` reads as the fallback as well.
                 let at_own_address = !created.interim_loopback;
+                if proxy_cause.is_some() {
+                    tracing::debug!(
+                        surface = "min session activate names: line",
+                        "printed the hostname-routing cause"
+                    );
+                }
                 eprintln!(
                     "{}",
                     crate::resolver::host_line_beside(
@@ -2698,8 +2715,7 @@ pub(crate) async fn activate_box(
                 // A kept session is active: it gets the `host_ip` name hold
                 // an activation that succeeded makes below.
                 if outcome == CleanupOutcome::Kept
-                    && kind == paths::HostKind::Minvmd
-                    && request.config.network == boxes::NetworkMode::HostNet
+                    && holds_name_with_vm_host(kind, request.config.network)
                     && let Some(name) = box_name.as_deref()
                 {
                     hold_box_name_with_vm_host(control_sock.clone(), name, Some(id), true).await;
@@ -2752,10 +2768,19 @@ pub(crate) async fn activate_box(
     // attaches to or execs into is dropped once the daemon's reconfirm
     // bound passes, and the name answers NXDOMAIN until the session's
     // next attach or exec.
+    //
+    // A `none` box on a VM host takes the same hold (NET-046): it has no
+    // switch row, so the hold is the host's one record of its box id, and
+    // the in-VM daemon's expose decision report names the box by that id.
+    // Its name answers NODATA, as a `host_ip` box's does while it is not
+    // resident. `min session destroy` and the dashboard's destroy release
+    // it, `min session rename` moves it, and an attach or exec re-holds it
+    // after a VM host daemon restart, because `holds_name` (vm_host.rs) is
+    // true for a `none` box as for a `host_ip` box. An unnamed `none` box
+    // holds nothing, and the host refuses its report.
     ActivationStep::HoldName
         .run(async {
-            if kind == paths::HostKind::Minvmd
-                && request.config.network == boxes::NetworkMode::HostNet
+            if holds_name_with_vm_host(kind, request.config.network)
                 && let Some(name) = box_name.as_deref()
             {
                 hold_box_name_with_vm_host(control_sock.clone(), name, Some(id), true).await;
@@ -3983,6 +4008,30 @@ mod tests {
             .downcast_ref::<boxes::core::bep::ActivationRefused>()
             .expect("the refusal is the box spec refusal");
         assert_eq!(refused.exit_code(), 3);
+    }
+
+    /// NET-046: a `none` box on a VM host holds its name with the host, as
+    /// a `host_ip` box does, so the host can name it by its box id.
+    #[test]
+    fn none_box_holds_its_name_with_the_vm_host() {
+        use boxes::NetworkMode;
+        use paths::HostKind;
+        assert!(holds_name_with_vm_host(
+            HostKind::Minvmd,
+            NetworkMode::NoNet
+        ));
+        assert!(holds_name_with_vm_host(
+            HostKind::Minvmd,
+            NetworkMode::HostNet
+        ));
+        assert!(!holds_name_with_vm_host(
+            HostKind::Minvmd,
+            NetworkMode::OwnIp
+        ));
+        assert!(!holds_name_with_vm_host(
+            HostKind::Minimald,
+            NetworkMode::NoNet
+        ));
     }
 
     /// BEP-017, BEP-062, BEP-080: a GitHub grant box with `dns` steering,

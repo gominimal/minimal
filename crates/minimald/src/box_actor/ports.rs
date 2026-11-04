@@ -615,6 +615,35 @@ impl BoxActor {
             .as_utf8_path()
             .as_std_path()
             .to_path_buf();
+        // How the VM host names this box when its copy of the record
+        // arrives (NET-046). A box with a switch address reports only by the
+        // route its listen watcher registered. A box with no switch address
+        // has no such route, so its report carries the box id and goes over
+        // this box's control channel. When the box record cannot be read,
+        // the switch address this box reported decides, so a box with no
+        // switch still reports by id.
+        let no_switch = match self.record.record().await {
+            Ok(record) => record.box_addresses.is_none(),
+            Err(error) => {
+                let no_switch = self.reported_switch_address.is_none();
+                tracing::debug!(
+                    name = %box_name,
+                    port,
+                    %error,
+                    no_switch,
+                    "the box record could not be read; the reported switch address decides the host report key"
+                );
+                no_switch
+            }
+        };
+        let host_key = if no_switch {
+            crate::audit::HostReportKey {
+                box_id: Some(*self.record.id()),
+                control: Some(self.switch_control().await),
+            }
+        } else {
+            crate::audit::HostReportKey::default()
+        };
         // An allow that stands is recorded before anything else is said
         // about it, and only a recorded one is answered as published
         // (NET-046): an allow whose record cannot be written is withdrawn and
@@ -631,7 +660,7 @@ impl BoxActor {
                     outcome: crate::audit::DecisionOutcome::Published,
                     reason: None,
                 };
-                match crate::audit::try_append(&state_dir, &record).await {
+                match crate::audit::try_append(&state_dir, &record, &host_key).await {
                     Ok(()) => {
                         // The record is written, so the box's relay gate
                         // admits the port now, before the caller hears the
@@ -812,6 +841,7 @@ impl BoxActor {
                     outcome: audited,
                     reason,
                 },
+                &host_key,
             )
             .await;
         }

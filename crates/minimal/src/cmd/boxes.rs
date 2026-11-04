@@ -7,6 +7,8 @@
 
 use super::*;
 
+#[path = "boxes/address.rs"]
+mod address;
 #[path = "boxes/attach.rs"]
 mod attach;
 #[path = "boxes/create.rs"]
@@ -26,6 +28,8 @@ mod show;
 #[path = "boxes/vm_host.rs"]
 mod vm_host;
 
+pub(crate) use address::*;
+pub use address::{AddressCandidate, BoxAddressRefusal};
 pub(crate) use attach::*;
 pub use create::*;
 pub(crate) use exec::*;
