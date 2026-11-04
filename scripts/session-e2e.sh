@@ -6437,7 +6437,47 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   mkdir -p "$TASK_SEED_DIR/sub/inner"
   : > "$TASK_SEED_DIR/sub/inner/marker"
 
-  # The loop: run → the task's output on stdout → exit 0 → session gone.
+  # task_kept_check <task> <stderr file>: the run's stderr names the kept
+  # box `<task>-<n>`, `min ls` lists it, and `min box rm` removes it. The
+  # box can still read running for a moment after the run returns, so the
+  # rm is retried briefly before it counts as a failure.
+  task_kept_check() {
+    local tk_task="$1" tk_err="$2" tk_name tk_ls tk_i
+    tk_name="$(grep -o "Kept box $tk_task-[0-9][0-9]*" "$tk_err" | head -n1)"
+    tk_name="${tk_name#Kept box }"
+    if [ -z "$tk_name" ]; then
+      echo "::error::'min task run $tk_task' did not name its kept box"
+      echo "--- task stderr ---"; cat "$tk_err" 2>/dev/null || true
+      fail
+    fi
+    grep -q "min box rm $tk_name" "$tk_err" \
+      || { echo "::error::kept-box line does not name 'min box rm $tk_name'"; cat "$tk_err"; fail; }
+    # Capture-then-glob, never `mnl ls | grep -q`: grep's early exit SIGPIPEs
+    # the ls under pipefail and the check would read wrong.
+    tk_ls="$(mnl ls 2>/dev/null)"
+    if [[ "$tk_ls" != *"$tk_name"* ]]; then
+      echo "::error::task box $tk_name not listed after 'min task run $tk_task'"
+      mnl ls 2>&1 || true
+      fail
+    fi
+    for tk_i in $(seq 1 20); do
+      mnl box rm "$tk_name" >/dev/null 2>"$WORK/task-rm.err" && break
+      if [ "$tk_i" -eq 20 ]; then
+        echo "::error::'min box rm $tk_name' failed after 'min task run $tk_task'"
+        cat "$WORK/task-rm.err" 2>/dev/null || true
+        fail
+      fi
+      sleep 0.5
+    done
+    tk_ls="$(mnl ls 2>/dev/null)"
+    if [[ "$tk_ls" == *"$tk_name"* ]]; then
+      echo "::error::task box $tk_name still listed after 'min box rm'"
+      fail
+    fi
+  }
+
+  # The loop: run → the task's output on stdout → exit 0 → the task box
+  # ended and kept, removable with the `min box rm` the run names (BOX-038).
   t0=$(now_ms)
   task_out="$(cd "$TASK_SEED_DIR" && mnl task run e2e-echo 2>"$WORK/task-run.err")"
   rc=$?
@@ -6455,17 +6495,13 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     echo "--- task stderr ---"; cat "$WORK/task-run.err" 2>/dev/null || true
     fail
   fi
-  # Capture-then-glob, never `mnl ls | grep -q`: grep's early exit SIGPIPEs
-  # the ls under pipefail and the leftover check would falsely pass.
-  ls_out="$(mnl ls 2>/dev/null)"
-  if [[ "$ls_out" == *e2e-echo-[0-9]* ]]; then
-    echo "::error::ephemeral session still listed after 'min task run e2e-echo'"
-    fail
-  fi
-  echo "task run loop: output + destroy OK ($((t1 - t0))ms)"
+  # The run keeps its box: the kept line names it, `min ls` still lists
+  # it, and the `min box rm` the line names removes it.
+  task_kept_check e2e-echo "$WORK/task-run.err"
+  echo "task run loop: output + kept box + rm OK ($((t1 - t0))ms)"
 
   # The task's exit code must come back as ours — and the failing run's
-  # session must be torn down just the same.
+  # box is kept just the same.
   (cd "$TASK_SEED_DIR" && mnl task run e2e-fail >/dev/null 2>"$WORK/task-fail.err")
   rc=$?
   if [ "$rc" -ne 7 ]; then
@@ -6473,11 +6509,7 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     echo "--- task stderr ---"; cat "$WORK/task-fail.err" 2>/dev/null || true
     fail
   fi
-  ls_out="$(mnl ls 2>/dev/null)"
-  if [[ "$ls_out" == *e2e-fail-[0-9]* ]]; then
-    echo "::error::ephemeral session still listed after a failing 'min task run'"
-    fail
-  fi
+  task_kept_check e2e-fail "$WORK/task-fail.err"
   echo "task run exit-code relay: 7 → 7 OK"
 
   # --keep retains the session, named <task>-<n> by the daemon, attachable later.
