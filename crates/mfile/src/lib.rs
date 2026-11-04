@@ -1530,12 +1530,14 @@ impl File {
             // BEP-037: a project cannot set secret-store rules. The table is
             // ignored with its own warning, not the generic unknown-field one.
             boxes::core::bep::warn_project_store_rules(self.extra.keys().map(String::as_str));
+            // NET-159: a project cannot open host ports to its boxes. The
+            // table is ignored with its own warning, as the store rules are.
+            boxes::core::egress::warn_project_host_exposures(self.extra.keys().map(String::as_str));
             let mut unknown = Vec::new();
-            for key in self
-                .extra
-                .keys()
-                .filter(|key| *key != boxes::core::bep::STORE_RULES_TABLE)
-            {
+            for key in self.extra.keys().filter(|key| {
+                *key != boxes::core::bep::STORE_RULES_TABLE
+                    && *key != boxes::core::egress::HOST_EXPOSURES_TABLE
+            }) {
                 match misplaced_top_level_key(key) {
                     Some(correct) => tracing::warn!(
                         "{key} is unknown at the top level of {MFILE_NAME}; did you mean {correct}?"
@@ -3160,6 +3162,34 @@ mod tests {
             );
             assert_eq!(count_unknown_warnings(&capture), 0, "{body}: {out}");
         }
+    }
+
+    /// NET-159: a project's top-level `[host-exposures]` table is ignored
+    /// with its own warning, once, not the generic unknown-field one.
+    #[test]
+    fn project_host_exposures_are_ignored_with_warning() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MFILE_NAME),
+            "[host-exposures.web]\nport = 8080\n",
+        )
+        .unwrap();
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        File::from_dir(dir.path()).expect("the file still reads");
+        drop(guard);
+        let out = capture.contents();
+        assert_eq!(
+            out.matches(boxes::core::egress::PROJECT_HOST_EXPOSURES_IGNORED)
+                .count(),
+            1,
+            "{out}"
+        );
+        assert_eq!(count_unknown_warnings(&capture), 0, "{out}");
     }
 
     fn count_unknown_warnings(capture: &CaptureWriter) -> usize {
