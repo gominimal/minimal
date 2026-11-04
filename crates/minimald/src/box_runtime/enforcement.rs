@@ -1091,6 +1091,28 @@ pub(crate) fn record_host_address_box_namespace(id: boxes::SessionId, supervisor
     }
 }
 
+/// Records the host-address box's PID namespace, or refuses the launch
+/// when there is none to record (NET-070). A box the launch cannot record
+/// is one the hostname proxy cannot tell from a process outside every box,
+/// so the launch fails closed rather than run it unattributed.
+pub(crate) fn require_host_address_box_namespace(
+    id: boxes::SessionId,
+    supervisor: u32,
+) -> std::io::Result<()> {
+    if record_host_address_box_namespace(id, supervisor) {
+        return Ok(());
+    }
+    tracing::warn!(
+        session = %id,
+        supervisor,
+        "refused the host-address box: no PID namespace of its own to record for the hostname proxy's owner lookup"
+    );
+    Err(std::io::Error::other(
+        "the box did not start: Minimal cannot read the box's process namespace, \
+         so the hostname proxy cannot tell which box opens a connection",
+    ))
+}
+
 /// The running host-address box whose PID namespace is `namespace`, the
 /// `(device, inode)` of a process's `/proc/<pid>/ns/pid` (NET-070). `None`
 /// when no running host-address box runs in it.
@@ -1184,5 +1206,30 @@ mod namespace_tests {
         assert!(!record_host_address_box_namespace(id, child.id()));
         child.kill().unwrap();
         child.wait().unwrap();
+    }
+
+    /// NET-070: a launch whose box has no PID namespace of its own to record
+    /// fails, so the box never runs unattributed. A plain child shares this
+    /// process's namespace, which is the case the launcher must refuse.
+    #[test]
+    fn owner_by_pid_namespace_without_classifier_leaf_refuses_unrecorded_launch() {
+        let id = boxes::SessionId::parse_str("00000000-0000-0000-0000-0000000000c2").unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let refused = require_host_address_box_namespace(id, child.id());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let err = refused.expect_err("an unrecorded host-address box must not start");
+        assert!(
+            err.to_string()
+                .contains("cannot tell which box opens a connection"),
+            "{err}"
+        );
+        assert!(
+            !host_address_namespaces().by_box.contains_key(&id),
+            "no record"
+        );
     }
 }
