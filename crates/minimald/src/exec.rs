@@ -114,6 +114,13 @@ pub trait Process: Send + 'static {
     /// Request termination. Idempotent. Returns immediately — the
     /// caller is expected to follow up with `wait` for the actual exit.
     fn start_kill(&mut self) -> io::Result<()>;
+
+    /// A line for the client's stderr about why the process ended, once
+    /// `wait` has returned. `None` (the default) when the process's own
+    /// output says all there is: it ran and exited, or was signalled.
+    fn exit_notice(&mut self) -> Option<String> {
+        None
+    }
 }
 
 /// Handles a request to run a program on an SSH channel.

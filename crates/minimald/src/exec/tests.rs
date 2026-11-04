@@ -5332,3 +5332,93 @@ mod end_to_end {
         let _ = out;
     }
 }
+
+/// A task whose sandbox failed before its command started: nothing on its
+/// stdio, hakoniwa's 125, and the reason kept for the client.
+struct FailedSandbox;
+
+impl super::Process for FailedSandbox {
+    type Stdin = tokio::io::Sink;
+    type Stdout = tokio::io::Empty;
+    type Stderr = tokio::io::Empty;
+
+    fn take_stdio(&mut self) -> Option<(Self::Stdin, Self::Stdout, Self::Stderr)> {
+        Some((tokio::io::sink(), tokio::io::empty(), tokio::io::empty()))
+    }
+
+    async fn wait(&mut self) -> std::io::Result<Option<i32>> {
+        Ok(Some(super::SANDBOX_FAILURE_CODE))
+    }
+
+    fn start_kill(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn exit_notice(&mut self) -> Option<String> {
+        Some(super::sandbox_failure_notice("mount /home/h810: ENOENT"))
+    }
+}
+
+/// inbox#1129: a task whose sandbox failed used to end with exit 125 and
+/// nothing on the client. The reason now reaches the client's stderr, and
+/// the status is still hakoniwa's.
+#[tokio::test]
+async fn a_sandbox_failure_reaches_the_client_stderr() {
+    let (mut bridge_stdout, mut client_stdout) = duplex(64 * 1024);
+    let (mut bridge_stderr, mut client_stderr) = duplex(64 * 1024);
+    let (client_stdin, mut stdin) = duplex(64);
+    drop(client_stdin);
+    let status = bridge(
+        "test",
+        futures::stream::iter(vec![Ok(FailedSandbox)]),
+        &mut stdin,
+        &mut bridge_stdout,
+        &mut bridge_stderr,
+        client_lost(),
+        super::UnreadStdin::Keep,
+    )
+    .await;
+    drop(bridge_stdout);
+    drop(bridge_stderr);
+    assert_eq!(status, 125);
+    let mut err = String::new();
+    client_stderr.read_to_string(&mut err).await.unwrap();
+    assert_eq!(
+        err,
+        "minimald: the task's sandbox failed before its command started: \
+         mount /home/h810: ENOENT\n"
+    );
+    let mut out = Vec::new();
+    client_stdout.read_to_end(&mut out).await.unwrap();
+    assert!(out.is_empty());
+}
+
+/// Only hakoniwa's own container failure counts: a command that exits 125
+/// itself, or one that was signalled, is not reported as a sandbox failure.
+#[test]
+fn only_a_container_failure_is_a_sandbox_failure() {
+    let status = |code, exit_code: Option<i32>, reason: &str| hakoniwa::ExitStatus {
+        code,
+        reason: reason.to_string(),
+        exit_code,
+        rusage: None,
+        proc_pid_smaps_rollup: None,
+        proc_pid_status: None,
+    };
+    assert_eq!(
+        super::sandbox_failure(&status(125, None, "mount /home/h810: ENOENT")),
+        Some("mount /home/h810: ENOENT".to_string())
+    );
+    assert_eq!(
+        super::sandbox_failure(&status(
+            125,
+            Some(125),
+            "process(bash) exited with code 125"
+        )),
+        None
+    );
+    assert_eq!(
+        super::sandbox_failure(&status(137, None, "process(bash) received signal SIGKILL")),
+        None
+    );
+}

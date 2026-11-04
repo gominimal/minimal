@@ -523,6 +523,9 @@ pub struct HakoniwaProcess {
     /// A line the daemon shows ahead of the child's own stderr, such as the
     /// `inherit_cwd` fallback notice (see [`task_start_dir`]).
     pub(super) stderr_notice: Option<String>,
+    /// hakoniwa's account of a sandbox that failed before the command
+    /// started, for the client's stderr ([`Process::exit_notice`]).
+    pub(super) failure: Option<String>,
 }
 
 /// The release of a task's network, owed once its process is gone.
@@ -598,6 +601,7 @@ impl HakoniwaProcess {
             state: WaitState::Spawned(Box::new(child)),
             net: NetRelease::new(net_guard),
             stderr_notice: None,
+            failure: None,
         }
     }
 }
@@ -639,7 +643,17 @@ impl Process for HakoniwaProcess {
                 // signal death), so a SIGKILL reports 137 rather than 1. The
                 // `exit_code` field is `None` for signals and would collapse
                 // to 1 downstream; `code` is what the session path reports too.
-                Ok(Ok(status)) => WaitState::Exited(Some(status.code)),
+                Ok(Ok(status)) => {
+                    self.failure = sandbox_failure(&status);
+                    if let Some(reason) = &self.failure {
+                        tracing::warn!(
+                            pid = self.pid,
+                            %reason,
+                            "task: the sandbox failed before the command started"
+                        );
+                    }
+                    WaitState::Exited(Some(status.code))
+                }
                 Ok(Err(_)) | Err(_) => WaitState::Failed,
             };
         }
@@ -667,6 +681,31 @@ impl Process for HakoniwaProcess {
         unsafe { libc::kill(self.pid, libc::SIGKILL) };
         Ok(())
     }
+
+    fn exit_notice(&mut self) -> Option<String> {
+        self.failure
+            .take()
+            .map(|reason| sandbox_failure_notice(&reason))
+    }
+}
+
+/// hakoniwa's exit code for a container that failed itself, rather than a
+/// command that ran (`ExitStatus::FAILURE`).
+pub(super) const SANDBOX_FAILURE_CODE: i32 = 125;
+
+/// The reason a task's sandbox failed before its command started, or `None`
+/// for a command that ran. hakoniwa reports that failure as code 125 with no
+/// inner exit code. A command that itself exits 125 carries its own exit code,
+/// and a signalled one reports `128 + signo`, so neither is taken for it.
+pub(super) fn sandbox_failure(status: &hakoniwa::ExitStatus) -> Option<String> {
+    (status.code == SANDBOX_FAILURE_CODE && status.exit_code.is_none())
+        .then(|| status.reason.clone())
+}
+
+/// The line the client gets for a task whose sandbox failed before its
+/// command started (inbox#1129), where it used to get exit 125 and nothing.
+pub(super) fn sandbox_failure_notice(reason: &str) -> String {
+    format!("minimald: the task's sandbox failed before its command started: {reason}\n")
 }
 
 /// The [`Process`] produced by a [`TaskExec`]: either a real sandboxed child
@@ -707,6 +746,13 @@ impl Process for TaskProcess {
         match self {
             TaskProcess::Sandbox(p) => p.start_kill(),
             TaskProcess::Echo(p) => p.start_kill(),
+        }
+    }
+
+    fn exit_notice(&mut self) -> Option<String> {
+        match self {
+            TaskProcess::Sandbox(p) => p.exit_notice(),
+            TaskProcess::Echo(p) => p.exit_notice(),
         }
     }
 }
@@ -1813,5 +1859,8 @@ impl<P: Process> Process for TimedProcess<P> {
 
     fn start_kill(&mut self) -> io::Result<()> {
         self.inner.start_kill()
+    }
+    fn exit_notice(&mut self) -> Option<String> {
+        self.inner.exit_notice()
     }
 }

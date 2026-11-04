@@ -212,6 +212,10 @@ impl<P: Process> Process for StoppedOnDestroy<P> {
     fn start_kill(&mut self) -> io::Result<()> {
         self.inner.start_kill()
     }
+
+    fn exit_notice(&mut self) -> Option<String> {
+        self.inner.exit_notice()
+    }
 }
 
 /// Runs [`bridge`] and writes the notice for why the command ended to `e`
@@ -1528,6 +1532,14 @@ where
             }
         }
     };
+    // A command that never started wrote nothing; the reason it did not
+    // start is all the client gets, so it goes on stderr ahead of the
+    // status (inbox#1129: a bare 125 with no output).
+    if let Some(notice) = process.exit_notice()
+        && e.write_all(notice.as_bytes()).await.is_err()
+    {
+        tracing::debug!(%channel_id, "exec: the exit notice was not written; the client is gone");
+    }
     match status {
         Ok(code) => code.unwrap_or(1) as u32,
         Err(err) => {
