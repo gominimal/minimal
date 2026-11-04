@@ -396,18 +396,16 @@ case "${1:-}" in
 esac
 
 # The host exposure the VM-backed daemon opens host.min.internal at. minvmd
-# closes the alias at every port unless MINVMD_HOST_EXPOSURE_PORTS lists
-# ports, and it reads the list from its own environment at each VM boot, so
-# the export must precede the first `min` call, whose autospawn inherits it.
-# The list is the one port NET-003 reaches the host's loopback at from a
-# host-address box (the proxy proof's PROXY_HOST_PORT) and nothing wider:
-# the same proof asserts the alias stays refused at an unlisted port, and
-# own-address boxes stay refused at every port, listed or not. A native
-# daemon has no alias gate and ignores the variable.
+# closes the alias at every port unless the [host-exposures] table of the
+# client config.toml opens ports. The table is written into the hermetic
+# XDG_CONFIG_HOME below, before the first `min` call, whose autospawn hands
+# minvmd that config dir. The table is the one port NET-003 reaches the
+# host's loopback at from a host-address box (the proxy proof's
+# PROXY_HOST_PORT) and nothing wider: the same proof asserts the alias stays
+# refused at a port outside the table, and own-address boxes stay refused at
+# every port, in the table or not. A native daemon has no alias gate and
+# ignores the table.
 E2E_HOST_EXPOSURE_PORT=18081
-if [ -n "$E2E_VM" ]; then
-  export MINVMD_HOST_EXPOSURE_PORTS="$E2E_HOST_EXPOSURE_PORT"
-fi
 
 # The non-baseline package the sandbox proof adds and then runs. It must be a
 # real upstream package that is genuinely ABSENT from a fresh shell-stack
@@ -703,6 +701,11 @@ fi
 # orientation banner (built-in `default` loadout). An operator's own
 # `default_loadouts`/`default.toml` must not leak into the canonical proof.
 export XDG_CONFIG_HOME="$WORK/config"
+if [ -n "$E2E_VM" ]; then
+  mkdir -p "$XDG_CONFIG_HOME/minimal"
+  printf '[host-exposures]\ne2e = { proto = "tcp", port = %s }\n' "$E2E_HOST_EXPOSURE_PORT" \
+    >>"$XDG_CONFIG_HOME/minimal/config.toml"
+fi
 
 # The CLI's tracing layer writes to STDOUT (ot::StdoutWriter, minimal/src/
 # main.rs), so at the default level the autospawn INFO lines interleave with
@@ -21880,8 +21883,8 @@ proof_min_internal_names_through_proxy() {
 
   # ---- the host exposure is the only opening (design §7.1) ----------------
   # A VM host's gate opens host.min.internal at the listed exposure alone
-  # (MINVMD_HOST_EXPOSURE_PORTS, exported at the top), so the same box, the
-  # same alias, at a port outside the list must not reach the host, even
+  # (the [host-exposures] table written at the top), so the same box, the
+  # same alias, at a port outside the table must not reach the host, even
   # with a host-loopback listener answering there. A native host-address box
   # shares the host's namespace, with no alias gate to assert.
   if [ -n "$E2E_VM" ]; then
@@ -21921,7 +21924,7 @@ proof_min_internal_names_through_proxy() {
     case "$proxy_unexposed_rc" in
       7 | 28) ;;
       0)
-        echo "::error::the host-address box reached the host through host.min.internal at port $PROXY_UNEXPOSED_PORT, outside MINVMD_HOST_EXPOSURE_PORTS=$MINVMD_HOST_EXPOSURE_PORTS"
+        echo "::error::the host-address box reached the host through host.min.internal at port $PROXY_UNEXPOSED_PORT, outside the [host-exposures] table, which opens port $E2E_HOST_EXPOSURE_PORT alone"
         fail
         ;;
       *)
