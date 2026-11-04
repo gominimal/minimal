@@ -4230,7 +4230,11 @@ mod tests {
         let marker = dir.path().join("minzoned.socket");
         std::fs::write(&marker, b"[Socket]\nListenDatagram=127.0.0.1:17656\n")
             .expect("the install marker is written");
-        let service = super::stand_in::fake_manager_held_service_gated(channel.clone(), Some(gate));
+        let service = super::stand_in::fake_manager_held_service_gated(
+            channel.clone(),
+            Some(gate),
+            Duration::ZERO,
+        );
         let status = AnswererStatus::starting();
         let shutdown = CancellationToken::new();
         let task = drive(
@@ -4475,7 +4479,7 @@ pub(crate) mod stand_in {
     /// connect finds it there, never racing the service up), then serves
     /// hellos and publishes forever.
     pub(crate) fn fake_manager_held_service(channel: std::path::PathBuf) -> FakeServiceHandle {
-        fake_manager_held_service_gated(channel, None)
+        fake_manager_held_service_gated(channel, None, Duration::ZERO)
     }
 
     /// [`fake_manager_held_service`] whose first publish is recorded at once but
@@ -4484,6 +4488,7 @@ pub(crate) mod stand_in {
     pub(crate) fn fake_manager_held_service_gated(
         channel: std::path::PathBuf,
         first_ack: Option<Arc<tokio::sync::Notify>>,
+        ack_delay: Duration,
     ) -> FakeServiceHandle {
         let listener =
             tokio::net::UnixListener::bind(&channel).expect("the service's channel listener binds");
@@ -4538,6 +4543,11 @@ pub(crate) mod stand_in {
                                 }
                                 let request: PublishRequest = serde_json_lenient::from_str(&line)
                                     .expect("the daemon's publish parses");
+                                // A slow service: the rows are held, and
+                                // answer, only once the delay has passed.
+                                if !ack_delay.is_zero() {
+                                    tokio::time::sleep(ack_delay).await;
+                                }
                                 publishes.lock().unwrap().push(request.rows);
                                 let gate = first_ack.lock().unwrap().take();
                                 if let Some(gate) = gate {
@@ -4567,6 +4577,11 @@ pub(crate) mod stand_in {
         }
     }
 
+    /// How long the stand-in takes to hold and acknowledge each publish:
+    /// longer than a registration takes to return without waiting, so a
+    /// lookup made on return finds the name only when the return waited.
+    const STAND_IN_ACK_DELAY: Duration = Duration::from_millis(300);
+
     /// A daemon publishing into a stand-in installed answerer: the service,
     /// the install marker beside its channel, and the daemon's acquisition
     /// on a thread of its own. Dropping it ends both.
@@ -4587,7 +4602,8 @@ pub(crate) mod stand_in {
             let marker = dir.path().join("minzoned.socket");
             std::fs::write(&marker, b"[Socket]\nListenDatagram=127.0.0.1:17656\n")
                 .expect("the install marker is written");
-            let service = fake_manager_held_service(channel.clone());
+            let service =
+                fake_manager_held_service_gated(channel.clone(), None, STAND_IN_ACK_DELAY);
             let status = AnswererStatus::starting();
             let shutdown = CancellationToken::new();
             let hook_port = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
