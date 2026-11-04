@@ -6845,6 +6845,64 @@ async fn host_stop_force_forces_boxes_and_daemon() {
     );
 }
 
+/// BCLI-049: `min host stop --force` on a VM host whose daemon connects but
+/// never answers stops the VM from this machine. It does not wait on a box
+/// listing first, and it exits 0. Without `--force` the command refuses with
+/// exit 7, as `min stop` does for a host that does not answer, and names
+/// `--force`.
+#[tokio::test]
+async fn host_stop_force_forces_boxes_and_daemon_when_daemon_does_not_answer() {
+    let state = state_with_host_dirs(&["local-minvmd0"]);
+    let sock = state.path().join("providers/local-minvmd0/ssh.sock");
+    // Accepts each connection and holds it open, and never writes a byte.
+    let listener = tokio::net::UnixListener::bind(&sock).expect("the socket binds");
+    let holder = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+
+    let started = std::time::Instant::now();
+    let mut out = Vec::new();
+    let args = HostStopArgs {
+        host: "local-minvmd0".to_owned(),
+        force: true,
+    };
+    cmd::hosts::cmd_host_stop(&host_globals(state.path()), &args, &mut out)
+        .await
+        .expect("host stop --force stops the VM of a daemon that does not answer");
+    // The VM dir has no running VM, so the host-side stop signals nothing.
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "local-minvmd0 is not running.\n"
+    );
+    // The probe's budget, and no RPC timeout on a listing after it.
+    assert!(
+        started.elapsed() < client::RPC_TIMEOUT,
+        "took {:?}",
+        started.elapsed()
+    );
+
+    let args = HostStopArgs {
+        host: "local-minvmd0".to_owned(),
+        force: false,
+    };
+    let err = cmd::hosts::cmd_host_stop(&host_globals(state.path()), &args, &mut Vec::new())
+        .await
+        .expect_err("host stop without --force refuses a daemon that does not answer");
+    assert!(
+        err.downcast_ref::<client::box_registration::HostUnreachable>()
+            .is_some(),
+        "{err:#}"
+    );
+    assert!(
+        format!("{err:#}").contains("Run `min host stop local-minvmd0 --force`"),
+        "{err:#}"
+    );
+    holder.abort();
+}
+
 /// BCLI-052: `min provider list --all` lists every well-known local provider
 /// present on the machine: a provider with a host, and `local-box` only in a
 /// box. Without `--all` it lists the provider the command selects.

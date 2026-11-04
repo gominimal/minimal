@@ -16,7 +16,6 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::Context as _;
 use serde::Serialize;
 
 use super::output::{self, ObjectType, OutputMode, Rendered};
@@ -487,33 +486,59 @@ pub async fn cmd_host_stop(
         writeln!(out, "{} is not running.", host.name)?;
         return Ok(());
     }
+    // `--force` on a VM host is the remedy for a guest that is stuck. Every
+    // failure to reach its daemon or its boxes falls through to a stop of
+    // the VM, never to an exit that leaves the VM up.
+    let force_vm = args.force && vm_dir.is_some();
+    if force_vm && state == HostState::Unreachable {
+        let cause = anyhow::anyhow!("the daemon did not answer its probe");
+        return host_unreachable(host, vm_dir, args.force, cause, out).await;
+    }
     // Ungated: as for `min stop`, stopping a daemon of another version is
     // the remedy the version check itself names.
     let mut client = match client::Client::connect(&host.socket()).await {
         Ok(client) => client,
         Err(e) => return host_unreachable(host, vm_dir, args.force, e, out).await,
     };
-    let listed = super::list_box_records(&mut client, None)
-        .await
-        .with_context(|| format!("the boxes on {} were not listed", host.name))?;
+    let listed = match super::list_box_records(&mut client, None).await {
+        Ok(listed) => listed,
+        Err(e) => {
+            drop(client);
+            let cause = e.context("the boxes were not listed");
+            return host_unreachable(host, vm_dir, args.force, cause, out).await;
+        }
+    };
     let mut stopped = 0;
+    let mut not_stopped = Vec::new();
     for entry in listed.iter().filter(|e| e.state == "running") {
         let target = entry
             .name
             .clone()
             .unwrap_or_else(|| entry.box_id.to_string());
-        super::stop_listed_box(&mut client, &mut out, entry.box_id, &target, args.force)
-            .await
-            .with_context(|| {
-                format!(
+        match super::stop_listed_box(&mut client, &mut out, entry.box_id, &target, args.force).await
+        {
+            Ok(true) => stopped += 1,
+            Ok(false) => {}
+            Err(e) if force_vm => {
+                tracing::debug!(host = %host.name, r#box = %target, "forced box stop failed: {e:#}");
+                not_stopped.push(target);
+            }
+            Err(e) => {
+                return Err(e.context(format!(
                     "the daemon on {} was not stopped, because {target} did not stop",
                     host.name
-                )
-            })?;
-        stopped += 1;
+                )));
+            }
+        }
     }
     let vm = vm_dir.is_some();
     super::shut_down_host_daemon(client, &host.name, vm_dir, args.force).await?;
+    for target in &not_stopped {
+        writeln!(
+            out,
+            "{target} did not answer the stop. It ended when its VM stopped."
+        )?;
+    }
     writeln!(out, "{}", host_stop_summary(stopped, &host.name, vm))?;
     Ok(())
 }
@@ -548,11 +573,18 @@ async fn host_unreachable(
             }
             Ok(())
         }
-        Some(_) => Err(cause.context(format!(
-            "the daemon on {} does not answer. Run `{force_command}` to stop its VM from this machine.",
-            host.name
-        ))),
-        None => Err(cause.context(format!("the daemon on {} does not answer.", host.name))),
+        // Exit 7, as `min stop` exits for a host that does not answer.
+        Some(_) => Err(client::box_registration::HostUnreachable::over(
+            cause,
+            format!(
+                "the daemon on {} does not answer. Run `{force_command}` to stop its VM from this machine.",
+                host.name
+            ),
+        )),
+        None => Err(client::box_registration::HostUnreachable::over(
+            cause,
+            format!("the daemon on {} does not answer.", host.name),
+        )),
     }
 }
 

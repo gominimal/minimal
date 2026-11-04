@@ -368,6 +368,13 @@ const UNACKNOWLEDGED_STOP_CAVEAT: &str = "The VM did not respond to shutdown, so
      Running sessions were killed without their shutdown steps, and recently written files \
      may be empty or cut short. The VM disk's filesystem itself stays consistent.";
 
+/// What `min host stop --force` says after killing a VM whose guest did not
+/// acknowledge Shutdown. The same caveat as [`UNACKNOWLEDGED_STOP_CAVEAT`],
+/// for a command that names boxes, not sessions.
+const HOST_UNACKNOWLEDGED_STOP_CAVEAT: &str = "The VM did not respond to shutdown, so it was killed from this machine. \
+     Running boxes were killed without their stop steps, and recently written files \
+     may be empty or cut short. The VM disk's filesystem itself stays consistent.";
+
 /// How long a host-side stop waits for minvmd to release the VM's alive lock
 /// once the VMM has been signalled: the supervisor has to reap the VMM child
 /// and exit. The same ceiling an acknowledged shutdown is given to reach
@@ -574,7 +581,7 @@ pub(crate) async fn shut_down_host_daemon(
         }
         let outcome = stop_vm_from_host_at(vm_dir, false, force_command).await?;
         if !acknowledged && outcome == minvmd::cmd::stop::HostStop::GuestUnacknowledged {
-            eprintln!("{UNACKNOWLEDGED_STOP_CAVEAT}");
+            eprintln!("{HOST_UNACKNOWLEDGED_STOP_CAVEAT}");
         }
         return Ok(());
     }
@@ -750,14 +757,16 @@ pub(crate) fn box_host_control_sock(
 }
 
 /// Stops the box `id`, which the address `target` resolved to, as BOX-013
-/// defines, forced under `force`. Writes one line to `out`.
+/// defines, forced under `force`. Writes one line to `out`. Returns true
+/// when this stop stopped the box, and false when the box had already
+/// exited.
 pub(crate) async fn stop_listed_box(
     client: &mut client::Client,
     out: &mut impl std::io::Write,
     id: boxes::SessionId,
     target: &str,
     force: bool,
-) -> Result<(), anyhow::Error> {
+) -> Result<bool, anyhow::Error> {
     use minimald_rpc::{Errorable, StopBox};
 
     crate::output::record_box_id(&id.to_string());
@@ -770,7 +779,7 @@ pub(crate) async fn stop_listed_box(
         Errorable::Err { error } => return Err(box_rpc_error(target, error)),
     };
     write_stop_line(out, target, &stopped)?;
-    Ok(())
+    Ok(!stopped.already_exited)
 }
 
 /// The one line `min box stop` prints for the daemon's answer `stopped`.
