@@ -95,8 +95,15 @@ pub async fn run(mut cli: Cli) -> Result<(), anyhow::Error> {
     // Boxed: inlined, this dispatch match's deepest arm overruns rustc's
     // query depth (128) when computing the future's layout.
     let result = run_in_root(root, Box::pin(run_command(cli))).await;
+    // A failed run hands the hint to the error path, which puts it in the
+    // `min/v1/error` object's `hint` field in a machine output mode, so
+    // stderr carries one object only (BCLI-042).
     if let Some(hint) = alias_hint {
-        eprintln!("{hint}");
+        if result.is_ok() {
+            eprintln!("{hint}");
+        } else {
+            hosts::defer_alias_hint_to_failure(hint);
+        }
     }
     match result? {
         None => Ok(()),

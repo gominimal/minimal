@@ -390,6 +390,18 @@ impl MachineModeFailure {
     pub fn hint(&self) -> &str {
         &self.hint
     }
+
+    /// The failure with an old-spelling hint added to its `hint` field, so
+    /// the error object carries it and no separate line prints (BCLI-042).
+    #[must_use]
+    pub fn with_alias_hint(mut self, alias_hint: &str) -> Self {
+        self.hint = if self.hint.is_empty() {
+            alias_hint.to_owned()
+        } else {
+            format!("{}. {alias_hint}", self.hint)
+        };
+        self
+    }
 }
 
 impl std::fmt::Display for MachineModeFailure {

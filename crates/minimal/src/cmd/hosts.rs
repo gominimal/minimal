@@ -39,6 +39,23 @@ pub fn read_provider_alias(global: &mut GlobalArgs) -> Option<&'static str> {
     }
 }
 
+/// The alias hint of a run that failed. The error path prints it, so a
+/// machine output mode carries it in the error object's `hint` field and
+/// prints no separate line (BCLI-042).
+static FAILED_RUN_ALIAS_HINT: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// Hand the alias hint to the error path of a run that failed.
+pub fn defer_alias_hint_to_failure(hint: &'static str) {
+    // A second set in one process keeps the first hint, which is the same.
+    let _ = FAILED_RUN_ALIAS_HINT.set(hint);
+}
+
+/// The alias hint the error path prints for a failed run, if any.
+#[must_use]
+pub fn failed_run_alias_hint() -> Option<&'static str> {
+    FAILED_RUN_ALIAS_HINT.get().copied()
+}
+
 /// A well-known local provider: one per local deployment style.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LocalProvider {
@@ -68,12 +85,17 @@ impl LocalProvider {
 /// One local host: a daemon instance with a state directory on this machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalHost {
-    /// The host's name: `local<N>` or `local-minvmd<N>`.
+    /// The host's name: `local<N>`, `local-minvmd<N>`, or
+    /// `<vm>.local-minvmd<N>` for a named VM.
     pub name: String,
     /// The provider the host belongs to.
     pub provider: LocalProvider,
-    /// The daemon instance number.
+    /// The daemon instance number. A named VM has the number of the VM host
+    /// directory it nests in.
     pub instance: u32,
+    /// The VM name, for a named VM at `local-minvmd<N>/<vm>`. `None` for
+    /// the host that the instance directory itself holds.
+    pub vm: Option<String>,
     /// The host's state directory.
     pub dir: PathBuf,
 }
@@ -142,16 +164,53 @@ pub fn local_hosts(minimal_dir: Option<&Path>) -> std::io::Result<Vec<LocalHost>
             continue;
         };
         if let Some((provider, instance, name)) = host_for_dir_name(&file_name) {
+            if provider == LocalProvider::LocalMinvmd {
+                hosts.extend(named_vms(&entry.path(), instance)?);
+            }
             hosts.push(LocalHost {
                 name,
                 provider,
                 instance,
+                vm: None,
                 dir: entry.path(),
             });
         }
     }
-    hosts.sort_by_key(|h| (h.provider, h.instance));
+    hosts.sort_by(|a, b| (a.provider, a.instance, &a.vm).cmp(&(b.provider, b.instance, &b.vm)));
     Ok(hosts)
+}
+
+/// The named VMs in one VM host directory: each subdirectory whose name is
+/// a valid VM name. Each named VM is its own minvmd, with its own socket.
+/// The default VM is the host directory itself, so a `default` subdirectory
+/// is no VM.
+fn named_vms(host_dir: &Path, instance: u32) -> std::io::Result<Vec<LocalHost>> {
+    let mut vms = Vec::new();
+    for entry in std::fs::read_dir(host_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Some(vm) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if vm == paths::DEFAULT_VM_NAME || paths::validate_vm_name(&vm).is_err() {
+            continue;
+        }
+        // The ssh host alias, `<vm>.local-minvmd<N>`: the name `min box
+        // list` prints for the same host, and one no other host can have.
+        let Some(name) = paths::ssh_host_alias(&entry.path()) else {
+            continue;
+        };
+        vms.push(LocalHost {
+            name,
+            provider: LocalProvider::LocalMinvmd,
+            instance,
+            vm: Some(vm),
+            dir: entry.path(),
+        });
+    }
+    Ok(vms)
 }
 
 /// Whether a host's daemon answers.
@@ -243,11 +302,15 @@ impl Rendered for HostDetail {
         writeln!(out, "Provider:        {}", self.provider)?;
         writeln!(out, "State:           {}", self.state.label())?;
         writeln!(out, "Socket:          {}", self.socket.display())?;
-        match &self.daemon_version {
-            Some(version) => writeln!(out, "Daemon version:  minimald {version}"),
-            None => writeln!(
+        match (&self.daemon_version, self.state) {
+            (Some(version), _) => writeln!(out, "Daemon version:  minimald {version}"),
+            (None, HostState::Stopped) => writeln!(
                 out,
                 "Daemon version:  unknown, because the daemon is not running"
+            ),
+            (None, _) => writeln!(
+                out,
+                "Daemon version:  unknown, because the daemon did not answer"
             ),
         }
     }

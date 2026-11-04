@@ -283,6 +283,10 @@ fn every_daemon_connection_is_classified() {
             "cmd/boxes/list.rs::list_other_host = ungated",
             "cmd/boxes/list.rs::list_selected_host = gated",
             "cmd/boxes/vm_host.rs::box_record_by = ungated",
+            // `min host list|show` probes each local host for its state and
+            // daemon version. It only reads, and it must show a skewed
+            // daemon's version, so it must work when the pair is skewed.
+            "cmd/hosts.rs::probe_host = ungated",
             "cmd/list.rs::cmd_bare = gated",
             // `min ls` reaches past the selected VM, and the two halves carry
             // the gate differently (see `ls_listings`): the selected VM is the
@@ -352,6 +356,9 @@ fn every_daemon_connection_is_classified() {
             "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy = ungated",
             "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy = ungated",
             "tests.rs::grant_box_registers_its_declared_egress_with_the_proxy_until_the_creation_fails = ungated",
+            // Not a product path: the host show test's own connection to
+            // the harness daemon, to read the version it expects.
+            "tests.rs::host_show_socket_and_version = ungated",
             "tests.rs::local_member_is_a_sign_in_reference_expiring_with_the_root = ungated",
             // Not a product path, and not the daemon: the audit test submits
             // a revocation to a test Box Egress Proxy's control socket.
@@ -6458,9 +6465,9 @@ fn stale_socket(sock: &std::path::Path) {
 }
 
 /// BCLI-046: the well-known local providers are `local`, `local-minvmd` and
-/// `local-box`, and each host is named after its daemon instance. A
-/// directory that is no daemon instance, and a named VM nested in a VM host,
-/// are no host.
+/// `local-box`, and each host is named after its daemon instance. A named
+/// VM nested in a VM host is a host of its own, named by its ssh host alias.
+/// A directory that is no daemon instance, or no valid VM name, is no host.
 #[test]
 fn local_provider_and_host_names() {
     use cmd::hosts::{LocalProvider, local_hosts};
@@ -6473,6 +6480,10 @@ fn local_provider_and_host_names() {
         "local-minimald0",
         "local-minvmd0",
         "local-minvmd0/alpha",
+        "local-minvmd0/Not_A_VM",
+        "local-minvmd0/guest",
+        "local-minvmd0/default",
+        "local-minimald0/beta",
         "remote-x",
         "local-minimald",
     ]);
@@ -6487,11 +6498,16 @@ fn local_provider_and_host_names() {
             ("local0", "local"),
             ("local1", "local"),
             ("local-minvmd0", "local-minvmd"),
+            ("alpha.local-minvmd0", "local-minvmd"),
         ]
     );
     assert_eq!(
         hosts[0].socket(),
         state.path().join("providers/local-minimald0/ssh.sock")
+    );
+    assert_eq!(
+        hosts[3].socket(),
+        state.path().join("providers/local-minvmd0/alpha/ssh.sock")
     );
 
     use clap::Parser as _;
@@ -6530,6 +6546,17 @@ fn local_minimald_alias_reads_as_local() {
         .map(|v| v.get_name().to_owned())
         .collect();
     assert_eq!(shown, ["local", "local-minvmd"]);
+
+    // A failed run in a machine output mode carries the hint in the error
+    // object's `hint` field, after any hint the failure has.
+    let hint = "local-minimald is now called local.";
+    let failure = MachineModeFailure::new("not_found", "no box 'x'".into(), String::new());
+    assert_eq!(failure.with_alias_hint(hint).hint(), hint);
+    let failure = MachineModeFailure::new("not_found", "no box 'x'".into(), "run `min ls`".into());
+    assert_eq!(
+        failure.with_alias_hint(hint).hint(),
+        "run `min ls`. local-minimald is now called local."
+    );
 }
 
 /// BCLI-047: `min host list` renders each local host with its name and
@@ -6621,6 +6648,24 @@ async fn host_show_socket_and_version() {
     );
     assert!(
         text.contains("Daemon version:  unknown, because the daemon is not running\n"),
+        "{text}"
+    );
+
+    // A daemon that does not answer can still run, so the text does not say
+    // that it is not running.
+    let unanswered = cmd::hosts::HostDetail {
+        name: "local-minvmd0".to_owned(),
+        provider: "local-minvmd",
+        state: cmd::hosts::HostState::Unreachable,
+        socket: stopped_sock.clone(),
+        daemon_version: None,
+    };
+    let mut out = Vec::new();
+    cmd::output::Rendered::text(&unanswered, &mut out).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("State:           not responding\n"), "{text}");
+    assert!(
+        text.contains("Daemon version:  unknown, because the daemon did not answer\n"),
         "{text}"
     );
 
