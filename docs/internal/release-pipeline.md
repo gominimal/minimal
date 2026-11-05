@@ -66,7 +66,7 @@ only whether the signing jobs can run:
   wait in the queue. This needs an organization owner:
 
 ```sh
-gh api orgs/gominimal/actions/runner-groups/3 --jq '{name, selected_workflows: (.selected_workflows + ["gominimal/minimal/.github/workflows/release.yml@refs/heads/release/X.Y.Z"])}' \
+gh api orgs/gominimal/actions/runner-groups/3 --jq '{name, visibility, allows_public_repositories, restricted_to_workflows, selected_workflows: (.selected_workflows + ["gominimal/minimal/.github/workflows/release.yml@refs/heads/release/X.Y.Z"])}' \
   | gh api -X PATCH orgs/gominimal/actions/runner-groups/3 --input -
 ```
 
