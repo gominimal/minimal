@@ -4916,9 +4916,15 @@ pub fn proxy_down_line(proxy_down: &ProxyDown) -> String {
 /// The cause of a proxy whose port another program holds (NET-021): who
 /// holds it, the port, and that the proxy starts serving by itself once the
 /// port is free. The VM host daemon retries the port while the VM runs, so
-/// the words carry no restart.
+/// the words carry no restart. The process that holds the port chooses its
+/// own name, so control characters in it are dropped: an escape sequence in
+/// a process name never reaches the terminal.
 fn held_port_detail(holder: Option<&str>, port: u16) -> String {
-    let holder = holder.unwrap_or("another program on this machine");
+    let holder: String = holder
+        .unwrap_or("another program on this machine")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
     format!(
         "{holder} holds 127.0.0.1:{port}. It starts serving by itself when the \
          port is free."
@@ -7669,6 +7675,22 @@ exit 0
                 );
             }
         }
+
+        // The holder's name comes from the process that holds the port, so
+        // its control characters never reach the terminal.
+        let hostile = ProxyDown {
+            port: 7_654,
+            cause: ProxyDownCause::PortHeldAfterStart {
+                holder: Some("pid 7 (\u{1b}[2Jevil\u{7}\r\n)".to_string()),
+            },
+        };
+        let line = proxy_down_line(&hostile);
+        assert_eq!(
+            line,
+            "the hostname proxy is not serving: pid 7 ([2Jevil) holds 127.0.0.1:7654. It \
+             starts serving by itself when the port is free."
+        );
+        assert!(!line.chars().any(char::is_control), "{line:?}");
     }
 
     #[cfg(any(test, target_os = "macos"))]
