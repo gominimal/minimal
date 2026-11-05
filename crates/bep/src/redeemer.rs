@@ -36,6 +36,7 @@ use crate::forward::{
 };
 use crate::handle::{self, Handle, Rules, StoreRule};
 use crate::keys::HeldKey;
+use crate::listener;
 use crate::module::Module;
 use crate::redeem::{
     self, Attribution, Authority, Decision, Redemption, RequestAuthority, Unsealed,
@@ -47,6 +48,11 @@ use crate::signin::{self, Keychain, NoTokenEndpoint, RenewError, Resolved, Token
 /// resolves to no live sign-in: the item is gone, names another sign-in, or
 /// its token expired and was not renewed.
 pub const SIGN_IN_REQUIRED: &str = "github_sign_in_required";
+
+/// The audit marker of a request on a `host_ip` cohort delivery whose
+/// sealed value names no live `host_ip` box of this host: an `own_ip` box,
+/// a box that ended, or a box of another host (BEP-084).
+pub const COHORT_MISATTRIBUTED: &str = "cohort_misattributed";
 
 /// The box ids that the revocations in force name.
 pub type Revocations = Arc<RwLock<Vec<String>>>;
@@ -109,6 +115,10 @@ struct Facts {
     /// The handle's `jti` for the audit record, or empty when the value did
     /// not open or the handle does not parse.
     jti: String,
+    /// True for a cohort delivery whose value names no live `host_ip` box
+    /// of this host. The request is refused [`COHORT_MISATTRIBUTED`]
+    /// (BEP-084).
+    misattributed: bool,
 }
 
 impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
@@ -206,8 +216,18 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
             .or_else(|| cohort.first().cloned())
     }
 
+    /// The box a request on a `host_ip` cohort delivery is for: the box
+    /// the value's `sub` names, when that is a live `host_ip` box of this
+    /// host (BEP-084). `None` for a value that names an `own_ip` box, a box
+    /// that ended, a box of another host, or no box. The `sub` is not yet
+    /// authenticated here. The open bound to the box authenticates it.
+    fn cohort_member(&self, sealed: &str) -> Option<String> {
+        Self::carried_box(sealed).filter(|id| self.boxes.cohort().contains(id))
+    }
+
     /// The `sub` member of the protected header of `sealed`, read with no
-    /// key and no check. Only [`Self::cohort_target`] reads it.
+    /// key and no check. Only [`Self::cohort_target`] and
+    /// [`Self::cohort_member`] read it.
     fn carried_box(sealed: &str) -> Option<String> {
         use base64::Engine as _;
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -260,9 +280,42 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
         sealed: &str,
         now: u64,
     ) -> Facts {
-        let attribution = self.boxes.attribution(box_id);
-        let egress = self.boxes.egress(box_id);
+        // BEP-084: a cohort delivery names no box. The request is
+        // attributed to the cohort, and its egress re-check and audit
+        // subject are the box the value names, which must be a live
+        // `host_ip` box of this host.
+        let cohort_delivery = listener::is_cohort_box_id(box_id);
+        let member = if cohort_delivery {
+            self.cohort_member(sealed)
+        } else {
+            None
+        };
+        let misattributed = cohort_delivery && member.is_none();
+        let attribution = if cohort_delivery {
+            Attribution::HostIpCohort
+        } else {
+            self.boxes.attribution(box_id)
+        };
+        let subject = member.as_deref().unwrap_or(box_id);
+        let egress = self.boxes.egress(subject);
+        tracing::debug!(
+            attribution = if matches!(attribution, Attribution::HostIpCohort) {
+                "cohort"
+            } else {
+                "box"
+            },
+            subject,
+            misattributed,
+            "attributed a sealed value"
+        );
         let (unsealed, opened, named_box_in_cohort) = match &attribution {
+            _ if misattributed => (Unsealed::OtherBox, None, false),
+            Attribution::HostIpCohort if cohort_delivery => {
+                let member = member.as_deref().unwrap_or_default();
+                let (unsealed, opened) = Self::unsealed(self.open(member, sealed, now));
+                let named = unsealed != Unsealed::OtherBox;
+                (unsealed, opened, named)
+            }
             Attribution::OwnIp(sender) => {
                 let (unsealed, opened) = Self::unsealed(self.open(sender, sealed, now));
                 (unsealed, opened, false)
@@ -382,12 +435,17 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
             identifier,
             kind,
             jti,
+            misattributed,
         }
     }
 
     /// The verdict on a sign-in member, from its `facts` at clock reading
     /// `now`.
     fn sign_in_verdict(&self, box_id: &str, facts: Facts, now: u64) -> Verdict {
+        if facts.misattributed {
+            tracing::debug!(box_id, "sealed value refused: it names no live host_ip box");
+            return Verdict::Refuse(COHORT_MISATTRIBUTED);
+        }
         let verdict = match redeem::decide(&facts.redemption) {
             Decision::Refuse(check) => Verdict::Refuse(check.marker()),
             decision @ Decision::Admit { .. } => {
@@ -551,8 +609,35 @@ where
     K: HeldKey + Send + Sync,
     C: Keychain + Send + Sync,
 {
+    /// The declared egress of `box_id`. For a cohort delivery, which names
+    /// no box, this is the union of the live `host_ip` boxes' egress: the
+    /// reach of the shared address. A request that carries a sealed value
+    /// is checked again against the egress of the box the value names
+    /// (BEP-084).
     fn egress(&self, box_id: &str) -> Vec<Authority<String>> {
-        self.boxes.egress(box_id)
+        if !listener::is_cohort_box_id(box_id) {
+            return self.boxes.egress(box_id);
+        }
+        let mut union: Vec<Authority<String>> = Vec::new();
+        for member in self.boxes.cohort() {
+            for authority in self.boxes.egress(&member) {
+                if !union.contains(&authority) {
+                    union.push(authority);
+                }
+            }
+        }
+        union
+    }
+
+    /// The box a cohort delivery's record names: the live `host_ip` box the
+    /// value names, or the cohort id when it names none (BEP-084).
+    fn audit_subject(&self, box_id: &str, sealed: &str) -> String {
+        if listener::is_cohort_box_id(box_id)
+            && let Some(member) = self.cohort_member(sealed)
+        {
+            return member;
+        }
+        box_id.to_owned()
     }
 
     fn redeem(
@@ -597,6 +682,12 @@ where
         let now = (self.clock)();
         let facts = self.facts(box_id, authority, request, sealed, now);
         let jti = facts.jti.clone();
+        if facts.misattributed {
+            return (
+                Redeemed::Verdict(self.sign_in_verdict(box_id, facts, now)),
+                jti,
+            );
+        }
         if facts.kind == Some(MemberKind::Store) {
             return (Self::store_decision(box_id, facts), jti);
         }
@@ -742,11 +833,23 @@ mod tests {
 
     /// A value sealed for `box_id` on this node, with a sign-in member.
     fn sealed_for<K, C>(world: &World<K, C>, box_id: &str, expiry: u64, version: u32) -> String {
+        sealed_on(world, NODE, box_id, expiry, version)
+    }
+
+    /// A value sealed for `box_id` on Box Host `node`, with a sign-in
+    /// member.
+    fn sealed_on<K, C>(
+        world: &World<K, C>,
+        node: &str,
+        box_id: &str,
+        expiry: u64,
+        version: u32,
+    ) -> String {
         let jws = handle::sign(
             &world.client,
             &Claims {
                 sub: box_id.into(),
-                node_id: NODE.into(),
+                node_id: node.into(),
                 store: GITHUB.id.into(),
                 id: INSTANCE.into(),
                 upstream: GITHUB.hosts.iter().map(|a| a.host.to_owned()).collect(),
@@ -760,7 +863,7 @@ mod tests {
             &world.sealing,
             &Context {
                 box_id: box_id.into(),
-                host: NODE.into(),
+                host: node.into(),
                 module: GITHUB.id.into(),
                 host_set_version: version,
                 mode: Mode::User,
@@ -1076,6 +1179,106 @@ mod tests {
         assert_eq!(refused(&end), None, "{end:?}");
         assert_eq!(records[0].outcome, Outcome::Admit);
         assert_eq!(records[0].marker, None);
+    }
+
+    // BEP-084: a request on a cohort delivery, which names no box, is
+    // checked against the egress of the live `host_ip` box its value
+    // names, and its audit record names that box as its subject.
+    #[test]
+    fn cohort_redemption_uses_named_box_egress_and_subject() {
+        assert_eq!(
+            listener::box_id_text(&listener::COHORT_BOX_ID),
+            listener::COHORT_BOX_ID_TEXT,
+            "the cohort id has one text form"
+        );
+        let cohort = listener::COHORT_BOX_ID_TEXT;
+        let world = new_world();
+        let github_com = Authority {
+            host: "github.com".to_owned(),
+            port: 443,
+        };
+        world.boxes.register("c1", vec![api()], Stance::HostIp);
+        world
+            .boxes
+            .register("c2", vec![github_com.clone()], Stance::HostIp);
+
+        // c1's egress admits the API: admitted for c1, in c1's records.
+        let sealed = sealed_for(&world, "c1", NOW + 600, GITHUB.host_set_version);
+        let (upstream, end, records) = send(&world, cohort, &api(), "api.github.com", &sealed);
+        assert_eq!(refused(&end), None, "{end:?}");
+        assert!(upstream.contains(&format!("Bearer {TOKEN}")));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, Outcome::Admit);
+        assert_eq!(records[0].box_id, "c1", "the subject is the named box");
+        assert_eq!(records[0].marker.as_deref(), Some("cohort_attributed"));
+
+        // c2's egress does not admit the API, though c1's does: refused by
+        // c2's egress, in c2's records.
+        let sealed = sealed_for(&world, "c2", NOW + 600, GITHUB.host_set_version);
+        let (upstream, end, records) = send(&world, cohort, &api(), "api.github.com", &sealed);
+        assert_eq!(
+            refused(&end),
+            Some(Check::OutsideDeclaredEgress.marker()),
+            "{end:?}"
+        );
+        assert!(upstream.is_empty());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, Outcome::Refuse);
+        assert_eq!(records[0].box_id, "c2", "the subject is the named box");
+
+        // c2's own egress admits github.com: admitted for c2.
+        let (upstream, end, records) = send(&world, cohort, &github_com, "github.com", &sealed);
+        assert_eq!(refused(&end), None, "{end:?}");
+        assert!(upstream.contains(&format!("Bearer {TOKEN}")));
+        assert_eq!(records[0].box_id, "c2");
+        assert_eq!(records[0].marker.as_deref(), Some("cohort_attributed"));
+    }
+
+    // BEP-084: a cohort delivery's value that names an `own_ip` box, a box
+    // that ended, or a box of another host is refused
+    // `cohort_misattributed`, and nothing reaches the upstream.
+    #[test]
+    fn cohort_value_naming_no_live_host_ip_box_is_refused() {
+        let cohort = listener::COHORT_BOX_ID_TEXT;
+        let world = new_world();
+        world.boxes.register("c1", github(), Stance::HostIp);
+        world.boxes.register("b1", github(), Stance::OwnIp);
+        world.boxes.register("ended", github(), Stance::HostIp);
+        let own_ip = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
+        let ended = sealed_for(&world, "ended", NOW + 600, GITHUB.host_set_version);
+        assert!(world.boxes.forget("ended"));
+        let elsewhere = sealed_on(
+            &world,
+            "node-2",
+            "elsewhere",
+            NOW + 600,
+            GITHUB.host_set_version,
+        );
+        for (case, sealed) in [
+            ("own_ip box", own_ip),
+            ("ended box", ended),
+            ("another host's box", elsewhere),
+        ] {
+            let (upstream, end, records) = send(&world, cohort, &api(), "api.github.com", &sealed);
+            assert_eq!(refused(&end), Some(COHORT_MISATTRIBUTED), "{case}: {end:?}");
+            assert!(upstream.is_empty(), "{case}: nothing reaches the upstream");
+            assert_eq!(records.len(), 1, "{case}");
+            assert_eq!(records[0].outcome, Outcome::Refuse, "{case}");
+            assert_eq!(
+                records[0].marker.as_deref(),
+                Some(COHORT_MISATTRIBUTED),
+                "{case}"
+            );
+            assert_eq!(
+                records[0].box_id, cohort,
+                "{case}: the subject is the cohort"
+            );
+        }
+
+        // The same value from the `own_ip` box itself is admitted.
+        let sealed = sealed_for(&world, "b1", NOW + 600, GITHUB.host_set_version);
+        let (_, end, _) = send(&world, "b1", &api(), "api.github.com", &sealed);
+        assert_eq!(refused(&end), None, "{end:?}");
     }
 
     /// One scenario for the property test.
