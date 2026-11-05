@@ -30841,14 +30841,19 @@ while True:
 
 # ---------------------------------------------------------------------------
 # `min host stop` stops the boxes first (BCLI-049), on a VM-backed lane: the
-# daemon is the guest's pid-1, so the VM must go down with it. Two running
-# boxes on the VM host, then `min host stop <host>`:
+# daemon is the guest's pid-1, so the VM must go down with it. Two boxes of
+# its own on the VM host, then `min host stop <host>`:
 #
-#   * it exits 0, prints `Stopped <box>.` for each box, then
-#     "Stopped 2 boxes, the daemon and its VM on <host>."
+#   * it exits 0, prints `Stopped <box>.` for each running box, then
+#     "Stopped <n> boxes, the daemon and its VM on <host>.", where <n> is
+#     the count of those lines. In a whole-lane run the earlier proofs can
+#     leave more boxes running, so <n> is at least 2, not exactly 2.
 #   * `minvmd status` reads the VM as stopped (exit 1).
-#   * the next `min box show` boots the VM again, and each box is listed
-#     as stopped: the stop kept the records.
+#   * the next `min box show` boots the VM again, and each of its two boxes
+#     is listed as stopped: the stop kept the records.
+#
+# The proof starts its own boxes, not the shared session: in a whole-lane
+# run an earlier daemon respawn can leave the shared session stopped.
 #
 # Diagnostics: each step prints the command it ran and its exit status. The
 # command's stdout and stderr stay in $WORK/host-stop, and a failure prints
@@ -30860,15 +30865,18 @@ proof_host_stop_stops_boxes_then_daemon_and_vm() {
     return 0
   fi
   echo "::group::min host stop stops the boxes, then the daemon and its VM (BCLI-049)"
-  local hs_dir="$WORK/host-stop" hs_b="e2e-host-stop-b" hs_host hs_out hs_rc hs_b_id hs_box hs_state
+  local hs_dir="$WORK/host-stop" hs_a="e2e-host-stop-a" hs_b="e2e-host-stop-b"
+  local hs_host hs_out hs_rc hs_id hs_box hs_state hs_lines hs_n
   mkdir -p "$hs_dir"
-  proof_shared_session
-  hs_b_id="$(cd "$PROJECT_DIR" && mnl session activate . --name "$hs_b" 2>"$hs_dir/activate-b.err" | tail -n1 | tr -d '\r')"
-  if [ -z "$hs_b_id" ]; then
-    echo "::error::the second box for the host stop did not start"
-    cat "$hs_dir/activate-b.err" 2>/dev/null || true
-    fail
-  fi
+  for hs_box in "$hs_a" "$hs_b"; do
+    hs_id="$(cd "$PROJECT_DIR" && mnl session activate . --name "$hs_box" 2>"$hs_dir/activate-$hs_box.err" | tail -n1 | tr -d '\r')"
+    if [ -z "$hs_id" ]; then
+      echo "::error::box $hs_box for the host stop did not start"
+      cat "$hs_dir/activate-$hs_box.err" 2>/dev/null || true
+      fail
+    fi
+    echo "run: min session activate . --name $hs_box -> $hs_id"
+  done
 
   # The VM host the boxes run on: the first running local-minvmd row.
   mnl host list >"$hs_dir/host-list.out" 2>"$hs_dir/host-list.err" || true
@@ -30883,11 +30891,16 @@ proof_host_stop_stops_boxes_then_daemon_and_vm() {
   mnl host stop "$hs_host" >"$hs_dir/stop.out" 2>"$hs_dir/stop.err" </dev/null || hs_rc=$?
   hs_out="$(tr -d '\r' <"$hs_dir/stop.out")"
   echo "run: min host stop $hs_host -> exit $hs_rc"
+  # Every line before the summary is one `Stopped <box>.` line.
+  hs_lines="$(printf '%s\n' "$hs_out" | sed '$d' | grep -c '^Stopped .*\.$' || true)"
+  hs_n="$(printf '%s\n' "$hs_out" | tail -n1 \
+    | sed -n "s/^Stopped \([0-9][0-9]*\) boxes, the daemon and its VM on $hs_host\.\$/\1/p")"
   if [ "$hs_rc" -ne 0 ] \
-     || ! printf '%s\n' "$hs_out" | grep -qxF "Stopped $SESSION_NAME." \
+     || ! printf '%s\n' "$hs_out" | grep -qxF "Stopped $hs_a." \
      || ! printf '%s\n' "$hs_out" | grep -qxF "Stopped $hs_b." \
-     || [ "$(printf '%s\n' "$hs_out" | tail -n1)" != "Stopped 2 boxes, the daemon and its VM on $hs_host." ]; then
+     || [ -z "$hs_n" ] || [ "$hs_n" -lt 2 ] || [ "$hs_n" != "$hs_lines" ]; then
     echo "::error::'min host stop $hs_host' did not stop both boxes, then the daemon and its VM"
+    echo "summary count '${hs_n:-<none>}', box lines $hs_lines"
     echo "--- stdout ---"; printf '%s\n' "$hs_out"
     echo "--- stderr ---"; cat "$hs_dir/stop.err" 2>/dev/null || true
     fail
@@ -30905,7 +30918,7 @@ proof_host_stop_stops_boxes_then_daemon_and_vm() {
 
   # The stop kept each record: the next command boots the VM again, and
   # each box is listed as stopped.
-  for hs_box in "$SESSION_NAME" "$hs_b"; do
+  for hs_box in "$hs_a" "$hs_b"; do
     hs_state="$(mnl box show "$hs_box" </dev/null 2>"$hs_dir/show-$hs_box.err" \
       | sed -n 's/^State: *//p' | tr -d '\r')"
     if [ "$hs_state" != stopped ]; then
@@ -30916,10 +30929,15 @@ proof_host_stop_stops_boxes_then_daemon_and_vm() {
     echo "check: $hs_box: State: stopped"
   done
 
+  mnl box rm --force "$hs_a" >/dev/null 2>&1 || true
   mnl box rm --force "$hs_b" >/dev/null 2>&1 || true
-  mnl box rm --force "$SESSION_NAME" >/dev/null 2>&1 || true
-  sid=""
-  echo "$hs_case OK (both boxes stopped, then the daemon and its VM; the records kept as stopped)"
+  # The stop also stopped the shared session. Remove it, so the next proof
+  # that needs it activates a fresh one.
+  if [ -n "${sid:-}" ]; then
+    mnl box rm --force "$SESSION_NAME" >/dev/null 2>&1 || true
+    sid=""
+  fi
+  echo "$hs_case OK ($hs_n boxes stopped, then the daemon and its VM; the records kept as stopped)"
   echo "::endgroup::"
 }
 
