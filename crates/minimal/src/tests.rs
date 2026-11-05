@@ -7029,6 +7029,183 @@ fn provider_list_all_shows_local_providers() {
     );
 }
 
+/// Runs one `min host` or `min provider` step of the end-to-end test below,
+/// and records the command with its output in `runs`. The caller's span
+/// covers the step, and the step logs one `ran` event in it.
+async fn run_host_command<F>(runs: &mut Vec<BoxCommandRun>, command: &str, step: F) -> u8
+where
+    F: AsyncFnOnce(&mut Vec<u8>) -> Result<(), anyhow::Error>,
+{
+    let mut stdout = Vec::new();
+    let result = step(&mut stdout).await;
+    let (stderr, exit) = box_command_ending(&result);
+    tracing::info!(command, exit, "host command ran");
+    runs.push(BoxCommandRun {
+        command: command.to_owned(),
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr,
+        exit,
+    });
+    exit
+}
+
+// The local hosts and providers slice end to end (BCLI-046, BCLI-047,
+// BCLI-048, BCLI-049, BCLI-052): `min provider list --all`, `min host
+// list`, `min host show` and `min host stop` over harness daemons that a
+// native host's socket and a VM host's socket serve. The VM host has no
+// VM process, so its VM state reads as not running once the daemon stops.
+// A failed step prints every command run so far, with its stdout, stderr
+// and exit code. One `hosts_and_providers` span covers the host listing
+// and the host stop.
+#[tokio::test]
+async fn hosts_and_providers_end_to_end() {
+    use tracing::Instrument as _;
+
+    let log = minimald::test_harness::captured_log();
+    let state = state_with_host_dirs(&["local-minimald0", "local-minvmd0"]);
+    let global = host_globals(state.path());
+    let native_sock = state.path().join("providers/local-minimald0/ssh.sock");
+    let vm_dir = state.path().join("providers/local-minvmd0");
+    let vm_sock = vm_dir.join("ssh.sock");
+    let native = minimald::test_harness::TestServer::new().await;
+    native.listen_on_uds(&native_sock).await;
+    let vm_host = minimald::test_harness::TestServer::new().await;
+    vm_host.listen_on_uds(&vm_sock).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let mut daemon = vm_host.connect().await;
+    for name in ["web", "api"] {
+        minimald::test_harness::create_configured_session(
+            &mut daemon,
+            name,
+            project.path().to_str().expect("a UTF-8 project path"),
+        )
+        .await;
+    }
+    drop(daemon);
+    let version = {
+        let mut client = client::Client::connect(&vm_sock).await.expect("connect");
+        client
+            .oneshot_rpc::<minimald_rpc::GetVersion>(())
+            .await
+            .expect("GetVersion")
+            .long_version
+    };
+    // The state dir path keeps this run's span apart from other tests'
+    // spans in a shared log.
+    let run = state.path().display().to_string();
+    let span = tracing::info_span!("hosts_and_providers", run = %run);
+    let mut runs = Vec::new();
+
+    async {
+        // `min provider list --all`: each local provider with its hosts.
+        let providers = async |out: &mut Vec<u8>| {
+            cmd::hosts::provider_list(&global, true, false, out)?;
+            Ok(())
+        };
+        let exit = run_host_command(&mut runs, "min provider list --all", providers).await;
+        let transcript = box_transcript(&runs);
+        assert_eq!(exit, 0, "{transcript}");
+        assert_eq!(
+            runs[0].stdout,
+            "PROVIDER       HOSTS\n\
+             local          local0\n\
+             local-minvmd   local-minvmd0\n",
+            "{transcript}"
+        );
+
+        // `min host list`: both hosts run.
+        let list = async |out: &mut Vec<u8>| cmd::hosts::cmd_host_list(&global, out).await;
+        let exit = run_host_command(&mut runs, "min host list", list).await;
+        let transcript = box_transcript(&runs);
+        assert_eq!(exit, 0, "{transcript}");
+        assert_eq!(
+            runs[1].stdout,
+            "HOST             PROVIDER       STATE\n\
+             local0           local          running\n\
+             local-minvmd0    local-minvmd   running\n",
+            "{transcript}"
+        );
+
+        // `min host show local-minvmd0`: its socket and its daemon version.
+        let show = async |out: &mut Vec<u8>| {
+            let args = HostShowArgs {
+                host: "local-minvmd0".to_owned(),
+            };
+            cmd::hosts::cmd_host_show(&global, &args, out).await
+        };
+        let exit = run_host_command(&mut runs, "min host show local-minvmd0", show).await;
+        let transcript = box_transcript(&runs);
+        assert_eq!(exit, 0, "{transcript}");
+        assert_eq!(
+            runs[2].stdout,
+            format!(
+                "Host:            local-minvmd0\n\
+                 Provider:        local-minvmd\n\
+                 State:           running\n\
+                 Socket:          {}\n\
+                 Daemon version:  {version}\n",
+                vm_sock.display()
+            ),
+            "{transcript}"
+        );
+
+        // `min host stop local-minvmd0`: each box, then the daemon and the
+        // VM.
+        let stop = async |out: &mut Vec<u8>| {
+            let args = HostStopArgs {
+                host: "local-minvmd0".to_owned(),
+                force: false,
+            };
+            cmd::hosts::cmd_host_stop(&global, &args, out).await
+        };
+        let exit = run_host_command(&mut runs, "min host stop local-minvmd0", stop).await;
+        let transcript = box_transcript(&runs);
+        assert_eq!(exit, 0, "{transcript}");
+        let mut lines: Vec<&str> = runs[3].stdout.lines().collect();
+        assert_eq!(
+            lines.pop(),
+            Some("Stopped 2 boxes, the daemon and its VM on local-minvmd0."),
+            "{transcript}"
+        );
+        lines.sort_unstable();
+        assert_eq!(lines, ["Stopped api.", "Stopped web."], "{transcript}");
+    }
+    .instrument(span)
+    .await;
+    let transcript = box_transcript(&runs);
+
+    // The VM host's daemon shuts down, its VM state reads as not running,
+    // and the native host's daemon keeps running.
+    assert!(
+        vm_host.state.sessions_manager().await.is_shutting_down(),
+        "the VM host's daemon is shutting down\n{transcript}"
+    );
+    let vm_state = minvmd::state::StateDir::new(vm_dir)
+        .and_then(|dir| dir.effective_state())
+        .expect("the VM state reads");
+    assert!(
+        !vm_state.lifecycle.is_active(),
+        "the VM is down: {:?}\n{transcript}",
+        vm_state.lifecycle
+    );
+    assert!(
+        !native.state.sessions_manager().await.is_shutting_down(),
+        "the native host's daemon keeps running\n{transcript}"
+    );
+
+    // One `hosts_and_providers` span holds each step's `ran` event.
+    let log = log.contents();
+    let span = format!("hosts_and_providers{{run={run}}}");
+    for run in &runs {
+        let event = format!("command=\"{}\"", run.command);
+        let held = log
+            .lines()
+            .filter(|line| line.contains(&span) && line.contains(&event))
+            .count();
+        assert_eq!(held, 1, "{event} in {span}\n{transcript}\n{log}");
+    }
+}
+
 /// One local host for the box address tests.
 fn address_host(provider: &'static str, host: &str, selected: bool) -> LocalHost {
     LocalHost {
