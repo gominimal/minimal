@@ -606,7 +606,9 @@ pub(crate) async fn shut_down_host_daemon(
         Ok(ShutdownResponse::SessionsLive) => Err(busy()),
         // On a VM the daemon is the guest's pid-1, so a shutdown that worked
         // can take the reply down with it. A VM that is down is the goal.
-        Err(rpc_err) if stopped().await => {
+        // Only a lost reply earns the wait. An error the daemon reported is
+        // an answer, and its VM stays up.
+        Err(rpc_err) if rpc_unanswered(&rpc_err) && stopped().await => {
             tracing::debug!(
                 host,
                 "the Shutdown reply was lost, but the VM stopped: {rpc_err:#}"
