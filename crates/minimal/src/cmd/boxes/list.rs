@@ -329,6 +329,7 @@ mod tests {
             reason: None,
             exit_code: None,
             signal: None,
+            pty_enabled: true,
         }
     }
 

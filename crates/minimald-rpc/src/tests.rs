@@ -2084,6 +2084,7 @@ fn reap_and_prune_requests_round_trip() {
         reason: Some("stopped".to_string()),
         exit_code: None,
         signal: Some(15),
+        pty_enabled: false,
     };
     let reap = ReapBoxResponse {
         reaped: entry.clone(),

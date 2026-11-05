@@ -286,6 +286,10 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     if let Some(refused) = e.downcast_ref::<minimal::BoxAddressRefusal>() {
         return refused.exit_code();
     }
+    // BCLI-068: `min box attach` refused, or its connection failed.
+    if let Some(refused) = e.downcast_ref::<minimal::BoxAttachRefusal>() {
+        return refused.exit_code();
+    }
     // BCLI-053: `min box exec -t` without a terminal, or into a box that is
     // not running (2), or whose spec turns exec off (5).
     if let Some(refused) = e.downcast_ref::<minimal::BoxExecRefusal>() {

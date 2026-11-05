@@ -1334,14 +1334,7 @@ impl BoxActor {
         // filed with no spec (a client that predates it, the dashboard
         // create) has only its Box Type to go by, and a session has a
         // terminal.
-        let pty = match &stored {
-            Some(bytes) => box_runtime::stored_spec_sets_pty(bytes),
-            None => record
-                .box_type
-                .as_deref()
-                .is_none_or(|box_type| box_type == boxes::SESSION_BOX_TYPE),
-        };
-        if !pty {
+        if !crate::box_manager::record_has_pty(&record, stored.as_deref()) {
             tracing::info!(
                 refusal = "terminal",
                 "resume: the box spec sets no terminal"

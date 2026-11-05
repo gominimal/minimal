@@ -460,6 +460,10 @@ pub enum BoxCommand {
     /// files. A running box is refused unless `--force` is given, which
     /// stops the box at once and then removes it
     Rm(BoxRmArgs),
+    /// Attach this terminal to a box's terminal. With no box named, attach
+    /// to this project's running box that has a terminal, else to its only
+    /// stopped or exited one, which starts again
+    Attach(BoxAttachArgs),
     /// Run a command in a running box and exit with the command's exit
     /// code. `-t` gives the command a terminal, and `--detach` starts it
     /// and returns its exec id
@@ -620,6 +624,15 @@ pub struct BoxStopArgs {
     /// Kill every process in the box at once, with no grace period
     #[arg(long)]
     pub force: bool,
+}
+
+// BCLI-068: `min box attach [<box>]`.
+#[derive(Debug, Args)]
+pub struct BoxAttachArgs {
+    /// The box: its id, the start of its id, its name, or
+    /// provider/host/name, as `min box list` prints them. Omit it to attach
+    /// to this project's box
+    pub target: Option<String>,
 }
 
 // BOX-019 (BCLI-060, BCLI-004): `min box rm <box> [--force]`.
