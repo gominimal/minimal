@@ -1107,10 +1107,11 @@ where
                 // Taken before the read, so a box a client admits while the
                 // list is in flight is not dropped on a list that predates it.
                 let mark = boxes.host_ip_admit_mark();
-                let since = previous.replace(mark);
+                let since = previous;
                 match read_guest() {
                     Ok(guest) => {
                         failing = false;
+                        previous = Some(mark);
                         let outcome = boxes.reconcile_host_ip_boxes(&guest, mark, trigger);
                         follow_up = !outcome.dropped.is_empty()
                             && since.is_none_or(|since| {
@@ -9568,6 +9569,73 @@ mod tests {
             calls.recv_timeout(HOST_IP_RECONCILE_MIN_GAP * 3).is_err(),
             "an old admit's drop runs no extra pass"
         );
+        drop(answers);
+    }
+
+    /// NET-085: a failed read does not advance the mark of the last pass
+    /// that read the list. A box a client admitted before the failed read
+    /// and dropped by the next good pass still gets its one more pass.
+    #[test]
+    fn host_ip_reconcile_thread_runs_again_after_a_failed_read() {
+        const NOT_SOON: Duration = Duration::from_secs(3600);
+        let read_timeout = Duration::from_secs(10);
+        let registry = BoxRegistry::new(SUBNET);
+        let (resumed, live) = (reconcile_session(1), reconcile_session(2));
+        assert!(registry.admit_host_ip_box(live, None));
+        let (calls_tx, calls) = std::sync::mpsc::channel();
+        let (answers, answers_rx) = std::sync::mpsc::channel();
+        let nudge = spawn_host_ip_reconcile_with(
+            registry.clone(),
+            NOT_SOON,
+            scripted_guest_reader(calls_tx, answers_rx),
+        )
+        .expect("the reconcile thread starts");
+        nudge.nudge();
+        calls
+            .recv_timeout(read_timeout)
+            .expect("a nudge reads the session list");
+        answers
+            .send(Ok(std::collections::BTreeMap::from([(
+                live,
+                boxes::BoxState::Active,
+            )])))
+            .expect("the reader waits");
+
+        // A resume admits the box, and the next read fails.
+        assert!(registry.admit_host_ip_box(resumed, None));
+        nudge.nudge();
+        calls
+            .recv_timeout(read_timeout)
+            .expect("a second nudge reads again");
+        answers
+            .send(Err(anyhow::anyhow!("the in-VM daemon did not answer")))
+            .expect("the reader waits");
+
+        // The next good read drops the box before the guest runs it again.
+        nudge.nudge();
+        calls
+            .recv_timeout(read_timeout)
+            .expect("a third nudge reads again");
+        answers
+            .send(Ok(std::collections::BTreeMap::from([
+                (resumed, boxes::BoxState::Stopped),
+                (live, boxes::BoxState::Active),
+            ])))
+            .expect("the reader waits");
+        wait_for_resident(&registry, &[live]);
+
+        // No nudge: the admit predates the last good read, so one more
+        // pass runs after the least gap.
+        calls
+            .recv_timeout(read_timeout)
+            .expect("a drop of an admit from before a failed read runs one more pass");
+        answers
+            .send(Ok(std::collections::BTreeMap::from([
+                (resumed, boxes::BoxState::Active),
+                (live, boxes::BoxState::Active),
+            ])))
+            .expect("the reader waits");
+        wait_for_resident(&registry, &[resumed, live]);
         drop(answers);
     }
 }
