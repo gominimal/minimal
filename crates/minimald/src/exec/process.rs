@@ -523,9 +523,12 @@ pub struct HakoniwaProcess {
     /// A line the daemon shows ahead of the child's own stderr, such as the
     /// `inherit_cwd` fallback notice (see [`task_start_dir`]).
     pub(super) stderr_notice: Option<String>,
-    /// hakoniwa's account of a sandbox that failed before the command
-    /// started, for the client's stderr ([`Process::exit_notice`]).
+    /// hakoniwa's account of a sandbox that failed, for the client's
+    /// stderr ([`Process::exit_notice`]).
     pub(super) failure: Option<String>,
+    /// Set by [`Process::start_kill`]: the daemon ended this task, so its
+    /// status is not read as a sandbox failure.
+    pub(super) killed: bool,
 }
 
 /// The release of a task's network, owed once its process is gone.
@@ -602,6 +605,7 @@ impl HakoniwaProcess {
             net: NetRelease::new(net_guard),
             stderr_notice: None,
             failure: None,
+            killed: false,
         }
     }
 }
@@ -644,13 +648,9 @@ impl Process for HakoniwaProcess {
                 // `exit_code` field is `None` for signals and would collapse
                 // to 1 downstream; `code` is what the session path reports too.
                 Ok(Ok(status)) => {
-                    self.failure = sandbox_failure(&status);
+                    self.failure = sandbox_failure(&status, self.killed);
                     if let Some(reason) = &self.failure {
-                        tracing::warn!(
-                            pid = self.pid,
-                            %reason,
-                            "task: the sandbox failed before the command started"
-                        );
+                        tracing::warn!(pid = self.pid, %reason, "task: the sandbox failed");
                     }
                     WaitState::Exited(Some(status.code))
                 }
@@ -679,6 +679,7 @@ impl Process for HakoniwaProcess {
         // invariants beyond the pid being a valid `pid_t`, which we
         // captured from `Child::id()` at construction time.
         unsafe { libc::kill(self.pid, libc::SIGKILL) };
+        self.killed = true;
         Ok(())
     }
 
@@ -693,19 +694,30 @@ impl Process for HakoniwaProcess {
 /// command that ran (`ExitStatus::FAILURE`).
 pub(super) const SANDBOX_FAILURE_CODE: i32 = 125;
 
-/// The reason a task's sandbox failed before its command started, or `None`
-/// for a command that ran. hakoniwa reports that failure as code 125 with no
-/// inner exit code. A command that itself exits 125 carries its own exit code,
-/// and a signalled one reports `128 + signo`, so neither is taken for it.
-pub(super) fn sandbox_failure(status: &hakoniwa::ExitStatus) -> Option<String> {
-    (status.code == SANDBOX_FAILURE_CODE && status.exit_code.is_none())
+/// hakoniwa's reason for a container that a SIGKILL ended. It reports that
+/// as [`SANDBOX_FAILURE_CODE`] with no inner exit code, the same shape as a
+/// sandbox failure, whether or not the command had started.
+pub(super) const CONTAINER_SIGKILL_REASON: &str = "container received signal SIGKILL";
+
+/// The reason a task's sandbox failed, or `None` for any other end of the
+/// task. hakoniwa reports a sandbox failure as code 125 with no inner
+/// exit code. A command that itself exits 125 carries its own exit code, and
+/// a signalled one reports `128 + signo`, so neither is taken for it. A
+/// container that was killed, by the daemon (`killed`) or by anything else,
+/// is not a sandbox failure either.
+pub(super) fn sandbox_failure(status: &hakoniwa::ExitStatus, killed: bool) -> Option<String> {
+    (!killed
+        && status.code == SANDBOX_FAILURE_CODE
+        && status.exit_code.is_none()
+        && status.reason != CONTAINER_SIGKILL_REASON)
         .then(|| status.reason.clone())
 }
 
-/// The line the client gets for a task whose sandbox failed before its
-/// command started (inbox#1129), where it used to get exit 125 and nothing.
+/// The line on the client's stderr for a task whose sandbox failed: the
+/// command's own output may be empty, so this is the only account of why the
+/// task ended with 125.
 pub(super) fn sandbox_failure_notice(reason: &str) -> String {
-    format!("minimald: the task's sandbox failed before its command started: {reason}\n")
+    format!("the task's sandbox failed: {reason}\n")
 }
 
 /// The [`Process`] produced by a [`TaskExec`]: either a real sandboxed child
