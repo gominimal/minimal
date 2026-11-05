@@ -13,6 +13,8 @@ mod address;
 mod attach;
 #[path = "boxes/create.rs"]
 mod create;
+#[path = "boxes/events.rs"]
+mod events;
 #[path = "boxes/exec.rs"]
 mod exec;
 #[path = "boxes/hooks.rs"]
@@ -33,6 +35,8 @@ pub use address::{AddressCandidate, BoxAddressRefusal};
 pub use attach::BoxAttachRefusal;
 pub(crate) use attach::*;
 pub use create::*;
+pub use events::BoxFileRefusal;
+pub(crate) use events::*;
 pub(crate) use exec::*;
 pub(crate) use hooks::*;
 pub(crate) use lifecycle::*;
