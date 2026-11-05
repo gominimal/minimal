@@ -97,7 +97,12 @@ fn task_box_spec(
     args: &[String],
 ) -> Option<mfile::spec::BoxSpec> {
     let mut spec = mfile::spec::BoxSpec::for_task(task, declared, flags)?;
-    if let mfile::spec::Entrypoint::Exec(argv) = &mut spec.entrypoint {
+    // `--` ends the in-box run's own options, so an argument such as
+    // `--path` reaches the task and not the in-box parser.
+    if let mfile::spec::Entrypoint::Exec(argv) = &mut spec.entrypoint
+        && !args.is_empty()
+    {
+        argv.push("--".to_string());
         argv.extend(args.iter().cloned());
     }
     Some(spec)
@@ -950,7 +955,12 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     if entrypoint_runs {
         eprintln!("Running task {} in box {session_name}...", args.task);
         // One span for the run, from the request to the exit code.
-        let span = tracing::info_span!("task_run", box_id = %id, task = %args.task);
+        let span = tracing::info_span!(
+            "task_run",
+            box_id = %id,
+            box_name = %session_name,
+            task = %args.task,
+        );
         let outcome = async {
             match open_task_box_run(&mut client, id, &args.task, &task_cwd, &task_env).await {
                 Ok(channel) => {
@@ -1123,17 +1133,33 @@ mod tests {
             "check",
             &mfile::Task::default(),
             mfile::spec::SpecFlags::default(),
-            &["--fast".to_string()],
+            &["--path".to_string(), "prod".to_string()],
         )
         .expect("a task that is not interactive has a spec");
+        let argv = ["min", "task", "run", "check", "--", "--path", "prod"];
         assert_eq!(
             spec.entrypoint,
-            mfile::spec::Entrypoint::Exec(
-                ["min", "task", "run", "check", "--fast"]
-                    .map(String::from)
-                    .to_vec()
-            )
+            mfile::spec::Entrypoint::Exec(argv.map(String::from).to_vec())
         );
+        // The in-box run reads `--path` as the task's, not as its own flag.
+        let cli = <crate::cli::Cli as clap::Parser>::try_parse_from(argv).expect("the argv parses");
+        let Some(crate::cli::Command::Task(crate::cli::TaskArgs {
+            command: crate::cli::TaskCommand::Run(run),
+        })) = cli.command
+        else {
+            panic!("the argv is a task run");
+        };
+        assert_eq!(run.path, None);
+        assert_eq!(run.args, ["--path", "prod"]);
+        // A run with no arguments adds no separator.
+        let spec = task_box_spec(
+            "check",
+            &mfile::Task::default(),
+            mfile::spec::SpecFlags::default(),
+            &[],
+        )
+        .expect("a task that is not interactive has a spec");
+        assert_eq!(spec.entrypoint, mfile::spec::Entrypoint::for_task("check"));
         // The run sends no arguments and owns no box.
         assert_eq!(
             entrypoint_run_request("check", ""),

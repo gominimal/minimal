@@ -951,8 +951,8 @@ pub enum TaskCommand {
     /// When the task ends, the box stays with its exit code: see it with
     /// `min box show <task>-<n>` and remove it with `min box rm <task>-<n>`.
     /// Ctrl-C destroys the box and exits 130 without relaying the interrupt
-    /// to the task itself. Tasks run non-interactively: pipe stdin to feed
-    /// input; use `min session attach` for interactive work.
+    /// to the task itself. The task does not read stdin. Use
+    /// `min session attach` for interactive work.
     Run(TaskRunArgs),
 }
 
