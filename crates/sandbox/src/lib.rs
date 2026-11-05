@@ -488,6 +488,10 @@ pub struct Container {
     /// its program, as the box spells it (`/run/<START_GATE_NAME>-<n>`). Set by
     /// [`Sandbox::hold_start`]; `None` runs the program at once.
     start_gate: Option<PathBuf>,
+    /// Whether a command from this container calls `setsid(2)` in its
+    /// pre-exec closure, without taking a controlling terminal. Set by
+    /// [`Container::set_session_leader_without_terminal`].
+    new_session: bool,
 }
 
 /// The prefix of a start gate's FIFO name in the box's `/run`; each gate adds
@@ -535,6 +539,15 @@ impl Container {
         self.container.runctl(hakoniwa::Runctl::NewSession);
     }
 
+    /// Makes each command from this container the leader of a new session
+    /// and process group, as [`Self::set_session_leader`] does, without a
+    /// controlling terminal. For a program whose stdin is not a terminal:
+    /// hakoniwa's own session step fails there, on `TIOCSCTTY`, before the
+    /// program runs.
+    pub fn set_session_leader_without_terminal(&mut self) {
+        self.new_session = true;
+    }
+
     fn command_inner<C, I, IE, ArgS, EnvK, EnvV>(
         &self,
         sandbox: &Sandbox<C>,
@@ -580,6 +593,7 @@ impl Container {
             sandbox.config.classifier_leaf.clone(),
             sandbox.config.force_cover_fallback,
             self.start_gate.clone(),
+            self.new_session,
         )?;
 
         Ok(command)
@@ -1255,6 +1269,10 @@ pub mod classifier {
 /// returned command afterwards (`SHELL`, `PS1`, stdio) lands on the closure
 /// command and reaches the program the same way.
 #[cfg(target_os = "linux")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one call site, which hands over each fact the closure captures"
+)]
 fn install_box_credentials(
     container: &hakoniwa::Container,
     command: &mut hakoniwa::Command,
@@ -1263,6 +1281,7 @@ fn install_box_credentials(
     classifier_leaf: Option<config::ClassifierLeaf>,
     force_cover_fallback: bool,
     start_gate: Option<PathBuf>,
+    new_session: bool,
 ) -> Result<(), Error> {
     let program = command.get_program().to_string();
     let args = command.get_args();
@@ -1312,6 +1331,7 @@ fn install_box_credentials(
                 force_cover_fallback,
                 closure_report.as_deref(),
                 start_gate.as_deref(),
+                new_session,
             )
         })
     };
@@ -1494,7 +1514,20 @@ fn exec_box_program(
     force_cover_fallback: bool,
     closure_report: Option<&Path>,
     start_gate: Option<&Path>,
+    new_session: bool,
 ) -> ! {
+    // A new session and process group for the program, with no controlling
+    // terminal: the box's own processes then share neither with the daemon,
+    // and none of them can open the daemon's terminal as `/dev/tty`.
+    // SAFETY: `setsid(2)` takes no arguments and is async-signal-safe. It
+    // fails only for a process group leader, which this forked child is not.
+    if new_session && unsafe { libc::setsid() } == -1 {
+        exit_child(
+            "starting the box's own session",
+            &std::io::Error::last_os_error(),
+            closure_report,
+        );
+    }
     // Cap the box's PTY count before the credentials drop: PTYs are a
     // machine-wide pool, and the box's devpts instance was mounted without a
     // per-instance `max=`, so it draws from the one kernel-wide counter and a
@@ -2359,6 +2392,7 @@ impl<C: Channel> Sandbox<C> {
             socket_family_filter,
             fresh_netns: isolate,
             start_gate: None,
+            new_session: false,
         })
     }
 

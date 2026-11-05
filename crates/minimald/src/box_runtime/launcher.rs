@@ -1654,7 +1654,14 @@ impl BoxLauncher for SandboxLauncher {
             let mut container = env
                 .container(&plan)
                 .map_err(|e| io::Error::other(format!("container build: {e}")))?;
-            container.set_session_leader();
+            // The entrypoint leads a session of its own either way. Only a
+            // terminal can be its controlling terminal: on pipes, taking one
+            // fails with ENOTTY and the entrypoint never runs.
+            if on_pipes {
+                container.set_session_leader_without_terminal();
+            } else {
+                container.set_session_leader();
+            }
             // A launch minted only for hooks holds its shell at the gate: the
             // hooks need the box, not the shell, and the shell's startup —
             // the user's rc files and prompt commands — must not run ahead of
