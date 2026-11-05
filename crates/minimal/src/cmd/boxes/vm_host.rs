@@ -231,7 +231,10 @@ pub(crate) async fn release_held_box_name(
 /// Moves the zone hold of renamed session `id` from `old_name` to
 /// `new_name`. A rename keeps the box live under the same id, so the box is
 /// not retired: its egress rules stay, and its id is not revoked (BEP-043).
-/// Only the old name's hold is released. Best-effort, as the hold is.
+/// The old name's registration is withdrawn by the box's id, so a later
+/// box under that name takes a fresh id (BEP-082). The VM host daemon
+/// serves that withdraw by name alone: it retires and revokes nothing.
+/// Then the old name's hold is released. Best-effort, as the hold is.
 pub(crate) async fn move_held_box_name(
     control_sock: Option<std::path::PathBuf>,
     id: boxes::SessionId,
@@ -239,6 +242,13 @@ pub(crate) async fn move_held_box_name(
     new_name: &str,
 ) {
     if let Some(old_name) = old_name {
+        withdraw_box_row(
+            control_sock.clone(),
+            Some(old_name),
+            None,
+            Some(minimald_rpc::BoxId::from_bytes(id.to_bytes())),
+        )
+        .await;
         hold_box_name_with_vm_host(control_sock.clone(), old_name, Some(id), false).await;
     }
     hold_box_name_with_vm_host(control_sock, new_name, Some(id), true).await;
@@ -2118,9 +2128,9 @@ mod tests {
         );
     }
 
-    /// BEP-043: a rename keeps the box live under the same id. It moves the
-    /// name's hold and retires nothing, so the box keeps its egress rules
-    /// and its id. A stop retires the box's rules and says that the box
+    /// BEP-043: a rename keeps the box live under the same id. It withdraws
+    /// the old registration name by the box's id, moves the name's hold and
+    /// retires nothing, so the box keeps its egress rules and its id. A stop retires the box's rules and says that the box
     /// stopped, so the VM host daemon does not revoke the id.
     #[tokio::test]
     async fn a_rename_retires_nothing_and_a_stop_retires_as_stopped() {
@@ -2142,16 +2152,28 @@ mod tests {
         );
         {
             let seen = requests.lock().unwrap();
-            assert_eq!(seen.len(), 2, "one release, one hold");
-            let minimald_rpc::BoxControlRequest::ReleaseBoxName(release) =
+            assert_eq!(seen.len(), 3, "one withdraw, one release, one hold");
+            let minimald_rpc::BoxControlRequest::Withdraw(withdraw) =
                 serde_json_lenient::from_str(&seen[0]).expect("the request is the wire type")
+            else {
+                panic!("the old registration name is withdrawn by the withdraw verb");
+            };
+            assert_eq!(withdraw.name, "web");
+            assert_eq!(
+                withdraw.box_id,
+                Some(minimald_rpc::BoxId::from_bytes(id.to_bytes())),
+                "the withdraw carries the box's id"
+            );
+            assert_eq!(withdraw.switch_address, std::net::Ipv4Addr::UNSPECIFIED);
+            let minimald_rpc::BoxControlRequest::ReleaseBoxName(release) =
+                serde_json_lenient::from_str(&seen[1]).expect("the request is the wire type")
             else {
                 panic!("the old name is released by the release verb");
             };
             assert_eq!(release.name, "web");
             assert_eq!(release.session_id, Some(id));
             let minimald_rpc::BoxControlRequest::HoldBoxName(hold) =
-                serde_json_lenient::from_str(&seen[1]).expect("the request is the wire type")
+                serde_json_lenient::from_str(&seen[2]).expect("the request is the wire type")
             else {
                 panic!("the new name is held by the hold verb");
             };
