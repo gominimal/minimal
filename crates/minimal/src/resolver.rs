@@ -3663,10 +3663,11 @@ pub(crate) const LEGACY_PLACE_UNIT_SERVICE_PATH: &str =
     "/etc/systemd/system/minimald-place.service";
 
 /// The boot unit: a oneshot that re-runs the classifier's step from the
-/// root-owned copy at every boot, ordered before the path unit. The tree
-/// lives in cgroupfs and the table in the kernel, so neither survives a
-/// reboot on its own; without this unit the first socket event after a
-/// boot would find no tree to place the daemon in.
+/// root-owned copy at every boot, which the placement service is ordered
+/// after. The tree lives in cgroupfs and the table in the kernel, so
+/// neither survives a reboot on its own; without this unit the first
+/// placement request after a boot would find no tree to place the daemon
+/// in.
 #[cfg(any(test, not(target_os = "macos")))]
 pub(crate) const CLASSIFIER_SYSTEMD_UNIT: &str = "minimald-classifier";
 #[cfg(any(test, not(target_os = "macos")))]

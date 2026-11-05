@@ -1251,7 +1251,6 @@ pub(crate) mod linux {
              cat > {CLASSIFIER_UNIT_SERVICE_PATH} <<\\MINIMAL_CLASSIFIER_SERVICE_EOF\n\
              [Unit]\n\
              Description=Install minimald's egress classifier tree and table\n\
-             Before={PLACE_SYSTEMD_UNIT}.socket\n\
              \n\
              [Service]\n\
              Type=oneshot\n\
@@ -1263,9 +1262,13 @@ pub(crate) mod linux {
              # The path pair an earlier install placed the daemon with goes first.\n\
              systemctl disable --now {PLACE_SYSTEMD_UNIT}.path 2>/dev/null || true\n\
              rm -f {LEGACY_PLACE_UNIT_PATH_PATH} {LEGACY_PLACE_UNIT_SERVICE_PATH}\n\
+             # A placement waits for the boot unit's tree. The order is on the service:\n\
+             # the socket sits before sockets.target, which basic.target and so the boot\n\
+             # unit come after, and ordering the socket after the boot unit is a cycle.\n\
              cat > {PLACE_UNIT_SERVICE_PATH} <<\\MINIMAL_PLACE_SERVICE_EOF\n\
              [Unit]\n\
              Description=Place minimald's listener in its classifier leaf\n\
+             After={CLASSIFIER_SYSTEMD_UNIT}.service\n\
              \n\
              [Service]\n\
              Type=oneshot\n\
@@ -1277,7 +1280,6 @@ pub(crate) mod linux {
              cat > {PLACE_UNIT_SOCKET_PATH} <<\\MINIMAL_PLACE_SOCKET_EOF\n\
              [Unit]\n\
              Description=Take minimald's requests to place its listener\n\
-             After={CLASSIFIER_SYSTEMD_UNIT}.service\n\
              \n\
              [Socket]\n\
              ListenStream={PLACE_REQUEST_SOCKET}\n\
@@ -3496,7 +3498,6 @@ mod tests {
             format!(": > {CLASSIFIER_TREE_RECORD}\n"),
             format!("cat > {CLASSIFIER_UNIT_SERVICE_PATH} <<"),
             format!("ExecStart={CLASSIFIER_PROGRAM_PATH} --user 'alice'\n"),
-            "Before=minimald-place.socket\n".to_string(),
             // gominimal/inbox#1206: the earlier path pair goes, and the
             // placement is a socket in /run the daemon connects to, so no
             // inotify watch on a path under the account's home is needed.
@@ -3508,7 +3509,6 @@ mod tests {
                 "ExecStart={CLASSIFIER_PROGRAM_PATH} --user 'alice' --place-listener '{sock}'\n"
             ),
             format!("cat > {PLACE_UNIT_SOCKET_PATH} <<"),
-            "After=minimald-classifier.service\n".to_string(),
             format!("ListenStream={PLACE_REQUEST_SOCKET}\n"),
             "SocketUser=alice\nSocketMode=0600\nAccept=yes\n".to_string(),
             "WantedBy=sockets.target\n".to_string(),
@@ -3548,6 +3548,31 @@ mod tests {
             )),
             "{unit_part}"
         );
+        // A placement waits for the boot unit, ordered on the template
+        // service alone: the socket is before sockets.target, which the boot
+        // unit comes after through basic.target, so an order between the
+        // socket and the boot unit closes a cycle at boot.
+        let unit_body = |heredoc: &str| -> String {
+            let start = script
+                .find(&format!("<<\\{heredoc}\n"))
+                .unwrap_or_else(|| panic!("the block writes {heredoc}: {script}"));
+            let body = &script[start..];
+            let body = &body[body.find('\n').unwrap() + 1..];
+            body[..body.find(&format!("\n{heredoc}\n")).unwrap()].to_string()
+        };
+        let boot = unit_body("MINIMAL_CLASSIFIER_SERVICE_EOF");
+        let place = unit_body("MINIMAL_PLACE_SERVICE_EOF");
+        let socket = unit_body("MINIMAL_PLACE_SOCKET_EOF");
+        assert!(
+            place.contains("\nAfter=minimald-classifier.service\n"),
+            "{place}"
+        );
+        for (name, body) in [("boot", &boot), ("socket", &socket)] {
+            assert!(
+                !body.contains("Before=") && !body.contains("After="),
+                "the {name} unit carries no order of its own: {body}"
+            );
+        }
         assert!(
             !script.contains("PathChanged="),
             "no unit watches the daemon's socket: {script}"
