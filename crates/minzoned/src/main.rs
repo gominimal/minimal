@@ -38,8 +38,12 @@ struct Cli {
 
     /// Admit the members of this group to the channel too (the installed
     /// service of a Mac several users share), besides the service's own
-    /// uid and root. Every member can publish any box name on this host
-    /// (first publisher keeps it): a group of users who trust each other.
+    /// uid and root. Box names are one space for the whole host: the first
+    /// publisher keeps a name while its row is up and for the answer TTL
+    /// after, then any member may take it, so the group is users who trust
+    /// each other with names. Each member's open connections and box
+    /// addresses are capped, so no one member takes the service from the
+    /// others.
     #[arg(long, value_name = "GROUP")]
     admit_group: Option<String>,
 
