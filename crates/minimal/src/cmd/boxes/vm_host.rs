@@ -2,6 +2,8 @@
 //! socket, the box row and the held box name.
 
 use super::*;
+pub(crate) use minimal_client::attach::HostIpBoxChange;
+pub(crate) use minimald_rpc::HostIpBoxEnd;
 
 // The box registration exchange with the VM host daemon (T66) — the
 // register, its lease, the withdrawal and the resume — is the client
@@ -221,9 +223,53 @@ pub(crate) async fn release_held_box_name(
     }
     // A `host_ip` box's egress goes with its session, named or not. A box
     // of another mode admitted none, and a retire of it is the goal state.
-    retire_host_ip_box_with_vm_host(control_sock.clone(), id).await;
+    retire_host_ip_box_with_vm_host(control_sock.clone(), id, HostIpBoxEnd::Destroyed).await;
     let Some(name) = name else { return };
     hold_box_name_with_vm_host(control_sock, name, Some(id), false).await;
+}
+
+/// Moves the zone hold of renamed session `id` from `old_name` to
+/// `new_name`. A rename keeps the box live under the same id, so the box is
+/// not retired: its egress rules stay, and its id is not revoked (BEP-043).
+/// The old name's registration is withdrawn by the box's id, so a later
+/// box under that name takes a fresh id (BEP-082). The VM host daemon
+/// serves that withdraw by name alone: it retires and revokes nothing.
+/// Then the old name's hold is released. Best-effort, as the hold is.
+pub(crate) async fn move_held_box_name(
+    control_sock: Option<std::path::PathBuf>,
+    id: boxes::SessionId,
+    old_name: Option<&str>,
+    new_name: &str,
+) {
+    if let Some(old_name) = old_name {
+        withdraw_box_row(
+            control_sock.clone(),
+            Some(old_name),
+            None,
+            Some(minimald_rpc::BoxId::from_bytes(id.to_bytes())),
+        )
+        .await;
+        hold_box_name_with_vm_host(control_sock.clone(), old_name, Some(id), false).await;
+    }
+    hold_box_name_with_vm_host(control_sock, new_name, Some(id), true).await;
+}
+
+/// Retires stopped box `id`'s `host_ip` egress rules on the VM host daemon.
+/// A stop is not a destroy: a restart brings the box back under the same
+/// id, so the retire says the box stopped and its id is not revoked
+/// (BEP-043). Best-effort: a box of another mode has no rules, and no VM
+/// host daemon means nothing to do.
+pub(crate) async fn retire_stopped_box_with_vm_host(
+    control_sock: Option<std::path::PathBuf>,
+    id: boxes::SessionId,
+) {
+    host_ip_box_with_vm_host(
+        control_sock,
+        id,
+        None,
+        HostIpBoxChange::Retire(HostIpBoxEnd::Stopped),
+    )
+    .await;
 }
 
 /// A session's record by its `id`, bounded by [`BOX_CONTROL_TIMEOUT`]:
@@ -291,7 +337,12 @@ pub(crate) async fn release_held_name_after_attach(
             // The record carries no box id, so the pair is the proof.
             Some(addresses) => withdraw_box_row_with_vm_host(sock, name, addresses).await,
             None => {
-                retire_host_ip_box_with_vm_host(control_sock_beside(sock), id).await;
+                retire_host_ip_box_with_vm_host(
+                    control_sock_beside(sock),
+                    id,
+                    HostIpBoxEnd::Destroyed,
+                )
+                .await;
                 hold_box_name_with_vm_host(control_sock_beside(sock), name, Some(id), false).await;
             }
         },
@@ -370,13 +421,18 @@ pub(crate) async fn rehold_held_name_before_attach(
             id,
             record.policy.egress.clone(),
             record.policy.credentialed_upstream.is_some(),
-            true,
+            HostIpBoxChange::Admit,
         )
         .await
     {
         match attached_box_record(sock, id).await {
             Ok(None) => {
-                retire_host_ip_box_with_vm_host(control_sock_beside(sock), id).await;
+                retire_host_ip_box_with_vm_host(
+                    control_sock_beside(sock),
+                    id,
+                    HostIpBoxEnd::Destroyed,
+                )
+                .await;
             }
             // Only a session still there was admitted for good. This runs
             // on every attach and exec, not only after a resume, so the
@@ -468,8 +524,8 @@ pub(crate) async fn withdraw_box_row_with_vm_host(
     }
 }
 
-/// Admits (`resident`) or retires a `host_ip` box's egress policy on the
-/// VM host daemon (NET-085), off the async worker and bounded by
+/// Admits ([`HostIpBoxChange::Admit`]) or retires a `host_ip` box's egress
+/// policy on the VM host daemon (NET-085), off the async worker and bounded by
 /// [`BOX_CONTROL_TIMEOUT`]. The host gate decides a frame a `host_ip` box
 /// sends by the policies admitted there, so a box is admitted before it
 /// runs anything and retired once it is gone. Returns whether the VM host
@@ -479,9 +535,9 @@ pub(crate) async fn host_ip_box_with_vm_host(
     control_sock: Option<std::path::PathBuf>,
     id: boxes::SessionId,
     egress: Option<boxes::EgressPolicy>,
-    resident: bool,
+    change: HostIpBoxChange,
 ) -> bool {
-    host_ip_box_with_vm_host_declaring(control_sock, id, egress, false, resident).await
+    host_ip_box_with_vm_host_declaring(control_sock, id, egress, false, change).await
 }
 
 /// [`host_ip_box_with_vm_host`] for a box that says whether it declares a
@@ -492,7 +548,7 @@ pub(crate) async fn host_ip_box_with_vm_host_declaring(
     id: boxes::SessionId,
     egress: Option<boxes::EgressPolicy>,
     credentialed_upstream: bool,
-    resident: bool,
+    change: HostIpBoxChange,
 ) -> bool {
     let Some(sock_path) = control_sock else {
         return false;
@@ -503,7 +559,7 @@ pub(crate) async fn host_ip_box_with_vm_host_declaring(
             id,
             egress.as_ref(),
             credentialed_upstream,
-            resident,
+            change,
         )
     });
     match tokio::time::timeout(BOX_CONTROL_TIMEOUT, exchange).await {
@@ -568,7 +624,7 @@ impl HostIpResidency {
             id,
             egress.cloned(),
             credentialed_upstream,
-            true,
+            HostIpBoxChange::Admit,
         )
         .await
         .then_some(Self {
@@ -591,9 +647,11 @@ impl HostIpResidency {
 impl Drop for HostIpResidency {
     fn drop(&mut self) {
         if !self.kept {
+            // The activation did not keep the box, so the box is gone.
             retire_host_ip_box_retrying(
                 &self.control_sock,
                 self.id,
+                HostIpBoxEnd::Destroyed,
                 HOST_IP_RETIRE_BACKOFF,
                 HOST_IP_RETIRE_DEADLINE,
             );
@@ -619,10 +677,12 @@ const HOST_IP_RETIRE_DEADLINE: std::time::Duration = BOX_CONTROL_TIMEOUT;
 /// a host that is not VM-backed, and then nothing is sent. A destroy, an
 /// attach that ends with the session gone, and the undo of a re-admit all
 /// retire through this, so one lost exchange leaves no gone box's rules in
-/// the gate's union.
+/// the gate's union. `end` says how the box ended. Only a destroyed box has
+/// its id revoked at the Box Egress Proxy (BEP-043).
 pub(crate) async fn retire_host_ip_box_with_vm_host(
     control_sock: Option<std::path::PathBuf>,
     id: boxes::SessionId,
+    end: HostIpBoxEnd,
 ) {
     let Some(sock_path) = control_sock else {
         return;
@@ -631,6 +691,7 @@ pub(crate) async fn retire_host_ip_box_with_vm_host(
         retire_host_ip_box_retrying(
             &sock_path,
             id,
+            end,
             HOST_IP_RETIRE_BACKOFF,
             HOST_IP_RETIRE_DEADLINE,
         );
@@ -652,10 +713,12 @@ pub(crate) async fn retire_host_ip_box_with_vm_host(
 /// runs on its own thread, so an exchange with a hung VM host daemon holds
 /// that thread and not the caller past the deadline. Blocking. Each failed
 /// attempt is a warn line with its attempt number, and a retire given up
-/// on is one more warn line. Returns whether a retire was answered.
+/// on is one more warn line. Returns whether a retire was answered. Every
+/// attempt carries `end`, how the box ended (BEP-043).
 fn retire_host_ip_box_retrying(
     control_sock: &std::path::Path,
     id: boxes::SessionId,
+    end: HostIpBoxEnd,
     backoff: std::time::Duration,
     deadline: std::time::Duration,
 ) -> bool {
@@ -670,7 +733,11 @@ fn retire_host_ip_box_retrying(
             .name("host-ip-retire".to_string())
             .spawn(move || {
                 let _ = answer_tx.send(minimal_client::attach::host_ip_box_at(
-                    &sock, id, None, false, false,
+                    &sock,
+                    id,
+                    None,
+                    false,
+                    HostIpBoxChange::Retire(end),
                 ));
             });
         if let Err(error) = exchange {
@@ -2070,9 +2137,77 @@ mod tests {
         assert_eq!(
             *residency.lock().unwrap(),
             vec![minimald_rpc::BoxControlRequest::RetireHostIpBox(
-                minimald_rpc::RetireHostIpBoxRequest { session_id: id }
+                minimald_rpc::RetireHostIpBoxRequest {
+                    session_id: id,
+                    end: HostIpBoxEnd::Destroyed,
+                }
             )],
             "the run's end retires the host_ip box's egress"
+        );
+    }
+
+    /// BEP-043: a rename keeps the box live under the same id. It withdraws
+    /// the old registration name by the box's id, moves the name's hold and
+    /// retires nothing, so the box keeps its egress rules and its id. A stop retires the box's rules and says that the box
+    /// stopped, so the VM host daemon does not revoke the id.
+    #[tokio::test]
+    async fn a_rename_retires_nothing_and_a_stop_retires_as_stopped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let host_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        let (requests, residency) = fake_vm_host_with_residency(
+            host_dir.join("control.sock"),
+            r#"{"name":"web","held":true}"#.to_string(),
+        )
+        .await;
+        let control_sock = || vm_host_control_sock(paths::HostKind::Minvmd, Some(dir.path()));
+        let id = boxes::SessionId::mint();
+
+        move_held_box_name(control_sock(), id, Some("web"), "api").await;
+        assert!(
+            residency.lock().unwrap().is_empty(),
+            "a rename sends no retire"
+        );
+        {
+            let seen = requests.lock().unwrap();
+            assert_eq!(seen.len(), 3, "one withdraw, one release, one hold");
+            let minimald_rpc::BoxControlRequest::Withdraw(withdraw) =
+                serde_json_lenient::from_str(&seen[0]).expect("the request is the wire type")
+            else {
+                panic!("the old registration name is withdrawn by the withdraw verb");
+            };
+            assert_eq!(withdraw.name, "web");
+            assert_eq!(
+                withdraw.box_id,
+                Some(minimald_rpc::BoxId::from_bytes(id.to_bytes())),
+                "the withdraw carries the box's id"
+            );
+            assert_eq!(withdraw.switch_address, std::net::Ipv4Addr::UNSPECIFIED);
+            let minimald_rpc::BoxControlRequest::ReleaseBoxName(release) =
+                serde_json_lenient::from_str(&seen[1]).expect("the request is the wire type")
+            else {
+                panic!("the old name is released by the release verb");
+            };
+            assert_eq!(release.name, "web");
+            assert_eq!(release.session_id, Some(id));
+            let minimald_rpc::BoxControlRequest::HoldBoxName(hold) =
+                serde_json_lenient::from_str(&seen[2]).expect("the request is the wire type")
+            else {
+                panic!("the new name is held by the hold verb");
+            };
+            assert_eq!(hold.name, "api");
+        }
+
+        retire_stopped_box_with_vm_host(control_sock(), id).await;
+        assert_eq!(
+            *residency.lock().unwrap(),
+            vec![minimald_rpc::BoxControlRequest::RetireHostIpBox(
+                minimald_rpc::RetireHostIpBoxRequest {
+                    session_id: id,
+                    end: HostIpBoxEnd::Stopped,
+                }
+            )],
+            "a stop retires the box as stopped"
         );
     }
 
@@ -2337,6 +2472,7 @@ mod tests {
             retire_host_ip_box_retrying(
                 &gone,
                 id,
+                HostIpBoxEnd::Destroyed,
                 std::time::Duration::from_millis(1),
                 HOST_IP_RETIRE_DEADLINE,
             )
@@ -2368,7 +2504,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let control_sock = dir.path().join(minvmd::control::CONTROL_SOCK_FILE);
         let retires = fake_vm_host_dropping_retires(&control_sock, 1);
-        retire_host_ip_box_with_vm_host(Some(control_sock), id).await;
+        retire_host_ip_box_with_vm_host(Some(control_sock), id, HostIpBoxEnd::Destroyed).await;
         assert_eq!(retires.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
@@ -2396,6 +2532,7 @@ mod tests {
             retire_host_ip_box_retrying(
                 &control_sock,
                 boxes::SessionId::nil(),
+                HostIpBoxEnd::Destroyed,
                 std::time::Duration::from_millis(1),
                 deadline,
             )

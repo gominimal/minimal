@@ -233,6 +233,17 @@ const WARN_INTERVAL: StackDuration = StackDuration::from_secs(1);
 /// does not hold.
 pub type BoxId = [u8; 16];
 
+/// The reserved id a delivery from the `host_ip` cohort address carries
+/// (BEP-084). The cohort's members share the node address, so a connection
+/// from it names no single box, and its header carries this id in place of
+/// any member's. The acceptor reads it as the cohort, and the sealed value
+/// the request carries names the box it is checked for.
+///
+/// All 16 bytes are `0xff`: the max UUID, which a UUIDv7 mint never gives,
+/// so it never collides with a box's own id. It is not all zero either, so
+/// the acceptor's zero-id refusal does not take it.
+pub const COHORT_BOX_ID: BoxId = [0xff; 16];
+
 /// The delivery header ahead of a flow's bytes: what tells the proxy which
 /// box's connection this is before any flow byte crosses (NET-132).
 ///
@@ -346,6 +357,19 @@ pub trait BepBoxSource: Send + Sync {
     /// so a source that holds no attachments at all refuses every
     /// delivery without a change.
     fn box_id_for_source(&self, _source: Ipv4Addr) -> Option<BoxId> {
+        None
+    }
+
+    /// The address the `host_ip` cohort sends from — the node address —
+    /// while the cohort's lane to the proxy is open, or `None` while it is
+    /// closed (BEP-083, BEP-084). While it is open the address holds a
+    /// share of the pool like a registered box's row, and every delivery
+    /// from it carries [`COHORT_BOX_ID`], never a member's id, whatever
+    /// [`Self::box_id_for_source`] answers for it. A source that answers
+    /// no id for it still gets no delivery.
+    ///
+    /// The default is a closed lane: no cohort share, no cohort delivery.
+    fn cohort_source(&self) -> Option<Ipv4Addr> {
         None
     }
 }
@@ -928,8 +952,13 @@ pub struct BepStack {
     /// flow.
     slots: Vec<Slot>,
     /// The partition as last reconciled: the registered boxes' switch
-    /// addresses, in row order.
+    /// addresses, in row order, then the cohort's address while its lane
+    /// is open.
     partition: Vec<Ipv4Address>,
+    /// The cohort's address as last reconciled
+    /// ([`BepBoxSource::cohort_source`]): a delivery from it carries
+    /// [`COHORT_BOX_ID`] (BEP-084).
+    cohort: Option<Ipv4Address>,
     wire: BepWire,
     boxes: Arc<dyn BepBoxSource>,
     /// The pins behind the leg's neighbour answers: shared with the
@@ -981,6 +1010,7 @@ impl BepStack {
             host,
             slots: Vec::new(),
             partition: Vec::new(),
+            cohort: None,
             wire,
             boxes,
             answers,
@@ -1383,7 +1413,22 @@ impl BepStack {
     /// address is not handed out again within the cache's lifetime: the
     /// switch's address-reuse quarantine must stay longer than 60 s.
     fn reconcile(&mut self) {
-        let desired: Vec<Ipv4Address> = self.boxes.box_switch_addresses();
+        let mut desired: Vec<Ipv4Address> = self.boxes.box_switch_addresses();
+        // BEP-084: while the cohort's lane is open, the node address holds
+        // a share of its own, beside the rows', and leaves with the lane.
+        let cohort = self.boxes.cohort_source();
+        if let Some(addr) = cohort
+            && !desired.contains(&addr)
+        {
+            desired.push(addr);
+        }
+        if cohort != self.cohort {
+            tracing::debug!(
+                cohort_addr = ?cohort,
+                "box egress proxy pool: the host_ip cohort's lane changed"
+            );
+        }
+        self.cohort = cohort;
         let cap = self.wire.per_source_cap;
         for addr in &desired {
             if !self.partition.contains(addr) {
@@ -1629,8 +1674,15 @@ impl BepStack {
             // shared audit. The node namespace never reaches here: it holds
             // no row's share, so the pre-screen refuses its SYN before a
             // slot ever carries one.
+            //
+            // The cohort's address is shared by every `host_ip` box, so its
+            // delivery names none of them: the header carries the reserved
+            // cohort id, whatever id the source answered (BEP-084).
             let IpAddress::Ipv4(source) = remote.addr;
             match self.boxes.box_id_for_source(source) {
+                Some(_) if self.cohort == Some(source) => {
+                    self.request_dial(idx, remote, local, COHORT_BOX_ID);
+                }
                 Some(box_id) => self.request_dial(idx, remote, local, box_id),
                 None => self.refuse_without_attachment(idx, source),
             }
@@ -2162,6 +2214,24 @@ impl Drop for BepPeer {
 }
 
 impl BepPeer {
+    /// Stops the peer and waits for its runtime thread to finish, bounded.
+    /// A clean VM stop calls this before it stops the switch, so the reader
+    /// pump is gone by the time the switch socket closes; the "switch socket
+    /// closed" WARN then means what it says, a lane lost mid-life, instead
+    /// of firing on every clean stop.
+    pub async fn shutdown(mut self) {
+        drop(self.stop.take());
+        if let Ok(Err(err)) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), &mut self.poll_task).await
+        {
+            tracing::warn!(%err, "BEP poll task ended with a join error");
+        }
+        // Drop does the rest: a thread that did not finish in time is left to
+        // the abort, as before.
+    }
+}
+
+impl BepPeer {
     /// Start a peer for `subnet.box_egress_proxy_address()` on the switch
     /// socket at `switch_sock`, delivering the connections its pool accepts
     /// to the acceptor `wire` names, partitioned by the rows `boxes` holds.
@@ -2220,7 +2290,10 @@ impl BepPeer {
         let (device, ends) = BepDevice::pair();
 
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        // The peer's thread logs to the subscriber its spawner logs to.
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let poll_task = tokio::task::spawn_blocking(move || {
+            let _dispatch = tracing::dispatcher::set_default(&dispatch);
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -3264,6 +3337,58 @@ mod tests {
         frame
     }
 
+    /// How many times `log` holds the reader pump's "switch socket closed"
+    /// line.
+    fn socket_closed_lines(log: &WarnLog) -> usize {
+        log.lines()
+            .iter()
+            .filter(|l| l.contains("switch socket closed"))
+            .count()
+    }
+
+    /// A clean stop shuts the peer down before the switch closes its socket,
+    /// so the reader pump is gone and says nothing; a switch that closes the
+    /// socket under a live peer still gets the WARN, since that lane is lost.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_clean_shutdown_is_quiet_and_a_lost_switch_warns() {
+        let (log, _guard) = capture_warn_lines();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let peer_at = |sock: std::path::PathBuf| {
+            let wire = BepWire::new(dir.path().join("proxy.sock"), [0u8; TOKEN_LEN]);
+            async move {
+                BepPeer::spawn(&sock, SwitchSubnet::default(), wire, Arc::new(NoBoxes))
+                    .await
+                    .expect("peer spawns against a listening switch socket")
+            }
+        };
+
+        let sock = dir.path().join("clean.sock");
+        let accept_fut = stand_in_switch(&sock).await;
+        let peer = peer_at(sock).await;
+        let switch = accept_fut.await.expect("acceptor task completed");
+        peer.shutdown().await;
+        drop(switch);
+        // Several poll periods: a reader still running would have seen EOF.
+        tokio::time::sleep(POLL_DELAY * 5).await;
+        assert_eq!(socket_closed_lines(&log), 0, "{:?}", log.lines());
+
+        let sock = dir.path().join("lost.sock");
+        let accept_fut = stand_in_switch(&sock).await;
+        let peer = peer_at(sock).await;
+        let switch = accept_fut.await.expect("acceptor task completed");
+        drop(switch);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while socket_closed_lines(&log) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("no switch socket closed WARN: {:?}", log.lines()));
+        assert_eq!(socket_closed_lines(&log), 1, "{:?}", log.lines());
+        peer.shutdown().await;
+    }
+
     /// NET-132: the peer is silent until addressed. Across an interval that
     /// covers several poll periods, an idle peer writes nothing onto the
     /// switch socket: no gratuitous ARP at attach, no probe, nothing — and
@@ -3374,8 +3499,14 @@ mod tests {
     /// what a delivery the pool accepts from it is delivered under — and
     /// the id can be dropped while the row stands: the shape whose
     /// deliveries the pool aborts.
+    ///
+    /// The second field is the cohort's lane: the node address while it is
+    /// open, with the id the source answers for it.
     #[derive(Clone, Default)]
-    struct TestBoxes(StdArc<StdMutex<Vec<TestRow>>>);
+    struct TestBoxes(
+        StdArc<StdMutex<Vec<TestRow>>>,
+        StdArc<StdMutex<Option<(Ipv4Addr, BoxId)>>>,
+    );
 
     impl TestBoxes {
         /// Registers a box at `ip` named by the id the fixture derives for
@@ -3407,6 +3538,12 @@ mod tests {
         fn withdraw(&self, ip: Ipv4Addr) {
             self.0.lock().unwrap().retain(|(row, _)| *row != ip);
         }
+
+        /// Opens the cohort's lane at `ip`, with `answer` as the id the
+        /// source gives for it, or closes the lane with `None`.
+        fn set_cohort(&self, cohort: Option<(Ipv4Addr, BoxId)>) {
+            *self.1.lock().unwrap() = cohort;
+        }
     }
 
     impl BepBoxSource for TestBoxes {
@@ -3415,12 +3552,21 @@ mod tests {
         }
 
         fn box_id_for_source(&self, source: Ipv4Addr) -> Option<BoxId> {
+            if let Some((cohort, answer)) = *self.1.lock().unwrap()
+                && cohort == source
+            {
+                return Some(answer);
+            }
             self.0
                 .lock()
                 .unwrap()
                 .iter()
                 .find(|(row, _)| *row == source)
                 .and_then(|(_, id)| *id)
+        }
+
+        fn cohort_source(&self) -> Option<Ipv4Addr> {
+            self.1.lock().unwrap().map(|(cohort, _)| cohort)
         }
     }
 
@@ -3770,6 +3916,69 @@ mod tests {
         );
         // The pool still holds exactly the one box's share.
         assert_eq!(h.lane.pool_len(), cap);
+    }
+
+    /// BEP-084: while the cohort's lane is open, a connection from the
+    /// node address is delivered under the reserved cohort id. The header
+    /// carries no member's id, even when the source answers one for the
+    /// address. Once the lane closes, the node address holds no share, and
+    /// its next connection is refused before a slot carries it.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn cohort_delivery_names_no_box() {
+        let (mut h, _proxy_sock, _token) = harness(1, Stall::None, true).await;
+        let subnet = SwitchSubnet::default();
+        let proxy_ip = subnet.box_egress_proxy_address();
+        let node = subnet.daemon_ip();
+        // A member's id, as a source that wrongly answered one for the
+        // shared address would give it.
+        let member: BoxId = [
+            0x01, 0x90, 0xf0, 0xe0, 0xa1, 0xb2, 0x70, 0xd4, 0x80, 0xf6, 0x07, 0x18, 0x29, 0x3a,
+            0x4b, 0x5c,
+        ];
+        h.boxes.set_cohort(Some((node, member)));
+        drive(&mut h.lane, 2).await;
+        assert_eq!(h.lane.pool_len(), 1, "the open lane gives the node a share");
+        h.lane.add_box(node);
+        drive(&mut h.lane, 1).await;
+        h.lane.boxes_mut()[0].arp_for(proxy_ip);
+        drive(&mut h.lane, 3).await;
+
+        let flow = h.lane.boxes_mut()[0].connect(proxy_ip, PROXY_PORT);
+        drive(&mut h.lane, 40).await;
+        let accepted = h.acceptor.as_ref().expect("acceptor").accepted();
+        assert_eq!(accepted.len(), 1, "the cohort's flow was delivered");
+        assert_eq!(accepted[0].source.addr, IpAddress::Ipv4(node));
+        assert_eq!(
+            accepted[0].box_id, COHORT_BOX_ID,
+            "the cohort's delivery carries the reserved cohort id"
+        );
+        assert_ne!(accepted[0].box_id, member, "no member's id is delivered");
+        assert_ne!(accepted[0].box_id, [0u8; 16], "the cohort id is not zero");
+        let answer = read_flow(&mut h.lane, 0, flow, 8).await;
+        assert!(
+            answer.starts_with(b"source="),
+            "the acceptor's answer arrived: {:?}",
+            String::from_utf8_lossy(&answer)
+        );
+
+        // The lane closes: the node's share goes, and its next connection
+        // is refused, nothing delivered for it.
+        h.boxes.set_cohort(None);
+        drive(&mut h.lane, 2).await;
+        assert_eq!(h.lane.pool_len(), 0, "the closed lane holds no share");
+        let refused = h.lane.boxes_mut()[0].connect(proxy_ip, PROXY_PORT);
+        drive(&mut h.lane, 40).await;
+        assert_eq!(
+            h.lane.boxes()[0].flow_state(refused),
+            State::Closed,
+            "a connection from the closed lane is reset"
+        );
+        assert_eq!(
+            h.acceptor.as_ref().expect("acceptor").connections(),
+            1,
+            "nothing is delivered from the closed lane"
+        );
     }
 
     /// NET-133: every delivered flow carries its own box's non-zero id,

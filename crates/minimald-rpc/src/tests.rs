@@ -527,12 +527,52 @@ fn create_session_request_round_trips() {
             // while it is left off the wire.
             creating_verb: CreatingVerb::Task,
             project_root: Some(paths::HostAbsPath::try_new("/home/u").unwrap()),
+            host_ip_registration: Some("dev~0123456789abcdef".into()),
         },
         must_match_version: Some("0.6.0".into()),
         spec: Some(serde_json_lenient::json!({"v": 0, "box": {"type": "task"}})),
         fresh_instance: true,
     };
     assert_eq!(round_trip(&req), req);
+}
+
+/// BEP-082: a fresh-instance `host_ip` grant box carries the creation key
+/// it registered under, so the in-VM daemon's id mint finds the
+/// registration after it names the box `<base>-<n>`. A config with no key
+/// leaves it off the wire, and an older client's config decodes with none.
+#[test]
+fn box_config_carries_the_host_ip_registration_name() {
+    let mut req = CreateSessionRequest::new(
+        "dev",
+        paths::HostAbsPath::try_new("/home/u/proj").unwrap(),
+        NetworkMode::HostNet,
+        BoxPolicy::default(),
+    );
+    req.config.host_ip_registration = Some("dev~0123456789abcdef".into());
+    let wire = serde_json_lenient::to_string(&req.config).unwrap();
+    let sent: serde_json_lenient::Value = serde_json_lenient::from_str(&wire).unwrap();
+    assert_eq!(
+        sent["host_ip_registration"], "dev~0123456789abcdef",
+        "the key reaches the wire"
+    );
+    assert_eq!(round_trip(&req), req);
+
+    req.config.host_ip_registration = None;
+    let wire = serde_json_lenient::to_string(&req.config).unwrap();
+    assert!(
+        !wire.contains("host_ip_registration"),
+        "no key, no field: {wire}"
+    );
+
+    let older = r#"{
+        "name": "dev",
+        "project_path": "/p",
+        "network": "host_net",
+        "attrs": {}
+    }"#;
+    let config: BoxConfig =
+        serde_json_lenient::from_str(older).expect("an older client's config must load");
+    assert_eq!(config.host_ip_registration, None);
 }
 
 /// The one constructor every daemon-side create goes through: it fills
@@ -564,6 +604,7 @@ fn create_request_constructor_round_trips() {
                 root_certificate: None,
                 creating_verb: CreatingVerb::Session,
                 project_root: None,
+                host_ip_registration: None,
             },
             must_match_version: None,
             spec: None,
@@ -2221,4 +2262,22 @@ fn read_log_request_round_trips() {
     })
     .unwrap();
     assert!(output.contains(r#""data":"6869""#), "{output}");
+}
+
+#[test]
+fn retire_without_an_end_is_refused_at_decode() {
+    let session = serde_json_lenient::to_string(&boxes::SessionId::mint()).unwrap();
+    let without_end = format!(r#"{{"verb":"retire_host_ip_box","session_id":{session}}}"#);
+    assert!(
+        serde_json_lenient::from_str::<BoxControlRequest>(&without_end).is_err(),
+        "a retire without `end` must not decode"
+    );
+    let stopped =
+        format!(r#"{{"verb":"retire_host_ip_box","session_id":{session},"end":"stopped"}}"#);
+    match serde_json_lenient::from_str::<BoxControlRequest>(&stopped).unwrap() {
+        BoxControlRequest::RetireHostIpBox(request) => {
+            assert_eq!(request.end, HostIpBoxEnd::Stopped);
+        }
+        other => panic!("decoded as {other:?}"),
+    }
 }

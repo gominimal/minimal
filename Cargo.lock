@@ -4216,7 +4216,6 @@ dependencies = [
  "async-compression",
  "async-tar",
  "boxes",
- "camino",
  "constcat",
  "indicatif",
  "libc",
@@ -4231,6 +4230,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "version",
 ]
 

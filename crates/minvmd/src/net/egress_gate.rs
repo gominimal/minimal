@@ -6460,17 +6460,10 @@ fn log_marked_decision(
 /// address still drop. While no member declares one, every frame to the
 /// proxy's address drops under [`PROXY_LANE_RULE`].
 ///
-/// Interim: while the lane is open, a member that declares no credentialed
-/// upstream also reaches the listener and TCP 443. Networking §7.1 (line
-/// 244) and §4.3 rule 2 (T28) say that member must not. The cause is that
-/// the gate cannot tell the members apart: every member leaves from the
-/// node address with the same cohort mark. The refusal of such a member
-/// belongs to the in-VM classifier, which knows the sender's cgroup. The
-/// owner accepted this exposure as an interim, and
-/// <https://github.com/gominimal/minimal/issues/2876> tracks the
-/// classifier work. The interim ends when the in-VM classifier refuses a connection
-/// to the proxy's address from a member that declares no lane. This gate
-/// logic stays as it is then: it is the gate half of the lane.
+/// The gate cannot tell the members apart: every member leaves from the
+/// node address with the same cohort mark. The in-VM classifier, which
+/// knows the sender's cgroup, refuses a connection to the proxy's address
+/// from a member that declares no lane. This gate is the lane's host half.
 fn host_ip_verdict(
     summary: &FrameSummary,
     l4: Option<&dns_pins::L4Packet>,
@@ -16319,7 +16312,7 @@ mod tests {
             );
         }
         // The box leaves: its reach goes with it.
-        assert!(registry.retire_host_ip_box(session));
+        assert!(registry.retire_host_ip_box(session, minimald_rpc::HostIpBoxEnd::Destroyed));
         assert_eq!(
             marked(host_ip_reach, 443),
             Err(unbounded(host_ip_reach, 0)),
@@ -16800,7 +16793,7 @@ mod tests {
             host_ip_cohort_to_proxy(&table, &baseline, &pins, 443),
             Ok(GateAdmit::ProxyLane)
         );
-        assert!(registry.retire_host_ip_box(grant));
+        assert!(registry.retire_host_ip_box(grant, minimald_rpc::HostIpBoxEnd::Destroyed));
         assert_eq!(
             host_ip_cohort_to_proxy(&table, &baseline, &pins, super::egress::PROXY_LISTENER_PORT),
             lane_drop,

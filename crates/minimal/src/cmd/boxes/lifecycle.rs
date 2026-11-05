@@ -751,7 +751,7 @@ pub async fn cmd_box_stop(global: &GlobalArgs, args: BoxStopArgs) -> Result<(), 
     // The retire goes to the VM that keeps the box, which need not be the
     // selected one.
     let control_sock = box_host_control_sock(&stopped.host);
-    host_ip_box_with_vm_host(control_sock, stopped.box_id, None, false).await;
+    retire_stopped_box_with_vm_host(control_sock, stopped.box_id).await;
     Ok(())
 }
 
@@ -988,14 +988,13 @@ pub async fn cmd_box_rename(global: &GlobalArgs, args: BoxRenameArgs) -> Result<
     .await?;
     if let Some(record) = record.filter(holds_name) {
         let control_sock = box_host_control_sock(&resolved.host);
-        release_held_box_name(
-            control_sock.clone(),
+        move_held_box_name(
+            control_sock,
             record.id,
             record.name.as_deref(),
-            None,
+            &args.new_name,
         )
         .await;
-        hold_box_name_with_vm_host(control_sock, &args.new_name, Some(record.id), true).await;
     }
     Ok(())
 }

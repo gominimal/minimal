@@ -625,6 +625,15 @@ pub struct BoxConfig {
     /// field. The daemon then records `project_path` as the root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_root: Option<paths::HostAbsPath>,
+    /// The name a `host_ip` grant box registered under with the VM host
+    /// daemon, when that is not the name the daemon gives the box. A fresh
+    /// instance registers under a creation key of its own, because the
+    /// daemon names it `<base>-<n>` only after the registration. The
+    /// daemon's id mint asks by this name. `None` for every other box, and
+    /// from a client that predates the field: the mint then asks by the
+    /// box's name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_ip_registration: Option<String>,
 }
 
 /// The client verb that asked for a box ([`BoxConfig::creating_verb`]).
@@ -1002,6 +1011,27 @@ pub struct HostIpBoxRequest {
 pub struct RetireHostIpBoxRequest {
     /// The session the box ran as.
     pub session_id: boxes::SessionId,
+    /// How the box ended. Required, with no default: a request that does
+    /// not say whether the box stopped or was destroyed is refused at
+    /// decode, because only a destroy revokes the box's id (BEP-043). A
+    /// client that predates the field also sends a retire on `min box
+    /// stop`, so a default of destroyed would revoke the id of a box that
+    /// `min box restart` brings back. Refused, nothing is retired or
+    /// revoked.
+    pub end: HostIpBoxEnd,
+}
+
+/// How a `host_ip` box left the VM host's resident set
+/// ([`RetireHostIpBoxRequest::end`]).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HostIpBoxEnd {
+    /// The box stopped. A restart can bring it back under the same id, so
+    /// its id is not revoked.
+    Stopped,
+    /// The box was destroyed. Its id is revoked at the Box Egress Proxy
+    /// when it declared a credentialed upstream (BEP-043).
+    Destroyed,
 }
 
 /// What side of the in-VM daemon reported a runtime-admitted port (NET-045,
@@ -2205,7 +2235,8 @@ impl CreateSessionRequest {
     /// a plain create sends: no handed addresses or box id, no task
     /// addresses, hooks on, not ended with a run, no attrs, no sealed
     /// deliveries, no root certificate, the session verb, no project root,
-    /// no version assertion, no spec, and no fresh instance.
+    /// no host-address registration name, no version assertion, no spec,
+    /// and no fresh instance.
     pub fn new(
         name: impl Into<String>,
         project_path: paths::HostAbsPath,
@@ -2228,6 +2259,7 @@ impl CreateSessionRequest {
                 root_certificate: None,
                 creating_verb: CreatingVerb::default(),
                 project_root: None,
+                host_ip_registration: None,
             },
             must_match_version: None,
             spec: None,

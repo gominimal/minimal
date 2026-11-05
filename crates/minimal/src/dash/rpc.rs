@@ -358,7 +358,7 @@ pub async fn prepare_attach(
             record.id,
             record.policy.egress.clone(),
             record.policy.credentialed_upstream.is_some(),
-            true,
+            crate::HostIpBoxChange::Admit,
         )
         .await
         && let Ok(None) = crate::attached_box_record(sock, record.id).await
@@ -367,7 +367,7 @@ pub async fn prepare_attach(
             minimal_client::box_registration::vm_host_control_sock(sock),
             record.id,
             None,
-            false,
+            crate::HostIpBoxChange::Retire(crate::HostIpBoxEnd::Destroyed),
         )
         .await;
     }
@@ -385,7 +385,7 @@ async fn settle_destroyed_box(sock: &Path, id: SessionId, record: &boxes::Record
             minimal_client::box_registration::vm_host_control_sock(sock),
             id,
             None,
-            false,
+            crate::HostIpBoxChange::Retire(crate::HostIpBoxEnd::Destroyed),
         )
         .await;
     }
