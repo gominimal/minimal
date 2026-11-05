@@ -3365,16 +3365,29 @@ STUB
     # runs — the bind in that window fires nothing. The step therefore
     # waits, briefly, for the socket to appear and then places the holder.
     # The stand-in: the daemon's fd table is recreated the way the skipped
-    # pass above left it gone, and the socket's net/unix line appears a
-    # moment after the step has already looked and found nothing, as if
-    # bound mid-run.
+    # pass above left it gone, and the socket's net/unix line appears only
+    # after the step has already looked and found nothing, as if bound
+    # mid-run. The writer waits for the step's own "waiting for the daemon
+    # to bind it" note before publishing the line, so the socket really is
+    # bound after the first failed lookup — a fixed sleep here would race
+    # the step's own wait: if the step reached its first lookup late, the
+    # inode would already be listed and the step would never say it waited.
     mkdir -p "$fproc/4242/fd"
     ln -s 'socket:[777]' "$fproc/4242/fd/5"
     printf 'Name:\tminimald\nUid:\t%s\t%s\t%s\t%s\n' "$me" "$me" "$me" "$me" >"$fproc/4242/status"
     printf '0::/user.slice/user-%s.slice/session-1.scope\n' "$me" >"$fproc/4242/cgroup"
     {
         printf 'Num       RefCount Protocol Flags    Type St Inode Path\n'
-        sleep 1
+        late_out="$root/hc.place_listener_late"
+        n=0
+        until grep -q 'waiting for the daemon to bind it' "$late_out" 2>/dev/null; do
+            n=$((n + 1))
+            # Bound the wait so a step that never says it looked cannot hang
+            # the suite; a timeout means the socket stays unbound, which the
+            # assertions below already fail loudly.
+            [ "$n" -lt 100 ] || exit 0
+            sleep 0.1
+        done
         printf '0000 00000002 00000000 00010000 0001 01 777 %s\n' "$lsock"
     } >"$fproc/net/unix" &
     netunix_writer=$!

@@ -578,6 +578,16 @@ place_listener() {
         sleep 1
         inodes="$(awk -v p="$listener" '$8 == p { print $7 }' "$PROC/net/unix")"
     done
+    # A daemon that binds after this loop's last lookup but before the
+    # manager rearms the directory watch is still missed: PathChanged=
+    # reports changes, not states, and the rearm lands only at this
+    # oneshot's exit. The miss is bounded — the daemon's next directory
+    # event (the socket's unlink at shutdown, its re-bind at restart)
+    # re-fires the unit and places the holder then — so closing the window
+    # outright would take a manager-clocked reconciliation (a timer unit
+    # re-running this step), a change to the unit set `min
+    # finalize-install` installs, not to this step. Resisted here on
+    # purpose; the bounded wait above is the whole of the step-local fix.
     if [ -z "$inodes" ]; then
         note "no process holds $listener: nothing to place"
         return 0
