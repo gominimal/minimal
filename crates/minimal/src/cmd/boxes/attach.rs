@@ -575,6 +575,27 @@ pub enum BoxAttachRefusal {
         /// Each host that did not answer.
         hosts: Vec<String>,
     },
+    /// With `--exec`, the box has no exec of that id, live or ended. Exit 4.
+    NoSuchExec {
+        /// The box as the caller named it.
+        address: String,
+        /// The exec id as the caller gave it.
+        exec_id: String,
+    },
+    /// With `--exec`, the exec ended. Exit 4.
+    ExecEnded {
+        /// The box as the caller named it.
+        address: String,
+        /// The exec's id.
+        exec_id: String,
+    },
+    /// With `--exec`, the exec runs without a terminal. Exit 2.
+    NoTerminalInExec {
+        /// The box as the caller named it.
+        address: String,
+        /// The exec's id.
+        exec_id: String,
+    },
     /// The connection to the box's host failed during the attach. Exit 7.
     ConnectionLost {
         /// The host of the box.
@@ -590,8 +611,11 @@ impl BoxAttachRefusal {
     /// unreachable host.
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::NoTerminal | Self::NoTerminalInBox { .. } | Self::Ambiguous { .. } => 2,
-            Self::NoCandidate => 4,
+            Self::NoTerminal
+            | Self::NoTerminalInBox { .. }
+            | Self::NoTerminalInExec { .. }
+            | Self::Ambiguous { .. } => 2,
+            Self::NoCandidate | Self::NoSuchExec { .. } | Self::ExecEnded { .. } => 4,
             Self::Unreachable { .. } | Self::ConnectionLost { .. } => 7,
         }
     }
@@ -603,6 +627,9 @@ impl BoxAttachRefusal {
             Self::NoTerminalInBox { .. } => "box has no terminal",
             Self::Ambiguous { .. } => "ambiguous",
             Self::NoCandidate => "no candidate",
+            Self::NoSuchExec { .. } => "exec not found",
+            Self::ExecEnded { .. } => "exec ended",
+            Self::NoTerminalInExec { .. } => "exec has no terminal",
             Self::Unreachable { .. } => "host unreachable",
             Self::ConnectionLost { .. } => "connection lost",
         }
@@ -640,6 +667,21 @@ impl std::fmt::Display for BoxAttachRefusal {
             Self::NoCandidate => write!(
                 f,
                 "No box with a terminal in this project. Start one with min box start."
+            ),
+            // BCLI-068: the exact wording the plan task fixes.
+            Self::NoSuchExec { address, exec_id } => {
+                write!(f, "{address} has no exec {exec_id}.")
+            }
+            Self::ExecEnded { address, exec_id } => write!(
+                f,
+                "Exec {exec_id} has ended. \
+                 Read its output with min box logs {address} --exec {exec_id}, \
+                 or its exit code with min box wait {address} --exec {exec_id}."
+            ),
+            Self::NoTerminalInExec { address, exec_id } => write!(
+                f,
+                "Exec {exec_id} in {address} has no terminal to attach to. \
+                 Run `min box logs {address} --exec {exec_id}` to see its output."
             ),
             Self::Unreachable { hosts } => {
                 let (noun, verb) = if hosts.len() == 1 {
@@ -722,6 +764,30 @@ pub(crate) fn ensure_box_attach_tty(stdin_is_tty: bool) -> Result<(), BoxAttachR
 pub async fn cmd_box_attach(global: &GlobalArgs, args: BoxAttachArgs) -> Result<(), anyhow::Error> {
     let stdin_is_tty = std::io::stdin().is_terminal();
     ensure_box_attach_tty(stdin_is_tty)?;
+    if let Some(exec_id) = args.exec.as_deref() {
+        // clap refuses `--exec` without a box (BCLI-068), so this holds.
+        let address = args
+            .target
+            .as_deref()
+            .context("min box attach --exec needs a box")?;
+        ensure_daemon(global)?;
+        let hosts = crate::cmd::list::local_hosts(global)?;
+        let kind = daemon_host_kind(global);
+        let ending = box_attach_exec_on_hosts(
+            hosts,
+            address,
+            exec_id,
+            stdin_is_tty,
+            async |target: &BoxAttachTarget, exec_id: &minimald_rpc::exec::ExecId| {
+                attach_exec_by_id(kind, &target.host.sock, target.box_id, exec_id).await
+            },
+        )
+        .await?;
+        if let Some(notice) = &ending.notice {
+            eprintln!("{notice}");
+        }
+        return Err(Handoff::Exit(ending.code).into());
+    }
     let scope = match args.target {
         Some(_) => None,
         None => {
@@ -757,6 +823,333 @@ pub async fn cmd_box_attach(global: &GlobalArgs, args: BoxAttachArgs) -> Result<
         eprintln!("{notice}");
     }
     Err(Handoff::Exit(ending.code).into())
+}
+
+/// What the box's records say of an exec id that `min box attach --exec`
+/// names, in the order its refusals are checked (BCLI-068).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecFound {
+    /// The box has no exec of that id, live or ended.
+    Unknown,
+    /// The exec ended.
+    Ended,
+    /// The exec runs without a terminal.
+    NoTerminal,
+    /// The exec runs with a terminal.
+    Terminal,
+}
+
+/// Classifies the exec `exec_id` from the box's `events`, the ids the host
+/// lists as live (`live_execs`), and whether the box runs. An exec of a box
+/// that does not run has ended, even if no end event was written for it.
+///
+/// Interim: `ShowBox.live_execs` stays empty until
+/// <https://github.com/gominimal/minimal/issues/2404> fills it, so a started
+/// exec with no `exec_exited` event in a running box counts as live here.
+/// Once #2404 fills `live_execs`, only `live_execs` decides whether an exec
+/// is live, and the events decide only its terminal.
+pub(crate) fn exec_found(
+    events: &[boxes::events::BoxEvent],
+    live_execs: &[String],
+    box_running: bool,
+    exec_id: &str,
+) -> ExecFound {
+    use boxes::events::{BoxEventType, exec_data};
+
+    let names = |event: &&boxes::events::BoxEvent| {
+        event.data.get(exec_data::EXEC_ID).and_then(|v| v.as_str()) == Some(exec_id)
+    };
+    let started = events
+        .iter()
+        .filter(names)
+        .rfind(|event| event.kind == BoxEventType::ExecStarted);
+    let exited = events
+        .iter()
+        .filter(names)
+        .any(|event| event.kind == BoxEventType::ExecExited);
+    let live = live_execs.iter().any(|id| id == exec_id);
+    if started.is_none() && !live {
+        return ExecFound::Unknown;
+    }
+    if !live && (exited || !box_running) {
+        return ExecFound::Ended;
+    }
+    let pty = started.and_then(|event| {
+        event
+            .data
+            .get(exec_data::PTY)
+            .and_then(|v| v.as_bool())
+            .or_else(|| {
+                event
+                    .data
+                    .get(exec_data::MODE)
+                    .and_then(|v| v.as_str())
+                    .map(|mode| mode == "tty")
+            })
+    });
+    // A live id with no start event, or a start event that says nothing of
+    // a terminal, leaves the terminal check to the host.
+    if pty == Some(false) {
+        ExecFound::NoTerminal
+    } else {
+        ExecFound::Terminal
+    }
+}
+
+/// Every event the box `box_id` kept, read once. `address` names the box
+/// in the errors.
+async fn read_kept_events(
+    client: &mut client::Client,
+    box_id: boxes::SessionId,
+    address: &str,
+) -> Result<Vec<boxes::events::BoxEvent>, anyhow::Error> {
+    use minimald_rpc::ReadEventsUpdate;
+
+    let unreadable = || {
+        anyhow::anyhow!(
+            "Could not read the events of box {address}, so the exec was not found. \
+             Run `min box show {address}` to check that the box still exists."
+        )
+    };
+    let mut lines = client.read_box_events(box_id, false).await.map_err(|e| {
+        tracing::warn!(verb = "box attach", box_id = %box_id, "open the events read: {e:#}");
+        unreadable()
+    })?;
+    let mut events = Vec::new();
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => {
+                tracing::warn!(verb = "box attach", box_id = %box_id, "the events read ended early");
+                return Err(unreadable());
+            }
+            Err(e) => {
+                tracing::warn!(verb = "box attach", box_id = %box_id, "read an events line: {e:#}");
+                return Err(unreadable());
+            }
+        };
+        match serde_json_lenient::from_str::<ReadEventsUpdate>(&line) {
+            Ok(ReadEventsUpdate::Event { event }) => events.push(event),
+            Ok(ReadEventsUpdate::Done | ReadEventsUpdate::Reaped) => return Ok(events),
+            Ok(ReadEventsUpdate::Failed { error }) => {
+                tracing::warn!(verb = "box attach", box_id = %box_id, "the events read failed: {error}");
+                return Err(unreadable());
+            }
+            Err(e) => {
+                tracing::warn!(verb = "box attach", box_id = %box_id, line, "decode an events line: {e}");
+                return Err(unreadable());
+            }
+        }
+    }
+}
+
+/// The box and the exec `min box attach <box> --exec <id>` attaches to.
+/// The box resolves as every `min box` verb resolves an address. The exec
+/// is refused when the box has no exec of that id, then when it ended,
+/// then when it has no terminal (BCLI-068).
+pub(crate) async fn box_attach_exec_target(
+    hosts: Vec<crate::cmd::list::LocalHost>,
+    address: &str,
+    exec_id: &str,
+) -> Result<(BoxAttachTarget, minimald_rpc::exec::ExecId), anyhow::Error> {
+    use minimald_rpc::{Errorable, ShowBox, ShowBoxRequest};
+
+    let ResolvedBox { host, box_id } = resolve_box_on_hosts(hosts, address, "box attach").await?;
+    let mut client = box_host_client(&host).await?;
+    let shown = match client
+        .oneshot_rpc::<ShowBox>(ShowBoxRequest { id: box_id })
+        .await
+        .context("ShowBox RPC failed")?
+    {
+        Errorable::Ok(shown) => shown,
+        Errorable::Err { error } if error.starts_with(minimald_rpc::UNKNOWN_SESSION_ID_LEAD) => {
+            tracing::info!(verb = "box attach", box_id = %box_id, outcome = "not found");
+            return Err(BoxAddressRefusal::NotFound {
+                address: address.to_owned(),
+            }
+            .into());
+        }
+        Errorable::Err { error } => bail!("{error}"),
+    };
+    let events = read_kept_events(&mut client, box_id, address).await?;
+    let parsed = minimald_rpc::exec::ExecId::parse(exec_id).ok();
+    let found = match &parsed {
+        Some(id) => exec_found(
+            &events,
+            &shown.live_execs,
+            shown.record.state == "running",
+            id.as_str(),
+        ),
+        None => ExecFound::Unknown,
+    };
+    let refusal = match found {
+        ExecFound::Unknown => Some(BoxAttachRefusal::NoSuchExec {
+            address: address.to_owned(),
+            exec_id: exec_id.to_owned(),
+        }),
+        ExecFound::Ended => Some(BoxAttachRefusal::ExecEnded {
+            address: address.to_owned(),
+            exec_id: exec_id.to_owned(),
+        }),
+        ExecFound::NoTerminal => Some(BoxAttachRefusal::NoTerminalInExec {
+            address: address.to_owned(),
+            exec_id: exec_id.to_owned(),
+        }),
+        ExecFound::Terminal => None,
+    };
+    if let Some(refusal) = refusal {
+        tracing::info!(
+            verb = "box attach",
+            box_id = %box_id,
+            exec_id,
+            outcome = refusal.outcome()
+        );
+        return Err(refusal.into());
+    }
+    let exec_id = parsed.expect("only a parsed id names a terminal exec");
+    Ok((
+        BoxAttachTarget {
+            host,
+            box_id,
+            name: shown.record.name,
+            label: address.to_owned(),
+        },
+        exec_id,
+    ))
+}
+
+/// `min box attach <box> --exec <id>` over the local `hosts`: refuses a
+/// caller with no terminal, finds the box and the exec
+/// ([`box_attach_exec_target`]), runs `attach` on them, and reads how the
+/// attach ended ([`exec_attach_ending`]).
+pub(crate) async fn box_attach_exec_on_hosts<A>(
+    hosts: Vec<crate::cmd::list::LocalHost>,
+    address: &str,
+    exec_id: &str,
+    stdin_is_tty: bool,
+    attach: A,
+) -> Result<AttachEnding, anyhow::Error>
+where
+    A: AsyncFnOnce(&BoxAttachTarget, &minimald_rpc::exec::ExecId) -> Result<i32, anyhow::Error>,
+{
+    ensure_box_attach_tty(stdin_is_tty)?;
+    let (target, exec_id) = box_attach_exec_target(hosts, address, exec_id).await?;
+    tracing::info!(
+        verb = "box attach",
+        box_id = %target.box_id,
+        host = %target.host.host,
+        exec_id = %exec_id,
+        outcome = "attaching"
+    );
+    let code = attach(&target, &exec_id).await.inspect_err(|err| {
+        tracing::info!(verb = "box attach", box_id = %target.box_id, exec_id = %exec_id, outcome = "error", "{err:#}");
+    })?;
+    if code == SSH_CONNECTION_FAILED {
+        let refusal = BoxAttachRefusal::ConnectionLost {
+            host: target.host.host.clone(),
+            address: format!("{} --exec {exec_id}", target.label),
+        };
+        tracing::info!(
+            verb = "box attach",
+            box_id = %target.box_id,
+            exec_id = %exec_id,
+            outcome = refusal.outcome(),
+            "{refusal}"
+        );
+        return Err(refusal.into());
+    }
+    // A stop ends the exec, by its signal or with its own code, before the
+    // daemon writes the stopped record, so every code reads the box again.
+    let settle = if code == DAEMON_ENDED_ATTACH {
+        DAEMON_END_SETTLE
+    } else {
+        ENTRYPOINT_END_SETTLE
+    };
+    let after = box_after_attach_settled(&target.host, target.box_id, settle).await;
+    let ending = exec_attach_ending(&target, &exec_id, code, &after)?;
+    tracing::info!(
+        verb = "box attach",
+        box_id = %target.box_id,
+        exec_id = %exec_id,
+        exec_exit = code,
+        exit = ending.code,
+        outcome = if ending.code == DAEMON_ENDED_ATTACH { "ended by the host" } else { "ended" },
+        "attach ended"
+    );
+    Ok(ending)
+}
+
+/// How an exec attach that ended with ssh's `code` ends the command, from
+/// what the host said of the box afterwards. It follows [`attach_ending`]:
+/// a stop, a removal or another terminal's attach ends with 254 and its
+/// line. A detach or the exec's own end is 0, whatever code the exec ended
+/// with. `min box wait <box> --exec <id>` reads that code. ssh's own 255 is
+/// a lost connection, and its retry names `--exec <id>`.
+pub(crate) fn exec_attach_ending(
+    target: &BoxAttachTarget,
+    exec_id: &minimald_rpc::exec::ExecId,
+    code: i32,
+    after: &BoxAfterAttach,
+) -> Result<AttachEnding, BoxAttachRefusal> {
+    match (code, after) {
+        (SSH_CONNECTION_FAILED, _) => Err(BoxAttachRefusal::ConnectionLost {
+            host: target.host.host.clone(),
+            address: format!("{} --exec {exec_id}", target.label),
+        }),
+        (DAEMON_ENDED_ATTACH, _) => attach_ending(target, code, after),
+        (_, BoxAfterAttach::Gone) => Ok(AttachEnding {
+            code: DAEMON_ENDED_ATTACH,
+            notice: Some(format!("Detached: {} was removed.", target.label)),
+        }),
+        // A stopped box ends with 254 and its line. Any other box ends
+        // with 0: the exec ended by itself or the caller detached.
+        _ => attach_ending(target, 0, after),
+    }
+}
+
+/// Connects this terminal to the terminal exec `exec_id` in box `id` on
+/// the daemon at `sock`, through `ssh -tt`, as `min box exec -t` does after
+/// it starts one. Returns ssh's exit status, which is the exec's.
+async fn attach_exec_by_id(
+    kind: paths::HostKind,
+    sock: &std::path::Path,
+    id: boxes::SessionId,
+    exec_id: &minimald_rpc::exec::ExecId,
+) -> Result<i32, anyhow::Error> {
+    // A VM-backed box gets its row and its name hold back first, as
+    // `min box exec` does.
+    let record = match control_sock_beside(sock).filter(|control| control.exists()) {
+        Some(_) => attached_box_record(sock, id).await.unwrap_or_else(|error| {
+            tracing::warn!(
+                "could not read the box's record ({error:#}); its box row is not asked back first"
+            );
+            None
+        }),
+        None => None,
+    };
+    resume_box_row(sock, record.as_ref()).await?;
+    rehold_held_name_before_attach(kind, sock, id, record.as_ref()).await;
+
+    let wire = minimald_rpc::exec::ExecRequest::ExecAttach(exec_id.clone()).encode();
+    let ssh = minimal_client::attach::attach_command(sock, id, Some(&wire), None)?;
+    // `-tt` before the other arguments, so ssh asks for a terminal.
+    let mut forced = std::process::Command::new(ssh.get_program());
+    forced.arg("-tt").args(ssh.get_args());
+    for (name, value) in ssh.get_envs() {
+        match value {
+            Some(value) => forced.env(name, value),
+            None => forced.env_remove(name),
+        };
+    }
+    tokio::task::spawn_blocking(move || {
+        interactive_attach(forced, true, crate::attach::TerminalUnwind::arm, |ssh| {
+            let real = minimal_client::tty_relay::RealTty::acquire()
+                .context(crate::attach::TerminalNotTaken)?;
+            minimal_client::attach::run_interactive_attach_on(ssh, real, None)
+        })
+    })
+    .await
+    .context("the terminal attach's thread failed")?
 }
 
 /// The exit code an attach through [`box_via_ssh`] ended with: the code of
