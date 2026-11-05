@@ -148,6 +148,11 @@ pub struct Connection {
     /// session that ended.
     past_kex: bool,
 
+    /// Set when authentication succeeds. A peer can ask for ssh-userauth
+    /// and hang up before it authenticates; only one that got here had a
+    /// session.
+    authenticated: bool,
+
     serv: ServerStateHandle,
 }
 
@@ -175,6 +180,7 @@ impl Connection {
             created_sessions: Vec::new(),
             liveness: Some(Arc::new(())),
             past_kex: false,
+            authenticated: false,
             serv,
         })));
 
@@ -248,6 +254,11 @@ impl ConnectionHandle {
         self.0.lock().await.past_kex
     }
 
+    /// Whether the peer authenticated (see [`Connection::authenticated`]).
+    pub async fn authenticated(&self) -> bool {
+        self.0.lock().await.authenticated
+    }
+
     /// Ends this connection's liveness: its sessions stop counting it as a
     /// live creator from here on, even if a stray handle clone outlives the
     /// teardown. Called last at connection teardown, once the unfinalized
@@ -304,6 +315,11 @@ impl russh::server::Handler for ConnectionHandler {
     async fn authentication_banner(&mut self) -> Result<Option<String>, Self::Error> {
         self.0.lock().await.past_kex = true;
         Ok(None)
+    }
+
+    async fn auth_succeeded(&mut self, _: &mut Session) -> Result<(), Self::Error> {
+        self.0.lock().await.authenticated = true;
+        Ok(())
     }
 
     async fn auth_none(&mut self, user: &str) -> Result<russh::server::Auth, Self::Error> {

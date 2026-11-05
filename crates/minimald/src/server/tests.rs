@@ -388,6 +388,59 @@ async fn a_peer_that_fails_key_exchange_after_its_id_is_a_failed_handshake() {
     );
 }
 
+/// A peer that gets through key exchange and asks for ssh-userauth, but
+/// hangs up without authenticating, had no session: its `conn` outcome is
+/// `closed_before_auth`, and only the client that authenticates is a
+/// `session`.
+#[tokio::test]
+async fn a_peer_that_never_authenticates_is_not_a_session() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let log = crate::test_harness::SpanLog::default();
+    let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+    let dir = TempDir::new().unwrap();
+    let (run, sock) = spawn_server(&dir);
+
+    let stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+    let mut peer = russh::client::connect_stream(
+        std::sync::Arc::new(russh::client::Config::default()),
+        stream,
+        crate::test_harness::TestClientHandler,
+    )
+    .await
+    .unwrap();
+    // The daemon takes no passwords: the request is refused, after the
+    // ssh-userauth service was granted.
+    let auth = peer.authenticate_password("test", "wrong").await.unwrap();
+    assert!(!auth.success());
+    drop(peer);
+    first_conn_once_closed(&log).await;
+
+    let mut client = connect_uds(&sock).await;
+    let resp = client.call::<GetVersion>(&()).await;
+    assert!(!resp.version.is_empty());
+    let _ = client
+        .call::<Shutdown>(&ShutdownRequest { force: false })
+        .await;
+    drop(client);
+    let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+
+    let outcomes: Vec<Option<String>> = log
+        .spans()
+        .iter()
+        .filter(|s| s.name == "conn")
+        .map(|s| s.field("outcome").map(str::to_owned))
+        .collect();
+    assert_eq!(
+        outcomes,
+        [
+            Some("closed_before_auth".to_owned()),
+            Some("session".to_owned())
+        ],
+        "{:#?}",
+        log.spans()
+    );
+}
+
 /// A connection that connects and never sends its SSH id line must not
 /// stall the accept loop: a second connection completes a full handshake
 /// and a `GetVersion` RPC while the silent one is still open.

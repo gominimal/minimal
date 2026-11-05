@@ -1386,9 +1386,9 @@ impl Server {
                     // transport.
                     let ended = session_fut.await;
                     let past_kex = conn_hnd.past_kex().await;
-                    let outcome = if past_kex {
+                    let outcome = if conn_hnd.authenticated().await {
                         "session"
-                    } else if ended.as_ref().is_err_and(|e| !closed_by_peer(e)) {
+                    } else if !past_kex && ended.as_ref().is_err_and(|e| !closed_by_peer(e)) {
                         "handshake_failed"
                     } else {
                         "closed_before_auth"
