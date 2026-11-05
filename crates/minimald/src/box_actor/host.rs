@@ -145,7 +145,17 @@ fn run_lane_nft(
     verb: &str,
     leaf: &std::path::Path,
 ) -> std::io::Result<()> {
-    let nft_verb = if verb == "lane-add" { "add" } else { "delete" };
+    // The helper refuses a verb it does not know, and so does this path.
+    let nft_verb = match verb {
+        "lane-add" => "add",
+        "lane-remove" => "delete",
+        other => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{other} is not a lane verb"),
+            ));
+        }
+    };
     let rel = leaf.strip_prefix(mount).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -2530,8 +2540,9 @@ mod quic443_cohort_tests {
     }
 
     /// BEP-083 on the root daemon's path: `run_lane_nft` hands `nft` the
-    /// element for the leaf's path below the mount, in the table's lane set,
-    /// and refuses a leaf that is not below the mount without running `nft`.
+    /// element for the leaf's path below the mount, in the table's lane set.
+    /// It refuses a leaf that is not below the mount, and a verb that is not
+    /// a lane verb, without running `nft`.
     #[test]
     fn root_lane_change_runs_nft_on_the_lane_set() {
         use crate::net::classifier::{nft_calls, recording_nft};
@@ -2574,6 +2585,15 @@ mod quic443_cohort_tests {
             nft_calls(stub.path()).len(),
             2,
             "no nft call for the refusal"
+        );
+
+        let unknown = super::run_lane_nft(&nft, mount.path(), "lane-flush", &leaf)
+            .expect_err("an unknown verb is refused");
+        assert_eq!(unknown.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            nft_calls(stub.path()).len(),
+            2,
+            "no nft call for the unknown verb"
         );
     }
 }
