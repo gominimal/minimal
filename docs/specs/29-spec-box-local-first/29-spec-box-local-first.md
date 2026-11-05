@@ -327,6 +327,34 @@ After this ships, a developer on a stock install with no identity plane runs ses
   verify:   cargo nextest run -p mfile expansion_order_and_merge_rules
   property: For every set of layers, expansion equals the fold of the merge rule over the layers in the stated order.
 
+- **BOX-166** WHERE an expanded spec's `loadout_mode` is `sealed` THE SYSTEM SHALL apply no loadout at BOX-064's selected-loadouts layer, neither the client config's `default_loadouts` nor a loadout a flag names.
+  tier:     T0
+  verify:   cargo nextest run -p mfile sealed_spec_applies_no_loadout
+  <!-- architecture expansion order step 6, "selected loadouts (subject to loadout_mode)"; optional-feature on the setting; gominimal/minimal#3068 -->
+
+- **BOX-167** WHERE an expanded spec's `loadout_mode` is `open` THE SYSTEM SHALL apply each selected loadout whole, with its config-file patches read under the client's `[loadout-file-rules]`.
+  tier:     T0
+  verify:   cargo nextest run -p mfile open_spec_applies_whole_loadout
+
+- **BOX-168** THE SYSTEM SHALL supply `loadout_mode = "open"` as the type default of the `session` built-in root.
+  tier:     T0
+  verify:   cargo nextest run -p mfile builtin_roots_default_loadout_mode
+
+- **BOX-169** THE SYSTEM SHALL supply `loadout_mode = "sealed"` as the type default of the `task` built-in root.
+  tier:     T0
+  verify:   cargo nextest run -p mfile builtin_roots_default_loadout_mode
+  <!-- the architecture's shipped-types table; the agent, service, build and container-build defaults stay with gominimal/inbox#678, which defines those types (BOX-063) -->
+
+- **BOX-170** THE SYSTEM SHALL decide whether to apply a selected loadout from the expanded spec's `loadout_mode` alone, whatever the box's type name.
+  tier:     T0
+  verify:   cargo nextest run -p mfile loadout_gate_follows_setting_not_type_name
+  <!-- architecture design principle 8: a session entry set to sealed gets no loadout, and a type extending task that sets open gets its loadouts -->
+
+- **BOX-171** WHEN a box whose expanded spec sets `loadout_mode = "sealed"` is created while the client config names `default_loadouts` THE SYSTEM SHALL print nothing about the skipped loadouts.
+  tier:     T0
+  verify:   cargo nextest run -p minimal sealed_task_run_prints_nothing_about_loadouts
+  <!-- a healthy start prints nothing new (AGENTS.md); `min box spec <entry>` shows `loadout_mode` and the layer that set it (BCLI-021) -->
+
 - **BOX-065** THE SYSTEM SHALL produce an expanded spec whose serialization is byte-identical across two runs over one file, one set of command-line overrides and one client `[secret-store-rules]` set.
   tier:     T1
   verify:   cargo nextest run -p mfile expansion_is_byte_identical_across_runs
@@ -504,7 +532,9 @@ Moved to the sibling spec `docs/specs/28-spec-box-cli` (BCLI) when the grammar w
 - Choosing the entry a bare start creates from, the entry named `default` else the sole entry, and its exit 2 when a non-session entry named `default` blocks the implicit one: `docs/specs/28-spec-box-cli` (BCLI). This spec supplies the implicit entry (BOX-165).
 - Credentialed egress, the node-local egress proxy, `[network.bep]`, `[secrets]` resolution, `min auth`, `min secret`, and `min box audit`: the egress-proxy spec, `docs/specs/24-spec-box-egress-proxy` (BEP), and gominimal/minimal#1501.
 - Entries of type `agent`, `service`, `build` and `container-build`, including their expansion and validation, the `[agents.<name>]` and `[services.<name>]` tables, and their type-specific behaviour (the agent harness, hermetic builds): the Agent Box epic gominimal/inbox#678 and successors. BOX-063 refuses each such entry when it is expanded or created, until that epic's spec lands; BOX-059 keeps all six built-in types as data.
-- Two attribute rules, which follow the attribute on any type that sets it rather than any one type (architecture design principle 8): what ends a box whose spec sets `lifetime = "until_stopped"`, what happens when its entrypoint returns, and the `[execution] restart` policy that applies to it; and the gate that applies selected loadouts only where the spec's `loadout_mode` permits them (BOX-064 places the loadout layer in the order and does not gate it). Both go to the Agent Box epic gominimal/inbox#678 or its successor. This spec accepts, expands and projects both keys (BOX-071) and enforces neither.
+- One attribute rule, which follows the attribute on any type that sets it rather than any one type (architecture design principle 8): what ends a box whose spec sets `lifetime = "until_stopped"`, what happens when its entrypoint returns, and the `[execution] restart` policy that applies to it. It goes to the Agent Box epic gominimal/inbox#678 or its successor. This spec accepts, expands and projects the key (BOX-071) and does not enforce it. The `loadout_mode` gate on loadouts is in this spec (BOX-166 to BOX-171).
+- `loadout_mode = "upstream-only"`. This spec states `sealed` and `open` only.
+- The default `loadout_mode` of the `agent`, `service`, `build` and `container-build` types. gominimal/inbox#678 defines those types.
 - Changing a running box's spec: `min add` and any other runtime change, with the `package_added`, `port_exposed` and `file_exported` events it writes: a follow-up spec, not yet filed. A box here resumes from its creation-time spec (BOX-025).
 - Organization Box Types: resolving a type from an organization registry, and refusing a project type that redefines an organization type's name: the Gatehouse directory work, gominimal/inbox#579. Until it lands, BOX-059 resolves only built-in and project types, and `type.source` in the projection (BOX-071) is `builtin` or `project`.
 - Spec sections this spec accepts and carries but does not enforce, each warned of at creation (BOX-076): `[[file_imports]]` and `[[file_exports]]`, whose schema validation the Agent Box epic gominimal/inbox#678 owns while the copy itself is unowned, a follow-up; `[[github_imports]]`, unowned, a follow-up (the clone is the broker's creation-time mint under Gatehouse §6.3); `[otel]`, the observability epic gominimal/inbox#515 and the Agent Box epic gominimal/inbox#678's telemetry receiver; and `[network] vpn_network_names`, the mesh spec MRF (gominimal/minimal#1420). A project's `[secret-store-rules]`, `[package-file-rules]` and `[loadout-file-rules]` are not carried: BOX-076 leaves them out with a warning, as BEP-037 does for the first.
@@ -586,6 +616,8 @@ Moved to the sibling spec `docs/specs/28-spec-box-cli` (BCLI) when the grammar w
 **The first slice has an observer.** Decided on 2026-10-05: listing records with their states (BOX-158) and reading one (BOX-159) are operations here, and the first slice pulls BCLI-001 and BCLI-003 forward to render them, so a person can see that a stopped session was retained. The alternative, relying on today's session listing, was rejected because it renders the old three-state session model and shows neither `stopped` nor `exited`.
 
 **Attribute rules and runtime changes have named owners rather than requirements here.** Decided on 2026-10-05: `lifetime = "until_stopped"` with `[execution] restart`, and the `loadout_mode` gate on loadouts, are stated as attribute rules and sent to the Agent Box epic gominimal/inbox#678 or its successor; changing a running box's spec (`min add`, with `package_added`, `port_exposed` and `file_exported`) goes to a follow-up spec, and a box here resumes from its creation-time spec (BOX-025); organization types go to the Gatehouse directory work, gominimal/inbox#579. The alternative was a requirement for each in this spec, rejected to keep this spec to the record, the spec and its expansion, which every one of those builds on. Stating the first two as attribute rules rather than type behaviour keeps their destination explicit under design principle 8.
+
+**The `loadout_mode` gate moves into this spec.** Decided on 2026-11-05, reversing the 2026-10-05 decision for this one rule: BOX-166 to BOX-171 gate the selected-loadouts layer on the expanded spec's `loadout_mode`, and the session and task roots supply its defaults. The cause was gominimal/minimal#3068. With no gate, `min task run` applies the user's `default_loadouts` to every task, so a person's shell, editor, env vars and loadout hooks change what a task sees, and a task does not run the same way for everyone. The gate sits in the expansion this spec owns, so leaving it to gominimal/inbox#678 left that bug with no owner until that epic is specified. The gate keys on the setting, never the type name (design principle 8). The spec states `sealed` and `open`. `upstream-only` waits for a use, and the other four types' defaults stay with the epic that defines those types.
 
 **Unenforced sections are accepted and warned of, never silently dropped.** Decided on 2026-10-05: BOX-076 keeps accepting the whole `box.toml` schema, and the daemon warns once at creation for each section this spec does not enforce, naming it, with each section's owner listed under Non-goals; a project's `[secret-store-rules]` is left out with BEP-037's warning. Decided on 2026-10-06: a project's `[package-file-rules]` and `[loadout-file-rules]` get the same treatment, because both authorize reads of the client's filesystem outside the project subtree, and carrying a cloned file's `allow` rules into the stored spec would hand the follow-up that enforces them a spec that says to honour them. The alternative, refusing those sections until an owner enforces them, was rejected because epic story S9 accepts keys whether or not this host enforces them yet, and the architecture's own example uses them.
 
