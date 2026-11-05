@@ -217,6 +217,13 @@ wordmark() {
         "$b" "$rst" "$dim" "$sep" "$rst" >&2
 }
 
+# The installed min's daily update check (inbox#589) stays out of every `min`
+# this script runs: the probe, finalize-install and the daemon stops run
+# before the closing card discloses the check, so they mint no install id,
+# send nothing and print nothing.
+MINIMAL_UNDER_INSTALLER=1
+export MINIMAL_UNDER_INSTALLER
+
 # --- Mode dispatch: install (default) vs uninstall -------------------------
 
 # `--uninstall` as the FIRST argument switches to uninstall mode; it is parsed
@@ -1524,8 +1531,18 @@ mkdir -p "$state_dir"
 # pointer it installed, which is what "up to date" compares against.
 # Written whole then renamed, and recorded so --uninstall removes it.
 # A --version install followed no channel: it is `pinned`, which the check
-# answers with nothing, so it is never told a channel moved on.
-printf 'channel = "%s"\nmethod = "installer"\nkey = "%s"\n' "${target:-pinned}" "$VERSION" >"$state_dir/install.toml.tmp"
+# answers with nothing, so it is never told a channel moved on. `bin` names
+# the binary the file describes: another min on this machine (a development
+# build, a copy in another prefix) is not this install and ignores it. A
+# literal string, so a backslash in the path is kept; a path with a `'` makes
+# the file unreadable, and that min then reports as a `source` build.
+if [ "$version_set" -eq 1 ]; then
+    install_channel=pinned
+else
+    install_channel="$target"
+fi
+printf 'channel = "%s"\nmethod = "installer"\nkey = "%s"\nbin = '"'"'%s'"'"'\n' \
+    "$install_channel" "$VERSION" "$bindir/min" >"$state_dir/install.toml.tmp"
 mv -f "$state_dir/install.toml.tmp" "$state_dir/install.toml"
 record_generated install-metadata "$state_dir/install.toml"
 mv -f "$records" "$prev_record"
@@ -1730,15 +1747,18 @@ say ""
 say "  ${dim}docs.minimal.dev   $sep   discord.com/invite/qgX8sm6X7G$rst"
 # The update check's disclosure (inbox#589), for every install: this card is
 # the only one an install without a terminal (an agent's, a script's) reads,
-# so it says what is sent and names the switch. A channel install is told
-# when its channel moves on; a pinned (--version) one is counted but never
-# told, since no channel pointer applies to it.
-if [ -n "${target:-}" ]; then
-    say "  ${dim}min checks once a day for a newer $target release, sending its channel, version, OS,$rst"
+# so it lists every field the request sends, as the CLI's own disclosure
+# does, and names the switch. A channel install is told when its channel
+# moves on; a pinned (--version) one is counted but never told, since no
+# channel pointer applies to it.
+if [ "$version_set" -eq 1 ]; then
+    say "  ${dim}min reports this install once a day (no release notices for --version), sending its channel$rst"
+    say "  ${dim}(pinned), version, OS, architecture, install method and a random install id to update.minimal.dev.$rst"
 else
-    say "  ${dim}min reports this install once a day (no release notices for --version), sending its version, OS,$rst"
+    say "  ${dim}min checks once a day for a newer $target release, sending its channel, version, OS,$rst"
+    say "  ${dim}architecture, install method and a random install id to update.minimal.dev.$rst"
 fi
-say "  ${dim}architecture and a random install id to update.minimal.dev. Off: MINIMAL_TELEMETRY=0$rst"
+say "  ${dim}Off: MINIMAL_TELEMETRY=0$rst"
 say "  ${dim}docs.minimal.dev/reference/telemetry#update-check$rst"
 say ""
 }
