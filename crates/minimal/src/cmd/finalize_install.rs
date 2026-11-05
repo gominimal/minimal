@@ -739,7 +739,8 @@ pub(crate) mod linux {
         ANSWERER_PROGRAM_DIR, APPARMOR_DIR, APPARMOR_PROFILE_RECORD, CLASSIFIER_PROGRAM_PATH,
         CLASSIFIER_SCRIPT, CLASSIFIER_SCRIPT_HEREDOC, CLASSIFIER_SYSTEMD_UNIT,
         CLASSIFIER_TREE_RECORD, CLASSIFIER_TREE_ROOT, CLASSIFIER_UNIT_SERVICE_PATH,
-        KVM_GROUP_RECORD, PLACE_SYSTEMD_UNIT, PLACE_UNIT_PATH_PATH, PLACE_UNIT_SERVICE_PATH,
+        KVM_GROUP_RECORD, LEGACY_PLACE_UNIT_PATH_PATH, LEGACY_PLACE_UNIT_SERVICE_PATH,
+        PLACE_REQUEST_SOCKET, PLACE_SYSTEMD_UNIT, PLACE_UNIT_SERVICE_PATH, PLACE_UNIT_SOCKET_PATH,
     };
 
     pub(crate) const USERNS_ID: &str = "userns-profile";
@@ -1162,9 +1163,11 @@ pub(crate) mod linux {
     /// The step's block: the classifier's step written from the bytes this
     /// binary carries to its root-owned copy (beside the target, then moved
     /// over it) and run with no source identity, then the units — a boot
-    /// oneshot that re-runs the step, and the placement pair: a path unit
-    /// on the daemon's socket and the oneshot it starts — enabled, and the
-    /// placement run once for the daemon that may already be listening.
+    /// oneshot that re-runs the step, and the placement pair: a socket unit
+    /// the daemon connects to at start and the template service systemd
+    /// starts per connection — enabled, the path pair an earlier install
+    /// left removed, and the placement run once for the daemon that may
+    /// already be listening.
     ///
     /// `mask`, when there is one, is passed to the step as
     /// `--ct-mark-mask` both now and in the boot unit: the mask's record
@@ -1191,19 +1194,20 @@ pub(crate) mod linux {
              : > {CLASSIFIER_TREE_RECORD}\n\
              # The units: a boot oneshot re-runs the step from the copy (the tree lives\n\
              # in cgroupfs and the table in the kernel, so neither survives a reboot),\n\
-             # then the placement pair: the path unit fires when the daemon's socket\n\
-             # appears, and its service puts the listener in the daemon's leaf, so every\n\
-             # daemon start is placed without a root step of its own. A socket that\n\
-             # flaps past systemd's trigger limit leaves the path unit failed until\n\
-             # `systemctl reset-failed {PLACE_SYSTEMD_UNIT}.path`. Without systemd the\n\
-             # units are skipped, and each daemon start is placed by hand with the step.\n\
+             # then the placement pair: the daemon connects to the socket unit once its\n\
+             # own listener is bound, and the service systemd starts for the connection\n\
+             # puts the listener's holder in the daemon's leaf, so every daemon start is\n\
+             # placed without a root step of its own. The socket is systemd's, in /run,\n\
+             # so no inotify watch on a path under the account's home is needed. Without\n\
+             # systemd the units are skipped, and each daemon start is placed by hand\n\
+             # with the step.\n\
              if ! command -v systemctl >/dev/null 2>&1 ; then\n\
              \x20 echo 'note: no systemctl on this host: the placement unit is not installed, so place each daemon start by hand with the step'\n\
              else\n\
              cat > {CLASSIFIER_UNIT_SERVICE_PATH} <<\\MINIMAL_CLASSIFIER_SERVICE_EOF\n\
              [Unit]\n\
              Description=Install minimald's egress classifier tree and table\n\
-             Before={PLACE_SYSTEMD_UNIT}.path\n\
+             Before={PLACE_SYSTEMD_UNIT}.socket\n\
              \n\
              [Service]\n\
              Type=oneshot\n\
@@ -1212,33 +1216,44 @@ pub(crate) mod linux {
              [Install]\n\
              WantedBy=multi-user.target\n\
              MINIMAL_CLASSIFIER_SERVICE_EOF\n\
+             # The path pair an earlier install placed the daemon with goes first.\n\
+             systemctl disable --now {PLACE_SYSTEMD_UNIT}.path 2>/dev/null || true\n\
+             rm -f {LEGACY_PLACE_UNIT_PATH_PATH} {LEGACY_PLACE_UNIT_SERVICE_PATH}\n\
              cat > {PLACE_UNIT_SERVICE_PATH} <<\\MINIMAL_PLACE_SERVICE_EOF\n\
              [Unit]\n\
              Description=Place minimald's listener in its classifier leaf\n\
              \n\
              [Service]\n\
              Type=oneshot\n\
+             StandardInput=socket\n\
+             StandardOutput=journal\n\
+             StandardError=journal\n\
              ExecStart={CLASSIFIER_PROGRAM_PATH} --user '{operator}' --place-listener '{socket}'\n\
              MINIMAL_PLACE_SERVICE_EOF\n\
-             cat > {PLACE_UNIT_PATH_PATH} <<\\MINIMAL_PLACE_PATH_EOF\n\
+             cat > {PLACE_UNIT_SOCKET_PATH} <<\\MINIMAL_PLACE_SOCKET_EOF\n\
              [Unit]\n\
-             Description=Watch minimald's socket to place its listener\n\
+             Description=Take minimald's requests to place its listener\n\
              After={CLASSIFIER_SYSTEMD_UNIT}.service\n\
              \n\
-             [Path]\n\
-             PathChanged={socket}\n\
-             Unit={PLACE_SYSTEMD_UNIT}.service\n\
+             [Socket]\n\
+             ListenStream={PLACE_REQUEST_SOCKET}\n\
+             SocketUser={operator}\n\
+             SocketMode=0600\n\
+             Accept=yes\n\
+             MaxConnections=4\n\
              \n\
              [Install]\n\
-             WantedBy=multi-user.target\n\
-             MINIMAL_PLACE_PATH_EOF\n\
+             WantedBy=sockets.target\n\
+             MINIMAL_PLACE_SOCKET_EOF\n\
              chmod 0644 {CLASSIFIER_UNIT_SERVICE_PATH} {PLACE_UNIT_SERVICE_PATH} \
-             {PLACE_UNIT_PATH_PATH}\n\
+             {PLACE_UNIT_SOCKET_PATH}\n\
              systemctl daemon-reload\n\
              systemctl enable {CLASSIFIER_SYSTEMD_UNIT}.service\n\
-             systemctl enable --now {PLACE_SYSTEMD_UNIT}.path\n\
-             systemctl start {PLACE_SYSTEMD_UNIT}.service\n\
-             fi\n"
+             systemctl enable --now {PLACE_SYSTEMD_UNIT}.socket\n\
+             fi\n\
+             # The daemon that may already be listening is placed now; later starts ask\n\
+             # the socket unit.\n\
+             {CLASSIFIER_PROGRAM_PATH} --user '{operator}' --place-listener '{socket}'\n"
         )
     }
 
@@ -1428,15 +1443,20 @@ pub(crate) mod linux {
             .any(|path| std::path::Path::new(path).is_file());
         let units_enabled = systemctl.then(|| {
             let wants = "/etc/systemd/system/multi-user.target.wants";
+            let sockets = "/etc/systemd/system/sockets.target.wants";
             [
                 CLASSIFIER_UNIT_SERVICE_PATH.to_string(),
                 PLACE_UNIT_SERVICE_PATH.to_string(),
-                PLACE_UNIT_PATH_PATH.to_string(),
+                PLACE_UNIT_SOCKET_PATH.to_string(),
                 format!("{wants}/{CLASSIFIER_SYSTEMD_UNIT}.service"),
-                format!("{wants}/{PLACE_SYSTEMD_UNIT}.path"),
+                format!("{sockets}/{PLACE_SYSTEMD_UNIT}.socket"),
             ]
             .iter()
             .all(|path| std::path::Path::new(path).exists())
+                // The path pair an earlier install left is the placement
+                // that SELinux can stop (gominimal/inbox#1206), so an
+                // install that still carries it is not done.
+                && !std::path::Path::new(LEGACY_PLACE_UNIT_PATH_PATH).exists()
         });
         // The tree is delegated to one account: the step chowns the boxes
         // subtree to it, so its owner is the account the install is for.
@@ -3190,8 +3210,9 @@ mod tests {
     fn classifier_step_places_the_daemon_on_every_start() {
         use crate::resolver::{
             CLASSIFIER_PROGRAM_PATH, CLASSIFIER_SCRIPT, CLASSIFIER_SCRIPT_HEREDOC,
-            CLASSIFIER_TREE_RECORD, CLASSIFIER_UNIT_SERVICE_PATH, PLACE_UNIT_PATH_PATH,
-            PLACE_UNIT_SERVICE_PATH,
+            CLASSIFIER_TREE_RECORD, CLASSIFIER_UNIT_SERVICE_PATH, LEGACY_PLACE_UNIT_PATH_PATH,
+            LEGACY_PLACE_UNIT_SERVICE_PATH, PLACE_REQUEST_SOCKET, PLACE_UNIT_SERVICE_PATH,
+            PLACE_UNIT_SOCKET_PATH,
         };
         use linux::{Cgroup2Mount, ClassifierFacts, classifier_item_over};
         let sock = "/home/alice/.local/state/minimal/providers/local-minimald0/ssh.sock";
@@ -3219,22 +3240,27 @@ mod tests {
             format!(": > {CLASSIFIER_TREE_RECORD}\n"),
             format!("cat > {CLASSIFIER_UNIT_SERVICE_PATH} <<"),
             format!("ExecStart={CLASSIFIER_PROGRAM_PATH} --user 'alice'\n"),
-            "Before=minimald-place.path\n".to_string(),
+            "Before=minimald-place.socket\n".to_string(),
+            // gominimal/inbox#1206: the earlier path pair goes, and the
+            // placement is a socket in /run the daemon connects to, so no
+            // inotify watch on a path under the account's home is needed.
+            "systemctl disable --now minimald-place.path 2>/dev/null || true\n".to_string(),
+            format!("rm -f {LEGACY_PLACE_UNIT_PATH_PATH} {LEGACY_PLACE_UNIT_SERVICE_PATH}\n"),
             format!("cat > {PLACE_UNIT_SERVICE_PATH} <<"),
+            "StandardInput=socket\nStandardOutput=journal\nStandardError=journal\n".to_string(),
             format!(
                 "ExecStart={CLASSIFIER_PROGRAM_PATH} --user 'alice' --place-listener '{sock}'\n"
             ),
-            format!("cat > {PLACE_UNIT_PATH_PATH} <<"),
+            format!("cat > {PLACE_UNIT_SOCKET_PATH} <<"),
             "After=minimald-classifier.service\n".to_string(),
-            format!("PathChanged={sock}\n"),
-            "Unit=minimald-place.service\n".to_string(),
+            format!("ListenStream={PLACE_REQUEST_SOCKET}\n"),
+            "SocketUser=alice\nSocketMode=0600\nAccept=yes\n".to_string(),
+            "WantedBy=sockets.target\n".to_string(),
             "WantedBy=multi-user.target\n".to_string(),
             "systemctl daemon-reload\n".to_string(),
             "systemctl enable minimald-classifier.service\n".to_string(),
-            "systemctl enable --now minimald-place.path\n".to_string(),
-            "systemctl start minimald-place.service\n".to_string(),
+            "systemctl enable --now minimald-place.socket\n".to_string(),
             "if ! command -v systemctl >/dev/null 2>&1 ; then\n".to_string(),
-            "systemctl reset-failed minimald-place.path".to_string(),
         ] {
             assert!(script.contains(&line), "the block runs {line:?}: {script}");
         }
@@ -3255,7 +3281,21 @@ mod tests {
                     .any(|line| !line.starts_with('#') && line.contains("systemctl")),
             "the step runs before and outside the systemd guard: {step_part}"
         );
-        assert!(unit_part.trim_end().ends_with("fi"), "{unit_part}");
+        // The daemon already listening is placed once the units are in,
+        // with or without systemd.
+        let (_, after_units) = unit_part
+            .rsplit_once("\nfi\n")
+            .expect("the unit guard closes");
+        assert!(
+            after_units.trim_end().ends_with(&format!(
+                "{CLASSIFIER_PROGRAM_PATH} --user 'alice' --place-listener '{sock}'"
+            )),
+            "{unit_part}"
+        );
+        assert!(
+            !script.contains("PathChanged="),
+            "no unit watches the daemon's socket: {script}"
+        );
         for absent in [
             "--pid",
             "--cohort-address",

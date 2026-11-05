@@ -2951,7 +2951,7 @@ proof_host_ip_deny_all() {
     # the common ancestor of its starting cgroup and the slice is the
     # root-owned hierarchy root — the barrier that stops a box climbing out
     # is the same fact that stops the daemon climbing in. The installer's
-    # --place-listener step is the placement the path unit `min
+    # --place-listener step is the placement the socket unit `min
     # finalize-install` installs makes at every daemon start: it finds the
     # daemon by the socket it holds, never by a pid anyone names, and the
     # placement probe is per launch, so the next box this daemon launches
@@ -8420,7 +8420,7 @@ setup_classifier_note() {
 # the unit's journal, which this run's own output never carries.
 setup_units_journal() {
   command -v journalctl >/dev/null 2>&1 || return 0
-  for unit in minimald-classifier.service minimald-place.path minimald-place.service; do
+  for unit in minimald-classifier.service minimald-place.socket 'minimald-place@*.service' minimald-place.path minimald-place.service; do
     echo "--- journal: $unit ---"
     sudo -n journalctl --no-pager -n 40 -u "$unit" 2>&1 || true
   done
@@ -8430,7 +8430,7 @@ setup_units_journal() {
 # SETUP_CLASSIFIER_INSTALLED): the cases that run the script are about names,
 # and the two classifier proofs later in the lane install their own and refuse
 # a host that already carries one, so the host must be as the case found it.
-# The order is the installer's: the daemon stops first (the path unit placed
+# The order is the installer's: the daemon stops first (the placement unit placed
 # it in the tree's daemon leaf, and the uninstall refuses while a process or
 # a live leaf holds the tree), the units go before the tree so no later
 # daemon start is placed and no boot re-installs it, then the step's own
@@ -8439,8 +8439,12 @@ setup_units_journal() {
 setup_classifier_teardown() {
   [ -n "${SETUP_CLASSIFIER_INSTALLED:-}" ] || return 0
   mnl stop --force >/dev/null 2>&1 || true
-  sudo -n systemctl disable --now minimald-place.path minimald-place.service \
-    minimald-classifier.service >/dev/null 2>&1 || true
+  # One unit per call: systemctl refuses a whole call that names a unit the
+  # host does not have.
+  for unit in minimald-place.socket minimald-place.path minimald-place.service \
+    minimald-classifier.service; do
+    sudo -n systemctl disable --now "$unit" >/dev/null 2>&1 || true
+  done
   # A box's leaf can outlive the stop by a moment; the uninstall is retried
   # over a bounded wait rather than failed on the first refusal.
   for _ in $(seq 1 20); do
@@ -8448,15 +8452,17 @@ setup_classifier_teardown() {
     sudo -n "$ROOT/scripts/install-host-classifier.sh" --uninstall >/dev/null 2>&1 && break
     sleep 0.5
   done
-  sudo -n rm -f /etc/systemd/system/minimald-place.path \
+  sudo -n rm -f /etc/systemd/system/minimald-place.socket \
+    '/etc/systemd/system/minimald-place@.service' \
+    /etc/systemd/system/minimald-place.path \
     /etc/systemd/system/minimald-place.service \
     /etc/systemd/system/minimald-classifier.service \
     /usr/local/lib/minimal/install-host-classifier.sh \
     /usr/local/lib/minimal/install-host-classifier.sh.new >/dev/null 2>&1 || true
   sudo -n rmdir /usr/local/lib/minimal >/dev/null 2>&1 || true
   sudo -n systemctl daemon-reload >/dev/null 2>&1 || true
-  sudo -n systemctl reset-failed minimald-place.path minimald-place.service \
-    minimald-classifier.service >/dev/null 2>&1 || true
+  sudo -n systemctl reset-failed minimald-place.socket minimald-place.path \
+    minimald-place.service minimald-classifier.service >/dev/null 2>&1 || true
   if [ -e /sys/fs/cgroup/minimald.slice ]; then
     return 1
   fi

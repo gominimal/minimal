@@ -1273,6 +1273,7 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
             .map_err(|e| MainError::IO(e, "listening to socket"))?;
 
         tracing::info!("Started listening on {}", cli.listen_on());
+        request_daemon_placement(tree_root).await;
         read_host_ip_enforcement_fact(tree_root);
         let (opts, ssh_name) = cli.ssh_args();
         tracing::info!(
@@ -1342,6 +1343,49 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
         Server::run(config, listener, log_release)
             .await
             .map_err(|e| MainError::IO(e, "serving on guest vsock"))
+    }
+}
+
+/// NET-079: asks the placement unit `min finalize-install` installs to put
+/// this native daemon in its classifier leaf, once the listener the placer
+/// finds it by is bound, and waits for the placer to finish, so the
+/// start-up reading below is taken from where the placement left the
+/// daemon. A daemon already in its leaf (a `Delegate=yes` unit, or the
+/// entry at start) asks for nothing, and a host without the unit answers
+/// at once. Each outcome is one line in the daemon's log.
+async fn request_daemon_placement(tree_root: &std::path::Path) {
+    use minimald::net::classifier::{self, PlaceRequest};
+    if minimald::guest::is_microvm_daemon() || classifier::daemon_fetch_leaf(tree_root).is_some() {
+        return;
+    }
+    let request = minimald::traced::spawn_blocking(|| {
+        classifier::request_daemon_placement(
+            std::path::Path::new(classifier::PLACE_REQUEST_SOCKET),
+            classifier::PLACE_REQUEST_WAIT,
+        )
+    })
+    .await;
+    match request {
+        Ok(PlaceRequest::Answered) => tracing::info!(
+            socket = classifier::PLACE_REQUEST_SOCKET,
+            placed = classifier::daemon_fetch_leaf(tree_root).is_some(),
+            "the placement unit answered this daemon's placement request"
+        ),
+        Ok(PlaceRequest::NoPlacer(e)) => tracing::info!(
+            socket = classifier::PLACE_REQUEST_SOCKET,
+            error = %e,
+            "no placement unit answers on this host, so nothing placed this daemon at start"
+        ),
+        Ok(PlaceRequest::NoAnswer(e)) => tracing::warn!(
+            socket = classifier::PLACE_REQUEST_SOCKET,
+            error = %e,
+            wait_secs = classifier::PLACE_REQUEST_WAIT.as_secs(),
+            "the placement unit did not finish placing this daemon in time"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "the placement request did not run"
+        ),
     }
 }
 

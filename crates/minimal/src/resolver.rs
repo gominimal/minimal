@@ -3636,15 +3636,31 @@ pub(crate) const CLASSIFIER_PROGRAM_PATH: &str =
     "/usr/local/lib/minimal/install-host-classifier.sh";
 
 /// The systemd unit pair that places the daemon's listener in its leaf on
-/// every daemon start: the path unit watches the daemon's socket, and the
-/// oneshot service it starts runs the step's `--place-listener`. The pair
-/// is why no daemon restart needs a root step of its own.
+/// every daemon start: a socket unit at [`PLACE_REQUEST_SOCKET`], which the
+/// daemon connects to once its own listener is bound, and the template
+/// service systemd starts for each connection, which runs the step's
+/// `--place-listener`. The pair is why no daemon restart needs a root step
+/// of its own. A socket in `/run` that systemd itself created needs no
+/// inotify watch, which SELinux policy can deny systemd for a socket under
+/// the account's home (gominimal/inbox#1206).
 #[cfg(any(test, not(target_os = "macos")))]
 pub(crate) const PLACE_SYSTEMD_UNIT: &str = "minimald-place";
 #[cfg(any(test, not(target_os = "macos")))]
-pub(crate) const PLACE_UNIT_PATH_PATH: &str = "/etc/systemd/system/minimald-place.path";
+pub(crate) const PLACE_UNIT_SOCKET_PATH: &str = "/etc/systemd/system/minimald-place.socket";
 #[cfg(any(test, not(target_os = "macos")))]
-pub(crate) const PLACE_UNIT_SERVICE_PATH: &str = "/etc/systemd/system/minimald-place.service";
+pub(crate) const PLACE_UNIT_SERVICE_PATH: &str = "/etc/systemd/system/minimald-place@.service";
+/// The socket the placement unit listens on. minimald spells it the same
+/// way (`PLACE_REQUEST_SOCKET` in `crates/minimald/src/net/classifier.rs`).
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const PLACE_REQUEST_SOCKET: &str = "/run/minimald-place.sock";
+/// The path unit and its oneshot an earlier install placed the daemon with,
+/// by watching the daemon's socket. The install removes them before it
+/// writes the socket pair, and `--undo` removes whichever it finds.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const LEGACY_PLACE_UNIT_PATH_PATH: &str = "/etc/systemd/system/minimald-place.path";
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const LEGACY_PLACE_UNIT_SERVICE_PATH: &str =
+    "/etc/systemd/system/minimald-place.service";
 
 /// The boot unit: a oneshot that re-runs the classifier's step from the
 /// root-owned copy at every boot, ordered before the path unit. The tree
@@ -3688,9 +3704,15 @@ fn linux_host_items_removal() -> String {
          stays; remove it with: apparmor_parser --remove {APPARMOR_DIR}/minimald && rm -f \
          {APPARMOR_DIR}/minimald {APPARMOR_DIR}/tunables/minimald' >&2\n\
          fi\n\
-         systemctl disable --now {PLACE_SYSTEMD_UNIT}.path {PLACE_SYSTEMD_UNIT}.service \
-         {CLASSIFIER_SYSTEMD_UNIT}.service 2>/dev/null || true\n\
-         rm -f {PLACE_UNIT_PATH_PATH} {PLACE_UNIT_SERVICE_PATH} {CLASSIFIER_UNIT_SERVICE_PATH} \
+         # One unit per call: systemctl refuses a whole call that names a unit this\n\
+         # host does not have, and an install carries either the socket pair or the\n\
+         # earlier path pair.\n\
+         for unit in {PLACE_SYSTEMD_UNIT}.socket {PLACE_SYSTEMD_UNIT}.path \
+         {PLACE_SYSTEMD_UNIT}.service {CLASSIFIER_SYSTEMD_UNIT}.service ; do\n\
+         \x20 systemctl disable --now \"$unit\" 2>/dev/null || true\n\
+         done\n\
+         rm -f {PLACE_UNIT_SOCKET_PATH} {PLACE_UNIT_SERVICE_PATH} {LEGACY_PLACE_UNIT_PATH_PATH} \
+         {LEGACY_PLACE_UNIT_SERVICE_PATH} {CLASSIFIER_UNIT_SERVICE_PATH} \
          {CLASSIFIER_PROGRAM_PATH}\n\
          systemctl daemon-reload 2>/dev/null || true\n\
          rmdir \"{ANSWERER_PROGRAM_DIR}\" 2>/dev/null || true\n\
@@ -6496,11 +6518,13 @@ mod tests {
             format!("  [ -n \"$classifier_held\" ] || rm -f {CLASSIFIER_TREE_RECORD}"),
             format!("elif [ -d {CLASSIFIER_TREE_ROOT} ] ; then"),
             format!(
-                "systemctl disable --now {PLACE_SYSTEMD_UNIT}.path {PLACE_SYSTEMD_UNIT}.service \
-                 {CLASSIFIER_SYSTEMD_UNIT}.service 2>/dev/null || true"
+                "for unit in {PLACE_SYSTEMD_UNIT}.socket {PLACE_SYSTEMD_UNIT}.path \
+                 {PLACE_SYSTEMD_UNIT}.service {CLASSIFIER_SYSTEMD_UNIT}.service ; do"
             ),
+            "  systemctl disable --now \"$unit\" 2>/dev/null || true".to_string(),
             format!(
-                "rm -f {PLACE_UNIT_PATH_PATH} {PLACE_UNIT_SERVICE_PATH} \
+                "rm -f {PLACE_UNIT_SOCKET_PATH} {PLACE_UNIT_SERVICE_PATH} \
+                 {LEGACY_PLACE_UNIT_PATH_PATH} {LEGACY_PLACE_UNIT_SERVICE_PATH} \
                  {CLASSIFIER_UNIT_SERVICE_PATH} {CLASSIFIER_PROGRAM_PATH}"
             ),
             format!("if [ -f {KVM_GROUP_RECORD} ] ; then"),

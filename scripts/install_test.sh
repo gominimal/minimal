@@ -810,6 +810,9 @@ case_finalize_install_uninstall() {
             /Library/PrivilegedHelperTools/Minimal.app/*) continue ;;
             # A fixture path in the source's own tests.
             /opt/minimal-test/*) continue ;;
+            # The placement unit's socket: systemd makes it in /run and
+            # removes it when the socket unit stops.
+            /run/minimald-place.sock) continue ;;
             '') continue ;;
         esac
         _undo_n=$((_undo_n + 1))
@@ -969,6 +972,33 @@ EOF
         "$(head -n 1 "$remedy_calls")" "the boot unit is disabled before anything is removed"
     want_ok "the remedy removes the classifier table" \
         grep -qx "nft delete table inet minimal_class" "$remedy_calls"
+
+    # The placement socket pair a current install leaves (gominimal/inbox#1206):
+    # the remedy disables the units whose files are there, never the earlier
+    # path pair this host does not carry, because systemctl refuses a whole
+    # call that names a unit it does not have.
+    HNS4S="$root/hns4s"; mkdir -p "$HNS4S"
+    run ns4s_seed "$HNS4S"
+    fake_ns4s="$root/fake net root-4s \$HOME"
+    cls_files_s="etc/systemd/system/minimald-classifier.service etc/systemd/system/minimald-place.socket etc/systemd/system/minimald-place@.service usr/local/lib/minimal/install-host-classifier.sh usr/local/lib/minimal/quic443-leaf etc/sudoers.d/minimal-quic443-leaf var/lib/minimal/finalize-install-classifier"
+    mkdir -p "$fake_ns4s/$cls_tree/classifier-table" "$fake_ns4s/$cls_tree/daemon" \
+        "$fake_ns4s/$cls_tree/boxes/allow" "$fake_ns4s/$cls_tree/boxes/deny"
+    for f in $cls_files_s; do
+        mkdir -p "$fake_ns4s/$(dirname "$f")"
+        printf 'unit\n' >"$fake_ns4s/$f"
+    done
+    FINALIZE_INSTALL_ROOT="$fake_ns4s"
+    run ns4s_run "$HNS4S" --uninstall
+    FINALIZE_INSTALL_ROOT=
+    check 0 "$rc" "uninstall with the placement socket pair exits 0"
+    want_ok "the socket pair's units are advised" \
+        grep -q "still installed on this host.*classifier units" "$OUT"
+    apply_remedies 3
+    for f in $cls_files_s "$cls_tree" usr/local/lib/minimal; do
+        want_err "the printed remedies remove $f" test -e "$fake_ns4s/$f"
+    done
+    check "systemctl disable --now minimald-classifier.service minimald-place.socket" \
+        "$(head -n 1 "$remedy_calls")" "the remedy disables the units this host carries, and only those"
 
     # A tree without the step's record was installed another way: it is not
     # the step's to remove, so nothing advises removing it.

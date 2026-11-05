@@ -3039,6 +3039,64 @@ pub fn daemon_fetch_leaf(root: &Path) -> Option<&'static str> {
         .then_some(sandbox::classifier::DAEMON_LEAF)
 }
 
+/// The socket the placement unit `min finalize-install` installs listens on
+/// (`minimald-place.socket`). The CLI spells it the same way
+/// (`PLACE_REQUEST_SOCKET` in `crates/minimal/src/resolver.rs`). systemd
+/// holds it, root-owned in `/run` and readable by the delegated account
+/// alone, and starts the root-owned placer for each connection. The placer
+/// finds the daemon from the holders of its listening socket, never from
+/// the connection, so a connection asks for a placement and names nothing.
+pub const PLACE_REQUEST_SOCKET: &str = "/run/minimald-place.sock";
+
+/// How long a daemon waits for the placer to finish: the placer scans every
+/// process's fd table and looks once more after a second when it finds no
+/// holder, so a few seconds cover it on a loaded host.
+pub const PLACE_REQUEST_WAIT: Duration = Duration::from_secs(5);
+
+/// What asking the placement unit for a placement came to.
+#[derive(Debug)]
+pub enum PlaceRequest {
+    /// The placer ran and closed the connection. Whether it placed this
+    /// daemon is [`daemon_fetch_leaf`]'s to read.
+    Answered,
+    /// No placer listens: the socket is not there, refuses, or is not this
+    /// account's to reach.
+    NoPlacer(std::io::Error),
+    /// The placer accepted the connection but did not close it in time, or
+    /// the read failed.
+    NoAnswer(std::io::Error),
+}
+
+/// Asks the placement unit at `socket` to place this daemon in its leaf
+/// (NET-079), and waits up to `wait` for the placer to finish. Call it once
+/// the daemon's own listener is bound, because the placer finds the daemon
+/// as that socket's holder. The connection carries nothing: systemd starts
+/// one placer per connection and closes the connection when it exits.
+///
+/// A placement request replaces the path unit's inotify watch on the
+/// daemon's socket, which an SELinux policy can deny systemd for a socket
+/// under the account's home (gominimal/inbox#1206). Connecting to a socket
+/// systemd itself created in `/run` needs no such permission.
+pub fn request_daemon_placement(socket: &Path, wait: Duration) -> PlaceRequest {
+    use std::io::Read as _;
+    let mut stream = match std::os::unix::net::UnixStream::connect(socket) {
+        Ok(stream) => stream,
+        Err(e) => return PlaceRequest::NoPlacer(e),
+    };
+    if let Err(e) = stream.set_read_timeout(Some(wait)) {
+        return PlaceRequest::NoAnswer(e);
+    }
+    let mut sink = [0_u8; 256];
+    loop {
+        match stream.read(&mut sink) {
+            Ok(0) => return PlaceRequest::Answered,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return PlaceRequest::NoAnswer(e),
+        }
+    }
+}
+
 /// NET-080: the node-plane record for the daemon's own fetches — one line
 /// per fetch the daemon itself makes, naming the box the fetch was made
 /// for, the host it left for, and the object it brought back, which is the
@@ -8716,5 +8774,51 @@ mod tests {
             elapsed < retransmit,
             "the per-launch reading ends inside one retransmit: {elapsed:?}"
         );
+    }
+
+    /// gominimal/inbox#1206: a placement request is answered when the placer
+    /// closes the connection, and reports no placer where nothing listens
+    /// and no answer where the placer holds the connection past the wait.
+    #[test]
+    fn a_placement_request_reads_the_placer_closing_the_connection() {
+        let dir = tempfile::tempdir().expect("a scratch directory for the request socket");
+        let socket = dir.path().join("place.sock");
+
+        assert!(
+            matches!(
+                request_daemon_placement(&socket, Duration::from_secs(1)),
+                PlaceRequest::NoPlacer(_)
+            ),
+            "no socket is no placer"
+        );
+
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        let placer = std::thread::spawn(move || {
+            let (connection, _) = listener.accept().expect("accept");
+            drop(connection);
+            listener
+        });
+        assert!(
+            matches!(
+                request_daemon_placement(&socket, Duration::from_secs(5)),
+                PlaceRequest::Answered
+            ),
+            "a placer that closes the connection answered"
+        );
+
+        let listener = placer.join().expect("the placer thread");
+        let holder = std::thread::spawn(move || {
+            let (connection, _) = listener.accept().expect("accept");
+            std::thread::sleep(Duration::from_millis(500));
+            drop(connection);
+        });
+        assert!(
+            matches!(
+                request_daemon_placement(&socket, Duration::from_millis(100)),
+                PlaceRequest::NoAnswer(_)
+            ),
+            "a placer that holds the connection past the wait gave no answer"
+        );
+        holder.join().expect("the holder thread");
     }
 }

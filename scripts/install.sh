@@ -530,19 +530,31 @@ maybe_remove_finalize_install() {
         # The classifier's units, the boot unit first: it re-runs the step at
         # every boot, so left enabled it lays the tree and the table out again.
         # They are disabled before their files go, and before the tree's line.
+        # Only the units whose files are there are named: systemctl refuses a
+        # whole call that names a unit this host does not have, and an install
+        # carries either the placement socket pair or the earlier path pair.
         _cls_rm=
         _cls_found=
-        for _cls_p in /etc/systemd/system/minimald-classifier.service /etc/systemd/system/minimald-place.path /etc/systemd/system/minimald-place.service /usr/local/lib/minimal/install-host-classifier.sh; do
+        _cls_units=
+        for _cls_p in /etc/systemd/system/minimald-classifier.service /etc/systemd/system/minimald-place.socket /etc/systemd/system/minimald-place@.service /etc/systemd/system/minimald-place.path /etc/systemd/system/minimald-place.service /usr/local/lib/minimal/install-host-classifier.sh; do
             _cls_rm="$_cls_rm $(shq "$_fi_root$_cls_p")"
             if [ -z "$_cls_found" ] && [ -e "$_fi_root$_cls_p" ]; then
                 _cls_found="$_cls_p"
             fi
+            case "$_cls_p" in
+                /etc/systemd/system/*@.service) ;;
+                /etc/systemd/system/*)
+                    if [ -e "$_fi_root$_cls_p" ]; then
+                        _cls_units="$_cls_units ${_cls_p##*/}"
+                    fi
+                    ;;
+            esac
         done
         if [ -n "$_cls_found" ]; then
             _fi_list="$_fi_list${_fi_list:+, }the classifier units ($_cls_found)"
             _fi_owned=1
             _fi_undo="$_fi_undo${_fi_undo:+
-}      sudo systemctl disable --now minimald-classifier.service minimald-place.path minimald-place.service; sudo rm -f$_cls_rm; sudo systemctl daemon-reload; sudo rmdir $(shq "$_lib_dir") 2>/dev/null || true"
+}      ${_cls_units:+sudo systemctl disable --now$_cls_units; }sudo rm -f$_cls_rm; sudo systemctl daemon-reload; sudo rmdir $(shq "$_lib_dir") 2>/dev/null || true"
         fi
         # The QUIC block helper and its sudoers rule, an item of their own.
         # `min finalize-install --undo` does not remove them, so a yes
