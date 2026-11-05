@@ -1480,7 +1480,12 @@ pub(crate) mod linux {
         let lock = socket.parent()?.join(paths::MINIMALD_LOCK_FILE);
         let meta = std::fs::metadata(lock).ok()?;
         let locks = std::fs::read_to_string("/proc/locks").ok()?;
-        let pid = lock_holder(&locks, meta.dev(), meta.ino())?;
+        let pid = lock_holder(
+            std::path::Path::new("/proc"),
+            &locks,
+            meta.dev(),
+            meta.ino(),
+        )?;
         let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
         if comm.trim() != "minimald" {
             return None;
@@ -1493,30 +1498,54 @@ pub(crate) mod linux {
     }
 
     /// The pid holding an exclusive `flock` on the file at device `dev`
-    /// (`st_dev`) and inode `inode`, read from a `/proc/locks` listing:
-    /// `<n>: FLOCK ADVISORY WRITE <pid> <major>:<minor>:<inode> <start>
-    /// <end>`, the major and minor in hex. Blocked waiters (`->` lines) are
-    /// not holders.
-    pub(crate) fn lock_holder(locks: &str, dev: u64, inode: u64) -> Option<u32> {
-        // glibc's `major`/`minor` decoding of `st_dev`.
-        let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
-        let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
-        locks.lines().find_map(|line| {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            let [_, "FLOCK", _, "WRITE", pid, id, ..] = fields.as_slice() else {
-                return None;
-            };
-            let mut parts = id.split(':');
-            let (Some(maj), Some(min), Some(ino), None) =
-                (parts.next(), parts.next(), parts.next(), parts.next())
-            else {
-                return None;
-            };
-            let same = u64::from_str_radix(maj, 16).ok()? == major
-                && u64::from_str_radix(min, 16).ok()? == minor
-                && ino.parse::<u64>().ok()? == inode;
-            if same { pid.parse().ok() } else { None }
+    /// (`st_dev`) and inode `inode`: a holder [`lock_holders`] lists for
+    /// the inode that also has the file open, which one of its
+    /// `<proc>/<pid>/fd/*` entries statting to `dev` and `inode` shows.
+    /// The listing's device is not compared: `/proc/locks` prints the
+    /// superblock's, and on btrfs `stat` gives the subvolume's own
+    /// anonymous device instead, so the two differ for the same file.
+    pub(crate) fn lock_holder(
+        proc: &std::path::Path,
+        locks: &str,
+        dev: u64,
+        inode: u64,
+    ) -> Option<u32> {
+        use std::os::unix::fs::MetadataExt as _;
+        lock_holders(locks, inode).into_iter().find(|pid| {
+            std::fs::read_dir(proc.join(pid.to_string()).join("fd")).is_ok_and(|fds| {
+                fds.flatten().any(|fd| {
+                    std::fs::metadata(fd.path())
+                        .is_ok_and(|meta| meta.dev() == dev && meta.ino() == inode)
+                })
+            })
         })
+    }
+
+    /// The pids holding an exclusive `flock` on an inode numbered `inode`
+    /// on any device, read from a `/proc/locks` listing: `<n>: FLOCK
+    /// ADVISORY WRITE <pid> <major>:<minor>:<inode> <start> <end>`.
+    /// Blocked waiters (`->` lines) are not holders.
+    pub(crate) fn lock_holders(locks: &str, inode: u64) -> Vec<u32> {
+        locks
+            .lines()
+            .filter_map(|line| {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                let [_, "FLOCK", _, "WRITE", pid, id, ..] = fields.as_slice() else {
+                    return None;
+                };
+                let mut parts = id.split(':');
+                let (Some(_), Some(_), Some(ino), None) =
+                    (parts.next(), parts.next(), parts.next(), parts.next())
+                else {
+                    return None;
+                };
+                if ino.parse::<u64>().ok()? == inode {
+                    pid.parse().ok()
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// [`classifier_item_over`]'s inputs from this host's reads: the table's
@@ -3368,17 +3397,6 @@ mod tests {
             !script.contains("cat >"),
             "the block writes no unit and no copy of the step: {script}"
         );
-        // The pid is the lock's holder as the kernel lists it, never a
-        // waiter and never another file's holder.
-        // st_dev 0x2a is major 0, minor 0x2a; 0x10305 is major 0x103, minor 5.
-        let locks = "1: FLOCK  ADVISORY  WRITE 7373 103:05:777 0 EOF\n\
-                     2: FLOCK  ADVISORY  WRITE 4242 00:2a:777 0 EOF\n\
-                     2: -> FLOCK  ADVISORY  WRITE 5151 00:2a:777 0 EOF\n\
-                     3: POSIX  ADVISORY  WRITE 6161 00:2a:888 0 EOF\n";
-        assert_eq!(linux::lock_holder(locks, 0x2a, 777), Some(4242));
-        assert_eq!(linux::lock_holder(locks, 0x1_0305, 777), Some(7373));
-        assert_eq!(linux::lock_holder(locks, 0x2a, 888), None);
-        assert_eq!(linux::lock_holder(locks, 0x2b, 777), None);
         // A step that is not installed is the install's item, whatever the
         // daemon's placement: the install places the daemon too.
         let bare = classifier_item_over(
@@ -3395,6 +3413,52 @@ mod tests {
                 .is_some_and(|script| script.contains("--place-listener")),
             "the install's block places the listening daemon"
         );
+    }
+
+    /// The daemon's pid is the lock's holder as the kernel lists it, never
+    /// a waiter and never a holder without the file open. The listing's
+    /// device is the superblock's, which on btrfs differs from the `st_dev`
+    /// a `stat` of the lock file gives (the subvolume's anonymous device),
+    /// so only the inode is matched and the holder is confirmed by its open
+    /// file.
+    #[test]
+    fn a_lock_holder_is_found_by_inode_and_confirmed_by_its_open_file() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("minimald.lock");
+        let other = dir.path().join("other");
+        std::fs::write(&lock, b"").unwrap();
+        std::fs::write(&other, b"").unwrap();
+        let meta = std::fs::metadata(&lock).unwrap();
+        let (dev, ino) = (meta.dev(), meta.ino());
+        // A stand-in /proc: 4242 has the lock file open, 7373 only another
+        // file, and 5151 (the waiter) the lock file too.
+        let proc = dir.path().join("proc");
+        for (pid, target) in [(4242, &lock), (7373, &other), (5151, &lock)] {
+            let fd = proc.join(pid.to_string()).join("fd");
+            std::fs::create_dir_all(&fd).unwrap();
+            std::os::unix::fs::symlink(target, fd.join("3")).unwrap();
+        }
+        // The listing's device is never this file's st_dev, as on a btrfs
+        // subvolume: one major above it (glibc's decoding of st_dev).
+        let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+        let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+        let listed = format!("{:02x}:{minor:02x}", major + 1);
+        let locks = format!(
+            "1: FLOCK  ADVISORY  WRITE 7373 {listed}:{ino} 0 EOF\n\
+             2: FLOCK  ADVISORY  WRITE 4242 {listed}:{ino} 0 EOF\n\
+             2: -> FLOCK  ADVISORY  WRITE 5151 {listed}:{ino} 0 EOF\n\
+             3: POSIX  ADVISORY  WRITE 6161 {listed}:{ino} 0 EOF\n"
+        );
+        assert_eq!(linux::lock_holders(&locks, ino), vec![7373, 4242]);
+        assert_eq!(linux::lock_holder(&proc, &locks, dev, ino), Some(4242));
+        // Another device's file with the same inode is not this lock.
+        assert_eq!(linux::lock_holder(&proc, &locks, dev ^ 1, ino), None);
+        // Nobody holds a lock on another inode.
+        assert_eq!(linux::lock_holder(&proc, &locks, dev, ino + 1), None);
+        // A holder whose fds cannot be read is not confirmed.
+        let only_unreadable = format!("1: FLOCK  ADVISORY  WRITE 9999 {listed}:{ino} 0 EOF\n");
+        assert_eq!(linux::lock_holder(&proc, &only_unreadable, dev, ino), None);
     }
 
     #[test]
