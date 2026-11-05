@@ -198,6 +198,13 @@ pub fn format_policy_on_host(
     fabric: Option<switch::SwitchSubnet>,
     native_host: bool,
 ) -> Result<(), anyhow::Error> {
+    // BEP-085: the credentialed-upstream row reads the host kind too, since
+    // a host-address box's lane is in effect on a VM host only.
+    let host_kind = if native_host {
+        paths::HostKind::Minimald
+    } else {
+        paths::HostKind::Minvmd
+    };
     // A none box has no network, so it can carry no egress or ingress
     // declaration at all — nothing the blocks print would describe anything
     // real (the same case the TUI's detail pane replaces with this note).
@@ -209,7 +216,7 @@ pub fn format_policy_on_host(
             writeln!(
                 out,
                 "  {}",
-                boxes::CredentialedUpstream::policy_row(network)
+                boxes::CredentialedUpstream::policy_row(network, host_kind)
             )?;
         }
         return Ok(());
@@ -282,7 +289,7 @@ pub fn format_policy_on_host(
         writeln!(
             out,
             "  {}",
-            boxes::CredentialedUpstream::policy_row(network)
+            boxes::CredentialedUpstream::policy_row(network, host_kind)
         )?;
     }
     // NET-160: a host-address box on a native host runs in the host's own
@@ -676,8 +683,8 @@ fn no_shared_port_collisions(rows: &&[minimald_rpc::SharedPortCollision]) -> boo
 
 /// A declared credentialed-upstream lane as the document carries it: the
 /// declaration as declared, plus `effective`, whether the box's network
-/// mode admits the lane (own-address only) — the machine form of the text
-/// row's `(not in effect: …)` mark.
+/// mode admits the lane on its host (BEP-085) — the machine form of the
+/// text row's `(not in effect: …)` mark.
 #[derive(serde::Serialize)]
 struct PolicyCredentialedUpstreamJson<'a> {
     #[serde(flatten)]
@@ -689,10 +696,11 @@ impl<'a> PolicyCredentialedUpstreamJson<'a> {
     fn from_effective(
         effective: &'a boxes::EffectiveBoxPolicy,
         network: boxes::NetworkMode,
+        host_kind: paths::HostKind,
     ) -> Option<Self> {
         effective.credentialed_upstream.as_ref().map(|lane| Self {
             lane,
-            effective: boxes::CredentialedUpstream::in_effect(network),
+            effective: boxes::CredentialedUpstream::in_effect(network, host_kind),
         })
     }
 }
@@ -722,7 +730,8 @@ enum LiveIngressJson {
 /// command walks for so the two renderings describe the same policy: the
 /// live rows arrive as the fetch's own result, served or failed, because
 /// which of the two it was is part of what the document says. Shared with
-/// the tests that pin the document, the way [`format_policy`] is.
+/// the tests that pin the document, the way [`format_policy`] is. Like
+/// [`format_policy`], it renders for a VM host.
 pub fn write_policy_json(
     out: &mut impl std::io::Write,
     effective: &boxes::EffectiveBoxPolicy,
@@ -735,6 +744,7 @@ pub fn write_policy_json(
         out,
         effective,
         network,
+        paths::HostKind::Minvmd,
         fabric,
         live,
         shared_port_collisions,
@@ -746,11 +756,14 @@ pub fn write_policy_json(
 /// unpublished because their audit record could not be written (NET-046)
 /// carried as `unaudited_listen_ports` — the key a machine reads the
 /// fail-closed listen-publish from, the way a person reads the text
-/// rendering's warning lines.
+/// rendering's warning lines. `host_kind` is the kind of the daemon the
+/// caller talks to: the lane's `effective` reads it (BEP-085).
+#[allow(clippy::too_many_arguments)]
 pub fn write_policy_json_noting(
     out: &mut impl std::io::Write,
     effective: &boxes::EffectiveBoxPolicy,
     network: boxes::NetworkMode,
+    host_kind: paths::HostKind,
     fabric: Option<switch::SwitchSubnet>,
     live: Result<Vec<minimald_rpc::LiveMapping>, String>,
     shared_port_collisions: &[minimald_rpc::SharedPortCollision],
@@ -768,7 +781,7 @@ pub fn write_policy_json_noting(
             ingress: None,
             // A declared lane is still carried, marked not in effect.
             credentialed_upstream: PolicyCredentialedUpstreamJson::from_effective(
-                effective, network,
+                effective, network, host_kind,
             ),
             node_plane_baseline: None,
             live_ingress: None,
@@ -809,9 +822,9 @@ pub fn write_policy_json_noting(
             // The lane rides the document the way the text rendering prints
             // it: only when declared, so the key's absence is the no-lane
             // claim. Carried in every mode; `effective` says whether this
-            // mode admits it, since the switch is the only place it is.
+            // mode admits it on this host (BEP-085).
             credentialed_upstream: PolicyCredentialedUpstreamJson::from_effective(
-                effective, network,
+                effective, network, host_kind,
             ),
             node_plane_baseline,
             // The wire's own rows, `pending` included — an empty list is a
@@ -1060,13 +1073,14 @@ pub(crate) async fn box_policy_as_json(
     // rendering keys it (see the comment in [`cmd_session_policy`]): the
     // backend this command actually talks to, with no fabric named for the
     // native daemon's per-daemon switch.
-    let fabric = (daemon_host_kind(global) == paths::HostKind::Minvmd)
-        .then_some(switch::SwitchSubnet::default());
+    let host_kind = daemon_host_kind(global);
+    let fabric = (host_kind == paths::HostKind::Minvmd).then_some(switch::SwitchSubnet::default());
     let mut out = std::io::stdout();
     write_policy_json_noting(
         &mut out,
         &policy,
         record.network,
+        host_kind,
         fabric,
         live,
         &shared_port_collisions,
@@ -1614,34 +1628,64 @@ mod tests {
             "a box without a lane carries no key, got: {unlaned_json}"
         );
 
-        // A host-address box sits behind no switch gate, so a declared
-        // lane there is admitted nowhere — but the view still shows what
-        // the box declared, marked as not in effect on both surfaces.
-        let mut out = Vec::new();
-        format_policy(&mut out, &laned, NetworkMode::HostNet, None, &[], None).unwrap();
-        let rendered = String::from_utf8(out).unwrap();
+        // BEP-085: a host-address box on a native host shares the host's
+        // network, so a declared lane there is admitted nowhere — but the
+        // view still shows what the box declared, marked as not in effect
+        // on both surfaces. On a VM host the host-side gate admits it, and
+        // the row is unmarked.
+        let host_ip_render = |native_host| {
+            let mut out = Vec::new();
+            format_policy_on_host(
+                &mut out,
+                &laned,
+                NetworkMode::HostNet,
+                None,
+                &[],
+                None,
+                native_host,
+            )
+            .unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        let rendered = host_ip_render(true);
         assert!(
             rendered.contains(
                 "  credentialed upstream  allowed to reach the Box Egress Proxy \
                  (not in effect: host_ip box)\n"
             ),
-            "a host-address box must show its declared lane, marked, got: {rendered}"
+            "a native host-address box must show its declared lane, marked, got: {rendered}"
         );
-        let mut out = Vec::new();
-        write_policy_json(
-            &mut out,
-            &laned,
-            NetworkMode::HostNet,
-            None,
-            Ok(Vec::new()),
-            &[],
-        )
-        .unwrap();
-        let host_json: serde_json_lenient::Value = serde_json_lenient::from_slice(&out).unwrap();
+        let rendered = host_ip_render(false);
+        assert!(
+            rendered.contains("  credentialed upstream  allowed to reach the Box Egress Proxy\n"),
+            "a host-address box on a VM host must show its lane unmarked, got: {rendered}"
+        );
+        let host_ip_json = |host_kind| {
+            let mut out = Vec::new();
+            write_policy_json_noting(
+                &mut out,
+                &laned,
+                NetworkMode::HostNet,
+                host_kind,
+                None,
+                Ok(Vec::new()),
+                &[],
+                &[],
+            )
+            .unwrap();
+            serde_json_lenient::from_slice::<serde_json_lenient::Value>(&out).unwrap()
+        };
+        let host_json = host_ip_json(paths::HostKind::Minimald);
         assert_eq!(
             host_json["credentialed_upstream"],
             serde_json_lenient::json!({ "effective": false }),
-            "a host-address box carries its declared lane as not in effect, got: {host_json}"
+            "a native host-address box carries its declared lane as not in effect, got: {host_json}"
+        );
+        let host_json = host_ip_json(paths::HostKind::Minvmd);
+        assert_eq!(
+            host_json["credentialed_upstream"],
+            serde_json_lenient::json!({ "effective": true }),
+            "a host-address box on a VM host carries its lane as in effect, got: {host_json}"
         );
 
         // A none box keeps the declaration visible the same way.
@@ -1973,6 +2017,7 @@ mod tests {
                 &mut out,
                 &policy,
                 NetworkMode::OwnIp,
+                paths::HostKind::Minvmd,
                 None,
                 Ok(Vec::new()),
                 &[],
