@@ -485,9 +485,7 @@ pub(crate) async fn handle_exec(
         }
         ExecRequest::ExecAttach(exec_id) => {
             session.channel_success(id)?;
-            spawn(
-                serve_exec_attach(channel, session_handle, session_id, exec_id).instrument(span),
-            );
+            spawn(serve_exec_attach(channel, session_handle, session_id, exec_id).instrument(span));
         }
         ExecRequest::ExecOutput(exec_id) => {
             session.channel_success(id)?;
