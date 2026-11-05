@@ -16411,9 +16411,10 @@ fn task_box_run_request() -> String {
 }
 
 // BOX-038, T43: a task run on a task box starts the box's entrypoint and
-// relays it: the entrypoint's output, then its exit code. The box ends
-// when the entrypoint returns, and keeps its record as `exited` with the
-// code. The daemon log names the box and the code.
+// relays it on three pipes: the run's stdin reaches the entrypoint, its
+// stdout and stderr come back as two streams, then its exit code. The box
+// ends when the entrypoint returns, and keeps its record as `exited` with
+// the code. The daemon log names the box and the code.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn until_complete_ends_on_entrypoint_return_without_client_task_run_returns_its_code() {
     use boxes::core::record::{ExitEnding, RecordState};
@@ -16421,7 +16422,15 @@ async fn until_complete_ends_on_entrypoint_return_without_client_task_run_return
     let log = crate::test_harness::captured_log();
     let server = TestServer::new().await;
     let mut client = server.connect().await;
-    let id = create_task_box(&mut client, &["/bin/sh", "-c", "echo task-ran; exit 7"]).await;
+    let id = create_task_box(
+        &mut client,
+        &[
+            "/bin/sh",
+            "-c",
+            "read line; echo \"task-ran:$line\"; echo task-diag >&2; cat; exit 7",
+        ],
+    )
+    .await;
 
     let outcome = tokio::time::timeout(
         Duration::from_secs(30),
@@ -16429,7 +16438,7 @@ async fn until_complete_ends_on_entrypoint_return_without_client_task_run_return
             &[(crate::MINIMAL_SESSION_ID_ENV, &id.to_string())],
             false,
             &task_box_run_request(),
-            b"",
+            b"q.sql\nrest\n",
         ),
     )
     .await
@@ -16442,9 +16451,15 @@ async fn until_complete_ends_on_entrypoint_return_without_client_task_run_return
         log.contents()
     );
     let stdout = String::from_utf8_lossy(&outcome.stdout);
-    assert!(
-        stdout.contains("task-ran\n") && !stdout.contains('\r'),
-        "the run relays the entrypoint's output as it wrote it: {stdout:?}"
+    assert_eq!(
+        stdout, "task-ran:q.sql\nrest\n",
+        "the run's stdin reaches the entrypoint, the stdin closes at its end, \
+         and stdout is the entrypoint's alone"
+    );
+    let stderr = String::from_utf8_lossy(&outcome.stderr);
+    assert_eq!(
+        stderr, "task-diag\n",
+        "the entrypoint's stderr comes back as its own stream"
     );
 
     let manager = server.state.sessions_manager().await;
@@ -16616,6 +16631,145 @@ async fn until_complete_ends_on_entrypoint_return_without_client_refuses_a_run_b
     assert!(
         stderr.starts_with("Task check did not start in box "),
         "the refusal names the task and the box, with no spawn-failure prefix: {stderr:?}"
+    );
+}
+
+// BOX-038, T43: a task box holds a shell for its activate hooks, and the
+// box has no host-side row. A plain exec on it stages nothing for the
+// entrypoint, so it takes the hook shell as it is: it launches nothing, and
+// the shell runs on. Only a task run replaces that shell with the task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn until_complete_ends_on_entrypoint_return_without_client_plain_exec_keeps_the_hook_shell() {
+    use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
+
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("activated");
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let mut spec = mfile::spec::BoxSpec::for_task(
+        "check",
+        &mfile::Task::default(),
+        mfile::spec::SpecFlags::default(),
+    )
+    .expect("a task that is not interactive has a spec");
+    spec.entrypoint =
+        mfile::spec::Entrypoint::Exec(vec!["/bin/sleep".to_string(), "600".to_string()]);
+    let mut req = crate::test_harness::create_session_req("check", "/tmp");
+    req.config.creating_verb = minimald_rpc::CreatingVerb::Task;
+    req.spec = Some(serde_json_lenient::to_value(&spec).expect("a spec serializes"));
+    let id = client.call::<CreateSession>(&req).await.unwrap().id;
+    crate::test_harness::unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: contribution_with_hook(boxes::wire::primitives::WireLifecycleHook {
+                    on_activate: Some(inline(marker_body(&marker))),
+                    ..Default::default()
+                }),
+            })
+            .await
+            .unwrap(),
+    );
+    finalize_session(&mut client, id).await;
+    assert!(marker.exists(), "the activate hook launched the box");
+    let launches = crate::box_actor::launch_spec_seam::observed(id);
+    assert!(
+        launches.last().is_some_and(|launch| launch.for_hooks),
+        "the box holds a hook shell: {launches:?}"
+    );
+
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves");
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("a plain exec takes the hook shell");
+    assert!(host.is_alive(), "the hook shell runs on");
+    assert_eq!(
+        crate::box_actor::launch_spec_seam::observed(id).len(),
+        launches.len(),
+        "a plain exec launched the box's entrypoint in place of the hook shell"
+    );
+    let again = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("a second plain exec takes the same shell");
+    assert!(again.same_host(&host), "the hook shell, not a new launch");
+}
+
+// BOX-038, T43: the entrypoint of an `until_complete` box returns, and its
+// host's mailbox closes, but the loop's exit does not come within the
+// settle wait. An exec queued beside it is refused as a box in the wrong
+// state (exit 2), and nothing launches: the entrypoint does not run a
+// second time. When the exit comes, the box ends `exited` as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn until_complete_ends_on_entrypoint_return_without_client_refuses_an_exec_on_an_unsettled_exit()
+ {
+    use boxes::core::record::{ExitEnding, RecordState};
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_session(&mut client).await;
+    crate::box_actor::exit_settle_seam::hold_exit(
+        session_id,
+        Duration::from_secs(2),
+        Duration::from_millis(100),
+    );
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session launches a headless host");
+    let launches_before = crate::box_actor::launch_spec_seam::observed(session_id).len();
+
+    let release = handle.hold_for_test().await;
+    host.feed_stdin(format!("{}\n", crate::box_runtime::MOCK_EXIT_LINE).into_bytes())
+        .await;
+    tokio::time::timeout(Duration::from_secs(10), host.closed())
+        .await
+        .expect("the host ends with its entrypoint");
+    let queued = {
+        let handle = handle.clone();
+        crate::traced::spawn(async move { handle.ensure_host("tester".to_string()).await })
+    };
+    handle.until_queued(1).await;
+    drop(release);
+
+    let ensured = tokio::time::timeout(Duration::from_secs(10), queued)
+        .await
+        .expect("the queued exec is answered")
+        .unwrap();
+    match ensured {
+        Err(crate::box_actor::AttachError::ResumeRefused(error, 2)) => {
+            assert!(error.to_string().contains("is ending"), "{error}");
+        }
+        Err(other) => panic!("the exec was refused for another reason: {other}"),
+        Ok(_) => panic!("the exec launched a host while the exit was not settled"),
+    }
+    assert_eq!(
+        crate::box_actor::launch_spec_seam::observed(session_id).len(),
+        launches_before,
+        "the entrypoint launched a second time"
+    );
+
+    let record = record_once_exited(&manager, session_id).await;
+    assert_eq!(
+        record.state().unwrap(),
+        RecordState::Exited(ExitEnding::Exit { exit_code: 0 })
+    );
+    assert_eq!(
+        crate::box_actor::launch_spec_seam::observed(session_id).len(),
+        launches_before,
+        "the entrypoint launched a second time after its exit"
     );
 }
 

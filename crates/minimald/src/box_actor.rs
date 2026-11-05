@@ -1534,7 +1534,10 @@ impl BoxActor {
             return None;
         }
         let watch = self.entrypoint_watch.as_mut()?;
-        let Ok(exit) = tokio::time::timeout(EXIT_SETTLE_TIMEOUT, watch).await else {
+        let settle = EXIT_SETTLE_TIMEOUT;
+        #[cfg(test)]
+        let settle = exit_settle_seam::settle_timeout(self.record.id()).unwrap_or(settle);
+        let Ok(exit) = tokio::time::timeout(settle, watch).await else {
             tracing::warn!(
                 box_id = %self.record.id(),
                 "the closed host's exit did not come in time; a launch for this message is refused"
@@ -2253,6 +2256,49 @@ pub(crate) mod exit_record_seam {
             }
             _ => false,
         }
+    }
+}
+
+/// The test seam for an exit that does not settle (BOX-038): a test names
+/// a box whose watched host loop holds its exit back for a while, and
+/// whose actor waits a short time for that exit. Keyed by box id, so tests
+/// running beside each other never hold each other's exits.
+#[cfg(test)]
+pub(crate) mod exit_settle_seam {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use boxes::SessionId;
+
+    /// For each box: how long its exit is held, and how long its actor
+    /// waits for the exit.
+    static HELD: Mutex<Option<HashMap<SessionId, (Duration, Duration)>>> = Mutex::new(None);
+
+    /// Holds the exit of every host loop of box `id` for `hold`, and makes
+    /// its actor wait `settle` for it.
+    pub(crate) fn hold_exit(id: SessionId, hold: Duration, settle: Duration) {
+        HELD.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(id, (hold, settle));
+    }
+
+    fn get(id: &SessionId) -> Option<(Duration, Duration)> {
+        HELD.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|held| held.get(id).copied())
+    }
+
+    /// How long the exit of box `id` is held.
+    pub(super) fn held(id: &SessionId) -> Option<Duration> {
+        get(id).map(|(hold, _)| hold)
+    }
+
+    /// How long the actor of box `id` waits for a closed host's exit.
+    pub(super) fn settle_timeout(id: &SessionId) -> Option<Duration> {
+        get(id).map(|(_, settle)| settle)
     }
 }
 

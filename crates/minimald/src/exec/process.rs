@@ -2200,3 +2200,42 @@ impl<P: Process> Process for TimedProcess<P> {
         self.inner.start_kill()
     }
 }
+
+#[cfg(test)]
+mod entrypoint_end_code_tests {
+    use super::entrypoint_end_code;
+    use boxes::core::record::{ExitEnding, RecordState, StopEnding};
+
+    // BOX-038, T43: a task run returns a code for every end the box's
+    // record keeps. A `min box stop` of a running task sends SIGTERM, so the
+    // run returns 143.
+    #[test]
+    fn until_complete_ends_on_entrypoint_return_without_client_maps_each_end_to_a_code() {
+        let end = |state| entrypoint_end_code(state);
+        assert_eq!(
+            end(RecordState::Stopped(StopEnding::Signalled { signal: 15 })),
+            Some(143)
+        );
+        assert_eq!(
+            end(RecordState::Stopped(StopEnding::Signalled { signal: 9 })),
+            Some(137)
+        );
+        assert_eq!(
+            end(RecordState::Stopped(StopEnding::AtDaemonStart)),
+            Some(137)
+        );
+        assert_eq!(
+            end(RecordState::Stopped(StopEnding::ExitedFirst {
+                exit_code: 3
+            })),
+            Some(3)
+        );
+        assert_eq!(
+            end(RecordState::Exited(ExitEnding::Exit { exit_code: 7 })),
+            Some(7)
+        );
+        assert_eq!(end(RecordState::Exited(ExitEnding::Timeout)), Some(124));
+        assert_eq!(end(RecordState::Exited(ExitEnding::Oom)), Some(137));
+        assert_eq!(end(RecordState::Running), None);
+    }
+}

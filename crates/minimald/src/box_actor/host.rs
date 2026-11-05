@@ -504,6 +504,10 @@ pub(super) fn watch_entrypoint_exit(
                 "task box ended: its entrypoint returned"
             );
         }
+        #[cfg(test)]
+        if let Some(hold) = super::exit_settle_seam::held(&box_id) {
+            tokio::time::sleep(hold).await;
+        }
         if let Ok(Ok(exit)) = &result {
             // The actor may be gone, or may hold a later launch's watch: the
             // exit is then nobody's to act on.
