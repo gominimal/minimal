@@ -176,6 +176,18 @@ pub const HELD_NAMES_FILE: &str = "box-held-names.json";
 /// is set aside and reloads no hold, like one that does not parse.
 const HELD_NAMES_FILE_VERSION: u32 = 1;
 
+/// The file the registry persists its minted `host_ip` box ids to, beside
+/// [`REGISTRY_FILE`]: every id it minted, and the ones admitted with a
+/// credentialed lane ([`HostIpIds`]). A file of its own, for the same
+/// reason as [`HELD_NAMES_FILE`]. A restart then still holds each id for
+/// the collision check, and still revokes a grant box's id at its destroy
+/// (BEP-043).
+pub const HOST_IP_IDS_FILE: &str = "box-host-ip-ids.json";
+
+/// The persisted `host_ip` ids' format version. A file of any other
+/// version is set aside and reloads no id, like one that does not parse.
+const HOST_IP_IDS_FILE_VERSION: u32 = 1;
+
 /// How long a hold reloaded from [`HELD_NAMES_FILE`] stands unconfirmed
 /// before it is dropped ([`BoxRegistry::expire_unconfirmed_holds`]). Only
 /// a host client re-makes a hold, over the host's control socket: the
@@ -1141,9 +1153,21 @@ struct HeldNamesFile {
     held_names: BTreeMap<String, Option<boxes::SessionId>>,
 }
 
+/// The persisted `host_ip` box ids ([`HOST_IP_IDS_FILE`]): its format
+/// version, every id the registry minted, and the minted ids admitted with
+/// a credentialed lane.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostIpIdsFile {
+    version: u32,
+    ids: Vec<boxes::BoxId>,
+    credentialed: Vec<boxes::BoxId>,
+}
+
 /// Writes `file` to `path` the one way any of the registry's persisted
-/// files — the box registry ([`REGISTRY_FILE`]) and its held names
-/// ([`HELD_NAMES_FILE`]) — is ever written: to a sibling temporary file
+/// files — the box registry ([`REGISTRY_FILE`]), its held names
+/// ([`HELD_NAMES_FILE`]) and its `host_ip` ids ([`HOST_IP_IDS_FILE`]) — is
+/// ever written: to a sibling temporary file
 /// created afresh with mode 0600 — what they hold names this user's boxes
 /// and sessions, which is no other user's to read — synced, then renamed
 /// over `path`, and the directory synced, so a crash at any point leaves
@@ -1359,6 +1383,59 @@ fn read_held_names_file(path: &std::path::Path) -> BTreeMap<String, Option<boxes
         ),
     }
     BTreeMap::new()
+}
+
+/// Reads the `host_ip` box ids persisted at `path`: none when there is no
+/// file yet. A credentialed id the file does not also list as minted is
+/// minted all the same: the file is only ever written by this registry. A
+/// file that cannot be read, does not parse, or is of another version than
+/// [`HOST_IP_IDS_FILE_VERSION`] reloads no id and is renamed aside under
+/// the same `.unusable-<unix seconds>` suffix, said as an error line.
+fn read_host_ip_ids_file(path: &std::path::Path) -> HostIpIds {
+    let why = match std::fs::read(path) {
+        Ok(bytes) => match serde_json_lenient::from_slice::<HostIpIdsFile>(&bytes) {
+            Ok(file) if file.version == HOST_IP_IDS_FILE_VERSION => {
+                let credentialed: BTreeSet<BoxId> =
+                    file.credentialed.iter().map(|id| id.to_bytes()).collect();
+                let mut ids: BTreeSet<BoxId> = file.ids.iter().map(|id| id.to_bytes()).collect();
+                ids.extend(credentialed.iter().copied());
+                return HostIpIds {
+                    ids,
+                    credentialed,
+                    ..HostIpIds::default()
+                };
+            }
+            Ok(file) => format!(
+                "version {}, this build reads {HOST_IP_IDS_FILE_VERSION}",
+                file.version
+            ),
+            Err(error) => error.to_string(),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return HostIpIds::default(),
+        Err(error) => error.to_string(),
+    };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let mut aside = path.as_os_str().to_owned();
+    aside.push(format!(".unusable-{stamp}"));
+    let aside = std::path::PathBuf::from(aside);
+    match std::fs::rename(path, &aside) {
+        Ok(()) => tracing::error!(
+            path = %path.display(),
+            aside = %aside.display(),
+            why,
+            "the persisted host_ip box ids are unusable; they are set aside and no id is reloaded"
+        ),
+        Err(error) => tracing::error!(
+            path = %path.display(),
+            why,
+            %error,
+            "the persisted host_ip box ids are unusable and could not be set aside; \
+             no id is reloaded and the next change writes over them"
+        ),
+    }
+    HostIpIds::default()
 }
 
 /// The run of `subnet`'s address plan the host hands registered boxes from:
@@ -3760,6 +3837,17 @@ impl BoxRegistry {
             *held = read_held_names_file(&path.with_file_name(HELD_NAMES_FILE));
             *self.unconfirmed_holds() = held.keys().map(|name| (name.clone(), now)).collect();
         }
+        {
+            // BEP-043: a reloaded id is held for the collision check, and a
+            // reloaded credentialed id is revoked at its box's destroy.
+            let reloaded = read_host_ip_ids_file(&path.with_file_name(HOST_IP_IDS_FILE));
+            tracing::info!(
+                minted = reloaded.ids.len(),
+                credentialed = reloaded.credentialed.len(),
+                "reloaded the persisted host_ip box ids"
+            );
+            *self.host_ip_id_set() = reloaded;
+        }
         self.persisted_at = Some(Arc::new(path));
         let mut held_loopbacks = std::collections::BTreeMap::new();
         // The file is in name order, not registration order. A standing
@@ -3974,6 +4062,44 @@ impl BoxRegistry {
                 path = %path.display(),
                 %error,
                 "could not persist the held box names; they will not survive this process"
+            );
+        }
+    }
+
+    /// Writes the minted `host_ip` box ids and the credentialed ones to
+    /// [`HOST_IP_IDS_FILE`]. Call it with no lock on the id set held.
+    fn persist_host_ip_ids(&self) {
+        let Some(path) = &self.persisted_at else {
+            return;
+        };
+        let path = path.with_file_name(HOST_IP_IDS_FILE);
+        let _turn = self
+            .persist_turn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let file = {
+            let ids = self.host_ip_id_set();
+            HostIpIdsFile {
+                version: HOST_IP_IDS_FILE_VERSION,
+                ids: ids
+                    .ids
+                    .iter()
+                    .copied()
+                    .map(boxes::BoxId::from_bytes)
+                    .collect(),
+                credentialed: ids
+                    .credentialed
+                    .iter()
+                    .copied()
+                    .map(boxes::BoxId::from_bytes)
+                    .collect(),
+            }
+        };
+        if let Err(error) = write_registry_file(&path, &file) {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "could not persist the host_ip box ids; they will not survive this process"
             );
         }
     }
@@ -4721,6 +4847,8 @@ impl BoxRegistry {
         ids.ids.insert(id);
         ids.by_name
             .insert(name.to_owned(), HostIpName { id, since: now });
+        drop(ids);
+        self.persist_host_ip_ids();
         Ok(id)
     }
 
@@ -6361,6 +6489,19 @@ impl BoxRegistry {
         resident.admits += 1;
         let admit = resident.admits;
         resident.admitted_at.insert(session_id, admit);
+        // BEP-043: a minted id admitted with a credentialed lane is revoked
+        // at its box's destroy, a destroy after a restart too. The resident
+        // set's lock is taken before the ids' lock, as on the register path.
+        let credentialed_changed = credentialed_upstream && {
+            let id = session_id.to_bytes();
+            let mut ids = self.host_ip_id_set();
+            if ids.ids.contains(&id) {
+                ids.credentialed_admit.insert(id, admit);
+                ids.credentialed.insert(id)
+            } else {
+                false
+            }
+        };
         if resident
             .boxes
             .get(&session_id)
@@ -6369,6 +6510,10 @@ impl BoxRegistry {
             // An attach re-admits with the rules the set already holds. The
             // cohort record stays the same `Arc`, so the pins and flows every
             // resident box took under it stay too.
+            drop(resident);
+            if credentialed_changed {
+                self.persist_host_ip_ids();
+            }
             return true;
         }
         // A client's admit supersedes any rules a reconcile set aside for
@@ -6383,6 +6528,9 @@ impl BoxRegistry {
             .node_mirror
             .set_published(resident.boxes.keys().copied().collect());
         drop(resident);
+        if credentialed_changed {
+            self.persist_host_ip_ids();
+        }
         // The first box since the last one ended binds the ports the guest
         // still holds as listening (NET-138).
         if !was_published {
@@ -6461,19 +6609,22 @@ impl BoxRegistry {
         let minted = ids.ids.contains(&id);
         // A stop drops the rules, so a later destroy of the stopped box
         // finds none. The id set keeps whether the box was credentialed,
-        // for that destroy to revoke.
-        let credentialed = match end {
+        // for that destroy to revoke, across a restart too.
+        let (credentialed, ids_changed) = match end {
             minimald_rpc::HostIpBoxEnd::Stopped => {
-                if credentialed && minted {
-                    ids.stopped_credentialed.insert(id);
-                }
-                false
+                let changed = credentialed && minted && ids.credentialed.insert(id);
+                (false, changed)
             }
             minimald_rpc::HostIpBoxEnd::Destroyed => {
-                ids.stopped_credentialed.remove(&id) || credentialed
+                ids.credentialed_admit.remove(&id);
+                let was = ids.credentialed.remove(&id);
+                (was || credentialed, was)
             }
         };
         drop(ids);
+        if ids_changed {
+            self.persist_host_ip_ids();
+        }
         // BEP-043: the destroy of a host_ip box with a credentialed lane
         // records a revocation of its minted id with the proxy, as the
         // destroy of an own-address box does. A stop revokes nothing. The
@@ -6522,7 +6673,9 @@ impl BoxRegistry {
     /// longer lists at all is forgotten. A box the guest no longer lists
     /// was destroyed there: when it declared a credentialed upstream under
     /// an id this registry minted, its id is revoked at the Box Egress
-    /// Proxy, as a client's destroy does (BEP-043).
+    /// Proxy, as a client's destroy does (BEP-043). So is the id of a
+    /// credentialed box that holds no rules here, a stopped one or one from
+    /// before a restart, once the guest no longer lists it.
     ///
     /// Root in the VM controls the guest's list, so a guest can move the
     /// union, but only within the rules host clients admitted, never past
@@ -6612,25 +6765,58 @@ impl BoxRegistry {
         admitted_at
             .retain(|session, _| held.contains_key(session) || dormant.contains_key(session));
         let mut revoke: Vec<BoxId> = Vec::new();
-        if !ended.is_empty() {
+        let ids_changed = {
             // The resident set's lock is taken before the ids' lock, as on
             // the register path.
             let mut ids = self.host_ip_id_set();
-            ids.by_name.retain(|_, named| {
-                !ended
-                    .iter()
-                    .any(|(session, _)| session.to_bytes() == named.id)
-            });
-            // The destroy is final, so the id leaves the stopped set. It
-            // stays in the id set, so no later mint takes it (BEP-082).
-            for (session, credentialed) in &ended {
-                let id = session.to_bytes();
-                let was_stopped = ids.stopped_credentialed.remove(&id);
-                if (*credentialed || was_stopped) && ids.ids.contains(&id) {
-                    revoke.push(id);
+            let mut changed = false;
+            if !ended.is_empty() {
+                ids.by_name.retain(|_, named| {
+                    !ended
+                        .iter()
+                        .any(|(session, _)| session.to_bytes() == named.id)
+                });
+                // The destroy is final, so the id leaves the credentialed
+                // set. It stays in the id set, so no later mint takes it
+                // (BEP-082).
+                for (session, credentialed) in &ended {
+                    let id = session.to_bytes();
+                    ids.credentialed_admit.remove(&id);
+                    let was = ids.credentialed.remove(&id);
+                    changed |= was;
+                    if (*credentialed || was) && ids.ids.contains(&id) {
+                        revoke.push(id);
+                    }
                 }
             }
-        }
+            // A credentialed id whose box holds no rules here and that the
+            // guest no longer lists was destroyed there: a stopped grant
+            // box, or one from before a restart. A box a client admitted
+            // after the mark is left alone, as above.
+            let swept: Vec<BoxId> = ids
+                .credentialed
+                .iter()
+                .copied()
+                .filter(|id| {
+                    let session = boxes::SessionId::from_bytes(*id);
+                    !guest.contains_key(&session)
+                        && !held.contains_key(&session)
+                        && !dormant.contains_key(&session)
+                        && ids
+                            .credentialed_admit
+                            .get(id)
+                            .is_none_or(|admit| *admit <= mark.0)
+                })
+                .collect();
+            for id in swept {
+                ids.credentialed.remove(&id);
+                ids.credentialed_admit.remove(&id);
+                ids.by_name.retain(|_, named| named.id != id);
+                changed = true;
+                revoke.push(id);
+            }
+            changed
+        };
         if let Some(path) = self.proxy_control.as_deref() {
             // BEP-043: the end of a grant box revokes its id, whichever
             // side destroyed it. The pass never waits for the proxy.
@@ -6639,6 +6825,10 @@ impl BoxRegistry {
             }
         }
         if outcome.is_empty() {
+            drop(resident);
+            if ids_changed {
+                self.persist_host_ip_ids();
+            }
             return outcome;
         }
         resident.cohort = HostIpBoxes::cohort_record(&resident.boxes, self.subnet);
@@ -6649,6 +6839,9 @@ impl BoxRegistry {
             .node_mirror
             .set_published(resident.boxes.keys().copied().collect());
         drop(resident);
+        if ids_changed {
+            self.persist_host_ip_ids();
+        }
         for session in &outcome.dropped {
             tracing::info!(
                 session = %session,
@@ -7801,16 +7994,20 @@ fn guest_state_name(state: Option<boxes::BoxState>) -> &'static str {
 /// the proxy revoked a grant. The set is what keeps an ended box's id out
 /// of a later mint's reach ([`BoxRegistry::holds_box_id`]). Its bound is
 /// one 16-byte id for each `host_ip` registration since the VM host daemon
-/// started: a million registrations cost about 16 MB. A restart clears it,
-/// and the proxy's revocation records then carry the ids that still matter.
+/// started. `ids` and `credentialed` persist to [`HOST_IP_IDS_FILE`], so a
+/// restart keeps them: a million registrations cost about 16 MB in memory.
 #[derive(Debug, Default)]
 struct HostIpIds {
     ids: BTreeSet<BoxId>,
     by_name: BTreeMap<String, HostIpName>,
-    /// The minted ids of stopped boxes that declared a credentialed
-    /// upstream. Their destroy revokes them, though the stop dropped the
-    /// rules that said so (BEP-043).
-    stopped_credentialed: BTreeSet<BoxId>,
+    /// The minted ids admitted with a credentialed lane, until their box
+    /// is destroyed. Their destroy revokes them, though a stop or a
+    /// restart dropped the rules that said so (BEP-043).
+    credentialed: BTreeSet<BoxId>,
+    /// The admit count at each credentialed id's latest admit, for this
+    /// process only. A reconcile leaves alone an id admitted after its
+    /// mark ([`BoxRegistry::reconcile_host_ip_boxes`]).
+    credentialed_admit: BTreeMap<BoxId, u64>,
 }
 
 /// The id a live `host_ip` registration name answers, and when the name
@@ -13934,6 +14131,139 @@ mod tests {
             ]
         );
         assert_eq!(wired.host_ip_id_for("gone-later"), None);
+    }
+
+    // BEP-043: a grant box's minted id and its credentialed lane persist
+    // beside the registry file. After a VM host daemon restart the destroy
+    // of the box finds no rules, and still revokes its id at the proxy.
+    #[test]
+    fn restarted_registry_revokes_a_destroyed_grant_box_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = persisted_registry(&dir);
+        let id = before
+            .register_host_ip_box_as("agent", [0x6a; 16])
+            .expect("no record holds the id");
+        let session = boxes::SessionId::from_bytes(id);
+        assert!(before.admit_host_ip_box_with_lane(session, None, true));
+        drop(before);
+
+        let sock = dir.path().join("control.sock");
+        let server = stub_control(&sock, &["{\"ok\":true}\n", "{\"ok\":true}\n"]);
+        let after = BoxRegistry::new(SUBNET)
+            .with_proxy_control(Some(sock))
+            .persisting_to(dir.path().join(REGISTRY_FILE));
+        assert!(after.holds_host_ip_id(id), "the reloaded id is held");
+        assert!(
+            !after.retire_host_ip_box(session, HostIpBoxEnd::Destroyed),
+            "a restart holds no rules for the box"
+        );
+        assert!(
+            revocation_spawned(id),
+            "the destroy revokes the reloaded id"
+        );
+        let hex = "6a".repeat(16);
+        assert_eq!(
+            server.join().unwrap(),
+            [
+                serde_json::json!({"op": "revoke_box", "box_id": hex}),
+                serde_json::json!({"op": "forget_box", "box_id": hex}),
+            ]
+        );
+        let file: HostIpIdsFile = serde_json_lenient::from_slice(
+            &std::fs::read(dir.path().join(HOST_IP_IDS_FILE)).expect("the id file reads"),
+        )
+        .expect("the id file parses");
+        assert_eq!(file.ids, vec![boxes::BoxId::from_bytes(id)]);
+        assert!(
+            file.credentialed.is_empty(),
+            "the destroyed box's id leaves the credentialed set"
+        );
+    }
+
+    // BEP-082: the ids a registry minted persist, so the registry of the
+    // next VM host daemon run refuses a mint that takes one of them. An
+    // unusable id file is set aside and reloads no id.
+    #[test]
+    fn restarted_registry_never_mints_an_id_it_minted_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = persisted_registry(&dir);
+        let id = before
+            .register_host_ip_box_as("first", [0x6b; 16])
+            .expect("no record holds the id");
+        drop(before);
+
+        let after = persisted_registry(&dir);
+        assert!(after.holds_host_ip_id(id), "the reloaded id is held");
+        assert!(
+            matches!(
+                after.register_host_ip_box_as("second", id),
+                Err(AllocationError::CollidingBoxId { id: refused }) if refused == id
+            ),
+            "a mint of an id minted before the restart is refused"
+        );
+
+        let path = dir.path().join(HOST_IP_IDS_FILE);
+        std::fs::write(&path, b"not json").unwrap();
+        let unusable = persisted_registry(&dir);
+        assert!(
+            !unusable.holds_host_ip_id(id),
+            "an unusable file reloads no id"
+        );
+        assert!(!path.exists(), "the unusable file is moved");
+        let aside = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("{HOST_IP_IDS_FILE}.unusable-"))
+            });
+        assert!(aside, "the unusable file is set aside");
+    }
+
+    // BEP-043: a grant box a client stopped holds no rules, so a reconcile
+    // that finds the VM no longer lists it revokes its id from the
+    // credentialed set. A reconcile that still lists it revokes nothing.
+    #[test]
+    fn a_stopped_grant_box_the_vm_destroyed_revokes_its_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        let registry = BoxRegistry::new(SUBNET).with_proxy_control(Some(sock.clone()));
+        let id = registry
+            .register_host_ip_box_as("stopped", [0x6c; 16])
+            .expect("no record holds the id");
+        let session = boxes::SessionId::from_bytes(id);
+        assert!(registry.admit_host_ip_box_with_lane(session, None, true));
+        assert!(registry.retire_host_ip_box(session, HostIpBoxEnd::Stopped));
+
+        let guest = BTreeMap::from([(session, boxes::BoxState::Stopped)]);
+        registry.reconcile_host_ip_boxes(
+            &guest,
+            registry.host_ip_admit_mark(),
+            HostIpReconcileTrigger::BoxEvent,
+        );
+        assert!(
+            !revocation_spawned(id),
+            "a box the VM still lists keeps its id"
+        );
+
+        let server = stub_control(&sock, &["{\"ok\":true}\n", "{\"ok\":true}\n"]);
+        registry.reconcile_host_ip_boxes(
+            &BTreeMap::new(),
+            registry.host_ip_admit_mark(),
+            HostIpReconcileTrigger::Timer,
+        );
+        assert!(revocation_spawned(id), "the destroyed stopped box revokes");
+        let hex = "6c".repeat(16);
+        assert_eq!(
+            server.join().unwrap(),
+            [
+                serde_json::json!({"op": "revoke_box", "box_id": hex}),
+                serde_json::json!({"op": "forget_box", "box_id": hex}),
+            ]
+        );
+        assert!(registry.holds_host_ip_id(id), "the revoked id stays");
     }
 
     // BEP-043: a box with no credentialed upstream that the VM destroyed
