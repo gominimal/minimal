@@ -42,22 +42,23 @@ fn the_switches_each_turn_it_off_in_order() {
         None,
         "the OTel opt-in is not a switch here"
     );
+    let user = PathBuf::from("/home/u/.config/minimal/config.toml");
     assert_eq!(
-        off_switch(ConfigState::Disabled, env(&[])),
-        Some(UpdateDisabledReason::Config)
+        off_switch(ConfigState::Disabled(user.clone()), env(&[])),
+        Some(UpdateDisabledReason::Config(user.clone()))
     );
     assert_eq!(
-        off_switch(ConfigState::Unreadable, env(&[])),
-        Some(UpdateDisabledReason::ConfigUnreadable),
+        off_switch(ConfigState::Unreadable(Some(user.clone())), env(&[])),
+        Some(UpdateDisabledReason::ConfigUnreadable(Some(user.clone()))),
         "an unreadable config fails closed, and says that, not a setting it may not hold"
     );
     assert!(
-        UpdateDisabledReason::ConfigUnreadable
+        UpdateDisabledReason::ConfigUnreadable(Some(user.clone()))
             .to_string()
-            .contains("could not be read")
+            .contains("/home/u/.config/minimal/config.toml, which could not be read")
     );
     assert_eq!(
-        off_switch(ConfigState::Disabled, env(&[("DO_NOT_TRACK", "1")])),
+        off_switch(ConfigState::Disabled(user), env(&[("DO_NOT_TRACK", "1")])),
         Some(UpdateDisabledReason::Env("DO_NOT_TRACK")),
         "the environment is named ahead of the config"
     );
@@ -155,11 +156,40 @@ fn the_install_file_precedence_is_user_then_package_then_source() {
         ("stable", "brew", "0.7.0")
     );
 
+    std::fs::create_dir_all(prefix.join("bin")).unwrap();
+    std::fs::write(&exe, b"").unwrap();
+    let other = tmp.path().join("target").join("min");
+    std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+    std::fs::write(&other, b"").unwrap();
+    let record = |bin: &Path| {
+        format!(
+            "channel = \"nightly\"\nmethod = \"installer\"\nkey = \"5a93a07a\"\nbin = '{}'\n",
+            bin.display()
+        )
+    };
+    std::fs::write(state.join(INSTALL_FILE), record(&other)).unwrap();
+    assert_eq!(
+        read_install(&state, Some(&exe)).method,
+        "brew",
+        "a record for another binary is not this one's"
+    );
+    std::fs::write(state.join(INSTALL_FILE), record(&exe)).unwrap();
+    assert_eq!(
+        read_install(&state, Some(&other)).channel,
+        SOURCE_CHANNEL,
+        "a development build beside an installer install reports as source"
+    );
     std::fs::write(
         state.join(INSTALL_FILE),
         "channel = \"nightly\"\nmethod = \"installer\"\nkey = \"5a93a07a\"\n",
     )
     .unwrap();
+    assert_eq!(
+        read_install(&state, Some(&exe)).method,
+        "brew",
+        "a record that names no binary describes none"
+    );
+    std::fs::write(state.join(INSTALL_FILE), record(&exe)).unwrap();
     let user = read_install(&state, Some(&exe));
     assert_eq!(
         (
@@ -232,6 +262,7 @@ fn the_state_round_trips_and_a_bad_file_is_the_default() {
         checked_at: Some(7),
         latest: Some("0.7.2".into()),
         latest_channel: Some("stable".into()),
+        latest_key: Some("0.7.1".into()),
         notified: None,
         disclosed: true,
     };
@@ -280,7 +311,7 @@ fn a_first_run_claims_one_id_and_keeps_what_was_written_meanwhile() {
     );
     // a child's answer lands between the read and the disclosure write
     let state = claim_install_id(dir, &path).unwrap();
-    record_answer(&path, Some(("stable".into(), "0.7.2".into())));
+    record_answer(&path, "0.7.1", Some(("stable".into(), "0.7.2".into())));
     record_disclosed(&path).unwrap();
     let read = read_state(&path);
     assert!(read.disclosed);
@@ -304,6 +335,7 @@ fn a_state_field_outside_its_charset_reads_as_absent() {
         checked_at: Some(7),
         latest: Some("0.7.2\u{1b}[31m".into()),
         latest_channel: Some("stable".into()),
+        latest_key: Some("0.7.1?x".into()),
         notified: Some("../etc".into()),
         disclosed: true,
     };
@@ -312,6 +344,7 @@ fn a_state_field_outside_its_charset_reads_as_absent() {
     assert_eq!(read.install_id, None);
     assert_eq!(read.latest, None);
     assert_eq!(read.notified, None);
+    assert_eq!(read.latest_key, None);
     assert_eq!(read.latest_channel.as_deref(), Some("stable"));
     assert_eq!(read.checked_at, Some(7));
     assert!(read.disclosed);
@@ -420,7 +453,7 @@ fn recording_an_answer_keeps_what_another_command_wrote_meanwhile() {
         },
     )
     .unwrap();
-    record_answer(&path, Some(("stable".into(), "0.7.2".into())));
+    record_answer(&path, "0.7.1", Some(("stable".into(), "0.7.2".into())));
     let after = read_state(&path);
     assert_eq!(
         after.notified.as_deref(),
@@ -430,7 +463,7 @@ fn recording_an_answer_keeps_what_another_command_wrote_meanwhile() {
     assert!(after.disclosed);
     assert_eq!(after.latest.as_deref(), Some("0.7.2"));
     assert!(after.checked_at.is_some());
-    record_answer(&path, None);
+    record_answer(&path, "0.7.1", None);
     let failed = read_state(&path);
     assert_eq!(
         failed.latest.as_deref(),
@@ -456,7 +489,7 @@ fn recording_the_notice_keeps_an_answer_that_landed_meanwhile() {
     )
     .unwrap();
     // The child finished between this command's read and its notice.
-    record_answer(&path, Some(("stable".into(), "0.7.2".into())));
+    record_answer(&path, "0.7.1", Some(("stable".into(), "0.7.2".into())));
     record_notified(&path, "0.7.2");
     let after = read_state(&path);
     assert_eq!(after.notified.as_deref(), Some("0.7.2"));
@@ -481,6 +514,7 @@ fn the_notice_is_owed_once_per_new_pointer_on_a_channel_install() {
     let mut state = State {
         latest: Some("0.7.2".into()),
         latest_channel: Some("stable".into()),
+        latest_key: Some("0.7.1".into()),
         ..State::default()
     };
     assert_eq!(notice_due(&state, &install), Some("0.7.2"));
@@ -655,8 +689,7 @@ async fn a_404_an_odd_body_and_a_slow_endpoint_are_silent_within_the_budget() {
 }
 
 /// The disclosure is one sentence for a person: it names the switches by their
-/// settings, with no type name of this module's in it (a rename once put
-/// `UpdateDisabledReason:` where `Off:` belongs, review 2026-10-28).
+/// settings, with no type name of this module's in it.
 #[test]
 fn the_disclosure_reads_as_a_sentence() {
     let text = disclosure();
@@ -669,4 +702,133 @@ fn the_disclosure_reads_as_a_sentence() {
         "{text}"
     );
     assert!(text.ends_with(DOCS_URL), "{text}");
+}
+
+/// The config files are read without a panic: a config directory that does
+/// not resolve fails closed, and each outcome names the file it came from.
+#[test]
+fn the_config_state_names_its_file_and_never_panics() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let user_dir = tmp.path().join("user");
+    let org = tmp.path().join("org.toml");
+    assert_eq!(
+        config_state_at(None, &org),
+        ConfigState::Unreadable(None),
+        "no config directory is unreadable, not a panic"
+    );
+    assert_eq!(config_state_at(Some(&user_dir), &org), ConfigState::Enabled);
+    std::fs::write(&org, "[telemetry]\nenabled = false\n").unwrap();
+    assert_eq!(
+        config_state_at(Some(&user_dir), &org),
+        ConfigState::Disabled(org.clone())
+    );
+    std::fs::create_dir_all(&user_dir).unwrap();
+    std::fs::write(user_dir.join("config.toml"), "[telemetry\n").unwrap();
+    assert_eq!(
+        config_state_at(Some(&user_dir), &org),
+        ConfigState::Unreadable(Some(user_dir.join("config.toml"))),
+        "an unreadable file wins over one that turns the check off"
+    );
+}
+
+/// Every refusal says what to do next, in a sentence of its own.
+#[test]
+fn each_switch_names_its_remedy() {
+    let org = PathBuf::from(boxes::client::config::ORGANIZATION_CONFIG_PATH);
+    let user = PathBuf::from("/home/u/.config/minimal/config.toml");
+    let cases = [
+        (UpdateDisabledReason::Env("CI"), "Unset CI to run it."),
+        (
+            UpdateDisabledReason::Config(user.clone()),
+            "Remove that line, or set enabled = true, in /home/u/.config/minimal/config.toml",
+        ),
+        (UpdateDisabledReason::Config(org), "only an administrator"),
+        (
+            UpdateDisabledReason::ConfigUnreadable(Some(user)),
+            "Fix /home/u/.config/minimal/config.toml to run it.",
+        ),
+        (UpdateDisabledReason::ConfigUnreadable(None), "Set HOME"),
+        (UpdateDisabledReason::MinimalDir, "without --minimal-dir"),
+    ];
+    for (reason, want) in cases {
+        assert!(
+            reason.remedy().contains(want),
+            "{reason}: {}",
+            reason.remedy()
+        );
+    }
+}
+
+/// The installer's own `min` calls are kept out of the check.
+#[test]
+fn the_installer_guard_is_its_variable_set_and_not_empty() {
+    assert!(under_installer(env(&[(INSTALLER_VAR, "1")])));
+    assert!(!under_installer(env(&[(INSTALLER_VAR, "")])));
+    assert!(!under_installer(env(&[])));
+}
+
+/// `min update-check` prints the answer in the notice's words, and never
+/// calls a pointer newer: the client does not order versions.
+#[test]
+fn the_answer_line_states_the_pointer_and_the_installed_key() {
+    assert_eq!(
+        answer_line("stable", "0.7.2", "0.7.1"),
+        "the stable channel is at 0.7.2. You have 0.7.1."
+    );
+    assert_eq!(
+        answer_line("stable", "0.7.1", "0.7.1"),
+        "the stable channel is at 0.7.1. You have it."
+    );
+    assert!(!answer_line("stable", "0.7.0", "0.7.1").contains("newer"));
+}
+
+/// A reinstall leaves the cached answer behind: an answer asked for another
+/// installed key is not told to this build.
+#[test]
+fn an_answer_for_another_key_is_not_told() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join(STATE_FILE);
+    record_answer(&path, "0.7.1", Some(("stable".into(), "0.7.2".into())));
+    let state = read_state(&path);
+    assert_eq!(state.latest_key.as_deref(), Some("0.7.1"));
+    let reinstalled = Install {
+        channel: "stable".into(),
+        method: "installer".into(),
+        key: "0.7.3".into(),
+    };
+    assert_eq!(notice_due(&state, &reinstalled), None);
+    let before = Install {
+        key: "0.7.1".into(),
+        ..reinstalled
+    };
+    assert_eq!(notice_due(&state, &before), Some("0.7.2"));
+}
+
+/// The request's `User-Agent` is the same for every install, so the header
+/// carries nothing beyond the six fields.
+#[tokio::test]
+async fn the_request_sends_a_fixed_user_agent() {
+    use std::io::{Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let n = s.read(&mut buf).unwrap_or(0);
+        let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase());
+        let body = r#"{"channel":"stable","latest":"0.7.2"}"#;
+        let _ = write!(
+            s,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+    });
+    let url = format!(
+        "http://127.0.0.1:{port}/v1/stable/0.7.1?os=linux&arch=x86_64&install=installer&id=x"
+    );
+    assert!(fetch_latest(&url).await.is_some());
+    let head = rx.recv().unwrap();
+    assert!(head.contains("\r\nuser-agent: min\r\n"), "{head}");
+    assert_eq!(USER_AGENT, "min");
 }

@@ -168,8 +168,11 @@ pub enum Command {
     Update(UpdateArgs),
     /// Print CLI and daemon version information
     Version,
-    /// The daily update check (gominimal/inbox#589): run it now, or as the
-    /// detached child every command spawns once a day.
+    /// Check now whether your channel has a newer release.
+    ///
+    /// min makes this check by itself once a day; see
+    /// https://docs.minimal.dev/reference/telemetry#update-check for what
+    /// it sends and how to turn it off.
     #[command(name = "update-check", hide = true)]
     UpdateCheck(UpdateCheckArgs),
     /// Demo the client's activity spinner (development aid).
@@ -1691,9 +1694,8 @@ pub struct SpinArgs {
 /// `min update-check`: see [`crate::update_check`].
 #[derive(Debug, Default, Args)]
 pub struct UpdateCheckArgs {
-    /// The detached child: one request within the budget, the answer
-    /// cached for the next command, nothing printed, exit 0 whatever
-    /// happens.
+    /// Check without printing anything and keep the answer for the next
+    /// command, as the daily check does. Always exits 0.
     #[arg(long, conflicts_with = "dry_run")]
     pub background: bool,
     /// Print the request that would be made, and the switch that stops it

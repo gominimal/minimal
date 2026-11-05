@@ -6,8 +6,8 @@
 use serde::Deserialize;
 
 use super::{
-    ENDPOINT, ENDPOINT_VAR, Install, LOCK_FILE, REQUEST_BUDGET, STATE_FILE, read_install,
-    read_state, record_answer, release_lock, state_dir,
+    DOCS_URL, ENDPOINT, ENDPOINT_VAR, Install, LOCK_FILE, REQUEST_BUDGET, STATE_FILE, read_install,
+    read_state, record_answer, release_lock, state_dir, valid_field,
 };
 use crate::cli::{GlobalArgs, UpdateCheckArgs};
 
@@ -48,16 +48,15 @@ pub(super) const CHILD_MUTE: [(&str, &str); 3] = [
 ];
 
 /// The detached child: this binary, `update-check --background`, its own
-/// process group, null stdio. Whether it was spawned.
+/// process group, null stdio. Whether it was spawned. Only the config
+/// directory is passed on: `--minimal-dir` turns the check off, so a child
+/// never runs under an alternate state directory.
 pub(super) fn spawn_background(global: &GlobalArgs) -> bool {
     use std::os::unix::process::CommandExt as _;
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
     let mut cmd = std::process::Command::new(exe);
-    if let Some(d) = &global.minimal_dir {
-        cmd.arg("--minimal-dir").arg(d);
-    }
     if let Some(d) = &global.config_dir {
         cmd.arg("--config-dir").arg(d);
     }
@@ -82,6 +81,10 @@ pub(super) fn spawn_background(global: &GlobalArgs) -> bool {
     true
 }
 
+/// The `User-Agent` of the request: the same for every install, so the
+/// header carries nothing the six fields do not.
+pub const USER_AGENT: &str = "min";
+
 /// The endpoint's answer.
 #[derive(Debug, Deserialize)]
 struct Answer {
@@ -98,7 +101,7 @@ pub async fn fetch_latest(url: &str) -> Option<(String, String)> {
         .redirect(reqwest::redirect::Policy::none())
         .timeout(REQUEST_BUDGET)
         .connect_timeout(REQUEST_BUDGET)
-        .user_agent(format!("min/{}", version::VERSION))
+        .user_agent(USER_AGENT)
         .build()
         .ok()?;
     let resp = client.get(url).send().await.ok()?;
@@ -107,13 +110,8 @@ pub async fn fetch_latest(url: &str) -> Option<(String, String)> {
     }
     let text = resp.text().await.ok()?;
     let answer: Answer = serde_json_lenient::from_str(&text).ok()?;
-    let ok = |s: &str| {
-        !s.is_empty()
-            && s.len() <= 64
-            && s.chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-    };
-    (ok(&answer.channel) && ok(&answer.latest)).then_some((answer.channel, answer.latest))
+    (valid_field(&answer.channel) && valid_field(&answer.latest))
+        .then_some((answer.channel, answer.latest))
 }
 
 /// `min update-check`: the check, now. `--background` is the detached
@@ -126,7 +124,10 @@ pub async fn cmd_update_check(
 ) -> Result<(), anyhow::Error> {
     let off = super::off(global);
     let Some(dir) = state_dir(global) else {
-        anyhow::bail!("no state directory (HOME is not set)");
+        anyhow::bail!(
+            "the update check found no state directory: XDG_STATE_HOME and HOME give no \
+             absolute UTF-8 path. Set one of them to run it."
+        );
     };
     let state_path = dir.join(STATE_FILE);
     let mut state = read_state(&state_path);
@@ -147,48 +148,57 @@ pub async fn cmd_update_check(
     let id = state
         .install_id
         .clone()
-        .unwrap_or_else(|| "<minted on the first run>".to_string());
+        .unwrap_or_else(|| "<a random id, made on the first run>".to_string());
     let url = request_url(&endpoint(), &install, &id);
 
     if args.dry_run {
         println!("GET {url}");
         match off {
-            Some(off) => println!("disabled by {off}: the request is not made"),
+            Some(off) => println!(
+                "disabled by {off}: the request is not made. {}",
+                off.remedy()
+            ),
             None => println!("enabled: made at most once every 24 hours"),
         }
         println!(
-            "channel {} via {}, installed key {}",
-            install.channel, install.method, install.key
+            "this install: the {} channel at {}, installed by {}",
+            install.channel, install.key, install.method
         );
         return Ok(());
     }
     if args.background {
         if off.is_none() && state.install_id.is_some() {
             let answer = fetch_latest(&url).await;
-            record_answer(&state_path, answer);
+            record_answer(&state_path, &install.key, answer);
         }
         release_lock(&dir.join(LOCK_FILE));
         return Ok(());
     }
     if let Some(off) = off {
-        anyhow::bail!("the update check is disabled by {off}");
+        anyhow::bail!("the update check is disabled by {off}. {}", off.remedy());
     }
     match fetch_latest(&url).await {
         Some((channel, latest)) => {
-            let standing = if latest == install.key {
-                "up to date"
-            } else {
-                "newer pointer available"
-            };
-            println!(
-                "{channel}: {latest} ({standing}; installed key {})",
-                install.key
-            );
+            println!("{}", answer_line(&channel, &latest, &install.key));
             if state.install_id.is_some() {
-                record_answer(&state_path, Some((channel, latest)));
+                record_answer(&state_path, &install.key, Some((channel, latest)));
             }
             Ok(())
         }
-        None => anyhow::bail!("no answer from {url} within {}s", REQUEST_BUDGET.as_secs()),
+        None => anyhow::bail!(
+            "the update check got no usable answer from {url}. Run it again later; {DOCS_URL} \
+             describes the check."
+        ),
+    }
+}
+
+/// What `min update-check` prints for an answer, in the notice's words. The
+/// client never orders versions, so a pointer other than the installed key
+/// is stated, not called newer.
+pub fn answer_line(channel: &str, latest: &str, key: &str) -> String {
+    if latest == key {
+        format!("the {channel} channel is at {latest}. You have it.")
+    } else {
+        format!("the {channel} channel is at {latest}. You have {key}.")
     }
 }

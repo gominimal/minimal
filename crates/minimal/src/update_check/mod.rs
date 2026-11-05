@@ -17,22 +17,29 @@
 //! - "Up to date" is `latest == key`, the key this build was installed from
 //!   (the channel pointer at install time, written to `install.toml` by the
 //!   installer), so the client never orders versions and a misbehaving
-//!   endpoint cannot nag: an answer equal to the key is silence.
+//!   endpoint cannot nag: an answer equal to the key is silence. An answer
+//!   is kept with the key it was asked for, so a reinstall never reads an
+//!   answer meant for the build it replaced.
 //! - The notice goes to stderr, only when stderr is a terminal, once per
-//!   new pointer. stdout belongs to the command's own output.
+//!   new pointer, and only before a short command whose output leaves it in
+//!   view ([`leaves_the_notice_visible`]: `min ls`, `min dirs`, ...). stdout
+//!   belongs to the command's own output.
 //! - Off switches, any one wins: `[telemetry] enabled = false` in the user
 //!   config or the organization's, `MINIMAL_TELEMETRY` falsy,
 //!   `OTEL_SDK_DISABLED=true` (D9: it turns off everything), `DO_NOT_TRACK`
 //!   set, or `CI` set (CI installs `min` per job and would mint an install
 //!   id each time).
-//! - On by default until 1.0. The first run with a terminal says so on
-//!   stderr and makes no request; the request waits for a later command.
-//!   An install whose commands are a script's or an agent's (no terminal)
-//!   is counted from its second command without that text: the docs page
-//!   and the installer's closing card carry it, and the decision to count
-//!   those installs is inbox#589's. Its first command with a terminal still
-//!   gets the disclosure, and makes no request that time either.
-
+//! - The installer's own `min` calls ([`INSTALLER_VAR`]) do nothing here:
+//!   they run before its closing card has disclosed the check.
+//! - On by default until 1.0. The disclosure prints on stderr before the
+//!   first short command with a terminal (the notice's rule), and that
+//!   command makes no request; the request waits for a later command. A
+//!   command with a terminal that takes the screen (bare `min`, an attach)
+//!   neither discloses nor sends. An install whose commands are a script's
+//!   or an agent's (no terminal) is counted from its second command without
+//!   that line: the docs page and the installer's closing card carry it.
+//!   Its first short command with a terminal still gets the disclosure, and
+//!   makes no request that time either.
 //!
 //! Layout: this file is the per-command hook ([`before_command`]) and the
 //! constants; `switches` is what turns the check off; `state` is what it
@@ -56,13 +63,13 @@ mod tests;
 
 pub use notice::{disclosure, disclosure_due, notice, notice_due};
 use request::spawn_background;
-pub use request::{cmd_update_check, fetch_latest, request_url};
+pub use request::{USER_AGENT, answer_line, cmd_update_check, fetch_latest, request_url};
 pub use state::{
     Install, State, acquire_lock, build_key, due, now_secs, read_install, read_state,
     record_answer, record_notified, release_lock, valid_field, valid_install_id, write_state,
 };
 use state::{claim_install_id, record_disclosed};
-pub use switches::{ConfigState, UpdateDisabledReason, off_switch};
+pub use switches::{ConfigState, UpdateDisabledReason, config_state_at, off_switch};
 
 /// The version endpoint; `MINIMAL_UPDATE_CHECK_URL` overrides it.
 pub const ENDPOINT: &str = "https://update.minimal.dev/v1";
@@ -88,6 +95,11 @@ pub const SOURCE_CHANNEL: &str = "source";
 /// counted, and never told about another pointer (there is no
 /// `go.minimal.dev/pinned` to run).
 pub const PINNED_CHANNEL: &str = "pinned";
+/// Set by the installer for its own `min` calls (its probe,
+/// `finalize-install`, the stop of an older daemon). Those mint no id, send
+/// nothing and print nothing: they run before the installer's closing card
+/// discloses the check.
+pub const INSTALLER_VAR: &str = "MINIMAL_UNDER_INSTALLER";
 
 /// The state directory: `--minimal-dir`, else `$XDG_STATE_HOME/minimal`.
 fn state_dir(global: &GlobalArgs) -> Option<PathBuf> {
@@ -114,7 +126,10 @@ fn off(global: &GlobalArgs) -> Option<UpdateDisabledReason> {
 /// cannot turn on what the administrator turned off). A missing file is the
 /// default, on. A file that exists but cannot be read or parsed turns the
 /// check off: it may well carry `enabled = false` next to the typo, and a
-/// check that is skipped until the file is fixed costs nothing.
+/// check that is skipped until the file is fixed costs nothing. A config
+/// directory that does not resolve (no `XDG_CONFIG_HOME`, no home) counts as
+/// unreadable the same way, and resolving it never panics: this runs before
+/// every command, most of which read no config.
 ///
 /// Read directly and silently, not through [`crate::config`]'s readers:
 /// those print an organization file's error and its refused store rules on
@@ -122,14 +137,17 @@ fn off(global: &GlobalArgs) -> Option<UpdateDisabledReason> {
 /// command (`min ls`, and `min proxy`, whose stderr is ssh's). The check
 /// never fails the command; the file's own error prints where it is used.
 fn config_state(global: &GlobalArgs) -> ConfigState {
-    use boxes::client::config::{ORGANIZATION_CONFIG_PATH, read_config_or_default};
-    let user = crate::config::resolve_minimal_config_dir(global).join("config.toml");
-    let read = |path: &Path| read_config_or_default(path).map(|c| c.telemetry.enabled);
-    match (read(&user), read(Path::new(ORGANIZATION_CONFIG_PATH))) {
-        (Ok(true), Ok(true)) => ConfigState::Enabled,
-        (Ok(_), Ok(_)) => ConfigState::Disabled,
-        _ => ConfigState::Unreadable,
-    }
+    let user = paths::try_minimal_config_dir_with_override(global.config_dir.as_deref());
+    config_state_at(
+        user.as_deref(),
+        Path::new(boxes::client::config::ORGANIZATION_CONFIG_PATH),
+    )
+}
+
+/// Whether this `min` runs under the installer: [`INSTALLER_VAR`] set and
+/// not empty.
+pub fn under_installer(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+    var(INSTALLER_VAR).is_some_and(|v| !v.is_empty())
 }
 
 /// The commands that do not trigger the check: the check itself, the
@@ -179,7 +197,7 @@ pub fn leaves_the_notice_visible(command: &Option<crate::cli::Command>) -> bool 
 /// The per-command hook: never waits, never fails the command. See the
 /// module doc.
 pub fn before_command(global: &GlobalArgs, command: &Option<crate::cli::Command>) {
-    if skip_for(command) {
+    if skip_for(command) || under_installer(|n| std::env::var_os(n)) {
         return;
     }
     if off(global).is_some() {
@@ -197,7 +215,7 @@ pub fn before_command(global: &GlobalArgs, command: &Option<crate::cli::Command>
     // file, so two first commands that run together mint one id between
     // them (the other finds it on disk, or finds the lock held and leaves
     // the minting to the next command) and neither clobbers the other's
-    // write: a last-writer-wins here was one install counted twice.
+    // write, which would count one install twice.
     let first_run = state.install_id.is_none();
     if first_run {
         match claim_install_id(&dir, &state_path) {
@@ -216,19 +234,16 @@ pub fn before_command(global: &GlobalArgs, command: &Option<crate::cli::Command>
     }
     // No request in the command that minted the id, nor in the one that
     // printed the disclosure: the request waits for a later command either
-    // way. Without a terminal (an agent, a script, the installer's own
-    // `finalize-install` call) the install is counted from its second
-    // command, and its first command with a terminal still discloses, and
-    // still sends nothing that time.
+    // way. Without a terminal (an agent, a script) the install is counted
+    // from its second command, and its first short command with a terminal
+    // still discloses, and still sends nothing that time.
     if first_run || disclose {
         return;
     }
     // A terminal that has not read the disclosure yet (its commands so far
     // took the screen) sends nothing either: the first interactive command
-    // that leaves the line visible discloses, and the request waits for the
-    // one after. An install without a terminal is counted from its second
-    // command, as the module doc says: that is inbox#589's decision, not a
-    // gap here.
+    // that leaves the line in view discloses, and the request waits for the
+    // one after. Without a terminal there is no line to wait for.
     if tty && !state.disclosed {
         return;
     }

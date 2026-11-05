@@ -1,20 +1,24 @@
-//! The switches that turn the check off: the environment and the user
-//! config, read in a fixed order ([`off_switch`]).
+//! The switches that turn the check off: the environment and the config
+//! files (the user's and the organization's), read in a fixed order
+//! ([`off_switch`]).
 
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 
+use boxes::client::config::ORGANIZATION_CONFIG_PATH;
 use mlog::otel::Flag;
 
 /// What turned the check off.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateDisabledReason {
-    /// `[telemetry] enabled = false` in the user config or the
-    /// organization's (`/etc/minimal/config.toml`): either turns it off.
-    Config,
-    /// A config file exists but could not be read or parsed: the check
-    /// fails closed until it is fixed, and says so rather than claiming a
-    /// setting the file may not hold.
-    ConfigUnreadable,
+    /// `[telemetry] enabled = false` in this file: the user config or the
+    /// organization's (`/etc/minimal/config.toml`). Either turns it off.
+    Config(PathBuf),
+    /// This config file exists but could not be read or parsed, or (`None`)
+    /// no config directory resolves at all. The check fails closed until it
+    /// is fixed, and says so rather than claiming a setting the file may not
+    /// hold.
+    ConfigUnreadable(Option<PathBuf>),
     /// An environment variable, named.
     Env(&'static str),
     /// `--minimal-dir`: an alternate state directory has its own state file
@@ -23,18 +27,45 @@ pub enum UpdateDisabledReason {
     MinimalDir,
 }
 
+impl UpdateDisabledReason {
+    /// What the person can do to run the check again, as one sentence.
+    pub fn remedy(&self) -> String {
+        match self {
+            Self::Config(path) if path == Path::new(ORGANIZATION_CONFIG_PATH) => {
+                "Your organization turned it off; only an administrator can turn it back on."
+                    .to_string()
+            }
+            Self::Config(path) => format!(
+                "Remove that line, or set enabled = true, in {} to run it.",
+                path.display()
+            ),
+            Self::ConfigUnreadable(Some(path)) => format!("Fix {} to run it.", path.display()),
+            Self::ConfigUnreadable(None) => {
+                "Set HOME, or pass --config-dir, to run it.".to_string()
+            }
+            Self::Env(name) => format!("Unset {name} to run it."),
+            Self::MinimalDir => "Run it without --minimal-dir.".to_string(),
+        }
+    }
+}
+
 impl std::fmt::Display for UpdateDisabledReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UpdateDisabledReason::Config => {
-                f.write_str("[telemetry] enabled = false in config.toml (yours or /etc/minimal/config.toml)")
+            Self::Config(path) => {
+                write!(f, "[telemetry] enabled = false in {}", path.display())
             }
-            UpdateDisabledReason::ConfigUnreadable => f.write_str(
-                "a config.toml (yours or /etc/minimal/config.toml) that could not be read or parsed \
-                 (the check stays off until it is fixed)",
+            Self::ConfigUnreadable(Some(path)) => {
+                write!(f, "{}, which could not be read or parsed", path.display())
+            }
+            Self::ConfigUnreadable(None) => f.write_str(
+                "the missing config directory (neither XDG_CONFIG_HOME nor HOME is an absolute \
+                 UTF-8 path)",
             ),
-            UpdateDisabledReason::Env(name) => write!(f, "{name} in the environment"),
-            UpdateDisabledReason::MinimalDir => f.write_str("--minimal-dir (an alternate state directory is not counted)"),
+            Self::Env(name) => write!(f, "{name} in the environment"),
+            Self::MinimalDir => {
+                f.write_str("--minimal-dir (an alternate state directory is not counted)")
+            }
         }
     }
 }
@@ -67,19 +98,43 @@ pub fn off_switch(
     }
     match config {
         ConfigState::Enabled => None,
-        ConfigState::Disabled => Some(UpdateDisabledReason::Config),
-        ConfigState::Unreadable => Some(UpdateDisabledReason::ConfigUnreadable),
+        ConfigState::Disabled(path) => Some(UpdateDisabledReason::Config(path)),
+        ConfigState::Unreadable(path) => Some(UpdateDisabledReason::ConfigUnreadable(path)),
     }
 }
 
 /// What the config files say about the check: the user's and the
 /// organization's, read together, the stricter winning.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigState {
     /// Both missing, or present with the check on (the default).
     Enabled,
-    /// `[telemetry] enabled = false` in either.
-    Disabled,
-    /// One is present but not readable or not parsable.
-    Unreadable,
+    /// `[telemetry] enabled = false` in this file.
+    Disabled(PathBuf),
+    /// This file is present but not readable or not parsable, or (`None`)
+    /// the user's config directory does not resolve.
+    Unreadable(Option<PathBuf>),
+}
+
+/// [`ConfigState`] from the user's config directory (`None` when it does
+/// not resolve) and the organization's file. An unreadable file wins over
+/// one that turns the check off, and the user's file is named first.
+pub fn config_state_at(user_dir: Option<&Path>, organization: &Path) -> ConfigState {
+    use boxes::client::config::read_config_or_default;
+    let Some(user_dir) = user_dir else {
+        return ConfigState::Unreadable(None);
+    };
+    let mut state = ConfigState::Enabled;
+    for path in [user_dir.join("config.toml"), organization.to_path_buf()] {
+        match read_config_or_default(&path) {
+            Ok(config) if config.telemetry.enabled => {}
+            Ok(_) => {
+                if state == ConfigState::Enabled {
+                    state = ConfigState::Disabled(path);
+                }
+            }
+            Err(_) => return ConfigState::Unreadable(Some(path)),
+        }
+    }
+    state
 }

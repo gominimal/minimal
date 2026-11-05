@@ -1,11 +1,12 @@
 //! What the check keeps on disk: the install description the installer
-//! wrote ([`Install`]), the state file ([`State`]) with its two writers
-//! that never clobber a concurrent one ([`record_answer`],
-//! [`record_notified`]), the daily cadence ([`due`]) and the lock between
-//! two commands that would both spawn a check.
+//! wrote ([`Install`]), the state file ([`State`]) with its writers, each
+//! of which re-reads the file and changes only its own fields so none
+//! clobbers a concurrent one ([`claim_install_id`], [`record_disclosed`],
+//! [`record_answer`], [`record_notified`]), the daily cadence ([`due`]) and
+//! the lock between two commands that would both spawn a check.
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{INSTALL_FILE, INTERVAL, LOCK_STALE, SOURCE_CHANNEL, STATE_FILE};
@@ -59,26 +60,53 @@ impl Install {
     }
 }
 
-/// The install description: the per-user file the installer wrote, else
-/// the read-only one a package ships beside the binary
-/// (`<prefix>/share/minimal/install.toml`, two levels up from `bin/min`),
-/// else [`Install::source`]. A file that does not parse, or whose fields
-/// are outside the charset a request path, query or terminal may carry,
-/// counts as absent: a package's file is not this program's to trust.
+/// The per-user file as the installer writes it: the install, and the
+/// binary it installed (`bin`), which ties the file to that binary.
+#[derive(Deserialize)]
+struct InstallRecord {
+    channel: String,
+    method: String,
+    key: String,
+    bin: PathBuf,
+}
+
+/// The install description: the per-user file the installer wrote, when
+/// its `bin` is the running binary; else the read-only one a package ships
+/// beside the binary (`<prefix>/share/minimal/install.toml`, two levels up
+/// from `bin/min`); else [`Install::source`]. The per-user file belongs to
+/// the user, not to a build: a development build or a copy in another
+/// prefix on the same machine is not the install it describes, and reads
+/// as `source`. A file that does not parse, or whose fields are outside the
+/// charset a request path, query or terminal may carry, counts as absent: a
+/// package's file is not this program's to trust.
 pub fn read_install(state_dir: &Path, exe: Option<&Path>) -> Install {
-    let per_user = state_dir.join(INSTALL_FILE);
-    let packaged = exe
-        .and_then(|e| e.parent())
-        .and_then(|bin| bin.parent())
-        .map(|prefix| prefix.join("share").join("minimal").join(INSTALL_FILE));
-    [Some(per_user), packaged]
-        .into_iter()
-        .flatten()
-        .find_map(|p| {
-            let text = std::fs::read_to_string(p).ok()?;
-            toml::from_str::<Install>(&text).ok().filter(Install::valid)
+    let per_user = || {
+        let text = std::fs::read_to_string(state_dir.join(INSTALL_FILE)).ok()?;
+        let record = toml::from_str::<InstallRecord>(&text).ok()?;
+        same_file(&record.bin, exe?).then_some(Install {
+            channel: record.channel,
+            method: record.method,
+            key: record.key,
         })
+    };
+    let packaged = || {
+        let prefix = exe?.parent()?.parent()?;
+        let path = prefix.join("share").join("minimal").join(INSTALL_FILE);
+        toml::from_str::<Install>(&std::fs::read_to_string(path).ok()?).ok()
+    };
+    per_user()
+        .filter(Install::valid)
+        .or_else(|| packaged().filter(Install::valid))
         .unwrap_or_else(Install::source)
+}
+
+/// Whether two paths name one file, links resolved. A path that does not
+/// resolve names nothing.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// What the last check learned, and what this install has already been
@@ -94,6 +122,9 @@ pub struct State {
     pub latest: Option<String>,
     /// The channel that answer was for.
     pub latest_channel: Option<String>,
+    /// The installed key that answer was asked for: an answer for another
+    /// key (the build a reinstall replaced) is not this build's.
+    pub latest_key: Option<String>,
     /// The pointer the user was last told about: the notice prints once per
     /// new pointer.
     pub notified: Option<String>,
@@ -114,6 +145,7 @@ pub fn read_state(path: &Path) -> State {
     state.install_id = state.install_id.filter(|id| valid_install_id(id));
     state.latest = state.latest.filter(|s| valid_field(s));
     state.latest_channel = state.latest_channel.filter(|s| valid_field(s));
+    state.latest_key = state.latest_key.filter(|s| valid_field(s));
     state.notified = state.notified.filter(|s| valid_field(s));
     state
 }
@@ -199,9 +231,10 @@ pub(super) fn new_install_id() -> String {
 /// The install id, minted if the file has none: taken under the spawn lock
 /// ([`acquire_lock`]) so two first commands running together mint one id
 /// between them, and written by re-reading the file so nothing another
-/// command wrote meanwhile is put back. `None` when the lock is held (the
-/// other command is minting, or has spawned the check; this command does
-/// nothing and the next one finds the id) or the write failed.
+/// command wrote meanwhile is put back. Fails with [`ClaimFailed`] when the
+/// lock is held (the other command is minting, or has spawned the check;
+/// this command does nothing and the next one finds the id) or the write
+/// failed.
 pub(super) fn claim_install_id(dir: &Path, state_path: &Path) -> Result<State, ClaimFailed> {
     let lock = dir.join(super::LOCK_FILE);
     if !acquire_lock(&lock) {
@@ -244,13 +277,14 @@ impl std::fmt::Display for ClaimFailed {
             Self::Locked => {
                 write!(
                     f,
-                    "another min command is minting the install id or checking now; run this again"
+                    "another min command is running the check. Run this again."
                 )
             }
             Self::NotSaved { path, err } => {
                 write!(
                     f,
-                    "the install id could not be saved to {}: {err}",
+                    "the update check could not write {}: {err}. Make its directory writable, \
+                     or free space on that disk, then run this again.",
                     path.display()
                 )
             }
@@ -280,15 +314,17 @@ pub fn record_notified(state_path: &Path, latest: &str) {
 }
 
 /// Writes a check's outcome into the state file: `checked_at` now, and the
-/// answer when there was one. The file is re-read first and only those
-/// fields change: a command that ran during the request (up to
-/// [`REQUEST_BUDGET`]) may have printed the notice and written `notified`,
-/// and the state read before the request would put the stale value back.
-pub fn record_answer(state_path: &Path, answer: Option<(String, String)>) {
+/// answer when there was one, with the installed `key` it was asked for.
+/// The file is re-read first and only those fields change: a command that
+/// ran during the request (up to [`REQUEST_BUDGET`]) may have printed the
+/// notice and written `notified`, and the state read before the request
+/// would put the stale value back.
+pub fn record_answer(state_path: &Path, key: &str, answer: Option<(String, String)>) {
     let mut state = read_state(state_path);
     if let Some((channel, latest)) = answer {
         state.latest = Some(latest);
         state.latest_channel = Some(channel);
+        state.latest_key = Some(key.to_string());
     }
     state.checked_at = Some(now_secs());
     // Unwritable: the next command finds the check still due and tries again;
