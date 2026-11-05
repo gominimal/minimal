@@ -6434,9 +6434,11 @@ impl BoxRegistry {
     /// client admitted: a box the host never admitted gains nothing, so a
     /// guest that lies can drop its own boxes' egress but never widen it.
     ///
-    /// `mark` is [`Self::host_ip_admit_mark`], taken before the list was
-    /// read. A box a client admitted after the mark keeps its rules for
-    /// this pass: the list can predate the box, or its resume.
+    /// `mark` is [`Self::host_ip_admit_mark`], taken when the previous
+    /// pass began, not before this pass's read. A box a client admitted
+    /// after the mark keeps its rules for this pass: the list can predate
+    /// the box, or its resume. A resume admits before the attach starts the
+    /// box, so a list read after that admit can still say `stopped`.
     ///
     /// One info line per box dropped or admitted again, naming the box, its
     /// state in the guest and the trigger. A pass that changes nothing logs
@@ -6558,9 +6560,8 @@ impl BoxRegistry {
         outcome
     }
 
-    /// The client admits so far. Take it before reading the in-VM daemon's
-    /// session list, and hand it to [`Self::reconcile_host_ip_boxes`] with
-    /// that list.
+    /// The client admits so far. Take it when a pass begins, and hand it
+    /// to the next pass's [`Self::reconcile_host_ip_boxes`].
     #[must_use]
     pub fn host_ip_admit_mark(&self) -> HostIpAdmitMark {
         let resident = self
@@ -7606,8 +7607,9 @@ impl std::fmt::Display for HostIpReconcileTrigger {
 
 /// The count of client admits of `host_ip` boxes at one moment
 /// ([`BoxRegistry::host_ip_admit_mark`]). A reconcile leaves alone a box a
-/// client admitted after the mark its session list was read under.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// client admitted after the mark it is given. The default is the mark
+/// before any admit.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct HostIpAdmitMark(u64);
 
 /// The boxes one reconcile changed, in session order.
@@ -13702,6 +13704,45 @@ mod tests {
             &held,
             "the box rejoins with the rules the host client admitted"
         );
+    }
+
+    /// NET-085 with BOX-025: a resume admits a stopped box before the
+    /// attach starts it, so a list read after the admit can still say
+    /// `stopped`. The pass takes the previous pass's mark, so it leaves the
+    /// box alone. The next pass decides on what the guest then reports.
+    #[test]
+    fn host_ip_box_running_again_is_readmitted_after_a_resume_admit() {
+        for runs_next in [true, false] {
+            let registry = BoxRegistry::new(SUBNET);
+            let resumed = mirror_session(1);
+            let before_admit = registry.host_ip_admit_mark();
+            assert!(registry.admit_host_ip_box(resumed, Some(&one_subnet_policy())));
+            let first_pass = registry.host_ip_admit_mark();
+
+            let stopped = BTreeMap::from([(resumed, boxes::BoxState::Stopped)]);
+            assert!(
+                registry
+                    .reconcile_host_ip_boxes(&stopped, before_admit, HostIpReconcileTrigger::Timer)
+                    .is_empty(),
+                "a box admitted since the previous pass keeps its rules"
+            );
+            assert_eq!(resident_sessions(&registry), vec![resumed]);
+
+            let next = if runs_next {
+                BTreeMap::from([(resumed, boxes::BoxState::Active)])
+            } else {
+                stopped
+            };
+            let outcome =
+                registry.reconcile_host_ip_boxes(&next, first_pass, HostIpReconcileTrigger::Timer);
+            if runs_next {
+                assert!(outcome.is_empty(), "a running box keeps its rules");
+                assert_eq!(resident_sessions(&registry), vec![resumed]);
+            } else {
+                assert_eq!(outcome.dropped, vec![resumed]);
+                assert!(resident_sessions(&registry).is_empty());
+            }
+        }
     }
 
     /// NET-085 with BEP-082: a box a reconcile set aside because it stopped
