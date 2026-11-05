@@ -3087,6 +3087,9 @@ enum BoxEnd {
     /// The retire of a destroyed host_ip box. Only a destroy revokes: the
     /// retire of a stopped box sends no revocation (BEP-043).
     HostIpRetire,
+    /// A reconcile found a host_ip box the VM no longer lists: the in-VM
+    /// daemon destroyed it with no retire from a client (BEP-043).
+    HostIpGuestDestroy,
 }
 
 impl BoxEnd {
@@ -3096,6 +3099,7 @@ impl BoxEnd {
         match self {
             Self::Destroy => "the destroy completed",
             Self::HostIpRetire => "the box was destroyed",
+            Self::HostIpGuestDestroy => "the VM destroyed the box",
         }
     }
 }
@@ -6515,12 +6519,16 @@ impl BoxRegistry {
     /// no client of this host retired it. Its rules are set aside, not
     /// dropped. A set-aside box the guest reports running again (a resume)
     /// rejoins the union with those rules. A set-aside box the guest no
-    /// longer lists at all is forgotten.
+    /// longer lists at all is forgotten. A box the guest no longer lists
+    /// was destroyed there: when it declared a credentialed upstream under
+    /// an id this registry minted, its id is revoked at the Box Egress
+    /// Proxy, as a client's destroy does (BEP-043).
     ///
     /// Root in the VM controls the guest's list, so a guest can move the
     /// union, but only within the rules host clients admitted, never past
     /// them. A false `running` can bring back a set-aside box's rules, as a
-    /// real resume in the VM does. A false absence can drop a box's rules.
+    /// real resume in the VM does. A false absence can drop a box's rules,
+    /// and revoke a grant box's id: that only takes a credential away.
     /// A box the host never admitted gains nothing. Rules a client retired
     /// are never set aside ([`Self::retire_host_ip_box`]), so no list
     /// brings them back.
@@ -6539,9 +6547,11 @@ impl BoxRegistry {
         trigger: HostIpReconcileTrigger,
     ) -> HostIpReconcile {
         let mut outcome = HostIpReconcile::default();
-        // The boxes the guest destroyed: their registration names go, as
-        // a retire's do ([`Self::retire_host_ip_box`]).
-        let mut ended: Vec<boxes::SessionId> = Vec::new();
+        // The boxes the guest destroyed, each with whether its rules
+        // declared a credentialed upstream: their registration names go,
+        // and a grant box's minted id is revoked, as a destroy's retire
+        // does ([`Self::retire_host_ip_box`], BEP-043).
+        let mut ended: Vec<(boxes::SessionId, bool)> = Vec::new();
         let mut resident = self
             .host_ip_boxes
             .write()
@@ -6565,7 +6575,7 @@ impl BoxRegistry {
                 if guest.contains_key(&session) {
                     resident.dormant.insert(session, rules);
                 } else {
-                    ended.push(session);
+                    ended.push((session, rules.declares_credentialed_upstream()));
                 }
                 outcome.dropped.push(session);
             }
@@ -6586,9 +6596,9 @@ impl BoxRegistry {
         ended.extend(
             resident
                 .dormant
-                .keys()
-                .filter(|session| !guest.contains_key(session))
-                .copied(),
+                .iter()
+                .filter(|(session, _)| !guest.contains_key(session))
+                .map(|(session, rules)| (*session, rules.declares_credentialed_upstream())),
         );
         resident
             .dormant
@@ -6601,12 +6611,32 @@ impl BoxRegistry {
         } = &mut *resident;
         admitted_at
             .retain(|session, _| held.contains_key(session) || dormant.contains_key(session));
+        let mut revoke: Vec<BoxId> = Vec::new();
         if !ended.is_empty() {
             // The resident set's lock is taken before the ids' lock, as on
             // the register path.
             let mut ids = self.host_ip_id_set();
-            ids.by_name
-                .retain(|_, named| !ended.contains(&boxes::SessionId::from_bytes(named.id)));
+            ids.by_name.retain(|_, named| {
+                !ended
+                    .iter()
+                    .any(|(session, _)| session.to_bytes() == named.id)
+            });
+            // The destroy is final, so the id leaves the stopped set. It
+            // stays in the id set, so no later mint takes it (BEP-082).
+            for (session, credentialed) in &ended {
+                let id = session.to_bytes();
+                let was_stopped = ids.stopped_credentialed.remove(&id);
+                if (*credentialed || was_stopped) && ids.ids.contains(&id) {
+                    revoke.push(id);
+                }
+            }
+        }
+        if let Some(path) = self.proxy_control.as_deref() {
+            // BEP-043: the end of a grant box revokes its id, whichever
+            // side destroyed it. The pass never waits for the proxy.
+            for id in revoke {
+                spawn_revocation(path.clone(), id, BoxEnd::HostIpGuestDestroy);
+            }
         }
         if outcome.is_empty() {
             return outcome;
@@ -13844,6 +13874,94 @@ mod tests {
                 serde_json::json!({"op": "forget_box", "box_id": hex}),
             ],
             "the destroy of the stopped dormant box revokes its id"
+        );
+    }
+
+    // BEP-043: a grant box the VM no longer lists was destroyed there with
+    // no retire from a client. The reconcile revokes its id, for a box
+    // whose rules were resident and for one whose rules were set aside.
+    #[test]
+    fn a_grant_box_the_vm_destroyed_revokes_its_id() {
+        let registry = BoxRegistry::new(SUBNET);
+        let resident = registry
+            .register_host_ip_box_as("gone", [0x1c; 16])
+            .expect("no record holds the id");
+        let dormant = registry
+            .register_host_ip_box_as("gone-later", [0x1d; 16])
+            .expect("no record holds the id");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let server = stub_control(&path, &["{\"ok\":true}\n", "{\"ok\":true}\n"]);
+        let wired = registry.clone().with_proxy_control(Some(path.clone()));
+        let first = boxes::SessionId::from_bytes(resident);
+        let second = boxes::SessionId::from_bytes(dormant);
+        assert!(wired.admit_host_ip_box_with_lane(first, None, true));
+        assert!(wired.admit_host_ip_box_with_lane(second, None, true));
+        let guest = BTreeMap::from([(second, boxes::BoxState::Stopped)]);
+        let outcome = wired.reconcile_host_ip_boxes(
+            &guest,
+            wired.host_ip_admit_mark(),
+            HostIpReconcileTrigger::BoxEvent,
+        );
+        assert_eq!(outcome.dropped, vec![first, second]);
+        assert!(revocation_spawned(resident), "the destroyed box revokes");
+        assert!(!revocation_spawned(dormant), "the stopped box keeps its id");
+        let hex = "1c".repeat(16);
+        assert_eq!(
+            server.join().unwrap(),
+            [
+                serde_json::json!({"op": "revoke_box", "box_id": hex}),
+                serde_json::json!({"op": "forget_box", "box_id": hex}),
+            ]
+        );
+        assert!(wired.holds_host_ip_id(resident), "the revoked id stays");
+        assert_eq!(wired.host_ip_id_for("gone"), None);
+
+        std::fs::remove_file(&path).unwrap();
+        let server = stub_control(&path, &["{\"ok\":true}\n", "{\"ok\":true}\n"]);
+        wired.reconcile_host_ip_boxes(
+            &BTreeMap::new(),
+            wired.host_ip_admit_mark(),
+            HostIpReconcileTrigger::Timer,
+        );
+        assert!(revocation_spawned(dormant), "the set-aside box revokes");
+        let hex = "1d".repeat(16);
+        assert_eq!(
+            server.join().unwrap(),
+            [
+                serde_json::json!({"op": "revoke_box", "box_id": hex}),
+                serde_json::json!({"op": "forget_box", "box_id": hex}),
+            ]
+        );
+        assert_eq!(wired.host_ip_id_for("gone-later"), None);
+    }
+
+    // BEP-043: a box with no credentialed upstream that the VM destroyed
+    // holds no grant, so the reconcile sends the proxy nothing.
+    #[test]
+    fn a_plain_box_the_vm_destroyed_sends_no_revocation() {
+        let registry = BoxRegistry::new(SUBNET);
+        let id = registry
+            .register_host_ip_box_as("bare", [0x0e; 16])
+            .expect("no record holds the id");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let wired = registry.clone().with_proxy_control(Some(path));
+        let session = boxes::SessionId::from_bytes(id);
+        assert!(wired.admit_host_ip_box_with_lane(session, None, false));
+        let outcome = wired.reconcile_host_ip_boxes(
+            &BTreeMap::new(),
+            wired.host_ip_admit_mark(),
+            HostIpReconcileTrigger::Timer,
+        );
+        assert_eq!(outcome.dropped, vec![session]);
+        assert!(!revocation_spawned(id));
+        assert_eq!(
+            listener.accept().map(|_| ()).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the end of a box with no grant sends nothing to the proxy"
         );
     }
 
