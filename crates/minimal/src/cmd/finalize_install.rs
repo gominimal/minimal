@@ -1287,6 +1287,7 @@ pub(crate) mod linux {
              SocketMode=0600\n\
              Accept=yes\n\
              MaxConnections=4\n\
+             RemoveOnStop=yes\n\
              \n\
              [Install]\n\
              WantedBy=sockets.target\n\
@@ -3511,6 +3512,9 @@ mod tests {
             format!("cat > {PLACE_UNIT_SOCKET_PATH} <<"),
             format!("ListenStream={PLACE_REQUEST_SOCKET}\n"),
             "SocketUser=alice\nSocketMode=0600\nAccept=yes\n".to_string(),
+            // The socket file goes with the unit, so --undo's
+            // `systemctl disable --now` leaves no /run/minimald-place.sock.
+            "RemoveOnStop=yes\n".to_string(),
             "WantedBy=sockets.target\n".to_string(),
             "WantedBy=multi-user.target\n".to_string(),
             "systemctl daemon-reload\n".to_string(),

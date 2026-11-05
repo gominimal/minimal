@@ -810,8 +810,8 @@ case_finalize_install_uninstall() {
             /Library/PrivilegedHelperTools/Minimal.app/*) continue ;;
             # A fixture path in the source's own tests.
             /opt/minimal-test/*) continue ;;
-            # The placement unit's socket: systemd makes it in /run and
-            # removes it when the socket unit stops.
+            # The placement unit's socket: systemd makes it in /run, and
+            # the unit's RemoveOnStop=yes removes it when the unit stops.
             /run/minimald-place.sock) continue ;;
             '') continue ;;
         esac
