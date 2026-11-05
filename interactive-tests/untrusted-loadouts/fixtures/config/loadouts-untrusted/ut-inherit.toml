@@ -1,0 +1,4 @@
+description = "Untrusted: inherits UT_TEST_TOKEN; gated by the var prompt"
+
+[vars]
+UT_TEST_TOKEN = { inherit = true }

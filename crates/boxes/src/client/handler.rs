@@ -106,23 +106,14 @@ pub fn handle_response(
 // Lifecycle hooks
 // =====================================================================
 
-/// One project whose hooks still need a decision: the root path the
-/// prompt shows, the original [`Source`] (kept rather than rebuilt from
-/// the path, so a re-check after the prompt matches on exactly what the
-/// policy saw the first time), and the ids waiting on that decision.
-type UndecidedProject = (
-    camino::Utf8PathBuf,
-    Source,
-    Vec<crate::wire::primitives::PendingId>,
-);
-
 /// Gate the daemon's pending lifecycle hooks against the hooks policy.
 ///
-/// Decisions are made **per project**, not per hook: a project's hooks
-/// are approved or refused as a set, so a project declaring five hooks
-/// prompts once rather than five times, and can't end up half-approved.
-/// Every hook from one project therefore receives that project's single
-/// decision.
+/// Decisions are made **per project**, not per hook, by the gate the
+/// loadout composition shares ([`decide_hooks`]). A hook that runs is
+/// `Approved`, one the policy or the prompt ignores is `Ignored`, and a
+/// denied one fails the whole response, so no verdict is ever `Denied`.
+///
+/// [`decide_hooks`]: crate::core::compose::decide_hooks
 fn gate_pending_hooks(
     pending: Vec<WirePendingHook>,
     policy: HooksPolicy,
@@ -134,91 +125,33 @@ fn gate_pending_hooks(
         return Ok((Vec::new(), policy));
     }
     let home_fallback = env("HOME").ok();
-    let expanded = policy.expand_with(combined_vars, home_fallback.as_deref())?;
-
-    // Pass 1: classify each hook. `Provenanced` is what the policy
-    // reads, so a lightweight (id, source) pair stands in for the hook
-    // itself here — the daemon holds the hook and only needs a verdict.
-    let mut verdicts: Vec<WireHookVerdict> = Vec::with_capacity(pending.len());
-    // Distinct projects still needing a decision, in first-seen order.
-    let mut unapproved: Vec<UndecidedProject> = Vec::new();
-    for p in pending {
-        let source: Source = p.source.into();
-        match expanded.check(HookRef {
+    // The same gate the loadout composition runs; see `decide_hooks`. A
+    // `HookRef` stands in for each hook: the daemon holds the hook and
+    // only needs a verdict.
+    let refs: Vec<HookRef> = pending
+        .into_iter()
+        .map(|p| HookRef {
             id: p.id,
-            source: source.clone(),
-        }) {
-            CheckOutcome::Decided(Decision::Allowed(h)) => {
-                verdicts.push(WireHookVerdict::Approved { id: h.id });
-            }
-            CheckOutcome::Decided(Decision::Denied(h)) => {
-                verdicts.push(WireHookVerdict::Denied { id: h.id });
-            }
-            CheckOutcome::Decided(Decision::Ignored) => {
-                verdicts.push(WireHookVerdict::Ignored { id: p.id });
-            }
-            CheckOutcome::NeedsApproval(h) => {
-                // Only `Source::Project` reaches here — the other two
-                // variants are always decided — so the path is present.
-                let root = match &h.source {
-                    Source::Project { path } => path.as_utf8_path().to_owned(),
-                    other => {
-                        return Err(ComposeError::InvalidWireItem {
-                            what: "lifecycle hook needing approval from a non-project source",
-                            context: format!("{other:?}"),
-                        });
-                    }
-                };
-                match unapproved.iter_mut().find(|(p, _, _)| *p == root) {
-                    Some((_, _, ids)) => ids.push(h.id),
-                    None => unapproved.push((root, h.source, vec![h.id])),
-                }
-            }
-        }
-    }
-    if unapproved.is_empty() {
-        return Ok((verdicts, policy));
-    }
-
-    // Pass 2: prompt once per project.
-    let view: Vec<Unapproved<'_, camino::Utf8Path>> = unapproved
-        .iter()
-        .map(|(root, source, _)| Unapproved {
-            item: root.as_path(),
-            source,
+            source: p.source.into(),
         })
         .collect();
-    let (decisions, policy) = crate::core::compose::prompt_hook_hook(hooks, policy, &view)?;
-
-    // Pass 3: apply one decision to every hook from that project.
-    let expanded = policy.expand_with(combined_vars, home_fallback.as_deref())?;
-    for ((root, source, ids), decision) in unapproved.into_iter().zip(decisions) {
-        for id in ids {
-            let verdict = match decision {
-                ItemDecision::AllowOnce => WireHookVerdict::Approved { id },
-                ItemDecision::IgnoreOnce => WireHookVerdict::Ignored { id },
-                ItemDecision::UseRule => match expanded.check(HookRef {
-                    id,
-                    source: source.clone(),
-                }) {
-                    CheckOutcome::Decided(Decision::Allowed(h)) => {
-                        WireHookVerdict::Approved { id: h.id }
-                    }
-                    CheckOutcome::Decided(Decision::Denied(h)) => {
-                        WireHookVerdict::Denied { id: h.id }
-                    }
-                    CheckOutcome::Decided(Decision::Ignored) => WireHookVerdict::Ignored { id },
-                    CheckOutcome::NeedsApproval(_) => {
-                        return Err(ComposeError::use_rule_undecided(
-                            HookDomain::Hook,
-                            format!("lifecycle hooks from project `{root}`"),
-                        ));
-                    }
-                },
-            };
-            verdicts.push(verdict);
-        }
-    }
+    let (decided, policy) = crate::core::compose::decide_hooks(
+        refs,
+        policy,
+        Some(hooks),
+        combined_vars,
+        home_fallback.as_deref(),
+    )?;
+    let verdicts = decided
+        .into_iter()
+        .map(|(h, keep)| {
+            if keep {
+                WireHookVerdict::Approved { id: h.id }
+            } else {
+                WireHookVerdict::Ignored { id: h.id }
+            }
+        })
+        .collect();
     Ok((verdicts, policy))
 }
 
@@ -302,6 +235,7 @@ fn gate_pending_vars(
         .map(|p| Unapproved {
             item: p.name(),
             source: p.provenanced().source(),
+            value: None,
         })
         .collect();
     let (decisions, policy) = crate::core::compose::prompt_var_hook(hooks, policy, &view)?;
@@ -443,7 +377,12 @@ fn gate_pending_patches(
     // arbitrary.
     let anchors = PatchAnchors::home(home_fallback);
 
-    let mut expanded_policy = policy.expand_with(combined_vars, home_fallback)?;
+    // Patch sources expand against every var; the policy's own patterns
+    // only against the user's trusted loadouts' (see
+    // `policy_expansion_vars`), never the project's or a package's whose
+    // patches are being gated.
+    let policy_vars = crate::core::compose::policy_expansion_vars(combined_vars);
+    let mut expanded_policy = policy.expand_with(policy_vars.as_slice(), home_fallback)?;
 
     // Pass 1: walk each pending patch's source pattern, classify
     // every matched file. Unapproved files batch into one queue so
@@ -466,12 +405,13 @@ fn gate_pending_patches(
         .map(|p| Unapproved {
             item: p.file().user_facing().as_utf8_path(),
             source: p.file().source(),
+            value: None,
         })
         .collect();
     let (decisions, policy, policy_updated) =
         crate::core::compose::prompt_patch_hook(hooks, policy, &view)?;
     if policy_updated {
-        expanded_policy = policy.expand_with(combined_vars, home_fallback)?;
+        expanded_policy = policy.expand_with(policy_vars.as_slice(), home_fallback)?;
     }
 
     // Pass 3: apply.

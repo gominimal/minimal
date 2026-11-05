@@ -1,0 +1,4 @@
+description = "Trusted: inline logging hook; runs with no prompt, kind=loadout"
+
+[[lifecycle_hooks]]
+on_activate = { type = "inline", value = "echo \"t-hook-inline kind=$MINIMAL_HOOK_SOURCE_KIND name=$MINIMAL_HOOK_SOURCE_NAME\" | tee -a \"$HOME/untrusted-loadout-test.log\"" }

@@ -134,6 +134,13 @@ the session's already-resolved variables at activation:
 - A leading `~/` expands to the host home directory.
 - `$NAME` / `${NAME}` references (including `$HOME`) resolve against the
   session vars; referencing an undefined name fails the activation.
+- Only variables from your own loadouts, the ones in
+  `<config>/minimal/loadouts/`, take part, in `~/` and in `$NAME` alike. A
+  project's, a package's, or an
+  [untrusted loadout's](./loadouts.md#untrusted-loadouts) variables never do:
+  a source the policy gates must not rewrite the rules that gate it. A pattern
+  naming a variable that only such a source defines is undefined, and fails the
+  activation.
 - `$LOADOUT_ROOT` is **not** available: a policy is yours, not any one
   loadout's, so there is no loadout for it to name. Referencing it fails the
   activation. Write the path out, or match with a glob.
@@ -157,7 +164,9 @@ ignore = ["**/.DS_Store"]
 ### `[hooks]` — Lifecycle-script rules
 
 Patterns match the **project root path** that declared the hook — as you refer
-to that project on your own machine, not the daemon's copy of it. The script's
+to that project on your own machine, not the daemon's copy of it. For an
+[untrusted loadout](./loadouts.md#untrusted-loadouts) they match the loadout's
+own directory, `<config>/minimal/loadouts-untrusted/<name>`. The script's
 own contents and any file it names are never matched: this section decides
 *whose* code may run, not which code.
 
@@ -167,9 +176,10 @@ own contents and any file it names are never matched: this section decides
 | `deny` | hooks may never run, and whose presence fails the activation |
 | `ignore` | hooks are silently dropped without prompting |
 
-Only the project is arbitrated here. Your loadouts' hooks are your own files
-and run without consulting this section; packages cannot declare hooks at all,
-and any that appear are denied outright.
+Only the project and untrusted loadouts are arbitrated here. The hooks of the
+loadouts in your own `loadouts/` directory are your own files and run without
+consulting this section; packages cannot declare hooks at all, and any that
+appear are denied outright.
 
 Patterns expand the same way patch patterns do (`~/`, `$NAME`, `${NAME}`).
 They are globs, so a path containing glob metacharacters must be escaped to
@@ -205,16 +215,21 @@ hooks is categorized against the relevant section in a fixed precedence:
 Every item carries the source that contributed it, and the allow step depends
 on it:
 
-- **User-origin** (items from your own [loadouts](./loadouts.md)) **auto-pass**
-  the allow step — you don't have to allow-list what you declared yourself.
-  They are still subject to `deny` and `ignore`.
+- **User-origin** (items from your own [loadouts](./loadouts.md), the ones in
+  `<config>/minimal/loadouts/`) **auto-pass** the allow step — you don't have
+  to allow-list what you declared yourself. They are still subject to `deny`
+  and `ignore`.
 - **Non-user-origin** items must match an `allow` pattern to pass cleanly. If
   none matches, the item is **undecided** and routes to an interactive prompt
   (or aborts under `--no-prompt`; see below). In practice the non-user
   contributor is the **project**: it can contribute both gated patches and
   gated variables. A package can only reach this step with a static-valued
   variable — its patches and host-inherited variables are dropped before the
-  gate.
+  gate. An [untrusted loadout](./loadouts.md#untrusted-loadouts), from
+  `<config>/minimal/loadouts-untrusted/`, is non-user-origin too: its
+  variables, patches, and hooks are gated like a project's. Its variables
+  with a literal or default value are gated as well, where a project's are
+  not.
 
 Composing several loadouts does not compose policy — the policy is a single
 file about what you let *other* sources contribute, kept separate from what

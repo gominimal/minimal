@@ -484,9 +484,14 @@ impl From<LifecycleHook> for LifecycleHookBuilder {
 /// staged tree readable when someone goes looking:
 ///
 /// ```text
-/// hooks/loadout/dev/activate.sh     ← loadout `dev`, "activate.sh"
-/// hooks/project/scripts/setup.sh    ← the project, "scripts/setup.sh"
+/// hooks/loadout/dev/activate.sh            ← loadout `dev`, "activate.sh"
+/// hooks/loadout-untrusted/ci/activate.sh   ← untrusted loadout `ci`, "activate.sh"
+/// hooks/project/scripts/setup.sh           ← the project, "scripts/setup.sh"
 /// ```
+///
+/// Trusted and untrusted loadouts stage under separate prefixes, so the
+/// two can never write to one another's scripts even if a name somehow
+/// appeared in both.
 ///
 /// The script path is a [`ConfigRelPath`], which rejects absolute paths
 /// and `..`. There is one project per session, so `project` needs no
@@ -518,6 +523,12 @@ pub fn staged_script_path(
                 return None;
             }
             Utf8PathBuf::from("loadout").join(name)
+        }
+        Source::UntrustedLoadout { name, .. } => {
+            if !safe_path_component(name) {
+                return None;
+            }
+            Utf8PathBuf::from("loadout-untrusted").join(name)
         }
         Source::Project { .. } => Utf8PathBuf::from("project"),
         Source::Package { .. } => return None,
@@ -659,6 +670,29 @@ mod tests {
             staged_script_path(&source, &script),
             Some(Utf8PathBuf::from("loadout/dev/scripts/activate.sh")),
         );
+    }
+
+    /// An untrusted loadout stages under its own prefix, so its scripts
+    /// can never land where a trusted loadout's of the same name would.
+    #[test]
+    fn an_untrusted_loadout_stages_under_its_own_prefix() {
+        use crate::core::source::Source;
+        let script = ConfigRelPath::try_new("scripts/activate.sh").unwrap();
+        let source = Source::UntrustedLoadout {
+            name: "dev".to_string(),
+            dir: paths::HostPath::try_new("/cfg/minimal/loadouts-untrusted/dev").unwrap(),
+        };
+        assert_eq!(
+            staged_script_path(&source, &script),
+            Some(Utf8PathBuf::from(
+                "loadout-untrusted/dev/scripts/activate.sh"
+            )),
+        );
+        let hostile = Source::UntrustedLoadout {
+            name: "..".to_string(),
+            dir: paths::HostPath::try_new("/cfg").unwrap(),
+        };
+        assert_eq!(staged_script_path(&hostile, &script), None);
     }
 
     #[test]

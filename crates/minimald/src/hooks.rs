@@ -816,8 +816,12 @@ fn metadata_env(
     // `#[non_exhaustive]`: a variant added later should degrade to a
     // usable value rather than fail to compile a crate that only needs
     // a label for it.
+    //
+    // An untrusted loadout gets its own kind, named like the directory
+    // it is read from, so a hook can tell the two kinds of loadout apart.
     let (kind, name) = match source {
         Source::UserLoadout { name } => ("loadout", name.clone()),
+        Source::UntrustedLoadout { name, .. } => ("loadout-untrusted", name.clone()),
         Source::Project { path } => ("project", path.as_utf8_path().to_string()),
         Source::Package { name } => ("package", name.clone()),
         other => ("other", other.to_string()),
@@ -1538,6 +1542,36 @@ mod tests {
 
         assert!(
             outcomes[0].output.contains("on_attach loadout dev"),
+            "{:?}",
+            outcomes[0],
+        );
+    }
+
+    /// An untrusted loadout's hook is told so by its source kind, which
+    /// differs from a trusted loadout's.
+    #[tokio::test]
+    async fn untrusted_loadout_hook_receives_its_own_source_kind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = camino::Utf8Path::from_path(tmp.path()).unwrap();
+        let comp = composition_of(vec![inline_hook(
+            HookEvent::Attach,
+            "echo $MINIMAL_HOOK_SOURCE_KIND $MINIMAL_HOOK_SOURCE_NAME",
+            Source::UntrustedLoadout {
+                name: "ci".to_string(),
+                dir: paths::HostPath::try_new("/cfg/minimal/loadouts-untrusted/ci").unwrap(),
+            },
+        )]);
+        let outcomes = run_hooks(
+            &HostCommands,
+            &ctx(&comp, dir),
+            HookEvent::Attach,
+            HookOutput::Capture,
+            None,
+        )
+        .await;
+
+        assert!(
+            outcomes[0].output.contains("loadout-untrusted ci"),
             "{:?}",
             outcomes[0],
         );

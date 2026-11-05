@@ -1,6 +1,7 @@
 //! Provenance: which source contributed a primitive.
 //!
-//! [`Source`] describes the origin (user loadout / project / package) of
+//! [`Source`] describes the origin (user loadout, untrusted loadout,
+//! project, package) of
 //! every item that flows through the composer. The [`Provenanced`] trait
 //! is what makes policy `check` methods source-aware; each `ProvenancedX`
 //! wrapper pairs a primitive with its origin so the composer can carry
@@ -22,9 +23,21 @@ use crate::core::primitives::{Patch, ResolvedVar};
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Source {
-    /// The user's own [`Loadout`](crate::core::loadout::Loadout). Bypasses
-    /// `allow`/`deny` checks (only `ignore` still applies).
+    /// The user's own [`Loadout`](crate::core::loadout::Loadout), read
+    /// from the trusted loadouts directory. Auto-passes the policy's
+    /// `allow` step (`deny` and `ignore` still apply).
     UserLoadout { name: String },
+    /// A [`Loadout`](crate::core::loadout::Loadout) read from the
+    /// untrusted loadouts directory (`<config>/minimal/loadouts-untrusted/`).
+    /// Gated like a [`Project`](Self::Project): every item must match the
+    /// policy's `allow` rules or be approved at a prompt, and its lifecycle
+    /// hooks are matched by `dir`, the way a project's are matched by its
+    /// root.
+    ///
+    /// `dir` is the loadout's own directory, `<untrusted dir>/<name>/`. It
+    /// is carried rather than derived because it is what the hooks policy
+    /// matches and what a permanent hook approval records.
+    UntrustedLoadout { name: String, dir: HostPath },
     /// A project's `minimal.toml`, identified by the project root
     /// directory on the client host (not the config file's path).
     /// Repo-relative patch sources resolve against this directory.
@@ -34,7 +47,8 @@ pub enum Source {
 }
 
 impl Source {
-    /// The directory a loadout's own files live in: `<loadouts_dir>/<name>/`.
+    /// The directory a loadout's own files live in: `<loadouts_dir>/<name>/`
+    /// for a trusted loadout, and the `dir` it carries for an untrusted one.
     ///
     /// Derived from the loadout's *name*, not from the path its
     /// definition was read from, so it is the same directory under
@@ -47,7 +61,8 @@ impl Source {
     /// ([`ScriptAnchors::for_source`]) and the `$LOADOUT_ROOT` patch-source
     /// reference ([`expand_source`]).
     ///
-    /// `None` for every non-loadout source, and for a loadout whose name
+    /// `None` for every non-loadout source, for an untrusted loadout whose
+    /// `dir` is not absolute, and for a loadout whose name
     /// isn't a path component that stays put — the name is joined into a
     /// path that is then read from, so it has to be one. A
     /// [`LoadoutName`] already rejects those, but this method is reached
@@ -65,6 +80,12 @@ impl Source {
         match self {
             Self::UserLoadout { name } => crate::core::lifecyclehook::safe_path_component(name)
                 .then(|| loadouts_dir.sub_path_unchecked(name)),
+            Self::UntrustedLoadout { name, dir } => {
+                if !crate::core::lifecyclehook::safe_path_component(name) {
+                    return None;
+                }
+                paths::HostAbsPath::try_new(dir.as_utf8_path().to_owned()).ok()
+            }
             Self::Project { .. } | Self::Package { .. } => None,
         }
     }
@@ -74,6 +95,7 @@ impl fmt::Display for Source {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UserLoadout { name } => write!(f, "user loadout `{name}`"),
+            Self::UntrustedLoadout { name, .. } => write!(f, "untrusted loadout `{name}`"),
             Self::Project { path } => write!(f, "project `{path}`"),
             Self::Package { name } => write!(f, "package `{name}`"),
         }
@@ -272,6 +294,9 @@ impl From<crate::wire::primitives::WireSource> for Source {
     fn from(s: crate::wire::primitives::WireSource) -> Self {
         match s {
             crate::wire::primitives::WireSource::UserLoadout { name } => Self::UserLoadout { name },
+            crate::wire::primitives::WireSource::UntrustedLoadout { name, dir } => {
+                Self::UntrustedLoadout { name, dir }
+            }
             crate::wire::primitives::WireSource::Project { path } => Self::Project { path },
             crate::wire::primitives::WireSource::Package { name } => Self::Package { name },
         }
@@ -311,6 +336,20 @@ mod tests {
         assert_eq!(
             source.loadout_dir(&loadouts_dir()).map(|p| p.to_string()),
             Some("/cfg/minimal/loadouts/dev".to_string()),
+        );
+    }
+
+    /// An untrusted loadout's directory is the one it carries, not a
+    /// name under the trusted loadouts directory.
+    #[test]
+    fn untrusted_loadout_dir_is_the_carried_dir() {
+        let source = Source::UntrustedLoadout {
+            name: "dev".into(),
+            dir: HostPath::try_new("/cfg/minimal/loadouts-untrusted/dev").unwrap(),
+        };
+        assert_eq!(
+            source.loadout_dir(&loadouts_dir()).map(|p| p.to_string()),
+            Some("/cfg/minimal/loadouts-untrusted/dev".to_string()),
         );
     }
 

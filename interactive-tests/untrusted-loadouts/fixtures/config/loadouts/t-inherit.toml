@@ -1,0 +1,4 @@
+description = "Trusted: inherits UT_TEST_TOKEN with no prompt"
+
+[vars]
+UT_TEST_TOKEN = { inherit = true }

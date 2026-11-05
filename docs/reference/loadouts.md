@@ -81,6 +81,46 @@ Two things to know if you do version-control a loadout:
   symlinked anchor, so they would fail to resolve. Clone into
   `loadouts/<name>/` directly.
 
+### Untrusted loadouts {#untrusted-loadouts}
+
+A second directory, beside the first, holds loadouts you did not write
+yourself, such as one a colleague shares or one cloned from a team repository:
+
+```
+<config>/minimal/loadouts-untrusted/<name>.toml
+<config>/minimal/loadouts-untrusted/<name>/loadout.toml
+```
+
+A loadout here works the same as one in `loadouts/`: both layouts,
+`--loadout <name>`, `default_loadouts`, `$LOADOUT_ROOT`, and hook scripts
+anchored at `loadouts-untrusted/<name>/`. The one difference is the
+[user policy](./user-policy.md#origin-semantics). Your own loadouts' items
+skip its `allow` check. An untrusted loadout's items get the same treatment as
+a project's:
+
+- Its variables and its patches must match an `allow` rule. Otherwise `min`
+  prompts, or fails with a `user_policy.toml` snippet under `--no-prompt`.
+  Unlike a project's, this includes variables with a literal value or a
+  default, because a value such as `BASH_ENV` or `PATH` can run code in the
+  session. The prompt shows the value it would set. A `[vars]` rule matches
+  the name only, so allowing a name permanently trusts whatever value the
+  loadout sets it to later.
+- Its lifecycle hooks may run only if the loadout's directory
+  (`<config>/minimal/loadouts-untrusted/<name>`) matches a
+  [`[hooks]`](./user-policy.md#hooks--lifecycle-script-rules) `allow` rule.
+  The policy matches a project's hooks by its root in the same way.
+- Its variables stay its own when `$NAME` and `~/` are expanded. Its patch
+  sources may use variables from your own loadouts and from itself. Your own
+  loadouts' patch sources, and your
+  [user policy's patterns](./user-policy.md#patches--file-patch-rules), use
+  only variables from your own loadouts. A reference to a variable that only
+  an untrusted loadout defines is undefined there, and fails the activation.
+
+`min` checks these before it contacts the daemon, so a refusal leaves no session
+behind. One name defined in **both** directories is an error, as one name in
+both layouts is: which copy applied would also decide whether the policy gates
+it. Neither directory is created automatically.
+
 ## Example
 
 A loadout that brings in the helix editor and zellij multiplexer, wired up
@@ -423,7 +463,7 @@ the run it is part of:
 | `MINIMAL_SESSION_ID` | The session's id. |
 | `MINIMAL_SESSION_NAME` | Its display name. |
 | `MINIMAL_HOOK_EVENT` | The transition: `on_activate`, `on_destroy`, `on_attach`, or `on_detach`. |
-| `MINIMAL_HOOK_SOURCE_KIND` | `loadout` or `project` — for branching. |
+| `MINIMAL_HOOK_SOURCE_KIND` | `loadout`, `loadout-untrusted` (a loadout from [`loadouts-untrusted/`](#untrusted-loadouts)), or `project` — for branching. |
 | `MINIMAL_HOOK_SOURCE_NAME` | The loadout's name, or the project's path as you refer to it on your own machine (not the daemon's copy of the tree). |
 | `MINIMAL_HOOK_INDEX` / `MINIMAL_HOOK_COUNT` | Position within this transition's run, 1-based — for logging, e.g. `[2/3]`. |
 
@@ -584,13 +624,14 @@ Two caveats on that per-channel model:
 ## Listing loadouts
 
 [`min loadout list`](./cli-min.md#loadout-list-alias-ls) (alias:
-`min loadout ls`) enumerates every `*.toml` file in the loadouts
-directory, one row per file:
+`min loadout ls`) enumerates every loadout in both loadouts
+directories, one row per loadout:
 
 ```
   NAME                DESCRIPTION                           CONTRIBUTES
 * dev                 helix + zellij with my dotfiles       2 pkg / 4 var / 5 patch
   extra                                                     1 pkg / 0 var / 0 patch
+  shared (untrusted)  the team's CI tooling                 3 pkg / 1 var / 0 patch
   default (built-in)  orientation banner and shaped prompt  0 pkg / 3 var / 0 patch
 
   default (built-in) applied when no loadouts are configured
@@ -603,12 +644,17 @@ table: the first appears only when the built-in `default` is shown, the
 second only when `default_loadouts` is non-empty.
 
 - Loadouts named in `default_loadouts` are marked with a leading `*`.
+- Loadouts from [`loadouts-untrusted/`](#untrusted-loadouts) are tagged
+  `(untrusted)`. A name in both directories is reported as an error and gets
+  no row. A copy of it that fails to load for its own reason is reported too.
 - The [built-in `default` loadout](#built-in-default-loadout) is listed as a
   `default (built-in)` row unless a user `default.toml` shadows it.
 - Malformed entries are listed with their parse error so they can be fixed
   in place; a `default_loadouts` entry with no matching file produces a
   warning.
-- `--dir <DIR>` overrides the loadouts directory.
+- `--dir <DIR>` names a minimal config directory to list in place of
+  `<config>/minimal`: its `loadouts/` and `loadouts-untrusted/` subdirectories,
+  with the defaults from its `config.toml`.
 
 ## Composition, conflicts, and policy
 
@@ -636,7 +682,9 @@ Loadout contributions are gated by the user's policy
 (`<config>/minimal/user_policy.toml`): items you declare yourself
 automatically pass the `allow` check, but the policy's `deny` and `ignore`
 rules still apply: a loadout patch matching a `deny` pattern fails the
-composition on the client, before the daemon is involved. A missing policy
+composition on the client, before the daemon is involved. Items from an
+[untrusted loadout](#untrusted-loadouts) get no automatic pass: they must
+match `allow` or be approved at a prompt, as a project's must. A missing policy
 file means an empty policy; a fresh install activates fine without it.
 
 ## Vars in the attach shell

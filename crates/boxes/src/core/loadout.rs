@@ -140,7 +140,11 @@ impl LoadoutFile {
     /// the file they were read from. Any declared `name` is discarded.
     #[must_use]
     pub fn into_loadout(self, name: LoadoutName) -> Loadout {
-        Loadout { name, file: self }
+        Loadout {
+            name,
+            file: self,
+            untrusted_dir: None,
+        }
     }
 }
 
@@ -154,6 +158,11 @@ pub struct Loadout {
     name: LoadoutName,
     /// Everything the file declared.
     file: LoadoutFile,
+    /// The loadout's own directory when it was read from the untrusted
+    /// loadouts directory, set via [`Loadout::untrusted`]; `None` for a
+    /// trusted loadout. Never read from the file: trust comes from
+    /// where the loader found it, not from anything the file says.
+    untrusted_dir: Option<paths::HostAbsPath>,
 }
 
 /// Serializing a [`Loadout`] emits the resolved name in the `name`
@@ -213,6 +222,54 @@ impl Loadout {
     #[must_use]
     pub fn name(&self) -> &LoadoutName {
         &self.name
+    }
+
+    /// Mark this loadout as untrusted: one read from the untrusted
+    /// loadouts directory, whose own directory is `dir`
+    /// (`<untrusted dir>/<name>/`).
+    ///
+    /// Everything it contributes is then tagged
+    /// [`Source::UntrustedLoadout`] rather than [`Source::UserLoadout`],
+    /// so the user policy gates it the way it gates a project: `allow`
+    /// must match or the item prompts, and its lifecycle hooks are
+    /// matched by `dir`.
+    ///
+    /// [`Source::UntrustedLoadout`]: crate::core::source::Source::UntrustedLoadout
+    /// [`Source::UserLoadout`]: crate::core::source::Source::UserLoadout
+    #[must_use]
+    pub fn untrusted(mut self, dir: paths::HostAbsPath) -> Self {
+        self.untrusted_dir = Some(dir);
+        self
+    }
+
+    /// Whether this loadout came from the untrusted loadouts directory.
+    #[must_use]
+    pub fn is_untrusted(&self) -> bool {
+        self.untrusted_dir.is_some()
+    }
+
+    /// The provenance every item this loadout contributes is tagged
+    /// with: [`Source::UntrustedLoadout`] for an untrusted loadout,
+    /// [`Source::UserLoadout`] otherwise.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: the untrusted directory is an absolute host
+    /// path, and every absolute host path is a valid host path.
+    ///
+    /// [`Source::UntrustedLoadout`]: crate::core::source::Source::UntrustedLoadout
+    /// [`Source::UserLoadout`]: crate::core::source::Source::UserLoadout
+    #[must_use]
+    pub fn source(&self) -> crate::core::source::Source {
+        let name = self.name.as_ref().to_owned();
+        match &self.untrusted_dir {
+            None => crate::core::source::Source::UserLoadout { name },
+            Some(dir) => crate::core::source::Source::UntrustedLoadout {
+                name,
+                dir: paths::HostPath::try_new(dir.as_str())
+                    .expect("an absolute host path is a valid host path"),
+            },
+        }
     }
 
     /// The loadout's free-form description, if any.
@@ -353,7 +410,9 @@ impl Loadout {
 
 impl crate::core::compose::Composable for Loadout {
     /// Materialize the loadout as a [`Contribution`](crate::core::compose::Contribution),
-    /// tagging every primitive with [`Source::UserLoadout`].
+    /// tagging every primitive with [`Source::UserLoadout`], or with
+    /// [`Source::UntrustedLoadout`] for an [untrusted](Loadout::untrusted)
+    /// loadout.
     ///
     /// Inherited / default-bearing var values are resolved via the
     /// `env` closure at this point. A pure `Inherit` var whose name
@@ -366,14 +425,13 @@ impl crate::core::compose::Composable for Loadout {
     /// `Inherit` gets this treatment.
     ///
     /// [`Source::UserLoadout`]: crate::core::source::Source::UserLoadout
+    /// [`Source::UntrustedLoadout`]: crate::core::source::Source::UntrustedLoadout
     fn contribute(
         self,
         env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
     ) -> Result<crate::core::compose::Contribution, crate::core::compose::Error> {
         let loadout_name = self.name.as_ref().to_string();
-        let source = crate::core::source::Source::UserLoadout {
-            name: self.name.into_inner(),
-        };
+        let source = self.source();
 
         // Vars: resolve each declaration directly into a
         // `ResolvedVar` that carries the correct

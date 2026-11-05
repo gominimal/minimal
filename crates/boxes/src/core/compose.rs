@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use crate::core::decision::{CheckOutcome, Decision, ItemDecision};
 use crate::core::enumerate::{ExpandedProvenancedPatch, PatchFile, enumerate_patch_files};
 use crate::core::hooks::{HookResult, PolicyHooks, Unapproved};
-use crate::core::policy::{PatchesPolicy, UserPolicy, VarsPolicy};
+use crate::core::policy::{PatchesPolicy, UserPolicy, VarsPolicy, hook_policy_root};
 use crate::core::primitives::{ResolvedPatch, ResolvedVar, VarError};
 use crate::core::source::{
     Provenanced, ProvenancedHook, ProvenancedPackage, ProvenancedPatch, ProvenancedVar, Source,
@@ -1450,6 +1450,22 @@ impl Provenanced for NameItem<'_> {
 /// [`VarsPolicy::check`]: crate::core::policy::VarsPolicy::check
 pub fn gate_names(
     items: &[(&str, &Source)],
+    policy: VarsPolicy,
+    hooks: Option<&dyn PolicyHooks>,
+) -> Result<(Vec<NameVerdict>, VarsPolicy), ComposeError> {
+    let items: Vec<(&str, &Source, Option<&str>)> = items
+        .iter()
+        .map(|&(name, source)| (name, source, None))
+        .collect();
+    gate_names_with_values(&items, policy, hooks)
+}
+
+/// [`gate_names`], where an item may carry the value its source set
+/// for it (a literal, or the default it fell back to). The value is
+/// shown to `hooks` so the user can judge what they are letting in;
+/// the policy still matches the name alone.
+pub(crate) fn gate_names_with_values(
+    items: &[(&str, &Source, Option<&str>)],
     mut policy: VarsPolicy,
     hooks: Option<&dyn PolicyHooks>,
 ) -> Result<(Vec<NameVerdict>, VarsPolicy), ComposeError> {
@@ -1474,7 +1490,7 @@ pub fn gate_names(
     // unwritten, the caller drops the name rather than carrying it.
     let mut verdicts: Vec<NameVerdict> = Vec::with_capacity(items.len());
     let mut unapproved: Vec<usize> = Vec::new();
-    for (i, (name, source)) in items.iter().enumerate() {
+    for (i, (name, source, _)) in items.iter().enumerate() {
         match policy.check(name, NameItem { source }) {
             CheckOutcome::Decided(d) => match verdict_of(&d) {
                 Some(v) => verdicts.push(v),
@@ -1501,13 +1517,14 @@ pub fn gate_names(
             .map(|&i| Unapproved {
                 item: items[i].0,
                 source: items[i].1,
+                value: items[i].2,
             })
             .collect();
         let (decisions, new_policy) = prompt_var_hook(hooks, policy, &view)?;
         policy = new_policy;
         // Pass 3: apply.
         for (&i, decision) in unapproved.iter().zip(decisions) {
-            let (name, source) = items[i];
+            let (name, source, _) = items[i];
             verdicts[i] = match decision {
                 ItemDecision::AllowOnce => NameVerdict::Allowed,
                 ItemDecision::IgnoreOnce => NameVerdict::Ignored,
@@ -1542,24 +1559,33 @@ pub(crate) fn gate_vars(
 ) -> Result<(Vec<SessionVar>, VarsPolicy), ComposeError> {
     // Vars whose value doesn't pull from the user's environment
     // (hardcoded literals, or `inherit-with-default` that fell back to
-    // the default) aren't a data-leak vector, so the allow/deny/ignore
-    // rules don't apply — they never reach the gate. The policy exists
-    // to gate user data crossing into the sandbox; there's no user data
-    // here.
+    // the default) aren't a data-leak vector, so for most sources the
+    // allow/deny/ignore rules don't apply — they never reach the gate.
+    //
+    // An untrusted loadout's are the exception. Their risk is the value
+    // itself — `BASH_ENV`, `PATH`, `PROMPT_COMMAND` run code in the
+    // session — so they are gated by name like any other var, and the
+    // value they would set goes to the prompt for the user to judge.
     let gated: Vec<usize> = items
         .iter()
         .enumerate()
-        .filter(|(_, pv)| pv.var().carries_user_data())
+        .filter(|(_, pv)| {
+            pv.var().carries_user_data() || matches!(pv.source(), Source::UntrustedLoadout { .. })
+        })
         .map(|(i, _)| i)
         .collect();
 
     // Scoped so the borrows of `items` end before it is consumed below.
     let (verdicts, policy) = {
-        let pairs: Vec<(&str, &Source)> = gated
+        let triples: Vec<(&str, &Source, Option<&str>)> = gated
             .iter()
-            .map(|&i| (items[i].var().name(), items[i].source()))
+            .map(|&i| {
+                let var = items[i].var();
+                let value = (!var.carries_user_data()).then(|| var.value());
+                (var.name(), items[i].source(), value)
+            })
             .collect();
-        gate_names(&pairs, policy, hooks)?
+        gate_names_with_values(&triples, policy, hooks)?
     };
 
     let mut verdict_at: Vec<Option<NameVerdict>> = vec![None; items.len()];
@@ -1602,6 +1628,9 @@ pub(crate) fn gate_vars(
 /// reference there is an error rather than a path pointing at someone
 /// else's tree.
 ///
+/// Each patch's source expands against only the vars its declarer may
+/// see; see [`patch_source_vars`].
+///
 /// Per-patch `follow_symlinks` is resolved here: any `Some(v)` carried
 /// on the [`ProvenancedPatch`] wins; `None` inherits
 /// `default_follow_symlinks`. The resolved bool is stamped onto the
@@ -1625,9 +1654,10 @@ pub(crate) fn expand_patch_sources(
             let pattern_anchors = crate::core::expansion::Anchors::home(anchors.home)
                 .with_loadout_root(loadout_root.as_ref().map(paths::HostAbsPath::as_str))
                 .with_project_root(project_root);
+            let source_vars = patch_source_vars(gated_vars, &provenance);
             let (source, plain_directory) = crate::core::expansion::expand_source_with_plain_dir(
                 patch.source(),
-                gated_vars,
+                source_vars.as_slice(),
                 pattern_anchors,
             )?;
             let follow_symlinks = follow_override.unwrap_or(default_follow_symlinks);
@@ -1672,7 +1702,12 @@ pub(crate) fn gate_patches(
     // filesystem work happens. Otherwise a costly walk could complete
     // only to be discarded by a policy-expansion error the user has
     // no IO context for.
-    let mut expanded = policy.expand_with(gated_vars, anchors.home)?;
+    //
+    // Patch sources expand against every gated var; the policy's own
+    // patterns only against the user's trusted loadouts' (see
+    // `policy_expansion_vars`).
+    let policy_vars = policy_expansion_vars(gated_vars);
+    let mut expanded = policy.expand_with(policy_vars.as_slice(), anchors.home)?;
 
     let expanded_patches =
         expand_patch_sources(items, gated_vars, anchors, options.follow_symlinks)?;
@@ -1707,12 +1742,13 @@ pub(crate) fn gate_patches(
             .map(|pf| Unapproved {
                 item: pf.user_facing().as_utf8_path(),
                 source: &pf.provenance,
+                value: None,
             })
             .collect();
         let (decisions, new_policy, policy_updated) = prompt_patch_hook(hooks, policy, &view)?;
         policy = new_policy;
         if policy_updated {
-            expanded = policy.expand_with(gated_vars, anchors.home)?;
+            expanded = policy.expand_with(policy_vars.as_slice(), anchors.home)?;
         }
         // Pass 3: apply.
         for (pf, decision) in unapproved.into_iter().zip(decisions) {
@@ -1788,10 +1824,10 @@ pub(crate) fn compose_contribution(
         packages,
         lifecycle_hooks,
     } = contribution;
-    // The hooks policy passes straight through: this is the *loadout*
-    // composition, and a loadout's hooks are the user's own files. Only
-    // project-declared hooks face the gate, on the daemon-response path
-    // in `client::handler`.
+    // This is the *loadout* composition. A trusted loadout's hooks are
+    // the user's own files and pass the hooks gate without a rule; an
+    // untrusted loadout's face it the way a project's do on the
+    // daemon-response path in `client::handler`.
     let (vars_policy, patches_policy, hooks_policy) = policy.into_parts();
     let (gated_vars, vars_policy) = gate_vars(vars, vars_policy, hooks)?;
     // Conflict detection runs post-gate so that the user's `ignore`
@@ -1829,6 +1865,15 @@ pub(crate) fn compose_contribution(
         |p| p.patch().host_path().as_str(),
     )?;
     check_patch_prefix_collisions(gated_patches.iter(), |p| p.patch().destination())?;
+    // Hooks gate last so the policy's patterns expand against the same
+    // resolved var set the patch gate used.
+    let (lifecycle_hooks, hooks_policy) = gate_hooks(
+        lifecycle_hooks,
+        hooks_policy,
+        hooks,
+        &combined_for_lookup,
+        anchors.home,
+    )?;
     let final_policy = UserPolicy::empty()
         .with_vars(vars_policy)
         .with_patches(patches_policy)
@@ -1844,6 +1889,225 @@ pub(crate) fn compose_contribution(
         orientation: Orientation::default(),
     };
     Ok((composition, final_policy))
+}
+
+/// The vars the user policy's own patterns may expand against: only
+/// those from the user's own, trusted loadouts.
+///
+/// The policy's `~/`, `$NAME` and `${NAME}` resolve against session
+/// vars, and `~/` prefers a declared `HOME` over the real one. Every
+/// other contributor — a project, a package, an untrusted loadout — is
+/// one the policy gates, and a literal var passes the var gate unasked,
+/// so letting theirs in here would let them rewrite the rules they are
+/// gated by: a `HOME = "/nonexistent"` would turn
+/// `deny = ["~/.ssh/**"]` into a rule that never matches the real
+/// `~/.ssh`. Without them, a pattern naming a var only such a source
+/// defines fails to expand, closing the activation rather than opening
+/// the rule.
+pub(crate) fn policy_expansion_vars(vars: &[SessionVar]) -> Vec<SessionVar> {
+    vars.iter()
+        .filter(|v| matches!(v.source(), Source::UserLoadout { .. }))
+        .cloned()
+        .collect()
+}
+
+/// The vars a patch's source may expand against, by who declared it.
+///
+/// An untrusted loadout's vars reach no one else's patch sources. A
+/// literal var passes the var gate unasked, and a trusted loadout's
+/// patches skip the `allow` step, so an untrusted `HOME = "/"` would
+/// otherwise turn a trusted `~/dotfiles` into `/dotfiles` and copy it in
+/// without a prompt. So:
+///
+/// - a trusted loadout's patch sees only trusted loadouts' vars;
+/// - an untrusted loadout's patch sees those plus its own, and nothing
+///   else;
+/// - a project's or package's patch sees every var but an untrusted
+///   loadout's.
+///
+/// A reference to a var the declarer may not see is undefined, and
+/// fails the composition. `~/` falls back to the real `HOME` when no
+/// visible var declares one.
+pub(crate) fn patch_source_vars(vars: &[SessionVar], declarer: &Source) -> Vec<SessionVar> {
+    vars.iter()
+        .filter(|v| match v.source() {
+            Source::UserLoadout { .. } => true,
+            untrusted @ Source::UntrustedLoadout { .. } => untrusted == declarer,
+            // A project's or package's var: visible to a project's or
+            // package's patch only.
+            _ => matches!(declarer, Source::Project { .. } | Source::Package { .. }),
+        })
+        .cloned()
+        .collect()
+}
+
+/// Decide a batch of lifecycle hooks against the hooks policy: the one
+/// gate both the loadout composition ([`gate_hooks`]) and the
+/// daemon-response path (`client::handler`) run, so the two cannot
+/// drift apart.
+///
+/// Hooks are decided **per policy root** (a project's root, or an
+/// untrusted loadout's own directory; see [`hook_policy_root`]): a
+/// source's hooks are approved or refused as a set, so the prompt fires
+/// once per source however many scripts it declares, and a source
+/// can't end up half-approved. A trusted loadout's hooks always pass.
+///
+/// Returns every item paired with whether it runs. `Ignored` is the
+/// "don't run it, but carry on" outcome; `Denied` is not an outcome at
+/// all but an error, as in the var and patch gates. That covers a deny
+/// rule, a "deny permanently" answer at the prompt, and a hook from a
+/// package, which has no legitimate way to declare one.
+///
+/// # Errors
+///
+/// [`ComposeError::Denied`], [`ComposeError::HookRequired`] (an
+/// undecided hook and no `hooks`), [`ComposeError::Aborted`],
+/// [`ComposeError::HookContract`], or an expansion error from the
+/// policy's patterns.
+pub(crate) fn decide_hooks<T: Provenanced>(
+    items: Vec<T>,
+    policy: crate::core::policy::HooksPolicy,
+    hooks: Option<&dyn PolicyHooks>,
+    gated_vars: &[SessionVar],
+    home_fallback: Option<&str>,
+) -> Result<(Vec<(T, bool)>, crate::core::policy::HooksPolicy), ComposeError> {
+    let denied = |source: &Source| ComposeError::Denied {
+        what: "lifecycle hooks".to_owned(),
+        from: source.clone(),
+    };
+    let policy_vars = policy_expansion_vars(gated_vars);
+    // Only a hook with a root is matched against the policy's patterns.
+    // With none, skip expanding them, so a pattern that can't expand only
+    // fails a composition it could affect.
+    let expand = |policy: &crate::core::policy::HooksPolicy, any_root: bool| {
+        if any_root {
+            policy.expand_with(policy_vars.as_slice(), home_fallback)
+        } else {
+            crate::core::policy::HooksPolicy::empty().expand_with(policy_vars.as_slice(), None)
+        }
+    };
+    let any_root = items.iter().any(|h| hook_policy_root(h.source()).is_some());
+    let expanded = expand(&policy, any_root)?;
+
+    // Pass 1: classify. `None` marks a hook awaiting its root's decision.
+    let mut decided: Vec<Option<bool>> = Vec::with_capacity(items.len());
+    let mut undecided: Vec<(camino::Utf8PathBuf, Source)> = Vec::new();
+    for item in &items {
+        match expanded.check(HookSourceRef {
+            source: item.source(),
+        }) {
+            CheckOutcome::Decided(Decision::Allowed(_)) => decided.push(Some(true)),
+            CheckOutcome::Decided(Decision::Ignored) => decided.push(Some(false)),
+            CheckOutcome::Decided(Decision::Denied(h)) => return Err(denied(h.source())),
+            CheckOutcome::NeedsApproval(h) => {
+                let root =
+                    hook_policy_root(h.source()).ok_or_else(|| ComposeError::InvalidWireItem {
+                        what: "lifecycle hook needing approval from a source with no root",
+                        context: format!("{:?}", h.source()),
+                    })?;
+                if !undecided.iter().any(|(r, _)| *r == root) {
+                    undecided.push((root, h.source().clone()));
+                }
+                decided.push(None);
+            }
+        }
+    }
+    if undecided.is_empty() {
+        let out = items
+            .into_iter()
+            .zip(decided)
+            .map(|(h, keep)| (h, keep.unwrap_or(false)))
+            .collect();
+        return Ok((out, policy));
+    }
+    let Some(hooks) = hooks else {
+        let (_, from) = undecided.swap_remove(0);
+        return Err(ComposeError::HookRequired {
+            what: "lifecycle hooks".to_owned(),
+            from,
+        });
+    };
+
+    // Pass 2: prompt once per root.
+    let view: Vec<Unapproved<'_, camino::Utf8Path>> = undecided
+        .iter()
+        .map(|(root, source)| Unapproved {
+            item: root.as_path(),
+            source,
+            value: None,
+        })
+        .collect();
+    let (decisions, policy) = prompt_hook_hook(hooks, policy, &view)?;
+
+    // Pass 3: resolve each root's decision, re-checking `UseRule`
+    // against the policy as the hook amended it.
+    let expanded = expand(&policy, true)?;
+    let mut keep_root: Vec<(camino::Utf8PathBuf, bool)> = Vec::with_capacity(undecided.len());
+    for ((root, source), decision) in undecided.into_iter().zip(decisions) {
+        let keep = match decision {
+            ItemDecision::AllowOnce => true,
+            ItemDecision::IgnoreOnce => false,
+            ItemDecision::UseRule => match expanded.check(HookSourceRef { source: &source }) {
+                CheckOutcome::Decided(Decision::Allowed(_)) => true,
+                CheckOutcome::Decided(Decision::Ignored) => false,
+                CheckOutcome::Decided(Decision::Denied(_)) => return Err(denied(&source)),
+                CheckOutcome::NeedsApproval(_) => {
+                    return Err(ComposeError::use_rule_undecided(
+                        HookDomain::Hook,
+                        format!("lifecycle hooks from {source} at `{root}`"),
+                    ));
+                }
+            },
+        };
+        keep_root.push((root, keep));
+    }
+
+    let out = items
+        .into_iter()
+        .zip(decided)
+        .map(|(h, keep)| {
+            let keep = keep.unwrap_or_else(|| {
+                hook_policy_root(h.source())
+                    .and_then(|root| keep_root.iter().find(|(r, _)| *r == root))
+                    .is_some_and(|(_, k)| *k)
+            });
+            (h, keep)
+        })
+        .collect();
+    Ok((out, policy))
+}
+
+/// Gate the loadout composition's lifecycle hooks against the hooks
+/// policy, keeping those [`decide_hooks`] lets run.
+///
+/// # Errors
+///
+/// See [`decide_hooks`].
+pub(crate) fn gate_hooks(
+    items: Vec<ProvenancedHook>,
+    policy: crate::core::policy::HooksPolicy,
+    hooks: Option<&dyn PolicyHooks>,
+    gated_vars: &[SessionVar],
+    home_fallback: Option<&str>,
+) -> Result<(Vec<ProvenancedHook>, crate::core::policy::HooksPolicy), ComposeError> {
+    let (decided, policy) = decide_hooks(items, policy, hooks, gated_vars, home_fallback)?;
+    let kept = decided
+        .into_iter()
+        .filter_map(|(h, keep)| keep.then_some(h))
+        .collect();
+    Ok((kept, policy))
+}
+
+/// A bare source standing in for a hook at a policy check, where only
+/// the provenance matters.
+struct HookSourceRef<'a> {
+    source: &'a Source,
+}
+
+impl Provenanced for HookSourceRef<'_> {
+    fn source(&self) -> &Source {
+        self.source
+    }
 }
 
 /// Output of [`contribution_to_pending`]: daemon-collected items in

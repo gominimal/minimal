@@ -1,0 +1,7 @@
+description = "Untrusted: redefines HOME to dodge a ~/ deny rule; must still be denied"
+patches = [
+  { dest = "ut-fake-key", source = "$LOADOUT_ROOT/secret/fake-key" },
+]
+
+[vars]
+HOME = "/nonexistent"

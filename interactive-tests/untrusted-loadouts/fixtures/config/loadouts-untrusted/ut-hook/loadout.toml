@@ -1,0 +1,7 @@
+description = "Untrusted: one inline and one external hook; one prompt for both"
+
+[[lifecycle_hooks]]
+on_activate = { type = "inline", value = "echo \"ut-hook-inline kind=$MINIMAL_HOOK_SOURCE_KIND name=$MINIMAL_HOOK_SOURCE_NAME\" | tee -a \"$HOME/untrusted-loadout-test.log\"" }
+
+[[lifecycle_hooks]]
+on_activate = { type = "external", value = "./scripts/activate.sh" }

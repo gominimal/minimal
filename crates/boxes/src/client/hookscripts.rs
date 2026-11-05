@@ -11,6 +11,7 @@
 //! | Source | Anchor |
 //! |---|---|
 //! | [`Source::UserLoadout`] | `<config>/minimal/loadouts/<name>/` |
+//! | [`Source::UntrustedLoadout`] | `<config>/minimal/loadouts-untrusted/<name>/` |
 //! | [`Source::Project`] | the project root |
 //!
 //! Validation runs on the client so a mistyped path fails locally and
@@ -19,6 +20,7 @@
 //!
 //! [`LifecycleHook`]: crate::core::lifecyclehook::LifecycleHook
 //! [`Source::UserLoadout`]: crate::core::source::Source::UserLoadout
+//! [`Source::UntrustedLoadout`]: crate::core::source::Source::UntrustedLoadout
 //! [`Source::Project`]: crate::core::source::Source::Project
 
 use camino::{Utf8Path, Utf8PathBuf};
@@ -88,8 +90,9 @@ pub enum StageError {
 /// directory.
 #[derive(Debug, Clone)]
 pub struct ScriptAnchors {
-    /// The user's loadouts directory. A loadout named `dev` anchors its
-    /// scripts at `<loadouts_dir>/dev/`.
+    /// The user's trusted loadouts directory. A loadout named `dev`
+    /// anchors its scripts at `<loadouts_dir>/dev/`. An untrusted
+    /// loadout carries its own directory in its [`Source`] instead.
     pub loadouts_dir: paths::HostAbsPath,
     /// The project root, for hooks declared in `minimal.toml`.
     pub project_root: paths::HostAbsPath,
@@ -108,7 +111,9 @@ impl ScriptAnchors {
             // its scripts never stage — and the daemon would refuse to read
             // them anyway. It is also what `$LOADOUT_ROOT` resolves to, so a
             // loadout's scripts and its patch sources share one directory.
-            Source::UserLoadout { .. } => source.loadout_dir(&self.loadouts_dir),
+            Source::UserLoadout { .. } | Source::UntrustedLoadout { .. } => {
+                source.loadout_dir(&self.loadouts_dir)
+            }
             Source::Project { .. } => Some(self.project_root.clone()),
             Source::Package { .. } => None,
         }

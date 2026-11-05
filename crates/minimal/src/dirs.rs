@@ -127,7 +127,17 @@ fn build_dir_rows(dirs: &DirsLookup) -> Vec<DirRow> {
         (
             "Config",
             "Loadouts dir",
-            Some(dirs.config.join("loadouts")),
+            Some(dirs.config.join(crate::loadouts::LOADOUTS_DIR_NAME)),
+            None,
+        )
+            .into_row(),
+        (
+            "Config",
+            "Untrusted loadouts dir",
+            Some(
+                dirs.config
+                    .join(crate::loadouts::UNTRUSTED_LOADOUTS_DIR_NAME),
+            ),
             None,
         )
             .into_row(),
@@ -324,6 +334,11 @@ mod tests {
                 "/home/u/.config/minimal/loadouts".to_string(),
             ),
             (
+                "Config",
+                "Untrusted loadouts dir",
+                "/home/u/.config/minimal/loadouts-untrusted".to_string(),
+            ),
+            (
                 "State",
                 "State dir",
                 "/home/u/.local/state/minimal".to_string(),
@@ -350,11 +365,12 @@ mod tests {
                 "/home/u/.cache/minimal/built".to_string(),
             ),
         ];
-        // Mesh enrolment prints under Config, right after "Loadouts
-        // dir", only in `remote-access` builds where `min mesh` exists.
+        // Mesh enrolment prints under Config, right after "Untrusted
+        // loadouts dir", only in `remote-access` builds where `min mesh`
+        // exists.
         #[cfg(feature = "remote-access")]
         expected.insert(
-            3,
+            4,
             (
                 "Config",
                 "Mesh enrolment",

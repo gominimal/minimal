@@ -14,6 +14,7 @@ use crate::core::source::Source;
 pub struct Unapproved<'a, T: ?Sized> {
     pub(crate) item: &'a T,
     pub(crate) source: &'a Source,
+    pub(crate) value: Option<&'a str>,
 }
 
 impl<'a, T: ?Sized> Unapproved<'a, T> {
@@ -24,7 +25,22 @@ impl<'a, T: ?Sized> Unapproved<'a, T> {
     /// its own private types.
     #[must_use]
     pub fn new(item: &'a T, source: &'a Source) -> Self {
-        Self { item, source }
+        Self {
+            item,
+            source,
+            value: None,
+        }
+    }
+
+    /// [`Self::new`], for a variable whose value its source set: a
+    /// literal, or the default it fell back to.
+    #[must_use]
+    pub fn with_value(item: &'a T, source: &'a Source, value: &'a str) -> Self {
+        Self {
+            item,
+            source,
+            value: Some(value),
+        }
     }
 
     /// The item the policy couldn't decide on (e.g. a variable name or
@@ -32,6 +48,16 @@ impl<'a, T: ?Sized> Unapproved<'a, T> {
     #[must_use]
     pub fn item(&self) -> &'a T {
         self.item
+    }
+
+    /// For a variable whose value its source set rather than read from
+    /// your environment, that value: what approving it actually lets
+    /// into the session. Only an untrusted loadout's such variables
+    /// reach a hook. `None` for a variable read from your environment,
+    /// and for every patch and lifecycle hook.
+    #[must_use]
+    pub fn value(&self) -> Option<&'a str> {
+        self.value
     }
 
     /// The [`Source`] that contributed this item — useful for prompts
@@ -124,12 +150,14 @@ pub trait PolicyHooks {
         items: &[Unapproved<'_, camino::Utf8Path>],
     ) -> HookResult<PatchesPolicy>;
 
-    /// Decide whether a project's lifecycle hooks may run.
+    /// Decide whether a project's, or an untrusted loadout's, lifecycle
+    /// hooks may run.
     ///
-    /// Each item's borrowed value is the **project root path**, not a
-    /// script — one entry per project awaiting a decision, deduplicated
-    /// by the gate, because a project's hooks are allowed or refused as
-    /// a set rather than one script at a time. Approving here grants
+    /// Each item's borrowed value is the **project root path** (or the
+    /// untrusted loadout's own directory), not a script — one entry per
+    /// source awaiting a decision, deduplicated by the gate, because a
+    /// source's hooks are allowed or refused as a set rather than one
+    /// script at a time. Approving here grants
     /// arbitrary code execution inside the session, so an implementation
     /// that prompts should say so plainly.
     ///
