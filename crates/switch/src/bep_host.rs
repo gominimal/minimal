@@ -2238,7 +2238,10 @@ impl BepPeer {
         let (device, ends) = BepDevice::pair();
 
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        // The peer's thread logs to the subscriber its spawner logs to.
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let poll_task = tokio::task::spawn_blocking(move || {
+            let _dispatch = tracing::dispatcher::set_default(&dispatch);
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -3280,6 +3283,58 @@ mod tests {
         let mut frame = vec![0u8; usize::from(u16::from_le_bytes(len_buf))];
         stream.read_exact(&mut frame).await.expect("read the frame");
         frame
+    }
+
+    /// How many times `log` holds the reader pump's "switch socket closed"
+    /// line.
+    fn socket_closed_lines(log: &WarnLog) -> usize {
+        log.lines()
+            .iter()
+            .filter(|l| l.contains("switch socket closed"))
+            .count()
+    }
+
+    /// A clean stop shuts the peer down before the switch closes its socket,
+    /// so the reader pump is gone and says nothing; a switch that closes the
+    /// socket under a live peer still gets the WARN, since that lane is lost.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn a_clean_shutdown_is_quiet_and_a_lost_switch_warns() {
+        let (log, _guard) = capture_warn_lines();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let peer_at = |sock: std::path::PathBuf| {
+            let wire = BepWire::new(dir.path().join("proxy.sock"), [0u8; TOKEN_LEN]);
+            async move {
+                BepPeer::spawn(&sock, SwitchSubnet::default(), wire, Arc::new(NoBoxes))
+                    .await
+                    .expect("peer spawns against a listening switch socket")
+            }
+        };
+
+        let sock = dir.path().join("clean.sock");
+        let accept_fut = stand_in_switch(&sock).await;
+        let peer = peer_at(sock).await;
+        let switch = accept_fut.await.expect("acceptor task completed");
+        peer.shutdown().await;
+        drop(switch);
+        // Several poll periods: a reader still running would have seen EOF.
+        tokio::time::sleep(POLL_DELAY * 5).await;
+        assert_eq!(socket_closed_lines(&log), 0, "{:?}", log.lines());
+
+        let sock = dir.path().join("lost.sock");
+        let accept_fut = stand_in_switch(&sock).await;
+        let peer = peer_at(sock).await;
+        let switch = accept_fut.await.expect("acceptor task completed");
+        drop(switch);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while socket_closed_lines(&log) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("no switch socket closed WARN: {:?}", log.lines()));
+        assert_eq!(socket_closed_lines(&log), 1, "{:?}", log.lines());
+        peer.shutdown().await;
     }
 
     /// NET-132: the peer is silent until addressed. Across an interval that
