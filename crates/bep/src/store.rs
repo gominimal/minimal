@@ -635,10 +635,27 @@ fn entry_admits(entry: &str, proxy: &str) -> bool {
             && !index.is_empty()
         {
             let path = rest.strip_suffix(" (OK)").unwrap_or(rest);
-            listed |= path == proxy;
+            listed |= path == proxy || is_bundle_of(path, proxy);
         }
     }
     decrypt && listed
+}
+
+/// Whether `path` is the bundle whose main program is `proxy`.
+///
+/// `security -T` records a bundle's main program as the bundle, with the
+/// bundle's requirement. It records any other program in the bundle under
+/// that program's own path, with that program's requirement. So an entry
+/// that names the bundle says nothing about another program inside it, and
+/// only `<name>.app/Contents/MacOS/<name>`, the form `bep.app` ships in,
+/// matches here. A bundle that names its main program differently reads as
+/// not listed, which refuses the item.
+fn is_bundle_of(path: &str, proxy: &str) -> bool {
+    let name = path.rsplit('/').next().and_then(|n| n.strip_suffix(".app"));
+    let program = proxy
+        .strip_prefix(path)
+        .and_then(|tail| tail.strip_prefix("/Contents/MacOS/"));
+    name.is_some() && name == program
 }
 
 /// The keychain operations that [`set_item`] puts in order.
@@ -1395,6 +1412,80 @@ mod tests {
             assert!(err.to_string().contains("is not a name a secret can have"));
         }
         keychain_add_line("claude", b"v", proxy).expect("valid");
+    }
+
+    // An installed proxy runs from a bundle, and `security -T` records the
+    // bundle: `dump-keychain -a` then prints the bundle's path, with the
+    // requirement line under it, and never the inner binary. A listing must
+    // still admit the bundle's own proxy, and neither a directory on its
+    // path, another bundle, nor another program inside the bundle.
+    #[test]
+    fn secret_item_acl_admits_a_bundled_proxy() {
+        let proxy = Path::new("/Users/me/.local/bin/bep.app/Contents/MacOS/bep");
+        let dump = "keychain: \"/Users/me/Library/Keychains/login.keychain-db\"
+class: \"genp\"
+attributes:
+    \"acct\"<blob>=\"claude\"
+    \"svce\"<blob>=\"dev.minimal.secret\"
+access: 1 entries
+    entry 0:
+        authorizations (6): decrypt derive export_clear export_wrapped mac sign
+        don't-require-password
+        description: Minimal secret claude
+        applications (1):
+            0: /Users/me/.local/bin/bep.app (OK)
+            requirement: identifier \"dev.minimal.bep\" and anchor apple generic and certificate leaf[subject.CN] = \"Minimal\"
+keychain: \"/Users/me/Library/Keychains/login.keychain-db\"
+class: \"genp\"
+attributes:
+    \"acct\"<blob>=\"other\"
+    \"svce\"<blob>=\"dev.minimal.secret\"
+access: 1 entries
+    entry 0:
+        authorizations (6): decrypt derive export_clear export_wrapped mac sign
+        don't-require-password
+        description: Minimal secret other
+        applications (1):
+            0: /Applications/Other.app (OK)
+keychain: \"/Users/me/Library/Keychains/login.keychain-db\"
+class: \"genp\"
+attributes:
+    \"acct\"<blob>=\"partial\"
+    \"svce\"<blob>=\"dev.minimal.secret\"
+access: 1 entries
+    entry 0:
+        authorizations (6): decrypt derive export_clear export_wrapped mac sign
+        don't-require-password
+        description: Minimal secret partial
+        applications (1):
+            0: /Users/me/.local/bin (OK)
+";
+        assert_eq!(
+            parse_dump(dump, proxy),
+            vec![
+                ItemInfo {
+                    id: "claude".into(),
+                    proxy_access: true
+                },
+                ItemInfo {
+                    id: "other".into(),
+                    proxy_access: false
+                },
+                ItemInfo {
+                    id: "partial".into(),
+                    proxy_access: false
+                },
+            ]
+        );
+        for other in ["helper", "nested/bep"] {
+            let other = format!("/Users/me/.local/bin/bep.app/Contents/MacOS/{other}");
+            assert!(
+                parse_dump(dump, Path::new(&other))
+                    .iter()
+                    .all(|item| !item.proxy_access),
+                "{other} is not the bundle's main program"
+            );
+        }
     }
 
     /// The BEP-051 leg on a real keychain: set, list, set again and remove

@@ -128,6 +128,8 @@ unicode-width.workspace = true
 insta.workspace = true
 nix = { workspace = true, features = ["term"] }
 minvmd = { path = "../minvmd", default-features = false, features = ["test-support"] }
+# The property test that no output mode writes a secret's value (BCLI-063).
+proptest.workspace = true
 # `test-util` (not in tokio's `full`) for `#[tokio::test(start_paused = true)]`:
 # lets the client's handshake-deadline test elapse in virtual time.
 tokio = { workspace = true, features = ["test-util"] }

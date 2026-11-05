@@ -57,6 +57,28 @@ impl BoxEventType {
     }
 }
 
+/// The keys of the `data` object of an `exec_started` and an `exec_exited`
+/// event (BOX-152). Both events carry the exec's id, its mode, its PTY
+/// flag, the principal that ran it and its argv. An `exec_exited` event
+/// adds the exit code and the reason the exec ended.
+pub mod exec_data {
+    /// The exec's id, a `UUIDv7` in its hyphenated spelling.
+    pub const EXEC_ID: &str = "exec_id";
+    /// The exec's mode: `attached`, `tty` or `detached`.
+    pub const MODE: &str = "mode";
+    /// Whether the exec runs on a PTY.
+    pub const PTY: &str = "pty";
+    /// The user the exec request came from.
+    pub const PRINCIPAL: &str = "principal";
+    /// The exec's argv, as the client sent it.
+    pub const ARGV: &str = "argv";
+    /// The exec's exit code, `null` when a signal ended it. Only on
+    /// `exec_exited`.
+    pub const EXIT_CODE: &str = "exit_code";
+    /// Why the exec ended. Only on `exec_exited`.
+    pub const REASON: &str = "reason";
+}
+
 /// One lifecycle event of one box (BOX-040).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoxEvent {

@@ -106,6 +106,10 @@ pub(crate) struct Host<P: BoxProcess, G: BoxGuard> {
     /// failure, never by a deliberate kill, which is what keeps a destroy from
     /// raising a shell-exit prompt.
     pending_pty_err: Option<std::io::Error>,
+    /// Set when [`Host::step`] takes a `Message::Kill`. The step-error branch
+    /// of [`Host::mainloop`] reads it to tell a requested end from a pty
+    /// failure. A pty error stashed before the kill does not hide the kill.
+    kill_requested: bool,
     /// The master-side fd of the Pty.
     master: AsyncFd<std::fs::File>,
     /// The box's output log (BOX-155). Every read from the master lands
@@ -806,12 +810,14 @@ const NO_PROXY_DEFAULTS: [&str; 4] = [
 ///
 /// Empty unless the box's steering is `proxy_env` or `both`, or its
 /// `[network.bep] proxy_env` is true. Also empty when the box declares no
-/// credentialed upstream, or its network mode puts the lane out of effect:
-/// such a box cannot reach the proxy's address, so the variables would send
-/// all of its HTTP traffic to an address that drops it.
+/// credentialed upstream, or its network mode on a host of kind `host` puts
+/// the lane out of effect (BEP-085): such a box cannot reach the proxy's
+/// address, so the variables would send all of its HTTP traffic to an
+/// address that drops it. A `host_ip` box on a VM host gets them.
 pub(crate) fn launch_proxy_env(
     record: &boxes::Record,
     subnet: switch::SwitchSubnet,
+    host: paths::HostKind,
 ) -> Vec<(String, String)> {
     use boxes::core::bep::Steering;
     let Some(upstream) = record.policy.credentialed_upstream.as_ref() else {
@@ -820,7 +826,7 @@ pub(crate) fn launch_proxy_env(
     let bep = &upstream.bep;
     let steered =
         matches!(bep.resolved_steering(), Steering::ProxyEnv | Steering::Both) || bep.proxy_env;
-    if !steered || !boxes::CredentialedUpstream::in_effect(record.network) {
+    if !steered || !boxes::CredentialedUpstream::in_effect(record.network, host) {
         return Vec::new();
     }
     let proxy = format!(
@@ -845,26 +851,43 @@ pub(crate) fn launch_proxy_env(
 /// Places the proxy variables (BEP-012) in a launch's connection layer, over
 /// any value the layer held there, so the shell's launch environment and
 /// everything the host runs in the box carry them. Call it before
-/// [`place_launch_deliveries`], which keeps the layer it reads. Logs one
-/// debug line for the box, naming the variables set.
+/// [`place_launch_deliveries`], which keeps the layer it reads.
+///
+/// Logs one debug line for a box that declares a credentialed upstream. The
+/// line names the variables set, the box's network mode, the host kind and
+/// whether the lane is in effect, so a box that got no variables shows why.
 pub(crate) fn place_launch_proxy_env(
     attach_env: &mut AttachEnv,
-    session_id: boxes::SessionId,
+    record: &boxes::Record,
+    host: paths::HostKind,
     vars: &[(String, String)],
 ) {
-    if vars.is_empty() {
-        return;
-    }
     for (name, value) in vars {
         attach_env.connection.retain(|(k, _)| k != name);
         attach_env.connection.push((name.clone(), value.clone()));
     }
+    if record.policy.credentialed_upstream.is_none() {
+        return;
+    }
     let names: Vec<&str> = vars.iter().map(|(name, _)| name.as_str()).collect();
     tracing::debug!(
-        session_id = %session_id,
+        session_id = %record.id,
+        network = record.network.word(),
+        host_kind = host.tag(),
+        lane_in_effect = boxes::CredentialedUpstream::in_effect(record.network, host),
         variables = %names.join(","),
-        "set the proxy variables in the box environment"
+        "proxy variables for the box environment"
     );
+}
+
+/// The host kind a launch reads from this daemon's switch transport: a
+/// switch reached over the VM's host shuttle means this daemon runs inside
+/// a VM, and every other transport is a native host.
+pub(crate) fn host_kind_of(transport: crate::net::SwitchTransport) -> paths::HostKind {
+    match transport {
+        crate::net::SwitchTransport::HostShuttle { .. } => paths::HostKind::Minvmd,
+        crate::net::SwitchTransport::LocalSpawn => paths::HostKind::Minimald,
+    }
 }
 
 /// The host's half of the name lifecycle (NET-128): the registry and the
@@ -1344,6 +1367,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             parser,
             process,
             pending_pty_err: None,
+            kill_requested: false,
             master,
             output_log,
             box_dir,
@@ -1439,10 +1463,16 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                     // repeat it here, where it is attributable, for the same
                     // reason the pty/step path does.
                     let exit = self.process.exit_reason();
+                    // A kill from the daemon can lose the race to this reap:
+                    // it is queued, but the process is reaped here before
+                    // `step` takes it. The daemon asked for the end, so the
+                    // entrypoint's own return does not end the box (BOX-038).
+                    let requested = self.kill_queued();
                     tracing::info!(
                         session_id = %self.session_id,
                         session = %self.session_name,
                         exit_code,
+                        requested,
                         abnormal = exit.as_ref().is_some_and(ExitReason::is_abnormal),
                         exit_reason = exit.as_ref().map_or("", |r| r.reason.as_str()),
                         "session process exited; reaped by the host loop",
@@ -1466,7 +1496,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                     break Ok(HostExit {
                         code: exit_code,
                         reason: exit,
-                        requested: false,
+                        requested,
                     });
                 }
                 Ok(None) => {}
@@ -1490,10 +1520,10 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                 // `Err` from `step`, but a destroy or a daemon shutdown either
                 // wants no farewell at all or has already sent its own teardown.
                 let mut pending = self.pending_pty_err.take();
-                // Read before `take_if` below can empty `pending`: with no
-                // stashed pty error, the only way `step` errs is
-                // `Message::Kill`, so the end was asked for.
-                let requested = pending.is_none();
+                // Read from the kill itself, not from `pending`: a kill can
+                // arrive after a pty error was stashed, and that end is still
+                // the daemon's, not the entrypoint's own return (BOX-038).
+                let requested = self.kill_requested;
 
                 // Notify *before* the reap when the process may still be
                 // running, because `wait` below is unbounded — see
@@ -1586,6 +1616,26 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         }
 
         result
+    }
+
+    /// Whether a kill from the daemon waits in the mailbox. Called once the
+    /// process is reaped and the loop ends, so it drains the mailbox: the
+    /// loop takes no message after this, and the other messages drop as
+    /// they do when the host ends.
+    fn kill_queued(&mut self) -> bool {
+        let mut killed = false;
+        while let Ok(msg) = self.receiver.try_recv() {
+            if let Message::Kill(for_shutdown) = msg {
+                tracing::info!(
+                    session_id = %self.session_id,
+                    session = %self.session_name,
+                    for_shutdown,
+                    "session host killed on request; the process was already reaped",
+                );
+                killed = true;
+            }
+        }
+        killed
     }
 
     /// Logs a pty-master failure and stashes it for [`Self::mainloop`] to hand
@@ -1713,6 +1763,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                             for_shutdown,
                             "session host killed on request",
                         );
+                        self.kill_requested = true;
                         if for_shutdown
                             && let Some(binding) = self.remote.take() {
                                 // If there was a binding we just swapped out, tell it to
@@ -2162,13 +2213,16 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         // interpreting those keystrokes under this channel's fresh keys.
         self.binding_generation += 1;
 
-        if !skip_flush {
+        // The redraw is rendered here but not written here: a redraw can be
+        // megabytes (a large terminal with per-cell colour), and russh parks
+        // a write while the client's ssh window is exhausted, so writing it
+        // on the host loop let one client that stopped reading before its
+        // redraw was written stall the host loop, and every other client of
+        // the session with it.
+        let redraw = (!skip_flush).then(|| {
             self.parser.screen_mut().set_size(sz.rows, sz.cols);
-            let _ = channel
-                .make_writer()
-                .write_all(&self.parser.screen().state_formatted())
-                .await;
-        }
+            self.parser.screen().state_formatted()
+        });
         let new_binding = Binding::spawn(
             channel,
             self.remote_tx.clone(),
@@ -2182,6 +2236,16 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             self.box_dir.clone(),
         )
         .await;
+
+        // The redraw is the new binding's first output, written by the
+        // binding's own task and raced against the shed like any other
+        // stdout, so a client that never reads stalls only its binding. The
+        // mailbox is fresh, so the first message always fits.
+        if let Some(redraw) = redraw
+            && let Err(e) = new_binding.0.try_send(BindingMsg::Stdin(redraw))
+        {
+            tracing::warn!(session = %self.session_name, "could not queue the attach redraw: {e}");
+        }
 
         if let Some(old_binding) = self.remote.replace(new_binding) {
             // If there was a binding we just swapped out, tell it to
@@ -2301,7 +2365,7 @@ mod proxy_env_tests {
     use super::*;
     use boxes::core::bep::{BepSettings, Steering};
 
-    fn record(network: NetworkMode, bep: Option<BepSettings>) -> boxes::Record {
+    pub(super) fn record(network: NetworkMode, bep: Option<BepSettings>) -> boxes::Record {
         boxes::Record {
             id: boxes::SessionId::nil(),
             name: None,
@@ -2336,7 +2400,7 @@ mod proxy_env_tests {
         }
     }
 
-    fn steering(steering: Steering) -> BepSettings {
+    pub(super) fn steering(steering: Steering) -> BepSettings {
         BepSettings {
             steering: Some(steering),
             ..BepSettings::default()
@@ -2358,6 +2422,7 @@ mod proxy_env_tests {
         let vars = launch_proxy_env(
             &record(NetworkMode::OwnIp, Some(bep)),
             switch::DEFAULT_SUBNET,
+            paths::HostKind::Minimald,
         );
         assert_eq!(
             get(&vars, "HTTPS_PROXY"),
@@ -2385,6 +2450,7 @@ mod proxy_env_tests {
             let vars = launch_proxy_env(
                 &record(NetworkMode::OwnIp, Some(bep.clone())),
                 switch::DEFAULT_SUBNET,
+                paths::HostKind::Minimald,
             );
             assert_eq!(get(&vars, "NODE_USE_ENV_PROXY"), Some("1"), "{bep:?}");
         }
@@ -2396,17 +2462,24 @@ mod proxy_env_tests {
             let vars = launch_proxy_env(
                 &record(NetworkMode::OwnIp, Some(bep.clone())),
                 switch::DEFAULT_SUBNET,
+                paths::HostKind::Minimald,
             );
             assert!(vars.is_empty(), "{bep:?}: {vars:?}");
         }
         // No credentialed upstream, or a network mode with no lane.
         assert!(
-            launch_proxy_env(&record(NetworkMode::OwnIp, None), switch::DEFAULT_SUBNET).is_empty()
+            launch_proxy_env(
+                &record(NetworkMode::OwnIp, None),
+                switch::DEFAULT_SUBNET,
+                paths::HostKind::Minimald,
+            )
+            .is_empty()
         );
         assert!(
             launch_proxy_env(
                 &record(NetworkMode::HostNet, Some(steering(Steering::ProxyEnv))),
                 switch::DEFAULT_SUBNET,
+                paths::HostKind::Minimald,
             )
             .is_empty()
         );
@@ -2424,11 +2497,9 @@ mod proxy_env_tests {
                 ),
             ],
         };
-        let vars = launch_proxy_env(
-            &record(NetworkMode::OwnIp, Some(steering(Steering::ProxyEnv))),
-            switch::DEFAULT_SUBNET,
-        );
-        place_launch_proxy_env(&mut attach_env, boxes::SessionId::nil(), &vars);
+        let laned = record(NetworkMode::OwnIp, Some(steering(Steering::ProxyEnv)));
+        let vars = launch_proxy_env(&laned, switch::DEFAULT_SUBNET, paths::HostKind::Minimald);
+        place_launch_proxy_env(&mut attach_env, &laned, paths::HostKind::Minimald, &vars);
         let kept = place_launch_deliveries(&mut attach_env, boxes::SessionId::nil(), &[]);
         assert_eq!(
             kept.get("HTTPS_PROXY").map(String::as_str),

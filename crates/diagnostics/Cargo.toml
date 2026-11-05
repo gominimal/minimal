@@ -8,6 +8,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+tracing.workspace = true
 anyhow.workspace = true
 async-compression.workspace = true
 async-tar.workspace = true

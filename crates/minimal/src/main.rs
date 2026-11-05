@@ -5,10 +5,8 @@
 // daemon crates themselves already declare.
 #![recursion_limit = "256"]
 use std::io::IsTerminal as _;
-use std::io::Write as _;
 use std::process::ExitCode;
 
-use anyhow::Context as _;
 use clap::{CommandFactory as _, Parser};
 use minimal::{ExecArgs, PolicyArgs, PolicyOutputFormat};
 use tracing_subscriber::fmt::format::{FormatEvent, Writer};
@@ -163,57 +161,109 @@ async fn run() -> ExitCode {
     // the bound cuts off is in the spool already.
     mlog::otel::shutdown(mlog::otel::CLI_EXIT_FLUSH);
     if let Err(e) = result {
-        // A task's non-zero exit (`min task run`) is a status to relay, not
-        // an error to print — the task's own output already streamed through
-        // (the git-remote helper's ExitCode precedent).
-        if let Some(&minimal::task::TaskExit(code)) = e.downcast_ref::<minimal::task::TaskExit>() {
-            return ExitCode::from(code);
-        }
-        // A machine-output run answers its failure with the one
-        // `min/v1/error` object a client parses: the emitter below, keyed
-        // on the output mode the run was under rather than on the command,
-        // so the mechanism is one, shared by every command that takes
-        // `-o json` — each fails its walk into the generic
-        // [`minimal::MachineModeFailure`] payload, which is all this path
-        // downcasts. The object is the contract, so there is no second,
-        // plain-text line to print for the same failure, only the non-zero
-        // status.
-        if output_mode {
-            match machine_mode_answer(&e) {
-                MachineModeAnswer::Quiet => return ExitCode::from(141),
-                MachineModeAnswer::Object(failure) => {
-                    emit_machine_mode_error(&failure);
-                    return ExitCode::from(failure_exit_code(&e));
-                }
-            }
-        }
-        // A reader that went away (`min version | head -1`) is not an error
-        // worth reporting: exit quietly with the shell's SIGPIPE convention.
-        if quiet_on_closed_pipe && is_broken_pipe(&e) {
-            return ExitCode::from(141);
-        }
-        eprintln!("error: {e:#}");
-        return ExitCode::from(failure_exit_code(&e));
+        return answer_failure(
+            &e,
+            output_mode,
+            quiet_on_closed_pipe,
+            minimal::hosts::failed_run_alias_hint(),
+            &mut std::io::stderr(),
+        );
     }
     ExitCode::SUCCESS
 }
 
+/// How a failed run ends: the exit code, and what goes to `stderr`. The run's
+/// stdout is not a parameter, so a failure writes nothing there.
+#[expect(
+    clippy::let_underscore_must_use,
+    reason = "a closed stderr has no reader left to tell; the exit status is \
+              the failure's answer either way"
+)]
+fn answer_failure(
+    e: &anyhow::Error,
+    machine_mode: bool,
+    quiet_on_closed_pipe: bool,
+    alias_hint: Option<&str>,
+    stderr: &mut dyn std::io::Write,
+) -> ExitCode {
+    // A task's non-zero exit (`min task run`) is a status to relay, not
+    // an error to print — the task's own output already streamed through
+    // (the git-remote helper's ExitCode precedent).
+    if let Some(&minimal::task::TaskExit(code)) = e.downcast_ref::<minimal::task::TaskExit>() {
+        if let Some(hint) = alias_hint {
+            let _ = writeln!(stderr, "{hint}");
+        }
+        return ExitCode::from(code);
+    }
+    // A machine-output run answers its failure with the one
+    // `min/v1/error` object a client parses (BCLI-033), written by the
+    // shared output writer, keyed on the output mode the run was under
+    // rather than on the command. The object is the contract, so there is
+    // no second, plain-text line to print for the same failure, only the
+    // non-zero status.
+    if machine_mode {
+        return match machine_mode_answer(e) {
+            MachineModeAnswer::Quiet => ExitCode::from(141),
+            MachineModeAnswer::Object(failure) => {
+                // BCLI-042: an old spelling's hint is the object's `hint`
+                // field, with no separate line.
+                let failure = match alias_hint {
+                    Some(hint) => failure.with_alias_hint(hint),
+                    None => failure,
+                };
+                emit_machine_mode_error(stderr, &failure);
+                ExitCode::from(failure_exit_code(e))
+            }
+        };
+    }
+    // A reader that went away (`min version | head -1`) is not an error
+    // worth reporting: exit quietly with the shell's SIGPIPE convention.
+    if quiet_on_closed_pipe && is_broken_pipe(e) {
+        return ExitCode::from(141);
+    }
+    let _ = writeln!(stderr, "error: {e:#}");
+    if let Some(hint) = alias_hint {
+        let _ = writeln!(stderr, "{hint}");
+    }
+    ExitCode::from(failure_exit_code(e))
+}
+
 /// The exit code a failed run ends with, from the architecture's reserved
 /// codes ("Exit codes"): 2 when a running box holds the name a create
-/// asked for (`minimald_rpc::HeldNameRefusal`), 3 when the activation
+/// asked for (`minimald_rpc::HeldNameRefusal`) or a removal without
+/// `--force` finds the box running (`minimal::BoxRunningRefusal`), 3 when
+/// the activation
 /// refused the box spec
 /// (`boxes::core::bep::ActivationRefused`) or found the project's
 /// `minimal.toml` invalid (`minimal::ProjectFileInvalid`) or a GitHub
 /// grant undeliverable (`minimal::GrantNotDelivered`), 7 when the VM host could not
 /// be reached to register or resume an own-address box's row (provider/host
 /// unreachable, #1790), 8 when the host refused the registration for want
-/// of addresses (insufficient resources), and 1, the unspecified error,
+/// of addresses (insufficient resources), the code a box address refusal
+/// carries (`minimal::BoxAddressRefusal`: 2 when a name matches boxes on
+/// more than one host, 4 when the address names no box, 7 when a host did
+/// not answer the lookup), the code a `min box exec` refusal carries
+/// (`minimal::BoxExecRefusal`: 2 for `-t` without a terminal or a box that
+/// is not running, 5 when its spec turns exec off), 124 when an exec ran past its own timeout
+/// (`minimal::BoxExecTimedOut`), and 1, the unspecified error,
 /// for everything else — a refusal the host answered included. Both
 /// output modes end with the same code.
 fn failure_exit_code(e: &anyhow::Error) -> u8 {
     // BEP-008/009/010/017/056: a box spec refused at activation.
     if let Some(refused) = e.downcast_ref::<boxes::core::bep::ActivationRefused>() {
         return refused.exit_code();
+    }
+    // BCLI-004: `min box rm` of a running box without `--force`.
+    if e.downcast_ref::<minimal::BoxRunningRefusal>().is_some() {
+        return minimal::BoxRunningRefusal::EXIT_CODE;
+    }
+    // BCLI-058: `min box rename` to a name BOX-010 refuses.
+    if e.downcast_ref::<minimal::BoxRenameRefusal>().is_some() {
+        return minimal::BoxRenameRefusal::EXIT_CODE;
+    }
+    // BCLI-005: `min box prune` off a terminal without `--yes`.
+    if e.downcast_ref::<minimal::PruneNeedsYes>().is_some() {
+        return minimal::PruneNeedsYes::EXIT_CODE;
     }
     // BOX-163: a create under a name a running box holds.
     if e.downcast_ref::<minimald_rpc::HeldNameRefusal>().is_some() {
@@ -236,6 +286,28 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
         .is_some()
     {
         return 8;
+    }
+    // BCLI-002, BCLI-064: a box address that names no single box.
+    if let Some(refused) = e.downcast_ref::<minimal::BoxAddressRefusal>() {
+        return refused.exit_code();
+    }
+    // BCLI-068: `min box attach` refused, or its connection failed.
+    if let Some(refused) = e.downcast_ref::<minimal::BoxAttachRefusal>() {
+        return refused.exit_code();
+    }
+    // BCLI-053: `min box exec -t` without a terminal, or into a box that is
+    // not running (2), or whose spec turns exec off (5).
+    if let Some(refused) = e.downcast_ref::<minimal::BoxExecRefusal>() {
+        return refused.exit_code();
+    }
+    // BCLI-053: an exec that its own timeout ended.
+    if e.downcast_ref::<minimal::BoxExecTimedOut>().is_some() {
+        return minimal::BoxExecTimedOut::EXIT_CODE;
+    }
+    // BCLI-034, BCLI-062: `min box cp` of a file the box does not have, or
+    // does not allow reading.
+    if let Some(refused) = e.downcast_ref::<minimal::BoxFileRefusal>() {
+        return refused.exit_code();
     }
     1
 }
@@ -324,6 +396,14 @@ fn machine_mode_answer(e: &anyhow::Error) -> MachineModeAnswer {
             hint,
         ));
     }
+    // BCLI-053: an exec that its own timeout ended is `timeout`.
+    if let Some(timed_out) = e.downcast_ref::<minimal::BoxExecTimedOut>() {
+        return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
+            minimal::BoxExecTimedOut::CODE,
+            format!("{e:#}"),
+            timed_out.hint().to_string(),
+        ));
+    }
     if e.downcast_ref::<minimal::OutputWriteError>().is_some() {
         return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
             "output_failed",
@@ -357,7 +437,8 @@ impl std::io::Write for DashLog {
 /// Whether the command's stdout is a data contract that tracing must not
 /// pollute, so its logs go to stderr instead. The `completions` handlers emit a
 /// shell shim on stdout, `session exec` carries only the exec'd
-/// command's output, and `task run` / `session run` stream the task's stdout —
+/// command's output, `box exec` carries the command's output or its exec
+/// id, and `task run` / `session run` stream the task's stdout —
 /// a log line in any of them would be read as content. A bare `min` (no subcommand) is
 /// one too: its non-TTY twin promises an empty stdout to pipelines, and its
 /// interactive activate path prints only the session id there. So is
@@ -378,6 +459,9 @@ fn stdout_is_data_contract(command: &Option<minimal::Command>) -> bool {
                 })
                 | minimal::Command::Task(minimal::TaskArgs {
                     command: minimal::TaskCommand::Run(_),
+                })
+                | minimal::Command::Box(minimal::BoxArgs {
+                    command: minimal::BoxCommand::Exec(_),
                 })
         )
     )
@@ -471,66 +555,43 @@ fn machine_output_mode(cli: &minimal::Cli) -> bool {
         Some(minimal::Command::Box(minimal::BoxArgs {
             command: minimal::BoxCommand::Audit(args),
         })) => args.output == Some(minimal::BoxAuditOutputFormat::Jsonl),
+        // Architecture line 383: a `min box list -o json` failure is one
+        // `min/v1/error` object (BCLI-001).
+        Some(minimal::Command::Box(minimal::BoxArgs {
+            command: minimal::BoxCommand::List(args),
+        })) => args.output.is_some(),
+        // BCLI-016: a `min box events -o jsonl` failure is one
+        // `min/v1/error` object too.
+        Some(minimal::Command::Box(minimal::BoxArgs {
+            command: minimal::BoxCommand::Events(args),
+        })) => args.output == Some(minimal::BoxEventsOutputFormat::Jsonl),
         _ => false,
     }
 }
 
-/// The schema stamp of the machine-mode error object — the same kind of
-/// stamp a document carries, on the object a failure answers with.
-const MACHINE_ERROR_SCHEMA: &str = "min/v1/error";
-
-/// The shape of the one `min/v1/error` object.
-#[derive(serde::Serialize)]
-struct MachineModeErrorDoc<'a> {
-    schema: &'static str,
-    code: &'a str,
-    message: &'a str,
-    /// Omitted when nothing about the failure names a remedy (`unspecified`).
-    #[serde(skip_serializing_if = "str::is_empty")]
-    hint: &'a str,
-}
-
-/// The machine-mode error object, encoded: the schema stamp, the `code` a
-/// script branches on, the message, and the hint — nothing else on the
-/// line, and no line beside it.
+/// The machine-mode error object, encoded as one line by the shared output
+/// writer: the `min/v1/error` stamp, the `code` a script branches on, the
+/// message, and the hint — nothing else on the line, and no line beside it.
+#[cfg(test)]
 fn machine_mode_error_line(failure: &minimal::MachineModeFailure) -> anyhow::Result<String> {
-    let object = MachineModeErrorDoc {
-        schema: MACHINE_ERROR_SCHEMA,
-        code: failure.code(),
-        message: failure.message(),
-        hint: failure.hint(),
-    };
-    serde_json_lenient::to_string(&object).context("encoding the machine-mode error object")
+    Ok(minimal::output::error_line(failure)?)
 }
 
 /// The machine-mode error emitter: writes the one `min/v1/error` object on
 /// stderr, the only thing the mode puts there on any failure, so a client
-/// parses a failure the same way it parses the document. Keyed on the
-/// output mode the failed run was under (the gate in the error path
-/// above), and generic over the payload: a command that takes `-o json`
-/// fails its walk into [`minimal::MachineModeFailure`] — carried through
-/// the `anyhow` chain, the way [`minimal::task::TaskExit`] is — and needs
-/// nothing else; the walk's own kinds name the code, message and hint, and
-/// this turns them into the object. `min ls --json` and its kin are
-/// untouched: their failure stays the plain-text line it always was.
+/// parses a failure the same way it parses the document. A command that
+/// takes `-o json` fails its walk into [`minimal::MachineModeFailure`] —
+/// carried through the `anyhow` chain, the way [`minimal::task::TaskExit`]
+/// is — and needs nothing else. `min ls --json` and its kin are untouched:
+/// their failure stays the plain-text line it always was.
 #[expect(
     clippy::let_underscore_must_use,
     reason = "a closed stderr has no reader left to tell; the exit status is \
               the failure's answer either way"
 )]
-fn emit_machine_mode_error(failure: &minimal::MachineModeFailure) {
-    let mut err = std::io::stderr();
-    match machine_mode_error_line(failure) {
-        // One object, one line — and a fallback the mode never wants, for
-        // an encode that cannot happen: the exit code is non-zero either
-        // way.
-        Ok(line) => {
-            let _ = writeln!(err, "{line}");
-        }
-        Err(error) => {
-            let _ = writeln!(err, "error: {error:#}");
-        }
-    }
+fn emit_machine_mode_error(stderr: &mut dyn std::io::Write, failure: &minimal::MachineModeFailure) {
+    // One object, one line. The exit code is non-zero either way.
+    let _ = minimal::output::write_error(stderr, failure);
 }
 
 #[cfg(test)]
@@ -787,17 +848,86 @@ mod tests {
         assert!(failure.hint().is_empty());
     }
 
-    /// An `unspecified` object carries no hint key at all.
+    /// An `unspecified` object still carries the `hint` key, empty, so
+    /// every error object has `code`, `message` and `hint` (BCLI-033).
     #[test]
-    fn machine_mode_error_line_omits_an_empty_hint() {
+    fn machine_mode_error_line_keeps_an_empty_hint() {
         let line = machine_mode_error_line(&minimal::MachineModeFailure::new(
             "unspecified",
             "boom".to_string(),
             String::new(),
         ))
         .unwrap();
-        assert!(!line.contains("hint"), "got {line}");
+        assert!(line.contains(r#""hint":"""#), "got {line}");
         assert!(line.contains(r#""code":"unspecified""#), "got {line}");
+    }
+
+    /// BCLI-033: a failure under a machine output mode is one `min/v1/error`
+    /// object on stderr with `code`, `message` and `hint`, and no
+    /// plain-text line. The text mode keeps its `error:` line. Both end
+    /// with the same exit code.
+    #[test]
+    fn machine_mode_error_object_on_stderr() {
+        let failures = [
+            anyhow::Error::new(minimal::MachineModeFailure::new(
+                "not_found",
+                "no box matches 'gone'".to_string(),
+                "`min box list` lists the boxes there are".to_string(),
+            )),
+            anyhow::anyhow!("the daemon went away"),
+        ];
+        for e in &failures {
+            let mut stderr = Vec::new();
+            let code = answer_failure(e, true, false, None, &mut stderr);
+            assert_eq!(code, ExitCode::from(1));
+            let text = String::from_utf8(stderr).unwrap();
+            assert_eq!(text.lines().count(), 1, "one object, one line: {text}");
+            assert!(!text.contains("error:"), "no text line beside it: {text}");
+            let object: serde_json_lenient::Value = serde_json_lenient::from_str(&text).unwrap();
+            assert_eq!(object["schema"], "min/v1/error", "{text}");
+            for key in ["code", "message", "hint"] {
+                assert!(object[key].is_string(), "{key} is present: {text}");
+            }
+
+            let mut stderr = Vec::new();
+            let code = answer_failure(e, false, false, None, &mut stderr);
+            assert_eq!(code, ExitCode::from(1));
+            let text = String::from_utf8(stderr).unwrap();
+            assert!(
+                text.starts_with("error: "),
+                "text mode keeps its line: {text}"
+            );
+        }
+        let object: serde_json_lenient::Value = {
+            let mut stderr = Vec::new();
+            answer_failure(&failures[0], true, false, None, &mut stderr);
+            serde_json_lenient::from_slice(&stderr).unwrap()
+        };
+        assert_eq!(object["code"], "not_found");
+        assert_eq!(object["message"], "no box matches 'gone'");
+        assert_eq!(object["hint"], "`min box list` lists the boxes there are");
+    }
+
+    /// BCLI-042, BCLI-046: an old spelling's hint on a failed run is the
+    /// error object's `hint` field in a machine output mode, with no
+    /// separate line. The text mode prints it after its `error:` line.
+    #[test]
+    fn alias_hint_is_the_error_objects_hint() {
+        let hint = "local-minimald is now called local.";
+        let e = anyhow::anyhow!("the daemon went away");
+        let mut stderr = Vec::new();
+        answer_failure(&e, true, false, Some(hint), &mut stderr);
+        let text = String::from_utf8(stderr).unwrap();
+        assert_eq!(text.lines().count(), 1, "one object, one line: {text}");
+        let object: serde_json_lenient::Value = serde_json_lenient::from_str(&text).unwrap();
+        assert_eq!(object["hint"], hint);
+
+        let mut stderr = Vec::new();
+        answer_failure(&e, false, false, Some(hint), &mut stderr);
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            format!("error: the daemon went away\n{hint}\n")
+        );
     }
 
     #[test]
@@ -840,6 +970,39 @@ mod tests {
                 command: Some(Command::Box(minimal::BoxArgs {
                     command: minimal::BoxCommand::Audit(minimal::BoxAuditArgs {
                         target: Some("self".to_string()),
+                        parent: None,
+                        output,
+                        follow: false,
+                    }),
+                })),
+            };
+            assert_eq!(machine_output_mode(&cli), machine);
+        }
+
+        // `min box list -o json` is a machine mode, its table form is not.
+        for (output, machine) in [
+            (Some(minimal::BoxListOutputFormat::Json), true),
+            (None, false),
+        ] {
+            let cli = minimal::Cli {
+                global_args: minimal::GlobalArgs::default(),
+                command: Some(Command::Box(minimal::BoxArgs {
+                    command: minimal::BoxCommand::List(minimal::BoxListArgs { all: false, output }),
+                })),
+            };
+            assert_eq!(machine_output_mode(&cli), machine);
+        }
+
+        // `min box events -o jsonl` is a machine mode, its text form is not.
+        for (output, machine) in [
+            (Some(minimal::BoxEventsOutputFormat::Jsonl), true),
+            (None, false),
+        ] {
+            let cli = minimal::Cli {
+                global_args: minimal::GlobalArgs::default(),
+                command: Some(Command::Box(minimal::BoxArgs {
+                    command: minimal::BoxCommand::Events(minimal::BoxEventsArgs {
+                        target: Some("web".to_string()),
                         parent: None,
                         output,
                         follow: false,
@@ -900,6 +1063,115 @@ mod tests {
             1,
             "one object, one line, nothing else: {line}"
         );
+    }
+
+    #[test]
+    fn box_address_refusals_exit_with_their_codes() {
+        let address = |s: &str| s.to_owned();
+        for (refusal, code) in [
+            (
+                minimal::BoxAddressRefusal::NotFound {
+                    address: address("web"),
+                },
+                4,
+            ),
+            (
+                minimal::BoxAddressRefusal::Unreachable {
+                    address: address("web"),
+                    hosts: vec![address("beta.local-minvmd0")],
+                },
+                7,
+            ),
+            (
+                minimal::BoxAddressRefusal::Ambiguous {
+                    name: address("web"),
+                    candidates: Vec::new(),
+                },
+                2,
+            ),
+        ] {
+            let err = anyhow::Error::from(refusal).context("showing the box");
+            assert_eq!(failure_exit_code(&err), code, "{err:#}");
+        }
+    }
+
+    /// BCLI-053: an exec that its own timeout ended ends the run with 124
+    /// in both output modes, and a machine-mode run answers it with the
+    /// `timeout` object. The exec refusals end with 2 and 5.
+    #[test]
+    fn exec_timeout_returns_124_from_exec_and_wait_exec_in_machine_mode() {
+        for timed_out in [
+            minimal::BoxExecTimedOut::exec("web", 30),
+            minimal::BoxExecTimedOut::waited("web", "0190a3c4-0000-7000-8000-000000000000"),
+        ] {
+            let e = anyhow::Error::new(timed_out.clone());
+            assert_eq!(failure_exit_code(&e), 124);
+            match machine_mode_answer(&e) {
+                MachineModeAnswer::Object(failure) => {
+                    assert_eq!(failure.code(), "timeout");
+                    assert_eq!(failure.message(), timed_out.to_string());
+                    assert_eq!(failure.hint(), timed_out.hint());
+                }
+                MachineModeAnswer::Quiet => panic!("a timeout is an error object"),
+            }
+            let mut stderr = Vec::new();
+            assert_eq!(
+                answer_failure(&e, true, false, None, &mut stderr),
+                ExitCode::from(124)
+            );
+            let line = String::from_utf8(stderr).unwrap();
+            assert!(line.contains(r#""code":"timeout""#), "{line}");
+        }
+        let target = "web".to_string();
+        for (refusal, code) in [
+            (
+                minimal::BoxExecRefusal::NoTerminal {
+                    target: target.clone(),
+                },
+                2,
+            ),
+            (
+                minimal::BoxExecRefusal::NotRunning {
+                    target: target.clone(),
+                    state: "stopped".to_string(),
+                },
+                2,
+            ),
+            (
+                minimal::BoxExecRefusal::ExecDisabled {
+                    target: target.clone(),
+                },
+                5,
+            ),
+            (minimal::BoxExecRefusal::SpecUnreadable { target }, 5),
+        ] {
+            assert_eq!(failure_exit_code(&anyhow::Error::new(refusal)), code);
+        }
+    }
+
+    /// BCLI-034: `min box cp` ends with 4 for a file the box does not have,
+    /// and 5 for a file the box does not allow reading.
+    #[test]
+    fn box_file_refusals_exit_with_their_codes() {
+        for (refusal, code) in [
+            (
+                minimal::BoxFileRefusal::NotFound {
+                    address: "web".to_owned(),
+                    path: "out.txt".to_owned(),
+                },
+                4,
+            ),
+            (
+                minimal::BoxFileRefusal::PermissionDenied {
+                    address: "web".to_owned(),
+                    path: "secret.txt".to_owned(),
+                },
+                5,
+            ),
+        ] {
+            let err = anyhow::Error::new(refusal).context("copying the file");
+            assert_eq!(failure_exit_code(&err), code, "{err:#}");
+        }
     }
 
     /// #1790: a VM host that could not be reached ends the run with 7 —
@@ -965,6 +1237,46 @@ mod tests {
         };
         let e = anyhow::Error::new(refused).context("activating the session");
         assert_eq!(failure_exit_code(&e), 3);
+    }
+
+    /// BCLI-005: `min box prune` off a terminal without `--yes` ends with
+    /// exit 2, and the text names `--yes`.
+    #[test]
+    fn prune_off_tty_needs_yes_exits_2() {
+        let e = anyhow::Error::new(minimal::PruneNeedsYes);
+        assert_eq!(failure_exit_code(&e), 2);
+        let mut stderr = Vec::new();
+        let code = answer_failure(&e, false, false, None, &mut stderr);
+        assert_eq!(code, ExitCode::from(2));
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "error: Prune removes boxes. Pass --yes to confirm, \
+             or --dry-run to see what it would remove.\n"
+        );
+    }
+
+    /// BCLI-004: `min box rm` of a running box without `--force` ends with
+    /// exit 2 in both output modes. The text mode prints the refusal, which
+    /// names `--force`, on stderr.
+    #[test]
+    fn rm_running_box_refuses_naming_force_with_exit_2() {
+        let e = anyhow::Error::new(minimal::BoxRunningRefusal::new("web"));
+        assert_eq!(failure_exit_code(&e), 2);
+
+        let mut stderr = Vec::new();
+        let code = answer_failure(&e, false, false, None, &mut stderr);
+        assert_eq!(code, ExitCode::from(2));
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "error: web is running. Stop it with min box stop web, \
+             or remove it now with min box rm web --force.\n"
+        );
+
+        let mut stderr = Vec::new();
+        let code = answer_failure(&e, true, false, None, &mut stderr);
+        assert_eq!(code, ExitCode::from(2));
+        let object: serde_json_lenient::Value = serde_json_lenient::from_slice(&stderr).unwrap();
+        assert_eq!(object["schema"], "min/v1/error");
     }
 
     /// Exit codes: an invalid project `minimal.toml` ends the run with
