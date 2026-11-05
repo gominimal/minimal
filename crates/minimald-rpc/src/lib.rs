@@ -625,6 +625,15 @@ pub struct BoxConfig {
     /// field. The daemon then records `project_path` as the root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_root: Option<paths::HostAbsPath>,
+    /// The name a `host_ip` grant box registered under with the VM host
+    /// daemon, when that is not the name the daemon gives the box. A fresh
+    /// instance registers under a creation key of its own, because the
+    /// daemon names it `<base>-<n>` only after the registration. The
+    /// daemon's id mint asks by this name. `None` for every other box, and
+    /// from a client that predates the field: the mint then asks by the
+    /// box's name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_ip_registration: Option<String>,
 }
 
 /// The client verb that asked for a box ([`BoxConfig::creating_verb`]).
@@ -2205,7 +2214,8 @@ impl CreateSessionRequest {
     /// a plain create sends: no handed addresses or box id, no task
     /// addresses, hooks on, not ended with a run, no attrs, no sealed
     /// deliveries, no root certificate, the session verb, no project root,
-    /// no version assertion, no spec, and no fresh instance.
+    /// no host-address registration name, no version assertion, no spec,
+    /// and no fresh instance.
     pub fn new(
         name: impl Into<String>,
         project_path: paths::HostAbsPath,
@@ -2228,6 +2238,7 @@ impl CreateSessionRequest {
                 root_certificate: None,
                 creating_verb: CreatingVerb::default(),
                 project_root: None,
+                host_ip_registration: None,
             },
             must_match_version: None,
             spec: None,
