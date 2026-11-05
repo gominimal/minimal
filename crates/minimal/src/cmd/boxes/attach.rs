@@ -1002,8 +1002,8 @@ pub(crate) const ENTRYPOINT_END_SETTLE: std::time::Duration = std::time::Duratio
 /// the entrypoint and every process in the box ended, or after its grace
 /// period and one more probe bound. A box that still runs at the bound lost
 /// its terminal to another attach. A takeover waits the whole bound.
-pub(crate) const DAEMON_END_SETTLE: std::time::Duration = minimald_rpc::STOP_GRACE
-    .saturating_add(minimald_rpc::HOST_PROBE_TIMEOUT);
+pub(crate) const DAEMON_END_SETTLE: std::time::Duration =
+    minimald_rpc::STOP_GRACE.saturating_add(minimald_rpc::HOST_PROBE_TIMEOUT);
 
 /// How often the settled read asks the host again.
 const SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
