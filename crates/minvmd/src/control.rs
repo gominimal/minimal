@@ -862,7 +862,10 @@ fn serve_connection(
     };
     // A box event on the guest door asks the host_ip reconcile to read the
     // in-VM daemon's session list (NET-085). The nudge carries nothing the
-    // guest says: the list it reads decides, and only narrows the union.
+    // guest says: the list it reads decides. Root in the VM controls that
+    // list, so it can move the union, but only within the rules host clients
+    // admitted, never past them. A false `running` can restore a set-aside
+    // box's rules, and a box no client admitted gains nothing.
     if door == ControlDoor::GuestReports && is_guest_box_event(&request) {
         reconcile.nudge();
     }
