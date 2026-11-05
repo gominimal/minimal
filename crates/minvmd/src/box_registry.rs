@@ -6906,15 +6906,20 @@ impl BoxRegistry {
         })
     }
 
-    /// Whether any `host_ip` box's rules are held, resident or set aside:
-    /// a reconcile has nothing to do while this is `false`.
+    /// Whether any `host_ip` box's rules are held, resident or set aside,
+    /// or any credentialed id waits for its box's destroy to revoke it: a
+    /// reconcile has nothing to do while this is `false`.
     #[must_use]
     pub fn holds_host_ip_boxes(&self) -> bool {
         let resident = self
             .host_ip_boxes
             .read()
             .expect("the resident host_ip boxes' lock is never held across a panic");
-        !resident.boxes.is_empty() || !resident.dormant.is_empty()
+        if !resident.boxes.is_empty() || !resident.dormant.is_empty() {
+            return true;
+        }
+        // The ids' lock after the resident set's, as on the register path.
+        !self.host_ip_id_set().credentialed.is_empty()
     }
 
     /// Sets the binder the node's mirror binds with ([`MirrorBinder`]):
@@ -14153,6 +14158,7 @@ mod tests {
             .with_proxy_control(Some(sock))
             .persisting_to(dir.path().join(REGISTRY_FILE));
         assert!(after.holds_host_ip_id(id), "the reloaded id is held");
+        assert!(after.holds_host_ip_boxes());
         assert!(
             !after.retire_host_ip_box(session, HostIpBoxEnd::Destroyed),
             "a restart holds no rules for the box"
@@ -14236,6 +14242,7 @@ mod tests {
         let session = boxes::SessionId::from_bytes(id);
         assert!(registry.admit_host_ip_box_with_lane(session, None, true));
         assert!(registry.retire_host_ip_box(session, HostIpBoxEnd::Stopped));
+        assert!(registry.holds_host_ip_boxes());
 
         let guest = BTreeMap::from([(session, boxes::BoxState::Stopped)]);
         registry.reconcile_host_ip_boxes(
