@@ -252,6 +252,14 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     if e.downcast_ref::<minimal::BoxRunningRefusal>().is_some() {
         return minimal::BoxRunningRefusal::EXIT_CODE;
     }
+    // BCLI-058: `min box rename` to a name BOX-010 refuses.
+    if e.downcast_ref::<minimal::BoxRenameRefusal>().is_some() {
+        return minimal::BoxRenameRefusal::EXIT_CODE;
+    }
+    // BCLI-005: `min box prune` off a terminal without `--yes`.
+    if e.downcast_ref::<minimal::PruneNeedsYes>().is_some() {
+        return minimal::PruneNeedsYes::EXIT_CODE;
+    }
     // BOX-163: a create under a name a running box holds.
     if e.downcast_ref::<minimald_rpc::HeldNameRefusal>().is_some() {
         return minimald_rpc::HeldNameRefusal::EXIT_CODE;
@@ -1166,6 +1174,22 @@ mod tests {
         };
         let e = anyhow::Error::new(refused).context("activating the session");
         assert_eq!(failure_exit_code(&e), 3);
+    }
+
+    /// BCLI-005: `min box prune` off a terminal without `--yes` ends with
+    /// exit 2, and the text names `--yes`.
+    #[test]
+    fn prune_off_tty_needs_yes_exits_2() {
+        let e = anyhow::Error::new(minimal::PruneNeedsYes);
+        assert_eq!(failure_exit_code(&e), 2);
+        let mut stderr = Vec::new();
+        let code = answer_failure(&e, false, false, None, &mut stderr);
+        assert_eq!(code, ExitCode::from(2));
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "error: Prune removes boxes. Pass --yes to confirm, \
+             or --dry-run to see what it would remove.\n"
+        );
     }
 
     /// BCLI-004: `min box rm` of a running box without `--force` ends with

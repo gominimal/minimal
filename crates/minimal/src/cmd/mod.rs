@@ -141,6 +141,8 @@ fn command_verb(command: Option<&Command>) -> &'static str {
             BoxCommand::Stop(_) => "box stop",
             BoxCommand::Rm(_) => "box rm",
             BoxCommand::Exec(_) => "box exec",
+            BoxCommand::Rename(_) => "box rename",
+            BoxCommand::Prune(_) => "box prune",
         },
         Some(Command::Host(HostArgs { command })) => match command {
             HostCommand::List => "host list",
@@ -384,6 +386,8 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             BoxCommand::Stop(args) => cmd_box_stop(&cli.global_args, args).await,
             BoxCommand::Rm(args) => cmd_box_rm(&cli.global_args, args).await,
             BoxCommand::Exec(args) => cmd_box_exec(&cli.global_args, args).await,
+            BoxCommand::Rename(args) => cmd_box_rename(&cli.global_args, args).await,
+            BoxCommand::Prune(args) => cmd_box_prune(&cli.global_args, args).await,
         },
         Some(Command::Host(HostArgs { command })) => match command {
             HostCommand::List => {

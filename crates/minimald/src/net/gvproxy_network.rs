@@ -2019,6 +2019,110 @@ mod tests {
         fake.abort();
     }
 
+    /// NET-162 on a native host: a box port a forwarder publishes at
+    /// `127.0.0.1`, where the host alias lands, is held as one of Minimal's
+    /// own listeners from the bind until the forwarder unbinds. So no
+    /// `[host-exposures]` entry opens it to another box. The ports are ones
+    /// no other test binds, since the registry is the daemon's.
+    #[tokio::test]
+    async fn native_own_ip_published_box_port_held_until_its_forwarder_unbinds() {
+        const LEASE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 9);
+        const HANDED: Ipv4Addr = Ipv4Addr::LOCALHOST;
+        const TCP: u8 = 6;
+        const UDP: u8 = 17;
+        let dir = tempfile::TempDir::new().unwrap();
+        let scenario = attach_scenario(&dir, "gvproxy.sock");
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let (handed_tx, _handed_rx) = mpsc::channel(4);
+        let fake = spawn_control_channel_deciding(
+            scenario.control_path.clone(),
+            |_, _| ok(),
+            events_tx,
+            handed_tx,
+        );
+        let switch = vm_host_switch();
+        let mapping = |external_port| boxes::PortMapping {
+            external_port,
+            internal_port: 80,
+            proto: boxes::IpProto::Tcp,
+        };
+        let policy = boxes::BoxPolicy {
+            ingress: Some(boxes::IngressPolicy {
+                port_mappings: vec![mapping(47180), mapping(47190)],
+                dynamic_allowed_range: None,
+                dynamic_ingress: None,
+            }),
+            egress: None,
+            credentialed_upstream: None,
+            quic443: None,
+        };
+        scenario
+            .registry
+            .write()
+            .expect("registry lock")
+            .publish_own_address(
+                boxes::SessionId::nil(),
+                "web",
+                HANDED,
+                BTreeSet::from([47180, 47190]),
+            );
+        let registry = crate::net::switch::MinimalListeners::daemon();
+        assert_eq!(
+            registry.holder(TCP, 47180),
+            None,
+            "nothing holds the port yet"
+        );
+
+        let guard = crate::net::gvproxy_network::complete_own_ip_attach(
+            &switch,
+            scenario.tap_fd,
+            ControlChannel::Unix(scenario.control_path.clone()),
+            lease_at(LEASE),
+            "web",
+            Some(&policy),
+            Some(&scenario.reporter),
+            false,
+        )
+        .await
+        .expect("the attach completes at the handed address");
+        let _ = collect_until(&mut events_rx, "/services/dns/add", 1).await;
+        for port in [47180, 47190] {
+            assert_eq!(
+                registry.holder(TCP, port),
+                Some(crate::net::switch::PUBLISHED_BOX_PORT_LISTENER),
+                "the bound forward holds {port}"
+            );
+        }
+        assert_eq!(
+            registry.holder(UDP, 47180),
+            None,
+            "a TCP forward holds its port for TCP only"
+        );
+
+        guard
+            .revoke_ingress(47180)
+            .await
+            .expect("the forward of 47180 unbinds");
+        assert_eq!(
+            registry.holder(TCP, 47180),
+            None,
+            "an unbound forward holds its port no more"
+        );
+        assert_eq!(
+            registry.holder(TCP, 47190),
+            Some(crate::net::switch::PUBLISHED_BOX_PORT_LISTENER),
+            "the other forward still holds its port"
+        );
+
+        Box::new(guard).teardown().await;
+        assert_eq!(
+            registry.holder(TCP, 47190),
+            None,
+            "teardown lets every port go with its forward"
+        );
+        fake.abort();
+    }
+
     /// NET-138: a task run's guard dropped without its teardown — the Env
     /// actor's abort cancelling an in-box `min run` mid-await — still
     /// releases its task slot, so the session's next run finds the slot free
