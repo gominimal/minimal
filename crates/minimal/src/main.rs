@@ -283,6 +283,11 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     if let Some(refused) = e.downcast_ref::<minimal::BoxAddressRefusal>() {
         return refused.exit_code();
     }
+    // BCLI-034, BCLI-062: `min box cp` of a file the box does not have, or
+    // does not allow reading.
+    if let Some(refused) = e.downcast_ref::<minimal::BoxFileRefusal>() {
+        return refused.exit_code();
+    }
     1
 }
 
@@ -522,6 +527,11 @@ fn machine_output_mode(cli: &minimal::Cli) -> bool {
         Some(minimal::Command::Box(minimal::BoxArgs {
             command: minimal::BoxCommand::List(args),
         })) => args.output.is_some(),
+        // BCLI-016: a `min box events -o jsonl` failure is one
+        // `min/v1/error` object too.
+        Some(minimal::Command::Box(minimal::BoxArgs {
+            command: minimal::BoxCommand::Events(args),
+        })) => args.output == Some(minimal::BoxEventsOutputFormat::Jsonl),
         _ => false,
     }
 }
@@ -950,6 +960,25 @@ mod tests {
             assert_eq!(machine_output_mode(&cli), machine);
         }
 
+        // `min box events -o jsonl` is a machine mode, its text form is not.
+        for (output, machine) in [
+            (Some(minimal::BoxEventsOutputFormat::Jsonl), true),
+            (None, false),
+        ] {
+            let cli = minimal::Cli {
+                global_args: minimal::GlobalArgs::default(),
+                command: Some(Command::Box(minimal::BoxArgs {
+                    command: minimal::BoxCommand::Events(minimal::BoxEventsArgs {
+                        target: Some("web".to_string()),
+                        parent: None,
+                        output,
+                        follow: false,
+                    }),
+                })),
+            };
+            assert_eq!(machine_output_mode(&cli), machine);
+        }
+
         // Its defined refusal answers with its own code.
         match machine_mode_answer(&anyhow::Error::new(minimal::AuditSelfUnsupportedUnenrolled)) {
             MachineModeAnswer::Object(failure) => {
@@ -1029,6 +1058,31 @@ mod tests {
             ),
         ] {
             let err = anyhow::Error::from(refusal).context("showing the box");
+            assert_eq!(failure_exit_code(&err), code, "{err:#}");
+        }
+    }
+
+    /// BCLI-034: `min box cp` ends with 4 for a file the box does not have,
+    /// and 5 for a file the box does not allow reading.
+    #[test]
+    fn box_file_refusals_exit_with_their_codes() {
+        for (refusal, code) in [
+            (
+                minimal::BoxFileRefusal::NotFound {
+                    address: "web".to_owned(),
+                    path: "out.txt".to_owned(),
+                },
+                4,
+            ),
+            (
+                minimal::BoxFileRefusal::PermissionDenied {
+                    address: "web".to_owned(),
+                    path: "secret.txt".to_owned(),
+                },
+                5,
+            ),
+        ] {
+            let err = anyhow::Error::new(refusal).context("copying the file");
             assert_eq!(failure_exit_code(&err), code, "{err:#}");
         }
     }
