@@ -5162,11 +5162,12 @@ async fn task_run_exits_with_held_open_stdin_pipe() {
     // it, the daemon's end came back over it, and the process ended with
     // its stdin held open. Stdout is the task's alone: every line the
     // client prints goes to stderr, so a task that never ran leaves stdout
-    // empty. That the client's stdin reaches the entrypoint, and that its
-    // stdout and stderr come back as two streams, is pinned against the
-    // daemon's exec channel (minimald's
+    // empty. That the entrypoint's stdout and stderr come back as two
+    // streams is pinned against the daemon's exec channel (minimald's
     // `until_complete_ends_on_entrypoint_return_without_client_task_run_returns_its_code`)
-    // and end to end by the session e2e (`scripts/session-e2e.sh`).
+    // and end to end by the session e2e (`scripts/session-e2e.sh`). The
+    // entrypoint is the in-box `min task run`, which does not pass its stdin
+    // to the task yet.
     assert!(
         !status.success(),
         "a task whose entrypoint never started must not succeed: {status:?}"

@@ -962,10 +962,9 @@ pub enum TaskCommand {
     /// project like `min session activate`, runs the task inside it, and
     /// exits with the task's exit code.
     ///
-    /// The task runs without a terminal. The task does not read stdin yet: it
-    /// gets no input, whether stdin is piped, redirected or a terminal. The
-    /// task's stdout is this command's stdout, and this command prints its own
-    /// lines on stderr, beside the task's stderr. So
+    /// The task runs without a terminal. This command does not pass its stdin
+    /// to the task yet. The task's stdout is this command's stdout, and this
+    /// command prints its own lines on stderr, beside the task's stderr. So
     /// `min task run query > out.csv` writes only the task's output.
     ///
     /// When the task ends, the box stays with its exit code: see it with
