@@ -3149,13 +3149,14 @@ fn bundle_copy_steps(install: &AnswererInstall, dir: &str, bundle: &str) -> Stri
 /// ([`macos_answerer_unit_steps`]) and the removal script
 /// ([`macos_undo_command`]), so a failed install and an undo remove the
 /// same files. `indent` prefixes every line.
+/// `root` prefixes every path, as in [`macos_undo_command_under`].
 #[cfg(any(test, target_os = "macos"))]
-fn macos_service_removal(channel: &str, indent: &str) -> String {
+fn macos_service_removal(root: &str, channel: &str, indent: &str) -> String {
     format!(
         "{unit}\
-         {indent}rm -rf \"{MACOS_ANSWERER_BUNDLE_PATH}\" \"{MACOS_ANSWERER_BUNDLE_PATH}.old\" \
-         \"{LEGACY_MACOS_ANSWERER_PROGRAM_PATH}\"\n",
-        unit = macos_unit_removal(channel, indent),
+         {indent}rm -rf \"{root}{MACOS_ANSWERER_BUNDLE_PATH}\" \"{root}{MACOS_ANSWERER_BUNDLE_PATH}.old\" \
+         \"{root}{LEGACY_MACOS_ANSWERER_PROGRAM_PATH}\"\n",
+        unit = macos_unit_removal(root, channel, indent),
     )
 }
 
@@ -3164,11 +3165,12 @@ fn macos_service_removal(channel: &str, indent: &str) -> String {
 /// failure block runs where the range unit runs the bundle's program
 /// ([`macos_range_bundle_steps`]), so a service that failed to start does
 /// not take the range unit's program with it. `indent` prefixes every line.
+/// `root` prefixes every path, as in [`macos_undo_command_under`].
 #[cfg(any(test, target_os = "macos"))]
-fn macos_unit_removal(channel: &str, indent: &str) -> String {
+fn macos_unit_removal(root: &str, channel: &str, indent: &str) -> String {
     format!(
         "{indent}(launchctl bootout system/{ANSWERER_LAUNCHD_LABEL} 2>/dev/null || true)\n\
-         {indent}rm -f {ANSWERER_PLIST_PATH} \"{channel}\"\n"
+         {indent}rm -f {root}{ANSWERER_PLIST_PATH} \"{root}{channel}\"\n"
     )
 }
 
@@ -3232,9 +3234,9 @@ fn macos_answerer_unit_steps(install: &AnswererInstall) -> String {
     // Where the range unit runs the bundle's program, a service that fails
     // to start leaves the bundle in place.
     let cleanup = if install.bundle.is_empty() {
-        macos_service_removal(channel, "  ")
+        macos_service_removal("", channel, "  ")
     } else {
-        macos_unit_removal(channel, "  ")
+        macos_unit_removal("", channel, "  ")
     };
     let fail = |reason: &str| answerer_fail_block(install, copy, &cleanup, reason);
     let release = if controls.is_empty() {
@@ -3424,11 +3426,12 @@ fn linux_zone_link_unit_steps(port: u16) -> String {
 /// The lines that remove the boot unit: disable it (tolerating a unit that
 /// is not there), remove its file and reload the manager. They run before
 /// the link is deleted, so nothing re-creates it.
+/// `root` prefixes every path, as in [`linux_undo_command_under`].
 #[cfg(any(test, not(target_os = "macos")))]
-fn linux_zone_link_unit_removal() -> String {
+fn linux_zone_link_unit_removal(root: &str) -> String {
     format!(
         "systemctl disable {ZONE_LINK_SYSTEMD_UNIT}.service 2>/dev/null || true\n\
-         rm -f {ZONE_LINK_UNIT_PATH}\n\
+         rm -f {root}{ZONE_LINK_UNIT_PATH}\n\
          systemctl daemon-reload || true\n"
     )
 }
@@ -3440,13 +3443,14 @@ fn linux_zone_link_unit_removal() -> String {
 /// block ([`linux_answerer_unit_steps`]) and the removal script
 /// ([`linux_undo_command`]), so a failed install and an undo remove the
 /// same files. `indent` prefixes every line.
+/// `root` prefixes every path, as in [`linux_undo_command_under`].
 #[cfg(any(test, not(target_os = "macos")))]
-fn linux_service_removal(indent: &str) -> String {
+fn linux_service_removal(root: &str, indent: &str) -> String {
     format!(
         "{indent}systemctl disable --now {ANSWERER_SYSTEMD_UNIT}.socket \
          {ANSWERER_SYSTEMD_UNIT}.service 2>/dev/null || true\n\
-         {indent}rm -f {ANSWERER_UNIT_SOCKET_PATH} {ANSWERER_UNIT_SERVICE_PATH} \
-         \"{LINUX_ANSWERER_PROGRAM_PATH}\"\n\
+         {indent}rm -f {root}{ANSWERER_UNIT_SOCKET_PATH} {root}{ANSWERER_UNIT_SERVICE_PATH} \
+         \"{root}{LINUX_ANSWERER_PROGRAM_PATH}\"\n\
          {indent}systemctl daemon-reload || true\n"
     )
 }
@@ -3491,7 +3495,7 @@ fn linux_answerer_unit_steps(install: &AnswererInstall) -> String {
     let copy = LINUX_ANSWERER_PROGRAM_PATH;
     let channel = &install.channel;
     let unit = format!("{ANSWERER_SYSTEMD_UNIT}.socket");
-    let cleanup = linux_service_removal("  ");
+    let cleanup = linux_service_removal("", "  ");
     let fail = |reason: &str| answerer_fail_block(install, copy, &cleanup, reason);
     let release = if controls.is_empty() {
         String::new()
@@ -3682,24 +3686,25 @@ pub(crate) const CLASSIFIER_UNIT_SERVICE_PATH: &str =
 /// removal runs whatever it does, and the script still exits non-zero
 /// with the note that names what to stop. Every other line tolerates what
 /// is already gone.
+/// `root` prefixes every path, as in [`linux_undo_command_under`].
 #[cfg(any(test, not(target_os = "macos")))]
-fn linux_host_items_removal() -> String {
+fn linux_host_items_removal(root: &str) -> String {
     format!(
         "\n\
          # The user-namespace profile, by the step's record: unload it, then remove\n\
          # its files. A profile without the record was installed another way and stays.\n\
-         if [ -f {APPARMOR_PROFILE_RECORD} ] ; then\n\
-         \x20 if [ -f {APPARMOR_DIR}/minimald ] ; then\n\
-         \x20   apparmor_parser --remove {APPARMOR_DIR}/minimald 2>/dev/null || true\n\
+         if [ -f {root}{APPARMOR_PROFILE_RECORD} ] ; then\n\
+         \x20 if [ -f {root}{APPARMOR_DIR}/minimald ] ; then\n\
+         \x20   apparmor_parser --remove {root}{APPARMOR_DIR}/minimald 2>/dev/null || true\n\
          \x20 fi\n\
-         \x20 rm -f {APPARMOR_DIR}/minimald {APPARMOR_DIR}/tunables/minimald \
-         {APPARMOR_DIR}/tunables/minimald.d/local\n\
-         \x20 rmdir {APPARMOR_DIR}/tunables/minimald.d 2>/dev/null || true\n\
-         \x20 rm -f {APPARMOR_PROFILE_RECORD}\n\
-         elif [ -f {APPARMOR_DIR}/minimald ] ; then\n\
-         \x20 echo 'note: {APPARMOR_DIR}/minimald was not installed by min finalize-install and \
-         stays; remove it with: apparmor_parser --remove {APPARMOR_DIR}/minimald && rm -f \
-         {APPARMOR_DIR}/minimald {APPARMOR_DIR}/tunables/minimald' >&2\n\
+         \x20 rm -f {root}{APPARMOR_DIR}/minimald {root}{APPARMOR_DIR}/tunables/minimald \
+         {root}{APPARMOR_DIR}/tunables/minimald.d/local\n\
+         \x20 rmdir {root}{APPARMOR_DIR}/tunables/minimald.d 2>/dev/null || true\n\
+         \x20 rm -f {root}{APPARMOR_PROFILE_RECORD}\n\
+         elif [ -f {root}{APPARMOR_DIR}/minimald ] ; then\n\
+         \x20 echo 'note: {root}{APPARMOR_DIR}/minimald was not installed by min finalize-install and \
+         stays; remove it with: apparmor_parser --remove {root}{APPARMOR_DIR}/minimald && rm -f \
+         {root}{APPARMOR_DIR}/minimald {root}{APPARMOR_DIR}/tunables/minimald' >&2\n\
          fi\n\
          # One unit per call: systemctl refuses a whole call that names a unit this\n\
          # host does not have, and an install carries either the socket pair or the\n\
@@ -3708,18 +3713,18 @@ fn linux_host_items_removal() -> String {
          {PLACE_SYSTEMD_UNIT}.service {CLASSIFIER_SYSTEMD_UNIT}.service ; do\n\
          \x20 systemctl disable --now \"$unit\" 2>/dev/null || true\n\
          done\n\
-         rm -f {PLACE_UNIT_SOCKET_PATH} {PLACE_UNIT_SERVICE_PATH} {LEGACY_PLACE_UNIT_PATH_PATH} \
-         {LEGACY_PLACE_UNIT_SERVICE_PATH} {CLASSIFIER_UNIT_SERVICE_PATH} \
-         {CLASSIFIER_PROGRAM_PATH}\n\
+         rm -f {root}{PLACE_UNIT_SOCKET_PATH} {root}{PLACE_UNIT_SERVICE_PATH} \
+         {root}{LEGACY_PLACE_UNIT_PATH_PATH} {root}{LEGACY_PLACE_UNIT_SERVICE_PATH} \
+         {root}{CLASSIFIER_UNIT_SERVICE_PATH} {root}{CLASSIFIER_PROGRAM_PATH}\n\
          systemctl daemon-reload 2>/dev/null || true\n\
-         rmdir \"{ANSWERER_PROGRAM_DIR}\" 2>/dev/null || true\n\
+         rmdir \"{root}{ANSWERER_PROGRAM_DIR}\" 2>/dev/null || true\n\
          \n\
          # The kvm group memberships the step added, one user per line of its record.\n\
-         if [ -f {KVM_GROUP_RECORD} ] ; then\n\
+         if [ -f {root}{KVM_GROUP_RECORD} ] ; then\n\
          \x20 while IFS= read -r kvm_user ; do\n\
          \x20   [ -z \"$kvm_user\" ] || gpasswd -d \"$kvm_user\" kvm 2>/dev/null || true\n\
-         \x20 done < {KVM_GROUP_RECORD}\n\
-         \x20 rm -f {KVM_GROUP_RECORD}\n\
+         \x20 done < {root}{KVM_GROUP_RECORD}\n\
+         \x20 rm -f {root}{KVM_GROUP_RECORD}\n\
          fi\n\
          \n\
          # The classifier tree: the step's own removal, by the step's record and while\n\
@@ -3727,20 +3732,20 @@ fn linux_host_items_removal() -> String {
          # stays. Last, and its failure held to the end: the tree stays held while\n\
          # minimald or a box has a leaf, and nothing above should be skipped for that.\n\
          classifier_held=\n\
-         if [ -f {CLASSIFIER_TREE_RECORD} ] ; then\n\
-         \x20 if [ -d {CLASSIFIER_TREE_ROOT} ] ; then\n\
+         if [ -f {root}{CLASSIFIER_TREE_RECORD} ] ; then\n\
+         \x20 if [ -d {root}{CLASSIFIER_TREE_ROOT} ] ; then\n\
          \x20   bash -s -- --uninstall <<\\{CLASSIFIER_SCRIPT_HEREDOC} || classifier_held=1\n\
          {CLASSIFIER_SCRIPT}\
          {CLASSIFIER_SCRIPT_HEREDOC}\n\
          \x20 fi\n\
-         \x20 [ -n \"$classifier_held\" ] || rm -f {CLASSIFIER_TREE_RECORD}\n\
-         elif [ -d {CLASSIFIER_TREE_ROOT} ] ; then\n\
-         \x20 echo 'note: the classifier tree at {CLASSIFIER_TREE_ROOT} was not installed by min \
-         finalize-install and stays; remove it as root with: {CLASSIFIER_PROGRAM_PATH} --uninstall \
+         \x20 [ -n \"$classifier_held\" ] || rm -f {root}{CLASSIFIER_TREE_RECORD}\n\
+         elif [ -d {root}{CLASSIFIER_TREE_ROOT} ] ; then\n\
+         \x20 echo 'note: the classifier tree at {root}{CLASSIFIER_TREE_ROOT} was not installed by min \
+         finalize-install and stays; remove it as root with: {root}{CLASSIFIER_PROGRAM_PATH} --uninstall \
          (or the same script from a checkout)' >&2\n\
          fi\n\
          if [ -n \"$classifier_held\" ] ; then\n\
-         \x20 echo 'note: the classifier tree at {CLASSIFIER_TREE_ROOT} is still held: stop minimald \
+         \x20 echo 'note: the classifier tree at {root}{CLASSIFIER_TREE_ROOT} is still held: stop minimald \
          and its boxes, then run min finalize-install --undo again' >&2\n\
          \x20 exit 1\n\
          fi\n"
@@ -3795,6 +3800,16 @@ fn channel_dir_removal(channel: &str) -> String {
 /// already resolved through it.
 #[cfg(any(test, target_os = "macos"))]
 pub(crate) fn macos_undo_command(channel: &str) -> String {
+    macos_undo_command_under("", channel)
+}
+
+/// [`macos_undo_command`] for the host whose `/` is `root`: every absolute
+/// path the script names, tools and `channel` included, is `root` followed
+/// by that path, so a test gives one temp dir and the script reaches
+/// nothing outside it. `root` is empty for the host itself, and the script
+/// is then byte for byte the one `--show --script` prints.
+#[cfg(any(test, target_os = "macos"))]
+fn macos_undo_command_under(root: &str, channel: &str) -> String {
     let aliases = switch::loopback::range_hosts()
         .map(|addr| addr.to_string())
         .collect::<Vec<_>>()
@@ -3810,26 +3825,26 @@ pub(crate) fn macos_undo_command(channel: &str) -> String {
          # take the aliases it added to lo0 off, unless a VM is running: its\n\
          # boxes use them, so they stay until the VM stops.\n\
          (launchctl bootout system/{RANGE_UNIT_LABEL} 2>/dev/null || true)\n\
-         rm -f {RANGE_PLIST_PATH} {RANGE_PROGRAM_PATH}\n\
+         rm -f {root}{RANGE_PLIST_PATH} {root}{RANGE_PROGRAM_PATH}\n\
          if pgrep -x minvmd >/dev/null 2>&1 ; then\n\
          \x20 echo '{MACOS_UNDO_VM_RUNNING_NOTE}' >&2\n\
          else\n\
          \x20 for addr in {aliases}; do\n\
-         \x20   /sbin/ifconfig lo0 -alias \"$addr\" 2>/dev/null || true\n\
+         \x20   {root}/sbin/ifconfig lo0 -alias \"$addr\" 2>/dev/null || true\n\
          \x20 done\n\
          fi\n\
          \n\
          # The resolver file, and its directory when it is empty.\n\
-         rm -f {RESOLVER_FILE}\n\
-         rmdir /etc/resolver 2>/dev/null || true\n\
+         rm -f {root}{RESOLVER_FILE}\n\
+         rmdir {root}/etc/resolver 2>/dev/null || true\n\
          \n\
          # Reload the resolver: the file and the answerer it named are\n\
          # gone, and what the system cached through them must go too.\n\
          dscacheutil -flushcache 2>/dev/null || true\n\
          killall -HUP mDNSResponder 2>/dev/null || true\n",
         header = script_header(MACOS_UNDO_WHAT, UNDO_SHOWN_BY),
-        service = macos_service_removal(channel, ""),
-        channel_dirs = channel_dir_removal(channel),
+        service = macos_service_removal(root, channel, ""),
+        channel_dirs = channel_dir_removal(&format!("{root}{channel}")),
     )
 }
 
@@ -3845,6 +3860,17 @@ pub(crate) fn macos_undo_command(channel: &str) -> String {
 /// channel path the step's socket unit names.
 #[cfg(any(test, not(target_os = "macos")))]
 pub(crate) fn linux_undo_command(channel: &str) -> String {
+    linux_undo_command_under("", channel)
+}
+
+/// [`linux_undo_command`] for the host whose `/` is `root`: every absolute
+/// path the script names, `channel` included, is `root` followed by that
+/// path, so a test gives one temp dir and the script reaches nothing
+/// outside it. `root` is empty for the host itself, and the script is then
+/// byte for byte the one `--show --script` prints. The classifier's own
+/// step rides whole in a heredoc to `bash`, which a test stands in for.
+#[cfg(any(test, not(target_os = "macos")))]
+fn linux_undo_command_under(root: &str, channel: &str) -> String {
     format!(
         "{header}\n\
          # The box-name service: disable and stop it, remove its units and its\n\
@@ -3852,23 +3878,23 @@ pub(crate) fn linux_undo_command(channel: &str) -> String {
          {service}\
          systemctl reset-failed {ANSWERER_SYSTEMD_UNIT}.socket {ANSWERER_SYSTEMD_UNIT}.service \
          2>/dev/null || true\n\
-         rmdir \"{ANSWERER_PROGRAM_DIR}\" 2>/dev/null || true\n\
-         rm -f \"{channel}\"\n\
+         rmdir \"{root}{ANSWERER_PROGRAM_DIR}\" 2>/dev/null || true\n\
+         rm -f \"{root}{channel}\"\n\
          {channel_dirs}\
          \n\
          # The resolver: remove the unit that re-creates the dedicated link at\n\
          # boot, then revert the link's DNS configuration and delete it.\n\
          {boot_unit}\
-         if [ -e /sys/class/net/{ZONE_LINK} ] ; then\n\
+         if [ -e {root}/sys/class/net/{ZONE_LINK} ] ; then\n\
          \x20 resolvectl revert {ZONE_LINK} 2>/dev/null || true\n\
          \x20 ip link del {ZONE_LINK}\n\
          fi\n\
          {host_items}",
         header = script_header(LINUX_UNDO_WHAT, UNDO_SHOWN_BY),
-        service = linux_service_removal(""),
-        boot_unit = linux_zone_link_unit_removal(),
-        channel_dirs = channel_dir_removal(channel),
-        host_items = linux_host_items_removal(),
+        service = linux_service_removal(root, ""),
+        boot_unit = linux_zone_link_unit_removal(root),
+        channel_dirs = channel_dir_removal(&format!("{root}{channel}")),
+        host_items = linux_host_items_removal(root),
     )
 }
 
@@ -6463,10 +6489,16 @@ mod tests {
             "the range unit is booted out before its aliases come off: {mac}"
         );
         // The service's removal is the step's own failure cleanup.
-        assert!(mac.contains(&macos_service_removal(channel, "")), "{mac}");
         assert!(
-            macos_command(15353, Some(&test_install()))
-                .contains(&macos_service_removal(&test_install().channel, "  ")),
+            mac.contains(&macos_service_removal("", channel, "")),
+            "{mac}"
+        );
+        assert!(
+            macos_command(15353, Some(&test_install())).contains(&macos_service_removal(
+                "",
+                &test_install().channel,
+                "  "
+            )),
             "the setup's failure block removes the same files"
         );
 
@@ -6505,7 +6537,7 @@ mod tests {
             "{linux}"
         );
         assert!(!linux.contains("rmdir \"/run\""), "{linux}");
-        assert!(linux.contains(&linux_service_removal("")), "{linux}");
+        assert!(linux.contains(&linux_service_removal("", "")), "{linux}");
         // Linux: the other items the step installs come away too — the
         // user-namespace profile unloaded and its files removed, the
         // classifier tree by the step's own `--uninstall` (the script
@@ -6575,21 +6607,219 @@ mod tests {
             "{mac}"
         );
         assert!(
-            linux_command(15353, Some(&test_install())).contains(&linux_service_removal("  ")),
+            linux_command(15353, Some(&test_install())).contains(&linux_service_removal("", "  ")),
             "the setup's failure block removes the same files"
         );
     }
 
-    /// The removal succeeds on a clean host: every step run against a host
-    /// with nothing installed, with every system tool a stand-in that
-    /// fails the way the real one does when its target is not there, exits
-    /// 0. The stand-ins record what ran; nothing outside the temp dir is
-    /// touched, because `rm` and `rmdir` are stand-ins too, and the macOS
-    /// script's absolute-path `ifconfig` is pointed at one.
+    /// The tools the removal scripts run by name that change the host.
+    /// [`run_confined`] finds each one in the test's stand-ins directory:
+    /// the test's own stand-in, or one it writes that fails the way the
+    /// real tool fails on a host without the item. `bash` is among them
+    /// because it runs the classifier's step, and that heredoc names the
+    /// real cgroup paths.
+    const HOST_TOOLS: &[&str] = &[
+        "apparmor_parser",
+        "bash",
+        "dscacheutil",
+        "gpasswd",
+        "ip",
+        "killall",
+        "launchctl",
+        "pgrep",
+        "resolvectl",
+        "systemctl",
+    ];
+
+    /// The absolute paths a confined script may name outside its root.
+    /// The script only reads or runs them; it changes neither.
+    const HOST_PATHS_ALLOWED: &[&str] = &["/bin/sh", "/dev/null"];
+
+    /// Every absolute path `script` names where the shell acts on it. It
+    /// skips comment lines and heredoc bodies: a heredoc body is input to
+    /// the command before it, and [`run_confined`] stands that command in.
+    /// A path starts at a `/` that opens a word, and ends at the next
+    /// space, quote or shell operator.
+    fn absolute_paths(script: &str) -> Vec<String> {
+        let opens = |b: u8| b" \t\"'=(<>:;|&`".contains(&b);
+        let closes = |b: u8| b" \t\"';)|&`<>".contains(&b);
+        let mut paths = Vec::new();
+        let mut heredoc: Option<String> = None;
+        for line in script.lines() {
+            if let Some(delimiter) = &heredoc {
+                if line.trim() == delimiter {
+                    heredoc = None;
+                }
+                continue;
+            }
+            if line.trim_start().starts_with('#') {
+                continue;
+            }
+            if let Some((_, after)) = line.split_once("<<") {
+                let word: String = after
+                    .trim_start_matches(['-', '\\', '\'', '"'])
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if !word.is_empty() {
+                    heredoc = Some(word);
+                }
+            }
+            let bytes = line.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'/' && (i == 0 || opens(bytes[i - 1])) {
+                    let end = bytes[i..]
+                        .iter()
+                        .position(|&b| closes(b))
+                        .map_or(bytes.len(), |n| i + n);
+                    paths.push(String::from_utf8_lossy(&bytes[i..end]).into_owned());
+                    i = end;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        paths
+    }
+
+    /// The absolute paths `script` names outside `root`, less
+    /// [`HOST_PATHS_ALLOWED`]: the host paths a run of it could change.
+    fn paths_outside(script: &str, root: &str) -> Vec<String> {
+        absolute_paths(script)
+            .into_iter()
+            .filter(|path| {
+                !(path == root
+                    || path.starts_with(&format!("{root}/"))
+                    || HOST_PATHS_ALLOWED.contains(&path.as_str()))
+            })
+            .collect()
+    }
+
+    /// `path` on the host whose `/` is `root`: the file a script rendered
+    /// under `root` names for it.
+    fn rooted(root: &std::path::Path, path: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(format!("{}{path}", root.display()))
+    }
+
+    /// Runs a removal script rendered under `root` with `/bin/sh`, with
+    /// `stubs` first on `PATH` and then `/usr/bin:/bin`. Before it runs
+    /// anything, it asserts that the script names no host path outside
+    /// `root`, so a test that renders a script for the host fails here.
+    /// It never reaches `rm`. Every tool in [`HOST_TOOLS`] that `stubs`
+    /// lacks gets a stand-in that exits 1.
+    fn run_confined(
+        root: &std::path::Path,
+        stubs: &std::path::Path,
+        script: &str,
+    ) -> std::process::Output {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root_str = root.to_str().expect("the temp root is UTF-8");
+        assert!(
+            root.is_absolute() && root.parent().is_some() && root.is_dir(),
+            "the root is a temp dir, never the host's /: {root_str}"
+        );
+        let outside = paths_outside(script, root_str);
+        assert!(
+            outside.is_empty(),
+            "the script names host paths outside {root_str}, so the test does not run it: \
+             {outside:?}\n{script}"
+        );
+        for tool in HOST_TOOLS {
+            let path = stubs.join(tool);
+            if !path.exists() {
+                std::fs::write(&path, "#!/bin/sh\nexit 1\n").unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        std::process::Command::new("/bin/sh")
+            .args(["-c", script])
+            .env("PATH", format!("{}:/usr/bin:/bin", stubs.display()))
+            .output()
+            .expect("sh runs")
+    }
+
+    /// The removal scripts come from one root: rendered under a root, every
+    /// path they name is inside it, and without that root they are byte
+    /// for byte the scripts the host runs. So a test that renders under a
+    /// temp root cannot miss a path, and the prefix changes nothing on the
+    /// host.
+    #[test]
+    fn finalize_install_undo_renders_every_path_under_one_root() {
+        let root = "/minimal-undo-test-root";
+        let linux_channel = "/run/minimal/answerer.sock";
+        let mac_channel = "/Library/Application Support/minimal/run/answerer.sock";
+        for (rooted, host) in [
+            (
+                linux_undo_command_under(root, linux_channel),
+                linux_undo_command(linux_channel),
+            ),
+            (
+                macos_undo_command_under(root, mac_channel),
+                macos_undo_command(mac_channel),
+            ),
+        ] {
+            assert_eq!(
+                paths_outside(&rooted, root),
+                Vec::<String>::new(),
+                "{rooted}"
+            );
+            assert_eq!(rooted.replace(root, ""), host);
+        }
+    }
+
+    /// The guard [`run_confined`] runs catches a script rendered for the
+    /// host: the host's removal scripts name the unit files, the program
+    /// copies and the records, and none is inside a temp root.
+    #[test]
+    fn finalize_install_undo_guard_catches_host_paths() {
+        let root = "/minimal-undo-test-root";
+        let linux = paths_outside(&linux_undo_command("/run/minimal/answerer.sock"), root);
+        for path in [
+            PLACE_UNIT_SOCKET_PATH,
+            PLACE_UNIT_SERVICE_PATH,
+            LEGACY_PLACE_UNIT_PATH_PATH,
+            LEGACY_PLACE_UNIT_SERVICE_PATH,
+            CLASSIFIER_UNIT_SERVICE_PATH,
+            CLASSIFIER_PROGRAM_PATH,
+            ANSWERER_UNIT_SOCKET_PATH,
+            ANSWERER_UNIT_SERVICE_PATH,
+            ZONE_LINK_UNIT_PATH,
+            KVM_GROUP_RECORD,
+            CLASSIFIER_TREE_ROOT,
+            "/run/minimal/answerer.sock",
+        ] {
+            assert!(linux.iter().any(|named| named == path), "{path}: {linux:?}");
+        }
+        let mac = paths_outside(&macos_undo_command("/run/answerer.sock"), root);
+        for path in [RESOLVER_FILE, RANGE_PLIST_PATH, "/sbin/ifconfig"] {
+            assert!(mac.iter().any(|named| named == path), "{path}: {mac:?}");
+        }
+        // The classifier's own step in its heredoc is not scanned: `bash`,
+        // the command it is fed to, is always a stand-in.
+        assert!(
+            !linux.iter().any(|named| named.contains("cgroup.procs")),
+            "{linux:?}"
+        );
+        assert_eq!(
+            absolute_paths("rm -f /etc/x \"/usr/y\" 2>/dev/null\n# /var/z\ncat <<\\E\n/opt/w\nE\n"),
+            ["/etc/x", "/usr/y", "/dev/null"]
+        );
+    }
+
+    /// The removal succeeds on a clean host: every step run against an
+    /// empty root, with every system tool a stand-in that fails the way
+    /// the real one does when its target is not there, exits 0. The
+    /// stand-ins record what ran, and the macOS script's absolute-path
+    /// `ifconfig` is a stand-in under the root.
     #[test]
     fn finalize_install_undo_succeeds_on_a_clean_host() {
         use std::os::unix::fs::PermissionsExt as _;
-        let stubs = tempfile::tempdir().expect("a temp dir");
+        let host = tempfile::tempdir().expect("a temp dir");
+        let root = host.path();
+        let root_str = root.to_str().unwrap();
+        let stubs = root.join("stubs");
+        std::fs::create_dir(&stubs).unwrap();
         for tool in [
             "launchctl",
             "systemctl",
@@ -6598,7 +6828,7 @@ mod tests {
             "ip",
             "pgrep",
         ] {
-            let path = stubs.path().join(tool);
+            let path = stubs.join(tool);
             std::fs::write(
                 &path,
                 "#!/bin/sh
@@ -6611,7 +6841,7 @@ exit 1
         }
         // `rm -f` succeeds on a missing file; the stand-in records and
         // succeeds the same way.
-        let rm = stubs.path().join("rm");
+        let rm = stubs.join("rm");
         std::fs::write(
             &rm,
             "#!/bin/sh
@@ -6623,8 +6853,9 @@ exit 0
         std::fs::set_permissions(&rm, std::fs::Permissions::from_mode(0o755)).unwrap();
         // The script sends `ifconfig`'s stderr to /dev/null, so its
         // stand-in logs its calls to a file.
-        let calls = stubs.path().join("calls");
-        let ifconfig = stubs.path().join("ifconfig");
+        let calls = root.join("calls");
+        let ifconfig = rooted(root, "/sbin/ifconfig");
+        std::fs::create_dir_all(ifconfig.parent().unwrap()).unwrap();
         std::fs::write(
             &ifconfig,
             format!(
@@ -6634,45 +6865,12 @@ exit 0
         )
         .unwrap();
         std::fs::set_permissions(&ifconfig, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let prepare = |script: String| {
-            // The link test reads `/sys/class/net`; on a clean host the
-            // link is absent, so `ip` is never reached. The profile, the
-            // tree and the record are read the same way, so a host the
-            // suite runs on that has any of them is still a clean one here.
-            script
-                .replace(
-                    "/sbin/ifconfig",
-                    &stubs.path().join("ifconfig").display().to_string(),
-                )
-                .replace("/sys/class/net/", "/nonexistent/sys/class/net/")
-                .replace(APPARMOR_DIR, "/nonexistent/etc/apparmor.d")
-                .replace(
-                    CLASSIFIER_TREE_ROOT,
-                    "/nonexistent/sys/fs/cgroup/minimald.slice",
-                )
-                .replace(KVM_GROUP_RECORD, "/nonexistent/var/lib/minimal/kvm-group")
-                .replace(
-                    APPARMOR_PROFILE_RECORD,
-                    "/nonexistent/var/lib/minimal/apparmor-profile",
-                )
-                .replace(
-                    CLASSIFIER_TREE_RECORD,
-                    "/nonexistent/var/lib/minimal/classifier",
-                )
-        };
-        let run = |script: &str| {
-            std::process::Command::new("/bin/sh")
-                .args(["-c", script])
-                .env("PATH", stubs.path())
-                .output()
-                .expect("sh runs")
-        };
+        let mac_channel = "/Library/Application Support/minimal/run/answerer.sock";
         for script in [
-            macos_undo_command("/nonexistent/minimal/run/answerer.sock"),
-            linux_undo_command("/nonexistent/minimal/answerer.sock"),
+            macos_undo_command_under(root_str, mac_channel),
+            linux_undo_command_under(root_str, "/run/minimal/answerer.sock"),
         ] {
-            let script = prepare(script);
-            let output = run(&script);
+            let output = run_confined(root, &stubs, &script);
             assert!(
                 output.status.success(),
                 "the removal succeeds on a clean host: {}\n{script}",
@@ -6701,11 +6899,11 @@ exit 0
         // A VM running (`pgrep` exits 0): the aliases stay, the note says
         // how to finish, and the rest of the removal still runs and succeeds.
         std::fs::remove_file(&calls).unwrap();
-        let pgrep = stubs.path().join("pgrep");
+        let pgrep = stubs.join("pgrep");
         std::fs::write(&pgrep, "#!/bin/sh\necho \"$0 $*\" >&2\nexit 0\n").unwrap();
         std::fs::set_permissions(&pgrep, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let script = prepare(macos_undo_command("/nonexistent/minimal/run/answerer.sock"));
-        let output = run(&script);
+        let script = macos_undo_command_under(root_str, mac_channel);
+        let output = run_confined(root, &stubs, &script);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "{stderr}\n{script}");
         assert!(stderr.contains(MACOS_UNDO_VM_RUNNING_NOTE), "{stderr}");
@@ -6715,7 +6913,7 @@ exit 0
             std::fs::read_to_string(&calls).unwrap_or_default()
         );
         assert!(
-            stderr.contains(&format!("rm -f {RESOLVER_FILE}")),
+            stderr.contains(&format!("rm -f {root_str}{RESOLVER_FILE}")),
             "the rest of the removal runs: {stderr}"
         );
     }
@@ -6728,11 +6926,12 @@ exit 0
     fn finalize_install_undo_removes_only_the_profile_it_recorded() {
         use std::os::unix::fs::PermissionsExt as _;
         let host = tempfile::tempdir().expect("a temp dir");
-        let stubs = host.path().join("stubs");
+        let root = host.path();
+        let stubs = root.join("stubs");
         std::fs::create_dir(&stubs).unwrap();
         // The stubs log their calls to a file: the script sends
         // `apparmor_parser`'s stderr to /dev/null, so stderr cannot tell.
-        let calls = host.path().join("calls");
+        let calls = root.join("calls");
         for (tool, code) in [
             ("apparmor_parser", 0),
             ("systemctl", 1),
@@ -6751,28 +6950,17 @@ exit 0
             .unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let apparmor_dir = host.path().join("apparmor.d");
-        let record = host.path().join("finalize-install-apparmor-profile");
+        let apparmor_dir = rooted(root, APPARMOR_DIR);
+        let record = rooted(root, APPARMOR_PROFILE_RECORD);
+        std::fs::create_dir_all(record.parent().unwrap()).unwrap();
         let profile = apparmor_dir.join("minimald");
         let tunable = apparmor_dir.join("tunables/minimald");
         let local = apparmor_dir.join("tunables/minimald.d/local");
-        let script = linux_undo_command("/nonexistent/minimal/answerer.sock")
-            .replace("/sys/class/net/", "/nonexistent/sys/class/net/")
-            .replace(
-                CLASSIFIER_TREE_ROOT,
-                "/nonexistent/sys/fs/cgroup/minimald.slice",
-            )
-            .replace(KVM_GROUP_RECORD, "/nonexistent/var/lib/minimal/kvm-group")
-            .replace(APPARMOR_PROFILE_RECORD, record.to_str().unwrap())
-            .replace(APPARMOR_DIR, apparmor_dir.to_str().unwrap());
+        let script = linux_undo_command_under(root.to_str().unwrap(), "/run/minimal/answerer.sock");
         // Runs the removal; gives back the stubs' calls and the stderr.
         let run = || {
             let _ = std::fs::remove_file(&calls);
-            let output = std::process::Command::new("/bin/sh")
-                .args(["-c", &script])
-                .env("PATH", format!("{}:/usr/bin:/bin", stubs.display()))
-                .output()
-                .expect("sh runs");
+            let output = run_confined(root, &stubs, &script);
             assert!(
                 output.status.success(),
                 "the removal succeeds: {}\n{script}",
@@ -6834,9 +7022,10 @@ exit 0
     fn finalize_install_undo_removes_the_other_items_before_a_held_classifier_tree() {
         use std::os::unix::fs::PermissionsExt as _;
         let host = tempfile::tempdir().expect("a temp dir");
-        let stubs = host.path().join("stubs");
+        let root = host.path();
+        let stubs = root.join("stubs");
         std::fs::create_dir(&stubs).unwrap();
-        let calls = host.path().join("calls");
+        let calls = root.join("calls");
         // `bash` stands for the classifier's `--uninstall`, failing the way
         // `die` does on a held tree; the service tools are absent-tolerant.
         for (tool, code) in [
@@ -6857,28 +7046,16 @@ exit 0
             .unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let tree = host.path().join("minimald.slice");
-        std::fs::create_dir(&tree).unwrap();
-        let tree_record = host.path().join("finalize-install-classifier");
+        let tree = rooted(root, CLASSIFIER_TREE_ROOT);
+        std::fs::create_dir_all(&tree).unwrap();
+        let tree_record = rooted(root, CLASSIFIER_TREE_RECORD);
+        std::fs::create_dir_all(tree_record.parent().unwrap()).unwrap();
         std::fs::write(&tree_record, "").unwrap();
-        let record = host.path().join("finalize-install-kvm-group");
+        let record = rooted(root, KVM_GROUP_RECORD);
         // Two users ran the step: both memberships come away.
         std::fs::write(&record, "alice\nbob\n").unwrap();
-        let script = linux_undo_command("/nonexistent/minimal/answerer.sock")
-            .replace("/sys/class/net/", "/nonexistent/sys/class/net/")
-            .replace(
-                APPARMOR_PROFILE_RECORD,
-                "/nonexistent/var/lib/minimal/apparmor-profile",
-            )
-            .replace(APPARMOR_DIR, "/nonexistent/etc/apparmor.d")
-            .replace(KVM_GROUP_RECORD, record.to_str().unwrap())
-            .replace(CLASSIFIER_TREE_RECORD, tree_record.to_str().unwrap())
-            .replace(CLASSIFIER_TREE_ROOT, tree.to_str().unwrap());
-        let output = std::process::Command::new("/bin/sh")
-            .args(["-c", &script])
-            .env("PATH", format!("{}:/usr/bin:/bin", stubs.display()))
-            .output()
-            .expect("sh runs");
+        let script = linux_undo_command_under(root.to_str().unwrap(), "/run/minimal/answerer.sock");
+        let output = run_confined(root, &stubs, &script);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let calls = std::fs::read_to_string(&calls).unwrap_or_default();
         assert_eq!(
@@ -6910,9 +7087,10 @@ exit 0
     fn finalize_install_undo_removes_only_the_classifier_tree_it_recorded() {
         use std::os::unix::fs::PermissionsExt as _;
         let host = tempfile::tempdir().expect("a temp dir");
-        let stubs = host.path().join("stubs");
+        let root = host.path();
+        let stubs = root.join("stubs");
         std::fs::create_dir(&stubs).unwrap();
-        let calls = host.path().join("calls");
+        let calls = root.join("calls");
         // `bash` stands for the classifier's `--uninstall`, succeeding.
         for (tool, code) in [
             ("bash", 0),
@@ -6932,26 +7110,14 @@ exit 0
             .unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let tree = host.path().join("minimald.slice");
-        std::fs::create_dir(&tree).unwrap();
-        let tree_record = host.path().join("finalize-install-classifier");
-        let script = linux_undo_command("/nonexistent/minimal/answerer.sock")
-            .replace("/sys/class/net/", "/nonexistent/sys/class/net/")
-            .replace(
-                APPARMOR_PROFILE_RECORD,
-                "/nonexistent/var/lib/minimal/apparmor-profile",
-            )
-            .replace(APPARMOR_DIR, "/nonexistent/etc/apparmor.d")
-            .replace(KVM_GROUP_RECORD, "/nonexistent/var/lib/minimal/kvm-group")
-            .replace(CLASSIFIER_TREE_RECORD, tree_record.to_str().unwrap())
-            .replace(CLASSIFIER_TREE_ROOT, tree.to_str().unwrap());
+        let tree = rooted(root, CLASSIFIER_TREE_ROOT);
+        std::fs::create_dir_all(&tree).unwrap();
+        let tree_record = rooted(root, CLASSIFIER_TREE_RECORD);
+        std::fs::create_dir_all(tree_record.parent().unwrap()).unwrap();
+        let script = linux_undo_command_under(root.to_str().unwrap(), "/run/minimal/answerer.sock");
         let run = || {
             let _ = std::fs::remove_file(&calls);
-            let output = std::process::Command::new("/bin/sh")
-                .args(["-c", &script])
-                .env("PATH", format!("{}:/usr/bin:/bin", stubs.display()))
-                .output()
-                .expect("sh runs");
+            let output = run_confined(root, &stubs, &script);
             assert!(
                 output.status.success(),
                 "the removal succeeds: {}\n{script}",
@@ -11150,7 +11316,7 @@ resolvectl domain minzone0 '~min.internal'
             "no failure block removes the bundle: {mac}"
         );
         assert!(
-            mac.contains(&macos_unit_removal(&install.channel, "  ")),
+            mac.contains(&macos_unit_removal("", &install.channel, "  ")),
             "{mac}"
         );
 

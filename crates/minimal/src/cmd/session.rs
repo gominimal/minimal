@@ -736,15 +736,13 @@ pub async fn cmd_rename(global: &GlobalArgs, args: RenameArgs) -> Result<(), any
             if holds_name(&record) {
                 let control_sock =
                     vm_host_control_sock(daemon_host_kind(global), global.minimal_dir.as_deref());
-                release_held_box_name(
-                    control_sock.clone(),
+                move_held_box_name(
+                    control_sock,
                     record.id,
                     record.name.as_deref(),
-                    None,
+                    &args.new_name,
                 )
                 .await;
-                hold_box_name_with_vm_host(control_sock, &args.new_name, Some(record.id), true)
-                    .await;
             }
             println!(
                 "Renamed session {} ({}) → {}",

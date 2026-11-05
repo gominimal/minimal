@@ -22,6 +22,7 @@
 #         [--ct-mark-mask 0x30000000]
 #         [--cohort-address ADDR --node-plane-address ADDR]
 #         [--cohort-dscp 1-63]                          # VM guest only
+#         [--proxy-lane ADDR:PORT]                      # VM guest only
 #   sudo scripts/install-host-classifier.sh --pid PID
 #   sudo scripts/install-host-classifier.sh --user NAME --place-listener SOCK
 #   sudo scripts/install-host-classifier.sh --uninstall
@@ -118,6 +119,13 @@ readonly QUIC443_LEAF_SET=quic443_blocked_leaves
 readonly QUIC443_HELPER=${MINIMAL_OVERRIDE_QUIC443_HELPER:-/usr/local/lib/minimal/quic443-leaf}
 readonly QUIC443_SUDOERS=${MINIMAL_OVERRIDE_QUIC443_SUDOERS:-/etc/sudoers.d/minimal-quic443-leaf}
 readonly quic443_helper_overridden=${MINIMAL_OVERRIDE_QUIC443_HELPER:+1}
+# The set of box leaves whose sockets may open a TCP connection to the Box
+# Egress Proxy's address (BEP-083): the own leaf of each resident
+# host-address box that declares a credentialed upstream. Only a VM guest's
+# render, with --proxy-lane, declares it. The daemon adds and removes a leaf
+# through the same helper, with its `lane-add` and `lane-remove` verbs
+# (PROXY_LANE_SET in crates/minimald/src/net/classifier.rs).
+readonly PROXY_LANE_SET=bep_lane_leaves
 # The name the loaded table and its presence marker share: the daemon probes
 # $tree_root/$TABLE_MARKER (read-only, no CAP_NET_ADMIN) because listing the
 # table itself needs the very capability that loaded it.
@@ -201,6 +209,12 @@ node_plane_address=
 # from the guest's one address. Only the guest's own render passes it. A
 # native host renders no DSCP rule and leaves the field alone.
 cohort_dscp=
+# The Box Egress Proxy's listener, as ADDR and PORT (BEP-083). Only the VM
+# guest's render passes it. A box in the boxes subtree whose own leaf is not
+# in $PROXY_LANE_SET is then refused a new TCP connection to ADDR at PORT or
+# at 443. A native host renders no such rule.
+proxy_lane_address=
+proxy_lane_port=
 # The unix socket --place-listener reads the daemon's pid from: every
 # process of the delegated account holding it is placed in the daemon leaf.
 listener=
@@ -261,6 +275,24 @@ while [ $# -gt 0 ]; do
             cohort_dscp=$2
             shift 2
             ;;
+        --proxy-lane)
+            [ $# -ge 2 ] || die "--proxy-lane needs an address and a port, as ADDR:PORT"
+            proxy_lane_address=${2%:*}
+            proxy_lane_port=${2##*:}
+            case "$proxy_lane_address" in
+                ''|*[!0-9.]*|*..*|.*|*.)
+                    die "--proxy-lane needs an IPv4 address and a port, as ADDR:PORT, got: $2" ;;
+            esac
+            [ "$(printf '%s' "$proxy_lane_address" | awk -F. '{ ok = NF == 4; for (i = 1; i <= NF; i++) if ($i > 255) ok = 0; print ok }')" = 1 ] ||
+                die "--proxy-lane needs an IPv4 address and a port, as ADDR:PORT, got: $2"
+            case "$proxy_lane_port" in ''|*[!0-9]*)
+                die "--proxy-lane needs a numeric port, as ADDR:PORT, got: $2" ;;
+            esac
+            if [ "$proxy_lane_port" -lt 1 ] || [ "$proxy_lane_port" -gt 65535 ]; then
+                die "--proxy-lane needs a port from 1 to 65535, got: $2"
+            fi
+            shift 2
+            ;;
         --ct-mark-mask)
             [ $# -ge 2 ] || die "--ct-mark-mask needs a mask"
             ct_mark_mask=$2
@@ -288,7 +320,7 @@ while [ $# -gt 0 ]; do
         # The header above this line is the usage. Two explicit strips, not
         # 's/^# \?//': \? is a GNU sed extension BSD sed does not know, and this
         # script's own tests run on macOS's /bin/sh too.
-        -h|--help)   sed -n '2,87p' "$0" | sed -e 's/^# //' -e 's/^#//'; exit 0 ;;
+        -h|--help)   sed -n '2,88p' "$0" | sed -e 's/^# //' -e 's/^#//'; exit 0 ;;
         *)           die "unknown argument: $1 (see --help)" ;;
     esac
 done
@@ -673,6 +705,9 @@ box_leaf_level() {
 # render_quic443_helper — the root-owned helper, on stdout. It takes `add`
 # or `remove` and one path, and it changes the $QUIC443_LEAF_SET set only
 # when that path is one box leaf directly under this tree's allow subtree.
+# `lane-add` and `lane-remove` change the $PROXY_LANE_SET set the same way,
+# under the same check. A table rendered without --proxy-lane has no such
+# set, and nft refuses the change.
 # It refuses every other path, so the account that may run it as root can
 # put no other cgroup in the set and run nothing else. The tree's paths and
 # the nft binary are written in at install: under sudo nothing in the
@@ -685,7 +720,9 @@ render_quic443_helper() {
 #!/bin/bash
 # Written by install-host-classifier.sh. Adds a box's own leaf to the set of
 # leaves that are refused UDP to port 443, or removes it. minimald runs this
-# with `sudo -n` while the host-address boxes block QUIC.
+# with `sudo -n` while the host-address boxes block QUIC. On a VM guest,
+# lane-add and lane-remove change the set of leaves that can connect to
+# the Box Egress Proxy's address instead.
 set -eu
 export LC_ALL=C
 HEAD
@@ -699,14 +736,18 @@ HEAD
 ' "$TABLE_NAME"
     printf 'readonly SET=%q
 ' "$QUIC443_LEAF_SET"
+    printf 'readonly LANE_SET=%q
+' "$PROXY_LANE_SET"
     cat <<'BODY'
 refuse() { printf 'error: %s
 ' "$*" >&2; exit 2; }
-[ "$#" -eq 2 ] || refuse "usage: $0 add|remove <box leaf directory>"
+[ "$#" -eq 2 ] || refuse "usage: $0 add|remove|lane-add|lane-remove <box leaf directory>"
 case "$1" in
-    add) verb=add ;;
-    remove) verb=delete ;;
-    *) refuse "refused: the first argument must be add or remove, not: $1" ;;
+    add) verb=add; set=$SET ;;
+    remove) verb=delete; set=$SET ;;
+    lane-add) verb=add; set=$LANE_SET ;;
+    lane-remove) verb=delete; set=$LANE_SET ;;
+    *) refuse "refused: the first argument must be add, remove, lane-add or lane-remove, not: $1" ;;
 esac
 leaf=$2
 name=${leaf#"$ALLOW_ROOT/"}
@@ -718,7 +759,7 @@ esac
 if [ "$verb" = add ] && { [ -L "$leaf" ] || [ ! -d "$leaf" ]; }; then
     refuse "refused: $leaf is not a directory"
 fi
-exec "$NFT" "$verb" element inet "$TABLE" "$SET" "{ \"$ALLOW_REL/$name\" }"
+exec "$NFT" "$verb" element inet "$TABLE" "$set" "{ \"$ALLOW_REL/$name\" }"
 BODY
 }
 
@@ -941,6 +982,18 @@ install_quic443_helper() {
 # VM host's gate reads the value to decide a frame from the guest's one
 # address by the box's rules, and an unmarked frame by the node plane's.
 #
+# With --proxy-lane ADDR:PORT, a VM guest's render adds the
+# $PROXY_LANE_SET set and the proxy_lane chain (BEP-083). The output chain
+# sends a new TCP connection from the boxes subtree to ADDR, at PORT or at
+# 443, to proxy_lane. That chain returns for a socket created in a box leaf
+# that is in the set, and refuses every other one with the deny chain's
+# counter, log prefix and reject. The daemon puts the own leaf of each
+# resident host-address box that declares a credentialed upstream in the
+# set, through the helper's lane-add verb. A member that declares none is
+# never in the set, and nor is the cohort's blocked leaf, so the proxy's
+# address is refused to both. The set is declared empty: only a guest
+# renders it, and a guest renders its table once, at boot.
+#
 # The ipv6_out chain refuses every IPv6 connection a box in the boxes
 # subtree opens to anything but loopback, whatever the box declares. A
 # host-address box's allow list is decided by IPv4 address rules only, and
@@ -971,6 +1024,26 @@ render_ruleset() {
         ct mark and $mask_hex == $cohort_hex oifname != \"lo\" snat ip to $cohort_address
         ct mark and $mask_hex == $node_hex oifname != \"lo\" snat ip to $node_plane_address"
     fi
+    lane_set=
+    lane_rule=
+    lane_chain=
+    if [ -n "$proxy_lane_address" ]; then
+        lane_ports="{ $proxy_lane_port, 443 }"
+        [ "$proxy_lane_port" != 443 ] || lane_ports=443
+        lane_set="
+    set $PROXY_LANE_SET {
+        typeof socket cgroupv2 level $(box_leaf_level)
+    }"
+        lane_rule="
+        ct state new ip daddr $proxy_lane_address tcp dport $lane_ports socket cgroupv2 level $(cgroup_level "$boxes_path") \"$boxes_path\" jump proxy_lane"
+        lane_chain="
+    chain proxy_lane {
+        socket cgroupv2 level $(box_leaf_level) @$PROXY_LANE_SET return
+        counter name \"$REFUSED_COUNTER\"
+        limit rate 1/second burst 4 packets log prefix \"minimal-classifier: refused \" level warn
+        reject with icmpx admin-prohibited
+    }"
+    fi
     dscp_chain=
     if [ -n "$cohort_dscp" ]; then
         dscp_chain="
@@ -997,13 +1070,13 @@ table inet $TABLE_NAME {
     }
     set $QUIC443_LEAF_SET {
         typeof socket cgroupv2 level $(box_leaf_level)$leaf_elements
-    }
+    }$lane_set
     chain output {
         type filter hook output priority filter; policy accept;
         socket cgroupv2 level $(cgroup_level "$deny_path") "$deny_path" jump deny_out
         socket cgroupv2 level $(cgroup_level "$quic443_blocked_path") "$quic443_blocked_path" udp dport 443 reject with icmpx port-unreachable
-        socket cgroupv2 level $(box_leaf_level) @$QUIC443_LEAF_SET udp dport 443 reject with icmpx port-unreachable
-    }
+        socket cgroupv2 level $(box_leaf_level) @$QUIC443_LEAF_SET udp dport 443 reject with icmpx port-unreachable$lane_rule
+    }$lane_chain
     chain deny_out {
         ct state established,related ct direction reply accept$carve_out_rule
         counter name "$REFUSED_COUNTER"
