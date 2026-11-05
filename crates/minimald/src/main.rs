@@ -1372,10 +1372,20 @@ async fn request_daemon_placement(tree_root: &std::path::Path) {
     })
     .await;
     match request {
-        Ok(PlaceRequest::Answered) => tracing::info!(
+        // A closed connection is not a placement: systemd also closes one it
+        // will not serve (over the socket's `MaxConnections=`), and a placer
+        // can exit without finding this daemon. Only the leaf says whether
+        // the request placed it.
+        Ok(PlaceRequest::Answered) if classifier::daemon_fetch_leaf(tree_root).is_some() => {
+            tracing::info!(
+                socket = paths::PLACE_REQUEST_SOCKET,
+                "the placement unit placed this daemon in its classifier leaf"
+            )
+        }
+        Ok(PlaceRequest::Answered) => tracing::warn!(
             socket = paths::PLACE_REQUEST_SOCKET,
-            placed = classifier::daemon_fetch_leaf(tree_root).is_some(),
-            "the placement unit answered this daemon's placement request"
+            "the placement unit closed this daemon's placement request without placing it, \
+             so it runs outside its classifier leaf"
         ),
         Ok(PlaceRequest::NoPlacer(e)) => tracing::info!(
             socket = paths::PLACE_REQUEST_SOCKET,
