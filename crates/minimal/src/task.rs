@@ -965,22 +965,20 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
             match open_task_box_run(&mut client, id, &args.task, &task_cwd, &task_env).await {
                 Ok(channel) => {
                     let outcome = bridge_exec(channel).await;
-                    // The daemon reports a code only once the box's record
-                    // keeps it, so a box still running after a reported
-                    // code never started its entrypoint: the daemon refused
-                    // the start. That box is removed too, and nothing is
-                    // kept. An entrypoint that ended by a signal reports no
-                    // code, and its box is kept the same way.
-                    if outcome.is_ok() {
-                        if entrypoint_started(&mut client, id).await {
-                            eprintln!("{}", crate::kept_box_line(&session_name));
-                        } else {
-                            tracing::info!(
-                                box_id = %id,
-                                "the daemon did not start the task box's entrypoint; \
-                                 removing the box"
-                            );
-                            crate::best_effort_destroy(&mut client, id, false).await;
+                    if let Ok(exit) = outcome {
+                        let end = task_box_end(exit, || entrypoint_started(&mut client, id)).await;
+                        match end {
+                            TaskBoxEnd::Keep => {
+                                eprintln!("{}", crate::kept_box_line(&session_name));
+                            }
+                            TaskBoxEnd::Remove => {
+                                tracing::info!(
+                                    box_id = %id,
+                                    "the daemon did not start the task box's entrypoint; \
+                                     removing the box"
+                                );
+                                crate::best_effort_destroy(&mut client, id, false).await;
+                            }
                         }
                     }
                     outcome
@@ -1057,6 +1055,36 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     drop(run_guard);
 
     exit_outcome(outcome?)
+}
+
+/// What a task run does with its box once the run's channel closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskBoxEnd {
+    /// The box stays, with its record (BOX-038), or runs on (BOX-015).
+    Keep,
+    /// The daemon refused to start the entrypoint, so the box is removed.
+    Remove,
+}
+
+/// Decides [`TaskBoxEnd`] from the exit status the run's channel reported.
+///
+/// The daemon reports a code only once the box's record keeps it, so a box
+/// whose record still reads not started after a reported code never started
+/// its entrypoint: the daemon refused the start, and the box is removed.
+/// `started` reads the record, and only then. A channel that closed with no
+/// status (a daemon or transport drop mid-run) says nothing about the
+/// entrypoint, which can still run, so the box is kept and the record is
+/// not read: a client that loses its run never ends the box (BOX-015).
+async fn task_box_end<F, Fut>(exit: Option<u32>, started: F) -> TaskBoxEnd
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    match exit {
+        None => TaskBoxEnd::Keep,
+        Some(_) if started().await => TaskBoxEnd::Keep,
+        Some(_) => TaskBoxEnd::Remove,
+    }
 }
 
 /// Whether the task box's entrypoint ran: the box's record shows it ended,
@@ -1283,6 +1311,33 @@ mod tests {
             "got: {err}"
         );
         assert!(err.downcast_ref::<TaskExit>().is_none());
+    }
+
+    /// BOX-015: a run whose channel dropped mid-run, with no exit status,
+    /// keeps its box even while the record reads running, and does not read
+    /// the record to decide. A reported code with a record that never left
+    /// running is the daemon's refusal, and only that removes the box.
+    #[tokio::test]
+    async fn a_task_box_run_that_loses_its_channel_keeps_the_box() {
+        let mut read = false;
+        let end = task_box_end(None, || {
+            read = true;
+            std::future::ready(false)
+        })
+        .await;
+        assert_eq!(end, TaskBoxEnd::Keep, "a dropped channel keeps the box");
+        assert!(!read, "a dropped channel does not read the record");
+
+        assert_eq!(
+            task_box_end(Some(3), || std::future::ready(true)).await,
+            TaskBoxEnd::Keep,
+            "an entrypoint that ended keeps its box"
+        );
+        assert_eq!(
+            task_box_end(Some(125), || std::future::ready(false)).await,
+            TaskBoxEnd::Remove,
+            "a refused start removes the box"
+        );
     }
 
     /// NET-131 from the client side: a `min task run` of a task with no
