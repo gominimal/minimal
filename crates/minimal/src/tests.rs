@@ -7762,6 +7762,13 @@ async fn box_cp_reads_stopped_box_as_box_017() {
         format!("{missing:#}") == "Box web has no file gone.txt.",
         "{missing:#}"
     );
+    assert_eq!(
+        missing
+            .downcast_ref::<BoxFileRefusal>()
+            .map(BoxFileRefusal::exit_code),
+        Some(4),
+        "a missing file ends with the not-found code: {missing:#}"
+    );
     assert!(!local.path().join("gone.txt").exists());
     // A failed copy leaves no temporary file beside the destination either.
     assert_eq!(
@@ -7847,7 +7854,7 @@ async fn events_jsonl_replay_schema_fields() {
         running[..],
         "the same stream, replayed"
     );
-    let mut last_ts = 0;
+    let mut last_ts = None;
     for line in &lines {
         let object = line.as_object().expect("a JSON object");
         let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
@@ -7865,9 +7872,17 @@ async fn events_jsonl_replay_schema_fields() {
         );
         assert!(line["type"].is_string(), "{line}");
         assert!(line["data"].is_object(), "{line}");
-        let ts = line["ts"].as_u64().expect("ts is milliseconds");
-        assert!(ts >= last_ts, "oldest first: {lines:?}");
-        last_ts = ts;
+        let ts = chrono::DateTime::parse_from_rfc3339(line["ts"].as_str().expect("ts is a string"))
+            .expect("ts is RFC 3339");
+        assert!(
+            line["ts"].as_str().unwrap().ends_with('Z'),
+            "ts is UTC: {line}"
+        );
+        assert!(
+            last_ts.is_none_or(|last| ts >= last),
+            "oldest first: {lines:?}"
+        );
+        last_ts = Some(ts);
     }
 
     // The text form gives one line for each event, with its type.
@@ -8033,9 +8048,12 @@ async fn events_parent_merges_children() {
     );
     assert!(!boxes_seen.contains(&other.to_string()));
     assert!(!boxes_seen.contains(&parent.to_string()));
-    let ts: Vec<u64> = lines
+    let ts: Vec<_> = lines
         .iter()
-        .map(|line| line["ts"].as_u64().unwrap())
+        .map(|line| {
+            chrono::DateTime::parse_from_rfc3339(line["ts"].as_str().expect("ts is a string"))
+                .expect("ts is RFC 3339")
+        })
         .collect();
     assert!(ts.is_sorted(), "one stream in time order: {lines:?}");
     // Each child's own stream keeps its order inside the merge.

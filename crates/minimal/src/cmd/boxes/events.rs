@@ -19,10 +19,52 @@ use minimald_rpc::ReadEventsUpdate;
 
 /// One box event as `min box events` renders it. Its machine form is the
 /// event's own fields beside the `min/v1/event` stamp: `ts`, `box`,
-/// `parent`, `type` and `data`.
-#[derive(Debug, serde::Serialize)]
-#[serde(transparent)]
+/// `parent`, `type` and `data`. `ts` is an RFC 3339 UTC string, as every
+/// machine-mode timestamp is.
+#[derive(Debug)]
 pub(crate) struct EventRow(pub boxes::events::BoxEvent);
+
+impl EventRow {
+    /// The event's time as RFC 3339 UTC with milliseconds, or the raw
+    /// milliseconds when they are out of the range a date can hold.
+    fn ts(&self) -> String {
+        let ts = self.0.ts;
+        i64::try_from(ts)
+            .ok()
+            .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+            .map_or_else(
+                || ts.to_string(),
+                |ts| ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            )
+    }
+}
+
+/// The machine form of an [`EventRow`]: the [`boxes::events::BoxEvent`]
+/// fields under their wire names, with `ts` as a string.
+#[derive(serde::Serialize)]
+struct EventRowWire<'a> {
+    #[serde(rename = "box")]
+    box_id: &'a boxes::BoxId,
+    parent: &'a Option<boxes::BoxId>,
+    ts: String,
+    #[serde(rename = "type")]
+    kind: &'a boxes::events::BoxEventType,
+    data: &'a boxes::events::EventData,
+}
+
+impl serde::Serialize for EventRow {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let event = &self.0;
+        EventRowWire {
+            box_id: &event.box_id,
+            parent: &event.parent,
+            ts: self.ts(),
+            kind: &event.kind,
+            data: &event.data,
+        }
+        .serialize(serializer)
+    }
+}
 
 impl Rendered for EventRow {
     const TYPE: ObjectType = ObjectType::Event;
@@ -31,14 +73,13 @@ impl Rendered for EventRow {
     /// any.
     fn text(&self, out: &mut dyn std::io::Write) -> std::io::Result<()> {
         let event = &self.0;
-        let ts = i64::try_from(event.ts)
-            .ok()
-            .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
-            .map_or_else(
-                || event.ts.to_string(),
-                |ts| ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-            );
-        write!(out, "{ts}  {}  {}", event.box_id, event.kind.name())?;
+        write!(
+            out,
+            "{}  {}  {}",
+            self.ts(),
+            event.box_id,
+            event.kind.name()
+        )?;
         if !event.data.is_empty() {
             let data = serde_json_lenient::to_string(&event.data).map_err(std::io::Error::other)?;
             write!(out, "  {data}")?;
@@ -46,6 +87,51 @@ impl Rendered for EventRow {
         writeln!(out)
     }
 }
+
+/// A file `min box cp` could not open in the box, for a reason with its
+/// own exit code: 4 when the box has no such file, 5 when the box does
+/// not allow the read (BCLI-034).
+#[derive(Debug)]
+pub enum BoxFileRefusal {
+    /// The box has no file at the path.
+    NotFound {
+        /// The box as the person named it.
+        address: String,
+        /// The path in the box.
+        path: String,
+    },
+    /// The box does not allow the read.
+    PermissionDenied {
+        /// The box as the person named it.
+        address: String,
+        /// The path in the box.
+        path: String,
+    },
+}
+
+impl BoxFileRefusal {
+    /// The exit code the command ends with: 4 for not found, 5 for
+    /// permission denied.
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::NotFound { .. } => 4,
+            Self::PermissionDenied { .. } => 5,
+        }
+    }
+}
+
+impl std::fmt::Display for BoxFileRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound { address, path } => write!(f, "Box {address} has no file {path}."),
+            Self::PermissionDenied { address, path } => {
+                write!(f, "Box {address} does not allow reading {path}.")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BoxFileRefusal {}
 
 /// `min box events`.
 pub(crate) async fn cmd_box_events(
@@ -84,6 +170,10 @@ pub(crate) async fn box_events_on_hosts(
 
     // Each stream with the name its errors call the box by: the address the
     // person typed, or a child's name, or its id when it has none.
+    // Interim: the set of children is read once, here, so a child created
+    // after the read is not in `--parent --follow`. Remove this when the
+    // follow also picks up new children:
+    // https://github.com/gominimal/minimal/issues/3024.
     let ids: Vec<(boxes::BoxId, String)> = if args.parent.is_some() {
         let listing = list_box_records(&mut client, None).await?;
         let children: Vec<_> = child_boxes(&listing, resolved.box_id)
@@ -339,9 +429,15 @@ async fn copy_box_file(
     let mut file = client.open_box_file(box_id, path).await.map_err(|e| {
         tracing::warn!(verb = "box cp", box_id = %box_id, path, "open the file in the box: {e}");
         match e {
-            client::BoxFileError::NotFound => anyhow::anyhow!("Box {address} has no file {path}."),
+            client::BoxFileError::NotFound => anyhow::Error::new(BoxFileRefusal::NotFound {
+                address: address.to_owned(),
+                path: path.to_owned(),
+            }),
             client::BoxFileError::PermissionDenied => {
-                anyhow::anyhow!("Box {address} does not allow reading {path}.")
+                anyhow::Error::new(BoxFileRefusal::PermissionDenied {
+                    address: address.to_owned(),
+                    path: path.to_owned(),
+                })
             }
             client::BoxFileError::Unavailable(_) | client::BoxFileError::Refused(_) => {
                 anyhow::anyhow!("Could not open {path} in box {address}.")

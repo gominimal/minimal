@@ -486,7 +486,7 @@ pub struct BoxEventsArgs {
     pub output: Option<BoxEventsOutputFormat>,
     /// Show the events so far, then keep showing new events as they
     /// happen, until the box is removed or the command is interrupted
-    #[arg(long)]
+    #[arg(short = 'f', long)]
     pub follow: bool,
 }
 

@@ -34,6 +34,7 @@ pub(crate) use address::*;
 pub use address::{AddressCandidate, BoxAddressRefusal};
 pub(crate) use attach::*;
 pub use create::*;
+pub use events::BoxFileRefusal;
 pub(crate) use events::*;
 pub(crate) use exec::*;
 pub(crate) use hooks::*;
