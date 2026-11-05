@@ -8464,6 +8464,16 @@ setup_classifier_teardown() {
   sudo -n systemctl reset-failed minimald-place.socket minimald-place.path \
     minimald-place.service minimald-classifier.service >/dev/null 2>&1 || true
   if [ -e /sys/fs/cgroup/minimald.slice ]; then
+    # What still holds the tree: each cgroup under it with its members,
+    # and each member's command line, so a failed teardown names its holder.
+    echo "--- the classifier tree's remaining cgroups and their processes ---"
+    find /sys/fs/cgroup/minimald.slice -name cgroup.procs 2>/dev/null | while IFS= read -r procs; do
+      echo "${procs%/cgroup.procs}: $(tr '\n' ' ' < "$procs" 2>/dev/null)"
+      while IFS= read -r member; do
+        [ -n "$member" ] || continue
+        echo "  $member: $(tr '\0' ' ' < "/proc/$member/cmdline" 2>/dev/null)"
+      done < "$procs"
+    done
     return 1
   fi
   sudo -n rm -f /var/lib/minimal/finalize-install-classifier >/dev/null 2>&1 || true
