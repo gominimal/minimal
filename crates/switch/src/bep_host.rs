@@ -34,6 +34,15 @@
 //! sockets: the pool's total is the sum of the shares, and every live
 //! connection counts against its own box alone.
 //!
+//! The pool listens at [`PROXY_TLS_PORT`] beside [`PROXY_PORT`], for the
+//! direct TLS a `dns`-steered box opens at the proxy's address (BEP-080).
+//! A slot is still one connection of its box's share: while it is idle it
+//! holds one listening socket at each port, and the turn it takes a
+//! connection at one port its listener at the other is closed. The cap
+//! counts a box's connections at both ports together, so the two ports are
+//! one lane, and the delivery header's destination carries the port the
+//! box dialed.
+//!
 //! Each connection the cap admits is delivered to the proxy's acceptor on
 //! its unix socket ([`BepWire::proxy_sock`]): one dial per flow, never
 //! reused, carrying the per-boot token ([`TOKEN_LEN`] bytes) and then one
@@ -164,6 +173,16 @@ const POLL_DELAY: Duration = Duration::from_millis(100);
 /// pool's sockets listen at. A proposed working value, recorded beside the
 /// per-source cap in the spec and tuned by the integration run.
 pub const PROXY_PORT: u16 = 8118;
+
+/// The port a `dns`-steered box opens TLS on at the leg's address: the box
+/// resolver gives a credentialed name the proxy's address, and the box
+/// dials it as the upstream itself (BEP-080). The pool listens here beside
+/// [`PROXY_PORT`], and a box's share counts its connections at both ports
+/// as one lane.
+pub const PROXY_TLS_PORT: u16 = 443;
+
+/// The ports the pool listens at, in the order an idle slot binds them.
+const POOL_PORTS: [u16; 2] = [PROXY_PORT, PROXY_TLS_PORT];
 
 /// The per-boot token's length in bytes: the shared secret the host daemon
 /// mints per boot and hands to the peer (in-process) and to the proxy's
@@ -828,6 +847,10 @@ impl BepWire {
 /// order a cap hit aborts against.
 struct Slot {
     handle: SocketHandle,
+    /// The idle slot's listener at the other pool port: `Some` while both
+    /// of the slot's sockets listen, `None` once the slot took a
+    /// connection at one of them ([`BepStack::settle_twins`]).
+    twin: Option<SocketHandle>,
     /// `Some` from the turn the socket took a connection to the turn the
     /// flow ends; `None` while the slot listens.
     activated: Option<u64>,
@@ -1008,7 +1031,7 @@ impl BepStack {
     ///    its first SYN is screened against the share that turn already
     ///    added, never against a sibling's, and the screen reads the
     ///    partition the pool actually holds;
-    /// 2. the inbound frames pre-screened: a SYN to [`PROXY_PORT`] whose
+    /// 2. the inbound frames pre-screened: a SYN to a pool port whose
     ///    source has no row, whose source MAC is not its address's
     ///    switch-derived MAC, or which already holds its cap's worth of
     ///    sockets, is refused with a reset before the interface ever
@@ -1046,11 +1069,104 @@ impl BepStack {
         self.reconcile();
         self.prescreen(now);
         self.host.poll(now);
+        self.settle_twins();
         self.dispatch_dials(now);
         self.enforce_caps(now);
         self.host.poll(now);
+        self.settle_twins();
         self.service();
         self.host.poll(now);
+        self.settle_twins();
+    }
+
+    /// Settle every idle slot whose sockets the stack's poll moved. A slot
+    /// whose socket at one port took a connection keeps that socket and
+    /// closes its listener at the other port. A slot whose two sockets both
+    /// took one in the same poll keeps the first and hands the second to
+    /// another idle slot, whose two listeners close: the pre-screen admits
+    /// no more connections than the pool has idle slots, so there is one.
+    /// A slot left listening at one port alone, because its connection
+    /// attempt fell back to listening, gets its other listener back.
+    fn settle_twins(&mut self) {
+        let mut spare: Vec<SocketHandle> = Vec::new();
+        for idx in 0..self.slots.len() {
+            if !matches!(self.slots[idx].flow, Flow::Listening) {
+                continue;
+            }
+            let handle = self.slots[idx].handle;
+            let first_taken = !self.socket_listens(handle);
+            match self.slots[idx].twin {
+                None if !first_taken => {
+                    let port = self.socket_port(handle);
+                    let other = POOL_PORTS
+                        .into_iter()
+                        .find(|p| Some(*p) != port)
+                        .unwrap_or(PROXY_TLS_PORT);
+                    self.slots[idx].twin = Some(self.add_listening(other));
+                }
+                None => {}
+                Some(twin) => match (first_taken, !self.socket_listens(twin)) {
+                    (false, false) => {}
+                    (true, false) => {
+                        self.host.sockets.remove(twin);
+                        self.slots[idx].twin = None;
+                    }
+                    (false, true) => {
+                        self.host.sockets.remove(handle);
+                        self.slots[idx].handle = twin;
+                        self.slots[idx].twin = None;
+                    }
+                    (true, true) => {
+                        self.slots[idx].twin = None;
+                        spare.push(twin);
+                    }
+                },
+            }
+        }
+        for extra in spare {
+            let idle = (0..self.slots.len()).find(|&idx| {
+                matches!(self.slots[idx].flow, Flow::Listening)
+                    && self.slots[idx]
+                        .twin
+                        .is_some_and(|twin| self.socket_listens(twin))
+                    && self.socket_listens(self.slots[idx].handle)
+            });
+            if let Some(idx) = idle {
+                let slot = &mut self.slots[idx];
+                let (handle, twin) = (slot.handle, slot.twin.take());
+                slot.handle = extra;
+                self.host.sockets.remove(handle);
+                if let Some(twin) = twin {
+                    self.host.sockets.remove(twin);
+                }
+            } else {
+                // The pre-screen keeps this from happening. If it does, the
+                // connection gets a slot of its own: the cap pass still
+                // bounds its box, and reconcile trims the slot once it is
+                // idle again.
+                tracing::warn!("box egress proxy pool: a connection took a slot past the shares");
+                self.slots.push(Slot {
+                    handle: extra,
+                    twin: None,
+                    activated: None,
+                    flow: Flow::Listening,
+                });
+            }
+        }
+    }
+
+    /// Whether the socket listens for a connection.
+    fn socket_listens(&self, handle: SocketHandle) -> bool {
+        self.host.sockets.get::<tcp::Socket>(handle).is_listening()
+    }
+
+    /// The port the socket listens at or carries a connection at.
+    fn socket_port(&self, handle: SocketHandle) -> Option<u16> {
+        let socket = self.host.sockets.get::<tcp::Socket>(handle);
+        socket
+            .local_endpoint()
+            .map(|local| local.port)
+            .or_else(|| Some(socket.listen_endpoint().port))
     }
 
     /// Rule on the inbound frames before the interface sees them. The
@@ -1065,7 +1181,7 @@ impl BepStack {
     /// without touching another's: the arms stay separate, never folded
     /// into one drop path.
     ///
-    /// A connection-opening SYN to [`PROXY_PORT`] at the leg's address is
+    /// A connection-opening SYN to a pool port at the leg's address is
     /// checked against its source's row: no row, no connection — the
     /// box-side answer to a source the registry does not hold. A SYN
     /// whose frame's source MAC is not its address's switch-derived MAC
@@ -1218,7 +1334,7 @@ impl BepStack {
             class,
             source: syn.source,
             address: Ipv4Addr::from(u32::from_be_bytes(self.host.ip().octets())),
-            about: refusal::About::Port(PROXY_PORT),
+            about: refusal::About::Port(syn.port),
         };
         // The pre-screen refuses a SYN it has parsed, so a reset is always
         // owed for this one.
@@ -1272,12 +1388,8 @@ impl BepStack {
         for addr in &desired {
             if !self.partition.contains(addr) {
                 for _ in 0..cap {
-                    let handle = self.add_listening();
-                    self.slots.push(Slot {
-                        handle,
-                        activated: None,
-                        flow: Flow::Listening,
-                    });
+                    let slot = self.listening_slot();
+                    self.slots.push(slot);
                 }
                 tracing::debug!(
                     box_addr = %addr,
@@ -1304,12 +1416,19 @@ impl BepStack {
         let target = self.partition.len() * cap;
         while self.slots.len() > target {
             let Some(idx) = (0..self.slots.len()).find(|&idx| {
-                matches!(self.slots[idx].flow, Flow::Listening) && self.slot_is_listening(idx)
+                matches!(self.slots[idx].flow, Flow::Listening)
+                    && self.slot_is_listening(idx)
+                    && self.slots[idx]
+                        .twin
+                        .is_none_or(|twin| self.socket_listens(twin))
             }) else {
                 break;
             };
             let handle = self.slots[idx].handle;
             self.host.sockets.remove(handle);
+            if let Some(twin) = self.slots[idx].twin {
+                self.host.sockets.remove(twin);
+            }
             self.slots.remove(idx);
         }
     }
@@ -1556,11 +1675,12 @@ impl BepStack {
     /// its window's one line, in the format every refusal leg uses
     /// (NET-133).
     fn refuse_without_attachment(&mut self, idx: usize, source: Ipv4Addr) {
+        let port = self.slot_local(idx).map_or(PROXY_PORT, |local| local.port);
         let refusal = refusal::Refusal {
             class: refusal::NO_ATTACHMENT,
             source,
             address: Ipv4Addr::from(u32::from_be_bytes(self.host.ip().octets())),
-            about: refusal::About::Port(PROXY_PORT),
+            about: refusal::About::Port(port),
         };
         // The abort is this refusal's reply, so it is charged to the
         // source's quota like the pre-screen's reset: a source that has
@@ -1603,8 +1723,20 @@ impl BepStack {
             .is_listening()
     }
 
-    /// Add a fresh listening socket at the proxy port and return its handle.
-    fn add_listening(&mut self) -> SocketHandle {
+    /// An idle slot: one listening socket at each pool port.
+    fn listening_slot(&mut self) -> Slot {
+        let [first, second] = POOL_PORTS;
+        Slot {
+            handle: self.add_listening(first),
+            twin: Some(self.add_listening(second)),
+            activated: None,
+            flow: Flow::Listening,
+        }
+    }
+
+    /// Add a fresh listening socket at `port` on the leg's address and
+    /// return its handle.
+    fn add_listening(&mut self, port: u16) -> SocketHandle {
         let mut socket = tcp::Socket::new(
             SocketBuffer::new(vec![0u8; POOL_BUFFER_LEN]),
             SocketBuffer::new(vec![0u8; POOL_BUFFER_LEN]),
@@ -1612,9 +1744,9 @@ impl BepStack {
         socket
             .listen(IpListenEndpoint {
                 addr: Some(IpAddress::Ipv4(self.host.ip())),
-                port: PROXY_PORT,
+                port,
             })
-            .expect("the proxy port is a fixed, nonzero port on the leg's own address");
+            .expect("a pool port is a fixed, nonzero port on the leg's own address");
         self.host.sockets.add(socket)
     }
 
@@ -1645,11 +1777,10 @@ impl BepStack {
     fn refresh_slot(&mut self, idx: usize) {
         let handle = self.slots[idx].handle;
         self.host.sockets.remove(handle);
-        self.slots[idx] = Slot {
-            handle: self.add_listening(),
-            activated: None,
-            flow: Flow::Listening,
-        };
+        if let Some(twin) = self.slots[idx].twin {
+            self.host.sockets.remove(twin);
+        }
+        self.slots[idx] = self.listening_slot();
     }
 }
 
@@ -1731,11 +1862,13 @@ struct ScreenedSyn {
     /// from. The admission check holds it to the address's switch-derived
     /// MAC, the pin records it on admission, and the refusal answers it.
     mac: EthernetAddress,
+    /// The pool port the connection is for.
+    port: u16,
 }
 
 impl ScreenedSyn {
     /// Recognize the frame the pool rules on: a TCP segment to
-    /// [`PROXY_PORT`] at `leg_ip` that opens a connection — SYN set, no
+    /// [`PROXY_PORT`] or [`PROXY_TLS_PORT`] at `leg_ip` that opens a connection — SYN set, no
     /// ACK — whose checksum verifies the way the interface will demand of
     /// everything it accepts. `None` for everything else, and the caller
     /// passes those through.
@@ -1761,7 +1894,7 @@ impl ScreenedSyn {
         .ok()?;
         if repr.control != TcpControl::Syn
             || repr.ack_number.is_some()
-            || repr.dst_port != PROXY_PORT
+            || !POOL_PORTS.contains(&repr.dst_port)
         {
             return None;
         }
@@ -1769,6 +1902,7 @@ impl ScreenedSyn {
             source,
             source_port: repr.src_port,
             mac,
+            port: repr.dst_port,
         })
     }
 
@@ -3749,6 +3883,107 @@ mod tests {
             2,
             "no header was presented for the source with no attachment"
         );
+    }
+
+    /// BEP-080: the proxy's address takes TCP at [`PROXY_TLS_PORT`] beside
+    /// [`PROXY_PORT`]. A connection at either port is delivered under its
+    /// own box's id, with the port the box dialed as the destination, and
+    /// a box's share counts its connections at both ports as one lane.
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn proxy_address_delivers_port_443_with_box_attribution() {
+        let (mut h, _proxy_sock, _token) = harness(1, Stall::None, true).await;
+        let subnet = SwitchSubnet::default();
+        let proxy_ip = subnet.box_egress_proxy_address();
+        let box_a = Ipv4Addr::from(subnet.first_ptask());
+        let box_b = Ipv4Addr::from(subnet.first_ptask() + 1);
+        h.boxes.register(box_a);
+        h.boxes.register(box_b);
+        drive(&mut h.lane, 2).await;
+        assert_eq!(h.lane.pool_len(), 2, "two boxes: two shares of one");
+        h.lane.add_box(box_a);
+        h.lane.add_box(box_b);
+        drive(&mut h.lane, 1).await;
+        h.lane.boxes_mut()[0].arp_for(proxy_ip);
+        h.lane.boxes_mut()[1].arp_for(proxy_ip);
+        drive(&mut h.lane, 3).await;
+
+        // In one turn, A dials 443 and B dials the listener's port: one
+        // idle slot's two listeners can take both, and each still gets a
+        // slot of its own.
+        let a_flow = h.lane.boxes_mut()[0].connect(proxy_ip, PROXY_TLS_PORT);
+        let b_flow = h.lane.boxes_mut()[1].connect(proxy_ip, PROXY_PORT);
+        drive(&mut h.lane, 40).await;
+
+        let accepted = h.acceptor.as_ref().expect("acceptor").accepted();
+        assert_eq!(accepted.len(), 2, "one connection per delivered flow");
+        let a_header = accepted
+            .iter()
+            .find(|header| header.source.addr == IpAddress::Ipv4(box_a))
+            .expect("A's flow at 443 was delivered");
+        let b_header = accepted
+            .iter()
+            .find(|header| header.source.addr == IpAddress::Ipv4(box_b))
+            .expect("B's flow at the listener's port was delivered");
+        assert_eq!(
+            a_header.box_id,
+            fixture_id(box_a),
+            "A's delivery carries A's id"
+        );
+        assert_eq!(
+            b_header.box_id,
+            fixture_id(box_b),
+            "B's delivery carries B's id"
+        );
+        assert_eq!(
+            a_header.destination,
+            IpEndpoint::new(IpAddress::Ipv4(proxy_ip), PROXY_TLS_PORT),
+            "the delivery names the port A dialed"
+        );
+        assert_eq!(
+            b_header.destination,
+            IpEndpoint::new(IpAddress::Ipv4(proxy_ip), PROXY_PORT)
+        );
+        for answer in [
+            read_flow(&mut h.lane, 0, a_flow, 8).await,
+            read_flow(&mut h.lane, 1, b_flow, 8).await,
+        ] {
+            assert!(
+                answer.starts_with(b"source="),
+                "the acceptor's answer arrived: {:?}",
+                String::from_utf8_lossy(&answer)
+            );
+        }
+        assert_eq!(h.lane.pool_len(), 2, "the shares stand");
+
+        // One lane: A holds its one connection at 443, so a second at the
+        // listener's port is past its share and is reset. Nothing more is
+        // delivered.
+        let past = h.lane.boxes_mut()[0].connect(proxy_ip, PROXY_PORT);
+        drive(&mut h.lane, 20).await;
+        assert_eq!(
+            h.lane.boxes()[0].flow_state(past),
+            State::Closed,
+            "a connection past the share at the other port is reset"
+        );
+        assert_eq!(h.acceptor.as_ref().expect("acceptor").accepted().len(), 2);
+        assert_eq!(
+            h.lane.boxes()[0].flow_state(a_flow),
+            State::Established,
+            "the admitted connection at 443 stands"
+        );
+
+        // When A's flow ends, its slot listens at both ports again.
+        h.lane.boxes_mut()[0].close(a_flow);
+        drive(&mut h.lane, 40).await;
+        let again = h.lane.boxes_mut()[0].connect(proxy_ip, PROXY_TLS_PORT);
+        drive(&mut h.lane, 40).await;
+        assert_eq!(
+            h.lane.boxes()[0].flow_state(again),
+            State::Established,
+            "the returned slot takes a new connection at 443"
+        );
+        assert_eq!(h.lane.pool_len(), 2, "the share never leaks away");
     }
 
     /// NET-132/T69: one box's exhaustion never starves a sibling — and

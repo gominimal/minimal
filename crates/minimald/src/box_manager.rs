@@ -100,6 +100,92 @@ pub(crate) fn refused_unenforceable_creates() -> u64 {
     REFUSED_UNENFORCEABLE_CREATES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The classifier tree and mount table a host-address create re-reads the
+/// host over, standing in for the real tree and the daemon's own mount table
+/// in a test that built a tree of its own. `None` in every production path.
+#[cfg(test)]
+pub(crate) static CREATE_CLASSIFIER_TREE_STANDIN: std::sync::Mutex<
+    Option<(std::path::PathBuf, String)>,
+> = std::sync::Mutex::new(None);
+
+/// The tree and mount table a create's re-read answers over: the constant
+/// tree every launch reads and the daemon's own mount table, read live
+/// (`None`), unless a test stood a tree in.
+fn create_classifier_tree() -> (std::path::PathBuf, Option<String>) {
+    #[cfg(test)]
+    if let Some((root, mountinfo)) = CREATE_CLASSIFIER_TREE_STANDIN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+    {
+        return (root, Some(mountinfo));
+    }
+    (
+        std::path::PathBuf::from(sandbox::classifier::TREE_ROOT),
+        None,
+    )
+}
+
+/// The host's classifier fact a create answers over (NET-079). Another
+/// mode's box reads the node fact as it stands. A host-address create reads
+/// it too, unless the stored fact says the probe could not read the table:
+/// that is the one cause a later read can clear without anything on the
+/// host changing (a daemon not yet placed in its leaf at start reads so),
+/// so the create re-reads the host rather than answer from a stale read.
+/// A re-read that does not run keeps the stored fact.
+// The create lines carry the fact as `host_fact`, never as
+// `host_ip_enforcement`: that field marks the per-launch classifier record,
+// and readers of the log take every line with it as a launch decision.
+async fn create_host_ip_fact(
+    network: boxes::NetworkMode,
+    session_name: &str,
+) -> crate::box_runtime::HostIpEnforcementFact {
+    let stored = crate::box_runtime::host_ip_enforcement_fact();
+    if !matches!(network, boxes::NetworkMode::HostNet) {
+        return stored;
+    }
+    if stored.cause != Some(crate::net::classifier::Cause::ProbeUnreadable) {
+        tracing::info!(
+            session_name,
+            reread = false,
+            host_fact = %stored.enforcement.machine_str(),
+            "host-address create answered from the stored classifier fact"
+        );
+        return stored;
+    }
+    let (root, mountinfo) = create_classifier_tree();
+    match crate::box_runtime::re_read_classifier_fact(
+        root,
+        mountinfo,
+        crate::guest::is_microvm_daemon(),
+    )
+    .await
+    {
+        Ok((_, decision)) => {
+            let fact = crate::box_runtime::host_ip_enforcement_fact();
+            tracing::info!(
+                session_name,
+                reread = true,
+                host_fact = %fact.enforcement.machine_str(),
+                cause = decision.cause().map(crate::net::classifier::Cause::detail),
+                "host-address create re-read the classifier fact the start-up \
+                 probe could not read"
+            );
+            fact
+        }
+        Err(e) => {
+            tracing::warn!(
+                session_name,
+                reread = false,
+                error = %e,
+                "host-address create could not re-read the classifier fact, \
+                 so it answers from the stored one"
+            );
+            stored
+        }
+    }
+}
+
 /// Assemble a [`boxes::Record`] from the out-of-band session
 /// config and the SSH-supplied username, then validate its policy.
 /// Returns `Err(io::InvalidInput)` if the policy is incompatible
@@ -439,16 +525,16 @@ impl BoxManagerHandle {
         async {
             let (send, recv) = Responder::channel();
             // Ignore send errors - the recv will also fail.
-            let _ = self.sender.send(ManagerMessage::Records(send)).await;
+            let _ = self.sender.send(ManagerMessage::Listing(send)).await;
             let records = recv
                 .await
                 .expect("corresponding sessions manager is dead")?;
             let mut boxes: Vec<_> = records
                 .iter()
-                .filter(|record| {
+                .filter(|(record, _)| {
                     project_root.is_none_or(|root| record.project_root.as_ref() == Some(root))
                 })
-                .map(box_listing_entry)
+                .map(|(record, pty)| box_listing_entry(record, *pty))
                 .collect();
             boxes.sort_by_key(|entry| entry.box_id);
             tracing::Span::current().record("count", boxes.len());
@@ -473,7 +559,7 @@ impl BoxManagerHandle {
         async {
             let (send, recv) = Responder::channel();
             // Ignore send errors - the recv will also fail.
-            let _ = self.sender.send(ManagerMessage::Records(send)).await;
+            let _ = self.sender.send(ManagerMessage::Listing(send)).await;
             let records = recv
                 .await
                 .expect("corresponding sessions manager is dead")?;
@@ -481,13 +567,12 @@ impl BoxManagerHandle {
             // guest's differs from its `id`), so that key wins.
             let record = records
                 .iter()
-                .find(|record| record.box_id == Some(id))
-                .or_else(|| records.iter().find(|record| record.id == id))
-                .cloned();
+                .find(|(record, _)| record.box_id == Some(id))
+                .or_else(|| records.iter().find(|(record, _)| record.id == id));
             tracing::Span::current().record("found", record.is_some());
             tracing::info!(session_id = %id, found = record.is_some(), "read a box record");
-            Ok(record.map(|record| minimald_rpc::ShowBoxResponse {
-                record: box_listing_entry(&record),
+            Ok(record.map(|(record, pty)| minimald_rpc::ShowBoxResponse {
+                record: box_listing_entry(record, *pty),
                 // BOX-140: no host this daemon runs on is enrolled with a
                 // Gatehouse, so every box reports the identity none.
                 identity: minimald_rpc::BoxIdentity::None,
@@ -639,7 +724,8 @@ impl BoxManagerHandle {
                     .await?
                     .ok_or_else(|| unknown_box(key))?;
             }
-            let reaped = box_listing_entry(&record);
+            // The reaped box has no terminal left to attach to.
+            let reaped = box_listing_entry(&record, false);
             let (send, recv) = Responder::channel();
             // A send error means the manager is gone: the recv fails as well.
             let _ = self.sender.send(ManagerMessage::ReapEnded(key, send)).await;
@@ -886,7 +972,8 @@ fn unknown_box(id: SessionId) -> BoxManagerError {
 /// state as BOX-011 spells it. A `stopped` or `exited` record whose stored
 /// ending is not a row of the BOX-011 table reports its status with the
 /// stored `reason`, `exit_code` and `signal` as they are.
-fn box_listing_entry(record: &boxes::Record) -> minimald_rpc::BoxListingEntry {
+/// `pty_enabled` is whether the box has a terminal ([`record_has_pty`]).
+fn box_listing_entry(record: &boxes::Record, pty_enabled: bool) -> minimald_rpc::BoxListingEntry {
     let (state, reason, exit_code, signal) = match record.state() {
         Ok(state) => (
             state.name(),
@@ -920,6 +1007,21 @@ fn box_listing_entry(record: &boxes::Record) -> minimald_rpc::BoxListingEntry {
         reason,
         exit_code,
         signal,
+        pty_enabled,
+    }
+}
+
+/// Whether a box has a terminal (BCLI-068): its stored spec sets
+/// `io.pty_enabled`, as the PTY check of a resume reads it (BOX-030). A box
+/// filed with no spec has only its Box Type to go by, and a session has a
+/// terminal, as the resume reads it too.
+pub(crate) fn record_has_pty(record: &boxes::Record, stored_spec: Option<&[u8]>) -> bool {
+    match stored_spec {
+        Some(bytes) => crate::box_runtime::stored_spec_sets_pty(bytes),
+        None => record
+            .box_type
+            .as_deref()
+            .is_none_or(|box_type| box_type == boxes::SESSION_BOX_TYPE),
     }
 }
 
@@ -953,6 +1055,9 @@ enum ManagerMessage {
     /// Every retained record, in any state (BOX-158). Read-only against
     /// the store: it starts no actor and probes no host.
     Records(Responder<Vec<boxes::Record>>),
+    /// [`Self::Records`], each record with whether its box has a terminal
+    /// ([`record_has_pty`]), for the listing and the read (BCLI-068).
+    Listing(Responder<Vec<(boxes::Record, bool)>>),
     GetRecord(BoxKeyPredicate, Responder<Option<boxes::Record>>),
     /// The retained box an events read follows (BOX-162): its on-disk
     /// object, so the read runs off the mainloop. `None` for an id no
@@ -1047,6 +1152,7 @@ impl ManagerMessage {
         match self {
             Self::List(..) => "List",
             Self::Records(..) => "Records",
+            Self::Listing(..) => "Listing",
             Self::GetRecord(..) => "GetRecord",
             Self::EventsSource(..) => "EventsSource",
             Self::EndedSource(..) => "EndedSource",
@@ -2285,7 +2391,8 @@ impl BoxManagerHandle {
 
     /// Stops the running box `id` and keeps its record (BOX-013, BOX-018),
     /// with the daemon's grace period between SIGTERM and SIGKILL. Answers
-    /// how the box ended.
+    /// how the box ended: stopped, or already exited when the entrypoint
+    /// returned first and the box ended on its own (BOX-038).
     ///
     /// # Errors
     ///
@@ -2296,18 +2403,65 @@ impl BoxManagerHandle {
         &self,
         id: SessionId,
         force: bool,
-    ) -> Result<boxes::core::record::StopEnding, BoxManagerError> {
-        self.stop_box_with_grace(id, force, crate::box_actor::STOP_GRACE)
+    ) -> Result<StopAnswer, BoxManagerError> {
+        self.stop_box_answer(id, force, crate::box_actor::STOP_GRACE)
             .await
     }
 
-    /// [`Self::stop_box`] with the grace period `grace`.
+    /// [`Self::stop_box`] with the grace period `grace`, for a caller that
+    /// needs the stop's own ending. A box whose entrypoint returned before
+    /// the stop ended it is refused with `InvalidInput`, as a box that is
+    /// not running is.
+    #[cfg(test)]
     pub(crate) async fn stop_box_with_grace(
         &self,
         id: SessionId,
         force: bool,
         grace: std::time::Duration,
     ) -> Result<boxes::core::record::StopEnding, BoxManagerError> {
+        match self.stop_box_answer(id, force, grace).await? {
+            StopAnswer::Stopped(ending) => Ok(ending),
+            StopAnswer::AlreadyExited(ending) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "session `{}` exited before the stop reached it ({ending:?})",
+                    id.as_ref()
+                ),
+            )),
+        }
+    }
+
+    /// [`Self::stop_box`] with the grace period `grace`. The `stop` span
+    /// records `outcome` as `stopped` or `already_exited`.
+    pub(crate) async fn stop_box_answer(
+        &self,
+        id: SessionId,
+        force: bool,
+        grace: std::time::Duration,
+    ) -> Result<StopAnswer, BoxManagerError> {
+        use tracing::Instrument as _;
+        let span = tracing::info_span!(
+            "stop",
+            session_id = %id,
+            force,
+            outcome = tracing::field::Empty,
+        );
+        let answer = self
+            .stop_box_answer_inner(id, force, grace)
+            .instrument(span.clone())
+            .await;
+        if let Ok(answer) = &answer {
+            span.record("outcome", answer.outcome());
+        }
+        answer
+    }
+
+    async fn stop_box_answer_inner(
+        &self,
+        id: SessionId,
+        force: bool,
+        grace: std::time::Duration,
+    ) -> Result<StopAnswer, BoxManagerError> {
         if self.in_shutdown.is_cancelled() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::ConnectionRefused,
@@ -2347,28 +2501,68 @@ impl BoxManagerHandle {
                 ));
             }
         }
+        #[cfg(test)]
+        stop_dispatch_seam::reached(id).await;
         tracing::info!(session_id = %id, force, "stop: dispatching to the session");
-        let session = self
-            .get_session(BoxKeyPredicate::Id(id))
-            .await?
-            .ok_or_else(unknown)?;
-        let stopped = session.stop_box(force, grace).await;
-        if stopped.is_err() {
-            // A stop that waited behind another stop of the same box finds
-            // the actor gone when the first one ends. The record then says
-            // how the box ended, and that is this stop's answer too.
-            if let Ok(Some(record)) = self.get_record(BoxKeyPredicate::Id(id)).await
-                && let Ok(boxes::core::record::RecordState::Stopped(ending)) = record.state()
-            {
+        let session = self.get_session(BoxKeyPredicate::Id(id)).await;
+        // The entrypoint can return between the read above and here, and
+        // its actor then ends the box as `exited` (BOX-038). A handle given
+        // out after that is a fresh actor with no host, whose stop would
+        // write a second ending over the first. Read the record again, so
+        // the box keeps the ending it already has.
+        if let Some(answer) = self.ended_while_stopping(id).await {
+            return Ok(answer);
+        }
+        let session = session?.ok_or_else(unknown)?;
+        match session.stop_box(force, grace).await {
+            Ok(ending) => {
                 tracing::info!(
                     session_id = %id,
+                    outcome = "stopped",
                     ending = ?ending,
-                    "stop: an earlier stop ended the box; answering with its ending"
+                    "stop: the stop ended the box"
                 );
-                return Ok(ending);
+                Ok(StopAnswer::Stopped(ending))
             }
+            // The actor ended before it took the stop: an earlier stop of
+            // the same box, or the entrypoint's own return, ended it. The
+            // record then says how the box ended, and that is this stop's
+            // answer too.
+            Err(error) => match self.ended_while_stopping(id).await {
+                Some(answer) => Ok(answer),
+                None => Err(error),
+            },
         }
-        stopped
+    }
+
+    /// The answer for a stop of `id` when the record says the box already
+    /// ended, as it does when another stop or the entrypoint's return
+    /// (BOX-038) ended it first. `None` while the box still runs, or when
+    /// the record cannot be read.
+    async fn ended_while_stopping(&self, id: SessionId) -> Option<StopAnswer> {
+        let record = self.get_record(BoxKeyPredicate::Id(id)).await.ok()??;
+        let answer = match record.state().ok()? {
+            boxes::core::record::RecordState::Stopped(ending) => StopAnswer::Stopped(ending),
+            boxes::core::record::RecordState::Exited(ending) => StopAnswer::AlreadyExited(ending),
+            _ => return None,
+        };
+        let state = answer.state();
+        match answer {
+            StopAnswer::Stopped(ending) => tracing::info!(
+                session_id = %id,
+                outcome = answer.outcome(),
+                ending = ?ending,
+                "stop: an earlier stop ended the box; answering with its ending"
+            ),
+            StopAnswer::AlreadyExited(ending) => tracing::info!(
+                session_id = %id,
+                outcome = answer.outcome(),
+                ending = ?ending,
+                exit_code = state.exit_code(),
+                "stop: the box already exited before the stop reached it; answering with its exit"
+            ),
+        }
+        Some(answer)
     }
 
     /// The state and directories of the box `id` when the box is stopped
@@ -2422,6 +2616,80 @@ impl BoxManagerHandle {
                 hooks: object.hooks_path(),
             },
         }))
+    }
+}
+
+/// The test seam for a stop that the entrypoint's return races (BOX-038):
+/// a test pauses the stop of one box after it read the record as running
+/// and before it reaches the box's actor. Keyed by box id, so tests running
+/// beside each other never pause each other's stops.
+#[cfg(test)]
+pub(crate) mod stop_dispatch_seam {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use boxes::SessionId;
+    use tokio::sync::oneshot;
+
+    type Pause = (oneshot::Sender<()>, oneshot::Receiver<()>);
+
+    static PAUSED: Mutex<Option<HashMap<SessionId, Pause>>> = Mutex::new(None);
+
+    /// Pauses the next stop of `id` at its dispatch. Answers a receiver
+    /// that fires when the stop reaches the pause, and the sender that
+    /// releases it.
+    pub(crate) fn pause(id: SessionId) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        PAUSED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(id, (reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+
+    /// Waits here when a test paused the stop of `id`.
+    pub(super) async fn reached(id: SessionId) {
+        let paused = PAUSED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .and_then(|p| p.remove(&id));
+        if let Some((reached, release)) = paused {
+            let _ = reached.send(());
+            let _ = release.await;
+        }
+    }
+}
+
+/// How a stop of a running box ended (BOX-013, BOX-038).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopAnswer {
+    /// The stop ended the box, or an earlier stop of it did.
+    Stopped(boxes::core::record::StopEnding),
+    /// The entrypoint returned before the stop could end the box, and the
+    /// box ended on its own: the record keeps that ending.
+    AlreadyExited(boxes::core::record::ExitEnding),
+}
+
+impl StopAnswer {
+    /// The record state this answer reports.
+    #[must_use]
+    pub const fn state(&self) -> boxes::core::record::RecordState {
+        match *self {
+            Self::Stopped(ending) => boxes::core::record::RecordState::Stopped(ending),
+            Self::AlreadyExited(ending) => boxes::core::record::RecordState::Exited(ending),
+        }
+    }
+
+    /// The `outcome` the stop span and the daemon log record.
+    #[must_use]
+    pub const fn outcome(&self) -> &'static str {
+        match self {
+            Self::Stopped(_) => "stopped",
+            Self::AlreadyExited(_) => "already_exited",
+        }
     }
 }
 
@@ -3048,9 +3316,10 @@ impl BoxManager {
         // declaration naming rules its classifier cannot enforce — a denied
         // range, a narrowing allow list — and refuses it here, before
         // anything is allocated: no record, no id, no name held, no actor
-        // spawned. The host's state is the daemon's one node fact, read
-        // exactly as the create response reads it — a create is not a place
-        // that decides a box, so it re-probes nothing itself — and the
+        // spawned. The host's state is the daemon's one node fact, as
+        // [`create_host_ip_fact`] returns it: the stored fact, except that
+        // a host-address create re-reads the host when the stored fact says
+        // the start-up probe could not read the table. The gate asks the
         // same `can_decide_per_box` the launch that follows re-reads for
         // its own gate; a host that cannot decide per box answers `false`
         // and the create falls through to the exception whole — the box is
@@ -3058,9 +3327,17 @@ impl BoxManager {
         // on this ground. Own-address boxes are untouched here: their
         // declarations are enforced on the address the box holds, so the
         // gate is the host-address mode's alone.
+        let host_ip_fact = create_host_ip_fact(
+            config.network,
+            config
+                .name
+                .as_deref()
+                .unwrap_or(crate::rpc::ANONYMOUS_SESSION),
+        )
+        .await;
         if let Some(rules) = crate::net::classifier::refuses_unenforceable_declaration(
             config.network,
-            crate::box_runtime::host_ip_enforcement_fact().can_decide_per_box(),
+            host_ip_fact.can_decide_per_box(),
             config.policy.egress.as_ref(),
         ) {
             let refusal = crate::net::classifier::unenforceable_declaration_refusal(&rules);
@@ -3140,8 +3417,17 @@ impl BoxManager {
         let mut config = config;
         let client_box_id = config.box_id.take();
         let switch_address = config.box_addresses.as_ref().map(|a| a.switch_address);
+        // BEP-082: a `host_ip` grant box has no row, and its registration
+        // minted its id under the box's name. See `host_ip_mint_name`.
+        let host_ip_name = host_ip_mint_name(&config);
         let control = crate::box_actor::switch_control_of(&self.net_switch).await;
-        let minted = match crate::net::listeners::mint_box_id(&control, switch_address).await {
+        let minted = match crate::net::listeners::mint_box_id(
+            &control,
+            switch_address,
+            host_ip_name.clone(),
+        )
+        .await
+        {
             None => None,
             Some(Ok(minted)) => Some(minted),
             Some(Err(error)) => {
@@ -3173,6 +3459,7 @@ impl BoxManager {
             tracing::info!(
                 box_id = %minted,
                 ?switch_address,
+                ?host_ip_name,
                 client_box_id = ?client_box_id,
                 "took the box id the VM host daemon minted; the request's box id is ignored"
             );
@@ -3480,6 +3767,42 @@ impl BoxManager {
                         if !tearing_down.contains(handle.id()) {
                             records.push(handle.record().await?);
                         }
+                    }
+                    Ok::<_, BoxManagerError>(records)
+                })
+                .await;
+            }
+            // Gets every retained record, as `Records` does, with whether
+            // the box's stored spec gives it a terminal.
+            ManagerMessage::Listing(r) => {
+                let tearing_down = self
+                    .tearing_down
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                r.handle(async {
+                    let mut records = Vec::new();
+                    for handle in self.store.handles().await? {
+                        if tearing_down.contains(handle.id()) {
+                            continue;
+                        }
+                        let record = handle.record().await?;
+                        // A spec that cannot be read leaves the Box Type
+                        // to go by, as for a box filed with no spec, so a
+                        // session still lists with its terminal.
+                        let stored = match handle.object().await.and_then(|o| o.load_spec()) {
+                            Ok(stored) => stored,
+                            Err(error) => {
+                                tracing::warn!(
+                                    session_id = %record.id,
+                                    %error,
+                                    "could not read the box's stored spec; terminal taken from its box type"
+                                );
+                                None
+                            }
+                        };
+                        let pty = record_has_pty(&record, stored.as_deref());
+                        records.push((record, pty));
                     }
                     Ok::<_, BoxManagerError>(records)
                 })
@@ -4700,6 +5023,78 @@ impl Drop for TearingDown {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.id);
+    }
+}
+
+/// The name a box's id mint asks the VM host daemon to answer from a
+/// registration (BEP-082), or `None` for a fresh mint.
+///
+/// Only a `host_ip` box with no box addresses and a declared credentialed
+/// upstream registered under its name, so only that box sends the name.
+/// A `host_ip` box with no grant registered nothing. If it sent its name, it
+/// could take the id of another live box that registered the same name.
+fn host_ip_mint_name(config: &minimald_rpc::BoxConfig) -> Option<String> {
+    let grant_box = matches!(config.network, boxes::NetworkMode::HostNet)
+        && config.box_addresses.is_none()
+        && config.policy.credentialed_upstream.is_some();
+    if grant_box { config.name.clone() } else { None }
+}
+
+#[cfg(test)]
+mod host_ip_mint_name_tests {
+    use super::host_ip_mint_name;
+    use std::net::Ipv4Addr;
+
+    fn config(network: boxes::NetworkMode) -> minimald_rpc::BoxConfig {
+        minimald_rpc::BoxConfig {
+            name: Some("agent".to_string()),
+            project_path: paths::HostAbsPath::try_new("/work/project").unwrap(),
+            network,
+            policy: Default::default(),
+            task_addresses: Vec::new(),
+            box_id: None,
+            box_addresses: None,
+            hooks_enabled: true,
+            ends_with_run: false,
+            attrs: Default::default(),
+            sealed_deliveries: Vec::new(),
+            root_certificate: None,
+            creating_verb: minimald_rpc::CreatingVerb::Session,
+            project_root: None,
+        }
+    }
+
+    fn with_upstream(mut config: minimald_rpc::BoxConfig) -> minimald_rpc::BoxConfig {
+        config.policy.credentialed_upstream = Some(boxes::CredentialedUpstream::default());
+        config
+    }
+
+    // BEP-082: a `host_ip` box with no grant registered nothing, so its
+    // mint is a fresh one.
+    #[test]
+    fn host_ip_box_record_takes_the_registration_id_only_with_a_grant() {
+        assert_eq!(
+            host_ip_mint_name(&config(boxes::NetworkMode::HostNet)),
+            None
+        );
+    }
+
+    // BEP-082: a `host_ip` grant box asks for the id its registration minted.
+    #[test]
+    fn host_ip_box_record_takes_the_registration_id_of_a_grant_box() {
+        let config = with_upstream(config(boxes::NetworkMode::HostNet));
+        assert_eq!(host_ip_mint_name(&config), Some("agent".to_string()));
+    }
+
+    // BEP-082: a box with addresses takes its id from its row, never a name.
+    #[test]
+    fn host_ip_box_record_takes_the_registration_id_never_for_a_row_box() {
+        let mut config = with_upstream(config(boxes::NetworkMode::HostNet));
+        config.box_addresses = Some(minimald_rpc::BoxAddresses {
+            switch_address: Ipv4Addr::new(100, 64, 0, 21),
+            loopback_address: Ipv4Addr::new(127, 0, 0, 21),
+        });
+        assert_eq!(host_ip_mint_name(&config), None);
     }
 }
 

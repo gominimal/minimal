@@ -349,6 +349,19 @@ fn refuse_unhonourable_grants(
     Ok(plan.warnings)
 }
 
+/// Whether the activation holds the box's name on the VM host daemon once
+/// the box is active. A `host_ip` box holds it for the zone (NET-128). A
+/// `none` box holds it so the host can name the box by its id when the
+/// in-VM daemon reports an expose decision (NET-046). An own-address box
+/// has a row, and a native host has no VM host daemon.
+pub(crate) fn holds_name_with_vm_host(kind: paths::HostKind, network: boxes::NetworkMode) -> bool {
+    kind == paths::HostKind::Minvmd
+        && matches!(
+            network,
+            boxes::NetworkMode::HostNet | boxes::NetworkMode::NoNet
+        )
+}
+
 /// Whether a box with `network` on a host of `kind` has its lookups go
 /// through a switch that steers the credential module's names (BEP-017,
 /// BEP-062). This is a host fact and does not read the steering. On the VM
@@ -358,11 +371,8 @@ fn refuse_unhonourable_grants(
 /// has no proxy, so a steered name there always fails closed, and a
 /// `host_ip` or `none` box has no steered lookups of its own. `min box
 /// spec` reads it for the network its `--network` flag names. Where this
-/// is true, `dns` steering is still refused on its own grounds until the proxy
-/// takes a direct TLS connection (#2805). Under `both`, a tool that
-/// ignores `HTTPS_PROXY` gets the proxy's address, and the switch drops its
-/// TCP connection to port 443 with no reset, so it stalls until #2805 adds
-/// the direct TLS path.
+/// is true, a `dns`-steered box opens TLS to the proxy's address on port
+/// 443, and the proxy routes it by its SNI (BEP-080).
 pub(crate) fn host_resolves_box_names(kind: paths::HostKind, network: boxes::NetworkMode) -> bool {
     kind == paths::HostKind::Minvmd && network == boxes::NetworkMode::OwnIp
 }
@@ -1422,6 +1432,35 @@ enum UploadPlan {
     },
 }
 
+/// The refusal when the VM gave a `host_ip` grant box an id other than the
+/// one its registration minted (BEP-082).
+const REGISTERED_ID_MISMATCH: &str = "No session was created. The VM gave the new session \
+     an id other than the one reserved for it. Run the command again.";
+
+/// Checks that the box the daemon created carries the id a `host_ip`
+/// registration minted, byte for byte (BEP-082). A box with no `host_ip`
+/// registration, or a registration with no id, has nothing to check.
+fn ensure_registered_id(
+    registered: Option<&minimal_client::box_registration::RegisteredWithVmHost>,
+    created: boxes::SessionId,
+) -> anyhow::Result<()> {
+    let Some(minted) = registered
+        .filter(|registration| registration.host_ip)
+        .and_then(|registration| registration.box_id)
+    else {
+        return Ok(());
+    };
+    if minted.to_bytes() == created.to_bytes() {
+        return Ok(());
+    }
+    tracing::warn!(
+        registered_box_id = %minted,
+        created_box_id = %created,
+        "refused a host_ip box whose record id is not its registration's id"
+    );
+    Err(anyhow::anyhow!(REGISTERED_ID_MISMATCH))
+}
+
 pub(crate) async fn activate_box(
     global: &GlobalArgs,
     args: ActivateArgs,
@@ -1787,6 +1826,9 @@ pub(crate) async fn activate_box(
     // row of its own — its name is held in the zone instead (NODATA) once
     // the session is active, below — and a `none` box, or a native daemon
     // with no box table, registers nothing and attaches as it always has.
+    // A `host_ip` box that declares a credentialed upstream registers for
+    // its box id alone (BEP-082): the host mints the id and hands it no
+    // address, and the proxy serves the box's grants under that id.
     // A registration that cannot be made ends the activation here, with its
     // cause: no session exists yet to clean up, and a box that went on to
     // create unregistered would run with no host-side row to decide its
@@ -1839,7 +1881,14 @@ pub(crate) async fn activate_box(
             // The registration is the client's record of the box: the addresses
             // the create carries, and the id the host minted for it (NET-133).
             // The id stays here: the create relays none (BOX-002).
-            carry_registration(&mut request.config, registered.as_ref());
+            // A `host_ip` registration has an id and no row, so it carries
+            // no addresses onto the create.
+            carry_registration(
+                &mut request.config,
+                registered
+                    .as_ref()
+                    .filter(|registration| !registration.host_ip),
+            );
             Ok::<_, anyhow::Error>(registered)
         })
         .await?;
@@ -1962,6 +2011,22 @@ pub(crate) async fn activate_box(
                 .await;
                 return Err(error);
             }
+            // BEP-082: a `host_ip` grant box's grants are sealed under the id
+            // its registration minted. A record under another id is a box
+            // the proxy cannot serve, so the activation ends fail-closed, as
+            // the version check above does.
+            if let Err(error) = ensure_registered_id(registered.as_ref(), created.id) {
+                withdraw_box_row(
+                    control_sock.clone(),
+                    box_name.as_deref(),
+                    request.config.box_addresses,
+                    registered
+                        .as_ref()
+                        .and_then(|registration| registration.box_id),
+                )
+                .await;
+                return Err(error);
+            }
             Ok::<_, anyhow::Error>(created)
         })
         .await?;
@@ -1981,12 +2046,15 @@ pub(crate) async fn activate_box(
     // box runs anything (NET-085): the host gate decides every frame the box
     // sends from the node's own address by the admitted policies, and drops
     // a box's frames that none admits. The guard retires it unless the
-    // session outlives this activation.
-    let mut host_ip_residency = HostIpResidency::admit(
+    // session outlives this activation. The admit carries the box's lane
+    // declaration (BEP-083), so a grant box reaches the proxy's listener
+    // from its first process on.
+    let mut host_ip_residency = HostIpResidency::admit_declaring(
         control_sock.clone(),
         id,
         request.config.network,
         request.config.policy.egress.as_ref(),
+        request.config.policy.credentialed_upstream.is_some(),
     )
     .await;
     ActivationStep::ReportStart
@@ -2012,10 +2080,8 @@ pub(crate) async fn activate_box(
                     )
                 );
             }
-            warn_if_hostname_routing_down(
-                created.hostname_routing_unavailable.as_deref(),
-                "min session activate",
-            );
+            // NET-020: no warning line of its own. The `names:` line below
+            // carries the cause in place of its resolution clause, once.
             // NET-122/NET-123/NET-138: the naming lines, printed once per session
             // start — after the create, and re-surfaced when the daemon reports this
             // session at the 127.0.0.1 interim because its session-start bind
@@ -2240,6 +2306,12 @@ pub(crate) async fn activate_box(
                 // it is not mirrored onto `127.0.0.1` and only the proxy
                 // reaches it, which `min ls` reads as the fallback as well.
                 let at_own_address = !created.interim_loopback;
+                if proxy_cause.is_some() {
+                    tracing::debug!(
+                        surface = "min session activate names: line",
+                        "printed the hostname-routing cause"
+                    );
+                }
                 eprintln!(
                     "{}",
                     crate::resolver::host_line_beside(
@@ -2308,6 +2380,15 @@ pub(crate) async fn activate_box(
     // prompt tears it down instead of orphaning it in `Pending` — see
     // [`ActivationInterrupt`]. Disarmed once the session is `Active`.
     let interrupt_guard = arm_activation_interrupt(global, id);
+    // A `host_ip` box has no pair on its record, so a Ctrl-C withdraws its
+    // name by the id its registration handed back (BEP-082).
+    if let Some(box_id) = registered
+        .as_ref()
+        .filter(|registration| registration.host_ip)
+        .and_then(|registration| registration.box_id)
+    {
+        interrupt_guard.withdraw_host_ip_name_as(box_id);
+    }
 
     // Upload the project directory to the daemon so the session
     // workspace holds the user's files — `ConfigureLoadout`'s compose
@@ -2642,8 +2723,7 @@ pub(crate) async fn activate_box(
                 // A kept session is active: it gets the `host_ip` name hold
                 // an activation that succeeded makes below.
                 if outcome == CleanupOutcome::Kept
-                    && kind == paths::HostKind::Minvmd
-                    && request.config.network == boxes::NetworkMode::HostNet
+                    && holds_name_with_vm_host(kind, request.config.network)
                     && let Some(name) = box_name.as_deref()
                 {
                     hold_box_name_with_vm_host(control_sock.clone(), name, Some(id), true).await;
@@ -2696,10 +2776,19 @@ pub(crate) async fn activate_box(
     // attaches to or execs into is dropped once the daemon's reconfirm
     // bound passes, and the name answers NXDOMAIN until the session's
     // next attach or exec.
+    //
+    // A `none` box on a VM host takes the same hold (NET-046): it has no
+    // switch row, so the hold is the host's one record of its box id, and
+    // the in-VM daemon's expose decision report names the box by that id.
+    // Its name answers NODATA, as a `host_ip` box's does while it is not
+    // resident. `min session destroy` and the dashboard's destroy release
+    // it, `min session rename` moves it, and an attach or exec re-holds it
+    // after a VM host daemon restart, because `holds_name` (vm_host.rs) is
+    // true for a `none` box as for a `host_ip` box. An unnamed `none` box
+    // holds nothing, and the host refuses its report.
     ActivationStep::HoldName
         .run(async {
-            if kind == paths::HostKind::Minvmd
-                && request.config.network == boxes::NetworkMode::HostNet
+            if holds_name_with_vm_host(kind, request.config.network)
                 && let Some(name) = box_name.as_deref()
             {
                 hold_box_name_with_vm_host(control_sock.clone(), name, Some(id), true).await;
@@ -3157,6 +3246,128 @@ mod tests {
         assert!(
             !attachments.holds_id(id.to_bytes()),
             "the withdrawn box's id is held by no attachment"
+        );
+    }
+
+    /// BEP-082: a `host_ip` grant box whose record takes another id than
+    /// its registration's is refused with this text. A matching id, a box
+    /// with no `host_ip` registration, and a registration with no id pass.
+    #[test]
+    fn host_ip_grant_box_with_another_id_is_refused() {
+        let minted = minimald_rpc::BoxId::from_bytes(*b"0123456789abcdef");
+        let registration =
+            |host_ip: bool, box_id| minimal_client::box_registration::RegisteredWithVmHost {
+                addresses: boxes::BoxAddresses {
+                    switch_address: std::net::Ipv4Addr::UNSPECIFIED,
+                    loopback_address: std::net::Ipv4Addr::UNSPECIFIED,
+                },
+                host_ip,
+                box_id,
+                task_addresses: Vec::new(),
+                lease: None,
+            };
+        let same = boxes::SessionId::from_bytes(minted.to_bytes());
+        let other = boxes::SessionId::from_bytes(*b"fedcba9876543210");
+        let host_ip = registration(true, Some(minted));
+        assert!(ensure_registered_id(Some(&host_ip), same).is_ok());
+        let refused = ensure_registered_id(Some(&host_ip), other)
+            .expect_err("another id ends the activation");
+        assert_eq!(
+            refused.to_string(),
+            "No session was created. The VM gave the new session an id other than the \
+             one reserved for it. Run the command again."
+        );
+        assert!(ensure_registered_id(None, other).is_ok());
+        assert!(ensure_registered_id(Some(&registration(true, None)), other).is_ok());
+        assert!(ensure_registered_id(Some(&registration(false, Some(minted))), other).is_ok());
+    }
+
+    /// BEP-082: a GitHub grant box with `--network host_ip` on a VM host
+    /// registers for a box id, with no address and no row in the host's
+    /// address table. With that id the proxy serves it, so the grant check
+    /// gives its id and its `host_ip` stance, not the refusal that says no
+    /// proxy serves boxes on this machine. A `host_ip` box that declares no
+    /// credentialed upstream registers nothing.
+    #[tokio::test]
+    async fn host_ip_grant_box_on_vm_host_is_not_refused_as_unserved() {
+        use minimal_client::box_registration::register_box_for_activation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let host_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        let sock_path = host_dir.join("control.sock");
+        let registry = minvmd::box_registry::BoxRegistry::new(switch::SwitchSubnet::default());
+        let _server = minvmd::control::spawn(
+            sock_path.clone(),
+            registry.clone(),
+            minvmd::net::answerer::AnswererStatus::allocating_for_tests("host-ip-grant-node"),
+            minvmd::control::ProxyPublishStatus::default(),
+        )
+        .expect("the control server binds its socket");
+
+        let grant_policy = boxes::BoxPolicy {
+            credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
+            ..boxes::BoxPolicy::default()
+        };
+        let registered = register_box_for_activation(
+            paths::HostKind::Minvmd,
+            Some(dir.path()),
+            boxes::NetworkMode::HostNet,
+            "agent",
+            &grant_policy,
+        )
+        .await
+        .expect("the control server answers the registration")
+        .expect("a host_ip grant box on a VM host registers");
+        assert!(registered.host_ip);
+        assert_eq!(registered.row_addresses(), None, "the box has no row");
+        assert!(registered.lease.is_none(), "no row, so no lease to hold");
+        let id = registered.box_id.expect("the host minted an id");
+        assert!(registry.holds_host_ip_id(id.to_bytes()));
+        assert!(
+            registry.table().rows().is_empty(),
+            "the registration put no row in the address table"
+        );
+
+        let facts = proxy_box_facts(
+            &["GH_TOKEN".to_owned()],
+            &[],
+            Some(id.to_string()),
+            boxes::NetworkMode::HostNet,
+        )
+        .expect("a host_ip grant box with an id is served");
+        assert_eq!(
+            facts,
+            Some((id.to_string(), bep::boxes::Stance::HostIp)),
+            "the grant is served under the minted id and the host_ip stance"
+        );
+
+        // A host_ip box that declares no upstream needs no id.
+        assert!(
+            register_box_for_activation(
+                paths::HostKind::Minvmd,
+                Some(dir.path()),
+                boxes::NetworkMode::HostNet,
+                "plain",
+                &boxes::BoxPolicy::default(),
+            )
+            .await
+            .expect("nothing to register is no failure")
+            .is_none()
+        );
+        // With no id, the refusal still prints: no proxy serves the box.
+        let refused = proxy_box_facts(
+            &["GH_TOKEN".to_owned()],
+            &[],
+            None,
+            boxes::NetworkMode::HostNet,
+        )
+        .expect_err("no box id, so no proxy serves the box");
+        assert!(
+            refused
+                .to_string()
+                .starts_with("Cannot create the box: it declares the GitHub grant GH_TOKEN, and "),
+            "{refused}"
         );
     }
 
@@ -3807,12 +4018,35 @@ mod tests {
         assert_eq!(refused.exit_code(), 3);
     }
 
-    /// BEP-017, BEP-062: a GitHub grant box with `both` steering is created
-    /// where the VM host's switch resolves its names, and `min box spec`
-    /// shows it. There, `dns`, declared or by default, is refused with exit
-    /// 3 and a text that names the proxy, not the host, until the proxy
-    /// takes a direct TLS connection (#2805). On a native host, and for a
-    /// `host_ip` box, both are refused for the missing resolver. For every
+    /// NET-046: a `none` box on a VM host holds its name with the host, as
+    /// a `host_ip` box does, so the host can name it by its box id.
+    #[test]
+    fn none_box_holds_its_name_with_the_vm_host() {
+        use boxes::NetworkMode;
+        use paths::HostKind;
+        assert!(holds_name_with_vm_host(
+            HostKind::Minvmd,
+            NetworkMode::NoNet
+        ));
+        assert!(holds_name_with_vm_host(
+            HostKind::Minvmd,
+            NetworkMode::HostNet
+        ));
+        assert!(!holds_name_with_vm_host(
+            HostKind::Minvmd,
+            NetworkMode::OwnIp
+        ));
+        assert!(!holds_name_with_vm_host(
+            HostKind::Minimald,
+            NetworkMode::NoNet
+        ));
+    }
+
+    /// BEP-017, BEP-062, BEP-080: a GitHub grant box with `dns` steering,
+    /// declared or by default, or with `both`, is created where the VM
+    /// host's switch resolves its names, and `min box spec` shows it. On a
+    /// native host, and for a `host_ip` box, both are refused for the
+    /// missing resolver. For every
     /// case, `min box spec` refuses exactly when creation does, with the
     /// same text.
     #[test]
@@ -3866,10 +4100,6 @@ mod tests {
                 "This box declares a secret with steering = \"{word}\", but this host \
                  has no box DNS resolver. Set steering = \"proxy_env\" in [network.bep]."
             );
-            let no_direct_tls = "This box declares a secret with steering = \"dns\", but the \
-                 Box Egress Proxy does not yet take a direct TLS connection, so dns steering \
-                 cannot reach it. Set steering = \"both\" or steering = \"proxy_env\" in \
-                 [network.bep].";
 
             for (kind, network) in [
                 (HostKind::Minvmd, boxes::NetworkMode::OwnIp),
@@ -3877,12 +4107,8 @@ mod tests {
                 (HostKind::Minvmd, boxes::NetworkMode::HostNet),
             ] {
                 let resolver = host_resolves_box_names(kind, network);
-                let accepted = word == "both" && resolver;
-                let refusal = if resolver {
-                    no_direct_tls
-                } else {
-                    no_resolver.as_str()
-                };
+                let accepted = resolver;
+                let refusal = no_resolver.as_str();
                 let case = format!("{word} {kind:?} {network:?}");
 
                 let created = refuse_unhonourable_grants(
@@ -3921,7 +4147,10 @@ mod tests {
                     let warnings = created.unwrap_or_else(|err| panic!("{case}: accepted: {err}"));
                     assert!(warnings.is_empty(), "{case}: no warning: {warnings:?}");
                     let text = String::from_utf8(out).expect("utf-8");
-                    assert!(text.contains("steering  both\n"), "{case}: {text}");
+                    assert!(
+                        text.contains(&format!("steering  {word}\n")),
+                        "{case}: {text}"
+                    );
                     continue;
                 }
                 for err in [
@@ -3988,15 +4217,19 @@ mod tests {
                     assert_eq!(created, previewed, "{case}: same refusal");
 
                     let own_ip_on_vm_host = kind == HostKind::Minvmd && flag == Some("own_ip");
-                    if word == "both" && own_ip_on_vm_host {
+                    if own_ip_on_vm_host {
                         // On the VM host, `min box spec --network own_ip`
-                        // admits a `both` spec with a credentialed upstream.
+                        // admits a `dns` or `both` spec with a credentialed
+                        // upstream.
                         assert_eq!(previewed, Ok(()), "{case}: admitted");
                         let text = String::from_utf8(out).expect("utf-8");
-                        assert!(text.contains("steering  both\n"), "{case}: {text}");
-                    } else if word == "both" {
+                        assert!(
+                            text.contains(&format!("steering  {word}\n")),
+                            "{case}: {text}"
+                        );
+                    } else {
                         // Any other mode or host has no steered lookups of
-                        // its own, so `both` is refused for the missing
+                        // its own, so the spec is refused for the missing
                         // resolver. That includes no flag at all, as a
                         // default activation is refused. A `none` box is
                         // also refused for its missing network.
@@ -4007,8 +4240,6 @@ mod tests {
                         } else {
                             assert_eq!(refused, no_resolver, "{case}");
                         }
-                    } else {
-                        assert!(previewed.is_err(), "{case}: dns is refused");
                     }
                 }
             }

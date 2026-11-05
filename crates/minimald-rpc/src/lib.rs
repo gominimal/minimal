@@ -24,6 +24,14 @@ pub use boxes::{
 
 pub const RPC_SUBSYSTEM_PREFIX: &str = "minimald-v1-";
 
+/// The daemon's grace period between a stop's SIGTERM and its SIGKILL
+/// (BOX-013). A client that waits for a stop to land waits this long.
+pub const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The bound on one host probe the daemon makes. A stop waits this long
+/// again after its last signal for the entrypoint to be reaped.
+pub const HOST_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// The message every RPC refusal carries once the daemon has begun its
 /// shutdown: a client racing `min stop` matches on it to name the lost race
 /// in plain language instead of surfacing the raw RPC chain. Matching keys
@@ -766,6 +774,13 @@ pub struct RegisterBoxRequest {
     /// registers none.
     #[serde(default)]
     pub task_slots: u8,
+    /// Whether the box is a `host_ip` box (BEP-082). The host mints a box
+    /// id for it and allocates no address: it has no row in the address
+    /// table, and the reply is [`BoxControlReply::BoxIdMinted`]. `false`,
+    /// the default and what a client that predates the field sends, is an
+    /// own-address registration.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host_ip: bool,
 }
 
 /// The one line a held registration's client writes on the lease
@@ -924,6 +939,14 @@ pub struct MintBoxIdRequest {
     /// (or none) for a claimed row is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub create_token: Option<String>,
+    /// The creation name of a `host_ip` box: a box that leaves the VM from
+    /// the node's own address and has no switch address. The VM host daemon
+    /// answers with the id the box's `host_ip` registration minted under
+    /// that name, so the record and the sealed grants name one id
+    /// (BEP-082). A name with no registration takes a fresh mint. `None`
+    /// from an older in-VM daemon, and for every other box.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_ip_name: Option<String>,
 }
 
 /// A name to hold in the host's zone without a row behind it
@@ -963,6 +986,12 @@ pub struct HostIpBoxRequest {
     /// request's policy carries. The host fills it under its own phase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress: Option<EgressPolicy>,
+    /// Whether the box declares a credentialed upstream (BEP-083): `true`
+    /// opens the cohort's lane to the Box Egress Proxy's listener while the
+    /// box is resident. `false`, the default and what a client that
+    /// predates the field sends, declares no lane.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub credentialed_upstream: bool,
 }
 
 /// The session whose `host_ip` box left the VM host's resident set
@@ -1114,12 +1143,23 @@ pub enum ExposeDecisionOutcome {
 ///
 /// Fixed and size-bounded like the port reports: the row key, the port, and
 /// three closed enums. The box is named by the host from the row at
-/// `switch_address`, never by a string the guest sends. A report keyed at
-/// no row is refused and leaves no record.
+/// `switch_address`, never by a string the guest sends. A box with no
+/// switch has no row key, so its report carries its box id instead, and
+/// the host names the box from what it holds under that id. A report keyed
+/// at no box the host holds is refused and leaves no record.
+///
+/// Both keys are serde-defaulted, so an older guest's report, which always
+/// carries a switch address and never a box id, still reads.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExposeDecisionReport {
-    /// The switch address of the row the decision is about.
-    pub switch_address: std::net::Ipv4Addr,
+    /// The switch address of the row the decision is about. `None` for a
+    /// box with no switch, which [`Self::box_id`] names instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_address: Option<std::net::Ipv4Addr>,
+    /// The box the decision is about, by its id. The host reads it only
+    /// when the report carries no switch address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub box_id: Option<BoxId>,
     /// The port the box asked to publish.
     pub port: u16,
     /// The decision the box's `dynamic_ingress` setting made.
@@ -2027,8 +2067,9 @@ pub enum BoxControlReply {
         audited: bool,
     },
     /// The mint verb's answer (BOX-002): the id the VM host daemon minted
-    /// for the box the in-VM daemon is about to create. `minted_box_id` is
-    /// required — the marker that keeps this document from decoding as any
+    /// for the box the in-VM daemon is about to create. It is also the
+    /// answer to a `host_ip` registration ([`RegisterBoxRequest::host_ip`]):
+    /// the box's id, with no address. `minted_box_id` is required — the marker that keeps this document from decoding as any
     /// other reply.
     BoxIdMinted {
         /// The box's id. The in-VM daemon files the box's record under it.
@@ -2669,6 +2710,12 @@ pub struct StopBoxResponse {
     /// of the stop ended it.
     #[serde(default)]
     pub signal: Option<i32>,
+    /// The entrypoint returned before the stop could end the box, so the
+    /// box already exited on its own and the stop changed nothing.
+    /// `exit_code` is then that exit's code. Absent, as from a daemon that
+    /// does not send it, the stop ended the box.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub already_exited: bool,
 }
 
 impl OneshotSshRpc for StopBox {
@@ -2722,6 +2769,11 @@ pub struct BoxListingEntry {
     /// The number of the signal that ended a stopped box.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal: Option<i32>,
+    /// Whether the box's stored spec sets `io.pty_enabled`, so a client can
+    /// attach a terminal to it (BCLI-068). A daemon that predates the field
+    /// sends none, and the box reads as one with no terminal.
+    #[serde(default)]
+    pub pty_enabled: bool,
 }
 
 /// The response for a [`ListBoxes`] RPC.
@@ -3810,10 +3862,17 @@ mod stop_box_tests {
             StopBoxResponse {
                 exit_code: None,
                 signal: Some(15),
+                already_exited: false,
             },
             StopBoxResponse {
                 exit_code: Some(0),
                 signal: None,
+                already_exited: false,
+            },
+            StopBoxResponse {
+                exit_code: Some(3),
+                signal: None,
+                already_exited: true,
             },
             StopBoxResponse::default(),
         ];
@@ -3848,6 +3907,7 @@ mod box_listing_tests {
             reason: None,
             exit_code: None,
             signal: None,
+            pty_enabled: true,
         }
     }
 
@@ -3900,6 +3960,14 @@ mod box_listing_tests {
             Errorable::Ok(back) => assert_eq!(back, show),
             Errorable::Err { error } => panic!("the read reply read back as an error: {error}"),
         }
+        // BCLI-068: a record from a daemon that predates `pty_enabled`
+        // reads as a box with no terminal.
+        let older: BoxListingEntry = serde_json_lenient::from_str(&format!(
+            r#"{{"box_id":"{}","state":"running"}}"#,
+            show.record.box_id
+        ))
+        .unwrap();
+        assert!(!older.pty_enabled);
         // The identity none serialises with the name BOX-140 reports.
         assert_eq!(
             serde_json_lenient::to_string(&BoxIdentity::None).unwrap(),
@@ -3935,6 +4003,12 @@ mod mint_box_id_tests {
             BoxControlRequest::MintBoxId(MintBoxIdRequest {
                 switch_address: Some(std::net::Ipv4Addr::new(100, 64, 0, 7)),
                 create_token: Some("create-1".to_string()),
+                host_ip_name: None,
+            }),
+            BoxControlRequest::MintBoxId(MintBoxIdRequest {
+                switch_address: None,
+                create_token: Some("create-2".to_string()),
+                host_ip_name: Some("agent".to_string()),
             }),
         ] {
             let line = serde_json_lenient::to_string(&request).unwrap();
@@ -3948,6 +4022,14 @@ mod mint_box_id_tests {
         .unwrap();
         assert!(!bare.contains("switch_address"), "{bare}");
         assert!(!bare.contains("create_token"), "{bare}");
+        assert!(!bare.contains("host_ip_name"), "{bare}");
+        // An older in-VM daemon's ask carries no name, and decodes as none.
+        let older: BoxControlRequest =
+            serde_json_lenient::from_str(r#"{"verb":"mint_box_id","create_token":"c"}"#).unwrap();
+        let BoxControlRequest::MintBoxId(older) = older else {
+            panic!("decoded as another verb: {older:?}");
+        };
+        assert_eq!(older.host_ip_name, None);
 
         let reply = BoxControlReply::BoxIdMinted {
             minted_box_id: BoxId::mint(),

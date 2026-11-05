@@ -360,20 +360,11 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
         let vmm_owned = state.vmm_pid.is_some_and(vmm_owned_by_live_supervisor);
         match classify_detach_poll(ready, child_status, daemon_alive, state.vmm_pid, vmm_owned) {
             DetachPoll::Ready => return Ok(()),
-            DetachPoll::Failed(status) => {
-                // A start that failed on the hostname proxy's port says so
-                // inline — port, holder and why (T93) — so the CLI's
-                // autospawn error carries it, not just a log path.
-                let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-                if let Some(line) = proxy_failure_line(&log) {
-                    bail!("{line} (supervisor log: {})", log_path.display());
-                }
-                bail!(
-                    "the detached supervisor exited during startup ({status}); \
-                     see {} for its error output",
-                    log_path.display()
-                )
-            }
+            DetachPoll::Failed(status) => bail!(
+                "the detached supervisor exited during startup ({status}); \
+                 see {} for its error output",
+                log_path.display()
+            ),
             DetachPoll::LeakedVmm(pid) => bail!(
                 "the supervisor exited but a leaked __krun-vmm (pid {pid}) still holds the \
                  alive lock; run `min stop` (or `kill -9 {pid}`), then retry"
@@ -608,7 +599,7 @@ fn node_mirror_pass(
     allocate: impl FnOnce() -> Result<std::net::Ipv4Addr, String>,
 ) -> Option<String> {
     let mirror = boxes.node_mirror();
-    mirror.set_range_probe(probe.present());
+    boxes.set_node_range_probe(probe.present());
     if !probe.present() || mirror.address().is_some() {
         return None;
     }
@@ -1307,6 +1298,9 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     // The port whose publish the start left unconfirmed (T93), when it did:
     // the guest's late report, if it ever comes, confirms it after the loop.
     let mut unconfirmed_port = None;
+    // Whether the start brought the VM up with its proxy down on a held
+    // port (NET-021): the held-port watcher then owns the publish.
+    let mut proxy_down_at_start = false;
     loop {
         // This boot's publish generation (T93): drawn fresh for every boot,
         // handed beside the port, and echoed by the guest in every publish
@@ -1508,41 +1502,33 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
                 }
                 continue;
             }
-            crate::control::PublishDecision::FailStart {
-                port,
-                holder,
-                cause,
-            } => {
-                // The start fails here, naming the port and the holder — one
-                // error line (T93) — and the cause is written to the status
-                // cell first, so a client reading the control socket in the
-                // teardown window reads *why*, not merely that the proxy is
-                // down. The reservation drops with the assignment below, so
-                // the kernel releases the port this start held.
-                proxy_publish.set_down(port, cause.clone());
-                let _ = child.kill();
-                let _ = child.wait();
-                crate::cmd::discard_fresh_volume_image(&volume_path, volume_preexisted);
-                // The holder by pid and exe when the host can see it, the
-                // decision's generic holder otherwise.
-                let holder = port_holder(port)
-                    .map(|(_, holder)| holder)
-                    .unwrap_or_else(|| holder.to_string());
-                let why = match cause {
-                    ProxyDownCause::PortHeld => configured_never_redraws(),
-                    ProxyDownCause::RedrawsRanOut => {
-                        format!("{publish_tries} publish tries exhausted, every drawn port taken")
-                    }
-                    // Never a failure's cause: an unconfirmed publish is
-                    // `UpUnconfirmed`, and a late refusal lands after the
-                    // start, never as `FailStart`.
-                    ProxyDownCause::PublishUnconfirmed => "the publish is unconfirmed".to_string(),
-                    ProxyDownCause::PortHeldAfterStart { .. } => {
-                        "the port was held after the start".to_string()
-                    }
+            crate::control::PublishDecision::FailStart { port, cause, .. } => {
+                // NET-021: a held port no longer fails the start. That is
+                // a pin another program holds, or a draw whose tries ran
+                // out. The VM starts with its proxy down, the cause names
+                // the holder the host can see, and the held-port watcher
+                // below publishes the port once it frees. The VM host
+                // daemon stays up, so `min ls` reads the cause from it for
+                // as long as the port stays held.
+                let holder = port_holder(port).map(|(_, holder)| holder);
+                let reason = match cause {
+                    ProxyDownCause::RedrawsRanOut => "every drawn port was taken",
+                    _ => "the port is held",
                 };
-                tracing::error!(port, %holder, %why, "the VM start failed on the proxy publish");
-                bail!("{}", proxy_port_failure(port, &holder, &why));
+                tracing::warn!(
+                    port,
+                    holder = holder.as_deref().unwrap_or("unnamed"),
+                    reason,
+                    publish_tries,
+                    "the VM starts with the hostname proxy down; retrying its port while the VM runs"
+                );
+                proxy_publish.set_down(port, ProxyDownCause::PortHeldAfterStart { holder });
+                // The watcher's check takes the reservation again when the
+                // port frees. A second take in this process contends with
+                // the held one, so this one goes first.
+                node_port.reservation = None;
+                proxy_down_at_start = true;
+                break;
             }
         }
     }
@@ -1553,6 +1539,23 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     // publishes both. A pinned port never moved, and a boot with no host
     // switch publishes nothing, so neither gets a watcher.
     let _proxy_reclaim = match (&_gvproxy, &reclaim_switch_sock) {
+        // NET-021, NET-022: no port serves. The watcher retries the held
+        // port with backoff, publishes it when it frees, and clears the
+        // proxy-down cause, so `min ls` stops naming it.
+        (Some(_), Some(switch_sock)) if proxy_down_at_start => {
+            let recorded = proxy_publish.clone();
+            Some(crate::net::proxy_reclaim::spawn_held_port_watcher(
+                node_port.port,
+                crate::net::proxy_reclaim::HeldPortBackoff::default(),
+                proxy_reclaim_check(ports_dir.clone()),
+                proxy_reclaim_publisher(
+                    switch_sock.clone(),
+                    boxes.subnet().daemon_ip(),
+                    boxes.table(),
+                ),
+                move |port| crate::net::proxy_reclaim::mark_serving(&recorded, port),
+            ))
+        }
         (Some(_), Some(switch_sock)) => {
             proxy_publish.set_serving(node_port.port);
             (node_port.port != node_port.preferred && !node_port.configured).then(|| {
@@ -1584,8 +1587,29 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     // held after all.
     // Only a report the running boot sent counts: its own generation, or —
     // from a guest too old to echo one — none.
+    // NET-021: a late refusal starts the held-port watcher, as a start that
+    // found the port held does. These slots hold the port's reservation and
+    // that watcher for the VM's life, because the supervisor returns only
+    // when the VM stops. The report thread releases the reservation first, so
+    // the watcher's own check can take it again when the port frees.
+    let late_reservation = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let late_watcher = std::sync::Arc::new(std::sync::Mutex::new(None));
     if let Some((port, generation)) = unconfirmed_port {
         let proxy_publish = proxy_publish.clone();
+        *late_reservation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = node_port.reservation.take();
+        let late_reservation = std::sync::Arc::clone(&late_reservation);
+        let late_watcher = std::sync::Arc::clone(&late_watcher);
+        let held_switch = reclaim_switch_sock
+            .clone()
+            .filter(|_| _gvproxy.is_some())
+            .map(|switch_sock| {
+                (
+                    proxy_reclaim_check(ports_dir.clone()),
+                    proxy_reclaim_publisher(switch_sock, boxes.subnet().daemon_ip(), boxes.table()),
+                )
+            });
         // The watcher's lines carry `vm` through a span of its own: it may
         // outlive READY, and keeping the start phase's span would keep that
         // phase from exporting (`telemetry::vm_task`).
@@ -1621,6 +1645,28 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
                             "the guest's late report says the hostname proxy's port is held"
                         );
                         proxy_publish.set_down(port, ProxyDownCause::PortHeldAfterStart { holder });
+                        let Some((check, publisher)) = held_switch else {
+                            return;
+                        };
+                        drop(
+                            late_reservation
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .take(),
+                        );
+                        let recorded = proxy_publish.clone();
+                        *late_watcher
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(crate::net::proxy_reclaim::spawn_held_port_watcher(
+                                port,
+                                crate::net::proxy_reclaim::HeldPortBackoff::default(),
+                                check,
+                                publisher,
+                                move |port| {
+                                    crate::net::proxy_reclaim::mark_serving(&recorded, port)
+                                },
+                            ));
                         return;
                     }
                     _ => {}
@@ -2596,12 +2642,17 @@ struct NodePortAssignment {
     skipped: Option<&'static str>,
     /// Whether the port came from the operator's pin rather than the draw
     /// (T93): a configured port never redraws, so a publish that finds the
-    /// port taken fails the start instead of moving the surface.
+    /// port taken starts the VM with its proxy down, and the held-port
+    /// watcher publishes the port once it frees (NET-021).
     configured: bool,
     /// The host-wide reservation this supervisor holds on `port` for the
-    /// VM's life ([`NodePortReservation`]). Never read: holding it is the
-    /// whole job, and dropping the assignment is what releases it.
-    _reservation: NodePortReservation,
+    /// VM's life ([`NodePortReservation`]). Holding it is the whole job, and
+    /// dropping the assignment is what releases it. `None` for a pin that
+    /// another program or VM held at the start: the held-port watcher takes
+    /// the reservation when the port frees. A start that brings the VM up
+    /// with its proxy down drops it too, so that the watcher's own check
+    /// can take it ([`proxy_reclaim_check`]).
+    reservation: Option<NodePortReservation>,
 }
 
 /// Assigns the node's hostname-proxy TCP port. The operator's override
@@ -2628,12 +2679,14 @@ fn assign_node_proxy_port(dir: &std::path::Path) -> Result<NodePortAssignment> {
     Ok(proxy)
 }
 
-/// The operator's pin (T93): probed and reserved like a drawn port, but a pin
-/// any check refuses fails the start naming the port and the holder — the
-/// reason the check carries — because the configured port never redraws: a
-/// start that moved the surface would publish a port the operator did not
-/// pin, and one that kept going would boot a VM whose proxy serves on a
-/// port someone else already holds.
+/// The operator's pin (T93): probed and reserved like a drawn port. The
+/// configured port never redraws, because a start that moved the surface
+/// would publish a port the operator did not pin. A pin that another
+/// program or another VM holds does not fail the start (NET-021): the
+/// guest is handed the pin, its publish is refused, and the VM starts with
+/// its proxy down until the held-port watcher publishes the pin. A pin on
+/// a port the node keeps for its own daemons can never serve, so it fails
+/// the start.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn configured_node_port(dir: &std::path::Path, port: u16) -> Result<NodePortAssignment> {
     let probe = node_port_probe(false);
@@ -2643,63 +2696,34 @@ fn configured_node_port(dir: &std::path::Path, port: u16) -> Result<NodePortAssi
             preferred: port,
             skipped: None,
             configured: true,
-            _reservation: reservation,
+            reservation: Some(reservation),
         }),
+        CandidateCheck::Skip(SKIP_NODE_RESERVED) => Err(anyhow::anyhow!(
+            "{} is set to {port}, a port Minimal keeps for its DNS service. Set {} to \
+             another port, or unset it",
+            crate::vm::NODE_PROXY_PORT_ENV,
+            crate::vm::NODE_PROXY_PORT_ENV
+        )),
         CandidateCheck::Skip(reason) => {
-            // Who holds it, as well as the host can say: a process by pid
-            // and exe when the bind or connect probe refused it, the node's
-            // own reservation, or another of this user's VMs.
-            let holder = match reason {
-                SKIP_NODE_RESERVED => "the node's own zone answerer (a reserved port)".to_string(),
-                SKIP_RESERVED_BY_ANOTHER_VM => "another VM's reservation".to_string(),
-                _ => port_holder(port)
-                    .map(|(_, holder)| holder)
-                    .unwrap_or_else(|| crate::control::HELD_BY_ANOTHER_PROCESS.to_string()),
-            };
-            let why = format!("{reason}; {}", configured_never_redraws());
-            Err(anyhow::anyhow!(
-                "{}",
-                proxy_port_failure(port, &holder, &why)
-            ))
+            // Held now: the start goes on without the reservation, and the
+            // publish decision below records the proxy down.
+            tracing::info!(
+                port,
+                skip_reason = reason,
+                "the configured hostname proxy port is held; the VM starts on it anyway"
+            );
+            Ok(NodePortAssignment {
+                port,
+                preferred: port,
+                skipped: None,
+                configured: true,
+                reservation: None,
+            })
         }
         CandidateCheck::Error(error) => {
             Err(error.context("assigning the configured hostname-proxy port"))
         }
     }
-}
-
-/// How every proxy-port start failure begins (T93): the one line the
-/// detaching parent lifts out of the supervisor's log ([`proxy_failure_line`])
-/// so the CLI's autospawn error names the port, the holder and why inline,
-/// rather than pointing at a log file.
-#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-const PROXY_PORT_FAILURE_PREFIX: &str = "hostname proxy port ";
-
-/// The one-line proxy-port start failure: the port, who holds it, and why the
-/// start ends instead of moving on.
-#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn proxy_port_failure(port: u16, holder: &str, why: &str) -> String {
-    format!("{PROXY_PORT_FAILURE_PREFIX}{port} held by {holder}; {why}")
-}
-
-/// Why a configured port's failure ends the start: the pin never redraws.
-#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn configured_never_redraws() -> String {
-    format!(
-        "configured ports never redraw (free the port or unset {})",
-        crate::vm::NODE_PROXY_PORT_ENV
-    )
-}
-
-/// The proxy-port failure line in a supervisor's captured stderr, when the
-/// start failed on it ([`PROXY_PORT_FAILURE_PREFIX`]), from the prefix on —
-/// anyhow's `Error:` and `Caused by:` framing dropped.
-#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn proxy_failure_line(log: &str) -> Option<&str> {
-    log.lines().find_map(|line| {
-        line.find(PROXY_PORT_FAILURE_PREFIX)
-            .map(|at| line[at..].trim_end())
-    })
 }
 
 /// Who listens on `port` on this host — its pid, and the holder as
@@ -3015,7 +3039,7 @@ fn assign_node_port(
                 preferred,
                 skipped: None,
                 configured: false,
-                _reservation: reservation,
+                reservation: Some(reservation),
             });
         }
         CandidateCheck::Skip(reason) => Some(reason),
@@ -3029,7 +3053,7 @@ fn assign_node_port(
         preferred,
         skipped,
         configured: false,
-        _reservation: reservation,
+        reservation: Some(reservation),
     })
 }
 
@@ -4392,28 +4416,6 @@ mod tests {
              proxy only, the answerer is not the node's to admit (NET-138)"
         );
 
-        // A pin some check refuses fails the start naming the port and the
-        // holder (T93): the configured port never redraws, so there is no
-        // fallback to a port the operator did not pin.
-        let held_pin = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let refused_pin = held_pin.local_addr().unwrap().port();
-        unsafe { std::env::set_var(crate::vm::NODE_PROXY_PORT_ENV, refused_pin.to_string()) };
-        let err = super::assign_node_proxy_port(ports.path())
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains(&format!("hostname proxy port {refused_pin} held by"))
-                && err.contains("configured ports never redraw")
-                && err.contains(super::SKIP_BIND_REFUSED),
-            "a held pin fails the start naming the port and why, got: {err}"
-        );
-        // The holder is this test process, by pid: the listener is its own.
-        assert!(
-            err.contains(&format!("pid {}", std::process::id())),
-            "a held pin names the holder's pid, got: {err}"
-        );
-        drop(held_pin);
-
         // The override's own garbage fails at the supervisor, naming the
         // variable and the value — never a fallback to selection that would
         // hand the guest a port different from the one the operator pinned.
@@ -4441,23 +4443,54 @@ mod tests {
         }
     }
 
+    /// NET-021: a pin another program holds does not fail the start. The
+    /// assignment hands the guest the pin with no reservation, so the VM
+    /// starts and the held-port watcher can take the reservation once the
+    /// port frees. A refused publish on the pin brings the VM up with its
+    /// proxy down, never a start failure. A pin on the port the node keeps
+    /// for its DNS service still fails, naming the variable to change.
     #[test]
-    fn detach_error_names_proxy_port_and_holder() {
-        // The supervisor's start failure, as its stderr lands in run.log —
-        // anyhow's `Error:` framing and the boot's context above it — is the
-        // line the detaching parent lifts for the CLI (T93).
-        let failure = super::proxy_port_failure(7654, "pid 4242 (python3)", "why");
-        let err = anyhow::anyhow!("{failure}").context("assigning the node's proxy port");
-        let log = format!("some gvproxy line\nError: {err:?}\n");
-        assert_eq!(
-            super::proxy_failure_line(&log),
-            Some("hostname proxy port 7654 held by pid 4242 (python3); why"),
-            "the failure line is lifted whole, framing dropped, from: {log}"
+    fn held_configured_port_starts_the_vm_with_the_proxy_down() {
+        let ports = tempfile::tempdir().expect("a test reservation dir");
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let pin = held.local_addr().unwrap().port();
+        let assigned =
+            super::configured_node_port(ports.path(), pin).expect("a held pin starts the VM");
+        assert_eq!(assigned.port, pin, "the guest is handed the pin");
+        assert_eq!(assigned.preferred, pin);
+        assert!(assigned.configured);
+        assert!(
+            assigned.skipped.is_none(),
+            "a held pin is not a substitute port"
         );
-        assert_eq!(
-            super::proxy_failure_line("Error: boot timed out\n"),
-            None,
-            "a start that failed on something else lifts nothing"
+        assert!(
+            assigned.reservation.is_none(),
+            "the watcher takes the reservation when the port frees"
+        );
+        // The publish on the held pin is refused: the decision is the one
+        // the boot loop turns into a VM with its proxy down.
+        assert!(matches!(
+            crate::control::decide_publish(
+                false,
+                1,
+                crate::control::GuestPublish::PortHeld { port: pin }
+            ),
+            crate::control::PublishDecision::FailStart { port, .. } if port == pin
+        ));
+        // Once the holder exits, the watcher's check passes and takes the
+        // reservation.
+        drop(held);
+        assert!(super::proxy_reclaim_check(ports.path().to_path_buf())(pin).is_some());
+
+        let reserved = crate::net::answerer::DEFAULT_ANSWERER_PORT;
+        let err = super::configured_node_port(ports.path(), reserved)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(crate::vm::NODE_PROXY_PORT_ENV)
+                && err.contains(&reserved.to_string())
+                && err.contains("DNS service"),
+            "a pin on the reserved port names the variable, got: {err}"
         );
     }
 

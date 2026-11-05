@@ -2189,6 +2189,79 @@ fn quic443_step(text: &str) {
     eprintln!("{QUIC443_LEG}: {text}");
 }
 
+/// A fresh root-owned directory for the QUIC block helper.
+///
+/// The helper runs as root, so the install wants its directory and every
+/// one above it root-only, and root must be able to execute the helper
+/// from it. `/run` is root-only but some runners mount it `noexec`, so
+/// each candidate is asked for both, and the directory goes under the
+/// first that has them. A host that has none is told what every
+/// candidate was refused for.
+fn quic443_helper_dir() -> PathBuf {
+    use nix::sys::statfs::statfs;
+    use nix::sys::statvfs::FsFlags;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let mut refusals = Vec::new();
+    for candidate in ["/run", "/var/lib", "/root"] {
+        let refused = |reason: String| format!("{candidate}: {reason}");
+        let meta = match std::fs::metadata(candidate) {
+            Ok(meta) => meta,
+            Err(e) => {
+                refusals.push(refused(format!("cannot stat it: {e}")));
+                continue;
+            }
+        };
+        if meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+            refusals.push(refused(format!(
+                "it is not root-only (uid {}, mode {:o})",
+                meta.uid(),
+                meta.mode() & 0o7777
+            )));
+            continue;
+        }
+        match statfs(candidate) {
+            Ok(fs) if fs.flags().contains(FsFlags::ST_NOEXEC) => {
+                refusals.push(format!(
+                    "{candidate} is mounted noexec on this runner, so root \
+                     cannot execute the helper from it"
+                ));
+                continue;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                refusals.push(refused(format!("statfs failed: {e}")));
+                continue;
+            }
+        }
+        let made = quic443_privileged("mktemp")
+            .arg("-d")
+            .arg(format!("{candidate}/minimald-quic443-proof.XXXXXX"))
+            .output()
+            .expect("making the helper's root-owned directory");
+        if !made.status.success() {
+            refusals.push(refused(format!(
+                "mktemp -d failed: {}",
+                String::from_utf8_lossy(&made.stderr).trim()
+            )));
+            continue;
+        }
+        let dir = PathBuf::from(String::from_utf8_lossy(&made.stdout).trim());
+        if !refusals.is_empty() {
+            eprintln!(
+                "QUIC block helper dir: {} (refused: {})",
+                dir.display(),
+                refusals.join("; ")
+            );
+        }
+        return dir;
+    }
+    panic!(
+        "no root-only directory on this host can hold the QUIC block helper: {}",
+        refusals.join("; ")
+    );
+}
+
 /// The NOT RUN record for a gate this host does not meet.
 fn quic443_not_run(gate: &str) {
     let line = format!("NOT RUN {QUIC443_LEG}: {gate}");
@@ -2380,18 +2453,37 @@ impl Quic443Scratch {
     }
 
     /// Runs the helper the daemon runs, as root, on the box leaf.
+    ///
+    /// A failed run is retried a bounded number of times before it fails
+    /// the leg: under the lane's load a privileged helper run can fail
+    /// transitively — sudo refusing to start one more subprocess, nft
+    /// failing to talk to the kernel — and neither verb minds a retry: an
+    /// nft transaction is all-or-nothing, so a failed run changed nothing,
+    /// and `add` on an element the set already holds succeeds again.
     fn helper_on_leaf(&self, verb: &str, leaf: &Path) {
-        let out = quic443_privileged(&self.helper().to_string_lossy())
-            .arg(verb)
-            .arg(leaf)
-            .output()
-            .expect("running the QUIC block helper");
-        assert!(
-            out.status.success(),
-            "the QUIC block helper runs `{verb}` on {}: {}",
-            leaf.display(),
-            String::from_utf8_lossy(&out.stderr),
-        );
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let run = quic443_privileged(&self.helper().to_string_lossy())
+                .arg(verb)
+                .arg(leaf)
+                .output();
+            match run {
+                Ok(out) if out.status.success() => return,
+                Ok(out) => assert!(
+                    attempt < 5,
+                    "the QUIC block helper runs `{verb}` on {}: {}",
+                    leaf.display(),
+                    String::from_utf8_lossy(&out.stderr),
+                ),
+                Err(e) => assert!(
+                    attempt < 5,
+                    "the QUIC block helper starts `{verb}` on {}: {e}",
+                    leaf.display(),
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
     }
 
     /// The elements of the blocked-leaves set in the loaded table.
@@ -2539,18 +2631,7 @@ fn a_blocked_cohort_rejects_a_pre_flip_udp_443_socket() {
         quic443_cgroup2_mount().expect("no cgroup2 mounted with nsdelegate on this host");
     let account = quic443_delegated_account();
 
-    // The helper runs as root, so the install wants its directory and every
-    // one above it root-only: a fresh directory under /run is.
-    let made = quic443_privileged("mktemp")
-        .args(["-d", "/run/minimald-quic443-proof.XXXXXX"])
-        .output()
-        .expect("making the helper's root-owned directory");
-    assert!(
-        made.status.success(),
-        "mktemp -d under /run: {}",
-        String::from_utf8_lossy(&made.stderr)
-    );
-    let helper_dir = PathBuf::from(String::from_utf8_lossy(&made.stdout).trim());
+    let helper_dir = quic443_helper_dir();
 
     let mut scratch = Quic443Scratch {
         root: mountpoint.join(format!("minimald-quic443-proof-{}", std::process::id())),
@@ -2643,20 +2724,30 @@ fn a_blocked_cohort_rejects_a_pre_flip_udp_443_socket() {
     ));
 
     // The rejected datagram: the output chain drops it with an ICMP port
-    // unreachable, and the send itself reports the drop or nothing.
+    // unreachable, and the send itself reports the drop or nothing. The
+    // ICMP verdict can lag the flip by a kernel timing slice, so the leg
+    // polls for the ECONNREFUSED the block guarantees instead of trusting
+    // one fixed delay — every datagram sent meanwhile is blocked by the
+    // same rule the flip loaded, and the listener-gets-nothing check
+    // below covers them all.
     let rejected = quic443_send(&socket, "during");
     assert!(
         matches!(rejected, None | Some(libc::EPERM | libc::ECONNREFUSED)),
         "the first datagram after the flip is dropped, got errno {rejected:?}"
     );
     if rejected != Some(libc::ECONNREFUSED) {
-        std::thread::sleep(Duration::from_millis(200));
-        let next = quic443_send(&socket, "during-next");
-        assert_eq!(
-            next,
-            Some(libc::ECONNREFUSED),
-            "the next datagram after the flip reports ECONNREFUSED (the first gave {rejected:?})"
-        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if quic443_send(&socket, "during-next") == Some(libc::ECONNREFUSED) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the datagram after the flip reports ECONNREFUSED (the \
+                 first gave {rejected:?})"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
     assert_eq!(
         listener.next_line(Duration::from_millis(500)),

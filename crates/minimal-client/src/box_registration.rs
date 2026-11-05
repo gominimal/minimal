@@ -274,7 +274,14 @@ pub async fn settle_lease_after_cleanup(lease: Option<BoxLease>, outcome: Cleanu
 pub struct RegisteredWithVmHost {
     /// The addresses the create request carries, so the in-VM daemon
     /// attaches with the handed switch address instead of drawing its own.
+    /// Unspecified (`0.0.0.0`) for a `host_ip` box, which the host hands no
+    /// address ([`Self::host_ip`]): read them through
+    /// [`Self::row_addresses`].
     pub addresses: boxes::BoxAddresses,
+    /// Whether the registration is a `host_ip` box's (BEP-082): the host
+    /// minted its id and allocated no address, so it has no row to carry,
+    /// to commit or to withdraw.
+    pub host_ip: bool,
     /// The box's own id the reply returned — 32 hex digits on the wire,
     /// the one spelling the row, the attachment and a diagnostic all name
     /// it by — or `None` when the answering daemon predates ids.
@@ -289,18 +296,49 @@ pub struct RegisteredWithVmHost {
     pub lease: Option<BoxLease>,
 }
 
+impl RegisteredWithVmHost {
+    /// The addresses of the box's row, or `None` for a `host_ip` box, which
+    /// has no row.
+    #[must_use]
+    pub fn row_addresses(&self) -> Option<boxes::BoxAddresses> {
+        (!self.host_ip).then_some(self.addresses)
+    }
+}
+
+/// The refusal when the VM host daemon answers a `host_ip` registration
+/// with an address row: that daemon is older than `host_ip` registration.
+/// An older daemon takes the unheld path and publishes a row under the
+/// box's name, and nothing here withdraws it, so the text says it may
+/// remain. A VM restart starts a fresh VM host daemon with no rows.
+const HOST_IP_REGISTRATION_UNSUPPORTED: &str = "the VM host daemon is older than this min, so \
+     it cannot start a --network host_ip box with a credentialed upstream. It may keep a box \
+     address under this box's name until the VM restarts. Run `min stop` and `min ls` to \
+     restart the VM with the matching VM host daemon (with the same --vm or --provider flags, \
+     if you use them)";
+
 /// Registers an own-address box with the VM host daemon over its control
 /// socket (T66), returning what it handed back.
 pub async fn register_box_with_vm_host(
     sock_path: &Path,
     request: minimald_rpc::RegisterBoxRequest,
 ) -> anyhow::Result<RegisteredWithVmHost> {
+    let host_ip = request.host_ip;
     let (reply, stream) = control_exchange_with_vm_host(
         sock_path,
         minimald_rpc::BoxControlRequest::Register(request),
     )
     .await?;
     match reply {
+        // An older daemon answers a `host_ip` request as an own-address
+        // registration: it allocated an address row and minted no box id
+        // for the `host_ip` box. That registration is refused here, never
+        // recorded as an own-address box.
+        minimald_rpc::BoxControlReply::Registered(_)
+        | minimald_rpc::BoxControlReply::Addresses(_)
+            if host_ip =>
+        {
+            Err(anyhow::anyhow!(HOST_IP_REGISTRATION_UNSUPPORTED))
+        }
         // The answer a daemon this build boots beside sends: the addresses
         // beside the id the published row holds, on the connection a held
         // registration keeps as its lease.
@@ -309,14 +347,30 @@ pub async fn register_box_with_vm_host(
                 switch_address: web.switch_address,
                 loopback_address: web.loopback_address,
             },
+            host_ip: false,
             box_id: Some(web.box_id),
             task_addresses: web.task_addresses,
             lease: Some(BoxLease { stream }),
         }),
+        // A `host_ip` registration's answer (BEP-082): the box's id and no
+        // address, on a connection that holds no lease.
+        minimald_rpc::BoxControlReply::BoxIdMinted { minted_box_id } if host_ip => {
+            Ok(RegisteredWithVmHost {
+                addresses: boxes::BoxAddresses {
+                    switch_address: std::net::Ipv4Addr::UNSPECIFIED,
+                    loopback_address: std::net::Ipv4Addr::UNSPECIFIED,
+                },
+                host_ip: true,
+                box_id: Some(minted_box_id),
+                task_addresses: Vec::new(),
+                lease: None,
+            })
+        }
         // A daemon that predates ids answers with the bare pair the
         // registration has always been answered with.
         minimald_rpc::BoxControlReply::Addresses(addresses) => Ok(RegisteredWithVmHost {
             addresses,
+            host_ip: false,
             box_id: None,
             task_addresses: Vec::new(),
             lease: None,
@@ -428,8 +482,10 @@ pub async fn register_box_with_vm_host(
 ///
 /// Always quiet when it owes nothing: a session that registered no box — a
 /// native host, a host-ip box sharing the node's own row, a refused
-/// registration — withdraws nothing and says nothing. In particular it
-/// never releases a held `host_ip` name: an activation that failed holds
+/// registration — withdraws nothing and says nothing. A `host_ip` box that
+/// registered (BEP-082) has no row, but its creator passes the id the
+/// registration handed back, and the withdrawal removes its registration
+/// name. It never releases a held `host_ip` name: an activation that failed holds
 /// none (the hold is made only once the session is active), and the name
 /// may be a live session's — a refused held name is exactly that — so
 /// only the destroy of the session that held it releases it. A withdrawal
@@ -449,8 +505,17 @@ pub async fn withdraw_box_row(
     box_id: Option<minimald_rpc::BoxId>,
 ) {
     let Some(name) = name else { return };
-    let Some(addresses) = box_addresses else {
-        return;
+    // A `host_ip` registration has no address pair, only the id it handed
+    // back (BEP-082). Its creator withdraws the registration name with the
+    // unspecified pair and that id, so a later box under the name takes a
+    // fresh id. With neither, there is nothing to withdraw.
+    let addresses = match (box_addresses, box_id) {
+        (Some(addresses), _) => addresses,
+        (None, Some(_)) => boxes::BoxAddresses {
+            switch_address: std::net::Ipv4Addr::UNSPECIFIED,
+            loopback_address: std::net::Ipv4Addr::UNSPECIFIED,
+        },
+        (None, None) => return,
     };
     let Some(sock_path) = control_sock else {
         tracing::warn!(
@@ -558,6 +623,13 @@ pub async fn resume_box_row(sock: &Path, record: Option<&boxes::Record>) -> anyh
 /// box's name is held in the zone instead (best-effort, NODATA rather than
 /// NXDOMAIN), but only once its session is active.
 ///
+/// One `host_ip` box registers (BEP-082): one whose spec declares a
+/// credentialed upstream. The host mints its id and allocates no address,
+/// so the registration carries an id and no row
+/// ([`RegisteredWithVmHost::host_ip`]). The proxy serves the box's grants
+/// under that id. A `host_ip` box that declares no upstream needs no id and
+/// registers nothing.
+///
 /// The box's own id comes back with it (NET-133): the request carries no
 /// id, the host mints one for this creation, and the reply returns the id
 /// the published row holds, which the client records — so the CLI, the row
@@ -588,9 +660,14 @@ pub async fn register_box_for_activation(
     name: &str,
     policy: &boxes::BoxPolicy,
 ) -> anyhow::Result<Option<RegisteredWithVmHost>> {
-    if kind != paths::HostKind::Minvmd || network != boxes::NetworkMode::OwnIp {
+    if kind != paths::HostKind::Minvmd {
         return Ok(None);
     }
+    let host_ip = match network {
+        boxes::NetworkMode::OwnIp => false,
+        boxes::NetworkMode::HostNet if policy.credentialed_upstream.is_some() => true,
+        _ => return Ok(None),
+    };
     // The control socket sits beside the ssh socket in the host dir the
     // daemon connection resolves through, so the client finds both by the
     // same rule — named VMs included, since the resolution reads the same
@@ -603,7 +680,9 @@ pub async fn register_box_for_activation(
     })?;
     let sock_path = control_sock_beside(&ssh_sock)
         .ok_or_else(|| HostUnreachable::error("no provider dir resolved for the ssh socket"))?;
-    register_box_at(&sock_path, name, policy).await.map(Some)
+    register_box_at(&sock_path, name, policy, host_ip)
+        .await
+        .map(Some)
 }
 
 /// Registers an own-address box under `name` with the VM host daemon whose
@@ -626,7 +705,9 @@ pub async fn register_box_beside(
     let Some(sock_path) = vm_host_control_sock(ssh_sock) else {
         return Ok(None);
     };
-    register_box_at(&sock_path, name, policy).await.map(Some)
+    register_box_at(&sock_path, name, policy, false)
+        .await
+        .map(Some)
 }
 
 /// The VM host daemon's control socket beside `ssh_sock`, when `ssh_sock`
@@ -665,10 +746,13 @@ pub fn control_sock_beside(ssh_sock: &Path) -> Option<PathBuf> {
 /// The registration exchange both front-ends make, on the control socket
 /// `sock_path`: the box's declaration in, held as a lease, bounded by
 /// [`BOX_CONTROL_TIMEOUT`], with the failure the activation ends with.
+/// `host_ip` registers a `host_ip` box: the host mints its id and hands it
+/// no address, so it asks for no task address and holds no lease.
 async fn register_box_at(
     sock_path: &Path,
     name: &str,
     policy: &boxes::BoxPolicy,
+    host_ip: bool,
 ) -> anyhow::Result<RegisteredWithVmHost> {
     // The declaration, as this activation expanded it: the ingress rules
     // reduced to the external ports they admit — the shape the host row
@@ -706,10 +790,15 @@ async fn register_box_at(
         // The row is held as a lease until the session is active: an
         // activation that dies before then — an interrupt, a crash, a
         // withdrawal that never lands — leaves no row holding its name.
-        hold: true,
+        hold: !host_ip,
         // The task addresses the box's task runs attach at, filed with the
         // box so the in-VM daemon draws nothing for a task (NET-138).
-        task_slots: minimald_rpc::TASK_SLOTS_PER_BOX,
+        task_slots: if host_ip {
+            0
+        } else {
+            minimald_rpc::TASK_SLOTS_PER_BOX
+        },
+        host_ip,
     };
     let registration = tokio::time::timeout(
         BOX_CONTROL_TIMEOUT,
@@ -717,6 +806,20 @@ async fn register_box_at(
     )
     .await;
     match registration {
+        Ok(Ok(web)) if web.host_ip => {
+            tracing::info!(
+                box = %name,
+                box_id = %web
+                    .box_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_default(),
+                network = "host_ip",
+                switch_address_allocated = false,
+                "registered the host_ip box with the VM host daemon; it has a box id and \
+                 no address"
+            );
+            Ok(web)
+        }
         Ok(Ok(web)) => {
             tracing::info!(
                 box = %name,
@@ -724,6 +827,8 @@ async fn register_box_at(
                     .box_id
                     .map(|id| id.to_string())
                     .unwrap_or_default(),
+                network = "own_ip",
+                switch_address_allocated = true,
                 switch_address = %web.addresses.switch_address,
                 loopback_address = %web.addresses.loopback_address,
                 "registered the box with the VM host daemon; its addresses are \
@@ -909,6 +1014,52 @@ mod tests {
         );
     }
 
+    /// BEP-082: an activation that fails after a `host_ip` registration has
+    /// no address pair, only the id the registration handed back. Its
+    /// withdrawal sends the unspecified pair and that id, so the daemon
+    /// withdraws the registration name.
+    #[tokio::test]
+    async fn a_failed_host_ip_activation_withdraws_its_registration_name() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+        let unspecified = boxes::BoxAddresses {
+            switch_address: std::net::Ipv4Addr::UNSPECIFIED,
+            loopback_address: std::net::Ipv4Addr::UNSPECIFIED,
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let sock_path = dir.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let line =
+            serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::Addresses(unspecified))
+                .unwrap();
+        let daemon = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = tokio::io::BufReader::new(stream);
+            let mut request = String::new();
+            stream.read_line(&mut request).await.unwrap();
+            stream
+                .get_mut()
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .unwrap();
+            request
+        });
+        let id = minimald_rpc::BoxId::from_bytes([9; 16]);
+        withdraw_box_row(Some(sock_path), Some("grant"), None, Some(id)).await;
+        let sent = daemon.await.unwrap();
+        let request: minimald_rpc::BoxControlRequest =
+            serde_json_lenient::from_str(sent.trim()).unwrap();
+        match request {
+            minimald_rpc::BoxControlRequest::Withdraw(withdrawal) => {
+                assert_eq!(withdrawal.name, "grant");
+                assert!(withdrawal.switch_address.is_unspecified());
+                assert!(withdrawal.loopback_address.is_unspecified());
+                assert_eq!(withdrawal.box_id, Some(id));
+            }
+            other => panic!("the activation withdraws its registration, got {other:?}"),
+        }
+    }
+
     /// The registration's lease is held across the finalize — the daemon
     /// sees neither a byte nor a close while it runs — and committed only
     /// when it succeeds: one commit line, then the close. A failed finalize
@@ -1064,7 +1215,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let error = register_box_at(&sock_path, "dev", &boxes::BoxPolicy::default())
+        let error = register_box_at(&sock_path, "dev", &boxes::BoxPolicy::default(), false)
             .await
             .expect_err("a held name refuses the registration");
         daemon.await.unwrap();
@@ -1073,5 +1224,69 @@ mod tests {
             .expect("the refusal is typed through its context");
         assert_eq!(held.held, "Dev");
         assert!(format!("{error:#}").contains("a box named Dev already exists"));
+    }
+
+    /// A VM host daemon older than `host_ip` registration answers a
+    /// `host_ip` request as an own-address one. The client refuses that
+    /// answer and never records the box as an own-address box.
+    #[tokio::test]
+    async fn an_older_vm_host_reply_to_a_host_ip_registration_is_refused() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+        let replies = [
+            minimald_rpc::BoxControlReply::Registered(minimald_rpc::RegisteredBox {
+                switch_address: PAIR.switch_address,
+                loopback_address: PAIR.loopback_address,
+                box_id: minimald_rpc::BoxId::from_bytes([7; 16]),
+                task_addresses: Vec::new(),
+            }),
+            minimald_rpc::BoxControlReply::Addresses(PAIR),
+        ];
+        for reply in replies {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sock_path = dir.path().join("control.sock");
+            let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+            let line = serde_json_lenient::to_string(&reply).unwrap();
+            let daemon = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = tokio::io::BufReader::new(stream);
+                let mut request = String::new();
+                stream.read_line(&mut request).await.unwrap();
+                stream
+                    .get_mut()
+                    .write_all(format!("{line}\n").as_bytes())
+                    .await
+                    .unwrap();
+            });
+            let request = minimald_rpc::RegisterBoxRequest {
+                name: "grant".to_string(),
+                ingress_ports: Vec::new(),
+                egress: None,
+                credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
+                hold: false,
+                task_slots: 0,
+                host_ip: true,
+            };
+            let outcome = register_box_with_vm_host(&sock_path, request).await;
+            daemon.await.unwrap();
+            let error = match outcome {
+                Ok(registered) => panic!(
+                    "{reply:?}: an older daemon's answer is refused, got host_ip {}",
+                    registered.host_ip
+                ),
+                Err(error) => error,
+            };
+            assert_eq!(
+                format!("{error:#}"),
+                "the VM host daemon is older than this min, so it cannot start a --network \
+                 host_ip box with a credentialed upstream. It may keep a box address under this \
+                 box's name until the VM restarts. Run `min stop` and `min ls` to restart the VM \
+                 with the matching VM host daemon (with the same --vm or --provider flags, if \
+                 you use them)",
+                "{reply:?}"
+            );
+        }
     }
 }

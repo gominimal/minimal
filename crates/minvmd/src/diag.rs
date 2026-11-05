@@ -2,8 +2,10 @@
 //! answerer answers the box zone from, written as a file a person — or a
 //! diagnostic bundle — can read: one row per published namespace, its name
 //! under the zone, the address an A lookup may be told, and whether the
-//! namespace is running. The same [`BoxRegistry::zone_view`] the answers
-//! come from, so a dump and a lookup can never disagree.
+//! namespace is running. The same view the answers come from
+//! ([`crate::net::answerer::own_zone_view`]): the registry's zone view with
+//! each running host-address box's held name answering its node's address,
+//! so a dump and a lookup can never disagree.
 //!
 //! The dump is this daemon's **own** table, not the machine's answering
 //! view: on a host running more than one VM host daemon each writes its own
@@ -94,8 +96,7 @@ fn dump_loop(registry: BoxRegistry) {
 /// sees the whole previous table or the whole new one, never a half of
 /// either.
 fn write_table(registry: &BoxRegistry) -> io::Result<()> {
-    let rows: Vec<ZoneRowDump> = registry
-        .zone_view()
+    let rows: Vec<ZoneRowDump> = crate::net::answerer::own_zone_view(registry)
         .rows()
         .map(|(name, row)| ZoneRowDump {
             name: name.to_string(),

@@ -459,7 +459,7 @@ pub(super) const HOOK_LAUNCH_TIMEOUT: std::time::Duration = std::time::Duration:
 /// and the manager's covers a wedged *session actor*, which can be parked in
 /// an inline `EnsureHost`, `Attach`, or `ConfigureLoadout` and never reach
 /// the spawn at all.
-pub(crate) const HOST_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+pub(crate) const HOST_PROBE_TIMEOUT: std::time::Duration = minimald_rpc::HOST_PROBE_TIMEOUT;
 
 /// Awaits a host probe under [`HOST_PROBE_TIMEOUT`], collapsing both a
 /// missed deadline and a dead host to `None`.
@@ -840,11 +840,20 @@ impl BoxActor {
         let mut attach_env = attach_env;
         // BEP-012: the proxy variables join the same layer, at the proxy's
         // address on this daemon's switch subnet.
-        let subnet = self.net_switch.lock().await.subnet();
+        // BEP-085: a host_ip box gets them on a VM host only, so the
+        // launch reads the host kind from the switch's transport.
+        let (subnet, host_kind) = {
+            let switch = self.net_switch.lock().await;
+            (
+                switch.subnet(),
+                box_runtime::host_kind_of(switch.transport()),
+            )
+        };
         box_runtime::place_launch_proxy_env(
             &mut attach_env,
-            record.id,
-            &box_runtime::launch_proxy_env(&record, subnet),
+            &record,
+            host_kind,
+            &box_runtime::launch_proxy_env(&record, subnet, host_kind),
         );
         let connection_env = box_runtime::place_launch_deliveries(
             &mut attach_env,
@@ -1577,7 +1586,7 @@ impl BoxActor {
 
 /// The daemon's grace period between a stop's SIGTERM and its SIGKILL
 /// (BOX-013). The daemon has no setting for it yet.
-pub(crate) const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const STOP_GRACE: std::time::Duration = minimald_rpc::STOP_GRACE;
 
 /// How often a stop checks, inside its grace period, whether the box ended.
 const STOP_POLL: std::time::Duration = std::time::Duration::from_millis(50);

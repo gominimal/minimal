@@ -56,6 +56,13 @@ pub const SCHEMA: &str = "min/v1/audit";
 /// store identifier.
 pub const NONE: &str = "none";
 
+/// The host a refusal's upstream authority carries when the box's TLS
+/// ClientHello sent no server name (SNI), as a client does for an address.
+/// A connection to port 443 is recorded as `(no SNI):443`. A DNS name
+/// cannot hold a parenthesis or a space, so an SNI a box sends never reads
+/// the same.
+pub const NO_SNI: &str = "(no SNI)";
+
 /// The resource and permission a record carries when the module maps none.
 pub const MODULE_UNMAPPED: &str = "module_unmapped";
 
