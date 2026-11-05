@@ -316,7 +316,7 @@ box that holds it returns to `running`. These terms follow the decision in
 - **NET-021** IF the host-side hostname listener cannot bind or publish THEN THE SYSTEM SHALL retry with backoff until it succeeds.
   tier:     T0
   verify:   cargo nextest run -p minimald listener_retries_with_backoff
-  <!-- S2a/AC1; prose 13; unwanted -->
+  <!-- S2a/AC1; prose 13; unwanted; the VM host daemon retries a held proxy port too: a pinned port that another program holds, or a draw that ran out of tries, starts the VM with its proxy down, and the daemon publishes the port when it frees; meanwhile the VM runs and nothing tells the user to run `min stop` -->
 
 - **NET-022** WHEN the hostname listener recovers THE SYSTEM SHALL clear the warning from `min ls` without a daemon restart.
   tier:     T0

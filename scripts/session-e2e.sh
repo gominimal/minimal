@@ -30070,31 +30070,73 @@ while True:
   [ -n "$tw_stopped" ] \
     || { echo "::error::the named VM never reached 'stopped' after the redraw beat"; fail; }
 
-  # The configured port: pinned to the held port, the start fails naming it
-  # and never redraws onto another.
-  if MINVMD_NODE_PROXY_PORT="$tw_held" minvmd --vm "$tw_name" run --detach \
+  # The configured port: pinned to the held port, the VM starts with its
+  # hostname proxy down (NET-021). It never redraws onto another port, and
+  # `min ls` names the held port as the cause.
+  if [ -n "$tw_log" ]; then tw_log_lines="$(wc -l < "$tw_log" | tr -d ' ')"; fi
+  TWO_VM_NAME="$tw_name" # alive again: teardown stops it
+  MINVMD_NODE_PROXY_PORT="$tw_held" RUST_LOG="warn,minvmd=info" \
+    minvmd --vm "$tw_name" run --detach \
       --timeout "${MINIMAL_SPAWN_TIMEOUT_SECS:-150}" \
-      </dev/null >"$WORK/two-vm-pinned.out" 2>"$WORK/two-vm-pinned.err"; then
-    echo "::error::the named VM started with its configured proxy port $tw_held held by another listener — a configured port must fail the start, never redraw (T93)"
+      </dev/null >"$WORK/two-vm-pinned.out" 2>"$WORK/two-vm-pinned.err" \
+    || { echo "::error::the named VM did not start with its configured proxy port $tw_held held by another listener — a held configured port must start the VM with the proxy down (NET-021)"
+         echo "--- stderr ---"; cat "$WORK/two-vm-pinned.err" 2>/dev/null || true
+         echo "--- supervisor log ---"; cat "$tw_alpha/run.log" 2>/dev/null || true
+         fail; }
+  tw_pin_ls=""
+  tw_pin_serving=""
+  for _ in $(seq 1 60); do
+    tw_pin_ls="$(two_vm_mn ls 2>&1 || true)"
+    tw_pin_serving="$(two_vm_ls_proxy_port "$tw_name" "$tw_pin_ls" scoped)"
+    [ -n "$tw_pin_serving" ] && break
+    case "$tw_pin_ls" in
+      *"the hostname proxy is not serving: "*"holds 127.0.0.1:$tw_held."*) break ;;
+    esac
+    sleep 1
+  done
+  if [ -n "$tw_pin_serving" ]; then
+    echo "::error::the named VM's hostname proxy serves on 127.0.0.1:$tw_pin_serving while its configured port $tw_held is held — a configured port must never redraw (NET-021)"
+    printf '%s\n' "$tw_pin_ls"
     fail
   fi
+  case "$tw_pin_ls" in
+    *"the hostname proxy is not serving: "*"holds 127.0.0.1:$tw_held."*) ;;
+    *)
+      echo "::error::min ls does not name the held configured port $tw_held as the cause the hostname proxy is down (NET-021)"
+      printf '%s\n' "$tw_pin_ls"
+      echo "--- supervisor log ---"; cat "$tw_alpha/run.log" 2>/dev/null || true
+      fail ;;
+  esac
+  # The start checks the configured port itself and logs it as a skipped
+  # candidate while it is held. Only a candidate line for another port means
+  # the VM host daemon drew a substitute.
+  tw_pin_skip="$(two_vm_log_since "$tw_log" "$tw_log_lines" \
+    | grep -F -- 'skipped a node-port candidate' \
+    | grep -vE -- "candidate_port\"?[:=]$tw_held([^0-9]|\$)" || true)"
+  if [ -n "$tw_pin_skip" ]; then
+    echo "::error::the VM host daemon drew another port for the configured port $tw_held: $tw_pin_skip (NET-021)"
+    fail
+  fi
+  echo "pinned: the VM is up with its proxy down — $(printf '%s\n' "$tw_pin_ls" | grep -F -- "holds 127.0.0.1:$tw_held" | head -n1)"
+  minvmd --vm "$tw_name" stop >/dev/null 2>"$WORK/two-vm-stop3.err" \
+    || { echo "::error::'minvmd --vm $tw_name stop' failed after the pinned beat"
+         cat "$WORK/two-vm-stop3.err" 2>/dev/null || true
+         fail; }
+  tw_stopped=""
+  for _ in $(seq 1 60); do
+    case "$(minvmd --vm "$tw_name" status --json 2>/dev/null || true)" in
+      *'"state":"stopped"'*) tw_stopped=1; break ;;
+    esac
+    sleep 1
+  done
+  [ -n "$tw_stopped" ] \
+    || { echo "::error::the named VM never reached 'stopped' after the pinned beat"; fail; }
   TWO_VM_NAME=""
-  # The detach's own stderr — what the CLI's autospawn error carries — must
-  # name the port, the holder and why inline.
-  tw_pin_err="$(cat "$WORK/two-vm-pinned.err" 2>/dev/null || true)"
-  if [[ "$tw_pin_err" != *"hostname proxy port $tw_held held by"* ]] \
-     || [[ "$tw_pin_err" != *"never redraw"* ]]; then
-    echo "::error::the failed start does not name the configured port $tw_held, its holder, and that it never redraws (T93)"
-    cat "$tw_alpha/run.log" 2>/dev/null || true
-    printf '%s\n' "$tw_pin_err"
-    fail
-  fi
-  echo "pinned: the start failed naming the held port — $(printf '%s\n' "$tw_pin_err" | grep -F -- "$tw_held" | head -n1)"
   kill "$TWO_VM_HOLD_PID" 2>/dev/null || true
   wait "$TWO_VM_HOLD_PID" 2>/dev/null || true
   TWO_VM_HOLD_PID=""
 
-  echo "two named VMs on one machine OK (own state each, booted at once on their own proxy ports, one listing with both, box names resolving to their VM, both routing at once, stop one leaves the other, a held drawn port redrawn, a held pinned port failing the start)"
+  echo "two named VMs on one machine OK (own state each, booted at once on their own proxy ports, one listing with both, box names resolving to their VM, both routing at once, stop one leaves the other, a held drawn port redrawn, a held pinned port starting the VM with its proxy down)"
   echo "::endgroup::"
 }
 

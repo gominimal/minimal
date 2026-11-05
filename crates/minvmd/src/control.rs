@@ -455,6 +455,19 @@ impl ProxyPublishStatus {
         }
     }
 
+    /// Clear any cause recorded on `port` (NET-022): the held-port watcher
+    /// published the port, so the proxy serves there now. A cause on another
+    /// port stays, because this publish does not answer it.
+    pub(crate) fn clear_down(&self, port: u16) {
+        let mut cell = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cell.as_ref().is_some_and(|(down, _)| *down == port) {
+            *cell = None;
+        }
+    }
+
     /// Record that the proxy serves on `port` and on no other host port:
     /// the port the start handed, once the publish decision brought the VM
     /// up.
@@ -5804,11 +5817,20 @@ mod tests {
             control(&sock_path, &BoxControlRequest::AnswererStatus).expect("the read is answered"),
             BoxControlReply::Status(minimald_rpc::AnswererStatusReply {
                 answerer: ZoneAnswererStatus::Holder { port: 7_656 },
-                proxy_down: Some(minimald_rpc::ProxyDown { port, cause: late }),
+                proxy_down: Some(minimald_rpc::ProxyDown {
+                    port,
+                    cause: late.clone(),
+                }),
             }),
             "a late refusal rides beside the answerer's state with its \
              holder, and a confirm never clears it"
         );
+        // NET-022: the held-port watcher's publish clears the cause on its
+        // own port, and never a cause on another port.
+        proxy_publish.clear_down(port + 1);
+        assert_eq!(proxy_publish.down(), Some((port, late)));
+        proxy_publish.clear_down(port);
+        assert_eq!(proxy_publish.down(), None, "the publish clears the cause");
     }
 
     /// The operator's pin's story (T93): the first address-in-use publish
