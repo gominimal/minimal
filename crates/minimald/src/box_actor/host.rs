@@ -459,7 +459,7 @@ pub(super) const HOOK_LAUNCH_TIMEOUT: std::time::Duration = std::time::Duration:
 /// and the manager's covers a wedged *session actor*, which can be parked in
 /// an inline `EnsureHost`, `Attach`, or `ConfigureLoadout` and never reach
 /// the spawn at all.
-pub(crate) const HOST_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+pub(crate) const HOST_PROBE_TIMEOUT: std::time::Duration = minimald_rpc::HOST_PROBE_TIMEOUT;
 
 /// Awaits a host probe under [`HOST_PROBE_TIMEOUT`], collapsing both a
 /// missed deadline and a dead host to `None`.
@@ -1586,7 +1586,7 @@ impl BoxActor {
 
 /// The daemon's grace period between a stop's SIGTERM and its SIGKILL
 /// (BOX-013). The daemon has no setting for it yet.
-pub(crate) const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const STOP_GRACE: std::time::Duration = minimald_rpc::STOP_GRACE;
 
 /// How often a stop checks, inside its grace period, whether the box ended.
 const STOP_POLL: std::time::Duration = std::time::Duration::from_millis(50);

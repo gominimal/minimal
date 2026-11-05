@@ -266,6 +266,10 @@ fn every_daemon_connection_is_classified() {
             "cmd/boxes/address.rs::connect_box_host = gated",
             "cmd/boxes/address.rs::probe_other_host = ungated",
             "cmd/boxes/address.rs::read_host_boxes = ungated",
+            // A read-only look at a box after `min box attach` ended, to say
+            // why the host ended it. The attach itself went through the
+            // address resolution above, and the read builds nothing.
+            "cmd/boxes/attach.rs::box_after_attach = ungated",
             // Test-only: the BEP-032 store mint test registers a box with a
             // proxy control socket it serves itself, so no daemon is involved.
             "cmd/boxes/create.rs::box_creation_seals_a_store_member_per_accepted_rule = ungated",
@@ -7231,6 +7235,7 @@ fn address_entry(id: &str, name: &str, state: &str) -> minimald_rpc::BoxListingE
         reason: None,
         exit_code: None,
         signal: None,
+        pty_enabled: true,
     }
 }
 
@@ -8023,6 +8028,695 @@ async fn box_first_slice_list_show_stop_rm_end_to_end() {
             .count();
         assert_eq!(spans, ran, "{span} spans\n{transcript}\n{log}");
     }
+}
+
+/// Creates a running box named `name` from `project` on the harness
+/// daemon, through the whole create flow, with a stored spec whose
+/// `io.pty_enabled` is `pty`. `None` stores no spec, as the harness's own
+/// create does, and a session filed that way has a terminal.
+async fn create_attach_box(
+    daemon: &mut minimald::test_harness::TestClient,
+    name: &str,
+    project: &std::path::Path,
+    pty: Option<bool>,
+) -> boxes::SessionId {
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+        FinalizeSessionRequest,
+    };
+    let mut request = minimald::test_harness::create_session_req(
+        name,
+        project.to_str().expect("a UTF-8 project path"),
+    );
+    request.spec = pty.map(|pty| serde_json_lenient::json!({"v": 1, "io": {"pty_enabled": pty}}));
+    let id = daemon.call::<CreateSession>(&request).await.unwrap().id;
+    minimald::test_harness::unwrap_ready(
+        daemon
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    match daemon
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
+        .await
+    {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+    }
+    id
+}
+
+/// One harness daemon on a fresh socket for the `min box attach` tests,
+/// served as the unselected local host `host`, with a project directory
+/// its boxes come from.
+struct AttachHost {
+    server: minimald::test_harness::TestServer,
+    _dir: tempfile::TempDir,
+    project: tempfile::TempDir,
+    host: LocalHost,
+}
+
+impl AttachHost {
+    async fn start(host: &str) -> Self {
+        let (server, dir, project, host) = address_daemon(host, &[]).await;
+        Self {
+            server,
+            _dir: dir,
+            project,
+            host,
+        }
+    }
+
+    /// Creates a running box from this host's project.
+    async fn create(&self, name: &str, pty: Option<bool>) -> boxes::SessionId {
+        let mut daemon = self.server.connect().await;
+        create_attach_box(&mut daemon, name, self.project.path(), pty).await
+    }
+
+    /// The project root the bare form reads for this host's project.
+    fn scope(&self) -> paths::HostAbsPath {
+        paths::HostAbsPath::try_new(self.project.path().to_str().expect("a UTF-8 path"))
+            .expect("an absolute project path")
+    }
+
+    /// Stops the box `name` as `min box stop` does.
+    async fn stop(&self, name: &str) {
+        cmd::stop_box_on_hosts(vec![self.host.clone()], &mut Vec::new(), name, false)
+            .await
+            .expect("the stop succeeds");
+    }
+}
+
+/// The `min box attach` refusal in `err`, as the command prints it, with
+/// the exit code the binary ends with.
+fn attach_refusal(err: &anyhow::Error) -> (String, u8) {
+    let refusal = err
+        .downcast_ref::<BoxAttachRefusal>()
+        .unwrap_or_else(|| panic!("a box attach refusal: {err:#}"));
+    (refusal.to_string(), refusal.exit_code())
+}
+
+/// An attach that must not run: the command refused before it.
+async fn no_attach(target: &BoxAttachTarget) -> Result<i32, anyhow::Error> {
+    panic!("the attach must not run, it ran on {target:?}")
+}
+
+/// A target on `host` for the ending tests.
+fn ending_target(host: &str) -> BoxAttachTarget {
+    BoxAttachTarget {
+        host: address_host(LOCAL_PROVIDER, host, true),
+        box_id: boxes::SessionId::parse_str("0199f000-0000-7000-8000-000000000001").unwrap(),
+        name: Some("web".to_owned()),
+        label: "web".to_owned(),
+    }
+}
+
+/// A listed box for the ending tests, in `state`.
+fn ending_entry(state: &str) -> minimald_rpc::BoxListingEntry {
+    address_entry("0199f000-0000-7000-8000-000000000001", "web", state)
+}
+
+/// BCLI-068: `min box attach <box>` hands the caller's terminal to the box
+/// that has a terminal, on the host that keeps it, by every address form.
+#[tokio::test]
+async fn box_attach_reattaches_pty_box() {
+    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    let web = alpha.create("web", Some(true)).await;
+    let session = alpha.create("dev", None).await;
+
+    for (address, id) in [
+        ("web", web),
+        ("local-minvmd/alpha.local-minvmd0/web", web),
+        (&*web.to_string(), web),
+        ("dev", session),
+    ] {
+        let mut attached = None;
+        let ending = box_attach_on_hosts(
+            vec![alpha.host.clone()],
+            Some(address),
+            None,
+            true,
+            async |target: &BoxAttachTarget| {
+                attached = Some(target.clone());
+                Ok(0)
+            },
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{address}: {err:#}"));
+        let target = attached.expect("the attach ran");
+        assert_eq!(target.box_id, id, "{address}");
+        assert_eq!(
+            target.host.sock, alpha.host.sock,
+            "{address}: the box's host"
+        );
+        assert_eq!(target.label, address);
+        assert_eq!(
+            ending,
+            AttachEnding {
+                code: 0,
+                notice: None
+            },
+            "{address}: a detach ends with 0"
+        );
+    }
+}
+
+/// BCLI-068: without a terminal on stdin the attach fails with exit 2
+/// before any lookup, so a stopped box is not resumed and stays stopped.
+#[tokio::test]
+async fn box_attach_without_tty_exit2() {
+    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    alpha.create("web", Some(true)).await;
+    alpha.stop("web").await;
+
+    for address in [Some("web"), None] {
+        let err = box_attach_on_hosts(
+            vec![alpha.host.clone()],
+            address,
+            Some(&alpha.scope()),
+            false,
+            no_attach,
+        )
+        .await
+        .expect_err("no terminal, no attach");
+        let (message, code) = attach_refusal(&err);
+        assert_eq!(code, 2, "{message}");
+        assert_eq!(
+            message,
+            "Cannot attach: stdin is not a terminal. Run `min box attach` from a terminal."
+        );
+    }
+    assert_eq!(address_state(&alpha.host, "web").await, "stopped");
+    // The check needs no host at all.
+    assert!(ensure_box_attach_tty(true).is_ok());
+}
+
+/// BCLI-068: a running box whose spec sets no terminal is refused with
+/// exit 2, and the refusal names `min box logs <box>`.
+#[tokio::test]
+async fn box_attach_running_non_pty_box_exit2_names_logs() {
+    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    alpha.create("worker", Some(false)).await;
+
+    let err = box_attach_on_hosts(
+        vec![alpha.host.clone()],
+        Some("worker"),
+        None,
+        true,
+        no_attach,
+    )
+    .await
+    .expect_err("a box with no terminal is refused");
+    let (message, code) = attach_refusal(&err);
+    assert_eq!(code, 2, "{message}");
+    assert_eq!(
+        message,
+        "Box worker has no terminal to attach to. \
+         Run `min box logs worker` to see its output."
+    );
+    assert_eq!(address_state(&alpha.host, "worker").await, "running");
+}
+
+/// BCLI-068: with no box named, the attach goes to the project's running
+/// box with a terminal. With none running, it goes to the project's only
+/// stopped or exited box with a terminal. A box with no terminal and a box
+/// of another project are never a candidate.
+#[tokio::test]
+async fn box_attach_without_address_picks_running_else_sole_retained() {
+    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    let other = AttachHost::start("beta.local-minvmd0").await;
+    let web = alpha.create("web", Some(true)).await;
+    alpha.create("worker", Some(false)).await;
+    // Another project's running box with a terminal, on another host.
+    other.create("elsewhere", Some(true)).await;
+    let hosts = vec![alpha.host.clone(), other.host.clone()];
+
+    let attach_bare = async || {
+        let mut attached = None;
+        box_attach_on_hosts(
+            hosts.clone(),
+            None,
+            Some(&alpha.scope()),
+            true,
+            async |target: &BoxAttachTarget| {
+                attached = Some(target.clone());
+                Ok(0)
+            },
+        )
+        .await
+        .expect("the bare form finds the box");
+        attached.expect("the attach ran")
+    };
+
+    let running = attach_bare().await;
+    assert_eq!(running.box_id, web, "the running box with a terminal");
+    assert_eq!(running.host.sock, alpha.host.sock);
+    assert_eq!(running.label, "web");
+
+    // Stopped, the box is still the project's only one with a terminal.
+    alpha.stop("web").await;
+    let retained = attach_bare().await;
+    assert_eq!(
+        retained.box_id, web,
+        "the only retained box with a terminal"
+    );
+
+    // A running box with a terminal wins over the retained one.
+    let fresh = alpha.create("api", Some(true)).await;
+    assert_eq!(attach_bare().await.box_id, fresh);
+}
+
+/// BCLI-068: with no box named, two candidates fail the attach with exit 2
+/// and the refusal lists them both.
+#[tokio::test]
+async fn box_attach_without_address_ambiguous_exit2_lists() {
+    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    let web = alpha.create("web", Some(true)).await;
+    let api = alpha.create("api", None).await;
+
+    let refusal = async || {
+        let err = box_attach_on_hosts(
+            vec![alpha.host.clone()],
+            None,
+            Some(&alpha.scope()),
+            true,
+            no_attach,
+        )
+        .await
+        .expect_err("two candidates, no attach");
+        attach_refusal(&err)
+    };
+    let (message, code) = refusal().await;
+    assert_eq!(code, 2, "{message}");
+    assert!(
+        message.starts_with("More than one box in this project has a terminal:\n"),
+        "{message}"
+    );
+    for line in [
+        format!("  local-minvmd/alpha.local-minvmd0/web  running  {web}"),
+        format!("  local-minvmd/alpha.local-minvmd0/api  running  {api}"),
+    ] {
+        assert!(
+            message.lines().any(|l| l == line),
+            "no `{line}`:\n{message}"
+        );
+    }
+    assert!(
+        message.ends_with("Name one with `min box attach <box>`."),
+        "{message}"
+    );
+
+    // Two retained boxes are as ambiguous as two running ones.
+    alpha.stop("web").await;
+    alpha.stop("api").await;
+    let (message, code) = refusal().await;
+    assert_eq!(code, 2, "{message}");
+    assert!(message.contains("web  stopped"), "{message}");
+    assert!(message.contains("api  stopped"), "{message}");
+    assert_eq!(address_state(&alpha.host, "web").await, "stopped");
+}
+
+/// BCLI-068: with no box named and no candidate, the attach fails with
+/// exit 4 and a hint that names `min box start`.
+#[tokio::test]
+async fn box_attach_without_address_none_exit4_hints_start() {
+    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    let empty = tempfile::TempDir::new().unwrap();
+    let empty_scope = paths::HostAbsPath::try_new(empty.path().to_str().unwrap()).unwrap();
+
+    // A project with no box, and a project whose only box has no terminal.
+    alpha.create("worker", Some(false)).await;
+    for scope in [empty_scope, alpha.scope()] {
+        let err = box_attach_on_hosts(
+            vec![alpha.host.clone()],
+            None,
+            Some(&scope),
+            true,
+            no_attach,
+        )
+        .await
+        .expect_err("no candidate, no attach");
+        let (message, code) = attach_refusal(&err);
+        assert_eq!(code, 4, "{message}");
+        assert_eq!(
+            message,
+            "No box with a terminal in this project. Start one with min box start."
+        );
+    }
+}
+
+/// BCLI-068: with no box named, a host that does not answer the lookup
+/// fails the attach with exit 7, names the host, and attaches to nothing,
+/// though another host has a candidate.
+#[tokio::test]
+async fn box_attach_without_address_unreachable_host_exit7() {
+    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    alpha.create("web", Some(true)).await;
+    // The selected host has no daemon at its socket, so it does not connect.
+    let down = address_host(LOCAL_MINVMD_PROVIDER, "beta.local-minvmd0", true);
+
+    let err = box_attach_on_hosts(
+        vec![alpha.host.clone(), down],
+        None,
+        Some(&alpha.scope()),
+        true,
+        no_attach,
+    )
+    .await
+    .expect_err("a silent host, no attach");
+    let (message, code) = attach_refusal(&err);
+    assert_eq!(code, 7, "{message}");
+    assert_eq!(
+        message,
+        "Could not reach host beta.local-minvmd0, so no box was chosen. \
+         Run the command again when the host answers, \
+         or name the box as provider/host/name."
+    );
+    let two = BoxAttachRefusal::Unreachable {
+        hosts: vec![
+            "beta.local-minvmd0".to_owned(),
+            "gamma.local-minvmd0".to_owned(),
+        ],
+    };
+    assert!(
+        two.to_string()
+            .starts_with("Could not reach hosts beta.local-minvmd0, gamma.local-minvmd0, so"),
+        "{two}"
+    );
+    assert_eq!(two.exit_code(), 7);
+}
+
+/// BCLI-068: a detach, or a box's entrypoint that exits on its own, ends
+/// the attach with exit 0 and no line of its own.
+#[tokio::test]
+async fn attach_detach_or_entrypoint_exit_returns_0() {
+    let target = ending_target("local0");
+    let quiet = AttachEnding {
+        code: 0,
+        notice: None,
+    };
+    let mut exited = ending_entry("exited");
+    exited.reason = Some("exit".to_owned());
+    exited.exit_code = Some(0);
+    for after in [
+        BoxAfterAttach::Listed(ending_entry("running")),
+        BoxAfterAttach::Listed(exited),
+        // The shell-exit prompt can delete the box the user chose to.
+        BoxAfterAttach::Gone,
+        BoxAfterAttach::HostSilent,
+        BoxAfterAttach::Unread,
+    ] {
+        assert_eq!(
+            attach_ending(&target, 0, &after),
+            Ok(quiet.clone()),
+            "{after:?}"
+        );
+    }
+
+    // A detach from a running box over a live host ends with 0.
+    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    alpha.create("web", Some(true)).await;
+    let ending = box_attach_on_hosts(
+        vec![alpha.host.clone()],
+        Some("web"),
+        None,
+        true,
+        async |_: &BoxAttachTarget| Ok(0),
+    )
+    .await
+    .expect("the detach ends the attach");
+    assert_eq!(ending, quiet);
+}
+
+/// BCLI-068: an attach the daemon ends from the other side exits with 254
+/// after one line that names the cause: a stop, a removal, another
+/// terminal that took the box, or a host that shut down. A stop gives 254
+/// although it also ends the entrypoint. A box that reads `exited` ended by
+/// itself, so its 254 ends with 0 and keeps its line.
+#[tokio::test]
+async fn attach_ended_from_other_side_notice_exit254() {
+    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    alpha.create("web", Some(true)).await;
+    let hosts = vec![alpha.host.clone()];
+
+    // The box is stopped while attached: the daemon reports 254, or 0 as
+    // for an entrypoint that ended.
+    for reported in [254, 0] {
+        let ending = box_attach_on_hosts(
+            hosts.clone(),
+            Some("web"),
+            None,
+            true,
+            async |_: &BoxAttachTarget| {
+                alpha.stop("web").await;
+                Ok(reported)
+            },
+        )
+        .await
+        .expect("the attach ends");
+        assert_eq!(
+            ending,
+            AttachEnding {
+                code: 254,
+                notice: Some("Detached: web was stopped.".to_owned())
+            },
+            "reported {reported}"
+        );
+        let mut daemon = alpha.server.connect().await;
+        resume_for_attach_test(&mut daemon, &alpha.host).await;
+    }
+
+    // The box is removed while attached.
+    let ending = box_attach_on_hosts(
+        hosts.clone(),
+        Some("web"),
+        None,
+        true,
+        async |_: &BoxAttachTarget| {
+            cmd::rm_box_on_hosts(hosts.clone(), "web", true)
+                .await
+                .expect("the removal succeeds");
+            Ok(254)
+        },
+    )
+    .await
+    .expect("the attach ends");
+    assert_eq!(
+        ending,
+        AttachEnding {
+            code: 254,
+            notice: Some("Detached: web was removed.".to_owned())
+        }
+    );
+
+    // Another terminal took the box, or the host shut down.
+    let target = ending_target("local0");
+    let line = |after: BoxAfterAttach| {
+        attach_ending(&target, 254, &after)
+            .expect("an ending")
+            .notice
+            .expect("a line")
+    };
+    assert_eq!(
+        line(BoxAfterAttach::Listed(ending_entry("running"))),
+        "Detached: another terminal attached to web."
+    );
+    assert_eq!(
+        line(BoxAfterAttach::HostSilent),
+        "Detached: host local0 shut down or stopped answering."
+    );
+    // A box that reads `exited` ended by itself: the attach ends with 0,
+    // and the line says how the box ended.
+    let exited_ending = |reason: &str, exit_code: Option<i32>| {
+        let mut entry = ending_entry("exited");
+        entry.reason = Some(reason.to_owned());
+        entry.exit_code = exit_code;
+        attach_ending(&target, 254, &BoxAfterAttach::Listed(entry)).expect("an ending")
+    };
+    assert_eq!(
+        exited_ending("exit", Some(3)),
+        AttachEnding {
+            code: 0,
+            notice: Some("Detached: web exited with code 3.".to_owned())
+        }
+    );
+    assert_eq!(
+        exited_ending("timeout", None),
+        AttachEnding {
+            code: 0,
+            notice: Some("Detached: web ran past its timeout and ended.".to_owned())
+        }
+    );
+    // An OOM record stores exit code 137 too. The line names the OOM.
+    assert_eq!(
+        exited_ending("oom", Some(137)),
+        AttachEnding {
+            code: 0,
+            notice: Some("Detached: web ran out of memory and ended.".to_owned())
+        }
+    );
+    // A stop whose entrypoint exited on its SIGTERM records the
+    // entrypoint's own code. The daemon reports 0 for it, and it is still
+    // a stop.
+    let mut stopped = ending_entry("stopped");
+    stopped.reason = Some("stopped".to_owned());
+    stopped.exit_code = Some(0);
+    assert_eq!(
+        attach_ending(&target, 0, &BoxAfterAttach::Listed(stopped)),
+        Ok(AttachEnding {
+            code: 254,
+            notice: Some("Detached: web was stopped.".to_owned())
+        })
+    );
+    assert_eq!(
+        attach_ending(&target, 254, &BoxAfterAttach::Unread),
+        Ok(AttachEnding {
+            code: 254,
+            notice: Some("Detached: host local0 ended the attach to web.".to_owned())
+        }),
+        "a host that answered with an error proves no cause, so the line names the host"
+    );
+}
+
+/// BCLI-068: the daemon closes the attach's channel before it writes the
+/// stopped record, so the first read after the attach still sees the box
+/// running. The command reads again until the record says why, and a stop
+/// still ends with 254 and its line, whether the daemon reported 254 or 0.
+#[tokio::test]
+async fn attach_ended_from_other_side_notice_exit254_before_the_record() {
+    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    alpha.create("web", Some(true)).await;
+    let hosts = vec![alpha.host.clone()];
+
+    for reported in [254, 0] {
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
+        let attach = box_attach_on_hosts(
+            hosts.clone(),
+            Some("web"),
+            None,
+            true,
+            async move |_: &BoxAttachTarget| {
+                // The channel closed: the stop has not written the record.
+                let _ = closed_tx.send(());
+                Ok(reported)
+            },
+        );
+        let stop = async {
+            closed_rx.await.expect("the attach ran");
+            // Let the command's first read see the box running.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            alpha.stop("web").await;
+        };
+        let (ending, ()) = tokio::join!(attach, stop);
+        assert_eq!(
+            ending.expect("the attach ends"),
+            AttachEnding {
+                code: 254,
+                notice: Some("Detached: web was stopped.".to_owned())
+            },
+            "reported {reported}"
+        );
+        let mut daemon = alpha.server.connect().await;
+        resume_for_attach_test(&mut daemon, &alpha.host).await;
+    }
+
+    // A stop waits for a process that ignores SIGTERM until its grace
+    // period ends, so after a 254 the record can still read `running`
+    // more than 2 s after the channel closed. It is still a stop.
+    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
+    let attach = box_attach_on_hosts(
+        hosts.clone(),
+        Some("web"),
+        None,
+        true,
+        async move |_: &BoxAttachTarget| {
+            let _ = closed_tx.send(());
+            Ok(254)
+        },
+    );
+    let stop = async {
+        closed_rx.await.expect("the attach ran");
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        alpha.stop("web").await;
+    };
+    let (ending, ()) = tokio::join!(attach, stop);
+    assert_eq!(
+        ending.expect("the attach ends"),
+        AttachEnding {
+            code: 254,
+            notice: Some("Detached: web was stopped.".to_owned())
+        },
+        "a stop recorded after 2 s"
+    );
+}
+
+/// Starts the stopped box `web` on `host` again by its resume, so the
+/// next round of a test attaches to a running box. A harness box resumes
+/// through the same create flow, so this creates it afresh under the name.
+async fn resume_for_attach_test(daemon: &mut minimald::test_harness::TestClient, host: &LocalHost) {
+    cmd::rm_box_on_hosts(vec![host.clone()], "web", true)
+        .await
+        .expect("the stopped box is removed");
+    let project = tempfile::TempDir::new().unwrap();
+    create_attach_box(daemon, "web", project.path(), Some(true)).await;
+}
+
+/// BCLI-068: a connection to the box's host that fails during the attach
+/// fails the command with exit 7 and names the host, whether or not the
+/// host still answers.
+#[tokio::test]
+async fn attach_connection_failure_exit7() {
+    let target = ending_target("alpha.local-minvmd0");
+    let refusal = attach_ending(&target, 255, &BoxAfterAttach::HostSilent)
+        .expect_err("a silent host after ssh failed is a lost connection");
+    assert_eq!(refusal.exit_code(), 7);
+    assert_eq!(
+        refusal.to_string(),
+        "The connection to host alpha.local-minvmd0 failed during the attach. \
+         Run `min box attach web` to attach again."
+    );
+    // The binary finds the refusal through the error chain it travels in.
+    let err = anyhow::Error::from(refusal).context("attaching");
+    assert_eq!(attach_refusal(&err).1, 7);
+
+    for after in [
+        BoxAfterAttach::Listed(ending_entry("running")),
+        BoxAfterAttach::Gone,
+        BoxAfterAttach::Unread,
+    ] {
+        assert_eq!(
+            attach_ending(&target, 255, &after).map_err(|refusal| refusal.exit_code()),
+            Err(7),
+            "{after:?}"
+        );
+    }
+
+    // A host with no daemon at its socket is read as silent.
+    let down = address_host(LOCAL_MINVMD_PROVIDER, "alpha.local-minvmd0", false);
+    assert_eq!(
+        box_after_attach(&down, target.box_id).await,
+        BoxAfterAttach::HostSilent
+    );
+
+    // ssh's 255 over a host that still answers is a lost connection too.
+    let alpha = AttachHost::start("alpha.local-minvmd0").await;
+    alpha.create("web", Some(true)).await;
+    let err = box_attach_on_hosts(
+        vec![alpha.host.clone()],
+        Some("web"),
+        None,
+        true,
+        async |_: &BoxAttachTarget| Ok(255),
+    )
+    .await
+    .expect_err("ssh failed");
+    assert_eq!(attach_refusal(&err).1, 7);
 }
 
 /// Runs one step of the address end-to-end test below inside its own
