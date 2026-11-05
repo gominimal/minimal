@@ -8503,7 +8503,9 @@ async fn a_second_take_of_entrypoint_streams_is_refused_while_the_first_reads() 
     );
 
     handle.kill(true).await.expect("kill should reach the host");
-    let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
+    let _ended = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the host ends after the kill");
 }
 
 /// BOX-155: the box's output is in its log from the start, with no client
