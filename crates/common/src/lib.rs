@@ -311,9 +311,10 @@ impl From<std::io::Error> for GlobError {
 }
 
 /// Enumerates files which match the given glob within the given directory.
-/// Symlinked directories are followed, as the callers that read a build's
-/// outputs by their declared layout expect (`lib64 -> lib`); a scan over
-/// untrusted output takes [`match_files_for_glob_no_follow`] instead.
+/// Symlinked directories are followed and nothing stops a loop: a link to an
+/// ancestor (`a -> .`) is walked down to the kernel's link limit, matching
+/// each file under it once per level. For a tree a build wrote, use
+/// [`match_files_for_glob_no_follow`].
 pub fn match_files_for_glob(dir: &Path, glob: &str) -> Result<Vec<PathBuf>, GlobError> {
     match_files_for_glob_with(dir, glob, true)
 }
@@ -373,33 +374,6 @@ fn match_files_for_glob_with(
 
     walk_dir(dir, dir, &matcher, follow_symlinked_dirs, &mut results)?;
     Ok(results)
-}
-
-#[cfg(test)]
-mod glob_tests {
-    use super::*;
-
-    /// A symlink loop in a tree sends the following walk down `a/a/a/...` until
-    /// the kernel's link limit, matching the same file at every level; the
-    /// no-follow walk returns each file once, ignores the loop, and still
-    /// matches a symlinked file.
-    #[test]
-    fn the_no_follow_walk_ignores_a_symlink_loop() {
-        let t = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(t.path().join("bin")).unwrap();
-        std::fs::write(t.path().join("bin/x"), b"x").unwrap();
-        std::os::unix::fs::symlink(".", t.path().join("a")).unwrap();
-        std::os::unix::fs::symlink("bin/x", t.path().join("y")).unwrap();
-        let mut got = match_files_for_glob_no_follow(t.path(), "**/*").unwrap();
-        got.sort();
-        assert_eq!(got, vec![t.path().join("bin/x"), t.path().join("y")]);
-        let following = match_files_for_glob(t.path(), "**/*").unwrap();
-        assert!(
-            following.len() > got.len(),
-            "the following walk matched {} paths: the loop walked",
-            following.len()
-        );
-    }
 }
 
 pub fn synth_dns_config(p: &Path) -> Result<(), io::Error> {
@@ -740,6 +714,28 @@ pub fn default_parallelism() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A symlink loop in a tree sends the following walk down `a/a/a/...` until
+    /// the kernel's link limit, matching the same file at every level; the
+    /// no-follow walk returns each file once, ignores the loop, and still
+    /// matches a symlinked file.
+    #[test]
+    fn the_no_follow_walk_ignores_a_symlink_loop() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(t.path().join("bin")).unwrap();
+        std::fs::write(t.path().join("bin/x"), b"x").unwrap();
+        std::os::unix::fs::symlink(".", t.path().join("a")).unwrap();
+        std::os::unix::fs::symlink("bin/x", t.path().join("y")).unwrap();
+        let mut got = match_files_for_glob_no_follow(t.path(), "**/*").unwrap();
+        got.sort();
+        assert_eq!(got, vec![t.path().join("bin/x"), t.path().join("y")]);
+        let following = match_files_for_glob(t.path(), "**/*").unwrap();
+        assert!(
+            following.len() > got.len(),
+            "the following walk matched {} paths: the loop walked",
+            following.len()
+        );
+    }
 
     #[test]
     fn synth_user_group_config_sets_home_on_uid_1000() {
