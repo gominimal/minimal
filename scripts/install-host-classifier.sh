@@ -543,7 +543,12 @@ readonly PROC=${MINIMAL_OVERRIDE_PROC:-/proc}
 # lift it out of its verdict (design §4.1: a box's placement is
 # inescapable, by root's hand as much as its own). A socket nobody holds is
 # nothing to place and exits 0: the unit fires on the socket's removal too,
-# and that is not a failure.
+# and that is not a failure. A socket not yet bound when the unit fires is
+# waited for, briefly: the path unit watches the directory, so it can run
+# this step between the daemon's creating the directory and its binding the
+# listener, and the manager holds no watch of its own while the oneshot is
+# active — the bind itself fires nothing, so this step is the one place the
+# gap can be covered.
 place_listener() {
     verify_mount
     resolve_owner
@@ -557,6 +562,22 @@ place_listener() {
     # stale entry outlives nothing here, but the match is by inode, so each
     # live one is placed and a dead one simply has no holder).
     inodes="$(awk -v p="$listener" '$8 == p { print $7 }' "$PROC/net/unix")"
+    # The directory watch can fire this step between the daemon's creating
+    # the provider directory and its binding the listener — and while the
+    # oneshot runs, the manager holds no watch (it is the triggered unit's
+    # own run), so the bind in that window fires nothing and would leave the
+    # daemon unplaced for its whole life. The socket is therefore looked
+    # for a few more times, a moment apart, before its absence reads as
+    # final; the wait is bounded because the unit also fires on the
+    # socket's removal, when no daemon is coming at all.
+    attempt=0
+    while [ -z "$inodes" ]; do
+        attempt=$((attempt + 1))
+        [ "$attempt" -le 3 ] || break
+        note "no socket at $listener yet: waiting for the daemon to bind it (pass $attempt of 3)"
+        sleep 1
+        inodes="$(awk -v p="$listener" '$8 == p { print $7 }' "$PROC/net/unix")"
+    done
     if [ -z "$inodes" ]; then
         note "no process holds $listener: nothing to place"
         return 0

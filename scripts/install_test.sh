@@ -3358,13 +3358,45 @@ STUB
     want_err "and does not claim the socket is unheld" grep -q "no process holds" "$OUT"
     want_err "and places nothing" [ -s "$tree/daemon/cgroup.procs" ]
     printf 'Num       RefCount Protocol Flags    Type St Inode Path\n' >"$fproc/net/unix"
+    # A daemon that binds its listener while the unit-triggered step is
+    # already running: the path unit watches the directory, so it can fire
+    # between the daemon's creating the directory and its binding the
+    # socket, and the manager holds no watch of its own while the oneshot
+    # runs — the bind in that window fires nothing. The step therefore
+    # waits, briefly, for the socket to appear and then places the holder.
+    # The stand-in: the daemon's fd table is recreated the way the skipped
+    # pass above left it gone, and the socket's net/unix line appears a
+    # moment after the step has already looked and found nothing, as if
+    # bound mid-run.
+    mkdir -p "$fproc/4242/fd"
+    ln -s 'socket:[777]' "$fproc/4242/fd/5"
+    printf 'Name:\tminimald\nUid:\t%s\t%s\t%s\t%s\n' "$me" "$me" "$me" "$me" >"$fproc/4242/status"
+    printf '0::/user.slice/user-%s.slice/session-1.scope\n' "$me" >"$fproc/4242/cgroup"
+    {
+        printf 'Num       RefCount Protocol Flags    Type St Inode Path\n'
+        sleep 1
+        printf '0000 00000002 00000000 00010000 0001 01 777 %s\n' "$lsock"
+    } >"$fproc/net/unix" &
+    netunix_writer=$!
+    : >"$tree/daemon/cgroup.procs"
+    run_hc place_listener_late "$root/mi-on" --user "$me" --place-listener "$lsock"
+    wait "$netunix_writer"
+    check 0 "$rc" "--place-listener waits for a socket bound mid-run and exits 0"
+    want_ok "the step says it waited for the daemon to bind the socket" \
+        grep -q "no socket at .* yet: waiting for the daemon to bind it" "$OUT"
+    want_ok "the late-bound socket's holder is placed" \
+        grep -qx 4242 "$tree/daemon/cgroup.procs"
+    rm -rf "$fproc/4242"
+    printf 'Num       RefCount Protocol Flags    Type St Inode Path\n' >"$fproc/net/unix"
     run_hc place_listener_nobody "$root/mi-on" --user "$me" --place-listener "$lsock"
     check 0 "$rc" "--place-listener over a socket nobody holds exits 0"
     want_ok "nobody holding it is nothing to place, said so" grep -q "no process holds .*: nothing to place" "$OUT"
     want_err "an unbound socket is not scanned twice" grep -q "scanned again" "$OUT"
     # A listed inode whose holder is not in any fd table (it vanished under
     # the scan): one more pass after a moment, then nothing to place, and
-    # still not a failure.
+    # still not a failure. The closing "nothing to place" is the vanished
+    # holder's own wording: the socket IS listed, so its absence from the fd
+    # tables reads as unheld, not as never-bound.
     {
         printf 'Num       RefCount Protocol Flags    Type St Inode Path\n'
         printf '0000 00000002 00000000 00010000 0001 01 779 %s\n' "$lsock"
