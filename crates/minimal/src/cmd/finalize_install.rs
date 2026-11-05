@@ -1452,12 +1452,16 @@ pub(crate) mod linux {
     /// The pid of the running native daemon for `socket` when it stands
     /// outside the tree's daemon leaf under `root`, and `None` when no such
     /// daemon runs, when it is in its leaf, or when the leaf is not there.
-    /// The pid is the one the daemon writes into the instance lock beside
-    /// its socket, and counts only while `/proc/<pid>/comm` reads
-    /// `minimald`, so a lock left by a daemon that has gone names nothing.
+    /// The pid is the holder of the instance lock beside the socket, as the
+    /// kernel lists it in `/proc/locks`, never the pid written into the file:
+    /// the file is the account's to edit, and a lock no process holds names
+    /// nothing. It counts only while `/proc/<pid>/comm` reads `minimald`.
     fn unplaced_daemon_pid(root: &std::path::Path, socket: &std::path::Path) -> Option<u32> {
+        use std::os::unix::fs::MetadataExt as _;
         let lock = socket.parent()?.join(paths::MINIMALD_LOCK_FILE);
-        let pid: u32 = std::fs::read_to_string(lock).ok()?.trim().parse().ok()?;
+        let inode = std::fs::metadata(lock).ok()?.ino();
+        let locks = std::fs::read_to_string("/proc/locks").ok()?;
+        let pid = lock_holder(&locks, inode)?;
         let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
         if comm.trim() != "minimald" {
             return None;
@@ -1467,6 +1471,24 @@ pub(crate) mod linux {
             .lines()
             .any(|member| member.trim().parse::<u32>() == Ok(pid));
         (!placed).then_some(pid)
+    }
+
+    /// The pid holding an exclusive `flock` on the file with inode `inode`,
+    /// read from a `/proc/locks` listing: `<n>: FLOCK ADVISORY WRITE <pid>
+    /// <major>:<minor>:<inode> <start> <end>`. Blocked waiters (`->` lines)
+    /// are not holders.
+    pub(crate) fn lock_holder(locks: &str, inode: u64) -> Option<u32> {
+        locks.lines().find_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            match fields.as_slice() {
+                [_, "FLOCK", _, "WRITE", pid, id, ..]
+                    if id.rsplit(':').next()?.parse::<u64>().ok()? == inode =>
+                {
+                    pid.parse().ok()
+                }
+                _ => None,
+            }
+        })
     }
 
     /// [`classifier_item_over`]'s inputs from this host's reads: the table's
@@ -3318,6 +3340,14 @@ mod tests {
             !script.contains("cat >"),
             "the block writes no unit and no copy of the step: {script}"
         );
+        // The pid is the lock's holder as the kernel lists it, never a
+        // waiter and never another file's holder.
+        let locks = "1: FLOCK  ADVISORY  WRITE 4242 00:2a:777 0 EOF\n\
+                     1: -> FLOCK  ADVISORY  WRITE 5151 00:2a:777 0 EOF\n\
+                     2: POSIX  ADVISORY  WRITE 6161 00:2a:888 0 EOF\n";
+        assert_eq!(linux::lock_holder(locks, 777), Some(4242));
+        assert_eq!(linux::lock_holder(locks, 888), None);
+        assert_eq!(linux::lock_holder(locks, 999), None);
         // A step that is not installed is the install's item, whatever the
         // daemon's placement: the install places the daemon too.
         let bare = classifier_item_over(
