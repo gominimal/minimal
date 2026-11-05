@@ -3787,15 +3787,18 @@ impl BoxManager {
                             continue;
                         }
                         let record = handle.record().await?;
+                        // A spec that cannot be read leaves the Box Type
+                        // to go by, as for a box filed with no spec, so a
+                        // session still lists with its terminal.
                         let stored = match handle.object().await.and_then(|o| o.load_spec()) {
                             Ok(stored) => stored,
                             Err(error) => {
-                                tracing::debug!(
+                                tracing::warn!(
                                     session_id = %record.id,
                                     %error,
-                                    "could not read the box's stored spec; listed with no terminal"
+                                    "could not read the box's stored spec; terminal taken from its box type"
                                 );
-                                Some(Vec::new())
+                                None
                             }
                         };
                         let pty = record_has_pty(&record, stored.as_deref());

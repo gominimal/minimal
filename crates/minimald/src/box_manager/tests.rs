@@ -3311,9 +3311,27 @@ async fn box_listing_and_show_carry_pty_enabled() {
         .create_session(rooted_config("unspecced", "/home/dev/proj"), None)
         .await
         .unwrap();
+    // A session whose stored spec cannot be read: a directory stands where
+    // the file goes. It lists on its Box Type, so with a terminal.
+    let unreadable = mngr
+        .create_session(rooted_config("unreadable", "/home/dev/proj"), None)
+        .await
+        .unwrap();
+    let spec_path = mngr
+        .box_events(unreadable)
+        .await
+        .unwrap()
+        .object
+        .spec_path();
+    std::fs::create_dir(spec_path.as_utf8_path()).unwrap();
 
     let listing = mngr.list_boxes(None).await.unwrap();
-    for (id, pty) in [(terminal, true), (headless, false), (unspecced, true)] {
+    for (id, pty) in [
+        (terminal, true),
+        (headless, false),
+        (unspecced, true),
+        (unreadable, true),
+    ] {
         let listed = listing
             .iter()
             .find(|entry| entry.box_id == id)
