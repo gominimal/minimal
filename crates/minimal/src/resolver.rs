@@ -3636,7 +3636,7 @@ pub(crate) const CLASSIFIER_PROGRAM_PATH: &str =
     "/usr/local/lib/minimal/install-host-classifier.sh";
 
 /// The systemd unit pair that places the daemon's listener in its leaf on
-/// every daemon start: a socket unit at [`PLACE_REQUEST_SOCKET`], which the
+/// every daemon start: a socket unit at [`paths::PLACE_REQUEST_SOCKET`], which the
 /// daemon connects to once its own listener is bound, and the template
 /// service systemd starts for each connection, which runs the step's
 /// `--place-listener`. The pair is why no daemon restart needs a root step
@@ -3649,10 +3649,6 @@ pub(crate) const PLACE_SYSTEMD_UNIT: &str = "minimald-place";
 pub(crate) const PLACE_UNIT_SOCKET_PATH: &str = "/etc/systemd/system/minimald-place.socket";
 #[cfg(any(test, not(target_os = "macos")))]
 pub(crate) const PLACE_UNIT_SERVICE_PATH: &str = "/etc/systemd/system/minimald-place@.service";
-/// The socket the placement unit listens on. minimald spells it the same
-/// way (`PLACE_REQUEST_SOCKET` in `crates/minimald/src/net/classifier.rs`).
-#[cfg(any(test, not(target_os = "macos")))]
-pub(crate) const PLACE_REQUEST_SOCKET: &str = "/run/minimald-place.sock";
 /// The path unit and its oneshot an earlier install placed the daemon with,
 /// by watching the daemon's socket. The install removes them before it
 /// writes the socket pair, and `--undo` removes whichever it finds.

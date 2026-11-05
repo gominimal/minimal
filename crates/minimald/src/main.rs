@@ -1360,24 +1360,24 @@ async fn request_daemon_placement(tree_root: &std::path::Path) {
     }
     let request = minimald::traced::spawn_blocking(|| {
         classifier::request_daemon_placement(
-            std::path::Path::new(classifier::PLACE_REQUEST_SOCKET),
+            std::path::Path::new(paths::PLACE_REQUEST_SOCKET),
             classifier::PLACE_REQUEST_WAIT,
         )
     })
     .await;
     match request {
         Ok(PlaceRequest::Answered) => tracing::info!(
-            socket = classifier::PLACE_REQUEST_SOCKET,
+            socket = paths::PLACE_REQUEST_SOCKET,
             placed = classifier::daemon_fetch_leaf(tree_root).is_some(),
             "the placement unit answered this daemon's placement request"
         ),
         Ok(PlaceRequest::NoPlacer(e)) => tracing::info!(
-            socket = classifier::PLACE_REQUEST_SOCKET,
+            socket = paths::PLACE_REQUEST_SOCKET,
             error = %e,
             "no placement unit answers on this host, so nothing placed this daemon at start"
         ),
         Ok(PlaceRequest::NoAnswer(e)) => tracing::warn!(
-            socket = classifier::PLACE_REQUEST_SOCKET,
+            socket = paths::PLACE_REQUEST_SOCKET,
             error = %e,
             wait_secs = classifier::PLACE_REQUEST_WAIT.as_secs(),
             "the placement unit did not finish placing this daemon in time"

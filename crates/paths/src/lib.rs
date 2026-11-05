@@ -166,6 +166,14 @@ pub const KNOWN_HOSTS_FILE: &str = "known_hosts";
 pub const MINIMALD_LOCK_FILE: &str = "minimald.lock";
 /// The minvmd supervisor's alive lock, held for the daemon's lifetime.
 pub const MINVMD_LOCK_FILE: &str = "minvmd.lock";
+/// The socket the placement unit `min finalize-install` installs listens on
+/// (`minimald-place.socket`), which native minimald connects to once its
+/// listener is bound. systemd holds it in `/run`, owned by the delegated
+/// account with mode 0600, so only that account and root connect. systemd
+/// starts the root-owned placer for each connection. The placer finds the
+/// daemon from the holders of its listening socket, never from the
+/// connection, so a connection asks for a placement and names nothing.
+pub const PLACE_REQUEST_SOCKET: &str = "/run/minimald-place.sock";
 
 /// Which local daemon backend (box host) an instance directory belongs to.
 ///

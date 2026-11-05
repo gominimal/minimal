@@ -3039,16 +3039,6 @@ pub fn daemon_fetch_leaf(root: &Path) -> Option<&'static str> {
         .then_some(sandbox::classifier::DAEMON_LEAF)
 }
 
-/// The socket the placement unit `min finalize-install` installs listens on
-/// (`minimald-place.socket`). The CLI spells it the same way
-/// (`PLACE_REQUEST_SOCKET` in `crates/minimal/src/resolver.rs`). systemd
-/// holds it in `/run`, owned by the delegated account with mode 0600, so
-/// only that account and root connect. systemd starts the root-owned placer
-/// for each connection. The placer finds the daemon from the holders of its
-/// listening socket, never from the connection, so a connection asks for a
-/// placement and names nothing.
-pub const PLACE_REQUEST_SOCKET: &str = "/run/minimald-place.sock";
-
 /// How long a daemon waits for the placer to finish: the placer scans every
 /// process's fd table and looks once more after a second when it finds no
 /// holder, so a few seconds cover it on a loaded host.

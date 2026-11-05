@@ -740,8 +740,9 @@ pub(crate) mod linux {
         CLASSIFIER_SCRIPT, CLASSIFIER_SCRIPT_HEREDOC, CLASSIFIER_SYSTEMD_UNIT,
         CLASSIFIER_TREE_RECORD, CLASSIFIER_TREE_ROOT, CLASSIFIER_UNIT_SERVICE_PATH,
         KVM_GROUP_RECORD, LEGACY_PLACE_UNIT_PATH_PATH, LEGACY_PLACE_UNIT_SERVICE_PATH,
-        PLACE_REQUEST_SOCKET, PLACE_SYSTEMD_UNIT, PLACE_UNIT_SERVICE_PATH, PLACE_UNIT_SOCKET_PATH,
+        PLACE_SYSTEMD_UNIT, PLACE_UNIT_SERVICE_PATH, PLACE_UNIT_SOCKET_PATH,
     };
+    use paths::PLACE_REQUEST_SOCKET;
 
     pub(crate) const USERNS_ID: &str = "userns-profile";
     const USERNS_LABEL: &str = "the private sandbox every box runs in";
@@ -3471,10 +3472,10 @@ mod tests {
         use crate::resolver::{
             CLASSIFIER_PROGRAM_PATH, CLASSIFIER_SCRIPT, CLASSIFIER_SCRIPT_HEREDOC,
             CLASSIFIER_TREE_RECORD, CLASSIFIER_UNIT_SERVICE_PATH, LEGACY_PLACE_UNIT_PATH_PATH,
-            LEGACY_PLACE_UNIT_SERVICE_PATH, PLACE_REQUEST_SOCKET, PLACE_UNIT_SERVICE_PATH,
-            PLACE_UNIT_SOCKET_PATH,
+            LEGACY_PLACE_UNIT_SERVICE_PATH, PLACE_UNIT_SERVICE_PATH, PLACE_UNIT_SOCKET_PATH,
         };
         use linux::{Cgroup2Mount, ClassifierFacts, classifier_item_over};
+        use paths::PLACE_REQUEST_SOCKET;
         let sock = "/home/alice/.local/state/minimal/providers/local-minimald0/ssh.sock";
         let item = classifier_item_over(
             &ClassifierFacts {
