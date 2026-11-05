@@ -1187,7 +1187,9 @@ pub(crate) mod linux {
 
     /// The step's block: the classifier's step written from the bytes this
     /// binary carries to its root-owned copy (beside the target, then moved
-    /// over it) and run with no source identity, then the units — a boot
+    /// over it) and run with no source identity; a run that fails puts the
+    /// previous copy back and stops the block, so the units already
+    /// installed keep the copy they were written for. Then the units — a boot
     /// oneshot that re-runs the step, and the placement pair: a socket unit
     /// the daemon connects to at start and the template service systemd
     /// starts per connection — enabled, the path pair an earlier install
@@ -1211,8 +1213,25 @@ pub(crate) mod linux {
              {CLASSIFIER_SCRIPT}\
              {CLASSIFIER_SCRIPT_HEREDOC}\n\
              chmod 0755 {CLASSIFIER_PROGRAM_PATH}.new\n\
+             # The new copy stays only once its step has installed. A step that refuses\n\
+             # (a connection-mark conflict, say) changes nothing, and the units below are\n\
+             # not reached, so the copy they run goes back to the previous one (or away,\n\
+             # when there was none) and the next boot restores what this host had.\n\
+             rm -f {CLASSIFIER_PROGRAM_PATH}.prev\n\
+             [ ! -e {CLASSIFIER_PROGRAM_PATH} ] || cp -p {CLASSIFIER_PROGRAM_PATH} \
+             {CLASSIFIER_PROGRAM_PATH}.prev\n\
              mv -f {CLASSIFIER_PROGRAM_PATH}.new {CLASSIFIER_PROGRAM_PATH}\n\
-             {CLASSIFIER_PROGRAM_PATH} --user '{operator}'{mask}\n\
+             if {CLASSIFIER_PROGRAM_PATH} --user '{operator}'{mask}; then\n\
+             \x20 rm -f {CLASSIFIER_PROGRAM_PATH}.prev\n\
+             else\n\
+             \x20 classifier_status=$?\n\
+             \x20 if [ -e {CLASSIFIER_PROGRAM_PATH}.prev ]; then\n\
+             \x20   mv -f {CLASSIFIER_PROGRAM_PATH}.prev {CLASSIFIER_PROGRAM_PATH}\n\
+             \x20 else\n\
+             \x20   rm -f {CLASSIFIER_PROGRAM_PATH}\n\
+             \x20 fi\n\
+             \x20 exit \"$classifier_status\"\n\
+             fi\n\
              # The record marks the tree as this step's, so --undo removes it; one\n\
              # installed another way is left alone.\n\
              mkdir -p /var/lib/minimal\n\
@@ -2962,7 +2981,7 @@ mod tests {
         };
         let run = plan.script().expect("a script while items are missing");
         let program = format!(
-            "{} --user 'alice'\n",
+            "if {} --user 'alice'; then\n",
             crate::resolver::CLASSIFIER_PROGRAM_PATH
         );
         assert!(
@@ -3245,7 +3264,7 @@ mod tests {
         let script = stale.script.expect("a stale copy carries the block");
         assert!(
             script.contains(&format!(
-                "\n{CLASSIFIER_PROGRAM_PATH} --user 'alice' --ct-mark-mask 0x0c000000\n"
+                "\nif {CLASSIFIER_PROGRAM_PATH} --user 'alice' --ct-mark-mask 0x0c000000; then\n"
             )),
             "the refresh runs the step with the recorded mask: {script}"
         );
@@ -3409,7 +3428,7 @@ mod tests {
             format!("{CLASSIFIER_SCRIPT}{CLASSIFIER_SCRIPT_HEREDOC}\n"),
             format!("chmod 0755 {CLASSIFIER_PROGRAM_PATH}.new\n"),
             format!("mv -f {CLASSIFIER_PROGRAM_PATH}.new {CLASSIFIER_PROGRAM_PATH}\n"),
-            format!("{CLASSIFIER_PROGRAM_PATH} --user 'alice'\n"),
+            format!("if {CLASSIFIER_PROGRAM_PATH} --user 'alice'; then\n"),
             format!(": > {CLASSIFIER_TREE_RECORD}\n"),
             format!("cat > {CLASSIFIER_UNIT_SERVICE_PATH} <<"),
             format!("ExecStart={CLASSIFIER_PROGRAM_PATH} --user 'alice'\n"),
@@ -3448,7 +3467,7 @@ mod tests {
             .expect("the unit guard splits the block");
         let step_lines = step_part.replace(CLASSIFIER_SCRIPT, "");
         assert!(
-            step_lines.contains("--user 'alice'\n")
+            step_lines.contains("--user 'alice'; then\n")
                 && !step_lines
                     .lines()
                     .any(|line| !line.starts_with('#') && line.contains("systemctl")),
@@ -3488,6 +3507,159 @@ mod tests {
             "the delimiter never occurs in the script it delimits"
         );
     }
+
+    /// The classifier block run for real under a scratch root, with the
+    /// step stubbed: one that refuses leaves the copy the units run and
+    /// the units themselves as they were, and one that installs replaces
+    /// the copy and goes on to the units.
+    #[test]
+    fn a_refused_classifier_step_keeps_the_installed_copy_and_units() {
+        use crate::resolver::{ANSWERER_PROGRAM_DIR, CLASSIFIER_SCRIPT};
+        use linux::{Cgroup2Mount, ClassifierFacts, classifier_item_over};
+        use std::os::unix::fs::PermissionsExt;
+
+        const OLD_COPY: &str = "#!/bin/sh\necho the previous step\n";
+        const OLD_UNIT: &str = "[Unit]\nDescription=the previous unit\n";
+
+        /// Runs the block under a fresh scratch root, with the step
+        /// replaced by `stub` and, when `installed` is set, a previous copy
+        /// and units already in place. Returns the root, the exit code,
+        /// and the scratch paths of the copy and the units directory.
+        fn run_block(
+            stub: &str,
+            installed: bool,
+        ) -> (
+            tempfile::TempDir,
+            Option<i32>,
+            std::path::PathBuf,
+            std::path::PathBuf,
+        ) {
+            let root = tempfile::tempdir().expect("a temp dir");
+            let lib = root.path().join("lib");
+            let units = root.path().join("units");
+            let var = root.path().join("var");
+            let bin = root.path().join("bin");
+            for dir in [&lib, &units, &var, &bin] {
+                std::fs::create_dir_all(dir).expect("a scratch dir");
+            }
+            let copy = lib.join("install-host-classifier.sh");
+            if installed {
+                std::fs::write(&copy, OLD_COPY).expect("the previous copy");
+                for unit in ["minimald-classifier.service", "minimald-place.path"] {
+                    std::fs::write(units.join(unit), OLD_UNIT).expect("a previous unit");
+                }
+            }
+            let systemctl = bin.join("systemctl");
+            std::fs::write(
+                &systemctl,
+                format!(
+                    "#!/bin/sh\necho \"$*\" >> '{}'\n",
+                    root.path().join("systemctl.log").display()
+                ),
+            )
+            .expect("the systemctl stub");
+            std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755))
+                .expect("an executable stub");
+
+            let item = classifier_item_over(
+                &ClassifierFacts {
+                    table_present: false,
+                    recorded_mask: None,
+                    requested_mask: None,
+                    copy_current: false,
+                    units_enabled: Some(false),
+                    other_owner: None,
+                    root: false,
+                    mount: Cgroup2Mount::Delegated,
+                    unplaced_daemon: None,
+                },
+                "alice",
+                "/home/alice/ssh.sock",
+            );
+            let plan = Plan { items: vec![item] };
+            let script = plan
+                .script()
+                .expect("a missing item carries its block")
+                .replace(CLASSIFIER_SCRIPT, stub)
+                .replace(ANSWERER_PROGRAM_DIR, &lib.display().to_string())
+                .replace("/etc/systemd/system", &units.display().to_string())
+                .replace("/var/lib/minimal", &var.display().to_string());
+            let path = format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .env("PATH", path)
+                .output()
+                .expect("sh runs the block");
+            (root, output.status.code(), copy, units)
+        }
+
+        let refusing = "#!/bin/sh\necho 'refusing: a connection-mark conflict' >&2\nexit 3\n";
+        let (root, code, copy, units) = run_block(refusing, true);
+        assert_eq!(code, Some(3), "the block exits with the step's status");
+        assert_eq!(
+            std::fs::read_to_string(&copy).expect("the copy is still there"),
+            OLD_COPY,
+            "a refused step leaves the previous copy in place"
+        );
+        for unit in ["minimald-classifier.service", "minimald-place.path"] {
+            assert_eq!(
+                std::fs::read_to_string(units.join(unit)).expect("the unit is still there"),
+                OLD_UNIT,
+                "a refused step leaves {unit} as it was"
+            );
+        }
+        assert!(!units.join("minimald-place.socket").exists());
+        assert!(
+            !copy.with_extension("sh.new").exists(),
+            "no staged copy is left"
+        );
+        assert!(
+            !copy.with_extension("sh.prev").exists(),
+            "no kept copy is left"
+        );
+        assert!(
+            !root.path().join("var/finalize-install-classifier").exists(),
+            "a refused step writes no record"
+        );
+        assert!(
+            !root.path().join("systemctl.log").exists(),
+            "a refused step touches no unit"
+        );
+
+        let (_fresh, code, copy, _) = run_block(refusing, false);
+        assert_eq!(code, Some(3));
+        assert!(
+            !copy.exists(),
+            "a refused first install leaves no copy that never installed"
+        );
+
+        let installing = "#!/bin/sh\nexit 0\n";
+        let (root, code, copy, units) = run_block(installing, true);
+        assert_eq!(code, Some(0));
+        assert_eq!(
+            std::fs::read_to_string(&copy).expect("the new copy"),
+            installing,
+            "an installed step replaces the copy"
+        );
+        assert!(
+            !copy.with_extension("sh.prev").exists(),
+            "no kept copy is left"
+        );
+        assert!(
+            !units.join("minimald-place.path").exists(),
+            "the install goes on to the units"
+        );
+        assert!(root.path().join("var/finalize-install-classifier").exists());
+        let log = std::fs::read_to_string(root.path().join("systemctl.log"))
+            .expect("the units are enabled");
+        assert!(log.contains("enable --now minimald-place.socket"), "{log}");
+    }
+
     /// The KVM item's table: done when the device opens, a group step on
     /// permission denied, blocked when the device is not there.
     #[test]
