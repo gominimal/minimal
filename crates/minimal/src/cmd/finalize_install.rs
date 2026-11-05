@@ -1028,6 +1028,10 @@ pub(crate) mod linux {
         pub(crate) root: bool,
         /// The cgroup2 mount the tree needs.
         pub(crate) mount: Cgroup2Mount,
+        /// The pid of the running daemon when it stands outside the tree's
+        /// daemon leaf: a daemon no placement reached, so it cannot decide a
+        /// host-address box's egress per box until it is placed.
+        pub(crate) unplaced_daemon: Option<u32>,
     }
 
     /// The classifier item over its facts: done once the tree's marker,
@@ -1075,6 +1079,27 @@ pub(crate) mod linux {
             && facts.copy_current
             && facts.units_enabled != Some(false)
         {
+            // gominimal/inbox#1206: the step is installed, but the running
+            // daemon is outside its leaf. That is its own state, and its
+            // remedy is the step's --pid for that daemon alone.
+            if let Some(pid) = facts.unplaced_daemon {
+                return Item::missing(
+                    CLASSIFIER_ID,
+                    CLASSIFIER_LABEL,
+                    format!(
+                        "the running Minimal daemon (pid {pid}) is not placed in its \
+                         egress-enforcement cgroup, so it cannot enforce egress per box for \
+                         boxes that share this machine's address"
+                    ),
+                    format!(
+                        "places the running Minimal daemon (pid {pid}) in its egress-enforcement cgroup"
+                    ),
+                    format!(
+                        "# The running daemon, outside its leaf: the step's --pid places it.\n\
+                         {CLASSIFIER_PROGRAM_PATH} --pid {pid}\n"
+                    ),
+                );
+            }
             return Item::done(CLASSIFIER_ID, CLASSIFIER_LABEL);
         }
         let cause = match facts.mount {
@@ -1424,6 +1449,26 @@ pub(crate) mod linux {
         })
     }
 
+    /// The pid of the running native daemon for `socket` when it stands
+    /// outside the tree's daemon leaf under `root`, and `None` when no such
+    /// daemon runs, when it is in its leaf, or when the leaf is not there.
+    /// The pid is the one the daemon writes into the instance lock beside
+    /// its socket, and counts only while `/proc/<pid>/comm` reads
+    /// `minimald`, so a lock left by a daemon that has gone names nothing.
+    fn unplaced_daemon_pid(root: &std::path::Path, socket: &std::path::Path) -> Option<u32> {
+        let lock = socket.parent()?.join(paths::MINIMALD_LOCK_FILE);
+        let pid: u32 = std::fs::read_to_string(lock).ok()?.trim().parse().ok()?;
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+        if comm.trim() != "minimald" {
+            return None;
+        }
+        let members = std::fs::read_to_string(root.join("daemon").join("cgroup.procs")).ok()?;
+        let placed = members
+            .lines()
+            .any(|member| member.trim().parse::<u32>() == Ok(pid));
+        (!placed).then_some(pid)
+    }
+
     /// [`classifier_item_over`]'s inputs from this host's reads: the table's
     /// presence, the root-owned copy's bytes against this binary's, the
     /// units and their `multi-user.target` links where the host has
@@ -1467,7 +1512,12 @@ pub(crate) mod linux {
             .filter(|uid| *uid != me);
         let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
         let recorded = recorded_mask(root);
-        let socket = crate::client::resolve_socket_path(global.minimal_dir.as_deref(), false)
+        let socket_path = crate::client::resolve_socket_path(global.minimal_dir.as_deref(), false);
+        let unplaced_daemon = socket_path
+            .as_deref()
+            .ok()
+            .and_then(|socket| unplaced_daemon_pid(root, socket));
+        let socket = socket_path
             .map(|path| path.display().to_string())
             .unwrap_or_default();
         (
@@ -1480,6 +1530,7 @@ pub(crate) mod linux {
                 other_owner,
                 root: me == 0,
                 mount: cgroup2_mount_from(&mountinfo),
+                unplaced_daemon,
             },
             crate::resolver::operator_name(),
             socket,
@@ -2779,6 +2830,7 @@ mod tests {
             other_owner: None,
             root: false,
             mount: Cgroup2Mount::Delegated,
+            unplaced_daemon: None,
         };
         let installed = Quic443HelperFacts {
             helper_root_owned: true,
@@ -2931,6 +2983,7 @@ mod tests {
             other_owner: None,
             root: false,
             mount: Cgroup2Mount::Delegated,
+            unplaced_daemon: None,
         };
         let bare = ClassifierFacts {
             table_present: false,
@@ -3148,6 +3201,7 @@ mod tests {
             other_owner: None,
             root: false,
             mount: Cgroup2Mount::Delegated,
+            unplaced_daemon: None,
         };
         let stale = classifier_item_over(
             &ClassifierFacts {
@@ -3206,6 +3260,82 @@ mod tests {
         );
     }
 
+    /// gominimal/inbox#1206: a step that is installed while the running
+    /// daemon stands outside its leaf is its own state. The item names the
+    /// daemon by its pid, and its step is the step's --pid for that daemon
+    /// alone, never the whole install again. A placed daemon, or none
+    /// running, leaves the item done.
+    #[test]
+    fn classifier_item_names_an_unplaced_daemon() {
+        use crate::resolver::CLASSIFIER_PROGRAM_PATH;
+        use linux::{Cgroup2Mount, ClassifierFacts, classifier_item_over};
+        let sock = "/home/alice/.local/state/minimal/providers/local-minimald0/ssh.sock";
+        let installed = ClassifierFacts {
+            table_present: true,
+            recorded_mask: Some(0x3000_0000),
+            requested_mask: None,
+            copy_current: true,
+            units_enabled: Some(true),
+            other_owner: None,
+            root: false,
+            mount: Cgroup2Mount::Delegated,
+            unplaced_daemon: None,
+        };
+        assert_eq!(
+            classifier_item_over(&installed, "alice", sock).state,
+            ItemState::Done,
+            "a placed daemon, or none running, leaves the item done"
+        );
+        let unplaced = classifier_item_over(
+            &ClassifierFacts {
+                unplaced_daemon: Some(4242),
+                ..installed
+            },
+            "alice",
+            sock,
+        );
+        assert_eq!(unplaced.state, ItemState::Missing);
+        assert_eq!(
+            unplaced.today.as_deref(),
+            Some(
+                "the running Minimal daemon (pid 4242) is not placed in its \
+                 egress-enforcement cgroup, so it cannot enforce egress per box for boxes \
+                 that share this machine's address"
+            )
+        );
+        assert_eq!(
+            unplaced.step.as_deref(),
+            Some("places the running Minimal daemon (pid 4242) in its egress-enforcement cgroup")
+        );
+        let script = unplaced
+            .script
+            .expect("an unplaced daemon carries its block");
+        assert!(
+            script.contains(&format!("\n{CLASSIFIER_PROGRAM_PATH} --pid 4242\n")),
+            "the block places that daemon with the step's --pid: {script}"
+        );
+        assert!(
+            !script.contains("cat >"),
+            "the block writes no unit and no copy of the step: {script}"
+        );
+        // A step that is not installed is the install's item, whatever the
+        // daemon's placement: the install places the daemon too.
+        let bare = classifier_item_over(
+            &ClassifierFacts {
+                table_present: false,
+                unplaced_daemon: Some(4242),
+                ..installed
+            },
+            "alice",
+            sock,
+        );
+        assert!(
+            bare.script
+                .is_some_and(|script| script.contains("--place-listener")),
+            "the install's block places the listening daemon"
+        );
+    }
+
     #[test]
     fn classifier_step_places_the_daemon_on_every_start() {
         use crate::resolver::{
@@ -3226,6 +3356,7 @@ mod tests {
                 other_owner: None,
                 root: false,
                 mount: Cgroup2Mount::Delegated,
+                unplaced_daemon: None,
             },
             "alice",
             sock,

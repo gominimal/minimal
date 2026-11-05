@@ -1417,9 +1417,27 @@ fn read_host_ip_enforcement_fact(tree_root: &std::path::Path) {
     // the daemon's first create answer already names this host, and
     // refreshed by each host-address launch's own re-read.
     minimald::box_runtime::set_host_ip_enforcement_fact(&classifier_decision);
+    // gominimal/inbox#1206: a native daemon outside its leaf on a host whose
+    // tree is installed is its own state, with its own remedy, so it gets
+    // its own line beside the probe's: the probe reads it only as a table
+    // whose effect could not be read.
+    let daemon_leaf = sandbox::classifier::daemon_leaf(tree_root);
+    let placed = minimald::net::classifier::daemon_fetch_leaf(tree_root).is_some();
+    if !guest && !placed && daemon_leaf.is_dir() {
+        tracing::warn!(
+            leaf = %daemon_leaf.display(),
+            daemon_cgroup = ?sandbox::classifier::own_cgroup_path(),
+            pid = std::process::id(),
+            "this daemon is not in its classifier leaf, so it cannot decide a \
+             host-address box's egress verdict per box. Run min finalize-install to \
+             place it. It also reinstalls the unit that places the daemon at every \
+             start when that unit is missing or out of date."
+        );
+    }
     match classifier_decision.cause() {
         Some(cause) => tracing::info!(
             tree = sandbox::classifier::TREE_ROOT,
+            daemon_placed = placed,
             probe = "undecided",
             cause = cause.detail(),
             install = ?cause.install_command(),
@@ -1430,6 +1448,7 @@ fn read_host_ip_enforcement_fact(tree_root: &std::path::Path) {
         ),
         None => tracing::info!(
             tree = sandbox::classifier::TREE_ROOT,
+            daemon_placed = placed,
             probe = "decided",
             host_ip_enforcement = "per_box",
             "this host decides a host-address box's egress verdict per box"
