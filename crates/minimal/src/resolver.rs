@@ -3636,9 +3636,10 @@ pub(crate) const CLASSIFIER_PROGRAM_PATH: &str =
     "/usr/local/lib/minimal/install-host-classifier.sh";
 
 /// The systemd unit pair that places the daemon's listener in its leaf on
-/// every daemon start: the path unit watches the daemon's socket, and the
-/// oneshot service it starts runs the step's `--place-listener`. The pair
-/// is why no daemon restart needs a root step of its own.
+/// every daemon start: the path unit watches the directory the daemon's
+/// socket lives in, and the oneshot service it starts runs the step's
+/// `--place-listener`. The pair is why no daemon restart needs a root
+/// step of its own.
 #[cfg(any(test, not(target_os = "macos")))]
 pub(crate) const PLACE_SYSTEMD_UNIT: &str = "minimald-place";
 #[cfg(any(test, not(target_os = "macos")))]

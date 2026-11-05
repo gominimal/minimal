@@ -1104,8 +1104,8 @@ pub(crate) mod linux {
                     "this process's user name carries a character outside [A-Za-z0-9._-], \
                      which the install script and its systemd units cannot handle"
                 } else if socket.is_empty() {
-                    "could not work out this machine's daemon socket path, which the \
-                     step's systemd unit watches"
+                    "could not work out this machine's daemon socket path, whose \
+                     directory the step's systemd unit watches"
                 } else if !socket
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || "._/-".contains(c))
@@ -1163,8 +1163,9 @@ pub(crate) mod linux {
     /// binary carries to its root-owned copy (beside the target, then moved
     /// over it) and run with no source identity, then the units — a boot
     /// oneshot that re-runs the step, and the placement pair: a path unit
-    /// on the daemon's socket and the oneshot it starts — enabled, and the
-    /// placement run once for the daemon that may already be listening.
+    /// on the directory the daemon's socket lives in and the oneshot it
+    /// starts — enabled, and the placement run once for the daemon that may
+    /// already be listening.
     ///
     /// `mask`, when there is one, is passed to the step as
     /// `--ct-mark-mask` both now and in the boot unit: the mask's record
@@ -1174,6 +1175,14 @@ pub(crate) mod linux {
         let mask = mask
             .map(|bits| format!(" --ct-mark-mask 0x{bits:08x}"))
             .unwrap_or_default();
+        // The path unit watches the directory the socket lives in, not the
+        // socket file itself: SELinux can deny the manager a watch on the
+        // file, while the directory watch still fires when the socket
+        // appears in it — or is unlinked, which the step treats as a no-op.
+        let dir = match socket.rsplit_once('/') {
+            Some(("", _)) | None => "/",
+            Some((parent, _)) => parent,
+        };
         format!(
             "# The egress classifier: its privileged step, from a root-owned copy of the\n\
              # bytes this binary carries, with no source identity (an un-enrolled host\n\
@@ -1192,8 +1201,12 @@ pub(crate) mod linux {
              # The units: a boot oneshot re-runs the step from the copy (the tree lives\n\
              # in cgroupfs and the table in the kernel, so neither survives a reboot),\n\
              # then the placement pair: the path unit fires when the daemon's socket\n\
-             # appears, and its service puts the listener in the daemon's leaf, so every\n\
-             # daemon start is placed without a root step of its own. A socket that\n\
+             # appears in the directory that holds it — a host can deny the manager a\n\
+             # watch on the socket file itself (SELinux does), and the directory is\n\
+             # what it watches instead — and its service puts the listener in the\n\
+             # daemon's leaf, so every daemon start is placed without a root step of\n\
+             # its own. A fire on the socket vanishing is harmless: the step treats a\n\
+             # socket that is absent or holds no listener as a no-op. A socket that\n\
              # flaps past systemd's trigger limit leaves the path unit failed until\n\
              # `systemctl reset-failed {PLACE_SYSTEMD_UNIT}.path`. Without systemd the\n\
              # units are skipped, and each daemon start is placed by hand with the step.\n\
@@ -1222,11 +1235,11 @@ pub(crate) mod linux {
              MINIMAL_PLACE_SERVICE_EOF\n\
              cat > {PLACE_UNIT_PATH_PATH} <<\\MINIMAL_PLACE_PATH_EOF\n\
              [Unit]\n\
-             Description=Watch minimald's socket to place its listener\n\
+             Description=Watch minimald's socket directory to place its listener\n\
              After={CLASSIFIER_SYSTEMD_UNIT}.service\n\
              \n\
              [Path]\n\
-             PathChanged={socket}\n\
+             PathChanged={dir}\n\
              Unit={PLACE_SYSTEMD_UNIT}.service\n\
              \n\
              [Install]\n\
@@ -3082,8 +3095,8 @@ mod tests {
             );
         }
         // Root is not the account whose daemon this is: `sudo min
-        // finalize-install` would install for root and watch root's socket,
-        // so it is refused before anything reads as done or missing.
+        // finalize-install` would install for root and watch root's socket
+        // directory, so it is refused before anything reads as done or missing.
         for facts in [installed, bare] {
             let as_root = classifier_item_over(
                 &ClassifierFacts {
@@ -3107,9 +3120,10 @@ mod tests {
     /// root-owned copy (atomically, beside the target then moved over it,
     /// so a unit firing mid-write never runs half a script; no fetch, no
     /// placeholder, no source identity), runs it, and installs a boot
-    /// oneshot that re-runs it plus a path unit on the daemon's socket whose
-    /// oneshot runs the step's `--place-listener` — so a daemon restart is
-    /// placed by the manager, never by a per-restart `--pid`.
+    /// oneshot that re-runs it plus a path unit on the directory the
+    /// daemon's socket lives in, whose oneshot runs the step's
+    /// `--place-listener` — so a daemon restart is placed by the manager,
+    /// never by a per-restart `--pid`.
     /// The boot unit and a refresh re-apply the mask the loaded table
     /// records, since a reboot empties the cgroupfs record. A
     /// `--ct-mark-mask` that differs from the record re-runs the step
@@ -3195,6 +3209,7 @@ mod tests {
         };
         use linux::{Cgroup2Mount, ClassifierFacts, classifier_item_over};
         let sock = "/home/alice/.local/state/minimal/providers/local-minimald0/ssh.sock";
+        let dir = "/home/alice/.local/state/minimal/providers/local-minimald0";
         let item = classifier_item_over(
             &ClassifierFacts {
                 table_present: false,
@@ -3226,7 +3241,7 @@ mod tests {
             ),
             format!("cat > {PLACE_UNIT_PATH_PATH} <<"),
             "After=minimald-classifier.service\n".to_string(),
-            format!("PathChanged={sock}\n"),
+            format!("PathChanged={dir}\n"),
             "Unit=minimald-place.service\n".to_string(),
             "WantedBy=multi-user.target\n".to_string(),
             "systemctl daemon-reload\n".to_string(),
@@ -3238,6 +3253,10 @@ mod tests {
         ] {
             assert!(script.contains(&line), "the block runs {line:?}: {script}");
         }
+        assert!(
+            !script.contains(&format!("PathChanged={sock}\n")),
+            "the path unit watches the socket's directory, not the socket: {script}"
+        );
         assert!(
             !script.contains(&format!("cat > {CLASSIFIER_PROGRAM_PATH} <<")),
             "the copy is never rewritten in place: {script}"
