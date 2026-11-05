@@ -8125,6 +8125,473 @@ async fn box_address_and_json_output_end_to_end() {
     }
 }
 
+/// A harness daemon under `state` that the native host's socket serves,
+/// with the global flags that select it, as the first-slice test sets
+/// them up.
+async fn native_box_daemon(
+    minimal_dir: &std::path::Path,
+    state: tempfile::TempDir,
+) -> (minimald::test_harness::TestServer, GlobalArgs) {
+    let global = GlobalArgs {
+        repo_dir: None,
+        minimal_dir: Some(minimal_dir.to_path_buf()),
+        config_dir: None,
+        provider: Some(Provider::LocalMinimald),
+        no_input: true,
+        vm: None,
+    };
+    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
+        .expect("the native daemon's socket path");
+    std::fs::create_dir_all(sock.parent().expect("the socket has a dir"))
+        .expect("the native daemon's state dir");
+    let server = minimald::test_harness::TestServer::new_in(state).await;
+    server.listen_on_uds(&sock).await;
+    (server, global)
+}
+
+/// `min box events` arguments for `target`, or for the children of
+/// `parent`.
+fn events_args(target: Option<&str>, parent: Option<&str>, follow: bool) -> BoxEventsArgs {
+    BoxEventsArgs {
+        target: target.map(str::to_owned),
+        parent: parent.map(str::to_owned),
+        output: Some(BoxEventsOutputFormat::Jsonl),
+        follow,
+    }
+}
+
+/// Each line `min box events -o jsonl` wrote, as a JSON object.
+fn event_lines(out: &[u8]) -> Vec<serde_json_lenient::Value> {
+    String::from_utf8_lossy(out)
+        .lines()
+        .map(|line| serde_json_lenient::from_str(line).expect("each line is one JSON object"))
+        .collect()
+}
+
+/// A writer that a test reads while a followed command still writes to it.
+#[derive(Clone, Default)]
+struct SharedOut(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for SharedOut {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl SharedOut {
+    fn lines(&self) -> Vec<serde_json_lenient::Value> {
+        event_lines(&self.0.lock().unwrap())
+    }
+
+    /// Waits until the command wrote more than `count` lines, and returns
+    /// them all.
+    async fn more_than(&self, count: usize) -> Vec<serde_json_lenient::Value> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let lines = self.lines();
+            if lines.len() > count {
+                return lines;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no event after the first {count}: {lines:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+}
+
+// BCLI-062, BOX-017: `min box cp <box>:<path> <local>` copies a file out
+// of a stopped box, from the files the box kept, into a local directory
+// under the file's own name or to a local file path.
+#[tokio::test]
+async fn box_cp_reads_stopped_box_as_box_017() {
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let mut daemon = server.connect().await;
+    let id = minimald::test_harness::create_configured_session(
+        &mut daemon,
+        "web",
+        project.path().to_str().expect("a UTF-8 project path"),
+    )
+    .await;
+    {
+        use tokio::io::AsyncWriteExt as _;
+        let sftp = daemon.open_sftp(id).await;
+        for (path, contents) in [
+            ("notes.txt", b"kept in the home"),
+            ("/workbench/tree.txt", b"kept in the tree"),
+        ] {
+            let mut file = sftp.create(path).await.unwrap();
+            file.write_all(contents).await.unwrap();
+            file.shutdown().await.unwrap();
+        }
+    }
+
+    let mut stopped = Vec::new();
+    stop_box_on_hosts(local_hosts(&global).unwrap(), &mut stopped, "web", false)
+        .await
+        .expect("the box stops");
+    let host = local_hosts(&global)
+        .unwrap()
+        .into_iter()
+        .find(|host| host.selected)
+        .expect("the native host is selected");
+    assert_eq!(address_state(&host, "web").await, "stopped");
+
+    let local = tempfile::tempdir().expect("a local dir");
+    let written = box_cp_on_hosts(local_hosts(&global).unwrap(), "web:notes.txt", local.path())
+        .await
+        .expect("the copy out of the stopped box succeeds");
+    assert_eq!(written, local.path().join("notes.txt"));
+    assert_eq!(std::fs::read(&written).unwrap(), b"kept in the home");
+
+    let file = local.path().join("copied.txt");
+    let by_id = format!("{id}:/workbench/tree.txt");
+    box_cp_on_hosts(local_hosts(&global).unwrap(), &by_id, &file)
+        .await
+        .expect("the copy by id succeeds");
+    assert_eq!(std::fs::read(&file).unwrap(), b"kept in the tree");
+
+    let missing = box_cp_on_hosts(local_hosts(&global).unwrap(), "web:gone.txt", local.path())
+        .await
+        .expect_err("a file the box does not have");
+    assert!(
+        format!("{missing:#}") == "Box web has no file gone.txt.",
+        "{missing:#}"
+    );
+    assert_eq!(
+        missing
+            .downcast_ref::<BoxFileRefusal>()
+            .map(BoxFileRefusal::exit_code),
+        Some(4),
+        "a missing file ends with the not-found code: {missing:#}"
+    );
+    assert!(!local.path().join("gone.txt").exists());
+    // A failed copy leaves no temporary file beside the destination either.
+    assert_eq!(
+        std::fs::read_dir(local.path()).unwrap().count(),
+        2,
+        "only notes.txt and copied.txt"
+    );
+
+    // A directory fails after the temporary file exists. The error says
+    // the path is a directory, and the temporary file is gone.
+    let dir = box_cp_on_hosts(
+        local_hosts(&global).unwrap(),
+        "web:/workbench",
+        local.path(),
+    )
+    .await
+    .expect_err("a directory is not a file");
+    assert_eq!(
+        format!("{dir:#}"),
+        format!(
+            "/workbench in box web is a directory, and min box cp copies one file. \
+             Run `min box cp web:/workbench/<file> {}`.",
+            local.path().join("workbench").display()
+        )
+    );
+    let names: Vec<_> = std::fs::read_dir(local.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names.len(), 2, "only notes.txt and copied.txt: {names:?}");
+
+    let refused = box_cp_on_hosts(local_hosts(&global).unwrap(), "notes.txt", local.path())
+        .await
+        .expect_err("a source with no box");
+    assert!(
+        refused
+            .to_string()
+            .contains("Run `min box cp <box>:<path> "),
+        "{refused}"
+    );
+}
+
+// BCLI-016: `min box events <box> -o jsonl` replays every event the box
+// kept, oldest first, also after the box stopped. Each line is one
+// `min/v1/event` object with `ts`, `box`, `parent`, `type` and `data`.
+#[tokio::test]
+async fn events_jsonl_replay_schema_fields() {
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let mut daemon = server.connect().await;
+    let id = minimald::test_harness::create_configured_session(
+        &mut daemon,
+        "web",
+        project.path().to_str().expect("a UTF-8 project path"),
+    )
+    .await;
+
+    let replay = async |args: &BoxEventsArgs| {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        box_events_on_hosts(local_hosts(&global).unwrap(), args, &mut out, &mut err)
+            .await
+            .expect("the events replay");
+        assert_eq!(String::from_utf8_lossy(&err), "", "nothing on stderr");
+        event_lines(&out)
+    };
+    let running = replay(&events_args(Some("web"), None, false)).await;
+    assert!(!running.is_empty(), "a created box has events");
+    assert_eq!(running[0]["type"], "created", "{running:?}");
+
+    let mut stopped = Vec::new();
+    stop_box_on_hosts(local_hosts(&global).unwrap(), &mut stopped, "web", false)
+        .await
+        .expect("the box stops");
+    let lines = replay(&events_args(Some("web"), None, false)).await;
+    assert!(
+        lines.len() > running.len(),
+        "the stop adds an event: {lines:?}"
+    );
+    assert_eq!(
+        lines[..running.len()],
+        running[..],
+        "the same stream, replayed"
+    );
+    let mut last_ts = None;
+    for line in &lines {
+        let object = line.as_object().expect("a JSON object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["box", "data", "parent", "schema", "ts", "type"],
+            "{line}"
+        );
+        assert_eq!(line["schema"], "min/v1/event", "{line}");
+        assert_eq!(line["box"], id.to_string(), "{line}");
+        assert!(
+            line["parent"].is_null(),
+            "a box created outside any box: {line}"
+        );
+        assert!(line["type"].is_string(), "{line}");
+        assert!(line["data"].is_object(), "{line}");
+        let ts = chrono::DateTime::parse_from_rfc3339(line["ts"].as_str().expect("ts is a string"))
+            .expect("ts is RFC 3339");
+        assert!(
+            line["ts"].as_str().unwrap().ends_with('Z'),
+            "ts is UTC: {line}"
+        );
+        assert!(
+            last_ts.is_none_or(|last| ts >= last),
+            "oldest first: {lines:?}"
+        );
+        last_ts = Some(ts);
+    }
+
+    // The text form gives one line for each event, with its type.
+    let mut text_args = events_args(Some("web"), None, false);
+    text_args.output = None;
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    box_events_on_hosts(
+        local_hosts(&global).unwrap(),
+        &text_args,
+        &mut out,
+        &mut err,
+    )
+    .await
+    .expect("the text replay");
+    let text = String::from_utf8_lossy(&out);
+    assert_eq!(text.lines().count(), lines.len(), "{text}");
+    assert!(
+        text.lines()
+            .next()
+            .is_some_and(|line| line.contains(&format!("  {id}  created"))),
+        "{text}"
+    );
+}
+
+// BCLI-016: `min box events --follow` replays the events the box kept,
+// then writes each new one as it happens, and ends when the box is
+// removed.
+#[tokio::test]
+async fn events_follow_replays_then_tails() {
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let mut daemon = server.connect().await;
+    minimald::test_harness::create_configured_session(
+        &mut daemon,
+        "web",
+        project.path().to_str().expect("a UTF-8 project path"),
+    )
+    .await;
+    let (mut replay, mut err) = (Vec::new(), Vec::new());
+    box_events_on_hosts(
+        local_hosts(&global).unwrap(),
+        &events_args(Some("web"), None, false),
+        &mut replay,
+        &mut err,
+    )
+    .await
+    .expect("the replay");
+    let replayed = event_lines(&replay);
+
+    let shared = SharedOut::default();
+    let args = events_args(Some("web"), None, true);
+    let follow = async {
+        let (mut out, mut err) = (shared.clone(), Vec::new());
+        box_events_on_hosts(local_hosts(&global).unwrap(), &args, &mut out, &mut err).await
+    };
+    let drive = async {
+        let first = shared.more_than(replayed.len() - 1).await;
+        assert_eq!(first, replayed, "the follow replays the kept events first");
+        let mut stopped = Vec::new();
+        stop_box_on_hosts(local_hosts(&global).unwrap(), &mut stopped, "web", false)
+            .await
+            .expect("the box stops");
+        let tailed = shared.more_than(replayed.len()).await;
+        assert_eq!(tailed[..replayed.len()], replayed[..]);
+        rm_box_on_hosts(local_hosts(&global).unwrap(), "web", false)
+            .await
+            .expect("the stopped box is removed");
+    };
+    let (followed, ()) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        tokio::join!(follow, drive)
+    })
+    .await
+    .expect("the follow ends when the box is removed");
+    followed.expect("the follow ends cleanly");
+    let lines = shared.lines();
+    assert!(lines.len() > replayed.len(), "{lines:?}");
+}
+
+/// Sets `parent` in the record of box `id` that the daemon keeps under
+/// `state`, as a box created inside `parent` has it.
+fn set_record_parent(state: &std::path::Path, id: boxes::SessionId, parent: boxes::SessionId) {
+    fn records(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                records(&path, found);
+            } else if path.file_name().is_some_and(|name| name == "record.json") {
+                found.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    records(state, &mut found);
+    for path in found {
+        let raw = std::fs::read(&path).unwrap();
+        let Ok(mut record) = serde_json_lenient::from_slice::<serde_json_lenient::Value>(&raw)
+        else {
+            continue;
+        };
+        if record["id"] == id.to_string() {
+            record["parent"] = serde_json_lenient::Value::String(parent.to_string());
+            std::fs::write(&path, serde_json_lenient::to_vec(&record).unwrap()).unwrap();
+            return;
+        }
+    }
+    panic!("no record of box {id} under {}", state.display());
+}
+
+// BCLI-016: `min box events --parent <box>` merges the event streams of
+// every child of the box into one, in time order, each event naming its
+// box. A box that is not a child is left out.
+#[tokio::test]
+async fn events_parent_merges_children() {
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let state_path = state.path().to_path_buf();
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let project = project.path().to_str().expect("a UTF-8 project path");
+    let mut daemon = server.connect().await;
+    let parent =
+        minimald::test_harness::create_configured_session(&mut daemon, "lead", project).await;
+    let first =
+        minimald::test_harness::create_configured_session(&mut daemon, "one", project).await;
+    let other =
+        minimald::test_harness::create_configured_session(&mut daemon, "other", project).await;
+    let second =
+        minimald::test_harness::create_configured_session(&mut daemon, "two", project).await;
+    for name in ["one", "two"] {
+        let mut stopped = Vec::new();
+        stop_box_on_hosts(local_hosts(&global).unwrap(), &mut stopped, name, false)
+            .await
+            .expect("the child stops");
+    }
+    for child in [first, second] {
+        set_record_parent(&state_path, child, parent);
+    }
+
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    box_events_on_hosts(
+        local_hosts(&global).unwrap(),
+        &events_args(None, Some("lead"), false),
+        &mut out,
+        &mut err,
+    )
+    .await
+    .expect("the merged replay");
+    assert_eq!(String::from_utf8_lossy(&err), "");
+    let lines = event_lines(&out);
+    let boxes_seen: std::collections::BTreeSet<String> = lines
+        .iter()
+        .map(|line| line["box"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        boxes_seen,
+        [first.to_string(), second.to_string()].into(),
+        "only the children: {lines:?}"
+    );
+    assert!(!boxes_seen.contains(&other.to_string()));
+    assert!(!boxes_seen.contains(&parent.to_string()));
+    let ts: Vec<_> = lines
+        .iter()
+        .map(|line| {
+            chrono::DateTime::parse_from_rfc3339(line["ts"].as_str().expect("ts is a string"))
+                .expect("ts is RFC 3339")
+        })
+        .collect();
+    assert!(ts.is_sorted(), "one stream in time order: {lines:?}");
+    // Each child's own stream keeps its order inside the merge.
+    for child in [first, second] {
+        let types: Vec<&str> = lines
+            .iter()
+            .filter(|line| line["box"] == child.to_string())
+            .map(|line| line["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(types.first(), Some(&"created"), "{lines:?}");
+        assert!(types.len() > 1, "the stop is in the stream: {lines:?}");
+    }
+
+    // A box with no children names the box and its host on stderr, and
+    // writes no event.
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    box_events_on_hosts(
+        local_hosts(&global).unwrap(),
+        &events_args(None, Some("other"), false),
+        &mut out,
+        &mut err,
+    )
+    .await
+    .expect("no children is not a failure");
+    assert!(out.is_empty());
+    assert!(
+        String::from_utf8_lossy(&err)
+            .starts_with(&format!("Box {other} has no child boxes on host ")),
+        "{}",
+        String::from_utf8_lossy(&err)
+    );
+}
+
 /// A session record carrying `mode` and `box_addresses`, with everything
 /// else at its default.
 fn hold_record(
