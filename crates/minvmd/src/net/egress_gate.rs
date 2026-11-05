@@ -694,6 +694,58 @@ fn names_host_by_name(allow_dns_hosts: &[String]) -> bool {
     })
 }
 
+/// The rule name for a frame to another box's lease that the source's
+/// `allow_subnets` leaves undeclared, from a box whose
+/// `egress.allow_dns_hosts` names boxes but not that one (NET-163). The
+/// drop line names the source box and the target box beside it.
+const BOX_NAME_RULE: &str = "box-name";
+
+/// The box-zone names `allow_dns_hosts` lists, ASCII lower-case and with no
+/// trailing dot: the names under the box zone that are neither its apex
+/// nor the host alias's (NET-163).
+fn box_zone_entries(allow_dns_hosts: &[String]) -> Vec<String> {
+    let suffix = format!(".{}", boxes::core::zone_answer::ZONE_APEX);
+    allow_dns_hosts
+        .iter()
+        .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+        .filter(|host| {
+            host.len() > suffix.len()
+                && host.ends_with(&suffix)
+                && !host.eq_ignore_ascii_case(baseline::HOST_ALIAS_NAME)
+        })
+        .collect()
+}
+
+/// How the source's name rules decide a frame to `dst` that its declared
+/// subnets left undeclared (NET-163). `None` when the source names no box,
+/// or when `dst` is no other box's lease, so the row's rules decide alone.
+/// `Some(true)` when an entry is the zone name of the box whose row holds
+/// `dst`: the name admits the source's half, and the target's ingress, in
+/// the guest, decides the rest. `Some(false)` refuses it under
+/// [`BOX_NAME_RULE`]. The match is exact, so an entry for `web` never
+/// covers a parallel instance `web-2`.
+fn box_name_verdict(table: &BoxTable, record: &BoxRecord, dst: [u8; 4]) -> Option<bool> {
+    let entries = box_zone_entries(record.allow_dns_hosts());
+    if entries.is_empty() || dst == table.subnet().daemon_ip().octets() {
+        return None;
+    }
+    let target = table.by_source(dst)?;
+    if target.switch_addr() == record.switch_addr() {
+        return None;
+    }
+    if target.is_task_row() {
+        // A task sandbox's address is not the box's lease, so no name
+        // covers it.
+        return Some(false);
+    }
+    let name = format!(
+        "{}.{}",
+        crate::box_registry::canonical_box_name(target.name()),
+        boxes::core::zone_answer::ZONE_APEX
+    );
+    Some(entries.contains(&name))
+}
+
 /// Which infrastructure rule refuses a destination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InfrastructureHit {
@@ -5156,6 +5208,20 @@ async fn relay_frames_to_switch(
                 limiter.warn_host_alias(src, dst_port, row);
                 continue;
             }
+            Err(GateDrop::BoxName { src, dst, dst_port }) => {
+                // The line names both boxes by the rows that hold their
+                // addresses, so a host reads who reached for whom.
+                let source = table.by_source(src);
+                let target = table.by_source(dst);
+                limiter.warn_box_name(
+                    src,
+                    dst,
+                    dst_port,
+                    source.as_deref().map(BoxRecord::name),
+                    target.as_deref().map(BoxRecord::name),
+                );
+                continue;
+            }
             Err(GateDrop::ProxyLane { src, dst, dst_port }) => {
                 // The plan's diagnostics line wants the refusal to name the
                 // box, not only its address: the row the frame's source
@@ -6699,7 +6765,28 @@ fn row_verdict(
         {
             Ok(GateAdmit::Row)
         }
-        FrameVerdict::Drop(reason) => Err(GateDrop::Verdict(reason)),
+        FrameVerdict::Drop(reason) => {
+            // NET-163: a box that names another box's zone name reaches that
+            // box's lease, while its deny rules and protocols still decide
+            // first. The target's ingress decides the rest in the guest.
+            // A box that names boxes reaches no other box by a name.
+            if matches!(reason, DropReason::UndeclaredSubnet { .. })
+                && row == AliasRow::Box
+                && let Some(dst) = summary.destination()
+                && let Some(named) = box_name_verdict(table, &record, dst)
+            {
+                return if named {
+                    Ok(GateAdmit::Row)
+                } else {
+                    Err(GateDrop::BoxName {
+                        src,
+                        dst,
+                        dst_port: summary.destination_port(),
+                    })
+                };
+            }
+            Err(GateDrop::Verdict(reason))
+        }
     }
 }
 
@@ -6767,6 +6854,18 @@ enum GateDrop {
         /// The row the alias's openings were decided for.
         row: AliasRow,
     },
+    /// The frame named another box's lease, and the source's
+    /// `allow_dns_hosts` names boxes but not that one, and its
+    /// `allow_subnets` does not cover the lease (NET-163,
+    /// [`BOX_NAME_RULE`]).
+    BoxName {
+        /// The source address the frame wore.
+        src: [u8; 4],
+        /// The target box's lease.
+        dst: [u8; 4],
+        /// The port the frame named there, `0` when it carried none.
+        dst_port: u16,
+    },
     /// The frame named the Box Egress Proxy's address and the lane does not
     /// admit it (NET-134): its source carries no credentialed lane, or the
     /// frame is headed somewhere at the address the declaration never
@@ -6817,6 +6916,7 @@ impl GateDrop {
             Self::Verdict(reason) => reason.rule(),
             Self::Infrastructure { .. } => INFRASTRUCTURE_RULE,
             Self::HostAlias { .. } => HOST_ALIAS_RULE,
+            Self::BoxName { .. } => BOX_NAME_RULE,
             Self::UnknownSource { .. } => UNKNOWN_SOURCE_RULE,
             Self::UnregisteredSource { .. } => UNREGISTERED_SOURCE_RULE,
             Self::SwitchControlSurface { .. } => SWITCH_CONTROL_RULE,
@@ -7011,6 +7111,46 @@ impl DropLimiter {
                     "dropped frames to host.min.internal from more distinct source addresses \
                      than the gate keeps a window per source for; one line per rule covers \
                      the rest",
+                );
+                true
+            }
+        }
+    }
+
+    /// Emits the warning for one frame to another box's lease that the
+    /// source's name rules refuse (NET-163): the same rate limit a drop's
+    /// line answers to, keyed by the source and the rule. The line names
+    /// the source box, the target box, the target's address and port, and
+    /// the rule. Returns whether a line was written.
+    fn warn_box_name(
+        &self,
+        src: [u8; 4],
+        dst: [u8; 4],
+        dst_port: u16,
+        source_box: Option<&str>,
+        target_box: Option<&str>,
+    ) -> bool {
+        match self.should_warn_at(Some(src), BOX_NAME_RULE, Instant::now()) {
+            WarnDecision::Silent => false,
+            WarnDecision::Named => {
+                tracing::warn!(
+                    source = %Ipv4Addr::from(src),
+                    destination = %Ipv4Addr::from(dst),
+                    port = dst_port,
+                    box = source_box,
+                    target = target_box,
+                    rule_matched = BOX_NAME_RULE,
+                    "dropped a frame to another box; this box's allow_dns_hosts does not \
+                     name that box, and its allow_subnets does not cover the address",
+                );
+                true
+            }
+            WarnDecision::Overflow => {
+                tracing::warn!(
+                    rule_matched = BOX_NAME_RULE,
+                    "dropped frames to other boxes from more distinct source addresses \
+                     than the gate keeps a window per source for; one line per rule \
+                     covers the rest",
                 );
                 true
             }
@@ -17278,6 +17418,137 @@ mod tests {
             ),
             "naming the host opens nothing without the table's entry"
         );
+    }
+
+    /// NET-163 on a VM host: a box whose `egress.allow_dns_hosts` names
+    /// another box's zone name reaches that box's lease, where its own
+    /// subnets name nothing. The gate decides the source's half alone, at
+    /// any port: the target's ingress decides the rest in the guest, at the
+    /// target's relay. A parallel instance `web-2` that the list does not
+    /// name is the `box-name` drop, unless `allow_subnets` covers its
+    /// lease. Deny rules still decide first, and a box that names no box
+    /// keeps the row's own drop. The drop line names the rule and both
+    /// boxes.
+    #[test]
+    fn zone_name_rule_admits_sibling_lease_under_its_ingress() {
+        let policy =
+            |subnets: Vec<String>, hosts: Vec<&str>, deny: Option<Vec<String>>| EgressPolicy {
+                allow_protocols: None,
+                allow_subnets: Some(subnets),
+                allow_dns_hosts: Some(hosts.into_iter().map(str::to_string).collect()),
+                deny_subnets: deny,
+            };
+        let app = LEASE;
+        let web = [100, 64, 0, 11];
+        let instance = [100, 64, 0, 12];
+        let covered = [100, 64, 0, 13];
+        let denied = [100, 64, 0, 14];
+        let plain = [100, 64, 0, 15];
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        for (name, addr, egress) in [
+            ("app", app, policy(vec![], vec!["Web.min.internal."], None)),
+            ("web", web, policy(vec![], vec![], None)),
+            ("web-2", instance, policy(vec![], vec![], None)),
+            (
+                "covered",
+                covered,
+                policy(
+                    vec![format!("{}/32", Ipv4Addr::from(instance))],
+                    vec!["web.min.internal"],
+                    None,
+                ),
+            ),
+            (
+                "denied",
+                denied,
+                policy(
+                    vec![],
+                    vec!["web.min.internal"],
+                    Some(vec![format!("{}/32", Ipv4Addr::from(web))]),
+                ),
+            ),
+            ("plain", plain, policy(vec![], vec!["example.com"], None)),
+        ] {
+            registry.register(
+                BoxRegistration::new(name, Ipv4Addr::from(addr), Ipv4Addr::LOCALHOST)
+                    .with_egress_policy(egress),
+            );
+        }
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        let decide = |src: [u8; 4], dst: [u8; 4], proto: u8, port: u16| {
+            gate_verdict(
+                &boxes::core::egress::summarize(&ipv4_frame(src, proto, dst, port)),
+                None,
+                &table,
+                &baseline,
+                &dns_pins::DnsPins::new(SUBNET),
+                &ReplyTables::new(),
+            )
+        };
+
+        for (proto, port) in [(6, 8080), (6, 9999), (17, 5353)] {
+            assert_eq!(
+                decide(app, web, proto, port),
+                Ok(GateAdmit::Row),
+                "the named box's lease is reached by the name, and its ingress decides \
+                 the port in the guest"
+            );
+        }
+        assert_eq!(
+            decide(app, instance, 6, 8080),
+            Err(GateDrop::BoxName {
+                src: app,
+                dst: instance,
+                dst_port: 8080,
+            }),
+            "a parallel instance the list does not name is refused"
+        );
+        assert_eq!(
+            decide(covered, instance, 6, 8080),
+            Ok(GateAdmit::Row),
+            "allow_subnets that covers the instance's lease still reaches it"
+        );
+        assert!(
+            matches!(decide(denied, web, 6, 8080), Err(GateDrop::Verdict(_))),
+            "deny_subnets decides ahead of the name"
+        );
+        assert!(
+            matches!(
+                decide(plain, web, 6, 8080),
+                Err(GateDrop::Verdict(DropReason::UndeclaredSubnet { .. }))
+            ),
+            "a box that names no box keeps the row's own drop"
+        );
+        assert_eq!(
+            GateDrop::BoxName {
+                src: app,
+                dst: instance,
+                dst_port: 8080
+            }
+            .rule(),
+            "box-name"
+        );
+
+        // The drop line names the rule, the source box and the target box.
+        let (log, _guard) = capture_log();
+        let limiter = DropLimiter::new();
+        assert!(limiter.warn_box_name(app, instance, 8080, Some("app"), Some("web-2")));
+        let logged = log.contents();
+        for expected in [
+            "source=100.64.0.9",
+            "destination=100.64.0.12",
+            "port=8080",
+            "box=\"app\"",
+            "target=\"web-2\"",
+            "rule_matched=\"box-name\"",
+        ] {
+            assert!(
+                logged.contains(expected),
+                "missing {expected:?} in: {logged}"
+            );
+        }
     }
 
     /// An entry of the `[host-exposures]` table at a port that one of
