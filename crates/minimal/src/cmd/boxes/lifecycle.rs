@@ -712,6 +712,21 @@ fn box_rpc_error(target: &str, error: String) -> anyhow::Error {
     }
 }
 
+/// Whether `e`, the error of a oneshot RPC, means the daemon did not
+/// answer: the call timed out, or the connection was lost before a reply.
+/// A refusal or a failure the daemon reported is an answer, and so is a
+/// reply that did not decode, unless the reply was empty.
+pub(crate) fn rpc_unanswered(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        if cause.downcast_ref::<russh::Error>().is_some() {
+            return true;
+        }
+        let text = cause.to_string();
+        // The client's deadline, and a channel that closed without a byte.
+        text.contains(" RPC timed out after ") || text.ends_with("(daemon replied: )")
+    })
+}
+
 /// `min box stop <box> [--force]`: stops the box and keeps its record.
 /// `<box>` is a box address, looked up on every local host.
 pub async fn cmd_box_stop(global: &GlobalArgs, args: BoxStopArgs) -> Result<(), anyhow::Error> {

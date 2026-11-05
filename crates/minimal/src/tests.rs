@@ -6903,6 +6903,72 @@ async fn host_stop_force_forces_boxes_and_daemon_when_daemon_does_not_answer() {
     holder.abort();
 }
 
+/// BCLI-049: only a timeout or a lost connection is a daemon that did not
+/// answer. A refusal the daemon sent, a failure it reported and a failed
+/// write of the output are not.
+#[test]
+fn host_stop_force_forces_boxes_and_daemon_tells_no_answer_from_an_answer() {
+    let timed_out =
+        anyhow::anyhow!("StopBox RPC timed out after 60s").context("StopBox RPC failed");
+    assert!(cmd::rpc_unanswered(&timed_out));
+    let lost = anyhow::Error::new(russh::Error::Disconnect)
+        .context("open channel for StopBox")
+        .context("StopBox RPC failed");
+    assert!(cmd::rpc_unanswered(&lost));
+    let closed = anyhow::anyhow!("decode response for ListBoxes (daemon replied: )");
+    assert!(cmd::rpc_unanswered(&closed));
+
+    let refused = anyhow::anyhow!("the box is still starting");
+    assert!(!cmd::rpc_unanswered(&refused));
+    let gone = anyhow::Error::new(BoxAddressRefusal::NotFound {
+        address: "web".to_owned(),
+    });
+    assert!(!cmd::rpc_unanswered(&gone));
+    let daemon_side = anyhow::anyhow!("StopBox RPC failed on the daemon side: boom")
+        .context("StopBox RPC failed");
+    assert!(!cmd::rpc_unanswered(&daemon_side));
+    let write = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+    assert!(!cmd::rpc_unanswered(&write));
+}
+
+/// BCLI-049: the lines `min host stop --force` prints for a box it did not
+/// stop. A box ended with its VM only when it got no answer or was skipped,
+/// and only when the VM stop worked.
+#[test]
+fn host_stop_force_forces_boxes_and_daemon_names_each_box_it_did_not_stop() {
+    use cmd::hosts::{BoxNotStopped, box_not_stopped_line};
+    let host = "local-minvmd0";
+    assert_eq!(
+        box_not_stopped_line("web", host, &BoxNotStopped::Unanswered, true),
+        "web did not answer the stop. It ended when its VM stopped."
+    );
+    assert_eq!(
+        box_not_stopped_line("web", host, &BoxNotStopped::Unanswered, false),
+        "web did not answer the stop."
+    );
+    let skipped = BoxNotStopped::Skipped {
+        after: "web".to_owned(),
+    };
+    assert_eq!(
+        box_not_stopped_line("api", host, &skipped, true),
+        "api was not asked to stop, because web did not answer the stop. \
+         It ended when its VM stopped."
+    );
+    assert_eq!(
+        box_not_stopped_line("api", host, &skipped, false),
+        "api was not asked to stop, because web did not answer the stop."
+    );
+    assert_eq!(
+        box_not_stopped_line("web", host, &BoxNotStopped::Gone, true),
+        "web was not stopped, because it is no longer on local-minvmd0."
+    );
+    let refused = BoxNotStopped::Refused("the box is still starting".to_owned());
+    assert_eq!(
+        box_not_stopped_line("web", host, &refused, true),
+        "web was not stopped. The daemon on local-minvmd0 answered: the box is still starting"
+    );
+}
+
 /// BCLI-052: `min provider list --all` lists every well-known local provider
 /// present on the machine: a provider with a host, and `local-box` only in a
 /// box. Without `--all` it lists the provider the command selects.

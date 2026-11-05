@@ -502,6 +502,11 @@ pub async fn cmd_host_stop(
     };
     let listed = match super::list_box_records(&mut client, None).await {
         Ok(listed) => listed,
+        // A daemon that answered the listing with an error is not one that
+        // does not answer: name its answer, unless `--force` stops the VM.
+        Err(e) if !force_vm && !super::rpc_unanswered(&e) => {
+            return Err(e.context(format!("the boxes on {} were not listed", host.name)));
+        }
         Err(e) => {
             drop(client);
             let cause = e.context("the boxes were not listed");
@@ -510,18 +515,38 @@ pub async fn cmd_host_stop(
     };
     let mut stopped = 0;
     let mut not_stopped = Vec::new();
+    let mut write_failed = None;
+    // The first box whose forced stop got no answer. The guest is stuck, so
+    // the boxes after it are not asked, and the VM stop ends them.
+    let mut unanswered: Option<String> = None;
     for entry in listed.iter().filter(|e| e.state == "running") {
         let target = entry
             .name
             .clone()
             .unwrap_or_else(|| entry.box_id.to_string());
+        if let Some(after) = &unanswered {
+            let why = BoxNotStopped::Skipped {
+                after: after.clone(),
+            };
+            not_stopped.push((target, why));
+            continue;
+        }
         match super::stop_listed_box(&mut client, &mut out, entry.box_id, &target, args.force).await
         {
             Ok(true) => stopped += 1,
             Ok(false) => {}
+            // The daemon stopped the box, and only its line was lost.
+            Err(e) if force_vm && e.downcast_ref::<std::io::Error>().is_some() => {
+                stopped += 1;
+                write_failed.get_or_insert(e);
+            }
             Err(e) if force_vm => {
                 tracing::debug!(host = %host.name, r#box = %target, "forced box stop failed: {e:#}");
-                not_stopped.push(target);
+                let why = box_not_stopped(&e);
+                if why == BoxNotStopped::Unanswered {
+                    unanswered = Some(target.clone());
+                }
+                not_stopped.push((target, why));
             }
             Err(e) => {
                 return Err(e.context(format!(
@@ -532,15 +557,74 @@ pub async fn cmd_host_stop(
         }
     }
     let vm = vm_dir.is_some();
-    super::shut_down_host_daemon(client, &host.name, vm_dir, args.force).await?;
-    for target in &not_stopped {
-        writeln!(
-            out,
-            "{target} did not answer the stop. It ended when its VM stopped."
-        )?;
+    let shut_down = super::shut_down_host_daemon(client, &host.name, vm_dir, args.force).await;
+    for (target, why) in &not_stopped {
+        let line = box_not_stopped_line(target, &host.name, why, shut_down.is_ok());
+        writeln!(out, "{line}")?;
+    }
+    shut_down?;
+    if let Some(e) = write_failed {
+        return Err(e);
     }
     writeln!(out, "{}", host_stop_summary(stopped, &host.name, vm))?;
     Ok(())
+}
+
+/// Why `min host stop --force` did not stop a box on a VM host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BoxNotStopped {
+    /// The stop timed out, or the connection was lost.
+    Unanswered,
+    /// The stop was not sent, because the stop of the box `after` got no
+    /// answer.
+    Skipped { after: String },
+    /// The daemon no longer has the box.
+    Gone,
+    /// The daemon answered the stop with this error.
+    Refused(String),
+}
+
+/// Sorts the error of a forced box stop into a [`BoxNotStopped`].
+fn box_not_stopped(e: &anyhow::Error) -> BoxNotStopped {
+    if super::rpc_unanswered(e) {
+        BoxNotStopped::Unanswered
+    } else if matches!(
+        e.downcast_ref::<super::BoxAddressRefusal>(),
+        Some(super::BoxAddressRefusal::NotFound { .. })
+    ) {
+        BoxNotStopped::Gone
+    } else {
+        BoxNotStopped::Refused(format!("{e:#}"))
+    }
+}
+
+/// The line `min host stop --force` prints for the box `target` on `host`
+/// that it did not stop. `vm_stopped` is true when the VM stop worked, so a
+/// box that was still running ended with it.
+#[must_use]
+pub(crate) fn box_not_stopped_line(
+    target: &str,
+    host: &str,
+    why: &BoxNotStopped,
+    vm_stopped: bool,
+) -> String {
+    let ended = if vm_stopped {
+        " It ended when its VM stopped."
+    } else {
+        ""
+    };
+    match why {
+        BoxNotStopped::Unanswered => format!("{target} did not answer the stop.{ended}"),
+        BoxNotStopped::Skipped { after } => format!(
+            "{target} was not asked to stop, because {after} did not answer the stop.{ended}"
+        ),
+        BoxNotStopped::Gone => {
+            format!("{target} was not stopped, because it is no longer on {host}.")
+        }
+        BoxNotStopped::Refused(reason) => {
+            format!("{target} was not stopped. The daemon on {host} answered: {reason}")
+        }
+    }
 }
 
 /// `min host stop` for a host whose daemon does not answer. With `--force`
