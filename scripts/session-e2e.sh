@@ -6842,7 +6842,7 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
       >/dev/null 2>"$WORK/task-int.err") &
   ti_pid=$!
   ti_name=""
-  for ti_i in $(seq 1 120); do
+  for _ in $(seq 1 120); do
     ti_name="$(grep -o 'Running task e2e-sleep in box [^ .]*' "$WORK/task-int.err" 2>/dev/null \
       | head -n1)"
     ti_name="${ti_name#Running task e2e-sleep in box }"
