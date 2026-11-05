@@ -865,16 +865,21 @@ pub(crate) fn exec_found(
     if !live && (exited || !box_running) {
         return ExecFound::Ended;
     }
-    let pty = started.map(|event| {
+    let pty = started.and_then(|event| {
         event
             .data
             .get(exec_data::PTY)
             .and_then(|v| v.as_bool())
-            .unwrap_or_else(|| {
-                event.data.get(exec_data::MODE).and_then(|v| v.as_str()) == Some("tty")
+            .or_else(|| {
+                event
+                    .data
+                    .get(exec_data::MODE)
+                    .and_then(|v| v.as_str())
+                    .map(|mode| mode == "tty")
             })
     });
-    // A live id with no start event leaves the terminal check to the host.
+    // A live id with no start event, or a start event that says nothing of
+    // a terminal, leaves the terminal check to the host.
     if pty == Some(false) {
         ExecFound::NoTerminal
     } else {

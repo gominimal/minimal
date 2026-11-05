@@ -8449,6 +8449,23 @@ async fn box_attach_exec_non_pty_exit2_names_logs() {
              Run `min box logs web --exec {AN_EXEC_ID}` to see its output."
         )
     );
+
+    // A start event that says nothing of a terminal proves no refusal: the
+    // command leaves the terminal check to the host.
+    let mut silent = boxes::events::BoxEvent {
+        box_id: web,
+        parent: None,
+        ts: 0,
+        kind: boxes::events::BoxEventType::ExecStarted,
+        data: Default::default(),
+    };
+    silent
+        .data
+        .insert(boxes::events::exec_data::EXEC_ID.into(), AN_EXEC_ID.into());
+    assert_eq!(
+        crate::exec_found(&[silent], &[], true, AN_EXEC_ID),
+        crate::ExecFound::Terminal,
+    );
 }
 
 /// BCLI-068: an exec that ended, with or without a terminal, is refused
