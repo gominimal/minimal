@@ -244,25 +244,30 @@ With telemetry off, that file is the only change to `min bug`.
 ## Update check
 
 Once a day, the first `min` command makes one request to
-`https://update.minimal.dev/v1/<channel>/<key>` and caches the answer. A
-later command then prints one line on stderr, once per new release, naming
-the channel's current release and pointing here for the update steps:
+`https://update.minimal.dev/v1/<channel>/<key>` and caches the answer. When
+the channel has moved on, one line on stderr names the channel's current
+release and points here for the update steps, once per new release:
 
 ```
 min 0.7.1: the stable channel is now at 0.7.2. How to update: https://docs.minimal.dev/reference/telemetry#update-check
 ```
 
-The line goes to stderr only when stderr is a terminal. stdout, the exit
+The line goes to stderr only when stderr is a terminal, and it waits for a
+short command whose output leaves it in view, such as `min ls`, `min dirs`,
+`min stop` or `min init`. A command that takes the terminal (bare `min`,
+`min run`, `min session attach`, `min task`, `min box`, the dashboard) never
+prints it, so if you only use those, the line is not shown. stdout, the exit
 code and the command's timing are never touched: the request is made by a
 detached `min update-check --background` with a 2 second budget and no
 retry, and the command that spawned it does not wait. An endpoint that is
 down, slow, or answers 404 produces nothing.
 
-The request carries six fields and nothing else:
+The request carries six fields, and a `User-Agent: min` header that is the
+same for every install:
 
 | field | value |
 |---|---|
-| channel | `stable`, `unstable`, `nightly`; `pinned` for an install made with `--version`; `source` for a build with no install record. Only a channel install is ever notified |
+| channel | `stable`, `unstable`, `nightly`; `pinned` for an install made with `--version`; `source` for a binary that no install record describes (a development build, or a copy of `min` other than the one the installer put in place). Only a channel install is ever notified |
 | key | the channel pointer this build was installed from, written by the installer to `<state>/minimal/install.toml`; for a build without one, the commit hash in `min version` |
 | os, arch | `linux`/`macos`, `x86_64`/`aarch64` |
 | install | `installer`, or the package that shipped `<prefix>/share/minimal/install.toml` |
@@ -278,8 +283,10 @@ and the switch that stops it, if one is set. `min update-check` with no
 flag makes the request now and prints the answer.
 
 **Updating.** An install made by the installer updates by running the
-installer again for your channel; it replaces the binaries in place and
-keeps your sessions, loadouts and settings:
+installer again for your channel. It replaces the binaries in place and
+keeps your loadouts and settings. It also restarts the Minimal daemon, which
+ends any active sessions: when sessions are running, it lists them and asks
+on your terminal first ([Upgrade](../guide/install.md#upgrade) has the details):
 
 ```shell
 curl --proto "=https" --tlsv1.2 -fsSL https://go.minimal.dev/stable | sh
@@ -300,10 +307,12 @@ updates through that package manager.
 | `DO_NOT_TRACK=1` | environment, the cross-tool convention |
 | `CI` set | environment: a CI job that installs `min` is not an install to count |
 
-An install's first `min` command never makes the request. The first command
-with a terminal prints a one-line disclosure of the above, even when earlier
-commands were a script's (the installer's own setup call, an agent), and the
-request waits for a later command. The installer's closing card carries the
+An install's first `min` command never makes the request, and the
+installer's own `min` calls never take part in the check. With a terminal,
+the first short command (the rule above: `min ls`, not bare `min`) prints a
+one-line disclosure of the above, even when earlier commands were a script's
+or an agent's, and the request waits for a later command; until that line
+has been shown, commands with a terminal send nothing. The installer's closing card carries the
 same disclosure for every install, `--version` ones included, so an install
 whose commands never have a terminal has read it there. Installs from a
 package manager see the terminal line instead of the card. A `config.toml`
