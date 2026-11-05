@@ -13897,7 +13897,7 @@ mod tests {
         assert!(registry.table().host_ip_cohort().is_none());
 
         // A client retire also forgets the rules a reconcile set aside.
-        assert!(!registry.retire_host_ip_box(live_box));
+        assert!(!registry.retire_host_ip_box(live_box, HostIpBoxEnd::Destroyed));
         assert!(!registry.holds_host_ip_boxes());
 
         // A list read before a client admit predates the box: that pass
