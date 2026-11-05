@@ -3365,6 +3365,9 @@ impl BoxManager {
                 .unwrap_or(crate::rpc::ANONYMOUS_SESSION),
         );
         let (name, source) = creation_name(config.name.as_deref(), spec.as_ref());
+        // BEP-082: only a fresh instance registered under a creation key,
+        // and only a key for its own base. See `host_ip_mint_name`.
+        let fresh_base = name.clone().filter(|_| fresh);
         let name = match name {
             Some(base) if fresh => {
                 let retained = self.retained_names().await?;
@@ -3419,7 +3422,7 @@ impl BoxManager {
         let switch_address = config.box_addresses.as_ref().map(|a| a.switch_address);
         // BEP-082: a `host_ip` grant box has no row, and its registration
         // minted its id under the box's name. See `host_ip_mint_name`.
-        let host_ip_name = host_ip_mint_name(&config);
+        let host_ip_name = host_ip_mint_name(&config, fresh_base.as_deref());
         let control = crate::box_actor::switch_control_of(&self.net_switch).await;
         let minted = match crate::net::listeners::mint_box_id(
             &control,
@@ -5032,23 +5035,51 @@ impl Drop for TearingDown {
 ///
 /// Only a `host_ip` box with no box addresses and a declared credentialed
 /// upstream registered, so only that box sends a name. It sends the name
-/// it registered under: the config's `host_ip_registration` when the
-/// client sent one, else the box's name. A fresh instance registered under
-/// a creation key, because this daemon names it `<base>-<n>` only after
-/// the registration. A `host_ip` box with no grant registered nothing. If
-/// it sent its name, it could take the id of another live box that
+/// it registered under: the config's `host_ip_registration`, else the
+/// box's name. A fresh instance registered under a creation key, because
+/// this daemon names it `<base>-<n>` only after the registration.
+/// `fresh_base` is that base, and `None` when the create is not a fresh
+/// instance. The key counts only as `<fresh_base>~<hex>`. Any other value
+/// is ignored, so a client cannot name another box's registration and
+/// take its id. A `host_ip` box with no grant registered nothing. If it
+/// sent its name, it could take the id of another live box that
 /// registered the same name.
-fn host_ip_mint_name(config: &minimald_rpc::BoxConfig) -> Option<String> {
+fn host_ip_mint_name(config: &minimald_rpc::BoxConfig, fresh_base: Option<&str>) -> Option<String> {
     let grant_box = matches!(config.network, boxes::NetworkMode::HostNet)
         && config.box_addresses.is_none()
         && config.policy.credentialed_upstream.is_some();
     if !grant_box {
         return None;
     }
-    config
-        .host_ip_registration
-        .clone()
-        .or_else(|| config.name.clone())
+    if let Some(key) = config.host_ip_registration.as_deref() {
+        if fresh_base.is_some_and(|base| is_creation_key_of(key, base)) {
+            return Some(key.to_string());
+        }
+        tracing::warn!(
+            host_ip_registration = %key,
+            fresh_base = ?fresh_base,
+            box_name = ?config.name,
+            "ignored a host_ip registration key that is not a creation key \
+             for this fresh box's base; the mint asks by the box's name"
+        );
+    }
+    config.name.clone()
+}
+
+/// Whether `key` is a creation key for `base` (BEP-082): `<base>~` and
+/// then one or more lowercase hex digits. The base compares under ASCII
+/// case, as box names do.
+fn is_creation_key_of(key: &str, base: &str) -> bool {
+    let Some(head) = key.get(..base.len()) else {
+        return false;
+    };
+    if !head.eq_ignore_ascii_case(base) {
+        return false;
+    }
+    let Some(hex) = key[base.len()..].strip_prefix('~') else {
+        return false;
+    };
+    !hex.is_empty() && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 #[cfg(test)]
@@ -5086,7 +5117,7 @@ mod host_ip_mint_name_tests {
     #[test]
     fn host_ip_box_record_takes_the_registration_id_only_with_a_grant() {
         assert_eq!(
-            host_ip_mint_name(&config(boxes::NetworkMode::HostNet)),
+            host_ip_mint_name(&config(boxes::NetworkMode::HostNet), None),
             None
         );
     }
@@ -5095,7 +5126,7 @@ mod host_ip_mint_name_tests {
     #[test]
     fn host_ip_box_record_takes_the_registration_id_of_a_grant_box() {
         let config = with_upstream(config(boxes::NetworkMode::HostNet));
-        assert_eq!(host_ip_mint_name(&config), Some("agent".to_string()));
+        assert_eq!(host_ip_mint_name(&config, None), Some("agent".to_string()));
     }
 
     // BEP-082: a box with addresses takes its id from its row, never a name.
@@ -5106,7 +5137,38 @@ mod host_ip_mint_name_tests {
             switch_address: Ipv4Addr::new(100, 64, 0, 21),
             loopback_address: Ipv4Addr::new(127, 0, 0, 21),
         });
-        assert_eq!(host_ip_mint_name(&config), None);
+        assert_eq!(host_ip_mint_name(&config, None), None);
+    }
+
+    // BEP-082: the mint asks by a creation key only on a fresh instance,
+    // and only by a key for the box's own base.
+    #[test]
+    fn host_ip_box_record_takes_the_registration_key_only_for_its_own_fresh_base() {
+        let key = "agent~00112233445566778899aabbccddeeff";
+        let mut config = with_upstream(config(boxes::NetworkMode::HostNet));
+        config.host_ip_registration = Some(key.to_string());
+        assert_eq!(
+            host_ip_mint_name(&config, Some("agent")),
+            Some(key.to_string())
+        );
+        assert_eq!(
+            host_ip_mint_name(&config, None),
+            Some("agent".to_string()),
+            "a create that is not a fresh instance asks by its name"
+        );
+        assert_eq!(
+            host_ip_mint_name(&config, Some("other")),
+            Some("agent".to_string()),
+            "a key for another base is ignored"
+        );
+        for wrong in ["agent", "agent~", "agent~XYZ", "agent-1", "other~00"] {
+            config.host_ip_registration = Some(wrong.to_string());
+            assert_eq!(
+                host_ip_mint_name(&config, Some("agent")),
+                Some("agent".to_string()),
+                "{wrong} is not a creation key for agent"
+            );
+        }
     }
 }
 
