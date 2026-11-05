@@ -6432,7 +6432,10 @@ impl BoxRegistry {
     ///
     /// The guest's list only ever narrows the union to the rules a host
     /// client admitted: a box the host never admitted gains nothing, so a
-    /// guest that lies can drop its own boxes' egress but never widen it.
+    /// guest that lies can drop its own boxes' egress but never widen it
+    /// past those rules. A lie can bring back a set-aside box's rules, as
+    /// a real resume in the VM does. Rules a client retired are never set
+    /// aside ([`Self::retire_host_ip_box`]), so no list brings them back.
     ///
     /// `mark` is [`Self::host_ip_admit_mark`], taken before the list was
     /// read. A box a client admitted after the mark keeps its rules for
