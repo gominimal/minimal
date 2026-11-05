@@ -1033,6 +1033,14 @@ pub(crate) mod linux {
         /// daemon leaf: a daemon no placement reached, so it cannot decide a
         /// host-address box's egress per box until it is placed.
         pub(crate) unplaced_daemon: Option<u32>,
+        /// Whether the placement socket listens at
+        /// [`paths::PLACE_REQUEST_SOCKET`]; `None` where the host has no
+        /// systemctl and so is owed no placement unit. The unit file can be
+        /// installed and enabled while the socket is stopped (a boot that
+        /// dropped its job, or an operator's `systemctl stop`), and then no
+        /// later daemon start is placed. The unit sets `RemoveOnStop=yes`,
+        /// so the socket file is there exactly while the unit listens.
+        pub(crate) placer_listening: Option<bool>,
     }
 
     /// The classifier item over its facts: done once the tree's marker,
@@ -1081,10 +1089,29 @@ pub(crate) mod linux {
             && facts.units_enabled != Some(false)
         {
             // gominimal/inbox#1206: the step is installed, but the running
-            // daemon is outside its leaf. That is its own state, and its
-            // remedy is the step's --pid for that daemon alone.
-            if let Some(pid) = facts.unplaced_daemon {
-                return Item::missing(
+            // daemon is outside its leaf, or the placement socket that
+            // places each later start is not listening. Each is its own
+            // state, and the remedy is only what is missing: the socket
+            // started again, the step's --pid for that daemon, or both.
+            let placer_down = facts.placer_listening == Some(false);
+            let start_placer = format!(
+                "# The placement socket is installed but not listening, so no daemon\n\
+                 # start is placed until it is started again.\n\
+                 systemctl start {PLACE_SYSTEMD_UNIT}.socket\n"
+            );
+            let place_pid = |pid: u32| {
+                format!(
+                    "# The running daemon, outside its leaf: the step's --pid places it.\n\
+                     {CLASSIFIER_PROGRAM_PATH} --pid {pid}\n"
+                )
+            };
+            let placer_cause = format!(
+                "the placement socket ({PLACE_SYSTEMD_UNIT}.socket) is not listening, so \
+                 the next Minimal daemon start is not placed in its egress-enforcement cgroup"
+            );
+            return match (facts.unplaced_daemon, placer_down) {
+                (None, false) => Item::done(CLASSIFIER_ID, CLASSIFIER_LABEL),
+                (Some(pid), false) => Item::missing(
                     CLASSIFIER_ID,
                     CLASSIFIER_LABEL,
                     format!(
@@ -1095,13 +1122,32 @@ pub(crate) mod linux {
                     format!(
                         "places the running Minimal daemon (pid {pid}) in its egress-enforcement cgroup"
                     ),
+                    place_pid(pid),
+                ),
+                (None, true) => Item::missing(
+                    CLASSIFIER_ID,
+                    CLASSIFIER_LABEL,
+                    placer_cause,
+                    "starts the placement socket, so every Minimal daemon start is placed in \
+                     its egress-enforcement cgroup"
+                        .to_string(),
+                    start_placer,
+                ),
+                (Some(pid), true) => Item::missing(
+                    CLASSIFIER_ID,
+                    CLASSIFIER_LABEL,
                     format!(
-                        "# The running daemon, outside its leaf: the step's --pid places it.\n\
-                         {CLASSIFIER_PROGRAM_PATH} --pid {pid}\n"
+                        "the running Minimal daemon (pid {pid}) is not placed in its \
+                         egress-enforcement cgroup, so it cannot enforce egress per box for \
+                         boxes that share this machine's address, and {placer_cause}"
                     ),
-                );
-            }
-            return Item::done(CLASSIFIER_ID, CLASSIFIER_LABEL);
+                    format!(
+                        "starts the placement socket and places the running Minimal daemon \
+                         (pid {pid}) in its egress-enforcement cgroup"
+                    ),
+                    format!("{start_placer}{}", place_pid(pid)),
+                ),
+            };
         }
         let cause = match facts.mount {
             Cgroup2Mount::Absent => {
@@ -1603,6 +1649,11 @@ pub(crate) mod linux {
         let socket = socket_path
             .map(|path| path.display().to_string())
             .unwrap_or_default();
+        let placer_listening = systemctl.then(|| {
+            use std::os::unix::fs::FileTypeExt as _;
+            std::fs::symlink_metadata(paths::PLACE_REQUEST_SOCKET)
+                .is_ok_and(|meta| meta.file_type().is_socket())
+        });
         (
             ClassifierFacts {
                 table_present: recorded.is_some(),
@@ -1614,6 +1665,7 @@ pub(crate) mod linux {
                 root: me == 0,
                 mount: cgroup2_mount_from(&mountinfo),
                 unplaced_daemon,
+                placer_listening,
             },
             crate::resolver::operator_name(),
             socket,
@@ -2914,6 +2966,7 @@ mod tests {
             root: false,
             mount: Cgroup2Mount::Delegated,
             unplaced_daemon: None,
+            placer_listening: Some(true),
         };
         let installed = Quic443HelperFacts {
             helper_root_owned: true,
@@ -3067,6 +3120,7 @@ mod tests {
             root: false,
             mount: Cgroup2Mount::Delegated,
             unplaced_daemon: None,
+            placer_listening: Some(true),
         };
         let bare = ClassifierFacts {
             table_present: false,
@@ -3287,6 +3341,7 @@ mod tests {
             root: false,
             mount: Cgroup2Mount::Delegated,
             unplaced_daemon: None,
+            placer_listening: Some(true),
         };
         let stale = classifier_item_over(
             &ClassifierFacts {
@@ -3365,6 +3420,7 @@ mod tests {
             root: false,
             mount: Cgroup2Mount::Delegated,
             unplaced_daemon: None,
+            placer_listening: Some(true),
         };
         assert_eq!(
             classifier_item_over(&installed, "alice", sock).state,
@@ -3374,6 +3430,7 @@ mod tests {
         let unplaced = classifier_item_over(
             &ClassifierFacts {
                 unplaced_daemon: Some(4242),
+                placer_listening: Some(true),
                 ..installed
             },
             "alice",
@@ -3403,12 +3460,85 @@ mod tests {
             !script.contains("cat >"),
             "the block writes no unit and no copy of the step: {script}"
         );
+        assert!(
+            !script.contains("systemctl start"),
+            "a listening placer is not started again: {script}"
+        );
+        // The units are installed but the placement socket is stopped (a
+        // boot that dropped its job, or `systemctl stop`): the daemon that
+        // runs now may be placed, but the next start is not, so the item is
+        // not done and its block starts the socket again.
+        let placer_down = classifier_item_over(
+            &ClassifierFacts {
+                placer_listening: Some(false),
+                ..installed
+            },
+            "alice",
+            sock,
+        );
+        assert_eq!(placer_down.state, ItemState::Missing);
+        assert_eq!(
+            placer_down.today.as_deref(),
+            Some(
+                "the placement socket (minimald-place.socket) is not listening, so the next \
+                 Minimal daemon start is not placed in its egress-enforcement cgroup"
+            )
+        );
+        let script = placer_down
+            .script
+            .expect("a stopped placer carries its block");
+        assert!(
+            script.contains("\nsystemctl start minimald-place.socket\n"),
+            "the block starts the placement socket: {script}"
+        );
+        assert!(
+            !script.contains("--pid") && !script.contains("cat >"),
+            "the block only starts the socket: {script}"
+        );
+        // Both at once: the block starts the socket, then places the
+        // running daemon, so this daemon and every later start are placed.
+        let both = classifier_item_over(
+            &ClassifierFacts {
+                unplaced_daemon: Some(4242),
+                placer_listening: Some(false),
+                ..installed
+            },
+            "alice",
+            sock,
+        );
+        assert_eq!(both.state, ItemState::Missing);
+        let script = both.script.expect("both carry one block");
+        let start = script
+            .find("\nsystemctl start minimald-place.socket\n")
+            .expect("the block starts the socket");
+        let place = script
+            .find(&format!("\n{CLASSIFIER_PROGRAM_PATH} --pid 4242\n"))
+            .expect("the block places the daemon");
+        assert!(
+            start < place,
+            "the socket starts before the --pid: {script}"
+        );
+        // No systemctl on the host: no placer is owed, so none is missing.
+        assert_eq!(
+            classifier_item_over(
+                &ClassifierFacts {
+                    units_enabled: None,
+                    placer_listening: None,
+                    ..installed
+                },
+                "alice",
+                sock,
+            )
+            .state,
+            ItemState::Done
+        );
         // A step that is not installed is the install's item, whatever the
         // daemon's placement: the install places the daemon too.
         let bare = classifier_item_over(
             &ClassifierFacts {
                 table_present: false,
                 unplaced_daemon: Some(4242),
+                placer_listening: Some(true),
                 ..installed
             },
             "alice",
@@ -3488,6 +3618,7 @@ mod tests {
                 root: false,
                 mount: Cgroup2Mount::Delegated,
                 unplaced_daemon: None,
+                placer_listening: Some(true),
             },
             "alice",
             sock,
@@ -3671,6 +3802,7 @@ mod tests {
                     root: false,
                     mount: Cgroup2Mount::Delegated,
                     unplaced_daemon: None,
+                    placer_listening: Some(true),
                 },
                 "alice",
                 sock.to_str().expect("the temp root is UTF-8"),
