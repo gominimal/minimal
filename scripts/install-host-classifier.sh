@@ -575,6 +575,14 @@ place_listener() {
         attempt=$((attempt + 1))
         [ "$attempt" -le 3 ] || break
         note "no socket at $listener yet: waiting for the daemon to bind it (pass $attempt of 3)"
+        # Wake any late-bind peer (the install test's stand-in writer) that
+        # publishes the socket between this step's lookups: the touch says
+        # this pass is over and the next lookup is armed, so the peer can
+        # hold its publication to a retry that is sure to see it. A daemon
+        # under the real manager sets no variable and an empty name touches
+        # nothing here.
+        [ -z "${MINIMAL_LISTENER_RETRY_ACK:-}" ] ||
+            : >"$MINIMAL_LISTENER_RETRY_ACK" 2>/dev/null || true
         sleep 1
         inodes="$(awk -v p="$listener" '$8 == p { print $7 }' "$PROC/net/unix")"
     done

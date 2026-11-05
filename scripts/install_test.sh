@@ -2663,6 +2663,7 @@ STUB
             NFT_FAIL="${NFT_FAIL:-0}" \
             NFT_RULESET="${NFT_RULESET:-}" \
             NFT_LEAF_SET="${NFT_LEAF_SET:-}" \
+            MINIMAL_LISTENER_RETRY_ACK="${HC_LISTENER_RETRY_ACK:-}" \
             MINIMAL_OVERRIDE_CGROUP_MOUNTINFO="$mi" \
             MINIMAL_OVERRIDE_PROC="${HC_PROC:-/proc}" \
             MINIMAL_OVERRIDE_QUIC443_HELPER="${HC_HELPER:-}" \
@@ -3372,13 +3373,24 @@ STUB
     # bound after the first failed lookup — a fixed sleep here would race
     # the step's own wait: if the step reached its first lookup late, the
     # inode would already be listed and the step would never say it waited.
+    # The wait is one-way, though: the step sleeps only a second between
+    # its retries and could finish all three before a slow writer runs, so
+    # the step touches the ack file once per failed pass and the writer
+    # waits for that touch after the note: the socket is then published
+    # only once the step has committed to another lookup that will see it.
+    # A step that retries without setting the ack path, or never touches
+    # it, cannot hang the writer: the wait is bounded and falls back to
+    # publishing anyway.
     mkdir -p "$fproc/4242/fd"
     ln -s 'socket:[777]' "$fproc/4242/fd/5"
     printf 'Name:\tminimald\nUid:\t%s\t%s\t%s\t%s\n' "$me" "$me" "$me" "$me" >"$fproc/4242/status"
     printf '0::/user.slice/user-%s.slice/session-1.scope\n' "$me" >"$fproc/4242/cgroup"
+    late_out="$root/hc.place_listener_late"
+    late_ack="$root/late_listener_ack"
+    rm -f "$late_ack"
+    HC_LISTENER_RETRY_ACK="$late_ack"
     {
         printf 'Num       RefCount Protocol Flags    Type St Inode Path\n'
-        late_out="$root/hc.place_listener_late"
         n=0
         until grep -q 'waiting for the daemon to bind it' "$late_out" 2>/dev/null; do
             n=$((n + 1))
@@ -3386,6 +3398,16 @@ STUB
             # the suite; a timeout means the socket stays unbound, which the
             # assertions below already fail loudly.
             [ "$n" -lt 100 ] || exit 0
+            sleep 0.1
+        done
+        # Hold publication until the step has finished the pass that printed
+        # the note and armed another lookup (its ack touch), so the retries
+        # cannot all run out before the inode is listed; bounded the same
+        # way, falling back to publishing if no ack ever comes.
+        n=0
+        until [ -e "$late_ack" ]; do
+            n=$((n + 1))
+            [ "$n" -lt 100 ] || break
             sleep 0.1
         done
         printf '0000 00000002 00000000 00010000 0001 01 777 %s\n' "$lsock"
@@ -3401,6 +3423,7 @@ STUB
         grep -qx 4242 "$tree/daemon/cgroup.procs"
     rm -rf "$fproc/4242"
     printf 'Num       RefCount Protocol Flags    Type St Inode Path\n' >"$fproc/net/unix"
+    HC_LISTENER_RETRY_ACK=
     run_hc place_listener_nobody "$root/mi-on" --user "$me" --place-listener "$lsock"
     check 0 "$rc" "--place-listener over a socket nobody holds exits 0"
     want_ok "nobody holding it is nothing to place, said so" grep -q "no process holds .*: nothing to place" "$OUT"
