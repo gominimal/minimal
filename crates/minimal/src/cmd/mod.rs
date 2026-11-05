@@ -140,6 +140,7 @@ fn command_verb(command: Option<&Command>) -> &'static str {
             BoxCommand::Show(_) => "box show",
             BoxCommand::Stop(_) => "box stop",
             BoxCommand::Rm(_) => "box rm",
+            BoxCommand::Attach(_) => "box attach",
             BoxCommand::Exec(_) => "box exec",
             BoxCommand::Events(_) => "box events",
             BoxCommand::Cp(_) => "box cp",
@@ -149,6 +150,7 @@ fn command_verb(command: Option<&Command>) -> &'static str {
         Some(Command::Host(HostArgs { command })) => match command {
             HostCommand::List => "host list",
             HostCommand::Show(_) => "host show",
+            HostCommand::Stop(_) => "host stop",
         },
         Some(Command::Provider(ProviderArgs { command })) => match command {
             ProviderCommand::List(_) => "provider list",
@@ -387,6 +389,7 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             BoxCommand::Show(args) => cmd_box_show(&cli.global_args, args).await,
             BoxCommand::Stop(args) => cmd_box_stop(&cli.global_args, args).await,
             BoxCommand::Rm(args) => cmd_box_rm(&cli.global_args, args).await,
+            BoxCommand::Attach(args) => cmd_box_attach(&cli.global_args, args).await,
             BoxCommand::Exec(args) => cmd_box_exec(&cli.global_args, args).await,
             BoxCommand::Events(args) => cmd_box_events(&cli.global_args, args).await,
             BoxCommand::Cp(args) => cmd_box_cp(&cli.global_args, args).await,
@@ -399,6 +402,9 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             }
             HostCommand::Show(args) => {
                 hosts::cmd_host_show(&cli.global_args, &args, &mut std::io::stdout()).await
+            }
+            HostCommand::Stop(args) => {
+                hosts::cmd_host_stop(&cli.global_args, &args, &mut std::io::stdout()).await
             }
         },
         Some(Command::Provider(ProviderArgs { command })) => match command {

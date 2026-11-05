@@ -24,6 +24,14 @@ pub use boxes::{
 
 pub const RPC_SUBSYSTEM_PREFIX: &str = "minimald-v1-";
 
+/// The daemon's grace period between a stop's SIGTERM and its SIGKILL
+/// (BOX-013). A client that waits for a stop to land waits this long.
+pub const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The bound on one host probe the daemon makes. A stop waits this long
+/// again after its last signal for the entrypoint to be reaped.
+pub const HOST_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// The message every RPC refusal carries once the daemon has begun its
 /// shutdown: a client racing `min stop` matches on it to name the lost race
 /// in plain language instead of surfacing the raw RPC chain. Matching keys
@@ -2761,6 +2769,11 @@ pub struct BoxListingEntry {
     /// The number of the signal that ended a stopped box.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal: Option<i32>,
+    /// Whether the box's stored spec sets `io.pty_enabled`, so a client can
+    /// attach a terminal to it (BCLI-068). A daemon that predates the field
+    /// sends none, and the box reads as one with no terminal.
+    #[serde(default)]
+    pub pty_enabled: bool,
 }
 
 /// The response for a [`ListBoxes`] RPC.
@@ -3894,6 +3907,7 @@ mod box_listing_tests {
             reason: None,
             exit_code: None,
             signal: None,
+            pty_enabled: true,
         }
     }
 
@@ -3946,6 +3960,14 @@ mod box_listing_tests {
             Errorable::Ok(back) => assert_eq!(back, show),
             Errorable::Err { error } => panic!("the read reply read back as an error: {error}"),
         }
+        // BCLI-068: a record from a daemon that predates `pty_enabled`
+        // reads as a box with no terminal.
+        let older: BoxListingEntry = serde_json_lenient::from_str(&format!(
+            r#"{{"box_id":"{}","state":"running"}}"#,
+            show.record.box_id
+        ))
+        .unwrap();
+        assert!(!older.pty_enabled);
         // The identity none serialises with the name BOX-140 reports.
         assert_eq!(
             serde_json_lenient::to_string(&BoxIdentity::None).unwrap(),

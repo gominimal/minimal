@@ -460,6 +460,10 @@ pub enum BoxCommand {
     /// files. A running box is refused unless `--force` is given, which
     /// stops the box at once and then removes it
     Rm(BoxRmArgs),
+    /// Attach this terminal to a box's terminal. With no box named, attach
+    /// to this project's running box that has a terminal, else to its only
+    /// stopped or exited one, which starts again
+    Attach(BoxAttachArgs),
     /// Run a command in a running box and exit with the command's exit
     /// code. `-t` gives the command a terminal, and `--detach` starts it
     /// and returns its exec id
@@ -537,6 +541,9 @@ pub enum HostCommand {
     /// Show one local host: its provider, whether it is running, the socket
     /// `min` connects to and the daemon version
     Show(HostShowArgs),
+    /// Stop each running box on a local host, then its daemon, and its VM
+    /// on a VM host
+    Stop(HostStopArgs),
 }
 
 // BCLI-048: `min host show <host>`.
@@ -544,6 +551,17 @@ pub enum HostCommand {
 pub struct HostShowArgs {
     /// The host, as `min host list` prints it (`local0`, `local-minvmd0`)
     pub host: String,
+}
+
+// BCLI-049: `min host stop <host> [--force]`.
+#[derive(Debug, Args)]
+pub struct HostStopArgs {
+    /// The host, as `min host list` prints it (`local0`, `local-minvmd0`)
+    pub host: String,
+    /// Force-stop each box, and stop the daemon without waiting for it to
+    /// shut down cleanly. On a VM host, the VM is stopped from this machine
+    #[arg(long, short, default_value_t = false)]
+    pub force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -606,6 +624,15 @@ pub struct BoxStopArgs {
     /// Kill every process in the box at once, with no grace period
     #[arg(long)]
     pub force: bool,
+}
+
+// BCLI-068: `min box attach [<box>]`.
+#[derive(Debug, Args)]
+pub struct BoxAttachArgs {
+    /// The box: its id, the start of its id, its name, or
+    /// provider/host/name, as `min box list` prints them. Omit it to attach
+    /// to this project's box
+    pub target: Option<String>,
 }
 
 // BOX-019 (BCLI-060, BCLI-004): `min box rm <box> [--force]`.

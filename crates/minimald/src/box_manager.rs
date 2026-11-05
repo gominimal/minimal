@@ -525,16 +525,16 @@ impl BoxManagerHandle {
         async {
             let (send, recv) = Responder::channel();
             // Ignore send errors - the recv will also fail.
-            let _ = self.sender.send(ManagerMessage::Records(send)).await;
+            let _ = self.sender.send(ManagerMessage::Listing(send)).await;
             let records = recv
                 .await
                 .expect("corresponding sessions manager is dead")?;
             let mut boxes: Vec<_> = records
                 .iter()
-                .filter(|record| {
+                .filter(|(record, _)| {
                     project_root.is_none_or(|root| record.project_root.as_ref() == Some(root))
                 })
-                .map(box_listing_entry)
+                .map(|(record, pty)| box_listing_entry(record, *pty))
                 .collect();
             boxes.sort_by_key(|entry| entry.box_id);
             tracing::Span::current().record("count", boxes.len());
@@ -559,7 +559,7 @@ impl BoxManagerHandle {
         async {
             let (send, recv) = Responder::channel();
             // Ignore send errors - the recv will also fail.
-            let _ = self.sender.send(ManagerMessage::Records(send)).await;
+            let _ = self.sender.send(ManagerMessage::Listing(send)).await;
             let records = recv
                 .await
                 .expect("corresponding sessions manager is dead")?;
@@ -567,13 +567,12 @@ impl BoxManagerHandle {
             // guest's differs from its `id`), so that key wins.
             let record = records
                 .iter()
-                .find(|record| record.box_id == Some(id))
-                .or_else(|| records.iter().find(|record| record.id == id))
-                .cloned();
+                .find(|(record, _)| record.box_id == Some(id))
+                .or_else(|| records.iter().find(|(record, _)| record.id == id));
             tracing::Span::current().record("found", record.is_some());
             tracing::info!(session_id = %id, found = record.is_some(), "read a box record");
-            Ok(record.map(|record| minimald_rpc::ShowBoxResponse {
-                record: box_listing_entry(&record),
+            Ok(record.map(|(record, pty)| minimald_rpc::ShowBoxResponse {
+                record: box_listing_entry(record, *pty),
                 // BOX-140: no host this daemon runs on is enrolled with a
                 // Gatehouse, so every box reports the identity none.
                 identity: minimald_rpc::BoxIdentity::None,
@@ -725,7 +724,8 @@ impl BoxManagerHandle {
                     .await?
                     .ok_or_else(|| unknown_box(key))?;
             }
-            let reaped = box_listing_entry(&record);
+            // The reaped box has no terminal left to attach to.
+            let reaped = box_listing_entry(&record, false);
             let (send, recv) = Responder::channel();
             // A send error means the manager is gone: the recv fails as well.
             let _ = self.sender.send(ManagerMessage::ReapEnded(key, send)).await;
@@ -972,7 +972,8 @@ fn unknown_box(id: SessionId) -> BoxManagerError {
 /// state as BOX-011 spells it. A `stopped` or `exited` record whose stored
 /// ending is not a row of the BOX-011 table reports its status with the
 /// stored `reason`, `exit_code` and `signal` as they are.
-fn box_listing_entry(record: &boxes::Record) -> minimald_rpc::BoxListingEntry {
+/// `pty_enabled` is whether the box has a terminal ([`record_has_pty`]).
+fn box_listing_entry(record: &boxes::Record, pty_enabled: bool) -> minimald_rpc::BoxListingEntry {
     let (state, reason, exit_code, signal) = match record.state() {
         Ok(state) => (
             state.name(),
@@ -1006,6 +1007,21 @@ fn box_listing_entry(record: &boxes::Record) -> minimald_rpc::BoxListingEntry {
         reason,
         exit_code,
         signal,
+        pty_enabled,
+    }
+}
+
+/// Whether a box has a terminal (BCLI-068): its stored spec sets
+/// `io.pty_enabled`, as the PTY check of a resume reads it (BOX-030). A box
+/// filed with no spec has only its Box Type to go by, and a session has a
+/// terminal, as the resume reads it too.
+pub(crate) fn record_has_pty(record: &boxes::Record, stored_spec: Option<&[u8]>) -> bool {
+    match stored_spec {
+        Some(bytes) => crate::box_runtime::stored_spec_sets_pty(bytes),
+        None => record
+            .box_type
+            .as_deref()
+            .is_none_or(|box_type| box_type == boxes::SESSION_BOX_TYPE),
     }
 }
 
@@ -1039,6 +1055,9 @@ enum ManagerMessage {
     /// Every retained record, in any state (BOX-158). Read-only against
     /// the store: it starts no actor and probes no host.
     Records(Responder<Vec<boxes::Record>>),
+    /// [`Self::Records`], each record with whether its box has a terminal
+    /// ([`record_has_pty`]), for the listing and the read (BCLI-068).
+    Listing(Responder<Vec<(boxes::Record, bool)>>),
     GetRecord(BoxKeyPredicate, Responder<Option<boxes::Record>>),
     /// The retained box an events read follows (BOX-162): its on-disk
     /// object, so the read runs off the mainloop. `None` for an id no
@@ -1133,6 +1152,7 @@ impl ManagerMessage {
         match self {
             Self::List(..) => "List",
             Self::Records(..) => "Records",
+            Self::Listing(..) => "Listing",
             Self::GetRecord(..) => "GetRecord",
             Self::EventsSource(..) => "EventsSource",
             Self::EndedSource(..) => "EndedSource",
@@ -3747,6 +3767,42 @@ impl BoxManager {
                         if !tearing_down.contains(handle.id()) {
                             records.push(handle.record().await?);
                         }
+                    }
+                    Ok::<_, BoxManagerError>(records)
+                })
+                .await;
+            }
+            // Gets every retained record, as `Records` does, with whether
+            // the box's stored spec gives it a terminal.
+            ManagerMessage::Listing(r) => {
+                let tearing_down = self
+                    .tearing_down
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                r.handle(async {
+                    let mut records = Vec::new();
+                    for handle in self.store.handles().await? {
+                        if tearing_down.contains(handle.id()) {
+                            continue;
+                        }
+                        let record = handle.record().await?;
+                        // A spec that cannot be read leaves the Box Type
+                        // to go by, as for a box filed with no spec, so a
+                        // session still lists with its terminal.
+                        let stored = match handle.object().await.and_then(|o| o.load_spec()) {
+                            Ok(stored) => stored,
+                            Err(error) => {
+                                tracing::warn!(
+                                    session_id = %record.id,
+                                    %error,
+                                    "could not read the box's stored spec; terminal taken from its box type"
+                                );
+                                None
+                            }
+                        };
+                        let pty = record_has_pty(&record, stored.as_deref());
+                        records.push((record, pty));
                     }
                     Ok::<_, BoxManagerError>(records)
                 })
