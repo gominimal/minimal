@@ -1072,9 +1072,6 @@ where
         .name("minvmd-host-ip-reconcile".to_string())
         .spawn(move || {
             let mut last: Option<std::time::Instant> = None;
-            // The admit count when the previous pass began. The first pass
-            // has none, so it leaves alone every box a client admitted.
-            let mut previous = crate::box_registry::HostIpAdmitMark::default();
             let mut failing = false;
             loop {
                 let trigger = match receiver.recv_timeout(interval) {
@@ -1091,15 +1088,12 @@ where
                 }
                 while receiver.try_recv().is_ok() {}
                 last = Some(std::time::Instant::now());
-                // The previous pass's mark, not this one's: a box a client
-                // admitted since then is left alone for this pass. A resume
-                // admits before the attach starts the box, and a list read
-                // in that gap still says `stopped`. A resume is no box event
-                // the guest door sees, so a drop then holds until the timer.
-                let mark = std::mem::replace(&mut previous, boxes.host_ip_admit_mark());
                 if !boxes.holds_host_ip_boxes() {
                     continue;
                 }
+                // Taken before the read, so a box a client admits while the
+                // list is in flight is not dropped on a list that predates it.
+                let mark = boxes.host_ip_admit_mark();
                 match read_guest() {
                     Ok(guest) => {
                         failing = false;
@@ -9423,26 +9417,16 @@ mod tests {
             scripted_guest_reader(calls_tx, answers_rx),
         )
         .expect("the reconcile thread starts");
-        let first_list = || {
-            Ok(std::collections::BTreeMap::from([
-                (stopped, boxes::BoxState::Stopped),
-                (live, boxes::BoxState::Active),
-            ]))
-        };
         nudge.nudge();
         calls
             .recv_timeout(read_timeout)
             .expect("a nudge reads the session list");
-        answers.send(first_list()).expect("the reader waits");
-        // The first pass leaves alone a box a client admitted before it:
-        // the list can predate a resume.
-        nudge.nudge();
-        calls
-            .recv_timeout(read_timeout)
-            .expect("a second nudge reads again");
-        assert_eq!(resident_host_ip_sessions(&registry), vec![stopped, live]);
-        // The next pass takes the first pass's mark, so the list decides.
-        answers.send(first_list()).expect("the reader waits");
+        answers
+            .send(Ok(std::collections::BTreeMap::from([
+                (stopped, boxes::BoxState::Stopped),
+                (live, boxes::BoxState::Active),
+            ])))
+            .expect("the reader waits");
         wait_for_resident(&registry, &[live]);
 
         // A failed read changes nothing: an empty list would drop `live`
@@ -9450,7 +9434,7 @@ mod tests {
         nudge.nudge();
         calls
             .recv_timeout(read_timeout)
-            .expect("a third nudge reads again");
+            .expect("a second nudge reads again");
         answers
             .send(Err(anyhow::anyhow!("the in-VM daemon did not answer")))
             .expect("the reader waits");
@@ -9458,7 +9442,7 @@ mod tests {
         nudge.nudge();
         calls
             .recv_timeout(read_timeout)
-            .expect("a fourth nudge reads again");
+            .expect("a third nudge reads again");
         assert_eq!(resident_host_ip_sessions(&registry), vec![live]);
         assert!(registry.holds_host_ip_boxes());
         // The guest runs the stopped box again: it rejoins.
@@ -9483,14 +9467,12 @@ mod tests {
             scripted_guest_reader(calls_tx, answers_rx),
         )
         .expect("the reconcile thread starts");
-        for _ in 0..2 {
-            calls
-                .recv_timeout(read_timeout)
-                .expect("the timer reads the session list");
-            answers
-                .send(Ok(std::collections::BTreeMap::new()))
-                .expect("the reader waits");
-        }
+        calls
+            .recv_timeout(read_timeout)
+            .expect("the timer reads the session list");
+        answers
+            .send(Ok(std::collections::BTreeMap::new()))
+            .expect("the reader waits");
         wait_for_resident(&registry, &[]);
         assert!(
             !registry.holds_host_ip_boxes(),
