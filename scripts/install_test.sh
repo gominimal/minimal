@@ -3310,8 +3310,8 @@ STUB
         grep -q "numeric process id" "$OUT"
 
     # --- --place-listener: the same placement, found from the daemon's own
-    # listener so a manager-held path unit can make it at every start the
-    # socket announces (no per-restart --pid). Over a stand-in process table:
+    # listener so the manager-held placement unit can make it at every start
+    # the daemon asks for (no per-restart --pid). Over a stand-in process table:
     # the holder of the socket that runs as the delegated account outside
     # the slice is placed; a holder of another uid, a holder of another
     # socket, a same-uid holder already inside the slice (a box in

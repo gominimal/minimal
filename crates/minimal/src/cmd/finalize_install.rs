@@ -1131,7 +1131,7 @@ pub(crate) mod linux {
                      which the install script and its systemd units cannot handle"
                 } else if socket.is_empty() {
                     "could not work out this machine's daemon socket path, which the \
-                     step's systemd unit watches"
+                     placement unit needs to find the daemon"
                 } else if !socket
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || "._/-".contains(c))
@@ -3121,7 +3121,8 @@ mod tests {
                 bare,
                 "alice",
                 "",
-                "could not work out this machine's daemon socket path",
+                "could not work out this machine's daemon socket path, which the placement \
+                 unit needs to find the daemon",
             ),
             (bare, "alice", "/run/it's.sock", outside),
             (bare, "alice", "/run/my dir/ssh.sock", outside),
@@ -3237,7 +3238,7 @@ mod tests {
             );
         }
         // Root is not the account whose daemon this is: `sudo min
-        // finalize-install` would install for root and watch root's socket,
+        // finalize-install` would install for root and place root's daemon,
         // so it is refused before anything reads as done or missing.
         for facts in [installed, bare] {
             let as_root = classifier_item_over(
@@ -3262,9 +3263,10 @@ mod tests {
     /// root-owned copy (atomically, beside the target then moved over it,
     /// so a unit firing mid-write never runs half a script; no fetch, no
     /// placeholder, no source identity), runs it, and installs a boot
-    /// oneshot that re-runs it plus a path unit on the daemon's socket whose
-    /// oneshot runs the step's `--place-listener` — so a daemon restart is
-    /// placed by the manager, never by a per-restart `--pid`.
+    /// oneshot that re-runs it plus a socket unit the daemon connects to at
+    /// start, whose per-connection service runs the step's
+    /// `--place-listener` — so a daemon restart is placed by the manager,
+    /// never by a per-restart `--pid`.
     /// The boot unit and a refresh re-apply the mask the loaded table
     /// records, since a reboot empties the cgroupfs record. A
     /// `--ct-mark-mask` that differs from the record re-runs the step
