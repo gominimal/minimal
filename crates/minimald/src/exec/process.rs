@@ -779,6 +779,16 @@ pub(super) async fn task_entrypoint_box(
     is_task_entrypoint.then_some(TaskEntrypointBox { record, dir })
 }
 
+/// The refusal of a task run whose box's entrypoint another run relays:
+/// the host hands the entrypoint's streams to one run at a time
+/// ([`crate::box_runtime::EntrypointIoTake::Relayed`]).
+pub(crate) fn entrypoint_relayed_refusal(task: &str, box_name: &str) -> String {
+    format!(
+        "Task {task} is already running in box {box_name}, and another min task run shows its \
+         output. Only one run at a time can show a task's output."
+    )
+}
+
 /// How often a task run checks whether its box's entrypoint ended, and
 /// whether the box's record keeps the end.
 const ENTRYPOINT_POLL: Duration = Duration::from_millis(100);
@@ -864,6 +874,18 @@ impl TaskEntrypointBox {
                     "The task's box runs its command on a terminal, so the run cannot pass its \
                      input and output.",
                 ));
+            }
+            crate::box_runtime::EntrypointIoTake::Relayed => {
+                // The run that started the entrypoint, or one that took its
+                // place, still reads it. That run keeps the output and the
+                // exit code. This run takes nothing, and its staged values
+                // went with the join (see `ensure_host`).
+                span.in_scope(|| {
+                    tracing::info!("task box: another run relays the entrypoint; refused the run");
+                });
+                return Ok(TaskProcess::Refused(RefusedProcess::new(
+                    &entrypoint_relayed_refusal(&exec.task, &box_name),
+                )));
             }
             crate::box_runtime::EntrypointIoTake::HostGone => {
                 span.in_scope(|| {

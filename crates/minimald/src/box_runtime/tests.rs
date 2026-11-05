@@ -8416,6 +8416,7 @@ async fn a_fast_entrypoint_on_pipes_keeps_its_output_for_a_late_run() {
     let io = match handle.take_entrypoint_io().await {
         EntrypointIoTake::Taken(io) => io,
         EntrypointIoTake::OnTerminal => panic!("an entrypoint on pipes read as on a terminal"),
+        EntrypointIoTake::Relayed => panic!("no other run took the streams"),
         EntrypointIoTake::HostGone => panic!("the host ended before the run took the streams"),
     };
     let collect = |mut rx: mpsc::Receiver<Vec<u8>>| async move {
@@ -8442,6 +8443,64 @@ async fn a_fast_entrypoint_on_pipes_keeps_its_output_for_a_late_run() {
         .expect("the host reaps the entrypoint");
     assert_eq!(exit.code, 3, "the entrypoint's own exit code");
     assert!(!exit.requested, "nobody asked for the end");
+}
+
+/// T43: the host hands its entrypoint's streams to one run at a time. A
+/// second take while the first run still reads them is refused, and the
+/// first run keeps every byte. Once the first run's streams close, a later
+/// run takes them in its place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_take_of_entrypoint_streams_is_refused_while_the_first_reads() {
+    use mfile::spec::{BoxSpec, Entrypoint, SpecFlags};
+
+    let stored = StoredBox::new();
+    let mark = stored._tmp.path().join("go");
+    let script = format!(
+        r#"while [ ! -e '{}' ]; do sleep 0.05; done; echo first-out; echo first-err >&2; sleep 60"#,
+        mark.display()
+    );
+    let mut spec = BoxSpec::for_session(None, SpecFlags::default());
+    spec.pty_enabled = false;
+    spec.entrypoint = Entrypoint::Exec(vec!["/bin/sh".to_string(), "-c".to_string(), script]);
+    let launcher = MockLauncher::default().and_spec(LaunchSpec {
+        spec: Some(Arc::new(spec)),
+        for_hooks: false,
+    });
+    let (host, handle) = Host::build(launcher, stored.params())
+        .await
+        .expect("failed to build host");
+    let task = crate::traced::spawn(host.run());
+
+    let EntrypointIoTake::Taken(mut first) = handle.take_entrypoint_io().await else {
+        panic!("the first run takes the streams");
+    };
+    assert!(first.stdin.is_some(), "the first run gets the stdin");
+    assert!(
+        matches!(handle.take_entrypoint_io().await, EntrypointIoTake::Relayed),
+        "a second run is refused while the first reads"
+    );
+
+    std::fs::write(&mark, b"").unwrap();
+    async fn recv(rx: &mut mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
+        tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the output reaches the first run")
+            .expect("the first run's stream is still open")
+    }
+    assert_eq!(recv(&mut first.stdout).await, b"first-out\n");
+    assert_eq!(recv(&mut first.stderr).await, b"first-err\n");
+
+    drop(first);
+    let EntrypointIoTake::Taken(later) = handle.take_entrypoint_io().await else {
+        panic!("a run takes the streams once the first run's streams closed");
+    };
+    assert!(
+        later.stdin.is_none(),
+        "only the first run gets the entrypoint's stdin"
+    );
+
+    handle.kill(true).await.expect("kill should reach the host");
+    let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
 }
 
 /// BOX-155: the box's output is in its log from the start, with no client

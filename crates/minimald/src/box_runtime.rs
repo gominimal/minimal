@@ -57,7 +57,7 @@ use hooks::*;
 pub(crate) use launcher::*;
 #[cfg(test)]
 pub(crate) use mock::*;
-pub(crate) use pipes::{EntrypointIo, EntrypointIoTake};
+pub(crate) use pipes::EntrypointIoTake;
 use pipes::{HostPipes, PIPE_EXIT_POLL, PipeStream, read_ready};
 
 /// What a host loop returns when it ends: the portable exit code, and the
@@ -1667,14 +1667,19 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
         killed
     }
 
-    /// Hands the entrypoint's streams to the run that asked for them. The
-    /// reply is `None` for a host whose entrypoint has a terminal.
-    fn answer_take_entrypoint_io(&mut self, reply: oneshot::Sender<Option<EntrypointIo>>) {
+    /// Hands the entrypoint's streams to the run that asked for them, or
+    /// says why it gets none: the entrypoint has a terminal, or another run
+    /// relays it.
+    fn answer_take_entrypoint_io(&mut self, reply: oneshot::Sender<EntrypointIoTake>) {
         #[expect(
             clippy::let_underscore_must_use,
             reason = "the run may already be gone; the output then goes to the log only"
         )]
-        let _ = reply.send(self.pipes.as_mut().map(HostPipes::take_io));
+        let _ = reply.send(
+            self.pipes
+                .as_mut()
+                .map_or(EntrypointIoTake::OnTerminal, HostPipes::take_io),
+        );
     }
 
     /// Holds an ended entrypoint's output for the run that started it, when

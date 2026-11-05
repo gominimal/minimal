@@ -16590,6 +16590,84 @@ async fn a_task_run_of_an_entrypoint_that_ends_at_once_returns_its_output() {
     assert_eq!(String::from_utf8_lossy(&outcome.stderr), "fast-err\n");
 }
 
+// T43: a second task run on a task box whose entrypoint a first run
+// relays is refused with exit 1 and a refusal on stderr. It takes none of
+// the entrypoint's output, so the first run keeps all of it and the exit
+// code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_task_run_is_refused_while_the_first_relays_the_entrypoint() {
+    let log = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_task_box(
+        &mut client,
+        &["/bin/sh", "-c", "sleep 4; echo first-out; exit 4"],
+    )
+    .await;
+
+    let first = crate::traced::spawn(async move {
+        client
+            .exec(
+                &[(crate::MINIMAL_SESSION_ID_ENV, &id.to_string())],
+                false,
+                &task_box_run_request(),
+                b"",
+            )
+            .await
+    });
+    let relaying = tokio::time::timeout(Duration::from_secs(10), async {
+        while !log
+            .contents()
+            .contains("task box: the run relays the box's entrypoint")
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        relaying.is_ok(),
+        "the first run relays the box's entrypoint"
+    );
+
+    let mut second_client = server.connect().await;
+    let second = tokio::time::timeout(
+        Duration::from_secs(10),
+        second_client.exec(
+            &[(crate::MINIMAL_SESSION_ID_ENV, &id.to_string())],
+            false,
+            &task_box_run_request(),
+            b"",
+        ),
+    )
+    .await
+    .expect("the second run is refused at once")
+    .expect("the daemon takes the second run");
+    assert_eq!(
+        second.exit_status,
+        Some(1),
+        "{second:?}: {}",
+        log.contents()
+    );
+    assert!(second.stdout.is_empty(), "the second run took no output");
+    assert_eq!(
+        String::from_utf8_lossy(&second.stderr),
+        "Task check is already running in box check, and another min task run shows its \
+         output. Only one run at a time can show a task's output.\n"
+    );
+
+    let first = tokio::time::timeout(Duration::from_secs(30), first)
+        .await
+        .expect("the first run ends when the entrypoint returns")
+        .expect("the first run does not panic")
+        .expect("the daemon takes the first run");
+    assert_eq!(first.exit_status, Some(4), "{first:?}: {}", log.contents());
+    assert_eq!(
+        String::from_utf8_lossy(&first.stdout),
+        "first-out\n",
+        "the first run keeps the entrypoint's output"
+    );
+}
+
 // BOX-038, BOX-025, T43: a run against a task box whose entrypoint already
 // returned is refused because the box exited, not because it is still
 // activating. The two refusals tell the user different things: a box that

@@ -39,8 +39,8 @@ pub(super) enum Message {
     GetScreen(oneshot::Sender<minimald_rpc::ScreenSnapshot>),
 
     /// Hand a task run the streams of an entrypoint that runs on pipes
-    /// (T43). `None` for a host whose entrypoint has a terminal.
-    TakeEntrypointIo(oneshot::Sender<Option<EntrypointIo>>),
+    /// (T43), or say why the run gets none.
+    TakeEntrypointIo(oneshot::Sender<EntrypointIoTake>),
 
     /// Ask the attached human whether the box may publish `port` at runtime
     /// (NET-045): the box's `dynamic_ingress` is `ask`, so the bound client
@@ -483,11 +483,7 @@ impl HostHandle {
         {
             return EntrypointIoTake::HostGone;
         }
-        match recv.await {
-            Ok(Some(io)) => EntrypointIoTake::Taken(io),
-            Ok(None) => EntrypointIoTake::OnTerminal,
-            Err(_) => EntrypointIoTake::HostGone,
-        }
+        recv.await.unwrap_or(EntrypointIoTake::HostGone)
     }
 
     /// Returns what a destroy of the session's workspace would lose: the

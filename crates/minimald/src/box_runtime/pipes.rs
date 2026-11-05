@@ -48,6 +48,9 @@ pub(crate) enum EntrypointIoTake {
     Taken(EntrypointIo),
     /// The entrypoint runs on a terminal, so it has no streams to take.
     OnTerminal,
+    /// Another run relays the entrypoint's output and still reads it. Only
+    /// one run at a time takes the streams, so this run gets none.
+    Relayed,
     /// The host ended before it answered: the entrypoint ended, and no run
     /// took its output while the host held it, or the box was stopped.
     HostGone,
@@ -147,9 +150,18 @@ impl HostPipes {
         }
     }
 
-    /// Hands a run the entrypoint's streams. A run that takes them later
-    /// replaces the earlier one, whose streams end.
-    pub(super) fn take_io(&mut self) -> EntrypointIo {
+    /// Hands a run the entrypoint's streams. While an earlier run still
+    /// reads either stream, the host keeps that run's relay and refuses
+    /// this one ([`EntrypointIoTake::Relayed`]). A run that went away
+    /// closed its streams, and a later run takes them in its place.
+    pub(super) fn take_io(&mut self) -> EntrypointIoTake {
+        if self
+            .relay
+            .as_ref()
+            .is_some_and(|relay| !relay.stdout.is_closed() || !relay.stderr.is_closed())
+        {
+            return EntrypointIoTake::Relayed;
+        }
         let (stdout_tx, stdout) = mpsc::channel(RELAY_CHUNKS);
         let (stderr_tx, stderr) = mpsc::channel(RELAY_CHUNKS);
         self.relay = Some(PipeRelay {
@@ -157,11 +169,11 @@ impl HostPipes {
             stderr: stderr_tx,
         });
         self.first_relay_deadline = None;
-        EntrypointIo {
+        EntrypointIoTake::Taken(EntrypointIo {
             stdin: self.stdin.take(),
             stdout,
             stderr,
-        }
+        })
     }
 
     /// Sends `bytes` to the run, when one relays. The caller reads only
