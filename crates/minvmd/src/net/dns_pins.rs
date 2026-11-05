@@ -2053,7 +2053,7 @@ pub(crate) mod tests {
             !pins.admits_host_ip_frame(&table, cache.octets(), None, now),
             "a baseline pin never admits a box-marked frame"
         );
-        assert!(registry.retire_host_ip_box(session));
+        assert!(registry.retire_host_ip_box(session, minimald_rpc::HostIpBoxEnd::Destroyed));
         assert!(
             !pins.admits_host_ip_frame(&table, site.octets(), None, now),
             "a retired box's pins go with it"

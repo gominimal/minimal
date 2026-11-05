@@ -1423,7 +1423,8 @@ async fn withdraw_interrupted_box(
     slot: &std::sync::OnceLock<minimald_rpc::BoxId>,
 ) {
     if record.network == boxes::NetworkMode::HostNet {
-        retire_host_ip_box_with_vm_host(control_sock.clone(), record.id).await;
+        retire_host_ip_box_with_vm_host(control_sock.clone(), record.id, HostIpBoxEnd::Destroyed)
+            .await;
     }
     withdraw_box_row(
         control_sock,
