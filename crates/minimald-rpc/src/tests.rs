@@ -2224,21 +2224,19 @@ fn read_log_request_round_trips() {
 }
 
 #[test]
-fn a_host_ip_retire_predating_its_end_decodes_as_a_destroy() {
-    let session = boxes::SessionId::mint();
-    let old = format!(
-        r#"{{"session_id":{}}}"#,
-        serde_json_lenient::to_string(&session).unwrap()
+fn retire_without_an_end_is_refused_at_decode() {
+    let session = serde_json_lenient::to_string(&boxes::SessionId::mint()).unwrap();
+    let without_end = format!(r#"{{"verb":"retire_host_ip_box","session_id":{session}}}"#);
+    assert!(
+        serde_json_lenient::from_str::<BoxControlRequest>(&without_end).is_err(),
+        "a retire without `end` must not decode"
     );
-    let decoded: RetireHostIpBoxRequest =
-        serde_json_lenient::from_str(&old).expect("a retire without `end` decodes");
-    assert_eq!(decoded.end, HostIpBoxEnd::Destroyed);
-    assert_eq!(
-        round_trip(&RetireHostIpBoxRequest {
-            session_id: session,
-            end: HostIpBoxEnd::Stopped
-        })
-        .end,
-        HostIpBoxEnd::Stopped
-    );
+    let stopped =
+        format!(r#"{{"verb":"retire_host_ip_box","session_id":{session},"end":"stopped"}}"#);
+    match serde_json_lenient::from_str::<BoxControlRequest>(&stopped).unwrap() {
+        BoxControlRequest::RetireHostIpBox(request) => {
+            assert_eq!(request.end, HostIpBoxEnd::Stopped);
+        }
+        other => panic!("decoded as {other:?}"),
+    }
 }
