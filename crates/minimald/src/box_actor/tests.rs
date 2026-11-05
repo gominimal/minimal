@@ -16656,7 +16656,7 @@ async fn a_task_run_of_an_entrypoint_that_ends_at_once_returns_its_output() {
 }
 
 // T43: a second task run on a task box whose entrypoint a first run
-// relays is refused with exit 1 and a refusal on stderr. It takes none of
+// relays is refused with exit 2 and a refusal on stderr. It takes none of
 // the entrypoint's output, so the first run keeps all of it and the exit
 // code.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -16709,7 +16709,7 @@ async fn a_second_task_run_is_refused_while_the_first_relays_the_entrypoint() {
     .expect("the daemon takes the second run");
     assert_eq!(
         second.exit_status,
-        Some(1),
+        Some(2),
         "{second:?}: {}",
         log.contents()
     );
