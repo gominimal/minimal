@@ -1651,6 +1651,14 @@ fn native_ruleset_digest() -> String {
     // box's packets, so the VM host's gate can tell a box's frame from the
     // daemon's own at the one address both leave from.
     let cohort_dscp = boxes::core::egress::BOX_COHORT_DSCP.to_string();
+    // BEP-083: the proxy's listener the guest's `main` renders with
+    // (`DEFAULT_SUBNET.box_egress_proxy_address()` at `PROXY_LISTENER_PORT`),
+    // whose address the table refuses to a box outside the lane set.
+    let proxy_lane = format!(
+        "{}:{}",
+        switch::DEFAULT_SUBNET.box_egress_proxy_address(),
+        boxes::core::egress::PROXY_LISTENER_PORT
+    );
     let out = Command::new("bash")
         .arg(&script)
         .args([
@@ -1669,6 +1677,8 @@ fn native_ruleset_digest() -> String {
             GUEST_CT_MARK_MASK_ARG,
             "--cohort-dscp",
             &cohort_dscp,
+            "--proxy-lane",
+            &proxy_lane,
         ])
         .env("MINIMAL_OVERRIDE_CGROUP_MOUNTINFO", &mountinfo)
         .output()

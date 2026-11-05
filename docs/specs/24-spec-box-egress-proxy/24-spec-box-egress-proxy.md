@@ -5,7 +5,7 @@ owner: norrietaylor
 epic: gominimal/inbox#625
 arch: https://github.com/gominimal/arch/blob/5c1201517ba07347344fb9725efb06ee39d5c03e/specs/authn-authz/gatehouse-spec.md
 arch_sha: "5c1201517ba07347344fb9725efb06ee39d5c03e"
-updated: 2026-11-02
+updated: 2026-11-05
 ---
 
 # BEP — Local Box Egress Proxy — sealed GitHub credentials and host-store secrets without Gatehouse
@@ -372,6 +372,10 @@ The `host_ip` lane on a VM host
   - WHILE no resident `host_ip` box of a VM host declares a credentialed upstream THE SYSTEM SHALL drop connections from the `host_ip` cohort address to the proxy's address.
     tier:   T0
     verify: cargo nextest run -p minvmd host_ip_cohort_proxy_lane_dropped_without_a_declaring_member
+  - WHILE a resident `host_ip` box of a VM host declares no credentialed upstream THE SYSTEM SHALL refuse, inside the VM, a connection from that box to the proxy's listener and to the proxy's address on TCP port 443.
+    tier:   T0
+    verify: cargo nextest run -p minimald --run-ignored ignored-only only_the_declaring_cohort_member_reaches_the_proxy_address
+    <!-- networking §7.1 and §4.3 rule 2: the host gate sees one cohort mark for every member, so only the in-VM classifier, which reads the sender's cgroup, can tell a member with no lane from one with a lane -->
 
 - **BEP-084** WHEN the proxy accepts a connection from the `host_ip` cohort address THE SYSTEM SHALL mark its delivery cohort-attributed, with no box id in it.
   tier:     T0
