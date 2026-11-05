@@ -12674,10 +12674,17 @@ while True:
 # The hostname proxy comes back by itself once its port frees, end to end
 # (NET-020, NET-021, NET-022). Another program holds the proxy's port before
 # the daemon starts. The box still starts. `min session activate` names the
-# cause once, on its `names:` line, and `min ls` names it on its HOSTNAME
-# PROXY row. Then the holder exits, and with no restart the box opens by its
-# name through the proxy on the same port. A second activate after the
-# recovery names that port on its `names:` line, as `min ls` does.
+# cause once, on its `names:` line, and `min ls` names it once. Then the
+# holder exits, and with no restart the box opens by its name through the
+# proxy on the same port. A second activate after the recovery names that
+# port on its `names:` line, as `min ls` does.
+#
+# The `min ls` row that names the cause: on a native lane it is the
+# HOSTNAME PROXY row, as NET-020 says. On a VM lane `min ls` prints the
+# cause on the BOX NAMES row and prints no HOSTNAME PROXY row while the port
+# is held. That differs from NET-020, and #3046 tracks it. After the
+# recovery the cause is gone from every row, and the HOSTNAME PROXY row
+# names the port on both lanes.
 #
 # Lanes: on a VM lane (E2E_VM) the case pins the VM's proxy port with
 # MINVMD_NODE_PROXY_PORT, so the VM starts with its proxy down and the VM
@@ -12864,16 +12871,20 @@ while True:
   fi
   echo "activate (port held), matched once: $prf_line"
 
+  # The row that names the cause: BOX NAMES on a VM lane (#3046), HOSTNAME
+  # PROXY on a native lane (NET-020).
+  local prf_cause_row="HOSTNAME PROXY:"
+  if [ "$min_daemon" = minvmd ]; then prf_cause_row="BOX NAMES:"; fi
   prf_row=""
   for _ in $(seq 1 30); do
     prf_ls="$(mnl ls 2>"$WORK/prf-ls.err" || true)"
-    prf_row="$(printf '%s\n' "$prf_ls" | grep -F -- 'HOSTNAME PROXY:' \
+    prf_row="$(printf '%s\n' "$prf_ls" | grep -F -- "$prf_cause_row" \
       | grep -F -- 'the hostname proxy is not serving' | grep -F -- "127.0.0.1:$prf_pin" | head -n1 || true)"
     [ -n "$prf_row" ] && break
     sleep 1
   done
   if [ -z "$prf_row" ]; then
-    echo "::error::min ls does not name the held port $prf_pin on its HOSTNAME PROXY row (NET-020)"
+    echo "::error::min ls does not name the held port $prf_pin on its ${prf_cause_row%:} row (NET-020)"
     echo "--- min ls ---"; printf '%s\n' "$prf_ls"
     prf_restore_env; fail
   fi
@@ -12881,10 +12892,16 @@ while True:
     case "$prf_row" in
       *"holds 127.0.0.1:$prf_pin."*) ;;
       *)
-        echo "::error::min ls's HOSTNAME PROXY row does not name who holds 127.0.0.1:$prf_pin (NET-021)"
+        echo "::error::min ls's ${prf_cause_row%:} row does not name who holds 127.0.0.1:$prf_pin (NET-021)"
         printf '%s\n' "$prf_row"
         prf_restore_env; fail ;;
     esac
+    prf_count="$(printf '%s\n' "$prf_ls" | grep -c -F -- 'the hostname proxy is not serving' || true)"
+    if [ "${prf_count:-0}" != 1 ]; then
+      echo "::error::min ls printed the proxy's cause ${prf_count:-0} times, not once (NET-020)"
+      echo "--- min ls ---"; printf '%s\n' "$prf_ls"
+      prf_restore_env; fail
+    fi
   fi
   if printf '%s\n' "$prf_ls" | grep -F -- 'HOSTNAME PROXY:' | grep -qF -- "listening on 127.0.0.1:$prf_pin"; then
     echo "::error::min ls names 127.0.0.1:$prf_pin as listening while another program holds it"
@@ -12947,19 +12964,32 @@ while True:
   fi
   echo "proxy: GET http://$prf_name.min.internal:$prf_box_port/ via 127.0.0.1:$prf_pin -> HTTP $prf_code $(head -c 40 "$WORK/prf-body.out" 2>/dev/null || true), ${prf_served} ms after the port freed"
 
-  prf_ls="$(mnl ls 2>&1 || true)"
-  prf_row="$(printf '%s\n' "$prf_ls" | grep -F -- 'HOSTNAME PROXY:' | head -n1 || true)"
-  case "$prf_row" in
-    *"the hostname proxy is not serving"*)
-      echo "::error::min ls still names the cause after the proxy serves (NET-022)"
-      printf '%s\n' "$prf_ls"
-      prf_restore_env; fail ;;
-    *"listening on 127.0.0.1:$prf_pin"*) ;;
-    *)
-      echo "::error::min ls does not name 127.0.0.1:$prf_pin as listening after the proxy serves (NET-022)"
-      printf '%s\n' "$prf_ls"
-      prf_restore_env; fail ;;
-  esac
+  # After the recovery the cause is gone from every row, the one that held
+  # it included, and the HOSTNAME PROXY row names the port. On a VM lane
+  # the listing reads the VM host daemon's state, so give it a few seconds
+  # to catch up with the proxy that already served.
+  prf_row=""
+  for _ in $(seq 1 10); do
+    prf_ls="$(mnl ls 2>&1 || true)"
+    prf_row="$(printf '%s\n' "$prf_ls" | grep -F -- 'HOSTNAME PROXY:' \
+      | grep -F -- "listening on 127.0.0.1:$prf_pin" | head -n1 || true)"
+    if [ -n "$prf_row" ] \
+      && ! printf '%s\n' "$prf_ls" | grep -qF -- 'the hostname proxy is not serving'; then
+      break
+    fi
+    sleep 1
+  done
+  if printf '%s\n' "$prf_ls" | grep -qF -- 'the hostname proxy is not serving'; then
+    echo "::error::min ls still names the cause on its $(printf '%s\n' "$prf_ls" \
+      | grep -F -- 'the hostname proxy is not serving' | head -n1 | cut -d: -f1) row after the proxy serves (NET-022)"
+    printf '%s\n' "$prf_ls"
+    prf_restore_env; fail
+  fi
+  if [ -z "$prf_row" ]; then
+    echo "::error::min ls does not name 127.0.0.1:$prf_pin as listening on its HOSTNAME PROXY row after the proxy serves (NET-022)"
+    printf '%s\n' "$prf_ls"
+    prf_restore_env; fail
+  fi
   echo "min ls (port free), matched: $prf_row"
   if [ -n "$prf_pid_before" ]; then
     prf_pid_after="$(prf_pids_for "hostname-proxy-port $prf_pin" | head -n1)"
