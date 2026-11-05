@@ -689,16 +689,16 @@ pub struct TaskArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum TaskCommand {
-    /// Run a declared task in an ephemeral session
+    /// Run a declared task in a task box
     ///
-    /// Creates a session for the project (named `task-<task>-<hex>`),
-    /// uploads the project like `min session activate`, runs the task
-    /// inside it with output streamed to the terminal, exits with the
-    /// task's exit code, and destroys the session afterwards. Ctrl-C tears
-    /// the session down and exits 130 without relaying the interrupt to the
-    /// task itself. Tasks run
-    /// non-interactively: pipe stdin to feed input; use `min session
-    /// attach` for interactive work.
+    /// Creates a box for the project (named `<task>-<n>`), uploads the
+    /// project like `min session activate`, runs the task inside it with
+    /// output streamed to the terminal, and exits with the task's exit code.
+    /// When the task ends, the box stays with its exit code: see it with
+    /// `min box show <task>-<n>` and remove it with `min box rm <task>-<n>`.
+    /// Ctrl-C destroys the box and exits 130 without relaying the interrupt
+    /// to the task itself. Tasks run non-interactively: pipe stdin to feed
+    /// input; use `min session attach` for interactive work.
     Run(TaskRunArgs),
 }
 

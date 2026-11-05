@@ -5101,7 +5101,7 @@ async fn net_forward_announces_the_bound_local_port() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn task_run_exits_with_held_open_stdin_pipe() {
-    let (_daemon, args) = setup().await;
+    let (daemon, args) = setup().await;
     let minimal_dir = args
         .minimal_dir
         .as_ref()
@@ -5168,9 +5168,18 @@ async fn task_run_exits_with_held_open_stdin_pipe() {
         stderr.contains("Running task e2e-echo in box e2e-echo-1"),
         "task run must reach its box's entrypoint: stderr={stderr}"
     );
+    // The entrypoint never started, so the client removes the box and
+    // keeps nothing.
     assert!(
-        stderr.contains("Kept box e2e-echo-1."),
-        "task run must return once the daemon ends the run: stderr={stderr}"
+        !stderr.contains("Kept box"),
+        "a box whose entrypoint never started must not be kept: stderr={stderr}"
+    );
+    let mut client = daemon.server.connect().await;
+    let resp = client.call::<minimald_rpc::ListSessions>(&()).await;
+    assert!(
+        resp.sessions.is_empty(),
+        "a box whose entrypoint never started must be removed: {} left",
+        resp.sessions.len()
     );
 }
 

@@ -705,9 +705,9 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // The task box runs its task as its entrypoint and keeps its record
     // when the task returns (BOX-038). Every created box stores its spec
     // (BOX-068). An interactive task, which has no spec, takes the exec
-    // channel. The box is marked at create, so a daemon restart before its task starts
-    // destroys it rather than resuming it (NET-131). The daemon clears the
-    // mark when the task box's entrypoint starts.
+    // channel. The box is marked at create, so a daemon restart before its
+    // task starts destroys it rather than resuming it (NET-131). The daemon
+    // clears the mark when the task box's entrypoint starts.
     let spec = task_box_spec(
         &args.task,
         &declared,
@@ -959,8 +959,9 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
                     // keeps it, so a box still running after a reported
                     // code never started its entrypoint: the daemon refused
                     // the start. That box is removed too, and nothing is
-                    // kept.
-                    if let Ok(Some(_)) = outcome {
+                    // kept. An entrypoint that ended by a signal reports no
+                    // code, and its box is kept the same way.
+                    if outcome.is_ok() {
                         if entrypoint_started(&mut client, id).await {
                             eprintln!("{}", crate::kept_box_line(&session_name));
                         } else {
