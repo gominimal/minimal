@@ -250,16 +250,21 @@ impl<C: Channel> Sandbox<C> {
         fs::create_dir_all(&rootfs)
             .map_err(|e| Error::IO("create rootfs dir", rootfs.clone(), e))?;
         let hardlinking_start = SystemTime::now();
+        let mut collisions = common::LinkCollisions::default();
         for i in config.rootfs.iter() {
             match i {
-                config::SandboxMapped::Dir(p) => hardlink_dir_contents(p, &rootfs)?,
-                config::SandboxMapped::TempDir(td) => hardlink_dir_contents(td.path(), &rootfs)?,
+                config::SandboxMapped::Dir(p) => {
+                    hardlink_dir_contents_counted(p, &rootfs, &mut collisions)?;
+                }
+                config::SandboxMapped::TempDir(td) => {
+                    hardlink_dir_contents_counted(td.path(), &rootfs, &mut collisions)?;
+                }
                 config::SandboxMapped::File(p) | config::SandboxMapped::FileCopy(p) => {
                     return Err(Error::MappedFile(p.clone()));
                 }
             }
         }
-        hardlink_dir_contents(&base_dir.join("synth"), &rootfs)?;
+        hardlink_dir_contents_counted(&base_dir.join("synth"), &rootfs, &mut collisions)?;
 
         // MINIMAL_INTERNAL_CS_BUILD bundle: when the env var is "1"
         // AND the convention path exists on host, hardlink that
@@ -281,9 +286,10 @@ impl<C: Channel> Sandbox<C> {
         if std::env::var("MINIMAL_INTERNAL_CS_BUILD").as_deref() == Ok("1") {
             let cs_mirror = Path::new("/root/.cache/minimal/cs-mirror");
             if cs_mirror.exists() {
-                hardlink_dir_contents(cs_mirror, &rootfs)?;
+                hardlink_dir_contents_counted(cs_mirror, &rootfs, &mut collisions)?;
             }
         }
+        log_rootfs_collisions(&collisions);
         tracing::trace!("rootfs hardlinking took {:?}", hardlinking_start.elapsed());
 
         // On aarch64, autotools/libtool defaults to installing libraries
@@ -312,11 +318,7 @@ impl<C: Channel> Sandbox<C> {
                                 Ok(()) => Ok(()),
                                 Err(e) => {
                                     if e.kind() == std::io::ErrorKind::AlreadyExists {
-                                        tracing::warn!(
-                                            "Not linking {} => {}, already exists",
-                                            p.display(),
-                                            dest.display()
-                                        );
+                                        log_input_collision("linking", p, dest);
                                         Ok(())
                                     } else {
                                         Err(e)
@@ -330,11 +332,7 @@ impl<C: Channel> Sandbox<C> {
                             if !copy_input_file(p, &dest)
                                 .map_err(|e| Error::IO("copying input file", dest.clone(), e))?
                             {
-                                tracing::warn!(
-                                    "Not copying {} => {}, already exists",
-                                    p.display(),
-                                    dest.display()
-                                );
+                                log_input_collision("copying", p, &dest);
                             }
                         }
                         config::SandboxMapped::Dir(p) => hardlink_dir_contents(p, &b)?,
@@ -2779,6 +2777,56 @@ fn copy_input_file(src: &Path, dest: &Path) -> std::io::Result<bool> {
 
 fn hardlink_dir_contents(src_dir: &Path, dst_parent_dir: &Path) -> Result<(), Error> {
     common::hardlink_dir_contents(src_dir, dst_parent_dir).map_err(Error::HardlinkFailed)
+}
+
+fn hardlink_dir_contents_counted(
+    src_dir: &Path,
+    dst_parent_dir: &Path,
+    counts: &mut common::LinkCollisions,
+) -> Result<(), Error> {
+    common::hardlink_dir_contents_counted(src_dir, dst_parent_dir, counts)
+        .map_err(Error::HardlinkFailed)
+}
+
+/// One line for the paths that more than one rootfs layer shipped. It is
+/// INFO only when some of them differ (each of those also has its own
+/// WARN); an overlap where every path matches is the usual case, at debug.
+fn log_rootfs_collisions(c: &common::LinkCollisions) {
+    if c.differ > 0 {
+        tracing::info!(
+            same = c.same,
+            unchecked = c.unchecked,
+            differ = c.differ,
+            "rootfs: paths shipped by more than one layer; the first-linked file stays"
+        );
+    } else if c.total() > 0 {
+        tracing::debug!(
+            same = c.same,
+            unchecked = c.unchecked,
+            differ = c.differ,
+            "rootfs: paths shipped by more than one layer; the first-linked file stays"
+        );
+    }
+}
+
+/// Logs a working input that was not placed at `dest` because something is
+/// already there, by the rootfs rule: debug when the two match or are too
+/// large to compare, a WARN when they differ. `verb` is "linking" or
+/// "copying".
+fn log_input_collision(verb: &str, src: &Path, dest: &Path) {
+    match common::link_collision(src, dest) {
+        common::LinkCollision::Differs(why) => tracing::warn!(
+            "Not {verb} {} => {}, already exists ({why}; the first one stays)",
+            src.display(),
+            dest.display()
+        ),
+        same_or_unchecked => tracing::debug!(
+            "Not {verb} {} => {}, already exists ({})",
+            src.display(),
+            dest.display(),
+            same_or_unchecked.note()
+        ),
+    }
 }
 
 /// Returns the kernel-locked mount flags for the mount containing `path`.
