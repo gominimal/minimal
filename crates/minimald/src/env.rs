@@ -4718,9 +4718,11 @@ exit $rc
             None,
             BTreeSet::from(["IGNORED_TOKEN".to_string(), "IGNORED_FIXED".to_string()]),
         );
-        // The launch: the dropped name is not among its variables.
-        let launch_vars = entrypoint_env::take(&id).expect("the run staged");
+        // The launch: the dropped name is not among its variables, and the
+        // launch records the names for the in-box run.
+        let (launch_vars, dropped) = entrypoint_env::take(&id).expect("the run staged");
         assert_eq!(launch_vars, vec![("KEPT".to_string(), "k".to_string())]);
+        entrypoint_env::record(id, dropped);
 
         // The in-box run, as the helper sends it with the caller's value.
         let request = TaskRunRequest::parse(&format!(

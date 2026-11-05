@@ -1956,6 +1956,78 @@ async fn ensure_host_launches_an_unattached_host_and_then_reuses_it() {
     );
 }
 
+/// T43: only a launch records a task run's dropped names. A second run
+/// that joins the host the first launched relays the in-box run that
+/// launch started, so its own `[vars] ignore` names leave the recorded
+/// ones as they were. It still takes what it staged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_joining_task_run_keeps_the_launch_recorded_drops() {
+    use crate::box_actor::entrypoint_env;
+    use std::collections::BTreeSet;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_configured_session(&mut client, "drops-join", "/tmp").await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+
+    let launched = BTreeSet::from(["LAUNCH_TOKEN".to_string()]);
+    entrypoint_env::stage(session_id, Vec::new(), None, launched.clone());
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active session should be able to launch a host");
+    assert_eq!(entrypoint_env::drops(&session_id), launched);
+
+    entrypoint_env::stage(
+        session_id,
+        Vec::new(),
+        None,
+        BTreeSet::from(["JOIN_TOKEN".to_string()]),
+    );
+    let again = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("a second request should be served by the running host");
+    assert!(again.same_host(&host), "the second run launched a host");
+    assert_eq!(
+        entrypoint_env::drops(&session_id),
+        launched,
+        "a joining run replaced the names the launch recorded"
+    );
+    assert!(
+        entrypoint_env::take(&session_id).is_none(),
+        "the joining run left its staged values for a later launch"
+    );
+}
+
+/// T43: destroying a box removes the dropped names a launch recorded for
+/// it, so the daemon keeps no entry per task box once the box is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn destroying_a_box_forgets_its_recorded_drops() {
+    use crate::box_actor::entrypoint_env;
+    use std::collections::BTreeSet;
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_session(&mut client).await;
+    let dropped = BTreeSet::from(["IGNORED_TOKEN".to_string()]);
+    entrypoint_env::record(session_id, dropped.clone());
+    assert_eq!(entrypoint_env::drops(&session_id), dropped);
+
+    destroy_session(&mut client, session_id).await;
+
+    assert!(
+        entrypoint_env::drops(&session_id).is_empty(),
+        "the destroyed box's recorded names outlived it"
+    );
+    assert!(!record_exists(&mut client, session_id).await);
+}
+
 // T42, T43: the actor reads the spec stored at creation, hands it to every
 // launcher it builds, and keeps its own hold, so a relaunch starts the box
 // from the same spec without reading the store again. A launch for hooks

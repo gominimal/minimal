@@ -1067,6 +1067,9 @@ impl BoxActor {
         self.destroying.cancel();
         drop(hook_slot);
         self.stop_running(false).await;
+        // The box's entrypoint has ended for good, so no in-box run reads
+        // its recorded names again.
+        entrypoint_env::forget(self.record.id());
         // Withdraw the hostname before the fallible record delete, so
         // a delete failure leaves a stale on-disk record (repairable
         // on restart) but never a stale routing entry pointing at a

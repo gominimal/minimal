@@ -347,11 +347,13 @@ pub(super) fn watch_quic443_exit(
 ///
 /// The run also stages the names the client's `[vars] ignore` matched
 /// (`TaskExec::drop_env`). The in-box `min task run` reads the task's
-/// declarations again from the uploaded `minimal.toml`, so the launch
-/// records the names for the box ([`drops`]), and the daemon's in-box run
-/// removes each of them from the task's variables before it fills any
-/// `inherit` one. A dropped name then never reaches the task, as on the
-/// old path.
+/// declarations again from the uploaded `minimal.toml`, so a launch of the
+/// entrypoint records the names for the box ([`record`], [`drops`]), and
+/// the daemon's in-box run removes each of them from the task's variables
+/// before it fills any `inherit` one. A dropped name then never reaches the
+/// task, as on the old path. A run that joins an entrypoint already running
+/// records nothing: the in-box run it relays is the one that launch
+/// started, with that launch's names.
 ///
 /// Interim: a seam beside the actor, because the actor's `EnsureHost`
 /// message carries no environment. The values move into that message
@@ -375,7 +377,9 @@ pub(crate) mod entrypoint_env {
         LazyLock::new(Mutex::default);
 
     /// The names to drop for each box whose entrypoint a launch started
-    /// with any. Kept for the box's run, and replaced by its next launch.
+    /// with any. Replaced by the box's next entrypoint launch. A stopped box
+    /// keeps its record, and its names with it. They are removed when the
+    /// box is destroyed ([`forget`]).
     static DROPS: LazyLock<Mutex<HashMap<boxes::SessionId, Drops>>> = LazyLock::new(Mutex::default);
 
     /// Stages `vars`, `start_dir` and `drops` for the next entrypoint
@@ -390,13 +394,13 @@ pub(crate) mod entrypoint_env {
             .insert(id, (vars, start_dir, drops));
     }
 
-    /// Takes what is staged for box `id`, as the launch's connection
-    /// variables. A staged directory rides among them under
-    /// [`crate::box_runtime::START_DIR_KEY`], which the launch takes out
-    /// and starts the entrypoint in. A dropped name is left out of them,
-    /// and recorded for the box's in-box run ([`drops`]). `None` when no
-    /// run staged anything.
-    pub(crate) fn take(id: &boxes::SessionId) -> Option<Vars> {
+    /// Takes what is staged for box `id`: the launch's connection
+    /// variables, and the names to drop. A staged directory rides among the
+    /// variables under [`crate::box_runtime::START_DIR_KEY`], which the
+    /// launch takes out and starts the entrypoint in. A dropped name is left
+    /// out of them. Only a launch records the names for the box's in-box run
+    /// ([`record`]). `None` when no run staged anything.
+    pub(crate) fn take(id: &boxes::SessionId) -> Option<(Vars, Drops)> {
         let (mut vars, start_dir, dropped) = STAGED
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -407,15 +411,35 @@ pub(crate) mod entrypoint_env {
         if let Some(dir) = start_dir {
             vars.push((crate::box_runtime::START_DIR_KEY.to_string(), dir));
         }
+        Some((vars, dropped))
+    }
+
+    /// Records `dropped` as the names box `id`'s in-box run drops, in place
+    /// of any a launch recorded before. Called by a launch of the box's
+    /// entrypoint only.
+    pub(crate) fn record(id: boxes::SessionId, dropped: Drops) {
         let mut recorded = DROPS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if dropped.is_empty() {
-            recorded.remove(id);
+            recorded.remove(&id);
         } else {
-            recorded.insert(*id, dropped);
+            recorded.insert(id, dropped);
         }
-        Some(vars)
+    }
+
+    /// Removes all that is staged or recorded for box `id`. Called when the
+    /// box is destroyed, so neither map keeps an entry for a box that is
+    /// gone.
+    pub(crate) fn forget(id: &boxes::SessionId) {
+        STAGED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
+        DROPS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
     }
 
     /// The names the launch of box `id`'s entrypoint recorded to drop from
@@ -1438,9 +1462,9 @@ impl BoxActor {
         conn_username: String,
     ) -> Result<box_runtime::HostHandle, AttachError> {
         // Taken first, so a staged value never waits for a later launch.
-        let staged_env = entrypoint_env::take(self.record.id());
-        let entrypoint_run = staged_env.is_some();
-        let staged_env = staged_env.unwrap_or_default();
+        let staged = entrypoint_env::take(self.record.id());
+        let entrypoint_run = staged.is_some();
+        let (staged_env, staged_drops) = staged.unwrap_or_default();
         let holds_host_row = {
             let record = self
                 .record
@@ -1564,6 +1588,13 @@ impl BoxActor {
                 ),
                 2,
             ));
+        }
+        // Only a launch records the run's dropped names: a run that joined
+        // the running host above relays the in-box run an earlier launch
+        // started, with that launch's names. Recorded before the launch, so
+        // the in-box run the entrypoint starts finds them.
+        if entrypoint_run {
+            entrypoint_env::record(*self.record.id(), staged_drops);
         }
         let (_, launched) = self
             .launch_host(
