@@ -382,6 +382,9 @@ fn every_daemon_connection_is_classified() {
             // Not a product path: the host stop test's own connection to the
             // harness daemon, to list the boxes it expects stopped.
             "tests.rs::host_stop_force_forces_boxes_and_daemon = ungated",
+            // Not a product path: the end-to-end test's own connection to
+            // the harness daemon, to read the version it expects.
+            "tests.rs::hosts_and_providers_end_to_end = ungated",
             "tests.rs::local_member_is_a_sign_in_reference_expiring_with_the_root = ungated",
             // Not a product path, and not the daemon: the audit test submits
             // a revocation to a test Box Egress Proxy's control socket.
