@@ -31027,6 +31027,10 @@ case "${1:-}" in
     # Beside the escape-union proof, for the same reason: it stops the daemon
     # pair and autospawns a fresh one under its own record filter.
     proof_escapes_and_builds_stay_inside_box_rules
+    # Stops the VM host: its boxes, then the daemon and its VM. The next
+    # command autospawns a fresh VM host daemon, so the proofs after it
+    # find a running daemon.
+    proof_host_stop_stops_boxes_then_daemon_and_vm
     # Second-to-last on purpose, for the same reasons the daemon-fetch proof
     # below is last: it installs its own host classifier tree and table (its
     # own, removed before it returns) and respawns the daemon pair under its
