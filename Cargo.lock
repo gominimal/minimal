@@ -4216,7 +4216,6 @@ dependencies = [
  "async-compression",
  "async-tar",
  "boxes",
- "camino",
  "constcat",
  "indicatif",
  "libc",
