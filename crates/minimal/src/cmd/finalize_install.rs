@@ -1459,9 +1459,9 @@ pub(crate) mod linux {
     fn unplaced_daemon_pid(root: &std::path::Path, socket: &std::path::Path) -> Option<u32> {
         use std::os::unix::fs::MetadataExt as _;
         let lock = socket.parent()?.join(paths::MINIMALD_LOCK_FILE);
-        let inode = std::fs::metadata(lock).ok()?.ino();
+        let meta = std::fs::metadata(lock).ok()?;
         let locks = std::fs::read_to_string("/proc/locks").ok()?;
-        let pid = lock_holder(&locks, inode)?;
+        let pid = lock_holder(&locks, meta.dev(), meta.ino())?;
         let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
         if comm.trim() != "minimald" {
             return None;
@@ -1473,21 +1473,30 @@ pub(crate) mod linux {
         (!placed).then_some(pid)
     }
 
-    /// The pid holding an exclusive `flock` on the file with inode `inode`,
-    /// read from a `/proc/locks` listing: `<n>: FLOCK ADVISORY WRITE <pid>
-    /// <major>:<minor>:<inode> <start> <end>`. Blocked waiters (`->` lines)
-    /// are not holders.
-    pub(crate) fn lock_holder(locks: &str, inode: u64) -> Option<u32> {
+    /// The pid holding an exclusive `flock` on the file at device `dev`
+    /// (`st_dev`) and inode `inode`, read from a `/proc/locks` listing:
+    /// `<n>: FLOCK ADVISORY WRITE <pid> <major>:<minor>:<inode> <start>
+    /// <end>`, the major and minor in hex. Blocked waiters (`->` lines) are
+    /// not holders.
+    pub(crate) fn lock_holder(locks: &str, dev: u64, inode: u64) -> Option<u32> {
+        // glibc's `major`/`minor` decoding of `st_dev`.
+        let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+        let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
         locks.lines().find_map(|line| {
             let fields: Vec<&str> = line.split_whitespace().collect();
-            match fields.as_slice() {
-                [_, "FLOCK", _, "WRITE", pid, id, ..]
-                    if id.rsplit(':').next()?.parse::<u64>().ok()? == inode =>
-                {
-                    pid.parse().ok()
-                }
-                _ => None,
-            }
+            let [_, "FLOCK", _, "WRITE", pid, id, ..] = fields.as_slice() else {
+                return None;
+            };
+            let mut parts = id.split(':');
+            let (Some(maj), Some(min), Some(ino), None) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                return None;
+            };
+            let same = u64::from_str_radix(maj, 16).ok()? == major
+                && u64::from_str_radix(min, 16).ok()? == minor
+                && ino.parse::<u64>().ok()? == inode;
+            if same { pid.parse().ok() } else { None }
         })
     }
 
@@ -3342,12 +3351,15 @@ mod tests {
         );
         // The pid is the lock's holder as the kernel lists it, never a
         // waiter and never another file's holder.
-        let locks = "1: FLOCK  ADVISORY  WRITE 4242 00:2a:777 0 EOF\n\
-                     1: -> FLOCK  ADVISORY  WRITE 5151 00:2a:777 0 EOF\n\
-                     2: POSIX  ADVISORY  WRITE 6161 00:2a:888 0 EOF\n";
-        assert_eq!(linux::lock_holder(locks, 777), Some(4242));
-        assert_eq!(linux::lock_holder(locks, 888), None);
-        assert_eq!(linux::lock_holder(locks, 999), None);
+        // st_dev 0x2a is major 0, minor 0x2a; 0x10305 is major 0x103, minor 5.
+        let locks = "1: FLOCK  ADVISORY  WRITE 7373 103:05:777 0 EOF\n\
+                     2: FLOCK  ADVISORY  WRITE 4242 00:2a:777 0 EOF\n\
+                     2: -> FLOCK  ADVISORY  WRITE 5151 00:2a:777 0 EOF\n\
+                     3: POSIX  ADVISORY  WRITE 6161 00:2a:888 0 EOF\n";
+        assert_eq!(linux::lock_holder(locks, 0x2a, 777), Some(4242));
+        assert_eq!(linux::lock_holder(locks, 0x1_0305, 777), Some(7373));
+        assert_eq!(linux::lock_holder(locks, 0x2a, 888), None);
+        assert_eq!(linux::lock_holder(locks, 0x2b, 777), None);
         // A step that is not installed is the install's item, whatever the
         // daemon's placement: the install places the daemon too.
         let bare = classifier_item_over(
