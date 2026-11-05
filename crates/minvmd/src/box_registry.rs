@@ -3084,7 +3084,8 @@ const PROXY_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 enum BoxEnd {
     /// The destroy of an own-address box.
     Destroy,
-    /// The retire of a host_ip box: it ended, stopped or was destroyed.
+    /// The retire of a destroyed host_ip box. Only a destroy revokes: the
+    /// retire of a stopped box sends no revocation (BEP-043).
     HostIpRetire,
 }
 
@@ -3094,15 +3095,34 @@ impl BoxEnd {
     fn completed(self) -> &'static str {
         match self {
             Self::Destroy => "the destroy completed",
-            Self::HostIpRetire => "the box ended",
+            Self::HostIpRetire => "the box was destroyed",
         }
     }
+}
+
+/// Every id [`spawn_revocation`] was called for, in order. A test reads it
+/// to know, with no wait, that a retire decided not to revoke.
+#[cfg(test)]
+static REVOCATIONS_SPAWNED: Mutex<Vec<BoxId>> = Mutex::new(Vec::new());
+
+/// Whether [`spawn_revocation`] was called for `box_id`.
+#[cfg(test)]
+fn revocation_spawned(box_id: BoxId) -> bool {
+    REVOCATIONS_SPAWNED
+        .lock()
+        .expect("the spawned revocations' lock is never held across a panic")
+        .contains(&box_id)
 }
 
 /// Sends the revocation of `box_id` to the proxy at `path` on a thread of its
 /// own, so the end of the box does not wait for it. A failure is one warning
 /// that names the step that failed.
 fn spawn_revocation(path: std::path::PathBuf, box_id: BoxId, end: BoxEnd) {
+    #[cfg(test)]
+    REVOCATIONS_SPAWNED
+        .lock()
+        .expect("the spawned revocations' lock is never held across a panic")
+        .push(box_id);
     let spawned = std::thread::Builder::new()
         .name("bep-revocation".into())
         .spawn(move || {
@@ -6386,12 +6406,18 @@ impl BoxRegistry {
     }
 
     /// Drops the egress [`Self::admit_host_ip_box`] holds for a session:
-    /// its box stopped or was destroyed, so its rules admit nothing from
-    /// now on. A session the set does not hold is the goal state already
-    /// holding. A box that declared a credentialed upstream under an id
-    /// this registry minted has its id revoked at the Box Egress Proxy
-    /// (BEP-043). Returns whether a box's rules were dropped.
-    pub fn retire_host_ip_box(&self, session_id: boxes::SessionId) -> bool {
+    /// its box stopped or was destroyed, as `end` says, so its rules admit
+    /// nothing from now on. A session the set does not hold is the goal
+    /// state already holding. Only a destroy revokes: a destroyed box that
+    /// declared a credentialed upstream under an id this registry minted
+    /// has its id revoked at the Box Egress Proxy (BEP-043). A stopped box
+    /// keeps its id, because a restart brings it back. Returns whether a
+    /// box's rules were dropped.
+    pub fn retire_host_ip_box(
+        &self,
+        session_id: boxes::SessionId,
+        end: minimald_rpc::HostIpBoxEnd,
+    ) -> bool {
         let mut resident = self
             .host_ip_boxes
             .write()
@@ -6421,11 +6447,26 @@ impl BoxRegistry {
         ids.by_name.retain(|_, named| named.id != id);
         let name_withdrawn = ids.by_name.len() != named_before;
         let minted = ids.ids.contains(&id);
+        // A stop drops the rules, so a later destroy of the stopped box
+        // finds none. The id set keeps whether the box was credentialed,
+        // for that destroy to revoke.
+        let credentialed = match end {
+            minimald_rpc::HostIpBoxEnd::Stopped => {
+                if credentialed && minted {
+                    ids.stopped_credentialed.insert(id);
+                }
+                false
+            }
+            minimald_rpc::HostIpBoxEnd::Destroyed => {
+                ids.stopped_credentialed.remove(&id) || credentialed
+            }
+        };
         drop(ids);
-        // BEP-043: the end of a host_ip box with a credentialed lane records
-        // a revocation of its minted id with the proxy, as the destroy of an
-        // own-address box does. The id stays in the id set, so no later
-        // mint takes it (BEP-082). The retire never waits for the proxy.
+        // BEP-043: the destroy of a host_ip box with a credentialed lane
+        // records a revocation of its minted id with the proxy, as the
+        // destroy of an own-address box does. A stop revokes nothing. The
+        // id stays in the id set, so no later mint takes it (BEP-082). The
+        // retire never waits for the proxy.
         if credentialed
             && minted
             && let Some(path) = self.proxy_control.as_deref()
@@ -7478,6 +7519,10 @@ impl HostIpBoxRules {
 struct HostIpIds {
     ids: BTreeSet<BoxId>,
     by_name: BTreeMap<String, HostIpName>,
+    /// The minted ids of stopped boxes that declared a credentialed
+    /// upstream. Their destroy revokes them, though the stop dropped the
+    /// rules that said so (BEP-043).
+    stopped_credentialed: BTreeSet<BoxId>,
 }
 
 /// The id a live `host_ip` registration name answers, and when the name
@@ -8074,6 +8119,7 @@ impl switch::bep_host::BepBoxSource for RegisteredBoxes {
 
 #[cfg(test)]
 mod tests {
+    use minimald_rpc::HostIpBoxEnd;
     use std::time::Duration;
 
     use boxes::IpProto;
@@ -12925,11 +12971,11 @@ mod tests {
 
         // A second resident box keeps the binds when the first one ends.
         assert!(registry.admit_host_ip_box(mirror_session(2), None));
-        assert!(registry.retire_host_ip_box(mirror_session(1)));
+        assert!(registry.retire_host_ip_box(mirror_session(1), HostIpBoxEnd::Destroyed));
         assert_eq!(binder.open().len(), 2);
         // The last box's end undoes every bind, and a later notice binds
         // nothing while no host-address box is published.
-        assert!(registry.retire_host_ip_box(mirror_session(2)));
+        assert!(registry.retire_host_ip_box(mirror_session(2), HostIpBoxEnd::Destroyed));
         assert!(
             binder.open().is_empty(),
             "the last box's end undoes every bind"
@@ -13022,7 +13068,7 @@ mod tests {
         // A probe pass and the next box's publication bind the held ports
         // again, and never the node's own.
         registry.node_mirror().set_range_probe(true);
-        assert!(registry.retire_host_ip_box(mirror_session(1)));
+        assert!(registry.retire_host_ip_box(mirror_session(1), HostIpBoxEnd::Destroyed));
         assert!(binder.open().is_empty());
         assert!(registry.admit_host_ip_box(mirror_session(2), None));
         assert_eq!(binder.open(), vec![(node, web)]);
@@ -13090,7 +13136,7 @@ mod tests {
             registry.mirror_notice(listening(18_080)),
             MirrorOutcome::Bound
         );
-        assert!(registry.retire_host_ip_box(mirror_session(1)));
+        assert!(registry.retire_host_ip_box(mirror_session(1), HostIpBoxEnd::Destroyed));
         assert!(registry.node_mirror().bound_ports().is_empty());
         assert_eq!(
             *binder.seen.lock().expect("the seen lock"),
@@ -13364,7 +13410,7 @@ mod tests {
         assert!(binder.calls().is_empty());
     }
 
-    // BEP-043: the end of a host_ip box that declared a credentialed
+    // BEP-043: the destroy of a host_ip box that declared a credentialed
     // upstream revokes the id its registration minted, as the destroy of an
     // own-address box does: a `revoke_box` line and then a `forget_box`
     // line. The id stays in the id set, so no later mint takes it.
@@ -13381,7 +13427,7 @@ mod tests {
         let session = boxes::SessionId::from_bytes(id);
         assert!(wired.admit_host_ip_box_with_lane(session, None, true));
 
-        assert!(wired.retire_host_ip_box(session));
+        assert!(wired.retire_host_ip_box(session, HostIpBoxEnd::Destroyed));
         let hex = "5a".repeat(16);
         assert_eq!(
             server.join().unwrap(),
@@ -13397,13 +13443,49 @@ mod tests {
         assert_eq!(wired.host_ip_id_for("agent"), None);
     }
 
-    // BEP-043: the revocation thread's warnings for a retired host_ip box
-    // say the box ended, not that a destroy completed. The destroy keeps
-    // the text that scripts/session-e2e.sh matches.
+    // BEP-043: a stop is not a destroy. A restart brings the stopped box
+    // back under the same id, so the retire of a stopped grant box sends
+    // the proxy nothing and its id stays in the id set. The destroy that
+    // follows the stop finds no rules, and still revokes the id.
     #[test]
-    fn retiring_a_host_ip_grant_box_revokes_its_minted_id_with_neutral_warnings() {
-        assert_eq!(super::BoxEnd::HostIpRetire.completed(), "the box ended");
-        assert_eq!(super::BoxEnd::Destroy.completed(), "the destroy completed");
+    fn retiring_a_stopped_host_ip_grant_box_sends_no_revocation() {
+        let registry = BoxRegistry::new(SUBNET);
+        let id = registry
+            .register_host_ip_box_as("paused", [0x4e; 16])
+            .expect("no record holds the id");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let wired = registry.clone().with_proxy_control(Some(path.clone()));
+        let session = boxes::SessionId::from_bytes(id);
+        assert!(wired.admit_host_ip_box_with_lane(session, None, true));
+
+        assert!(wired.retire_host_ip_box(session, HostIpBoxEnd::Stopped));
+        assert!(
+            !revocation_spawned(id),
+            "the stop of a grant box revokes nothing"
+        );
+        assert_eq!(
+            listener.accept().map(|_| ()).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the stop of a grant box sends nothing to the proxy"
+        );
+        assert!(wired.holds_host_ip_id(id), "the stopped box keeps its id");
+
+        drop(listener);
+        std::fs::remove_file(&path).unwrap();
+        let server = stub_control(&path, &["{\"ok\":true}\n", "{\"ok\":true}\n"]);
+        assert!(!wired.retire_host_ip_box(session, HostIpBoxEnd::Destroyed));
+        let hex = "4e".repeat(16);
+        assert_eq!(
+            server.join().unwrap(),
+            [
+                serde_json::json!({"op": "revoke_box", "box_id": hex}),
+                serde_json::json!({"op": "forget_box", "box_id": hex}),
+            ],
+            "the destroy of the stopped box revokes its id"
+        );
     }
 
     // BEP-043: a host_ip box with no credentialed upstream holds no grant,
@@ -13423,13 +13505,15 @@ mod tests {
 
         let plain = boxes::SessionId::from_bytes(id);
         assert!(wired.admit_host_ip_box_with_lane(plain, None, false));
-        assert!(wired.retire_host_ip_box(plain));
+        assert!(wired.retire_host_ip_box(plain, HostIpBoxEnd::Destroyed));
         let unminted = boxes::SessionId::from_bytes([0x7c; 16]);
         assert!(wired.admit_host_ip_box_with_lane(unminted, None, true));
-        assert!(wired.retire_host_ip_box(unminted));
+        assert!(wired.retire_host_ip_box(unminted, HostIpBoxEnd::Destroyed));
 
-        // A revocation thread connects at once. Give one the time to.
-        std::thread::sleep(Duration::from_millis(200));
+        // The retire decides to revoke before it returns, so the record of
+        // spawned revocations answers with no wait.
+        assert!(!revocation_spawned(id));
+        assert!(!revocation_spawned([0x7c; 16]));
         assert_eq!(
             listener.accept().map(|_| ()).unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock,

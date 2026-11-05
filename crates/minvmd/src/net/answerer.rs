@@ -7766,7 +7766,7 @@ mod tests {
         );
         assert_eq!(a_answer(&ask_a(&answerer, "web")), node);
 
-        assert!(registry.retire_host_ip_box(web));
+        assert!(registry.retire_host_ip_box(web, minimald_rpc::HostIpBoxEnd::Destroyed));
         assert_nodata(
             &ask_a(&answerer, "web"),
             "the node's last running host-address box ended, so its name answers NODATA",
@@ -7833,7 +7833,7 @@ mod tests {
         assert_eq!(foreign.held, Vec::new(), "{:?}", foreign.refused);
 
         // One box ends: its name answers NODATA, the other keeps the address.
-        assert!(registry.retire_host_ip_box(web));
+        assert!(registry.retire_host_ip_box(web, minimald_rpc::HostIpBoxEnd::Destroyed));
         assert_nodata(&ask_a(&own, "web"), "the ended box's name answers NODATA");
         assert_eq!(a_answer(&ask_a(&own, "api")), node);
     }

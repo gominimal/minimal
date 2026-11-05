@@ -1169,7 +1169,7 @@ fn serve_request(
             // suppressed-count line its audit window can still owe.
             let box_name = no_switch_box_name(boxes, request.session_id)
                 .unwrap_or_else(|| request.session_id.to_string());
-            boxes.retire_host_ip_box(request.session_id);
+            boxes.retire_host_ip_box(request.session_id, request.end);
             // A host-address box has no switch: its audit window, filed by
             // its box id, ends with it (NET-046).
             flush_guest_audit(
@@ -4379,7 +4379,10 @@ mod tests {
             Some(first.to_bytes()),
             "the refusal leaves the name with the first registration"
         );
-        registry.retire_host_ip_box(boxes::SessionId::from_bytes(first.to_bytes()));
+        registry.retire_host_ip_box(
+            boxes::SessionId::from_bytes(first.to_bytes()),
+            minimald_rpc::HostIpBoxEnd::Destroyed,
+        );
         let second = minted(register(&sock_path, &host_ip(true)).expect("answered"));
         assert_ne!(first, second, "each creation gets its own id");
         assert_eq!(registry.host_ip_id_for("agent"), Some(second.to_bytes()));
@@ -4520,7 +4523,7 @@ mod tests {
         // the name with no registration of its own takes a fresh id, not the
         // ended box's claimed one.
         let session = boxes::SessionId::from_bytes(registered.to_bytes());
-        registry.retire_host_ip_box(session);
+        registry.retire_host_ip_box(session, minimald_rpc::HostIpBoxEnd::Destroyed);
         assert_eq!(registry.host_ip_id_for("agent"), None);
         assert!(
             registry.holds_host_ip_id(registered.to_bytes()),
@@ -8681,6 +8684,7 @@ mod tests {
             &sock_path,
             &BoxControlRequest::RetireHostIpBox(minimald_rpc::RetireHostIpBoxRequest {
                 session_id: unnamed,
+                end: minimald_rpc::HostIpBoxEnd::Destroyed,
             }),
         )
         .expect("the retire is answered");
