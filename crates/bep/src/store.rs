@@ -635,15 +635,27 @@ fn entry_admits(entry: &str, proxy: &str) -> bool {
             && !index.is_empty()
         {
             let path = rest.strip_suffix(" (OK)").unwrap_or(rest);
-            // The dump prints a bundled proxy as its bundle: the `.app`
-            // directory that holds the binary the resolver hands us.
-            listed |= path == proxy
-                || proxy
-                    .strip_prefix(path)
-                    .is_some_and(|tail| tail.starts_with("/Contents/MacOS/"));
+            listed |= path == proxy || is_bundle_of(path, proxy);
         }
     }
     decrypt && listed
+}
+
+/// Whether `path` is the bundle whose main program is `proxy`.
+///
+/// `security -T` records a bundle's main program as the bundle, with the
+/// bundle's requirement. It records any other program in the bundle under
+/// that program's own path, with that program's requirement. So an entry
+/// that names the bundle says nothing about another program inside it, and
+/// only `<name>.app/Contents/MacOS/<name>`, the form `bep.app` ships in,
+/// matches here. A bundle that names its main program differently reads as
+/// not listed, which refuses the item.
+fn is_bundle_of(path: &str, proxy: &str) -> bool {
+    let name = path.rsplit('/').next().and_then(|n| n.strip_suffix(".app"));
+    let program = proxy
+        .strip_prefix(path)
+        .and_then(|tail| tail.strip_prefix("/Contents/MacOS/"));
+    name.is_some() && name == program
 }
 
 /// The keychain operations that [`set_item`] puts in order.
@@ -1404,9 +1416,9 @@ mod tests {
 
     // An installed proxy runs from a bundle, and `security -T` records the
     // bundle: `dump-keychain -a` then prints the bundle's path, with the
-    // designated-requirement line under it, and never the inner binary. A
-    // listing must still admit the bundle's own proxy, and neither a
-    // directory on its path nor another bundle.
+    // requirement line under it, and never the inner binary. A listing must
+    // still admit the bundle's own proxy, and neither a directory on its
+    // path, another bundle, nor another program inside the bundle.
     #[test]
     fn secret_item_acl_admits_a_bundled_proxy() {
         let proxy = Path::new("/Users/me/.local/bin/bep.app/Contents/MacOS/bep");
@@ -1465,6 +1477,15 @@ access: 1 entries
                 },
             ]
         );
+        for other in ["helper", "nested/bep"] {
+            let other = format!("/Users/me/.local/bin/bep.app/Contents/MacOS/{other}");
+            assert!(
+                parse_dump(dump, Path::new(&other))
+                    .iter()
+                    .all(|item| !item.proxy_access),
+                "{other} is not the bundle's main program"
+            );
+        }
     }
 
     /// The BEP-051 leg on a real keychain: set, list, set again and remove
