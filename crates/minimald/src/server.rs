@@ -2529,9 +2529,9 @@ pub(crate) async fn drive_proxy_until_serving(
                 // answer for, not this daemon's to out-wait. The VM host
                 // holds the reservation and owns the retry (a redraw hands
                 // a fresh port, or the start fails naming this one), and
-                // the report is how it hears the failure; a backoff loop
-                // here would leave the VM up with no hostname proxy, which
-                // the host forbids. `publish_on_host` is the in-VM flag, so
+                // the report is how it hears the failure. The VM host
+                // daemon then starts the VM with its proxy down and retries
+                // the port itself. `publish_on_host` is the in-VM flag, so
                 // the report has a listener exactly when it is sent; a
                 // native daemon never reaches this arm at all.
                 if publish_on_host && failure.port_taken && !choice.reselects_when_publish_refused()
@@ -2544,10 +2544,12 @@ pub(crate) async fn drive_proxy_until_serving(
                         %failure.report,
                         "the host holds the hostname proxy's port; reporting the terminal publish failure to the VM host daemon"
                     );
-                    // Recorded first, reported in the background: the drive
-                    // ends here and never waits on the report's vsock dial,
-                    // which can take seconds per try.
-                    proxy.record_unavailable(&state, failure.report).await;
+                    // The VM host daemon records the cause, naming the
+                    // holder it can see, and its held-port watcher owns the
+                    // retry (NET-021). The guest records none, so its note
+                    // never stands in for that cause. Reported in the
+                    // background: the drive ends here and never waits on the
+                    // report's vsock dial, which can take seconds per try.
                     crate::traced::spawn(report_proxy_port_held(host_port));
                     return;
                 }

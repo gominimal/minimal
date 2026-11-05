@@ -9768,3 +9768,122 @@ fn none_box_hold_is_released_by_destroy_and_moved_by_rename() {
         "a box with a row owns its name through the row"
     );
 }
+
+/// NET-022: a held port that frees after the VM start publishes on the VM
+/// host daemon only, so the guest reply carries no proxy port. The BOX NAMES
+/// row then reads the port the VM host daemon serves on, and says the names
+/// open through it, on one VM and across VMs. While the port is held, the
+/// row names the cause.
+#[test]
+fn ls_warning_clears_on_recovery_with_no_guest_port() {
+    let mut resp = listing_of(&[("web", None, None)]);
+    resp.hostname_proxy_port = None;
+    resp.answerer_bound = true;
+    let held = minimald_rpc::AnswererStatusReply {
+        answerer: minimald_rpc::ZoneAnswererStatus::Registered { port: 7_656 },
+        proxy_down: Some(minimald_rpc::ProxyDown {
+            port: 7_654,
+            cause: minimald_rpc::ProxyDownCause::PortHeldAfterStart {
+                holder: Some("pid 4242 (python3)".to_string()),
+            },
+        }),
+    };
+    let recovered = minimald_rpc::AnswererStatusReply {
+        answerer: minimald_rpc::ZoneAnswererStatus::Registered { port: 7_656 },
+        proxy_down: None,
+    };
+    let render = |reply: minimald_rpc::AnswererStatusReply, ports: &[u16]| {
+        let mut out = Vec::new();
+        cmd::format_ls_with_proxy_ports_on(
+            &mut out,
+            &LsArgs {
+                raw: false,
+                json: false,
+            },
+            &resp,
+            Some(crate::resolver::LiveSurface::Proxy),
+            Some(reply),
+            ports,
+            crate::resolver::HostInstall::default(),
+        )
+        .expect("rendering the listing");
+        String::from_utf8(out).expect("the listing is UTF-8")
+    };
+    let box_names = |text: &str| {
+        text.lines()
+            .find(|line| line.starts_with("BOX NAMES:"))
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("a BOX NAMES row:\n{text}"))
+    };
+
+    let before = render(held.clone(), &[]);
+    assert!(
+        box_names(&before).contains("the hostname proxy is not serving: pid 4242 (python3)"),
+        "the held port names its cause:\n{before}"
+    );
+
+    let after = render(recovered.clone(), &[7_654]);
+    assert!(
+        !after.contains("not serving"),
+        "the cause clears once the port frees:\n{after}"
+    );
+    assert!(
+        box_names(&after).contains("127.0.0.1:7654"),
+        "the row names the port the proxy serves on:\n{after}"
+    );
+    assert!(
+        after.contains("HOSTNAME PROXY:  listening on 127.0.0.1:7654"),
+        "the HOSTNAME PROXY row names the served port:\n{after}"
+    );
+
+    // Across VMs, each VM reads its own served ports.
+    let listings = [
+        cmd::VmListing {
+            vm: "default".to_string(),
+            resp: resp.clone(),
+            control_sock: None,
+            running: true,
+        },
+        cmd::VmListing {
+            vm: "other".to_string(),
+            resp: resp.clone(),
+            control_sock: None,
+            running: true,
+        },
+    ];
+    let mut out = Vec::new();
+    cmd::format_ls_across_vms_with_proxy_ports_on(
+        &mut out,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        &listings,
+        &[
+            Some(crate::resolver::LiveSurface::Proxy),
+            Some(crate::resolver::LiveSurface::Proxy),
+        ],
+        &[Some(recovered), Some(held)],
+        &[vec![7_654], vec![]],
+        crate::resolver::HostInstall::default(),
+    )
+    .expect("rendering the listing");
+    let across = String::from_utf8(out).expect("the listing is UTF-8");
+    let rows: Vec<&str> = across
+        .lines()
+        .filter(|line| line.starts_with("BOX NAMES:"))
+        .collect();
+    assert_eq!(rows.len(), 2, "one BOX NAMES row per VM:\n{across}");
+    assert!(
+        rows[0].contains("default") && rows[0].contains("127.0.0.1:7654"),
+        "the recovered VM names its served port:\n{across}"
+    );
+    assert!(
+        !rows[0].contains("not serving"),
+        "the recovered VM carries no cause:\n{across}"
+    );
+    assert!(
+        rows[1].contains("other") && rows[1].contains("not serving"),
+        "the held VM keeps its cause:\n{across}"
+    );
+}

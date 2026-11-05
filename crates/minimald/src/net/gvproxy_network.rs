@@ -311,6 +311,9 @@ pub(crate) async fn complete_own_ip_attach(
         .map(|policy| {
             BoxGate::for_session_steered(
                 lease_ip.to_string(),
+                // NET-163: another box's `allow_dns_hosts` names this box
+                // by its own name, so the gate carries it.
+                Some(session_name),
                 lease_ip,
                 policy,
                 subnet,
