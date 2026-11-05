@@ -1389,6 +1389,14 @@ if [ "$mode" = uninstall ]; then
         [ -d "$record" ] || continue
         rmdir "$record" 2>/dev/null || true
     done
+    # The effect probe's throwaway leaves, filter-probe-<pid>: a daemon
+    # stopped in the middle of its probe leaves one behind, empty. rmdir
+    # removes only an empty one, and a box's own leaf is never swept here:
+    # it still stops the uninstall below.
+    for probe_leaf in "$tree_root/$BOXES_DIR/$DENY_DIR"/filter-probe-*; do
+        [ -d "$probe_leaf" ] || continue
+        rmdir "$probe_leaf" 2>/dev/null || true
+    done
     rmdir "$tree_root/$BOXES_DIR/$DENY_DIR" 2>/dev/null || true
     rmdir "$tree_root/$BOXES_DIR/$ALLOW_DIR" 2>/dev/null || true
     rmdir "$tree_root/$BOXES_DIR/$QUIC443_BLOCKED_DIR" 2>/dev/null || true

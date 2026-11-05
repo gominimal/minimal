@@ -3269,6 +3269,10 @@ STUB
     drop_cgroup_files "$tree/boxes/deny"
     drop_cgroup_files "$tree/boxes/allow"
     drop_cgroup_files "$tree/boxes/quic443-blocked"
+    # The probe leaf a daemon stopped mid-probe leaves behind
+    # (gominimal/inbox#1206) is the probe's own, so it does not stop the
+    # uninstall.
+    mkdir "$tree/boxes/deny/filter-probe-4242"
     run_hc uninstall "$root/mi-on" --uninstall
     check 0 "$rc" "uninstall removes the installed tree"
     want_err "uninstall leaves no tree behind" test -e "$tree"
