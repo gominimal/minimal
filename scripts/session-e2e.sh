@@ -5093,7 +5093,7 @@ fresh_install_range_lands_on_macos() {
   # The box's own address: the zone answerer's A record for its name.
   for _ in $(seq 1 40); do
     frm_ans_port="$(mnl ls 2>/dev/null \
-      | sed -n 's/^DNS SERVICE:.*listening on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' \
+      | sed -En 's/^DNS SERVICE:.* on 127\.0\.0\.1:([0-9]+) \(UDP\).*/\1/p' \
       | head -n1)"
     [ -n "$frm_ans_port" ] && break
     sleep 0.25
