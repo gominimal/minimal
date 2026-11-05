@@ -16709,7 +16709,7 @@ async fn a_second_task_run_is_refused_while_the_first_relays_the_entrypoint() {
     .expect("the daemon takes the second run");
     assert_eq!(
         second.exit_status,
-        Some(1),
+        Some(2),
         "{second:?}: {}",
         log.contents()
     );

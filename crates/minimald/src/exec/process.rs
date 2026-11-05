@@ -883,8 +883,11 @@ impl TaskEntrypointBox {
                 span.in_scope(|| {
                     tracing::info!("task box: another run relays the entrypoint; refused the run");
                 });
-                return Ok(TaskProcess::Refused(RefusedProcess::new(
+                // Exit 2, as an exec against a box in the wrong state
+                // gets, so the refusal never reads as the task's own exit 1.
+                return Ok(TaskProcess::Refused(RefusedProcess::with_code(
                     &entrypoint_relayed_refusal(&exec.task, &box_name),
+                    2,
                 )));
             }
             crate::box_runtime::EntrypointIoTake::HostGone => {
@@ -1141,16 +1144,24 @@ impl Process for EchoProcess {
 }
 
 /// A synthetic [`Process`] for a task run the daemon refused to start: it
-/// writes the refusal on stderr and exits 1, without spawning anything.
+/// writes the refusal on stderr and exits 1, or the code it was given,
+/// without spawning anything.
 pub struct RefusedProcess {
     /// `Some` until `take_stdio` hands the streams out; `None` thereafter.
     stderr: Option<Vec<u8>>,
+    /// The exit code `wait` reports.
+    code: i32,
 }
 
 impl RefusedProcess {
     fn new(text: &str) -> Self {
+        Self::with_code(text, 1)
+    }
+
+    fn with_code(text: &str, code: i32) -> Self {
         Self {
             stderr: Some(format!("{text}\n").into_bytes()),
+            code,
         }
     }
 }
@@ -1170,7 +1181,7 @@ impl Process for RefusedProcess {
     }
 
     async fn wait(&mut self) -> io::Result<Option<i32>> {
-        Ok(Some(1))
+        Ok(Some(self.code))
     }
 
     fn start_kill(&mut self) -> io::Result<()> {
