@@ -114,6 +114,12 @@
 #                                    switch the install placed, with the VM
 #                                    host daemon's start record naming them
 #   min_internal_names_through_proxy NET-001..004 through the shipped proxy
+#   host_exposures_follow_the_table  NET-156/159/160/161 on a VM lane: a
+#                                    box that names host.min.internal
+#                                    reaches a port only while a
+#                                    [host-exposures] entry opens it, and a
+#                                    box that does not name the host is
+#                                    refused there; NOT RUN on a native lane
 #   own_ip_deny_all_box_answers_published_port
 #                                    NET-040's answer half: a deny-all box
 #                                    with a published port answers a host
@@ -412,6 +418,7 @@ case "${1:-}" in
     | vm_host_row_read_tracks_create_and_destroy \
     | answerer_survives_session_stop \
     | escapes_and_builds_stay_inside_box_rules \
+    | host_exposures_follow_the_table \
     | host_stop_stops_boxes_then_daemon_and_vm)
     E2E_VM="${E2E_VM:-1}"
     if [ -z "${E2E_MINIMAL_ARGS:-}" ]; then
@@ -490,6 +497,11 @@ PROXY_OWN_SEED_DIR="" # its own-address box's seed; removed on teardown
 PROXY_HOST_DIR="" # the host-loopback dir that proof serves; removed on teardown
 PROXY_HOST_SRV_PID="" # the host-loopback server it starts; killed on teardown
 PROXY_UNEXPOSED_SRV_PID="" # its listener at a port outside the host exposure; killed on teardown
+HX_SEED_DIR="" # seeded by the host-exposures table proof; removed on teardown
+HX_HOST_DIR="" # the host-loopback dir that proof serves; removed on teardown
+HX_SRV_PID="" # the host-loopback server it starts; killed on teardown
+HX_SIDS="" # its boxes; destroyed on teardown
+HX_CFG_SAVED="" # the config.toml it saved before it added an entry ("none": there was no file); restored on teardown
 HAN_HOST_SRV_PID="" # the host-address names case's host listener; killed on teardown
 HAN_HOST_DIR=""     # the directory it serves; removed on teardown
 PAR_SEED_DIR="" # seeded by the proxy-parity proof below; removed on teardown
@@ -1138,6 +1150,18 @@ teardown() {
   fi
   [ -n "$PROXY_SEED_DIR" ] && rm -rf "$PROXY_SEED_DIR"
   [ -n "$PROXY_OWN_SEED_DIR" ] && rm -rf "$PROXY_OWN_SEED_DIR"
+  # The host-exposures table proof: its entry, its boxes, its listener.
+  if [ "$HX_CFG_SAVED" = none ]; then
+    rm -f "$XDG_CONFIG_HOME/minimal/config.toml"
+  elif [ -n "$HX_CFG_SAVED" ]; then
+    cat "$HX_CFG_SAVED" >"$XDG_CONFIG_HOME/minimal/config.toml" 2>/dev/null || true
+  fi
+  for hx_sid in $HX_SIDS; do
+    mnl session destroy --force "$hx_sid" >/dev/null 2>&1 || true
+  done
+  [ -n "$HX_SRV_PID" ] && { kill "$HX_SRV_PID" 2>/dev/null || true; }
+  [ -n "$HX_HOST_DIR" ] && rm -rf "$HX_HOST_DIR"
+  [ -n "$HX_SEED_DIR" ] && rm -rf "$HX_SEED_DIR"
   [ -n "$PROXY_HOST_DIR" ] && rm -rf "$PROXY_HOST_DIR"
   if [ -n "$PROXY_HOST_SRV_PID" ]; then
     kill "$PROXY_HOST_SRV_PID" 2>/dev/null || true
@@ -23014,6 +23038,243 @@ proof_min_internal_names_through_proxy() {
   echo "::endgroup::"
 }
 
+# host_exposures_follow_the_table: on a VM-backed host, a flow from a box to
+# host.min.internal reaches only what the client config.toml's
+# [host-exposures] table opens, and only from a box whose egress names the
+# host (NET-156, NET-159, NET-160, NET-161). The case serves a marker on the
+# host loopback at a port the lane's table does not open, then:
+#
+#   * a box that names host.min.internal (--allow-dns-hosts) is refused at
+#     that port while no entry opens it;
+#   * the case adds an entry for the port under [host-exposures], and the
+#     same box's next flow fetches the marker;
+#   * a box that does not name the host is refused at the same port while
+#     the entry is in force;
+#   * the case removes the entry, and the first box's next flow is refused.
+#
+# Each request prints its target, its curl exit and its HTTP status. The two
+# refusals at the VM host gate are asserted from minvmd's log on the host,
+# with the host-alias rule. The refusal of the box that does not name the
+# host happens at its own relay in the guest, so the case prints the guest
+# console's host-alias lines for it and does not assert them.
+#
+# The node-plane half of the design's openings (NET-158) is not driven here:
+# the built-in baseline set names no endpoint at the alias, and no box can
+# send with the node's identity. The minvmd unit test
+# host_alias_admits_baseline_for_node_plane_only carries it.
+proof_host_exposures_follow_the_table() {
+  local hx_case=host_exposures_follow_the_table
+  local hx_port=18157 hx_marker="HOST_EXPOSURE_T152_OK"
+  local hx_named="e2e-hostx-named" hx_bare="e2e-hostx-bare"
+  local hx_cfg="$XDG_CONFIG_HOME/minimal/config.toml"
+  local hx_entry hx_src hx_named_sid="" hx_bare_sid="" hx_drops0="" hx_drops1="" hx_boot0=""
+  local hx_first_drop_at=0 hx_wait=0
+  echo "::group::host.min.internal reaches only the [host-exposures] table, from a box that names the host (NET-156, NET-160, NET-161)"
+
+  if [ -z "$E2E_VM" ]; then
+    not_run "$hx_case" "native target: the VM host gate this case drives exists only where the CLI is VM-backed"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ "$(uname -s)" = Linux ] && { [ ! -e /dev/kvm ] || [ ! -w /dev/kvm ]; }; then
+    not_run "$hx_case" "no writable /dev/kvm: a Linux VM boots on KVM and this host has none"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    not_run "$hx_case" "no MINVMD_GVPROXY_BIN: this target has no switch, so no own-address box can come up"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # The refusals minvmd logged at this case's port, one line each. The gate
+  # names the rule, the source, the row and the port in each line.
+  hx_alias_drops() {
+    minvmd_log_lines 'that no host exposure opens' \
+      | grep -E -- "port\"?[=:] ?\"?$hx_port([^0-9]|$)" || true
+  }
+  hx_alias_drop_count() { hx_alias_drops | wc -l | tr -d ' '; }
+  # Waits up to 5 s for a new host-gate refusal at the port past $1 lines,
+  # prints the new lines, and fails the case when none arrives.
+  hx_want_host_drop() {
+    local before="$1" leg="$2" now=0 i
+    for i in $(seq 1 20); do
+      now="$(hx_alias_drop_count)"
+      [ "$now" -gt "$before" ] && break
+      sleep 0.25
+    done
+    if [ "$now" -le "$before" ]; then
+      echo "::error::$leg: minvmd logged no host-alias refusal at port $hx_port"
+      echo "--- minvmd host-alias lines ---"; minvmd_log_lines 'host-alias' | tail -n 10 || true
+      fail
+    fi
+    hx_alias_drops | tail -n "+$((before + 1))" | sed 's/^/minvmd log: /'
+  }
+  # The guest console, where the in-VM daemon's relay logs its own drops.
+  hx_boot_log() {
+    printf '%s\n' "${MINVMD_BOOT_LOG:-$XDG_STATE_HOME/minimal/providers/local-minvmd0/boot.log}"
+  }
+  hx_boot_lines() {
+    local f
+    f="$(hx_boot_log)"
+    if [ -f "$f" ]; then wc -l <"$f" | tr -d ' '; else printf '0\n'; fi
+  }
+
+  # One GET of the marker from box $1 at host.min.internal. Prints the
+  # request, its target and its status, and sets HX_RC (curl's exit) and
+  # HX_CODE (the HTTP status, 000 when nothing answered).
+  hx_get() {
+    local sid="$1" leg="$2" out
+    out="$(mnl session exec "$sid" \
+      "curl -sS --max-time 8 -o /home/hx.body -w 'hx_code=%{http_code}\n' http://host.min.internal:$hx_port/marker; echo \"hx_rc=\$?\"; cat /home/hx.body 2>/dev/null" \
+      2>"$WORK/$hx_case.exec.err" || true)"
+    printf '%s\n' "$out" >"$WORK/$hx_case.exec.out"
+    HX_RC="$(sed -n 's/^.*hx_rc=\([0-9]*\).*$/\1/p' "$WORK/$hx_case.exec.out" | tr -d '\r' | head -n1)"
+    HX_CODE="$(sed -n 's/^.*hx_code=\([0-9]*\).*$/\1/p' "$WORK/$hx_case.exec.out" | tr -d '\r' | head -n1)"
+    HX_BODY="$out"
+    echo "$leg: GET http://host.min.internal:$hx_port/marker from box $sid -> curl exit ${HX_RC:-<none>}, HTTP ${HX_CODE:-<none>}"
+  }
+  hx_want_reached() {
+    if [ "${HX_RC:-}" != 0 ] || [ "${HX_CODE:-}" != 200 ] || [[ "$HX_BODY" != *"$hx_marker"* ]]; then
+      echo "::error::$1: the box did not fetch the marker from host.min.internal:$hx_port (curl exit '${HX_RC:-none}', HTTP '${HX_CODE:-none}')"
+      echo "--- exec stdout ---"; cat "$WORK/$hx_case.exec.out" 2>/dev/null || true
+      echo "--- exec stderr ---"; cat "$WORK/$hx_case.exec.err" 2>/dev/null || true
+      fail
+    fi
+  }
+  hx_want_refused() {
+    case "${HX_RC:-}" in
+      7 | 28) ;;
+      0)
+        echo "::error::$1: the box reached host.min.internal:$hx_port (HTTP '${HX_CODE:-none}'), which must be refused"
+        fail
+        ;;
+      *)
+        echo "::error::$1: the fetch from host.min.internal:$hx_port failed with curl exit '${HX_RC:-none}', not a refused connection (7) or a timeout (28)"
+        echo "--- exec stdout ---"; cat "$WORK/$hx_case.exec.out" 2>/dev/null || true
+        echo "--- exec stderr ---"; cat "$WORK/$hx_case.exec.err" 2>/dev/null || true
+        fail
+        ;;
+    esac
+  }
+  # Activates own-address box $1 with the egress flags that follow, and
+  # sets HX_ACT_SID to its id. It runs in this shell, so its `fail` ends the
+  # case.
+  hx_activate() {
+    local name="$1" out
+    shift
+    if ! out="$(cd "$HX_SEED_DIR" && mnl session activate . --no-prompt --name "$name" \
+      --network own_ip "$@" </dev/null 2>"$WORK/$hx_case.$name.err")"; then
+      echo "::error::'min session activate --name $name --network own_ip $*' failed"
+      echo "--- stderr ---"; cat "$WORK/$hx_case.$name.err" 2>/dev/null || true
+      fail
+    fi
+    HX_ACT_SID="$(printf '%s\n' "$out" | tail -n1 | tr -d '\r')"
+    HX_SIDS="$HX_SIDS $HX_ACT_SID"
+  }
+
+  # The host listener at a port that no entry of the lane's table opens.
+  HX_HOST_DIR="$(hook_mktemp /tmp/mnlhx.XXXXXX)"
+  printf '%s\n' "$hx_marker" >"$HX_HOST_DIR/marker"
+  ( cd "$HX_HOST_DIR" && exec python3 -m http.server "$hx_port" --bind 127.0.0.1 ) \
+    >/dev/null 2>"$WORK/$hx_case.srv.err" &
+  HX_SRV_PID=$!
+  for _ in $(seq 1 40); do
+    [ "$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' \
+      "http://127.0.0.1:$hx_port/marker" 2>/dev/null || true)" = 200 ] && break
+    sleep 0.25
+  done
+  if [ "$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' \
+    "http://127.0.0.1:$hx_port/marker" 2>/dev/null || true)" != 200 ]; then
+    echo "::error::the host-loopback http.server never answered on 127.0.0.1:$hx_port"
+    echo "--- server stderr ---"; cat "$WORK/$hx_case.srv.err" 2>/dev/null || true
+    fail
+  fi
+  echo "host listener: http://127.0.0.1:$hx_port/marker serves $hx_marker"
+
+  HX_SEED_DIR="$(hook_mktemp /tmp/mnlhxs.XXXXXX)"
+  hook_seed_preamble >"$HX_SEED_DIR/minimal.toml"
+  mkdir "$HX_SEED_DIR/.git"
+
+  # The box that names the host, and nothing else.
+  hx_activate "$hx_named" --allow-dns-hosts host.min.internal
+  hx_named_sid="$HX_ACT_SID"
+  echo "box $hx_named ($hx_named_sid): egress.allow_dns_hosts = [\"host.min.internal\"]"
+
+  # No entry opens the port yet: the VM host gate refuses the flow.
+  hx_drops0="$(hx_alias_drop_count)"
+  hx_get "$hx_named_sid" "before the entry"
+  hx_want_refused "before the entry"
+  hx_want_host_drop "$hx_drops0" "before the entry"
+  # The gate logs one refusal per source and rule per 60 s. The last leg
+  # waits out that window, so its refusal from this box gets a line too.
+  hx_first_drop_at="$(date +%s)"
+
+  # Add the entry under the existing [host-exposures] header, or add the
+  # table when the file has none. A second header for one table is not
+  # valid TOML, so the line goes inside the table that is there.
+  mkdir -p "$(dirname "$hx_cfg")"
+  hx_src=/dev/null
+  if [ -f "$hx_cfg" ]; then
+    cp "$hx_cfg" "$WORK/$hx_case.config.saved"
+    HX_CFG_SAVED="$WORK/$hx_case.config.saved"
+    hx_src="$HX_CFG_SAVED"
+  else
+    HX_CFG_SAVED="none"
+  fi
+  hx_entry="e2e-t152 = { proto = \"tcp\", port = $hx_port }"
+  awk -v line="$hx_entry" '
+    { print }
+    /^\[host-exposures\][[:space:]]*$/ && !done { print line; done = 1 }
+    END { if (!done) { print ""; print "[host-exposures]"; print line } }
+  ' "$hx_src" >"$WORK/$hx_case.config.new"
+  cat "$WORK/$hx_case.config.new" >"$hx_cfg"
+  echo "added to $hx_cfg under [host-exposures]: $hx_entry"
+
+  # The next flow is decided by the changed table.
+  hx_get "$hx_named_sid" "with the entry"
+  hx_want_reached "with the entry"
+
+  # A box that does not name the host: its allow_subnets (TEST-NET-1 alone)
+  # does not cover the alias, so the entry gives it nothing.
+  hx_activate "$hx_bare" --allow-subnets 192.0.2.0/24
+  hx_bare_sid="$HX_ACT_SID"
+  echo "box $hx_bare ($hx_bare_sid): egress.allow_subnets = [\"192.0.2.0/24\"], names no host.min.internal"
+  hx_boot0="$(hx_boot_lines)"
+  hx_get "$hx_bare_sid" "with the entry, box that does not name the host"
+  hx_want_refused "with the entry, box that does not name the host"
+  tail -n "+$((hx_boot0 + 1))" "$(hx_boot_log)" 2>/dev/null \
+    | sed "s/$(printf '\033')[[0-9;]*m//g" | grep -F -- 'host-alias' | sed 's/^/guest log: /' \
+    || echo "guest log: (no host-alias line in this window)"
+
+  # Remove the entry: put the file back as it was.
+  if [ "$HX_CFG_SAVED" = none ]; then
+    rm -f "$hx_cfg"
+  else
+    cat "$HX_CFG_SAVED" >"$hx_cfg"
+  fi
+  HX_CFG_SAVED=""
+  echo "removed the entry for port $hx_port from $hx_cfg"
+
+  hx_wait=$((61 - ($(date +%s) - hx_first_drop_at)))
+  if [ "$hx_wait" -gt 0 ]; then
+    echo "waiting ${hx_wait}s: minvmd logs one host-alias refusal per box per 60s"
+    sleep "$hx_wait"
+  fi
+  hx_drops1="$(hx_alias_drop_count)"
+  hx_get "$hx_named_sid" "after the entry is removed"
+  hx_want_refused "after the entry is removed"
+  hx_want_host_drop "$hx_drops1" "after the entry is removed"
+
+  mnl session destroy --force "$hx_named_sid" >/dev/null 2>&1 || true
+  mnl session destroy --force "$hx_bare_sid" >/dev/null 2>&1 || true
+  HX_SIDS=""
+  kill "$HX_SRV_PID" 2>/dev/null || true
+  HX_SRV_PID=""
+  echo "$hx_case OK (host.min.internal:$hx_port refused with no entry, reached with the entry from the box that names the host, refused from the box that does not, and refused again once the entry is removed)"
+  echo "::endgroup::"
+}
+
 # ---------------------------------------------------------------------------
 # A deny-all own-address box ANSWERS the connections its published port
 # received (NET-040's answer half), while its own outbound connect is still a
@@ -30994,6 +31255,7 @@ case "${1:-}" in
     proof_native_names_answer_on_time
     proof_hostnames_recover_and_two_daemons_route
     proof_min_internal_names_through_proxy
+    proof_host_exposures_follow_the_table
     proof_own_ip_deny_all_box_answers_published_port
     proof_port_publishes_on_listen_and_box_outlives_client
     proof_min_net_expose_publishes_lists_and_refuses
@@ -31082,6 +31344,7 @@ case "${1:-}" in
     | native_names_answer_on_time \
     | hostnames_recover_and_two_daemons_route \
     | min_internal_names_through_proxy | own_ip_deny_all_box_answers_published_port \
+    | host_exposures_follow_the_table \
     | port_publishes_on_listen_and_box_outlives_client \
     | min_net_expose_publishes_lists_and_refuses \
     | listen_published_port_reaches_peer_and_host \
@@ -31159,6 +31422,7 @@ case "${1:-}" in
     echo "         linux_stock_install_runs_vm_boxes"
     echo "         hostnames_recover_and_two_daemons_route"
     echo "         min_internal_names_through_proxy own_ip_deny_all_box_answers_published_port"
+    echo "         host_exposures_follow_the_table"
     echo "         port_publishes_on_listen_and_box_outlives_client"
     echo "         min_net_expose_publishes_lists_and_refuses"
     echo "         listen_published_port_reaches_peer_and_host"
