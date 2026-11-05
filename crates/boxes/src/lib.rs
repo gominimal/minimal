@@ -374,23 +374,31 @@ impl CredentialedUpstream {
             })
     }
 
-    /// Whether a declared lane takes effect in a box of this network mode:
-    /// the lane is admitted at the switch's gate, which only own-address
-    /// boxes sit behind. A declaration in any other mode stays on the
-    /// record and is still shown, marked as not in effect.
+    /// Whether a declared lane takes effect in a box of this network mode
+    /// on a host of this kind (BEP-085). An own-address box reaches the
+    /// proxy through the switch's gate on every host. A host-address box
+    /// reaches it only on a VM host, where the host-side gate admits the
+    /// box's cohort to the proxy's listener. On a native host a
+    /// host-address box shares the host's network, and no gate admits it.
+    /// A `none` box has no network. A declaration that is not in effect
+    /// stays on the record and is still shown, marked as not in effect.
     #[must_use]
-    pub fn in_effect(network: NetworkMode) -> bool {
-        network == NetworkMode::OwnIp
+    pub fn in_effect(network: NetworkMode, host: paths::HostKind) -> bool {
+        match network {
+            NetworkMode::OwnIp => true,
+            NetworkMode::HostNet => host == paths::HostKind::Minvmd,
+            NetworkMode::NoNet => false,
+        }
     }
 
     /// The policy row that states a declared lane, without indentation:
     /// the one text `min session policy` and the `min dash` detail pane
     /// both print, so the two surfaces cannot disagree. A box whose mode
-    /// leaves the lane without effect gets a `(not in effect: <mode> box)`
-    /// mark, the mode named by its CLI word.
+    /// leaves the lane without effect on its host gets a
+    /// `(not in effect: <mode> box)` mark, the mode named by its CLI word.
     #[must_use]
-    pub fn policy_row(network: NetworkMode) -> String {
-        if Self::in_effect(network) {
+    pub fn policy_row(network: NetworkMode, host: paths::HostKind) -> String {
+        if Self::in_effect(network, host) {
             Self::POLICY_ROW.to_string()
         } else {
             format!(
@@ -2221,25 +2229,41 @@ mod tests {
         }
     }
 
-    /// NET-134: the lane's row is unmarked only where the switch gate
-    /// admits it; every other mode still shows the declaration, marked
-    /// with the mode that leaves it without effect.
+    /// NET-134, BEP-085: the lane is in effect for an own-address box on
+    /// every host and for a host-address box on a VM host. Its row is
+    /// unmarked there. Every other case still shows the declaration,
+    /// marked with the mode that leaves it without effect.
     #[test]
-    fn credentialed_upstream_row_marks_modes_without_effect() {
-        assert!(CredentialedUpstream::in_effect(NetworkMode::OwnIp));
+    fn credentialed_upstream_in_effect_by_mode_and_host() {
+        use paths::HostKind::{Minimald, Minvmd};
+        const ROW: &str = "credentialed upstream  allowed to reach the Box Egress Proxy";
+        for host in [Minimald, Minvmd] {
+            assert!(CredentialedUpstream::in_effect(NetworkMode::OwnIp, host));
+            assert_eq!(
+                CredentialedUpstream::policy_row(NetworkMode::OwnIp, host),
+                ROW
+            );
+            assert!(!CredentialedUpstream::in_effect(NetworkMode::NoNet, host));
+            assert_eq!(
+                CredentialedUpstream::policy_row(NetworkMode::NoNet, host),
+                format!("{ROW} (not in effect: none box)")
+            );
+        }
+        assert!(CredentialedUpstream::in_effect(
+            NetworkMode::HostNet,
+            Minvmd
+        ));
         assert_eq!(
-            CredentialedUpstream::policy_row(NetworkMode::OwnIp),
-            "credentialed upstream  allowed to reach the Box Egress Proxy"
+            CredentialedUpstream::policy_row(NetworkMode::HostNet, Minvmd),
+            ROW
         );
-        assert!(!CredentialedUpstream::in_effect(NetworkMode::HostNet));
+        assert!(!CredentialedUpstream::in_effect(
+            NetworkMode::HostNet,
+            Minimald
+        ));
         assert_eq!(
-            CredentialedUpstream::policy_row(NetworkMode::HostNet),
-            "credentialed upstream  allowed to reach the Box Egress Proxy (not in effect: host_ip box)"
-        );
-        assert!(!CredentialedUpstream::in_effect(NetworkMode::NoNet));
-        assert_eq!(
-            CredentialedUpstream::policy_row(NetworkMode::NoNet),
-            "credentialed upstream  allowed to reach the Box Egress Proxy (not in effect: none box)"
+            CredentialedUpstream::policy_row(NetworkMode::HostNet, Minimald),
+            format!("{ROW} (not in effect: host_ip box)")
         );
     }
 
