@@ -23062,6 +23062,7 @@ proof_host_exposures_follow_the_table() {
   local hx_named="e2e-hostx-named" hx_bare="e2e-hostx-bare"
   local hx_cfg="$XDG_CONFIG_HOME/minimal/config.toml"
   local hx_entry hx_src hx_named_sid="" hx_bare_sid="" hx_drops0="" hx_drops1="" hx_boot0=""
+  local hx_first_drop_at=0 hx_wait=0
   echo "::group::host.min.internal reaches only the [host-exposures] table, from a box that names the host (NET-156, NET-160, NET-161)"
 
   if [ -z "$E2E_VM" ]; then
@@ -23199,6 +23200,9 @@ proof_host_exposures_follow_the_table() {
   hx_get "$hx_named_sid" "before the entry"
   hx_want_refused "before the entry"
   hx_want_host_drop "$hx_drops0" "before the entry"
+  # The gate logs one refusal per source and rule per 60 s. The last leg
+  # waits out that window, so its refusal from this box gets a line too.
+  hx_first_drop_at="$(date +%s)"
 
   # Add the entry under the existing [host-exposures] header, or add the
   # table when the file has none. A second header for one table is not
@@ -23246,6 +23250,11 @@ proof_host_exposures_follow_the_table() {
   HX_CFG_SAVED=""
   echo "removed the entry for port $hx_port from $hx_cfg"
 
+  hx_wait=$((61 - ($(date +%s) - hx_first_drop_at)))
+  if [ "$hx_wait" -gt 0 ]; then
+    echo "waiting ${hx_wait}s: minvmd logs one host-alias refusal per box per 60s"
+    sleep "$hx_wait"
+  fi
   hx_drops1="$(hx_alias_drop_count)"
   hx_get "$hx_named_sid" "after the entry is removed"
   hx_want_refused "after the entry is removed"
