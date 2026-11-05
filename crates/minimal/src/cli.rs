@@ -464,6 +464,14 @@ pub enum BoxCommand {
     /// code. `-t` gives the command a terminal, and `--detach` starts it
     /// and returns its exec id
     Exec(BoxExecArgs),
+    /// Show what happened to a box: each event the daemon recorded for
+    /// it, such as its creation, each start and stop, each exec and its
+    /// exit, oldest first. A stopped or exited box keeps its events until
+    /// `min box rm` removes it
+    Events(BoxEventsArgs),
+    /// Copy a file out of a box to this machine. A stopped or exited box
+    /// keeps its files, so a copy from it works too
+    Cp(BoxCpArgs),
     /// Give a box a new name. The box keeps its id, its state and its
     /// files. A name that a running box on the same host holds is refused
     Rename(BoxRenameArgs),
@@ -471,6 +479,47 @@ pub enum BoxCommand {
     /// files. A running box is never removed. `--older-than` and `--parent`
     /// narrow what is removed. Off a terminal, `--yes` is required
     Prune(BoxPruneArgs),
+}
+
+// BOX-162 (BCLI-016): `min box events <box> | --parent <box> [-o jsonl] [--follow]`.
+#[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("box_or_parent").required(true).args(["target", "parent"])))]
+pub struct BoxEventsArgs {
+    /// The box: its id, the start of its id, or its name, as `min box list`
+    /// prints them
+    pub target: Option<String>,
+    /// Show the events of every child box of this box together, in time
+    /// order, each event naming its box
+    #[arg(long, value_name = "BOX")]
+    pub parent: Option<String>,
+    /// Write each event as one JSON object on its own line
+    #[arg(short = 'o', long = "output", value_enum)]
+    pub output: Option<BoxEventsOutputFormat>,
+    /// Show the events so far, then keep showing new events as they
+    /// happen, until the box is removed or the command is interrupted
+    #[arg(short = 'f', long)]
+    pub follow: bool,
+}
+
+/// The rendering `min box events` writes, beside the text default.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum BoxEventsOutputFormat {
+    /// One JSON object for each event
+    Jsonl,
+}
+
+// BOX-017 (BCLI-062): `min box cp <box>:<path> <local>`.
+#[derive(Debug, Args)]
+pub struct BoxCpArgs {
+    /// The file to copy, as `<box>:<path>`. `<box>` is the box's id, the
+    /// start of its id, or its name. A relative `<path>` is in the box's
+    /// home directory, and `/workbench/<path>` is in its copy of the project
+    #[arg(value_name = "BOX:PATH")]
+    pub source: String,
+    /// Where to write the file on this machine. An existing directory
+    /// receives the file under its own name
+    #[arg(value_name = "LOCAL")]
+    pub destination: PathBuf,
 }
 
 #[derive(Debug, Args)]
