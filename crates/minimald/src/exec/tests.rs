@@ -3268,6 +3268,75 @@ mod managed {
         assert_eq!(events[0].data["pty"], true);
     }
 
+    /// BCLI-068: a box stop takes the box's host before it signals the
+    /// box's processes. An attached tty exec that ends after that ends its
+    /// attach with 254, whatever status the exec ended with, so the client
+    /// reads the box and says it was stopped. A removal does the same. An
+    /// exec that ends on its own in a running box gives its own status, and
+    /// its records keep that status in every case.
+    #[tokio::test]
+    async fn box_stop_ends_attached_exec_channel_254() {
+        use super::super::{BOX_ENDED_ATTACH_STATUS, ExecExit, attach_terminal};
+
+        // A running box: its actor holds a host. `ending` models the stop
+        // (true) or the removal (false) when it ends the exec.
+        let running = || {
+            let session = crate::box_actor::WeakBoxHandle::answering(Vec::new())
+                .upgrade()
+                .expect("the stand-in actor lives");
+            session.put_host_for_test(crate::box_runtime::HostHandle::answering_attrs());
+            session
+        };
+        let disk = box_on_disk();
+        for case in ["own end", "stop", "removal"] {
+            let session = running();
+            let entry = disk.start(
+                ExecMode::Tty,
+                &["sh", "-c", "echo READY; read line; exit 7"],
+                None,
+                false,
+            );
+            let (typed, msgs) = super::msg_stream();
+            let (mut client, mut server) = tokio::io::duplex(1 << 16);
+            let attach = tokio::spawn({
+                let entry = Arc::clone(&entry);
+                let session = session.clone();
+                async move { attach_terminal(&entry, &session, msgs, &mut server).await }
+            });
+            let mut seen = String::new();
+            read_until(&mut client, &mut seen, "READY").await;
+            match case {
+                "stop" => session.take_host_for_test(),
+                "removal" => session.start_destroy_for_test(),
+                _ => {}
+            }
+            typed
+                .send(russh::ChannelMsg::Data {
+                    data: b"bye\n".to_vec().into(),
+                })
+                .unwrap();
+            let status = tokio::time::timeout(Duration::from_secs(10), attach)
+                .await
+                .expect("the attach ends with the exec")
+                .unwrap()
+                .unwrap();
+            let expected = if case == "own end" {
+                7
+            } else {
+                BOX_ENDED_ATTACH_STATUS
+            };
+            assert_eq!(status, Some(expected), "{case}");
+            assert_eq!(
+                entry.wait().await,
+                ExecExit {
+                    code: Some(7),
+                    reason: ExecExitReason::Exited
+                },
+                "{case}: the exec keeps its own end"
+            );
+        }
+    }
+
     /// BOX-149: a tty exec whose program never reads its terminal holds no
     /// more of what a client types than the exec's cap. Past the cap the
     /// input is dropped. When the exec ends, what it held leaves the daemon's
