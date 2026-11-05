@@ -998,9 +998,12 @@ pub(crate) const ENTRYPOINT_END_SETTLE: std::time::Duration = std::time::Duratio
 
 /// How long the read after an attach the daemon ended (254) waits for a box
 /// that still reads `running` to leave it. A stop or a removal closes the
-/// channel before the daemon writes the record. A box that still runs at
-/// the bound lost its terminal to another attach.
-pub(crate) const DAEMON_END_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+/// channel before the daemon writes the record. A stop writes it only once
+/// the entrypoint and every process in the box ended, or after its grace
+/// period and one more probe bound. A box that still runs at the bound lost
+/// its terminal to another attach. A takeover waits the whole bound.
+pub(crate) const DAEMON_END_SETTLE: std::time::Duration = minimald_rpc::STOP_GRACE
+    .saturating_add(minimald_rpc::HOST_PROBE_TIMEOUT);
 
 /// How often the settled read asks the host again.
 const SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
@@ -1092,10 +1095,12 @@ pub(crate) fn attach_ending(
 /// The line for a box the daemon ended the attach of that is neither
 /// running nor stopped.
 fn ended_box_line(label: &str, entry: &minimald_rpc::BoxListingEntry) -> String {
+    // An OOM record also stores an exit code (`OOM_EXIT_CODE`, 137), so
+    // the reason is matched before the code.
     match (entry.exit_code, entry.reason.as_deref()) {
+        (_, Some("oom")) => format!("Detached: {label} ran out of memory and ended."),
         (Some(code), _) => format!("Detached: {label} exited with code {code}."),
         (None, Some("timeout")) => format!("Detached: {label} ran past its timeout and ended."),
-        (None, Some("oom")) => format!("Detached: {label} ran out of memory and ended."),
         _ => format!("Detached: {label} is {}.", box_state_label(entry)),
     }
 }

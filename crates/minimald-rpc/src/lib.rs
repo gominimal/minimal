@@ -24,6 +24,14 @@ pub use boxes::{
 
 pub const RPC_SUBSYSTEM_PREFIX: &str = "minimald-v1-";
 
+/// The daemon's grace period between a stop's SIGTERM and its SIGKILL
+/// (BOX-013). A client that waits for a stop to land waits this long.
+pub const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The bound on one host probe the daemon makes. A stop waits this long
+/// again after its last signal for the entrypoint to be reaped.
+pub const HOST_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// The message every RPC refusal carries once the daemon has begun its
 /// shutdown: a client racing `min stop` matches on it to name the lost race
 /// in plain language instead of surfacing the raw RPC chain. Matching keys

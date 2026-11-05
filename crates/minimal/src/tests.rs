@@ -8149,6 +8149,14 @@ async fn attach_ended_from_other_side_notice_exit254() {
         line(BoxAfterAttach::Listed(timed_out)),
         "Detached: web ran past its timeout and ended."
     );
+    // An OOM record stores exit code 137 too. The line names the OOM.
+    let mut oom = ending_entry("exited");
+    oom.reason = Some("oom".to_owned());
+    oom.exit_code = Some(137);
+    assert_eq!(
+        line(BoxAfterAttach::Listed(oom)),
+        "Detached: web ran out of memory and ended."
+    );
     // A stop whose entrypoint exited on its SIGTERM records the
     // entrypoint's own code. The daemon reports 0 for it, and it is still
     // a stop.
@@ -8213,6 +8221,35 @@ async fn attach_ended_from_other_side_notice_exit254_before_the_record() {
         let mut daemon = alpha.server.connect().await;
         resume_for_attach_test(&mut daemon, &alpha.host).await;
     }
+
+    // A stop waits for a process that ignores SIGTERM until its grace
+    // period ends, so after a 254 the record can still read `running`
+    // more than 2 s after the channel closed. It is still a stop.
+    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
+    let attach = box_attach_on_hosts(
+        hosts.clone(),
+        Some("web"),
+        None,
+        true,
+        async move |_: &BoxAttachTarget| {
+            let _ = closed_tx.send(());
+            Ok(254)
+        },
+    );
+    let stop = async {
+        closed_rx.await.expect("the attach ran");
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        alpha.stop("web").await;
+    };
+    let (ending, ()) = tokio::join!(attach, stop);
+    assert_eq!(
+        ending.expect("the attach ends"),
+        AttachEnding {
+            code: 254,
+            notice: Some("Detached: web was stopped.".to_owned())
+        },
+        "a stop recorded after 2 s"
+    );
 }
 
 /// Starts the stopped box `web` on `host` again by its resume, so the
