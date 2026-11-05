@@ -819,6 +819,7 @@ impl TaskEntrypointBox {
             box_id,
             exec.env.into_iter().collect(),
             start_dir.clone(),
+            exec.drop_env.clone(),
         );
         let username = self
             .record

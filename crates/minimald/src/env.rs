@@ -2205,14 +2205,13 @@ impl BoxChannel {
             None
         };
 
-        // The caller's own values for the task's `inherit` variables. The
+        // The caller's own values for the task's `inherit` variables, after
+        // the names the client's `[vars] ignore` matched are gone. The
         // daemon's environment is not the caller's, so it never fills one.
         // A variable the caller does not set, or sets to a value that is not
         // valid UTF-8, refuses the run with the text the laptop's `min task
         // run` prints for both.
-        if relays
-            && let Err(name) =
-                inherit_from_caller(&mut task.vars, &request.env, &request.invalid_env)
+        if let Err(name) = run_task_vars(&mut task.vars, self.session_id.as_ref(), relays, &request)
         {
             let _ = writeln!(stream, "{}", inherit_refusal(task_name, &name));
             return relay_refusal_exit(stream, relays, task_name, EXIT_USAGE);
@@ -3143,6 +3142,28 @@ fn one_line(text: &str) -> std::borrow::Cow<'_, str> {
         }
     }
     out.into()
+}
+
+/// Settles an in-box run's task variables. First each name the client's
+/// `[vars] ignore` matched for box `box_id`'s entrypoint run goes (see
+/// [`crate::box_actor::entrypoint_env`]), so a dropped name never reaches
+/// the task, whatever the uploaded `minimal.toml` declares for it. Then a
+/// relaying helper's caller fills the `inherit` ones
+/// ([`inherit_from_caller`]).
+fn run_task_vars(
+    vars: &mut BTreeMap<String, EnvVarValue>,
+    box_id: Option<&boxes::SessionId>,
+    relays: bool,
+    request: &TaskRunRequest,
+) -> Result<(), String> {
+    if let Some(id) = box_id {
+        let drops = crate::box_actor::entrypoint_env::drops(id);
+        vars.retain(|name, _| !drops.contains(name));
+    }
+    if relays {
+        inherit_from_caller(vars, &request.env, &request.invalid_env)?;
+    }
+    Ok(())
 }
 
 /// Gives each `inherit` variable of a task the caller's value. The daemon's
@@ -4676,6 +4697,61 @@ exit $rc
         });
         drop((out, err));
         assert_eq!(read_all(rx), "msg:to stdout\nerr:to stderr\n");
+    }
+
+    /// T43: a name the client's `[vars] ignore` matched never reaches the
+    /// task on the entrypoint path. The run stages it, the launch takes it,
+    /// and the in-box run drops it before it fills `inherit` variables. That
+    /// holds for a name the uploaded `minimal.toml` gives a value, and for
+    /// an `inherit` one whose value the helper's caller still has.
+    #[test]
+    fn task_entrypoint_drops_ignored_vars() {
+        use crate::box_actor::entrypoint_env;
+
+        let id = boxes::SessionId::mint();
+        entrypoint_env::stage(
+            id,
+            vec![
+                ("KEPT".to_string(), "k".to_string()),
+                ("IGNORED_TOKEN".to_string(), "leak".to_string()),
+            ],
+            None,
+            BTreeSet::from(["IGNORED_TOKEN".to_string(), "IGNORED_FIXED".to_string()]),
+        );
+        // The launch: the dropped name is not among its variables.
+        let launch_vars = entrypoint_env::take(&id).expect("the run staged");
+        assert_eq!(launch_vars, vec![("KEPT".to_string(), "k".to_string())]);
+
+        // The in-box run, as the helper sends it with the caller's value.
+        let request = TaskRunRequest::parse(&format!(
+            "/workbench{RUN_GROUP_SEP}lint{RUN_GROUP_SEP}IGNORED_TOKEN=caller{RUN_ITEM_SEP}KEPT=k"
+        ));
+        let mut vars = BTreeMap::from([
+            ("IGNORED_TOKEN".to_string(), EnvVarValue::Inherit),
+            (
+                "IGNORED_FIXED".to_string(),
+                EnvVarValue::Value("from-toml".to_string()),
+            ),
+            ("KEPT".to_string(), EnvVarValue::Inherit),
+        ]);
+        assert_eq!(run_task_vars(&mut vars, Some(&id), true, &request), Ok(()));
+        assert_eq!(
+            vars,
+            BTreeMap::from([("KEPT".to_string(), EnvVarValue::Value("k".to_string()))]),
+            "only the kept variable reaches the task"
+        );
+
+        // A box no task run launched drops nothing.
+        let mut vars = BTreeMap::from([(
+            "IGNORED_FIXED".to_string(),
+            EnvVarValue::Value("v".to_string()),
+        )]);
+        let other = boxes::SessionId::mint();
+        assert_eq!(
+            run_task_vars(&mut vars, Some(&other), false, &request),
+            Ok(())
+        );
+        assert_eq!(vars.len(), 1);
     }
 
     /// BCLI-010 (T62): the request `min task run` sends carries the caller's
