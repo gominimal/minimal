@@ -89,7 +89,7 @@
 #                                    and disallowed connections, the in-force
 #                                    deny-all default and its note;
 #                                    a deny-all box's names outside the box
-#                                    zone are REFUSED fast at its relay, a
+#                                    zone are NXDOMAIN fast at its relay, a
 #                                    zone TXT is NODATA there, while
 #                                    host.min.internal resolves, and its
 #                                    TCP 53 is dropped (NET-141)
@@ -2364,7 +2364,7 @@ published_loopback_host() {
 # reaches in the same run, and not an external name, which fails fast at
 # resolution while host.min.internal still resolves. An explicit deny-all
 # declaration carries NET-141's deny-all case: its relay answers a name
-# outside the box zone REFUSED, fast, while host.min.internal still resolves,
+# outside the box zone NXDOMAIN, fast, while host.min.internal still resolves,
 # and its TCP to the resolver's port is dropped. NET-077's opt-out is not
 # driven here (it needs a daemon restarted with it); it stays with the unit
 # test deny_all_opt_out_keeps_prior_default.
@@ -2744,7 +2744,7 @@ proof_own_ip_egress_declared_and_enforced() {
 
     # ---- the disallowed NAME, its own assertion ----------------------------
     # example.org is outside `allow_dns_hosts`, so its connection must not
-    # complete. Its relay answers the name REFUSED (NET-141), so curl must
+    # complete. Its relay answers the name NXDOMAIN (NET-141), so curl must
     # fail at resolution, inside 5000 ms, before any connection is tried.
     name_deny_start_ms="$(now_ms)"
     mnl session exec "$declare_sid" \
@@ -2773,6 +2773,78 @@ proof_own_ip_egress_declared_and_enforced() {
     echo "allowed/disallowed-connection WARNING: the declared box could not complete its allowed connection to https://example.com; the connection assertions that need the public internet are skipped as weather warnings"
   fi
 
+  # One raw DNS query sent from inside box $1 to its resolver $2, carried in
+  # and out as base64 with socat (both launcher baseline packages), built and
+  # parsed host-side with python3 (an e2e prerequisite). Prints
+  # "rcode ancount soa" for a reply to the query's own id, or nothing. soa is
+  # "root:<minimum>" when the first authority record is an SOA owned by the
+  # root, else "-". NET-141's refusal is "3 0 root:15": NXDOMAIN that cites
+  # the root-owned SOA, whose 15 s minimum bounds the negative cache.
+  egress_dns_reply() { # $1 sid, $2 nameserver, $3 name, $4 qtype number
+    local q b64
+    q="$(python3 -c '
+import base64, struct, sys
+name, qtype = sys.argv[1], int(sys.argv[2])
+wire = b"".join(bytes([len(l)]) + l.encode() for l in name.split(".")) + b"\0"
+sys.stdout.write(base64.b64encode(
+    struct.pack("!HHHHHH", 0x4d31, 0x0100, 1, 0, 0, 0) + wire + struct.pack("!HH", qtype, 1)
+).decode())' "$3" "$4")"
+    b64="$(mnl session exec "$1" \
+      "printf %s '$q' | /usr/bin/base64 -d | /usr/bin/socat -t 2 - UDP:$2:53 | /usr/bin/base64 -w0" \
+      2>"$WORK/egress-dns-reply.err" | tr -d '\r\n')" || true
+    python3 -c '
+import base64, sys
+try:
+    r = base64.b64decode(sys.argv[1])
+except Exception:
+    sys.exit(0)
+if len(r) < 12 or r[0:2] != b"\x4d\x31" or not r[2] & 0x80:
+    sys.exit(0)
+rcode, an, ns = r[3] & 0x0f, int.from_bytes(r[6:8], "big"), int.from_bytes(r[8:10], "big")
+def skip_name(i):
+    while i < len(r):
+        if r[i] == 0:
+            return i + 1
+        if r[i] & 0xc0 == 0xc0:
+            return i + 2
+        i += 1 + r[i]
+    return len(r)
+i = 12
+for _ in range(int.from_bytes(r[4:6], "big")):
+    i = skip_name(i) + 4
+for _ in range(an):
+    i = skip_name(i)
+    i += 10 + int.from_bytes(r[i + 8:i + 10], "big")
+soa = "-"
+if ns and i + 11 <= len(r) and r[i] == 0:
+    rdlen = int.from_bytes(r[i + 9:i + 11], "big")
+    rdata = r[i + 11:i + 11 + rdlen]
+    if int.from_bytes(r[i + 1:i + 3], "big") == 6 and len(rdata) >= 4:
+        soa = "root:%d" % int.from_bytes(rdata[-4:], "big")
+print(rcode, an, soa)' "$b64"
+  }
+
+  # ---- NET-141's partial-allow-list case, on the wire: example.org is off
+  # the declared box's list, so its relay answers NXDOMAIN (rcode 3) and
+  # cites the root-owned SOA. It is not REFUSED (rcode 5), which glibc reads
+  # as a temporary failure that clients retry. The relay makes this answer
+  # itself, so the leg needs no public internet.
+  pl_ns="$(mnl session exec "$declare_sid" 'cat /etc/resolv.conf' \
+    2>"$WORK/egress-declared-resolv.err" | tr -d '\r' \
+    | awk '$1 == "nameserver" { print $2; exit }')" || true
+  if [ -z "$pl_ns" ]; then
+    echo "::error::NET-141: the partial-allow-list box's /etc/resolv.conf names no nameserver"
+    cat "$WORK/egress-declared-resolv.err" 2>/dev/null || true
+    fail
+  fi
+  pl_reply="$(egress_dns_reply "$declare_sid" "$pl_ns" example.org 1)"
+  echo "NET-141: A example.org from the partial-allow-list box -> rcode/answers/soa ${pl_reply:-<no reply>}"
+  if [ "${pl_reply%% *}" != 3 ] || [ "${pl_reply##* }" != root:15 ]; then
+    echo "::error::NET-141: the partial-allow-list box's A lookup of example.org, a name off its allow list, was not answered NXDOMAIN (rcode 3) citing the root SOA with a 15 s minimum by its relay (got '${pl_reply:-no reply}')"
+    cat "$WORK/egress-dns-reply.err" 2>/dev/null || true
+    fail
+  fi
+
   # ---- a declared deny-all box: `--deny-all-egress`, every allow list
   # present and empty — the very section the in-force default materializes
   # for the bare box above (NET-074), here declared, so the box carries it
@@ -2789,7 +2861,7 @@ proof_own_ip_egress_declared_and_enforced() {
   deny_all_sid="$(printf '%s\n' "$deny_all_sid" | tail -n1 | tr -d '\r')"
 
   # ---- NET-141's deny-all case: the relay's DNS gate answers a deny-all
-  # box's lookup of any name outside the box zone REFUSED itself, whatever
+  # box's lookup of any name outside the box zone NXDOMAIN itself, whatever
   # the record type, and forwards nothing; zone names pass; and DNS over TCP
   # to the resolver is dropped, because the resolver carve-out is UDP alone.
   # None of it needs the public internet: the refusal is the relay's own
@@ -2808,39 +2880,19 @@ proof_own_ip_egress_declared_and_enforced() {
   fi
   echo "NET-141: the deny-all box's resolver is $da_ns"
 
-  # The rcode itself, read off the wire: a raw query sent from inside the box
-  # with socat, carried in and out as base64 (both launcher baseline
-  # packages), built and parsed host-side with python3 (an e2e prerequisite).
-  # A REFUSED answer to the query's own id is the relay's: NXDOMAIN, an
-  # answer, or silence would each be something else.
-  da_dns_rcode() { # $1 name, $2 qtype number -> prints "rcode ancount", or nothing
-    local q b64
-    q="$(python3 -c '
-import base64, struct, sys
-name, qtype = sys.argv[1], int(sys.argv[2])
-wire = b"".join(bytes([len(l)]) + l.encode() for l in name.split(".")) + b"\0"
-sys.stdout.write(base64.b64encode(
-    struct.pack("!HHHHHH", 0x4d31, 0x0100, 1, 0, 0, 0) + wire + struct.pack("!HH", qtype, 1)
-).decode())' "$1" "$2")"
-    b64="$(mnl session exec "$deny_all_sid" \
-      "printf %s '$q' | /usr/bin/base64 -d | /usr/bin/socat -t 2 - UDP:$da_ns:53 | /usr/bin/base64 -w0" \
-      2>"$WORK/egress-deny-all-rcode.err" | tr -d '\r\n')" || true
-    python3 -c '
-import base64, sys
-try:
-    r = base64.b64decode(sys.argv[1])
-except Exception:
-    sys.exit(0)
-if len(r) >= 8 and r[0:2] == b"\x4d\x31" and r[2] & 0x80:
-    print(r[3] & 0x0f, int.from_bytes(r[6:8], "big"))' "$b64"
+  # The rcode itself, read off the wire with egress_dns_reply above. An
+  # NXDOMAIN to the query's own id that cites the root-owned SOA is the
+  # relay's: REFUSED, an answer, or silence would each be something else.
+  da_dns_rcode() { # $1 name, $2 qtype number -> prints "rcode ancount soa", or nothing
+    egress_dns_reply "$deny_all_sid" "$da_ns" "$1" "$2"
   }
   for da_q in A:1 AAAA:28 TXT:16; do
-    da_rcode="$(da_dns_rcode example.com "${da_q#*:}")"
-    da_rcode="${da_rcode%% *}"
-    echo "NET-141: ${da_q%%:*} example.com from the deny-all box -> rcode ${da_rcode:-<no reply>}"
-    if [ "$da_rcode" != 5 ]; then
-      echo "::error::NET-141: the deny-all box's ${da_q%%:*} lookup of example.com, a name outside the box zone, was not answered REFUSED (rcode 5) by its relay (got '${da_rcode:-no reply}')"
-      cat "$WORK/egress-deny-all-rcode.err" 2>/dev/null || true
+    da_reply="$(da_dns_rcode example.com "${da_q#*:}")"
+    da_rcode="${da_reply%% *}"
+    echo "NET-141: ${da_q%%:*} example.com from the deny-all box -> rcode/answers/soa ${da_reply:-<no reply>}"
+    if [ "$da_rcode" != 3 ] || [ "${da_reply##* }" != root:15 ]; then
+      echo "::error::NET-141: the deny-all box's ${da_q%%:*} lookup of example.com, a name outside the box zone, was not answered NXDOMAIN (rcode 3) citing the root SOA with a 15 s minimum by its relay (got '${da_reply:-no reply}')"
+      cat "$WORK/egress-dns-reply.err" 2>/dev/null || true
       fail
     fi
   done
@@ -2852,9 +2904,9 @@ if len(r) >= 8 and r[0:2] == b"\x4d\x31" and r[2] & 0x80:
   da_nonce="e2e$(date +%s)$$"
   da_zone_reply="$(da_dns_rcode "$da_nonce.min.internal" 16)"
   echo "NET-141: TXT $da_nonce.min.internal from the deny-all box -> rcode/answers ${da_zone_reply:-<no reply>}"
-  if [ "$da_zone_reply" != "0 0" ]; then
+  if [ "${da_zone_reply% *}" != "0 0" ]; then
     echo "::error::NET-141: the deny-all box's TXT lookup of $da_nonce.min.internal, a zone name, was not answered NODATA (rcode 0, no answers) by its relay (got '${da_zone_reply:-no reply}')"
-    cat "$WORK/egress-deny-all-rcode.err" 2>/dev/null || true
+    cat "$WORK/egress-dns-reply.err" 2>/dev/null || true
     fail
   fi
 
@@ -2904,7 +2956,7 @@ if len(r) >= 8 and r[0:2] == b"\x4d\x31" and r[2] & 0x80:
     cat "$WORK/egress-deny-all-tcp53.err" 2>/dev/null || true
     fail
   fi
-  echo "NET-141 OK: the deny-all box's names outside the zone are REFUSED at its relay, a zone TXT is NODATA, host.min.internal resolves, and its TCP 53 is dropped"
+  echo "NET-141 OK: the deny-all box's names outside the zone are NXDOMAIN at its relay, a zone TXT is NODATA, host.min.internal resolves, and its TCP 53 is dropped"
 
   # "A box with no effective reach reaches nothing" only means something if
   # the lane can already reach the public internet — otherwise the
@@ -2932,7 +2984,7 @@ if len(r) >= 8 and r[0:2] == b"\x4d\x31" and r[2] & 0x80:
     fi
     # One outcome is legitimate for this box: the lookup is refused before any
     # connection is tried. Its relay answers every name outside the box zone
-    # REFUSED (NET-141, asserted on the wire above), so curl must fail at
+    # NXDOMAIN (NET-141, asserted on the wire above), so curl must fail at
     # resolution, fast. A SYN that left — reset, answered, or silently
     # dropped — would mean the name resolved, which the refusal rules out.
     deny_all_outcome="not a resolver refusal"
