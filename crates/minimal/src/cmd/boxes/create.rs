@@ -4347,11 +4347,15 @@ mod activation_step_tests {
     use tracing_subscriber::layer::SubscriberExt as _;
 
     /// What the capture layer saw: each `activation_step` span's step, in
-    /// creation order, and each failure record's step and error.
+    /// creation order, each failure record's step and error, and the step
+    /// of each span that recorded an ERROR status.
     #[derive(Default)]
     struct Seen {
         spans: Vec<String>,
         failures: Vec<(String, String)>,
+        errored: Vec<String>,
+        /// The step of each open `activation_step` span, by span id.
+        by_id: std::collections::HashMap<u64, String>,
     }
 
     #[derive(Default)]
@@ -4359,6 +4363,7 @@ mod activation_step_tests {
         step: Option<String>,
         error: Option<String>,
         message: Option<String>,
+        status: Option<String>,
     }
 
     impl tracing::field::Visit for Fields {
@@ -4367,6 +4372,7 @@ mod activation_step_tests {
                 "step" => self.step = Some(value.to_owned()),
                 "error" => self.error = Some(value.to_owned()),
                 "message" => self.message = Some(value.to_owned()),
+                "otel.status_code" => self.status = Some(value.to_owned()),
                 _ => {}
             }
         }
@@ -4382,17 +4388,32 @@ mod activation_step_tests {
         fn on_new_span(
             &self,
             attrs: &tracing::span::Attributes<'_>,
-            _id: &tracing::span::Id,
+            id: &tracing::span::Id,
             _ctx: tracing_subscriber::layer::Context<'_, S>,
         ) {
             if attrs.metadata().name() == "activation_step" {
                 let mut fields = Fields::default();
                 attrs.record(&mut fields);
-                self.0
-                    .lock()
-                    .unwrap()
-                    .spans
-                    .push(fields.step.unwrap_or_default());
+                let step = fields.step.unwrap_or_default();
+                let mut seen = self.0.lock().unwrap();
+                seen.by_id.insert(id.into_u64(), step.clone());
+                seen.spans.push(step);
+            }
+        }
+
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = Fields::default();
+            values.record(&mut fields);
+            let mut seen = self.0.lock().unwrap();
+            if fields.status.as_deref() == Some("ERROR")
+                && let Some(step) = seen.by_id.get(&id.into_u64()).cloned()
+            {
+                seen.errored.push(step);
             }
         }
 
@@ -4499,6 +4520,8 @@ mod activation_step_tests {
                 "Failed to upload project files".to_owned()
             )]
         );
+        // Only the failing step's span carries the ERROR status.
+        assert_eq!(seen.errored, ["upload_files"]);
     }
 
     #[derive(clap::Parser)]
@@ -4534,5 +4557,6 @@ mod activation_step_tests {
             "failure record: {:?}",
             seen.failures[0].1
         );
+        assert_eq!(seen.errored, ["check_arguments"]);
     }
 }
