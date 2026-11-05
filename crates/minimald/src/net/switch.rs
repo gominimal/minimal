@@ -1027,7 +1027,7 @@ where
             if let Some(Err(target_name)) = &by_name {
                 if let Some(SocketAddr::V4(destination)) = drop_remote(&summary) {
                     let transport = drop_transport(&reason);
-                    if gate.warn_box_name(destination, transport, target_name.as_deref()) {
+                    if gate.warn_box_name(destination, transport, target_name) {
                         crate::net::listeners::report_refused_egress(
                             reject.lease,
                             Some(destination),
@@ -1189,11 +1189,6 @@ pub(crate) const HOST_MIN_INTERNAL: &str = zone_answer::HOST_ROW_NAME;
 /// not match from a box that named no box at all.
 pub(crate) const BOX_NAME_RULE: &str = "box-name";
 
-/// How many box-zone answers one box's gate keeps. Past it, a new answer
-/// is not recorded until a dead target's entry is swept, so a box that
-/// resolves many names cannot grow the daemon's memory.
-const ZONE_ANSWERS_PER_BOX: usize = 256;
-
 /// A zone name in the form the gate compares it in: ASCII lower-case, with
 /// no trailing dot.
 fn normalized_zone_name(name: &str) -> String {
@@ -1206,6 +1201,12 @@ fn is_box_zone_name(name: &str) -> bool {
     name != super::dns::HOSTNAME_SUFFIX
         && name != HOST_MIN_INTERNAL
         && super::dns::is_zone_name(name)
+}
+
+/// The zone name a box named `name` holds: `<name>.min.internal`,
+/// normalized (NET-163).
+fn box_zone_name(name: &str) -> String {
+    normalized_zone_name(&format!("{name}.{}", super::dns::HOSTNAME_SUFFIX))
 }
 
 /// The box-zone names `egress.allow_dns_hosts` lists, normalized (NET-163).
@@ -1221,15 +1222,6 @@ fn named_boxes(policy: &boxes::BoxPolicy) -> Vec<String> {
         .map(|host| normalized_zone_name(host))
         .filter(|host| is_box_zone_name(host))
         .collect()
-}
-
-/// One box-zone answer a box's own lookup received: the name it asked for
-/// and the gate of the box that held the answer's address then. A later
-/// holder of the address has another gate, so the entry never covers it.
-#[derive(Debug)]
-struct ZoneAnswer {
-    name: String,
-    gate: Weak<BoxGate>,
 }
 
 /// The limiter key the deprecation notice logs under: its own rule, so a
@@ -1681,12 +1673,11 @@ pub struct BoxGate {
     /// The box-zone names the box's `egress.allow_dns_hosts` lists
     /// (NET-163). Empty for a box that names no other box.
     box_names: Vec<String>,
-    /// The box-zone answers the box's own lookups received, keyed by the
-    /// answer's address. Recorded only for a box with [`Self::box_names`]:
-    /// a flow to an address whose answer was a listed name is admitted
-    /// under the target's ingress, and the refusal of any other flow to a
-    /// box names the target by the name the box asked for.
-    zone_answers: Mutex<HashMap<Ipv4Addr, ZoneAnswer>>,
+    /// The box's own zone name, `<name>.min.internal` in ASCII lower-case
+    /// (NET-163). Another box's [`Self::box_names`] entry is matched
+    /// against it, so the name rule reads the name the target holds and
+    /// not the source's lookups. `None` for a gate built with no name.
+    zone_name: Option<String>,
 }
 
 /// What the gate holds for one flow to a host exposure.
@@ -1953,6 +1944,7 @@ impl BoxGate {
         // that stays down, so a steered name fails closed (BEP-062).
         Self::for_session_steered(
             label,
+            None,
             lease,
             policy,
             subnet,
@@ -1966,9 +1958,14 @@ impl BoxGate {
     /// or `both`, its DNS gate answers the credential module's names itself
     /// (BEP-062, BEP-078): the proxy's address on this switch while
     /// `listener` reads live, and SERVFAIL while it reads down.
+    ///
+    /// `box_name` is the box's own name. Another box whose
+    /// `allow_dns_hosts` lists `<box_name>.min.internal` reaches this box's
+    /// lease by it (NET-163).
     #[must_use]
     pub(crate) fn for_session_steered(
         label: String,
+        box_name: Option<&str>,
         lease: Ipv4Addr,
         policy: &boxes::BoxPolicy,
         subnet: SwitchSubnet,
@@ -2074,79 +2071,8 @@ impl BoxGate {
             host_protocols: declared_protocols(policy),
             host_flows: Mutex::new(HashMap::new()),
             box_names: named_boxes(policy),
-            zone_answers: Mutex::new(HashMap::new()),
+            zone_name: box_name.map(box_zone_name),
         }
-    }
-
-    /// Records the box-zone answer in a reply from this box's resolver, for
-    /// a box that names boxes in `allow_dns_hosts` (NET-163). Each A answer
-    /// that is another live box's lease is kept with that box's gate, and
-    /// the name's earlier answers are dropped, so the newest answer wins.
-    /// A reply that is not the resolver's, not a response, or not a box
-    /// name's records nothing. The reply itself always passes to the box.
-    fn observe_zone_answer(&self, src: &SocketAddrV4, payload: &[u8]) {
-        if self.box_names.is_empty()
-            || src.ip().octets() != self.egress.resolver()
-            || src.port() != 53
-        {
-            return;
-        }
-        let Ok(message) = hickory_proto::op::Message::from_vec(payload) else {
-            return;
-        };
-        if message.metadata.message_type != hickory_proto::op::MessageType::Response {
-            return;
-        }
-        let Some(question) = message.queries.first() else {
-            return;
-        };
-        let asked = normalized_zone_name(&question.name().to_string());
-        if !is_box_zone_name(&asked) {
-            return;
-        }
-        // The targets are read before the table is locked, so this lock is
-        // never held across the live-gate table's.
-        let targets: Vec<(Ipv4Addr, Arc<BoxGate>)> = message
-            .answers
-            .iter()
-            .filter_map(|record| match &record.data {
-                hickory_proto::rr::RData::A(address) => Some(address.0),
-                _ => None,
-            })
-            .filter_map(|address| live_gate(address).map(|gate| (address, gate)))
-            .filter(|(_, gate)| !std::ptr::eq(Arc::as_ptr(gate), self))
-            .collect();
-        let mut answers = self
-            .zone_answers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        answers.retain(|_, answer| answer.name != asked && answer.gate.strong_count() > 0);
-        for (address, gate) in targets {
-            if answers.len() >= ZONE_ANSWERS_PER_BOX {
-                break;
-            }
-            answers.insert(
-                address,
-                ZoneAnswer {
-                    name: asked.clone(),
-                    gate: Arc::downgrade(&gate),
-                },
-            );
-        }
-    }
-
-    /// The box-zone name this box's own lookup received `dst` for, while
-    /// the box that held the address then still holds it. `None` for an
-    /// address no answer named, and for an address another box holds now.
-    fn zone_name_at(&self, dst: Ipv4Addr) -> Option<String> {
-        let target = live_gate(dst)?;
-        let answers = self
-            .zone_answers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let answer = answers.get(&dst)?;
-        let held = answer.gate.upgrade()?;
-        Arc::ptr_eq(&held, &target).then(|| answer.name.clone())
     }
 
     /// How the box's name rules decide a flow to `dst` that its declared
@@ -2155,9 +2081,10 @@ impl BoxGate {
     /// decide alone. `Some(Ok(()))` admits the flow, because the box's
     /// `allow_dns_hosts` names the box at `dst`. The target's ingress
     /// still decides it at the target's relay. `Some(Err(name))` refuses
-    /// it under [`BOX_NAME_RULE`], with the name the box resolved the
-    /// target by when it did.
-    fn box_name_verdict(&self, dst: Ipv4Addr) -> Option<Result<(), Option<String>>> {
+    /// it under [`BOX_NAME_RULE`], with the zone name the target holds.
+    /// The rule reads the target's own name, so it needs no lookup, and it
+    /// still holds after the target's relay starts again under that name.
+    fn box_name_verdict(&self, dst: Ipv4Addr) -> Option<Result<(), String>> {
         if self.box_names.is_empty() {
             return None;
         }
@@ -2165,23 +2092,30 @@ impl BoxGate {
         if std::ptr::eq(Arc::as_ptr(&target), self) {
             return None;
         }
-        let name = self.zone_name_at(dst);
-        match name {
-            Some(name) if self.box_names.contains(&name) => Some(Ok(())),
-            name => Some(Err(name)),
+        self.names_box(&target)
+    }
+
+    /// The name rule's verdict on `target` for a box that names boxes:
+    /// `Some(Ok(()))` when [`Self::box_names`] lists the zone name the
+    /// target holds, `Some(Err(name))` otherwise, and `None` for a box that
+    /// names no box. A target gate built with no name is named by its
+    /// label, the name its own log lines carry.
+    fn names_box(&self, target: &BoxGate) -> Option<Result<(), String>> {
+        if self.box_names.is_empty() {
+            return None;
+        }
+        match &target.zone_name {
+            Some(name) if self.box_names.contains(name) => Some(Ok(())),
+            Some(name) => Some(Err(name.clone())),
+            None => Some(Err(target.label.clone())),
         }
     }
 
     /// Says one refusal under [`BOX_NAME_RULE`] (NET-163), rate-limited
     /// through the box's own limiter: the source box, the target's address
-    /// and the name the box resolved it by. Returns whether a line was
+    /// and the zone name the target holds. Returns whether a line was
     /// written.
-    fn warn_box_name(
-        &self,
-        destination: SocketAddrV4,
-        proto: Proto,
-        target_name: Option<&str>,
-    ) -> bool {
+    fn warn_box_name(&self, destination: SocketAddrV4, proto: Proto, target_name: &str) -> bool {
         if !self
             .limiter
             .should_warn_at(&self.label, BOX_NAME_RULE, Instant::now())
@@ -2194,7 +2128,7 @@ impl BoxGate {
             remote_addr = %destination,
             %proto,
             dst_port = destination.port(),
-            target = target_name.unwrap_or("none"),
+            target = target_name,
             rule_matched = BOX_NAME_RULE,
             "network policy violation"
         );
@@ -2875,8 +2809,8 @@ impl BoxGate {
     /// `allow_subnets` and `deny_subnets` — and the box names its
     /// `allow_dns_hosts` lists (NET-163), and nothing else: no pin lifts
     /// it, so a sibling is reached by a CIDR entry or by its own exact
-    /// box-zone name, read off the box-zone answer the source's own lookup
-    /// received ([`BoxGate::box_name_verdict`]), never by another name-scoped
+    /// box-zone name, matched against the name the target holds
+    /// ([`BoxGate::box_name_verdict`]), never by another name-scoped
     /// grant. The DNS gate's pin (NET-066) is the source's *own*
     /// relay's lift of its own undeclared-destination drop, and a box-zone
     /// answer creates no pin at all — NET-072's carve-out is the
@@ -2958,7 +2892,7 @@ impl BoxGate {
             return false;
         }
         if let Some(Err(target_name)) = &by_name {
-            peer.warn_box_name(pkt.dst, Proto::Tcp, target_name.as_deref());
+            peer.warn_box_name(pkt.dst, Proto::Tcp, target_name);
             return true;
         }
         let reason = refusal.expect("refusal known when the source half fails");
@@ -3767,11 +3701,33 @@ pub fn proxied_request_verdict(
     if let Some(caller) = caller
         && let FrameVerdict::Drop(reason) = direct_connection_verdict(caller.egress(), target, port)
     {
-        return ProxiedRequest::Refused(Refusal {
-            rule: reason.rule(),
-            direction: Direction::Egress,
-            other: Some(SocketAddr::V4(SocketAddrV4::new(target, port))),
-        });
+        // NET-163: the caller's half passes by name as its relay passes a
+        // direct flow. A caller whose `allow_dns_hosts` lists the target's
+        // zone name passes, and the target's ingress decides below. A caller
+        // that names boxes but not this one is refused under the name rule.
+        let by_name = match reason {
+            DropReason::UndeclaredSubnet { .. } => live_gate(caller.lease())
+                .filter(|gate| !gate.box_names.is_empty())
+                .map(|gate| gate.box_names.contains(&box_zone_name(route.session()))),
+            _ => None,
+        };
+        match by_name {
+            Some(true) => {}
+            Some(false) => {
+                return ProxiedRequest::Refused(Refusal {
+                    rule: BOX_NAME_RULE,
+                    direction: Direction::Egress,
+                    other: Some(SocketAddr::V4(SocketAddrV4::new(target, port))),
+                });
+            }
+            None => {
+                return ProxiedRequest::Refused(Refusal {
+                    rule: reason.rule(),
+                    direction: Direction::Egress,
+                    other: Some(SocketAddr::V4(SocketAddrV4::new(target, port))),
+                });
+            }
+        }
     }
     match route.upstream(port) {
         Some(upstream) => ProxiedRequest::Forward(upstream),
@@ -4418,9 +4374,6 @@ where
             && let Some((pkt, payload)) = udp_datagram(&frame[..n])
         {
             gate.dns.observe_response(&pkt.src, payload, Instant::now());
-            // NET-163: a box-zone answer to a box that names boxes is kept,
-            // so its flows to a listed box's lease are admitted.
-            gate.observe_zone_answer(&pkt.src, payload);
         }
         // NET-040's answer half: the frame above has passed the ingress
         // gate, so the port it is headed to is one the box's declaration
@@ -5115,6 +5068,17 @@ pub(crate) mod tests {
         policy: Option<&boxes::BoxPolicy>,
         configure: impl FnOnce(&mut BoxGate),
     ) -> RelayHarness {
+        spawn_named_relay_for(lease, None, policy, configure)
+    }
+
+    /// [`spawn_relay_for`] for a box named `name`, the name its gate
+    /// carries as `<name>.min.internal` (NET-163).
+    fn spawn_named_relay_for(
+        lease: Ipv4Addr,
+        name: Option<&str>,
+        policy: Option<&boxes::BoxPolicy>,
+        configure: impl FnOnce(&mut BoxGate),
+    ) -> RelayHarness {
         let mut fds = [0 as libc::c_int; 2];
         // SAFETY: `socketpair` with a valid domain/type either returns -1
         // (checked) or fills `fds` with two fresh descriptors.
@@ -5129,12 +5093,14 @@ pub(crate) mod tests {
         let (sock_rx, sock_tx) = tokio::io::split(relay_side);
         let gate = policy
             .map(|policy| {
-                BoxGate::for_session(
+                BoxGate::for_session_steered(
                     lease.to_string(),
+                    name,
                     lease,
                     policy,
                     SwitchSubnet::default(),
                     None,
+                    crate::net::dns::ProxyListenerState::down(),
                 )
             })
             .map(|mut gate| {
@@ -8001,99 +7967,50 @@ pub(crate) mod tests {
         }
     }
 
-    /// Delivers the resolver's A answer for `name` to the box behind
-    /// `harness`, the way its own lookup receives it, and waits until the
-    /// box has read it.
-    async fn resolve_zone_name(
-        harness: &mut RelayHarness,
-        box_addr: Ipv4Addr,
-        name: &str,
-        answer: Ipv4Addr,
-    ) {
-        use crate::net::dns_gate::tests::{
-            RESOLVER, dns_query, dns_response, read_box_frame, udp_payload_frame, wire_frame,
-        };
-        use hickory_proto::rr::RecordType;
-        // The query goes out first, so the reply matches a flow the box
-        // opened, as a real lookup's does.
-        let query = udp_payload_frame(
-            box_addr,
-            40053,
-            RESOLVER,
-            53,
-            &dns_query(name, RecordType::A),
-        );
-        harness.box_end.write_all(&query).unwrap();
-        let forwarded =
-            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
-                .await
-                .expect("the query is forwarded")
-                .expect("the switch side stays open");
-        assert_eq!(
-            forwarded, query,
-            "a zone name needs no allowlist entry to resolve"
-        );
-        let response = udp_payload_frame(
-            RESOLVER,
-            53,
-            box_addr,
-            40053,
-            &dns_response(name, &[answer]),
-        );
-        harness
-            .switch
-            .write_all(&wire_frame(&response))
+    /// Sends a bare SYN from the box behind `source` and returns the frame
+    /// its own leg forwards to the switch, or the sentinel when the leg
+    /// refuses the SYN.
+    async fn source_leg_out(source: &mut RelayHarness, syn: &[u8], sentinel: &[u8]) -> Vec<u8> {
+        source.box_end.write_all(syn).unwrap();
+        source.box_end.write_all(sentinel).unwrap();
+        let out = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut source.switch))
             .await
-            .unwrap();
-        let passed = read_box_frame(harness)
-            .await
-            .expect("the reply passes to the box");
-        assert_eq!(passed, response, "resolution is honest");
+            .expect("the relay keeps deciding")
+            .expect("the switch side stays open");
+        if out != sentinel {
+            // Drain the sentinel behind a forwarded SYN.
+            let _ =
+                tokio::time::timeout(Duration::from_secs(5), read_framed(&mut source.switch)).await;
+        }
+        out
     }
 
     /// NET-163 on a native host: an own-address box whose `allow_dns_hosts`
     /// names another box's zone name reaches that box's lease, where its
-    /// own subnets name nothing. Its own leg forwards the SYN, and the
-    /// target's relay admits it at the port the target publishes. The
-    /// target's ingress still decides: a port it does not publish is
-    /// refused.
+    /// own subnets name nothing. The rule reads the name the target holds,
+    /// so the first SYN, sent before any lookup, is forwarded. The target's
+    /// relay admits it at the port the target publishes, and its ingress
+    /// still refuses a port it does not publish. The target's relay that
+    /// starts again under the same name is still reached with no lookup.
     #[tokio::test]
     async fn zone_name_in_allow_dns_hosts_admits_the_named_box() {
         use crate::net::dns_gate::tests::{read_box_frame, wire_frame};
         const SOURCE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 40);
         const TARGET: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 41);
-        let mut source = spawn_relay_for(
+        let mut source = spawn_named_relay_for(
             SOURCE,
+            Some("box-a"),
             Some(&zone_named_egress(&["Box-B.min.internal."], Vec::new())),
             |_| {},
         );
-        let mut target = spawn_relay_for(TARGET, Some(&zone_target_policy()), |_| {});
+        let mut target =
+            spawn_named_relay_for(TARGET, Some("Box-B"), Some(&zone_target_policy()), |_| {});
         let sentinel = arp_frame(SOURCE);
 
-        // Before the box resolves the name, nothing tells the gate whose
-        // lease the address is, so the flow is refused.
-        let early = egress_tcp_segment(SOURCE, 40000, TARGET, ZONE_TARGET_PORT, SYN);
-        source.box_end.write_all(&early).unwrap();
-        source.box_end.write_all(&sentinel).unwrap();
-        let out = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut source.switch))
-            .await
-            .expect("the relay keeps deciding")
-            .expect("the switch side stays open");
-        assert_eq!(
-            out, sentinel,
-            "an address no answer named is not the named box"
-        );
-
-        resolve_zone_name(&mut source, SOURCE, "box-b.min.internal.", TARGET).await;
-
-        // The source's own leg forwards the SYN by the name.
+        // The source's own leg forwards the first SYN by the name, with no
+        // lookup before it.
         let syn = egress_tcp_segment(SOURCE, 40001, TARGET, ZONE_TARGET_PORT, SYN);
-        source.box_end.write_all(&syn).unwrap();
-        let forwarded =
-            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut source.switch))
-                .await
-                .expect("the source's own leg forwards the SYN")
-                .expect("the switch side stays open");
+        let forwarded = source_leg_out(&mut source, &syn, &sentinel).await;
         assert_eq!(
             forwarded, syn,
             "the listed name carries the flow out of the source box"
@@ -8109,12 +8026,7 @@ pub(crate) mod tests {
 
         // A port the target does not publish is refused by its ingress.
         let unpublished = egress_tcp_segment(SOURCE, 40002, TARGET, 9999, SYN);
-        source.box_end.write_all(&unpublished).unwrap();
-        let forwarded =
-            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut source.switch))
-                .await
-                .expect("the source's own leg forwards the SYN")
-                .expect("the switch side stays open");
+        let forwarded = source_leg_out(&mut source, &unpublished, &sentinel).await;
         assert_eq!(
             forwarded, unpublished,
             "the name admits the source's half at any port"
@@ -8136,11 +8048,107 @@ pub(crate) mod tests {
             next, sentinel,
             "the target's ingress still refuses an unpublished port"
         );
+
+        // The target's relay starts again under the same name. The source
+        // still reaches it, with no lookup in between.
+        drop(target);
+        let target =
+            spawn_named_relay_for(TARGET, Some("box-b"), Some(&zone_target_policy()), |_| {});
+        let again = egress_tcp_segment(SOURCE, 40003, TARGET, ZONE_TARGET_PORT, SYN);
+        let forwarded = source_leg_out(&mut source, &again, &sentinel).await;
+        assert_eq!(
+            forwarded, again,
+            "the name still admits the box after its relay starts again"
+        );
+        let mut target = target;
+        target.switch.write_all(&wire_frame(&again)).await.unwrap();
+        let reached = read_box_frame(&target)
+            .await
+            .expect("the SYN reaches the restarted box");
+        assert_eq!(reached, again, "the restarted box is reached by its name");
+    }
+
+    /// NET-163 through the hostname proxy: the caller's half of a proxied
+    /// request follows the name rule the caller's relay applies to a direct
+    /// connection. A caller whose `allow_dns_hosts` names `box-n` reaches
+    /// `box-n` under its ingress, and is refused under `box-name` at
+    /// `box-n-2`, a parallel instance the list does not name.
+    #[tokio::test]
+    async fn proxied_request_admits_a_box_named_in_allow_dns_hosts() {
+        const CALLER: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 45);
+        const NAMED: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 46);
+        const INSTANCE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 47);
+        let caller_policy = zone_named_egress(&["box-n.min.internal"], Vec::new());
+        let caller_relay =
+            spawn_named_relay_for(CALLER, Some("box-p"), Some(&caller_policy), |_| {});
+        let _named =
+            spawn_named_relay_for(NAMED, Some("box-n"), Some(&zone_target_policy()), |_| {});
+        let _instance = spawn_named_relay_for(
+            INSTANCE,
+            Some("box-n-2"),
+            Some(&zone_target_policy()),
+            |_| {},
+        );
+
+        let id = boxes::SessionId::parse_str("00000000-0000-0000-0000-000000000163").unwrap();
+        let mut registry = crate::net::dns::HostnameRegistry::new("dev", true);
+        registry.register_caller(id, "box-p", &caller_policy, SwitchSubnet::default(), None);
+        registry.report_own_address(id, "box-p", CALLER, std::collections::BTreeMap::new());
+        let caller = registry
+            .caller_at(CALLER)
+            .expect("the caller holds its lease");
+        let ports = std::collections::BTreeMap::from([(ZONE_TARGET_PORT, ZONE_TARGET_PORT)]);
+        let gate = caller_relay
+            .gate
+            .as_ref()
+            .expect("the caller's relay is gated");
+
+        // The named box: the relay admits the direct flow by the name, and
+        // the proxy forwards the request to the target's published port.
+        assert!(matches!(
+            direct_connection_verdict(caller.egress(), NAMED, ZONE_TARGET_PORT),
+            FrameVerdict::Drop(DropReason::UndeclaredSubnet { .. })
+        ));
+        assert_eq!(gate.box_name_verdict(NAMED), Some(Ok(())));
+        let named = crate::net::dns::Route::lease("box-n", NAMED, ports.clone());
+        assert_eq!(
+            proxied_request_verdict(Some(&caller), &named, ZONE_TARGET_PORT),
+            ProxiedRequest::Forward(SocketAddr::new(NAMED.into(), ZONE_TARGET_PORT)),
+            "the proxy admits the named box as the relay does"
+        );
+        // The target's ingress still decides a port it does not publish.
+        assert!(matches!(
+            proxied_request_verdict(Some(&caller), &named, 9999),
+            ProxiedRequest::Refused(Refusal {
+                rule: NO_INGRESS_MAPPING_RULE,
+                ..
+            })
+        ));
+
+        // The parallel instance: the relay refuses the direct flow under the
+        // name rule, and the proxy refuses the request under the same rule.
+        assert_eq!(
+            gate.box_name_verdict(INSTANCE),
+            Some(Err("box-n-2.min.internal".to_string()))
+        );
+        let instance = crate::net::dns::Route::lease("box-n-2", INSTANCE, ports);
+        assert_eq!(
+            proxied_request_verdict(Some(&caller), &instance, ZONE_TARGET_PORT),
+            ProxiedRequest::Refused(Refusal {
+                rule: BOX_NAME_RULE,
+                direction: Direction::Egress,
+                other: Some(SocketAddr::V4(SocketAddrV4::new(
+                    INSTANCE,
+                    ZONE_TARGET_PORT
+                ))),
+            }),
+            "the proxy refuses the parallel instance as the relay does"
+        );
     }
 
     /// NET-163's parallel-instance case on a native host: a box that names
     /// `box-c` does not reach `box-c-2`, a parallel instance the list does
-    /// not name, even after it resolves the instance's name. Its own leg
+    /// not name. Its own leg
     /// and the instance's relay both refuse the flow, and the line names
     /// the rule `box-name` and the instance. A box whose `allow_subnets`
     /// covers the instance's lease still reaches it.
@@ -8158,23 +8166,28 @@ pub(crate) mod tests {
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        let mut source = spawn_relay_for(
+        let mut source = spawn_named_relay_for(
             SOURCE,
+            Some("box-a2"),
             Some(&zone_named_egress(&["box-c.min.internal"], Vec::new())),
             |_| {},
         );
-        let mut covered = spawn_relay_for(
+        let mut covered = spawn_named_relay_for(
             COVERED,
+            Some("box-a3"),
             Some(&zone_named_egress(
                 &["box-c.min.internal"],
                 vec![format!("{INSTANCE}/32")],
             )),
             |_| {},
         );
-        let mut instance = spawn_relay_for(INSTANCE, Some(&zone_target_policy()), |_| {});
+        let mut instance = spawn_named_relay_for(
+            INSTANCE,
+            Some("box-c-2"),
+            Some(&zone_target_policy()),
+            |_| {},
+        );
         let sentinel = arp_frame(SOURCE);
-
-        resolve_zone_name(&mut source, SOURCE, "box-c-2.min.internal.", INSTANCE).await;
 
         // The source's own leg refuses the flow: the list names `box-c`,
         // never a prefix of it.
@@ -9760,6 +9773,7 @@ pub(crate) mod tests {
         fn steered_box_gate(listener: ProxyListenerState) -> BoxGate {
             BoxGate::for_session_steered(
                 "100.64.0.20".to_string(),
+                None,
                 Ipv4Addr::new(100, 64, 0, 20),
                 &steered_policy(),
                 SwitchSubnet::default(),
@@ -10066,6 +10080,7 @@ pub(crate) mod tests {
             let lease = Ipv4Addr::new(100, 64, 0, 21);
             let gate = BoxGate::for_session_steered(
                 lease.to_string(),
+                None,
                 lease,
                 &policy,
                 SwitchSubnet::default(),
@@ -10153,6 +10168,7 @@ pub(crate) mod tests {
                 // The attach's own construction (`gvproxy_network.rs`).
                 let gate = BoxGate::for_session_steered(
                     lease.to_string(),
+                    None,
                     lease,
                     &policy,
                     SwitchSubnet::default(),
