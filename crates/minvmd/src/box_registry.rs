@@ -6570,6 +6570,28 @@ impl BoxRegistry {
         HostIpAdmitMark(resident.admits)
     }
 
+    /// Whether a client admitted any of `sessions` after `mark`, among the
+    /// boxes whose rules are held, resident or set aside. The reconcile
+    /// thread asks it of the boxes a pass dropped: a box a client admitted
+    /// since the previous pass can be one whose resume is still starting.
+    #[must_use]
+    pub fn host_ip_admitted_after(
+        &self,
+        sessions: &[boxes::SessionId],
+        mark: HostIpAdmitMark,
+    ) -> bool {
+        let resident = self
+            .host_ip_boxes
+            .read()
+            .expect("the resident host_ip boxes' lock is never held across a panic");
+        sessions.iter().any(|session| {
+            resident
+                .admitted_at
+                .get(session)
+                .is_some_and(|admit| *admit > mark.0)
+        })
+    }
+
     /// Whether any `host_ip` box's rules are held, resident or set aside:
     /// a reconcile has nothing to do while this is `false`.
     #[must_use]
@@ -13697,6 +13719,52 @@ mod tests {
             vec![resumed],
             "a box the guest stopped listing is not admitted again on the guest's word"
         );
+        assert_eq!(
+            registry.table().host_ip_boxes()[0].egress(),
+            &held,
+            "the box rejoins with the rules the host client admitted"
+        );
+    }
+
+    /// NET-085 with BOX-025: a resume admits a stopped box before the
+    /// attach starts it. A pass whose mark follows that admit and whose list
+    /// still says `stopped` drops the box: a stopped box keeps no egress.
+    /// Its rules are set aside, and the next pass that lists it `active`
+    /// admits it again with them.
+    #[test]
+    fn host_ip_box_running_again_is_readmitted_after_a_drop_on_a_stopped_list() {
+        let registry = BoxRegistry::new(SUBNET);
+        let resumed = mirror_session(1);
+        let before_admit = registry.host_ip_admit_mark();
+        assert!(registry.admit_host_ip_box(resumed, Some(&one_subnet_policy())));
+        let held = registry.table().host_ip_boxes()[0].egress().clone();
+
+        let stopped = BTreeMap::from([(resumed, boxes::BoxState::Stopped)]);
+        let outcome = registry.reconcile_host_ip_boxes(
+            &stopped,
+            registry.host_ip_admit_mark(),
+            HostIpReconcileTrigger::Timer,
+        );
+        assert_eq!(
+            outcome.dropped,
+            vec![resumed],
+            "a stopped box keeps no egress"
+        );
+        assert!(resident_sessions(&registry).is_empty());
+        assert!(registry.holds_host_ip_boxes(), "its rules are set aside");
+        assert!(
+            registry.host_ip_admitted_after(&outcome.dropped, before_admit),
+            "the thread runs one more pass for a box admitted since the last one"
+        );
+
+        let running = BTreeMap::from([(resumed, boxes::BoxState::Active)]);
+        let outcome = registry.reconcile_host_ip_boxes(
+            &running,
+            registry.host_ip_admit_mark(),
+            HostIpReconcileTrigger::Timer,
+        );
+        assert_eq!(outcome.admitted, vec![resumed]);
+        assert_eq!(resident_sessions(&registry), vec![resumed]);
         assert_eq!(
             registry.table().host_ip_boxes()[0].egress(),
             &held,
