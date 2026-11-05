@@ -773,7 +773,7 @@ pub async fn cmd_box_attach(global: &GlobalArgs, args: BoxAttachArgs) -> Result<
         ensure_daemon(global)?;
         let hosts = crate::cmd::list::local_hosts(global)?;
         let kind = daemon_host_kind(global);
-        let code = box_attach_exec_on_hosts(
+        let ending = box_attach_exec_on_hosts(
             hosts,
             address,
             exec_id,
@@ -783,7 +783,10 @@ pub async fn cmd_box_attach(global: &GlobalArgs, args: BoxAttachArgs) -> Result<
             },
         )
         .await?;
-        return Err(Handoff::Exit(code).into());
+        if let Some(notice) = &ending.notice {
+            eprintln!("{notice}");
+        }
+        return Err(Handoff::Exit(ending.code).into());
     }
     let scope = match args.target {
         Some(_) => None,
@@ -839,6 +842,12 @@ pub(crate) enum ExecFound {
 /// Classifies the exec `exec_id` from the box's `events`, the ids the host
 /// lists as live (`live_execs`), and whether the box runs. An exec of a box
 /// that does not run has ended, even if no end event was written for it.
+///
+/// Interim: `ShowBox.live_execs` stays empty until
+/// <https://github.com/gominimal/minimal/issues/2404> fills it, so a started
+/// exec with no `exec_exited` event in a running box counts as live here.
+/// Once #2404 fills `live_execs`, only `live_execs` decides whether an exec
+/// is live, and the events decide only its terminal.
 pub(crate) fn exec_found(
     events: &[boxes::events::BoxEvent],
     live_execs: &[String],
@@ -1011,15 +1020,15 @@ pub(crate) async fn box_attach_exec_target(
 
 /// `min box attach <box> --exec <id>` over the local `hosts`: refuses a
 /// caller with no terminal, finds the box and the exec
-/// ([`box_attach_exec_target`]), and runs `attach` on them. Returns the
-/// code the attach ended with, which is the exec's own code when it ends.
+/// ([`box_attach_exec_target`]), runs `attach` on them, and reads how the
+/// attach ended ([`exec_attach_ending`]).
 pub(crate) async fn box_attach_exec_on_hosts<A>(
     hosts: Vec<crate::cmd::list::LocalHost>,
     address: &str,
     exec_id: &str,
     stdin_is_tty: bool,
     attach: A,
-) -> Result<i32, anyhow::Error>
+) -> Result<AttachEnding, anyhow::Error>
 where
     A: AsyncFnOnce(&BoxAttachTarget, &minimald_rpc::exec::ExecId) -> Result<i32, anyhow::Error>,
 {
@@ -1049,15 +1058,47 @@ where
         );
         return Err(refusal.into());
     }
+    // A stop ends the exec, by its signal or with its own code, before the
+    // daemon writes the stopped record, so every code reads the box again.
+    let settle = if code == DAEMON_ENDED_ATTACH {
+        DAEMON_END_SETTLE
+    } else {
+        ENTRYPOINT_END_SETTLE
+    };
+    let after = box_after_attach_settled(&target.host, target.box_id, settle).await;
+    let ending = exec_attach_ending(&target, code, &after)?;
     tracing::info!(
         verb = "box attach",
         box_id = %target.box_id,
         exec_id = %exec_id,
-        exit = code,
-        outcome = "ended",
+        exec_exit = code,
+        exit = ending.code,
+        outcome = if ending.code == DAEMON_ENDED_ATTACH { "ended by the host" } else { "ended" },
         "attach ended"
     );
-    Ok(code)
+    Ok(ending)
+}
+
+/// How an exec attach that ended with ssh's `code` ends the command, from
+/// what the host said of the box afterwards. It follows [`attach_ending`]:
+/// a stop, a removal or another terminal's attach ends with 254 and its
+/// line. A detach or the exec's own end is 0, whatever code the exec ended
+/// with. `min box wait <box> --exec <id>` reads that code.
+pub(crate) fn exec_attach_ending(
+    target: &BoxAttachTarget,
+    code: i32,
+    after: &BoxAfterAttach,
+) -> Result<AttachEnding, BoxAttachRefusal> {
+    match (code, after) {
+        (SSH_CONNECTION_FAILED | DAEMON_ENDED_ATTACH, _) => attach_ending(target, code, after),
+        (_, BoxAfterAttach::Gone) => Ok(AttachEnding {
+            code: DAEMON_ENDED_ATTACH,
+            notice: Some(format!("Detached: {} was removed.", target.label)),
+        }),
+        // A stopped box ends with 254 and its line. Any other box ends
+        // with 0: the exec ended by itself or the caller detached.
+        _ => attach_ending(target, 0, after),
+    }
 }
 
 /// Connects this terminal to the terminal exec `exec_id` in box `id` on

@@ -8345,7 +8345,7 @@ async fn box_attach_exec_reattaches_live_pty_exec() {
         &*web.to_string(),
     ] {
         let mut attached = None;
-        let code = box_attach_exec_on_hosts(
+        let ending = box_attach_exec_on_hosts(
             vec![alpha.host.clone()],
             address,
             AN_EXEC_ID,
@@ -8362,7 +8362,14 @@ async fn box_attach_exec_reattaches_live_pty_exec() {
         assert_eq!(target.host.sock, alpha.host.sock, "{address}");
         assert_eq!(target.label, address);
         assert_eq!(exec_id.as_str(), AN_EXEC_ID, "{address}");
-        assert_eq!(code, 3, "{address}: the attach ends with the exec's code");
+        assert_eq!(
+            ending,
+            AttachEnding {
+                code: 0,
+                notice: None
+            },
+            "{address}: the exec's own end is 0"
+        );
     }
 
     let cli = Cli::try_parse_from(["min", "box", "attach", "web", "--exec", AN_EXEC_ID])
@@ -8376,6 +8383,107 @@ async fn box_attach_exec_reattaches_live_pty_exec() {
         }
         _ => panic!("not `min box attach`"),
     }
+}
+
+/// BCLI-068: an exec that ends by itself ends `min box attach --exec` with
+/// 0 and no line, whatever code the exec ended with. `min box wait <box>
+/// --exec <id>` reads that code.
+#[tokio::test]
+async fn box_attach_exec_own_end_code7_exits_0() {
+    let (alpha, state) = exec_attach_host("alpha.local-minvmd0").await;
+    let web = alpha.create("web", Some(true)).await;
+    write_exec_event(
+        &state,
+        web,
+        boxes::events::BoxEventType::ExecStarted,
+        AN_EXEC_ID,
+        true,
+    );
+    let ending = box_attach_exec_on_hosts(
+        vec![alpha.host.clone()],
+        "web",
+        AN_EXEC_ID,
+        true,
+        async |_: &BoxAttachTarget, _: &minimald_rpc::exec::ExecId| Ok(7),
+    )
+    .await
+    .expect("the attach ends");
+    assert_eq!(
+        ending,
+        AttachEnding {
+            code: 0,
+            notice: None
+        }
+    );
+}
+
+/// BCLI-068: `min box stop` ends the attached exec by its signal, which the
+/// daemon reports as 1, before it writes the stopped record. The command
+/// reads the box again, and ends with 254 and the stop's line. A removed
+/// box ends with 254 and the removal's line.
+#[tokio::test]
+async fn box_attach_exec_box_stopped_exit254_names_stop() {
+    let (alpha, state) = exec_attach_host("alpha.local-minvmd0").await;
+    let web = alpha.create("web", Some(true)).await;
+    write_exec_event(
+        &state,
+        web,
+        boxes::events::BoxEventType::ExecStarted,
+        AN_EXEC_ID,
+        true,
+    );
+    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
+    let attach = box_attach_exec_on_hosts(
+        vec![alpha.host.clone()],
+        "web",
+        AN_EXEC_ID,
+        true,
+        async move |_: &BoxAttachTarget, _: &minimald_rpc::exec::ExecId| {
+            let _ = closed_tx.send(());
+            Ok(1)
+        },
+    );
+    let stop = async {
+        closed_rx.await.expect("the attach ran");
+        // Let the command's first read see the box running.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        alpha.stop("web").await;
+    };
+    let (ending, ()) = tokio::join!(attach, stop);
+    assert_eq!(
+        ending.expect("the attach ends"),
+        AttachEnding {
+            code: 254,
+            notice: Some("Detached: web was stopped.".to_owned())
+        }
+    );
+
+    let target = ending_target("local0");
+    assert_eq!(
+        exec_attach_ending(&target, 1, &BoxAfterAttach::Gone),
+        Ok(AttachEnding {
+            code: 254,
+            notice: Some("Detached: web was removed.".to_owned())
+        })
+    );
+    assert_eq!(
+        exec_attach_ending(
+            &target,
+            254,
+            &BoxAfterAttach::Listed(ending_entry("running"))
+        ),
+        Ok(AttachEnding {
+            code: 254,
+            notice: Some("Detached: another terminal attached to web.".to_owned())
+        })
+    );
+    assert_eq!(
+        exec_attach_ending(&target, 7, &BoxAfterAttach::Listed(ending_entry("running"))),
+        Ok(AttachEnding {
+            code: 0,
+            notice: None
+        })
+    );
 }
 
 /// BCLI-068: an exec id the box never ran is refused with exit 4, naming
