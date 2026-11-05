@@ -3330,10 +3330,7 @@ async fn run_invocations_in(
         cmd.stderr(hakoniwa::Stdio::MakePipe);
         let mut child = sandbox::forker::on_fork_thread(move || cmd.spawn())
             .map_err(|e| Error::Other(anyhow::anyhow!("spawn failed: {e}")))?;
-        let guard = match planned
-            .attach(sandbox::Spawned::from_child(&mut child))
-            .await
-        {
+        let guard = match planned.attach_child(&mut child).await {
             Ok(guard) => guard,
             Err(e) => {
                 let _ = child.kill();
@@ -3352,7 +3349,9 @@ async fn run_invocations_in(
             child.wait()
         })
         .await;
-        guard.teardown().await;
+        if let Some(guard) = guard {
+            guard.teardown().await;
+        }
         drop(container);
         let status = status
             .map_err(|e| Error::Other(anyhow::anyhow!("waiting for the task failed: {e}")))?
