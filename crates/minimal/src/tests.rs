@@ -8243,6 +8243,277 @@ async fn box_attach_running_non_pty_box_exit2_names_logs() {
     assert_eq!(address_state(&alpha.host, "worker").await, "running");
 }
 
+/// An [`AttachHost`] whose daemon keeps its state in a directory the test
+/// can reach, so the test can write the exec events the daemon writes when
+/// it runs an exec. The harness daemon never starts a sandbox, so it runs
+/// no exec itself.
+async fn exec_attach_host(host: &str) -> (AttachHost, std::path::PathBuf) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let sock = dir.path().join("ssh.sock");
+    let state = tempfile::TempDir::new().unwrap();
+    let state_path = state.path().to_path_buf();
+    let server = minimald::test_harness::TestServer::new_in(state).await;
+    server.listen_on_uds(&sock).await;
+    let project = tempfile::TempDir::new().unwrap();
+    let mut local = address_host(LOCAL_MINVMD_PROVIDER, host, false);
+    local.sock = sock;
+    (
+        AttachHost {
+            server,
+            _dir: dir,
+            project,
+            host: local,
+        },
+        state_path,
+    )
+}
+
+/// Appends the exec event `kind` for `exec_id` to the events of box `id`
+/// under the daemon state dir `state`, with the fields the daemon writes.
+fn write_exec_event(
+    state: &std::path::Path,
+    id: boxes::SessionId,
+    kind: boxes::events::BoxEventType,
+    exec_id: &str,
+    pty: bool,
+) {
+    use boxes::events::exec_data;
+
+    let box_dir = std::fs::read_dir(state.join("sessions"))
+        .expect("the daemon's sessions dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|dir| {
+            std::fs::read_to_string(dir.join("record.json"))
+                .is_ok_and(|record| record.contains(&id.to_string()))
+        })
+        .expect("the box's state dir");
+    let record: boxes::Record =
+        serde_json_lenient::from_slice(&std::fs::read(box_dir.join("record.json")).unwrap())
+            .expect("the box's record");
+    let mut event = boxes::events::BoxEvent::for_record(&record, kind);
+    event.data.insert(exec_data::EXEC_ID.into(), exec_id.into());
+    let mode = if pty { "tty" } else { "detached" };
+    event.data.insert(exec_data::MODE.into(), mode.into());
+    event.data.insert(exec_data::PTY.into(), pty.into());
+    event.data.insert(
+        exec_data::ARGV.into(),
+        serde_json_lenient::json!(["sleep", "600"]),
+    );
+    if kind == boxes::events::BoxEventType::ExecExited {
+        event
+            .data
+            .insert(exec_data::EXIT_CODE.into(), serde_json_lenient::json!(0));
+        event.data.insert(exec_data::REASON.into(), "exited".into());
+    }
+    let events = camino::Utf8PathBuf::from_path_buf(box_dir.join(boxes::events::EVENTS_FILE))
+        .expect("a UTF-8 path");
+    boxes::store::append_event_at(&events, &event).expect("the event is written");
+}
+
+/// An exec attach that must not run: the command refused before it.
+async fn no_exec_attach(
+    target: &BoxAttachTarget,
+    exec_id: &minimald_rpc::exec::ExecId,
+) -> Result<i32, anyhow::Error> {
+    panic!("the attach must not run, it ran on {target:?} for {exec_id}")
+}
+
+/// Another exec id as the daemon mints one.
+const OTHER_EXEC_ID: &str = "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f4a5c";
+
+/// BCLI-068: `min box attach <box> --exec <id>` hands the caller's terminal
+/// to the live terminal exec of that id, in the box on the host that keeps
+/// it, by every address form.
+#[tokio::test]
+async fn box_attach_exec_reattaches_live_pty_exec() {
+    use clap::Parser as _;
+
+    let (alpha, state) = exec_attach_host("alpha.local-minvmd0").await;
+    let web = alpha.create("web", Some(false)).await;
+    write_exec_event(
+        &state,
+        web,
+        boxes::events::BoxEventType::ExecStarted,
+        AN_EXEC_ID,
+        true,
+    );
+
+    for address in [
+        "web",
+        "local-minvmd/alpha.local-minvmd0/web",
+        &*web.to_string(),
+    ] {
+        let mut attached = None;
+        let code = box_attach_exec_on_hosts(
+            vec![alpha.host.clone()],
+            address,
+            AN_EXEC_ID,
+            true,
+            async |target: &BoxAttachTarget, exec_id: &minimald_rpc::exec::ExecId| {
+                attached = Some((target.clone(), exec_id.clone()));
+                Ok(3)
+            },
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{address}: {err:#}"));
+        let (target, exec_id) = attached.expect("the attach ran");
+        assert_eq!(target.box_id, web, "{address}");
+        assert_eq!(target.host.sock, alpha.host.sock, "{address}");
+        assert_eq!(target.label, address);
+        assert_eq!(exec_id.as_str(), AN_EXEC_ID, "{address}");
+        assert_eq!(code, 3, "{address}: the attach ends with the exec's code");
+    }
+
+    let cli = Cli::try_parse_from(["min", "box", "attach", "web", "--exec", AN_EXEC_ID])
+        .expect("`--exec` with a box parses");
+    match cli.command {
+        Some(Command::Box(BoxArgs {
+            command: BoxCommand::Attach(args),
+        })) => {
+            assert_eq!(args.target.as_deref(), Some("web"));
+            assert_eq!(args.exec.as_deref(), Some(AN_EXEC_ID));
+        }
+        _ => panic!("not `min box attach`"),
+    }
+}
+
+/// BCLI-068: an exec id the box never ran is refused with exit 4, naming
+/// the id. The check comes before the ended and the no-terminal checks, so
+/// an id of another box is refused the same way.
+#[tokio::test]
+async fn box_attach_exec_unknown_id_exit4_names_id() {
+    let (alpha, state) = exec_attach_host("alpha.local-minvmd0").await;
+    let web = alpha.create("web", Some(true)).await;
+    let other = alpha.create("other", Some(true)).await;
+    write_exec_event(
+        &state,
+        other,
+        boxes::events::BoxEventType::ExecStarted,
+        OTHER_EXEC_ID,
+        false,
+    );
+    write_exec_event(
+        &state,
+        web,
+        boxes::events::BoxEventType::ExecStarted,
+        AN_EXEC_ID,
+        true,
+    );
+
+    for exec_id in [OTHER_EXEC_ID, "not-an-exec-id"] {
+        let err = box_attach_exec_on_hosts(
+            vec![alpha.host.clone()],
+            "web",
+            exec_id,
+            true,
+            no_exec_attach,
+        )
+        .await
+        .expect_err("an exec the box never ran is refused");
+        let (message, code) = attach_refusal(&err);
+        assert_eq!(code, 4, "{message}");
+        assert_eq!(message, format!("web has no exec {exec_id}."));
+    }
+}
+
+/// BCLI-068: a live exec that did not ask for a terminal is refused with
+/// exit 2, naming `min box logs <box> --exec <id>`.
+#[tokio::test]
+async fn box_attach_exec_non_pty_exit2_names_logs() {
+    let (alpha, state) = exec_attach_host("alpha.local-minvmd0").await;
+    let web = alpha.create("web", Some(true)).await;
+    write_exec_event(
+        &state,
+        web,
+        boxes::events::BoxEventType::ExecStarted,
+        AN_EXEC_ID,
+        false,
+    );
+
+    let err = box_attach_exec_on_hosts(
+        vec![alpha.host.clone()],
+        "web",
+        AN_EXEC_ID,
+        true,
+        no_exec_attach,
+    )
+    .await
+    .expect_err("an exec with no terminal is refused");
+    let (message, code) = attach_refusal(&err);
+    assert_eq!(code, 2, "{message}");
+    assert_eq!(
+        message,
+        format!(
+            "Exec {AN_EXEC_ID} in web has no terminal to attach to. \
+             Run `min box logs web --exec {AN_EXEC_ID}` to see its output."
+        )
+    );
+}
+
+/// BCLI-068: an exec that ended, with or without a terminal, is refused
+/// with exit 4, naming `min box logs` and `min box wait` with `--exec`.
+/// The ended check comes before the no-terminal check. An exec of a box
+/// that stopped has ended too.
+#[tokio::test]
+async fn box_attach_exec_ended_exit4_names_logs_and_wait() {
+    use boxes::events::BoxEventType;
+
+    let (alpha, state) = exec_attach_host("alpha.local-minvmd0").await;
+    let web = alpha.create("web", Some(true)).await;
+    let stopped = alpha.create("stopped", Some(true)).await;
+    for (exec_id, pty) in [(AN_EXEC_ID, true), (OTHER_EXEC_ID, false)] {
+        write_exec_event(&state, web, BoxEventType::ExecStarted, exec_id, pty);
+        write_exec_event(&state, web, BoxEventType::ExecExited, exec_id, pty);
+    }
+    write_exec_event(&state, stopped, BoxEventType::ExecStarted, AN_EXEC_ID, true);
+    alpha.stop("stopped").await;
+
+    for (address, exec_id) in [
+        ("web", AN_EXEC_ID),
+        ("web", OTHER_EXEC_ID),
+        ("stopped", AN_EXEC_ID),
+    ] {
+        let err = box_attach_exec_on_hosts(
+            vec![alpha.host.clone()],
+            address,
+            exec_id,
+            true,
+            no_exec_attach,
+        )
+        .await
+        .expect_err("an exec that ended is refused");
+        let (message, code) = attach_refusal(&err);
+        assert_eq!(code, 4, "{address} {exec_id}: {message}");
+        assert_eq!(
+            message,
+            format!(
+                "Exec {exec_id} has ended. \
+                 Read its output with min box logs {address} --exec {exec_id}, \
+                 or its exit code with min box wait {address} --exec {exec_id}."
+            )
+        );
+    }
+}
+
+/// BCLI-068: `min box attach --exec <id>` with no box fails with exit 2,
+/// before any lookup.
+#[tokio::test]
+async fn box_attach_exec_without_box_exit2() {
+    use clap::Parser as _;
+
+    let Err(err) = Cli::try_parse_from(["min", "box", "attach", "--exec", AN_EXEC_ID]) else {
+        panic!("`--exec` needs a box");
+    };
+    assert_eq!(
+        err.kind(),
+        clap::error::ErrorKind::MissingRequiredArgument,
+        "{err}"
+    );
+    assert_eq!(err.exit_code(), 2, "{err}");
+    assert!(err.to_string().contains("<TARGET>"), "{err}");
+}
+
 /// BCLI-068: with no box named, the attach goes to the project's running
 /// box with a terminal. With none running, it goes to the project's only
 /// stopped or exited box with a terminal. A box with no terminal and a box
