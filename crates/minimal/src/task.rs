@@ -536,8 +536,13 @@ fn arm_task_run_interrupt(
                 }
             }
             // The run's own return never comes on this path, so the release
-            // it owes is made here, inside the same bound.
-            release_task_name_hold(control_sock, box_id, &box_name, false).await;
+            // it owes is made here, inside the same bound. A stopped box
+            // keeps its record until it is reaped (BOX-018), and a stop
+            // that did not land leaves it running, so only a destroy
+            // releases: the stopped box's reap releases its hold.
+            if ends == InterruptEnds::Destroy {
+                release_task_name_hold(control_sock, box_id, &box_name).await;
+            }
         };
         tokio::select! {
             res = tokio::time::timeout(bound, end_box) => {
@@ -1030,13 +1035,16 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
             box_name = %session_name,
             task = %args.task,
         );
-        let outcome = async {
+        // What the run did with its box: only a box it removed gives up
+        // its name hold and its egress ([`release_task_box_holds`]).
+        let (outcome, end) = async {
             match open_task_box_run(&mut client, id, &args.task, &task_cwd, &task_env).await {
                 Ok(channel) => {
                     let outcome = bridge_exec(channel).await;
                     run_guard.yield_to_handler().await;
+                    let mut end = TaskBoxEnd::Keep;
                     if let Ok(exit) = outcome {
-                        let end = task_box_end(exit, || entrypoint_started(&mut client, id)).await;
+                        end = task_box_end(exit, || entrypoint_started(&mut client, id)).await;
                         match end {
                             TaskBoxEnd::Keep => {
                                 eprintln!("{}", crate::kept_box_line(&session_name));
@@ -1051,13 +1059,13 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
                             }
                         }
                     }
-                    outcome
+                    (outcome, end)
                 }
                 // The exec never started, so no entrypoint ran: the box is
                 // removed, as the client always removed it.
                 Err(e) => {
                     crate::best_effort_destroy(&mut client, id, false).await;
-                    Err(e)
+                    (Err(e), TaskBoxEnd::Remove)
                 }
             }
         }
@@ -1069,15 +1077,14 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         if let Some(residency) = host_ip_residency.as_mut() {
             residency.keep();
         }
-        // The box ended: it holds no name a running box needs.
-        release_task_name_hold(
+        release_task_box_holds(
+            end,
             crate::vm_host_control_sock(
                 crate::daemon_host_kind(global),
                 global.minimal_dir.as_deref(),
             ),
             id,
             &session_name,
-            false,
         )
         .await;
         drop(run_guard);
@@ -1119,7 +1126,6 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         ),
         id,
         &session_name,
-        false,
     )
     .await;
     drop(run_guard);
@@ -1129,7 +1135,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
 
 /// What a task run does with its box once the run's channel closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TaskBoxEnd {
+pub(crate) enum TaskBoxEnd {
     /// The box stays, with its record (BOX-038), or runs on (BOX-015).
     Keep,
     /// The daemon refused to start the entrypoint, so the box is removed.
@@ -1183,26 +1189,40 @@ async fn entrypoint_started(client: &mut crate::client::Client, id: boxes::Sessi
     }
 }
 
-/// Releases the name hold a finished run's session may carry on the VM
-/// host daemon, best-effort. A task run holds no name of its own, but a
-/// `min session attach` or `min exec` into its running session re-makes
-/// one (`rehold_held_name_before_attach` cannot tell a task session
-/// apart), and the daemon ends the session with the run, where no client
-/// destroy releases it; an interrupted run's raw `DestroySession` releases
-/// nothing either, so its handler calls this too. The release is by the
-/// session's `id`, so it frees
-/// only this session's hold, and a name nothing held is the goal state
-/// already holding. `keep` withholds it: a kept session lives on, and its
-/// destroy releases its hold.
+/// Releases what a task box held on the VM host daemon once its run
+/// ended, as `end` says: a removed box releases its name hold and its
+/// `host_ip` egress ([`release_task_name_hold`]). A kept box releases
+/// nothing. It may still run, because a run that lost its channel never
+/// ends the box (BOX-015), or it ended and keeps its record until it is
+/// reaped (BOX-018). Its reap releases both.
+pub(crate) async fn release_task_box_holds(
+    end: TaskBoxEnd,
+    control_sock: Option<std::path::PathBuf>,
+    id: boxes::SessionId,
+    name: &str,
+) {
+    if end == TaskBoxEnd::Remove {
+        release_task_name_hold(control_sock, id, name).await;
+    }
+}
+
+/// Releases what a removed task run's box held on the VM host daemon,
+/// best-effort: its name hold and its `host_ip` egress. A
+/// `min session attach` or `min exec` into the running box re-makes a name
+/// hold (`rehold_held_name_before_attach` cannot tell a task box apart),
+/// and a destroy through the raw `DestroySession` RPC releases neither.
+/// So a task box's run calls this after it destroyed its box itself
+/// ([`release_task_box_holds`]), an interrupt that destroys the box calls
+/// it, and so does a run whose box the daemon ends with the run (NET-131).
+/// A task box the run keeps, running or ended, keeps both until its reap
+/// releases them. The release is by the box's
+/// `id`, so it frees only this box's hold, and a name nothing held is the
+/// goal state already holding.
 pub(crate) async fn release_task_name_hold(
     control_sock: Option<std::path::PathBuf>,
     id: boxes::SessionId,
     name: &str,
-    keep: bool,
 ) {
-    if keep {
-        return;
-    }
     crate::release_held_box_name(control_sock, id, Some(name), None).await;
 }
 

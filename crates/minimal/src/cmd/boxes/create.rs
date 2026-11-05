@@ -2756,8 +2756,9 @@ pub(crate) async fn activate_box(
     // an attach or exec ([`rehold_held_name_before_attach`]) does not tell
     // a task session apart, though: it holds the name of any named host_ip
     // session without a box row that a client attaches to or execs into.
-    // A task run releases such a hold by its session's id once the run
-    // returns or is interrupted (`release_task_name_hold`); a run whose
+    // A task run releases such a hold by its session's id once it removes
+    // or destroys its box (`release_task_name_hold`). A box the run keeps
+    // holds it until its reap releases it. A run whose
     // client is killed outright releases nothing, and that hold is
     // dropped after the VM host daemon's next restart, when nothing
     // re-makes it.
