@@ -261,6 +261,34 @@ impl BoxHandle {
         probe_host(host?.get_attrs()).await
     }
 
+    /// Whether the actor holds a host for the box. A stop takes the host out
+    /// before it signals the box's processes, and so does the end of the
+    /// entrypoint, so a command that one of them ends can see why.
+    #[must_use]
+    pub(crate) fn has_host(&self) -> bool {
+        self.2
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// Test-only: marks the box as being destroyed, as a removal does
+    /// before it stops the host.
+    #[cfg(test)]
+    pub(crate) fn start_destroy_for_test(&self) {
+        self.1.cancel();
+    }
+
+    /// Test-only: empties the slot a listing reads, as a stop does before
+    /// it signals the box.
+    #[cfg(test)]
+    pub(crate) fn take_host_for_test(&self) {
+        self.2
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+
     /// Test-only: puts `host` in the slot a listing reads, as the actor does
     /// after a message; the actor's next message overwrites it.
     #[cfg(test)]

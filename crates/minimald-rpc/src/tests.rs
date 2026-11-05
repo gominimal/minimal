@@ -2263,3 +2263,21 @@ fn read_log_request_round_trips() {
     .unwrap();
     assert!(output.contains(r#""data":"6869""#), "{output}");
 }
+
+#[test]
+fn retire_without_an_end_is_refused_at_decode() {
+    let session = serde_json_lenient::to_string(&boxes::SessionId::mint()).unwrap();
+    let without_end = format!(r#"{{"verb":"retire_host_ip_box","session_id":{session}}}"#);
+    assert!(
+        serde_json_lenient::from_str::<BoxControlRequest>(&without_end).is_err(),
+        "a retire without `end` must not decode"
+    );
+    let stopped =
+        format!(r#"{{"verb":"retire_host_ip_box","session_id":{session},"end":"stopped"}}"#);
+    match serde_json_lenient::from_str::<BoxControlRequest>(&stopped).unwrap() {
+        BoxControlRequest::RetireHostIpBox(request) => {
+            assert_eq!(request.end, HostIpBoxEnd::Stopped);
+        }
+        other => panic!("decoded as {other:?}"),
+    }
+}

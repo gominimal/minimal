@@ -626,13 +626,17 @@ pub struct BoxStopArgs {
     pub force: bool,
 }
 
-// BCLI-068: `min box attach [<box>]`.
+// BCLI-068: `min box attach [<box>] [--exec <id>]`.
 #[derive(Debug, Args)]
 pub struct BoxAttachArgs {
     /// The box: its id, the start of its id, its name, or
     /// provider/host/name, as `min box list` prints them. Omit it to attach
     /// to this project's box
     pub target: Option<String>,
+    /// Attach to a command that `min box exec -t` started in the box, by the
+    /// exec id it printed. Needs a box
+    #[arg(long = "exec", value_name = "EXEC_ID", requires = "target")]
+    pub exec: Option<String>,
 }
 
 // BOX-019 (BCLI-060, BCLI-004): `min box rm <box> [--force]`.

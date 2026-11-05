@@ -16319,7 +16319,7 @@ mod tests {
             );
         }
         // The box leaves: its reach goes with it.
-        assert!(registry.retire_host_ip_box(session));
+        assert!(registry.retire_host_ip_box(session, minimald_rpc::HostIpBoxEnd::Destroyed));
         assert_eq!(
             marked(host_ip_reach, 443),
             Err(unbounded(host_ip_reach, 0)),
@@ -16800,7 +16800,7 @@ mod tests {
             host_ip_cohort_to_proxy(&table, &baseline, &pins, 443),
             Ok(GateAdmit::ProxyLane)
         );
-        assert!(registry.retire_host_ip_box(grant));
+        assert!(registry.retire_host_ip_box(grant, minimald_rpc::HostIpBoxEnd::Destroyed));
         assert_eq!(
             host_ip_cohort_to_proxy(&table, &baseline, &pins, super::egress::PROXY_LISTENER_PORT),
             lane_drop,

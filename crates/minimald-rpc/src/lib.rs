@@ -1011,6 +1011,27 @@ pub struct HostIpBoxRequest {
 pub struct RetireHostIpBoxRequest {
     /// The session the box ran as.
     pub session_id: boxes::SessionId,
+    /// How the box ended. Required, with no default: a request that does
+    /// not say whether the box stopped or was destroyed is refused at
+    /// decode, because only a destroy revokes the box's id (BEP-043). A
+    /// client that predates the field also sends a retire on `min box
+    /// stop`, so a default of destroyed would revoke the id of a box that
+    /// `min box restart` brings back. Refused, nothing is retired or
+    /// revoked.
+    pub end: HostIpBoxEnd,
+}
+
+/// How a `host_ip` box left the VM host's resident set
+/// ([`RetireHostIpBoxRequest::end`]).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HostIpBoxEnd {
+    /// The box stopped. A restart can bring it back under the same id, so
+    /// its id is not revoked.
+    Stopped,
+    /// The box was destroyed. Its id is revoked at the Box Egress Proxy
+    /// when it declared a credentialed upstream (BEP-043).
+    Destroyed,
 }
 
 /// What side of the in-VM daemon reported a runtime-admitted port (NET-045,
