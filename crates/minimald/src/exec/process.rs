@@ -82,10 +82,7 @@ impl Exec for TaskExec {
         // request takes the older path below, kept for one release.
         stream::once(async move {
             match task_entrypoint_box(&self, &session).await {
-                Some(run) => stream::once(async move {
-                    run.start(self, session).await.map(TaskProcess::Entrypoint)
-                })
-                .boxed(),
+                Some(run) => stream::once(async move { run.start(self, session).await }).boxed(),
                 None => self.sandboxed(session),
             }
         })
@@ -701,6 +698,7 @@ pub enum TaskProcess {
     Sandbox(HakoniwaProcess),
     Echo(EchoProcess),
     Entrypoint(EntrypointProcess),
+    Refused(RefusedProcess),
 }
 
 impl Process for TaskProcess {
@@ -718,6 +716,7 @@ impl Process for TaskProcess {
             }
             TaskProcess::Echo(p) => p.take_stdio(),
             TaskProcess::Entrypoint(p) => p.take_stdio(),
+            TaskProcess::Refused(p) => p.take_stdio(),
         }
     }
 
@@ -726,6 +725,7 @@ impl Process for TaskProcess {
             TaskProcess::Sandbox(p) => p.wait().await,
             TaskProcess::Echo(p) => p.wait().await,
             TaskProcess::Entrypoint(p) => p.wait().await,
+            TaskProcess::Refused(p) => p.wait().await,
         }
     }
 
@@ -734,6 +734,7 @@ impl Process for TaskProcess {
             TaskProcess::Sandbox(p) => p.start_kill(),
             TaskProcess::Echo(p) => p.start_kill(),
             TaskProcess::Entrypoint(p) => p.start_kill(),
+            TaskProcess::Refused(p) => p.start_kill(),
         }
     }
 }
@@ -791,7 +792,7 @@ impl TaskEntrypointBox {
     /// relays its output from the box's log. The task's resolved variables
     /// go to the launch that starts the entrypoint (see
     /// [`crate::box_actor::entrypoint_env`]).
-    async fn start(self, exec: TaskExec, session: BoxHandle) -> io::Result<EntrypointProcess> {
+    async fn start(self, exec: TaskExec, session: BoxHandle) -> io::Result<TaskProcess> {
         let box_id = self.record.id;
         let box_name = self
             .record
@@ -829,11 +830,22 @@ impl TaskEntrypointBox {
             .username
             .clone()
             .unwrap_or_else(|| "user".to_string());
-        let host = session
-            .ensure_host(username)
-            .instrument(span.clone())
-            .await
-            .map_err(|e| io::Error::other(format!("{e}")))?;
+        let host = match session.ensure_host(username).instrument(span.clone()).await {
+            Ok(host) => host,
+            // The box's actor refused the start. The run says so in plain
+            // words, without the spawn-failure prefix, and exits 1.
+            Err(error) if crate::box_actor::EntrypointBehindHookShell::is(&error) => {
+                span.in_scope(|| {
+                    tracing::info!("task box: the entrypoint did not start behind a hook shell");
+                });
+                return Ok(TaskProcess::Refused(RefusedProcess::new(&format!(
+                    "Task {task} did not start in box {box_name}. {why}",
+                    task = exec.task,
+                    why = crate::box_actor::ENTRYPOINT_BEHIND_HOOK_SHELL,
+                ))));
+            }
+            Err(error) => return Err(io::Error::other(format!("{error}"))),
+        };
         span.in_scope(|| {
             tracing::info!(
                 drop_env = exec.drop_env.len(),
@@ -850,7 +862,7 @@ impl TaskEntrypointBox {
             relay_entrypoint_log(host.clone(), self.dir.clone(), offset, writer)
                 .instrument(span.clone()),
         );
-        Ok(EntrypointProcess {
+        Ok(TaskProcess::Entrypoint(EntrypointProcess {
             host,
             record_dir: self.dir.clone(),
             box_id,
@@ -860,7 +872,7 @@ impl TaskEntrypointBox {
             stdout: Some(reader),
             relay: Some(relay),
             released: false,
-        })
+        }))
     }
 }
 
@@ -1087,6 +1099,44 @@ impl Process for EchoProcess {
 
     async fn wait(&mut self) -> io::Result<Option<i32>> {
         Ok(Some(0))
+    }
+
+    fn start_kill(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A synthetic [`Process`] for a task run the daemon refused to start: it
+/// writes the refusal on stderr and exits 1, without spawning anything.
+pub struct RefusedProcess {
+    /// `Some` until `take_stdio` hands the streams out; `None` thereafter.
+    stderr: Option<Vec<u8>>,
+}
+
+impl RefusedProcess {
+    fn new(text: &str) -> Self {
+        Self {
+            stderr: Some(format!("{text}\n").into_bytes()),
+        }
+    }
+}
+
+impl Process for RefusedProcess {
+    type Stdin = std::pin::Pin<Box<dyn AsyncWrite + Send + Unpin>>;
+    type Stdout = std::pin::Pin<Box<dyn AsyncRead + Send + Unpin>>;
+    type Stderr = std::pin::Pin<Box<dyn AsyncRead + Send + Unpin>>;
+
+    fn take_stdio(&mut self) -> Option<(Self::Stdin, Self::Stdout, Self::Stderr)> {
+        let bytes = self.stderr.take()?;
+        Some((
+            Box::pin(tokio::io::sink()),
+            Box::pin(tokio::io::empty()),
+            Box::pin(std::io::Cursor::new(bytes)),
+        ))
+    }
+
+    async fn wait(&mut self) -> io::Result<Option<i32>> {
+        Ok(Some(1))
     }
 
     fn start_kill(&mut self) -> io::Result<()> {

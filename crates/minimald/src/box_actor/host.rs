@@ -392,10 +392,38 @@ pub(crate) mod entrypoint_env {
 }
 
 /// Why a task run cannot start the entrypoint of a box that has its own
-/// network address while a shell for its activate hooks runs (T43).
-pub(crate) const ENTRYPOINT_BEHIND_HOOK_SHELL: &str = "the task cannot start in this box. \
-     The box has its own network address, and the shell that ran the project's \
-     activate hooks holds it. Ending that shell releases the address";
+/// network address while a shell for its activate hooks runs (T43). The
+/// run prints it after the line that names the task and the box. No
+/// command ends that shell, so the text states the situation and stops.
+pub(crate) const ENTRYPOINT_BEHIND_HOOK_SHELL: &str = "The box has its own network address. \
+     The shell that ran the project's activate hooks holds that address, \
+     and that shell does not end.";
+
+/// The refusal of a task run whose entrypoint cannot start behind a hook
+/// shell, as [`BoxActor::ensure_host`] returns it inside
+/// [`AttachError::SpawnFailed`]. The run finds it by type, not by text,
+/// and answers with [`ENTRYPOINT_BEHIND_HOOK_SHELL`].
+#[derive(Debug)]
+pub(crate) struct EntrypointBehindHookShell;
+
+impl std::fmt::Display for EntrypointBehindHookShell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(ENTRYPOINT_BEHIND_HOOK_SHELL)
+    }
+}
+
+impl std::error::Error for EntrypointBehindHookShell {}
+
+impl EntrypointBehindHookShell {
+    /// Whether `error` is this refusal.
+    pub(crate) fn is(error: &AttachError) -> bool {
+        matches!(
+            error,
+            AttachError::SpawnFailed(e)
+                if e.get_ref().is_some_and(|inner| inner.is::<EntrypointBehindHookShell>())
+        )
+    }
+}
 
 /// The actor's end of an [`watch_entrypoint_exit`] watch: it receives how
 /// the watched host's runtime loop ended, once, when it ends with an exit.
@@ -1433,7 +1461,7 @@ impl BoxActor {
                          box's host-side row, so the box's entrypoint cannot start"
                     );
                     return Err(AttachError::SpawnFailed(std::io::Error::other(
-                        ENTRYPOINT_BEHIND_HOOK_SHELL,
+                        EntrypointBehindHookShell,
                     )));
                 }
                 if entrypoint_run {

@@ -1627,11 +1627,11 @@ fn session_run_encodes_a_task_form_not_a_command() {
     );
 }
 
-/// `min task run <task>` parses with `--keep` off by default; the `--path`
-/// option and the `--keep` flag are accepted in any order, and every
-/// positional after the task name is a task argument, never a project path.
+/// `min task run <task>` parses its `--path` option before or after the
+/// task name, every positional after the task name is a task argument,
+/// never a project path, and it has no `--keep` flag.
 #[test]
-fn task_run_parses_task_keep_and_path() {
+fn task_run_parses_task_and_path() {
     use clap::Parser as _;
     let run_args = |args: &[&str]| -> TaskRunArgs {
         match Cli::try_parse_from(args).unwrap().command {
@@ -1644,17 +1644,15 @@ fn task_run_parses_task_keep_and_path() {
 
     let a = run_args(&["min", "task", "run", "build"]);
     assert_eq!(a.task, "build");
-    assert!(!a.keep);
     assert!(a.path.is_none());
     assert!(a.args.is_empty());
 
-    let a = run_args(&["min", "task", "run", "build", "--keep"]);
-    assert!(a.keep);
-
-    let a = run_args(&["min", "task", "run", "--keep", "build", "--path", "sub/dir"]);
+    let a = run_args(&["min", "task", "run", "build", "--path", "sub/dir"]);
     assert_eq!(a.task, "build");
     assert_eq!(a.path.as_deref(), Some("sub/dir"));
-    assert!(a.keep);
+
+    // `min task run` has no `--keep`: every box keeps its record.
+    assert!(Cli::try_parse_from(["min", "task", "run", "--keep", "build"]).is_err());
 
     // A positional after the task name is a task argument, not a path.
     let a = run_args(&["min", "task", "run", "greet", "Alice"]);
@@ -1672,8 +1670,8 @@ fn task_run_parses_task_keep_and_path() {
     assert_eq!(a.task, "greet");
     assert_eq!(a.args, ["--name", "Alice"]);
 
-    // A task arg whose name collides with a `min task run` option (`path`,
-    // `keep`) goes after `--`, which ends `min`'s own options.
+    // A task arg whose name collides with a `min task run` option (`path`)
+    // goes after `--`, which ends `min`'s own options.
     let a = run_args(&["min", "task", "run", "deploy", "--", "--path", "prod"]);
     assert_eq!(a.task, "deploy");
     assert!(a.path.is_none());

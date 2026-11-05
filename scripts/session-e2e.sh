@@ -6423,7 +6423,7 @@ s.close()' "$1"
 # ---------------------------------------------------------------------------
 # `min task run` proof: a declared task runs in an ephemeral session — output
 # streamed through, the task's exit code relayed, the session destroyed
-# afterwards (or kept with --keep). Runs against its own tiny seeded project:
+# afterwards. Runs against its own tiny seeded project:
 # the shared PROJECT_DIR seed deliberately declares no tasks, so this seed
 # carries the same pinned [upstream] + shell stack PLUS the tasks (and the
 # same `.git` marker, so the headless upload gate ships the config into the
@@ -6531,32 +6531,6 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   task_kept_check e2e-fail "$WORK/task-fail.err"
   echo "task run exit-code relay: 7 → 7 OK"
 
-  # --keep retains the task box, named <task>-<n> by the daemon. The box
-  # ends when its task returns and keeps its record (BOX-038).
-  (cd "$TASK_SEED_DIR" && mnl task run e2e-echo --keep >/dev/null 2>"$WORK/task-keep.err") \
-    || { echo "::error::'min task run e2e-echo --keep' failed"; cat "$WORK/task-keep.err" 2>/dev/null || true; fail; }
-  kept="$(mnl ls 2>/dev/null | grep -o 'e2e-echo-[0-9][0-9]*' | head -n1)"
-  if [ -z "$kept" ]; then
-    echo "::error::--keep did not leave a 'e2e-echo-<n>' box listed"
-    mnl ls 2>&1 || true
-    fail
-  fi
-  # The destroy dirty gate: the kept task box ended with its task, so
-  # no host is running and its at-risk state is unknowable — the gate must
-  # refuse a headless (no TTY) destroy without --force, naming the escape
-  # hatch. (Were a host live, the seed's empty `.git` marker would make VCS
-  # mode decline into the activation-delta fallback instead; only a
-  # proven-clean tree may destroy headless without --force.)
-  if mnl session destroy "$kept" >/dev/null 2>"$WORK/destroy-refuse.err"; then
-    echo "::error::headless 'min session destroy' without --force should refuse"
-    fail
-  fi
-  grep -q -- "--force" "$WORK/destroy-refuse.err" \
-    || { echo "::error::headless destroy refusal does not name --force"; cat "$WORK/destroy-refuse.err" 2>/dev/null || true; fail; }
-  mnl session destroy --force "$kept" >/dev/null 2>&1 \
-    || { echo "::error::could not destroy kept session $kept"; fail; }
-  echo "task run --keep: box $kept retained; dirty gate refused headless destroy OK"
-
   # `min session run <session> <task>` runs a declared task against a session
   # that already exists, rather than composing one of its own. A task box
   # ends with its task (BOX-038), so the proof runs in a session that
@@ -6589,9 +6563,23 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     echo "::error::'min session run $sr_sid e2e-fail' exited $rc (expected 7)"
     fail
   fi
+  # The destroy dirty gate: a file written after activation makes the
+  # session's work at risk. The seed's empty `.git` marker makes VCS mode
+  # decline into the activation-delta fallback, which lists the file. The
+  # gate must refuse a headless (no TTY) destroy without --force, naming
+  # the escape hatch.
+  mnl session exec "$sr_sid" 'echo dirty > e2e-dirty-gate' >/dev/null 2>"$WORK/dirty-write.err" \
+    || { echo "::error::could not write a file in session $sr_sid"; cat "$WORK/dirty-write.err" 2>/dev/null || true; fail; }
+  if mnl session destroy "$sr_sid" >/dev/null 2>"$WORK/destroy-refuse.err"; then
+    echo "::error::headless 'min session destroy' without --force should refuse"
+    fail
+  fi
+  grep -q -- "--force" "$WORK/destroy-refuse.err" \
+    || { echo "::error::headless destroy refusal does not name --force"; cat "$WORK/destroy-refuse.err" 2>/dev/null || true; fail; }
   mnl session destroy --force "$sr_sid" >/dev/null 2>&1 \
     || { echo "::error::could not destroy session $sr_sid"; fail; }
   echo "session run proof OK (task in an existing session, exit relay 7 → 7)"
+  echo "dirty gate refused headless destroy of a changed session OK"
 
   # Unknown task: an instant client-side error listing what IS declared.
   if (cd "$TASK_SEED_DIR" && mnl task run no-such-task >/dev/null 2>"$WORK/task-unknown.err"); then

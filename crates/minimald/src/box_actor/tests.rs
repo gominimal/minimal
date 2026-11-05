@@ -16373,7 +16373,7 @@ async fn create_task_box(client: &mut TestClient, argv: &[&str]) -> SessionId {
     spec.entrypoint = mfile::spec::Entrypoint::Exec(argv.iter().map(ToString::to_string).collect());
     let mut req = crate::test_harness::create_session_req("check", "/tmp");
     req.config.creating_verb = minimald_rpc::CreatingVerb::Task;
-    // Marked as `min task run` without `--keep` marks it (NET-131).
+    // Marked as `min task run` marks it (NET-131).
     req.config.ends_with_run = true;
     req.spec = Some(serde_json_lenient::to_value(&spec).expect("a spec serializes"));
     let id = client.call::<CreateSession>(&req).await.unwrap().id;
@@ -16612,6 +16612,10 @@ async fn until_complete_ends_on_entrypoint_return_without_client_refuses_a_run_b
     assert!(
         stderr.contains(super::ENTRYPOINT_BEHIND_HOOK_SHELL),
         "the refusal says why the task cannot start: {stderr:?}"
+    );
+    assert!(
+        stderr.starts_with("Task check did not start in box "),
+        "the refusal names the task and the box, with no spawn-failure prefix: {stderr:?}"
     );
 }
 

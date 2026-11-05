@@ -90,7 +90,9 @@ pub enum ExecRequest {
     /// claim on the session it was created for (NET-131). When it is set,
     /// the daemon ends the session once this task's exit status is on the
     /// wire, whether or not the client that started the run is still
-    /// there. A `min task run` from before T43 sets it. `min session run`
+    /// there. `min task run` sets it for an interactive task, which has no
+    /// spec, and a `min task run` from before T43 sets it on every run.
+    /// `min session run`
     /// leaves it unset: its box is an attachable session someone else
     /// keeps. A payload without the marker parses as `owns_box: false`,
     /// which is also what a client from before the flag sends.

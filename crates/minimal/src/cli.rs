@@ -694,10 +694,9 @@ pub enum TaskCommand {
     /// Creates a session for the project (named `task-<task>-<hex>`),
     /// uploads the project like `min session activate`, runs the task
     /// inside it with output streamed to the terminal, exits with the
-    /// task's exit code, and destroys the session afterwards. `--keep`
-    /// retains the session as an attachable box instead. Ctrl-C tears the
-    /// session down (or keeps it with `--keep`) and exits 130 without
-    /// relaying the interrupt to the task itself. Tasks run
+    /// task's exit code, and destroys the session afterwards. Ctrl-C tears
+    /// the session down and exits 130 without relaying the interrupt to the
+    /// task itself. Tasks run
     /// non-interactively: pipe stdin to feed input; use `min session
     /// attach` for interactive work.
     Run(TaskRunArgs),
@@ -713,9 +712,6 @@ pub struct TaskRunArgs {
     /// task name is a task argument, never a project path.
     #[arg(long)]
     pub path: Option<String>,
-    /// Keep the session after the task exits instead of destroying it
-    #[arg(long)]
-    pub keep: bool,
     /// Arguments to the task, passed through to its declared `args`.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
     pub args: Vec<String>,

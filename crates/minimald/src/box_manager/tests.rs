@@ -362,8 +362,8 @@ async fn destroying_an_idle_session_goes_through_its_actor() {
     );
 }
 
-/// `sample_config` for a box created for a `min task run` without
-/// `--keep`: marked to end with its run from its create.
+/// `sample_config` for a box created for a `min task run`: marked to end
+/// with its run from its create.
 fn run_owned_config() -> minimald_rpc::BoxConfig {
     let mut config = sample_config();
     config.ends_with_run = true;
