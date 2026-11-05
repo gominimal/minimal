@@ -16483,6 +16483,41 @@ async fn until_complete_ends_on_entrypoint_return_without_client_task_run_return
     );
 }
 
+// T43: a task whose entrypoint ends at once, before the run takes its
+// streams, still hands the run its stdout, its stderr and its exit code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_task_run_of_an_entrypoint_that_ends_at_once_returns_its_output() {
+    let log = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_task_box(
+        &mut client,
+        &["/bin/sh", "-c", "echo fast-out; echo fast-err >&2; exit 3"],
+    )
+    .await;
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        client.exec(
+            &[(crate::MINIMAL_SESSION_ID_ENV, &id.to_string())],
+            false,
+            &task_box_run_request(),
+            b"",
+        ),
+    )
+    .await
+    .expect("the run ends when the entrypoint returns")
+    .expect("the daemon takes the run");
+    assert_eq!(
+        outcome.exit_status,
+        Some(3),
+        "{outcome:?}: {}",
+        log.contents()
+    );
+    assert_eq!(String::from_utf8_lossy(&outcome.stdout), "fast-out\n");
+    assert_eq!(String::from_utf8_lossy(&outcome.stderr), "fast-err\n");
+}
+
 // BOX-038, BOX-025, T43: a run against a task box whose entrypoint already
 // returned is refused because the box exited, not because it is still
 // activating. The two refusals tell the user different things: a box that

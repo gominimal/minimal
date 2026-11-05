@@ -851,16 +851,31 @@ impl TaskEntrypointBox {
         // The box runs its entrypoint on three pipes (T43): the run's stdin
         // goes to the entrypoint's stdin, and its stdout and stderr come
         // back as two streams.
-        let Some(io) = host.take_entrypoint_io().await else {
-            span.in_scope(|| {
-                tracing::warn!(
-                    "task box: the entrypoint has a terminal, so the run cannot relay it"
-                );
-            });
-            return Err(io::Error::other(
-                "The task's box runs its command on a terminal, so the run cannot pass its \
-                 input and output.",
-            ));
+        let io = match host.take_entrypoint_io().await {
+            crate::box_runtime::EntrypointIoTake::Taken(io) => io,
+            crate::box_runtime::EntrypointIoTake::OnTerminal => {
+                span.in_scope(|| {
+                    tracing::warn!(
+                        "task box: the entrypoint has a terminal, so the run cannot relay it"
+                    );
+                });
+                return Err(io::Error::other(
+                    "The task's box runs its command on a terminal, so the run cannot pass its \
+                     input and output.",
+                ));
+            }
+            crate::box_runtime::EntrypointIoTake::HostGone => {
+                span.in_scope(|| {
+                    tracing::warn!(
+                        "task box: the box's host ended before the run took the entrypoint's \
+                         streams"
+                    );
+                });
+                return Err(io::Error::other(format!(
+                    "Box {box_name} ended before the run connected to the task's input and \
+                     output. The run cannot show the task's output."
+                )));
+            }
         };
         span.in_scope(|| {
             tracing::info!(

@@ -8381,6 +8381,69 @@ async fn box_output_logged_from_start_complete_after_disconnect_past_cap_keeps_n
     let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
 }
 
+/// T43: an entrypoint on pipes that ends before its run takes the streams
+/// keeps its output for the run. The host reaps it, then still answers the
+/// run's take with what the entrypoint wrote, and its exit follows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fast_entrypoint_on_pipes_keeps_its_output_for_a_late_run() {
+    use mfile::spec::{BoxSpec, Entrypoint, SpecFlags};
+
+    let stored = StoredBox::new();
+    let mut spec = BoxSpec::for_session(None, SpecFlags::default());
+    spec.pty_enabled = false;
+    spec.entrypoint = Entrypoint::Exec(vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "echo fast-out; echo fast-err >&2; exit 3".to_string(),
+    ]);
+    let launcher = MockLauncher::default().and_spec(LaunchSpec {
+        spec: Some(Arc::new(spec)),
+        for_hooks: false,
+    });
+    let (host, handle) = Host::build(launcher, stored.params())
+        .await
+        .expect("failed to build host");
+    let task = crate::traced::spawn(host.run());
+
+    // Several exit polls go by, so the host has reaped the entrypoint before
+    // the run asks for its streams.
+    tokio::time::sleep(pipes::PIPE_EXIT_POLL * 5).await;
+    assert!(
+        !task.is_finished(),
+        "the host holds the ended entrypoint's output for its run"
+    );
+
+    let io = match handle.take_entrypoint_io().await {
+        EntrypointIoTake::Taken(io) => io,
+        EntrypointIoTake::OnTerminal => panic!("an entrypoint on pipes read as on a terminal"),
+        EntrypointIoTake::HostGone => panic!("the host ended before the run took the streams"),
+    };
+    let collect = |mut rx: mpsc::Receiver<Vec<u8>>| async move {
+        let mut out = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            out.extend_from_slice(&chunk);
+        }
+        String::from_utf8(out).unwrap()
+    };
+    let (stdout, stderr) = tokio::time::timeout(
+        Duration::from_secs(10),
+        futures::future::join(collect(io.stdout), collect(io.stderr)),
+    )
+    .await
+    .expect("the streams end with the host");
+    assert_eq!(stdout, "fast-out\n", "the run gets the entrypoint's stdout");
+    assert_eq!(stderr, "fast-err\n", "the run gets the entrypoint's stderr");
+
+    let exit = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the host ends once the run took the streams");
+    let exit = exit
+        .expect("host task should not panic")
+        .expect("the host reaps the entrypoint");
+    assert_eq!(exit.code, 3, "the entrypoint's own exit code");
+    assert!(!exit.requested, "nobody asked for the end");
+}
+
 /// BOX-155: the box's output is in its log from the start, with no client
 /// attached. An attached client reads the same output as a second reader,
 /// and after the client drops, the log holds what came before, during and

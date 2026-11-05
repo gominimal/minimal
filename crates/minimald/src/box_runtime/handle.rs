@@ -471,15 +471,23 @@ impl HostHandle {
 
     /// Takes the streams of the host's entrypoint, when it runs on pipes
     /// (T43): the write end of its stdin, and what it writes to stdout and
-    /// stderr from now on. `None` for a host whose entrypoint has a
-    /// terminal, or a host that is gone.
-    pub(crate) async fn take_entrypoint_io(&self) -> Option<EntrypointIo> {
+    /// stderr from now on. An entrypoint that ended before the call keeps
+    /// what it wrote for the call, while the host holds its output.
+    pub(crate) async fn take_entrypoint_io(&self) -> EntrypointIoTake {
         let (send, recv) = oneshot::channel();
-        self.sender
+        if self
+            .sender
             .send(Message::TakeEntrypointIo(send))
             .await
-            .ok()?;
-        recv.await.ok().flatten()
+            .is_err()
+        {
+            return EntrypointIoTake::HostGone;
+        }
+        match recv.await {
+            Ok(Some(io)) => EntrypointIoTake::Taken(io),
+            Ok(None) => EntrypointIoTake::OnTerminal,
+            Err(_) => EntrypointIoTake::HostGone,
+        }
     }
 
     /// Returns what a destroy of the session's workspace would lose: the

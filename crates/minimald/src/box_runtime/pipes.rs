@@ -42,6 +42,17 @@ pub(crate) struct EntrypointIo {
     pub(crate) stderr: mpsc::Receiver<Vec<u8>>,
 }
 
+/// What [`super::HostHandle::take_entrypoint_io`] gets from the host.
+pub(crate) enum EntrypointIoTake {
+    /// The entrypoint's streams.
+    Taken(EntrypointIo),
+    /// The entrypoint runs on a terminal, so it has no streams to take.
+    OnTerminal,
+    /// The host ended before it answered: the entrypoint ended, and no run
+    /// took its output while the host held it, or the box was stopped.
+    HostGone,
+}
+
 /// The run a host relays its entrypoint's output to.
 struct PipeRelay {
     stdout: mpsc::Sender<Vec<u8>>,

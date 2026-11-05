@@ -57,7 +57,7 @@ use hooks::*;
 pub(crate) use launcher::*;
 #[cfg(test)]
 pub(crate) use mock::*;
-pub(crate) use pipes::EntrypointIo;
+pub(crate) use pipes::{EntrypointIo, EntrypointIoTake};
 use pipes::{HostPipes, PIPE_EXIT_POLL, PipeStream, read_ready};
 
 /// What a host loop returns when it ends: the portable exit code, and the
@@ -1597,6 +1597,14 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             }
         };
 
+        // An entrypoint that ended before its run took the streams, as a
+        // fast one can, still has its output held in the pipes. The run can
+        // take it until the hold ends. A kill asked for the end, so no run
+        // waits on it.
+        if matches!(&result, Ok(exit) if !exit.requested) {
+            self.hold_output_after_exit().await;
+        }
+
         // What the entrypoint wrote before it ended and the host did not
         // read yet, to the log and to the run. Then the run's streams end.
         if let Some(pipes) = self.pipes.as_mut() {
@@ -1636,22 +1644,68 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
 
     /// Whether a kill from the daemon waits in the mailbox. Called once the
     /// process is reaped and the loop ends, so it drains the mailbox: the
-    /// loop takes no message after this, and the other messages drop as
-    /// they do when the host ends.
+    /// loop takes no message after this. A run that asked for the
+    /// entrypoint's streams gets them, and the other messages drop as they
+    /// do when the host ends.
     fn kill_queued(&mut self) -> bool {
         let mut killed = false;
         while let Ok(msg) = self.receiver.try_recv() {
-            if let Message::Kill(for_shutdown) = msg {
-                tracing::info!(
-                    session_id = %self.session_id,
-                    session = %self.session_name,
-                    for_shutdown,
-                    "session host killed on request; the process was already reaped",
-                );
-                killed = true;
+            match msg {
+                Message::Kill(for_shutdown) => {
+                    tracing::info!(
+                        session_id = %self.session_id,
+                        session = %self.session_name,
+                        for_shutdown,
+                        "session host killed on request; the process was already reaped",
+                    );
+                    killed = true;
+                }
+                Message::TakeEntrypointIo(reply) => self.answer_take_entrypoint_io(reply),
+                _ => {}
             }
         }
         killed
+    }
+
+    /// Hands the entrypoint's streams to the run that asked for them. The
+    /// reply is `None` for a host whose entrypoint has a terminal.
+    fn answer_take_entrypoint_io(&mut self, reply: oneshot::Sender<Option<EntrypointIo>>) {
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the run may already be gone; the output then goes to the log only"
+        )]
+        let _ = reply.send(self.pipes.as_mut().map(HostPipes::take_io));
+    }
+
+    /// Holds an ended entrypoint's output for the run that started it, when
+    /// the entrypoint ended before the run took its streams. The pipes keep
+    /// what it wrote. The hold ends when the run takes the streams, when a
+    /// kill arrives, or at the hold's deadline ([`pipes::FIRST_RELAY_WAIT`]
+    /// from the launch). The process is reaped already, so every other
+    /// message drops as it does when the host ends.
+    async fn hold_output_after_exit(&mut self) {
+        let Some(deadline) = self.pipes.as_ref().and_then(|p| p.first_relay_deadline) else {
+            return;
+        };
+        loop {
+            tokio::select! {
+                msg = self.receiver.recv() => match msg {
+                    Some(Message::TakeEntrypointIo(reply)) => {
+                        self.answer_take_entrypoint_io(reply);
+                        return;
+                    }
+                    Some(Message::Kill(_)) | None => return,
+                    Some(_) => {}
+                },
+                () = tokio::time::sleep_until(deadline) => {
+                    let session = self.session_name.clone();
+                    if let Some(pipes) = self.pipes.as_mut() {
+                        pipes.first_relay_missed(&session);
+                    }
+                    return;
+                }
+            }
+        }
     }
 
     /// Logs a pty-master failure and stashes it for [`Self::mainloop`] to hand
@@ -1852,13 +1906,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                     Message::GetScreen(s) => {
                         let _ = s.send(self.screen_snapshot());
                     }
-                    Message::TakeEntrypointIo(reply) => {
-                        #[expect(
-                            clippy::let_underscore_must_use,
-                            reason = "the run may already be gone; the output then goes to the log only"
-                        )]
-                        let _ = reply.send(self.pipes.as_mut().map(HostPipes::take_io));
-                    }
+                    Message::TakeEntrypointIo(reply) => self.answer_take_entrypoint_io(reply),
                     // NET-045: forward the ask to the attached client, whose
                     // binding renders the exit prompt's own dialog. Nobody
                     // attached — no binding, or one whose mailbox is wedged —
