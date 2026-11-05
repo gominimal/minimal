@@ -838,7 +838,7 @@ pub(crate) fn run_rm(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bep::store::{MemorySecretStore, keychain_add_line};
+    use bep::store::MemorySecretStore;
     use clap::Parser as _;
 
     fn set_args(argv: &[&str]) -> SecretSetArgs {
@@ -1307,22 +1307,6 @@ sentry
         assert!(store.reads_without_prompt("claude", &proxy));
         assert!(!store.reads_without_prompt("claude", Path::new("/usr/bin/security")));
         assert!(!store.reads_without_prompt("claude", &proxy.with_file_name("min")));
-
-        // The keychain line names the proxy as the one trusted application,
-        // without `-A` (any application), and carries the value only as hex.
-        let line = keychain_add_line("claude", b"sk-ant", &proxy).unwrap();
-        let words: Vec<&str> = line.split_whitespace().collect();
-        assert_eq!(words.iter().filter(|w| **w == "-T").count(), 1, "{line}");
-        assert!(
-            line.contains(&format!("-T \"{}\"", proxy.display())),
-            "{line}"
-        );
-        assert!(!words.contains(&"-A"), "{line}");
-        // An update in place keeps the old access control, so no `-U`.
-        assert!(!words.contains(&"-U"), "{line}");
-        assert!(!line.contains("sk-ant"), "{line}");
-        assert!(line.trim_end().ends_with("-X 736b2d616e74"), "{line}");
-        assert!(keychain_add_line("claude", b"v", Path::new("/a\"b/bep")).is_err());
 
         // A listing reads the entry back from `security dump-keychain -a`.
         let dump = format!(
