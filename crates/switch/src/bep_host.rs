@@ -2166,7 +2166,7 @@ impl BepPeer {
     /// A clean VM stop calls this before it stops the switch, so the reader
     /// pump is gone by the time the switch socket closes; the "switch socket
     /// closed" WARN then means what it says, a lane lost mid-life, instead
-    /// of firing on every clean stop (1.9k a week in the lab, one per stop).
+    /// of firing on every clean stop.
     pub async fn shutdown(mut self) {
         drop(self.stop.take());
         if let Ok(Err(err)) =

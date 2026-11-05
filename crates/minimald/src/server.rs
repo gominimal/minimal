@@ -1348,8 +1348,8 @@ impl Server {
                                 // the socket that way before every command
                                 // (autospawn's liveness check), and a client
                                 // that gave up on a stalled daemon looks the
-                                // same. 333k of these a week in the lab, at
-                                // WARN, hid the handshakes that did fail.
+                                // same. At WARN they would hide the
+                                // handshakes that did fail.
                                 if closed_by_peer(&e) {
                                     handshake_span.record("outcome", "closed_before_id");
                                     handshake_span.in_scope(|| {
@@ -1517,7 +1517,7 @@ async fn close_connection(state: &ServerStateHandle, conn: &ConnectionHandle) {
     reap_seam::park(&created).await;
     // Only a connection that created a session has anything to reap; the
     // span is not worth opening for the rest (every probe and every plain
-    // RPC connection: 250k empty spans a week in the lab).
+    // RPC connection).
     if !created.is_empty() {
         reap_unfinalized_sessions(state, created).await;
     }

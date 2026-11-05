@@ -591,8 +591,8 @@ impl Client {
             .map_err(|_| anyhow::anyhow!("{} RPC timed out after {timeout:?}", R::NAME))
             .and_then(|r| r);
         if result.is_err() {
-            // A failed or timed-out RPC marks its span, so the daemon's 4k
-            // "rpc failed" a week have a client-side span to find.
+            // A failed or timed-out RPC marks its span, so a daemon-side
+            // "rpc failed" has a failed client-side span to match.
             tracing::Span::current().record("otel.status_code", "ERROR");
         }
         result

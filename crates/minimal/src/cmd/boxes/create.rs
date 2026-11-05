@@ -1200,8 +1200,7 @@ impl ActivationStep {
         );
         let result = work.instrument(span.clone()).await;
         if let Err(error) = &result {
-            // The status, so a trace query for failed steps finds them (no
-            // CLI span carried one across 2 M spans in a lab week); the
+            // The status, so a trace query for failed steps finds them; the
             // event stays at INFO, since a failed step is often expected.
             span.record("otel.status_code", "ERROR");
             span.in_scope(|| {
