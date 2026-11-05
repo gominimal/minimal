@@ -1527,7 +1527,9 @@ impl BoxActor {
             return None;
         }
         let watch = self.entrypoint_watch.as_mut()?;
-        let exit = tokio::time::timeout(EXIT_SETTLE_TIMEOUT, watch).await.ok()?;
+        let exit = tokio::time::timeout(EXIT_SETTLE_TIMEOUT, watch)
+            .await
+            .ok()?;
         self.entrypoint_watch = None;
         Some(exit.ok())
     }
