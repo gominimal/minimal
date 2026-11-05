@@ -8063,7 +8063,8 @@ async fn attach_detach_or_entrypoint_exit_returns_0() {
 /// BCLI-068: an attach the daemon ends from the other side exits with 254
 /// after one line that names the cause: a stop, a removal, another
 /// terminal that took the box, or a host that shut down. A stop gives 254
-/// although it also ends the entrypoint.
+/// although it also ends the entrypoint. A box that reads `exited` ended by
+/// itself, so its 254 ends with 0 and keeps its line.
 #[tokio::test]
 async fn attach_ended_from_other_side_notice_exit254() {
     let alpha = AttachHost::start("alpha.local-minvmd0").await;
@@ -8136,26 +8137,35 @@ async fn attach_ended_from_other_side_notice_exit254() {
         line(BoxAfterAttach::HostSilent),
         "Detached: host local0 shut down or stopped answering."
     );
-    let mut exited = ending_entry("exited");
-    exited.reason = Some("exit".to_owned());
-    exited.exit_code = Some(3);
+    // A box that reads `exited` ended by itself: the attach ends with 0,
+    // and the line says how the box ended.
+    let exited_ending = |reason: &str, exit_code: Option<i32>| {
+        let mut entry = ending_entry("exited");
+        entry.reason = Some(reason.to_owned());
+        entry.exit_code = exit_code;
+        attach_ending(&target, 254, &BoxAfterAttach::Listed(entry)).expect("an ending")
+    };
     assert_eq!(
-        line(BoxAfterAttach::Listed(exited)),
-        "Detached: web exited with code 3."
+        exited_ending("exit", Some(3)),
+        AttachEnding {
+            code: 0,
+            notice: Some("Detached: web exited with code 3.".to_owned())
+        }
     );
-    let mut timed_out = ending_entry("exited");
-    timed_out.reason = Some("timeout".to_owned());
     assert_eq!(
-        line(BoxAfterAttach::Listed(timed_out)),
-        "Detached: web ran past its timeout and ended."
+        exited_ending("timeout", None),
+        AttachEnding {
+            code: 0,
+            notice: Some("Detached: web ran past its timeout and ended.".to_owned())
+        }
     );
     // An OOM record stores exit code 137 too. The line names the OOM.
-    let mut oom = ending_entry("exited");
-    oom.reason = Some("oom".to_owned());
-    oom.exit_code = Some(137);
     assert_eq!(
-        line(BoxAfterAttach::Listed(oom)),
-        "Detached: web ran out of memory and ended."
+        exited_ending("oom", Some(137)),
+        AttachEnding {
+            code: 0,
+            notice: Some("Detached: web ran out of memory and ended.".to_owned())
+        }
     );
     // A stop whose entrypoint exited on its SIGTERM records the
     // entrypoint's own code. The daemon reports 0 for it, and it is still
@@ -8174,9 +8184,9 @@ async fn attach_ended_from_other_side_notice_exit254() {
         attach_ending(&target, 254, &BoxAfterAttach::Unread),
         Ok(AttachEnding {
             code: 254,
-            notice: None
+            notice: Some("Detached: host local0 ended the attach to web.".to_owned())
         }),
-        "a host that answered with an error proves no cause"
+        "a host that answered with an error proves no cause, so the line names the host"
     );
 }
 
@@ -8264,8 +8274,8 @@ async fn resume_for_attach_test(daemon: &mut minimald::test_harness::TestClient,
 }
 
 /// BCLI-068: a connection to the box's host that fails during the attach
-/// fails the command with exit 7 and names the host. ssh's 255 from a host
-/// that still answers is the daemon's own end, and stays 255.
+/// fails the command with exit 7 and names the host, whether or not the
+/// host still answers.
 #[tokio::test]
 async fn attach_connection_failure_exit7() {
     let target = ending_target("alpha.local-minvmd0");
@@ -8281,17 +8291,17 @@ async fn attach_connection_failure_exit7() {
     let err = anyhow::Error::from(refusal).context("attaching");
     assert_eq!(attach_refusal(&err).1, 7);
 
-    assert_eq!(
-        attach_ending(
-            &target,
-            255,
-            &BoxAfterAttach::Listed(ending_entry("running"))
-        ),
-        Ok(AttachEnding {
-            code: 255,
-            notice: None
-        })
-    );
+    for after in [
+        BoxAfterAttach::Listed(ending_entry("running")),
+        BoxAfterAttach::Gone,
+        BoxAfterAttach::Unread,
+    ] {
+        assert_eq!(
+            attach_ending(&target, 255, &after).map_err(|refusal| refusal.exit_code()),
+            Err(7),
+            "{after:?}"
+        );
+    }
 
     // A host with no daemon at its socket is read as silent.
     let down = address_host(LOCAL_MINVMD_PROVIDER, "alpha.local-minvmd0", false);
@@ -8300,10 +8310,10 @@ async fn attach_connection_failure_exit7() {
         BoxAfterAttach::HostSilent
     );
 
-    // ssh's 255 over a host that still answers stays the daemon's own.
+    // ssh's 255 over a host that still answers is a lost connection too.
     let alpha = AttachHost::start("alpha.local-minvmd0").await;
     alpha.create("web", Some(true)).await;
-    let ending = box_attach_on_hosts(
+    let err = box_attach_on_hosts(
         vec![alpha.host.clone()],
         Some("web"),
         None,
@@ -8311,14 +8321,8 @@ async fn attach_connection_failure_exit7() {
         async |_: &BoxAttachTarget| Ok(255),
     )
     .await
-    .expect("the host answers");
-    assert_eq!(
-        ending,
-        AttachEnding {
-            code: 255,
-            notice: None
-        }
-    );
+    .expect_err("ssh failed");
+    assert_eq!(attach_refusal(&err).1, 7);
 }
 
 /// Runs one step of the address end-to-end test below inside its own

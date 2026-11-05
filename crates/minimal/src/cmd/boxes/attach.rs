@@ -801,7 +801,6 @@ where
         DAEMON_ENDED_ATTACH => {
             box_after_attach_settled(&target.host, target.box_id, DAEMON_END_SETTLE).await
         }
-        SSH_CONNECTION_FAILED => box_after_attach(&target.host, target.box_id).await,
         _ => BoxAfterAttach::Unread,
     };
     match attach_ending(&target, code, &after) {
@@ -810,7 +809,7 @@ where
                 verb = "box attach",
                 box_id = %target.box_id,
                 exit = ending.code,
-                outcome = if ending.notice.is_some() { "ended by the host" } else { "ended" },
+                outcome = if ending.code == DAEMON_ENDED_ATTACH { "ended by the host" } else { "ended" },
                 "attach ended"
             );
             Ok(ending)
@@ -1044,8 +1043,10 @@ pub(crate) async fn box_after_attach_settled(
 /// box was stopped or removed, another terminal attached to it, or its host
 /// shut down or stopped answering. A stop can also end the entrypoint, which
 /// the daemon reports as 0, so a box that is `stopped` ends with 254 too,
-/// whatever exit code its entrypoint recorded. ssh's own 255 against a host that does not answer is a lost
-/// connection, exit 7. Every other code is the code: 0 for a detach or an
+/// whatever exit code its entrypoint recorded. A 254 against a box that
+/// reads `exited` ends with 0 and its line, since the entrypoint ended by
+/// itself. ssh's own 255 is a lost connection, exit 7, whatever the host
+/// says afterwards. Every other code is the code: 0 for a detach or an
 /// entrypoint that exited.
 pub(crate) fn attach_ending(
     target: &BoxAttachTarget,
@@ -1061,7 +1062,9 @@ pub(crate) fn attach_ending(
     };
     let stopped = |entry: &minimald_rpc::BoxListingEntry| entry.state == "stopped";
     match (code, after) {
-        (SSH_CONNECTION_FAILED, BoxAfterAttach::HostSilent) => {
+        (SSH_CONNECTION_FAILED, _) => {
+            // ssh's own failure is a lost connection whether or not the
+            // host answers the read afterwards.
             Err(BoxAttachRefusal::ConnectionLost {
                 host: target.host.host.clone(),
                 address: label.clone(),
@@ -1073,6 +1076,14 @@ pub(crate) fn attach_ending(
         (DAEMON_ENDED_ATTACH, BoxAfterAttach::Listed(entry)) if entry.state == "running" => {
             ended(format!("Detached: another terminal attached to {label}."))
         }
+        (DAEMON_ENDED_ATTACH, BoxAfterAttach::Listed(entry)) if entry.state == "exited" => {
+            // The box's entrypoint ended by itself, so the attach ended
+            // normally. The line still says how the box ended.
+            Ok(AttachEnding {
+                code: 0,
+                notice: Some(ended_box_line(label, entry)),
+            })
+        }
         (DAEMON_ENDED_ATTACH, BoxAfterAttach::Listed(entry)) => ended(ended_box_line(label, entry)),
         (DAEMON_ENDED_ATTACH, BoxAfterAttach::Gone) => {
             ended(format!("Detached: {label} was removed."))
@@ -1082,6 +1093,14 @@ pub(crate) fn attach_ending(
             // stopped, or it cannot be reached.
             ended(format!(
                 "Detached: host {} shut down or stopped answering.",
+                target.host.host
+            ))
+        }
+        (DAEMON_ENDED_ATTACH, BoxAfterAttach::Unread) => {
+            // The host answered the read with an error, so the record does
+            // not say why the attach ended.
+            ended(format!(
+                "Detached: host {} ended the attach to {label}.",
                 target.host.host
             ))
         }
