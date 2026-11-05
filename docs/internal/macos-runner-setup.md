@@ -46,7 +46,15 @@ Do not give a new Mac the `minimal-signing` label. `smoke-macos` and the CI
 `e2e` job stay on the base labels. The smoke job uses signed files from an
 earlier job, so any fleet Mac can run it.
 
-A new job that signs or notarizes must also require `minimal-signing`. See
+The signing Mac sits alone in the `signing` runner group. That group admits
+only `release.yml` from `main` and from the `release/` branches it lists, so
+no other workflow reaches the Mac, whatever labels it asks for. Keep every
+other Mac out of the group. To add a release branch, see
+[Give the commit a branch](release-pipeline.md#2-give-the-commit-a-branch).
+
+A new job that signs or notarizes must also require `minimal-signing` and set
+`environment: release`. It must lock the keychain in an `if: always()` last
+step. See
 [Pending changes that affect the fleet](#pending-changes-that-affect-the-fleet).
 
 ## Privileged tests stay off the fleet
