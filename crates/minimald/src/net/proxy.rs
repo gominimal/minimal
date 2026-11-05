@@ -552,7 +552,10 @@ impl<T: HostRoute> Router<T> {
     /// The caller a connection from `peer` to `local` stands for (NET-070).
     /// A peer at a live box's switch lease is that box. Any other peer is
     /// the node's address, and the caller is the host-address box that owns
-    /// the connecting socket, if one does. The socket lookup reads `/proc`,
+    /// the connecting socket, if one does: the box whose classifier leaf or
+    /// PID namespace a holder of the socket runs in. The gate does not read
+    /// whether the host decides the box's egress per box, so a host without
+    /// the classifier refuses the same requests. The socket lookup reads `/proc`,
     /// so it runs off the async workers, and it runs only while some live
     /// caller holds no switch lease. A lookup that cannot name the socket's
     /// holder then is [`CallerLookup::Unattributed`], never no caller: the
@@ -4604,6 +4607,107 @@ mod tests {
                 "expected the refusal to carry {expected}, got: {logged}"
             );
         }
+    }
+
+    /// The socket-owner lookup of a host without the classifier: the real
+    /// kernel lookup, with this test process's PID namespace standing in for
+    /// the deny-all host-address box's. The process runs in no classifier
+    /// leaf, as every box does on such a host.
+    fn unplaced_socket_owner(
+        peer: SocketAddrV4,
+        local: SocketAddrV4,
+    ) -> crate::net::dns::ConnectingOwner {
+        let own = crate::box_runtime::pid_namespace_of(std::process::id());
+        crate::net::dns::connecting_box_with(peer, local, |namespace| {
+            (Some(namespace) == own).then(|| SessionId::parse_str(HOST_BOX).unwrap())
+        })
+    }
+
+    /// NET-070, NET-071: on a host that cannot decide a host-address box's
+    /// egress per box, a `host_ip` deny-all box runs in no classifier leaf.
+    /// The proxy names it by its PID namespace and refuses its request with
+    /// 403 and the egress reason, and the refusal line names the box. A
+    /// request whose owner is unknown is refused with 403 too. Neither
+    /// reaches the target.
+    #[cfg(target_os = "linux")]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the fact is process-global, so the guard must span the awaited \
+                  requests it is set for"
+    )]
+    #[tokio::test]
+    async fn proxy_unplaced_host_address_caller_egress_denied() {
+        let _fact_window = crate::box_runtime::PROBE_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::box_runtime::set_host_ip_enforcement_fact(
+            &crate::net::classifier::Decision::undecidable(
+                crate::net::classifier::Cause::StepNotInstalled,
+            ),
+        );
+        assert!(!crate::box_runtime::host_ip_enforcement_fact().can_decide_per_box());
+
+        let (backend_port, received) = spawn_recording_backend().await;
+        let subnet = SwitchSubnet::default();
+        let web = SessionId::parse_str("00000000-0000-0000-0000-000000000010").unwrap();
+        let host_box = SessionId::parse_str(HOST_BOX).unwrap();
+        let deny_all = BoxPolicy {
+            egress: Some(EgressPolicy::deny_all()),
+            ingress: None,
+            credentialed_upstream: None,
+            quic443: None,
+        };
+        let registry = || {
+            let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, true);
+            reg.report_own_address(
+                web,
+                "web",
+                Ipv4Addr::LOCALHOST,
+                BTreeMap::from([(18080, backend_port)]),
+            );
+            reg.register_host_net(host_box, "hostbox");
+            reg.register_caller(host_box, "hostbox", &deny_all, subnet, None);
+            Arc::new(RwLock::new(reg))
+        };
+
+        let (buf, guard) = capture_logs();
+        for (owner, reason) in [
+            (
+                unplaced_socket_owner as super::SocketOwner,
+                "the caller's egress policy denies this target",
+            ),
+            (
+                unknown_socket_owner,
+                "the proxy cannot tell which box opened this connection",
+            ),
+        ] {
+            let router = Router::new(registry(), proxied_request_verdict).with_socket_owner(owner);
+            let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let proxy_addr = proxy.local_addr().unwrap();
+            crate::traced::spawn(serve(proxy, router));
+            let refused =
+                proxy_get_from(proxy_addr, Ipv4Addr::LOCALHOST, "web.min.internal:18080").await;
+            assert!(
+                refused.contains("403 Forbidden") && refused.contains(reason),
+                "expected 403 with {reason:?}, got: {refused}"
+            );
+        }
+        drop(guard);
+        crate::box_runtime::clear_host_ip_enforcement_fact();
+
+        assert!(
+            received.lock().unwrap().is_empty(),
+            "a refused request never reaches the target"
+        );
+        let logged = buf.contents();
+        assert!(
+            logged
+                .lines()
+                .any(|line| line.contains("network policy violation")
+                    && line.contains(r#"caller="hostbox""#)
+                    && line.contains("direction=egress")),
+            "expected the refusal line to name the caller box, got: {logged}"
+        );
     }
 
     /// NET-070, design §7.1: an ended box brought up for its destroy hooks

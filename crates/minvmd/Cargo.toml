@@ -34,6 +34,9 @@ serde_json_lenient.workspace = true
 # host forwards only what a strict collector reads the same way.
 serde_json.workspace = true
 toml.workspace = true
+# The one reader of the client `config.toml`'s `[host-exposures]` table,
+# shared with minimald so a bad entry is handled one way (NET-159).
+client-config.workspace = true
 # Cross-platform per-process resource sampling (CPU%, RSS, disk I/O) of the VMM
 # child PID, and host capacity (cores/memory) for `config set` validation (#747).
 sysinfo.workspace = true
