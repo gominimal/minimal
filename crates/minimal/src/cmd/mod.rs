@@ -295,8 +295,8 @@ impl Drop for RootSpanSlot {
 /// Run `command` inside `root`, end `root`, and return the command's
 /// [`Handoff`], if it made one. Any other error is returned as is.
 ///
-/// `root` ends when the instrumented future is dropped, at the end of the
-/// `await`, so it has closed (and its exporter has it) by the time a caller
+/// `root` ends before this function returns, when the last handle on it
+/// drops, so it has closed (and its exporter has it) by the time a caller
 /// finishes the hand-off.
 async fn run_in_root<F>(root: tracing::Span, command: F) -> Result<Option<Handoff>, anyhow::Error>
 where
