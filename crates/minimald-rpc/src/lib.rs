@@ -24,6 +24,14 @@ pub use boxes::{
 
 pub const RPC_SUBSYSTEM_PREFIX: &str = "minimald-v1-";
 
+/// The daemon's grace period between a stop's SIGTERM and its SIGKILL
+/// (BOX-013). A client that waits for a stop to land waits this long.
+pub const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The bound on one host probe the daemon makes. A stop waits this long
+/// again after its last signal for the entrypoint to be reaped.
+pub const HOST_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// The message every RPC refusal carries once the daemon has begun its
 /// shutdown: a client racing `min stop` matches on it to name the lost race
 /// in plain language instead of surfacing the raw RPC chain. Matching keys
@@ -149,7 +157,7 @@ pub fn version_skew_message(cli: &str, daemon: &str) -> Option<String> {
     })
 }
 
-/// How a user-namespace refusal opens (NET-141): the daemon formats a
+/// How a user-namespace refusal opens (NET-143): the daemon formats a
 /// create refused on the host's user-namespace verdict as this lead, the
 /// cause (`sandbox::UsernsRestriction::cause`) closing the parenthesis,
 /// and the cause's remedy for the daemon on a second line. Clients print
@@ -290,7 +298,7 @@ pub struct ResourcePool {
 /// The response to the [`ListSessions`] RPC.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListSessionsResponse {
-    /// Provider capacity shared by all sessions. Optional for compatibility
+    /// Host capacity shared by all sessions. Optional for compatibility
     /// with minimald versions that predate resource-pool reporting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_pool: Option<ResourcePool>,
@@ -350,6 +358,78 @@ pub struct ListSessionsResponse {
     /// native DNS on a host that may not have one.
     #[serde(default)]
     pub answerer_bound: bool,
+    /// Each listed box's network facts, keyed by its id (T110): the host
+    /// loopback address its ports answer at and its effective egress
+    /// posture. A box the daemon has no fact for is absent from the map,
+    /// or carries `None` in the field it cannot fill. Serde-defaulted, so
+    /// a reply from a daemon that predates the map reads as every box
+    /// unreported, and omitted when empty, so the common reply from such
+    /// a daemon is unchanged on the wire.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub box_networks: std::collections::BTreeMap<SessionId, BoxNetworkFacts>,
+}
+
+/// What a listing reports about one box's network (T110): where its ports
+/// answer on the host and what its egress is held to. Both fields are
+/// serde-defaulted and omitted when `None`, so a field this daemon could
+/// not fill reads as unreported rather than as an invented value.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BoxNetworkFacts {
+    /// The host loopback address the box's ports answer at: its own
+    /// reserved-range address (NET-010), `127.0.0.1` where the range is
+    /// absent, or the node's address for a host-address box. `None` while
+    /// the box publishes nowhere, such as before its first launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loopback_address: Option<std::net::Ipv4Addr>,
+    /// The egress posture the box is held to, from the same resolution
+    /// `GetEffectiveSessionPolicy` answers. `None` when the daemon could
+    /// not read the box's record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_posture: Option<EgressPosture>,
+    /// Whether [`Self::loopback_address`] is the `127.0.0.1` fallback an
+    /// own-address or `none` box takes where the reserved range is absent.
+    /// `Some(false)` for a host-address box, whose node address can also be
+    /// `127.0.0.1`. The client cannot tell those two apart without it.
+    /// `None` when the box reports no address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_fallback: Option<bool>,
+}
+
+/// A box's effective egress, named as one posture (T110): the summary
+/// `min session policy` prints for it. The client owns the printed words.
+/// This is the machine spelling.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EgressPosture {
+    /// No `egress` section, resolved to deny everything (NET-074).
+    DenyAllDefault,
+    /// No `egress` section, resolved to allow everything: the opt-out
+    /// (NET-077), or a box without an address of its own.
+    AllowAllDefault,
+    /// A declared section that admits nothing (NET-075).
+    DenyAll,
+    /// A declared section with rules of its own.
+    DeclaredRules,
+    /// A `none` box: it has no network, so no egress posture applies.
+    NoNetwork,
+}
+
+impl EgressPosture {
+    /// The posture of `egress`, the effective egress the gate enforces,
+    /// for a box in `network` mode. A `none` box has no network, whatever
+    /// its egress resolves to, as `min session policy` says for it.
+    #[must_use]
+    pub fn of(egress: &boxes::EffectiveEgress, network: boxes::NetworkMode) -> Self {
+        if network == boxes::NetworkMode::NoNet {
+            return Self::NoNetwork;
+        }
+        match egress {
+            boxes::EffectiveEgress::DenyAll => Self::DenyAllDefault,
+            boxes::EffectiveEgress::AllowAll => Self::AllowAllDefault,
+            boxes::EffectiveEgress::Declared(section) if section.admits_nothing() => Self::DenyAll,
+            boxes::EffectiveEgress::Declared(_) => Self::DeclaredRules,
+        }
+    }
 }
 
 impl OneshotSshRpc for ListSessions {
@@ -502,6 +582,14 @@ pub struct BoxConfig {
     /// so a client that predates the field gets hooks, not silence.
     #[serde(default = "default_hooks_enabled")]
     pub hooks_enabled: bool,
+    /// Whether the box ends with the one `min task run` it is created for
+    /// (NET-131): set by a run without `--keep`, and persisted onto the
+    /// record as [`boxes::Record::ends_with_run`] by the create itself, so
+    /// a daemon restart at any point after the create destroys the box
+    /// rather than resuming it. Defaults to `false`, which is every other
+    /// create and every client that predates the field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ends_with_run: bool,
     /// Free-form attributes (typed by the caller), persisted onto the
     /// session's record. The daemon writes none of its own: NET-079's
     /// per-box enforcement is a daemon-owned launch record, carried on the
@@ -610,7 +698,7 @@ pub const TASK_SLOTS_PER_BOX: u8 = 4;
 /// one door a client has to the host-side box table (NET-138).
 ///
 /// On a minvmd-backed host, `min session activate` opens this socket — a
-/// UDS beside the daemon's ssh socket in the provider's state dir — writes
+/// UDS beside the daemon's ssh socket in the host's state dir — writes
 /// one [`BoxControlRequest`] line of JSON — a registration when the box is
 /// created, a withdrawal when the session that registered it is destroyed
 /// or its activation fails — and reads one [`BoxControlReply`] line back.
@@ -686,6 +774,13 @@ pub struct RegisterBoxRequest {
     /// registers none.
     #[serde(default)]
     pub task_slots: u8,
+    /// Whether the box is a `host_ip` box (BEP-082). The host mints a box
+    /// id for it and allocates no address: it has no row in the address
+    /// table, and the reply is [`BoxControlReply::BoxIdMinted`]. `false`,
+    /// the default and what a client that predates the field sends, is an
+    /// own-address registration.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host_ip: bool,
 }
 
 /// The one line a held registration's client writes on the lease
@@ -824,6 +919,36 @@ pub struct RowStandingRequest {
     pub box_id: Option<BoxId>,
 }
 
+/// The in-VM daemon's ask for the id of a box it is about to create
+/// ([`BoxControlRequest::MintBoxId`], BOX-002). The VM host daemon mints
+/// every box id on an un-enrolled host and hands it to the in-VM daemon,
+/// so the in-VM daemon never mints one and never takes one from its
+/// client. Answered with [`BoxControlReply::BoxIdMinted`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MintBoxIdRequest {
+    /// The switch address the box's registration handed it, when the box
+    /// has one. The VM host daemon answers with the id it minted for the
+    /// row at that address, so the box's record and its host row name one
+    /// id. `None` for a box with no row: the VM host daemon mints a fresh
+    /// id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_address: Option<std::net::Ipv4Addr>,
+    /// One token per create, the same on every retry of that create. The
+    /// VM host daemon gives a row's id to one create only: a repeat ask
+    /// with the same token gets the same id, and an ask with another token
+    /// (or none) for a claimed row is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_token: Option<String>,
+    /// The creation name of a `host_ip` box: a box that leaves the VM from
+    /// the node's own address and has no switch address. The VM host daemon
+    /// answers with the id the box's `host_ip` registration minted under
+    /// that name, so the record and the sealed grants name one id
+    /// (BEP-082). A name with no registration takes a fresh mint. `None`
+    /// from an older in-VM daemon, and for every other box.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_ip_name: Option<String>,
+}
+
 /// A name to hold in the host's zone without a row behind it
 /// ([`BoxControlRequest::HoldBoxName`]): the interim a `host_ip` box's
 /// name answers NODATA — the box exists, no address to tell — instead
@@ -839,6 +964,65 @@ pub struct HoldBoxNameRequest {
     /// client that predates the field: the release is by name alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<boxes::SessionId>,
+}
+
+/// A `host_ip` box's egress policy, for the VM host's gate to hold while
+/// the box is resident ([`BoxControlRequest::AdmitHostIpBox`], NET-085).
+///
+/// A `host_ip` box leaves the VM from the node's own address, so it has no
+/// row of its own. The guest marks its frames, and root in the guest can
+/// write the same mark on any frame. The host gate therefore decides a
+/// marked frame from the node address by the union of the rules this verb
+/// registers, and drops it when no `host_ip` box is resident. Keyed by the
+/// session id, so an unnamed box and a task box register the same way.
+/// Answered with [`BoxControlReply::HostIpBox`]; idempotent, and a second
+/// admit for the same session replaces the policy the first one held.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostIpBoxRequest {
+    /// The session the box runs as.
+    pub session_id: boxes::SessionId,
+    /// The box's egress policy, as the session's create declared it.
+    /// Absent is the egress default's to fill, the same meaning the create
+    /// request's policy carries. The host fills it under its own phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<EgressPolicy>,
+    /// Whether the box declares a credentialed upstream (BEP-083): `true`
+    /// opens the cohort's lane to the Box Egress Proxy's listener while the
+    /// box is resident. `false`, the default and what a client that
+    /// predates the field sends, declares no lane.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub credentialed_upstream: bool,
+}
+
+/// The session whose `host_ip` box left the VM host's resident set
+/// ([`BoxControlRequest::RetireHostIpBox`]): its rules admit nothing from
+/// then on. Answered with [`BoxControlReply::HostIpBox`]; a session the set
+/// does not hold is the goal state already holding.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetireHostIpBoxRequest {
+    /// The session the box ran as.
+    pub session_id: boxes::SessionId,
+    /// How the box ended. Required, with no default: a request that does
+    /// not say whether the box stopped or was destroyed is refused at
+    /// decode, because only a destroy revokes the box's id (BEP-043). A
+    /// client that predates the field also sends a retire on `min box
+    /// stop`, so a default of destroyed would revoke the id of a box that
+    /// `min box restart` brings back. Refused, nothing is retired or
+    /// revoked.
+    pub end: HostIpBoxEnd,
+}
+
+/// How a `host_ip` box left the VM host's resident set
+/// ([`RetireHostIpBoxRequest::end`]).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HostIpBoxEnd {
+    /// The box stopped. A restart can bring it back under the same id, so
+    /// its id is not revoked.
+    Stopped,
+    /// The box was destroyed. Its id is revoked at the Box Egress Proxy
+    /// when it declared a credentialed upstream (BEP-043).
+    Destroyed,
 }
 
 /// What side of the in-VM daemon reported a runtime-admitted port (NET-045,
@@ -909,6 +1093,129 @@ pub struct WithdrawPortRequest {
     /// Which side of the in-VM daemon reported it
     /// ([`PortReportSource`]).
     pub source: PortReportSource,
+}
+
+/// Whether the listener a [`ListenNotice`] names opened or closed.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ListenState {
+    /// A process in a host-address box started to listen on the port.
+    Listening,
+    /// The listener on the port closed.
+    Stopped,
+}
+
+/// The in-VM daemon's notice that a process in a host-address box started
+/// or stopped listening on a TCP port of the guest node (NET-138, NET-129):
+/// the fixed, size-bounded message the VM host daemon mirrors the node's
+/// binds from. It carries a port and a state and nothing else — no
+/// address, no path, no name, no box — so a forged notice can only select
+/// a port at the node's own host-allocated address, never say where the
+/// host binds it or for whom. Unknown fields refuse the line.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ListenNotice {
+    /// The TCP port the listener holds in the guest node's namespace.
+    pub port: u16,
+    /// Whether the listener opened or closed.
+    pub state: ListenState,
+}
+
+impl ListenNotice {
+    /// The longest request line a listen notice can be, its verb tag
+    /// included: `{"verb":"listen_notice","port":65535,"state":"listening"}`
+    /// is 57 bytes. The VM host daemon refuses a longer `listen_notice`
+    /// line before the mirror sees it. The line is parsed first, so before
+    /// the parse only the box control channel's own line bound applies.
+    pub const MAX_LINE_BYTES: usize = 96;
+}
+
+/// Who decided a dynamic ingress request, as the in-VM daemon's expose
+/// decision report names it ([`ExposeDecisionReport`]): the same three
+/// deciders, in the same kebab-case spelling, as the in-VM daemon's own
+/// audit record.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExposeDecidedBy {
+    /// The box's own `dynamic_ingress` declaration.
+    BoxPolicy,
+    /// The attached human, answering an `ask` (NET-045).
+    AttachedHuman,
+    /// The in-VM daemon, failing an `ask` closed with nobody attached.
+    Daemon,
+}
+
+/// What became of a dynamic ingress request, as the expose decision report
+/// names it ([`ExposeDecisionReport`]).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExposeDecisionOutcome {
+    /// The port was published.
+    Published,
+    /// The request was refused.
+    Refused,
+    /// The publish could not be made.
+    PublishFailed,
+}
+
+/// The in-VM daemon's report of one dynamic ingress decision (NET-046): the
+/// host keeps a copy of each decision in its own audit log, outside the VM,
+/// so the record survives a box that erases the in-VM log.
+///
+/// Fixed and size-bounded like the port reports: the row key, the port, and
+/// three closed enums. The box is named by the host from the row at
+/// `switch_address`, never by a string the guest sends. A box with no
+/// switch has no row key, so its report carries its box id instead, and
+/// the host names the box from what it holds under that id. A report keyed
+/// at no box the host holds is refused and leaves no record.
+///
+/// Both keys are serde-defaulted, so an older guest's report, which always
+/// carries a switch address and never a box id, still reads.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExposeDecisionReport {
+    /// The switch address of the row the decision is about. `None` for a
+    /// box with no switch, which [`Self::box_id`] names instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_address: Option<std::net::Ipv4Addr>,
+    /// The box the decision is about, by its id. The host reads it only
+    /// when the report carries no switch address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub box_id: Option<BoxId>,
+    /// The port the box asked to publish.
+    pub port: u16,
+    /// The decision the box's `dynamic_ingress` setting made.
+    pub decision: DynamicIngress,
+    /// Who decided it.
+    pub decided_by: ExposeDecidedBy,
+    /// What became of the request.
+    pub outcome: ExposeDecisionOutcome,
+}
+
+/// The longest `proto` or `rule` text a [`RefusedEgressReport`] carries.
+/// The host clamps a longer one, so a report cannot grow the host's log.
+pub const REFUSED_EGRESS_TEXT_MAX: usize = 64;
+
+/// The in-VM daemon's report of one refused own-address egress flow: the
+/// relay dropped a box's frame against its egress rules and said so in its
+/// rate-limited drop line, and the same event is reported to the host,
+/// which appends it to its own audit log outside the VM.
+///
+/// Sent at most once per drop line, so under the same rate limit as that
+/// line and never once per frame. The host caps the records it writes per
+/// box again on its side, whatever the guest sends.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RefusedEgressReport {
+    /// The switch address of the row of the box whose frame was dropped.
+    pub switch_address: std::net::Ipv4Addr,
+    /// The destination the dropped frame was sent to, when it had an IPv4
+    /// destination to read.
+    pub destination: Option<std::net::SocketAddrV4>,
+    /// The frame's protocol as the drop line names it (`tcp`, `udp`,
+    /// `icmp`, `ipv6`, ...), at most [`REFUSED_EGRESS_TEXT_MAX`] bytes.
+    pub proto: String,
+    /// The rule that dropped it, as the drop line names it, at most
+    /// [`REFUSED_EGRESS_TEXT_MAX`] bytes.
+    pub rule: String,
 }
 
 /// The read-only row verb's key: the box's name, the identity a row is
@@ -1279,6 +1586,16 @@ pub enum BoxControlRequest {
     /// [`BoxControlReply::NameHeld`]; a name no hold kept is the goal
     /// state already holding.
     ReleaseBoxName(HoldBoxNameRequest),
+    /// Hold a resident `host_ip` box's egress policy on the host
+    /// ([`HostIpBoxRequest`], NET-085): the gate decides a box-marked frame
+    /// from the node address by the union of the policies held. Served on
+    /// the host's control socket only, answered with
+    /// [`BoxControlReply::HostIpBox`].
+    AdmitHostIpBox(HostIpBoxRequest),
+    /// Drop the policy [`BoxControlRequest::AdmitHostIpBox`] holds for a
+    /// session: the box stopped or was destroyed. Answered with
+    /// [`BoxControlReply::HostIpBox`].
+    RetireHostIpBox(RetireHostIpBoxRequest),
     /// The in-VM daemon's report that one of its boxes published a port at
     /// runtime (NET-138), carried on the daemon's own control channel: the
     /// host records it in the row only within the grant the host-side
@@ -1340,6 +1657,31 @@ pub enum BoxControlRequest {
     /// steered name with the proxy's address only while the answer is
     /// `true`, and SERVFAIL otherwise.
     ProxyListening,
+    /// Read every host port this VM's hostname proxy serves on (NET-150,
+    /// NET-154): served on the VM host's control socket only, answered with
+    /// [`BoxControlReply::ProxyPorts`]. A read: no state changes.
+    ProxyPorts,
+    /// The in-VM daemon's ask for the id of a box it is about to create
+    /// ([`MintBoxIdRequest`], BOX-002): carried on the daemon's own control
+    /// channel, answered with [`BoxControlReply::BoxIdMinted`].
+    MintBoxId(MintBoxIdRequest),
+    /// The in-VM daemon's report of one dynamic ingress decision
+    /// ([`ExposeDecisionReport`], NET-046): carried on the daemon's own
+    /// control channel, appended to the host's audit log, and answered with
+    /// [`BoxControlReply::Audited`].
+    ReportExposeDecision(ExposeDecisionReport),
+    /// The in-VM daemon's report of one refused own-address egress flow
+    /// ([`RefusedEgressReport`]): carried on the daemon's own control
+    /// channel, appended to the host's audit log under a per-box cap, and
+    /// answered with [`BoxControlReply::Audited`].
+    ReportRefusedEgress(RefusedEgressReport),
+    /// The in-VM daemon's notice that a host-address box's listener opened
+    /// or closed ([`ListenNotice`], NET-138): carried on the daemon's own
+    /// control channel. The VM host daemon mirrors the bind at the node's
+    /// own address and answers [`BoxControlReply::PortRecorded`] when the
+    /// mirror holds the notice, or [`BoxControlReply::Error`] naming why
+    /// it does not.
+    ListenNotice(ListenNotice),
 }
 
 /// The VM host daemon's answerer status: the state of the machine's
@@ -1644,6 +1986,17 @@ pub enum BoxControlReply {
     /// The verb succeeded: a withdrawal's echo of the pair the row went by,
     /// and a registration's answer on a daemon that predates box ids.
     Addresses(BoxAddresses),
+    /// An admit or a retire of a `host_ip` box's policy was answered: the
+    /// session back, `resident` saying which — `true` the gate holds the
+    /// box's policy now, `false` it holds none for the session. The
+    /// `resident` marker is this shape's own field, so no other reply
+    /// decodes as it.
+    HostIpBox {
+        /// The session the admit or the retire was about.
+        session_id: boxes::SessionId,
+        /// The marker: whether the gate holds the box's policy now.
+        resident: bool,
+    },
     /// A hold or a release was answered: the name back, `held` saying
     /// which — `true` a hold the table now keeps, `false` a release that
     /// freed one (or found none).
@@ -1716,6 +2069,34 @@ pub enum BoxControlReply {
         /// Whether the proxy's listener is live.
         listening: bool,
     },
+    /// The proxy-ports read's answer (NET-154): every host port the VM's
+    /// hostname proxy serves on, the preferred port first. One port while
+    /// the proxy serves on one, two once a proxy that started on a
+    /// substitute port took its preferred port back. Empty when the proxy
+    /// serves on no host port. `proxy_ports` is required — the marker that
+    /// keeps this document from decoding as any other reply.
+    ProxyPorts {
+        /// The host ports, the preferred first.
+        proxy_ports: Vec<u16>,
+    },
+    /// An audit report's answer: whether the host wrote a record for it.
+    /// `false` when the host's per-box cap suppressed the record, which the
+    /// host counts in its log instead. `audited` is required — the marker
+    /// that keeps this document from decoding as any other reply.
+    Audited {
+        /// Whether a record was written.
+        audited: bool,
+    },
+    /// The mint verb's answer (BOX-002): the id the VM host daemon minted
+    /// for the box the in-VM daemon is about to create. It is also the
+    /// answer to a `host_ip` registration ([`RegisterBoxRequest::host_ip`]):
+    /// the box's id, with no address. `minted_box_id` is required — the marker that keeps this document from decoding as any
+    /// other reply.
+    BoxIdMinted {
+        /// The box's id. The in-VM daemon files the box's record under it.
+        #[serde(with = "boxes::box_id_hex")]
+        minted_box_id: BoxId,
+    },
 }
 
 /// The request for a [`CreateSession`] RPC.
@@ -1742,15 +2123,110 @@ pub struct CreateSessionRequest {
     /// [`CreateSessionResponse::daemon_version`] it fails to echo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub must_match_version: Option<String>,
+    /// The box's spec, as the client built it from the project's entry and
+    /// the command's flags (BOX-068): a JSON object whose `v` names the
+    /// spec's shape. The daemon stores it beside the box's record before the
+    /// box starts, and refuses a create whose spec is not such an object.
+    /// `None` comes from three senders: a client that predates the field,
+    /// the dashboard create (#2635), and `min task run` of an interactive
+    /// task (#2411). The daemon then files a record with no stored spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<serde_json_lenient::Value>,
+    /// Whether the create asks for a fresh instance (BOX-163). The daemon
+    /// names the box `<name>-<n>`, with the smallest `n` that no retained
+    /// record on the host uses, and never refuses it for a held name.
+    /// `false`, the default, names the box `<name>` and refuses the create
+    /// when a running box holds that name ([`HeldNameRefusal`]). A daemon
+    /// that predates the field reads every create as `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fresh_instance: bool,
 }
+
+/// The refusal of a [`CreateSession`] whose name a running box on the host
+/// holds (BOX-163). It names the holder, as a rename's refusal does
+/// (BOX-010). The daemon sends its [`Display`](std::fmt::Display) text as
+/// the reply's error, and a client reads the holder back with
+/// [`Self::from_error`], so one definition spells and parses it.
+///
+/// `holder` is `None` only on the client: the VM host refused the box's
+/// registration under the name, and the in-VM daemon could not say which
+/// box holds it. The refusal then names the held spelling alone, and still
+/// ends the command with [`Self::EXIT_CODE`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldNameRefusal {
+    /// The name the create asked for.
+    pub name: String,
+    /// The running box that holds the name, when it is known.
+    pub holder: Option<SessionId>,
+    /// The holder's name, with the case it was given.
+    pub holder_name: String,
+}
+
+impl HeldNameRefusal {
+    /// The exit code a client ends with on this refusal (BOX-163, as
+    /// BOX-010 for a rename).
+    pub const EXIT_CODE: u8 = 2;
+
+    const HEAD: &'static str = "Cannot create a session named `";
+    const TAKEN: &'static str = "`: the running session `";
+    const HOLDS: &'static str = " holds that name.";
+
+    /// The refusal a create reply's `error` carries, or `None` when the
+    /// error is any other failure.
+    pub fn from_error(error: &str) -> Option<Self> {
+        let rest = error.strip_prefix(Self::HEAD)?;
+        let (name, rest) = rest.split_once(Self::TAKEN)?;
+        // A box name is a DNS label, so it holds no backtick.
+        let (holder_name, rest) = rest.split_once('`')?;
+        let holder = if rest.starts_with(Self::HOLDS) {
+            None
+        } else {
+            let (holder, _) = rest.strip_prefix(" (")?.split_once(')')?;
+            if !rest.contains(Self::HOLDS) {
+                return None;
+            }
+            Some(SessionId::parse_str(holder).ok()?)
+        };
+        Some(Self {
+            name: name.to_string(),
+            holder,
+            holder_name: holder_name.to_string(),
+        })
+    }
+}
+
+impl std::fmt::Display for HeldNameRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            name,
+            holder,
+            holder_name,
+        } = self;
+        let (head, taken, holds) = (Self::HEAD, Self::TAKEN, Self::HOLDS);
+        match holder {
+            Some(holder) => write!(
+                f,
+                "{head}{name}{taken}{holder_name}` ({holder}){holds} \
+                 Rename that session with `min session rename {holder} <new-name>`, \
+                 or choose another name.",
+            ),
+            None => write!(
+                f,
+                "{head}{name}{taken}{holder_name}`{holds} Choose another name.",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HeldNameRefusal {}
 
 impl CreateSessionRequest {
     /// A create request for a box named `name` over `project_path`, with
     /// the given network mode and policy. Everything else takes the value
     /// a plain create sends: no handed addresses or box id, no task
-    /// addresses, hooks on, no attrs, no sealed deliveries, no root
-    /// certificate, the session verb, no project root, and no version
-    /// assertion.
+    /// addresses, hooks on, not ended with a run, no attrs, no sealed
+    /// deliveries, no root certificate, the session verb, no project root,
+    /// no version assertion, no spec, and no fresh instance.
     pub fn new(
         name: impl Into<String>,
         project_path: paths::HostAbsPath,
@@ -1767,6 +2243,7 @@ impl CreateSessionRequest {
                 box_id: None,
                 box_addresses: None,
                 hooks_enabled: default_hooks_enabled(),
+                ends_with_run: false,
                 attrs: Default::default(),
                 sealed_deliveries: Vec::new(),
                 root_certificate: None,
@@ -1774,6 +2251,8 @@ impl CreateSessionRequest {
                 project_root: None,
             },
             must_match_version: None,
+            spec: None,
+            fresh_instance: false,
         }
     }
 }
@@ -2065,6 +2544,112 @@ pub struct SharedPortCollision {
     pub held_by: String,
 }
 
+/// What holds a declared host port that an activation refused (NET-144).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortHolder {
+    /// Another box on this machine holds the port. Carries its box name.
+    Box(String),
+    /// No box in this daemon's hostname registry holds the port, so
+    /// another program on this machine does. That program can be this
+    /// daemon's own proxy or a box of another daemon on the machine.
+    Host,
+}
+
+impl PortHolder {
+    /// The holder as the daemon log names it: `box:<name>` or `host`.
+    #[must_use]
+    pub fn log_label(&self) -> String {
+        match self {
+            Self::Box(name) => format!("box:{name}"),
+            Self::Host => "host".to_string(),
+        }
+    }
+}
+
+/// An activation refused because a declared ingress host port is already in
+/// use on this machine (NET-144): the port, the box port the declaration
+/// maps it to, and what holds it.
+///
+/// The refusal travels as the daemon's error text, which is exactly this
+/// type's [`std::fmt::Display`]. The client reads it back with
+/// [`Self::find_in`], so the two cannot drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortInUseRefusal {
+    /// The host port the declaration names.
+    pub port: u16,
+    /// The box port the declaration maps the host port to.
+    pub box_port: u16,
+    /// What holds the host port.
+    pub holder: PortHolder,
+}
+
+/// The middle of the refusal's first line, after `Port <port>`.
+const PORT_IN_USE_MIDDLE: &str = " is already in use on this machine by ";
+/// The holder clause when no box holds the port.
+const PORT_IN_USE_HOST: &str = "another program on this machine.";
+/// The refusal's second line, up to the suggested host port.
+const PORT_IN_USE_REMEDY: &str = "\nChoose another host port in --ingress (for example --ingress ";
+/// The refusal's second line, after the suggested mapping.
+const PORT_IN_USE_REMEDY_END: &str = ") or in [network] ingress in minimal.toml.";
+
+impl PortInUseRefusal {
+    /// The host port the remedy suggests: the next port up, or the one
+    /// below when the refused port is the highest.
+    #[must_use]
+    pub fn suggested_port(&self) -> u16 {
+        self.port
+            .checked_add(1)
+            .unwrap_or_else(|| self.port.saturating_sub(1))
+    }
+
+    /// The refusal inside `error`, if it carries one. The daemon's text can
+    /// arrive inside other context, so the search does not need it to open
+    /// the string.
+    #[must_use]
+    pub fn find_in(error: &str) -> Option<Self> {
+        error
+            .match_indices("Port ")
+            .find_map(|(at, _)| Self::parse_at(&error[at + "Port ".len()..]))
+    }
+
+    fn parse_at(text: &str) -> Option<Self> {
+        let digits = text.find(|c: char| !c.is_ascii_digit())?;
+        let port: u16 = text[..digits].parse().ok()?;
+        let rest = text[digits..].strip_prefix(PORT_IN_USE_MIDDLE)?;
+        let remedy = rest.find(PORT_IN_USE_REMEDY)?;
+        let holder = match &rest[..remedy] {
+            PORT_IN_USE_HOST => PortHolder::Host,
+            clause => PortHolder::Box(clause.strip_prefix("box ")?.strip_suffix('.')?.to_string()),
+        };
+        let mapping = &rest[remedy + PORT_IN_USE_REMEDY.len()..];
+        let end = mapping.find(PORT_IN_USE_REMEDY_END)?;
+        let (_, box_port) = mapping[..end].split_once(':')?;
+        Some(Self {
+            port,
+            box_port: box_port.parse().ok()?,
+            holder,
+        })
+    }
+}
+
+impl std::fmt::Display for PortInUseRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Port {}{PORT_IN_USE_MIDDLE}", self.port)?;
+        match &self.holder {
+            PortHolder::Box(name) => write!(f, "box {name}.")?,
+            PortHolder::Host => f.write_str(PORT_IN_USE_HOST)?,
+        }
+        write!(
+            f,
+            "{PORT_IN_USE_REMEDY}{}:{}{PORT_IN_USE_REMEDY_END}",
+            self.suggested_port(),
+            self.box_port
+        )
+    }
+}
+
+impl std::error::Error for PortInUseRefusal {}
+
 /// Serde helper: omit [`FinalizeSessionResponse::package_check_skipped`]
 /// when it is `false`, so the common success payload is unchanged for
 /// clients that predate the field.
@@ -2111,6 +2696,257 @@ impl OneshotSshRpc for RenameSession {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "RenameSession");
     type Request<'a> = RenameSessionRequest;
     type Response = Errorable<RenameSessionResponse>;
+}
+
+/// An RPC to stop a running box and keep its record (BOX-013, BOX-018).
+///
+/// The daemon sends SIGTERM to every process in the box, waits its grace
+/// period, sends SIGKILL to those still running, sets the record to
+/// `stopped` and records an `exited` event. With `force`, it sends SIGKILL
+/// to every process at once. The record, its events and the box's
+/// filesystem stay until the box is reaped.
+pub struct StopBox;
+
+/// The request for a [`StopBox`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StopBoxRequest {
+    /// The box to stop.
+    pub id: SessionId,
+    /// Kill every process in the box at once, with no grace period.
+    /// Absent, as from a client that does not send it, the stop is the
+    /// graceful one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force: bool,
+}
+
+/// The response for a [`StopBox`] RPC: how the stopped box ended, as its
+/// record now stores it (BOX-011).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StopBoxResponse {
+    /// The entrypoint's exit status, when it exited before a signal ended
+    /// it.
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    /// The number of the signal that ended the entrypoint, when a signal
+    /// of the stop ended it.
+    #[serde(default)]
+    pub signal: Option<i32>,
+    /// The entrypoint returned before the stop could end the box, so the
+    /// box already exited on its own and the stop changed nothing.
+    /// `exit_code` is then that exit's code. Absent, as from a daemon that
+    /// does not send it, the stop ended the box.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub already_exited: bool,
+}
+
+impl OneshotSshRpc for StopBox {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "StopBox");
+    type Request<'a> = StopBoxRequest;
+    type Response = Errorable<StopBoxResponse>;
+}
+
+/// An RPC to list the box records this host keeps, in any state
+/// (BOX-158).
+pub struct ListBoxes;
+
+/// The request for a [`ListBoxes`] RPC.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListBoxesRequest {
+    /// List only the boxes whose project root is this one. Absent, the
+    /// listing holds every box on the host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<paths::HostAbsPath>,
+}
+
+/// One box record in a [`ListBoxes`] or [`ShowBox`] reply (BOX-158,
+/// BOX-159): who the box is and the state its record is in (BOX-011).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BoxListingEntry {
+    /// The box's id.
+    pub box_id: SessionId,
+    /// The box's name, when it has one.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The box's type, `None` for a record that predates the field.
+    #[serde(default)]
+    pub box_type: Option<String>,
+    /// The box that created this one, `None` for a box created outside
+    /// any box.
+    #[serde(default)]
+    pub parent: Option<SessionId>,
+    /// The root of the project the box came from, `None` for a record
+    /// that predates the field.
+    #[serde(default)]
+    pub project_root: Option<paths::HostAbsPath>,
+    /// The record's state as BOX-011 spells it: `pending`,
+    /// `materializing`, `running`, `stopped` or `exited`.
+    pub state: String,
+    /// Why a `stopped` or `exited` box ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The entrypoint's exit status, where BOX-011 gives one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// The number of the signal that ended a stopped box.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
+    /// Whether the box's stored spec sets `io.pty_enabled`, so a client can
+    /// attach a terminal to it (BCLI-068). A daemon that predates the field
+    /// sends none, and the box reads as one with no terminal.
+    #[serde(default)]
+    pub pty_enabled: bool,
+}
+
+/// The response for a [`ListBoxes`] RPC.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListBoxesResponse {
+    /// Every retained record in the listing's scope, in box id order.
+    #[serde(default)]
+    pub boxes: Vec<BoxListingEntry>,
+}
+
+impl OneshotSshRpc for ListBoxes {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ListBoxes");
+    type Request<'a> = ListBoxesRequest;
+    type Response = Errorable<ListBoxesResponse>;
+}
+
+/// An RPC to read one box record (BOX-159).
+pub struct ShowBox;
+
+/// The request for a [`ShowBox`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShowBoxRequest {
+    /// The box to read.
+    pub id: SessionId,
+}
+
+/// The identity a box runs under, as the host reports it (BOX-140).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BoxIdentity {
+    /// The box has no per-box identity, because the host is not
+    /// enrolled with a Gatehouse. It serialises as `{"kind":"none"}`.
+    #[default]
+    None,
+    /// An identity this build does not know.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The response for a [`ShowBox`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShowBoxResponse {
+    /// The record, with its state.
+    pub record: BoxListingEntry,
+    /// The identity the box runs under.
+    #[serde(default)]
+    pub identity: BoxIdentity,
+    /// The exec id of each exec running in the box now.
+    ///
+    /// The daemon does not give an exec an id yet (BOX-149), so this
+    /// list is always empty. An empty list does not mean that no process
+    /// runs in the box. The list fills when each exec has an id:
+    /// <https://github.com/gominimal/minimal/issues/2404> (T30, BOX-149).
+    #[serde(default)]
+    pub live_execs: Vec<String>,
+}
+
+impl OneshotSshRpc for ShowBox {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ShowBox");
+    type Request<'a> = ShowBoxRequest;
+    type Response = Errorable<ShowBoxResponse>;
+}
+
+/// An RPC to reap one box: delete its record, its events and its
+/// filesystem (BOX-019, BOX-045).
+///
+/// The daemon reaps a `stopped` or `exited` box. It refuses a `running`
+/// box and leaves it running, unless `force` is set. A forced reap stops
+/// the box with the forced stop of [`StopBox`] first, then deletes it.
+pub struct ReapBox;
+
+/// The request for a [`ReapBox`] RPC.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReapBoxRequest {
+    /// The box to reap.
+    pub id: SessionId,
+    /// Stop a running box at once and then reap it. Absent, as from a
+    /// client that does not send it, a running box is refused.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force: bool,
+}
+
+/// The response for a [`ReapBox`] RPC.
+///
+/// `deny_unknown_fields`, so that `{"error": "..."}` never decodes as a
+/// reap that succeeded.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReapBoxResponse {
+    /// The box the daemon reaped, as its record read before the reap.
+    pub reaped: BoxListingEntry,
+    /// One line per `on_destroy` hook that did not succeed. A failing hook
+    /// does not stop the reap.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hook_failures: Vec<String>,
+}
+
+impl OneshotSshRpc for ReapBox {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ReapBox");
+    type Request<'a> = ReapBoxRequest;
+    type Response = Errorable<ReapBoxResponse>;
+}
+
+/// An RPC to reap every `stopped` or `exited` box that matches all the
+/// given selectors (BOX-021). The daemon never reaps a box in any other
+/// state. With no selector, every `stopped` and `exited` box matches.
+pub struct PruneBoxes;
+
+/// The request for a [`PruneBoxes`] RPC.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PruneBoxesRequest {
+    /// Match only the boxes that entered `stopped` or `exited` at least
+    /// this many seconds ago. A box with no record of when it entered
+    /// either state does not match. Absent, the age does not narrow the
+    /// prune.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub older_than_secs: Option<u64>,
+    /// Match only the boxes whose parent is this box. Absent, the parent
+    /// does not narrow the prune.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<SessionId>,
+}
+
+/// A box that a [`PruneBoxes`] matched and did not reap.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PruneFailure {
+    /// The box's id.
+    pub box_id: SessionId,
+    /// Why the daemon did not reap it.
+    pub error: String,
+}
+
+/// The response for a [`PruneBoxes`] RPC.
+///
+/// `deny_unknown_fields`, so that `{"error": "..."}` never decodes as a
+/// prune that reaped nothing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PruneBoxesResponse {
+    /// Every box the prune reaped, as its record read before the reap, in
+    /// box id order.
+    #[serde(default)]
+    pub reaped: Vec<BoxListingEntry>,
+    /// Every box the prune matched and did not reap, in box id order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed: Vec<PruneFailure>,
+}
+
+impl OneshotSshRpc for PruneBoxes {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "PruneBoxes");
+    type Request<'a> = PruneBoxesRequest;
+    type Response = Errorable<PruneBoxesResponse>;
 }
 
 /// An RPC to destroy an existing session.
@@ -2834,6 +3670,394 @@ impl CleanCacheUpdate {
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Done { .. } | Self::Failed { .. })
+    }
+}
+
+/// Read a box's lifecycle events (BOX-162), streaming.
+///
+/// Not an [`OneshotSshRpc`]: the client writes one JSON-encoded
+/// [`ReadEventsRequest`] and half-closes. The daemon then streams back one
+/// JSON-encoded [`ReadEventsUpdate`] per line: an `Event` for each retained
+/// event in the order it was written, then, with `follow`, each new event as
+/// it is written. Exactly one terminal line ends the stream: `Done` after the
+/// retained events of a read that does not follow, `Reaped` when a followed
+/// box is reaped, or `Failed`. A request the daemon refuses before it reads
+/// any event leaves the stream empty and says why on extended data.
+pub const READ_EVENTS_SUBSYSTEM: &str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ReadEvents");
+
+/// Request body for [`READ_EVENTS_SUBSYSTEM`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadEventsRequest {
+    /// The box whose events to read.
+    pub id: SessionId,
+    /// Keep the stream open after the retained events, and send each new
+    /// event as it is written, until the box is reaped or the client
+    /// closes the channel.
+    #[serde(default)]
+    pub follow: bool,
+}
+
+/// One line of a [`READ_EVENTS_SUBSYSTEM`] response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReadEventsUpdate {
+    /// One event of the box, in the order the daemon wrote it.
+    Event { event: boxes::events::BoxEvent },
+    /// Terminal: every retained event was sent, and the read does not
+    /// follow.
+    Done,
+    /// Terminal: the followed box was reaped, so no event follows.
+    Reaped,
+    /// Terminal: the read stopped on an error after it started.
+    Failed { error: String },
+}
+
+impl ReadEventsUpdate {
+    /// Whether this update ends the stream.
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self, Self::Event { .. })
+    }
+}
+
+/// Read a box's output log (BOX-155), streaming.
+///
+/// The log holds every byte the box's entrypoint wrote to its terminal,
+/// from each start of the box, whether or not a client was attached. The
+/// daemon alone writes it, outside every path the box can reach (BOX-164).
+///
+/// Not an [`OneshotSshRpc`]: the client writes one JSON-encoded
+/// [`ReadLogRequest`] and half-closes. The daemon then streams back one
+/// JSON-encoded [`ReadLogUpdate`] per line: an `Output` for each chunk of
+/// the log from the request's `offset`, in log order, then, with
+/// `follow`, each new chunk as the box writes it. Exactly one terminal
+/// line ends the stream: `Done` at the end of the log for a read that does
+/// not follow, `Reaped` when a followed box is reaped, or `Failed`. A
+/// request the daemon refuses before it reads the log, such as an unknown
+/// id, leaves the stream empty and says why on extended data.
+///
+/// The log holds at most 8 MiB. Past that, the daemon replaces the file
+/// with a line that says older output was dropped, then the newest output,
+/// half the cap in all. One stream sends no byte twice across a drop. It
+/// goes on with the bytes after the ones it already sent, so an `Output`
+/// offset can then be smaller than the one before it. When the stream fell
+/// behind by more than one drop, it sends the new file from its first
+/// byte, and the dropped-output line marks the gap.
+///
+/// The design does not state this cap yet. A box that writes more than
+/// 8 MiB loses the start of its log, which departs from
+/// docs/architecture.md line 473 ("complete from the box's start").
+/// <https://github.com/gominimal/arch/issues/159> decides the bound.
+pub const READ_LOG_SUBSYSTEM: &str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ReadLog");
+
+/// Request body for [`READ_LOG_SUBSYSTEM`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadLogRequest {
+    /// The box whose log to read.
+    pub id: SessionId,
+    /// The byte of the log file to start from: 0 for the whole log. A
+    /// later read can resume from a `Done` offset. After a drop of the
+    /// oldest output (see [`READ_LOG_SUBSYSTEM`]) the file starts again, so
+    /// an offset from before the drop does not name the same byte.
+    #[serde(default)]
+    pub offset: u64,
+    /// Keep the stream open at the end of the log, and send each new chunk
+    /// as the box writes it, until the box is reaped or the client closes
+    /// the channel.
+    #[serde(default)]
+    pub follow: bool,
+}
+
+/// One line of a [`READ_LOG_SUBSYSTEM`] response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReadLogUpdate {
+    /// The log's bytes from `offset`, in log order. The bytes are the
+    /// terminal's raw output, so the wire carries them hex-encoded.
+    Output {
+        offset: u64,
+        #[serde(with = "hex_bytes")]
+        data: Vec<u8>,
+    },
+    /// Terminal: the read reached the end of the log, and does not follow.
+    /// `offset` is the log's length, where a later read can resume.
+    Done { offset: u64 },
+    /// Terminal: the followed box was reaped, so no output follows.
+    Reaped,
+    /// Terminal: the read stopped on an error after it started.
+    Failed { error: String },
+}
+
+impl ReadLogUpdate {
+    /// Whether this update ends the stream.
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self, Self::Output { .. })
+    }
+}
+
+/// Serialises bytes as one lowercase hex string.
+mod hex_bytes {
+    use serde::{Deserialize as _, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(bytes))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(d)?;
+        hex::decode(text).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod read_events_tests {
+    use super::*;
+    use boxes::events::{BoxEvent, BoxEventType};
+
+    /// BOX-162: the request and every update line survive the wire.
+    #[test]
+    fn read_events_request_round_trips() {
+        let id = SessionId::mint();
+        for follow in [false, true] {
+            let req = ReadEventsRequest { id, follow };
+            let bytes = serde_json_lenient::to_vec(&req).unwrap();
+            let back: ReadEventsRequest = serde_json_lenient::from_slice(&bytes).unwrap();
+            assert_eq!(back, req);
+        }
+        // A client that sends no `follow` reads without following.
+        let bare = format!(r#"{{"id":"{id}"}}"#);
+        let back: ReadEventsRequest = serde_json_lenient::from_str(&bare).unwrap();
+        assert!(!back.follow);
+
+        let updates = [
+            ReadEventsUpdate::Event {
+                event: BoxEvent {
+                    box_id: id,
+                    parent: Some(SessionId::mint()),
+                    ts: 1_700_000_000_000,
+                    kind: BoxEventType::Exited,
+                    data: [("reason".to_string(), "stopped".into())]
+                        .into_iter()
+                        .collect(),
+                },
+            },
+            ReadEventsUpdate::Done,
+            ReadEventsUpdate::Reaped,
+            ReadEventsUpdate::Failed {
+                error: "the events file cannot be read".to_string(),
+            },
+        ];
+        for update in updates {
+            let bytes = serde_json_lenient::to_vec(&update).unwrap();
+            let back: ReadEventsUpdate = serde_json_lenient::from_slice(&bytes).unwrap();
+            assert_eq!(
+                back.is_terminal(),
+                !matches!(update, ReadEventsUpdate::Event { .. })
+            );
+            assert_eq!(back, update);
+        }
+    }
+}
+
+#[cfg(test)]
+mod stop_box_tests {
+    use super::*;
+
+    /// BOX-013: the stop request and its response survive the wire, and a
+    /// request without `force` reads as the graceful stop.
+    #[test]
+    fn stop_box_request_round_trips() {
+        let id = SessionId::mint();
+        for force in [false, true] {
+            let req = StopBoxRequest { id, force };
+            let bytes = serde_json_lenient::to_vec(&req).unwrap();
+            let back: StopBoxRequest = serde_json_lenient::from_slice(&bytes).unwrap();
+            assert_eq!(back, req);
+        }
+        let bare = format!(r#"{{"id":"{id}"}}"#);
+        let back: StopBoxRequest = serde_json_lenient::from_str(&bare).unwrap();
+        assert!(!back.force, "a request without force is the graceful stop");
+
+        let responses = [
+            StopBoxResponse {
+                exit_code: None,
+                signal: Some(15),
+                already_exited: false,
+            },
+            StopBoxResponse {
+                exit_code: Some(0),
+                signal: None,
+                already_exited: false,
+            },
+            StopBoxResponse {
+                exit_code: Some(3),
+                signal: None,
+                already_exited: true,
+            },
+            StopBoxResponse::default(),
+        ];
+        for response in responses {
+            let wire: Errorable<StopBoxResponse> = Errorable::Ok(response.clone());
+            let bytes = serde_json_lenient::to_vec(&wire).unwrap();
+            let back: Errorable<StopBoxResponse> = serde_json_lenient::from_slice(&bytes).unwrap();
+            match back {
+                Errorable::Ok(back) => assert_eq!(back, response),
+                Errorable::Err { error } => panic!("the response read back as an error: {error}"),
+            }
+        }
+        assert_eq!(
+            StopBox::NAME,
+            constcat::concat!(RPC_SUBSYSTEM_PREFIX, "StopBox")
+        );
+    }
+}
+
+#[cfg(test)]
+mod box_listing_tests {
+    use super::*;
+
+    fn entry(state: &str) -> BoxListingEntry {
+        BoxListingEntry {
+            box_id: SessionId::mint(),
+            name: Some("web".to_string()),
+            box_type: Some("session".to_string()),
+            parent: None,
+            project_root: Some(paths::HostAbsPath::try_new("/home/dev/proj").unwrap()),
+            state: state.to_string(),
+            reason: None,
+            exit_code: None,
+            signal: None,
+            pty_enabled: true,
+        }
+    }
+
+    /// BOX-158, BOX-159: a listing reply and a read reply keep each box's
+    /// state, its ending and its parent across the wire.
+    #[test]
+    fn box_listing_reply_carries_state_and_parent() {
+        let running = entry("running");
+        let mut stopped = entry("stopped");
+        stopped.parent = Some(running.box_id);
+        stopped.reason = Some("stopped".to_string());
+        stopped.signal = Some(15);
+        let mut exited = entry("exited");
+        exited.reason = Some("oom".to_string());
+        exited.exit_code = Some(137);
+        let listing = ListBoxesResponse {
+            boxes: vec![running.clone(), stopped.clone(), exited],
+        };
+        let bytes = serde_json_lenient::to_vec(&Errorable::Ok(listing.clone())).unwrap();
+        match serde_json_lenient::from_slice::<Errorable<ListBoxesResponse>>(&bytes).unwrap() {
+            Errorable::Ok(back) => {
+                assert_eq!(back, listing);
+                assert_eq!(back.boxes[1].state, "stopped");
+                assert_eq!(back.boxes[1].parent, Some(running.box_id));
+                assert_eq!(back.boxes[0].parent, None);
+            }
+            Errorable::Err { error } => panic!("the listing read back as an error: {error}"),
+        }
+
+        // An unscoped request is the bare object, and a scoped one keeps
+        // its project root.
+        let bare: ListBoxesRequest = serde_json_lenient::from_str("{}").unwrap();
+        assert_eq!(bare.project_root, None);
+        let scoped = ListBoxesRequest {
+            project_root: Some(paths::HostAbsPath::try_new("/home/dev/proj").unwrap()),
+        };
+        let bytes = serde_json_lenient::to_vec(&scoped).unwrap();
+        assert_eq!(
+            serde_json_lenient::from_slice::<ListBoxesRequest>(&bytes).unwrap(),
+            scoped
+        );
+
+        let show = ShowBoxResponse {
+            record: stopped,
+            identity: BoxIdentity::None,
+            live_execs: vec!["exec-1".to_string()],
+        };
+        let bytes = serde_json_lenient::to_vec(&Errorable::Ok(show.clone())).unwrap();
+        match serde_json_lenient::from_slice::<Errorable<ShowBoxResponse>>(&bytes).unwrap() {
+            Errorable::Ok(back) => assert_eq!(back, show),
+            Errorable::Err { error } => panic!("the read reply read back as an error: {error}"),
+        }
+        // BCLI-068: a record from a daemon that predates `pty_enabled`
+        // reads as a box with no terminal.
+        let older: BoxListingEntry = serde_json_lenient::from_str(&format!(
+            r#"{{"box_id":"{}","state":"running"}}"#,
+            show.record.box_id
+        ))
+        .unwrap();
+        assert!(!older.pty_enabled);
+        // The identity none serialises with the name BOX-140 reports.
+        assert_eq!(
+            serde_json_lenient::to_string(&BoxIdentity::None).unwrap(),
+            r#"{"kind":"none"}"#
+        );
+        // An identity a newer daemon reports reads as unknown, not as a
+        // failed reply.
+        let newer: BoxIdentity = serde_json_lenient::from_str(r#"{"kind":"enrolled"}"#).unwrap();
+        assert_eq!(newer, BoxIdentity::Unknown);
+
+        assert_eq!(
+            ListBoxes::NAME,
+            constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ListBoxes")
+        );
+        assert_eq!(
+            ShowBox::NAME,
+            constcat::concat!(RPC_SUBSYSTEM_PREFIX, "ShowBox")
+        );
+    }
+}
+
+#[cfg(test)]
+mod mint_box_id_tests {
+    use super::*;
+
+    /// BOX-002: the mint verb and its answer survive the wire, the answer
+    /// decodes as itself among the untagged replies, and an ask with no
+    /// switch address spells none.
+    #[test]
+    fn mint_box_id_request_and_reply_round_trip() {
+        for request in [
+            BoxControlRequest::MintBoxId(MintBoxIdRequest::default()),
+            BoxControlRequest::MintBoxId(MintBoxIdRequest {
+                switch_address: Some(std::net::Ipv4Addr::new(100, 64, 0, 7)),
+                create_token: Some("create-1".to_string()),
+                host_ip_name: None,
+            }),
+            BoxControlRequest::MintBoxId(MintBoxIdRequest {
+                switch_address: None,
+                create_token: Some("create-2".to_string()),
+                host_ip_name: Some("agent".to_string()),
+            }),
+        ] {
+            let line = serde_json_lenient::to_string(&request).unwrap();
+            assert!(line.contains(r#""verb":"mint_box_id""#), "{line}");
+            let back: BoxControlRequest = serde_json_lenient::from_str(&line).unwrap();
+            assert_eq!(back, request);
+        }
+        let bare = serde_json_lenient::to_string(&BoxControlRequest::MintBoxId(
+            MintBoxIdRequest::default(),
+        ))
+        .unwrap();
+        assert!(!bare.contains("switch_address"), "{bare}");
+        assert!(!bare.contains("create_token"), "{bare}");
+        assert!(!bare.contains("host_ip_name"), "{bare}");
+        // An older in-VM daemon's ask carries no name, and decodes as none.
+        let older: BoxControlRequest =
+            serde_json_lenient::from_str(r#"{"verb":"mint_box_id","create_token":"c"}"#).unwrap();
+        let BoxControlRequest::MintBoxId(older) = older else {
+            panic!("decoded as another verb: {older:?}");
+        };
+        assert_eq!(older.host_ip_name, None);
+
+        let reply = BoxControlReply::BoxIdMinted {
+            minted_box_id: BoxId::mint(),
+        };
+        let line = serde_json_lenient::to_string(&reply).unwrap();
+        let back: BoxControlReply = serde_json_lenient::from_str(&line).unwrap();
+        assert_eq!(back, reply);
     }
 }
 

@@ -13,7 +13,8 @@ use paths::HostAbsPath;
 pub mod client;
 pub mod core;
 pub mod daemon;
-pub mod keys;
+pub use client_config::keys;
+pub mod events;
 pub mod store;
 pub mod terminal;
 pub mod wire;
@@ -347,26 +348,57 @@ pub struct CredentialedUpstream {
     /// The `[secrets]` grants, by the environment variable each lands in.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub secrets: core::bep::SecretGrants,
+    /// The upstream authorities, each `host` or `host:port`, of the
+    /// `[secret-store-rules]` rules the creation accepted for this box's
+    /// store references. A `dns` or `both` box's lookups of their hosts are
+    /// steered to the proxy (BEP-062). Skipped when empty, so a box with no
+    /// store reference serializes as it did before the field existed, and a
+    /// daemon that predates the field still reads its policy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub store_upstreams: Vec<String>,
 }
 
 impl CredentialedUpstream {
-    /// Whether a declared lane takes effect in a box of this network mode:
-    /// the lane is admitted at the switch's gate, which only own-address
-    /// boxes sit behind. A declaration in any other mode stays on the
-    /// record and is still shown, marked as not in effect.
+    /// The host part of each of [`Self::store_upstreams`], with any port
+    /// removed: the names a steered box's lookups resolve to the proxy.
+    pub fn store_upstream_hosts(&self) -> impl Iterator<Item = &str> + '_ {
+        self.store_upstreams
+            .iter()
+            .map(|authority| match authority.rsplit_once(':') {
+                Some((host, port))
+                    if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) =>
+                {
+                    host
+                }
+                _ => authority.as_str(),
+            })
+    }
+
+    /// Whether a declared lane takes effect in a box of this network mode
+    /// on a host of this kind (BEP-085). An own-address box reaches the
+    /// proxy through the switch's gate on every host. A host-address box
+    /// reaches it only on a VM host, where the host-side gate admits the
+    /// box's cohort to the proxy's listener. On a native host a
+    /// host-address box shares the host's network, and no gate admits it.
+    /// A `none` box has no network. A declaration that is not in effect
+    /// stays on the record and is still shown, marked as not in effect.
     #[must_use]
-    pub fn in_effect(network: NetworkMode) -> bool {
-        network == NetworkMode::OwnIp
+    pub fn in_effect(network: NetworkMode, host: paths::HostKind) -> bool {
+        match network {
+            NetworkMode::OwnIp => true,
+            NetworkMode::HostNet => host == paths::HostKind::Minvmd,
+            NetworkMode::NoNet => false,
+        }
     }
 
     /// The policy row that states a declared lane, without indentation:
     /// the one text `min session policy` and the `min dash` detail pane
     /// both print, so the two surfaces cannot disagree. A box whose mode
-    /// leaves the lane without effect gets a `(not in effect: <mode> box)`
-    /// mark, the mode named by its CLI word.
+    /// leaves the lane without effect on its host gets a
+    /// `(not in effect: <mode> box)` mark, the mode named by its CLI word.
     #[must_use]
-    pub fn policy_row(network: NetworkMode) -> String {
-        if Self::in_effect(network) {
+    pub fn policy_row(network: NetworkMode, host: paths::HostKind) -> String {
+        if Self::in_effect(network, host) {
             Self::POLICY_ROW.to_string()
         } else {
             format!(
@@ -921,6 +953,7 @@ pub type SessionId = BoxId;
 ///
 /// [`CreateSessionResponse::Pending`]: ../minimald_rpc/enum.CreateSessionResponse.html#variant.Pending
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[serde(rename_all = "snake_case")]
 pub enum BoxState {
     /// Composition is in flight; the record is a stub awaiting the
@@ -943,9 +976,18 @@ pub enum BoxState {
     Materializing,
     /// Composition complete and every side-channel upload is on
     /// disk; the record is ready to apply and the session is
-    /// attachable.
+    /// attachable. This is the stored spelling of the `running` state
+    /// (BOX-011), and a record that spells it `running` loads as it.
     #[default]
+    #[serde(alias = "running")]
     Active,
+    /// A stop ended the box, or the daemon found it running with no
+    /// process left (BOX-011). The record's `reason`, `exit_code` and
+    /// `signal` say how it ended.
+    Stopped,
+    /// The box ended on its own, by timeout, or by an OOM kill (BOX-011).
+    /// The record's `reason`, `exit_code` and `signal` say how it ended.
+    Exited,
 }
 
 /// Default for [`Record::hooks_enabled`] (and for the matching field on
@@ -1339,6 +1381,24 @@ pub struct Record {
     #[serde(default)]
     pub status: BoxState,
 
+    /// The `reason` a `stopped` or `exited` record ended for (BOX-011),
+    /// as written: a reason this build does not know loads and saves
+    /// unchanged. `None` for every other state, and for records that
+    /// predate the field. Write it with [`Self::set_state`] and read it
+    /// with [`Self::state`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<crate::core::record::StoredReason>,
+
+    /// The exit code the BOX-011 table gives a `stopped` or `exited`
+    /// record, else `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+
+    /// The number of the signal that ended a `stopped` box's entrypoint
+    /// (BOX-013), else `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
+
     /// Whether this session runs the lifecycle hooks composed into it.
     /// Cleared by `min session activate --no-hooks`.
     ///
@@ -1440,6 +1500,24 @@ pub struct Record {
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub bound_ports: BTreeSet<SocketAddrV4>,
 
+    /// Set on a box created for a single `min task run` without `--keep`,
+    /// so the box dies with its run even if the daemon that accepted it
+    /// does not (NET-131): a restart's resume destroys a marked box
+    /// instead of bringing it back, which is the same teardown a finished
+    /// run's own box-end takes. Written once, by the create that mints the
+    /// record (the client's `BoxConfig::ends_with_run`), and read only by
+    /// the resume (`resume_active_sessions`, which runs on Linux only, so
+    /// on other hosts the mark is written and never read). Defaults to
+    /// `false` for every record that predates the field.
+    ///
+    /// The destroy of a run's `running` record at restart is an interim
+    /// against architecture line 495: a restart sets an orphaned
+    /// `running` record to `stopped` and keeps it (spec 29 BOX-012,
+    /// BOX-154). gominimal/inbox#731 owns the flip. The flip sets the
+    /// record to `stopped` and keeps it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ends_with_run: bool,
+
     /// The sealed value of each of the box's GitHub grants, as the
     /// creating client minted them (BEP-007). Every host launch places
     /// each one in its grant's environment variable. Empty for a box with
@@ -1490,6 +1568,36 @@ pub const SESSION_BOX_TYPE: &str = "session";
 pub const TASK_BOX_TYPE: &str = "task";
 
 impl Record {
+    /// The one state the record is in (BOX-011), read from its `status`
+    /// and its stored ending.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::core::record::UnreadableEnding`] when the record is `stopped` or
+    /// `exited` and its `reason`, `exit_code` and `signal` are not a row
+    /// of the BOX-011 table, such as a reason this build does not know.
+    pub fn state(
+        &self,
+    ) -> Result<crate::core::record::RecordState, crate::core::record::UnreadableEnding> {
+        crate::core::record::RecordState::from_stored(
+            self.status,
+            self.reason.as_ref(),
+            self.exit_code,
+            self.signal,
+        )
+    }
+
+    /// Puts the record in `state`: its `status` and the `reason`,
+    /// `exit_code` and `signal` the BOX-011 table gives the state. A state
+    /// with no ending clears all three.
+    pub fn set_state(&mut self, state: crate::core::record::RecordState) {
+        let stored = state.to_stored();
+        self.status = stored.status;
+        self.reason = stored.reason;
+        self.exit_code = stored.exit_code;
+        self.signal = stored.signal;
+    }
+
     /// [`Record::validate_policy`] plus the checks a record must pass only
     /// when it is created: added after records were already stored, they
     /// would strand an existing session if they ran on every launch.
@@ -1622,6 +1730,419 @@ impl Record {
     }
 }
 
+/// Box names on one host and across hosts (BOX-004, BOX-005, BOX-010,
+/// BOX-143).
+///
+/// A name is an alias of a record. Many retained records can share one
+/// name: only a live box (pending, materializing or running) holds it, so
+/// at most one live box on a host has a given name. Every function here
+/// is pure over the records it is given, and answers with a `box_id`,
+/// never with a name, so nothing downstream keys on the name.
+///
+/// Names compare under ASCII case folding, as hostnames do. A name that
+/// matches some record exactly picks among the exact matches only, so a
+/// legacy pair of names that differ only in case stays addressable.
+pub mod box_name {
+    use std::fmt;
+
+    use crate::{BoxId, BoxState, Record};
+
+    /// The exit code of every refusal in this module: the usage-shaped
+    /// code the BOX spec gives a name that cannot be used.
+    pub const REFUSAL_EXIT_CODE: i32 = 2;
+
+    /// The name a box can never take: it addresses the calling box.
+    pub const RESERVED_NAME: &str = "self";
+
+    /// The longest box name [`entry_box_name`] makes from an entry. It leaves
+    /// room under the 63-octet DNS label limit for a fresh instance's `-<n>`.
+    pub const ENTRY_NAME_MAX: usize = 48;
+
+    /// The box name an entry gives (BOX-163), as one DNS label: ASCII letters
+    /// and digits lowercased, `-`, `_` and `.` as `-`, other characters
+    /// dropped, at most [`ENTRY_NAME_MAX`] octets, and no `-` at either end.
+    /// An entry with nothing left names the box `box`. A `[box] name` or a
+    /// `--name` never passes through here, so an invalid one is still refused.
+    #[must_use]
+    pub fn entry_box_name(entry: &str) -> String {
+        let filtered: String = entry
+            .chars()
+            .filter_map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    Some(c.to_ascii_lowercase())
+                } else if matches!(c, '-' | '_' | '.') {
+                    Some('-')
+                } else {
+                    None
+                }
+            })
+            .take(ENTRY_NAME_MAX)
+            .collect();
+        let trimmed = filtered.trim_matches('-');
+        if trimmed.is_empty() {
+            "box".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    }
+
+    /// What a name check reads of one retained record on one host.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct NamedBox {
+        /// The record's key.
+        pub id: BoxId,
+        /// The record's current alias.
+        pub name: String,
+        /// The record's state, as its `status` stores it.
+        pub status: BoxState,
+    }
+
+    impl NamedBox {
+        /// The facts of `record`, or `None` for a record with no name.
+        #[must_use]
+        pub fn from_record(record: &Record) -> Option<Self> {
+            Some(Self {
+                id: record.id,
+                name: record.name.clone()?,
+                status: record.status,
+            })
+        }
+
+        /// Whether the box holds its name: it is pending, materializing
+        /// or running. A stopped or exited box keeps its name but does
+        /// not hold it, so a new box can reuse the name (BOX-004). A box
+        /// that is still starting holds it, so two creations of one name
+        /// cannot both reach `running`.
+        #[must_use]
+        pub fn is_running(&self) -> bool {
+            holds_name(self.status)
+        }
+
+        /// The state word a person reads: `pending`, `materializing`,
+        /// `running`, `stopped` or `exited`.
+        #[must_use]
+        pub fn state_word(&self) -> &'static str {
+            state_word(self.status)
+        }
+    }
+
+    /// Whether a box in `status` holds its name (see
+    /// [`NamedBox::is_running`]).
+    #[must_use]
+    pub fn holds_name(status: BoxState) -> bool {
+        match status {
+            BoxState::Pending | BoxState::Materializing | BoxState::Active => true,
+            BoxState::Stopped | BoxState::Exited => false,
+        }
+    }
+
+    fn state_word(status: BoxState) -> &'static str {
+        match status {
+            BoxState::Pending => "pending",
+            BoxState::Materializing => "materializing",
+            BoxState::Active => "running",
+            BoxState::Stopped => "stopped",
+            BoxState::Exited => "exited",
+        }
+    }
+
+    /// The records `name` addresses: every record whose name folds to
+    /// `name` under ASCII case. A running holder blocks its name under
+    /// case folding (see [`running_holder`]), so resolution folds case
+    /// first and uses the exact case only to break a tie.
+    #[must_use]
+    pub fn candidates<'a>(boxes: &'a [NamedBox], name: &str) -> Vec<&'a NamedBox> {
+        boxes
+            .iter()
+            .filter(|b| b.name.eq_ignore_ascii_case(name))
+            .collect()
+    }
+
+    /// The records of `found` whose name is `name` in its exact case,
+    /// when there are any, else all of `found`.
+    fn prefer_exact<'a>(found: &[&'a NamedBox], name: &str) -> Vec<&'a NamedBox> {
+        let exact: Vec<&NamedBox> = found.iter().copied().filter(|b| b.name == name).collect();
+        if exact.is_empty() {
+            found.to_vec()
+        } else {
+            exact
+        }
+    }
+
+    /// The running box on this host, other than `except`, whose name
+    /// folds to `name` under ASCII case: the box that blocks a creation,
+    /// a rename or a resume to `name` (BOX-004, BOX-010, BOX-025).
+    #[must_use]
+    pub fn running_holder<'a>(
+        boxes: &'a [NamedBox],
+        name: &str,
+        except: Option<BoxId>,
+    ) -> Option<&'a NamedBox> {
+        boxes
+            .iter()
+            .find(|b| Some(b.id) != except && b.is_running() && b.name.eq_ignore_ascii_case(name))
+    }
+
+    /// The most recently created of `boxes`. Ids are `UUIDv7`s, minted in
+    /// creation order, so the greatest id is the latest box.
+    #[must_use]
+    pub fn latest<'a>(boxes: impl IntoIterator<Item = &'a NamedBox>) -> Option<&'a NamedBox> {
+        boxes.into_iter().max_by_key(|b| b.id)
+    }
+
+    /// Resolves an unqualified name against one host (BOX-005): the
+    /// running box of that name, else the most recently created box of
+    /// that name, else `None`. Names match under ASCII case folding, so
+    /// a running `dev` answers for `Dev` even when a stopped `Dev`
+    /// exists. The exact case breaks a tie only: among the boxes that
+    /// do not run, the latest exact match wins over a folded one. Two
+    /// running boxes of one name are a store that broke BOX-004. They
+    /// resolve to the one in the exact case, else to neither.
+    #[must_use]
+    pub fn resolve_on_host(boxes: &[NamedBox], name: &str) -> Option<BoxId> {
+        let found = candidates(boxes, name);
+        let running: Vec<&NamedBox> = found.iter().copied().filter(|b| b.is_running()).collect();
+        match running.as_slice() {
+            [] => {}
+            [one] => return Some(one.id),
+            _ => {
+                return match prefer_exact(&running, name).as_slice() {
+                    [one] if one.name == name => Some(one.id),
+                    _ => None,
+                };
+            }
+        }
+        latest(prefer_exact(&found, name)).map(|b| b.id)
+    }
+
+    /// One box a name matched on one host, as a refusal lists it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Candidate {
+        /// The host the box is on.
+        pub host: String,
+        /// The box's id.
+        pub id: BoxId,
+        /// The box's name, with the case it was given.
+        pub name: String,
+        /// The box's state word (see [`NamedBox::state_word`]).
+        pub state: &'static str,
+    }
+
+    /// An unqualified name that matches boxes on more than one host, so
+    /// resolution picks none (BOX-005).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct AmbiguousName {
+        /// The name that was asked for.
+        pub name: String,
+        /// `true` when running boxes of the name are on more than one
+        /// host. `false` when no box of the name runs, and retained
+        /// records of it are on more than one host.
+        pub running: bool,
+        /// One entry per matching box, in host order.
+        pub candidates: Vec<Candidate>,
+    }
+
+    impl AmbiguousName {
+        /// The exit code of the refusal.
+        #[must_use]
+        pub fn exit_code(&self) -> i32 {
+            REFUSAL_EXIT_CODE
+        }
+    }
+
+    impl fmt::Display for AmbiguousName {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            if self.running {
+                write!(
+                    f,
+                    "Boxes named `{}` are running on more than one host. \
+                     The name alone does not choose one of them.",
+                    self.name
+                )?;
+            } else {
+                write!(
+                    f,
+                    "No box named `{}` is running. More than one host keeps a box \
+                     with that name, so the name alone does not choose one of them.",
+                    self.name
+                )?;
+            }
+            f.write_str(" Use the box id. The boxes are:")?;
+            for c in &self.candidates {
+                if self.running {
+                    write!(f, "\n  {}  {}  {}", c.host, c.id, c.name)?;
+                } else {
+                    write!(f, "\n  {}  {}  {}  {}", c.host, c.id, c.name, c.state)?;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl std::error::Error for AmbiguousName {}
+
+    /// Resolves an unqualified name against every host the caller can
+    /// reach (BOX-005). `hosts` pairs each host's name with its records.
+    ///
+    /// The answer is the host and id of the one box the name selects, or
+    /// `None` when no host has a box of that name. Running boxes win: the
+    /// name selects the running box when exactly one host runs one. When
+    /// no host runs one, the name selects the latest box of the one host
+    /// that keeps records of it.
+    ///
+    /// # Errors
+    ///
+    /// [`AmbiguousName`] when running boxes of the name are on more than
+    /// one host, or when none runs and records of it are on more than one
+    /// host. It lists every candidate with its host, and its state when
+    /// none runs.
+    pub fn resolve_across_hosts(
+        hosts: &[(String, Vec<NamedBox>)],
+        name: &str,
+    ) -> Result<Option<(String, BoxId)>, AmbiguousName> {
+        let matched: Vec<(&str, Vec<&NamedBox>)> = hosts
+            .iter()
+            .map(|(host, boxes)| (host.as_str(), candidates(boxes, name)))
+            .filter(|(_, found)| !found.is_empty())
+            .collect();
+        let running: Vec<(&str, Vec<&NamedBox>)> = matched
+            .iter()
+            .map(|(host, found)| {
+                (
+                    *host,
+                    found.iter().copied().filter(|b| b.is_running()).collect(),
+                )
+            })
+            .filter(|(_, found): &(&str, Vec<&NamedBox>)| !found.is_empty())
+            .collect();
+        let (pool, is_running) = if running.is_empty() {
+            (matched, false)
+        } else {
+            (running, true)
+        };
+        match pool.as_slice() {
+            [] => Ok(None),
+            [(host, found)] => {
+                let on_host: Vec<NamedBox> = found.iter().map(|b| (*b).clone()).collect();
+                Ok(resolve_on_host(&on_host, name).map(|id| ((*host).to_string(), id)))
+            }
+            _ => Err(AmbiguousName {
+                name: name.to_string(),
+                running: is_running,
+                candidates: pool
+                    .iter()
+                    .flat_map(|(host, found)| {
+                        found.iter().map(move |b| Candidate {
+                            host: (*host).to_string(),
+                            id: b.id,
+                            name: b.name.clone(),
+                            state: b.state_word(),
+                        })
+                    })
+                    .collect(),
+            }),
+        }
+    }
+
+    /// Why a rename was refused (BOX-010). The box, its name and its
+    /// events stay as they were.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum RenameRefusal {
+        /// A running box on the same host holds the new name.
+        HeldByRunning {
+            /// The name that was asked for.
+            name: String,
+            /// The running box that holds it.
+            holder: BoxId,
+            /// The holder's name, with the case it was given.
+            holder_name: String,
+        },
+        /// The new name is the reserved name `self`.
+        Reserved,
+    }
+
+    impl RenameRefusal {
+        /// The exit code of the refusal.
+        #[must_use]
+        pub fn exit_code(&self) -> i32 {
+            REFUSAL_EXIT_CODE
+        }
+    }
+
+    impl fmt::Display for RenameRefusal {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::HeldByRunning {
+                    name,
+                    holder,
+                    holder_name,
+                } => write!(
+                    f,
+                    "The running session `{holder_name}` ({holder}) holds the name `{name}`. \
+                     Rename it with `min session rename {holder} <new-name>`, \
+                     or choose another name."
+                ),
+                Self::Reserved => write!(
+                    f,
+                    "The name `{RESERVED_NAME}` is reserved. Choose another name."
+                ),
+            }
+        }
+    }
+
+    impl std::error::Error for RenameRefusal {}
+
+    impl From<RenameRefusal> for std::io::Error {
+        fn from(refusal: RenameRefusal) -> Self {
+            let kind = match refusal {
+                RenameRefusal::HeldByRunning { .. } => std::io::ErrorKind::AlreadyExists,
+                RenameRefusal::Reserved => std::io::ErrorKind::InvalidInput,
+            };
+            Self::new(kind, refusal)
+        }
+    }
+
+    /// The `data` of the `renamed` event a rename records (BOX-010): the
+    /// box's name before the rename under `old_name`, `null` when it had
+    /// none, and its new name under `new_name`.
+    #[must_use]
+    pub fn renamed_event_data(old_name: Option<&str>, new_name: &str) -> crate::events::EventData {
+        let mut data = crate::events::EventData::new();
+        data.insert(
+            "old_name".to_string(),
+            old_name.map_or(serde_json_lenient::Value::Null, Into::into),
+        );
+        data.insert("new_name".to_string(), new_name.into());
+        data
+    }
+
+    /// Checks a rename of box `id` to `new_name` on the host whose
+    /// records are `boxes` (BOX-010).
+    ///
+    /// # Errors
+    ///
+    /// [`RenameRefusal::Reserved`] for `self` in any case, and
+    /// [`RenameRefusal::HeldByRunning`] when another running box on the
+    /// host holds a name that folds to `new_name`.
+    pub fn check_rename(
+        boxes: &[NamedBox],
+        id: BoxId,
+        new_name: &str,
+    ) -> Result<(), RenameRefusal> {
+        if new_name.eq_ignore_ascii_case(RESERVED_NAME) {
+            return Err(RenameRefusal::Reserved);
+        }
+        if let Some(holder) = running_holder(boxes, new_name, Some(id)) {
+            return Err(RenameRefusal::HeldByRunning {
+                name: new_name.to_string(),
+                holder: holder.id,
+                holder_name: holder.name.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1708,25 +2229,41 @@ mod tests {
         }
     }
 
-    /// NET-134: the lane's row is unmarked only where the switch gate
-    /// admits it; every other mode still shows the declaration, marked
-    /// with the mode that leaves it without effect.
+    /// NET-134, BEP-085: the lane is in effect for an own-address box on
+    /// every host and for a host-address box on a VM host. Its row is
+    /// unmarked there. Every other case still shows the declaration,
+    /// marked with the mode that leaves it without effect.
     #[test]
-    fn credentialed_upstream_row_marks_modes_without_effect() {
-        assert!(CredentialedUpstream::in_effect(NetworkMode::OwnIp));
+    fn credentialed_upstream_in_effect_by_mode_and_host() {
+        use paths::HostKind::{Minimald, Minvmd};
+        const ROW: &str = "credentialed upstream  allowed to reach the Box Egress Proxy";
+        for host in [Minimald, Minvmd] {
+            assert!(CredentialedUpstream::in_effect(NetworkMode::OwnIp, host));
+            assert_eq!(
+                CredentialedUpstream::policy_row(NetworkMode::OwnIp, host),
+                ROW
+            );
+            assert!(!CredentialedUpstream::in_effect(NetworkMode::NoNet, host));
+            assert_eq!(
+                CredentialedUpstream::policy_row(NetworkMode::NoNet, host),
+                format!("{ROW} (not in effect: none box)")
+            );
+        }
+        assert!(CredentialedUpstream::in_effect(
+            NetworkMode::HostNet,
+            Minvmd
+        ));
         assert_eq!(
-            CredentialedUpstream::policy_row(NetworkMode::OwnIp),
-            "credentialed upstream  allowed to reach the Box Egress Proxy"
+            CredentialedUpstream::policy_row(NetworkMode::HostNet, Minvmd),
+            ROW
         );
-        assert!(!CredentialedUpstream::in_effect(NetworkMode::HostNet));
+        assert!(!CredentialedUpstream::in_effect(
+            NetworkMode::HostNet,
+            Minimald
+        ));
         assert_eq!(
-            CredentialedUpstream::policy_row(NetworkMode::HostNet),
-            "credentialed upstream  allowed to reach the Box Egress Proxy (not in effect: host_ip box)"
-        );
-        assert!(!CredentialedUpstream::in_effect(NetworkMode::NoNet));
-        assert_eq!(
-            CredentialedUpstream::policy_row(NetworkMode::NoNet),
-            "credentialed upstream  allowed to reach the Box Egress Proxy (not in effect: none box)"
+            CredentialedUpstream::policy_row(NetworkMode::HostNet, Minimald),
+            format!("{ROW} (not in effect: host_ip box)")
         );
     }
 
@@ -1739,6 +2276,9 @@ mod tests {
             network,
             policy,
             status: BoxState::default(),
+            reason: None,
+            exit_code: None,
+            signal: None,
             hooks_enabled: true,
             task_addresses: Vec::new(),
             box_addresses: None,
@@ -1746,6 +2286,8 @@ mod tests {
             box_id: None,
             host_row_bound: false,
             bound_ports: std::collections::BTreeSet::new(),
+            // No run ever minted these records, so none ends with one.
+            ends_with_run: false,
             sealed_deliveries: Vec::new(),
             root_certificate: None,
             box_type: None,
@@ -1787,6 +2329,38 @@ mod tests {
         }"#;
         let r: Record = serde_json_lenient::from_str(json).expect("record must load");
         assert!(!r.hooks_enabled);
+    }
+
+    /// A record written before `ends_with_run` existed loads unmarked:
+    /// the run-owned teardown must not claim a pre-existing session's
+    /// box, so an absent field reads as `false`, never as `true`.
+    #[test]
+    fn record_predating_ends_with_run_defaults_to_plain() {
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000001",
+            "name": null,
+            "username": null,
+            "project_path": "/p",
+            "attrs": {}
+        }"#;
+        let r: Record = serde_json_lenient::from_str(json).expect("legacy record must still load");
+        assert!(!r.ends_with_run);
+    }
+
+    /// An explicit `ends_with_run: true` survives deserialization rather
+    /// than being dropped by the default.
+    #[test]
+    fn record_honours_explicit_ends_with_run() {
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000001",
+            "name": null,
+            "username": null,
+            "project_path": "/p",
+            "ends_with_run": true,
+            "attrs": {}
+        }"#;
+        let r: Record = serde_json_lenient::from_str(json).expect("record must load");
+        assert!(r.ends_with_run);
     }
 
     /// NET-134: the session policy gains a box's declaration of a
@@ -2879,5 +3453,242 @@ mod tests {
     fn pending_serializes_as_pending_not_draft() {
         let s = serde_json_lenient::to_string(&BoxState::Pending).expect("serialize");
         assert_eq!(s, "\"pending\"");
+    }
+
+    // ---- Box names across hosts (BOX-005) ----
+
+    mod box_names {
+        use super::super::box_name::{
+            AmbiguousName, Candidate, NamedBox, resolve_across_hosts, resolve_on_host,
+        };
+        use crate::{BoxId, BoxState};
+        use proptest::prelude::*;
+
+        fn named(id: u128, name: &str, status: BoxState) -> NamedBox {
+            NamedBox {
+                id: BoxId::from(uuid::Uuid::from_u128(id)),
+                name: name.to_string(),
+                status,
+            }
+        }
+
+        fn id(n: u128) -> BoxId {
+            BoxId::from(uuid::Uuid::from_u128(n))
+        }
+
+        /// BOX-163: the entry cleaning keeps the edge cases the removed
+        /// client-side sanitiser covered.
+        #[test]
+        fn entry_box_name_caps_trims_drops_and_falls_back() {
+            use super::super::box_name::{ENTRY_NAME_MAX, entry_box_name};
+
+            // The cap is 48 octets of the cleaned name.
+            let long = "a".repeat(ENTRY_NAME_MAX + 12);
+            assert_eq!(entry_box_name(&long), "a".repeat(ENTRY_NAME_MAX));
+
+            // A `-` that the cap leaves at the end is trimmed again.
+            let cut_at_dash = format!("{}_{}", "a".repeat(ENTRY_NAME_MAX - 1), "b".repeat(5));
+            assert_eq!(entry_box_name(&cut_at_dash), "a".repeat(ENTRY_NAME_MAX - 1));
+
+            // Unicode, tabs and spaces drop; `_` and `.` become `-`.
+            assert_eq!(entry_box_name("\tCafé Bar\t"), "cafbar");
+            assert_eq!(entry_box_name("Build_All.v2"), "build-all-v2");
+            assert_eq!(entry_box_name("-_.dev.-_"), "dev");
+
+            // An entry that cleans to nothing names the box `box`.
+            assert_eq!(entry_box_name(""), "box");
+            assert_eq!(entry_box_name("\t日本\t"), "box");
+            assert_eq!(entry_box_name("-_."), "box");
+        }
+
+        fn status() -> impl Strategy<Value = BoxState> {
+            prop_oneof![
+                Just(BoxState::Pending),
+                Just(BoxState::Materializing),
+                Just(BoxState::Active),
+                Just(BoxState::Stopped),
+                Just(BoxState::Exited),
+            ]
+        }
+
+        /// One host's records, with distinct ids and at most one running
+        /// box per name under ASCII case, as BOX-004 keeps a store.
+        fn host_store() -> impl Strategy<Value = Vec<NamedBox>> {
+            prop::collection::vec((0..3usize, status()), 0..8).prop_map(|rows| {
+                let names = ["dev", "DEV", "web"];
+                let mut running: Vec<String> = Vec::new();
+                rows.into_iter()
+                    .enumerate()
+                    .map(|(i, (n, mut status))| {
+                        let folded = names[n].to_ascii_lowercase();
+                        if super::super::box_name::holds_name(status) {
+                            if running.contains(&folded) {
+                                status = BoxState::Stopped;
+                            } else {
+                                running.push(folded);
+                            }
+                        }
+                        // Ids grow with creation order, as minted ids do.
+                        named(u128::try_from(i).unwrap() + 1, names[n], status)
+                    })
+                    .collect()
+            })
+        }
+
+        proptest! {
+            /// BOX-005: resolution returns the unique running box of the
+            /// name on the host, else the most recently created box of the
+            /// name, else none.
+            #[test]
+            fn unqualified_name_resolves_running_else_latest_for_every_store(
+                store in host_store(),
+                asked in prop_oneof![Just("dev"), Just("Dev"), Just("DEV"), Just("web"), Just("api")],
+            ) {
+                // Case folds first: a running box of the folded name
+                // answers whatever the case of the stopped ones.
+                let folded: Vec<&NamedBox> =
+                    store.iter().filter(|b| b.name.eq_ignore_ascii_case(asked)).collect();
+                let running: Vec<&NamedBox> =
+                    folded.iter().copied().filter(|b| b.is_running()).collect();
+                let exact: Vec<&NamedBox> =
+                    folded.iter().copied().filter(|b| b.name == asked).collect();
+                let want = match running.as_slice() {
+                    [one] => Some(one.id),
+                    // The exact case breaks the tie among retained boxes.
+                    _ if !exact.is_empty() => exact.iter().map(|b| b.id).max(),
+                    _ => folded.iter().map(|b| b.id).max(),
+                };
+                prop_assert_eq!(resolve_on_host(&store, asked), want);
+            }
+        }
+
+        /// BOX-005: running boxes of the name on two hosts are ambiguous.
+        /// The refusal exits 2, lists each candidate with its host, and
+        /// picks none. A stopped box elsewhere does not join the list.
+        #[test]
+        fn unqualified_name_running_on_two_hosts_refused_exit2_lists_candidates() {
+            let hosts = vec![
+                (
+                    "local0".to_string(),
+                    vec![
+                        named(1, "dev", BoxState::Stopped),
+                        named(4, "dev", BoxState::Active),
+                    ],
+                ),
+                (
+                    "local-minvmd0".to_string(),
+                    vec![named(2, "dev", BoxState::Active)],
+                ),
+                (
+                    "remote0".to_string(),
+                    vec![named(3, "dev", BoxState::Exited)],
+                ),
+            ];
+            let err = resolve_across_hosts(&hosts, "dev").unwrap_err();
+            assert_eq!(err.exit_code(), 2);
+            assert_eq!(
+                err,
+                AmbiguousName {
+                    name: "dev".to_string(),
+                    running: true,
+                    candidates: vec![
+                        Candidate {
+                            host: "local0".to_string(),
+                            id: id(4),
+                            name: "dev".to_string(),
+                            state: "running",
+                        },
+                        Candidate {
+                            host: "local-minvmd0".to_string(),
+                            id: id(2),
+                            name: "dev".to_string(),
+                            state: "running",
+                        },
+                    ],
+                }
+            );
+            let text = err.to_string();
+            for want in [
+                "local0",
+                "local-minvmd0",
+                &id(4).to_string(),
+                &id(2).to_string(),
+            ] {
+                assert!(text.contains(want), "`{want}` missing from: {text}");
+            }
+            assert!(!text.contains("remote0"), "{text}");
+
+            // One host runs it: that box answers, whatever the others keep.
+            let one_running = vec![hosts[0].clone(), hosts[2].clone()];
+            assert_eq!(
+                resolve_across_hosts(&one_running, "dev").unwrap(),
+                Some(("local0".to_string(), id(4)))
+            );
+            // No host has it.
+            assert_eq!(resolve_across_hosts(&hosts, "web").unwrap(), None);
+        }
+
+        /// BOX-005: with no box of the name running, records of it on two
+        /// hosts are ambiguous. The refusal exits 2, lists each candidate
+        /// with its host and state, and picks none.
+        #[test]
+        fn unqualified_name_retained_on_two_hosts_none_running_refused_exit2_lists_candidates() {
+            let hosts = vec![
+                (
+                    "local0".to_string(),
+                    vec![
+                        named(1, "dev", BoxState::Stopped),
+                        named(5, "web", BoxState::Active),
+                    ],
+                ),
+                (
+                    "local-minvmd0".to_string(),
+                    vec![named(2, "Dev", BoxState::Exited)],
+                ),
+            ];
+            let err = resolve_across_hosts(&hosts, "dev").unwrap_err();
+            assert_eq!(err.exit_code(), 2);
+            assert!(!err.running);
+            assert_eq!(
+                err.candidates,
+                vec![
+                    Candidate {
+                        host: "local0".to_string(),
+                        id: id(1),
+                        name: "dev".to_string(),
+                        state: "stopped",
+                    },
+                    Candidate {
+                        host: "local-minvmd0".to_string(),
+                        id: id(2),
+                        name: "Dev".to_string(),
+                        state: "exited",
+                    },
+                ]
+            );
+            let text = err.to_string();
+            for want in [
+                "local0  ",
+                "local-minvmd0  ",
+                "stopped",
+                "exited",
+                "No box named `dev` is running",
+            ] {
+                assert!(text.contains(want), "`{want}` missing from: {text}");
+            }
+
+            // Records on one host only: its latest answers.
+            let one_host = vec![(
+                "local0".to_string(),
+                vec![
+                    named(1, "dev", BoxState::Stopped),
+                    named(3, "dev", BoxState::Exited),
+                ],
+            )];
+            assert_eq!(
+                resolve_across_hosts(&one_host, "dev").unwrap(),
+                Some(("local0".to_string(), id(3)))
+            );
+        }
     }
 }

@@ -5,7 +5,7 @@ owner: mitodrummer
 epic: gominimal/inbox#731
 arch: https://github.com/gominimal/arch/blob/823f45faf5a48349611f35d8e93e2d4695a61d4e/architecture.md
 arch_sha: "823f45faf5a48349611f35d8e93e2d4695a61d4e"
-updated: 2026-10-07
+updated: 2026-10-27
 ---
 
 # BOX — Box — one record and one spec for every session and task on a stock install
@@ -62,9 +62,10 @@ After this ships, a developer on a stock install with no identity plane runs ses
   verify:   cargo nextest run -p minvmd vm_host_mints_box_id_before_in_vm_create
   <!-- runs on the VM lane (NET-107): the behaviour exists only with the VM host daemon in the loop -->
 
-- **BOX-003** WHEN the daemon starts and finds a record without `box_type` or `parent` THE SYSTEM SHALL migrate it once to `box_type = "session"` with no parent, assigning a fresh id only when the stored id is nil, and leave it unchanged on any later start.
+- **BOX-003** WHEN the daemon starts and finds a record without `box_type` or without a `parent` key THE SYSTEM SHALL migrate it once: a record without `box_type` takes `box_type = "session"`, a record that has a `box_type` keeps it, both record no parent, a fresh id is assigned only when the stored id is nil, and the record is left unchanged on any later start.
   tier:     T0
   verify:   cargo nextest run -p boxes restart_migrates_records_missing_type_or_parent_once
+  verify:   cargo nextest run -p boxes heal_migrate_keeps_box_type_of_record_without_parent_key
 
 - **BOX-004** THE SYSTEM SHALL keep a box name unique among the running boxes of one host, let a stopped or exited box keep its name, and allow a new box on that host to reuse it.
   tier:     T1
@@ -510,7 +511,7 @@ Moved to the sibling spec `docs/specs/28-spec-box-cli` (BCLI) when the grammar w
 - Nesting, the `local-box` provider, and running `min` inside a box, including `min box spec self`: gominimal/inbox#568.
 - Memory and resource declaration, admission, the per-box cgroup limit, OOM handling and `enforced`/`advisory` reporting (epic story S15): the resources spec (gominimal/inbox#698; BRES), written from that epic.
 - The dash (epic story S14: type, state, provider and host columns; resume, reap and start from the list; the create form over entries): an amendment to `docs/specs/07-spec-min-dash-tui`, filed as a follow-up issue on that spec when this merges.
-- The local providers serving the Box Provider API (epic story S16, BPA-013): they wait on gominimal/arch#45 and are specified once it settles transport and authentication.
+- The local providers serving the Box Provider API (epic story S16, BPA-013). gominimal/arch#45 ruled on 2026-10-27 that the daemons serve them over their Unix sockets. The Box Provider requirements spec (BPA), which that ruling moves into this repository, specifies them.
 - A test-suite requirement per requirement (epic story S18): every requirement's `tier:` and `verify:` lines carry it, and the golden vectors are BOX-145.
 - Box Volumes: the sibling spec `docs/specs/27-spec-box-volumes`.
 - Remote creation, attach, listing, and providers, and any enrolled-host identity: the open remote-compute epic gominimal/inbox#513 and the DYOC tracker gominimal/inbox#494 that parents it and this epic, with the Box Provider API draft gominimal/arch#45; the earlier remote-attach and remote-boxes epics (gominimal/inbox#668, #669) are closed.
@@ -524,9 +525,9 @@ Moved to the sibling spec `docs/specs/28-spec-box-cli` (BCLI) when the grammar w
 
 **The grammar is a sibling spec.** The owner split the `min` grammar into `docs/specs/28-spec-box-cli` (BCLI) on 2026-09-25. The model lands first because it unblocks the networking and egress-proxy specs, which bind to the box spec and record rather than to verbs; the grammar is scheduled and reviewed separately; and a client other than the CLI binds to the model. So the requirements here name operations (a box is stopped, reaped, resumed, renamed) rather than commands, and BCLI maps each verb onto them.
 
-**Host-agnostic requirements, exercised on the two local providers.** Every requirement is written for any host a daemon runs on and verified on `local0` and `local-minvmd0`; a remote host inherits them unchanged, which is what makes the local box the remote box. The alternative, naming the local providers in the requirements, was rejected because the remote work would then re-specify the same behaviours. Two exceptions are deliberate: BOX-002 applies only where the host is an un-enrolled VM, since on an enrolled node the Gatehouse STS mints the id at bootstrap-grant redemption (Gatehouse §6.3 (c), v1.27), and BOX-140 names `identity.sock` because its absence is what un-enrolled means inside a box. The well-known local provider names are BCLI's.
+**Host-agnostic requirements, exercised on two local hosts.** Every requirement is written for any host a daemon runs on and verified on `local0` and `local-minvmd0`, the first hosts of the `local` and `local-minvmd` providers (gominimal/arch#45, 2026-10-27); a remote host inherits them unchanged, which is what makes the local box the remote box. The alternative, naming the local providers in the requirements, was rejected because the remote work would then re-specify the same behaviours. Two exceptions are deliberate: BOX-002 applies only where the host is an un-enrolled VM, since on an enrolled node the Gatehouse STS mints the id at bootstrap-grant redemption (Gatehouse §6.3 (c), v1.27), and BOX-140 names `identity.sock` because its absence is what un-enrolled means inside a box. The well-known local provider names are BCLI's.
 
-**The local Box Provider API, resources and the dash moved out on the author's review.** The epic committed all three. The local providers' obligations under the Box Provider API wait on gominimal/arch#45's transport and authentication decision; memory and resource declaration, admission, limits and OOM handling move to gominimal/inbox#698, whose resources spec (BRES) is written from that epic; and the dash is an amendment to `docs/specs/07-spec-min-dash-tui`. Each non-goal names its destination. This epic's work is three specs here (BOX, BVOL and BCLI) plus the resources spec under gominimal/inbox#698.
+**The local Box Provider API, resources and the dash moved out on the author's review.** The epic committed all three. The local providers' obligations under the Box Provider API follow gominimal/arch#45's 2026-10-27 ruling and belong to BPA; memory and resource declaration, admission, limits and OOM handling move to gominimal/inbox#698, whose resources spec (BRES) is written from that epic; and the dash is an amendment to `docs/specs/07-spec-min-dash-tui`. Each non-goal names its destination. This epic's work is three specs here (BOX, BVOL and BCLI) plus the resources spec under gominimal/inbox#698.
 
 **VM-host behaviours run on the VM lane.** Minting the id outside the VM exists only with the VM host daemon in the loop, so its test names the VM lane (NET-107) rather than `tier: none`. The alternative left the VM path unverified.
 
@@ -568,7 +569,7 @@ Moved to the sibling spec `docs/specs/28-spec-box-cli` (BCLI) when the grammar w
 
 **Only sessions and tasks are expanded here.** Decided on 2026-10-05: this spec expands and validates entries of type `session` and `task` and project types rooted at them (BOX-063); an entry of the other four built-in types, or from an `[agents.<name>]` or `[services.<name>]` table, is refused with exit 3 naming the type and the Agent Box epic gominimal/inbox#678 until that epic's spec lands, while BOX-059 keeps all six built-in types as data. Decided on 2026-10-06: the refusal is per entry, when that entry is expanded or created, so a file's session and task entries stay usable beside an agent entry declared for later, and BOX-145's golden vectors are the session and task entries of the architecture's example; a file-level refusal was rejected because it made that example, and any project declaring an agent ahead of time, unusable. The alternative, expanding and validating all six, was rejected because a type whose behaviour no spec defines would then expand to a box nothing here can run as the type means.
 
-**A box's output is logged from its start.** Decided on 2026-10-05: the daemon writes the entrypoint's stdout and stderr to the log from the box's start, attached or not, and an attached client is a second reader (BOX-155), so `logs` is complete after any disconnect, as the architecture's capture to `logs` for a detached box implies. The alternative, capturing only while no client holds the stdio, was rejected because a disconnect mid-run would leave a log with a gap.
+**A box's output is logged from its start.** Decided on 2026-10-05: the daemon writes the entrypoint's stdout and stderr to the log from the box's start, attached or not, and an attached client is a second reader (BOX-155), so `logs` is complete after any disconnect, as the architecture's capture to `logs` for a detached box implies. The alternative, capturing only while no client holds the stdio, was rejected because a disconnect mid-run would leave a log with a gap. Until [arch#159](https://github.com/gominimal/arch/issues/159) decides a bound, the daemon keeps at most 8 MiB of a box's log (`boxes::store::LOG_CAP`). Past the cap, the log keeps the `LOG_DROPPED` line and the newest half of the cap. The flip is the arch#159 decision: remove `LOG_CAP` if the design keeps the log complete, or change BOX-155 to the bound that the design states.
 
 **An exec may carry its own timeout.** Decided on 2026-10-06: an exec may set its own timeout, and when it expires the daemon ends that exec with BOX-150's sequence, records `exec_exited` with reason `timeout` and keeps the box running (BOX-149); the exec still runs under the box's resource ceilings and ends with the box at the box's timeout (BOX-037). The alternative, the box's ceilings only, was rejected because a hung one-off exec would then hold its process group until the whole box ends. The architecture adopted the per-exec timeout and the `timeout` reason on 2026-10-07 (gominimal/arch#114).
 

@@ -48,13 +48,74 @@ pub struct SpecBuild<'a, SF: crate::SourceFetcher> {
     /// CPU shares, for partitioning CPU when the system is contended. Maps roughly to
     /// cgroups v2 cpu.weights.
     pub cpu_weight: Option<u64>,
+
+    /// The classifier leaf of the box this build runs for, if any (NET-155).
+    /// When set, the build's sandbox runs in that leaf, so the box's egress
+    /// verdict decides every connection the build makes. When `None`, the
+    /// build runs in the cgroup of its caller, as the caller's own traffic.
+    pub classifier_leaf: Option<sandbox::config::ClassifierLeaf>,
+
+    /// The network of the box this build runs for, if the box has a network
+    /// namespace of its own and no classifier leaf (NET-155): an own-address
+    /// box. A build that needs the network attaches to it, so the box's egress
+    /// verdict decides every connection the build makes. A build that needs
+    /// no network stays in its empty namespace. `None` keeps the plan below.
+    pub box_network: Option<BuildNetwork>,
+}
+
+/// Makes the network a package build attaches to when it runs for a box with
+/// a network namespace of its own (NET-155). Each build gets a network of its
+/// own, because a network holds the reservation of one sandbox at a time and
+/// the dependency builds of one box can run at the same time.
+#[derive(Clone)]
+pub struct BuildNetwork {
+    make: std::sync::Arc<dyn Fn() -> std::sync::Arc<dyn sandbox::Network> + Send + Sync>,
+    denies_all: bool,
+}
+
+impl BuildNetwork {
+    /// A build network that `make` makes again for each build.
+    pub fn new(
+        make: impl Fn() -> std::sync::Arc<dyn sandbox::Network> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            make: std::sync::Arc::new(make),
+            denies_all: false,
+        }
+    }
+
+    /// Records whether the egress rules of the network admit no destination,
+    /// so the caller that reads a failed build can name the refusal.
+    #[must_use]
+    pub fn with_denies_all(mut self, denies_all: bool) -> Self {
+        self.denies_all = denies_all;
+        self
+    }
+
+    /// Whether the egress rules of the network admit no destination.
+    pub fn denies_all(&self) -> bool {
+        self.denies_all
+    }
+
+    /// A new network for one build.
+    pub fn network(&self) -> std::sync::Arc<dyn sandbox::Network> {
+        (self.make)()
+    }
+}
+
+impl std::fmt::Debug for BuildNetwork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BuildNetwork")
+            .field("denies_all", &self.denies_all)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
-    async fn build_deps_mapped(
-        &self,
+    async fn build_deps_mapped<'b>(
+        &mut self,
         build: &BuildSpec,
-        opts: &Options<'a>,
+        opts: &Options<'b>,
         op: &OpTracker,
     ) -> Result<Vec<SandboxMapped>, Error> {
         let mut build_deps = Vec::new();
@@ -69,6 +130,7 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
                         source,
                         remote_fetcher: self.remote_fetcher,
                         into: None,
+                        classifier_leaf: self.classifier_leaf.as_ref(),
                     }
                     .run(&Options {
                         ot: Some(op.to_owned()),
@@ -77,7 +139,14 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
                         exec_base: opts.exec_base.clone(),
                         daemon_id: opts.daemon_id.clone(),
                     })
-                    .await?;
+                    .await;
+                    let resolved_src = match resolved_src {
+                        Ok(resolved) => resolved,
+                        Err(e) => {
+                            self.report_failed_fetch(source, &e).await;
+                            return Err(e);
+                        }
+                    };
                     match resolved_src {
                         Materialized::Given(_) => unreachable!(),
                         // A copy, not a hardlink: the path is the download cache's own file,
@@ -259,9 +328,17 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
                 source,
                 remote_fetcher: self.remote_fetcher,
                 into: Some(out_dir),
+                classifier_leaf: self.classifier_leaf.as_ref(),
             }
             .run(opts)
-            .await?;
+            .await;
+            let resolved_src = match resolved_src {
+                Ok(resolved) => resolved,
+                Err(e) => {
+                    self.report_failed_fetch(source, &e).await;
+                    return Err(e);
+                }
+            };
 
             if let Materialized::Given(d) = resolved_src {
                 let build_ms = Instant::now().duration_since(start).as_millis() as usize;
@@ -278,6 +355,120 @@ impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
         } else {
             panic!("prebuilt input was not source: {:?}", build.build_deps[0]);
         }
+    }
+}
+
+/// `url` without its credentials, its query and its fragment, or `None`
+/// when it is not a URL.
+pub(crate) fn stripped_url(url: &str) -> Option<String> {
+    let mut parsed = url::Url::parse(url).ok()?;
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    Some(parsed.to_string())
+}
+
+/// `text` with each URL in it stripped as `stripped_url` strips one. A URL
+/// runs from its scheme to the next space, quote, bracket or parenthesis.
+/// One that does not parse is replaced whole, so no credential in it stays.
+pub(crate) fn strip_urls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        let start = rest[..at]
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+            .map_or(0, |i| i + 1);
+        let end = rest[at..]
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '(' | ')'))
+            .map_or(rest.len(), |i| at + i);
+        out.push_str(&rest[..start]);
+        if start == at {
+            // No scheme before the `://`: not a URL.
+            out.push_str(&rest[start..end]);
+        } else {
+            match stripped_url(&rest[start..end]) {
+                Some(url) => out.push_str(&url),
+                None => out.push_str("<url>"),
+            }
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+impl<'a, SF: crate::SourceFetcher> SpecBuild<'a, SF> {
+    /// Writes a web source this build could not fetch to the build's stderr
+    /// (NET-155), so the output of a build placed for a box names the source
+    /// and its host. A daemon that reads the output can then say which
+    /// destination the box's egress rules refused. The URL is written without
+    /// its credentials and its query.
+    async fn report_failed_fetch(&mut self, source: &graph::SourceInput, e: &Error) {
+        use tokio::io::AsyncWriteExt;
+        let graph::SourceFetch::Web { url, .. } = &source.from else {
+            return;
+        };
+        let Some(writer) = self.stderr_writer.as_mut() else {
+            return;
+        };
+        let Some(shown) = stripped_url(url) else {
+            return;
+        };
+        // The error can quote a URL too: reqwest's names the request's.
+        let line = format!(
+            "could not fetch the source {shown}: {}\n",
+            strip_urls(&e.to_string())
+        );
+        let _ = writer.write_all(line.as_bytes()).await;
+        let _ = writer.flush().await;
+    }
+
+    /// The sandbox configuration this build runs in. A build placed for a box
+    /// (NET-155) carries that box's classifier leaf, so its sandbox joins the
+    /// box's leaf and not the leaf of the process that starts it.
+    fn sandbox_config(
+        &self,
+        build: &BuildSpec,
+        inputs: Vec<SandboxMapped>,
+        rootfs: HashSet<SandboxMapped>,
+        needs_dns: bool,
+        needs_internet: bool,
+        daemon_id: Option<&String>,
+    ) -> sandbox::config::Config {
+        let mut config = sandbox::config::Config::new(&build.name)
+            .with_isolated_wd(inputs.into_iter())
+            .with_rootfs(rootfs.into_iter())
+            .with_dns(needs_dns)
+            // A build that needs neither DNS nor the internet runs in an empty
+            // network namespace; anything else shares the host's. Said as a plan
+            // rather than as a mode: a build is not a PTask and has never had
+            // one, and the sandbox layer acts on plans.
+            .with_plan(if !needs_dns && !needs_internet {
+                sandbox::NetPlan::isolated()
+            } else {
+                sandbox::NetPlan::host()
+            });
+        if let Some(a) = &build.build_args {
+            config = config.with_build_args(a.iter());
+        }
+        if let Some(w) = self.cpu_weight {
+            config = config.with_cpu_weight(w);
+        }
+        if let Some(id) = daemon_id {
+            config = config.with_daemon_id(id.clone());
+        }
+        if let Some(leaf) = &self.classifier_leaf {
+            config = config.with_classifier_leaf(leaf.clone());
+        }
+        // NET-155: a build that needs the network, for an own-address box,
+        // runs on that box's network and under its egress verdict.
+        if let Some(network) = &self.box_network
+            && (needs_dns || needs_internet)
+        {
+            config = config.with_network(network.network());
+        }
+        config
     }
 }
 
@@ -315,28 +506,14 @@ impl<'a, SF: crate::SourceFetcher> Runnable for SpecBuild<'a, SF> {
 
         let channel = ();
 
-        let mut config = sandbox::config::Config::new(&build.name)
-            .with_isolated_wd(inputs.into_iter())
-            .with_rootfs(rootfs.into_iter())
-            .with_dns(needs_dns)
-            // A build that needs neither DNS nor the internet runs in an empty
-            // network namespace; anything else shares the host's. Said as a plan
-            // rather than as a mode: a build is not a PTask and has never had
-            // one, and the sandbox layer acts on plans.
-            .with_plan(if !needs_dns && !needs_internet {
-                sandbox::NetPlan::isolated()
-            } else {
-                sandbox::NetPlan::host()
-            });
-        if let Some(a) = &build.build_args {
-            config = config.with_build_args(a.iter());
-        }
-        if let Some(w) = self.cpu_weight {
-            config = config.with_cpu_weight(w);
-        }
-        if let Some(id) = &opts.daemon_id {
-            config = config.with_daemon_id(id.clone());
-        }
+        let config = self.sandbox_config(
+            build,
+            inputs,
+            rootfs,
+            needs_dns,
+            needs_internet,
+            opts.daemon_id.as_ref(),
+        );
         let mut sandbox = config.build(&opts.exec_base, channel).await?;
         sandbox.keep_dir(true);
 
@@ -426,6 +603,28 @@ mod tests {
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
+    /// NET-155: the line a failed web-source fetch writes to the build's
+    /// stderr keeps no credential and no query of any URL its error quotes.
+    #[test]
+    fn failed_fetch_line_strips_urls() {
+        assert_eq!(
+            strip_urls(
+                "error sending request for url \
+                 (https://user:secret@downloads.example.org/a.tar.gz?token=t0k#f): \
+                 could not connect to downloads.example.org:443: refused"
+            ),
+            "error sending request for url \
+             (https://downloads.example.org/a.tar.gz): \
+             could not connect to downloads.example.org:443: refused"
+        );
+        assert_eq!(strip_urls("no scheme ://here"), "no scheme ://here");
+        assert_eq!(strip_urls("bad http://user:pw@[::1 end"), "bad <url> end");
+        assert_eq!(
+            stripped_url("http://u:p@example.org/x?y=1").as_deref(),
+            Some("http://example.org/x")
+        );
+    }
+
     /// A [`SourceFetcher`] that must never be called. The build paths exercised
     /// here short-circuit before any source is fetched, so reaching either
     /// method indicates the function (or the test) took an unexpected branch.
@@ -437,8 +636,9 @@ mod tests {
             &self,
             _url: &str,
             _sha256: &str,
+            _leaf: Option<&sandbox::config::ClassifierLeaf>,
             _op: &OpTracker,
-        ) -> anyhow::Result<PathBuf> {
+        ) -> anyhow::Result<(PathBuf, bool)> {
             unreachable!("source fetch must not happen on these build paths")
         }
 
@@ -462,9 +662,10 @@ mod tests {
             &self,
             _url: &str,
             _sha256: &str,
+            _leaf: Option<&sandbox::config::ClassifierLeaf>,
             _op: &OpTracker,
-        ) -> anyhow::Result<PathBuf> {
-            Ok(self.0.clone())
+        ) -> anyhow::Result<(PathBuf, bool)> {
+            Ok((self.0.clone(), false))
         }
 
         async fn download_gcs(
@@ -496,6 +697,8 @@ mod tests {
             stderr_writer: None,
             cancel: CancellationToken::new(),
             cpu_weight: None,
+            classifier_leaf: None,
+            box_network: None,
         }
     }
 
@@ -601,7 +804,7 @@ mod tests {
         "#});
         let bsr = *dg.by_name("uses-raw-source").unwrap();
         let fetcher = OneFileFetcher(cached.clone());
-        let sb = SpecBuild {
+        let mut sb = SpecBuild {
             spec: &bsr,
             remote_fetcher: &fetcher,
             override_deps: None,
@@ -609,6 +812,8 @@ mod tests {
             stderr_writer: None,
             cancel: CancellationToken::new(),
             cpu_weight: None,
+            classifier_leaf: None,
+            box_network: None,
         };
         let opts = Options {
             cache: cache.clone(),
@@ -621,5 +826,53 @@ mod tests {
         let op = OpTracker::new_root();
         let deps = futures::executor::block_on(sb.build_deps_mapped(build, &opts, &op)).unwrap();
         assert_eq!(deps, vec![SandboxMapped::FileCopy(cached)]);
+    }
+
+    /// NET-155: a spec build placed for a box runs its sandbox in that box's
+    /// classifier leaf. A build with no placement names no leaf, so its
+    /// sandbox stays in the cgroup of the process that starts it.
+    #[test]
+    fn spec_build_runs_in_the_given_classifier_leaf() {
+        let dg = graph_from(indoc! {r#"
+            let {BuildSpec, ..} = import "minimal.ncl" in
+            {
+                name = "downloads-at-build",
+                build_deps = [],
+                cmd = "curl https://example.invalid/",
+            } | BuildSpec
+        "#});
+        let bsr = *dg.by_name("downloads-at-build").unwrap();
+        let build = dg.get(&bsr).unwrap();
+        let fetcher = UnusedFetcher;
+        let leaf = sandbox::config::ClassifierLeaf::under(
+            std::path::Path::new("/sys/fs/cgroup/minimald.slice"),
+            "box-1",
+            sandbox::config::Verdict::Deny,
+        );
+
+        let mut placed = spec_build(&bsr, &fetcher);
+        placed.classifier_leaf = Some(leaf.clone());
+        let config = placed.sandbox_config(build, Vec::new(), HashSet::new(), true, true, None);
+        assert_eq!(config.classifier_leaf, Some(leaf));
+
+        let unplaced = spec_build(&bsr, &fetcher);
+        let config = unplaced.sandbox_config(build, Vec::new(), HashSet::new(), true, true, None);
+        assert_eq!(config.classifier_leaf, None);
+        assert!(config.network.is_none());
+
+        // An own-address box has no leaf. Its build runs on the box's own
+        // network when the build needs the network, and in an empty
+        // namespace when it does not.
+        let mut on_box_network = spec_build(&bsr, &fetcher);
+        on_box_network.box_network = Some(BuildNetwork::new(|| {
+            std::sync::Arc::new(sandbox::NoNet) as std::sync::Arc<dyn sandbox::Network>
+        }));
+        let config =
+            on_box_network.sandbox_config(build, Vec::new(), HashSet::new(), true, true, None);
+        assert_eq!(config.classifier_leaf, None);
+        assert!(config.network.is_some());
+        let config =
+            on_box_network.sandbox_config(build, Vec::new(), HashSet::new(), false, false, None);
+        assert!(config.network.is_none());
     }
 }

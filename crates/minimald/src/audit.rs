@@ -148,8 +148,8 @@ pub(crate) fn rotated_path(state_dir: &Path) -> PathBuf {
 /// failure the caller fails closed on. The daemon's own log, which the
 /// diagnostic bundle ships beside this file's tail, carries the failure
 /// either way.
-pub(crate) async fn append(state_dir: &Path, record: &DecisionRecord) {
-    if let Err(e) = try_append(state_dir, record).await {
+pub(crate) async fn append(state_dir: &Path, record: &DecisionRecord, host: &HostReportKey) {
+    if let Err(e) = try_append_capped(state_dir, record, MAX_LOG_BYTES).await {
         tracing::warn!(
             box = %record.box_name,
             port = record.port,
@@ -157,6 +157,52 @@ pub(crate) async fn append(state_dir: &Path, record: &DecisionRecord) {
             "the dynamic ingress decision could not be audited"
         );
     }
+    // A refusal goes to the host whether or not the local line landed: the
+    // host's copy is the one a box cannot reach, and it names a refusal
+    // that stands either way.
+    report_to_host(record, host);
+}
+
+/// How the VM host daemon finds the box a decision is about, when the box has
+/// no audit route by switch address (NET-046). The host names a box with no
+/// switch by its id, and the report goes over the box's own control channel.
+/// Not written to the local log: the record names the box already.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct HostReportKey {
+    /// The box's id, which the report carries when no route names the box.
+    pub(crate) box_id: Option<boxes::BoxId>,
+    /// The box's switch control channel. Its VM host door carries a report
+    /// keyed by box id. A native channel has no door, so nothing is sent.
+    #[cfg(target_os = "linux")]
+    pub(crate) control: Option<crate::net::policy::ControlChannel>,
+}
+
+/// Reports `record` to the VM host daemon, which keeps its own copy of the
+/// decision outside the VM (NET-046). Best-effort and in the background:
+/// the local record is the decision's own, and a host that cannot be
+/// reached never changes it. A daemon with no VM host behind the box sends
+/// nothing. A box with no switch is named by the box id in `host`.
+fn report_to_host(record: &DecisionRecord, host: &HostReportKey) {
+    #[cfg(target_os = "linux")]
+    crate::net::listeners::report_expose_decision(
+        &record.box_name,
+        host.box_id,
+        host.control.as_ref(),
+        record.port,
+        record.decision,
+        match record.decided_by {
+            DecidedBy::BoxPolicy => minimald_rpc::ExposeDecidedBy::BoxPolicy,
+            DecidedBy::AttachedHuman => minimald_rpc::ExposeDecidedBy::AttachedHuman,
+            DecidedBy::Daemon => minimald_rpc::ExposeDecidedBy::Daemon,
+        },
+        match record.outcome {
+            DecisionOutcome::Published => minimald_rpc::ExposeDecisionOutcome::Published,
+            DecisionOutcome::Refused => minimald_rpc::ExposeDecisionOutcome::Refused,
+            DecisionOutcome::PublishFailed => minimald_rpc::ExposeDecisionOutcome::PublishFailed,
+        },
+    );
+    #[cfg(not(target_os = "linux"))]
+    let _ = (record, host);
 }
 
 /// Appends one decision to the log (NET-046), rotating it first when the
@@ -164,8 +210,18 @@ pub(crate) async fn append(state_dir: &Path, record: &DecisionRecord) {
 /// landed: the caller of an allow refuses the exposure on an `Err`, because
 /// NET-046 requires every decision recorded and an allow is the one decision
 /// that can still be taken back.
-pub(crate) async fn try_append(state_dir: &Path, record: &DecisionRecord) -> std::io::Result<()> {
-    try_append_capped(state_dir, record, MAX_LOG_BYTES).await
+///
+/// A record that landed is also reported to the VM host daemon, in the
+/// background. One that did not land is not: the caller withdraws the
+/// allow it names, and records that withdrawal through [`append`].
+pub(crate) async fn try_append(
+    state_dir: &Path,
+    record: &DecisionRecord,
+    host: &HostReportKey,
+) -> std::io::Result<()> {
+    try_append_capped(state_dir, record, MAX_LOG_BYTES).await?;
+    report_to_host(record, host);
+    Ok(())
 }
 
 /// [`try_append`] with the rotation threshold passed in, so a test can rotate
@@ -368,6 +424,7 @@ mod tests {
                 outcome: DecisionOutcome::Published,
                 reason: None,
             },
+            &HostReportKey::default(),
         )
         .await;
         append(
@@ -381,6 +438,7 @@ mod tests {
                 outcome: DecisionOutcome::Refused,
                 reason: Some("dynamic ingress is denied for this box".to_string()),
             },
+            &HostReportKey::default(),
         )
         .await;
 
@@ -446,7 +504,7 @@ mod tests {
             std::fs::write(&planted, "planted\n").unwrap();
             std::os::unix::fs::symlink(&planted, log_path(state_dir)).unwrap();
 
-            append(state_dir, &record).await;
+            append(state_dir, &record, &HostReportKey::default()).await;
 
             assert_eq!(
                 std::fs::read_to_string(&planted).unwrap(),
@@ -480,7 +538,7 @@ mod tests {
             std::fs::create_dir_all(&planted_dir).unwrap();
             std::os::unix::fs::symlink(&planted_dir, state_dir.join("audit")).unwrap();
 
-            append(state_dir, &record).await;
+            append(state_dir, &record, &HostReportKey::default()).await;
 
             assert!(
                 !planted_dir.join("decisions.log").exists(),
@@ -598,7 +656,7 @@ mod tests {
         std::fs::create_dir_all(&planted_dir).unwrap();
         std::os::unix::fs::symlink(&planted_dir, state_dir.join("audit")).unwrap();
 
-        let error = try_append(state_dir, &record_for(3000))
+        let error = try_append(state_dir, &record_for(3000), &HostReportKey::default())
             .await
             .expect_err("a symlinked audit directory refuses the append");
         assert!(

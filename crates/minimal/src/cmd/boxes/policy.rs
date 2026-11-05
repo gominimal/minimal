@@ -74,6 +74,42 @@ pub fn print_classifier_advisory(
     }
 }
 
+/// The words `min session policy` and `min ls` both print for a box's
+/// egress posture (T110), so the two surfaces cannot drift. A default is
+/// marked as one. A declared deny-all is not, because the box chose it. A
+/// declaration with rules of its own reads as `declared rules`, the rows
+/// `min session policy` lists under it.
+#[must_use]
+pub fn egress_posture_words(posture: minimald_rpc::EgressPosture) -> &'static str {
+    match posture {
+        minimald_rpc::EgressPosture::DenyAllDefault => "deny-all (default)",
+        minimald_rpc::EgressPosture::AllowAllDefault => "allow-all (default)",
+        minimald_rpc::EgressPosture::DenyAll => "deny-all",
+        minimald_rpc::EgressPosture::DeclaredRules => "declared rules",
+        minimald_rpc::EgressPosture::NoNetwork => "no network",
+    }
+}
+
+/// The EGRESS cell `min ls` prints for a box (T110): the posture in
+/// [`egress_posture_words`]' words, with `; per-box enforcement none`
+/// appended for a host-address box this host cannot decide per box, the
+/// fact `min session policy` prints as its `per-box enforcement` row. A
+/// posture the daemon did not report prints `-`.
+#[must_use]
+pub fn egress_posture_cell(
+    posture: Option<minimald_rpc::EgressPosture>,
+    host_ip_enforcement: Option<boxes::HostIpEnforcement>,
+) -> String {
+    let Some(posture) = posture else {
+        return "-".to_string();
+    };
+    let words = egress_posture_words(posture);
+    match host_ip_enforcement {
+        Some(boxes::HostIpEnforcement::None) => format!("{words}; per-box enforcement none"),
+        _ => words.to_string(),
+    }
+}
+
 /// Render a session's effective policy as its rules: the egress the gate
 /// enforces (NET-074/NET-075) — a declared section's dimensions each
 /// resolved to its list or its default (`allow-all`; `deny subnets` reads
@@ -137,6 +173,38 @@ pub fn format_policy(
     shared_port_collisions: &[minimald_rpc::SharedPortCollision],
     fabric: Option<switch::SwitchSubnet>,
 ) -> Result<(), anyhow::Error> {
+    format_policy_on_host(
+        out,
+        effective,
+        network,
+        host_ip_enforcement,
+        shared_port_collisions,
+        fabric,
+        false,
+    )
+}
+
+/// [`format_policy`], told whether the box runs on a native host.
+/// `native_host` is the caller's fact about the daemon it talks to (the
+/// host kind), never derived from `fabric`: `fabric` names a switch plan
+/// and says nothing about the host. On a native host a host-address box
+/// prints a row that says the host exposures do not apply to it (NET-160).
+pub fn format_policy_on_host(
+    out: &mut impl std::io::Write,
+    effective: &boxes::EffectiveBoxPolicy,
+    network: boxes::NetworkMode,
+    host_ip_enforcement: Option<boxes::HostIpEnforcement>,
+    shared_port_collisions: &[minimald_rpc::SharedPortCollision],
+    fabric: Option<switch::SwitchSubnet>,
+    native_host: bool,
+) -> Result<(), anyhow::Error> {
+    // BEP-085: the credentialed-upstream row reads the host kind too, since
+    // a host-address box's lane is in effect on a VM host only.
+    let host_kind = if native_host {
+        paths::HostKind::Minimald
+    } else {
+        paths::HostKind::Minvmd
+    };
     // A none box has no network, so it can carry no egress or ingress
     // declaration at all — nothing the blocks print would describe anything
     // real (the same case the TUI's detail pane replaces with this note).
@@ -148,13 +216,14 @@ pub fn format_policy(
             writeln!(
                 out,
                 "  {}",
-                boxes::CredentialedUpstream::policy_row(network)
+                boxes::CredentialedUpstream::policy_row(network, host_kind)
             )?;
         }
         return Ok(());
     }
     writeln!(out, "egress")?;
-    if let Some(label) = effective.egress.summary_label() {
+    let posture = minimald_rpc::EgressPosture::of(&effective.egress, network);
+    if posture != minimald_rpc::EgressPosture::DeclaredRules {
         // A verdict by name rather than as rows: the defaults marked as
         // defaults, and the declared deny-all section unmarked — every list
         // empty would render as blankness, which reads as nothing, the one
@@ -162,8 +231,8 @@ pub fn format_policy(
         // nothing"). The mark is the difference between a verdict the box
         // chose and the one the rollout chose for it, and the JSON document
         // carries the same distinction as `source`. The label is the
-        // `boxes` crate's, shared with the TUI's detail pane.
-        writeln!(out, "  {label}")?;
+        // posture's own words, shared with `min ls` (T110).
+        writeln!(out, "  {}", egress_posture_words(posture))?;
     } else if let boxes::EffectiveEgress::Declared(egress) = &effective.egress {
         write_rules(out, "subnets", egress.allow_subnets.as_ref(), "allow-all")?;
         write_rules(
@@ -220,7 +289,19 @@ pub fn format_policy(
         writeln!(
             out,
             "  {}",
-            boxes::CredentialedUpstream::policy_row(network)
+            boxes::CredentialedUpstream::policy_row(network, host_kind)
+        )?;
+    }
+    // NET-160: a host-address box on a native host runs in the host's own
+    // network namespace, so no gate applies the host exposures table to it
+    // (design §7.1 Lanes, NET-079). The row says so in place of a list of
+    // exposures. `native_host` is the caller's host kind. On a VM-backed
+    // host the box sits behind the host-side gate, and the row is not
+    // printed.
+    if network == boxes::NetworkMode::HostNet && native_host {
+        writeln!(
+            out,
+            "  host exposures  not applied: this box shares the host's network"
         )?;
     }
     // The node-plane baseline set, beside the box's rules (NET-130): the
@@ -249,7 +330,7 @@ pub fn format_policy(
                 out,
                 "  {}  {}",
                 entry.category().as_str(),
-                entry.endpoints().join(", ")
+                baseline.display_endpoints(entry).join(", ")
             )?;
         }
     }
@@ -602,8 +683,8 @@ fn no_shared_port_collisions(rows: &&[minimald_rpc::SharedPortCollision]) -> boo
 
 /// A declared credentialed-upstream lane as the document carries it: the
 /// declaration as declared, plus `effective`, whether the box's network
-/// mode admits the lane (own-address only) — the machine form of the text
-/// row's `(not in effect: …)` mark.
+/// mode admits the lane on its host (BEP-085) — the machine form of the
+/// text row's `(not in effect: …)` mark.
 #[derive(serde::Serialize)]
 struct PolicyCredentialedUpstreamJson<'a> {
     #[serde(flatten)]
@@ -615,10 +696,11 @@ impl<'a> PolicyCredentialedUpstreamJson<'a> {
     fn from_effective(
         effective: &'a boxes::EffectiveBoxPolicy,
         network: boxes::NetworkMode,
+        host_kind: paths::HostKind,
     ) -> Option<Self> {
         effective.credentialed_upstream.as_ref().map(|lane| Self {
             lane,
-            effective: boxes::CredentialedUpstream::in_effect(network),
+            effective: boxes::CredentialedUpstream::in_effect(network, host_kind),
         })
     }
 }
@@ -648,7 +730,8 @@ enum LiveIngressJson {
 /// command walks for so the two renderings describe the same policy: the
 /// live rows arrive as the fetch's own result, served or failed, because
 /// which of the two it was is part of what the document says. Shared with
-/// the tests that pin the document, the way [`format_policy`] is.
+/// the tests that pin the document, the way [`format_policy`] is. Like
+/// [`format_policy`], it renders for a VM host.
 pub fn write_policy_json(
     out: &mut impl std::io::Write,
     effective: &boxes::EffectiveBoxPolicy,
@@ -661,6 +744,7 @@ pub fn write_policy_json(
         out,
         effective,
         network,
+        paths::HostKind::Minvmd,
         fabric,
         live,
         shared_port_collisions,
@@ -672,11 +756,14 @@ pub fn write_policy_json(
 /// unpublished because their audit record could not be written (NET-046)
 /// carried as `unaudited_listen_ports` — the key a machine reads the
 /// fail-closed listen-publish from, the way a person reads the text
-/// rendering's warning lines.
+/// rendering's warning lines. `host_kind` is the kind of the daemon the
+/// caller talks to: the lane's `effective` reads it (BEP-085).
+#[allow(clippy::too_many_arguments)]
 pub fn write_policy_json_noting(
     out: &mut impl std::io::Write,
     effective: &boxes::EffectiveBoxPolicy,
     network: boxes::NetworkMode,
+    host_kind: paths::HostKind,
     fabric: Option<switch::SwitchSubnet>,
     live: Result<Vec<minimald_rpc::LiveMapping>, String>,
     shared_port_collisions: &[minimald_rpc::SharedPortCollision],
@@ -694,7 +781,7 @@ pub fn write_policy_json_noting(
             ingress: None,
             // A declared lane is still carried, marked not in effect.
             credentialed_upstream: PolicyCredentialedUpstreamJson::from_effective(
-                effective, network,
+                effective, network, host_kind,
             ),
             node_plane_baseline: None,
             live_ingress: None,
@@ -716,7 +803,7 @@ pub fn write_policy_json_noting(
                     .iter()
                     .map(|entry| PolicyBaselineEntryJson {
                         category: entry.category().as_str(),
-                        endpoints: entry.endpoints().to_vec(),
+                        endpoints: baseline.display_endpoints(entry),
                     })
                     .collect(),
             })
@@ -735,9 +822,9 @@ pub fn write_policy_json_noting(
             // The lane rides the document the way the text rendering prints
             // it: only when declared, so the key's absence is the no-lane
             // claim. Carried in every mode; `effective` says whether this
-            // mode admits it, since the switch is the only place it is.
+            // mode admits it on this host (BEP-085).
             credentialed_upstream: PolicyCredentialedUpstreamJson::from_effective(
-                effective, network,
+                effective, network, host_kind,
             ),
             node_plane_baseline,
             // The wire's own rows, `pending` included — an empty list is a
@@ -896,22 +983,28 @@ async fn box_policy_json_inputs(
 > {
     ensure_daemon(global)
         .map_err(|error| PolicyJsonFailure::DaemonUnreachable(format!("{error:#}")))?;
-    let mut client = connect_daemon(global)
+    let client = connect_daemon(global)
         .await
         .map_err(|error| PolicyJsonFailure::DaemonUnreachable(format!("{error:#}")))?;
 
     // The record the ingress key is gated on, resolved through the same
-    // lookup the text walk uses, with the failure kinds told apart where
-    // they can be: an RPC the daemon never answered is no daemon to ask;
-    // a lookup that answered with nothing is the not-found itself.
-    let resp = get_session_record(&mut client, box_name)
+    // lookup the text walk uses — on the VM that owns the name (NET-058) —
+    // with the failure kinds told apart where they can be: an RPC the daemon
+    // never answered is no daemon to ask; a lookup that answered with
+    // nothing, or a box on a stopped VM, is the not-found itself.
+    let example = format!("session policy {box_name} -o json");
+    let (mut client, record) = resolve_box_on_any_vm(global, client, box_name, &example)
         .await
-        .map_err(|error| match error.downcast_ref::<AmbiguousIdPrefix>() {
-            Some(ambiguous) => PolicyJsonFailure::SessionNotFound(ambiguous.to_string()),
-            None => PolicyJsonFailure::DaemonUnreachable(format!("{error:#}")),
+        .map_err(|error| {
+            if error.downcast_ref::<BoxNotFound>().is_some()
+                || error.downcast_ref::<AmbiguousIdPrefix>().is_some()
+                || error.downcast_ref::<AmbiguousBoxName>().is_some()
+            {
+                PolicyJsonFailure::SessionNotFound(error.to_string())
+            } else {
+                PolicyJsonFailure::DaemonUnreachable(format!("{error:#}"))
+            }
         })?;
-    let record = named_record(resp.record, box_name)
-        .map_err(|error| PolicyJsonFailure::SessionNotFound(error.to_string()))?;
     // By the resolved id, as the text walk does.
     let box_id = &record.id.to_string();
 
@@ -980,13 +1073,14 @@ pub(crate) async fn box_policy_as_json(
     // rendering keys it (see the comment in [`cmd_session_policy`]): the
     // backend this command actually talks to, with no fabric named for the
     // native daemon's per-daemon switch.
-    let fabric = (daemon_provider_kind(global) == paths::ProviderKind::Minvmd)
-        .then_some(switch::SwitchSubnet::default());
+    let host_kind = daemon_host_kind(global);
+    let fabric = (host_kind == paths::HostKind::Minvmd).then_some(switch::SwitchSubnet::default());
     let mut out = std::io::stdout();
     write_policy_json_noting(
         &mut out,
         &policy,
         record.network,
+        host_kind,
         fabric,
         live,
         &shared_port_collisions,
@@ -1417,6 +1511,55 @@ mod tests {
         );
     }
 
+    /// NET-160: a host-address box on a native host shares the host's
+    /// network namespace, so the host exposures table is not applied to
+    /// it, and the view says so. A host that is not native, with or
+    /// without a fabric named, and an own-address box print no such row.
+    #[test]
+    fn native_host_ip_network_view_says_host_exposures_do_not_apply() {
+        const ROW: &str = "  host exposures  not applied: this box shares the host's network\n";
+        let policy = EffectiveBoxPolicy {
+            egress: EffectiveEgress::AllowAll,
+            ingress: None,
+            credentialed_upstream: None,
+        };
+        let render = |network, fabric, native_host| {
+            let mut out = Vec::new();
+            format_policy_on_host(&mut out, &policy, network, None, &[], fabric, native_host)
+                .unwrap();
+            String::from_utf8(out).unwrap()
+        };
+
+        let native = render(NetworkMode::HostNet, None, true);
+        assert!(
+            native.contains(ROW),
+            "a native host-address box must say exposures do not apply, got: {native}"
+        );
+
+        let vm = render(
+            NetworkMode::HostNet,
+            Some(switch::SwitchSubnet::default()),
+            false,
+        );
+        assert!(
+            !vm.contains("host exposures"),
+            "a VM-backed host-address box prints no such row, got: {vm}"
+        );
+
+        // No fabric named does not make the host native.
+        let unnamed = render(NetworkMode::HostNet, None, false);
+        assert!(
+            !unnamed.contains("host exposures"),
+            "a box not on a native host prints no such row, got: {unnamed}"
+        );
+
+        let own = render(NetworkMode::OwnIp, None, true);
+        assert!(
+            !own.contains("host exposures"),
+            "an own-address box prints no such row, got: {own}"
+        );
+    }
+
     /// NET-134's lane in the policy render: a box that declared a
     /// credentialed upstream prints the row — the one destination its
     /// egress rules never decide, named as the lane's whole reach — while
@@ -1485,34 +1628,64 @@ mod tests {
             "a box without a lane carries no key, got: {unlaned_json}"
         );
 
-        // A host-address box sits behind no switch gate, so a declared
-        // lane there is admitted nowhere — but the view still shows what
-        // the box declared, marked as not in effect on both surfaces.
-        let mut out = Vec::new();
-        format_policy(&mut out, &laned, NetworkMode::HostNet, None, &[], None).unwrap();
-        let rendered = String::from_utf8(out).unwrap();
+        // BEP-085: a host-address box on a native host shares the host's
+        // network, so a declared lane there is admitted nowhere — but the
+        // view still shows what the box declared, marked as not in effect
+        // on both surfaces. On a VM host the host-side gate admits it, and
+        // the row is unmarked.
+        let host_ip_render = |native_host| {
+            let mut out = Vec::new();
+            format_policy_on_host(
+                &mut out,
+                &laned,
+                NetworkMode::HostNet,
+                None,
+                &[],
+                None,
+                native_host,
+            )
+            .unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        let rendered = host_ip_render(true);
         assert!(
             rendered.contains(
                 "  credentialed upstream  allowed to reach the Box Egress Proxy \
                  (not in effect: host_ip box)\n"
             ),
-            "a host-address box must show its declared lane, marked, got: {rendered}"
+            "a native host-address box must show its declared lane, marked, got: {rendered}"
         );
-        let mut out = Vec::new();
-        write_policy_json(
-            &mut out,
-            &laned,
-            NetworkMode::HostNet,
-            None,
-            Ok(Vec::new()),
-            &[],
-        )
-        .unwrap();
-        let host_json: serde_json_lenient::Value = serde_json_lenient::from_slice(&out).unwrap();
+        let rendered = host_ip_render(false);
+        assert!(
+            rendered.contains("  credentialed upstream  allowed to reach the Box Egress Proxy\n"),
+            "a host-address box on a VM host must show its lane unmarked, got: {rendered}"
+        );
+        let host_ip_json = |host_kind| {
+            let mut out = Vec::new();
+            write_policy_json_noting(
+                &mut out,
+                &laned,
+                NetworkMode::HostNet,
+                host_kind,
+                None,
+                Ok(Vec::new()),
+                &[],
+                &[],
+            )
+            .unwrap();
+            serde_json_lenient::from_slice::<serde_json_lenient::Value>(&out).unwrap()
+        };
+        let host_json = host_ip_json(paths::HostKind::Minimald);
         assert_eq!(
             host_json["credentialed_upstream"],
             serde_json_lenient::json!({ "effective": false }),
-            "a host-address box carries its declared lane as not in effect, got: {host_json}"
+            "a native host-address box carries its declared lane as not in effect, got: {host_json}"
+        );
+        let host_json = host_ip_json(paths::HostKind::Minvmd);
+        assert_eq!(
+            host_json["credentialed_upstream"],
+            serde_json_lenient::json!({ "effective": true }),
+            "a host-address box on a VM host carries its lane as in effect, got: {host_json}"
         );
 
         // A none box keeps the declaration visible the same way.
@@ -1844,6 +2017,7 @@ mod tests {
                 &mut out,
                 &policy,
                 NetworkMode::OwnIp,
+                paths::HostKind::Minvmd,
                 None,
                 Ok(Vec::new()),
                 &[],

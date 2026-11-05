@@ -62,6 +62,16 @@
 //! < {"ok":true,"old_fingerprint":"<hex>","new_fingerprint":"<hex>"}
 //! ```
 //!
+//! `min secret set` asks the serving proxy to re-certify its root after it
+//! writes a store rule. The proxy re-issues the root for the current rules
+//! and publishes it to the identity file before it replies, so the next box
+//! trusts the new upstream (BEP-013):
+//!
+//! ```text
+//! > {"op":"recertify_root"}
+//! < {"ok":true}
+//! ```
+//!
 //! The box's creator asks for the box ids the revocations in force name
 //! before it gives a new box its id, so a minted id that a revocation holds
 //! is refused (BEP-070). The list holds the revocations the proxy restored
@@ -115,6 +125,21 @@
 //! ```text
 //! > {"op":"register_client_key","key":"<key>","box_id":"<id>"}
 //! < {"ok":true,"kid":"<kid>"}
+//! ```
+//!
+//! A box can end with no `forget_box`: a creation stopped before `minvmd`
+//! recorded the box, a stopped `minvmd`, or a failed file write at the
+//! forget. The file then keeps the box as a user of its key across
+//! restarts. The box's creator sends every box id it still holds when it
+//! starts the proxy. Each box that the file held at this start and that the
+//! list leaves out ended, so it no longer uses its key, and a retired key
+//! whose boxes all ended is revoked. An info log line names each `kid` that
+//! no box uses after that. Until the list arrives, the proxy frees no key,
+//! so a box created before a restart keeps redeeming:
+//!
+//! ```text
+//! > {"op":"live_boxes","box_ids":["<id>"]}
+//! < {"ok":true}
 //! ```
 //!
 //! The registry is bounded ([`KeyBound`]): it holds at most a set count of
@@ -212,6 +237,37 @@ pub enum Request {
         /// The box id.
         box_id: String,
     },
+}
+
+/// The request that names every box the box's creator still holds. It is a
+/// type of its own, beside [`Request`], so a client that matches every
+/// [`Request`] keeps its match.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum LiveBoxesRequest {
+    /// Name every box that the box's creator still holds. Each box that the
+    /// registrations file held at this start and that the list leaves out
+    /// ended with no `forget_box`, so it no longer uses its key.
+    LiveBoxes {
+        /// The box ids.
+        box_ids: Vec<String>,
+    },
+}
+
+/// Frees the keys of the boxes that ended with no `forget_box`: each box
+/// that `keys` held at its restore and that `box_ids` leaves out.
+fn live_boxes(box_ids: &[String], registry: &RwLock<ClientKeys>, keys: &KeyFile) -> Reply {
+    let Some(live) = box_ids
+        .iter()
+        .map(|id| normalise_box_id(id))
+        .collect::<Option<BTreeSet<_>>>()
+    else {
+        return Reply::refused("a box id is not 32 hex digits");
+    };
+    match keys.reconcile(&live, registry) {
+        Ok(_) => Reply::done(),
+        Err(error) => Reply::refused(error),
+    }
 }
 
 /// What the control socket writes into: the client keys, the boxes, the
@@ -426,6 +482,52 @@ async fn rotate(ca: Option<Rotation>) -> RotationReply {
         Err(error) => {
             tracing::warn!(%error, "the signing CA did not rotate on request");
             RotationReply::refused("the rotation stopped before it finished")
+        }
+    }
+}
+
+/// The client's request to re-certify the root at once, after it changed a
+/// store registration: a rule of the client's `[secret-store-rules]`. It
+/// is a type of its own, beside [`Request`], because only the serving
+/// proxy can do it: [`handle_line`] has no CA. The reply is a [`Reply`],
+/// and it comes after the re-issue and the publish, so a box created after
+/// an `ok` reply reads a root that permits the changed rules (BEP-013).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum RecertifyRequest {
+    /// Re-issue the root for the current store rules, and publish it.
+    RecertifyRoot,
+}
+
+/// The serving proxy's root, as the control socket re-certifies it.
+pub trait RecertifyRoot: Send + Sync {
+    /// Reads the current store rules, re-issues the root under the same
+    /// key and subject when their names changed, and publishes it to the
+    /// identity file.
+    ///
+    /// # Errors
+    ///
+    /// Why the re-issue or the publish failed, in words for the operator.
+    /// The root in use stays.
+    fn recertify_root(&self) -> Result<(), String>;
+}
+
+/// The root a control socket re-certifies.
+pub type Recertification = Arc<dyn RecertifyRoot>;
+
+/// Re-certifies the root of `source` for one [`RecertifyRequest`]. The
+/// re-issue signs through the keychain, which can block or wait for a
+/// prompt, so it runs on a blocking thread.
+async fn recertify(source: Option<Recertification>) -> Reply {
+    let Some(source) = source else {
+        return Reply::refused("this proxy does not re-issue its root certificate on request");
+    };
+    match tokio::task::spawn_blocking(move || source.recertify_root()).await {
+        Ok(Ok(())) => Reply::done(),
+        Ok(Err(error)) => Reply::refused(error),
+        Err(error) => {
+            tracing::warn!(%error, "the root was not re-certified on request");
+            Reply::refused("the re-issue of the root certificate stopped before it finished")
         }
     }
 }
@@ -652,6 +754,10 @@ struct KeyFile {
     entries: Mutex<Vec<Entry>>,
     /// The time that `register` last wrote the file, or [`NEVER_WRITTEN`].
     written: AtomicU64,
+    /// The boxes that the file held at the restore and that no `live_boxes`
+    /// list has confirmed or freed yet. Only these can be stranded: a box
+    /// registered since the start is one this process will see forgotten.
+    from_start: Mutex<BTreeSet<String>>,
 }
 
 /// The value of [`KeyFile::written`] before `register` writes the file.
@@ -664,6 +770,7 @@ impl KeyFile {
             bound: KeyBound::default(),
             entries: Mutex::new(Vec::new()),
             written: AtomicU64::new(NEVER_WRITTEN),
+            from_start: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -728,7 +835,64 @@ impl KeyFile {
             self.write(&entries)?;
         }
         install(&entries, registry);
+        *self
+            .from_start
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = entries
+            .iter()
+            .flat_map(|entry| entry.boxes.iter().cloned())
+            .collect();
         Ok(entries.len())
+    }
+
+    /// Frees the keys of the boxes that ended with no `forget_box` (#2617):
+    /// each box that the file held at the restore and that `live` does not
+    /// hold. A retired key whose boxes all ended is revoked. Returns how
+    /// many boxes it freed.
+    fn reconcile(
+        &self,
+        live: &BTreeSet<String>,
+        registry: &RwLock<ClientKeys>,
+    ) -> Result<usize, String> {
+        let mut entries = self.lock();
+        let ended: BTreeSet<String> = {
+            let mut from_start = self
+                .from_start
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let ended = from_start.difference(live).cloned().collect();
+            from_start.retain(|id| live.contains(id));
+            ended
+        };
+        let mut freed = 0;
+        for entry in entries.iter_mut() {
+            let held = entry.boxes.len();
+            entry.boxes.retain(|id| !ended.contains(id));
+            if entry.boxes.len() == held {
+                continue;
+            }
+            freed += held - entry.boxes.len();
+            if !entry.in_use() {
+                tracing::info!(
+                    kid = %entry.kid,
+                    ended = held,
+                    "freed a client key: no box that used it still runs"
+                );
+            }
+        }
+        if freed == 0 {
+            return Ok(0);
+        }
+        retire_unused(&mut entries);
+        install(&entries, registry);
+        self.write(&entries).map_err(|err| {
+            tracing::error!(path = %self.path.display(), %err, "did not record the ended boxes of the client keys");
+            self.written.store(NEVER_WRITTEN, Ordering::Relaxed);
+            format!(
+                "the proxy freed the keys of the ended boxes, but did not record the change, so they return after a restart: {err}"
+            )
+        })?;
+        Ok(freed)
     }
 
     /// Applies the bound at `now` to the kept keys and to `registry`.
@@ -918,9 +1082,9 @@ impl KeyFile {
         // The end of the box takes effect in memory first, as a revocation
         // does in `replace`, so a failed write leaves no retired key
         // verifying in this process. A failed write leaves the ended box in
-        // the file. The next registration then writes the file again, and a
-        // restart before a successful write restores the retired key as in
-        // use (#2617).
+        // the file. The next registration then writes the file again. A
+        // restart before a successful write restores the key as in use,
+        // until the `live_boxes` list at that start frees it (#2617).
         if entries.len() != before {
             install(&entries, registry);
         }
@@ -1253,6 +1417,7 @@ pub struct Control {
     records: Records,
     keys: Arc<KeyFile>,
     rotation: Option<Rotation>,
+    recertification: Option<Recertification>,
 }
 
 impl std::fmt::Debug for Control {
@@ -1260,6 +1425,7 @@ impl std::fmt::Debug for Control {
         f.debug_struct("Control")
             .field("inner", &self.inner)
             .field("rotation", &self.rotation.is_some())
+            .field("recertification", &self.recertification.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -1281,8 +1447,8 @@ impl Control {
 
     /// [`Control::bind`], with the client key registry bounded by `bound`
     /// in place of [`KeyBound::default`]. The restore applies `bound`, so a
-    /// larger bound keeps each key the file holds inside it. The proxy
-    /// binary does not call it, so its bound is the fixed default.
+    /// larger bound keeps each key the file holds inside it. `bep serve`
+    /// calls it with the value of `--max-client-keys`.
     ///
     /// # Errors
     ///
@@ -1313,6 +1479,7 @@ impl Control {
             },
             keys: Arc::new(keys),
             rotation: None,
+            recertification: None,
         })
     }
 
@@ -1337,6 +1504,14 @@ impl Control {
     #[must_use]
     pub fn with_rotation(mut self, ca: Rotation) -> Self {
         self.rotation = Some(ca);
+        self
+    }
+
+    /// Takes `recertify_root` requests for the root of `source`. Without
+    /// it, the socket refuses each one.
+    #[must_use]
+    pub fn with_recertification(mut self, source: Recertification) -> Self {
+        self.recertification = Some(source);
         self
     }
 
@@ -1366,6 +1541,7 @@ impl Control {
                 self.records.clone(),
                 Arc::clone(&self.keys),
                 self.rotation.clone(),
+                self.recertification.clone(),
             ));
         }
     }
@@ -1386,6 +1562,7 @@ async fn serve(
     records: Records,
     keys: Arc<KeyFile>,
     rotation: Option<Rotation>,
+    recertification: Option<Recertification>,
 ) {
     // SAFETY: geteuid reads the caller's effective uid. It has no side
     // effects and cannot fail.
@@ -1419,8 +1596,12 @@ async fn serve(
         }
         let written = if let Ok(RotationRequest::RotateSigning) = serde_json::from_str(&line) {
             write_reply(&mut write, &rotate(rotation.clone()).await).await
+        } else if let Ok(RecertifyRequest::RecertifyRoot) = serde_json::from_str(&line) {
+            write_reply(&mut write, &recertify(recertification.clone()).await).await
         } else if let Ok(RevocationsRequest::RevokedBoxIds) = serde_json::from_str(&line) {
             write_reply(&mut write, &records.revoked_box_ids()).await
+        } else if let Ok(LiveBoxesRequest::LiveBoxes { box_ids }) = serde_json::from_str(&line) {
+            write_reply(&mut write, &live_boxes(&box_ids, &records.registry, &keys)).await
         } else {
             write_reply(&mut write, &records.handle_keeping(&line, Some(&keys))).await
         };
@@ -2074,5 +2255,111 @@ mod tests {
             .restore(&restored, 40)
             .unwrap();
         assert_eq!(held(&restored), [false, false, true]);
+    }
+
+    // BEP-063 (#2617): a box that ended with no `forget_box` stays in the
+    // registrations file, and a restart keeps its key in use. The
+    // `live_boxes` list then frees it: a box the list leaves out ended, and
+    // a retired key whose boxes all ended is revoked. The bound then counts
+    // only the keys that running boxes use.
+    #[test]
+    fn a_stranded_box_frees_its_key_at_start() {
+        const STRANDED: &str = "0192f0c17a2b7c3d8e4fa0b1c2d3e4f5";
+        const RUNNING: &str = "0192f0c17a2b7c3d8e4fa0b1c2d3e4f6";
+        const RETIRED_BOX: &str = "0192f0c17a2b7c3d8e4fa0b1c2d3e4f7";
+        let dir = tempfile::tempdir().unwrap();
+        let bound = KeyBound {
+            max_keys: 3,
+            idle: None,
+        };
+        let keys = KeyFile {
+            bound,
+            ..KeyFile::new(dir.path().join("control.sock.client-keys"))
+        };
+        let registry = RwLock::new(ClientKeys::new());
+        let entry = |byte: u8| {
+            let key = p256::ecdsa::SigningKey::from_bytes(&[byte; 32].into()).unwrap();
+            Entry::parse(
+                &URL_SAFE_NO_PAD.encode(key.verifying_key().to_sec1_bytes()),
+                0,
+            )
+            .unwrap()
+        };
+        let (retired, stranded, running, new) = (entry(1), entry(2), entry(3), entry(4));
+        keys.register_for(retired.clone(), &registry, 10, false, Some(RETIRED_BOX))
+            .unwrap();
+        // The replacement retires `retired`: box RETIRED_BOX still uses it.
+        keys.register_for(stranded.clone(), &registry, 20, true, Some(STRANDED))
+            .unwrap();
+        keys.register_for(running.clone(), &registry, 30, false, Some(RUNNING))
+            .unwrap();
+        // Running boxes use every key, so the bound refuses a new one.
+        let error = keys
+            .register(new.clone(), &registry, 40, false)
+            .unwrap_err();
+        assert_eq!(keys_in_use_bound(&error), Some(3), "{error}");
+        let held = |registry: &RwLock<ClientKeys>| {
+            let registry = registry.read().unwrap();
+            [&retired, &stranded, &running, &new].map(|e| registry.contains(&e.kid))
+        };
+        assert_eq!(held(&registry), [true, true, true, false]);
+
+        // The proxy restarts. Boxes STRANDED and RETIRED_BOX ended with no
+        // `forget_box`, and the file still names them, so every key stays
+        // in use until the list arrives.
+        let restarted = KeyFile {
+            bound,
+            ..KeyFile::new(keys.path.clone())
+        };
+        let restored = RwLock::new(ClientKeys::new());
+        assert_eq!(restarted.restore(&restored, 50).unwrap(), 3);
+        assert_eq!(held(&restored), [true, true, true, false]);
+        let error = restarted
+            .register(new.clone(), &restored, 50, false)
+            .unwrap_err();
+        assert_eq!(keys_in_use_bound(&error), Some(3), "{error}");
+
+        // The box's creator names box RUNNING alone.
+        let line = format!(
+            r#"{{"op":"live_boxes","box_ids":["{}"]}}"#,
+            RUNNING.to_uppercase()
+        );
+        let LiveBoxesRequest::LiveBoxes { box_ids } = serde_json::from_str(&line).unwrap();
+        let reply = live_boxes(&box_ids, &restored, &restarted);
+        assert!(reply.ok, "{reply:?}");
+        // The retired key is revoked, and the stranded box frees its key.
+        assert_eq!(held(&restored), [false, true, true, false]);
+        let file = std::fs::read_to_string(&keys.path).unwrap();
+        assert!(!file.contains(STRANDED), "{file}");
+        assert!(!file.contains(RETIRED_BOX), "{file}");
+        assert!(file.contains(&format!("boxes={RUNNING}")), "{file}");
+
+        // The bound counts only the key that box RUNNING uses, so a new key
+        // passes it.
+        restarted
+            .register(new.clone(), &restored, 60, false)
+            .unwrap();
+        assert_eq!(held(&restored), [false, true, true, true]);
+        // At the bound, the freed key is dropped and the used key stays.
+        let fourth = entry(5);
+        restarted
+            .register(fourth.clone(), &restored, 70, false)
+            .unwrap();
+        assert_eq!(held(&restored), [false, false, true, true]);
+        assert!(restored.read().unwrap().contains(&fourth.kid));
+
+        // A box registered since the start is not one the list can strand.
+        restarted
+            .register_for(entry(6), &restored, 80, false, Some(STRANDED))
+            .unwrap();
+        let reply = live_boxes(&box_ids, &restored, &restarted);
+        assert!(reply.ok, "{reply:?}");
+        let file = std::fs::read_to_string(&keys.path).unwrap();
+        assert!(file.contains(&format!("boxes={STRANDED}")), "{file}");
+        assert!(file.contains(&format!("boxes={RUNNING}")), "{file}");
+
+        // A list with an id that is not a box id is refused.
+        let reply = live_boxes(&["not-a-box".to_owned()], &restored, &restarted);
+        assert!(!reply.ok, "{reply:?}");
     }
 }

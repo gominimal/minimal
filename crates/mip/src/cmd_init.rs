@@ -18,7 +18,12 @@ pub async fn cmd_init(args: InitArgs, config: Config) -> Result<(), Error> {
 
     // -- Confirmation prompt (unless --yes) --
     if !args.yes {
-        eprintln!("\nWill create {}:\n", plan.toml_path.display());
+        let verb = if plan.toml_path.exists() {
+            "overwrite"
+        } else {
+            "create"
+        };
+        eprintln!("\nWill {verb} {}:\n", plan.toml_path.display());
         eprintln!("---");
         eprint!("{}", plan.content);
         eprintln!("---");
@@ -40,7 +45,16 @@ pub async fn cmd_init(args: InitArgs, config: Config) -> Result<(), Error> {
         }
     }
 
-    std::fs::write(&plan.toml_path, &plan.content).map_err(|e| {
+    // Write under the same lock and atomic rename `min init`, `min add` and
+    // `min update` use, so a concurrent edit is neither lost nor torn. `mip
+    // init` has always overwritten an existing file, so it keeps doing that;
+    // whether the file existed under the lock decides Created vs Updated.
+    let mut existed = false;
+    mfile::File::edit_exclusively::<Error>(&plan.toml_path, |content| {
+        existed = content.is_some();
+        Ok(Some(plan.content.clone()))
+    })
+    .map_err(|e| {
         Error::Other(anyhow::anyhow!(
             "writing {}: {}",
             plan.toml_path.display(),
@@ -48,7 +62,8 @@ pub async fn cmd_init(args: InitArgs, config: Config) -> Result<(), Error> {
         ))
     })?;
 
-    eprintln!("Created {}", plan.toml_path.display());
+    let verb = if existed { "Updated" } else { "Created" };
+    eprintln!("{verb} {}", plan.toml_path.display());
     eprintln!();
     eprintln!("Next steps:");
     eprintln!("  mip update      # pin package versions");

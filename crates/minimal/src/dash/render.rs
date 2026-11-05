@@ -130,22 +130,22 @@ fn render_sidebar(model: &mut Model, frame: &mut Frame, area: Rect) {
     for (i, row) in rows.iter().enumerate() {
         let selected = i == model.cursor;
         let line = match row {
-            Row::ProviderHeader(p) => {
-                let provider = &model.providers[*p];
-                let arrow = if provider.collapsed { "▸" } else { "▼" };
+            Row::HostHeader(p) => {
+                let host = &model.hosts[*p];
+                let arrow = if host.collapsed { "▸" } else { "▼" };
                 // The dot is the group's health mark: green while the last
                 // refresh reached the daemon, red once it drops.
-                let (status, dot) = match provider.reachable {
-                    true => (format!("v{}", provider.version), Color::Green),
+                let (status, dot) = match host.reachable {
+                    true => (format!("v{}", host.version), Color::Green),
                     false => ("unreachable".to_string(), Color::Red),
                 };
                 let status = pad_truncate(
                     &status,
-                    inner_width.saturating_sub(UnicodeWidthStr::width(provider.label.as_str()) + 7),
+                    inner_width.saturating_sub(UnicodeWidthStr::width(host.label.as_str()) + 7),
                 );
                 Line::from(vec![
                     Span::styled(
-                        format!("{arrow} {}  ", provider.label),
+                        format!("{arrow} {}  ", host.label),
                         Style::default().add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(status, Style::default().fg(Color::Gray)),
@@ -484,6 +484,9 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
     let detail = model.details.get(key);
     let record = detail.and_then(|d| d.record.as_ref());
     let network = record.map(|r| r.network);
+    // BEP-085: the credentialed-upstream row reads the box's host kind, from
+    // the sidebar group the box is listed under.
+    let host_kind = crate::dash::rpc::host_kind_of_label(&key.host);
     let mut lines: Vec<Line> = Vec::new();
 
     if network == Some(boxes::NetworkMode::NoNet) {
@@ -502,7 +505,7 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
         {
             lines.push(Line::raw(format!(
                 "  {}",
-                boxes::CredentialedUpstream::policy_row(network)
+                boxes::CredentialedUpstream::policy_row(network, host_kind)
             )));
         }
     } else {
@@ -563,7 +566,7 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
                 if policy.credentialed_upstream.is_some() {
                     let row = network.map_or_else(
                         || boxes::CredentialedUpstream::POLICY_ROW.to_string(),
-                        boxes::CredentialedUpstream::policy_row,
+                        |network| boxes::CredentialedUpstream::policy_row(network, host_kind),
                     );
                     lines.push(Line::raw(format!("  {row}")));
                 }
@@ -749,6 +752,23 @@ fn wire_color(s: &str) -> Color {
     Color::Reset
 }
 
+/// The upload confirm's question, rendered between the root and the key
+/// hints. [`upload_confirm_path`] budgets the root against the same two
+/// spans, so rewording the prompt cannot clip the hints on a narrow terminal.
+const UPLOAD_CONFIRM_QUESTION: &str = " is not a repository root; upload it? ";
+/// The upload confirm's key hints, after [`UPLOAD_CONFIRM_QUESTION`].
+const UPLOAD_CONFIRM_HINTS: &str = " y / n / esc ";
+
+/// The upload root shown in the create confirm, shortened so the fixed
+/// question and key hints fit beside it. The leading space is part of the
+/// rendered line, so it counts against the path's budget too.
+fn upload_confirm_path(root: &str, width: u16) -> String {
+    let reserved = 1
+        + UnicodeWidthStr::width(UPLOAD_CONFIRM_QUESTION)
+        + UnicodeWidthStr::width(UPLOAD_CONFIRM_HINTS);
+    truncate(root, (width as usize).saturating_sub(reserved))
+}
+
 fn render_footer(model: &Model, frame: &mut Frame, area: Rect) {
     use ratatui::layout::Alignment;
     match &model.action {
@@ -759,6 +779,19 @@ fn render_footer(model: &Model, frame: &mut Frame, area: Rect) {
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(" y / n ", Style::default().fg(Color::Gray)),
+            ]);
+            frame.render_widget(Paragraph::new(line), area);
+        }
+        Some(Action::ConfirmCreateUpload { root, .. }) => {
+            let root = upload_confirm_path(root, area.width);
+            let line = Line::from(vec![
+                Span::styled(
+                    format!(" {root}{UPLOAD_CONFIRM_QUESTION}"),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(UPLOAD_CONFIRM_HINTS, Style::default().fg(Color::Gray)),
             ]);
             frame.render_widget(Paragraph::new(line), area);
         }
@@ -895,6 +928,21 @@ mod tests {
     }
 
     #[test]
+    fn upload_confirm_keeps_the_question_and_keys() {
+        let width = 60;
+        let long = "/home/someone/Projects/a-very-long-project-name/with/more/depth";
+        let shown = upload_confirm_path(long, width);
+        let line = format!(" {shown}{UPLOAD_CONFIRM_QUESTION}{UPLOAD_CONFIRM_HINTS}");
+        assert!(
+            UnicodeWidthStr::width(line.as_str()) <= width as usize,
+            "{line:?}"
+        );
+        assert!(line.ends_with(UPLOAD_CONFIRM_HINTS), "{line:?}");
+        assert!(shown.ends_with('…'), "{shown:?}");
+        assert_eq!(upload_confirm_path("/tmp/x", width), "/tmp/x");
+    }
+
+    #[test]
     fn shorten_home_only_shortens_at_a_path_boundary() {
         let Some(home) = dirs::home_dir() else {
             return;
@@ -933,12 +981,12 @@ mod tests {
         }
     }
 
-    fn provider_view(
+    fn host_view(
         label: &str,
         collapsed: bool,
         sessions: Vec<minimald_rpc::ListSessionsEntry>,
-    ) -> crate::dash::app::ProviderView {
-        crate::dash::app::ProviderView {
+    ) -> crate::dash::app::HostView {
+        crate::dash::app::HostView {
             label: label.to_string(),
             version: "0.1".to_string(),
             collapsed,
@@ -947,12 +995,12 @@ mod tests {
         }
     }
 
-    fn sidebar_model(providers: Vec<crate::dash::app::ProviderView>) -> Model {
+    fn sidebar_model(hosts: Vec<crate::dash::app::HostView>) -> Model {
         let now = chrono::DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z")
             .unwrap()
             .to_utc();
         let mut model = Model::new(now);
-        model.providers = providers;
+        model.hosts = hosts;
         model
     }
 
@@ -977,7 +1025,7 @@ mod tests {
         let sessions = (0..30)
             .map(|n| sess_entry(n, &format!("s{n:02}")))
             .collect();
-        let mut model = sidebar_model(vec![provider_view("host", false, sessions)]);
+        let mut model = sidebar_model(vec![host_view("host", false, sessions)]);
         // Rows: one header + 30 sessions; a short pane can't show them all.
         model.cursor = model.visible_rows().len() - 1;
         let out = draw_sidebar(&mut model, 40, 16);
@@ -999,22 +1047,18 @@ mod tests {
     /// editing", so the bar is the observable edit state.
     #[test]
     fn render_sidebar_shows_the_filter_edit_cursor_while_editing() {
-        let mut model = sidebar_model(vec![provider_view(
-            "host",
-            false,
-            vec![sess_entry(1, "api")],
-        )]);
+        let mut model = sidebar_model(vec![host_view("host", false, vec![sess_entry(1, "api")])]);
         model.filter.editing = true;
         model.filter.input = "web".to_string();
         let out = draw_sidebar(&mut model, 40, 12);
         assert!(out.contains("web▏"), "filter edit cursor missing:\n{out}");
     }
 
-    /// A collapsed provider renders its `▸` arrow and drops its session rows
+    /// A collapsed host renders its `▸` arrow and drops its session rows
     /// from the sidebar entirely.
     #[test]
-    fn render_sidebar_collapses_a_provider_hiding_its_sessions() {
-        let mut model = sidebar_model(vec![provider_view(
+    fn render_sidebar_collapses_a_host_hiding_its_sessions() {
+        let mut model = sidebar_model(vec![host_view(
             "host",
             true,
             vec![sess_entry(1, "hidden-sess")],
@@ -1030,7 +1074,7 @@ mod tests {
     /// The Policy pane's text for one session with this mode and policy.
     fn policy_text(network: boxes::NetworkMode, policy: boxes::BoxPolicy) -> String {
         let key = SessionKey {
-            provider: "host".to_string(),
+            host: "host".to_string(),
             id: sid(1),
         };
         let record = boxes::Record {
@@ -1041,6 +1085,9 @@ mod tests {
             network,
             policy: policy.clone(),
             status: boxes::BoxState::Active,
+            reason: None,
+            exit_code: None,
+            signal: None,
             hooks_enabled: true,
             task_addresses: Vec::new(),
             box_addresses: None,
@@ -1048,6 +1095,7 @@ mod tests {
             box_id: None,
             host_row_bound: false,
             bound_ports: std::collections::BTreeSet::new(),
+            ends_with_run: false,
             sealed_deliveries: Vec::new(),
             root_certificate: None,
             box_type: None,

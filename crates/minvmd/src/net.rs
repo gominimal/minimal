@@ -90,12 +90,14 @@ pub(crate) mod egress_gate;
 pub use egress_gate::EgressGate;
 pub mod answerer;
 mod forward_revoke;
+pub(crate) mod proxy_reclaim;
 mod shuttle;
 mod stale_gvproxy;
 pub use shuttle::{VSOCK_GVPROXY_SHUTTLE_PORT, resolve_gate_sock, resolve_switch_sock};
 #[cfg_attr(not(minvmd_libkrun), allow(unused_imports))]
 pub(crate) use stale_gvproxy::reap_stale_gvproxy;
 mod baseline;
+pub(crate) mod host_exposures;
 pub use baseline::{NodeBaselinePhase, NodePlaneBaseline};
 pub use switch::bep_host::{BepBoxSource, BepWire};
 pub use switch::{BepDevice, BepDeviceEnds, BepHost, BepPeer};
@@ -622,6 +624,25 @@ async fn monitor_switch_datapath(
     }
 }
 
+/// The environment variable that listed the host exposures before the
+/// `[host-exposures]` table of the client `config.toml` replaced it.
+const RETIRED_HOST_EXPOSURE_ENV: &str = "MINVMD_HOST_EXPOSURE_PORTS";
+
+/// Logs a warning when the retired host-exposure variable is set. `minvmd`
+/// ignores its value, and only the `[host-exposures]` table opens a port.
+fn warn_retired_host_exposure_env(value: Option<std::ffi::OsString>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    tracing::warn!(
+        variable = RETIRED_HOST_EXPOSURE_ENV,
+        value = %value.to_string_lossy(),
+        "ignored MINVMD_HOST_EXPOSURE_PORTS: host.min.internal opens only the ports \
+         that the [host-exposures] table of the client config.toml lists"
+    );
+    true
+}
+
 /// Deliver `signal` to the process referred to by `pidfd` via
 /// `pidfd_send_signal(2)`. A pidfd is bound to the exact process instance
 /// opened at spawn, so this call returns `ESRCH` after the process exits
@@ -795,8 +816,17 @@ impl HostGvproxy {
         // In force, the gate decides a frame from the daemon's own address
         // by it, beside the boxes' rows; announced — the shipped posture —
         // the allow-all interim node row still does, and the gate's
-        // start-up line names the posture deciding.
-        let baseline = NodePlaneBaseline::built_in(subnet);
+        // start-up line names the posture deciding. The host exposures the
+        // alias is opened at — none unless the client `config.toml` names
+        // ports in `[host-exposures]` — are the live table: the gate reads
+        // it again when the file changes, so an added entry opens its port
+        // and a removed one closes it, with no restart (NET-161).
+        // The retired variable no longer opens a port. Say so in the daemon
+        // log, so an operator who still sets it sees why the alias stays
+        // closed at its ports (NET-159).
+        warn_retired_host_exposure_env(std::env::var_os(RETIRED_HOST_EXPOSURE_ENV));
+        let baseline = NodePlaneBaseline::built_in(subnet)
+            .with_host_exposures(host_exposures::HostExposures::client_config());
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<io::Result<u32>>();
 
@@ -1035,6 +1065,12 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use tracing_subscriber::fmt::MakeWriter;
+
+    #[test]
+    fn retired_host_exposure_env_is_warned_when_set() {
+        assert!(!warn_retired_host_exposure_env(None));
+        assert!(warn_retired_host_exposure_env(Some("8080".into())));
+    }
 
     fn spawn_sleep() -> Child {
         // A long-lived child to stand in for gvproxy in supervision tests.

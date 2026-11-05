@@ -134,7 +134,9 @@ use tokio::sync::watch;
 use boxes::IpProto;
 use boxes::core::egress::ListenVerdict;
 
-use super::policy::{ControlChannel, ExposedMapping, expose_mapping, unexpose_mapping};
+use super::policy::{
+    ControlChannel, ExposedMapping, expose_mapping, log_withdrawal, unexpose_mapping,
+};
 use super::switch::BoxGate;
 
 /// How often the watcher reads the box's socket table: often enough that a
@@ -225,7 +227,7 @@ enum BoxReportChannel {
 /// polls reach the stand-in exactly the expose path's own reports do.
 #[cfg(test)]
 static VM_REPORT_SEAM: LazyLock<Mutex<HashMap<std::path::PathBuf, std::path::PathBuf>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Seed a stand-in report door for the session whose switch control socket
 /// is `control_socket` (tests only, T94): the door at `door` answers every
@@ -422,6 +424,78 @@ pub(crate) async fn host_row_standing(
     None
 }
 
+/// The id the VM host daemon mints for a box this daemon is about to
+/// create (BOX-002), asked over the report door. `switch_address` is the
+/// address the box's registration handed it, when it has one: the host
+/// answers with the id it minted for that row, so the record and the row
+/// name one id. `None` on a native host, which has no VM host, and where
+/// this daemon's own store mints the id. An error when the door refused
+/// the ask or did not answer within [`REPORT_DEADLINE`] over its attempts:
+/// the caller refuses the create, because no other source may name the
+/// box's id. A row's id goes to one create only. Each call is one create:
+/// it makes one token and sends it on every attempt, so a retry of the same
+/// create after a lost or late reply gets the same id. Another create that
+/// asks for a claimed row is refused, and that create fails closed.
+/// `host_ip_name` is the creation name of a `host_ip` box, which has no
+/// row: the host answers with the id the box's registration minted under
+/// that name (BEP-082), and a fresh id when no registration used it.
+pub(crate) async fn mint_box_id(
+    control: &ControlChannel,
+    switch_address: Option<Ipv4Addr>,
+    host_ip_name: Option<String>,
+) -> Option<io::Result<minimald_rpc::BoxId>> {
+    let channel = box_report_channel(control)?;
+    let request = minimald_rpc::BoxControlRequest::MintBoxId(minimald_rpc::MintBoxIdRequest {
+        switch_address,
+        create_token: Some(uuid::Uuid::new_v4().simple().to_string()),
+        host_ip_name,
+    });
+    let deadline = tokio::time::Instant::now() + REPORT_DEADLINE;
+    let mut last = io::Error::new(io::ErrorKind::TimedOut, "the deadline passed");
+    for attempt in 1..=REPORT_ATTEMPTS {
+        let bound = attempt_deadline(deadline, REPORT_DEADLINE, REPORT_ATTEMPTS);
+        match report_exchange(&channel, &request, bound).await {
+            Ok(minimald_rpc::BoxControlReply::BoxIdMinted { minted_box_id }) => {
+                return Some(Ok(minted_box_id));
+            }
+            Ok(minimald_rpc::BoxControlReply::Error { error }) => {
+                tracing::warn!(?switch_address, %error, "the VM host daemon refused the box id mint");
+                return Some(Err(io::Error::other(error)));
+            }
+            Ok(other) => {
+                tracing::warn!(
+                    ?switch_address,
+                    reply = ?other,
+                    "the VM host daemon answered the box id mint with another verb's reply"
+                );
+                return Some(Err(io::Error::other(
+                    "the VM host daemon answered with something other than a box id",
+                )));
+            }
+            Err(error) => {
+                tracing::debug!(?switch_address, attempt, %error, "the box id mint was not answered");
+                last = error;
+            }
+        }
+        if attempt < REPORT_ATTEMPTS {
+            if tokio::time::Instant::now() + REPORT_BACKOFF >= deadline {
+                break;
+            }
+            tokio::time::sleep(REPORT_BACKOFF).await;
+        }
+    }
+    // No door, or a door that never answered: the bare `minvmd boot` path
+    // binds none. The caller refuses the create with this text as its
+    // reply, so it names what happened in the words the client reads.
+    tracing::warn!(?switch_address, error = %last, "the box id mint was never answered");
+    // The kind marks "no answer" for the caller, whatever the transport
+    // said. The transport's error goes to the log above, not to the client.
+    Some(Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "it did not answer in time",
+    )))
+}
+
 /// Whether the Box Egress Proxy's listener is live on the host (BEP-062):
 /// asked over the report door the way [`host_row_standing`] asks, because
 /// the proxy runs on the host and its listener state lives in the VM host
@@ -496,7 +570,7 @@ pub(crate) async fn report_ask(
     let dial_timeout = |_elapsed| {
         io::Error::new(
             io::ErrorKind::TimedOut,
-            "the VM host daemon did not accept the port prompt before its deadline",
+            "the port prompt did not get an answer in time",
         )
     };
     let reply = match &channel {
@@ -524,11 +598,15 @@ pub(crate) async fn report_ask(
     match reply {
         minimald_rpc::BoxControlReply::AskAdmit(outcome) => Ok(outcome),
         minimald_rpc::BoxControlReply::Error { error } => Err(io::Error::other(format!(
-            "the VM host daemon refused the port prompt: {error}"
+            "the port prompt was refused: {error}"
         ))),
-        other => Err(io::Error::other(format!(
-            "the VM host daemon sent an unexpected reply to the port prompt: {other:?}"
-        ))),
+        other => {
+            // The reply itself goes to the log, not to the person.
+            tracing::warn!(reply = ?other, "the port prompt got an unexpected reply");
+            Err(io::Error::other(
+                "the port prompt got an answer it could not read",
+            ))
+        }
     }
 }
 
@@ -582,17 +660,17 @@ pub(crate) async fn report_admitted_port(
                 // the next attempt would draw the same refusal, and the
                 // rate window does not need it asked for again.
                 return Err(io::Error::other(format!(
-                    "the VM host daemon refused to open the port: {error}"
+                    "the request to open the port was refused: {error}"
                 )));
             }
             Ok(other) => {
                 // Not the admit's own answer, so not a decision either: the
                 // host's row may or may not name the port, and the unwind
                 // below withdraws it the way a lost reply's does.
-                unanswered = Some(io::Error::other(format!(
-                    "the VM host daemon sent an unexpected reply when asked to open the \
-                     port: {other:?}"
-                )));
+                tracing::warn!(reply = ?other, "the request to open the port got an unexpected reply");
+                unanswered = Some(io::Error::other(
+                    "the request to open the port got an answer it could not read",
+                ));
                 break;
             }
             // No reply: a lost answer, retried — the host's admit is
@@ -607,6 +685,15 @@ pub(crate) async fn report_admitted_port(
         }
     }
     let unanswered = unanswered.expect("the loop ran at least once without deciding");
+    // A deadline reads as the request's own words, not the door's.
+    let unanswered = if unanswered.kind() == io::ErrorKind::TimedOut {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "the request to open the port did not get an answer in time",
+        )
+    } else {
+        unanswered
+    };
     // Fail-closed, and clean on the host's side too: the host may have
     // recorded the port before its reply was lost, so the unwind withdraws
     // it there — best-effort, because the publish is failing either way and
@@ -665,6 +752,215 @@ pub(crate) async fn unreport_port(
              unwound failed; the host's row may still name it"
         );
     }
+}
+
+/// Where one box's audit reports go (NET-046): the VM host daemon's door,
+/// and the row key the host names the box by. Registered while the box's
+/// listen watcher runs on a VM host ([`register_host_audit_route`]), so a
+/// box with no switch, or a box on a native host, has none and reports
+/// nothing.
+#[derive(Debug, Clone)]
+struct HostAuditRoute {
+    /// The box's name, as the in-VM audit record names it.
+    box_name: String,
+    /// The door the reports go to.
+    channel: BoxReportChannel,
+}
+
+/// The live audit routes, by the box's switch address: the relay's drop
+/// line knows the box by its lease, and the expose decision record by its
+/// name, so both look here.
+static HOST_AUDIT_ROUTES: std::sync::LazyLock<Mutex<HashMap<Ipv4Addr, HostAuditRoute>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The most audit reports in flight at once. A report past it is not sent
+/// and the in-VM record stays the only one, so a box that refuses frames
+/// in a loop cannot grow the daemon's tasks. The drop line's own rate limit
+/// keeps a box far under it.
+const HOST_AUDIT_IN_FLIGHT: usize = 64;
+
+/// The audit reports in flight now ([`HOST_AUDIT_IN_FLIGHT`]).
+static HOST_AUDIT_SENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Registers where `box_name`'s audit reports go, while its watcher runs:
+/// the VM host daemon's door over `control`, keyed by the box's switch
+/// address. A native host's control channel has no door, so nothing is
+/// registered there.
+fn register_host_audit_route(box_name: &str, switch_address: Ipv4Addr, control: &ControlChannel) {
+    let channel = match control {
+        ControlChannel::Vsock { cid, .. } => BoxReportChannel::Vsock { cid: *cid },
+        ControlChannel::Unix(_) => return,
+    };
+    HOST_AUDIT_ROUTES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            switch_address,
+            HostAuditRoute {
+                box_name: box_name.to_string(),
+                channel,
+            },
+        );
+}
+
+/// Removes the audit route [`register_host_audit_route`] made for the box
+/// at `switch_address`, when it is still that box's.
+fn deregister_host_audit_route(box_name: &str, switch_address: Ipv4Addr) {
+    let mut routes = HOST_AUDIT_ROUTES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if routes
+        .get(&switch_address)
+        .is_some_and(|route| route.box_name == box_name)
+    {
+        routes.remove(&switch_address);
+    }
+}
+
+/// Seeds an audit route for `box_name` at `switch_address` whose reports go
+/// to the stand-in door at `door` (tests only): the harness runs boxes on a
+/// native-shaped switch, which registers no route of its own.
+#[cfg(test)]
+pub(crate) fn seed_host_audit_route_for_tests(
+    box_name: &str,
+    switch_address: Ipv4Addr,
+    door: impl Into<std::path::PathBuf>,
+) {
+    HOST_AUDIT_ROUTES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            switch_address,
+            HostAuditRoute {
+                box_name: box_name.to_string(),
+                channel: BoxReportChannel::Unix(door.into()),
+            },
+        );
+}
+
+/// Removes an audit route a test seeded (tests only).
+#[cfg(test)]
+pub(crate) fn clear_host_audit_route_for_tests(box_name: &str, switch_address: Ipv4Addr) {
+    deregister_host_audit_route(box_name, switch_address);
+}
+
+/// Sends one audit report to the VM host daemon in the background, once,
+/// under [`REPORT_DEADLINE`]. Best-effort: the in-VM record is already
+/// written or already failed on its own, so a host that cannot be reached
+/// costs only the host's copy. A report the host does not take says so in
+/// one debug line.
+fn send_host_audit(channel: BoxReportChannel, request: minimald_rpc::BoxControlRequest) {
+    use std::sync::atomic::Ordering;
+    if HOST_AUDIT_SENDING.fetch_add(1, Ordering::AcqRel) >= HOST_AUDIT_IN_FLIGHT {
+        HOST_AUDIT_SENDING.fetch_sub(1, Ordering::AcqRel);
+        tracing::debug!(
+            request = ?request,
+            "too many audit reports are in flight; the host keeps no copy of this one"
+        );
+        return;
+    }
+    // A caller off a runtime (a sync test) has nothing to send on.
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        HOST_AUDIT_SENDING.fetch_sub(1, Ordering::AcqRel);
+        return;
+    };
+    runtime.spawn(async move {
+        let deadline = tokio::time::Instant::now() + REPORT_DEADLINE;
+        match report_exchange(&channel, &request, deadline).await {
+            Ok(minimald_rpc::BoxControlReply::Audited { .. }) => {}
+            Ok(other) => tracing::debug!(
+                reply = ?other,
+                "the VM host daemon did not take an audit report"
+            ),
+            Err(error) => tracing::debug!(
+                %error,
+                "an audit report did not reach the VM host daemon"
+            ),
+        }
+        HOST_AUDIT_SENDING.fetch_sub(1, Ordering::AcqRel);
+    });
+}
+
+/// Reports one dynamic ingress decision to the VM host daemon (NET-046), so
+/// the host keeps its own copy outside the VM. A box with an audit route is
+/// named by its switch address. A box with no route, such as a box with no
+/// switch, is named by `box_id`, and the report goes over the VM host door
+/// of its `control` channel. Nothing is sent on a native host, or when
+/// neither key is known.
+pub(crate) fn report_expose_decision(
+    box_name: &str,
+    box_id: Option<boxes::BoxId>,
+    control: Option<&ControlChannel>,
+    port: u16,
+    decision: boxes::DynamicIngress,
+    decided_by: minimald_rpc::ExposeDecidedBy,
+    outcome: minimald_rpc::ExposeDecisionOutcome,
+) {
+    let route = HOST_AUDIT_ROUTES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(_, route)| route.box_name == box_name)
+        .map(|(switch_address, route)| (*switch_address, route.channel.clone()));
+    let (switch_address, box_id, channel) = match route {
+        Some((switch_address, channel)) => (Some(switch_address), None, channel),
+        None => {
+            let Some(box_id) = box_id else {
+                return;
+            };
+            let Some(channel) = control.and_then(box_report_channel) else {
+                return;
+            };
+            (None, Some(box_id), channel)
+        }
+    };
+    send_host_audit(
+        channel,
+        minimald_rpc::BoxControlRequest::ReportExposeDecision(minimald_rpc::ExposeDecisionReport {
+            switch_address,
+            box_id,
+            port,
+            decision,
+            decided_by,
+            outcome,
+        }),
+    );
+}
+
+/// Reports one refused own-address egress flow to the VM host daemon: the
+/// relay calls this when its rate-limited drop line fires, so the report
+/// shares that line's rate limit and is never sent once per frame. Nothing
+/// is sent for a box with no audit route.
+pub(crate) fn report_refused_egress(
+    switch_address: Ipv4Addr,
+    destination: Option<std::net::SocketAddrV4>,
+    proto: &str,
+    rule: &str,
+) {
+    let channel = HOST_AUDIT_ROUTES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&switch_address)
+        .map(|route| route.channel.clone());
+    let Some(channel) = channel else {
+        return;
+    };
+    let clamp = |text: &str| {
+        let mut end = text.len().min(minimald_rpc::REFUSED_EGRESS_TEXT_MAX);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text[..end].to_string()
+    };
+    send_host_audit(
+        channel,
+        minimald_rpc::BoxControlRequest::ReportRefusedEgress(minimald_rpc::RefusedEgressReport {
+            switch_address,
+            destination,
+            proto: clamp(proto),
+            rule: clamp(rule),
+        }),
+    );
 }
 
 /// The withdrawal's attempts over a resolved report channel, shared by
@@ -787,35 +1083,82 @@ impl ListenPlan {
         }
     }
 
-    /// Records `port` as held by this box at its published address
-    /// (NET-129): the dynamic port's one holder of record, read by every
-    /// declared publish of the port — so another box's declaration collides
-    /// with the box that is serving and yields its forward, instead of
-    /// failing on a bind the forwarder refuses. A port another box already
+    /// Records `port` as held by this box at `address`, where its forward
+    /// is bound (NET-129): the dynamic port's one holder of record, read by
+    /// every declared publish of the port — so another box's declaration
+    /// collides with the box that is serving and yields its forward, instead
+    /// of failing on a bind the forwarder refuses. A port another box already
     /// holds is left alone: the record never displaces a holder.
-    fn record_dynamic_hold(&self, port: u16) {
+    fn record_dynamic_hold(&self, address: Ipv4Addr, port: u16) {
         let Some(registry) = self.hostnames.as_ref() else {
             return;
         };
         registry
             .write()
             .expect("hostname registry lock poisoned")
-            .record_dynamic_hold(self.session_id, self.published, port);
+            .record_dynamic_hold(self.session_id, address, port);
     }
 
     /// Releases the hold [`Self::record_dynamic_hold`] recorded — the
     /// listener closed or the box stopped — returning the hand-overs the
     /// release elected, so the close's own line can say them beside the
     /// registry's. A port the box still declares keeps its record: the
-    /// declaration is the claim now.
-    fn release_dynamic_hold(&self, port: u16) -> Vec<crate::net::dns::PortHandOver> {
+    /// declaration is the claim now. `address` is where the forward was
+    /// bound, which is where the hold was recorded: after the box's address
+    /// moved, a forward whose move failed is still bound at the old one
+    /// (#2748).
+    fn release_dynamic_hold(
+        &self,
+        address: Ipv4Addr,
+        port: u16,
+    ) -> Vec<crate::net::dns::PortHandOver> {
         let Some(registry) = self.hostnames.as_ref() else {
             return Vec::new();
         };
         registry
             .write()
             .expect("hostname registry lock poisoned")
-            .release_dynamic_hold(self.session_id, self.published, port)
+            .release_dynamic_hold(self.session_id, address, port)
+    }
+
+    /// The address the hostname registry publishes the box at now
+    /// (NET-010), the source the plan's own `published` was read from at
+    /// the launch. `None` when the launch carried no registry, or the box
+    /// publishes nowhere any more.
+    fn registry_published(&self) -> Option<Ipv4Addr> {
+        self.hostnames.as_ref().and_then(|registry| {
+            registry
+                .read()
+                .expect("hostname registry lock poisoned")
+                .published_own_address(self.session_id)
+        })
+    }
+
+    /// The box holding `port` at the plan's published address of record
+    /// (NET-129), declared or dynamic. `None` when nobody holds it, or the
+    /// launch carried no registry.
+    fn holder_at_published(&self, port: u16) -> Option<boxes::SessionId> {
+        self.hostnames.as_ref().and_then(|registry| {
+            registry
+                .read()
+                .expect("hostname registry lock poisoned")
+                .shared_port_holder(self.published, port)
+        })
+    }
+
+    /// Moves the hold [`Self::record_dynamic_hold`] recorded at `from` to
+    /// the box's published address (#2748): the forward moved there, so the
+    /// port is released at `from`, where another box may take it over, and
+    /// held where the box serves it now. Returns the hand-overs the release
+    /// elected, as [`Self::release_dynamic_hold`] does.
+    fn move_dynamic_hold(&self, from: Ipv4Addr, port: u16) -> Vec<crate::net::dns::PortHandOver> {
+        let Some(registry) = self.hostnames.as_ref() else {
+            return Vec::new();
+        };
+        let mut registry = registry.write().expect("hostname registry lock poisoned");
+        let hand_overs = registry.release_dynamic_hold(self.session_id, from, port);
+        registry.record_dynamic_hold(self.session_id, self.published, port);
+        hand_overs
     }
 }
 
@@ -998,6 +1341,21 @@ impl BoxPublications {
             .collect()
     }
 
+    /// The row the listen watcher's standing publication of `port` is
+    /// listed as, when one is: the publication stands and its gate admits
+    /// the port, so the port is reachable at the row's `local`. `None` for a
+    /// port the watcher does not hold, a pending reservation, and a
+    /// publication committed unlisted because its record was refused.
+    pub fn listen_row(&self, port: u16) -> Option<minimald_rpc::LiveMapping> {
+        self.set
+            .lock()
+            .expect("box publications lock poisoned")
+            .ports
+            .get(&port)
+            .filter(|entry| entry.owner == PublicationOwner::Listen && entry.published)
+            .and_then(|entry| entry.listed.clone())
+    }
+
     /// Withdraws `port` from the set — `owner`'s own publication only. The
     /// other surface's entry is left standing whatever the caller meant,
     /// because the publisher is the one who withdraws: a port held by
@@ -1042,6 +1400,22 @@ impl BoxPublications {
             .filter(|entry| entry.owner == owner && entry.published)
         {
             entry.listed = Some(row);
+        }
+    }
+
+    /// Re-points the row `owner`'s listed publication of `port` carries at
+    /// `local`, the forward's new `host:port` after the box's published
+    /// address moved (#2748). A publication with no row stays unlisted:
+    /// the move never lists a port its gate refuses.
+    pub fn relist_local(&self, port: u16, owner: PublicationOwner, local: &str) {
+        let mut set = self.set.lock().expect("box publications lock poisoned");
+        if let Some(row) = set
+            .ports
+            .get_mut(&port)
+            .filter(|entry| entry.owner == owner && entry.published)
+            .and_then(|entry| entry.listed.as_mut())
+        {
+            row.local = local.to_string();
         }
     }
 
@@ -1283,6 +1657,10 @@ impl ListenWatcher {
             session = %plan.box_name,
             lease = %plan.lease,
         );
+        // The box's audit reports reach the VM host daemon while the
+        // watcher runs (NET-046), and stop when it ends.
+        register_host_audit_route(&plan.box_name, plan.lease, &plan.control);
+        let route = (plan.box_name.clone(), plan.lease);
         let task = crate::traced::spawn_detached(root, async move {
             let mut state = WatchState::new(plan, leader);
             loop {
@@ -1295,6 +1673,7 @@ impl ListenWatcher {
             // The stop's own work: everything the box's processes published
             // comes down here, before the stopper's teardown continues.
             state.withdraw_all().await;
+            deregister_host_audit_route(&route.0, route.1);
         });
         Self { stop, task }
     }
@@ -1415,6 +1794,19 @@ struct WatchState {
     /// is written — an allow nobody can read is never admitted, not even
     /// twice. The entry goes when the forward comes down, recorded or not.
     unrecorded: HashSet<u16>,
+    /// Forwards left at the box's old published address after a move
+    /// (#2748) because their unexpose failed. Each poll asks again, and the
+    /// stop's withdrawal passes do too.
+    retired: Vec<ExposedMapping>,
+    /// The ports whose failed move has been said once already: a bind at
+    /// the new address that keeps failing is retried on every poll, and is
+    /// the same failure each time.
+    reported_move_failures: HashSet<u16>,
+}
+
+/// The address `mapping`'s forward is bound at, read off its `local`.
+fn bound_address(mapping: &ExposedMapping) -> Option<Ipv4Addr> {
+    mapping.host_port().and_then(|(host, _)| host.parse().ok())
 }
 
 /// One permitted port whose publish the switch refused: the book
@@ -1483,7 +1875,183 @@ impl WatchState {
             reported_contention: HashSet::new(),
             reported_withdrawal_failures: HashSet::new(),
             unrecorded: HashSet::new(),
+            retired: Vec::new(),
+            reported_move_failures: HashSet::new(),
         }
+    }
+
+    /// The address the forward of `port` is bound at, where its hold of
+    /// record is: the plan's published address, unless the box's address
+    /// moved and the forward's move has not stood yet (#2748).
+    fn bound_address(&self, port: u16) -> Ipv4Addr {
+        self.forwards
+            .get(&port)
+            .and_then(bound_address)
+            .unwrap_or(self.plan.published)
+    }
+
+    /// Follows the box's published address when it moved (#2748): the
+    /// present landing moves a box off the `127.0.0.1` interim while it
+    /// runs, and the registry is the one source of the address the box's
+    /// name answers at. The plan takes the new address, so every publish
+    /// from here binds there. Each forward this watcher bound at another
+    /// address is bound again at the new one, toward the same lease, and
+    /// the old one is unbound after it, so the port is served the whole way
+    /// through. The box's gate and the VM host daemon's row name the port,
+    /// not the address, so neither changes.
+    ///
+    /// A bind at the new address that fails leaves the forward where it is,
+    /// and the next poll asks again. An unexpose at the old address that
+    /// fails is asked again on every poll and at the stop.
+    async fn follow_published_address(&mut self) {
+        if let Some(moved) = self.plan.registry_published()
+            && moved != self.plan.published
+        {
+            tracing::info!(
+                session = %self.plan.box_name,
+                from = %self.plan.published,
+                to = %moved,
+                "the box's published address moved; its listening ports follow"
+            );
+            self.plan.published = moved;
+        }
+        let host = self.plan.published.to_string();
+        let mut stray: Vec<u16> = self
+            .forwards
+            .iter()
+            .filter(|(_, mapping)| mapping.host_port().is_none_or(|(bound, _)| bound != host))
+            .map(|(port, _)| *port)
+            .collect();
+        stray.sort_unstable();
+        for port in stray {
+            self.move_forward(port).await;
+        }
+        self.unbind_retired().await;
+    }
+
+    /// Binds the forward of `port` again at the plan's published address
+    /// and unbinds the one at the address it was bound at before
+    /// ([`Self::follow_published_address`]).
+    async fn move_forward(&mut self, port: u16) {
+        let Some(old) = self.forwards.get(&port).cloned() else {
+            return;
+        };
+        let from = bound_address(&old);
+        // Another box holding the port at the new address keeps it, as a
+        // declared publish there would (NET-129, first-come): the forward
+        // stays where it is, and a later poll moves it once that box gives
+        // the port up. The `127.0.0.1` interim an absent landing moves the
+        // box to is shared, and a stopped box's hold stands there with no
+        // forward behind it.
+        if let Some(holder) = self.plan.holder_at_published(port)
+            && holder != self.plan.session_id
+        {
+            if self.reported_move_failures.insert(port) {
+                tracing::info!(
+                    session = %self.plan.box_name,
+                    host = %self.plan.published,
+                    port,
+                    from = old.local(),
+                    other = %holder,
+                    owner = %PublicationOwner::Listen.as_str(),
+                    "another box holds the listening port at the box's new address; \
+                     it stays at the old address until that box gives it up"
+                );
+            }
+            return;
+        }
+        let moved = match expose_mapping(
+            &self.plan.control,
+            self.plan.published,
+            self.plan.lease,
+            port,
+        )
+        .await
+        {
+            Ok(moved) => moved,
+            Err(error) => {
+                if self.reported_move_failures.insert(port) {
+                    tracing::warn!(
+                        session = %self.plan.box_name,
+                        host = %self.plan.published,
+                        port,
+                        from = old.local(),
+                        owner = %PublicationOwner::Listen.as_str(),
+                        %error,
+                        "binding a listening port at the box's new address failed; \
+                         retrying on every poll"
+                    );
+                }
+                return;
+            }
+        };
+        self.reported_move_failures.remove(&port);
+        self.plan
+            .publications
+            .relist_local(port, PublicationOwner::Listen, moved.local());
+        self.forwards.insert(port, moved);
+        // The hold of record follows the forward (NET-129).
+        if let Some(from) = from {
+            for hand_over in self.plan.move_dynamic_hold(from, port) {
+                tracing::info!(
+                    session_id = %hand_over.holder,
+                    address = %hand_over.address,
+                    port = hand_over.port,
+                    from = %self.plan.box_name,
+                    action = "shared-address-port-hand-over",
+                    "a shared-address port passes to the earliest-created box still publishing it"
+                );
+            }
+        }
+        tracing::info!(
+            session = %self.plan.box_name,
+            host = %self.plan.published,
+            port,
+            from = old.local(),
+            owner = %PublicationOwner::Listen.as_str(),
+            "moved a listening port to the box's new address"
+        );
+        match unexpose_mapping(&self.plan.control, &old).await {
+            Ok(closed) => tracing::info!(
+                session = %self.plan.box_name,
+                port,
+                from = old.local(),
+                owner = %PublicationOwner::Listen.as_str(),
+                closed_connections = %closed,
+                "unbound a listening port at the box's old address after its move"
+            ),
+            Err(error) => {
+                tracing::warn!(
+                    session = %self.plan.box_name,
+                    port,
+                    from = old.local(),
+                    owner = %PublicationOwner::Listen.as_str(),
+                    %error,
+                    "unbinding a listening port at the box's old address failed; \
+                     retrying on every poll"
+                );
+                self.retired.push(old);
+            }
+        }
+    }
+
+    /// Asks again for the unexpose of each forward a move left at the old
+    /// address ([`Self::move_forward`]). Said once, when the move failed it.
+    async fn unbind_retired(&mut self) {
+        let mut still = Vec::new();
+        for mapping in std::mem::take(&mut self.retired) {
+            match unexpose_mapping(&self.plan.control, &mapping).await {
+                Ok(closed) => tracing::info!(
+                    session = %self.plan.box_name,
+                    from = mapping.local(),
+                    owner = %PublicationOwner::Listen.as_str(),
+                    closed_connections = %closed,
+                    "unbound a listening port at the box's old address after its move"
+                ),
+                Err(_) => still.push(mapping),
+            }
+        }
+        self.retired = still;
     }
 
     /// The PID this poll reads the box's table through, resolving the leader
@@ -1545,6 +2113,9 @@ impl WatchState {
     /// into a permitted port that stays unpublished until its server
     /// restarts.
     async fn poll(&mut self) {
+        // The publications follow the box's address before anything else:
+        // a move needs no table read, only the forwards already standing.
+        self.follow_published_address().await;
         // The leader first, when the box's host could not resolve it.
         let Some(leader) = self.resolve_leader() else {
             return;
@@ -1742,6 +2313,7 @@ impl WatchState {
                                 crate::audit::DecisionOutcome::Published,
                                 None,
                             ),
+                            &crate::audit::HostReportKey::default(),
                         )
                         .await
                         {
@@ -1772,7 +2344,8 @@ impl WatchState {
                         // The standing forward serves from here on, so the
                         // box holds its port of record (NET-129), exactly
                         // as the fresh publish below records it.
-                        self.plan.record_dynamic_hold(port);
+                        self.plan
+                            .record_dynamic_hold(self.bound_address(port), port);
                         if let Some(mapping) = self.forwards.get(&port) {
                             self.plan.publications.list(
                                 port,
@@ -1996,6 +2569,7 @@ impl WatchState {
                                         crate::audit::DecisionOutcome::Published,
                                         None,
                                     ),
+                                    &crate::audit::HostReportKey::default(),
                                 )
                                 .await
                                 {
@@ -2074,7 +2648,8 @@ impl WatchState {
                                 // publish of the same port elsewhere sees
                                 // the box that is serving and yields
                                 // instead of failing on it.
-                                self.plan.record_dynamic_hold(port);
+                                self.plan
+                                    .record_dynamic_hold(self.bound_address(port), port);
                                 self.plan.publications.mark_audit_refused(port, false);
                                 tracing::info!(
                                     session = %self.plan.box_name,
@@ -2212,6 +2787,9 @@ impl WatchState {
         crate::audit::append(
             &self.plan.state_dir,
             &self.listen_record(port, outcome, reason),
+            // A watched box reports through the route its watcher
+            // registered by switch address, so it needs no box id.
+            &crate::audit::HostReportKey::default(),
         )
         .await;
     }
@@ -2278,7 +2856,8 @@ impl WatchState {
             // rather than binding onto the forward this one still holds.
             // The re-admit records it again, idempotently, and the close
             // whose unexpose comes down releases it.
-            self.plan.record_dynamic_hold(port);
+            self.plan
+                .record_dynamic_hold(self.bound_address(port), port);
         }
         // The failure reaches `min session policy` as a warning row for as
         // long as the box listens and the log refuses: a watcher-driven
@@ -2309,11 +2888,12 @@ impl WatchState {
     /// already run, so there is no later pass to hand it to.
     async fn unbind_revoked(&mut self, port: u16, mapping: &ExposedMapping) {
         match unexpose_mapping(&self.plan.control, mapping).await {
-            Ok(()) => tracing::info!(
+            Ok(closed) => tracing::info!(
                 session = %self.plan.box_name,
                 host = %self.plan.published,
                 port,
                 owner = %PublicationOwner::Listen.as_str(),
+                closed_connections = %closed,
                 "unbound a listening port whose publication was revoked mid-bind"
             ),
             Err(e) => tracing::warn!(
@@ -2361,7 +2941,10 @@ impl WatchState {
         // way.
         let terminated = self.plan.gate.withdraw_published(port);
         match unexpose_mapping(&self.plan.control, &mapping).await {
-            Ok(()) => {
+            Ok(closed) => {
+                // NET-017's own line: the only caller of the shared unexpose
+                // that withdraws a published port, so the only one to say so.
+                log_withdrawal(&mapping, closed);
                 // The publication is the watcher's own and it came down, so
                 // the set gives the port back: the next surface that wants
                 // it — this watcher, when the box's next server binds the
@@ -2378,7 +2961,8 @@ impl WatchState {
                 // another box waits on it. Said here beside the withdraw,
                 // as the hand-over's own line; the registry has already sent
                 // each to the sessions manager.
-                for hand_over in self.plan.release_dynamic_hold(port) {
+                let bound = bound_address(&mapping).unwrap_or(self.plan.published);
+                for hand_over in self.plan.release_dynamic_hold(bound, port) {
                     tracing::info!(
                         session_id = %hand_over.holder,
                         address = %hand_over.address,
@@ -2499,7 +3083,8 @@ impl WatchState {
     /// about.
     async fn withdraw_all(&mut self) {
         for attempt in 0..WITHDRAW_PASSES {
-            if self.forwards.is_empty() {
+            self.unbind_retired().await;
+            if self.forwards.is_empty() && self.retired.is_empty() {
                 return;
             }
             if attempt > 0 {
@@ -2512,14 +3097,19 @@ impl WatchState {
                 self.close(port, "box stopped").await;
             }
         }
-        if self.forwards.is_empty() {
+        if self.forwards.is_empty() && self.retired.is_empty() {
             // The last pass brought the last forward down: every port the
             // box's processes published is unpublished, and a warning that
             // named none of them would only say the stop happened — which
             // the stop itself already says.
             return;
         }
-        let still: Vec<&str> = self.forwards.values().map(ExposedMapping::local).collect();
+        let still: Vec<&str> = self
+            .forwards
+            .values()
+            .chain(&self.retired)
+            .map(ExposedMapping::local)
+            .collect();
         tracing::warn!(
             session = %self.plan.box_name,
             still_published = ?still,
@@ -2641,6 +3231,289 @@ fn v4_word(word: &str) -> Option<Ipv4Addr> {
     u32::from_str_radix(word, 16)
         .ok()
         .map(|word| Ipv4Addr::from(word.swap_bytes()))
+}
+
+/// Whether a process whose cgroup v2 path is `cgroup` (the path after
+/// `0::` in `/proc/<pid>/cgroup`) sits in the boxes subtree, matched as the
+/// classifier's packet filter matches it: the cgroup's ancestor at level 2
+/// is `<tree root>/boxes` (NET-078's cohort identity, NET-079). The daemon's
+/// own leaf is a sibling of that subtree, so its sockets never match.
+pub(crate) fn in_boxes_subtree(cgroup: &str) -> bool {
+    let tree = Path::new(sandbox::classifier::TREE_ROOT)
+        .file_name()
+        .and_then(|name| name.to_str());
+    let mut levels = cgroup.trim().trim_start_matches('/').split('/');
+    tree.is_some_and(|tree| levels.next() == Some(tree))
+        && levels.next() == Some(sandbox::classifier::BOXES_DIR)
+}
+
+/// The TCP ports of the node's own network namespace that a process in the
+/// boxes subtree listens on, read from `proc_root` (`/proc` in the guest):
+/// the listeners of the host-address boxes, which share the node's
+/// namespace (NET-129). A listener counts only when a dial to `lease`, the
+/// node's own address, can reach it ([`binds_for_the_lease`]). A socket
+/// that `own_pid` or any process outside the boxes subtree also holds is
+/// never counted: the in-VM daemon sends no notice for a listener of its
+/// own, even one a box process inherited.
+pub(crate) fn host_address_listening_ports(
+    proc_root: &Path,
+    own_pid: u32,
+    lease: Ipv4Addr,
+) -> io::Result<BTreeSet<u16>> {
+    let mut by_inode: HashMap<u64, u16> = HashMap::new();
+    for (table, v6) in [("net/tcp", false), ("net/tcp6", true)] {
+        let text = match std::fs::read_to_string(proc_root.join(table)) {
+            Ok(text) => text,
+            Err(error) if v6 && error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for line in text.lines().skip(1) {
+            let inode = line
+                .split_whitespace()
+                .nth(9)
+                .and_then(|word| word.parse().ok());
+            if let (Some(port), Some(inode)) = (listen_port(line, v6, lease), inode) {
+                by_inode.insert(inode, port);
+            }
+        }
+    }
+    // Per listening socket: whether a box process holds it, and whether
+    // anything that is not a box process holds it too.
+    let mut held: HashMap<u64, (bool, bool)> = HashMap::new();
+    for entry in std::fs::read_dir(proc_root)?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
+            continue;
+        };
+        let inodes: Vec<u64> = fds
+            .flatten()
+            .filter_map(|fd| std::fs::read_link(fd.path()).ok())
+            .filter_map(|target| {
+                target
+                    .to_str()?
+                    .strip_prefix("socket:[")?
+                    .strip_suffix(']')?
+                    .parse()
+                    .ok()
+            })
+            .filter(|inode| by_inode.contains_key(inode))
+            .collect();
+        if inodes.is_empty() {
+            continue;
+        }
+        let in_boxes = pid != own_pid
+            && std::fs::read_to_string(entry.path().join("cgroup"))
+                .ok()
+                .and_then(|text| {
+                    text.lines()
+                        .find_map(|line| line.strip_prefix("0::").map(in_boxes_subtree))
+                })
+                .unwrap_or(false);
+        for inode in inodes {
+            let holders = held.entry(inode).or_default();
+            if in_boxes {
+                holders.0 = true;
+            } else {
+                holders.1 = true;
+            }
+        }
+    }
+    Ok(held
+        .into_iter()
+        .filter(|(_, (box_holds, other_holds))| *box_holds && !*other_holds)
+        .filter_map(|(inode, _)| by_inode.get(&inode).copied())
+        .collect())
+}
+
+/// The longest wait before a refused or unanswered listen notice is sent
+/// again. The wait doubles from [`LISTEN_POLL_INTERVAL`] up to this bound.
+const LISTEN_NOTICE_RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// The listen notices the in-VM daemon owes the VM host daemon for the
+/// host-address boxes (NET-138): the diff of one read of
+/// [`host_address_listening_ports`] against the ports the host holds as
+/// listening. A port moves into or out of that set only on a holding
+/// answer from the host ([`Self::answered`]). A notice the host refused or
+/// never answered stays owed, and is sent again after a per-port wait that
+/// doubles up to [`LISTEN_NOTICE_RETRY_MAX`].
+#[derive(Debug, Default)]
+pub(crate) struct HostAddressListens {
+    /// The ports the host answered a listening notice for and no stopped
+    /// notice since.
+    noticed: BTreeSet<u16>,
+    /// The ports whose last listening notice the host did not hold, and no
+    /// holding answer since. The host can still record such a port, for
+    /// example as a collision, so a port here that stops listening owes a
+    /// stopped notice too.
+    refused: BTreeSet<u16>,
+    /// Per port with a notice the host did not hold: when it is owed
+    /// again, and the wait the next failure earns.
+    retry: HashMap<u16, (std::time::Instant, Duration)>,
+}
+
+impl HostAddressListens {
+    /// The notices owed at `at` to move the host's ports to `now`: one
+    /// listening notice per new port and one stopped notice per closed
+    /// port, held or refused, less each port still in its retry wait. It
+    /// commits nothing.
+    pub(crate) fn notices(
+        &mut self,
+        now: &BTreeSet<u16>,
+        at: std::time::Instant,
+    ) -> Vec<minimald_rpc::ListenNotice> {
+        let stopped = self
+            .noticed
+            .union(&self.refused)
+            .filter(|port| !now.contains(port))
+            .map(|port| minimald_rpc::ListenNotice {
+                port: *port,
+                state: minimald_rpc::ListenState::Stopped,
+            });
+        let listening = now
+            .difference(&self.noticed)
+            .map(|port| minimald_rpc::ListenNotice {
+                port: *port,
+                state: minimald_rpc::ListenState::Listening,
+            });
+        let owed: Vec<_> = stopped.chain(listening).collect();
+        // A port that owes nothing any more forgets its wait.
+        self.retry
+            .retain(|port, _| owed.iter().any(|notice| notice.port == *port));
+        owed.into_iter()
+            .filter(|notice| {
+                self.retry
+                    .get(&notice.port)
+                    .is_none_or(|(due, _)| *due <= at)
+            })
+            .collect()
+    }
+
+    /// Records the host's answer to `notice` at `at`. `held` is whether
+    /// the host holds the notice: a listening port is then the host's, and
+    /// a stopped one is not. Any other answer leaves the port owed, and
+    /// sends it again after its wait.
+    pub(crate) fn answered(
+        &mut self,
+        notice: minimald_rpc::ListenNotice,
+        held: bool,
+        at: std::time::Instant,
+    ) {
+        if held {
+            self.retry.remove(&notice.port);
+            self.refused.remove(&notice.port);
+            match notice.state {
+                minimald_rpc::ListenState::Listening => self.noticed.insert(notice.port),
+                minimald_rpc::ListenState::Stopped => self.noticed.remove(&notice.port),
+            };
+            return;
+        }
+        if notice.state == minimald_rpc::ListenState::Listening {
+            self.refused.insert(notice.port);
+        }
+        let wait = self
+            .retry
+            .get(&notice.port)
+            .map_or(LISTEN_POLL_INTERVAL, |(_, wait)| *wait);
+        let next = (wait * 2).min(LISTEN_NOTICE_RETRY_MAX);
+        self.retry.insert(notice.port, (at + wait, next));
+    }
+}
+
+/// Sends the host-address boxes' listen notices to the VM host daemon until
+/// `stop` turns true: every [`LISTEN_POLL_INTERVAL`] it reads
+/// [`host_address_listening_ports`] under `/proc` for `lease`, the node's
+/// own address, and sends one notice per change ([`HostAddressListens`]).
+/// A read that fails is logged and retried on the next poll. A notice the
+/// host refuses or never answers is logged and sent again after its retry
+/// wait. A native host has no report door, so this returns at once.
+pub(crate) async fn watch_host_address_listens(
+    control: ControlChannel,
+    lease: Ipv4Addr,
+    mut stop: watch::Receiver<bool>,
+) {
+    if box_report_channel(&control).is_none() {
+        return;
+    }
+    let own_pid = std::process::id();
+    let mut listens = HostAddressListens::default();
+    while !*stop.borrow() {
+        match host_address_listening_ports(Path::new("/proc"), own_pid, lease) {
+            Ok(ports) => {
+                for notice in listens.notices(&ports, std::time::Instant::now()) {
+                    let answer = send_listen_notice(&control, notice).await;
+                    let held = matches!(
+                        answer,
+                        Ok(Some(minimald_rpc::BoxControlReply::PortRecorded { .. }))
+                    );
+                    match answer {
+                        Ok(Some(minimald_rpc::BoxControlReply::Error { error })) => {
+                            tracing::warn!(
+                                port = notice.port,
+                                state = ?notice.state,
+                                reason = %error,
+                                "the VM host daemon refused a host-address box's listen notice"
+                            );
+                        }
+                        Ok(Some(minimald_rpc::BoxControlReply::PortRecorded { .. })) => {
+                            tracing::debug!(
+                                port = notice.port,
+                                state = ?notice.state,
+                                "the VM host daemon holds a host-address box's listen notice"
+                            );
+                        }
+                        Ok(other) => tracing::warn!(
+                            port = notice.port,
+                            state = ?notice.state,
+                            answer = ?other,
+                            "the VM host daemon answered a host-address box's listen notice \
+                             with an unexpected reply"
+                        ),
+                        Err(error) => tracing::warn!(
+                            port = notice.port,
+                            state = ?notice.state,
+                            reason = %error,
+                            "a host-address box's listen notice got no answer"
+                        ),
+                    }
+                    listens.answered(notice, held, std::time::Instant::now());
+                }
+            }
+            Err(error) => tracing::warn!(
+                reason = %error,
+                "could not read the node's listening sockets for the host-address boxes"
+            ),
+        }
+        tokio::select! {
+            () = tokio::time::sleep(LISTEN_POLL_INTERVAL) => {}
+            changed = stop.changed() => if changed.is_err() { return; },
+        }
+    }
+}
+
+/// Sends one listen notice to the VM host daemon's report door and returns
+/// its answer. A native host has no door: `Ok(None)` without a round trip.
+///
+/// # Errors
+///
+/// The exchange's error when no answer arrived before [`REPORT_DEADLINE`].
+pub(crate) async fn send_listen_notice(
+    control: &ControlChannel,
+    notice: minimald_rpc::ListenNotice,
+) -> io::Result<Option<minimald_rpc::BoxControlReply>> {
+    let Some(channel) = box_report_channel(control) else {
+        return Ok(None);
+    };
+    let request = minimald_rpc::BoxControlRequest::ListenNotice(notice);
+    let deadline = tokio::time::Instant::now() + REPORT_DEADLINE;
+    report_exchange(&channel, &request, deadline)
+        .await
+        .map(Some)
 }
 
 #[cfg(test)]
@@ -5674,5 +6547,170 @@ mod tests {
         door_task.abort();
         server.abort();
         drop(listener);
+    }
+
+    /// One fake `/proc` entry: `pid` with `cgroup` and fds onto `inodes`.
+    fn fake_process(root: &Path, pid: u32, cgroup: &str, inodes: &[u64]) {
+        let entry = root.join(pid.to_string());
+        std::fs::create_dir_all(entry.join("fd")).expect("a fake fd dir");
+        std::fs::write(entry.join("cgroup"), format!("0::{cgroup}\n")).expect("a fake cgroup");
+        for (n, inode) in inodes.iter().enumerate() {
+            std::os::unix::fs::symlink(
+                format!("socket:[{inode}]"),
+                entry.join("fd").join(n.to_string()),
+            )
+            .expect("a fake socket fd");
+        }
+    }
+
+    /// NET-138: the in-VM daemon notices a listen or a close only for a
+    /// socket a process in the boxes subtree holds, matched as the
+    /// classifier matches the subtree, and never for a listener of its own
+    /// or one any process outside the subtree holds.
+    #[test]
+    fn listen_notice_only_for_box_cgroup_sockets() {
+        assert!(in_boxes_subtree("/minimald.slice/boxes/allow/web"));
+        assert!(in_boxes_subtree("/minimald.slice/boxes/deny/db\n"));
+        assert!(!in_boxes_subtree("/minimald.slice/daemon"));
+        assert!(!in_boxes_subtree("/minimald.slice"));
+        assert!(!in_boxes_subtree("/boxes/allow/web"));
+        assert!(!in_boxes_subtree(
+            "/other.slice/minimald.slice/boxes/allow/web"
+        ));
+        assert!(!in_boxes_subtree("/"));
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("net")).expect("a fake net dir");
+        // Listeners on the any address, ports 0x1F90 (8080), 0x0BB8
+        // (3000), 0x1A0A (6666), 0x1E61 (7777) and 0x08AE (2222); one
+        // established socket on 0x2328 (9000).
+        let row = |sl: u32, port: &str, state: &str, inode: u64| {
+            format!(
+                "{sl:4}: 00000000:{port} 00000000:0000 {state} 00000000:00000000 00:00000000 \
+                 00000000  1000        0 {inode} 1 0000000000000000 100 0 0 10 0"
+            )
+        };
+        let table = [
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode".to_string(),
+            row(0, "1F90", "0A", 101),
+            row(1, "0BB8", "0A", 102),
+            row(2, "1A0A", "0A", 103),
+            row(3, "1E61", "0A", 104),
+            row(4, "08AE", "0A", 105),
+            row(5, "2328", "01", 106),
+        ]
+        .join("\n");
+        std::fs::write(root.join("net/tcp"), table).expect("a fake tcp table");
+        let own_pid = 10;
+        // A box process listens on 8080 and 3000, and holds the established
+        // socket too.
+        fake_process(
+            root,
+            20,
+            "/minimald.slice/boxes/allow/web",
+            &[101, 102, 106],
+        );
+        // The daemon's own listener, in its own leaf.
+        fake_process(root, own_pid, "/minimald.slice/daemon", &[105]);
+        // A box process inherited the daemon's 6666 listener: still the
+        // daemon's own.
+        fake_process(root, 21, "/minimald.slice/boxes/deny/db", &[103]);
+        fake_process(root, own_pid + 1, "/minimald.slice/daemon", &[103]);
+        // A process outside the minimald tree listens on 7777.
+        fake_process(root, 30, "/init.scope", &[104]);
+
+        let lease = Ipv4Addr::new(192, 168, 127, 2);
+        let ports =
+            host_address_listening_ports(root, own_pid, lease).expect("the fake proc reads");
+        assert_eq!(ports, BTreeSet::from([3000, 8080]));
+
+        let mut listens = HostAddressListens::default();
+        let at = std::time::Instant::now();
+        let notices = listens.notices(&ports, at);
+        assert_eq!(
+            notices,
+            vec![
+                minimald_rpc::ListenNotice {
+                    port: 3000,
+                    state: minimald_rpc::ListenState::Listening
+                },
+                minimald_rpc::ListenNotice {
+                    port: 8080,
+                    state: minimald_rpc::ListenState::Listening
+                },
+            ]
+        );
+        // Only a holding answer commits a port. The host held 3000 and
+        // refused 8080, so 8080 stays owed after its wait.
+        listens.answered(notices[0], true, at);
+        listens.answered(notices[1], false, at);
+        assert!(
+            listens.notices(&ports, at).is_empty(),
+            "a held port owes nothing, and a refused one waits"
+        );
+        assert_eq!(
+            listens.notices(&ports, at + LISTEN_POLL_INTERVAL),
+            vec![notices[1]],
+            "a refused notice is sent again after its wait"
+        );
+        listens.answered(notices[1], true, at + LISTEN_POLL_INTERVAL);
+        assert!(
+            listens
+                .notices(&ports, at + LISTEN_NOTICE_RETRY_MAX)
+                .is_empty(),
+            "an unchanged read owes nothing"
+        );
+        let stop_3000 = minimald_rpc::ListenNotice {
+            port: 3000,
+            state: minimald_rpc::ListenState::Stopped,
+        };
+        assert_eq!(
+            listens.notices(&BTreeSet::from([8080]), at),
+            vec![stop_3000]
+        );
+        // A stopped notice that got no answer stays owed too.
+        listens.answered(stop_3000, false, at);
+        assert!(listens.notices(&BTreeSet::from([8080]), at).is_empty());
+        assert_eq!(
+            listens.notices(&BTreeSet::from([8080]), at + LISTEN_POLL_INTERVAL),
+            vec![stop_3000]
+        );
+        listens.answered(stop_3000, true, at + LISTEN_POLL_INTERVAL);
+        assert!(
+            listens
+                .notices(&BTreeSet::from([8080]), at + LISTEN_NOTICE_RETRY_MAX)
+                .is_empty()
+        );
+        // A port the host refused and that then closes owes a stopped
+        // notice, so the host forgets what it recorded for it, such as a
+        // collision. 8080 is refused again here, then its listener closes.
+        let stop_8080 = minimald_rpc::ListenNotice {
+            port: 8080,
+            state: minimald_rpc::ListenState::Stopped,
+        };
+        let mut refused = HostAddressListens::default();
+        refused.answered(notices[1], false, at);
+        let later = at + LISTEN_NOTICE_RETRY_MAX;
+        assert_eq!(
+            refused.notices(&BTreeSet::new(), later),
+            vec![stop_8080],
+            "a refused port that closes owes a stopped notice"
+        );
+        refused.answered(stop_8080, true, later);
+        assert!(
+            refused.notices(&BTreeSet::new(), later).is_empty(),
+            "a held stopped notice clears the refused port"
+        );
+        // The wire line is the fixed notice: a port and a state alone.
+        let line = serde_json_lenient::to_string(&minimald_rpc::BoxControlRequest::ListenNotice(
+            notices[0],
+        ))
+        .expect("the notice serializes");
+        assert_eq!(
+            line,
+            r#"{"verb":"listen_notice","port":3000,"state":"listening"}"#
+        );
+        assert!(line.len() <= minimald_rpc::ListenNotice::MAX_LINE_BYTES);
     }
 }

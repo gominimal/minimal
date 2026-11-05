@@ -7,12 +7,12 @@ use anyhow::{Context as _, bail};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::config::{read_client_config, resolve_minimal_config_dir};
+use crate::config::{read_client_config, read_user_policy, resolve_minimal_config_dir};
 use crate::{GlobalArgs, LoadoutListArgs};
 
 /// The user's choice of which loadouts to apply for a session
 /// activation, resolved from CLI flags before disk I/O begins.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LoadoutSelection {
     /// `--no-loadouts` set — apply nothing regardless of config.
     None,
@@ -517,6 +517,142 @@ pub(crate) fn compose_user_contribution(
 }
 
 // =========================================================================
+// Shared activation inputs
+// =========================================================================
+
+/// Everything a session activation resolves from the client's config and
+/// loadouts before it touches the daemon: the composed contribution, the
+/// staged loadout hook scripts, the finalize hook budget, and the user policy
+/// the composition may have amended.
+///
+/// The CLI-only fields ([`Self::initial_policy`], [`Self::compose_options`],
+/// [`Self::loadout_names`]) exist so the interactive-pending flows can drive
+/// their gating and print their orientation line without re-reading the
+/// config; the dashboard ignores them.
+pub struct ActivationInputs {
+    pub contribution: boxes::wire::request::WireContribution,
+    pub hook_scripts: Vec<boxes::client::hookscripts::StagedScript>,
+    pub hook_budget: Duration,
+    pub user_policy: boxes::core::policy::UserPolicy,
+    /// The user policy before composition, so a caller that drives
+    /// interactive gating can tell whether a prompt appended rules worth
+    /// saving.
+    pub initial_policy: boxes::core::policy::UserPolicy,
+    /// The compose options the daemon-side pending gate re-uses.
+    pub compose_options: boxes::core::compose::ComposeOptions,
+    /// The active loadouts' names, for the CLI's "Applying loadouts" line.
+    pub loadout_names: Vec<String>,
+}
+
+impl ActivationInputs {
+    /// Print the "Applying loadouts" orientation line the CLI emits at
+    /// session start. Never called by the dashboard, which owns its screen.
+    pub(crate) fn announce_loadouts(&self) {
+        if !self.loadout_names.is_empty() {
+            eprintln!("Applying loadouts: {}", self.loadout_names.join(", "));
+        }
+    }
+}
+
+/// What [`prepare_activation_inputs`] does with lifecycle hooks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HookPrep {
+    /// Stage the loadouts' scripts, check the project's own hooks, and size
+    /// the finalize budget: `min session activate` and the dashboard create,
+    /// which upload the project tree and so carry the hooks to the daemon.
+    Enforce,
+    /// Stage the loadouts' scripts and size the budget, but leave the
+    /// project's own hooks unchecked. `min task run` shares this prep, never
+    /// checked them before the helper was shared, and has no `--no-hooks` to
+    /// get past a refusal.
+    StageOnly,
+    /// Leave every hook alone: `--no-hooks` already disabled them.
+    Disabled,
+}
+
+/// Read the client config and user policy, resolve `selection` into the
+/// active loadouts, and stage/validate/compose everything an activation
+/// needs — the one sequence `min session activate`, `min task run`, and the
+/// dashboard all run. `project` is the activation's project root: the
+/// loadout hook scripts are anchored against it, its own hooks are checked,
+/// and its `[session]` hook timeouts size the finalize budget.
+///
+/// Run before the daemon connection: a missing loadout, a malformed config, or
+/// a mistyped hook script must fail on this machine, not after a session
+/// exists on the daemon.
+///
+/// `user_policy_override` short-circuits the policy read. A caller that has
+/// already read — and possibly amended — the policy passes it so composition
+/// and the later pending gate run under those rules even when persisting them
+/// failed.
+pub(crate) fn prepare_activation_inputs(
+    global: &GlobalArgs,
+    project: &camino::Utf8Path,
+    selection: LoadoutSelection,
+    hooks: HookPrep,
+    user_policy_override: Option<boxes::core::policy::UserPolicy>,
+) -> Result<ActivationInputs, anyhow::Error> {
+    let cfg = read_client_config(global)?;
+    prepare_activation_inputs_with_config(
+        &cfg,
+        global,
+        project,
+        selection,
+        hooks,
+        user_policy_override,
+    )
+}
+
+/// [`prepare_activation_inputs`] with the client config already read, for a
+/// caller that must read it before it takes over the screen (the `min dash`
+/// TUI): the read can print store-rule refusals and organization-file
+/// errors, and those belong on the terminal the user still owns.
+pub(crate) fn prepare_activation_inputs_with_config(
+    cfg: &boxes::client::config::Config,
+    global: &GlobalArgs,
+    project: &camino::Utf8Path,
+    selection: LoadoutSelection,
+    hooks: HookPrep,
+    user_policy_override: Option<boxes::core::policy::UserPolicy>,
+) -> Result<ActivationInputs, anyhow::Error> {
+    let hooks_enabled = hooks != HookPrep::Disabled;
+    let project =
+        paths::HostAbsPath::try_new(project.to_path_buf()).context("Invalid project root")?;
+    let project = &project;
+    let user_policy = match user_policy_override {
+        Some(policy) => policy,
+        None => read_user_policy(global)?,
+    };
+    let initial_policy = user_policy.clone();
+    let compose_options = compose_options_from_config(cfg);
+    let active = resolve_active_loadouts(selection, cfg, global)?;
+    let loadout_names = active
+        .loadouts
+        .iter()
+        .map(|l| l.name().as_ref().to_owned())
+        .collect();
+    let hook_scripts = stage_loadout_hook_scripts(&active, project, hooks_enabled)?;
+    // The project's hooks reach the daemon inside the uploaded mfile, so they
+    // never pass through the staging above; the checks a staging pass would
+    // have made are still worth making here, for the callers that ask.
+    if hooks == HookPrep::Enforce {
+        check_project_hooks(project)?;
+    }
+    let hook_budget = activate_hook_budget(&active, project.as_utf8_path(), hooks_enabled);
+    let (contribution, user_policy) =
+        compose_user_contribution(active, user_policy, compose_options, hooks_enabled)?;
+    Ok(ActivationInputs {
+        contribution,
+        hook_scripts,
+        hook_budget,
+        user_policy,
+        initial_policy,
+        compose_options,
+        loadout_names,
+    })
+}
+
+// =========================================================================
 // `minimal loadout list` — enumerate discovered loadouts.
 // =========================================================================
 
@@ -708,6 +844,41 @@ impl LoadoutRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `HookPrep::StageOnly` leaves alone a project whose hooks the staging
+    /// check would reject: `min task run` never refused one before the prep
+    /// was shared, and it has no `--no-hooks` to get past a refusal.
+    #[test]
+    fn hook_prep_stage_only_keeps_task_runs_pre_shared_behaviour() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(mfile::MFILE_NAME),
+            "[[session.lifecycle_hooks]]\n\
+             on_activate = { type = \"inline\", value = \"\" }\n",
+        )
+        .unwrap();
+        let root = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+        let global = GlobalArgs::default();
+        let cfg = boxes::client::config::Config::default();
+        let prepare = |hooks| {
+            prepare_activation_inputs_with_config(
+                &cfg,
+                &global,
+                root,
+                LoadoutSelection::None,
+                hooks,
+                Some(boxes::core::policy::UserPolicy::default()),
+            )
+        };
+        assert!(
+            prepare(HookPrep::Enforce).is_err(),
+            "an empty inline hook is refused where the check runs"
+        );
+        assert!(
+            prepare(HookPrep::StageOnly).is_ok(),
+            "task run keeps its pre-shared behaviour"
+        );
+    }
 
     /// The directory these tests pretend their hand-built loadouts were
     /// read from. Nothing here declares a `$LOADOUT_ROOT` patch source

@@ -215,9 +215,17 @@ impl Plan {
             labels.join(", ")
         );
         let mut script = crate::resolver::script_header(&what, crate::resolver::FINALIZE_SHOWN_BY);
+        // Two items can share one step (the classifier step installs the
+        // QUIC block helper too), and the script runs that step once.
+        let mut blocks: Vec<&str> = Vec::new();
         for item in missing {
+            let block = item.script.as_deref().unwrap_or_default();
+            if blocks.contains(&block) {
+                continue;
+            }
+            blocks.push(block);
             script.push('\n');
-            script.push_str(item.script.as_deref().unwrap_or_default());
+            script.push_str(block);
         }
         Some(script)
     }
@@ -345,7 +353,7 @@ pub async fn cmd_finalize_install(
     if args.undo {
         return cmd_finalize_install_undo(args.show);
     }
-    let plan = plan_for_this_host(global).await;
+    let plan = plan_for_this_host(global, args.ct_mark_mask).await;
     if args.json {
         println!("{}", plan.json());
         if plan.exit_code() != 0 {
@@ -410,6 +418,22 @@ pub(crate) fn closing_lines(installed_other_items: bool, added_kvm_group: bool) 
 pub(crate) fn undo_flags_refusal(args: &FinalizeInstallArgs) -> Option<&'static str> {
     (args.undo && args.show && !args.script)
         .then_some("--undo takes --show only with --script: `min finalize-install --undo --show --script` prints the removal script")
+}
+
+/// `--ct-mark-mask`'s value: a 0x-prefixed hex value naming exactly two
+/// contiguous bits of the 32-bit connection mark, the shape the install
+/// step itself requires. The step also refuses the ranges well-known
+/// components use, and names them, so that check stays in one place.
+pub(crate) fn parse_ct_mark_mask(value: &str) -> Result<u32, String> {
+    let bits = value
+        .strip_prefix("0x")
+        .filter(|hex| !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()))
+        .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+        .ok_or("use a 0x-prefixed hex value of at most 32 bits, such as 0x0c000000")?;
+    if bits == 0 || bits >> bits.trailing_zeros() != 0b11 {
+        return Err("name exactly two contiguous bits, such as 0x0c000000".to_string());
+    }
+    Ok(bits)
 }
 
 /// `min finalize-install --undo`: remove everything the step installs on
@@ -494,13 +518,16 @@ fn run_as_root(script: &str, pointer: &str) -> Result<(), anyhow::Error> {
 }
 
 /// Every item this host has, probed in the order the summary lists them.
-async fn plan_for_this_host(global: &GlobalArgs) -> Plan {
-    // The names item sits before the last of the other items (the `kvm`
-    // group or the classifier tree), after the user-namespace profile.
-    let mut items = other_items_for_this_host(global);
-    let last = items.pop();
-    items.push(names_item_on_this_host(global).await);
-    items.extend(last);
+/// `ct_mark_mask` is `--ct-mark-mask`, the bits the classifier step uses.
+async fn plan_for_this_host(global: &GlobalArgs, ct_mark_mask: Option<u32>) -> Plan {
+    // The names item sits after the user-namespace profile, ahead of the
+    // `kvm` group or the classifier tree and its QUIC block helper.
+    let mut items = other_items_for_this_host(global, ct_mark_mask);
+    let at = items
+        .iter()
+        .take_while(|item| item.id == "userns-profile")
+        .count();
+    items.insert(at, names_item_on_this_host(global).await);
     Plan { items }
 }
 
@@ -512,7 +539,7 @@ async fn plan_for_this_host(global: &GlobalArgs) -> Plan {
 /// and the host line ([`host_install_for_this_host`]) reads them whole, so
 /// the two read the same items by construction. Every item is Linux-only,
 /// so a macOS host reads none.
-fn other_items_for_this_host(global: &GlobalArgs) -> Vec<Item> {
+fn other_items_for_this_host(global: &GlobalArgs, ct_mark_mask: Option<u32>) -> Vec<Item> {
     let mut items = Vec::new();
     #[cfg(target_os = "linux")]
     {
@@ -520,16 +547,17 @@ fn other_items_for_this_host(global: &GlobalArgs) -> Vec<Item> {
             items.extend(linux::userns_item_on_this_host());
         }
         if global.use_minvmd() {
-            // BEP-047: the vm-users item is not offered until minvmd starts
-            // the VM and gvproxy through `sudo -n` (T66, #2566). Its drop-in
-            // names subcommands minvmd does not have at this head.
+            // Formerly BEP-047 (gominimal/inbox#1184): the vm-users item is
+            // not offered until minvmd starts the VM and gvproxy through
+            // `sudo -n` (T66, #2566). Its drop-in names subcommands minvmd
+            // does not have at this head.
             items.push(linux::kvm_item_on_this_host());
         } else {
-            items.push(linux::classifier_item_on_this_host(global));
+            items.extend(linux::classifier_items_on_this_host(global, ct_mark_mask));
         }
     }
     #[cfg(not(target_os = "linux"))]
-    let _ = global;
+    let _ = (global, ct_mark_mask);
     items
 }
 
@@ -541,7 +569,7 @@ fn other_items_for_this_host(global: &GlobalArgs) -> Vec<Item> {
 /// holds). Every item is Linux-only, so a macOS host reads `false`.
 pub(crate) fn host_install_for_this_host(global: &GlobalArgs) -> crate::resolver::HostInstall {
     crate::resolver::HostInstall {
-        other_items_unfinished: other_items_for_this_host(global)
+        other_items_unfinished: other_items_for_this_host(global, None)
             .iter()
             .any(|item| item.state != ItemState::Done),
     }
@@ -584,10 +612,12 @@ pub(crate) fn names_item(verdict: crate::resolver::NamesVerdict, port: u16) -> I
                     crate::resolver::range_text()
                 )
             } else {
+                // The boot unit is part of the step: without it the
+                // setting is gone after the next restart.
                 format!(
                     "configures this machine's DNS (systemd-resolved) to send \
                      *.{zone} lookups to Minimal's DNS service on \
-                     127.0.0.1:{port}{}",
+                     127.0.0.1:{port} at every boot{}",
                     if install.is_some() {
                         " and installs that service"
                     } else {
@@ -718,6 +748,16 @@ pub(crate) mod linux {
     const CLASSIFIER_LABEL: &str = "deny-all egress enforcement for boxes that share this \
      machine's address (--network host_ip with --deny-all-egress)";
     const KVM_LABEL: &str = "KVM access for the Linux VM provider";
+    pub(crate) const QUIC443_HELPER_ID: &str = "quic443-helper";
+    const QUIC443_HELPER_LABEL: &str = "QUIC block helper";
+    /// The root-owned helper minimald runs through `sudo -n` to block UDP
+    /// 443 for a box (BEP-018). Spelled as `QUIC443_HELPER` in
+    /// `scripts/install-host-classifier.sh` and `QUIC443_LEAF_HELPER` in
+    /// minimald.
+    pub(crate) const QUIC443_HELPER_PATH: &str = "/usr/local/lib/minimal/quic443-leaf";
+    /// The sudoers drop-in that lets the daemon's account run the helper,
+    /// spelled as `QUIC443_SUDOERS` in the classifier step.
+    pub(crate) const QUIC443_SUDOERS_PATH: &str = "/etc/sudoers.d/minimal-quic443-leaf";
 
     /// The profile the step installs, the very file the checkout ships.
     const APPARMOR_PROFILE: &str = include_str!("../../../../packaging/apparmor/minimald");
@@ -965,6 +1005,14 @@ pub(crate) mod linux {
         /// the daemon agree on what installed means. A marker without its
         /// record is a step that did not finish.
         pub(crate) table_present: bool,
+        /// The mask in that record, when the table is present: the bits
+        /// the loaded table classifies with. The step's block passes it
+        /// on when `--ct-mark-mask` does not name one, so a refresh and
+        /// the boot unit keep the operator's earlier choice.
+        pub(crate) recorded_mask: Option<u32>,
+        /// `--ct-mark-mask`: the bits this run installs with. A table
+        /// loaded with other bits is not done.
+        pub(crate) requested_mask: Option<u32>,
         /// The copy at [`CLASSIFIER_PROGRAM_PATH`] reads as
         /// [`CLASSIFIER_SCRIPT`] byte for byte: the copy outlives an
         /// upgrade of this binary and the units run it, so one that differs
@@ -1018,7 +1066,14 @@ pub(crate) mod linux {
                     .to_string(),
             );
         }
-        if facts.table_present && facts.copy_current && facts.units_enabled != Some(false) {
+        let mask_matches = facts
+            .requested_mask
+            .is_none_or(|mask| Some(mask) == facts.recorded_mask);
+        if facts.table_present
+            && mask_matches
+            && facts.copy_current
+            && facts.units_enabled != Some(false)
+        {
             return Item::done(CLASSIFIER_ID, CLASSIFIER_LABEL);
         }
         let cause = match facts.mount {
@@ -1066,24 +1121,37 @@ pub(crate) mod linux {
                             "deny-all egress is not enforced for boxes that share this \
                              machine's address: the step that enforces it is not \
                              installed, or did not finish"
+                                .to_string()
+                        } else if !mask_matches {
+                            format!(
+                                "egress enforcement uses the connection-mark bits {}, and \
+                                 --ct-mark-mask asks for {}",
+                                mask_hex(facts.recorded_mask),
+                                mask_hex(facts.requested_mask),
+                            )
                         } else if !facts.copy_current {
                             "the installed copy of the step that enforces deny-all egress \
                              is missing or out of date, so this version of min's step is \
                              not what runs at boot or at daemon start"
+                                .to_string()
                         } else {
                             "the step that enforces deny-all egress is installed but its \
                              systemd units are missing or not enabled, so a daemon restart \
                              can leave deny-all boxes refused, and a reboot can leave \
                              deny-all egress not enforced"
-                        }
-                        .to_string(),
+                                .to_string()
+                        },
                         format!(
                             "installs the cgroup tree and packet filter that enforce \
                              deny-all egress for {operator}'s daemon, and systemd units \
                              that restore them at boot and place the daemon under them on \
                              every daemon start"
                         ),
-                        classifier_steps(operator, socket),
+                        classifier_steps(
+                            operator,
+                            socket,
+                            facts.requested_mask.or(facts.recorded_mask),
+                        ),
                     );
                 }
             }
@@ -1097,7 +1165,15 @@ pub(crate) mod linux {
     /// oneshot that re-runs the step, and the placement pair: a path unit
     /// on the daemon's socket and the oneshot it starts — enabled, and the
     /// placement run once for the daemon that may already be listening.
-    fn classifier_steps(operator: &str, socket: &str) -> String {
+    ///
+    /// `mask`, when there is one, is passed to the step as
+    /// `--ct-mark-mask` both now and in the boot unit: the mask's record
+    /// lives in cgroupfs, which a reboot empties, so the unit is what keeps
+    /// the operator's bits across one.
+    fn classifier_steps(operator: &str, socket: &str, mask: Option<u32>) -> String {
+        let mask = mask
+            .map(|bits| format!(" --ct-mark-mask 0x{bits:08x}"))
+            .unwrap_or_default();
         format!(
             "# The egress classifier: its privileged step, from a root-owned copy of the\n\
              # bytes this binary carries, with no source identity (an un-enrolled host\n\
@@ -1108,7 +1184,7 @@ pub(crate) mod linux {
              {CLASSIFIER_SCRIPT_HEREDOC}\n\
              chmod 0755 {CLASSIFIER_PROGRAM_PATH}.new\n\
              mv -f {CLASSIFIER_PROGRAM_PATH}.new {CLASSIFIER_PROGRAM_PATH}\n\
-             {CLASSIFIER_PROGRAM_PATH} --user '{operator}'\n\
+             {CLASSIFIER_PROGRAM_PATH} --user '{operator}'{mask}\n\
              # The record marks the tree as this step's, so --undo removes it; one\n\
              # installed another way is left alone.\n\
              mkdir -p /var/lib/minimal\n\
@@ -1131,7 +1207,7 @@ pub(crate) mod linux {
              \n\
              [Service]\n\
              Type=oneshot\n\
-             ExecStart={CLASSIFIER_PROGRAM_PATH} --user '{operator}'\n\
+             ExecStart={CLASSIFIER_PROGRAM_PATH} --user '{operator}'{mask}\n\
              \n\
              [Install]\n\
              WantedBy=multi-user.target\n\
@@ -1172,39 +1248,177 @@ pub(crate) mod linux {
     /// table classifies with (the step writes both in one install). A
     /// marker alone, a record that does not parse, or two that disagree
     /// is a step that did not finish, and reads as not installed.
-    pub(crate) fn table_present(root: &std::path::Path) -> bool {
+    ///
+    /// The mask is the one the record names, and `None` reads as not
+    /// installed.
+    pub(crate) fn recorded_mask(root: &std::path::Path) -> Option<u32> {
         if !root.join("classifier-table").is_dir() {
-            return false;
+            return None;
         }
-        let Ok(entries) = std::fs::read_dir(root) else {
-            return false;
-        };
+        let entries = std::fs::read_dir(root).ok()?;
         let mut mask = None;
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(value) = name.to_str().and_then(|n| n.strip_prefix("ct-mark-mask-")) else {
                 continue;
             };
-            let Some(bits) = value
+            let bits = value
                 .strip_prefix("0x")
-                .and_then(|hex| u32::from_str_radix(hex, 16).ok())
-            else {
-                return false;
-            };
+                .and_then(|hex| u32::from_str_radix(hex, 16).ok())?;
             if mask.is_some_and(|other| other != bits) {
-                return false;
+                return None;
             }
             mask = Some(bits);
         }
-        mask.is_some()
+        mask
     }
 
-    /// [`classifier_item_over`] this host's reads: the table's presence, the
-    /// root-owned copy's bytes against this binary's, the units and their
-    /// `multi-user.target` links where the host has systemctl, the tree's
-    /// owner, this process's uid and account, the cgroup2 mount, and the
-    /// native daemon's socket path for this `--minimal-dir`.
-    pub(crate) fn classifier_item_on_this_host(global: &GlobalArgs) -> Item {
+    /// A mask as the step spells it, or the step's default when there is
+    /// none.
+    fn mask_hex(mask: Option<u32>) -> String {
+        mask.map_or_else(|| "0x30000000".to_string(), |bits| format!("0x{bits:08x}"))
+    }
+
+    /// The QUIC block helper's facts: whether the helper and its sudoers
+    /// drop-in are each a file owned by root.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct Quic443HelperFacts {
+        /// [`QUIC443_HELPER_PATH`] is a root-owned file.
+        pub(crate) helper_root_owned: bool,
+        /// [`QUIC443_SUDOERS_PATH`] is a root-owned file. Where this account
+        /// cannot look inside its directory (some distributions make
+        /// `/etc/sudoers.d` root-only), `sudo -n -l` lists a NOPASSWD rule
+        /// that names the helper.
+        pub(crate) sudoers_root_owned: bool,
+    }
+
+    /// The QUIC block helper item (BEP-018): done when the helper and its
+    /// sudoers drop-in are installed root-owned. Otherwise it names the
+    /// helper's path and carries the classifier step, which installs both,
+    /// or it is blocked by what blocks that step.
+    pub(crate) fn quic443_helper_item_over(
+        helper: Quic443HelperFacts,
+        classifier: &ClassifierFacts,
+        operator: &str,
+        socket: &str,
+    ) -> Item {
+        if helper.helper_root_owned && helper.sudoers_root_owned {
+            return Item::done(QUIC443_HELPER_ID, QUIC443_HELPER_LABEL);
+        }
+        // The classifier item as if its table were absent: its step is the
+        // one that installs the helper, so its script or its cause is ours.
+        let step = classifier_item_over(
+            &ClassifierFacts {
+                table_present: false,
+                ..*classifier
+            },
+            operator,
+            socket,
+        );
+        match step.script {
+            // The wording is the task's diagnostics line (#2607).
+            Some(script) => Item::missing(
+                QUIC443_HELPER_ID,
+                QUIC443_HELPER_LABEL,
+                format!(
+                    "not installed at {QUIC443_HELPER_PATH}. Run `min finalize-install` to \
+                     install it."
+                ),
+                format!(
+                    "installs the helper at {QUIC443_HELPER_PATH} that blocks UDP port 443 \
+                     (QUIC) for boxes, and the sudoers rule at {QUIC443_SUDOERS_PATH} that \
+                     lets {operator}'s daemon run it"
+                ),
+                script,
+            ),
+            None => Item::cannot(
+                QUIC443_HELPER_ID,
+                QUIC443_HELPER_LABEL,
+                step.cause.unwrap_or_default(),
+            ),
+        }
+    }
+
+    /// The classifier item and the QUIC block helper item over this host's
+    /// reads, in that order.
+    pub(crate) fn classifier_items_on_this_host(
+        global: &GlobalArgs,
+        ct_mark_mask: Option<u32>,
+    ) -> [Item; 2] {
+        use std::os::unix::fs::MetadataExt as _;
+        let (facts, operator, socket) = classifier_facts_on_this_host(global, ct_mark_mask);
+        // Root-owned and writable by root alone: not a symlink, no group or
+        // other write bit, and the same of the directory that holds it.
+        let root_only = |meta: &std::fs::Metadata| meta.uid() == 0 && meta.mode() & 0o022 == 0;
+        let root_owned_file = |path: &str| -> std::io::Result<bool> {
+            let path = std::path::Path::new(path);
+            let meta = std::fs::symlink_metadata(path)?;
+            let parent_root_only = path
+                .parent()
+                .and_then(|dir| std::fs::symlink_metadata(dir).ok())
+                .is_some_and(|dir| dir.is_dir() && root_only(&dir));
+            Ok(meta.file_type().is_file() && root_only(&meta) && parent_root_only)
+        };
+        let helper_root_owned = root_owned_file(QUIC443_HELPER_PATH).unwrap_or(false);
+        let helper = Quic443HelperFacts {
+            helper_root_owned,
+            sudoers_root_owned: match root_owned_file(QUIC443_SUDOERS_PATH) {
+                Ok(owned) => owned,
+                // Some distributions make `/etc/sudoers.d` root-only, so this
+                // account cannot stat the drop-in. Ask sudo instead whether
+                // this account may run the helper with no password: the
+                // rule is NOPASSWD, so `sudo -n -l` answers without a prompt,
+                // and only a rule that names the helper counts.
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    helper_root_owned && sudo_lets_this_account_run(QUIC443_HELPER_PATH)
+                }
+                Err(_) => false,
+            },
+        };
+        [
+            classifier_item_over(&facts, &operator, &socket),
+            quic443_helper_item_over(helper, &facts, &operator, &socket),
+        ]
+    }
+
+    /// Whether this account's sudo rules, listed by `sudo -n -l`, let it run
+    /// `path` with no password. A broad rule such as `NOPASSWD: ALL` does
+    /// not count: it says nothing of the drop-in. False when sudo is absent
+    /// or asks.
+    fn sudo_lets_this_account_run(path: &str) -> bool {
+        std::process::Command::new("sudo")
+            .args(["-n", "-l"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .is_ok_and(|out| {
+                out.status.success()
+                    && sudo_listing_names_nopasswd(&String::from_utf8_lossy(&out.stdout), path)
+            })
+    }
+
+    /// Whether a `sudo -l` listing has a NOPASSWD rule whose commands name
+    /// `path` itself, as the drop-in's rule does.
+    pub(crate) fn sudo_listing_names_nopasswd(listing: &str, path: &str) -> bool {
+        listing.lines().any(|line| {
+            line.split_once("NOPASSWD:").is_some_and(|(_, commands)| {
+                commands
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .any(|token| token == path)
+            })
+        })
+    }
+
+    /// [`classifier_item_over`]'s inputs from this host's reads: the table's
+    /// presence, the root-owned copy's bytes against this binary's, the
+    /// units and their `multi-user.target` links where the host has
+    /// systemctl, the tree's owner, this process's uid and account, the
+    /// cgroup2 mount, and the native daemon's socket path for this
+    /// `--minimal-dir`.
+    fn classifier_facts_on_this_host(
+        global: &GlobalArgs,
+        ct_mark_mask: Option<u32>,
+    ) -> (ClassifierFacts, String, String) {
         use std::os::unix::fs::MetadataExt as _;
         let root = std::path::Path::new(CLASSIFIER_TREE_ROOT);
         let copy_current = std::fs::read(CLASSIFIER_PROGRAM_PATH)
@@ -1232,20 +1446,23 @@ pub(crate) mod linux {
             .map(|meta| meta.uid())
             .filter(|uid| *uid != me);
         let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+        let recorded = recorded_mask(root);
         let socket = crate::client::resolve_socket_path(global.minimal_dir.as_deref(), false)
             .map(|path| path.display().to_string())
             .unwrap_or_default();
-        classifier_item_over(
-            &ClassifierFacts {
-                table_present: table_present(root),
+        (
+            ClassifierFacts {
+                table_present: recorded.is_some(),
+                recorded_mask: recorded,
+                requested_mask: ct_mark_mask,
                 copy_current,
                 units_enabled,
                 other_owner,
                 root: me == 0,
                 mount: cgroup2_mount_from(&mountinfo),
             },
-            &crate::resolver::operator_name(),
-            &socket,
+            crate::resolver::operator_name(),
+            socket,
         )
     }
     /// The KVM item over the result of opening `/dev/kvm` for reading:
@@ -1350,7 +1567,7 @@ pub(crate) mod linux {
         kvm_item_over(open, &operator, in_kvm_group(&group, &operator))
     }
 
-    // ── The VM's own users (BEP-047) ──────────────────────────────────────
+    // ── The VM's own users (formerly BEP-047, gominimal/inbox#1184) ────────
     //
     // The VMM child runs as `minimal-vmm` and gvproxy as `minimal-gvproxy`,
     // each started by the login through `sudo -n -u` under a drop-in this
@@ -1397,7 +1614,7 @@ pub(crate) mod linux {
     /// The paths the item works on, for one login and one VM.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) struct VmUsersLayout {
-        pub provider_dir: std::path::PathBuf,
+        pub host_dir: std::path::PathBuf,
         pub vm_dir: std::path::PathBuf,
         pub gvproxy_dir: std::path::PathBuf,
         pub gvproxy_config_dir: std::path::PathBuf,
@@ -1405,12 +1622,12 @@ pub(crate) mod linux {
     }
 
     impl VmUsersLayout {
-        /// The layout for `operator`'s `vm` with its provider dir at
-        /// `provider_dir`, under [`VM_USERS_BASE`].
-        pub(crate) fn new(provider_dir: std::path::PathBuf, operator: &str, vm: &str) -> Self {
+        /// The layout for `operator`'s `vm` with its host dir at
+        /// `host_dir`, under [`VM_USERS_BASE`].
+        pub(crate) fn new(host_dir: std::path::PathBuf, operator: &str, vm: &str) -> Self {
             let vm_dir = std::path::Path::new(VM_USERS_BASE).join(operator).join(vm);
             VmUsersLayout {
-                provider_dir,
+                host_dir,
                 gvproxy_dir: vm_dir.join("gvproxy"),
                 gvproxy_config_dir: vm_dir.join("gvproxy-config"),
                 gate_dir: vm_dir.join("gate"),
@@ -1419,7 +1636,7 @@ pub(crate) mod linux {
         }
 
         pub(crate) fn vmm_dir(&self) -> std::path::PathBuf {
-            self.provider_dir.join("vmm")
+            self.host_dir.join("vmm")
         }
     }
 
@@ -1435,7 +1652,7 @@ pub(crate) mod linux {
         /// The VM name the rules name.
         pub vm: String,
         pub layout: VmUsersLayout,
-        pub provider: Option<DirFact>,
+        pub host_dir: Option<DirFact>,
         pub vmm: Option<DirFact>,
         pub gvproxy_dir: Option<DirFact>,
         pub gvproxy_config_dir: Option<DirFact>,
@@ -1545,16 +1762,16 @@ pub(crate) mod linux {
     }
 
     /// The script block that creates the users, the directories and the
-    /// drop-in. The provider dir and `vmm/` sit in the login's state dir,
+    /// drop-in. The host dir and `vmm/` sit in the login's state dir,
     /// which the login can change while root works there. So root reaches
     /// them by `cd -P`, checks that `pwd -P` is the path it means and
     /// checks the owner of `.`, and changes only `.`.
     fn vm_users_script(facts: &VmUsersFacts, drop_in: &str) -> String {
         let op = &facts.operator;
         let layout = &facts.layout;
-        let provider = layout.provider_dir.display().to_string();
+        let host_dir = layout.host_dir.display().to_string();
         let components: Vec<String> = layout
-            .provider_dir
+            .host_dir
             .components()
             .filter_map(|c| match c {
                 std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
@@ -1578,13 +1795,13 @@ pub(crate) mod linux {
             // went one level down from where the walk was. The physical
             // path is checked too.
             walk.push_str(&format!(
-                "  [ ! -L '{name}' ] || {{ echo \"{provider}: a component is a symlink\" >&2; exit 1; }}\n\
+                "  [ ! -L '{name}' ] || {{ echo \"{host_dir}: a component is a symlink\" >&2; exit 1; }}\n\
                  \x20 here=$(stat -c %d:%i .)\n\
                  \x20 cd -P -- '{name}'\n\
-                 \x20 {CD_PARENT_CHECK}{provider}: a component moved\" >&2; exit 1; }}\n\
-                 \x20 [ \"$(pwd -P)\" = '{here}' ] || {{ echo \"{provider}: a component is a symlink\" >&2; exit 1; }}\n\
+                 \x20 {CD_PARENT_CHECK}{host_dir}: a component moved\" >&2; exit 1; }}\n\
+                 \x20 [ \"$(pwd -P)\" = '{here}' ] || {{ echo \"{host_dir}: a component is a symlink\" >&2; exit 1; }}\n\
                  \x20 owner=$(stat -c %u .)\n\
-                 \x20 {want} || {{ echo \"{provider}: a component has another owner\" >&2; exit 1; }}\n"
+                 \x20 {want} || {{ echo \"{host_dir}: a component has another owner\" >&2; exit 1; }}\n"
             ));
         }
         let base = VM_USERS_BASE;
@@ -1616,15 +1833,15 @@ pub(crate) mod linux {
              \x20 chgrp {VMM_USER} .\n\
              \x20 chmod 0710 .\n\
              \x20 [ -e vmm ] || mkdir -m 0700 vmm\n\
-             \x20 [ ! -L vmm ] || {{ echo \"{provider}/vmm is a symlink\" >&2; exit 1; }}\n\
+             \x20 [ ! -L vmm ] || {{ echo \"{host_dir}/vmm is a symlink\" >&2; exit 1; }}\n\
              \x20 here=$(stat -c %d:%i .)\n\
              \x20 cd -P vmm\n\
-             \x20 {CD_PARENT_CHECK}{provider}/vmm moved\" >&2; exit 1; }}\n\
+             \x20 {CD_PARENT_CHECK}{host_dir}/vmm moved\" >&2; exit 1; }}\n\
              \x20 [ \"$(pwd -P)\" = '{here}/vmm' ] || \
-             {{ echo \"{provider}/vmm is a symlink\" >&2; exit 1; }}\n\
+             {{ echo \"{host_dir}/vmm is a symlink\" >&2; exit 1; }}\n\
              \x20 owner=$(stat -c %u .)\n\
              \x20 [ \"$owner\" = 0 ] || [ \"$owner\" = \"$(id -u {VMM_USER})\" ] || \
-             {{ echo \"{provider}/vmm has another owner\" >&2; exit 1; }}\n\
+             {{ echo \"{host_dir}/vmm has another owner\" >&2; exit 1; }}\n\
              \x20 chown root:root .\n\
              \x20 chmod 0700 .\n\
              \x20 chown {VMM_USER}:{VMM_USER} .\n\
@@ -1687,10 +1904,10 @@ pub(crate) mod linux {
             Ok(path) => path,
             Err(why) => return Item::cannot(VM_USERS_ID, VM_USERS_LABEL, why.clone()),
         };
-        // The script prints the provider path inside double quotes, where
+        // The script prints the host dir path inside double quotes, where
         // `$`, a backtick and `\` keep a meaning to the shell. So those
         // characters are refused too.
-        let paths_quotable = [&facts.layout.provider_dir, &facts.layout.vm_dir]
+        let paths_quotable = [&facts.layout.host_dir, &facts.layout.vm_dir]
             .iter()
             .all(|p| {
                 p.to_str()
@@ -1708,15 +1925,15 @@ pub(crate) mod linux {
             );
         };
 
-        // The script walks into the provider dir and does not create it.
-        if !facts.provider.is_some_and(|f| f.is_dir) {
+        // The script walks into the host dir and does not create it.
+        if !facts.host_dir.is_some_and(|f| f.is_dir) {
             return Item::cannot(
                 VM_USERS_ID,
                 VM_USERS_LABEL,
                 format!(
                     "{} does not exist yet, so there is no VM directory to set up. minvmd \
                      creates it the first time the VM starts",
-                    facts.layout.provider_dir.display()
+                    facts.layout.host_dir.display()
                 ),
             );
         }
@@ -1761,7 +1978,7 @@ pub(crate) mod linux {
                 let (vmm_gid, gvp_gid) = (*vmm_gid, *gvp_gid);
                 one_member(&vmm_group)
                     && one_member(&gvp_group)
-                    && facts.provider.is_some_and(|f| {
+                    && facts.host_dir.is_some_and(|f| {
                         f.is_dir
                             && f.uid == facts.operator_uid
                             && f.gid == vmm_gid
@@ -1837,30 +2054,27 @@ pub(crate) mod linux {
     }
 
     /// [`vm_users_item_over`] this host's reads, for the default VM.
-    // BEP-047: not offered until T66 (#2566) spawns through `sudo -n`, so
-    // no caller exists at this head. T66 adds the caller back.
+    // Formerly BEP-047 (gominimal/inbox#1184): not offered until T66 (#2566)
+    // spawns through `sudo -n`, so no caller exists at this head. T66 adds
+    // the caller back.
     #[allow(dead_code)]
     pub(crate) fn vm_users_item_on_this_host() -> Item {
         let operator = crate::resolver::operator_name();
-        let provider_dir = paths::provider_instance_dir(
-            &paths::minimal_state_dir(),
-            paths::ProviderKind::Minvmd,
-            0,
-        )
-        .as_utf8_path()
-        .as_std_path()
-        .to_path_buf();
+        let host_dir = paths::host_dir(&paths::minimal_state_dir(), paths::HostKind::Minvmd, 0)
+            .as_utf8_path()
+            .as_std_path()
+            .to_path_buf();
         // The script refuses a symlink in the path, and `/home` is a
         // symlink on some hosts. So the item works on the real path.
-        let provider_dir = std::fs::canonicalize(&provider_dir).unwrap_or(provider_dir);
-        let vm = paths::provider_instance_name(paths::ProviderKind::Minvmd, 0);
-        let layout = VmUsersLayout::new(provider_dir, &operator, &vm);
+        let host_dir = std::fs::canonicalize(&host_dir).unwrap_or(host_dir);
+        let vm = paths::host_name(paths::HostKind::Minvmd, 0);
+        let layout = VmUsersLayout::new(host_dir, &operator, &vm);
         let facts = VmUsersFacts {
             operator_uid: nix::unistd::getuid().as_raw(),
             passwd: std::fs::read_to_string("/etc/passwd").unwrap_or_default(),
             group: std::fs::read_to_string("/etc/group").unwrap_or_default(),
             vm,
-            provider: dir_fact(&layout.provider_dir),
+            host_dir: dir_fact(&layout.host_dir),
             vmm: dir_fact(&layout.vmm_dir()),
             gvproxy_dir: dir_fact(&layout.gvproxy_dir),
             gvproxy_config_dir: dir_fact(&layout.gvproxy_config_dir),
@@ -2039,6 +2253,7 @@ mod tests {
             script,
             json: false,
             undo,
+            ct_mark_mask: None,
         };
         assert!(undo_flags_refusal(&args(true, false, true)).is_some());
         assert_eq!(undo_flags_refusal(&args(true, true, true)), None);
@@ -2240,7 +2455,7 @@ mod tests {
              reserves the box IPs (127.0.64.0/24) on this machine's loopback at every boot"
         } else {
             "configures this machine's DNS (systemd-resolved) to send *.min.internal lookups \
-             to Minimal's DNS service on 127.0.0.1:15353"
+             to Minimal's DNS service on 127.0.0.1:15353 at every boot"
         };
         assert_eq!(missing.step.as_deref(), Some(expected_step));
         assert!(NAMES_LABEL.contains(crate::resolver::ZONE), "{NAMES_LABEL}");
@@ -2296,7 +2511,7 @@ mod tests {
             );
         } else {
             assert!(
-                step.ends_with("on 127.0.0.1:15353 and installs that service"),
+                step.ends_with("on 127.0.0.1:15353 at every boot and installs that service"),
                 "{step}"
             );
         }
@@ -2488,25 +2703,174 @@ mod tests {
     /// disagree is not installed; one record, or two that agree, is.
     #[test]
     fn classifier_table_presence_needs_the_marker_and_one_mask_record() {
-        use linux::table_present;
+        use linux::recorded_mask;
         let root = tempfile::tempdir().expect("a temp dir");
         let root = root.path();
-        assert!(!table_present(root), "an empty root");
+        assert_eq!(recorded_mask(root), None, "an empty root");
         std::fs::create_dir(root.join("classifier-table")).unwrap();
-        assert!(
-            !table_present(root),
+        assert_eq!(
+            recorded_mask(root),
+            None,
             "the marker alone is a step that did not finish"
         );
         std::fs::create_dir(root.join("ct-mark-mask-not-a-mask")).unwrap();
-        assert!(!table_present(root), "a record that does not parse");
+        assert_eq!(recorded_mask(root), None, "a record that does not parse");
         std::fs::remove_dir(root.join("ct-mark-mask-not-a-mask")).unwrap();
         std::fs::create_dir(root.join("ct-mark-mask-0x30000000")).unwrap();
-        assert!(table_present(root), "the marker and one record");
+        assert_eq!(
+            recorded_mask(root),
+            Some(0x3000_0000),
+            "the marker and one record"
+        );
         std::fs::create_dir(root.join("ct-mark-mask-0x0000c000")).unwrap();
-        assert!(!table_present(root), "two records that disagree");
+        assert_eq!(recorded_mask(root), None, "two records that disagree");
         std::fs::remove_dir(root.join("ct-mark-mask-0x0000c000")).unwrap();
         std::fs::remove_dir(root.join("classifier-table")).unwrap();
-        assert!(!table_present(root), "a record without the marker");
+        assert_eq!(recorded_mask(root), None, "a record without the marker");
+    }
+
+    /// BEP-018 (#2607): the QUIC block helper item is done when the helper
+    /// and its sudoers drop-in are root-owned. Otherwise it names the
+    /// helper's path and the step that installs it, which is the classifier
+    /// step, and a run carries that step once.
+    #[test]
+    fn finalize_install_names_the_quic_block_helper() {
+        use linux::{
+            Cgroup2Mount, ClassifierFacts, QUIC443_HELPER_PATH, QUIC443_SUDOERS_PATH,
+            Quic443HelperFacts, classifier_item_over, quic443_helper_item_over,
+            sudo_listing_names_nopasswd,
+        };
+        // The paths are the ones the classifier step installs to.
+        let script = crate::resolver::CLASSIFIER_SCRIPT;
+        assert!(script.contains(&format!(
+            "QUIC443_HELPER=${{MINIMAL_OVERRIDE_QUIC443_HELPER:-{QUIC443_HELPER_PATH}}}"
+        )));
+        assert!(script.contains(&format!(
+            "QUIC443_SUDOERS=${{MINIMAL_OVERRIDE_QUIC443_SUDOERS:-{QUIC443_SUDOERS_PATH}}}"
+        )));
+
+        let sock = "/home/alice/.local/state/minimal/providers/local-minimald0/ssh.sock";
+        let classifier = ClassifierFacts {
+            table_present: true,
+            recorded_mask: Some(0x3000_0000),
+            requested_mask: None,
+            copy_current: true,
+            units_enabled: Some(true),
+            other_owner: None,
+            root: false,
+            mount: Cgroup2Mount::Delegated,
+        };
+        let installed = Quic443HelperFacts {
+            helper_root_owned: true,
+            sudoers_root_owned: true,
+        };
+        let item = quic443_helper_item_over(installed, &classifier, "alice", sock);
+        assert_eq!(item.id, "quic443-helper");
+        assert_eq!(item.label, "QUIC block helper");
+        assert_eq!(item.state, ItemState::Done);
+
+        let wanted = format!(
+            "not installed at {QUIC443_HELPER_PATH}. Run `min finalize-install` to install it."
+        );
+        for helper in [
+            Quic443HelperFacts {
+                helper_root_owned: false,
+                ..installed
+            },
+            Quic443HelperFacts {
+                sudoers_root_owned: false,
+                ..installed
+            },
+        ] {
+            let item = quic443_helper_item_over(helper, &classifier, "alice", sock);
+            assert_eq!(item.state, ItemState::Missing, "{helper:?}");
+            assert_eq!(item.today.as_deref(), Some(wanted.as_str()));
+            let step = item.step.as_deref().unwrap_or_default();
+            assert!(step.contains(QUIC443_HELPER_PATH), "{step}");
+            assert!(step.contains(QUIC443_SUDOERS_PATH), "{step}");
+            assert!(
+                item.script
+                    .as_deref()
+                    .is_some_and(|block| block.contains(crate::resolver::CLASSIFIER_PROGRAM_PATH)),
+                "the step is the classifier step"
+            );
+            let summary = Plan {
+                items: vec![item.clone()],
+            }
+            .summary();
+            assert!(summary.contains("  ✗ QUIC block helper\n"), "{summary}");
+            assert!(
+                summary.contains(&format!("      today: {wanted}\n")),
+                "{summary}"
+            );
+        }
+
+        // Where `/etc/sudoers.d` is root-only, only a NOPASSWD rule that
+        // names the helper stands in for the drop-in, not a broad one.
+        let drop_in = format!(
+            "User alice may run the following commands on host:\n    (root) NOPASSWD: \
+             {QUIC443_HELPER_PATH}\n"
+        );
+        assert!(sudo_listing_names_nopasswd(&drop_in, QUIC443_HELPER_PATH));
+        let among = format!("    (root) NOPASSWD: SETENV: /usr/bin/true, {QUIC443_HELPER_PATH}\n");
+        assert!(sudo_listing_names_nopasswd(&among, QUIC443_HELPER_PATH));
+        for broad in [
+            "User alice may run the following commands on host:\n    (ALL) NOPASSWD: ALL\n",
+            "    (ALL : ALL) NOPASSWD: ALL\n",
+            &format!("    (root) {QUIC443_HELPER_PATH}\n"),
+            &format!("    (root) NOPASSWD: {QUIC443_HELPER_PATH}.bak\n"),
+        ] {
+            assert!(
+                !sudo_listing_names_nopasswd(broad, QUIC443_HELPER_PATH),
+                "{broad}"
+            );
+        }
+
+        // What blocks the classifier step blocks the helper too.
+        let unmounted = ClassifierFacts {
+            mount: Cgroup2Mount::Absent,
+            ..classifier
+        };
+        let missing_helper = Quic443HelperFacts {
+            helper_root_owned: false,
+            sudoers_root_owned: false,
+        };
+        let blocked = quic443_helper_item_over(missing_helper, &unmounted, "alice", sock);
+        assert_eq!(blocked.state, ItemState::Cannot);
+        assert!(
+            blocked
+                .cause
+                .as_deref()
+                .is_some_and(|c| c.contains("cgroup2")),
+            "{blocked:?}"
+        );
+
+        // With the classifier missing as well, a run carries its step once.
+        let bare = ClassifierFacts {
+            table_present: false,
+            recorded_mask: None,
+            ..classifier
+        };
+        let plan = Plan {
+            items: vec![
+                classifier_item_over(&bare, "alice", sock),
+                quic443_helper_item_over(missing_helper, &bare, "alice", sock),
+            ],
+        };
+        let run = plan.script().expect("a script while items are missing");
+        let program = format!(
+            "{} --user 'alice'\n",
+            crate::resolver::CLASSIFIER_PROGRAM_PATH
+        );
+        assert!(
+            run.contains("QUIC block helper"),
+            "the header names the item"
+        );
+        assert_eq!(
+            run.matches(&format!("\n{program}")).count(),
+            1,
+            "one classifier step: {run}"
+        );
     }
 
     /// The classifier item's table: done on the marker with a current copy
@@ -2540,6 +2904,8 @@ mod tests {
         let sock = "/home/alice/.local/state/minimal/providers/local-minimald0/ssh.sock";
         let installed = ClassifierFacts {
             table_present: true,
+            recorded_mask: Some(0x3000_0000),
+            requested_mask: None,
             copy_current: true,
             units_enabled: Some(true),
             other_owner: None,
@@ -2548,6 +2914,7 @@ mod tests {
         };
         let bare = ClassifierFacts {
             table_present: false,
+            recorded_mask: None,
             copy_current: false,
             units_enabled: Some(false),
             ..installed
@@ -2743,6 +3110,82 @@ mod tests {
     /// oneshot that re-runs it plus a path unit on the daemon's socket whose
     /// oneshot runs the step's `--place-listener` — so a daemon restart is
     /// placed by the manager, never by a per-restart `--pid`.
+    /// The boot unit and a refresh re-apply the mask the loaded table
+    /// records, since a reboot empties the cgroupfs record. A
+    /// `--ct-mark-mask` that differs from the record re-runs the step
+    /// with the new bits, and one that matches leaves the item done.
+    #[test]
+    fn classifier_boot_unit_reapplies_a_recorded_mask() {
+        use crate::resolver::CLASSIFIER_PROGRAM_PATH;
+        use linux::{Cgroup2Mount, ClassifierFacts, classifier_item_over};
+        let sock = "/home/alice/.local/state/minimal/providers/local-minimald0/ssh.sock";
+        let installed = ClassifierFacts {
+            table_present: true,
+            recorded_mask: Some(0x0c00_0000),
+            requested_mask: None,
+            copy_current: true,
+            units_enabled: Some(true),
+            other_owner: None,
+            root: false,
+            mount: Cgroup2Mount::Delegated,
+        };
+        let stale = classifier_item_over(
+            &ClassifierFacts {
+                copy_current: false,
+                ..installed
+            },
+            "alice",
+            sock,
+        );
+        let script = stale.script.expect("a stale copy carries the block");
+        assert!(
+            script.contains(&format!(
+                "\n{CLASSIFIER_PROGRAM_PATH} --user 'alice' --ct-mark-mask 0x0c000000\n"
+            )),
+            "the refresh runs the step with the recorded mask: {script}"
+        );
+        assert!(
+            script.contains(&format!(
+                "ExecStart={CLASSIFIER_PROGRAM_PATH} --user 'alice' --ct-mark-mask 0x0c000000\n"
+            )),
+            "the boot unit carries the recorded mask: {script}"
+        );
+
+        let same = ClassifierFacts {
+            requested_mask: Some(0x0c00_0000),
+            ..installed
+        };
+        assert_eq!(
+            classifier_item_over(&same, "alice", sock).state,
+            ItemState::Done,
+            "a requested mask the table already uses is done"
+        );
+
+        let other = classifier_item_over(
+            &ClassifierFacts {
+                requested_mask: Some(0x0300_0000),
+                ..installed
+            },
+            "alice",
+            sock,
+        );
+        assert_eq!(other.state, ItemState::Missing);
+        assert_eq!(
+            other.today.as_deref(),
+            Some(
+                "egress enforcement uses the connection-mark bits 0x0c000000, and \
+                 --ct-mark-mask asks for 0x03000000"
+            )
+        );
+        let script = other.script.expect("a new mask carries the block");
+        assert!(
+            script.contains(&format!(
+                "ExecStart={CLASSIFIER_PROGRAM_PATH} --user 'alice' --ct-mark-mask 0x03000000\n"
+            )),
+            "the boot unit carries the requested mask: {script}"
+        );
+    }
+
     #[test]
     fn classifier_step_places_the_daemon_on_every_start() {
         use crate::resolver::{
@@ -2755,6 +3198,8 @@ mod tests {
         let item = classifier_item_over(
             &ClassifierFacts {
                 table_present: false,
+                recorded_mask: None,
+                requested_mask: None,
                 copy_current: false,
                 units_enabled: Some(false),
                 other_owner: None,
@@ -2889,10 +3334,10 @@ mod tests {
         assert!(!in_kvm_group("", "alice"));
     }
 
-    /// BEP-047: the VM users item creates `minimal-vmm` and
-    /// `minimal-gvproxy`, the provider dir at 0710 group `minimal-vmm`,
-    /// `vmm/`, the gvproxy, gvproxy config and gate dirs, and the sudoers
-    /// drop-in, and reads as done once all of them hold.
+    /// Formerly BEP-047 (gominimal/inbox#1184): the VM users item creates
+    /// `minimal-vmm` and `minimal-gvproxy`, the host dir at 0710 group
+    /// `minimal-vmm`, `vmm/`, the gvproxy, gvproxy config and gate dirs, and
+    /// the sudoers drop-in, and reads as done once all of them hold.
     #[test]
     fn finalize_install_creates_the_split_users_dirs_and_drop_in() {
         use linux::*;
@@ -2910,7 +3355,7 @@ mod tests {
             group: "root:x:0:\nalice:x:1000:\n".to_string(),
             vm: "local-minvmd0".to_string(),
             layout: layout.clone(),
-            provider: Some(DirFact {
+            host_dir: Some(DirFact {
                 uid: 1000,
                 gid: 1000,
                 mode: 0o700,
@@ -3035,7 +3480,7 @@ mod tests {
                 "{}minimal-vmm:x:990:alice\nminimal-gvproxy:x:991:alice\n",
                 fresh.group
             ),
-            provider: dir(1000, 990, 0o710),
+            host_dir: dir(1000, 990, 0o710),
             vmm: dir(990, 990, 0o750),
             gvproxy_dir: dir(991, 991, 0o750),
             gvproxy_config_dir: dir(1000, 991, 0o750),
@@ -3044,7 +3489,7 @@ mod tests {
             ..fresh.clone()
         };
         assert_eq!(vm_users_item_over(&finished).state, ItemState::Done);
-        // A gate dir without setgid, a provider dir at the wrong mode, or a
+        // A gate dir without setgid, a host dir at the wrong mode, or a
         // stale drop-in each make the step run again.
         for broken in [
             VmUsersFacts {
@@ -3052,7 +3497,7 @@ mod tests {
                 ..finished.clone()
             },
             VmUsersFacts {
-                provider: dir(1000, 1000, 0o700),
+                host_dir: dir(1000, 1000, 0o700),
                 ..finished.clone()
             },
             VmUsersFacts {
@@ -3091,16 +3536,16 @@ mod tests {
             cause.contains("`sudo gpasswd -d bob minimal-vmm`"),
             "{cause}"
         );
-        // No provider dir yet: the script has nothing to walk into, so the
+        // No host dir yet: the script has nothing to walk into, so the
         // item refuses, and the rest of the plan still runs.
-        let no_provider = VmUsersFacts {
-            provider: None,
+        let no_host_dir = VmUsersFacts {
+            host_dir: None,
             ..fresh.clone()
         };
-        let not_yet = vm_users_item_over(&no_provider);
+        let not_yet = vm_users_item_over(&no_host_dir);
         assert_eq!(not_yet.state, ItemState::Cannot);
         assert!(not_yet.script.is_none());
-        // The script prints the provider path in double quotes, so a path
+        // The script prints the host dir path in double quotes, so a path
         // the shell expands there is refused, and root runs nothing.
         for active in ["/home/$(id)/p", "/home/`id`/p", "/home/a\\b/p"] {
             let unsafe_path = VmUsersFacts {

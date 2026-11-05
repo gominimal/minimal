@@ -2,13 +2,53 @@ use super::*;
 
 // The other command families reach these helpers through `session::`.
 pub(crate) use super::box_verbs::{
-    advisory_host_reads, control_sock_beside, daemon_provider_kind, host_asks_box,
+    advisory_host_reads, control_sock_beside, daemon_host_kind, host_asks_box,
     vm_host_answerer_status_at,
 };
 
+/// Every host port the VM's hostname proxy serves on, the preferred first
+/// (NET-154), read from the VM host daemon's control socket at `sock_path`
+/// beside [`vm_host_answerer_status_at`]'s read and under the same bound.
+/// Empty — nothing to add to what the daemon's own listing reports — when
+/// there is no socket, the deadline passes, or the daemon predates the read
+/// and refuses it: `min ls` then prints the one port it always printed.
+pub(crate) async fn vm_host_proxy_ports_at(sock_path: Option<std::path::PathBuf>) -> Vec<u16> {
+    use minimal_client::box_registration::{BOX_CONTROL_TIMEOUT, control_request_with_vm_host};
+    let Some(sock_path) = sock_path else {
+        return Vec::new();
+    };
+    let read = tokio::time::timeout(
+        BOX_CONTROL_TIMEOUT,
+        control_request_with_vm_host(&sock_path, minimald_rpc::BoxControlRequest::ProxyPorts),
+    )
+    .await;
+    match read {
+        Ok(Ok(minimald_rpc::BoxControlReply::ProxyPorts { proxy_ports })) => proxy_ports,
+        Ok(Ok(_)) | Ok(Err(_)) | Err(_) => Vec::new(),
+    }
+}
+
 /// Create a new session via the `CreateSession` RPC.
 pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(), anyhow::Error> {
-    activate_box(global, args, true).await
+    activate_box(global, args, true)
+        .await
+        .map_err(activate_refusal)
+}
+
+/// The error `min session activate` ends with (NET-144). When the daemon
+/// refused the activation because a declared host port is already in use,
+/// the refusal's own text replaces the whole chain: it names the port, its
+/// holder and the next step, and the stage and RPC context around it add
+/// nothing a person can act on. The activate cleanup has already destroyed
+/// the box by then. Any other error passes through as it is.
+fn activate_refusal(error: anyhow::Error) -> anyhow::Error {
+    let refusal = error
+        .chain()
+        .find_map(|cause| minimald_rpc::PortInUseRefusal::find_in(&cause.to_string()));
+    match refusal {
+        Some(refusal) => anyhow::anyhow!("{refusal}"),
+        None => error,
+    }
 }
 
 /// Attach to an existing session. Both interactive and `--command` paths
@@ -66,7 +106,7 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
 
     let host_asks = host_asks_box(global, name.as_deref());
     box_via_ssh(
-        daemon_provider_kind(global),
+        daemon_host_kind(global),
         &sock,
         id,
         None,
@@ -95,15 +135,26 @@ pub async fn cmd_exec(global: &GlobalArgs, args: ExecArgs) -> Result<(), anyhow:
     // Gated by hand for the same reason as `cmd_attach`: this hands off into a
     // live session (the daemon mints the exec channel and runs the attach
     // hooks around it), which is not something to drive on a skewed pair. The
-    // gate rides on the lookup's reply — no `GetVersion` ahead of it.
-    let r = resolve_session_version_gated(&mut client, &args.session).await?;
+    // gate rides on the lookup's reply — no `GetVersion` ahead of it. The name
+    // alone decides where to look (NET-058), as it does for attach: a box on
+    // another VM is reached over that VM's socket, with no global flag.
+    let example = format!("session exec {} <command>", args.session);
+    let (r, sock) = resolve_named_box_version_gated(
+        global,
+        &mut client,
+        sock,
+        &args.session,
+        "Running in",
+        &example,
+    )
+    .await?;
     tracing::info!(
         session_id = %r.id,
         session_name = ?r.name,
         "found session"
     );
 
-    box_via_ssh(daemon_provider_kind(global), &sock, r.id, wire, None, None).await
+    box_via_ssh(daemon_host_kind(global), &sock, r.id, wire, None, None).await
 }
 
 /// Runs a task declared by the session's project, in that session.
@@ -125,8 +176,18 @@ pub async fn cmd_session_run(
         .await
         .context("Failed to connect to minimald")?;
     // Gated by hand for the same reason as `cmd_exec`: this hands off into a
-    // live session, which is not something to drive on a skewed pair.
-    let r = resolve_session_version_gated(&mut client, &args.session).await?;
+    // live session, which is not something to drive on a skewed pair. The name
+    // alone decides where to look (NET-058), as for exec.
+    let example = format!("session run {} {}", args.session, args.task);
+    let (r, sock) = resolve_named_box_version_gated(
+        global,
+        &mut client,
+        sock,
+        &args.session,
+        "Running the task in",
+        &example,
+    )
+    .await?;
     tracing::info!(
         session_id = %r.id,
         session_name = ?r.name,
@@ -135,7 +196,7 @@ pub async fn cmd_session_run(
     );
 
     box_via_ssh(
-        daemon_provider_kind(global),
+        daemon_host_kind(global),
         &sock,
         r.id,
         // No owns-box flag (NET-131): the task runs in a session someone
@@ -172,13 +233,16 @@ pub async fn cmd_session_policy(
 
     ensure_daemon(global)?;
 
-    let mut client = connect_daemon(global).await?;
+    let client = connect_daemon(global).await?;
 
     // The effective reply carries only the rules, but the ingress block is
     // suppressed for host-address sessions (see [`format_policy`]), so the
     // command also resolves the record the policy rides on for its network
-    // mode.
-    let record = resolve_session(&mut client, &args.session).await?;
+    // mode. The name alone decides which VM is asked (NET-058): a box on
+    // another VM is read from that VM's daemon, with no global flag.
+    let example = format!("session policy {}", args.session);
+    let (mut client, record) =
+        resolve_box_on_any_vm(global, client, &args.session, &example).await?;
     // The follow-up lookups go by the resolved id, so a session named by an
     // id prefix reaches the same session they do.
     let box_id = record.id.to_string();
@@ -236,7 +300,7 @@ pub async fn cmd_session_policy(
             // microVM backend's run path builds its registry and the
             // helper's enumeration from the default plan, so that is the
             // plan the display can name for it. Keyed on the backend this
-            // command actually talks to — `client_provider_kind`, the same
+            // command actually talks to — `client_host_kind`, the same
             // key `resolve_socket_path` turns on — not on `use_minvmd()`,
             // which is true only under an explicit `--provider
             // local-minvmd`: on macOS that kind is `Minvmd` without the
@@ -245,16 +309,21 @@ pub async fn cmd_session_policy(
             // carry — and it has no host-side gate the set would describe —
             // so that arm passes `None` and the block is left out rather
             // than printed from a plan the session does not attach to.
-            let fabric = (daemon_provider_kind(global) == paths::ProviderKind::Minvmd)
-                .then_some(switch::SwitchSubnet::default());
+            let host_kind = daemon_host_kind(global);
+            let fabric =
+                (host_kind == paths::HostKind::Minvmd).then_some(switch::SwitchSubnet::default());
+            // NET-160: the host exposures row turns on the host kind itself,
+            // not on `fabric`.
+            let native_host = host_kind == paths::HostKind::Minimald;
             let mut out = std::io::stdout();
-            format_policy(
+            format_policy_on_host(
                 &mut out,
                 &policy,
                 record.network,
                 host_ip_enforcement,
                 &shared_port_collisions,
                 fabric,
+                native_host,
             )?;
             write_live_ingress(&mut out, &live)?;
             if let Some(facts) = &facts {
@@ -466,7 +535,9 @@ pub async fn cmd_destroy(global: &GlobalArgs, args: DestroyArgs) -> Result<(), a
         .session
         .as_deref()
         .context("a session or --all is required")?;
-    let record = resolve_session(&mut client, box_name).await?;
+    // The name alone decides which VM destroys the box (NET-058).
+    let example = format!("session destroy {box_name}");
+    let (mut client, record) = resolve_box_on_any_vm(global, client, box_name, &example).await?;
 
     // Under --force the at-risk fetch is skipped outright — the gate is
     // bypassed regardless, so there is nothing to ask the daemon for.
@@ -540,7 +611,7 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
     let mut client = match connect_daemon_unchecked(global).await {
         Ok(client) => client,
         Err(connect_err) => {
-            if daemon_provider_kind(global) != paths::ProviderKind::Minvmd {
+            if daemon_host_kind(global) != paths::HostKind::Minvmd {
                 return Err(connect_err);
             }
             // The VM may have gone down between the probe and the connect:
@@ -572,7 +643,7 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
     // still draining past the generic RPC deadline must not be killed sooner
     // than minvmd itself would kill it. A native daemon keeps the generic
     // deadline (a zero extra budget).
-    let drain_budget = if daemon_provider_kind(global) == paths::ProviderKind::Minvmd {
+    let drain_budget = if daemon_host_kind(global) == paths::HostKind::Minvmd {
         minvmd::cmd::stop::GUEST_SHUTDOWN_TIMEOUT.saturating_sub(client::RPC_TIMEOUT)
     } else {
         std::time::Duration::ZERO
@@ -593,7 +664,7 @@ pub async fn cmd_stop(global: &GlobalArgs, args: StopArgs) -> Result<(), anyhow:
     // error takes, reached by the same evidence.
     let resp = match resp {
         Err(rpc_err)
-            if daemon_provider_kind(global) == paths::ProviderKind::Minvmd
+            if daemon_host_kind(global) == paths::HostKind::Minvmd
                 && !daemon_confirmed_stopped(global.use_minvmd(), global.minimal_dir.clone())
                     .await =>
         {
@@ -662,20 +733,16 @@ pub async fn cmd_rename(global: &GlobalArgs, args: RenameArgs) -> Result<(), any
             // of a row: the hold moves with the name, so the old name no box
             // owns answers NXDOMAIN again and the new one is the one the
             // destroy releases.
-            if record.network == boxes::NetworkMode::HostNet && record.box_addresses.is_none() {
-                let control_sock = vm_host_control_sock(
-                    daemon_provider_kind(global),
-                    global.minimal_dir.as_deref(),
-                );
-                release_held_box_name(
-                    control_sock.clone(),
+            if holds_name(&record) {
+                let control_sock =
+                    vm_host_control_sock(daemon_host_kind(global), global.minimal_dir.as_deref());
+                move_held_box_name(
+                    control_sock,
                     record.id,
                     record.name.as_deref(),
-                    None,
+                    &args.new_name,
                 )
                 .await;
-                hold_box_name_with_vm_host(control_sock, &args.new_name, Some(record.id), true)
-                    .await;
             }
             println!(
                 "Renamed session {} ({}) → {}",
@@ -688,5 +755,54 @@ pub async fn cmd_rename(global: &GlobalArgs, args: RenameArgs) -> Result<(), any
         minimald_rpc::Errorable::Err { error } => {
             bail!("{error}")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::activate_refusal;
+
+    /// NET-144: the daemon's refusal reaches the person as its own text,
+    /// with the port and the holder named, whatever context the
+    /// activation wrapped around it on the way up.
+    #[test]
+    fn activate_refusal_names_port_and_holder() {
+        for (holder, first_line) in [
+            (
+                minimald_rpc::PortHolder::Box("web".to_string()),
+                "Port 8080 is already in use on this machine by box web.",
+            ),
+            (
+                minimald_rpc::PortHolder::Host,
+                "Port 8080 is already in use on this machine by another program on this machine.",
+            ),
+        ] {
+            let refusal = minimald_rpc::PortInUseRefusal {
+                port: 8080,
+                box_port: 80,
+                holder,
+            };
+            let from_daemon = anyhow::anyhow!("could not finish activating the session: {refusal}")
+                .context("Finalize failed");
+            let printed = format!("{:#}", activate_refusal(from_daemon));
+            assert_eq!(
+                printed,
+                format!(
+                    "{first_line}\nChoose another host port in --ingress (for example \
+                     --ingress 8081:80) or in [network] ingress in minimal.toml."
+                )
+            );
+            assert_eq!(
+                minimald_rpc::PortInUseRefusal::find_in(&printed),
+                Some(refusal),
+                "the text reads back as the same refusal"
+            );
+        }
+        let other = activate_refusal(anyhow::anyhow!("something else failed"));
+        assert_eq!(
+            format!("{other:#}"),
+            "something else failed",
+            "any other error passes through"
+        );
     }
 }

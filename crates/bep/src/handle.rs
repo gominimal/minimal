@@ -34,6 +34,7 @@ use std::fmt;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use client_config::store_rules::{StoreAction, StoreRuleConfig};
 use p256::ecdsa::signature::{Signer as _, Verifier as _};
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -270,6 +271,40 @@ pub struct StoreRule {
     pub upstream: Vec<String>,
     /// The injection form the rule registers.
     pub inject: Inject,
+}
+
+impl StoreRule {
+    /// The proxy's form of the checked rule `rule` for the item `id`: none
+    /// for a `deny` rule, which is never redeemed, and none for a rule with
+    /// no single injection form. `bep serve` holds its rules in this form,
+    /// and `min` checks a rule against it at mint, so the two decide
+    /// `inject` with this one function (BEP-032).
+    #[must_use]
+    pub fn from_config(id: &str, rule: &StoreRuleConfig) -> Option<Self> {
+        if rule.action == Some(StoreAction::Deny) {
+            return None;
+        }
+        let inject = match (&rule.header, &rule.basic_auth) {
+            (Some(name), None) => Inject::Header {
+                name: name.clone(),
+                prefix: rule.prefix.clone(),
+            },
+            (None, Some(field)) => Inject::BasicAuth {
+                field: field.clone(),
+            },
+            // The check refuses a rule with no form or with both.
+            _ => return None,
+        };
+        Some(Self {
+            store: rule
+                .store
+                .clone()
+                .unwrap_or_else(|| crate::store::NATIVE_STORE.to_owned()),
+            id: id.to_owned(),
+            upstream: rule.upstream.clone(),
+            inject,
+        })
+    }
 }
 
 /// The source of the current `[secret-store-rules]`. [`read`] asks it once

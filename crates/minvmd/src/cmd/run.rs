@@ -69,7 +69,7 @@ pub fn run(
         match crate::image::resolve_boot_images() {
             Ok((kernel, rootfs, initramfs)) => tracing::info!(
                 vm = %crate::state::vm_name(),
-                state_dir = %crate::state::provider_dir().display(),
+                state_dir = %crate::state::host_dir().display(),
                 kernel = %kernel.display(),
                 rootfs = %rootfs.display(),
                 initramfs = %initramfs.display(),
@@ -78,7 +78,7 @@ pub fn run(
             ),
             Err(e) => tracing::warn!(
                 vm = %crate::state::vm_name(),
-                state_dir = %crate::state::provider_dir().display(),
+                state_dir = %crate::state::host_dir().display(),
                 switch = %switch_str,
                 error = %e,
                 "starting VM with unresolved boot images"
@@ -134,7 +134,7 @@ fn run_supervisor(detach: bool, timeout_secs: u64, root: tracing::span::EnteredS
     // Adopt any pre-split `providers/local-<N>` dir into the kind-tagged scheme
     // before resolving our own `local-minvmd0` dir, so an upgraded host reuses
     // its existing VM state (data volume, boot log) instead of orphaning it.
-    paths::migrate_legacy_provider_dirs(&crate::state::state_base_dir());
+    paths::migrate_legacy_host_dirs(&crate::state::state_base_dir());
 
     // R2.4: fail fast with an actionable error if the hypervisor backend is
     // unavailable (Linux: /dev/kvm). No-op on macOS. Runs in the foreground
@@ -360,20 +360,11 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
         let vmm_owned = state.vmm_pid.is_some_and(vmm_owned_by_live_supervisor);
         match classify_detach_poll(ready, child_status, daemon_alive, state.vmm_pid, vmm_owned) {
             DetachPoll::Ready => return Ok(()),
-            DetachPoll::Failed(status) => {
-                // A start that failed on the hostname proxy's port says so
-                // inline — port, holder and why (T93) — so the CLI's
-                // autospawn error carries it, not just a log path.
-                let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-                if let Some(line) = proxy_failure_line(&log) {
-                    bail!("{line} (supervisor log: {})", log_path.display());
-                }
-                bail!(
-                    "the detached supervisor exited during startup ({status}); \
-                     see {} for its error output",
-                    log_path.display()
-                )
-            }
+            DetachPoll::Failed(status) => bail!(
+                "the detached supervisor exited during startup ({status}); \
+                 see {} for its error output",
+                log_path.display()
+            ),
             DetachPoll::LeakedVmm(pid) => bail!(
                 "the supervisor exited but a leaked __krun-vmm (pid {pid}) still holds the \
                  alive lock; run `min stop` (or `kill -9 {pid}`), then retry"
@@ -407,6 +398,270 @@ fn supervisor_registry(
         .with_egress_deny_all_opt_out(egress_deny_all_opt_out)
         .with_proxy_control(crate::box_registry::home_proxy_control())
         .persisting_to(registry_file)
+}
+
+/// The bound on one forwarder exchange the node mirror's binder makes with
+/// the switch: the connect, the request and the answer. A switch that
+/// stalls past it fails the bind, and the guest sends the notice again.
+const MIRROR_SWITCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The largest switch answer the node mirror's binder reads. gvproxy's
+/// forwarder answers are one status line and a short body.
+const MIRROR_SWITCH_MAX_ANSWER: usize = 16 * 1024;
+
+/// The body gvproxy's forwarder answers an expose with when it already
+/// holds a forward at the listener: the goal state holds.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+const SWITCH_ALREADY_BOUND: &str = "proxy already running";
+
+/// The body gvproxy's forwarder answers an unexpose with when it holds no
+/// forward at the listener: the goal state holds.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+const SWITCH_NOT_BOUND: &str = "proxy not found";
+
+/// The production binder of the node's mirrored binds (NET-138): it asks the
+/// host switch (gvproxy's forwarder, on the switch socket) to listen at the
+/// node's reserved-range address on the host and forward to the same port at
+/// the guest node's own address, and to undo it.
+///
+/// Each bind goes through the egress gate's publish ledger at the node's
+/// switch address ([`crate::net::egress_gate::MirrorLedger`]), noted before
+/// the expose. So the gate tracks the connections the forward carries and
+/// admits the node's replies on them. An unbind closes the listener first,
+/// then drops the note and resets the connections the gate tracked at that
+/// port, and no other port's.
+#[derive(Debug)]
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+struct SwitchMirrorBinder {
+    /// gvproxy's `-listen` socket, which serves the forwarder verbs.
+    switch_sock: std::path::PathBuf,
+    /// The guest node's own switch address: where each forward dials.
+    node: std::net::Ipv4Addr,
+    /// The table the running egress gate leaves its ledger on.
+    table: crate::box_registry::BoxTable,
+}
+
+impl crate::box_registry::MirrorBinder for SwitchMirrorBinder {
+    fn bind(
+        &self,
+        address: std::net::Ipv4Addr,
+        port: u16,
+    ) -> Result<(), crate::box_registry::MirrorBindError> {
+        use crate::box_registry::MirrorBindError;
+        let ledger = self
+            .table
+            .mirror_ledger()
+            .ok_or_else(|| MirrorBindError::Failed("the egress gate is not running".to_string()))?;
+        let noted = ledger
+            .note_bind(address, port, self.node)
+            .map_err(|refused| MirrorBindError::Failed(refused.to_string()))?;
+        let body = format!(
+            r#"{{"local":"{address}:{port}","remote":"{}:{port}","protocol":"tcp"}}"#,
+            self.node
+        );
+        let result = match post_switch_forwarder(&self.switch_sock, "expose", &body) {
+            Ok((status, _)) if (200..300).contains(&status) => Ok(()),
+            Ok((500, answer)) if answer.trim() == SWITCH_ALREADY_BOUND => Ok(()),
+            Ok((_, answer)) if answer.contains("address already in use") => {
+                Err(MirrorBindError::Occupied)
+            }
+            Ok((status, answer)) => Err(MirrorBindError::Failed(format!(
+                "the switch answered the expose with HTTP {status}: {:?}",
+                answer.trim()
+            ))),
+            Err(error) => Err(MirrorBindError::Unanswered(format!(
+                "the expose went unanswered: {error}"
+            ))),
+        };
+        // A note this bind made goes when the switch bound nothing. An
+        // unanswered expose may have bound, so its note stays for the
+        // mirror's retry or undo.
+        if noted
+            && matches!(
+                result,
+                Err(MirrorBindError::Occupied | MirrorBindError::Failed(_))
+            )
+        {
+            ledger.forget_bind(address, port, self.node);
+        }
+        result
+    }
+
+    fn unbind(&self, address: std::net::Ipv4Addr, port: u16) -> crate::box_registry::MirrorUnbind {
+        use crate::box_registry::MirrorUnbind;
+        let body = format!(r#"{{"local":"{address}:{port}","protocol":"tcp"}}"#);
+        match post_switch_forwarder(&self.switch_sock, "unexpose", &body) {
+            Ok((status, _)) if (200..300).contains(&status) => {}
+            Ok((500, answer)) if answer.trim() == SWITCH_NOT_BOUND => {}
+            Ok((status, answer)) => {
+                return MirrorUnbind::Refused(format!(
+                    "the switch answered the unexpose with HTTP {status}: {:?}",
+                    answer.trim()
+                ));
+            }
+            Err(error) => {
+                return MirrorUnbind::Unanswered(format!("the unexpose went unanswered: {error}"));
+            }
+        }
+        // The listener is closed, so no new connection arrives after the
+        // ones taken here.
+        let connections_reset = self.table.mirror_ledger().map_or(0, |ledger| {
+            ledger.forget_bind(address, port, self.node);
+            ledger.reset_port(self.node, port)
+        });
+        MirrorUnbind::Undone { connections_reset }
+    }
+}
+
+/// One forwarder exchange with the switch at `switch_sock`: `verb` posted
+/// with the JSON `body`, answered by a status and a body, bounded by
+/// [`MIRROR_SWITCH_TIMEOUT`] per read and write. Blocking: the node mirror
+/// calls its binder from the report door's thread, outside every lock.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn post_switch_forwarder(
+    switch_sock: &std::path::Path,
+    verb: &str,
+    body: &str,
+) -> std::io::Result<(u16, String)> {
+    use std::io::{Read as _, Write as _};
+    let mut switch = std::os::unix::net::UnixStream::connect(switch_sock)?;
+    switch.set_read_timeout(Some(MIRROR_SWITCH_TIMEOUT))?;
+    switch.set_write_timeout(Some(MIRROR_SWITCH_TIMEOUT))?;
+    let request = format!(
+        "POST /services/forwarder/{verb} HTTP/1.1\r\nHost: localhost\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    switch.write_all(request.as_bytes())?;
+    let mut answer = Vec::with_capacity(256);
+    let mut chunk = [0u8; 1024];
+    loop {
+        if let Some(head_end) = answer
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|at| at + 4)
+        {
+            let head = String::from_utf8_lossy(answer.get(..head_end).unwrap_or_default());
+            let length = head.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            });
+            if length.is_some_and(|length| answer.len() >= head_end + length) {
+                break;
+            }
+        }
+        if answer.len() >= MIRROR_SWITCH_MAX_ANSWER {
+            break;
+        }
+        let n = switch.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        answer.extend_from_slice(chunk.get(..n).unwrap_or_default());
+    }
+    let text = String::from_utf8_lossy(&answer);
+    let status = text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| std::io::Error::other("the switch's answer had no status line"))?;
+    let body = text
+        .split_once("\r\n\r\n")
+        .map_or_else(String::new, |(_, body)| body.to_string());
+    Ok((status, body))
+}
+
+/// The name the node's mirror address is allocated under in the machine's
+/// answerer: one address per node. A box name holds no space, so no box
+/// can take it.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+const NODE_MIRROR_NAME: &str = "host_ip boxes";
+
+/// How often the host probes the whole reserved local range for the node's
+/// mirror. A host that gains the range aliases after the VM booted opens
+/// the mirror within one interval.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+const NODE_MIRROR_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One pass of the node mirror's upkeep: runs the host-side whole-range
+/// probe, feeds its verdict to the mirror, and while the range passes and
+/// the mirror has no address, opens it at the address `allocate` hands the
+/// node. Returns the reason the mirror did not open, for the caller to log
+/// once per change, or `None` when the mirror is open or the range fails.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn node_mirror_pass(
+    boxes: &crate::box_registry::BoxRegistry,
+    probe: &switch::loopback::RangeProbe,
+    allocate: impl FnOnce() -> Result<std::net::Ipv4Addr, String>,
+) -> Option<String> {
+    let mirror = boxes.node_mirror();
+    boxes.set_node_range_probe(probe.present());
+    if !probe.present() || mirror.address().is_some() {
+        return None;
+    }
+    let address = match allocate() {
+        Ok(address) => address,
+        Err(error) => return Some(error),
+    };
+    match boxes.open_node_mirror(address) {
+        Ok(()) => {
+            tracing::info!(
+                node = %boxes.subnet().daemon_ip(),
+                %address,
+                "opened the node's mirrored binds at its reserved-range address"
+            );
+            None
+        }
+        Err(error) => Some(error.to_string()),
+    }
+}
+
+/// Spawns the node mirror's upkeep thread for the process's life: every
+/// [`NODE_MIRROR_PROBE_INTERVAL`] it runs [`node_mirror_pass`] with the
+/// machine's answerer allocating the node's address. One line per change of
+/// the probe's verdict, and one per new reason the mirror stays closed.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn spawn_node_mirror(
+    boxes: crate::box_registry::BoxRegistry,
+    answerer: crate::net::answerer::AnswererStatus,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("node-mirror".to_string())
+        .spawn(move || {
+            let node = boxes.subnet().daemon_ip();
+            let mut last_present = None;
+            let mut last_refusal: Option<String> = None;
+            loop {
+                let probe = switch::loopback::probe();
+                if last_present != Some(probe.present()) {
+                    tracing::info!(
+                        %node,
+                        probe = %probe.summary(),
+                        range_probe_passes = probe.present(),
+                        "the host's reserved local range probe changed; mirrored binds are \
+                         made only while it passes"
+                    );
+                    last_present = Some(probe.present());
+                }
+                let refusal =
+                    node_mirror_pass(&boxes, &probe, || answerer.allocate(NODE_MIRROR_NAME));
+                if let Some(reason) = &refusal
+                    && last_refusal.as_ref() != Some(reason)
+                {
+                    tracing::warn!(
+                        %node,
+                        %reason,
+                        "could not open the node's mirrored binds at a reserved-range address"
+                    );
+                }
+                last_refusal = refusal;
+                std::thread::sleep(NODE_MIRROR_PROBE_INTERVAL);
+            }
+        })
 }
 
 /// Foreground supervisor: boot the VM, manage lifecycle state, supervise until
@@ -756,6 +1011,7 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     // startup, unlike the control socket: a thread that could not spawn is
     // warned and the VM still boots, its names then answering from whatever
     // answerer holds the port.
+    let mirror_answerer = answerer_status.clone();
     if let Err(error) =
         crate::net::answerer::spawn(boxes.clone(), DEFAULT_ANSWERER_PORT, answerer_status)
     {
@@ -763,6 +1019,21 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
             %error,
             "failed to start the zone answerer; this VM's box names answer only from \
              another VM host daemon's table, if one is running"
+        );
+    }
+
+    // The node's mirrored binds (NET-138): a host-address box shares the
+    // guest node's namespace, so its listeners open on the host at the
+    // node's own reserved-range address, allocated by the machine's
+    // answerer like a box's. The upkeep thread feeds the host-side
+    // whole-range probe to the mirror, and opens it once the range passes.
+    // Best-effort: a thread that could not spawn is warned, and the VM boots
+    // with no port of a host-address box opened on the host.
+    if let Err(error) = spawn_node_mirror(boxes.clone(), mirror_answerer) {
+        tracing::warn!(
+            %error,
+            "failed to start the node's mirrored binds; no port a host_ip box listens \
+             on opens on this host"
         );
     }
 
@@ -802,6 +1073,9 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     // before the switch so the switch drops first: no delivery is in
     // flight when the proxy is stopped.
     let mut _bep_proxy: Option<BepProxy> = None;
+    // The reclaim watcher's copy (NET-150): it asks this switch to publish
+    // the preferred proxy port once that port is free.
+    let reclaim_switch_sock = switch_sock.clone();
     let _gvproxy = match (gvproxy_binary, switch_sock) {
         (binary, Some(switch_sock)) => {
             crate::sock::prepare_socket_dir(&switch_sock).context("preparing switch socket dir")?;
@@ -892,7 +1166,7 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
             // nothing. Best-effort, like a missing gvproxy: a boot without
             // the proxy still runs boxes, without a credentialed lane.
             if !stub_enabled && cfg!(target_os = "macos") {
-                _bep_proxy = start_bep_proxy(&proxy_sock, &token);
+                _bep_proxy = start_bep_proxy(&proxy_sock, &token, &boxes);
             }
             // The wire the peer carries: the acceptor's socket, this boot's
             // token, and the per-source cap that is each registered box's
@@ -915,6 +1189,7 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
             if let Some(listening) = &proxy_listening {
                 bep_listening.attach(std::sync::Arc::clone(listening));
             }
+            let mirror_switch_sock = switch_sock.clone();
             match crate::net::HostGvproxy::spawn(
                 binary,
                 switch_sock,
@@ -925,6 +1200,16 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
             ) {
                 Ok(gvproxy) => {
                     let subnet = boxes.subnet();
+                    // The node's mirrored binds go through this switch
+                    // (NET-138). Every registry clone shares one mirror, so
+                    // the clone the binder is set on is dropped at once.
+                    drop(boxes.clone().with_mirror_binder(std::sync::Arc::new(
+                        SwitchMirrorBinder {
+                            switch_sock: mirror_switch_sock,
+                            node: subnet.daemon_ip(),
+                            table: boxes.table(),
+                        },
+                    )));
                     tracing::info!(
                         pid = gvproxy.pid(),
                         proxy_ip = %subnet.box_egress_proxy_address(),
@@ -1013,6 +1298,9 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     // The port whose publish the start left unconfirmed (T93), when it did:
     // the guest's late report, if it ever comes, confirms it after the loop.
     let mut unconfirmed_port = None;
+    // Whether the start brought the VM up with its proxy down on a held
+    // port (NET-021): the held-port watcher then owns the publish.
+    let mut proxy_down_at_start = false;
     loop {
         // This boot's publish generation (T93): drawn fresh for every boot,
         // handed beside the port, and echoed by the guest in every publish
@@ -1214,44 +1502,83 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
                 }
                 continue;
             }
-            crate::control::PublishDecision::FailStart {
-                port,
-                holder,
-                cause,
-            } => {
-                // The start fails here, naming the port and the holder — one
-                // error line (T93) — and the cause is written to the status
-                // cell first, so a client reading the control socket in the
-                // teardown window reads *why*, not merely that the proxy is
-                // down. The reservation drops with the assignment below, so
-                // the kernel releases the port this start held.
-                proxy_publish.set_down(port, cause.clone());
-                let _ = child.kill();
-                let _ = child.wait();
-                crate::cmd::discard_fresh_volume_image(&volume_path, volume_preexisted);
-                // The holder by pid and exe when the host can see it, the
-                // decision's generic holder otherwise.
-                let holder = port_holder(port)
-                    .map(|(_, holder)| holder)
-                    .unwrap_or_else(|| holder.to_string());
-                let why = match cause {
-                    ProxyDownCause::PortHeld => configured_never_redraws(),
-                    ProxyDownCause::RedrawsRanOut => {
-                        format!("{publish_tries} publish tries exhausted, every drawn port taken")
-                    }
-                    // Never a failure's cause: an unconfirmed publish is
-                    // `UpUnconfirmed`, and a late refusal lands after the
-                    // start, never as `FailStart`.
-                    ProxyDownCause::PublishUnconfirmed => "the publish is unconfirmed".to_string(),
-                    ProxyDownCause::PortHeldAfterStart { .. } => {
-                        "the port was held after the start".to_string()
-                    }
+            crate::control::PublishDecision::FailStart { port, cause, .. } => {
+                // NET-021: a held port no longer fails the start. That is
+                // a pin another program holds, or a draw whose tries ran
+                // out. The VM starts with its proxy down, the cause names
+                // the holder the host can see, and the held-port watcher
+                // below publishes the port once it frees. The VM host
+                // daemon stays up, so `min ls` reads the cause from it for
+                // as long as the port stays held.
+                let holder = port_holder(port).map(|(_, holder)| holder);
+                let reason = match cause {
+                    ProxyDownCause::RedrawsRanOut => "every drawn port was taken",
+                    _ => "the port is held",
                 };
-                tracing::error!(port, %holder, %why, "the VM start failed on the proxy publish");
-                bail!("{}", proxy_port_failure(port, &holder, &why));
+                tracing::warn!(
+                    port,
+                    holder = holder.as_deref().unwrap_or("unnamed"),
+                    reason,
+                    publish_tries,
+                    "the VM starts with the hostname proxy down; retrying its port while the VM runs"
+                );
+                proxy_publish.set_down(port, ProxyDownCause::PortHeldAfterStart { holder });
+                // The watcher's check takes the reservation again when the
+                // port frees. A second take in this process contends with
+                // the held one, so this one goes first.
+                node_port.reservation = None;
+                proxy_down_at_start = true;
+                break;
             }
         }
     }
+
+    // NET-150: the proxy serves on the handed port. When that port is a
+    // substitute — the preferred one was held at the start — a watcher
+    // takes the preferred port back once it is free, and the switch then
+    // publishes both. A pinned port never moved, and a boot with no host
+    // switch publishes nothing, so neither gets a watcher.
+    let _proxy_reclaim = match (&_gvproxy, &reclaim_switch_sock) {
+        // NET-021, NET-022: no port serves. The watcher retries the held
+        // port with backoff, publishes it when it frees, and clears the
+        // proxy-down cause, so `min ls` stops naming it.
+        (Some(_), Some(switch_sock)) if proxy_down_at_start => {
+            let recorded = proxy_publish.clone();
+            Some(crate::net::proxy_reclaim::spawn_held_port_watcher(
+                node_port.port,
+                crate::net::proxy_reclaim::HeldPortBackoff::default(),
+                proxy_reclaim_check(ports_dir.clone()),
+                proxy_reclaim_publisher(
+                    switch_sock.clone(),
+                    boxes.subnet().daemon_ip(),
+                    boxes.table(),
+                ),
+                move |port| crate::net::proxy_reclaim::mark_serving(&recorded, port),
+            ))
+        }
+        (Some(_), Some(switch_sock)) => {
+            proxy_publish.set_serving(node_port.port);
+            (node_port.port != node_port.preferred && !node_port.configured).then(|| {
+                let recorded = proxy_publish.clone();
+                crate::net::proxy_reclaim::spawn_reclaim_watcher(
+                    node_port.preferred,
+                    node_port.port,
+                    crate::net::proxy_reclaim::RECLAIM_PROBE_INTERVAL,
+                    crate::net::proxy_reclaim::take_while_serving(
+                        proxy_publish.clone(),
+                        proxy_reclaim_check(ports_dir.clone()),
+                    ),
+                    proxy_reclaim_publisher(
+                        switch_sock.clone(),
+                        boxes.subnet().daemon_ip(),
+                        boxes.table(),
+                    ),
+                    move |preferred| recorded.add_preferred(preferred),
+                )
+            })
+        }
+        _ => None,
+    };
 
     // T93: an unconfirmed publish stays unconfirmed until the guest's report
     // says otherwise. The marker channel is the supervisor's to drain from
@@ -1260,8 +1587,29 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     // held after all.
     // Only a report the running boot sent counts: its own generation, or —
     // from a guest too old to echo one — none.
+    // NET-021: a late refusal starts the held-port watcher, as a start that
+    // found the port held does. These slots hold the port's reservation and
+    // that watcher for the VM's life, because the supervisor returns only
+    // when the VM stops. The report thread releases the reservation first, so
+    // the watcher's own check can take it again when the port frees.
+    let late_reservation = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let late_watcher = std::sync::Arc::new(std::sync::Mutex::new(None));
     if let Some((port, generation)) = unconfirmed_port {
         let proxy_publish = proxy_publish.clone();
+        *late_reservation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = node_port.reservation.take();
+        let late_reservation = std::sync::Arc::clone(&late_reservation);
+        let late_watcher = std::sync::Arc::clone(&late_watcher);
+        let held_switch = reclaim_switch_sock
+            .clone()
+            .filter(|_| _gvproxy.is_some())
+            .map(|switch_sock| {
+                (
+                    proxy_reclaim_check(ports_dir.clone()),
+                    proxy_reclaim_publisher(switch_sock, boxes.subnet().daemon_ip(), boxes.table()),
+                )
+            });
         // The watcher's lines carry `vm` through a span of its own: it may
         // outlive READY, and keeping the start phase's span would keep that
         // phase from exporting (`telemetry::vm_task`).
@@ -1297,6 +1645,28 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
                             "the guest's late report says the hostname proxy's port is held"
                         );
                         proxy_publish.set_down(port, ProxyDownCause::PortHeldAfterStart { holder });
+                        let Some((check, publisher)) = held_switch else {
+                            return;
+                        };
+                        drop(
+                            late_reservation
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .take(),
+                        );
+                        let recorded = proxy_publish.clone();
+                        *late_watcher
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(crate::net::proxy_reclaim::spawn_held_port_watcher(
+                                port,
+                                crate::net::proxy_reclaim::HeldPortBackoff::default(),
+                                check,
+                                publisher,
+                                move |port| {
+                                    crate::net::proxy_reclaim::mark_serving(&recorded, port)
+                                },
+                            ));
                         return;
                     }
                     _ => {}
@@ -1346,7 +1716,7 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
     tracing::info!(pid = child_pid, "VM is up; supervisor is running");
 
     // Tighten + verify the bridge socket permissions (R3.2): libkrun creates
-    // it with default perms, and the shared provider dir is not 0700.
+    // it with default perms, and the shared host dir is not 0700.
     match crate::sock::resolve_uds_path() {
         Ok(uds_path) => {
             if let Err(e) = crate::sock::enforce_socket_permissions(&uds_path)
@@ -1429,7 +1799,7 @@ fn run_foreground(root: tracing::span::EnteredSpan) -> Result<()> {
 const BEP_BIN_ENV: &str = bep::store::PROXY_BIN_ENV;
 
 /// The file beside the proxy's socket that holds its stdout and stderr.
-/// `min bug` collects it from the provider dir by the same name.
+/// `min bug` collects it from the host dir by the same name.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 const BEP_LOG_FILE: &str = "bep.log";
 
@@ -1498,8 +1868,8 @@ fn bep_binary_at(
 ///
 /// Interim: `bep` starts as minvmd's own user, which is also the user of
 /// gvproxy and the VM. Gatehouse §6.10 requires distinct OS users for them
-/// (BEP-047). T38, #2285 (https://github.com/gominimal/minimal/issues/2285),
-/// owns that split.
+/// (formerly BEP-047, gominimal/inbox#1184). T38, #2285
+/// (https://github.com/gominimal/minimal/issues/2285), owns that split.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 #[derive(Debug)]
 struct BepProxy {
@@ -1518,12 +1888,14 @@ impl BepProxy {
     /// with `token` as 64 hex digits on its standard input and its output
     /// appended to `log`. The standard input stays open after the token for
     /// as long as the child is owned here: it is the supervisor's lifeline
-    /// ([`BEP_LIFELINE_FLAG`]).
+    /// ([`BEP_LIFELINE_FLAG`]). The watcher runs `on_listening` each time
+    /// the proxy starts to listen.
     fn spawn(
         binary: &std::path::Path,
         listener: &std::path::Path,
         token: &[u8; switch::bep_host::TOKEN_LEN],
         log: &std::path::Path,
+        on_listening: Option<OnListening>,
     ) -> std::io::Result<Self> {
         use std::io::Write as _;
         use std::process::{Command, Stdio};
@@ -1583,6 +1955,7 @@ impl BepProxy {
                 listener: listener.to_path_buf(),
                 stale,
                 log: log.to_path_buf(),
+                on_listening,
             };
             hand_to_watcher(child, watch, |body| {
                 std::thread::Builder::new()
@@ -1665,6 +2038,30 @@ struct BepWatch {
     /// The socket at `listener` before the start, which is not the proxy's.
     stale: Option<SocketIdentity>,
     log: std::path::PathBuf,
+    /// Runs each time the proxy starts to listen.
+    on_listening: Option<OnListening>,
+}
+
+/// What the watcher runs when the proxy starts to listen.
+type OnListening = Box<dyn Fn() + Send + 'static>;
+
+/// The hook that names the boxes of `boxes` to the proxy each time it starts
+/// to listen (BEP-063, #2617), on a thread of its own so the watcher does
+/// not wait for it.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn send_live_boxes_on_listening(boxes: crate::box_registry::BoxRegistry) -> OnListening {
+    Box::new(move || {
+        let boxes = boxes.clone();
+        let spawned = std::thread::Builder::new()
+            .name("bep-live-boxes".into())
+            .spawn(move || boxes.send_live_boxes());
+        if let Err(error) = spawned {
+            tracing::warn!(
+                %error,
+                "the Box Egress Proxy did not get the live box list: its thread did not start"
+            );
+        }
+    })
 }
 
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
@@ -1751,6 +2148,9 @@ fn watch_bep(mut child: std::process::Child, watch: &BepWatch) {
                     .is_some_and(|identity| Some(identity) != watch.stale);
                 if bound != watch.listening.swap(bound, Ordering::SeqCst) {
                     tracing::debug!(pid, listening = bound, "box egress proxy listener");
+                    if bound && let Some(on_listening) = &watch.on_listening {
+                        on_listening();
+                    }
                 }
             }
             Err(error) => {
@@ -1775,11 +2175,13 @@ fn watch_bep(mut child: std::process::Child, watch: &BepWatch) {
 
 /// Starts this boot's proxy on `listener`, its log beside it. Logs one
 /// info line naming the socket and the pid, or one warn line naming why
-/// the boot goes on without the proxy.
+/// the boot goes on without the proxy. Once the proxy listens, it gets the
+/// box ids `boxes` holds ([`send_live_boxes_on_listening`]).
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn start_bep_proxy(
     listener: &std::path::Path,
     token: &[u8; switch::bep_host::TOKEN_LEN],
+    boxes: &crate::box_registry::BoxRegistry,
 ) -> Option<BepProxy> {
     let Some(binary) = resolve_bep_binary() else {
         tracing::warn!(
@@ -1789,7 +2191,8 @@ fn start_bep_proxy(
         return None;
     };
     let log = listener.with_file_name(BEP_LOG_FILE);
-    match BepProxy::spawn(&binary, listener, token, &log) {
+    let on_listening = send_live_boxes_on_listening(boxes.clone());
+    match BepProxy::spawn(&binary, listener, token, &log, Some(on_listening)) {
         Ok(proxy) => {
             tracing::info!(
                 pid = proxy.pid(),
@@ -2091,7 +2494,7 @@ fn verify_ports_dir(ports: &std::path::Path) -> Result<()> {
 /// not arbitrate two opens made by the same process at all.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 #[derive(Debug)]
-struct NodePortReservation {
+pub(crate) struct NodePortReservation {
     _lock: std::fs::File,
 }
 
@@ -2155,9 +2558,26 @@ fn check_candidate(
     udp: bool,
     probe: &dyn Fn(u16) -> std::io::Result<u16>,
 ) -> CandidateCheck {
+    let verdict = candidate_verdict(dir, port, udp, probe);
+    match &verdict {
+        CandidateCheck::Free(_) => log_reserved_candidate(port),
+        CandidateCheck::Skip(reason) => log_skipped_candidate(port, reason),
+        CandidateCheck::Error(_) => {}
+    }
+    verdict
+}
+
+/// [`check_candidate`]'s checks, in the same order, with no log line: the
+/// reclaim watcher runs them on every probe ([`proxy_reclaim_check`]).
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn candidate_verdict(
+    dir: &std::path::Path,
+    port: u16,
+    udp: bool,
+    probe: &dyn Fn(u16) -> std::io::Result<u16>,
+) -> CandidateCheck {
     use std::io::ErrorKind::AddrInUse;
     if NODE_RESERVED_PORTS.contains(&port) {
-        log_skipped_candidate(port, SKIP_NODE_RESERVED);
         return CandidateCheck::Skip(SKIP_NODE_RESERVED);
     }
     let refused = match probe(port) {
@@ -2172,18 +2592,11 @@ fn check_candidate(
         Ok(_) => None,
     };
     if let Some(reason) = refused {
-        log_skipped_candidate(port, reason);
         return CandidateCheck::Skip(reason);
     }
     match NodePortReservation::take(dir, port) {
-        Ok(Some(reservation)) => {
-            log_reserved_candidate(port);
-            CandidateCheck::Free(reservation)
-        }
-        Ok(None) => {
-            log_skipped_candidate(port, SKIP_RESERVED_BY_ANOTHER_VM);
-            CandidateCheck::Skip(SKIP_RESERVED_BY_ANOTHER_VM)
-        }
+        Ok(Some(reservation)) => CandidateCheck::Free(reservation),
+        Ok(None) => CandidateCheck::Skip(SKIP_RESERVED_BY_ANOTHER_VM),
         Err(error) => CandidateCheck::Error(error),
     }
 }
@@ -2229,12 +2642,17 @@ struct NodePortAssignment {
     skipped: Option<&'static str>,
     /// Whether the port came from the operator's pin rather than the draw
     /// (T93): a configured port never redraws, so a publish that finds the
-    /// port taken fails the start instead of moving the surface.
+    /// port taken starts the VM with its proxy down, and the held-port
+    /// watcher publishes the port once it frees (NET-021).
     configured: bool,
     /// The host-wide reservation this supervisor holds on `port` for the
-    /// VM's life ([`NodePortReservation`]). Never read: holding it is the
-    /// whole job, and dropping the assignment is what releases it.
-    _reservation: NodePortReservation,
+    /// VM's life ([`NodePortReservation`]). Holding it is the whole job, and
+    /// dropping the assignment is what releases it. `None` for a pin that
+    /// another program or VM held at the start: the held-port watcher takes
+    /// the reservation when the port frees. A start that brings the VM up
+    /// with its proxy down drops it too, so that the watcher's own check
+    /// can take it ([`proxy_reclaim_check`]).
+    reservation: Option<NodePortReservation>,
 }
 
 /// Assigns the node's hostname-proxy TCP port. The operator's override
@@ -2257,16 +2675,18 @@ fn assign_node_proxy_port(dir: &std::path::Path) -> Result<NodePortAssignment> {
         Some(proxy) => configured_node_port(dir, proxy)?,
         None => assign_node_port(dir, NODE_DEFAULT_PROXY_PORT, false)?,
     };
-    log_node_port_assignment("hostname proxy", &proxy);
+    log_node_port_assignment(&proxy);
     Ok(proxy)
 }
 
-/// The operator's pin (T93): probed and reserved like a drawn port, but a pin
-/// any check refuses fails the start naming the port and the holder — the
-/// reason the check carries — because the configured port never redraws: a
-/// start that moved the surface would publish a port the operator did not
-/// pin, and one that kept going would boot a VM whose proxy serves on a
-/// port someone else already holds.
+/// The operator's pin (T93): probed and reserved like a drawn port. The
+/// configured port never redraws, because a start that moved the surface
+/// would publish a port the operator did not pin. A pin that another
+/// program or another VM holds does not fail the start (NET-021): the
+/// guest is handed the pin, its publish is refused, and the VM starts with
+/// its proxy down until the held-port watcher publishes the pin. A pin on
+/// a port the node keeps for its own daemons can never serve, so it fails
+/// the start.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn configured_node_port(dir: &std::path::Path, port: u16) -> Result<NodePortAssignment> {
     let probe = node_port_probe(false);
@@ -2276,63 +2696,34 @@ fn configured_node_port(dir: &std::path::Path, port: u16) -> Result<NodePortAssi
             preferred: port,
             skipped: None,
             configured: true,
-            _reservation: reservation,
+            reservation: Some(reservation),
         }),
+        CandidateCheck::Skip(SKIP_NODE_RESERVED) => Err(anyhow::anyhow!(
+            "{} is set to {port}, a port Minimal keeps for its DNS service. Set {} to \
+             another port, or unset it",
+            crate::vm::NODE_PROXY_PORT_ENV,
+            crate::vm::NODE_PROXY_PORT_ENV
+        )),
         CandidateCheck::Skip(reason) => {
-            // Who holds it, as well as the host can say: a process by pid
-            // and exe when the bind or connect probe refused it, the node's
-            // own reservation, or another of this user's VMs.
-            let holder = match reason {
-                SKIP_NODE_RESERVED => "the node's own zone answerer (a reserved port)".to_string(),
-                SKIP_RESERVED_BY_ANOTHER_VM => "another VM's reservation".to_string(),
-                _ => port_holder(port)
-                    .map(|(_, holder)| holder)
-                    .unwrap_or_else(|| crate::control::HELD_BY_ANOTHER_PROCESS.to_string()),
-            };
-            let why = format!("{reason}; {}", configured_never_redraws());
-            Err(anyhow::anyhow!(
-                "{}",
-                proxy_port_failure(port, &holder, &why)
-            ))
+            // Held now: the start goes on without the reservation, and the
+            // publish decision below records the proxy down.
+            tracing::info!(
+                port,
+                skip_reason = reason,
+                "the configured hostname proxy port is held; the VM starts on it anyway"
+            );
+            Ok(NodePortAssignment {
+                port,
+                preferred: port,
+                skipped: None,
+                configured: true,
+                reservation: None,
+            })
         }
         CandidateCheck::Error(error) => {
             Err(error.context("assigning the configured hostname-proxy port"))
         }
     }
-}
-
-/// How every proxy-port start failure begins (T93): the one line the
-/// detaching parent lifts out of the supervisor's log ([`proxy_failure_line`])
-/// so the CLI's autospawn error names the port, the holder and why inline,
-/// rather than pointing at a log file.
-#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-const PROXY_PORT_FAILURE_PREFIX: &str = "hostname proxy port ";
-
-/// The one-line proxy-port start failure: the port, who holds it, and why the
-/// start ends instead of moving on.
-#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn proxy_port_failure(port: u16, holder: &str, why: &str) -> String {
-    format!("{PROXY_PORT_FAILURE_PREFIX}{port} held by {holder}; {why}")
-}
-
-/// Why a configured port's failure ends the start: the pin never redraws.
-#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn configured_never_redraws() -> String {
-    format!(
-        "configured ports never redraw (free the port or unset {})",
-        crate::vm::NODE_PROXY_PORT_ENV
-    )
-}
-
-/// The proxy-port failure line in a supervisor's captured stderr, when the
-/// start failed on it ([`PROXY_PORT_FAILURE_PREFIX`]), from the prefix on —
-/// anyhow's `Error:` and `Caused by:` framing dropped.
-#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn proxy_failure_line(log: &str) -> Option<&str> {
-    log.lines().find_map(|line| {
-        line.find(PROXY_PORT_FAILURE_PREFIX)
-            .map(|at| line[at..].trim_end())
-    })
 }
 
 /// Who listens on `port` on this host — its pid, and the holder as
@@ -2468,35 +2859,93 @@ fn port_holder(_port: u16) -> Option<(u32, String)> {
     None
 }
 
-/// One line per node-port assignment: the port the assignment preferred, the
-/// port handed to the guest, and — when the preferred port was skipped — the
-/// probe that refused it. The skip reason is the half a shared host needs:
-/// two VMs and a native daemon can all want the default proxy port, so a boot
-/// that landed elsewhere says so here, in the supervisor's own log, rather
-/// than leaving a hostname surface that never answered to be found there.
-/// A preferred port refused because something holds it names that holder's
-/// pid and executable, so the log says which leftover owns the bind the
-/// boot moved off.
+/// The assignment's one line, written by the hostname proxy's own log
+/// ([`crate::net::proxy_reclaim::log_proxy_port_assignment`]): info when the
+/// start took the preferred port, warn when it skipped it (NET-151). A
+/// preferred port refused because something holds it names that holder's
+/// pid and executable, so the log says which process owns the port the boot
+/// moved off.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn log_node_port_assignment(surface: &str, assigned: &NodePortAssignment) {
+fn log_node_port_assignment(assigned: &NodePortAssignment) {
     // The holder is looked up only for the bind-refused skip: any other skip
     // (loopback answering, reserved by another VM) is not a holder question,
     // and a configured port never reaches here — its refusal fails the
     // start naming the holder already.
-    let holder = (assigned.skipped == Some(SKIP_BIND_REFUSED))
+    let port_holder = (assigned.skipped == Some(SKIP_BIND_REFUSED))
         .then(|| port_holder(assigned.preferred))
         .flatten()
-        .map(|(_, holder)| holder)
-        .unwrap_or_default();
-    tracing::info!(
-        surface,
-        preferred = assigned.preferred,
-        handed = assigned.port,
-        configured = assigned.configured,
-        skip_reason = assigned.skipped.unwrap_or(""),
-        port_holder = %holder,
-        "assigned the node port"
+        .map(|(_, holder)| holder);
+    crate::net::proxy_reclaim::log_proxy_port_assignment(
+        &crate::net::proxy_reclaim::AssignmentLine {
+            preferred: assigned.preferred,
+            port: assigned.port,
+            configured: assigned.configured,
+            skip_reason: assigned.skipped,
+            port_holder,
+        },
     );
+}
+
+/// The reclaim watcher's check (NET-150): the same checks the assignment
+/// holds the preferred port to ([`candidate_verdict`]), and the port's
+/// reservation taken when they pass. It logs nothing, because the watcher
+/// runs it on every probe while the port stays held.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+pub(crate) fn proxy_reclaim_check(
+    dir: std::path::PathBuf,
+) -> impl FnMut(u16) -> Option<NodePortReservation> + Send + 'static {
+    move |port| {
+        let probe = node_port_probe(false);
+        match candidate_verdict(&dir, port, false, &probe) {
+            CandidateCheck::Free(reservation) => Some(reservation),
+            CandidateCheck::Skip(_) | CandidateCheck::Error(_) => None,
+        }
+    }
+}
+
+/// The reclaim watcher's publish (NET-150): asks the switch at `switch_sock`
+/// to listen on `127.0.0.1:<preferred>` and forward to the guest proxy at
+/// `node`'s `<substitute>` port.
+///
+/// The forward is noted in the egress gate's publish ledger first, as the
+/// node mirror's binds are ([`SwitchMirrorBinder`]), so the gate tracks the
+/// connections it carries and admits the replies on them. A gate that is
+/// not running, or a ledger that refuses the note, publishes nothing. The
+/// switch's `proxy already running` answer counts as success only when the
+/// ledger already held this same forward. Otherwise some other forward
+/// holds the listener, and the attempt fails. A note this attempt made goes
+/// when the expose fails.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+pub(crate) fn proxy_reclaim_publisher(
+    switch_sock: std::path::PathBuf,
+    node: std::net::Ipv4Addr,
+    table: crate::box_registry::BoxTable,
+) -> impl FnMut(u16, u16) -> Result<(), String> + Send + 'static {
+    move |preferred, substitute| {
+        let listener = std::net::Ipv4Addr::LOCALHOST;
+        let ledger = table
+            .mirror_ledger()
+            .ok_or_else(|| "the egress gate is not running".to_string())?;
+        let noted = ledger
+            .note_forward(listener, preferred, node, substitute)
+            .map_err(|refused| refused.to_string())?;
+        let body = format!(
+            r#"{{"local":"{listener}:{preferred}","remote":"{node}:{substitute}","protocol":"tcp"}}"#
+        );
+        let result = match post_switch_forwarder(&switch_sock, "expose", &body) {
+            Ok((status, _)) if (200..300).contains(&status) => Ok(()),
+            Ok((500, answer)) if answer.trim() == SWITCH_ALREADY_BOUND && !noted => Ok(()),
+            Ok((status, answer)) => Err(format!(
+                "the switch answered the expose with HTTP {status}: {:?}",
+                answer.trim()
+            )),
+            Err(error) => Err(format!("the expose went unanswered: {error}")),
+        };
+        if noted && result.is_err() {
+            ledger.forget_bind(listener, preferred, node);
+        }
+        result
+    }
 }
 
 /// Reads one operator override for a node port off this supervisor's env —
@@ -2590,7 +3039,7 @@ fn assign_node_port(
                 preferred,
                 skipped: None,
                 configured: false,
-                _reservation: reservation,
+                reservation: Some(reservation),
             });
         }
         CandidateCheck::Skip(reason) => Some(reason),
@@ -2604,7 +3053,7 @@ fn assign_node_port(
         preferred,
         skipped,
         configured: false,
-        _reservation: reservation,
+        reservation: Some(reservation),
     })
 }
 
@@ -3864,6 +4313,10 @@ mod tests {
         assert_eq!(drawn, 1, "one candidate drawn, no TCP probe applied to it");
     }
 
+    /// How many times a step that releases a port asks for it again when
+    /// another test in the process took it first (#2653).
+    const NODE_PORT_RACE_ATTEMPTS: usize = 16;
+
     #[test]
     fn node_port_assigned_on_host_and_handed_to_daemon() {
         // Its own reservation dir: no test takes a flock in the real one.
@@ -3886,16 +4339,24 @@ mod tests {
         // probe assigns it as asked — the case the session e2e's hardcoded
         // default proxy port depends on. Released on the wildcard the probe
         // addresses, like the hold above.
-        let freed = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
-        let free = freed.local_addr().unwrap().port();
-        drop(freed);
-        assert_eq!(
-            super::assign_node_port(ports.path(), free, false)
-                .unwrap()
-                .port,
-            free,
-            "a free port is assigned as asked"
-        );
+        // Another test in the process can take the released port before the
+        // probe runs (#2653): that is a lost race, not a wrong answer, so a
+        // skipped preferred port releases a fresh one and asks again. A probe
+        // that refuses every free port still fails after the last attempt.
+        let mut handed_as_asked = None;
+        for _ in 0..NODE_PORT_RACE_ATTEMPTS {
+            let freed = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+            let free = freed.local_addr().unwrap().port();
+            drop(freed);
+            let assigned = super::assign_node_port(ports.path(), free, false).unwrap();
+            if assigned.port == free {
+                handed_as_asked = Some(assigned);
+                break;
+            }
+        }
+        let handed_as_asked = handed_as_asked.expect("a free port is assigned as asked");
+        assert!(handed_as_asked.skipped.is_none(), "nothing skipped");
+        drop(handed_as_asked);
 
         // The supervisor assigns the proxy port and hands it to the guest:
         // whatever the host picked, it is a real port the guest can bind as
@@ -3921,11 +4382,26 @@ mod tests {
         // (T93), so pin a port this test knows is free — and the one
         // resolved port is what both the handoff and the row carry.
         let previous = std::env::var(crate::vm::NODE_PROXY_PORT_ENV).ok();
-        let freed_pin = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
-        let pin = freed_pin.local_addr().unwrap().port();
-        drop(freed_pin);
-        unsafe { std::env::set_var(crate::vm::NODE_PROXY_PORT_ENV, pin.to_string()) };
-        let pinned = super::assign_node_proxy_port(ports.path()).unwrap();
+        // The released pin has the same race as the free port above (#2653):
+        // a pin another test took fails the start, so release a fresh one and
+        // pin again.
+        let mut last_refusal = None;
+        let mut resolved = None;
+        for _ in 0..NODE_PORT_RACE_ATTEMPTS {
+            let freed_pin = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+            let pin = freed_pin.local_addr().unwrap().port();
+            drop(freed_pin);
+            unsafe { std::env::set_var(crate::vm::NODE_PROXY_PORT_ENV, pin.to_string()) };
+            match super::assign_node_proxy_port(ports.path()) {
+                Ok(pinned) => {
+                    resolved = Some((pin, pinned));
+                    break;
+                }
+                Err(error) => last_refusal = Some(error.to_string()),
+            }
+        }
+        let (pin, pinned) = resolved
+            .unwrap_or_else(|| panic!("a free pin resolves, last refusal: {last_refusal:?}"));
         assert_eq!(pinned.port, pin, "the override is the resolution");
         assert!(
             pinned.configured,
@@ -3939,28 +4415,6 @@ mod tests {
             "the row publishes the port the guest is handed — the hostname \
              proxy only, the answerer is not the node's to admit (NET-138)"
         );
-
-        // A pin some check refuses fails the start naming the port and the
-        // holder (T93): the configured port never redraws, so there is no
-        // fallback to a port the operator did not pin.
-        let held_pin = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let refused_pin = held_pin.local_addr().unwrap().port();
-        unsafe { std::env::set_var(crate::vm::NODE_PROXY_PORT_ENV, refused_pin.to_string()) };
-        let err = super::assign_node_proxy_port(ports.path())
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains(&format!("hostname proxy port {refused_pin} held by"))
-                && err.contains("configured ports never redraw")
-                && err.contains(super::SKIP_BIND_REFUSED),
-            "a held pin fails the start naming the port and why, got: {err}"
-        );
-        // The holder is this test process, by pid: the listener is its own.
-        assert!(
-            err.contains(&format!("pid {}", std::process::id())),
-            "a held pin names the holder's pid, got: {err}"
-        );
-        drop(held_pin);
 
         // The override's own garbage fails at the supervisor, naming the
         // variable and the value — never a fallback to selection that would
@@ -3989,23 +4443,54 @@ mod tests {
         }
     }
 
+    /// NET-021: a pin another program holds does not fail the start. The
+    /// assignment hands the guest the pin with no reservation, so the VM
+    /// starts and the held-port watcher can take the reservation once the
+    /// port frees. A refused publish on the pin brings the VM up with its
+    /// proxy down, never a start failure. A pin on the port the node keeps
+    /// for its DNS service still fails, naming the variable to change.
     #[test]
-    fn detach_error_names_proxy_port_and_holder() {
-        // The supervisor's start failure, as its stderr lands in run.log —
-        // anyhow's `Error:` framing and the boot's context above it — is the
-        // line the detaching parent lifts for the CLI (T93).
-        let failure = super::proxy_port_failure(7654, "pid 4242 (python3)", "why");
-        let err = anyhow::anyhow!("{failure}").context("assigning the node's proxy port");
-        let log = format!("some gvproxy line\nError: {err:?}\n");
-        assert_eq!(
-            super::proxy_failure_line(&log),
-            Some("hostname proxy port 7654 held by pid 4242 (python3); why"),
-            "the failure line is lifted whole, framing dropped, from: {log}"
+    fn held_configured_port_starts_the_vm_with_the_proxy_down() {
+        let ports = tempfile::tempdir().expect("a test reservation dir");
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let pin = held.local_addr().unwrap().port();
+        let assigned =
+            super::configured_node_port(ports.path(), pin).expect("a held pin starts the VM");
+        assert_eq!(assigned.port, pin, "the guest is handed the pin");
+        assert_eq!(assigned.preferred, pin);
+        assert!(assigned.configured);
+        assert!(
+            assigned.skipped.is_none(),
+            "a held pin is not a substitute port"
         );
-        assert_eq!(
-            super::proxy_failure_line("Error: boot timed out\n"),
-            None,
-            "a start that failed on something else lifts nothing"
+        assert!(
+            assigned.reservation.is_none(),
+            "the watcher takes the reservation when the port frees"
+        );
+        // The publish on the held pin is refused: the decision is the one
+        // the boot loop turns into a VM with its proxy down.
+        assert!(matches!(
+            crate::control::decide_publish(
+                false,
+                1,
+                crate::control::GuestPublish::PortHeld { port: pin }
+            ),
+            crate::control::PublishDecision::FailStart { port, .. } if port == pin
+        ));
+        // Once the holder exits, the watcher's check passes and takes the
+        // reservation.
+        drop(held);
+        assert!(super::proxy_reclaim_check(ports.path().to_path_buf())(pin).is_some());
+
+        let reserved = crate::net::answerer::DEFAULT_ANSWERER_PORT;
+        let err = super::configured_node_port(ports.path(), reserved)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(crate::vm::NODE_PROXY_PORT_ENV)
+                && err.contains(&reserved.to_string())
+                && err.contains("DNS service"),
+            "a pin on the reserved port names the variable, got: {err}"
         );
     }
 
@@ -4663,7 +5148,7 @@ mod tests {
         for (i, byte) in token.iter_mut().enumerate() {
             *byte = u8::try_from(i * 7 + 1).unwrap();
         }
-        let proxy = super::BepProxy::spawn(&bin, &listener, &token, &log).expect("spawn");
+        let proxy = super::BepProxy::spawn(&bin, &listener, &token, &log, None).expect("spawn");
         assert_ne!(proxy.pid(), 0);
 
         let token_file = seen.with_extension("token");
@@ -4754,7 +5239,7 @@ mod tests {
 
         let proxy = std::thread::spawn({
             let (bin, listener, log) = (bin.clone(), listener.clone(), log.clone());
-            move || super::BepProxy::spawn(&bin, &listener, &token, &log).expect("spawn")
+            move || super::BepProxy::spawn(&bin, &listener, &token, &log, None).expect("spawn")
         })
         .join()
         .expect("the starting thread");
@@ -4804,7 +5289,7 @@ mod tests {
         let log = listener.with_file_name(super::BEP_LOG_FILE);
         let token = [9u8; switch::bep_host::TOKEN_LEN];
 
-        let proxy = super::BepProxy::spawn(&bin, &listener, &token, &log).expect("spawn");
+        let proxy = super::BepProxy::spawn(&bin, &listener, &token, &log, None).expect("spawn");
         std::thread::sleep(super::BEP_WATCH_INTERVAL * 3);
         assert!(
             !eof.exists(),
@@ -4869,6 +5354,7 @@ mod tests {
             listener: dir.path().join("gvproxy-bep.sock"),
             stale: None,
             log: dir.path().join(super::BEP_LOG_FILE),
+            on_listening: None,
         };
         let error = super::hand_to_watcher(child, watch, |_body| {
             Err(std::io::Error::other("no thread for the watcher"))
@@ -4881,5 +5367,221 @@ mod tests {
             .unwrap()
             .success();
         assert!(!alive, "the proxy does not outlive a failed watcher start");
+    }
+
+    /// BEP-063 (#2617): when `bep serve` starts to listen, the watcher sends
+    /// the proxy's control socket one `live_boxes` line with every box id
+    /// the registry holds, so the proxy frees the keys of the boxes that
+    /// ended with no forget.
+    #[test]
+    fn proxy_gets_the_live_box_ids_when_it_starts_to_listen() {
+        use std::io::{BufRead as _, Write as _};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let control = dir.path().join("control.sock");
+        let registry = crate::box_registry::BoxRegistry::new(switch::SwitchSubnet::default());
+        for name in ["box-a", "box-b"] {
+            registry
+                .register_client_box(crate::box_registry::ClientBoxSpec {
+                    name: name.to_string(),
+                    ingress_ports: Vec::new(),
+                    egress: None,
+                    credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
+                })
+                .expect("the plan has a switch address to hand out");
+        }
+        let expected = registry.live_box_ids();
+        assert_eq!(expected.len(), 2);
+        let registry = registry.with_proxy_control(Some(control.clone()));
+
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let listener = dir.path().join("gvproxy-bep.sock");
+        let watch = super::BepWatch {
+            stop: std::sync::Arc::default(),
+            listening: std::sync::Arc::default(),
+            listener: listener.clone(),
+            stale: None,
+            log: dir.path().join(super::BEP_LOG_FILE),
+            on_listening: Some(super::send_live_boxes_on_listening(registry)),
+        };
+        let stop = std::sync::Arc::clone(&watch.stop);
+        let watcher =
+            super::hand_to_watcher(child, watch, |body| std::thread::Builder::new().spawn(body))
+                .expect("the watcher starts");
+
+        // The proxy binds its listener, then its control socket.
+        let _listening = std::os::unix::net::UnixListener::bind(&listener).unwrap();
+        let control = std::os::unix::net::UnixListener::bind(&control).unwrap();
+        let (stream, _) = control.accept().unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        (&stream).write_all(b"{\"ok\":true}\n").unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&line).unwrap(),
+            serde_json::json!({"op": "live_boxes", "box_ids": expected})
+        );
+
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        watcher.join().unwrap();
+    }
+
+    /// A stand-in switch: answers each forwarder request on `sock` with the
+    /// next of `answers` (status, body), and sends every request it read,
+    /// head and body, on the returned channel.
+    fn fake_switch(
+        sock: &std::path::Path,
+        answers: Vec<(u16, &'static str)>,
+    ) -> std::sync::mpsc::Receiver<String> {
+        use std::io::{Read as _, Write as _};
+        let listener = std::os::unix::net::UnixListener::bind(sock).expect("bind the fake switch");
+        let (sent, requests) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for (status, body) in answers {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    let n = stream.read(&mut chunk).expect("read the request");
+                    request.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some((head, rest)) = text.split_once("\r\n\r\n") {
+                        let length: usize = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("Content-Length: "))
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(0);
+                        if rest.len() >= length {
+                            break;
+                        }
+                    }
+                    if n == 0 {
+                        break;
+                    }
+                }
+                sent.send(String::from_utf8_lossy(&request).into_owned())
+                    .expect("send the request");
+                let answer = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(answer.as_bytes()).expect("answer");
+            }
+        });
+        requests
+    }
+
+    // NET-138: the production binder asks the switch to listen at the
+    // node's address and forward to the same port at the guest node. A port
+    // the host already holds is a collision, never another port.
+    #[test]
+    fn switch_mirror_binder_exposes_at_the_node_address_only() {
+        use crate::box_registry::{MirrorBindError, MirrorBinder as _};
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let sock = dir.path().join("switch.sock");
+        let requests = fake_switch(
+            &sock,
+            vec![
+                (200, ""),
+                (
+                    500,
+                    "listen tcp 127.0.64.9:8080: bind: address already in use\n",
+                ),
+                (500, "proxy already running\n"),
+                (200, ""),
+            ],
+        );
+        let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+        let _entered = runtime.enter();
+        let registry = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
+        let node = std::net::Ipv4Addr::new(192, 168, 127, 2);
+        let binder = super::SwitchMirrorBinder {
+            switch_sock: sock.clone(),
+            node,
+            table: registry.table(),
+        };
+        let address = std::net::Ipv4Addr::new(127, 0, 64, 9);
+        assert!(
+            binder.bind(address, 8080).is_err(),
+            "no bind is made while no egress gate tracks its connections"
+        );
+        let ledger =
+            crate::net::egress_gate::TestMirrorLedger::attach(&registry.table(), sock.clone());
+        assert_eq!(binder.bind(address, 8080), Ok(()));
+        assert_eq!(
+            ledger.dials(address, 8080),
+            Some(node),
+            "the bind is noted in the gate's ledger at the node's switch address"
+        );
+        let expose = requests.recv().expect("the expose");
+        assert!(expose.starts_with("POST /services/forwarder/expose HTTP/1.1\r\n"));
+        assert!(expose.ends_with(
+            r#"{"local":"127.0.64.9:8080","remote":"192.168.127.2:8080","protocol":"tcp"}"#
+        ));
+        assert_eq!(binder.bind(address, 8080), Err(MirrorBindError::Occupied));
+        requests.recv().expect("the second expose");
+        assert_eq!(
+            binder.bind(address, 8080),
+            Ok(()),
+            "a forward the switch already holds is the goal state"
+        );
+        requests.recv().expect("the third expose");
+        assert_eq!(
+            binder.unbind(address, 8080),
+            crate::box_registry::MirrorUnbind::Undone {
+                connections_reset: 0
+            }
+        );
+        let unexpose = requests.recv().expect("the unexpose");
+        assert!(unexpose.starts_with("POST /services/forwarder/unexpose HTTP/1.1\r\n"));
+        assert!(unexpose.ends_with(r#"{"local":"127.0.64.9:8080","protocol":"tcp"}"#));
+        assert_eq!(
+            ledger.dials(address, 8080),
+            None,
+            "the unbind drops the note"
+        );
+    }
+
+    // NET-138: the upkeep opens the node's mirror only while the whole-range
+    // probe passes, at the address the answerer hands the node, and never
+    // at the 127.0.0.1 interim.
+    #[test]
+    fn node_mirror_opens_at_the_allocated_address_once_the_range_passes() {
+        let boxes = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
+        let absent = switch::loopback::RangeProbe::failed_to_run();
+        let present = switch::loopback::RangeProbe {
+            bound: 1,
+            probed: 1,
+            first_failure: None,
+        };
+        let address = std::net::Ipv4Addr::new(127, 0, 64, 40);
+        assert_eq!(
+            super::node_mirror_pass(&boxes, &absent, || panic!("no allocation while absent")),
+            None
+        );
+        assert_eq!(boxes.node_mirror().address(), None);
+        assert!(
+            super::node_mirror_pass(&boxes, &present, || Ok(std::net::Ipv4Addr::LOCALHOST))
+                .is_some(),
+            "the 127.0.0.1 interim is refused"
+        );
+        assert_eq!(boxes.node_mirror().address(), None);
+        assert_eq!(
+            super::node_mirror_pass(&boxes, &present, || Ok(address)),
+            None
+        );
+        assert_eq!(boxes.node_mirror().address(), Some(address));
+        assert_eq!(
+            super::node_mirror_pass(&boxes, &present, || panic!(
+                "an open mirror allocates nothing"
+            )),
+            None
+        );
     }
 }

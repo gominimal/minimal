@@ -942,7 +942,7 @@ EOF
     run ns4_seed "$HNS4"
     fake_ns4="$root/fake net root-4 \$HOME"
     cls_tree="sys/fs/cgroup/minimald.slice"
-    cls_files="etc/systemd/system/minimald-classifier.service etc/systemd/system/minimald-place.path etc/systemd/system/minimald-place.service usr/local/lib/minimal/install-host-classifier.sh var/lib/minimal/finalize-install-classifier"
+    cls_files="etc/systemd/system/minimald-classifier.service etc/systemd/system/minimald-place.path etc/systemd/system/minimald-place.service usr/local/lib/minimal/install-host-classifier.sh usr/local/lib/minimal/quic443-leaf etc/sudoers.d/minimal-quic443-leaf var/lib/minimal/finalize-install-classifier"
     mkdir -p "$fake_ns4/$cls_tree/classifier-table" "$fake_ns4/$cls_tree/daemon" \
         "$fake_ns4/$cls_tree/boxes/allow" "$fake_ns4/$cls_tree/boxes/deny"
     for f in $cls_files; do
@@ -957,9 +957,11 @@ EOF
         grep -q "still installed on this host.*classifier units" "$OUT"
     want_ok "the classifier tree is advised" \
         grep -q "still installed on this host.*classifier tree" "$OUT"
+    want_ok "the QUIC block helper is advised as its own item" \
+        grep -q "still installed on this host.*the QUIC block helper and its sudoers rule" "$OUT"
     want_ok "non-interactive uninstall never elevates (the tree survives)" \
         test -d "$fake_ns4/$cls_tree/classifier-table"
-    apply_remedies 2
+    apply_remedies 3
     for f in $cls_files "$cls_tree" usr/local/lib/minimal; do
         want_err "the printed remedies remove $f" test -e "$fake_ns4/$f"
     done
@@ -1002,6 +1004,31 @@ EOF
     check 1 "$_h_failed" "the tree's remedy fails while the tree is held"
     want_ok "a held tree keeps its record" \
         test -f "$fake_ns4c/var/lib/minimal/finalize-install-classifier"
+
+    # The QUIC block helper and its sudoers rule, on their own: they are found,
+    # named in the list, and the printed remedy removes both.
+    HNS4D="$root/hns4d"; mkdir -p "$HNS4D"
+    run ns4d_seed "$HNS4D"
+    fake_ns4d="$root/fake net root-4d \$HOME"
+    qb_files="usr/local/lib/minimal/quic443-leaf etc/sudoers.d/minimal-quic443-leaf"
+    for f in $qb_files; do
+        mkdir -p "$fake_ns4d/$(dirname "$f")"
+        printf 'helper\n' >"$fake_ns4d/$f"
+    done
+    FINALIZE_INSTALL_ROOT="$fake_ns4d"
+    run ns4d_run "$HNS4D" --uninstall
+    FINALIZE_INSTALL_ROOT=
+    check 0 "$rc" "uninstall with only the QUIC block helper exits 0"
+    want_ok "the uninstall names the QUIC block helper and its sudoers rule" \
+        grep -q "still installed on this host.*the QUIC block helper and its sudoers rule (/usr/local/lib/minimal/quic443-leaf)" "$OUT"
+    want_err "the QUIC block helper is not called a classifier unit" \
+        grep -q "classifier units" "$OUT"
+    want_ok "non-interactive uninstall never elevates (the helper survives)" \
+        test -f "$fake_ns4d/usr/local/lib/minimal/quic443-leaf"
+    apply_remedies 1
+    for f in $qb_files; do
+        want_err "the printed remedy removes $f" test -e "$fake_ns4d/$f"
+    done
 
     # The kvm group membership, by its record.
     HNS5="$root/hns5"; mkdir -p "$HNS5"
@@ -1048,7 +1075,7 @@ EOF
     done
     want_ok "non-interactive uninstall leaves the system profile in place" \
         test -f "$fake_aa6/minimald"
-    apply_remedies 5
+    apply_remedies 6
     for f in $all_files "$cls_tree" usr/local/lib/minimal run/minimal; do
         want_err "the printed remedies remove $f" test -e "$fake_ns6/$f"
     done
@@ -2606,6 +2633,10 @@ if [ "$1" = "list" ] && [ "$2" = "ruleset" ]; then
     cat "${NFT_RULESET:-/dev/null}"
     exit 0
 fi
+if [ "$*" = "-a --debug=netlink list ruleset" ]; then
+    cat "${NFT_RULESET:-/dev/null}"
+    exit 0
+fi
 if [ "$1" = "-j" ] && [ "$2" = "list" ] && [ "$3" = "set" ]; then
     [ -n "${NFT_LEAF_SET:-}" ] || exit 1
     cat "$NFT_LEAF_SET"
@@ -3107,24 +3138,71 @@ delete element inet minimal_class quic443_blocked_leaves { "minimald.slice/boxes
     want_ok "the refusal names the conflicting rule itself" \
         grep -q 'ct mark set ct mark or 0x10000000' "$OUT"
     want_ok "the refusal names the override it would take instead" \
-        grep -q -- "--ct-mark-mask <two contiguous bits nothing else classes with>" "$OUT"
+        grep -q -- "Choose two contiguous bits that no rule above uses and run: min finalize-install --ct-mark-mask <mask>$" "$OUT"
     want_ok "the refusal dies before touching anything: the previous marker \
 still vouches for the table it loaded" \
         test -d "$tree/classifier-table"
     run_hc conflict_escaped "$root/mi-on" --user "$me" \
         --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1 \
-        --ct-mark-mask 0x0000c000
+        --ct-mark-mask 0x03000000
     check 0 "$rc" "an install with non-overlapping bits escapes the conflict"
     want_ok "the escape renders its own bits, both identities on them" \
-        grep -q 'ct mark and 0x0000c000 == 0x00004000 oifname != "lo" snat ip to 100.72.0.9' "$nft_input"
+        grep -q 'ct mark and 0x03000000 == 0x01000000 oifname != "lo" snat ip to 100.72.0.9' "$nft_input"
     want_ok "the escape records the bits it chose" \
-        test -d "$tree/ct-mark-mask-0x0000c000"
+        test -d "$tree/ct-mark-mask-0x03000000"
     want_err "the escape left no record of the refused mask" \
         test -e "$tree/ct-mark-mask-0x30000000"
-    run_hc conflict_back "$root/mi-on" --user "$me" \
+    # --- With no --ct-mark-mask, the next install re-applies the mask the
+    # previous install recorded, so a re-run keeps the operator's bits
+    # rather than falling back to the default that conflicts.
+    : >"$nft_input"
+    run_hc conflict_recorded "$root/mi-on" --user "$me" \
         --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
-    check 1 "$rc" "the next default-mask install refuses again"
+    check 0 "$rc" "an install with no mask re-applies the recorded mask over the conflict"
+    want_ok "the install says which recorded mask it uses" \
+        grep -q "using the ct-mark mask 0x03000000 that the previous install recorded" "$OUT"
+    want_ok "the install renders the recorded bits" \
+        grep -q 'ct mark and 0x03000000 == 0x01000000 oifname != "lo" snat ip to 100.72.0.9' "$nft_input"
+    want_ok "the recorded mask is still the one record" \
+        test -d "$tree/ct-mark-mask-0x03000000"
+    want_err "the install wrote no default-mask record" \
+        test -e "$tree/ct-mark-mask-0x30000000"
+    run_hc conflict_back "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1 \
+        --ct-mark-mask 0x30000000
+    check 1 "$rc" "an explicit default-mask install refuses again"
     NFT_RULESET=
+
+    # --- A CONNMARK --restore-mark copies the connection mark into the
+    # packet mark and never writes the connection mark, so a restore with
+    # no mask is no conflict. A stand-in iptables-save serves the listing.
+    _iptdir="$root/hc-iptables-save"; mkdir -p "$_iptdir"
+    cat >"$_iptdir/iptables-save" <<'STUB'
+#!/bin/sh
+cat "$(dirname "$0")/listing"
+STUB
+    chmod 0755 "$_iptdir/iptables-save"
+    HC_PATH_PREFIX="$_iptdir"
+    printf '*mangle\n:OUTPUT ACCEPT [0:0]\n-A OUTPUT -p udp -j CONNMARK --restore-mark\nCOMMIT\n' \
+        >"$_iptdir/listing"
+    run_hc restore_mark_nomask "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    check 0 "$rc" "a --restore-mark with no mask does not block the install"
+    unset HC_PATH_PREFIX
+
+    # --- A mask in a range a well-known component classes with is refused
+    # even when no loaded rule uses it yet: the component can start after
+    # the install. The refusal names the range and the component.
+    run_hc well_known_range "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1 \
+        --ct-mark-mask 0x0000c000
+    check 1 "$rc" "an install with a mask in kube-proxy's range exits 1"
+    want_ok "the refusal names the range and the component" \
+        grep -q "uses bits in 0x0000c000, the range kube-proxy marks connections with" "$OUT"
+    want_ok "the refusal names min finalize-install with another mask" \
+        grep -q -- "two contiguous bits outside 0x0000c000 and run: min finalize-install --ct-mark-mask <mask>$" "$OUT"
+    want_err "the refused mask is not recorded" \
+        test -e "$tree/ct-mark-mask-0x0000c000"
 
     # --- --ct-mark-mask is validated before anything is made: exactly two
     # contiguous set bits inside the 32 a connection mark holds, nothing
@@ -3397,6 +3475,88 @@ case_linux_vm_stack() {
         grep -qE "^  switch-binary +(verified|current)" "$OUT"
 }
 
+# --- #2498: the Box Egress Proxy installs beside minvmd on macOS -------------
+# minvmd starts `bep` from beside its own binary, so an installed minvmd finds
+# the proxy only when both land in the same directory. The proof reads the
+# release's own component table (scripts/stage-release.sh), then installs a
+# darwin manifest with those two rows and checks where they land.
+case_bep_installs_beside_minvmd() {
+    _table="$here/stage-release.sh"
+    _row() {
+        awk -F'|' -v c="$1" '$1 ~ "\"" c "$" && $2 == "darwin" && $3 == "arm64" {print $4 "|" $5 "|" $6}' "$_table"
+    }
+    # bin/bep is a link to the program inside bin/bep.app, whose provisioning
+    # profile carries the program's keychain entitlement (#2812).
+    check 'symlink|bin/bep|bep.app/Contents/MacOS/bep"' "$(_row bep)" \
+        "the release links bin/bep to the program in bin/bep.app"
+    check 'file|bin/bep.app/Contents/MacOS/bep|bep-macos-arm64"' "$(_row bep-program)" \
+        "the release stages the bep program inside bin/bep.app"
+    check "bin/minvmd" "$(_row minvmd | cut -d'|' -f2)" "the release stages minvmd for darwin/arm64 at bin/minvmd"
+    want_err "the release stages no bep for Linux" \
+        grep -qE '^    "bep[-a-z]*\|linux\|' "$_table"
+
+    printf 'darwin-arm64-minvmd-body\n' >"$mock/versions/v1/minvmd-macos-arm64"
+    printf 'darwin-arm64-bep-body\n'    >"$mock/versions/v1/bep-macos-arm64"
+    h_dminvmd="$(hash_file "$mock/versions/v1/minvmd-macos-arm64")"
+    h_dbep="$(hash_file "$mock/versions/v1/bep-macos-arm64")"
+    # _bep_components SRC — the manifest, with the bep program fetched from
+    # SRC. The link row comes after the program row, as in the release table.
+    _bep_components() {
+        printf '# format: 1\n'
+        printf '# c o a v s k d s\n'
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            minvmd darwin arm64 v1 "$h_dminvmd" file bin/minvmd versions/v1/minvmd-macos-arm64
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            bep-program darwin arm64 v1 "$h_dbep" file bin/bep.app/Contents/MacOS/bep "$1"
+        printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+            bep darwin arm64 v1 - symlink bin/bep bep.app/Contents/MacOS/bep
+    }
+    want_ok "the release table links bin/bep after every bep.app file" \
+        test "$(grep -E '^    "bep[-a-z]*\|darwin\|' "$_table" | tail -n1 | cut -d'|' -f1)" = '    "bep'
+
+    PLAT_S=Darwin; PLAT_M=arm64
+    : >"$root/xattr.calls"
+    H_BEP="$root/h_bep_darwin"; mkdir -p "$H_BEP/bin"
+    # A host that ran an earlier release has bin/bep as a plain file.
+    printf 'old-bep\n' >"$H_BEP/bin/bep"
+
+    # A bundle download that fails leaves that bin/bep in place.
+    _bep_components versions/v1/bep-not-there >"$mock/versions/v1/components"
+    reset_dl
+    run bep_darwin_failed_install "$H_BEP"
+    want_err "darwin install with an unreachable bep program fails" test "$rc" -eq 0
+    want_err "bin/bep is not yet a link" test -L "$H_BEP/bin/bep"
+    check "old-bep" "$(cat "$H_BEP/bin/bep")" "the earlier bin/bep is still in place"
+
+    _bep_components versions/v1/bep-macos-arm64 >"$mock/versions/v1/components"
+    : >"$root/xattr.calls"
+    reset_dl
+    run bep_darwin_install "$H_BEP"
+    check 0 "$rc" "darwin install with the bep rows exits 0"
+    want_ok "minvmd installs in the same bin directory" test -f "$H_BEP/bin/minvmd"
+    want_ok "bin/bep replaces the earlier plain file with a link" test -L "$H_BEP/bin/bep"
+    check "bep.app/Contents/MacOS/bep" "$(readlink "$H_BEP/bin/bep")" "bin/bep links to the program in the bundle"
+    check "$h_dbep" "$(hash_file "$H_BEP/bin/bep")" "bin/bep resolves to the program the manifest hashes"
+    want_ok "the bep program is executable like every bin row" test -x "$H_BEP/bin/bep.app/Contents/MacOS/bep"
+    want_ok "quarantine stripped from the bep program (xattr)" \
+        grep -q "/bin/bep\.app/Contents/MacOS/bep\.tmp" "$root/xattr.calls"
+    want_ok "bin/bep is recorded at its user-prefix path" \
+        record_has bep "$H_BEP/bin/bep" "$H_BEP/xdg-state/minimal/installed"
+    want_ok "the bep program is recorded at its user-prefix path" \
+        record_has bep-program "$H_BEP/bin/bep.app/Contents/MacOS/bep" "$H_BEP/xdg-state/minimal/installed"
+    want_ok "the installer printed the bep link status" \
+        grep -qE "^  bep +linked" "$OUT"
+
+    run bep_darwin_uninstall "$H_BEP" --uninstall
+    check 0 "$rc" "darwin uninstall with the bep rows exits 0"
+    want_err "uninstall removed the bin/bep link" test -L "$H_BEP/bin/bep"
+    want_err "uninstall removed the bep program" test -e "$H_BEP/bin/bep.app/Contents/MacOS/bep"
+    want_err "uninstall removed the emptied bin/bep.app directories" test -e "$H_BEP/bin/bep.app"
+    want_err "uninstall removed minvmd beside it" test -e "$H_BEP/bin/minvmd"
+    cp "$root/good-components" "$mock/versions/v1/components"   # restore
+    PLAT_S=Linux; PLAT_M=x86_64
+}
+
 case_linux_amd64_manifest_ships_vm_stack() { case_linux_vm_stack amd64; }
 case_linux_arm64_manifest_ships_vm_stack() { case_linux_vm_stack arm64; }
 
@@ -3539,6 +3699,7 @@ case_for() {
         answerer_source_installed)      case_answerer_source_installed ;;
         linux_amd64_manifest_ships_vm_stack) case_linux_amd64_manifest_ships_vm_stack ;;
         linux_arm64_manifest_ships_vm_stack) case_linux_arm64_manifest_ships_vm_stack ;;
+        bep_installs_beside_minvmd)         case_bep_installs_beside_minvmd ;;
         *)
             echo "install_test: unknown case '$1' (known cases listed in the dispatch)" >&2
             exit 2
@@ -3555,7 +3716,8 @@ case "${1:-}" in
             shell_integration darwin_dequarantine uninstall \
             gvproxy_rename_migration installer_switch_binary_executable \
             host_classifier_tree_installed answerer_source_installed \
-            linux_amd64_manifest_ships_vm_stack linux_arm64_manifest_ships_vm_stack; do
+            linux_amd64_manifest_ships_vm_stack linux_arm64_manifest_ships_vm_stack \
+            bep_installs_beside_minvmd; do
             case_for "$_c"
         done
         ;;

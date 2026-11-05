@@ -44,6 +44,15 @@ mod listener;
 pub trait Channel: Send {
     // Return true to close the connection.
     fn handle(&mut self, stream: &mut UnixStream, line: &str, rootfs: &Path);
+
+    /// Handles a request line that was not valid UTF-8. `line` is its lossy
+    /// decode, with each invalid byte replaced by U+FFFD, and `raw` is the
+    /// line as the box sent it, so a channel can tell which values held an
+    /// invalid byte. The default handles `line` as [`Channel::handle`] does.
+    fn handle_lossy(&mut self, stream: &mut UnixStream, line: &str, raw: &[u8], rootfs: &Path) {
+        let _ = raw;
+        self.handle(stream, line, rootfs);
+    }
 }
 
 impl Channel for () {
@@ -181,6 +190,7 @@ impl<C: Channel> Sandbox<C> {
     /// share one: a container's commands wait at the gate its own call
     /// returned, and releasing one gate starts no other container's program.
     #[cfg(target_os = "linux")]
+    #[tracing::instrument(level = "info", skip_all, err)]
     pub fn hold_start(&self, container: &mut Container) -> Result<StartGate, Error> {
         use std::os::fd::FromRawFd as _;
         use std::os::unix::ffi::OsStrExt as _;
@@ -233,6 +243,7 @@ impl<C: Channel> Sandbox<C> {
     }
 
     /// Creates a new sandbox, containing all filesystem state within `base_dir`.
+    #[tracing::instrument(level = "info", skip_all, err)]
     pub(crate) fn new(base_dir: PathBuf, config: Config, channel: C) -> Result<Self, Error> {
         // Setup the rootfs
         let rootfs = base_dir.join("rootfs");
@@ -2960,7 +2971,7 @@ fn shell_word(path: &str) -> String {
 /// a loss of isolation.
 ///
 /// A `Some` is not advisory: `minimald` gates every session create on it
-/// (NET-141), refusing the create with this cause and its remedy, so a false
+/// (NET-143), refusing the create with this cause and its remedy, so a false
 /// `Some` — a host whose kernel would in fact allow the unshare — refuses
 /// every session on that host. Three facts are read, each live from `/proc`
 /// on every call, so a remedy applied to a running host takes effect at the
@@ -3801,7 +3812,7 @@ mod tests {
     /// The daemon's AppArmor remedy names the install step for the
     /// installed daemon and, on its own line, the loader with `--path` for
     /// this daemon's own path, so a source-built daemon is covered too
-    /// (NET-141).
+    /// (NET-143).
     #[test]
     fn daemon_apparmor_remedy_names_finalize_install_and_this_binary() {
         let remedy = UsernsRestriction::ApparmorUnconfined.remedy(RemedyTarget::Daemon {
@@ -3827,7 +3838,7 @@ mod tests {
 
     /// The mip AppArmor remedy is a command the operator pastes, so a data
     /// dir or binary path with a space stays one shell word, while a plain
-    /// path is shown bare (NET-141).
+    /// path is shown bare (NET-143).
     #[test]
     fn mip_apparmor_remedy_quotes_paths_with_spaces() {
         let remedy = UsernsRestriction::ApparmorUnconfined.remedy(RemedyTarget::Mip {

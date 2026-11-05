@@ -27,11 +27,9 @@
 //! Box creation reads that key from the host keychain
 //! ([`HostClientKeyStore`]), so every creation signs under one key and the
 //! proxy keeps one registration for this client.
-//! [`mint_store_handle`] has no caller yet: the sealed member list has no
-//! `store` kind to carry a handle to the box.
-//! <https://github.com/gominimal/minimal/issues/2525> owns that kind, and
-//! <https://github.com/gominimal/minimal/issues/2526> owns the
-//! `min box spec` store references.
+//! Box creation seals each store handle as a `store` member, one sealed
+//! value for each store reference that a rule accepts
+//! ([`mint_store_members`], BEP-032).
 //!
 //! A mint refuses a root CA whose validity ended: every handle minted under
 //! it would be expired already.
@@ -130,10 +128,81 @@ pub enum MintError {
         /// The proxy's bound.
         max: usize,
     },
+    /// The rule is read from a `min --config-dir` override, and the files
+    /// that `bep serve` reads hold no rule for the item, so it would not
+    /// redeem the handle.
+    RuleNotRead {
+        /// The rule's item identifier.
+        id: String,
+        /// The client configuration that `bep serve` reads.
+        bep_config: PathBuf,
+        /// The `--config-dir` override.
+        config_dir: PathBuf,
+    },
+    /// A configuration file that `bep serve` reads store rules from does
+    /// not read, so `bep serve` holds no store rules at all.
+    BepConfigUnread {
+        /// The rule's item identifier.
+        id: String,
+        /// The file that does not read.
+        file: PathBuf,
+        /// Why it does not read.
+        error: String,
+    },
+    /// `bep serve` refuses its own rule for the item when it reads it.
+    BepRuleRefused {
+        /// The rule's item identifier.
+        id: String,
+        /// The refusal, which names its file.
+        refusal: String,
+    },
+    /// The rules that `bep serve` reads give the item a `deny` action.
+    BepRuleDenied {
+        /// The rule's item identifier.
+        id: String,
+        /// The files that `bep serve` reads store rules from.
+        files: String,
+    },
+    /// `bep serve` holds a rule for the item in another form.
+    BepRuleDiffers {
+        /// The rule's item identifier.
+        id: String,
+        /// The files that `bep serve` reads store rules from.
+        files: String,
+        /// The rule fields that differ, as the configuration names them.
+        fields: Vec<&'static str>,
+    },
 }
 
 impl fmt::Display for MintError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.write_for(f, false)
+    }
+}
+
+/// A [`MintError`] for a box whose only proxy-served secrets are
+/// `source = "store"` references. Its text names those secrets, not a
+/// GitHub grant. Every other variant prints as [`MintError`] prints it.
+#[derive(Debug)]
+pub struct StoreOnlyMintError(pub MintError);
+
+impl fmt::Display for StoreOnlyMintError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.write_for(f, true)
+    }
+}
+
+impl std::error::Error for StoreOnlyMintError {}
+
+impl MintError {
+    /// The error's text. `stored` says the box declares store references
+    /// only, so the text names no GitHub grant.
+    fn write_for(&self, f: &mut fmt::Formatter<'_>, stored: bool) -> fmt::Result {
+        let declares = if stored {
+            "a secret from the host's secret store"
+        } else {
+            "a GitHub grant"
+        };
         match self {
             Self::SignIn(error) => write!(
                 f,
@@ -150,19 +219,16 @@ impl fmt::Display for MintError {
                 error: PublishError::Io { source, .. },
             } if source.kind() == io::ErrorKind::NotFound => write!(
                 f,
-                "Cannot start the box: it declares a GitHub grant, and the Box Egress Proxy \
+                "Cannot start the box: it declares {declares}, and the Box Egress Proxy \
                  has not published its keys at {}.",
                 path.display()
             ),
             Self::Identity { error, .. } => {
-                write!(
-                    f,
-                    "Cannot start the box: it declares a GitHub grant. {error}"
-                )
+                write!(f, "Cannot start the box: it declares {declares}. {error}")
             }
             Self::NotRunning { path, error } => write!(
                 f,
-                "Cannot start the box: it declares a GitHub grant, and the Box Egress Proxy \
+                "Cannot start the box: it declares {declares}, and the Box Egress Proxy \
                  does not answer on {}: {error}.",
                 path.display()
             ),
@@ -184,6 +250,10 @@ impl fmt::Display for MintError {
                 f,
                 "Cannot start the box: its id {id} is not one the Box Egress Proxy accepts."
             ),
+            Self::Random if stored => write!(
+                f,
+                "Cannot start the box: this machine gave no random bytes for the store handle's key."
+            ),
             Self::Random => write!(
                 f,
                 "Cannot start the box: this machine gave no random bytes for the GitHub grant's key."
@@ -203,6 +273,42 @@ impl fmt::Display for MintError {
                 f,
                 "min did not create the box: the Box Egress Proxy already holds {max} client keys, \
                  and running boxes use each one. A key is freed when the last box created under it ends."
+            ),
+            // The exact text the task fixes for a rule that `bep serve`
+            // does not read (BEP-032).
+            Self::RuleNotRead {
+                id,
+                bep_config,
+                config_dir,
+            } => write!(
+                f,
+                "min did not mint a store handle for {id}: bep serve reads store rules from {}, \
+                 not from --config-dir {}.",
+                bep_config.display(),
+                config_dir.display()
+            ),
+            Self::BepConfigUnread { id, file, error } => write!(
+                f,
+                "min did not mint a store handle for {id}: bep serve cannot read {}, \
+                 so it holds no store rules. {error}",
+                file.display()
+            ),
+            Self::BepRuleRefused { id, refusal } => write!(
+                f,
+                "min did not mint a store handle for {id}: bep serve refuses its rule for {id}. \
+                 {refusal}"
+            ),
+            Self::BepRuleDenied { id, files } => write!(
+                f,
+                "min did not mint a store handle for {id}: the store rules that bep serve reads \
+                 from {files} set action = \"deny\" for {id}."
+            ),
+            Self::BepRuleDiffers { id, files, fields } => write!(
+                f,
+                "min did not mint a store handle for {id}: the rule for {id} that bep serve reads \
+                 from {files} has a different {}. Give both rules the same {}.",
+                fields.join(" and "),
+                fields.join(" and ")
             ),
         }
     }
@@ -849,7 +955,11 @@ impl ControlClient {
         })
     }
 
-    fn ask(&mut self, request: &Request, what: &'static str) -> Result<Reply, MintError> {
+    fn ask(
+        &mut self,
+        request: &impl serde::Serialize,
+        what: &'static str,
+    ) -> Result<Reply, MintError> {
         let mut line = serde_json_lenient::to_string(request).map_err(|error| {
             MintError::Control(io::Error::new(io::ErrorKind::InvalidData, error))
         })?;
@@ -948,6 +1058,25 @@ impl ControlClient {
                 Err(error)
             }
         }
+    }
+
+    /// Asks the proxy to re-certify its root for the current store rules,
+    /// after `min secret set` wrote one (BEP-013). The proxy replies after
+    /// it re-issued the root and published it to the identity file, so a box
+    /// created after an `Ok` reads a root that permits the rule's upstream.
+    ///
+    /// # Errors
+    ///
+    /// [`MintError::Control`] when the connection fails, and
+    /// [`MintError::Refused`] when the proxy did not re-issue or publish the
+    /// root, with its reason.
+    pub fn recertify_root(&mut self) -> Result<(), MintError> {
+        self.ask(
+            &bep::control::RecertifyRequest::RecertifyRoot,
+            "the re-issue of its root certificate",
+        )?;
+        tracing::debug!("the proxy re-certified its root for the store rules");
+        Ok(())
     }
 
     /// Tells the proxy to forget the box `box_id`.
@@ -1268,13 +1397,6 @@ pub fn mint_and_register(
 /// The claims of a store handle for box `box_id` on Box Host `node`, under
 /// `rule`: its store and identifier, its registered authorities as the
 /// upstream set, its injection form, and `expiry` as the expiry.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no caller until the sealed member list has a `store` kind (https://github.com/gominimal/minimal/issues/2525)"
-    )
-)]
 #[must_use]
 pub fn store_claims(
     box_id: &str,
@@ -1298,13 +1420,6 @@ pub fn store_claims(
 }
 
 /// One minted store handle.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no caller until the sealed member list has a `store` kind (https://github.com/gominimal/minimal/issues/2525)"
-    )
-)]
 pub struct StoreHandle {
     /// The handle, a JWS of `typ` `gatehouse-store-handle+jws`.
     pub jws: Zeroizing<String>,
@@ -1340,12 +1455,13 @@ impl fmt::Debug for StoreHandle {
 /// [`MintError::Identity`] when the identity has no usable sealing key or
 /// root validity, [`MintError::RootExpired`] when that validity ended, and
 /// the control socket's errors. A refused key is [`MintError::Refused`].
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no caller until the sealed member list has a `store` kind (https://github.com/gominimal/minimal/issues/2525)"
-    )
+/// [`MintError::RuleNotRead`], [`MintError::BepConfigUnread`],
+/// [`MintError::BepRuleRefused`], [`MintError::BepRuleDenied`] and
+/// [`MintError::BepRuleDiffers`] when `config_dir`, the `min --config-dir`
+/// override, gives a rule that `bep serve` does not hold as given.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each input is a distinct fact of the mint, and the caller holds each one"
 )]
 pub fn mint_store_handle(
     identity: &Identity,
@@ -1354,8 +1470,18 @@ pub fn mint_store_handle(
     key: &ClientKey,
     box_id: &str,
     rule: &StoreRule,
+    config_dir: Option<&Path>,
     now: u64,
 ) -> Result<StoreHandle, MintError> {
+    if let Some(dir) = config_dir {
+        let bep_config = paths::minimal_config_dir_with_override(None).join("config.toml");
+        bep_reads_store_rule(
+            rule,
+            dir,
+            &bep_config,
+            Path::new(crate::config::ORGANIZATION_CONFIG_PATH),
+        )?;
+    }
     let box_id = box_id_hex(box_id)?;
     let node = identity
         .key(bep::keys::Role::Sealing)
@@ -1380,6 +1506,218 @@ pub fn mint_store_handle(
         "minted a store handle"
     );
     Ok(StoreHandle { jws, jti, expiry })
+}
+
+/// A store reference that a `[secret-store-rules]` rule accepted: the grant
+/// the value lands in, and the rule the proxy redeems it under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreGrant {
+    /// The grant: the environment variable the value is for.
+    pub grant: String,
+    /// The accepted rule, in the form the proxy holds it.
+    pub rule: StoreRule,
+}
+
+/// Mints a store handle for each of `grants` for the box `box_id`, and
+/// seals each one as a `store` member (BEP-032, BEP-063). Each grant gets
+/// its own sealed value. [`mint_store_handle`] registers `key` before it
+/// gives a handle, so no handle leaves this process under a key the proxy
+/// does not know. After each mint, one `mint` record goes to the proxy's
+/// audit log (BEP-067). A record that the proxy does not take is a warn
+/// line, and the mint stands.
+///
+/// The box must be registered with the proxy before this runs: the caller
+/// does that, and forgets the box when this fails.
+///
+/// # Errors
+///
+/// As [`mint_store_handle`] says, and [`MintError::Identity`] when the
+/// value does not seal.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each input is a distinct fact of the mint, and the caller holds each one"
+)]
+pub fn mint_store_members(
+    identity: &Identity,
+    identity_path: &Path,
+    control: &mut ControlClient,
+    key: &ClientKey,
+    box_id: &str,
+    grants: &[StoreGrant],
+    config_dir: Option<&Path>,
+    now: u64,
+) -> Result<Vec<Minted>, MintError> {
+    let mut minted = Vec::with_capacity(grants.len());
+    if grants.is_empty() {
+        return Ok(minted);
+    }
+    let box_id = box_id_hex(box_id)?;
+    let identity_error = |error| MintError::Identity {
+        path: identity_path.to_owned(),
+        error,
+    };
+    let node = identity
+        .key(bep::keys::Role::Sealing)
+        .map_err(identity_error)?
+        .kid();
+    for grant in grants {
+        let handle = mint_store_handle(
+            identity,
+            identity_path,
+            control,
+            key,
+            &box_id,
+            &grant.rule,
+            config_dir,
+            now,
+        )?;
+        // The proxy opens every value under its one module, so a store
+        // member is sealed under it too, as `bep serve` reads it.
+        let context = Context {
+            box_id: box_id.clone(),
+            host: node.clone(),
+            module: GITHUB.id.to_owned(),
+            host_set_version: GITHUB.host_set_version,
+            mode: Mode::User,
+            iat: now,
+            expiry: handle.expiry,
+            kid: node.clone(),
+        };
+        let members = MemberList {
+            members: vec![Member {
+                kind: MemberKind::Store,
+                breadth: Breadth::Full,
+                jws: handle.jws,
+                exp: Some(handle.expiry),
+            }],
+            default_owner: None,
+        };
+        let sealed = Zeroizing::new(identity.seal(&context, &members).map_err(identity_error)?);
+        let identifier = format!("{}:{}", grant.rule.store, grant.rule.id);
+        if let Err(error) = control.record_mint(&box_id, &identifier) {
+            tracing::warn!(
+                box_id = %box_id,
+                identifier = %identifier,
+                error = %error,
+                "the proxy did not record the mint"
+            );
+        }
+        tracing::info!(
+            box_id = %box_id,
+            grant = %grant.grant,
+            identifier = %identifier,
+            jti = %handle.jti,
+            "sealed a store handle as a store member"
+        );
+        minted.push(Minted {
+            grant: grant.grant.clone(),
+            sealed,
+            expiry: handle.expiry,
+        });
+    }
+    Ok(minted)
+}
+
+/// Refuses `rule`, read under the `min --config-dir` override `config_dir`,
+/// unless `bep serve` holds the same rule (BEP-032). `bep serve` reads
+/// `bep_config` merged over `organization` and never the override, because
+/// `minvmd` starts it with no `--config-dir`. A handle under a rule that it
+/// does not hold, or holds in another form, is not redeemed as minted. Each
+/// cause has its own error, so the person edits the right file.
+fn bep_reads_store_rule(
+    rule: &StoreRule,
+    config_dir: &Path,
+    bep_config: &Path,
+    organization: &Path,
+) -> Result<(), MintError> {
+    let user = paths::minimal_config_dir_with_override(Some(config_dir)).join("config.toml");
+    if user == bep_config {
+        return Ok(());
+    }
+    let id = rule.id.clone();
+    let module_hosts = crate::config::store_module_hosts();
+    // A file that does not read gives `bep serve` no rules at all.
+    let read = boxes::client::config::read_client_store_rules(
+        bep_config,
+        organization,
+        crate::config::store_deny_set(&module_hosts),
+    )
+    .map_err(|err| MintError::BepConfigUnread {
+        id: id.clone(),
+        file: bep_config.to_owned(),
+        error: err.to_string(),
+    })?;
+    if let Some(err) = &read.organization_error {
+        return Err(MintError::BepConfigUnread {
+            id,
+            file: organization.to_owned(),
+            error: err.to_string(),
+        });
+    }
+    if let Some(refusal) = read.refused.iter().find(|r| r.rule == rule.id) {
+        return Err(MintError::BepRuleRefused {
+            id,
+            refusal: refusal.to_string(),
+        });
+    }
+    let files = if organization.exists() {
+        format!("{} and {}", bep_config.display(), organization.display())
+    } else {
+        bep_config.display().to_string()
+    };
+    let Some(held) = read.rules.get(&rule.id) else {
+        return Err(MintError::RuleNotRead {
+            id,
+            bep_config: bep_config.to_owned(),
+            config_dir: config_dir.to_owned(),
+        });
+    };
+    if held.action == Some(boxes::core::bep::StoreAction::Deny) {
+        return Err(MintError::BepRuleDenied { id, files });
+    }
+    let fields = StoreRule::from_config(&rule.id, held).map_or_else(
+        || vec!["header and basic_auth"],
+        |held| differing_fields(&held, rule),
+    );
+    if fields.is_empty() {
+        return Ok(());
+    }
+    Err(MintError::BepRuleDiffers { id, files, fields })
+}
+
+/// The configuration fields in which `held`, the rule `bep serve` holds,
+/// differs from `rule`, the rule `min` mints under.
+fn differing_fields(held: &StoreRule, rule: &StoreRule) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if held.store != rule.store {
+        fields.push("store");
+    }
+    if held.upstream != rule.upstream {
+        fields.push("upstream");
+    }
+    match (&held.inject, &rule.inject) {
+        (
+            handle::Inject::Header { name, prefix },
+            handle::Inject::Header {
+                name: other_name,
+                prefix: other_prefix,
+            },
+        ) => {
+            if name != other_name {
+                fields.push("header");
+            }
+            if prefix != other_prefix {
+                fields.push("prefix");
+            }
+        }
+        (handle::Inject::BasicAuth { field }, handle::Inject::BasicAuth { field: other }) => {
+            if field != other {
+                fields.push("basic_auth");
+            }
+        }
+        _ => fields.push("header and basic_auth"),
+    }
+    fields
 }
 
 /// Tells the proxy at `path` to forget `box_id` over a new connection, so
@@ -1608,6 +1946,7 @@ mod tests {
             &key,
             BOX_ID,
             &rule(),
+            None,
             NOW,
         )
         .unwrap();
@@ -1641,6 +1980,7 @@ mod tests {
             &key,
             BOX_ID,
             &rule(),
+            None,
             NOW,
         )
         .unwrap();
@@ -1656,6 +1996,7 @@ mod tests {
             &key,
             BOX_ID,
             &rule(),
+            None,
             NOW,
         )
         .unwrap_err();
@@ -1677,6 +2018,7 @@ mod tests {
             &key,
             BOX_ID,
             &rule(),
+            None,
             NOW,
         )
         .unwrap_err();
@@ -1906,6 +2248,7 @@ mod tests {
                 key,
                 BOX_ID,
                 &rule(),
+                None,
                 NOW,
             )
             .unwrap();
@@ -2142,5 +2485,185 @@ mod tests {
         let err = local_client_key_at(&RefusingThenFailing, &path).unwrap_err();
         assert!(matches!(err, MintError::KeyStore(_)), "{err}");
         assert!(clients.read().unwrap().contains(&old.kid()));
+    }
+
+    // BEP-032: `bep serve` reads the default config dir only, so a store
+    // handle under a rule from a `--config-dir` override is minted only when
+    // `bep serve` holds the same rule, and refused with the reason otherwise.
+    #[test]
+    fn a_store_rule_under_config_dir_is_minted_only_when_bep_reads_it() {
+        const NPM: &str = "[secret-store-rules.npm-token]\n\
+                           upstream = [\"registry.npmjs.org\"]\n\
+                           header = \"Authorization\"\n\
+                           prefix = \"Bearer \"\n";
+        let dir = tempfile::tempdir().unwrap();
+        let bep_config = dir.path().join("default/minimal/config.toml");
+        let organization = dir.path().join("etc/config.toml");
+        let over = dir.path().join("over");
+        std::fs::create_dir_all(over.join("minimal")).unwrap();
+        std::fs::write(over.join("minimal/config.toml"), NPM).unwrap();
+        let check = || bep_reads_store_rule(&rule(), &over, &bep_config, &organization);
+
+        // The rule exists only below the override: refused, with the reason.
+        let err = check().unwrap_err();
+        assert!(matches!(err, MintError::RuleNotRead { .. }), "{err}");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "min did not mint a store handle for npm-token: bep serve reads store rules from {}, \
+                 not from --config-dir {}.",
+                bep_config.display(),
+                over.display()
+            )
+        );
+
+        // `bep serve` holds the rule in another form: refused.
+        std::fs::create_dir_all(bep_config.parent().unwrap()).unwrap();
+        std::fs::write(&bep_config, NPM.replace("Bearer ", "Token ")).unwrap();
+        assert!(matches!(check(), Err(MintError::BepRuleDiffers { .. })));
+
+        // `bep serve` holds the same rule: minted.
+        std::fs::write(&bep_config, NPM).unwrap();
+        check().unwrap();
+
+        // An override that names the default config dir is what `bep serve`
+        // reads, whatever the file holds.
+        std::fs::write(&bep_config, "").unwrap();
+        bep_reads_store_rule(
+            &rule(),
+            &dir.path().join("default"),
+            &bep_config,
+            &organization,
+        )
+        .unwrap();
+    }
+
+    /// The checked rule `npm-token` under an override, and the paths of the
+    /// files that `bep serve` reads, all below `dir`.
+    fn bep_files(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        const NPM: &str = "[secret-store-rules.npm-token]\n\
+                           upstream = [\"registry.npmjs.org\"]\n\
+                           header = \"Authorization\"\n\
+                           prefix = \"Bearer \"\n";
+        let bep_config = dir.join("default/minimal/config.toml");
+        let organization = dir.join("etc/config.toml");
+        let over = dir.join("over");
+        std::fs::create_dir_all(over.join("minimal")).unwrap();
+        std::fs::write(over.join("minimal/config.toml"), NPM).unwrap();
+        std::fs::create_dir_all(bep_config.parent().unwrap()).unwrap();
+        (bep_config, organization, over)
+    }
+
+    // BEP-032: a rule that differs in `bep serve`'s file names that file and
+    // each field that differs, not the override.
+    #[test]
+    fn a_rule_that_differs_for_bep_names_its_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bep_config, organization, over) = bep_files(dir.path());
+        std::fs::write(
+            &bep_config,
+            "[secret-store-rules.npm-token]\n\
+             upstream = [\"npm.example.com\"]\n\
+             header = \"Authorization\"\n\
+             prefix = \"Token \"\n",
+        )
+        .unwrap();
+        let err = bep_reads_store_rule(&rule(), &over, &bep_config, &organization).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "min did not mint a store handle for npm-token: the rule for npm-token that bep \
+                 serve reads from {} has a different upstream and prefix. Give both rules the \
+                 same upstream and prefix.",
+                bep_config.display()
+            )
+        );
+    }
+
+    // BEP-032: a `deny` rule in `bep serve`'s file is named as a deny.
+    #[test]
+    fn a_rule_that_bep_denies_says_deny() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bep_config, organization, over) = bep_files(dir.path());
+        std::fs::write(
+            &bep_config,
+            "[secret-store-rules.npm-token]\n\
+             upstream = [\"registry.npmjs.org\"]\n\
+             header = \"Authorization\"\n\
+             prefix = \"Bearer \"\n\
+             action = \"deny\"\n",
+        )
+        .unwrap();
+        let err = bep_reads_store_rule(&rule(), &over, &bep_config, &organization).unwrap_err();
+        assert!(matches!(err, MintError::BepRuleDenied { .. }), "{err}");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "min did not mint a store handle for npm-token: the store rules that bep serve \
+                 reads from {} set action = \"deny\" for npm-token.",
+                bep_config.display()
+            )
+        );
+    }
+
+    // BEP-032: a file that `bep serve` cannot read is named, with why.
+    #[test]
+    fn a_bep_config_that_does_not_read_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bep_config, organization, over) = bep_files(dir.path());
+        std::fs::write(&bep_config, "not toml [").unwrap();
+        let err = bep_reads_store_rule(&rule(), &over, &bep_config, &organization).unwrap_err();
+        let MintError::BepConfigUnread { file, .. } = &err else {
+            panic!("{err}");
+        };
+        assert_eq!(file, &bep_config);
+        let text = err.to_string();
+        assert!(
+            text.starts_with(&format!(
+                "min did not mint a store handle for npm-token: bep serve cannot read {}, \
+                 so it holds no store rules. ",
+                bep_config.display()
+            )),
+            "{text}"
+        );
+        assert!(!text.contains("--config-dir"), "{text}");
+
+        // An organization file that does not read is named in its place.
+        std::fs::write(&bep_config, "").unwrap();
+        std::fs::create_dir_all(organization.parent().unwrap()).unwrap();
+        std::fs::write(&organization, "not toml [").unwrap();
+        let err = bep_reads_store_rule(&rule(), &over, &bep_config, &organization).unwrap_err();
+        let MintError::BepConfigUnread { file, .. } = &err else {
+            panic!("{err}");
+        };
+        assert_eq!(file, &organization);
+    }
+
+    // BEP-032: a rule that `bep serve` refuses when it reads it gives the
+    // refusal, which names the file.
+    #[test]
+    fn a_rule_that_bep_refuses_gives_the_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bep_config, organization, over) = bep_files(dir.path());
+        std::fs::write(
+            &bep_config,
+            "[secret-store-rules.npm-token]\n\
+             upstream = [\"github.com\"]\n\
+             header = \"Authorization\"\n",
+        )
+        .unwrap();
+        let err = bep_reads_store_rule(&rule(), &over, &bep_config, &organization).unwrap_err();
+        let MintError::BepRuleRefused { refusal, .. } = &err else {
+            panic!("{err}");
+        };
+        assert!(
+            refusal.contains(&bep_config.display().to_string()),
+            "{refusal}"
+        );
+        assert!(
+            err.to_string()
+                .starts_with("min did not mint a store handle for npm-token: bep serve refuses its rule for npm-token. "),
+            "{err}"
+        );
     }
 }

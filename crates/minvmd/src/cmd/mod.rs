@@ -167,12 +167,12 @@ pub(crate) fn env_vcpus() -> Option<u8> {
     positive_env(VM_VCPUS_ENV)
 }
 
-/// The persisted resource config from the provider dir. A missing file yields
+/// The persisted resource config from the host dir. A missing file yields
 /// the all-`None` default; a malformed file is logged — so a boot that silently
 /// falls back to built-in defaults is at least diagnosable — and also treated as
 /// the default, so an unreadable file never blocks boot (R9.7).
 pub(crate) fn persisted_resource_config() -> crate::config::ResourceConfig {
-    match crate::config::ResourceConfig::read(&crate::state::provider_dir()) {
+    match crate::config::ResourceConfig::read(&crate::state::host_dir()) {
         Ok(cfg) => cfg,
         Err(e) => {
             tracing::warn!(error = %e, "failed to read persisted resource config; using defaults");
@@ -294,10 +294,10 @@ fn kvm_access_error(err: &std::io::Error) -> anyhow::Error {
 }
 
 /// Returns the path to the VM SSH known_hosts file:
-/// `<provider dir>/known_hosts`.
+/// `<host dir>/known_hosts`.
 #[cfg(minvmd_libkrun)]
 pub(crate) fn default_vm_known_hosts_path() -> std::path::PathBuf {
-    crate::state::provider_dir().join(paths::KNOWN_HOSTS_FILE)
+    crate::state::host_dir().join(paths::KNOWN_HOSTS_FILE)
 }
 
 /// Outcome of the guest boot beacon (R2.4/R2.5): the guest either reached
@@ -394,8 +394,8 @@ pub(crate) fn read_ready_beacon<R: std::io::BufRead>(
                         // Key the known_hosts entry on the alias ssh connects
                         // with (`local-minvmd0` for the default VM,
                         // `<vm>.local-minvmd0` for a named VM) rather than a
-                        // fixed provider-instance name. The path is always
-                        // `<provider dir>/known_hosts`, so a missing alias is
+                        // fixed host name. The path is always
+                        // `<host dir>/known_hosts`, so a missing alias is
                         // a programming error.
                         let host_alias = known_hosts_path.parent().and_then(paths::ssh_host_alias);
                         debug_assert!(
@@ -577,7 +577,7 @@ mod beacon_tests {
 
         let tmp = tempfile::tempdir().unwrap();
         // Default-VM layout: the known_hosts file sits directly in the
-        // provider-instance dir, so the alias is its basename.
+        // host dir, so the alias is its basename.
         let known_hosts_path = tmp
             .path()
             .join("providers")
@@ -613,7 +613,7 @@ mod beacon_tests {
         let tmp = tempfile::tempdir().unwrap();
         // Named-VM layout: the known_hosts file sits in the per-name
         // subdirectory, so the alias is the VM name namespaced under the
-        // provider-instance name.
+        // host name.
         let known_hosts_path = tmp
             .path()
             .join("providers")

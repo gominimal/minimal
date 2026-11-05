@@ -59,7 +59,7 @@
 //! own, so a door's other connections never wait behind a human. Every ask
 //! event appends one line to the same audit log.
 //!
-//! The socket lives beside the daemon's ssh socket in the provider-instance
+//! The socket lives beside the daemon's ssh socket in the host
 //! dir and is created with the same 0700-dir / 0600-socket posture the
 //! bridge socket gets ([`crate::sock`]): only the same user may reach the
 //! box table. The serving shape mirrors [`crate::net::HostGvproxy::spawn`]
@@ -71,7 +71,7 @@
 //! egress gate dropping its frames under the unregistered rule (NET-085).
 //!
 //! The v1 posture, stated: the trust is the uid. The bind tightens the
-//! provider dir to 0700 when the daemon owns it, refuses one it does not
+//! host dir to 0700 when the daemon owns it, refuses one it does not
 //! own, and sets the socket to 0600; every connection's peer uid is then
 //! checked against the daemon's own (`SO_PEERCRED` on Linux, `getpeereid`
 //! on macOS) and a foreign uid is dropped unanswered. Within the
@@ -110,14 +110,14 @@ use minimald_rpc::{
 use crate::box_registry::{AllocationError, BoxRegistry, ClientBoxSpec};
 use crate::net::answerer::AnswererStatus;
 
-/// The control socket's file name inside the provider-instance dir, beside
+/// The control socket's file name inside the host dir, beside
 /// `paths::SSH_SOCK_FILE`. Deliberately not in the `paths` crate: that crate
 /// is shared with consumers that have no box table, and this name only
 /// means something where `minvmd` supervises one.
 pub const CONTROL_SOCK_FILE: &str = "control.sock";
 
 /// The in-VM daemon's control channel's file name, beside the control
-/// socket in the same provider-instance dir: the door the port reports
+/// socket in the same host dir: the door the port reports
 /// (NET-138) arrive on, bridged to the guest over vsock at
 /// [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`] — the one channel from inside
 /// the microVM that answers, because a report the grant refused must be
@@ -133,7 +133,7 @@ pub const GUEST_CONTROL_SOCK_FILE: &str = "guest-control.sock";
 pub const GUEST_REPORT_SOCK_ENV: &str = "MINVMD_GUEST_REPORT_SOCK";
 
 /// The audit log the daemon appends its host-side copy of each recorded
-/// admission to, relative to the provider dir the sockets live in — the
+/// admission to, relative to the host dir the sockets live in — the
 /// daemon's own audit log, beside the state it keeps for the VM it
 /// serves.
 const AUDIT_LOG_RELATIVE_PATH: &str = "audit/box-admissions.log";
@@ -160,7 +160,7 @@ fn unix_now_secs() -> u64 {
 /// decides what a report may record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ControlDoor {
-    /// The host's control socket, in the provider dir beside the ssh
+    /// The host's control socket, in the host dir beside the ssh
     /// socket: registrations, withdrawals, and both read-only verbs.
     Host,
     /// The in-VM daemon's control channel: the port reports alone. Bound
@@ -409,8 +409,15 @@ pub(crate) fn decide_publish(
 /// read on the serving thread — because that is the pattern the status
 /// read already serves under.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+///
+/// The second cell is the host ports the proxy serves on (NET-154): the
+/// port the start handed, and the preferred port in front of it once the
+/// reclaim watcher took that port back ([`crate::net::proxy_reclaim`]).
 #[derive(Clone, Default)]
-pub struct ProxyPublishStatus(Arc<Mutex<Option<(u16, ProxyDownCause)>>>);
+pub struct ProxyPublishStatus(
+    Arc<Mutex<Option<(u16, ProxyDownCause)>>>,
+    Arc<Mutex<Vec<u16>>>,
+);
 
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 impl ProxyPublishStatus {
@@ -446,6 +453,57 @@ impl ProxyPublishStatus {
         if *cell == Some((port, ProxyDownCause::PublishUnconfirmed)) {
             *cell = None;
         }
+    }
+
+    /// Clear any cause recorded on `port` (NET-022): the held-port watcher
+    /// published the port, so the proxy serves there now. A cause on another
+    /// port stays, because this publish does not answer it.
+    pub(crate) fn clear_down(&self, port: u16) {
+        let mut cell = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cell.as_ref().is_some_and(|(down, _)| *down == port) {
+            *cell = None;
+        }
+    }
+
+    /// Record that the proxy serves on `port` and on no other host port:
+    /// the port the start handed, once the publish decision brought the VM
+    /// up.
+    pub(crate) fn set_serving(&self, port: u16) {
+        *self
+            .1
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = vec![port];
+    }
+
+    /// Record that the proxy also serves on its preferred port `preferred`
+    /// (NET-150): the reclaim watcher published it beside the substitute,
+    /// so the preferred port goes first and the substitute stays.
+    pub(crate) fn add_preferred(&self, preferred: u16) {
+        let mut ports = self
+            .1
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ports.retain(|port| *port != preferred);
+        ports.insert(0, preferred);
+    }
+
+    /// Every host port the proxy serves on, the preferred first: the
+    /// answer to [`BoxControlRequest::ProxyPorts`]. Empty before the start
+    /// recorded a port, and for a start that never brought the proxy up.
+    /// Empty too while a down cause is recorded ([`Self::down`]): an
+    /// unconfirmed publish or a port held after the start serves nothing
+    /// the host can vouch for.
+    pub(crate) fn serving_ports(&self) -> Vec<u16> {
+        if self.down().is_some() {
+            return Vec::new();
+        }
+        self.1
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// The proxy-down fact to serve beside the read-only verb's answer
@@ -500,11 +558,11 @@ impl BepListening {
     }
 }
 
-/// Resolve the control socket's path: `<provider dir>/control.sock`, the
+/// Resolve the control socket's path: `<host dir>/control.sock`, the
 /// dir the CLI resolves the ssh socket under, so the client finds both by
 /// the same rule.
 pub fn resolve_control_sock() -> std::io::Result<PathBuf> {
-    Ok(crate::state::provider_dir().join(CONTROL_SOCK_FILE))
+    Ok(crate::state::host_dir().join(CONTROL_SOCK_FILE))
 }
 
 /// Bind the control socket at `sock_path` and serve box control requests
@@ -535,7 +593,7 @@ pub fn spawn(
     crate::sock::prepare_socket_dir(&sock_path)?;
     if let Some(parent) = sock_path.parent() {
         crate::sock::restrict_owned_dir(parent)?;
-        crate::sock::verify_provider_dir_ownership(parent)?;
+        crate::sock::verify_host_dir_ownership(parent)?;
     }
     crate::sock::remove_stale_socket(&sock_path)?;
     let listener = UnixListener::bind(&sock_path)?;
@@ -556,6 +614,7 @@ pub fn spawn(
                 ControlDoor::Host,
                 &audit_path,
                 MAX_CONTROL_CONNECTIONS,
+                &HostIpReconcileNudge::default(),
             )
         })
 }
@@ -614,12 +673,18 @@ pub fn spawn_guest_reports_door_with_proxy(
     crate::sock::prepare_socket_dir(&sock_path)?;
     if let Some(parent) = sock_path.parent() {
         crate::sock::restrict_owned_dir(parent)?;
-        crate::sock::verify_provider_dir_ownership(parent)?;
+        crate::sock::verify_host_dir_ownership(parent)?;
     }
     crate::sock::remove_stale_socket(&sock_path)?;
     let listener = UnixListener::bind(&sock_path)?;
     crate::sock::enforce_socket_permissions(&sock_path)?;
     let audit_path = audit_log_path(&sock_path);
+    // The in-VM daemon's RPC bridge sits beside the control socket, as the
+    // stop path finds it (NET-085).
+    let reconcile = spawn_host_ip_reconcile(
+        boxes.clone(),
+        control_sock_path.with_file_name(paths::SSH_SOCK_FILE),
+    )?;
     tracing::info!(
         sock = %sock_path.display(),
         vsock_port = minimald_rpc::VM_HOST_BOX_REPORT_PORT,
@@ -638,6 +703,7 @@ pub fn spawn_guest_reports_door_with_proxy(
                 ControlDoor::GuestReports,
                 &audit_path,
                 MAX_CONTROL_CONNECTIONS,
+                &reconcile,
             )
         })
         // The door's bound path is the handle the caller pairs with the
@@ -676,6 +742,7 @@ fn accept_loop(
     door: ControlDoor,
     audit_path: &Path,
     cap: usize,
+    reconcile: &HostIpReconcileNudge,
 ) {
     let connections = Arc::new(crate::box_registry::ConnectionGauge::default());
     let order = Arc::new(ApplyOrder::default());
@@ -705,6 +772,7 @@ fn accept_loop(
                 let bep_listening = bep_listening.clone();
                 let audit_path = audit_path.to_path_buf();
                 let order = Arc::clone(&order);
+                let reconcile = reconcile.clone();
                 if let Err(error) = std::thread::Builder::new()
                     .name("minvmd-control-conn".to_string())
                     .spawn(move || {
@@ -718,6 +786,7 @@ fn accept_loop(
                             door,
                             &audit_path,
                             &order,
+                            &reconcile,
                         ) {
                             tracing::debug!(error = %error, "box control connection failed");
                         }
@@ -745,6 +814,7 @@ fn serve_connection(
     door: ControlDoor,
     audit_path: &Path,
     order: &Arc<ApplyOrder>,
+    reconcile: &HostIpReconcileNudge,
 ) -> std::io::Result<()> {
     let mut stream = stream;
     stream.set_read_timeout(Some(REGISTER_READ_TIMEOUT))?;
@@ -752,7 +822,7 @@ fn serve_connection(
     // Check the peer's credentials: only the daemon's own uid may reach
     // the box table. The 0600 socket mode is the primary gate; this is
     // defense in depth against a mis-moded file or a group- or
-    // world-writable provider directory. The kernel captures the peer's
+    // world-writable host directory. The kernel captures the peer's
     // credentials at connect time, so a descriptor a same-uid connector
     // passes on still carries that connector's uid.
     //
@@ -768,9 +838,10 @@ fn serve_connection(
         }
     };
     let root_peer = is_root_peer(uid);
-    // The guest door also admits the VM user's uid (BEP-047): the VMM child
-    // dials it as `minimal-vmm`. The host door keeps its check, and the
-    // door, not the peer, decides which verbs a connection can ask for.
+    // The guest door also admits the VM user's uid (formerly BEP-047,
+    // gominimal/inbox#1184): the VMM child dials it as `minimal-vmm`. The
+    // host door keeps its check, and the door, not the peer, decides which
+    // verbs a connection can ask for.
     let checked = match door {
         ControlDoor::GuestReports => check_guest_peer_uid(uid),
         ControlDoor::Host => check_peer_uid(uid),
@@ -785,6 +856,15 @@ fn serve_connection(
         // answer, nothing to log past the connection level.
         return Ok(());
     };
+    // The read-only mirror-collisions verb (T126) is answered before the
+    // shared verbs parse, on the host door only. A guest asking for it
+    // falls through to the parse refusal, as any verb it may not ask does.
+    if door == ControlDoor::Host
+        && !root_peer
+        && let Some(reply) = mirror_collisions_reply(&line, boxes)
+    {
+        return write_json_line(&mut stream, &reply);
+    }
     let request = match parse_request(&line) {
         Ok(request) => request,
         Err(error) => {
@@ -793,6 +873,15 @@ fn serve_connection(
             return write_reply(&mut stream, &BoxControlReply::Error { error });
         }
     };
+    // A box event on the guest door asks the host_ip reconcile to read the
+    // in-VM daemon's session list (NET-085). The nudge carries nothing the
+    // guest says: the list it reads decides. Root in the VM controls that
+    // list, so it can move the union, but only within the rules host clients
+    // admitted, never past them. A false `running` can restore a set-aside
+    // box's rules, and a box no client admitted gains nothing.
+    if door == ControlDoor::GuestReports && is_guest_box_event(&request) {
+        reconcile.nudge();
+    }
     if root_peer && !root_may_ask(&request) {
         tracing::warn!(
             peer_uid = uid,
@@ -800,6 +889,11 @@ fn serve_connection(
              answerer or cancel a release"
         );
         return Ok(());
+    }
+    // A listen notice is the fixed, size-bounded message (NET-138): a line
+    // past its bound is refused before it reaches the mirror.
+    if let Some(reply) = oversized_listen_notice(&request, &line) {
+        return write_reply(&mut stream, &reply);
     }
     // The ask verbs hold their connection open for as long as the ask or
     // the subscription lives (NET-045), so each runs on a thread of its
@@ -916,6 +1010,173 @@ fn serve_connection(
     served
 }
 
+/// Whether a guest-door request is a box event: a box created, or a
+/// listener in a box opened or closed. A box that stops or is reaped
+/// closes its listeners, so each such end reaches the reconcile soon. The
+/// reads and the ask and decision reports are not box events.
+fn is_guest_box_event(request: &BoxControlRequest) -> bool {
+    matches!(
+        request,
+        BoxControlRequest::MintBoxId(_)
+            | BoxControlRequest::ListenNotice(_)
+            | BoxControlRequest::AdmitPort(_)
+            | BoxControlRequest::WithdrawPort(_)
+    )
+}
+
+/// How often the `host_ip` reconcile reads the in-VM daemon's session list
+/// with no box event to prompt it (NET-085).
+const HOST_IP_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The least time between two reconcile reads, so a guest that floods its
+/// door with box events costs one session list a second at most.
+const HOST_IP_RECONCILE_MIN_GAP: Duration = Duration::from_secs(1);
+
+/// The connect and the exchange bounds of one session-list read.
+const GUEST_LIST_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const GUEST_LIST_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The guest door's handle on the `host_ip` reconcile thread
+/// ([`spawn_host_ip_reconcile`]). A nudge asks for one reconcile soon. Nudges
+/// that arrive before it runs fold into it. The default handle is inert:
+/// the host door's.
+#[derive(Debug, Clone, Default)]
+struct HostIpReconcileNudge(Option<std::sync::mpsc::SyncSender<()>>);
+
+impl HostIpReconcileNudge {
+    fn nudge(&self) {
+        if let Some(sender) = &self.0 {
+            // A full channel is a reconcile already asked for.
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "a full or closed channel needs no second nudge"
+            )]
+            let _ = sender.try_send(());
+        }
+    }
+}
+
+/// Starts the thread that keeps the resident `host_ip` boxes in line with
+/// the in-VM daemon (NET-085): on each nudge from the guest door and every
+/// [`HOST_IP_RECONCILE_INTERVAL`], it reads the daemon's session list over
+/// `guest_rpc_sock` and hands it to
+/// [`BoxRegistry::reconcile_host_ip_boxes`]. A read that fails changes
+/// nothing: a failed read is no evidence that a box ended.
+fn spawn_host_ip_reconcile(
+    boxes: BoxRegistry,
+    guest_rpc_sock: PathBuf,
+) -> std::io::Result<HostIpReconcileNudge> {
+    spawn_host_ip_reconcile_with(boxes, HOST_IP_RECONCILE_INTERVAL, move || {
+        read_guest_box_states(&guest_rpc_sock)
+    })
+}
+
+/// [`spawn_host_ip_reconcile`] with its timer and its session-list read
+/// given, so a test can drive the thread without an in-VM daemon.
+fn spawn_host_ip_reconcile_with<R>(
+    boxes: BoxRegistry,
+    interval: Duration,
+    mut read_guest: R,
+) -> std::io::Result<HostIpReconcileNudge>
+where
+    R: FnMut() -> anyhow::Result<std::collections::BTreeMap<boxes::SessionId, boxes::BoxState>>
+        + Send
+        + 'static,
+{
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("minvmd-host-ip-reconcile".to_string())
+        .spawn(move || {
+            let mut last: Option<std::time::Instant> = None;
+            let mut failing = false;
+            // The mark the last pass that read the list took.
+            let mut previous: Option<crate::box_registry::HostIpAdmitMark> = None;
+            // A pass dropped a box a client admitted since the pass before
+            // it, which can be a resume still starting in the guest. One
+            // more pass runs soon, so a resumed box rejoins without waiting
+            // for the timer. The dropped box holds no rules until then.
+            let mut follow_up = false;
+            loop {
+                let wait = if follow_up {
+                    HOST_IP_RECONCILE_MIN_GAP
+                } else {
+                    interval
+                };
+                follow_up = false;
+                let trigger = match receiver.recv_timeout(wait) {
+                    Ok(()) => crate::box_registry::HostIpReconcileTrigger::BoxEvent,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        crate::box_registry::HostIpReconcileTrigger::Timer
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                };
+                if let Some(at) = last
+                    && let Some(wait) = HOST_IP_RECONCILE_MIN_GAP.checked_sub(at.elapsed())
+                {
+                    std::thread::sleep(wait);
+                }
+                while receiver.try_recv().is_ok() {}
+                last = Some(std::time::Instant::now());
+                if !boxes.holds_host_ip_boxes() {
+                    continue;
+                }
+                // Taken before the read, so a box a client admits while the
+                // list is in flight is not dropped on a list that predates it.
+                let mark = boxes.host_ip_admit_mark();
+                let since = previous;
+                match read_guest() {
+                    Ok(guest) => {
+                        failing = false;
+                        previous = Some(mark);
+                        let outcome = boxes.reconcile_host_ip_boxes(&guest, mark, trigger);
+                        follow_up = !outcome.dropped.is_empty()
+                            && since.is_none_or(|since| {
+                                boxes.host_ip_admitted_after(&outcome.dropped, since)
+                            });
+                    }
+                    Err(error) if !failing => {
+                        failing = true;
+                        tracing::warn!(
+                            error = %format!("{error:#}"),
+                            trigger = %trigger,
+                            "could not read the in-VM daemon's session list; the host_ip \
+                             boxes' egress rules stay as they are until a read succeeds"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::debug!(error = %format!("{error:#}"), "session list read failed again");
+                    }
+                }
+            }
+        })?;
+    Ok(HostIpReconcileNudge(Some(sender)))
+}
+
+/// The in-VM daemon's sessions, as each one's state.
+fn read_guest_box_states(
+    guest_rpc_sock: &Path,
+) -> anyhow::Result<std::collections::BTreeMap<boxes::SessionId, boxes::BoxState>> {
+    let listing = crate::rpc_client::call_oneshot_blocking::<minimald_rpc::ListSessions>(
+        guest_rpc_sock,
+        (),
+        GUEST_LIST_CONNECT_TIMEOUT,
+        GUEST_LIST_RPC_TIMEOUT,
+        None,
+    )?;
+    Ok(guest_box_states(&listing))
+}
+
+/// The state of each session in a listing.
+fn guest_box_states(
+    listing: &minimald_rpc::ListSessionsResponse,
+) -> std::collections::BTreeMap<boxes::SessionId, boxes::BoxState> {
+    listing
+        .sessions
+        .iter()
+        .map(|entry| (entry.id, entry.status))
+        .collect()
+}
+
 /// Wait for the peer's close on a guest-door connection whose reply was
 /// already written: read until EOF — the reporter closing its end, which
 /// it does once it has the reply — or until the drain bound ends a client
@@ -1000,8 +1261,23 @@ fn serve_request(
             let reply = registration_reply(boxes, answerer, order, request);
             write_reply(stream, &reply)
         }
+        (BoxControlRequest::Withdraw(request), ControlDoor::Host)
+            if host_ip_withdrawal(&request).is_some() =>
+        {
+            let reply = order.apply(|| withdraw_host_ip_name(boxes, &request));
+            write_reply(stream, &reply)
+        }
         (BoxControlRequest::Withdraw(request), ControlDoor::Host) => {
-            let reply = order.apply(|| withdraw_box(boxes, answerer, request));
+            let reply = order.apply(|| {
+                let (name, switch_address) = (request.name.clone(), request.switch_address);
+                let reply = withdraw_box(boxes, answerer, request);
+                // The box is gone: its audit window ends, and the count of
+                // the records it suppressed lands now.
+                if matches!(reply, BoxControlReply::Addresses(_)) {
+                    flush_guest_audit(audit_path, &name, GuestAuditKey::Switch(switch_address));
+                }
+                reply
+            });
             write_reply(stream, &reply)
         }
         (BoxControlRequest::ResumeBox(request), ControlDoor::Host) => {
@@ -1030,6 +1306,14 @@ fn serve_request(
             };
             write_reply(stream, &reply)
         }
+        // BOX-002: the in-VM daemon asks for the id of the box it is about
+        // to create, and files the box's record under the answer. No
+        // ticket: the answer changes no row, no liveness and no
+        // attribution. A box with a row takes the id its registration
+        // minted, so the record and the row name one id.
+        (BoxControlRequest::MintBoxId(request), ControlDoor::GuestReports) => {
+            write_reply(stream, &mint_box_id_reply(boxes, &request))
+        }
         // A read of the host's own proxy, like the row read: no ticket.
         // The proxy runs on the host, so the in-VM daemon asks here before
         // its DNS gate answers a steered name with the proxy's address
@@ -1048,8 +1332,59 @@ fn serve_request(
             write_reply(stream, &reply)
         }
         (BoxControlRequest::ReleaseBoxName(request), ControlDoor::Host) => {
-            let reply = order.apply(|| release_box_name(boxes, &request.name, request.session_id));
+            let reply = order.apply(|| {
+                let reply = release_box_name(boxes, &request.name, request.session_id);
+                // A box with no switch ends with its hold: its audit window,
+                // filed by its box id, ends here too (NET-046).
+                if let Some(session_id) = request.session_id {
+                    flush_guest_audit(audit_path, &request.name, GuestAuditKey::Box(session_id));
+                }
+                reply
+            });
             write_reply(stream, &reply)
+        }
+        // A `host_ip` box's policy changes no zone table, so it takes no
+        // ticket. Its held name answers its node's address while it is
+        // resident (NET-129), but the answerer reads the holds and the
+        // resident set together each time it builds its view, so the order
+        // of a hold and an admit cannot change the answer. Each change pings
+        // the answerer. Only the host's door serves these verbs: the guest
+        // must never say what a marked frame may reach (NET-085), nor that
+        // its box is running.
+        (BoxControlRequest::AdmitHostIpBox(request), ControlDoor::Host) => {
+            let resident = boxes.admit_host_ip_box_with_lane(
+                request.session_id,
+                request.egress.as_ref(),
+                request.credentialed_upstream,
+            );
+            write_reply(
+                stream,
+                &BoxControlReply::HostIpBox {
+                    session_id: request.session_id,
+                    resident,
+                },
+            )
+        }
+        (BoxControlRequest::RetireHostIpBox(request), ControlDoor::Host) => {
+            // Name the box before it leaves the resident set, for the
+            // suppressed-count line its audit window can still owe.
+            let box_name = no_switch_box_name(boxes, request.session_id)
+                .unwrap_or_else(|| request.session_id.to_string());
+            boxes.retire_host_ip_box(request.session_id, request.end);
+            // A host-address box has no switch: its audit window, filed by
+            // its box id, ends with it (NET-046).
+            flush_guest_audit(
+                audit_path,
+                &box_name,
+                GuestAuditKey::Box(request.session_id),
+            );
+            write_reply(
+                stream,
+                &BoxControlReply::HostIpBox {
+                    session_id: request.session_id,
+                    resident: false,
+                },
+            )
         }
         (BoxControlRequest::AnswererStatus, ControlDoor::Host) => {
             // The read-only status answers both host facts the CLI's
@@ -1058,13 +1393,26 @@ fn serve_request(
             // reached one, the cause that names why the hostname proxy
             // is not serving. Two facts, one reply: the answerer's state
             // decides the zone-answerer row and the native-DNS probe,
-            // the sibling cause the proxy's own line.
+            // the sibling cause the proxy's own line. The answerer's state
+            // reads `starting` until this node's first publish is
+            // acknowledged (or the node gives up on it past its bound), so
+            // an activation never reads a registration in flight as a
+            // failure.
             let reply = BoxControlReply::Status(minimald_rpc::AnswererStatusReply {
-                answerer: answerer.get(),
+                answerer: answerer.reported(),
                 proxy_down: proxy_publish
                     .down()
                     .map(|(port, cause)| minimald_rpc::ProxyDown { port, cause }),
             });
+            write_reply(stream, &reply)
+        }
+        (BoxControlRequest::ProxyPorts, ControlDoor::Host) => {
+            // Every host port the hostname proxy serves on (NET-154), the
+            // preferred first: `min ls` lists each one, so a person reads
+            // where to point a browser while the proxy serves on two.
+            let reply = BoxControlReply::ProxyPorts {
+                proxy_ports: proxy_publish.serving_ports(),
+            };
             write_reply(stream, &reply)
         }
         (BoxControlRequest::ReadRow(request), ControlDoor::Host) => {
@@ -1080,6 +1428,20 @@ fn serve_request(
         }
         (BoxControlRequest::WithdrawPort(request), ControlDoor::GuestReports) => {
             let reply = order.apply(|| withdraw_report(boxes, &request));
+            write_reply(stream, &reply)
+        }
+        (BoxControlRequest::ListenNotice(notice), ControlDoor::GuestReports) => {
+            let reply = order.apply(|| listen_notice_reply(boxes, notice));
+            write_reply(stream, &reply)
+        }
+        // The audit reports touch no row, so they take no ticket: each is
+        // a line in the host's audit log, under the per-box cap.
+        (BoxControlRequest::ReportExposeDecision(request), ControlDoor::GuestReports) => {
+            let reply = audit_expose_decision(boxes, audit_path, &request);
+            write_reply(stream, &reply)
+        }
+        (BoxControlRequest::ReportRefusedEgress(request), ControlDoor::GuestReports) => {
+            let reply = audit_refused_egress(boxes, audit_path, &request);
             write_reply(stream, &reply)
         }
         (BoxControlRequest::ReleaseAnswerer, ControlDoor::Host) => {
@@ -1122,6 +1484,215 @@ fn serve_request(
     }
 }
 
+/// The refusal of a `listen_notice` line longer than
+/// [`minimald_rpc::ListenNotice::MAX_LINE_BYTES`], or `None` for any
+/// other line.
+fn oversized_listen_notice(request: &BoxControlRequest, line: &str) -> Option<BoxControlReply> {
+    if !matches!(request, BoxControlRequest::ListenNotice(_))
+        || line.len() <= minimald_rpc::ListenNotice::MAX_LINE_BYTES
+    {
+        return None;
+    }
+    tracing::warn!(
+        bytes = line.len(),
+        max_bytes = minimald_rpc::ListenNotice::MAX_LINE_BYTES,
+        "refused a listen notice longer than its fixed size"
+    );
+    Some(BoxControlReply::Error {
+        error: format!(
+            "a listen notice is at most {} bytes; this one is {}",
+            minimald_rpc::ListenNotice::MAX_LINE_BYTES,
+            line.len()
+        ),
+    })
+}
+
+/// The guest infrastructure ports this VM host provisioned for the guest's
+/// own services, read from this daemon's own configuration and never from
+/// a guest report: the vsock ports it bridges (the in-VM daemon's RPC
+/// bridge, the boot marker, the timekeep bridge, the report door and the
+/// telemetry port), the zone answerer's port, the range probe's port, and
+/// the node row's admitted ports, which hold the hostname proxy's port the
+/// host assigned before boot.
+pub(crate) fn guest_infrastructure_ports(boxes: &BoxRegistry) -> std::collections::BTreeSet<u16> {
+    let vsock = [
+        crate::sock::VSOCK_BRIDGE_PORT,
+        crate::cmd::VSOCK_MARKER_PORT,
+        crate::timekeep::VSOCK_TIMEKEEP_PORT,
+        minimald_rpc::VM_HOST_BOX_REPORT_PORT,
+        crate::guest_telemetry::VSOCK_TELEMETRY_PORT,
+    ];
+    let mut ports: std::collections::BTreeSet<u16> = vsock
+        .into_iter()
+        .filter_map(|port| u16::try_from(port).ok())
+        .collect();
+    ports.insert(crate::net::answerer::DEFAULT_ANSWERER_PORT);
+    ports.insert(switch::loopback::RANGE_PROBE_PORT);
+    if let Some(node) = boxes.table().by_source(boxes.subnet().daemon_ip().octets()) {
+        ports.extend(node.admitted_ports().iter().copied());
+    }
+    ports
+}
+
+/// The guest door's answer to a listen notice (NET-138): the node's mirror
+/// binds or undoes the port at the node's own address. The mirror refuses a
+/// listening notice for one of [`guest_infrastructure_ports`] on this
+/// daemon's own authority, whatever the notice says. The outcome is the mirror's
+/// audit line; the reply is [`BoxControlReply::PortRecorded`] when the
+/// mirror holds the notice, and [`BoxControlReply::Error`] when it refused.
+fn listen_notice_reply(boxes: &BoxRegistry, notice: minimald_rpc::ListenNotice) -> BoxControlReply {
+    use crate::box_registry::MirrorOutcome;
+    let recorded = BoxControlReply::PortRecorded {
+        port: notice.port,
+        proto: IpProto::Tcp,
+    };
+    let error = match boxes.mirror_notice(notice) {
+        MirrorOutcome::Bound | MirrorOutcome::Waiting | MirrorOutcome::Unbound => {
+            return recorded;
+        }
+        MirrorOutcome::Collided => format!(
+            "port {} is already in use on the host; it is not opened",
+            notice.port
+        ),
+        MirrorOutcome::RefusedInfrastructure => format!(
+            "port {} is used by the VM's own services; it is not opened on the host",
+            notice.port
+        ),
+        MirrorOutcome::Capped => format!(
+            "port {} is not opened on the host: the VM sent too many listen notices, \
+             or holds the most ports the host opens ({})",
+            notice.port,
+            crate::box_registry::MIRRORED_BINDS_CAP
+        ),
+        MirrorOutcome::NoHostAddressBox => format!(
+            "port {} is not opened on the host: no host-address box runs in the VM",
+            notice.port
+        ),
+        MirrorOutcome::BindFailed => {
+            format!("port {} could not be opened on the host", notice.port)
+        }
+        MirrorOutcome::PortZero => "port 0 is not opened on the host".to_string(),
+    };
+    BoxControlReply::Error { error }
+}
+
+/// The mint verb's answer (BOX-002): the id of the box the in-VM daemon
+/// is about to create. A request that names a switch address takes the id
+/// the box's registration minted for its row there, so the record and the
+/// row name one id. A request that names none takes a fresh mint. A named
+/// address that holds no box row is refused: the box's registration is
+/// gone, and a fresh id would name a box no row stands for.
+fn mint_box_id_reply(
+    boxes: &BoxRegistry,
+    request: &minimald_rpc::MintBoxIdRequest,
+) -> BoxControlReply {
+    let host_ip_id = request
+        .host_ip_name
+        .as_deref()
+        .filter(|_| request.switch_address.is_none())
+        .and_then(|name| boxes.host_ip_id_for(name).map(|id| (name, id)));
+    let (box_id, source) = match (request.switch_address, host_ip_id) {
+        // BEP-082: a `host_ip` box has no row. Its registration minted its
+        // id under its name, and the proxy seals its grants under that id,
+        // so the record takes it too. The id goes to one create only, as a
+        // row's id does.
+        (None, Some((name, id))) => {
+            let box_id = minimald_rpc::BoxId::from_bytes(id);
+            if !claim_row_box_id(boxes, box_id, request.create_token.as_deref()) {
+                tracing::warn!(
+                    host_ip_name = %name,
+                    %box_id,
+                    "refused a box id mint: the host_ip registration's id already went to \
+                     an in-VM create"
+                );
+                return BoxControlReply::Error {
+                    error: format!("the box registered as {name} already has a session"),
+                };
+            }
+            (box_id, "host_ip registration")
+        }
+        (None, None) => (crate::bep_attach::mint_record_box_id(), "fresh"),
+        (Some(switch_address), _) => {
+            let row_id = boxes
+                .table()
+                .by_source(switch_address.octets())
+                .filter(|record| !record.is_task_row())
+                .map(|record| minimald_rpc::BoxId::from_bytes(record.box_id()));
+            let Some(box_id) = row_id else {
+                tracing::warn!(
+                    %switch_address,
+                    "refused a box id mint: no box row stands at the switch address"
+                );
+                return BoxControlReply::Error {
+                    error: format!("no box is registered at {switch_address}"),
+                };
+            };
+            // A row's id goes to one create only. The address comes from
+            // the in-VM daemon's client, so an ask from another create is
+            // one that names another box's address. The in-VM daemon sends
+            // one token on every retry of a create, so a retry after a lost
+            // or late reply gets the same id. Another token is refused.
+            if !claim_row_box_id(boxes, box_id, request.create_token.as_deref()) {
+                tracing::warn!(
+                    %switch_address,
+                    %box_id,
+                    "refused a box id mint: the row's id already went to an in-VM create"
+                );
+                return BoxControlReply::Error {
+                    error: format!("the box registered at {switch_address} already has a session"),
+                };
+            }
+            (box_id, "registration")
+        }
+    };
+    tracing::info!(
+        box_id = %box_id,
+        switch_address = ?request.switch_address,
+        host_ip_name = ?request.host_ip_name,
+        source,
+        "minted the box id for an in-VM create"
+    );
+    BoxControlReply::BoxIdMinted {
+        minted_box_id: box_id,
+    }
+}
+
+/// The row ids that already went to an in-VM create (BOX-002), each with
+/// the token of the create that took it. Each id is a UUIDv7 that one
+/// registration minted, so one map serves every registry in the process.
+static CLAIMED_ROW_BOX_IDS: std::sync::Mutex<
+    std::collections::BTreeMap<minimald_rpc::BoxId, Option<String>>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Claims `box_id`, a row's id or a `host_ip` registration's id, for the
+/// in-VM create that `token` names. `true` for the first ask, and for a
+/// repeat ask that carries the same token: a retry of one create. `false`
+/// when another create took the id, or when the ask or the claim carries
+/// no token, because then nothing proves the two asks are one create. The
+/// map keeps only ids whose row still stands or that a live `host_ip`
+/// registration name answers, so it never outgrows the registry.
+fn claim_row_box_id(boxes: &BoxRegistry, box_id: minimald_rpc::BoxId, token: Option<&str>) -> bool {
+    let standing: std::collections::BTreeSet<minimald_rpc::BoxId> = boxes
+        .table()
+        .rows()
+        .iter()
+        .map(|record| minimald_rpc::BoxId::from_bytes(record.box_id()))
+        .collect();
+    let mut claimed = CLAIMED_ROW_BOX_IDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    claimed.retain(|id, _| standing.contains(id) || boxes.host_ip_id_is_named(id.to_bytes()));
+    match claimed.entry(box_id) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(token.map(str::to_owned));
+            true
+        }
+        std::collections::btree_map::Entry::Occupied(entry) => {
+            token.is_some() && entry.get().as_deref() == token
+        }
+    }
+}
+
 /// Register a box in its door's apply order and build the reply: the one
 /// registration path the one-shot and the held verb share.
 fn registration_reply(
@@ -1130,6 +1701,11 @@ fn registration_reply(
     order: &Arc<ApplyOrder>,
     request: RegisterBoxRequest,
 ) -> BoxControlReply {
+    // A `host_ip` box leaves the VM from the node's own address (BEP-082):
+    // it gets a box id and no address, so the answerer is not asked.
+    if request.host_ip {
+        return order.apply(move || register_host_ip_box(boxes, &request));
+    }
     // The published address is asked of the answerer before the
     // ticket: the allocation can wait out a handover, and no turn
     // is held across it.
@@ -1185,9 +1761,23 @@ fn resume_reply(
         Err(error) => return refused(error),
     };
     let claim = boxes.begin_registration(&name);
-    let allocated = match allocate_box_address(answerer, &name) {
-        Ok(allocated) => allocated,
-        Err(reply) => return reply,
+    // A box created at the 127.0.0.1 interim (the host could not bind the
+    // box range then) keeps it: the answerer records no address for it, so
+    // asking it now would hand a range address once the host binds the
+    // range, and the resume would refuse it as moved. `resumable` checked
+    // the presented address against the creation's.
+    let interim = request.loopback_address == std::net::Ipv4Addr::LOCALHOST;
+    // A box created at a range address asks to keep it. A restarted
+    // answerer holds no record of a dormant box, and where the host cannot
+    // bind the range now it would hand a fresh ask the 127.0.0.1 interim,
+    // which the resume refuses as moved.
+    let allocated = if interim {
+        std::net::Ipv4Addr::LOCALHOST
+    } else {
+        match allocate_box_address_keeping(answerer, &name, Some(request.loopback_address)) {
+            Ok(allocated) => allocated,
+            Err(reply) => return reply,
+        }
     };
     order.apply(move || {
         match boxes.resume_client_box(
@@ -1205,9 +1795,10 @@ fn resume_reply(
                 task_addresses: record.task_addrs().to_vec(),
             }),
             Err(error) => {
-                let released = boxes.release_unless_owned(&claim, || {
-                    answerer.release_address(&name);
-                });
+                let released = !interim
+                    && boxes.release_unless_owned(&claim, || {
+                        answerer.release_address(&name);
+                    });
                 tracing::info!(
                     address_released = released,
                     box = %name,
@@ -1400,6 +1991,8 @@ fn request_verb(request: &BoxControlRequest) -> &'static str {
         BoxControlRequest::Withdraw(_) => "withdraw",
         BoxControlRequest::HoldBoxName(_) => "hold_box_name",
         BoxControlRequest::ReleaseBoxName(_) => "release_box_name",
+        BoxControlRequest::AdmitHostIpBox(_) => "admit_host_ip_box",
+        BoxControlRequest::RetireHostIpBox(_) => "retire_host_ip_box",
         BoxControlRequest::AnswererStatus => "answerer_status",
         BoxControlRequest::AdmitPort(_) => "admit_port",
         BoxControlRequest::WithdrawPort(_) => "withdraw_port",
@@ -1412,6 +2005,11 @@ fn request_verb(request: &BoxControlRequest) -> &'static str {
         BoxControlRequest::ResumeBox(_) => "resume_box",
         BoxControlRequest::RowStanding(_) => "row_standing",
         BoxControlRequest::ProxyListening => "proxy_listening",
+        BoxControlRequest::ProxyPorts => "proxy_ports",
+        BoxControlRequest::MintBoxId(_) => "mint_box_id",
+        BoxControlRequest::ReportExposeDecision(_) => "report_expose_decision",
+        BoxControlRequest::ReportRefusedEgress(_) => "report_refused_egress",
+        BoxControlRequest::ListenNotice(_) => "listen_notice",
     }
 }
 
@@ -1575,6 +2173,85 @@ fn read_request_line(stream: &mut UnixStream) -> std::io::Result<Option<String>>
     }
 }
 
+/// The host control socket's reads that the shared verb set does not carry.
+/// The request line of each is its verb alone, as
+/// `{"verb":"mirror_collisions"}`.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(tag = "verb", rename_all = "snake_case")]
+pub enum HostReadRequest {
+    /// The node's mirrored ports that collided with a holder on the host
+    /// (NET-138). The reply is a [`MirrorCollisionsReply`].
+    MirrorCollisions,
+}
+
+/// The reply to [`HostReadRequest::MirrorCollisions`]: the node's mirrored
+/// ports that collided with a holder on the host, in ascending order. It
+/// carries ports only, and no address, path or box name.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct MirrorCollisionsReply {
+    pub mirror_collisions: Vec<u16>,
+}
+
+/// How long [`read_mirror_collisions`] waits for the whole exchange.
+pub const MIRROR_COLLISIONS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The reply to a request line that asks for the mirror collisions, or
+/// `None` for any other line.
+fn mirror_collisions_reply(line: &str, boxes: &BoxRegistry) -> Option<MirrorCollisionsReply> {
+    match serde_json_lenient::from_str::<HostReadRequest>(line) {
+        Ok(HostReadRequest::MirrorCollisions) => {
+            let reply = MirrorCollisionsReply {
+                mirror_collisions: boxes.node_mirror().collisions(),
+            };
+            tracing::debug!(
+                collisions = reply.mirror_collisions.len(),
+                "answered the mirror collisions read"
+            );
+            Some(reply)
+        }
+        Err(_) => None,
+    }
+}
+
+fn write_json_line(stream: &mut UnixStream, reply: &impl serde::Serialize) -> std::io::Result<()> {
+    let mut line = serde_json_lenient::to_string(reply).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("control reply did not serialize: {error}"),
+        )
+    })?;
+    line.push('\n');
+    stream.write_all(line.as_bytes())
+}
+
+/// Reads the node's collided mirror ports from the VM host daemon's control
+/// socket at `sock_path`, for the host CLI.
+///
+/// `None` when the socket is not there, the exchange fails or passes
+/// [`MIRROR_COLLISIONS_TIMEOUT`], or the daemon predates the verb and
+/// answers with a refusal. The caller then prints nothing for it.
+pub async fn read_mirror_collisions(sock_path: &Path) -> Option<Vec<u16>> {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+    let exchange = async {
+        let mut stream = tokio::net::UnixStream::connect(sock_path).await.ok()?;
+        let mut line = serde_json_lenient::to_string(&HostReadRequest::MirrorCollisions).ok()?;
+        line.push('\n');
+        stream.write_all(line.as_bytes()).await.ok()?;
+        let mut reply = String::new();
+        tokio::io::BufReader::new(&mut stream)
+            .read_line(&mut reply)
+            .await
+            .ok()?;
+        serde_json_lenient::from_str::<MirrorCollisionsReply>(reply.trim())
+            .ok()
+            .map(|reply| reply.mirror_collisions)
+    };
+    tokio::time::timeout(MIRROR_COLLISIONS_TIMEOUT, exchange)
+        .await
+        .ok()
+        .flatten()
+}
+
 fn parse_request(line: &str) -> Result<BoxControlRequest, serde_json_lenient::Error> {
     serde_json_lenient::from_str(line)
 }
@@ -1631,6 +2308,8 @@ fn register_box(
                 loopback_address = %record.loopback_addr(),
                 task_addresses = ?record.task_addrs(),
                 egress = %declared_egress,
+                network = "own_ip",
+                switch_address_allocated = true,
                 "registered box with the VM host daemon; addresses allocated"
             );
             BoxControlReply::Registered(RegisteredBox {
@@ -1673,6 +2352,40 @@ fn register_box(
     }
 }
 
+/// Register a `host_ip` box (BEP-082): mint its id, with no switch address
+/// and no row in the address table, and answer with the id alone. The id
+/// takes the collision check an own-address box's id takes. A held
+/// registration holds nothing here: the box has no row for a lease to
+/// withdraw, so the reply is written and the connection closes.
+fn register_host_ip_box(boxes: &BoxRegistry, request: &RegisterBoxRequest) -> BoxControlReply {
+    match boxes.register_host_ip_box(&request.name) {
+        Ok(id) => {
+            tracing::info!(
+                box = %request.name,
+                box_id = %crate::bep_attach::BoxIdText(&id),
+                network = "host_ip",
+                switch_address_allocated = false,
+                credentialed_upstream = request.credentialed_upstream.is_some(),
+                "registered box with the VM host daemon; a host_ip box gets an id and no address"
+            );
+            BoxControlReply::BoxIdMinted {
+                minted_box_id: minimald_rpc::BoxId::from_bytes(id),
+            }
+        }
+        Err(error) => {
+            tracing::debug!(
+                box = %request.name,
+                network = "host_ip",
+                error = %error,
+                "box registration refused"
+            );
+            BoxControlReply::Error {
+                error: error.to_string(),
+            }
+        }
+    }
+}
+
 /// Ask the machine's answerer for box `name`'s published address, or the
 /// refusal to answer with when it hands none out. The wait can run as long
 /// as an answerer handover, so it runs before the registration takes its
@@ -1681,7 +2394,19 @@ fn allocate_box_address(
     answerer: &AnswererStatus,
     name: &str,
 ) -> Result<std::net::Ipv4Addr, BoxControlReply> {
-    answerer.allocate(name).map_err(|reason| {
+    // None: a fresh registration has no earlier address to keep. Only a
+    // resume knows the address its box was created at.
+    allocate_box_address_keeping(answerer, name, None)
+}
+
+/// [`allocate_box_address`] for a resumed box created at `keep`, which the
+/// answerer hands back while no other box holds it.
+fn allocate_box_address_keeping(
+    answerer: &AnswererStatus,
+    name: &str,
+    keep: Option<std::net::Ipv4Addr>,
+) -> Result<std::net::Ipv4Addr, BoxControlReply> {
+    answerer.allocate_keeping(name, keep).map_err(|reason| {
         tracing::warn!(
             box = %name,
             %reason,
@@ -1751,16 +2476,71 @@ fn withdraw_box(
     }
 }
 
-/// Hold a `host_ip` box's name in the host's zone with no row behind it:
-/// the interim that answers the name NODATA until the node's bind mirror
-/// lands. `held` true either way — a name the table already holds is the
-/// goal state, not a refusal.
+/// The id a withdrawal names when it withdraws a `host_ip` registration
+/// (BEP-082): a `host_ip` box has no address pair, so its creator sends
+/// the unspecified pair and the id the registration handed back.
+fn host_ip_withdrawal(request: &WithdrawBoxRequest) -> Option<minimald_rpc::BoxId> {
+    (request.switch_address.is_unspecified() && request.loopback_address.is_unspecified())
+        .then_some(request.box_id)
+        .flatten()
+}
+
+/// Withdraw the `host_ip` registration name an activation that failed
+/// after it registered leaves behind, so a later box under the name takes
+/// a fresh id. The reply echoes the unspecified pair, as a row
+/// withdrawal echoes its own. A name that no longer answers the id is the
+/// goal state already holding: the box retired, or a later registration
+/// took the name.
+fn withdraw_host_ip_name(boxes: &BoxRegistry, request: &WithdrawBoxRequest) -> BoxControlReply {
+    if let Some(id) = host_ip_withdrawal(request) {
+        let box_id = id.to_string();
+        if boxes.withdraw_host_ip_name(&request.name, id.to_bytes()) {
+            tracing::info!(
+                box = %request.name,
+                box_id = %box_id,
+                network = "host_ip",
+                "withdrew the host_ip box's registration name; a later box under the name \
+                 takes a fresh id"
+            );
+        } else {
+            tracing::debug!(
+                box = %request.name,
+                box_id = %box_id,
+                "no host_ip registration name answers the withdrawn id; already withdrawn"
+            );
+        }
+    }
+    BoxControlReply::Addresses(BoxAddresses {
+        switch_address: request.switch_address,
+        loopback_address: request.loopback_address,
+    })
+}
+
+/// Hold a `host_ip` box's name in the host's zone with no row behind it,
+/// recorded against the node row for `session_id`. While that session is
+/// a resident `host_ip` box and the node's binds are mirrored, the name
+/// answers the node's address (NET-129). Otherwise it answers NODATA
+/// (NET-128). `held` true either way — a name the table already holds is
+/// the goal state, not a refusal.
 fn hold_box_name(
     boxes: &BoxRegistry,
     name: &str,
     session_id: Option<boxes::SessionId>,
 ) -> BoxControlReply {
     boxes.hold_box_name(name, session_id);
+    let running = session_id.is_some_and(|session| {
+        boxes
+            .table()
+            .host_ip_boxes()
+            .iter()
+            .any(|rules| rules.session_id() == session)
+    });
+    tracing::debug!(
+        box = %name,
+        running,
+        node_address = ?boxes.node_mirror().mirrored_address(),
+        "held a host-address box's name against the node row"
+    );
     BoxControlReply::NameHeld {
         name: name.to_string(),
         held: true,
@@ -1926,7 +2706,7 @@ fn source_text(source: PortReportSource) -> &'static str {
 }
 
 /// The audit copy's path, derived from the control socket's own dir: the
-/// provider-instance dir is this daemon's state for the VM it serves, so
+/// host dir is this daemon's state for the VM it serves, so
 /// the log lives beside the sockets and the persisted state it speaks for.
 fn audit_log_path(sock_path: &Path) -> PathBuf {
     match sock_path.parent() {
@@ -1984,18 +2764,534 @@ fn append_audit_copy(
     );
 }
 
+/// How long one box's audit window lasts: the guest's expose decision
+/// reports for a box write at most [`GUEST_AUDIT_RECORDS_PER_WINDOW`]
+/// records in it, and its refused egress reports as many again.
+const GUEST_AUDIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The most records each kind of the guest's audit reports (expose
+/// decisions, refused egress) writes for one box in one
+/// [`GUEST_AUDIT_WINDOW`]. Each kind has its own budget, so a flood of
+/// refused flows never hides a later expose decision. Past it a report is
+/// counted, not written, and one line with the count precedes the next
+/// window's first record, or lands when the box is withdrawn. So a hostile
+/// box cannot fill the host's disk through its reports.
+const GUEST_AUDIT_RECORDS_PER_WINDOW: u32 = 30;
+
+/// The most refused flows one box's window remembers to fold repeats.
+const GUEST_AUDIT_FLOWS_PER_WINDOW: usize = 256;
+
+/// The most boxes the audit cap tracks at once, across every door in the
+/// process. Past it the windows that ended are pruned.
+const GUEST_AUDIT_TRACKED: usize = 1024;
+
+/// One box's audit window: when it opened, how many records of each kind
+/// it wrote, how many it suppressed, and the refused flows it already
+/// recorded.
+#[derive(Debug)]
+struct GuestAuditWindow {
+    opened: std::time::Instant,
+    expose_written: u32,
+    egress_written: u32,
+    suppressed: u64,
+    flows: HashSet<String>,
+}
+
+/// The key one box's audit window is filed under: the row's switch
+/// address, or the box id for a box with no switch. Every box with no switch
+/// shares the node's own address, so that address is never a key: one such
+/// box would spend the cap of all of them (NET-046).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum GuestAuditKey {
+    /// A box with a row, by the row's switch address.
+    Switch(Ipv4Addr),
+    /// A box with no switch, by its box id.
+    Box(minimald_rpc::BoxId),
+}
+
+impl GuestAuditKey {
+    /// The switch address, for a box with a row.
+    fn switch_address(self) -> Option<Ipv4Addr> {
+        match self {
+            Self::Switch(switch_address) => Some(switch_address),
+            Self::Box(_) => None,
+        }
+    }
+
+    /// The box id, for a box with no switch.
+    fn box_id(self) -> Option<minimald_rpc::BoxId> {
+        match self {
+            Self::Switch(_) => None,
+            Self::Box(box_id) => Some(box_id),
+        }
+    }
+}
+
+/// The audit windows, by the audit log they write to and the box's key. The
+/// log is part of the key so that two doors in one process (the tests)
+/// never share a cap.
+static GUEST_AUDIT_WINDOWS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(PathBuf, GuestAuditKey), GuestAuditWindow>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// What the per-box cap says about one report.
+#[derive(Debug, PartialEq, Eq)]
+enum GuestAuditAdmission {
+    /// Write the record, after a line counting the `suppressed` records of
+    /// the window that ended, when there were any.
+    Write { suppressed: u64 },
+    /// The same refused flow is already recorded in this window: no record,
+    /// because a flow is recorded once, never per frame.
+    Repeat,
+    /// The window's cap is reached: no record, and the count goes up.
+    Suppressed,
+}
+
+/// Decides one report against its box's window at `now`. `flow` is the
+/// refused flow's identity, or `None` for a report that is not a flow (an
+/// expose decision, each of which is its own record).
+fn admit_guest_audit(
+    audit_path: &Path,
+    key: GuestAuditKey,
+    flow: Option<String>,
+    now: std::time::Instant,
+) -> GuestAuditAdmission {
+    let mut windows = GUEST_AUDIT_WINDOWS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let key = (audit_path.to_path_buf(), key);
+    if windows.len() >= GUEST_AUDIT_TRACKED && !windows.contains_key(&key) {
+        windows.retain(|_, window| {
+            now.duration_since(window.opened) < GUEST_AUDIT_WINDOW || window.suppressed > 0
+        });
+    }
+    let window = windows.entry(key).or_insert_with(|| GuestAuditWindow {
+        opened: now,
+        expose_written: 0,
+        egress_written: 0,
+        suppressed: 0,
+        flows: HashSet::new(),
+    });
+    let mut carried = 0;
+    if now.duration_since(window.opened) >= GUEST_AUDIT_WINDOW {
+        carried = window.suppressed;
+        *window = GuestAuditWindow {
+            opened: now,
+            expose_written: 0,
+            egress_written: 0,
+            suppressed: 0,
+            flows: HashSet::new(),
+        };
+    }
+    if let Some(flow) = &flow
+        && window.flows.contains(flow)
+    {
+        return GuestAuditAdmission::Repeat;
+    }
+    // Each kind spends its own budget: refused flows never use up the
+    // records an expose decision needs.
+    let written = if flow.is_some() {
+        &mut window.egress_written
+    } else {
+        &mut window.expose_written
+    };
+    if *written >= GUEST_AUDIT_RECORDS_PER_WINDOW {
+        window.suppressed = window.suppressed.saturating_add(1);
+        return GuestAuditAdmission::Suppressed;
+    }
+    *written += 1;
+    if let Some(flow) = flow
+        && window.flows.len() < GUEST_AUDIT_FLOWS_PER_WINDOW
+    {
+        window.flows.insert(flow);
+    }
+    GuestAuditAdmission::Write {
+        suppressed: carried,
+    }
+}
+
+/// The host's copy of one dynamic ingress decision the in-VM daemon
+/// reported (NET-046): the box named from the host's own row, never from
+/// text the guest sent.
+#[derive(serde::Serialize)]
+struct ExposeDecisionAudit {
+    /// When the report was recorded: Unix seconds.
+    ts: u64,
+    /// Always `expose_decision`.
+    event: &'static str,
+    /// Who asserted this record: always `guest`. The in-VM daemon reported
+    /// it, and the host did not observe it.
+    reported_by: &'static str,
+    /// The box the decision was about, from the row, or from what the
+    /// host holds under the box id for a box with no switch.
+    #[serde(rename = "box")]
+    box_name: String,
+    /// The row key the report named; absent for a box with no switch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    switch_address: Option<Ipv4Addr>,
+    /// The box id the report named a box with no switch by; absent when
+    /// the row key named the box.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    box_id: Option<String>,
+    /// The port the box asked to publish.
+    port: u16,
+    /// The decision the box's `dynamic_ingress` setting made.
+    decision: boxes::DynamicIngress,
+    /// Who decided it.
+    decided_by: minimald_rpc::ExposeDecidedBy,
+    /// What became of the request.
+    outcome: minimald_rpc::ExposeDecisionOutcome,
+}
+
+/// The host's copy of one refused own-address egress flow the in-VM
+/// daemon reported.
+#[derive(serde::Serialize)]
+struct RefusedEgressAudit {
+    /// When the report was recorded: Unix seconds.
+    ts: u64,
+    /// Always `egress_refused`.
+    event: &'static str,
+    /// Who asserted this record: always `guest`. The in-VM daemon reported
+    /// it, and the host did not observe it.
+    reported_by: &'static str,
+    /// The box whose flow was refused, from the row.
+    #[serde(rename = "box")]
+    box_name: String,
+    /// The row key the report named.
+    switch_address: Ipv4Addr,
+    /// The destination the flow was sent to, when it had one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    destination: Option<std::net::SocketAddrV4>,
+    /// The flow's protocol, clamped.
+    proto: String,
+    /// The rule that refused it, clamped.
+    rule: String,
+}
+
+/// The line that counts the records a box's audit window suppressed.
+#[derive(serde::Serialize)]
+struct SuppressedAudit {
+    /// When the line was written: Unix seconds.
+    ts: u64,
+    /// Always `audit_suppressed`.
+    event: &'static str,
+    /// The box whose records were suppressed.
+    #[serde(rename = "box")]
+    box_name: String,
+    /// The box's row key; absent for a box with no switch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    switch_address: Option<Ipv4Addr>,
+    /// The box id, for a box with no switch; absent when the row key names
+    /// the box.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    box_id: Option<String>,
+    /// How many records the cap suppressed in the window that ended.
+    suppressed: u64,
+}
+
+/// Writes the line that counts `suppressed` records for the box, when
+/// there are any.
+fn append_suppressed_audit(audit_path: &Path, box_name: &str, key: GuestAuditKey, suppressed: u64) {
+    if suppressed == 0 {
+        return;
+    }
+    tracing::warn!(
+        box = %box_name,
+        switch_address = ?key.switch_address(),
+        box_id = ?key.box_id(),
+        suppressed,
+        "the box's audit reports passed the host's cap; records were suppressed"
+    );
+    append_audit_line(
+        audit_path,
+        &SuppressedAudit {
+            ts: unix_now_secs(),
+            event: "audit_suppressed",
+            box_name: box_name.to_string(),
+            switch_address: key.switch_address(),
+            box_id: key.box_id().map(|box_id| box_id.simple()),
+            suppressed,
+        },
+    );
+}
+
+/// Writes the suppressed-count line when the admission carries one, and
+/// says whether the record itself is to be written.
+fn take_guest_audit(
+    audit_path: &Path,
+    box_name: &str,
+    key: GuestAuditKey,
+    admission: &GuestAuditAdmission,
+) -> bool {
+    match admission {
+        GuestAuditAdmission::Write { suppressed } => {
+            append_suppressed_audit(audit_path, box_name, key, *suppressed);
+            true
+        }
+        GuestAuditAdmission::Repeat | GuestAuditAdmission::Suppressed => false,
+    }
+}
+
+/// Ends a box's audit window when the box is gone: a withdrawn row, by its
+/// switch address, or a box with no switch, by its box id. The window is
+/// forgotten, so a later box under the same key starts a fresh one. The
+/// count of the records it suppressed is written now: a box that stops
+/// reporting opens no later window, so without this flush that count is
+/// never written, and the window, which the trim keeps while it holds a
+/// count, stays in the table.
+fn flush_guest_audit(audit_path: &Path, box_name: &str, key: GuestAuditKey) {
+    let window = GUEST_AUDIT_WINDOWS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&(audit_path.to_path_buf(), key));
+    if let Some(window) = window {
+        append_suppressed_audit(audit_path, box_name, key, window.suppressed);
+    }
+}
+
+/// Clamps a guest-sent text to [`minimald_rpc::REFUSED_EGRESS_TEXT_MAX`]
+/// bytes of printable ASCII: the guest names the protocol and the rule,
+/// and the host log takes nothing longer or stranger.
+fn clamp_guest_text(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(minimald_rpc::REFUSED_EGRESS_TEXT_MAX)
+        .collect()
+}
+
+/// Serves the in-VM daemon's expose decision report (NET-046): one record
+/// in the host's audit log. The box is named from the row at the report's
+/// switch address, or, for a box with no switch, from what the host holds
+/// under the report's box id ([`no_switch_box_name`]). A report that names
+/// no box the host holds is refused and writes nothing.
+fn audit_expose_decision(
+    boxes: &BoxRegistry,
+    audit_path: &Path,
+    request: &minimald_rpc::ExposeDecisionReport,
+) -> BoxControlReply {
+    // The key the per-box cap is filed under: the row's switch address, or
+    // the box id for a box with no switch. Boxes with no switch all share
+    // the node's own address, so that address cannot keep their caps apart.
+    let (box_name, cap_key, box_id) = match (request.switch_address, request.box_id) {
+        (Some(switch_address), _) => {
+            let Some(record) = boxes.table().by_source(switch_address.octets()) else {
+                tracing::debug!(
+                    %switch_address,
+                    "refused an expose decision report at an address no row holds"
+                );
+                return BoxControlReply::Error {
+                    error: format!("no box is registered at {switch_address}"),
+                };
+            };
+            tracing::debug!(
+                box = %record.name(),
+                %switch_address,
+                key = "switch_address",
+                "found the expose decision report's box by its switch address"
+            );
+            (
+                record.name().to_string(),
+                GuestAuditKey::Switch(switch_address),
+                None,
+            )
+        }
+        (None, Some(box_id)) => {
+            let Some(box_name) = no_switch_box_name(boxes, box_id) else {
+                tracing::debug!(
+                    %box_id,
+                    "refused an expose decision report for a box id the host holds nothing for"
+                );
+                return BoxControlReply::Error {
+                    error: format!("no box with id {box_id} is known to the VM host"),
+                };
+            };
+            tracing::debug!(
+                box = %box_name,
+                %box_id,
+                key = "box_id",
+                "found the expose decision report's box by its box id"
+            );
+            (box_name, GuestAuditKey::Box(box_id), Some(box_id))
+        }
+        (None, None) => {
+            tracing::debug!("refused an expose decision report that names no box");
+            return BoxControlReply::Error {
+                error: "the expose decision report names no box".to_string(),
+            };
+        }
+    };
+    let admission = admit_guest_audit(audit_path, cap_key, None, std::time::Instant::now());
+    let audited = take_guest_audit(audit_path, &box_name, cap_key, &admission);
+    if audited {
+        tracing::info!(
+            box = %box_name,
+            switch_address = ?request.switch_address,
+            box_id = ?box_id,
+            port = request.port,
+            decision = ?request.decision,
+            decided_by = ?request.decided_by,
+            outcome = ?request.outcome,
+            reported_by = "guest",
+            "recorded the box's expose decision in the host audit log"
+        );
+        append_audit_line(
+            audit_path,
+            &ExposeDecisionAudit {
+                ts: unix_now_secs(),
+                event: "expose_decision",
+                reported_by: "guest",
+                box_name,
+                switch_address: request.switch_address,
+                // The 32 lowercase hex form every audit record spells a box
+                // id in ([`AskAudit::with_facts`]).
+                box_id: box_id.map(|box_id| box_id.simple()),
+                port: request.port,
+                decision: request.decision,
+                decided_by: request.decided_by,
+                outcome: request.outcome,
+            },
+        );
+    }
+    BoxControlReply::Audited { audited }
+}
+
+/// The name of the box a report with no switch address names by `box_id`
+/// (NET-046): a row filed under the id, a name held for it (a named
+/// `host_ip` box), or a resident `host_ip` box, which has no name the host
+/// holds and is named by its id. `None` when the host holds nothing under
+/// the id.
+fn no_switch_box_name(boxes: &BoxRegistry, box_id: minimald_rpc::BoxId) -> Option<String> {
+    let table = boxes.table();
+    if let Some(record) = table
+        .rows()
+        .into_iter()
+        .find(|record| record.box_id() == box_id.to_bytes())
+    {
+        return Some(record.name().to_string());
+    }
+    if let Some((name, _)) = boxes
+        .held_name_owners()
+        .into_iter()
+        .find(|(_, owner)| *owner == Some(box_id))
+    {
+        return Some(name);
+    }
+    table
+        .host_ip_boxes()
+        .iter()
+        .any(|rules| rules.session_id() == box_id)
+        .then(|| box_id.to_string())
+}
+
+/// Serves the in-VM daemon's refused egress report: one record per refused
+/// flow in the host's audit log, under the box's cap, the box named from
+/// the row at the report's switch address. A repeat of a flow already
+/// recorded in the window writes nothing. A report at no row is refused.
+fn audit_refused_egress(
+    boxes: &BoxRegistry,
+    audit_path: &Path,
+    request: &minimald_rpc::RefusedEgressReport,
+) -> BoxControlReply {
+    let Some(record) = boxes.table().by_source(request.switch_address.octets()) else {
+        tracing::debug!(
+            switch_address = %request.switch_address,
+            "refused a refused-egress report at an address no row holds"
+        );
+        return BoxControlReply::Error {
+            error: format!("no box is registered at {}", request.switch_address),
+        };
+    };
+    let proto = clamp_guest_text(&request.proto);
+    let rule = clamp_guest_text(&request.rule);
+    let destination = request
+        .destination
+        .map_or_else(|| "none".to_string(), |d| d.to_string());
+    let flow = format!("{destination}/{proto}/{rule}");
+    let admission = admit_guest_audit(
+        audit_path,
+        GuestAuditKey::Switch(request.switch_address),
+        Some(flow),
+        std::time::Instant::now(),
+    );
+    let audited = take_guest_audit(
+        audit_path,
+        record.name(),
+        GuestAuditKey::Switch(request.switch_address),
+        &admission,
+    );
+    if audited {
+        tracing::info!(
+            box = %record.name(),
+            %destination,
+            %proto,
+            %rule,
+            reported_by = "guest",
+            "recorded the box's refused egress in the host audit log"
+        );
+        append_audit_line(
+            audit_path,
+            &RefusedEgressAudit {
+                ts: unix_now_secs(),
+                event: "egress_refused",
+                reported_by: "guest",
+                box_name: record.name().to_string(),
+                switch_address: request.switch_address,
+                destination: request.destination,
+                proto,
+                rule,
+            },
+        );
+    }
+    BoxControlReply::Audited { audited }
+}
+
+/// The size the host-side audit log may reach before it rotates (NET-046).
+/// The per-box caps bound the rate a guest can report at, not the total, so
+/// the file itself is bounded too: the append that would carry it past this
+/// size first renames it to `box-admissions.log.1`, replacing the generation
+/// rotated before it, and starts a fresh file. One kept generation bounds
+/// the log at about twice this size. The same bound and shape as the in-VM
+/// daemon's own audit log (`minimald`'s `audit::MAX_LOG_BYTES`).
+const MAX_AUDIT_LOG_BYTES: u64 = 1024 * 1024;
+
+/// Serialises every append to the host-side audit log. The ask threads and
+/// the doors append concurrently, and a rotation is a size read, a rename
+/// and a reopen: two writers deciding it at once could each rotate, and the
+/// second rename would replace the full generation the first one kept.
+static AUDIT_APPEND_LOCK: Mutex<()> = Mutex::new(());
+
 /// Append one JSON line to the daemon's owner-only audit log: the shared
 /// half of the admission copy and the ask records.
 fn append_audit_line(path: &Path, line: &impl serde::Serialize) {
+    append_audit_line_capped(path, line, MAX_AUDIT_LOG_BYTES);
+}
+
+/// [`append_audit_line`] with the rotation size passed in, so a test can
+/// rotate the log without writing a mebibyte.
+fn append_audit_line_capped(path: &Path, line: &impl serde::Serialize, cap: u64) {
     let Ok(json) = serde_json_lenient::to_string(line) else {
         // A plain struct of primitives serializes; this arm is unreachable
         // in practice and costs nothing to keep honest.
         tracing::warn!("an audit line did not serialize");
         return;
     };
+    let bytes = format!("{json}\n");
+    // A poisoned lock guards no data: the append it serialised failed or
+    // panicked, and the next append is still safe to make.
+    let _guard = AUDIT_APPEND_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let written = (|| -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+        }
+        let len = match std::fs::metadata(path) {
+            Ok(meta) => meta.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error),
+        };
+        if audit_log_rotates(len, bytes.len() as u64, cap) {
+            std::fs::rename(path, audit_log_rotated_path(path))?;
         }
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -2004,9 +3300,9 @@ fn append_audit_line(path: &Path, line: &impl serde::Serialize) {
             .append(true)
             .mode(0o600)
             .open(path)?;
-        // One write per line: the ask threads append concurrently, and a
-        // line written in two pieces could interleave with another's.
-        file.write_all(format!("{json}\n").as_bytes())
+        // One write per line: a line written in two pieces could interleave
+        // with another writer's outside this process.
+        file.write_all(bytes.as_bytes())
     })();
     if let Err(error) = written {
         tracing::warn!(
@@ -2015,6 +3311,22 @@ fn append_audit_line(path: &Path, line: &impl serde::Serialize) {
             "an audit line could not be appended to the host-side audit log"
         );
     }
+}
+
+/// Whether a log already holding `len` bytes rotates before an `incoming`
+/// line lands: only when the line would carry it past `cap`, and never when
+/// it is empty, so a single line longer than the cap goes into a fresh file
+/// rather than rotating on every append.
+fn audit_log_rotates(len: u64, incoming: u64, cap: u64) -> bool {
+    len > 0 && len.saturating_add(incoming) > cap
+}
+
+/// The one rotated generation's path beside the live log:
+/// `box-admissions.log.1`.
+fn audit_log_rotated_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".1");
+    path.with_file_name(name)
 }
 
 /// Run one ask verb's connection on a thread of its own (NET-045): the ask
@@ -2723,6 +4035,21 @@ fn record_ask_answer(
                 dismissed = ended.dismissed,
                 "recorded the attached client's answer to a pending ask; the first answer wins"
             );
+            // A yes admits the port into the row (NET-045), so it gets the
+            // same admission record an allow-decided expose does (NET-046).
+            if let minimald_rpc::AskAdmitOutcome::Admitted { port, proto, .. } = ended.outcome {
+                append_audit_line(
+                    audit_path,
+                    &AdmittedPortAudit {
+                        ts: unix_now_secs(),
+                        box_name: ended.facts.name.clone(),
+                        switch_address: ended.facts.switch_address,
+                        port,
+                        proto,
+                        source: PortReportSource::Ask,
+                    },
+                );
+            }
             if let Some(offered) = &ended.offered_next {
                 log_and_audit_offer(audit_path, offered);
             }
@@ -2939,8 +4266,9 @@ mod tests {
     use std::sync::OnceLock;
     use std::time::Duration;
 
-    /// BEP-047: the guest door admits the `minimal-vmm` uid the VMM child
-    /// dials as, and the daemon's own; the host door admits only its own.
+    /// Formerly BEP-047 (gominimal/inbox#1184): the guest door admits the
+    /// `minimal-vmm` uid the VMM child dials as, and the daemon's own; the
+    /// host door admits only its own.
     #[test]
     fn guest_door_admits_the_vmm_uid_and_the_host_door_does_not() {
         assert!(guest_peer_admitted(1000, 1000, Some(990)));
@@ -2972,6 +4300,77 @@ mod tests {
     /// The default switch subnet, the plan the registries below are built
     /// for.
     const SUBNET: SwitchSubnet = switch::DEFAULT_SUBNET;
+
+    /// NET-046: the host-side audit log is bounded. Past its cap it rotates
+    /// to one kept generation, so neither file grows past the cap however
+    /// many records a guest reports, and the newest records are the ones
+    /// kept.
+    #[test]
+    fn host_audit_log_rotates_within_its_bound_and_keeps_the_newest_records() {
+        #[derive(serde::Serialize)]
+        struct Line {
+            seq: u64,
+        }
+        fn seqs(path: &Path) -> Vec<u64> {
+            std::fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .map(|line| {
+                    serde_json_lenient::from_str::<serde_json_lenient::Value>(line)
+                        .expect("each kept line is whole JSON")["seq"]
+                        .as_u64()
+                        .expect("seq")
+                })
+                .collect()
+        }
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join(AUDIT_LOG_RELATIVE_PATH);
+        let rotated = audit_log_rotated_path(&path);
+        let cap = 512;
+        let total = 1000;
+        for seq in 0..total {
+            append_audit_line_capped(&path, &Line { seq }, cap);
+            assert!(
+                std::fs::metadata(&path).unwrap().len() <= cap,
+                "the live log stays within its cap"
+            );
+            if let Ok(meta) = std::fs::metadata(&rotated) {
+                assert!(
+                    meta.len() <= cap,
+                    "the kept generation stays within its cap"
+                );
+            }
+        }
+        let files: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            files.len(),
+            2,
+            "one rotated generation is kept, never more: {files:?}"
+        );
+        let kept: Vec<u64> = seqs(&rotated).into_iter().chain(seqs(&path)).collect();
+        assert_eq!(
+            kept.last().copied(),
+            Some(total - 1),
+            "the newest record is kept"
+        );
+        let first = kept[0];
+        assert_eq!(
+            kept,
+            (first..total).collect::<Vec<_>>(),
+            "the kept records are the newest, contiguous and in order"
+        );
+        assert!(
+            kept.len() as u64 * 12 > cap,
+            "a rotation keeps at least a full generation: {}",
+            kept.len()
+        );
+        // The host's own records still land after rotation.
+        append_audit_line_capped(&path, &Line { seq: total }, cap);
+        assert_eq!(seqs(&path).last().copied(), Some(total));
+    }
 
     /// A process-global log capture. The server serves on its own OS
     /// thread, so the thread-local captures the crate's other tests install
@@ -3120,10 +4519,13 @@ mod tests {
                      reply for {port}/{proto:?}"
                 )
             }
-            other @ BoxControlReply::RowStanding { .. } => {
+            other @ (BoxControlReply::RowStanding { .. } | BoxControlReply::HostIpBox { .. }) => {
                 panic!("a box verb is never answered with a row-standing read, got {other:?}")
             }
-            other @ BoxControlReply::ProxyListening { .. } => {
+            other @ (BoxControlReply::ProxyListening { .. }
+            | BoxControlReply::ProxyPorts { .. }
+            | BoxControlReply::Audited { .. }
+            | BoxControlReply::BoxIdMinted { .. }) => {
                 panic!("a box verb is never answered with a proxy-listening read, got {other:?}")
             }
             BoxControlReply::AnswererRelease { detail, .. } => {
@@ -3135,6 +4537,255 @@ mod tests {
                      reply for {name:?} (held: {held})"
                 )
             }
+        }
+    }
+
+    /// BEP-082: a `host_ip` registration is answered with a box id and no
+    /// address. Each registration is a new creation with its own id, and
+    /// none of them puts a row in the address table. A held registration
+    /// holds no lease: the reply is written and the connection closes.
+    /// BOX-163 parity: a second registration of a live name is refused with
+    /// the held-name text, and after the box retires the name registers
+    /// again under a fresh id.
+    #[test]
+    fn host_ip_box_registration_mints_a_creation_unique_id() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let host_ip = |hold: bool| RegisterBoxRequest {
+            host_ip: true,
+            hold,
+            credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
+            task_slots: minimald_rpc::TASK_SLOTS_PER_BOX,
+            ..box_request("agent")
+        };
+        let minted = |reply: BoxControlReply| match reply {
+            BoxControlReply::BoxIdMinted { minted_box_id } => minted_box_id,
+            other => panic!("a host_ip registration is answered with a box id, got {other:?}"),
+        };
+        let first = minted(register(&sock_path, &host_ip(false)).expect("answered"));
+        match register(&sock_path, &host_ip(true)).expect("answered") {
+            BoxControlReply::Error { error } => assert_eq!(
+                error,
+                AllocationError::NameAlreadyHeld {
+                    held: "agent".to_string()
+                }
+                .to_string(),
+                "a live registration keeps its name"
+            ),
+            other => panic!("a second registration of a live name is refused, got {other:?}"),
+        }
+        assert_eq!(
+            registry.host_ip_id_for("agent"),
+            Some(first.to_bytes()),
+            "the refusal leaves the name with the first registration"
+        );
+        registry.retire_host_ip_box(
+            boxes::SessionId::from_bytes(first.to_bytes()),
+            minimald_rpc::HostIpBoxEnd::Destroyed,
+        );
+        let second = minted(register(&sock_path, &host_ip(true)).expect("answered"));
+        assert_ne!(first, second, "each creation gets its own id");
+        assert_eq!(registry.host_ip_id_for("agent"), Some(second.to_bytes()));
+        // An admitted box keeps its name past the unadmitted bound.
+        assert!(registry.admit_host_ip_box_with_lane(
+            boxes::SessionId::from_bytes(second.to_bytes()),
+            None,
+            true,
+        ));
+        registry.advance_clock(
+            crate::box_registry::HOST_IP_UNADMITTED_NAME_BOUND + std::time::Duration::from_secs(1),
+        );
+        assert!(
+            matches!(
+                register(&sock_path, &host_ip(true)).expect("answered"),
+                BoxControlReply::Error { .. }
+            ),
+            "an admitted box's name is not taken over"
+        );
+        assert_eq!(registry.host_ip_id_for("agent"), Some(second.to_bytes()));
+        // A creator that died between its register and its box's admission
+        // leaves a name nothing withdraws. Past the bound, a new
+        // registration under the name takes it with a fresh id.
+        let scout = |hold: bool| RegisterBoxRequest {
+            name: "scout".to_string(),
+            ..host_ip(hold)
+        };
+        let orphan = minted(register(&sock_path, &scout(false)).expect("answered"));
+        assert!(
+            matches!(
+                register(&sock_path, &scout(false)).expect("answered"),
+                BoxControlReply::Error { .. }
+            ),
+            "inside the bound an unadmitted name is still held"
+        );
+        registry.advance_clock(
+            crate::box_registry::HOST_IP_UNADMITTED_NAME_BOUND + std::time::Duration::from_secs(1),
+        );
+        let fresh = minted(register(&sock_path, &scout(false)).expect("answered"));
+        assert_ne!(orphan, fresh, "the new creation gets its own id");
+        assert_eq!(registry.host_ip_id_for("scout"), Some(fresh.to_bytes()));
+        assert!(
+            registry.holds_host_ip_id(orphan.to_bytes()),
+            "the orphan's id stays for the collision check"
+        );
+        for id in [first, second] {
+            assert!(
+                registry.holds_host_ip_id(id.to_bytes()),
+                "the registry records {id}"
+            );
+        }
+        assert!(
+            registry.table().rows().is_empty(),
+            "a host_ip registration puts no row in the address table"
+        );
+        assert_eq!(
+            registry.live_switch_addrs(),
+            0,
+            "a host_ip registration draws no switch address"
+        );
+        // An own-address registration after them is unchanged: it gets
+        // its own row, under an id that is neither host_ip id.
+        let web = handed(register(&sock_path, &box_request("web")).expect("answered"));
+        assert_ne!(web.box_id, first);
+        assert_ne!(web.box_id, second);
+        assert_eq!(registry.table().rows().len(), 1);
+    }
+
+    /// BEP-082: a `host_ip` box's record takes the id its registration
+    /// minted, so the record and the sealed grants name one id. The in-VM
+    /// daemon's mint ask names the box's creation name. The id goes to one
+    /// create only: a retry with the same token gets it again, and an ask
+    /// with another token is refused. A name with no registration takes a
+    /// fresh mint, because a `host_ip` box with no grant registers nothing.
+    /// After the box retires, its name takes a fresh mint too.
+    #[test]
+    fn host_ip_box_record_takes_the_registration_id() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let request = RegisterBoxRequest {
+            host_ip: true,
+            hold: false,
+            credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
+            task_slots: minimald_rpc::TASK_SLOTS_PER_BOX,
+            ..box_request("agent")
+        };
+        let registered = match register(&sock_path, &request).expect("answered") {
+            BoxControlReply::BoxIdMinted { minted_box_id } => minted_box_id,
+            other => panic!("a host_ip registration is answered with a box id, got {other:?}"),
+        };
+        let guest = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        let ask = |name: &str, token: &str| {
+            control(
+                &guest,
+                &BoxControlRequest::MintBoxId(minimald_rpc::MintBoxIdRequest {
+                    switch_address: None,
+                    create_token: Some(token.to_owned()),
+                    host_ip_name: Some(name.to_owned()),
+                }),
+            )
+            .expect("the mint is answered")
+        };
+        let minted = BoxControlReply::BoxIdMinted {
+            minted_box_id: registered,
+        };
+        assert_eq!(
+            ask("agent", "create-a"),
+            minted,
+            "the record takes the registration's id"
+        );
+        assert_eq!(
+            ask("agent", "create-a"),
+            minted,
+            "a retry of the same create gets the same id"
+        );
+        match ask("agent", "create-b") {
+            BoxControlReply::Error { error } => assert!(
+                error.contains("the box registered as agent already has a session"),
+                "{error}"
+            ),
+            other => panic!("the registration's id goes to one create only, got {other:?}"),
+        }
+        match ask("ungranted", "create-c") {
+            BoxControlReply::BoxIdMinted { minted_box_id } => {
+                assert_ne!(
+                    minted_box_id, registered,
+                    "a name with no registration is fresh"
+                );
+                assert_eq!(
+                    AsRef::<uuid::Uuid>::as_ref(&minted_box_id).get_version_num(),
+                    7
+                );
+            }
+            other => panic!("a name with no registration takes a fresh mint, got {other:?}"),
+        }
+        // The box ends: its retire withdraws the name, so a later box under
+        // the name with no registration of its own takes a fresh id, not the
+        // ended box's claimed one.
+        let session = boxes::SessionId::from_bytes(registered.to_bytes());
+        registry.retire_host_ip_box(session, minimald_rpc::HostIpBoxEnd::Destroyed);
+        assert_eq!(registry.host_ip_id_for("agent"), None);
+        assert!(
+            registry.holds_host_ip_id(registered.to_bytes()),
+            "the ended box's id stays for the collision check"
+        );
+        match ask("agent", "create-b") {
+            BoxControlReply::BoxIdMinted { minted_box_id } => {
+                assert_ne!(
+                    minted_box_id, registered,
+                    "a box after the retire is a new creation"
+                );
+                assert_eq!(
+                    AsRef::<uuid::Uuid>::as_ref(&minted_box_id).get_version_num(),
+                    7
+                );
+            }
+            other => panic!("a retired box's name takes a fresh mint, got {other:?}"),
+        }
+
+        // An activation that fails after it registered withdraws the name
+        // with the id it was handed: no box retires under the name, and a
+        // later box under it takes a fresh id. A withdrawal with another id
+        // leaves the name.
+        let failed = match register(&sock_path, &request).expect("answered") {
+            BoxControlReply::BoxIdMinted { minted_box_id } => minted_box_id,
+            other => panic!("a host_ip registration is answered with a box id, got {other:?}"),
+        };
+        let withdraw = |box_id| {
+            control(
+                &sock_path,
+                &BoxControlRequest::Withdraw(WithdrawBoxRequest {
+                    name: "agent".to_string(),
+                    switch_address: Ipv4Addr::UNSPECIFIED,
+                    loopback_address: Ipv4Addr::UNSPECIFIED,
+                    box_id: Some(box_id),
+                }),
+            )
+            .expect("the withdrawal is answered")
+        };
+        let unspecified = BoxControlReply::Addresses(BoxAddresses {
+            switch_address: Ipv4Addr::UNSPECIFIED,
+            loopback_address: Ipv4Addr::UNSPECIFIED,
+        });
+        assert_eq!(withdraw(registered), unspecified);
+        assert_eq!(
+            registry.host_ip_id_for("agent"),
+            Some(failed.to_bytes()),
+            "a withdrawal with another id leaves the name"
+        );
+        assert_eq!(withdraw(failed), unspecified);
+        assert_eq!(registry.host_ip_id_for("agent"), None);
+        assert!(
+            registry.holds_host_ip_id(failed.to_bytes()),
+            "the withdrawn box's id stays for the collision check"
+        );
+        match ask("agent", "create-d") {
+            BoxControlReply::BoxIdMinted { minted_box_id } => assert_ne!(
+                minted_box_id, failed,
+                "a box after a failed activation is a new creation"
+            ),
+            other => panic!("a withdrawn name takes a fresh mint, got {other:?}"),
         }
     }
 
@@ -3160,6 +4811,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: u8::MAX,
+                    host_ip: false,
                 },
             )
             .expect("the registration is answered"),
@@ -3235,6 +4887,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("first registration is answered"),
@@ -3306,6 +4959,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("second registration is answered"),
@@ -3351,6 +5005,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("server still serves after a refused request"),
@@ -3467,6 +5122,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("the registration is answered"),
@@ -3543,6 +5199,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("the registration is answered"),
@@ -3599,10 +5256,13 @@ mod tests {
             BoxControlReply::PortRecorded { .. } => {
                 panic!("a withdrawal echoes the pair it went by, never a port report")
             }
-            other @ BoxControlReply::RowStanding { .. } => {
+            other @ (BoxControlReply::RowStanding { .. } | BoxControlReply::HostIpBox { .. }) => {
                 panic!("a box verb is never answered with a row-standing read, got {other:?}")
             }
-            other @ BoxControlReply::ProxyListening { .. } => {
+            other @ (BoxControlReply::ProxyListening { .. }
+            | BoxControlReply::ProxyPorts { .. }
+            | BoxControlReply::Audited { .. }
+            | BoxControlReply::BoxIdMinted { .. }) => {
                 panic!("a box verb is never answered with a proxy-listening read, got {other:?}")
             }
             BoxControlReply::AnswererRelease { detail, .. } => {
@@ -3668,6 +5328,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("the marker box is registered"),
@@ -3719,10 +5380,14 @@ mod tests {
                 BoxControlReply::PortRecorded { .. } => {
                     panic!("a foreign pair's withdrawal must be refused, got a port report")
                 }
-                other @ BoxControlReply::RowStanding { .. } => {
+                other @ (BoxControlReply::RowStanding { .. }
+                | BoxControlReply::HostIpBox { .. }) => {
                     panic!("a box verb is never answered with a row-standing read, got {other:?}")
                 }
-                other @ BoxControlReply::ProxyListening { .. } => {
+                other @ (BoxControlReply::ProxyListening { .. }
+                | BoxControlReply::ProxyPorts { .. }
+                | BoxControlReply::Audited { .. }
+                | BoxControlReply::BoxIdMinted { .. }) => {
                     panic!(
                         "a box verb is never answered with a proxy-listening read, got {other:?}"
                     )
@@ -3792,10 +5457,13 @@ mod tests {
             BoxControlReply::PortRecorded { .. } => {
                 panic!("a repeat withdrawal echoes the pair, never a port report")
             }
-            other @ BoxControlReply::RowStanding { .. } => {
+            other @ (BoxControlReply::RowStanding { .. } | BoxControlReply::HostIpBox { .. }) => {
                 panic!("a box verb is never answered with a row-standing read, got {other:?}")
             }
-            other @ BoxControlReply::ProxyListening { .. } => {
+            other @ (BoxControlReply::ProxyListening { .. }
+            | BoxControlReply::ProxyPorts { .. }
+            | BoxControlReply::Audited { .. }
+            | BoxControlReply::BoxIdMinted { .. }) => {
                 panic!("a box verb is never answered with a proxy-listening read, got {other:?}")
             }
             BoxControlReply::AnswererRelease { detail, .. } => {
@@ -3928,6 +5596,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("a registration still answers around the read"),
@@ -4339,11 +6008,20 @@ mod tests {
             control(&sock_path, &BoxControlRequest::AnswererStatus).expect("the read is answered"),
             BoxControlReply::Status(minimald_rpc::AnswererStatusReply {
                 answerer: ZoneAnswererStatus::Holder { port: 7_656 },
-                proxy_down: Some(minimald_rpc::ProxyDown { port, cause: late }),
+                proxy_down: Some(minimald_rpc::ProxyDown {
+                    port,
+                    cause: late.clone(),
+                }),
             }),
             "a late refusal rides beside the answerer's state with its \
              holder, and a confirm never clears it"
         );
+        // NET-022: the held-port watcher's publish clears the cause on its
+        // own port, and never a cause on another port.
+        proxy_publish.clear_down(port + 1);
+        assert_eq!(proxy_publish.down(), Some((port, late)));
+        proxy_publish.clear_down(port);
+        assert_eq!(proxy_publish.down(), None, "the publish clears the cause");
     }
 
     /// The operator's pin's story (T93): the first address-in-use publish
@@ -4461,11 +6139,11 @@ mod tests {
         assert!(!is_root_peer(me.wrapping_add(1).max(1)));
     }
 
-    /// The bind tightens a provider dir the daemon owns but `StateDir::new`
+    /// The bind tightens a host dir the daemon owns but `StateDir::new`
     /// created under the umask (0755), rather than refusing every existing
     /// install, and then serves on it.
     #[test]
-    fn bind_tightens_an_owned_provider_dir_to_0700() {
+    fn bind_tightens_an_owned_host_dir_to_0700() {
         use std::os::unix::fs::PermissionsExt as _;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("local-minvmd0");
@@ -4508,6 +6186,7 @@ mod tests {
                     dynamic_allowed_range: Some((3000, 3999)),
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("the registration is answered"),
@@ -4711,6 +6390,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("the registration is answered"),
@@ -4755,6 +6435,96 @@ mod tests {
         assert!(!row.was_attributed(), "the read attributes nothing");
         assert!(!row.is_detached(), "the read detaches nothing");
         assert_eq!(registry.live_switch_addrs(), 1, "the read frees nothing");
+    }
+
+    /// BOX-002: the guest door mints the id of a box the in-VM daemon is
+    /// about to create. A box with a row takes the id its registration
+    /// minted, and a retry of the same create gets it again. Another
+    /// create's ask for that row is refused. A box with no row takes a
+    /// fresh UUIDv7. An address that holds no row is refused, and the host
+    /// socket does not serve the verb.
+    #[test]
+    fn guest_door_mints_the_box_id_for_an_in_vm_create() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, _registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let web = handed(
+            register(
+                &sock_path,
+                &RegisterBoxRequest {
+                    name: "web".to_string(),
+                    ingress_ports: Vec::new(),
+                    egress: None,
+                    credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
+                    hold: false,
+                    task_slots: 0,
+                    host_ip: false,
+                },
+            )
+            .expect("the registration is answered"),
+        );
+        let guest = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        let ask = |switch_address, token: Option<&str>| {
+            control(
+                &guest,
+                &BoxControlRequest::MintBoxId(minimald_rpc::MintBoxIdRequest {
+                    switch_address,
+                    create_token: token.map(str::to_owned),
+                    host_ip_name: None,
+                }),
+            )
+            .expect("the mint is answered")
+        };
+        let mint = |switch_address| ask(switch_address, None);
+        assert_eq!(
+            ask(Some(web.switch_address), Some("create-a")),
+            BoxControlReply::BoxIdMinted {
+                minted_box_id: web.box_id
+            },
+            "a box with a row takes its registration's id"
+        );
+        assert_eq!(
+            ask(Some(web.switch_address), Some("create-a")),
+            BoxControlReply::BoxIdMinted {
+                minted_box_id: web.box_id
+            },
+            "a retry of the same create gets the same id"
+        );
+        for other_create in [Some("create-b"), None] {
+            match ask(Some(web.switch_address), other_create) {
+                BoxControlReply::Error { error } => {
+                    assert!(error.contains("already has a session"), "{error}");
+                }
+                other => panic!("a row's id goes to one create only, got {other:?}"),
+            }
+        }
+        let fresh = |reply| match reply {
+            BoxControlReply::BoxIdMinted { minted_box_id } => minted_box_id,
+            other => panic!("expected a minted id, got {other:?}"),
+        };
+        let first = fresh(mint(None));
+        let second = fresh(mint(None));
+        assert_eq!(AsRef::<uuid::Uuid>::as_ref(&first).get_version_num(), 7);
+        assert_ne!(first, second, "each fresh mint is a new id");
+        assert_ne!(first, web.box_id);
+        match mint(Some(Ipv4Addr::new(100, 64, 0, 200))) {
+            BoxControlReply::Error { error } => assert!(
+                error.contains("no box is registered at 100.64.0.200"),
+                "{error}"
+            ),
+            other => panic!("an address with no row is refused, got {other:?}"),
+        }
+        match control(
+            &sock_path,
+            &BoxControlRequest::MintBoxId(minimald_rpc::MintBoxIdRequest::default()),
+        )
+        .expect("the host socket answers")
+        {
+            BoxControlReply::Error { error } => assert!(error.contains("mint_box_id"), "{error}"),
+            other => panic!("the host socket refuses the mint, got {other:?}"),
+        }
     }
 
     /// NET-138: a resume of a row that stands is answered from the row
@@ -4807,6 +6577,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("the registration is answered"),
@@ -4831,6 +6602,191 @@ mod tests {
             allocations.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "only the registration asked the answerer"
+        );
+    }
+
+    /// A box created while the host lacked the box range was handed the
+    /// 127.0.0.1 interim, and keeps it: once the aliases are installed and
+    /// its row is withdrawn, its creator's resume reinstates it at
+    /// 127.0.0.1 rather than refusing it as moved, while a new box gets an
+    /// address out of the range.
+    #[test]
+    fn an_interim_box_keeps_the_interim_across_a_resume() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sock_path = dir.path().join(CONTROL_SOCK_FILE);
+        let boxes = BoxRegistry::new(SUBNET);
+        let aliased = Arc::new(AtomicBool::new(false));
+        let probed = Arc::clone(&aliased);
+        let answerer = AnswererStatus::allocating_for_tests_probed(
+            "control-test-node",
+            || None,
+            |_, _| {},
+            move || {
+                let present = probed.load(Ordering::SeqCst);
+                switch::loopback::probe_over(switch::loopback::range_hosts(), |_| {
+                    if present {
+                        Ok(())
+                    } else {
+                        Err(std::io::ErrorKind::AddrNotAvailable.into())
+                    }
+                })
+            },
+        );
+        let _server = spawn(
+            sock_path.clone(),
+            boxes.clone(),
+            answerer,
+            ProxyPublishStatus::new(),
+        )
+        .expect("server binds");
+        for _ in 0..500 {
+            if TestStream::connect(&sock_path).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let request = |name: &str| RegisterBoxRequest {
+            name: name.to_string(),
+            ingress_ports: Vec::new(),
+            egress: None,
+            credentialed_upstream: None,
+            dynamic_ingress: None,
+            dynamic_allowed_range: None,
+            hold: false,
+            task_slots: 0,
+            host_ip: false,
+        };
+        let web = handed(register(&sock_path, &request("web")).expect("registered"));
+        assert_eq!(
+            web.loopback_address,
+            Ipv4Addr::LOCALHOST,
+            "a host without the range hands the interim"
+        );
+
+        aliased.store(true, Ordering::SeqCst);
+        assert!(
+            boxes.withdraw(web.switch_address).is_some(),
+            "the row is withdrawn, its creation dormant"
+        );
+        let resumed = handed(
+            control(
+                &sock_path,
+                &BoxControlRequest::ResumeBox(minimald_rpc::ResumeBoxRequest {
+                    name: "web".to_string(),
+                    switch_address: web.switch_address,
+                    loopback_address: web.loopback_address,
+                    box_id: Some(web.box_id),
+                }),
+            )
+            .expect("the resume is answered"),
+        );
+        assert_eq!(
+            (resumed.box_id, resumed.loopback_address),
+            (web.box_id, Ipv4Addr::LOCALHOST),
+            "the interim box resumes at its own 127.0.0.1"
+        );
+
+        let api = handed(register(&sock_path, &request("api")).expect("registered"));
+        assert!(
+            api.loopback_address != Ipv4Addr::LOCALHOST,
+            "a new box gets a range address once the host binds the range: {}",
+            api.loopback_address
+        );
+    }
+
+    /// A box created at a range address keeps it across a resume after the
+    /// answerer restarts while the host lacks the range. The restarted
+    /// answerer holds no record of the dormant box. It hands back the
+    /// address the box was created at, not the 127.0.0.1 interim, so the
+    /// resume reinstates the box rather than refusing it as moved.
+    #[test]
+    fn a_range_box_keeps_its_address_across_an_answerer_restart() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sock_path = dir.path().join(CONTROL_SOCK_FILE);
+        let boxes = BoxRegistry::new(SUBNET);
+        let wait_for = |path: &std::path::Path| {
+            for _ in 0..500 {
+                if TestStream::connect(path).is_ok() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let _server = spawn(
+            sock_path.clone(),
+            boxes.clone(),
+            AnswererStatus::allocating_for_tests("control-test-node"),
+            ProxyPublishStatus::new(),
+        )
+        .expect("server binds");
+        wait_for(&sock_path);
+        let request = |name: &str| RegisterBoxRequest {
+            name: name.to_string(),
+            ingress_ports: Vec::new(),
+            egress: None,
+            credentialed_upstream: None,
+            dynamic_ingress: None,
+            dynamic_allowed_range: None,
+            hold: false,
+            task_slots: 0,
+            host_ip: false,
+        };
+        let web = handed(register(&sock_path, &request("web")).expect("registered"));
+        assert!(
+            web.loopback_address != Ipv4Addr::LOCALHOST,
+            "a host with the range hands a range address: {}",
+            web.loopback_address
+        );
+        assert!(
+            boxes.withdraw(web.switch_address).is_some(),
+            "the row is withdrawn, its creation dormant"
+        );
+
+        // The restarted answerer: an empty book, on a host that lacks the
+        // range aliases now.
+        let restarted_dir = tempfile::TempDir::new().expect("temp dir");
+        let restarted_path = restarted_dir.path().join(CONTROL_SOCK_FILE);
+        let _restarted = spawn(
+            restarted_path.clone(),
+            boxes.clone(),
+            AnswererStatus::allocating_for_tests_probed(
+                "control-test-node",
+                || None,
+                |_, _| {},
+                || {
+                    switch::loopback::probe_over(switch::loopback::range_hosts(), |_| {
+                        Err(std::io::ErrorKind::AddrNotAvailable.into())
+                    })
+                },
+            ),
+            ProxyPublishStatus::new(),
+        )
+        .expect("server binds");
+        wait_for(&restarted_path);
+        let resumed = handed(
+            control(
+                &restarted_path,
+                &BoxControlRequest::ResumeBox(minimald_rpc::ResumeBoxRequest {
+                    name: "web".to_string(),
+                    switch_address: web.switch_address,
+                    loopback_address: web.loopback_address,
+                    box_id: Some(web.box_id),
+                }),
+            )
+            .expect("the resume is answered"),
+        );
+        assert_eq!(
+            (resumed.box_id, resumed.loopback_address),
+            (web.box_id, web.loopback_address),
+            "the range box resumes at its own address"
+        );
+
+        let api = handed(register(&restarted_path, &request("api")).expect("registered"));
+        assert_eq!(
+            api.loopback_address,
+            Ipv4Addr::LOCALHOST,
+            "a new box on a host without the range still gets the interim"
         );
     }
 
@@ -4859,6 +6815,7 @@ mod tests {
                     dynamic_allowed_range: Some((3000, 3999)),
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("the registration is answered"),
@@ -4950,6 +6907,7 @@ mod tests {
                     dynamic_allowed_range: None,
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("the registration is answered"),
@@ -5073,6 +7031,7 @@ mod tests {
                         dynamic_allowed_range: Some((ASK_PORT, ASK_PORT + 999)),
                         hold: false,
                         task_slots: 0,
+                        host_ip: false,
                     },
                 )
                 .expect("the registration is answered"),
@@ -5627,10 +7586,10 @@ mod tests {
             );
         }
         let box_id = format!(r#""box_id":"{}""#, web.box_id.simple());
-        for line in audit
-            .lines()
-            .filter(|line| !line.contains("refused_unknown_id"))
-        {
+        // The yes also writes an admission record, which is not an ask line.
+        for line in audit.lines().filter(|line| {
+            line.contains(r#""event":"ask""#) && !line.contains("refused_unknown_id")
+        }) {
             assert!(
                 line.contains(&box_id) && line.contains(r#""proto":"tcp""#),
                 "each ask line names the box id and the protocol: {line}"
@@ -5866,6 +7825,7 @@ mod tests {
                 dynamic_allowed_range: None,
                 hold: false,
                 task_slots: 0,
+                host_ip: false,
             },
         )
         .expect("the second connection is served");
@@ -5902,21 +7862,25 @@ mod tests {
                 ControlDoor::Host,
                 &audit_path,
                 1,
+                &HostIpReconcileNudge::default(),
             )
         });
 
         // The refusal closes without reading the request line, so a
-        // client's write can lose the race to the close (a broken pipe):
-        // the reply already written is still read. `None` is a connection
-        // whose reply could not be read at all.
+        // client's write can lose the race to the close: Linux reports
+        // that lost write as a broken pipe, macOS as a socket that is
+        // not connected. The reply already written is still read.
+        // `None` is a connection whose reply could not be read at all.
         let control_past_cap = |request: &BoxControlRequest| -> Option<BoxControlReply> {
             let mut stream = TestStream::connect(&sock_path).expect("socket accepts");
             let mut line = serde_json_lenient::to_string(request).expect("request serializes");
             line.push('\n');
             if let Err(error) = stream.write_all(line.as_bytes()) {
-                assert_eq!(
-                    error.kind(),
-                    std::io::ErrorKind::BrokenPipe,
+                assert!(
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::NotConnected
+                    ),
                     "write: {error}"
                 );
             }
@@ -5986,6 +7950,7 @@ mod tests {
                     dynamic_allowed_range: Some((3000, 3999)),
                     hold: false,
                     task_slots: 0,
+                    host_ip: false,
                 },
             )
             .expect("the registration is answered"),
@@ -6285,6 +8250,7 @@ mod tests {
             dynamic_allowed_range: None,
             hold: false,
             task_slots: 0,
+            host_ip: false,
         }
     }
 
@@ -6516,6 +8482,7 @@ mod tests {
         let request = BoxControlRequest::Register(RegisterBoxRequest {
             hold: true,
             task_slots: 0,
+            host_ip: false,
             ..box_request(name)
         });
         let mut line = serde_json_lenient::to_string(&request).expect("the request serializes");
@@ -6647,5 +8614,1057 @@ mod tests {
             .with_facts(Some(&facts));
         let json = serde_json::to_value(&line).expect("serialise the ask audit line");
         assert_eq!(json["box_id"], "019a2b3c4d5e7f608192a3b4c5d6e7f8");
+    }
+
+    /// Registers one box on the host socket for the audit report tests and
+    /// answers its row: a plain box, so its switch address is a row key the
+    /// guest door's reports can name.
+    fn register_audited_box(sock_path: &std::path::Path, name: &str) -> RegisteredBox {
+        handed(
+            register(
+                sock_path,
+                &RegisterBoxRequest {
+                    name: name.to_string(),
+                    ingress_ports: vec![],
+                    egress: None,
+                    credentialed_upstream: None,
+                    dynamic_ingress: Some(boxes::DynamicIngress::Allow),
+                    dynamic_allowed_range: Some((3000, 3999)),
+                    hold: false,
+                    task_slots: 0,
+                    host_ip: false,
+                },
+            )
+            .expect("the registration is answered"),
+        )
+    }
+
+    /// The host's audit log beside `sock_path`, parsed one record per line.
+    fn host_audit_records(sock_path: &std::path::Path) -> Vec<serde_json::Value> {
+        let logged = std::fs::read_to_string(audit_log_path(sock_path)).unwrap_or_default();
+        logged
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("one audit line is one record"))
+            .collect()
+    }
+
+    /// NET-046 on a VM host: a decision the in-VM daemon reports on the guest
+    /// door lands in the host's own audit log, outside the VM, the box named
+    /// from the host's row and not from the report. A denied expose and a
+    /// published one are each one record. A report at an address no row
+    /// holds is refused and writes nothing.
+    #[test]
+    fn expose_decision_recorded_on_host() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, _registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let guest = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        let web = register_audited_box(&sock_path, "web");
+
+        for (port, decision, outcome) in [
+            (
+                4000,
+                boxes::DynamicIngress::Deny,
+                minimald_rpc::ExposeDecisionOutcome::Refused,
+            ),
+            (
+                3000,
+                boxes::DynamicIngress::Allow,
+                minimald_rpc::ExposeDecisionOutcome::Published,
+            ),
+        ] {
+            let reply = control(
+                &guest,
+                &BoxControlRequest::ReportExposeDecision(minimald_rpc::ExposeDecisionReport {
+                    switch_address: Some(web.switch_address),
+                    box_id: None,
+                    port,
+                    decision,
+                    decided_by: minimald_rpc::ExposeDecidedBy::BoxPolicy,
+                    outcome,
+                }),
+            )
+            .expect("the report is answered");
+            assert_eq!(reply, BoxControlReply::Audited { audited: true });
+        }
+        let stray = control(
+            &guest,
+            &BoxControlRequest::ReportExposeDecision(minimald_rpc::ExposeDecisionReport {
+                switch_address: Some(Ipv4Addr::new(192, 0, 2, 1)),
+                box_id: None,
+                port: 3000,
+                decision: boxes::DynamicIngress::Allow,
+                decided_by: minimald_rpc::ExposeDecidedBy::BoxPolicy,
+                outcome: minimald_rpc::ExposeDecisionOutcome::Published,
+            }),
+        )
+        .expect("the stray report is answered");
+        assert!(
+            matches!(stray, BoxControlReply::Error { .. }),
+            "a report at no row is refused: {stray:?}"
+        );
+        // The host socket does not take the guest's reports.
+        let wrong_door = control(
+            &sock_path,
+            &BoxControlRequest::ReportExposeDecision(minimald_rpc::ExposeDecisionReport {
+                switch_address: Some(web.switch_address),
+                box_id: None,
+                port: 3001,
+                decision: boxes::DynamicIngress::Allow,
+                decided_by: minimald_rpc::ExposeDecidedBy::BoxPolicy,
+                outcome: minimald_rpc::ExposeDecisionOutcome::Published,
+            }),
+        )
+        .expect("the wrong-door report is answered");
+        assert!(matches!(wrong_door, BoxControlReply::Error { .. }));
+
+        let records: Vec<_> = host_audit_records(&guest)
+            .into_iter()
+            .filter(|record| record["event"] == "expose_decision")
+            .collect();
+        assert_eq!(records.len(), 2, "one record per decision: {records:?}");
+        assert_eq!(records[0]["box"], "web");
+        assert_eq!(records[0]["port"], 4000);
+        assert_eq!(records[0]["decision"], "deny");
+        assert_eq!(records[0]["decided_by"], "box-policy");
+        assert_eq!(records[0]["outcome"], "refused");
+        assert_eq!(records[0]["reported_by"], "guest");
+        assert_eq!(records[1]["port"], 3000);
+        assert_eq!(records[1]["reported_by"], "guest");
+        assert_eq!(records[1]["decision"], "allow");
+        assert_eq!(records[1]["outcome"], "published");
+    }
+
+    /// NET-046 for a box with no switch: its report carries its box id in
+    /// place of a row key, and the host names the box from what it holds
+    /// under that id. A `none` box is named by the name `min` holds for it
+    /// at create, over the host's door, and a resident `host_ip` box with no
+    /// held name is named by its id. A report
+    /// for an id the host holds nothing for, or one that names no box, is
+    /// refused and writes nothing. An older guest's report, which always
+    /// carries a switch address and never a box id, still reads.
+    #[test]
+    fn expose_decision_recorded_for_no_switch_box() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let guest = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        let named =
+            boxes::SessionId::parse_str("00000000-0000-4000-8000-0000000000a1").expect("a box id");
+        let unnamed =
+            boxes::SessionId::parse_str("00000000-0000-4000-8000-0000000000a2").expect("a box id");
+        let unknown =
+            boxes::SessionId::parse_str("00000000-0000-4000-8000-0000000000a3").expect("a box id");
+        // `named` is a `none` box: `min` holds its name at create, over the
+        // host's door, and that hold is all the host holds for it.
+        assert_eq!(
+            control(
+                &sock_path,
+                &BoxControlRequest::HoldBoxName(HoldBoxNameRequest {
+                    name: "api".to_string(),
+                    session_id: Some(named),
+                }),
+            )
+            .expect("the hold is answered"),
+            BoxControlReply::NameHeld {
+                name: "api".to_string(),
+                held: true,
+            }
+        );
+        assert!(registry.admit_host_ip_box(unnamed, None));
+
+        let report = |box_id: Option<boxes::SessionId>, port: u16| {
+            control(
+                &guest,
+                &BoxControlRequest::ReportExposeDecision(minimald_rpc::ExposeDecisionReport {
+                    switch_address: None,
+                    box_id,
+                    port,
+                    // An `ask` box with nobody attached, refused closed.
+                    decision: boxes::DynamicIngress::Ask,
+                    decided_by: minimald_rpc::ExposeDecidedBy::Daemon,
+                    outcome: minimald_rpc::ExposeDecisionOutcome::Refused,
+                }),
+            )
+            .expect("the report is answered")
+        };
+        assert_eq!(
+            report(Some(named), 4000),
+            BoxControlReply::Audited { audited: true }
+        );
+        assert_eq!(
+            report(Some(unnamed), 4001),
+            BoxControlReply::Audited { audited: true }
+        );
+        let stray = report(Some(unknown), 4002);
+        assert!(
+            matches!(stray, BoxControlReply::Error { .. }),
+            "a report for an id the host holds nothing for is refused: {stray:?}"
+        );
+        let keyless = report(None, 4003);
+        assert!(
+            matches!(keyless, BoxControlReply::Error { .. }),
+            "a report that names no box is refused: {keyless:?}"
+        );
+
+        let records: Vec<_> = host_audit_records(&guest)
+            .into_iter()
+            .filter(|record| record["event"] == "expose_decision")
+            .collect();
+        assert_eq!(records.len(), 2, "one record per known box: {records:?}");
+        assert_eq!(records[0]["box"], "api");
+        assert_eq!(records[0]["box_id"], named.simple());
+        assert_eq!(records[0]["port"], 4000);
+        assert_eq!(records[0]["decision"], "ask");
+        assert_eq!(records[0]["decided_by"], "daemon");
+        assert_eq!(records[0]["outcome"], "refused");
+        assert_eq!(records[0]["reported_by"], "guest");
+        assert!(
+            records[0].get("switch_address").is_none(),
+            "a box with no switch has no row key to record: {records:?}"
+        );
+        assert_eq!(records[1]["box"], unnamed.to_string());
+        assert_eq!(records[1]["box_id"], unnamed.simple());
+        assert_eq!(records[1]["port"], 4001);
+
+        // Each box with no switch has its own cap window: one box that
+        // passes its cap never suppresses the record of another. The box
+        // wrote one record above, so this fills the rest of its cap.
+        for port in 1..(GUEST_AUDIT_RECORDS_PER_WINDOW as u16) {
+            report(Some(named), 5000 + port);
+        }
+        assert_eq!(
+            report(Some(named), 6000),
+            BoxControlReply::Audited { audited: false },
+            "the flooding box passed its own cap"
+        );
+        assert_eq!(
+            report(Some(unnamed), 6001),
+            BoxControlReply::Audited { audited: true },
+            "another box with no switch still gets its record"
+        );
+
+        // The count line for a box with no switch names its box id.
+        let audit_path = audit_log_path(&guest);
+        let later = std::time::Instant::now() + GUEST_AUDIT_WINDOW;
+        let admission = admit_guest_audit(&audit_path, GuestAuditKey::Box(named), None, later);
+        assert_eq!(admission, GuestAuditAdmission::Write { suppressed: 1 });
+        assert!(take_guest_audit(
+            &audit_path,
+            "api",
+            GuestAuditKey::Box(named),
+            &admission
+        ));
+        let suppressed: Vec<_> = host_audit_records(&guest)
+            .into_iter()
+            .filter(|record| record["event"] == "audit_suppressed")
+            .collect();
+        assert_eq!(suppressed.len(), 1, "one count line: {suppressed:?}");
+        assert_eq!(suppressed[0]["box"], "api");
+        assert_eq!(suppressed[0]["box_id"], named.simple());
+        assert!(
+            suppressed[0].get("switch_address").is_none(),
+            "a box with no switch has no row key to record: {suppressed:?}"
+        );
+
+        // A box with no switch that ends writes the count its window still
+        // holds, and its window leaves the table. A host-address box ends
+        // when it retires, and a named one also when its hold is released.
+        let window_held = |box_id| {
+            GUEST_AUDIT_WINDOWS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&(audit_path.clone(), GuestAuditKey::Box(box_id)))
+        };
+        let suppressed_for = |box_id: boxes::SessionId| {
+            host_audit_records(&guest)
+                .into_iter()
+                .filter(|record| {
+                    record["event"] == "audit_suppressed" && record["box_id"] == box_id.simple()
+                })
+                .collect::<Vec<_>>()
+        };
+        // The unnamed box wrote two records: fill the rest of its cap, and
+        // pass it once.
+        for port in 2..=(GUEST_AUDIT_RECORDS_PER_WINDOW as u16) {
+            report(Some(unnamed), 7000 + port);
+        }
+        assert!(window_held(unnamed));
+        assert!(suppressed_for(unnamed).is_empty());
+        control(
+            &sock_path,
+            &BoxControlRequest::RetireHostIpBox(minimald_rpc::RetireHostIpBoxRequest {
+                session_id: unnamed,
+                end: minimald_rpc::HostIpBoxEnd::Destroyed,
+            }),
+        )
+        .expect("the retire is answered");
+        let flushed = suppressed_for(unnamed);
+        assert_eq!(flushed.len(), 1, "the retire writes the count: {flushed:?}");
+        assert_eq!(flushed[0]["box"], unnamed.to_string());
+        assert_eq!(flushed[0]["suppressed"], 1);
+        assert!(!window_held(unnamed), "the retired box's window is gone");
+
+        // The named box's new window holds one record: fill its cap, and
+        // pass it once.
+        for port in 1..=(GUEST_AUDIT_RECORDS_PER_WINDOW as u16) {
+            report(Some(named), 8000 + port);
+        }
+        control(
+            &sock_path,
+            &BoxControlRequest::ReleaseBoxName(HoldBoxNameRequest {
+                name: "api".to_string(),
+                session_id: Some(named),
+            }),
+        )
+        .expect("the release is answered");
+        let flushed = suppressed_for(named);
+        assert_eq!(
+            flushed.len(),
+            2,
+            "the release writes the count: {flushed:?}"
+        );
+        assert_eq!(flushed[1]["box"], "api");
+        assert_eq!(flushed[1]["suppressed"], 1);
+        assert!(!window_held(named), "the released box's window is gone");
+
+        // An older guest's report: a switch address, and no box id.
+        let old = parse_request(
+            r#"{"verb":"report_expose_decision","switch_address":"100.64.128.9","port":3000,"decision":"allow","decided_by":"box-policy","outcome":"published"}"#,
+        )
+        .expect("an older guest's report still reads");
+        let BoxControlRequest::ReportExposeDecision(old) = old else {
+            panic!("the line is an expose decision report");
+        };
+        assert_eq!(old.switch_address, Some(Ipv4Addr::new(100, 64, 128, 9)));
+        assert_eq!(old.box_id, None);
+    }
+
+    /// NET-046 under `ask`: an attached client's yes admits the port, and
+    /// the host's audit log gets the same admission record an
+    /// allow-decided expose writes, its source `ask`. A no admits nothing
+    /// and writes no admission record.
+    #[test]
+    fn ask_yes_writes_admission_line() {
+        let host = AskHost::start();
+        let web = host.register_ask_box("web");
+        let mut client = attach_client(&host, &web);
+
+        let mut guest = guest_ask(&host, &web, ASK_PORT);
+        let offer = expect_offer(&mut client);
+        assert_eq!(
+            host.answer(offer.ask_id, AskAnswer::Yes),
+            BoxControlReply::AskAnswerRecorded {
+                ask_id: offer.ask_id,
+                recorded: true
+            }
+        );
+        assert!(matches!(
+            expect_outcome(&mut guest),
+            AskAdmitOutcome::Admitted { .. }
+        ));
+        assert!(matches!(
+            client.next(),
+            BoxControlReply::PendingAskDismissed { .. }
+        ));
+
+        let mut refused_guest = guest_ask(&host, &web, ASK_PORT + 1);
+        let offer = expect_offer(&mut client);
+        assert_eq!(
+            host.answer(offer.ask_id, AskAnswer::No),
+            BoxControlReply::AskAnswerRecorded {
+                ask_id: offer.ask_id,
+                recorded: true
+            }
+        );
+        assert_eq!(
+            refused(expect_outcome(&mut refused_guest)),
+            AskRefused::Denied
+        );
+
+        let admissions: Vec<_> = host_audit_records(&host.guest)
+            .into_iter()
+            .filter(|record| record.get("source").is_some())
+            .collect();
+        assert_eq!(
+            admissions.len(),
+            1,
+            "a yes writes one admission record and a no writes none: {admissions:?}"
+        );
+        assert_eq!(admissions[0]["box"], "web");
+        assert_eq!(admissions[0]["port"], ASK_PORT);
+        assert_eq!(admissions[0]["proto"], "tcp");
+        assert_eq!(admissions[0]["source"], "ask");
+        assert_eq!(
+            admissions[0]["switch_address"],
+            web.switch_address.to_string()
+        );
+    }
+
+    /// A refused own-address egress flow the in-VM daemon reports lands in
+    /// the host's audit log: one record per refused flow, never per frame, so
+    /// a repeat of the same flow writes nothing more. The records a box
+    /// writes are capped per window, the rest counted, and the next window
+    /// opens with one line that says how many were suppressed. The guest's
+    /// texts are clamped.
+    #[test]
+    fn egress_refusal_logged_on_host() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, _registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let guest = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        let web = register_audited_box(&sock_path, "web");
+        let refused = |port: u16, rule: &str| {
+            control(
+                &guest,
+                &BoxControlRequest::ReportRefusedEgress(minimald_rpc::RefusedEgressReport {
+                    switch_address: web.switch_address,
+                    destination: Some(std::net::SocketAddrV4::new(
+                        Ipv4Addr::new(203, 0, 113, 9),
+                        port,
+                    )),
+                    proto: "tcp".to_string(),
+                    rule: rule.to_string(),
+                }),
+            )
+            .expect("the report is answered")
+        };
+
+        assert_eq!(
+            refused(443, "undeclared subnet"),
+            BoxControlReply::Audited { audited: true }
+        );
+        assert_eq!(
+            refused(443, "undeclared subnet"),
+            BoxControlReply::Audited { audited: false },
+            "the same flow again is not a second record"
+        );
+        let records: Vec<_> = host_audit_records(&guest)
+            .into_iter()
+            .filter(|record| record["event"] == "egress_refused")
+            .collect();
+        assert_eq!(records.len(), 1, "one record per refused flow: {records:?}");
+        assert_eq!(records[0]["box"], "web");
+        assert_eq!(records[0]["destination"], "203.0.113.9:443");
+        assert_eq!(records[0]["proto"], "tcp");
+        assert_eq!(records[0]["rule"], "undeclared subnet");
+        assert_eq!(records[0]["reported_by"], "guest");
+
+        // A flood of distinct flows writes up to the cap, and the rest are
+        // counted, not written.
+        let long_rule = "x".repeat(500);
+        let mut written = 1;
+        for port in 1..=(GUEST_AUDIT_RECORDS_PER_WINDOW as u16 + 20) {
+            if refused(port, &long_rule) == (BoxControlReply::Audited { audited: true }) {
+                written += 1;
+            }
+        }
+        assert_eq!(written, GUEST_AUDIT_RECORDS_PER_WINDOW);
+        let records: Vec<_> = host_audit_records(&guest)
+            .into_iter()
+            .filter(|record| record["event"] == "egress_refused")
+            .collect();
+        assert_eq!(records.len() as u32, GUEST_AUDIT_RECORDS_PER_WINDOW);
+        assert!(
+            records.iter().all(|record| record["rule"]
+                .as_str()
+                .is_some_and(|rule| rule.len() <= minimald_rpc::REFUSED_EGRESS_TEXT_MAX)),
+            "a guest's rule text is clamped: {records:?}"
+        );
+
+        // The flood used up the egress budget, not the expose one: a denied
+        // `min net expose` after it is still recorded.
+        let expose = control(
+            &guest,
+            &BoxControlRequest::ReportExposeDecision(minimald_rpc::ExposeDecisionReport {
+                switch_address: Some(web.switch_address),
+                box_id: None,
+                port: 4000,
+                decision: boxes::DynamicIngress::Deny,
+                decided_by: minimald_rpc::ExposeDecidedBy::BoxPolicy,
+                outcome: minimald_rpc::ExposeDecisionOutcome::Refused,
+            }),
+        )
+        .expect("the report is answered");
+        assert_eq!(
+            expose,
+            BoxControlReply::Audited { audited: true },
+            "a flood of refused flows never hides an expose decision"
+        );
+        assert_eq!(
+            host_audit_records(&guest)
+                .iter()
+                .filter(|record| record["event"] == "expose_decision")
+                .count(),
+            1
+        );
+
+        // The window's end: the next record is preceded by the count.
+        let audit_path = audit_log_path(&guest);
+        let later = std::time::Instant::now() + GUEST_AUDIT_WINDOW;
+        let admission = admit_guest_audit(
+            &audit_path,
+            GuestAuditKey::Switch(web.switch_address),
+            Some("later".to_string()),
+            later,
+        );
+        assert_eq!(admission, GuestAuditAdmission::Write { suppressed: 21 });
+        assert!(take_guest_audit(
+            &audit_path,
+            "web",
+            GuestAuditKey::Switch(web.switch_address),
+            &admission
+        ));
+        let suppressed: Vec<_> = host_audit_records(&guest)
+            .into_iter()
+            .filter(|record| record["event"] == "audit_suppressed")
+            .collect();
+        assert_eq!(
+            suppressed.len(),
+            1,
+            "one line counts the suppressed records"
+        );
+        assert_eq!(suppressed[0]["box"], "web");
+        assert_eq!(suppressed[0]["suppressed"], 21);
+
+        // A box that floods and then goes quiet: its withdrawal writes the
+        // count, since no later report will.
+        let mut dropped = 0u64;
+        for port in 1..=(GUEST_AUDIT_RECORDS_PER_WINDOW as u16 + 5) {
+            if refused(port, "quiet after") == (BoxControlReply::Audited { audited: false }) {
+                dropped += 1;
+            }
+        }
+        assert!(dropped > 0, "the flood passed the cap");
+        let withdrawn = control(
+            &sock_path,
+            &BoxControlRequest::Withdraw(WithdrawBoxRequest {
+                name: "web".to_string(),
+                switch_address: web.switch_address,
+                loopback_address: web.loopback_address,
+                box_id: None,
+            }),
+        )
+        .expect("the withdrawal is answered");
+        assert!(
+            matches!(withdrawn, BoxControlReply::Addresses(_)),
+            "the box is withdrawn: {withdrawn:?}"
+        );
+        let suppressed: Vec<_> = host_audit_records(&guest)
+            .into_iter()
+            .filter(|record| record["event"] == "audit_suppressed")
+            .collect();
+        assert_eq!(suppressed.len(), 2, "the withdrawal flushes the count");
+        assert_eq!(suppressed[1]["box"], "web");
+        assert_eq!(suppressed[1]["suppressed"], dropped);
+    }
+
+    /// NET-138: the guest door refuses, on this daemon's own authority, a
+    /// listen notice for a guest infrastructure port it provisioned, read
+    /// from its own configuration: the in-VM daemon's RPC bridge port and
+    /// the hostname proxy's port the node row holds. A forged notice that
+    /// carries an address, or a line past the notice's fixed size, never
+    /// reaches the mirror. A box's own port binds.
+    #[test]
+    fn mirror_refuses_guest_rpc_port_under_forged_notice() {
+        let binder = Arc::new(crate::box_registry::TestMirrorBinder::default());
+        let boxes = BoxRegistry::new(SUBNET)
+            .with_mirror_binder(Arc::clone(&binder) as Arc<dyn crate::box_registry::MirrorBinder>);
+        let proxy_port = 7654;
+        boxes.register_node_namespace(proxy_port);
+        let node = switch::loopback::range_hosts()
+            .nth(201)
+            .expect("a reserved-range host");
+        boxes.open_node_mirror(node).expect("the mirror opens");
+        boxes.node_mirror().set_range_probe(true);
+        let session = boxes::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
+            .expect("a session id");
+        assert!(boxes.admit_host_ip_box(session, None));
+
+        let rpc_port = u16::try_from(crate::sock::VSOCK_BRIDGE_PORT).expect("a TCP-sized port");
+        // Every refusal logs at warn, a repeated one too: the notice rate
+        // cap bounds them, and its counter counts what it drops.
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for port in [
+                rpc_port,
+                proxy_port,
+                minimald_rpc::VM_HOST_BOX_REPORT_PORT as u16,
+            ] {
+                let line =
+                    format!(r#"{{"verb":"listen_notice","port":{port},"state":"listening"}}"#);
+                let request = parse_request(&line).expect("a well-formed notice parses");
+                assert!(oversized_listen_notice(&request, &line).is_none());
+                let BoxControlRequest::ListenNotice(notice) = request else {
+                    panic!("the line is a listen notice");
+                };
+                match listen_notice_reply(&boxes, notice) {
+                    BoxControlReply::Error { error } => assert!(
+                        error.contains("used by the VM's own services"),
+                        "the refusal says why: {error}"
+                    ),
+                    other => panic!("port {port} is the guest's own; got {other:?}"),
+                }
+            }
+            // The registry's own entry refuses them too, so no caller can
+            // reach a bind past the check.
+            for port in [rpc_port, proxy_port] {
+                assert_eq!(
+                    boxes.mirror_notice(minimald_rpc::ListenNotice {
+                        port,
+                        state: minimald_rpc::ListenState::Listening,
+                    }),
+                    crate::box_registry::MirrorOutcome::RefusedInfrastructure,
+                    "port {port} is the guest's own"
+                );
+            }
+        });
+        let log = capture.contents();
+        let refusals: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains("refused a mirrored bind"))
+            .collect();
+        assert_eq!(refusals.len(), 5, "one line per refusal:\n{log}");
+        assert!(
+            refusals
+                .iter()
+                .all(|line| line.contains("WARN") && line.contains("guest-infrastructure-port")),
+            "each refusal is a warn line:\n{log}"
+        );
+        assert_eq!(boxes.node_mirror().notices_dropped_by_rate(), 0);
+        assert!(binder.calls().is_empty(), "no infrastructure port is bound");
+
+        // A notice that names an address, a path or a name is not a notice.
+        for forged in [
+            r#"{"verb":"listen_notice","port":8080,"state":"listening","address":"127.0.0.1"}"#,
+            r#"{"verb":"listen_notice","port":8080,"state":"listening","name":"web"}"#,
+            r#"{"verb":"listen_notice","port":8080,"state":"listening","path":"/x"}"#,
+        ] {
+            assert!(parse_request(forged).is_err(), "refused: {forged}");
+        }
+        let padded = format!(
+            r#"{{"verb":"listen_notice","port":8080,"state":"listening"}}{}"#,
+            " ".repeat(minimald_rpc::ListenNotice::MAX_LINE_BYTES)
+        );
+        let request = parse_request(&padded).expect("trailing spaces still parse");
+        assert!(
+            matches!(
+                oversized_listen_notice(&request, &padded),
+                Some(BoxControlReply::Error { .. })
+            ),
+            "a line past the fixed size is refused"
+        );
+
+        // A forged notice for port 0 is refused: a bind there takes a port
+        // the host picks, and the mirror never moves a port.
+        assert!(matches!(
+            listen_notice_reply(
+                &boxes,
+                minimald_rpc::ListenNotice {
+                    port: 0,
+                    state: minimald_rpc::ListenState::Listening,
+                }
+            ),
+            BoxControlReply::Error { .. }
+        ));
+        assert!(binder.open().is_empty(), "port 0 binds nothing");
+
+        // A box's own port binds at the node's address.
+        let port = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .and_then(|listener| listener.local_addr())
+            .expect("a free port")
+            .port();
+        assert_eq!(
+            listen_notice_reply(
+                &boxes,
+                minimald_rpc::ListenNotice {
+                    port,
+                    state: minimald_rpc::ListenState::Listening,
+                }
+            ),
+            BoxControlReply::PortRecorded {
+                port,
+                proto: IpProto::Tcp
+            }
+        );
+        assert_eq!(binder.open(), vec![(node, port)]);
+        // A stop notice for an infrastructure port is the goal state.
+        assert!(matches!(
+            listen_notice_reply(
+                &boxes,
+                minimald_rpc::ListenNotice {
+                    port: rpc_port,
+                    state: minimald_rpc::ListenState::Stopped,
+                }
+            ),
+            BoxControlReply::PortRecorded { .. }
+        ));
+    }
+
+    /// T126 (NET-138): the host door's read-only `mirror_collisions` verb
+    /// answers the node's mirrored ports that collided with a holder on the
+    /// host, as ports alone. A port leaves the list when it binds. The guest
+    /// door does not answer the verb.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mirror_collisions_reported_over_control() {
+        use crate::box_registry::{MirrorBinder, MirrorOutcome, TestMirrorBinder};
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sock_path = dir.path().join(CONTROL_SOCK_FILE);
+        let binder = Arc::new(TestMirrorBinder::default());
+        let boxes = BoxRegistry::new(SUBNET)
+            .with_mirror_binder(Arc::clone(&binder) as Arc<dyn MirrorBinder>);
+        boxes.register_node_namespace(7654);
+        let node = switch::loopback::range_hosts()
+            .nth(200)
+            .expect("the reserved range has more than 200 hosts");
+        boxes
+            .open_node_mirror(node)
+            .expect("a reserved-range address no row holds opens the mirror");
+        boxes.node_mirror().set_range_probe(true);
+        let session = boxes::SessionId::parse_str("00000000-0000-4000-8000-000000000001")
+            .expect("a session id");
+        assert!(boxes.admit_host_ip_box(session, None));
+        let answerer = AnswererStatus::allocating_for_tests("control-test-node");
+        let proxy_publish = ProxyPublishStatus::new();
+        let _server = spawn(
+            sock_path.clone(),
+            boxes.clone(),
+            answerer.clone(),
+            proxy_publish.clone(),
+        )
+        .expect("server binds");
+        for _ in 0..500 {
+            if TestStream::connect(&sock_path).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        assert_eq!(
+            read_mirror_collisions(&sock_path).await,
+            Some(Vec::new()),
+            "a node with no collision answers an empty list"
+        );
+
+        let holder =
+            std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a holder on the host");
+        let port = holder.local_addr().expect("the holder's address").port();
+        assert_eq!(
+            boxes.mirror_notice(minimald_rpc::ListenNotice {
+                port,
+                state: minimald_rpc::ListenState::Listening,
+            }),
+            MirrorOutcome::Collided
+        );
+        assert_eq!(read_mirror_collisions(&sock_path).await, Some(vec![port]));
+        let since = boxes.node_mirror().collisions_since();
+        assert_eq!(since.len(), 1);
+        assert_eq!(since[0].0, port);
+
+        // The raw reply carries the ports and nothing else.
+        let mut stream = TestStream::connect(&sock_path).expect("connects");
+        stream
+            .write_all(b"{\"verb\":\"mirror_collisions\"}\n")
+            .expect("writes");
+        let mut raw = String::new();
+        BufReader::new(stream).read_line(&mut raw).expect("reads");
+        let value: serde_json_lenient::Value =
+            serde_json_lenient::from_str(raw.trim()).expect("the reply is JSON");
+        assert_eq!(
+            value,
+            serde_json_lenient::json!({ "mirror_collisions": [port] }),
+            "the reply carries ports only"
+        );
+
+        // Once the holder is gone and the port binds, it leaves the list.
+        drop(holder);
+        assert_eq!(
+            boxes.mirror_notice(minimald_rpc::ListenNotice {
+                port,
+                state: minimald_rpc::ListenState::Listening,
+            }),
+            MirrorOutcome::Bound
+        );
+        assert_eq!(read_mirror_collisions(&sock_path).await, Some(Vec::new()));
+
+        // The guest door does not answer the verb.
+        let guest = spawn_guest_reports_door(&sock_path, boxes.clone(), answerer, proxy_publish)
+            .expect("the guest door binds");
+        assert_eq!(read_mirror_collisions(&guest).await, None);
+    }
+
+    /// The reconcile thread's read, as a test drives it: each call says it
+    /// started on `calls`, then waits for the test's answer on `answers`.
+    type GuestList = anyhow::Result<std::collections::BTreeMap<boxes::SessionId, boxes::BoxState>>;
+
+    fn scripted_guest_reader(
+        calls: std::sync::mpsc::Sender<()>,
+        answers: std::sync::mpsc::Receiver<GuestList>,
+    ) -> impl FnMut() -> GuestList + Send + 'static {
+        move || {
+            calls
+                .send(())
+                .map_err(|_| anyhow::anyhow!("the test ended"))?;
+            answers
+                .recv()
+                .map_err(|_| anyhow::anyhow!("the test ended"))?
+        }
+    }
+
+    fn reconcile_session(n: u8) -> boxes::SessionId {
+        boxes::SessionId::parse_str(&format!("00000000-0000-4000-8000-0000000000{n:02}"))
+            .expect("a session id")
+    }
+
+    fn resident_host_ip_sessions(registry: &BoxRegistry) -> Vec<boxes::SessionId> {
+        registry
+            .table()
+            .host_ip_boxes()
+            .iter()
+            .map(|rules| rules.session_id())
+            .collect()
+    }
+
+    /// Polls until the resident `host_ip` boxes are `want`, or panics.
+    fn wait_for_resident(registry: &BoxRegistry, want: &[boxes::SessionId]) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while resident_host_ip_sessions(registry) != want {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the resident host_ip boxes stayed {:?}, not {want:?}",
+                resident_host_ip_sessions(registry)
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// NET-085: the reconcile thread reads the in-VM daemon's session list
+    /// on a guest-door nudge and on its timer, and hands each list to the
+    /// registry. A read that fails changes nothing.
+    #[test]
+    fn host_ip_reconcile_thread_runs_on_nudge_and_timer() {
+        const NOT_SOON: Duration = Duration::from_secs(3600);
+        let read_timeout = Duration::from_secs(10);
+
+        // A nudge runs a pass, with the timer far away.
+        let registry = BoxRegistry::new(SUBNET);
+        let (stopped, live) = (reconcile_session(1), reconcile_session(2));
+        assert!(registry.admit_host_ip_box(stopped, None));
+        assert!(registry.admit_host_ip_box(live, None));
+        let (calls_tx, calls) = std::sync::mpsc::channel();
+        let (answers, answers_rx) = std::sync::mpsc::channel();
+        let nudge = spawn_host_ip_reconcile_with(
+            registry.clone(),
+            NOT_SOON,
+            scripted_guest_reader(calls_tx, answers_rx),
+        )
+        .expect("the reconcile thread starts");
+        nudge.nudge();
+        calls
+            .recv_timeout(read_timeout)
+            .expect("a nudge reads the session list");
+        answers
+            .send(Ok(std::collections::BTreeMap::from([
+                (stopped, boxes::BoxState::Stopped),
+                (live, boxes::BoxState::Active),
+            ])))
+            .expect("the reader waits");
+        wait_for_resident(&registry, &[live]);
+
+        // A failed read changes nothing: an empty list would drop `live`
+        // and forget `stopped`'s set-aside rules.
+        nudge.nudge();
+        calls
+            .recv_timeout(read_timeout)
+            .expect("a second nudge reads again");
+        answers
+            .send(Err(anyhow::anyhow!("the in-VM daemon did not answer")))
+            .expect("the reader waits");
+        // The next read starts only after the failed pass is done.
+        nudge.nudge();
+        calls
+            .recv_timeout(read_timeout)
+            .expect("a third nudge reads again");
+        assert_eq!(resident_host_ip_sessions(&registry), vec![live]);
+        assert!(registry.holds_host_ip_boxes());
+        // The guest runs the stopped box again: it rejoins.
+        answers
+            .send(Ok(std::collections::BTreeMap::from([
+                (stopped, boxes::BoxState::Active),
+                (live, boxes::BoxState::Active),
+            ])))
+            .expect("the reader waits");
+        wait_for_resident(&registry, &[stopped, live]);
+        drop(answers);
+
+        // The timer runs a pass with no nudge.
+        let registry = BoxRegistry::new(SUBNET);
+        let reaped = reconcile_session(3);
+        assert!(registry.admit_host_ip_box(reaped, None));
+        let (calls_tx, calls) = std::sync::mpsc::channel();
+        let (answers, answers_rx) = std::sync::mpsc::channel();
+        let _timer_only = spawn_host_ip_reconcile_with(
+            registry.clone(),
+            Duration::from_millis(50),
+            scripted_guest_reader(calls_tx, answers_rx),
+        )
+        .expect("the reconcile thread starts");
+        calls
+            .recv_timeout(read_timeout)
+            .expect("the timer reads the session list");
+        answers
+            .send(Ok(std::collections::BTreeMap::new()))
+            .expect("the reader waits");
+        wait_for_resident(&registry, &[]);
+        assert!(
+            !registry.holds_host_ip_boxes(),
+            "a box the guest no longer lists is forgotten"
+        );
+        drop(answers);
+    }
+
+    /// NET-085: a pass that drops a box a client admitted since the pass
+    /// before it runs one more pass after the least gap, with no nudge and
+    /// the timer far away. A resumed box then rejoins soon. A drop of a box
+    /// admitted before the previous pass runs no extra pass.
+    #[test]
+    fn host_ip_reconcile_thread_runs_again_after_dropping_a_new_admit() {
+        const NOT_SOON: Duration = Duration::from_secs(3600);
+        let read_timeout = Duration::from_secs(10);
+        let registry = BoxRegistry::new(SUBNET);
+        let (resumed, live) = (reconcile_session(1), reconcile_session(2));
+        assert!(registry.admit_host_ip_box(live, None));
+        let (calls_tx, calls) = std::sync::mpsc::channel();
+        let (answers, answers_rx) = std::sync::mpsc::channel();
+        let nudge = spawn_host_ip_reconcile_with(
+            registry.clone(),
+            NOT_SOON,
+            scripted_guest_reader(calls_tx, answers_rx),
+        )
+        .expect("the reconcile thread starts");
+        nudge.nudge();
+        calls
+            .recv_timeout(read_timeout)
+            .expect("a nudge reads the session list");
+        answers
+            .send(Ok(std::collections::BTreeMap::from([(
+                live,
+                boxes::BoxState::Active,
+            )])))
+            .expect("the reader waits");
+
+        // A resume admits the box before the guest runs it again.
+        assert!(registry.admit_host_ip_box(resumed, None));
+        nudge.nudge();
+        calls
+            .recv_timeout(read_timeout)
+            .expect("a second nudge reads again");
+        let resume_pending = || {
+            Ok(std::collections::BTreeMap::from([
+                (resumed, boxes::BoxState::Stopped),
+                (live, boxes::BoxState::Active),
+            ]))
+        };
+        answers.send(resume_pending()).expect("the reader waits");
+        wait_for_resident(&registry, &[live]);
+
+        // No nudge: the thread reads once more after the least gap.
+        calls
+            .recv_timeout(read_timeout)
+            .expect("a drop of a new admit runs one more pass");
+        answers
+            .send(Ok(std::collections::BTreeMap::from([
+                (resumed, boxes::BoxState::Active),
+                (live, boxes::BoxState::Active),
+            ])))
+            .expect("the reader waits");
+        wait_for_resident(&registry, &[resumed, live]);
+
+        // The box stops again. Its admit is older than the previous pass,
+        // so the drop runs no extra pass.
+        nudge.nudge();
+        calls
+            .recv_timeout(read_timeout)
+            .expect("a nudge reads again");
+        answers.send(resume_pending()).expect("the reader waits");
+        wait_for_resident(&registry, &[live]);
+        assert!(
+            calls.recv_timeout(HOST_IP_RECONCILE_MIN_GAP * 3).is_err(),
+            "an old admit's drop runs no extra pass"
+        );
+        drop(answers);
+    }
+
+    /// NET-085: a failed read does not advance the mark of the last pass
+    /// that read the list. A box a client admitted before the failed read
+    /// and dropped by the next good pass still gets its one more pass.
+    #[test]
+    fn host_ip_reconcile_thread_runs_again_after_a_failed_read() {
+        const NOT_SOON: Duration = Duration::from_secs(3600);
+        let read_timeout = Duration::from_secs(10);
+        let registry = BoxRegistry::new(SUBNET);
+        let (resumed, live) = (reconcile_session(1), reconcile_session(2));
+        assert!(registry.admit_host_ip_box(live, None));
+        let (calls_tx, calls) = std::sync::mpsc::channel();
+        let (answers, answers_rx) = std::sync::mpsc::channel();
+        let nudge = spawn_host_ip_reconcile_with(
+            registry.clone(),
+            NOT_SOON,
+            scripted_guest_reader(calls_tx, answers_rx),
+        )
+        .expect("the reconcile thread starts");
+        nudge.nudge();
+        calls
+            .recv_timeout(read_timeout)
+            .expect("a nudge reads the session list");
+        answers
+            .send(Ok(std::collections::BTreeMap::from([(
+                live,
+                boxes::BoxState::Active,
+            )])))
+            .expect("the reader waits");
+
+        // A resume admits the box, and the next read fails.
+        assert!(registry.admit_host_ip_box(resumed, None));
+        nudge.nudge();
+        calls
+            .recv_timeout(read_timeout)
+            .expect("a second nudge reads again");
+        answers
+            .send(Err(anyhow::anyhow!("the in-VM daemon did not answer")))
+            .expect("the reader waits");
+
+        // The next good read drops the box before the guest runs it again.
+        nudge.nudge();
+        calls
+            .recv_timeout(read_timeout)
+            .expect("a third nudge reads again");
+        answers
+            .send(Ok(std::collections::BTreeMap::from([
+                (resumed, boxes::BoxState::Stopped),
+                (live, boxes::BoxState::Active),
+            ])))
+            .expect("the reader waits");
+        wait_for_resident(&registry, &[live]);
+
+        // No nudge: the admit predates the last good read, so one more
+        // pass runs after the least gap.
+        calls
+            .recv_timeout(read_timeout)
+            .expect("a drop of an admit from before a failed read runs one more pass");
+        answers
+            .send(Ok(std::collections::BTreeMap::from([
+                (resumed, boxes::BoxState::Active),
+                (live, boxes::BoxState::Active),
+            ])))
+            .expect("the reader waits");
+        wait_for_resident(&registry, &[resumed, live]);
+        drop(answers);
     }
 }
