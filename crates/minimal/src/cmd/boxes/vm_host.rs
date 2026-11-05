@@ -635,10 +635,10 @@ impl HostIpResidency {
     }
 
     /// Keeps the admitted policy: the session stays, so its destroy retires
-    /// it ([`release_held_box_name`]). The policy also stays while the box
-    /// is `stopped` or `exited`, so the gate's union can include a box with
-    /// no live process until its destroy.
-    /// <https://github.com/gominimal/minimal/issues/2747> owns this case.
+    /// it ([`release_held_box_name`]). While the box is `stopped` or
+    /// `exited`, the VM host daemon's reconcile against the in-VM daemon's
+    /// session list drops the box's rules from the gate's union. A resume
+    /// that runs the box again restores them.
     pub(crate) fn keep(&mut self) {
         self.kept = true;
     }
