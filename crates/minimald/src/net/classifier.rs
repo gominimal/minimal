@@ -552,6 +552,11 @@ pub const QUIC443_BLOCKED_DIR: &str = "quic443-blocked";
 /// `scripts/install-host-classifier.sh`.
 pub const QUIC443_LEAF_SET: &str = "quic443_blocked_leaves";
 
+/// The name of the guest table's set of box leaves that can open a TCP
+/// connection to the Box Egress Proxy's address (BEP-083). Spelled the same
+/// as `PROXY_LANE_SET` in `scripts/install-host-classifier.sh`.
+pub const PROXY_LANE_SET: &str = "bep_lane_leaves";
+
 /// The cohort's blocked leaf under the classifier tree `root`:
 /// `<root>/boxes/quic443-blocked`.
 #[must_use]
@@ -617,6 +622,27 @@ pub(crate) trait CgroupMoves {
             std::io::ErrorKind::Unsupported,
             format!(
                 "{} cannot be removed from the blocked set here",
+                leaf.display()
+            ),
+        ))
+    }
+    /// Adds the box leaf `leaf` to the guest table's set of leaves that
+    /// can connect to the proxy's address ([`PROXY_LANE_SET`], BEP-083).
+    /// The default changes no set and fails, as
+    /// [`Self::add_blocked_leaf`] says.
+    fn add_lane_leaf(&self, leaf: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("{} cannot be added to the lane set here", leaf.display()),
+        ))
+    }
+    /// Removes the box leaf `leaf` from that set. The default changes no
+    /// set and fails, as [`Self::add_blocked_leaf`] says.
+    fn remove_lane_leaf(&self, leaf: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "{} cannot be removed from the lane set here",
                 leaf.display()
             ),
         ))
@@ -766,6 +792,16 @@ impl std::error::Error for CohortPlaceError {
 /// `deny` subtree stays where it is: its leaf already refuses everything
 /// but its resolver, UDP 443 included. The daemon's one cohort is
 /// [`cohort_quic443`].
+///
+/// The cohort also keeps each member's lane bit (BEP-083): whether the
+/// member declares a credentialed upstream that is in effect. The own leaf
+/// of each lane member in the `allow` subtree is in the guest table's
+/// [`PROXY_LANE_SET`] while it is resident
+/// ([`CgroupMoves::add_lane_leaf`]), and only a socket created in a leaf of
+/// that set can connect to the proxy's address. So a lane member is never
+/// moved into the blocked leaf. It stays in its own leaf, and its own leaf
+/// in the blocked-leaves set refuses its UDP 443. A member that declares no
+/// lane is never in the lane set.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CohortQuic443 {
     /// Each resident member's resolved stance, by box id: `true` where it
@@ -785,6 +821,12 @@ pub struct CohortQuic443 {
     /// The own leaves in the table's blocked-leaves set, by box id: the
     /// leaves whose add succeeded and that were not removed since.
     listed: std::collections::BTreeMap<String, PathBuf>,
+    /// The resident members that declare a credentialed upstream in effect
+    /// (BEP-083): the members whose own leaf belongs in the lane set.
+    lanes: std::collections::BTreeSet<String>,
+    /// The own leaves in the guest table's lane set, by box id: the leaves
+    /// whose add succeeded and that were not removed since.
+    lane_listed: std::collections::BTreeMap<String, PathBuf>,
 }
 
 impl CohortQuic443 {
@@ -796,6 +838,91 @@ impl CohortQuic443 {
             homes: std::collections::BTreeMap::new(),
             moved: std::collections::BTreeMap::new(),
             listed: std::collections::BTreeMap::new(),
+            lanes: std::collections::BTreeSet::new(),
+            lane_listed: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// The own leaves in the guest table's lane set, as far as this cohort
+    /// knows: the adds that succeeded, less the removes.
+    pub fn lane_leaves(&self) -> impl Iterator<Item = &Path> {
+        self.lane_listed.values().map(PathBuf::as_path)
+    }
+
+    /// The resident members that declare a lane in effect.
+    pub fn lane_members(&self) -> impl Iterator<Item = &str> {
+        self.lanes.iter().map(String::as_str)
+    }
+
+    /// Brings the guest table's lane set in step with the cohort: the own
+    /// leaf of every resident lane member in the `allow` subtree, and no
+    /// other leaf (BEP-083). Each change logs one info line with the box,
+    /// its leaf and the lane members. A refused remove stays recorded for
+    /// the next change, unless the leaf is gone. A refused add is logged
+    /// and not recorded, so the next change tries it again. A refused add
+    /// fails closed: the member's connections to the proxy's address stay
+    /// refused, and its launch goes on.
+    fn sync_lane_set(&mut self, moves: &dyn CgroupMoves) {
+        let want: std::collections::BTreeMap<String, PathBuf> = self
+            .homes
+            .iter()
+            .filter(|(id, _)| self.lanes.contains(*id))
+            .map(|(id, leaf)| (id.clone(), leaf.clone()))
+            .collect();
+        let stale: Vec<(String, PathBuf)> = self
+            .lane_listed
+            .iter()
+            .filter(|(id, leaf)| want.get(*id) != Some(*leaf))
+            .map(|(id, leaf)| (id.clone(), leaf.clone()))
+            .collect();
+        for (id, leaf) in stale {
+            if moves.remove_lane_leaf(&leaf).is_ok() {
+                self.lane_listed.remove(&id);
+                self.log_lane_change(&id, &leaf, false);
+            } else if !leaf.exists() {
+                // A gone cgroup's id is never reused: its element matches
+                // no socket.
+                self.lane_listed.remove(&id);
+            }
+        }
+        for (id, leaf) in want {
+            if self.lane_listed.contains_key(&id) {
+                continue;
+            }
+            match moves.add_lane_leaf(&leaf) {
+                Ok(()) => {
+                    self.log_lane_change(&id, &leaf, true);
+                    self.lane_listed.insert(id, leaf);
+                }
+                Err(error) => tracing::warn!(
+                    box_id = id,
+                    leaf = %leaf.display(),
+                    %error,
+                    "cannot add a host-address box's own leaf to the set that can connect \
+                     to the proxy's address; its connections there stay refused until the \
+                     next change of the cohort"
+                ),
+            }
+        }
+    }
+
+    /// The one info line per change of the lane set.
+    fn log_lane_change(&self, box_id: &str, leaf: &Path, added: bool) {
+        let lane_members: Vec<&str> = self.lane_members().collect();
+        if added {
+            tracing::info!(
+                box_id,
+                leaf = %leaf.display(),
+                lane_members = ?lane_members,
+                "added a host-address box's own leaf to the set that can connect to the proxy's address"
+            );
+        } else {
+            tracing::info!(
+                box_id,
+                leaf = %leaf.display(),
+                lane_members = ?lane_members,
+                "removed a host-address box's own leaf from the set that can connect to the proxy's address"
+            );
         }
     }
 
@@ -891,6 +1018,7 @@ impl CohortQuic443 {
     /// counting at once.
     pub fn leave(&mut self, box_id: &str) {
         self.members.remove(box_id);
+        self.lanes.remove(box_id);
     }
 
     /// Whether the cohort blocks UDP to port 443: any resident member's
@@ -921,10 +1049,11 @@ impl CohortQuic443 {
 
     /// The leaf a process injected into `box_id` must join: the blocked
     /// leaf while the cohort blocks and the box's processes move into it,
-    /// `None` when the box's own leaf is the right one.
+    /// `None` when the box's own leaf is the right one. A lane member's
+    /// processes never move, so its answer is always `None` (BEP-083).
     #[must_use]
     pub fn injection_leaf(&self, box_id: &str) -> Option<&Path> {
-        if self.blocked() && self.homes.contains_key(box_id) {
+        if self.blocked() && self.homes.contains_key(box_id) && !self.lanes.contains(box_id) {
             self.blocked_leaf.as_deref()
         } else {
             None
@@ -967,6 +1096,7 @@ impl CohortQuic443 {
     /// every process in the blocked leaf goes home, as [`Self::depart`]
     /// does. `home` is the box's own leaf when its processes are to move,
     /// `None` for a box in the `deny` subtree or one placed in no leaf.
+    /// The box declares no lane: [`Self::admit_with_lane`] with `false`.
     ///
     /// # Errors
     ///
@@ -974,6 +1104,7 @@ impl CohortQuic443 {
     /// processes cannot all be placed in the blocked leaf, or a member's
     /// own leaf cannot be added to the blocked-leaves set. The box stays a
     /// member: the caller fails its launch and calls [`Self::depart`].
+    #[cfg(test)]
     pub(crate) fn admit(
         &mut self,
         box_id: &str,
@@ -981,8 +1112,32 @@ impl CohortQuic443 {
         blocked: bool,
         moves: &dyn CgroupMoves,
     ) -> Result<(), CohortPlaceError> {
+        self.admit_with_lane(box_id, home, blocked, false, moves)
+    }
+
+    /// [`Self::admit`] with the box's lane bit (BEP-083). A lane member's
+    /// own leaf joins the guest table's lane set while it is resident, and
+    /// its processes stay in that leaf when the cohort blocks.
+    ///
+    /// # Errors
+    ///
+    /// The [`CohortPlaceError`] of [`Self::admit`]. A refused add to the
+    /// lane set is logged and is not an error.
+    pub(crate) fn admit_with_lane(
+        &mut self,
+        box_id: &str,
+        home: Option<PathBuf>,
+        blocked: bool,
+        lane: bool,
+        moves: &dyn CgroupMoves,
+    ) -> Result<(), CohortPlaceError> {
         let was = self.blocked();
         self.join(box_id, blocked);
+        if lane {
+            self.lanes.insert(box_id.to_string());
+        } else {
+            self.lanes.remove(box_id);
+        }
         match home {
             Some(home) => {
                 self.homes.insert(box_id.to_string(), home);
@@ -996,6 +1151,7 @@ impl CohortQuic443 {
             self.log_flip(box_id);
         }
         let listed = self.sync_leaf_set(moves);
+        self.sync_lane_set(moves);
         if !now {
             if was {
                 self.move_all_home(None, moves);
@@ -1026,6 +1182,7 @@ impl CohortQuic443 {
         // A stop cannot fail. A refused add here is a leaf whose launch
         // already failed on it, and the helper logged the refusal.
         let _ = self.sync_leaf_set(moves);
+        self.sync_lane_set(moves);
         let now = self.blocked();
         if was && !now {
             self.log_flip(box_id);
@@ -1069,6 +1226,11 @@ impl CohortQuic443 {
         let Some(home) = self.homes.get(box_id).cloned() else {
             return Ok(());
         };
+        // BEP-083: a lane member stays in its own leaf, the leaf the lane
+        // set names. Its own leaf in the blocked-leaves set refuses UDP 443.
+        if self.lanes.contains(box_id) {
+            return Ok(());
+        }
         let Some(blocked_leaf) = self.blocked_leaf.clone() else {
             return Err(CohortPlaceError::NoBlockedLeaf);
         };
@@ -1187,7 +1349,8 @@ pub(crate) fn cohort_quic443() -> &'static std::sync::Mutex<CohortQuic443> {
 
 /// A `host_ip` box joins `cohort` with its resolved stance
 /// ([`CohortQuic443::admit`]). Its processes move when it sits in the
-/// `allow` subtree of the classifier tree `root`.
+/// `allow` subtree of the classifier tree `root`. `lane` is the box's lane
+/// bit (BEP-083).
 ///
 /// # Errors
 ///
@@ -1197,6 +1360,7 @@ pub(crate) fn cohort_quic443_admit_over(
     root: &Path,
     box_id: &str,
     blocked: bool,
+    lane: bool,
     moves: &dyn CgroupMoves,
 ) -> Result<(), CohortPlaceError> {
     let home = sandbox::classifier::box_leaf(root, box_id, Verdict::Allow);
@@ -1205,7 +1369,7 @@ pub(crate) fn cohort_quic443_admit_over(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     cohort.learn_blocked_leaf(quic443_blocked_leaf(root));
-    cohort.admit(box_id, home, blocked, moves)
+    cohort.admit_with_lane(box_id, home, blocked, lane, moves)
 }
 
 /// A `host_ip` box leaves `cohort` ([`CohortQuic443::depart`]). A box
@@ -1242,6 +1406,8 @@ pub(crate) struct StandinMoves {
     /// The leaves the stand-in helper refuses to remove, as a transient
     /// failure of `sudo` or `nft` would.
     pub(crate) unremovable: std::sync::Mutex<std::collections::BTreeSet<PathBuf>>,
+    /// The leaves in the stand-in lane set (BEP-083).
+    pub(crate) lane: std::sync::Mutex<std::collections::BTreeSet<PathBuf>>,
 }
 
 #[cfg(test)]
@@ -1312,6 +1478,16 @@ impl CgroupMoves for StandinMoves {
             return Err(std::io::Error::from_raw_os_error(libc::EBUSY));
         }
         self.listed.lock().unwrap().remove(leaf);
+        Ok(())
+    }
+
+    fn add_lane_leaf(&self, leaf: &Path) -> std::io::Result<()> {
+        self.lane.lock().unwrap().insert(leaf.to_path_buf());
+        Ok(())
+    }
+
+    fn remove_lane_leaf(&self, leaf: &Path) -> std::io::Result<()> {
+        self.lane.lock().unwrap().remove(leaf);
         Ok(())
     }
 }
@@ -2118,6 +2294,10 @@ pub struct GuestRender<'a> {
     pub node_plane_address: IpAddr,
     /// The ct-mark bits the table classifies with.
     pub ct_mark_mask: u32,
+    /// The Box Egress Proxy's listener (BEP-083). The table refuses a new
+    /// TCP connection from the boxes subtree to its address, at its port or
+    /// at 443, unless the socket's own leaf is in [`PROXY_LANE_SET`].
+    pub proxy_listener: std::net::SocketAddrV4,
     /// A stand-in mount table, tests only.
     pub mountinfo_override: Option<&'a Path>,
 }
@@ -2288,6 +2468,11 @@ pub fn render_guest_ruleset_over(
         // cgroup from this DSCP mark instead of from the source address.
         .arg("--cohort-dscp")
         .arg(boxes::core::egress::BOX_COHORT_DSCP.to_string())
+        // BEP-083: only a box whose own leaf is in the lane set can open a
+        // connection to the proxy's address, so a host-address box with no
+        // credentialed upstream is refused there inside the VM.
+        .arg("--proxy-lane")
+        .arg(params.proxy_listener.to_string())
         .env_clear()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -3656,8 +3841,19 @@ fn guest_params<'a>(
         cohort_address: cohort,
         node_plane_address: node_plane,
         ct_mark_mask: GUEST_CT_MARK_MASK,
+        proxy_listener: guest_proxy_listener(),
         mountinfo_override: mountinfo,
     }
+}
+
+/// The proxy's listener a guest's own boot renders its table with: the
+/// proxy's address on the default subnet, at the listener port (BEP-083).
+#[cfg(test)]
+fn guest_proxy_listener() -> std::net::SocketAddrV4 {
+    std::net::SocketAddrV4::new(
+        crate::net::SwitchSubnet::default().box_egress_proxy_address(),
+        boxes::core::egress::PROXY_LISTENER_PORT,
+    )
 }
 
 /// The guest's rendered table for one pair of source identities, as its own
@@ -5614,6 +5810,7 @@ mod tests {
         // resolver.
         let print_mount = standin_mount();
         let dscp = boxes::core::egress::BOX_COHORT_DSCP.to_string();
+        let lane = guest_proxy_listener().to_string();
         let printed = run_step(
             &print_mount,
             &[
@@ -5622,6 +5819,8 @@ mod tests {
                 GUEST_RESOLVER_FLAGS[1],
                 "--cohort-dscp",
                 &dscp,
+                "--proxy-lane",
+                &lane,
             ],
             None,
         );
@@ -5663,6 +5862,8 @@ mod tests {
                 GUEST_RESOLVER_FLAGS[3],
                 "--cohort-dscp",
                 &dscp,
+                "--proxy-lane",
+                &lane,
             ],
             stub.path(),
         );
@@ -6376,6 +6577,164 @@ mod tests {
         );
     }
 
+    /// BEP-083: the guest's table refuses a new TCP connection from the
+    /// boxes subtree to the proxy's address, at the listener port or at
+    /// 443, unless the socket was created in a box leaf of the lane set.
+    /// The refusal is the deny chain's: the same named counter, log prefix
+    /// and reject. A native install, which takes no `--proxy-lane`, renders
+    /// none of it. The helper's `lane-add` and `lane-remove` change one
+    /// element of the lane set, under the same check as `add`.
+    #[test]
+    fn guest_render_refuses_the_proxy_address_outside_the_lane_set() {
+        let guest_ip = IpAddr::V4(crate::net::SwitchSubnet::default().daemon_ip());
+        let ruleset = String::from_utf8(guest_ruleset(guest_ip, guest_ip))
+            .expect("the guest's render is text");
+        let listener = guest_proxy_listener();
+        let slice = Path::new(sandbox::classifier::TREE_ROOT)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("the tree root is a named slice");
+        let boxes_rel = format!("{slice}/{}", sandbox::classifier::BOXES_DIR);
+        let leaf_rel = format!("{boxes_rel}/{}/grant", sandbox::config::ALLOW_DIR);
+        let level = leaf_rel.split('/').count();
+
+        let lines: Vec<&str> = ruleset.lines().map(str::trim).collect();
+        let set = format!("set {PROXY_LANE_SET} {{");
+        let at_set = lines
+            .iter()
+            .position(|line| *line == set)
+            .unwrap_or_else(|| panic!("the guest's table declares the lane set: {ruleset}"));
+        assert_eq!(
+            lines.get(at_set + 1..at_set + 3),
+            Some(
+                &[
+                    format!("typeof socket cgroupv2 level {level}").as_str(),
+                    "}"
+                ][..]
+            ),
+            "the lane set holds box leaves and is declared empty: {ruleset}"
+        );
+
+        let output = chain_rules(&ruleset, "output");
+        let gate = format!(
+            "ct state new ip daddr {} tcp dport {{ {}, 443 }} socket cgroupv2 level {} \
+             \"{boxes_rel}\" jump proxy_lane",
+            listener.ip(),
+            listener.port(),
+            boxes_rel.split('/').count(),
+        );
+        assert_eq!(
+            output.last(),
+            Some(&gate.as_str()),
+            "the output chain sends the boxes subtree's new connections to the \
+             proxy's address at its port and at 443 to the lane chain: {output:?}"
+        );
+        let deny = chain_rules(&ruleset, "deny_out");
+        let lane = chain_rules(&ruleset, "proxy_lane");
+        assert_eq!(
+            lane.first(),
+            Some(&format!("socket cgroupv2 level {level} @{PROXY_LANE_SET} return").as_str()),
+            "a socket created in a leaf of the lane set goes on: {lane:?}"
+        );
+        assert_eq!(
+            lane[1..],
+            deny[deny.len() - 3..],
+            "every other socket meets the deny chain's counter, log and reject"
+        );
+        assert!(
+            lane.last()
+                .is_some_and(|rule| *rule == "reject with icmpx admin-prohibited"),
+            "the refusal is active, so a connect fails at once: {lane:?}"
+        );
+
+        let mount = standin_mount();
+        let native = run_step(&mount, &["--print-ruleset"], None);
+        let native = String::from_utf8_lossy(&native.stdout);
+        assert!(
+            !native.contains(PROXY_LANE_SET) && !native.contains("proxy_lane"),
+            "a native install renders no proxy lane: {native}"
+        );
+
+        // The helper's lane verbs change one element of the lane set.
+        let stub = tempfile::tempdir().expect("a dir for the recording nft");
+        recording_nft(stub.path(), &[]);
+        let scratch = tempfile::tempdir().expect("a dir for the helper");
+        let helper = scratch.path().join("lib/quic443-leaf");
+        let sudoers = scratch.path().join("sudoers.d/minimal-quic443-leaf");
+        let (uid, gid) = delegated_owner();
+        let installed = step_command(&mount, &GUEST_RESOLVER_FLAGS, Some(stub.path()))
+            .env("SUDO_UID", uid.to_string())
+            .env("SUDO_GID", gid.to_string())
+            .env("MINIMAL_OVERRIDE_QUIC443_HELPER", &helper)
+            .env("MINIMAL_OVERRIDE_QUIC443_SUDOERS", &sudoers)
+            .output()
+            .expect("running the install");
+        assert!(
+            installed.status.success(),
+            "the install succeeds: {}{}",
+            String::from_utf8_lossy(&installed.stdout),
+            String::from_utf8_lossy(&installed.stderr),
+        );
+        let calls_before = nft_calls(stub.path()).len();
+        let home = sandbox::classifier::create_box_leaf(&mount.root, "grant", Verdict::Allow)
+            .expect("the box's own leaf");
+        let run = |verb: &str, leaf: &Path| {
+            std::process::Command::new(&helper)
+                .arg(verb)
+                .arg(leaf)
+                .output()
+                .expect("running the helper")
+        };
+        for verb in ["lane-add", "lane-remove"] {
+            let ran = run(verb, &home);
+            assert!(
+                ran.status.success(),
+                "the helper runs {verb} for {}: {}",
+                home.display(),
+                String::from_utf8_lossy(&ran.stderr)
+            );
+        }
+        let deny_leaf = sandbox::classifier::create_box_leaf(&mount.root, "sealed", Verdict::Deny)
+            .expect("a deny box's leaf");
+        for leaf in [deny_leaf, quic443_blocked_leaf(&mount.root)] {
+            let ran = run("lane-add", &leaf);
+            assert_eq!(
+                ran.status.code(),
+                Some(2),
+                "the helper refuses {}: {}",
+                leaf.display(),
+                String::from_utf8_lossy(&ran.stderr)
+            );
+        }
+        let element = format!("{{ \"{leaf_rel}\" }}");
+        let changes: Vec<Vec<String>> = nft_calls(stub.path())[calls_before..]
+            .iter()
+            .map(|(argv, _)| argv.clone())
+            .collect();
+        assert_eq!(
+            changes,
+            [
+                vec![
+                    "add",
+                    "element",
+                    "inet",
+                    "minimal_class",
+                    PROXY_LANE_SET,
+                    &element
+                ],
+                vec![
+                    "delete",
+                    "element",
+                    "inet",
+                    "minimal_class",
+                    PROXY_LANE_SET,
+                    &element
+                ],
+            ],
+            "the lane verbs change one element of the lane set, and nothing else"
+        );
+    }
+
     /// NET-079: the guest loads the installer's own render, not a second
     /// spelling of it kept in step. The daemon compiles the installer in
     /// from the one file — `include_str!`, never a copy staged anywhere a
@@ -6411,6 +6770,7 @@ mod tests {
             // The guest's render also names the box mark, which a native
             // install never takes, so the step is handed the same flag.
             let dscp = boxes::core::egress::BOX_COHORT_DSCP.to_string();
+            let lane = guest_proxy_listener().to_string();
             let step = step_command_over(
                 &mount,
                 &[
@@ -6421,6 +6781,8 @@ mod tests {
                     GUEST_RESOLVER_FLAGS[3],
                     "--cohort-dscp",
                     &dscp,
+                    "--proxy-lane",
+                    &lane,
                 ],
                 None,
                 &cohort.to_string(),
@@ -6497,6 +6859,8 @@ mod tests {
                 format!("0x{:08x}", GUEST_CT_MARK_MASK),
                 "--cohort-dscp".to_string(),
                 boxes::core::egress::BOX_COHORT_DSCP.to_string(),
+                "--proxy-lane".to_string(),
+                guest_proxy_listener().to_string(),
             ],
             "every parameter arrives as argv after --print-ruleset, none \
              interpolated into the script the daemon pipes"
@@ -6716,10 +7080,15 @@ mod tests {
             !ruleset.contains(&format!("ip daddr {gateway}")),
             "the gateway's resolver is no longer admitted:\n{ruleset}"
         );
-        assert!(
-            !ruleset.contains("tcp dport"),
-            "no TCP destination is admitted or steered:\n{ruleset}"
-        );
+        // The proxy lane's rule names TCP ports too, but it only refuses
+        // (BEP-083), so the deny and dstnat chains are the ones to read.
+        for chain in ["deny_out", "dstnat"] {
+            let rules = chain_rules(&ruleset, chain);
+            assert!(
+                rules.iter().all(|rule| !rule.contains("tcp dport")),
+                "no TCP destination is admitted or steered in {chain}: {rules:?}"
+            );
+        }
         for chain in ["output", "classify", "postrouting"] {
             let rules = chain_rules(&ruleset, chain);
             assert!(
@@ -7957,7 +8326,7 @@ mod tests {
             .expect("the box's own leaf");
         moves.spawn_in(10, &home);
         moves.fork(10, 11);
-        cohort_quic443_admit_over(&cohort, &mount.root, "grant", true, &moves)
+        cohort_quic443_admit_over(&cohort, &mount.root, "grant", true, false, &moves)
             .expect("the grant box is placed");
         let guard = cohort.lock().unwrap();
         assert!(guard.blocked());
@@ -7971,7 +8340,7 @@ mod tests {
         let deny = sandbox::classifier::create_box_leaf(&mount.root, "sealed", Verdict::Deny)
             .expect("the deny box's own leaf");
         moves.spawn_in(20, &deny);
-        cohort_quic443_admit_over(&cohort, &mount.root, "sealed", false, &moves)
+        cohort_quic443_admit_over(&cohort, &mount.root, "sealed", false, false, &moves)
             .expect("the deny box needs no move");
         assert_eq!(moves.where_is(20), deny);
     }

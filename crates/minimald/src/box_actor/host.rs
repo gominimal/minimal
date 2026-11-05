@@ -100,13 +100,96 @@ impl crate::net::classifier::CgroupMoves for HostMoves {
             leaf,
         )
     }
+
+    // BEP-083: the lane set changes through the helper's lane verbs.
+    fn add_lane_leaf(&self, leaf: &std::path::Path) -> std::io::Result<()> {
+        change_lane_set("lane-add", leaf)
+    }
+
+    fn remove_lane_leaf(&self, leaf: &std::path::Path) -> std::io::Result<()> {
+        change_lane_set("lane-remove", leaf)
+    }
+}
+
+/// Changes the guest table's lane set for the box leaf `leaf` (BEP-083):
+/// `verb` is the helper's `lane-add` or `lane-remove`. A daemon that does
+/// not run as root runs the helper through `sudo -n`, as it does for the
+/// blocked-leaves set. A daemon that runs as root, as the VM guest's does,
+/// has no helper and no `sudo` to run, so it hands `nft` the element the
+/// helper would.
+fn change_lane_set(verb: &str, leaf: &std::path::Path) -> std::io::Result<()> {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    if unsafe { libc::geteuid() } != 0 {
+        return run_quic443_leaf_helper(
+            std::path::Path::new("sudo"),
+            std::path::Path::new(QUIC443_LEAF_HELPER),
+            verb,
+            leaf,
+        );
+    }
+    run_lane_nft(
+        std::path::Path::new(crate::net::classifier::GUEST_NFT),
+        std::path::Path::new(sandbox::classifier::CONVENTIONAL_CGROUP2_MOUNTPOINT),
+        verb,
+        leaf,
+    )
+}
+
+/// The root daemon's half of [`change_lane_set`]: runs `nft` to add or
+/// delete the element for `leaf`, spelled as its path below the cgroup2
+/// mount `mount`, in the table's lane set. A refusal is logged with what
+/// `nft` said, and returned.
+fn run_lane_nft(
+    nft: &std::path::Path,
+    mount: &std::path::Path,
+    verb: &str,
+    leaf: &std::path::Path,
+) -> std::io::Result<()> {
+    let nft_verb = if verb == "lane-add" { "add" } else { "delete" };
+    let rel = leaf.strip_prefix(mount).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not below {}", leaf.display(), mount.display()),
+        )
+    })?;
+    let ran = std::process::Command::new(nft)
+        .arg(nft_verb)
+        .arg("element")
+        .arg("inet")
+        .arg("minimal_class")
+        .arg(crate::net::classifier::PROXY_LANE_SET)
+        .arg(format!("{{ \"{}\" }}", rel.display()))
+        .stdin(std::process::Stdio::null())
+        .output();
+    let error = match ran {
+        Ok(ran) if ran.status.success() => return Ok(()),
+        Ok(ran) => std::io::Error::other(format!(
+            "{} exited with {}: {}",
+            nft.display(),
+            ran.status,
+            String::from_utf8_lossy(&ran.stderr).trim()
+        )),
+        Err(error) => std::io::Error::new(
+            error.kind(),
+            format!("cannot run {}: {error}", nft.display()),
+        ),
+    };
+    tracing::warn!(
+        leaf = %leaf.display(),
+        verb,
+        %error,
+        "nft refused a change to the set of leaves that can connect to the proxy's address"
+    );
+    Err(error)
 }
 
 /// The `host_ip` launch's half of the cohort's QUIC stance (BEP-018): the
 /// launched box joins the daemon's cohort with its resolved `quic443`
 /// stance, and its processes move into the cohort's blocked leaf while any
 /// member blocks. A box that is not a host-address box (no
-/// `host_ip_enforcement`) shares no address and joins nothing.
+/// `host_ip_enforcement`) shares no address and joins nothing. The box
+/// joins with its lane bit (BEP-083): it declares a credentialed upstream,
+/// and the lane is in effect on a host of kind `host`.
 ///
 /// # Errors
 ///
@@ -117,6 +200,7 @@ impl crate::net::classifier::CgroupMoves for HostMoves {
 pub(super) fn join_quic443_cohort(
     record: &Record,
     host_ip_enforcement: Option<minimald_rpc::HostIpEnforcement>,
+    host: paths::HostKind,
     root: &std::path::Path,
     cohort: &std::sync::Mutex<crate::net::classifier::CohortQuic443>,
     moves: &dyn crate::net::classifier::CgroupMoves,
@@ -126,8 +210,11 @@ pub(super) fn join_quic443_cohort(
     }
     let box_id = record.id.to_string();
     let blocked = crate::net::classifier::resolved_quic443_blocked(&record.policy);
-    let placed =
-        crate::net::classifier::cohort_quic443_admit_over(cohort, root, &box_id, blocked, moves);
+    let lane = record.policy.credentialed_upstream.is_some()
+        && boxes::CredentialedUpstream::in_effect(record.network, host);
+    let placed = crate::net::classifier::cohort_quic443_admit_over(
+        cohort, root, &box_id, blocked, lane, moves,
+    );
     if let Err(error) = &placed {
         tracing::warn!(
             box_id,
@@ -1039,9 +1126,13 @@ impl BoxActor {
         let box_id = record.id.to_string();
         let joins = joins_quic443_cohort(&record, host_ip_enforcement);
         let launch = joins.then(|| begin_quic443_launch(&box_id, quic443_launches()));
+        // BEP-083: the lane bit is in effect for a host-address box on a VM
+        // host only, so the join reads the host kind from the switch.
+        let host_kind = box_runtime::host_kind_of(self.net_switch.lock().await.transport());
         if let Err(error) = join_quic443_cohort(
             &record,
             host_ip_enforcement,
+            host_kind,
             std::path::Path::new(sandbox::classifier::TREE_ROOT),
             crate::net::classifier::cohort_quic443(),
             &HostMoves,
@@ -1966,6 +2057,100 @@ mod quic443_cohort_tests {
         }
     }
 
+    /// BEP-083 over the launch and stop paths: on a VM host, the own leaf
+    /// of a host-address box that declares a credentialed upstream is in
+    /// the lane set while it runs, and a member that declares none is never
+    /// in it. While the cohort blocks UDP 443, the lane member stays in its
+    /// own leaf, and its own leaf is in the blocked-leaves set. The
+    /// lane-less member moves into the blocked leaf. On a native host the
+    /// lane is not in effect, and the set stays empty.
+    #[test]
+    fn lane_less_cohort_member_stays_out_of_the_proxy_lane_set() {
+        use boxes::core::bep::Quic443;
+
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path();
+        std::fs::create_dir_all(
+            root.join(sandbox::classifier::BOXES_DIR)
+                .join(sandbox::config::ALLOW_DIR),
+        )
+        .unwrap();
+        std::fs::create_dir(quic443_blocked_leaf(root)).unwrap();
+        let blocked_leaf = quic443_blocked_leaf(root);
+        let cohort = std::sync::Mutex::new(CohortQuic443::default());
+        let moves = StandinMoves::default();
+        let launch = |record: &Record, host: paths::HostKind, pid: i32| {
+            let leaf =
+                sandbox::classifier::create_box_leaf(root, &record.id.to_string(), Verdict::Allow)
+                    .unwrap();
+            moves.spawn_in(pid, &leaf);
+            join_quic443_cohort(
+                record,
+                record.host_ip_enforcement,
+                host,
+                root,
+                &cohort,
+                &moves,
+            )
+            .expect("the box is placed");
+            leaf
+        };
+        let mut grant = host_ip_record(None);
+        grant.policy.credentialed_upstream = Some(boxes::CredentialedUpstream::default());
+        let grant_leaf = launch(&grant, paths::HostKind::Minvmd, 100);
+        assert_eq!(
+            *moves.lane.lock().unwrap(),
+            [grant_leaf.clone()].into_iter().collect(),
+            "the declaring member's own leaf is in the lane set"
+        );
+
+        let plain = host_ip_record(Some(Quic443::Block));
+        let plain_leaf = launch(&plain, paths::HostKind::Minvmd, 200);
+        assert_eq!(
+            *moves.lane.lock().unwrap(),
+            [grant_leaf.clone()].into_iter().collect(),
+            "the member that declares no lane is never in the lane set"
+        );
+        assert_eq!(
+            moves.where_is(100),
+            grant_leaf,
+            "the lane member stays in its own leaf while the cohort blocks"
+        );
+        assert_eq!(
+            moves.where_is(200),
+            blocked_leaf,
+            "the lane-less member moves into the blocked leaf"
+        );
+        assert_eq!(
+            *moves.listed.lock().unwrap(),
+            [grant_leaf.clone(), plain_leaf].into_iter().collect(),
+            "both own leaves are refused UDP 443"
+        );
+        {
+            let cohort = cohort.lock().unwrap();
+            assert_eq!(cohort.injection_leaf(&grant.id.to_string()), None);
+            assert_eq!(
+                cohort.injection_leaf(&plain.id.to_string()),
+                Some(blocked_leaf.as_path())
+            );
+        }
+
+        leave_quic443_cohort(&grant.id.to_string(), &cohort, &moves);
+        assert!(
+            moves.lane.lock().unwrap().is_empty(),
+            "the stop takes the lane member's leaf out of the lane set"
+        );
+        leave_quic443_cohort(&plain.id.to_string(), &cohort, &moves);
+
+        let mut native = host_ip_record(None);
+        native.policy.credentialed_upstream = Some(boxes::CredentialedUpstream::default());
+        launch(&native, paths::HostKind::Minimald, 300);
+        assert!(
+            moves.lane.lock().unwrap().is_empty(),
+            "on a native host the lane is not in effect"
+        );
+    }
+
     /// BEP-018 over the launch and stop paths: a blocking launch puts the
     /// own leaf of every host-address member in the blocked-leaves set,
     /// and its stop takes them all out again.
@@ -1988,8 +2173,15 @@ mod quic443_cohort_tests {
                 sandbox::classifier::create_box_leaf(root, &record.id.to_string(), Verdict::Allow)
                     .unwrap();
             moves.spawn_in(pid, &leaf);
-            join_quic443_cohort(record, record.host_ip_enforcement, root, &cohort, &moves)
-                .expect("the box is placed");
+            join_quic443_cohort(
+                record,
+                record.host_ip_enforcement,
+                paths::HostKind::Minimald,
+                root,
+                &cohort,
+                &moves,
+            )
+            .expect("the box is placed");
             leaf
         };
         let plain = host_ip_record(None);
@@ -2077,8 +2269,15 @@ mod quic443_cohort_tests {
                 sandbox::classifier::create_box_leaf(root, &record.id.to_string(), Verdict::Allow)
                     .unwrap();
             moves.spawn_in(pid, &leaf);
-            join_quic443_cohort(record, record.host_ip_enforcement, root, &cohort, &moves)
-                .expect("the box is placed");
+            join_quic443_cohort(
+                record,
+                record.host_ip_enforcement,
+                paths::HostKind::Minimald,
+                root,
+                &cohort,
+                &moves,
+            )
+            .expect("the box is placed");
             leaf
         };
 
@@ -2108,7 +2307,8 @@ mod quic443_cohort_tests {
         let mut own = host_ip_record(Some(Quic443::Block));
         own.network = NetworkMode::OwnIp;
         own.host_ip_enforcement = None;
-        join_quic443_cohort(&own, None, root, &cohort, &moves).expect("nothing to place");
+        join_quic443_cohort(&own, None, paths::HostKind::Minimald, root, &cohort, &moves)
+            .expect("nothing to place");
         assert_eq!(
             cohort.lock().unwrap().blocking_members().count(),
             1,
@@ -2149,8 +2349,15 @@ mod quic443_cohort_tests {
             sandbox::classifier::create_box_leaf(root, &plain.id.to_string(), Verdict::Allow)
                 .unwrap();
         moves.spawn_in(100, &plain_leaf);
-        join_quic443_cohort(&plain, plain.host_ip_enforcement, root, &cohort, &moves)
-            .expect("nothing to place");
+        join_quic443_cohort(
+            &plain,
+            plain.host_ip_enforcement,
+            paths::HostKind::Minimald,
+            root,
+            &cohort,
+            &moves,
+        )
+        .expect("nothing to place");
 
         // This host's tree has no blocked leaf: the blocked box fails.
         let strict = host_ip_record(Some(Quic443::Block));
@@ -2158,8 +2365,15 @@ mod quic443_cohort_tests {
             sandbox::classifier::create_box_leaf(root, &strict.id.to_string(), Verdict::Allow)
                 .unwrap();
         moves.spawn_in(200, &strict_leaf);
-        let error = join_quic443_cohort(&strict, strict.host_ip_enforcement, root, &cohort, &moves)
-            .expect_err("no leaf to place the cohort in");
+        let error = join_quic443_cohort(
+            &strict,
+            strict.host_ip_enforcement,
+            paths::HostKind::Minimald,
+            root,
+            &cohort,
+            &moves,
+        )
+        .expect_err("no leaf to place the cohort in");
         assert!(
             !cohort.lock().unwrap().blocked(),
             "the block left with its box"
@@ -2176,8 +2390,15 @@ mod quic443_cohort_tests {
         let blocked_leaf = quic443_blocked_leaf(root);
         std::fs::create_dir(&blocked_leaf).unwrap();
         moves.refused.lock().unwrap().insert(100);
-        join_quic443_cohort(&strict, strict.host_ip_enforcement, root, &cohort, &moves)
-            .expect_err("a member that cannot move fails the launch");
+        join_quic443_cohort(
+            &strict,
+            strict.host_ip_enforcement,
+            paths::HostKind::Minimald,
+            root,
+            &cohort,
+            &moves,
+        )
+        .expect_err("a member that cannot move fails the launch");
         let guard = cohort.lock().unwrap();
         assert!(!guard.blocked(), "the block left with its box");
         assert_eq!(guard.blocking_members().count(), 0);
@@ -2224,8 +2445,15 @@ mod quic443_cohort_tests {
             }
             moves.spawn_in(pid, &leaf);
             let number = begin_quic443_launch(&box_id, launches);
-            join_quic443_cohort(record, record.host_ip_enforcement, root, cohort, moves)
-                .expect("the box is placed");
+            join_quic443_cohort(
+                record,
+                record.host_ip_enforcement,
+                paths::HostKind::Minimald,
+                root,
+                cohort,
+                moves,
+            )
+            .expect("the box is placed");
             let (exit, exited) = tokio::sync::oneshot::channel::<i32>();
             // A negative code stands in for a loop that panics.
             let task = crate::traced::spawn(async move {
