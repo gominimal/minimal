@@ -119,6 +119,11 @@ struct Facts {
     /// of this host. The request is refused [`COHORT_MISATTRIBUTED`]
     /// (BEP-084).
     misattributed: bool,
+    /// The box the audit record names: the flow's own box, or for a cohort
+    /// delivery the live `host_ip` box the value names, else the cohort id.
+    /// It is read from the same cohort snapshot as `misattributed`
+    /// (BEP-084).
+    subject: String,
 }
 
 impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
@@ -296,15 +301,15 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
         } else {
             self.boxes.attribution(box_id)
         };
-        let subject = member.as_deref().unwrap_or(box_id);
-        let egress = self.boxes.egress(subject);
+        let subject = member.as_deref().unwrap_or(box_id).to_owned();
+        let egress = self.boxes.egress(&subject);
         tracing::debug!(
             attribution = if matches!(attribution, Attribution::HostIpCohort) {
                 "cohort"
             } else {
                 "box"
             },
-            subject,
+            subject = subject.as_str(),
             misattributed,
             "attributed a sealed value"
         );
@@ -436,6 +441,7 @@ impl<K: HeldKey, C: Keychain> BoxRedeemer<K, C> {
             kind,
             jti,
             misattributed,
+            subject,
         }
     }
 
@@ -613,7 +619,9 @@ where
     /// no box, this is the union of the live `host_ip` boxes' egress: the
     /// reach of the shared address. A request that carries a sealed value
     /// is checked again against the egress of the box the value names
-    /// (BEP-084).
+    /// (BEP-084). A request with no sealed value is checked against the
+    /// union alone. That is the shared address's network reach (BEP-083),
+    /// so the proxy admits nothing the cohort cannot reach directly.
     fn egress(&self, box_id: &str) -> Vec<Authority<String>> {
         if !listener::is_cohort_box_id(box_id) {
             return self.boxes.egress(box_id);
@@ -627,17 +635,6 @@ where
             }
         }
         union
-    }
-
-    /// The box a cohort delivery's record names: the live `host_ip` box the
-    /// value names, or the cohort id when it names none (BEP-084).
-    fn audit_subject(&self, box_id: &str, sealed: &str) -> String {
-        if listener::is_cohort_box_id(box_id)
-            && let Some(member) = self.cohort_member(sealed)
-        {
-            return member;
-        }
-        box_id.to_owned()
     }
 
     fn redeem(
@@ -679,27 +676,49 @@ where
         sealed: &str,
         header: &str,
     ) -> (Redeemed, String) {
+        let (redeemed, jti, _subject) =
+            self.redeem_attributed(box_id, authority, request, sealed, header);
+        (redeemed, jti)
+    }
+
+    /// Decides one request as [`Self::redeem_reference`] does. The subject
+    /// comes from the same [`Self::facts`] as the verdict, so one cohort
+    /// read decides both: a cohort delivery's record names the live
+    /// `host_ip` box the value names, or the cohort id when it names none
+    /// (BEP-084).
+    fn redeem_attributed(
+        &self,
+        box_id: &str,
+        authority: &Authority<String>,
+        request: &RequestAuthority<String>,
+        sealed: &str,
+        header: &str,
+    ) -> (Redeemed, String, String) {
         let now = (self.clock)();
         let facts = self.facts(box_id, authority, request, sealed, now);
         let jti = facts.jti.clone();
+        let subject = facts.subject.clone();
         if facts.misattributed {
             return (
                 Redeemed::Verdict(self.sign_in_verdict(box_id, facts, now)),
                 jti,
+                subject,
             );
         }
         if facts.kind == Some(MemberKind::Store) {
-            return (Self::store_decision(box_id, facts), jti);
+            return (Self::store_decision(box_id, facts), jti, subject);
         }
         if !header.eq_ignore_ascii_case("authorization") {
             return (
                 Redeemed::Verdict(Verdict::Refuse(SEALED_HEADER_MISPLACED)),
                 String::new(),
+                subject,
             );
         }
         (
             Redeemed::Verdict(self.sign_in_verdict(box_id, facts, now)),
             jti,
+            subject,
         )
     }
 }

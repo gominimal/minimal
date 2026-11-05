@@ -358,12 +358,22 @@ pub trait Redeemer: Send + Sync {
         (Redeemed::Verdict(verdict), jti)
     }
 
-    /// The box id the audit record of a request that carries `sealed` on a
-    /// flow from `box_id` names as its subject. The default is the flow's
-    /// own box. A redeemer gives another box where the flow names no single
-    /// box, as a `host_ip` cohort delivery does (BEP-084).
-    fn audit_subject(&self, box_id: &str, _sealed: &str) -> String {
-        box_id.to_owned()
+    /// Decides one request as [`Self::redeem_reference`] does, and gives the
+    /// box id its audit record names as its subject, third. The default
+    /// subject is the flow's own box. A redeemer gives another box where the
+    /// flow names no single box, as a `host_ip` cohort delivery does
+    /// (BEP-084). It decides the subject in the same step as the verdict,
+    /// so the record names the box the verdict was reached for.
+    fn redeem_attributed(
+        &self,
+        box_id: &str,
+        authority: &Authority<String>,
+        request: &RequestAuthority<String>,
+        sealed: &str,
+        header: &str,
+    ) -> (Redeemed, String, String) {
+        let (redeemed, jti) = self.redeem_reference(box_id, authority, request, sealed, header);
+        (redeemed, jti, box_id.to_owned())
     }
 }
 
@@ -1053,12 +1063,11 @@ impl Flow {
                 // The record's box is the one the redeemer names for the
                 // value: the flow's own, or for a cohort flow the box the
                 // value names (BEP-084).
-                let subject = self.redeemer.audit_subject(&self.box_id, &at.value);
                 let header = request
                     .headers
                     .get(at.header)
                     .map_or("", |h| h.name.as_str());
-                let (redeemed, jti) = self.redeemer.redeem_reference(
+                let (redeemed, jti, subject) = self.redeemer.redeem_attributed(
                     &self.box_id,
                     &self.authority,
                     &plain.request,
