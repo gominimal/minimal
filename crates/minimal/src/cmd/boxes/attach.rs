@@ -1066,7 +1066,7 @@ where
         ENTRYPOINT_END_SETTLE
     };
     let after = box_after_attach_settled(&target.host, target.box_id, settle).await;
-    let ending = exec_attach_ending(&target, code, &after)?;
+    let ending = exec_attach_ending(&target, &exec_id, code, &after)?;
     tracing::info!(
         verb = "box attach",
         box_id = %target.box_id,
@@ -1083,14 +1083,20 @@ where
 /// what the host said of the box afterwards. It follows [`attach_ending`]:
 /// a stop, a removal or another terminal's attach ends with 254 and its
 /// line. A detach or the exec's own end is 0, whatever code the exec ended
-/// with. `min box wait <box> --exec <id>` reads that code.
+/// with. `min box wait <box> --exec <id>` reads that code. ssh's own 255 is
+/// a lost connection, and its retry names `--exec <id>`.
 pub(crate) fn exec_attach_ending(
     target: &BoxAttachTarget,
+    exec_id: &minimald_rpc::exec::ExecId,
     code: i32,
     after: &BoxAfterAttach,
 ) -> Result<AttachEnding, BoxAttachRefusal> {
     match (code, after) {
-        (SSH_CONNECTION_FAILED | DAEMON_ENDED_ATTACH, _) => attach_ending(target, code, after),
+        (SSH_CONNECTION_FAILED, _) => Err(BoxAttachRefusal::ConnectionLost {
+            host: target.host.host.clone(),
+            address: format!("{} --exec {exec_id}", target.label),
+        }),
+        (DAEMON_ENDED_ATTACH, _) => attach_ending(target, code, after),
         (_, BoxAfterAttach::Gone) => Ok(AttachEnding {
             code: DAEMON_ENDED_ATTACH,
             notice: Some(format!("Detached: {} was removed.", target.label)),

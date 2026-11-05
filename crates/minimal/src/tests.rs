@@ -8459,8 +8459,9 @@ async fn box_attach_exec_box_stopped_exit254_names_stop() {
     );
 
     let target = ending_target("local0");
+    let exec_id = minimald_rpc::exec::ExecId::parse(AN_EXEC_ID).unwrap();
     assert_eq!(
-        exec_attach_ending(&target, 1, &BoxAfterAttach::Gone),
+        exec_attach_ending(&target, &exec_id, 1, &BoxAfterAttach::Gone),
         Ok(AttachEnding {
             code: 254,
             notice: Some("Detached: web was removed.".to_owned())
@@ -8469,6 +8470,7 @@ async fn box_attach_exec_box_stopped_exit254_names_stop() {
     assert_eq!(
         exec_attach_ending(
             &target,
+            &exec_id,
             254,
             &BoxAfterAttach::Listed(ending_entry("running"))
         ),
@@ -8478,11 +8480,74 @@ async fn box_attach_exec_box_stopped_exit254_names_stop() {
         })
     );
     assert_eq!(
-        exec_attach_ending(&target, 7, &BoxAfterAttach::Listed(ending_entry("running"))),
+        exec_attach_ending(
+            &target,
+            &exec_id,
+            7,
+            &BoxAfterAttach::Listed(ending_entry("running"))
+        ),
         Ok(AttachEnding {
             code: 0,
             notice: None
         })
+    );
+    // ssh's own 255 is a lost connection. The retry names the exec.
+    let lost = exec_attach_ending(
+        &target,
+        &exec_id,
+        255,
+        &BoxAfterAttach::Listed(ending_entry("running")),
+    )
+    .expect_err("a lost connection is refused");
+    assert_eq!(
+        lost.to_string(),
+        format!(
+            "The connection to host local0 failed during the attach. \
+             Run `min box attach web --exec {AN_EXEC_ID}` to attach again."
+        )
+    );
+}
+
+/// BCLI-068: a stop whose entrypoint outlives SIGTERM writes the stopped
+/// record only at the end of its grace period, long after the daemon ended
+/// the attached exec's channel with 254. The command waits for the record,
+/// and ends with 254 and the stop's line.
+#[tokio::test]
+async fn box_attach_exec_late_stop_record_exit254_names_stop() {
+    let (alpha, state) = exec_attach_host("alpha.local-minvmd0").await;
+    let web = alpha.create("web", Some(true)).await;
+    write_exec_event(
+        &state,
+        web,
+        boxes::events::BoxEventType::ExecStarted,
+        AN_EXEC_ID,
+        true,
+    );
+    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
+    let attach = box_attach_exec_on_hosts(
+        vec![alpha.host.clone()],
+        "web",
+        AN_EXEC_ID,
+        true,
+        async move |_: &BoxAttachTarget, _: &minimald_rpc::exec::ExecId| {
+            let _ = closed_tx.send(());
+            Ok(254)
+        },
+    );
+    let stop = async {
+        closed_rx.await.expect("the attach ran");
+        // Past the 500 ms the command waits after an exec's own end.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert_eq!(address_state(&alpha.host, "web").await, "running");
+        alpha.stop("web").await;
+    };
+    let (ending, ()) = tokio::join!(attach, stop);
+    assert_eq!(
+        ending.expect("the attach ends"),
+        AttachEnding {
+            code: 254,
+            notice: Some("Detached: web was stopped.".to_owned())
+        }
     );
 }
 
