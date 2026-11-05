@@ -295,9 +295,10 @@ impl ChildPipes {
     }
 }
 
-/// The connection-variable name under which a task run stages the
-/// directory its box's entrypoint starts in (`inherit_cwd`). A launch takes
-/// it out before the environment is built, so it never reaches the box.
+/// The name among a task run's entrypoint variables
+/// ([`AttachEnv::entrypoint`]) under which the run stages the directory its
+/// box's entrypoint starts in (`inherit_cwd`). A launch takes it out before
+/// the environment is built, so it never reaches the box.
 /// The `:` keeps it apart from any variable name a task can declare.
 pub(crate) const START_DIR_KEY: &str = "minimal:start-dir";
 
@@ -543,6 +544,13 @@ pub(crate) struct AttachEnv {
     /// sandbox has no host `/dev/pts` and the Unix-socket transport has no peer
     /// address, so any value would name something that doesn't exist in-session.)
     pub(crate) connection: Vec<(String, String)>,
+    /// A task run's resolved variables (T43), and the directory it starts
+    /// in under [`START_DIR_KEY`]: for the argv entrypoint's process alone,
+    /// layered above everything else in its environment. They can hold
+    /// values the caller's shell gave, secrets among them. So neither the
+    /// box's environment nor the host's connection layer keeps them, and no
+    /// later exec, attach or hook in the box sees them.
+    pub(crate) entrypoint: Vec<(String, String)>,
 }
 
 impl AttachEnv {
@@ -1556,13 +1564,15 @@ impl BoxLauncher for SandboxLauncher {
         // follow any that the composition sets. A count that is not a
         // number adds no pairs, so the pairs the box set stay as they are.
         let mut connection = attach_env.connection;
-        // A task run's start directory rides the connection variables (see
-        // [`START_DIR_KEY`]). Only an argv entrypoint starts there.
-        let start_dir = connection
+        // A task run's start directory rides its entrypoint variables (see
+        // [`START_DIR_KEY`]). Only an argv entrypoint starts there, and only
+        // an argv entrypoint gets the variables.
+        let mut entrypoint_vars = attach_env.entrypoint;
+        let start_dir = entrypoint_vars
             .iter()
             .rposition(|(key, _)| key == START_DIR_KEY)
-            .map(|at| connection.remove(at).1);
-        connection.retain(|(key, _)| key != START_DIR_KEY);
+            .map(|at| entrypoint_vars.remove(at).1);
+        entrypoint_vars.retain(|(key, _)| key != START_DIR_KEY);
         let git_config_count = composition_vars
             .iter()
             .chain(&connection)
@@ -1784,6 +1794,11 @@ impl BoxLauncher for SandboxLauncher {
                     let mut command = env
                         .command(&container, program, args.iter().map(String::as_str))
                         .map_err(|e| io::Error::other(format!("build command: {e}")))?;
+                    // The task run's variables reach this process, and the
+                    // processes it starts, and nothing else in the box.
+                    for (key, value) in &entrypoint_vars {
+                        command.env(key, value);
+                    }
                     // `inherit_cwd`: the in-box `min task run` reads its
                     // `$PWD`, so the argv starts where the client ran.
                     if let Some(dir) = &start_dir {

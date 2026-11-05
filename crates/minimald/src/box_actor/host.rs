@@ -394,8 +394,8 @@ pub(crate) mod entrypoint_env {
             .insert(id, (vars, start_dir, drops));
     }
 
-    /// Takes what is staged for box `id`: the launch's connection
-    /// variables, and the names to drop. A staged directory rides among the
+    /// Takes what is staged for box `id`: the launch's entrypoint
+    /// variables (`AttachEnv::entrypoint`), and the names to drop. A staged directory rides among the
     /// variables under [`crate::box_runtime::START_DIR_KEY`], which the
     /// launch takes out and starts the entrypoint in. A dropped name is left
     /// out of them. Only a launch records the names for the box's in-box run
@@ -1048,14 +1048,11 @@ impl BoxActor {
             host_kind,
             &box_runtime::launch_proxy_env(&record, subnet, host_kind),
         );
-        let mut connection_env = box_runtime::place_launch_deliveries(
+        let connection_env = box_runtime::place_launch_deliveries(
             &mut attach_env,
             record.id,
             &box_runtime::launch_deliveries(&record),
         );
-        // A task run's start directory is for this launch alone. The host
-        // never layers it onto what it runs later.
-        connection_env.remove(box_runtime::START_DIR_KEY);
         // The box starts from its stored spec. The actor keeps its hold, so
         // the next launch reads the same spec. A stored spec that cannot be
         // read refuses the launch, as a resume of it is refused: the box's
@@ -1603,7 +1600,10 @@ impl BoxActor {
                 UNATTACHED_WIN_SIZE,
                 box_runtime::AttachEnv {
                     inherited: Vec::new(),
-                    connection: staged_env,
+                    connection: Vec::new(),
+                    // For the entrypoint's process alone: a later exec in
+                    // the box never sees a task run's variables.
+                    entrypoint: staged_env,
                 },
                 None,
                 LaunchPhase::Attached,

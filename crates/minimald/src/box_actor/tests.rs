@@ -2005,6 +2005,71 @@ async fn a_joining_task_run_keeps_the_launch_recorded_drops() {
     );
 }
 
+/// T43: a task run's variables reach the box's entrypoint and nothing else
+/// in the box. They can hold values from the caller's shell, secrets among
+/// them, so a later exec in the box does not see them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_task_runs_variables_reach_only_its_entrypoint() {
+    use crate::box_actor::entrypoint_env;
+    use std::collections::BTreeSet;
+
+    let dir = tempfile::tempdir().unwrap();
+    let seen = dir.path().join("seen");
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let script = format!(
+        r#"printf '%s' "$TASK_SECRET" > '{}'; sleep 600"#,
+        seen.display()
+    );
+    let id = create_task_box(&mut client, &["/bin/sh", "-c", &script]).await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves");
+
+    entrypoint_env::stage(
+        id,
+        vec![("TASK_SECRET".to_string(), "s3cret".to_string())],
+        None,
+        BTreeSet::new(),
+    );
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the run launches the box's entrypoint");
+    let entry = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(value) = std::fs::read_to_string(&seen)
+                && !value.is_empty()
+            {
+                return value;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the entrypoint writes what it sees");
+    assert_eq!(entry, "s3cret", "the entrypoint sees the task's variable");
+
+    let output = host
+        .command_in_session_env(
+            "/bin/sh",
+            ["-c", r#"printf '%s' "${TASK_SECRET-unset}""#],
+            Default::default(),
+        )
+        .await
+        .expect("an exec's command builds")
+        .output()
+        .expect("the exec runs");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "unset",
+        "a later exec in the box sees the task run's variable"
+    );
+}
+
 /// T43: destroying a box removes the dropped names a launch recorded for
 /// it, so the daemon keeps no entry per task box once the box is gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

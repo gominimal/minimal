@@ -2665,6 +2665,7 @@ mod proxy_env_tests {
                     "http://elsewhere:3128".to_string(),
                 ),
             ],
+            entrypoint: vec![],
         };
         let laned = record(NetworkMode::OwnIp, Some(steering(Steering::ProxyEnv)));
         let vars = launch_proxy_env(&laned, switch::DEFAULT_SUBNET, paths::HostKind::Minimald);

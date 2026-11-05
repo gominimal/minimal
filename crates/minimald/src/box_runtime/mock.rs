@@ -101,6 +101,10 @@ pub(crate) struct MockLauncher {
     /// what the mock starts, through [`LaunchSpec::entrypoint`], as it
     /// decides what the real launcher starts.
     spec: LaunchSpec,
+    /// A task run's variables for the argv entrypoint alone
+    /// ([`super::AttachEnv::entrypoint`]), set on its process as the real
+    /// launcher sets them.
+    entrypoint_env: Vec<(String, String)>,
 }
 
 #[cfg(test)]
@@ -154,6 +158,15 @@ impl MockLauncher {
         self.spec = spec;
         self
     }
+
+    /// This mock with a task run's entrypoint variables, as the box's
+    /// actor hands them to the launch that starts the entrypoint. The
+    /// start directory among them is left out: the mock runs host-side.
+    pub(crate) fn and_entrypoint_env(mut self, mut vars: Vec<(String, String)>) -> Self {
+        vars.retain(|(key, _)| key != super::START_DIR_KEY);
+        self.entrypoint_env = vars;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -202,6 +215,7 @@ impl BoxLauncher for MockLauncher {
             LaunchEntrypoint::Argv { program, args } => {
                 let mut command = std::process::Command::new(program);
                 command.args(args);
+                command.envs(self.entrypoint_env.iter().cloned());
                 command
             }
         };

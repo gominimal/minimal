@@ -7289,6 +7289,7 @@ async fn sealed_value_is_placed_in_its_grant_variable_only() {
             ("TERM".to_string(), "xterm-256color".to_string()),
             ("GH_TOKEN".to_string(), PLAINTEXT.to_string()),
         ],
+        entrypoint: vec![],
     };
     let connection_env = place_launch_deliveries(
         &mut attach_env,
@@ -7376,6 +7377,7 @@ fn sealed_value_reaches_the_shell_launch_environment() {
     let mut attach_env = AttachEnv {
         inherited: vec![("LANG".to_string(), "C.UTF-8".to_string())],
         connection: vec![("TERM".to_string(), "xterm-256color".to_string())],
+        entrypoint: vec![],
     };
     let kept = place_launch_deliveries(
         &mut attach_env,
@@ -7408,6 +7410,7 @@ fn sealed_value_reaches_the_shell_launch_environment() {
     let mut plain = AttachEnv {
         inherited: vec![],
         connection: vec![("TERM".to_string(), "xterm-256color".to_string())],
+        entrypoint: vec![],
     };
     let kept = place_launch_deliveries(&mut plain, boxes::SessionId::nil(), &[]);
     assert_eq!(kept.len(), 1, "{kept:?}");
