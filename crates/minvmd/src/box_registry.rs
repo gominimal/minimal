@@ -4763,7 +4763,9 @@ impl BoxRegistry {
 
     /// Withdraws the `host_ip` registration name `name` while it still
     /// answers `id`: the creator's activation failed after it registered,
-    /// so no box will retire under the name ([`Self::retire_host_ip_box`]).
+    /// so no box will retire under the name ([`Self::retire_host_ip_box`]),
+    /// or the box was renamed and keeps its id under its new name. The
+    /// withdraw retires nothing and revokes nothing.
     /// A name a later registration took answers another id and stays. The
     /// id stays for the collision check (BEP-082). Returns whether the name
     /// was withdrawn.
@@ -13520,5 +13522,40 @@ mod tests {
             "the end of a box with no grant sends nothing to the proxy"
         );
         assert!(wired.holds_host_ip_id(id));
+    }
+
+    // BEP-082: a rename withdraws the old registration name by the box's
+    // id. The box stays admitted under its id, and a new grant box under
+    // the old name takes a fresh id. The first id stays in the minted set,
+    // so no later mint takes it.
+    #[test]
+    fn a_renamed_host_ip_grant_box_frees_its_old_name_for_a_fresh_id() {
+        let registry = BoxRegistry::new(SUBNET);
+        let first = registry
+            .register_host_ip_box_as("web", [0x2f; 16])
+            .expect("no record holds the id");
+        let session = boxes::SessionId::from_bytes(first);
+        assert!(registry.admit_host_ip_box_with_lane(session, None, true));
+        assert!(
+            matches!(
+                registry.register_host_ip_box_as("web", [0x30; 16]),
+                Err(AllocationError::NameAlreadyHeld { .. })
+            ),
+            "an admitted box holds its registration name"
+        );
+
+        assert!(registry.withdraw_host_ip_name("web", first));
+        assert!(!revocation_spawned(first), "the withdraw revokes nothing");
+        assert!(!registry.host_ip_id_is_named(first));
+
+        let fresh = registry
+            .register_host_ip_box_as("web", [0x31; 16])
+            .expect("the old name is free once withdrawn");
+        assert_ne!(fresh, first, "a new box under the name takes a fresh id");
+        assert_eq!(registry.host_ip_id_for("web"), Some(fresh));
+        assert!(
+            registry.holds_host_ip_id(first),
+            "the renamed box's id stays in the minted set"
+        );
     }
 }
