@@ -959,13 +959,19 @@ pub enum TaskCommand {
     /// Run a declared task in a task box
     ///
     /// Creates a box for the project (named `<task>-<n>`), uploads the
-    /// project like `min session activate`, runs the task inside it with
-    /// output streamed to the terminal, and exits with the task's exit code.
+    /// project like `min session activate`, runs the task inside it, and
+    /// exits with the task's exit code.
+    ///
+    /// The task runs without a terminal. A piped or redirected stdin goes to
+    /// the task, and the task sees its end. A terminal stdin gives the task
+    /// no input. The task's stdout is this command's stdout, and the task's
+    /// stderr is this command's stderr. So a pipeline works:
+    /// `cat q.sql | min task run query > out.csv`.
+    ///
     /// When the task ends, the box stays with its exit code: see it with
     /// `min box show <task>-<n>` and remove it with `min box rm <task>-<n>`.
     /// Ctrl-C destroys the box and exits 130 without relaying the interrupt
-    /// to the task itself. The task does not read stdin. Use
-    /// `min session attach` for interactive work.
+    /// to the task itself. Use `min session attach` for interactive work.
     Run(TaskRunArgs),
 }
 
