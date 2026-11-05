@@ -484,6 +484,9 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
     let detail = model.details.get(key);
     let record = detail.and_then(|d| d.record.as_ref());
     let network = record.map(|r| r.network);
+    // BEP-085: the credentialed-upstream row reads the box's host kind, from
+    // the sidebar group the box is listed under.
+    let host_kind = crate::dash::rpc::host_kind_of_label(&key.host);
     let mut lines: Vec<Line> = Vec::new();
 
     if network == Some(boxes::NetworkMode::NoNet) {
@@ -502,7 +505,7 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
         {
             lines.push(Line::raw(format!(
                 "  {}",
-                boxes::CredentialedUpstream::policy_row(network)
+                boxes::CredentialedUpstream::policy_row(network, host_kind)
             )));
         }
     } else {
@@ -563,7 +566,7 @@ fn policy_lines(model: &Model, key: &SessionKey) -> Vec<Line<'static>> {
                 if policy.credentialed_upstream.is_some() {
                     let row = network.map_or_else(
                         || boxes::CredentialedUpstream::POLICY_ROW.to_string(),
-                        boxes::CredentialedUpstream::policy_row,
+                        |network| boxes::CredentialedUpstream::policy_row(network, host_kind),
                     );
                     lines.push(Line::raw(format!("  {row}")));
                 }

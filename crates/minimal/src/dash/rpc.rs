@@ -39,6 +39,17 @@ const PROBES: &[bool] = &[false, true];
 /// The sidebar group label the native `minimald`'s host carries.
 const HOST_LABEL: &str = "host";
 
+/// The kind of the host behind a sidebar group label: [`HOST_LABEL`] is the
+/// native `minimald`, and every other label is a VM's host.
+#[must_use]
+pub fn host_kind_of_label(label: &str) -> paths::HostKind {
+    if label == HOST_LABEL {
+        paths::HostKind::Minimald
+    } else {
+        paths::HostKind::Minvmd
+    }
+}
+
 /// The sidebar group label the default VM's host carries. A named VM's
 /// group carries the VM's own name; the default VM keeps this one because
 /// it is the identity every saved dashboard state has ever recorded
@@ -342,10 +353,11 @@ pub async fn prepare_attach(
     // retired here once a second lookup finds it gone.
     if let Some(record) = record.as_ref()
         && record.network == NetworkMode::HostNet
-        && crate::host_ip_box_with_vm_host(
+        && crate::host_ip_box_with_vm_host_declaring(
             minimal_client::box_registration::vm_host_control_sock(sock),
             record.id,
             record.policy.egress.clone(),
+            record.policy.credentialed_upstream.is_some(),
             true,
         )
         .await
@@ -1340,6 +1352,56 @@ mod tests {
         assert_eq!(request.switch_address, handed.switch_address);
         assert_eq!(request.loopback_address, handed.loopback_address);
         assert_eq!(request.box_id, None, "the record carries no box id");
+    }
+
+    /// BEP-082: the dashboard's destroy of a `host_ip` box retires the box
+    /// on the VM host daemon first, as `min session destroy` does, so the
+    /// host frees the box's registration name.
+    #[tokio::test]
+    async fn tui_destroy_retires_a_host_ip_box() {
+        use std::io::{BufRead as _, Write as _};
+        let dir = tempfile::TempDir::new().unwrap();
+        // A VM host's state dir: the retire goes only to a VM host daemon.
+        let host_dir = dir.path().join("local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        let ssh_sock = host_dir.join("ssh.sock");
+        let listener = std::os::unix::net::UnixListener::bind(
+            host_dir.join(minimal_client::attach::VM_HOST_CONTROL_SOCK_FILE),
+        )
+        .unwrap();
+        let id = SessionId::from_bytes([7; 16]);
+        // One exchange: the retire. The name hold's release that follows
+        // finds no listener and warns, which the test does not read.
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            // Closed before the reply, so the release finds no listener.
+            drop(listener);
+            let mut reader = std::io::BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let reply = serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::HostIpBox {
+                session_id: id,
+                resident: false,
+            })
+            .unwrap();
+            reader
+                .get_mut()
+                .write_all(format!("{reply}\n").as_bytes())
+                .unwrap();
+            line
+        });
+        let mut record = own_ip_record(None);
+        record.id = id;
+        record.name = Some("web".to_string());
+        record.network = NetworkMode::HostNet;
+        settle_destroyed_box(&ssh_sock, record.id, &record).await;
+        let line = server.join().unwrap();
+        let request: minimald_rpc::BoxControlRequest =
+            serde_json_lenient::from_str(line.trim()).expect("the request is the wire type");
+        let minimald_rpc::BoxControlRequest::RetireHostIpBox(retire) = request else {
+            panic!("a destroyed host_ip box goes by the retire verb first: {request:?}");
+        };
+        assert_eq!(retire.session_id, id);
     }
 
     /// BOX-001: the dashboard's create from a form path `<root>/sub` sends

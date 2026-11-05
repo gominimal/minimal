@@ -845,6 +845,12 @@ impl ServerStateHandle {
     /// compile from it, not the configured port the daemon may have moved off.
     #[cfg(target_os = "linux")]
     pub(crate) async fn set_switch_hostname_proxy_port(&self, port: u16) {
+        // NET-162: from the bind on, no host exposure reaches this port.
+        crate::net::switch::MinimalListeners::daemon().hold(crate::net::switch::MinimalListener {
+            port,
+            protocol: None,
+            name: crate::net::switch::HOSTNAME_PROXY_LISTENER,
+        });
         let switch = Arc::clone(&self.0.lock().await.net_switch);
         let stranded = switch.lock().await.set_hostname_proxy_port(Some(port));
         if stranded > 0 {
@@ -884,6 +890,12 @@ impl ServerStateHandle {
     /// Records the port the box-zone answerer actually listens on (UDP),
     /// once its startup has bound (and, in a microVM, published) it.
     pub(crate) async fn set_zone_answerer_port(&self, port: u16) {
+        // NET-162: from the bind on, no host exposure reaches this port.
+        crate::net::switch::MinimalListeners::daemon().hold(crate::net::switch::MinimalListener {
+            port,
+            protocol: None,
+            name: crate::net::switch::ANSWERER_LISTENER,
+        });
         self.0.lock().await.zone_answerer_port = Some(port);
     }
 
@@ -2517,9 +2529,9 @@ pub(crate) async fn drive_proxy_until_serving(
                 // answer for, not this daemon's to out-wait. The VM host
                 // holds the reservation and owns the retry (a redraw hands
                 // a fresh port, or the start fails naming this one), and
-                // the report is how it hears the failure; a backoff loop
-                // here would leave the VM up with no hostname proxy, which
-                // the host forbids. `publish_on_host` is the in-VM flag, so
+                // the report is how it hears the failure. The VM host
+                // daemon then starts the VM with its proxy down and retries
+                // the port itself. `publish_on_host` is the in-VM flag, so
                 // the report has a listener exactly when it is sent; a
                 // native daemon never reaches this arm at all.
                 if publish_on_host && failure.port_taken && !choice.reselects_when_publish_refused()
@@ -2532,10 +2544,12 @@ pub(crate) async fn drive_proxy_until_serving(
                         %failure.report,
                         "the host holds the hostname proxy's port; reporting the terminal publish failure to the VM host daemon"
                     );
-                    // Recorded first, reported in the background: the drive
-                    // ends here and never waits on the report's vsock dial,
-                    // which can take seconds per try.
-                    proxy.record_unavailable(&state, failure.report).await;
+                    // The VM host daemon records the cause, naming the
+                    // holder it can see, and its held-port watcher owns the
+                    // retry (NET-021). The guest records none, so its note
+                    // never stands in for that cause. Reported in the
+                    // background: the drive ends here and never waits on the
+                    // report's vsock dial, which can take seconds per try.
                     crate::traced::spawn(report_proxy_port_held(host_port));
                     return;
                 }

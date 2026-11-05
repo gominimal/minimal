@@ -436,14 +436,19 @@ pub(crate) async fn host_row_standing(
 /// it makes one token and sends it on every attempt, so a retry of the same
 /// create after a lost or late reply gets the same id. Another create that
 /// asks for a claimed row is refused, and that create fails closed.
+/// `host_ip_name` is the creation name of a `host_ip` box, which has no
+/// row: the host answers with the id the box's registration minted under
+/// that name (BEP-082), and a fresh id when no registration used it.
 pub(crate) async fn mint_box_id(
     control: &ControlChannel,
     switch_address: Option<Ipv4Addr>,
+    host_ip_name: Option<String>,
 ) -> Option<io::Result<minimald_rpc::BoxId>> {
     let channel = box_report_channel(control)?;
     let request = minimald_rpc::BoxControlRequest::MintBoxId(minimald_rpc::MintBoxIdRequest {
         switch_address,
         create_token: Some(uuid::Uuid::new_v4().simple().to_string()),
+        host_ip_name,
     });
     let deadline = tokio::time::Instant::now() + REPORT_DEADLINE;
     let mut last = io::Error::new(io::ErrorKind::TimedOut, "the deadline passed");
@@ -877,10 +882,15 @@ fn send_host_audit(channel: BoxReportChannel, request: minimald_rpc::BoxControlR
 }
 
 /// Reports one dynamic ingress decision to the VM host daemon (NET-046), so
-/// the host keeps its own copy outside the VM. Nothing is sent for a box
-/// with no audit route: a native host, or a box with no switch.
+/// the host keeps its own copy outside the VM. A box with an audit route is
+/// named by its switch address. A box with no route, such as a box with no
+/// switch, is named by `box_id`, and the report goes over the VM host door
+/// of its `control` channel. Nothing is sent on a native host, or when
+/// neither key is known.
 pub(crate) fn report_expose_decision(
     box_name: &str,
+    box_id: Option<boxes::BoxId>,
+    control: Option<&ControlChannel>,
     port: u16,
     decision: boxes::DynamicIngress,
     decided_by: minimald_rpc::ExposeDecidedBy,
@@ -892,13 +902,23 @@ pub(crate) fn report_expose_decision(
         .iter()
         .find(|(_, route)| route.box_name == box_name)
         .map(|(switch_address, route)| (*switch_address, route.channel.clone()));
-    let Some((switch_address, channel)) = route else {
-        return;
+    let (switch_address, box_id, channel) = match route {
+        Some((switch_address, channel)) => (Some(switch_address), None, channel),
+        None => {
+            let Some(box_id) = box_id else {
+                return;
+            };
+            let Some(channel) = control.and_then(box_report_channel) else {
+                return;
+            };
+            (None, Some(box_id), channel)
+        }
     };
     send_host_audit(
         channel,
         minimald_rpc::BoxControlRequest::ReportExposeDecision(minimald_rpc::ExposeDecisionReport {
             switch_address,
+            box_id,
             port,
             decision,
             decided_by,
@@ -2293,6 +2313,7 @@ impl WatchState {
                                 crate::audit::DecisionOutcome::Published,
                                 None,
                             ),
+                            &crate::audit::HostReportKey::default(),
                         )
                         .await
                         {
@@ -2548,6 +2569,7 @@ impl WatchState {
                                         crate::audit::DecisionOutcome::Published,
                                         None,
                                     ),
+                                    &crate::audit::HostReportKey::default(),
                                 )
                                 .await
                                 {
@@ -2765,6 +2787,9 @@ impl WatchState {
         crate::audit::append(
             &self.plan.state_dir,
             &self.listen_record(port, outcome, reason),
+            // A watched box reports through the route its watcher
+            // registered by switch address, so it needs no box id.
+            &crate::audit::HostReportKey::default(),
         )
         .await;
     }

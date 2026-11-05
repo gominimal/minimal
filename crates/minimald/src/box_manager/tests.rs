@@ -3224,6 +3224,8 @@ async fn show_returns_record_state_identity_and_live_execs() {
             reason: Some("stopped".to_string()),
             exit_code: Some(3),
             signal: None,
+            // A session filed with no spec has a terminal.
+            pty_enabled: true,
         }
     );
     assert_eq!(shown.identity, minimald_rpc::BoxIdentity::None);
@@ -3278,6 +3280,71 @@ async fn show_box_finds_a_box_by_the_id_list_prints() {
         .unwrap()
         .expect("the record id still finds the box");
     assert_eq!(by_record_id.record.box_id, box_id);
+}
+
+/// BCLI-068: the listing and the read carry whether the box's stored spec
+/// sets `io.pty_enabled`. A spec that sets it is a terminal box, one that
+/// clears it is not, and a session filed with no spec has a terminal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn box_listing_and_show_carry_pty_enabled() {
+    let (_state, _cache, mngr) = manager().await;
+    let spec = |pty: bool| serde_json_lenient::json!({"v": 1, "io": {"pty_enabled": pty}});
+    let terminal = mngr
+        .create_box_with_spec(
+            rooted_config("terminal", "/home/dev/proj"),
+            Some(spec(true)),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let headless = mngr
+        .create_box_with_spec(
+            rooted_config("headless", "/home/dev/proj"),
+            Some(spec(false)),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let unspecced = mngr
+        .create_session(rooted_config("unspecced", "/home/dev/proj"), None)
+        .await
+        .unwrap();
+    // A session whose stored spec cannot be read: a directory stands where
+    // the file goes. It lists on its Box Type, so with a terminal.
+    let unreadable = mngr
+        .create_session(rooted_config("unreadable", "/home/dev/proj"), None)
+        .await
+        .unwrap();
+    let spec_path = mngr
+        .box_events(unreadable)
+        .await
+        .unwrap()
+        .object
+        .spec_path();
+    std::fs::create_dir(spec_path.as_utf8_path()).unwrap();
+
+    let listing = mngr.list_boxes(None).await.unwrap();
+    for (id, pty) in [
+        (terminal, true),
+        (headless, false),
+        (unspecced, true),
+        (unreadable, true),
+    ] {
+        let listed = listing
+            .iter()
+            .find(|entry| entry.box_id == id)
+            .unwrap_or_else(|| panic!("the listing holds {id}"));
+        assert_eq!(listed.pty_enabled, pty, "listing: {listed:?}");
+        let shown = mngr
+            .show_box(id)
+            .await
+            .unwrap()
+            .expect("the box is retained");
+        assert_eq!(shown.record.pty_enabled, pty, "read: {:?}", shown.record);
+        assert_eq!(&shown.record, listed, "the read and the listing agree");
+    }
 }
 
 /// Creates an `Active` box through the whole create flow a client drives,
@@ -5070,5 +5137,167 @@ async fn stop_racing_natural_end_answers_already_exited() {
     assert!(
         logged.contains("stop: the box already exited before the stop reached it"),
         "the daemon log names the race outcome:\n{logged}"
+    );
+}
+
+/// A classifier tree laid out the way the privileged step installs it, with
+/// a mount table that covers it with `nsdelegate`: every fact the decision
+/// reads off the tree, so the probe's reading (a stand-in) is the one input
+/// it still needs. The guard keeps the tree alive.
+fn stand_in_classifier_tree() -> (TempDir, std::path::PathBuf, String) {
+    let tree = TempDir::new().expect("a temp dir standing in for the classifier tree");
+    let root = tree.path().to_path_buf();
+    for verdict in [
+        sandbox::config::Verdict::Deny,
+        sandbox::config::Verdict::Allow,
+    ] {
+        let subtree = root
+            .join(sandbox::classifier::BOXES_DIR)
+            .join(verdict.dir_name());
+        std::fs::create_dir_all(&subtree).expect("the step makes the subtree");
+        for file in ["cgroup.procs", "cgroup.threads", "cgroup.subtree_control"] {
+            std::fs::write(subtree.join(file), "").expect("the step makes the subtree's files");
+        }
+    }
+    std::fs::create_dir_all(root.join(sandbox::classifier::TABLE_MARKER))
+        .expect("the step writes the table's marker");
+    std::fs::create_dir_all(root.join("ct-mark-mask-0x30000000"))
+        .expect("the step records the ct-mark mask beside the marker");
+    let mountinfo = format!(
+        "35 30 0:26 / {} rw,relatime shared:2 - cgroup2 cgroup2 rw,nsdelegate\n",
+        root.display()
+    );
+    (tree, root, mountinfo)
+}
+
+/// NET-079: a host-address create re-reads the host's classifier fact when
+/// the stored one says the probe could not read the table — the read a
+/// daemon takes before it stands in its own leaf — so the create answers
+/// over the host as it is now. A deny-all box is then created over
+/// `per_box`, and a narrowing declaration is refused naming only the rule
+/// it declared. Any other stored cause, and any other mode's create, is
+/// answered from the stored fact with no re-read.
+// The guard spans the awaited creates on purpose: the fact, the reading
+// stand-in and the tree stand-in are process-global.
+#[expect(
+    clippy::await_holding_lock,
+    reason = "the fact is process-global, so the guard must span the awaited \
+              creates it is set for"
+)]
+#[tokio::test]
+async fn host_ip_create_rereads_a_stale_unreadable_fact() {
+    use crate::net::classifier::{Cause, Decision, Reading};
+    let _fact_window = crate::box_runtime::PROBE_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let (_state, _cache, mngr) = manager().await;
+    let capture = crate::test_harness::captured_log();
+    let (tree, root, mountinfo) = stand_in_classifier_tree();
+    // Resets the process-global stand-ins and the fact on every exit, a
+    // failed assert included, before the fact window's lock is released.
+    // The tree drops after the reset, so no stand-in names a removed path.
+    struct ResetStandins(Option<TempDir>);
+    impl Drop for ResetStandins {
+        fn drop(&mut self) {
+            *CREATE_CLASSIFIER_TREE_STANDIN
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = None;
+            crate::box_runtime::clear_classifier_reading_standin();
+            crate::box_runtime::clear_host_ip_enforcement_fact();
+            drop(self.0.take());
+        }
+    }
+    let _reset = ResetStandins(Some(tree));
+    *CREATE_CLASSIFIER_TREE_STANDIN
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some((root, mountinfo));
+    // The table refuses, as a loaded table does once the daemon is placed.
+    crate::box_runtime::install_classifier_reading_standin(Reading::Refused(Vec::new()));
+    let host_ip = |name: &str, egress: boxes::EgressPolicy| {
+        let mut config = sample_config();
+        config.name = Some(name.to_string());
+        config.network = boxes::NetworkMode::HostNet;
+        config.policy = boxes::BoxPolicy::new(Some(egress), None);
+        config
+    };
+
+    // The stale start-up read: the probe could not read the table.
+    crate::box_runtime::set_host_ip_enforcement_fact(&Decision::undecidable(
+        Cause::ProbeUnreadable,
+    ));
+    mngr.create_session(
+        host_ip("stale-deny-all", boxes::EgressPolicy::deny_all()),
+        None,
+    )
+    .await
+    .expect("a deny-all host-address box is created over the re-read fact");
+    let fact = crate::box_runtime::host_ip_enforcement_fact();
+    assert!(
+        fact.can_decide_per_box() && fact.cause.is_none(),
+        "the create re-read the host and found it decides per box"
+    );
+
+    // The same stale fact, and a box started with `--allow-subnets` alone:
+    // the re-read says the host decides per box, so the create refuses the
+    // narrowing, and names only the rule the box declared.
+    crate::box_runtime::set_host_ip_enforcement_fact(&Decision::undecidable(
+        Cause::ProbeUnreadable,
+    ));
+    let refused = mngr
+        .create_session(
+            host_ip(
+                "stale-allow-subnets",
+                boxes::EgressPolicy {
+                    allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                    ..Default::default()
+                },
+            ),
+            None,
+        )
+        .await
+        .expect_err("a per-box host refuses a narrowing it cannot enforce");
+    assert_eq!(refused.kind(), ErrorKind::InvalidInput);
+    let words = refused.to_string();
+    assert!(
+        words.contains("allow_subnets") && !words.contains("allow_dns_hosts"),
+        "the refusal names only the declared rule: {words}"
+    );
+
+    // Any other stored cause is answered as stored: no re-read.
+    crate::box_runtime::set_host_ip_enforcement_fact(&Decision::undecidable(
+        Cause::TableNotEffective,
+    ));
+    mngr.create_session(
+        host_ip("stored-cause", boxes::EgressPolicy::deny_all()),
+        None,
+    )
+    .await
+    .expect("a create over a stored cause is not refused at create");
+    assert_eq!(
+        crate::box_runtime::host_ip_enforcement_fact().cause,
+        Some(Cause::TableNotEffective),
+        "a create over any other cause does not re-read the host"
+    );
+
+    // An own-address create never re-reads the host-address fact.
+    crate::box_runtime::set_host_ip_enforcement_fact(&Decision::undecidable(
+        Cause::ProbeUnreadable,
+    ));
+    let mut own = sample_config();
+    own.name = Some("own-address".to_string());
+    own.network = boxes::NetworkMode::OwnIp;
+    mngr.create_session(own, None)
+        .await
+        .expect("an own-address box is created");
+    assert_eq!(
+        crate::box_runtime::host_ip_enforcement_fact().cause,
+        Some(Cause::ProbeUnreadable),
+        "an own-address create does not re-read the host"
+    );
+
+    let logged = capture.contents();
+    assert!(
+        logged.contains("reread=true") && logged.contains("reread=false"),
+        "each host-address create logs whether it re-read the fact:\n{logged}"
     );
 }

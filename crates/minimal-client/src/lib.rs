@@ -1034,6 +1034,138 @@ impl Client {
         Ok(())
     }
 
+    /// Opens a session channel for the box `box_id` and requests the
+    /// `subsystem` on it, returning the channel once the daemon accepts it.
+    ///
+    /// `MINIMAL_SESSION_ID` is set on the channel before the request, the
+    /// contract the daemon scopes a box's subsystems by (the `sftp` one
+    /// refuses a channel without it). A refused request is an error here,
+    /// because a bare refusal does not close the channel.
+    pub async fn open_box_subsystem(
+        &mut self,
+        box_id: boxes::BoxId,
+        subsystem: &str,
+    ) -> Result<russh::Channel<russh::client::Msg>, anyhow::Error> {
+        let mut channel = self
+            .handle
+            .channel_open_session()
+            .await
+            .with_context(|| format!("open channel for the {subsystem} subsystem"))?;
+        send_trace_context(&channel).await;
+        // No reply is asked for the env request: the daemon answers each
+        // request that wants one, in order, so the first answer on the
+        // channel is then the subsystem's.
+        channel
+            .set_env(false, "MINIMAL_SESSION_ID", box_id.to_string())
+            .await
+            .context("set MINIMAL_SESSION_ID env")?;
+        channel
+            .request_subsystem(true, subsystem)
+            .await
+            .with_context(|| format!("request the {subsystem} subsystem"))?;
+        loop {
+            match channel.wait().await {
+                Some(russh::ChannelMsg::Success) => return Ok(channel),
+                Some(russh::ChannelMsg::Failure) => {
+                    anyhow::bail!("the daemon refused the {subsystem} subsystem for box {box_id}")
+                }
+                // Window adjustments and env acks can precede the reply; the
+                // daemon sends nothing on the channel before it.
+                Some(_) => continue,
+                None => anyhow::bail!(
+                    "the channel closed before the daemon answered the {subsystem} request"
+                ),
+            }
+        }
+    }
+
+    /// Opens the `subsystem` for the box `box_id` as
+    /// [`Self::open_box_subsystem`] does, writes `request` and half-closes,
+    /// and returns the reply to read line by line.
+    ///
+    /// This is the shape of the daemon's streaming reads, such as
+    /// [`minimald_rpc::READ_EVENTS_SUBSYSTEM`]: one JSON request, then one
+    /// JSON update for each line until the daemon ends the stream.
+    pub async fn stream_box_subsystem(
+        &mut self,
+        box_id: boxes::BoxId,
+        subsystem: &str,
+        request: &[u8],
+    ) -> Result<SubsystemLines, anyhow::Error> {
+        let channel = self.open_box_subsystem(box_id, subsystem).await?;
+        channel
+            .data(request)
+            .await
+            .with_context(|| format!("write the {subsystem} request"))?;
+        channel
+            .eof()
+            .await
+            .with_context(|| format!("half-close the {subsystem} request"))?;
+        Ok(SubsystemLines {
+            channel,
+            buf: Vec::new(),
+            daemon_error: Vec::new(),
+            closed: false,
+        })
+    }
+
+    /// Reads the events of the box `box_id` (BOX-162): every retained
+    /// event, then, with `follow`, each new one until the box is reaped.
+    /// Each line of the reply is one JSON [`minimald_rpc::ReadEventsUpdate`].
+    pub async fn read_box_events(
+        &mut self,
+        box_id: boxes::BoxId,
+        follow: bool,
+    ) -> Result<SubsystemLines, anyhow::Error> {
+        let request = minimald_rpc::ReadEventsRequest { id: box_id, follow };
+        let body = serde_json_lenient::to_vec(&request).context("serialize the events request")?;
+        self.stream_box_subsystem(box_id, minimald_rpc::READ_EVENTS_SUBSYSTEM, &body)
+            .await
+    }
+
+    /// Opens the file at `path` in the box `box_id` for reading, over the
+    /// box's `sftp` subsystem. A stopped or exited box is served from its
+    /// retained files (BOX-017). A relative `path` is below the box's home.
+    ///
+    /// The returned file streams its contents, so a large file is never
+    /// held in memory. It keeps the sftp conversation open until it drops.
+    ///
+    /// # Errors
+    ///
+    /// [`BoxFileError`] says whether the box's files were not served at
+    /// all, or the open of `path` was refused, and why.
+    pub async fn open_box_file(
+        &mut self,
+        box_id: boxes::BoxId,
+        path: &str,
+    ) -> Result<russh_sftp::client::fs::File, BoxFileError> {
+        let channel = self
+            .open_box_subsystem(box_id, "sftp")
+            .await
+            .map_err(BoxFileError::Unavailable)?;
+        let sftp = russh_sftp::client::SftpSession::new(channel.into_stream())
+            .await
+            .context("start the sftp conversation")
+            .map_err(BoxFileError::Unavailable)?;
+        // The file holds its own reference to the conversation, so dropping
+        // `sftp` here does not end it.
+        sftp.open(path).await.map_err(|e| match e {
+            russh_sftp::client::error::Error::Status(status)
+                if status.status_code == russh_sftp::protocol::StatusCode::NoSuchFile =>
+            {
+                BoxFileError::NotFound
+            }
+            russh_sftp::client::error::Error::Status(status)
+                if status.status_code == russh_sftp::protocol::StatusCode::PermissionDenied =>
+            {
+                BoxFileError::PermissionDenied
+            }
+            other => {
+                BoxFileError::Refused(anyhow::Error::new(other).context(format!("open {path}")))
+            }
+        })
+    }
+
     /// Requests the daemon's diagnostic bundle (`min bug`): sends `req` on the
     /// [`minimald_rpc::DIAG_BUNDLE_SUBSYSTEM`] subsystem and collects the
     /// streamed tar+zstd archive, up to `max_bytes`.
@@ -1168,6 +1300,91 @@ const DAEMON_ERROR_MAX: usize = 64 * 1024;
 /// spending the caller's entire `--guest-timeout-secs`, which would turn a
 /// usable truncated bundle into a total loss.
 const TRUNCATED_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Why [`Client::open_box_file`] could not open a file in a box.
+#[derive(Debug)]
+pub enum BoxFileError {
+    /// The box host did not serve the box's files: the box is gone, or the
+    /// connection or the sftp conversation failed. The error carries the
+    /// detail, for the log.
+    Unavailable(anyhow::Error),
+    /// The box has no file at the path.
+    NotFound,
+    /// The box does not let the file be read.
+    PermissionDenied,
+    /// The box's file server refused the open for another reason. The
+    /// error carries the detail, for the log.
+    Refused(anyhow::Error),
+}
+
+impl std::fmt::Display for BoxFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(e) => write!(f, "the box's files were not served: {e:#}"),
+            Self::NotFound => f.write_str("no such file"),
+            Self::PermissionDenied => f.write_str("permission denied"),
+            Self::Refused(e) => write!(f, "the open was refused: {e:#}"),
+        }
+    }
+}
+
+impl std::error::Error for BoxFileError {}
+
+/// The reply of a subsystem channel, read one line at a time. See
+/// [`Client::stream_box_subsystem`].
+pub struct SubsystemLines {
+    channel: russh::Channel<russh::client::Msg>,
+    buf: Vec<u8>,
+    daemon_error: Vec<u8>,
+    closed: bool,
+}
+
+impl SubsystemLines {
+    /// The next line of the reply, without its newline, or `None` when the
+    /// daemon ended the stream. A last line with no newline is still a
+    /// line.
+    ///
+    /// # Errors
+    ///
+    /// The daemon's message on extended data when the stream ends with
+    /// one, such as the refusal of a request before its first line, and a
+    /// line that is not UTF-8.
+    pub async fn next_line(&mut self) -> Result<Option<String>, anyhow::Error> {
+        loop {
+            if let Some(end) = self.buf.iter().position(|b| *b == b'\n') {
+                let mut line: Vec<u8> = self.buf.drain(..=end).collect();
+                line.pop();
+                return String::from_utf8(line)
+                    .map(Some)
+                    .context("the daemon sent a line that is not UTF-8");
+            }
+            if self.closed {
+                if !self.buf.is_empty() {
+                    let line = std::mem::take(&mut self.buf);
+                    return String::from_utf8(line)
+                        .map(Some)
+                        .context("the daemon sent a line that is not UTF-8");
+                }
+                if !self.daemon_error.is_empty() {
+                    let message = String::from_utf8_lossy(&self.daemon_error)
+                        .trim()
+                        .to_owned();
+                    self.daemon_error.clear();
+                    anyhow::bail!("{message}");
+                }
+                return Ok(None);
+            }
+            match self.channel.wait().await {
+                Some(russh::ChannelMsg::Data { data }) => self.buf.extend_from_slice(&data),
+                Some(russh::ChannelMsg::ExtendedData { data, ext: 1 }) => {
+                    append_daemon_error(&mut self.daemon_error, &data);
+                }
+                Some(russh::ChannelMsg::Close) | None => self.closed = true,
+                Some(_) => {}
+            }
+        }
+    }
+}
 
 /// Appends `data` to the daemon's error message, bounded: a daemon streaming
 /// only extended data must not balloon the CLI past the bound the archive
@@ -2372,5 +2589,178 @@ mod opt_out_tests {
             )
         );
         server.abort();
+    }
+}
+
+#[cfg(test)]
+mod subsystem_tests {
+    use std::sync::{Arc, Mutex};
+
+    /// A stand-in daemon for a box's subsystem: it records the env and the
+    /// request each channel carries, and answers once the request is
+    /// half-closed. `split` is refused, `refuse` answers with only an
+    /// extended-data message, and any other subsystem echoes the request,
+    /// then a reply split across frames in the middle of a line.
+    #[derive(Clone, Default)]
+    struct LineServer {
+        env: Arc<Mutex<Vec<(String, String)>>>,
+        request: Arc<Mutex<Vec<u8>>>,
+        subsystem: Arc<Mutex<String>>,
+    }
+
+    impl russh::server::Handler for LineServer {
+        type Error = russh::Error;
+
+        async fn auth_none(&mut self, _: &str) -> Result<russh::server::Auth, Self::Error> {
+            Ok(russh::server::Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            _: russh::Channel<russh::server::Msg>,
+            reply: russh::server::ChannelOpenHandle,
+            _: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            Ok(())
+        }
+
+        async fn env_request(
+            &mut self,
+            id: russh::ChannelId,
+            name: &str,
+            value: &str,
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            self.env
+                .lock()
+                .unwrap()
+                .push((name.to_owned(), value.to_owned()));
+            session.channel_success(id)?;
+            Ok(())
+        }
+
+        async fn subsystem_request(
+            &mut self,
+            id: russh::ChannelId,
+            name: &str,
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            name.clone_into(&mut self.subsystem.lock().unwrap());
+            if name == "split" {
+                session.channel_failure(id)?;
+            } else {
+                session.channel_success(id)?;
+            }
+            Ok(())
+        }
+
+        async fn data(
+            &mut self,
+            _: russh::ChannelId,
+            data: &[u8],
+            _: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            self.request.lock().unwrap().extend_from_slice(data);
+            Ok(())
+        }
+
+        async fn channel_eof(
+            &mut self,
+            id: russh::ChannelId,
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            if self.subsystem.lock().unwrap().as_str() == "refuse" {
+                session.extended_data(id, 1, "no box has this id\n".as_bytes().to_vec())?;
+            } else {
+                let mut echo = self.request.lock().unwrap().clone();
+                echo.push(b'\n');
+                session.data(id, echo)?;
+                session.data(id, b"first li".to_vec())?;
+                session.data(id, b"ne\nsecond line\nlast".to_vec())?;
+                session.eof(id)?;
+            }
+            session.close(id)?;
+            Ok(())
+        }
+    }
+
+    async fn serve(dir: &std::path::Path, server: LineServer) -> std::path::PathBuf {
+        let key = russh::keys::PrivateKey::random(
+            &mut russh::keys::key::safe_rng(),
+            russh::keys::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let config = Arc::new(russh::server::Config {
+            keys: vec![key],
+            auth_rejection_time_initial: Some(std::time::Duration::ZERO),
+            ..Default::default()
+        });
+        let sock = dir.join("ssh.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (config, server) = (config.clone(), server.clone());
+                tokio::spawn(async move {
+                    if let Ok(session) = russh::server::run_stream(config, stream, server).await {
+                        drop(session.await);
+                    }
+                });
+            }
+        });
+        sock
+    }
+
+    /// The box's subsystem channel carries `MINIMAL_SESSION_ID`, sends the
+    /// request whole, and gives back each line of the reply once, however
+    /// the daemon split it into frames, then `None`. A refusal of the
+    /// subsystem, and a stream that ends with only the daemon's message,
+    /// are errors that say so.
+    #[tokio::test]
+    async fn session_subsystem_channel_streams_reply_lines() {
+        let dir = tempfile::Builder::new()
+            .prefix("mcsl")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let server = LineServer::default();
+        let sock = serve(dir.path(), server.clone()).await;
+        let mut client = super::Client::connect(&sock).await.unwrap();
+        let id = boxes::SessionId::parse_str("019f8ab5-27ba-7260-a03c-3914b9595a1a").unwrap();
+
+        let mut lines = client
+            .stream_box_subsystem(id, "lines", br#"{"follow":true}"#)
+            .await
+            .unwrap();
+        let mut read = Vec::new();
+        while let Some(line) = lines.next_line().await.unwrap() {
+            read.push(line);
+        }
+        assert_eq!(
+            read,
+            [r#"{"follow":true}"#, "first line", "second line", "last"]
+        );
+        assert!(
+            server
+                .env
+                .lock()
+                .unwrap()
+                .contains(&("MINIMAL_SESSION_ID".to_owned(), id.to_string())),
+            "the channel names the box"
+        );
+        assert_eq!(server.subsystem.lock().unwrap().as_str(), "lines");
+
+        let refused = client.stream_box_subsystem(id, "split", b"{}").await;
+        let err = refused.err().expect("a refused subsystem is an error");
+        assert!(
+            format!("{err:#}").contains("refused the split subsystem"),
+            "{err:#}"
+        );
+
+        let mut lines = client
+            .stream_box_subsystem(id, "refuse", b"{}")
+            .await
+            .unwrap();
+        let err = lines.next_line().await.expect_err("the daemon's message");
+        assert_eq!(err.to_string(), "no box has this id");
     }
 }

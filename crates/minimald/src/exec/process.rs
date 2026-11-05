@@ -1050,30 +1050,81 @@ impl ExecBox {
         Ok(Self { record, dir })
     }
 
-    /// Writes one exec event about `id` to the box's events file. A failed
-    /// write is logged and never ends the exec.
+    /// Whether the spec stored beside the box's record lets the box run
+    /// commands (BOX-153). It reads only `io.exec_enabled`, as the PTY
+    /// check of a resume reads `io.pty_enabled`. A box with no stored spec,
+    /// or a spec without a `false` key, takes commands. The gate fails
+    /// closed: a stored spec that cannot be read or does not parse refuses.
+    pub(crate) fn exec_gate(&self) -> ExecGate {
+        match std::fs::read(self.dir.join(boxes::store::SPEC_FILE)) {
+            Ok(bytes) => match stored_spec_disables_exec(&bytes) {
+                Some(true) => ExecGate::Disabled,
+                Some(false) => ExecGate::Enabled,
+                None => {
+                    tracing::warn!(
+                        box_id = %self.record.id,
+                        "exec: the box's stored spec does not parse; exec refused"
+                    );
+                    ExecGate::SpecUnreadable
+                }
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => ExecGate::Enabled,
+            Err(error) => {
+                tracing::warn!(
+                    box_id = %self.record.id,
+                    %error,
+                    "exec: could not read the box's stored spec; exec refused"
+                );
+                ExecGate::SpecUnreadable
+            }
+        }
+    }
+
+    /// Writes one exec event about `id` to the box's events file
+    /// (BOX-152): the exec's id, mode, PTY flag, principal and argv, and
+    /// for an `exec_exited` event its exit code and reason. A failed write
+    /// is logged and never ends the exec.
     pub(crate) fn write_event(
         &self,
         kind: boxes::events::BoxEventType,
         id: &ExecId,
         mode: ExecMode,
+        facts: &ExecFacts,
         exit: Option<ExecExit>,
     ) {
+        use boxes::events::exec_data;
         let mut event = boxes::events::BoxEvent::for_record(&self.record, kind);
-        event.data.insert("exec_id".into(), id.as_str().into());
-        event.data.insert("mode".into(), mode.name().into());
         event
             .data
-            .insert("pty".into(), (mode == ExecMode::Tty).into());
+            .insert(exec_data::EXEC_ID.into(), id.as_str().into());
+        event
+            .data
+            .insert(exec_data::MODE.into(), mode.name().into());
+        event
+            .data
+            .insert(exec_data::PTY.into(), (mode == ExecMode::Tty).into());
+        event
+            .data
+            .insert(exec_data::PRINCIPAL.into(), facts.principal.as_str().into());
+        event.data.insert(
+            exec_data::ARGV.into(),
+            serde_json_lenient::Value::Array(
+                facts.argv.iter().map(|word| word.as_str().into()).collect(),
+            ),
+        );
         if let Some(exit) = exit {
             event.data.insert(
-                "exit_code".into(),
+                exec_data::EXIT_CODE.into(),
                 exit.code
                     .map_or(serde_json_lenient::Value::Null, Into::into),
             );
             event
                 .data
-                .insert("reason".into(), exit.reason.name().into());
+                .insert(exec_data::REASON.into(), exit.reason.name().into());
+        }
+        #[cfg(test)]
+        if kind == boxes::events::BoxEventType::ExecStarted {
+            stop_at_start::observe(self.record.id, id);
         }
         let path = self.dir.join(boxes::events::EVENTS_FILE);
         if let Err(error) = boxes::store::append_event_at(&path, &event) {
@@ -1087,6 +1138,41 @@ impl ExecBox {
     }
 }
 
+/// What the stored spec says about exec (BOX-153).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecGate {
+    /// The box takes commands.
+    Enabled,
+    /// The spec sets `io.exec_enabled = false`.
+    Disabled,
+    /// A stored spec exists but cannot be read or parsed, so the gate
+    /// refuses.
+    SpecUnreadable,
+}
+
+/// Whether the spec `bytes` set `io.exec_enabled = false` (BOX-153).
+/// `None` when the bytes do not parse as a JSON object.
+pub(crate) fn stored_spec_disables_exec(bytes: &[u8]) -> Option<bool> {
+    let spec = serde_json_lenient::from_slice::<serde_json_lenient::Value>(bytes).ok()?;
+    if !spec.is_object() {
+        return None;
+    }
+    Some(
+        spec.get("io")
+            .and_then(|io| io.get("exec_enabled")?.as_bool())
+            == Some(false),
+    )
+}
+
+/// Who ran an exec and what it ran, as its events carry them (BOX-152).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ExecFacts {
+    /// The user the exec request came from.
+    pub(crate) principal: String,
+    /// The exec's argv, as the client sent it.
+    pub(crate) argv: Vec<String>,
+}
+
 /// What a tty or a detached exec needs to start (BOX-149).
 #[derive(Debug)]
 pub(crate) struct ManagedStart {
@@ -1097,6 +1183,8 @@ pub(crate) struct ManagedStart {
     pub(crate) timeout: Option<Duration>,
     /// The terminal's rows and columns, for a tty exec.
     pub(crate) winsize: (u16, u16),
+    /// Who ran the exec and what it runs, for its events.
+    pub(crate) facts: ExecFacts,
 }
 
 /// Starts a tty or a detached exec from `command`, which runs the exec's
@@ -1134,6 +1222,7 @@ pub(super) fn start_managed_exec_within(
         exec_box,
         timeout,
         winsize,
+        facts,
     } = start;
     let transcript_path = boxes::store::exec_transcript_path(&exec_box.dir, id.as_str());
     if let Some(dir) = transcript_path.parent() {
@@ -1186,6 +1275,10 @@ pub(super) fn start_managed_exec_within(
         }
         ExecMode::Detached | ExecMode::Attached => (None, None),
     };
+    // The stop is registered before the entry, and both before
+    // `exec_started`. A stop of the id that a follower of the events sees
+    // first then finds the exec and ends it (BOX-151).
+    let stop = register_stop(&id);
     let entry = Arc::new(ExecEntry::new(
         id.clone(),
         exec_box.record.id,
@@ -1194,7 +1287,13 @@ pub(super) fn start_managed_exec_within(
         terminal,
     ));
     register_exec(Arc::clone(&entry));
-    exec_box.write_event(boxes::events::BoxEventType::ExecStarted, &id, mode, None);
+    exec_box.write_event(
+        boxes::events::BoxEventType::ExecStarted,
+        &id,
+        mode,
+        &facts,
+        None,
+    );
     tracing::info!(
         exec_id = %id,
         mode = mode.name(),
@@ -1212,6 +1311,8 @@ pub(super) fn start_managed_exec_within(
         pump,
         feed,
         exec_box,
+        facts,
+        stop,
     ));
     Ok(entry)
 }
@@ -1224,6 +1325,10 @@ const TERMINAL_DRAIN: Duration = Duration::from_secs(1);
 /// Waits for a managed exec, ends it at its own timeout, and records how it
 /// ended: on its entry for a wait, in the daemon log, and as the box's
 /// `exec_exited` event. The box itself is not touched.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the exec's process, its helpers and its facts, from one call site"
+)]
 async fn supervise_managed_exec(
     entry: Arc<ExecEntry>,
     mut process: TokioProcess,
@@ -1231,20 +1336,29 @@ async fn supervise_managed_exec(
     mut pump: JoinHandle<()>,
     feed: Option<JoinHandle<()>>,
     exec_box: ExecBox,
+    facts: ExecFacts,
+    stop: CancellationToken,
 ) {
-    let (status, reason) = wait_with_timeout(&mut process, timeout).await;
+    let (status, reason) = wait_or_stop(&mut process, timeout, &stop, &entry.id).await;
+    forget_stop(&entry.id);
     entry.close_input();
     // Nothing reads the terminal now. A feed that waits to write ends here.
     if let Some(feed) = feed {
         feed.abort();
     }
-    // A tty pump stops at the drain. A detached pump keeps on, so the
-    // transcript still gets what a descendant writes after the exit.
+    // The pump stops at the drain, in every mode. A descendant that keeps
+    // the terminal or the pipe open must not hold the pump, its descriptor
+    // and its transcript file for the daemon's life. The pump waits in the
+    // runtime, not in a blocking thread, so the abort ends it.
     if tokio::time::timeout(TERMINAL_DRAIN, &mut pump)
         .await
         .is_err()
-        && entry.mode == ExecMode::Tty
     {
+        tracing::info!(
+            exec_id = %entry.id,
+            mode = entry.mode.name(),
+            "exec: output still open after the exit; the transcript stops here"
+        );
         pump.abort();
     }
     let code = status.unwrap_or_else(|error| {
@@ -1256,6 +1370,7 @@ async fn supervise_managed_exec(
         boxes::events::BoxEventType::ExecExited,
         &entry.id,
         entry.mode,
+        &facts,
         Some(exit),
     );
     tracing::info!(
@@ -1266,6 +1381,136 @@ async fn supervise_managed_exec(
         "exec ended"
     );
     entry.finish(exit);
+}
+
+/// The stop of every exec that still runs, by its id (BOX-151): a tty or a
+/// detached exec, and an attached one.
+/// The supervisor of the exec removes its token when the exec ends.
+static STOPS: std::sync::LazyLock<std::sync::Mutex<BTreeMap<ExecId, CancellationToken>>> =
+    std::sync::LazyLock::new(Default::default);
+
+pub(crate) fn register_stop(id: &ExecId) -> CancellationToken {
+    let token = CancellationToken::new();
+    STOPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id.clone(), token.clone());
+    token
+}
+
+pub(crate) fn forget_stop(id: &ExecId) {
+    STOPS.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+}
+
+/// How a stop of one exec ended (BOX-151).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExecStopAnswer {
+    /// How the exec ended.
+    pub(crate) exit: ExecExit,
+    /// Set when the exec had already ended before the stop, so the stop
+    /// sent no signal.
+    pub(crate) already_ended: bool,
+}
+
+/// Fires the stop of the exec `id` of the box `box_id` (BOX-151). Answers
+/// the exec's entry, and whether a stop token was still there to fire.
+/// `None` when this daemon holds no entry for that exec.
+fn fire_stop(box_id: SessionId, id: &ExecId) -> Option<(Arc<ExecEntry>, bool)> {
+    let entry = find_exec(box_id, id)?;
+    let token = STOPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(id)
+        .cloned();
+    let fired = match token {
+        Some(token) => {
+            tracing::info!(exec_id = %id, %box_id, "exec stop requested");
+            token.cancel();
+            true
+        }
+        None => {
+            tracing::info!(exec_id = %id, %box_id, "exec stop: the exec already ended");
+            false
+        }
+    };
+    Some((entry, fired))
+}
+
+/// Stops the exec `id` of the box `box_id` and waits for its end (BOX-151):
+/// SIGTERM to its process group, a wait, then SIGKILL, through
+/// [`Process::start_kill`] of the injection shim. Only that exec ends. The
+/// box and its other execs keep running. An exec that already ended
+/// answers with its exit. `None` when this daemon holds no entry for exec
+/// `id` in that box. The caller then reads the box's events for an exec
+/// that a daemon before a restart started, with [`stored_exec_exit`].
+pub(crate) async fn stop_exec(box_id: SessionId, id: &ExecId) -> Option<ExecStopAnswer> {
+    let (entry, fired) = fire_stop(box_id, id)?;
+    Some(ExecStopAnswer {
+        exit: entry.wait().await,
+        already_ended: !fired,
+    })
+}
+
+/// A test hook that stops an exec at the earliest point its id is
+/// observable: when its `exec_started` event is written (BOX-151).
+#[cfg(test)]
+pub(crate) mod stop_at_start {
+    use super::*;
+
+    /// The boxes whose execs the hook stops, and for each exec it saw,
+    /// whether the stop found the exec and fired.
+    static ARMED: std::sync::LazyLock<
+        std::sync::Mutex<BTreeMap<SessionId, BTreeMap<ExecId, bool>>>,
+    > = std::sync::LazyLock::new(Default::default);
+
+    /// Stops every exec of `box_id` as its `exec_started` is written.
+    pub(crate) fn arm(box_id: SessionId) {
+        ARMED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(box_id, BTreeMap::new());
+    }
+
+    /// The execs of `box_id` the hook saw, and whether each stop fired.
+    pub(crate) fn seen(box_id: SessionId) -> BTreeMap<ExecId, bool> {
+        ARMED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&box_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(super) fn observe(box_id: SessionId, id: &ExecId) {
+        let mut armed = ARMED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(seen) = armed.get_mut(&box_id) {
+            let fired = matches!(fire_stop(box_id, id), Some((_, true)));
+            seen.insert(id.clone(), fired);
+        }
+    }
+}
+
+/// Waits for `process` as [`wait_with_timeout`] does, and ends it when
+/// `stop` fires (BOX-151).
+async fn wait_or_stop<P: Process>(
+    process: &mut P,
+    timeout: Option<Duration>,
+    stop: &CancellationToken,
+    id: &ExecId,
+) -> (io::Result<Option<i32>>, ExecExitReason) {
+    let ended = tokio::select! {
+        out = wait_with_timeout(process, timeout) => Some(out),
+        () = stop.cancelled() => None,
+    };
+    if let Some(out) = ended {
+        return out;
+    }
+    if let Err(error) = process.start_kill() {
+        tracing::warn!(exec_id = %id, %error, "exec: failed to stop the command");
+    }
+    let status = wait_after_stop(process).await;
+    tracing::info!(exec_id = %id, "exec stopped");
+    (status, ExecExitReason::Exited)
 }
 
 /// Waits for `process`, and ends it once `timeout` runs out (BOX-149):
@@ -1320,7 +1565,9 @@ pub(crate) async fn wait_after_stop<P: Process>(process: &mut P) -> io::Result<O
 /// Opens a terminal pair of `rows` by `cols`, both sides close-on-exec. The
 /// slave side becomes the exec's stdio through `dup2`, which clears the flag
 /// on the copies the exec gets.
-fn open_terminal((rows, cols): (u16, u16)) -> io::Result<(std::fs::File, std::fs::File)> {
+pub(super) fn open_terminal(
+    (rows, cols): (u16, u16),
+) -> io::Result<(std::fs::File, std::fs::File)> {
     use std::os::fd::{FromRawFd as _, OwnedFd};
 
     let mut master: libc::c_int = -1;
@@ -1456,6 +1703,8 @@ pub struct TimedBoxExec {
     pub timeout: Option<Duration>,
     /// Set when the timeout ended the exec, for its `exec_exited` reason.
     pub timed_out: Arc<AtomicBool>,
+    /// Fires when a stop of the exec's id ends it (BOX-151).
+    pub stop: CancellationToken,
 }
 
 impl Exec for TimedBoxExec {
@@ -1470,6 +1719,7 @@ impl Exec for TimedBoxExec {
             inner,
             timeout,
             timed_out,
+            stop,
         } = self;
         inner
             .exec(session)
@@ -1478,6 +1728,8 @@ impl Exec for TimedBoxExec {
                     inner,
                     deadline: timeout_deadline(timeout),
                     timed_out: Arc::clone(&timed_out),
+                    stop: stop.clone(),
+                    stopped: false,
                 })
             })
             .boxed()
@@ -1491,12 +1743,16 @@ pub(crate) fn timeout_deadline(timeout: Option<Duration>) -> Option<tokio::time:
     timeout.and_then(|t| tokio::time::Instant::now().checked_add(t))
 }
 
-/// A [`Process`] that [`Process::start_kill`]s itself at its deadline.
+/// A [`Process`] that [`Process::start_kill`]s itself at its deadline, or
+/// when a stop of its exec fires.
 #[derive(Debug)]
 pub struct TimedProcess<P> {
     pub(super) inner: P,
     pub(super) deadline: Option<tokio::time::Instant>,
     pub(super) timed_out: Arc<AtomicBool>,
+    pub(super) stop: CancellationToken,
+    /// Set once the stop asked the process to end.
+    pub(super) stopped: bool,
 }
 
 impl<P: Process> Process for TimedProcess<P> {
@@ -1509,21 +1765,40 @@ impl<P: Process> Process for TimedProcess<P> {
     }
 
     // Cancel-safe: the deadline is fixed at the spawn, the inner `wait` is
-    // cancel-safe, and `timed_out` is set before the next await point.
+    // cancel-safe, and `timed_out` and `stopped` are set before the next
+    // await point.
     async fn wait(&mut self) -> io::Result<Option<i32>> {
-        if let Some(deadline) = self.deadline
-            && !self.timed_out.load(Ordering::SeqCst)
-        {
-            match tokio::time::timeout_at(deadline, self.inner.wait()).await {
-                Ok(status) => return status,
-                Err(_elapsed) => {
+        if !self.timed_out.load(Ordering::SeqCst) && !self.stopped {
+            let deadline = self.deadline;
+            let stop = self.stop.clone();
+            let at_deadline = async move {
+                match deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                status = self.inner.wait() => return status,
+                () = at_deadline => {
                     self.timed_out.store(true, Ordering::SeqCst);
                     tracing::info!("exec: the command ran past its timeout; stopping it");
                     if let Err(error) = self.inner.start_kill() {
                         tracing::warn!(%error, "exec: failed to stop the command at its timeout");
                     }
                 }
+                () = stop.cancelled() => {
+                    self.stopped = true;
+                    tracing::info!("exec: a stop of the exec asked the command to end");
+                    if let Err(error) = self.inner.start_kill() {
+                        tracing::warn!(%error, "exec: failed to stop the command");
+                    }
+                }
             }
+        }
+        if self.stopped {
+            let status = wait_after_stop(&mut self.inner).await;
+            tracing::info!("exec stopped");
+            return status;
         }
         if self.timed_out.load(Ordering::SeqCst) {
             // The timeout ended the exec, so its status is the timeout's,

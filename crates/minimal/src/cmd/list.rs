@@ -409,10 +409,7 @@ async fn listings_across_vms(
     global: &GlobalArgs,
     strict: bool,
 ) -> Result<Vec<VmListing>, anyhow::Error> {
-    let mut vms = client::enumerate_vm_sockets(global.minimal_dir.as_deref(), global.use_minvmd())?;
-    if let Some(pinned) = global.vm.as_deref() {
-        vms.retain(|vm| vm.vm == pinned);
-    }
+    let vms = vm_sockets_in_scope(global)?;
     let selected = client::vm_name();
     let mut listings = Vec::new();
     for vm in vms {
@@ -486,6 +483,114 @@ async fn listings_across_vms(
         });
     }
     Ok(listings)
+}
+
+/// Every VM's socket the CLI can see, narrowed to the VM an explicit `--vm`
+/// names: the set of hosts `min ls` and `min box list` both walk. The
+/// native backend enumerates nothing, and its callers fall back to the one
+/// socket it serves.
+fn vm_sockets_in_scope(global: &GlobalArgs) -> Result<Vec<client::VmSocket>, anyhow::Error> {
+    let mut vms = client::enumerate_vm_sockets(global.minimal_dir.as_deref(), global.use_minvmd())?;
+    if let Some(pinned) = global.vm.as_deref() {
+        vms.retain(|vm| vm.vm == pinned);
+    }
+    Ok(vms)
+}
+
+/// The provider that serves the native daemons on this machine.
+pub(crate) const LOCAL_PROVIDER: &str = "local";
+
+/// The provider that serves the VMs on this machine.
+pub(crate) const LOCAL_MINVMD_PROVIDER: &str = "local-minvmd";
+
+/// One local host a box listing reads: the provider that serves it, its
+/// name, and the socket its daemon serves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocalHost {
+    /// `local` for a native daemon, `local-minvmd` for a VM.
+    pub provider: &'static str,
+    /// The host's name: `local0` for the native daemon, `local-minvmd0`
+    /// for the default VM and `<vm>.local-minvmd0` for a named VM, as its
+    /// ssh host alias names it.
+    pub host: String,
+    /// The socket the host's daemon serves.
+    pub sock: std::path::PathBuf,
+    /// Whether this is the host this process selected, which
+    /// [`ensure_daemon`] starts.
+    pub selected: bool,
+}
+
+/// The local hosts `min box list` reads, in the order `min ls` walks them:
+/// every VM in scope, else the one socket the native backend serves.
+pub(crate) fn local_hosts(global: &GlobalArgs) -> Result<Vec<LocalHost>, anyhow::Error> {
+    let vms = vm_sockets_in_scope(global)?;
+    let fallback = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
+        .context("Failed to resolve daemon socket path")?;
+    Ok(local_hosts_from(
+        client::client_host_kind(global.use_minvmd()),
+        vms,
+        fallback,
+        client::vm_name(),
+    ))
+}
+
+/// [`local_hosts`] over what it read: the host kind, the VMs in scope, the
+/// socket the selected daemon serves, and the selected VM's name.
+pub(crate) fn local_hosts_from(
+    kind: paths::HostKind,
+    vms: Vec<client::VmSocket>,
+    fallback: std::path::PathBuf,
+    selected: &str,
+) -> Vec<LocalHost> {
+    if vms.is_empty() {
+        return vec![LocalHost {
+            provider: provider_for(kind),
+            host: host_name_for(kind, &fallback),
+            sock: fallback,
+            selected: true,
+        }];
+    }
+    vms.into_iter()
+        .map(|vm| LocalHost {
+            provider: provider_for(kind),
+            host: host_name_for(kind, &vm.sock),
+            selected: vm.vm == selected,
+            sock: vm.sock,
+        })
+        .collect()
+}
+
+/// The well-known local provider that serves a host of `kind`.
+fn provider_for(kind: paths::HostKind) -> &'static str {
+    match kind {
+        paths::HostKind::Minimald => LOCAL_PROVIDER,
+        paths::HostKind::Minvmd => LOCAL_MINVMD_PROVIDER,
+    }
+}
+
+/// The name of the host whose daemon serves `sock`. The native daemon is
+/// `local0`. A VM is named by the ssh host alias of its host dir.
+///
+/// A named VM prints as `<vm>.local-minvmd0`, its ssh host alias.
+/// `min host list|show` names the same host the same way
+/// (`cmd/hosts.rs::named_vms`), so one host has one name on both.
+fn host_name_for(kind: paths::HostKind, sock: &std::path::Path) -> String {
+    let alias = sock.parent().and_then(paths::ssh_host_alias);
+    match kind {
+        paths::HostKind::Minimald => {
+            // The state dir names the native instance `local-minimald<N>`.
+            // The provider names that host `local<N>`.
+            let prefix = paths::host_name(kind, 0);
+            let prefix = prefix.trim_end_matches('0');
+            alias
+                .and_then(|name| {
+                    name.strip_prefix(prefix)
+                        .map(|n| format!("{LOCAL_PROVIDER}{n}"))
+                })
+                .unwrap_or_else(|| format!("{LOCAL_PROVIDER}0"))
+        }
+        paths::HostKind::Minvmd => alias.unwrap_or_else(|| paths::host_name(kind, 0)),
+    }
 }
 
 /// The selected daemon's `ListSessions` reply, from its socket, gated as `min
@@ -571,27 +676,6 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     ensure_daemon(global)?;
 
     let listings = ls_listings(global).await?;
-
-    // On stderr, and outside the formatters: every output mode should carry a
-    // fault this severe — `--raw` most of all, since a script parsing bare ids
-    // is exactly what will go on using hostnames that no longer resolve — and
-    // stdout stays clean for the parser either way. With more than one VM
-    // listed the fault is per daemon, so each warning names the VM it is on;
-    // one listing keeps the single-VM wording every consumer of `min ls` has
-    // always read.
-    for listing in &listings {
-        if let Some(reason) = listing.resp.hostname_routing_unavailable.as_deref() {
-            if listings.len() == 1 {
-                warn_if_hostname_routing_down(Some(reason), "min ls");
-            } else {
-                eprintln!(
-                    "VM {}: {}",
-                    listing.vm,
-                    hostname_routing_warning(reason, "min ls")
-                );
-            }
-        }
-    }
 
     // NET-018's verdict — which surface a box name resolves through on
     // this host — from the one function both verbs share (`resolver`), one
@@ -904,40 +988,18 @@ pub fn shared_port_collision_lines(listings: &[VmListing]) -> Vec<String> {
         .collect()
 }
 
-/// The warning `min ls` and `min session activate` print when the daemon
-/// reports hostname routing down: the daemon's reason and remedy for the
-/// failed bind or publish, plus what recovery looks like from here — the
-/// daemon retries with backoff and clears the warning on its own once the
-/// listener recovers (NET-020, NET-022). `command` names the command the
-/// warning rides on: re-running it shows the warning while the listener is
-/// still down and nothing once it has recovered, so the recovery sentence
-/// tells the user to re-run the command they are already in, not some other
-/// one. Pure, so tests can assert the wording without capturing stderr.
+/// The `HOSTNAME PROXY` row's text when the daemon reports hostname routing
+/// down and no proxy-down sibling names a cause of its own (NET-020): the
+/// daemon's reason and remedy for the failed bind or publish, and what
+/// recovery looks like from here. The daemon retries with backoff and clears
+/// its report once the listener recovers (NET-022), so the row tells the
+/// user to re-run `min ls`. Pure, so tests can assert the wording.
 #[must_use]
-pub fn hostname_routing_warning(reason: &str, command: &str) -> String {
+pub fn hostname_routing_cause_row(reason: &str) -> String {
     format!(
-        "warning: the hostname proxy is not serving: {reason}. Minimal \
-         retries on its own; run `{command}` again to check."
+        "the hostname proxy is not serving: {reason}. Minimal retries on its \
+         own. Run `min ls` again to check."
     )
-}
-
-/// Tells the user that `<name>.local.min.internal` will not resolve, and why,
-/// and what clears it.
-///
-/// The daemon keeps serving without its host-side proxy, so nothing else the
-/// user sees is different: sessions activate, exec works, the list prints. The
-/// only other trace is a `warn!` in the daemon log, which is not where someone
-/// watching curl fail is looking (gominimal/inbox#560). The daemon's report
-/// carries the reason and the remedy for the cause (a held port, a failed
-/// publish); the recovery is the daemon's job now — it retries with backoff
-/// and the warning goes away by itself, so the remedy says to check again
-/// rather than to restart anything. `command` names the command this runs
-/// from, so the recovery sentence fits it — `min ls` on the list, `min
-/// session activate` at activation.
-pub(crate) fn warn_if_hostname_routing_down(reason: Option<&str>, command: &str) {
-    if let Some(reason) = reason {
-        eprintln!("{}", hostname_routing_warning(reason, command));
-    }
 }
 
 /// The VM a session-start line names, as a fact about the backend kind: the
@@ -1068,8 +1130,10 @@ pub(crate) fn format_ls_with_proxy_ports_on(
         let proxy_down = vm_answerer
             .as_ref()
             .and_then(|reply| reply.proxy_down.as_ref());
-        let serving_proxy_port =
-            crate::resolver::serving_proxy_port(resp.hostname_proxy_port, proxy_down);
+        let serving_proxy_port = crate::resolver::serving_proxy_port(
+            reported_proxy_port(resp.hostname_proxy_port, proxy_ports),
+            proxy_down,
+        );
         let row_ports = hostname_proxy_row_ports(serving_proxy_port, proxy_ports);
         if !row_ports.is_empty() {
             writeln!(
@@ -1108,6 +1172,21 @@ pub(crate) fn format_ls_with_proxy_ports_on(
         // merely silent, prints nothing here.
         if let Some(line) = &proxy_down_line {
             writeln!(out, "HOSTNAME PROXY:  {line}")?;
+        } else if proxy_down.is_none()
+            && let Some(reason) = resp.hostname_routing_unavailable.as_deref()
+        {
+            // NET-020: the daemon's own cause takes the row that names the
+            // listener, on stdout, once. A proxy-down sibling names its own
+            // cause above or on the BOX NAMES row, so it wins.
+            tracing::debug!(
+                surface = "min ls HOSTNAME PROXY row",
+                "printed the hostname-routing cause"
+            );
+            writeln!(
+                out,
+                "HOSTNAME PROXY:  {}",
+                hostname_routing_cause_row(reason)
+            )?;
         }
         // NET-018: say which of the two surfaces is live — the one verdict
         // both verbs share ([`resolver::live_name_surfaces`]) — and end the
@@ -1120,18 +1199,19 @@ pub(crate) fn format_ls_with_proxy_ports_on(
         if let Some(surface) = surface {
             writeln!(
                 out,
-                "BOX NAMES:       {}{}",
-                crate::resolver::name_surface_line_at(
-                    surface.clone(),
-                    serving_proxy_port,
-                    boxes_at_own_address(resp),
+                "BOX NAMES:       {}",
+                crate::resolver::with_install_pointer(
+                    crate::resolver::name_surface_line_at(
+                        surface.clone(),
+                        serving_proxy_port,
+                        boxes_at_own_address(resp),
+                    ),
+                    crate::resolver::install_unfinished(&surface, host),
                 ),
-                crate::resolver::install_clause(crate::resolver::install_unfinished(
-                    &surface, host
-                )),
             )?;
         }
-        if resp.hostname_proxy_port.is_some()
+        if serving_proxy_port.is_some()
+            || resp.hostname_proxy_port.is_some()
             || resp.zone_answerer_port.is_some()
             || vm_answerer_line.is_some()
             || proxy_down.is_some()
@@ -1254,6 +1334,16 @@ fn listing_json(
         }
     }
     Ok(document)
+}
+
+/// The proxy port the guest reported, or else the first port the VM host
+/// daemon says it serves on. A held port that frees after the start
+/// (NET-022) publishes on the VM host daemon only: the guest recorded no
+/// port for it, so without this fallback the BOX NAMES row says the proxy
+/// is not serving while it serves.
+#[must_use]
+pub(crate) fn reported_proxy_port(reported: Option<u16>, served: &[u16]) -> Option<u16> {
+    reported.or_else(|| served.first().copied())
 }
 
 /// The ports the `HOSTNAME PROXY` row names (NET-154). `serving` is the port
@@ -1573,8 +1663,10 @@ pub(crate) fn format_ls_across_vms_with_proxy_ports_on(
             let proxy_down = answerer
                 .as_ref()
                 .and_then(|reply| reply.proxy_down.as_ref());
-            let serving_proxy_port =
-                crate::resolver::serving_proxy_port(listing.resp.hostname_proxy_port, proxy_down);
+            let serving_proxy_port = crate::resolver::serving_proxy_port(
+                reported_proxy_port(listing.resp.hostname_proxy_port, ports_at(index)),
+                proxy_down,
+            );
             let row_ports = hostname_proxy_row_ports(serving_proxy_port, ports_at(index));
             if !row_ports.is_empty() {
                 writeln!(
@@ -1626,6 +1718,23 @@ pub(crate) fn format_ls_across_vms_with_proxy_ports_on(
                     width = VM_COLUMN_WIDTH,
                 )?;
                 facts += 1;
+            } else if proxy_down.is_none()
+                && let Some(reason) = listing.resp.hostname_routing_unavailable.as_deref()
+            {
+                // NET-020: this VM's daemon names its own cause on its row.
+                tracing::debug!(
+                    surface = "min ls HOSTNAME PROXY row",
+                    vm = %listing.vm,
+                    "printed the hostname-routing cause"
+                );
+                writeln!(
+                    out,
+                    "HOSTNAME PROXY:  {vm:<width$} {row}",
+                    vm = listing.vm,
+                    width = VM_COLUMN_WIDTH,
+                    row = hostname_routing_cause_row(reason),
+                )?;
+                facts += 1;
             }
             // NET-018: say which of the two surfaces is live for this VM —
             // the one verdict both verbs share, this VM's own, as `cmd_ls`
@@ -1638,15 +1747,15 @@ pub(crate) fn format_ls_across_vms_with_proxy_ports_on(
             if let Some(surface) = surface {
                 writeln!(
                     out,
-                    "BOX NAMES:       {vm:<width$} {}{}",
-                    crate::resolver::name_surface_line_at(
-                        surface.clone(),
-                        serving_proxy_port,
-                        boxes_at_own_address(&listing.resp),
+                    "BOX NAMES:       {vm:<width$} {}",
+                    crate::resolver::with_install_pointer(
+                        crate::resolver::name_surface_line_at(
+                            surface.clone(),
+                            serving_proxy_port,
+                            boxes_at_own_address(&listing.resp),
+                        ),
+                        crate::resolver::install_unfinished(&surface, host),
                     ),
-                    crate::resolver::install_clause(crate::resolver::install_unfinished(
-                        &surface, host
-                    )),
                     vm = listing.vm,
                     width = VM_COLUMN_WIDTH,
                 )?;
@@ -1772,6 +1881,64 @@ pub(crate) fn format_memory(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::status_label;
+
+    // BCLI-051: the walk over the local hosts names the provider and the
+    // host of each one, so `min box list` prints the host of every box.
+    #[test]
+    fn list_shows_host_per_box() {
+        use std::path::PathBuf;
+        let providers = PathBuf::from("/state/minimal/providers");
+        let vm = |name: &str, dir: PathBuf| super::client::VmSocket {
+            vm: name.to_string(),
+            sock: dir.join(paths::SSH_SOCK_FILE),
+        };
+        let default_dir = providers.join("local-minvmd0");
+        let alpha_dir = default_dir.join("alpha");
+        let hosts = super::local_hosts_from(
+            paths::HostKind::Minvmd,
+            vec![
+                vm(paths::DEFAULT_VM_NAME, default_dir.clone()),
+                vm("alpha", alpha_dir.clone()),
+            ],
+            default_dir.join(paths::SSH_SOCK_FILE),
+            "alpha",
+        );
+        let named: Vec<(&str, &str, bool)> = hosts
+            .iter()
+            .map(|host| (host.provider, host.host.as_str(), host.selected))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("local-minvmd", "local-minvmd0", false),
+                ("local-minvmd", "alpha.local-minvmd0", true),
+            ]
+        );
+        assert_eq!(hosts[1].sock, alpha_dir.join(paths::SSH_SOCK_FILE));
+
+        // The native backend enumerates no VM, so its one daemon is the
+        // host, named by its instance.
+        for (instance, expected) in [(0, "local0"), (3, "local3")] {
+            let sock = providers
+                .join(paths::host_name(paths::HostKind::Minimald, instance))
+                .join(paths::SSH_SOCK_FILE);
+            let hosts = super::local_hosts_from(
+                paths::HostKind::Minimald,
+                Vec::new(),
+                sock.clone(),
+                paths::DEFAULT_VM_NAME,
+            );
+            assert_eq!(
+                hosts,
+                [super::LocalHost {
+                    provider: "local",
+                    host: expected.to_string(),
+                    sock,
+                    selected: true,
+                }]
+            );
+        }
+    }
 
     // BOX-011: `min ls` labels each state with its BOX-011 name.
     #[test]

@@ -729,18 +729,23 @@ async fn spawn_backend_on(addr: std::net::SocketAddr, body: &'static str) {
     });
 }
 
-/// Spawns a loopback backend (see [`spawn_backend_on`]) on a free port,
-/// returning the port it listens on.
+/// Spawns a backend (see [`spawn_backend_on`]) at `0.0.0.0` on a free port,
+/// returning the port it listens on. A host-address box's name reaches only
+/// a port held at `0.0.0.0`, never one held at `127.0.0.1` only (NET-071).
 #[cfg(target_os = "linux")]
 async fn spawn_backend_saying(body: &'static str) -> u16 {
     use std::net::{IpAddr, Ipv4Addr};
 
     // Reserve then drop: the bind below re-takes the port for keeps.
     let port = {
-        let bind = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let bind = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
         bind.local_addr().unwrap().port()
     };
-    spawn_backend_on(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port), body).await;
+    spawn_backend_on(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+        body,
+    )
+    .await;
     port
 }
 
@@ -1953,9 +1958,9 @@ async fn proxy_publish_in_use_is_reported_not_retried() {
         "a handed port has no rung to walk to, got: {log}"
     );
     assert!(
-        state.proxy_unavailable().await.is_some(),
-        "the terminal failure must stay recorded as the unavailable note \
-         min ls warns from"
+        state.proxy_unavailable().await.is_none(),
+        "a host-held port records no cause in the guest: the VM host \
+         daemon records the cause that min ls reads"
     );
     assert!(
         state.hostname_proxy_port().await.is_none(),
