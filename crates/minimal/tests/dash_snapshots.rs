@@ -355,6 +355,42 @@ fn detail_pane_marks_a_credentialed_upstream_lane_not_in_effect() {
     insta::assert_snapshot!(render(&mut model));
 }
 
+/// BEP-085: a host-address box on a VM host reaches the Box Egress Proxy
+/// through the host-side gate, so the pane shows its declared lane with no
+/// not-in-effect mark. The box under the native `host` group keeps the mark
+/// (see the test above).
+#[test]
+fn detail_pane_shows_a_host_ip_lane_in_effect_on_a_vm_host() {
+    let mut model = fixed_model(vec![host(
+        "vm",
+        vec![entry(1, Some("api-staging"), "/src/api")],
+    )]);
+    let key = SessionKey {
+        host: "vm".to_string(),
+        id: id(1),
+    };
+    model.details.insert(
+        key,
+        Detail {
+            record: Some(record(Some("api-staging"), NetworkMode::HostNet)),
+            policy: Some(boxes::EffectiveBoxPolicy {
+                egress: boxes::EffectiveEgress::AllowAll,
+                ingress: None,
+                credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
+            }),
+            policy_error: None,
+        },
+    );
+    model.cursor = 1;
+    let rendered = render(&mut model);
+    assert!(
+        rendered.contains("credentialed upstream  allowed to reach the Box Egress Proxy"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("not in effect"), "{rendered}");
+    insta::assert_snapshot!(rendered);
+}
+
 /// A daemon that predates `GetEffectiveSessionPolicy` refuses the RPC: the
 /// pane keeps the record and names the failure rather than showing
 /// "loading policy…" for an answer that never comes.
