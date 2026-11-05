@@ -205,13 +205,32 @@ impl BoxLauncher for MockLauncher {
                 command
             }
         };
-        command.stdin(std::process::Stdio::from(pty.dup_slave_fd()?));
-        command.stdout(std::process::Stdio::from(pty.dup_slave_fd()?));
-        let tty_path = pty.slave_path().to_path_buf();
-        let (master, slave) = pty.into_fds();
-        command.stderr(std::process::Stdio::from(slave));
+        // A box without a terminal runs its argv on three pipes, as the
+        // real launcher runs it.
+        let (master, tty_path, pipes) = if self.spec.runs_on_pipes(&entrypoint) {
+            let child = ChildPipes::open()?;
+            command.stdin(std::process::Stdio::from(child.stdin));
+            command.stdout(std::process::Stdio::from(child.stdout));
+            command.stderr(std::process::Stdio::from(child.stderr));
+            drop(pty);
+            (
+                child.stdout_reader,
+                std::path::PathBuf::from("/dev/null"),
+                Some(child.parent),
+            )
+        } else {
+            command.stdin(std::process::Stdio::from(pty.dup_slave_fd()?));
+            command.stdout(std::process::Stdio::from(pty.dup_slave_fd()?));
+            let tty_path = pty.slave_path().to_path_buf();
+            let (master, slave) = pty.into_fds();
+            command.stderr(std::process::Stdio::from(slave));
+            (master, tty_path, None)
+        };
 
         let process = command.spawn()?;
+        // The child holds its own ends now. The daemon's copies close here,
+        // so the child's exit closes its pipes.
+        drop(command);
 
         Ok(Launched {
             master,
@@ -229,6 +248,7 @@ impl BoxLauncher for MockLauncher {
             // The mock's process is a plain host child with no pre-exec
             // closure to hold it.
             start_gate: None,
+            pipes,
         })
     }
 }

@@ -779,9 +779,9 @@ pub(super) async fn task_entrypoint_box(
     is_task_entrypoint.then_some(TaskEntrypointBox { record, dir })
 }
 
-/// How often the relay of a task box's entrypoint reads its log for new
-/// output. The host appends to the log with no wake-up to send.
-const ENTRYPOINT_LOG_POLL: Duration = Duration::from_millis(100);
+/// How often a task run checks whether its box's entrypoint ended, and
+/// whether the box's record keeps the end.
+const ENTRYPOINT_POLL: Duration = Duration::from_millis(100);
 
 /// How long the run waits for the box's actor to write the ended record
 /// after the entrypoint's host ends.
@@ -789,7 +789,7 @@ const ENTRYPOINT_RECORD_WAIT: Duration = Duration::from_secs(30);
 
 impl TaskEntrypointBox {
     /// Starts the box's entrypoint, or joins it when it already runs, and
-    /// relays its output from the box's log. The task's resolved variables
+    /// relays its stdin, stdout and stderr. The task's resolved variables
     /// go to the launch that starts the entrypoint (see
     /// [`crate::box_actor::entrypoint_env`]).
     async fn start(self, exec: TaskExec, session: BoxHandle) -> io::Result<TaskProcess> {
@@ -805,11 +805,6 @@ impl TaskEntrypointBox {
             box_name = %box_name,
             task = %exec.task,
         );
-        // The log can hold output from before this run, such as a hook
-        // launch's. The relay sends what the entrypoint writes from here.
-        let offset = std::fs::metadata(self.dir.log_path().as_utf8_path())
-            .map(|meta| meta.len())
-            .unwrap_or(0);
         // `inherit_cwd`: the client sends a directory only for a task that
         // declares it. The entrypoint starts there, so the in-box `min task
         // run` reads it as its `$PWD`. A directory that is not in the
@@ -830,7 +825,14 @@ impl TaskEntrypointBox {
             .username
             .clone()
             .unwrap_or_else(|| "user".to_string());
-        let host = match session.ensure_host(username).instrument(span.clone()).await {
+        let ensured = session.ensure_host(username).instrument(span.clone()).await;
+        if ensured.is_err() {
+            // An `ensure_host` that failed before the box's actor took the
+            // staged values leaves them staged. Nothing launches for this
+            // run, so no later launch of the box may take them.
+            drop(crate::box_actor::entrypoint_env::take(&box_id));
+        }
+        let host = match ensured {
             Ok(host) => host,
             // The box's actor refused the start. The run says so in plain
             // words, without the spawn-failure prefix, and exits 1.
@@ -846,22 +848,44 @@ impl TaskEntrypointBox {
             }
             Err(error) => return Err(io::Error::other(format!("{error}"))),
         };
+        // The box runs its entrypoint on three pipes (T43): the run's stdin
+        // goes to the entrypoint's stdin, and its stdout and stderr come
+        // back as two streams.
+        let Some(io) = host.take_entrypoint_io().await else {
+            span.in_scope(|| {
+                tracing::warn!(
+                    "task box: the entrypoint has a terminal, so the run cannot relay it"
+                );
+            });
+            return Err(io::Error::other(
+                "The task's box runs its command on a terminal, so the run cannot pass its \
+                 input and output.",
+            ));
+        };
         span.in_scope(|| {
             tracing::info!(
                 drop_env = exec.drop_env.len(),
                 start_dir = ?start_dir,
+                stdin = io.stdin.is_some(),
                 "task box: the run relays the box's entrypoint"
             );
         });
 
-        let (reader, mut writer) = tokio::io::duplex(64 * 1024);
+        // `None` for a run that joins an entrypoint another run started:
+        // that run has the entrypoint's stdin.
+        let stdin = io
+            .stdin
+            .map(tokio::net::unix::pipe::Sender::from_file)
+            .transpose()?;
+        let (stdout, stdout_writer) = tokio::io::duplex(64 * 1024);
+        let (stderr, mut stderr_writer) = tokio::io::duplex(64 * 1024);
         if let Some(notice) = start_notice {
-            writer.write_all(notice.as_bytes()).await?;
+            stderr_writer.write_all(notice.as_bytes()).await?;
         }
-        let relay = spawn(
-            relay_entrypoint_log(host.clone(), self.dir.clone(), offset, writer)
-                .instrument(span.clone()),
-        );
+        let relays = vec![
+            spawn(relay_entrypoint_stream(io.stdout, stdout_writer).instrument(span.clone())),
+            spawn(relay_entrypoint_stream(io.stderr, stderr_writer).instrument(span.clone())),
+        ];
         Ok(TaskProcess::Entrypoint(EntrypointProcess {
             host,
             record_dir: self.dir.clone(),
@@ -869,80 +893,34 @@ impl TaskEntrypointBox {
             box_name,
             task: exec.task,
             span,
-            stdout: Some(reader),
-            relay: Some(relay),
+            stdio: Some((stdin, stdout, stderr)),
+            relays,
             released: false,
         }))
     }
 }
 
-/// Copies the box's log from `offset` to `out` until the entrypoint's host
-/// ends, then copies what is left and closes `out`. The terminal turns
-/// each newline into CR LF. The relay turns it back, so the output the
-/// task run prints is the task's own.
-async fn relay_entrypoint_log(
-    host: crate::box_runtime::HostHandle,
-    dir: boxes::store::BoxDir,
-    offset: u64,
+/// Copies one output stream of the box's entrypoint to `out` until the
+/// host ends the stream, then closes `out`. A pipe is no terminal, so the
+/// bytes are the entrypoint's own.
+async fn relay_entrypoint_stream(
+    mut chunks: tokio::sync::mpsc::Receiver<Vec<u8>>,
     mut out: tokio::io::DuplexStream,
 ) {
-    let mut reader = boxes::store::LogReader::new(&dir, offset);
-    let mut held_cr = false;
-    let mut ended = false;
-    loop {
-        loop {
-            let chunk = match reader.read(64 * 1024) {
-                Ok(chunk) => chunk,
-                Err(error) => {
-                    tracing::warn!(%error, "task box: the entrypoint's log could not be read");
-                    return;
-                }
-            };
-            if chunk.data.is_empty() {
-                break;
-            }
-            let bytes = strip_terminal_cr(&chunk.data, &mut held_cr);
-            if out.write_all(&bytes).await.is_err() {
-                // Nobody reads the run any more. The entrypoint runs on.
-                return;
-            }
-        }
-        if ended {
-            if held_cr {
-                let _ = out.write_all(b"\r").await;
-            }
-            let _ = out.shutdown().await;
+    while let Some(chunk) = chunks.recv().await {
+        if out.write_all(&chunk).await.is_err() {
+            // Nobody reads the run any more. The entrypoint runs on, and
+            // its output goes on to the box's log.
             return;
         }
-        // Read before the sleep, so the read after an end takes every
-        // byte the entrypoint wrote.
-        ended = !host.is_alive();
-        if !ended {
-            tokio::time::sleep(ENTRYPOINT_LOG_POLL).await;
-        }
     }
-}
-
-/// `bytes` with each CR LF turned into LF. `held_cr` carries a CR at the
-/// end of one chunk to the next, where the LF can follow it.
-fn strip_terminal_cr(bytes: &[u8], held_cr: &mut bool) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len() + 1);
-    for &byte in bytes {
-        if std::mem::take(held_cr) && byte != b'\n' {
-            out.push(b'\r');
-        }
-        if byte == b'\r' {
-            *held_cr = true;
-        } else {
-            out.push(byte);
-        }
-    }
-    out
+    let _ = out.shutdown().await;
 }
 
 /// The [`Process`] of a task run whose task is its box's entrypoint (T43).
-/// Its output is the entrypoint's, read from the box's log, and its exit
-/// code is the one the box's record keeps when the entrypoint returns.
+/// Its stdin, stdout and stderr are the entrypoint's, through the pipes it
+/// runs on, and its exit code is the one the box's record keeps when the
+/// entrypoint returns.
 ///
 /// The run does not own the entrypoint. A client that goes away, or a
 /// kill of the run, stops the relay, and the box runs on (BOX-015). The
@@ -957,44 +935,55 @@ pub struct EntrypointProcess {
     box_name: String,
     task: String,
     span: tracing::Span,
-    stdout: Option<tokio::io::DuplexStream>,
-    relay: Option<JoinHandle<()>>,
+    stdio: Option<(
+        Option<tokio::net::unix::pipe::Sender>,
+        tokio::io::DuplexStream,
+        tokio::io::DuplexStream,
+    )>,
+    /// The copies of the entrypoint's stdout and stderr to the run.
+    relays: Vec<JoinHandle<()>>,
     released: bool,
 }
 
+/// The exit code a task run returns for the end its box's record keeps,
+/// as `min` gives it for each end. `None` while the record keeps no end.
+fn entrypoint_end_code(state: boxes::core::record::RecordState) -> Option<i32> {
+    use boxes::core::record::{ExitEnding, RecordState, StopEnding};
+    match state {
+        RecordState::Exited(ExitEnding::Exit { exit_code })
+        | RecordState::Stopped(StopEnding::ExitedFirst { exit_code }) => Some(exit_code),
+        // 124 for a run past its timeout, and the 137 the record keeps for
+        // an OOM kill (BOX-011).
+        RecordState::Exited(ExitEnding::Timeout) => Some(124),
+        RecordState::Exited(ExitEnding::Oom) => Some(137),
+        // A stop by a signal borrows the shell's 128 + signal, so a `min
+        // box stop` (SIGTERM) gives 143. A box the daemon found running at
+        // its start was killed with it, as SIGKILL ends a process: 137.
+        RecordState::Stopped(StopEnding::Signalled { signal }) => Some(128 + signal),
+        RecordState::Stopped(StopEnding::AtDaemonStart) => Some(137),
+        _ => None,
+    }
+}
+
 impl EntrypointProcess {
-    /// The exit code the box's record keeps once its entrypoint returned.
-    /// `Ok(None)` for an end with no code, such as a signal.
+    /// The exit code for the end the box's record keeps once its
+    /// entrypoint ended ([`entrypoint_end_code`]).
     async fn recorded_code(&self) -> io::Result<Option<i32>> {
-        use boxes::core::record::{ExitEnding, RecordState, StopEnding};
         let deadline = tokio::time::Instant::now() + ENTRYPOINT_RECORD_WAIT;
         loop {
             let dir = self.record_dir.clone();
             let record = crate::traced::spawn_blocking(move || dir.record())
                 .await
                 .map_err(io::Error::other)??;
-            let code = match record.state() {
-                Ok(RecordState::Exited(ExitEnding::Exit { exit_code }))
-                | Ok(RecordState::Stopped(StopEnding::ExitedFirst { exit_code })) => {
-                    Some(Some(exit_code))
-                }
-                // The codes `min` uses for these ends: 124 for a run past
-                // its timeout, and the 137 the record keeps for an OOM kill
-                // (BOX-011).
-                Ok(RecordState::Exited(ExitEnding::Timeout)) => Some(Some(124)),
-                Ok(RecordState::Exited(ExitEnding::Oom)) => Some(Some(137)),
-                Ok(RecordState::Stopped(_)) => Some(None),
-                _ => None,
-            };
-            if let Some(code) = code {
-                return Ok(code);
+            if let Some(code) = record.state().ok().and_then(entrypoint_end_code) {
+                return Ok(Some(code));
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(io::Error::other(
                     "the task box's entrypoint ended, and its record keeps no exit code",
                 ));
             }
-            tokio::time::sleep(ENTRYPOINT_LOG_POLL).await;
+            tokio::time::sleep(ENTRYPOINT_POLL).await;
         }
     }
 }
@@ -1005,29 +994,31 @@ impl Process for EntrypointProcess {
     type Stderr = std::pin::Pin<Box<dyn AsyncRead + Send + Unpin>>;
 
     fn take_stdio(&mut self) -> Option<(Self::Stdin, Self::Stdout, Self::Stderr)> {
-        let stdout = self.stdout.take()?;
-        Some((
-            // The entrypoint reads no input from the run: its terminal is
-            // the box's, not the client's.
-            Box::pin(tokio::io::sink()),
-            Box::pin(stdout),
-            // The terminal joins the entrypoint's stderr to its stdout.
-            Box::pin(tokio::io::empty()),
-        ))
+        // The client's stdin goes to the entrypoint's stdin, and the
+        // bridge closes it at the client's EOF. Stdout and stderr are the
+        // entrypoint's, as two streams.
+        let (stdin, stdout, stderr) = self.stdio.take()?;
+        let stdin: Self::Stdin = match stdin {
+            Some(stdin) => Box::pin(stdin),
+            None => Box::pin(tokio::io::sink()),
+        };
+        Some((stdin, Box::pin(stdout), Box::pin(stderr)))
     }
 
     async fn wait(&mut self) -> io::Result<Option<i32>> {
         if self.released {
             return Ok(None);
         }
-        if let Some(relay) = self.relay.as_mut() {
+        // One at a time, and each removed once it ended: the bridge can
+        // drop this future and poll `wait` again.
+        while let Some(relay) = self.relays.first_mut() {
             let _ = relay.await;
-            self.relay = None;
+            self.relays.remove(0);
         }
-        // The relay can stop before the entrypoint ends, on a log it cannot
-        // read. The code comes only when the host ends, so wait for that.
+        // A relay can stop before the entrypoint ends, when nobody reads
+        // the run. The code comes only when the host ends, so wait for that.
         while self.host.is_alive() {
-            tokio::time::sleep(ENTRYPOINT_LOG_POLL).await;
+            tokio::time::sleep(ENTRYPOINT_POLL).await;
         }
         let code = self.recorded_code().await;
         let _entered = self.span.enter();
@@ -1054,7 +1045,7 @@ impl Process for EntrypointProcess {
         // BOX-015: the loss of the run's client never stops the box. The
         // relay stops, and the box's entrypoint runs on.
         self.released = true;
-        if let Some(relay) = self.relay.take() {
+        for relay in self.relays.drain(..) {
             relay.abort();
         }
         let _entered = self.span.enter();

@@ -667,6 +667,14 @@ pub struct BoxActor {
     /// end the box. `None` before the first launch and after the watch fired.
     entrypoint_watch: Option<EntrypointWatch>,
 
+    /// Set while a message runs whose wait for the entrypoint's exit did
+    /// not settle: the closed host's exit did not come within
+    /// [`EXIT_SETTLE_TIMEOUT`], or its loop ended with no exit to read.
+    /// The box may be ending, so [`Self::ensure_host`] refuses and launches
+    /// nothing: a launch could run an `until_complete` entrypoint a second
+    /// time (BOX-038).
+    exit_unsettled: bool,
+
     /// Whether this daemon opted out of the deny-all egress default
     /// (NET-077), threaded from the server config: the launcher resolves
     /// this session's effective egress (NET-074) against it, and the task
@@ -764,6 +772,7 @@ impl BoxActor {
             held_spec: None,
             // No launch yet, so no loop to watch.
             entrypoint_watch: None,
+            exit_unsettled: false,
             // Forwards are registered as their channels open; a session
             // starts with none.
             forwards: Vec::new(),
@@ -1512,18 +1521,29 @@ impl BoxActor {
     /// that exit (bounded by [`EXIT_SETTLE_TIMEOUT`]). Otherwise an exec
     /// queued beside the exit finds no live host and launches the
     /// entrypoint again (BOX-038).
+    ///
+    /// A wait that does not settle sets [`Self::exit_unsettled`]: on a
+    /// timeout, which keeps the watch for the mainloop to read the exit
+    /// later, and on a loop that ended with no exit to read.
     async fn settled_entrypoint_exit(&mut self) -> Option<Option<box_runtime::HostExit>> {
         if let Some(exit) = ready_entrypoint_exit(&mut self.entrypoint_watch) {
+            self.exit_unsettled = exit.is_none();
             return Some(exit);
         }
         if self.has_live_host() {
             return None;
         }
         let watch = self.entrypoint_watch.as_mut()?;
-        let exit = tokio::time::timeout(EXIT_SETTLE_TIMEOUT, watch)
-            .await
-            .ok()?;
+        let Ok(exit) = tokio::time::timeout(EXIT_SETTLE_TIMEOUT, watch).await else {
+            tracing::warn!(
+                box_id = %self.record.id(),
+                "the closed host's exit did not come in time; a launch for this message is refused"
+            );
+            self.exit_unsettled = true;
+            return None;
+        };
         self.entrypoint_watch = None;
+        self.exit_unsettled = exit.is_err();
         Some(exit.ok())
     }
 
@@ -1552,6 +1572,7 @@ impl BoxActor {
                     // finds the box exited: an attach resumes it, and an
                     // exec is refused.
                     let mut ended = None;
+                    self.exit_unsettled = false;
                     if !goes_before_exit(&queued.0)
                         && let Some(exit) = self.settled_entrypoint_exit().await
                     {
@@ -1588,9 +1609,11 @@ impl BoxActor {
                 parent_span_id = tracing::field::Empty,
             );
             crate::exec::adopt_trace(&span, caller);
-            if let ControlFlow::Break(t) =
-                tracing::Instrument::instrument(self.handle_message(msg), span).await
-            {
+            let handled = tracing::Instrument::instrument(self.handle_message(msg), span).await;
+            // The refusal holds for the one message that found the wait
+            // unsettled.
+            self.exit_unsettled = false;
+            if let ControlFlow::Break(t) = handled {
                 teardown = t;
                 break;
             }

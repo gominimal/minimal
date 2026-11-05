@@ -237,6 +237,64 @@ impl LaunchSpec {
     }
 }
 
+impl LaunchSpec {
+    /// Whether `entrypoint` runs on three pipes, not on the box's terminal:
+    /// an argv entrypoint of a box whose spec does not set
+    /// `io.pty_enabled`. Such a box speaks the pipeline contract, so a task
+    /// run relays its stdin, stdout and stderr as three streams (T43).
+    pub(crate) fn runs_on_pipes(&self, entrypoint: &LaunchEntrypoint) -> bool {
+        matches!(entrypoint, LaunchEntrypoint::Argv { .. })
+            && self.spec.as_deref().is_some_and(|spec| !spec.pty_enabled)
+    }
+}
+
+/// The daemon's ends of the three pipes an entrypoint runs on when
+/// [`LaunchSpec::runs_on_pipes`] says so. The launch's
+/// [`Launched::master`] is then the read end of the entrypoint's stdout.
+pub(crate) struct EntrypointPipes {
+    /// The write end of the entrypoint's stdin.
+    pub(super) stdin: OwnedFd,
+    /// The read end of the entrypoint's stderr.
+    pub(super) stderr: OwnedFd,
+}
+
+/// The three pipes of an entrypoint that runs on pipes: what the child
+/// gets as its stdin, stdout and stderr, and the daemon's ends. Every end
+/// is close-on-exec, so no other process inherits one. The child's ends
+/// become its fds 0, 1 and 2 through `dup2`, which clears the flag there.
+pub(crate) struct ChildPipes {
+    pub(crate) stdin: OwnedFd,
+    pub(crate) stdout: OwnedFd,
+    pub(crate) stderr: OwnedFd,
+    /// The read end of the child's stdout: the launch's master.
+    pub(crate) stdout_reader: OwnedFd,
+    pub(crate) parent: EntrypointPipes,
+}
+
+impl ChildPipes {
+    /// Opens the three pipes.
+    ///
+    /// # Errors
+    ///
+    /// The error of `pipe2(2)`.
+    pub(crate) fn open() -> io::Result<Self> {
+        let pipe = || nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).map_err(io::Error::from);
+        let (stdin, stdin_writer) = pipe()?;
+        let (stdout_reader, stdout) = pipe()?;
+        let (stderr_reader, stderr) = pipe()?;
+        Ok(Self {
+            stdin,
+            stdout,
+            stderr,
+            stdout_reader,
+            parent: EntrypointPipes {
+                stdin: stdin_writer,
+                stderr: stderr_reader,
+            },
+        })
+    }
+}
+
 /// The connection-variable name under which a task run stages the
 /// directory its box's entrypoint starts in (`inherit_cwd`). A launch takes
 /// it out before the environment is built, so it never reaches the box.
@@ -327,6 +385,10 @@ pub(crate) struct Launched<P, G> {
     /// startup files are the user's — waits for the first attach. `None` on
     /// every other launch, whose shell starts at once.
     pub(super) start_gate: Option<sandbox::StartGate>,
+    /// The daemon's ends of the entrypoint's stdin and stderr, on a launch
+    /// whose entrypoint runs on pipes ([`LaunchSpec::runs_on_pipes`]).
+    /// `None` on a launch that gives its process the terminal.
+    pub(super) pipes: Option<EntrypointPipes>,
 }
 
 /// The box's output log as its host writes it (BOX-155): every byte the
@@ -1113,6 +1175,7 @@ impl BoxLauncher for SandboxLauncher {
         // Decided before anything is built, so a spec no launch can start
         // reserves nothing.
         let entrypoint = self.entrypoint()?;
+        let on_pipes = self.spec.runs_on_pipes(&entrypoint);
         let ctx = self.ctx;
         // Move the session policy out of `self` up front so it can be applied
         // after the switch attach below (the rest of `self` is consumed first).
@@ -1723,19 +1786,39 @@ impl BoxLauncher for SandboxLauncher {
                     command
                 }
             };
-            command.stdin(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
-            command.stdout(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
-            let tty_path = pty.slave_path().to_path_buf();
-            // Kept for one notice written after the switch attach below (an
-            // own-address box the hostname proxy stranded), so it is said in
-            // the terminal, not only in the daemon's log. Never for a hook
-            // launch: its pty is read by nobody. Dropped before the launch
-            // returns, so it never outlives the shell's own slave fds.
-            let late_notice_fd = (matches!(network_mode, NetworkMode::OwnIp) && !for_hooks)
-                .then(|| pty.dup_slave_fd().ok())
-                .flatten();
-            let (master, slave) = pty.into_fds();
-            command.stderr(hakoniwa::Stdio::from(slave));
+            // A box without a terminal runs its argv on three pipes, so
+            // a task run relays its stdin, stdout and stderr (T43). The
+            // host reads the stdout pipe where it reads a terminal's
+            // master, and nothing holds the terminal opened above.
+            let (master, tty_path, late_notice_fd, pipes) = if on_pipes {
+                let child = ChildPipes::open()?;
+                command.stdin(hakoniwa::Stdio::from(child.stdin));
+                command.stdout(hakoniwa::Stdio::from(child.stdout));
+                command.stderr(hakoniwa::Stdio::from(child.stderr));
+                drop(pty);
+                (
+                    child.stdout_reader,
+                    std::path::PathBuf::from("/dev/null"),
+                    None,
+                    Some(child.parent),
+                )
+            } else {
+                command.stdin(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
+                command.stdout(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
+                let tty_path = pty.slave_path().to_path_buf();
+                // Kept for one notice written after the switch attach below
+                // (an own-address box the hostname proxy stranded), so it is
+                // said in the terminal, not only in the daemon's log. Never
+                // for a hook launch: its pty is read by nobody. Dropped
+                // before the launch returns, so it never outlives the
+                // shell's own slave fds.
+                let late_notice_fd = (matches!(network_mode, NetworkMode::OwnIp) && !for_hooks)
+                    .then(|| pty.dup_slave_fd().ok())
+                    .flatten();
+                let (master, slave) = pty.into_fds();
+                command.stderr(hakoniwa::Stdio::from(slave));
+                (master, tty_path, late_notice_fd, None)
+            };
 
             // On the fork thread, never this one: the container dies with
             // the thread that forked it (see `sandbox::forker`).
@@ -1752,11 +1835,12 @@ impl BoxLauncher for SandboxLauncher {
                 late_notice_fd,
                 start_gate,
                 namespace_gate,
+                pipes,
             ))
         }
         .await;
 
-        let (env, master, process, tty_path, late_notice_fd, start_gate, namespace_gate) =
+        let (env, master, process, tty_path, late_notice_fd, start_gate, namespace_gate, pipes) =
             match build_and_spawn {
                 Ok(parts) => parts,
                 Err(e) => return Err(e),
@@ -1974,6 +2058,7 @@ impl BoxLauncher for SandboxLauncher {
             // cancelled launch's plan never reaches any host at all.
             listen_plan,
             start_gate,
+            pipes,
         })
     }
 }

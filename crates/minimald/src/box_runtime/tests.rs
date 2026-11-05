@@ -1985,6 +1985,7 @@ impl BoxLauncher for SealingMockLauncher {
             listen_plan: None,
             // A plain host child: no pre-exec closure to hold.
             start_gate: None,
+            pipes: None,
         })
     }
 }

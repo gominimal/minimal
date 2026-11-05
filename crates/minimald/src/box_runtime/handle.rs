@@ -38,6 +38,10 @@ pub(super) enum Message {
     /// Answered straight off the parser — no PTY resize, no I/O relay.
     GetScreen(oneshot::Sender<minimald_rpc::ScreenSnapshot>),
 
+    /// Hand a task run the streams of an entrypoint that runs on pipes
+    /// (T43). `None` for a host whose entrypoint has a terminal.
+    TakeEntrypointIo(oneshot::Sender<Option<EntrypointIo>>),
+
     /// Ask the attached human whether the box may publish `port` at runtime
     /// (NET-045): the box's `dynamic_ingress` is `ask`, so the bound client
     /// decides. Answered with the answer the human gave, or `None` when
@@ -463,6 +467,19 @@ impl HostHandle {
             Err(SendError(Message::GetScreen(_))) => Err(()),
             Err(e) => unreachable!("{:?}", e),
         }
+    }
+
+    /// Takes the streams of the host's entrypoint, when it runs on pipes
+    /// (T43): the write end of its stdin, and what it writes to stdout and
+    /// stderr from now on. `None` for a host whose entrypoint has a
+    /// terminal, or a host that is gone.
+    pub(crate) async fn take_entrypoint_io(&self) -> Option<EntrypointIo> {
+        let (send, recv) = oneshot::channel();
+        self.sender
+            .send(Message::TakeEntrypointIo(send))
+            .await
+            .ok()?;
+        recv.await.ok().flatten()
     }
 
     /// Returns what a destroy of the session's workspace would lose: the

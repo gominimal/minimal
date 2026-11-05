@@ -349,8 +349,8 @@ pub(super) fn watch_quic443_exit(
 /// message carries no environment. The values move into that message
 /// when it gains one. Known gap until then: the run does not apply the
 /// names that the client's `[vars] ignore` matched (`TaskExec::drop_env`)
-/// to the entrypoint launch. No issue tracks this gap yet. File one, and
-/// put its URL here as the flip condition.
+/// to the entrypoint launch. Flip condition: the `[vars] ignore` issue,
+/// https://github.com/gominimal/minimal/issues/3043.
 pub(crate) mod entrypoint_env {
     use std::collections::HashMap;
     use std::sync::{LazyLock, Mutex};
@@ -408,8 +408,8 @@ pub(crate) const ENTRYPOINT_BEHIND_HOOK_SHELL: &str = "The box has its own netwo
 /// and answers with [`ENTRYPOINT_BEHIND_HOOK_SHELL`].
 ///
 /// Known gap: this refusal fails closed, so a box with its own network
-/// address and activate hooks cannot run its task. No issue tracks this
-/// gap yet. File one, and name it here.
+/// address and activate hooks cannot run its task. Tracked by
+/// https://github.com/gominimal/minimal/issues/3042.
 #[derive(Debug)]
 pub(crate) struct EntrypointBehindHookShell;
 
@@ -1452,11 +1452,15 @@ impl BoxActor {
             BoxInner::Active { .. } => None,
         };
         if let Some(host) = running {
-            // A hook launch holds the shell, never the spec's argv. A box
-            // whose entrypoint is an argv, a task box, replaces that shell
-            // with its entrypoint here, or the task never runs. A box that
-            // holds a host-side row keeps it, as an attach keeps it.
-            let replace = self.host_origin == HostOrigin::Hooks && self.starts_argv().await;
+            // A hook launch holds the shell, never the spec's argv. A task
+            // run on a box whose entrypoint is an argv, a task box,
+            // replaces that shell with its entrypoint here, or the task
+            // never runs. Any other caller (an exec, an attach, a resume)
+            // keeps the shell: it staged no environment for the entrypoint.
+            // A box that holds a host-side row keeps it, as an attach keeps
+            // it.
+            let replace =
+                entrypoint_run && self.host_origin == HostOrigin::Hooks && self.starts_argv().await;
             if replace && !holds_host_row {
                 tracing::info!(
                     box_id = %self.record.id(),
@@ -1498,6 +1502,29 @@ impl BoxActor {
             }
         }
 
+        // The wait for a closed host's exit did not settle, so the box may
+        // be ending. A launch here could run an `until_complete`
+        // entrypoint a second time (BOX-038): refuse, and launch nothing.
+        if self.exit_unsettled {
+            tracing::warn!(
+                box_id = %self.record.id(),
+                "refused the exec: the box's last host ended and its exit is not known yet"
+            );
+            let name = self
+                .record
+                .record()
+                .await
+                .ok()
+                .and_then(|record| record.name)
+                .unwrap_or_else(|| self.record.id().to_string());
+            return Err(AttachError::ResumeRefused(
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("box {name} is ending. Only a running box can run a command."),
+                ),
+                2,
+            ));
+        }
         let (_, launched) = self
             .launch_host(
                 session_hnd,
