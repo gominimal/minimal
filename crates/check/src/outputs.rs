@@ -500,9 +500,13 @@ impl DetbuildScan {
         let root = cached_build.path();
         for path in self.files_naming_detbuild(self.output_files(root)?)? {
             result.verdict = CheckVerdict::Fail;
-            result.err.push(detbuild_leak_message(
-                path.strip_prefix(root).unwrap_or(&path),
+            result.err.push(format!(
+                "{} contains the text `libdetbuild`.",
+                path.strip_prefix(root).unwrap_or(&path).display()
             ));
+        }
+        if !result.err.is_empty() {
+            result.err.push(DETBUILD_LEAK_EXPLANATION.into());
         }
         Ok(result)
     }
@@ -544,20 +548,15 @@ impl DetbuildScan {
     }
 }
 
-/// What a package author reads for one output that names the shim: what the
-/// leak does to the people who run the package, and the fix. It names no
-/// skip flag: the `detbuild` package is exempt in code, and skipping this
-/// check for any other package ships the leak.
-fn detbuild_leak_message(output: &Path) -> String {
-    format!(
-        "{} contains the text `libdetbuild`. The build wrote the name of its build-time \
-         preload library into this output. A program started through this file can load that \
-         library, and then its random numbers come from a fixed seed, so any key it makes can \
-         be guessed. Rebuilding with a fix does not change a key made before it. Change the \
-         package's build so that this output does not name the library.",
-        output.display()
-    )
-}
+/// What a package author reads once, after the line for each output that
+/// names the shim: what the leak does to the people who run the package, and
+/// the fix. It names no skip flag: the `detbuild` package is exempt in code,
+/// and skipping this check for any other package ships the leak.
+const DETBUILD_LEAK_EXPLANATION: &str = "The build wrote the name of its build-time preload \
+    library into the outputs above. A program started through one of them can load that \
+    library, and then its random numbers come from a fixed seed, so any key it makes can be \
+    guessed. Rebuilding with a fix does not change a key made before it. Change the package's \
+    build so that no output names the library.";
 
 /// Whether `path` contains `needle`: the file read in 64 KiB chunks, each
 /// searched with `memmem`, with `needle.len() - 1` bytes carried between
@@ -797,23 +796,28 @@ mod tests {
         ))
     }
 
-    /// #2489: an output that names `libdetbuild` (here a libtool-style wrapper
-    /// that recorded the build's `LD_PRELOAD`) fails the check, and the error
-    /// names the file.
+    /// #2489: outputs that name `libdetbuild` (here a libtool-style wrapper
+    /// that recorded the build's `LD_PRELOAD`, and a libtool `.la`) fail the
+    /// check: one short line names each file, then one explanation follows.
     #[tokio::test]
     async fn no_detbuild_fails_when_an_output_names_it() {
         let tmpdir = make_tmp_dir("detbuild_leak");
         let ctx = make_ctx(&tmpdir, vec![]);
         let graph = pkg_with_bin_output("wrapped");
-        staged_build_with_file(
-            &ctx,
-            &graph,
-            "wrapped",
-            "bin/wrapped",
-            b"#!/bin/sh
-LD_PRELOAD=/usr/lib/minimal/libdetbuild.so exec /usr/bin/real \"$@\"
-",
-        )
+        staged_build(&ctx, &graph, "wrapped", |root| {
+            std::fs::write(
+                root.join("bin/wrapped"),
+                b"#!/bin/sh\nLD_PRELOAD=/usr/lib/minimal/libdetbuild.so exec /usr/bin/real \"$@\"\n",
+            )
+            .expect("write wrapper");
+            std::fs::write(
+                root.join("bin/wrapped.la"),
+                b"dependency_libs=' /usr/lib/minimal/libdetbuild.so'\n",
+            )
+            .expect("write libtool archive");
+            std::fs::write(root.join("bin/clean"), b"#!/bin/sh\nexec /usr/bin/real\n")
+                .expect("write clean file");
+        })
         .await;
 
         let guard = graph.read().await;
@@ -826,29 +830,35 @@ LD_PRELOAD=/usr/lib/minimal/libdetbuild.so exec /usr/bin/real \"$@\"
             "a leaked preload must fail, got {:?}",
             result.verdict
         );
-        assert_eq!(result.err.len(), 1, "one file, one error: {:?}", result.err);
-        assert!(
-            result.err[0].starts_with("bin/wrapped contains the text `libdetbuild`."),
-            "{:?}",
+        assert_eq!(
+            result.err[..2],
+            [
+                "bin/wrapped contains the text `libdetbuild`.",
+                "bin/wrapped.la contains the text `libdetbuild`.",
+            ],
+            "one line per leaking file, in path order: {:?}",
             result.err
         );
-        assert!(
-            result.err[0].contains("any key it makes can be guessed"),
-            "the message says what the leak does: {:?}",
+        assert_eq!(
+            result.err.len(),
+            3,
+            "then one explanation: {:?}",
             result.err
         );
+        let explanation = &result.err[2];
         assert!(
-            result.err[0].ends_with(
-                "Change the package's build so that this output does not name the library."
-            ),
-            "the message ends on the fix: {:?}",
-            result.err
+            explanation.contains("any key it makes can be guessed"),
+            "the explanation says what the leak does: {explanation:?}"
+        );
+        assert!(
+            explanation
+                .ends_with("Change the package's build so that no output names the library."),
+            "the explanation ends on the fix: {explanation:?}"
         );
         // `min check` refuses the flag, and skipping ships the leak.
         assert!(
-            !result.err[0].contains("--skip"),
-            "the message names no skip flag: {:?}",
-            result.err
+            !explanation.contains("--skip"),
+            "the explanation names no skip flag: {explanation:?}"
         );
 
         std::fs::remove_dir_all(&tmpdir).expect("cleanup test tmp dir");
@@ -1057,10 +1067,65 @@ LD_PRELOAD=/usr/lib/minimal/libdetbuild.so exec /usr/bin/real \"$@\"
             "{:?}",
             result.verdict
         );
-        assert_eq!(result.err.len(), 1, "one file, one error: {:?}", result.err);
-        assert!(
-            result.err[0].starts_with("bin/wrapped contains"),
+        assert_eq!(
+            result.err[0], "bin/wrapped contains the text `libdetbuild`.",
             "{:?}",
+            result.err
+        );
+        assert_eq!(
+            result.err.len(),
+            2,
+            "one file, one line, one explanation: {:?}",
+            result.err
+        );
+
+        std::fs::remove_dir_all(&tmpdir).expect("cleanup test tmp dir");
+    }
+
+    /// The walk every glob-reading checker shares does not follow a symlinked
+    /// directory: a loop (`loop -> .`) adds no paths, and a library under
+    /// `usr/lib` is found once by `**/` even with `usr/lib64 -> lib` beside it.
+    #[test]
+    fn the_check_cache_walk_follows_no_symlinked_directory() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path();
+        std::fs::create_dir_all(root.join("usr/lib")).unwrap();
+        std::fs::write(root.join("usr/lib/libfoo.so.1"), b"elf").unwrap();
+        std::os::unix::fs::symlink("lib", root.join("usr/lib64")).unwrap();
+        std::os::unix::fs::symlink(".", root.join("loop")).unwrap();
+        let check_cache = crate::CheckCache::new();
+        let all = check_cache.match_files_for_glob(root, "**/*").unwrap();
+        assert_eq!(*all, vec![root.join("usr/lib/libfoo.so.1")]);
+        let lib = check_cache
+            .match_files_for_glob(root, "**/libfoo.so.1")
+            .unwrap();
+        assert_eq!(*lib, vec![root.join("usr/lib/libfoo.so.1")]);
+    }
+
+    /// `output types valid` ends over an output with two links back to its
+    /// root (`loop -> .`, `bin/up -> ..`), which a following walk descends
+    /// about 2^40 times.
+    #[tokio::test]
+    async fn output_types_valid_ends_across_a_symlink_loop() {
+        let tmpdir = make_tmp_dir("types_loop");
+        let ctx = make_ctx(&tmpdir, vec![]);
+        let graph = pkg_with_bin_output("looped");
+        staged_build(&ctx, &graph, "looped", |root| {
+            std::fs::write(root.join("bin/data"), b"data").expect("write output file");
+            std::os::unix::fs::symlink(".", root.join("loop")).expect("loop link");
+            std::os::unix::fs::symlink("..", root.join("bin/up")).expect("up link");
+        })
+        .await;
+
+        let guard = graph.read().await;
+        let result = OutputTypesValid
+            .check(&ctx, "looped".to_string(), &tmpdir, guard, None)
+            .await
+            .expect("check should not error");
+        assert!(
+            matches!(result.verdict, CheckVerdict::Pass),
+            "{:?} {:?}",
+            result.verdict,
             result.err
         );
 

@@ -237,7 +237,7 @@ pub type CheckFuture =
 /// Shared, single-flighted cache for expensive computations during checks.
 #[derive(Clone)]
 pub struct CheckCache {
-    /// Cache for [`common::match_files_for_glob`] results, keyed by `(dir, glob)`.
+    /// Cache for [`common::match_files_for_glob_no_follow`] results, keyed by `(dir, glob)`.
     glob_cache: moka::sync::Cache<(PathBuf, String), Arc<Vec<PathBuf>>>,
     /// Cache for library symbol sets, keyed by `(BuildSpecRef, lib_path)`.
     symbols_cache: moka::sync::Cache<(BuildSpecRef, PathBuf), Arc<HashSet<String>>>,
@@ -251,11 +251,16 @@ impl CheckCache {
         }
     }
 
-    /// Single-flighted, cached wrapper around [`common::match_files_for_glob`].
+    /// Single-flighted, cached wrapper around [`common::match_files_for_glob_no_follow`].
+    /// The walk does not descend into a symlinked directory, so a loop in a
+    /// build's output (`a -> .`) ends and each file is matched once. Collecting
+    /// a build's outputs copies files by their real paths and a symlinked
+    /// directory as a link, so every file in a cached build is at a path this
+    /// walk reaches.
     pub fn match_files_for_glob(&self, dir: &Path, glob: &str) -> Result<Arc<Vec<PathBuf>>, Error> {
         self.glob_cache
             .try_get_with((dir.to_path_buf(), glob.to_string()), || {
-                common::match_files_for_glob(dir, glob).map(Arc::new)
+                common::match_files_for_glob_no_follow(dir, glob).map(Arc::new)
             })
             .map_err(|e| Error::Other(anyhow!("{e}")))
     }
