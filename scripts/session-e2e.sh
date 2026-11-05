@@ -268,6 +268,9 @@
 #                                    keeps its own address and page
 #   hostnames_recover_and_two_daemons_route NET-020..027 cause, recovery,
 #                                   two daemons on one machine routing
+#   proxy_recovers_when_its_port_frees NET-020..022: a held proxy port, the
+#                                    cause once at activate and on min ls,
+#                                    the box opened by name once it frees
 #   retired_surfaces_gone            NET-109/110: the retired surfaces are gone,
 #                                    and a direct-tcpip forward relays for real
 #   two_named_vms_on_one_machine     NET-052..059: a second named VM with its
@@ -548,6 +551,8 @@ TWO_VM_SEED_A_DIR="" # that proof's default-VM box seed; removed on teardown
 TWO_VM_SEED_B_DIR="" # its named-VM box seed; removed on teardown
 TWO_VM_FWD_PID="" # the `min net forward` it starts; killed on teardown
 TWO_VM_HOLD_PID="" # the non-minimal port holder it starts; killed on teardown
+PRF_HOLD_PID="" # the proxy-recovery proof's port holder; killed on teardown
+PRF_SEED_DIR="" # its box seed; removed on teardown
 MACOS_OPEN_SEED_A_DIR="" # the macOS name-and-proxy proof's box A seed; removed on teardown
 MACOS_OPEN_SEED_B_DIR="" # its refused box B seed; removed on teardown
 MACOS_OPEN_HOLD_PID="" # its range-address port holder; killed on teardown
@@ -1237,6 +1242,10 @@ teardown() {
   if [ -n "$TWO_VM_HOLD_PID" ]; then
     kill "$TWO_VM_HOLD_PID" 2>/dev/null || true
   fi
+  if [ -n "$PRF_HOLD_PID" ]; then
+    kill "$PRF_HOLD_PID" 2>/dev/null || true
+  fi
+  [ -n "$PRF_SEED_DIR" ] && rm -rf "$PRF_SEED_DIR"
   if [ -n "$MACOS_OPEN_HOLD_PID" ]; then
     kill "$MACOS_OPEN_HOLD_PID" 2>/dev/null || true
   fi
@@ -12669,6 +12678,414 @@ while True:
   echo "beat C (lost switch datapath) SKIPPED on this native lane: there is no minvmd switch here —"
   echo "  that record is the VM lanes' assertion (its emission is pinned by the minvmd net.rs unit tests)"
   echo "hostnames recover and two daemons route OK (reason+remedy at activate and ls, cleared without a restart, second daemon selected and both routed)"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
+# The hostname proxy comes back by itself once its port frees, end to end
+# (NET-020, NET-021, NET-022). Another program holds the proxy's port before
+# the daemon starts. The box still starts. `min session activate` names the
+# cause once, on its `names:` line, and `min ls` names it once. Then the
+# holder exits, and with no restart the box opens by its name through the
+# proxy on the same port. A second activate after the recovery names that
+# port on its `names:` line, as `min ls` does.
+#
+# The `min ls` row that names the cause: on a native lane it is the
+# HOSTNAME PROXY row, as NET-020 says. On a VM lane `min ls` prints the
+# cause on the BOX NAMES row and prints no HOSTNAME PROXY row while the port
+# is held. That differs from NET-020, and #3046 tracks it. After the
+# recovery the cause is gone from every row, and the HOSTNAME PROXY row
+# names the port on both lanes.
+#
+# Lanes: on a VM lane (E2E_VM) the case pins the VM's proxy port with
+# MINVMD_NODE_PROXY_PORT, so the VM starts with its proxy down and the VM
+# host daemon's watcher retries the port. A VM lane with no switch never
+# publishes the proxy port on the host, so the case reports NOT RUN there.
+# On a native lane the case pins the daemon with --hostname-proxy-port.
+proof_proxy_recovers_when_its_port_frees() {
+  echo "::group::the hostname proxy comes back by itself once its port frees (NET-020..NET-022)"
+  local prf_pin="" prf_cand="" prf_sid="" prf_sid2="" prf_log="" prf_log_lines=0
+  local prf_line="" prf_row="" prf_ls="" prf_count="" prf_t0="" prf_code=""
+  local prf_ready="" prf_served="" prf_pid_before="" prf_pid_after=""
+  local prf_rust_log0="${RUST_LOG:-}" prf_rust_log_set="${RUST_LOG+set}"
+  # Fixed, so the execs that start and probe the responder agree. Clear of
+  # the ports the earlier proofs fix (18080-18084).
+  local prf_box_port=18085 prf_marker="PROXY_RECOVERED_OK"
+  local prf_name="e2e-proxy-recover" prf_name2="e2e-proxy-recover-after"
+
+  if [ "$min_daemon" = minvmd ] && [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    not_run proxy_recovers_when_its_port_frees \
+      "no MINVMD_GVPROXY_BIN: this VM has no switch, so its proxy port is never published on the host"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # A bind probe with SO_REUSEADDR, as the proxy's own bind does: only a
+  # live listener reads as busy.
+  prf_port_free() {
+    python3 -c 'import socket,sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    s.bind(("127.0.0.1", int(sys.argv[1])))
+except OSError:
+    sys.exit(1)
+s.close()' "$1"
+  }
+  # The log this case's daemon writes: the VM host daemon's on a VM lane,
+  # the session daemon's on a native lane. Newest first.
+  prf_daemon_log() {
+    if [ "$min_daemon" = minvmd ]; then
+      find "$XDG_STATE_HOME/minimal/logs" -maxdepth 1 -name 'minvmd.log*' -type f 2>/dev/null \
+        | sort | tail -n1
+    else
+      find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f 2>/dev/null \
+        | sort | tail -n1
+    fi
+  }
+  # The lines the log gained since the snapshot below. A rotation mid-case
+  # makes every line of the newest file this case's.
+  prf_case_log() {
+    local f
+    f="$(prf_daemon_log)"
+    [ -n "$f" ] || return 0
+    if [ "$f" = "$prf_log" ]; then
+      tail -n +"$((prf_log_lines + 1))" "$f" 2>/dev/null
+    else
+      cat "$f" 2>/dev/null
+    fi
+  }
+  # The pids whose cmdline carries $1, read from /proc.
+  prf_pids_for() {
+    local proc entry
+    for proc in /proc/[0-9]*; do
+      [ -r "$proc/cmdline" ] || continue
+      entry="$(tr '\0' ' ' 2>/dev/null <"$proc/cmdline" || true)"
+      case "$entry" in
+        *"$1"*) printf '%s\n' "${proc#/proc/}" ;;
+      esac
+    done
+  }
+  # Put the environment back, so no later case inherits the pin or the
+  # widened filter.
+  prf_restore_env() {
+    unset MINVMD_NODE_PROXY_PORT
+    if [ -n "$prf_rust_log_set" ]; then
+      export RUST_LOG="$prf_rust_log0"
+    else
+      unset RUST_LOG
+    fi
+  }
+  # One host request to the box's name through the proxy on the pinned
+  # port. Sets prf_code, and the body lands in $WORK/prf-body.out.
+  prf_request() {
+    prf_code="$(curl -sS --max-time 10 -o "$WORK/prf-body.out" -w '%{http_code}' \
+      -x "http://127.0.0.1:$prf_pin" "http://$prf_name.min.internal:$prf_box_port/" \
+      2>"$WORK/prf-curl.err" || true)"
+  }
+
+  # Stop both daemons an earlier case left, so the daemon below starts
+  # with this case's pin.
+  mnl stop --force >/dev/null 2>&1 || true
+  if [ -n "$E2E_VM" ]; then
+    minvmd stop >/dev/null 2>&1 || true
+  fi
+
+  for prf_cand in 18756 18757 18758; do
+    if prf_port_free "$prf_cand"; then prf_pin="$prf_cand"; break; fi
+  done
+  if [ -z "$prf_pin" ]; then
+    echo "::error::no free candidate port among 18756/18757/18758 to hold"
+    fail
+  fi
+
+  # The holder: a plain listener that is not part of Minimal.
+  rm -f "$WORK/prf-hold.ready"
+  python3 -c 'import socket,sys,time
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+s.listen(1)
+open(sys.argv[2], "w").close()
+while True:
+    time.sleep(3600)' "$prf_pin" "$WORK/prf-hold.ready" \
+    >/dev/null 2>"$WORK/prf-hold.err" &
+  PRF_HOLD_PID=$!
+  for _ in $(seq 1 40); do
+    [ -f "$WORK/prf-hold.ready" ] && break
+    kill -0 "$PRF_HOLD_PID" 2>/dev/null || break
+    sleep 0.25
+  done
+  if [ ! -f "$WORK/prf-hold.ready" ]; then
+    echo "::error::the holder could not take 127.0.0.1:$prf_pin"
+    cat "$WORK/prf-hold.err" 2>/dev/null || true
+    fail
+  fi
+  echo "holder: python3 (pid $PRF_HOLD_PID) holds 127.0.0.1:$prf_pin"
+
+  prf_log="$(prf_daemon_log)"
+  prf_log_lines=0
+  if [ -n "$prf_log" ]; then prf_log_lines="$(wc -l <"$prf_log" | tr -d ' ')"; fi
+
+  if [ "$min_daemon" = minvmd ]; then
+    # The activate below autospawns the VM host daemon, which inherits the
+    # pin and the filter that keeps its retry records.
+    export MINVMD_NODE_PROXY_PORT="$prf_pin"
+    export RUST_LOG="warn,minimald::exec=info,minvmd=info"
+    echo "daemon: the VM host daemon, its proxy port pinned to $prf_pin (MINVMD_NODE_PROXY_PORT)"
+  else
+    export RUST_LOG="warn,minimald::server=info"
+    minimald run --detach --instance-num 0 --hostname-proxy-port "$prf_pin" \
+      >"$WORK/prf-spawn.out" 2>"$WORK/prf-spawn.err" \
+      || { echo "::error::could not start the daemon pinned to 127.0.0.1:$prf_pin"
+           cat "$WORK/prf-spawn.err" 2>/dev/null || true
+           prf_restore_env; fail; }
+    prf_pid_before="$(prf_pids_for "hostname-proxy-port $prf_pin" | head -n1)"
+    echo "daemon: minimald (pid ${prf_pid_before:-<unknown>}) pinned to --hostname-proxy-port $prf_pin"
+  fi
+
+  PRF_SEED_DIR="$(hook_mktemp /tmp/mnlprf.XXXXXX)"
+  hook_seed_preamble > "$PRF_SEED_DIR/minimal.toml"
+  mkdir "$PRF_SEED_DIR/.git"
+
+  # ---- while the port is held: the box starts, the cause prints once ----
+  prf_sid="$(cd "$PRF_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "$prf_name" 2>"$WORK/prf-activate.err")" \
+    || { echo "::error::'min session activate' failed while another program held the proxy port $prf_pin (NET-021: the box must still start)"
+         cat "$WORK/prf-activate.err" 2>/dev/null || true
+         prf_restore_env; fail; }
+  prf_sid="$(printf '%s\n' "$prf_sid" | tail -n1 | tr -d '\r')"
+  echo "box: $prf_sid ($prf_name) started while the port was held"
+
+  prf_line="$(grep -F -- 'names: ' "$WORK/prf-activate.err" 2>/dev/null | head -n1 || true)"
+  case "$prf_line" in
+    "names: "*"the hostname proxy is not serving: "*"127.0.0.1:$prf_pin"*) ;;
+    *)
+      echo "::error::activate did not name the held port $prf_pin as the cause on its names: line (NET-020)"
+      echo "--- activate stderr ---"; cat "$WORK/prf-activate.err" 2>/dev/null || true
+      prf_restore_env; fail ;;
+  esac
+  if [ "$min_daemon" = minvmd ]; then
+    case "$prf_line" in
+      *"holds 127.0.0.1:$prf_pin. It starts serving by itself when the port is free."*) ;;
+      *)
+        echo "::error::activate's names: line does not name who holds 127.0.0.1:$prf_pin (NET-021)"
+        printf '%s\n' "$prf_line"
+        prf_restore_env; fail ;;
+    esac
+  fi
+  prf_count="$(grep -c -F -- 'the hostname proxy is not serving' "$WORK/prf-activate.err" 2>/dev/null || true)"
+  if [ "${prf_count:-0}" != 1 ]; then
+    echo "::error::activate printed the proxy's cause ${prf_count:-0} times, not once (NET-020)"
+    cat "$WORK/prf-activate.err" 2>/dev/null || true
+    prf_restore_env; fail
+  fi
+  echo "activate (port held), matched once: $prf_line"
+
+  # The row that names the cause: BOX NAMES on a VM lane (#3046), HOSTNAME
+  # PROXY on a native lane (NET-020).
+  local prf_cause_row="HOSTNAME PROXY:"
+  if [ "$min_daemon" = minvmd ]; then prf_cause_row="BOX NAMES:"; fi
+  prf_row=""
+  for _ in $(seq 1 30); do
+    prf_ls="$(mnl ls 2>"$WORK/prf-ls.err" || true)"
+    prf_row="$(printf '%s\n' "$prf_ls" | grep -F -- "$prf_cause_row" \
+      | grep -F -- 'the hostname proxy is not serving' | grep -F -- "127.0.0.1:$prf_pin" | head -n1 || true)"
+    [ -n "$prf_row" ] && break
+    sleep 1
+  done
+  if [ -z "$prf_row" ]; then
+    echo "::error::min ls does not name the held port $prf_pin on its ${prf_cause_row%:} row (NET-020)"
+    echo "--- min ls ---"; printf '%s\n' "$prf_ls"
+    prf_restore_env; fail
+  fi
+  if [ "$min_daemon" = minvmd ]; then
+    case "$prf_row" in
+      *"holds 127.0.0.1:$prf_pin."*) ;;
+      *)
+        echo "::error::min ls's ${prf_cause_row%:} row does not name who holds 127.0.0.1:$prf_pin (NET-021)"
+        printf '%s\n' "$prf_row"
+        prf_restore_env; fail ;;
+    esac
+    prf_count="$(printf '%s\n' "$prf_ls" | grep -c -F -- 'the hostname proxy is not serving' || true)"
+    if [ "${prf_count:-0}" != 1 ]; then
+      echo "::error::min ls printed the proxy's cause ${prf_count:-0} times, not once (NET-020)"
+      echo "--- min ls ---"; printf '%s\n' "$prf_ls"
+      prf_restore_env; fail
+    fi
+  fi
+  if printf '%s\n' "$prf_ls" | grep -F -- 'HOSTNAME PROXY:' | grep -qF -- "listening on 127.0.0.1:$prf_pin"; then
+    echo "::error::min ls names 127.0.0.1:$prf_pin as listening while another program holds it"
+    printf '%s\n' "$prf_ls"
+    prf_restore_env; fail
+  fi
+  echo "min ls (port held), matched: $prf_row"
+
+  # A host whose boxes cannot run (a sandboxed developer host, where a
+  # host-address box gets no PID namespace of its own) can only skip on a
+  # native developer run. On CI or a VM lane it is a lane fault. The same
+  # gate as host_address_names_and_host_alias.
+  if ! mnl session exec "$prf_sid" 'true' >"$WORK/prf-execgate.err" 2>&1 \
+     && ! { sleep 1; mnl session exec "$prf_sid" 'true' >"$WORK/prf-execgate.err" 2>&1; }; then
+    if [ -z "${CI:-}" ] && [ -z "$E2E_VM" ]; then
+      kill "$PRF_HOLD_PID" 2>/dev/null || true
+      wait "$PRF_HOLD_PID" 2>/dev/null || true
+      PRF_HOLD_PID=""
+      mnl session destroy --force "$prf_sid" >/dev/null 2>&1 || true
+      rm -rf "$PRF_SEED_DIR"
+      PRF_SEED_DIR=""
+      mnl stop --force >/dev/null 2>&1 || true
+      prf_restore_env
+      not_run proxy_recovers_when_its_port_frees "this host cannot run a box sandbox: $(head -n1 "$WORK/prf-execgate.err" 2>/dev/null || true)"
+      echo "::endgroup::"
+      return 0
+    fi
+    echo "::error::this lane cannot run a box sandbox, so the box's responder cannot start"
+    echo "  (exec: $(head -n1 "$WORK/prf-execgate.err" 2>/dev/null || true))"
+    prf_restore_env; fail
+  fi
+
+  # The box's responder: the socat form the other proxy proofs use. It
+  # starts while the port is held, so a 200 after the port frees also
+  # shows the box was not restarted.
+  mnl session exec "$prf_sid" \
+    "body=$prf_marker; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/http200" \
+    >/dev/null 2>"$WORK/prf-responder.err" \
+    || { echo "::error::could not write the box's response"; cat "$WORK/prf-responder.err" 2>/dev/null || true; prf_restore_env; fail; }
+  mnl session exec "$prf_sid" \
+    "nohup /usr/bin/socat TCP-LISTEN:$prf_box_port,reuseaddr,fork SYSTEM:\"cat /home/http200\" >/dev/null 2>&1 &" \
+    >/dev/null 2>"$WORK/prf-responder.err" \
+    || { echo "::error::could not start the box's responder"; cat "$WORK/prf-responder.err" 2>/dev/null || true; prf_restore_env; fail; }
+  prf_ready=""
+  for _ in $(seq 1 40); do
+    if [ "$(mnl session exec "$prf_sid" \
+      "curl -sS --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:$prf_box_port/" \
+      2>/dev/null || true)" = "200" ]; then
+      prf_ready=1; break
+    fi
+    sleep 0.25
+  done
+  if [ -z "$prf_ready" ]; then
+    echo "::error::the box's responder never answered a direct curl on 127.0.0.1:$prf_box_port"
+    cat "$WORK/prf-responder.err" 2>/dev/null || true
+    prf_restore_env; fail
+  fi
+  echo "responder: $prf_name answers on its port $prf_box_port"
+
+  # ---- free the port: the proxy serves by itself, no restart ------------
+  kill "$PRF_HOLD_PID" 2>/dev/null || true
+  wait "$PRF_HOLD_PID" 2>/dev/null || true
+  PRF_HOLD_PID=""
+  prf_t0="$(now_ms)"
+  echo "holder exited: 127.0.0.1:$prf_pin is free"
+
+  # The retry backoff caps at 30 s, so 90 one-second tries is generous.
+  prf_served=""
+  for _ in $(seq 1 90); do
+    prf_request
+    if [ "$prf_code" = 200 ] && grep -qF -- "$prf_marker" "$WORK/prf-body.out" 2>/dev/null; then
+      prf_served="$(( $(now_ms) - prf_t0 ))"
+      break
+    fi
+    sleep 1
+  done
+  if [ -z "$prf_served" ]; then
+    echo "::error::$prf_name.min.internal did not open through 127.0.0.1:$prf_pin within 90 s after the port freed (NET-022); last status '${prf_code:-<none>}'"
+    echo "--- curl stderr ---"; cat "$WORK/prf-curl.err" 2>/dev/null || true
+    echo "--- body ---"; cat "$WORK/prf-body.out" 2>/dev/null || true
+    echo "--- min ls ---"; mnl ls 2>&1 || true
+    echo "--- daemon log since the case began ---"; prf_case_log | tail -n 40
+    prf_restore_env; fail
+  fi
+  echo "proxy: GET http://$prf_name.min.internal:$prf_box_port/ via 127.0.0.1:$prf_pin -> HTTP $prf_code $(head -c 40 "$WORK/prf-body.out" 2>/dev/null || true), ${prf_served} ms after the port freed"
+
+  # After the recovery the cause is gone from every row, the one that held
+  # it included, and the HOSTNAME PROXY row names the port. On a VM lane
+  # the listing reads the VM host daemon's state, so give it a few seconds
+  # to catch up with the proxy that already served.
+  prf_row=""
+  for _ in $(seq 1 10); do
+    prf_ls="$(mnl ls 2>&1 || true)"
+    prf_row="$(printf '%s\n' "$prf_ls" | grep -F -- 'HOSTNAME PROXY:' \
+      | grep -F -- "listening on 127.0.0.1:$prf_pin" | head -n1 || true)"
+    if [ -n "$prf_row" ] \
+      && ! printf '%s\n' "$prf_ls" | grep -qF -- 'the hostname proxy is not serving'; then
+      break
+    fi
+    sleep 1
+  done
+  if printf '%s\n' "$prf_ls" | grep -qF -- 'the hostname proxy is not serving'; then
+    echo "::error::min ls still names the cause on its $(printf '%s\n' "$prf_ls" \
+      | grep -F -- 'the hostname proxy is not serving' | head -n1 | cut -d: -f1) row after the proxy serves (NET-022)"
+    printf '%s\n' "$prf_ls"
+    prf_restore_env; fail
+  fi
+  if [ -z "$prf_row" ]; then
+    echo "::error::min ls does not name 127.0.0.1:$prf_pin as listening on its HOSTNAME PROXY row after the proxy serves (NET-022)"
+    printf '%s\n' "$prf_ls"
+    prf_restore_env; fail
+  fi
+  echo "min ls (port free), matched: $prf_row"
+  if [ -n "$prf_pid_before" ]; then
+    prf_pid_after="$(prf_pids_for "hostname-proxy-port $prf_pin" | head -n1)"
+    if [ "$prf_pid_after" != "$prf_pid_before" ]; then
+      echo "::error::the daemon's pid changed across the recovery ($prf_pid_before -> ${prf_pid_after:-<none>}): a restart is not a recovery (NET-022)"
+      prf_restore_env; fail
+    fi
+    echo "daemon pid unchanged ($prf_pid_before): no restart"
+  fi
+
+  # A box that starts after the recovery names the recovered port on its
+  # names: line, as `min ls` does.
+  prf_sid2="$(cd "$PRF_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "$prf_name2" 2>"$WORK/prf-activate2.err")" \
+    || { echo "::error::'min session activate' failed after the proxy recovered"
+         cat "$WORK/prf-activate2.err" 2>/dev/null || true
+         prf_restore_env; fail; }
+  prf_sid2="$(printf '%s\n' "$prf_sid2" | tail -n1 | tr -d '\r')"
+  prf_line="$(grep -F -- 'names: ' "$WORK/prf-activate2.err" 2>/dev/null | head -n1 || true)"
+  case "$prf_line" in
+    *"the hostname proxy is not serving"*)
+      echo "::error::activate after the recovery still names the cause on its names: line (NET-022)"
+      cat "$WORK/prf-activate2.err" 2>/dev/null || true
+      prf_restore_env; fail ;;
+    "names: "*"127.0.0.1:$prf_pin"*) ;;
+    *)
+      echo "::error::activate after the recovery does not name the proxy on 127.0.0.1:$prf_pin on its names: line"
+      echo "--- activate stderr ---"; cat "$WORK/prf-activate2.err" 2>/dev/null || true
+      prf_restore_env; fail ;;
+  esac
+  echo "activate (port free), matched: $prf_line"
+
+  # The daemon's retry records, kept in the work directory for whoever
+  # reads this case's output.
+  prf_case_log | grep -E -- 'retrying|serving after its port freed|serving after retrying|could not bind|proxy down' \
+    >"$WORK/prf-retry.log" 2>/dev/null || true
+  if [ "$min_daemon" = minvmd ]; then
+    if ! grep -qF -- 'the hostname proxy is serving after its port freed' "$WORK/prf-retry.log"; then
+      echo "::error::the VM host daemon log has no 'serving after its port freed' record for this case"
+      echo "--- daemon log since the case began ---"; prf_case_log | tail -n 40
+      prf_restore_env; fail
+    fi
+  elif ! grep -qF -- 'host-side proxy is serving after retrying' "$WORK/prf-retry.log"; then
+    echo "::error::the daemon log has no 'serving after retrying' record for this case"
+    echo "--- daemon log since the case began ---"; prf_case_log | tail -n 40
+    prf_restore_env; fail
+  fi
+  echo "retry records: $WORK/prf-retry.log ($(wc -l <"$WORK/prf-retry.log" | tr -d ' ') line(s))"
+  sed 's/^/  /' "$WORK/prf-retry.log" | tail -n 6
+
+  mnl session destroy --force "$prf_sid" >/dev/null 2>&1 || true
+  mnl session destroy --force "$prf_sid2" >/dev/null 2>&1 || true
+  rm -rf "$PRF_SEED_DIR"
+  PRF_SEED_DIR=""
+  # The daemons carry the pin. Stop them, so the next case starts its own.
+  mnl stop --force >/dev/null 2>&1 || true
+  if [ -n "$E2E_VM" ]; then
+    minvmd stop >/dev/null 2>&1 || true
+  fi
+  prf_restore_env
+  echo "proxy recovers when its port frees OK (port $prf_pin: the box started while it was held, the cause printed once at activate and on min ls, and the box opened by name ${prf_served} ms after it freed, with no restart)"
   echo "::endgroup::"
 }
 
@@ -31822,6 +32239,7 @@ case "${1:-}" in
     proof_native_answerer_survives_session_stop
     proof_native_names_answer_on_time
     proof_hostnames_recover_and_two_daemons_route
+    proof_proxy_recovers_when_its_port_frees
     proof_min_internal_names_through_proxy
     proof_host_exposures_follow_the_table
     proof_own_ip_deny_all_box_answers_published_port
@@ -31913,6 +32331,7 @@ case "${1:-}" in
     | answerer_survives_session_stop | native_answerer_survives_session_stop \
     | native_names_answer_on_time \
     | hostnames_recover_and_two_daemons_route \
+    | proxy_recovers_when_its_port_frees \
     | min_internal_names_through_proxy | own_ip_deny_all_box_answers_published_port \
     | host_exposures_follow_the_table \
     | port_publishes_on_listen_and_box_outlives_client \
@@ -31992,6 +32411,7 @@ case "${1:-}" in
     echo "         fresh_linux_kvm_activate_local_minvmd fresh_arm64_kvm_activate_local_minvmd"
     echo "         linux_stock_install_runs_vm_boxes"
     echo "         hostnames_recover_and_two_daemons_route"
+    echo "         proxy_recovers_when_its_port_frees"
     echo "         min_internal_names_through_proxy own_ip_deny_all_box_answers_published_port"
     echo "         host_exposures_follow_the_table"
     echo "         port_publishes_on_listen_and_box_outlives_client"

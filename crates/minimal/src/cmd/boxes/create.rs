@@ -2136,8 +2136,23 @@ pub(crate) async fn activate_box(
             // Absent while the proxy is still coming up, or from a daemon that
             // predates the field, and beside a proxy-down sibling, whose cause
             // names itself in the line instead.
+            //
+            // A proxy whose held port freed after the VM started (NET-022)
+            // publishes on the VM host daemon only, so the guest reported no
+            // port for it. The line then reads the ports the VM host daemon
+            // serves on, as `min ls` does (`reported_proxy_port`). The read
+            // runs only on a VM-backed host whose guest reported no port.
+            let vm_served_ports = if created.hostname_proxy_port.is_none() && vm_answerer.is_some()
+            {
+                crate::cmd::session::vm_host_proxy_ports_at(control_sock.clone()).await
+            } else {
+                Vec::new()
+            };
             let serving_proxy_port = crate::resolver::serving_proxy_port(
-                created.hostname_proxy_port,
+                crate::cmd::list::reported_proxy_port(
+                    created.hostname_proxy_port,
+                    &vm_served_ports,
+                ),
                 proxy_down_sibling,
             );
             // The interim itself, named at every session start on a VM-backed host
