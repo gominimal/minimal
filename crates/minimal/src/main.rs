@@ -237,7 +237,10 @@ fn answer_failure(
 /// of addresses (insufficient resources), the code a box address refusal
 /// carries (`minimal::BoxAddressRefusal`: 2 when a name matches boxes on
 /// more than one host, 4 when the address names no box, 7 when a host did
-/// not answer the lookup), and 1, the unspecified error,
+/// not answer the lookup), the code a `min box exec` refusal carries
+/// (`minimal::BoxExecRefusal`: 2 for `-t` without a terminal or a box that
+/// is not running, 5 when its spec turns exec off), 124 when an exec ran past its own timeout
+/// (`minimal::BoxExecTimedOut`), and 1, the unspecified error,
 /// for everything else — a refusal the host answered included. Both
 /// output modes end with the same code.
 fn failure_exit_code(e: &anyhow::Error) -> u8 {
@@ -282,6 +285,15 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     // BCLI-002, BCLI-064: a box address that names no single box.
     if let Some(refused) = e.downcast_ref::<minimal::BoxAddressRefusal>() {
         return refused.exit_code();
+    }
+    // BCLI-053: `min box exec -t` without a terminal, or into a box that is
+    // not running (2), or whose spec turns exec off (5).
+    if let Some(refused) = e.downcast_ref::<minimal::BoxExecRefusal>() {
+        return refused.exit_code();
+    }
+    // BCLI-053: an exec that its own timeout ended.
+    if e.downcast_ref::<minimal::BoxExecTimedOut>().is_some() {
+        return minimal::BoxExecTimedOut::EXIT_CODE;
     }
     // BCLI-034, BCLI-062: `min box cp` of a file the box does not have, or
     // does not allow reading.
@@ -375,6 +387,14 @@ fn machine_mode_answer(e: &anyhow::Error) -> MachineModeAnswer {
             hint,
         ));
     }
+    // BCLI-053: an exec that its own timeout ended is `timeout`.
+    if let Some(timed_out) = e.downcast_ref::<minimal::BoxExecTimedOut>() {
+        return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
+            minimal::BoxExecTimedOut::CODE,
+            format!("{e:#}"),
+            timed_out.hint().to_string(),
+        ));
+    }
     if e.downcast_ref::<minimal::OutputWriteError>().is_some() {
         return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
             "output_failed",
@@ -408,7 +428,8 @@ impl std::io::Write for DashLog {
 /// Whether the command's stdout is a data contract that tracing must not
 /// pollute, so its logs go to stderr instead. The `completions` handlers emit a
 /// shell shim on stdout, `session exec` carries only the exec'd
-/// command's output, and `task run` / `session run` stream the task's stdout —
+/// command's output, `box exec` carries the command's output or its exec
+/// id, and `task run` / `session run` stream the task's stdout —
 /// a log line in any of them would be read as content. A bare `min` (no subcommand) is
 /// one too: its non-TTY twin promises an empty stdout to pipelines, and its
 /// interactive activate path prints only the session id there. So is
@@ -429,6 +450,9 @@ fn stdout_is_data_contract(command: &Option<minimal::Command>) -> bool {
                 })
                 | minimal::Command::Task(minimal::TaskArgs {
                     command: minimal::TaskCommand::Run(_),
+                })
+                | minimal::Command::Box(minimal::BoxArgs {
+                    command: minimal::BoxCommand::Exec(_),
                 })
         )
     )
@@ -1059,6 +1083,60 @@ mod tests {
         ] {
             let err = anyhow::Error::from(refusal).context("showing the box");
             assert_eq!(failure_exit_code(&err), code, "{err:#}");
+        }
+    }
+
+    /// BCLI-053: an exec that its own timeout ended ends the run with 124
+    /// in both output modes, and a machine-mode run answers it with the
+    /// `timeout` object. The exec refusals end with 2 and 5.
+    #[test]
+    fn exec_timeout_returns_124_from_exec_and_wait_exec_in_machine_mode() {
+        for timed_out in [
+            minimal::BoxExecTimedOut::exec("web", 30),
+            minimal::BoxExecTimedOut::waited("web", "0190a3c4-0000-7000-8000-000000000000"),
+        ] {
+            let e = anyhow::Error::new(timed_out.clone());
+            assert_eq!(failure_exit_code(&e), 124);
+            match machine_mode_answer(&e) {
+                MachineModeAnswer::Object(failure) => {
+                    assert_eq!(failure.code(), "timeout");
+                    assert_eq!(failure.message(), timed_out.to_string());
+                    assert_eq!(failure.hint(), timed_out.hint());
+                }
+                MachineModeAnswer::Quiet => panic!("a timeout is an error object"),
+            }
+            let mut stderr = Vec::new();
+            assert_eq!(
+                answer_failure(&e, true, false, None, &mut stderr),
+                ExitCode::from(124)
+            );
+            let line = String::from_utf8(stderr).unwrap();
+            assert!(line.contains(r#""code":"timeout""#), "{line}");
+        }
+        let target = "web".to_string();
+        for (refusal, code) in [
+            (
+                minimal::BoxExecRefusal::NoTerminal {
+                    target: target.clone(),
+                },
+                2,
+            ),
+            (
+                minimal::BoxExecRefusal::NotRunning {
+                    target: target.clone(),
+                    state: "stopped".to_string(),
+                },
+                2,
+            ),
+            (
+                minimal::BoxExecRefusal::ExecDisabled {
+                    target: target.clone(),
+                },
+                5,
+            ),
+            (minimal::BoxExecRefusal::SpecUnreadable { target }, 5),
+        ] {
+            assert_eq!(failure_exit_code(&anyhow::Error::new(refusal)), code);
         }
     }
 
