@@ -268,20 +268,54 @@ async fn shutdown_rpc_returns_even_if_the_initiating_client_lingers() {
     drop(client);
 }
 
+/// The first `conn` span `log` saw, once it has closed: its task has then
+/// recorded the outcome and logged how the connection ended.
+async fn first_conn_once_closed(
+    log: &crate::test_harness::SpanLog,
+) -> crate::test_harness::LoggedSpan {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(first) = log.spans().into_iter().find(|s| s.name == "conn")
+                && first.closed
+            {
+                return first;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first conn span closes")
+}
+
 /// `min` probes the daemon's socket before every command by connecting
 /// and hanging up without an SSH id line; that is not a failed handshake
-/// and must not be logged as one (333k WARNs a week in the lab hid the
-/// real ones). The `conn` span says what became of the connection instead.
+/// and is not logged as one. The `conn` span says what became of the
+/// connection instead.
 #[tokio::test]
 async fn a_peer_that_hangs_up_before_the_ssh_id_is_not_a_handshake_failure() {
-    let capture = crate::test_harness::captured_log();
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let capture = crate::test_harness::CaptureWriter::default();
+    let log = crate::test_harness::SpanLog::default();
+    let _g = tracing::subscriber::set_default(
+        tracing_subscriber::registry().with(log.clone()).with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(capture.clone())
+                .with_ansi(false),
+        ),
+    );
     let dir = TempDir::new().unwrap();
     let (run, sock) = spawn_server(&dir);
 
     let probe = tokio::net::UnixStream::connect(&sock).await.unwrap();
     drop(probe);
-    // A real client after the probe, so the accept loop has served the
-    // probe's teardown by the time the log is read.
+    // The probe's `conn` span closes when its task has classified the
+    // hang-up and logged it, so the log is complete for the probe then.
+    let probe_conn = first_conn_once_closed(&log).await;
+    assert_eq!(
+        probe_conn.field("outcome"),
+        Some("closed_before_id"),
+        "{probe_conn:?}"
+    );
     let mut client = connect_uds(&sock).await;
     let resp = client.call::<GetVersion>(&()).await;
     assert!(!resp.version.is_empty());
@@ -290,6 +324,10 @@ async fn a_peer_that_hangs_up_before_the_ssh_id_is_not_a_handshake_failure() {
     assert!(
         !logged.contains("SSH handshake failed"),
         "a peer that hung up before the id exchange is not a failed handshake: {logged}"
+    );
+    assert!(
+        logged.contains("peer closed before the SSH id exchange"),
+        "the probe's hang-up is logged at debug: {logged}"
     );
     assert!(
         logged.matches("accepted connection").count() >= 2,
