@@ -2861,6 +2861,14 @@ pub struct ShowBoxResponse {
     /// <https://github.com/gominimal/minimal/issues/2404> (T30, BOX-149).
     #[serde(default)]
     pub live_execs: Vec<String>,
+    /// The bytes on disk that a reap of the box frees: the box's
+    /// directory, with its filesystem, record, events and log. The daemon
+    /// gives it for a `stopped` or `exited` box only. It is absent for a
+    /// box in any other state, for a box whose disk the daemon cannot
+    /// measure, and from a daemon that predates the field. Absent never
+    /// means zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_bytes: Option<u64>,
 }
 
 impl OneshotSshRpc for ShowBox {
@@ -2958,6 +2966,42 @@ impl OneshotSshRpc for PruneBoxes {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "PruneBoxes");
     type Request<'a> = PruneBoxesRequest;
     type Response = Errorable<PruneBoxesResponse>;
+}
+
+/// An RPC to preview a [`PruneBoxes`]: it lists every box that a prune
+/// with the same selectors matches, with the disk each one holds, and
+/// reaps none (BOX-021). The request is a [`PruneBoxesRequest`], and the
+/// match is the one [`PruneBoxes`] makes.
+pub struct PreviewPrune;
+
+/// One box a [`PreviewPrune`] matched.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrunePreviewEntry {
+    /// The box's record, as a prune that reaps it reports it.
+    pub record: BoxListingEntry,
+    /// The bytes on disk that a reap of the box frees, as
+    /// [`ShowBoxResponse::disk_bytes`] gives them. Absent when the daemon
+    /// cannot measure them. Absent never means zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_bytes: Option<u64>,
+}
+
+/// The response for a [`PreviewPrune`] RPC.
+///
+/// `deny_unknown_fields`, so that `{"error": "..."}` never decodes as a
+/// preview that matched nothing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewPruneResponse {
+    /// Every box a prune with these selectors reaps now, in box id order.
+    #[serde(default)]
+    pub matched: Vec<PrunePreviewEntry>,
+}
+
+impl OneshotSshRpc for PreviewPrune {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "PreviewPrune");
+    type Request<'a> = PruneBoxesRequest;
+    type Response = Errorable<PreviewPruneResponse>;
 }
 
 /// An RPC to destroy an existing session.
@@ -3986,6 +4030,7 @@ mod box_listing_tests {
             record: stopped,
             identity: BoxIdentity::None,
             live_execs: vec!["exec-1".to_string()],
+            disk_bytes: Some(4096),
         };
         let bytes = serde_json_lenient::to_vec(&Errorable::Ok(show.clone())).unwrap();
         match serde_json_lenient::from_slice::<Errorable<ShowBoxResponse>>(&bytes).unwrap() {
