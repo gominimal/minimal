@@ -12910,6 +12910,30 @@ while True:
   fi
   echo "min ls (port held), matched: $prf_row"
 
+  # A host whose boxes cannot run (a sandboxed developer host, where a
+  # host-address box gets no PID namespace of its own) can only skip on a
+  # native developer run. On CI or a VM lane it is a lane fault. The same
+  # gate as host_address_names_and_host_alias.
+  if ! mnl session exec "$prf_sid" 'true' >"$WORK/prf-execgate.err" 2>&1 \
+     && ! { sleep 1; mnl session exec "$prf_sid" 'true' >"$WORK/prf-execgate.err" 2>&1; }; then
+    if [ -z "${CI:-}" ] && [ -z "$E2E_VM" ]; then
+      kill "$PRF_HOLD_PID" 2>/dev/null || true
+      wait "$PRF_HOLD_PID" 2>/dev/null || true
+      PRF_HOLD_PID=""
+      mnl session destroy --force "$prf_sid" >/dev/null 2>&1 || true
+      rm -rf "$PRF_SEED_DIR"
+      PRF_SEED_DIR=""
+      mnl stop --force >/dev/null 2>&1 || true
+      prf_restore_env
+      not_run proxy_recovers_when_its_port_frees "this host cannot run a box sandbox: $(head -n1 "$WORK/prf-execgate.err" 2>/dev/null || true)"
+      echo "::endgroup::"
+      return 0
+    fi
+    echo "::error::this lane cannot run a box sandbox, so the box's responder cannot start"
+    echo "  (exec: $(head -n1 "$WORK/prf-execgate.err" 2>/dev/null || true))"
+    prf_restore_env; fail
+  fi
+
   # The box's responder: the socat form the other proxy proofs use. It
   # starts while the port is held, so a 200 after the port frees also
   # shows the box was not restarted.
