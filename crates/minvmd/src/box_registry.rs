@@ -4647,11 +4647,8 @@ impl BoxRegistry {
             // before its box was admitted leaves nothing to withdraw the
             // name. Once no box is admitted under the id and the bound has
             // passed, the name is free for a new creation.
-            // A box a reconcile set aside is stopped, not ended: it keeps
-            // its name for its resume (NET-085).
             let session = boxes::SessionId::from_bytes(named.id);
-            let admitted =
-                resident.boxes.contains_key(&session) || resident.dormant.contains_key(&session);
+            let admitted = resident.boxes.contains_key(&session);
             let stale = !admitted
                 && now.saturating_duration_since(named.since) >= HOST_IP_UNADMITTED_NAME_BOUND;
             if !stale {
@@ -13708,8 +13705,8 @@ mod tests {
     }
 
     /// NET-085 with BEP-082: a box a reconcile set aside because it stopped
-    /// keeps its registration name for its resume. A box the guest no
-    /// longer lists ended there, so its name goes, as a retire's does.
+    /// holds no admitted row, so a new box can take its name once the
+    /// unadmitted bound passes. A resume runs under the box id, not the name.
     #[test]
     fn host_ip_rules_retired_when_guest_no_longer_runs_box_withdraws_only_an_ended_name() {
         let registry = BoxRegistry::new(SUBNET);
@@ -13731,10 +13728,11 @@ mod tests {
             Some(id),
             "a stopped box keeps its name"
         );
-        assert!(matches!(
-            registry.register_host_ip_box("held"),
-            Err(AllocationError::NameAlreadyHeld { .. })
-        ));
+        registry.advance_clock(HOST_IP_UNADMITTED_NAME_BOUND);
+        let fresh = registry
+            .register_host_ip_box("held")
+            .expect("a new box can reuse a stopped box's name");
+        assert_ne!(fresh, id, "the new box gets a new id");
 
         let outcome = registry.reconcile_host_ip_boxes(
             &BTreeMap::new(),
@@ -13748,8 +13746,8 @@ mod tests {
         assert!(!registry.holds_host_ip_boxes());
         assert_eq!(
             registry.host_ip_id_for("held"),
-            None,
-            "an ended box's name goes"
+            Some(fresh),
+            "the name stays with the new registration"
         );
         assert!(
             registry.holds_host_ip_id(id),
