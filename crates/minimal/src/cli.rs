@@ -541,6 +541,9 @@ pub enum HostCommand {
     /// Show one local host: its provider, whether it is running, the socket
     /// `min` connects to and the daemon version
     Show(HostShowArgs),
+    /// Stop each running box on a local host, then its daemon, and its VM
+    /// on a VM host
+    Stop(HostStopArgs),
 }
 
 // BCLI-048: `min host show <host>`.
@@ -548,6 +551,17 @@ pub enum HostCommand {
 pub struct HostShowArgs {
     /// The host, as `min host list` prints it (`local0`, `local-minvmd0`)
     pub host: String,
+}
+
+// BCLI-049: `min host stop <host> [--force]`.
+#[derive(Debug, Args)]
+pub struct HostStopArgs {
+    /// The host, as `min host list` prints it (`local0`, `local-minvmd0`)
+    pub host: String,
+    /// Force-stop each box, and stop the daemon without waiting for it to
+    /// shut down cleanly. On a VM host, the VM is stopped from this machine
+    #[arg(long, short, default_value_t = false)]
+    pub force: bool,
 }
 
 #[derive(Debug, Args)]

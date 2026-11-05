@@ -150,6 +150,7 @@ fn command_verb(command: Option<&Command>) -> &'static str {
         Some(Command::Host(HostArgs { command })) => match command {
             HostCommand::List => "host list",
             HostCommand::Show(_) => "host show",
+            HostCommand::Stop(_) => "host stop",
         },
         Some(Command::Provider(ProviderArgs { command })) => match command {
             ProviderCommand::List(_) => "provider list",
@@ -401,6 +402,9 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             }
             HostCommand::Show(args) => {
                 hosts::cmd_host_show(&cli.global_args, &args, &mut std::io::stdout()).await
+            }
+            HostCommand::Stop(args) => {
+                hosts::cmd_host_stop(&cli.global_args, &args, &mut std::io::stdout()).await
             }
         },
         Some(Command::Provider(ProviderArgs { command })) => match command {
