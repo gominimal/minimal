@@ -978,7 +978,12 @@ impl EntrypointProcess {
                 | Ok(RecordState::Stopped(StopEnding::ExitedFirst { exit_code })) => {
                     Some(Some(exit_code))
                 }
-                Ok(RecordState::Exited(_) | RecordState::Stopped(_)) => Some(None),
+                // The codes `min` uses for these ends: 124 for a run past
+                // its timeout, and the 137 the record keeps for an OOM kill
+                // (BOX-011).
+                Ok(RecordState::Exited(ExitEnding::Timeout)) => Some(Some(124)),
+                Ok(RecordState::Exited(ExitEnding::Oom)) => Some(Some(137)),
+                Ok(RecordState::Stopped(_)) => Some(None),
                 _ => None,
             };
             if let Some(code) = code {

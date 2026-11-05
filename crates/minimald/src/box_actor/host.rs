@@ -347,7 +347,10 @@ pub(super) fn watch_quic443_exit(
 ///
 /// Interim: a seam beside the actor, because the actor's `EnsureHost`
 /// message carries no environment. The values move into that message
-/// when it gains one.
+/// when it gains one. Known gap until then: the run does not apply the
+/// names that the client's `[vars] ignore` matched (`TaskExec::drop_env`)
+/// to the entrypoint launch. No issue tracks this gap yet. File one, and
+/// put its URL here as the flip condition.
 pub(crate) mod entrypoint_env {
     use std::collections::HashMap;
     use std::sync::{LazyLock, Mutex};
@@ -403,6 +406,10 @@ pub(crate) const ENTRYPOINT_BEHIND_HOOK_SHELL: &str = "The box has its own netwo
 /// shell, as [`BoxActor::ensure_host`] returns it inside
 /// [`AttachError::SpawnFailed`]. The run finds it by type, not by text,
 /// and answers with [`ENTRYPOINT_BEHIND_HOOK_SHELL`].
+///
+/// Known gap: this refusal fails closed, so a box with its own network
+/// address and activate hooks cannot run its task. No issue tracks this
+/// gap yet. File one, and name it here.
 #[derive(Debug)]
 pub(crate) struct EntrypointBehindHookShell;
 
@@ -465,6 +472,7 @@ pub(crate) fn entry_run_as_entrypoint(spec: &mfile::spec::BoxSpec) -> Option<&st
 pub(super) fn watch_entrypoint_exit(
     task: JoinHandle<Result<box_runtime::HostExit, std::io::Error>>,
     box_id: boxes::SessionId,
+    box_name: String,
     entry: Option<String>,
 ) -> (
     JoinHandle<Result<box_runtime::HostExit, std::io::Error>>,
@@ -490,6 +498,7 @@ pub(super) fn watch_entrypoint_exit(
                 .unwrap_or(exit.code);
             tracing::info!(
                 box_id = %box_id,
+                box_name = %box_name,
                 task,
                 exit_code,
                 "task box ended: its entrypoint returned"
@@ -1193,7 +1202,8 @@ impl BoxActor {
         };
         // BOX-038: the actor reads how this launch's loop ends. A later
         // launch replaces the watch, so an earlier loop never ends the box.
-        let (task, watch) = watch_entrypoint_exit(task, record.id, entry);
+        let box_name = record.name.clone().unwrap_or_else(|| record.id.to_string());
+        let (task, watch) = watch_entrypoint_exit(task, record.id, box_name, entry);
         self.entrypoint_watch = Some(watch);
         // A write that fails costs only the restart's memory of who bound
         // the port, never this launch: said, and the box is handed back.
