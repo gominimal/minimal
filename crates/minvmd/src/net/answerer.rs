@@ -627,6 +627,9 @@ struct AddressBook {
     /// Whether the last probe read the box range absent: the interim
     /// episode its warning is logged once for.
     range_absent: bool,
+    /// The most addresses one user's nodes may hold, on the shared
+    /// service ([`PER_USER_ADDRESSES`]); `None` caps nothing.
+    per_user_cap: Option<usize>,
 }
 
 impl Default for AddressBook {
@@ -636,7 +639,31 @@ impl Default for AddressBook {
             released: BTreeMap::new(),
             range_probe: HOST_RANGE_PROBE,
             range_absent: false,
+            per_user_cap: None,
         }
+    }
+}
+
+impl AddressBook {
+    /// `Ok` unless handing `node`'s user one more address would pass the
+    /// per-user cap; the refusal names the count and the cap.
+    fn within_user_cap(&self, node: &str) -> Result<(), String> {
+        let (Some(cap), Some((_, uid))) = (self.per_user_cap, node_uid(node)) else {
+            return Ok(());
+        };
+        let held = self
+            .held
+            .values()
+            .filter(|holder| node_uid(&holder.node).is_some_and(|(_, held_by)| held_by == uid))
+            .count();
+        if held < cap {
+            return Ok(());
+        }
+        Err(format!(
+            "the nodes of uid {uid} hold {held} box addresses, the most one user may on \
+             the host's shared answerer service; a box of theirs must end before another \
+             gets an address"
+        ))
     }
 }
 
@@ -787,6 +814,9 @@ impl AddressBook {
             });
         };
         if own.is_none() {
+            // A fresh address counts against its user's share; a box's own
+            // address coming back does not.
+            self.within_user_cap(node)?;
             let probe = range_probe();
             if !probe.present() {
                 if let Some((address, kind)) = probe.first_failure
@@ -842,15 +872,17 @@ impl AddressBook {
             && holder.node != node
         {
             return Err(format!(
-                "another node ({}) holds the address {address}; the answerer hands each \
-                 box its own",
-                holder.node
+                "{} holds the address {address}; the answerer hands each box its own",
+                holder_label(&holder.node, node)
             ));
         }
         let holder = AddressHolder {
             node: node.to_string(),
             name: name.to_string(),
         };
+        if !self.held.values().any(|held| *held == holder) {
+            self.within_user_cap(node)?;
+        }
         if let Some((was, at)) = self.released.get(&address)
             && now.saturating_duration_since(*at) < REUSE_QUARANTINE
             && *was != holder
@@ -941,6 +973,16 @@ struct RegisteredTables {
     /// The box addresses handed out and claimed. Locked after `rows` when
     /// both are held, never before.
     book: Mutex<AddressBook>,
+    /// Box names whose last row went less than [`REUSE_QUARANTINE`] ago,
+    /// against the uid whose node held them and when: a name stays its
+    /// last user's for the quarantine, as an address does, so a reconnect
+    /// (a daemon restart, a laptop's sleep) never loses a name to another
+    /// member of the shared service, and a browser's cached answer never
+    /// reaches another user's box. The same uid takes its name back at
+    /// once. Nothing survives an answerer restart: the window after one is
+    /// the group's trust, and spec 18 says so. Locked after `rows`, never
+    /// before.
+    released_names: Mutex<BTreeMap<String, (u32, Instant)>>,
 }
 
 /// What one publish left in the tables: the rows the connection now holds,
@@ -958,6 +1000,26 @@ impl RegisteredTables {
         Self::default()
     }
 
+    /// The shared service's tables: one user's nodes may hold at most
+    /// [`PER_USER_ADDRESSES`] of the box range, so no member takes the
+    /// range from the others.
+    fn shared() -> Self {
+        let tables = Self::default();
+        tables.book().per_user_cap = Some(PER_USER_ADDRESSES);
+        tables
+    }
+
+    /// [`Self::install_validated_at`], now.
+    fn install_validated(
+        &self,
+        connection: u64,
+        node: &str,
+        rows: Vec<RegisteredRow>,
+        reserved: &[String],
+    ) -> PublishOutcome {
+        self.install_validated_at(connection, node, rows, reserved, Instant::now())
+    }
+
     /// Holds `rows` as the publish `connection` of the node `node` filed,
     /// replacing whatever it held before — a re-publish is the whole table
     /// again, so a row that went is gone in the same line — refusing the
@@ -973,17 +1035,28 @@ impl RegisteredTables {
     /// and an A address outside the host-answerable range (NET-127) never
     /// reaches the zone at all. Every refusal is *per row*: the publish's
     /// other rows still hold.
-    fn install_validated(
+    ///
+    /// A name nobody holds but another user's node released less than
+    /// the quarantine before `now` is refused too (`released_names`), and
+    /// the names this publish drops are recorded as released by it.
+    fn install_validated_at(
         &self,
         connection: u64,
         node: &str,
         rows: Vec<RegisteredRow>,
         reserved: &[String],
+        now: Instant,
     ) -> PublishOutcome {
         let mut held = self.rows.lock().expect(
             "the registered tables' lock is never held across a panic, so it cannot \
                  be poisoned",
         );
+        let mut released_names = self
+            .released_names
+            .lock()
+            .expect("the released names' lock is never held across a panic");
+        released_names.retain(|_, (_, at)| now.saturating_duration_since(*at) < REUSE_QUARANTINE);
+        let uid = node_uid(node).map(|(_, uid)| uid);
         let mut accepted = Vec::with_capacity(rows.len());
         let mut refused = Vec::new();
         // The box addresses this publish's earlier rows claimed: the book
@@ -1021,8 +1094,28 @@ impl RegisteredTables {
                 refused.push(RefusedRow {
                     name: row.name,
                     reason: format!(
-                        "another node ({holder}) holds this name; the first publisher \
-                         keeps it"
+                        "{} holds this name; the first publisher keeps it",
+                        holder_label(holder, node)
+                    ),
+                });
+                continue;
+            }
+            // A name no node holds, but another user's node let go inside
+            // the quarantine: still theirs, for the answer TTL a host
+            // resolver may serve the old answer under.
+            if !row.address_only
+                && holder.is_none()
+                && let Some((owner, at)) = released_names.get(&name)
+                && Some(*owner) != uid
+            {
+                let left = REUSE_QUARANTINE.saturating_sub(now.saturating_duration_since(*at));
+                refused.push(RefusedRow {
+                    name: row.name,
+                    reason: format!(
+                        "another user's node (uid {owner}) released this name less than {} s \
+                         ago; it stays theirs for {} s more",
+                        REUSE_QUARANTINE.as_secs(),
+                        left.as_secs().max(1)
                     ),
                 });
                 continue;
@@ -1112,13 +1205,36 @@ impl RegisteredTables {
             held: accepted,
             refused,
         };
-        held.insert(
+        // The names this publish holds are nobody's release; the ones its
+        // last publish held and this one dropped are this user's.
+        for row in outcome.held.iter().filter(|row| !row.address_only) {
+            released_names.remove(&canonical(&row.name));
+        }
+        let before = held.insert(
             connection,
             NodeRows {
                 node: node.to_string(),
                 rows: outcome.held.clone(),
             },
         );
+        if let Some(uid) = uid
+            && let Some(before) = before
+        {
+            for name in before
+                .rows
+                .iter()
+                .filter(|row| !row.address_only)
+                .map(|row| canonical(&row.name))
+            {
+                let dropped = !outcome
+                    .held
+                    .iter()
+                    .any(|row| !row.address_only && canonical(&row.name) == name);
+                if dropped {
+                    released_names.insert(name, (uid, now));
+                }
+            }
+        }
         outcome
     }
 
@@ -1134,10 +1250,35 @@ impl RegisteredTables {
              be poisoned",
         );
         let removed = rows.remove(&connection);
-        if let Some(gone) = &removed
-            && !rows.values().any(|held| held.node == gone.node)
-        {
-            self.book().release_node(&gone.node);
+        if let Some(gone) = &removed {
+            if !rows.values().any(|held| held.node == gone.node) {
+                self.book().release_node(&gone.node);
+            }
+            // Its names are its user's for the quarantine (see
+            // `released_names`), unless another of the node's connections
+            // still holds them, which a re-publish on reconnect does.
+            if let Some((_, uid)) = node_uid(&gone.node) {
+                let now = Instant::now();
+                let mut released = self
+                    .released_names
+                    .lock()
+                    .expect("the released names' lock is never held across a panic");
+                for name in gone
+                    .rows
+                    .iter()
+                    .filter(|row| !row.address_only)
+                    .map(|row| canonical(&row.name))
+                {
+                    let still_held = rows.values().any(|held| {
+                        held.rows
+                            .iter()
+                            .any(|row| !row.address_only && canonical(&row.name) == name)
+                    });
+                    if !still_held {
+                        released.insert(name, (uid, now));
+                    }
+                }
+            }
         }
         removed
     }
@@ -1720,8 +1861,15 @@ const FOREIGN_PEER_HELLO_WAIT: Duration = Duration::from_secs(1);
 /// the profile), and another operator's daemons are turned away here. Its
 /// hello is drained unread, on a thread of its own, so a foreign peer that
 /// never writes cannot stall the gate's accept loop.
-fn refuse_foreign_peer(mut stream: UnixStream, peer_uid: u32, admission: Admission) {
-    // The refusals in flight are capped: past the cap a foreign peer is
+fn refuse_foreign_peer(stream: UnixStream, peer_uid: u32, admission: Admission) {
+    refuse_peer(stream, admission.refusal(peer_uid));
+}
+
+/// Answers a peer the accept loop refused — a foreign uid, or a user past
+/// the shared service's connection cap — with `reason`, as
+/// [`refuse_foreign_peer`] describes.
+fn refuse_peer(mut stream: UnixStream, reason: String) {
+    // The refusals in flight are capped: past the cap a refused peer is
     // closed bare, and no peer can grow this service's threads or fds
     // by connecting, however connectable the socket's mode left it.
     if FOREIGN_REFUSALS_IN_FLIGHT.fetch_add(1, Ordering::SeqCst) >= FOREIGN_REFUSALS_MAX {
@@ -1734,19 +1882,93 @@ fn refuse_foreign_peer(mut stream: UnixStream, peer_uid: u32, admission: Admissi
             let _in_flight = RefusalSlot;
             let _ = stream.set_read_timeout(Some(FOREIGN_PEER_HELLO_WAIT));
             let _ = read_reply_line(&mut stream);
-            let reply = RegistrationReply::refused(admission.refusal(peer_uid));
+            let reply = RegistrationReply::refused(reason);
             if let Err(error) = write_reply(&mut stream, &reply) {
-                tracing::debug!(component = COMPONENT, %error, "foreign peer refusal failed");
+                tracing::debug!(component = COMPONENT, %error, "peer refusal failed");
             }
         });
     if let Err(error) = spawned {
         // The closure never ran, so its slot is released here.
         FOREIGN_REFUSALS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-        tracing::debug!(component = COMPONENT, %error, "could not answer a foreign peer");
+        tracing::debug!(component = COMPONENT, %error, "could not answer a refused peer");
     }
 }
 
-/// The most foreign-peer refusals answered at once ([`refuse_foreign_peer`]).
+/// The foreign-uid warns written inside the current window
+/// ([`FOREIGN_WARN_WINDOW`]): the loop's and the connection threads'
+/// together, so a storm of group non-members is one line's worth of news
+/// too. The warn is rate-limited; the refusal never is.
+#[derive(Default)]
+struct ForeignWarns(std::collections::VecDeque<Instant>);
+
+impl ForeignWarns {
+    fn warn(&mut self, uid: u32, admission: Admission) {
+        let now = Instant::now();
+        while self
+            .0
+            .front()
+            .is_some_and(|at| now.duration_since(*at) >= FOREIGN_WARN_WINDOW)
+        {
+            self.0.pop_front();
+        }
+        if self.0.len() < FOREIGN_WARN_RATE_PER_SECOND {
+            tracing::warn!(
+                component = COMPONENT,
+                peer_uid = uid,
+                service_uid = admission.uid,
+                admitted_group = admission.group.map(|group| group.name),
+                "refused an answerer channel connection from a foreign uid; the uid this \
+                 answerer serves, and the members of the admitted group when it has one, \
+                 may publish rows"
+            );
+            self.0.push_back(now);
+        }
+    }
+}
+
+/// One connection's place among the ones its uid holds open, counted
+/// against the shared service's cap ([`PER_USER_CONNECTIONS`]) and given
+/// back when the connection's thread ends, however it ends.
+struct Seat {
+    seats: Arc<Mutex<BTreeMap<u32, usize>>>,
+    uid: u32,
+}
+
+impl Seat {
+    /// A seat for `uid`, or the number it holds already when that is the
+    /// cap. With no cap (a single-operator answerer) every take succeeds
+    /// and the count is kept all the same.
+    fn take(
+        seats: &Arc<Mutex<BTreeMap<u32, usize>>>,
+        uid: u32,
+        cap: Option<usize>,
+    ) -> Result<Self, usize> {
+        let mut held = seats.lock().expect("the seat count is never poisoned");
+        let open = held.entry(uid).or_insert(0);
+        if cap.is_some_and(|cap| *open >= cap) {
+            return Err(*open);
+        }
+        *open += 1;
+        Ok(Self {
+            seats: Arc::clone(seats),
+            uid,
+        })
+    }
+}
+
+impl Drop for Seat {
+    fn drop(&mut self) {
+        let mut held = self.seats.lock().expect("the seat count is never poisoned");
+        if let Some(open) = held.get_mut(&self.uid) {
+            *open = open.saturating_sub(1);
+            if *open == 0 {
+                held.remove(&self.uid);
+            }
+        }
+    }
+}
+
+/// The most peer refusals answered at once ([`refuse_peer`]).
 const FOREIGN_REFUSALS_MAX: usize = 4;
 
 /// How many foreign-peer warns the accept loop writes per second: a
@@ -1891,21 +2113,17 @@ fn reserved_names(own: Option<&Arc<BoxRegistry>>) -> Vec<String> {
     reserved
 }
 
-/// Binds the answerer channel's listener beside the interim holder's socket
-/// and serves publishes on a dedicated thread: one connection per
-/// co-resident VM host daemon, each connection's rows held while the
-/// connection lives. The bind happens on the calling thread so its failure
-/// surfaces where the answerer is started ([`acquire_loop_at`] warns and
-/// serves on); the socket gets the bridge socket's posture — path-length
-/// check, a 0700 parent dir, a stale socket removed, 0600 on the socket —
-/// so only the same user may connect, the same trust the control socket
-/// rests on, with the uid gate ([`peer_uid`]) as the wire's own check of
-/// it.
 /// Who the channel admits: the uid this answerer serves (every peer of an
 /// operator's own daemon), and, for an installed service that one machine's
 /// users share, the members of one group as well (the package's `_minimal`
 /// group on macOS: spec 18's open question on several users of one host).
-/// A peer is judged on what it is, before any byte of it is read.
+/// A peer is judged on what it is, before any byte of it is read, and
+/// once per connection: a membership that changes while a node is
+/// connected takes effect at its next connect. The service's own uid is
+/// judged on the accept loop (one integer compare); a group member is
+/// judged on the connection's own thread, because the account database
+/// behind [`uid_in_group`] can be a directory service that answers in
+/// seconds, and the loop must not stall for everyone while it does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Admission {
     /// The uid this answerer serves.
@@ -1939,14 +2157,29 @@ impl Admission {
         }
     }
 
-    /// Whether `peer_uid` may publish here. The shared service (the one
-    /// with a group) admits root too: root can add itself to the group
-    /// anyway, and a `sudo min` refused at the channel would only confuse.
+    /// Whether `peer_uid` is admitted without asking the account database:
+    /// the service's own uid, and root on the shared service (root can add
+    /// itself to the group anyway, and a `sudo min` refused at the channel
+    /// would only confuse). The accept loop's whole judgement.
+    fn admits_outright(self, peer_uid: u32) -> bool {
+        peer_uid == self.uid || (self.group.is_some() && peer_uid == 0)
+    }
+
+    /// Whether `peer_uid` may publish here: [`Self::admits_outright`], or
+    /// a member of the admitted group. The second half asks the account
+    /// database, so it runs on a connection's thread, never the loop's.
     fn admits(self, peer_uid: u32) -> bool {
-        peer_uid == self.uid
+        self.admits_outright(peer_uid)
             || self
                 .group
-                .is_some_and(|group| peer_uid == 0 || uid_in_group(peer_uid, group.gid))
+                .is_some_and(|group| uid_in_group(peer_uid, group.gid))
+    }
+
+    /// The shared service's cap on one user's open channel connections,
+    /// when it has one ([`PER_USER_CONNECTIONS`]): a single-operator
+    /// answerer has only its own daemons to count, and counts nothing.
+    fn per_user_connections(self) -> Option<usize> {
+        self.group.map(|_| PER_USER_CONNECTIONS)
     }
 
     /// The refusal a peer outside the admission reads. The shared
@@ -1960,30 +2193,72 @@ impl Admission {
                 self.uid
             ),
             Some(group) => {
-                let user = account_of(peer_uid)
-                    .map(|(name, _)| name)
-                    .unwrap_or_else(|| format!("uid {peer_uid}"));
+                let user = account_label(peer_uid);
                 format!(
                     "the host answerer service serves uid {}, root and the members of group \
-                     {name} (gid {gid}); this operator ({user}, uid {peer_uid}) is refused: \
-                     an administrator adds them with: sudo dseditgroup -o edit -a {user} -t \
-                     user {name}",
+                     {name} (gid {gid}); this operator ({user}) is refused: an administrator \
+                     adds them with: {add}",
                     self.uid,
                     name = group.name,
                     gid = group.gid,
+                    add = add_to_group_command(&user_name_of(peer_uid), group.name),
                 )
             }
         }
     }
 }
 
-/// Whether `uid` is a member of the group `gid`, by the account database
-/// (`getgrouplist`): the primary group and every supplementary one. A uid
-/// with no account is in no group.
+/// The most channel connections one user may hold open on the shared
+/// service at once, members and the own uid alike: a user runs a daemon
+/// per state directory and each daemon holds one connection, so a
+/// handful is the working set and the cap is well above it. Past it a
+/// connection is refused with the count, and the loop and the other
+/// users' nodes carry on. The service's own uid is not exempt: it runs no
+/// boxes.
+pub(crate) const PER_USER_CONNECTIONS: usize = 32;
+
+/// The most box addresses one user's nodes may hold on the shared
+/// service: a quarter of the range, so no one member's boxes (or one
+/// member's runaway daemon) take the whole range from the others. A
+/// single-operator answerer caps nothing: the range is its one user's.
+pub(crate) const PER_USER_ADDRESSES: usize = 64;
+
+/// The command that adds `user` to `group` on this platform: the line a
+/// refusal ends with, so it reads the same at the channel and in the
+/// CLI's `--show`.
+pub fn add_to_group_command(user: &str, group: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("sudo dseditgroup -o edit -a {user} -t user {group}")
+    } else {
+        format!("sudo usermod -aG {group} {user}")
+    }
+}
+
+/// `uid` as a refusal names it: its account name and uid, or the uid alone
+/// when it has no account. Never a path of the account's.
+pub(crate) fn account_label(uid: u32) -> String {
+    match account_of(uid) {
+        Some((name, _)) => format!("{name}, uid {uid}"),
+        None => format!("uid {uid}"),
+    }
+}
+
+/// The account name of `uid`, or its uid spelled out when it has none.
+fn user_name_of(uid: u32) -> String {
+    account_of(uid)
+        .map(|(name, _)| name)
+        .unwrap_or_else(|| uid.to_string())
+}
+
 /// Whether the account of `uid` is in the group `gid`: its primary group,
-/// or any membership the directory resolves for it (`getgrouplist`). The
-/// one definition of membership: the channel's admission, and what the
-/// CLI's `--show` tells a user about it.
+/// or any membership the directory resolves for it. The one definition of
+/// membership: the channel's admission, and what the CLI's `--show` tells
+/// a user about it. A uid with no account is in no group.
+///
+/// On macOS the question goes to the membership API
+/// (`mbr_check_membership`), which resolves nested groups and more than
+/// the sixteen groups `getgrouplist` reports there; on Linux
+/// `getgrouplist` is the account database's own answer.
 pub fn uid_in_group(uid: u32, gid: u32) -> bool {
     let Some((name, primary)) = account_of(uid) else {
         return false;
@@ -1991,22 +2266,63 @@ pub fn uid_in_group(uid: u32, gid: u32) -> bool {
     if primary == gid {
         return true;
     }
+    #[cfg(target_os = "macos")]
+    if let Some(member) = membership_api_says(uid, gid) {
+        return member;
+    }
+    uid_in_group_list(&name, primary, gid)
+}
+
+/// Apple's membership API's answer, when it has one: `None` when a uuid
+/// could not be resolved or the check itself failed, and the group list
+/// answers instead.
+#[cfg(target_os = "macos")]
+fn membership_api_says(uid: u32, gid: u32) -> Option<bool> {
+    // The three calls live in libSystem, which every macOS program links;
+    // the libc crate does not declare them.
+    unsafe extern "C" {
+        fn mbr_uid_to_uuid(uid: libc::uid_t, uu: *mut u8) -> libc::c_int;
+        fn mbr_gid_to_uuid(gid: libc::gid_t, uu: *mut u8) -> libc::c_int;
+        fn mbr_check_membership(
+            user: *const u8,
+            group: *const u8,
+            ismember: *mut libc::c_int,
+        ) -> libc::c_int;
+    }
+    let mut user = [0u8; 16];
+    let mut group = [0u8; 16];
+    let mut member: libc::c_int = 0;
+    // SAFETY: each uuid buffer is the 16 bytes the API writes, `member`
+    // outlives the call, and every pointer names storage on this frame.
+    let rc = unsafe {
+        if mbr_uid_to_uuid(uid, user.as_mut_ptr()) != 0
+            || mbr_gid_to_uuid(gid, group.as_mut_ptr()) != 0
+        {
+            return None;
+        }
+        mbr_check_membership(user.as_ptr(), group.as_ptr(), &mut member)
+    };
+    (rc == 0).then_some(member != 0)
+}
+
+/// Whether `getgrouplist` lists `gid` for the account `name` whose
+/// primary group is `primary`.
+fn uid_in_group_list(name: &str, primary: u32, gid: u32) -> bool {
+    account_group_list(name, primary).is_some_and(|groups| groups.contains(&gid))
+}
+
+/// Every group `getgrouplist` resolves for the account `name` with the
+/// primary group `primary`; `None` when the name is no C string or the
+/// list could not be read within the bound.
+pub(crate) fn account_group_list(name: &str, primary: u32) -> Option<Vec<u32>> {
     let Ok(name) = std::ffi::CString::new(name) else {
-        return false;
+        return None;
     };
     // getgrouplist's group type is `int` on macOS and `gid_t` on Linux.
     #[cfg(target_os = "macos")]
     type Group = libc::c_int;
     #[cfg(not(target_os = "macos"))]
     type Group = libc::gid_t;
-    #[cfg(target_os = "macos")]
-    fn is_gid(g: Group, gid: u32) -> bool {
-        u32::try_from(g).is_ok_and(|g| g == gid)
-    }
-    #[cfg(not(target_os = "macos"))]
-    fn is_gid(g: Group, gid: u32) -> bool {
-        g == gid
-    }
     // On truncation macOS reports the count stored, Linux the count
     // needed; either way a failed call is retried with a larger buffer,
     // up to a bound no real account reaches.
@@ -2026,10 +2342,16 @@ pub fn uid_in_group(uid: u32, gid: u32) -> bool {
         };
         let count = usize::try_from(count).unwrap_or(0);
         if rc >= 0 {
-            return groups.iter().take(count).any(|g| is_gid(*g, gid));
+            return Some(
+                groups
+                    .iter()
+                    .take(count)
+                    .filter_map(|g| u32::try_from(*g).ok())
+                    .collect(),
+            );
         }
         if groups.len() >= 4096 {
-            return false;
+            return None;
         }
         let wanted = count.max(groups.len() * 2);
         groups.resize(wanted, 0 as Group);
@@ -2104,6 +2426,16 @@ pub fn group_id(name: &str) -> io::Result<Option<u32>> {
     }
 }
 
+/// Binds the answerer channel's listener beside the interim holder's socket
+/// and serves publishes on a dedicated thread: one connection per
+/// co-resident VM host daemon, each connection's rows held while the
+/// connection lives. The bind happens on the calling thread so its failure
+/// surfaces where the answerer is started ([`acquire_loop_at`] warns and
+/// serves on); the socket gets the bridge socket's posture — path-length
+/// check, a 0700 parent dir, a stale socket removed, 0600 on the socket —
+/// so only the same user may connect, the same trust the control socket
+/// rests on, with the uid gate ([`peer_uid`]) as the wire's own check of
+/// it.
 fn hold_channel(
     sock: &Path,
     registered: Arc<RegisteredTables>,
@@ -2156,10 +2488,12 @@ fn serve_channel(
         return;
     }
     let mut next: u64 = 0;
-    // The foreign-uid warns this loop wrote inside the current window:
-    // a connect storm is capped at a few lines a second, while every
-    // peer is still refused.
-    let mut foreign_warns: std::collections::VecDeque<Instant> = Default::default();
+    // The foreign-uid warns written inside the current window, shared with
+    // the connection threads that judge group members: a connect storm is
+    // capped at a few lines a second, while every peer is still refused.
+    let foreign_warns = Arc::new(Mutex::new(ForeignWarns::default()));
+    // The connections each uid holds open, for the shared service's cap.
+    let seats = Arc::new(Mutex::new(BTreeMap::<u32, usize>::new()));
     loop {
         if stop.load(Ordering::Relaxed) {
             return;
@@ -2188,15 +2522,61 @@ fn serve_channel(
                 // much as a storm of them — the one a misconfigured
                 // unit's service user answers at a glance.
                 match peer_uid(&stream) {
-                    Ok(uid) if admission.admits(uid) => {
+                    // A uid the loop can judge by itself: the own uid, root
+                    // on the shared service, and every foreign uid of a
+                    // single-operator answerer, where no group is asked.
+                    // A storm of those spawns nothing per connect beyond
+                    // the capped refusals.
+                    Ok(uid) if !admission.admits_outright(uid) && admission.group.is_none() => {
+                        foreign_warns
+                            .lock()
+                            .expect("the warn window is never poisoned")
+                            .warn(uid, admission);
+                        refuse_foreign_peer(stream, uid, admission);
+                    }
+                    Ok(uid) => {
+                        // The shared service's cap, taken before anything is
+                        // spawned for the uid: a member past it is refused
+                        // with the count, on the loop, which costs no lookup.
+                        let seat = match Seat::take(&seats, uid, admission.per_user_connections()) {
+                            Ok(seat) => seat,
+                            Err(open) => {
+                                refuse_peer(
+                                    stream,
+                                    format!(
+                                        "the host answerer service holds {open} channel \
+                                         connections for uid {uid} already, the most one \
+                                         user may hold open at once; a node reconnects when \
+                                         one ends"
+                                    ),
+                                );
+                                continue;
+                            }
+                        };
                         let connection = next;
                         next += 1;
                         let registered = Arc::clone(&registered);
                         let own = own.clone();
                         let stop = Arc::clone(&stop);
+                        let foreign_warns = Arc::clone(&foreign_warns);
                         let spawned = std::thread::Builder::new()
                             .name("minvmd-zone-publish".to_string())
                             .spawn(move || {
+                                // The seat is the thread's for as long as
+                                // the connection is served, however the
+                                // service ends.
+                                let _seat = seat;
+                                // A group member is judged here, where the
+                                // account database's seconds stall this
+                                // connection alone.
+                                if !admission.admits(uid) {
+                                    foreign_warns
+                                        .lock()
+                                        .expect("the warn window is never poisoned")
+                                        .warn(uid, admission);
+                                    refuse_foreign_peer(stream, uid, admission);
+                                    return;
+                                }
                                 serve_registration(
                                     connection, uid, stream, registered, own, holder, stop,
                                 )
@@ -2209,29 +2589,6 @@ fn serve_channel(
                                  will not answer here"
                             );
                         }
-                    }
-                    Ok(uid) => {
-                        // The warn is rate-limited; the refusal never is.
-                        let now = Instant::now();
-                        while foreign_warns
-                            .front()
-                            .is_some_and(|at| now.duration_since(*at) >= FOREIGN_WARN_WINDOW)
-                        {
-                            foreign_warns.pop_front();
-                        }
-                        if foreign_warns.len() < FOREIGN_WARN_RATE_PER_SECOND {
-                            tracing::warn!(
-                                component = COMPONENT,
-                                peer_uid = uid,
-                                service_uid = admission.uid,
-                                admitted_group = admission.group.map(|group| group.name),
-                                "refused an answerer channel connection from a foreign uid; \
-                                 the uid this answerer serves, and the members of the \
-                                 admitted group when it has one, may publish rows"
-                            );
-                            foreign_warns.push_back(now);
-                        }
-                        refuse_foreign_peer(stream, uid, admission);
                     }
                     Err(error) => {
                         // A dropped connect loses that node's publishes
@@ -2262,9 +2619,37 @@ fn serve_channel(
 
 /// The node id the tables key on: the hello's node id and the peer's uid,
 /// as one string, so every rule that compares node ids compares users
-/// too, and a refusal that names the holder names both.
+/// too. [`node_uid`] reads the uid back; [`holder_label`] names a holder
+/// to another node without the holder's own words, which are a path in
+/// that user's home.
 fn qualified_node(node: &str, uid: u32) -> String {
-    format!("{node}, uid {uid}")
+    format!("{node}{NODE_UID_SEPARATOR}{uid}")
+}
+
+/// What [`qualified_node`] puts between the hello's word and the uid.
+const NODE_UID_SEPARATOR: &str = ", uid ";
+
+/// The uid a qualified node id carries, and the hello's own word before
+/// it; `None` for an id [`qualified_node`] did not build.
+fn node_uid(qualified: &str) -> Option<(&str, u32)> {
+    let (node, uid) = qualified.rsplit_once(NODE_UID_SEPARATOR)?;
+    Some((node, uid.parse().ok()?))
+}
+
+/// How a refusal names the node `holder` to the node `asker`: the same
+/// user's node by its own word (its state directory and VM, which that
+/// user knows), another user's by uid alone, so no user reads a path of
+/// another's. Pure, so the wording is unit-tested.
+fn holder_label(holder: &str, asker: &str) -> String {
+    match (node_uid(holder), node_uid(asker)) {
+        // The holder's word is left out on purpose: it is the other
+        // user's path.
+        (Some((_, held_by)), Some((_, asking))) if held_by != asking => {
+            format!("another user's node (uid {held_by})")
+        }
+        (Some((word, _)), _) => format!("another node ({word})"),
+        (None, _) => format!("another node ({holder})"),
+    }
 }
 
 /// Serves one node's connection: the hello first — bounded, because a
@@ -4418,17 +4803,22 @@ fn serve_with_stop(socket: UdpSocket, answerer: HostAnswerer, stop: Option<Arc<A
 /// restart holds nothing until the nodes reconnect and re-publish, which
 /// they do unprompted, in backoff time.
 ///
-/// The uid gate is the channel's whole security posture: a peer whose uid
-/// is not this service's own is refused before a byte of its payload is
-/// read ([`serve_channel`]), so only the operator's own daemons — and the
-/// tests — can publish.
+/// The uid gate is the channel's whole security posture: a peer outside
+/// `admission` — not the service's own uid, nor a member of the group a
+/// shared service admits — is refused before a byte of its payload is
+/// read ([`serve_channel`]). A shared service's tables cap what one user
+/// holds ([`PER_USER_CONNECTIONS`], [`PER_USER_ADDRESSES`]).
 pub(crate) fn serve_service(
     listener: UdpSocket,
     channel: UnixListener,
     admission: Admission,
     stop: Arc<AtomicBool>,
 ) {
-    let registered = Arc::new(RegisteredTables::new());
+    let registered = Arc::new(if admission.group.is_some() {
+        RegisteredTables::shared()
+    } else {
+        RegisteredTables::new()
+    });
     let answerer = HostAnswerer::for_service(Arc::clone(&registered));
     // The answers are served on their own thread, so a slow DNS exchange
     // never delays a publish — and the channel is served here, on the
@@ -4456,9 +4846,6 @@ mod tests {
 
     use super::*;
 
-    /// The answerer's own row is the sessions zone's host row, byte for byte:
-    /// the CLI's liveness query reads [`HOST_NAME`], so a spelling that drifts
-    /// from the zone fails here rather than as a dead liveness probe.
     /// A node is the hello's node id and the peer's uid together: another
     /// user speaking the same id is another node, so its publish neither
     /// replaces the first user's row (the name is refused it, the holder
@@ -4479,7 +4866,7 @@ mod tests {
             panic!("the held name is refused once: {:?}", second.refused);
         };
         assert!(
-            refused.reason.contains("another node (vm-a, uid 501)"),
+            refused.reason.contains("another user's node (uid 501)"),
             "{}",
             refused.reason
         );
@@ -4500,31 +4887,42 @@ mod tests {
         );
     }
 
-    /// The admission: the service's own uid always; a group's members when
-    /// the unit names one, by the account database; nobody else.
+    /// The admission: the service's own uid always; root on the shared
+    /// service; a group's members when the unit names one, by the account
+    /// database; nobody else. Under root the non-member half is the root
+    /// half (root is admitted), so it is asserted as such, not skipped.
     #[test]
     fn admission_is_the_own_uid_or_a_groups_members() {
-        // SAFETY: geteuid and getgroups only read the process's own ids.
+        // SAFETY: geteuid only reads the process's own uid.
         let own = unsafe { libc::geteuid() };
-        let mut groups = vec![0 as libc::gid_t; 128];
-        // SAFETY: `groups` has the number of elements passed and outlives
-        // the call; only the elements the call reports filled are read.
-        let n = unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
-        let n = usize::try_from(n).expect("the test process is in some group");
-        assert!(n > 0, "the test process is in some group");
-        let groups = &groups[..n];
-        let (_, primary) = account_of(own).expect("the test process has an account");
+        let (name, primary) = account_of(own).expect("the test process has an account");
+        // The account's groups, as the service judges them: the directory's
+        // list for the account, not the process's own set.
+        let groups = account_group_list(&name, primary).expect("the account's groups read");
+        assert!(
+            groups.contains(&primary),
+            "the list carries the primary group"
+        );
         let no_such_group = (0..u32::MAX)
             .rev()
-            .find(|g| !groups.contains(&(*g as libc::gid_t)))
-            .expect("a gid the process is not in");
+            .find(|g| !groups.contains(g) && !uid_in_group(own, *g))
+            .expect("a gid the account is not in");
 
         let alone = Admission::uid(own ^ 1);
         assert!(!alone.admits(own), "a foreign uid with no group is refused");
         assert!(
+            !alone.admits_outright(own) && alone.admits_outright(own ^ 1),
+            "the loop judges a single-operator answerer's peers by itself"
+        );
+        assert!(
             alone
                 .refusal(own)
                 .contains("multi-operator hosts are not supported")
+        );
+        assert_eq!(
+            alone.per_user_connections(),
+            None,
+            "one operator is not capped"
         );
 
         let by_primary = Admission::uid_and_group(
@@ -4542,8 +4940,13 @@ mod tests {
             by_primary.admits(own ^ 1),
             "the service's own uid always is"
         );
-        // A supplementary group is what getgrouplist answers for, past the
-        // primary-group short cut; the test process has one on every host
+        assert_eq!(
+            by_primary.per_user_connections(),
+            Some(PER_USER_CONNECTIONS),
+            "the shared service caps each user's connections"
+        );
+        // A supplementary group is what the directory answers for, past the
+        // primary-group short cut; the test account has one on every host
         // the suite runs on (staff/everyone on macOS, the login groups on
         // Linux), and without one that half is reported, not assumed.
         match groups.iter().find(|g| **g != primary) {
@@ -4559,9 +4962,13 @@ mod tests {
                     by_list.admits(own),
                     "a member by a supplementary group (gid {supplementary}) is admitted"
                 );
+                assert!(
+                    own == 0 || !by_list.admits_outright(own),
+                    "a member is judged by the account database, off the loop"
+                );
             }
             None => {
-                eprintln!("the test process has only its primary group; getgrouplist unexercised")
+                eprintln!("the test account has only its primary group; the list is unexercised")
             }
         }
 
@@ -4572,24 +4979,39 @@ mod tests {
                 gid: no_such_group,
             },
         );
-        assert!(!other_group.admits(own), "a non-member is refused");
+        if own == 0 {
+            assert!(
+                other_group.admits(own) && other_group.admits_outright(own),
+                "root is admitted to the shared service outright"
+            );
+        } else {
+            assert!(!other_group.admits(own), "a non-member is refused");
+        }
         assert!(
             other_group.admits(0) && !alone.admits(0),
             "root is admitted to the shared service, not to a user's own"
         );
         let reason = other_group.refusal(own);
+        let add = add_to_group_command(&name, "nosuch");
         assert!(
             reason.contains(&format!("group nosuch (gid {no_such_group})"))
-                && reason.contains("dseditgroup -o edit -a ")
-                && reason.contains(" -t user nosuch")
+                && reason.contains(&format!("({name}, uid {own})"))
+                && reason.ends_with(&add)
                 && !reason.contains("USER")
                 && !reason.contains("GROUP"),
             "the refusal names the group, the user and the way in: {reason}"
         );
+        if cfg!(target_os = "macos") {
+            assert!(add.starts_with("sudo dseditgroup "), "{add}");
+        } else {
+            assert!(add.starts_with("sudo usermod "), "{add}");
+        }
         assert!(
             !uid_in_group(u32::MAX - 7, primary),
             "a uid with no account is in no group"
         );
+        assert_eq!(account_label(u32::MAX - 7), format!("uid {}", u32::MAX - 7));
+        assert_eq!(account_label(own), format!("{name}, uid {own}"));
         assert_eq!(
             group_id("no-such-group-for-minimal").expect("a lookup that ran"),
             None,
@@ -4597,6 +5019,152 @@ mod tests {
         );
     }
 
+    /// The shared service's seat per user: the cap refuses the one past it
+    /// with the count, a dropped seat frees one, and no cap counts but
+    /// never refuses.
+    #[test]
+    fn a_users_seats_are_capped_and_given_back() {
+        let seats = Arc::new(Mutex::new(BTreeMap::new()));
+        let first = Seat::take(&seats, 501, Some(2)).expect("the first seat");
+        let second = Seat::take(&seats, 501, Some(2)).expect("the second seat");
+        assert_eq!(
+            Seat::take(&seats, 501, Some(2)).err(),
+            Some(2),
+            "the third is refused with the count"
+        );
+        let _other = Seat::take(&seats, 502, Some(2)).expect("another user's first seat");
+        drop(first);
+        let _third = Seat::take(&seats, 501, Some(2)).expect("a dropped seat is free again");
+        drop(second);
+        drop(_third);
+        let _uncapped: Vec<Seat> = (0..5)
+            .map(|_| Seat::take(&seats, 501, None).expect("no cap, no refusal"))
+            .collect();
+        assert_eq!(seats.lock().unwrap().get(&501), Some(&5));
+        drop(_uncapped);
+        assert_eq!(
+            seats.lock().unwrap().get(&501),
+            None,
+            "an empty count is dropped"
+        );
+    }
+
+    /// A refusal names a holder to its own user by the node's word and to
+    /// another user by uid only: the word is a path in the holder's home.
+    #[test]
+    fn a_holder_is_named_by_word_to_its_user_and_by_uid_to_others() {
+        let alice = qualified_node("/Users/alice/.minimal#default", 501);
+        let bob = qualified_node("/Users/bob/.minimal#default", 502);
+        assert_eq!(
+            node_uid(&alice),
+            Some(("/Users/alice/.minimal#default", 501))
+        );
+        assert_eq!(node_uid("vm-a"), None);
+        assert_eq!(holder_label(&alice, &bob), "another user's node (uid 501)");
+        assert_eq!(
+            holder_label(&alice, &qualified_node("/Users/alice/.minimal#other", 501)),
+            "another node (/Users/alice/.minimal#default)"
+        );
+        assert_eq!(holder_label("vm-a", &bob), "another node (vm-a)");
+    }
+
+    /// A name's last user keeps it for the quarantine after its row goes:
+    /// another user's publish of it is refused with the wait, the same
+    /// user's takes it straight back, and once the quarantine has passed
+    /// anyone may. A re-publish that drops a name releases it the same way.
+    #[test]
+    fn a_released_name_stays_its_users_for_the_quarantine() {
+        let tables = RegisteredTables::new();
+        let alice = qualified_node("vm-a", 501);
+        let bob = qualified_node("vm-b", 502);
+        let a = Ipv4Addr::new(127, 0, 64, 10);
+        let b = Ipv4Addr::new(127, 0, 64, 11);
+        let t0 = Instant::now();
+        let first = tables.install_validated_at(1, &alice, vec![published_row("web", a)], &[], t0);
+        assert!(first.refused.is_empty(), "{:?}", first.refused);
+        assert!(tables.remove(1).is_some(), "alice's connection ends");
+        let soon = t0 + Duration::from_secs(1);
+        let bobs = tables.install_validated_at(2, &bob, vec![published_row("web", b)], &[], soon);
+        let [refused] = &bobs.refused[..] else {
+            panic!("the released name is refused once: {:?}", bobs.refused);
+        };
+        assert!(
+            refused
+                .reason
+                .contains("another user's node (uid 501) released this name")
+                && refused.reason.contains("stays theirs for"),
+            "{}",
+            refused.reason
+        );
+        let back = tables.install_validated_at(3, &alice, vec![published_row("web", a)], &[], soon);
+        assert!(
+            back.refused.is_empty(),
+            "the same user takes it back: {:?}",
+            back.refused
+        );
+        // Dropping the name from a re-publish releases it too.
+        let dropped = tables.install_validated_at(3, &alice, vec![], &[], soon);
+        assert!(dropped.refused.is_empty());
+        let later = t0 + REUSE_QUARANTINE + Duration::from_secs(1);
+        let bobs = tables.install_validated_at(2, &bob, vec![published_row("web", b)], &[], later);
+        assert!(
+            bobs.refused.is_empty(),
+            "past the quarantine the name is anyone's: {:?}",
+            bobs.refused
+        );
+    }
+
+    /// The shared service's share of the range per user: a fresh address
+    /// past the cap is refused naming the count, a box's own address comes
+    /// back regardless, another user is unaffected, and the single-operator
+    /// book caps nothing.
+    #[test]
+    fn a_users_box_addresses_are_capped_on_the_shared_service() {
+        let tables = RegisteredTables::shared();
+        let alice = qualified_node("vm-a", 501);
+        let bob = qualified_node("vm-b", 502);
+        let mut book = tables.book();
+        book.range_probe = range_present;
+        let mut last = None;
+        for i in 0..PER_USER_ADDRESSES {
+            last = Some(
+                book.allocate(&alice, &format!("box{i}"))
+                    .unwrap_or_else(|e| panic!("address {i} of the share: {e}")),
+            );
+        }
+        let refused = book
+            .allocate(&alice, "one-more")
+            .expect_err("the address past the share is refused");
+        assert!(
+            refused.contains(&format!("uid 501 hold {PER_USER_ADDRESSES} box addresses")),
+            "{refused}"
+        );
+        assert_eq!(
+            book.allocate(&alice, &format!("box{}", PER_USER_ADDRESSES - 1)),
+            Ok(last.expect("an address")),
+            "a box's own address comes back"
+        );
+        book.allocate(&bob, "theirs")
+            .expect("another user's share is their own");
+        let claimed = book.claim(&alice, "claimed", Ipv4Addr::new(127, 0, 64, 200));
+        assert!(
+            claimed.is_err_and(|e| e.contains("the most one user may")),
+            "a claim counts against the share too"
+        );
+        let mut single = AddressBook {
+            range_probe: range_present,
+            ..Default::default()
+        };
+        for i in 0..=PER_USER_ADDRESSES {
+            single
+                .allocate(&alice, &format!("box{i}"))
+                .unwrap_or_else(|e| panic!("one operator is not capped: {e}"));
+        }
+    }
+
+    /// The answerer's own row is the sessions zone's host row, byte for byte:
+    /// the CLI's liveness query reads [`HOST_NAME`], so a spelling that drifts
+    /// from the zone fails here rather than as a dead liveness probe.
     #[test]
     fn host_name_is_the_zone_host_row() {
         assert_eq!(HOST_NAME, "host.min.internal");
@@ -6484,7 +7052,7 @@ mod tests {
             "the refused row is the held name"
         );
         assert!(
-            refused.reason.contains("another node (vm-a, uid ")
+            refused.reason.contains("another node (vm-a)")
                 && refused.reason.contains("first publisher"),
             "the refusal names the node that keeps the name: {}",
             refused.reason
