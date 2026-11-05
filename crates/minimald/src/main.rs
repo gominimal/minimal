@@ -942,6 +942,12 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
             cohort_address: identity,
             node_plane_address: identity,
             ct_mark_mask: minimald::net::classifier::GUEST_CT_MARK_MASK,
+            // BEP-083: the proxy's listener, whose address the table refuses
+            // to every box whose own leaf is not in the lane set.
+            proxy_listener: std::net::SocketAddrV4::new(
+                minimald::net::DEFAULT_SUBNET.box_egress_proxy_address(),
+                boxes::core::egress::PROXY_LISTENER_PORT,
+            ),
             mountinfo_override: None,
         };
         minimald::net::classifier::boot_guest_classifier(
