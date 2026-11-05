@@ -300,6 +300,9 @@ fn every_daemon_connection_is_classified() {
             // `min host list|show` probes each local host for its state and
             // daemon version. It only reads, and it must show a skewed
             // daemon's version, so it must work when the pair is skewed.
+            // `min host stop` stops the daemon, as `min stop` does: the
+            // remedy the version check names, so it is never gated by it.
+            "cmd/hosts.rs::cmd_host_stop = ungated",
             "cmd/hosts.rs::probe_host = ungated",
             "cmd/list.rs::cmd_bare = gated",
             // `min ls` reaches past the selected VM, and the two halves carry
@@ -376,6 +379,9 @@ fn every_daemon_connection_is_classified() {
             // Not a product path: the host show test's own connection to
             // the harness daemon, to read the version it expects.
             "tests.rs::host_show_socket_and_version = ungated",
+            // Not a product path: the host stop test's own connection to the
+            // harness daemon, to list the boxes it expects stopped.
+            "tests.rs::host_stop_force_forces_boxes_and_daemon = ungated",
             "tests.rs::local_member_is_a_sign_in_reference_expiring_with_the_root = ungated",
             // Not a product path, and not the daemon: the audit test submits
             // a revocation to a test Box Egress Proxy's control socket.
@@ -6757,6 +6763,214 @@ async fn host_show_socket_and_version() {
     );
 }
 
+/// BCLI-049: `min host stop --force` force-stops each running box on the
+/// host, then stops its daemon. Each box gets the forced stop, and none the
+/// graceful one. The daemon then refuses box work, because it is shutting
+/// down. The last line says what stopped.
+#[tokio::test]
+async fn host_stop_force_forces_boxes_and_daemon() {
+    let log = minimald::test_harness::captured_log();
+    let state = state_with_host_dirs(&["local-minimald0"]);
+    let sock = state.path().join("providers/local-minimald0/ssh.sock");
+    let server = minimald::test_harness::TestServer::new().await;
+    server.listen_on_uds(&sock).await;
+    let project = tempfile::TempDir::new().unwrap();
+    let mut daemon = server.connect().await;
+    for name in ["web", "api"] {
+        minimald::test_harness::create_configured_session(
+            &mut daemon,
+            name,
+            project.path().to_str().unwrap(),
+        )
+        .await;
+    }
+    let ids: Vec<(String, boxes::SessionId)> = {
+        let mut client = client::Client::connect(&sock).await.expect("connect");
+        list_box_records(&mut client, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.name.unwrap_or_default(), entry.box_id))
+            .collect()
+    };
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert!(!server.state.sessions_manager().await.is_shutting_down());
+
+    let mut out = Vec::new();
+    let args = HostStopArgs {
+        host: "local0".to_owned(),
+        force: true,
+    };
+    cmd::hosts::cmd_host_stop(&host_globals(state.path()), &args, &mut out)
+        .await
+        .expect("host stop --force runs");
+    let text = String::from_utf8(out).unwrap();
+    let mut lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines.pop(),
+        Some("Stopped 2 boxes and the daemon on local0."),
+        "{text}"
+    );
+    lines.sort_unstable();
+    assert_eq!(lines, ["Stopped api.", "Stopped web."], "{text}");
+
+    // Each box got the forced stop of BOX-013, and no graceful one.
+    let log = log.contents();
+    let served = |id: boxes::SessionId, force: bool| {
+        log.lines()
+            .filter(|line| {
+                line.contains("session stopped")
+                    && line.contains(&format!("session_id={id}"))
+                    && line.contains(&format!("force={force}"))
+            })
+            .count()
+    };
+    for (name, id) in &ids {
+        assert_eq!(served(*id, true), 1, "{name}: {log}");
+        assert_eq!(served(*id, false), 0, "{name}: {log}");
+    }
+
+    // The daemon is shutting down.
+    assert!(
+        server.state.sessions_manager().await.is_shutting_down(),
+        "the daemon is shutting down after host stop"
+    );
+
+    // A VM host's line names its VM too, and one box is one box.
+    assert_eq!(
+        cmd::hosts::host_stop_summary(1, "local-minvmd0", true),
+        "Stopped 1 box, the daemon and its VM on local-minvmd0."
+    );
+    assert_eq!(
+        cmd::hosts::host_stop_summary(3, "local-minvmd0", true),
+        "Stopped 3 boxes, the daemon and its VM on local-minvmd0."
+    );
+}
+
+/// BCLI-049: `min host stop --force` on a VM host whose daemon connects but
+/// never answers stops the VM from this machine. It does not wait on a box
+/// listing first, and it exits 0. Without `--force` the command refuses with
+/// exit 7, as `min stop` does for a host that does not answer, and names
+/// `--force`.
+#[tokio::test]
+async fn host_stop_force_forces_boxes_and_daemon_when_daemon_does_not_answer() {
+    let state = state_with_host_dirs(&["local-minvmd0"]);
+    let sock = state.path().join("providers/local-minvmd0/ssh.sock");
+    // Accepts each connection and holds it open, and never writes a byte.
+    let listener = tokio::net::UnixListener::bind(&sock).expect("the socket binds");
+    let holder = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+
+    let started = std::time::Instant::now();
+    let mut out = Vec::new();
+    let args = HostStopArgs {
+        host: "local-minvmd0".to_owned(),
+        force: true,
+    };
+    cmd::hosts::cmd_host_stop(&host_globals(state.path()), &args, &mut out)
+        .await
+        .expect("host stop --force stops the VM of a daemon that does not answer");
+    // The VM dir has no running VM, so the host-side stop signals nothing.
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "local-minvmd0 is not running.\n"
+    );
+    // The probe's budget, and no RPC timeout on a listing after it.
+    assert!(
+        started.elapsed() < client::RPC_TIMEOUT,
+        "took {:?}",
+        started.elapsed()
+    );
+
+    let args = HostStopArgs {
+        host: "local-minvmd0".to_owned(),
+        force: false,
+    };
+    let err = cmd::hosts::cmd_host_stop(&host_globals(state.path()), &args, &mut Vec::new())
+        .await
+        .expect_err("host stop without --force refuses a daemon that does not answer");
+    assert!(
+        err.downcast_ref::<client::box_registration::HostUnreachable>()
+            .is_some(),
+        "{err:#}"
+    );
+    assert!(
+        format!("{err:#}").contains("Run `min host stop local-minvmd0 --force`"),
+        "{err:#}"
+    );
+    holder.abort();
+}
+
+/// BCLI-049: only a timeout or a lost connection is a daemon that did not
+/// answer. A refusal the daemon sent, a failure it reported and a failed
+/// write of the output are not.
+#[test]
+fn host_stop_force_forces_boxes_and_daemon_tells_no_answer_from_an_answer() {
+    let timed_out =
+        anyhow::anyhow!("StopBox RPC timed out after 60s").context("StopBox RPC failed");
+    assert!(cmd::rpc_unanswered(&timed_out));
+    let lost = anyhow::Error::new(russh::Error::Disconnect)
+        .context("open channel for StopBox")
+        .context("StopBox RPC failed");
+    assert!(cmd::rpc_unanswered(&lost));
+    let closed = anyhow::anyhow!("decode response for ListBoxes (daemon replied: )");
+    assert!(cmd::rpc_unanswered(&closed));
+
+    let refused = anyhow::anyhow!("the box is still starting");
+    assert!(!cmd::rpc_unanswered(&refused));
+    let gone = anyhow::Error::new(BoxAddressRefusal::NotFound {
+        address: "web".to_owned(),
+    });
+    assert!(!cmd::rpc_unanswered(&gone));
+    let daemon_side = anyhow::anyhow!("StopBox RPC failed on the daemon side: boom")
+        .context("StopBox RPC failed");
+    assert!(!cmd::rpc_unanswered(&daemon_side));
+    let write = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+    assert!(!cmd::rpc_unanswered(&write));
+}
+
+/// BCLI-049: the lines `min host stop --force` prints for a box it did not
+/// stop. A box ended with its VM only when it got no answer or was skipped,
+/// and only when the VM stop worked.
+#[test]
+fn host_stop_force_forces_boxes_and_daemon_names_each_box_it_did_not_stop() {
+    use cmd::hosts::{BoxNotStopped, box_not_stopped_line};
+    let host = "local-minvmd0";
+    assert_eq!(
+        box_not_stopped_line("web", host, &BoxNotStopped::Unanswered, true),
+        "web did not answer the stop. It ended when its VM stopped."
+    );
+    assert_eq!(
+        box_not_stopped_line("web", host, &BoxNotStopped::Unanswered, false),
+        "web did not answer the stop."
+    );
+    let skipped = BoxNotStopped::Skipped {
+        after: "web".to_owned(),
+    };
+    assert_eq!(
+        box_not_stopped_line("api", host, &skipped, true),
+        "api was not asked to stop, because web did not answer the stop. \
+         It ended when its VM stopped."
+    );
+    assert_eq!(
+        box_not_stopped_line("api", host, &skipped, false),
+        "api was not asked to stop, because web did not answer the stop."
+    );
+    assert_eq!(
+        box_not_stopped_line("web", host, &BoxNotStopped::Gone, true),
+        "web was not stopped, because it is no longer on local-minvmd0."
+    );
+    let refused = BoxNotStopped::Refused("the box is still starting".to_owned());
+    assert_eq!(
+        box_not_stopped_line("web", host, &refused, true),
+        "web was not stopped. The daemon on local-minvmd0 answered: the box is still starting"
+    );
+}
+
 /// BCLI-052: `min provider list --all` lists every well-known local provider
 /// present on the machine: a provider with a host, and `local-box` only in a
 /// box. Without `--all` it lists the provider the command selects.
@@ -7909,6 +8123,647 @@ async fn box_address_and_json_output_end_to_end() {
     }
 }
 
+/// A native host whose socket a harness daemon serves, with a running box
+/// named `web` and a running box named `locked` whose spec sets `[io]
+/// exec_enabled = false`. Holds the state dir, the daemon and the project
+/// dir.
+struct ExecHost {
+    _state: tempfile::TempDir,
+    _server: minimald::test_harness::TestServer,
+    _project: tempfile::TempDir,
+    global: GlobalArgs,
+    web: boxes::SessionId,
+    locked: boxes::SessionId,
+}
+
+async fn exec_host() -> ExecHost {
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+        FinalizeSessionRequest,
+    };
+
+    let state = tempfile::tempdir().expect("a temp minimal state dir");
+    let global = GlobalArgs {
+        repo_dir: None,
+        minimal_dir: Some(state.path().to_path_buf()),
+        config_dir: None,
+        provider: Some(Provider::LocalMinimald),
+        no_input: true,
+        vm: None,
+    };
+    let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
+        .expect("the native daemon's socket path");
+    std::fs::create_dir_all(sock.parent().expect("the socket has a dir"))
+        .expect("the native daemon's state dir");
+    let server = minimald::test_harness::TestServer::new().await;
+    server.listen_on_uds(&sock).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let project_path = project.path().to_str().expect("a UTF-8 project path");
+    let mut daemon = server.connect().await;
+    let web =
+        minimald::test_harness::create_configured_session(&mut daemon, "web", project_path).await;
+
+    // The same steps as `create_configured_session`, with a stored spec.
+    let mut create = minimald::test_harness::create_session_req("locked", project_path);
+    create.spec = Some(serde_json_lenient::json!({"v": 0, "io": {"exec_enabled": false}}));
+    let locked = daemon.call::<CreateSession>(&create).await.unwrap().id;
+    minimald::test_harness::unwrap_ready(
+        daemon
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: locked,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    match daemon
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: locked,
+            report_shared_port_collisions: false,
+        })
+        .await
+    {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("FinalizeSession of the locked box: {error}"),
+    }
+    ExecHost {
+        _state: state,
+        _server: server,
+        _project: project,
+        global,
+        web,
+        locked,
+    }
+}
+
+/// One `min box exec` run: what it wrote to stdout and stderr, the error
+/// it ended with, and the exit code `main` gives that ending.
+struct ExecRun {
+    stdout: String,
+    stderr: String,
+    error: Option<anyhow::Error>,
+    exit: u8,
+}
+
+impl ExecRun {
+    fn of(result: Result<i32, anyhow::Error>, stdout: &[u8], stderr: &[u8]) -> Self {
+        let (error, exit) = match result {
+            Ok(code) => (None, u8::try_from(code).unwrap_or(1)),
+            Err(error) => {
+                let exit = exec_failure_code(&error);
+                (Some(error), exit)
+            }
+        };
+        Self {
+            stdout: String::from_utf8_lossy(stdout).into_owned(),
+            stderr: String::from_utf8_lossy(stderr).into_owned(),
+            error,
+            exit,
+        }
+    }
+
+    /// The error as `main` prints it after `error: `.
+    fn message(&self) -> Option<String> {
+        self.error.as_ref().map(|e| format!("{e:#}"))
+    }
+}
+
+impl std::fmt::Display for ExecRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "exit: {}", self.exit)?;
+        writeln!(f, "error: {:?}", self.message())?;
+        writeln!(f, "stdout:\n{}", self.stdout)?;
+        writeln!(f, "stderr:\n{}", self.stderr)
+    }
+}
+
+/// The exit code `main` ends with for `error`, as its `failure_exit_code`
+/// maps the `min box exec` failures.
+fn exec_failure_code(error: &anyhow::Error) -> u8 {
+    if let Some(refusal) = error.downcast_ref::<BoxExecRefusal>() {
+        return refusal.exit_code();
+    }
+    if error.downcast_ref::<BoxExecTimedOut>().is_some() {
+        return BoxExecTimedOut::EXIT_CODE;
+    }
+    if let Some(refusal) = error.downcast_ref::<BoxAddressRefusal>() {
+        return refusal.exit_code();
+    }
+    1
+}
+
+/// `min box exec <target> <flags> -- <argv>`, parsed as the CLI parses it.
+fn box_exec_request(target: &str, flags: &[&str], argv: &[&str]) -> cmd::BoxExecRequest {
+    let mut words = vec!["min", "box", "exec", target];
+    words.extend_from_slice(flags);
+    words.push("--");
+    words.extend_from_slice(argv);
+    let cli = Cli::try_parse_from(&words).unwrap_or_else(|e| panic!("{words:?}: {e}"));
+    match cli.command {
+        Some(Command::Box(BoxArgs {
+            command: BoxCommand::Exec(args),
+        })) => cmd::BoxExecRequest::from_args(args),
+        _ => panic!("{words:?} is not `min box exec`"),
+    }
+}
+
+/// Runs `min box exec` for `request` against the harness daemon of `host`,
+/// with a terminal on stdin when `terminal` is set.
+async fn run_box_exec_on_host_with(
+    host: &ExecHost,
+    request: &cmd::BoxExecRequest,
+    terminal: bool,
+) -> ExecRun {
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let result = cmd::box_exec_on_hosts(
+        local_hosts(&host.global).expect("the local hosts"),
+        cmd::daemon_host_kind(&host.global),
+        request,
+        terminal,
+        None,
+        &mut stdout,
+        &mut stderr,
+    )
+    .await;
+    ExecRun::of(result, &stdout, &stderr)
+}
+
+/// [`run_box_exec_on_host_with`] with a terminal on stdin. Each refusal
+/// these runs meet comes before a `-t` exec attaches.
+async fn run_box_exec_on_host(host: &ExecHost, request: &cmd::BoxExecRequest) -> ExecRun {
+    run_box_exec_on_host_with(host, request, true).await
+}
+
+/// What one scripted exec channel answers: after `delay`, these messages,
+/// then the close.
+struct Script {
+    delay: std::time::Duration,
+    msgs: Vec<russh::ChannelMsg>,
+}
+
+/// A daemon's answer on an exec channel: `stdout`, `stderr`, then `status`.
+fn answer(stdout: &[u8], stderr: &[u8], status: u32) -> Script {
+    let mut msgs = Vec::new();
+    if !stdout.is_empty() {
+        msgs.push(russh::ChannelMsg::Data {
+            data: stdout.to_vec().into(),
+        });
+    }
+    if !stderr.is_empty() {
+        msgs.push(russh::ChannelMsg::ExtendedData {
+            data: stderr.to_vec().into(),
+            ext: 1,
+        });
+    }
+    msgs.push(russh::ChannelMsg::Eof);
+    msgs.push(russh::ChannelMsg::ExitStatus {
+        exit_status: status,
+    });
+    Script {
+        delay: std::time::Duration::ZERO,
+        msgs,
+    }
+}
+
+/// Exec channels whose daemon answers each channel with the next script,
+/// and records the exec form each channel carried.
+struct ScriptedChannels {
+    opened: Vec<String>,
+    scripts: std::collections::VecDeque<Script>,
+}
+
+struct ScriptedChannel {
+    delay: std::time::Duration,
+    msgs: std::collections::VecDeque<russh::ChannelMsg>,
+}
+
+impl cmd::ExecChannel for ScriptedChannel {
+    async fn wait(&mut self) -> Option<russh::ChannelMsg> {
+        if !self.delay.is_zero() {
+            tokio::time::sleep(std::mem::take(&mut self.delay)).await;
+        }
+        self.msgs.pop_front()
+    }
+
+    async fn eof(&mut self) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
+    fn input(&self) -> std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>> {
+        Box::pin(tokio::io::sink())
+    }
+}
+
+impl cmd::ExecChannels for ScriptedChannels {
+    type Channel = ScriptedChannel;
+
+    async fn open(&mut self, wire: &str) -> Result<ScriptedChannel, anyhow::Error> {
+        self.opened.push(wire.to_owned());
+        let script = self
+            .scripts
+            .pop_front()
+            .unwrap_or_else(|| panic!("no script for channel {wire}"));
+        Ok(ScriptedChannel {
+            delay: script.delay,
+            msgs: script.msgs.into(),
+        })
+    }
+}
+
+/// Runs `request` over channels that answer with `scripts`. Returns the run
+/// and the exec form of each channel it opened.
+async fn run_scripted_exec(
+    request: &cmd::BoxExecRequest,
+    scripts: Vec<Script>,
+) -> (ExecRun, Vec<minimald_rpc::exec::ExecRequest>) {
+    let mut channels = ScriptedChannels {
+        opened: Vec::new(),
+        scripts: scripts.into(),
+    };
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let result = cmd::exec_over(
+        &mut channels,
+        request,
+        cmd::TtyAttach::Pipes,
+        None,
+        &mut stdout,
+        &mut stderr,
+    )
+    .await;
+    let opened = channels
+        .opened
+        .iter()
+        .map(|wire| minimald_rpc::exec::ExecRequest::parse(wire).expect("an exec form"))
+        .collect();
+    (ExecRun::of(result, &stdout, &stderr), opened)
+}
+
+/// An exec id as the daemon mints one.
+const AN_EXEC_ID: &str = "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f4a5b";
+
+/// The exec form `min box exec` sends for `argv` in `mode`.
+fn exec_form(
+    argv: &[&str],
+    mode: minimald_rpc::exec::ExecMode,
+    timeout_secs: Option<u64>,
+) -> minimald_rpc::exec::ExecRequest {
+    minimald_rpc::exec::ExecRequest::Exec(minimald_rpc::exec::ExecSpec {
+        argv: argv.iter().map(|word| (*word).to_owned()).collect(),
+        mode,
+        timeout_secs,
+    })
+}
+
+// BCLI-053: `min box exec web -- <cmd>` sends the command to the box as
+// BOX-149's attached exec, relays its stdout and stderr, and exits with its
+// code. Against a harness daemon, a box whose spec turns exec off is
+// refused with exit 5, and a box that is not running with exit 2, in every
+// mode, each in the CLI's own words. The command's span records the verb,
+// the box id and the outcome.
+#[tokio::test]
+async fn box_exec_runs_command_and_exits_with_its_code() {
+    use minimald_rpc::exec::ExecMode;
+
+    let argv = ["sh", "-c", "echo out; echo err >&2; exit 3"];
+    let (run, opened) = run_scripted_exec(
+        &box_exec_request("web", &[], &argv),
+        vec![answer(b"out\n", b"err\n", 3)],
+    )
+    .await;
+    assert_eq!(run.exit, 3, "{run}");
+    assert!(run.error.is_none(), "{run}");
+    assert_eq!(run.stdout, "out\n", "{run}");
+    assert_eq!(run.stderr, "err\n", "{run}");
+    assert_eq!(opened, [exec_form(&argv, ExecMode::Attached, None)]);
+
+    // A command's own stderr that reads like a refusal is still printed when
+    // its code is not the refusal's.
+    let (run, _) = run_scripted_exec(
+        &box_exec_request("web", &[], &["false"]),
+        vec![answer(
+            b"",
+            b"box web is stopped. Only a running box can run a command.\n",
+            1,
+        )],
+    )
+    .await;
+    assert_eq!(run.exit, 1, "{run}");
+    assert!(run.error.is_none(), "{run}");
+    assert!(run.stderr.contains("Only a running box"), "{run}");
+
+    let log = minimald::test_harness::captured_log();
+    let host = exec_host().await;
+    let marker = tempfile::tempdir().expect("a temp dir");
+    let marker = marker.path().join("exec-ran");
+    let touch = marker.to_str().expect("a UTF-8 path");
+    let modes: [&[&str]; 3] = [&[], &["--detach"], &["-t"]];
+    for flags in modes {
+        let run =
+            run_box_exec_on_host(&host, &box_exec_request("locked", flags, &["touch", touch]))
+                .await;
+        assert_eq!(run.exit, 5, "{flags:?}\n{run}");
+        assert_eq!(
+            run.message().as_deref(),
+            Some("locked does not allow exec (its spec sets [io] exec_enabled = false)."),
+            "{flags:?}\n{run}"
+        );
+        assert_eq!(run.stdout, "", "{flags:?}\n{run}");
+        assert_eq!(run.stderr, "", "{flags:?}: no other words\n{run}");
+        assert!(!marker.exists(), "{flags:?}: nothing ran\n{run}");
+    }
+
+    let mut out = Vec::new();
+    cmd::stop_box_on_hosts(local_hosts(&host.global).unwrap(), &mut out, "web", true)
+        .await
+        .expect("stop the box");
+    for flags in modes {
+        let run =
+            run_box_exec_on_host(&host, &box_exec_request("web", flags, &["touch", touch])).await;
+        assert_eq!(run.exit, 2, "{flags:?}\n{run}");
+        assert_eq!(
+            run.message().as_deref(),
+            Some("web is stopped. Only a running box can run a command."),
+            "{flags:?}\n{run}"
+        );
+        assert_eq!(run.stdout, "", "{flags:?}\n{run}");
+        assert_eq!(run.stderr, "", "{flags:?}: no other words\n{run}");
+        assert!(!marker.exists(), "{flags:?}: nothing ran\n{run}");
+    }
+
+    let log = log.contents();
+    for (id, outcome) in [(host.locked, "exec disabled"), (host.web, "not running")] {
+        let events = log
+            .lines()
+            .filter(|line| {
+                line.contains("verb=\"box exec\"")
+                    && line.contains(&format!("box_id={id}"))
+                    && line.contains(&format!("outcome=\"{outcome}\""))
+            })
+            .count();
+        assert_eq!(events, 3, "one `{outcome}` event for each mode\n{log}");
+    }
+}
+
+// BCLI-053: `min box exec -t` with a stdin that is not a terminal is refused
+// with exit 2 before the box resolves. The refusal says why and what to do,
+// and no exec starts in the box.
+#[tokio::test]
+async fn box_exec_tty_refuses_without_a_terminal() {
+    let log = minimald::test_harness::captured_log();
+    let host = exec_host().await;
+    let marker = tempfile::tempdir().expect("a temp dir");
+    let marker = marker.path().join("exec-ran");
+    let touch = marker.to_str().expect("a UTF-8 path");
+    for flags in [&["-t"][..], &["--tty"]] {
+        let request = box_exec_request("web", flags, &["touch", touch]);
+        let run = run_box_exec_on_host_with(&host, &request, false).await;
+        assert_eq!(run.exit, 2, "{flags:?}\n{run}");
+        assert_eq!(
+            run.message().as_deref(),
+            Some(
+                "Did not run the command in web: -t needs a terminal. \
+                 Stdin is not a terminal. Run `min box exec web -- <command>` \
+                 without -t, or run it from a terminal."
+            ),
+            "{flags:?}\n{run}"
+        );
+        assert_eq!(run.stdout, "", "{flags:?}\n{run}");
+        assert_eq!(run.stderr, "", "{flags:?}: no exec id, no output\n{run}");
+        assert!(!marker.exists(), "{flags:?}: nothing ran\n{run}");
+    }
+    let log = log.contents();
+    let refused = log
+        .lines()
+        .filter(|line| {
+            line.contains("verb=\"box exec\"") && line.contains("outcome=\"no terminal\"")
+        })
+        .count();
+    assert_eq!(refused, 2, "one `no terminal` event for each run\n{log}");
+}
+
+// BCLI-053: `min box exec -t` starts BOX-149's terminal exec, prints its
+// exec id to stderr, then attaches to it by that id and writes nothing but
+// the exec's output to stdout. It exits with the exec's code.
+#[tokio::test]
+async fn box_exec_tty_prints_exec_id_to_stderr() {
+    use minimald_rpc::exec::{ExecId, ExecMode, ExecRequest};
+
+    let argv = ["sh", "-c", "echo hello-tty; exit 4"];
+    let (run, opened) = run_scripted_exec(
+        &box_exec_request("web", &["-t"], &argv),
+        vec![
+            answer(format!("{AN_EXEC_ID}\n").as_bytes(), b"", 0),
+            answer(b"hello-tty\r\n", b"", 4),
+        ],
+    )
+    .await;
+    assert_eq!(run.exit, 4, "the exec's code\n{run}");
+    assert_eq!(run.stderr, format!("{AN_EXEC_ID}\n"), "{run}");
+    assert_eq!(run.stdout, "hello-tty\r\n", "only the exec's output\n{run}");
+    assert_eq!(
+        opened,
+        [
+            exec_form(&argv, ExecMode::Tty, None),
+            ExecRequest::ExecAttach(ExecId::parse(AN_EXEC_ID).unwrap()),
+        ]
+    );
+
+    let long = box_exec_request("web", &["--tty"], &["true"]);
+    assert_eq!(long.mode, ExecMode::Tty, "--tty is -t");
+    assert!(
+        Cli::try_parse_from(["min", "box", "exec", "web", "-t", "--detach", "--", "true"]).is_err(),
+        "-t and --detach do not go together"
+    );
+}
+
+// BCLI-053: `min box exec --detach` starts BOX-149's detached exec, prints
+// only its exec id to stdout, and returns without waiting for the command.
+// A start that runs nothing prints the reason on stderr and its code.
+#[tokio::test]
+async fn box_exec_detach_prints_id_and_returns() {
+    use minimald_rpc::exec::ExecMode;
+
+    let (run, opened) = run_scripted_exec(
+        &box_exec_request("web", &["--detach"], &["sleep", "600"]),
+        vec![answer(format!("{AN_EXEC_ID}\n").as_bytes(), b"", 0)],
+    )
+    .await;
+    assert_eq!(run.exit, 0, "{run}");
+    assert_eq!(
+        run.stdout,
+        format!("{AN_EXEC_ID}\n"),
+        "only the exec id\n{run}"
+    );
+    assert_eq!(run.stderr, "", "{run}");
+    assert_eq!(
+        opened,
+        [exec_form(&["sleep", "600"], ExecMode::Detached, None)],
+        "one channel, and no wait for the command"
+    );
+
+    let (run, _) = run_scripted_exec(
+        &box_exec_request("web", &["--detach"], &["nope"]),
+        vec![answer(
+            b"",
+            b"the command could not start in the box: nope\n",
+            1,
+        )],
+    )
+    .await;
+    assert_eq!(run.exit, 1, "{run}");
+    assert_eq!(run.stdout, "", "no exec id\n{run}");
+    assert_eq!(
+        run.stderr, "the command could not start in the box: nope\n",
+        "{run}"
+    );
+}
+
+// BCLI-053: `--timeout <duration>` takes seconds, minutes or hours, refuses
+// anything else, and asks for the exec's own timeout (BOX-149) in every
+// mode.
+#[tokio::test]
+async fn box_exec_timeout_flag_requests_exec_timeout() {
+    use minimald_rpc::exec::ExecMode;
+
+    for (flag, secs) in [("45", 45), ("30s", 30), ("5m", 300), ("1h", 3600)] {
+        let request = box_exec_request("web", &["--timeout", flag], &["sleep", "30"]);
+        assert_eq!(request.timeout_secs, Some(secs), "--timeout {flag}");
+    }
+    for refused in ["0", "0s", "abc", "-1", "1d", "s", ""] {
+        let flag = format!("--timeout={refused}");
+        let parsed = Cli::try_parse_from(["min", "box", "exec", "web", &flag, "--", "true"]);
+        let error = match parsed {
+            Ok(_) => panic!("--timeout {refused:?} is refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("such as 30s, 5m or 1h"),
+            "{refused:?}: {error}"
+        );
+    }
+
+    let (run, opened) = run_scripted_exec(
+        &box_exec_request("web", &["--timeout", "5m"], &["make"]),
+        vec![answer(b"", b"", 0)],
+    )
+    .await;
+    assert_eq!(run.exit, 0, "{run}");
+    assert_eq!(
+        opened,
+        [exec_form(&["make"], ExecMode::Attached, Some(300))]
+    );
+    let (run, opened) = run_scripted_exec(
+        &box_exec_request("web", &["--detach", "--timeout", "30"], &["make"]),
+        vec![answer(format!("{AN_EXEC_ID}\n").as_bytes(), b"", 0)],
+    )
+    .await;
+    assert_eq!(run.exit, 0, "{run}");
+    assert_eq!(opened, [exec_form(&["make"], ExecMode::Detached, Some(30))]);
+    let (run, opened) = run_scripted_exec(
+        &box_exec_request("web", &["-t", "--timeout", "1h"], &["make"]),
+        vec![
+            answer(format!("{AN_EXEC_ID}\n").as_bytes(), b"", 0),
+            answer(b"", b"", 0),
+        ],
+    )
+    .await;
+    assert_eq!(run.exit, 0, "{run}");
+    assert_eq!(opened[0], exec_form(&["make"], ExecMode::Tty, Some(3600)));
+}
+
+// BCLI-053: an exec that its own timeout ended returns 124 from `min box
+// exec` in each mode that waits for it, and from the wait for the exec by
+// its id, as the timeout failure that a machine-mode run answers with
+// `code = "timeout"`. A command that exits 124 by itself is not one.
+#[tokio::test]
+async fn exec_timeout_returns_124_from_exec_and_wait_exec() {
+    use minimald_rpc::exec::{ExecId, ExecRequest};
+
+    // Attached: the daemon ends the exec with 124 at the timeout.
+    let mut ended = answer(b"", b"", 124);
+    ended.delay = std::time::Duration::from_secs(1);
+    let (run, _) = run_scripted_exec(
+        &box_exec_request("web", &["--timeout", "1"], &["sleep", "30"]),
+        vec![ended],
+    )
+    .await;
+    assert_eq!(run.exit, 124, "{run}");
+    assert!(
+        run.error
+            .as_ref()
+            .is_some_and(|e| e.downcast_ref::<BoxExecTimedOut>().is_some()),
+        "{run}"
+    );
+    assert_eq!(
+        run.message().as_deref(),
+        Some("The command in web ran for longer than its timeout of 1s and was stopped."),
+        "{run}"
+    );
+    let (run, _) = run_scripted_exec(
+        &box_exec_request("web", &["--timeout", "60"], &["sh", "-c", "exit 124"]),
+        vec![answer(b"", b"", 124)],
+    )
+    .await;
+    assert_eq!(run.exit, 124, "{run}");
+    assert!(run.error.is_none(), "exit 124 before the timeout\n{run}");
+
+    // With a terminal: the attach ends with 124, and the exec's wait says
+    // why, in the daemon's words.
+    let id = ExecId::parse(AN_EXEC_ID).unwrap();
+    let timed_out = format!("exec {AN_EXEC_ID} ran past its timeout and was stopped.\n");
+    let (run, opened) = run_scripted_exec(
+        &box_exec_request("web", &["-t", "--timeout", "1"], &["sleep", "30"]),
+        vec![
+            answer(format!("{AN_EXEC_ID}\n").as_bytes(), b"", 0),
+            answer(b"", b"", 124),
+            answer(b"", timed_out.as_bytes(), 124),
+        ],
+    )
+    .await;
+    assert_eq!(run.exit, 124, "{run}");
+    assert_eq!(
+        run.message().as_deref(),
+        Some(
+            format!("Exec {AN_EXEC_ID} in web ran for longer than its timeout and was stopped.")
+                .as_str()
+        ),
+        "{run}"
+    );
+    assert_eq!(opened.last(), Some(&ExecRequest::ExecWait(id.clone())));
+
+    // The wait for an exec by its id, as `min box wait <box> --exec <id>`
+    // makes it.
+    for (said, status, timeout) in [
+        (timed_out.as_str(), 124, true),
+        ("", 124, false),
+        ("", 7, false),
+    ] {
+        let mut channels = ScriptedChannels {
+            opened: Vec::new(),
+            scripts: vec![answer(b"", said.as_bytes(), status)].into(),
+        };
+        let mut stderr = Vec::new();
+        let waited = cmd::wait_exec_over(&mut channels, "web", &id, &mut stderr).await;
+        let run = ExecRun::of(waited, b"", &stderr);
+        assert_eq!(run.exit, u8::try_from(status).unwrap(), "{run}");
+        assert_eq!(
+            run.error
+                .as_ref()
+                .is_some_and(|e| e.downcast_ref::<BoxExecTimedOut>().is_some()),
+            timeout,
+            "{run}"
+        );
+        assert_eq!(run.stderr, "", "{run}");
+        assert_eq!(
+            channels.opened,
+            [ExecRequest::ExecWait(id.clone()).encode()],
+            "{run}"
+        );
+    }
+}
+
 /// A harness daemon under `state` that the native host's socket serves,
 /// with the global flags that select it, as the first-slice test sets
 /// them up.
@@ -8433,5 +9288,124 @@ fn none_box_hold_is_released_by_destroy_and_moved_by_rename() {
     assert!(
         !crate::holds_name(&hold_record(boxes::NetworkMode::NoNet, Some(row))),
         "a box with a row owns its name through the row"
+    );
+}
+
+/// NET-022: a held port that frees after the VM start publishes on the VM
+/// host daemon only, so the guest reply carries no proxy port. The BOX NAMES
+/// row then reads the port the VM host daemon serves on, and says the names
+/// open through it, on one VM and across VMs. While the port is held, the
+/// row names the cause.
+#[test]
+fn ls_warning_clears_on_recovery_with_no_guest_port() {
+    let mut resp = listing_of(&[("web", None, None)]);
+    resp.hostname_proxy_port = None;
+    resp.answerer_bound = true;
+    let held = minimald_rpc::AnswererStatusReply {
+        answerer: minimald_rpc::ZoneAnswererStatus::Registered { port: 7_656 },
+        proxy_down: Some(minimald_rpc::ProxyDown {
+            port: 7_654,
+            cause: minimald_rpc::ProxyDownCause::PortHeldAfterStart {
+                holder: Some("pid 4242 (python3)".to_string()),
+            },
+        }),
+    };
+    let recovered = minimald_rpc::AnswererStatusReply {
+        answerer: minimald_rpc::ZoneAnswererStatus::Registered { port: 7_656 },
+        proxy_down: None,
+    };
+    let render = |reply: minimald_rpc::AnswererStatusReply, ports: &[u16]| {
+        let mut out = Vec::new();
+        cmd::format_ls_with_proxy_ports_on(
+            &mut out,
+            &LsArgs {
+                raw: false,
+                json: false,
+            },
+            &resp,
+            Some(crate::resolver::LiveSurface::Proxy),
+            Some(reply),
+            ports,
+            crate::resolver::HostInstall::default(),
+        )
+        .expect("rendering the listing");
+        String::from_utf8(out).expect("the listing is UTF-8")
+    };
+    let box_names = |text: &str| {
+        text.lines()
+            .find(|line| line.starts_with("BOX NAMES:"))
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("a BOX NAMES row:\n{text}"))
+    };
+
+    let before = render(held.clone(), &[]);
+    assert!(
+        box_names(&before).contains("the hostname proxy is not serving: pid 4242 (python3)"),
+        "the held port names its cause:\n{before}"
+    );
+
+    let after = render(recovered.clone(), &[7_654]);
+    assert!(
+        !after.contains("not serving"),
+        "the cause clears once the port frees:\n{after}"
+    );
+    assert!(
+        box_names(&after).contains("127.0.0.1:7654"),
+        "the row names the port the proxy serves on:\n{after}"
+    );
+    assert!(
+        after.contains("HOSTNAME PROXY:  listening on 127.0.0.1:7654"),
+        "the HOSTNAME PROXY row names the served port:\n{after}"
+    );
+
+    // Across VMs, each VM reads its own served ports.
+    let listings = [
+        cmd::VmListing {
+            vm: "default".to_string(),
+            resp: resp.clone(),
+            control_sock: None,
+            running: true,
+        },
+        cmd::VmListing {
+            vm: "other".to_string(),
+            resp: resp.clone(),
+            control_sock: None,
+            running: true,
+        },
+    ];
+    let mut out = Vec::new();
+    cmd::format_ls_across_vms_with_proxy_ports_on(
+        &mut out,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        &listings,
+        &[
+            Some(crate::resolver::LiveSurface::Proxy),
+            Some(crate::resolver::LiveSurface::Proxy),
+        ],
+        &[Some(recovered), Some(held)],
+        &[vec![7_654], vec![]],
+        crate::resolver::HostInstall::default(),
+    )
+    .expect("rendering the listing");
+    let across = String::from_utf8(out).expect("the listing is UTF-8");
+    let rows: Vec<&str> = across
+        .lines()
+        .filter(|line| line.starts_with("BOX NAMES:"))
+        .collect();
+    assert_eq!(rows.len(), 2, "one BOX NAMES row per VM:\n{across}");
+    assert!(
+        rows[0].contains("default") && rows[0].contains("127.0.0.1:7654"),
+        "the recovered VM names its served port:\n{across}"
+    );
+    assert!(
+        !rows[0].contains("not serving"),
+        "the recovered VM carries no cause:\n{across}"
+    );
+    assert!(
+        rows[1].contains("other") && rows[1].contains("not serving"),
+        "the held VM keeps its cause:\n{across}"
     );
 }
