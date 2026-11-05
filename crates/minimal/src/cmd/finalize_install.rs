@@ -3657,6 +3657,9 @@ mod tests {
             std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755))
                 .expect("an executable stub");
 
+            // The daemon's socket is under the root too, so every path the
+            // block acts on is the root's.
+            let sock = root.path().join("home/alice/ssh.sock");
             let item = classifier_item_over(
                 &ClassifierFacts {
                     table_present: false,
@@ -3670,7 +3673,7 @@ mod tests {
                     unplaced_daemon: None,
                 },
                 "alice",
-                "/home/alice/ssh.sock",
+                sock.to_str().expect("the temp root is UTF-8"),
             );
             let plan = Plan { items: vec![item] };
             let script = plan
@@ -3680,17 +3683,9 @@ mod tests {
                 .replace(ANSWERER_PROGRAM_DIR, &lib.display().to_string())
                 .replace("/etc/systemd/system", &units.display().to_string())
                 .replace("/var/lib/minimal", &var.display().to_string());
-            let path = format!(
-                "{}:{}",
-                bin.display(),
-                std::env::var("PATH").unwrap_or_default()
-            );
-            let output = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(&script)
-                .env("PATH", path)
-                .output()
-                .expect("sh runs the block");
+            // The guard refuses a block that still names a host path, and
+            // `bin` holds the systemctl stub ahead of the other stand-ins.
+            let output = crate::resolver::tests::run_confined(root.path(), &bin, &script);
             (root, output.status.code(), copy, units)
         }
 

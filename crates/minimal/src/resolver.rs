@@ -5407,7 +5407,7 @@ pub(crate) async fn naming_surface() -> NamingSurface {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 
     // T126 (NET-138): `min session activate` of a `host_ip` box on a VM host
     // reads the collided mirror ports over the VM host daemon's control
@@ -6708,7 +6708,7 @@ mod tests {
     /// `root`, so a test that renders a script for the host fails here.
     /// It never reaches `rm`. Every tool in [`HOST_TOOLS`] that `stubs`
     /// lacks gets a stand-in that exits 1.
-    fn run_confined(
+    pub(crate) fn run_confined(
         root: &std::path::Path,
         stubs: &std::path::Path,
         script: &str,
