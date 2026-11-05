@@ -6424,13 +6424,16 @@ impl BoxRegistry {
             .write()
             .expect("the resident host_ip boxes' lock is never held across a panic");
         // Rules a reconcile set aside go too: a destroyed box is never
-        // admitted again ([`Self::reconcile_host_ip_boxes`]).
-        resident.dormant.remove(&session_id);
+        // admitted again ([`Self::reconcile_host_ip_boxes`]). They still
+        // decide whether the destroy revokes: a box the guest stopped holds
+        // its rules there alone (BEP-043).
+        let dormant_rules = resident.dormant.remove(&session_id);
         resident.admitted_at.remove(&session_id);
         let removed_rules = resident.boxes.remove(&session_id);
         let removed = removed_rules.is_some();
         let credentialed = removed_rules
             .as_deref()
+            .or(dormant_rules.as_deref())
             .is_some_and(HostIpBoxRules::declares_credentialed_upstream);
         if removed {
             resident.cohort = HostIpBoxes::cohort_record(&resident.boxes, self.subnet);
@@ -13750,6 +13753,97 @@ mod tests {
                 serde_json::json!({"op": "forget_box", "box_id": hex}),
             ],
             "the destroy of the stopped box revokes its id"
+        );
+    }
+
+    // BEP-043: a grant box the guest stopped has its rules set aside by a
+    // reconcile, and a client's destroy of it still revokes its id.
+    #[test]
+    fn a_destroyed_dormant_grant_box_revokes_its_id() {
+        let registry = BoxRegistry::new(SUBNET);
+        let id = registry
+            .register_host_ip_box_as("asleep", [0x3d; 16])
+            .expect("no record holds the id");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let server = stub_control(&path, &["{\"ok\":true}\n", "{\"ok\":true}\n"]);
+        let wired = registry.clone().with_proxy_control(Some(path));
+        let session = boxes::SessionId::from_bytes(id);
+        assert!(wired.admit_host_ip_box_with_lane(session, None, true));
+        let guest = BTreeMap::from([(session, boxes::BoxState::Stopped)]);
+        let outcome = wired.reconcile_host_ip_boxes(
+            &guest,
+            wired.host_ip_admit_mark(),
+            HostIpReconcileTrigger::BoxEvent,
+        );
+        assert_eq!(outcome.dropped, vec![session], "the rules go dormant");
+
+        assert!(!wired.retire_host_ip_box(session, HostIpBoxEnd::Destroyed));
+        assert!(
+            revocation_spawned(id),
+            "the destroy of the dormant box revokes"
+        );
+        let hex = "3d".repeat(16);
+        assert_eq!(
+            server.join().unwrap(),
+            [
+                serde_json::json!({"op": "revoke_box", "box_id": hex}),
+                serde_json::json!({"op": "forget_box", "box_id": hex}),
+            ],
+            "the destroy of the dormant box revokes its id"
+        );
+    }
+
+    // BEP-043: the stop of a grant box whose rules a reconcile set aside
+    // revokes nothing, and the destroy that follows revokes its id.
+    #[test]
+    fn a_stopped_dormant_grant_box_revokes_at_its_destroy() {
+        let registry = BoxRegistry::new(SUBNET);
+        let id = registry
+            .register_host_ip_box_as("dozing", [0x2e; 16])
+            .expect("no record holds the id");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let wired = registry.clone().with_proxy_control(Some(path.clone()));
+        let session = boxes::SessionId::from_bytes(id);
+        assert!(wired.admit_host_ip_box_with_lane(session, None, true));
+        let guest = BTreeMap::from([(session, boxes::BoxState::Stopped)]);
+        let outcome = wired.reconcile_host_ip_boxes(
+            &guest,
+            wired.host_ip_admit_mark(),
+            HostIpReconcileTrigger::BoxEvent,
+        );
+        assert_eq!(outcome.dropped, vec![session], "the rules go dormant");
+
+        assert!(!wired.retire_host_ip_box(session, HostIpBoxEnd::Stopped));
+        assert!(
+            !revocation_spawned(id),
+            "the stop of a dormant grant box revokes nothing"
+        );
+        assert_eq!(
+            listener.accept().map(|_| ()).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the stop of a dormant grant box sends nothing to the proxy"
+        );
+
+        drop(listener);
+        std::fs::remove_file(&path).unwrap();
+        let server = stub_control(&path, &["{\"ok\":true}\n", "{\"ok\":true}\n"]);
+        assert!(!wired.retire_host_ip_box(session, HostIpBoxEnd::Destroyed));
+        assert!(
+            revocation_spawned(id),
+            "the destroy of the stopped dormant box revokes"
+        );
+        let hex = "2e".repeat(16);
+        assert_eq!(
+            server.join().unwrap(),
+            [
+                serde_json::json!({"op": "revoke_box", "box_id": hex}),
+                serde_json::json!({"op": "forget_box", "box_id": hex}),
+            ],
+            "the destroy of the stopped dormant box revokes its id"
         );
     }
 
