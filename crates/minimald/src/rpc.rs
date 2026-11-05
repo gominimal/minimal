@@ -486,23 +486,14 @@ async fn serve_create_session(
             // the manager consumes it, and the stored record's egress is what
             // the counts below report beside the "session created" line.
             let egress_counts = EgressRuleCounts::of(&req.config.policy);
-            // NET-079: this host's verdict on whether it can decide a
-            // host-address box's egress per box — the daemon's one node
-            // fact, seeded by the start-up read and refreshed by each
-            // host-address launch's re-read, read here rather than re-probed,
-            // because a create is not a place that decides a box: the launch
-            // that follows reads the host again, over the same tree and the
-            // same table, before it places anything, and records its own
-            // outcome on the session record this create is minting. The
-            // advisory the fact yields rides the reply to the start that is
-            // about to rely on the host's decision, and the enforcement is
-            // the same derivation every read surface answers through — over
-            // the declaration the config carries and with no launch record
-            // to show yet, so the fact is the best either half of the daemon
-            // knows about the box that is coming, and the launch's own
-            // refusal gate holds here too: a create under a probe cause
-            // refuses the box the same way its launch would, and carries
-            // no enforcement value anywhere.
+            // NET-079: the advisory and the enforcement the reply states are
+            // read off the daemon's one node fact once the manager has
+            // created the box (below), not before: the manager's create
+            // re-reads the host when the stored fact says the start-up
+            // probe could not read the table, and the reply must answer
+            // over that re-read. The launch that follows reads the host
+            // again for its own gate, and its refusal holds whatever the
+            // create said.
             //
             // Nothing is recorded at create: only a launch writes the
             // outcome, on the daemon-owned record field. The one key a
@@ -525,21 +516,9 @@ async fn serve_create_session(
                     error: refused.to_string(),
                 });
             }
-            let fact = crate::box_runtime::host_ip_enforcement_fact();
-            let classifier_cause = fact.cause;
-            let classifier_advisory = create_classifier_advisory(
-                in_microvm,
-                req.config.network,
-                classifier_cause,
-                req.config.policy.egress.as_ref(),
-            );
-            let host_ip_enforcement = crate::box_runtime::displayed_host_ip_enforcement(
-                in_microvm,
-                req.config.network,
-                classifier::verdict_of(req.config.policy.egress.as_ref()),
-                &fact,
-                None,
-            );
+            // The declaration the reply's advisory reads, kept because the
+            // manager consumes the config.
+            let egress = req.config.policy.egress.clone();
             req.config.attrs.remove(HOST_IP_ENFORCEMENT_ATTR);
 
             // The session remembers its creator, so an attach from another
@@ -569,6 +548,26 @@ async fn serve_create_session(
                     // the gating prompt) — see [`ConnectionHandle`] and the
                     // teardown reap in `server.rs`.
                     conn.record_created_session(id).await;
+                    // The fact as the manager's create left it: re-read
+                    // there when the start-up probe could not read the
+                    // table (`create_host_ip_fact`), so a reading taken
+                    // before the daemon stood in its leaf never reaches
+                    // the reply.
+                    let fact = crate::box_runtime::host_ip_enforcement_fact();
+                    let classifier_cause = fact.cause;
+                    let classifier_advisory = create_classifier_advisory(
+                        in_microvm,
+                        network,
+                        classifier_cause,
+                        egress.as_ref(),
+                    );
+                    let host_ip_enforcement = crate::box_runtime::displayed_host_ip_enforcement(
+                        in_microvm,
+                        network,
+                        classifier::verdict_of(egress.as_ref()),
+                        &fact,
+                        None,
+                    );
                     tracing::info!(
                         session_id = %id,
                         session_name = session_name.as_deref().unwrap_or(ANONYMOUS_SESSION),
