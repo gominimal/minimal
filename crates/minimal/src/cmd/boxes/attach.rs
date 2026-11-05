@@ -799,22 +799,7 @@ where
     let after = match code {
         0 => box_after_attach_settled(&target.host, target.box_id, ENTRYPOINT_END_SETTLE).await,
         DAEMON_ENDED_ATTACH => {
-            // A stop most often records within the first bound. A box that
-            // still runs then can wait the whole of DAEMON_END_SETTLE, so
-            // the person sees why the terminal is quiet.
-            let first =
-                box_after_attach_settled(&target.host, target.box_id, DAEMON_END_QUIET).await;
-            if matches!(&first, BoxAfterAttach::Listed(entry) if entry.state == "running") {
-                eprintln!("{}", daemon_end_wait_line(&target.label));
-                box_after_attach_settled(
-                    &target.host,
-                    target.box_id,
-                    DAEMON_END_SETTLE.saturating_sub(DAEMON_END_QUIET),
-                )
-                .await
-            } else {
-                first
-            }
+            box_after_attach_settled(&target.host, target.box_id, DAEMON_END_SETTLE).await
         }
         SSH_CONNECTION_FAILED => box_after_attach(&target.host, target.box_id).await,
         _ => BoxAfterAttach::Unread,
@@ -1016,22 +1001,9 @@ pub(crate) const ENTRYPOINT_END_SETTLE: std::time::Duration = std::time::Duratio
 /// channel before the daemon writes the record. A stop writes it only once
 /// the entrypoint and every process in the box ended, or after its grace
 /// period and one more probe bound. A box that still runs at the bound lost
-/// its terminal to another attach. A takeover waits the whole bound, after
-/// [`daemon_end_wait_line`].
+/// its terminal to another attach. A takeover waits the whole bound.
 pub(crate) const DAEMON_END_SETTLE: std::time::Duration =
     minimald_rpc::STOP_GRACE.saturating_add(minimald_rpc::HOST_PROBE_TIMEOUT);
-
-/// How long the read after a 254 waits with nothing on the terminal. A box
-/// that still reads `running` then gets [`daemon_end_wait_line`] before the
-/// rest of [`DAEMON_END_SETTLE`].
-pub(crate) const DAEMON_END_QUIET: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// The line a 254 prints when the box still reads `running` after
-/// [`DAEMON_END_QUIET`]: the attach ended, and the command waits to read why.
-pub(crate) fn daemon_end_wait_line(label: &str) -> String {
-    let left = DAEMON_END_SETTLE.saturating_sub(DAEMON_END_QUIET).as_secs();
-    format!("Detached from {label}. Checking why. This can take up to {left} seconds.")
-}
 
 /// How often the settled read asks the host again.
 const SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
@@ -1138,18 +1110,6 @@ mod tests {
     use super::*;
     use boxes::{DynamicIngress, IngressPolicy, NetworkMode};
     use minimal_client::box_registration::{RegisteredWithVmHost, register_box_for_activation};
-
-    /// A 254 against a box that still runs waits up to the stop's grace
-    /// period. The terminal says so after the quiet bound, with the box's
-    /// name and the wait that is left (BCLI-068).
-    #[test]
-    fn daemon_end_wait_line_names_the_box_and_the_wait() {
-        assert!(DAEMON_END_QUIET < DAEMON_END_SETTLE);
-        assert_eq!(
-            daemon_end_wait_line("web"),
-            "Detached from web. Checking why. This can take up to 11 seconds."
-        );
-    }
 
     /// A box whose record was read and carries no address pair registered no
     /// row with the VM host daemon: the attach gets no subscription target,
