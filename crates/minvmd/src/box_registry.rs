@@ -8354,11 +8354,11 @@ impl BoxTable {
 /// The guest node namespace's row is not one of them, so it buys no
 /// share (see the [`BepBoxSource`](switch::bep_host::BepBoxSource)
 /// impl) — and it holds no attachment either, so a delivery from it
-/// names nothing. The host's own address outside the box host — the
-/// cohort address host-address boxes arrive from (NET-078) — is a row
-/// like a box's when the host published one there: its attachment is
-/// the cohort's, and a delivered connection from it carries the
-/// cohort's id.
+/// names nothing, until the `host_ip` cohort's lane opens. The resident
+/// host-address boxes send from the node address. While one of them
+/// declares a credentialed upstream, the node address is the cohort's
+/// source: it holds a share, and a delivered connection from it carries
+/// the reserved cohort id (BEP-084).
 pub struct RegisteredBoxes {
     /// The registry's live read-only view: every registration and
     /// withdrawal the table sees reaches the pool through it.
@@ -8406,12 +8406,28 @@ impl switch::bep_host::BepBoxSource for RegisteredBoxes {
         // carries. A source with no attachment — the node namespace
         // above all, which holds none — names nothing, and the pool
         // aborts what it accepts from it rather than deliver a
-        // connection it cannot attribute. The host's cohort row
-        // (NET-078) holds one like any box's, so a host-address box's
-        // delivery carries the cohort's own id.
+        // connection it cannot attribute.
+        //
+        // BEP-084: the node address is the `host_ip` cohort's, shared by
+        // every resident host-address box. While a lane member is
+        // resident it answers the reserved cohort id, never a member's.
+        if self.cohort_source() == Some(source) {
+            return Some(switch::bep_host::COHORT_BOX_ID);
+        }
         self.attachments
             .by_source(source.octets())
             .map(|attachment| attachment.box_id())
+    }
+
+    fn cohort_source(&self) -> Option<Ipv4Addr> {
+        // The cohort's lane is open while one resident `host_ip` box
+        // declares a credentialed upstream (BEP-083), the same count the
+        // gate opens the proxy's address by.
+        self.table
+            .host_ip_boxes()
+            .iter()
+            .any(|rules| rules.declares_credentialed_upstream())
+            .then(|| self.table.subnet().daemon_ip())
     }
 }
 
