@@ -106,7 +106,9 @@ use std::process::{Command, Output};
 use std::time::Duration;
 
 use boxes::BoxPolicy;
-use minimald::net::classifier::{QUIC443_BLOCKED_DIR, QUIC443_LEAF_SET, quic443_blocked_leaf};
+use minimald::net::classifier::{
+    PROXY_LANE_SET, QUIC443_BLOCKED_DIR, QUIC443_LEAF_SET, quic443_blocked_leaf,
+};
 use minimald::net::switch::{BoxGate, attach_to_switch, open_tap, tap_netns_commands};
 use minimald::net::{PtaskLease, SwitchClient, SwitchSubnet};
 use minimald::nsenter::GROUP_GRACE;
@@ -2425,6 +2427,8 @@ struct Quic443Scratch {
     mountpoint: PathBuf,
     helper_dir: PathBuf,
     leaf: Option<PathBuf>,
+    /// Further box leaves a leg makes, removed with `leaf`.
+    more_leaves: Vec<PathBuf>,
 }
 
 impl Quic443Scratch {
@@ -2488,13 +2492,18 @@ impl Quic443Scratch {
 
     /// The elements of the blocked-leaves set in the loaded table.
     fn listed_set(&self) -> String {
+        self.listed(QUIC443_LEAF_SET)
+    }
+
+    /// The elements of the set `set` in the loaded table.
+    fn listed(&self, set: &str) -> String {
         let out = quic443_privileged("nft")
-            .args(["list", "set", "inet", QUIC443_TABLE, QUIC443_LEAF_SET])
+            .args(["list", "set", "inet", QUIC443_TABLE, set])
             .output()
-            .expect("listing the blocked-leaves set");
+            .expect("listing a set of the loaded table");
         assert!(
             out.status.success(),
-            "nft lists the set {QUIC443_LEAF_SET}: {}",
+            "nft lists the set {set}: {}",
             String::from_utf8_lossy(&out.stderr),
         );
         String::from_utf8_lossy(&out.stdout).into_owned()
@@ -2521,6 +2530,9 @@ impl Drop for Quic443Scratch {
             eprintln!("could not return this proof process to the cgroup2 root");
         }
         if let Some(leaf) = self.leaf.take() {
+            let _ = sandbox::classifier::remove_box_leaf(&leaf);
+        }
+        for leaf in self.more_leaves.drain(..) {
             let _ = sandbox::classifier::remove_box_leaf(&leaf);
         }
         match self.installer().arg("--uninstall").output() {
@@ -2638,6 +2650,7 @@ fn a_blocked_cohort_rejects_a_pre_flip_udp_443_socket() {
         mountpoint,
         helper_dir,
         leaf: None,
+        more_leaves: Vec::new(),
     };
     // Outside the tree, so it never holds a cgroup the cleanup removes.
     // Declared after the scratch, so it stops before the scratch goes.
@@ -2783,4 +2796,321 @@ fn a_blocked_cohort_rejects_a_pre_flip_udp_443_socket() {
     drop(scratch);
     drop(lock);
     quic443_step("step 9: the table, the helper and the scratch tree are removed");
+}
+
+/// The leg's name, as nextest and the NOT RUN line spell it.
+const LANE_LEG: &str = "only_the_declaring_cohort_member_reaches_the_proxy_address";
+
+/// The stand-in proxy address: a loopback address of this network
+/// namespace that nothing else on the host listens on.
+const LANE_ADDRESS: std::net::Ipv4Addr = std::net::Ipv4Addr::new(127, 0, 0, 2);
+
+/// One line per step of the lane leg, on the proof's own stderr.
+fn lane_step(text: &str) {
+    eprintln!("{LANE_LEG}: {text}");
+}
+
+/// The NOT RUN record for a gate this host does not meet.
+fn lane_not_run(gate: &str) {
+    let line = format!("NOT RUN {LANE_LEG}: {gate}");
+    eprintln!("{line}");
+    tell_the_runner(&line);
+}
+
+/// A root-bound TCP listener on the stand-in proxy address, at the proxy's
+/// listener port and at 443, run as `python3` through the root reach:
+/// port 443 is privileged. It accepts each connection and closes it.
+struct LaneListener {
+    child: std::process::Child,
+}
+
+impl LaneListener {
+    fn spawn(ports: [u16; 2]) -> Self {
+        let script = format!(
+            "import socket, select\n\
+             ls = []\n\
+             for port in ({}, {}):\n    \
+                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n    \
+                 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n    \
+                 s.bind(('{LANE_ADDRESS}', port))\n    \
+                 s.listen(16)\n    \
+                 ls.append(s)\n\
+             print('ready', flush=True)\n\
+             while True:\n    \
+                 for s in select.select(ls, [], [])[0]:\n        \
+                     s.accept()[0].close()\n",
+            ports[0], ports[1]
+        );
+        let mut child = quic443_privileged("python3")
+            .args(["-u", "-c", &script])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .expect("spawning the root-bound TCP listener (python3)");
+        let mut stdout = child.stdout.take().expect("the listener's stdout");
+        let (send, ready) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::Read as _;
+            let mut line = [0u8; 6];
+            let _ = send.send(stdout.read_exact(&mut line).map(|()| line));
+            // Hold the pipe open, so the listener's prints never fail.
+            let _ = std::io::copy(&mut stdout, &mut std::io::sink());
+        });
+        assert!(
+            matches!(
+                ready.recv_timeout(Duration::from_secs(10)),
+                Ok(Ok(line)) if &line == b"ready\n"
+            ),
+            "the TCP listener binds {LANE_ADDRESS} at ports {ports:?} (is something \
+             already bound there?)"
+        );
+        Self { child }
+    }
+}
+
+impl Drop for LaneListener {
+    fn drop(&mut self) {
+        // SIGTERM, not SIGKILL: sudo relays SIGTERM to python3.
+        let Ok(pid) = libc::pid_t::try_from(self.child.id()) else {
+            return;
+        };
+        // SAFETY: `kill(2)` addresses this proof's own child.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        for _ in 0..50 {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The errno of one TCP connect to the stand-in proxy address at `port`,
+/// from a socket created now, in the cgroup this process is in. `None`
+/// when the connection is accepted.
+fn lane_connect(port: u16) -> Option<i32> {
+    let to = std::net::SocketAddr::from((LANE_ADDRESS, port));
+    std::net::TcpStream::connect_timeout(&to, Duration::from_secs(5))
+        .err()
+        .map(|e| e.raw_os_error().unwrap_or(-1))
+}
+
+/// BEP-083, live on this kernel against the installer's table rendered
+/// with `--proxy-lane`: of two host-address members in their own leaves,
+/// only the one whose leaf is in the lane set connects to the proxy's
+/// address, at the listener port and at 443. The other is refused at once
+/// with EHOSTUNREACH. Both hold while the cohort blocks UDP 443, when the
+/// lane-less member runs in the blocked leaf and the lane member stays in
+/// its own leaf, and while the cohort does not block.
+///
+/// The proof process plays both members: it moves itself into a member's
+/// cgroup and opens each connection there, so the socket carries that
+/// cgroup. Gated like the QUIC leg beside it.
+#[test]
+#[ignore = "loads the installer's nftables table over this host's real cgroup2; gated on MINIMALD_NETNS_TEST; runs in the native lane's minimald-root-integration job"]
+fn only_the_declaring_cohort_member_reaches_the_proxy_address() {
+    use std::os::unix::io::AsRawFd as _;
+
+    if !gated() {
+        return;
+    }
+    let has_nft = Command::new("nft")
+        .arg("--version")
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if !has_nft {
+        lane_not_run("no nft on this host (apt install nftables)");
+        return;
+    }
+    assert!(
+        quic443_as_root()
+            || quic443_privileged("true")
+                .status()
+                .is_ok_and(|status| status.success()),
+        "the install and the helper need root: run the lane's recipe under \
+         sudo, or give this account passwordless sudo"
+    );
+    match quic443_in_root_netns() {
+        Some(true) => {}
+        Some(false) => {
+            lane_not_run("this process is not in the root network namespace");
+            return;
+        }
+        None => {
+            lane_not_run("the root network namespace cannot be read on this host");
+            return;
+        }
+    }
+    announce_to_the_runner(LANE_LEG);
+
+    // One table at a time across binaries and legs.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(std::env::temp_dir().join("minimald-classifier-root-proof.lock"))
+        .expect("the classifier proofs' lock file");
+    // SAFETY: `flock(2)` on the descriptor just opened. The kernel releases
+    // the lock when the descriptor closes at the end of the leg.
+    let taken = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+    assert_eq!(taken, 0, "locking the classifier proofs against each other");
+
+    assert!(
+        !Path::new(sandbox::classifier::TREE_ROOT).exists(),
+        "a classifier tree is already installed at {}: this leg never runs \
+         over a host's own install",
+        sandbox::classifier::TREE_ROOT
+    );
+    assert!(
+        !quic443_privileged("nft")
+            .args(["list", "table", "inet", QUIC443_TABLE])
+            .output()
+            .is_ok_and(|out| out.status.success()),
+        "a table named {QUIC443_TABLE} is already loaded: this leg never \
+         replaces a host's own table"
+    );
+    let mountpoint =
+        quic443_cgroup2_mount().expect("no cgroup2 mounted with nsdelegate on this host");
+    let account = quic443_delegated_account();
+    let helper_dir = quic443_helper_dir();
+    let mut scratch = Quic443Scratch {
+        root: mountpoint.join(format!("minimald-lane-proof-{}", std::process::id())),
+        mountpoint,
+        helper_dir,
+        leaf: None,
+        more_leaves: Vec::new(),
+    };
+    let listener_port = boxes::core::egress::PROXY_LISTENER_PORT;
+    let ports = [listener_port, 443];
+    // Outside the tree. Declared after the scratch, so it stops first.
+    let listener = LaneListener::spawn(ports);
+    lane_step(&format!(
+        "step 1: a TCP listener is on {LANE_ADDRESS} at ports {ports:?}"
+    ));
+
+    let installed = scratch
+        .installer()
+        .arg("--user")
+        .arg(&account)
+        .arg("--proxy-lane")
+        .arg(format!("{LANE_ADDRESS}:{listener_port}"))
+        .output()
+        .expect("running the install over the scratch tree");
+    assert!(
+        installed.status.success(),
+        "the install with --proxy-lane loads its table: {}{}",
+        String::from_utf8_lossy(&installed.stdout),
+        String::from_utf8_lossy(&installed.stderr),
+    );
+    let placed = scratch
+        .installer()
+        .arg("--pid")
+        .arg(std::process::id().to_string())
+        .output()
+        .expect("running the step's placement half");
+    assert!(
+        placed.status.success(),
+        "placing this proof process in the scratch tree's daemon leaf: {}",
+        String::from_utf8_lossy(&placed.stderr),
+    );
+    lane_step(&format!(
+        "step 2: the installer loaded table inet {QUIC443_TABLE} with the proxy lane over {}",
+        scratch.root.display()
+    ));
+
+    let make_leaf = |name: &str| {
+        sandbox::classifier::create_box_leaf(
+            &scratch.root,
+            &format!("lane-proof-{name}-{}", std::process::id()),
+            sandbox::config::Verdict::Allow,
+        )
+        .unwrap_or_else(|e| panic!("creating the {name} member's own leaf: {e}"))
+    };
+    let grant = make_leaf("grant");
+    scratch.leaf = Some(grant.clone());
+    let plain = make_leaf("plain");
+    scratch.more_leaves.push(plain.clone());
+    scratch.helper_on_leaf("lane-add", &grant);
+    let grant_rel = grant
+        .strip_prefix(&scratch.mountpoint)
+        .expect("the leaf is under the cgroup2 mount")
+        .to_string_lossy()
+        .into_owned();
+    let plain_rel = plain
+        .strip_prefix(&scratch.mountpoint)
+        .expect("the leaf is under the cgroup2 mount")
+        .to_string_lossy()
+        .into_owned();
+    let lane = scratch.listed(PROXY_LANE_SET);
+    assert!(
+        lane.contains(&grant_rel) && !lane.contains(&plain_rel),
+        "the set {PROXY_LANE_SET} lists {grant_rel} alone: {lane}"
+    );
+    lane_step(&format!(
+        "step 3: {grant_rel} is in {PROXY_LANE_SET}, and {plain_rel} is not"
+    ));
+
+    let blocked_leaf = quic443_blocked_leaf(&scratch.root);
+    for blocked in [false, true] {
+        let stance = if blocked {
+            "while the cohort blocks UDP 443"
+        } else {
+            "while the cohort does not block UDP 443"
+        };
+        // The lane-less member runs in the blocked leaf while the cohort
+        // blocks. The lane member stays in its own leaf.
+        let plain_home = if blocked { &blocked_leaf } else { &plain };
+        for (who, home, admitted) in [("grant", &grant, true), ("plain", plain_home, false)] {
+            quic443_move_self(home);
+            for port in ports {
+                let got = lane_connect(port);
+                if admitted {
+                    assert_eq!(
+                        got, None,
+                        "the {who} member connects to {LANE_ADDRESS}:{port} {stance}"
+                    );
+                } else {
+                    assert_eq!(
+                        got,
+                        Some(libc::EHOSTUNREACH),
+                        "the {who} member is refused {LANE_ADDRESS}:{port} with \
+                         EHOSTUNREACH {stance}"
+                    );
+                }
+            }
+        }
+        lane_step(&format!(
+            "step {}: {stance}, the grant member connects at {ports:?} and the plain \
+             member is refused with EHOSTUNREACH",
+            if blocked { 5 } else { 4 }
+        ));
+        if !blocked {
+            // The flip, as the daemon makes it: both own leaves join the
+            // blocked-leaves set, and only the lane-less member moves.
+            scratch.helper_on_leaf("add", &grant);
+            scratch.helper_on_leaf("add", &plain);
+        }
+    }
+
+    // The stop of the lane member takes its leaf out of the lane set.
+    scratch.helper_on_leaf("lane-remove", &grant);
+    let lane = scratch.listed(PROXY_LANE_SET);
+    assert!(
+        !lane.contains(&grant_rel),
+        "the set {PROXY_LANE_SET} no longer lists {grant_rel}: {lane}"
+    );
+    quic443_move_self(&grant);
+    assert_eq!(
+        lane_connect(listener_port),
+        Some(libc::EHOSTUNREACH),
+        "out of the lane set, the grant member is refused too"
+    );
+    lane_step("step 6: out of the lane set, the grant member's leaf is refused too");
+
+    drop(listener);
+    drop(scratch);
+    drop(lock);
+    lane_step("step 7: the table, the helper and the scratch tree are removed");
 }
