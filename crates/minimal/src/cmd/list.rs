@@ -1130,8 +1130,10 @@ pub(crate) fn format_ls_with_proxy_ports_on(
         let proxy_down = vm_answerer
             .as_ref()
             .and_then(|reply| reply.proxy_down.as_ref());
-        let serving_proxy_port =
-            crate::resolver::serving_proxy_port(resp.hostname_proxy_port, proxy_down);
+        let serving_proxy_port = crate::resolver::serving_proxy_port(
+            reported_proxy_port(resp.hostname_proxy_port, proxy_ports),
+            proxy_down,
+        );
         let row_ports = hostname_proxy_row_ports(serving_proxy_port, proxy_ports);
         if !row_ports.is_empty() {
             writeln!(
@@ -1208,7 +1210,8 @@ pub(crate) fn format_ls_with_proxy_ports_on(
                 ),
             )?;
         }
-        if resp.hostname_proxy_port.is_some()
+        if serving_proxy_port.is_some()
+            || resp.hostname_proxy_port.is_some()
             || resp.zone_answerer_port.is_some()
             || vm_answerer_line.is_some()
             || proxy_down.is_some()
@@ -1331,6 +1334,16 @@ fn listing_json(
         }
     }
     Ok(document)
+}
+
+/// The proxy port the guest reported, or else the first port the VM host
+/// daemon says it serves on. A held port that frees after the start
+/// (NET-022) publishes on the VM host daemon only: the guest recorded no
+/// port for it, so without this fallback the BOX NAMES row says the proxy
+/// is not serving while it serves.
+#[must_use]
+pub(crate) fn reported_proxy_port(reported: Option<u16>, served: &[u16]) -> Option<u16> {
+    reported.or_else(|| served.first().copied())
 }
 
 /// The ports the `HOSTNAME PROXY` row names (NET-154). `serving` is the port
@@ -1650,8 +1663,10 @@ pub(crate) fn format_ls_across_vms_with_proxy_ports_on(
             let proxy_down = answerer
                 .as_ref()
                 .and_then(|reply| reply.proxy_down.as_ref());
-            let serving_proxy_port =
-                crate::resolver::serving_proxy_port(listing.resp.hostname_proxy_port, proxy_down);
+            let serving_proxy_port = crate::resolver::serving_proxy_port(
+                reported_proxy_port(listing.resp.hostname_proxy_port, ports_at(index)),
+                proxy_down,
+            );
             let row_ports = hostname_proxy_row_ports(serving_proxy_port, ports_at(index));
             if !row_ports.is_empty() {
                 writeln!(
