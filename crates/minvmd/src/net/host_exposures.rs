@@ -24,20 +24,20 @@
 //! and an entry whose port a listener binds later is shadowed from that
 //! decision on. The daemon log names the entry and the listener, once.
 //!
-//! The reader fails closed. A missing file, a file that does not parse, or a
-//! table that is not a table gives no exposure, and the alias stays closed
-//! at every port. An entry that is not an inline table with a port from 1 to
-//! 65535 and a protocol of `tcp` or `udp` is skipped, and the daemon log
-//! names it.
+//! The file is read through the shared reader in `client-config`
+//! ([`HostExposuresFile`]), the one the native session daemon reads it
+//! through, so both daemons handle a bad entry one way. The reader fails
+//! closed. A missing file, a file that does not parse, or a table that is
+//! not a table gives no exposure, and the alias stays closed at every port.
+//! An entry that is not a table with a port from 1 to 65535 and a protocol
+//! of `tcp` or `udp` is skipped, and the daemon log names it.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use boxes::core::egress::{IPPROTO_TCP, IPPROTO_UDP};
-
-/// The table of the client `config.toml` that names the host exposures.
-pub(crate) const HOST_EXPOSURES_TABLE: &str = "host-exposures";
+use client_config::host_exposures::{HOST_EXPOSURES_TABLE, HostExposuresFile};
 
 /// The longest time a changed table waits before the gate decides by it:
 /// the handle stats the file at most once in this interval.
@@ -177,15 +177,16 @@ pub struct HostExposures {
 
 struct Inner {
     /// The `config.toml` the table is read from, `None` for a fixed table.
-    path: Option<PathBuf>,
+    file: Option<HostExposuresFile>,
     /// The least time between two stats of the file.
     recheck: Duration,
     state: Mutex<State>,
 }
 
 struct State {
-    /// The stat of the file version the entries came from.
-    stamp: Option<Stamp>,
+    /// The table the shared reader gave for the entries, so a read that
+    /// gives the same table changes nothing.
+    table: Option<Arc<client_config::host_exposures::HostExposures>>,
     /// When the handle last looked at the file, `None` before the first look.
     checked: Option<Instant>,
     /// The entries of the current table, each in the accepted form.
@@ -197,33 +198,6 @@ struct State {
     /// The entries the log already named as refused or shadowed, each with
     /// its holder, so the log names each one once while the holder stays.
     reported: Vec<(String, HostExposure, &'static str)>,
-}
-
-/// The stat of one file version: an edit changes at least one field.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Stamp {
-    modified: Option<SystemTime>,
-    len: u64,
-    /// The inode change time, the inode and the device: an edit that keeps
-    /// the length and the modification time still sets the change time, and
-    /// a file replaced by a rename gets a new inode.
-    #[cfg(unix)]
-    unix: (i64, i64, u64, u64),
-}
-
-fn stamp(path: &Path) -> Option<Stamp> {
-    let meta = std::fs::metadata(path).ok()?;
-    #[cfg(unix)]
-    let unix = {
-        use std::os::unix::fs::MetadataExt as _;
-        (meta.ctime(), meta.ctime_nsec(), meta.dev(), meta.ino())
-    };
-    Some(Stamp {
-        modified: meta.modified().ok(),
-        len: meta.len(),
-        #[cfg(unix)]
-        unix,
-    })
 }
 
 impl HostExposures {
@@ -277,10 +251,10 @@ impl HostExposures {
         let open: Arc<[HostExposure]> = entries.iter().map(|entry| entry.exposure).collect();
         Self {
             inner: Arc::new(Inner {
-                path,
+                file: path.map(HostExposuresFile::new),
                 recheck,
                 state: Mutex::new(State {
-                    stamp: None,
+                    table: None,
                     checked: None,
                     entries: entries.into(),
                     held: Vec::new(),
@@ -350,12 +324,12 @@ impl HostExposures {
         Arc::clone(&state.open)
     }
 
-    /// Re-reads the file when the recheck interval passed and its stat
-    /// changed, and returns the entries it read then. The stat and the read
-    /// run outside the lock, so a slow disk stalls only the frame that found
-    /// the recheck due, never the other callers.
+    /// Asks the shared reader for the table when the recheck interval
+    /// passed, and returns the entries when its table changed. The reader
+    /// runs outside this handle's lock, so a slow disk stalls only the frame
+    /// that found the recheck due, never the other callers.
     fn reload(&self) -> Option<Arc<[Entry]>> {
-        let path = self.inner.path.as_ref()?;
+        let file = self.inner.file.as_ref()?;
         let (first, known) = {
             let mut state = self.lock();
             let now = Instant::now();
@@ -369,19 +343,23 @@ impl HostExposures {
             // come in the meantime keep the current table and do not stat.
             let first = state.checked.is_none();
             state.checked = Some(now);
-            (first, state.stamp.clone())
+            (first, state.table.clone())
         };
-        let current = stamp(path);
-        if !first && current == known {
+        let table = file.current();
+        if !first
+            && known
+                .as_ref()
+                .is_some_and(|known| Arc::ptr_eq(known, &table))
+        {
             return None;
         }
-        let entries: Arc<[Entry]> = read_table(path).into();
+        let entries: Arc<[Entry]> = entries_of(&table).into();
         let mut state = self.lock();
-        state.stamp = current;
+        state.table = Some(table);
         if first || entries != state.entries {
             let ports: Vec<HostExposure> = entries.iter().map(|entry| entry.exposure).collect();
             tracing::info!(
-                config = %path.display(),
+                config = %file.path().display(),
                 host_exposure_ports = %render(&ports),
                 "read the host exposures for host.min.internal"
             );
@@ -408,7 +386,10 @@ impl HostExposures {
 impl std::fmt::Debug for HostExposures {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HostExposures")
-            .field("path", &self.inner.path)
+            .field(
+                "path",
+                &self.inner.file.as_ref().map(HostExposuresFile::path),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -453,98 +434,40 @@ fn client_config_path() -> Option<PathBuf> {
     Some(paths::minimal_config_dir_with_override(None).join("config.toml"))
 }
 
-/// Reads the table of the file at `path`, failing closed: a missing or
-/// unparseable file is no exposure.
-fn read_table(path: &Path) -> Vec<Entry> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-        Err(error) => {
-            tracing::warn!(
-                config = %path.display(),
-                %error,
-                "could not read the client config, so host.min.internal has no host exposure"
-            );
-            return Vec::new();
-        }
-    };
-    match parse_table(&text) {
-        Ok(entries) => entries,
-        Err(error) => {
-            tracing::warn!(
-                config = %path.display(),
-                %error,
-                "could not parse the client config, so host.min.internal has no host exposure"
-            );
-            Vec::new()
-        }
-    }
-}
-
-/// Parses the `[host-exposures]` table of one `config.toml` text. No table
-/// is no exposure. An entry that is not an exposure is skipped, and the log
-/// names it. The listeners are held against the entries at each decision
+/// The entries of one table the shared reader gave, each in the accepted
+/// form, in the order of their exposure and then their name. The listeners
+/// are held against the entries at each decision
 /// ([`HostExposures::current`]), not here.
-fn parse_table(text: &str) -> Result<Vec<Entry>, toml::de::Error> {
-    let doc: toml::Table = toml::from_str(text)?;
-    let Some(table) = doc.get(HOST_EXPOSURES_TABLE) else {
-        return Ok(Vec::new());
-    };
-    let Some(table) = table.as_table() else {
-        tracing::warn!(
-            table = HOST_EXPOSURES_TABLE,
-            "the host-exposures key in the client config is not a table, so \
-             host.min.internal has no host exposure"
-        );
-        return Ok(Vec::new());
-    };
+fn entries_of(table: &client_config::host_exposures::HostExposures) -> Vec<Entry> {
     let mut entries: Vec<Entry> = table
         .iter()
-        .filter_map(|(name, value)| {
-            let Some(exposure) = entry_exposure(value) else {
-                tracing::warn!(
-                    table = HOST_EXPOSURES_TABLE,
-                    entry = %name,
-                    value = %value,
-                    "skipped a host exposure that is not {{ proto = \"tcp\" or \"udp\", \
-                     port = 1 to 65535 }}"
-                );
-                return None;
-            };
-            Some(Entry {
-                name: name.clone(),
-                exposure,
-            })
+        .map(|(name, entry)| Entry {
+            name: name.to_string(),
+            exposure: HostExposure {
+                protocol: entry.proto.ip_protocol(),
+                port: entry.port,
+            },
         })
         .collect();
     entries.sort_unstable_by(|a, b| (a.exposure, &a.name).cmp(&(b.exposure, &b.name)));
-    Ok(entries)
-}
-
-/// One entry's value as an exposure: the inline table
-/// `{ proto = "tcp", port = N }`, where `proto` is `tcp` or `udp` and
-/// defaults to `tcp`. Any other key or form is not an exposure.
-fn entry_exposure(value: &toml::Value) -> Option<HostExposure> {
-    let entry = value.as_table()?;
-    if entry.keys().any(|key| key != "proto" && key != "port") {
-        return None;
-    }
-    let port = entry
-        .get("port")?
-        .as_integer()
-        .and_then(|n| u16::try_from(n).ok())
-        .filter(|&port| port != 0)?;
-    match entry.get("proto").map(toml::Value::as_str) {
-        None | Some(Some("tcp")) => Some(HostExposure::tcp(port)),
-        Some(Some("udp")) => Some(HostExposure::udp(port)),
-        Some(_) => None,
-    }
+    entries
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{HostExposure, HostExposures, client_config_path, parse_table};
+    use super::{HostExposure, HostExposures, client_config_path, entries_of};
     use std::time::Duration;
+
+    /// The entries of `text`, read by the shared reader.
+    fn parse_table(
+        text: &str,
+    ) -> Result<Vec<super::Entry>, client_config::host_exposures::HostExposuresError> {
+        client_config::host_exposures::parse_host_exposures(
+            text,
+            std::path::Path::new("config.toml"),
+        )
+        .map(|table| entries_of(&table))
+    }
 
     fn exposures_of(entries: &[super::Entry]) -> Vec<HostExposure> {
         entries.iter().map(|entry| entry.exposure).collect()
@@ -581,7 +504,10 @@ mod tests {
         );
         assert_eq!(entries[0].name, "vite", "each entry keeps its name");
         assert!(parse_table("[other]\nx = 1\n").unwrap().is_empty());
-        assert!(parse_table("host-exposures = 8080\n").unwrap().is_empty());
+        assert!(
+            parse_table("host-exposures = 8080\n").is_err(),
+            "a key that is not a table reads as no table, and the alias stays closed"
+        );
         assert!(parse_table("not toml [").is_err());
 
         // The file is the client config: `config.toml` in the config dir.

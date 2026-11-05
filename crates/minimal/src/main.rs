@@ -249,6 +249,14 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     if e.downcast_ref::<minimal::BoxRunningRefusal>().is_some() {
         return minimal::BoxRunningRefusal::EXIT_CODE;
     }
+    // BCLI-058: `min box rename` to a name BOX-010 refuses.
+    if e.downcast_ref::<minimal::BoxRenameRefusal>().is_some() {
+        return minimal::BoxRenameRefusal::EXIT_CODE;
+    }
+    // BCLI-005: `min box prune` off a terminal without `--yes`.
+    if e.downcast_ref::<minimal::PruneNeedsYes>().is_some() {
+        return minimal::PruneNeedsYes::EXIT_CODE;
+    }
     // BOX-163: a create under a name a running box holds.
     if e.downcast_ref::<minimald_rpc::HeldNameRefusal>().is_some() {
         return minimald_rpc::HeldNameRefusal::EXIT_CODE;
@@ -273,6 +281,11 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     }
     // BCLI-002, BCLI-064: a box address that names no single box.
     if let Some(refused) = e.downcast_ref::<minimal::BoxAddressRefusal>() {
+        return refused.exit_code();
+    }
+    // BCLI-034, BCLI-062: `min box cp` of a file the box does not have, or
+    // does not allow reading.
+    if let Some(refused) = e.downcast_ref::<minimal::BoxFileRefusal>() {
         return refused.exit_code();
     }
     1
@@ -514,6 +527,11 @@ fn machine_output_mode(cli: &minimal::Cli) -> bool {
         Some(minimal::Command::Box(minimal::BoxArgs {
             command: minimal::BoxCommand::List(args),
         })) => args.output.is_some(),
+        // BCLI-016: a `min box events -o jsonl` failure is one
+        // `min/v1/error` object too.
+        Some(minimal::Command::Box(minimal::BoxArgs {
+            command: minimal::BoxCommand::Events(args),
+        })) => args.output == Some(minimal::BoxEventsOutputFormat::Jsonl),
         _ => false,
     }
 }
@@ -942,6 +960,25 @@ mod tests {
             assert_eq!(machine_output_mode(&cli), machine);
         }
 
+        // `min box events -o jsonl` is a machine mode, its text form is not.
+        for (output, machine) in [
+            (Some(minimal::BoxEventsOutputFormat::Jsonl), true),
+            (None, false),
+        ] {
+            let cli = minimal::Cli {
+                global_args: minimal::GlobalArgs::default(),
+                command: Some(Command::Box(minimal::BoxArgs {
+                    command: minimal::BoxCommand::Events(minimal::BoxEventsArgs {
+                        target: Some("web".to_string()),
+                        parent: None,
+                        output,
+                        follow: false,
+                    }),
+                })),
+            };
+            assert_eq!(machine_output_mode(&cli), machine);
+        }
+
         // Its defined refusal answers with its own code.
         match machine_mode_answer(&anyhow::Error::new(minimal::AuditSelfUnsupportedUnenrolled)) {
             MachineModeAnswer::Object(failure) => {
@@ -1025,6 +1062,31 @@ mod tests {
         }
     }
 
+    /// BCLI-034: `min box cp` ends with 4 for a file the box does not have,
+    /// and 5 for a file the box does not allow reading.
+    #[test]
+    fn box_file_refusals_exit_with_their_codes() {
+        for (refusal, code) in [
+            (
+                minimal::BoxFileRefusal::NotFound {
+                    address: "web".to_owned(),
+                    path: "out.txt".to_owned(),
+                },
+                4,
+            ),
+            (
+                minimal::BoxFileRefusal::PermissionDenied {
+                    address: "web".to_owned(),
+                    path: "secret.txt".to_owned(),
+                },
+                5,
+            ),
+        ] {
+            let err = anyhow::Error::new(refusal).context("copying the file");
+            assert_eq!(failure_exit_code(&err), code, "{err:#}");
+        }
+    }
+
     /// #1790: a VM host that could not be reached ends the run with 7 —
     /// provider/host unreachable — found through every context the
     /// activation adds over it, and a machine-mode run answers it with the
@@ -1088,6 +1150,22 @@ mod tests {
         };
         let e = anyhow::Error::new(refused).context("activating the session");
         assert_eq!(failure_exit_code(&e), 3);
+    }
+
+    /// BCLI-005: `min box prune` off a terminal without `--yes` ends with
+    /// exit 2, and the text names `--yes`.
+    #[test]
+    fn prune_off_tty_needs_yes_exits_2() {
+        let e = anyhow::Error::new(minimal::PruneNeedsYes);
+        assert_eq!(failure_exit_code(&e), 2);
+        let mut stderr = Vec::new();
+        let code = answer_failure(&e, false, false, None, &mut stderr);
+        assert_eq!(code, ExitCode::from(2));
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "error: Prune removes boxes. Pass --yes to confirm, \
+             or --dry-run to see what it would remove.\n"
+        );
     }
 
     /// BCLI-004: `min box rm` of a running box without `--force` ends with
