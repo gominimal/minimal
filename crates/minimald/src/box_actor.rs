@@ -231,6 +231,10 @@ fn ready_entrypoint_exit(
     Some(ready)
 }
 
+/// How long the actor waits for the exit of a host whose mailbox is already
+/// closed. The loop drops its mailbox a moment before its task returns.
+const EXIT_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The exit `watch` receives, or never when nothing is watched.
 async fn next_entrypoint_exit(
     watch: &mut Option<EntrypointWatch>,
@@ -1509,6 +1513,25 @@ impl BoxActor {
         outcome
     }
 
+    /// The exit the watch holds before a message runs, as
+    /// [`ready_entrypoint_exit`] reads it. When the watched host already
+    /// closed its mailbox, its loop is about to return, so this waits for
+    /// that exit (bounded by [`EXIT_SETTLE_TIMEOUT`]). Otherwise an exec
+    /// queued beside the exit finds no live host and launches the
+    /// entrypoint again (BOX-038).
+    async fn settled_entrypoint_exit(&mut self) -> Option<Option<box_runtime::HostExit>> {
+        if let Some(exit) = ready_entrypoint_exit(&mut self.entrypoint_watch) {
+            return Some(exit);
+        }
+        if self.has_live_host() {
+            return None;
+        }
+        let watch = self.entrypoint_watch.as_mut()?;
+        let exit = tokio::time::timeout(EXIT_SETTLE_TIMEOUT, watch).await.ok()?;
+        self.entrypoint_watch = None;
+        Some(exit.ok())
+    }
+
     /// The async task which handles interactions with the session.
     ///
     /// On an actor-initiated termination (abort, failed verdict resume) the
@@ -1535,7 +1558,7 @@ impl BoxActor {
                     // exec is refused.
                     let mut ended = None;
                     if !goes_before_exit(&queued.0)
-                        && let Some(exit) = ready_entrypoint_exit(&mut self.entrypoint_watch)
+                        && let Some(exit) = self.settled_entrypoint_exit().await
                     {
                         if let Some(exit) = exit
                             && let ControlFlow::Break(t) = self.end_on_entrypoint_return(exit).await
