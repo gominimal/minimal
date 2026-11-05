@@ -363,18 +363,24 @@ pub(crate) fn holds_name_with_vm_host(kind: paths::HostKind, network: boxes::Net
 }
 
 /// Whether a box with `network` on a host of `kind` has its lookups go
-/// through a switch that steers the credential module's names (BEP-017,
-/// BEP-062). This is a host fact and does not read the steering. On the VM
-/// host, an own-address box's lookups go through the VM host's switch. Its
-/// DNS gate answers a steered name with the proxy's address while the
-/// proxy's listener is live, and SERVFAIL while it is down. A native host
-/// has no proxy, so a steered name there always fails closed, and a
-/// `host_ip` or `none` box has no steered lookups of its own. `min box
-/// spec` reads it for the network its `--network` flag names. Where this
-/// is true, a `dns`-steered box opens TLS to the proxy's address on port
-/// 443, and the proxy routes it by its SNI (BEP-080).
+/// through a resolver that steers the credential module's names (BEP-017,
+/// BEP-062, BEP-081). This is a host fact and does not read the steering.
+/// On the VM host, an own-address box's lookups go through the VM host's
+/// switch, whose DNS gate steers them. A host-address box there resolves
+/// through a steering answerer of its own in the guest (BEP-086). Both
+/// answer a steered name with the proxy's address while the proxy's
+/// listener is live, and SERVFAIL while it is down. A native host has no
+/// proxy, so a steered name there always fails closed, and a `none` box
+/// has no steered lookups of its own. `min box spec` reads it for the
+/// network its `--network` flag names. Where this is true, a `dns`-steered
+/// box opens TLS to the proxy's address on port 443, and the proxy routes
+/// it by its SNI (BEP-080).
 pub(crate) fn host_resolves_box_names(kind: paths::HostKind, network: boxes::NetworkMode) -> bool {
-    kind == paths::HostKind::Minvmd && network == boxes::NetworkMode::OwnIp
+    kind == paths::HostKind::Minvmd
+        && matches!(
+            network,
+            boxes::NetworkMode::OwnIp | boxes::NetworkMode::HostNet
+        )
 }
 
 /// The network and the host fact a creation reads, for a host of `kind`:
@@ -4247,15 +4253,14 @@ mod tests {
         ));
     }
 
-    /// BEP-017, BEP-062, BEP-080: a GitHub grant box with `dns` steering,
-    /// declared or by default, or with `both`, is created where the VM
-    /// host's switch resolves its names, and `min box spec` shows it. On a
-    /// native host, and for a `host_ip` box, both are refused for the
-    /// missing resolver. For every
-    /// case, `min box spec` refuses exactly when creation does, with the
-    /// same text.
+    /// BEP-017, BEP-062, BEP-080, BEP-081: a GitHub grant box with `dns`
+    /// steering, declared or by default, or with `both`, is created on the
+    /// VM host for `own_ip` and `host_ip`, and `min box spec` shows it. On
+    /// a native host, and for a `none` box, both are refused for the
+    /// missing resolver. For every case, `min box spec` refuses exactly
+    /// when creation does, with the same text.
     #[test]
-    fn dns_steering_is_admitted_where_the_switch_resolves_boxes() {
+    fn vm_host_admits_dns_and_both_for_own_ip_and_host_ip() {
         use boxes::core::bep::Steering;
         use paths::HostKind;
         // The host fact does not read the steering.
@@ -4267,9 +4272,17 @@ mod tests {
             HostKind::Minimald,
             boxes::NetworkMode::OwnIp
         ));
-        assert!(!host_resolves_box_names(
+        assert!(host_resolves_box_names(
             HostKind::Minvmd,
             boxes::NetworkMode::HostNet
+        ));
+        assert!(!host_resolves_box_names(
+            HostKind::Minimald,
+            boxes::NetworkMode::HostNet
+        ));
+        assert!(!host_resolves_box_names(
+            HostKind::Minvmd,
+            boxes::NetworkMode::NoNet
         ));
         let github_hosts: Vec<&str> = bep::module::GITHUB
             .hosts
@@ -4310,6 +4323,7 @@ mod tests {
                 (HostKind::Minvmd, boxes::NetworkMode::OwnIp),
                 (HostKind::Minimald, boxes::NetworkMode::OwnIp),
                 (HostKind::Minvmd, boxes::NetworkMode::HostNet),
+                (HostKind::Minimald, boxes::NetworkMode::HostNet),
             ] {
                 let resolver = host_resolves_box_names(kind, network);
                 let accepted = resolver;
@@ -4421,11 +4435,13 @@ mod tests {
                     let previewed = previewed.map_err(|err| err.to_string());
                     assert_eq!(created, previewed, "{case}: same refusal");
 
-                    let own_ip_on_vm_host = kind == HostKind::Minvmd && flag == Some("own_ip");
-                    if own_ip_on_vm_host {
+                    // With no flag the box is a `host_ip` box.
+                    let admitted_on_vm_host = kind == HostKind::Minvmd
+                        && matches!(flag, None | Some("host_ip") | Some("own_ip"));
+                    if admitted_on_vm_host {
                         // On the VM host, `min box spec --network own_ip`
-                        // admits a `dns` or `both` spec with a credentialed
-                        // upstream.
+                        // and `--network host_ip` admit a `dns` or `both`
+                        // spec with a credentialed upstream (BEP-081).
                         assert_eq!(previewed, Ok(()), "{case}: admitted");
                         let text = String::from_utf8(out).expect("utf-8");
                         assert!(
@@ -4433,11 +4449,10 @@ mod tests {
                             "{case}: {text}"
                         );
                     } else {
-                        // Any other mode or host has no steered lookups of
-                        // its own, so the spec is refused for the missing
-                        // resolver. That includes no flag at all, as a
-                        // default activation is refused. A `none` box is
-                        // also refused for its missing network.
+                        // A native host, and a `none` box, have no
+                        // steered lookups, so the spec is refused for the
+                        // missing resolver. A `none` box is also refused
+                        // for its missing network.
                         let refused = previewed.expect_err("min box spec refuses");
                         assert!(refused.ends_with(no_resolver.as_str()), "{case}: {refused}");
                         if flag == Some("none") {
