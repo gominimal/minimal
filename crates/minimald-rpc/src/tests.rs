@@ -2222,3 +2222,23 @@ fn read_log_request_round_trips() {
     .unwrap();
     assert!(output.contains(r#""data":"6869""#), "{output}");
 }
+
+#[test]
+fn a_host_ip_retire_predating_its_end_decodes_as_a_destroy() {
+    let session = boxes::SessionId::mint();
+    let old = format!(
+        r#"{{"session_id":{}}}"#,
+        serde_json_lenient::to_string(&session).unwrap()
+    );
+    let decoded: RetireHostIpBoxRequest =
+        serde_json_lenient::from_str(&old).expect("a retire without `end` decodes");
+    assert_eq!(decoded.end, HostIpBoxEnd::Destroyed);
+    assert_eq!(
+        round_trip(&RetireHostIpBoxRequest {
+            session_id: session,
+            end: HostIpBoxEnd::Stopped
+        })
+        .end,
+        HostIpBoxEnd::Stopped
+    );
+}
