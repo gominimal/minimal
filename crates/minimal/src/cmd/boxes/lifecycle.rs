@@ -1,6 +1,7 @@
 //! `min session destroy`, `stop` and `rename`: the box lifecycle helpers.
-//! `min box stop` (BOX-013, BCLI-059) and `min box rm` (BOX-019, BCLI-060,
-//! BCLI-004) live here too.
+//! `min box stop` (BOX-013, BCLI-059), `min box rm` (BOX-019, BCLI-060,
+//! BCLI-004), `min box rename` (BOX-010, BCLI-058) and `min box prune`
+//! (BOX-021, BCLI-061, BCLI-005) live here too.
 
 use super::*;
 
@@ -308,35 +309,7 @@ pub(crate) async fn stop_wedged_vm_from_host(
 ) -> Result<(), anyhow::Error> {
     let host_dir = client::resolve_host_dir(minimal_dir.as_deref(), true)
         .context("resolving the VM's provider dir for a host-side stop")?;
-
-    // The stop sleep-polls the VMM's exit and the wait polls the alive lock,
-    // so both go on the blocking pool rather than stalling an async worker
-    // (rust-coding-standards: no blocking in an async context).
-    let outcome = tokio::task::spawn_blocking(move || {
-        let state_dir = minvmd::state::StateDir::new(host_dir.clone())
-            .context("opening the VM's state dir for a host-side stop")?;
-        let state = state_dir
-            .effective_state()
-            .context("reading the VM's state for a host-side stop")?;
-        // Checked first: the VM going down on its own (or a dead supervisor's
-        // stale state being repaired by the read above) since the caller's
-        // liveness probe is the goal state, not a boot to wait out.
-        if !state.lifecycle.is_active() {
-            return Ok(minvmd::cmd::stop::HostStop::NothingSignalled);
-        }
-        if state.lifecycle == minvmd::lifecycle::Lifecycle::Starting || state.vmm_pid.is_none() {
-            anyhow::bail!(
-                "the VM is still booting; retry `{}` once it is up",
-                stop_command()
-            );
-        }
-        let outcome = minvmd::cmd::stop::stop_at(host_dir, quiesce_guest)
-            .context("stopping the VM from the host")?;
-        wait_for_alive_lock_released(&state_dir, HOST_STOP_RELEASE_WAIT)?;
-        Ok(outcome)
-    })
-    .await
-    .context("the host-side stop of the VM panicked")??;
+    let outcome = stop_vm_from_host_at(host_dir, quiesce_guest, stop_command()).await?;
 
     // stderr, so it survives the `>/dev/null` every scripted caller wraps
     // `stop` in. The loss caveat is only true of a guest that was killed: one
@@ -353,11 +326,54 @@ pub(crate) async fn stop_wedged_vm_from_host(
     Ok(())
 }
 
+/// Stop the VM whose state directory is `host_dir` from this machine, as
+/// `minvmd stop` does, then wait until minvmd releases the VM's alive lock.
+/// `retry` is the command a VM that is still booting is told to run again.
+/// [`stop_wedged_vm_from_host`] and `min host stop --force` share it.
+pub(crate) async fn stop_vm_from_host_at(
+    host_dir: PathBuf,
+    quiesce_guest: bool,
+    retry: String,
+) -> Result<minvmd::cmd::stop::HostStop, anyhow::Error> {
+    // The stop sleep-polls the VMM's exit and the wait polls the alive lock,
+    // so both go on the blocking pool rather than stalling an async worker
+    // (rust-coding-standards: no blocking in an async context).
+    tokio::task::spawn_blocking(move || {
+        let state_dir = minvmd::state::StateDir::new(host_dir.clone())
+            .context("opening the VM's state dir for a host-side stop")?;
+        let state = state_dir
+            .effective_state()
+            .context("reading the VM's state for a host-side stop")?;
+        // Checked first: the VM going down on its own (or a dead supervisor's
+        // stale state being repaired by the read above) since the caller's
+        // liveness probe is the goal state, not a boot to wait out.
+        if !state.lifecycle.is_active() {
+            return Ok(minvmd::cmd::stop::HostStop::NothingSignalled);
+        }
+        if state.lifecycle == minvmd::lifecycle::Lifecycle::Starting || state.vmm_pid.is_none() {
+            anyhow::bail!("the VM is still booting; retry `{retry}` once it is up");
+        }
+        let outcome = minvmd::cmd::stop::stop_at(host_dir, quiesce_guest)
+            .context("stopping the VM from the host")?;
+        wait_for_alive_lock_released(&state_dir, HOST_STOP_RELEASE_WAIT)?;
+        Ok(outcome)
+    })
+    .await
+    .context("the host-side stop of the VM panicked")?
+}
+
 /// What `min stop --force` says after killing a VM whose guest did not
 /// acknowledge Shutdown. The volume's journal keeps its filesystem metadata
 /// consistent across the kill; it does not keep the data.
 const UNACKNOWLEDGED_STOP_CAVEAT: &str = "The VM did not respond to shutdown, so it was killed from this machine. \
      Running sessions were killed without their shutdown steps, and recently written files \
+     may be empty or cut short. The VM disk's filesystem itself stays consistent.";
+
+/// What `min host stop --force` says after killing a VM whose guest did not
+/// acknowledge Shutdown. The same caveat as [`UNACKNOWLEDGED_STOP_CAVEAT`],
+/// for a command that names boxes, not sessions.
+const HOST_UNACKNOWLEDGED_STOP_CAVEAT: &str = "The VM did not respond to shutdown, so it was killed from this machine. \
+     Running boxes were killed without their stop steps, and recently written files \
      may be empty or cut short. The VM disk's filesystem itself stays consistent.";
 
 /// How long a host-side stop waits for minvmd to release the VM's alive lock
@@ -513,6 +529,123 @@ where
     }
 }
 
+/// Stop the daemon of the host named `host`, over `client`, for
+/// `min host stop` (BCLI-049). `vm_dir` is the VM's state directory when
+/// the host is a VM host, and `None` for a native daemon.
+///
+/// Without `force`, the daemon gets the clean `Shutdown` that `min stop`
+/// sends, with the same drain budget on a VM. The call then waits until
+/// the VM is down. With `force`, the `Shutdown` skips the busy-box check and
+/// the drain budget. A VM is then stopped from this machine without a wait
+/// for its own shutdown. A guest that acknowledged has already drained its
+/// boxes and quiesced its volume, so it is not asked again.
+pub(crate) async fn shut_down_host_daemon(
+    mut client: client::Client,
+    host: &str,
+    vm_dir: Option<PathBuf>,
+    force: bool,
+) -> Result<(), anyhow::Error> {
+    use minimald_rpc::{Shutdown, ShutdownRequest, ShutdownResponse};
+    let force_command = format!("min host stop {host} --force");
+    let drain_budget = if vm_dir.is_some() && !force {
+        minvmd::cmd::stop::GUEST_SHUTDOWN_TIMEOUT.saturating_sub(client::RPC_TIMEOUT)
+    } else {
+        std::time::Duration::ZERO
+    };
+    let resp = client
+        .oneshot_rpc_with_hook_budget::<Shutdown>(ShutdownRequest { force }, drain_budget)
+        .await
+        .context("Shutdown RPC failed");
+    // The daemon holds its shutdown open for a drain grace while a client is
+    // still attached, and this is that client.
+    drop(client);
+    tracing::debug!(host, force, answer = ?resp.as_ref().ok(), "host daemon Shutdown answered");
+    let busy = || {
+        anyhow::anyhow!(
+            "the daemon on {host} did not stop, because a box on it is still busy. \
+             Run `{force_command}` to stop it anyway."
+        )
+    };
+    let Some(vm_dir) = vm_dir else {
+        return match resp? {
+            ShutdownResponse::ShuttingDown => Ok(()),
+            ShutdownResponse::SessionsLive => Err(busy()),
+        };
+    };
+    if force {
+        let acknowledged = matches!(resp, Ok(ShutdownResponse::ShuttingDown));
+        if let Err(e) = &resp {
+            tracing::debug!(
+                host,
+                "forced Shutdown failed, stopping the VM from this machine: {e:#}"
+            );
+        }
+        let outcome = stop_vm_from_host_at(vm_dir, false, force_command).await?;
+        if !acknowledged && outcome == minvmd::cmd::stop::HostStop::GuestUnacknowledged {
+            eprintln!("{HOST_UNACKNOWLEDGED_STOP_CAVEAT}");
+        }
+        return Ok(());
+    }
+    let stopped = || async {
+        let dir = vm_dir.clone();
+        tokio::task::spawn_blocking(move || wait_for_vm_stopped_at(&dir, HOST_STOP_RELEASE_WAIT))
+            .await
+            .unwrap_or(false)
+    };
+    match resp {
+        Ok(ShutdownResponse::ShuttingDown) => {
+            if stopped().await {
+                Ok(())
+            } else {
+                bail!(
+                    "the VM of {host} is still shutting down after {}s. \
+                     Run `{force_command}` to stop it from this machine.",
+                    HOST_STOP_RELEASE_WAIT.as_secs()
+                )
+            }
+        }
+        Ok(ShutdownResponse::SessionsLive) => Err(busy()),
+        // On a VM the daemon is the guest's pid-1, so a shutdown that worked
+        // can take the reply down with it. A VM that is down is the goal.
+        // Only a lost reply earns the wait. An error the daemon reported is
+        // an answer, and its VM stays up.
+        Err(rpc_err) if rpc_unanswered(&rpc_err) && stopped().await => {
+            tracing::debug!(
+                host,
+                "the Shutdown reply was lost, but the VM stopped: {rpc_err:#}"
+            );
+            Ok(())
+        }
+        Err(rpc_err) => Err(rpc_err.context(format!(
+            "the daemon on {host} did not stop. \
+             Run `{force_command}` to stop its VM from this machine."
+        ))),
+    }
+}
+
+/// Whether the VM whose state directory is `dir` is down within `timeout`.
+/// A state that cannot be read is no proof that it stopped.
+fn wait_for_vm_stopped_at(dir: &std::path::Path, timeout: std::time::Duration) -> bool {
+    let Ok(state_dir) = minvmd::state::StateDir::new(dir.to_path_buf()) else {
+        return false;
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match state_dir.effective_state() {
+            Ok(state) if !state.lifecycle.is_active() => return true,
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!(dir = %dir.display(), "VM state not read: {e:#}");
+                return false;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 /// The refusal of `min box rm` for a running box without `--force`
 /// (BCLI-004, BOX-019). `target` is the box as the user named it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -582,6 +715,21 @@ fn box_rpc_error(target: &str, error: String) -> anyhow::Error {
     }
 }
 
+/// Whether `e`, the error of a oneshot RPC, means the daemon did not
+/// answer: the call timed out, or the connection was lost before a reply.
+/// A refusal or a failure the daemon reported is an answer, and so is a
+/// reply that did not decode, unless the reply was empty.
+pub(crate) fn rpc_unanswered(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        if cause.downcast_ref::<russh::Error>().is_some() {
+            return true;
+        }
+        let text = cause.to_string();
+        // The client's deadline, and a channel that closed without a byte.
+        text.contains(" RPC timed out after ") || text.ends_with("(daemon replied: )")
+    })
+}
+
 /// `min box stop <box> [--force]`: stops the box and keeps its record.
 /// `<box>` is a box address, looked up on every local host.
 pub async fn cmd_box_stop(global: &GlobalArgs, args: BoxStopArgs) -> Result<(), anyhow::Error> {
@@ -627,14 +775,16 @@ pub(crate) fn box_host_control_sock(
 }
 
 /// Stops the box `id`, which the address `target` resolved to, as BOX-013
-/// defines, forced under `force`. Writes one line to `out`.
+/// defines, forced under `force`. Writes one line to `out`. Returns true
+/// when this stop stopped the box, and false when the box had already
+/// exited.
 pub(crate) async fn stop_listed_box(
     client: &mut client::Client,
     out: &mut impl std::io::Write,
     id: boxes::SessionId,
     target: &str,
     force: bool,
-) -> Result<(), anyhow::Error> {
+) -> Result<bool, anyhow::Error> {
     use minimald_rpc::{Errorable, StopBox};
 
     crate::output::record_box_id(&id.to_string());
@@ -647,7 +797,7 @@ pub(crate) async fn stop_listed_box(
         Errorable::Err { error } => return Err(box_rpc_error(target, error)),
     };
     write_stop_line(out, target, &stopped)?;
-    Ok(())
+    Ok(!stopped.already_exited)
 }
 
 /// The one line `min box stop` prints for the daemon's answer `stopped`.
@@ -770,6 +920,393 @@ pub(crate) async fn rm_listed_box(
         name,
         box_addresses,
     })
+}
+
+/// The daemon's refusal of a rename (BOX-010): a running box on the host
+/// holds the name, or the name is reserved. The text is the daemon's, and
+/// names the holder. `min box rename` ends with exit 2 on it (BCLI-058).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoxRenameRefusal {
+    pub(crate) message: String,
+}
+
+impl BoxRenameRefusal {
+    /// The exit code `min box rename` ends with on this refusal.
+    pub const EXIT_CODE: u8 = 2;
+
+    /// The lead of the daemon's text when a running box holds the name, as
+    /// `boxes::box_name::RenameRefusal::HeldByRunning` spells it.
+    const HELD_LEAD: &'static str = "The running session `";
+
+    /// The refusal a `RenameSession` error carries, or `None` when the
+    /// error is any other failure.
+    fn from_error(error: &str) -> Option<Self> {
+        let reserved = boxes::box_name::RenameRefusal::Reserved.to_string();
+        let held = error.starts_with(Self::HELD_LEAD) && error.contains(" holds the name `");
+        (held || error == reserved).then(|| Self {
+            message: error.to_owned(),
+        })
+    }
+}
+
+impl std::fmt::Display for BoxRenameRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for BoxRenameRefusal {}
+
+/// `min box rename <box> <name>`: renames the box as BOX-010 defines.
+/// `<box>` is a box address, looked up on every local host.
+pub async fn cmd_box_rename(global: &GlobalArgs, args: BoxRenameArgs) -> Result<(), anyhow::Error> {
+    ensure_daemon(global)?;
+    let hosts = crate::cmd::list::local_hosts(global)?;
+    let resolved = resolve_box_on_hosts(hosts, &args.target, "box rename").await?;
+    let mut client = gated_box_host_client(&resolved.host).await?;
+    // The record says whether the box holds its name in the VM host's zone,
+    // which the hold then moves to the new name.
+    let record = get_session_record(&mut client, &resolved.box_id.to_string())
+        .await
+        .ok()
+        .and_then(|resp| resp.record);
+    let mut out = std::io::stdout().lock();
+    rename_listed_box(
+        &mut client,
+        &mut out,
+        resolved.box_id,
+        &args.target,
+        &args.new_name,
+    )
+    .await?;
+    if let Some(record) = record.filter(holds_name) {
+        let control_sock = box_host_control_sock(&resolved.host);
+        release_held_box_name(
+            control_sock.clone(),
+            record.id,
+            record.name.as_deref(),
+            None,
+        )
+        .await;
+        hold_box_name_with_vm_host(control_sock, &args.new_name, Some(record.id), true).await;
+    }
+    Ok(())
+}
+
+/// Renames the box `id`, which the address `target` resolved to, to
+/// `new_name`, as BOX-010 defines. Writes one line to `out`. The daemon's
+/// refusal returns as a [`BoxRenameRefusal`].
+pub(crate) async fn rename_listed_box(
+    client: &mut client::Client,
+    out: &mut impl std::io::Write,
+    id: boxes::SessionId,
+    target: &str,
+    new_name: &str,
+) -> Result<(), anyhow::Error> {
+    use minimald_rpc::{Errorable, RenameSession, RenameSessionRequest};
+
+    crate::output::record_box_id(&id.to_string());
+    let answer = client
+        .oneshot_rpc::<RenameSession>(RenameSessionRequest {
+            id,
+            new_name: new_name.to_owned(),
+        })
+        .await
+        .context("RenameSession RPC failed")?;
+    match answer {
+        Errorable::Ok(_) => {
+            tracing::info!(verb = "box rename", box_id = %id, outcome = "renamed");
+            writeln!(out, "Renamed {target} to {new_name}.")?;
+            Ok(())
+        }
+        Errorable::Err { error } => {
+            tracing::info!(verb = "box rename", box_id = %id, outcome = "refused", "{error}");
+            match BoxRenameRefusal::from_error(&error) {
+                Some(refusal) => Err(refusal.into()),
+                None => Err(box_rpc_error(target, error)),
+            }
+        }
+    }
+}
+
+/// The refusal of `min box prune` off a terminal without `--yes`
+/// (BCLI-005). It ends the command with exit 2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PruneNeedsYes;
+
+impl PruneNeedsYes {
+    /// The exit code `min box prune` ends with on this refusal.
+    pub const EXIT_CODE: u8 = 2;
+}
+
+impl std::fmt::Display for PruneNeedsYes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "Prune removes boxes. Pass --yes to confirm, or --dry-run to see what it would remove.",
+        )
+    }
+}
+
+impl std::error::Error for PruneNeedsYes {}
+
+/// How `min box prune` proceeds past its confirmation gate.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PruneGate {
+    /// Prune without asking: `--yes`.
+    Proceed,
+    /// Ask on the terminal first, default No.
+    Confirm,
+}
+
+/// Decides whether `min box prune` prunes, asks, or refuses with
+/// [`PruneNeedsYes`]. Off a terminal, or under `--no-input`, nothing can
+/// answer the question, so only `--yes` prunes.
+pub(crate) fn prune_gate(
+    yes: bool,
+    no_input: bool,
+    stdin_is_terminal: bool,
+) -> Result<PruneGate, PruneNeedsYes> {
+    match (yes, !no_input && stdin_is_terminal) {
+        (true, _) => Ok(PruneGate::Proceed),
+        (false, true) => Ok(PruneGate::Confirm),
+        (false, false) => Err(PruneNeedsYes),
+    }
+}
+
+/// The `PruneBoxes` request for `min box prune`: BOX-021's `older-than`
+/// selector for `--older-than`, and its `parent` selector for `--parent`,
+/// which the caller resolved to the box `parent`.
+pub(crate) fn box_prune_request(
+    older_than: Option<std::time::Duration>,
+    parent: Option<boxes::SessionId>,
+) -> minimald_rpc::PruneBoxesRequest {
+    minimald_rpc::PruneBoxesRequest {
+        older_than_secs: older_than.map(|age| age.as_secs()),
+        parent,
+    }
+}
+
+/// The question `min box prune` asks on a terminal. It names each
+/// selector the person passed, so it never claims more than the prune
+/// removes. The age prints in the largest whole unit `--older-than` takes.
+pub(crate) fn prune_question(
+    older_than: Option<std::time::Duration>,
+    parent: Option<&str>,
+) -> String {
+    let what = match parent {
+        Some(parent) => format!("child box of {parent}"),
+        None => "box".to_owned(),
+    };
+    match older_than {
+        Some(age) => {
+            let secs = age.as_secs();
+            let (n, unit) = [(86_400, 'd'), (3_600, 'h'), (60, 'm')]
+                .into_iter()
+                .find(|(size, _)| secs > 0 && secs % size == 0)
+                .map_or((secs, 's'), |(size, unit)| (secs / size, unit));
+            format!("Remove every {what} that stopped or exited at least {n}{unit} ago?")
+        }
+        None => format!("Remove every stopped or exited {what}?"),
+    }
+}
+
+/// `min box prune [--older-than <d>] [--parent <box>] [--yes]`: removes
+/// the stopped and exited boxes that match, as BOX-021 defines. With
+/// `--parent`, only the host that keeps that box is pruned. Without it,
+/// every local host that is running is pruned.
+pub async fn cmd_box_prune(global: &GlobalArgs, args: BoxPruneArgs) -> Result<(), anyhow::Error> {
+    let gate = prune_gate(args.yes, global.no_input, std::io::stdin().is_terminal())
+        .inspect_err(|_| tracing::info!(verb = "box prune", outcome = "refused", "no --yes"))?;
+    if gate == PruneGate::Confirm {
+        let question = prune_question(args.older_than, args.parent.as_deref());
+        if !confirm(&question, false)? {
+            tracing::info!(verb = "box prune", outcome = "declined");
+            println!("Nothing was removed.");
+            return Ok(());
+        }
+    }
+    ensure_daemon(global)?;
+    let hosts = crate::cmd::list::local_hosts(global)?;
+    let (hosts, parent) = match &args.parent {
+        Some(parent) => {
+            let resolved = resolve_box_on_hosts(hosts, parent, "box prune").await?;
+            (vec![resolved.host], Some(resolved.box_id))
+        }
+        None => (hosts, None),
+    };
+    let request = box_prune_request(args.older_than, parent);
+    let mut out = std::io::stdout().lock();
+    let tally = prune_hosts(hosts, parent.is_some(), request, &mut out).await?;
+    tracing::info!(
+        verb = "box prune",
+        reaped = tally.reaped,
+        failed = tally.failed,
+        failed_hosts = tally.failed_hosts.len(),
+        outcome = "pruned"
+    );
+    finish_prune(&tally, &mut out, &mut std::io::stderr().lock())
+}
+
+/// What `min box prune` did across its hosts: how many boxes it removed and
+/// did not, how many hosts it pruned, and each host it could not prune with
+/// the reason.
+#[derive(Debug, Default)]
+pub(crate) struct PruneTally {
+    pub reaped: usize,
+    pub failed: usize,
+    pub pruned_hosts: usize,
+    pub failed_hosts: Vec<(String, anyhow::Error)>,
+}
+
+/// Prunes each host in `hosts` with `request`. A host that fails does not
+/// stop the prune: its error goes in the tally and the next host is pruned.
+/// A host that is not selected is probed first, and one that is not running
+/// is skipped. Only a write to `out` that fails ends the walk.
+pub(crate) async fn prune_hosts(
+    hosts: Vec<crate::cmd::list::LocalHost>,
+    by_parent: bool,
+    request: minimald_rpc::PruneBoxesRequest,
+    out: &mut impl std::io::Write,
+) -> Result<PruneTally, anyhow::Error> {
+    let mut tally = PruneTally::default();
+    for host in hosts {
+        let client = if host.selected || by_parent {
+            gated_box_host_client(&host).await.map(Some)
+        } else {
+            match client::Client::probe(&host.sock).await {
+                Ok(mut client) => client::ensure_version_match(&mut client)
+                    .await
+                    .map(|()| Some(client)),
+                Err(client::ProbeRefusal::NotRunning) => Ok(None),
+                Err(client::ProbeRefusal::Unreachable(e)) => Err(e),
+            }
+        };
+        let pruned = match client {
+            Ok(None) => continue,
+            Ok(Some(mut client)) => prune_host(&mut client, &host, out, request.clone()).await,
+            Err(e) => Err(e),
+        };
+        match pruned {
+            Ok((reaped, failed)) => {
+                tally.reaped += reaped;
+                tally.failed += failed;
+                tally.pruned_hosts += 1;
+            }
+            Err(e) => {
+                tracing::warn!(verb = "box prune", host = %host.host, error = %format!("{e:#}"), "host prune failed");
+                tally.failed_hosts.push((host.host, e));
+            }
+        }
+    }
+    Ok(tally)
+}
+
+/// Ends `min box prune` from its `tally`: one line on `err` for each host it
+/// could not prune, then an error that counts the boxes and the hosts that
+/// failed. With no failure and nothing removed, it says so on `out`.
+pub(crate) fn finish_prune(
+    tally: &PruneTally,
+    out: &mut impl std::io::Write,
+    err: &mut impl std::io::Write,
+) -> Result<(), anyhow::Error> {
+    for (host, e) in &tally.failed_hosts {
+        writeln!(err, "Could not prune host {host}: {e:#}")?;
+    }
+    let plural =
+        |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let mut summary = Vec::new();
+    if tally.failed > 0 {
+        summary.push(format!(
+            "Prune could not remove {} of {}.",
+            tally.failed,
+            plural(tally.reaped + tally.failed, "box", "boxes")
+        ));
+    }
+    if !tally.failed_hosts.is_empty() {
+        summary.push(format!(
+            "Prune failed on {} of {}.",
+            tally.failed_hosts.len(),
+            plural(
+                tally.pruned_hosts + tally.failed_hosts.len(),
+                "host",
+                "hosts"
+            )
+        ));
+    }
+    if !summary.is_empty() {
+        bail!("{}", summary.join(" "));
+    }
+    if tally.reaped == 0 {
+        writeln!(
+            out,
+            "No stopped or exited box matched, so nothing was removed."
+        )?;
+    }
+    Ok(())
+}
+
+/// Prunes the host `client` serves with `request`, writes one line for each
+/// box it removed to `out` and one line for each it did not to stderr, and
+/// retires the row or the name hold each removed box leaves on the VM host
+/// daemon. Returns how many boxes it removed and how many it did not.
+pub(crate) async fn prune_host(
+    client: &mut client::Client,
+    host: &crate::cmd::list::LocalHost,
+    out: &mut impl std::io::Write,
+    request: minimald_rpc::PruneBoxesRequest,
+) -> Result<(usize, usize), anyhow::Error> {
+    use minimald_rpc::{Errorable, PruneBoxes};
+
+    // The records of the boxes a prune can remove carry the pair each box's
+    // registration handed back, which the withdrawal after the prune
+    // presents. The prune reaps the boxes all the same without them.
+    let mut addresses = std::collections::HashMap::new();
+    if host.provider == crate::cmd::list::LOCAL_MINVMD_PROVIDER {
+        for entry in list_box_records(client, None).await.unwrap_or_default() {
+            if entry.state == "stopped" || entry.state == "exited" {
+                let record = get_session_record(client, &entry.box_id.to_string())
+                    .await
+                    .ok()
+                    .and_then(|resp| resp.record);
+                addresses.insert(entry.box_id, record.and_then(|r| r.box_addresses));
+            }
+        }
+    }
+    let pruned = match client
+        .oneshot_rpc::<PruneBoxes>(request)
+        .await
+        .context("PruneBoxes RPC failed")?
+    {
+        Errorable::Ok(pruned) => pruned,
+        Errorable::Err { error } => bail!("{error}"),
+    };
+    let control_sock = box_host_control_sock(host);
+    for entry in &pruned.reaped {
+        let name = entry.name.as_deref();
+        let box_addresses = addresses.get(&entry.box_id).copied().flatten();
+        withdraw_box_row(control_sock.clone(), name, box_addresses, None).await;
+        release_held_box_name(control_sock.clone(), entry.box_id, name, box_addresses).await;
+    }
+    write_prune_lines(out, &pruned)?;
+    Ok((pruned.reaped.len(), pruned.failed.len()))
+}
+
+/// The lines `min box prune` prints for one host's answer `pruned`: one on
+/// `out` for each box it removed, and one on stderr for each it did not.
+fn write_prune_lines(
+    out: &mut impl std::io::Write,
+    pruned: &minimald_rpc::PruneBoxesResponse,
+) -> std::io::Result<()> {
+    for entry in &pruned.reaped {
+        match &entry.name {
+            Some(name) => writeln!(out, "Removed {name} ({}).", entry.box_id)?,
+            None => writeln!(out, "Removed {}.", entry.box_id)?,
+        }
+    }
+    for failure in &pruned.failed {
+        eprintln!("Could not remove {}: {}", failure.box_id, failure.error);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1014,6 +1551,258 @@ mod tests {
         assert_eq!(
             listed_state(&mut client, "web").await.as_deref(),
             Some("running")
+        );
+    }
+
+    // BCLI-058: `min box rename` renames the box as BOX-010 defines. A name
+    // a running box holds is refused with exit 2, and the refusal names the
+    // holder. The reserved name `self` is refused too.
+    #[tokio::test]
+    async fn box_rename_renames_as_box_010() {
+        let log = minimald::test_harness::captured_log();
+        let (_server, _dir, _project, mut client) = daemon_with_boxes(&["web", "api"]).await;
+
+        let web = listed_id(&mut client, "web").await;
+        let mut out = Vec::new();
+        rename_listed_box(&mut client, &mut out, web, "web", "front")
+            .await
+            .expect("the rename succeeds");
+        assert_eq!(String::from_utf8(out).unwrap(), "Renamed web to front.\n");
+        assert_eq!(listed_state(&mut client, "web").await, None);
+        assert_eq!(listed_id(&mut client, "front").await, web);
+        assert!(
+            log.contents().contains("renamed a box"),
+            "{}",
+            log.contents()
+        );
+
+        // The running box `front` holds the name, so `api` cannot take it.
+        let api = listed_id(&mut client, "api").await;
+        let mut out = Vec::new();
+        let err = rename_listed_box(&mut client, &mut out, api, "api", "front")
+            .await
+            .expect_err("a held name is refused");
+        let refusal = err
+            .downcast_ref::<BoxRenameRefusal>()
+            .unwrap_or_else(|| panic!("the refusal is typed: {err:#}"));
+        assert_eq!(BoxRenameRefusal::EXIT_CODE, 2);
+        let text = refusal.to_string();
+        assert!(text.contains(&web.to_string()), "names the holder: {text}");
+        assert!(text.contains("`front`"), "names the holder: {text}");
+        assert!(out.is_empty());
+        assert_eq!(listed_id(&mut client, "api").await, api);
+
+        // `self` is reserved.
+        let err = rename_listed_box(&mut client, &mut Vec::new(), api, "api", "self")
+            .await
+            .expect_err("`self` is refused");
+        assert!(err.downcast_ref::<BoxRenameRefusal>().is_some(), "{err:#}");
+
+        // Any other daemon error is not the refusal.
+        assert_eq!(
+            BoxRenameRefusal::from_error("session is already named `api`"),
+            None
+        );
+    }
+
+    // BCLI-061: `min box prune` asks for BOX-021's prune, with the
+    // `older-than` selector for `--older-than` and the `parent` selector for
+    // `--parent`. A running box is never removed.
+    #[tokio::test]
+    async fn box_prune_flags_map_to_box_021_selectors() {
+        // The flags map to the selectors.
+        let parent = boxes::SessionId::from_bytes([7; 16]);
+        let age = crate::cli::parse_box_age("7d").unwrap();
+        assert_eq!(age.as_secs(), 7 * 86_400);
+        assert_eq!(
+            box_prune_request(Some(age), Some(parent)),
+            minimald_rpc::PruneBoxesRequest {
+                older_than_secs: Some(7 * 86_400),
+                parent: Some(parent),
+            }
+        );
+        assert_eq!(
+            box_prune_request(None, None),
+            minimald_rpc::PruneBoxesRequest::default()
+        );
+        // The terminal question names every selector it was given.
+        assert_eq!(
+            prune_question(None, None),
+            "Remove every stopped or exited box?"
+        );
+        assert_eq!(
+            prune_question(None, Some("api")),
+            "Remove every stopped or exited child box of api?"
+        );
+        assert_eq!(
+            prune_question(Some(age), None),
+            "Remove every box that stopped or exited at least 7d ago?"
+        );
+        assert_eq!(
+            prune_question(crate::cli::parse_box_age("90s").ok(), Some("api")),
+            "Remove every child box of api that stopped or exited at least 90s ago?"
+        );
+        for (arg, secs) in [("12h", 43_200), ("30m", 1_800), ("90s", 90), ("0d", 0)] {
+            assert_eq!(crate::cli::parse_box_age(arg).unwrap().as_secs(), secs);
+        }
+        for bad in ["", "7", "d", "7y", "-1d", "1.5h"] {
+            let err = crate::cli::parse_box_age(bad).expect_err(bad);
+            assert!(err.contains("such as 7d, 12h, 30m or 90s"), "{err}");
+        }
+
+        let (_server, dir, _project, mut client) = daemon_with_boxes(&["web", "api", "db"]).await;
+        let host = crate::cmd::list::LocalHost {
+            provider: crate::cmd::list::LOCAL_PROVIDER,
+            host: "local0".to_owned(),
+            sock: dir.path().join("ssh.sock"),
+            selected: true,
+        };
+        let web = listed_id(&mut client, "web").await;
+        let api = listed_id(&mut client, "api").await;
+        for id in [web, api] {
+            stop_listed_box(&mut client, &mut Vec::new(), id, "box", false)
+                .await
+                .expect("the stop succeeds");
+        }
+
+        // The boxes stopped just now, so an hour's age matches none.
+        let mut out = Vec::new();
+        let pruned = prune_host(
+            &mut client,
+            &host,
+            &mut out,
+            box_prune_request(Some(std::time::Duration::from_secs(3_600)), None),
+        )
+        .await
+        .expect("the prune succeeds");
+        assert_eq!(pruned, (0, 0));
+        assert!(out.is_empty());
+
+        // No box is a child of `db`, so its parent selector matches none.
+        let db = listed_id(&mut client, "db").await;
+        let pruned = prune_host(
+            &mut client,
+            &host,
+            &mut Vec::new(),
+            box_prune_request(None, Some(db)),
+        )
+        .await
+        .expect("the prune succeeds");
+        assert_eq!(pruned, (0, 0));
+        assert_eq!(
+            listed_state(&mut client, "web").await.as_deref(),
+            Some("stopped")
+        );
+
+        // With no selector, every stopped box goes, and the running one stays.
+        let mut out = Vec::new();
+        let pruned = prune_host(&mut client, &host, &mut out, box_prune_request(None, None))
+            .await
+            .expect("the prune succeeds");
+        assert_eq!(pruned, (2, 0));
+        let mut lines: Vec<String> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        lines.sort();
+        let mut want = vec![
+            format!("Removed api ({api})."),
+            format!("Removed web ({web})."),
+        ];
+        want.sort();
+        assert_eq!(lines, want);
+        assert_eq!(listed_state(&mut client, "web").await, None);
+        assert_eq!(listed_state(&mut client, "api").await, None);
+        assert_eq!(
+            listed_state(&mut client, "db").await.as_deref(),
+            Some("running")
+        );
+    }
+
+    // BCLI-061: a host that `min box prune` cannot prune does not stop the
+    // prune. The other hosts are still pruned, the failed host is named with
+    // its reason, and the command ends with an error that counts it.
+    #[tokio::test]
+    async fn box_prune_goes_on_past_a_failed_host() {
+        let (_server, dir, _project, mut client) = daemon_with_boxes(&["web", "db"]).await;
+        let web = listed_id(&mut client, "web").await;
+        stop_listed_box(&mut client, &mut Vec::new(), web, "box", false)
+            .await
+            .expect("the stop succeeds");
+
+        // A host whose socket accepts and then closes: its probe fails.
+        let broken_sock = dir.path().join("broken.sock");
+        let listener = tokio::net::UnixListener::bind(&broken_sock).unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        let hosts = vec![
+            crate::cmd::list::LocalHost {
+                provider: crate::cmd::list::LOCAL_PROVIDER,
+                host: "broken0".to_owned(),
+                sock: broken_sock,
+                selected: false,
+            },
+            crate::cmd::list::LocalHost {
+                provider: crate::cmd::list::LOCAL_PROVIDER,
+                host: "local0".to_owned(),
+                sock: dir.path().join("ssh.sock"),
+                selected: true,
+            },
+        ];
+
+        let mut out = Vec::new();
+        let tally = prune_hosts(hosts, false, box_prune_request(None, None), &mut out)
+            .await
+            .expect("only a write to out can end the walk");
+        assert_eq!((tally.reaped, tally.failed, tally.pruned_hosts), (1, 0, 1));
+        assert_eq!(tally.failed_hosts.len(), 1);
+        assert_eq!(tally.failed_hosts[0].0, "broken0");
+        assert_eq!(
+            String::from_utf8(out.clone()).unwrap(),
+            format!("Removed web ({web}).\n")
+        );
+        assert_eq!(listed_state(&mut client, "web").await, None);
+        assert_eq!(
+            listed_state(&mut client, "db").await.as_deref(),
+            Some("running")
+        );
+
+        let mut err = Vec::new();
+        let summary = finish_prune(&tally, &mut out, &mut err).expect_err("a host failed");
+        let err = String::from_utf8(err).unwrap();
+        assert!(err.starts_with("Could not prune host broken0: "), "{err}");
+        assert_eq!(err.lines().count(), 1, "{err}");
+        assert_eq!(summary.to_string(), "Prune failed on 1 of 2 hosts.");
+
+        // The box count says "box" for one.
+        let one_failed = PruneTally {
+            failed: 1,
+            pruned_hosts: 1,
+            ..PruneTally::default()
+        };
+        let summary =
+            finish_prune(&one_failed, &mut Vec::new(), &mut Vec::new()).expect_err("a box failed");
+        assert_eq!(summary.to_string(), "Prune could not remove 1 of 1 box.");
+    }
+
+    // BCLI-005: off a terminal, or under `--no-input`, `min box prune`
+    // without `--yes` is refused with exit 2, naming `--yes`. On a terminal
+    // it asks, and `--yes` prunes without asking.
+    #[test]
+    fn prune_off_tty_needs_yes() {
+        assert_eq!(prune_gate(false, false, false), Err(PruneNeedsYes));
+        assert_eq!(prune_gate(false, true, true), Err(PruneNeedsYes));
+        assert_eq!(prune_gate(false, false, true), Ok(PruneGate::Confirm));
+        assert_eq!(prune_gate(true, false, false), Ok(PruneGate::Proceed));
+        assert_eq!(prune_gate(true, true, true), Ok(PruneGate::Proceed));
+        assert_eq!(PruneNeedsYes::EXIT_CODE, 2);
+        assert_eq!(
+            PruneNeedsYes.to_string(),
+            "Prune removes boxes. Pass --yes to confirm, or --dry-run to see what it would remove."
         );
     }
 }

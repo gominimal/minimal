@@ -388,9 +388,10 @@ the lane's whole reach. The gate still refuses everything else the box
 sends to the proxy's address. A box without the lane omits the row, so
 the missing row means the box runs without a lane.
 
-The gate that admits the lane sits only in front of own-address boxes. A
-box in any other mode still prints the row it declared, marked as not in
-effect, with the box's mode named:
+The lane takes effect with `--network own_ip`, and with `--network
+host_ip` on a host that runs boxes in a VM. Every other box still prints
+the row it declared, with the `(not in effect: <mode> box)` mark. This
+example is a `host_ip` box on a host that runs boxes natively:
 
 ```
 egress
@@ -474,7 +475,8 @@ shape. A client written against the earlier document ignores them. A
 client that reads them finds a value in every `ingress` object. The
 document also carries `credentialed_upstream`, an object, when the box
 declared a lane, in any network mode. Its `effective` field is `true`
-for an own-address box and `false` for any other, the text row's
+for an `own_ip` box, and for a `host_ip` box on a host that runs boxes in
+a VM. It is `false` for any other box, the text row's
 `(not in effect: …)` mark. The document leaves the key out when the box
 did not declare a lane, so a missing key means the box runs without one.
 

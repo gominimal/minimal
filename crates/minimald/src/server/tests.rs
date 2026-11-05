@@ -1958,9 +1958,9 @@ async fn proxy_publish_in_use_is_reported_not_retried() {
         "a handed port has no rung to walk to, got: {log}"
     );
     assert!(
-        state.proxy_unavailable().await.is_some(),
-        "the terminal failure must stay recorded as the unavailable note \
-         min ls warns from"
+        state.proxy_unavailable().await.is_none(),
+        "a host-held port records no cause in the guest: the VM host \
+         daemon records the cause that min ls reads"
     );
     assert!(
         state.hostname_proxy_port().await.is_none(),
