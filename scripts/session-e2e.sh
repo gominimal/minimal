@@ -24403,8 +24403,8 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       return 0
     fi
 
-    # The `run box ended` record this half reads at its end is at info under
-    # `minimald::exec`, and a daemon's filter is fixed at its spawn — so the
+    # The `task box ended` record this half reads at its end is at info under
+    # `minimald::box_actor`, and a daemon's filter is fixed at its spawn — so the
     # half that reads a record pins the module it lives in, the way the port
     # half pins its two above. The port half's restart cannot stand in for
     # this one: a lane with no switch skips that half outright, leaving the
@@ -24419,7 +24419,7 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     if hook_log_readable; then
       mnl stop >/dev/null 2>&1 || true # a standalone run has no daemon yet
       PO_RUN_SAVED_RUST_LOG="${RUST_LOG:-}"
-      export RUST_LOG="warn,minimald::exec=info"
+      export RUST_LOG="warn,minimald::exec=info,minimald::box_actor=info"
     fi
     po_run_restore_log() {
       # Guarded on the same predicate the pin was: a lane this half never
@@ -24442,14 +24442,14 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       # the exec's exit status, not on the client — so the beat kills the
       # client INSIDE the command's running window (the marker gates it: the
       # command is up, the sleep still has its seconds to run) and then
-      # demands the box delisted after the command exits. A client the
+      # demands the box ended after the command exits. A client the
       # daemon sees vanish ends the exec'd command first — the lost-client
       # contract `lost_exec_client_kills_only_its_own_process` pins the
       # daemon killing the child when the client's channel closes, then
       # waiting for it — and a command ended that way is the command
       # exiting: the exit the destroy keys on either way. Five seconds is
       # the window: short enough that the run ends shortly after the kill
-      # (the 90 s delist poll below holds it), long enough that the marker
+      # (the 90 s state poll below holds it), long enough that the marker
       # read, the `min ls` and the kill all land while the command runs.
       printf '\n[tasks.e2e-port-run]\nbash = "echo %s; sleep 5"\n' "$PO_RUN_MARKER"
     } > "$PO_TASK_SEED_DIR/minimal.toml"
@@ -24541,25 +24541,33 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     fi
     echo "run: the box ended with its run's command as $po_task_state, exit code $po_task_code — the end keyed on the exit, not on the client's death (NET-131)"
     # The daemon-side end's own record, where the lane can read it: one line
-    # naming the session, the run and the exit its box ended with — at info
-    # under the module this half pinned the daemon to above, whatever filter
-    # the lane's earlier proofs left it running under.
+    # naming the box, the task and the exit code its entrypoint returned —
+    # at info under the module this half pinned the daemon to above,
+    # whatever filter the lane's earlier proofs left it running under. The
+    # box's actor writes it whether or not a client is connected.
     if hook_log_readable; then
       po_end_rec=""
       for _ in $(seq 1 20); do
-        po_end_rec="$(grep -h -- 'run box ended' "$(po_daemon_log)" 2>/dev/null \
+        po_end_rec="$(grep -h -- 'task box ended' "$(po_daemon_log)" 2>/dev/null \
           | grep -F -- '"task":"e2e-port-run"' | tail -n1 || true)"
         [ -n "$po_end_rec" ] && break
         sleep 0.25
       done
       if [ -z "$po_end_rec" ]; then
-        echo "::error::no 'run box ended' record names the task's run — the daemon-side destroy NET-131 moved has no record of firing"
+        echo "::error::no 'task box ended' record names the task's run — the daemon logged no end for a task box whose client was lost"
         echo "--- daemon log (tail) ---"; tail -20 "$(po_daemon_log)" 2>/dev/null || true
         fail
       fi
       echo "daemon log: $po_end_rec"
     else
       echo "run-box-ended log check skipped (guest-side daemon log on VM lane)"
+    fi
+    # The ended box keeps its record (BOX-038). Remove it, so no later case
+    # finds it listed.
+    if ! po_rm_out="$(mnl box rm "$po_task_box" </dev/null 2>&1)"; then
+      echo "::error::min box rm $po_task_box failed for the ended run box"
+      printf '%s\n' "$po_rm_out"
+      fail
     fi
     rm -rf "$PO_TASK_SEED_DIR"; PO_TASK_SEED_DIR=""
     po_run_restore_log

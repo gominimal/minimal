@@ -745,12 +745,13 @@ pub(super) struct TaskEntrypointBox {
     dir: boxes::store::BoxDir,
 }
 
-/// The task box `exec` runs in, when its entrypoint is the task: a box of
-/// the task type whose stored spec names this task as its entry and an
-/// argv as its entrypoint. `None` sends the request down the older path:
-/// a request that carries the task's arguments (a client from before T43
-/// sends them there, not in the spec), a box of another type, or a box
-/// with no spec that can be read. A request's directory is no reason for
+/// The task box `exec` runs in, when its entrypoint is the task: a box
+/// whose stored spec sets `lifetime = "until_complete"`, names an argv as
+/// its entrypoint and this task as its entry. The spec's settings decide,
+/// never its Box Type. `None` sends the request down the older path: a
+/// request that carries the task's arguments (a client from before T43
+/// sends them there, not in the spec), a box whose spec says otherwise,
+/// or a box with no spec that can be read. A request's directory is no reason for
 /// the older path: the entrypoint starts there (see
 /// [`TaskEntrypointBox::start`]).
 pub(super) async fn task_entrypoint_box(
@@ -772,9 +773,8 @@ pub(super) async fn task_entrypoint_box(
     )
     .ok()?;
     let spec = crate::box_runtime::stored_spec(&bytes).ok()?;
-    let is_task_entrypoint = spec.box_type == boxes::TASK_BOX_TYPE
-        && spec.entry == exec.task
-        && matches!(spec.entrypoint, mfile::spec::Entrypoint::Exec(_));
+    let is_task_entrypoint =
+        crate::box_actor::entry_run_as_entrypoint(&spec) == Some(exec.task.as_str());
     is_task_entrypoint.then_some(TaskEntrypointBox { record, dir })
 }
 
@@ -782,7 +782,7 @@ pub(super) async fn task_entrypoint_box(
 /// output. The host appends to the log with no wake-up to send.
 const ENTRYPOINT_LOG_POLL: Duration = Duration::from_millis(100);
 
-/// How long the relay waits for the box's actor to write the ended record
+/// How long the run waits for the box's actor to write the ended record
 /// after the entrypoint's host ends.
 const ENTRYPOINT_RECORD_WAIT: Duration = Duration::from_secs(30);
 
@@ -847,9 +847,11 @@ impl TaskEntrypointBox {
             writer.write_all(notice.as_bytes()).await?;
         }
         let relay = spawn(
-            relay_entrypoint_log(host, self.dir.clone(), offset, writer).instrument(span.clone()),
+            relay_entrypoint_log(host.clone(), self.dir.clone(), offset, writer)
+                .instrument(span.clone()),
         );
         Ok(EntrypointProcess {
+            host,
             record_dir: self.dir.clone(),
             box_id,
             box_name,
@@ -934,6 +936,8 @@ fn strip_terminal_cr(bytes: &[u8], held_cr: &mut bool) -> Vec<u8> {
 /// kill of the run, stops the relay, and the box runs on (BOX-015). The
 /// box ends when its entrypoint returns (BOX-038), and keeps its record.
 pub struct EntrypointProcess {
+    /// The entrypoint's host. The run reads the exit code once it ends.
+    host: crate::box_runtime::HostHandle,
     /// Where the box's record is read from once the entrypoint ends: the
     /// box's actor stops with the box, so its handle answers no more.
     record_dir: boxes::store::BoxDir,
@@ -1003,6 +1007,11 @@ impl Process for EntrypointProcess {
             let _ = relay.await;
             self.relay = None;
         }
+        // The relay can stop before the entrypoint ends, on a log it cannot
+        // read. The code comes only when the host ends, so wait for that.
+        while self.host.is_alive() {
+            tokio::time::sleep(ENTRYPOINT_LOG_POLL).await;
+        }
         let code = self.recorded_code().await;
         let _entered = self.span.enter();
         match &code {
@@ -1011,14 +1020,14 @@ impl Process for EntrypointProcess {
                 box_name = %self.box_name,
                 task = %self.task,
                 exit_code = ?code,
-                "task box ended"
+                "task run: returned the entrypoint's exit code"
             ),
             Err(error) => tracing::warn!(
                 box_id = %self.box_id,
                 box_name = %self.box_name,
                 task = %self.task,
                 %error,
-                "task box ended with no exit code"
+                "task run: the entrypoint ended, and the run has no exit code"
             ),
         }
         code

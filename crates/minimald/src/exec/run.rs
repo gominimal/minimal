@@ -42,7 +42,9 @@ pub(super) async fn run_in_session(
 /// sets `owns_box` on a task run. A newer `min task run` runs the task as
 /// its box's entrypoint and owns no box, so the box ends when the task
 /// returns and keeps its record (BOX-038). Flip condition: the release
-/// after T43 (#2405) drops `owns_box` and this function with it. The destroy used to be the client's, issued after a normal
+/// after T43 (#2405) drops `owns_box` and this function with it.
+///
+/// The destroy used to be the client's, issued after a normal
 /// run; left there, a client killed mid-run would strand its session — the
 /// abandoned-launch reap covers only un-finalized sessions and there is no
 /// idle stop to catch one. The teardown is the `DestroySession` RPC's own

@@ -364,35 +364,38 @@ pub(crate) mod entrypoint_env {
         LazyLock::new(Mutex::default);
 
     /// Stages `vars` and `start_dir` for the next entrypoint launch of box
-    /// `id`, in place of any staged before.
+    /// `id`, in place of any staged before. Only a task run that relays
+    /// the box's entrypoint stages, so a staged entry also tells the next
+    /// [`super::BoxActor::ensure_host`] that it starts the entrypoint.
     pub(crate) fn stage(id: boxes::SessionId, vars: Vars, start_dir: Option<String>) {
-        let mut staged = STAGED
+        STAGED
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if vars.is_empty() && start_dir.is_none() {
-            staged.remove(&id);
-        } else {
-            staged.insert(id, (vars, start_dir));
-        }
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id, (vars, start_dir));
     }
 
     /// Takes what is staged for box `id`, as the launch's connection
     /// variables. A staged directory rides among them under
     /// [`crate::box_runtime::START_DIR_KEY`], which the launch takes out
-    /// and starts the entrypoint in. Empty when nothing is staged.
-    pub(crate) fn take(id: &boxes::SessionId) -> Vars {
+    /// and starts the entrypoint in. `None` when no run staged anything.
+    pub(crate) fn take(id: &boxes::SessionId) -> Option<Vars> {
         let (mut vars, start_dir) = STAGED
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(id)
-            .unwrap_or_default();
+            .remove(id)?;
         vars.retain(|(name, _)| name != crate::box_runtime::START_DIR_KEY);
         if let Some(dir) = start_dir {
             vars.push((crate::box_runtime::START_DIR_KEY.to_string(), dir));
         }
-        vars
+        Some(vars)
     }
 }
+
+/// Why a task run cannot start the entrypoint of a box that has its own
+/// network address while a shell for its activate hooks runs (T43).
+pub(crate) const ENTRYPOINT_BEHIND_HOOK_SHELL: &str = "the task cannot start in this box. \
+     The box has its own network address, and the shell that ran the project's \
+     activate hooks holds it. Ending that shell releases the address";
 
 /// The actor's end of an [`watch_entrypoint_exit`] watch: it receives how
 /// the watched host's runtime loop ended, once, when it ends with an exit.
@@ -403,6 +406,16 @@ pub(super) type EntrypointWatch = tokio::sync::oneshot::Receiver<box_runtime::Ho
 /// as a spec stored without `box.lifetime` does.
 pub(super) fn ends_with_entrypoint(spec: Option<&mfile::spec::BoxSpec>) -> bool {
     spec.is_none_or(|spec| spec.lifetime == mfile::spec::Lifetime::UntilComplete)
+}
+
+/// The entry a box runs as its entrypoint and ends with (T43): the spec
+/// sets `lifetime = "until_complete"` and names an argv entrypoint. A task
+/// run relays such a box's entrypoint, and the daemon log names the entry
+/// when it returns. The settings decide it, never the Box Type's name.
+pub(crate) fn entry_run_as_entrypoint(spec: &mfile::spec::BoxSpec) -> Option<&str> {
+    let runs = spec.lifetime == mfile::spec::Lifetime::UntilComplete
+        && matches!(spec.entrypoint, mfile::spec::Entrypoint::Exec(_));
+    runs.then_some(spec.entry.as_str())
 }
 
 /// Watches a host's runtime loop `task` for the box's actor. When the loop
@@ -416,9 +429,15 @@ pub(super) fn ends_with_entrypoint(spec: Option<&mfile::spec::BoxSpec>) -> bool 
 ///
 /// The handle it returns stands in for `task`, as [`watch_quic443_exit`]'s
 /// does: it yields the loop's result, and an abort of it aborts the loop.
+///
+/// `entry` names the task a launch runs as its entrypoint (see
+/// [`entry_run_as_entrypoint`]). When that entrypoint returns on its own,
+/// the watch logs the box, the task and the exit code. It logs whether or
+/// not a client is connected, so the daemon log names each task box's end.
 pub(super) fn watch_entrypoint_exit(
     task: JoinHandle<Result<box_runtime::HostExit, std::io::Error>>,
     box_id: boxes::SessionId,
+    entry: Option<String>,
 ) -> (
     JoinHandle<Result<box_runtime::HostExit, std::io::Error>>,
     EntrypointWatch,
@@ -433,6 +452,21 @@ pub(super) fn watch_entrypoint_exit(
     let watched = crate::traced::spawn_detached(root, async move {
         let result = task.await;
         abort_loop.disarm();
+        if let (Ok(Ok(exit)), Some(task)) = (&result, entry.as_deref())
+            && !exit.requested
+        {
+            let exit_code = exit
+                .reason
+                .as_ref()
+                .and_then(|r| r.exit_code)
+                .unwrap_or(exit.code);
+            tracing::info!(
+                box_id = %box_id,
+                task,
+                exit_code,
+                "task box ended: its entrypoint returned"
+            );
+        }
         if let Ok(Ok(exit)) = &result {
             // The actor may be gone, or may hold a later launch's watch: the
             // exit is then nobody's to act on.
@@ -933,6 +967,10 @@ impl BoxActor {
         // Read before the launcher takes the spec: the host hands it to each
         // binding, which raises no shell-exit prompt for a box that ends.
         let ends_with_entrypoint = ends_with_entrypoint(spec.spec.as_deref());
+        let entry = (!for_hooks)
+            .then(|| spec.spec.as_deref().and_then(entry_run_as_entrypoint))
+            .flatten()
+            .map(str::to_string);
         let launcher = self
             .session_launcher(session_hnd, &record, spec, attach_env, phase, for_hooks)
             .await?;
@@ -1118,7 +1156,7 @@ impl BoxActor {
         };
         // BOX-038: the actor reads how this launch's loop ends. A later
         // launch replaces the watch, so an earlier loop never ends the box.
-        let (task, watch) = watch_entrypoint_exit(task, record.id);
+        let (task, watch) = watch_entrypoint_exit(task, record.id, entry);
         self.entrypoint_watch = Some(watch);
         // A write that fails costs only the restart's memory of who bound
         // the port, never this launch: said, and the box is handed back.
@@ -1314,6 +1352,8 @@ impl BoxActor {
     ) -> Result<box_runtime::HostHandle, AttachError> {
         // Taken first, so a staged value never waits for a later launch.
         let staged_env = entrypoint_env::take(self.record.id());
+        let entrypoint_run = staged_env.is_some();
+        let staged_env = staged_env.unwrap_or_default();
         let holds_host_row = {
             let record = self
                 .record
@@ -1385,11 +1425,19 @@ impl BoxActor {
                 }
             } else {
                 if replace {
+                    // The hook shell never exits (BOX-015), so a run that
+                    // relayed it would wait for a task that never starts.
                     tracing::warn!(
                         box_id = %self.record.id(),
-                        "kept the hook-launched shell: replacing it would end the box's \
-                         host-side row, so the box's entrypoint does not start"
+                        "refused the run: replacing the hook-launched shell would end the \
+                         box's host-side row, so the box's entrypoint cannot start"
                     );
+                    return Err(AttachError::SpawnFailed(std::io::Error::other(
+                        ENTRYPOINT_BEHIND_HOOK_SHELL,
+                    )));
+                }
+                if entrypoint_run {
+                    self.clear_ends_with_run().await;
                 }
                 // Same claim as the launch below, for a host this call did
                 // not mint: an exec is about to run in this sandbox, so a
@@ -1427,7 +1475,35 @@ impl BoxActor {
         // later attach must not replace it. See [`HostOrigin::Exec`].
         self.host_origin = HostOrigin::Exec;
         self.publish_host();
+        if entrypoint_run {
+            self.clear_ends_with_run().await;
+        }
         Ok(host)
+    }
+
+    /// Clears the record's `ends_with_run` mark once a task run started
+    /// the box's entrypoint (T43, NET-131). Until then a daemon restart
+    /// destroys the box, so a client lost before the task starts strands
+    /// no box. After it, the box ends with its entrypoint and keeps its
+    /// record (BOX-038). A failed write keeps the mark, and is logged.
+    async fn clear_ends_with_run(&mut self) {
+        let cleared = async {
+            let mut record = self.record.record().await?;
+            if !record.ends_with_run {
+                return Ok(());
+            }
+            record.ends_with_run = false;
+            self.record.write(record).await
+        }
+        .await;
+        if let Err(error) = cleared {
+            tracing::warn!(
+                box_id = %self.record.id(),
+                %error,
+                "the task started, but the box's record still says a daemon restart \
+                 destroys it"
+            );
+        }
     }
 
     /// Whether a launch of this box that is not for hooks starts an argv,

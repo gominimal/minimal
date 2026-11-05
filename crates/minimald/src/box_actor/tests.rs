@@ -16373,6 +16373,8 @@ async fn create_task_box(client: &mut TestClient, argv: &[&str]) -> SessionId {
     spec.entrypoint = mfile::spec::Entrypoint::Exec(argv.iter().map(ToString::to_string).collect());
     let mut req = crate::test_harness::create_session_req("check", "/tmp");
     req.config.creating_verb = minimald_rpc::CreatingVerb::Task;
+    // Marked as `min task run` without `--keep` marks it (NET-131).
+    req.config.ends_with_run = true;
     req.spec = Some(serde_json_lenient::to_value(&spec).expect("a spec serializes"));
     let id = client.call::<CreateSession>(&req).await.unwrap().id;
     crate::test_harness::unwrap_ready(
@@ -16548,6 +16550,71 @@ async fn until_complete_ends_on_entrypoint_return_without_client_then_a_run_read
     }
 }
 
+// BOX-015, T43: a task box with its own network address runs its project's
+// activate hooks in a shell that holds the box's host-side row. The shell
+// never exits, so a run that relayed it would wait for a task that never
+// starts. The run is refused at once, and the refusal says why.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn until_complete_ends_on_entrypoint_return_without_client_refuses_a_run_behind_a_hook_shell()
+{
+    use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
+
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("activated");
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let mut spec = mfile::spec::BoxSpec::for_task(
+        "check",
+        &mfile::Task::default(),
+        mfile::spec::SpecFlags::default(),
+    )
+    .expect("a task that is not interactive has a spec");
+    spec.entrypoint =
+        mfile::spec::Entrypoint::Exec(vec!["/bin/sleep".to_string(), "600".to_string()]);
+    let mut req = own_ip_handed_session_req(
+        "check",
+        std::net::Ipv4Addr::new(100, 64, 128, 24),
+        std::net::Ipv4Addr::new(127, 0, 64, 24),
+    );
+    req.config.creating_verb = minimald_rpc::CreatingVerb::Task;
+    req.spec = Some(serde_json_lenient::to_value(&spec).expect("a spec serializes"));
+    let id = client.call::<CreateSession>(&req).await.unwrap().id;
+    crate::test_harness::unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: contribution_with_hook(boxes::wire::primitives::WireLifecycleHook {
+                    on_activate: Some(inline(marker_body(&marker))),
+                    ..Default::default()
+                }),
+            })
+            .await
+            .unwrap(),
+    );
+    finalize_session(&mut client, id).await;
+    assert!(marker.exists(), "the activate hook launched the box");
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        client.exec(
+            &[(crate::MINIMAL_SESSION_ID_ENV, &id.to_string())],
+            false,
+            &task_box_run_request(),
+            b"",
+        ),
+    )
+    .await
+    .expect("the run is refused at once, not left waiting on the hook shell")
+    .expect("the daemon answers the run");
+    assert_ne!(outcome.exit_status, Some(0), "{outcome:?}");
+    let stderr = String::from_utf8_lossy(&outcome.stderr);
+    assert!(
+        stderr.contains(super::ENTRYPOINT_BEHIND_HOOK_SHELL),
+        "the refusal says why the task cannot start: {stderr:?}"
+    );
+}
+
 // BOX-015, T43: the client of a task run goes away while the box's
 // entrypoint runs. The run stops relaying, and the box runs on: the
 // entrypoint is not launched again, the record still runs, and no
@@ -16611,6 +16678,10 @@ async fn daemon_never_stops_for_idle_or_client_loss_of_a_task_run() {
     assert_eq!(
         record.state().unwrap(),
         boxes::core::record::RecordState::Running
+    );
+    assert!(
+        !record.ends_with_run,
+        "the task started, so a daemon restart no longer destroys the box"
     );
     let mut events = manager.box_events(id).await.unwrap();
     let events = events.read_new().unwrap();
