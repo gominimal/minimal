@@ -1214,21 +1214,48 @@ pub(crate) struct SharedService {
 /// of a plist, the next word of a service unit's `ExecStart=`. `None`
 /// when the unit passes none. Pure over the file's bytes.
 pub(crate) fn unit_admit_group(text: &str) -> Option<&str> {
-    let (_, rest) = text.split_once("--admit-group")?;
-    // The flag's `--admit-group=GROUP` spelling, which the service takes
-    // too, names the group in the same word.
-    if let Some(attached) = rest.strip_prefix('=') {
-        return attached
-            .split(|c: char| c.is_whitespace() || c == '<')
-            .next()
-            .filter(|group| !group.is_empty());
+    let arguments = unit_program_arguments(text);
+    let mut arguments = arguments.iter().copied();
+    while let Some(argument) = arguments.next() {
+        // The flag's `--admit-group=GROUP` spelling, which the service
+        // takes too, names the group in the same word.
+        if let Some(attached) = argument.strip_prefix("--admit-group=") {
+            return Some(attached).filter(|group| !group.is_empty());
+        }
+        if argument == "--admit-group" {
+            return arguments.next().filter(|group| !group.is_empty());
+        }
     }
-    if let Some(after) = rest.strip_prefix("</string>") {
-        let (_, from_open) = after.split_once("<string>")?;
-        let (group, _) = from_open.split_once("</string>")?;
-        return Some(group.trim()).filter(|group| !group.is_empty());
+    None
+}
+
+/// The program arguments the unit passes, in order: the `<string>`s of a
+/// plist's `ProgramArguments` array (up to its `</array>`), else the
+/// words of a service unit's first `ExecStart=` line. A word elsewhere in
+/// the file (a comment, a `Description=`) is not an argument. Pure.
+fn unit_program_arguments(text: &str) -> Vec<&str> {
+    if let Some(key) = text.find("<key>ProgramArguments</key>") {
+        let after = &text[key + "<key>ProgramArguments</key>".len()..];
+        let Some(open) = after.find("<array>") else {
+            return Vec::new();
+        };
+        let array = &after[open + "<array>".len()..];
+        let array = array.find("</array>").map_or(array, |end| &array[..end]);
+        return array
+            .split("<string>")
+            .skip(1)
+            .filter_map(|rest| rest.split_once("</string>").map(|(value, _)| value.trim()))
+            .collect();
     }
-    rest.split_whitespace().next()
+    service_exec_start_line(text)
+        .map(|line| line.split_whitespace().collect())
+        .unwrap_or_default()
+}
+
+/// The value of a service unit's first `ExecStart=` line, if any.
+fn service_exec_start_line(text: &str) -> Option<&str> {
+    text.lines()
+        .find_map(|line| line.trim_start().strip_prefix("ExecStart="))
 }
 
 /// The account the unit runs the service as, by platform: the plist's
@@ -1660,13 +1687,53 @@ fn uid_in_group(uid: Option<u32>, gid: u32) -> bool {
     uid.is_some_and(|uid| minvmd::net::answerer::uid_in_group(uid, gid))
 }
 
-/// The command that adds `user` to `group` on this platform.
+/// The command that adds `user` to `group` on this platform: the
+/// service's own line, so the channel's refusal and `--show` agree.
 fn add_to_group_command(user: &str, group: &str) -> String {
-    if cfg!(target_os = "macos") {
-        format!("sudo dseditgroup -o edit -a {user} -t user {group}")
-    } else {
-        format!("sudo usermod -aG {group} {user}")
+    minvmd::net::answerer::add_to_group_command(user, group)
+}
+
+/// What a read of the installed unit file found: no file, its text, or a
+/// file that is not text (a binary plist an MDM rewrote, or one this user
+/// may not read). The third is judged closed: the file may well be the
+/// shared service's, and a guess that it is not would run a removal or a
+/// replacement over everyone the service admits.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum UnitRead {
+    Absent,
+    Text(String),
+    Unreadable(String),
+}
+
+/// [`UnitRead`] of the bytes a read of `path` gave. Pure over the read's
+/// result, so each arm is unit-tested without a root-owned path.
+pub(crate) fn unit_read(path: &str, read: std::io::Result<Vec<u8>>) -> UnitRead {
+    match read {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => UnitRead::Absent,
+        Err(error) => UnitRead::Unreadable(format!("{path} could not be read: {error}")),
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(text) => UnitRead::Text(text),
+            Err(_) => UnitRead::Unreadable(format!(
+                "{path} is not a text file (a binary plist, as `plutil -convert binary1` \
+                 or a device-management rewrite leaves it; `plutil -convert xml1 {path}` \
+                 as root makes it readable again)"
+            )),
+        },
     }
+}
+
+/// The refusal an unreadable unit earns from every guard: nothing that
+/// would act on the service runs while what the unit says is unknown.
+fn unreadable_unit_refusal(why: &str) -> String {
+    format!(
+        "Minimal's DNS service unit on this machine could not be read, so whether it is \
+         one user's or the one installed for a group is unknown: {why}. Nothing was run."
+    )
+}
+
+/// [`unit_read`] over the installed unit on this host.
+fn read_installed_unit(path: &str) -> UnitRead {
+    unit_read(path, std::fs::read(path))
 }
 
 /// The gid of the group `name`; `None` when no such group exists.
@@ -2134,9 +2201,12 @@ pub(crate) async fn read_answerer_step() -> AnswererStep {
     for path in ANSWERER_UNIT_PATHS {
         units.push(file_custody(path).await);
     }
-    let unit_text = tokio::fs::read_to_string(ANSWERER_UNIT_PATHS[ANSWERER_UNIT_PATHS.len() - 1])
-        .await
-        .ok();
+    let unit_path = ANSWERER_UNIT_PATHS[ANSWERER_UNIT_PATHS.len() - 1];
+    let unit = unit_read(unit_path, tokio::fs::read(unit_path).await);
+    let unit_text = match &unit {
+        UnitRead::Text(text) => Some(text.as_str()),
+        UnitRead::Absent | UnitRead::Unreadable(_) => None,
+    };
     let channel = file_custody(
         &minvmd::net::answerer::resolve_channel_sock()
             .display()
@@ -2202,6 +2272,15 @@ pub(crate) async fn read_answerer_step() -> AnswererStep {
             refuse_foreign_operator(step, facts.channel_owner, operator_uid, owner_is_account)
         }
     };
+    // A unit that is there but not readable as text may be the shared
+    // service's: no step is offered over it (fail closed), and the reason
+    // names the file and what makes it readable.
+    if let UnitRead::Unreadable(why) = &unit {
+        return AnswererStep::SourceUnavailable {
+            service: Box::new(step),
+            reason: unreadable_unit_refusal(why),
+        };
+    }
     if matches!(step, AnswererStep::SourceUnavailable { .. }) {
         return step;
     }
@@ -4230,8 +4309,11 @@ pub(crate) fn shared_service_undo_refusal_on_this_host() -> Option<String> {
     let path = ANSWERER_PLIST_PATH;
     #[cfg(not(target_os = "macos"))]
     let path = ANSWERER_UNIT_SERVICE_PATH;
-    let text = std::fs::read_to_string(path).ok()?;
-    shared_service_undo_refusal(&text)
+    match read_installed_unit(path) {
+        UnitRead::Absent => None,
+        UnitRead::Text(text) => shared_service_undo_refusal(&text),
+        UnitRead::Unreadable(why) => Some(unreadable_unit_refusal(&why)),
+    }
 }
 
 /// [`shared_service_undo_refusal_on_this_host`] over a unit's text. Pure.
@@ -4254,8 +4336,11 @@ pub(crate) fn other_operator_refusal_on_this_host() -> Option<String> {
     #[cfg(not(target_os = "macos"))]
     let (path, operator_of): (&str, fn(&str) -> Option<&str>) =
         (ANSWERER_UNIT_SERVICE_PATH, service_user);
-    let text = std::fs::read_to_string(path).ok();
-    other_operator_refusal(text.as_deref(), operator_of, &operator_name())
+    match read_installed_unit(path) {
+        UnitRead::Absent => other_operator_refusal(None, operator_of, &operator_name()),
+        UnitRead::Text(text) => other_operator_refusal(Some(&text), operator_of, &operator_name()),
+        UnitRead::Unreadable(why) => Some(unreadable_unit_refusal(&why)),
+    }
 }
 
 /// The command [`command`] renders for this host with the answerer step
@@ -7445,6 +7530,29 @@ exit 0
     /// decision is tested without a root-owned path.
     #[test]
     fn finalize_install_refuses_another_users_service() {
+        /// `text` with `--admit-group _minimal` among its program
+        /// arguments: inside the plist's `ProgramArguments` array, or on
+        /// the service unit's `ExecStart=` line.
+        fn shared_unit(text: &str) -> String {
+            if let Some(key) = text.find("<key>ProgramArguments</key>") {
+                let close = key + text[key..].find("</array>").expect("the array closes");
+                format!(
+                    "{}<string>--admit-group</string><string>_minimal</string>{}",
+                    &text[..close],
+                    &text[close..]
+                )
+            } else {
+                text.lines()
+                    .map(|line| {
+                        if line.trim_start().starts_with("ExecStart=") {
+                            format!("{line} --admit-group _minimal\n")
+                        } else {
+                            format!("{line}\n")
+                        }
+                    })
+                    .collect()
+            }
+        }
         let install = AnswererInstall {
             operator: "alice".to_string(),
             ..test_install()
@@ -7474,11 +7582,10 @@ exit 0
             );
             assert_eq!(other_operator_refusal(None, operator_of, "bob"), None);
             // A shared service's unit (it admits a group) is nobody's to
-            // replace: no refusal, whoever asks.
-            let shared = format!(
-                "{text}\n<key>ProgramArguments</key><array><string>/x/minzoned</string>\
-                 <string>--admit-group</string><string>_minimal</string></array>"
-            );
+            // replace: no refusal, whoever asks. The flag goes into the
+            // unit's own program arguments, where the package puts it.
+            let shared = shared_unit(text);
+            assert_ne!(shared, text, "the fixture carries the flag");
             assert_eq!(
                 other_operator_refusal(Some(&shared), operator_of, "bob"),
                 None
@@ -7494,7 +7601,10 @@ exit 0
                 Some("minimal")
             );
             assert_eq!(
-                unit_admit_group("<string>--admit-group=_minimal</string>"),
+                unit_admit_group(
+                    "<key>ProgramArguments</key><array><string>/x/minzoned</string>\
+                     <string>--admit-group=_minimal</string></array>"
+                ),
                 Some("_minimal")
             );
             assert_eq!(
@@ -7502,6 +7612,65 @@ exit 0
                 None
             );
             assert_eq!(unit_admit_group(text), None);
+            // The flag is read from the program arguments only: the word
+            // in a comment, a description or past the array is not one.
+            assert_eq!(
+                unit_admit_group("# --admit-group staff\nExecStart=/x/minzoned\n"),
+                None
+            );
+            assert_eq!(
+                unit_admit_group(
+                    "<key>ProgramArguments</key><array><string>/x/minzoned</string>\
+                     </array><key>Comment</key><string>--admit-group staff</string>"
+                ),
+                None
+            );
+            assert_eq!(
+                unit_admit_group(
+                    "<key>ProgramArguments</key><array><string>/x/minzoned</string>\
+                     <string>--admit-group</string></array>"
+                ),
+                None,
+                "a flag with no word after it names no group"
+            );
+            // A unit that is there but is not text is read closed: the
+            // --undo guard refuses naming the file, as the step reader does.
+            assert_eq!(
+                unit_read(
+                    "/x/unit",
+                    Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+                ),
+                UnitRead::Absent
+            );
+            assert_eq!(
+                unit_read("/x/unit", Ok(b"<plist/>".to_vec())),
+                UnitRead::Text("<plist/>".to_string())
+            );
+            let binary = unit_read(
+                "/x/unit",
+                Ok(vec![0x62, 0x70, 0x6c, 0x69, 0x73, 0x74, 0xff]),
+            );
+            let UnitRead::Unreadable(why) = &binary else {
+                panic!("a binary plist is unreadable, not text: {binary:?}");
+            };
+            assert!(
+                why.contains("/x/unit is not a text file") && why.contains("plutil -convert xml1"),
+                "{why}"
+            );
+            let denied = unit_read(
+                "/x/unit",
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            );
+            assert!(
+                matches!(&denied, UnitRead::Unreadable(why) if why.starts_with("/x/unit could not be read")),
+                "{denied:?}"
+            );
+            let refusal = unreadable_unit_refusal(why);
+            assert!(
+                refusal.contains("could not be read, so whether it is one user's")
+                    && refusal.ends_with("Nothing was run."),
+                "{refusal}"
+            );
             // `--undo` over a shared unit is refused with the package named;
             // over one operator's, or none, it is not.
             let undo = shared_service_undo_refusal(&shared).expect("a shared unit refuses --undo");
