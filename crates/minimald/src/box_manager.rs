@@ -3460,6 +3460,7 @@ impl BoxManager {
                 box_id = %minted,
                 ?switch_address,
                 ?host_ip_name,
+                box_name = ?config.name,
                 client_box_id = ?client_box_id,
                 "took the box id the VM host daemon minted; the request's box id is ignored"
             );
@@ -5030,14 +5031,24 @@ impl Drop for TearingDown {
 /// registration (BEP-082), or `None` for a fresh mint.
 ///
 /// Only a `host_ip` box with no box addresses and a declared credentialed
-/// upstream registered under its name, so only that box sends the name.
-/// A `host_ip` box with no grant registered nothing. If it sent its name, it
-/// could take the id of another live box that registered the same name.
+/// upstream registered, so only that box sends a name. It sends the name
+/// it registered under: the config's `host_ip_registration` when the
+/// client sent one, else the box's name. A fresh instance registered under
+/// a creation key, because this daemon names it `<base>-<n>` only after
+/// the registration. A `host_ip` box with no grant registered nothing. If
+/// it sent its name, it could take the id of another live box that
+/// registered the same name.
 fn host_ip_mint_name(config: &minimald_rpc::BoxConfig) -> Option<String> {
     let grant_box = matches!(config.network, boxes::NetworkMode::HostNet)
         && config.box_addresses.is_none()
         && config.policy.credentialed_upstream.is_some();
-    if grant_box { config.name.clone() } else { None }
+    if !grant_box {
+        return None;
+    }
+    config
+        .host_ip_registration
+        .clone()
+        .or_else(|| config.name.clone())
 }
 
 #[cfg(test)]
@@ -5061,6 +5072,7 @@ mod host_ip_mint_name_tests {
             root_certificate: None,
             creating_verb: minimald_rpc::CreatingVerb::Session,
             project_root: None,
+            host_ip_registration: None,
         }
     }
 
@@ -5164,6 +5176,7 @@ mod create_stamp_tests {
             root_certificate: None,
             creating_verb: minimald_rpc::CreatingVerb::Session,
             project_root: None,
+            host_ip_registration: None,
         }
     }
 
@@ -5374,6 +5387,7 @@ mod ended_box_tests {
             root_certificate: None,
             creating_verb: minimald_rpc::CreatingVerb::Session,
             project_root: None,
+            host_ip_registration: None,
         }
     }
 

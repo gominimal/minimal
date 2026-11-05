@@ -138,6 +138,7 @@ fn sample_config() -> minimald_rpc::BoxConfig {
         root_certificate: None,
         creating_verb: minimald_rpc::CreatingVerb::Session,
         project_root: None,
+        host_ip_registration: None,
     }
 }
 
@@ -4092,6 +4093,69 @@ async fn guest_create_ignores_a_client_supplied_box_id() {
          at 100.64.0.9. Run the command again."
     );
     assert_eq!(mngr.list_boxes(None).await.unwrap().len(), 2);
+
+    crate::net::listeners::clear_vm_report_door_for_tests(&control);
+    door_task.abort();
+}
+
+/// BEP-082: a fresh-instance `host_ip` grant box registered under a
+/// creation key, and this daemon names it `<base>-<n>` only after. The
+/// mint asks by the key the config carries, never by the `<base>-<n>`
+/// name, so it finds the registration. Two fresh instances of one entry
+/// ask by their own keys and take their own ids.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fresh_instance_mint_finds_its_registration_after_the_rename() {
+    let (state, _cache, mngr) = manager().await;
+    let control = manager_switch_control(state.path());
+    let door = state.path().join("vm-host-door.sock");
+    let first = SessionId::mint();
+    let second = SessionId::mint();
+    let (door_task, mut asks) = mint_door(
+        &door,
+        vec![
+            minimald_rpc::BoxControlReply::BoxIdMinted {
+                minted_box_id: first,
+            },
+            minimald_rpc::BoxControlReply::BoxIdMinted {
+                minted_box_id: second,
+            },
+        ],
+    );
+    crate::net::listeners::seed_vm_report_door_for_tests(&control, &door);
+
+    let grant_config = |key: &str| {
+        let mut config = unnamed_config();
+        config.network = boxes::NetworkMode::HostNet;
+        config.policy.credentialed_upstream = Some(boxes::CredentialedUpstream::default());
+        config.host_ip_registration = Some(key.to_string());
+        config
+    };
+    let mut created = Vec::new();
+    for key in [
+        "dev~00112233445566778899aabbccddeeff",
+        "dev~ffeeddccbbaa99887766554433221100",
+    ] {
+        let id = mngr
+            .create_fresh_box_with_spec(grant_config(key), Some(task_spec("dev", None)), None, None)
+            .await
+            .unwrap();
+        let ask = mint_ask(asks.recv().await.unwrap());
+        assert_eq!(
+            ask.host_ip_name.as_deref(),
+            Some(key),
+            "the mint asks by the key"
+        );
+        assert_eq!(ask.switch_address, None);
+        created.push((id, record_name(&mngr, id).await));
+    }
+    assert_eq!(
+        created,
+        vec![
+            (first, Some("dev-1".to_string())),
+            (second, Some("dev-2".to_string())),
+        ],
+        "each fresh instance takes its own id under its `<base>-<n>` name"
+    );
 
     crate::net::listeners::clear_vm_report_door_for_tests(&control);
     door_task.abort();
