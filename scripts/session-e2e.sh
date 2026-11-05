@@ -6740,6 +6740,7 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     printf '\n[stack]\nuse = "shell"\n'
     printf '\n[tasks.e2e-echo]\necho = "TASK_RUN_E2E_OK"\n'
     printf '\n[tasks.e2e-fail]\nbash = "exit 7"\n'
+    printf '\n[tasks.e2e-sleep]\nbash = "sleep 300"\n'
     printf '\n[tasks.e2e-envprint]\nexec = "printenv E2E_INHERIT_MARKER"\nenv_vars.E2E_INHERIT_MARKER = { inherit = true }\n'
     # shellcheck disable=SC2016 # $PWD is the task's, expanded in the box
     printf '\n[tasks.e2e-ic]\ninherit_cwd = true\nbash = "echo PWD=$PWD"\n'
@@ -6825,6 +6826,58 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   fi
   task_kept_check e2e-fail "$WORK/task-fail.err"
   echo "task run exit-code relay: 7 → 7 OK"
+
+  # Ctrl-C on a running task stops its box (BOX-013) and keeps its record
+  # (BOX-038): the run exits 130, the box lists as stopped, and
+  # `min box rm` removes it. The subshell execs `min` as `mnl` calls it, so
+  # `$!` is the `min` the SIGINT goes to.
+  ti_env=()
+  # shellcheck disable=SC2031
+  if [ -n "$E2E_NATIVE_SWITCH_DIR" ] && [ "${MINIMAL_BIN:-}" = "$E2E_LANE_MINIMAL_BIN" ]; then
+    ti_env=(env "MINIMAL_BIN=$E2E_NATIVE_SWITCH_DIR")
+  fi
+  # shellcheck disable=SC2086
+  (cd "$TASK_SEED_DIR" \
+    && exec ${ti_env[@]+"${ti_env[@]}"} min ${E2E_MINIMAL_ARGS:-} task run e2e-sleep \
+      >/dev/null 2>"$WORK/task-int.err") &
+  ti_pid=$!
+  ti_name=""
+  for ti_i in $(seq 1 120); do
+    ti_name="$(grep -o 'Running task e2e-sleep in box [^ .]*' "$WORK/task-int.err" 2>/dev/null \
+      | head -n1)"
+    ti_name="${ti_name#Running task e2e-sleep in box }"
+    [ -n "$ti_name" ] && break
+    sleep 0.5
+  done
+  if [ -z "$ti_name" ]; then
+    echo "::error::'min task run e2e-sleep' did not name its box"
+    cat "$WORK/task-int.err" 2>/dev/null || true
+    kill "$ti_pid" 2>/dev/null || true
+    fail
+  fi
+  # Long enough for the entrypoint to start; the sleep task runs for 300s.
+  sleep 3
+  kill -INT "$ti_pid"
+  wait "$ti_pid"
+  rc=$?
+  if [ "$rc" -ne 130 ]; then
+    echo "::error::an interrupted 'min task run e2e-sleep' exited $rc (expected 130)"
+    echo "--- task stderr ---"; cat "$WORK/task-int.err" 2>/dev/null || true
+    fail
+  fi
+  ti_row="$(mnl ls 2>/dev/null | grep -F "$ti_name" || true)"
+  if [[ "$ti_row" != *stopped* ]]; then
+    echo "::error::interrupted task box $ti_name is not listed as stopped: '$ti_row'"
+    echo "--- task stderr ---"; cat "$WORK/task-int.err" 2>/dev/null || true
+    mnl ls 2>&1 || true
+    fail
+  fi
+  if ! mnl box rm "$ti_name" >/dev/null 2>"$WORK/task-int-rm.err"; then
+    echo "::error::'min box rm $ti_name' failed after an interrupted run"
+    cat "$WORK/task-int-rm.err" 2>/dev/null || true
+    fail
+  fi
+  echo "task run interrupt: box stopped, record kept, exit 130 OK"
 
   # `min session run <session> <task>` runs a declared task against a session
   # that already exists, rather than composing one of its own. A task box

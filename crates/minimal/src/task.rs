@@ -418,23 +418,58 @@ fn unknown_task_message(file: &mfile::File, task: &str) -> String {
     }
 }
 
-/// Guard that resolves the ephemeral session if the user interrupts the run
-/// phase, modeled on [`crate::arm_activation_interrupt`]: the primary
-/// connection is parked in the exec bridge, so the handler works over a
-/// fresh connection. The first Ctrl-C best-effort `DestroySession`s the
-/// box and releases the name hold an attach or exec may have re-made for
-/// it ([`release_task_name_hold`]), and the process exits 130. The
-/// destroy leg is bounded: the connect-and-destroy runs under the same
-/// 10-second cleanup ceiling as [`crate::best_effort_destroy`], and a
-/// second Ctrl-C during it abandons the cleanup and exits 130 immediately —
-/// an unresponsive daemon can delay the exit, never prevent it. Dropping
-/// the guard cancels the handler once the normal end path has run.
+/// What the first Ctrl-C of a task run does to its box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterruptEnds {
+    /// A task box whose entrypoint is the task: the box is stopped as
+    /// `min box stop` stops it (BOX-013), and keeps its record (BOX-038).
+    Stop,
+    /// An interactive task, which has no spec: the run owns its box, and
+    /// the box is destroyed.
+    Destroy,
+}
+
+/// The line the first Ctrl-C prints, before the box is stopped or
+/// destroyed.
+fn interrupt_line(ends: InterruptEnds, box_name: &str) -> String {
+    match ends {
+        InterruptEnds::Stop => format!("\nInterrupted. Stopping box {box_name}…"),
+        InterruptEnds::Destroy => format!("\nInterrupted; destroying session {box_name}…"),
+    }
+}
+
+/// Guard that ends the run's box if the user interrupts the run phase,
+/// modeled on [`crate::arm_activation_interrupt`]: the primary connection
+/// is parked in the exec bridge, so the handler works over a fresh
+/// connection. The first Ctrl-C ends the box as `ends` says, releases the
+/// name hold an attach or exec may have re-made for it
+/// ([`release_task_name_hold`]), and the process exits 130.
 ///
-/// Note the SIGINT is consumed on the host: it is NOT relayed into the box,
-/// so — unlike interrupting a local command — the task itself gets no
-/// chance to trap it and clean up; the box is torn down around it.
+/// A stop is the daemon's graceful stop: SIGTERM, the grace period, then
+/// SIGKILL to what still runs. Its leg is bounded by the grace period plus
+/// the 10-second cleanup ceiling of [`crate::best_effort_destroy`], which
+/// bounds a destroy alone. A second Ctrl-C during either abandons the
+/// cleanup and exits 130 at once: an unresponsive daemon can delay the
+/// exit, never prevent it. Dropping the guard cancels the handler once the
+/// normal end path has run.
+///
+/// The SIGINT is consumed on the host. It is not relayed into the box as
+/// a SIGINT; a stop sends the box SIGTERM first.
 struct TaskRunInterrupt {
     task: tokio::task::JoinHandle<()>,
+    /// Set once the first Ctrl-C arrived. The handler then owns the exit.
+    interrupted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl TaskRunInterrupt {
+    /// Waits forever once a Ctrl-C arrived, so the handler's exit 130 is
+    /// the run's exit. A stop ends the box, and the run's channel then
+    /// reports that end, which the run must not exit with.
+    async fn yield_to_handler(&self) {
+        if self.interrupted.load(std::sync::atomic::Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 impl Drop for TaskRunInterrupt {
@@ -447,6 +482,7 @@ fn arm_task_run_interrupt(
     global: &GlobalArgs,
     box_id: boxes::SessionId,
     box_name: String,
+    ends: InterruptEnds,
 ) -> TaskRunInterrupt {
     let sock =
         crate::client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd());
@@ -454,52 +490,76 @@ fn arm_task_run_interrupt(
         crate::daemon_host_kind(global),
         global.minimal_dir.as_deref(),
     );
+    let interrupted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = interrupted.clone();
     let task = tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_err() {
             return;
         }
-        eprintln!("\nInterrupted; destroying session {box_name}…");
-        // The whole connect-and-destroy is bounded by the same 10-second
-        // cleanup ceiling as `best_effort_destroy` — the interrupt may well
-        // mean the daemon is already wedged — and raced against a second
-        // Ctrl-C, which abandons the cleanup and exits immediately.
-        // `ctrl_c()` keeps the process-wide SIGINT handler installed, so
-        // without that race a second interrupt would be silently swallowed.
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        eprintln!("{}", interrupt_line(ends, &box_name));
+        // The interrupt may well mean the daemon is already wedged, so the
+        // leg is bounded, and raced against a second Ctrl-C, which abandons
+        // it and exits immediately. `ctrl_c()` keeps the process-wide
+        // SIGINT handler installed, so without that race a second interrupt
+        // would be silently swallowed.
         const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-        let destroy = async {
+        let bound = match ends {
+            InterruptEnds::Stop => minimald_rpc::STOP_GRACE + CLEANUP_TIMEOUT,
+            InterruptEnds::Destroy => CLEANUP_TIMEOUT,
+        };
+        let end_box = async {
             // Deliberately not version-gated: this is the recovery half of a
             // task run, and a cleanup blocked by a skew is exactly the orphaned
             // session the gate exists to prevent.
             if let Ok(sock) = sock
                 && let Ok(mut client) = crate::client::Client::connect(&sock).await
             {
-                use minimald_rpc::{DestroySession, DestroySessionRequest};
-                let _ = client
-                    .oneshot_rpc::<DestroySession>(DestroySessionRequest {
-                        id: box_id,
-                        only_if_unfinalized: false,
-                    })
-                    .await;
+                match ends {
+                    InterruptEnds::Stop => {
+                        let _ = client
+                            .oneshot_rpc::<minimald_rpc::StopBox>(minimald_rpc::StopBoxRequest {
+                                id: box_id,
+                                force: false,
+                            })
+                            .await;
+                    }
+                    InterruptEnds::Destroy => {
+                        use minimald_rpc::{DestroySession, DestroySessionRequest};
+                        let _ = client
+                            .oneshot_rpc::<DestroySession>(DestroySessionRequest {
+                                id: box_id,
+                                only_if_unfinalized: false,
+                            })
+                            .await;
+                    }
+                }
             }
             // The run's own return never comes on this path, so the release
             // it owes is made here, inside the same bound.
             release_task_name_hold(control_sock, box_id, &box_name, false).await;
         };
         tokio::select! {
-            res = tokio::time::timeout(CLEANUP_TIMEOUT, destroy) => {
+            res = tokio::time::timeout(bound, end_box) => {
                 if res.is_err() {
-                    eprintln!(
-                        "DestroySession timed out after {CLEANUP_TIMEOUT:?}; the session may \
-                         still be present (run `min session destroy {box_name}` to clean \
-                         up manually)"
-                    );
+                    match ends {
+                        InterruptEnds::Stop => eprintln!(
+                            "Box {box_name} did not stop within {bound:?}. Run \
+                             `min box stop {box_name}` to stop it."
+                        ),
+                        InterruptEnds::Destroy => eprintln!(
+                            "DestroySession timed out after {bound:?}; the session may \
+                             still be present (run `min session destroy {box_name}` to clean \
+                             up manually)"
+                        ),
+                    }
                 }
             }
             _ = tokio::signal::ctrl_c() => {}
         }
         std::process::exit(130);
     });
-    TaskRunInterrupt { task }
+    TaskRunInterrupt { task, interrupted }
 }
 
 /// Bridge an acked exec channel to the caller's stdio, mirroring the
@@ -950,7 +1010,16 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // Active: from here an interrupt destroys the session rather than
     // aborting a draft.
     drop(interrupt_guard);
-    let run_guard = arm_task_run_interrupt(global, id, session_name.clone());
+    let run_guard = arm_task_run_interrupt(
+        global,
+        id,
+        session_name.clone(),
+        if entrypoint_runs {
+            InterruptEnds::Stop
+        } else {
+            InterruptEnds::Destroy
+        },
+    );
 
     if entrypoint_runs {
         eprintln!("Running task {} in box {session_name}...", args.task);
@@ -965,6 +1034,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
             match open_task_box_run(&mut client, id, &args.task, &task_cwd, &task_env).await {
                 Ok(channel) => {
                     let outcome = bridge_exec(channel).await;
+                    run_guard.yield_to_handler().await;
                     if let Ok(exit) = outcome {
                         let end = task_box_end(exit, || entrypoint_started(&mut client, id)).await;
                         match end {
@@ -1311,6 +1381,21 @@ mod tests {
             "got: {err}"
         );
         assert!(err.downcast_ref::<TaskExit>().is_none());
+    }
+
+    /// BOX-013, BOX-038: the first Ctrl-C of an entrypoint run says it stops
+    /// the box. An interactive task's run still destroys its box, and says
+    /// so.
+    #[test]
+    fn an_interrupted_entrypoint_run_says_it_stops_the_box() {
+        assert_eq!(
+            interrupt_line(InterruptEnds::Stop, "lint-1"),
+            "\nInterrupted. Stopping box lint-1…"
+        );
+        assert_eq!(
+            interrupt_line(InterruptEnds::Destroy, "lint-1"),
+            "\nInterrupted; destroying session lint-1…"
+        );
     }
 
     /// BOX-015: a run whose channel dropped mid-run, with no exit status,
