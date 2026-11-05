@@ -579,15 +579,22 @@ pub fn add_as_this_program(service: &str, id: &str, value: &[u8]) -> Result<(), 
 }
 
 /// The secret items in the output of `security dump-keychain -a`: each
-/// item under [`SERVICE`], by account, with whether an access-control entry
-/// that allows `decrypt` lists `proxy` among its applications.
+/// item under [`SERVICE`], by account, with whether the proxy can read it.
+/// It can when an access-control entry that allows `decrypt` lists `proxy`
+/// among its applications, and the item's partition list names `partition`,
+/// the proxy's own. With no `partition`, no item is readable.
 #[must_use]
-pub fn parse_dump(dump: &str, proxy: &Path) -> Vec<ItemInfo> {
-    parse_dump_service(dump, SERVICE, proxy)
+pub fn parse_dump(dump: &str, proxy: &Path, partition: Option<&str>) -> Vec<ItemInfo> {
+    parse_dump_service(dump, SERVICE, proxy, partition)
 }
 
 /// [`parse_dump`] for the items under `service`.
-fn parse_dump_service(dump: &str, service: &str, proxy: &Path) -> Vec<ItemInfo> {
+fn parse_dump_service(
+    dump: &str,
+    service: &str,
+    proxy: &Path,
+    partition: Option<&str>,
+) -> Vec<ItemInfo> {
     let proxy = proxy.to_string_lossy();
     // `dump-keychain -a` lists every keychain in the search list, so one
     // identifier can appear more than once. Review finding 4369647108: the
@@ -609,7 +616,7 @@ fn parse_dump_service(dump: &str, service: &str, proxy: &Path) -> Vec<ItemInfo> 
         let Some(id) = attr("acct") else { continue };
         let mut entries = record.split("entry ").skip(1);
         let proxy_access = entries.clone().any(|entry| entry_admits(entry, &proxy))
-            && !entries.any(in_apple_tool_partition);
+            && partition.is_some_and(|name| entries.any(|entry| names_partition(entry, name)));
         items
             .entry(id)
             .and_modify(|access| *access &= proxy_access)
@@ -641,16 +648,29 @@ fn entry_admits(entry: &str, proxy: &str) -> bool {
     decrypt && listed
 }
 
-/// Whether one access-control entry puts the item in the partition of
-/// Apple's own tools, which an item that `/usr/bin/security` created is in.
-/// The proxy is never in that partition, so it cannot read the item, whatever
-/// the application list says.
-fn in_apple_tool_partition(entry: &str) -> bool {
+/// Whether one access-control entry is the item's partition list and names
+/// `partition`. A program outside the list cannot read the item, whatever the
+/// application list says.
+fn names_partition(entry: &str, partition: &str) -> bool {
     let mut lines = entry.lines().map(str::trim);
     lines.clone().any(|line| {
         line.strip_prefix("authorizations")
             .is_some_and(|rest| rest.split_whitespace().any(|a| a == "partition_id"))
-    }) && lines.any(|line| line == "description: apple-tool:")
+    }) && lines.any(|line| {
+        line.strip_prefix("description:")
+            .is_some_and(|list| list.split(',').any(|name| name.trim() == partition))
+    })
+}
+
+/// The keychain partition of a program, from what `codesign -dvvv` prints:
+/// `teamid:<team>` for a team-signed program, else `cdhash:<hash>`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn signature_partition(display: &str) -> Option<String> {
+    let value = |key: &str| display.lines().find_map(|line| line.strip_prefix(key));
+    match value("TeamIdentifier=") {
+        Some(team) if team != "not set" => Some(format!("teamid:{team}")),
+        _ => value("CDHash=").map(|hash| format!("cdhash:{hash}")),
+    }
 }
 
 /// Whether `path` is the bundle whose main program is `proxy`.
@@ -834,18 +854,20 @@ impl ValueReader for HostStore {
 mod host {
     use super::{
         ItemInfo, Keychain, NATIVE_STORE, ReadError, SERVICE, StoreError, add_args, parse_dump,
-        parse_dump_service, set_item,
+        parse_dump_service, set_item, signature_partition,
     };
-    use std::io::Write as _;
+    use std::io::{ErrorKind, Write as _};
     use std::path::Path;
     use std::process::{Command, Stdio};
     use zeroize::Zeroizing;
 
     const SECURITY: &str = "/usr/bin/security";
+    const CODESIGN: &str = "/usr/bin/codesign";
     /// `security` exits 44 when no item matches.
     const NOT_FOUND: i32 = 44;
 
-    fn run(
+    /// Run `program` to its exit, with `stdin` on its standard input.
+    pub(super) fn run(
         program: &Path,
         action: &'static str,
         args: &[&str],
@@ -867,7 +889,14 @@ mod host {
             .stderr(Stdio::piped());
         let mut child = cmd.spawn().map_err(|e| refused(e.to_string()))?;
         if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
-            pipe.write_all(input).map_err(|e| refused(e.to_string()))?;
+            // A program that exits without reading closes the pipe. Its exit
+            // status and stderr say why, so they decide the message.
+            match pipe.write_all(input) {
+                Err(e) if e.kind() != ErrorKind::BrokenPipe => {
+                    return Err(refused(e.to_string()));
+                }
+                _ => {}
+            }
         }
         child.wait_with_output().map_err(|e| refused(e.to_string()))
     }
@@ -902,7 +931,13 @@ mod host {
 
         fn items(&self, service: &str, proxy: &Path) -> Result<Vec<ItemInfo>, StoreError> {
             let out = dump()?;
-            Ok(parse_dump_service(&out, service, proxy))
+            let partition = proxy_partition(proxy);
+            Ok(parse_dump_service(
+                &out,
+                service,
+                proxy,
+                partition.as_deref(),
+            ))
         }
 
         fn delete(&self, service: &str, id: &str) -> Result<bool, StoreError> {
@@ -925,6 +960,23 @@ mod host {
         Ok(())
     }
 
+    /// The partition that an item `proxy` creates lands in. `None` when its
+    /// signature cannot be read, which reports no item as readable.
+    pub(super) fn proxy_partition(proxy: &Path) -> Option<String> {
+        let out = run(
+            Path::new(CODESIGN),
+            "read the proxy's signature",
+            &["-dvvv", proxy.to_str()?],
+            None,
+        )
+        .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        // `codesign` prints what it displays on stderr.
+        signature_partition(&String::from_utf8_lossy(&out.stderr))
+    }
+
     /// The output of `dump-keychain -a`.
     fn dump() -> Result<String, StoreError> {
         // `dump-keychain` without `-d` decrypts nothing, so it prints no
@@ -942,7 +994,11 @@ mod host {
     }
 
     pub(super) fn list(proxy: &Path) -> Result<Vec<ItemInfo>, StoreError> {
-        Ok(parse_dump(&dump()?, proxy))
+        Ok(parse_dump(
+            &dump()?,
+            proxy,
+            proxy_partition(proxy).as_deref(),
+        ))
     }
 
     pub(super) fn remove(id: &str) -> Result<bool, StoreError> {
@@ -1455,8 +1511,8 @@ mod tests {
     // read still fails with `errSecAuthFailed`, so a listing must not say the
     // proxy reads it. An item the proxy created is in the proxy's partition.
     #[test]
-    fn a_listing_refuses_an_item_in_the_apple_tool_partition() {
-        let dump = |partition: &str| {
+    fn a_listing_admits_only_the_proxys_own_partition() {
+        let dump = |entry: &str| {
             format!(
                 "keychain: \"/Users/me/Library/Keychains/login.keychain-db\"
 class: \"genp\"
@@ -1470,12 +1526,7 @@ access: 3 entries
         description: dev.minimal.secret
         applications (1):
             0: {PROXY} (OK)
-    entry 1:
-        authorizations (1): partition_id
-        don't-require-password
-        description: {partition}
-        applications: <null>
-    entry 2:
+{entry}    entry 2:
         authorizations (1): change_acl
         don't-require-password
         description: dev.minimal.secret
@@ -1483,10 +1534,60 @@ access: 3 entries
 "
             )
         };
-        let access = |partition| parse_dump(&dump(partition), Path::new(PROXY))[0].proxy_access;
-        assert!(!access("apple-tool:"));
-        assert!(access("teamid:3G47C5HY64"));
-        assert!(access("cdhash:a9ee3da6b0baa9708b950b24f8a999741f97d3b4"));
+        let access = |list: &str, own: Option<&str>| {
+            let entry = format!(
+                "    entry 1:
+        authorizations (1): partition_id
+        don't-require-password
+        description: {list}
+        applications: <null>
+"
+            );
+            parse_dump(&dump(&entry), Path::new(PROXY), own)[0].proxy_access
+        };
+        let team = Some("teamid:3G47C5HY64");
+        let hash = Some("cdhash:a9ee3da6b0baa9708b950b24f8a999741f97d3b4");
+        assert!(access("teamid:3G47C5HY64", team));
+        assert!(access(
+            "cdhash:a9ee3da6b0baa9708b950b24f8a999741f97d3b4",
+            hash
+        ));
+        assert!(access("apple-tool:,teamid:3G47C5HY64", team));
+        assert!(!access("apple-tool:", team));
+        assert!(!access("apple-tool:,apple:", team));
+        assert!(!access("teamid:AAAAAAAAAA", team));
+        assert!(!access("teamid:3G47C5HY64", hash));
+        assert!(!access("teamid:3G47C5HY64", None));
+        // An item with no partition list does not name the proxy's partition.
+        assert!(!parse_dump(&dump(""), Path::new(PROXY), team)[0].proxy_access);
+    }
+
+    #[test]
+    fn a_signature_gives_the_partition_of_the_program() {
+        assert_eq!(
+            signature_partition("CDHash=a9ee\nSignature=adhoc\nTeamIdentifier=not set\n"),
+            Some("cdhash:a9ee".to_owned())
+        );
+        assert_eq!(
+            signature_partition("CDHash=a9ee\nTeamIdentifier=3G47C5HY64\n"),
+            Some("teamid:3G47C5HY64".to_owned())
+        );
+        assert_eq!(
+            signature_partition("code object is not signed at all\n"),
+            None
+        );
+    }
+
+    /// `codesign` on a real program. This test binary is signed ad hoc by the
+    /// linker, so it is in a `cdhash:` partition.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_partition_of_a_real_program_comes_from_its_signature() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let partition = host::proxy_partition(&exe).expect("a signature");
+        let hash = partition.strip_prefix("cdhash:").expect("ad hoc signature");
+        assert_eq!(hash.len(), 40, "{partition}");
+        assert_eq!(host::proxy_partition(Path::new("/no/such/bep")), None);
     }
 
     // An installed proxy runs from a bundle, and the keychain records the
@@ -1510,6 +1611,10 @@ access: 1 entries
         applications (1):
             0: /Users/me/.local/bin/bep.app (OK)
             requirement: identifier \"dev.minimal.bep\" and anchor apple generic and certificate leaf[subject.CN] = \"Minimal\"
+    entry 1:
+        authorizations (1): partition_id
+        description: teamid:3G47C5HY64
+        applications: <null>
 keychain: \"/Users/me/Library/Keychains/login.keychain-db\"
 class: \"genp\"
 attributes:
@@ -1522,6 +1627,10 @@ access: 1 entries
         description: Minimal secret other
         applications (1):
             0: /Applications/Other.app (OK)
+    entry 1:
+        authorizations (1): partition_id
+        description: teamid:3G47C5HY64
+        applications: <null>
 keychain: \"/Users/me/Library/Keychains/login.keychain-db\"
 class: \"genp\"
 attributes:
@@ -1534,9 +1643,14 @@ access: 1 entries
         description: Minimal secret partial
         applications (1):
             0: /Users/me/.local/bin (OK)
+    entry 1:
+        authorizations (1): partition_id
+        description: teamid:3G47C5HY64
+        applications: <null>
 ";
+        let own = Some("teamid:3G47C5HY64");
         assert_eq!(
-            parse_dump(dump, proxy),
+            parse_dump(dump, proxy, own),
             vec![
                 ItemInfo {
                     id: "claude".into(),
@@ -1555,12 +1669,30 @@ access: 1 entries
         for other in ["helper", "nested/bep"] {
             let other = format!("/Users/me/.local/bin/bep.app/Contents/MacOS/{other}");
             assert!(
-                parse_dump(dump, Path::new(&other))
+                parse_dump(dump, Path::new(&other), own)
                     .iter()
                     .all(|item| !item.proxy_access),
                 "{other} is not the bundle's main program"
             );
         }
+    }
+
+    /// A proxy program that exits without reading the value, such as an older
+    /// `bep` with no `store-add`, closes the pipe. Its exit status and stderr
+    /// still reach the caller. The value is larger than a pipe's buffer, so
+    /// the write always meets the closed pipe.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn run_keeps_the_stderr_of_a_program_that_reads_no_input() {
+        let out = host::run(
+            Path::new("/bin/sh"),
+            "store the secret",
+            &["-c", "echo no such subcommand >&2; exit 3"],
+            Some(&vec![0; 1 << 20]),
+        )
+        .expect("the program ran");
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(out.stderr, b"no such subcommand\n");
     }
 
     /// The BEP-051 leg on a real keychain: set, list, set again and remove

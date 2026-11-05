@@ -1325,6 +1325,10 @@ access: 2 entries
         description: Minimal secret claude
         applications (1):
             0: {p} (OK)
+    entry 2:
+        authorizations (1): partition_id
+        description: teamid:3G47C5HY64
+        applications: <null>
 keychain: \"/Users/me/Library/Keychains/login.keychain-db\"
 class: \"genp\"
 attributes:
@@ -1357,10 +1361,11 @@ attributes:
         // the first copy grants the proxy access. The copies merge, in
         // either order. Review thread 4369745218: the copy without the
         // proxy's entry prompts the proxy, so the merged item has no access.
-        let items = bep::store::parse_dump(&dump, &proxy);
+        let own = Some("teamid:3G47C5HY64");
+        let items = bep::store::parse_dump(&dump, &proxy, own);
         let (head, tail) = dump.split_at(dump.find("keychain: \"/Library").unwrap());
         let reordered = format!("{tail}\n{head}");
-        assert_eq!(bep::store::parse_dump(&reordered, &proxy), items);
+        assert_eq!(bep::store::parse_dump(&reordered, &proxy, own), items);
         assert_eq!(
             items,
             vec![
