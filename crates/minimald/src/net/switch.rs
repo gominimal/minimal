@@ -1012,7 +1012,33 @@ where
                     let pkt = parse_ipv4_l4(&buf[..n]);
                     gate.dns.admits_flow(dst, pkt.as_ref(), Instant::now())
                 });
-            if !pinned {
+            // NET-163: a flow to another box's lease that the declared
+            // subnets leave undeclared is the box's name rules' to decide.
+            // A listed name admits the flow, and the target's relay still
+            // decides it by the target's ingress. Any other flow to a box is
+            // refused under the name rule's own line.
+            let by_name = if !pinned && matches!(reason, DropReason::UndeclaredSubnet { .. }) {
+                reason
+                    .destination()
+                    .and_then(|dst| gate.box_name_verdict(Ipv4Addr::from(dst)))
+            } else {
+                None
+            };
+            if let Some(Err(target_name)) = &by_name {
+                if let Some(SocketAddr::V4(destination)) = drop_remote(&summary) {
+                    let transport = drop_transport(&reason);
+                    if gate.warn_box_name(destination, transport, target_name.as_deref()) {
+                        crate::net::listeners::report_refused_egress(
+                            reject.lease,
+                            Some(destination),
+                            &transport.to_string(),
+                            BOX_NAME_RULE,
+                        );
+                    }
+                }
+                continue;
+            }
+            if !pinned && by_name.is_none() {
                 let remote = drop_remote(&summary);
                 let transport = drop_transport(&reason);
                 let rule = gate.drop_rule(&reason);
@@ -1156,6 +1182,55 @@ pub(crate) const IPPROTO_UDP: u8 = 17;
 /// of it. The name itself lives in the sessions zone, the one source both
 /// daemons and the store's reserved names read.
 pub(crate) const HOST_MIN_INTERNAL: &str = zone_answer::HOST_ROW_NAME;
+
+/// The rule a refused flow to another box's lease carries when the source
+/// box names boxes in `egress.allow_dns_hosts` and none of those names is
+/// the target's (NET-163). Its own rule, so the log tells a name that did
+/// not match from a box that named no box at all.
+pub(crate) const BOX_NAME_RULE: &str = "box-name";
+
+/// How many box-zone answers one box's gate keeps. Past it, a new answer
+/// is not recorded until a dead target's entry is swept, so a box that
+/// resolves many names cannot grow the daemon's memory.
+const ZONE_ANSWERS_PER_BOX: usize = 256;
+
+/// A zone name in the form the gate compares it in: ASCII lower-case, with
+/// no trailing dot.
+fn normalized_zone_name(name: &str) -> String {
+    name.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Whether `name`, normalized, is a box's zone name: a name under the box
+/// zone that is neither the apex nor the host's row.
+fn is_box_zone_name(name: &str) -> bool {
+    name != super::dns::HOSTNAME_SUFFIX
+        && name != HOST_MIN_INTERNAL
+        && super::dns::is_zone_name(name)
+}
+
+/// The box-zone names `egress.allow_dns_hosts` lists, normalized (NET-163).
+/// Each one admits the box's flows to the box that holds the name, and
+/// only that box: the match is exact, so `web` never covers `web-2`.
+fn named_boxes(policy: &boxes::BoxPolicy) -> Vec<String> {
+    policy
+        .egress
+        .as_ref()
+        .and_then(|egress| egress.allow_dns_hosts.as_ref())
+        .into_iter()
+        .flatten()
+        .map(|host| normalized_zone_name(host))
+        .filter(|host| is_box_zone_name(host))
+        .collect()
+}
+
+/// One box-zone answer a box's own lookup received: the name it asked for
+/// and the gate of the box that held the answer's address then. A later
+/// holder of the address has another gate, so the entry never covers it.
+#[derive(Debug)]
+struct ZoneAnswer {
+    name: String,
+    gate: Weak<BoxGate>,
+}
 
 /// The limiter key the deprecation notice logs under: its own rule, so a
 /// policy warning on the same relay never consumes the notice's interval and
@@ -1603,6 +1678,15 @@ pub struct BoxGate {
     /// The flows this box opened to a host exposure, so a segment of one
     /// whose exposure was removed ends the flow (NET-161).
     host_flows: Mutex<HashMap<HostFlowKey, HostFlow>>,
+    /// The box-zone names the box's `egress.allow_dns_hosts` lists
+    /// (NET-163). Empty for a box that names no other box.
+    box_names: Vec<String>,
+    /// The box-zone answers the box's own lookups received, keyed by the
+    /// answer's address. Recorded only for a box with [`Self::box_names`]:
+    /// a flow to an address whose answer was a listed name is admitted
+    /// under the target's ingress, and the refusal of any other flow to a
+    /// box names the target by the name the box asked for.
+    zone_answers: Mutex<HashMap<Ipv4Addr, ZoneAnswer>>,
 }
 
 /// What the gate holds for one flow to a host exposure.
@@ -1989,7 +2073,132 @@ impl BoxGate {
             names_host,
             host_protocols: declared_protocols(policy),
             host_flows: Mutex::new(HashMap::new()),
+            box_names: named_boxes(policy),
+            zone_answers: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Records the box-zone answer in a reply from this box's resolver, for
+    /// a box that names boxes in `allow_dns_hosts` (NET-163). Each A answer
+    /// that is another live box's lease is kept with that box's gate, and
+    /// the name's earlier answers are dropped, so the newest answer wins.
+    /// A reply that is not the resolver's, not a response, or not a box
+    /// name's records nothing. The reply itself always passes to the box.
+    fn observe_zone_answer(&self, src: &SocketAddrV4, payload: &[u8]) {
+        if self.box_names.is_empty()
+            || src.ip().octets() != self.egress.resolver()
+            || src.port() != 53
+        {
+            return;
+        }
+        let Ok(message) = hickory_proto::op::Message::from_vec(payload) else {
+            return;
+        };
+        if message.metadata.message_type != hickory_proto::op::MessageType::Response {
+            return;
+        }
+        let Some(question) = message.queries.first() else {
+            return;
+        };
+        let asked = normalized_zone_name(&question.name().to_string());
+        if !is_box_zone_name(&asked) {
+            return;
+        }
+        // The targets are read before the table is locked, so this lock is
+        // never held across the live-gate table's.
+        let targets: Vec<(Ipv4Addr, Arc<BoxGate>)> = message
+            .answers
+            .iter()
+            .filter_map(|record| match &record.data {
+                hickory_proto::rr::RData::A(address) => Some(address.0),
+                _ => None,
+            })
+            .filter_map(|address| live_gate(address).map(|gate| (address, gate)))
+            .filter(|(_, gate)| !std::ptr::eq(Arc::as_ptr(gate), self))
+            .collect();
+        let mut answers = self
+            .zone_answers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        answers.retain(|_, answer| answer.name != asked && answer.gate.strong_count() > 0);
+        for (address, gate) in targets {
+            if answers.len() >= ZONE_ANSWERS_PER_BOX {
+                break;
+            }
+            answers.insert(
+                address,
+                ZoneAnswer {
+                    name: asked.clone(),
+                    gate: Arc::downgrade(&gate),
+                },
+            );
+        }
+    }
+
+    /// The box-zone name this box's own lookup received `dst` for, while
+    /// the box that held the address then still holds it. `None` for an
+    /// address no answer named, and for an address another box holds now.
+    fn zone_name_at(&self, dst: Ipv4Addr) -> Option<String> {
+        let target = live_gate(dst)?;
+        let answers = self
+            .zone_answers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let answer = answers.get(&dst)?;
+        let held = answer.gate.upgrade()?;
+        Arc::ptr_eq(&held, &target).then(|| answer.name.clone())
+    }
+
+    /// How the box's name rules decide a flow to `dst` that its declared
+    /// subnets left undeclared (NET-163): `None` when `dst` is no other
+    /// box's lease on this switch or the box names no box, so the rules
+    /// decide alone. `Some(Ok(()))` admits the flow, because the box's
+    /// `allow_dns_hosts` names the box at `dst`. The target's ingress
+    /// still decides it at the target's relay. `Some(Err(name))` refuses
+    /// it under [`BOX_NAME_RULE`], with the name the box resolved the
+    /// target by when it did.
+    fn box_name_verdict(&self, dst: Ipv4Addr) -> Option<Result<(), Option<String>>> {
+        if self.box_names.is_empty() {
+            return None;
+        }
+        let target = live_gate(dst)?;
+        if std::ptr::eq(Arc::as_ptr(&target), self) {
+            return None;
+        }
+        let name = self.zone_name_at(dst);
+        match name {
+            Some(name) if self.box_names.contains(&name) => Some(Ok(())),
+            name => Some(Err(name)),
+        }
+    }
+
+    /// Says one refusal under [`BOX_NAME_RULE`] (NET-163), rate-limited
+    /// through the box's own limiter: the source box, the target's address
+    /// and the name the box resolved it by. Returns whether a line was
+    /// written.
+    fn warn_box_name(
+        &self,
+        destination: SocketAddrV4,
+        proto: Proto,
+        target_name: Option<&str>,
+    ) -> bool {
+        if !self
+            .limiter
+            .should_warn_at(&self.label, BOX_NAME_RULE, Instant::now())
+        {
+            return false;
+        }
+        tracing::warn!(
+            session_id = %self.label,
+            direction = %Direction::Egress,
+            remote_addr = %destination,
+            %proto,
+            dst_port = destination.port(),
+            target = target_name.unwrap_or("none"),
+            rule_matched = BOX_NAME_RULE,
+            "network policy violation"
+        );
+        true
     }
 
     /// Decides the host alias by `table` from now on (NET-160). The first
@@ -2663,9 +2872,12 @@ impl BoxGate {
     /// have.
     ///
     /// The source's half is the source's rules as declared —
-    /// `allow_subnets` and `deny_subnets` — and nothing else: no pin lifts
-    /// it, so a sibling is reached by a CIDR entry and never by a
-    /// name-scoped grant. The DNS gate's pin (NET-066) is the source's *own*
+    /// `allow_subnets` and `deny_subnets` — and the box names its
+    /// `allow_dns_hosts` lists (NET-163), and nothing else: no pin lifts
+    /// it, so a sibling is reached by a CIDR entry or by its own exact
+    /// box-zone name, read off the box-zone answer the source's own lookup
+    /// received ([`BoxGate::box_name_verdict`]), never by another name-scoped
+    /// grant. The DNS gate's pin (NET-066) is the source's *own*
     /// relay's lift of its own undeclared-destination drop, and a box-zone
     /// answer creates no pin at all — NET-072's carve-out is the
     /// resolution's alone ([`DnsGate`]) — so deciding this half by the
@@ -2715,11 +2927,20 @@ impl BoxGate {
         // The source's half of the conjunction: the verdict the source's
         // declared rules give this connection, and nothing beside them — no
         // pin lifts a refusal here, so a sibling is reached by a CIDR entry
-        // and never by a name-scoped grant (see the method doc).
+        // or by its exact box name (see the method doc).
         let (refusal, source_pass) = match direct_connection_verdict(&peer.egress, *dst, dst_port) {
             FrameVerdict::Admit => (None, true),
             FrameVerdict::Drop(reason) => (Some(reason), false),
         };
+        // NET-163: a source whose `allow_dns_hosts` names this box passes
+        // its half by the name, as its own egress leg admits the flow. A
+        // source that names boxes but not this one is refused under the
+        // name rule, the line its own leg says.
+        let by_name = match refusal {
+            Some(DropReason::UndeclaredSubnet { .. }) => peer.box_name_verdict(*dst),
+            _ => None,
+        };
+        let source_pass = source_pass || matches!(by_name, Some(Ok(())));
         // The target's half, as `inbound_drop` will decide the same frame a
         // breath later if the source's half passes — the declared and
         // listen-published ports together, the one admission set a new
@@ -2735,6 +2956,10 @@ impl BoxGate {
         );
         if source_pass {
             return false;
+        }
+        if let Some(Err(target_name)) = &by_name {
+            peer.warn_box_name(pkt.dst, Proto::Tcp, target_name.as_deref());
+            return true;
         }
         let reason = refusal.expect("refusal known when the source half fails");
         // The source's own limiter, not this relay's: the refusal stands for
@@ -4193,6 +4418,9 @@ where
             && let Some((pkt, payload)) = udp_datagram(&frame[..n])
         {
             gate.dns.observe_response(&pkt.src, payload, Instant::now());
+            // NET-163: a box-zone answer to a box that names boxes is kept,
+            // so its flows to a listed box's lease are admitted.
+            gate.observe_zone_answer(&pkt.src, payload);
         }
         // NET-040's answer half: the frame above has passed the ingress
         // gate, so the port it is headed to is one the box's declaration
@@ -7753,6 +7981,267 @@ pub(crate) mod tests {
             logged.matches("address=100.64.0.11 port=9999").count(),
             1,
             "the target's ingress refusal says the shared audit's line: {logged}"
+        );
+    }
+
+    /// A source box for the NET-163 proofs: TCP declared, no subnet, and
+    /// `allow_dns_hosts` naming `names`, plus `subnets` when a proof needs
+    /// the CIDR fall-through.
+    fn zone_named_egress(names: &[&str], subnets: Vec<String>) -> boxes::BoxPolicy {
+        boxes::BoxPolicy {
+            egress: Some(boxes::EgressPolicy {
+                allow_protocols: Some(vec![boxes::IpProto::Tcp]),
+                allow_subnets: Some(subnets),
+                allow_dns_hosts: Some(names.iter().map(|name| (*name).to_string()).collect()),
+                deny_subnets: None,
+            }),
+            ingress: None,
+            credentialed_upstream: None,
+            quic443: None,
+        }
+    }
+
+    /// Delivers the resolver's A answer for `name` to the box behind
+    /// `harness`, the way its own lookup receives it, and waits until the
+    /// box has read it.
+    async fn resolve_zone_name(
+        harness: &mut RelayHarness,
+        box_addr: Ipv4Addr,
+        name: &str,
+        answer: Ipv4Addr,
+    ) {
+        use crate::net::dns_gate::tests::{
+            RESOLVER, dns_query, dns_response, read_box_frame, udp_payload_frame, wire_frame,
+        };
+        use hickory_proto::rr::RecordType;
+        // The query goes out first, so the reply matches a flow the box
+        // opened, as a real lookup's does.
+        let query = udp_payload_frame(
+            box_addr,
+            40053,
+            RESOLVER,
+            53,
+            &dns_query(name, RecordType::A),
+        );
+        harness.box_end.write_all(&query).unwrap();
+        let forwarded =
+            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+                .await
+                .expect("the query is forwarded")
+                .expect("the switch side stays open");
+        assert_eq!(
+            forwarded, query,
+            "a zone name needs no allowlist entry to resolve"
+        );
+        let response = udp_payload_frame(
+            RESOLVER,
+            53,
+            box_addr,
+            40053,
+            &dns_response(name, &[answer]),
+        );
+        harness
+            .switch
+            .write_all(&wire_frame(&response))
+            .await
+            .unwrap();
+        let passed = read_box_frame(harness)
+            .await
+            .expect("the reply passes to the box");
+        assert_eq!(passed, response, "resolution is honest");
+    }
+
+    /// NET-163 on a native host: an own-address box whose `allow_dns_hosts`
+    /// names another box's zone name reaches that box's lease, where its
+    /// own subnets name nothing. Its own leg forwards the SYN, and the
+    /// target's relay admits it at the port the target publishes. The
+    /// target's ingress still decides: a port it does not publish is
+    /// refused.
+    #[tokio::test]
+    async fn zone_name_in_allow_dns_hosts_admits_the_named_box() {
+        use crate::net::dns_gate::tests::{read_box_frame, wire_frame};
+        const SOURCE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 40);
+        const TARGET: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 41);
+        let mut source = spawn_relay_for(
+            SOURCE,
+            Some(&zone_named_egress(&["Box-B.min.internal."], Vec::new())),
+            |_| {},
+        );
+        let mut target = spawn_relay_for(TARGET, Some(&zone_target_policy()), |_| {});
+        let sentinel = arp_frame(SOURCE);
+
+        // Before the box resolves the name, nothing tells the gate whose
+        // lease the address is, so the flow is refused.
+        let early = egress_tcp_segment(SOURCE, 40000, TARGET, ZONE_TARGET_PORT, SYN);
+        source.box_end.write_all(&early).unwrap();
+        source.box_end.write_all(&sentinel).unwrap();
+        let out = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut source.switch))
+            .await
+            .expect("the relay keeps deciding")
+            .expect("the switch side stays open");
+        assert_eq!(
+            out, sentinel,
+            "an address no answer named is not the named box"
+        );
+
+        resolve_zone_name(&mut source, SOURCE, "box-b.min.internal.", TARGET).await;
+
+        // The source's own leg forwards the SYN by the name.
+        let syn = egress_tcp_segment(SOURCE, 40001, TARGET, ZONE_TARGET_PORT, SYN);
+        source.box_end.write_all(&syn).unwrap();
+        let forwarded =
+            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut source.switch))
+                .await
+                .expect("the source's own leg forwards the SYN")
+                .expect("the switch side stays open");
+        assert_eq!(
+            forwarded, syn,
+            "the listed name carries the flow out of the source box"
+        );
+
+        // The target's relay admits the source's half by the same name and
+        // its own ingress admits the published port.
+        target.switch.write_all(&wire_frame(&syn)).await.unwrap();
+        let reached = read_box_frame(&target)
+            .await
+            .expect("the SYN reaches the target box");
+        assert_eq!(reached, syn, "the named box is reached under its ingress");
+
+        // A port the target does not publish is refused by its ingress.
+        let unpublished = egress_tcp_segment(SOURCE, 40002, TARGET, 9999, SYN);
+        source.box_end.write_all(&unpublished).unwrap();
+        let forwarded =
+            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut source.switch))
+                .await
+                .expect("the source's own leg forwards the SYN")
+                .expect("the switch side stays open");
+        assert_eq!(
+            forwarded, unpublished,
+            "the name admits the source's half at any port"
+        );
+        target
+            .switch
+            .write_all(&wire_frame(&unpublished))
+            .await
+            .unwrap();
+        target
+            .switch
+            .write_all(&wire_frame(&sentinel))
+            .await
+            .unwrap();
+        let next = read_box_frame(&target)
+            .await
+            .expect("the relay keeps deciding");
+        assert_eq!(
+            next, sentinel,
+            "the target's ingress still refuses an unpublished port"
+        );
+    }
+
+    /// NET-163's parallel-instance case on a native host: a box that names
+    /// `box-c` does not reach `box-c-2`, a parallel instance the list does
+    /// not name, even after it resolves the instance's name. Its own leg
+    /// and the instance's relay both refuse the flow, and the line names
+    /// the rule `box-name` and the instance. A box whose `allow_subnets`
+    /// covers the instance's lease still reaches it.
+    #[tokio::test]
+    async fn zone_name_rule_does_not_cover_a_parallel_instance() {
+        use crate::net::dns_gate::tests::{read_box_frame, wire_frame};
+        const SOURCE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 42);
+        const COVERED: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 43);
+        const INSTANCE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 44);
+        let capture = crate::test_harness::CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let mut source = spawn_relay_for(
+            SOURCE,
+            Some(&zone_named_egress(&["box-c.min.internal"], Vec::new())),
+            |_| {},
+        );
+        let mut covered = spawn_relay_for(
+            COVERED,
+            Some(&zone_named_egress(
+                &["box-c.min.internal"],
+                vec![format!("{INSTANCE}/32")],
+            )),
+            |_| {},
+        );
+        let mut instance = spawn_relay_for(INSTANCE, Some(&zone_target_policy()), |_| {});
+        let sentinel = arp_frame(SOURCE);
+
+        resolve_zone_name(&mut source, SOURCE, "box-c-2.min.internal.", INSTANCE).await;
+
+        // The source's own leg refuses the flow: the list names `box-c`,
+        // never a prefix of it.
+        let syn = egress_tcp_segment(SOURCE, 40000, INSTANCE, ZONE_TARGET_PORT, SYN);
+        source.box_end.write_all(&syn).unwrap();
+        source.box_end.write_all(&sentinel).unwrap();
+        let out = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut source.switch))
+            .await
+            .expect("the relay keeps deciding")
+            .expect("the switch side stays open");
+        assert_eq!(
+            out, sentinel,
+            "a parallel instance the list does not name is refused"
+        );
+        let logged = capture.contents();
+        for expected in [
+            "network policy violation",
+            "session_id=100.64.0.42",
+            "remote_addr=100.64.0.44:8080",
+            "target=\"box-c-2.min.internal\"",
+            "rule_matched=\"box-name\"",
+        ] {
+            assert!(
+                logged.contains(expected),
+                "missing {expected:?} in: {logged}"
+            );
+        }
+
+        // The instance's relay refuses the same SYN on the source's half.
+        instance.switch.write_all(&wire_frame(&syn)).await.unwrap();
+        instance
+            .switch
+            .write_all(&wire_frame(&sentinel))
+            .await
+            .unwrap();
+        let reached = read_box_frame(&instance)
+            .await
+            .expect("the relay keeps deciding");
+        assert_eq!(
+            reached, sentinel,
+            "the instance's relay refuses the source's half"
+        );
+
+        // The CIDR fall-through stays: a box whose `allow_subnets` covers
+        // the instance's lease reaches it, whatever its list names.
+        let allowed = egress_tcp_segment(COVERED, 40000, INSTANCE, ZONE_TARGET_PORT, SYN);
+        covered.box_end.write_all(&allowed).unwrap();
+        let forwarded =
+            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut covered.switch))
+                .await
+                .expect("the covered box's leg forwards the SYN")
+                .expect("the switch side stays open");
+        assert_eq!(
+            forwarded, allowed,
+            "allow_subnets covers the instance's lease"
+        );
+        instance
+            .switch
+            .write_all(&wire_frame(&allowed))
+            .await
+            .unwrap();
+        let reached = read_box_frame(&instance)
+            .await
+            .expect("the SYN reaches the instance");
+        assert_eq!(
+            reached, allowed,
+            "the covered box reaches the instance under its ingress"
         );
     }
 
