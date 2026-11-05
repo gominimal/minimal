@@ -14937,8 +14937,9 @@ proof_bep_revoke_and_sign_out_end_to_end() {
 
 # DNS steering fails closed, end to end (BEP T32): one case on a VM lane with
 # the gvproxy switch. A box on a credentialed lane with the default `dns`
-# steering and `quic443 = "block"` starts. Then the case stops the Box Egress
-# Proxy (`bep serve`, which minvmd starts on macOS only, so elsewhere no proxy
+# steering and `quic443 = "block"` starts. Where a Box Egress Proxy runs, an A
+# lookup of api.github.com must first get an address. Then the case stops the
+# proxy (`bep serve`, which minvmd starts on macOS only, so elsewhere no proxy
 # runs and it is down from the start) and, from inside the box:
 #   1. an A lookup of api.github.com, a steered name, must be answered
 #      SERVFAIL (rcode 2) by the box's resolver, never by real DNS (BEP-062);
@@ -15022,22 +15023,6 @@ proof_bep_dns_steering_fails_closed_end_to_end() {
     ds_fail
   }
 
-  # Stop the proxy. minvmd does not restart a `bep serve` that exits, so the
-  # proxy stays down for the rest of the case.
-  if pkill -f -- "serve --listener $ds_sock" 2>/dev/null; then
-    for _ in $(seq 1 20); do
-      pgrep -f -- "serve --listener $ds_sock" >/dev/null 2>&1 || break
-      sleep 0.5
-    done
-    if pgrep -f -- "serve --listener $ds_sock" >/dev/null 2>&1; then
-      echo "::error::the Box Egress Proxy (bep serve --listener $ds_sock) still runs 10 s after SIGTERM"
-      ds_fail
-    fi
-    echo "stopped the Box Egress Proxy (bep serve --listener $ds_sock)"
-  else
-    echo "no Box Egress Proxy runs for this VM host, so it is down for the whole case"
-  fi
-
   ds_resolv="$(mnl session exec "$ds_sid" 'cat /etc/resolv.conf' 2>/dev/null | tr -d '\r')" || true
   ds_ns="$(printf '%s\n' "$ds_resolv" | awk '$1 == "nameserver" { print $2; exit }')"
   if [ -z "$ds_ns" ]; then
@@ -15071,7 +15056,45 @@ if len(r) >= 8 and r[0:2] == b"\x5e\x32" and r[2] & 0x80:
     print(r[3] & 0x0f, int.from_bytes(r[6:8], "big"))' "$b64"
   }
 
-  # Leg 1: the steered A lookup fails closed.
+  # A running proxy must answer before it stops, or leg 1 could not tell a
+  # withdrawn answer from a proxy that never came up.
+  if pgrep -f -- "serve --listener $ds_sock" >/dev/null 2>&1; then
+    for _ in $(seq 1 20); do
+      ds_ans="$(ds_dns api.github.com 1)"
+      case "$ds_ans" in "0 "[1-9]*) break ;; esac
+      sleep 0.5
+    done
+    echo "A api.github.com with the proxy up -> rcode and answers: ${ds_ans:-no reply}"
+    case "$ds_ans" in
+      "0 "[1-9]*) ;;
+      *)
+        echo "::error::the A lookup of the steered name api.github.com got no address while the Box Egress Proxy runs: got '${ds_ans:-no reply}'"
+        cat "$WORK/$ds_case.dns.err" 2>/dev/null || true
+        ds_fail
+        ;;
+    esac
+  fi
+
+  # Stop the proxy. minvmd does not restart a `bep serve` that exits, so the
+  # proxy stays down for the rest of the case.
+  if pkill -f -- "serve --listener $ds_sock" 2>/dev/null; then
+    for _ in $(seq 1 20); do
+      pgrep -f -- "serve --listener $ds_sock" >/dev/null 2>&1 || break
+      sleep 0.5
+    done
+    if pgrep -f -- "serve --listener $ds_sock" >/dev/null 2>&1; then
+      echo "::error::the Box Egress Proxy (bep serve --listener $ds_sock) still runs 10 s after SIGTERM"
+      ds_fail
+    fi
+    echo "stopped the Box Egress Proxy (bep serve --listener $ds_sock)"
+  else
+    echo "no Box Egress Proxy runs for this VM host, so it is down for the whole case"
+  fi
+
+  # Leg 1: the steered A lookup fails closed. The relay asks minvmd about
+  # the listener every 250 ms and minvmd checks it every 200 ms, so a second
+  # covers both. One lookup, no retry: a stale answer fails the case.
+  sleep 1
   ds_ans="$(ds_dns api.github.com 1)"
   echo "A api.github.com with the proxy down -> rcode and answers: ${ds_ans:-no reply}"
   if [ "${ds_ans%% *}" = 2 ]; then

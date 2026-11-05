@@ -99,22 +99,31 @@ pub fn is_zone_name(name: &str) -> bool {
 ///
 /// A state built by [`Self::for_switch`] refreshes itself: it asks the VM
 /// host daemon over the switch's control channel
-/// ([`super::listeners::proxy_listening`]), and a read that finds the last
-/// answer older than [`PROXY_LISTENER_CACHE`] starts the next ask. The read
-/// never waits for the ask: it answers from the last answer. A host that
-/// cannot be asked, a native host among them, answers down.
+/// ([`super::listeners::proxy_listening`]) every [`PROXY_LISTENER_CACHE`],
+/// whether or not anything reads it, so a proxy that stopped while no box
+/// looked anything up is already down at the next lookup. The asks end with
+/// the switch's last gate. A read never waits for an ask: it answers from
+/// the last answer. A host that cannot be asked, a native host among them,
+/// answers down.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ProxyListenerState {
-    live: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Where the state asks, or `None` for a state only [`Self::set_live`]
-    /// writes.
-    source: Option<std::sync::Arc<ListenerSource>>,
+    shared: std::sync::Arc<SharedListener>,
 }
 
-/// How long one answer about the proxy's listener stands before a read
-/// asks again. Short, so a proxy that stops listening fails its steered
-/// names closed within seconds.
-pub(crate) const PROXY_LISTENER_CACHE: Duration = Duration::from_secs(2);
+/// What every clone of a [`ProxyListenerState`] reads and writes.
+#[derive(Debug, Default)]
+struct SharedListener {
+    live: std::sync::atomic::AtomicBool,
+    /// Where the state asks, or `None` for a state only
+    /// [`ProxyListenerState::set_live`] writes.
+    source: Option<ListenerSource>,
+}
+
+/// How long one answer about the proxy's listener stands before the next
+/// ask. Short, because a steered name answers from the last answer: this
+/// bounds how long a proxy that stopped listening still gets its address
+/// handed out (BEP-062).
+pub(crate) const PROXY_LISTENER_CACHE: Duration = Duration::from_millis(250);
 
 /// Where a [`ProxyListenerState`] asks, and when it last asked.
 #[derive(Debug)]
@@ -128,9 +137,10 @@ struct ListenerSource {
     asking: std::sync::atomic::AtomicBool,
 }
 
-/// The one listener state of each switch, by its control channel.
+/// The one listener state of each switch, by its control channel. Held
+/// weakly: the gates own a state, so it ends with the switch's last gate.
 static SWITCH_LISTENERS: std::sync::LazyLock<
-    std::sync::Mutex<HashMap<String, ProxyListenerState>>,
+    std::sync::Mutex<HashMap<String, std::sync::Weak<SharedListener>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 impl ProxyListenerState {
@@ -141,35 +151,68 @@ impl ProxyListenerState {
     }
 
     /// A new state that asks the VM host daemon over `control`. The first
-    /// ask starts at once when a runtime runs.
+    /// ask starts at once when a runtime runs, and the asks repeat for as
+    /// long as the state lives.
     #[must_use]
     pub(crate) fn asking(control: super::policy::ControlChannel) -> Self {
         let state = Self {
-            live: std::sync::Arc::default(),
-            source: Some(std::sync::Arc::new(ListenerSource {
-                control,
-                asked: std::sync::Mutex::new(None),
-                asking: std::sync::atomic::AtomicBool::new(false),
-            })),
+            shared: std::sync::Arc::new(SharedListener {
+                live: std::sync::atomic::AtomicBool::new(false),
+                source: Some(ListenerSource {
+                    control,
+                    asked: std::sync::Mutex::new(None),
+                    asking: std::sync::atomic::AtomicBool::new(false),
+                }),
+            }),
         };
         state.refresh_if_stale();
+        state.keep_asking();
         state
     }
 
+    /// Ask again every [`PROXY_LISTENER_CACHE`] until the last clone of the
+    /// state is dropped. Without a runtime to run on, only reads start an
+    /// ask.
+    fn keep_asking(&self) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let shared = std::sync::Arc::downgrade(&self.shared);
+        crate::traced::spawn_detached(
+            tracing::info_span!(parent: None, "net.proxy_listener"),
+            async move {
+                loop {
+                    tokio::time::sleep(PROXY_LISTENER_CACHE).await;
+                    let Some(shared) = shared.upgrade() else {
+                        return;
+                    };
+                    Self { shared }.refresh_if_stale();
+                }
+            },
+        );
+    }
+
     /// The state every gate on the switch at `control` shares: built and
-    /// asked at the first box's attach, and handed to every later one.
+    /// asked at the attach of a box that finds no gate on the switch, and
+    /// handed to every box that attaches while one stands. A state built
+    /// after the last gate went reads down until its first answer, as the
+    /// first box's does.
     #[must_use]
     pub(crate) fn for_switch(control: &super::policy::ControlChannel) -> Self {
         let key = match control {
             super::policy::ControlChannel::Unix(path) => format!("unix:{}", path.display()),
             super::policy::ControlChannel::Vsock { cid, port } => format!("vsock:{cid}:{port}"),
         };
-        SWITCH_LISTENERS
+        let mut listeners = SWITCH_LISTENERS
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(key)
-            .or_insert_with(|| Self::asking(control.clone()))
-            .clone()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        listeners.retain(|_, shared| shared.strong_count() > 0);
+        if let Some(shared) = listeners.get(&key).and_then(std::sync::Weak::upgrade) {
+            return Self { shared };
+        }
+        let state = Self::asking(control.clone());
+        listeners.insert(key, std::sync::Arc::downgrade(&state.shared));
+        state
     }
 
     /// Whether the listener is live now, by the last answer. A read that
@@ -177,14 +220,21 @@ impl ProxyListenerState {
     #[must_use]
     pub(crate) fn is_live(&self) -> bool {
         self.refresh_if_stale();
-        self.live.load(std::sync::atomic::Ordering::Acquire)
+        self.shared.live.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The last answer, without starting an ask: a test can wait for an
+    /// answer this way and leave the asking to the state.
+    #[cfg(test)]
+    pub(crate) fn last_answer(&self) -> bool {
+        self.shared.live.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Start an ask when the last one is older than [`PROXY_LISTENER_CACHE`]
     /// and none is in flight. Without a runtime to run the ask on, the
     /// state keeps its last answer.
     fn refresh_if_stale(&self) {
-        let Some(source) = &self.source else {
+        let Some(source) = &self.shared.source else {
             return;
         };
         if tokio::runtime::Handle::try_current().is_err() {
@@ -219,8 +269,8 @@ impl ProxyListenerState {
     /// cannot be asked or does not answer. Returns the recorded answer. A
     /// state with nowhere to ask keeps its last answer.
     pub(crate) async fn refresh(&self) -> bool {
-        let Some(source) = &self.source else {
-            return self.live.load(std::sync::atomic::Ordering::Acquire);
+        let Some(source) = &self.shared.source else {
+            return self.shared.live.load(std::sync::atomic::Ordering::Acquire);
         };
         // The guard clears `asking` however the ask ends. A task dropped or
         // panicking mid-ask would otherwise leave `asking` set, and no later
@@ -244,7 +294,10 @@ impl ProxyListenerState {
     /// writes one info line, so the log shows when steered names start to
     /// resolve to the proxy again. Returns whether the state changed.
     pub(crate) fn set_live(&self, live: bool) -> bool {
-        let was = self.live.swap(live, std::sync::atomic::Ordering::AcqRel);
+        let was = self
+            .shared
+            .live
+            .swap(live, std::sync::atomic::Ordering::AcqRel);
         if live && !was {
             tracing::info!(
                 component = "dns-gate",
@@ -3462,8 +3515,28 @@ pub enum ConnectingOwner {
 /// switch's gateway, is never in this node's socket tables. Without this
 /// rule its lookup finds nothing, and the proxy refuses every host request
 /// while a host-address box is live.
+///
+/// A holder in no classifier leaf is put to its PID namespace: a host without
+/// the classifier places no box in a leaf, and every process of a
+/// host-address box runs in the PID namespace its launch recorded
+/// ([`crate::box_runtime::host_address_box_in_namespace`]). A holder whose
+/// namespace cannot be read makes the owner unknown.
 #[must_use]
 pub fn connecting_box(peer: SocketAddrV4, local: SocketAddrV4) -> ConnectingOwner {
+    connecting_box_with(
+        peer,
+        local,
+        crate::box_runtime::host_address_box_in_namespace,
+    )
+}
+
+/// [`connecting_box`], with the box that runs in a PID namespace named by
+/// `box_in_namespace`.
+pub(crate) fn connecting_box_with(
+    peer: SocketAddrV4,
+    local: SocketAddrV4,
+    box_in_namespace: impl Fn((u64, u64)) -> Option<SessionId>,
+) -> ConnectingOwner {
     if !node_holds_address(*peer.ip()) {
         return ConnectingOwner::OffNode;
     }
@@ -3475,17 +3548,22 @@ pub fn connecting_box(peer: SocketAddrV4, local: SocketAddrV4) -> ConnectingOwne
         let Some(holders) = socket_holders(inode) else {
             return ConnectingOwner::Unknown;
         };
-        // Read each holder's cgroup, then check that the pid still holds the
-        // socket. A pid that exited and was reused between the two reads
-        // names another process's cgroup, so it counts as unreadable.
+        // Read each holder's cgroup and PID namespace, then check that the
+        // pid still holds the socket. A pid that exited and was reused
+        // between the reads names another process's cgroup and namespace,
+        // so it counts as unreadable.
         owner_of_holders(holders.into_iter().map(|pid| {
             let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
-            holds_socket(pid, inode).then_some(cgroup)
+            let namespaces = crate::box_runtime::pid_namespaces_of(pid);
+            if !holds_socket(pid, inode) {
+                return None;
+            }
+            holder_box(&cgroup, namespaces.as_deref(), &box_in_namespace)
         }))
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (peer, local);
+        let _ = (peer, local, box_in_namespace);
         ConnectingOwner::Unknown
     }
 }
@@ -3503,6 +3581,15 @@ pub fn connecting_box(peer: SocketAddrV4, local: SocketAddrV4) -> ConnectingOwne
 /// process's cgroup, so it counts as unreadable, as in [`connecting_box`].
 #[must_use]
 pub fn connecting_boxes(pairs: &[(SocketAddrV4, SocketAddrV4)]) -> Vec<ConnectingOwner> {
+    connecting_boxes_with(pairs, crate::box_runtime::host_address_box_in_namespace)
+}
+
+/// [`connecting_boxes`], with the box that runs in a PID namespace named by
+/// `box_in_namespace`.
+fn connecting_boxes_with(
+    pairs: &[(SocketAddrV4, SocketAddrV4)],
+    box_in_namespace: impl Fn((u64, u64)) -> Option<SessionId>,
+) -> Vec<ConnectingOwner> {
     #[cfg(target_os = "linux")]
     {
         let on_node: Vec<bool> = pairs
@@ -3550,10 +3637,11 @@ pub fn connecting_boxes(pairs: &[(SocketAddrV4, SocketAddrV4)]) -> Vec<Connectin
                         .values()
                         .filter(|holder| holder.held.contains(inode))
                         .map(|holder| {
-                            holder
+                            let cgroup = holder
                                 .cgroup
-                                .clone()
-                                .filter(|_| holder.still.contains(inode))
+                                .as_deref()
+                                .filter(|_| holder.still.contains(inode))?;
+                            holder_box(cgroup, holder.namespaces.as_deref(), &box_in_namespace)
                         }),
                 )
             })
@@ -3563,7 +3651,7 @@ pub fn connecting_boxes(pairs: &[(SocketAddrV4, SocketAddrV4)]) -> Vec<Connectin
     {
         pairs
             .iter()
-            .map(|(peer, local)| connecting_box(*peer, *local))
+            .map(|(peer, local)| connecting_box_with(*peer, *local, &box_in_namespace))
             .collect()
     }
 }
@@ -3580,6 +3668,9 @@ struct Holder {
     still: Vec<u64>,
     /// Its `/proc/<pid>/cgroup`, or `None` when that read failed.
     cgroup: Option<String>,
+    /// Its PID namespace and each parent, innermost first, or `None` when
+    /// that read failed.
+    namespaces: Option<Vec<(u64, u64)>>,
 }
 
 /// The processes that hold a descriptor for any socket in `wanted`, by pid,
@@ -3613,6 +3704,7 @@ fn socket_holders_of(wanted: &BTreeSet<u64>) -> Option<BTreeMap<u32, Holder>> {
                 return None;
             }
             let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok();
+            let namespaces = crate::box_runtime::pid_namespaces_of(pid);
             let still = held_by(pid);
             Some((
                 pid,
@@ -3620,6 +3712,7 @@ fn socket_holders_of(wanted: &BTreeSet<u64>) -> Option<BTreeMap<u32, Holder>> {
                     held,
                     still,
                     cgroup,
+                    namespaces,
                 },
             ))
         })
@@ -3708,32 +3801,80 @@ fn holds_socket(pid: u32, inode: u64) -> bool {
     })
 }
 
-/// The owner of a socket from its holders' cgroups (NET-070). Each item is
-/// one holder's `/proc/<pid>/cgroup`, or `None` when that read failed or the
+/// The box one holder of a socket runs in (NET-070), as [`holder_box`]
+/// reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HolderBox {
+    /// The holder runs in this box's classifier leaf.
+    Leaf(SessionId),
+    /// The holder runs in no classifier leaf, and in the PID namespace of
+    /// this running host-address box or in one nested inside it.
+    Namespace(SessionId),
+    /// The holder runs in no classifier leaf and in no box's PID namespace,
+    /// as the developer's browser does.
+    Outside,
+}
+
+/// The box a holder runs in, from its `/proc/<pid>/cgroup` and its PID
+/// namespaces, innermost first (NET-070). A classifier leaf names its box
+/// first. A holder in no leaf is put to the first of its namespaces that
+/// `box_in_namespace` names, so a holder in a namespace nested inside a box's
+/// is that box's. `None` when the holder is in no leaf and its namespaces
+/// could not be read: the owner is then unknown, and the proxy refuses the
+/// connection.
+fn holder_box(
+    cgroup: &str,
+    namespaces: Option<&[(u64, u64)]>,
+    box_in_namespace: impl Fn((u64, u64)) -> Option<SessionId>,
+) -> Option<HolderBox> {
+    if let Some(id) = box_in_cgroup(cgroup) {
+        return Some(HolderBox::Leaf(id));
+    }
+    Some(
+        namespaces?
+            .iter()
+            .find_map(|namespace| box_in_namespace(*namespace))
+            .map_or(HolderBox::Outside, HolderBox::Namespace),
+    )
+}
+
+/// The owner of a socket from the boxes its holders run in (NET-070). Each
+/// item is one holder's [`HolderBox`], or `None` when a read failed or the
 /// pid no longer held the socket after it. The socket is a box's when any
-/// holder runs in that box's leaf, whatever other holders run outside every
-/// box: a process outside the boxes must not lift the box's gate by sharing
-/// its socket. [`ConnectingOwner::Unknown`] when there is no holder, when
-/// any holder cannot be read, or when holders run in two different boxes'
-/// leaves, so the proxy refuses the connection. [`ConnectingOwner::NoBox`]
-/// only when every holder runs outside every box.
-fn owner_of_holders(holders: impl IntoIterator<Item = Option<String>>) -> ConnectingOwner {
+/// holder runs in that box's leaf or PID namespace, whatever other holders
+/// run outside every box: a process outside the boxes must not lift the
+/// box's gate by sharing its socket. [`ConnectingOwner::Unknown`] when there
+/// is no holder, when any holder cannot be read, or when holders run in two
+/// different boxes, so the proxy refuses the connection.
+/// [`ConnectingOwner::NoBox`] only when every holder runs outside every box.
+fn owner_of_holders(holders: impl IntoIterator<Item = Option<HolderBox>>) -> ConnectingOwner {
     let mut owner = None;
+    let mut by_leaf = false;
     let mut any = false;
-    for cgroup in holders {
+    for holder in holders {
         any = true;
-        let Some(cgroup) = cgroup else {
-            return ConnectingOwner::Unknown;
+        let (id, leaf) = match holder {
+            None => return ConnectingOwner::Unknown,
+            Some(HolderBox::Outside) => continue,
+            Some(HolderBox::Leaf(id)) => (id, true),
+            Some(HolderBox::Namespace(id)) => (id, false),
         };
-        if let Some(id) = box_in_cgroup(&cgroup) {
-            match owner {
-                Some(seen) if seen != id => return ConnectingOwner::Unknown,
-                _ => owner = Some(id),
-            }
+        match owner {
+            Some(seen) if seen != id => return ConnectingOwner::Unknown,
+            _ => owner = Some(id),
         }
+        by_leaf |= leaf;
     }
     match owner {
-        Some(id) => ConnectingOwner::Box(id),
+        Some(id) => {
+            tracing::debug!(
+                component = "dns-proxy",
+                box_id = %id,
+                named_by = if by_leaf { "classifier leaf" } else { "pid namespace" },
+                "named the box that holds a connecting socket"
+            );
+            ConnectingOwner::Box(id)
+        }
         None if any => ConnectingOwner::NoBox,
         None => ConnectingOwner::Unknown,
     }
@@ -4231,8 +4372,20 @@ mod tests {
     fn owner_of_holders_prefers_a_box_holder_and_refuses_two_boxes() {
         let a = "00000000-0000-0000-0000-0000000000aa";
         let b = "00000000-0000-0000-0000-0000000000bb";
-        let in_box = |id: &str| Some(format!("0::/minimal/boxes/deny/{id}\n"));
-        let outside = || Some("0::/user.slice/user-1000.slice/session-1.scope\n".to_owned());
+        let in_box = |id: &str| {
+            holder_box(
+                &format!("0::/minimal/boxes/deny/{id}\n"),
+                Some(&[(1, 1)]),
+                |_| None,
+            )
+        };
+        let outside = || {
+            holder_box(
+                "0::/user.slice/user-1000.slice/session-1.scope\n",
+                Some(&[(1, 1)]),
+                |_| None,
+            )
+        };
         let box_a = ConnectingOwner::Box(SessionId::parse_str(a).unwrap());
 
         assert_eq!(owner_of_holders([outside(), in_box(a)]), box_a);
@@ -4257,6 +4410,96 @@ mod tests {
             ConnectingOwner::Unknown,
             "no holder"
         );
+    }
+
+    /// NET-070: on a host without the classifier, a holder in no classifier
+    /// leaf is put to its PID namespace. The namespace of a running
+    /// host-address box names that box, through the one-pair lookup and the
+    /// batch lookup alike. A holder whose namespace cannot be read makes the
+    /// owner unknown, and only a holder in neither a leaf nor a box's
+    /// namespace is no box's.
+    #[test]
+    fn owner_by_pid_namespace_without_classifier_leaf() {
+        let a = SessionId::parse_str("00000000-0000-0000-0000-0000000000aa").unwrap();
+        let b = SessionId::parse_str("00000000-0000-0000-0000-0000000000bb").unwrap();
+        let unplaced = "0::/user.slice/user-1000.slice/session-1.scope\n";
+        let in_a = |namespace: (u64, u64)| (namespace == (7, 7)).then_some(a);
+
+        assert_eq!(
+            holder_box(unplaced, Some(&[(7, 7)]), in_a),
+            Some(HolderBox::Namespace(a))
+        );
+        assert_eq!(
+            holder_box(unplaced, Some(&[(9, 9), (7, 7), (1, 1)]), in_a),
+            Some(HolderBox::Namespace(a)),
+            "a namespace nested inside a box's is that box's"
+        );
+        assert_eq!(
+            holder_box(unplaced, Some(&[(9, 9), (8, 8), (1, 1)]), in_a),
+            Some(HolderBox::Outside)
+        );
+        assert_eq!(
+            holder_box(unplaced, None, in_a),
+            None,
+            "a holder whose namespace cannot be read"
+        );
+        assert_eq!(
+            holder_box(
+                "0::/minimal/boxes/allow/00000000-0000-0000-0000-0000000000bb\n",
+                None,
+                in_a
+            ),
+            Some(HolderBox::Leaf(b)),
+            "a classifier leaf names its box first"
+        );
+        assert_eq!(
+            owner_of_holders([Some(HolderBox::Outside), Some(HolderBox::Namespace(a))]),
+            ConnectingOwner::Box(a)
+        );
+        assert_eq!(
+            owner_of_holders([Some(HolderBox::Namespace(a)), Some(HolderBox::Leaf(b))]),
+            ConnectingOwner::Unknown,
+            "holders in two boxes"
+        );
+        assert_eq!(
+            owner_of_holders([Some(HolderBox::Namespace(a)), None]),
+            ConnectingOwner::Unknown,
+            "a holder that cannot be read"
+        );
+
+        // A real connection from this process, which runs in no leaf.
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_accepted, peer) = listener.accept().unwrap();
+        let (SocketAddr::V4(peer), SocketAddr::V4(local)) = (peer, listener.local_addr().unwrap())
+        else {
+            panic!("an IPv4 connection");
+        };
+        if cfg!(target_os = "linux") {
+            let own = crate::box_runtime::pid_namespace_of(std::process::id())
+                .expect("this process's namespace is readable");
+            assert_eq!(
+                crate::box_runtime::pid_namespaces_of(std::process::id())
+                    .expect("this process's namespaces are readable")
+                    .first(),
+                Some(&own),
+                "the walk starts at the process's own namespace"
+            );
+            let in_own = |namespace: (u64, u64)| (namespace == own).then_some(a);
+            assert_eq!(
+                connecting_box_with(peer, local, in_own),
+                ConnectingOwner::Box(a)
+            );
+            assert_eq!(
+                connecting_boxes_with(&[(peer, local)], in_own),
+                [ConnectingOwner::Box(a)]
+            );
+            assert_eq!(
+                connecting_box_with(peer, local, |_| None),
+                ConnectingOwner::NoBox
+            );
+        }
+        drop(client);
     }
 
     /// The socket table row of a connection's client end is the one whose
@@ -6898,12 +7141,14 @@ mod tests {
         super::super::listeners::seed_vm_report_door_for_tests(&control_sock, &door);
 
         let state = ProxyListenerState {
-            live: std::sync::Arc::default(),
-            source: Some(std::sync::Arc::new(ListenerSource {
-                control: super::super::policy::ControlChannel::Unix(control_sock.clone()),
-                asked: std::sync::Mutex::new(None),
-                asking: std::sync::atomic::AtomicBool::new(true),
-            })),
+            shared: std::sync::Arc::new(SharedListener {
+                live: std::sync::atomic::AtomicBool::new(false),
+                source: Some(ListenerSource {
+                    control: super::super::policy::ControlChannel::Unix(control_sock.clone()),
+                    asked: std::sync::Mutex::new(None),
+                    asking: std::sync::atomic::AtomicBool::new(true),
+                }),
+            }),
         };
         state.set_live(true);
         let ask = tokio::time::timeout(Duration::from_millis(50), state.refresh()).await;
@@ -6912,15 +7157,16 @@ mod tests {
             "the silent door holds the ask past the timeout"
         );
 
-        let source = state.source.as_ref().expect("the state has a source");
+        let source = state
+            .shared
+            .source
+            .as_ref()
+            .expect("the state has a source");
         assert!(
             !source.asking.load(std::sync::atomic::Ordering::Acquire),
             "the dropped ask clears asking"
         );
-        assert!(
-            !state.live.load(std::sync::atomic::Ordering::Acquire),
-            "the dropped ask records down"
-        );
+        assert!(!state.last_answer(), "the dropped ask records down");
         super::super::listeners::clear_vm_report_door_for_tests(&control_sock);
     }
 }
