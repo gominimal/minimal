@@ -3077,35 +3077,58 @@ pub fn home_proxy_control() -> Option<std::path::PathBuf> {
 /// reply.
 const PROXY_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How the box whose id [`spawn_revocation`] revokes came to its end. The
+/// revocation thread's warnings name it, so a log reader sees which step
+/// completed without the proxy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoxEnd {
+    /// The destroy of an own-address box.
+    Destroy,
+    /// The retire of a host_ip box: it ended, stopped or was destroyed.
+    HostIpRetire,
+}
+
+impl BoxEnd {
+    /// The words that open the revocation thread's warnings. The destroy
+    /// keeps its text, which `scripts/session-e2e.sh` matches.
+    fn completed(self) -> &'static str {
+        match self {
+            Self::Destroy => "the destroy completed",
+            Self::HostIpRetire => "the box ended",
+        }
+    }
+}
+
 /// Sends the revocation of `box_id` to the proxy at `path` on a thread of its
-/// own, so the destroy does not wait for it. A failure is one warning that
-/// names the step that failed.
-fn spawn_revocation(path: std::path::PathBuf, box_id: BoxId) {
+/// own, so the end of the box does not wait for it. A failure is one warning
+/// that names the step that failed.
+fn spawn_revocation(path: std::path::PathBuf, box_id: BoxId, end: BoxEnd) {
     let spawned = std::thread::Builder::new()
         .name("bep-revocation".into())
         .spawn(move || {
             let submitted = submit_revocation(&path, box_id);
             let id = box_id_hex(box_id);
+            let completed = end.completed();
             match (submitted.revoke, submitted.forget) {
                 (Ok(()), Ok(())) => {}
                 (Err(revoke), Ok(())) => tracing::warn!(
                     box_id = %id,
                     error = %revoke,
-                    "the destroy completed without a revocation from the Box Egress Proxy: \
+                    "{completed} without a revocation from the Box Egress Proxy: \
                      the proxy forgot the box, and the withdrawn attachment refuses its values"
                 ),
                 (Err(revoke), Err(forget)) => tracing::warn!(
                     box_id = %id,
                     revoke_error = %revoke,
                     forget_error = %forget,
-                    "the destroy completed without a revocation from the Box Egress Proxy \
+                    "{completed} without a revocation from the Box Egress Proxy \
                      and without the proxy forgetting the box: the withdrawn attachment \
                      refuses its values"
                 ),
                 (Ok(()), Err(forget)) => tracing::warn!(
                     box_id = %id,
                     error = %forget,
-                    "the Box Egress Proxy recorded the destroyed box's revocation but did not \
+                    "the Box Egress Proxy recorded the ended box's revocation but did not \
                      forget the box"
                 ),
             }
@@ -3114,7 +3137,8 @@ fn spawn_revocation(path: std::path::PathBuf, box_id: BoxId) {
         tracing::warn!(
             box_id = %box_id_hex(box_id),
             %error,
-            "the destroy completed without a revocation: the revocation thread did not start"
+            "{} without a revocation: the revocation thread did not start",
+            end.completed()
         );
     }
 }
@@ -3143,7 +3167,7 @@ fn submit_revocation(path: &std::path::Path, box_id: BoxId) -> Submitted {
     if revoke.is_ok() {
         tracing::info!(
             box_id = %id,
-            "recorded the destroyed box's revocation with the Box Egress Proxy"
+            "recorded the ended box's revocation with the Box Egress Proxy"
         );
     }
     let forget = send_control(path, "forget_box", &id);
@@ -5203,7 +5227,7 @@ impl BoxRegistry {
         if let (Some(record), Some(path)) = (removed.as_deref(), self.proxy_control.as_deref())
             && record.declares_credentialed_upstream()
         {
-            spawn_revocation(path.clone(), record.box_id);
+            spawn_revocation(path.clone(), record.box_id, BoxEnd::Destroy);
         }
         self.retired(&removed, withdrawal);
         self.retire_task_rows(task_rows, true);
@@ -6406,7 +6430,7 @@ impl BoxRegistry {
             && minted
             && let Some(path) = self.proxy_control.as_deref()
         {
-            spawn_revocation(path.clone(), id);
+            spawn_revocation(path.clone(), id, BoxEnd::HostIpRetire);
         }
         if name_withdrawn {
             tracing::info!(
@@ -13371,6 +13395,15 @@ mod tests {
             "the revoked id stays in the id set"
         );
         assert_eq!(wired.host_ip_id_for("agent"), None);
+    }
+
+    // BEP-043: the revocation thread's warnings for a retired host_ip box
+    // say the box ended, not that a destroy completed. The destroy keeps
+    // the text that scripts/session-e2e.sh matches.
+    #[test]
+    fn retiring_a_host_ip_grant_box_revokes_its_minted_id_with_neutral_warnings() {
+        assert_eq!(super::BoxEnd::HostIpRetire.completed(), "the box ended");
+        assert_eq!(super::BoxEnd::Destroy.completed(), "the destroy completed");
     }
 
     // BEP-043: a host_ip box with no credentialed upstream holds no grant,
