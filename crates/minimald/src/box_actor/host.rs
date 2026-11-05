@@ -156,7 +156,7 @@ fn run_lane_nft(
         .arg(nft_verb)
         .arg("element")
         .arg("inet")
-        .arg("minimal_class")
+        .arg(crate::net::classifier::TABLE_NAME)
         .arg(crate::net::classifier::PROXY_LANE_SET)
         .arg(format!("{{ \"{}\" }}", rel.display()))
         .stdin(std::process::Stdio::null())
@@ -2527,5 +2527,53 @@ mod quic443_cohort_tests {
         assert!(!cohort.lock().unwrap().blocked(), "the block lifted");
         assert_eq!(moves.where_is(100), plain_leaf, "UDP 443 leaves again");
         plain_task.abort();
+    }
+
+    /// BEP-083 on the root daemon's path: `run_lane_nft` hands `nft` the
+    /// element for the leaf's path below the mount, in the table's lane set,
+    /// and refuses a leaf that is not below the mount without running `nft`.
+    #[test]
+    fn root_lane_change_runs_nft_on_the_lane_set() {
+        use crate::net::classifier::{nft_calls, recording_nft};
+        let stub = tempfile::tempdir().unwrap();
+        let nft = recording_nft(stub.path(), &[]);
+        let mount = tempfile::tempdir().unwrap();
+        let id = BoxId::mint().to_string();
+        let root = mount.path().join("minimald.slice");
+        let leaf = sandbox::classifier::box_leaf(&root, &id, Verdict::Allow);
+        let element = format!("{{ \"minimald.slice/boxes/allow/{id}\" }}");
+        let argv = |verb: &str| -> Vec<String> {
+            [
+                verb,
+                "element",
+                "inet",
+                "minimal_class",
+                "bep_lane_leaves",
+                &element,
+            ]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect()
+        };
+
+        super::run_lane_nft(&nft, mount.path(), "lane-add", &leaf).expect("lane-add runs nft");
+        super::run_lane_nft(&nft, mount.path(), "lane-remove", &leaf)
+            .expect("lane-remove runs nft");
+        let calls: Vec<Vec<String>> = nft_calls(stub.path())
+            .into_iter()
+            .map(|(argv, _)| argv)
+            .collect();
+        assert_eq!(calls, vec![argv("add"), argv("delete")]);
+
+        let elsewhere = tempfile::tempdir().unwrap();
+        let outside = sandbox::classifier::box_leaf(elsewhere.path(), &id, Verdict::Allow);
+        let refused = super::run_lane_nft(&nft, mount.path(), "lane-add", &outside)
+            .expect_err("a leaf outside the mount is refused");
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            nft_calls(stub.path()).len(),
+            2,
+            "no nft call for the refusal"
+        );
     }
 }

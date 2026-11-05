@@ -2258,7 +2258,7 @@ pub const GUEST_BASH: &str = "/bin/bash";
 /// The name of the table both lanes load, and the chain a deny-all box's
 /// verdict rides on: `nft list` must show both behind the marker for a
 /// guest's decision to rest on more than the marker's existence.
-const TABLE_NAME: &str = "minimal_class";
+pub(crate) const TABLE_NAME: &str = "minimal_class";
 const DENY_OUT_CHAIN: &str = "chain deny_out";
 
 /// The ct-mark bits the guest's own boot classifies with: the step's default,
@@ -3883,7 +3883,7 @@ pub(crate) fn guest_ruleset(cohort: IpAddr, node_plane: IpAddr) -> Vec<u8> {
 /// every other call exits 0, so the marker's discipline is read against a
 /// packet filter that says no when the test wants it to.
 #[cfg(test)]
-fn recording_nft(dir: &Path, refuse_on: &[&str]) -> PathBuf {
+pub(crate) fn recording_nft(dir: &Path, refuse_on: &[&str]) -> PathBuf {
     let nft = dir.join("nft");
     let dir = dir.display();
     let refusals = if refuse_on.is_empty() {
@@ -3926,7 +3926,7 @@ fn recording_nft(dir: &Path, refuse_on: &[&str]) -> PathBuf {
 /// each one's argv and exactly the bytes it was piped on stdin — the bytes
 /// the digest of a load covers, read back off the stub that received them.
 #[cfg(test)]
-fn nft_calls(dir: &Path) -> Vec<(Vec<String>, Vec<u8>)> {
+pub(crate) fn nft_calls(dir: &Path) -> Vec<(Vec<String>, Vec<u8>)> {
     let mut calls = Vec::new();
     for n in 0.. {
         let argv = std::fs::read_to_string(dir.join(format!("call{n}.argv")))
