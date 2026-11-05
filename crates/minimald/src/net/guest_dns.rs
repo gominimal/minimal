@@ -6,9 +6,10 @@
 //! in-VM daemon starts no box-zone answerer — and denies everything but the
 //! reply direction and that listener, so a deny-all box that cannot resolve
 //! out-of-zone names at the switch's resolver (the interim NET-079 carve-out
-//! admitted the gateway's port 53 whole) now meets a listener that refuses
-//! every name outside the box zone instead: nothing outside the machine is
-//! asked. In-zone questions are refused unless every one of them is a type-A
+//! admitted the gateway's port 53 whole) now meets a listener that answers
+//! every name outside the box zone NXDOMAIN instead, citing the same
+//! root-owned SOA as the relay: nothing outside the machine is asked.
+//! In-zone questions are refused unless every one of them is a type-A
 //! question for a name the switch's resolver answers itself
 //! ([`answered_on_the_switch`], NET-079), and those — the zone's own A
 //! records, `host.min.internal` among them — are forwarded to the switch
@@ -18,7 +19,7 @@
 //! answers a zone name the switch would send upstream with NXDOMAIN
 //! (NET-006), while the guest's table steers lookups here only from a
 //! deny-all box, whose every question outside the switch's own zone match is
-//! refused regardless. The listener does not consult the box zone
+//! answered NXDOMAIN regardless. The listener does not consult the box zone
 //! (`boxes::core::zone_answer`): on a VM host the zone is the VM host
 //! daemon's to serve (NET-138), so an in-guest listener answering zone
 //! names itself would answer stale.
@@ -28,12 +29,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hickory_proto::op::{Message, MessageType, Metadata, OpCode, ResponseCode};
-use hickory_proto::rr::RecordType;
+use hickory_proto::rr::{Record, RecordType};
 use tokio::net::UdpSocket;
 
 use super::SwitchSubnet;
 use super::answerer::ANSWERER_PORT;
-use super::dns_gate::answered_on_the_switch;
+use super::dns_gate::{answered_on_the_switch, out_of_zone_soa_record};
 
 /// The `component` field every guest listener log line carries, matching the
 /// answerer's `zone-answerer` convention.
@@ -103,7 +104,7 @@ pub async fn start(subnet: SwitchSubnet) {
         component = COMPONENT,
         %addr,
         status = "listening",
-        "the guest's DNS listener is serving; a deny-all box's lookups refuse \
+        "the guest's DNS listener is serving; a deny-all box's lookups get NXDOMAIN \
          outside the zone and forward the zone's A questions to {gateway}"
     );
     // The serve task runs for the daemon's lifetime; its handle is dropped
@@ -150,7 +151,12 @@ async fn serve_bounded(
         };
         let verdict = decide(&query);
         let reply = match verdict {
-            Decision::Answer(rcode) => answer(&query, rcode),
+            Decision::Answer(rcode) => answer(&query, rcode, None),
+            Decision::OutOfZone => answer(
+                &query,
+                ResponseCode::NXDomain,
+                Some(out_of_zone_soa_record()),
+            ),
             Decision::Forward => {
                 // The forward runs as its own task so a slow upstream holds
                 // no other lookup's turn: the relay's discipline, applied to a
@@ -193,6 +199,9 @@ async fn serve_bounded(
 enum Decision {
     /// Reply `rcode` here, nothing forwarded.
     Answer(ResponseCode),
+    /// A name outside the switch's own zone match: reply NXDOMAIN here,
+    /// citing the root-owned SOA, nothing forwarded (NET-079, NET-141).
+    OutOfZone,
     /// Send the query's datagram to the gateway unmodified.
     Forward,
 }
@@ -232,10 +241,10 @@ fn parse(datagram: &[u8]) -> Option<Message> {
 /// behind the first cannot ride a query the first one let through. A box
 /// whose table steers lookups here is deny-all by construction, so the gate's
 /// deny_all guard is the caller: any question naming something outside the
-/// switch's own zone match is refused — the apex and a zone suffix not in
-/// exact lowercase among them, both of which the gateway would send
-/// upstream. What is left is in-zone, and refused empty (NET-136, NET-006)
-/// unless every question is a type-A question for a name the switch answers
+/// switch's own zone match is answered NXDOMAIN citing the root-owned SOA —
+/// the apex and a zone suffix not in exact lowercase among them, both of
+/// which the gateway would send upstream. What is left is in-zone, and
+/// refused empty (NET-136, NET-006) unless every question is a type-A question for a name the switch answers
 /// itself (NET-079) — the zone's A records, which the listener forwards to
 /// the gateway alone.
 fn decide(query: &Message) -> Decision {
@@ -251,10 +260,12 @@ fn decide(query: &Message) -> Decision {
         return Decision::Answer(ResponseCode::Refused);
     }
     let questions = || query.queries.iter();
-    // REFUSED (NET-079): answered here, so no resolver beyond the guest —
-    // not even the gateway's — ever sees the name.
+    // NXDOMAIN citing the root SOA (NET-079, NET-141): answered here, so no
+    // resolver beyond the guest — not even the gateway's — ever sees the
+    // name. Not REFUSED: glibc reads REFUSED as a temporary failure, and
+    // clients retry it. The SOA's 15 s minimum bounds the negative cache.
     if questions().any(|q| !answered_on_the_switch(q.name())) {
-        return Decision::Answer(ResponseCode::Refused);
+        return Decision::OutOfZone;
     }
     // NODATA (NET-136, NET-006): an AAAA, HTTPS or SVCB question, or a zone
     // name's question of any type but A — the switch's resolver answers a
@@ -277,13 +288,18 @@ fn decide(query: &Message) -> Decision {
 
 /// The reply the listener writes back for `query` instead of forwarding it:
 /// `rcode`, every question echoed back, no answers, and the query's id, so
-/// the box's resolver stack matches the reply to its own query. The log line
-/// names `name` and `rtype`, the question that decided `rcode`.
-fn answer(query: &Message, rcode: ResponseCode) -> Option<Vec<u8>> {
+/// the box's resolver stack matches the reply to its own query. `soa`, when
+/// there is one, goes in the authority section: the record a negative
+/// answer cites (RFC 2308). The log line names `name` and `rtype`, the
+/// question that decided `rcode`.
+fn answer(query: &Message, rcode: ResponseCode, soa: Option<Record>) -> Option<Vec<u8>> {
     let mut reply = Message::response(query.metadata.id, query.metadata.op_code);
     reply.metadata = Metadata::response_from_request(&query.metadata);
     reply.metadata.response_code = rcode;
     reply.add_queries(query.queries.clone());
+    if let Some(soa) = soa {
+        reply.add_authority(soa);
+    }
     let question = query.queries.first();
     let name = question.map_or_else(String::new, |q| q.name().to_string());
     tracing::debug!(
@@ -375,7 +391,7 @@ mod tests {
     use hickory_proto::rr::{Name, RecordType};
     use tokio::net::UdpSocket;
 
-    use super::{Decision, MAX_DATAGRAM, decide, parse};
+    use super::{Decision, MAX_DATAGRAM, answer, decide, out_of_zone_soa_record, parse};
 
     /// The guest's listener verdict for one query message, as [`decide`]
     /// returns it, named for the assertion that reads it.
@@ -403,46 +419,59 @@ mod tests {
         query
     }
 
-    /// A REFUSED verdict for an out-of-zone A question: the name the issue's
-    /// field report asks a deny-all box to resolve, answered here so no
-    /// resolver beyond the guest ever sees it.
+    /// An NXDOMAIN for an out-of-zone A question, citing the root-owned SOA:
+    /// the name the issue's field report asks a deny-all box to resolve,
+    /// answered here so no resolver beyond the guest ever sees it, and so
+    /// glibc reads it as not found, not as a temporary failure.
     #[test]
-    fn out_of_zone_a_is_refused() {
+    fn out_of_zone_name_is_nxdomain_with_root_soa() {
         let query = query_of(&[("example.com.".to_string(), RecordType::A)]);
         assert_decision(
             &query,
-            Decision::Answer(ResponseCode::Refused),
-            "a name outside the box zone is refused, not forwarded",
+            Decision::OutOfZone,
+            "a name outside the box zone is NXDOMAIN, not forwarded",
         );
+        let reply = answer(
+            &query,
+            ResponseCode::NXDomain,
+            Some(out_of_zone_soa_record()),
+        )
+        .expect("the reply encodes");
+        let reply = Message::from_vec(&reply).expect("the reply parses");
+        assert_eq!(reply.metadata.id, query.metadata.id, "the id is echoed");
+        assert_eq!(reply.metadata.response_code, ResponseCode::NXDomain);
+        assert_eq!(reply.queries, query.queries, "every question is echoed");
+        assert!(reply.answers.is_empty(), "NXDOMAIN answers nothing");
+        crate::net::dns_gate::tests::assert_cites_root_soa(&reply);
     }
 
-    /// REFUSED covers every record type outside the zone: the carve-out the
+    /// NXDOMAIN covers every record type outside the zone: the carve-out the
     /// interim design admitted (the gateway on port 53) answered out-of-zone
     /// AAAA and TXT alike from off the machine.
     #[test]
-    fn out_of_zone_non_a_is_refused() {
+    fn out_of_zone_non_a_is_nxdomain() {
         for rtype in [RecordType::AAAA, RecordType::TXT] {
             let query = query_of(&[("example.com.".to_string(), rtype)]);
             assert_decision(
                 &query,
-                Decision::Answer(ResponseCode::Refused),
-                "an out-of-zone question is refused regardless of type",
+                Decision::OutOfZone,
+                "an out-of-zone question is NXDOMAIN regardless of type",
             );
         }
     }
 
-    /// The apex, and a zone suffix not in exact lowercase, are refused:
+    /// The apex, and a zone suffix not in exact lowercase, are NXDOMAIN:
     /// both name the zone in a form the switch's resolver would send
     /// upstream, so neither is the listener's to forward — deliberately
     /// narrower than the relay's NXDOMAIN leg, which answers them by name.
     #[test]
-    fn apex_and_non_lowercase_suffix_are_refused() {
+    fn apex_and_non_lowercase_suffix_are_nxdomain() {
         for name in ["min.internal.", "x.MIN.INTERNAL."] {
             let query = query_of(&[(name.to_string(), RecordType::A)]);
             assert_decision(
                 &query,
-                Decision::Answer(ResponseCode::Refused),
-                "{name} names the zone in a form the gateway would forward: refused",
+                Decision::OutOfZone,
+                "{name} names the zone in a form the gateway would forward: NXDOMAIN",
             );
         }
     }
@@ -477,7 +506,7 @@ mod tests {
         ]);
         assert_decision(
             &ridden,
-            Decision::Answer(ResponseCode::Refused),
+            Decision::OutOfZone,
             "an out-of-zone question refuses the query it rides in",
         );
     }
@@ -723,8 +752,8 @@ mod tests {
     /// names below the apex forward, and the match is
     /// [`answered_on_the_switch`] verbatim, case included — a name whose
     /// zone suffix is not the exact lowercase form the switch answers is
-    /// not the switch's to answer, so the listener refuses it rather than
-    /// forward what the gateway would send upstream.
+    /// not the switch's to answer, so the listener answers it NXDOMAIN
+    /// rather than forward what the gateway would send upstream.
     #[test]
     fn zone_match_is_the_switchs_own() {
         let query = query_of(&[
@@ -739,8 +768,8 @@ mod tests {
         let cased = query_of(&[("host.MIN.internal.".to_string(), RecordType::A)]);
         assert_decision(
             &cased,
-            Decision::Answer(ResponseCode::Refused),
-            "a zone suffix not in the exact lowercase form is refused",
+            Decision::OutOfZone,
+            "a zone suffix not in the exact lowercase form is NXDOMAIN",
         );
     }
 
