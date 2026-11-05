@@ -6531,41 +6531,17 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   task_kept_check e2e-fail "$WORK/task-fail.err"
   echo "task run exit-code relay: 7 → 7 OK"
 
-  # --keep retains the session, named <task>-<n> by the daemon, attachable later.
+  # --keep retains the task box, named <task>-<n> by the daemon. The box
+  # ends when its task returns and keeps its record (BOX-038).
   (cd "$TASK_SEED_DIR" && mnl task run e2e-echo --keep >/dev/null 2>"$WORK/task-keep.err") \
     || { echo "::error::'min task run e2e-echo --keep' failed"; cat "$WORK/task-keep.err" 2>/dev/null || true; fail; }
   kept="$(mnl ls 2>/dev/null | grep -o 'e2e-echo-[0-9][0-9]*' | head -n1)"
   if [ -z "$kept" ]; then
-    echo "::error::--keep did not leave a 'e2e-echo-<n>' session listed"
+    echo "::error::--keep did not leave a 'e2e-echo-<n>' box listed"
     mnl ls 2>&1 || true
     fail
   fi
-  # `min session run <session> <task>` runs a declared task against a session
-  # that already exists, rather than composing one of its own. It reaches the
-  # daemon as a named `min://task/run` form, so nothing about the task's name
-  # is inferred from the text — the routing a bare string used to decide by
-  # prefix-sniffing (gominimal/inbox#558).
-  sr_out="$(mnl session run "$kept" e2e-echo 2>"$WORK/session-run.err")"
-  rc=$?
-  if [ "$rc" -ne 0 ]; then
-    echo "::error::'min session run $kept e2e-echo' exited $rc (expected 0)"
-    echo "--- stderr ---"; cat "$WORK/session-run.err" 2>/dev/null || true
-    fail
-  fi
-  if [[ "$sr_out" != *TASK_RUN_E2E_OK* ]]; then
-    echo "::error::'min session run' did not stream the task's output, got '$sr_out'"
-    fail
-  fi
-  # The task's exit code is the client's, as it is for `min task run`.
-  mnl session run "$kept" e2e-fail >/dev/null 2>&1
-  rc=$?
-  if [ "$rc" -ne 7 ]; then
-    echo "::error::'min session run $kept e2e-fail' exited $rc (expected 7)"
-    fail
-  fi
-  echo "session run proof OK (task in an existing session, exit relay 7 → 7)"
-
-  # The destroy dirty gate: the kept session's task process has exited, so
+  # The destroy dirty gate: the kept task box ended with its task, so
   # no host is running and its at-risk state is unknowable — the gate must
   # refuse a headless (no TTY) destroy without --force, naming the escape
   # hatch. (Were a host live, the seed's empty `.git` marker would make VCS
@@ -6579,7 +6555,43 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     || { echo "::error::headless destroy refusal does not name --force"; cat "$WORK/destroy-refuse.err" 2>/dev/null || true; fail; }
   mnl session destroy --force "$kept" >/dev/null 2>&1 \
     || { echo "::error::could not destroy kept session $kept"; fail; }
-  echo "task run --keep: session $kept retained; dirty gate refused headless destroy OK"
+  echo "task run --keep: box $kept retained; dirty gate refused headless destroy OK"
+
+  # `min session run <session> <task>` runs a declared task against a session
+  # that already exists, rather than composing one of its own. A task box
+  # ends with its task (BOX-038), so the proof runs in a session that
+  # `min session activate` starts. It reaches the daemon as a named
+  # `min://task/run` form, so nothing about the task's name is inferred from
+  # the text — the routing a bare string used to decide by prefix-sniffing
+  # (gominimal/inbox#558).
+  sr_sid="$(cd "$TASK_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-task-sr 2>"$WORK/session-run-activate.err")" || {
+    echo "::error::'min session activate' for the session run proof failed"
+    echo "--- stderr ---"; cat "$WORK/session-run-activate.err" 2>/dev/null || true
+    fail
+  }
+  sr_sid="$(printf '%s\n' "$sr_sid" | tail -n1 | tr -d '\r')"
+  sr_out="$(mnl session run "$sr_sid" e2e-echo 2>"$WORK/session-run.err")"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "::error::'min session run $sr_sid e2e-echo' exited $rc (expected 0)"
+    echo "--- stderr ---"; cat "$WORK/session-run.err" 2>/dev/null || true
+    fail
+  fi
+  if [[ "$sr_out" != *TASK_RUN_E2E_OK* ]]; then
+    echo "::error::'min session run' did not stream the task's output, got '$sr_out'"
+    fail
+  fi
+  # The task's exit code is the client's, as it is for `min task run`.
+  mnl session run "$sr_sid" e2e-fail >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" -ne 7 ]; then
+    echo "::error::'min session run $sr_sid e2e-fail' exited $rc (expected 7)"
+    fail
+  fi
+  mnl session destroy --force "$sr_sid" >/dev/null 2>&1 \
+    || { echo "::error::could not destroy session $sr_sid"; fail; }
+  echo "session run proof OK (task in an existing session, exit relay 7 → 7)"
 
   # Unknown task: an instant client-side error listing what IS declared.
   if (cd "$TASK_SEED_DIR" && mnl task run no-such-task >/dev/null 2>"$WORK/task-unknown.err"); then
