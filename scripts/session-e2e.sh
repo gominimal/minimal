@@ -89,7 +89,7 @@
 #                                    and disallowed connections, the in-force
 #                                    deny-all default and its note;
 #                                    a deny-all box's names outside the box
-#                                    zone are REFUSED fast at its relay, a
+#                                    zone are NXDOMAIN fast at its relay, a
 #                                    zone TXT is NODATA there, while
 #                                    host.min.internal resolves, and its
 #                                    TCP 53 is dropped (NET-141)
@@ -397,6 +397,11 @@
 #                                    deny-all, `min add` inside it, and the
 #                                    daemon's own fetch recorded as node-plane
 #                                    traffic naming the box and the package
+#   host_stop_stops_boxes_then_daemon_and_vm
+#                                    BCLI-049 on a VM-backed lane: `min host
+#                                    stop` on the VM host stops each running
+#                                    box, then the daemon and its VM, and
+#                                    each box stays listed as stopped
 #
 # Usage: scripts/session-e2e.sh [case]
 set -uo pipefail # not -e: capture failures so we can dump diagnostics
@@ -425,7 +430,8 @@ case "${1:-}" in
     | answerer_survives_session_stop \
     | escapes_and_builds_stay_inside_box_rules \
     | host_ip_rules_follow_the_running_box \
-    | host_exposures_follow_the_table)
+    | host_exposures_follow_the_table \
+    | host_stop_stops_boxes_then_daemon_and_vm)
     E2E_VM="${E2E_VM:-1}"
     if [ -z "${E2E_MINIMAL_ARGS:-}" ]; then
       E2E_MINIMAL_ARGS="--provider local-minvmd"
@@ -2375,7 +2381,7 @@ published_loopback_host() {
 # reaches in the same run, and not an external name, which fails fast at
 # resolution while host.min.internal still resolves. An explicit deny-all
 # declaration carries NET-141's deny-all case: its relay answers a name
-# outside the box zone REFUSED, fast, while host.min.internal still resolves,
+# outside the box zone NXDOMAIN, fast, while host.min.internal still resolves,
 # and its TCP to the resolver's port is dropped. NET-077's opt-out is not
 # driven here (it needs a daemon restarted with it); it stays with the unit
 # test deny_all_opt_out_keeps_prior_default.
@@ -2755,7 +2761,7 @@ proof_own_ip_egress_declared_and_enforced() {
 
     # ---- the disallowed NAME, its own assertion ----------------------------
     # example.org is outside `allow_dns_hosts`, so its connection must not
-    # complete. Its relay answers the name REFUSED (NET-141), so curl must
+    # complete. Its relay answers the name NXDOMAIN (NET-141), so curl must
     # fail at resolution, inside 5000 ms, before any connection is tried.
     name_deny_start_ms="$(now_ms)"
     mnl session exec "$declare_sid" \
@@ -2784,6 +2790,78 @@ proof_own_ip_egress_declared_and_enforced() {
     echo "allowed/disallowed-connection WARNING: the declared box could not complete its allowed connection to https://example.com; the connection assertions that need the public internet are skipped as weather warnings"
   fi
 
+  # One raw DNS query sent from inside box $1 to its resolver $2, carried in
+  # and out as base64 with socat (both launcher baseline packages), built and
+  # parsed host-side with python3 (an e2e prerequisite). Prints
+  # "rcode ancount soa" for a reply to the query's own id, or nothing. soa is
+  # "root:<minimum>" when the first authority record is an SOA owned by the
+  # root, else "-". NET-141's refusal is "3 0 root:15": NXDOMAIN that cites
+  # the root-owned SOA, whose 15 s minimum bounds the negative cache.
+  egress_dns_reply() { # $1 sid, $2 nameserver, $3 name, $4 qtype number
+    local q b64
+    q="$(python3 -c '
+import base64, struct, sys
+name, qtype = sys.argv[1], int(sys.argv[2])
+wire = b"".join(bytes([len(l)]) + l.encode() for l in name.split(".")) + b"\0"
+sys.stdout.write(base64.b64encode(
+    struct.pack("!HHHHHH", 0x4d31, 0x0100, 1, 0, 0, 0) + wire + struct.pack("!HH", qtype, 1)
+).decode())' "$3" "$4")"
+    b64="$(mnl session exec "$1" \
+      "printf %s '$q' | /usr/bin/base64 -d | /usr/bin/socat -t 2 - UDP:$2:53 | /usr/bin/base64 -w0" \
+      2>"$WORK/egress-dns-reply.err" | tr -d '\r\n')" || true
+    python3 -c '
+import base64, sys
+try:
+    r = base64.b64decode(sys.argv[1])
+except Exception:
+    sys.exit(0)
+if len(r) < 12 or r[0:2] != b"\x4d\x31" or not r[2] & 0x80:
+    sys.exit(0)
+rcode, an, ns = r[3] & 0x0f, int.from_bytes(r[6:8], "big"), int.from_bytes(r[8:10], "big")
+def skip_name(i):
+    while i < len(r):
+        if r[i] == 0:
+            return i + 1
+        if r[i] & 0xc0 == 0xc0:
+            return i + 2
+        i += 1 + r[i]
+    return len(r)
+i = 12
+for _ in range(int.from_bytes(r[4:6], "big")):
+    i = skip_name(i) + 4
+for _ in range(an):
+    i = skip_name(i)
+    i += 10 + int.from_bytes(r[i + 8:i + 10], "big")
+soa = "-"
+if ns and i + 11 <= len(r) and r[i] == 0:
+    rdlen = int.from_bytes(r[i + 9:i + 11], "big")
+    rdata = r[i + 11:i + 11 + rdlen]
+    if int.from_bytes(r[i + 1:i + 3], "big") == 6 and len(rdata) >= 4:
+        soa = "root:%d" % int.from_bytes(rdata[-4:], "big")
+print(rcode, an, soa)' "$b64"
+  }
+
+  # ---- NET-141's partial-allow-list case, on the wire: example.org is off
+  # the declared box's list, so its relay answers NXDOMAIN (rcode 3) and
+  # cites the root-owned SOA. It is not REFUSED (rcode 5), which glibc reads
+  # as a temporary failure that clients retry. The relay makes this answer
+  # itself, so the leg needs no public internet.
+  pl_ns="$(mnl session exec "$declare_sid" 'cat /etc/resolv.conf' \
+    2>"$WORK/egress-declared-resolv.err" | tr -d '\r' \
+    | awk '$1 == "nameserver" { print $2; exit }')" || true
+  if [ -z "$pl_ns" ]; then
+    echo "::error::NET-141: the partial-allow-list box's /etc/resolv.conf names no nameserver"
+    cat "$WORK/egress-declared-resolv.err" 2>/dev/null || true
+    fail
+  fi
+  pl_reply="$(egress_dns_reply "$declare_sid" "$pl_ns" example.org 1)"
+  echo "NET-141: A example.org from the partial-allow-list box -> rcode/answers/soa ${pl_reply:-<no reply>}"
+  if [ "${pl_reply%% *}" != 3 ] || [ "${pl_reply##* }" != root:15 ]; then
+    echo "::error::NET-141: the partial-allow-list box's A lookup of example.org, a name off its allow list, was not answered NXDOMAIN (rcode 3) citing the root SOA with a 15 s minimum by its relay (got '${pl_reply:-no reply}')"
+    cat "$WORK/egress-dns-reply.err" 2>/dev/null || true
+    fail
+  fi
+
   # ---- a declared deny-all box: `--deny-all-egress`, every allow list
   # present and empty — the very section the in-force default materializes
   # for the bare box above (NET-074), here declared, so the box carries it
@@ -2800,7 +2878,7 @@ proof_own_ip_egress_declared_and_enforced() {
   deny_all_sid="$(printf '%s\n' "$deny_all_sid" | tail -n1 | tr -d '\r')"
 
   # ---- NET-141's deny-all case: the relay's DNS gate answers a deny-all
-  # box's lookup of any name outside the box zone REFUSED itself, whatever
+  # box's lookup of any name outside the box zone NXDOMAIN itself, whatever
   # the record type, and forwards nothing; zone names pass; and DNS over TCP
   # to the resolver is dropped, because the resolver carve-out is UDP alone.
   # None of it needs the public internet: the refusal is the relay's own
@@ -2819,39 +2897,19 @@ proof_own_ip_egress_declared_and_enforced() {
   fi
   echo "NET-141: the deny-all box's resolver is $da_ns"
 
-  # The rcode itself, read off the wire: a raw query sent from inside the box
-  # with socat, carried in and out as base64 (both launcher baseline
-  # packages), built and parsed host-side with python3 (an e2e prerequisite).
-  # A REFUSED answer to the query's own id is the relay's: NXDOMAIN, an
-  # answer, or silence would each be something else.
-  da_dns_rcode() { # $1 name, $2 qtype number -> prints "rcode ancount", or nothing
-    local q b64
-    q="$(python3 -c '
-import base64, struct, sys
-name, qtype = sys.argv[1], int(sys.argv[2])
-wire = b"".join(bytes([len(l)]) + l.encode() for l in name.split(".")) + b"\0"
-sys.stdout.write(base64.b64encode(
-    struct.pack("!HHHHHH", 0x4d31, 0x0100, 1, 0, 0, 0) + wire + struct.pack("!HH", qtype, 1)
-).decode())' "$1" "$2")"
-    b64="$(mnl session exec "$deny_all_sid" \
-      "printf %s '$q' | /usr/bin/base64 -d | /usr/bin/socat -t 2 - UDP:$da_ns:53 | /usr/bin/base64 -w0" \
-      2>"$WORK/egress-deny-all-rcode.err" | tr -d '\r\n')" || true
-    python3 -c '
-import base64, sys
-try:
-    r = base64.b64decode(sys.argv[1])
-except Exception:
-    sys.exit(0)
-if len(r) >= 8 and r[0:2] == b"\x4d\x31" and r[2] & 0x80:
-    print(r[3] & 0x0f, int.from_bytes(r[6:8], "big"))' "$b64"
+  # The rcode itself, read off the wire with egress_dns_reply above. An
+  # NXDOMAIN to the query's own id that cites the root-owned SOA is the
+  # relay's: REFUSED, an answer, or silence would each be something else.
+  da_dns_rcode() { # $1 name, $2 qtype number -> prints "rcode ancount soa", or nothing
+    egress_dns_reply "$deny_all_sid" "$da_ns" "$1" "$2"
   }
   for da_q in A:1 AAAA:28 TXT:16; do
-    da_rcode="$(da_dns_rcode example.com "${da_q#*:}")"
-    da_rcode="${da_rcode%% *}"
-    echo "NET-141: ${da_q%%:*} example.com from the deny-all box -> rcode ${da_rcode:-<no reply>}"
-    if [ "$da_rcode" != 5 ]; then
-      echo "::error::NET-141: the deny-all box's ${da_q%%:*} lookup of example.com, a name outside the box zone, was not answered REFUSED (rcode 5) by its relay (got '${da_rcode:-no reply}')"
-      cat "$WORK/egress-deny-all-rcode.err" 2>/dev/null || true
+    da_reply="$(da_dns_rcode example.com "${da_q#*:}")"
+    da_rcode="${da_reply%% *}"
+    echo "NET-141: ${da_q%%:*} example.com from the deny-all box -> rcode/answers/soa ${da_reply:-<no reply>}"
+    if [ "$da_rcode" != 3 ] || [ "${da_reply##* }" != root:15 ]; then
+      echo "::error::NET-141: the deny-all box's ${da_q%%:*} lookup of example.com, a name outside the box zone, was not answered NXDOMAIN (rcode 3) citing the root SOA with a 15 s minimum by its relay (got '${da_reply:-no reply}')"
+      cat "$WORK/egress-dns-reply.err" 2>/dev/null || true
       fail
     fi
   done
@@ -2863,9 +2921,9 @@ if len(r) >= 8 and r[0:2] == b"\x4d\x31" and r[2] & 0x80:
   da_nonce="e2e$(date +%s)$$"
   da_zone_reply="$(da_dns_rcode "$da_nonce.min.internal" 16)"
   echo "NET-141: TXT $da_nonce.min.internal from the deny-all box -> rcode/answers ${da_zone_reply:-<no reply>}"
-  if [ "$da_zone_reply" != "0 0" ]; then
+  if [ "${da_zone_reply% *}" != "0 0" ]; then
     echo "::error::NET-141: the deny-all box's TXT lookup of $da_nonce.min.internal, a zone name, was not answered NODATA (rcode 0, no answers) by its relay (got '${da_zone_reply:-no reply}')"
-    cat "$WORK/egress-deny-all-rcode.err" 2>/dev/null || true
+    cat "$WORK/egress-dns-reply.err" 2>/dev/null || true
     fail
   fi
 
@@ -2915,7 +2973,7 @@ if len(r) >= 8 and r[0:2] == b"\x4d\x31" and r[2] & 0x80:
     cat "$WORK/egress-deny-all-tcp53.err" 2>/dev/null || true
     fail
   fi
-  echo "NET-141 OK: the deny-all box's names outside the zone are REFUSED at its relay, a zone TXT is NODATA, host.min.internal resolves, and its TCP 53 is dropped"
+  echo "NET-141 OK: the deny-all box's names outside the zone are NXDOMAIN at its relay, a zone TXT is NODATA, host.min.internal resolves, and its TCP 53 is dropped"
 
   # "A box with no effective reach reaches nothing" only means something if
   # the lane can already reach the public internet — otherwise the
@@ -2943,7 +3001,7 @@ if len(r) >= 8 and r[0:2] == b"\x4d\x31" and r[2] & 0x80:
     fi
     # One outcome is legitimate for this box: the lookup is refused before any
     # connection is tried. Its relay answers every name outside the box zone
-    # REFUSED (NET-141, asserted on the wire above), so curl must fail at
+    # NXDOMAIN (NET-141, asserted on the wire above), so curl must fail at
     # resolution, fast. A SYN that left — reset, answered, or silently
     # dropped — would mean the name resolved, which the refusal rules out.
     deny_all_outcome="not a resolver refusal"
@@ -30341,31 +30399,73 @@ while True:
   [ -n "$tw_stopped" ] \
     || { echo "::error::the named VM never reached 'stopped' after the redraw beat"; fail; }
 
-  # The configured port: pinned to the held port, the start fails naming it
-  # and never redraws onto another.
-  if MINVMD_NODE_PROXY_PORT="$tw_held" minvmd --vm "$tw_name" run --detach \
+  # The configured port: pinned to the held port, the VM starts with its
+  # hostname proxy down (NET-021). It never redraws onto another port, and
+  # `min ls` names the held port as the cause.
+  if [ -n "$tw_log" ]; then tw_log_lines="$(wc -l < "$tw_log" | tr -d ' ')"; fi
+  TWO_VM_NAME="$tw_name" # alive again: teardown stops it
+  MINVMD_NODE_PROXY_PORT="$tw_held" RUST_LOG="warn,minvmd=info" \
+    minvmd --vm "$tw_name" run --detach \
       --timeout "${MINIMAL_SPAWN_TIMEOUT_SECS:-150}" \
-      </dev/null >"$WORK/two-vm-pinned.out" 2>"$WORK/two-vm-pinned.err"; then
-    echo "::error::the named VM started with its configured proxy port $tw_held held by another listener — a configured port must fail the start, never redraw (T93)"
+      </dev/null >"$WORK/two-vm-pinned.out" 2>"$WORK/two-vm-pinned.err" \
+    || { echo "::error::the named VM did not start with its configured proxy port $tw_held held by another listener — a held configured port must start the VM with the proxy down (NET-021)"
+         echo "--- stderr ---"; cat "$WORK/two-vm-pinned.err" 2>/dev/null || true
+         echo "--- supervisor log ---"; cat "$tw_alpha/run.log" 2>/dev/null || true
+         fail; }
+  tw_pin_ls=""
+  tw_pin_serving=""
+  for _ in $(seq 1 60); do
+    tw_pin_ls="$(two_vm_mn ls 2>&1 || true)"
+    tw_pin_serving="$(two_vm_ls_proxy_port "$tw_name" "$tw_pin_ls" scoped)"
+    [ -n "$tw_pin_serving" ] && break
+    case "$tw_pin_ls" in
+      *"the hostname proxy is not serving: "*"holds 127.0.0.1:$tw_held."*) break ;;
+    esac
+    sleep 1
+  done
+  if [ -n "$tw_pin_serving" ]; then
+    echo "::error::the named VM's hostname proxy serves on 127.0.0.1:$tw_pin_serving while its configured port $tw_held is held — a configured port must never redraw (NET-021)"
+    printf '%s\n' "$tw_pin_ls"
     fail
   fi
+  case "$tw_pin_ls" in
+    *"the hostname proxy is not serving: "*"holds 127.0.0.1:$tw_held."*) ;;
+    *)
+      echo "::error::min ls does not name the held configured port $tw_held as the cause the hostname proxy is down (NET-021)"
+      printf '%s\n' "$tw_pin_ls"
+      echo "--- supervisor log ---"; cat "$tw_alpha/run.log" 2>/dev/null || true
+      fail ;;
+  esac
+  # The start checks the configured port itself and logs it as a skipped
+  # candidate while it is held. Only a candidate line for another port means
+  # the VM host daemon drew a substitute.
+  tw_pin_skip="$(two_vm_log_since "$tw_log" "$tw_log_lines" \
+    | grep -F -- 'skipped a node-port candidate' \
+    | grep -vE -- "candidate_port\"?[:=]$tw_held([^0-9]|\$)" || true)"
+  if [ -n "$tw_pin_skip" ]; then
+    echo "::error::the VM host daemon drew another port for the configured port $tw_held: $tw_pin_skip (NET-021)"
+    fail
+  fi
+  echo "pinned: the VM is up with its proxy down — $(printf '%s\n' "$tw_pin_ls" | grep -F -- "holds 127.0.0.1:$tw_held" | head -n1)"
+  minvmd --vm "$tw_name" stop >/dev/null 2>"$WORK/two-vm-stop3.err" \
+    || { echo "::error::'minvmd --vm $tw_name stop' failed after the pinned beat"
+         cat "$WORK/two-vm-stop3.err" 2>/dev/null || true
+         fail; }
+  tw_stopped=""
+  for _ in $(seq 1 60); do
+    case "$(minvmd --vm "$tw_name" status --json 2>/dev/null || true)" in
+      *'"state":"stopped"'*) tw_stopped=1; break ;;
+    esac
+    sleep 1
+  done
+  [ -n "$tw_stopped" ] \
+    || { echo "::error::the named VM never reached 'stopped' after the pinned beat"; fail; }
   TWO_VM_NAME=""
-  # The detach's own stderr — what the CLI's autospawn error carries — must
-  # name the port, the holder and why inline.
-  tw_pin_err="$(cat "$WORK/two-vm-pinned.err" 2>/dev/null || true)"
-  if [[ "$tw_pin_err" != *"hostname proxy port $tw_held held by"* ]] \
-     || [[ "$tw_pin_err" != *"never redraw"* ]]; then
-    echo "::error::the failed start does not name the configured port $tw_held, its holder, and that it never redraws (T93)"
-    cat "$tw_alpha/run.log" 2>/dev/null || true
-    printf '%s\n' "$tw_pin_err"
-    fail
-  fi
-  echo "pinned: the start failed naming the held port — $(printf '%s\n' "$tw_pin_err" | grep -F -- "$tw_held" | head -n1)"
   kill "$TWO_VM_HOLD_PID" 2>/dev/null || true
   wait "$TWO_VM_HOLD_PID" 2>/dev/null || true
   TWO_VM_HOLD_PID=""
 
-  echo "two named VMs on one machine OK (own state each, booted at once on their own proxy ports, one listing with both, box names resolving to their VM, both routing at once, stop one leaves the other, a held drawn port redrawn, a held pinned port failing the start)"
+  echo "two named VMs on one machine OK (own state each, booted at once on their own proxy ports, one listing with both, box names resolving to their VM, both routing at once, stop one leaves the other, a held drawn port redrawn, a held pinned port starting the VM with its proxy down)"
   echo "::endgroup::"
 }
 
@@ -31568,6 +31668,108 @@ while True:
 }
 
 # ---------------------------------------------------------------------------
+# `min host stop` stops the boxes first (BCLI-049), on a VM-backed lane: the
+# daemon is the guest's pid-1, so the VM must go down with it. Two boxes of
+# its own on the VM host, then `min host stop <host>`:
+#
+#   * it exits 0, prints `Stopped <box>.` for each running box, then
+#     "Stopped <n> boxes, the daemon and its VM on <host>.", where <n> is
+#     the count of those lines. In a whole-lane run the earlier proofs can
+#     leave more boxes running, so <n> is at least 2, not exactly 2.
+#   * `minvmd status` reads the VM as stopped (exit 1).
+#   * the next `min box show` boots the VM again, and each of its two boxes
+#     is listed as stopped: the stop kept the records.
+#
+# The proof starts its own boxes, not the shared session: in a whole-lane
+# run an earlier daemon respawn can leave the shared session stopped.
+#
+# Diagnostics: each step prints the command it ran and its exit status. The
+# command's stdout and stderr stay in $WORK/host-stop, and a failure prints
+# them.
+proof_host_stop_stops_boxes_then_daemon_and_vm() {
+  local hs_case=host_stop_stops_boxes_then_daemon_and_vm
+  if [ -z "$E2E_VM" ]; then
+    not_run "$hs_case" "native lane: the VM host's stop is this case's subject"
+    return 0
+  fi
+  echo "::group::min host stop stops the boxes, then the daemon and its VM (BCLI-049)"
+  local hs_dir="$WORK/host-stop" hs_a="e2e-host-stop-a" hs_b="e2e-host-stop-b"
+  local hs_host hs_out hs_rc hs_id hs_box hs_state hs_lines hs_n
+  mkdir -p "$hs_dir"
+  for hs_box in "$hs_a" "$hs_b"; do
+    hs_id="$(cd "$PROJECT_DIR" && mnl session activate . --name "$hs_box" 2>"$hs_dir/activate-$hs_box.err" | tail -n1 | tr -d '\r')"
+    if [ -z "$hs_id" ]; then
+      echo "::error::box $hs_box for the host stop did not start"
+      cat "$hs_dir/activate-$hs_box.err" 2>/dev/null || true
+      fail
+    fi
+    echo "run: min session activate . --name $hs_box -> $hs_id"
+  done
+
+  # The VM host the boxes run on: the first running local-minvmd row.
+  mnl host list >"$hs_dir/host-list.out" 2>"$hs_dir/host-list.err" || true
+  hs_host="$(awk '$2 == "local-minvmd" && $3 == "running" { print $1; exit }' "$hs_dir/host-list.out")"
+  if [ -z "$hs_host" ]; then
+    echo "::error::'min host list' shows no running local-minvmd host"
+    cat "$hs_dir/host-list.out" "$hs_dir/host-list.err" 2>/dev/null || true
+    fail
+  fi
+
+  hs_rc=0
+  mnl host stop "$hs_host" >"$hs_dir/stop.out" 2>"$hs_dir/stop.err" </dev/null || hs_rc=$?
+  hs_out="$(tr -d '\r' <"$hs_dir/stop.out")"
+  echo "run: min host stop $hs_host -> exit $hs_rc"
+  # Every line before the summary is one `Stopped <box>.` line.
+  hs_lines="$(printf '%s\n' "$hs_out" | sed '$d' | grep -c '^Stopped .*\.$' || true)"
+  hs_n="$(printf '%s\n' "$hs_out" | tail -n1 \
+    | sed -n "s/^Stopped \([0-9][0-9]*\) boxes, the daemon and its VM on $hs_host\.\$/\1/p")"
+  if [ "$hs_rc" -ne 0 ] \
+     || ! printf '%s\n' "$hs_out" | grep -qxF "Stopped $hs_a." \
+     || ! printf '%s\n' "$hs_out" | grep -qxF "Stopped $hs_b." \
+     || [ -z "$hs_n" ] || [ "$hs_n" -lt 2 ] || [ "$hs_n" != "$hs_lines" ]; then
+    echo "::error::'min host stop $hs_host' did not stop both boxes, then the daemon and its VM"
+    echo "summary count '${hs_n:-<none>}', box lines $hs_lines"
+    echo "--- stdout ---"; printf '%s\n' "$hs_out"
+    echo "--- stderr ---"; cat "$hs_dir/stop.err" 2>/dev/null || true
+    fail
+  fi
+  echo "check: $(printf '%s\n' "$hs_out" | tail -n1)"
+
+  # The VM went down with its daemon. `minvmd status` exits 1 when stopped.
+  hs_rc=0
+  minvmd status >/dev/null 2>&1 || hs_rc=$?
+  if [ "$hs_rc" -ne 1 ]; then
+    echo "::error::the VM is not stopped after 'min host stop $hs_host' ('minvmd status' exited $hs_rc, expected 1)"
+    fail
+  fi
+  echo "check: minvmd status reads the VM as stopped"
+
+  # The stop kept each record: the next command boots the VM again, and
+  # each box is listed as stopped.
+  for hs_box in "$hs_a" "$hs_b"; do
+    hs_state="$(mnl box show "$hs_box" </dev/null 2>"$hs_dir/show-$hs_box.err" \
+      | sed -n 's/^State: *//p' | tr -d '\r')"
+    if [ "$hs_state" != stopped ]; then
+      echo "::error::box $hs_box is not listed as stopped after the host stop (state '${hs_state:-<none>}')"
+      cat "$hs_dir/show-$hs_box.err" 2>/dev/null || true
+      fail
+    fi
+    echo "check: $hs_box: State: stopped"
+  done
+
+  mnl box rm --force "$hs_a" >/dev/null 2>&1 || true
+  mnl box rm --force "$hs_b" >/dev/null 2>&1 || true
+  # The stop also stopped the shared session. Remove it, so the next proof
+  # that needs it activates a fresh one.
+  if [ -n "${sid:-}" ]; then
+    mnl box rm --force "$SESSION_NAME" >/dev/null 2>&1 || true
+    sid=""
+  fi
+  echo "$hs_case OK ($hs_n boxes stopped, then the daemon and its VM; the records kept as stopped)"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
 # Dispatch on the first argument: every proof in today's order when none is
 # given, or exactly the named one. The names are the proof functions' suffixes.
 case "${1:-}" in
@@ -31675,6 +31877,10 @@ case "${1:-}" in
     proof_escapes_and_builds_stay_inside_box_rules
     # Beside them, for the same reason.
     proof_host_ip_rules_follow_the_running_box
+    # Stops the VM host: its boxes, then the daemon and its VM. The next
+    # command autospawns a fresh VM host daemon, so the proofs after it
+    # find a running daemon.
+    proof_host_stop_stops_boxes_then_daemon_and_vm
     # Second-to-last on purpose, for the same reasons the daemon-fetch proof
     # below is last: it installs its own host classifier tree and table (its
     # own, removed before it returns) and respawns the daemon pair under its
@@ -31765,7 +31971,8 @@ case "${1:-}" in
     | bep_round_three_conditions_closed \
     | bep_ahm_audit_by_id_and_name | bep_ahm_parent_merges_children \
     | bep_ahm_relayed_response_has_no_alt_svc | bep_ahm_missing_proxy_refused \
-    | bep_audit_http_and_messages_closed)
+    | bep_audit_http_and_messages_closed \
+    | host_stop_stops_boxes_then_daemon_and_vm)
     "proof_$1"
     ;;
   *)
@@ -31830,6 +32037,7 @@ case "${1:-}" in
     echo "         bep_ahm_audit_by_id_and_name bep_ahm_parent_merges_children"
     echo "         bep_ahm_relayed_response_has_no_alt_svc bep_ahm_missing_proxy_refused"
     echo "         bep_audit_http_and_messages_closed"
+    echo "         host_stop_stops_boxes_then_daemon_and_vm"
     exit 2
     ;;
 esac

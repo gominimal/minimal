@@ -4885,10 +4885,11 @@ pub fn proxy_down_line_beside(
 #[must_use]
 pub fn proxy_down_line(proxy_down: &ProxyDown) -> String {
     match &proxy_down.cause {
+        // NET-021: the VM host daemon retries a held port while the VM
+        // runs, so the line says the proxy comes back by itself.
         ProxyDownCause::PortHeld => format!(
-            "the hostname proxy is not serving: another program on this \
-             machine holds 127.0.0.1:{}",
-            proxy_down.port
+            "the hostname proxy is not serving: {}",
+            held_port_detail(None, proxy_down.port)
         ),
         ProxyDownCause::RedrawsRanOut => format!(
             "the hostname proxy is not serving: every port Minimal tried for \
@@ -4903,21 +4904,31 @@ pub fn proxy_down_line(proxy_down: &ProxyDown) -> String {
              names may not open through it yet",
             proxy_down.port
         ),
-        // A running VM's state, never the start failure's words — the
-        // port, who holds it, and that the VM is up.
-        ProxyDownCause::PortHeldAfterStart { holder } => {
-            let holder = holder
-                .as_deref()
-                .unwrap_or("another program on this machine");
-            format!(
-                "the hostname proxy is not serving: the VM is up without it \
-                 because {holder} holds 127.0.0.1:{}; free the port, then \
-                 run `min stop` and `min ls` to restart the VM (with the \
-                 same --vm or --provider flags, if you use them)",
-                proxy_down.port
-            )
-        }
+        // A running VM's state: the port, who holds it, and that the
+        // proxy serves once the port frees (NET-021, NET-022).
+        ProxyDownCause::PortHeldAfterStart { holder } => format!(
+            "the hostname proxy is not serving: {}",
+            held_port_detail(holder.as_deref(), proxy_down.port)
+        ),
     }
+}
+
+/// The cause of a proxy whose port another program holds (NET-021): who
+/// holds it, the port, and that the proxy starts serving by itself once the
+/// port is free. The VM host daemon retries the port while the VM runs, so
+/// the words carry no restart. The process that holds the port chooses its
+/// own name, so control characters in it are dropped: an escape sequence in
+/// a process name never reaches the terminal.
+fn held_port_detail(holder: Option<&str>, port: u16) -> String {
+    let holder: String = holder
+        .unwrap_or("another program on this machine")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    format!(
+        "{holder} holds 127.0.0.1:{port}. It starts serving by itself when the \
+         port is free."
+    )
 }
 
 /// The warning every session start prints when the answerer's port is held
@@ -5058,6 +5069,22 @@ pub fn install_clause(unfinished: bool) -> &'static str {
     }
 }
 
+/// `line` with the install pointer after it while this host's install is
+/// unfinished (NET-018, NET-122), the same on both verbs. A line that ends
+/// a sentence, such as the held-port cause, gets the pointer as a sentence
+/// of its own. Any other line gets [`install_clause`]. A finished host
+/// gets the line unchanged.
+#[must_use]
+pub fn with_install_pointer(line: String, unfinished: bool) -> String {
+    if !unfinished {
+        line
+    } else if line.ends_with('.') {
+        format!("{line} Finish setup: min finalize-install")
+    } else {
+        format!("{line}{}", install_clause(true))
+    }
+}
+
 /// The one host line a session start prints (NET-018), naming the box:
 /// `names: ` and then how the box name opens on this host, in the words
 /// [`box_name_opens`] gives the `min ls` BOX NAMES row too. Where native
@@ -5112,10 +5139,7 @@ pub fn host_line_beside(
         Some(cause) => format!("{name}: the hostname proxy is not serving: {cause}"),
         None => box_name_opens(&name, surface, proxy_port, at_own_address),
     };
-    format!(
-        "names: {names}{}",
-        install_clause(install_unfinished(surface, host))
-    )
+    with_install_pointer(format!("names: {names}"), install_unfinished(surface, host))
 }
 
 /// How a box name opens on this host (T110): the one statement the
@@ -5193,9 +5217,7 @@ pub fn host_line_proxy_cause(
 /// which port to check, not the fact that something failed.
 fn proxy_down_detail(port: u16, cause: &ProxyDownCause) -> String {
     match cause {
-        ProxyDownCause::PortHeld => {
-            format!("another program on this machine holds 127.0.0.1:{port}")
-        }
+        ProxyDownCause::PortHeld => held_port_detail(None, port),
         ProxyDownCause::RedrawsRanOut => format!(
             "every port Minimal tried for it was already taken; the last was \
              127.0.0.1:{port}"
@@ -5208,21 +5230,10 @@ fn proxy_down_detail(port: u16, cause: &ProxyDownCause) -> String {
             "the VM is up, but the VM host daemon has not seen it listening on \
              127.0.0.1:{port}; box names may not open through it yet"
         ),
-        // The guest's late report refused the port after the VM came up:
-        // the VM keeps running with no hostname proxy, so this is said as a
-        // running VM's state, never in the start failure's words — the
-        // port, who holds it, and that the VM is up.
-        ProxyDownCause::PortHeldAfterStart { holder } => {
-            let holder = holder
-                .as_deref()
-                .unwrap_or("another program on this machine");
-            format!(
-                "the VM is up without it because {holder} holds 127.0.0.1:{port}; \
-                 free the port, then run `min stop` and `min ls` to restart \
-                 the VM (with the same --vm or --provider flags, if you use \
-                 them)"
-            )
-        }
+        // The port was held at the start or after it: the VM runs with no
+        // hostname proxy, and the VM host daemon publishes the port once it
+        // frees (NET-021), so the words name the holder and no restart.
+        ProxyDownCause::PortHeldAfterStart { holder } => held_port_detail(holder.as_deref(), port),
     }
 }
 
@@ -6155,7 +6166,8 @@ mod tests {
         assert_eq!(
             down,
             "names: web.min.internal: the hostname proxy is not serving: another program on \
-             this machine holds 127.0.0.1:7654; finish setup: min finalize-install"
+             this machine holds 127.0.0.1:7654. It starts serving by itself when the port \
+             is free. Finish setup: min finalize-install"
         );
         // NET-020 in both forms: the cause the start reads beside its
         // verdict replaces the resolution half whether the verdict was the
@@ -6179,7 +6191,8 @@ mod tests {
         assert_eq!(
             native_down,
             "names: web.min.internal: the hostname proxy is not serving: another program on \
-             this machine holds 127.0.0.1:7654"
+             this machine holds 127.0.0.1:7654. It starts serving by itself when the port \
+             is free."
         );
         let native_down_open = host_line_beside(
             "web",
@@ -6192,7 +6205,8 @@ mod tests {
         assert_eq!(
             native_down_open,
             "names: web.min.internal: the hostname proxy is not serving: another program on \
-             this machine holds 127.0.0.1:7654; finish setup: min finalize-install"
+             this machine holds 127.0.0.1:7654. It starts serving by itself when the port \
+             is free. Finish setup: min finalize-install"
         );
         // A native daemon's own report — no VM sibling — is the cause in the
         // daemon's words, and a Proxy verdict beside it never claims a port.
@@ -6223,7 +6237,10 @@ mod tests {
         // while the proxy serves.
         assert_eq!(
             host_line_proxy_cause(Some(&sibling), Some("stale")).as_deref(),
-            Some("another program on this machine holds 127.0.0.1:7654")
+            Some(
+                "another program on this machine holds 127.0.0.1:7654. It starts serving by \
+                 itself when the port is free."
+            )
         );
         assert_eq!(host_line_proxy_cause(None, None), None);
         assert_eq!(
@@ -7327,11 +7344,13 @@ exit 0
                     for at_own_address in [true, false] {
                         let activate =
                             host_line_beside("web", &surface, port, host, None, at_own_address);
-                        let row = format!(
-                            "{}{}",
+                        let row = with_install_pointer(
                             name_surface_line_at(surface.clone(), port, at_own_address),
-                            install_clause(install_unfinished(&surface, host))
+                            install_unfinished(&surface, host),
                         );
+                        // The install pointer never follows a full stop as
+                        // a clause: after a sentence it is a sentence.
+                        assert!(!activate.contains(".;"), "{activate}");
                         assert_eq!(
                             activate,
                             format!("names: {}", row.replace("<box>", "web")),
@@ -7380,7 +7399,8 @@ exit 0
         assert_eq!(
             name_surface_line(held, None),
             "<box>.min.internal: the hostname proxy is not serving: another program on \
-             this machine holds 127.0.0.1:7654"
+             this machine holds 127.0.0.1:7654. It starts serving by itself when the port \
+             is free."
         );
     }
 
@@ -7570,12 +7590,9 @@ exit 0
         );
         assert_eq!(
             line,
-            "<box>.min.internal: the hostname proxy is not serving: the VM is up \
-             without it because pid 4242 (python3) holds 127.0.0.1:19918; free the \
-             port, then run \
-             `min stop` and `min ls` to restart the VM (with the same --vm or \
-             --provider flags, if you use them)",
-            "the row names the port, the holder, and that the VM is up"
+            "<box>.min.internal: the hostname proxy is not serving: pid 4242 (python3) \
+             holds 127.0.0.1:19918. It starts serving by itself when the port is free.",
+            "the row names the port, the holder, and that the proxy comes back"
         );
         assert!(
             !line.contains("box names open only through it"),
@@ -7589,9 +7606,91 @@ exit 0
         let line = name_surface_line(unnamed, None);
         assert!(
             line.contains("another program on this machine holds 127.0.0.1:19918")
-                && line.contains("the VM is up"),
-            "an unnamed holder still names the port and the running VM: {line}"
+                && line.contains("It starts serving by itself when the port is free."),
+            "an unnamed holder still names the port and the recovery: {line}"
         );
+    }
+
+    /// NET-021, NET-022: a held proxy port, at the start or after it, reads
+    /// the same on the activate `names:` line, the `min ls` HOSTNAME PROXY
+    /// row and the folded BOX NAMES row: the holder, the port, and that
+    /// the proxy serves by itself once the port frees. No surface tells
+    /// the user to run `min stop` or to restart the VM.
+    #[test]
+    fn proxy_held_line_names_holder_without_restart() {
+        let named = ProxyDown {
+            port: 7_654,
+            cause: ProxyDownCause::PortHeldAfterStart {
+                holder: Some("pid 4242 (python3)".to_string()),
+            },
+        };
+        let unnamed = ProxyDown {
+            port: 7_654,
+            cause: ProxyDownCause::PortHeld,
+        };
+        for (down, holder) in [
+            (&named, "pid 4242 (python3)"),
+            (&unnamed, "another program on this machine"),
+        ] {
+            let sentence = format!(
+                "the hostname proxy is not serving: {holder} holds 127.0.0.1:7654. It \
+                 starts serving by itself when the port is free."
+            );
+            // The `min ls` HOSTNAME PROXY row.
+            assert_eq!(proxy_down_line(down), sentence);
+            // The row folded beside a Proxy verdict.
+            let folded = surface_beside_proxy_down(LiveSurface::Proxy, Some(down));
+            assert_eq!(
+                name_surface_line(folded, None),
+                format!("<box>.min.internal: {sentence}")
+            );
+            // The `min session activate` names: line, on a finished host and
+            // on one whose install pointer rides after the sentence.
+            let cause = host_line_proxy_cause(Some(down), None).expect("the cause");
+            let names = host_line_beside(
+                "web",
+                &LiveSurface::Native,
+                Some(7_654),
+                HostInstall::default(),
+                Some(&cause),
+                true,
+            );
+            assert_eq!(names, format!("names: web.min.internal: {sentence}"));
+            let unfinished = host_line_beside(
+                "web",
+                &LiveSurface::Proxy,
+                Some(7_654),
+                HostInstall::default(),
+                Some(&cause),
+                true,
+            );
+            assert_eq!(
+                unfinished,
+                format!("names: web.min.internal: {sentence} Finish setup: min finalize-install")
+            );
+            for line in [&sentence, &names, &unfinished] {
+                assert!(
+                    !line.contains("min stop") && !line.contains("restart"),
+                    "a held port needs no restart: {line}"
+                );
+            }
+        }
+
+        // The holder's name comes from the process that holds the port, so
+        // its control characters never reach the terminal.
+        let hostile = ProxyDown {
+            port: 7_654,
+            cause: ProxyDownCause::PortHeldAfterStart {
+                holder: Some("pid 7 (\u{1b}[2Jevil\u{7}\r\n)".to_string()),
+            },
+        };
+        let line = proxy_down_line(&hostile);
+        assert_eq!(
+            line,
+            "the hostname proxy is not serving: pid 7 ([2Jevil) holds 127.0.0.1:7654. It \
+             starts serving by itself when the port is free."
+        );
+        assert!(!line.chars().any(char::is_control), "{line:?}");
     }
 
     #[cfg(any(test, target_os = "macos"))]

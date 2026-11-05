@@ -300,6 +300,9 @@ fn every_daemon_connection_is_classified() {
             // `min host list|show` probes each local host for its state and
             // daemon version. It only reads, and it must show a skewed
             // daemon's version, so it must work when the pair is skewed.
+            // `min host stop` stops the daemon, as `min stop` does: the
+            // remedy the version check names, so it is never gated by it.
+            "cmd/hosts.rs::cmd_host_stop = ungated",
             "cmd/hosts.rs::probe_host = ungated",
             "cmd/list.rs::cmd_bare = gated",
             // `min ls` reaches past the selected VM, and the two halves carry
@@ -376,6 +379,9 @@ fn every_daemon_connection_is_classified() {
             // Not a product path: the host show test's own connection to
             // the harness daemon, to read the version it expects.
             "tests.rs::host_show_socket_and_version = ungated",
+            // Not a product path: the host stop test's own connection to the
+            // harness daemon, to list the boxes it expects stopped.
+            "tests.rs::host_stop_force_forces_boxes_and_daemon = ungated",
             "tests.rs::local_member_is_a_sign_in_reference_expiring_with_the_root = ungated",
             // Not a product path, and not the daemon: the audit test submits
             // a revocation to a test Box Egress Proxy's control socket.
@@ -6759,6 +6765,214 @@ async fn host_show_socket_and_version() {
     );
 }
 
+/// BCLI-049: `min host stop --force` force-stops each running box on the
+/// host, then stops its daemon. Each box gets the forced stop, and none the
+/// graceful one. The daemon then refuses box work, because it is shutting
+/// down. The last line says what stopped.
+#[tokio::test]
+async fn host_stop_force_forces_boxes_and_daemon() {
+    let log = minimald::test_harness::captured_log();
+    let state = state_with_host_dirs(&["local-minimald0"]);
+    let sock = state.path().join("providers/local-minimald0/ssh.sock");
+    let server = minimald::test_harness::TestServer::new().await;
+    server.listen_on_uds(&sock).await;
+    let project = tempfile::TempDir::new().unwrap();
+    let mut daemon = server.connect().await;
+    for name in ["web", "api"] {
+        minimald::test_harness::create_configured_session(
+            &mut daemon,
+            name,
+            project.path().to_str().unwrap(),
+        )
+        .await;
+    }
+    let ids: Vec<(String, boxes::SessionId)> = {
+        let mut client = client::Client::connect(&sock).await.expect("connect");
+        list_box_records(&mut client, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.name.unwrap_or_default(), entry.box_id))
+            .collect()
+    };
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert!(!server.state.sessions_manager().await.is_shutting_down());
+
+    let mut out = Vec::new();
+    let args = HostStopArgs {
+        host: "local0".to_owned(),
+        force: true,
+    };
+    cmd::hosts::cmd_host_stop(&host_globals(state.path()), &args, &mut out)
+        .await
+        .expect("host stop --force runs");
+    let text = String::from_utf8(out).unwrap();
+    let mut lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines.pop(),
+        Some("Stopped 2 boxes and the daemon on local0."),
+        "{text}"
+    );
+    lines.sort_unstable();
+    assert_eq!(lines, ["Stopped api.", "Stopped web."], "{text}");
+
+    // Each box got the forced stop of BOX-013, and no graceful one.
+    let log = log.contents();
+    let served = |id: boxes::SessionId, force: bool| {
+        log.lines()
+            .filter(|line| {
+                line.contains("session stopped")
+                    && line.contains(&format!("session_id={id}"))
+                    && line.contains(&format!("force={force}"))
+            })
+            .count()
+    };
+    for (name, id) in &ids {
+        assert_eq!(served(*id, true), 1, "{name}: {log}");
+        assert_eq!(served(*id, false), 0, "{name}: {log}");
+    }
+
+    // The daemon is shutting down.
+    assert!(
+        server.state.sessions_manager().await.is_shutting_down(),
+        "the daemon is shutting down after host stop"
+    );
+
+    // A VM host's line names its VM too, and one box is one box.
+    assert_eq!(
+        cmd::hosts::host_stop_summary(1, "local-minvmd0", true),
+        "Stopped 1 box, the daemon and its VM on local-minvmd0."
+    );
+    assert_eq!(
+        cmd::hosts::host_stop_summary(3, "local-minvmd0", true),
+        "Stopped 3 boxes, the daemon and its VM on local-minvmd0."
+    );
+}
+
+/// BCLI-049: `min host stop --force` on a VM host whose daemon connects but
+/// never answers stops the VM from this machine. It does not wait on a box
+/// listing first, and it exits 0. Without `--force` the command refuses with
+/// exit 7, as `min stop` does for a host that does not answer, and names
+/// `--force`.
+#[tokio::test]
+async fn host_stop_force_forces_boxes_and_daemon_when_daemon_does_not_answer() {
+    let state = state_with_host_dirs(&["local-minvmd0"]);
+    let sock = state.path().join("providers/local-minvmd0/ssh.sock");
+    // Accepts each connection and holds it open, and never writes a byte.
+    let listener = tokio::net::UnixListener::bind(&sock).expect("the socket binds");
+    let holder = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+
+    let started = std::time::Instant::now();
+    let mut out = Vec::new();
+    let args = HostStopArgs {
+        host: "local-minvmd0".to_owned(),
+        force: true,
+    };
+    cmd::hosts::cmd_host_stop(&host_globals(state.path()), &args, &mut out)
+        .await
+        .expect("host stop --force stops the VM of a daemon that does not answer");
+    // The VM dir has no running VM, so the host-side stop signals nothing.
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "local-minvmd0 is not running.\n"
+    );
+    // The probe's budget, and no RPC timeout on a listing after it.
+    assert!(
+        started.elapsed() < client::RPC_TIMEOUT,
+        "took {:?}",
+        started.elapsed()
+    );
+
+    let args = HostStopArgs {
+        host: "local-minvmd0".to_owned(),
+        force: false,
+    };
+    let err = cmd::hosts::cmd_host_stop(&host_globals(state.path()), &args, &mut Vec::new())
+        .await
+        .expect_err("host stop without --force refuses a daemon that does not answer");
+    assert!(
+        err.downcast_ref::<client::box_registration::HostUnreachable>()
+            .is_some(),
+        "{err:#}"
+    );
+    assert!(
+        format!("{err:#}").contains("Run `min host stop local-minvmd0 --force`"),
+        "{err:#}"
+    );
+    holder.abort();
+}
+
+/// BCLI-049: only a timeout or a lost connection is a daemon that did not
+/// answer. A refusal the daemon sent, a failure it reported and a failed
+/// write of the output are not.
+#[test]
+fn host_stop_force_forces_boxes_and_daemon_tells_no_answer_from_an_answer() {
+    let timed_out =
+        anyhow::anyhow!("StopBox RPC timed out after 60s").context("StopBox RPC failed");
+    assert!(cmd::rpc_unanswered(&timed_out));
+    let lost = anyhow::Error::new(russh::Error::Disconnect)
+        .context("open channel for StopBox")
+        .context("StopBox RPC failed");
+    assert!(cmd::rpc_unanswered(&lost));
+    let closed = anyhow::anyhow!("decode response for ListBoxes (daemon replied: )");
+    assert!(cmd::rpc_unanswered(&closed));
+
+    let refused = anyhow::anyhow!("the box is still starting");
+    assert!(!cmd::rpc_unanswered(&refused));
+    let gone = anyhow::Error::new(BoxAddressRefusal::NotFound {
+        address: "web".to_owned(),
+    });
+    assert!(!cmd::rpc_unanswered(&gone));
+    let daemon_side = anyhow::anyhow!("StopBox RPC failed on the daemon side: boom")
+        .context("StopBox RPC failed");
+    assert!(!cmd::rpc_unanswered(&daemon_side));
+    let write = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+    assert!(!cmd::rpc_unanswered(&write));
+}
+
+/// BCLI-049: the lines `min host stop --force` prints for a box it did not
+/// stop. A box ended with its VM only when it got no answer or was skipped,
+/// and only when the VM stop worked.
+#[test]
+fn host_stop_force_forces_boxes_and_daemon_names_each_box_it_did_not_stop() {
+    use cmd::hosts::{BoxNotStopped, box_not_stopped_line};
+    let host = "local-minvmd0";
+    assert_eq!(
+        box_not_stopped_line("web", host, &BoxNotStopped::Unanswered, true),
+        "web did not answer the stop. It ended when its VM stopped."
+    );
+    assert_eq!(
+        box_not_stopped_line("web", host, &BoxNotStopped::Unanswered, false),
+        "web did not answer the stop."
+    );
+    let skipped = BoxNotStopped::Skipped {
+        after: "web".to_owned(),
+    };
+    assert_eq!(
+        box_not_stopped_line("api", host, &skipped, true),
+        "api was not asked to stop, because web did not answer the stop. \
+         It ended when its VM stopped."
+    );
+    assert_eq!(
+        box_not_stopped_line("api", host, &skipped, false),
+        "api was not asked to stop, because web did not answer the stop."
+    );
+    assert_eq!(
+        box_not_stopped_line("web", host, &BoxNotStopped::Gone, true),
+        "web was not stopped, because it is no longer on local-minvmd0."
+    );
+    let refused = BoxNotStopped::Refused("the box is still starting".to_owned());
+    assert_eq!(
+        box_not_stopped_line("web", host, &refused, true),
+        "web was not stopped. The daemon on local-minvmd0 answered: the box is still starting"
+    );
+}
+
 /// BCLI-052: `min provider list --all` lists every well-known local provider
 /// present on the machine: a provider with a host, and `local-box` only in a
 /// box. Without `--all` it lists the provider the command selects.
@@ -9076,5 +9290,124 @@ fn none_box_hold_is_released_by_destroy_and_moved_by_rename() {
     assert!(
         !crate::holds_name(&hold_record(boxes::NetworkMode::NoNet, Some(row))),
         "a box with a row owns its name through the row"
+    );
+}
+
+/// NET-022: a held port that frees after the VM start publishes on the VM
+/// host daemon only, so the guest reply carries no proxy port. The BOX NAMES
+/// row then reads the port the VM host daemon serves on, and says the names
+/// open through it, on one VM and across VMs. While the port is held, the
+/// row names the cause.
+#[test]
+fn ls_warning_clears_on_recovery_with_no_guest_port() {
+    let mut resp = listing_of(&[("web", None, None)]);
+    resp.hostname_proxy_port = None;
+    resp.answerer_bound = true;
+    let held = minimald_rpc::AnswererStatusReply {
+        answerer: minimald_rpc::ZoneAnswererStatus::Registered { port: 7_656 },
+        proxy_down: Some(minimald_rpc::ProxyDown {
+            port: 7_654,
+            cause: minimald_rpc::ProxyDownCause::PortHeldAfterStart {
+                holder: Some("pid 4242 (python3)".to_string()),
+            },
+        }),
+    };
+    let recovered = minimald_rpc::AnswererStatusReply {
+        answerer: minimald_rpc::ZoneAnswererStatus::Registered { port: 7_656 },
+        proxy_down: None,
+    };
+    let render = |reply: minimald_rpc::AnswererStatusReply, ports: &[u16]| {
+        let mut out = Vec::new();
+        cmd::format_ls_with_proxy_ports_on(
+            &mut out,
+            &LsArgs {
+                raw: false,
+                json: false,
+            },
+            &resp,
+            Some(crate::resolver::LiveSurface::Proxy),
+            Some(reply),
+            ports,
+            crate::resolver::HostInstall::default(),
+        )
+        .expect("rendering the listing");
+        String::from_utf8(out).expect("the listing is UTF-8")
+    };
+    let box_names = |text: &str| {
+        text.lines()
+            .find(|line| line.starts_with("BOX NAMES:"))
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("a BOX NAMES row:\n{text}"))
+    };
+
+    let before = render(held.clone(), &[]);
+    assert!(
+        box_names(&before).contains("the hostname proxy is not serving: pid 4242 (python3)"),
+        "the held port names its cause:\n{before}"
+    );
+
+    let after = render(recovered.clone(), &[7_654]);
+    assert!(
+        !after.contains("not serving"),
+        "the cause clears once the port frees:\n{after}"
+    );
+    assert!(
+        box_names(&after).contains("127.0.0.1:7654"),
+        "the row names the port the proxy serves on:\n{after}"
+    );
+    assert!(
+        after.contains("HOSTNAME PROXY:  listening on 127.0.0.1:7654"),
+        "the HOSTNAME PROXY row names the served port:\n{after}"
+    );
+
+    // Across VMs, each VM reads its own served ports.
+    let listings = [
+        cmd::VmListing {
+            vm: "default".to_string(),
+            resp: resp.clone(),
+            control_sock: None,
+            running: true,
+        },
+        cmd::VmListing {
+            vm: "other".to_string(),
+            resp: resp.clone(),
+            control_sock: None,
+            running: true,
+        },
+    ];
+    let mut out = Vec::new();
+    cmd::format_ls_across_vms_with_proxy_ports_on(
+        &mut out,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        &listings,
+        &[
+            Some(crate::resolver::LiveSurface::Proxy),
+            Some(crate::resolver::LiveSurface::Proxy),
+        ],
+        &[Some(recovered), Some(held)],
+        &[vec![7_654], vec![]],
+        crate::resolver::HostInstall::default(),
+    )
+    .expect("rendering the listing");
+    let across = String::from_utf8(out).expect("the listing is UTF-8");
+    let rows: Vec<&str> = across
+        .lines()
+        .filter(|line| line.starts_with("BOX NAMES:"))
+        .collect();
+    assert_eq!(rows.len(), 2, "one BOX NAMES row per VM:\n{across}");
+    assert!(
+        rows[0].contains("default") && rows[0].contains("127.0.0.1:7654"),
+        "the recovered VM names its served port:\n{across}"
+    );
+    assert!(
+        !rows[0].contains("not serving"),
+        "the recovered VM carries no cause:\n{across}"
+    );
+    assert!(
+        rows[1].contains("other") && rows[1].contains("not serving"),
+        "the held VM keeps its cause:\n{across}"
     );
 }
