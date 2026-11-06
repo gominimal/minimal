@@ -622,7 +622,6 @@ mod tests {
             command: minimal::TaskCommand::Run(minimal::TaskRunArgs {
                 task: "build".to_string(),
                 path: None,
-                keep: false,
                 args: vec![],
             }),
         }));

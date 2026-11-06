@@ -529,6 +529,13 @@ where
     }
 }
 
+/// The line `min task run` prints when its task returns (T43). The task
+/// box ended with its task and keeps its record, so the line names the box
+/// and the command that removes it.
+pub(crate) fn kept_box_line(name: &str) -> String {
+    format!("Kept box {name}. Remove it with min box rm {name}.")
+}
+
 /// Stop the daemon of the host named `host`, over `client`, for
 /// `min host stop` (BCLI-049). `vm_dir` is the VM's state directory when
 /// the host is a VM host, and `None` for a native daemon.
