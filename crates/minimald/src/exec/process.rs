@@ -735,9 +735,13 @@ pub(super) fn sandbox_failure(status: &hakoniwa::ExitStatus, killed: bool) -> Op
 
 /// The line on the client's stderr for a task whose sandbox failed: the
 /// command's own output may be empty, so this is the only account of why the
-/// task ended with 125.
+/// task ended with 125. The reason can quote a path the box chose, so its
+/// control characters are escaped and it stays one line.
 pub(super) fn sandbox_failure_notice(reason: &str) -> String {
-    format!("the task's sandbox failed: {reason}\n")
+    format!(
+        "the task's sandbox failed: {}\n",
+        crate::env::one_line(reason)
+    )
 }
 
 /// The [`Process`] produced by a [`TaskExec`]: either a real sandboxed child

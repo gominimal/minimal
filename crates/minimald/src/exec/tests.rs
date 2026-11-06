@@ -5430,14 +5430,16 @@ impl super::Process for FailedSandbox {
 
 /// A task whose sandbox failed ends with hakoniwa's 125 and nothing of its
 /// own on stdout or stderr; the reason reaches the client's stderr
-/// (inbox#1129).
+/// (inbox#1129). The process goes through [`bridge_noting_reason`], which
+/// wraps it in `StoppedOnDestroy` as production does, so the wrapper must
+/// pass the notice on.
 #[tokio::test]
 async fn a_sandbox_failure_reaches_the_client_stderr() {
     let (mut bridge_stdout, mut client_stdout) = duplex(64 * 1024);
     let (mut bridge_stderr, mut client_stderr) = duplex(64 * 1024);
     let (client_stdin, mut stdin) = duplex(64);
     drop(client_stdin);
-    let status = bridge(
+    let (status, _late) = bridge_noting_reason(
         "test",
         futures::stream::iter(vec![Ok(FailedSandbox)]),
         &mut stdin,
@@ -5445,6 +5447,8 @@ async fn a_sandbox_failure_reaches_the_client_stderr() {
         &mut bridge_stderr,
         client_lost(),
         super::UnreadStdin::Keep,
+        None,
+        || false,
     )
     .await;
     drop(bridge_stdout);
@@ -5498,6 +5502,16 @@ fn only_a_container_failure_is_a_sandbox_failure() {
         super::sandbox_failure(&status(125, None, "mount /home/h810: ENOENT"), true),
         None,
         "a task the daemon killed is not a sandbox failure"
+    );
+}
+
+/// The notice quotes hakoniwa's reason, which can name a path the box
+/// chose; a control character in it is escaped, so the notice stays one line.
+#[test]
+fn the_sandbox_failure_notice_escapes_control_characters() {
+    assert_eq!(
+        super::sandbox_failure_notice("mount /home/x\n\u{1b}[2J: ENOENT"),
+        "the task's sandbox failed: mount /home/x\\n\\u{1b}[2J: ENOENT\n"
     );
 }
 
