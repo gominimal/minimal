@@ -2158,6 +2158,72 @@ fn reap_and_prune_requests_round_trip() {
     assert_eq!(PruneBoxes::NAME, "minimald-v1-PruneBoxes");
 }
 
+/// BOX-021, BOX-159: a prune preview carries each matched record with
+/// its disk figure, a show reply carries the disk figure of its box, and
+/// an absent figure stays absent, never zero. A show reply from a daemon
+/// that predates the field reads as one with no figure, and an error
+/// reply decodes as an error, not an empty preview.
+#[test]
+fn preview_prune_and_show_disk_round_trip() {
+    let id = SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+    let entry = BoxListingEntry {
+        box_id: id,
+        name: Some("dev".to_string()),
+        box_type: Some("session".to_string()),
+        parent: None,
+        project_root: None,
+        state: "exited".to_string(),
+        reason: Some("exit".to_string()),
+        exit_code: Some(0),
+        signal: None,
+        pty_enabled: true,
+    };
+    let preview = PreviewPruneResponse {
+        matched: vec![
+            PrunePreviewEntry {
+                record: entry.clone(),
+                disk_bytes: Some(1_048_576),
+            },
+            PrunePreviewEntry {
+                record: entry.clone(),
+                disk_bytes: None,
+            },
+        ],
+    };
+    assert_eq!(round_trip(&preview), preview);
+    let json = serde_json_lenient::to_string(&preview).unwrap();
+    assert_eq!(
+        json.matches("disk_bytes").count(),
+        1,
+        "an unmeasured box sends no figure: {json}"
+    );
+    assert_eq!(
+        serde_json_lenient::from_str::<PreviewPruneResponse>("{}").unwrap(),
+        PreviewPruneResponse::default()
+    );
+
+    let show = ShowBoxResponse {
+        record: entry.clone(),
+        identity: BoxIdentity::None,
+        live_execs: Vec::new(),
+        disk_bytes: Some(8192),
+    };
+    assert_eq!(round_trip(&show), show);
+    let older: ShowBoxResponse = serde_json_lenient::from_str(&format!(
+        r#"{{"record":{}}}"#,
+        serde_json_lenient::to_string(&entry).unwrap()
+    ))
+    .unwrap();
+    assert_eq!(older.disk_bytes, None);
+
+    let error = r#"{"error":"no session with ID `x`"}"#;
+    assert!(matches!(
+        serde_json_lenient::from_str::<Errorable<PreviewPruneResponse>>(error).unwrap(),
+        Errorable::Err { .. }
+    ));
+    assert_eq!(PreviewPrune::NAME, "minimald-v1-PreviewPrune");
+}
+
 /// BEP-082, BEP-083: the admit of a `host_ip` box carries whether the box
 /// declares a credentialed upstream, and a host_ip registration says it is
 /// one. A line from a client that predates either field reads as no lane
