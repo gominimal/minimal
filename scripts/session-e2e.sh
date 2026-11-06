@@ -16383,6 +16383,12 @@ proof_bep_host_ip_grant_box_reaches_the_proxy_lane() {
   hl_plain="$(bep_hi_activate e2e-bep-hostip-nogrant)" || bep_hi_fail
   BEP_HI_SIDS="$BEP_HI_SIDS $hl_plain"
   rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
+  # Probe socat first, so a missing tool or a failed exec does not pass as
+  # a refusal. The connect error must then name a connect failure.
+  mnl session exec "$hl_plain" 'test -x /usr/bin/socat' >/dev/null 2>&1 || {
+    echo "::error::the host_ip box with no grant has no /usr/bin/socat (a launcher baseline package)"
+    bep_hi_fail
+  }
   hl_start="$(now_ms)"
   if mnl session exec "$hl_plain" \
     "/usr/bin/socat /dev/null TCP:$BEP_HI_PROXY_IP:$BEP_HI_PROXY_PORT,connect-timeout=10" \
@@ -16391,6 +16397,12 @@ proof_bep_host_ip_grant_box_reaches_the_proxy_lane() {
     bep_hi_fail
   fi
   hl_ms=$(( $(now_ms) - hl_start ))
+  if ! grep -qiE 'timed out|timeout|Connection refused|No route to host|unreachable|Operation not permitted|Permission denied' \
+    "$WORK/$BEP_HI_CASE.nogrant.err" 2>/dev/null; then
+    echo "::error::the connect from the host_ip box with no grant to $BEP_HI_PROXY_IP:$BEP_HI_PROXY_PORT failed, but not with a connect failure or a timeout"
+    cat "$WORK/$BEP_HI_CASE.nogrant.err" 2>/dev/null || true
+    bep_hi_fail
+  fi
   echo "the box with no grant could not connect to $BEP_HI_PROXY_IP:$BEP_HI_PROXY_PORT (${hl_ms} ms): $(tr -d '\r' <"$WORK/$BEP_HI_CASE.nogrant.err" | tail -n1)"
 
   bep_hi_cleanup
