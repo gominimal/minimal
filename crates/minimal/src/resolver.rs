@@ -3640,21 +3640,34 @@ pub(crate) const CLASSIFIER_PROGRAM_PATH: &str =
     "/usr/local/lib/minimal/install-host-classifier.sh";
 
 /// The systemd unit pair that places the daemon's listener in its leaf on
-/// every daemon start: the path unit watches the daemon's socket, and the
-/// oneshot service it starts runs the step's `--place-listener`. The pair
-/// is why no daemon restart needs a root step of its own.
+/// every daemon start: a socket unit at [`paths::PLACE_REQUEST_SOCKET`], which the
+/// daemon connects to once its own listener is bound, and the template
+/// service systemd starts for each connection, which runs the step's
+/// `--place-listener`. The pair is why no daemon restart needs a root step
+/// of its own. A socket in `/run` that systemd itself created needs no
+/// inotify watch, which SELinux policy can deny systemd for a socket under
+/// the account's home (gominimal/inbox#1206).
 #[cfg(any(test, not(target_os = "macos")))]
 pub(crate) const PLACE_SYSTEMD_UNIT: &str = "minimald-place";
 #[cfg(any(test, not(target_os = "macos")))]
-pub(crate) const PLACE_UNIT_PATH_PATH: &str = "/etc/systemd/system/minimald-place.path";
+pub(crate) const PLACE_UNIT_SOCKET_PATH: &str = "/etc/systemd/system/minimald-place.socket";
 #[cfg(any(test, not(target_os = "macos")))]
-pub(crate) const PLACE_UNIT_SERVICE_PATH: &str = "/etc/systemd/system/minimald-place.service";
+pub(crate) const PLACE_UNIT_SERVICE_PATH: &str = "/etc/systemd/system/minimald-place@.service";
+/// The path unit and its oneshot an earlier install placed the daemon with,
+/// by watching the daemon's socket. The install removes them before it
+/// writes the socket pair, and `--undo` removes whichever it finds.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const LEGACY_PLACE_UNIT_PATH_PATH: &str = "/etc/systemd/system/minimald-place.path";
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const LEGACY_PLACE_UNIT_SERVICE_PATH: &str =
+    "/etc/systemd/system/minimald-place.service";
 
 /// The boot unit: a oneshot that re-runs the classifier's step from the
-/// root-owned copy at every boot, ordered before the path unit. The tree
-/// lives in cgroupfs and the table in the kernel, so neither survives a
-/// reboot on its own; without this unit the first socket event after a
-/// boot would find no tree to place the daemon in.
+/// root-owned copy at every boot, which the placement service is ordered
+/// after. The tree lives in cgroupfs and the table in the kernel, so
+/// neither survives a reboot on its own; without this unit the first
+/// placement request after a boot would find no tree to place the daemon
+/// in.
 #[cfg(any(test, not(target_os = "macos")))]
 pub(crate) const CLASSIFIER_SYSTEMD_UNIT: &str = "minimald-classifier";
 #[cfg(any(test, not(target_os = "macos")))]
@@ -3693,10 +3706,16 @@ fn linux_host_items_removal(root: &str) -> String {
          stays; remove it with: apparmor_parser --remove {root}{APPARMOR_DIR}/minimald && rm -f \
          {root}{APPARMOR_DIR}/minimald {root}{APPARMOR_DIR}/tunables/minimald' >&2\n\
          fi\n\
-         systemctl disable --now {PLACE_SYSTEMD_UNIT}.path {PLACE_SYSTEMD_UNIT}.service \
-         {CLASSIFIER_SYSTEMD_UNIT}.service 2>/dev/null || true\n\
-         rm -f {root}{PLACE_UNIT_PATH_PATH} {root}{PLACE_UNIT_SERVICE_PATH} {root}{CLASSIFIER_UNIT_SERVICE_PATH} \
-         {root}{CLASSIFIER_PROGRAM_PATH}\n\
+         # One unit per call: systemctl refuses a whole call that names a unit this\n\
+         # host does not have, and an install carries either the socket pair or the\n\
+         # earlier path pair.\n\
+         for unit in {PLACE_SYSTEMD_UNIT}.socket {PLACE_SYSTEMD_UNIT}.path \
+         {PLACE_SYSTEMD_UNIT}.service {CLASSIFIER_SYSTEMD_UNIT}.service ; do\n\
+         \x20 systemctl disable --now \"$unit\" 2>/dev/null || true\n\
+         done\n\
+         rm -f {root}{PLACE_UNIT_SOCKET_PATH} {root}{PLACE_UNIT_SERVICE_PATH} \
+         {root}{LEGACY_PLACE_UNIT_PATH_PATH} {root}{LEGACY_PLACE_UNIT_SERVICE_PATH} \
+         {root}{CLASSIFIER_UNIT_SERVICE_PATH} {root}{CLASSIFIER_PROGRAM_PATH}\n\
          systemctl daemon-reload 2>/dev/null || true\n\
          rmdir \"{root}{ANSWERER_PROGRAM_DIR}\" 2>/dev/null || true\n\
          \n\
@@ -5388,7 +5407,7 @@ pub(crate) async fn naming_surface() -> NamingSurface {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 
     // T126 (NET-138): `min session activate` of a `host_ip` box on a VM host
     // reads the collided mirror ports over the VM host daemon's control
@@ -6545,11 +6564,13 @@ mod tests {
             format!("  [ -n \"$classifier_held\" ] || rm -f {CLASSIFIER_TREE_RECORD}"),
             format!("elif [ -d {CLASSIFIER_TREE_ROOT} ] ; then"),
             format!(
-                "systemctl disable --now {PLACE_SYSTEMD_UNIT}.path {PLACE_SYSTEMD_UNIT}.service \
-                 {CLASSIFIER_SYSTEMD_UNIT}.service 2>/dev/null || true"
+                "for unit in {PLACE_SYSTEMD_UNIT}.socket {PLACE_SYSTEMD_UNIT}.path \
+                 {PLACE_SYSTEMD_UNIT}.service {CLASSIFIER_SYSTEMD_UNIT}.service ; do"
             ),
+            "  systemctl disable --now \"$unit\" 2>/dev/null || true".to_string(),
             format!(
-                "rm -f {PLACE_UNIT_PATH_PATH} {PLACE_UNIT_SERVICE_PATH} \
+                "rm -f {PLACE_UNIT_SOCKET_PATH} {PLACE_UNIT_SERVICE_PATH} \
+                 {LEGACY_PLACE_UNIT_PATH_PATH} {LEGACY_PLACE_UNIT_SERVICE_PATH} \
                  {CLASSIFIER_UNIT_SERVICE_PATH} {CLASSIFIER_PROGRAM_PATH}"
             ),
             format!("if [ -f {KVM_GROUP_RECORD} ] ; then"),
@@ -6687,7 +6708,7 @@ mod tests {
     /// `root`, so a test that renders a script for the host fails here.
     /// It never reaches `rm`. Every tool in [`HOST_TOOLS`] that `stubs`
     /// lacks gets a stand-in that exits 1.
-    fn run_confined(
+    pub(crate) fn run_confined(
         root: &std::path::Path,
         stubs: &std::path::Path,
         script: &str,
@@ -6755,8 +6776,10 @@ mod tests {
         let root = "/minimal-undo-test-root";
         let linux = paths_outside(&linux_undo_command("/run/minimal/answerer.sock"), root);
         for path in [
-            PLACE_UNIT_PATH_PATH,
+            PLACE_UNIT_SOCKET_PATH,
             PLACE_UNIT_SERVICE_PATH,
+            LEGACY_PLACE_UNIT_PATH_PATH,
+            LEGACY_PLACE_UNIT_SERVICE_PATH,
             CLASSIFIER_UNIT_SERVICE_PATH,
             CLASSIFIER_PROGRAM_PATH,
             ANSWERER_UNIT_SOCKET_PATH,
