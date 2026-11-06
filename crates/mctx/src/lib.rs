@@ -21,8 +21,11 @@ use rcache::{Error as RemoteError, RemoteBinProvider, RemoteCache, RemoteCacheWr
 mod error;
 pub use error::{Error, remote_cache_setup_error};
 mod config;
-pub use config::{Config, ConfigBuilder, ConfigError, DEFAULT_REMOTE_CACHE_BUCKET};
+pub use config::{Config, ConfigBuilder, ConfigError, DEFAULT_REMOTE_CACHE_BUCKET, TaskPatchPolicy};
 mod env;
+// The `[patches]` gate for a task run by name (inbox#1128).
+mod patch_gate;
+pub use patch_gate::{GatedTask, gate_task_patches};
 use graph::Error as GraphError;
 use graph::{BinProvider, BuildSpecRef, Graph, MaskingBinProvider, Transitives};
 use mfile::{EnvPatches, EnvVarValue, LinkConfig, Task};

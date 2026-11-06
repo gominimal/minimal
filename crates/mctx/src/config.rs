@@ -82,6 +82,25 @@ fn parse_remote_cache_url(raw: &str) -> Result<(AnyUrl, Option<String>), ConfigE
     Ok((any, Some(bucket.to_string())))
 }
 
+/// How a [super::Context] treats the `patch.dir` / `patch.file` entries of a
+/// task it runs by name: `mip run <task>`, or a nested `run <task>` a sandbox
+/// sends over its environment channel (inbox#1128). Read by
+/// [`crate::gate_task_patches`], the one gate both paths call.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum TaskPatchPolicy {
+    /// Mount the entries as declared. The default, and what the daemon runs
+    /// with: a session's task patches are inbox#602, and the guest holds no
+    /// copy of the user's `user_policy.toml` to judge them against.
+    #[default]
+    Ungated,
+    /// Judge the entries against the `[patches]` section of the user's
+    /// `<config>/minimal/user_policy.toml`, the file `min` reads. What `mip`
+    /// runs with. The location is resolved only when a task has patches.
+    UserPolicy,
+    /// As [`Self::UserPolicy`], with the policy read from this file.
+    UserPolicyAt(PathBuf),
+}
+
 /// Builder for [Config].
 #[derive(Debug, Default, Clone)]
 pub struct ConfigBuilder {
@@ -99,6 +118,7 @@ pub struct ConfigBuilder {
     vcs_manager: Option<ManagerHandle>,
     ot: Option<OpTracker>,
     remote_cache_url: Option<String>,
+    task_patch_policy: Option<TaskPatchPolicy>,
 }
 
 impl ConfigBuilder {
@@ -137,6 +157,13 @@ impl ConfigBuilder {
     /// Configures the max number of parallel builds.
     pub fn with_num_parallel_builds(mut self, num_parallel_builds: usize) -> Self {
         self.num_parallel_builds = Some(num_parallel_builds);
+        self
+    }
+    /// Configures how a task run by name has its patches judged (default
+    /// [`TaskPatchPolicy::Ungated`]).
+    #[must_use]
+    pub fn with_task_patch_policy(mut self, policy: TaskPatchPolicy) -> Self {
+        self.task_patch_policy = Some(policy);
         self
     }
     /// Overrides the base directory for minimal state.
@@ -255,6 +282,7 @@ impl ConfigBuilder {
             remote_cache_url: configured_cache_url,
             remote_cache_read,
             remote_cache_write_bucket,
+            task_patch_policy: self.task_patch_policy.unwrap_or_default(),
         })
     }
 }
@@ -276,6 +304,7 @@ impl Config {
             vcs_manager: self.vcs_manager,
             ot: self.ot,
             remote_cache_url: self.remote_cache_url,
+            task_patch_policy: Some(self.task_patch_policy),
         }
     }
 }
@@ -319,6 +348,8 @@ pub struct Config {
     /// The GCS bucket a *writer* uses; `None` when the configured location is an
     /// HTTPS mirror (writes then error — you can't write to a read mirror).
     remote_cache_write_bucket: Option<String>,
+    /// How a task run by name has its patches judged.
+    task_patch_policy: TaskPatchPolicy,
 }
 
 impl Config {
@@ -327,6 +358,11 @@ impl Config {
     }
     pub(crate) fn vcs_manager_override(&self) -> Option<ManagerHandle> {
         self.vcs_manager.clone()
+    }
+
+    /// How a task run by name has its patches judged (inbox#1128).
+    pub fn task_patch_policy(&self) -> &TaskPatchPolicy {
+        &self.task_patch_policy
     }
 
     /// Returns the path to the repo, if overridden (i.e. via '-C' argument).

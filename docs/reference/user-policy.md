@@ -147,6 +147,20 @@ once a `$VAR` is substituted is not rejected up front.
 Both the resolved target path and, when a patch source traverses a symlink,
 the link path are checked independently; the most restrictive outcome wins.
 
+`mip run` applies this section to the `patch.dir` and `patch.file` entries of
+the task it runs, reading the same file (it has no `--config-dir` flag, so the
+default location). The same check applies to a task a `mip run` sandbox runs
+in turn with the in-sandbox `min run <task>` helper. The sandbox mounts each
+entry whole, so an entry is decided as one path: the declared path with `~/`
+expanded, and the path it resolves to through a symlink, must both pass. A
+directory is also checked for contained paths that a `deny` rule names, and
+refused if it holds one, or if it holds more than 10,000 entries to check.
+`$NAME` references expand against the environment `mip` runs in. `mip` does
+not prompt: an entry that no rule allows refuses the run, with the
+`[patches] allow` snippet that would approve it. An entry an `ignore` rule matches is
+left out of the sandbox, with a warning naming it. Mappings that packages
+declare are not checked here.
+
 ```toml
 [patches]
 allow  = ["~/.config/**", "/etc/xdg/**"]

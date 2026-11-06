@@ -162,12 +162,34 @@ pub async fn cmd_run(args: RunArgs, ctx: &mut Context) -> Result<(), Error> {
                 None
             };
 
+            let task = gate_task_patches(&task_name, task, ctx)?;
             run_task(&task_name, &task, parsed_args, graph, ctx).await
         }
         RunVariant::BySpec { .. } => {
             unreachable!("BySpec variant should be handled before Context::new via cmd_run_by_spec")
         }
     }
+}
+
+/// The `[patches]` gate for the task `mip run <task>` names (inbox#1128):
+/// [`mctx::gate_task_patches`], the one gate a task run by name passes, here
+/// and in a nested `run <task>` over the sandbox's channel. `mip` builds its
+/// config with [`mctx::TaskPatchPolicy::UserPolicy`] (see `base_config`), so
+/// the task's entries are judged against the user's `user_policy.toml`. An
+/// entry an `ignore` rule dropped is named in a warning.
+///
+/// Only the named-task lane is gated here: the project file is the untrusted
+/// input. A `--task-spec` is typed by the user on the command line.
+fn gate_task_patches(
+    task_name: &str,
+    task: mfile::Task,
+    ctx: &Context,
+) -> Result<mfile::Task, Error> {
+    let gated = mctx::gate_task_patches(ctx, task_name, task)?;
+    if let Some(notice) = gated.ignored_notice(task_name) {
+        warn!("{notice}");
+    }
+    Ok(gated.task)
 }
 
 /// Handles `mip run --upstream ... --task-spec ...` without requiring a minimal.toml.
@@ -333,4 +355,54 @@ pub async fn run_task(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mctx::{ConfigBuilder, TaskPatchPolicy};
+
+    /// `mip run <task>` judges the task's patches before it builds anything
+    /// (inbox#1128, scenario 812's shape): a task whose `patch.dir` the user
+    /// policy denies is refused with the policy text. This goes through
+    /// `cmd_run` itself, so it fails if the call to the gate is dropped.
+    #[test]
+    fn mip_run_refuses_a_task_whose_patch_the_policy_denies() {
+        let state = tempfile::tempdir().unwrap();
+        let cfg = tempfile::tempdir().unwrap();
+        let policy_file = cfg.path().join("user_policy.toml");
+        std::fs::write(
+            &policy_file,
+            "[patches]\ndeny = [\"/min-test-1128-denied\", \"/min-test-1128-denied/**\"]\n",
+        )
+        .unwrap();
+        let manifest_dir = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+        let config = ConfigBuilder::new()
+            .with_state_dir(state.path().to_path_buf())
+            .with_repo_dir(manifest_dir.join("../mctx/testdata/patchrepo"))
+            .with_stdlib_dir(manifest_dir.join("../stdlib/minimal-ncl"))
+            .with_no_fetch(true)
+            .with_task_patch_policy(TaskPatchPolicy::UserPolicyAt(policy_file.clone()))
+            .build()
+            .unwrap();
+        let mut ctx = Context::new(config).unwrap();
+
+        let args = RunArgs {
+            variant: RunVariant::ByName {
+                task_name: "peek-denied".to_string(),
+            },
+            task_args: vec![],
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(cmd_run(args, &mut ctx))
+            .expect_err("a denied patch must refuse the run");
+        let text = format!("{err}");
+        assert!(text.contains("policy denied"), "{text}");
+        assert!(text.contains("/min-test-1128-denied"), "{text}");
+        assert!(text.contains(policy_file.to_str().unwrap()), "{text}");
+    }
 }

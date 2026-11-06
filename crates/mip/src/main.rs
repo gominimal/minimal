@@ -164,6 +164,17 @@ pub(crate) fn enforce_science_mode() -> Result<(), Error> {
     }
 }
 
+/// The config every `mip` command starts from, before the global flags.
+///
+/// A task `mip` runs by name, from `mip run <task>` or from a nested
+/// `run <task>` a sandbox sends back over its channel, has its patches judged
+/// against the user's `user_policy.toml` (inbox#1128). `mip` runs on the
+/// user's own host, where that file is the user's, so the policy is on for
+/// every context `mip` builds, the `--task-spec` lane's included.
+fn base_config() -> ConfigBuilder {
+    ConfigBuilder::new().with_task_patch_policy(mctx::TaskPatchPolicy::UserPolicy)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -206,7 +217,7 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
     let ot_root = ot::OpTracker::new_root();
     ot::render_to_stderr(ot_root.clone());
 
-    let mut config = ConfigBuilder::new()
+    let mut config = base_config()
         .with_operation_tracker(ot_root)
         .with_no_cache(global_args.no_cache)
         .with_no_fetch(global_args.no_fetch)
@@ -262,5 +273,19 @@ async fn run_cli(cli: Cli) -> Result<(), Error> {
         Command::Cache(args) => cmd_cache(args, &mut ctx).await,
         // Handled before Context::new
         Command::Completions(_) | Command::Init(_) => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every context `mip` builds judges a named task's patches against the
+    /// user's policy (inbox#1128). Without this the gate `mip run` and the
+    /// nested-run channel share is off.
+    #[test]
+    fn mip_contexts_gate_task_patches_on_the_user_policy() {
+        let config = base_config().with_no_fetch(true).build().unwrap();
+        assert_eq!(config.task_patch_policy(), &mctx::TaskPatchPolicy::UserPolicy);
     }
 }
