@@ -894,35 +894,65 @@ pub(crate) fn append_entry_text(
     Ok(doc.to_string())
 }
 
-/// The project's `minimal.toml` in `dir`, in the root layout or the
-/// `.minimal/` layout.
-fn find_init_mfile(dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    [
-        dir.join(mfile::MFILE_NAME),
-        dir.join(".minimal").join(mfile::MFILE_NAME),
-    ]
-    .into_iter()
-    .find(|path| path.is_file())
+/// The project's `minimal.toml`, found the way the other commands find it:
+/// in `dir` and its ancestors when `search_ancestors` is set
+/// (`MFileSearchStrategy::CurrentDirRecursive`), or in `dir` only for
+/// `--repo-dir` (`MFileSearchStrategy::Override`). Both layouts in one
+/// directory are refused, as `mfile` refuses them.
+fn find_init_mfile(
+    dir: &std::path::Path,
+    search_ancestors: bool,
+) -> Result<std::path::PathBuf, anyhow::Error> {
+    let found = if search_ancestors {
+        mfile::File::from_dir_recursive(dir)
+    } else {
+        mfile::File::from_dir(dir)
+    };
+    match found {
+        Ok(file) => file.file_path().cloned().ok_or_else(|| {
+            anyhow::anyhow!("the minimal.toml found from {} has no path", dir.display())
+        }),
+        Err(mfile::Error::NotFound) => Err(InitRefusal {
+            code: 1,
+            message: format!(
+                "No minimal.toml in {}{}. Run min init to create one, then append the entry.",
+                dir.display(),
+                if search_ancestors {
+                    " or its parent directories"
+                } else {
+                    ""
+                }
+            ),
+        }
+        .into()),
+        Err(mfile::Error::ConflictingLayouts(paths)) => Err(InitRefusal {
+            code: 3,
+            message: format!(
+                "min init did not add the entry: the project has two minimal.toml files, {}. \
+                 Remove one of them, then run the command again.",
+                paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            ),
+        }
+        .into()),
+        Err(e) => Err(anyhow::Error::new(e).context("reading minimal.toml")),
+    }
 }
 
-/// Append the entry to the project's `minimal.toml` in `dir`, under the
-/// file's edit lock, and return the path written. A refusal comes back as
-/// an [`InitRefusal`] inside the error, and leaves the file unchanged.
+/// Append the entry to the project's `minimal.toml`, found from `dir` by
+/// [`find_init_mfile`], under the file's edit lock, and return the path
+/// written. A refusal comes back as an [`InitRefusal`] inside the error,
+/// and leaves the file unchanged.
 pub(crate) fn append_entry_in(
     dir: &std::path::Path,
+    search_ancestors: bool,
     entry: &str,
     box_type: &str,
 ) -> Result<std::path::PathBuf, anyhow::Error> {
-    let Some(path) = find_init_mfile(dir) else {
-        return Err(InitRefusal {
-            code: 1,
-            message: format!(
-                "No minimal.toml in {}. Run min init to create one, then append the entry.",
-                dir.display()
-            ),
-        }
-        .into());
-    };
+    let path = find_init_mfile(dir, search_ancestors)?;
     mfile::File::edit_exclusively::<anyhow::Error>(&path, |content| {
         let Some(content) = content else {
             return Err(InitRefusal {
@@ -973,13 +1003,18 @@ pub async fn cmd_init(global: &GlobalArgs, args: InitArgs) -> Result<(), mctx::E
         }
         InitRequest::Append { entry, box_type } => (entry, box_type),
     };
-    let dir = match &global.repo_dir {
-        Some(dir) => dir.clone(),
-        None => std::env::current_dir()
-            .context("reading the current directory")
-            .map_err(mctx::Error::Other)?,
+    // `--repo-dir` names the project root, as `MFileSearchStrategy::Override`
+    // does. Without it the search walks up from the current directory.
+    let (dir, search_ancestors) = match &global.repo_dir {
+        Some(dir) => (dir.clone(), false),
+        None => (
+            std::env::current_dir()
+                .context("reading the current directory")
+                .map_err(mctx::Error::Other)?,
+            true,
+        ),
     };
-    match append_entry_in(&dir, &entry, &box_type) {
+    match append_entry_in(&dir, search_ancestors, &entry, &box_type) {
         Ok(path) => {
             tracing::info!(verb = "init", entry, box_type, outcome = "appended");
             println!("Added the {box_type} entry {entry} to {}", path.display());
@@ -1210,7 +1245,7 @@ mod init_tests {
         match init_request(&init_args(argv))? {
             InitRequest::Scaffold => panic!("expected an append"),
             InitRequest::Append { entry, box_type } => {
-                append_entry_in(dir.path(), &entry, &box_type)
+                append_entry_in(dir.path(), true, &entry, &box_type)
                     .map(|_| ())
                     .map_err(|e| e.downcast::<InitRefusal>().expect("a refusal"))
             }
@@ -1459,5 +1494,63 @@ mod init_tests {
             INIT_ONE_TYPE_FLAG,
             "Pass one of --session, --task, --agent, --service or --type."
         );
+    }
+
+    /// Run the append from `dir`, searching its ancestors as `min init` does
+    /// without `--repo-dir`.
+    fn append_from(dir: &std::path::Path, entry: &str) -> Result<std::path::PathBuf, InitRefusal> {
+        append_entry_in(dir, true, entry, "task")
+            .map_err(|e| e.downcast::<InitRefusal>().expect("a refusal"))
+    }
+
+    // BCLI-018: the append finds minimal.toml the way the other commands do.
+    #[test]
+    fn init_entry_type_appends_from_subdirectory() {
+        let root = project(LEGACY_SCAFFOLD);
+        let sub = root.path().join("src").join("bin");
+        std::fs::create_dir_all(&sub).expect("create the subdirectory");
+        let path = append_from(&sub, "worker").expect("the entry is appended");
+        assert_eq!(path, root.path().join(mfile::MFILE_NAME));
+        let after: toml::Table = read(&root).parse().unwrap();
+        assert_eq!(after["boxes"]["worker"]["type"].as_str(), Some("task"));
+        assert!(
+            !sub.join(mfile::MFILE_NAME).exists(),
+            "no file in the subdirectory"
+        );
+        assert!(
+            !sub.join(".minimal").exists(),
+            "no file in the subdirectory"
+        );
+        assert!(!root.path().join("src").join(mfile::MFILE_NAME).exists());
+    }
+
+    // BCLI-018: both layouts in one directory are refused, as mfile refuses them.
+    #[test]
+    fn init_conflicting_layouts_exit3_appends_nothing() {
+        let root = project(LEGACY_SCAFFOLD);
+        let dot = root.path().join(".minimal");
+        std::fs::create_dir(&dot).expect("create .minimal");
+        let dot_file = dot.join(mfile::MFILE_NAME);
+        std::fs::write(&dot_file, LEGACY_SCAFFOLD).expect("write .minimal/minimal.toml");
+        let sub = root.path().join("src");
+        std::fs::create_dir(&sub).expect("create the subdirectory");
+        for dir in [root.path(), sub.as_path()] {
+            let refusal = append_from(dir, "worker").unwrap_err();
+            assert_eq!(refusal.code, 3, "{}", refusal.message);
+            let root_file = root.path().join(mfile::MFILE_NAME);
+            for path in [&root_file, &dot_file] {
+                assert!(
+                    refusal.message.contains(&path.display().to_string()),
+                    "{}",
+                    refusal.message
+                );
+            }
+            assert_eq!(read(&root), LEGACY_SCAFFOLD, "the root file is unchanged");
+            assert_eq!(
+                std::fs::read_to_string(&dot_file).unwrap(),
+                LEGACY_SCAFFOLD,
+                "the .minimal file is unchanged"
+            );
+        }
     }
 }
