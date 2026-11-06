@@ -800,7 +800,7 @@ Prints important directories and file paths for debugging.
 ### `bug`
 
 ```
-min bug [-o <OUTPUT>] [--upload [--context <TEXT>] [--endpoint <URL>]]
+min bug [-o <OUTPUT>] [--upload [--context <TEXT>] [--security] [--endpoint <URL>]]
 ```
 
 Collects a diagnostic bundle (logs, state, config) to send to the minimal
@@ -869,11 +869,25 @@ starts it there. The report URL does not contain the delete token, so
 you can share the URL. To remove the bundle sooner, run the `Delete:`
 line. See [`diag`](#diag).
 
+`--security` sends the bundle as a security report, for a suspected
+vulnerability. It needs `--upload`. Only portal owners can read the
+report. Its description is never public, it is never filed to public
+GitHub, and the results go to a private channel. `bug` prints these
+lines instead:
+
+```
+Received privately as a security report. Only the minimal team's portal owners can read it.
+Receipt: https://agents.minimal.farm/diag/<id>
+That page only confirms receipt. It shows nothing else and will not change.
+Expires: <date>
+Delete:  min diag delete <id> <token>
+```
+
 ### `diag`
 
 ```
 min diag collect [<bug options>]
-min diag upload <PATH> [--context <TEXT>] [--endpoint <URL>]
+min diag upload <PATH> [--context <TEXT>] [--security] [--endpoint <URL>]
 min diag delete <ID> <TOKEN> [--endpoint <URL>]
 ```
 
@@ -882,7 +896,8 @@ options.
 
 `diag upload` sends a bundle that you collected earlier. Use it for a
 bundle someone gave you, or for one you collected while the portal was
-unreachable. It prints the same lines as `bug --upload`.
+unreachable. It prints the same lines as `bug --upload`, and takes
+`--security` the same way.
 
 `diag delete` deletes an uploaded bundle before it expires. Give it the
 id and the delete token that the upload printed. The portal deletes the

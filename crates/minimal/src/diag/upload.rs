@@ -17,6 +17,11 @@
 //! The create hands back a delete token beside the diagnosis id. That token
 //! is how the uploader takes the bundle back before it expires: see
 //! [`delete`].
+//!
+//! A security report is marked on the create, so it is never public, not even
+//! briefly. The portal honours only a literal JSON `true`. Its report page
+//! shows the uploader nothing but receipt, so [`Uploaded::receipt`] says that
+//! instead of the ordinary lines.
 
 use std::path::Path;
 use std::time::Duration;
@@ -50,6 +55,8 @@ pub struct Uploaded {
     pub delete_token: String,
     /// When the portal deletes the bundle on its own, as the portal said it.
     pub expires_at: Option<String>,
+    /// Whether this went up as a security report.
+    pub security: bool,
 }
 
 impl Uploaded {
@@ -58,13 +65,25 @@ impl Uploaded {
     /// Plain about where the bundle went, what happens to it next, and how
     /// to take it back.
     pub fn receipt(&self) -> Vec<String> {
-        let mut lines = vec![
-            format!("Report:  {}", self.report_url),
-            format!(
-                "The bundle is stored for the minimal team for {RETENTION_DAYS} days. It is not \
-                 diagnosed until someone signs in at the report URL and starts the diagnosis."
-            ),
-        ];
+        let mut lines = if self.security {
+            vec![
+                "Received privately as a security report. Only the minimal team's portal owners \
+                 can read it."
+                    .to_owned(),
+                format!("Receipt: {}", self.report_url),
+                "That page only confirms receipt. It shows nothing else and will not change."
+                    .to_owned(),
+            ]
+        } else {
+            vec![
+                format!("Report:  {}", self.report_url),
+                format!(
+                    "The bundle is stored for the minimal team for {RETENTION_DAYS} days. It is \
+                     not diagnosed until someone signs in at the report URL and starts the \
+                     diagnosis."
+                ),
+            ]
+        };
         if let Some(expires_at) = &self.expires_at {
             lines.push(format!("Expires: {}", expiry(expires_at)));
         }
@@ -128,7 +147,12 @@ const UPLOAD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// checked against the file's length first. A stream would buy nothing after
 /// that: the create request declares the exact byte count and sha256 up front,
 /// and computing those means reading every byte regardless.
-pub async fn upload(path: &Path, endpoint: &str, note: &str) -> Result<Uploaded, anyhow::Error> {
+pub async fn upload(
+    path: &Path,
+    endpoint: &str,
+    note: &str,
+    security: bool,
+) -> Result<Uploaded, anyhow::Error> {
     let (base, local_only) = checked_base(endpoint)?;
     let base = &base;
     let size = tokio::fs::metadata(path)
@@ -161,8 +185,14 @@ pub async fn upload(path: &Path, endpoint: &str, note: &str) -> Result<Uploaded,
         .timeout(CREATE_TIMEOUT)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(
-            json!({ "name": name, "bytes": bytes.len(), "sha256": sha256, "context": note })
-                .to_string(),
+            json!({
+                "name": name,
+                "bytes": bytes.len(),
+                "sha256": sha256,
+                "context": note,
+                "security": security,
+            })
+            .to_string(),
         )
         .send()
         .await
@@ -227,6 +257,7 @@ pub async fn upload(path: &Path, endpoint: &str, note: &str) -> Result<Uploaded,
         id,
         delete_token,
         expires_at,
+        security,
     })
 }
 
@@ -450,7 +481,7 @@ mod tests {
         ])
         .await;
 
-        let uploaded = upload(&path, &base, "min up hangs").await.unwrap();
+        let uploaded = upload(&path, &base, "min up hangs", false).await.unwrap();
         let seen = served.await.unwrap();
         let base = base.trim_end_matches('/');
 
@@ -474,6 +505,7 @@ mod tests {
         assert_eq!(declared["bytes"], bundle.len());
         assert_eq!(declared["sha256"], hex::encode(Sha256::digest(&bundle)));
         assert_eq!(declared["context"], "min up hangs");
+        assert_eq!(declared["security"], false);
 
         let put = &seen[1];
         assert_eq!(
@@ -495,6 +527,51 @@ mod tests {
         // The delete token is printed once, in the command, and kept out of
         // the URL that gets shared.
         assert!(!receipt[0].contains("tok-xyz"));
+    }
+
+    /// The mark goes on the create as a JSON `true`, the only value the portal
+    /// honours, and the receipt says what a security reporter can expect: it
+    /// was received privately, and the page only confirms that.
+    #[tokio::test]
+    async fn a_security_upload_is_marked_on_the_create_and_its_receipt_is_private() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("minimal-diag-x.tar.zst");
+        tokio::fs::write(&path, b"\x28\xb5\x2f\xfdnot really zstd")
+            .await
+            .unwrap();
+
+        let (base, served) = portal(vec![
+            (
+                201,
+                r#"{"id":"d-123","upload":"/diag/api/diagnoses/d-123/bundle","delete_token":"tok-xyz","expires_at":"2026-10-16T12:00:00Z"}"#,
+            ),
+            (202, r#"{"id":"d-123","state":"stored"}"#),
+        ])
+        .await;
+
+        let uploaded = upload(&path, &base, "a sandbox escape", true)
+            .await
+            .unwrap();
+        let seen = served.await.unwrap();
+        let base = base.trim_end_matches('/');
+
+        let declared: Value = serde_json_lenient::from_slice(&seen[0].body).unwrap();
+        assert_eq!(declared["security"], Value::Bool(true));
+        assert_eq!(declared["context"], "a sandbox escape");
+
+        assert_eq!(
+            uploaded.receipt(),
+            [
+                "Received privately as a security report. Only the minimal team's portal owners \
+                 can read it."
+                    .to_owned(),
+                format!("Receipt: {base}/diag/d-123"),
+                "That page only confirms receipt. It shows nothing else and will not change."
+                    .to_owned(),
+                "Expires: 2026-10-16 12:00 UTC".to_owned(),
+                "Delete:  min diag delete d-123 tok-xyz".to_owned(),
+            ]
+        );
     }
 
     /// The delete sends the token in the body and nothing in a header, and
@@ -624,7 +701,7 @@ mod tests {
 
         let empty = dir.path().join("empty.tar.zst");
         tokio::fs::File::create(&empty).await.unwrap();
-        let err = upload(&empty, "http://127.0.0.1:1", "")
+        let err = upload(&empty, "http://127.0.0.1:1", "", false)
             .await
             .unwrap_err()
             .to_string();
@@ -639,7 +716,7 @@ mod tests {
             .set_len(MAX_BUNDLE_BYTES + 1)
             .await
             .unwrap();
-        let err = upload(&huge, "http://127.0.0.1:1", "")
+        let err = upload(&huge, "http://127.0.0.1:1", "", false)
             .await
             .unwrap_err()
             .to_string();
