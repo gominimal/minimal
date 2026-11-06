@@ -106,9 +106,16 @@ encoding**.
   tag and then its payload. Every string has a `u32` little-endian length
   prefix. Every list, set or map has a `u32` little-endian count prefix.
   Keys take their 32 bytes, and flags take one byte. An optional value
-  takes a present tag or an absent tag. The encoding emits every field, so
-  an absence is always a tag (witness class 5). The encoder sorts a set by
-  the bytes of its elements and drops repeats.
+  takes a present tag or an absent tag. The encoding emits every field the
+  seal assigns, so an absence among them is always a tag (witness class 5).
+  The one exception is a field added after the seal under a reserved tag
+  (EPOCH-021): it is emitted only when set, after every sealed field, in
+  ascending tag order, as a tag and its framed payload. Injectivity holds
+  because the sealed fields have a fixed, fully framed layout that ends at a
+  position the decoder knows, and each reserved tag appears at most once
+  after it, so a closure that sets the field and one that does not differ in
+  the bytes that follow the sealed fields. The encoder sorts a set by the
+  bytes of its elements and drops repeats.
 - **What the codec module fixes.** The tag byte values, the field order and
   the byte layout of a number are those of the epoch-1 codec module in
   `crates/graph`. No tag is in the reserve 0xF0 to 0xFF (EPOCH-007). The
