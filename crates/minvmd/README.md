@@ -22,18 +22,11 @@ boots from three artifacts:
 Prereqs:
 - Apple Silicon Mac with Docker (for the `cross` musl toolchain).
 - `brew install slp/krun/libkrun` — third-party tap; required by minvmd.
-- The `minimal` shim on `PATH` (`~/.minimal/shim/bin/minimal`). On macOS,
-  `materialize` runs `minimal` inside a Linux VM; a from-source macOS build
-  cannot run the build pipeline (the `sandbox` crate is Linux-only).
+- `jq` and `zstd` (`brew install jq zstd`), which `just artifacts` uses.
 
 ```sh
-# 1. Materialize the kernel + GENERIC guest rootfs INTO THE REPO.
-#    macOS caveat: the shim runs minimal in a VM and only syncs the project dir
-#    back to the host, so --output MUST be a path under the repo. A /tmp path is
-#    written inside the VM and never appears on the host.
-mkdir -p .scratch
-minimal materialize --output .scratch/vmlinuz    --arch aarch64 virtio-kernel
-minimal materialize --output .scratch/rootfs.img --arch aarch64 minvmd-rootfs
+# 1. Fetch the prebuilt kernel + GENERIC guest rootfs into .scratch/.
+just artifacts
 
 # 2. Build the guest initramfs (cross-compiles minimald → static aarch64, cpio).
 scripts/build-initramfs.sh .scratch/initramfs.cpio
@@ -57,9 +50,8 @@ target/debug/minvmd boot --foreground   # vm-up = minimald READY from the initra
 ## Run the boot verification locally (Linux / KVM)
 
 On a Linux host with `/dev/kvm`, minvmd links libkrun's KVM backend and boots
-natively — **no Docker, no codesigning**. Unlike macOS, `materialize` runs the
-build pipeline directly, so a native host (aarch64 *or* x86_64) materializes its
-own artifacts. This is the same flow as the `ci-linux-kvm.yml` lane.
+natively — **no Docker, no codesigning**. `materialize` runs the build pipeline
+directly, so a native host (aarch64 *or* x86_64) materializes its own artifacts. This is the same flow as the `ci-linux-kvm.yml` lane.
 
 Prereqs:
 - A KVM-capable Linux host, and membership in the `kvm` group (durable — see the
