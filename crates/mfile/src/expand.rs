@@ -1,7 +1,7 @@
 //! Expansion: the fold of a box entry's layers into one expanded spec.
 //!
 //! An entry expands in the order of [`Layer::ORDER`] (BOX-064): the
-//! `[upstream]` project's layer, the defaults of the entry's Box Type
+//! `[upstream]` layer of minimal.toml, the defaults of the entry's Box Type
 //! chain (root first), `[defaults]`, `[defaults.<type>]`, the entry, the
 //! selected loadouts, then the command-line overrides. The merge rule is
 //! the same between every pair of layers (BOX-048): a list unions with the
@@ -41,7 +41,7 @@ pub const BUILTIN_BOX_TYPES: [&str; 6] = [
 /// One layer of an entry's expansion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Layer {
-    /// The project that `[upstream]` names.
+    /// The `[upstream]` table of minimal.toml: the registry pin.
     Upstream,
     /// The `defaults` of a Box Type in the entry's type chain.
     TypeDefaults,
@@ -134,7 +134,7 @@ pub struct ExpansionReport {
 /// nothing.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Layers {
-    /// The `[upstream]` project's layer.
+    /// The `[upstream]` layer of minimal.toml.
     pub upstream: toml::Table,
     /// The defaults of each type in the entry's type chain, the built-in
     /// root first and the entry's own type last, each with its type name.
@@ -191,6 +191,10 @@ pub struct Expansion {
     pub spec: toml::Table,
     /// Where each of the spec's values came from. Never in the spec bytes.
     pub report: ExpansionReport,
+    /// Each project section that the fold left out ([`IGNORED_SECTIONS`]),
+    /// with the layer that carried it, in layer order. The caller warns
+    /// about each one. Never in the spec bytes or the report.
+    pub ignored_sections: Vec<(String, Origin)>,
 }
 
 impl Expansion {
@@ -229,16 +233,34 @@ pub fn expand(entry: &BoxEntry, layers: &Layers) -> Result<Expansion, Error> {
     Ok(expansion)
 }
 
+/// The client sections that a project file can carry but never sets. The
+/// fold leaves each one out of the spec and lists it in
+/// [`Expansion::ignored_sections`], so the caller can warn (BOX-065).
+pub const IGNORED_SECTIONS: [&str; 3] = [
+    "loadout-file-rules",
+    "package-file-rules",
+    "secret-store-rules",
+];
+
 /// Folds the layers, in the order given, under the merge rule.
 fn fold(ordered: &[(Origin, &toml::Table)]) -> Expansion {
     let mut spec = toml::Table::new();
     let mut report = ExpansionReport::default();
+    let mut ignored_sections = Vec::new();
     for (origin, layer) in ordered {
         for (key, value) in layer.iter() {
+            if IGNORED_SECTIONS.contains(&key.as_str()) {
+                ignored_sections.push((key.clone(), origin.clone()));
+                continue;
+            }
             merge_value(&mut spec, &mut report, key, value, origin);
         }
     }
-    Expansion { spec, report }
+    Expansion {
+        spec,
+        report,
+        ignored_sections,
+    }
 }
 
 /// The keys whose list is an argument vector. Order and repeats are part of
@@ -378,35 +400,60 @@ const fn value_words(value: &toml::Value) -> &'static str {
 }
 
 /// The top-level box settings an expanded spec can carry, and the shape of
-/// each: the entry keys this crate reads today, and the flat per-entry
-/// keys of BOX-049.
+/// each: the entry keys this crate reads today, the flat per-entry keys of
+/// BOX-049, the top-level sections of a Box Spec, and the keys a type's
+/// defaults set.
+///
+/// This table is an interim. The interim table goes when
+/// <https://github.com/gominimal/minimal/issues/3096> lands: BOX-076
+/// replaces it with the full Box Spec schema. Two more residuals of this
+/// fold are filed:
+/// - <https://github.com/gominimal/minimal/issues/3097>: `expand` takes the
+///   client `[secret-store-rules]` input of BOX-065.
+/// - <https://github.com/gominimal/minimal/issues/3098>: [`Expansion`]
+///   marks an implicit `default` entry (BOX-161 with BOX-165).
 const SPEC_KEYS: &[(&str, Shape)] = &[
     ("args", Shape::Table),
     ("bash", Shape::Str),
+    ("box", Shape::Table),
     ("cmdcmd", Shape::StrList),
     ("description", Shape::Str),
     ("echo", Shape::Str),
     ("env_vars", Shape::Table),
     ("exec", Shape::StrOrStrList),
+    ("exec_enabled", Shape::Bool),
+    ("execution", Shape::Table),
+    ("file_exports", Shape::List),
+    ("file_imports", Shape::List),
+    ("github_imports", Shape::List),
+    ("github_token_mode", Shape::Str),
     ("hooks_on_resume", Shape::Bool),
     ("inherit_cwd", Shape::Bool),
+    ("install", Shape::Table),
     ("interactive", Shape::Bool),
+    ("io", Shape::Table),
     ("lifecycle_hooks", Shape::List),
     ("lifetime", Shape::Str),
+    ("loadout_mode", Shape::Str),
+    ("loadouts", Shape::List),
     ("machine", Shape::Table),
     ("name", Shape::Str),
+    ("nesting", Shape::Table),
     ("network", Shape::Table),
     ("on_oom", Shape::Str),
+    ("otel", Shape::Table),
     ("packages", Shape::StrList),
     ("params", Shape::Table),
     ("patch", Shape::Table),
     ("patches", Shape::TableOrList),
     ("profile", Shape::Str),
     ("pty_enabled", Shape::Bool),
+    ("restart", Shape::Str),
     ("secrets", Shape::Table),
     ("state_key", Shape::Str),
     ("timeout", Shape::StrOrInt),
     ("type", Shape::Str),
+    ("upstream", Shape::Table),
     ("vars", Shape::Table),
     ("volumes", Shape::StrList),
 ];
@@ -460,7 +507,7 @@ fn layer_words(entry: &BoxEntry, origin: Option<&Origin>) -> String {
         );
     };
     match origin.layer {
-        Layer::Upstream => "the project that `[upstream]` names".to_owned(),
+        Layer::Upstream => "`[upstream]` in minimal.toml".to_owned(),
         Layer::TypeDefaults => {
             let name = origin.box_type.as_deref().unwrap_or_default();
             if BUILTIN_BOX_TYPES.contains(&name) {
@@ -856,6 +903,7 @@ mod tests {
         let reversed = Expansion {
             spec: reversed,
             report: first.report.clone(),
+            ignored_sections: Vec::new(),
         };
         assert_eq!(reversed.spec_bytes().expect("writes"), bytes);
     }
@@ -956,8 +1004,8 @@ mod tests {
                     upstream: table("colour = \"red\""),
                     ..Layers::default()
                 },
-                "the project that `[upstream]` names sets `colour`, which is not \
-                 a box setting. Remove the key or correct its name.",
+                "`[upstream]` in minimal.toml sets `colour`, which is not a box \
+                 setting. Remove the key or correct its name.",
             ),
             (
                 "[tasks.lint]\nexec = \"cargo clippy\"\n",
@@ -986,6 +1034,46 @@ mod tests {
         )
         .expect("the expanded spec is valid");
         assert_eq!(ok.spec["pty_enabled"].as_bool(), Some(true));
+
+        // Every key a built-in type's defaults set, and the Box Spec
+        // sections an entry can set, are box settings.
+        let ok = expand_in(
+            "[sessions.dev]\nio = { stdin = \"null\" }\n\
+             [[sessions.dev.file_imports]]\nsrc = \"a\"\ndst = \"/a\"\n",
+            "dev",
+            Layers {
+                type_defaults: vec![(
+                    "session".to_owned(),
+                    table(
+                        "loadout_mode = \"merge\"\nexec_enabled = true\n\
+                         restart = \"never\"\ngithub_token_mode = \"none\"\n\
+                         nesting = { allowed = true }",
+                    ),
+                )],
+                ..Layers::default()
+            },
+        );
+        assert!(ok.is_ok(), "{ok:?}");
+    }
+
+    // BOX-065: a project's client sections are left out of the spec and
+    // listed for the caller to warn, never refused.
+    #[test]
+    fn invalid_key_exit3_names_key_and_layer_ignores_client_sections() {
+        let e = expand_in(
+            "[sessions.dev]\npackages = [\"git\"]\n\
+             [sessions.dev.secret-store-rules]\ngithub = { upstream = \"x\" }\n",
+            "dev",
+            Layers::default(),
+        )
+        .expect("a client section is ignored, not refused");
+        let bytes = e.spec_bytes().expect("writes");
+        assert!(!bytes.contains("secret-store-rules"), "{bytes}");
+        assert!(!e.report.values.contains_key("secret-store-rules"));
+        assert_eq!(
+            e.ignored_sections,
+            vec![("secret-store-rules".to_owned(), Origin::of(Layer::Entry))]
+        );
     }
 
     // BOX-161: the report names the layer of every value, and the type for
@@ -1044,6 +1132,7 @@ mod tests {
         let only_spec = Expansion {
             spec: e.spec.clone(),
             report: ExpansionReport::default(),
+            ignored_sections: Vec::new(),
         };
         assert_eq!(bytes, only_spec.spec_bytes().expect("writes"));
         for word in [
