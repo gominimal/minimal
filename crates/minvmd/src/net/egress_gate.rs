@@ -175,10 +175,11 @@ use tokio::task::{JoinHandle, JoinSet};
 use crate::bep_attach::{BoxId, BoxIdText};
 use crate::box_registry::{BoxRecord, BoxTable, RowWithdrawal};
 
-use super::baseline::{NodeBaselinePhase, NodePlaneBaseline};
+use super::baseline::{self, NodeBaselinePhase, NodePlaneBaseline};
 use super::dns_pins;
 use super::drop_limiter::{DropLimiter, WarnDecision};
 use super::forward_revoke::{self, ForwardedFlows};
+use super::host_exposures;
 
 /// The HTTP request that upgrades a control-socket connection into a raw
 /// frame stream. The guest shuttle writes this head before its first frame;
@@ -441,6 +442,14 @@ const NODE_PLANE_FETCH_PROTOCOL: u8 = egress::IPPROTO_TCP;
 /// [`NODE_PLANE_UNPINNED_RULE`]'s drop, the same as an address no pin names.
 const NODE_PLANE_FETCH_PORTS: [u16; 1] = [443];
 
+// The baseline set opens the host alias at the node plane's fetch ports, over
+// its fetch protocol, and at nothing else.
+const _: () = assert!(
+    NODE_PLANE_FETCH_PORTS.len() == baseline::ALIAS_FETCH_PORTS.len()
+        && NODE_PLANE_FETCH_PORTS[0] == baseline::ALIAS_FETCH_PORTS[0]
+        && NODE_PLANE_FETCH_PROTOCOL == baseline::ALIAS_FETCH_PROTOCOL
+);
+
 /// The rule name for a frame headed to the switch's own address — the plan's
 /// gateway — that is not a resolver query: TCP or UDP to the resolver's port
 /// is the one carve-out the frame rules admit there, and everything else —
@@ -542,21 +551,232 @@ static INFRASTRUCTURE_RANGES: LazyLock<InfrastructureRanges> = LazyLock::new(|| 
     }
 });
 
-/// Whether `dst` lies in the infrastructure deny set as the host frame rule
-/// holds it ([`INFRASTRUCTURE_RULE`]): a fixed range; the host alias, which
-/// is default-deny at every port for a box row (design §7.1, NET-062) when
-/// `refuse_host_alias` says so, and for the node row's frames too outside
-/// the host exposures `host_exposure` carries — the inclusive port ranges
-/// the deployment configured, empty unless it named ports, matched against
-/// `transport_port`, the TCP or UDP destination port, `None` for any other
-/// frame. Box rows stay refused at a configured exposure too: the design
-/// holds an exposure as local reach under the box's egress rules (§7.1),
-/// and that reach is not built yet; the refusal fails closed, and
-/// gominimal/inbox#1144 owns the gap. The fabric plane outside `own_block`, the subnet the gate's rows live in — a frame to a
-/// sibling or to the daemon inside the node's own block is local reach,
-/// decided by the row's CIDR rules and the target's ingress, never by this
-/// rule, and the gateway inside it is the control-surface rule's; or RFC
-/// 1918 space the row's `allow_subnets` does not cover.
+/// The rule name for a frame to the host alias, `host.min.internal`, at a
+/// port no opening the source's row has covers (NET-156, design §7.1). The
+/// drop line names the row ([`AliasRow`]) and the port beside it.
+const HOST_ALIAS_RULE: &str = "host-alias";
+
+/// The row a frame to the host alias is decided for: the in-VM daemon's own
+/// traffic (`node`), the host-address boxes that share the guest's root
+/// namespace (`cohort`, the frames the node address carries for them), or
+/// one box with its own address (`box`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AliasRow {
+    Node,
+    Cohort,
+    Box,
+}
+
+impl AliasRow {
+    /// The row as the drop line spells it.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Node => "node",
+            Self::Cohort => "cohort",
+            Self::Box => "box",
+        }
+    }
+}
+
+/// The openings the host alias has for one row. The alias is default-deny
+/// (design §7.1, NET-156, NET-158): every row reaches it at the configured
+/// host exposures, the current `[host-exposures]` table (NET-161), and the
+/// row's own rules decide the flow from there. A box row reaches an
+/// exposure only when the box names the host, by `host.min.internal` in
+/// `egress.allow_dns_hosts` or by an `allow_subnets` that covers the alias
+/// (NET-160). The node-plane identity alone also reaches the alias at the
+/// ports the baseline set's own endpoints open there
+/// ([`NodePlaneBaseline::alias_ports`]). An exposure opens its port for its
+/// own protocol alone.
+///
+/// Minimal's own listeners and sockets are refused ahead of the exposure
+/// openings, at each flow (NET-162): the hostname proxy at the node row's
+/// assigned port, the box-name answerer, the Box Egress Proxy's listener,
+/// and the baseline endpoints at the alias for every row but the node's.
+/// So a listener that binds an exposed port later shadows the entry from
+/// the next flow on ([`host_exposures::HostExposures::current`]).
+///
+/// The design's two other host-side openings are not at the alias: the
+/// resolver's port is on the gateway address ([`SWITCH_CONTROL_RULE`]'s
+/// arm), and a credentialed lane's steered flow goes to the Box Egress
+/// Proxy's own address ([`PROXY_LANE_RULE`]'s arm). So a frame to the alias
+/// at the resolver's port or the proxy's port is refused here like any other.
+#[derive(Clone, Copy)]
+struct AliasOpenings<'a> {
+    row: AliasRow,
+    baseline: &'a NodePlaneBaseline,
+    table: &'a BoxTable,
+    /// Whether the row names the host, the box's half of an exposure
+    /// (NET-160). Always `true` for the node and the cohort rows.
+    names_host: bool,
+}
+
+impl<'a> AliasOpenings<'a> {
+    fn new(row: AliasRow, baseline: &'a NodePlaneBaseline, table: &'a BoxTable) -> Self {
+        Self {
+            row,
+            baseline,
+            table,
+            names_host: true,
+        }
+    }
+
+    /// The openings for one box row, whose exposures need the box to name
+    /// the host (NET-160).
+    fn for_box(baseline: &'a NodePlaneBaseline, table: &'a BoxTable, record: &BoxRecord) -> Self {
+        let alias = table.subnet().host_alias().octets();
+        Self {
+            names_host: names_host_by_name(record.allow_dns_hosts())
+                || record
+                    .egress()
+                    .allow_subnets()
+                    .is_none_or(|list| list.iter().any(|cidr| cidr.contains(alias))),
+            ..Self::new(AliasRow::Box, baseline, table)
+        }
+    }
+
+    /// Minimal's own listeners and sockets at the alias as of this flow
+    /// (NET-162), the hostname proxy's port read from the node row the
+    /// host registered before boot.
+    fn listeners(&self) -> Vec<host_exposures::Holder> {
+        let node = self
+            .table
+            .by_source(self.table.subnet().daemon_ip().octets());
+        host_exposures::minimal_listeners(
+            node.as_deref().map_or(&[][..], BoxRecord::admitted_ports),
+            self.baseline.alias_ports(),
+            baseline::ALIAS_FETCH_PROTOCOL,
+        )
+    }
+
+    /// Whether the row reaches the alias with this transport, the frame's
+    /// IP protocol and destination port when it is TCP or UDP. A frame with
+    /// no transport port (ICMP, a later fragment) fails every opening closed.
+    /// The table is read here, so only a frame to the alias pays for it.
+    fn admit(&self, transport: Option<(u8, u16)>) -> bool {
+        let Some((protocol, port)) = transport else {
+            return false;
+        };
+        let within =
+            |ranges: &[(u16, u16)]| ranges.iter().any(|&(lo, hi)| lo <= port && port <= hi);
+        if self.row == AliasRow::Node
+            && protocol == baseline::ALIAS_FETCH_PROTOCOL
+            && within(self.baseline.alias_ports())
+        {
+            // The baseline set's ports at the alias are the node plane's
+            // alone (NET-158). Another protocol at the same port is not a
+            // baseline fetch, so the table decides it.
+            return true;
+        }
+        let held = self.listeners();
+        // The table holds its entries against the listeners as of this
+        // flow, so it records a listener that shadows an entry even when
+        // the check below refuses the frame.
+        let exposures = self.baseline.host_exposure_ports(&held);
+        if held.iter().any(|holder| holder.holds_port(protocol, port)) {
+            // Minimal's own listener, refused ahead of the exposures at
+            // each flow (NET-162), even when a table entry names the port.
+            return false;
+        }
+        self.names_host
+            && exposures
+                .iter()
+                .any(|exposure| exposure.admits(protocol, port))
+    }
+}
+
+/// Whether `allow_dns_hosts` names the host alias, `host.min.internal`,
+/// as the box's half of a host exposure (NET-160).
+fn names_host_by_name(allow_dns_hosts: &[String]) -> bool {
+    allow_dns_hosts.iter().any(|host| {
+        host.trim_end_matches('.')
+            .eq_ignore_ascii_case(baseline::HOST_ALIAS_NAME)
+    })
+}
+
+/// The rule name for a frame to another box's lease that the source's
+/// `allow_subnets` leaves undeclared, from a box whose
+/// `egress.allow_dns_hosts` names boxes but not that one (NET-163). The
+/// drop line names the source box and the target box beside it.
+const BOX_NAME_RULE: &str = "box-name";
+
+/// The box-zone names `allow_dns_hosts` lists, ASCII lower-case and with no
+/// trailing dot: the names under the box zone that are neither its apex
+/// nor the host alias's (NET-163).
+fn box_zone_entries(allow_dns_hosts: &[String]) -> Vec<String> {
+    let suffix = format!(".{}", boxes::core::zone_answer::ZONE_APEX);
+    allow_dns_hosts
+        .iter()
+        .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+        .filter(|host| {
+            host.len() > suffix.len()
+                && host.ends_with(&suffix)
+                && !host.eq_ignore_ascii_case(baseline::HOST_ALIAS_NAME)
+        })
+        .collect()
+}
+
+/// How the source's name rules decide a frame to `dst` that its declared
+/// subnets left undeclared (NET-163). `None` when the source names no box,
+/// or when `dst` is no other box's lease, so the row's rules decide alone.
+/// `Some(true)` when an entry is the zone name of the box whose row holds
+/// `dst`: the name admits the source's half, and the target's ingress, in
+/// the guest, decides the rest. `Some(false)` refuses it under
+/// [`BOX_NAME_RULE`]. The match is exact, so an entry for `web` never
+/// covers a parallel instance `web-2`.
+fn box_name_verdict(table: &BoxTable, record: &BoxRecord, dst: [u8; 4]) -> Option<bool> {
+    let entries = box_zone_entries(record.allow_dns_hosts());
+    if entries.is_empty() || dst == table.subnet().daemon_ip().octets() {
+        return None;
+    }
+    let target = table.by_source(dst)?;
+    if target.switch_addr() == record.switch_addr() {
+        return None;
+    }
+    if target.is_task_row() {
+        // A task sandbox's address is not the box's lease, so no name
+        // covers it.
+        return Some(false);
+    }
+    let name = format!(
+        "{}.{}",
+        crate::box_registry::canonical_box_name(target.name()),
+        boxes::core::zone_answer::ZONE_APEX
+    );
+    Some(entries.contains(&name))
+}
+
+/// Which infrastructure rule refuses a destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InfrastructureHit {
+    /// The infrastructure deny set ([`INFRASTRUCTURE_RULE`]).
+    Set,
+    /// The host alias outside the row's openings ([`HOST_ALIAS_RULE`]).
+    HostAlias,
+}
+
+/// The frame's IP protocol and destination port when it is TCP or UDP, the
+/// transport the alias's openings are matched against.
+fn alias_transport(summary: &FrameSummary) -> Option<(u8, u16)> {
+    summary
+        .protocol()
+        .filter(|&protocol| matches!(protocol, egress::IPPROTO_TCP | egress::IPPROTO_UDP))
+        .map(|protocol| (protocol, summary.destination_port()))
+}
+
+/// Which rule, if any, refuses `dst` as infrastructure, as the host frame
+/// rule holds it ([`INFRASTRUCTURE_RULE`], [`HOST_ALIAS_RULE`]): a fixed
+/// range; the host alias outside the openings `alias` grants the row; the
+/// fabric plane outside `own_block`, the subnet the gate's rows live in — a
+/// frame to a sibling or to the daemon inside the node's own block is local
+/// reach, decided by the row's CIDR rules and the target's ingress, never by
+/// this rule, and the gateway inside it is the control-surface rule's; or
+/// RFC 1918 space the row's `allow_subnets` does not cover.
+///
+/// `transport` is the frame's protocol and port when it is TCP or UDP
+/// ([`alias_transport`]), `None` for any other frame. A non-first IPv4
+/// fragment carries no readable port and reads as port 0, so it fails every
+/// alias opening: the stateless verdict fails such a frame closed.
 ///
 /// `allow` is the row's compiled `allow_subnets`, `None` when the dimension
 /// is undeclared — allow-all, the shipped default (03-spec R2.1) — which
@@ -570,51 +790,30 @@ static INFRASTRUCTURE_RANGES: LazyLock<InfrastructureRanges> = LazyLock::new(|| 
 /// allowing the range, so neither a name rule nor a pin can become a way
 /// around leaving it undeclared.
 ///
-/// `refuse_host_alias` is `false` for the node namespace's row alone: the
-/// interim node row, keyed to the daemon's own address, carries the frames
-/// of every box that shares the guest root namespace (a host-address box,
-/// the default network mode), and those reach the host alias as own-block
-/// local reach until the in-force baseline, which names the alias as its
-/// registry and cache endpoint, decides the node plane instead. Announced,
-/// that reach is scoped: the alias is opened at the configured host
-/// exposures alone, and a node-row frame to any other port, or with no TCP
-/// or UDP port, is this rule's drop. This mirrors the shared verdict,
-/// whose own-address refusal is attached to box relays only, never to the
-/// daemon relay.
 fn infrastructure_destination(
     dst: [u8; 4],
-    transport_port: Option<u16>,
+    transport: Option<(u8, u16)>,
     own_block: SwitchSubnet,
     allow: Option<&[Ipv4Cidr]>,
-    refuse_host_alias: bool,
-    host_exposure: &[(u16, u16)],
-) -> bool {
+    alias: AliasOpenings<'_>,
+) -> Option<InfrastructureHit> {
     let ranges = &*INFRASTRUCTURE_RANGES;
     if ranges.fixed.iter().any(|cidr| cidr.contains(dst)) {
-        return true;
+        return Some(InfrastructureHit::Set);
     }
-    // The host alias is default-deny (design §7.1, NET-062): a box reaches
-    // the host only through a declared exposure, never by addressing the
-    // alias directly, so the alias is refused under this rule at every port
-    // whatever the row's rules would say about it. The node row's frames
-    // — the host-address boxes the interim row carries — reach the alias at
-    // the configured host exposures alone, and only over TCP or UDP: a frame
-    // with no transport port (ICMP reads as port 0) fails the opening closed.
-    let exposed = transport_port.is_some_and(|port| {
-        host_exposure
-            .iter()
-            .any(|&(lo, hi)| lo <= port && port <= hi)
-    });
-    if dst == own_block.host_alias().octets() && (refuse_host_alias || !exposed) {
-        return true;
+    // The host alias is default-deny (design §7.1, NET-156): it opens only
+    // at the row's openings, whatever the row's rules say about it.
+    if dst == own_block.host_alias().octets() {
+        return (!alias.admit(transport)).then_some(InfrastructureHit::HostAlias);
     }
     let in_own_block = (u32::from_be_bytes(dst) & u32::from(own_block.netmask()))
         == u32::from(own_block.network());
     if ranges.plane.contains(dst) && !in_own_block {
-        return true;
+        return Some(InfrastructureHit::Set);
     }
-    ranges.rfc1918.iter().any(|cidr| cidr.contains(dst))
-        && !allow.is_none_or(|list| list.iter().any(|cidr| cidr.contains(dst)))
+    (ranges.rfc1918.iter().any(|cidr| cidr.contains(dst))
+        && !allow.is_none_or(|list| list.iter().any(|cidr| cidr.contains(dst))))
+    .then_some(InfrastructureHit::Set)
 }
 
 /// The rule name for a frame headed to the Box Egress Proxy's address that
@@ -5005,6 +5204,24 @@ async fn relay_frames_to_switch(
                 limiter.warn_infrastructure(src, dst, dst_port);
                 continue;
             }
+            Err(GateDrop::HostAlias { src, dst_port, row }) => {
+                limiter.warn_host_alias(src, dst_port, row);
+                continue;
+            }
+            Err(GateDrop::BoxName { src, dst, dst_port }) => {
+                // The line names both boxes by the rows that hold their
+                // addresses, so a host reads who reached for whom.
+                let source = table.by_source(src);
+                let target = table.by_source(dst);
+                limiter.warn_box_name(
+                    src,
+                    dst,
+                    dst_port,
+                    source.as_deref().map(BoxRecord::name),
+                    target.as_deref().map(BoxRecord::name),
+                );
+                continue;
+            }
             Err(GateDrop::ProxyLane { src, dst, dst_port }) => {
                 // The plan's diagnostics line wants the refusal to name the
                 // box, not only its address: the row the frame's source
@@ -5903,7 +6120,8 @@ fn reply_tuple_of(pkt: &dns_pins::L4Packet) -> egress::FlowTuple {
 ///   at [`NODE_PLANE_FETCH_PROTOCOL`] and [`NODE_PLANE_FETCH_PORTS`] only;
 /// - a subnet a baseline entry names, and the resolver carve-out, both by the
 ///   set's compiled rules;
-/// - the host alias at the configured host exposures, over TCP or UDP;
+/// - the host alias at the configured host exposures, over TCP or UDP, and
+///   at the ports the set's own endpoints open there;
 /// - a box's lease the registry holds, which the target box's ingress
 ///   decides on the switch's side, the reach the node's hostname proxy and
 ///   its answers to the boxes ride.
@@ -5935,23 +6153,27 @@ fn node_plane_verdict(
     if dst == subnet.box_egress_proxy_address().octets() {
         return Err(GateDrop::ProxyLane { src, dst, dst_port });
     }
-    let transport_port = matches!(
-        summary.protocol(),
-        Some(egress::IPPROTO_TCP | egress::IPPROTO_UDP)
-    )
-    .then_some(dst_port);
-    if infrastructure_destination(
+    match infrastructure_destination(
         dst,
-        transport_port,
+        alias_transport(summary),
         subnet,
         baseline.rules().allow_subnets(),
-        false,
-        baseline.host_exposure_ports(),
+        AliasOpenings::new(AliasRow::Node, baseline, table),
     ) {
-        return Err(GateDrop::Infrastructure { src, dst, dst_port });
+        Some(InfrastructureHit::Set) => {
+            return Err(GateDrop::Infrastructure { src, dst, dst_port });
+        }
+        Some(InfrastructureHit::HostAlias) => {
+            return Err(GateDrop::HostAlias {
+                src,
+                dst_port,
+                row: AliasRow::Node,
+            });
+        }
+        None => {}
     }
-    // Past the infrastructure check, the alias is at a configured host
-    // exposure: the one opening the alias has.
+    // Past the infrastructure check, the alias is at one of the node's
+    // openings there: a host exposure or the baseline set's own port.
     if dst == subnet.host_alias().octets() {
         return Ok(GateAdmit::Baseline);
     }
@@ -6230,9 +6452,18 @@ fn log_marked_decision(
 /// RFC 1918 allowance and the node's own block reach a `host_ip` box keeps,
 /// then the box's compiled rules, then the DNS admission table's pins for
 /// the names the resident boxes declared. The Box Egress Proxy's listener is
-/// decided by the node row's lane declaration, as it was for every frame the
-/// node row carried, because the proxy's attachment for the node address is
-/// the node row's.
+/// decided by the cohort's lane (BEP-083): the union of the resident
+/// members' declarations. While one member declares a credentialed
+/// upstream, two ports at the proxy's address are admitted
+/// ([`GateAdmit::ProxyLane`]): the proxy's listener port, and TCP 443
+/// ([`egress::PROXY_DIRECT_TLS_PORT`]). UDP 443 and every other port at that
+/// address still drop. While no member declares one, every frame to the
+/// proxy's address drops under [`PROXY_LANE_RULE`].
+///
+/// The gate cannot tell the members apart: every member leaves from the
+/// node address with the same cohort mark. The in-VM classifier, which
+/// knows the sender's cgroup, refuses a connection to the proxy's address
+/// from a member that declares no lane. This gate is the lane's host half.
 fn host_ip_verdict(
     summary: &FrameSummary,
     l4: Option<&dns_pins::L4Packet>,
@@ -6256,20 +6487,43 @@ fn host_ip_verdict(
     if let Some(dst) = dst
         && dst == table.subnet().box_egress_proxy_address().octets()
     {
-        let declared = table
-            .by_source(src)
-            .is_some_and(|record| record.declares_credentialed_upstream());
+        let declaring = resident
+            .iter()
+            .filter(|rules| rules.declares_credentialed_upstream())
+            .count();
         let listener = egress::ProxyListener::at(dst);
-        if egress::proxy_lane_admits(declared, listener, summary) {
+        // BEP-083: the cohort lane opens the listener and TCP 443 at the
+        // proxy's address, through the one lane predicate every leg shares.
+        let admitted = egress::proxy_lane_admits(declaring > 0, listener, summary);
+        tracing::debug!(
+            source = %Ipv4Addr::from(src),
+            destination = %Ipv4Addr::from(dst),
+            port = dst_port,
+            cohort_lane = if declaring > 0 { "open" } else { "closed" },
+            declaring_members = declaring,
+            resident_members = resident.len(),
+            admitted,
+            "decided a host_ip cohort frame to the box egress proxy's address"
+        );
+        if admitted {
             return Ok(GateAdmit::ProxyLane);
         }
         return Err(GateDrop::ProxyLane { src, dst, dst_port });
     }
-    let transport_port = matches!(
-        summary.protocol(),
-        Some(egress::IPPROTO_TCP | egress::IPPROTO_UDP)
-    )
-    .then_some(dst_port);
+    let transport = alias_transport(summary);
+    let openings = AliasOpenings::new(AliasRow::Cohort, baseline, table);
+    // The alias's openings are the cohort's, the same for every resident
+    // box, so the alias is decided once, before the boxes' rules.
+    if let Some(dst) = dst
+        && dst == table.subnet().host_alias().octets()
+        && !openings.admit(transport)
+    {
+        return Err(GateDrop::HostAlias {
+            src,
+            dst_port,
+            row: AliasRow::Cohort,
+        });
+    }
     let mut infrastructure = false;
     // Whether a name-resolving box left the frame to the pins. The pins are
     // one shared cohort entry, so the gate asks them once, after the loop,
@@ -6279,12 +6533,12 @@ fn host_ip_verdict(
         if let Some(dst) = dst
             && infrastructure_destination(
                 dst,
-                transport_port,
+                transport,
                 table.subnet(),
                 rules.egress().allow_subnets(),
-                false,
-                baseline.host_exposure_ports(),
+                openings,
             )
+            .is_some()
         {
             infrastructure = true;
             continue;
@@ -6308,12 +6562,12 @@ fn host_ip_verdict(
         && resident.iter().all(|rules| {
             infrastructure_destination(
                 dst,
-                transport_port,
+                transport,
                 table.subnet(),
                 rules.egress().allow_subnets(),
-                false,
-                baseline.host_exposure_ports(),
+                openings,
             )
+            .is_some()
         })
     {
         return Err(GateDrop::Infrastructure { src, dst, dst_port });
@@ -6370,49 +6624,48 @@ fn row_verdict(
     // now — the source check above returns before any other source — so the
     // set applies to every box-plane packet, and no row's rules concede the
     // fabric.
-    // The host-alias refusal is a box row's alone: the node namespace's
-    // row, keyed to the daemon's own address, carries the host-address
-    // boxes' frames, whose `host.min.internal` resolves to the alias, and
-    // keeps own-block local reach to it while the baseline is announced
-    // (in force, the node-plane arm above returned first, with the same
-    // scoping). That reach is scoped by the baseline's configured host
-    // exposures, which the arm below reads for every row: the box rows'
-    // refusal stands at every port, and the node row's outside the
-    // exposures.
-    let box_row = src != table.subnet().daemon_ip().octets();
-    // A non-first IPv4 fragment carries no readable L4 port — `summarize`
-    // reports destination port 0 for it — so it fails the exposure match
-    // and the gate drops it, never admits it: a fragmented UDP datagram to
-    // an exposed port dies at its later fragments. Reviewer ask
-    // (CodeRabbit, PR #2331) was to associate later fragments with their
-    // admitted first fragment, or defer the port check to reassembly.
-    // Declined: the verdict path is stateless and allocation-free by
-    // design — every input comes from the one frame being judged — and
-    // fragment association would add per-flow state here (or reassembly
-    // elsewhere) to recover a packet whose failure mode is a drop, not an
-    // exposure: deny-by-default keeps the safe direction. The in-force
-    // node-plane arm reads the exposures the same way, with the same
-    // fragment case.
-    let transport_port = matches!(
-        summary.protocol(),
-        Some(egress::IPPROTO_TCP | egress::IPPROTO_UDP)
-    )
-    .then(|| summary.destination_port());
-    if let Some(dst) = summary.destination()
-        && infrastructure_destination(
+    // The host alias opens at the configured host exposures for every row,
+    // and the row's own rules decide the flow from there (design §7.1). The
+    // node namespace's row, keyed to the daemon's own address, carries the
+    // host-address boxes' frames under the announced baseline, so it is the
+    // cohort here and never gets the baseline set's own openings. A
+    // non-first IPv4 fragment reads as port 0 and fails the openings
+    // closed: the verdict path is stateless, and a drop is the safe
+    // direction.
+    let row = if src == table.subnet().daemon_ip().octets() {
+        AliasRow::Cohort
+    } else {
+        AliasRow::Box
+    };
+    // A box row reaches an exposure only when it names the host (NET-160).
+    let openings = match row {
+        AliasRow::Box => AliasOpenings::for_box(baseline, table, &record),
+        _ => AliasOpenings::new(row, baseline, table),
+    };
+    if let Some(dst) = summary.destination() {
+        match infrastructure_destination(
             dst,
-            transport_port,
+            alias_transport(summary),
             table.subnet(),
             record.egress().allow_subnets(),
-            box_row,
-            baseline.host_exposure_ports(),
-        )
-    {
-        return Err(GateDrop::Infrastructure {
-            src,
-            dst,
-            dst_port: summary.destination_port(),
-        });
+            openings,
+        ) {
+            Some(InfrastructureHit::Set) => {
+                return Err(GateDrop::Infrastructure {
+                    src,
+                    dst,
+                    dst_port: summary.destination_port(),
+                });
+            }
+            Some(InfrastructureHit::HostAlias) => {
+                return Err(GateDrop::HostAlias {
+                    src,
+                    dst_port: summary.destination_port(),
+                    row,
+                });
+            }
+            None => {}
+        }
     }
     // The Box Egress Proxy's listener, decided beside every rule (NET-134):
     // the proxy is a credentialed lane's infrastructure — the one host-side
@@ -6493,7 +6746,40 @@ fn row_verdict(
         {
             Ok(GateAdmit::Row)
         }
-        FrameVerdict::Drop(reason) => Err(GateDrop::Verdict(reason)),
+        // The alias passed its openings above, so the frame is at a host
+        // exposure. A box that names `host.min.internal` reaches it by the
+        // name, as a pin admits an answer to a declared name, while its
+        // deny rules and protocols still decide first (NET-160).
+        FrameVerdict::Drop(reason)
+            if matches!(reason, DropReason::UndeclaredSubnet { .. })
+                && row == AliasRow::Box
+                && summary.destination() == Some(table.subnet().host_alias().octets())
+                && names_host_by_name(record.allow_dns_hosts()) =>
+        {
+            Ok(GateAdmit::Row)
+        }
+        FrameVerdict::Drop(reason) => {
+            // NET-163: a box that names another box's zone name reaches that
+            // box's lease, while its deny rules and protocols still decide
+            // first. The target's ingress decides the rest in the guest.
+            // A box that names boxes reaches no other box by a name.
+            if matches!(reason, DropReason::UndeclaredSubnet { .. })
+                && row == AliasRow::Box
+                && let Some(dst) = summary.destination()
+                && let Some(named) = box_name_verdict(table, &record, dst)
+            {
+                return if named {
+                    Ok(GateAdmit::Row)
+                } else {
+                    Err(GateDrop::BoxName {
+                        src,
+                        dst,
+                        dst_port: summary.destination_port(),
+                    })
+                };
+            }
+            Err(GateDrop::Verdict(reason))
+        }
     }
 }
 
@@ -6551,6 +6837,28 @@ enum GateDrop {
         /// The port the frame named there, `0` when it carried none.
         dst_port: u16,
     },
+    /// The frame named the host alias at a port no opening of its row
+    /// covers (NET-156, [`HOST_ALIAS_RULE`]).
+    HostAlias {
+        /// The source address the frame wore.
+        src: [u8; 4],
+        /// The port the frame named at the alias, `0` when it carried none.
+        dst_port: u16,
+        /// The row the alias's openings were decided for.
+        row: AliasRow,
+    },
+    /// The frame named another box's lease, and the source's
+    /// `allow_dns_hosts` names boxes but not that one, and its
+    /// `allow_subnets` does not cover the lease (NET-163,
+    /// [`BOX_NAME_RULE`]).
+    BoxName {
+        /// The source address the frame wore.
+        src: [u8; 4],
+        /// The target box's lease.
+        dst: [u8; 4],
+        /// The port the frame named there, `0` when it carried none.
+        dst_port: u16,
+    },
     /// The frame named the Box Egress Proxy's address and the lane does not
     /// admit it (NET-134): its source carries no credentialed lane, or the
     /// frame is headed somewhere at the address the declaration never
@@ -6600,6 +6908,8 @@ impl GateDrop {
         match self {
             Self::Verdict(reason) => reason.rule(),
             Self::Infrastructure { .. } => INFRASTRUCTURE_RULE,
+            Self::HostAlias { .. } => HOST_ALIAS_RULE,
+            Self::BoxName { .. } => BOX_NAME_RULE,
             Self::UnknownSource { .. } => UNKNOWN_SOURCE_RULE,
             Self::UnregisteredSource { .. } => UNREGISTERED_SOURCE_RULE,
             Self::SwitchControlSurface { .. } => SWITCH_CONTROL_RULE,
@@ -6764,6 +7074,76 @@ impl DropLimiter {
                     "dropped frames to infrastructure destinations from more distinct \
                      source addresses than the gate keeps a window per source for; one \
                      line per rule covers the rest",
+                );
+                true
+            }
+        }
+    }
+
+    /// Emits the warning for one frame to the host alias outside its row's
+    /// openings (NET-156): the same rate limit a drop's line answers to,
+    /// keyed by the source and the rule, and naming the row and the port.
+    /// Returns whether a line was written.
+    fn warn_host_alias(&self, src: [u8; 4], dst_port: u16, row: AliasRow) -> bool {
+        match self.should_warn_at(Some(src), HOST_ALIAS_RULE, Instant::now()) {
+            WarnDecision::Silent => false,
+            WarnDecision::Named => {
+                tracing::warn!(
+                    source = %Ipv4Addr::from(src),
+                    row = row.as_str(),
+                    port = dst_port,
+                    rule_matched = HOST_ALIAS_RULE,
+                    "dropped a frame to host.min.internal at a port that no host exposure \
+                     opens for this row",
+                );
+                true
+            }
+            WarnDecision::Overflow => {
+                tracing::warn!(
+                    rule_matched = HOST_ALIAS_RULE,
+                    "dropped frames to host.min.internal from more distinct source addresses \
+                     than the gate keeps a window per source for; one line per rule covers \
+                     the rest",
+                );
+                true
+            }
+        }
+    }
+
+    /// Emits the warning for one frame to another box's lease that the
+    /// source's name rules refuse (NET-163): the same rate limit a drop's
+    /// line answers to, keyed by the source and the rule. The line names
+    /// the source box, the target box, the target's address and port, and
+    /// the rule. Returns whether a line was written.
+    fn warn_box_name(
+        &self,
+        src: [u8; 4],
+        dst: [u8; 4],
+        dst_port: u16,
+        source_box: Option<&str>,
+        target_box: Option<&str>,
+    ) -> bool {
+        match self.should_warn_at(Some(src), BOX_NAME_RULE, Instant::now()) {
+            WarnDecision::Silent => false,
+            WarnDecision::Named => {
+                tracing::warn!(
+                    source = %Ipv4Addr::from(src),
+                    destination = %Ipv4Addr::from(dst),
+                    port = dst_port,
+                    box = source_box,
+                    target = target_box,
+                    rule_matched = BOX_NAME_RULE,
+                    "dropped a frame to another box; this box's allow_dns_hosts does not \
+                     name that box, and its allow_subnets does not cover the address",
+                );
+                true
+            }
+            WarnDecision::Overflow => {
+                tracing::warn!(
+                    rule_matched = BOX_NAME_RULE,
+                    "dropped frames to other boxes from more distinct source addresses \
+                     than the gate keeps a window per source for; one line per rule \
+                     covers the rest",
                 );
                 true
             }
@@ -7868,8 +8248,8 @@ mod tests {
         send_frame, unexpose_request, wait_for_log,
     };
     use super::{
-        AcceptFailure, CONNECT_REQUEST, CONTROL_VERBS, ControlVerb, DropLimiter, EgressGate,
-        FrameSummary, GateAdmit, GateDrop, GuestSource, GuestSpeak, HANDSHAKE_TIMEOUT,
+        AcceptFailure, AliasRow, CONNECT_REQUEST, CONTROL_VERBS, ControlVerb, DropLimiter,
+        EgressGate, FrameSummary, GateAdmit, GateDrop, GuestSource, GuestSpeak, HANDSHAKE_TIMEOUT,
         HOST_IP_BOXES_RULE, MALFORMED_PUBLISH_RULE, MAX_HEAD, MAX_LIVE_RELAYS, MAX_NAMED_TARGET,
         PublishedForwards, Record, ReplyTables, UNDECLARED_PUBLISH_RECORD_RULE,
         UNDECLARED_RETRACT_RULE, UNKNOWN_PUBLISH_ADDRESS_RULE, UNREGISTERED_LIVE_LEASE_RULE,
@@ -12495,9 +12875,9 @@ mod tests {
     /// and neither does the widest allowance. The node's own block is the
     /// carve-out for a sibling and the daemon: the same CIDR row reaches a
     /// sibling, local reach the row's rules and the target's ingress decide.
-    /// The host alias is not local reach — it is default-deny at every port
-    /// (design §7.1, NET-062), refused under this rule whatever the row's
-    /// rules admit. RFC 1918
+    /// The host alias is not local reach — it is default-deny outside the
+    /// host exposures (design §7.1, NET-156), refused under its own rule
+    /// (`host-alias`), whose line names the row and the port. RFC 1918
     /// is the one exemption: a `10.0.0.0/8` destination is refused for the
     /// name-declaring row, whose declared `allow_subnets` does not cover it
     /// — the frame its deferral would otherwise have passed to the guest —
@@ -12595,13 +12975,14 @@ mod tests {
         // The drops say so under the rule, naming the destination and the
         // port, one line per source: the first refused frame of each.
         wait_for_log(&h.log, "egress-infrastructure-destination").await;
+        wait_for_log(&h.log, "rule_matched=\"host-alias\"").await;
         let logged = h.log.contents();
         for needle in [
             "source=100.64.0.9",
             "destination=10.1.2.3",
             "port=443",
             "source=100.64.0.10",
-            "destination=100.64.255.254",
+            "row=\"box\"",
             "source=100.64.0.11",
             "destination=169.254.169.254",
             "source=100.64.0.12",
@@ -15931,7 +16312,7 @@ mod tests {
             );
         }
         // The box leaves: its reach goes with it.
-        assert!(registry.retire_host_ip_box(session));
+        assert!(registry.retire_host_ip_box(session, minimald_rpc::HostIpBoxEnd::Destroyed));
         assert_eq!(
             marked(host_ip_reach, 443),
             Err(unbounded(host_ip_reach, 0)),
@@ -16167,7 +16548,8 @@ mod tests {
                 .with_admitted_ports([8080]),
         );
         let table = registry.table();
-        let baseline = NodePlaneBaseline::built_in(SUBNET).with_host_exposure(vec![(4200, 4200)]);
+        let baseline = NodePlaneBaseline::built_in(SUBNET)
+            .with_host_exposure(vec![crate::net::host_exposures::HostExposure::tcp(4200)]);
         assert_eq!(
             baseline.phase(),
             NodeBaselinePhase::InForce,
@@ -16266,12 +16648,16 @@ mod tests {
         );
 
         // The host alias at a configured exposure is admitted, and at any
-        // other port it is the infrastructure drop.
+        // other port it is the host-alias drop.
         let alias = SUBNET.host_alias().octets();
         assert_eq!(decide(6, alias, 4200), Ok(GateAdmit::Baseline));
         assert!(matches!(
             decide(6, alias, 443),
-            Err(GateDrop::Infrastructure { dst, .. }) if dst == alias
+            Err(GateDrop::HostAlias {
+                dst_port: 443,
+                row: AliasRow::Node,
+                ..
+            })
         ));
 
         // A resident box's lease: the target's ingress decides it.
@@ -16286,6 +16672,138 @@ mod tests {
             decide(6, SUBNET.dns_server().octets(), 80),
             Err(GateDrop::SwitchControlSurface { .. })
         ));
+    }
+
+    /// A box-marked TCP frame from the node address to the Box Egress
+    /// Proxy's address at `port`, decided by the gate.
+    fn host_ip_cohort_to_proxy(
+        table: &BoxTable,
+        baseline: &NodePlaneBaseline,
+        pins: &dns_pins::DnsPins,
+        port: u16,
+    ) -> Result<GateAdmit, GateDrop> {
+        host_ip_cohort_to_proxy_over(table, baseline, pins, 6, port)
+    }
+
+    /// A box-marked frame of IP protocol `proto` from the node address to
+    /// the Box Egress Proxy's address at `port`, decided by the gate.
+    fn host_ip_cohort_to_proxy_over(
+        table: &BoxTable,
+        baseline: &NodePlaneBaseline,
+        pins: &dns_pins::DnsPins,
+        proto: u8,
+        port: u16,
+    ) -> Result<GateAdmit, GateDrop> {
+        let node = SUBNET.daemon_ip().octets();
+        let proxy = SUBNET.box_egress_proxy_address().octets();
+        let frame =
+            boxes::core::egress::summarize(&box_cohort_frame(ipv4_frame(node, proto, proxy, port)));
+        assert!(frame.box_cohort_marked());
+        gate_verdict(&frame, None, table, baseline, pins, &ReplyTables::new())
+    }
+
+    /// BEP-083: the `host_ip` cohort's lane to the proxy's listener is the
+    /// union of its resident members' declarations. While one member
+    /// declares a credentialed upstream, a cohort frame to the listener
+    /// port and to TCP 443 at the proxy's address passes, whatever the
+    /// other members declare. UDP 443 and a frame to another port at the
+    /// proxy's address still drop: the lane opens those two ports alone.
+    #[test]
+    fn host_ip_cohort_reaches_proxy_while_a_member_declares_a_lane() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        assert_eq!(baseline.phase(), NodeBaselinePhase::InForce);
+        let pins = dns_pins::DnsPins::new(SUBNET);
+        let plain = boxes::SessionId::mint();
+        let grant = boxes::SessionId::mint();
+        assert!(registry.admit_host_ip_box(plain, None));
+        assert!(registry.admit_host_ip_box_with_lane(grant, None, true));
+        assert_eq!(
+            host_ip_cohort_to_proxy(&table, &baseline, &pins, super::egress::PROXY_LISTENER_PORT),
+            Ok(GateAdmit::ProxyLane),
+            "a cohort frame reaches the listener while a member declares a lane"
+        );
+        assert_eq!(
+            host_ip_cohort_to_proxy(&table, &baseline, &pins, 443),
+            Ok(GateAdmit::ProxyLane),
+            "a cohort frame reaches TCP 443 at the proxy while a member declares a lane"
+        );
+        assert!(
+            matches!(
+                host_ip_cohort_to_proxy_over(&table, &baseline, &pins, 17, 443),
+                Err(GateDrop::ProxyLane { dst_port: 443, .. })
+            ),
+            "the lane opens TCP 443, never UDP 443"
+        );
+        assert!(
+            matches!(
+                host_ip_cohort_to_proxy(&table, &baseline, &pins, 22),
+                Err(GateDrop::ProxyLane { dst_port: 22, .. })
+            ),
+            "the lane opens the listener port and TCP 443 alone"
+        );
+    }
+
+    /// BEP-083: with no resident member that declares a credentialed
+    /// upstream, the cohort's lane is closed. A cohort frame to the proxy's
+    /// listener or to TCP 443 at the proxy's address drops under
+    /// [`PROXY_LANE_RULE`], before any member's egress
+    /// rules are read, so an allow-all member opens nothing there. When the
+    /// last declaring member is retired, the lane closes again.
+    #[test]
+    fn host_ip_cohort_proxy_lane_dropped_without_a_declaring_member() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        let pins = dns_pins::DnsPins::new(SUBNET);
+        let node = SUBNET.daemon_ip().octets();
+        let proxy = SUBNET.box_egress_proxy_address().octets();
+        let lane_drop = Err(GateDrop::ProxyLane {
+            src: node,
+            dst: proxy,
+            dst_port: super::egress::PROXY_LISTENER_PORT,
+        });
+        let plain = boxes::SessionId::mint();
+        assert!(registry.admit_host_ip_box(plain, None));
+        assert_eq!(
+            host_ip_cohort_to_proxy(&table, &baseline, &pins, super::egress::PROXY_LISTENER_PORT),
+            lane_drop,
+            "an allow-all member with no lane does not open the listener"
+        );
+        let tls_drop = Err(GateDrop::ProxyLane {
+            src: node,
+            dst: proxy,
+            dst_port: 443,
+        });
+        assert_eq!(
+            host_ip_cohort_to_proxy(&table, &baseline, &pins, 443),
+            tls_drop,
+            "an allow-all member with no lane does not open TCP 443 at the proxy"
+        );
+        let grant = boxes::SessionId::mint();
+        assert!(registry.admit_host_ip_box_with_lane(grant, None, true));
+        assert_eq!(
+            host_ip_cohort_to_proxy(&table, &baseline, &pins, super::egress::PROXY_LISTENER_PORT),
+            Ok(GateAdmit::ProxyLane)
+        );
+        assert_eq!(
+            host_ip_cohort_to_proxy(&table, &baseline, &pins, 443),
+            Ok(GateAdmit::ProxyLane)
+        );
+        assert!(registry.retire_host_ip_box(grant, minimald_rpc::HostIpBoxEnd::Destroyed));
+        assert_eq!(
+            host_ip_cohort_to_proxy(&table, &baseline, &pins, super::egress::PROXY_LISTENER_PORT),
+            lane_drop,
+            "the lane closes when the last declaring member ends"
+        );
+        assert_eq!(
+            host_ip_cohort_to_proxy(&table, &baseline, &pins, 443),
+            tls_drop,
+            "TCP 443 at the proxy closes when the last declaring member ends"
+        );
     }
 
     /// The node address carries two senders: the guest daemon and every
@@ -16398,120 +16916,791 @@ mod tests {
         }
     }
 
-    /// The host alias's default-deny is a box row's alone, and the node
-    /// plane's reach through it is scoped by the configured host exposures
-    /// (design §7.1, NET-062). The daemon's address carries the frames of
-    /// every box sharing the guest root namespace — a host-address box, the
-    /// default network mode, whose `host.min.internal` resolves to the
-    /// alias — and the in-force baseline decides them. The built-in baseline
-    /// carries no exposure, so the alias is closed at every port until a
-    /// deployment names ports; with a list, a node-plane TCP or UDP frame to
-    /// the alias is admitted by the baseline set inside the list's ranges, edges included, and the infrastructure drop outside them,
-    /// while an ICMP frame, which carries no port, is refused even by a list
-    /// spanning every port. The same frames from a box lease, even an
-    /// allow-all one, are the infrastructure drop whatever the port.
+    /// The gate's verdict for one frame `src` sends to the host alias, with
+    /// the box mark when `marked`.
+    fn alias_verdict(
+        table: &BoxTable,
+        baseline: &NodePlaneBaseline,
+        src: [u8; 4],
+        marked: bool,
+        proto: u8,
+        port: u16,
+    ) -> Result<GateAdmit, GateDrop> {
+        let alias = SUBNET.host_alias().octets();
+        let frame = ipv4_frame(src, proto, alias, port);
+        let frame = if marked {
+            box_cohort_frame(frame)
+        } else {
+            frame
+        };
+        gate_verdict(
+            &boxes::core::egress::summarize(&frame),
+            None,
+            table,
+            baseline,
+            &dns_pins::DnsPins::new(SUBNET),
+            &ReplyTables::new(),
+        )
+    }
+
+    /// A box with its own address, an allow-all one included, reaches the
+    /// host alias at a configured host exposure and nowhere else (NET-156).
+    /// Its own rules decide the exposure: a deny-all box reaches nothing.
+    /// The alias is not where the resolver or the Box Egress Proxy listen,
+    /// so the alias at their ports is refused, while the resolver on the
+    /// gateway and a lane box's flow to the proxy's own address still pass.
+    /// The drop is the `host-alias` rule's and names the `box` row.
     #[test]
-    fn host_alias_refused_for_box_rows_and_scoped_by_the_exposures_for_the_node_row() {
+    fn host_alias_refused_outside_exposures_for_boxes() {
         let registry = BoxRegistry::new(SUBNET);
         registry.register_node_namespace(7654);
         registry.register(
             BoxRegistration::new("bare", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
                 .with_admitted_ports([8080]),
         );
+        let locked = [100, 64, 0, 11];
+        registry.register(
+            BoxRegistration::new("locked", Ipv4Addr::from(locked), Ipv4Addr::LOCALHOST)
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: None,
+                    allow_subnets: None,
+                    allow_dns_hosts: None,
+                    deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+                }),
+        );
+        let laned = [100, 64, 0, 12];
+        registry.register(
+            BoxRegistration::new("laned", Ipv4Addr::from(laned), Ipv4Addr::LOCALHOST)
+                .with_credentialed_upstream(boxes::CredentialedUpstream::default()),
+        );
         let table = registry.table();
-        let built_in = NodePlaneBaseline::built_in(SUBNET);
-        assert_eq!(built_in.phase(), NodeBaselinePhase::InForce);
-        let pins = dns_pins::DnsPins::new(SUBNET);
-        let summarize = boxes::core::egress::summarize;
-        let alias = SUBNET.host_alias().octets();
-        let node = SUBNET.daemon_ip().octets();
-
-        let verdict = |src: [u8; 4], proto: u8, port: u16, baseline: &NodePlaneBaseline| {
-            gate_verdict(
-                &summarize(&ipv4_frame(src, proto, alias, port)),
-                None,
-                &table,
-                baseline,
-                &pins,
-                &ReplyTables::new(),
-            )
+        let exposed = NodePlaneBaseline::built_in(SUBNET).with_host_exposure(vec![
+            crate::net::host_exposures::HostExposure::tcp(3000),
+            crate::net::host_exposures::HostExposure::tcp(3999),
+            crate::net::host_exposures::HostExposure::tcp(8080),
+            crate::net::host_exposures::HostExposure::udp(8080),
+        ]);
+        let refused = |result: Result<GateAdmit, GateDrop>, port: u16| {
+            result
+                == Err(GateDrop::HostAlias {
+                    src: LEASE,
+                    dst_port: port,
+                    row: AliasRow::Box,
+                })
         };
-        let refused = |result: Result<GateAdmit, GateDrop>| matches!(result, Err(GateDrop::Infrastructure { dst, .. }) if dst == alias);
 
-        assert!(
-            refused(verdict(node, 6, 8080, &built_in)),
-            "with no configured exposure the alias is closed to the node plane at every port"
-        );
-
-        let exposed = built_in
-            .clone()
-            .with_host_exposure(vec![(3000, 3999), (8080, 8080)]);
-        assert!(
-            refused(verdict(node, 6, 2999, &exposed)),
-            "the port below a range's low edge is the infrastructure drop"
-        );
         for port in [3000, 3999, 8080] {
             assert_eq!(
-                verdict(node, 6, port, &exposed),
-                Ok(GateAdmit::Baseline),
-                "the node plane reaches the host alias at exposed port {port}"
+                alias_verdict(&table, &exposed, LEASE, false, 6, port),
+                Ok(GateAdmit::Row),
+                "an allow-all box reaches the alias at exposed port {port}"
+            );
+        }
+        assert_eq!(
+            alias_verdict(&table, &exposed, LEASE, false, 17, 8080),
+            Ok(GateAdmit::Row)
+        );
+        for port in [2999, 3500, 4000, 22, 53, 443, switch::bep_host::PROXY_PORT] {
+            assert!(
+                refused(alias_verdict(&table, &exposed, LEASE, false, 6, port), port),
+                "the alias at unexposed port {port} is the host-alias drop for a box"
             );
         }
         assert!(
-            refused(verdict(node, 6, 18081, &exposed)),
-            "the node plane's frame to the host alias outside the exposures is the infrastructure drop"
+            refused(
+                alias_verdict(&table, &exposed, LEASE, false, 17, 3000),
+                3000
+            ),
+            "a TCP entry does not open its port for UDP"
+        );
+        // Minimal's own listeners are refused ahead of the exposures, the
+        // hostname proxy at the port the node row holds (NET-162).
+        for (port, holder) in [
+            (7654, "the hostname proxy"),
+            (crate::net::answerer::DEFAULT_ANSWERER_PORT, "the answerer"),
+            (switch::bep_host::PROXY_PORT, "the Box Egress Proxy"),
+        ] {
+            let at_listener = NodePlaneBaseline::built_in(SUBNET)
+                .with_host_exposure(vec![crate::net::host_exposures::HostExposure::tcp(port)]);
+            assert!(
+                refused(
+                    alias_verdict(&table, &at_listener, LEASE, false, 6, port),
+                    port
+                ),
+                "an exposure at {holder}'s port {port} never opens it to a box"
+            );
+        }
+        assert!(
+            refused(alias_verdict(&table, &exposed, LEASE, false, 1, 0), 0),
+            "ICMP carries no port and opens nothing"
+        );
+        assert!(
+            refused(
+                alias_verdict(
+                    &table,
+                    &NodePlaneBaseline::built_in(SUBNET),
+                    LEASE,
+                    false,
+                    6,
+                    8080
+                ),
+                8080
+            ),
+            "with no exposure the alias is closed to a box at every port"
+        );
+        assert!(
+            matches!(
+                alias_verdict(&table, &exposed, locked, false, 6, 8080),
+                Err(GateDrop::Verdict(_))
+            ),
+            "a deny-all box's own rules refuse the exposure"
+        );
+        assert!(
+            matches!(
+                alias_verdict(
+                    &table,
+                    &exposed,
+                    laned,
+                    false,
+                    6,
+                    switch::bep_host::PROXY_PORT
+                ),
+                Err(GateDrop::HostAlias {
+                    row: AliasRow::Box,
+                    ..
+                })
+            ),
+            "a lane opens the proxy's own address, not the alias"
+        );
+        let proxy = SUBNET.box_egress_proxy_address().octets();
+        let to_proxy = ipv4_frame(laned, 6, proxy, switch::bep_host::PROXY_PORT);
+        let resolver = ipv4_frame(LEASE, 17, SUBNET.dns_server().octets(), 53);
+        let pins = dns_pins::DnsPins::new(SUBNET);
+        for (frame, what) in [(to_proxy, "the lane's proxy"), (resolver, "the resolver")] {
+            let summary = boxes::core::egress::summarize(&frame);
+            assert!(
+                gate_verdict(&summary, None, &table, &exposed, &pins, &ReplyTables::new()).is_ok(),
+                "{what} stays open at its own address"
+            );
+        }
+    }
+
+    /// The node-plane identity alone reaches the host alias at the ports
+    /// the baseline set's own endpoints open there (NET-156). A box row and
+    /// the host-address cohort, marked frames at the node address, never
+    /// get that set, and each drop names its row. With no endpoint at the
+    /// alias the node is closed there too.
+    #[test]
+    fn host_alias_admits_baseline_for_node_plane_only() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        registry.register(
+            BoxRegistration::new("bare", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080]),
+        );
+        assert!(registry.admit_host_ip_box(boxes::SessionId::mint(), None));
+        let table = registry.table();
+        let node = SUBNET.daemon_ip().octets();
+        let alias = Ipv4Addr::from(SUBNET.host_alias().octets());
+        let built_in = NodePlaneBaseline::built_in(SUBNET);
+        assert_eq!(built_in.phase(), NodeBaselinePhase::InForce);
+        let at_alias = built_in.clone().with_cache(vec![format!("{alias}/32")]);
+
+        assert_eq!(
+            alias_verdict(&table, &built_in, node, false, 6, 443),
+            Err(GateDrop::HostAlias {
+                src: node,
+                dst_port: 443,
+                row: AliasRow::Node,
+            }),
+            "with no endpoint at the alias the node is closed there"
         );
         assert_eq!(
-            verdict(node, 17, 8080, &exposed),
+            alias_verdict(&table, &at_alias, node, false, 6, 443),
             Ok(GateAdmit::Baseline),
-            "a UDP frame reaches the host alias at an exposed port"
+            "the node reaches its baseline endpoint at the alias"
         );
-        assert!(
-            refused(verdict(LEASE, 6, 8080, &exposed)),
-            "a box row's frame to the host alias is the infrastructure drop at an exposed port"
+        for (proto, port) in [(17, 443), (6, 80), (1, 0)] {
+            assert!(
+                matches!(
+                    alias_verdict(&table, &at_alias, node, false, proto, port),
+                    Err(GateDrop::HostAlias {
+                        row: AliasRow::Node,
+                        ..
+                    })
+                ),
+                "the baseline set opens TCP 443 alone, not protocol {proto} port {port}"
+            );
+        }
+        assert_eq!(
+            alias_verdict(&table, &at_alias, node, true, 6, 443),
+            Err(GateDrop::HostAlias {
+                src: node,
+                dst_port: 443,
+                row: AliasRow::Cohort,
+            }),
+            "the host-address cohort never gets the baseline set"
         );
-
-        let every_port = built_in.with_host_exposure(vec![(0, u16::MAX)]);
-        assert!(
-            refused(verdict(node, 1, 0, &every_port)),
-            "an ICMP frame carries no port and never matches an exposure"
+        assert_eq!(
+            alias_verdict(&table, &at_alias, LEASE, false, 6, 443),
+            Err(GateDrop::HostAlias {
+                src: LEASE,
+                dst_port: 443,
+                row: AliasRow::Box,
+            }),
+            "a box row never gets the baseline set"
+        );
+        let exposed = at_alias.with_host_exposure(vec![
+            crate::net::host_exposures::HostExposure::tcp(8080),
+            crate::net::host_exposures::HostExposure::tcp(443),
+        ]);
+        for marked in [false, true] {
+            assert!(
+                alias_verdict(&table, &exposed, node, marked, 6, 8080).is_ok(),
+                "a host exposure is open to the node and to the cohort"
+            );
+        }
+        assert_eq!(
+            alias_verdict(&table, &exposed, node, false, 6, 443),
+            Ok(GateAdmit::Baseline),
+            "the node keeps its baseline port"
+        );
+        for (src, marked, row) in [
+            (node, true, AliasRow::Cohort),
+            (LEASE, false, AliasRow::Box),
+        ] {
+            assert_eq!(
+                alias_verdict(&table, &exposed, src, marked, 6, 443),
+                Err(GateDrop::HostAlias {
+                    src,
+                    dst_port: 443,
+                    row,
+                }),
+                "an entry at a baseline port never opens it to the {row:?} row"
+            );
+        }
+        // A UDP entry at the baseline's TCP port is not a baseline fetch,
+        // so the table decides it like any other port.
+        let udp_exposed =
+            exposed.with_host_exposure(vec![crate::net::host_exposures::HostExposure::udp(443)]);
+        for marked in [false, true] {
+            assert!(
+                alias_verdict(&table, &udp_exposed, node, marked, 17, 443).is_ok(),
+                "a UDP exposure at a baseline TCP port is open to the node and the cohort"
+            );
+        }
+        assert_eq!(
+            GateDrop::HostAlias {
+                src: node,
+                dst_port: 0,
+                row: AliasRow::Node
+            }
+            .rule(),
+            "host-alias"
         );
     }
 
-    /// The in-force arm opens the host alias at the configured host
-    /// exposures and nowhere else: the registry and the cache are named
-    /// endpoints now, so no fetch port is held open on the alias, and with
-    /// no exposure TCP at 443 is the infrastructure drop. With 443 exposed,
-    /// TCP and UDP pass, and a frame with no transport port — ICMP, or GRE
-    /// whose bytes read as 443 — never matches the exposure.
+    /// An entry added to the `[host-exposures]` table of the client
+    /// `config.toml` opens its port at the alias for the next flow, with no
+    /// restart (NET-161).
     #[test]
-    fn in_force_baseline_opens_the_alias_at_the_host_exposures_alone() {
+    fn host_alias_admits_a_port_the_current_table_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, "[secrets]\n").unwrap();
         let registry = BoxRegistry::new(SUBNET);
-        registry.register_node_namespace(7654);
-        let table = registry.table();
-        let built_in = NodePlaneBaseline::built_in(SUBNET);
-        let pins = dns_pins::DnsPins::new(SUBNET);
-        let node = built_in.node_addr();
-        let alias = SUBNET.host_alias().octets();
-        let decide = |proto: u8, baseline: &NodePlaneBaseline| {
-            let summary = boxes::core::egress::summarize(&ipv4_frame(node, proto, alias, 443));
-            gate_verdict(&summary, None, &table, baseline, &pins, &ReplyTables::new())
-        };
-        let refused = |result: Result<GateAdmit, GateDrop>| matches!(result, Err(GateDrop::Infrastructure { dst, dst_port: 443, .. }) if dst == alias);
-
-        assert!(
-            refused(decide(6, &built_in)),
-            "with no exposure, TCP at 443 on the alias is the infrastructure drop"
+        registry.register(
+            BoxRegistration::new("bare", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080]),
         );
-        let exposed = built_in.clone().with_host_exposure(vec![(443, 443)]);
-        assert_eq!(decide(6, &exposed), Ok(GateAdmit::Baseline));
-        assert_eq!(decide(17, &exposed), Ok(GateAdmit::Baseline));
-        for (proto, name) in [(1u8, "ICMP"), (47, "GRE")] {
-            assert!(
-                refused(decide(proto, &exposed)),
-                "{name} to alias:443 is the infrastructure drop, in force"
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET).with_host_exposures(
+            crate::net::host_exposures::HostExposures::at(config.clone(), Duration::ZERO),
+        );
+        assert!(
+            matches!(
+                alias_verdict(&table, &baseline, LEASE, false, 6, 5173),
+                Err(GateDrop::HostAlias { .. })
+            ),
+            "no entry, no opening"
+        );
+        std::fs::write(
+            &config,
+            "[secrets]\n\n[host-exposures]\nvite = { proto = \"tcp\", port = 5173 }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            alias_verdict(&table, &baseline, LEASE, false, 6, 5173),
+            Ok(GateAdmit::Row),
+            "the added entry opens its port"
+        );
+        assert!(
+            matches!(
+                alias_verdict(&table, &baseline, LEASE, false, 6, 5174),
+                Err(GateDrop::HostAlias { .. })
+            ),
+            "the entry opens its own port alone"
+        );
+    }
+
+    /// An entry removed from the `[host-exposures]` table ends each
+    /// established flow to its port (NET-161). The gate keeps no per-flow
+    /// state for the alias: it decides every frame of a flow, the frames of
+    /// a flow already running included, by the table as it is at that
+    /// frame. So the next frame of a flow that ran through the removed
+    /// exposure is the `host-alias` drop, and the flow carries nothing more.
+    #[test]
+    fn host_exposure_removal_ends_established_flows() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "[host-exposures]\ndev = { port = 8080 }\nvite = { proto = \"tcp\", port = 3500 }\n",
+        )
+        .unwrap();
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(
+            BoxRegistration::new("bare", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080]),
+        );
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET).with_host_exposures(
+            crate::net::host_exposures::HostExposures::at(config.clone(), Duration::ZERO),
+        );
+        // The flow's frames: one 5-tuple, the box's port 40000 to the alias.
+        for _ in 0..3 {
+            assert_eq!(
+                alias_verdict(&table, &baseline, LEASE, false, 6, 8080),
+                Ok(GateAdmit::Row),
+                "the established flow runs while the entry stands"
             );
         }
+        assert_eq!(
+            alias_verdict(&table, &baseline, LEASE, false, 6, 3500),
+            Ok(GateAdmit::Row)
+        );
+        std::fs::write(
+            &config,
+            "[host-exposures]\nvite = { proto = \"tcp\", port = 3500 }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            alias_verdict(&table, &baseline, LEASE, false, 6, 8080),
+            Err(GateDrop::HostAlias {
+                src: LEASE,
+                dst_port: 8080,
+                row: AliasRow::Box,
+            }),
+            "the next frame of the established flow is refused"
+        );
+        assert_eq!(
+            alias_verdict(&table, &baseline, LEASE, false, 6, 3500),
+            Ok(GateAdmit::Row),
+            "the entry that stays keeps its flows"
+        );
+        std::fs::remove_file(&config).unwrap();
+        assert!(
+            matches!(
+                alias_verdict(&table, &baseline, LEASE, false, 6, 3500),
+                Err(GateDrop::HostAlias { .. })
+            ),
+            "a removed file ends the flows of every entry"
+        );
+    }
+
+    /// A box reaches a host exposure only when it names the host: by
+    /// `host.min.internal` in `egress.allow_dns_hosts`, or by an
+    /// `allow_subnets` that covers the alias (NET-160). A box that does
+    /// neither is the `host-alias` drop at the exposure. Naming the host
+    /// opens the exposures alone, never another port at the alias.
+    #[test]
+    fn host_alias_exposure_needs_the_box_to_name_the_host() {
+        let alias = SUBNET.host_alias().octets();
+        let policy = |subnets: Vec<String>, hosts: Vec<&str>| EgressPolicy {
+            allow_protocols: None,
+            allow_subnets: Some(subnets),
+            allow_dns_hosts: Some(hosts.into_iter().map(str::to_string).collect()),
+            deny_subnets: None,
+        };
+        let registry = BoxRegistry::new(SUBNET);
+        let unnamed = LEASE;
+        let named = [100, 64, 0, 11];
+        let covered = [100, 64, 0, 12];
+        let dotted = [100, 64, 0, 13];
+        for (name, addr, egress) in [
+            (
+                "unnamed",
+                unnamed,
+                policy(vec!["10.0.0.0/8".into()], vec!["example.com"]),
+            ),
+            (
+                "named",
+                named,
+                policy(vec!["10.0.0.0/8".into()], vec!["host.min.internal"]),
+            ),
+            (
+                "covered",
+                covered,
+                policy(vec![format!("{}/32", Ipv4Addr::from(alias))], vec![]),
+            ),
+            ("dotted", dotted, policy(vec![], vec!["HOST.min.internal."])),
+        ] {
+            registry.register(
+                BoxRegistration::new(name, Ipv4Addr::from(addr), Ipv4Addr::LOCALHOST)
+                    .with_egress_policy(egress),
+            );
+        }
+        // A box with no egress section is allow-all: its undeclared
+        // `allow_subnets` covers the alias, as it covers a sibling box.
+        let undeclared = [100, 64, 0, 14];
+        registry.register(BoxRegistration::new(
+            "undeclared",
+            Ipv4Addr::from(undeclared),
+            Ipv4Addr::LOCALHOST,
+        ));
+        let table = registry.table();
+        let exposed = NodePlaneBaseline::built_in(SUBNET)
+            .with_host_exposure(vec![crate::net::host_exposures::HostExposure::tcp(5432)]);
+
+        assert_eq!(
+            alias_verdict(&table, &exposed, unnamed, false, 6, 5432),
+            Err(GateDrop::HostAlias {
+                src: unnamed,
+                dst_port: 5432,
+                row: AliasRow::Box,
+            }),
+            "a box that does not name the host never reaches the exposure"
+        );
+        assert_eq!(
+            alias_verdict(&table, &exposed, undeclared, false, 6, 5432),
+            Ok(GateAdmit::Row),
+            "a box with no egress section reaches the exposure as it reaches a sibling"
+        );
+        for (src, what) in [
+            (named, "by name"),
+            (covered, "by a subnet that covers the alias"),
+            (dotted, "by the name in any case, with a trailing dot"),
+        ] {
+            assert_eq!(
+                alias_verdict(&table, &exposed, src, false, 6, 5432),
+                Ok(GateAdmit::Row),
+                "a box that names the host {what} reaches the exposure"
+            );
+            assert!(
+                matches!(
+                    alias_verdict(&table, &exposed, src, false, 6, 5433),
+                    Err(GateDrop::HostAlias {
+                        row: AliasRow::Box,
+                        ..
+                    })
+                ),
+                "naming the host {what} opens no other port"
+            );
+        }
+        assert!(
+            matches!(
+                alias_verdict(
+                    &table,
+                    &NodePlaneBaseline::built_in(SUBNET),
+                    named,
+                    false,
+                    6,
+                    5432
+                ),
+                Err(GateDrop::HostAlias { .. })
+            ),
+            "naming the host opens nothing without the table's entry"
+        );
+    }
+
+    /// NET-163 on a VM host: a box whose `egress.allow_dns_hosts` names
+    /// another box's zone name reaches that box's lease, where its own
+    /// subnets name nothing. The gate decides the source's half alone, at
+    /// any port: the target's ingress decides the rest in the guest, at the
+    /// target's relay. A parallel instance `web-2` that the list does not
+    /// name is the `box-name` drop, unless `allow_subnets` covers its
+    /// lease. Deny rules still decide first, and a box that names no box
+    /// keeps the row's own drop. The drop line names the rule and both
+    /// boxes.
+    #[test]
+    fn zone_name_rule_admits_sibling_lease_under_its_ingress() {
+        let policy =
+            |subnets: Vec<String>, hosts: Vec<&str>, deny: Option<Vec<String>>| EgressPolicy {
+                allow_protocols: None,
+                allow_subnets: Some(subnets),
+                allow_dns_hosts: Some(hosts.into_iter().map(str::to_string).collect()),
+                deny_subnets: deny,
+            };
+        let app = LEASE;
+        let web = [100, 64, 0, 11];
+        let instance = [100, 64, 0, 12];
+        let covered = [100, 64, 0, 13];
+        let denied = [100, 64, 0, 14];
+        let plain = [100, 64, 0, 15];
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        for (name, addr, egress) in [
+            ("app", app, policy(vec![], vec!["Web.min.internal."], None)),
+            ("web", web, policy(vec![], vec![], None)),
+            ("web-2", instance, policy(vec![], vec![], None)),
+            (
+                "covered",
+                covered,
+                policy(
+                    vec![format!("{}/32", Ipv4Addr::from(instance))],
+                    vec!["web.min.internal"],
+                    None,
+                ),
+            ),
+            (
+                "denied",
+                denied,
+                policy(
+                    vec![],
+                    vec!["web.min.internal"],
+                    Some(vec![format!("{}/32", Ipv4Addr::from(web))]),
+                ),
+            ),
+            ("plain", plain, policy(vec![], vec!["example.com"], None)),
+        ] {
+            registry.register(
+                BoxRegistration::new(name, Ipv4Addr::from(addr), Ipv4Addr::LOCALHOST)
+                    .with_egress_policy(egress),
+            );
+        }
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        let decide = |src: [u8; 4], dst: [u8; 4], proto: u8, port: u16| {
+            gate_verdict(
+                &boxes::core::egress::summarize(&ipv4_frame(src, proto, dst, port)),
+                None,
+                &table,
+                &baseline,
+                &dns_pins::DnsPins::new(SUBNET),
+                &ReplyTables::new(),
+            )
+        };
+
+        for (proto, port) in [(6, 8080), (6, 9999), (17, 5353)] {
+            assert_eq!(
+                decide(app, web, proto, port),
+                Ok(GateAdmit::Row),
+                "the named box's lease is reached by the name, and its ingress decides \
+                 the port in the guest"
+            );
+        }
+        assert_eq!(
+            decide(app, instance, 6, 8080),
+            Err(GateDrop::BoxName {
+                src: app,
+                dst: instance,
+                dst_port: 8080,
+            }),
+            "a parallel instance the list does not name is refused"
+        );
+        assert_eq!(
+            decide(covered, instance, 6, 8080),
+            Ok(GateAdmit::Row),
+            "allow_subnets that covers the instance's lease still reaches it"
+        );
+        assert!(
+            matches!(decide(denied, web, 6, 8080), Err(GateDrop::Verdict(_))),
+            "deny_subnets decides ahead of the name"
+        );
+        assert!(
+            matches!(
+                decide(plain, web, 6, 8080),
+                Err(GateDrop::Verdict(DropReason::UndeclaredSubnet { .. }))
+            ),
+            "a box that names no box keeps the row's own drop"
+        );
+        assert_eq!(
+            GateDrop::BoxName {
+                src: app,
+                dst: instance,
+                dst_port: 8080
+            }
+            .rule(),
+            "box-name"
+        );
+
+        // The drop line names the rule, the source box and the target box.
+        let (log, _guard) = capture_log();
+        let limiter = DropLimiter::new();
+        assert!(limiter.warn_box_name(app, instance, 8080, Some("app"), Some("web-2")));
+        let logged = log.contents();
+        for expected in [
+            "source=100.64.0.9",
+            "destination=100.64.0.12",
+            "port=8080",
+            "box=\"app\"",
+            "target=\"web-2\"",
+            "rule_matched=\"box-name\"",
+        ] {
+            assert!(
+                logged.contains(expected),
+                "missing {expected:?} in: {logged}"
+            );
+        }
+    }
+
+    /// An entry of the `[host-exposures]` table at a port that one of
+    /// Minimal's own listeners holds is refused when the table loads, and
+    /// the daemon log names the entry and the listener (NET-162). The
+    /// listeners are the hostname proxy at the node row's port, here a
+    /// drawn one, the box-name answerer, the Box Egress Proxy, and a
+    /// node-plane baseline endpoint at the alias.
+    #[test]
+    fn host_exposure_on_minimal_listener_port_refused() {
+        let (log, _guard) = capture_log();
+        let drawn = 41234;
+        let answerer = crate::net::answerer::DEFAULT_ANSWERER_PORT;
+        let proxy = switch::bep_host::PROXY_PORT;
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[host-exposures]\n\
+                 web = {{ port = 5173 }}\n\
+                 hp = {{ port = {drawn} }}\n\
+                 ans = {{ proto = \"udp\", port = {answerer} }}\n\
+                 bep = {{ port = {proxy} }}\n\
+                 fetch = {{ port = 443 }}\n"
+            ),
+        )
+        .unwrap();
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(drawn);
+        registry.register(BoxRegistration::new(
+            "bare",
+            Ipv4Addr::from(LEASE),
+            Ipv4Addr::LOCALHOST,
+        ));
+        let table = registry.table();
+        let alias = Ipv4Addr::from(SUBNET.host_alias().octets());
+        let baseline = NodePlaneBaseline::built_in(SUBNET)
+            .with_cache(vec![format!("{alias}/32")])
+            .with_host_exposures(crate::net::host_exposures::HostExposures::at(
+                config,
+                Duration::ZERO,
+            ));
+
+        assert_eq!(
+            alias_verdict(&table, &baseline, LEASE, false, 6, 5173),
+            Ok(GateAdmit::Row),
+            "an entry at a free port opens"
+        );
+        for (proto, port) in [(6, drawn), (17, answerer), (6, proxy), (6, 443)] {
+            for _ in 0..2 {
+                assert_eq!(
+                    alias_verdict(&table, &baseline, LEASE, false, proto, port),
+                    Err(GateDrop::HostAlias {
+                        src: LEASE,
+                        dst_port: port,
+                        row: AliasRow::Box,
+                    }),
+                    "the entry at Minimal's port {port} is refused"
+                );
+            }
+        }
+        let logged = log.contents();
+        for (entry, holder) in [
+            ("hp", "the hostname proxy"),
+            ("ans", "the box-name answerer"),
+            ("bep", "the Box Egress Proxy"),
+            (
+                "fetch",
+                "a node-plane baseline endpoint at host.min.internal",
+            ),
+        ] {
+            let line = format!("entry={entry} ");
+            let lines: Vec<&str> = logged
+                .lines()
+                .filter(|line| line.contains("refused a host exposure"))
+                .filter(|l| l.contains(&line))
+                .collect();
+            assert_eq!(lines.len(), 1, "the load names {entry} once: {logged}");
+            assert!(
+                lines[0].contains(&format!("holder=\"{holder}\"")),
+                "the refusal of {entry} names {holder}: {logged}"
+            );
+        }
+        assert!(
+            !logged.contains("entry=web "),
+            "the open entry is not refused: {logged}"
+        );
+        assert_eq!(
+            alias_verdict(
+                &table,
+                &baseline,
+                SUBNET.daemon_ip().octets(),
+                false,
+                6,
+                443
+            ),
+            Ok(GateAdmit::Baseline),
+            "the node keeps its own baseline endpoint"
+        );
+    }
+
+    /// A listener of Minimal's own that binds the port of a standing entry
+    /// later shadows the entry: from the next flow on, a box is refused
+    /// there, and the daemon log records once which listener shadows which
+    /// entry (NET-162). Here the hostname proxy binds the entry's port.
+    #[test]
+    fn host_exposure_shadowed_by_a_later_minimal_listener() {
+        let (log, _guard) = capture_log();
+        let port = 41001;
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            format!("[host-exposures]\ndev = {{ port = {port} }}\n"),
+        )
+        .unwrap();
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(BoxRegistration::new(
+            "bare",
+            Ipv4Addr::from(LEASE),
+            Ipv4Addr::LOCALHOST,
+        ));
+        let baseline = NodePlaneBaseline::built_in(SUBNET).with_host_exposures(
+            crate::net::host_exposures::HostExposures::at(config, Duration::ZERO),
+        );
+        assert_eq!(
+            alias_verdict(&registry.table(), &baseline, LEASE, false, 6, port),
+            Ok(GateAdmit::Row),
+            "the entry opens while no listener holds its port"
+        );
+        registry.register_node_namespace(port);
+        let table = registry.table();
+        for _ in 0..3 {
+            assert_eq!(
+                alias_verdict(&table, &baseline, LEASE, false, 6, port),
+                Err(GateDrop::HostAlias {
+                    src: LEASE,
+                    dst_port: port,
+                    row: AliasRow::Box,
+                }),
+                "the listener shadows the entry from the next flow on"
+            );
+        }
+        let logged = log.contents();
+        let shadowed: Vec<&str> = logged
+            .lines()
+            .filter(|line| line.contains("now holds the port of a host exposure"))
+            .collect();
+        assert_eq!(shadowed.len(), 1, "the log records it once: {logged}");
+        assert!(
+            shadowed[0].contains("entry=dev ")
+                && shadowed[0].contains("holder=\"the hostname proxy\""),
+            "the record names the entry and the listener: {logged}"
+        );
+        assert!(
+            !logged.contains("refused a host exposure"),
+            "a shadowed entry is not a load refusal: {logged}"
+        );
     }
 
     /// NET-130, un-enrolled, at the gate: the node-plane baseline set comes

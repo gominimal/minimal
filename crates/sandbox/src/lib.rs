@@ -44,6 +44,15 @@ mod listener;
 pub trait Channel: Send {
     // Return true to close the connection.
     fn handle(&mut self, stream: &mut UnixStream, line: &str, rootfs: &Path);
+
+    /// Handles a request line that was not valid UTF-8. `line` is its lossy
+    /// decode, with each invalid byte replaced by U+FFFD, and `raw` is the
+    /// line as the box sent it, so a channel can tell which values held an
+    /// invalid byte. The default handles `line` as [`Channel::handle`] does.
+    fn handle_lossy(&mut self, stream: &mut UnixStream, line: &str, raw: &[u8], rootfs: &Path) {
+        let _ = raw;
+        self.handle(stream, line, rootfs);
+    }
 }
 
 impl Channel for () {
@@ -241,16 +250,21 @@ impl<C: Channel> Sandbox<C> {
         fs::create_dir_all(&rootfs)
             .map_err(|e| Error::IO("create rootfs dir", rootfs.clone(), e))?;
         let hardlinking_start = SystemTime::now();
+        let mut collisions = common::LinkCollisions::default();
         for i in config.rootfs.iter() {
             match i {
-                config::SandboxMapped::Dir(p) => hardlink_dir_contents(p, &rootfs)?,
-                config::SandboxMapped::TempDir(td) => hardlink_dir_contents(td.path(), &rootfs)?,
+                config::SandboxMapped::Dir(p) => {
+                    hardlink_dir_contents_counted(p, &rootfs, &mut collisions)?;
+                }
+                config::SandboxMapped::TempDir(td) => {
+                    hardlink_dir_contents_counted(td.path(), &rootfs, &mut collisions)?;
+                }
                 config::SandboxMapped::File(p) | config::SandboxMapped::FileCopy(p) => {
                     return Err(Error::MappedFile(p.clone()));
                 }
             }
         }
-        hardlink_dir_contents(&base_dir.join("synth"), &rootfs)?;
+        hardlink_dir_contents_counted(&base_dir.join("synth"), &rootfs, &mut collisions)?;
 
         // MINIMAL_INTERNAL_CS_BUILD bundle: when the env var is "1"
         // AND the convention path exists on host, hardlink that
@@ -272,9 +286,10 @@ impl<C: Channel> Sandbox<C> {
         if std::env::var("MINIMAL_INTERNAL_CS_BUILD").as_deref() == Ok("1") {
             let cs_mirror = Path::new("/root/.cache/minimal/cs-mirror");
             if cs_mirror.exists() {
-                hardlink_dir_contents(cs_mirror, &rootfs)?;
+                hardlink_dir_contents_counted(cs_mirror, &rootfs, &mut collisions)?;
             }
         }
+        log_rootfs_collisions(&collisions);
         tracing::trace!("rootfs hardlinking took {:?}", hardlinking_start.elapsed());
 
         // On aarch64, autotools/libtool defaults to installing libraries
@@ -303,11 +318,7 @@ impl<C: Channel> Sandbox<C> {
                                 Ok(()) => Ok(()),
                                 Err(e) => {
                                     if e.kind() == std::io::ErrorKind::AlreadyExists {
-                                        tracing::warn!(
-                                            "Not linking {} => {}, already exists",
-                                            p.display(),
-                                            dest.display()
-                                        );
+                                        log_input_collision("linking", p, dest);
                                         Ok(())
                                     } else {
                                         Err(e)
@@ -321,11 +332,7 @@ impl<C: Channel> Sandbox<C> {
                             if !copy_input_file(p, &dest)
                                 .map_err(|e| Error::IO("copying input file", dest.clone(), e))?
                             {
-                                tracing::warn!(
-                                    "Not copying {} => {}, already exists",
-                                    p.display(),
-                                    dest.display()
-                                );
+                                log_input_collision("copying", p, &dest);
                             }
                         }
                         config::SandboxMapped::Dir(p) => hardlink_dir_contents(p, &b)?,
@@ -479,6 +486,10 @@ pub struct Container {
     /// its program, as the box spells it (`/run/<START_GATE_NAME>-<n>`). Set by
     /// [`Sandbox::hold_start`]; `None` runs the program at once.
     start_gate: Option<PathBuf>,
+    /// Whether a command from this container calls `setsid(2)` in its
+    /// pre-exec closure, without taking a controlling terminal. Set by
+    /// [`Container::set_session_leader_without_terminal`].
+    new_session: bool,
 }
 
 /// The prefix of a start gate's FIFO name in the box's `/run`; each gate adds
@@ -526,6 +537,15 @@ impl Container {
         self.container.runctl(hakoniwa::Runctl::NewSession);
     }
 
+    /// Makes each command from this container the leader of a new session
+    /// and process group, as [`Self::set_session_leader`] does, without a
+    /// controlling terminal. For a program whose stdin is not a terminal:
+    /// hakoniwa's own session step fails there, on `TIOCSCTTY`, before the
+    /// program runs.
+    pub fn set_session_leader_without_terminal(&mut self) {
+        self.new_session = true;
+    }
+
     fn command_inner<C, I, IE, ArgS, EnvK, EnvV>(
         &self,
         sandbox: &Sandbox<C>,
@@ -571,6 +591,7 @@ impl Container {
             sandbox.config.classifier_leaf.clone(),
             sandbox.config.force_cover_fallback,
             self.start_gate.clone(),
+            self.new_session,
         )?;
 
         Ok(command)
@@ -1246,6 +1267,10 @@ pub mod classifier {
 /// returned command afterwards (`SHELL`, `PS1`, stdio) lands on the closure
 /// command and reaches the program the same way.
 #[cfg(target_os = "linux")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one call site, which hands over each fact the closure captures"
+)]
 fn install_box_credentials(
     container: &hakoniwa::Container,
     command: &mut hakoniwa::Command,
@@ -1254,6 +1279,7 @@ fn install_box_credentials(
     classifier_leaf: Option<config::ClassifierLeaf>,
     force_cover_fallback: bool,
     start_gate: Option<PathBuf>,
+    new_session: bool,
 ) -> Result<(), Error> {
     let program = command.get_program().to_string();
     let args = command.get_args();
@@ -1303,6 +1329,7 @@ fn install_box_credentials(
                 force_cover_fallback,
                 closure_report.as_deref(),
                 start_gate.as_deref(),
+                new_session,
             )
         })
     };
@@ -1485,7 +1512,20 @@ fn exec_box_program(
     force_cover_fallback: bool,
     closure_report: Option<&Path>,
     start_gate: Option<&Path>,
+    new_session: bool,
 ) -> ! {
+    // A new session and process group for the program, with no controlling
+    // terminal: the box's own processes then share neither with the daemon,
+    // and none of them can open the daemon's terminal as `/dev/tty`.
+    // SAFETY: `setsid(2)` takes no arguments and is async-signal-safe. It
+    // fails only for a process group leader, which this forked child is not.
+    if new_session && unsafe { libc::setsid() } == -1 {
+        exit_child(
+            "starting the box's own session",
+            &std::io::Error::last_os_error(),
+            closure_report,
+        );
+    }
     // Cap the box's PTY count before the credentials drop: PTYs are a
     // machine-wide pool, and the box's devpts instance was mounted without a
     // per-instance `max=`, so it draws from the one kernel-wide counter and a
@@ -2350,6 +2390,7 @@ impl<C: Channel> Sandbox<C> {
             socket_family_filter,
             fresh_netns: isolate,
             start_gate: None,
+            new_session: false,
         })
     }
 
@@ -2770,6 +2811,56 @@ fn copy_input_file(src: &Path, dest: &Path) -> std::io::Result<bool> {
 
 fn hardlink_dir_contents(src_dir: &Path, dst_parent_dir: &Path) -> Result<(), Error> {
     common::hardlink_dir_contents(src_dir, dst_parent_dir).map_err(Error::HardlinkFailed)
+}
+
+fn hardlink_dir_contents_counted(
+    src_dir: &Path,
+    dst_parent_dir: &Path,
+    counts: &mut common::LinkCollisions,
+) -> Result<(), Error> {
+    common::hardlink_dir_contents_counted(src_dir, dst_parent_dir, counts)
+        .map_err(Error::HardlinkFailed)
+}
+
+/// One line for the paths that more than one rootfs layer shipped. It is
+/// INFO only when some of them differ (each of those also has its own
+/// WARN); an overlap where every path matches is the usual case, at debug.
+fn log_rootfs_collisions(c: &common::LinkCollisions) {
+    if c.differ > 0 {
+        tracing::info!(
+            same = c.same,
+            unchecked = c.unchecked,
+            differ = c.differ,
+            "rootfs: paths shipped by more than one layer; the first-linked file stays"
+        );
+    } else if c.total() > 0 {
+        tracing::debug!(
+            same = c.same,
+            unchecked = c.unchecked,
+            differ = c.differ,
+            "rootfs: paths shipped by more than one layer; the first-linked file stays"
+        );
+    }
+}
+
+/// Logs a working input that was not placed at `dest` because something is
+/// already there, by the rootfs rule: debug when the two match or are too
+/// large to compare, a WARN when they differ. `verb` is "linking" or
+/// "copying".
+fn log_input_collision(verb: &str, src: &Path, dest: &Path) {
+    match common::link_collision(src, dest) {
+        common::LinkCollision::Differs(why) => tracing::warn!(
+            "Not {verb} {} => {}, already exists ({why}; the first one stays)",
+            src.display(),
+            dest.display()
+        ),
+        same_or_unchecked => tracing::debug!(
+            "Not {verb} {} => {}, already exists ({})",
+            src.display(),
+            dest.display(),
+            same_or_unchecked.note()
+        ),
+    }
 }
 
 /// Returns the kernel-locked mount flags for the mount containing `path`.

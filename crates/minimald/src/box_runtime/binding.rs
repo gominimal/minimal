@@ -414,6 +414,21 @@ pub(super) struct Binding {
     box_dir: Option<boxes::store::BoxDir>,
 }
 
+/// How many inbound channel messages a binding holds for the host before it
+/// stops reading its channel (see `to_host` in [`Binding::run`]); a client
+/// cannot type that many packets while the host is not taking input unless
+/// it is flooding, and a flooding client is bounded by its ssh window as
+/// before.
+const DRAIN_STASH: usize = 256;
+
+/// A binding's wait for a slot in the host's stdin queue (see `to_host` in
+/// [`Binding::run`]).
+type SlotWait = std::pin::Pin<
+    Box<
+        dyn Future<Output = Result<mpsc::OwnedPermit<StdinMsg>, mpsc::error::SendError<()>>> + Send,
+    >,
+>;
+
 /// What the host keeps of an attached binding: its mailbox, its task, and
 /// the token that sheds it.
 pub(super) type BindingSlot = (mpsc::Sender<BindingMsg>, JoinHandle<()>, CancellationToken);
@@ -519,21 +534,71 @@ impl Binding {
         (tx, crate::traced::spawn_detached(span, binding.run()), shed)
     }
 
-    /// Hands `kind` to the host, giving up if the binding is shed first.
-    ///
-    /// The host's stdin queue fills when the shell stops reading its input,
-    /// and a binding parked here would never see the shed. Takes the fields
-    /// it needs rather than `&self`, because [`Self::run`] has moved the
-    /// channel out of `self` by the time it sends.
-    async fn send_to_host(
-        stdin_tx: &mpsc::Sender<StdinMsg>,
+    /// What `to_host` still holds when the client is lost, handed to the
+    /// host's stdin queue in order, each entry once a slot is reserved for
+    /// it, within one second in all. A client that sends and then closes at
+    /// once (a paste piped in, then EOF) has its last chunk queued here while
+    /// `select!` picks the close as readily as the slot; dropped with the
+    /// loop, that chunk went missing about half the time. The host is still
+    /// reading (only the client is gone), so the wait is short; the bound is
+    /// for a host that is not, and what it cuts off is what was lost before.
+    async fn drain_queued_stdin(
+        tx: &mpsc::Sender<StdinMsg>,
         generation: u64,
-        shed: &CancellationToken,
-        kind: StdinMsgKind,
-    ) -> Result<(), ()> {
-        tokio::select! {
-            _ = stdin_tx.send(StdinMsg::new(generation, kind)) => Ok(()),
-            () = shed.cancelled() => Err(()),
+        to_host: &mut VecDeque<StdinMsgKind>,
+    ) {
+        let drain = async {
+            while !to_host.is_empty() {
+                let Ok(permit) = tx.reserve().await else {
+                    break;
+                };
+                let Some(kind) = to_host.pop_front() else {
+                    break;
+                };
+                permit.send(StdinMsg::new(generation, kind));
+            }
+        };
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), drain).await;
+    }
+
+    /// What a channel message means to the host's stdin, if anything:
+    /// keystrokes, a pty request, a resize. Window adjusts (one per burst of
+    /// bytes forwarded, v. noisy) and duplicates of pre-attach requests the
+    /// connection handler already answered (russh buffers them into the
+    /// taken channel) mean nothing here.
+    fn stdin_kind(msg: russh::ChannelMsg) -> Option<StdinMsgKind> {
+        match msg {
+            russh::ChannelMsg::Data { data } => Some(StdinMsgKind::Bytes(data)),
+            russh::ChannelMsg::RequestPty {
+                want_reply: _,
+                term,
+                col_width,
+                row_height,
+                pix_width,
+                pix_height,
+                terminal_modes,
+            } => Some(StdinMsgKind::TerminalUpdate(RequestedPty {
+                char_sizes: (col_width, row_height),
+                pixel_sizes: (pix_width, pix_height),
+                term: term.to_string(),
+                modes: terminal_modes.to_vec(),
+            })),
+            russh::ChannelMsg::WindowChange {
+                col_width,
+                row_height,
+                pix_width,
+                pix_height,
+            } => Some(StdinMsgKind::WindowChange {
+                col_width,
+                row_height,
+                pix_width,
+                pix_height,
+            }),
+            russh::ChannelMsg::WindowAdjusted { .. } => None,
+            _ => {
+                tracing::debug!("ignoring channel request on attached binding: {:?}", msg);
+                None
+            }
         }
     }
 
@@ -546,7 +611,29 @@ impl Binding {
         // (NET-045), stashed by the select arm below because a dialog needs
         // the channel halves the select's own futures are borrowing.
         let mut pending_asks: VecDeque<(u16, oneshot::Sender<AskAnswer>)> = VecDeque::new();
+        // Input on its way to the host. The binding never awaits the host's
+        // stdin queue outside a select that is also draining its own mailbox:
+        // the host takes input only while the pty accepts it, the pty accepts
+        // it only while the shell reads, a shell blocked on output reads
+        // nothing, and the host reads the shell's output only while this
+        // mailbox has room. A binding parked on `stdin_tx.send` with a full
+        // mailbox closes that loop, and only the shed would open it.
+        let mut to_host: VecDeque<StdinMsgKind> = VecDeque::new();
+        // The wait for a host stdin slot, kept across turns of the loop: a
+        // future made fresh each turn would be dropped whenever another arm
+        // fires first, losing its place in the queue's line, and under a
+        // flood of output the mailbox arm fires every turn, so the input
+        // behind it would never reach the host.
+        let mut slot: Option<SlotWait> = None;
+        // Set once the host has dropped its stdin receiver. Input stops
+        // there, but the mailbox is still drained to its end: the host
+        // queues its teardown (the shell-exit prompt among them) before the
+        // receiver goes, and the client is owed it.
+        let mut input_closed = false;
         let exit_reason = loop {
+            if slot.is_none() && !to_host.is_empty() && !input_closed {
+                slot = Some(Box::pin(self.stdin_tx.clone().reserve_owned()));
+            }
             if let Some((port, reply)) = pending_asks.pop_front() {
                 tracing::info!(
                     port,
@@ -720,67 +807,39 @@ impl Binding {
                 // a message that is already spent.
                 continue;
             }
+            let mut slot_used = false;
             tokio::select! {
                 // Remote (ssh channel) => session stdin.
                 // An EOF from the client ends its input only. The loop
-                // reads on, to forward stdout and to see the close.
-                res = rs.wait() => match res {
+                // reads on, to forward stdout and to see the close. Past
+                // `DRAIN_STASH` queued entries the channel is left unread,
+                // so a flooding client is bounded by its window as before.
+                res = rs.wait(), if to_host.len() < DRAIN_STASH => match res {
                     // The client closed its channel, or its connection
                     // dropped: nothing reads this terminal any more. russh
                     // forwards a close as `Close` and then ends the stream.
                     // BOX-015: only this binding ends. The box keeps
                     // running, and its entrypoint's return or a stop ends it.
                     None | Some(russh::ChannelMsg::Close) => break MainloopExitReason::ClientLost,
-                    Some(msg) => {
-                        match msg {
-                            russh::ChannelMsg::Data{ data } => {
-                                if Self::send_to_host(&self.stdin_tx, self.generation, &self.shed, StdinMsgKind::Bytes(data)).await.is_err() {
-                                    break MainloopExitReason::Shed;
-                                }
-                            }
-                            russh::ChannelMsg::RequestPty {
-                                want_reply: _,
-                                term,
-                                col_width,
-                                row_height,
-                                pix_width,
-                                pix_height,
-                                terminal_modes,
-                            } => {
-                                let update = StdinMsgKind::TerminalUpdate(RequestedPty {
-                                    char_sizes: (col_width, row_height),
-                                    pixel_sizes: (pix_width, pix_height),
-                                    term: term.to_string(),
-                                    modes: terminal_modes.to_vec(),
-                                });
-                                if Self::send_to_host(&self.stdin_tx, self.generation, &self.shed, update).await.is_err() {
-                                    break MainloopExitReason::Shed;
-                                }
-                            },
-                            russh::ChannelMsg::WindowChange{
-                                col_width,
-                                row_height,
-                                pix_width,
-                                pix_height,
-                            } => {
-                                let change = StdinMsgKind::WindowChange {
-                                    col_width, row_height, pix_width, pix_height,
-                                };
-                                if Self::send_to_host(&self.stdin_tx, self.generation, &self.shed, change).await.is_err() {
-                                    break MainloopExitReason::Shed;
-                                }
-                            },
-                            // Flow-control window updates fire on every
-                            // burst of bytes forwarded through the
-                            // channel, v. noisy.
-                            russh::ChannelMsg::WindowAdjusted { .. } => {}
-                            // Duplicates of pre-attach requests the
-                            // connection handler already answered (russh
-                            // buffers them into the taken channel); noise on
-                            // every healthy attach, so keep them out of
-                            // info-level field bundles.
-                            _ => tracing::debug!("ignoring channel request on attached binding: {:?}", msg),
-                        };
+                    // Past the host's EOF nothing drains `to_host`: what
+                    // arrives is read and dropped, so the queue cannot fill
+                    // to `DRAIN_STASH` and stop this arm from reading, which
+                    // would let a teardown write starve again (#2197).
+                    Some(msg) => if !input_closed && let Some(kind) = Self::stdin_kind(msg) {
+                        to_host.push_back(kind);
+                    },
+                },
+                // Input reaches the host as slots open; the select picks
+                // among ready arms fairly, so this arm never starves the
+                // output arm below, and the output arm never starves it.
+                permit = async { slot.as_mut().expect("guarded").await }, if slot.is_some() => {
+                    slot_used = true;
+                    match permit {
+                        Ok(permit) => { permit.send(StdinMsg::new(self.generation, to_host.pop_front().expect("a slot is waited for only with input queued"))); }
+                        Err(_) => {
+                            input_closed = true;
+                            to_host.clear();
+                        }
                     }
                 },
                 () = self.shed.cancelled() => break MainloopExitReason::Shed,
@@ -793,17 +852,57 @@ impl Binding {
                         BindingMsg::Stdin(b) => {
                             // Raced against the shed: this is where a client
                             // that stopped draining parks the binding.
-                            let delivered = tokio::select! {
-                                _ = w.write_all(&b) => true,
-                                () = self.shed.cancelled() => false,
+                            //
+                            // The read half is drained meanwhile. A long
+                            // write (an attach redraw runs to megabytes)
+                            // otherwise leaves the channel's inbound queue
+                            // unread; russh's session loop blocks on that
+                            // queue when the client types, and a blocked loop
+                            // applies no more window adjusts, so the write
+                            // starves on credit the client already granted:
+                            // the duplex deadlock of #2197, on the attach
+                            // path. What arrives joins `to_host` and reaches
+                            // the host as its stdin queue takes it, in order;
+                            // past `DRAIN_STASH` entries the read half is
+                            // left alone again, so a client that floods
+                            // input while refusing output is bounded by its
+                            // window as before.
+                            let mut write = std::pin::pin!(w.write_all(&b));
+                            let ended = loop {
+                                tokio::select! {
+                                    _ = &mut write => break None,
+                                    () = self.shed.cancelled() => break Some(MainloopExitReason::Shed),
+                                    res = rs.wait(), if to_host.len() < DRAIN_STASH => match res {
+                                        // The client left mid-write: nothing
+                                        // reads the rest (BOX-015, as above).
+                                        None | Some(russh::ChannelMsg::Close) => break Some(MainloopExitReason::ClientLost),
+                                        // Dropped past the host's EOF, as above.
+                                        Some(msg) => if !input_closed && let Some(kind) = Self::stdin_kind(msg) {
+                                            to_host.push_back(kind);
+                                        },
+                                    },
+                                    permit = async { slot.as_mut().expect("guarded").await }, if slot.is_some() => {
+                                        slot = None;
+                                        match permit {
+                                            Ok(permit) => { permit.send(StdinMsg::new(self.generation, to_host.pop_front().expect("a slot is waited for only with input queued"))); }
+                                            Err(_) => {
+                                                input_closed = true;
+                                                to_host.clear();
+                                            }
+                                        }
+                                    },
+                                }
+                                if slot.is_none() && !to_host.is_empty() && !input_closed {
+                                    slot = Some(Box::pin(self.stdin_tx.clone().reserve_owned()));
+                                }
                             };
-                            if !delivered {
+                            if let Some(reason) = ended {
                                 // Dropped mid-send like the dialog and the
-                                // held flush: a fresh writer, so the shed
-                                // notice is not answered with the
-                                // interrupted write's byte count.
+                                // held flush: a fresh writer, so a notice is
+                                // not answered with the interrupted write's
+                                // byte count.
                                 w = ws.make_writer();
-                                break MainloopExitReason::Shed;
+                                break reason;
                             }
                         },
                         BindingMsg::AskExpose { port, reply } => {
@@ -836,9 +935,20 @@ impl Binding {
 
                 }
             }
+            if slot_used {
+                slot = None;
+            }
         };
 
         tracing::info!(reason = ?exit_reason, "binding leaving mainloop");
+
+        // The input the lost client sent before closing, which the loop had
+        // queued but not yet handed to the host (see `drain_queued_stdin`).
+        // The slot wait is dropped first: it belongs to the loop's turn.
+        drop(slot);
+        if matches!(exit_reason, MainloopExitReason::ClientLost) && !to_host.is_empty() {
+            Self::drain_queued_stdin(&self.stdin_tx, self.generation, &mut to_host).await;
+        }
 
         // Whether the session outlives this binding, and so should run its
         // `on_detach` hooks. `HostGone` leaves no session to detach from,

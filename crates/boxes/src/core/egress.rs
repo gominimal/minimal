@@ -255,6 +255,14 @@ pub struct SwitchOwnAddresses {
     /// the node's one opening (TCP only) while that proxy is served.
     /// `None` leaves the node address with no opening.
     hostname_proxy_port: Option<u16>,
+    /// Whether a gate past this leg decides the host alias (NET-160): the
+    /// VM host daemon's, against the current `[host-exposures]` table. Set
+    /// only for a box that names the host, by `host.min.internal` in its
+    /// `egress.allow_dns_hosts` or by an `allow_subnets` that covers the
+    /// alias, on a relay whose frames cross that gate. The alias then opens
+    /// at every TCP and UDP port, and the box's protocol and deny rules
+    /// still decide first. `false` keeps the alias at its exposure ports.
+    host_alias_passed_on: bool,
 }
 
 impl SwitchOwnAddresses {
@@ -270,7 +278,28 @@ impl SwitchOwnAddresses {
             bep_peer,
             host_exposure_ports: Vec::new(),
             hostname_proxy_port: None,
+            host_alias_passed_on: false,
         }
+    }
+
+    /// Passes a frame to the host alias on to the gate past this leg
+    /// (NET-160): the VM host daemon's gate, which decides the flow against
+    /// the current `[host-exposures]` table. This leg cannot read that
+    /// table, so it opens the alias at every TCP and UDP port and admits it
+    /// past an `allow_subnets` that does not cover it. The box's protocol
+    /// and deny rules still decide first. The caller sets it only for a box
+    /// that names the host, on a relay whose frames cross that gate. A
+    /// native relay has no such gate and never sets it.
+    #[must_use]
+    pub fn with_host_alias_passed_on(mut self) -> Self {
+        self.host_alias_passed_on = true;
+        self
+    }
+
+    /// Whether `dst` is the host alias and this set passes it on to the
+    /// gate past this leg ([`Self::with_host_alias_passed_on`]).
+    fn passes_host_alias_on(&self, dst: [u8; 4]) -> bool {
+        self.host_alias_passed_on && dst == self.host_alias
     }
 
     /// The configured host exposures over the host alias (NET-062's third
@@ -335,7 +364,14 @@ impl SwitchOwnAddresses {
             // the set holds the address for a compile that carries none,
             // where no lane exists to open it.
             Some(reason)
-        } else if dst == self.host_alias && !self.host_exposure_ports.contains(&dst_port) {
+        } else if dst == self.host_alias
+            && !self.host_exposure_ports.contains(&dst_port)
+            && !(self.host_alias_passed_on && (proto == IPPROTO_TCP || proto == IPPROTO_UDP))
+        {
+            // NET-160: a box that names the host has its TCP and UDP frames
+            // to the alias passed on to the VM host daemon's gate, which
+            // reads the current table. Any other protocol has no port for
+            // an exposure to name, and stays this set's drop.
             Some(reason)
         } else {
             None
@@ -1241,8 +1277,16 @@ fn verdict_ipv4(summary: &FrameSummary, rules: &EgressRules) -> FrameVerdict {
     {
         return FrameVerdict::Drop(DropReason::DeniedSubnet { dst, proto });
     }
+    // NET-160: a box that names `host.min.internal` reaches the alias by the
+    // name, as the VM host daemon's gate admits it, so an `allow_subnets`
+    // that does not cover the alias does not drop it on this leg. The gate
+    // past this leg decides the flow against the current table.
     if let Some(allow) = &rules.allow_subnets
         && !allow.iter().any(|cidr| cidr.contains(dst))
+        && !rules
+            .switch_own
+            .as_ref()
+            .is_some_and(|own| own.passes_host_alias_on(dst))
     {
         return FrameVerdict::Drop(DropReason::UndeclaredSubnet { dst, proto });
     }
@@ -2197,9 +2241,51 @@ impl Default for ReplyFlows {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Host exposures: the client's `[host-exposures]` table (NET-159).
+// ---------------------------------------------------------------------------
+
+/// The client configuration table that holds the host exposures. Only the
+/// client `config.toml` sets it. A project cannot (NET-159).
+pub const HOST_EXPOSURES_TABLE: &str = "host-exposures";
+
+/// The warning for a project `minimal.toml` with a `[host-exposures]`
+/// table (NET-159).
+pub const PROJECT_HOST_EXPOSURES_IGNORED: &str = "minimal.toml has a [host-exposures] table. \
+     A project cannot open host ports to its boxes, so the table is ignored. Put the table in \
+     your own config.toml instead. Run `min dirs` to find that file.";
+
+/// Whether a project file's unknown keys hold a `[host-exposures]` table,
+/// which the reader ignores with [`PROJECT_HOST_EXPOSURES_IGNORED`]
+/// (NET-159). Logs that warning once when they do.
+pub fn warn_project_host_exposures<'a>(keys: impl IntoIterator<Item = &'a str>) -> bool {
+    let found = keys.into_iter().any(|key| key == HOST_EXPOSURES_TABLE);
+    if found {
+        tracing::warn!("{PROJECT_HOST_EXPOSURES_IGNORED}");
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NET-159: a project's `[host-exposures]` table is found among the
+    /// project's unknown keys, and the warning says it is ignored.
+    #[test]
+    fn project_host_exposures_ignored_with_warning() {
+        assert!(warn_project_host_exposures([
+            "session",
+            HOST_EXPOSURES_TABLE
+        ]));
+        assert!(!warn_project_host_exposures(["session", "host-exposure"]));
+        assert_eq!(
+            PROJECT_HOST_EXPOSURES_IGNORED,
+            "minimal.toml has a [host-exposures] table. A project cannot open host ports to \
+             its boxes, so the table is ignored. Put the table in your own config.toml \
+             instead. Run `min dirs` to find that file."
+        );
+    }
 
     /// The switch gateway's address, the resolver every rule set below is
     /// keyed to (the default switch subnet's gateway).
