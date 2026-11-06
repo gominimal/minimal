@@ -4,12 +4,13 @@
 //! `[boxes.<name>]` is the general form. Each type-noun table is sugar for it
 //! (BOX-046): `[sessions.<name>]`, `[tasks.<name>]`, `[agents.<name>]` and
 //! `[services.<name>]` read as `[boxes.<name>]` with `type` set to the
-//! noun's type. An explicit `type` key in a sugar table stays as written, so
-//! it can name a project type. The entry keeps the table it came from, so a
-//! later step can refuse `[agents.*]` and `[services.*]` per entry (BOX-063).
+//! noun's type. A sugar table can repeat that `type`, and any other `type`
+//! in it fails with exit 3. A `type` that is not a string fails with exit 3
+//! in every table. The entry keeps the table it came from, so a later step
+//! can refuse `[agents.*]` and `[services.*]` per entry (BOX-063).
 //!
 //! Every entry name must be DNS-safe, unique across the file, and not
-//! `self` (BOX-007, BOX-046). A name that breaks a rule fails with
+//! `self` (BOX-007, BOX-046). An entry that breaks a rule fails with
 //! [`Error::InvalidEntryName`], which exits 3 and names the entry.
 
 use std::collections::BTreeMap;
@@ -81,8 +82,9 @@ pub struct BoxEntry {
     pub name: String,
     /// The table that declares the entry.
     pub table: EntryTable,
-    /// The entry's Box Type: its `type` key, or the noun of its sugar table
-    /// when it sets none. `None` only for a `[boxes.*]` entry without `type`.
+    /// The entry's Box Type: the noun of its sugar table, or the `type` key
+    /// of a `[boxes.*]` entry. `None` only for a `[boxes.*]` entry without
+    /// `type`.
     pub box_type: Option<String>,
     /// The entry's keys as the file wrote them, with `type` set to
     /// [`BoxEntry::box_type`] when it is known.
@@ -123,7 +125,8 @@ impl EntryTables {
 ///
 /// [`Error::Format`] when the bytes are not TOML or an entry table is not a
 /// table of tables. [`Error::InvalidEntryName`] for the first entry whose
-/// name is `self`, is not DNS-safe, or names an earlier entry.
+/// name is `self`, is not DNS-safe, or names an earlier entry, or whose
+/// `type` is not a string or differs from its sugar table's noun.
 pub fn read_entries(bytes: &[u8]) -> Result<Vec<BoxEntry>, Error> {
     let mut tables: EntryTables = toml::from_slice(bytes).map_err(Error::Format)?;
     let mut seen: BTreeMap<String, EntryTable> = BTreeMap::new();
@@ -141,10 +144,7 @@ pub fn read_entries(bytes: &[u8]) -> Result<Vec<BoxEntry>, Error> {
                 });
             }
             seen.insert(name.clone(), table);
-            let box_type = match body.get("type") {
-                Some(toml::Value::String(t)) => Some(t.clone()),
-                _ => table.box_type().map(str::to_owned),
-            };
+            let box_type = entry_type(table, &name, body.get("type"))?;
             if let Some(t) = &box_type {
                 body.insert("type".to_owned(), toml::Value::String(t.clone()));
             }
@@ -157,6 +157,31 @@ pub fn read_entries(bytes: &[u8]) -> Result<Vec<BoxEntry>, Error> {
         }
     }
     Ok(entries)
+}
+
+/// The Box Type of one entry, from its table and its `type` key.
+fn entry_type(
+    table: EntryTable,
+    name: &str,
+    written: Option<&toml::Value>,
+) -> Result<Option<String>, Error> {
+    let rule = match (written, table.box_type()) {
+        (None, noun) => return Ok(noun.map(str::to_owned)),
+        (Some(toml::Value::String(t)), None) => return Ok(Some(t.clone())),
+        (Some(toml::Value::String(t)), Some(noun)) if t == noun => {
+            return Ok(Some(noun.to_owned()));
+        }
+        (Some(toml::Value::String(t)), Some(noun)) => EntryNameRule::TypeMismatch {
+            expected: noun,
+            found: t.clone(),
+        },
+        (Some(_), _) => EntryNameRule::TypeNotString,
+    };
+    Err(Error::InvalidEntryName {
+        table: table.key(),
+        name: name.to_owned(),
+        rule,
+    })
 }
 
 /// Checks one entry name against the reserved name and the DNS-label rule.
@@ -243,8 +268,8 @@ mod tests {
 
             [services.db]
 
-            [sessions.custom]
-            type = "rust-dev"
+            [sessions.same]
+            type = "session"
 
             [defaults]
             timeout = "2h"
@@ -264,7 +289,7 @@ mod tests {
             ("test", EntryTable::Tasks, Some("task")),
             ("helper", EntryTable::Agents, Some("agent")),
             ("db", EntryTable::Services, Some("service")),
-            ("custom", EntryTable::Sessions, Some("rust-dev")),
+            ("same", EntryTable::Sessions, Some("session")),
         ];
         assert_eq!(entries.len(), expect.len(), "{entries:?}");
         for (name, table, ty) in expect {
@@ -297,6 +322,35 @@ mod tests {
                 .and_then(toml::Value::as_str),
             Some("1h")
         );
+
+        // A sugar table sets its noun's type. Any other `type` exits 3.
+        for (value, found) in [("\"task\"", "task"), ("\"rust-dev\"", "rust-dev")] {
+            let (err, msg) = invalid(&format!("[sessions.x]\ntype = {value}\n"));
+            assert_eq!(err.exit_code(), Some(3), "{msg}");
+            assert_eq!(
+                msg,
+                format!(
+                    "entry `[sessions.x]` in minimal.toml: a `[sessions.*]` table \
+                     always has `type = \"session\"`, so it cannot set \
+                     `type = \"{found}\"`. Remove the `type` key, or move the \
+                     entry to `[boxes.x]`."
+                )
+            );
+        }
+
+        // A `type` that is not a string exits 3, in every table.
+        for table in EntryTable::ALL {
+            let (err, msg) = invalid(&format!("[{}.x]\ntype = 5\n", table.key()));
+            assert_eq!(err.exit_code(), Some(3), "{msg}");
+            assert_eq!(
+                msg,
+                format!(
+                    "entry `[{}.x]` in minimal.toml: `type` must be a quoted \
+                     string, such as `type = \"session\"`. Fix the `type` key.",
+                    table.key()
+                )
+            );
+        }
 
         // A file with no entry tables has no entries.
         assert!(read_entries(b"[defaults]\n").expect("reads").is_empty());

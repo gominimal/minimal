@@ -28,8 +28,9 @@ pub enum Error {
     /// toolchain surfaces much later as a bare linker error. Carries
     /// the path of the offending file when it is known.
     HarnessTable(Option<PathBuf>),
-    /// An entry name breaks a naming rule (BOX-007, BOX-046). Carries the
-    /// table key (`sessions`), the entry name and the rule. Exits 3.
+    /// An entry breaks a naming rule or a `type` rule (BOX-007, BOX-046).
+    /// Carries the table key (`sessions`), the entry name and the rule.
+    /// Exits 3.
     InvalidEntryName {
         table: &'static str,
         name: String,
@@ -46,6 +47,14 @@ pub enum EntryNameRule {
     NotDnsSafe,
     /// An earlier entry, in the table this carries, has the same name.
     Duplicate { other_table: &'static str },
+    /// The entry's `type` key is not a string.
+    TypeNotString,
+    /// A type-noun table sets a `type` other than its noun's type. Carries
+    /// the noun's type and the `type` the entry wrote.
+    TypeMismatch {
+        expected: &'static str,
+        found: String,
+    },
 }
 
 /// Writes an entry as its table header, `[sessions.dev]`, and quotes a name
@@ -159,6 +168,18 @@ impl fmt::Display for Error {
                         "the name `{name}` also names `{}`. Entry names must \
                          be unique in the file. Rename one of the entries.",
                         EntryHeader(other_table, name)
+                    ),
+                    EntryNameRule::TypeNotString => write!(
+                        f,
+                        "`type` must be a quoted string, such as \
+                         `type = \"session\"`. Fix the `type` key."
+                    ),
+                    EntryNameRule::TypeMismatch { expected, found } => write!(
+                        f,
+                        "a `[{table}.*]` table always has `type = \"{expected}\"`, \
+                         so it cannot set `type = {found:?}`. Remove the `type` \
+                         key, or move the entry to `{}`.",
+                        EntryHeader("boxes", name)
                     ),
                 }
             }
