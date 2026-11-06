@@ -15,6 +15,7 @@ pub mod entry;
 mod error;
 pub use error::{EntryNameRule, Error, SpecKeyProblem};
 pub mod expand;
+pub mod legacy;
 mod package_composable;
 pub use package_composable::{PackageComposable, PackageFsMapping, StateWiring};
 mod project_composable;
@@ -1008,7 +1009,18 @@ impl File {
     /// `LinkConfig` failure to [`Error::LinkConfig`], which names the keys a
     /// link table must set and where the bad table is, instead of quoting
     /// serde's internal enum name.
+    ///
+    /// It then reads the legacy tables (BOX-050, BOX-051, BOX-052) and
+    /// prints one hint on stderr for each, on every read.
     fn parse(bytes: &[u8], path: Option<&Path>) -> Result<Self, Error> {
+        let mut file = Self::deserialize_bytes(bytes, path)?;
+        for legacy in legacy::settle(&mut file, legacy::this_release(), path)? {
+            eprintln!("{legacy}");
+        }
+        Ok(file)
+    }
+
+    fn deserialize_bytes(bytes: &[u8], path: Option<&Path>) -> Result<Self, Error> {
         toml::from_slice(bytes).map_err(|e| {
             if !e.message().contains("untagged enum LinkConfig") {
                 return Error::Format(e);
@@ -1093,8 +1105,9 @@ impl File {
     ///
     /// Returns [`Error::MissingParamDefault`] if any `[params.X]` entry has
     /// no `default` field, [`Error::HarnessTable`] if the file names the
-    /// pre-v0.5.0 `harness` key, or [`Error::MultipleTaskActions`] if a task
-    /// sets more than one action key.
+    /// pre-v0.5.0 `harness` key, [`Error::MultipleTaskActions`] if a task
+    /// sets more than one action key, or [`Error::InteractiveTask`] if a
+    /// task sets `interactive = true`.
     pub fn validate(&self) -> Result<(), Error> {
         if let Some(params) = &self.params {
             for (n, s) in params.0.iter() {
@@ -1126,6 +1139,7 @@ impl File {
             if keys.len() > 1 {
                 return Err(Error::MultipleTaskActions(task_name.clone(), keys));
             }
+            task.refuse_interactive(task_name)?;
         }
         self.warn_unknown_fields();
         Ok(())
