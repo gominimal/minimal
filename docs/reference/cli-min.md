@@ -678,7 +678,12 @@ anything other than the `kvm` group membership ends with
 `Running boxes pick this up on their next start.`. A run that added you to
 the `kvm` group ends with
 `KVM group membership starts at your next login: log out and back in, or restart the daemon from a new login.`
-When both apply, both lines print, the login line last. On a host that needs nothing it prints
+When both apply, both lines print, the login line last. When the step that
+enforces deny-all egress installs while a daemon is running, the script also
+prints `note: a Minimal daemon is running. If a box you start next still says this machine cannot enforce its egress, restart the daemon: min stop --force, and your next min command starts it again (sessions survive the restart).`
+A daemon of this release reads the machine again once the step places it, so
+the restart is for a daemon started by an earlier release.
+On a host that needs nothing it prints
 `Every part of the install is finished on this machine; there is nothing to run.`
 and exits 0. It lists a fact that no script can change, such as cgroup2
 mounted without `nsdelegate`, under `can't do on this machine:`. The other
