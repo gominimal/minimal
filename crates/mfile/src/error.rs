@@ -28,6 +28,56 @@ pub enum Error {
     /// toolchain surfaces much later as a bare linker error. Carries
     /// the path of the offending file when it is known.
     HarnessTable(Option<PathBuf>),
+    /// An entry name breaks a naming rule (BOX-007, BOX-046). Carries the
+    /// table key (`sessions`), the entry name and the rule. Exits 3.
+    InvalidEntryName {
+        table: &'static str,
+        name: String,
+        rule: EntryNameRule,
+    },
+}
+
+/// The naming rule that an entry name breaks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntryNameRule {
+    /// The name is `self`, which addresses the caller's own box.
+    Reserved,
+    /// The name is not a lowercase DNS label.
+    NotDnsSafe,
+    /// An earlier entry, in the table this carries, has the same name.
+    Duplicate { other_table: &'static str },
+}
+
+/// Writes an entry as its table header, `[sessions.dev]`, and quotes a name
+/// that TOML cannot write as a bare key.
+struct EntryHeader<'a>(&'a str, &'a str);
+
+impl fmt::Display for EntryHeader<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let EntryHeader(table, name) = self;
+        let bare = !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        if bare {
+            write!(f, "[{table}.{name}]")
+        } else {
+            write!(f, "[{table}.{name:?}]")
+        }
+    }
+}
+
+impl Error {
+    /// The exit code a command ends with on this error, when the
+    /// architecture's exit-code table fixes one. An invalid entry name is a
+    /// configuration error: exit 3.
+    #[must_use]
+    pub fn exit_code(&self) -> Option<u8> {
+        match self {
+            Error::InvalidEntryName { .. } => Some(3),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -90,6 +140,28 @@ impl fmt::Display for Error {
                      as `name = \"x\"` under `[stack]`.",
                 )
             }
+            Error::InvalidEntryName { table, name, rule } => {
+                write!(f, "entry `{}` in minimal.toml: ", EntryHeader(table, name))?;
+                match rule {
+                    EntryNameRule::Reserved => write!(
+                        f,
+                        "`self` is reserved and cannot name an entry. \
+                         Rename the entry."
+                    ),
+                    EntryNameRule::NotDnsSafe => write!(
+                        f,
+                        "an entry name must be 1 to 63 lowercase letters, \
+                         digits or hyphens, and cannot start or end with a \
+                         hyphen. Rename the entry."
+                    ),
+                    EntryNameRule::Duplicate { other_table } => write!(
+                        f,
+                        "the name `{name}` also names `{}`. Entry names must \
+                         be unique in the file. Rename one of the entries.",
+                        EntryHeader(other_table, name)
+                    ),
+                }
+            }
         }
     }
 }
@@ -107,6 +179,7 @@ impl std::error::Error for Error {
             Error::MissingParamDefault(_) => None,
             Error::MultipleTaskActions(..) => None,
             Error::HarnessTable(_) => None,
+            Error::InvalidEntryName { .. } => None,
         }
     }
 }
