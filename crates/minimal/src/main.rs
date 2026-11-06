@@ -227,7 +227,8 @@ fn answer_failure(
 /// codes ("Exit codes"): 2 when a running box holds the name a create
 /// asked for (`minimald_rpc::HeldNameRefusal`) or a removal without
 /// `--force` finds the box running (`minimal::BoxRunningRefusal`) or a run
-/// names an entry with a terminal (`minimal::task::RunNeedsTerminal`), 3 when
+/// names an entry with a terminal (`minimal::task::RunNeedsTerminal`) or
+/// asks `--detach` of an interactive task (`minimal::task::RunDetachRefusal`), 3 when
 /// the activation
 /// refused the box spec
 /// (`boxes::core::bep::ActivationRefused`) or found the project's
@@ -258,6 +259,12 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
         .is_some()
     {
         return minimal::task::RunNeedsTerminal::EXIT_CODE;
+    }
+    // BCLI-010: `--detach` on an interactive task.
+    if e.downcast_ref::<minimal::task::RunDetachRefusal>()
+        .is_some()
+    {
+        return minimal::task::RunDetachRefusal::EXIT_CODE;
     }
     // BCLI-058: `min box rename` to a name BOX-010 refuses.
     if e.downcast_ref::<minimal::BoxRenameRefusal>().is_some() {
@@ -1239,6 +1246,26 @@ mod tests {
         };
         let e = anyhow::Error::new(refused).context("activating the session");
         assert_eq!(failure_exit_code(&e), 3);
+    }
+
+    /// BCLI-010: `--detach` on an interactive task is a usage refusal, so
+    /// both run verbs end with exit 2 and print the refusal on stderr.
+    #[test]
+    fn run_detach_prints_id_closes_stdin_refusal_exits_2() {
+        for command in ["min task run", "min box run"] {
+            let e = anyhow::Error::new(minimal::task::RunDetachRefusal::new("shell", command));
+            assert_eq!(failure_exit_code(&e), 2);
+            let mut stderr = Vec::new();
+            let code = answer_failure(&e, false, false, None, &mut stderr);
+            assert_eq!(code, ExitCode::from(2));
+            assert_eq!(
+                String::from_utf8(stderr).unwrap(),
+                format!(
+                    "error: Task shell is interactive, so {command} --detach cannot start it. \
+                     Run it without --detach: {command} shell\n"
+                )
+            );
+        }
     }
 
     /// BCLI-005: `min box prune` off a terminal without `--yes` ends with
