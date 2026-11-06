@@ -161,11 +161,27 @@ fn move_under(table: &mut toml::Table, key: &str, into: &str) {
     }
 }
 
-/// Merges `old` under `new`: each key of `new` keeps its value, and `old`
-/// supplies the keys `new` does not set.
+/// Merges `old` under `new` with the defaults merge rule (BOX-048): a list
+/// in both is `old`'s items then `new`'s, each item once, any other value
+/// of `new` replaces `old`'s, and `old` supplies the keys `new` does not
+/// set. `min add` writes `[session]` today, so a file can carry both
+/// spellings, and the packages it adds must not be lost.
 fn merge_under(old: toml::Table, new: &mut toml::Table) {
     for (key, value) in old {
-        new.entry(key).or_insert(value);
+        match (value, new.get_mut(&key)) {
+            (toml::Value::Array(mut items), Some(toml::Value::Array(newer))) => {
+                for item in newer.drain(..) {
+                    if !items.contains(&item) {
+                        items.push(item);
+                    }
+                }
+                *newer = items;
+            }
+            (_, Some(_)) => {}
+            (value, None) => {
+                new.insert(key, value);
+            }
+        }
     }
 }
 
@@ -239,7 +255,8 @@ pub fn canonicalize(doc: &mut toml::Table, release: &str) -> Result<Vec<LegacyTa
 /// layout, and reads the new spellings into those fields: `[defaults.session]`
 /// into [`File::session`], `state_key` and `profile` under `[defaults.task]`
 /// into [`File::defaults`], and `[args]` into [`File::params`]. Where a file
-/// writes both spellings, the new one wins key by key.
+/// writes both `[session]` and `[defaults.session]`, they merge as
+/// `merge_under` says.
 ///
 /// Returns one [`LegacyTable`] for each legacy table the file carries. The
 /// caller prints each one, on every read.
@@ -454,7 +471,8 @@ mod tests {
             .expect("this release reads [session]");
         assert_eq!(file.session.expect("reads").packages, ["git"]);
 
-        // The new spelling wins key by key over the legacy table.
+        // Where a file carries both spellings, lists union and the new
+        // spelling's other values win.
         let (file, _) = settled(
             "[session]\npackages = [\"git\"]\nvars = { A = \"1\" }\n\
              [defaults.session]\npackages = [\"helix\"]\n",
@@ -462,7 +480,7 @@ mod tests {
         )
         .expect("inside the grace window");
         let session = file.session.expect("reads");
-        assert_eq!(session.packages, ["helix"]);
+        assert_eq!(session.packages, ["git", "helix"]);
         assert_eq!(session.vars.len(), 1);
 
         let hint = LegacyTable::Session.to_string();
