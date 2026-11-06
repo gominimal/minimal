@@ -8737,3 +8737,208 @@ fn host_ip_box_on_vm_host_gets_the_proxy_variables() {
         paths::HostKind::Minimald
     );
 }
+
+/// Creates and finalizes a task box for task `check` whose entrypoint is
+/// `argv`, as `min task run` creates one, and returns its id.
+async fn create_task_box_for_run(
+    client: &mut crate::test_harness::TestClient,
+    argv: &[&str],
+) -> boxes::SessionId {
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+        FinalizeSessionRequest,
+    };
+    let mut spec = mfile::spec::BoxSpec::for_task(
+        "check",
+        &mfile::Task::default(),
+        mfile::spec::SpecFlags::default(),
+    )
+    .expect("a task that is not interactive has a spec");
+    spec.entrypoint = mfile::spec::Entrypoint::Exec(argv.iter().map(ToString::to_string).collect());
+    let mut req = crate::test_harness::create_session_req("check", "/tmp");
+    req.config.creating_verb = minimald_rpc::CreatingVerb::Task;
+    req.config.ends_with_run = true;
+    req.spec = Some(serde_json_lenient::to_value(&spec).expect("a spec serializes"));
+    let id = client.call::<CreateSession>(&req).await.unwrap().id;
+    crate::test_harness::unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    match client
+        .call::<FinalizeSession>(&FinalizeSessionRequest {
+            session_id: id,
+            report_shared_port_collisions: false,
+        })
+        .await
+    {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+    }
+    id
+}
+
+/// Reads a box's whole output log over the `ReadLog` subsystem, without
+/// following, and returns its bytes as text.
+async fn read_box_output(
+    client: &mut crate::test_harness::TestClient,
+    id: boxes::SessionId,
+) -> String {
+    use minimald_rpc::{ReadLogRequest, ReadLogUpdate};
+    use tokio::io::AsyncWriteExt as _;
+
+    let mut channel = client
+        .open_subsystem(minimald_rpc::READ_LOG_SUBSYSTEM, &[])
+        .await;
+    let req = ReadLogRequest {
+        id,
+        offset: 0,
+        follow: false,
+    };
+    let mut writer = channel.make_writer();
+    writer
+        .write_all(&serde_json_lenient::to_vec(&req).unwrap())
+        .await
+        .unwrap();
+    drop(writer);
+    channel.eof().await.unwrap();
+    let mut out = Vec::new();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Data { data } => out.extend_from_slice(&data),
+                russh::ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the log read answers in time");
+    let mut output = Vec::new();
+    let mut done = false;
+    for line in String::from_utf8(out).unwrap().lines() {
+        match serde_json_lenient::from_str::<ReadLogUpdate>(line).expect("each line is an update") {
+            ReadLogUpdate::Output { data, .. } => output.extend_from_slice(&data),
+            ReadLogUpdate::Done { .. } => done = true,
+            other => panic!("the log read ended with {other:?}"),
+        }
+    }
+    assert!(done, "the log read reaches the end of the log");
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+// T11, end to end: a task run starts a task box, and its client goes away
+// while the task still runs. The task then writes more and exits 3. The box
+// ends by itself as `exited` with code 3. Its record, its `exited` event and
+// its whole output stay readable by a new client, and the daemon log names
+// the box's end and its code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_box_exits_with_code_and_output_after_client_drop() {
+    use boxes::core::record::{ExitEnding, RecordState};
+
+    let log = captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let mark = tempfile::tempdir().unwrap();
+    let mark = mark.path().join("client-gone");
+    let script = format!(
+        "echo before-drop; while [ ! -e '{}' ]; do sleep 0.05; done; \
+         echo after-drop; echo task-err >&2; sleep 1; exit 3",
+        mark.display()
+    );
+    let id = create_task_box_for_run(&mut client, &["/bin/sh", "-c", &script]).await;
+
+    let run = crate::traced::spawn(async move {
+        let outcome = client
+            .exec(
+                &[(crate::MINIMAL_SESSION_ID_ENV, &id.to_string())],
+                false,
+                &minimald_rpc::exec::ExecRequest::TaskRun {
+                    task: "check".to_string(),
+                    owns_box: false,
+                    args: vec![],
+                    cwd: String::new(),
+                }
+                .encode(),
+                b"",
+            )
+            .await;
+        drop(client);
+        outcome
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !log
+            .contents()
+            .contains("task box: the run relays the box's entrypoint")
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the run relays the box's entrypoint");
+
+    // The client goes away mid-run: its channel and connection drop.
+    run.abort();
+    let _ = run.await;
+    std::fs::write(&mark, b"").unwrap();
+
+    let manager = server.state.sessions_manager().await;
+    let record = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let record = manager
+                .get_record(crate::box_manager::BoxKeyPredicate::Id(id))
+                .await
+                .unwrap()
+                .expect("an ended task box keeps its record");
+            if record.status == boxes::BoxState::Exited {
+                break record;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the task box never exited: {}", log.contents()));
+    assert_eq!(
+        record.state().unwrap(),
+        RecordState::Exited(ExitEnding::Exit { exit_code: 3 }),
+        "the box is exited with the task's own code"
+    );
+    assert_eq!(record.exit_code, Some(3));
+
+    let mut events = manager.box_events(id).await.unwrap();
+    let events = events.read_new().unwrap();
+    let exited = events
+        .iter()
+        .find(|e| e.kind == boxes::events::BoxEventType::Exited)
+        .unwrap_or_else(|| panic!("the end records an exited event: {events:?}"));
+    assert_eq!(exited.data["reason"], "exit");
+    assert_eq!(exited.data["exit_code"], 3);
+
+    // A new client reads the box's whole output after its end.
+    let mut reader = server.connect().await;
+    let output = read_box_output(&mut reader, id).await;
+    for line in ["before-drop", "after-drop", "task-err"] {
+        assert!(
+            output.contains(line),
+            "the box's output keeps {line:?} after the client drop: {output:?}"
+        );
+    }
+
+    let log = log.contents();
+    let ended = log
+        .lines()
+        .find(|line| line.contains("task box ended") && line.contains(&id.to_string()))
+        .unwrap_or_else(|| panic!("the daemon log names the task box's end: {log}"));
+    assert!(
+        ended.contains("exit_code=3"),
+        "the daemon log names the task's exit code: {ended}"
+    );
+    assert!(
+        log.contains("reading a box's log") && log.contains(&id.to_string()),
+        "the daemon log names the read of the box's output: {log}"
+    );
+}

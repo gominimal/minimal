@@ -11,8 +11,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+pub mod entry;
 mod error;
-pub use error::Error;
+pub use error::{EntryNameRule, Error};
 mod package_composable;
 pub use package_composable::{PackageComposable, PackageFsMapping, StateWiring};
 mod project_composable;
