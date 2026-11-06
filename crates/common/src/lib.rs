@@ -446,6 +446,9 @@ impl From<std::io::Error> for GlobError {
 }
 
 /// Enumerates files which match the given glob within the given directory.
+/// Symlinked directories are followed, so a file under `lib64 -> lib` matches
+/// at both paths. A link to a directory the walk is already inside (`a -> .`,
+/// `bin/up -> ..`) is not entered again, so a loop ends.
 pub fn match_files_for_glob(dir: &Path, glob: &str) -> Result<Vec<PathBuf>, GlobError> {
     let mut results = Vec::new();
 
@@ -455,11 +458,21 @@ pub fn match_files_for_glob(dir: &Path, glob: &str) -> Result<Vec<PathBuf>, Glob
         .build()?
         .compile_matcher();
 
-    // Walk the filesystem starting from root_dir
+    /// The device and inode of the directory at `path`, through any link.
+    fn dir_id(path: &Path) -> Result<(u64, u64), GlobError> {
+        use std::os::unix::fs::MetadataExt as _;
+        let m = std::fs::metadata(path)?;
+        Ok((m.dev(), m.ino()))
+    }
+
+    // Walk the filesystem starting from root_dir. `inside` holds the
+    // directories from the root down to `dir`: a link back to any of them is
+    // a loop. A link to a directory elsewhere (`lib64 -> lib`) is walked.
     fn walk_dir(
         dir: &Path,
         root_dir: &Path,
         matcher: &globset::GlobMatcher,
+        inside: &mut Vec<(u64, u64)>,
         results: &mut Vec<PathBuf>,
     ) -> Result<(), GlobError> {
         let entries = std::fs::read_dir(dir)?;
@@ -472,15 +485,21 @@ pub fn match_files_for_glob(dir: &Path, glob: &str) -> Result<Vec<PathBuf>, Glob
             if path.is_file() && matcher.is_match(subset) {
                 results.push(path);
             } else if path.is_dir() {
-                // Recursively walk subdirectories
-                walk_dir(&path, root_dir, matcher, results)?;
+                let id = dir_id(&path)?;
+                if inside.contains(&id) {
+                    continue;
+                }
+                inside.push(id);
+                walk_dir(&path, root_dir, matcher, inside, results)?;
+                inside.pop();
             }
         }
 
         Ok(())
     }
 
-    walk_dir(dir, dir, &matcher, &mut results)?;
+    let mut inside = vec![dir_id(dir)?];
+    walk_dir(dir, dir, &matcher, &mut inside, &mut results)?;
     Ok(results)
 }
 
@@ -822,6 +841,34 @@ pub fn default_parallelism() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The walk still matches a file at the path a sibling link gives it
+    /// (`usr/lib64/libfoo.so.1` through `usr/lib64 -> lib`), but does not
+    /// re-enter a directory it is inside: with `loop -> .` and `bin/up -> ..`
+    /// the unchecked walk doubles at each level up to the kernel's 40-link
+    /// limit.
+    #[test]
+    fn the_glob_walk_keeps_sibling_links_and_ends_a_loop() {
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path();
+        std::fs::create_dir_all(r.join("usr/lib")).unwrap();
+        std::fs::create_dir_all(r.join("bin")).unwrap();
+        std::fs::write(r.join("usr/lib/libfoo.so.1"), b"elf").unwrap();
+        std::fs::write(r.join("bin/x"), b"x").unwrap();
+        std::os::unix::fs::symlink("lib", r.join("usr/lib64")).unwrap();
+        std::os::unix::fs::symlink(".", r.join("loop")).unwrap();
+        std::os::unix::fs::symlink("..", r.join("bin/up")).unwrap();
+        let mut got = match_files_for_glob(r, "**/*").unwrap();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                r.join("bin/x"),
+                r.join("usr/lib/libfoo.so.1"),
+                r.join("usr/lib64/libfoo.so.1"),
+            ]
+        );
+    }
 
     /// A path two layers both ship is linked once and counted, with a WARN
     /// only when the two differ: another size, other bytes of the same size
