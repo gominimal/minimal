@@ -956,11 +956,7 @@ mod tests {
     }
 
     fn trees() -> Vec<Tree> {
-        Tree::session(
-            Path::new("/s/home"),
-            Path::new("/s/home/proj"),
-            "workbench",
-        )
+        Tree::session(Path::new("/s/home"), Path::new("/s/home/proj"), "workbench")
     }
 
     /// Which mappings hakoniwa still binds by path, and which the closure
@@ -1007,8 +1003,7 @@ mod tests {
             }
         );
         assert_eq!(
-            plan.binds[1].locked,
-            0,
+            plan.binds[1].locked, 0,
             "a staged mapping keeps hakoniwa's flags"
         );
         assert_eq!(

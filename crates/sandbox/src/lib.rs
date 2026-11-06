@@ -2384,7 +2384,9 @@ impl<C: Channel> Sandbox<C> {
             ),
             _ => Vec::new(),
         };
-        let plan = session_bind::plan(
+        // Not `plan`: that is the network plan this function was given, whose
+        // resolver and hosts are written below.
+        let mounts = session_bind::plan(
             &trees,
             self.config.wd.fs_mappings(),
             session_bind::locked_of,
@@ -2395,17 +2397,17 @@ impl<C: Channel> Sandbox<C> {
                 path,
             })
         })?;
-        if plan.stages() {
+        if mounts.stages() {
             container.tmpfsmount(session_bind::STAGE);
         }
-        for (m, target) in &plan.by_path {
+        for (m, target) in &mounts.by_path {
             let opts = BindOpts {
                 recursive: !m.is_file,
                 read_only: m.read_only,
             };
             Self::bind_mount(Path::new(&m.host_path), target, opts, &mut container)?;
         }
-        let session_binds = plan.binds;
+        let session_binds = mounts.binds;
 
         if let Some(hn) = &self.config.hostname {
             let etc_hostname = self.rootfs().join("etc").join("hostname");
@@ -6683,7 +6685,9 @@ int main(int argc, char **argv) {
                 "{patch} is a read-only, nosuid mount of its own in the box: {mount:?}"
             );
             assert_eq!(
-                report.get(&format!("open {patch}/token")).map(String::as_str),
+                report
+                    .get(&format!("open {patch}/token"))
+                    .map(String::as_str),
                 Some("errno 30"),
                 "{patch}/token cannot be opened for writing (EROFS): {report:?}"
             );
