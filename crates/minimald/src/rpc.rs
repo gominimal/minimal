@@ -535,26 +535,23 @@ async fn serve_create_session(
             // refused for a held name. Any other create takes `<name>`, and
             // a running box that holds it refuses the create.
             let fresh_instance = req.fresh_instance;
-            let created = if fresh_instance {
-                mngr.create_fresh_box_with_spec(req.config, spec, ssh_username, creator)
-                    .await
-            } else {
-                mngr.create_box_with_spec(req.config, spec, ssh_username, creator)
-                    .await
-            };
+            let created = mngr
+                .create_box_reporting_fact(req.config, spec, fresh_instance, ssh_username, creator)
+                .await;
             Ok(match created {
-                Ok(id) => {
+                Ok((id, fact)) => {
                     // Tag the session to this connection so it is reaped if
                     // the client drops before finalizing it (e.g. Ctrl-C at
                     // the gating prompt) — see [`ConnectionHandle`] and the
                     // teardown reap in `server.rs`.
                     conn.record_created_session(id).await;
-                    // The fact as the manager's create left it: re-read
-                    // there when the start-up probe could not read the
-                    // table (`create_host_ip_fact`), so a reading taken
-                    // before the daemon stood in its leaf never reaches
-                    // the reply.
-                    let fact = crate::box_runtime::host_ip_enforcement_fact();
+                    // `fact` is the one this create's own gate read
+                    // (`create_host_ip_fact`): re-read there when the
+                    // start-up probe could not read the table, so a reading
+                    // taken before the daemon stood in its leaf never
+                    // reaches the reply, and never the global fact read
+                    // again here, which another create or launch may have
+                    // refreshed since.
                     let classifier_cause = fact.cause;
                     let classifier_advisory = create_classifier_advisory(
                         in_microvm,

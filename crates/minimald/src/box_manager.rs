@@ -325,6 +325,10 @@ struct CreateBoxMsg {
     /// Whether the create asks for a fresh instance (BOX-163): the box is
     /// named `<name>-<n>` and never refused for a held name.
     fresh: bool,
+    /// Where a created box's host-address fact goes: the one the create's
+    /// own gate read ([`create_host_ip_fact`]), so the reply states what
+    /// this create saw rather than whatever the global fact reads later.
+    fact: Option<tokio::sync::oneshot::Sender<crate::box_runtime::HostIpEnforcementFact>>,
 }
 
 /// The refusal of a create whose name a running box holds (BOX-163). It
@@ -459,7 +463,7 @@ impl BoxManagerHandle {
         username: Option<String>,
         creator: Option<std::sync::Weak<()>>,
     ) -> Result<SessionId, BoxManagerError> {
-        self.send_create_box(config, spec, false, username, creator)
+        self.send_create_box(config, spec, false, username, creator, None)
             .await
     }
 
@@ -474,8 +478,31 @@ impl BoxManagerHandle {
         username: Option<String>,
         creator: Option<std::sync::Weak<()>>,
     ) -> Result<SessionId, BoxManagerError> {
-        self.send_create_box(config, spec, true, username, creator)
+        self.send_create_box(config, spec, true, username, creator, None)
             .await
+    }
+
+    /// [`Self::create_box_with_spec`], or the fresh-instance create when
+    /// `fresh` is set, that also returns the host-address fact the create's
+    /// own gate read. The create reply states this fact, never a later read
+    /// of the global one, which another create or launch may have refreshed
+    /// in between.
+    pub(crate) async fn create_box_reporting_fact(
+        &self,
+        config: minimald_rpc::BoxConfig,
+        spec: Option<serde_json_lenient::Value>,
+        fresh: bool,
+        username: Option<String>,
+        creator: Option<std::sync::Weak<()>>,
+    ) -> Result<(SessionId, crate::box_runtime::HostIpEnforcementFact), BoxManagerError> {
+        let (send, recv) = tokio::sync::oneshot::channel();
+        let id = self
+            .send_create_box(config, spec, fresh, username, creator, Some(send))
+            .await?;
+        let fact = recv
+            .await
+            .expect("a created box's manager sends its fact before its id");
+        Ok((id, fact))
     }
 
     async fn send_create_box(
@@ -485,6 +512,7 @@ impl BoxManagerHandle {
         fresh: bool,
         username: Option<String>,
         creator: Option<std::sync::Weak<()>>,
+        fact: Option<tokio::sync::oneshot::Sender<crate::box_runtime::HostIpEnforcementFact>>,
     ) -> Result<SessionId, BoxManagerError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
@@ -499,6 +527,7 @@ impl BoxManagerHandle {
                 },
                 spec,
                 fresh,
+                fact,
             })))
             .await;
         recv.await.expect("corresponding sessions manager is dead")
@@ -3305,7 +3334,7 @@ impl BoxManager {
         fresh: bool,
         username: Option<String>,
         creator: Option<std::sync::Weak<()>>,
-    ) -> Result<SessionId, BoxManagerError> {
+    ) -> Result<(SessionId, crate::box_runtime::HostIpEnforcementFact), BoxManagerError> {
         if self.in_shutdown.is_cancelled() {
             return Err(BoxManagerError::new(
                 std::io::ErrorKind::ConnectionRefused,
@@ -3611,7 +3640,7 @@ impl BoxManager {
         match BoxActor::run(seed).await {
             Ok(session) => {
                 self.running.insert(session_id, session);
-                Ok(session_id)
+                Ok((session_id, host_ip_fact))
             }
             // The actor never started, so no one else will delete the
             // record. Best-effort: the spawn error is what the client needs
@@ -3966,7 +3995,8 @@ impl BoxManager {
                 } = *msg;
                 let created = self
                     .create_session(config, None, false, username, creator)
-                    .await;
+                    .await
+                    .map(|(id, _)| id);
                 responder.handle(async move { created }).await;
             }
             ManagerMessage::CreateBox(msg) => {
@@ -3980,10 +4010,17 @@ impl BoxManager {
                         },
                     spec,
                     fresh,
+                    fact,
                 } = *msg;
                 let created = self
                     .create_session(config, spec, fresh, username, creator)
-                    .await;
+                    .await
+                    .map(|(id, host_ip_fact)| {
+                        if let Some(fact) = fact {
+                            let _ = fact.send(host_ip_fact);
+                        }
+                        id
+                    });
                 responder.handle(async move { created }).await;
             }
             // Deletes a session: see `delete_box`.
