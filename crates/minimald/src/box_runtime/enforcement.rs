@@ -384,6 +384,58 @@ pub(crate) async fn re_read_classifier_fact(
     .map_err(std::io::Error::other)
 }
 
+/// How often [`re_read_when_moved`] reads the daemon's own cgroup: one small
+/// procfs read a second.
+pub const OWN_CGROUP_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// gominimal/inbox#1054: re-reads the node fact each time this native
+/// daemon's own cgroup changes, for the daemon's whole life. The start-up
+/// reading stands for where the daemon stood then. `min finalize-install`
+/// run under a running daemon installs the tree and moves that daemon into
+/// its leaf, and a placement can land after the start-up reading. Without a
+/// re-read, every later create answers with the cause the daemon read before
+/// the move, such as "the classifier's privileged step is not installed".
+///
+/// `last` is the cgroup the fact was last read in: the one the daemon stood
+/// in when its start-up reading began. `own_cgroup` reads the daemon's
+/// cgroup now (`/proc/self/cgroup`'s unified line in the daemon). An
+/// unreadable cgroup is not a move. Each move is one info line naming both
+/// cgroups and what the re-read found.
+pub async fn re_read_when_moved(
+    root: std::path::PathBuf,
+    mountinfo_knob: Option<String>,
+    mut last: Option<String>,
+    poll: std::time::Duration,
+    mut own_cgroup: impl FnMut() -> Option<String> + Send + 'static,
+) {
+    loop {
+        tokio::time::sleep(poll).await;
+        let Some(now) = own_cgroup() else {
+            continue;
+        };
+        if last.as_deref() == Some(now.as_str()) {
+            continue;
+        }
+        let from = last.replace(now.clone());
+        match re_read_classifier_fact(root.clone(), mountinfo_knob.clone(), false).await {
+            Ok((_, decision)) => tracing::info!(
+                from = from.as_deref().unwrap_or("unknown"),
+                to = %now,
+                host_fact = %host_ip_enforcement_fact().enforcement.machine_str(),
+                cause = decision.cause().map(crate::net::classifier::Cause::detail),
+                "this daemon moved to another cgroup, so it re-read the classifier fact"
+            ),
+            Err(e) => tracing::warn!(
+                from = from.as_deref().unwrap_or("unknown"),
+                to = %now,
+                error = %e,
+                "this daemon moved to another cgroup, but the classifier fact could \
+                 not be re-read, so it keeps the stored one"
+            ),
+        }
+    }
+}
+
 /// Creates the classifier leaf this session's host-address box is placed in
 /// (NET-079), under the tree the privileged step installs on a native host
 /// (`scripts/install-host-classifier.sh`) and the guest daemon mounts for
