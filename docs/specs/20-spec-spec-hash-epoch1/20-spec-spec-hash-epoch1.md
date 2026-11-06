@@ -6,7 +6,7 @@ owner: bryan-minimal
 epic: gominimal/inbox#583
 arch: https://github.com/gominimal/arch/blob/d77725b6dcca73918efb66f0e15e97120db62a0e/architecture.md#d31--the-build-spec-hash-keyspace-contract-and-epochs
 arch_sha: "d77725b6dcca73918efb66f0e15e97120db62a0e"
-updated: 2026-10-30
+updated: 2026-11-05
 ---
 
 # EPOCH — spec-hash epoch 1: an injective, machine-checked BuildSpec encoding
@@ -33,25 +33,91 @@ a global "current" epoch. Keyspace rotation is a migration class. After
 epoch 1, evolution is additive. This spec delivers that contract for epoch 1
 and cites D3.1 by its stable identifier.
 
-This document uses these terms. A spec's **canonical form** is the set of
-fields the epoch-0 encoder covers. In that form the dependency edges form a
-set and every number takes its normal form (EPOCH-002, EPOCH-006). A spec's
-`tests` are outside its canonical form (EPOCH-010). An **edge** of a spec is
-identified by the epoch-1 key of the dependency it names and by the
-dependency's kind. A spec's edges enter its encoding as a set ordered by
+This document uses these terms. A spec's **canonical form** is the spec
+field list of the epoch-1 encoding below. The list holds the fields the
+epoch-0 encoder covers and no others. In that form the dependency edges form
+a set and every number takes its normal form (EPOCH-002, EPOCH-006). A
+spec's `tests` are outside its canonical form (EPOCH-010). An **edge** of a
+spec is identified by the epoch-1 key of the dependency it names and by the
+dependency's kind. An edge that names a subset also has the set of output
+names it selects. A spec's edges enter its encoding as a set ordered by
 those bytes, so neither the order a recipe lists them in nor a repeated
 listing is part of the canonical form. A **container's canonical form** is
-the set of fields the container encoder covers: its name, the set of keys of
-its member packages, and its image configuration. Specs or containers with
-different canonical forms are **canonically distinct**. Every **bounded
-spec** has at most 3 elements in any list and at most 8 bytes in any string.
-Its dependency depth is at most 2. A **bounded container** has at most 3
+the container field list below. Its members enter it as the set of their
+keys. Specs or containers with
+different canonical forms are **canonically distinct**. A **bounded spec**
+has at most 3 elements in any list, set or map, its edges included. It has
+at most 8 bytes in any string, and each edge key is an arbitrary 32-byte
+value. A **bounded container** has at most 3
 elements in any list, set or map, at most 8 bytes in any string, and up to 3
-arbitrary 32-byte member keys. Members enter a container's canonical form as
-keys, so a harness ranges over the keys and never runs the hash
-symbolically. Harnesses that are exhaustive over bounded specs or containers
-state nothing beyond that domain. The **epoch-1 context** is the Blake3
-`derive_key` context string `minimal.dev spec-hash epoch 1`.
+arbitrary 32-byte member keys. Edges and members enter an encoding as keys.
+So a harness ranges over the key bytes, never runs the hash symbolically,
+and has no dependency depth to bound. Harnesses that are exhaustive over
+bounded specs or containers state nothing beyond that domain. The **epoch-1
+context** is the Blake3 `derive_key` context string
+`minimal.dev spec-hash epoch 1`.
+
+D3.1 leaves three things to each epoch's spec: the field enumeration, the
+normal forms and the tag layout. This section gives them for the **epoch-1
+encoding**.
+
+- **Spec fields.** These are the canonical form of a spec:
+  - `name`, a string.
+  - `prebuilt`, a flag.
+  - `cmds`, a list of commands, each a list of argument strings.
+  - `build_args`, a map from name to value.
+  - The build inputs that are not edges, in the order the spec lists them.
+    A web source is its `url` and `sha256`. A local source is its
+    `filename` and `file_hash`. Each source also has its `extract` flag and
+    an optional `strip_prefix`. A local input is its `filename` and
+    `file_hash`.
+  - `outputs`, a map from output name to output. An output is its kind
+    (library, data or binary), its glob, and the flag of that kind
+    (`allow_data`, `allow_executable` or `allow_missing_interpreter`).
+  - `target`, its architecture and OS. The encoding always emits it, the
+    default target included.
+  - `abstract_deps`, a map from name to attribute value. An attribute value
+    is a flag, a string, a number, or an enum variant's name with its value.
+    It can also be a list or a map of attribute values.
+  - The edges, as a set. An edge's kind is build input, runtime dependency
+    or replace-on-cycle.
+- **Outside a spec's canonical form:** `tests` (EPOCH-010, decision 1 of
+  minimal#1246), the attributes defined on the spec (`attrs`) and its
+  origin (`from`). The diagnostic fields are also outside: `url_pos`,
+  `sha256_pos`, `full_path` and the positions of strings. Epoch 0 leaves
+  all of these out too.
+- **Subset fields.** A subset is a set of components. Each component
+  holds the epoch-1 key of a spec and the set of output names the subset
+  takes from that spec.
+- **Container fields.** These are the canonical form of a container:
+  - `name`, a string.
+  - The member packages, as the set of their keys (EPOCH-014).
+  - `entrypoint` and `cmd`, each an optional list of strings.
+  - `arch`, `working_dir`, `user` and `stop_signal`, each an optional
+    string.
+  - `env_vars`, `labels` and `config`, each a map from string to string.
+  - `exposed_ports` and `volumes`, each a set of strings. A port enters as
+    `port/proto`.
+- **Normal forms.** For specs these are EPOCH-002 and EPOCH-006 and
+  nothing more. A spec's other lists and maps keep the order the spec
+  declares. The encoder orders a container's maps by key and sorts its
+  sets, as epoch 0 does.
+- **Layout.** The encoding is a byte-tagged TLV. Each field is a one-byte
+  tag and then its payload. Every string has a `u32` little-endian length
+  prefix. Every list, set or map has a `u32` little-endian count prefix.
+  Keys take their 32 bytes, and flags take one byte. An optional value
+  takes a present tag or an absent tag. The encoding emits every field, so
+  an absence is always a tag (witness class 5). The encoder sorts a set by
+  the bytes of its elements and drops repeats.
+- **What the codec module fixes.** The tag byte values, the field order and
+  the byte layout of a number are those of the epoch-1 codec module in
+  `crates/graph`. No tag is in the reserve 0xF0 to 0xFF (EPOCH-007). The
+  module and the golden digests that EPOCH-008 pins are normative for those
+  bytes. That meets D3.1. This spec fixes the fields, their normal forms and
+  their framing, which are what injectivity rests on. The pins fix the
+  remaining bytes at the seal, and after the seal those bytes never change.
+  A second client follows this definition and checks its keys against the
+  pins.
 
 The **epoch-0 defect catalog** is these nine collision-witness classes of
 the epoch-0 encoder. Seven are a pair of distinct specs with one key; two
@@ -76,8 +142,9 @@ the epoch-0 encoder. Seven are a pair of distinct specs with one key; two
    parent key and tagged output names.
 
 **Success:** two distinct canonical specs share a cache key only through a
-Blake3 collision, and a machine checks that property. A dependency reorder
-no longer rotates keys.
+Blake3 collision. A machine checks the injectivity of the encoding under
+the key over bounded specs (EPOCH-001). A dependency reorder no longer
+rotates keys.
 
 **First slice:** the pure encode/decode codec with its machine-checked
 round-trip and the nine witness refutations, plus the pinned epoch-1
@@ -102,7 +169,7 @@ build-infra operator. Release manager.
 - AS A build-infra operator I WANT the epoch flip to change only which keys
   exist — same 32-byte hashes, same index/snapshot/provenance formats — SO
   THAT migration is one cold catalog rebuild, not a format migration
-- AS A security engineer I WANT the Container Spec Hash to carry the same
+- AS A security engineer I WANT the Container Spec Hash to give the same
   guarantee as the package key SO THAT an OCI Archive fetched by key is as
   safe from substitution as a package tarball (D3.1, AT2)
 - AS A release manager I WANT additive evolution (reserved tags,
@@ -118,10 +185,11 @@ build-infra operator. Release manager.
   verify:   cargo nextest run -p graph epoch1_injectivity_bounded
   property: for all canonical a, b: a != b implies encode(a) != encode(b)
   harness:  kani_epoch1_injectivity_bounded, exhaustive over bounded specs
-    (3 elements per list, 8 bytes per string, depth 2), unwind 33 (the
-    32-byte edge-key loop, as EPOCH-013's member keys; strings and lists
-    need less). The bound is the starting point. The codec PR measures the
-    harness and records the bound it ran at
+    (3 elements per list, set or map, 8 bytes per string, each edge key an
+    arbitrary 32-byte value), unwind 33 (the 32-byte edge-key loop, as
+    EPOCH-013's member keys. Strings and lists need less). The bound is
+    the starting point. The codec PR measures the harness and records the
+    bound it ran at
 
 - **EPOCH-002** WHEN a permutation reorders a spec's edges, or an edge is
   listed more than once, THE SYSTEM SHALL produce an identical encoding.
@@ -137,8 +205,8 @@ build-infra operator. Release manager.
   property: for all bounded specs x: decode(encode(x)) == canon(x), and
     canon(canon(x)) == canon(x)
   harness:  kani_epoch1_roundtrip_bounded, exhaustive over bounded specs
-    (3 elements per list, 8 bytes per string, depth 2), unwind 33 (the
-    32-byte edge-key loop)
+    (3 elements per list, set or map, 8 bytes per string, each edge key an
+    arbitrary 32-byte value), unwind 33 (the 32-byte edge-key loop)
 
 - **EPOCH-004** THE SYSTEM SHALL refute every class of the epoch-0 defect
   catalog: the witness pair of each distinct-spec class (1 to 6 and 9)
@@ -282,15 +350,16 @@ build-infra operator. Release manager.
   container's epoch is the one the producing side is configured to seal
   at: the same value that selects the spec and subset encoders, epoch 1
   once the flip has moved it (EPOCH-015 derives the key under the epoch-1
-  context). Before the flip a container key is an epoch-0 key; no index
-  records one today, and the epoch-0 container witness (EPOCH-013) is a
-  property of that encoding, not of a stored key.
+  context).
   tier:     T1
   verify:   cargo nextest run -p graph epoch1_container_members_by_key
   property: for all containers c, members m of c: the member bytes of
     encode(c) are hash_e(m) for the epoch e of c's key
   - IF a member's key is not of the container's epoch THEN THE SYSTEM SHALL
-    refuse to seal the container and name the member. A key carries no
+    refuse to seal the container. The message names the container, the
+    member, the member's epoch and the container's epoch. It tells the
+    person to reseal the member's index under the container's epoch and
+    then seal the container again. A key carries no
     epoch in its bytes. The member's epoch is the one the index record its
     key was read from declares (EPOCH-009), and the sealer hands the hasher
     each member key with that epoch.
@@ -326,9 +395,10 @@ build-infra operator. Release manager.
   tier:     T0
   verify:   cargo nextest run -p graph epoch0_golden_pin_unchanged
 
-- **EPOCH-019** THE SYSTEM SHALL serialize an epoch-1 key in every record
-  format that embeds a SpecHash exactly as that format serializes an
-  epoch-0 key.
+- **EPOCH-019** THE SYSTEM SHALL serialize an epoch-1 key exactly as it
+  serializes an epoch-0 key in each format that embeds a SpecHash. The
+  formats are those of the epic's acceptance criterion 4: index records,
+  snapshots, closures, provenance subjects, events and object names.
   tier:     T0
   verify:   cargo nextest run -p graph epoch1_record_layouts_unchanged
 
@@ -341,7 +411,11 @@ build-infra operator. Release manager.
 
 - **EPOCH-021** WHERE an optional field is added to epoch 1 under a
   reserved tag THE SYSTEM SHALL encode a closure that does not set the
-  field byte-identically to epoch 1 without the field.
+  field byte-identically to epoch 1 without the field. The test adds a
+  test-only optional field under a tag from the reserve 0xF0 to 0xFF
+  (EPOCH-007) and compares a closure that does not set it with the same
+  closure under the sealed encoder. The field exists only in the test
+  build, so the seal's tag assignment does not change.
   tier:     T0
   verify:   cargo nextest run -p graph epoch1_absent_field_is_byte_identical
 
@@ -360,7 +434,11 @@ build-infra operator. Release manager.
 - The Lean proof of EPOCH-001: minimal#1109, harness set 6. Kani holds the
   property at T2, and the theorem is an open question below.
 - Signing the epoch an index declares: the index's Sigstore bundle covers
-  the sealed bytes, and client-side bundle verification is minimal#1109.
+  the sealed bytes, and client-side bundle verification is minimal#2736.
+- Gating the signing of release attestations on epoch 1, and retiring
+  epoch 0 by a minimum accepted epoch in the trust root:
+  gominimal/arch#157. This spec defines the encoding those attestations
+  key on.
 
 ## Design reasoning
 
@@ -468,8 +546,10 @@ the one its index record declares, because nothing in the key's bytes says
 it. So a container key is well-defined only when every member key is of
 the container's epoch. EPOCH-014's refusal makes that a requirement rather
 than an inference from EPOCH-009. A member may well sit in another index
-of another epoch. Today no index holds a container record,
-so the container keyspace has nothing to rotate.
+of another epoch. Before the flip a container key is an epoch-0 key.
+Today no index holds a container record, so the container keyspace has
+nothing to rotate. The epoch-0 container witness (EPOCH-013) is a property
+of the epoch-0 encoding and not of a stored key.
 
 This spec binds four decisions from the epoch-0 defect catalog's ledger.
 `tests` stay outside the canonical form with a write-guard (EPOCH-010).
@@ -481,6 +561,11 @@ Rollout section prescribes. Dual hashing, keeping epoch-0 keys live beside
 epoch-1 keys, doubles every index. It also makes the epoch a per-record
 question for the whole overlap, which EPOCH-009's one-epoch-per-index rule
 exists to avoid.
+
+The release-attestation scheme of gominimal/arch#157 signs only at epoch 1
+or later. So no signature covers a key with epoch 0's known collisions.
+That gate belongs to the verification scheme, and this spec only supplies
+the encoding it relies on.
 
 **Generality:** a second epoch is additive by construction, through
 reserved tags and a new `derive_key` context. A second hash algorithm is
