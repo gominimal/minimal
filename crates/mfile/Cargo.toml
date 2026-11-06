@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dev-dependencies]
 indoc.workspace = true
+proptest.workspace = true
 tracing-subscriber.workspace = true
 
 [dependencies]
