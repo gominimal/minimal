@@ -36,6 +36,30 @@ pub enum Error {
         name: String,
         rule: EntryNameRule,
     },
+    /// An expanded box spec carries a key it cannot carry, or a value of
+    /// the wrong shape (BOX-066). Carries the key, the layer that set it,
+    /// as the message names it, and the problem. Exits 3.
+    InvalidSpecKey {
+        key: String,
+        layer: String,
+        problem: SpecKeyProblem,
+    },
+}
+
+/// What is wrong with a key of an expanded box spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpecKeyProblem {
+    /// No box setting has this name.
+    Unknown,
+    /// The key is inside an `[upstream]` table, and is not one of the
+    /// registry pin's keys.
+    UnknownUpstream,
+    /// The value has the wrong shape. Carries what the key takes and what
+    /// the layer wrote, each as the message names it.
+    WrongShape {
+        expected: &'static str,
+        found: &'static str,
+    },
 }
 
 /// The naming rule that an entry name breaks.
@@ -59,7 +83,7 @@ pub enum EntryNameRule {
 
 /// Writes an entry as its table header, `[sessions.dev]`, and quotes a name
 /// that TOML cannot write as a bare key.
-struct EntryHeader<'a>(&'a str, &'a str);
+pub(crate) struct EntryHeader<'a>(pub(crate) &'a str, pub(crate) &'a str);
 
 impl fmt::Display for EntryHeader<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -83,7 +107,7 @@ impl Error {
     #[must_use]
     pub fn exit_code(&self) -> Option<u8> {
         match self {
-            Error::InvalidEntryName { .. } => Some(3),
+            Error::InvalidEntryName { .. } | Error::InvalidSpecKey { .. } => Some(3),
             _ => None,
         }
     }
@@ -183,6 +207,29 @@ impl fmt::Display for Error {
                     ),
                 }
             }
+            Error::InvalidSpecKey {
+                key,
+                layer,
+                problem,
+            } => match problem {
+                SpecKeyProblem::Unknown => write!(
+                    f,
+                    "{layer} sets `{key}`, which is not a box setting. \
+                     Remove the key or correct its name."
+                ),
+                SpecKeyProblem::UnknownUpstream => write!(
+                    f,
+                    "{layer} sets `{key}`, which is not an `[upstream]` setting. \
+                     The `[upstream]` settings are `repo_url`, `branch`, \
+                     `commit` and `build_cache_url`. Remove the key or correct \
+                     its name."
+                ),
+                SpecKeyProblem::WrongShape { expected, found } => write!(
+                    f,
+                    "{layer} sets `{key}` to {found}, but `{key}` takes \
+                     {expected}. Fix the value."
+                ),
+            },
         }
     }
 }
@@ -201,6 +248,7 @@ impl std::error::Error for Error {
             Error::MultipleTaskActions(..) => None,
             Error::HarnessTable(_) => None,
             Error::InvalidEntryName { .. } => None,
+            Error::InvalidSpecKey { .. } => None,
         }
     }
 }
