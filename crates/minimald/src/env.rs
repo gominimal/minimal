@@ -3729,14 +3729,50 @@ pub(crate) fn patched_build_refusal<'a>(
 ) -> Option<String> {
     let lines: Vec<&str> = lines.into_iter().collect();
     let destination = refused_destination(lines.iter().copied())?;
-    let host = destination
-        .rsplit_once(':')
-        .filter(|(h, p)| !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
-        .map_or(destination.as_str(), |(h, _)| h);
-    if !failure.contains(host) {
+    if !failure.contains(destination_host(&destination)) {
         return None;
     }
     egress_refusal(denies_all, package, box_name, lines)
+}
+
+/// A destination [`refused_destination`] read, without its port.
+fn destination_host(destination: &str) -> &str {
+    destination
+        .rsplit_once(':')
+        .filter(|(h, p)| !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        .map_or(destination, |(h, _)| h)
+}
+
+/// The host a refusal's next step can name for `destination`, which `line`
+/// of the build's output named. `None` for a web source: an own-address box
+/// has no classifier leaf, so its build fetches the source as the daemon's
+/// own traffic, and in a VM no rule of the box lets that out.
+fn remedy_host<'a>(destination: &'a str, line: &str) -> Option<&'a str> {
+    (!line.starts_with(WEB_SOURCE_FAILURE)).then(|| destination_host(destination))
+}
+
+/// The next step that lets a box's builds reach `host`, or `None` when `host`
+/// is no name `--allow-dns-hosts` can admit. The step names `--network
+/// own_ip` because a box on the default network refuses that flag at create
+/// (`classifier::unenforceable_rules`). It names no `minimal.toml` key
+/// because none reaches a box yet
+/// ([#2702](https://github.com/gominimal/minimal/issues/2702)).
+fn egress_remedy(host: &str) -> Option<String> {
+    (boxes::is_valid_dns_host(host) && host.parse::<std::net::Ipv4Addr>().is_err()).then(|| {
+        format!(
+            "To allow it, activate a new session with --network own_ip --allow-dns-hosts {host}"
+        )
+    })
+}
+
+/// Why a box's egress rules refused a build, with the next step when `host`
+/// has one.
+fn egress_rules_refuse(box_name: &str, host: Option<&str>) -> String {
+    let refused = format!("the egress rules of box {box_name} do not allow it");
+    match host.and_then(egress_remedy) {
+        Some(remedy) => format!("{refused}. {remedy}"),
+        None => refused,
+    }
 }
 
 /// The error line for a package build that the egress rules of its box
@@ -3754,7 +3790,12 @@ pub(crate) fn egress_refusal<'a>(
     if !denies_all {
         return None;
     }
-    let destination = refused_destination(lines)?;
+    let lines: Vec<&str> = lines.into_iter().collect();
+    let line = lines
+        .into_iter()
+        .rev()
+        .find(|line| refused_destination([*line]).is_some())?;
+    let destination = refused_destination([line])?;
     // Box-zone names are not subject to egress rules, so a failure to
     // resolve or reach one is not a refusal by the box's rules.
     let host = destination
@@ -3766,9 +3807,9 @@ pub(crate) fn egress_refusal<'a>(
     if host == zone_apex || host.ends_with(&format!(".{zone_apex}")) {
         return None;
     }
+    let reason = egress_rules_refuse(box_name, remedy_host(&destination, line));
     Some(format!(
-        "the build of {package} could not reach {destination}: \
-         the egress rules of box {box_name} do not allow it"
+        "the build of {package} could not reach {destination}: {reason}"
     ))
 }
 
@@ -3819,6 +3860,58 @@ mod tests {
             "could not connect to a.example:443: no",
         ] {
             assert_eq!(unreachable_source(other), None, "{other}");
+        }
+    }
+
+    /// A refusal gives a next step only where the step would work: a host
+    /// name a build's own connection named, without its port, and not a
+    /// literal address or a web source.
+    #[test]
+    fn a_refusal_gives_a_next_step_only_where_it_works() {
+        let refused = |line: &str| egress_refusal(true, "foo", "x", [line]).unwrap();
+        let with_step = |destination: &str, host: &str| {
+            format!(
+                "the build of foo could not reach {destination}: \
+                 the egress rules of box x do not allow it. \
+                 To allow it, activate a new session with \
+                 --network own_ip --allow-dns-hosts {host}"
+            )
+        };
+        let without_step = |destination: &str| {
+            format!(
+                "the build of foo could not reach {destination}: \
+                 the egress rules of box x do not allow it"
+            )
+        };
+        for (line, want) in [
+            (
+                "curl: (6) Could not resolve host: example.com",
+                with_step("example.com", "example.com"),
+            ),
+            (
+                "curl: (7) Failed to connect to example.com port 8080 after 2 ms: refused",
+                with_step("example.com:8080", "example.com"),
+            ),
+            (
+                "Connecting to 93.184.215.14:80... failed: No route to host.",
+                without_step("93.184.215.14:80"),
+            ),
+            (
+                "curl: (7) Failed to connect to [2001:db8::1] port 443 after 2 ms: refused",
+                without_step("[2001:db8::1]:443"),
+            ),
+            (
+                "could not fetch the source https://example.com/a.tar.gz: \
+                 could not connect to example.com:443: refused",
+                without_step("example.com"),
+            ),
+            (
+                "could not fetch the source http://example.com/a.tar.gz: \
+                 could not connect to example.com:80: refused",
+                without_step("example.com"),
+            ),
+        ] {
+            assert_eq!(refused(line), want, "{line}");
         }
     }
 
