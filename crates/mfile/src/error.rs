@@ -51,6 +51,9 @@ pub enum Error {
 pub enum SpecKeyProblem {
     /// No box setting has this name.
     Unknown,
+    /// The key is inside an `[upstream]` table, and is not one of the
+    /// registry pin's keys.
+    UnknownUpstream,
     /// The value has the wrong shape. Carries what the key takes and what
     /// the layer wrote, each as the message names it.
     WrongShape {
@@ -213,6 +216,13 @@ impl fmt::Display for Error {
                     f,
                     "{layer} sets `{key}`, which is not a box setting. \
                      Remove the key or correct its name."
+                ),
+                SpecKeyProblem::UnknownUpstream => write!(
+                    f,
+                    "{layer} sets `{key}`, which is not an `[upstream]` setting. \
+                     The `[upstream]` settings are `repo_url`, `branch`, \
+                     `commit` and `build_cache_url`. Remove the key or correct \
+                     its name."
                 ),
                 SpecKeyProblem::WrongShape { expected, found } => write!(
                     f,

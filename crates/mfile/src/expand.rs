@@ -134,7 +134,10 @@ pub struct ExpansionReport {
 /// nothing.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Layers {
-    /// The `[upstream]` layer of minimal.toml.
+    /// The `[upstream]` table of minimal.toml, as the file writes it: the
+    /// registry pin (`repo_url`, `branch`, `commit`, `build_cache_url`).
+    /// [`expand`] folds it as the one spec key `upstream`. It holds no
+    /// box settings.
     pub upstream: toml::Table,
     /// The defaults of each type in the entry's type chain, the built-in
     /// root first and the entry's own type last, each with its type name.
@@ -218,8 +221,16 @@ impl Expansion {
 /// a box setting or has a value of the wrong shape. It names the layer
 /// that set the bad value.
 pub fn expand(entry: &BoxEntry, layers: &Layers) -> Result<Expansion, Error> {
-    let mut ordered: Vec<(Origin, &toml::Table)> =
-        vec![(Origin::of(Layer::Upstream), &layers.upstream)];
+    // The `[upstream]` table is the registry pin, so it sets the one spec
+    // key `upstream` and nothing else. An empty table sets nothing.
+    let mut upstream = toml::Table::new();
+    if !layers.upstream.is_empty() {
+        upstream.insert(
+            "upstream".to_owned(),
+            toml::Value::Table(layers.upstream.clone()),
+        );
+    }
+    let mut ordered: Vec<(Origin, &toml::Table)> = vec![(Origin::of(Layer::Upstream), &upstream)];
     for (box_type, table) in &layers.type_defaults {
         ordered.push((Origin::type_defaults(box_type), table));
     }
@@ -467,6 +478,10 @@ fn check_keys(entry: &BoxEntry, expansion: &Expansion) -> Result<(), Error> {
         let problem = match SPEC_KEYS.iter().find(|(k, _)| k == key) {
             None => SpecKeyProblem::Unknown,
             Some((_, shape)) => match shape.mismatch(value) {
+                None if key.as_str() == "upstream" => {
+                    check_upstream(entry, value, origin)?;
+                    continue;
+                }
                 None => continue,
                 Some(found) => SpecKeyProblem::WrongShape {
                     expected: shape.words(),
@@ -477,6 +492,47 @@ fn check_keys(entry: &BoxEntry, expansion: &Expansion) -> Result<(), Error> {
         let origin = bad_value_origin(origin, value);
         return Err(Error::InvalidSpecKey {
             key: key.clone(),
+            layer: layer_words(entry, origin),
+            problem,
+        });
+    }
+    Ok(())
+}
+
+/// The keys of an `[upstream]` table, the registry pin. Each takes a
+/// string.
+const UPSTREAM_KEYS: &[&str] = &["branch", "build_cache_url", "commit", "repo_url"];
+
+/// Checks every key inside the spec's `upstream` table, in key order. The
+/// error names a key of minimal.toml's `[upstream]` by its own name, and
+/// the same key from any other layer as `upstream.<key>`.
+fn check_upstream(
+    entry: &BoxEntry,
+    value: &toml::Value,
+    origin: Option<&ValueOrigin>,
+) -> Result<(), Error> {
+    let Some(pin) = value.as_table() else {
+        return Ok(());
+    };
+    let origin = origin.and_then(ValueOrigin::first);
+    let keys: BTreeSet<&String> = pin.keys().collect();
+    for key in keys {
+        let problem = if !UPSTREAM_KEYS.contains(&key.as_str()) {
+            SpecKeyProblem::UnknownUpstream
+        } else if let Some(found) = Shape::Str.mismatch(&pin[key.as_str()]) {
+            SpecKeyProblem::WrongShape {
+                expected: Shape::Str.words(),
+                found,
+            }
+        } else {
+            continue;
+        };
+        let key = match origin {
+            Some(o) if o.layer == Layer::Upstream => key.clone(),
+            _ => format!("upstream.{key}"),
+        };
+        return Err(Error::InvalidSpecKey {
+            key,
             layer: layer_words(entry, origin),
             problem,
         });
@@ -756,14 +812,20 @@ mod tests {
             timeout = "entry"
         "#;
         let layers = || Layers {
-            upstream: table("packages = [\"u\"]\ntimeout = \"upstream\"\npty_enabled = false"),
+            upstream: table(
+                "repo_url = \"https://github.com/gominimal/pkgs\"\ncommit = \"abc123\"",
+            ),
             type_defaults: vec![
                 (
                     "session".to_owned(),
-                    table("packages = [\"t1\"]\ntimeout = \"t1\""),
+                    table("packages = [\"u\"]\ntimeout = \"upstream\"\npty_enabled = false"),
                 ),
                 (
                     "rust-dev".to_owned(),
+                    table("packages = [\"t1\"]\ntimeout = \"t1\""),
+                ),
+                (
+                    "rust-dev-plus".to_owned(),
                     table("packages = [\"t2\"]\ntimeout = \"t2\""),
                 ),
             ],
@@ -782,6 +844,18 @@ mod tests {
             toml::Value::Table(table("memory = \"1G\""))
         );
         assert_eq!(all.spec["pty_enabled"].as_bool(), Some(false));
+        // The `[upstream]` layer is the registry pin: the spec's one
+        // `upstream` table, as minimal.toml writes it.
+        assert_eq!(
+            all.spec["upstream"],
+            toml::Value::Table(table(
+                "repo_url = \"https://github.com/gominimal/pkgs\"\ncommit = \"abc123\""
+            ))
+        );
+        assert_eq!(
+            all.report.values["upstream"],
+            ValueOrigin::Value(Origin::of(Layer::Upstream))
+        );
 
         // Take the layers away from the top: the next one down decides.
         let mut l = layers();
@@ -801,9 +875,13 @@ mod tests {
         l.type_defaults.pop();
         let e = expand_in(only_upstream_and_types, "dev", l.clone()).expect("expands");
         assert_eq!(e.spec["timeout"].as_str(), Some("t1"));
+        l.type_defaults.pop();
+        let e = expand_in(only_upstream_and_types, "dev", l.clone()).expect("expands");
+        assert_eq!(e.spec["timeout"].as_str(), Some("upstream"));
         l.type_defaults.clear();
         let e = expand_in(only_upstream_and_types, "dev", l).expect("expands");
-        assert_eq!(e.spec["timeout"].as_str(), Some("upstream"));
+        assert_eq!(e.spec.get("timeout"), None);
+        assert!(e.spec.contains_key("upstream"));
 
         // A scalar in a later layer replaces an earlier list, and a list
         // after it starts the union again.
@@ -961,7 +1039,7 @@ mod tests {
     // shape, exits 3 and names the key and the layer that set it.
     #[test]
     fn invalid_key_exit3_names_key_and_layer() {
-        let cases: [(&str, Layers, &str); 7] = [
+        let cases: [(&str, Layers, &str); 9] = [
             (
                 "[defaults]\ntimeot = \"2h\"\n[sessions.dev]\n",
                 Layers::default(),
@@ -1004,8 +1082,27 @@ mod tests {
                     upstream: table("colour = \"red\""),
                     ..Layers::default()
                 },
-                "`[upstream]` in minimal.toml sets `colour`, which is not a box \
-                 setting. Remove the key or correct its name.",
+                "`[upstream]` in minimal.toml sets `colour`, which is not an \
+                 `[upstream]` setting. The `[upstream]` settings are `repo_url`, \
+                 `branch`, `commit` and `build_cache_url`. Remove the key or \
+                 correct its name.",
+            ),
+            (
+                "[sessions.dev]\n",
+                Layers {
+                    upstream: table("commit = 5"),
+                    ..Layers::default()
+                },
+                "`[upstream]` in minimal.toml sets `commit` to a whole number, but \
+                 `commit` takes a string. Fix the value.",
+            ),
+            (
+                "[sessions.dev]\nupstream = { colour = \"red\" }\n",
+                Layers::default(),
+                "`[sessions.dev]` in minimal.toml sets `upstream.colour`, which is \
+                 not an `[upstream]` setting. The `[upstream]` settings are \
+                 `repo_url`, `branch`, `commit` and `build_cache_url`. Remove the \
+                 key or correct its name.",
             ),
             (
                 "[tasks.lint]\nexec = \"cargo clippy\"\n",
@@ -1034,6 +1131,21 @@ mod tests {
         )
         .expect("the expanded spec is valid");
         assert_eq!(ok.spec["pty_enabled"].as_bool(), Some(true));
+
+        // The registry pin's keys expand without error.
+        let ok = expand_in(
+            "[sessions.dev]\n",
+            "dev",
+            Layers {
+                upstream: table(
+                    "repo_url = \"https://github.com/gominimal/pkgs\"\n\
+                     commit = \"abc123\"",
+                ),
+                ..Layers::default()
+            },
+        )
+        .expect("the registry pin is valid");
+        assert_eq!(ok.spec["upstream"]["commit"].as_str(), Some("abc123"));
 
         // Every key a built-in type's defaults set, and the Box Spec
         // sections an entry can set, are box settings.
@@ -1081,7 +1193,7 @@ mod tests {
     #[test]
     fn expansion_reports_layer_and_type_per_value_outside_spec_bytes() {
         let layers = Layers {
-            upstream: table("description = \"from upstream\""),
+            upstream: table("commit = \"abc123\""),
             type_defaults: vec![
                 ("session".to_owned(), table("lifetime = \"until_complete\"")),
                 (
@@ -1102,7 +1214,7 @@ mod tests {
             ValueOrigin::Value(o) => o.clone(),
             other => panic!("{k} is a list: {other:?}"),
         };
-        assert_eq!(value("description"), Origin::of(Layer::Upstream));
+        assert_eq!(value("upstream"), Origin::of(Layer::Upstream));
         assert_eq!(value("lifetime"), Origin::type_defaults("session"));
         assert_eq!(value("machine"), Origin::of(Layer::DefaultsType));
         assert_eq!(value("network"), Origin::of(Layer::Entry));
