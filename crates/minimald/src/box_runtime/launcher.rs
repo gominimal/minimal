@@ -155,16 +155,12 @@ pub(crate) struct LaunchSpec {
     /// The spec stored beside the box's record (BOX-068). `None` for a box
     /// filed with no spec: a client that predates it, or the dashboard.
     pub(crate) spec: Option<std::sync::Arc<mfile::spec::BoxSpec>>,
-    /// Whether an exec runs the command the box is for. When it is set, the
-    /// launch starts the shell, whatever entrypoint the spec names.
-    ///
-    /// Interim: the box's actor sets this to `true` on every launch, a hook
-    /// launch and an attach included. `min task run` sends a task's run
-    /// over the exec channel, so a task box starts the shell and not its
-    /// spec's argv, and the task runs once. Flip condition: T43 (#2405)
-    /// moves a task's run from the exec channel to the box's entrypoint,
-    /// and removes the constant.
-    pub(crate) run_by_exec: bool,
+    /// Whether the launch is minted only for lifecycle hooks. A hook
+    /// launch starts the shell, whatever entrypoint the spec names: the
+    /// hooks need the box, and a task's argv must not run before its
+    /// activate hooks end. Every other launch starts the spec's
+    /// entrypoint, so a task box runs its task as its first process (T43).
+    pub(crate) for_hooks: bool,
 }
 
 /// The first process a launch starts, as [`LaunchSpec::entrypoint`]
@@ -202,7 +198,7 @@ impl LaunchEntrypoint {
 impl LaunchSpec {
     /// The one place a launch decides its box's first process (T42):
     ///
-    /// - a box with no spec, and a box whose run an exec carries, start the
+    /// - a box with no spec, and a launch minted only for hooks, start the
     ///   shell;
     /// - otherwise the spec's entrypoint: the shell, or its argv.
     ///
@@ -219,7 +215,7 @@ impl LaunchSpec {
         };
         match &spec.entrypoint {
             mfile::spec::Entrypoint::Shell => Ok(LaunchEntrypoint::Shell),
-            mfile::spec::Entrypoint::Exec(_) if self.run_by_exec => Ok(LaunchEntrypoint::Shell),
+            mfile::spec::Entrypoint::Exec(_) if self.for_hooks => Ok(LaunchEntrypoint::Shell),
             mfile::spec::Entrypoint::Exec(argv) => {
                 let Some((program, args)) = argv.split_first() else {
                     return Err(io::Error::new(
@@ -240,6 +236,71 @@ impl LaunchSpec {
         }
     }
 }
+
+impl LaunchSpec {
+    /// Whether `entrypoint` runs on three pipes, not on the box's terminal:
+    /// an argv entrypoint of a box whose spec does not set
+    /// `io.pty_enabled`. Such a box speaks the pipeline contract, so a task
+    /// run relays its stdin, stdout and stderr as three streams (T43).
+    pub(crate) fn runs_on_pipes(&self, entrypoint: &LaunchEntrypoint) -> bool {
+        matches!(entrypoint, LaunchEntrypoint::Argv { .. })
+            && self.spec.as_deref().is_some_and(|spec| !spec.pty_enabled)
+    }
+}
+
+/// The daemon's ends of the three pipes an entrypoint runs on when
+/// [`LaunchSpec::runs_on_pipes`] says so. The launch's
+/// [`Launched::master`] is then the read end of the entrypoint's stdout.
+pub(crate) struct EntrypointPipes {
+    /// The write end of the entrypoint's stdin.
+    pub(super) stdin: OwnedFd,
+    /// The read end of the entrypoint's stderr.
+    pub(super) stderr: OwnedFd,
+}
+
+/// The three pipes of an entrypoint that runs on pipes: what the child
+/// gets as its stdin, stdout and stderr, and the daemon's ends. Every end
+/// is close-on-exec, so no other process inherits one. The child's ends
+/// become its fds 0, 1 and 2 through `dup2`, which clears the flag there.
+pub(crate) struct ChildPipes {
+    pub(crate) stdin: OwnedFd,
+    pub(crate) stdout: OwnedFd,
+    pub(crate) stderr: OwnedFd,
+    /// The read end of the child's stdout: the launch's master.
+    pub(crate) stdout_reader: OwnedFd,
+    pub(crate) parent: EntrypointPipes,
+}
+
+impl ChildPipes {
+    /// Opens the three pipes.
+    ///
+    /// # Errors
+    ///
+    /// The error of `pipe2(2)`.
+    pub(crate) fn open() -> io::Result<Self> {
+        let pipe = || nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).map_err(io::Error::from);
+        let (stdin, stdin_writer) = pipe()?;
+        let (stdout_reader, stdout) = pipe()?;
+        let (stderr_reader, stderr) = pipe()?;
+        Ok(Self {
+            stdin,
+            stdout,
+            stderr,
+            stdout_reader,
+            parent: EntrypointPipes {
+                stdin: stdin_writer,
+                stderr: stderr_reader,
+            },
+        })
+    }
+}
+
+/// The name among a task run's entrypoint variables
+/// ([`AttachEnv::entrypoint`]) under which the run stages the directory its
+/// box's entrypoint starts in (`inherit_cwd`). A launch takes it out before
+/// the environment is built, so it never reaches the box.
+/// The `:` keeps it apart from any variable name a task can declare.
+pub(crate) const START_DIR_KEY: &str = "minimal:start-dir";
 
 /// Where a command should start in a session, and with what environment.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -325,6 +386,10 @@ pub(crate) struct Launched<P, G> {
     /// startup files are the user's — waits for the first attach. `None` on
     /// every other launch, whose shell starts at once.
     pub(super) start_gate: Option<sandbox::StartGate>,
+    /// The daemon's ends of the entrypoint's stdin and stderr, on a launch
+    /// whose entrypoint runs on pipes ([`LaunchSpec::runs_on_pipes`]).
+    /// `None` on a launch that gives its process the terminal.
+    pub(super) pipes: Option<EntrypointPipes>,
 }
 
 /// The box's output log as its host writes it (BOX-155): every byte the
@@ -479,6 +544,13 @@ pub(crate) struct AttachEnv {
     /// sandbox has no host `/dev/pts` and the Unix-socket transport has no peer
     /// address, so any value would name something that doesn't exist in-session.)
     pub(crate) connection: Vec<(String, String)>,
+    /// A task run's resolved variables (T43), and the directory it starts
+    /// in under [`START_DIR_KEY`]: for the argv entrypoint's process alone,
+    /// layered above everything else in its environment. They can hold
+    /// values the caller's shell gave, secrets among them. So neither the
+    /// box's environment nor the host's connection layer keeps them, and no
+    /// later exec, attach or hook in the box sees them.
+    pub(crate) entrypoint: Vec<(String, String)>,
 }
 
 impl AttachEnv {
@@ -1111,6 +1183,7 @@ impl BoxLauncher for SandboxLauncher {
         // Decided before anything is built, so a spec no launch can start
         // reserves nothing.
         let entrypoint = self.entrypoint()?;
+        let on_pipes = self.spec.runs_on_pipes(&entrypoint);
         let ctx = self.ctx;
         // Move the session policy out of `self` up front so it can be applied
         // after the switch attach below (the rest of `self` is consumed first).
@@ -1491,6 +1564,15 @@ impl BoxLauncher for SandboxLauncher {
         // follow any that the composition sets. A count that is not a
         // number adds no pairs, so the pairs the box set stay as they are.
         let mut connection = attach_env.connection;
+        // A task run's start directory rides its entrypoint variables (see
+        // [`START_DIR_KEY`]). Only an argv entrypoint starts there, and only
+        // an argv entrypoint gets the variables.
+        let mut entrypoint_vars = attach_env.entrypoint;
+        let start_dir = entrypoint_vars
+            .iter()
+            .rposition(|(key, _)| key == START_DIR_KEY)
+            .map(|at| entrypoint_vars.remove(at).1);
+        entrypoint_vars.retain(|(key, _)| key != START_DIR_KEY);
         let git_config_count = composition_vars
             .iter()
             .chain(&connection)
@@ -1582,7 +1664,14 @@ impl BoxLauncher for SandboxLauncher {
             let mut container = env
                 .container(&plan)
                 .map_err(|e| io::Error::other(format!("container build: {e}")))?;
-            container.set_session_leader();
+            // The entrypoint leads a session of its own either way. Only a
+            // terminal can be its controlling terminal: on pipes, taking one
+            // fails with ENOTTY and the entrypoint never runs.
+            if on_pipes {
+                container.set_session_leader_without_terminal();
+            } else {
+                container.set_session_leader();
+            }
             // A launch minted only for hooks holds its shell at the gate: the
             // hooks need the box, not the shell, and the shell's startup —
             // the user's rc files and prompt commands — must not run ahead of
@@ -1701,23 +1790,57 @@ impl BoxLauncher for SandboxLauncher {
                 // The argv runs in the same environment the shell gets.
                 // `SHELL` and `PS1` stay as composed: no shell of the
                 // daemon's choosing runs here for them to describe.
-                LaunchEntrypoint::Argv { program, args } => env
-                    .command(&container, program, args.iter().map(String::as_str))
-                    .map_err(|e| io::Error::other(format!("build command: {e}")))?,
+                LaunchEntrypoint::Argv { program, args } => {
+                    let mut command = env
+                        .command(&container, program, args.iter().map(String::as_str))
+                        .map_err(|e| io::Error::other(format!("build command: {e}")))?;
+                    // The task run's variables reach this process, and the
+                    // processes it starts, and nothing else in the box.
+                    for (key, value) in &entrypoint_vars {
+                        command.env(key, value);
+                    }
+                    // `inherit_cwd`: the in-box `min task run` reads its
+                    // `$PWD`, so the argv starts where the client ran.
+                    if let Some(dir) = &start_dir {
+                        command.current_dir(dir);
+                        command.env("PWD", dir);
+                    }
+                    command
+                }
             };
-            command.stdin(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
-            command.stdout(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
-            let tty_path = pty.slave_path().to_path_buf();
-            // Kept for one notice written after the switch attach below (an
-            // own-address box the hostname proxy stranded), so it is said in
-            // the terminal, not only in the daemon's log. Never for a hook
-            // launch: its pty is read by nobody. Dropped before the launch
-            // returns, so it never outlives the shell's own slave fds.
-            let late_notice_fd = (matches!(network_mode, NetworkMode::OwnIp) && !for_hooks)
-                .then(|| pty.dup_slave_fd().ok())
-                .flatten();
-            let (master, slave) = pty.into_fds();
-            command.stderr(hakoniwa::Stdio::from(slave));
+            // A box without a terminal runs its argv on three pipes, so
+            // a task run relays its stdin, stdout and stderr (T43). The
+            // host reads the stdout pipe where it reads a terminal's
+            // master, and nothing holds the terminal opened above.
+            let (master, tty_path, late_notice_fd, pipes) = if on_pipes {
+                let child = ChildPipes::open()?;
+                command.stdin(hakoniwa::Stdio::from(child.stdin));
+                command.stdout(hakoniwa::Stdio::from(child.stdout));
+                command.stderr(hakoniwa::Stdio::from(child.stderr));
+                drop(pty);
+                (
+                    child.stdout_reader,
+                    std::path::PathBuf::from("/dev/null"),
+                    None,
+                    Some(child.parent),
+                )
+            } else {
+                command.stdin(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
+                command.stdout(hakoniwa::Stdio::from(pty.dup_slave_fd()?));
+                let tty_path = pty.slave_path().to_path_buf();
+                // Kept for one notice written after the switch attach below
+                // (an own-address box the hostname proxy stranded), so it is
+                // said in the terminal, not only in the daemon's log. Never
+                // for a hook launch: its pty is read by nobody. Dropped
+                // before the launch returns, so it never outlives the
+                // shell's own slave fds.
+                let late_notice_fd = (matches!(network_mode, NetworkMode::OwnIp) && !for_hooks)
+                    .then(|| pty.dup_slave_fd().ok())
+                    .flatten();
+                let (master, slave) = pty.into_fds();
+                command.stderr(hakoniwa::Stdio::from(slave));
+                (master, tty_path, late_notice_fd, None)
+            };
 
             // On the fork thread, never this one: the container dies with
             // the thread that forked it (see `sandbox::forker`).
@@ -1734,11 +1857,12 @@ impl BoxLauncher for SandboxLauncher {
                 late_notice_fd,
                 start_gate,
                 namespace_gate,
+                pipes,
             ))
         }
         .await;
 
-        let (env, master, process, tty_path, late_notice_fd, start_gate, namespace_gate) =
+        let (env, master, process, tty_path, late_notice_fd, start_gate, namespace_gate, pipes) =
             match build_and_spawn {
                 Ok(parts) => parts,
                 Err(e) => return Err(e),
@@ -1956,6 +2080,7 @@ impl BoxLauncher for SandboxLauncher {
             // cancelled launch's plan never reaches any host at all.
             listen_plan,
             start_gate,
+            pipes,
         })
     }
 }

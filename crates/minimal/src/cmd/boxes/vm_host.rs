@@ -2078,10 +2078,12 @@ mod tests {
         assert_eq!(requests.lock().unwrap().len(), 2, "nothing to release by");
     }
 
-    /// A finished task run releases the hold an attach or exec into its
-    /// session may have re-made: one release naming the session and its
-    /// id, since the daemon ends that session with no client destroy to
-    /// release it. A kept session's hold is left for its destroy.
+    /// A task run that removed its box releases the hold an attach or exec
+    /// into the box may have re-made: one release naming the box and its
+    /// id, and the retire of its egress. A box the run keeps releases
+    /// nothing, neither its name nor its egress: it may still run
+    /// (BOX-015), or keeps its record until it is reaped (BOX-018), and its
+    /// reap releases both.
     #[tokio::test]
     async fn a_finished_task_run_releases_its_sessions_name_hold() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -2095,13 +2097,29 @@ mod tests {
         let control_sock = || vm_host_control_sock(paths::HostKind::Minvmd, Some(dir.path()));
         let id = boxes::SessionId::nil();
 
-        crate::task::release_task_name_hold(control_sock(), id, "task-build-9c1e", true).await;
+        crate::task::release_task_box_holds(
+            crate::task::TaskBoxEnd::Keep,
+            control_sock(),
+            id,
+            "task-build-9c1e",
+        )
+        .await;
         assert!(
             requests.lock().unwrap().is_empty(),
-            "a kept session keeps its hold"
+            "a kept box keeps its name hold"
+        );
+        assert!(
+            residency.lock().unwrap().is_empty(),
+            "a kept box keeps its egress"
         );
 
-        crate::task::release_task_name_hold(control_sock(), id, "task-build-9c1e", false).await;
+        crate::task::release_task_box_holds(
+            crate::task::TaskBoxEnd::Remove,
+            control_sock(),
+            id,
+            "task-build-9c1e",
+        )
+        .await;
         let seen = requests.lock().unwrap();
         assert_eq!(seen.len(), 1, "one release, one request");
         let minimald_rpc::BoxControlRequest::ReleaseBoxName(request) =

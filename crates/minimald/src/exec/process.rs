@@ -77,6 +77,26 @@ impl Exec for TaskExec {
     const ENDED_BY_BOX_DESTROY: bool = false;
 
     fn exec(self, session: BoxHandle) -> BoxStream<'static, io::Result<Self::Process>> {
+        // T43: a task box runs its task as its entrypoint. The run relays
+        // that entrypoint, and runs nothing beside the box. Any other
+        // request takes the older path below, kept for one release.
+        stream::once(async move {
+            match task_entrypoint_box(&self, &session).await {
+                Some(run) => stream::once(async move { run.start(self, session).await }).boxed(),
+                None => self.sandboxed(session),
+            }
+        })
+        .flatten()
+        .boxed()
+    }
+}
+
+impl TaskExec {
+    /// The older task path: the task runs in a sandbox of its own, beside
+    /// the box. Kept for one release, for a client that sends its task's
+    /// arguments on the request, as a `min` from before T43 does, and for
+    /// a box that is not a task box.
+    fn sandboxed(self, session: BoxHandle) -> BoxStream<'static, io::Result<TaskProcess>> {
         // 1-slot request/response channels: the producer only spawns
         // the next child once the consumer pulls. Dropping a
         // `HakoniwaProcess` orphans the child, so we don't want to
@@ -677,6 +697,8 @@ impl Process for HakoniwaProcess {
 pub enum TaskProcess {
     Sandbox(HakoniwaProcess),
     Echo(EchoProcess),
+    Entrypoint(EntrypointProcess),
+    Refused(RefusedProcess),
 }
 
 impl Process for TaskProcess {
@@ -693,6 +715,8 @@ impl Process for TaskProcess {
                 Some((Box::pin(i), Box::pin(o), Box::pin(e)))
             }
             TaskProcess::Echo(p) => p.take_stdio(),
+            TaskProcess::Entrypoint(p) => p.take_stdio(),
+            TaskProcess::Refused(p) => p.take_stdio(),
         }
     }
 
@@ -700,6 +724,8 @@ impl Process for TaskProcess {
         match self {
             TaskProcess::Sandbox(p) => p.wait().await,
             TaskProcess::Echo(p) => p.wait().await,
+            TaskProcess::Entrypoint(p) => p.wait().await,
+            TaskProcess::Refused(p) => p.wait().await,
         }
     }
 
@@ -707,7 +733,367 @@ impl Process for TaskProcess {
         match self {
             TaskProcess::Sandbox(p) => p.start_kill(),
             TaskProcess::Echo(p) => p.start_kill(),
+            TaskProcess::Entrypoint(p) => p.start_kill(),
+            TaskProcess::Refused(p) => p.start_kill(),
         }
+    }
+}
+
+/// A task box whose entrypoint a task run relays (T43), as
+/// [`task_entrypoint_box`] finds it.
+pub(super) struct TaskEntrypointBox {
+    record: boxes::Record,
+    dir: boxes::store::BoxDir,
+}
+
+/// The task box `exec` runs in, when its entrypoint is the task: a box
+/// whose stored spec sets `lifetime = "until_complete"`, names an argv as
+/// its entrypoint and this task as its entry. The spec's settings decide,
+/// never its Box Type. `None` sends the request down the older path: a
+/// request that carries the task's arguments (a client from before T43
+/// sends them there, not in the spec), a box whose spec says otherwise,
+/// or a box with no spec that can be read. A request's directory is no reason for
+/// the older path: the entrypoint starts there (see
+/// [`TaskEntrypointBox::start`]).
+pub(super) async fn task_entrypoint_box(
+    exec: &TaskExec,
+    session: &BoxHandle,
+) -> Option<TaskEntrypointBox> {
+    if !exec.args.is_empty() {
+        return None;
+    }
+    let paths = session.paths().await.ok()?;
+    let dir = boxes::store::BoxDir::for_tree(&paths.working)?;
+    let record = session.record().await.ok()?;
+    let bytes = std::fs::read(
+        paths
+            .home
+            .as_utf8_path()
+            .parent()?
+            .join(boxes::store::SPEC_FILE),
+    )
+    .ok()?;
+    let spec = crate::box_runtime::stored_spec(&bytes).ok()?;
+    let is_task_entrypoint =
+        crate::box_actor::entry_run_as_entrypoint(&spec) == Some(exec.task.as_str());
+    is_task_entrypoint.then_some(TaskEntrypointBox { record, dir })
+}
+
+/// The refusal of a task run whose box's entrypoint another run relays:
+/// the host hands the entrypoint's streams to one run at a time
+/// ([`crate::box_runtime::EntrypointIoTake::Relayed`]).
+pub(crate) fn entrypoint_relayed_refusal(task: &str, box_name: &str) -> String {
+    format!(
+        "Task {task} is already running in box {box_name}, and another min task run shows its \
+         output. Only one run at a time can show a task's output."
+    )
+}
+
+/// How often a task run checks whether its box's entrypoint ended, and
+/// whether the box's record keeps the end.
+const ENTRYPOINT_POLL: Duration = Duration::from_millis(100);
+
+/// How long the run waits for the box's actor to write the ended record
+/// after the entrypoint's host ends.
+const ENTRYPOINT_RECORD_WAIT: Duration = Duration::from_secs(30);
+
+impl TaskEntrypointBox {
+    /// Starts the box's entrypoint, or joins it when it already runs, and
+    /// relays its stdin, stdout and stderr. The task's resolved variables
+    /// go to the launch that starts the entrypoint (see
+    /// [`crate::box_actor::entrypoint_env`]).
+    async fn start(self, exec: TaskExec, session: BoxHandle) -> io::Result<TaskProcess> {
+        let box_id = self.record.id;
+        let box_name = self
+            .record
+            .name
+            .clone()
+            .unwrap_or_else(|| box_id.to_string());
+        let span = tracing::info_span!(
+            "task_run",
+            box_id = %box_id,
+            box_name = %box_name,
+            task = %exec.task,
+        );
+        // `inherit_cwd`: the client sends a directory only for a task that
+        // declares it. The entrypoint starts there, so the in-box `min task
+        // run` reads it as its `$PWD`. A directory that is not in the
+        // uploaded tree starts the entrypoint at the root, with a notice.
+        let working = session.paths().await?.working;
+        let (start_dir, start_notice) =
+            match task_start_dir(true, &exec.cwd, working.as_utf8_path().as_std_path()) {
+                Ok(dir) => (dir, None),
+                Err(notice) => (None, Some(notice)),
+            };
+        crate::box_actor::entrypoint_env::stage(
+            box_id,
+            exec.env.into_iter().collect(),
+            start_dir.clone(),
+            exec.drop_env.clone(),
+        );
+        let username = self
+            .record
+            .username
+            .clone()
+            .unwrap_or_else(|| "user".to_string());
+        let ensured = session.ensure_host(username).instrument(span.clone()).await;
+        if ensured.is_err() {
+            // An `ensure_host` that failed before the box's actor took the
+            // staged values leaves them staged. Nothing launches for this
+            // run, so no later launch of the box may take them.
+            drop(crate::box_actor::entrypoint_env::take(&box_id));
+        }
+        let host = match ensured {
+            Ok(host) => host,
+            // The box's actor refused the start. The run says so in plain
+            // words, without the spawn-failure prefix, and exits 1.
+            Err(error) if crate::box_actor::EntrypointBehindHookShell::is(&error) => {
+                span.in_scope(|| {
+                    tracing::info!("task box: the entrypoint did not start behind a hook shell");
+                });
+                return Ok(TaskProcess::Refused(RefusedProcess::new(&format!(
+                    "Task {task} did not start in box {box_name}. {why}",
+                    task = exec.task,
+                    why = crate::box_actor::ENTRYPOINT_BEHIND_HOOK_SHELL,
+                ))));
+            }
+            Err(error) => return Err(io::Error::other(format!("{error}"))),
+        };
+        // The box runs its entrypoint on three pipes (T43): the run's stdin
+        // goes to the entrypoint's stdin, and its stdout and stderr come
+        // back as two streams.
+        let io = match host.take_entrypoint_io().await {
+            crate::box_runtime::EntrypointIoTake::Taken(io) => io,
+            crate::box_runtime::EntrypointIoTake::OnTerminal => {
+                span.in_scope(|| {
+                    tracing::warn!(
+                        "task box: the entrypoint has a terminal, so the run cannot relay it"
+                    );
+                });
+                return Err(io::Error::other(
+                    "The task's box runs its command on a terminal, so the run cannot pass its \
+                     input and output.",
+                ));
+            }
+            crate::box_runtime::EntrypointIoTake::Relayed => {
+                // The run that started the entrypoint, or one that took its
+                // place, still reads it. That run keeps the output and the
+                // exit code. This run takes nothing, and its staged values
+                // went with the join (see `ensure_host`).
+                span.in_scope(|| {
+                    tracing::info!("task box: another run relays the entrypoint; refused the run");
+                });
+                return Ok(TaskProcess::Refused(RefusedProcess::with_code(
+                    &entrypoint_relayed_refusal(&exec.task, &box_name),
+                    2,
+                )));
+            }
+            crate::box_runtime::EntrypointIoTake::HostGone => {
+                span.in_scope(|| {
+                    tracing::warn!(
+                        "task box: the box's host ended before the run took the entrypoint's \
+                         streams"
+                    );
+                });
+                return Err(io::Error::other(format!(
+                    "Box {box_name} ended before the run connected to the task's input and \
+                     output. The run cannot show the task's output."
+                )));
+            }
+        };
+        span.in_scope(|| {
+            tracing::info!(
+                drop_env = exec.drop_env.len(),
+                start_dir = ?start_dir,
+                stdin = io.stdin.is_some(),
+                "task box: the run relays the box's entrypoint"
+            );
+        });
+
+        // `None` for a run that joins an entrypoint another run started:
+        // that run has the entrypoint's stdin.
+        let stdin = io
+            .stdin
+            .map(tokio::net::unix::pipe::Sender::from_file)
+            .transpose()?;
+        let (stdout, stdout_writer) = tokio::io::duplex(64 * 1024);
+        let (stderr, mut stderr_writer) = tokio::io::duplex(64 * 1024);
+        if let Some(notice) = start_notice {
+            stderr_writer.write_all(notice.as_bytes()).await?;
+        }
+        let relays = vec![
+            spawn(relay_entrypoint_stream(io.stdout, stdout_writer).instrument(span.clone())),
+            spawn(relay_entrypoint_stream(io.stderr, stderr_writer).instrument(span.clone())),
+        ];
+        Ok(TaskProcess::Entrypoint(EntrypointProcess {
+            host,
+            record_dir: self.dir.clone(),
+            box_id,
+            box_name,
+            task: exec.task,
+            span,
+            stdio: Some((stdin, stdout, stderr)),
+            relays,
+            released: false,
+        }))
+    }
+}
+
+/// Copies one output stream of the box's entrypoint to `out` until the
+/// host ends the stream, then closes `out`. A pipe is no terminal, so the
+/// bytes are the entrypoint's own.
+async fn relay_entrypoint_stream(
+    mut chunks: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    mut out: tokio::io::DuplexStream,
+) {
+    while let Some(chunk) = chunks.recv().await {
+        if out.write_all(&chunk).await.is_err() {
+            // Nobody reads the run any more. The entrypoint runs on, and
+            // its output goes on to the box's log.
+            return;
+        }
+    }
+    let _ = out.shutdown().await;
+}
+
+/// The [`Process`] of a task run whose task is its box's entrypoint (T43).
+/// Its stdin, stdout and stderr are the entrypoint's, through the pipes it
+/// runs on, and its exit code is the one the box's record keeps when the
+/// entrypoint returns.
+///
+/// The run does not own the entrypoint. A client that goes away, or a
+/// kill of the run, stops the relay, and the box runs on (BOX-015). The
+/// box ends when its entrypoint returns (BOX-038), and keeps its record.
+pub struct EntrypointProcess {
+    /// The entrypoint's host. The run reads the exit code once it ends.
+    host: crate::box_runtime::HostHandle,
+    /// Where the box's record is read from once the entrypoint ends: the
+    /// box's actor stops with the box, so its handle answers no more.
+    record_dir: boxes::store::BoxDir,
+    box_id: SessionId,
+    box_name: String,
+    task: String,
+    span: tracing::Span,
+    stdio: Option<(
+        Option<tokio::net::unix::pipe::Sender>,
+        tokio::io::DuplexStream,
+        tokio::io::DuplexStream,
+    )>,
+    /// The copies of the entrypoint's stdout and stderr to the run.
+    relays: Vec<JoinHandle<()>>,
+    released: bool,
+}
+
+/// The exit code a task run returns for the end its box's record keeps,
+/// as `min` gives it for each end. `None` while the record keeps no end.
+fn entrypoint_end_code(state: boxes::core::record::RecordState) -> Option<i32> {
+    use boxes::core::record::{ExitEnding, RecordState, StopEnding};
+    match state {
+        RecordState::Exited(ExitEnding::Exit { exit_code })
+        | RecordState::Stopped(StopEnding::ExitedFirst { exit_code }) => Some(exit_code),
+        // 124 for a run past its timeout, and the 137 the record keeps for
+        // an OOM kill (BOX-011).
+        RecordState::Exited(ExitEnding::Timeout) => Some(124),
+        RecordState::Exited(ExitEnding::Oom) => Some(137),
+        // A stop by a signal borrows the shell's 128 + signal, so a `min
+        // box stop` (SIGTERM) gives 143. A box the daemon found running at
+        // its start was killed with it, as SIGKILL ends a process: 137.
+        RecordState::Stopped(StopEnding::Signalled { signal }) => Some(128 + signal),
+        RecordState::Stopped(StopEnding::AtDaemonStart) => Some(137),
+        _ => None,
+    }
+}
+
+impl EntrypointProcess {
+    /// The exit code for the end the box's record keeps once its
+    /// entrypoint ended ([`entrypoint_end_code`]).
+    async fn recorded_code(&self) -> io::Result<Option<i32>> {
+        let deadline = tokio::time::Instant::now() + ENTRYPOINT_RECORD_WAIT;
+        loop {
+            let dir = self.record_dir.clone();
+            let record = crate::traced::spawn_blocking(move || dir.record())
+                .await
+                .map_err(io::Error::other)??;
+            if let Some(code) = record.state().ok().and_then(entrypoint_end_code) {
+                return Ok(Some(code));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(io::Error::other(
+                    "the task box's entrypoint ended, and its record keeps no exit code",
+                ));
+            }
+            tokio::time::sleep(ENTRYPOINT_POLL).await;
+        }
+    }
+}
+
+impl Process for EntrypointProcess {
+    type Stdin = std::pin::Pin<Box<dyn AsyncWrite + Send + Unpin>>;
+    type Stdout = std::pin::Pin<Box<dyn AsyncRead + Send + Unpin>>;
+    type Stderr = std::pin::Pin<Box<dyn AsyncRead + Send + Unpin>>;
+
+    fn take_stdio(&mut self) -> Option<(Self::Stdin, Self::Stdout, Self::Stderr)> {
+        // The client's stdin goes to the entrypoint's stdin, and the
+        // bridge closes it at the client's EOF. Stdout and stderr are the
+        // entrypoint's, as two streams.
+        let (stdin, stdout, stderr) = self.stdio.take()?;
+        let stdin: Self::Stdin = match stdin {
+            Some(stdin) => Box::pin(stdin),
+            None => Box::pin(tokio::io::sink()),
+        };
+        Some((stdin, Box::pin(stdout), Box::pin(stderr)))
+    }
+
+    async fn wait(&mut self) -> io::Result<Option<i32>> {
+        if self.released {
+            return Ok(None);
+        }
+        // One at a time, and each removed once it ended: the bridge can
+        // drop this future and poll `wait` again.
+        while let Some(relay) = self.relays.first_mut() {
+            let _ = relay.await;
+            self.relays.remove(0);
+        }
+        // A relay can stop before the entrypoint ends, when nobody reads
+        // the run. The code comes only when the host ends, so wait for that.
+        while self.host.is_alive() {
+            tokio::time::sleep(ENTRYPOINT_POLL).await;
+        }
+        let code = self.recorded_code().await;
+        let _entered = self.span.enter();
+        match &code {
+            Ok(code) => tracing::info!(
+                box_id = %self.box_id,
+                box_name = %self.box_name,
+                task = %self.task,
+                exit_code = ?code,
+                "task run: returned the entrypoint's exit code"
+            ),
+            Err(error) => tracing::warn!(
+                box_id = %self.box_id,
+                box_name = %self.box_name,
+                task = %self.task,
+                %error,
+                "task run: the entrypoint ended, and the run has no exit code"
+            ),
+        }
+        code
+    }
+
+    fn start_kill(&mut self) -> io::Result<()> {
+        // BOX-015: the loss of the run's client never stops the box. The
+        // relay stops, and the box's entrypoint runs on.
+        self.released = true;
+        for relay in self.relays.drain(..) {
+            relay.abort();
+        }
+        let _entered = self.span.enter();
+        tracing::info!(
+            box_id = %self.box_id,
+            task = %self.task,
+            "task run: the client left; the box runs on"
+        );
+        Ok(())
     }
 }
 
@@ -748,6 +1134,53 @@ impl Process for EchoProcess {
 
     async fn wait(&mut self) -> io::Result<Option<i32>> {
         Ok(Some(0))
+    }
+
+    fn start_kill(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A synthetic [`Process`] for a task run the daemon refused to start: it
+/// writes the refusal on stderr and exits with its code, 1 unless set,
+/// without spawning anything.
+pub struct RefusedProcess {
+    /// `Some` until `take_stdio` hands the streams out; `None` thereafter.
+    stderr: Option<Vec<u8>>,
+    /// The exit code the run returns.
+    code: i32,
+}
+
+impl RefusedProcess {
+    fn new(text: &str) -> Self {
+        Self::with_code(text, 1)
+    }
+
+    /// A refusal that exits with `code`.
+    fn with_code(text: &str, code: i32) -> Self {
+        Self {
+            stderr: Some(format!("{text}\n").into_bytes()),
+            code,
+        }
+    }
+}
+
+impl Process for RefusedProcess {
+    type Stdin = std::pin::Pin<Box<dyn AsyncWrite + Send + Unpin>>;
+    type Stdout = std::pin::Pin<Box<dyn AsyncRead + Send + Unpin>>;
+    type Stderr = std::pin::Pin<Box<dyn AsyncRead + Send + Unpin>>;
+
+    fn take_stdio(&mut self) -> Option<(Self::Stdin, Self::Stdout, Self::Stderr)> {
+        let bytes = self.stderr.take()?;
+        Some((
+            Box::pin(tokio::io::sink()),
+            Box::pin(tokio::io::empty()),
+            Box::pin(std::io::Cursor::new(bytes)),
+        ))
+    }
+
+    async fn wait(&mut self) -> io::Result<Option<i32>> {
+        Ok(Some(self.code))
     }
 
     fn start_kill(&mut self) -> io::Result<()> {
@@ -1813,5 +2246,44 @@ impl<P: Process> Process for TimedProcess<P> {
 
     fn start_kill(&mut self) -> io::Result<()> {
         self.inner.start_kill()
+    }
+}
+
+#[cfg(test)]
+mod entrypoint_end_code_tests {
+    use super::entrypoint_end_code;
+    use boxes::core::record::{ExitEnding, RecordState, StopEnding};
+
+    // BOX-038, T43: a task run returns a code for every end the box's
+    // record keeps. A `min box stop` of a running task sends SIGTERM, so the
+    // run returns 143.
+    #[test]
+    fn until_complete_ends_on_entrypoint_return_without_client_maps_each_end_to_a_code() {
+        let end = |state| entrypoint_end_code(state);
+        assert_eq!(
+            end(RecordState::Stopped(StopEnding::Signalled { signal: 15 })),
+            Some(143)
+        );
+        assert_eq!(
+            end(RecordState::Stopped(StopEnding::Signalled { signal: 9 })),
+            Some(137)
+        );
+        assert_eq!(
+            end(RecordState::Stopped(StopEnding::AtDaemonStart)),
+            Some(137)
+        );
+        assert_eq!(
+            end(RecordState::Stopped(StopEnding::ExitedFirst {
+                exit_code: 3
+            })),
+            Some(3)
+        );
+        assert_eq!(
+            end(RecordState::Exited(ExitEnding::Exit { exit_code: 7 })),
+            Some(7)
+        );
+        assert_eq!(end(RecordState::Exited(ExitEnding::Timeout)), Some(124));
+        assert_eq!(end(RecordState::Exited(ExitEnding::Oom)), Some(137));
+        assert_eq!(end(RecordState::Running), None);
     }
 }

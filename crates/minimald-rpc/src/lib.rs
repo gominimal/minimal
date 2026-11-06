@@ -583,7 +583,7 @@ pub struct BoxConfig {
     #[serde(default = "default_hooks_enabled")]
     pub hooks_enabled: bool,
     /// Whether the box ends with the one `min task run` it is created for
-    /// (NET-131): set by a run without `--keep`, and persisted onto the
+    /// (NET-131): set by every task run, and persisted onto the
     /// record as [`boxes::Record::ends_with_run`] by the create itself, so
     /// a daemon restart at any point after the create destroys the box
     /// rather than resuming it. Defaults to `false`, which is every other
