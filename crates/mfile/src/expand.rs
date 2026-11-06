@@ -241,8 +241,13 @@ fn fold(ordered: &[(Origin, &toml::Table)]) -> Expansion {
     Expansion { spec, report }
 }
 
+/// The keys whose list is an argument vector. Order and repeats are part of
+/// the command, so a layer replaces such a list whole and keeps every item.
+const ARGV_KEYS: &[&str] = &["cmdcmd", "exec"];
+
 /// Merges one key of a layer into the spec: a list onto a list unions,
-/// each item once, and any other value replaces the spec's.
+/// each item once, and any other value replaces the spec's. An argument
+/// vector (`ARGV_KEYS`) always replaces, item for item.
 fn merge_value(
     spec: &mut toml::Table,
     report: &mut ExpansionReport,
@@ -250,6 +255,15 @@ fn merge_value(
     value: &toml::Value,
     origin: &Origin,
 ) {
+    if ARGV_KEYS.contains(&key) {
+        let value_origin = match value {
+            toml::Value::Array(items) => ValueOrigin::List(vec![origin.clone(); items.len()]),
+            _ => ValueOrigin::Value(origin.clone()),
+        };
+        spec.insert(key.to_owned(), value.clone());
+        report.values.insert(key.to_owned(), value_origin);
+        return;
+    }
     if let (Some(toml::Value::Array(have)), toml::Value::Array(add)) = (spec.get_mut(key), value) {
         let origins = match report.values.get_mut(key) {
             Some(ValueOrigin::List(origins)) => origins,
@@ -548,6 +562,21 @@ mod tests {
             toml::Value::Table(table("cpus = 2\nmemory = \"4G\""))
         );
         assert!(!lint.spec.contains_key("session"), "{:?}", lint.spec);
+        assert_eq!(strings(lint.spec.get("exec")), ["cargo", "clippy"]);
+
+        // An argument vector replaces whole and keeps its repeats.
+        let argv = r#"
+            [defaults.task]
+            exec = ["cargo", "clippy"]
+            cmdcmd = ["sh", "-c", "x"]
+
+            [tasks.test]
+            exec = ["cargo", "test", "test"]
+            cmdcmd = ["cp", "a", "a"]
+        "#;
+        let test = expand_in(argv, "test", Layers::default()).expect("test expands");
+        assert_eq!(strings(test.spec.get("exec")), ["cargo", "test", "test"]);
+        assert_eq!(strings(test.spec.get("cmdcmd")), ["cp", "a", "a"]);
 
         // `[defaults.<project type>]` is a type table too.
         let types: BTreeSet<String> = ["rust-dev".to_owned()].into();
