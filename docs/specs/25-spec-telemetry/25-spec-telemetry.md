@@ -379,7 +379,8 @@ has a unit test. No repeatable macOS VM lane exists yet (minimal#2037).
 - **TEL-022** THE SYSTEM SHALL run the daemon's work for a request (manager and
   session messages, compose, checkouts, blocking-pool work, spawned
   short-lived tasks, package fetches, orchestrator and check tasks, port
-  hand-overs and publish moves) in descendants of that request's span.
+  hand-overs and publish moves, the reap of a session its connection left
+  unfinalized) in descendants of that request's span.
   tier:     T0
   verify:   cargo nextest run -p minimald a_message_carries_its_senders_context_not_its_span
   test:     crates/minimald/src/traced.rs::a_message_carries_its_senders_context_not_its_span;
@@ -394,6 +395,7 @@ has a unit test. No repeatable macOS VM lane exists yet (minimal#2037).
             crates/minimald/src/exec.rs::a_git_receive_task_runs_in_its_span;
             crates/minimald/src/exec.rs::a_git_upload_task_runs_in_its_span;
             crates/minimald/src/box_manager/tests.rs::a_hand_over_and_a_publish_move_join_the_requests_trace;
+            crates/minimald/src/server/tests.rs::the_reap_of_an_unfinalized_session_joins_its_creators_trace;
             crates/minimald/src/traced.rs::no_direct_tokio_spawn_blocking (a text guard;
             review S15 lists spawn forms it misses)
   lab:      710d, 713, 716

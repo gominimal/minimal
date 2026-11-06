@@ -128,8 +128,9 @@ pub struct Connection {
     /// composition-gating prompt) doesn't strand a half-built session
     /// that holds its name hostage. Finalized (`Active`) sessions are
     /// long-lived and outlive the connection, so they are never reaped
-    /// here.
-    created_sessions: Vec<SessionId>,
+    /// here. Each with the trace context of the request that created it,
+    /// for the reap to join (TEL-022).
+    created_sessions: Vec<(SessionId, crate::traced::Caller)>,
 
     /// Held while this connection is live; every session created over it
     /// keeps a weak reference (see [`ConnectionHandle::liveness`]).
@@ -231,21 +232,24 @@ impl ConnectionHandle {
     }
 
     /// Record a session created via `CreateSession` over this connection,
-    /// so an unfinalized one can be reaped when the connection closes.
+    /// so an unfinalized one can be reaped when the connection closes, in
+    /// the trace of the request this is called from.
     pub async fn record_created_session(&self, id: SessionId) {
-        self.0.lock().await.created_sessions.push(id);
+        let creator = crate::traced::caller_context();
+        self.0.lock().await.created_sessions.push((id, creator));
     }
 
     /// Drain and return the ids of every session created over this
-    /// connection. Called once at connection teardown to decide which
-    /// half-built sessions to reap.
+    /// connection, each with its creating request's trace context. Called
+    /// once at connection teardown to decide which half-built sessions to
+    /// reap.
     ///
     /// The liveness is deliberately left held here: the sessions this
     /// returns are still unreaped, and one that stopped counting its creator
     /// as live now would let an attach from elsewhere configure a half-built
     /// `Draft` before the reap deletes it. [`Self::release_liveness`] ends
     /// it, after the reap.
-    pub async fn take_created_sessions(&self) -> Vec<SessionId> {
+    pub async fn take_created_sessions(&self) -> Vec<(SessionId, crate::traced::Caller)> {
         std::mem::take(&mut self.0.lock().await.created_sessions)
     }
 
