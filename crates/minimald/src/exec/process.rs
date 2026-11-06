@@ -814,6 +814,7 @@ impl TaskEntrypointBox {
             box_id = %box_id,
             box_name = %box_name,
             task = %exec.task,
+            stdin = tracing::field::Empty,
         );
         // `inherit_cwd`: the client sends a directory only for a task that
         // declares it. The entrypoint starts there, so the in-box `min task
@@ -901,6 +902,9 @@ impl TaskEntrypointBox {
                 )));
             }
         };
+        // Whether this run passes its stdin to the entrypoint, whose in-box
+        // `min task run` forwards it to the task (T123).
+        span.record("stdin", io.stdin.is_some());
         span.in_scope(|| {
             tracing::info!(
                 drop_env = exec.drop_env.len(),
@@ -954,6 +958,100 @@ async fn relay_entrypoint_stream(
         }
     }
     let _ = out.shutdown().await;
+}
+
+/// The stdin that the in-box `min task run` forwards over its minenv
+/// connection, as it goes to the task's stdin pipe (T123). The in-box run
+/// is a task box's entrypoint, so this is how the run's own stdin reaches
+/// the task.
+///
+/// A thread copies the connection to the pipe and closes the pipe at the
+/// connection's EOF, so the task reads EOF. When the task closes its stdin
+/// or ends first, the thread reads on and drops the rest until the helper
+/// closes its side. So the helper's writes never fail, and the run's last
+/// lines (its `exit:` line among them) reach it.
+pub(crate) struct ForwardedStdin {
+    connection: std::os::unix::net::UnixStream,
+    done: std::sync::mpsc::Receiver<io::Result<()>>,
+    ended: bool,
+}
+
+impl ForwardedStdin {
+    /// Starts the copy of `connection` to `task_stdin`.
+    pub(crate) fn start(
+        connection: &std::os::unix::net::UnixStream,
+        task_stdin: impl io::Write + Send + 'static,
+    ) -> io::Result<Self> {
+        let reader = connection.try_clone()?;
+        let connection = connection.try_clone()?;
+        let (tx, done) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("task-stdin".to_string())
+            .spawn(move || {
+                let _ = tx.send(copy_forwarded_stdin(reader, task_stdin));
+            })?;
+        Ok(Self {
+            connection,
+            done,
+            ended: false,
+        })
+    }
+
+    /// The error that stopped the copy while the task still read its
+    /// stdin, if the copy ended with one. Does not wait.
+    pub(crate) fn failure(&mut self) -> Option<io::Error> {
+        match self.done.try_recv() {
+            Ok(Err(error)) => {
+                self.ended = true;
+                Some(error)
+            }
+            Ok(Ok(())) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.ended = true;
+                None
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+        }
+    }
+
+    /// Waits, up to `wait`, for the helper to close its side once the run
+    /// sent its last line. Past `wait`, the connection's read side closes
+    /// and the copy ends. Blocks, so call it off the runtime.
+    pub(crate) fn finish(self, wait: Duration) {
+        if self.ended {
+            return;
+        }
+        if self.done.recv_timeout(wait).is_err() {
+            tracing::warn!(
+                wait_secs = wait.as_secs(),
+                "the in-box min task run did not close its forwarded stdin; closed it"
+            );
+            let _ = self.connection.shutdown(std::net::Shutdown::Read);
+            let _ = self.done.recv();
+        }
+    }
+}
+
+/// Copies `from` to `to` until `from` ends, and closes `to` then. A write
+/// that fails means the task closed its stdin or ended. The copy then
+/// drops the rest of `from` and reads on to its end. Only a read that
+/// fails while the task reads its stdin is an error.
+fn copy_forwarded_stdin(mut from: impl io::Read, to: impl io::Write) -> io::Result<()> {
+    let mut to = Some(to);
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = match from.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if to.is_some() => return Err(e),
+            Err(_) => return Ok(()),
+        };
+        if let Some(pipe) = to.as_mut()
+            && pipe.write_all(&buf[..n]).and_then(|()| pipe.flush()).is_err()
+        {
+            to = None;
+        }
+    }
 }
 
 /// The [`Process`] of a task run whose task is its box's entrypoint (T43).
