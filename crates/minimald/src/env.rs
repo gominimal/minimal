@@ -532,9 +532,10 @@ impl Env {
                      with no per-box egress enforcement, because the box has none",
                 ),
             }
-            ctx.build_graph(&graph, false, None)
-                .await
-                .map_err(err_to_io)?;
+            ctx.build_graph(&graph, false, None).await.map_err(|e| {
+                let failure = e.to_string();
+                std::io::Error::other(unreachable_source(&failure).unwrap_or(failure))
+            })?;
         }
 
         // Collect the package-derived wiring and merge caller-supplied
@@ -1826,6 +1827,7 @@ impl BoxChannel {
             });
         let (build_err, ()) = tokio::join!(build, render);
         if let Some(e) = build_err {
+            let e = unreachable_source(&e).unwrap_or(e);
             let _ = writeln!(stream, "error: {e}");
             return;
         }
@@ -3655,6 +3657,23 @@ const WEB_SOURCE_FAILURE: &str = "could not fetch the source ";
 /// followed by the host and the port.
 const WEB_SOURCE_CONNECT_FAILURE: &str = "could not connect to ";
 
+/// The error line for a package build whose source download could not
+/// connect (NET-155), or `None` for any other failure. `failure` is the
+/// build's own error: its package, then the download's text, whose reason
+/// the line keeps.
+pub(crate) fn unreachable_source(failure: &str) -> Option<String> {
+    let (head, rest) = failure.split_once("` failed to build: ")?;
+    let (_, package) = head.rsplit_once('`')?;
+    let connect = rest
+        .strip_prefix("other: ")?
+        .strip_prefix(WEB_SOURCE_CONNECT_FAILURE)?;
+    let host = connect_host(connect)?;
+    let (_, why) = connect.lines().next()?.split_once(": ")?;
+    Some(format!(
+        "the build of {package} could not reach {host}: {why}"
+    ))
+}
+
 /// The host in the `<host>:<port>: <error>` text that follows
 /// [`WEB_SOURCE_CONNECT_FAILURE`], without the port. `None` when the text
 /// names no host and port.
@@ -3756,6 +3775,53 @@ pub(crate) fn egress_refusal<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NET-155: a build whose source download could not connect reports the
+    /// package, the host and the reason, in the words of the user-facing
+    /// line. Any other failure is left as the build reported it.
+    #[test]
+    fn unreachable_source_names_the_package_and_the_host() {
+        assert_eq!(
+            unreachable_source(
+                "session spawn: `claude-code` failed to build: other: could not connect to \
+                     storage.googleapis.com:443: no answer after 15s"
+            )
+            .as_deref(),
+            Some(
+                "the build of claude-code could not reach storage.googleapis.com: no answer after 15s"
+            )
+        );
+        assert_eq!(
+            unreachable_source(
+                "`zsh` failed to build: other: could not connect to objects.example.net:443: \
+                     Connection refused (os error 111)\nsecond line"
+            )
+            .as_deref(),
+            Some(
+                "the build of zsh could not reach objects.example.net: \
+                     Connection refused (os error 111)"
+            )
+        );
+        assert_eq!(
+            unreachable_source(
+                "`foo` failed to build: other: could not connect to sources.example.com:443: \
+                     the egress rules admit no destination"
+            )
+            .as_deref(),
+            Some(
+                "the build of foo could not reach sources.example.com: \
+                     the egress rules admit no destination"
+            )
+        );
+        for other in [
+            "`foo` failed to build: other: hash mismatch",
+            "`foo` failed to build: exit status 1: could not connect to a.example:443: no",
+            "could not connect to a.example:443: no",
+        ] {
+            assert_eq!(unreachable_source(other), None, "{other}");
+        }
+    }
+
     /// A helper request arrives as `traceparent%<tp>%<method>%<data>` when
     /// the box has a `TRACEPARENT`, and bare otherwise; the prefix is taken
     /// off before dispatch and the request's span is named for the method.

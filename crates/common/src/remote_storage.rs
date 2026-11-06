@@ -1,4 +1,4 @@
-use crate::fetchers::{GcsUrl, ReqwestUrl};
+use crate::fetchers::{FetchBackend, GcsUrl, ReqwestUrl};
 use crate::file_cache;
 use crate::file_cache::CachingDownloader;
 use anyhow::Result;
@@ -7,6 +7,42 @@ use ot::OpTracker;
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
+
+/// How long a download waits for one connection to open.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The host every `gs://` source is read from: the Google Cloud Storage
+/// client's endpoint. The source's URL names a bucket, not a host.
+const GCS_HOST: &str = "storage.googleapis.com";
+
+/// [`Storage`], with a bound on the wait for the first answer to a read. The
+/// client has no connect bound of its own. Rules that drop packets leave each
+/// attempt waiting for the kernel's retry limit, and it retries for minutes.
+/// The bound ends with the first answer, so it does not limit a long download.
+#[derive(Debug)]
+struct BoundedStorage<'a> {
+    storage: &'a Storage,
+    bound: std::time::Duration,
+}
+
+impl FetchBackend for BoundedStorage<'_> {
+    type Url = GcsUrl;
+    type Request = <Storage as FetchBackend>::Request;
+    type Response = <Storage as FetchBackend>::Response;
+
+    fn get(&self, url: GcsUrl) -> Result<Self::Request, google_cloud_storage::Error> {
+        self.storage.get(url)
+    }
+
+    async fn execute(
+        &self,
+        req: Self::Request,
+    ) -> Result<Self::Response, google_cloud_storage::Error> {
+        tokio::time::timeout(self.bound, self.storage.execute(req))
+            .await
+            .unwrap_or_else(|elapsed| Err(google_cloud_storage::Error::timeout(elapsed)))
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RemoteStorage {
@@ -75,14 +111,19 @@ impl RemoteStorage {
                 .await
                 .map(|(path, _connected)| path);
         }
-        let client = reqwest::Client::new();
+        // Rules that drop packets, not reject them, leave a connect waiting
+        // for the kernel's retry limit, once per address the name answered.
+        // This bound covers every address of one connection.
+        let client = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()?;
         let backend = (&client, &self.cache);
         backend
             .download(ReqwestUrl::try_from(url)?, sha256, op)
             .await
             .map_err(|e| match e {
                 either::Either::Left(e) => anyhow::Error::from(e),
-                either::Either::Right(e) => anyhow::Error::from(e),
+                either::Either::Right(e) => connect_failure(e),
             })
     }
 
@@ -118,7 +159,25 @@ impl RemoteStorage {
         sha256: &str,
         op: &OpTracker,
     ) -> Result<PathBuf> {
-        let backend = (&self.client, &self.cache);
+        self.download_gcs_within(CONNECT_TIMEOUT, bucket_id, file, sha256, op)
+            .await
+    }
+
+    /// [`download_with_verification_and_caching`](Self::download_with_verification_and_caching),
+    /// failing when no first answer comes within `bound`.
+    async fn download_gcs_within(
+        &self,
+        bound: std::time::Duration,
+        bucket_id: String,
+        file: &str,
+        sha256: &str,
+        op: &OpTracker,
+    ) -> Result<PathBuf> {
+        let storage = BoundedStorage {
+            storage: &self.client,
+            bound,
+        };
+        let backend = (&storage, &self.cache);
         backend
             .download(
                 GcsUrl {
@@ -131,6 +190,9 @@ impl RemoteStorage {
             .await
             .map_err(|e| match e {
                 either::Either::Left(e) => anyhow::Error::from(e),
+                either::Either::Right(e) if e.is_timeout() => anyhow::Error::from(e).context(
+                    format!("could not connect to {GCS_HOST}:443: no answer after {bound:?}"),
+                ),
                 either::Either::Right(e) => anyhow::Error::from(e),
             })
     }
@@ -148,6 +210,31 @@ impl RemoteStorage {
             .await?;
 
         Ok(())
+    }
+}
+
+/// A web download's error, naming the host it could not connect to the way a
+/// placed download's does (NET-155). The URL on the error is the request's
+/// last, so a redirect names the host it sent the download to. Any other
+/// error is unchanged.
+fn connect_failure(e: reqwest::Error) -> anyhow::Error {
+    let target = e
+        .url()
+        .and_then(|url| Some((url.host_str()?.to_string(), url.port_or_known_default()?)));
+    match target {
+        Some((host, port)) if e.is_connect() => {
+            let why = if e.is_timeout() {
+                format!("no answer after {CONNECT_TIMEOUT:?}")
+            } else {
+                let mut cause: &dyn std::error::Error = &e;
+                while let Some(next) = cause.source() {
+                    cause = next;
+                }
+                cause.to_string()
+            };
+            anyhow::Error::from(e).context(format!("could not connect to {host}:{port}: {why}"))
+        }
+        _ => anyhow::Error::from(e),
     }
 }
 
@@ -278,7 +365,8 @@ mod placed {
         /// the cgroup. `None` takes the `nameserver` lines of
         /// `/etc/resolv.conf`.
         nameservers: Option<Vec<SocketAddr>>,
-        /// How long the relay waits for one connection to one address.
+        /// How long the relay waits for one connection, across every
+        /// address its host answers.
         connect_timeout: std::time::Duration,
         /// How long the relay waits for the head of a request, so a client
         /// that connects and sends nothing does not hold a handler task.
@@ -464,6 +552,11 @@ mod placed {
                     }
                 }
             };
+            // A share of the bound each, so a host that answers many
+            // addresses behind rules that drop packets fails within the
+            // bound and not once per address.
+            let share =
+                self.connect_timeout / u32::try_from(addrs.len()).unwrap_or(u32::MAX).max(1);
             let mut last = None;
             for ip in addrs {
                 let addr = SocketAddr::new(ip, port);
@@ -478,13 +571,13 @@ mod placed {
                 // Rules that drop packets, not reject them, leave a connect
                 // waiting for the kernel's retry limit. The deadline bounds it.
                 let connecting = tokio::net::TcpSocket::from_std_stream(socket).connect(addr);
-                match tokio::time::timeout(self.connect_timeout, connecting).await {
+                match tokio::time::timeout(share, connecting).await {
                     Ok(Ok(stream)) => return Ok(stream),
                     Ok(Err(e)) => last = Some(e),
                     Err(_) => {
                         last = Some(io::Error::new(
                             io::ErrorKind::TimedOut,
-                            format!("no answer from {addr} after {:?}", self.connect_timeout),
+                            format!("no answer from {addr} after {share:?}"),
                         ))
                     }
                 }
@@ -494,9 +587,6 @@ mod placed {
             }))
         }
     }
-
-    /// How long the relay waits for one connection to one address.
-    const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
     /// How long the relay waits for one answer from the name server.
     const LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -1358,6 +1448,34 @@ mod placed {
             assert!(took < bound * 4, "it waited {took:?}");
         }
 
+        /// A host with many addresses behind rules that drop packets fails
+        /// within one connect bound, not one bound per address.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_placed_connect_shares_its_bound_across_a_hosts_addresses() {
+            let (addr, _held, _listener) = dropping_port().await;
+            let tmp = tempfile::tempdir().unwrap();
+            let procs = tmp.path().join("cgroup.procs");
+            std::fs::write(&procs, "").unwrap();
+            let ip = addr.ip();
+            std::fs::write(
+                procs.with_file_name("hosts"),
+                format!("{ip} many.test\n").repeat(4),
+            )
+            .unwrap();
+            let bound = std::time::Duration::from_millis(800);
+            let relay = test_relay(&procs, bound);
+
+            let started = std::time::Instant::now();
+            let e = relay
+                .connect("many.test", addr.port())
+                .await
+                .expect_err("every address drops every packet");
+            let took = started.elapsed();
+            assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
+            assert!(took < bound * 2, "it waited {took:?}");
+        }
+
         /// Sends one CONNECT to `target` through the relay at `relay`, and
         /// returns the status line of the answer.
         #[cfg(target_os = "linux")]
@@ -1553,5 +1671,80 @@ mod placed {
             assert!(took >= bound, "it waited {took:?}");
             assert!(took < bound * 10, "it waited {took:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod connect_tests {
+    use super::*;
+
+    const SHA: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    /// A download that could not connect names the host and the socket's
+    /// reason, in the text the daemon reads the host from.
+    #[tokio::test]
+    async fn a_failed_connect_names_the_host() {
+        let closed = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = closed.local_addr().unwrap();
+        drop(closed);
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = RemoteStorage::new(tmp.path().to_path_buf(), false)
+            .await
+            .unwrap();
+
+        let e = storage
+            .download_web_with_verification_and_caching(
+                &format!("http://{addr}/pkg.tar.gz"),
+                SHA,
+                None,
+                false,
+                &OpTracker::new_root(),
+            )
+            .await
+            .expect_err("the port is closed");
+        let text = e.to_string();
+        assert!(
+            text.starts_with(&format!("could not connect to {addr}: ")),
+            "{text}"
+        );
+    }
+
+    /// A `gs://` source whose host gives no answer fails at the bound, and
+    /// names the host. The listener takes the connection and never answers.
+    #[tokio::test]
+    async fn a_gs_source_fails_when_no_answer_comes() {
+        let silent = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = silent.local_addr().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = RemoteStorage {
+            client: Storage::builder()
+                .with_endpoint(format!("http://{addr}"))
+                .with_credentials(google_cloud_auth::credentials::anonymous::Builder::new().build())
+                .build()
+                .await
+                .unwrap(),
+            cache: file_cache::FileCache::new_with_offline(tmp.path().to_path_buf(), false)
+                .unwrap(),
+        };
+
+        let bound = std::time::Duration::from_millis(200);
+        let e = storage
+            .download_gcs_within(
+                bound,
+                "bucket".to_string(),
+                "pkg.tar.gz",
+                SHA,
+                &OpTracker::new_root(),
+            )
+            .await
+            .expect_err("no answer comes");
+        assert_eq!(
+            e.to_string(),
+            "could not connect to storage.googleapis.com:443: no answer after 200ms"
+        );
     }
 }
