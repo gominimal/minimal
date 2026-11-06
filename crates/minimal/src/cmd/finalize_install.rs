@@ -1095,6 +1095,16 @@ pub(crate) mod linux {
             // started again, the step's --place-listener for the daemon
             // holding the socket now, or both.
             let placer_down = facts.placer_listening == Some(false);
+            // Placing the running daemon spells both names into the root
+            // block, so they pass the same check the install does. Only
+            // that remedy is held to it: a healthy install read through an
+            // unusual `--minimal-dir` stays done, and starting the socket
+            // names neither.
+            if facts.unplaced_daemon.is_some()
+                && let Some(cause) = unsafe_name_cause(operator, socket)
+            {
+                return Item::cannot(CLASSIFIER_ID, CLASSIFIER_LABEL, cause.to_string());
+            }
             let start_placer = format!(
                 "# The placement socket is installed but not listening, so no daemon\n\
                  # start is placed until it is started again.\n\
@@ -1105,8 +1115,8 @@ pub(crate) mod linux {
             // then, and --place-listener moves only a holder of this
             // account that stands outside the slice.
             let place_daemon = format!(
-                "# The running daemon, outside its leaf: the step places the holder of\n\
-                 # its socket.\n\
+                "# The Minimal daemon running now is outside its egress-enforcement cgroup.\n\
+                 # This moves the process that owns its socket into that cgroup.\n\
                  {CLASSIFIER_PROGRAM_PATH} --user '{operator}' --place-listener '{socket}'\n"
             );
             let placer_cause = format!(
@@ -1169,34 +1179,9 @@ pub(crate) mod linux {
                 "cgroup2 is mounted without nsdelegate, which egress enforcement needs to \
                  keep a box inside its own cgroup"
             }
-            // The two names ride in a shell single-quoted word, in a unit
-            // file (systemd expands `%` specifiers everywhere and `$` in
-            // `ExecStart=`), through `awk -v` (backslash escapes), and the
-            // socket path as one whitespace-delimited field of
-            // /proc/net/unix. Only the characters none of those read are
-            // admitted; anything else is a name the block cannot spell
-            // safely, and the item says so rather than installing a unit
-            // that never finds the daemon.
             Cgroup2Mount::Delegated => {
-                if operator.is_empty() {
-                    "could not read this process's user name, so there is no account to \
-                     install this step for"
-                } else if !operator
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
-                {
-                    "this process's user name carries a character outside [A-Za-z0-9._-], \
-                     which the install script and its systemd units cannot handle"
-                } else if socket.is_empty() {
-                    "could not work out this machine's daemon socket path, which the \
-                     placement unit needs to find the daemon"
-                } else if !socket
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "._/-".contains(c))
-                {
-                    "this machine's daemon socket path carries a character outside \
-                     [A-Za-z0-9._/-], which the install script and its systemd units \
-                     cannot handle"
+                if let Some(cause) = unsafe_name_cause(operator, socket) {
+                    cause
                 } else {
                     return Item::missing(
                         CLASSIFIER_ID,
@@ -1241,6 +1226,48 @@ pub(crate) mod linux {
             }
         };
         Item::cannot(CLASSIFIER_ID, CLASSIFIER_LABEL, cause.to_string())
+    }
+
+    /// Why `operator` or `socket` cannot go into the step's block, or `None`
+    /// when both can. The two names ride in a shell single-quoted word in a
+    /// block run as root, in a unit file (systemd expands `%` specifiers
+    /// everywhere and `$` in `ExecStart=`), through `awk -v` (backslash
+    /// escapes), and the socket path as one whitespace-delimited field of
+    /// /proc/net/unix. Only the characters none of those read are admitted;
+    /// anything else is a name the block cannot spell safely, and the item
+    /// says so rather than rendering a line that never finds the daemon, or
+    /// one the shell reads as more than one word.
+    fn unsafe_name_cause(operator: &str, socket: &str) -> Option<&'static str> {
+        if operator.is_empty() {
+            Some(
+                "could not read this process's user name, so there is no account to \
+                 install this step for",
+            )
+        } else if !operator
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+        {
+            Some(
+                "this process's user name carries a character outside [A-Za-z0-9._-], \
+                 which the install script and its systemd units cannot handle",
+            )
+        } else if socket.is_empty() {
+            Some(
+                "could not work out this machine's daemon socket path, which the \
+                 placement socket needs to find the daemon",
+            )
+        } else if !socket
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._/-".contains(c))
+        {
+            Some(
+                "this machine's daemon socket path carries a character outside \
+                 [A-Za-z0-9._/-], which the install script and its systemd units \
+                 cannot handle",
+            )
+        } else {
+            None
+        }
     }
 
     /// The step's block: the classifier's step written from the bytes this
@@ -1294,17 +1321,15 @@ pub(crate) mod linux {
              # installed another way is left alone.\n\
              mkdir -p /var/lib/minimal\n\
              : > {CLASSIFIER_TREE_RECORD}\n\
-             # The units: a boot oneshot re-runs the step from the copy (the tree lives\n\
-             # in cgroupfs and the table in the kernel, so neither survives a reboot),\n\
-             # then the placement pair: the daemon connects to the socket unit once its\n\
-             # own listener is bound, and the service systemd starts for the connection\n\
-             # puts the listener's holder in the daemon's leaf, so every daemon start is\n\
-             # placed without a root step of its own. The socket is systemd's, in /run,\n\
-             # so no inotify watch on a path under the account's home is needed. Without\n\
-             # systemd the units are skipped, and each daemon start is placed by hand\n\
-             # with the step.\n\
+             # The systemd units. A boot service sets up egress enforcement again at\n\
+             # every boot, because neither the cgroups nor the packet filter survive a\n\
+             # reboot. The placement socket, in /run, is what each Minimal daemon start\n\
+             # connects to: systemd then runs a service that moves that daemon into its\n\
+             # egress-enforcement cgroup, so no daemon start needs sudo. Without systemd\n\
+             # the units are skipped, and each daemon start must be placed by hand with\n\
+             # the script above.\n\
              if ! command -v systemctl >/dev/null 2>&1 ; then\n\
-             \x20 echo 'note: no systemctl on this host: the placement unit is not installed, so place each daemon start by hand with the step'\n\
+             \x20 echo 'note: no systemctl on this host: the placement socket is not installed, so place each daemon start by hand with the install script'\n\
              else\n\
              cat > {CLASSIFIER_UNIT_SERVICE_PATH} <<\\MINIMAL_CLASSIFIER_SERVICE_EOF\n\
              [Unit]\n\
@@ -3212,7 +3237,7 @@ mod tests {
                 "alice",
                 "",
                 "could not work out this machine's daemon socket path, which the placement \
-                 unit needs to find the daemon",
+                 socket needs to find the daemon",
             ),
             (bare, "alice", "/run/it's.sock", outside),
             (bare, "alice", "/run/my dir/ssh.sock", outside),
@@ -3227,6 +3252,60 @@ mod tests {
             assert_eq!(item.id, "classifier");
             assert!(item.cause.as_deref().unwrap().contains(word), "{item:?}");
         }
+        // The installed step with the running daemon outside its leaf: its
+        // remedy spells both names into the root block, so an unsafe name is
+        // the same refusal there, with or without a stopped placer, and no
+        // block is rendered. A healthy install read under such a name stays
+        // done, and a stopped placer alone names neither.
+        let installed = ClassifierFacts {
+            table_present: true,
+            recorded_mask: Some(0x3000_0000),
+            copy_current: true,
+            units_enabled: Some(true),
+            placer_listening: Some(true),
+            ..bare
+        };
+        for placer_listening in [Some(true), Some(false)] {
+            let unplaced = ClassifierFacts {
+                unplaced_daemon: Some(4242),
+                placer_listening,
+                ..installed
+            };
+            for (operator, socket) in [
+                ("al'ice", sock),
+                ("", sock),
+                ("alice", "/tmp/it's/ssh.sock"),
+                ("alice", "/tmp/x'; touch /pwned; : '/ssh.sock"),
+                ("alice", "/tmp/my dir/ssh.sock"),
+                ("alice", ""),
+            ] {
+                let item = classifier_item_over(&unplaced, operator, socket);
+                assert_eq!(
+                    item.state,
+                    ItemState::Cannot,
+                    "{operator:?} {socket:?}: {item:?}"
+                );
+                assert_eq!(item.script, None, "{item:?}");
+            }
+        }
+        assert_eq!(
+            classifier_item_over(&installed, "alice", "/tmp/it's/ssh.sock").state,
+            ItemState::Done
+        );
+        let placer_down = classifier_item_over(
+            &ClassifierFacts {
+                placer_listening: Some(false),
+                ..installed
+            },
+            "alice",
+            "/tmp/it's/ssh.sock",
+        );
+        assert_eq!(placer_down.state, ItemState::Missing, "{placer_down:?}");
+        assert!(
+            !placer_down.script.as_deref().unwrap().contains("it's"),
+            "{placer_down:?}"
+        );
+
         let item = classifier_item_over(&bare, "alice", sock);
         assert_eq!(item.state, ItemState::Missing, "{item:?}");
         assert!(item.today.as_deref().unwrap().contains("is not enforced"));
@@ -3715,8 +3794,7 @@ mod tests {
             format!("cat > {CLASSIFIER_UNIT_SERVICE_PATH} <<"),
             format!("ExecStart={CLASSIFIER_PROGRAM_PATH} --user 'alice'\n"),
             // gominimal/inbox#1206: the earlier path pair goes, and the
-            // placement is a socket in /run the daemon connects to, so no
-            // inotify watch on a path under the account's home is needed.
+            // placement is a socket in /run the daemon connects to.
             "systemctl disable --now minimald-place.path 2>/dev/null || true\n".to_string(),
             format!("rm -f {LEGACY_PLACE_UNIT_PATH_PATH} {LEGACY_PLACE_UNIT_SERVICE_PATH}\n"),
             format!("cat > {PLACE_UNIT_SERVICE_PATH} <<"),

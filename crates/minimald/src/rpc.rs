@@ -487,11 +487,11 @@ async fn serve_create_session(
             // the counts below report beside the "session created" line.
             let egress_counts = EgressRuleCounts::of(&req.config.policy);
             // NET-079: the advisory and the enforcement the reply states are
-            // read off the daemon's one node fact once the manager has
-            // created the box (below), not before: the manager's create
-            // re-reads the host when the stored fact says the start-up
-            // probe could not read the table, and the reply must answer
-            // over that re-read. The launch that follows reads the host
+            // the fact the manager's create gated on, which it returns with
+            // the box's id (below): the create re-reads the host when the
+            // stored fact says the start-up probe could not read the table,
+            // and the reply must answer over that re-read. The launch that
+            // follows reads the host
             // again for its own gate. Its refusal holds what the create said
             // only for a box it places: a daemon outside its leaf places no
             // box, so its deny-all box starts unenforced.
@@ -546,12 +546,11 @@ async fn serve_create_session(
                     // teardown reap in `server.rs`.
                     conn.record_created_session(id).await;
                     // `fact` is the one this create's own gate read
-                    // (`create_host_ip_fact`): re-read there when the
-                    // start-up probe could not read the table, so a reading
-                    // taken before the daemon stood in its leaf never
-                    // reaches the reply, and never the global fact read
-                    // again here, which another create or launch may have
-                    // refreshed since.
+                    // (`create_host_ip_fact`). That read re-reads the host
+                    // when the start-up probe could not read the table, and
+                    // falls back to the stored fact only when the re-read
+                    // fails. The global fact is not read again here, because
+                    // another create or launch may have refreshed it since.
                     let classifier_cause = fact.cause;
                     let classifier_advisory = create_classifier_advisory(
                         in_microvm,
