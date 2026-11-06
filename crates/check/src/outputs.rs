@@ -448,6 +448,7 @@ impl crate::GraphBasedChecker for OutputsFreeOfDetbuild {
                 .collect(),
             spec_hash: graph.spec_hash(&bsr),
             cache,
+            check_cache: ctx.check_cache.clone(),
             cancel: ctx.cancel.clone(),
         };
         drop(graph);
@@ -465,13 +466,15 @@ impl crate::GraphBasedChecker for OutputsFreeOfDetbuild {
 }
 
 /// One package's scan: what names its cached build, its name and output
-/// globs, the cache, and the cancel token. Built under the graph's guard,
-/// run on the blocking pool without it.
+/// globs, the cache, the check cache the other output checkers walk
+/// through, and the cancel token. Built under the graph's guard, run on the
+/// blocking pool without it.
 struct DetbuildScan {
     name: String,
     globs: Vec<String>,
     spec_hash: common::SpecHash,
     cache: Cache<LocalDir>,
+    check_cache: std::sync::Arc<CheckCache>,
     cancel: tokio_util::sync::CancellationToken,
 }
 
@@ -512,15 +515,15 @@ impl DetbuildScan {
     }
 
     /// The output files under every output glob: each file once, however
-    /// many globs name it, in path order. The walk does not follow a
-    /// symlinked directory, so a loop in an output (`a -> .`) ends.
+    /// many globs name it, in path order. The walk is the check cache's, so
+    /// a `(root, glob)` the other output checkers already walked is not
+    /// walked again, and it does not follow a symlinked directory.
     fn output_files(&self, root: &Path) -> Result<BTreeSet<PathBuf>, Error> {
         let mut files = BTreeSet::new();
         for glob in &self.globs {
             crate::bail_if_cancelled(&self.cancel)?;
-            let matched = common::match_files_for_glob_no_follow(root, glob)
-                .map_err(|e| Error::Other(anyhow!("{e}")))?;
-            files.extend(matched);
+            let matched = self.check_cache.match_files_for_glob(root, glob)?;
+            files.extend(matched.iter().cloned());
         }
         Ok(files)
     }
@@ -963,12 +966,20 @@ mod tests {
                 globs: vec!["bin/*".into()],
                 spec_hash: g.spec_hash(g.by_name("cancelled").unwrap()),
                 cache: ctx.cache.clone(),
+                check_cache: ctx.check_cache.clone(),
                 cancel: tokio_util::sync::CancellationToken::new(),
             }
         };
         let root = scan.cache.read_dir(&scan.spec_hash).expect("cached build");
         let files = scan.output_files(root.path()).expect("walk");
         assert_eq!(files.len(), 1, "{files:?}");
+        // The walk went through the check cache the sibling checkers share.
+        assert!(
+            ctx.check_cache
+                .glob_cache
+                .contains_key(&(root.path().to_path_buf(), "bin/*".to_string())),
+            "the scan walked outside the check cache"
+        );
 
         scan.cancel.cancel();
         let got = scan.files_naming_detbuild(files);
