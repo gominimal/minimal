@@ -133,11 +133,11 @@ fn command_verb(command: Option<&Command>) -> &'static str {
         },
         Some(Command::Loadout(_)) => "loadout list",
         Some(Command::Task(_)) => "task run",
-        Some(Command::Run(_)) => "run",
         Some(Command::Box(BoxArgs { command })) => match command {
             BoxCommand::Spec(_) => "box spec",
             BoxCommand::Audit(_) => "box audit",
             BoxCommand::List(_) => "box list",
+            BoxCommand::Run(_) => "box run",
             BoxCommand::Show(_) => "box show",
             BoxCommand::Stop(_) => "box stop",
             BoxCommand::Rm(_) => "box rm",
@@ -387,11 +387,11 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Task(TaskArgs { command })) => match command {
             TaskCommand::Run(args) => task::cmd_task_run(&cli.global_args, args).await,
         },
-        Some(Command::Run(args)) => task::cmd_run(&args),
         Some(Command::Box(BoxArgs { command })) => match command {
             BoxCommand::Spec(args) => box_spec::cmd_box_spec(&cli.global_args, args),
             BoxCommand::Audit(args) => box_audit::cmd_box_audit(&cli.global_args, args).await,
             BoxCommand::List(args) => cmd_box_list(&cli.global_args, args).await,
+            BoxCommand::Run(args) => task::cmd_box_run(&cli.global_args, args).await,
             BoxCommand::Show(args) => cmd_box_show(&cli.global_args, args).await,
             BoxCommand::Stop(args) => cmd_box_stop(&cli.global_args, args).await,
             BoxCommand::Rm(args) => cmd_box_rm(&cli.global_args, args).await,

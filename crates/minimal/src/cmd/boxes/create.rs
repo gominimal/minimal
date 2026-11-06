@@ -1265,6 +1265,16 @@ pub(crate) fn put_spec(
     Ok(())
 }
 
+/// Marks `request` as a fresh instance (BCLI-070, BOX-163). The daemon
+/// names the box `<name>-<n>`, with the smallest `n` no retained box uses,
+/// and never refuses it for a held name. The client invents no name, so the
+/// request carries none. `min task run` and `min box run` create every box
+/// this way.
+pub(crate) fn request_fresh_instance(request: &mut minimald_rpc::CreateSessionRequest) {
+    request.config.name = None;
+    request.fresh_instance = true;
+}
+
 /// The name the daemon gives the box `request` creates, when the create
 /// is not a fresh instance (BOX-163): the spec's `[box] name`, else the
 /// request's name, else the spec's entry as the daemon cleans it
@@ -1985,7 +1995,8 @@ pub(crate) async fn activate_box(
     // BOX-163: a box the person did not name takes its entry's name. A
     // create under a name that a running box holds, the entry's name or a
     // `--name`, is refused: the command ends with exit 2, naming the
-    // holder. Only `min task run` asks for a fresh instance, `<name>-<n>`.
+    // holder. Only a run (`min task run`, `min box run`) asks for a fresh
+    // instance, `<name>-<n>` ([`request_fresh_instance`]).
     let created = ActivationStep::CreateSession
         .run(async {
             let created = {
