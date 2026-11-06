@@ -3375,7 +3375,10 @@ fn relayed_exit_code(result: &Result<(), Error>) -> Option<u8> {
 /// `Env::run` gives a task no stdin either, so a run whose helper forwards
 /// its stdin runs here too (T123). With `stdin`, the first invocation gets
 /// a stdin pipe, the channel sends the helper `stdin:`, and the copy of the
-/// forwarded stdin to the pipe goes into `stdin`.
+/// forwarded stdin to the pipe goes into `stdin`. Only the first invocation
+/// of a multi-invocation task gets the forwarded stdin. The later
+/// invocations get none. https://github.com/gominimal/minimal/issues/3094
+/// tracks this gap.
 async fn run_invocations_in(
     env: &mut mctx::Env<'_>,
     invocations: Vec<sandbox::config::Invocation>,
