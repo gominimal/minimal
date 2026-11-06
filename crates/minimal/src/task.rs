@@ -950,7 +950,10 @@ pub(crate) async fn run_entry(global: &GlobalArgs, args: RunEntry) -> Result<(),
     );
     let entrypoint_runs = spec.is_some();
     request.config.ends_with_run = true;
-    // The record's type is the task verb's (BOX-001).
+    // BOX-001: the record's type is the one the expanded spec names. Both
+    // verbs resolve the entry as a declared task (`declared_task`), and
+    // `task_box_spec` names the task type, so `min box run` creates a task
+    // box too.
     request.config.creating_verb = minimald_rpc::CreatingVerb::Task;
     // BOX-068: the declared task's spec, with this command's settings. An
     // interactive task sends none: the task type denies a terminal.
