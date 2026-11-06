@@ -1403,7 +1403,11 @@ mod network_hint_tests {
                 toml::from_str(&format!("[network]\nmode = \"{legacy}\"\n"))
                     .expect("test TOML parses");
             let table = mfile::network::canonicalize(&mut spec).expect("the table is accepted");
-            assert_eq!(table, [flag.clone()], "one hint, the same line");
+            assert_eq!(
+                table,
+                std::slice::from_ref(&flag),
+                "one hint, the same line"
+            );
             assert!(flag.contains(&format!("--network {current}")), "{flag}");
             assert!(flag.contains(&format!("mode = \"{current}\"")), "{flag}");
         }
