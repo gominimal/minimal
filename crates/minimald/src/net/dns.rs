@@ -4372,50 +4372,89 @@ impl SteeringPlan {
 /// A host-address box's own DNS answerer (BEP-086), in the guest's
 /// namespace at a loopback address no other box holds. The box's
 /// `/etc/resolv.conf` names it, so only this box's lookups come here. It
-/// answers the box's steered names as [`SteeringPlan::verdict`] says and
-/// forwards every other lookup to the node's resolver. It stops when it is
-/// dropped, and its address is free again.
+/// serves UDP and TCP at the same address and port, because a box's
+/// resolver retries a truncated reply over TCP. It answers the box's
+/// steered names as [`SteeringPlan::verdict`] says and forwards every other
+/// lookup to the node's resolver, over the transport the lookup came in on.
+/// It stops when it is dropped. Its address and port are free again at
+/// once, because it holds the only strong reference to each socket.
 #[derive(Debug)]
 pub(crate) struct SteeringAnswerer {
     bound: SocketAddrV4,
-    serve: tokio::task::JoinHandle<()>,
+    stop: tokio_util::sync::CancellationToken,
+    serve: Vec<tokio::task::JoinHandle<()>>,
+    // The only strong references to the two sockets. Every task holds a
+    // `Weak`, so a forward or a connection still in flight never keeps the
+    // port bound after the answerer is dropped.
+    _udp: std::sync::Arc<tokio::net::UdpSocket>,
+    _tcp: std::sync::Arc<tokio::net::TcpListener>,
     _address: SteeringAddress,
 }
 
+/// How many times [`SteeringAnswerer::start`] tries a new port, when it
+/// picks one, before it gives up because TCP holds each UDP port it got.
+const STEERING_BIND_ATTEMPTS: usize = 8;
+
+/// Upper bound on the TCP connections one steering answerer serves at
+/// once. A connection that finds no room is closed, and the box's
+/// resolver retries.
+const STEERING_MAX_TCP_CONNECTIONS: usize = 64;
+
+/// How long a TCP connection to a steering answerer can wait between two
+/// lookups before the answerer closes it.
+const STEERING_TCP_IDLE: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl SteeringAnswerer {
-    /// Claims a steering address and serves `plan` on it at `port`: the
-    /// DNS port in production, and `0` in a test that cannot bind it.
+    /// Claims a steering address and serves `plan` on it at `port`, over
+    /// UDP and TCP: the DNS port in production, and `0` in a test that
+    /// cannot bind it.
     ///
     /// # Errors
     ///
-    /// Every steering address is held, or the bind fails.
+    /// Every steering address is held, or a bind fails.
     pub(crate) async fn start(plan: SteeringPlan, port: u16) -> std::io::Result<Self> {
         let address = SteeringAddress::claim().ok_or_else(|| {
             std::io::Error::other("every steering answerer address in 127.53.0.0/16 is in use")
         })?;
-        let socket = tokio::net::UdpSocket::bind(SocketAddrV4::new(address.0, port)).await?;
-        let SocketAddr::V4(bound) = socket.local_addr()? else {
-            return Err(std::io::Error::other(
-                "a steering answerer bound an IPv6 address",
-            ));
-        };
+        let (udp, tcp, bound) = bind_steering(address.0, port).await?;
         tracing::info!(
             component = STEERING_COMPONENT,
             box_name = %plan.box_label,
             %bound,
             upstream = %plan.upstream,
             proxy = %plan.proxy,
-            "a host-address box's steering answerer is serving its lookups"
+            "a host-address box's steering answerer is serving its lookups over UDP and TCP"
         );
-        let serve = crate::traced::spawn(serve_steering(std::sync::Arc::new(socket), plan));
+        let udp = std::sync::Arc::new(udp);
+        let tcp = std::sync::Arc::new(tcp);
+        let stop = tokio_util::sync::CancellationToken::new();
+        let plan = std::sync::Arc::new(plan);
+        let warn = std::sync::Arc::new(SteeringServfailWarn::default());
+        let serve = vec![
+            crate::traced::spawn(serve_steering(
+                std::sync::Arc::downgrade(&udp),
+                std::sync::Arc::clone(&plan),
+                std::sync::Arc::clone(&warn),
+                stop.clone(),
+            )),
+            crate::traced::spawn(serve_steering_tcp(
+                std::sync::Arc::downgrade(&tcp),
+                plan,
+                warn,
+                stop.clone(),
+            )),
+        ];
         Ok(Self {
             bound,
+            stop,
             serve,
+            _udp: udp,
+            _tcp: tcp,
             _address: address,
         })
     }
 
-    /// The address and port the answerer is bound at.
+    /// The address and port the answerer is bound at, for UDP and TCP.
     pub(crate) fn bound(&self) -> SocketAddrV4 {
         self.bound
     }
@@ -4423,19 +4462,133 @@ impl SteeringAnswerer {
 
 impl Drop for SteeringAnswerer {
     fn drop(&mut self) {
-        self.serve.abort();
+        // Stop every task, the forwards and connections too. The sockets
+        // close when the fields drop, right after this.
+        self.stop.cancel();
+        for serve in &self.serve {
+            serve.abort();
+        }
     }
 }
 
-/// The steering answerer's receive loop: one datagram per turn, answered
-/// here or forwarded in a task of its own.
-async fn serve_steering(socket: std::sync::Arc<tokio::net::UdpSocket>, plan: SteeringPlan) {
+/// Binds a UDP socket and a TCP listener at `address` and the same port.
+/// With `port` 0 the UDP bind picks the port, and a port that TCP already
+/// holds is given back for another.
+async fn bind_steering(
+    address: Ipv4Addr,
+    port: u16,
+) -> std::io::Result<(tokio::net::UdpSocket, tokio::net::TcpListener, SocketAddrV4)> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let udp = tokio::net::UdpSocket::bind(SocketAddrV4::new(address, port)).await?;
+        let SocketAddr::V4(bound) = udp.local_addr()? else {
+            return Err(std::io::Error::other(
+                "a steering answerer bound an IPv6 address",
+            ));
+        };
+        match tokio::net::TcpListener::bind(SocketAddr::V4(bound)).await {
+            Ok(tcp) => return Ok((udp, tcp, bound)),
+            Err(error)
+                if port == 0
+                    && error.kind() == std::io::ErrorKind::AddrInUse
+                    && attempt < STEERING_BIND_ATTEMPTS => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// The error a task gets once its answerer is dropped.
+fn steering_stopped() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::NotConnected,
+        "the steering answerer stopped",
+    )
+}
+
+/// Receives one datagram on `socket`, holding a strong reference only
+/// inside each poll.
+async fn steering_recv_from(
+    socket: &std::sync::Weak<tokio::net::UdpSocket>,
+    buf: &mut [u8],
+) -> std::io::Result<(usize, SocketAddr)> {
+    let mut read = tokio::io::ReadBuf::new(buf);
+    let peer = std::future::poll_fn(|cx| match socket.upgrade() {
+        Some(socket) => socket.poll_recv_from(cx, &mut read),
+        None => std::task::Poll::Ready(Err(steering_stopped())),
+    })
+    .await?;
+    Ok((read.filled().len(), peer))
+}
+
+/// Sends one datagram from `socket`, holding a strong reference only
+/// inside each poll.
+async fn steering_send_to(
+    socket: &std::sync::Weak<tokio::net::UdpSocket>,
+    datagram: &[u8],
+    peer: SocketAddr,
+) -> std::io::Result<usize> {
+    std::future::poll_fn(|cx| match socket.upgrade() {
+        Some(socket) => socket.poll_send_to(cx, datagram, peer),
+        None => std::task::Poll::Ready(Err(steering_stopped())),
+    })
+    .await
+}
+
+/// Accepts one connection on `listener`, holding a strong reference only
+/// inside each poll.
+async fn steering_accept(
+    listener: &std::sync::Weak<tokio::net::TcpListener>,
+) -> std::io::Result<(tokio::net::TcpStream, SocketAddr)> {
+    std::future::poll_fn(|cx| match listener.upgrade() {
+        Some(listener) => listener.poll_accept(cx),
+        None => std::task::Poll::Ready(Err(steering_stopped())),
+    })
+    .await
+}
+
+/// The SERVFAIL warning's clock, shared by one answerer's UDP and TCP
+/// halves so the warning is written at most once a period.
+#[derive(Debug, Default)]
+struct SteeringServfailWarn(std::sync::Mutex<Option<std::time::Instant>>);
+
+impl SteeringServfailWarn {
+    /// Writes the warning for a steered answer while the proxy's listener
+    /// is down, unless it was written less than a period ago.
+    fn answered(&self, plan: &SteeringPlan) {
+        if plan.listener.is_live() {
+            return;
+        }
+        let mut warned = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if warned.is_none_or(|at| at.elapsed() >= STEERING_SERVFAIL_WARN_EVERY) {
+            *warned = Some(std::time::Instant::now());
+            tracing::warn!(
+                component = STEERING_COMPONENT,
+                box_name = %plan.box_label,
+                "answered a steered lookup without the proxy's address: \
+                 the Box Egress Proxy is not listening"
+            );
+        }
+    }
+}
+
+/// The steering answerer's UDP receive loop: one datagram per turn,
+/// answered here or forwarded in a task of its own.
+async fn serve_steering(
+    socket: std::sync::Weak<tokio::net::UdpSocket>,
+    plan: std::sync::Arc<SteeringPlan>,
+    warn: std::sync::Arc<SteeringServfailWarn>,
+    stop: tokio_util::sync::CancellationToken,
+) {
     let in_flight = std::sync::Arc::new(tokio::sync::Semaphore::new(STEERING_MAX_IN_FLIGHT));
     let mut buf = vec![0u8; STEERING_MAX_DATAGRAM + 1];
-    let mut warned: Option<std::time::Instant> = None;
     loop {
-        let (len, peer) = match socket.recv_from(&mut buf).await {
+        let (len, peer) = match steering_recv_from(&socket, &mut buf).await {
             Ok(received) => received,
+            Err(error) if error.kind() == std::io::ErrorKind::NotConnected => return,
             Err(error) => {
                 tracing::warn!(
                     component = STEERING_COMPONENT,
@@ -4449,18 +4602,8 @@ async fn serve_steering(socket: std::sync::Arc<tokio::net::UdpSocket>, plan: Ste
         let datagram = &buf[..len];
         match plan.verdict(datagram) {
             SteeringVerdict::Answer(reply) => {
-                if !plan.listener.is_live()
-                    && warned.is_none_or(|at| at.elapsed() >= STEERING_SERVFAIL_WARN_EVERY)
-                {
-                    warned = Some(std::time::Instant::now());
-                    tracing::warn!(
-                        component = STEERING_COMPONENT,
-                        box_name = %plan.box_label,
-                        "answered a steered lookup without the proxy's address: \
-                         the Box Egress Proxy is not listening"
-                    );
-                }
-                if let Err(error) = socket.send_to(&reply, peer).await {
+                warn.answered(&plan);
+                if let Err(error) = steering_send_to(&socket, &reply, peer).await {
                     tracing::debug!(
                         component = STEERING_COMPONENT,
                         %peer,
@@ -4487,13 +4630,15 @@ async fn serve_steering(socket: std::sync::Arc<tokio::net::UdpSocket>, plan: Ste
                     );
                     continue;
                 };
-                let socket = std::sync::Arc::clone(&socket);
+                let socket = socket.clone();
                 let datagram = datagram.to_vec();
                 let upstream = plan.upstream;
-                drop(crate::traced::spawn(async move {
-                    forward_steering(&socket, upstream, &datagram, peer).await;
-                    drop(permit);
-                }));
+                drop(crate::traced::spawn(
+                    stop.clone().run_until_cancelled_owned(async move {
+                        forward_steering(&socket, upstream, &datagram, peer).await;
+                        drop(permit);
+                    }),
+                ));
             }
         }
     }
@@ -4504,7 +4649,7 @@ async fn serve_steering(socket: std::sync::Arc<tokio::net::UdpSocket>, plan: Ste
 /// answerer's own address. A lookup that gets no reply is dropped, and the
 /// box's resolver retries.
 async fn forward_steering(
-    answerer: &tokio::net::UdpSocket,
+    answerer: &std::sync::Weak<tokio::net::UdpSocket>,
     upstream: SocketAddr,
     datagram: &[u8],
     peer: SocketAddr,
@@ -4519,7 +4664,7 @@ async fn forward_steering(
             .await
             .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
         buf.truncate(len);
-        answerer.send_to(&buf, peer).await
+        steering_send_to(answerer, &buf, peer).await
     };
     if let Err(error) = forwarded.await {
         tracing::debug!(
@@ -4530,6 +4675,157 @@ async fn forward_steering(
             "could not forward a lookup from a steering answerer"
         );
     }
+}
+
+/// The steering answerer's TCP accept loop: each connection is served in a
+/// task of its own.
+async fn serve_steering_tcp(
+    listener: std::sync::Weak<tokio::net::TcpListener>,
+    plan: std::sync::Arc<SteeringPlan>,
+    warn: std::sync::Arc<SteeringServfailWarn>,
+    stop: tokio_util::sync::CancellationToken,
+) {
+    let connections =
+        std::sync::Arc::new(tokio::sync::Semaphore::new(STEERING_MAX_TCP_CONNECTIONS));
+    loop {
+        let (stream, peer) = match steering_accept(&listener).await {
+            Ok(accepted) => accepted,
+            Err(error) if error.kind() == std::io::ErrorKind::NotConnected => return,
+            Err(error) => {
+                // A failed accept (a connection reset before it was taken,
+                // or no file descriptor free) does not stop the loop.
+                tracing::debug!(
+                    component = STEERING_COMPONENT,
+                    box_name = %plan.box_label,
+                    %error,
+                    "a steering answerer could not accept a TCP connection"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let Ok(permit) = std::sync::Arc::clone(&connections).try_acquire_owned() else {
+            tracing::debug!(
+                component = STEERING_COMPONENT,
+                box_name = %plan.box_label,
+                %peer,
+                "closed a TCP connection at a steering answerer: too many connections"
+            );
+            continue;
+        };
+        let plan = std::sync::Arc::clone(&plan);
+        let warn = std::sync::Arc::clone(&warn);
+        drop(crate::traced::spawn(
+            stop.clone().run_until_cancelled_owned(async move {
+                serve_steering_connection(stream, peer, &plan, &warn).await;
+                drop(permit);
+            }),
+        ));
+    }
+}
+
+/// Reads one length-prefixed DNS message from `stream`, or `None` when the
+/// peer closed the connection between two messages.
+async fn read_steering_message(
+    stream: &mut tokio::net::TcpStream,
+) -> std::io::Result<Option<Vec<u8>>> {
+    use tokio::io::AsyncReadExt;
+    let mut prefix = [0u8; 2];
+    match stream.read_exact(&mut prefix).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    let mut message = vec![0u8; usize::from(u16::from_be_bytes(prefix))];
+    stream.read_exact(&mut message).await?;
+    Ok(Some(message))
+}
+
+/// Writes one DNS message to `stream` with its two-byte length prefix.
+async fn write_steering_message(
+    stream: &mut tokio::net::TcpStream,
+    message: &[u8],
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let len = u16::try_from(message.len())
+        .map_err(|_| std::io::Error::other("a DNS message over TCP is longer than 65535 bytes"))?;
+    let mut framed = Vec::with_capacity(message.len() + 2);
+    framed.extend_from_slice(&len.to_be_bytes());
+    framed.extend_from_slice(message);
+    stream.write_all(&framed).await
+}
+
+/// Serves the lookups of one TCP connection in order, with the same
+/// verdicts as a datagram. A message the answerer cannot read closes the
+/// connection, so it never reaches real DNS.
+async fn serve_steering_connection(
+    mut stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    plan: &SteeringPlan,
+    warn: &SteeringServfailWarn,
+) {
+    let served = async {
+        loop {
+            let Ok(read) =
+                tokio::time::timeout(STEERING_TCP_IDLE, read_steering_message(&mut stream)).await
+            else {
+                return Ok(());
+            };
+            let Some(message) = read? else {
+                return Ok(());
+            };
+            match plan.verdict(&message) {
+                SteeringVerdict::Answer(reply) => {
+                    warn.answered(plan);
+                    write_steering_message(&mut stream, &reply).await?;
+                }
+                SteeringVerdict::Drop => {
+                    tracing::debug!(
+                        component = STEERING_COMPONENT,
+                        box_name = %plan.box_label,
+                        %peer,
+                        len = message.len(),
+                        "closed a TCP connection at a steering answerer: \
+                         its lookup is too large or cannot be read"
+                    );
+                    return Ok(());
+                }
+                SteeringVerdict::Forward => {
+                    let reply = forward_steering_tcp(plan.upstream, &message).await?;
+                    write_steering_message(&mut stream, &reply).await?;
+                }
+            }
+        }
+    };
+    let result: std::io::Result<()> = served.await;
+    if let Err(error) = result {
+        tracing::debug!(
+            component = STEERING_COMPONENT,
+            box_name = %plan.box_label,
+            upstream = %plan.upstream,
+            %peer,
+            %error,
+            "a steering answerer's TCP connection ended with an error"
+        );
+    }
+}
+
+/// Sends one DNS message to `upstream` over a TCP connection of its own,
+/// and returns the reply.
+async fn forward_steering_tcp(upstream: SocketAddr, message: &[u8]) -> std::io::Result<Vec<u8>> {
+    let forwarded = async {
+        let mut socket = tokio::net::TcpStream::connect(upstream).await?;
+        write_steering_message(&mut socket, message).await?;
+        read_steering_message(&mut socket).await?.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "the node's resolver closed the connection with no reply",
+            )
+        })
+    };
+    tokio::time::timeout(STEERING_FORWARD_TIMEOUT, forwarded)
+        .await
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))?
 }
 
 #[cfg(test)]
@@ -7559,5 +7855,206 @@ mod tests {
         );
         assert!(!state.last_answer(), "the dropped ask records down");
         super::super::listeners::clear_vm_report_door_for_tests(&control_sock);
+    }
+
+    /// The address a TCP stand-in for the node's resolver answers each A
+    /// question with.
+    const STEERING_TCP_REAL: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 7);
+
+    /// A stand-in for the node's resolver over TCP on loopback: it answers
+    /// each A question with [`STEERING_TCP_REAL`], and counts the lookups.
+    async fn steering_tcp_resolver() -> (SocketAddr, std::sync::Arc<std::sync::atomic::AtomicUsize>)
+    {
+        use hickory_proto::op::{Message, MessageType};
+        use hickory_proto::rr::{RData, Record, RecordType, rdata::A};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&asked);
+        crate::traced::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let counted = std::sync::Arc::clone(&counted);
+                crate::traced::spawn(async move {
+                    while let Ok(Some(message)) = read_steering_message(&mut stream).await {
+                        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let Ok(query) = Message::from_vec(&message) else {
+                            return;
+                        };
+                        let mut reply = query.clone();
+                        reply.metadata.message_type = MessageType::Response;
+                        for q in &query.queries {
+                            if q.query_type() == RecordType::A {
+                                reply.add_answer(Record::from_rdata(
+                                    q.name().clone(),
+                                    60,
+                                    RData::A(A(STEERING_TCP_REAL)),
+                                ));
+                            }
+                        }
+                        let reply = reply.to_vec().unwrap();
+                        if write_steering_message(&mut stream, &reply).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (addr, asked)
+    }
+
+    /// Asks `server` one question over a TCP connection of its own.
+    async fn ask_steering_tcp(
+        server: SocketAddrV4,
+        name: &str,
+        rtype: hickory_proto::rr::RecordType,
+    ) -> hickory_proto::op::Message {
+        let mut stream = tokio::net::TcpStream::connect(server).await.unwrap();
+        write_steering_message(
+            &mut stream,
+            &crate::net::answerer::encode_query(name, rtype),
+        )
+        .await
+        .unwrap();
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_steering_message(&mut stream),
+        )
+        .await
+        .expect("the answerer replies over TCP")
+        .unwrap()
+        .expect("a reply, not a closed connection");
+        hickory_proto::op::Message::from_vec(&reply).unwrap()
+    }
+
+    /// The A addresses of `reply`.
+    fn steering_a_answers(reply: &hickory_proto::op::Message) -> Vec<Ipv4Addr> {
+        reply
+            .answers
+            .iter()
+            .filter_map(|record| match &record.data {
+                hickory_proto::rr::RData::A(a) => Some(a.0),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// BEP-086: a box's resolver retries a truncated reply over TCP, so
+    /// the steering answerer serves TCP at its UDP address and port. A
+    /// steered name gets the proxy's address over TCP as over UDP, NODATA
+    /// for AAAA, HTTPS and SVCB, and SERVFAIL while the proxy is down. No
+    /// steered name reaches the node's resolver.
+    #[tokio::test]
+    async fn steering_answerer_answers_steered_names_over_tcp() {
+        use hickory_proto::op::ResponseCode;
+        use hickory_proto::rr::RecordType;
+
+        let proxy = Ipv4Addr::new(10, 0, 2, 2);
+        let (upstream, asked) = steering_tcp_resolver().await;
+        let listener = ProxyListenerState::down();
+        listener.set_live(true);
+        let plan = SteeringPlan::new(
+            "grant-box",
+            ["github.com"],
+            proxy,
+            listener.clone(),
+            upstream,
+        );
+        let answerer = SteeringAnswerer::start(plan, 0).await.unwrap();
+        let server = answerer.bound();
+
+        let reply = ask_steering_tcp(server, "GitHub.com.", RecordType::A).await;
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(steering_a_answers(&reply), vec![proxy]);
+        for rtype in [RecordType::AAAA, RecordType::HTTPS, RecordType::SVCB] {
+            let reply = ask_steering_tcp(server, "github.com.", rtype).await;
+            assert_eq!(
+                reply.metadata.response_code,
+                ResponseCode::NoError,
+                "{rtype}"
+            );
+            assert!(reply.answers.is_empty(), "{rtype} is NODATA");
+        }
+        listener.set_live(false);
+        let reply = ask_steering_tcp(server, "github.com.", RecordType::A).await;
+        assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no steered name reaches real DNS"
+        );
+    }
+
+    /// BEP-086: a TCP lookup for a name that is not steered goes to the
+    /// node's resolver over TCP, and its reply comes back on the box's
+    /// connection.
+    #[tokio::test]
+    async fn steering_answerer_forwards_other_names_over_tcp() {
+        use hickory_proto::rr::RecordType;
+
+        let (upstream, asked) = steering_tcp_resolver().await;
+        let listener = ProxyListenerState::down();
+        listener.set_live(true);
+        let plan = SteeringPlan::new(
+            "grant-box",
+            ["github.com"],
+            Ipv4Addr::new(10, 0, 2, 2),
+            listener,
+            upstream,
+        );
+        let answerer = SteeringAnswerer::start(plan, 0).await.unwrap();
+
+        let reply = ask_steering_tcp(answerer.bound(), "example.com.", RecordType::A).await;
+        assert_eq!(steering_a_answers(&reply), vec![STEERING_TCP_REAL]);
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Dropping a steering answerer frees its address and port at once,
+    /// for UDP and TCP, even with a forward still waiting on the node's
+    /// resolver and a TCP connection still open. A restart binds them
+    /// again with no `AddrInUse`.
+    #[tokio::test]
+    async fn steering_answerer_binds_again_at_once_after_drop() {
+        use hickory_proto::rr::RecordType;
+
+        // A node's resolver that reads each lookup and never answers, so
+        // the forward waits for its whole timeout.
+        let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream = silent.local_addr().unwrap();
+        let plan = || {
+            SteeringPlan::new(
+                "grant-box",
+                ["github.com"],
+                Ipv4Addr::new(10, 0, 2, 2),
+                ProxyListenerState::down(),
+                upstream,
+            )
+        };
+        let answerer = SteeringAnswerer::start(plan(), 0).await.unwrap();
+        let bound = answerer.bound();
+
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(
+                &crate::net::answerer::encode_query("example.com.", RecordType::A),
+                bound,
+            )
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 4096];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            silent.recv_from(&mut buf),
+        )
+        .await
+        .expect("the lookup is forwarded")
+        .unwrap();
+        let open = tokio::net::TcpStream::connect(bound).await.unwrap();
+
+        drop(answerer);
+        let again = SteeringAnswerer::start(plan(), bound.port())
+            .await
+            .expect("the address and port are free at once");
+        assert_eq!(again.bound(), bound);
+        drop(open);
     }
 }
