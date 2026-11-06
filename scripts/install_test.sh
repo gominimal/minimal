@@ -970,6 +970,33 @@ EOF
     want_ok "the remedy removes the classifier table" \
         grep -qx "nft delete table inet minimal_class" "$remedy_calls"
 
+    # The placement socket pair a current install leaves (gominimal/inbox#1206):
+    # the remedy disables the units whose files are there, never the earlier
+    # path pair this host does not carry, because systemctl refuses a whole
+    # call that names a unit it does not have.
+    HNS4S="$root/hns4s"; mkdir -p "$HNS4S"
+    run ns4s_seed "$HNS4S"
+    fake_ns4s="$root/fake net root-4s \$HOME"
+    cls_files_s="etc/systemd/system/minimald-classifier.service etc/systemd/system/minimald-place.socket etc/systemd/system/minimald-place@.service usr/local/lib/minimal/install-host-classifier.sh usr/local/lib/minimal/quic443-leaf etc/sudoers.d/minimal-quic443-leaf var/lib/minimal/finalize-install-classifier"
+    mkdir -p "$fake_ns4s/$cls_tree/classifier-table" "$fake_ns4s/$cls_tree/daemon" \
+        "$fake_ns4s/$cls_tree/boxes/allow" "$fake_ns4s/$cls_tree/boxes/deny"
+    for f in $cls_files_s; do
+        mkdir -p "$fake_ns4s/$(dirname "$f")"
+        printf 'unit\n' >"$fake_ns4s/$f"
+    done
+    FINALIZE_INSTALL_ROOT="$fake_ns4s"
+    run ns4s_run "$HNS4S" --uninstall
+    FINALIZE_INSTALL_ROOT=
+    check 0 "$rc" "uninstall with the placement socket pair exits 0"
+    want_ok "the socket pair's units are advised" \
+        grep -q "still installed on this host.*classifier units" "$OUT"
+    apply_remedies 3
+    for f in $cls_files_s "$cls_tree" usr/local/lib/minimal; do
+        want_err "the printed remedies remove $f" test -e "$fake_ns4s/$f"
+    done
+    check "systemctl disable --now minimald-classifier.service minimald-place.socket" \
+        "$(head -n 1 "$remedy_calls")" "the remedy disables the units this host carries, and only those"
+
     # A tree without the step's record was installed another way: it is not
     # the step's to remove, so nothing advises removing it.
     HNS4B="$root/hns4b"; mkdir -p "$HNS4B"
@@ -3243,6 +3270,10 @@ STUB
     drop_cgroup_files "$tree/boxes/deny"
     drop_cgroup_files "$tree/boxes/allow"
     drop_cgroup_files "$tree/boxes/quic443-blocked"
+    # The probe leaf a daemon stopped mid-probe leaves behind
+    # (gominimal/inbox#1206) is the probe's own, so it does not stop the
+    # uninstall.
+    mkdir "$tree/boxes/deny/filter-probe-4242"
     run_hc uninstall "$root/mi-on" --uninstall
     check 0 "$rc" "uninstall removes the installed tree"
     want_err "uninstall leaves no tree behind" test -e "$tree"
@@ -3276,8 +3307,8 @@ STUB
         grep -q "numeric process id" "$OUT"
 
     # --- --place-listener: the same placement, found from the daemon's own
-    # listener so a manager-held path unit can make it at every start the
-    # socket announces (no per-restart --pid). Over a stand-in process table:
+    # listener so the manager-held placement unit can make it at every start
+    # the daemon asks for (no per-restart --pid). Over a stand-in process table:
     # the holder of the socket that runs as the delegated account outside
     # the slice is placed; a holder of another uid, a holder of another
     # socket, a same-uid holder already inside the slice (a box in
