@@ -337,6 +337,21 @@ mod tests {
         let t: Task = toml::from_str("exec = \"bash\"\ninteractive = false").unwrap();
         t.refuse_interactive("shell")
             .expect("a task that is not interactive");
+
+        // The project's own file is refused from disk too. The package
+        // graph reads the same file as a layer: the default package
+        // repository declares interactive tasks, and the user cannot fix
+        // that file, so the graph load reads it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(crate::MFILE_NAME),
+            "[tasks.shell]\ninteractive = true\nexec = \"bash -l\"\n",
+        )
+        .unwrap();
+        let err = crate::File::from_dir(dir.path()).expect_err("the project file is refused");
+        assert_eq!(err.exit_code(), Some(3), "{err}");
+        let layer = crate::File::from_dir_for_graph(dir.path()).expect("a graph layer reads");
+        assert!(layer.tasks["shell"].interactive);
     }
 
     /// Tests the interpolation path used by task_invocations when parsed_args is Some:

@@ -998,6 +998,15 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
+/// Whether a load refuses a task that sets `interactive = true` (BOX-054).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskCheck {
+    /// Refuse it: the file is the project's own.
+    Refuse,
+    /// Read it: the package graph reads the file as a layer.
+    Skip,
+}
+
 impl File {
     /// Parses a `minimal.toml` from raw bytes — the pure, filesystem-free core
     /// of [`File::from_dir`], exposed for fuzzing (crates/mfile/fuzz) and tests.
@@ -1078,6 +1087,7 @@ impl File {
         path: &PathBuf,
         layout: Layout,
         content_hash: u64,
+        tasks: TaskCheck,
     ) -> Result<Self, Error> {
         self.mfile_path = Some(path.to_path_buf());
         self.layout = Some(layout);
@@ -1088,7 +1098,7 @@ impl File {
                 sideload.link.fixup_relative(path);
             }
         }
-        self.validate()?;
+        self.check(tasks)?;
         Ok(self)
     }
 
@@ -1109,6 +1119,12 @@ impl File {
     /// sets more than one action key, or [`Error::InteractiveTask`] if a
     /// task sets `interactive = true`.
     pub fn validate(&self) -> Result<(), Error> {
+        self.check(TaskCheck::Refuse)
+    }
+
+    /// [`Self::validate`], with the interactive-task refusal as `tasks`
+    /// says.
+    fn check(&self, tasks: TaskCheck) -> Result<(), Error> {
         if let Some(params) = &self.params {
             for (n, s) in params.0.iter() {
                 if s.default.is_none() {
@@ -1139,7 +1155,9 @@ impl File {
             if keys.len() > 1 {
                 return Err(Error::MultipleTaskActions(task_name.clone(), keys));
             }
-            task.refuse_interactive(task_name)?;
+            if tasks == TaskCheck::Refuse {
+                task.refuse_interactive(task_name)?;
+            }
         }
         self.warn_unknown_fields();
         Ok(())
@@ -1148,11 +1166,26 @@ impl File {
     /// Loads the minimal file from the given directory path. The given
     /// directory must be a repository / minimalfile root.
     pub fn from_dir<P: AsRef<Path>>(dir: P) -> Result<Self, Error> {
+        Self::load_dir(dir.as_ref(), TaskCheck::Refuse)
+    }
+
+    /// Loads the minimal file from `dir` as the package graph reads a
+    /// layer: [`Self::from_dir`] without the interactive-task refusal
+    /// (BOX-054). The graph reads only a layer's `[upstream]`, `[params]`
+    /// and `[stdlib]`, and never runs its tasks. An upstream package
+    /// repository can still declare `interactive = true` tasks, and the
+    /// user cannot fix that file. The project's own file gets the refusal
+    /// when it loads through [`Self::from_dir`].
+    pub fn from_dir_for_graph<P: AsRef<Path>>(dir: P) -> Result<Self, Error> {
+        Self::load_dir(dir.as_ref(), TaskCheck::Skip)
+    }
+
+    fn load_dir(dir: &Path, tasks: TaskCheck) -> Result<Self, Error> {
         // Check for the minimal file at the directory root.
-        let path = dir.as_ref().join(MFILE_NAME);
+        let path = dir.join(MFILE_NAME);
         match std::fs::read(&path) {
             Ok(file_data) => {
-                let conflicting_path = dir.as_ref().join(".minimal").join(MFILE_NAME);
+                let conflicting_path = dir.join(".minimal").join(MFILE_NAME);
                 if std::fs::exists(&conflicting_path)
                     .map_err(|e| Error::IO("stat", conflicting_path.clone(), e))?
                 {
@@ -1164,6 +1197,7 @@ impl File {
                     &path,
                     Layout::Root,
                     hash_bytes(&file_data),
+                    tasks,
                 );
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1171,13 +1205,14 @@ impl File {
         };
 
         // Check for the minimal file at `./.minimal`.
-        let path = dir.as_ref().join(".minimal").join(MFILE_NAME);
+        let path = dir.join(".minimal").join(MFILE_NAME);
         match std::fs::read(&path) {
             Ok(file_data) => Self::init_toml(
                 Self::parse(&file_data, Some(&path))?,
                 &path,
                 Layout::DotMinimal,
                 hash_bytes(&file_data),
+                tasks,
             ),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::NotFound),
             Err(e) => Err(Error::IO("minimal file", path, e)),
