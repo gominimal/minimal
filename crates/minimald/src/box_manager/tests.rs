@@ -5365,3 +5365,326 @@ async fn host_ip_create_rereads_a_stale_unreadable_fact() {
         "each host-address create logs whether it re-read the fact:\n{logged}"
     );
 }
+
+/// The directory of box `id` and its workspace, through a store over
+/// `state_dir`, with the workspace made when the box has none yet.
+async fn box_dir_and_tree(
+    state_dir: &std::path::Path,
+    id: SessionId,
+) -> (boxes::store::BoxDir, std::path::PathBuf) {
+    use boxes::store::BoxObject as _;
+
+    let store = crate::store::Store::init(daemon_abs(state_dir))
+        .await
+        .unwrap();
+    let handle = store
+        .find(RecordPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the record is retained");
+    let object = handle.object().await.unwrap();
+    let tree = object
+        .workspace_path()
+        .as_utf8_path()
+        .as_std_path()
+        .to_path_buf();
+    std::fs::create_dir_all(&tree).unwrap();
+    (object.dir(), tree)
+}
+
+/// Writes `len` bytes of data to `name` in the workspace of box `id`.
+async fn write_box_file(state_dir: &std::path::Path, id: SessionId, name: &str, len: usize) {
+    let (_, tree) = box_dir_and_tree(state_dir, id).await;
+    std::fs::write(tree.join(name), vec![7u8; len]).unwrap();
+}
+
+/// BOX-021: a prune preview lists every stopped or exited box the
+/// selectors match, in box id order, each with the disk a reap of it
+/// frees. A running or pending box is not listed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prune_dry_run_lists_matches_with_disk() {
+    use boxes::core::record::{ExitEnding, RecordState, StopEnding};
+
+    let log = crate::test_harness::captured_log();
+    let (state, _cache, mngr) = manager().await;
+    let running = create_active_session_with(&mngr, rooted_config("running", "/p")).await;
+    let stopped = create_active_session_with(&mngr, rooted_config("stopped", "/p")).await;
+    let exited = create_active_session_with(&mngr, rooted_config("exited", "/p")).await;
+    let pending = mngr
+        .create_session(rooted_config("pending", "/p"), None)
+        .await
+        .unwrap();
+    set_record_state(
+        state.path(),
+        stopped,
+        RecordState::Stopped(StopEnding::AtDaemonStart),
+    )
+    .await;
+    set_record_state(state.path(), exited, RecordState::Exited(ExitEnding::Oom)).await;
+    let mib = 1024 * 1024;
+    write_box_file(state.path(), stopped, "big.bin", 4 * mib).await;
+    write_box_file(state.path(), exited, "small.bin", 64 * 1024).await;
+
+    let preview = mngr.preview_prune(None, None).await.unwrap();
+    let mut expected = vec![stopped, exited];
+    expected.sort();
+    let listed: Vec<_> = preview
+        .matched
+        .iter()
+        .map(|entry| entry.record.box_id)
+        .collect();
+    assert_eq!(
+        listed, expected,
+        "the ended boxes, never {running} or {pending}"
+    );
+    for entry in &preview.matched {
+        let (dir, _) = box_dir_and_tree(state.path(), entry.record.box_id).await;
+        assert_eq!(
+            entry.disk_bytes,
+            Some(dir.disk_bytes().unwrap()),
+            "the figure is what a reap of the box directory frees"
+        );
+    }
+    let disk_of = |id| {
+        preview
+            .matched
+            .iter()
+            .find(|entry| entry.record.box_id == id)
+            .and_then(|entry| entry.disk_bytes)
+            .unwrap()
+    };
+    assert!(disk_of(stopped) >= 4 * mib as u64, "{}", disk_of(stopped));
+    assert!(disk_of(exited) >= 64 * 1024, "{}", disk_of(exited));
+    assert!(disk_of(exited) < disk_of(stopped));
+    let state_of = |id| {
+        preview
+            .matched
+            .iter()
+            .find(|entry| entry.record.box_id == id)
+            .map(|entry| entry.record.state.clone())
+    };
+    assert_eq!(state_of(stopped).as_deref(), Some("stopped"));
+    assert_eq!(state_of(exited).as_deref(), Some("exited"));
+
+    // The parent selector narrows the preview as it narrows a prune.
+    let preview = mngr.preview_prune(None, Some(running)).await.unwrap();
+    assert!(preview.matched.is_empty(), "{preview:?}");
+
+    let logged = log.contents();
+    assert!(
+        logged.contains("previewed a prune: no box was reaped"),
+        "{logged}"
+    );
+}
+
+/// BOX-021: a prune preview reaps none of the boxes it lists. Each
+/// record and its directory stay, and a later prune reaps them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prune_dry_run_reaps_none() {
+    use boxes::core::record::{RecordState, StopEnding};
+
+    let log = crate::test_harness::captured_log();
+    let (state, _cache, mngr) = manager().await;
+    let running = create_active_session_with(&mngr, rooted_config("running", "/p")).await;
+    let stopped = create_active_session_with(&mngr, rooted_config("stopped", "/p")).await;
+    set_record_state(
+        state.path(),
+        stopped,
+        RecordState::Stopped(StopEnding::AtDaemonStart),
+    )
+    .await;
+    write_box_file(state.path(), stopped, "kept.bin", 64 * 1024).await;
+    let (dir, tree) = box_dir_and_tree(state.path(), stopped).await;
+    let before = dir.disk_bytes().unwrap();
+
+    let mut listed_before: Vec<_> = mngr
+        .list_boxes(None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| (entry.box_id, entry.state))
+        .collect();
+    listed_before.sort();
+    for _ in 0..2 {
+        let preview = mngr.preview_prune(None, None).await.unwrap();
+        assert_eq!(preview.matched.len(), 1, "{preview:?}");
+    }
+    let mut listed_after: Vec<_> = mngr
+        .list_boxes(None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| (entry.box_id, entry.state))
+        .collect();
+    listed_after.sort();
+    assert_eq!(listed_after, listed_before, "the preview changes no record");
+    assert!(dir.is_retained(), "the previewed box is retained");
+    assert!(tree.join("kept.bin").exists(), "its files are on disk");
+    assert_eq!(dir.disk_bytes().unwrap(), before);
+    let logged = log.contents();
+    assert!(
+        !logged
+            .lines()
+            .any(|line| line.contains("reaped a box") && line.contains(&stopped.to_string())),
+        "no reap ran:\n{logged}"
+    );
+
+    let reply = mngr.prune_boxes(None, None).await.unwrap();
+    let reaped: Vec<_> = reply.reaped.iter().map(|entry| entry.box_id).collect();
+    assert_eq!(reaped, vec![stopped]);
+    assert!(!dir.is_retained());
+    assert_eq!(
+        mngr.show_box(running).await.unwrap().unwrap().record.state,
+        "running"
+    );
+}
+
+/// BOX-021: for each set of selectors, a prune preview lists exactly the
+/// boxes a prune with the same selectors then reaps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prune_dry_run_matches_what_prune_reaps() {
+    use boxes::core::record::{ExitEnding, RecordState, StopEnding};
+
+    let (state, _cache, mngr) = manager().await;
+    let running = create_active_session_with(&mngr, rooted_config("running", "/p")).await;
+    let child_stopped = create_active_session_with(&mngr, rooted_config("child-a", "/p")).await;
+    let child_exited = create_active_session_with(&mngr, rooted_config("child-b", "/p")).await;
+    let running_child = create_active_session_with(&mngr, rooted_config("child-c", "/p")).await;
+    let orphan = create_active_session_with(&mngr, rooted_config("orphan", "/p")).await;
+    let recent = create_active_session_with(&mngr, rooted_config("recent", "/p")).await;
+    let no_exit = create_active_session_with(&mngr, rooted_config("no-exit", "/p")).await;
+    for id in [child_stopped, child_exited, running_child] {
+        edit_record(state.path(), id, |record| record.parent = Some(running)).await;
+    }
+    let stopped = RecordState::Stopped(StopEnding::AtDaemonStart);
+    for id in [child_stopped, orphan, recent, no_exit] {
+        set_record_state(state.path(), id, stopped).await;
+    }
+    set_record_state(
+        state.path(),
+        child_exited,
+        RecordState::Exited(ExitEnding::Oom),
+    )
+    .await;
+    let day = std::time::Duration::from_secs(24 * 60 * 60);
+    let now = std::time::SystemTime::now();
+    write_exited_event(state.path(), orphan, now).await;
+    write_exited_event(state.path(), recent, now + day + day / 2).await;
+    write_exited_event(state.path(), child_stopped, now).await;
+
+    let later = now + 2 * day;
+    // Each step previews and then prunes with the same selectors, over
+    // what the steps before it left.
+    let steps: [(
+        Option<std::time::Duration>,
+        Option<SessionId>,
+        std::time::SystemTime,
+    ); 4] = [
+        (Some(day), None, now),
+        (Some(day), Some(running), later),
+        (None, Some(running), later),
+        (Some(day), None, later),
+    ];
+    let mut reaped_any = 0;
+    for (older_than, parent, at) in steps {
+        let preview = mngr.preview_prune_at(older_than, parent, at).await.unwrap();
+        let listed: Vec<_> = preview
+            .matched
+            .iter()
+            .map(|entry| entry.record.clone())
+            .collect();
+        let reply = mngr.prune_boxes_at(older_than, parent, at).await.unwrap();
+        assert!(reply.failed.is_empty(), "{:?}", reply.failed);
+        assert_eq!(
+            listed, reply.reaped,
+            "the preview with {older_than:?} {parent:?} lists what the prune reaps"
+        );
+        reaped_any += reply.reaped.len();
+    }
+    assert_eq!(reaped_any, 3, "the steps reap child-a, child-b and orphan");
+
+    let preview = mngr.preview_prune(None, None).await.unwrap();
+    let mut listed: Vec<_> = preview
+        .matched
+        .iter()
+        .map(|entry| entry.record.box_id)
+        .collect();
+    listed.sort();
+    let mut expected = vec![recent, no_exit];
+    expected.sort();
+    assert_eq!(listed, expected);
+    let reply = mngr.prune_boxes(None, None).await.unwrap();
+    let mut reaped: Vec<_> = reply.reaped.iter().map(|entry| entry.box_id).collect();
+    reaped.sort();
+    assert_eq!(reaped, expected);
+}
+
+/// BOX-159: a read of a stopped or exited box returns the disk a reap of
+/// it frees, the same figure a prune preview lists. A running box has no
+/// figure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn show_reports_disk_a_reap_frees() {
+    use boxes::core::record::{ExitEnding, RecordState, StopEnding};
+
+    let log = crate::test_harness::captured_log();
+    let (state, cache, mngr) = manager().await;
+    let stopped = create_active_session_with(&mngr, rooted_config("stopped", "/p")).await;
+    let exited = create_active_session_with(&mngr, rooted_config("exited", "/p")).await;
+    let running = create_active_session_with(&mngr, rooted_config("running", "/p")).await;
+    let shown = mngr.show_box(running).await.unwrap().unwrap();
+    assert_eq!(shown.record.state, "running");
+    assert_eq!(shown.disk_bytes, None, "a running box has no figure");
+    drop(mngr);
+
+    set_record_state(
+        state.path(),
+        stopped,
+        RecordState::Stopped(StopEnding::ExitedFirst { exit_code: 0 }),
+    )
+    .await;
+    set_record_state(
+        state.path(),
+        exited,
+        RecordState::Exited(ExitEnding::Exit { exit_code: 1 }),
+    )
+    .await;
+    write_box_file(state.path(), stopped, "data.bin", 1024 * 1024).await;
+    let mngr = manager_over(state.path(), cache.path()).await;
+
+    let preview = mngr.preview_prune(None, None).await.unwrap();
+    for id in [stopped, exited] {
+        let shown = mngr.show_box(id).await.unwrap().unwrap();
+        let (dir, _) = box_dir_and_tree(state.path(), id).await;
+        assert_eq!(shown.disk_bytes, Some(dir.disk_bytes().unwrap()));
+        let listed = preview
+            .matched
+            .iter()
+            .find(|entry| entry.record.box_id == id)
+            .expect("the preview lists the box");
+        assert_eq!(
+            shown.disk_bytes, listed.disk_bytes,
+            "show and the preview give the same figure"
+        );
+    }
+    let stopped_disk = mngr
+        .show_box(stopped)
+        .await
+        .unwrap()
+        .unwrap()
+        .disk_bytes
+        .unwrap();
+    assert!(stopped_disk >= 1024 * 1024, "{stopped_disk}");
+
+    // The reap frees the whole directory the figure counts.
+    let (dir, _) = box_dir_and_tree(state.path(), stopped).await;
+    mngr.reap_box(stopped, false).await.unwrap();
+    assert_eq!(
+        dir.disk_bytes().unwrap_err().kind(),
+        ErrorKind::NotFound,
+        "nothing the figure counted is left"
+    );
+    assert_eq!(mngr.show_box(stopped).await.unwrap(), None);
+
+    let logged = log.contents();
+    assert!(logged.contains("read a box record"), "{logged}");
+}

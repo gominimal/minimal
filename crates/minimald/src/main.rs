@@ -1279,6 +1279,7 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
             .map_err(|e| MainError::IO(e, "listening to socket"))?;
 
         tracing::info!("Started listening on {}", cli.listen_on());
+        request_daemon_placement(tree_root).await;
         read_host_ip_enforcement_fact(tree_root);
         let (opts, ssh_name) = cli.ssh_args();
         tracing::info!(
@@ -1351,6 +1352,59 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
     }
 }
 
+/// NET-079: asks the placement unit `min finalize-install` installs to put
+/// this native daemon in its classifier leaf, once the listener the placer
+/// finds it by is bound, and waits for the placer to finish, so the
+/// start-up reading below is taken from where the placement left the
+/// daemon. A daemon already in its leaf (a `Delegate=yes` unit, or the
+/// entry at start) asks for nothing, and a host without the unit answers
+/// at once. Each outcome is one line in the daemon's log.
+async fn request_daemon_placement(tree_root: &std::path::Path) {
+    use minimald::net::classifier::{self, PlaceRequest};
+    if minimald::guest::is_microvm_daemon() || classifier::daemon_fetch_leaf(tree_root).is_some() {
+        return;
+    }
+    let request = minimald::traced::spawn_blocking(|| {
+        classifier::request_daemon_placement(
+            std::path::Path::new(paths::PLACE_REQUEST_SOCKET),
+            classifier::PLACE_REQUEST_WAIT,
+        )
+    })
+    .await;
+    match request {
+        // A closed connection is not a placement: systemd also closes one it
+        // will not serve (over the socket's `MaxConnections=`), and a placer
+        // can exit without finding this daemon. Only the leaf says whether
+        // the request placed it.
+        Ok(PlaceRequest::Answered) if classifier::daemon_fetch_leaf(tree_root).is_some() => {
+            tracing::info!(
+                socket = paths::PLACE_REQUEST_SOCKET,
+                "the placement unit placed this daemon in its classifier leaf"
+            )
+        }
+        Ok(PlaceRequest::Answered) => tracing::warn!(
+            socket = paths::PLACE_REQUEST_SOCKET,
+            "the placement unit closed this daemon's placement request without placing it, \
+             so it runs outside its classifier leaf"
+        ),
+        Ok(PlaceRequest::NoPlacer(e)) => tracing::info!(
+            socket = paths::PLACE_REQUEST_SOCKET,
+            error = %e,
+            "no placement unit answers on this host, so nothing placed this daemon at start"
+        ),
+        Ok(PlaceRequest::NoAnswer(e)) => tracing::warn!(
+            socket = paths::PLACE_REQUEST_SOCKET,
+            error = %e,
+            wait_secs = classifier::PLACE_REQUEST_WAIT.as_secs(),
+            "the placement unit did not finish placing this daemon in time"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "the placement request did not run"
+        ),
+    }
+}
+
 /// NET-079: the start-time fact this daemon answers every create with —
 /// whether this host can decide a host-address box's egress verdict per box,
 /// and why not when it cannot. Read with its probe attached, because the fact
@@ -1379,9 +1433,27 @@ fn read_host_ip_enforcement_fact(tree_root: &std::path::Path) {
     // the daemon's first create answer already names this host, and
     // refreshed by each host-address launch's own re-read.
     minimald::box_runtime::set_host_ip_enforcement_fact(&classifier_decision);
+    // gominimal/inbox#1206: a native daemon outside its leaf on a host whose
+    // tree is installed is its own state, with its own remedy, so it gets
+    // its own line beside the probe's: the probe reads it only as a table
+    // whose effect could not be read.
+    let daemon_leaf = sandbox::classifier::daemon_leaf(tree_root);
+    let placed = minimald::net::classifier::daemon_fetch_leaf(tree_root).is_some();
+    if !guest && !placed && daemon_leaf.is_dir() {
+        tracing::warn!(
+            leaf = %daemon_leaf.display(),
+            daemon_cgroup = ?sandbox::classifier::own_cgroup_path(),
+            pid = std::process::id(),
+            "this daemon is not in its classifier leaf, so it cannot decide a \
+             host-address box's egress verdict per box. Run min finalize-install to \
+             place it. It also reinstalls the unit that places the daemon at every \
+             start when that unit is missing or out of date."
+        );
+    }
     match classifier_decision.cause() {
         Some(cause) => tracing::info!(
             tree = sandbox::classifier::TREE_ROOT,
+            daemon_placed = placed,
             probe = "undecided",
             cause = cause.detail(),
             install = ?cause.install_command(),
@@ -1392,6 +1464,7 @@ fn read_host_ip_enforcement_fact(tree_root: &std::path::Path) {
         ),
         None => tracing::info!(
             tree = sandbox::classifier::TREE_ROOT,
+            daemon_placed = placed,
             probe = "decided",
             host_ip_enforcement = "per_box",
             "this host decides a host-address box's egress verdict per box"

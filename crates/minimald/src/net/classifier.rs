@@ -557,6 +557,237 @@ pub const QUIC443_LEAF_SET: &str = "quic443_blocked_leaves";
 /// as `PROXY_LANE_SET` in `scripts/install-host-classifier.sh`.
 pub const PROXY_LANE_SET: &str = "bep_lane_leaves";
 
+/// The name of the guest table's chain that fences one host-address box's
+/// steering answerer at `address` (BEP-086): `steer_127_53_0_1` for
+/// `127.53.0.1`. One chain per answerer, so its removal touches no other
+/// rule of the table.
+#[must_use]
+pub(crate) fn steering_fence_chain(address: Ipv4Addr) -> String {
+    let [a, b, c, d] = address.octets();
+    format!("steer_{a}_{b}_{c}_{d}")
+}
+
+/// The `nft -f` script that fences the steering answerer at
+/// `address`:`port` to the box leaf `leaf`, spelled as its path below the
+/// cgroup2 mount (BEP-086). A socket created in `leaf` may reach the
+/// answerer over UDP or TCP. Every other socket's packet to it is counted,
+/// logged at a bounded rate and rejected, so no other box and no other
+/// process of the guest gets this box's steered answers. The chain is a
+/// base chain of its own on the output hook, flushed before it is filled,
+/// so a second fence of one address replaces the first.
+#[must_use]
+pub(crate) fn render_steering_fence(address: Ipv4Addr, port: u16, leaf: &Path) -> String {
+    let chain = steering_fence_chain(address);
+    let rel = leaf.to_string_lossy();
+    let rel = rel.trim_matches('/');
+    let level = rel.split('/').filter(|part| !part.is_empty()).count();
+    let to_answerer = format!("ip daddr {address} meta l4proto {{ tcp, udp }} th dport {port}");
+    format!(
+        "add table inet {TABLE_NAME}\n\
+         add chain inet {TABLE_NAME} {chain} {{ type filter hook output priority filter; policy accept; }}\n\
+         flush chain inet {TABLE_NAME} {chain}\n\
+         add rule inet {TABLE_NAME} {chain} {to_answerer} socket cgroupv2 level {level} \"{rel}\" return\n\
+         add rule inet {TABLE_NAME} {chain} {to_answerer} counter limit rate 1/second burst 4 packets \
+         log prefix \"minimal-classifier: refused \" level warn\n\
+         add rule inet {TABLE_NAME} {chain} {to_answerer} reject with icmpx admin-prohibited\n"
+    )
+}
+
+/// The `nft -f` script that fences the steering answerer at
+/// `address`:`port` to no leaf at all: every socket's packet to it is
+/// counted, logged at a bounded rate and rejected (BEP-086). The plan sets
+/// it as soon as the answerer binds, so nothing reaches the answerer before
+/// attach knows the box's leaf and replaces it with
+/// [`render_steering_fence`].
+#[must_use]
+pub(crate) fn render_steering_closed_fence(address: Ipv4Addr, port: u16) -> String {
+    let chain = steering_fence_chain(address);
+    let to_answerer = format!("ip daddr {address} meta l4proto {{ tcp, udp }} th dport {port}");
+    format!(
+        "add table inet {TABLE_NAME}\n\
+         add chain inet {TABLE_NAME} {chain} {{ type filter hook output priority filter; policy accept; }}\n\
+         flush chain inet {TABLE_NAME} {chain}\n\
+         add rule inet {TABLE_NAME} {chain} {to_answerer} counter limit rate 1/second burst 4 packets \
+         log prefix \"minimal-classifier: refused \" level warn\n\
+         add rule inet {TABLE_NAME} {chain} {to_answerer} reject with icmpx admin-prohibited\n"
+    )
+}
+
+/// Closes the steering answerer at `address`:`port` to every leaf, until
+/// [`fence_steering_answerer`] admits the box's own.
+///
+/// # Errors
+///
+/// `nft` refuses the fence.
+pub(crate) async fn close_steering_answerer(
+    nft: &Path,
+    address: Ipv4Addr,
+    port: u16,
+) -> std::io::Result<()> {
+    run_nft_script(nft, &render_steering_closed_fence(address, port)).await
+}
+
+/// The `nft -f` script that removes the fence of the steering answerer at
+/// `address`.
+#[must_use]
+pub(crate) fn render_steering_unfence(address: Ipv4Addr) -> String {
+    let chain = steering_fence_chain(address);
+    format!(
+        "flush chain inet {TABLE_NAME} {chain}\n\
+         delete chain inet {TABLE_NAME} {chain}\n"
+    )
+}
+
+/// The unified (cgroup2) path in the text of a `/proc/<pid>/cgroup` file,
+/// with no leading slash: `minimald.slice/boxes/allow/b1` for the line
+/// `0::/minimald.slice/boxes/allow/b1`.
+#[must_use]
+pub(crate) fn unified_cgroup_path(text: &str) -> Option<PathBuf> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .map(|path| PathBuf::from(path.trim().trim_start_matches('/')))
+}
+
+/// Whether `rel`, a path below the cgroup2 mount, is a box leaf: a
+/// directory under the classifier tree's `boxes` directory.
+#[must_use]
+pub(crate) fn is_box_leaf(rel: &Path) -> bool {
+    let mut parts = rel.components().map(|part| part.as_os_str().to_owned());
+    parts.any(|part| part == sandbox::classifier::BOXES_DIR) && parts.next().is_some()
+}
+
+/// Whether `rel`, a leaf path that a fence writes into an `nft` script
+/// between double quotes, holds only characters that cannot end the quote
+/// or the line: ASCII letters, digits, and `.`, `_`, `-`, `@`, `:`, `+`
+/// and `/`.
+#[must_use]
+pub(crate) fn is_safe_leaf_path(rel: &Path) -> bool {
+    rel.to_str().is_some_and(|text| {
+        !text.is_empty()
+            && text
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-@:+/".contains(&b))
+    })
+}
+
+/// How many times a fence reads the box's cgroup before it gives up, and
+/// how long it waits between reads: the box's first process joins its own
+/// leaf before its program runs, which can be just after the launch hands
+/// the process to the network.
+const STEERING_FENCE_READS: usize = 20;
+const STEERING_FENCE_READ_WAIT: Duration = Duration::from_millis(50);
+
+/// The box leaf of the process `pid`, read from `/proc/<pid>/cgroup`
+/// until the process is in a box leaf, a bounded number of times.
+///
+/// # Errors
+///
+/// The file cannot be read, or the process is not in a box leaf after the
+/// last read.
+pub(crate) async fn box_leaf_of(pid: u32) -> std::io::Result<PathBuf> {
+    let file = format!("/proc/{pid}/cgroup");
+    let mut last = None;
+    for _ in 0..STEERING_FENCE_READS {
+        let text = tokio::fs::read_to_string(&file).await?;
+        match unified_cgroup_path(&text) {
+            Some(rel) if is_box_leaf(&rel) => return Ok(rel),
+            other => last = other,
+        }
+        tokio::time::sleep(STEERING_FENCE_READ_WAIT).await;
+    }
+    Err(std::io::Error::other(format!(
+        "process {pid} is not in a box leaf: its cgroup is {}",
+        last.map_or_else(|| "unknown".to_string(), |rel| rel.display().to_string())
+    )))
+}
+
+/// Runs `nft -f -` with `script` on stdin. The `nft` binary is `nft`: the
+/// guest's own in production, and a stand-in in a test.
+///
+/// # Errors
+///
+/// `nft` cannot be run, or it exits with a failure, with what it said.
+pub(crate) async fn run_nft_script(nft: &Path, script: &str) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+    let mut child = tokio::process::Command::new(nft)
+        .args(["-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("cannot run {}: {error}", nft.display()),
+            )
+        })?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(script.as_bytes()).await?;
+    }
+    let ran = tokio::time::timeout(TABLE_LIST_DEADLINE, child.wait_with_output())
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("{} did not finish in time", nft.display()),
+            )
+        })??;
+    if ran.status.success() {
+        return Ok(());
+    }
+    Err(std::io::Error::other(format!(
+        "{} exited with {}: {}",
+        nft.display(),
+        ran.status,
+        String::from_utf8_lossy(&ran.stderr).trim()
+    )))
+}
+
+/// Fences the steering answerer at `address`:`port` to the box leaf of
+/// the process `pid` (BEP-086): that leaf may reach it, and no other leaf
+/// may. Returns the leaf.
+///
+/// # Errors
+///
+/// The process's leaf cannot be read, its path holds a character that
+/// [`is_safe_leaf_path`] refuses, or `nft` refuses the fence.
+pub(crate) async fn fence_steering_answerer(
+    nft: &Path,
+    address: Ipv4Addr,
+    port: u16,
+    pid: u32,
+) -> std::io::Result<PathBuf> {
+    let leaf = box_leaf_of(pid).await?;
+    if !is_safe_leaf_path(&leaf) {
+        return Err(std::io::Error::other(format!(
+            "process {pid}'s box leaf {:?} holds a character an nft script cannot carry",
+            leaf.display().to_string()
+        )));
+    }
+    run_nft_script(nft, &render_steering_fence(address, port, &leaf)).await?;
+    tracing::info!(
+        leaf = %leaf.display(),
+        %address,
+        port,
+        "fenced a host-address box's steering answerer to the box's own leaf"
+    );
+    Ok(leaf)
+}
+
+/// Removes the fence of the steering answerer at `address`. A refusal is
+/// logged, not returned: the answerer is gone by then, and a fence of a
+/// gone answerer refuses only packets that nothing answers.
+pub(crate) async fn unfence_steering_answerer(nft: &Path, address: Ipv4Addr) {
+    if let Err(error) = run_nft_script(nft, &render_steering_unfence(address)).await {
+        tracing::debug!(
+            %address,
+            %error,
+            "could not remove the fence of a host-address box's steering answerer"
+        );
+    }
+}
+
 /// The cohort's blocked leaf under the classifier tree `root`:
 /// `<root>/boxes/quic443-blocked`.
 #[must_use]
@@ -3222,6 +3453,54 @@ pub fn daemon_fetch_leaf(root: &Path) -> Option<&'static str> {
         .lines()
         .any(|member| member.trim().parse::<u32>() == Ok(std::process::id()))
         .then_some(sandbox::classifier::DAEMON_LEAF)
+}
+
+/// How long a daemon waits for the placer to finish: the placer scans every
+/// process's fd table and looks once more after a second when it finds no
+/// holder, so a few seconds cover it on a loaded host.
+pub const PLACE_REQUEST_WAIT: Duration = Duration::from_secs(5);
+
+/// What asking the placement unit for a placement came to.
+#[derive(Debug)]
+pub enum PlaceRequest {
+    /// The placer ran and closed the connection. Whether it placed this
+    /// daemon is [`daemon_fetch_leaf`]'s to read.
+    Answered,
+    /// No placer listens: the socket is not there, refuses, or is not this
+    /// account's to reach.
+    NoPlacer(std::io::Error),
+    /// The placer accepted the connection but did not close it in time, or
+    /// the read failed.
+    NoAnswer(std::io::Error),
+}
+
+/// Asks the placement unit at `socket` to place this daemon in its leaf
+/// (NET-079), and waits up to `wait` for the placer to finish. Call it once
+/// the daemon's own listener is bound, because the placer finds the daemon
+/// as that socket's holder. The connection carries nothing: systemd starts
+/// one placer per connection and closes the connection when it exits.
+///
+/// The daemon connects to a socket systemd holds in `/run` because SELinux
+/// policy can deny systemd a watch on a socket under the account's home;
+/// connecting to a socket systemd itself created needs no such permission.
+pub fn request_daemon_placement(socket: &Path, wait: Duration) -> PlaceRequest {
+    use std::io::Read as _;
+    let mut stream = match std::os::unix::net::UnixStream::connect(socket) {
+        Ok(stream) => stream,
+        Err(e) => return PlaceRequest::NoPlacer(e),
+    };
+    if let Err(e) = stream.set_read_timeout(Some(wait)) {
+        return PlaceRequest::NoAnswer(e);
+    }
+    let mut sink = [0_u8; 256];
+    loop {
+        match stream.read(&mut sink) {
+            Ok(0) => return PlaceRequest::Answered,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return PlaceRequest::NoAnswer(e),
+        }
+    }
 }
 
 /// NET-080: the node-plane record for the daemon's own fetches — one line
@@ -9491,5 +9770,168 @@ mod tests {
             elapsed < retransmit,
             "the per-launch reading ends inside one retransmit: {elapsed:?}"
         );
+    }
+
+    /// gominimal/inbox#1206: a placement request is answered when the placer
+    /// closes the connection, and reports no placer where nothing listens
+    /// and no answer where the placer holds the connection past the wait.
+    #[test]
+    fn a_placement_request_reads_the_placer_closing_the_connection() {
+        let dir = tempfile::tempdir().expect("a scratch directory for the request socket");
+        let socket = dir.path().join("place.sock");
+
+        assert!(
+            matches!(
+                request_daemon_placement(&socket, Duration::from_secs(1)),
+                PlaceRequest::NoPlacer(_)
+            ),
+            "no socket is no placer"
+        );
+
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        let placer = std::thread::spawn(move || {
+            let (connection, _) = listener.accept().expect("accept");
+            drop(connection);
+            listener
+        });
+        assert!(
+            matches!(
+                request_daemon_placement(&socket, Duration::from_secs(5)),
+                PlaceRequest::Answered
+            ),
+            "a placer that closes the connection answered"
+        );
+
+        let listener = placer.join().expect("the placer thread");
+        let holder = std::thread::spawn(move || {
+            let (connection, _) = listener.accept().expect("accept");
+            std::thread::sleep(Duration::from_millis(500));
+            drop(connection);
+        });
+        assert!(
+            matches!(
+                request_daemon_placement(&socket, Duration::from_millis(100)),
+                PlaceRequest::NoAnswer(_)
+            ),
+            "a placer that holds the connection past the wait gave no answer"
+        );
+        holder.join().expect("the holder thread");
+    }
+
+    /// BEP-086: a steered `host_ip` box's answerer is fenced to the box's
+    /// own leaf. The fence reads the leaf from the process's unified cgroup
+    /// line, and takes only a leaf under the classifier tree's `boxes`
+    /// directory. Its chain returns for a socket of that leaf alone, and
+    /// rejects every other socket's packet to the answerer's address and
+    /// port, so a lookup outside the box never gets its steered answers.
+    /// The script goes to `nft -f -` whole, and the unfence removes the
+    /// one chain.
+    #[tokio::test]
+    async fn host_ip_lookup_outside_a_steered_box_resolves_real_fence_admits_only_the_box_leaf() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let text = "0::/minimald.slice/boxes/allow/grant\n";
+        let leaf = unified_cgroup_path(text).expect("the unified line");
+        assert_eq!(leaf, Path::new("minimald.slice/boxes/allow/grant"));
+        assert!(is_box_leaf(&leaf));
+        for outside in [
+            "minimald.slice",
+            "minimald.slice/boxes",
+            "user.slice/session-1.scope",
+        ] {
+            assert!(!is_box_leaf(Path::new(outside)), "{outside}");
+        }
+        assert_eq!(unified_cgroup_path("1:name=systemd:/x\n"), None);
+        assert!(is_safe_leaf_path(&leaf));
+        for unsafe_leaf in [
+            "minimald.slice/boxes/allow/a\"b",
+            "minimald.slice/boxes/allow/a\nadd rule",
+            "minimald.slice/boxes/allow/a b",
+            "minimald.slice/boxes/allow/a;b",
+            "",
+        ] {
+            assert!(
+                !is_safe_leaf_path(Path::new(unsafe_leaf)),
+                "{unsafe_leaf:?}"
+            );
+        }
+
+        let address = Ipv4Addr::new(127, 53, 0, 7);
+        let fence = render_steering_fence(address, 53, &leaf);
+        let chain = steering_fence_chain(address);
+        assert_eq!(chain, "steer_127_53_0_7");
+        let rules: Vec<&str> = fence
+            .lines()
+            .filter(|line| line.starts_with(&format!("add rule inet {TABLE_NAME} {chain} ")))
+            .collect();
+        assert_eq!(rules.len(), 3, "{fence}");
+        let to_answerer = "ip daddr 127.53.0.7 meta l4proto { tcp, udp } th dport 53";
+        assert!(
+            rules.iter().all(|rule| rule.contains(to_answerer)),
+            "{fence}"
+        );
+        assert!(
+            rules[0]
+                .ends_with("socket cgroupv2 level 4 \"minimald.slice/boxes/allow/grant\" return"),
+            "the box's own leaf returns first: {fence}"
+        );
+        assert!(
+            rules[2].ends_with("reject with icmpx admin-prohibited"),
+            "{fence}"
+        );
+        assert!(
+            fence.contains(&format!("flush chain inet {TABLE_NAME} {chain}\n")),
+            "a second fence replaces the first: {fence}"
+        );
+        // Before attach knows the leaf, the answerer is closed to every
+        // leaf, in the same chain the fence later replaces.
+        let closed = render_steering_closed_fence(address, 53);
+        let closed_rules: Vec<&str> = closed
+            .lines()
+            .filter(|line| line.starts_with(&format!("add rule inet {TABLE_NAME} {chain} ")))
+            .collect();
+        assert_eq!(closed_rules.len(), 2, "{closed}");
+        assert!(!closed.contains("return"), "{closed}");
+        assert!(
+            closed_rules[1].ends_with(&format!("{to_answerer} reject with icmpx admin-prohibited")),
+            "{closed}"
+        );
+        assert!(
+            closed.contains(&format!("flush chain inet {TABLE_NAME} {chain}\n")),
+            "{closed}"
+        );
+        assert_eq!(
+            render_steering_unfence(address),
+            format!(
+                "flush chain inet {TABLE_NAME} {chain}\ndelete chain inet {TABLE_NAME} {chain}\n"
+            )
+        );
+
+        // The script reaches `nft -f -` on stdin, whole.
+        let dir = tempfile::tempdir().expect("a scratch dir");
+        let nft = dir.path().join("nft");
+        let seen = dir.path().join("seen");
+        std::fs::write(
+            &nft,
+            format!(
+                "#!/bin/sh\n[ \"$1 $2\" = \"-f -\" ] || exit 9\ncat > '{}'\n",
+                seen.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&nft, std::fs::Permissions::from_mode(0o755)).unwrap();
+        run_nft_script(&nft, &fence)
+            .await
+            .expect("the stand-in nft takes the fence");
+        assert_eq!(std::fs::read_to_string(&seen).unwrap(), fence);
+
+        // A refusing nft is an error that carries what it said.
+        let refusing = dir.path().join("refusing");
+        std::fs::write(&refusing, "#!/bin/sh\necho 'no such table' >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&refusing, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = run_nft_script(&refusing, &fence)
+            .await
+            .expect_err("refused");
+        assert!(error.to_string().contains("no such table"), "{error}");
     }
 }

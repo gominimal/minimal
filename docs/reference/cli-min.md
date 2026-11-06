@@ -653,8 +653,9 @@ The script holds only what this host is missing from:
   range on macOS
 - the classifier tree that enforces a host-address box's egress declaration.
   The step keeps a root-owned copy of itself under `/usr/local/lib/minimal`.
-  A systemd boot unit re-installs the tree after a reboot. A path unit places
-  the daemon's listener in its leaf on every daemon start. An un-enrolled
+  A systemd boot unit re-installs the tree after a reboot. On every start the
+  daemon connects to a systemd socket unit at `/run/minimald-place.sock`, and
+  the service it starts places the daemon in its leaf. An un-enrolled
   host does not need a source identity for it. The classifier translates
   nothing until an association adds the reserved addresses
 - membership of the `kvm` group, only when the configured provider is the

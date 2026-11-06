@@ -36,9 +36,10 @@ pub(crate) struct SpecInputs<'a> {
     /// The box's network mode, from `min box spec --network`, the same
     /// mode `min session activate --network` gives the box it creates.
     pub network: boxes::NetworkMode,
-    /// Whether this host's switch resolves the box's steered names, the
-    /// same host fact the box's creation reads (BEP-017):
-    /// `host_resolves_box_names` for this host and [`Self::network`].
+    /// Whether this host resolves the box's steered names, the same host
+    /// fact the box's creation reads (BEP-017, BEP-081):
+    /// `host_resolves_box_names` for this host and [`Self::network`]. On a
+    /// VM host it is true for `own_ip` and for `host_ip`.
     pub box_zone_resolver: bool,
     /// The GitHub module's upstream hosts.
     pub github_hosts: &'a [&'a str],
@@ -271,10 +272,11 @@ pub(crate) fn cmd_box_spec(global: &GlobalArgs, args: BoxSpecArgs) -> anyhow::Re
 }
 
 /// The network and the host fact the preview reads, for a host of `kind`:
-/// the box's `--network` mode, and whether the switch resolves that box's
-/// names. Creation reads the same fact for the same mode, so `min box spec
-/// --network <mode>` refuses what `min session activate --network <mode>`
-/// refuses.
+/// the box's `--network` mode, and whether the host resolves that box's
+/// steered names: the switch's DNS gate for `own_ip`, and the box's own
+/// steering answerer for `host_ip` (BEP-081). Creation reads the same fact
+/// for the same mode, so `min box spec --network <mode>` refuses what `min
+/// session activate --network <mode>` refuses.
 pub(crate) fn preview_host(
     kind: paths::HostKind,
     args: &BoxSpecArgs,
