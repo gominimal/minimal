@@ -95,11 +95,11 @@ pub(crate) fn offer_mfile_scaffold(
     // read (`id=$(min activate)`). A result line on stdout here would land
     // ahead of that id and corrupt the capture.
     // The legacy shape: session start reads packages from `[session]`, and
-    // `[defaults.session]` in the entry shape is still an unknown key of
-    // `[defaults]` in `mfile::File`. #2410 (T16, BOX-064) expands a box's
-    // spec over `[defaults.<type>]`. When it lands, pass `true` here, and
-    // then remove the `entry_shape` parameter of `run_init_flow`.
-    if let Some(line) = run_init_flow(config, false, false, false)?.result_line() {
+    // box creation does not read `[defaults.<type>]` yet. #2418 (BOX T21)
+    // wires the expanded spec into box creation. When it lands, pass `true`
+    // here and in `cmd_init`, and then remove the `entry_shape` parameter of
+    // `run_init_flow`.
+    if let Some(line) = run_init_flow(config, false, false, INIT_ENTRY_SHAPE)?.result_line() {
         eprintln!("{line}");
     }
     Ok(())
@@ -516,15 +516,21 @@ impl InitOutcome {
     }
 }
 
+/// Whether `min init` and the `min activate` scaffold write the entry shape.
+/// `false` until #2418 (BOX T21): box creation still reads packages from
+/// `[session]`, so an entry-shaped scaffold loses them at session start.
+pub(crate) const INIT_ENTRY_SHAPE: bool = false;
+
 /// Run the init flow for a given config: detect the project's stack,
 /// generate a `minimal.toml`, show the plan, prompt for confirmation,
 /// and write the file. Shared by `cmd_init` and the `cmd_activate`
 /// missing-mfile prompt.
 ///
 /// `entry_shape` writes the entry shape (BCLI-017) in place of the legacy
-/// `[session]` shape. It is an interim until #2410 (T16, BOX-064) reads
-/// `[defaults.session]` at session start. Then every caller passes `true`
-/// and the parameter is removed.
+/// `[session]` shape. Both callers pass [`INIT_ENTRY_SHAPE`], which is
+/// `false` until #2418 (BOX T21) makes box creation read
+/// `[defaults.<type>]`. Then both callers pass `true` and the parameter is
+/// removed.
 pub(crate) fn run_init_flow(
     config: mctx::Config,
     skip_confirm: bool,
@@ -943,8 +949,8 @@ pub async fn cmd_init(global: &GlobalArgs, args: InitArgs) -> Result<(), mctx::E
     let (entry, box_type) = match request {
         InitRequest::Scaffold => {
             let config = build_config(global)?;
-            let outcome =
-                run_init_flow(config, args.yes, args.force, true).map_err(mctx::Error::Other)?;
+            let outcome = run_init_flow(config, args.yes, args.force, INIT_ENTRY_SHAPE)
+                .map_err(mctx::Error::Other)?;
             tracing::info!(
                 verb = "init",
                 entry = "dev",
@@ -1245,6 +1251,21 @@ mod init_tests {
         // The project loader still reads the scaffold.
         let dir = project(&shaped);
         mfile::File::from_dir(dir.path()).expect("the scaffold loads");
+    }
+
+    // Until #2418, `min init` with no flags writes the legacy `[session]`
+    // shape, and `mfile::File` reads its packages from there.
+    #[test]
+    fn init_no_flags_writes_legacy_shape() {
+        assert_eq!(
+            init_request(&init_args(&["init"])),
+            Ok(InitRequest::Scaffold)
+        );
+        const { assert!(!INIT_ENTRY_SHAPE, "min init writes the legacy shape") };
+        let dir = project(LEGACY_SCAFFOLD);
+        let file = mfile::File::from_dir(dir.path()).expect("the scaffold loads");
+        let session = file.session.as_ref().expect("a [session] table");
+        assert_eq!(session.packages, ["base", "vim", "git"]);
     }
 
     // BCLI-018
