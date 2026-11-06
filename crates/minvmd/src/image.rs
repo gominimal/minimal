@@ -1,19 +1,21 @@
 //! Kernel and rootfs image resolution.
 //!
 //! Paths are supplied at runtime via environment variables. When an override is
-//! unset, each resolver falls back to the file the installer stamps into the
+//! unset, each resolver falls back to the image directory: the first of the
 //! minimal data directory (`$XDG_DATA_HOME/minimal`, else
-//! `$HOME/.local/share/minimal`), then to the same file under each system data
-//! directory (`$XDG_DATA_DIRS`, else `/usr/local/share:/usr/share`, each with
-//! `minimal/` appended: where a machine-wide package puts the images) — but
-//! only when that file actually exists, so a default install works with no
-//! env setup, a system install serves every user with no per-user copy, and a
-//! genuinely missing image still errors rather than silently returning a
-//! non-existent path.
+//! `$HOME/.local/share/minimal`) and then each system data directory
+//! (`$XDG_DATA_DIRS`, else `/usr/local/share:/usr/share`, each with `minimal/`
+//! appended: where a machine-wide package puts the images) that holds every
+//! image whose override is unset, so all the defaulted images of one boot come
+//! from one directory, one install: a user directory missing a file (an
+//! interrupted or older install) is passed over whole, never mixed with the
+//! machine's copy. A default install works with no env setup, a system install
+//! serves every user with no per-user copy, and a genuinely missing image still
+//! errors rather than silently returning a non-existent path.
 
 use std::path::PathBuf;
 
-use crate::error::VmError;
+use crate::error::{SearchedDir, VmError};
 
 /// Filenames the installer stamps into the `data/` prefix. Kept in sync with
 /// `scripts/stage-release.sh` (`data/vmlinuz`, `data/rootfs.img`,
@@ -22,20 +24,30 @@ const DEFAULT_KERNEL_FILE: &str = "vmlinuz";
 const DEFAULT_ROOTFS_FILE: &str = "rootfs.img";
 const DEFAULT_INITRAMFS_FILE: &str = "initramfs.cpio";
 
+/// Each guest image's override variable and default file name.
+const IMAGES: [(&str, &str); 3] = [
+    ("MINVMD_KERNEL_PATH", DEFAULT_KERNEL_FILE),
+    ("MINVMD_ROOTFS_PATH", DEFAULT_ROOTFS_FILE),
+    ("MINVMD_INITRAMFS", DEFAULT_INITRAMFS_FILE),
+];
+
 /// The minimal data directory: `$XDG_DATA_HOME/minimal`, else
 /// `$HOME/.local/share/minimal`. Mirrors the installer's `data` prefix
 /// resolution in `scripts/install.sh`. `None` when neither `XDG_DATA_HOME` nor
 /// `HOME` is set, so no default location can be computed.
 fn data_dir() -> Option<PathBuf> {
-    if let Some(xdg) = std::env::var("XDG_DATA_HOME")
-        .ok()
-        .filter(|v| !v.is_empty())
-    {
+    data_dir_from(
+        std::env::var("XDG_DATA_HOME").ok(),
+        std::env::var("HOME").ok(),
+    )
+}
+
+/// [`data_dir`] from the values of `XDG_DATA_HOME` and `HOME`.
+fn data_dir_from(xdg_data_home: Option<String>, home: Option<String>) -> Option<PathBuf> {
+    if let Some(xdg) = xdg_data_home.filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(xdg).join("minimal"));
     }
-    std::env::var("HOME")
-        .ok()
-        .filter(|v| !v.is_empty())
+    home.filter(|v| !v.is_empty())
         .map(|home| PathBuf::from(home).join(".local/share/minimal"))
 }
 
@@ -58,43 +70,64 @@ fn system_data_dirs() -> Vec<PathBuf> {
         .collect()
 }
 
+/// The override in `var` when set and non-empty, used verbatim.
+fn override_path(var: &str) -> Option<PathBuf> {
+    std::env::var(var)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
 /// Return the override in `var` when set and non-empty (used verbatim, without
-/// an existence check — the caller owns an explicit path). Otherwise fall back
-/// to `<data-dir>/default_file`, then to `<system-data-dir>/default_file` for
-/// each system data directory, but only to a file that exists.
+/// an existence check — the caller owns an explicit path). Otherwise return
+/// `default_file` in the image directory: the first of the user's data
+/// directory and the system data directories that holds, as regular files,
+/// every image whose override is unset (see the module doc).
 ///
-/// Errors with `VmError::MissingEnv` when the override is unset, no data
-/// directory can be resolved and no system data directory has the file,
-/// and `VmError::MissingImage` when the default path is resolvable but no
-/// file is present there or under any system data directory.
+/// Errors with `VmError::MissingImage` when no directory holds them all,
+/// including when there is no directory to look in (no `XDG_DATA_HOME`, no
+/// `HOME` and no absolute `XDG_DATA_DIRS` entry).
 fn resolve_or_default(var: &'static str, default_file: &str) -> Result<PathBuf, VmError> {
-    if let Some(val) = std::env::var(var).ok().filter(|v| !v.is_empty()) {
-        return Ok(PathBuf::from(val));
+    if let Some(path) = override_path(var) {
+        return Ok(path);
     }
-    let default = data_dir().map(|dir| dir.join(default_file));
-    if let Some(default) = &default
-        && default.exists()
-    {
-        return Ok(default.clone());
-    }
-    // The machine's copy serves a daemon with no data directory of its
-    // own too (no HOME: a service account, a scrubbed environment).
-    let system_dirs = system_data_dirs();
-    if let Some(found) = system_dirs
+    let unset: Vec<_> = IMAGES
         .iter()
-        .map(|dir| dir.join(default_file))
-        .find(|path| path.exists())
-    {
-        return Ok(found);
+        .filter(|(v, _)| override_path(v).is_none())
+        .copied()
+        .collect();
+    resolve_in(var, default_file, &unset, data_dir(), system_data_dirs())
+}
+
+/// The lookup behind [`resolve_or_default`], with its inputs passed in: `unset`
+/// pairs each override that is unset with its file, `user` is the user's data
+/// directory (`None` when none resolves) and `system` the system ones.
+fn resolve_in(
+    var: &'static str,
+    default_file: &str,
+    unset: &[(&'static str, &'static str)],
+    user: Option<PathBuf>,
+    system: Vec<PathBuf>,
+) -> Result<PathBuf, VmError> {
+    let mut searched = Vec::new();
+    for dir in user.into_iter().chain(system) {
+        // `is_file`, not `exists`: a directory that happens to carry an
+        // image's name is not the image, and the lookup moves on.
+        let missing: Vec<_> = unset
+            .iter()
+            .map(|(_, file)| *file)
+            .filter(|file| !dir.join(file).is_file())
+            .collect();
+        if missing.is_empty() {
+            return Ok(dir.join(default_file));
+        }
+        searched.push(SearchedDir { dir, missing });
     }
-    match default {
-        Some(default) => Err(VmError::MissingImage {
-            var,
-            default,
-            system_dirs,
-        }),
-        None => Err(VmError::MissingEnv { var }),
-    }
+    Err(VmError::MissingImage {
+        var,
+        unset: unset.iter().map(|(v, _)| *v).collect(),
+        searched,
+    })
 }
 
 /// Arch-appropriate libkrun kernel format.
@@ -122,34 +155,34 @@ pub fn kernel_format() -> crate::krun::KernelFormat {
     }
 }
 
-/// Resolve the kernel path from `MINVMD_KERNEL_PATH`, falling back to an
-/// existing `<data-dir>/vmlinuz` when the override is unset or empty.
+/// Resolve the kernel path from `MINVMD_KERNEL_PATH`, falling back to
+/// `vmlinuz` in the image directory (the first data directory, the user's then
+/// the system ones, that holds every image whose override is unset) when the
+/// override is unset or empty.
 ///
-/// Errors with `VmError::MissingImage` when the override is unset and no file
-/// exists at the default location, or `VmError::MissingEnv` when no data
-/// directory can be resolved (neither `XDG_DATA_HOME` nor `HOME` is set).
+/// Errors with `VmError::MissingImage` when the override is unset and no data
+/// directory holds those images, or there is no data directory to look in.
 pub fn resolve_kernel_path() -> Result<PathBuf, VmError> {
     resolve_or_default("MINVMD_KERNEL_PATH", DEFAULT_KERNEL_FILE)
 }
 
-/// Resolve the rootfs path from `MINVMD_ROOTFS_PATH`, falling back to an
-/// existing `<data-dir>/rootfs.img` when the override is unset or empty.
+/// Resolve the rootfs path from `MINVMD_ROOTFS_PATH`, falling back to
+/// `rootfs.img` in the image directory (see [`resolve_kernel_path`]) when the
+/// override is unset or empty.
 ///
 /// This is the path to a read-only ext4 root disk image (loaded via
-/// `krun_add_disk2`), not a directory. Errors with `VmError::MissingImage` when
-/// the override is unset and no file exists at the default location, or
-/// `VmError::MissingEnv` when no data directory can be resolved.
+/// `krun_add_disk2`), not a directory. Errors with `VmError::MissingImage` as
+/// [`resolve_kernel_path`] does.
 pub fn resolve_rootfs_path() -> Result<PathBuf, VmError> {
     resolve_or_default("MINVMD_ROOTFS_PATH", DEFAULT_ROOTFS_FILE)
 }
 
-/// Resolve the initramfs path from `MINVMD_INITRAMFS`, falling back to an
-/// existing `<data-dir>/initramfs.cpio` when the override is unset or empty.
+/// Resolve the initramfs path from `MINVMD_INITRAMFS`, falling back to
+/// `initramfs.cpio` in the image directory (see [`resolve_kernel_path`]) when
+/// the override is unset or empty.
 ///
 /// This is the cpio initramfs whose `/init` is minimald (booted as pid-1).
-/// Errors with `VmError::MissingImage` when the override is unset and no file
-/// exists at the default location, or `VmError::MissingEnv` when no data
-/// directory can be resolved.
+/// Errors with `VmError::MissingImage` as [`resolve_kernel_path`] does.
 pub fn resolve_initramfs_path() -> Result<PathBuf, VmError> {
     resolve_or_default("MINVMD_INITRAMFS", DEFAULT_INITRAMFS_FILE)
 }
@@ -198,44 +231,67 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     // Point the data dir at an isolated temp dir by setting XDG_DATA_HOME (so
-    // `data_dir` never consults the real HOME) and clearing the override var.
-    fn scoped_data_dir(var: &str, xdg: &std::path::Path) {
-        unsafe {
-            std::env::remove_var(var);
-            std::env::set_var("XDG_DATA_HOME", xdg);
+    // `data_dir` never consults the real HOME), point XDG_DATA_DIRS at
+    // `system` (so the machine's real /usr/local/share and /usr/share never
+    // count), and clear every image override.
+    fn scoped_data_dirs(xdg: &std::path::Path, system: &std::path::Path) {
+        for (var, _) in IMAGES {
+            unset_env(var);
+        }
+        set_env("XDG_DATA_HOME", xdg);
+        set_env("XDG_DATA_DIRS", system);
+    }
+
+    fn clear_env() {
+        for (var, _) in IMAGES {
+            unset_env(var);
+        }
+        unset_env("XDG_DATA_HOME");
+        unset_env("XDG_DATA_DIRS");
+    }
+
+    // Callers hold ENV_LOCK.
+    fn set_env(var: &str, value: impl AsRef<std::ffi::OsStr>) {
+        // SAFETY: the calling test holds ENV_LOCK, so nothing else in this
+        // module reads or writes the process environment meanwhile.
+        unsafe { std::env::set_var(var, value) };
+    }
+
+    // Callers hold ENV_LOCK.
+    fn unset_env(var: &str) {
+        // SAFETY: as in `set_env`.
+        unsafe { std::env::remove_var(var) };
+    }
+
+    // Write `files` into `<root>/minimal`, as an install would.
+    fn install(root: &std::path::Path, files: &[&str]) {
+        let dir = root.join("minimal");
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in files {
+            std::fs::write(dir.join(file), file.as_bytes()).unwrap();
         }
     }
 
-    fn clear_env(var: &str) {
-        unsafe {
-            std::env::remove_var(var);
-            std::env::remove_var("XDG_DATA_HOME");
-            std::env::remove_var("XDG_DATA_DIRS");
-        }
-    }
-
-    // The user's data dir at `xdg` (empty or not) and one system data dir at
-    // `system`, with the override var cleared.
-    fn scoped_data_dirs(var: &str, xdg: &std::path::Path, system: &std::path::Path) {
-        scoped_data_dir(var, xdg);
-        // SAFETY: ENV_LOCK is held by this test, so nothing else reads or
-        // writes the process environment meanwhile.
-        unsafe { std::env::set_var("XDG_DATA_DIRS", system) };
-    }
+    const ALL_FILES: [&str; 3] = [
+        DEFAULT_KERNEL_FILE,
+        DEFAULT_ROOTFS_FILE,
+        DEFAULT_INITRAMFS_FILE,
+    ];
 
     #[test]
     fn falls_back_to_a_system_data_dir_when_the_user_has_no_copy() {
         let _g = ENV_LOCK.lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         let system = tempfile::tempdir().unwrap();
-        let want = system.path().join("minimal").join(DEFAULT_KERNEL_FILE);
-        std::fs::create_dir_all(want.parent().unwrap()).unwrap();
-        std::fs::write(&want, b"kernel").unwrap();
+        install(system.path(), &ALL_FILES);
 
-        scoped_data_dirs("MINVMD_KERNEL_PATH", home.path(), system.path());
+        scoped_data_dirs(home.path(), system.path());
         let path = resolve_kernel_path().unwrap();
-        assert_eq!(path, want);
-        clear_env("MINVMD_KERNEL_PATH");
+        assert_eq!(
+            path,
+            system.path().join("minimal").join(DEFAULT_KERNEL_FILE)
+        );
+        clear_env();
     }
 
     #[test]
@@ -243,46 +299,208 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         let system = tempfile::tempdir().unwrap();
-        for root in [home.path(), system.path()] {
-            let file = root.join("minimal").join(DEFAULT_ROOTFS_FILE);
-            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-            std::fs::write(&file, b"rootfs").unwrap();
-        }
+        install(home.path(), &ALL_FILES);
+        install(system.path(), &ALL_FILES);
 
-        scoped_data_dirs("MINVMD_ROOTFS_PATH", home.path(), system.path());
+        scoped_data_dirs(home.path(), system.path());
         let path = resolve_rootfs_path().unwrap();
         assert_eq!(path, home.path().join("minimal").join(DEFAULT_ROOTFS_FILE));
-        clear_env("MINVMD_ROOTFS_PATH");
+        clear_env();
     }
 
     #[test]
-    fn missing_everywhere_names_the_system_dirs_too() {
+    fn a_partial_user_copy_is_passed_over_whole_never_mixed() {
         let _g = ENV_LOCK.lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         let system = tempfile::tempdir().unwrap();
-        scoped_data_dirs("MINVMD_INITRAMFS", home.path(), system.path());
+        // An interrupted or older install: no initramfs in the user's copy.
+        install(home.path(), &[DEFAULT_KERNEL_FILE, DEFAULT_ROOTFS_FILE]);
+        install(system.path(), &ALL_FILES);
+
+        scoped_data_dirs(home.path(), system.path());
+        let (kernel, rootfs, initramfs) = resolve_boot_images().unwrap();
+        let want = system.path().join("minimal");
+        assert_eq!(kernel, want.join(DEFAULT_KERNEL_FILE));
+        assert_eq!(rootfs, want.join(DEFAULT_ROOTFS_FILE));
+        assert_eq!(initramfs, want.join(DEFAULT_INITRAMFS_FILE));
+        clear_env();
+    }
+
+    #[test]
+    fn an_overridden_image_is_not_needed_in_the_directory() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let system = tempfile::tempdir().unwrap();
+        install(home.path(), &[DEFAULT_ROOTFS_FILE, DEFAULT_INITRAMFS_FILE]);
+        install(system.path(), &ALL_FILES);
+
+        scoped_data_dirs(home.path(), system.path());
+        set_env("MINVMD_KERNEL_PATH", "/boot/vmlinuz");
+        let (kernel, rootfs, _) = resolve_boot_images().unwrap();
+        assert_eq!(kernel, PathBuf::from("/boot/vmlinuz"));
+        assert_eq!(
+            rootfs,
+            home.path().join("minimal").join(DEFAULT_ROOTFS_FILE)
+        );
+        clear_env();
+    }
+
+    #[test]
+    fn a_directory_named_like_an_image_is_skipped() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        install(first.path(), &[DEFAULT_ROOTFS_FILE, DEFAULT_INITRAMFS_FILE]);
+        std::fs::create_dir_all(first.path().join("minimal").join(DEFAULT_KERNEL_FILE)).unwrap();
+        install(second.path(), &ALL_FILES);
+
+        scoped_data_dirs(home.path(), first.path());
+        let dirs = format!("{}:{}", first.path().display(), second.path().display());
+        set_env("XDG_DATA_DIRS", dirs);
+        let path = resolve_kernel_path().unwrap();
+        assert_eq!(
+            path,
+            second.path().join("minimal").join(DEFAULT_KERNEL_FILE)
+        );
+        clear_env();
+    }
+
+    #[test]
+    fn missing_everywhere_names_each_directory_and_what_it_lacked() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let system = tempfile::tempdir().unwrap();
+        install(home.path(), &[DEFAULT_KERNEL_FILE, DEFAULT_ROOTFS_FILE]);
+        scoped_data_dirs(home.path(), system.path());
         let err = resolve_initramfs_path().unwrap_err();
         let VmError::MissingImage {
             var,
-            default,
-            system_dirs,
+            unset,
+            searched,
         } = &err
         else {
             panic!("expected MissingImage, got {err:?}");
         };
         assert_eq!(*var, "MINVMD_INITRAMFS");
         assert_eq!(
-            *default,
-            home.path().join("minimal").join(DEFAULT_INITRAMFS_FILE)
+            *unset,
+            vec![
+                "MINVMD_KERNEL_PATH",
+                "MINVMD_ROOTFS_PATH",
+                "MINVMD_INITRAMFS"
+            ]
         );
-        assert_eq!(*system_dirs, vec![system.path().join("minimal")]);
+        assert_eq!(
+            *searched,
+            vec![
+                SearchedDir {
+                    dir: home.path().join("minimal"),
+                    missing: vec![DEFAULT_INITRAMFS_FILE],
+                },
+                SearchedDir {
+                    dir: system.path().join("minimal"),
+                    missing: ALL_FILES.to_vec(),
+                },
+            ]
+        );
         let text = err.to_string();
-        assert!(text.contains(&default.display().to_string()), "{text}");
+        let user_dir = home.path().join("minimal");
         assert!(
-            text.contains(&system.path().join("minimal").display().to_string()),
+            text.contains(&format!("{} (no initramfs.cpio)", user_dir.display())),
             "{text}"
         );
-        clear_env("MINVMD_INITRAMFS");
+        assert!(
+            text.contains(&format!(
+                "{} (no vmlinuz, rootfs.img, initramfs.cpio)",
+                system.path().join("minimal").display()
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "Reinstall minimal, or set MINVMD_KERNEL_PATH, MINVMD_ROOTFS_PATH, \
+                 MINVMD_INITRAMFS to the image files."
+            ),
+            "{text}"
+        );
+        clear_env();
+    }
+
+    #[test]
+    fn no_data_directory_without_xdg_data_home_or_home() {
+        assert_eq!(data_dir_from(None, None), None);
+        assert_eq!(
+            data_dir_from(Some(String::new()), Some(String::new())),
+            None
+        );
+        assert_eq!(
+            data_dir_from(None, Some("/home/me".to_owned())),
+            Some(PathBuf::from("/home/me/.local/share/minimal"))
+        );
+    }
+
+    #[test]
+    fn with_no_data_directory_the_systems_copy_serves() {
+        // The no-HOME daemon (a service account, a scrubbed environment):
+        // `data_dir` gives `None` (see the test above). Driven through
+        // `resolve_in` rather than by clearing HOME, which other modules'
+        // tests read outside ENV_LOCK.
+        let system = tempfile::tempdir().unwrap();
+        install(system.path(), &ALL_FILES);
+        let dir = system.path().join("minimal");
+        let path = resolve_in(
+            "MINVMD_ROOTFS_PATH",
+            DEFAULT_ROOTFS_FILE,
+            &IMAGES,
+            None,
+            vec![dir.clone()],
+        )
+        .unwrap();
+        assert_eq!(path, dir.join(DEFAULT_ROOTFS_FILE));
+    }
+
+    #[test]
+    fn with_no_data_directory_and_no_system_copy_the_error_names_the_system_dirs() {
+        let system = tempfile::tempdir().unwrap();
+        let dir = system.path().join("minimal");
+        let err = resolve_in(
+            "MINVMD_KERNEL_PATH",
+            DEFAULT_KERNEL_FILE,
+            &IMAGES[..1],
+            None,
+            vec![dir.clone()],
+        )
+        .unwrap_err();
+        let VmError::MissingImage { searched, .. } = &err else {
+            panic!("expected MissingImage, got {err:?}");
+        };
+        assert_eq!(searched.len(), 1, "only the system directory: {err}");
+        let text = err.to_string();
+        assert!(
+            text.contains(&format!("{} (no vmlinuz)", dir.display())),
+            "{text}"
+        );
+        assert!(
+            text.contains("set MINVMD_KERNEL_PATH to the image file."),
+            "{text}"
+        );
+        assert!(!text.contains("required environment variable"), "{text}");
+    }
+
+    #[test]
+    fn with_no_directory_at_all_the_error_says_so() {
+        let err = resolve_in(
+            "MINVMD_KERNEL_PATH",
+            DEFAULT_KERNEL_FILE,
+            &IMAGES,
+            None,
+            Vec::new(),
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("There was no directory to look in"), "{text}");
+        assert!(!text.contains("()"), "{text}");
     }
 
     #[test]
@@ -300,14 +518,14 @@ mod tests {
         );
         // SAFETY: ENV_LOCK is held by this test, so nothing else reads or
         // writes the process environment meanwhile.
-        unsafe { std::env::set_var("XDG_DATA_DIRS", "/opt/data::/srv/share") };
+        unsafe { std::env::set_var("XDG_DATA_DIRS", "/opt/data::share:/srv/share") };
         assert_eq!(
             system_data_dirs(),
             vec![
                 PathBuf::from("/opt/data/minimal"),
                 PathBuf::from("/srv/share/minimal")
             ],
-            "an empty entry is skipped"
+            "an empty entry and a relative entry are skipped"
         );
         // SAFETY: ENV_LOCK is held by this test, so nothing else reads or
         // writes the process environment meanwhile.
@@ -321,58 +539,56 @@ mod tests {
         unsafe { std::env::set_var("MINVMD_KERNEL_PATH", "/boot/Image.gz") };
         let path = resolve_kernel_path().unwrap();
         assert_eq!(path, PathBuf::from("/boot/Image.gz"));
-        clear_env("MINVMD_KERNEL_PATH");
+        clear_env();
     }
 
     #[test]
     fn falls_back_to_default_when_file_exists() {
         let _g = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        let want = tmp.path().join("minimal").join(DEFAULT_KERNEL_FILE);
-        std::fs::create_dir_all(want.parent().unwrap()).unwrap();
-        std::fs::write(&want, b"kernel").unwrap();
+        let system = tempfile::tempdir().unwrap();
+        install(tmp.path(), &ALL_FILES);
 
-        scoped_data_dir("MINVMD_KERNEL_PATH", tmp.path());
+        scoped_data_dirs(tmp.path(), system.path());
         let path = resolve_kernel_path().unwrap();
-        assert_eq!(path, want);
-        clear_env("MINVMD_KERNEL_PATH");
+        assert_eq!(path, tmp.path().join("minimal").join(DEFAULT_KERNEL_FILE));
+        clear_env();
     }
 
     #[test]
     fn errors_with_missing_image_when_default_absent() {
         let _g = ENV_LOCK.lock().unwrap();
-        // XDG_DATA_HOME points at an empty temp dir: default is resolvable but
-        // no file is present there.
+        // XDG_DATA_HOME and XDG_DATA_DIRS each point at an empty temp dir: the
+        // directories resolve but hold no image, whatever this host has
+        // installed under /usr/local/share or /usr/share.
         let tmp = tempfile::tempdir().unwrap();
-        scoped_data_dir("MINVMD_ROOTFS_PATH", tmp.path());
+        let system = tempfile::tempdir().unwrap();
+        scoped_data_dirs(tmp.path(), system.path());
         let err = resolve_rootfs_path().unwrap_err();
-        let VmError::MissingImage { var, default, .. } = &err else {
+        let VmError::MissingImage { var, searched, .. } = &err else {
             panic!("expected MissingImage, got {err:?}");
         };
         assert_eq!(*var, "MINVMD_ROOTFS_PATH");
-        assert_eq!(
-            *default,
-            tmp.path().join("minimal").join(DEFAULT_ROOTFS_FILE)
-        );
-        clear_env("MINVMD_ROOTFS_PATH");
+        assert_eq!(searched[0].dir, tmp.path().join("minimal"));
+        clear_env();
     }
 
     #[test]
     fn empty_override_is_treated_as_unset() {
         let _g = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        let want = tmp.path().join("minimal").join(DEFAULT_INITRAMFS_FILE);
-        std::fs::create_dir_all(want.parent().unwrap()).unwrap();
-        std::fs::write(&want, b"initramfs").unwrap();
+        let system = tempfile::tempdir().unwrap();
+        install(tmp.path(), &ALL_FILES);
 
+        scoped_data_dirs(tmp.path(), system.path());
         // Empty string must not be used as a path; it falls through to default.
-        unsafe {
-            std::env::set_var("MINVMD_INITRAMFS", "");
-            std::env::set_var("XDG_DATA_HOME", tmp.path());
-        }
+        set_env("MINVMD_INITRAMFS", "");
         let path = resolve_initramfs_path().unwrap();
-        assert_eq!(path, want);
-        clear_env("MINVMD_INITRAMFS");
+        assert_eq!(
+            path,
+            tmp.path().join("minimal").join(DEFAULT_INITRAMFS_FILE)
+        );
+        clear_env();
     }
 
     // Remove every env var the gvproxy resolver consults, so a tier is only
@@ -461,7 +677,7 @@ mod tests {
         assert_eq!(resolve_rootfs_path().unwrap(), want_rootfs);
         assert_eq!(resolve_initramfs_path().unwrap(), want_initramfs);
 
-        clear_env("MINVMD_KERNEL_PATH");
+        clear_env();
     }
 
     #[cfg(minvmd_libkrun)]
