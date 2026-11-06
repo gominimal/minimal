@@ -6,13 +6,13 @@
 //! `signal` the BOX-011 table gives for each way a box ends are the only
 //! combinations the type can hold.
 //!
-//! The stored [`BoxState`] does not yet hold `stopped` or `exited`: every
-//! stored record projects onto `pending`, `materializing` or `running`
-//! through [`RecordState::from`]. Until the store holds an ending, the
-//! `state_is_exactly_one` harness runs over [`RecordState`], not over
-//! the stored [`crate::Record`] that the BOX-011 harness line names.
-//! Issue #2634 owns the stored ending and the move of the harness to
-//! [`crate::Record`].
+//! The stored [`crate::Record`] holds the state as its [`BoxState`] and the
+//! ending as its `reason`, `exit_code` and `signal` fields.
+//! [`RecordState::from_stored`] reads the four back, and
+//! [`RecordState::to_stored`] writes them, so a record the daemon writes
+//! through [`crate::Record::set_state`] always reads back as the state it
+//! was given. A stored ending that is not a row of the table, such as a
+//! `reason` this build does not know, reads as an [`UnreadableEnding`].
 
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +23,7 @@ pub const OOM_EXIT_CODE: i32 = 137;
 
 /// The `reason` a `stopped` or `exited` record carries (BOX-011).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 #[serde(rename_all = "snake_case")]
 pub enum EndReason {
     /// The entrypoint exited on its own.
@@ -33,6 +34,90 @@ pub enum EndReason {
     Oom,
     /// A stop ended the box, or the daemon found it with no process left.
     Stopped,
+}
+
+impl EndReason {
+    /// The reason as it is written on disk and on the wire.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Exit => "exit",
+            Self::Timeout => "timeout",
+            Self::Oom => "oom",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+/// The `reason` a stored record carries: one this build knows, or the
+/// text of one it does not, kept as written so a save does not lose it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum StoredReason {
+    /// A reason of the BOX-011 table.
+    Known(EndReason),
+    /// A reason this build does not know, as the record spells it.
+    Unknown(String),
+}
+
+impl StoredReason {
+    /// The reason as the record spells it.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Known(reason) => reason.name(),
+            Self::Unknown(text) => text,
+        }
+    }
+
+    /// The reason, when this build knows it.
+    #[must_use]
+    pub const fn known(&self) -> Option<EndReason> {
+        match self {
+            Self::Known(reason) => Some(*reason),
+            Self::Unknown(_) => None,
+        }
+    }
+}
+
+/// A stored `stopped` or `exited` record whose `reason`, `exit_code` and
+/// `signal` are not a row of the BOX-011 table: a reason this build does
+/// not know, or a combination no write produces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadableEnding {
+    /// The stored state: `stopped` or `exited`.
+    pub state: &'static str,
+    /// The stored reason, as written.
+    pub reason: Option<String>,
+    /// The stored exit code.
+    pub exit_code: Option<i32>,
+    /// The stored signal number.
+    pub signal: Option<i32>,
+}
+
+impl std::fmt::Display for UnreadableEnding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} record with reason {:?}, exit code {:?} and signal {:?} is not an ending this build knows",
+            self.state, self.reason, self.exit_code, self.signal
+        )
+    }
+}
+
+impl std::error::Error for UnreadableEnding {}
+
+/// The four stored fields a record's state is read from and written to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredState {
+    /// The record's `status`.
+    pub status: BoxState,
+    /// The record's `reason`.
+    pub reason: Option<StoredReason>,
+    /// The record's `exit_code`.
+    pub exit_code: Option<i32>,
+    /// The record's `signal`.
+    pub signal: Option<i32>,
 }
 
 /// How a `stopped` box ended (BOX-011, BOX-013, BOX-154).
@@ -143,13 +228,80 @@ impl RecordState {
     }
 }
 
-impl From<BoxState> for RecordState {
-    /// The stored status's state. A stored `Active` record is `running`.
-    fn from(status: BoxState) -> Self {
-        match status {
-            BoxState::Pending => Self::Pending,
-            BoxState::Materializing => Self::Materializing,
-            BoxState::Active => Self::Running,
+impl RecordState {
+    /// Reads the state from the stored fields (BOX-011). A `pending`,
+    /// `materializing` or `running` record carries no ending, and its
+    /// stored `reason`, `exit_code` and `signal` are not read. A stored
+    /// `active` record, an old session included, is `running`.
+    ///
+    /// # Errors
+    ///
+    /// [`UnreadableEnding`] when a `stopped` or `exited` record's ending is
+    /// not a row of the table.
+    pub fn from_stored(
+        status: BoxState,
+        reason: Option<&StoredReason>,
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+    ) -> Result<Self, UnreadableEnding> {
+        let known = reason.map(StoredReason::known);
+        let state = match status {
+            BoxState::Pending => Some(Self::Pending),
+            BoxState::Materializing => Some(Self::Materializing),
+            BoxState::Active => Some(Self::Running),
+            BoxState::Stopped => match (known, exit_code, signal) {
+                (Some(Some(EndReason::Stopped)), Some(exit_code), None) => {
+                    Some(Self::Stopped(StopEnding::ExitedFirst { exit_code }))
+                }
+                (Some(Some(EndReason::Stopped)), None, Some(signal)) => {
+                    Some(Self::Stopped(StopEnding::Signalled { signal }))
+                }
+                (Some(Some(EndReason::Stopped)), None, None) => {
+                    Some(Self::Stopped(StopEnding::AtDaemonStart))
+                }
+                _ => None,
+            },
+            BoxState::Exited => match (known, exit_code, signal) {
+                (Some(Some(EndReason::Exit)), Some(exit_code), None) => {
+                    Some(Self::Exited(ExitEnding::Exit { exit_code }))
+                }
+                (Some(Some(EndReason::Timeout)), None, None) => {
+                    Some(Self::Exited(ExitEnding::Timeout))
+                }
+                (Some(Some(EndReason::Oom)), Some(OOM_EXIT_CODE), None) => {
+                    Some(Self::Exited(ExitEnding::Oom))
+                }
+                _ => None,
+            },
+        };
+        state.ok_or_else(|| UnreadableEnding {
+            state: if matches!(status, BoxState::Stopped) {
+                "stopped"
+            } else {
+                "exited"
+            },
+            reason: reason.map(|r| r.as_str().to_owned()),
+            exit_code,
+            signal,
+        })
+    }
+
+    /// The stored fields that hold this state: the inverse of
+    /// [`Self::from_stored`]. A `running` record is stored as `active`.
+    #[must_use]
+    pub fn to_stored(&self) -> StoredState {
+        let status = match self {
+            Self::Pending => BoxState::Pending,
+            Self::Materializing => BoxState::Materializing,
+            Self::Running => BoxState::Active,
+            Self::Stopped(_) => BoxState::Stopped,
+            Self::Exited(_) => BoxState::Exited,
+        };
+        StoredState {
+            status,
+            reason: self.reason().map(StoredReason::Known),
+            exit_code: self.exit_code(),
+            signal: self.signal(),
         }
     }
 }
@@ -208,6 +360,24 @@ fn holds_one_state_with_its_ending(state: &RecordState) -> bool {
         }
     };
     exactly_one && ending
+}
+
+/// The BOX-011 property for one stored record: its fields read as one
+/// state with a row of the table, whose name is the stored status's, or,
+/// only for a `stopped` or `exited` record, as an unreadable ending.
+#[cfg(any(test, kani))]
+fn stored_reads_as_one_state(stored: &StoredState) -> bool {
+    match RecordState::from_stored(
+        stored.status,
+        stored.reason.as_ref(),
+        stored.exit_code,
+        stored.signal,
+    ) {
+        Ok(state) => {
+            holds_one_state_with_its_ending(&state) && state.to_stored().status == stored.status
+        }
+        Err(_) => matches!(stored.status, BoxState::Stopped | BoxState::Exited),
+    }
 }
 
 /// The BOX-012 property for one store: the restart reaps exactly the
@@ -323,24 +493,68 @@ mod tests {
             );
         }
 
-        assert_eq!(RecordState::from(BoxState::Pending), RecordState::Pending);
+        let read = |status| RecordState::from_stored(status, None, None, None);
+        assert_eq!(read(BoxState::Pending), Ok(RecordState::Pending));
         assert_eq!(
-            RecordState::from(BoxState::Materializing),
-            RecordState::Materializing
+            read(BoxState::Materializing),
+            Ok(RecordState::Materializing)
         );
         assert_eq!(
-            RecordState::from(BoxState::Active),
-            RecordState::Running,
+            read(BoxState::Active),
+            Ok(RecordState::Running),
             "a stored active record, an old session included, is running"
         );
     }
 
     // BOX-011: the property the `state_is_exactly_one` Kani harness proves
-    // for every value, checked here over every shape.
+    // for every stored record, checked here over every shape: each shape
+    // writes to stored fields that read back as the same shape, and every
+    // stored combination reads as one state with its ending or as an
+    // unreadable ending.
     #[test]
     fn state_is_exactly_one() {
         for state in every_shape() {
             assert!(holds_one_state_with_its_ending(&state), "{state:?}");
+            let stored = state.to_stored();
+            assert_eq!(
+                RecordState::from_stored(
+                    stored.status,
+                    stored.reason.as_ref(),
+                    stored.exit_code,
+                    stored.signal
+                ),
+                Ok(state)
+            );
+        }
+        let reasons = [
+            None,
+            Some(StoredReason::Known(EndReason::Exit)),
+            Some(StoredReason::Known(EndReason::Timeout)),
+            Some(StoredReason::Known(EndReason::Oom)),
+            Some(StoredReason::Known(EndReason::Stopped)),
+            Some(StoredReason::Unknown("evicted".to_owned())),
+        ];
+        let numbers = [None, Some(0), Some(9), Some(OOM_EXIT_CODE)];
+        for status in [
+            BoxState::Pending,
+            BoxState::Materializing,
+            BoxState::Active,
+            BoxState::Stopped,
+            BoxState::Exited,
+        ] {
+            for reason in &reasons {
+                for exit_code in numbers {
+                    for signal in numbers {
+                        let stored = StoredState {
+                            status,
+                            reason: reason.clone(),
+                            exit_code,
+                            signal,
+                        };
+                        assert!(stored_reads_as_one_state(&stored), "{stored:?}");
+                    }
+                }
+            }
         }
     }
 
@@ -410,13 +624,42 @@ mod tests {
 mod kani_proofs {
     use super::*;
 
-    /// BOX-011: every record value is in exactly one state, and its
-    /// ending is a row of the table.
+    /// BOX-011: every stored record reads as exactly one state with a row
+    /// of the table, or, when stopped or exited, as an unreadable ending,
+    /// and every state reads back as itself from the fields it writes.
+    ///
+    /// The harness draws the four stored fields [`crate::Record::state`]
+    /// reads, not a whole `kani::any::<Record>()`: the record's other
+    /// fields (paths, maps, strings) have no `Arbitrary` and do not reach
+    /// the state. An unknown reason is drawn as an empty string.
     #[kani::proof]
     #[kani::unwind(1)]
     fn state_is_exactly_one() {
+        let reason = if kani::any() {
+            None
+        } else if kani::any() {
+            Some(StoredReason::Unknown(String::new()))
+        } else {
+            Some(StoredReason::Known(kani::any()))
+        };
+        let stored = StoredState {
+            status: kani::any(),
+            reason,
+            exit_code: kani::any(),
+            signal: kani::any(),
+        };
+        assert!(stored_reads_as_one_state(&stored));
+
         let state = kani::any::<RecordState>();
-        assert!(holds_one_state_with_its_ending(&state));
+        let written = state.to_stored();
+        assert!(
+            RecordState::from_stored(
+                written.status,
+                written.reason.as_ref(),
+                written.exit_code,
+                written.signal
+            ) == Ok(state)
+        );
     }
 
     /// BOX-012: a restart reaps a record exactly when it is `pending` or

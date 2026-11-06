@@ -97,6 +97,14 @@ pub(crate) struct MockLauncher {
     /// a real launch drives one over a sandboxed box — and, left `None`,
     /// prove a launch that carries no plan starts no watcher at all.
     listen_plan: Option<crate::net::listeners::ListenPlan>,
+    /// The spec the box's actor handed this launch. Its entrypoint decides
+    /// what the mock starts, through [`LaunchSpec::entrypoint`], as it
+    /// decides what the real launcher starts.
+    spec: LaunchSpec,
+    /// A task run's variables for the argv entrypoint alone
+    /// ([`super::AttachEnv::entrypoint`]), set on its process as the real
+    /// launcher sets them.
+    entrypoint_env: Vec<(String, String)>,
 }
 
 #[cfg(test)]
@@ -105,8 +113,7 @@ impl MockLauncher {
     pub(crate) fn with_net_guard(net_guard: Box<dyn sandbox::NetGuard>) -> Self {
         Self {
             net_guard: Some(net_guard),
-            host_ip_enforcement: None,
-            listen_plan: None,
+            ..Default::default()
         }
     }
 
@@ -144,12 +151,32 @@ impl MockLauncher {
         self.listen_plan = Some(listen_plan);
         self
     }
+
+    /// This mock with `spec` handed over, as the box's actor hands the
+    /// spec to every launcher it builds.
+    pub(crate) fn and_spec(mut self, spec: LaunchSpec) -> Self {
+        self.spec = spec;
+        self
+    }
+
+    /// This mock with a task run's entrypoint variables, as the box's
+    /// actor hands them to the launch that starts the entrypoint. The
+    /// start directory among them is left out: the mock runs host-side.
+    pub(crate) fn and_entrypoint_env(mut self, mut vars: Vec<(String, String)>) -> Self {
+        vars.retain(|(key, _)| key != super::START_DIR_KEY);
+        self.entrypoint_env = vars;
+        self
+    }
 }
 
 #[cfg(test)]
 impl BoxLauncher for MockLauncher {
     type Process = MockProcess;
     type Guard = ();
+
+    fn entrypoint(&self) -> io::Result<LaunchEntrypoint> {
+        self.spec.entrypoint()
+    }
 
     async fn launch(
         self,
@@ -160,6 +187,7 @@ impl BoxLauncher for MockLauncher {
         _paths: BoxPaths,
         sz: WinSize,
     ) -> io::Result<Launched<MockProcess, ()>> {
+        let entrypoint = self.entrypoint()?;
         let pty = Pty::open(sz)?;
 
         // A launch that carries a listen plan starts a watcher that
@@ -176,15 +204,47 @@ impl BoxLauncher for MockLauncher {
         let script = format!(
             r#"{leader_child}while read line; do [ "$line" = {MOCK_EXIT_LINE} ] && exit 0; printf 'got:%s\n' "$line"; done"#
         );
-        let mut command = std::process::Command::new("/bin/sh");
-        command.arg("-c").arg(&script);
-        command.stdin(std::process::Stdio::from(pty.dup_slave_fd()?));
-        command.stdout(std::process::Stdio::from(pty.dup_slave_fd()?));
-        let tty_path = pty.slave_path().to_path_buf();
-        let (master, slave) = pty.into_fds();
-        command.stderr(std::process::Stdio::from(slave));
+        // The shell entrypoint is the echo loop every runtime test drives.
+        // An argv entrypoint runs as the spec names it, host-side.
+        let mut command = match &entrypoint {
+            LaunchEntrypoint::Shell => {
+                let mut command = std::process::Command::new("/bin/sh");
+                command.arg("-c").arg(&script);
+                command
+            }
+            LaunchEntrypoint::Argv { program, args } => {
+                let mut command = std::process::Command::new(program);
+                command.args(args);
+                command.envs(self.entrypoint_env.iter().cloned());
+                command
+            }
+        };
+        // A box without a terminal runs its argv on three pipes, as the
+        // real launcher runs it.
+        let (master, tty_path, pipes) = if self.spec.runs_on_pipes(&entrypoint) {
+            let child = ChildPipes::open()?;
+            command.stdin(std::process::Stdio::from(child.stdin));
+            command.stdout(std::process::Stdio::from(child.stdout));
+            command.stderr(std::process::Stdio::from(child.stderr));
+            drop(pty);
+            (
+                child.stdout_reader,
+                std::path::PathBuf::from("/dev/null"),
+                Some(child.parent),
+            )
+        } else {
+            command.stdin(std::process::Stdio::from(pty.dup_slave_fd()?));
+            command.stdout(std::process::Stdio::from(pty.dup_slave_fd()?));
+            let tty_path = pty.slave_path().to_path_buf();
+            let (master, slave) = pty.into_fds();
+            command.stderr(std::process::Stdio::from(slave));
+            (master, tty_path, None)
+        };
 
         let process = command.spawn()?;
+        // The child holds its own ends now. The daemon's copies close here,
+        // so the child's exit closes its pipes.
+        drop(command);
 
         Ok(Launched {
             master,
@@ -202,6 +262,7 @@ impl BoxLauncher for MockLauncher {
             // The mock's process is a plain host child with no pre-exec
             // closure to hold it.
             start_gate: None,
+            pipes,
         })
     }
 }

@@ -346,6 +346,26 @@ impl SwitchSubnet {
         Ipv4Addr::from(u32::from(self.broadcast()) - 1)
     }
 
+    /// The documented host literal this switch also maps to the host's
+    /// loopback (NET-004): the default subnet's host alias, `100.64.255.254`,
+    /// when this subnet is a block carved out of [`DEFAULT_SUBNET`] that does
+    /// not hold that address itself. A box on a carved `/24` reaches the host
+    /// at its own subnet's alias, so the old literal needs its own `nat` and
+    /// virtual-IP entry to keep reaching what `host.min.internal` reaches.
+    /// `None` for the default subnet, whose own alias is the literal, and for
+    /// a subnet outside the default block, which the literal never named.
+    #[must_use]
+    pub fn documented_host_literal(self) -> Option<Ipv4Addr> {
+        let literal = DEFAULT_SUBNET.host_alias();
+        let holds = |subnet: Self, addr: Ipv4Addr| {
+            u32::from(addr) & subnet.mask() == u32::from(subnet.network())
+        };
+        (self.prefix > DEFAULT_SUBNET.prefix
+            && holds(DEFAULT_SUBNET, self.network())
+            && !holds(self, literal))
+        .then_some(literal)
+    }
+
     /// The Box Egress Proxy address (the address below [`Self::daemon_ip`],
     /// `broadcast - 3`): a second infrastructure address above the PTask lease
     /// pool that the host-side stack peer owns directly. Reserved, never
@@ -650,10 +670,20 @@ pub fn render_gvproxy_config(subnet: SwitchSubnet, leases: &[(Ipv4Addr, MacAddr)
     s.push_str(&format!(
         "  tcpConnectTimeout: {TCP_CONNECT_TIMEOUT_SECS}\n"
     ));
+    // NET-004: a switch carved from the default block also maps the
+    // documented literal to the host's loopback, beside its own alias, so the
+    // literal reaches what `host.min.internal` reaches.
+    let literal = subnet.documented_host_literal();
     s.push_str("  nat:\n");
     s.push_str(&format!("    \"{}\": \"127.0.0.1\"\n", subnet.host_alias()));
+    if let Some(literal) = literal {
+        s.push_str(&format!("    \"{literal}\": \"127.0.0.1\"\n"));
+    }
     s.push_str("  gatewayVirtualIPs:\n");
     s.push_str(&format!("    - \"{}\"\n", subnet.host_alias()));
+    if let Some(literal) = literal {
+        s.push_str(&format!("    - \"{literal}\"\n"));
+    }
     // NET-003: the switch answers `host.min.internal` itself, with the host
     // alias — the address its `nat` table maps to the host's loopback. Rendered
     // from first boot, ahead of any dynamic `min.internal.` registration; the
@@ -765,6 +795,49 @@ mod tests {
             assert!(yaml.contains(&format!("\"{}\": \"127.0.0.1\"", net.host_alias())));
             assert!(yaml.contains(&format!("- \"{}\"", net.host_alias())));
         }
+    }
+
+    /// NET-004: a `/24` switch carved from the default `/16` maps the
+    /// documented literal to the host's loopback and carries it as a gateway
+    /// virtual address, beside its own alias. The `/16` a guest daemon uses
+    /// renders as before, and a subnet outside the default block gets nothing.
+    #[test]
+    fn gvproxy_config_maps_documented_literal_on_a_slash_24() {
+        let literal = Ipv4Addr::new(100, 64, 255, 254);
+        let carved = SwitchSubnet::new(Ipv4Addr::new(100, 64, 3, 0), 24).unwrap();
+        assert_eq!(carved.documented_host_literal(), Some(literal));
+        let yaml = render_gvproxy_config(carved, &[]);
+        assert!(
+            yaml.contains(
+                "  nat:\n    \"100.64.3.254\": \"127.0.0.1\"\n    \"100.64.255.254\": \"127.0.0.1\"\n"
+            ),
+            "{yaml}"
+        );
+        assert!(
+            yaml.contains(
+                "  gatewayVirtualIPs:\n    - \"100.64.3.254\"\n    - \"100.64.255.254\"\n  dns:\n"
+            ),
+            "{yaml}"
+        );
+        // `host.min.internal` keeps the switch's own alias.
+        assert!(yaml.contains("          ip: \"100.64.3.254\"\n"), "{yaml}");
+
+        // The default /16: its own alias is the literal, rendered once each.
+        assert_eq!(DEFAULT_SUBNET.documented_host_literal(), None);
+        let yaml = render_gvproxy_config(DEFAULT_SUBNET, &[]);
+        assert_eq!(yaml.matches("\"100.64.255.254\": \"127.0.0.1\"").count(), 1);
+        assert_eq!(yaml.matches("- \"100.64.255.254\"").count(), 1);
+
+        // The /24 that holds the literal as its own alias renders it once.
+        let top = SwitchSubnet::new(Ipv4Addr::new(100, 64, 255, 0), 24).unwrap();
+        assert_eq!(top.documented_host_literal(), None);
+        let yaml = render_gvproxy_config(top, &[]);
+        assert_eq!(yaml.matches("\"100.64.255.254\": \"127.0.0.1\"").count(), 1);
+
+        // A subnet outside the default block never maps the literal.
+        let custom = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 24).unwrap();
+        assert_eq!(custom.documented_host_literal(), None);
+        assert!(!render_gvproxy_config(custom, &[]).contains("100.64.255.254"));
     }
 
     #[test]

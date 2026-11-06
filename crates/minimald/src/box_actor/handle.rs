@@ -9,6 +9,12 @@ use super::*;
 /// handles ([`BoxActor::publish_host`]).
 pub(crate) type HostSlot = Arc<std::sync::Mutex<Option<AttrsProbe>>>;
 
+/// Set by a forced stop before it queues its message, and read by a
+/// graceful stop that is in its grace period: the graceful stop then sends
+/// SIGKILL at once (BOX-013). The actor clears it when a stop has signalled
+/// the box.
+pub(crate) type StopForce = Arc<std::sync::atomic::AtomicBool>;
+
 /// Empties a [`HostSlot`] when the actor that publishes it ends, however it
 /// ends: a teardown's `break` (which publishes nothing after it), or a panic
 /// unwinding the actor's task. A listing then reads no host for an actor
@@ -44,13 +50,19 @@ pub struct BoxHandle(
     pub(super) crate::traced::Sender<BoxMessage>,
     pub(super) CancellationToken,
     pub(super) HostSlot,
+    pub(super) StopForce,
 );
 
 impl BoxHandle {
     /// Returns a non-owning handle to this session.
     #[must_use]
     pub fn downgrade(&self) -> WeakBoxHandle {
-        WeakBoxHandle(self.0.downgrade(), self.1.clone(), Arc::clone(&self.2))
+        WeakBoxHandle(
+            self.0.downgrade(),
+            self.1.clone(),
+            Arc::clone(&self.2),
+            Arc::clone(&self.3),
+        )
     }
 
     /// Whether this session is being destroyed.
@@ -249,6 +261,34 @@ impl BoxHandle {
         probe_host(host?.get_attrs()).await
     }
 
+    /// Whether the actor holds a host for the box. A stop takes the host out
+    /// before it signals the box's processes, and so does the end of the
+    /// entrypoint, so a command that one of them ends can see why.
+    #[must_use]
+    pub(crate) fn has_host(&self) -> bool {
+        self.2
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// Test-only: marks the box as being destroyed, as a removal does
+    /// before it stops the host.
+    #[cfg(test)]
+    pub(crate) fn start_destroy_for_test(&self) {
+        self.1.cancel();
+    }
+
+    /// Test-only: empties the slot a listing reads, as a stop does before
+    /// it signals the box.
+    #[cfg(test)]
+    pub(crate) fn take_host_for_test(&self) {
+        self.2
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+
     /// Test-only: puts `host` in the slot a listing reads, as the actor does
     /// after a message; the actor's next message overwrites it.
     #[cfg(test)]
@@ -402,6 +442,28 @@ impl BoxHandle {
         let _ = self
             .0
             .send(BoxMessage::BindHandedPort { address, port })
+            .await;
+    }
+
+    /// Tells the session's actor its publish moved from `from` to `to`
+    /// (#2748), so it binds `ports`, the declared ports it holds at `to`,
+    /// unbinds their forwards at `from`, and moves the forwards its
+    /// `min net expose` bound at `from`, if its box is running. Not
+    /// answered: a box that is gone or stopped has no forward to move.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn publish_moved(
+        &self,
+        from: std::net::Ipv4Addr,
+        to: std::net::Ipv4Addr,
+        ports: Vec<u16>,
+    ) {
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "an actor that is gone has no box to move the forwards for"
+        )]
+        let _ = self
+            .0
+            .send(BoxMessage::PublishMoved { from, to, ports })
             .await;
     }
 
@@ -807,6 +869,7 @@ pub struct WeakBoxHandle(
     pub(super) crate::traced::WeakSender<BoxMessage>,
     pub(super) CancellationToken,
     pub(super) HostSlot,
+    pub(super) StopForce,
 );
 
 impl WeakBoxHandle {
@@ -818,6 +881,7 @@ impl WeakBoxHandle {
             self.0.upgrade()?,
             self.1.clone(),
             Arc::clone(&self.2),
+            Arc::clone(&self.3),
         ))
     }
 
@@ -831,7 +895,12 @@ impl WeakBoxHandle {
         let weak = tx.downgrade();
         // Drop the only strong sender so `upgrade()` returns `None`.
         drop(tx);
-        Self(weak, CancellationToken::new(), HostSlot::default())
+        Self(
+            weak,
+            CancellationToken::new(),
+            HostSlot::default(),
+            StopForce::default(),
+        )
     }
 
     /// A handle to a stand-in "actor" that answers each expose request with
@@ -869,6 +938,11 @@ impl WeakBoxHandle {
                 }
             }
         });
-        Self(weak, CancellationToken::new(), HostSlot::default())
+        Self(
+            weak,
+            CancellationToken::new(),
+            HostSlot::default(),
+            StopForce::default(),
+        )
     }
 }

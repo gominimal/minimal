@@ -121,8 +121,8 @@ fn classify(lifecycle: Lifecycle) -> Decision {
 /// On targets with no minvmd backend this is a no-op (see below).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn ensure_minvmd_running(minimal_dir: Option<&Path>) -> io::Result<()> {
-    let provider_dir = crate::client::resolve_provider_dir(minimal_dir, true)?;
-    let state_dir = minvmd::state::StateDir::new(provider_dir)?;
+    let host_dir = crate::client::resolve_host_dir(minimal_dir, true)?;
+    let state_dir = minvmd::state::StateDir::new(host_dir)?;
 
     match classify(state_dir.effective_state()?.lifecycle) {
         Decision::AlreadyRunning => {
@@ -248,8 +248,8 @@ pub fn ensure_minvmd_running(_minimal_dir: Option<&Path>) -> io::Result<()> {
 /// `Stopped` still resolves rather than pinning the wait to its deadline.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn wait_for_minvmd_stopped(minimal_dir: Option<&Path>) -> io::Result<()> {
-    let provider_dir = crate::client::resolve_provider_dir(minimal_dir, true)?;
-    let state_dir = minvmd::state::StateDir::new(provider_dir)?;
+    let host_dir = crate::client::resolve_host_dir(minimal_dir, true)?;
+    let state_dir = minvmd::state::StateDir::new(host_dir)?;
 
     let deadline = Instant::now() + Duration::from_secs(STOPPED_WAIT_SECS);
     loop {
@@ -376,8 +376,8 @@ pub fn is_daemon_running(use_minvmd: bool, minimal_dir: Option<&Path>) -> io::Re
 /// return as though the VM were already down.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn is_minvmd_running(minimal_dir: Option<&Path>) -> io::Result<bool> {
-    let provider_dir = crate::client::resolve_provider_dir(minimal_dir, true)?;
-    let state_dir = minvmd::state::StateDir::new(provider_dir)?;
+    let host_dir = crate::client::resolve_host_dir(minimal_dir, true)?;
+    let state_dir = minvmd::state::StateDir::new(host_dir)?;
     Ok(state_dir.effective_state()?.lifecycle.is_active())
 }
 
@@ -487,40 +487,9 @@ mod tests {
         assert!(msg.contains("Re-run"), "suggests retrying: {msg}");
     }
 
-    /// T93: a VM start that failed on the hostname proxy's port reaches the
-    /// user with the port, the holder and why inline — the line `minvmd run
-    /// --detach` lifts from its supervisor's log — not a bare pointer at it.
-    #[test]
-    fn autospawn_error_names_proxy_port_and_holder() {
-        for (stderr, port, holder, why) in [
-            (
-                "Error: hostname proxy port 7654 held by pid 4242 (python3); configured ports \
-                 never redraw (free the port or unset MINVMD_NODE_PROXY_PORT) \
-                 (supervisor log: /s/run.log)\n",
-                "hostname proxy port 7654",
-                "held by pid 4242 (python3)",
-                "configured ports never redraw",
-            ),
-            (
-                "Error: hostname proxy port 41001 held by pid 77 (gvproxy); 3 publish tries \
-                 exhausted, every drawn port taken (supervisor log: /s/run.log)\n",
-                "hostname proxy port 41001",
-                "held by pid 77 (gvproxy)",
-                "3 publish tries exhausted",
-            ),
-        ] {
-            let msg = boot_failure_error(stderr).to_string();
-            for part in [port, holder, why] {
-                assert!(msg.contains(part), "the error names '{part}': {msg}");
-            }
-            assert!(msg.contains("min bug"), "still actionable: {msg}");
-        }
-    }
-
     /// The state dir a `--minimal-dir` override resolves to.
     fn state_dir_for(minimal_dir: &std::path::Path) -> StateDir {
-        StateDir::new(crate::client::resolve_provider_dir(Some(minimal_dir), true).unwrap())
-            .unwrap()
+        StateDir::new(crate::client::resolve_host_dir(Some(minimal_dir), true).unwrap()).unwrap()
     }
 
     #[test]

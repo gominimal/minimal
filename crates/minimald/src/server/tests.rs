@@ -25,6 +25,32 @@ fn inactivity_deadline_spans_the_full_keepalive_budget() {
     assert!(INACTIVITY_TIMEOUT > KEEPALIVE_INTERVAL * KEEPALIVE_MAX as u32);
 }
 
+/// A client that hangs up with daemon output still unread resets the
+/// connection instead of closing it, and that is the same abrupt client loss
+/// as an end of file: it is logged as a closed connection, not as an error.
+/// A fault on this side still is one.
+#[test]
+fn a_reset_connection_was_closed_by_its_peer() {
+    use crate::connection::ConnectionError;
+    use std::io::{Error, ErrorKind};
+
+    let io = |kind| ConnectionError::Protocol(russh::Error::IO(Error::from(kind)));
+    for kind in [
+        ErrorKind::ConnectionReset,
+        ErrorKind::UnexpectedEof,
+        ErrorKind::BrokenPipe,
+    ] {
+        assert!(closed_by_peer(&io(kind)), "{kind:?} is the peer hanging up");
+    }
+    assert!(closed_by_peer(&ConnectionError::Protocol(
+        russh::Error::Disconnect
+    )));
+    assert!(!closed_by_peer(&io(ErrorKind::PermissionDenied)));
+    assert!(!closed_by_peer(&ConnectionError::Internal(
+        "the session store is unreadable".to_string()
+    )));
+}
+
 /// The production config arms the inactivity deadline: with `None` a
 /// wedged transport write parks the session loop forever.
 #[tokio::test]
@@ -240,6 +266,179 @@ async fn shutdown_rpc_returns_even_if_the_initiating_client_lingers() {
         .expect("run must return after the grace period aborts lingering connections");
     assert!(res.unwrap().is_ok(), "run should return Ok after shutdown");
     drop(client);
+}
+
+/// The first `conn` span `log` saw, once it has closed: its task has then
+/// recorded the outcome and logged how the connection ended.
+async fn first_conn_once_closed(
+    log: &crate::test_harness::SpanLog,
+) -> crate::test_harness::LoggedSpan {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(first) = log.spans().into_iter().find(|s| s.name == "conn")
+                && first.closed
+            {
+                return first;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first conn span closes")
+}
+
+/// `min` probes the daemon's socket before every command by connecting
+/// and hanging up without an SSH id line; that is not a failed handshake
+/// and is not logged as one. The `conn` span says what became of the
+/// connection instead.
+#[tokio::test]
+async fn a_peer_that_hangs_up_before_the_ssh_id_is_not_a_handshake_failure() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let capture = crate::test_harness::CaptureWriter::default();
+    let log = crate::test_harness::SpanLog::default();
+    let _g = tracing::subscriber::set_default(
+        tracing_subscriber::registry().with(log.clone()).with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(capture.clone())
+                .with_ansi(false),
+        ),
+    );
+    let dir = TempDir::new().unwrap();
+    let (run, sock) = spawn_server(&dir);
+
+    let probe = tokio::net::UnixStream::connect(&sock).await.unwrap();
+    drop(probe);
+    // The probe's `conn` span closes when its task has classified the
+    // hang-up and logged it, so the log is complete for the probe then.
+    let probe_conn = first_conn_once_closed(&log).await;
+    assert_eq!(
+        probe_conn.field("outcome"),
+        Some("closed_before_id"),
+        "{probe_conn:?}"
+    );
+    let mut client = connect_uds(&sock).await;
+    let resp = client.call::<GetVersion>(&()).await;
+    assert!(!resp.version.is_empty());
+
+    let logged = capture.contents();
+    assert!(
+        !logged.contains("SSH handshake failed"),
+        "a peer that hung up before the id exchange is not a failed handshake: {logged}"
+    );
+    assert!(
+        logged.contains("peer closed before the SSH id exchange"),
+        "the probe's hang-up is logged at debug: {logged}"
+    );
+    assert!(
+        logged.matches("accepted connection").count() >= 2,
+        "both the probe and the client were accepted: {logged}"
+    );
+
+    let _ = client
+        .call::<Shutdown>(&ShutdownRequest { force: false })
+        .await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+}
+
+/// `run_stream` returns once the SSH ids are exchanged, with key exchange
+/// still to run in russh's task: a peer that sends its id and then fails key
+/// exchange is a failed handshake, not a session, while a real client that
+/// gets through is one. The `conn` span's outcome says which.
+#[tokio::test]
+async fn a_peer_that_fails_key_exchange_after_its_id_is_a_failed_handshake() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let log = crate::test_harness::SpanLog::default();
+    let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+    let dir = TempDir::new().unwrap();
+    let (run, sock) = spawn_server(&dir);
+
+    let mut peer = tokio::net::UnixStream::connect(&sock).await.unwrap();
+    peer.write_all(b"SSH-2.0-not-a-client\r\n").await.unwrap();
+    // A packet length no SSH implementation accepts. The daemon may close
+    // before all of it is written.
+    let _ = peer.write_all(&[0xff; 64]).await;
+    let mut sink = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), peer.read_to_end(&mut sink)).await;
+    drop(peer);
+
+    let mut client = connect_uds(&sock).await;
+    let resp = client.call::<GetVersion>(&()).await;
+    assert!(!resp.version.is_empty());
+    let _ = client
+        .call::<Shutdown>(&ShutdownRequest { force: false })
+        .await;
+    drop(client);
+    let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+
+    let outcomes: Vec<Option<String>> = log
+        .spans()
+        .iter()
+        .filter(|s| s.name == "conn")
+        .map(|s| s.field("outcome").map(str::to_owned))
+        .collect();
+    assert_eq!(
+        outcomes,
+        [
+            Some("handshake_failed".to_owned()),
+            Some("session".to_owned())
+        ],
+        "{:#?}",
+        log.spans()
+    );
+}
+
+/// A peer that gets through key exchange and asks for ssh-userauth, but
+/// hangs up without authenticating, had no session: its `conn` outcome is
+/// `closed_before_auth`, and only the client that authenticates is a
+/// `session`.
+#[tokio::test]
+async fn a_peer_that_never_authenticates_is_not_a_session() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let log = crate::test_harness::SpanLog::default();
+    let _g = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
+    let dir = TempDir::new().unwrap();
+    let (run, sock) = spawn_server(&dir);
+
+    let stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+    let mut peer = russh::client::connect_stream(
+        std::sync::Arc::new(russh::client::Config::default()),
+        stream,
+        crate::test_harness::TestClientHandler,
+    )
+    .await
+    .unwrap();
+    // The daemon takes no passwords: the request is refused, after the
+    // ssh-userauth service was granted.
+    let auth = peer.authenticate_password("test", "wrong").await.unwrap();
+    assert!(!auth.success());
+    drop(peer);
+    first_conn_once_closed(&log).await;
+
+    let mut client = connect_uds(&sock).await;
+    let resp = client.call::<GetVersion>(&()).await;
+    assert!(!resp.version.is_empty());
+    let _ = client
+        .call::<Shutdown>(&ShutdownRequest { force: false })
+        .await;
+    drop(client);
+    let _ = tokio::time::timeout(Duration::from_secs(5), run).await;
+
+    let outcomes: Vec<Option<String>> = log
+        .spans()
+        .iter()
+        .filter(|s| s.name == "conn")
+        .map(|s| s.field("outcome").map(str::to_owned))
+        .collect();
+    assert_eq!(
+        outcomes,
+        [
+            Some("closed_before_auth".to_owned()),
+            Some("session".to_owned())
+        ],
+        "{:#?}",
+        log.spans()
+    );
 }
 
 /// A connection that connects and never sends its SSH id line must not
@@ -703,18 +902,23 @@ async fn spawn_backend_on(addr: std::net::SocketAddr, body: &'static str) {
     });
 }
 
-/// Spawns a loopback backend (see [`spawn_backend_on`]) on a free port,
-/// returning the port it listens on.
+/// Spawns a backend (see [`spawn_backend_on`]) at `0.0.0.0` on a free port,
+/// returning the port it listens on. A host-address box's name reaches only
+/// a port held at `0.0.0.0`, never one held at `127.0.0.1` only (NET-071).
 #[cfg(target_os = "linux")]
 async fn spawn_backend_saying(body: &'static str) -> u16 {
     use std::net::{IpAddr, Ipv4Addr};
 
     // Reserve then drop: the bind below re-takes the port for keeps.
     let port = {
-        let bind = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let bind = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
         bind.local_addr().unwrap().port()
     };
-    spawn_backend_on(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port), body).await;
+    spawn_backend_on(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+        body,
+    )
+    .await;
     port
 }
 
@@ -1927,9 +2131,9 @@ async fn proxy_publish_in_use_is_reported_not_retried() {
         "a handed port has no rung to walk to, got: {log}"
     );
     assert!(
-        state.proxy_unavailable().await.is_some(),
-        "the terminal failure must stay recorded as the unavailable note \
-         min ls warns from"
+        state.proxy_unavailable().await.is_none(),
+        "a host-held port records no cause in the guest: the VM host \
+         daemon records the cause that min ls reads"
     );
     assert!(
         state.hostname_proxy_port().await.is_none(),
@@ -3095,5 +3299,125 @@ async fn a_walked_answerer_publication_keeps_the_bind_and_reports_the_rung() {
     assert!(
         logged.contains(&format!("guest_port={default_port}")),
         "the publication line must name the guest port beside it, got: {logged}"
+    );
+}
+
+/// A vsock-shaped listener a test feeds: each accept hands back the next
+/// queued stream with the peer address the test chose, so a test can stand
+/// a peer at any CID without a VM. It refuses peers exactly as the real
+/// vsock listener does, through that listener's own `refused_cid`.
+#[cfg(target_os = "linux")]
+struct FedVsockListener {
+    queued: tokio::sync::Mutex<
+        tokio::sync::mpsc::UnboundedReceiver<(tokio::io::DuplexStream, tokio_vsock::VsockAddr)>,
+    >,
+}
+
+#[cfg(target_os = "linux")]
+impl Listener for FedVsockListener {
+    type Stream = tokio::io::DuplexStream;
+    type Addr = tokio_vsock::VsockAddr;
+
+    const TRANSPORT: &'static str = "vsock";
+    const IS_LOCAL: bool = true;
+
+    async fn accept(&self) -> std::io::Result<(Self::Stream, Self::Addr)> {
+        match self.queued.lock().await.recv().await {
+            Some(accepted) => Ok(accepted),
+            None => std::future::pending().await,
+        }
+    }
+
+    fn refused_cid(peer: &Self::Addr) -> Option<u32> {
+        <tokio_vsock::VsockListener as Listener>::refused_cid(peer)
+    }
+}
+
+/// NET-139: the in-VM daemon's vsock RPC listener serves only the host. A
+/// peer at any other CID (here a sibling at CID 3 and the guest's own
+/// loopback at CID 1) is dropped at accept. The daemon never sends it the
+/// SSH banner and never reads what it wrote. One audited line names the
+/// CID. A peer at CID 2 is served as before.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn vsock_rpc_refuses_non_host_cid() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    assert!(vsock_peer_refused(1), "the guest's loopback CID is refused");
+    assert!(vsock_peer_refused(3), "a sibling CID is refused");
+    assert!(
+        !vsock_peer_refused(tokio_vsock::VMADDR_CID_HOST),
+        "the host's CID is served"
+    );
+
+    let capture = crate::test_harness::captured_log();
+    let dir = TempDir::new().unwrap();
+    let state = ServerStateHandle::new(test_config(&dir), None)
+        .await
+        .unwrap();
+    let (feed, queued) = tokio::sync::mpsc::unbounded_channel();
+    let listener = FedVsockListener {
+        queued: tokio::sync::Mutex::new(queued),
+    };
+    let run = tokio::spawn(Server::serve(state, listener));
+
+    for cid in [3, 1] {
+        let (mut peer, served) = tokio::io::duplex(4096);
+        // The peer speaks first. A refusal at accept must not read it.
+        peer.write_all(b"SSH-2.0-not-the-host\r\n").await.unwrap();
+        feed.send((served, tokio_vsock::VsockAddr::new(cid, 22)))
+            .unwrap();
+        let mut heard = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(10), peer.read_to_end(&mut heard))
+            .await
+            .expect("a refused peer's connection is closed at once");
+        assert!(
+            read.is_ok() && heard.is_empty(),
+            "a peer at CID {cid} hears nothing before its connection closes: {heard:?}"
+        );
+    }
+
+    let (mut host, served) = tokio::io::duplex(4096);
+    feed.send((
+        served,
+        tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_HOST, 22),
+    ))
+    .unwrap();
+    let mut banner = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(10), host.read_exact(&mut banner))
+        .await
+        .expect("the host is answered")
+        .expect("the host reads the daemon's SSH banner");
+    assert_eq!(&banner, b"SSH-", "the host's connection is served");
+
+    let log = capture.contents();
+    for cid in [3, 1] {
+        assert!(
+            log.contains(&format!("peer_cid={cid}")) && log.contains("audit=true"),
+            "the refusal of CID {cid} is one audited line naming it: {log}"
+        );
+    }
+    assert!(
+        !log.contains("peer_cid=2"),
+        "the host's CID is never refused: {log}"
+    );
+    run.abort();
+}
+
+/// NET-139's rate limit: the first refusal of a CID writes the line, the
+/// refusals inside its window are counted and not written, and the first
+/// refusal after the window writes a line that covers them all.
+#[test]
+fn refused_peer_line_is_rate_limited_per_cid() {
+    // A CID no other test refuses: the limiter is process-wide.
+    let cid = 0xdead_beef;
+    let start = std::time::Instant::now();
+    assert_eq!(peer_refusal_due(cid, start), Some(1));
+    assert_eq!(peer_refusal_due(cid, start + Duration::from_secs(1)), None);
+    assert_eq!(peer_refusal_due(cid, start + Duration::from_secs(2)), None);
+    assert_eq!(
+        peer_refusal_due(cid, start + PEER_REFUSAL_LOG_INTERVAL),
+        Some(3),
+        "the next line counts the refusals its window suppressed"
     );
 }

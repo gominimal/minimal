@@ -63,7 +63,9 @@
 //! boxes run unenforced like any host's and say so per launch, in the
 //! interim's words.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
+use std::net::{
+    IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket,
+};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -141,7 +143,9 @@ impl UnenforceableRule {
 /// `deny_subnets` entry (a partial refusal the deny subtree does not spell)
 /// and every present `allow_*` list in a declaration that is not the
 /// deny-all shape (a narrowing the allow subtree has no rule to enforce)
-/// names a rule this host decides nothing for. An absent section and the
+/// names a rule this host decides nothing for, except an empty destination
+/// list beside a non-empty one: that list grants and narrows nothing, so it
+/// names no rule. An absent section and the
 /// deny-all shape name nothing — the first is placed under `allow` exactly
 /// as the allow-all it is, and the second is the one shape the deny
 /// subtree enforces; a `deny_subnets` entry over the deny-all shape
@@ -170,10 +174,21 @@ pub(crate) fn unenforceable_rules(
             .flatten()
             .map(|entry| UnenforceableRule::DenySubnets(entry.clone())),
     );
-    if section.allow_subnets.is_some() {
+    // An empty destination list beside a non-empty one grants nothing and
+    // narrows nothing: it is the list the in-force default fills in for a
+    // box that declared only the other one (`boxes::effective_egress`). It
+    // names no rule, so the launch, which reads the resolved section, and
+    // the create, which reads the declared one, name the same rules, and a
+    // refusal names only the flags the box was started with. The deny-all
+    // shape, both lists present and empty, returned above.
+    let declares = |list: &Option<Vec<String>>| list.as_ref().is_some_and(|l| !l.is_empty());
+    let names_a_rule = |list: &Option<Vec<String>>, other: &Option<Vec<String>>| {
+        list.is_some() && (declares(list) || !declares(other))
+    };
+    if names_a_rule(&section.allow_subnets, &section.allow_dns_hosts) {
         rules.push(UnenforceableRule::AllowSubnets);
     }
-    if section.allow_dns_hosts.is_some() {
+    if names_a_rule(&section.allow_dns_hosts, &section.allow_subnets) {
         rules.push(UnenforceableRule::AllowDnsHosts);
     }
     if section.allow_protocols.is_some() {
@@ -537,6 +552,11 @@ pub const QUIC443_BLOCKED_DIR: &str = "quic443-blocked";
 /// `scripts/install-host-classifier.sh`.
 pub const QUIC443_LEAF_SET: &str = "quic443_blocked_leaves";
 
+/// The name of the guest table's set of box leaves that can open a TCP
+/// connection to the Box Egress Proxy's address (BEP-083). Spelled the same
+/// as `PROXY_LANE_SET` in `scripts/install-host-classifier.sh`.
+pub const PROXY_LANE_SET: &str = "bep_lane_leaves";
+
 /// The cohort's blocked leaf under the classifier tree `root`:
 /// `<root>/boxes/quic443-blocked`.
 #[must_use]
@@ -602,6 +622,27 @@ pub(crate) trait CgroupMoves {
             std::io::ErrorKind::Unsupported,
             format!(
                 "{} cannot be removed from the blocked set here",
+                leaf.display()
+            ),
+        ))
+    }
+    /// Adds the box leaf `leaf` to the guest table's set of leaves that
+    /// can connect to the proxy's address ([`PROXY_LANE_SET`], BEP-083).
+    /// The default changes no set and fails, as
+    /// [`Self::add_blocked_leaf`] says.
+    fn add_lane_leaf(&self, leaf: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("{} cannot be added to the lane set here", leaf.display()),
+        ))
+    }
+    /// Removes the box leaf `leaf` from that set. The default changes no
+    /// set and fails, as [`Self::add_blocked_leaf`] says.
+    fn remove_lane_leaf(&self, leaf: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "{} cannot be removed from the lane set here",
                 leaf.display()
             ),
         ))
@@ -751,6 +792,16 @@ impl std::error::Error for CohortPlaceError {
 /// `deny` subtree stays where it is: its leaf already refuses everything
 /// but its resolver, UDP 443 included. The daemon's one cohort is
 /// [`cohort_quic443`].
+///
+/// The cohort also keeps each member's lane bit (BEP-083): whether the
+/// member declares a credentialed upstream that is in effect. The own leaf
+/// of each lane member in the `allow` subtree is in the guest table's
+/// [`PROXY_LANE_SET`] while it is resident
+/// ([`CgroupMoves::add_lane_leaf`]), and only a socket created in a leaf of
+/// that set can connect to the proxy's address. So a lane member is never
+/// moved into the blocked leaf. It stays in its own leaf, and its own leaf
+/// in the blocked-leaves set refuses its UDP 443. A member that declares no
+/// lane is never in the lane set.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CohortQuic443 {
     /// Each resident member's resolved stance, by box id: `true` where it
@@ -770,6 +821,12 @@ pub struct CohortQuic443 {
     /// The own leaves in the table's blocked-leaves set, by box id: the
     /// leaves whose add succeeded and that were not removed since.
     listed: std::collections::BTreeMap<String, PathBuf>,
+    /// The resident members that declare a credentialed upstream in effect
+    /// (BEP-083): the members whose own leaf belongs in the lane set.
+    lanes: std::collections::BTreeSet<String>,
+    /// The own leaves in the guest table's lane set, by box id: the leaves
+    /// whose add succeeded and that were not removed since.
+    lane_listed: std::collections::BTreeMap<String, PathBuf>,
 }
 
 impl CohortQuic443 {
@@ -781,6 +838,91 @@ impl CohortQuic443 {
             homes: std::collections::BTreeMap::new(),
             moved: std::collections::BTreeMap::new(),
             listed: std::collections::BTreeMap::new(),
+            lanes: std::collections::BTreeSet::new(),
+            lane_listed: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// The own leaves in the guest table's lane set, as far as this cohort
+    /// knows: the adds that succeeded, less the removes.
+    pub fn lane_leaves(&self) -> impl Iterator<Item = &Path> {
+        self.lane_listed.values().map(PathBuf::as_path)
+    }
+
+    /// The resident members that declare a lane in effect.
+    pub fn lane_members(&self) -> impl Iterator<Item = &str> {
+        self.lanes.iter().map(String::as_str)
+    }
+
+    /// Brings the guest table's lane set in step with the cohort: the own
+    /// leaf of every resident lane member in the `allow` subtree, and no
+    /// other leaf (BEP-083). Each change logs one info line with the box,
+    /// its leaf and the lane members. A refused remove stays recorded for
+    /// the next change, unless the leaf is gone. A refused add is logged
+    /// and not recorded, so the next change tries it again. A refused add
+    /// fails closed: the member's connections to the proxy's address stay
+    /// refused, and its launch goes on.
+    fn sync_lane_set(&mut self, moves: &dyn CgroupMoves) {
+        let want: std::collections::BTreeMap<String, PathBuf> = self
+            .homes
+            .iter()
+            .filter(|(id, _)| self.lanes.contains(*id))
+            .map(|(id, leaf)| (id.clone(), leaf.clone()))
+            .collect();
+        let stale: Vec<(String, PathBuf)> = self
+            .lane_listed
+            .iter()
+            .filter(|(id, leaf)| want.get(*id) != Some(*leaf))
+            .map(|(id, leaf)| (id.clone(), leaf.clone()))
+            .collect();
+        for (id, leaf) in stale {
+            if moves.remove_lane_leaf(&leaf).is_ok() {
+                self.lane_listed.remove(&id);
+                self.log_lane_change(&id, &leaf, false);
+            } else if !leaf.exists() {
+                // A gone cgroup's id is never reused: its element matches
+                // no socket.
+                self.lane_listed.remove(&id);
+            }
+        }
+        for (id, leaf) in want {
+            if self.lane_listed.contains_key(&id) {
+                continue;
+            }
+            match moves.add_lane_leaf(&leaf) {
+                Ok(()) => {
+                    self.log_lane_change(&id, &leaf, true);
+                    self.lane_listed.insert(id, leaf);
+                }
+                Err(error) => tracing::warn!(
+                    box_id = id,
+                    leaf = %leaf.display(),
+                    %error,
+                    "cannot add a host-address box's own leaf to the set that can connect \
+                     to the proxy's address; its connections there stay refused until the \
+                     next change of the cohort"
+                ),
+            }
+        }
+    }
+
+    /// The one info line per change of the lane set.
+    fn log_lane_change(&self, box_id: &str, leaf: &Path, added: bool) {
+        let lane_members: Vec<&str> = self.lane_members().collect();
+        if added {
+            tracing::info!(
+                box_id,
+                leaf = %leaf.display(),
+                lane_members = ?lane_members,
+                "added a host-address box's own leaf to the set that can connect to the proxy's address"
+            );
+        } else {
+            tracing::info!(
+                box_id,
+                leaf = %leaf.display(),
+                lane_members = ?lane_members,
+                "removed a host-address box's own leaf from the set that can connect to the proxy's address"
+            );
         }
     }
 
@@ -876,6 +1018,7 @@ impl CohortQuic443 {
     /// counting at once.
     pub fn leave(&mut self, box_id: &str) {
         self.members.remove(box_id);
+        self.lanes.remove(box_id);
     }
 
     /// Whether the cohort blocks UDP to port 443: any resident member's
@@ -906,10 +1049,11 @@ impl CohortQuic443 {
 
     /// The leaf a process injected into `box_id` must join: the blocked
     /// leaf while the cohort blocks and the box's processes move into it,
-    /// `None` when the box's own leaf is the right one.
+    /// `None` when the box's own leaf is the right one. A lane member's
+    /// processes never move, so its answer is always `None` (BEP-083).
     #[must_use]
     pub fn injection_leaf(&self, box_id: &str) -> Option<&Path> {
-        if self.blocked() && self.homes.contains_key(box_id) {
+        if self.blocked() && self.homes.contains_key(box_id) && !self.lanes.contains(box_id) {
             self.blocked_leaf.as_deref()
         } else {
             None
@@ -952,6 +1096,7 @@ impl CohortQuic443 {
     /// every process in the blocked leaf goes home, as [`Self::depart`]
     /// does. `home` is the box's own leaf when its processes are to move,
     /// `None` for a box in the `deny` subtree or one placed in no leaf.
+    /// The box declares no lane: [`Self::admit_with_lane`] with `false`.
     ///
     /// # Errors
     ///
@@ -959,6 +1104,7 @@ impl CohortQuic443 {
     /// processes cannot all be placed in the blocked leaf, or a member's
     /// own leaf cannot be added to the blocked-leaves set. The box stays a
     /// member: the caller fails its launch and calls [`Self::depart`].
+    #[cfg(test)]
     pub(crate) fn admit(
         &mut self,
         box_id: &str,
@@ -966,8 +1112,32 @@ impl CohortQuic443 {
         blocked: bool,
         moves: &dyn CgroupMoves,
     ) -> Result<(), CohortPlaceError> {
+        self.admit_with_lane(box_id, home, blocked, false, moves)
+    }
+
+    /// [`Self::admit`] with the box's lane bit (BEP-083). A lane member's
+    /// own leaf joins the guest table's lane set while it is resident, and
+    /// its processes stay in that leaf when the cohort blocks.
+    ///
+    /// # Errors
+    ///
+    /// The [`CohortPlaceError`] of [`Self::admit`]. A refused add to the
+    /// lane set is logged and is not an error.
+    pub(crate) fn admit_with_lane(
+        &mut self,
+        box_id: &str,
+        home: Option<PathBuf>,
+        blocked: bool,
+        lane: bool,
+        moves: &dyn CgroupMoves,
+    ) -> Result<(), CohortPlaceError> {
         let was = self.blocked();
         self.join(box_id, blocked);
+        if lane {
+            self.lanes.insert(box_id.to_string());
+        } else {
+            self.lanes.remove(box_id);
+        }
         match home {
             Some(home) => {
                 self.homes.insert(box_id.to_string(), home);
@@ -981,6 +1151,7 @@ impl CohortQuic443 {
             self.log_flip(box_id);
         }
         let listed = self.sync_leaf_set(moves);
+        self.sync_lane_set(moves);
         if !now {
             if was {
                 self.move_all_home(None, moves);
@@ -1011,6 +1182,7 @@ impl CohortQuic443 {
         // A stop cannot fail. A refused add here is a leaf whose launch
         // already failed on it, and the helper logged the refusal.
         let _ = self.sync_leaf_set(moves);
+        self.sync_lane_set(moves);
         let now = self.blocked();
         if was && !now {
             self.log_flip(box_id);
@@ -1054,6 +1226,11 @@ impl CohortQuic443 {
         let Some(home) = self.homes.get(box_id).cloned() else {
             return Ok(());
         };
+        // BEP-083: a lane member stays in its own leaf, the leaf the lane
+        // set names. Its own leaf in the blocked-leaves set refuses UDP 443.
+        if self.lanes.contains(box_id) {
+            return Ok(());
+        }
         let Some(blocked_leaf) = self.blocked_leaf.clone() else {
             return Err(CohortPlaceError::NoBlockedLeaf);
         };
@@ -1172,7 +1349,8 @@ pub(crate) fn cohort_quic443() -> &'static std::sync::Mutex<CohortQuic443> {
 
 /// A `host_ip` box joins `cohort` with its resolved stance
 /// ([`CohortQuic443::admit`]). Its processes move when it sits in the
-/// `allow` subtree of the classifier tree `root`.
+/// `allow` subtree of the classifier tree `root`. `lane` is the box's lane
+/// bit (BEP-083).
 ///
 /// # Errors
 ///
@@ -1182,6 +1360,7 @@ pub(crate) fn cohort_quic443_admit_over(
     root: &Path,
     box_id: &str,
     blocked: bool,
+    lane: bool,
     moves: &dyn CgroupMoves,
 ) -> Result<(), CohortPlaceError> {
     let home = sandbox::classifier::box_leaf(root, box_id, Verdict::Allow);
@@ -1190,7 +1369,7 @@ pub(crate) fn cohort_quic443_admit_over(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     cohort.learn_blocked_leaf(quic443_blocked_leaf(root));
-    cohort.admit(box_id, home, blocked, moves)
+    cohort.admit_with_lane(box_id, home, blocked, lane, moves)
 }
 
 /// A `host_ip` box leaves `cohort` ([`CohortQuic443::depart`]). A box
@@ -1227,6 +1406,8 @@ pub(crate) struct StandinMoves {
     /// The leaves the stand-in helper refuses to remove, as a transient
     /// failure of `sudo` or `nft` would.
     pub(crate) unremovable: std::sync::Mutex<std::collections::BTreeSet<PathBuf>>,
+    /// The leaves in the stand-in lane set (BEP-083).
+    pub(crate) lane: std::sync::Mutex<std::collections::BTreeSet<PathBuf>>,
 }
 
 #[cfg(test)]
@@ -1299,6 +1480,16 @@ impl CgroupMoves for StandinMoves {
         self.listed.lock().unwrap().remove(leaf);
         Ok(())
     }
+
+    fn add_lane_leaf(&self, leaf: &Path) -> std::io::Result<()> {
+        self.lane.lock().unwrap().insert(leaf.to_path_buf());
+        Ok(())
+    }
+
+    fn remove_lane_leaf(&self, leaf: &Path) -> std::io::Result<()> {
+        self.lane.lock().unwrap().remove(leaf);
+        Ok(())
+    }
 }
 
 /// The cgroup v2 delegation contract, the same three files the privileged
@@ -1361,6 +1552,43 @@ const REJECT_SET: [libc::c_int; 3] = [libc::EHOSTUNREACH, libc::EACCES, libc::EP
 /// soft error and `connect()` fails only at the first SYN retransmit
 /// (initial RTO, 1 s). Three seconds outlasts that retransmit with room.
 const PROBE_DEADLINE: Duration = Duration::from_secs(3);
+
+/// The transport one probe leg reaches its endpoint with. The reading at
+/// daemon start keeps the stream leg, a TCP connect, which pays the SYN
+/// retransmit described at [`PROBE_DEADLINE`] on a refusing table. The
+/// per-launch readings use the datagram leg, so a launch never waits that
+/// second: the filter's drop fails the leg's `send()` at once, with no
+/// retransmit to wait for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Leg {
+    /// A TCP connect to the endpoint's listener.
+    Stream,
+    /// One UDP datagram, sent on a connected socket to the endpoint's
+    /// bound socket.
+    Datagram,
+}
+
+impl Leg {
+    /// The leg's own spelling for the probe's log record.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Stream => "tcp",
+            Self::Datagram => "udp",
+        }
+    }
+}
+
+/// How long a datagram leg whose `send()` the filter refused waits for the
+/// rejection's ICMP error to land on its socket. The rejection is made in
+/// the same `send()`, so the error is there at once or never. When it is
+/// not there, the leg reports the `send()` errno itself (EPERM, a drop).
+const DATAGRAM_ERROR_WAIT_MS: libc::c_int = 50;
+
+/// How long a datagram leg whose `send()` went out waits for an ICMP error
+/// before it reads the datagram as admitted. Only a table that does not
+/// refuse, or a socket that is gone, gets here. A refusing table fails the
+/// `send()` itself, so the healthy per-launch reading never waits this.
+const DATAGRAM_SETTLE_MS: libc::c_int = 100;
 
 /// The migration file a child writes its own pid into: `cgroup.procs`, the
 /// file the kernel makes in every cgroup2 directory and the one a stand-in
@@ -1534,8 +1762,13 @@ impl Reading {
 /// child met. No capability beyond that: no `CAP_NET_ADMIN`, no root
 /// helper, and no byte written outside the leaf the probe names after
 /// itself and removes.
-pub(crate) fn probe_effect(root: &Path, endpoints: &[(Family, SocketAddr)]) -> Reading {
-    for (family, addr) in endpoints {
+///
+/// `leg` names the transport. A datagram endpoint is a socket the caller
+/// holds bound for the whole reading, so it cannot be gone the way a
+/// listener can, and no control connect runs for it.
+pub(crate) fn probe_effect(root: &Path, endpoints: &[(Family, SocketAddr)], leg: Leg) -> Reading {
+    let control = if leg == Leg::Stream { endpoints } else { &[] };
+    for (family, addr) in control {
         if let Err(cause) = TcpStream::connect(addr) {
             return Reading::Inconclusive {
                 because: format!(
@@ -1575,7 +1808,7 @@ pub(crate) fn probe_effect(root: &Path, endpoints: &[(Family, SocketAddr)]) -> R
     let made_procs = !procs.exists() && std::fs::write(&procs, b"").is_ok();
     let observations = endpoints
         .iter()
-        .map(|(family, addr)| probe_family(&procs, *family, addr))
+        .map(|(family, addr)| probe_family(&procs, *family, addr, leg))
         .collect::<Vec<_>>();
     // The throwaway leaf is owed its removal even when a leg read nothing.
     if made_procs {
@@ -1606,7 +1839,7 @@ fn probe_leaf(root: &Path) -> PathBuf {
 /// report, and returns what the child's connect met. The child is killed
 /// and reaped at the deadline if it has not reported — no probe child
 /// outlives the decision it was forked for.
-fn probe_family(procs: &Path, family: Family, addr: &SocketAddr) -> (Family, Observed) {
+fn probe_family(procs: &Path, family: Family, addr: &SocketAddr, leg: Leg) -> (Family, Observed) {
     // Everything the child needs is prepared before the fork, the only
     // place allocation still may run: after the fork the child touches
     // nothing but raw syscalls, the same pre-exec discipline a sandbox's
@@ -1624,7 +1857,8 @@ fn probe_family(procs: &Path, family: Family, addr: &SocketAddr) -> (Family, Obs
     }
     // SAFETY: `fork(2)` runs in this (possibly multithreaded) process, and
     // the child runs only async-signal-safe calls between the fork and its
-    // `_exit` — open, write, close, getpid, socket, connect — so no
+    // `_exit` — open, write, close, getpid, socket, connect, send, poll,
+    // getsockopt — so no
     // allocator or lock can be held across the fork by the child itself,
     // in kind with the pre-exec closure this probe models.
     let pid = unsafe { libc::fork() };
@@ -1641,7 +1875,7 @@ fn probe_family(procs: &Path, family: Family, addr: &SocketAddr) -> (Family, Obs
         // child's whole report channel, and `probe_child` never returns.
         unsafe {
             libc::close(fds[0]);
-            probe_child(c_procs.as_ptr(), family, port, fds[1]);
+            probe_child(c_procs.as_ptr(), family, port, leg, fds[1]);
         }
     }
     // SAFETY: the write end is the child's, closed here so the read below
@@ -1721,6 +1955,7 @@ unsafe fn probe_child(
     c_procs: *const libc::c_char,
     family: Family,
     port: u16,
+    leg: Leg,
     report: libc::c_int,
 ) -> ! {
     // SAFETY: `open(2)` reads `c_procs`; the flags are the append the
@@ -1752,8 +1987,12 @@ unsafe fn probe_child(
         Family::V4 => libc::AF_INET,
         Family::V6 => libc::AF_INET6,
     };
+    let kind = match leg {
+        Leg::Stream => libc::SOCK_STREAM,
+        Leg::Datagram => libc::SOCK_DGRAM,
+    };
     // SAFETY: `socket(2)` makes the one descriptor this child connects with.
-    let socket = unsafe { libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    let socket = unsafe { libc::socket(domain, kind | libc::SOCK_CLOEXEC, 0) };
     if socket == -1 {
         let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(1);
         tell(report, 0, errno);
@@ -1806,17 +2045,73 @@ unsafe fn probe_child(
             }
         }
     };
+    let errno = if connected == 0 {
+        match leg {
+            Leg::Stream => 0,
+            Leg::Datagram => datagram_outcome(socket),
+        }
+    } else {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(1)
+    };
     // SAFETY: the one descriptor this child made, done with either way.
     unsafe { libc::close(socket) };
-    if connected == 0 {
-        tell(report, 0, 0);
-        // SAFETY: the child ends here.
-        unsafe { libc::_exit(0) };
-    }
-    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(1);
     tell(report, 0, errno);
     // SAFETY: the child ends here.
     unsafe { libc::_exit(0) };
+}
+
+/// The datagram leg's outcome on its connected UDP socket, raw syscalls
+/// only, as [`probe_child`] needs: 0 when the datagram went out and no
+/// error came back, else the errno that reads as what met it. A refusing
+/// table fails the `send()` itself (its drop reads as EPERM) and answers
+/// with an ICMP error, which the socket holds as its pending error:
+/// EHOSTUNREACH over IPv4 and EACCES over IPv6, the stream leg's own
+/// errnos. The pending error wins when it lands, so both legs report one
+/// errno for one refusal. A datagram that went out waits
+/// [`DATAGRAM_SETTLE_MS`] for an error, so a socket that is gone reads as
+/// ECONNREFUSED, as a stream leg to a dead listener does.
+fn datagram_outcome(socket: libc::c_int) -> libc::c_int {
+    let byte = [0u8; 1];
+    // SAFETY: `send(2)` reads the one byte above on the descriptor this
+    // child owns; MSG_NOSIGNAL keeps a failure from raising a signal.
+    let sent = unsafe { libc::send(socket, byte.as_ptr().cast(), 1, libc::MSG_NOSIGNAL) };
+    let send_errno = if sent < 0 {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(1)
+    } else {
+        0
+    };
+    let wait = if send_errno == 0 {
+        DATAGRAM_SETTLE_MS
+    } else {
+        DATAGRAM_ERROR_WAIT_MS
+    };
+    // `poll(2)` always reports POLLERR, so no event is asked for: the wait
+    // ends at the first pending error or at the bound.
+    let mut pfd = libc::pollfd {
+        fd: socket,
+        events: 0,
+        revents: 0,
+    };
+    // SAFETY: `poll(2)` writes into `pfd` and reads the child's own socket.
+    unsafe { libc::poll(&mut pfd, 1, wait) };
+    let mut pending: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `getsockopt(2)` writes one int and its length into the two
+    // locals above, which outlive the call.
+    let read = unsafe {
+        libc::getsockopt(
+            socket,
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            (&raw mut pending).cast(),
+            &raw mut len,
+        )
+    };
+    if read == 0 && pending != 0 {
+        pending
+    } else {
+        send_errno
+    }
 }
 
 /// Writes this process's own pid, decimal and newline-terminated, to `fd`
@@ -1890,6 +2185,41 @@ fn bind_probe_listener(family: Family) -> std::io::Result<TcpListener> {
     ))
 }
 
+/// Binds one family's datagram endpoint on an ephemeral loopback port, the
+/// datagram leg's twin of [`bind_probe_listener`], with the same retry off
+/// the answerer's port: the carve-out admits UDP to that port.
+fn bind_datagram_endpoint(family: Family) -> std::io::Result<UdpSocket> {
+    for _ in 0..4 {
+        let socket = UdpSocket::bind(SocketAddr::new(family.loopback(), 0))?;
+        if socket.local_addr()?.port() != crate::net::answerer::ANSWERER_PORT {
+            return Ok(socket);
+        }
+    }
+    Err(std::io::Error::other(
+        "the probe's port choice collided with the answerer's",
+    ))
+}
+
+/// The datagram leg's endpoints, one per family this host's loopback can
+/// carry, with the same tolerance for a host without IPv6 loopback as
+/// [`bind_probe_listeners`].
+fn bind_datagram_endpoints() -> std::io::Result<Vec<(Family, UdpSocket)>> {
+    let mut sockets = Vec::new();
+    for family in [Family::V4, Family::V6] {
+        match bind_datagram_endpoint(family) {
+            Ok(socket) => sockets.push((family, socket)),
+            Err(cause)
+                if family == Family::V6
+                    && matches!(
+                        cause.raw_os_error(),
+                        Some(libc::EAFNOSUPPORT) | Some(libc::EADDRNOTAVAIL)
+                    ) => {}
+            Err(cause) => return Err(cause),
+        }
+    }
+    Ok(sockets)
+}
+
 /// The probe's listeners, one per family this host's loopback can carry.
 fn bind_probe_listeners() -> std::io::Result<Vec<(Family, TcpListener)>> {
     let mut listeners = Vec::new();
@@ -1928,7 +2258,7 @@ pub const GUEST_BASH: &str = "/bin/bash";
 /// The name of the table both lanes load, and the chain a deny-all box's
 /// verdict rides on: `nft list` must show both behind the marker for a
 /// guest's decision to rest on more than the marker's existence.
-const TABLE_NAME: &str = "minimal_class";
+pub(crate) const TABLE_NAME: &str = "minimal_class";
 const DENY_OUT_CHAIN: &str = "chain deny_out";
 
 /// The ct-mark bits the guest's own boot classifies with: the step's default,
@@ -1964,6 +2294,10 @@ pub struct GuestRender<'a> {
     pub node_plane_address: IpAddr,
     /// The ct-mark bits the table classifies with.
     pub ct_mark_mask: u32,
+    /// The Box Egress Proxy's listener (BEP-083). The table refuses a new
+    /// TCP connection from the boxes subtree to its address, at its port or
+    /// at 443, unless the socket's own leaf is in [`PROXY_LANE_SET`].
+    pub proxy_listener: std::net::SocketAddrV4,
     /// A stand-in mount table, tests only.
     pub mountinfo_override: Option<&'a Path>,
 }
@@ -2129,6 +2463,16 @@ pub fn render_guest_ruleset_over(
         .arg(params.node_plane_address.to_string())
         .arg("--ct-mark-mask")
         .arg(format!("0x{:08x}", params.ct_mark_mask))
+        // The guest's one address carries both the boxes cohort and the
+        // daemon's own traffic, so the VM host's gate reads the sender's
+        // cgroup from this DSCP mark instead of from the source address.
+        .arg("--cohort-dscp")
+        .arg(boxes::core::egress::BOX_COHORT_DSCP.to_string())
+        // BEP-083: only a box whose own leaf is in the lane set can open a
+        // connection to the proxy's address, so a host-address box with no
+        // credentialed upstream is refused there inside the VM.
+        .arg("--proxy-lane")
+        .arg(params.proxy_listener.to_string())
         .env_clear()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2466,6 +2810,12 @@ pub(crate) fn guest_table_listed(nft: &Path) -> Listing {
 static HELD_PROBE_ENDPOINTS: std::sync::Mutex<Vec<(Family, SocketAddr)>> =
     std::sync::Mutex::new(Vec::new());
 
+/// The datagram endpoints the guest's per-launch readings send to, held
+/// for the daemon's life beside the listeners above and drained the same
+/// way, so a datagram leg is never sent to a port bound for one reading.
+static HELD_DATAGRAM_ENDPOINTS: std::sync::Mutex<Vec<(Family, SocketAddr)>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// Binds and holds the probe's listeners, one thread per family this host's
 /// loopback can carry: the endpoints it returns are the ones the guest's
 /// readings connect to, for as long as this daemon runs. Native readings
@@ -2475,6 +2825,13 @@ static HELD_PROBE_ENDPOINTS: std::sync::Mutex<Vec<(Family, SocketAddr)>> =
 /// a port the box never saw refused.
 pub fn hold_probe_listeners() -> std::io::Result<Vec<(Family, SocketAddr)>> {
     let listeners = bind_probe_listeners()?;
+    // Every endpoint binds before any drain thread runs, so a failed
+    // datagram bind returns with no TCP listener served and none published.
+    let sockets = bind_datagram_endpoints()?;
+    let datagram_endpoints: Vec<(Family, SocketAddr)> = sockets
+        .iter()
+        .filter_map(|(family, socket)| socket.local_addr().ok().map(|addr| (*family, addr)))
+        .collect();
     let endpoints: Vec<(Family, SocketAddr)> = listeners
         .iter()
         .filter_map(|(family, listener)| listener.local_addr().ok().map(|addr| (*family, addr)))
@@ -2494,9 +2851,26 @@ pub fn hold_probe_listeners() -> std::io::Result<Vec<(Family, SocketAddr)>> {
             ))
         })?;
     }
+    for (family, socket) in sockets {
+        let draining = std::thread::Builder::new()
+            .name(format!("minimald-classifier-probe-udp-{}", family.name()))
+            .spawn(move || {
+                let mut datagram = [0u8; 16];
+                while socket.recv(&mut datagram).is_ok() {}
+            });
+        draining.map_err(|cause| {
+            std::io::Error::other(format!(
+                "holding the probe's {} datagram endpoint: {cause}",
+                family.name()
+            ))
+        })?;
+    }
     *HELD_PROBE_ENDPOINTS
         .lock()
         .expect("the probe's listeners are only held by this daemon") = endpoints.clone();
+    *HELD_DATAGRAM_ENDPOINTS
+        .lock()
+        .expect("the probe's datagram endpoints are only held by this daemon") = datagram_endpoints;
     Ok(endpoints)
 }
 
@@ -2507,6 +2881,10 @@ pub(crate) fn clear_probe_listeners() {
     HELD_PROBE_ENDPOINTS
         .lock()
         .expect("the probe's listeners are only held by this daemon")
+        .clear();
+    HELD_DATAGRAM_ENDPOINTS
+        .lock()
+        .expect("the probe's datagram endpoints are only held by this daemon")
         .clear();
 }
 
@@ -2566,14 +2944,26 @@ pub fn boot_guest_classifier(
     let _ = load();
 }
 
-/// Reads the table's effect over the listeners this daemon holds: the
-/// guest's own reading, whose listener is its boot's, not one bound and
-/// dropped per probe — so the probe's evidence is about the table, never
-/// about whether a listener happened to be there.
+/// Reads the table's effect over the datagram endpoints this daemon holds:
+/// the guest's per-launch reading, with the datagram leg so a launch never
+/// waits a SYN retransmit, over endpoints its boot bound, not ones bound
+/// and dropped per probe — so the probe's evidence is about the table,
+/// never about whether an endpoint happened to be there.
 pub(crate) fn read_held_filter(root: &Path) -> Reading {
-    let endpoints = HELD_PROBE_ENDPOINTS
+    read_held_filter_with(root, Leg::Datagram)
+}
+
+/// [`read_held_filter`] with the leg named: the stream leg reads the held
+/// listeners (the daemon-start reading), the datagram leg the held
+/// datagram endpoints.
+fn read_held_filter_with(root: &Path, leg: Leg) -> Reading {
+    let held = match leg {
+        Leg::Stream => &HELD_PROBE_ENDPOINTS,
+        Leg::Datagram => &HELD_DATAGRAM_ENDPOINTS,
+    };
+    let endpoints = held
         .lock()
-        .expect("the probe's listeners are only held by this daemon")
+        .expect("the probe's endpoints are only held by this daemon")
         .clone();
     if endpoints.is_empty() {
         tracing::warn!(
@@ -2583,49 +2973,76 @@ pub(crate) fn read_held_filter(root: &Path) -> Reading {
             because: "the daemon holds no loopback listener for its effect probe".to_string(),
         };
     }
-    read_over(root, &endpoints, true)
+    read_over(root, &endpoints, true, leg)
 }
 
 /// Reads the table's effect on this host (NET-079, design §7.4): the probe,
-/// with its own listener — a destination the daemon holds on loopback, on
+/// with its own endpoint — a destination the daemon holds on loopback, on
 /// a port other than the answerer's, is the place a deny-all box's
 /// connections would be refused. The probe connects and waits, so an async
 /// caller runs it on the blocking pool; it logs one record per run, naming
-/// every family it read and what the leg there met, the errno included.
+/// the leg's transport, every family it read and what the leg there met,
+/// the errno included, and how long the reading took.
 ///
-/// The healthy refusal is the quiet case — a launch's own record already
-/// names its enforcement — while anything else is the state a person
-/// reading the log has to see: a control leg that did not connect, or a
-/// family that connected, timed out or failed with an errno outside the
-/// reject set, is the launch's own line to carry. The two lanes carry it
-/// at their own levels: a guest's reading is its boot's own product, and a
-/// launch that reads anything but a refusal is the one line a bundle
-/// carries of why that guest refuses every deny-all host-address box, so
-/// it is a warn there — while the native lane is T48's (#1805) and keeps
-/// the level it chose, an info a person reading a host they installed
-/// sees without being alarmed by the launch's own record beside it.
-fn read_over(root: &Path, endpoints: &[(Family, SocketAddr)], guest: bool) -> Reading {
-    let reading = probe_effect(root, endpoints);
+/// Every reading logs its line, the healthy refusal at info, so each
+/// launch's probe and its duration are in the log. Anything else is the
+/// state a person reading the log has to see: a control leg that did not
+/// connect, or a family that connected, timed out or failed with an errno
+/// outside the reject set. The two lanes carry it at their own levels: a
+/// guest's reading is its boot's own product, and a launch that reads
+/// anything but a refusal is the one line a bundle carries of why that
+/// guest refuses every deny-all host-address box, so it is a warn there —
+/// while the native lane is T48's (#1805) and keeps the level it chose, an
+/// info a person reading a host they installed sees without being alarmed
+/// by the launch's own record beside it.
+fn read_over(root: &Path, endpoints: &[(Family, SocketAddr)], guest: bool, leg: Leg) -> Reading {
+    let began = std::time::Instant::now();
+    let reading = probe_effect(root, endpoints, leg);
+    let elapsed_ms = began.elapsed().as_millis() as u64;
+    let leg = leg.name();
     if matches!(reading, Reading::Refused(_)) {
-        tracing::debug!(probe = %reading.record(), "the classifier table refused the probe's connection out of a deny leaf");
+        tracing::info!(probe = %reading.record(), leg, elapsed_ms, "the classifier table refused the probe's connection out of a deny leaf");
     } else if guest {
-        tracing::warn!(probe = %reading.record(), "read the classifier table's effect on this host");
+        tracing::warn!(probe = %reading.record(), leg, elapsed_ms, "read the classifier table's effect on this host");
     } else {
-        tracing::info!(probe = %reading.record(), "read the classifier table's effect on this host");
+        tracing::info!(probe = %reading.record(), leg, elapsed_ms, "read the classifier table's effect on this host");
     }
     reading
 }
 
-/// Reads the table's effect with a listener of its own, held for the
-/// probe's whole duration — the native reading, whose host binds and drops
-/// per probe; a listener nothing holds is the dead-listener case the
-/// control leg exists to catch.
+/// Reads the table's effect with datagram endpoints of its own, held for
+/// the probe's whole duration — the native per-launch reading, whose host
+/// binds and drops per probe.
 ///
 /// The one probe surface outside the crate: the native lane's root harness
 /// proves the *loaded* table's effect with the daemon's own probe, over a
 /// scratch tree the installer laid out — the only artifact that can
 /// produce the reading. No other caller reads a reading directly.
+///
+/// It is the per-launch reading, so it reads with the datagram leg: a
+/// launch never waits the SYN retransmit a refused TCP connect pays. The
+/// daemon-start reading keeps the TCP leg ([`decide_now`]).
 pub fn read_filter(root: &Path) -> Reading {
+    let sockets = match bind_datagram_endpoints() {
+        Ok(sockets) => sockets,
+        Err(cause) => {
+            return Reading::Inconclusive {
+                because: format!("binding the probe's loopback datagram endpoint: {cause}"),
+            };
+        }
+    };
+    let endpoints: Vec<_> = sockets
+        .iter()
+        .filter_map(|(family, socket)| socket.local_addr().ok().map(|addr| (*family, addr)))
+        .collect();
+    // The sockets stay bound until the reading is done: a datagram to a
+    // port nobody holds reads as ECONNREFUSED, never as the table.
+    read_over(root, &endpoints, false, Leg::Datagram)
+}
+
+/// The daemon-start reading: [`read_filter`]'s stream twin, with a TCP
+/// listener of its own held for the probe's duration.
+fn read_filter_at_start(root: &Path) -> Reading {
     let listeners = match bind_probe_listeners() {
         Ok(listeners) => listeners,
         Err(cause) => {
@@ -2638,7 +3055,7 @@ pub fn read_filter(root: &Path) -> Reading {
         .iter()
         .filter_map(|(family, listener)| listener.local_addr().ok().map(|addr| (*family, addr)))
         .collect();
-    read_over(root, &endpoints, false)
+    read_over(root, &endpoints, false, Leg::Stream)
 }
 
 /// The check (NET-079, design §7.4): whether this host can decide a
@@ -2772,9 +3189,9 @@ pub(crate) fn decide_over(
 pub fn decide_now(root: &Path, mountinfo: Option<&str>, guest: bool) -> Decision {
     decide(root, mountinfo, guest, || {
         if guest {
-            read_held_filter(root)
+            read_held_filter_with(root, Leg::Stream)
         } else {
-            read_filter(root)
+            read_filter_at_start(root)
         }
     })
 }
@@ -3424,8 +3841,19 @@ fn guest_params<'a>(
         cohort_address: cohort,
         node_plane_address: node_plane,
         ct_mark_mask: GUEST_CT_MARK_MASK,
+        proxy_listener: guest_proxy_listener(),
         mountinfo_override: mountinfo,
     }
+}
+
+/// The proxy's listener a guest's own boot renders its table with: the
+/// proxy's address on the default subnet, at the listener port (BEP-083).
+#[cfg(test)]
+fn guest_proxy_listener() -> std::net::SocketAddrV4 {
+    std::net::SocketAddrV4::new(
+        crate::net::SwitchSubnet::default().box_egress_proxy_address(),
+        boxes::core::egress::PROXY_LISTENER_PORT,
+    )
 }
 
 /// The guest's rendered table for one pair of source identities, as its own
@@ -3455,7 +3883,7 @@ pub(crate) fn guest_ruleset(cohort: IpAddr, node_plane: IpAddr) -> Vec<u8> {
 /// every other call exits 0, so the marker's discipline is read against a
 /// packet filter that says no when the test wants it to.
 #[cfg(test)]
-fn recording_nft(dir: &Path, refuse_on: &[&str]) -> PathBuf {
+pub(crate) fn recording_nft(dir: &Path, refuse_on: &[&str]) -> PathBuf {
     let nft = dir.join("nft");
     let dir = dir.display();
     let refusals = if refuse_on.is_empty() {
@@ -3498,7 +3926,7 @@ fn recording_nft(dir: &Path, refuse_on: &[&str]) -> PathBuf {
 /// each one's argv and exactly the bytes it was piped on stdin — the bytes
 /// the digest of a load covers, read back off the stub that received them.
 #[cfg(test)]
-fn nft_calls(dir: &Path) -> Vec<(Vec<String>, Vec<u8>)> {
+pub(crate) fn nft_calls(dir: &Path) -> Vec<(Vec<String>, Vec<u8>)> {
     let mut calls = Vec::new();
     for n in 0.. {
         let argv = std::fs::read_to_string(dir.join(format!("call{n}.argv")))
@@ -4078,7 +4506,8 @@ mod tests {
             "a denied range is one unenforceable rule, named with its entry"
         );
 
-        // Every entry is a rule, and every present `allow_*` list is one,
+        // Every entry is a rule, and every present `allow_*` list is one
+        // (an empty destination list beside a non-empty one is not),
         // denied ranges first and the lists in the declaration's own field
         // order — the same order a person typed them in.
         let narrowing = boxes::EgressPolicy {
@@ -4273,6 +4702,84 @@ mod tests {
         assert!(
             words.chars().count() < 300,
             "a one-rule refusal stays a sentence, not a wall: {words}"
+        );
+    }
+
+    /// NET-079: the launch reads the section the in-force default resolved,
+    /// which fills in the destination list a box left absent as present and
+    /// empty, while the create reads the section as declared. Both name the
+    /// same rules, and only the flags the box was started with: a box
+    /// started with `--allow-subnets` alone is never refused naming
+    /// `allow_dns_hosts`, and one started with `--allow-dns-hosts` alone is
+    /// never refused naming `allow_subnets`.
+    #[test]
+    fn launch_refusal_names_only_declared_rules() {
+        let resolve = |declared: &boxes::EgressPolicy| match boxes::effective_egress(
+            Some(declared),
+            boxes::NetworkMode::HostNet,
+            boxes::EgressDefaultPhase::InForce,
+            false,
+        ) {
+            boxes::EffectiveEgress::Declared(section) => section,
+            other => panic!("a declared section resolves as declared, got {other:?}"),
+        };
+
+        let subnets_only = boxes::EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            ..Default::default()
+        };
+        let resolved = resolve(&subnets_only);
+        assert_eq!(
+            resolved.allow_dns_hosts,
+            Some(Vec::new()),
+            "the in-force default fills the absent name list in as empty"
+        );
+        assert_eq!(
+            unenforceable_rules(Some(&resolved)),
+            vec![UnenforceableRule::AllowSubnets],
+            "the launch names the one flag the box was started with"
+        );
+        assert_eq!(
+            unenforceable_rules(Some(&resolved)),
+            unenforceable_rules(Some(&subnets_only)),
+            "the launch and the create name the same rules"
+        );
+        let words = unenforceable_declaration_words(&unenforceable_rules(Some(&resolved)));
+        assert!(
+            words.contains("allow_subnets") && !words.contains("allow_dns_hosts"),
+            "the refusal names only the rule the box declared: {words}"
+        );
+
+        let names_only = boxes::EgressPolicy {
+            allow_dns_hosts: Some(vec!["example.com".to_string()]),
+            ..Default::default()
+        };
+        let resolved = resolve(&names_only);
+        assert_eq!(
+            unenforceable_rules(Some(&resolved)),
+            vec![UnenforceableRule::AllowDnsHosts],
+            "the launch names the one flag the box was started with"
+        );
+        assert_eq!(
+            unenforceable_rules(Some(&resolved)),
+            unenforceable_rules(Some(&names_only)),
+            "the launch and the create name the same rules"
+        );
+
+        // A denied range beside an allow list is still named in full, and
+        // the filled-in empty list still names nothing.
+        let subnets_and_denies = boxes::EgressPolicy {
+            allow_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+            deny_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            unenforceable_rules(Some(&resolve(&subnets_and_denies))),
+            vec![
+                UnenforceableRule::DenySubnets("10.0.0.0/8".to_string()),
+                UnenforceableRule::AllowSubnets,
+            ],
+            "every declared rule is named, and no filled-in one"
         );
     }
 
@@ -5302,12 +5809,18 @@ mod tests {
         // own parameters — a VM-backed guest's carve-out is the gateway's
         // resolver.
         let print_mount = standin_mount();
+        let dscp = boxes::core::egress::BOX_COHORT_DSCP.to_string();
+        let lane = guest_proxy_listener().to_string();
         let printed = run_step(
             &print_mount,
             &[
                 "--print-ruleset",
                 GUEST_RESOLVER_FLAGS[0],
                 GUEST_RESOLVER_FLAGS[1],
+                "--cohort-dscp",
+                &dscp,
+                "--proxy-lane",
+                &lane,
             ],
             None,
         );
@@ -5338,7 +5851,22 @@ mod tests {
         // posture lifts is the only privilege it does — so this lane
         // asserts the one text on root lanes too, not only where a
         // person's account happens to be the one that ran sudo.
-        let installed = run_install_with(&mount, &GUEST_RESOLVER_FLAGS, stub.path());
+        // The guest's render names the box mark, so the install is handed
+        // the same flag and renders the same one text.
+        let installed = run_install_with(
+            &mount,
+            &[
+                GUEST_RESOLVER_FLAGS[0],
+                GUEST_RESOLVER_FLAGS[1],
+                GUEST_RESOLVER_FLAGS[2],
+                GUEST_RESOLVER_FLAGS[3],
+                "--cohort-dscp",
+                &dscp,
+                "--proxy-lane",
+                &lane,
+            ],
+            stub.path(),
+        );
         assert!(
             installed.status.success(),
             "the install lays out its tree and hands its one transaction to nft: {}{}",
@@ -5856,7 +6384,7 @@ mod tests {
             .expect("a loopback listener to point the probe at");
         let addr = listener.local_addr().expect("the dead listener's address");
         drop(listener);
-        match probe_effect(tree.path(), &[(Family::V4, addr)]) {
+        match probe_effect(tree.path(), &[(Family::V4, addr)], Leg::Stream) {
             Reading::Inconclusive { because } => assert!(
                 because.contains("the daemon's own connect"),
                 "the reading names the control leg that failed: {because}"
@@ -6012,6 +6540,201 @@ mod tests {
         );
     }
 
+    /// The guest's table writes the sender's cgroup into every packet it
+    /// sends: the boxes cohort's connections leave with the box mark, and
+    /// every other packet with the field cleared, so the VM host's gate
+    /// can tell a box's frame from the daemon's own at the one address
+    /// both leave from. A native install, which takes no `--cohort-dscp`,
+    /// renders no such chain and leaves the field alone.
+    #[test]
+    fn guest_table_marks_the_box_cohort_in_dscp() {
+        let guest_ip = IpAddr::V4(crate::net::SwitchSubnet::default().daemon_ip());
+        let ruleset = String::from_utf8(guest_ruleset(guest_ip, guest_ip))
+            .expect("the guest's render is text");
+        let dscp = boxes::core::egress::BOX_COHORT_DSCP;
+        let marks = chain_rules(&ruleset, "mark_cohort");
+        assert_eq!(marks.len(), 2, "the chain holds two rules: {marks:?}");
+        assert!(
+            ruleset.contains(
+                "chain mark_cohort {\n        type filter hook postrouting priority mangle;"
+            ),
+            "the mark is a postrouting filter chain, which sees every packet:\n{ruleset}"
+        );
+        assert!(
+            marks[0].ends_with(&format!("ip dscp set {dscp}")) && marks[0].contains("=="),
+            "the cohort's connections take the box mark: {marks:?}"
+        );
+        assert!(
+            marks[1].ends_with("ip dscp set 0") && marks[1].contains("!="),
+            "every other packet leaves with the field cleared: {marks:?}"
+        );
+
+        let mount = standin_mount();
+        let native = run_step(&mount, &["--print-ruleset"], None);
+        assert!(
+            !String::from_utf8_lossy(&native.stdout).contains("mark_cohort"),
+            "a native install renders no DSCP chain"
+        );
+    }
+
+    /// BEP-083: the guest's table refuses a new TCP connection from the
+    /// boxes subtree to the proxy's address, at the listener port or at
+    /// 443, unless the socket was created in a box leaf of the lane set.
+    /// The refusal is the deny chain's: the same named counter, log prefix
+    /// and reject. A native install, which takes no `--proxy-lane`, renders
+    /// none of it. The helper's `lane-add` and `lane-remove` change one
+    /// element of the lane set, under the same check as `add`.
+    #[test]
+    fn guest_render_refuses_the_proxy_address_outside_the_lane_set() {
+        let guest_ip = IpAddr::V4(crate::net::SwitchSubnet::default().daemon_ip());
+        let ruleset = String::from_utf8(guest_ruleset(guest_ip, guest_ip))
+            .expect("the guest's render is text");
+        let listener = guest_proxy_listener();
+        let slice = Path::new(sandbox::classifier::TREE_ROOT)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("the tree root is a named slice");
+        let boxes_rel = format!("{slice}/{}", sandbox::classifier::BOXES_DIR);
+        let leaf_rel = format!("{boxes_rel}/{}/grant", sandbox::config::ALLOW_DIR);
+        let level = leaf_rel.split('/').count();
+
+        let lines: Vec<&str> = ruleset.lines().map(str::trim).collect();
+        let set = format!("set {PROXY_LANE_SET} {{");
+        let at_set = lines
+            .iter()
+            .position(|line| *line == set)
+            .unwrap_or_else(|| panic!("the guest's table declares the lane set: {ruleset}"));
+        assert_eq!(
+            lines.get(at_set + 1..at_set + 3),
+            Some(
+                &[
+                    format!("typeof socket cgroupv2 level {level}").as_str(),
+                    "}"
+                ][..]
+            ),
+            "the lane set holds box leaves and is declared empty: {ruleset}"
+        );
+
+        let output = chain_rules(&ruleset, "output");
+        let gate = format!(
+            "ct state new ip daddr {} tcp dport {{ {}, 443 }} socket cgroupv2 level {} \
+             \"{boxes_rel}\" jump proxy_lane",
+            listener.ip(),
+            listener.port(),
+            boxes_rel.split('/').count(),
+        );
+        assert_eq!(
+            output.last(),
+            Some(&gate.as_str()),
+            "the output chain sends the boxes subtree's new connections to the \
+             proxy's address at its port and at 443 to the lane chain: {output:?}"
+        );
+        let deny = chain_rules(&ruleset, "deny_out");
+        let lane = chain_rules(&ruleset, "proxy_lane");
+        assert_eq!(
+            lane.first(),
+            Some(&format!("socket cgroupv2 level {level} @{PROXY_LANE_SET} return").as_str()),
+            "a socket created in a leaf of the lane set goes on: {lane:?}"
+        );
+        assert_eq!(
+            lane[1..],
+            deny[deny.len() - 3..],
+            "every other socket meets the deny chain's counter, log and reject"
+        );
+        assert!(
+            lane.last()
+                .is_some_and(|rule| *rule == "reject with icmpx admin-prohibited"),
+            "the refusal is active, so a connect fails at once: {lane:?}"
+        );
+
+        let mount = standin_mount();
+        let native = run_step(&mount, &["--print-ruleset"], None);
+        let native = String::from_utf8_lossy(&native.stdout);
+        assert!(
+            !native.contains(PROXY_LANE_SET) && !native.contains("proxy_lane"),
+            "a native install renders no proxy lane: {native}"
+        );
+
+        // The helper's lane verbs change one element of the lane set.
+        let stub = tempfile::tempdir().expect("a dir for the recording nft");
+        recording_nft(stub.path(), &[]);
+        let scratch = tempfile::tempdir().expect("a dir for the helper");
+        let helper = scratch.path().join("lib/quic443-leaf");
+        let sudoers = scratch.path().join("sudoers.d/minimal-quic443-leaf");
+        let (uid, gid) = delegated_owner();
+        let installed = step_command(&mount, &GUEST_RESOLVER_FLAGS, Some(stub.path()))
+            .env("SUDO_UID", uid.to_string())
+            .env("SUDO_GID", gid.to_string())
+            .env("MINIMAL_OVERRIDE_QUIC443_HELPER", &helper)
+            .env("MINIMAL_OVERRIDE_QUIC443_SUDOERS", &sudoers)
+            .output()
+            .expect("running the install");
+        assert!(
+            installed.status.success(),
+            "the install succeeds: {}{}",
+            String::from_utf8_lossy(&installed.stdout),
+            String::from_utf8_lossy(&installed.stderr),
+        );
+        let calls_before = nft_calls(stub.path()).len();
+        let home = sandbox::classifier::create_box_leaf(&mount.root, "grant", Verdict::Allow)
+            .expect("the box's own leaf");
+        let run = |verb: &str, leaf: &Path| {
+            std::process::Command::new(&helper)
+                .arg(verb)
+                .arg(leaf)
+                .output()
+                .expect("running the helper")
+        };
+        for verb in ["lane-add", "lane-remove"] {
+            let ran = run(verb, &home);
+            assert!(
+                ran.status.success(),
+                "the helper runs {verb} for {}: {}",
+                home.display(),
+                String::from_utf8_lossy(&ran.stderr)
+            );
+        }
+        let deny_leaf = sandbox::classifier::create_box_leaf(&mount.root, "sealed", Verdict::Deny)
+            .expect("a deny box's leaf");
+        for leaf in [deny_leaf, quic443_blocked_leaf(&mount.root)] {
+            let ran = run("lane-add", &leaf);
+            assert_eq!(
+                ran.status.code(),
+                Some(2),
+                "the helper refuses {}: {}",
+                leaf.display(),
+                String::from_utf8_lossy(&ran.stderr)
+            );
+        }
+        let element = format!("{{ \"{leaf_rel}\" }}");
+        let changes: Vec<Vec<String>> = nft_calls(stub.path())[calls_before..]
+            .iter()
+            .map(|(argv, _)| argv.clone())
+            .collect();
+        assert_eq!(
+            changes,
+            [
+                vec![
+                    "add",
+                    "element",
+                    "inet",
+                    "minimal_class",
+                    PROXY_LANE_SET,
+                    &element
+                ],
+                vec![
+                    "delete",
+                    "element",
+                    "inet",
+                    "minimal_class",
+                    PROXY_LANE_SET,
+                    &element
+                ],
+            ],
+            "the lane verbs change one element of the lane set, and nothing else"
+        );
+    }
+
     /// NET-079: the guest loads the installer's own render, not a second
     /// spelling of it kept in step. The daemon compiles the installer in
     /// from the one file — `include_str!`, never a copy staged anywhere a
@@ -6044,6 +6767,10 @@ mod tests {
                 "the harness pair the step's own tests render",
             ),
         ] {
+            // The guest's render also names the box mark, which a native
+            // install never takes, so the step is handed the same flag.
+            let dscp = boxes::core::egress::BOX_COHORT_DSCP.to_string();
+            let lane = guest_proxy_listener().to_string();
             let step = step_command_over(
                 &mount,
                 &[
@@ -6052,6 +6779,10 @@ mod tests {
                     GUEST_RESOLVER_FLAGS[1],
                     GUEST_RESOLVER_FLAGS[2],
                     GUEST_RESOLVER_FLAGS[3],
+                    "--cohort-dscp",
+                    &dscp,
+                    "--proxy-lane",
+                    &lane,
                 ],
                 None,
                 &cohort.to_string(),
@@ -6126,6 +6857,10 @@ mod tests {
                 guest_ip.to_string(),
                 "--ct-mark-mask".to_string(),
                 format!("0x{:08x}", GUEST_CT_MARK_MASK),
+                "--cohort-dscp".to_string(),
+                boxes::core::egress::BOX_COHORT_DSCP.to_string(),
+                "--proxy-lane".to_string(),
+                guest_proxy_listener().to_string(),
             ],
             "every parameter arrives as argv after --print-ruleset, none \
              interpolated into the script the daemon pipes"
@@ -6345,10 +7080,15 @@ mod tests {
             !ruleset.contains(&format!("ip daddr {gateway}")),
             "the gateway's resolver is no longer admitted:\n{ruleset}"
         );
-        assert!(
-            !ruleset.contains("tcp dport"),
-            "no TCP destination is admitted or steered:\n{ruleset}"
-        );
+        // The proxy lane's rule names TCP ports too, but it only refuses
+        // (BEP-083), so the deny and dstnat chains are the ones to read.
+        for chain in ["deny_out", "dstnat"] {
+            let rules = chain_rules(&ruleset, chain);
+            assert!(
+                rules.iter().all(|rule| !rule.contains("tcp dport")),
+                "no TCP destination is admitted or steered in {chain}: {rules:?}"
+            );
+        }
         for chain in ["output", "classify", "postrouting"] {
             let rules = chain_rules(&ruleset, chain);
             assert!(
@@ -6392,7 +7132,6 @@ mod tests {
                 Some(&allow_list),
             ),
             Some(vec![
-                UnenforceableRule::AllowSubnets,
                 UnenforceableRule::AllowDnsHosts,
                 UnenforceableRule::AllowProtocols,
             ]),
@@ -7462,7 +8201,7 @@ mod tests {
             drop(listener);
             addr
         };
-        match probe_effect(root, &[(Family::V4, stale)]) {
+        match probe_effect(root, &[(Family::V4, stale)], Leg::Stream) {
             Reading::Inconclusive { because } => assert!(
                 because.contains("the daemon's own connect"),
                 "the control leg is the failure the reading names: {because}"
@@ -7587,7 +8326,7 @@ mod tests {
             .expect("the box's own leaf");
         moves.spawn_in(10, &home);
         moves.fork(10, 11);
-        cohort_quic443_admit_over(&cohort, &mount.root, "grant", true, &moves)
+        cohort_quic443_admit_over(&cohort, &mount.root, "grant", true, false, &moves)
             .expect("the grant box is placed");
         let guard = cohort.lock().unwrap();
         assert!(guard.blocked());
@@ -7601,7 +8340,7 @@ mod tests {
         let deny = sandbox::classifier::create_box_leaf(&mount.root, "sealed", Verdict::Deny)
             .expect("the deny box's own leaf");
         moves.spawn_in(20, &deny);
-        cohort_quic443_admit_over(&cohort, &mount.root, "sealed", false, &moves)
+        cohort_quic443_admit_over(&cohort, &mount.root, "sealed", false, false, &moves)
             .expect("the deny box needs no move");
         assert_eq!(moves.where_is(20), deny);
     }
@@ -8067,5 +8806,690 @@ mod tests {
         moves.spawn_in(60, &blocked);
         cohort.adopt_injected("plain", 60, &moves);
         assert_eq!(moves.where_is(60), homes[0]);
+    }
+
+    /// What the stand-in host tools print for the install's conflict scan.
+    struct HostTools<'a> {
+        /// `nft list ruleset`.
+        ruleset: &'a str,
+        /// `nft -a --debug=netlink list ruleset`; `ruleset` when `None`.
+        annotated: Option<&'a str>,
+        /// `iptables-save`, and `ip6tables-save` (empty for none).
+        v4: &'a str,
+        v6: &'a str,
+        /// Whether the two save tools report the nf_tables backend; the
+        /// legacy one otherwise.
+        nf_tables: bool,
+        /// Whether `nft -a --debug=netlink list ruleset` fails, as on an
+        /// nft that cannot print the netlink form.
+        netlink_fails: bool,
+    }
+
+    /// The stand-in host tools in `dir`, for the install's conflict scan:
+    /// `nft list ruleset` and its annotated form print what `tools` says, a
+    /// JSON listing fails as it does over no table, and a load reads its
+    /// transaction and succeeds. `iptables-save` and `ip6tables-save` print
+    /// their listings and name their backend for `--version`, and the
+    /// `-nft-save` pair answers for the nf_tables backend alone, so no real
+    /// tool on the test host's PATH is read.
+    fn host_tools(dir: &Path, tools: &HostTools<'_>) {
+        use std::os::unix::fs::PermissionsExt;
+        let file = |name: &str, body: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, body).expect("writing a stand-in listing");
+            path
+        };
+        let listing = file("ruleset", tools.ruleset);
+        let annotated = file("annotated", tools.annotated.unwrap_or(tools.ruleset));
+        let mut written = vec![(
+            "nft".to_string(),
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$1 $2\" = 'list ruleset' ]; then cat '{}'; exit 0; fi\n\
+                 if [ \"$*\" = '-a --debug=netlink list ruleset' ]; then {}; fi\n\
+                 if [ \"$1\" = -j ]; then exit 1; fi\n\
+                 cat >/dev/null\n\
+                 exit 0\n",
+                listing.display(),
+                if tools.netlink_fails {
+                    "exit 1".to_string()
+                } else {
+                    format!("cat '{}'; exit 0", annotated.display())
+                }
+            ),
+        )];
+        let backend = if tools.nf_tables {
+            "nf_tables"
+        } else {
+            "legacy"
+        };
+        for (stem, body) in [("iptables", tools.v4), ("ip6tables", tools.v6)] {
+            let saved = file(&format!("{stem}-listing"), body);
+            written.push((
+                format!("{stem}-save"),
+                format!(
+                    "#!/bin/sh\n\
+                     if [ \"$1\" = --version ]; then echo '{stem}-save v1.8.11 ({backend})'; exit 0; fi\n\
+                     cat '{}'\n",
+                    saved.display()
+                ),
+            ));
+            written.push((
+                format!("{stem}-nft-save"),
+                if tools.nf_tables {
+                    format!("#!/bin/sh\ncat '{}'\n", saved.display())
+                } else {
+                    "#!/bin/sh\nexit 1\n".to_string()
+                },
+            ));
+        }
+        for (name, body) in written {
+            let tool = dir.join(name);
+            std::fs::write(&tool, body).expect("writing a stand-in tool");
+            std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755))
+                .expect("the stand-in tool is executable");
+        }
+    }
+
+    /// [`host_tools`] over `ruleset` with no netlink form, and a legacy
+    /// `iptables-save` that prints `legacy`.
+    fn host_ruleset_tools(dir: &Path, ruleset: &str, legacy: &str) {
+        host_tools(
+            dir,
+            &HostTools {
+                ruleset,
+                annotated: None,
+                v4: legacy,
+                v6: "",
+                nf_tables: false,
+                netlink_fails: false,
+            },
+        );
+    }
+
+    /// The install's whole output, stdout and stderr, for the assertions.
+    fn said(output: &std::process::Output) -> String {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    }
+
+    /// NET-079: a rule that writes the connection mark with no mask writes
+    /// every bit of it, the bits this install classifies with among them,
+    /// whatever value it writes. The scan refuses it under every mask, and
+    /// names the rule with the table and chain it belongs to. A masked
+    /// writer of other bits is not refused.
+    #[test]
+    fn install_refuses_a_whole_mark_ct_writer() {
+        let whole_nft = "table inet wg_quick {\n\
+                         \tchain premangle {\n\
+                         \t\ttype filter hook prerouting priority mangle; policy accept;\n\
+                         \t\tmeta l4proto udp meta mark set ct mark\n\
+                         \t}\n\
+                         \tchain postmangle {\n\
+                         \t\ttype filter hook postrouting priority mangle; policy accept;\n\
+                         \t\tmeta l4proto udp meta mark 0x0000ca6c ct mark set meta mark\n\
+                         \t}\n\
+                         }\n";
+        for mask in [None, Some("0x0c000000")] {
+            let mount = standin_mount();
+            let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+            host_ruleset_tools(tools.path(), whole_nft, "");
+            let flags: Vec<&str> = mask.map(|m| vec!["--ct-mark-mask", m]).unwrap_or_default();
+            let refused = run_install_with(&mount, &flags, tools.path());
+            let text = said(&refused);
+            assert!(
+                !refused.status.success(),
+                "the install refuses a whole-mark ct writer under mask {mask:?}: {text}"
+            );
+            assert!(
+                text.contains("table inet wg_quick, chain postmangle: ")
+                    && text.contains("ct mark set meta mark"),
+                "the refusal names the rule and the table and chain it is in: {text}"
+            );
+            assert!(
+                text.contains("writes every bit of the connection mark"),
+                "the refusal says why no mask avoids it: {text}"
+            );
+            assert!(
+                text.contains("then run min finalize-install again."),
+                "the refusal names the command to run once the rule is changed: {text}"
+            );
+            assert!(
+                !text.contains("chain premangle"),
+                "a rule that only reads the ct mark is not a writer: {text}"
+            );
+            assert!(
+                !mount.root.join(sandbox::classifier::TABLE_MARKER).exists(),
+                "a refused install writes no marker: {text}"
+            );
+        }
+
+        // iptables spells the same writer as a CONNMARK with no mask.
+        let mount = standin_mount();
+        let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+        host_ruleset_tools(
+            tools.path(),
+            "",
+            "*mangle\n:OUTPUT ACCEPT [0:0]\n-A OUTPUT -p tcp -j CONNMARK --set-mark 0x1\nCOMMIT\n",
+        );
+        let refused = run_install_with(&mount, &[], tools.path());
+        let text = said(&refused);
+        assert!(
+            !refused.status.success(),
+            "a CONNMARK with no mask is refused: {text}"
+        );
+        assert!(
+            text.contains("iptables table mangle, chain OUTPUT: ")
+                && text.contains("--set-mark 0x1"),
+            "the refusal names the iptables rule, its table and chain: {text}"
+        );
+
+        // A CONNMARK --restore-mark writes only the packet mark, never the
+        // connection mark, so a restore with no mask is no conflict.
+        let mount = standin_mount();
+        let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+        host_ruleset_tools(
+            tools.path(),
+            "",
+            "*mangle\n:OUTPUT ACCEPT [0:0]\n\
+             -A OUTPUT -p udp -j CONNMARK --restore-mark\nCOMMIT\n",
+        );
+        let installed = run_install_with(&mount, &[], tools.path());
+        assert!(
+            installed.status.success(),
+            "a --restore-mark with no mask does not block the install: {}",
+            said(&installed)
+        );
+
+        // A writer that keeps every bit but its own is no conflict.
+        let mount = standin_mount();
+        let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+        host_ruleset_tools(
+            tools.path(),
+            "table inet other {\n\tchain c {\n\t\ttcp dport 9 ct mark set ct mark | 0x00000003\n\t}\n}\n",
+            "",
+        );
+        let installed = run_install_with(&mount, &[], tools.path());
+        assert!(
+            installed.status.success(),
+            "a masked writer of other bits does not block the install: {}",
+            said(&installed)
+        );
+    }
+
+    /// Tailscale's connmark rules for its rp_filter workaround, as
+    /// tailscaled 1.104.2 installs them through iptables-nft in the ip and
+    /// ip6 mangle tables (gominimal/inbox#1201): `iptables-save` spells
+    /// them with both masks, and `nft list ruleset` prints the CONNMARK
+    /// targets through libxtables, which drops the --ctmask. The OUTPUT
+    /// lines are the ones a host printed in that issue.
+    const TAILSCALE_CONNMARK_NFT: &str = "table ip mangle {\n\
+         \tchain PREROUTING {\n\
+         \t\ttype filter hook prerouting priority mangle; policy accept;\n\
+         \t\tct state related,established ct mark and 0xff0000 != 0x0 counter packets 0 bytes 0 meta mark set ct mark and 0xff0000\n\
+         \t}\n\
+         \tchain OUTPUT {\n\
+         \t\ttype route hook output priority mangle; policy accept;\n\
+         \t\tct state new meta mark & 0x00ff0000 != 0x00000000 counter packets 39900 bytes 3116800 ct mark set mark and 0xff0000\n\
+         \t}\n\
+         }\n\
+         table ip6 mangle {\n\
+         \tchain PREROUTING {\n\
+         \t\ttype filter hook prerouting priority mangle; policy accept;\n\
+         \t\tct state related,established ct mark and 0xff0000 != 0x0 counter packets 0 bytes 0 meta mark set ct mark and 0xff0000\n\
+         \t}\n\
+         \tchain OUTPUT {\n\
+         \t\ttype route hook output priority mangle; policy accept;\n\
+         \t\tct state new meta mark & 0x00ff0000 != 0x00000000 counter packets 0 bytes 0 ct mark set mark and 0xff0000\n\
+         \t}\n\
+         }\n";
+
+    /// [`TAILSCALE_CONNMARK_NFT`]'s IPv4 half as `iptables-save` prints it.
+    const TAILSCALE_CONNMARK_SAVE: &str = "*mangle\n\
+         :PREROUTING ACCEPT [0:0]\n\
+         :OUTPUT ACCEPT [0:0]\n\
+         -A PREROUTING -m conntrack --ctstate RELATED,ESTABLISHED -m connmark ! --mark 0x0/0xff0000 -j CONNMARK --restore-mark --nfmask 0xff0000 --ctmask 0xff0000\n\
+         -A OUTPUT -m conntrack --ctstate NEW -m mark ! --mark 0x0/0xff0000 -j CONNMARK --save-mark --nfmask 0xff0000 --ctmask 0xff0000\n\
+         COMMIT\n";
+
+    /// NET-079: a connection-mark write is decoded with its masks, so only
+    /// the bits it can change conflict. Tailscale's masked save and restore
+    /// change the bits 0x00ff0000 alone, and the install goes ahead over
+    /// them under the default mask, and the same spelling over the default
+    /// bits is a conflict the scan names.
+    #[test]
+    fn install_decodes_masked_ct_mark_writes() {
+        let mount = standin_mount();
+        let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+        host_ruleset_tools(
+            tools.path(),
+            TAILSCALE_CONNMARK_NFT,
+            TAILSCALE_CONNMARK_SAVE,
+        );
+        let installed = run_install_with(&mount, &[], tools.path());
+        assert!(
+            installed.status.success(),
+            "Tailscale's masked connmark rules do not block the install: {}",
+            said(&installed)
+        );
+
+        // Each nft value against the default bits 0x30000000: whether the
+        // install is refused, and whether it says no mask avoids the rule.
+        for (value, refused, whole) in [
+            // CONNMARK --save-mark with equal masks, through libxtables:
+            // it changes the bits of its mask alone, so a mask over the
+            // default bits conflicts and one beside them does not.
+            ("mark and 0x30000000", true, false),
+            ("mark and 0x00ff0000", false, false),
+            // A rule with two statements: each `ct mark set` is decoded,
+            // so a later write is not hidden behind a masked one.
+            ("mark and 0x00ff0000 ct mark set meta mark", true, true),
+            (
+                "mark and 0x00ff0000 ct mark set mark and 0x30000000",
+                true,
+                false,
+            ),
+            (
+                "mark and 0x00ff0000 ct mark set ct mark and 0xffffffcf",
+                false,
+                false,
+            ),
+            // A native save keeping every bit outside 0x00ff0000.
+            (
+                "ct mark & 0xff00ffff | meta mark & 0x00ff0000",
+                false,
+                false,
+            ),
+            // An AND that keeps the default bits changes only bits 4 and 5.
+            ("ct mark and 0xffffffcf", false, false),
+            // An AND that clears the default bits.
+            ("ct mark & 0xcfffffff", true, false),
+            // An OR with a packet mark under no mask.
+            ("ct mark | meta mark", true, true),
+            // A native packet-mark read under a mask still replaces the rest.
+            ("meta mark & 0x00ff0000", true, true),
+            // CONNMARK --save-mark with no masks, through libxtables.
+            ("mark", true, true),
+        ] {
+            let mount = standin_mount();
+            let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+            host_ruleset_tools(
+                tools.path(),
+                &format!("table inet other {{\n\tchain c {{\n\t\tct mark set {value}\n\t}}\n}}\n"),
+                "",
+            );
+            let ran = run_install_with(&mount, &[], tools.path());
+            let text = said(&ran);
+            assert_eq!(
+                !ran.status.success(),
+                refused,
+                "`ct mark set {value}` refused: {text}"
+            );
+            assert_eq!(
+                text.contains("already uses the ct-mark bits"),
+                refused,
+                "`ct mark set {value}` is named by the conflict scan: {text}"
+            );
+            assert_eq!(
+                text.contains("writes every bit of the connection mark"),
+                whole,
+                "`ct mark set {value}` writes every bit: {text}"
+            );
+        }
+    }
+
+    /// One family's mangle table as `nft -a --debug=netlink list ruleset`
+    /// prints Tailscale's connmark rules through iptables-nft: the netlink
+    /// form first, where the CONNMARK is an xt compat target, then the text
+    /// with each rule's handle. The OUTPUT block is the dump a host printed
+    /// on gominimal/inbox#1201.
+    fn tailscale_annotated(family: &str) -> String {
+        format!(
+            "# Warning: table {family} mangle is managed by iptables-nft, do not touch!\n\
+             {family} mangle PREROUTING 3\n\
+             \x20 [ match name conntrack rev 3 ]\n\
+             \x20 [ match name connmark rev 1 ]\n\
+             \x20 [ counter pkts 0 bytes 0 ]\n\
+             \x20 [ target name CONNMARK rev 2 ]\n\
+             \n\
+             {family} mangle OUTPUT 4\n\
+             \x20 [ match name conntrack rev 3 ]\n\
+             \x20 [ meta load mark => reg 1 ]\n\
+             \x20 [ bitwise reg 1 = ( reg 1 & 0x00ff0000 ) ^ 0x00000000 ]\n\
+             \x20 [ cmp neq reg 1 0x00000000 ]\n\
+             \x20 [ counter pkts 42812 bytes 3343056 ]\n\
+             \x20 [ target name CONNMARK rev 2 ]\n\
+             \n\
+             table {family} mangle {{ # handle 1\n\
+             \tchain PREROUTING {{ # handle 1\n\
+             \t\ttype filter hook prerouting priority mangle; policy accept;\n\
+             \t\tct state related,established ct mark and 0xff0000 != 0x0 counter packets 0 bytes 0 meta mark set ct mark and 0xff0000 # handle 3\n\
+             \t}}\n\
+             \tchain OUTPUT {{ # handle 2\n\
+             \t\ttype route hook output priority mangle; policy accept;\n\
+             \t\tct state new meta mark & 0x00ff0000 != 0x00000000 counter packets 42812 bytes 3343056 ct mark set mark and 0xff0000 # handle 4\n\
+             \t}}\n\
+             }}\n"
+        )
+    }
+
+    /// One family's mangle OUTPUT with a single CONNMARK that libxtables
+    /// cannot translate, as `nft -a --debug=netlink list ruleset` prints it.
+    fn untranslated_connmark_annotated(family: &str) -> String {
+        format!(
+            "{family} mangle OUTPUT 4\n\
+             \x20 [ counter pkts 0 bytes 0 ]\n\
+             \x20 [ target name CONNMARK rev 2 ]\n\
+             \n\
+             table {family} mangle {{ # handle 1\n\
+             \tchain OUTPUT {{ # handle 2\n\
+             \t\ttype route hook output priority mangle; policy accept;\n\
+             \t\tcounter packets 0 bytes 0 xt target \"CONNMARK\" # handle 4\n\
+             \t}}\n\
+             }}\n"
+        )
+    }
+
+    /// A mangle OUTPUT as iptables-save prints it, holding `rule`.
+    fn mangle_output_save(rule: &str) -> String {
+        format!("*mangle\n:OUTPUT ACCEPT [0:0]\n-A OUTPUT {rule}\nCOMMIT\n")
+    }
+
+    /// NET-079: a rule iptables-nft wrote is an xt compat target in the
+    /// kernel, and its nft text is libxtables' display of it, so the scan
+    /// reads its masks from the nf_tables iptables-save and ip6tables-save
+    /// listings. Tailscale's rules, v4 and v6, install; a CONNMARK that
+    /// libxtables cannot translate is decoded from its saved masks, in
+    /// either family; and a CONNMARK no listing shows is refused.
+    #[test]
+    fn install_reads_xt_connmark_masks_from_iptables_save() {
+        let tailscale = format!(
+            "{}{}",
+            tailscale_annotated("ip"),
+            tailscale_annotated("ip6")
+        );
+        let tailscale_text = TAILSCALE_CONNMARK_NFT;
+        let run = |tools: &HostTools<'_>| {
+            let mount = standin_mount();
+            let dir = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+            host_tools(dir.path(), tools);
+            let ran = run_install_with(&mount, &[], dir.path());
+            let text = said(&ran);
+            (ran.status.success(), text)
+        };
+
+        let (installed, text) = run(&HostTools {
+            ruleset: tailscale_text,
+            annotated: Some(&tailscale),
+            v4: TAILSCALE_CONNMARK_SAVE,
+            v6: TAILSCALE_CONNMARK_SAVE,
+            nf_tables: true,
+            netlink_fails: false,
+        });
+        assert!(
+            installed,
+            "Tailscale's xt CONNMARK rules, read from iptables-save and ip6tables-save, do not block the install: {text}"
+        );
+
+        // With no iptables-save listing, the scan cannot see which bits a
+        // CONNMARK keeps, and refuses it in both families.
+        let (installed, text) = run(&HostTools {
+            ruleset: tailscale_text,
+            annotated: Some(&tailscale),
+            v4: "",
+            v6: "",
+            nf_tables: true,
+            netlink_fails: false,
+        });
+        assert!(!installed, "an unlisted CONNMARK is refused: {text}");
+        for family in ["ip", "ip6"] {
+            assert!(
+                text.contains(&format!(
+                    "table {family} mangle, chain OUTPUT: ct state new meta mark & 0x00ff0000 != 0x00000000 counter packets 42812 bytes 3343056 ct mark set mark and 0xff0000 (an iptables rule whose masks iptables-save did not list)"
+                )),
+                "the refusal names the {family} rule without its handle: {text}"
+            );
+        }
+        assert!(
+            text.contains(
+                "refusing to install over an iptables CONNMARK rule whose masks this step cannot read, so it may write the bits this install uses. Install iptables with its nf_tables backend, so that iptables-save and ip6tables-save list the rule, then run min finalize-install again."
+            ),
+            "the refusal names the listing as the remedy: {text}"
+        );
+
+        // A CONNMARK libxtables cannot translate (nfmask != ctmask), read
+        // from its saved masks: refused when its --ctmask covers the
+        // default bits 0x30000000, installed when it does not.
+        for (family, ctmask, refused) in [
+            ("ip", "0x30ff0000", true),
+            ("ip", "0x00ffff00", false),
+            ("ip6", "0x30ff0000", true),
+            ("ip6", "0x00ffff00", false),
+        ] {
+            let annotated = untranslated_connmark_annotated(family);
+            let saved = mangle_output_save(&format!(
+                "-j CONNMARK --save-mark --nfmask 0xff0000 --ctmask {ctmask}"
+            ));
+            let (v4, v6) = if family == "ip" {
+                (saved.as_str(), "")
+            } else {
+                ("", saved.as_str())
+            };
+            let (installed, text) = run(&HostTools {
+                ruleset: "",
+                annotated: Some(&annotated),
+                v4,
+                v6,
+                nf_tables: true,
+                netlink_fails: false,
+            });
+            assert_eq!(
+                !installed, refused,
+                "a {family} CONNMARK with --ctmask {ctmask} refused: {text}"
+            );
+            if refused {
+                let saver = if family == "ip" {
+                    "iptables"
+                } else {
+                    "ip6tables"
+                };
+                assert!(
+                    text.contains(&format!(
+                        "{saver} table mangle, chain OUTPUT: -A OUTPUT -j CONNMARK --save-mark --nfmask 0xff0000 --ctmask {ctmask}"
+                    )) && text.contains("refusing to install over another ct-mark user"),
+                    "the refusal names the saved rule and a mask to choose: {text}"
+                );
+            }
+        }
+
+        // An nft that cannot print the netlink form leaves the plain
+        // listing: Tailscale's libxtables text is decoded from its mask, and
+        // a CONNMARK libxtables could not translate is found by its text.
+        let (installed, text) = run(&HostTools {
+            ruleset: tailscale_text,
+            annotated: None,
+            v4: "",
+            v6: "",
+            nf_tables: true,
+            netlink_fails: true,
+        });
+        assert!(
+            installed,
+            "without the netlink form, Tailscale's rules still install: {text}"
+        );
+        let plain = untranslated_connmark_annotated("ip");
+        let plain = plain
+            .split("\n\n")
+            .nth(1)
+            .expect("the text half")
+            .replace(" # handle 4", "")
+            .replace(" { # handle 1", " {")
+            .replace(" { # handle 2", " {");
+        let (installed, text) = run(&HostTools {
+            ruleset: &plain,
+            annotated: None,
+            v4: "",
+            v6: "",
+            nf_tables: true,
+            netlink_fails: true,
+        });
+        assert!(
+            !installed && text.contains("table ip mangle, chain OUTPUT: counter packets 0 bytes 0 xt target \"CONNMARK\" (an iptables rule whose masks iptables-save did not list)"),
+            "without the netlink form, an untranslated CONNMARK with no listing is refused: {text}"
+        );
+
+        // An IPv6-only CONNMARK with only an IPv4 listing is not covered.
+        let annotated = untranslated_connmark_annotated("ip6");
+        let saved =
+            mangle_output_save("-j CONNMARK --save-mark --nfmask 0xff0000 --ctmask 0x00ffff00");
+        let (installed, text) = run(&HostTools {
+            ruleset: "",
+            annotated: Some(&annotated),
+            v4: &saved,
+            v6: "",
+            nf_tables: true,
+            netlink_fails: false,
+        });
+        assert!(
+            !installed && text.contains("table ip6 mangle, chain OUTPUT: counter packets 0 bytes 0 xt target \"CONNMARK\" (an iptables rule whose masks iptables-save did not list)"),
+            "an IPv6 CONNMARK with no ip6tables-save listing is refused: {text}"
+        );
+    }
+
+    /// NET-079: `--ct-mark-mask` refuses a mask in a range a well-known
+    /// component classes with, naming the range and the component, and
+    /// names `min finalize-install --ct-mark-mask <mask>` for two other bits.
+    #[test]
+    fn install_refuses_a_well_known_mark_range() {
+        for (mask, component, range) in [
+            ("0x00030000", "Tailscale", "0x00ff0000"),
+            ("0x00c00000", "Tailscale", "0x00ff0000"),
+            ("0x0000c000", "kube-proxy", "0x0000c000"),
+            ("0x00006000", "kube-proxy", "0x0000c000"),
+        ] {
+            let mount = standin_mount();
+            let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+            host_ruleset_tools(tools.path(), "", "");
+            let refused = run_install_with(&mount, &["--ct-mark-mask", mask], tools.path());
+            let text = said(&refused);
+            assert!(!refused.status.success(), "mask {mask} is refused: {text}");
+            assert!(
+                text.contains(&format!("--ct-mark-mask {mask} uses bits in {range}"))
+                    && text.contains(&format!("the range {component} marks connections with")),
+                "the refusal names the range and its component: {text}"
+            );
+            assert!(
+                text.contains("run: min finalize-install --ct-mark-mask <mask>")
+                    && !text.contains(&format!("{mask} --")),
+                "the refusal names min finalize-install with a placeholder for the mask: {text}"
+            );
+            assert!(
+                !mount.root.join(sandbox::classifier::TABLE_MARKER).exists(),
+                "a refused install writes no marker: {text}"
+            );
+        }
+        let mount = standin_mount();
+        let tools = tempfile::tempdir().expect("a temp dir holding the stand-in tools");
+        host_ruleset_tools(tools.path(), "", "");
+        let installed = run_install_with(&mount, &["--ct-mark-mask", "0x0c000000"], tools.path());
+        assert!(
+            installed.status.success(),
+            "a mask outside every well-known range installs: {}",
+            said(&installed)
+        );
+    }
+
+    /// NET-079: the table refuses every IPv6 connection a box of the
+    /// boxes subtree opens to anything but loopback, allow boxes included,
+    /// with the deny chain's own refusal: replies admitted, then the one
+    /// named counter both chains count in, the log line, and an active
+    /// reject.
+    #[test]
+    fn host_ip_box_ipv6_egress_refused() {
+        let ruleset = rendered_ruleset();
+        let boxes = format!("{}/{}", tree_root_name(), sandbox::classifier::BOXES_DIR);
+        assert!(
+            ruleset.contains(
+                "chain ipv6_out {\n        type filter hook output priority filter; policy accept;"
+            ),
+            "the IPv6 chain hooks output at the filter priority: {ruleset}"
+        );
+        let ipv6_out = chain_rules(&ruleset, "ipv6_out");
+        assert_eq!(
+            ipv6_out,
+            [format!(
+                "meta nfproto ipv6 oifname != \"lo\" socket cgroupv2 level {} \"{boxes}\" jump ipv6_refuse",
+                boxes.split('/').count()
+            )
+            .as_str()],
+            "the whole boxes subtree's non-loopback IPv6 goes to the refusal: {ipv6_out:?}"
+        );
+        let refuse = chain_rules(&ruleset, "ipv6_refuse");
+        assert_eq!(
+            refuse,
+            [
+                "ct state established,related ct direction reply accept",
+                "counter name \"refused\"",
+                "limit rate 1/second burst 4 packets log prefix \"minimal-classifier: refused \" level warn",
+                "reject with icmpx admin-prohibited",
+            ],
+            "the IPv6 refusal is the deny chain's refusal: {refuse:?}"
+        );
+        let deny_out = chain_rules(&ruleset, "deny_out");
+        assert!(
+            deny_out.contains(&"counter name \"refused\""),
+            "the IPv4 refusal counts in the same counter: {deny_out:?}"
+        );
+        assert!(
+            ruleset.contains("    counter refused {"),
+            "the table declares the counter both chains count in: {ruleset}"
+        );
+    }
+
+    /// The per-launch reading does not wait a SYN retransmit: its leg is a
+    /// datagram, so an error comes back at once, where a refused TCP
+    /// connect only fails at the first retransmit, a second later. A
+    /// datagram to an endpoint nobody holds reads its ICMP error well
+    /// inside that second, and the per-launch reading over a stand-in tree
+    /// ends inside it too.
+    #[test]
+    fn per_launch_probe_returns_without_tcp_retransmit_wait() {
+        let retransmit = Duration::from_secs(1);
+        let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+        installed_cohort(tree.path());
+        let dead = {
+            let socket = UdpSocket::bind(SocketAddr::new(Family::V4.loopback(), 0))
+                .expect("a loopback datagram endpoint to point the probe at");
+            socket.local_addr().expect("the dead endpoint's address")
+        };
+        let began = std::time::Instant::now();
+        let reading = probe_effect(tree.path(), &[(Family::V4, dead)], Leg::Datagram);
+        let elapsed = began.elapsed();
+        assert_eq!(
+            reading.legs(),
+            [(Family::V4, Observed::Refused(libc::ECONNREFUSED))],
+            "the datagram leg reads the error that came back: {}",
+            reading.record()
+        );
+        assert!(
+            elapsed < retransmit,
+            "the datagram leg reads its error without a retransmit wait: {elapsed:?}"
+        );
+
+        let began = std::time::Instant::now();
+        let reading = read_filter(tree.path());
+        let elapsed = began.elapsed();
+        assert!(
+            reading.legs().contains(&(Family::V4, Observed::Connected)),
+            "behind no table the per-launch reading's datagram goes out: {}",
+            reading.record()
+        );
+        assert!(
+            elapsed < retransmit,
+            "the per-launch reading ends inside one retransmit: {elapsed:?}"
+        );
     }
 }

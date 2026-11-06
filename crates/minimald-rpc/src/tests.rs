@@ -512,6 +512,7 @@ fn create_session_request_round_trips() {
             // default, so a fixture using it would round-trip green
             // even if the field never reached the wire.
             hooks_enabled: false,
+            ends_with_run: false,
             attrs: [("color".to_string(), "blue".to_string())]
                 .into_iter()
                 .collect(),
@@ -526,11 +527,52 @@ fn create_session_request_round_trips() {
             // while it is left off the wire.
             creating_verb: CreatingVerb::Task,
             project_root: Some(paths::HostAbsPath::try_new("/home/u").unwrap()),
+            host_ip_registration: Some("dev~0123456789abcdef".into()),
         },
         must_match_version: Some("0.6.0".into()),
         spec: Some(serde_json_lenient::json!({"v": 0, "box": {"type": "task"}})),
+        fresh_instance: true,
     };
     assert_eq!(round_trip(&req), req);
+}
+
+/// BEP-082: a fresh-instance `host_ip` grant box carries the creation key
+/// it registered under, so the in-VM daemon's id mint finds the
+/// registration after it names the box `<base>-<n>`. A config with no key
+/// leaves it off the wire, and an older client's config decodes with none.
+#[test]
+fn box_config_carries_the_host_ip_registration_name() {
+    let mut req = CreateSessionRequest::new(
+        "dev",
+        paths::HostAbsPath::try_new("/home/u/proj").unwrap(),
+        NetworkMode::HostNet,
+        BoxPolicy::default(),
+    );
+    req.config.host_ip_registration = Some("dev~0123456789abcdef".into());
+    let wire = serde_json_lenient::to_string(&req.config).unwrap();
+    let sent: serde_json_lenient::Value = serde_json_lenient::from_str(&wire).unwrap();
+    assert_eq!(
+        sent["host_ip_registration"], "dev~0123456789abcdef",
+        "the key reaches the wire"
+    );
+    assert_eq!(round_trip(&req), req);
+
+    req.config.host_ip_registration = None;
+    let wire = serde_json_lenient::to_string(&req.config).unwrap();
+    assert!(
+        !wire.contains("host_ip_registration"),
+        "no key, no field: {wire}"
+    );
+
+    let older = r#"{
+        "name": "dev",
+        "project_path": "/p",
+        "network": "host_net",
+        "attrs": {}
+    }"#;
+    let config: BoxConfig =
+        serde_json_lenient::from_str(older).expect("an older client's config must load");
+    assert_eq!(config.host_ip_registration, None);
 }
 
 /// The one constructor every daemon-side create goes through: it fills
@@ -556,14 +598,17 @@ fn create_request_constructor_round_trips() {
                 box_id: None,
                 box_addresses: None,
                 hooks_enabled: true,
+                ends_with_run: false,
                 attrs: Default::default(),
                 sealed_deliveries: Vec::new(),
                 root_certificate: None,
                 creating_verb: CreatingVerb::Session,
                 project_root: None,
+                host_ip_registration: None,
             },
             must_match_version: None,
             spec: None,
+            fresh_instance: false,
         }
     );
     assert_eq!(round_trip(&req), req);
@@ -1046,6 +1091,7 @@ fn hostname_routing_field_is_omitted_when_healthy() {
         answerer_bound: false,
         resource_pool: None,
         sessions: vec![],
+        box_networks: Default::default(),
     };
     let json = serde_json_lenient::to_string(&resp).expect("serializes");
     assert!(
@@ -1231,6 +1277,112 @@ fn list_sessions_entry_decodes_with_and_without_git() {
     assert_eq!(round_trip(&with), with);
 }
 
+/// T110: the listing carries each box's address and egress posture keyed
+/// by its id, both survive the wire, a field the daemon could not fill
+/// stays off it, and a reply from a daemon that predates the map decodes
+/// with every box unreported.
+#[test]
+fn list_sessions_reply_carries_box_address_and_posture() {
+    let own = SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+    let host = SessionId::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+    let unreported = SessionId::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
+    let reply = ListSessionsResponse {
+        resource_pool: None,
+        sessions: Vec::new(),
+        daemon_version: None,
+        hostname_routing_unavailable: None,
+        hostname_proxy_port: None,
+        zone_answerer_port: None,
+        answerer_bound: false,
+        box_networks: [
+            (
+                own,
+                BoxNetworkFacts {
+                    loopback_address: Some(std::net::Ipv4Addr::new(127, 0, 64, 2)),
+                    egress_posture: Some(EgressPosture::DenyAllDefault),
+                    at_fallback: Some(false),
+                },
+            ),
+            (
+                host,
+                BoxNetworkFacts {
+                    loopback_address: Some(std::net::Ipv4Addr::LOCALHOST),
+                    egress_posture: Some(EgressPosture::DeclaredRules),
+                    at_fallback: Some(false),
+                },
+            ),
+            (unreported, BoxNetworkFacts::default()),
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let json = serde_json_lenient::to_value(&reply).expect("serializes");
+    assert_eq!(
+        json["box_networks"][own.to_string()],
+        serde_json_lenient::json!({
+            "loopback_address": "127.0.64.2",
+            "egress_posture": "deny_all_default",
+            "at_fallback": false,
+        }),
+        "got {json}"
+    );
+    assert_eq!(
+        json["box_networks"][unreported.to_string()],
+        serde_json_lenient::json!({}),
+        "an unreported field stays off the wire: {json}"
+    );
+    let back: ListSessionsResponse = serde_json_lenient::from_value(json).expect("round trips");
+    assert_eq!(back.box_networks, reply.box_networks);
+
+    // A daemon that predates the map sends no key: every box unreported.
+    let older: ListSessionsResponse =
+        serde_json_lenient::from_str(r#"{"sessions": []}"#).expect("an older reply decodes");
+    assert!(older.box_networks.is_empty());
+    let quiet = ListSessionsResponse {
+        box_networks: Default::default(),
+        ..reply
+    };
+    assert!(
+        !serde_json_lenient::to_string(&quiet)
+            .unwrap()
+            .contains("box_networks"),
+        "an empty map stays off the wire"
+    );
+
+    // The posture is the one `min session policy` names, from the same
+    // effective egress.
+    use boxes::{EffectiveEgress, EgressPolicy, NetworkMode};
+    assert_eq!(
+        EgressPosture::of(&EffectiveEgress::DenyAll, NetworkMode::OwnIp),
+        EgressPosture::DenyAllDefault
+    );
+    assert_eq!(
+        EgressPosture::of(&EffectiveEgress::AllowAll, NetworkMode::HostNet),
+        EgressPosture::AllowAllDefault
+    );
+    assert_eq!(
+        EgressPosture::of(
+            &EffectiveEgress::Declared(EgressPolicy::deny_all()),
+            NetworkMode::HostNet
+        ),
+        EgressPosture::DenyAll
+    );
+    assert_eq!(
+        EgressPosture::of(
+            &EffectiveEgress::Declared(EgressPolicy {
+                allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                ..EgressPolicy::default()
+            }),
+            NetworkMode::OwnIp
+        ),
+        EgressPosture::DeclaredRules
+    );
+    assert_eq!(
+        EgressPosture::of(&EffectiveEgress::AllowAll, NetworkMode::NoNet),
+        EgressPosture::NoNetwork
+    );
+}
+
 /// NET-129's listing half survives version skew both ways without a
 /// request flag, because neither [`ListSessionsResponse`] nor
 /// [`ListSessionsEntry`] is `deny_unknown_fields`. A newer daemon's
@@ -1259,6 +1411,7 @@ fn list_sessions_shared_port_collisions_survive_version_skew_both_ways() {
         hostname_proxy_port: None,
         zone_answerer_port: None,
         answerer_bound: false,
+        box_networks: Default::default(),
     };
 
     let quiet =
@@ -1935,4 +2088,196 @@ fn every_reply_id_round_trips_byte_for_byte() {
         wire.contains(&format!(r#""box_id":"{HEX}""#)),
         "the handed id crosses as its hex spelling: {wire}"
     );
+}
+
+/// BOX-019, BOX-021: the reap and prune requests and replies keep every
+/// field across the wire. An old client's request without `force` or
+/// selectors reads as an unforced reap and an unnarrowed prune, and an
+/// error reply never decodes as a reap or a prune that succeeded.
+#[test]
+fn reap_and_prune_requests_round_trip() {
+    let id = SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+    let parent = SessionId::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+
+    for force in [false, true] {
+        let req = ReapBoxRequest { id, force };
+        assert_eq!(round_trip(&req), req);
+    }
+    let bare: ReapBoxRequest =
+        serde_json_lenient::from_str(&format!(r#"{{"id":"{id}"}}"#)).expect("deserialize");
+    assert!(!bare.force, "a request without `force` is an unforced reap");
+
+    let req = PruneBoxesRequest {
+        older_than_secs: Some(86_400),
+        parent: Some(parent),
+    };
+    assert_eq!(round_trip(&req), req);
+    let bare: PruneBoxesRequest = serde_json_lenient::from_str("{}").expect("deserialize");
+    assert_eq!(bare, PruneBoxesRequest::default());
+
+    let entry = BoxListingEntry {
+        box_id: id,
+        name: Some("dev".to_string()),
+        box_type: Some("session".to_string()),
+        parent: Some(parent),
+        project_root: None,
+        state: "stopped".to_string(),
+        reason: Some("stopped".to_string()),
+        exit_code: None,
+        signal: Some(15),
+        pty_enabled: false,
+    };
+    let reap = ReapBoxResponse {
+        reaped: entry.clone(),
+        hook_failures: vec!["hook: failed".to_string()],
+    };
+    assert_eq!(round_trip(&reap), reap);
+    let prune = PruneBoxesResponse {
+        reaped: vec![entry],
+        failed: vec![PruneFailure {
+            box_id: parent,
+            error: "running".to_string(),
+        }],
+    };
+    assert_eq!(round_trip(&prune), prune);
+
+    let error = r#"{"error":"no session with ID `x`"}"#;
+    for decoded in [
+        matches!(
+            serde_json_lenient::from_str::<Errorable<ReapBoxResponse>>(error).unwrap(),
+            Errorable::Err { .. }
+        ),
+        matches!(
+            serde_json_lenient::from_str::<Errorable<PruneBoxesResponse>>(error).unwrap(),
+            Errorable::Err { .. }
+        ),
+    ] {
+        assert!(decoded, "an error reply decodes as an error");
+    }
+    assert_eq!(ReapBox::NAME, "minimald-v1-ReapBox");
+    assert_eq!(PruneBoxes::NAME, "minimald-v1-PruneBoxes");
+}
+
+/// BEP-082, BEP-083: the admit of a `host_ip` box carries whether the box
+/// declares a credentialed upstream, and a host_ip registration says it is
+/// one. A line from a client that predates either field reads as no lane
+/// and as an own-address registration.
+#[test]
+fn host_ip_box_request_carries_the_lane_declaration() {
+    let session_id = boxes::SessionId::mint();
+    let declaring = BoxControlRequest::AdmitHostIpBox(HostIpBoxRequest {
+        session_id,
+        egress: None,
+        credentialed_upstream: true,
+    });
+    let line = serde_json_lenient::to_string(&declaring).unwrap();
+    assert!(line.contains(r#""credentialed_upstream":true"#), "{line}");
+    let back: BoxControlRequest = serde_json_lenient::from_str(&line).unwrap();
+    assert_eq!(back, declaring);
+
+    // A request with no lane leaves the field out, so the line an older
+    // host reads is the line it always read.
+    let silent = HostIpBoxRequest {
+        session_id,
+        egress: None,
+        credentialed_upstream: false,
+    };
+    let line = serde_json_lenient::to_string(&silent).unwrap();
+    assert!(!line.contains("credentialed_upstream"), "{line}");
+
+    // An older client's admit has no field: it declares no lane.
+    let mut older = serde_json_lenient::to_value(&declaring).unwrap();
+    older
+        .as_object_mut()
+        .unwrap()
+        .remove("credentialed_upstream");
+    let BoxControlRequest::AdmitHostIpBox(read) =
+        serde_json_lenient::from_value::<BoxControlRequest>(older).unwrap()
+    else {
+        panic!("an admit line reads as an admit");
+    };
+    assert!(!read.credentialed_upstream);
+
+    // An older client's registration has no `host_ip` field: it is an
+    // own-address registration.
+    let register = serde_json_lenient::from_str::<RegisterBoxRequest>(r#"{"name":"web"}"#).unwrap();
+    assert!(!register.host_ip);
+    let host_ip = RegisterBoxRequest {
+        host_ip: true,
+        ..register
+    };
+    let line = serde_json_lenient::to_string(&host_ip).unwrap();
+    assert!(line.contains(r#""host_ip":true"#), "{line}");
+    assert_eq!(
+        serde_json_lenient::from_str::<RegisterBoxRequest>(&line).unwrap(),
+        host_ip
+    );
+}
+
+/// BOX-155: a log read's request and every update line survive the wire,
+/// raw terminal bytes included.
+#[test]
+fn read_log_request_round_trips() {
+    let id = SessionId::mint();
+    for (offset, follow) in [(0, false), (4096, true)] {
+        let req = ReadLogRequest { id, offset, follow };
+        let bytes = serde_json_lenient::to_vec(&req).unwrap();
+        let back: ReadLogRequest = serde_json_lenient::from_slice(&bytes).unwrap();
+        assert_eq!(back, req);
+    }
+    // A client that sends only the id reads the whole log without following.
+    let bare = format!(r#"{{"id":"{id}"}}"#);
+    let back: ReadLogRequest = serde_json_lenient::from_str(&bare).unwrap();
+    assert_eq!(back.offset, 0);
+    assert!(!back.follow);
+
+    let updates = [
+        ReadLogUpdate::Output {
+            offset: 0,
+            data: b"\x1b[1mbold\x1b[0m\r\n\xff\x00".to_vec(),
+        },
+        ReadLogUpdate::Output {
+            offset: 12,
+            data: Vec::new(),
+        },
+        ReadLogUpdate::Done { offset: 12 },
+        ReadLogUpdate::Reaped,
+        ReadLogUpdate::Failed {
+            error: "the log cannot be read".to_string(),
+        },
+    ];
+    for update in updates {
+        let line = serde_json_lenient::to_string(&update).unwrap();
+        assert!(!line.contains('\n'), "one update is one line: {line}");
+        let back: ReadLogUpdate = serde_json_lenient::from_str(&line).unwrap();
+        assert_eq!(
+            back.is_terminal(),
+            !matches!(update, ReadLogUpdate::Output { .. })
+        );
+        assert_eq!(back, update);
+    }
+    let output = serde_json_lenient::to_string(&ReadLogUpdate::Output {
+        offset: 0,
+        data: b"hi".to_vec(),
+    })
+    .unwrap();
+    assert!(output.contains(r#""data":"6869""#), "{output}");
+}
+
+#[test]
+fn retire_without_an_end_is_refused_at_decode() {
+    let session = serde_json_lenient::to_string(&boxes::SessionId::mint()).unwrap();
+    let without_end = format!(r#"{{"verb":"retire_host_ip_box","session_id":{session}}}"#);
+    assert!(
+        serde_json_lenient::from_str::<BoxControlRequest>(&without_end).is_err(),
+        "a retire without `end` must not decode"
+    );
+    let stopped =
+        format!(r#"{{"verb":"retire_host_ip_box","session_id":{session},"end":"stopped"}}"#);
+    match serde_json_lenient::from_str::<BoxControlRequest>(&stopped).unwrap() {
+        BoxControlRequest::RetireHostIpBox(request) => {
+            assert_eq!(request.end, HostIpBoxEnd::Stopped);
+        }
+        other => panic!("decoded as {other:?}"),
+    }
 }

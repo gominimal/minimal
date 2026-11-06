@@ -38,6 +38,10 @@ pub(super) enum Message {
     /// Answered straight off the parser — no PTY resize, no I/O relay.
     GetScreen(oneshot::Sender<minimald_rpc::ScreenSnapshot>),
 
+    /// Hand a task run the streams of an entrypoint that runs on pipes
+    /// (T43), or say why the run gets none.
+    TakeEntrypointIo(oneshot::Sender<EntrypointIoTake>),
+
     /// Ask the attached human whether the box may publish `port` at runtime
     /// (NET-045): the box's `dynamic_ingress` is `ask`, so the bound client
     /// decides. Answered with the answer the human gave, or `None` when
@@ -249,6 +253,17 @@ impl HostHandle {
         (Self { sender }, WedgedMailbox(receiver))
     }
 
+    /// Resolves once the host's runtime loop has dropped its mailbox, so a
+    /// send from here on finds the channel closed.
+    ///
+    /// Awaiting an aborted loop task is not always enough for that: the
+    /// task a caller holds can be a watcher that stands in for the loop
+    /// (`box_actor`'s `watch_quic443_exit`), and aborting the watcher only
+    /// asks the loop to abort.
+    pub(crate) async fn closed(&self) {
+        self.sender.closed().await;
+    }
+
     /// A handle to a host that answers every attrs probe at once (with
     /// default attrs) and ignores everything else: a live host, as far as a
     /// listing can tell.
@@ -454,6 +469,23 @@ impl HostHandle {
         }
     }
 
+    /// Takes the streams of the host's entrypoint, when it runs on pipes
+    /// (T43): the write end of its stdin, and what it writes to stdout and
+    /// stderr from now on. An entrypoint that ended before the call keeps
+    /// what it wrote for the call, while the host holds its output.
+    pub(crate) async fn take_entrypoint_io(&self) -> EntrypointIoTake {
+        let (send, recv) = oneshot::channel();
+        if self
+            .sender
+            .send(Message::TakeEntrypointIo(send))
+            .await
+            .is_err()
+        {
+            return EntrypointIoTake::HostGone;
+        }
+        recv.await.unwrap_or(EntrypointIoTake::HostGone)
+    }
+
     /// Returns what a destroy of the session's workspace would lose: the
     /// VCS-exact at-risk report when the workspace is a git repository, the
     /// changed-since-activation rows otherwise, and `Unavailable` when
@@ -551,4 +583,9 @@ pub struct HostAttrs {
     /// launch. Nothing for a none box or an own-IP box, whose verdicts are
     /// decided on address leases rather than the host's cgroup tree.
     pub(crate) host_ip_enforcement: Option<HostIpEnforcement>,
+
+    /// The pid of the box's container supervisor, which a stop signals the
+    /// box's processes from (BOX-013). `None` only for attrs no host
+    /// reported.
+    pub(crate) container_pid: Option<u32>,
 }

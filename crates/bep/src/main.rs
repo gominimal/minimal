@@ -46,6 +46,7 @@ use bep::publish::{Identity, PublishError, certificate_fingerprint};
 use bep::redeemer::{BoxRedeemer, Revocations, StoreRules};
 use bep::revoke;
 use bep::signin::{self, HostKeychain, Keychain, RefreshError, Refreshed, TokenEndpoint};
+use bep::store;
 use clap::{Parser, Subcommand};
 use client_config::store_rules::StoreDenySet;
 use zeroize::{Zeroize as _, Zeroizing};
@@ -85,6 +86,21 @@ enum Command {
     /// Start the proxy and serve box connections. Give the connection token
     /// on standard input, as 64 hex digits.
     Serve(ServeArgs),
+    /// Store one secret as this program, so that the keychain puts the item
+    /// in this program's partition. `min secret set` runs this and gives the
+    /// value on standard input.
+    #[command(hide = true)]
+    StoreAdd(StoreAddArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct StoreAddArgs {
+    /// The secret's identifier.
+    id: String,
+
+    /// Store the item under the staging service, for a replacement.
+    #[arg(long)]
+    staging: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -176,6 +192,9 @@ fn run<S: KeyStore>(store: &S, args: &Args) -> ExitCode
 where
     S::Key: CaKey + Send + Sync + 'static,
 {
+    if let Some(Command::StoreAdd(add)) = &args.command {
+        return store_add(add);
+    }
     let path = match identity_path(args) {
         Ok(path) => path,
         Err(err) => {
@@ -227,7 +246,7 @@ where
     let held = rules.current();
     let started = start(store, &path, &held).and_then(|(keys, root)| match &args.command {
         Some(Command::Serve(serve_args)) => serve(serve_args, keys, root, rules, held, &path),
-        None => Ok(()),
+        Some(Command::StoreAdd(_)) | None => Ok(()),
     });
     match started {
         Ok(()) => ExitCode::SUCCESS,
@@ -238,35 +257,149 @@ where
     }
 }
 
+/// `bep store-add`: store the value on standard input. It needs no proxy key.
+fn store_add(args: &StoreAddArgs) -> ExitCode {
+    // Reserved up front, so that a usual value is not left behind in a smaller
+    // buffer when the vector grows.
+    let mut value = Zeroizing::new(Vec::with_capacity(1 << 16));
+    if let Err(err) = io::stdin().lock().read_to_end(&mut value) {
+        eprintln!("bep did not read the value from standard input: {err}");
+        return ExitCode::FAILURE;
+    }
+    let service = if args.staging {
+        store::STAGING_SERVICE
+    } else {
+        store::SERVICE
+    };
+    match store::add_as_this_program(service, &args.id, &value) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(detail) => {
+            eprintln!("{detail}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// What `bep --replace-key <role>` prints when the store did not replace the
+/// key (BEP-060).
+fn replace_failure(role: Role, err: &ReplaceError) -> String {
+    match err {
+        ReplaceError::Generate(cause) => format!(
+            "The {role} key was not replaced, because no new key was made: {cause}. The old key is still in use."
+        ),
+        ReplaceError::NoKey(cause) => format!(
+            "The {role} key was not replaced, because no new key was made: {cause}. The proxy has no {role} key now. Run `bep --replace-key {role}` again to make a new one."
+        ),
+        // BEP-014, BEP-059: a key was made, and the build refused it.
+        ReplaceError::Exportable {
+            refused: KeyError::Exportable { removed: false, .. },
+            held: true,
+        } => format!(
+            "The {role} key was not replaced. A new key was made. The keychain made it exportable. A release build does not use an exportable key. bep did not remove the new key from the keychain, so it is still there beside the old key. The proxy does not use it. The old key is still in use."
+        ),
+        ReplaceError::Exportable {
+            refused: KeyError::Exportable { removed: false, .. },
+            held: false,
+        } => format!(
+            "The {role} key was not replaced. A new key was made. The keychain made it exportable. A release build does not use an exportable key. bep did not remove the new key from the keychain. The proxy does not use it. The proxy has no {role} key now."
+        ),
+        ReplaceError::Exportable { held: true, .. } => format!(
+            "The {role} key was not replaced. A new key was made. The keychain made it exportable. A release build does not keep an exportable key, so bep removed the new key. The old key is still in use."
+        ),
+        ReplaceError::Exportable { held: false, .. } => format!(
+            "The {role} key was not replaced. A new key was made. The keychain made it exportable. A release build does not keep an exportable key, so bep removed the new key. The proxy has no {role} key now."
+        ),
+        ReplaceError::MoveNoKey(cause) => format!(
+            "The {role} key was not replaced: {cause}. The proxy has no {role} key now. Run `bep --replace-key {role}` again to make a new one."
+        ),
+        ReplaceError::Unread => format!(
+            "The {role} key was not replaced. The proxy has no {role} key now. An earlier `bep --replace-key {role}` set a {role} key aside in the keychain. bep did not read which {role} key the identity file names, so it did not check whether that key is the one in use. Nothing was changed. Correct the problem above, then run `bep --replace-key {role}` again."
+        ),
+        ReplaceError::RemoveNoKey(cause) => format!(
+            "The {role} key was not replaced: {cause}. The proxy has no {role} key now. Run `bep --replace-key {role}` again to make a new one."
+        ),
+        ReplaceError::Remove(cause) | ReplaceError::Move(cause) => {
+            format!("The {role} key was not replaced. The old key is still in use: {cause}.")
+        }
+        ReplaceError::Restore { moved, restored } => format!(
+            "The {role} key was not replaced: {moved}. The old key was not put back: {restored}. The proxy has no {role} key now. Run `bep --replace-key {role}` again to make a new one."
+        ),
+        // A run of the command first tries the move back again.
+        ReplaceError::Recover(cause) => format!(
+            "The {role} key was not replaced. An earlier `bep --replace-key {role}` stopped before it finished, and its old key was not put back: {cause}. The proxy has no {role} key now. Run `bep --replace-key {role}` again to put the old key back and replace it."
+        ),
+        ReplaceError::Check(cause) => format!(
+            "The {role} key was not replaced. The proxy has no {role} key now. The keychain did not say whether an earlier `bep --replace-key {role}` left keys aside: {cause}. Nothing was changed."
+        ),
+    }
+}
+
+/// What `bep --replace-key <role>` prints when the new key is in use and
+/// the store did not remove the old key (BEP-060).
+fn old_key_kept(role: Role, cause: &KeyError) -> String {
+    format!(
+        "The old {role} key was not removed: {cause}. The proxy does not use it. Run `bep --replace-key {role}` again to make another new key and remove the old one."
+    )
+}
+
+/// The `kid` that `identity` names for `role`, and the problem when the
+/// entry for `role` is not a key.
+fn published_kid(identity: &Identity, role: Role) -> (keys::PublishedKid, Option<String>) {
+    if !identity.roles().contains(&role) {
+        return (keys::PublishedKid::Absent, None);
+    }
+    match identity.key(role) {
+        Ok(key) => (keys::PublishedKid::Kid(key.kid()), None),
+        Err(err) => (keys::PublishedKid::Unread, Some(err.to_string())),
+    }
+}
+
 /// `bep --replace-key <role>`. It needs no other key and no file, so it
 /// works when the proxy does not start.
 fn replace_key<S: KeyStore>(store: &S, role: Role, path: &Path, rules: &[StoreRule]) -> ExitCode
 where
     S::Key: CaKey,
 {
-    let key = match keys::replace(store, role) {
-        Ok(key) => key,
-        Err(ReplaceError::Remove(err)) => {
-            eprintln!("The {role} key was not replaced. The old key is still in use: {err}.");
-            return ExitCode::FAILURE;
+    // BEP-060: the `kid` the file names tells the key in use from a
+    // replaced key, when an earlier replacement left one aside alone.
+    let read = match Identity::read(path) {
+        Ok(identity) => Ok(Some(identity)),
+        Err(PublishError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+            Ok(None)
         }
-        Err(ReplaceError::Generate(err)) => {
-            eprintln!(
-                "The old {role} key was deleted, but no new key was made: {err}. Run `bep --replace-key {role}` again."
-            );
+        Err(err) => Err(err),
+    };
+    let (published, unread) = match &read {
+        Ok(Some(identity)) => published_kid(identity, role),
+        Ok(None) => (keys::PublishedKid::Absent, None),
+        Err(err) => (keys::PublishedKid::Unread, Some(err.to_string())),
+    };
+    let (key, old_kept) = match keys::replace_outcome(store, role, &published) {
+        Ok(replaced) => (replaced.key, replaced.old_kept),
+        Err(err) => {
+            // The identity file is not written: it still names the key the
+            // store holds, or the store holds no key for the role.
+            if let (ReplaceError::Unread, Some(problem)) = (&err, &unread) {
+                eprintln!("{problem}");
+            }
+            eprintln!("{}", replace_failure(role, &err));
             return ExitCode::FAILURE;
         }
     };
     println!("{}", keys::replacement_report(role));
+    if let Some(cause) = &old_kept {
+        // BEP-060: a person who replaces a leaked key must learn that the
+        // old key still exists, though the proxy no longer loads it.
+        eprintln!("{}", old_key_kept(role, cause));
+    }
     // The identity file still names the old key. Publish the new one now, so
     // that a mint never seals to a deleted key. The other roles come from
     // the store, or from the old file when the store refuses them.
     // BEP-060: a file that is there and not read can name a role whose key
     // the store lost. A file written without that role makes the next start
     // generate the key silently, so the file is left as it is.
-    let previous = match Identity::read(path) {
-        Ok(identity) => Some(identity),
-        Err(PublishError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => None,
+    let previous = match read {
+        Ok(previous) => previous,
         Err(err) => {
             eprintln!("{err}");
             eprintln!(
@@ -331,7 +464,13 @@ where
         Ok(()) => {
             tracing::info!(path = %path.display(), "published the proxy identity");
             println!("Published the new public key to {}.", path.display());
-            ExitCode::SUCCESS
+            // BEP-060: an old key that still exists is not a finished
+            // replacement, so a script does not read it as one.
+            if old_kept.is_some() {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
         }
         Err(err) => {
             eprintln!("{err}");
@@ -362,7 +501,7 @@ where
         Err(PublishError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => None,
         Err(err) => return Err(err.to_string()),
     };
-    let published = previous.as_ref().map(Identity::roles).unwrap_or_default();
+
     // BEP-005: the store keeps no creation time. A root key that the store
     // does not hold before `keys::load` is one this start generates, so its
     // validity starts now. A root key loaded from the store has an unknown
@@ -371,7 +510,14 @@ where
     // The clock is read before `keys::load`, so a clock fault stops the
     // start before it generates a root key with no known validity.
     let root_made_at = if root_absent { Some(unix_now()?) } else { None };
-    let loaded = keys::load(store, &published).map_err(|err| err.to_string())?;
+    let loaded = keys::load_with(store, |role| {
+        previous
+            .as_ref()
+            .map_or(keys::PublishedKid::Absent, |identity| {
+                published_kid(identity, role).0
+            })
+    })
+    .map_err(|err| err.to_string())?;
     // BEP-013, BEP-072: each start issues the root from the held root key,
     // so a changed set of registered names reaches the next box created.
     let (identity, root) = Identity::of(&loaded)
@@ -485,9 +631,9 @@ impl<K: CaKey + Send + Sync + 'static> StoreAdmission<K> {
     /// Issues the root again for `rules` when their names changed, and
     /// publishes it, or publishes a root that an earlier call did not.
     /// Gives the names the root in use permits, and whether the re-issue
-    /// and the publish succeeded. On an error the root in use stays, and
-    /// the caller tries again at the next CONNECT.
-    fn reissue(&self, rules: &[StoreRule], unpublished: &mut bool) -> (Union, bool) {
+    /// and the publish succeeded, or why not. On an error the root in use
+    /// stays, and the caller tries again at the next CONNECT.
+    fn reissue(&self, rules: &[StoreRule], unpublished: &mut bool) -> (Union, Result<(), String>) {
         let mut ca = self.ca.lock().unwrap_or_else(PoisonError::into_inner);
         let issued = match ca.reissue_root(registered_union(rules), SystemTime::now()) {
             Ok(issued) => issued,
@@ -496,7 +642,8 @@ impl<K: CaKey + Send + Sync + 'static> StoreAdmission<K> {
                     error = %err,
                     "did not re-issue the root for the changed secret-store rules; the old names stay admitted"
                 );
-                return (ca.union().clone(), false);
+                let reason = format!("the root certificate was not re-issued: {err}");
+                return (ca.union().clone(), Err(reason));
             }
         };
         if issued || *unpublished {
@@ -507,11 +654,48 @@ impl<K: CaKey + Send + Sync + 'static> StoreAdmission<K> {
                     error = %err,
                     "did not publish the re-issued root; boxes created now get the old root"
                 );
-                return (ca.union().clone(), false);
+                let reason = format!(
+                    "the root certificate was not written to {}: {err}",
+                    self.identity.display()
+                );
+                return (ca.union().clone(), Err(reason));
             }
             *unpublished = false;
         }
-        (ca.union().clone(), true)
+        (ca.union().clone(), Ok(()))
+    }
+
+    /// Re-issues and publishes the root for `rules`, and moves the admitted
+    /// set to the names the root in use permits. A failure keeps the retry
+    /// delay for the same rules. Gives the admitted authorities, and
+    /// whether the re-issue and the publish succeeded, or why not.
+    fn update(
+        &self,
+        admitted: &mut Admitted,
+        rules: Vec<StoreRule>,
+    ) -> (Vec<(String, u16)>, Result<(), String>) {
+        let (union, done) = self.reissue(&rules, &mut admitted.unpublished);
+        let authorities = store_authorities(&rules, &union);
+        if authorities != admitted.authorities {
+            tracing::info!(
+                before = ?admitted.authorities,
+                after = ?authorities,
+                identity = %self.identity.display(),
+                "admits the changed secret-store upstreams with no restart"
+            );
+        }
+        admitted.authorities.clone_from(&authorities);
+        if done.is_ok() {
+            admitted.rules = rules;
+            admitted.failed = None;
+        } else {
+            tracing::info!(
+                retry_secs = REISSUE_RETRY.as_secs(),
+                "re-issues or publishes the root again after the retry delay, or when the rules change"
+            );
+            admitted.failed = Some((rules, Instant::now() + REISSUE_RETRY));
+        }
+        (authorities, done)
     }
 
     /// Writes `root` to the identity file when the file names the root key
@@ -549,28 +733,35 @@ impl<K: CaKey + Send + Sync + 'static> StoreAuthorities for StoreAdmission<K> {
         {
             return admitted.authorities.clone();
         }
-        let (union, done) = self.reissue(&rules, &mut admitted.unpublished);
-        let authorities = store_authorities(&rules, &union);
-        if authorities != admitted.authorities {
-            tracing::info!(
-                before = ?admitted.authorities,
-                after = ?authorities,
-                identity = %self.identity.display(),
-                "admits the changed secret-store upstreams with no restart"
+        self.update(&mut admitted, rules).0
+    }
+}
+
+/// A store registration change that the control socket reports: `min
+/// secret set` asks after it writes a rule. The root is re-issued and
+/// published at once, not at the next CONNECT, so the next box created
+/// reads a root that permits the new upstream (#2746, BEP-013). The CONNECT
+/// path stays the fallback for a rule file edited by hand.
+impl<K: CaKey + Send + Sync + 'static> bep::control::RecertifyRoot for StoreAdmission<K> {
+    fn recertify_root(&self) -> Result<(), String> {
+        let rules = self.rules.current();
+        let mut admitted = self.admitted.lock().unwrap_or_else(PoisonError::into_inner);
+        if admitted.rules == rules && !admitted.unpublished {
+            tracing::debug!(
+                store_rules = rules.len(),
+                "the published root already permits the secret-store rules"
             );
+            return Ok(());
         }
-        admitted.authorities.clone_from(&authorities);
-        if done {
-            admitted.rules = rules;
-            admitted.failed = None;
-        } else {
-            tracing::info!(
-                retry_secs = REISSUE_RETRY.as_secs(),
-                "re-issues or publishes the root again after the retry delay, or when the rules change"
-            );
-            admitted.failed = Some((rules, Instant::now() + REISSUE_RETRY));
-        }
-        authorities
+        let store_rules = rules.len();
+        let (_, done) = self.update(&mut admitted, rules);
+        tracing::info!(
+            store_rules,
+            published = done.is_ok(),
+            identity = %self.identity.display(),
+            "re-certified the root for a secret-store registration change"
+        );
+        done
     }
 }
 
@@ -1202,10 +1393,80 @@ fn start_audit_log(dir: &Path, quarantine: bool) -> Result<(AuditLog, revoke::Re
     Ok((log, restored))
 }
 
+/// The environment variable that sets the size bound of an audit segment,
+/// in bytes. It is a test surface: the end-to-end suite sets it so the log
+/// rotates after a few requests. Only `bep serve` reads it, and only in a
+/// debug build. A release build ignores it, so a stray value cannot make
+/// the log rotate fast and prune its history.
+const AUDIT_SEGMENT_BYTES_ENV: &str = "BEP_AUDIT_SEGMENT_BYTES";
+
+/// The segment bound that `value` of [`AUDIT_SEGMENT_BYTES_ENV`] sets: a
+/// positive integer, else [`audit::SEGMENT_BYTES`]. An unset, empty, zero
+/// or unparsable value keeps the default.
+fn audit_segment_bound(value: Option<&std::ffi::OsStr>) -> u64 {
+    audit_segment_override(value).unwrap_or(audit::SEGMENT_BYTES)
+}
+
+/// The positive integer that `value` of [`AUDIT_SEGMENT_BYTES_ENV`] holds,
+/// or `None` when it is unset, empty, zero or unparsable.
+fn audit_segment_override(value: Option<&std::ffi::OsStr>) -> Option<u64> {
+    value
+        .and_then(|value| value.to_str())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|bound| *bound > 0)
+}
+
+/// The rotation bounds of the audit log that `bep serve` writes. In a
+/// debug build, the segment bound follows [`AUDIT_SEGMENT_BYTES_ENV`] when
+/// it is set. A release build always keeps [`audit::SEGMENT_BYTES`].
+fn audit_rotation() -> audit::Rotation {
+    audit_rotation_for(
+        std::env::var_os(AUDIT_SEGMENT_BYTES_ENV),
+        cfg!(debug_assertions),
+    )
+}
+
+/// [`audit_rotation`] for the value `set` of [`AUDIT_SEGMENT_BYTES_ENV`],
+/// in a debug build when `debug` is true and a release build when false.
+fn audit_rotation_for(set: Option<std::ffi::OsString>, debug: bool) -> audit::Rotation {
+    if !debug && set.is_some() {
+        tracing::warn!(
+            variable = AUDIT_SEGMENT_BYTES_ENV,
+            bound = audit::SEGMENT_BYTES,
+            "ignored the audit segment test override: this is a release build"
+        );
+    }
+    let value = set.filter(|_| debug);
+    let bound = audit_segment_bound(value.as_deref());
+    match (value.is_some(), audit_segment_override(value.as_deref())) {
+        (true, Some(_)) => tracing::info!(
+            bound,
+            variable = AUDIT_SEGMENT_BYTES_ENV,
+            default = audit::SEGMENT_BYTES,
+            "audit segment bound set by the test override"
+        ),
+        (true, None) => tracing::warn!(
+            variable = AUDIT_SEGMENT_BYTES_ENV,
+            bound,
+            "ignored the audit segment test override: the value is not a positive integer"
+        ),
+        (false, _) => {}
+    }
+    audit::Rotation {
+        bound,
+        ..audit::Rotation::default()
+    }
+}
+
 /// Opens the audit log in `dir` for `bep serve`. The log holds the
 /// directory, so a second `bep serve` on it is refused.
 fn open_audit_log(dir: &Path) -> Result<AuditLog, String> {
-    AuditLog::open_dir(dir, audit::Rotation::default()).map_err(|err| {
+    open_audit_log_with(dir, audit_rotation())
+}
+
+/// [`open_audit_log`] with the rotation bounds `rotation`.
+fn open_audit_log_with(dir: &Path, rotation: audit::Rotation) -> Result<AuditLog, String> {
+    AuditLog::open_dir(dir, rotation).map_err(|err| {
         if err.kind() == io::ErrorKind::WouldBlock {
             tracing::error!(audit = %dir.display(), error = %err, "refused the start: the audit log has another writer");
             format!(
@@ -1277,16 +1538,16 @@ fn serve<K: CaKey + Send + Sync + 'static>(
     // `off_module`. The set starts with the rules that `start` issued the
     // root under, and each CONNECT asks for the current rules, so a widened
     // rule re-issues the root and is admitted with no restart (#2618).
-    let admitted = Admission::with_source(
-        &[GITHUB],
-        Arc::new(StoreAdmission::new(
-            Arc::clone(&rules),
-            Arc::clone(&ca),
-            root_key.public().kid(),
-            identity.to_path_buf(),
-            held,
-        )),
-    );
+    // The same source takes `recertify_root` on the control socket, which
+    // `min secret set` sends after it writes a rule (#2746).
+    let store_admission = Arc::new(StoreAdmission::new(
+        Arc::clone(&rules),
+        Arc::clone(&ca),
+        root_key.public().kid(),
+        identity.to_path_buf(),
+        held,
+    ));
+    let admitted = Admission::with_source(&[GITHUB], Arc::clone(&store_admission) as _);
     // One log, one writer: the proxy's decisions and the control socket's
     // mint and revocation records share the chain (BEP-067).
     let log: Arc<Mutex<AuditLog>> = Arc::new(Mutex::new(log));
@@ -1318,7 +1579,8 @@ fn serve<K: CaKey + Send + Sync + 'static>(
         let control_socket = wiring
             .control(&control, log, key_bound)
             .map_err(|err| format!("bep did not listen on {}: {err}", control.display()))?
-            .with_rotation(ca);
+            .with_rotation(ca)
+            .with_recertification(store_admission);
         tracing::info!(
             listener = %args.listener.display(),
             control = %control.display(),
@@ -1713,6 +1975,7 @@ mod tests {
 
     use super::*;
     use bep::ca::Leaf;
+    use bep::keys::Slot;
     use bep::proxy::LeafIssuer;
 
     // BEP-068: a line that does not parse can be a revocation, so the start
@@ -1853,6 +2116,99 @@ mod tests {
         );
         drop(first);
         open_audit_log(&audit).unwrap();
+    }
+
+    // T35: `BEP_AUDIT_SEGMENT_BYTES` sets the segment bound when it is a
+    // positive integer, and a log opened with that bound rotates past it.
+    #[test]
+    fn audit_segment_bound_follows_the_test_override() {
+        use bep::audit::{Decision, Kind, Mapping, Outcome};
+        use std::ffi::OsStr;
+        assert_eq!(audit_segment_bound(None), audit::SEGMENT_BYTES);
+        assert_eq!(audit_segment_bound(Some(OsStr::new("4096"))), 4096);
+        assert_eq!(audit_segment_bound(Some(OsStr::new(" 512 "))), 512);
+        for ignored in ["", "0", "-1", "lots", "1.5"] {
+            assert_eq!(
+                audit_segment_bound(Some(OsStr::new(ignored))),
+                audit::SEGMENT_BYTES,
+                "{ignored:?}"
+            );
+            assert_eq!(audit_segment_override(Some(OsStr::new(ignored))), None);
+        }
+        assert_eq!(audit_segment_override(Some(OsStr::new("512"))), Some(512));
+
+        // The gate that `open_audit_log` goes through: a debug build takes
+        // the override, and a release build keeps the default bound.
+        let set = || Some(std::ffi::OsString::from("512"));
+        assert_eq!(audit_rotation_for(set(), true).bound, 512);
+        assert_eq!(audit_rotation_for(set(), false).bound, audit::SEGMENT_BYTES);
+        assert_eq!(audit_rotation_for(None, true).bound, audit::SEGMENT_BYTES);
+        assert_eq!(audit_rotation_for(None, false).bound, audit::SEGMENT_BYTES);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("audit");
+        let rotation = audit::Rotation {
+            bound: audit_segment_bound(Some(OsStr::new("512"))),
+            ..audit::Rotation::default()
+        };
+        let mut log = open_audit_log_with(&dir, rotation).unwrap();
+        for n in 0..20 {
+            log.append(&Decision {
+                kind: Kind::Decision,
+                box_id: format!("box-{n}"),
+                authority: String::new(),
+                identifier: None,
+                jti: String::new(),
+                mapping: Mapping::ModuleUnmapped,
+                outcome: Outcome::Admit,
+                marker: None,
+            })
+            .unwrap();
+        }
+        drop(log);
+        let segments = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".jsonl"))
+            .count();
+        assert!(segments > 1, "the log did not rotate: {segments} segment");
+        assert_eq!(audit::verify_chain(&dir).unwrap(), Ok(20));
+    }
+
+    // BEP-068 (#2460): the log `bep serve` writes is the log `min box audit`
+    // reads. The writer starts as `bep serve` does, and the reader is the
+    // `LogReader` the `min box audit` command uses, over the same directory.
+    #[test]
+    fn serve_writes_audit_segments_the_reader_reads() {
+        use bep::audit::{Decision, Kind, Mapping, Outcome};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("audit");
+        let (mut log, restored) = start_audit_log(&dir, false).unwrap();
+        assert!(restored.box_ids.is_empty());
+        let written = log
+            .append(&Decision {
+                kind: Kind::Decision,
+                box_id: "box-serve".to_owned(),
+                authority: "github.com".to_owned(),
+                identifier: None,
+                jti: String::new(),
+                mapping: Mapping::ModuleUnmapped,
+                outcome: Outcome::Admit,
+                marker: None,
+            })
+            .unwrap();
+        drop(log);
+
+        let segment = dir.join(audit::segment_name(0));
+        assert_eq!(segment.file_name().unwrap(), "audit-0.jsonl");
+        assert!(segment.is_file(), "{} is missing", segment.display());
+
+        let batch = audit::LogReader::new(&dir).read_new().unwrap();
+        assert_eq!(batch.skipped, 0);
+        assert_eq!(batch.segments, vec![segment]);
+        let records: Vec<_> = batch.entries.into_iter().map(|e| e.record).collect();
+        assert_eq!(records, vec![written]);
+        assert_eq!(records[0].subject, "box-serve");
     }
 
     /// A leaf issuer that signs no leaf, so the test opens no tunnel.
@@ -2651,6 +3007,154 @@ mod tests {
         );
     }
 
+    /// Sends one `recertify_root` line on `stream`, and reads the reply.
+    async fn ask_recertify(stream: &mut BufReader<UnixStream>) -> Reply {
+        let mut line =
+            serde_json::to_string(&bep::control::RecertifyRequest::RecertifyRoot).unwrap();
+        line.push('\n');
+        stream.get_mut().write_all(line.as_bytes()).await.unwrap();
+        let mut reply = String::new();
+        stream.read_line(&mut reply).await.unwrap();
+        serde_json::from_str(&reply).unwrap()
+    }
+
+    // BEP-013, #2746: `min secret set` reports a store registration change
+    // on the control socket. The proxy re-issues the root and publishes it
+    // before it replies, with no CONNECT, so the next box reads a root that
+    // permits the new upstream. A failed publish is the reply's reason, and
+    // the next request tries again at once.
+    #[tokio::test]
+    async fn a_store_registration_change_recertifies_the_published_root_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let path = dir.path().join("identity.json");
+        std::fs::write(&config, "").unwrap();
+        let rules = Arc::new(ClientRules::new(Some((
+            config.clone(),
+            dir.path().join("organization.toml"),
+        ))));
+        let keys: &'static ProxyKeys<CaTestKey> = Box::leak(Box::new(ProxyKeys {
+            sealing: CaTestKey::new(Role::Sealing),
+            root: CaTestKey::new(Role::Root),
+            signing: CaTestKey::new(Role::Signing),
+        }));
+        let held = rules.current();
+        let at = SystemTime::now();
+        let (identity, root) = Identity::of(keys)
+            .issuing_root(&keys.root, registered_union(&held), at)
+            .unwrap();
+        identity.publish(&path).unwrap();
+        let before = Identity::read(&path)
+            .unwrap()
+            .root_certificate_der()
+            .unwrap();
+        let ca = Arc::new(Mutex::new(
+            Ca::with_root(&keys.root, &keys.signing, root, at).unwrap(),
+        ));
+        let source = Arc::new(StoreAdmission::new(
+            Arc::clone(&rules),
+            Arc::clone(&ca),
+            keys.root.public().kid(),
+            path.clone(),
+            held,
+        ));
+        let control = dir.path().join("bep/control.sock");
+        let socket = Control::bind(&control, Registry::default(), BoxRegistry::default())
+            .unwrap()
+            .with_recertification(Arc::clone(&source) as _);
+        tokio::spawn(socket.run());
+        let mut stream = BufReader::new(UnixStream::connect(&control).await.unwrap());
+
+        // No rule changed: the reply is ok, and the published root stays.
+        assert!(ask_recertify(&mut stream).await.ok);
+        let unchanged = Identity::read(&path).unwrap();
+        assert_eq!(unchanged.root_certificate_der().unwrap(), before);
+
+        // `min secret set` writes a rule and asks. No CONNECT runs.
+        std::fs::write(&config, OPENAI_RULE).unwrap();
+        let reply = ask_recertify(&mut stream).await;
+        assert!(reply.ok, "{reply:?}");
+        let published = Identity::read(&path).unwrap();
+        let after = published.root_certificate_der().unwrap();
+        assert_ne!(after, before, "the published root was not re-issued");
+        assert_eq!(after, ca.lock().unwrap().root().to_vec());
+        assert_eq!(
+            published.key(Role::Root).unwrap().kid(),
+            keys.root.public().kid()
+        );
+        // A box that reads the published root now trusts the new upstream.
+        // A box created before the change keeps the root it read.
+        let leaf = ca
+            .lock()
+            .unwrap()
+            .issue_leaf("api.openai.com", SystemTime::now())
+            .unwrap();
+        let check_at = SystemTime::now();
+        let after_der = rustls::pki_types::CertificateDer::from(after.clone());
+        let before_der = rustls::pki_types::CertificateDer::from(before.clone());
+        assert!(validates(&after_der, &leaf, "api.openai.com", check_at));
+        assert!(!validates(&before_der, &leaf, "api.openai.com", check_at));
+        // The admitted set follows with no second re-issue.
+        assert_eq!(
+            source.admitted.lock().unwrap().authorities,
+            vec![("api.openai.com".to_owned(), 443)]
+        );
+
+        // A root key replaced in the file: the publish fails, and the reply
+        // says why. The file stays as it was.
+        let other: &'static ProxyKeys<CaTestKey> = Box::leak(Box::new(ProxyKeys {
+            sealing: CaTestKey::new(Role::Sealing),
+            root: CaTestKey::new(Role::Root),
+            signing: CaTestKey::new(Role::Signing),
+        }));
+        let (replaced, _) = Identity::of(other)
+            .issuing_root(&other.root, registered_union(&[]), at)
+            .unwrap();
+        replaced.publish(&path).unwrap();
+        let foreign = Identity::read(&path)
+            .unwrap()
+            .root_certificate_der()
+            .unwrap();
+        std::fs::write(&config, "").unwrap();
+        let refused = ask_recertify(&mut stream).await;
+        assert!(!refused.ok);
+        let reason = refused.error.unwrap();
+        assert!(
+            reason.starts_with(&format!(
+                "the root certificate was not written to {}: ",
+                path.display()
+            )),
+            "{reason}"
+        );
+        assert_eq!(
+            Identity::read(&path)
+                .unwrap()
+                .root_certificate_der()
+                .unwrap(),
+            foreign
+        );
+
+        // The next request does not wait for the CONNECT retry delay.
+        published.publish(&path).unwrap();
+        let retried = ask_recertify(&mut stream).await;
+        assert!(retried.ok, "{retried:?}");
+        assert_eq!(
+            Identity::read(&path)
+                .unwrap()
+                .root_certificate_der()
+                .unwrap(),
+            ca.lock().unwrap().root().to_vec()
+        );
+        assert!(source.admitted.lock().unwrap().authorities.is_empty());
+
+        // A control socket with no root to re-certify refuses the request.
+        let bare = dir.path().join("bare/control.sock");
+        let socket = Control::bind(&bare, Registry::default(), BoxRegistry::default()).unwrap();
+        tokio::spawn(socket.run());
+        let mut stream = BufReader::new(UnixStream::connect(&bare).await.unwrap());
+        assert!(!ask_recertify(&mut stream).await.ok);
+    }
+
     // BEP-032: a redemption stats the files and reads them only when a
     // stamp changed or a file changed inside the racy window.
     #[test]
@@ -2721,7 +3225,7 @@ mod tests {
             .expect("the arguments parse");
             match args.command {
                 Some(Command::Serve(serve)) => serve.exit_on_stdin_close,
-                None => panic!("no serve command"),
+                _ => panic!("no serve command"),
             }
         };
         assert!(!parsed(&[]), "a hand-run proxy outlives its input");
@@ -2741,7 +3245,7 @@ mod tests {
             )
             .map(|args| match args.command {
                 Some(Command::Serve(serve)) => serve,
-                None => panic!("no serve command"),
+                _ => panic!("no serve command"),
             })
         };
         assert_eq!(serve_args(&[]).unwrap().key_bound(), KeyBound::default());
@@ -2891,5 +3395,629 @@ mod tests {
         );
         assert_eq!(chosen(Some(""), None), None);
         assert_eq!(chosen(None, None), None);
+    }
+
+    /// A store whose keys are exportable, as the macOS login keychain
+    /// makes a key for the program that generated it. The roles in `held`
+    /// are the exception: their keys are non-exportable. The keys are held
+    /// under the custody rule of `build`.
+    struct ExportableStore {
+        build: keys::Build,
+        held: Vec<Role>,
+        pairs: Mutex<std::collections::HashMap<Role, Arc<rcgen::KeyPair>>>,
+    }
+
+    /// A key of an [`ExportableStore`].
+    struct ExportableKey {
+        role: Role,
+        pair: Arc<rcgen::KeyPair>,
+        build: keys::Build,
+        exportable: bool,
+    }
+
+    impl ExportableStore {
+        fn new(build: keys::Build) -> Self {
+            Self {
+                build,
+                held: Vec::new(),
+                pairs: Mutex::default(),
+            }
+        }
+
+        /// A store that holds a key for each role, as a debug build left
+        /// them. The keys of the roles in `held` are non-exportable.
+        fn holding_every_key(build: keys::Build, held: &[Role]) -> Self {
+            let mut store = Self::new(build);
+            store.held = held.to_vec();
+            for role in Role::ALL {
+                store.pairs.lock().unwrap().insert(
+                    role,
+                    Arc::new(rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap()),
+                );
+            }
+            store
+        }
+
+        fn key(&self, role: Role, pair: Arc<rcgen::KeyPair>) -> ExportableKey {
+            ExportableKey {
+                role,
+                pair,
+                build: self.build,
+                exportable: !self.held.contains(&role),
+            }
+        }
+    }
+
+    impl HeldKey for ExportableKey {
+        fn role(&self) -> Role {
+            self.role
+        }
+
+        fn public(&self) -> ProxyPublicKey {
+            ProxyPublicKey::from_sec1_bytes(self.pair.public_key_raw()).unwrap()
+        }
+
+        fn exportable(&self) -> bool {
+            self.exportable
+        }
+
+        fn build(&self) -> keys::Build {
+            self.build
+        }
+
+        fn agree(&self, _peer: &ProxyPublicKey) -> Result<Zeroizing<Vec<u8>>, KeyError> {
+            Err(KeyError::Store {
+                role: self.role,
+                detail: "an exportable test key does no key agreement".into(),
+            })
+        }
+
+        fn probe(&self) -> Result<(), KeyError> {
+            Ok(())
+        }
+    }
+
+    impl CaKey for ExportableKey {
+        fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, KeyError> {
+            rcgen::SigningKey::sign(&*self.pair, msg).map_err(|err| KeyError::Store {
+                role: self.role,
+                detail: err.to_string(),
+            })
+        }
+    }
+
+    impl KeyStore for ExportableStore {
+        type Key = ExportableKey;
+
+        fn find(&self, role: Role) -> Result<Option<ExportableKey>, KeyError> {
+            let pair = self.pairs.lock().unwrap().get(&role).cloned();
+            Ok(pair.map(|pair| self.key(role, pair)))
+        }
+
+        fn generate_in(&self, role: Role, slot: Slot) -> Result<ExportableKey, KeyError> {
+            assert_eq!(slot, Slot::Held, "this test store holds one slot");
+            let pair =
+                Arc::new(rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap());
+            let key = self.key(role, Arc::clone(&pair));
+            // The keychain's generation site takes the same decision, and
+            // holds no key it refuses.
+            keys::keep_generated(&key)?;
+            self.pairs.lock().unwrap().insert(role, pair);
+            Ok(key)
+        }
+
+        fn remove_in(&self, role: Role, slot: Slot) -> Result<(), KeyError> {
+            if slot == Slot::Held {
+                self.pairs.lock().unwrap().remove(&role);
+            }
+            Ok(())
+        }
+
+        fn holds_in(&self, role: Role, slot: Slot) -> Result<bool, KeyError> {
+            Ok(slot == Slot::Held && self.pairs.lock().unwrap().contains_key(&role))
+        }
+
+        fn kid_in(&self, role: Role, slot: Slot) -> Result<Option<String>, KeyError> {
+            if slot != Slot::Held {
+                return Ok(None);
+            }
+            Ok(self.find(role)?.map(|key| key.public().kid()))
+        }
+
+        fn relabel(&self, role: Role, _from: Slot, _to: Slot) -> Result<(), KeyError> {
+            Err(KeyError::Store {
+                role,
+                detail: "this test store moves no key".into(),
+            })
+        }
+    }
+
+    /// A store that holds the keys of an [`ExportableStore`] and makes no
+    /// new key.
+    struct NoNewKeyStore(ExportableStore);
+
+    impl KeyStore for NoNewKeyStore {
+        type Key = ExportableKey;
+
+        fn find(&self, role: Role) -> Result<Option<ExportableKey>, KeyError> {
+            self.0.find(role)
+        }
+
+        fn generate_in(&self, role: Role, _slot: Slot) -> Result<ExportableKey, KeyError> {
+            Err(KeyError::Store {
+                role,
+                detail: "the keychain is locked".into(),
+            })
+        }
+
+        fn remove_in(&self, role: Role, slot: Slot) -> Result<(), KeyError> {
+            self.0.remove_in(role, slot)
+        }
+
+        fn holds_in(&self, role: Role, slot: Slot) -> Result<bool, KeyError> {
+            self.0.holds_in(role, slot)
+        }
+
+        fn kid_in(&self, role: Role, slot: Slot) -> Result<Option<String>, KeyError> {
+            self.0.kid_in(role, slot)
+        }
+
+        fn relabel(&self, role: Role, from: Slot, to: Slot) -> Result<(), KeyError> {
+            self.0.relabel(role, from, to)
+        }
+    }
+
+    // BEP-060: a replacement that makes no new key keeps the old key and the
+    // identity file as they were, and names the cause, not the same command.
+    #[test]
+    fn replace_key_failure_keeps_the_old_key_in_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/identity.json");
+        let store = ExportableStore::new(keys::Build::Debug);
+        let (keys, _root) = start(&store, &path, &[]).unwrap();
+        let old = keys.sealing.public();
+        let published = std::fs::read(&path).unwrap();
+
+        let store = NoNewKeyStore(store);
+        let (code, log) = logged(|| replace_key(&store, Role::Sealing, &path, &[]));
+        assert_eq!(code, ExitCode::FAILURE);
+        assert_eq!(std::fs::read(&path).unwrap(), published);
+        assert_eq!(
+            store.find(Role::Sealing).unwrap().unwrap().public(),
+            old,
+            "the old key is still held"
+        );
+        assert_eq!(
+            log.matches("generated no new proxy key and kept the old key")
+                .count(),
+            1,
+            "{log}"
+        );
+        assert!(log.contains("role=sealing"), "{log}");
+
+        let Err(err) = keys::replace(&store, Role::Sealing) else {
+            panic!("the replacement made a key");
+        };
+        let message = replace_failure(Role::Sealing, &err);
+        assert_eq!(
+            message,
+            "The sealing key was not replaced, because no new key was made: the key store failed for the sealing key: the keychain is locked. The old key is still in use."
+        );
+        assert!(!message.contains("again"), "{message}");
+    }
+
+    /// A store that holds the keys of an [`ExportableStore`] under the
+    /// role's label, and the other slots beside them. It does not remove an
+    /// old key that a replacement moved aside.
+    struct KeepsOldStore {
+        inner: ExportableStore,
+        side: Mutex<std::collections::HashMap<(Role, Slot), Arc<rcgen::KeyPair>>>,
+    }
+
+    impl KeepsOldStore {
+        fn take(&self, role: Role, slot: Slot) -> Option<Arc<rcgen::KeyPair>> {
+            if slot == Slot::Held {
+                self.inner.pairs.lock().unwrap().remove(&role)
+            } else {
+                self.side.lock().unwrap().remove(&(role, slot))
+            }
+        }
+
+        fn put(&self, role: Role, slot: Slot, pair: Arc<rcgen::KeyPair>) {
+            if slot == Slot::Held {
+                self.inner.pairs.lock().unwrap().insert(role, pair);
+            } else {
+                self.side.lock().unwrap().insert((role, slot), pair);
+            }
+        }
+    }
+
+    impl KeyStore for KeepsOldStore {
+        type Key = ExportableKey;
+
+        fn find(&self, role: Role) -> Result<Option<ExportableKey>, KeyError> {
+            self.inner.find(role)
+        }
+
+        fn generate_in(&self, role: Role, slot: Slot) -> Result<ExportableKey, KeyError> {
+            let pair =
+                Arc::new(rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap());
+            let key = self.inner.key(role, Arc::clone(&pair));
+            keys::keep_generated(&key)?;
+            self.put(role, slot, pair);
+            Ok(key)
+        }
+
+        fn remove_in(&self, role: Role, slot: Slot) -> Result<(), KeyError> {
+            if slot == Slot::Old && self.side.lock().unwrap().contains_key(&(role, slot)) {
+                return Err(KeyError::Store {
+                    role,
+                    detail: "the keychain is locked".into(),
+                });
+            }
+            self.take(role, slot);
+            Ok(())
+        }
+
+        fn holds_in(&self, role: Role, slot: Slot) -> Result<bool, KeyError> {
+            Ok(if slot == Slot::Held {
+                self.inner.pairs.lock().unwrap().contains_key(&role)
+            } else {
+                self.side.lock().unwrap().contains_key(&(role, slot))
+            })
+        }
+
+        fn kid_in(&self, role: Role, slot: Slot) -> Result<Option<String>, KeyError> {
+            if slot == Slot::Held {
+                return self.inner.kid_in(role, slot);
+            }
+            let pair = self.side.lock().unwrap().get(&(role, slot)).cloned();
+            Ok(pair.map(|pair| self.inner.key(role, pair).public().kid()))
+        }
+
+        fn relabel(&self, role: Role, from: Slot, to: Slot) -> Result<(), KeyError> {
+            if let Some(pair) = self.take(role, from) {
+                self.put(role, to, pair);
+            }
+            Ok(())
+        }
+    }
+
+    // BEP-060: a replacement that keeps the old key publishes the new key
+    // and exits non-zero, so a script does not read it as finished.
+    #[test]
+    fn replace_key_exits_non_zero_when_the_old_key_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/identity.json");
+        let store = ExportableStore::new(keys::Build::Debug);
+        let (keys, _root) = start(&store, &path, &[]).unwrap();
+        let old = keys.sealing.public();
+        drop(keys);
+        let published = std::fs::read(&path).unwrap();
+
+        let store = KeepsOldStore {
+            inner: store,
+            side: Mutex::default(),
+        };
+        let code = replace_key(&store, Role::Sealing, &path, &[]);
+        assert_eq!(code, ExitCode::FAILURE);
+        let new = store.find(Role::Sealing).unwrap().unwrap().public();
+        assert_ne!(new, old, "the new key is in use");
+        assert!(
+            store
+                .side
+                .lock()
+                .unwrap()
+                .contains_key(&(Role::Sealing, Slot::Old)),
+            "the old key stays"
+        );
+        assert_ne!(
+            std::fs::read(&path).unwrap(),
+            published,
+            "the new key is published"
+        );
+    }
+
+    // BEP-014, BEP-059, BEP-060: a release build refuses a new key that the
+    // keychain made exportable. The message says that a key was made and
+    // refused, not that none was made, and the old key stays in use.
+    #[test]
+    fn replace_key_refusal_of_an_exportable_key_keeps_the_old_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/identity.json");
+        let store = KeepsOldStore {
+            inner: ExportableStore::holding_every_key(keys::Build::Release, &[]),
+            side: Mutex::default(),
+        };
+        let old = store.find(Role::Sealing).unwrap().unwrap().public();
+
+        let (code, log) = logged(|| replace_key(&store, Role::Sealing, &path, &[]));
+        assert_eq!(code, ExitCode::FAILURE);
+        assert!(!path.exists(), "no identity file is written");
+        assert_eq!(store.find(Role::Sealing).unwrap().unwrap().public(), old);
+        assert!(store.side.lock().unwrap().is_empty(), "no new key is kept");
+        assert_eq!(
+            log.matches("refused the new proxy key and kept the old key")
+                .count(),
+            1,
+            "{log}"
+        );
+
+        let Err(err) = keys::replace(&store, Role::Sealing) else {
+            panic!("the replacement kept an exportable key");
+        };
+        assert_eq!(
+            replace_failure(Role::Sealing, &err),
+            "The sealing key was not replaced. A new key was made. The keychain made it exportable. A release build does not keep an exportable key, so bep removed the new key. The old key is still in use."
+        );
+    }
+
+    // BEP-060: an old key that an earlier replacement moved aside and that
+    // did not move back is reported as no key in use.
+    #[test]
+    fn replace_key_names_an_old_key_not_put_back() {
+        let cause = KeyError::Store {
+            role: Role::Sealing,
+            detail: "the keychain is locked".into(),
+        };
+        let message = replace_failure(Role::Sealing, &ReplaceError::Recover(cause));
+        assert_eq!(
+            message,
+            "The sealing key was not replaced. An earlier `bep --replace-key sealing` stopped before it finished, and its old key was not put back: the key store failed for the sealing key: the keychain is locked. The proxy has no sealing key now. Run `bep --replace-key sealing` again to put the old key back and replace it."
+        );
+        assert!(!message.contains("still in use"), "{message}");
+    }
+
+    // BEP-060: a failed generation for a role whose label held no key says
+    // that the proxy has no key, not that an old key is in use.
+    #[test]
+    fn replace_key_names_no_key_when_none_was_held() {
+        let store = NoNewKeyStore(ExportableStore::new(keys::Build::Debug));
+        let Err(err) = keys::replace(&store, Role::Sealing) else {
+            panic!("the replacement made a key");
+        };
+        assert!(matches!(err, ReplaceError::NoKey(_)), "{err}");
+        let message = replace_failure(Role::Sealing, &err);
+        assert_eq!(
+            message,
+            "The sealing key was not replaced, because no new key was made: the key store failed for the sealing key: the keychain is locked. The proxy has no sealing key now. Run `bep --replace-key sealing` again to make a new one."
+        );
+        assert!(!message.contains("still in use"), "{message}");
+    }
+
+    // BEP-060: a store that did not answer the check for keys left aside is
+    // named as that, and not as an earlier replacement that stopped.
+    #[test]
+    fn replace_key_names_an_unanswered_check() {
+        let cause = KeyError::Store {
+            role: Role::Sealing,
+            detail: "the keychain is locked".into(),
+        };
+        let message = replace_failure(Role::Sealing, &ReplaceError::Check(cause));
+        assert_eq!(
+            message,
+            "The sealing key was not replaced. The proxy has no sealing key now. The keychain did not say whether an earlier `bep --replace-key sealing` left keys aside: the key store failed for the sealing key: the keychain is locked. Nothing was changed."
+        );
+        assert!(!message.contains("stopped"), "{message}");
+    }
+
+    // BEP-014, BEP-060: an exportable new key that the keychain did not
+    // remove is not reported as removed.
+    #[test]
+    fn replace_key_names_an_exportable_key_not_removed() {
+        let err = ReplaceError::Exportable {
+            refused: KeyError::Exportable {
+                role: Role::Sealing,
+                removed: false,
+            },
+            held: true,
+        };
+        let message = replace_failure(Role::Sealing, &err);
+        assert_eq!(
+            message,
+            "The sealing key was not replaced. A new key was made. The keychain made it exportable. A release build does not use an exportable key. bep did not remove the new key from the keychain, so it is still there beside the old key. The proxy does not use it. The old key is still in use."
+        );
+        assert!(!message.contains("bep removed"), "{message}");
+    }
+
+    // BEP-014, BEP-060: a refused exportable key for a role whose label held
+    // no key says that the proxy has no key, not that an old key is in use.
+    #[test]
+    fn replace_key_names_an_exportable_key_when_none_was_held() {
+        for (removed, expected) in [
+            (
+                true,
+                "The sealing key was not replaced. A new key was made. The keychain made it exportable. A release build does not keep an exportable key, so bep removed the new key. The proxy has no sealing key now.",
+            ),
+            (
+                false,
+                "The sealing key was not replaced. A new key was made. The keychain made it exportable. A release build does not use an exportable key. bep did not remove the new key from the keychain. The proxy does not use it. The proxy has no sealing key now.",
+            ),
+        ] {
+            let err = ReplaceError::Exportable {
+                refused: KeyError::Exportable {
+                    role: Role::Sealing,
+                    removed,
+                },
+                held: false,
+            };
+            let message = replace_failure(Role::Sealing, &err);
+            assert_eq!(message, expected);
+            assert!(!message.contains("old key"), "{message}");
+        }
+    }
+
+    // BEP-060: a failed move for a role whose label held no key says that
+    // the proxy has no key, not that an old key was not put back.
+    #[test]
+    fn replace_key_names_a_failed_move_when_none_was_held() {
+        let cause = KeyError::Store {
+            role: Role::Sealing,
+            detail: "the keychain is locked".into(),
+        };
+        let message = replace_failure(Role::Sealing, &ReplaceError::MoveNoKey(cause));
+        assert_eq!(
+            message,
+            "The sealing key was not replaced: the key store failed for the sealing key: the keychain is locked. The proxy has no sealing key now. Run `bep --replace-key sealing` again to make a new one."
+        );
+        assert!(!message.contains("put back"), "{message}");
+        assert!(!message.contains("still in use"), "{message}");
+    }
+
+    // BEP-060: a key set aside alone that the identity file does not say
+    // is in use is kept, and the message names the unread identity.
+    #[test]
+    fn replace_key_names_an_unread_identity() {
+        let message = replace_failure(Role::Sealing, &ReplaceError::Unread);
+        assert_eq!(
+            message,
+            "The sealing key was not replaced. The proxy has no sealing key now. An earlier `bep --replace-key sealing` set a sealing key aside in the keychain. bep did not read which sealing key the identity file names, so it did not check whether that key is the one in use. Nothing was changed. Correct the problem above, then run `bep --replace-key sealing` again."
+        );
+    }
+
+    // BEP-060: a failed cleanup for a role whose label held no key says that
+    // the proxy has no key, not that an old key is in use.
+    #[test]
+    fn replace_key_names_a_failed_cleanup_when_none_was_held() {
+        let cause = KeyError::Store {
+            role: Role::Sealing,
+            detail: "the keychain is locked".into(),
+        };
+        let message = replace_failure(Role::Sealing, &ReplaceError::RemoveNoKey(cause));
+        assert_eq!(
+            message,
+            "The sealing key was not replaced: the key store failed for the sealing key: the keychain is locked. The proxy has no sealing key now. Run `bep --replace-key sealing` again to make a new one."
+        );
+        assert!(!message.contains("still in use"), "{message}");
+    }
+
+    // BEP-060: an old key that the store did not remove is named, with the
+    // one command that removes it.
+    #[test]
+    fn replace_key_names_an_old_key_not_removed() {
+        let cause = KeyError::Store {
+            role: Role::Sealing,
+            detail: "the keychain is locked".into(),
+        };
+        assert_eq!(
+            old_key_kept(Role::Sealing, &cause),
+            "The old sealing key was not removed: the key store failed for the sealing key: the keychain is locked. The proxy does not use it. Run `bep --replace-key sealing` again to make another new key and remove the old one."
+        );
+    }
+
+    /// Runs `f` under a subscriber at the default level. Gives what it
+    /// logged.
+    fn logged<T>(f: impl FnOnce() -> T) -> (T, String) {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_writer(move || sink.clone())
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.0.lock().unwrap().clone();
+        (out, String::from_utf8(bytes).unwrap())
+    }
+
+    fn kept_exportable(role: Role) -> String {
+        format!(
+            "kept the proxy's {role} key although the keychain made it exportable: this is a debug build, and a release build refuses it"
+        )
+    }
+
+    // BEP-014, BEP-059: the macOS login keychain lets the program that made
+    // a key export it. A debug build keeps such a key, warns once for each
+    // role at each start, and serves with it.
+    #[test]
+    fn a_debug_build_starts_with_exportable_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/identity.json");
+        let store = ExportableStore::new(keys::Build::Debug);
+        for start_number in 1..=2 {
+            let ((), log) = logged(|| {
+                let (keys, root) = start(&store, &path, &[]).unwrap();
+                assert!(keys.signing.exportable());
+                // As `serve` does: the signing CA under the published root,
+                // which issues a leaf that a box validates.
+                let at = SystemTime::now();
+                let ca = Ca::with_root(&keys.root, &keys.signing, root.clone(), at).unwrap();
+                let leaf = ca.issue_leaf("api.github.com", at).unwrap();
+                assert!(validates(root.der(), &leaf, "api.github.com", at));
+                let published = Identity::read(&path).unwrap();
+                assert_eq!(published.key(Role::Root).unwrap(), keys.root.public());
+            });
+            for role in Role::ALL {
+                assert_eq!(
+                    log.matches(&kept_exportable(role)).count(),
+                    1,
+                    "start {start_number}, {role}: {log}"
+                );
+            }
+        }
+    }
+
+    // BEP-014, BEP-059: a release build refuses an exportable key where the
+    // keychain generates it, and when a debug build left it in the keychain:
+    // at the CA for the root and signing keys, and at load for the sealing
+    // key. It writes no warning.
+    #[test]
+    fn a_release_build_refuses_an_exportable_key_at_both_sites() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bep/identity.json");
+
+        let store = ExportableStore::new(keys::Build::Release);
+        let (refused, log) = logged(|| start(&store, &path, &[]).map(drop).unwrap_err());
+        assert_eq!(
+            refused,
+            "The proxy did not start: the keychain made the new sealing key exportable. This build does not use an exportable key."
+        );
+        assert!(
+            !log.contains("although the keychain made it exportable"),
+            "{log}"
+        );
+        assert!(store.pairs.lock().unwrap().is_empty(), "no key is held");
+        assert!(!path.exists());
+
+        let store = ExportableStore::holding_every_key(keys::Build::Release, &[Role::Sealing]);
+        let (refused, log) = logged(|| start(&store, &path, &[]).map(drop).unwrap_err());
+        assert_eq!(
+            refused,
+            "The proxy did not start: the proxy root key is exportable, so the proxy does not use it for a CA."
+        );
+        assert!(
+            !log.contains("although the keychain made it exportable"),
+            "{log}"
+        );
+        assert!(!path.exists());
+
+        let store =
+            ExportableStore::holding_every_key(keys::Build::Release, &[Role::Root, Role::Signing]);
+        let (refused, log) = logged(|| start(&store, &path, &[]).map(drop).unwrap_err());
+        assert_eq!(
+            refused,
+            "The proxy did not start: the keychain holds the proxy's sealing key as exportable, and a release build does not use an exportable key. Run `bep --replace-key sealing` to make a new one. Boxes created before then must be re-created."
+        );
+        assert!(
+            !log.contains("although the keychain made it exportable"),
+            "{log}"
+        );
+        assert_eq!(
+            store.pairs.lock().unwrap().len(),
+            3,
+            "the store keeps its keys"
+        );
+        assert!(!path.exists());
     }
 }

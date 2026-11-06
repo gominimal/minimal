@@ -510,30 +510,6 @@ pub fn cmd_mesh_leave(global: &GlobalArgs) -> Result<(), anyhow::Error> {
     }
 }
 
-/// Print that there is nothing to mint.
-///
-/// `min login` once called the daemon's certificate-issuing RPC and wrote
-/// the key and CA to the config directory; that surface is retired, so the
-/// verb now writes nothing and asks the daemon for nothing — it does not
-/// spawn one. It stays as the home of the sign-in that replaces it.
-///
-/// The notice goes to the caller's writer rather than to stdout directly,
-/// so the test can capture it and hold the verb to what it actually emits.
-pub async fn cmd_login<W: std::io::Write>(
-    _global: &GlobalArgs,
-    _args: LoginArgs,
-    out: &mut W,
-) -> Result<(), anyhow::Error> {
-    writeln!(out, "{}", login_nothing_to_mint_line()).context("writing the login notice")?;
-    Ok(())
-}
-
-/// The one line `min login` prints. A person who runs the verb out of habit
-/// is owed the reason it is now a no-op, not a silent exit.
-pub(crate) fn login_nothing_to_mint_line() -> &'static str {
-    "Nothing to mint: the HTTPS reverse proxy is retired, so no client certificate is issued and no key is written."
-}
-
 // ---------------------------------------------------------------------------
 // Build-system commands (local, no daemon).
 //

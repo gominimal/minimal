@@ -618,6 +618,70 @@ pub fn hold_box_name_beside(
     );
 }
 
+/// What [`host_ip_box_at`] asks of the VM host daemon for a `host_ip` box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostIpBoxChange {
+    /// Admit the box's egress policy: the box is resident.
+    Admit,
+    /// Retire the box's egress policy, and say how the box ended.
+    Retire(minimald_rpc::HostIpBoxEnd),
+}
+
+/// Admits ([`HostIpBoxChange::Admit`]) or retires a `host_ip` box's egress policy at the
+/// VM host daemon whose control socket is `control_sock` (NET-085). A
+/// `host_ip` box leaves the VM from the node's own address, and the host
+/// gate decides its frames by the policies admitted here: a box whose
+/// policy is not admitted reaches nothing outside the VM. Keyed by the
+/// session `session_id`, so an unnamed box and a task box admit the same
+/// way. `credentialed_upstream` says whether the box declares a
+/// credentialed upstream (BEP-083): the host gate opens the cohort's lane
+/// to the Box Egress Proxy's listener while one resident box declares one.
+/// A retire ignores it. A retire carries how the box ended
+/// ([`HostIpBoxChange::Retire`]): only a destroyed box has its id revoked
+/// (BEP-043).
+///
+/// Blocking: an admit returns only once the VM host daemon answered, so a
+/// caller that admits before it starts the box's first process knows the
+/// gate holds the box's rules by then. Best-effort: a failed exchange warns
+/// and returns `false`. A daemon that predates the verbs refuses them, and
+/// its gate predates the decision too.
+pub fn host_ip_box_at(
+    control_sock: &Path,
+    session_id: boxes::SessionId,
+    egress: Option<&boxes::EgressPolicy>,
+    credentialed_upstream: bool,
+    change: HostIpBoxChange,
+) -> bool {
+    let (verb, operation) = match change {
+        HostIpBoxChange::Admit => (
+            minimald_rpc::BoxControlRequest::AdmitHostIpBox(minimald_rpc::HostIpBoxRequest {
+                session_id,
+                egress: egress.cloned(),
+                credentialed_upstream,
+            }),
+            "admit",
+        ),
+        HostIpBoxChange::Retire(end) => (
+            minimald_rpc::BoxControlRequest::RetireHostIpBox(
+                minimald_rpc::RetireHostIpBoxRequest { session_id, end },
+            ),
+            "retire",
+        ),
+    };
+    let failure = match host_control(control_sock, &verb) {
+        Ok((minimald_rpc::BoxControlReply::HostIpBox { .. }, _)) => return true,
+        Ok((other, _)) => format!("another verb's reply: {other:?}"),
+        Err(error) => format!("{error:#}"),
+    };
+    tracing::warn!(
+        session = %session_id,
+        operation,
+        credentialed_upstream,
+        "the host_ip box's egress {operation} could not be made ({failure})"
+    );
+    false
+}
+
 /// Withdraws a box's host row (T66) on the VM host daemon whose control
 /// socket is `control_sock`, once the session that registered it is gone:
 /// the creator presents the name and the pair the registration handed back,
@@ -1150,7 +1214,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_command_targets_the_provider_alias() {
+    fn attach_command_targets_the_host_alias() {
         let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
         let cmd = attach_command(&sock, boxes::SessionId::nil(), None, None).unwrap();
         let args: Vec<_> = cmd
@@ -1238,7 +1302,7 @@ mod tests {
     }
 
     /// A named VM's socket nests under a per-name subdirectory, so the ssh
-    /// host is the VM name namespaced under the provider-instance name.
+    /// host is the VM name namespaced under the host name.
     #[test]
     fn attach_command_targets_a_named_vm_alias() {
         let sock = PathBuf::from("/tmp/x/providers/local-minvmd0/alpha/ssh.sock");
@@ -1450,7 +1514,7 @@ mod tests {
         }
     }
 
-    /// A VM-backed provider dir carries the guest's recorded host key, so
+    /// A VM-backed host dir carries the guest's recorded host key, so
     /// attach must verify against it rather than waive the check.
     #[test]
     fn host_key_opts_pin_to_an_adjacent_known_hosts() {
@@ -1507,6 +1571,61 @@ mod tests {
         assert!(
             hosts_file.contains(r#"q\"uote"#) && hosts_file.contains(r"back\\slash"),
             "path must reach ssh escaped, got: {hosts_file}"
+        );
+    }
+
+    /// BEP-083: the admit of a `host_ip` box carries its lane declaration,
+    /// and returns only once the VM host daemon answered it. This test does
+    /// not check the admit's order against the create: `activate_box` in
+    /// the `minimal` crate sends the admit after the create returns.
+    #[test]
+    fn host_ip_admission_carries_the_lane_and_waits_for_the_answer() {
+        use std::io::{BufRead as _, Write as _};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let sock = dir.path().join(VM_HOST_CONTROL_SOCK_FILE);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let answered = std::sync::Arc::new(AtomicBool::new(false));
+        let daemon = {
+            let answered = std::sync::Arc::clone(&answered);
+            std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let request: minimald_rpc::BoxControlRequest =
+                    serde_json_lenient::from_str(line.trim()).unwrap();
+                // The daemon takes its time: the admit waits for it.
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let minimald_rpc::BoxControlRequest::AdmitHostIpBox(admit) = request else {
+                    panic!("the admit sends the admit verb, got {request:?}");
+                };
+                answered.store(true, Ordering::SeqCst);
+                let reply = minimald_rpc::BoxControlReply::HostIpBox {
+                    session_id: admit.session_id,
+                    resident: true,
+                };
+                let mut reply = serde_json_lenient::to_string(&reply).unwrap();
+                reply.push('\n');
+                (&stream).write_all(reply.as_bytes()).unwrap();
+                admit
+            })
+        };
+        let session = boxes::SessionId::mint();
+        assert!(
+            host_ip_box_at(&sock, session, None, true, HostIpBoxChange::Admit),
+            "the VM host daemon answered the admit"
+        );
+        assert!(
+            answered.load(Ordering::SeqCst),
+            "the admit returned only after the VM host daemon answered it"
+        );
+        let admit = daemon.join().unwrap();
+        assert_eq!(admit.session_id, session);
+        assert!(
+            admit.credentialed_upstream,
+            "the admit carries the box's lane declaration"
         );
     }
 }

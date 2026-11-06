@@ -5,6 +5,10 @@
 //! invoked the CLI. The daemon's state is inspected directly (via
 //! `TestClient`) to verify side-effects.
 
+// The in-process daemon's async bodies are deep: rustc's default query depth (128)
+// overflows computing their layout (`queries overflow the depth limit!`), as the
+// daemon crates themselves already declare.
+#![recursion_limit = "256"]
 mod common;
 
 use boxes::SessionId;
@@ -215,6 +219,7 @@ async fn finalize_install_show_returns_within_its_deadline_on_a_wedged_daemon() 
 #[test]
 fn ls_shows_shared_resource_pool() {
     let resp = ListSessionsResponse {
+        box_networks: Default::default(),
         daemon_version: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
@@ -258,6 +263,7 @@ fn ls_shows_shared_resource_pool() {
 #[test]
 fn ls_table_exposes_project_path_and_status() {
     let resp = ListSessionsResponse {
+        box_networks: Default::default(),
         daemon_version: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
@@ -295,21 +301,40 @@ fn ls_table_exposes_project_path_and_status() {
         text.contains("PROJECT PATH"),
         "header should list PROJECT PATH: {text}"
     );
-    assert!(text.contains("active"), "row should show status: {text}");
+    assert!(text.contains("running"), "row should show status: {text}");
     assert!(
         text.contains("/work/proj"),
         "row should show project path: {text}"
     );
 }
 
-/// NET-079's proof names the listing: a host-address box that runs
-/// unenforced shows egress enforcement `none` in the human `min ls`, not
-/// only in `--json`; one decided per box shows `per_box`; a box the daemon
-/// reports no enforcement for shows `-`.
+/// The cell under `column` in the row that contains `row_key`, read by
+/// the header's positions: `column` up to `next`, the column after it. A
+/// cell can hold spaces, so the row is not split on whitespace.
+fn ls_cell(text: &str, row_key: &str, column: &str, next: &str) -> String {
+    let header = text
+        .lines()
+        .find(|l| l.contains("SESSION ID"))
+        .unwrap_or_else(|| panic!("a header in:\n{text}"));
+    let start = header.find(column).expect("the column in the header");
+    let end = header.find(next).expect("the next column in the header");
+    let row = text
+        .lines()
+        .find(|l| l.contains(row_key) && !l.contains("SESSION ID"))
+        .unwrap_or_else(|| panic!("a row for {row_key} in:\n{text}"));
+    row[start..end].trim().to_string()
+}
+
+/// NET-079's proof names the listing, in `min session policy`'s words
+/// (T110): a host-address box that runs unenforced shows its posture with
+/// `; per-box enforcement none` in the human `min ls`, one decided per box
+/// shows its posture alone, and a box the daemon reports no posture for
+/// shows `-`.
 #[test]
 fn ls_table_shows_host_address_enforcement() {
+    let id = |n: u64| SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012}")).unwrap();
     let entry = |name: &str, n: u64, enforcement| minimald_rpc::ListSessionsEntry {
-        id: SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012}")).unwrap(),
+        id: id(n),
         name: Some(name.to_string()),
         project_path: Some(paths::HostAbsPath::try_new("/work/proj").unwrap()),
         status: boxes::BoxState::Active,
@@ -318,7 +343,18 @@ fn ls_table_shows_host_address_enforcement() {
         shared_port_collisions: Vec::new(),
         attrs: None,
     };
+    let posture = |posture| minimald_rpc::BoxNetworkFacts {
+        loopback_address: Some(std::net::Ipv4Addr::LOCALHOST),
+        egress_posture: Some(posture),
+        at_fallback: Some(true),
+    };
     let resp = ListSessionsResponse {
+        box_networks: [
+            (id(1), posture(minimald_rpc::EgressPosture::DenyAll)),
+            (id(2), posture(minimald_rpc::EgressPosture::AllowAllDefault)),
+        ]
+        .into_iter()
+        .collect(),
         daemon_version: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
@@ -346,18 +382,15 @@ fn ls_table_shows_host_address_enforcement() {
     .unwrap();
 
     let text = String::from_utf8(out).unwrap();
-    let cells_of = |name: &str| -> Vec<String> {
-        text.lines()
-            .find(|l| l.contains(name))
-            .unwrap_or_else(|| panic!("a row for {name} in:\n{text}"))
-            .split_whitespace()
-            .map(str::to_string)
-            .collect()
-    };
-    assert!(text.contains("EGRESS"), "header should list EGRESS: {text}");
-    assert_eq!(cells_of("decided")[3], "per_box", "got:\n{text}");
-    assert_eq!(cells_of("unenforced")[3], "none", "got:\n{text}");
-    assert_eq!(cells_of("own-address")[3], "-", "got:\n{text}");
+    let egress = |name: &str| ls_cell(&text, name, "EGRESS", "TITLE");
+    assert_eq!(egress("decided"), "deny-all", "got:\n{text}");
+    assert_eq!(
+        egress("unenforced"),
+        "allow-all (default); per-box enforcement none",
+        "got:\n{text}"
+    );
+    assert_eq!(egress("own-address"), "-", "got:\n{text}");
+    assert!(!text.contains("per_box"), "got:\n{text}");
 }
 
 /// NET-129's listing half: a box that yields a declared port at a shared
@@ -382,6 +415,7 @@ fn ls_reports_yielded_shared_address_ports() {
         held_by: "first.min.internal".to_string(),
     };
     let resp = ListSessionsResponse {
+        box_networks: Default::default(),
         daemon_version: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
@@ -398,6 +432,7 @@ fn ls_reports_yielded_shared_address_ports() {
         vm: "default".to_string(),
         resp: resp.clone(),
         control_sock: None,
+        running: true,
     }];
 
     assert_eq!(
@@ -438,12 +473,13 @@ fn ls_reports_yielded_shared_address_ports() {
     );
 }
 
-/// The multi-VM table carries the same EGRESS cell, one column right of the
-/// single-VM one because each row leads with its VM.
+/// The multi-VM table carries the same EGRESS cell, after the VM column
+/// each row leads with.
 #[test]
 fn ls_across_vms_table_shows_host_address_enforcement() {
+    let id = |n: u64| SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012}")).unwrap();
     let entry = |name: &str, n: u64, enforcement| minimald_rpc::ListSessionsEntry {
-        id: SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012}")).unwrap(),
+        id: id(n),
         name: Some(name.to_string()),
         project_path: Some(paths::HostAbsPath::try_new("/work/proj").unwrap()),
         status: boxes::BoxState::Active,
@@ -452,9 +488,20 @@ fn ls_across_vms_table_shows_host_address_enforcement() {
         shared_port_collisions: Vec::new(),
         attrs: None,
     };
-    let listing = |vm: &str, sessions| VmListing {
+    let posture = |n: u64, posture| {
+        (
+            id(n),
+            minimald_rpc::BoxNetworkFacts {
+                loopback_address: None,
+                egress_posture: Some(posture),
+                at_fallback: None,
+            },
+        )
+    };
+    let listing = |vm: &str, sessions, box_networks| VmListing {
         vm: vm.to_string(),
         resp: ListSessionsResponse {
+            box_networks,
             daemon_version: None,
             hostname_routing_unavailable: None,
             hostname_proxy_port: None,
@@ -464,6 +511,7 @@ fn ls_across_vms_table_shows_host_address_enforcement() {
             sessions,
         },
         control_sock: None,
+        running: true,
     };
     let listings = vec![
         listing(
@@ -472,6 +520,9 @@ fn ls_across_vms_table_shows_host_address_enforcement() {
                 entry("decided", 1, Some(minimald_rpc::HostIpEnforcement::PerBox)),
                 entry("own-address", 3, None),
             ],
+            [posture(1, minimald_rpc::EgressPosture::AllowAllDefault)]
+                .into_iter()
+                .collect(),
         ),
         listing(
             "alpha",
@@ -480,6 +531,9 @@ fn ls_across_vms_table_shows_host_address_enforcement() {
                 2,
                 Some(minimald_rpc::HostIpEnforcement::None),
             )],
+            [posture(2, minimald_rpc::EgressPosture::DeclaredRules)]
+                .into_iter()
+                .collect(),
         ),
     ];
     let mut out = Vec::new();
@@ -497,18 +551,15 @@ fn ls_across_vms_table_shows_host_address_enforcement() {
     .unwrap();
 
     let text = String::from_utf8(out).unwrap();
-    let cells_of = |name: &str| -> Vec<String> {
-        text.lines()
-            .find(|l| l.contains(name))
-            .unwrap_or_else(|| panic!("a row for {name} in:\n{text}"))
-            .split_whitespace()
-            .map(str::to_string)
-            .collect()
-    };
-    assert!(text.contains("EGRESS"), "header should list EGRESS: {text}");
-    assert_eq!(cells_of("decided")[4], "per_box", "got:\n{text}");
-    assert_eq!(cells_of("unenforced")[4], "none", "got:\n{text}");
-    assert_eq!(cells_of("own-address")[4], "-", "got:\n{text}");
+    let egress = |name: &str| ls_cell(&text, name, "EGRESS", "TITLE");
+    assert_eq!(egress("decided"), "allow-all (default)", "got:\n{text}");
+    assert_eq!(
+        egress("unenforced"),
+        "declared rules; per-box enforcement none",
+        "got:\n{text}"
+    );
+    assert_eq!(egress("own-address"), "-", "got:\n{text}");
+    assert_eq!(ls_cell(&text, "decided", "ADDRESS", "STATUS"), "-");
 }
 
 #[tokio::test]
@@ -3026,10 +3077,10 @@ async fn policy_shows_unset_egress_as_named_default() {
 /// rules (NET-130): the helper's built-in enumeration of the categories the
 /// in-VM daemon's own traffic may reach, one row per category, on an
 /// own-address box, headed by the posture the host-side gate decides the
-/// daemon's own fetches under — announced, the shipped posture, the run
-/// path's allow-all interim node row still decides those fetches, so the
-/// rows are what the set will bound, not what bounds them today; in force,
-/// it decides them whatever the box's own declaration resolves to. The set
+/// daemon's own fetches under — in force, the shipped posture: the set is
+/// what bounds Minimal's own downloads in the VM, whatever the box's own
+/// declaration resolves to, and each entry names the host those downloads
+/// go to. The set
 /// is shown where the fabric the helper gates is named — the microVM
 /// backend's plan — and nowhere it is not: a host-address box shares its
 /// host's namespace and has no switch fabric, and a backend with no
@@ -3070,40 +3121,62 @@ fn policy_shows_baseline_set() {
         "the box's own rules are shown:\n{text}"
     );
     // The posture is spelled beside the set, the way the daemon's start-up
-    // line spells it. The shipped posture is announced — the run path's
-    // allow-all interim node row still decides the daemon's own fetches — so
-    // the display must not present the rows as what bounds them. The flip of
-    // `NODE_BASELINE_PHASE` updates this assertion with the rest of the
-    // cutover.
+    // line spells it. The shipped posture is in force: the set is what
+    // bounds Minimal's own downloads in the VM. A frame from the node
+    // address that wears the box mark is decided by the resident host_ip
+    // boxes' rules, so no caveat rides beside the posture, and the line
+    // names no design term.
     assert!(
         text.contains(
             "destinations for Minimal's own downloads in this VM (not this box's rules): \
-             announced (node row's allow-all interim)"
+             in force\n"
         ),
         "the helper's baseline set is shown beside the box's rules, headed by the \
-         gate's announced posture:\n{text}"
+         gate's in-force posture:\n{text}"
+    );
+    assert!(
+        !text.contains("interim") && !text.contains("bypass"),
+        "the posture names no design term and no caveat:\n{text}"
     );
 
     // The rows are the enumeration the helper carries, one per category —
-    // the set the host-side gate decides the daemon's own frames by once the
-    // baseline is in force.
-    let baseline = minvmd::net::NodePlaneBaseline::built_in(fabric);
-    let rendered_baseline = baseline
-        .entries()
-        .iter()
-        .map(|entry| {
-            format!(
-                "  {}  {}",
-                entry.category().as_str(),
-                entry.endpoints().join(", ")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    // the set the host-side gate decides the daemon's own frames by — each
+    // named by the host the daemon's own downloads go to (NET-061).
+    let rendered_baseline = "  registry  github.com\n  cache  cache.minimal.dev\n";
     assert!(
-        text.contains(&rendered_baseline),
-        "the baseline rows are the enumeration's entries, one per category:\n{text}"
+        text.contains(rendered_baseline),
+        "the baseline rows are the enumeration's entries, one per category, \
+         each naming its host:\n{text}"
     );
+
+    // The JSON view carries the same posture and endpoints.
+    let mut out = Vec::new();
+    write_policy_json(
+        &mut out,
+        &deny_all,
+        boxes::NetworkMode::OwnIp,
+        Some(fabric),
+        Ok(Vec::new()),
+        &[],
+    )
+    .unwrap();
+    let document: Value = serde_json_lenient::from_slice(&out).unwrap();
+    assert_eq!(
+        document["node_plane_baseline"]["phase"],
+        Value::String("in force".to_string()),
+        "the JSON view carries the in-force posture:\n{document}"
+    );
+    let entries = document["node_plane_baseline"]["entries"]
+        .as_array()
+        .expect("the JSON view carries the baseline entries");
+    assert_eq!(entries.len(), 2, "registry and cache:\n{document}");
+    for (entry, host) in entries.iter().zip(["github.com", "cache.minimal.dev"]) {
+        assert_eq!(
+            entry["endpoints"],
+            Value::Array(vec![Value::String(host.to_string())]),
+            "the JSON view names each entry's host:\n{document}"
+        );
+    }
     // Beside, not instead: the egress block comes first, the baseline set
     // after it, the ingress block last.
     let egress_at = text.find("egress").expect("the egress block renders");
@@ -3420,10 +3493,11 @@ async fn hold_proxy_port_and_start_retry(
     (held, retry)
 }
 
-/// NET-020: with the proxy port occupied, both `min ls` and `min session
-/// activate` print the failure's reason and the remedy for it, and say the
-/// daemon recovers on its own. Driven through the compiled binary so the
-/// assertion is on what the user actually sees.
+/// NET-020: with the proxy port occupied, `min ls` prints the failure's
+/// reason and remedy on its HOSTNAME PROXY row, and says the daemon recovers
+/// on its own. `min session activate` prints the cause once, on its `names:`
+/// line. Driven through the compiled binary so the assertion is on what the
+/// user actually sees.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn listener_failure_reported_with_remedy() {
@@ -3431,28 +3505,32 @@ async fn listener_failure_reported_with_remedy() {
     let (held, retry) = hold_proxy_port_and_start_retry(&daemon.server.state).await;
     let reason = wait_for_routing_failure(&args).await;
 
-    let ls_stderr = run_min_stderr(&args, &["ls"]).await;
-    assert!(
-        ls_stderr.contains("warning: the hostname proxy is not serving"),
-        "ls must warn about hostname routing, got: {ls_stderr}"
+    // `min ls` names the cause on its HOSTNAME PROXY row, on stdout, and
+    // says nothing about it on stderr.
+    let ls = run_min(&args, &["ls"]).await;
+    let ls_stdout = String::from_utf8_lossy(&ls.stdout).into_owned();
+    let ls_stderr = String::from_utf8_lossy(&ls.stderr).into_owned();
+    let row = format!(
+        "HOSTNAME PROXY:  the hostname proxy is not serving: {reason}. Minimal retries on \
+         its own. Run `min ls` again to check."
     );
     assert!(
-        ls_stderr.contains(&reason),
-        "ls must print the daemon's reason, got: {ls_stderr}"
+        ls_stdout.lines().any(|line| line == row),
+        "ls must name the cause on its HOSTNAME PROXY row, got: {ls_stdout}"
     );
     assert!(
-        ls_stderr.contains("Remedy"),
-        "ls must print the remedy, got: {ls_stderr}"
+        reason.contains("Remedy"),
+        "the daemon's reason carries the remedy, got: {reason}"
+    );
+    assert_eq!(
+        ls_stdout.matches(&reason).count(),
+        1,
+        "ls names the cause once, got: {ls_stdout}"
     );
     assert!(
-        ls_stderr.contains("retries"),
-        "ls must say the daemon recovers on its own, got: {ls_stderr}"
+        !ls_stderr.contains("hostname proxy is not serving"),
+        "ls prints the cause on stdout only, got stderr: {ls_stderr}"
     );
-    assert!(
-        ls_stderr.contains("run `min ls` again to check"),
-        "ls must name the command its warning rides on, got: {ls_stderr}"
-    );
-
     // `min session activate` prints the same report on its path.
     let project = tempfile::TempDir::new().unwrap();
     std::fs::create_dir(project.path().join(".git")).unwrap();
@@ -3475,21 +3553,16 @@ async fn listener_failure_reported_with_remedy() {
         ],
     )
     .await;
+    // The cause prints once, on the `names:` line below, and no warning
+    // line of its own repeats it.
     assert!(
-        activate_stderr.contains("warning: the hostname proxy is not serving"),
-        "activate must warn about hostname routing, got: {activate_stderr}"
+        !activate_stderr.contains("warning: the hostname proxy is not serving"),
+        "activate prints no separate warning, got: {activate_stderr}"
     );
-    assert!(
-        activate_stderr.contains(&reason),
-        "activate must print the daemon's reason, got: {activate_stderr}"
-    );
-    assert!(
-        activate_stderr.contains("Remedy"),
-        "activate must print the remedy, got: {activate_stderr}"
-    );
-    assert!(
-        activate_stderr.contains("run `min session activate` again to check"),
-        "activate must name the command its warning rides on, got: {activate_stderr}"
+    assert_eq!(
+        activate_stderr.matches(&reason).count(),
+        1,
+        "activate names the cause once, got: {activate_stderr}"
     );
     // NET-020 on the one host line: the cause replaces the resolution half,
     // so the line never claims a route through a proxy that is not serving.
@@ -3517,10 +3590,10 @@ async fn ls_warning_clears_on_recovery() {
     let (held, retry) = hold_proxy_port_and_start_retry(&daemon.server.state).await;
     let _reason = wait_for_routing_failure(&args).await;
 
-    let before = run_min_stderr(&args, &["ls"]).await;
+    let before = String::from_utf8_lossy(&run_min(&args, &["ls"]).await.stdout).into_owned();
     assert!(
-        before.contains("warning: the hostname proxy is not serving"),
-        "ls must warn while the port is held, got: {before}"
+        before.contains("HOSTNAME PROXY:  the hostname proxy is not serving"),
+        "ls must name the cause while the port is held, got: {before}"
     );
 
     // Free the port: the startup retry binds (a native daemon has no
@@ -3531,9 +3604,14 @@ async fn ls_warning_clears_on_recovery() {
         .expect("the startup retry must finish once the port frees")
         .expect("the startup retry must not panic");
 
-    let after = run_min_stderr(&args, &["ls"]).await;
+    let after = run_min(&args, &["ls"]).await;
+    let after = format!(
+        "{}{}",
+        String::from_utf8_lossy(&after.stdout),
+        String::from_utf8_lossy(&after.stderr)
+    );
     assert!(
-        !after.contains("warning: the hostname proxy is not serving"),
+        !after.contains("the hostname proxy is not serving"),
         "the warning must clear without a daemon restart, got: {after}"
     );
 }
@@ -3686,7 +3764,7 @@ async fn activate_and_ls_report_native_surface() {
     // the port the proxy's half of the line names, and the port a hook
     // would have to route to.
     let mut client = connect_daemon(&args).await.unwrap();
-    let resp = client.oneshot_rpc::<ListSessions>(()).await.unwrap();
+    let mut resp = client.oneshot_rpc::<ListSessions>(()).await.unwrap();
     let port = resp
         .hostname_proxy_port
         .expect("the proxy must report the port it landed on");
@@ -3718,7 +3796,7 @@ async fn activate_and_ls_report_native_surface() {
          {ls_stdout}"
     );
     assert!(
-        !ls_stdout.contains("resolves through this machine's DNS"),
+        !ls_stdout.contains("on this machine"),
         "a host with no hook must not be told native DNS is live: {ls_stdout}"
     );
 
@@ -3767,7 +3845,7 @@ async fn activate_and_ls_report_native_surface() {
         "a default start prints exactly one host line, got: {activate_stderr}"
     );
     assert!(
-        !activate_stderr.contains("resolves on this machine"),
+        !activate_stderr.contains("on this machine"),
         "a host with no hook must not be told native DNS is live: {activate_stderr}"
     );
     assert!(
@@ -3786,6 +3864,17 @@ async fn activate_and_ls_report_native_surface() {
     // live surface, the proxy's half stays beside it (NET-019), and neither
     // the NET-122 advisory nor the pointer a native host no longer needs
     // rides it.
+    // A box that reports its own range address (T110): the BOX NAMES row
+    // reads the own-address form only when a box proves it is off the
+    // `127.0.0.1` fallback.
+    resp.box_networks.insert(
+        boxes::SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+        minimald_rpc::BoxNetworkFacts {
+            loopback_address: Some(Ipv4Addr::new(127, 0, 64, 2)),
+            egress_posture: None,
+            at_fallback: Some(false),
+        },
+    );
     let mut native_out = Vec::new();
     format_ls(
         &mut native_out,
@@ -3800,14 +3889,13 @@ async fn activate_and_ls_report_native_surface() {
     .unwrap();
     let native_ls = String::from_utf8(native_out).unwrap();
     assert!(
-        native_ls
-            .contains("BOX NAMES:       <box>.min.internal resolves through this machine's DNS"),
+        native_ls.contains("BOX NAMES:       <box>.min.internal opens at its name on this machine"),
         "`min ls` must say native DNS is the live surface when the three facts hold, got: \
          {native_ls}"
     );
     assert!(
         native_ls.contains(&format!(
-            "the hostname proxy also listens on 127.0.0.1:{port}"
+            "; the HTTP proxy at 127.0.0.1:{port} opens it too"
         )),
         "the native arm keeps the proxy's half beside it (NET-019): {native_ls}"
     );
@@ -3830,8 +3918,8 @@ async fn activate_and_ls_report_native_surface() {
     assert_eq!(
         finished,
         format!(
-            "names: native-surface.min.internal resolves on this machine; open it through the \
-             HTTP proxy at 127.0.0.1:{port}"
+            "names: native-surface.min.internal opens at its name on this machine; the HTTP \
+             proxy at 127.0.0.1:{port} opens it too"
         ),
         "a finished host's start line carries no clause"
     );
@@ -3931,6 +4019,7 @@ async fn ls_keeps_detail_rows_and_name_surface_clause() {
 #[test]
 fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
     let resp = ListSessionsResponse {
+        box_networks: Default::default(),
         daemon_version: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
@@ -3967,10 +4056,11 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
     );
     // The verdict beside it: the query proved the answerer live and this
     // host's facts held, so the surface the CLI computed prints through —
-    // the same `BOX NAMES` line the native host's list carries.
+    // the same `BOX NAMES` line the native host's list carries. No box is
+    // listed, so none proves it is off the `127.0.0.1` fallback, and the
+    // row reads the fallback form (T110).
     assert!(
-        holder_ls
-            .contains("BOX NAMES:       <box>.min.internal resolves through this machine's DNS"),
+        holder_ls.contains("BOX NAMES:       <box>.min.internal resolves on this machine"),
         "the VM-host verdict rides the list like a native one: {holder_ls}"
     );
     assert!(
@@ -4008,8 +4098,8 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
     );
     assert!(
         held_ls.contains(
-            "BOX NAMES:       the hostname proxy is not serving, and box names open only \
-             through it"
+            "BOX NAMES:       <box>.min.internal: the hostname proxy is not serving; finish \
+             setup: min finalize-install"
         ),
         "the no-channel verdict reads the proxy: {held_ls}"
     );
@@ -4071,6 +4161,7 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
 #[test]
 fn ls_keeps_the_answerer_row_beside_a_down_proxy() {
     let resp = ListSessionsResponse {
+        box_networks: Default::default(),
         daemon_version: None,
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
@@ -4187,6 +4278,7 @@ fn ls_keeps_the_answerer_row_beside_a_down_proxy() {
     // cause row is the one HOSTNAME PROXY row, and neither it nor the NAME
     // SURFACE row names the reported port as serving.
     let reported = ListSessionsResponse {
+        box_networks: Default::default(),
         hostname_proxy_port: Some(7_654),
         ..resp.clone()
     };
@@ -4255,6 +4347,7 @@ fn ls_across_vms_names_one_proxy_verdict_per_vm() {
     let listing = |vm: &str, proxy_port: u16| VmListing {
         vm: vm.to_string(),
         resp: ListSessionsResponse {
+            box_networks: Default::default(),
             daemon_version: None,
             hostname_routing_unavailable: None,
             hostname_proxy_port: Some(proxy_port),
@@ -4264,6 +4357,7 @@ fn ls_across_vms_names_one_proxy_verdict_per_vm() {
             sessions: Vec::new(),
         },
         control_sock: None,
+        running: true,
     };
     let listings = vec![listing("default", 7_654), listing("alpha", 7_655)];
     let answerers = vec![
@@ -4340,9 +4434,11 @@ fn ls_across_vms_names_one_proxy_verdict_per_vm() {
                 && !default_surface[0].contains("opens through the HTTP proxy at"),
             "the down VM's surface row does not name its proxy as serving:\n{text}"
         );
+        // The surface row names no proxy at all (T110): the HOSTNAME PROXY
+        // row above is where the cause is named.
         assert!(
-            default_surface[0].contains("not serving"),
-            "the down VM's surface row agrees the proxy is not serving:\n{text}"
+            !default_surface[0].contains("HTTP proxy"),
+            "the down VM's surface row names no proxy to open it through:\n{text}"
         );
 
         // The other VM: its own listening row and serving surface, as before.
@@ -4369,8 +4465,8 @@ fn ls_across_vms_names_one_proxy_verdict_per_vm() {
 /// client-certificate RPC, or the `ssh-forward` feature that compiled
 /// `direct-tcpip` out (NET-109, NET-110). A client crate cannot reach the
 /// daemon's build flags from here, so assert on its sources and manifests —
-/// the same source-scan approach `minimal`'s own `login_mints_no_certificate`
-/// uses to prove a verb dropped a surface.
+/// a source scan, the way `minimal`'s own unit tests prove a verb dropped
+/// a surface.
 #[test]
 fn retired_surfaces_absent() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -4445,6 +4541,11 @@ fn retired_surfaces_absent() {
         ("Cargo.toml", &["rcgen"]),
         // Nothing passes a removed feature to the daemon builds.
         ("justfile", &["networking-proxy", "{{features}}"]),
+        // A `min bug` bundle collects no client certificate.
+        ("crates/minimal/src/diag/collect.rs", &["client.pem"]),
+        // Neither answerer documents the retired proxy port.
+        ("crates/minimald/src/net/answerer.rs", &[":7655"]),
+        ("crates/minvmd/src/net/answerer.rs", &[":7655"]),
     ];
     for (rel, retired) in retired_surfaces.iter().copied() {
         let text = source(rel);
@@ -4457,6 +4558,50 @@ fn retired_surfaces_absent() {
     }
 }
 
+/// `min login` is the GitHub sign-in, the alias for `min auth login`
+/// (NET-109): it takes the same arguments, parses into the same arguments,
+/// and its help describes the sign-in, not a retired certificate.
+#[test]
+fn login_runs_auth_login() {
+    use clap::{CommandFactory as _, Parser as _};
+
+    let cli = Cli::try_parse_from(["min", "login", "--device"]).expect("min login --device parses");
+    let Some(Command::Login(AuthLoginArgs { device })) = cli.command else {
+        panic!("min login must parse into the auth login arguments");
+    };
+    assert!(device, "--device reaches the sign-in");
+
+    let mut cmd = Cli::command();
+    let login = cmd
+        .find_subcommand_mut("login")
+        .expect("min login is a command");
+    assert!(!login.is_hide_set(), "min login is listed in min --help");
+    let help = login.render_long_help().to_string();
+    assert!(
+        help.contains("Sign in to GitHub (the same as min auth login)"),
+        "min login --help must describe the GitHub sign-in, got: {help}"
+    );
+    assert!(
+        help.contains("--device"),
+        "min login --help lists --device: {help}"
+    );
+    for retired in ["mint", "certificate", "reverse proxy"] {
+        assert!(
+            !help.contains(retired),
+            "min login --help still names `{retired}`: {help}"
+        );
+    }
+
+    // The flag that steered the retired certificate writes is refused.
+    let Err(err) = Cli::try_parse_from(["min", "login", "--cert-dir", "/tmp/certs"]) else {
+        panic!("--cert-dir is retired and must not parse");
+    };
+    assert!(
+        err.to_string().contains("--cert-dir"),
+        "the refusal must name the retired flag, got: {err}"
+    );
+}
+
 /// The daemon's `ListSessions` reply no longer carries the mTLS field, and a
 /// reply without it decodes: `min ls` keeps reading the list, and never
 /// prints an mTLS warning again (NET-109). A reply from an older daemon that
@@ -4465,6 +4610,7 @@ fn retired_surfaces_absent() {
 #[test]
 fn session_list_decodes_without_mtls_field() {
     let resp = ListSessionsResponse {
+        box_networks: Default::default(),
         daemon_version: Some("test".to_string()),
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
@@ -4950,12 +5096,12 @@ async fn net_forward_announces_the_bound_local_port() {
 /// so the assertion is on the process actually terminating.
 ///
 /// Linux-only for the same reason as [`run_min`]: the spawned binary resolves
-/// the native `local-minimald` provider socket, which the harness daemon
+/// the native `local-minimald` host socket, which the harness daemon
 /// serves on a UDS; macOS resolves `local-minvmd` instead.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn task_run_exits_with_held_open_stdin_pipe() {
-    let (_daemon, args) = setup().await;
+    let (daemon, args) = setup().await;
     let minimal_dir = args
         .minimal_dir
         .as_ref()
@@ -5009,15 +5155,45 @@ async fn task_run_exits_with_held_open_stdin_pipe() {
     .await
     .unwrap();
 
+    // The task runs as its box's entrypoint (T43), on three pipes. This
+    // harness has no packages, so the entrypoint cannot start: the daemon
+    // refuses it at the spawn, and the run exits with that refusal's
+    // non-zero status. What this test pins is the bridge: the run reached
+    // it, the daemon's end came back over it, and the process ended with
+    // its stdin held open. Stdout is the task's alone: every line the
+    // client prints goes to stderr, so a task that never ran leaves stdout
+    // empty. That the entrypoint's stdout and stderr come back as two
+    // streams is pinned against the daemon's exec channel (minimald's
+    // `until_complete_ends_on_entrypoint_return_without_client_task_run_returns_its_code`)
+    // and end to end by the session e2e (`scripts/session-e2e.sh`). The
+    // entrypoint is the in-box `min task run`, which does not pass its stdin
+    // to the task yet.
     assert!(
-        status.success(),
-        "task run must exit 0: stderr={}",
-        String::from_utf8_lossy(&stderr)
+        !status.success(),
+        "a task whose entrypoint never started must not succeed: {status:?}"
     );
     assert!(
-        String::from_utf8_lossy(&stdout).contains("TASK_RUN_STDIN_OK"),
-        "task output must stream back: stdout={}",
+        stdout.is_empty(),
+        "stdout is the task's alone, and the task never ran: {:?}",
         String::from_utf8_lossy(&stdout)
+    );
+    let stderr = String::from_utf8_lossy(&stderr);
+    assert!(
+        stderr.contains("Running task e2e-echo in box e2e-echo-1"),
+        "task run must reach its box's entrypoint: stderr={stderr}"
+    );
+    // The entrypoint never started, so the client removes the box and
+    // keeps nothing.
+    assert!(
+        !stderr.contains("Kept box"),
+        "a box whose entrypoint never started must not be kept: stderr={stderr}"
+    );
+    let mut client = daemon.server.connect().await;
+    let resp = client.call::<minimald_rpc::ListSessions>(&()).await;
+    assert!(
+        resp.sessions.is_empty(),
+        "a box whose entrypoint never started must be removed: {} left",
+        resp.sessions.len()
     );
 }
 
@@ -5041,8 +5217,8 @@ async fn activate_own_ip_on_vm_host<G>(
     stand_up: impl FnOnce(&std::path::Path) -> G,
 ) -> std::process::Output {
     let state = tempfile::TempDir::new().unwrap();
-    let provider_dir = state.path().join("providers").join("local-minvmd0");
-    let state_dir = minvmd::state::StateDir::new(provider_dir.clone()).unwrap();
+    let host_dir = state.path().join("providers").join("local-minvmd0");
+    let state_dir = minvmd::state::StateDir::new(host_dir.clone()).unwrap();
     state_dir
         .write_state(&minvmd::state::State {
             lifecycle: minvmd::lifecycle::Lifecycle::Running,
@@ -5051,8 +5227,8 @@ async fn activate_own_ip_on_vm_host<G>(
         .unwrap();
     let _alive = state_dir.try_acquire_alive_lock().unwrap();
     let server = minimald::test_harness::TestServer::new().await;
-    server.listen_on_uds(&provider_dir.join("ssh.sock")).await;
-    let _control = stand_up(&provider_dir.join("control.sock"));
+    server.listen_on_uds(&host_dir.join("ssh.sock")).await;
+    let _control = stand_up(&host_dir.join("control.sock"));
 
     let project = tempfile::TempDir::new().unwrap();
     std::fs::create_dir(project.path().join(".git")).unwrap();

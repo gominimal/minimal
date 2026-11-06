@@ -11,6 +11,10 @@
 //! a child process whose environment starts with every `OTEL_*`,
 //! `MINIMAL_*`, `DO_NOT_TRACK`, `TRACEPARENT` and `RUST_LOG` variable
 //! removed, and writes its spans to a spool the test reads.
+// The in-process daemon's async bodies are deep: rustc's default query depth (128)
+// overflows computing their layout (`queries overflow the depth limit!`), as the
+// daemon crates themselves already declare.
+#![recursion_limit = "256"]
 #![cfg(target_os = "linux")]
 #![expect(
     clippy::unwrap_used,
@@ -752,7 +756,9 @@ async fn exec_run_attach_and_task_run_share_the_commands_trace() {
         let (name, command) = match r.verb {
             "exec" => ("exec", Some("min://shell ")),
             "run" => ("exec", Some("min://task/run tp")),
-            "task run" => ("exec", Some("min://task/run --owns-box tp")),
+            // The task box's entrypoint runs the task, so the run owns no
+            // box and sends no `--owns-box` (T43).
+            "task run" => ("exec", Some("min://task/run tp")),
             _ => ("attach", None),
         };
         let request = daemon_spans

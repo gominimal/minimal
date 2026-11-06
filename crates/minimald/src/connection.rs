@@ -141,6 +141,18 @@ pub struct Connection {
     /// any other exit, when the connection itself drops.
     liveness: Option<Arc<()>>,
 
+    /// Set when the peer asks for the ssh-userauth service, the first thing
+    /// any client does once key exchange is done. `run_stream` returns after
+    /// the id exchange with key exchange still running in russh's own task,
+    /// so this is how the accept loop tells a failed key exchange from a
+    /// session that ended.
+    past_kex: bool,
+
+    /// Set when authentication succeeds. A peer can ask for ssh-userauth
+    /// and hang up before it authenticates; only one that got here had a
+    /// session.
+    authenticated: bool,
+
     serv: ServerStateHandle,
 }
 
@@ -167,6 +179,8 @@ impl Connection {
             channels: BTreeMap::new(),
             created_sessions: Vec::new(),
             liveness: Some(Arc::new(())),
+            past_kex: false,
+            authenticated: false,
             serv,
         })));
 
@@ -235,6 +249,16 @@ impl ConnectionHandle {
         std::mem::take(&mut self.0.lock().await.created_sessions)
     }
 
+    /// Whether the peer got past key exchange (see [`Connection::past_kex`]).
+    pub async fn past_kex(&self) -> bool {
+        self.0.lock().await.past_kex
+    }
+
+    /// Whether the peer authenticated (see [`Connection::authenticated`]).
+    pub async fn authenticated(&self) -> bool {
+        self.0.lock().await.authenticated
+    }
+
     /// Ends this connection's liveness: its sessions stop counting it as a
     /// live creator from here on, even if a stray handle clone outlives the
     /// teardown. Called last at connection teardown, once the unfinalized
@@ -287,6 +311,16 @@ pub struct ConnectionHandler(ConnectionHandle);
 
 impl russh::server::Handler for ConnectionHandler {
     type Error = ConnectionError;
+
+    async fn authentication_banner(&mut self) -> Result<Option<String>, Self::Error> {
+        self.0.lock().await.past_kex = true;
+        Ok(None)
+    }
+
+    async fn auth_succeeded(&mut self, _: &mut Session) -> Result<(), Self::Error> {
+        self.0.lock().await.authenticated = true;
+        Ok(())
+    }
 
     async fn auth_none(&mut self, user: &str) -> Result<russh::server::Auth, Self::Error> {
         let mut s = self.0.lock().await;
@@ -457,6 +491,11 @@ impl russh::server::Handler for ConnectionHandler {
                 let _ = hnd
                     .data(id, format!("Error attaching to session: {e}\r\n"))
                     .await;
+                // A refusal with its own exit status (a refused resume,
+                // BOX-025) ends the client's attach with it, not 255.
+                if let Some(code) = e.exit_code() {
+                    let _ = hnd.exit_status_request(id, code).await;
+                }
                 let _ = hnd.close(id).await;
             }
         };

@@ -127,14 +127,12 @@ pub(super) fn host_ask_refusal_text(reason: minimald_rpc::AskRefused) -> &'stati
             "too many port prompts from this box are already waiting for an answer"
         }
         minimald_rpc::AskRefused::NoRow => {
-            "this box's network addresses are not registered with the VM host daemon"
+            "this box's network addresses are not registered on the host"
         }
         minimald_rpc::AskRefused::StanceNotAsk => {
-            "the VM host daemon does not have this box's --dynamic-ingress set to ask"
+            "the host does not have this box's --dynamic-ingress set to ask"
         }
-        minimald_rpc::AskRefused::OutsideGrant => {
-            "the port is outside the --dynamic-range the VM host daemon holds for this box"
-        }
+        minimald_rpc::AskRefused::OutsideGrant => "the port is outside this box's --dynamic-range",
         minimald_rpc::AskRefused::NoClient => "nobody is attached on the host to answer",
         minimald_rpc::AskRefused::Denied => "the person attached answered no",
         minimald_rpc::AskRefused::NoTty => "the attached terminal could not show the prompt",
@@ -263,7 +261,9 @@ impl BoxActor {
             .unwrap_or(boxes::DynamicIngress::Deny);
         // The box's own setting decides first (NET-043), whatever asked: the
         // deny-all default when nothing was declared, the range gate under an
-        // `allow`, and an `ask` handed to whoever is attached (NET-045).
+        // `allow` or an `ask`, and an in-range `ask` handed to whoever is
+        // attached (NET-045). A port outside an `ask` box's range is refused
+        // here, so no prompt is routed for it (NET-047).
         match crate::net::policy::dynamic_ingress_decision(record.policy.ingress.as_ref(), port) {
             Err(crate::net::policy::ExposeRefusal::AskNeedsAnswer) => {
                 self.route_ask(record, box_name, port, reply).await;
@@ -474,13 +474,14 @@ impl BoxActor {
                 // A VM host recorded the yes in the row before the publish
                 // ran, so a publish refused before its bind gives the port
                 // back there, leaving no partial mapping — unless the port
-                // stands published already, whose admission the row's entry
-                // is.
+                // stands published already, by either surface, whose
+                // admission the row's entry is.
                 if ask.host_ask.is_some()
                     && let Err(crate::net::policy::ExposeFailure::Refused(refusal)) = &published
                     && !matches!(
                         refusal,
                         crate::net::policy::ExposeRefusal::AlreadyPublished { .. }
+                            | crate::net::policy::ExposeRefusal::ListenPublished { .. }
                     )
                     && let Some(addresses) = ask.record.box_addresses
                 {
@@ -537,7 +538,7 @@ impl BoxActor {
             AskEnd::HostRefused(reason) => Err(crate::net::policy::ExposeFailure::Publish {
                 port: ask.port,
                 source: std::io::Error::other(format!(
-                    "the VM host daemon refused the port prompt: {}",
+                    "the port prompt was refused: {}",
                     host_ask_refusal_text(*reason)
                 )),
             }),
@@ -614,6 +615,35 @@ impl BoxActor {
             .as_utf8_path()
             .as_std_path()
             .to_path_buf();
+        // How the VM host names this box when its copy of the record
+        // arrives (NET-046). A box with a switch address reports only by the
+        // route its listen watcher registered. A box with no switch address
+        // has no such route, so its report carries the box id and goes over
+        // this box's control channel. When the box record cannot be read,
+        // the switch address this box reported decides, so a box with no
+        // switch still reports by id.
+        let no_switch = match self.record.record().await {
+            Ok(record) => record.box_addresses.is_none(),
+            Err(error) => {
+                let no_switch = self.reported_switch_address.is_none();
+                tracing::debug!(
+                    name = %box_name,
+                    port,
+                    %error,
+                    no_switch,
+                    "the box record could not be read; the reported switch address decides the host report key"
+                );
+                no_switch
+            }
+        };
+        let host_key = if no_switch {
+            crate::audit::HostReportKey {
+                box_id: Some(*self.record.id()),
+                control: Some(self.switch_control().await),
+            }
+        } else {
+            crate::audit::HostReportKey::default()
+        };
         // An allow that stands is recorded before anything else is said
         // about it, and only a recorded one is answered as published
         // (NET-046): an allow whose record cannot be written is withdrawn and
@@ -630,7 +660,7 @@ impl BoxActor {
                     outcome: crate::audit::DecisionOutcome::Published,
                     reason: None,
                 };
-                match crate::audit::try_append(&state_dir, &record).await {
+                match crate::audit::try_append(&state_dir, &record, &host_key).await {
                     Ok(()) => {
                         // The record is written, so the box's relay gate
                         // admits the port now, before the caller hears the
@@ -707,13 +737,45 @@ impl BoxActor {
                     Some(refusal.to_string()),
                 )
             }
-            Err(crate::net::policy::ExposeFailure::Refused(refusal)) => {
+            // The box's own listening process published the port already:
+            // the request is answered as the goal met, so its line and its
+            // record say the port is published, and name the listener's
+            // publication as the one standing — never one this request made.
+            Err(crate::net::policy::ExposeFailure::Refused(
+                refusal @ crate::net::policy::ExposeRefusal::ListenPublished { .. },
+            )) => {
                 tracing::info!(
                     name = %box_name,
                     port,
                     decision = %decision,
                     decided_by = %decided_by,
-                    outcome = "refused",
+                    outcome = "published already",
+                    reason = %refusal,
+                    owner = %crate::net::listeners::PublicationOwner::Listen.as_str(),
+                    "dynamic ingress expose"
+                );
+                (
+                    crate::audit::DecisionOutcome::Published,
+                    Some(refusal.to_string()),
+                )
+            }
+            Err(crate::net::policy::ExposeFailure::Refused(refusal)) => {
+                // A port outside the box's range says so in the outcome, so
+                // the log tail tells it apart from a stance refusal.
+                let outcome = if matches!(
+                    refusal,
+                    crate::net::policy::ExposeRefusal::OutOfRange { .. }
+                ) {
+                    "refused: out of range"
+                } else {
+                    "refused"
+                };
+                tracing::info!(
+                    name = %box_name,
+                    port,
+                    decision = %decision,
+                    decided_by = %decided_by,
+                    outcome,
                     reason = %refusal,
                     "dynamic ingress expose"
                 );
@@ -764,6 +826,8 @@ impl BoxActor {
         };
         // A refusal is recorded best-effort: it already refused, and a record
         // that cannot be written must not undo it — that would open the port.
+        // So is a port the box's listener published already: the
+        // publication is the listener's, and this request has none to undo.
         if !recorded {
             let reason = because.map(str::to_string).or(reason);
             crate::audit::append(
@@ -777,6 +841,7 @@ impl BoxActor {
                     outcome: audited,
                     reason,
                 },
+                &host_key,
             )
             .await;
         }
@@ -1022,6 +1087,31 @@ impl BoxActor {
         {
             Ok(reservation) => reservation,
             Err(held) => {
+                // The box's own listening process published the port
+                // already, and the publication stands listed and admitted:
+                // what the request asks for is true, so it is answered as
+                // such, with the address the port answers at. Nothing is
+                // reserved, reported or bound for it, and the publication
+                // stays the listener's, to be withdrawn when the listener
+                // closes (NET-017). A pending listen reservation, or one
+                // committed unlisted because its record was refused, is not
+                // reachable yet, so it stays the refusal below. So does one
+                // whose listener is closing: its withdrawal refuses the port
+                // at the gate before its row leaves the set, and keeps the
+                // row across a failed unexpose's retries.
+                let admitted = crate::net::switch::live_gate(switch_address)
+                    .is_none_or(|gate| gate.admits_tcp(port));
+                if let Some(local) = self
+                    .publications
+                    .listen_row(port)
+                    .filter(|_| admitted)
+                    .and_then(|row| row.local.parse().ok())
+                {
+                    return Err(ExposeFailure::Refused(ExposeRefusal::ListenPublished {
+                        port,
+                        local,
+                    }));
+                }
                 return Err(ExposeFailure::Refused(ExposeRefusal::AlreadyPublished {
                     port,
                     owner: held.owner,
@@ -1194,7 +1284,11 @@ impl BoxActor {
     /// it runs (NET-129): the port's holder was destroyed, moved off the
     /// address or stopped naming the port, and the registry elected this
     /// box. Its attach skipped the port while it yielded, so nothing is
-    /// bound for it until this, or until its next attach.
+    /// bound for it until this, or until its next attach. The present
+    /// landing sends the same hand-over to a box it moved off the
+    /// `127.0.0.1` interim (NET-123 §7.1): its attach bound the forward at
+    /// the interim, and this binds it at the address its name now answers
+    /// at.
     ///
     /// Nothing is asked for a box with no host running or whose spawn has
     /// ended: that box holds the port of record and its next attach binds
@@ -1311,6 +1405,181 @@ impl BoxActor {
                 %error,
                 "the hand-over could not record the shared-address port it bound; \
                  a daemon restart may hand it to another box"
+            );
+        }
+    }
+
+    /// Unbinds the declared forward of `port` still bound at `from` once the
+    /// move's hand-over bound it at `to` (#2748). Without this the box keeps
+    /// a listener at the old address: the `127.0.0.1` interim is shared, and
+    /// the registry may give the port there to another box, whose bind would
+    /// meet it. The old forward is unbound only after the new one stands, so
+    /// the port is served the whole way through. A bind at `to` that failed
+    /// leaves the old forward as it is.
+    ///
+    /// On a VM-backed host the host refuses a declared port's withdrawal and
+    /// unbinds the box's declared forwards itself
+    /// ([`crate::net::policy::ControlChannel::host_unbinds_declared_forwards`]),
+    /// so nothing is asked there. An unbind that fails is logged, and the
+    /// spawn's end unbinds the forward as it would have.
+    #[cfg(target_os = "linux")]
+    pub(super) async fn release_moved_declared(
+        &mut self,
+        from: std::net::Ipv4Addr,
+        to: std::net::Ipv4Addr,
+        port: u16,
+    ) {
+        if !self.has_live_host() || !self.live_ingress.holds_handed_at(to, port) {
+            return;
+        }
+        let stale = self.live_ingress.declared_at(from, port);
+        if stale.is_empty() {
+            return;
+        }
+        let control = self.switch_control().await;
+        if control.host_unbinds_declared_forwards() {
+            return;
+        }
+        for forwarder in stale {
+            match forwarder.unbind_moved(&control).await {
+                Ok(()) => tracing::info!(
+                    port,
+                    %from,
+                    %to,
+                    "unbound a declared port at the box's old address after its move"
+                ),
+                Err(error) => tracing::warn!(
+                    port,
+                    %from,
+                    %error,
+                    "unbinding a declared port at the box's old address failed; \
+                     it is unbound when the box's spawn ends"
+                ),
+            }
+        }
+    }
+
+    /// Moves the forwards this box's `min net expose` bound at `from` to
+    /// `to`, the address its publish moved to (#2748). The present landing
+    /// moves a box off the `127.0.0.1` interim while it runs, and a runtime
+    /// publish binds at the address the box published at when it was asked,
+    /// so without this the name would answer at `to` while the exposed port
+    /// listens at `from`.
+    ///
+    /// Each forward is bound at `to` first, toward the same lease, and only
+    /// then is the one at `from` unbound, so the port is served the whole
+    /// way through. The box's gate and the VM host daemon's row name the port,
+    /// not the address, so neither changes. A bind that fails is logged and
+    /// leaves the forward at `from`. An unbind that fails keeps the old
+    /// forward for the box's stop or its spawn's end to unbind.
+    ///
+    /// Nothing is moved for a box with no host running or whose spawn has
+    /// ended, or when the registry no longer publishes the box at `to`,
+    /// since the move is read after other changes may have landed.
+    #[cfg(target_os = "linux")]
+    pub(super) async fn move_exposed_ports(
+        &mut self,
+        from: std::net::Ipv4Addr,
+        to: std::net::Ipv4Addr,
+    ) {
+        if !self.has_live_host() || self.live_ingress.is_detached() {
+            return;
+        }
+        let moving = self.live_ingress.bound_at(from);
+        if moving.is_empty() {
+            return;
+        }
+        let Ok(record) = self.record.record().await else {
+            return;
+        };
+        let switch_address = {
+            let registry = self
+                .hostnames
+                .read()
+                .expect("hostname registry lock poisoned");
+            if registry.published_own_address(record.id) != Some(to) {
+                return;
+            }
+            match record.box_addresses {
+                Some(addresses) => Some(addresses.switch_address),
+                None => registry.own_lease(record.id),
+            }
+        };
+        let Some(switch_address) = switch_address else {
+            return;
+        };
+        let session_name = record
+            .name
+            .as_deref()
+            .unwrap_or(crate::rpc::ANONYMOUS_SESSION);
+        let control = self.switch_control().await;
+        for (port, proto) in moving {
+            let forwarder = match crate::net::policy::expose_dynamic(
+                &control,
+                to,
+                switch_address,
+                port,
+                proto,
+                None,
+            )
+            .await
+            {
+                Ok(forwarder) => forwarder,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %record.id,
+                        session_name,
+                        port,
+                        %from,
+                        %to,
+                        %error,
+                        owner = %crate::net::listeners::PublicationOwner::Expose.as_str(),
+                        "binding an exposed port at the box's new address failed; \
+                         it stays at the old address until the box stops"
+                    );
+                    continue;
+                }
+            };
+            let mapping = minimald_rpc::LiveMapping {
+                local: forwarder.local().to_string(),
+                internal_port: forwarder.internal_port(),
+                proto,
+                pending: None,
+            };
+            let moved = crate::net::provider::LiveIngressForward { forwarder, mapping };
+            let old = match self.live_ingress.rebind(from, moved) {
+                Ok(old) => old,
+                Err(moved) => {
+                    // The spawn ended, or the port was withdrawn, while the
+                    // bind was in flight: the new forward comes down here.
+                    crate::net::policy::remove_ingress(&control, &[moved.forwarder]).await;
+                    continue;
+                }
+            };
+            if let Err(error) =
+                crate::net::policy::unexpose_forwarder(&control, &old.forwarder).await
+            {
+                tracing::warn!(
+                    session_id = %record.id,
+                    session_name,
+                    port,
+                    %from,
+                    %error,
+                    "unbinding an exposed port at the box's old address failed; \
+                     it is unbound again when the box stops"
+                );
+                if let Err(stale) = self.live_ingress.retire(old.forwarder) {
+                    crate::net::policy::remove_ingress(&control, &[stale]).await;
+                }
+            }
+            tracing::info!(
+                session_id = %record.id,
+                session_name,
+                port,
+                %from,
+                %to,
+                owner = %crate::net::listeners::PublicationOwner::Expose.as_str(),
+                "moved an exposed port to the box's new address"
             );
         }
     }

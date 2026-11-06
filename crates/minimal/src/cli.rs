@@ -88,6 +88,12 @@ pub enum Command {
     Net(NetArgs),
     /// Box subcommands: show what a box will get
     Box(BoxArgs),
+    /// Host subcommands: the daemons on this machine that run boxes
+    #[command(visible_alias = "hosts")]
+    Host(HostArgs),
+    /// Provider subcommands: the kinds of local host this machine runs
+    #[command(visible_alias = "providers")]
+    Provider(ProviderArgs),
     /// Finish the install on this host: every privileged step it still needs, in one run (`--show` names them, `--show --script` prints the script, `--undo` removes them)
     FinalizeInstall(FinalizeInstallArgs),
     /// Muscle-memory catch for the in-box `min run <task>`: always errors,
@@ -97,6 +103,14 @@ pub enum Command {
     Run(RunArgs),
     /// Print important directories and file paths for debugging
     Dirs,
+    /// Check this host for problems: today, that no record of the audit log
+    /// was changed or removed
+    ///
+    /// Exits 0 when the audit log verifies or audit files are missing, and 6
+    /// when a record was changed or removed.
+    // BEP-049: whole-log verification of the audit chain is a `min doctor`
+    // check, never a `min box audit` flag.
+    Doctor,
     /// Collect a diagnostic bundle (logs, state, config) to send to the
     /// minimal dev team.
     ///
@@ -121,14 +135,14 @@ pub enum Command {
     Auth(AuthArgs),
     /// Store, list and remove the secrets that boxes reference by name
     Secret(SecretArgs),
-    /// Print that there is nothing to mint
+    // NET-109: `min login` is the alias for `min auth login`, so it takes
+    // the same arguments and runs the same sign-in.
+    /// Sign in to GitHub (the same as min auth login)
     ///
-    /// The HTTPS reverse proxy this verb once served is retired, so it
-    /// issues nothing and writes nothing to disk. The verb stays as the
-    /// future home of the sign-in that replaces it.
-    #[command(verbatim_doc_comment)]
-    #[command(hide = true)]
-    Login(LoginArgs),
+    /// Opens GitHub in your browser. With `--device`, or in a build with no
+    /// browser sign-in, prints a code to enter at github.com instead. The
+    /// token is kept in the host keychain and never written to a file.
+    Login(AuthLoginArgs),
     // `init`, `add`, and `update` are deliberate exceptions to the
     // `<noun> <verb>` convention (documented in docs/reference/cli.md): they
     // are passthroughs to the project-configuration commands of the same name
@@ -376,6 +390,18 @@ impl MachineModeFailure {
     pub fn hint(&self) -> &str {
         &self.hint
     }
+
+    /// The failure with an old-spelling hint added to its `hint` field, so
+    /// the error object carries it and no separate line prints (BCLI-042).
+    #[must_use]
+    pub fn with_alias_hint(mut self, alias_hint: &str) -> Self {
+        self.hint = if self.hint.is_empty() {
+            alias_hint.to_owned()
+        } else {
+            format!("{}. {alias_hint}", self.hint)
+        };
+        self
+    }
 }
 
 impl std::fmt::Display for MachineModeFailure {
@@ -418,6 +444,445 @@ pub enum BoxCommand {
     /// admitted or refused, each secret minted for the box, and the box's
     /// revocation. A removed box's records stay readable by its id
     Audit(BoxAuditArgs),
+    /// List the boxes of the current project, in any state: their id,
+    /// name, type, parent, project and state, with how a stopped or exited
+    /// box ended, and the provider and host each box runs on. `--all`
+    /// lists the boxes of every project
+    List(BoxListArgs),
+    /// Show one box: its id, name, type, parent, project, state, how it
+    /// ended, the identity it runs under, and its provider and host
+    Show(BoxShowArgs),
+    /// Stop a running box and keep it: its record, its events and its
+    /// files stay until `min box rm` removes them. `--force` kills every
+    /// process in the box at once, with no grace period
+    Stop(BoxStopArgs),
+    /// Remove a stopped or exited box: its record, its events and its
+    /// files. A running box is refused unless `--force` is given, which
+    /// stops the box at once and then removes it
+    Rm(BoxRmArgs),
+    /// Attach this terminal to a box's terminal. With no box named, attach
+    /// to this project's running box that has a terminal, else to its only
+    /// stopped or exited one, which starts again
+    Attach(BoxAttachArgs),
+    /// Run a command in a running box and exit with the command's exit
+    /// code. `-t` gives the command a terminal, and `--detach` starts it
+    /// and returns its exec id
+    Exec(BoxExecArgs),
+    /// Show what happened to a box: each event the daemon recorded for
+    /// it, such as its creation, each start and stop, each exec and its
+    /// exit, oldest first. A stopped or exited box keeps its events until
+    /// `min box rm` removes it
+    Events(BoxEventsArgs),
+    /// Copy a file out of a box to this machine. A stopped or exited box
+    /// keeps its files, so a copy from it works too
+    Cp(BoxCpArgs),
+    /// Give a box a new name. The box keeps its id, its state and its
+    /// files. A name that a running box on the same host holds is refused
+    Rename(BoxRenameArgs),
+    /// Remove every stopped or exited box: its record, its events and its
+    /// files. A running box is never removed. `--older-than` and `--parent`
+    /// narrow what is removed. Off a terminal, `--yes` is required
+    Prune(BoxPruneArgs),
+}
+
+// BOX-162 (BCLI-016): `min box events <box> | --parent <box> [-o jsonl] [--follow]`.
+#[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("box_or_parent").required(true).args(["target", "parent"])))]
+pub struct BoxEventsArgs {
+    /// The box: its id, the start of its id, or its name, as `min box list`
+    /// prints them
+    pub target: Option<String>,
+    /// Show the events of every child box of this box together, in time
+    /// order, each event naming its box
+    #[arg(long, value_name = "BOX")]
+    pub parent: Option<String>,
+    /// Write each event as one JSON object on its own line
+    #[arg(short = 'o', long = "output", value_enum)]
+    pub output: Option<BoxEventsOutputFormat>,
+    /// Show the events so far, then keep showing new events as they
+    /// happen, until the box is removed or the command is interrupted
+    #[arg(short = 'f', long)]
+    pub follow: bool,
+}
+
+/// The rendering `min box events` writes, beside the text default.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum BoxEventsOutputFormat {
+    /// One JSON object for each event
+    Jsonl,
+}
+
+// BOX-017 (BCLI-062): `min box cp <box>:<path> <local>`.
+#[derive(Debug, Args)]
+pub struct BoxCpArgs {
+    /// The file to copy, as `<box>:<path>`. `<box>` is the box's id, the
+    /// start of its id, or its name. A relative `<path>` is in the box's
+    /// home directory, and `/workbench/<path>` is in its copy of the project
+    #[arg(value_name = "BOX:PATH")]
+    pub source: String,
+    /// Where to write the file on this machine. An existing directory
+    /// receives the file under its own name
+    #[arg(value_name = "LOCAL")]
+    pub destination: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct HostArgs {
+    #[command(subcommand)]
+    pub command: HostCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HostCommand {
+    /// List the local hosts: each daemon on this machine that runs boxes,
+    /// with its provider and whether it is running
+    #[command(visible_alias = "ls")]
+    List,
+    /// Show one local host: its provider, whether it is running, the socket
+    /// `min` connects to and the daemon version
+    Show(HostShowArgs),
+    /// Stop each running box on a local host, then its daemon, and its VM
+    /// on a VM host
+    Stop(HostStopArgs),
+}
+
+// BCLI-048: `min host show <host>`.
+#[derive(Debug, Args)]
+pub struct HostShowArgs {
+    /// The host, as `min host list` prints it (`local0`, `local-minvmd0`)
+    pub host: String,
+}
+
+// BCLI-049: `min host stop <host> [--force]`.
+#[derive(Debug, Args)]
+pub struct HostStopArgs {
+    /// The host, as `min host list` prints it (`local0`, `local-minvmd0`)
+    pub host: String,
+    /// Force-stop each box, and stop the daemon without waiting for it to
+    /// shut down cleanly. On a VM host, the VM is stopped from this machine
+    #[arg(long, short, default_value_t = false)]
+    pub force: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ProviderArgs {
+    #[command(subcommand)]
+    pub command: ProviderCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProviderCommand {
+    /// List the provider this command selects, with its hosts. `--all`
+    /// lists every local provider on this machine
+    #[command(visible_alias = "ls")]
+    List(ProviderListArgs),
+}
+
+// BCLI-052: `min provider list [--all]`.
+#[derive(Debug, Args)]
+pub struct ProviderListArgs {
+    /// List every local provider on this machine, not only the one this
+    /// command selects
+    #[arg(long)]
+    pub all: bool,
+}
+
+// BOX-158 (BCLI-001, BCLI-051): `min box list [--all] [-o json]`.
+#[derive(Debug, Args)]
+pub struct BoxListArgs {
+    /// List the boxes of every project, not only the boxes of the current
+    /// project
+    #[arg(long)]
+    pub all: bool,
+    /// Write the boxes as a JSON array, one object for each box, and
+    /// nothing else
+    #[arg(short = 'o', long = "output", value_enum)]
+    pub output: Option<BoxListOutputFormat>,
+}
+
+/// The rendering `min box list` writes, beside the table default.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum BoxListOutputFormat {
+    /// One JSON array of box objects
+    Json,
+}
+
+// BOX-159 (BCLI-003): `min box show <box>`.
+#[derive(Debug, Args)]
+pub struct BoxShowArgs {
+    /// The box: its id, the start of its id, or its name, as `min box list`
+    /// prints them
+    pub target: String,
+}
+
+// BOX-013 (BCLI-059): `min box stop <box> [--force]`.
+#[derive(Debug, Args)]
+pub struct BoxStopArgs {
+    /// The box: its id, the start of its id, or its name, as `min box list`
+    /// prints them
+    pub target: String,
+    /// Kill every process in the box at once, with no grace period
+    #[arg(long)]
+    pub force: bool,
+}
+
+// BCLI-068: `min box attach [<box>] [--exec <id>]`.
+#[derive(Debug, Args)]
+pub struct BoxAttachArgs {
+    /// The box: its id, the start of its id, its name, or
+    /// provider/host/name, as `min box list` prints them. Omit it to attach
+    /// to this project's box
+    pub target: Option<String>,
+    /// Attach to a command that `min box exec -t` started in the box, by the
+    /// exec id it printed. Needs a box
+    #[arg(long = "exec", value_name = "EXEC_ID", requires = "target")]
+    pub exec: Option<String>,
+}
+
+// BOX-019 (BCLI-060, BCLI-004): `min box rm <box> [--force]`.
+#[derive(Debug, Args)]
+pub struct BoxRmArgs {
+    /// The box: its id, the start of its id, or its name, as `min box list`
+    /// prints them
+    pub target: String,
+    /// Remove a running box too: stop it at once, then remove it
+    #[arg(long)]
+    pub force: bool,
+}
+
+// BOX-149 (BCLI-053): `min box exec <box> [-t|--detach] [--timeout <d>] -- <cmd>`.
+#[derive(Debug, Args)]
+pub struct BoxExecArgs {
+    /// The box: its id, the start of its id, or its name, as `min box list`
+    /// prints them
+    pub target: String,
+    /// Give the command a terminal and connect this terminal to it. The
+    /// command's exec id is printed on stderr
+    #[arg(short = 't', long = "tty", conflicts_with = "detach")]
+    pub tty: bool,
+    /// Start the command and return at once. Only the command's exec id is
+    /// printed, on stdout
+    #[arg(long)]
+    pub detach: bool,
+    /// Stop the command when it runs for longer than this: a number of
+    /// seconds, or a number followed by s, m or h, such as 30s, 5m or 1h.
+    /// The command then ends with exit code 124
+    #[arg(long, value_name = "DURATION", value_parser = parse_exec_timeout)]
+    pub timeout: Option<u64>,
+    /// The command and its arguments, after `--`. The command runs as these
+    /// words, with no shell
+    #[arg(last = true, required = true, num_args = 1.., value_name = "COMMAND")]
+    pub command: Vec<String>,
+}
+
+/// Reads a `min box exec --timeout` value as whole seconds: a number of
+/// seconds, or a number followed by `s`, `m` or `h`. Zero is refused, as the
+/// daemon refuses a timeout of zero seconds (BOX-149).
+pub(crate) fn parse_exec_timeout(raw: &str) -> Result<u64, String> {
+    let refused = || {
+        format!(
+            "'{raw}' is not a timeout. Give a whole number of seconds, minutes or hours \
+             that is more than zero, such as 30s, 5m or 1h."
+        )
+    };
+    let (digits, scale) = match raw.char_indices().last() {
+        Some((at, 's')) => (&raw[..at], 1),
+        Some((at, 'm')) => (&raw[..at], 60),
+        Some((at, 'h')) => (&raw[..at], 3600),
+        _ => (raw, 1),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(refused());
+    }
+    let count: u64 = digits.parse().map_err(|_| refused())?;
+    match count.checked_mul(scale) {
+        Some(secs) if secs > 0 => Ok(secs),
+        _ => Err(refused()),
+    }
+}
+
+/// Why `min box exec` ran no command in the box: `-t` without a terminal
+/// (exit 2), the box is not running (BOX-149, exit 2), or its spec turns
+/// exec off (BOX-153, exit 5). `target` is the box as the user named it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoxExecRefusal {
+    /// `-t` ran with a stdin that is not a terminal, so nothing started.
+    /// Exit 2.
+    NoTerminal {
+        /// The box as the user named it.
+        target: String,
+    },
+    /// The box is not running. Exit 2.
+    NotRunning {
+        /// The box as the user named it.
+        target: String,
+        /// The box's state as its host names it, such as `stopped`.
+        state: String,
+    },
+    /// The box's spec sets `[io] exec_enabled = false`. Exit 5.
+    ExecDisabled {
+        /// The box as the user named it.
+        target: String,
+    },
+    /// The box's spec cannot be read, so exec stays off. Exit 5.
+    SpecUnreadable {
+        /// The box as the user named it.
+        target: String,
+    },
+}
+
+impl BoxExecRefusal {
+    /// The exit code `min box exec` ends with on this refusal, from the
+    /// architecture's exit-code table: 2 for the state, 5 for the spec.
+    #[must_use]
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::NoTerminal { .. } | Self::NotRunning { .. } => 2,
+            Self::ExecDisabled { .. } | Self::SpecUnreadable { .. } => 5,
+        }
+    }
+
+    /// The outcome the command's tracing event records.
+    #[must_use]
+    pub fn outcome(&self) -> &'static str {
+        match self {
+            Self::NoTerminal { .. } => "no terminal",
+            Self::NotRunning { .. } => "not running",
+            Self::ExecDisabled { .. } => "exec disabled",
+            Self::SpecUnreadable { .. } => "spec unreadable",
+        }
+    }
+}
+
+impl std::fmt::Display for BoxExecRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoTerminal { target } => write!(
+                f,
+                "Did not run the command in {target}: -t needs a terminal. \
+                 Stdin is not a terminal. Run `min box exec {target} -- <command>` \
+                 without -t, or run it from a terminal."
+            ),
+            // BOX-149, BCLI-053: the refusal names the box's state.
+            Self::NotRunning { target, state } => write!(
+                f,
+                "{target} is {state}. Only a running box can run a command."
+            ),
+            Self::ExecDisabled { target } => write!(
+                f,
+                "{target} does not allow exec (its spec sets [io] exec_enabled = false)."
+            ),
+            Self::SpecUnreadable { target } => write!(
+                f,
+                "{target} does not allow exec: its spec cannot be read, so exec stays off."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BoxExecRefusal {}
+
+/// A command in a box that ran past its own timeout and was stopped
+/// (BOX-149, BCLI-053). `min box exec` and the wait for an exec end with
+/// exit 124 on it, and a machine-mode run answers it with `code =
+/// "timeout"`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoxExecTimedOut {
+    message: String,
+    hint: String,
+}
+
+impl BoxExecTimedOut {
+    /// The exit code, as `timeout(1)` gives it.
+    pub const EXIT_CODE: u8 = 124;
+
+    /// The `code` of the machine-mode error object.
+    pub const CODE: &'static str = "timeout";
+
+    /// The command `min box exec` ran in `target` with `--timeout`, after
+    /// `secs` seconds.
+    #[must_use]
+    pub fn exec(target: &str, secs: u64) -> Self {
+        Self {
+            message: format!(
+                "The command in {target} ran for longer than its timeout of {secs}s and was stopped."
+            ),
+            hint: "Run the command again with a longer --timeout.".to_string(),
+        }
+    }
+
+    /// The exec `exec_id` in `target`, as a wait for it found it.
+    #[must_use]
+    pub fn waited(target: &str, exec_id: &str) -> Self {
+        Self {
+            message: format!(
+                "Exec {exec_id} in {target} ran for longer than its timeout and was stopped."
+            ),
+            hint: String::new(),
+        }
+    }
+
+    /// The hint of the machine-mode error object.
+    #[must_use]
+    pub fn hint(&self) -> &str {
+        &self.hint
+    }
+}
+
+impl std::fmt::Display for BoxExecTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for BoxExecTimedOut {}
+
+// BOX-010 (BCLI-058): `min box rename <box> <name>`.
+#[derive(Debug, Args)]
+pub struct BoxRenameArgs {
+    /// The box: its id, the start of its id, or its name, as `min box list`
+    /// prints them
+    pub target: String,
+    /// The new name for the box
+    pub new_name: String,
+}
+
+// BOX-021 (BCLI-061, BCLI-005): `min box prune [--older-than <d>]
+// [--parent <box>] [--yes]`.
+#[derive(Debug, Args)]
+pub struct BoxPruneArgs {
+    /// Remove only the boxes that stopped or exited at least this long ago.
+    /// Takes a whole number of days, hours, minutes or seconds, such as
+    /// `7d`, `12h`, `30m` or `90s`
+    #[arg(long, value_name = "AGE", value_parser = parse_box_age)]
+    pub older_than: Option<std::time::Duration>,
+    /// Remove only the child boxes of this box: its id, the start of its
+    /// id, or its name
+    #[arg(long, value_name = "BOX")]
+    pub parent: Option<String>,
+    /// Remove the boxes without asking first
+    #[arg(long, short)]
+    pub yes: bool,
+}
+
+/// Parses the `--older-than` age of `min box prune`: a whole number with a
+/// `d`, `h`, `m` or `s` unit.
+pub(crate) fn parse_box_age(arg: &str) -> Result<std::time::Duration, String> {
+    let units: [(char, u64); 4] = [('d', 86_400), ('h', 3_600), ('m', 60), ('s', 1)];
+    let invalid = || {
+        format!(
+            "`{arg}` is not an age. Use a whole number of days, hours, minutes or \
+             seconds, such as 7d, 12h, 30m or 90s."
+        )
+    };
+    let unit = arg.chars().last().ok_or_else(invalid)?;
+    let (_, scale) = units
+        .iter()
+        .find(|(suffix, _)| *suffix == unit)
+        .ok_or_else(invalid)?;
+    let count: u64 = arg[..arg.len() - 1].parse().map_err(|_| invalid())?;
+    let secs = count.checked_mul(*scale).ok_or_else(invalid)?;
+    Ok(std::time::Duration::from_secs(secs))
 }
 
 // BEP-042: `min box audit <box|self> | --parent <box|self> [-o jsonl] [--follow]`.
@@ -453,6 +918,17 @@ pub struct BoxSpecArgs {
     /// The project directory whose minimal.toml declares the box
     /// (default: --repo-dir, or the current directory)
     pub path: Option<PathBuf>,
+    // The same flag as `min session activate --network`, from the same
+    // definition, so the preview is of the box that activation creates.
+    #[arg(
+        long,
+        value_name = NETWORK_VALUE_NAME,
+        value_parser = parse_network_mode,
+        default_value = NETWORK_DEFAULT,
+        help = NETWORK_HELP,
+        long_help = NETWORK_LONG_HELP
+    )]
+    pub network: CliNetworkMode,
 }
 
 #[derive(Debug, Args)]
@@ -484,17 +960,23 @@ pub struct TaskArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum TaskCommand {
-    /// Run a declared task in an ephemeral session
+    /// Run a declared task in a task box
     ///
-    /// Creates a session for the project (named `task-<task>-<hex>`),
-    /// uploads the project like `min session activate`, runs the task
-    /// inside it with output streamed to the terminal, exits with the
-    /// task's exit code, and destroys the session afterwards. `--keep`
-    /// retains the session as an attachable box instead. Ctrl-C tears the
-    /// session down (or keeps it with `--keep`) and exits 130 without
-    /// relaying the interrupt to the task itself. Tasks run
-    /// non-interactively: pipe stdin to feed input; use `min session
-    /// attach` for interactive work.
+    /// Creates a box for the project (named `<task>-<n>`), uploads the
+    /// project like `min session activate`, runs the task inside it, and
+    /// exits with the task's exit code.
+    ///
+    /// The task runs without a terminal. This command does not pass its stdin
+    /// to the task yet. The task's stdout is this command's stdout, and this
+    /// command prints its own lines on stderr, beside the task's stderr. So
+    /// `min task run query > out.csv` writes only the task's output.
+    ///
+    /// When the task ends, the box stays with its exit code: see it with
+    /// `min box show <task>-<n>` and remove it with `min box rm <task>-<n>`.
+    /// Ctrl-C stops the box as `min box stop` does, the box stays, and this
+    /// command exits 130. For a task declared with `interactive = true`,
+    /// Ctrl-C destroys its box instead. Use `min session attach` for
+    /// interactive work.
     Run(TaskRunArgs),
 }
 
@@ -508,9 +990,6 @@ pub struct TaskRunArgs {
     /// task name is a task argument, never a project path.
     #[arg(long)]
     pub path: Option<String>,
-    /// Keep the session after the task exits instead of destroying it
-    #[arg(long)]
-    pub keep: bool,
     /// Arguments to the task, passed through to its declared `args`.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
     pub args: Vec<String>,
@@ -614,9 +1093,10 @@ pub struct GlobalArgs {
     pub config_dir: Option<PathBuf>,
     /// Select the daemon backend that hosts sessions.
     ///
-    /// On Linux, `local-minimald` (the default) runs minimald on the host;
+    /// On Linux, `local` (the default) runs minimald on the host;
     /// `local-minvmd` runs it inside the minvmd microVM. No effect on macOS,
-    /// where minvmd is the only backend.
+    /// where minvmd is the only backend. `min provider list --all` lists the
+    /// providers on this machine.
     #[arg(long, global = true, value_name = "PROVIDER")]
     pub provider: Option<Provider>,
     /// Skip interactive prompts that need a terminal.
@@ -631,7 +1111,7 @@ pub struct GlobalArgs {
     ///
     /// A named VM keeps its own state directory, socket, and in-VM daemon
     /// under a per-name subdirectory of the provider dir, so several VMs can
-    /// run side by side on one host. Refused on the native `local-minimald`
+    /// run side by side on one host. Refused on the native `local`
     /// backend, which hosts no VMs — named VMs need
     /// `--provider local-minvmd` — and no effect on the default VM's paths
     /// when the name is `default` or omitted.
@@ -646,7 +1126,7 @@ impl GlobalArgs {
         matches!(self.provider, Some(Provider::LocalMinvmd))
     }
 
-    /// Publish `--vm` as this process's VM name so every provider dir the
+    /// Publish `--vm` as this process's VM name so every host dir the
     /// command resolves — socket, state dir, autospawn — names the same VM
     /// (NET-052). Called once at dispatch, before any path resolution; the
     /// default VM is untouched when the flag is absent (NET-053).
@@ -697,20 +1177,15 @@ pub struct ActivateArgs {
     /// are otherwise skipped without a prompt.
     #[arg(long, value_enum)]
     pub sync: Option<SyncMode>,
-    /// Network mode for the session: `none` gives the session no network
-    /// (every socket it opens to a destination outside itself fails),
-    /// `host_ip` shares the host's network namespace (the default), and
-    /// `own_ip` gives the session its own IP address, so `--ingress` can
-    /// publish ports; unless the host opts out, an `own_ip` session with
-    /// no egress rules can reach no external address.
-    ///
-    /// The hyphenated spellings `no-net`, `host-net`, and `own-ip` are still
-    /// accepted, but each prints a one-line hint naming the current spelling.
+    // The `--network` flag is shared with `min box spec`, so the two
+    // cannot drift: see [`NETWORK_HELP`].
     #[arg(
         long,
-        value_name = "none|host_ip|own_ip",
+        value_name = NETWORK_VALUE_NAME,
         value_parser = parse_network_mode,
-        default_value = "host_ip"
+        default_value = NETWORK_DEFAULT,
+        help = NETWORK_HELP,
+        long_help = NETWORK_LONG_HELP
     )]
     pub network: CliNetworkMode,
     /// Static ingress port mapping `EXT:INT[/PROTO]` (PROTO = tcp|udp, default
@@ -775,8 +1250,9 @@ pub struct ActivateArgs {
     pub deny_all_egress: bool,
     /// Let the box reach the Box Egress Proxy, whatever its
     /// `--allow-*`/`--deny-*` rules say. Without this flag, everything the
-    /// box sends to the proxy's address is dropped. Takes effect only with
-    /// `--network own_ip`.
+    /// box sends to the proxy's address is dropped. Takes effect with
+    /// `--network own_ip`, and with `--network host_ip` on a host that runs
+    /// boxes in a VM.
     #[arg(long)]
     pub credentialed_upstream: bool,
     /// Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml`.
@@ -810,7 +1286,7 @@ pub struct ActivateArgs {
     pub attach: bool,
 }
 
-/// Which daemon backend ("provider") hosts sessions.
+/// Which daemon backend (box host) serves sessions, as `--provider` names it.
 ///
 /// On Linux the default is the host-native daemon (DM2); `local-minvmd` runs
 /// `minimald` inside the minvmd microVM (DM1) instead. On macOS minvmd is the
@@ -818,9 +1294,14 @@ pub struct ActivateArgs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Provider {
     /// Linux: run minimald natively on the host (the default).
-    LocalMinimald,
+    Local,
     /// Run minimald inside the minvmd microVM.
     LocalMinvmd,
+    /// The old name of `local`.
+    // BCLI-046: read as `local` for one release, with a hint on stderr
+    // after the command ends.
+    #[value(hide = true)]
+    LocalMinimald,
 }
 
 /// Configuration for file sync during activation.
@@ -843,6 +1324,38 @@ pub enum CliNetworkMode {
     HostNet,
     OwnIp,
 }
+
+/// The `--network` value name, shared by `min session activate` and
+/// `min box spec`.
+pub(crate) const NETWORK_VALUE_NAME: &str = "none|host_ip|own_ip";
+
+/// The `--network` default, shared by `min session activate` and `min box
+/// spec`, so a preview with no flag is of a box created with no flag.
+pub(crate) const NETWORK_DEFAULT: &str = "host_ip";
+
+/// The first paragraph of the `--network` help, as a literal so that
+/// [`NETWORK_LONG_HELP`] can extend it.
+macro_rules! network_help {
+    () => {
+        "Network mode for the session: `none` gives the session no network (every socket it \
+         opens to a destination outside itself fails), `host_ip` shares the host's network \
+         namespace (the default), and `own_ip` gives the session its own IP address, so \
+         `--ingress` can publish ports; unless the host opts out, an `own_ip` session with no \
+         egress rules can reach no external address"
+    };
+}
+
+/// The `--network` short help, shared by `min session activate` and `min
+/// box spec`.
+pub(crate) const NETWORK_HELP: &str = network_help!();
+
+/// The `--network` long help: the short help and the legacy spellings.
+pub(crate) const NETWORK_LONG_HELP: &str = concat!(
+    network_help!(),
+    ".\n\n",
+    "The hyphenated spellings `no-net`, `host-net`, and `own-ip` are still accepted, but each \
+     prints a one-line hint naming the current spelling."
+);
 
 /// Parses the `--network <none|host_ip|own_ip>` value (NET-037). The
 /// hyphenated spellings `no-net`, `host-net`, and `own-ip` predate the
@@ -1100,6 +1613,14 @@ pub struct FinalizeInstallArgs {
     /// Remove everything the step installed on this host (with --show --script, print the removal script instead)
     #[arg(long)]
     pub undo: bool,
+    /// The two contiguous connection-mark bits that egress enforcement uses, in hex (for example 0x0c000000). Use it when another firewall rule already uses the default bits. The boot service keeps the value
+    #[arg(
+        long,
+        value_name = "MASK",
+        value_parser = crate::cmd::parse_ct_mark_mask,
+        conflicts_with = "undo"
+    )]
+    pub ct_mark_mask: Option<u32>,
 }
 
 #[derive(Debug, Args)]
@@ -1300,10 +1821,6 @@ pub struct SecretRmArgs {
     #[arg(long)]
     pub store: Option<String>,
 }
-
-/// Arguments for `min login`.
-#[derive(Debug, Args)]
-pub struct LoginArgs {}
 
 /// Arguments for the hidden `min complete-session-str`.
 #[derive(Debug, Args)]

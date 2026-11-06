@@ -94,7 +94,7 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 /// Isolated `XDG_STATE_HOME` under /tmp: macOS's $TMPDIR is deep enough that
-/// provider sockets beneath a default tempdir would overflow sun_path (104).
+/// host sockets beneath a default tempdir would overflow sun_path (104).
 fn short_state_dir() -> tempfile::TempDir {
     tempfile::Builder::new()
         .prefix("mnl")
@@ -361,13 +361,13 @@ impl Guest {
     /// deadlines, quoting the supervisor's `run.log`.
     fn boot(gvproxy: &Path) -> Guest {
         let state = short_state_dir();
-        let provider_dir = state.path().join("minimal/providers/local-minvmd0");
+        let host_dir = state.path().join("minimal/providers/local-minvmd0");
         let boot_log_path = std::env::var_os("MINVMD_BOOT_LOG")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|| provider_dir.join("boot.log"));
+            .unwrap_or_else(|| host_dir.join("boot.log"));
         let mut guest = Guest {
-            sock_path: provider_dir.join("ssh.sock"),
+            sock_path: host_dir.join("ssh.sock"),
             boot_log_path,
             gvproxy: gvproxy.to_path_buf(),
             vmm_pid: None,
@@ -1110,14 +1110,14 @@ async fn guest_deny_all_probe_refused() {
 
 /// A deny-all host-address box still resolves (NET-003, NET-079): its one
 /// carve-out is the guest's own DNS listener, which the deny subtree's
-/// lookups are steered onto and which refuses every name outside the box
-/// zone. Four reads from inside the box:
+/// lookups are steered onto and which answers every name outside the box
+/// zone NXDOMAIN. Four reads from inside the box:
 ///
 /// - `a`: its lookup of `host.min.internal` through its own `/etc/resolv.conf`
 ///   answers the switch's host alias — the listener forwards the zone's A
 ///   questions to the gateway (NET-003), the address the zone holds for the
 ///   host;
-/// - `refused`: a raw AAAA query for example.com comes back REFUSED, the
+/// - `nxdomain`: a raw AAAA query for example.com comes back NXDOMAIN, the
 ///   listener's own verdict — answered inside the guest, so no resolver
 ///   beyond it ever sees the name — and the guest's console carries the
 ///   listener's own line for it;
@@ -1164,12 +1164,12 @@ async fn guest_deny_all_resolver_reachable() {
          socket.SOCK_STREAM)"
             .to_string(),
         "    return \",\".join(sorted({i[4][0] for i in infos}))".to_string(),
-        "def refused():".to_string(),
+        "def nxdomain():".to_string(),
         "    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)".to_string(),
         "    u.settimeout(5)".to_string(),
         // The box's resolver stack asks the address its resolv.conf names —
         // the switch gateway — and the table steers the lookup onto the
-        // guest's own listener, which refuses the name.
+        // guest's own listener, which answers the name NXDOMAIN.
         format!("    u.connect((\"{gateway}\", 53))"),
         "    q = bytes.fromhex(\"123401000001000000000000076578616d706c6503636f6d00001c0001\")"
             .to_string(),
@@ -1197,7 +1197,7 @@ async fn guest_deny_all_resolver_reachable() {
         "        return \"timeout\"".to_string(),
         "resolved = a()".to_string(),
         "print(\"a\", resolved)".to_string(),
-        "print(\"refused\", refused())".to_string(),
+        "print(\"nxdomain\", nxdomain())".to_string(),
         "print(\"tcp\", tcp())".to_string(),
         "print(\"reach\", reach(resolved.split(\",\")[0]))".to_string(),
     ]
@@ -1234,23 +1234,24 @@ async fn guest_deny_all_resolver_reachable() {
         context(),
     );
 
-    // REFUSED (rcode 5): the listener answers the example.com AAAA lookup
+    // NXDOMAIN (rcode 3): the listener answers the example.com AAAA lookup
     // itself — the name is outside the box zone, so no resolver beyond the
-    // guest ever sees it.
-    let refused = read("refused");
+    // guest ever sees it. Not REFUSED (rcode 5), which glibc reads as a
+    // temporary failure that clients retry (NET-079, NET-141).
+    let nxdomain = read("nxdomain");
     assert_eq!(
-        refused,
-        "5",
-        "a deny-all box's example.com AAAA lookup must be refused by the guest's own \
-         listener; read {refused}\n{}",
+        nxdomain,
+        "3",
+        "a deny-all box's example.com AAAA lookup must be answered NXDOMAIN by the guest's \
+         own listener; read {nxdomain}\n{}",
         context(),
     );
     assert!(
         guest
             .boot_log_lines(&["answered a lookup at the guest listener"])
             .iter()
-            .any(|line| line.contains("example.com") && line.contains("answer=Refused")),
-        "the guest's own listener never left its REFUSED verdict on the box's example.com \
+            .any(|line| line.contains("example.com") && line.contains("answer=NXDomain")),
+        "the guest's own listener never left its NXDOMAIN verdict on the box's example.com \
          lookup\n{}",
         context(),
     );
@@ -1331,11 +1332,13 @@ async fn guest_deny_all_box_answers_inbound_through_the_proxy() {
 
     const SERVE_PORT: u16 = 8412;
     // One-shot server in the deny-all box: bind, accept one, answer, exit.
+    // It binds 0.0.0.0: the hostname proxy refuses a host-address port that
+    // only a 127.0.0.1 listener holds (NET-071).
     let server_cmd = format!(
         "python3 -c 'import socket\n\
          s = socket.socket()\n\
          s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n\
-         s.bind((\"127.0.0.1\", {SERVE_PORT}))\n\
+         s.bind((\"0.0.0.0\", {SERVE_PORT}))\n\
          s.listen(1)\n\
          s.settimeout(20)\n\
          c, _ = s.accept()\n\
@@ -1644,6 +1647,18 @@ fn native_ruleset_digest() -> String {
     // fails this digest, not a guest's table).
     let listener_addr = "127.0.0.1";
     let listener_port = "7656";
+    // The guest's render also names the box mark its table writes into a
+    // box's packets, so the VM host's gate can tell a box's frame from the
+    // daemon's own at the one address both leave from.
+    let cohort_dscp = boxes::core::egress::BOX_COHORT_DSCP.to_string();
+    // BEP-083: the proxy's listener the guest's `main` renders with
+    // (`DEFAULT_SUBNET.box_egress_proxy_address()` at `PROXY_LISTENER_PORT`),
+    // whose address the table refuses to a box outside the lane set.
+    let proxy_lane = format!(
+        "{}:{}",
+        switch::DEFAULT_SUBNET.box_egress_proxy_address(),
+        boxes::core::egress::PROXY_LISTENER_PORT
+    );
     let out = Command::new("bash")
         .arg(&script)
         .args([
@@ -1660,6 +1675,10 @@ fn native_ruleset_digest() -> String {
             &identity.to_string(),
             "--ct-mark-mask",
             GUEST_CT_MARK_MASK_ARG,
+            "--cohort-dscp",
+            &cohort_dscp,
+            "--proxy-lane",
+            &proxy_lane,
         ])
         .env("MINIMAL_OVERRIDE_CGROUP_MOUNTINFO", &mountinfo)
         .output()

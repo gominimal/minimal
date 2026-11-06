@@ -122,6 +122,9 @@ fn record_with(mode: boxes::NetworkMode) -> boxes::Record {
         task_addresses: Vec::new(),
         box_addresses: None,
         status: boxes::BoxState::Active,
+        reason: None,
+        exit_code: None,
+        signal: None,
         hooks_enabled: true,
         // No launch ever minted these records, so none has recorded its
         // outcome on one.
@@ -129,6 +132,8 @@ fn record_with(mode: boxes::NetworkMode) -> boxes::Record {
         box_id: None,
         host_row_bound: false,
         bound_ports: std::collections::BTreeSet::new(),
+        // No run ever minted these records, so none ends with one.
+        ends_with_run: false,
         sealed_deliveries: Vec::new(),
         root_certificate: None,
         box_type: None,
@@ -626,6 +631,89 @@ async fn bridge_round_trips_stdio_and_propagates_exit_code() {
     assert_eq!(err, b"err!");
 
     assert!(!ctrl.was_killed());
+}
+
+/// BOX-151: a stop of an attached exec ends its process. The stop fires
+/// the exec's token, the process is killed, and the channel gets the
+/// status the process ended with, not the timeout's.
+#[tokio::test]
+async fn stop_exec_ends_process_group_of_an_attached_exec() {
+    use futures::StreamExt as _;
+
+    let (stream, MockEndpoints { ctrl, .. }) = build_mock();
+    let timed_out = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = CancellationToken::new();
+    let flag = std::sync::Arc::clone(&timed_out);
+    let token = stop.clone();
+    let stream = stream.map(move |spawned| {
+        spawned.map(|inner| super::TimedProcess {
+            inner,
+            deadline: None,
+            timed_out: std::sync::Arc::clone(&flag),
+            stop: token.clone(),
+            stopped: false,
+        })
+    });
+    let (_client_stdin, mut bridge_stdin) = duplex(64);
+    let (mut bridge_stdout, _client_stdout) = duplex(64);
+    let (mut bridge_stderr, _client_stderr) = duplex(64);
+    stop.cancel();
+    let status = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        bridge(
+            "test",
+            stream,
+            &mut bridge_stdin,
+            &mut bridge_stdout,
+            &mut bridge_stderr,
+            client_lost(),
+            super::UnreadStdin::Discard,
+        ),
+    )
+    .await
+    .expect("the stop ends the exec");
+    assert!(ctrl.was_killed(), "the stop killed the command");
+    assert!(
+        !timed_out.load(std::sync::atomic::Ordering::SeqCst),
+        "a stop is not a timeout"
+    );
+    assert_ne!(status, 124, "the stop's status is not the timeout's");
+}
+
+/// BOX-149: an attached exec that its own timeout ends gives its channel
+/// exit status 124, the same as a wait on a detached one.
+#[tokio::test(start_paused = true)]
+async fn attached_exec_timeout_sends_status_124() {
+    use futures::StreamExt as _;
+
+    let (stream, MockEndpoints { ctrl, .. }) = build_mock();
+    let timed_out = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = std::sync::Arc::clone(&timed_out);
+    let stream = stream.map(move |spawned| {
+        spawned.map(|inner| super::TimedProcess {
+            inner,
+            deadline: Some(tokio::time::Instant::now() + std::time::Duration::from_secs(1)),
+            timed_out: std::sync::Arc::clone(&flag),
+            stop: CancellationToken::new(),
+            stopped: false,
+        })
+    });
+    let (_client_stdin, mut bridge_stdin) = duplex(64);
+    let (mut bridge_stdout, _client_stdout) = duplex(64);
+    let (mut bridge_stderr, _client_stderr) = duplex(64);
+    let status = bridge(
+        "test",
+        stream,
+        &mut bridge_stdin,
+        &mut bridge_stdout,
+        &mut bridge_stderr,
+        client_lost(),
+        super::UnreadStdin::Discard,
+    )
+    .await;
+    assert!(ctrl.was_killed(), "the timeout stopped the command");
+    assert!(timed_out.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(status, 124, "the channel exit status of a timed-out exec");
 }
 
 /// A child that stops reading stdin must not stop the bridge from
@@ -1625,6 +1713,9 @@ fn fresh_daemon() -> &'static std::sync::atomic::AtomicUsize {
 fn fresh_progress() -> &'static tokio::sync::Notify {
     Box::leak(Box::new(tokio::sync::Notify::new()))
 }
+fn fresh_registry() -> &'static super::ExecRegistry {
+    Box::leak(Box::new(std::sync::Mutex::new(Vec::new())))
+}
 fn unlimited() -> super::HeldInputLimits {
     super::HeldInputLimits {
         per_exec: usize::MAX,
@@ -1634,6 +1725,10 @@ fn unlimited() -> super::HeldInputLimits {
         stall: std::time::Duration::from_millis(300),
         starved: std::time::Duration::from_millis(900),
         unstarted: std::time::Duration::from_secs(5),
+        // One byte: the tests above this helper's introduction are about
+        // the bounds, not the drain; the drain tests set their own.
+        quantum: 1,
+        registry: fresh_registry(),
     }
 }
 fn held_with(
@@ -1971,10 +2066,11 @@ async fn an_end_while_the_command_is_starting_ends_the_exec_at_once() {
 }
 
 /// An exec holding nothing at the daemon bound waits for the others, but
-/// not past `starved`: when the budget stays full (its holders read just
-/// enough never to stall, or, here, never at all while not at a bound
-/// themselves), the waiting exec ends with the daemon-bound reason
-/// instead of parking its connection for good. The holder is untouched.
+/// not past `starved`: when the budget stays full of a holder that *is*
+/// draining (it reads a quantum per window while its client keeps it
+/// topped up: a busy daemon, not a hoarder), the waiting exec ends with the
+/// daemon-bound reason instead of parking its connection for good. The
+/// holder is untouched: it is doing nothing wrong.
 #[tokio::test]
 async fn an_exec_starved_at_the_daemon_bound_ends_after_the_ceiling() {
     use std::time::Duration;
@@ -1989,11 +2085,292 @@ async fn an_exec_starved_at_the_daemon_bound_ends_after_the_ceiling() {
         stall: Duration::from_millis(300),
         starved: Duration::from_millis(1500),
         unstarted: Duration::from_secs(5),
+        quantum: 50,
+        registry: fresh_registry(),
     };
     let mut pumps = Vec::new();
     for _ in 0..2 {
         let (msg_tx, msgs) = msg_stream();
         let (held, stdin_r) = held_with(limits);
+        let (end_tx, end_rx) = tokio::sync::watch::channel(None);
+        tokio::spawn(super::pump_channel_input(
+            msgs,
+            std::sync::Arc::clone(&held),
+            end_tx,
+        ));
+        pumps.push((msg_tx, stdin_r, end_rx, held));
+    }
+    for p in &pumps {
+        p.3.command_started();
+    }
+    // 250 held, so the holder's reads never make room for the waiter's
+    // 150: the budget stays full.
+    pumps[0].0.send(data(250, 1)).unwrap();
+    assert!(
+        until(5, || daemon_held.load(std::sync::atomic::Ordering::Acquire)
+            == 250)
+        .await
+    );
+    // The holder drains 60 bytes every 100 ms (a quantum and more per
+    // window) and its client sends 60 more each time: the budget stays
+    // full of input that is being read.
+    let (holder_tx, mut holder_stdin) = (
+        pumps[0].0.clone(),
+        std::mem::replace(&mut pumps[0].1, {
+            let (_, r) = held_with(limits);
+            r
+        }),
+    );
+    let churn = tokio::spawn(async move {
+        let mut buf = [0u8; 60];
+        loop {
+            let _ = holder_stdin.read_exact(&mut buf).await;
+            holder_tx.send(data(60, 1)).unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+    pumps[1].0.send(data(150, 1)).unwrap(); // starved: the budget is the first's
+    tokio::time::sleep(limits.stall * 3).await;
+    assert!(
+        pumps[1].2.borrow().is_none(),
+        "past the stall, but inside the ceiling: still waiting"
+    );
+    timeout(Duration::from_secs(10), pumps[1].2.changed())
+        .await
+        .expect("a starved exec is ended at the ceiling")
+        .unwrap();
+    assert_eq!(
+        *pumps[1].2.borrow(),
+        Some(super::ExecEnd::InputHeldOver(super::HeldBound::Daemon))
+    );
+    churn.abort();
+    assert!(
+        pumps[0].2.borrow().is_none(),
+        "a draining holder is untouched"
+    );
+    assert!(
+        pumps[0].3.held_bytes() >= 190,
+        "it still holds what it was reading"
+    );
+}
+
+/// #2238: a command at its cap that reads one byte per window is not
+/// reading; the window restarts on a quantum, so it is ended within one
+/// window like a command that reads nothing.
+#[tokio::test]
+async fn a_trickle_reader_at_its_cap_is_ended_within_a_window() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let limits = super::HeldInputLimits {
+        per_exec: 200,
+        quantum: 50,
+        stall: Duration::from_millis(300),
+        ..unlimited()
+    };
+    let (msg_tx, msgs) = msg_stream();
+    let (held, mut stdin_r) = held_with(limits);
+    let (end_tx, mut end_rx) = tokio::sync::watch::channel(None);
+    tokio::spawn(super::pump_channel_input(
+        msgs,
+        std::sync::Arc::clone(&held),
+        end_tx,
+    ));
+    held.command_started();
+    for _ in 0..3 {
+        msg_tx.send(data(100, 7)).unwrap(); // the third waits at the cap
+    }
+    let trickle = tokio::spawn(async move {
+        let mut byte = [0u8; 1];
+        loop {
+            let _ = stdin_r.read(&mut byte).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    let ended = timeout(Duration::from_secs(5), end_rx.changed()).await;
+    trickle.abort();
+    ended
+        .expect("a trickle reader is ended within a window")
+        .unwrap();
+    assert_eq!(
+        *end_rx.borrow(),
+        Some(super::ExecEnd::InputHeldOver(super::HeldBound::Exec))
+    );
+}
+
+/// #2238's trickle again, in small chunks: a client that feeds one byte per
+/// channel message while the command reads one byte per window gets each
+/// chunk in after one read. The wait at the bound must span chunks, or the
+/// exec at its cap is never ended.
+#[tokio::test]
+async fn a_trickle_reader_fed_one_byte_chunks_is_still_ended() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let limits = super::HeldInputLimits {
+        per_exec: 200,
+        quantum: 50,
+        stall: Duration::from_millis(300),
+        ..unlimited()
+    };
+    let (msg_tx, msgs) = msg_stream();
+    let (held, mut stdin_r) = held_with(limits);
+    let (end_tx, mut end_rx) = tokio::sync::watch::channel(None);
+    tokio::spawn(super::pump_channel_input(
+        msgs,
+        std::sync::Arc::clone(&held),
+        end_tx,
+    ));
+    held.command_started();
+    for _ in 0..200 {
+        msg_tx.send(data(1, 7)).unwrap(); // to the cap, one byte at a time
+    }
+    // The client is ahead of the command: one-byte chunks already wait
+    // behind the cap, so each read lets one in and the next is refused at
+    // once. A feeder on the reader's own period raced it instead, and only
+    // queued chunks when it happened to run ahead, so the window filled
+    // late or not at all (a timeout about one run in twelve on `main`).
+    // A hundred chunks outlast the 5 s timeout at one read per 50 ms.
+    for _ in 0..100 {
+        msg_tx.send(data(1, 7)).unwrap();
+    }
+    let trickle = tokio::spawn(async move {
+        let mut byte = [0u8; 1];
+        loop {
+            let _ = stdin_r.read(&mut byte).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    let ended = timeout(Duration::from_secs(5), end_rx.changed()).await;
+    trickle.abort();
+    ended
+        .expect("a trickle reader fed in one-byte chunks is ended within a window")
+        .unwrap();
+    assert_eq!(
+        *end_rx.borrow(),
+        Some(super::ExecEnd::InputHeldOver(super::HeldBound::Exec))
+    );
+}
+
+/// The other side of the quantum: a command at its cap that reads a
+/// quantum or more per window is reading, and is never ended; it works
+/// through everything held.
+#[tokio::test]
+async fn a_reader_draining_a_quantum_per_window_is_never_ended() {
+    use std::time::Duration;
+
+    let limits = super::HeldInputLimits {
+        per_exec: 200,
+        quantum: 50,
+        stall: Duration::from_millis(300),
+        ..unlimited()
+    };
+    let (msg_tx, msgs) = msg_stream();
+    let (held, mut stdin_r) = held_with(limits);
+    let (end_tx, end_rx) = tokio::sync::watch::channel(None);
+    tokio::spawn(super::pump_channel_input(
+        msgs,
+        std::sync::Arc::clone(&held),
+        end_tx,
+    ));
+    held.command_started();
+    for _ in 0..3 {
+        msg_tx.send(data(100, 7)).unwrap();
+    }
+    let mut got = 0usize;
+    let mut buf = [0u8; 25];
+    while got < 300 {
+        got += stdin_r.read(&mut buf).await.unwrap(); // 25 bytes per 100 ms: 75 a window
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        end_rx.borrow().is_none(),
+        "a reader draining a quantum per window is never ended"
+    );
+    assert_eq!(held.held_bytes(), 0);
+}
+
+/// A holder whose command has not started is under its own `unstarted`
+/// grace and is never another exec's victim: the starved exec waits its
+/// ceiling out and ends itself, as before.
+#[tokio::test]
+async fn an_unstarted_holder_is_not_a_victim() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let daemon_held = fresh_daemon();
+    let limits = super::HeldInputLimits {
+        per_exec: usize::MAX,
+        daemon: 300,
+        daemon_held,
+        daemon_progress: fresh_progress(),
+        stall: Duration::from_millis(300),
+        starved: Duration::from_millis(600),
+        unstarted: Duration::from_secs(30),
+        quantum: 50,
+        registry: fresh_registry(),
+    };
+    let mut pumps = Vec::new();
+    for _ in 0..2 {
+        let (msg_tx, msgs) = msg_stream();
+        let (held, stdin_r) = held_with(limits);
+        let (end_tx, end_rx) = tokio::sync::watch::channel(None);
+        tokio::spawn(super::pump_channel_input(
+            msgs,
+            std::sync::Arc::clone(&held),
+            end_tx,
+        ));
+        pumps.push((msg_tx, stdin_r, end_rx, held));
+    }
+    // Only the waiter's command runs; the holder's is still starting.
+    pumps[1].3.command_started();
+    pumps[0].0.send(data(200, 1)).unwrap();
+    assert!(
+        until(5, || daemon_held.load(std::sync::atomic::Ordering::Acquire)
+            == 200)
+        .await
+    );
+    pumps[1].0.send(data(150, 1)).unwrap(); // starved by an unstarted holder
+    timeout(Duration::from_secs(10), pumps[1].2.changed())
+        .await
+        .expect("the starved exec ends itself at the ceiling")
+        .unwrap();
+    assert_eq!(
+        *pumps[1].2.borrow(),
+        Some(super::ExecEnd::InputHeldOver(super::HeldBound::Daemon))
+    );
+    assert!(
+        pumps[0].2.borrow().is_none(),
+        "the unstarted holder is untouched"
+    );
+    assert_eq!(pumps[0].3.held_bytes(), 200);
+}
+
+/// #2238's daemon half: the exec that would cross the daemon's budget
+/// while holding nothing is not the one at fault. After its wait, the
+/// largest holder that read none of what it owed over the window is the
+/// one ended, and the waiting exec gets its input.
+#[tokio::test]
+async fn a_starved_exec_ends_the_holder_that_is_not_draining() {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let daemon_held = fresh_daemon();
+    let limits = super::HeldInputLimits {
+        per_exec: usize::MAX,
+        daemon: 300,
+        daemon_held,
+        daemon_progress: fresh_progress(),
+        stall: Duration::from_millis(300),
+        starved: Duration::from_millis(600),
+        unstarted: Duration::from_secs(5),
+        quantum: 50,
+        registry: fresh_registry(),
+    };
+    let mut pumps = Vec::new();
+    for _ in 0..2 {
+        let (msg_tx, msgs) = msg_stream();
+        let (held, stdin_r) = held_with(limits); // nobody reads
         let (end_tx, end_rx) = tokio::sync::watch::channel(None);
         tokio::spawn(super::pump_channel_input(
             msgs,
@@ -2012,21 +2389,23 @@ async fn an_exec_starved_at_the_daemon_bound_ends_after_the_ceiling() {
         .await
     );
     pumps[1].0.send(data(150, 1)).unwrap(); // starved: the budget is the first's
-    tokio::time::sleep(limits.stall * 3).await;
-    assert!(
-        pumps[1].2.borrow().is_none(),
-        "past the stall, but inside the ceiling: still waiting"
-    );
-    timeout(Duration::from_secs(10), pumps[1].2.changed())
+    timeout(Duration::from_secs(10), pumps[0].2.changed())
         .await
-        .expect("a starved exec is ended at the ceiling")
+        .expect("the holder that is not draining is the one ended")
         .unwrap();
     assert_eq!(
-        *pumps[1].2.borrow(),
+        *pumps[0].2.borrow(),
         Some(super::ExecEnd::InputHeldOver(super::HeldBound::Daemon))
     );
-    assert!(pumps[0].2.borrow().is_none(), "the holder is untouched");
-    assert_eq!(pumps[0].3.held_bytes(), 200);
+    assert!(
+        until(5, || pumps[1].3.held_bytes() == 150).await,
+        "the waiting exec gets its input once the holder is ended"
+    );
+    assert!(
+        pumps[1].2.borrow().is_none(),
+        "the waiting exec is not ended"
+    );
+    assert_eq!(daemon_held.load(std::sync::atomic::Ordering::Acquire), 150);
 }
 
 /// The per-exec stall counts this exec's own reads only. Another exec
@@ -2095,6 +2474,8 @@ async fn the_daemon_budget_makes_an_exec_holding_nothing_wait_for_the_others() {
         // longer than this test's waits: it is about the wait, not its end
         starved: Duration::from_secs(60),
         unstarted: Duration::from_secs(5),
+        quantum: 1,
+        registry: fresh_registry(),
     };
     let mut pumps = Vec::new();
     for _ in 0..2 {
@@ -2602,6 +2983,1403 @@ async fn echo_process_writes_text_and_exits_zero() {
     let mut err = Vec::new();
     client_stderr.read_to_end(&mut err).await.unwrap();
     assert!(err.is_empty(), "echo should produce no stderr: {err:?}");
+}
+
+/// Execs the daemon starts under an id (BOX-149), run against a box record
+/// in a temp store. The harness has no box sandbox to join, so `command` is
+/// the argv itself, spawned on this host; the box host's join is pinned
+/// separately, in `exec_runs_argv_unshelled_in_box_namespaces_and_cgroup`.
+#[cfg(target_os = "linux")]
+mod managed {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use boxes::events::{BoxEvent, BoxEventType};
+    use boxes::store::{BoxObject as _, DiskBoxKey, DiskLoader, Loader as _};
+    use minimald_rpc::exec::{ExecId, ExecMode};
+    use tokio::io::AsyncReadExt as _;
+
+    use super::super::{
+        AttachEnd, ExecBox, ExecEntry, ExecExitReason, ExecFacts, ManagedStart, SESSION_SHELL,
+        exec_argv, find_exec, mint_exec_id, read_exec_output, relay_terminal, start_managed_exec,
+        start_managed_exec_within, timeout_deadline,
+    };
+
+    /// The principal the harness starts every exec as.
+    const PRINCIPAL: &str = "exec-tester";
+
+    /// A running box's record in a temp store, and the [`ExecBox`] an exec
+    /// in it gets.
+    struct DiskExecBox {
+        _tmp: tempfile::TempDir,
+        loader: DiskLoader,
+        key: DiskBoxKey,
+        exec_box: ExecBox,
+    }
+
+    fn box_on_disk() -> DiskExecBox {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut loader =
+            DiskLoader::new(paths::DaemonAbsPath::try_new(tmp.path().to_str().unwrap()).unwrap())
+                .unwrap();
+        let key = loader
+            .create(super::record_with(boxes::NetworkMode::HostNet))
+            .unwrap();
+        let object = loader.get(&key).unwrap();
+        let dir = object
+            .events_path()
+            .as_utf8_path()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let exec_box = ExecBox {
+            record: object.record().clone(),
+            dir,
+        };
+        DiskExecBox {
+            _tmp: tmp,
+            loader,
+            key,
+            exec_box,
+        }
+    }
+
+    impl DiskExecBox {
+        /// Starts `argv` in `mode`, as the daemon starts it in the box.
+        fn start(
+            &self,
+            mode: ExecMode,
+            argv: &[&str],
+            timeout: Option<Duration>,
+            graceful: bool,
+        ) -> Arc<ExecEntry> {
+            let words: Vec<String> = argv.iter().map(|w| (*w).to_string()).collect();
+            let (program, args) = exec_argv(words.clone());
+            let mut command = std::process::Command::new(program);
+            command.args(args);
+            start_managed_exec(
+                ManagedStart {
+                    id: mint_exec_id(),
+                    mode,
+                    exec_box: self.exec_box.clone(),
+                    timeout,
+                    winsize: (24, 80),
+                    facts: ExecFacts {
+                        principal: PRINCIPAL.to_string(),
+                        argv: words,
+                    },
+                },
+                command,
+                graceful,
+            )
+            .expect("the exec starts")
+        }
+
+        async fn output(&self, id: &ExecId) -> String {
+            let mut bytes = Vec::new();
+            read_exec_output(&self.exec_box.dir, id)
+                .unwrap()
+                .expect("the box keeps the exec's transcript")
+                .copy_to(&mut bytes)
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+
+        fn events(&self) -> Vec<BoxEvent> {
+            self.loader
+                .get(&self.key)
+                .unwrap()
+                .read_events_from(0)
+                .unwrap()
+                .events
+        }
+
+        fn exec_events(&self, id: &ExecId) -> Vec<BoxEvent> {
+            self.events()
+                .into_iter()
+                .filter(|e| e.data.get("exec_id").and_then(|v| v.as_str()) == Some(id.as_str()))
+                .collect()
+        }
+    }
+
+    /// Reads `out` until what it read holds `needle`, for at most 10 s.
+    async fn read_until(out: &mut tokio::io::DuplexStream, seen: &mut String, needle: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut buf = [0u8; 4096];
+        while !seen.contains(needle) {
+            let n = tokio::time::timeout_at(deadline, out.read(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("{needle:?} never arrived; read {seen:?}"))
+                .unwrap();
+            assert_ne!(n, 0, "the attach closed before {needle:?}; read {seen:?}");
+            seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+    }
+
+    /// BOX-149: the argv runs as given. The words reach the box host's
+    /// injection unchanged after its `--`, with no shell before them, and
+    /// the injection joins the box's namespaces (through the pidfd of its
+    /// leader) and its cgroup leaf. Run, the words print as data, nothing
+    /// expands them, and the exit code comes back.
+    #[tokio::test]
+    async fn exec_runs_argv_unshelled_in_box_namespaces_and_cgroup() {
+        let words = ["printf", "%s|", "a b", "$HOME", "*", "; echo injected"];
+        let (program, args) = exec_argv(words.map(String::from).to_vec());
+        assert_eq!(program, words[0]);
+        assert_eq!(args, words[1..]);
+
+        // The same join the box host builds for an exec (box_runtime's
+        // `command_in_session_env`), against a stand-in box leader.
+        let leaf =
+            sandbox::config::ClassifierLeaf::new("/sys/fs/cgroup/minimald.slice/boxes/allow/b");
+        let shim = tempfile::NamedTempFile::new().unwrap();
+        let mut leader = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let built = crate::nsenter::Injection::new(leader.id(), &program, &args)
+            .with_shim(shim.path())
+            .with_classifier_leaf(leaf.clone())
+            .command();
+        let _ = leader.kill();
+        let _ = leader.wait();
+        let argv: Vec<String> = built
+            .expect("the injection builds")
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let dashdash = argv.iter().position(|a| a == "--").expect("{argv:?}");
+        assert_eq!(argv[dashdash + 1..], words, "{argv:?}");
+        assert!(
+            !argv.iter().any(|a| a == SESSION_SHELL || a == "-c"),
+            "no shell stands before the words: {argv:?}"
+        );
+        assert!(argv.iter().any(|a| a == "--pidfd"), "{argv:?}");
+        let at = argv
+            .iter()
+            .position(|a| a == "--classifier-leaf")
+            .expect("the exec joins the box's cgroup leaf");
+        assert_eq!(std::path::Path::new(&argv[at + 1]), leaf.dir());
+
+        let disk = box_on_disk();
+        let entry = disk.start(ExecMode::Detached, &words, None, false);
+        assert_eq!(entry.wait().await.code, Some(0));
+        assert_eq!(disk.output(&entry.id).await, "a b|$HOME|*|; echo injected|");
+
+        let failing = disk.start(ExecMode::Detached, &["sh", "-c", "exit 7"], None, false);
+        let exit = failing.wait().await;
+        assert_eq!(exit.code, Some(7));
+        assert_eq!(exit.status(), 7);
+    }
+
+    /// BOX-149: every exec gets a UUIDv7 id, whatever its mode: the id the
+    /// daemon mints for each, and the id a tty and a detached exec start
+    /// under, which finds the exec in its box and in no other.
+    #[tokio::test]
+    async fn every_exec_gets_uuidv7_id() {
+        let minted: Vec<ExecId> = (0..64).map(|_| mint_exec_id()).collect();
+        for id in &minted {
+            let uuid = uuid::Uuid::parse_str(id.as_str()).unwrap();
+            assert_eq!(uuid.get_version_num(), 7, "{id}");
+            assert_eq!(uuid.get_variant(), uuid::Variant::RFC4122, "{id}");
+        }
+        let unique: std::collections::BTreeSet<_> = minted.iter().collect();
+        assert_eq!(unique.len(), minted.len());
+
+        let disk = box_on_disk();
+        let box_id = disk.exec_box.record.id;
+        for mode in [ExecMode::Tty, ExecMode::Detached] {
+            let entry = disk.start(mode, &["true"], None, false);
+            let uuid = uuid::Uuid::parse_str(entry.id.as_str()).unwrap();
+            assert_eq!(uuid.get_version_num(), 7, "{mode:?}");
+            assert_eq!(entry.mode, mode);
+            assert!(find_exec(box_id, &entry.id).is_some(), "{mode:?}");
+            assert!(find_exec(boxes::SessionId::mint(), &entry.id).is_none());
+            entry.wait().await;
+            let started = disk.exec_events(&entry.id);
+            assert_eq!(started[0].kind, BoxEventType::ExecStarted);
+            assert_eq!(started[0].data["mode"], mode.name());
+        }
+    }
+
+    /// BOX-149: a tty exec gets a terminal and returns at once with its id.
+    /// A client attaches by the id, sees the terminal, and goes away while
+    /// the exec runs on. A later attach by the same id resumes it: it
+    /// replays what the terminal wrote, takes input, and ends with the
+    /// exec's exit. The transcript keeps all of it for a read by the id.
+    #[tokio::test]
+    async fn exec_tty_returns_reattachable_id_and_keeps_transcript() {
+        let disk = box_on_disk();
+        let entry = disk.start(
+            ExecMode::Tty,
+            &[
+                "sh",
+                "-c",
+                r#"if [ -t 0 ] && [ -t 1 ]; then echo TTY-YES; fi; read line; echo "got:$line""#,
+            ],
+            None,
+            false,
+        );
+        let found = find_exec(disk.exec_box.record.id, &entry.id).expect("the id finds the exec");
+
+        // First attach: the client sees the terminal, then goes away.
+        let (typed, msgs) = super::msg_stream();
+        let (mut client, mut server) = tokio::io::duplex(1 << 16);
+        let first = tokio::spawn({
+            let found = Arc::clone(&found);
+            async move { relay_terminal(&found, msgs, &mut server).await }
+        });
+        let mut seen = String::new();
+        read_until(&mut client, &mut seen, "TTY-YES").await;
+        drop(typed);
+        assert_eq!(first.await.unwrap().unwrap(), AttachEnd::ClientGone);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), entry.wait())
+                .await
+                .is_err(),
+            "the exec runs on after its client goes away"
+        );
+
+        // Second attach: the replay, then input, then the exit.
+        let (typed, msgs) = super::msg_stream();
+        let (mut client, mut server) = tokio::io::duplex(1 << 16);
+        let second = tokio::spawn({
+            let found = Arc::clone(&found);
+            async move { relay_terminal(&found, msgs, &mut server).await }
+        });
+        let mut seen = String::new();
+        read_until(&mut client, &mut seen, "TTY-YES").await;
+        typed
+            .send(russh::ChannelMsg::Data {
+                data: b"hello\n".to_vec().into(),
+            })
+            .unwrap();
+        read_until(&mut client, &mut seen, "got:hello").await;
+        match second.await.unwrap().unwrap() {
+            AttachEnd::Exited(exit) => assert_eq!(exit.code, Some(0)),
+            other => panic!("the attach ends with the exec, got {other:?}"),
+        }
+
+        let transcript = disk.output(&entry.id).await;
+        assert!(transcript.contains("TTY-YES"), "{transcript:?}");
+        assert!(transcript.contains("got:hello"), "{transcript:?}");
+        let events = disk.exec_events(&entry.id);
+        assert_eq!(events[0].data["pty"], true);
+    }
+
+    /// BCLI-068: a box stop takes the box's host before it signals the
+    /// box's processes. An attached tty exec that ends after that ends its
+    /// attach with 254, whatever status the exec ended with, so the client
+    /// reads the box and says it was stopped. A removal does the same. An
+    /// exec that ends on its own in a running box gives its own status, and
+    /// its records keep that status in every case.
+    #[tokio::test]
+    async fn box_stop_ends_attached_exec_channel_254() {
+        use super::super::{BOX_ENDED_ATTACH_STATUS, ExecExit, attach_terminal};
+
+        // A running box: its actor holds a host. `ending` models the stop
+        // (true) or the removal (false) when it ends the exec.
+        let running = || {
+            let session = crate::box_actor::WeakBoxHandle::answering(Vec::new())
+                .upgrade()
+                .expect("the stand-in actor lives");
+            session.put_host_for_test(crate::box_runtime::HostHandle::answering_attrs());
+            session
+        };
+        let disk = box_on_disk();
+        for case in ["own end", "stop", "removal"] {
+            let session = running();
+            let entry = disk.start(
+                ExecMode::Tty,
+                &["sh", "-c", "echo READY; read line; exit 7"],
+                None,
+                false,
+            );
+            let (typed, msgs) = super::msg_stream();
+            let (mut client, mut server) = tokio::io::duplex(1 << 16);
+            let attach = tokio::spawn({
+                let entry = Arc::clone(&entry);
+                let session = session.clone();
+                async move { attach_terminal(&entry, &session, msgs, &mut server).await }
+            });
+            let mut seen = String::new();
+            read_until(&mut client, &mut seen, "READY").await;
+            match case {
+                "stop" => session.take_host_for_test(),
+                "removal" => session.start_destroy_for_test(),
+                _ => {}
+            }
+            typed
+                .send(russh::ChannelMsg::Data {
+                    data: b"bye\n".to_vec().into(),
+                })
+                .unwrap();
+            let status = tokio::time::timeout(Duration::from_secs(10), attach)
+                .await
+                .expect("the attach ends with the exec")
+                .unwrap()
+                .unwrap();
+            let expected = if case == "own end" {
+                7
+            } else {
+                BOX_ENDED_ATTACH_STATUS
+            };
+            assert_eq!(status, Some(expected), "{case}");
+            assert_eq!(
+                entry.wait().await,
+                ExecExit {
+                    code: Some(7),
+                    reason: ExecExitReason::Exited
+                },
+                "{case}: the exec keeps its own end"
+            );
+        }
+    }
+
+    /// BOX-149: a tty exec whose program never reads its terminal holds no
+    /// more of what a client types than the exec's cap. Past the cap the
+    /// input is dropped. When the exec ends, what it held leaves the daemon's
+    /// count.
+    #[tokio::test]
+    async fn exec_tty_unread_input_is_held_within_the_cap() {
+        const CAP: usize = 64 * 1024;
+        let limits = super::super::HeldInputLimits {
+            per_exec: CAP,
+            ..super::unlimited()
+        };
+        let daemon_held = limits.daemon_held;
+        let disk = box_on_disk();
+        let words = ["sh", "-c", "stty raw -echo; echo READY; exec sleep 60"];
+        let (program, args) = exec_argv(words.map(String::from).to_vec());
+        let mut command = std::process::Command::new(program);
+        command.args(args);
+        let entry = start_managed_exec_within(
+            ManagedStart {
+                id: mint_exec_id(),
+                mode: ExecMode::Tty,
+                exec_box: disk.exec_box.clone(),
+                timeout: Some(Duration::from_secs(3)),
+                winsize: (24, 80),
+                facts: ExecFacts::default(),
+            },
+            command,
+            false,
+            limits,
+        )
+        .expect("the exec starts");
+
+        let (typed, msgs) = super::msg_stream();
+        let (mut client, mut server) = tokio::io::duplex(1 << 16);
+        let attach = tokio::spawn({
+            let entry = Arc::clone(&entry);
+            async move { relay_terminal(&entry, msgs, &mut server).await }
+        });
+        let mut seen = String::new();
+        read_until(&mut client, &mut seen, "READY").await;
+        // Sixteen times the cap, in chunks of an SSH packet's size.
+        let chunk = vec![b'x'; 32 * 1024];
+        for _ in 0..16 * CAP / chunk.len() {
+            typed
+                .send(russh::ChannelMsg::Data {
+                    data: chunk.clone().into(),
+                })
+                .unwrap();
+        }
+        // The relay takes the messages in order: once it sees the close, it
+        // offered every chunk to the terminal.
+        typed.send(russh::ChannelMsg::Close).unwrap();
+        let end = tokio::time::timeout(Duration::from_secs(10), attach)
+            .await
+            .expect("the attach takes every chunk, then the close");
+        assert_eq!(end.unwrap().unwrap(), AttachEnd::ClientGone);
+
+        let held = entry.held_input();
+        assert!(held <= CAP, "the terminal holds {held} bytes, past the cap");
+        assert!(
+            held >= CAP / 2,
+            "the program reads nothing, so the input is held: {held} bytes"
+        );
+        let counted = daemon_held.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(counted <= CAP, "the daemon counts {counted} bytes");
+
+        tokio::time::timeout(Duration::from_secs(20), entry.wait())
+            .await
+            .expect("the timeout ends the exec");
+        assert_eq!(
+            daemon_held.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the end releases what the terminal held"
+        );
+        drop(client);
+    }
+
+    /// BOX-149: an exec id belongs to the box it started in. Sent to another
+    /// box, each lookup that attach, output and wait make by the id finds
+    /// nothing, while the exec runs and after it ended. `min://exec/attach`
+    /// and `min://exec/wait` find the exec with `find_exec` under the box the
+    /// request came to. `min://exec/output` reads the transcript in that
+    /// box's directory, and a wait with no live exec reads that box's events.
+    #[tokio::test]
+    async fn exec_id_from_one_box_is_refused_in_another() {
+        let a = box_on_disk();
+        let b = box_on_disk();
+        let (a_id, b_id) = (a.exec_box.record.id, b.exec_box.record.id);
+        assert_ne!(a_id, b_id);
+        let entry = a.start(
+            ExecMode::Tty,
+            &["sh", "-c", "echo FROM-A; exec sleep 60"],
+            Some(Duration::from_secs(2)),
+            false,
+        );
+        let found = find_exec(a_id, &entry.id).expect("box A finds its exec");
+
+        // While it runs: attach and wait find no live exec in box B.
+        assert!(find_exec(b_id, &entry.id).is_none(), "attach and wait");
+        let (_typed, msgs) = super::msg_stream();
+        let (_client, mut server) = tokio::io::duplex(1 << 16);
+        let attach = tokio::spawn({
+            let found = Arc::clone(&found);
+            async move { relay_terminal(&found, msgs, &mut server).await }
+        });
+        assert!(
+            read_exec_output(&b.exec_box.dir, &entry.id)
+                .unwrap()
+                .is_none(),
+            "output"
+        );
+        assert!(
+            super::super::stored_exec_exit(&b.exec_box.dir, &entry.id).is_none(),
+            "wait"
+        );
+
+        tokio::time::timeout(Duration::from_secs(20), entry.wait())
+            .await
+            .expect("the timeout ends the exec");
+        attach.abort();
+
+        // After the end: box B still has no exec, output or exit for the id.
+        assert!(find_exec(b_id, &entry.id).is_none(), "attach and wait");
+        assert!(
+            read_exec_output(&b.exec_box.dir, &entry.id)
+                .unwrap()
+                .is_none(),
+            "output"
+        );
+        assert!(
+            super::super::stored_exec_exit(&b.exec_box.dir, &entry.id).is_none(),
+            "wait"
+        );
+        // Box A has all three.
+        assert!(find_exec(a_id, &entry.id).is_some());
+        assert!(a.output(&entry.id).await.contains("FROM-A"));
+        assert!(super::super::stored_exec_exit(&a.exec_box.dir, &entry.id).is_some());
+    }
+
+    /// BOX-149: a timeout too far out for the clock is no deadline. The
+    /// exec starts, runs to its end, and nothing panics after the spawn.
+    #[tokio::test]
+    async fn exec_timeout_past_the_clock_is_no_deadline() {
+        for huge in [Duration::from_secs(u64::MAX), Duration::MAX] {
+            assert!(timeout_deadline(Some(huge)).is_none(), "{huge:?}");
+        }
+        assert!(timeout_deadline(None).is_none());
+        let soon = timeout_deadline(Some(Duration::from_secs(1))).expect("a deadline");
+        assert!(soon > tokio::time::Instant::now());
+
+        let disk = box_on_disk();
+        let entry = disk.start(
+            ExecMode::Detached,
+            &["sh", "-c", "echo done"],
+            Some(Duration::from_secs(u64::MAX)),
+            false,
+        );
+        let exit = tokio::time::timeout(Duration::from_secs(10), entry.wait())
+            .await
+            .expect("the exec ends");
+        assert_eq!(exit.code, Some(0));
+        assert_eq!(exit.reason, ExecExitReason::Exited);
+        assert_eq!(disk.output(&entry.id).await, "done\n");
+    }
+
+    /// BOX-149: a detached exec gets a closed stdin at creation and returns
+    /// at once with its id. Its stdout and stderr read back by the id, and
+    /// a wait by the id returns its exit code, again after it ended.
+    #[tokio::test]
+    async fn exec_detach_closes_stdin_captures_logs_and_wait_returns_code() {
+        let disk = box_on_disk();
+        let entry = disk.start(
+            ExecMode::Detached,
+            &[
+                "sh",
+                "-c",
+                "if read x; then echo STDIN-OPEN; else echo STDIN-CLOSED; fi; echo out; echo err >&2; exit 3",
+            ],
+            None,
+            false,
+        );
+        let found = find_exec(disk.exec_box.record.id, &entry.id).expect("the id finds the exec");
+        let exit = tokio::time::timeout(Duration::from_secs(10), found.wait())
+            .await
+            .expect("the exec ends");
+        assert_eq!(exit.code, Some(3));
+        assert_eq!(exit.reason, ExecExitReason::Exited);
+        assert_eq!(found.wait().await.code, Some(3), "the exit code is kept");
+
+        let output = disk.output(&entry.id).await;
+        assert_eq!(output, "STDIN-CLOSED\nout\nerr\n");
+
+        let events = disk.exec_events(&entry.id);
+        let kinds: Vec<_> = events.iter().map(|e| e.kind).collect();
+        assert_eq!(kinds, [BoxEventType::ExecStarted, BoxEventType::ExecExited]);
+        assert_eq!(events[1].data["exit_code"], 3);
+        assert_eq!(events[1].data["reason"], "exited");
+    }
+
+    /// BOX-149: a command that writes past the transcript cap keeps running
+    /// to its end. Its transcript is never larger than the cap, and it holds
+    /// the newest output: the last line the command wrote.
+    #[tokio::test]
+    async fn exec_transcript_past_cap_keeps_newest_output_within_cap() {
+        let disk = box_on_disk();
+        // About 20 MiB of numbered lines, more than twice the cap.
+        let entry = disk.start(ExecMode::Detached, &["seq", "1", "3000000"], None, false);
+        let exit = tokio::time::timeout(Duration::from_secs(60), entry.wait())
+            .await
+            .expect("the exec ends");
+        assert_eq!(exit.code, Some(0), "the command runs to its end");
+
+        let transcript = boxes::store::exec_transcript_path(&disk.exec_box.dir, entry.id.as_str());
+        let len = std::fs::metadata(&transcript).unwrap().len();
+        assert!(
+            len <= super::super::TRANSCRIPT_CAP,
+            "the transcript is {len} bytes, past the cap"
+        );
+        let output = disk.output(&entry.id).await;
+        assert_eq!(
+            output.len() as u64,
+            len,
+            "the read gives the whole transcript"
+        );
+        assert!(
+            output.starts_with("[older output was dropped. Only the newest output is kept.]\n"),
+            "the transcript says it dropped output: {:?}",
+            &output[..80]
+        );
+        assert!(
+            output.ends_with("\n2999999\n3000000\n"),
+            "the newest output is kept"
+        );
+        assert!(!output.contains("\n1\n"), "the oldest output is dropped");
+    }
+
+    /// BOX-149: an exec's own timeout ends the exec as a stop does: SIGTERM,
+    /// a wait, then SIGKILL for a command that ignores SIGTERM. Its
+    /// `exec_exited` event says `timeout`, and the box is still running:
+    /// its record is unchanged and it has no `exited` event.
+    #[tokio::test]
+    async fn exec_own_timeout_ends_exec_reason_timeout_box_keeps_running() {
+        let disk = box_on_disk();
+        let timeout = Duration::from_secs(1);
+        let begun = Instant::now();
+        let entry = disk.start(
+            ExecMode::Detached,
+            &["sh", "-c", "trap '' TERM; echo started; exec sleep 60"],
+            Some(timeout),
+            true,
+        );
+        let exit = tokio::time::timeout(Duration::from_secs(30), entry.wait())
+            .await
+            .expect("the timeout ends the exec");
+        let took = begun.elapsed();
+        assert_eq!(exit.reason, ExecExitReason::Timeout);
+        assert_eq!(exit.status(), 124, "a timed-out exec exits 124");
+        assert!(took >= timeout, "{took:?}");
+        // The SIGTERM was ignored, so the SIGKILL after the wait ended it.
+        assert!(
+            took >= crate::nsenter::SHIM_ESCALATION,
+            "the SIGKILL waits out the grace: {took:?}"
+        );
+        assert!(took < Duration::from_secs(25), "{took:?}");
+        assert_eq!(disk.output(&entry.id).await, "started\n");
+
+        let events = disk.exec_events(&entry.id);
+        let exited = events
+            .iter()
+            .find(|e| e.kind == BoxEventType::ExecExited)
+            .expect("an exec_exited event");
+        assert_eq!(exited.data["reason"], "timeout");
+
+        let record = disk.loader.get(&disk.key).unwrap().record().clone();
+        assert_eq!(record.status, boxes::BoxState::Active);
+        assert!(
+            !disk.events().iter().any(|e| e.kind == BoxEventType::Exited),
+            "the box did not end"
+        );
+    }
+
+    /// BOX-149: a wait on a detached exec that a daemon before a restart
+    /// started reads the exit from the box's stored `exec_exited` event.
+    #[test]
+    fn stored_exec_exit_reads_the_exit_after_a_restart() {
+        let disk = box_on_disk();
+        let ended = mint_exec_id();
+        let timed_out = mint_exec_id();
+        let unknown = mint_exec_id();
+        let exit_box = disk.exec_box.record.id;
+        for (id, code, reason) in [
+            (&ended, Some(7), ExecExitReason::Exited),
+            (&timed_out, None, ExecExitReason::Timeout),
+        ] {
+            let facts = ExecFacts::default();
+            disk.exec_box.write_event(
+                BoxEventType::ExecStarted,
+                id,
+                ExecMode::Detached,
+                &facts,
+                None,
+            );
+            disk.exec_box.write_event(
+                BoxEventType::ExecExited,
+                id,
+                ExecMode::Detached,
+                &facts,
+                Some(super::super::ExecExit { code, reason }),
+            );
+            assert!(find_exec(exit_box, id).is_none(), "no live entry holds it");
+        }
+        let dir = &disk.exec_box.dir;
+
+        let exit = super::super::stored_exec_exit(dir, &ended).expect("the stored exit");
+        assert_eq!(exit.code, Some(7));
+        assert_eq!(exit.reason, ExecExitReason::Exited);
+        assert_eq!(exit.status(), 7);
+
+        let exit = super::super::stored_exec_exit(dir, &timed_out).expect("the stored exit");
+        assert_eq!(exit.reason, ExecExitReason::Timeout);
+        assert_eq!(exit.status(), 124);
+
+        assert!(super::super::stored_exec_exit(dir, &unknown).is_none());
+    }
+
+    /// The refusal for a box that is not running names its state as
+    /// `min ls` prints it.
+    #[test]
+    fn the_not_running_refusal_names_the_state() {
+        for (status, word) in [
+            (boxes::BoxState::Pending, "pending"),
+            (boxes::BoxState::Materializing, "materializing"),
+            (boxes::BoxState::Stopped, "stopped"),
+            (boxes::BoxState::Exited, "exited"),
+        ] {
+            assert_eq!(
+                super::super::not_running_message("web", status),
+                format!("box web is {word}. Only a running box can run a command.\n"),
+            );
+        }
+    }
+
+    /// A command that neither ends nor takes the stop at its timeout.
+    struct StuckProcess {
+        kills: usize,
+    }
+
+    impl super::super::Process for StuckProcess {
+        type Stdin = tokio::io::Sink;
+        type Stdout = tokio::io::Empty;
+        type Stderr = tokio::io::Empty;
+
+        fn take_stdio(&mut self) -> Option<(Self::Stdin, Self::Stdout, Self::Stderr)> {
+            None
+        }
+
+        async fn wait(&mut self) -> std::io::Result<Option<i32>> {
+            std::future::pending().await
+        }
+
+        fn start_kill(&mut self) -> std::io::Result<()> {
+            self.kills += 1;
+            Err(std::io::Error::from_raw_os_error(libc::EPERM))
+        }
+    }
+
+    // BOX-149: an exec that survives its stop still ends, so a wait returns.
+    #[tokio::test(start_paused = true)]
+    async fn exec_timeout_ends_even_when_the_stop_fails() {
+        let mut process = StuckProcess { kills: 0 };
+        let (status, reason) =
+            super::super::wait_with_timeout(&mut process, Some(std::time::Duration::from_secs(1)))
+                .await;
+        assert_eq!(reason, ExecExitReason::Timeout);
+        assert_eq!(
+            status.expect_err("a stuck command gives an error").kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        assert_eq!(process.kills, 2, "the stop, then a last SIGKILL");
+    }
+
+    // BOX-149: the exec map does not keep an ended exec of a reaped box.
+    #[test]
+    fn ended_exec_of_a_reaped_box_is_not_found() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let box_dir = camino::Utf8Path::from_path(tmp.path()).expect("utf-8 temp path");
+        let id = mint_exec_id();
+        let transcript = boxes::store::exec_transcript_path(box_dir, id.as_str());
+        std::fs::create_dir_all(transcript.parent().expect("execs dir")).expect("execs dir");
+        let box_id = boxes::SessionId::mint();
+        let entry = std::sync::Arc::new(ExecEntry::new(
+            id.clone(),
+            box_id,
+            ExecMode::Detached,
+            transcript.clone(),
+            None,
+        ));
+        super::super::register_exec(std::sync::Arc::clone(&entry));
+        entry.finish(super::super::ExecExit {
+            code: Some(0),
+            reason: ExecExitReason::Exited,
+        });
+        assert!(
+            find_exec(box_id, &id).is_some(),
+            "the box still has its directory"
+        );
+        std::fs::remove_dir_all(transcript.parent().expect("execs dir")).expect("reap");
+        assert!(find_exec(box_id, &id).is_none(), "the box was reaped");
+        // The next exec's registration drops the reaped entry from the map.
+        let next = std::sync::Arc::new(ExecEntry::new(
+            mint_exec_id(),
+            box_id,
+            ExecMode::Detached,
+            transcript,
+            None,
+        ));
+        super::super::register_exec(next);
+        assert_eq!(std::sync::Arc::strong_count(&entry), 1);
+    }
+
+    /// Whether process `pid` is gone: no `/proc` entry, or a zombie.
+    fn process_gone(pid: u32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            Ok(stat) => stat
+                .rsplit_once(')')
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+        }
+    }
+
+    /// BOX-150: the client of a PTY exec or a detached exec goes away, and
+    /// the exec runs on. It writes to its transcript after the client is
+    /// gone, its id still finds it, and a wait by the id gets its exit.
+    #[tokio::test]
+    async fn pty_or_detached_exec_survives_client_loss() {
+        let disk = box_on_disk();
+        let box_id = disk.exec_box.record.id;
+
+        // A PTY exec: a client attaches, sees the first line, and goes away.
+        let tty = disk.start(
+            ExecMode::Tty,
+            &["sh", "-c", "echo first; sleep 2; echo later-tty"],
+            None,
+            false,
+        );
+        let found = find_exec(box_id, &tty.id).expect("the id finds the exec");
+        let (typed, msgs) = super::msg_stream();
+        let (mut client, mut server) = tokio::io::duplex(1 << 16);
+        let attach = tokio::spawn({
+            let found = Arc::clone(&found);
+            async move { relay_terminal(&found, msgs, &mut server).await }
+        });
+        let mut seen = String::new();
+        read_until(&mut client, &mut seen, "first").await;
+        drop(typed);
+        drop(client);
+        assert_eq!(attach.await.unwrap().unwrap(), AttachEnd::ClientGone);
+
+        // A detached exec: its start answered and its client went away.
+        let detached = disk.start(
+            ExecMode::Detached,
+            &["sh", "-c", "sleep 2; echo later-detached"],
+            None,
+            false,
+        );
+
+        for entry in [&tty, &detached] {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), entry.wait())
+                    .await
+                    .is_err(),
+                "{:?}: the exec runs on after its client goes away",
+                entry.mode
+            );
+            assert!(
+                find_exec(box_id, &entry.id).is_some(),
+                "{:?}: the id still finds the exec",
+                entry.mode
+            );
+        }
+        for (entry, later) in [(&tty, "later-tty"), (&detached, "later-detached")] {
+            let exit = tokio::time::timeout(Duration::from_secs(10), entry.wait())
+                .await
+                .expect("the exec ends by itself");
+            assert_eq!(exit.code, Some(0), "{:?}", entry.mode);
+            assert_eq!(exit.reason, ExecExitReason::Exited, "{:?}", entry.mode);
+            let output = disk.output(&entry.id).await;
+            assert!(output.contains(later), "{:?}: {output:?}", entry.mode);
+        }
+    }
+
+    /// BOX-150: the pump of a detached exec stops at the drain after the
+    /// exec ends. A descendant that keeps the pipe open and writes later
+    /// does not hold the pump, its descriptor and its transcript file.
+    #[tokio::test]
+    async fn pty_or_detached_exec_survives_client_loss_pump_ends_at_drain() {
+        let disk = box_on_disk();
+        let entry = disk.start(
+            ExecMode::Detached,
+            &["sh", "-c", "(sleep 3; echo late) & echo early"],
+            None,
+            false,
+        );
+        let exit = tokio::time::timeout(Duration::from_secs(10), entry.wait())
+            .await
+            .expect("the exec ends");
+        assert_eq!(exit.code, Some(0));
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let output = disk.output(&entry.id).await;
+        assert!(output.contains("early"), "{output:?}");
+        assert!(!output.contains("late"), "the pump ended: {output:?}");
+    }
+
+    /// T32, end to end in the daemon: a terminal exec and a detached exec
+    /// run in a box. The client of each goes away, and only the exec id is
+    /// left. A new lookup by that id attaches to the terminal again: it
+    /// replays what the exec wrote, including what it wrote with no client,
+    /// takes input, and ends with the exec's exit. The detached exec's
+    /// output reads by its id, and reads again the same.
+    #[tokio::test]
+    async fn terminal_exec_reattached_by_id_after_client_drop() {
+        let disk = box_on_disk();
+        let box_id = disk.exec_box.record.id;
+
+        let tty_id = {
+            let entry = disk.start(
+                ExecMode::Tty,
+                &[
+                    "sh",
+                    "-c",
+                    r#"read a; echo "got:$a"; sleep 1; echo while-away; read b; echo "got:$b""#,
+                ],
+                None,
+                false,
+            );
+            entry.id.clone()
+        };
+        let detached_id = {
+            let entry = disk.start(
+                ExecMode::Detached,
+                &[
+                    "sh",
+                    "-c",
+                    "echo detached-early; sleep 1; echo detached-late",
+                ],
+                None,
+                false,
+            );
+            entry.id.clone()
+        };
+
+        // First client: attach by id, type a line, see the answer, go away.
+        let found = find_exec(box_id, &tty_id).expect("the id finds the terminal exec");
+        let (typed, msgs) = super::msg_stream();
+        let (mut client, mut server) = tokio::io::duplex(1 << 16);
+        let first = tokio::spawn({
+            let found = Arc::clone(&found);
+            async move { relay_terminal(&found, msgs, &mut server).await }
+        });
+        typed
+            .send(russh::ChannelMsg::Data {
+                data: b"one\n".to_vec().into(),
+            })
+            .unwrap();
+        let mut seen = String::new();
+        read_until(&mut client, &mut seen, "got:one").await;
+        drop(typed);
+        drop(client);
+        assert_eq!(first.await.unwrap().unwrap(), AttachEnd::ClientGone);
+        drop(found);
+
+        // No client now. The exec writes on, and its id still finds it.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let found = find_exec(box_id, &tty_id).expect("the id finds the exec after the drop");
+        assert_eq!(found.mode, ExecMode::Tty);
+
+        // Second client, by the id alone: the replay holds what the exec
+        // wrote with no client, then input reaches it, then it exits.
+        let (typed, msgs) = super::msg_stream();
+        let (mut client, mut server) = tokio::io::duplex(1 << 16);
+        let second = tokio::spawn({
+            let found = Arc::clone(&found);
+            async move { relay_terminal(&found, msgs, &mut server).await }
+        });
+        let mut seen = String::new();
+        read_until(&mut client, &mut seen, "while-away").await;
+        assert!(seen.contains("got:one"), "the replay: {seen:?}");
+        typed
+            .send(russh::ChannelMsg::Data {
+                data: b"two\n".to_vec().into(),
+            })
+            .unwrap();
+        read_until(&mut client, &mut seen, "got:two").await;
+        match tokio::time::timeout(Duration::from_secs(10), second)
+            .await
+            .expect("the attach ends with the exec")
+            .unwrap()
+            .unwrap()
+        {
+            AttachEnd::Exited(exit) => assert_eq!(exit.code, Some(0)),
+            other => panic!("the attach ends with the exec, got {other:?}"),
+        }
+        let transcript = disk.output(&tty_id).await;
+        for line in ["got:one", "while-away", "got:two"] {
+            assert!(transcript.contains(line), "{line}: {transcript:?}");
+        }
+
+        // The detached exec: its client is gone, and its id reads its output.
+        let detached = find_exec(box_id, &detached_id).expect("the id finds the detached exec");
+        let exit = tokio::time::timeout(Duration::from_secs(10), detached.wait())
+            .await
+            .expect("the detached exec ends by itself");
+        assert_eq!(exit.code, Some(0));
+        let first_read = disk.output(&detached_id).await;
+        assert_eq!(first_read, "detached-early\ndetached-late\n");
+        assert_eq!(disk.output(&detached_id).await, first_read, "a read again");
+
+        // Each exec's events name its own id, start and exit.
+        for id in [&tty_id, &detached_id] {
+            let kinds: Vec<_> = disk.exec_events(id).into_iter().map(|e| e.kind).collect();
+            assert!(
+                kinds.contains(&BoxEventType::ExecStarted),
+                "{id}: {kinds:?}"
+            );
+            assert!(kinds.contains(&BoxEventType::ExecExited), "{id}: {kinds:?}");
+        }
+    }
+
+    /// BOX-151: a stop ends one exec. The exec's process gets SIGTERM
+    /// (here a stand-in for the injection shim, which ends its process
+    /// group on SIGTERM), and the whole group is gone after it. The stop
+    /// answers with the exec's end, writes its `exec_exited` event, and
+    /// leaves the box and its other exec running.
+    #[tokio::test]
+    async fn stop_exec_ends_process_group() {
+        use std::os::unix::process::CommandExt as _;
+
+        let disk = box_on_disk();
+        let box_id = disk.exec_box.record.id;
+        let dir = tempfile::tempdir().unwrap();
+        let term = dir.path().join("term");
+        let member = dir.path().join("member");
+        let script = r#"trap 'trap - TERM; echo term > "$1"; kill -TERM 0' TERM
+sleep 600 &
+echo $! > "$2"
+echo ready
+wait"#;
+        let mut command = std::process::Command::new("sh");
+        command
+            .args(["-c", script, "sh"])
+            .arg(&term)
+            .arg(&member)
+            .process_group(0);
+        let entry = start_managed_exec(
+            ManagedStart {
+                id: mint_exec_id(),
+                mode: ExecMode::Detached,
+                exec_box: disk.exec_box.clone(),
+                timeout: None,
+                winsize: (24, 80),
+                facts: ExecFacts::default(),
+            },
+            command,
+            true,
+        )
+        .expect("the exec starts");
+        let other = disk.start(ExecMode::Detached, &["sleep", "600"], None, false);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let member_pid: u32 = loop {
+            if let Some(pid) = std::fs::read_to_string(&member)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "the group member never started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        while !disk.output(&entry.id).await.contains("ready") {
+            assert!(Instant::now() < deadline, "the trap was never installed");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let exit = tokio::time::timeout(
+            crate::nsenter::SHIM_ESCALATION + Duration::from_secs(10),
+            super::super::stop_exec(box_id, &entry.id),
+        )
+        .await
+        .expect("the stop ends the exec")
+        .expect("the stop finds the exec");
+        assert!(!exit.already_ended, "the stop ended a running exec");
+        let exit = exit.exit;
+        assert_eq!(exit.code, None, "a signal ended the exec");
+        assert_eq!(
+            std::fs::read_to_string(&term).unwrap_or_default(),
+            "term\n",
+            "the exec got SIGTERM"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !process_gone(member_pid) {
+            assert!(
+                Instant::now() < deadline,
+                "the group member outlived the stop"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let exited = disk
+            .exec_events(&entry.id)
+            .into_iter()
+            .find(|e| e.kind == BoxEventType::ExecExited)
+            .expect("the stop writes the exec_exited event");
+        assert_eq!(exited.data["exit_code"], serde_json_lenient::Value::Null);
+
+        // Only that exec ended.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), other.wait())
+                .await
+                .is_err(),
+            "the other exec runs on"
+        );
+        assert_eq!(
+            disk.loader.get(&disk.key).unwrap().record().status,
+            boxes::BoxState::Active,
+            "the box keeps running"
+        );
+        // A second stop of the ended exec answers with the same end.
+        let again = super::super::stop_exec(box_id, &entry.id)
+            .await
+            .expect("the ended exec is still known");
+        assert_eq!(again.exit, exit);
+        assert!(again.already_ended, "the second stop sent no signal");
+        // An exec of another box is not found.
+        assert!(
+            super::super::stop_exec(boxes::SessionId::mint(), &other.id)
+                .await
+                .is_none()
+        );
+        super::super::stop_exec(box_id, &other.id).await;
+    }
+
+    /// BOX-151: a stop at the earliest point an exec's id is observable,
+    /// as its `exec_started` event is written, finds the exec and ends it.
+    /// The stop is registered before the event, in every managed mode.
+    #[tokio::test]
+    async fn stop_exec_ends_process_group_at_the_first_sight_of_a_managed_exec() {
+        for mode in [ExecMode::Detached, ExecMode::Tty] {
+            let disk = box_on_disk();
+            let box_id = disk.exec_box.record.id;
+            super::super::stop_at_start::arm(box_id);
+            let entry = disk.start(mode, &["sleep", "600"], None, false);
+            let seen = super::super::stop_at_start::seen(box_id);
+            assert_eq!(
+                seen.get(&entry.id),
+                Some(&true),
+                "{mode:?}: the stop at exec_started found the exec: {seen:?}"
+            );
+            let exit = tokio::time::timeout(Duration::from_secs(10), entry.wait())
+                .await
+                .unwrap_or_else(|_| panic!("{mode:?}: the stop ended the exec"));
+            assert_eq!(exit.code, None, "{mode:?}: a signal ended the exec");
+        }
+    }
+
+    /// BOX-151: a stop of an exec that a daemon before a restart started
+    /// answers from the box's stored `exec_exited` event that the exec
+    /// already ended, with its code. Only an id that no event names gets
+    /// the "no exec" answer.
+    #[tokio::test]
+    async fn stop_exec_ends_process_group_or_answers_a_stored_end() {
+        let disk = box_on_disk();
+        let box_id = disk.exec_box.record.id;
+        let state_dir = paths::DaemonAbsPath::try_new(disk._tmp.path().to_str().unwrap()).unwrap();
+        let ended = mint_exec_id();
+        let facts = ExecFacts::default();
+        disk.exec_box.write_event(
+            BoxEventType::ExecStarted,
+            &ended,
+            ExecMode::Detached,
+            &facts,
+            None,
+        );
+        disk.exec_box.write_event(
+            BoxEventType::ExecExited,
+            &ended,
+            ExecMode::Detached,
+            &facts,
+            Some(super::super::ExecExit {
+                code: Some(7),
+                reason: ExecExitReason::Exited,
+            }),
+        );
+        assert!(
+            find_exec(box_id, &ended).is_none(),
+            "no live entry holds it"
+        );
+
+        let answer = crate::rpc::stop_exec_answer(&state_dir, box_id, ended.as_str()).await;
+        assert_eq!(
+            answer,
+            minimald_rpc::Errorable::Ok(crate::rpc::StopExecResponse {
+                exit_code: Some(7),
+                reason: "exited".to_string(),
+                already_ended: true,
+            })
+        );
+
+        let unknown = mint_exec_id();
+        let answer = crate::rpc::stop_exec_answer(&state_dir, box_id, unknown.as_str()).await;
+        assert!(
+            matches!(&answer, minimald_rpc::Errorable::Err { error } if error.contains("has no exec")),
+            "{answer:?}"
+        );
+        // The stored end of one box does not answer for another box.
+        let answer =
+            crate::rpc::stop_exec_answer(&state_dir, boxes::SessionId::mint(), ended.as_str())
+                .await;
+        assert!(
+            matches!(&answer, minimald_rpc::Errorable::Err { error } if error.contains("has no exec")),
+            "{answer:?}"
+        );
+    }
+
+    /// BOX-151: a tty exec leads its own session, and a shell with job
+    /// control puts a background job in a process group of its own. The
+    /// injection shim's stop reaches that job through the session: SIGTERM
+    /// to the leader's group and to every other group of the session, then
+    /// SIGKILL to what is left. The job here ignores SIGTERM, so only the
+    /// SIGKILL ends it. The unit tests cannot run the shim binary, so this
+    /// drives the session calls the shim makes.
+    #[test]
+    fn stop_exec_ends_process_group_of_every_tty_job() {
+        use std::os::unix::process::CommandExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let member = dir.path().join("member");
+        let (master, slave) = super::super::open_terminal((24, 80)).unwrap();
+        let script =
+            r#"set -m; sh -c 'trap "" TERM; echo $$ > "$1"; exec sleep 600' sh "$1" & wait"#;
+        let mut shell = std::process::Command::new("sh");
+        shell
+            .args(["-c", script, "sh"])
+            .arg(&member)
+            .stdin(slave.try_clone().unwrap())
+            .stdout(slave.try_clone().unwrap())
+            .stderr(slave);
+        // SAFETY: the step makes only async-signal-safe calls.
+        unsafe {
+            shell.pre_exec(|| crate::nsenter::lead_session_on_terminal());
+        }
+        let mut shell = shell.spawn().expect("the shell starts");
+        let sid = libc::pid_t::try_from(shell.id()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let job: libc::pid_t = loop {
+            if let Some(pid) = std::fs::read_to_string(&member)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "the job never started");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        // SAFETY: both calls only query the kernel.
+        let (job_group, job_session) = unsafe { (libc::getpgid(job), libc::getsid(job)) };
+        assert_eq!(job_session, sid, "the job is in the exec's session");
+        assert_ne!(job_group, sid, "the job has a process group of its own");
+
+        let proc_dir = std::fs::File::open("/proc").unwrap();
+        // The shim's handler: SIGTERM to the leader's group. Its main flow:
+        // SIGTERM to the session's other groups.
+        // SAFETY: `sid` is the group this test spawned.
+        unsafe { libc::kill(-sid, libc::SIGTERM) };
+        crate::nsenter::signal_session(&proc_dir, sid, libc::SIGTERM, Some(sid));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !process_gone(shell.id()) {
+            assert!(Instant::now() < deadline, "the shell outlived its SIGTERM");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        let job_pid = u32::try_from(job).unwrap();
+        assert!(!process_gone(job_pid), "the job ignores SIGTERM");
+        assert!(
+            crate::nsenter::session_has_live_member(&proc_dir, sid),
+            "the session still has the job"
+        );
+
+        // The grace period ends: SIGKILL to the whole session. The shell is
+        // still unreaped, so its session id is not recycled.
+        crate::nsenter::signal_session(&proc_dir, sid, libc::SIGKILL, None);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !process_gone(job_pid) {
+            assert!(Instant::now() < deadline, "the job outlived the stop");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!crate::nsenter::session_has_live_member(&proc_dir, sid));
+        let _ = shell.wait();
+        drop(master);
+    }
+
+    /// BOX-149: the PTY of a tty exec is the controlling terminal of the
+    /// process the injection shim starts on it. The shim's pre-exec step
+    /// makes the process lead a new session, and the PTY's foreground
+    /// process group is then that process. A process started without the
+    /// step has no controlling terminal on the PTY.
+    #[tokio::test]
+    async fn tty_exec_pty_is_controlling_terminal() {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::process::CommandExt as _;
+
+        let spawn_on_pty = |lead: bool| {
+            let (master, slave) = super::super::open_terminal((24, 80)).unwrap();
+            let mut command = std::process::Command::new("sleep");
+            command
+                .arg("30")
+                .stdin(slave.try_clone().unwrap())
+                .stdout(slave.try_clone().unwrap())
+                .stderr(slave);
+            if lead {
+                // SAFETY: the step makes only async-signal-safe calls.
+                unsafe {
+                    command.pre_exec(|| crate::nsenter::lead_session_on_terminal());
+                }
+            }
+            let child = command.spawn().expect("the process starts");
+            (master, child)
+        };
+
+        let (master, mut child) = spawn_on_pty(true);
+        let pid = i32::try_from(child.id()).unwrap();
+        // SAFETY: both calls only query the kernel.
+        let (foreground, sid) = unsafe { (libc::tcgetpgrp(master.as_raw_fd()), libc::getsid(pid)) };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(sid, pid, "the process leads its own session");
+        assert_eq!(
+            foreground, pid,
+            "the PTY is the controlling terminal of the process"
+        );
+
+        let (master, mut child) = spawn_on_pty(false);
+        let pid = i32::try_from(child.id()).unwrap();
+        // SAFETY: only queries the kernel.
+        let foreground = unsafe { libc::tcgetpgrp(master.as_raw_fd()) };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_ne!(
+            foreground, pid,
+            "without the step the PTY is no one's terminal"
+        );
+    }
+
+    /// BOX-152: `exec_started` and `exec_exited` carry the principal, the
+    /// argv and the PTY flag, and `exec_exited` adds the exit code.
+    #[tokio::test]
+    async fn exec_events_carry_principal_argv_pty_code() {
+        use boxes::events::exec_data;
+
+        let disk = box_on_disk();
+        for (mode, argv, code) in [
+            (ExecMode::Tty, ["sh", "-c", "exit 3"], 3),
+            (ExecMode::Detached, ["sh", "-c", "exit 4"], 4),
+        ] {
+            let entry = disk.start(mode, &argv, None, false);
+            assert_eq!(entry.wait().await.code, Some(code));
+            let events = disk.exec_events(&entry.id);
+            let kinds: Vec<_> = events.iter().map(|e| e.kind).collect();
+            assert_eq!(
+                kinds,
+                [BoxEventType::ExecStarted, BoxEventType::ExecExited],
+                "{mode:?}"
+            );
+            for event in &events {
+                assert_eq!(event.data[exec_data::PRINCIPAL], PRINCIPAL, "{mode:?}");
+                assert_eq!(
+                    event.data[exec_data::ARGV],
+                    serde_json_lenient::json!(argv),
+                    "{mode:?}"
+                );
+                assert_eq!(
+                    event.data[exec_data::PTY],
+                    mode == ExecMode::Tty,
+                    "{mode:?}"
+                );
+            }
+            assert!(events[0].data.get(exec_data::EXIT_CODE).is_none());
+            assert_eq!(events[1].data[exec_data::EXIT_CODE], code, "{mode:?}");
+        }
+
+        // The events store the argv exactly as the request sent it. The
+        // read gate on the events protects it. Only the daemon log masks it.
+        let argv = [
+            "true",
+            "-H",
+            "Authorization: Bearer ghp_FAKETOKEN",
+            "--password",
+            "hunter2",
+            "https://x/",
+        ];
+        let entry = disk.start(ExecMode::Detached, &argv, None, false);
+        assert_eq!(entry.wait().await.code, Some(0));
+        let events = disk.exec_events(&entry.id);
+        assert_eq!(events.len(), 2);
+        for event in &events {
+            assert_eq!(event.data[exec_data::ARGV], serde_json_lenient::json!(argv));
+        }
+    }
+
+    /// BOX-153: only `io.exec_enabled = false` in the stored spec turns
+    /// exec off. No spec, no key, or `true` leave it on. Bytes that are not
+    /// JSON, or a spec that cannot be read, refuse: the gate fails closed.
+    #[test]
+    fn exec_disabled_reads_only_a_false_exec_enabled() {
+        use super::super::ExecGate;
+        let disk = box_on_disk();
+        assert_eq!(
+            disk.exec_box.exec_gate(),
+            ExecGate::Enabled,
+            "no stored spec"
+        );
+        let spec = disk.exec_box.dir.join(boxes::store::SPEC_FILE);
+        for (text, gate) in [
+            (r#"{"v":0,"io":{"exec_enabled":false}}"#, ExecGate::Disabled),
+            (r#"{"v":0,"io":{"exec_enabled":true}}"#, ExecGate::Enabled),
+            (r#"{"v":0,"io":{"pty_enabled":true}}"#, ExecGate::Enabled),
+            (r#"{"v":0}"#, ExecGate::Enabled),
+            ("not json", ExecGate::SpecUnreadable),
+            ("[1, 2]", ExecGate::SpecUnreadable),
+        ] {
+            std::fs::write(&spec, text).unwrap();
+            assert_eq!(disk.exec_box.exec_gate(), gate, "{text}");
+        }
+        // A spec path that is a directory reads as an error, not as absent.
+        std::fs::remove_file(&spec).unwrap();
+        std::fs::create_dir(&spec).unwrap();
+        assert_eq!(
+            disk.exec_box.exec_gate(),
+            ExecGate::SpecUnreadable,
+            "unreadable spec"
+        );
+    }
 }
 
 mod end_to_end {
@@ -3259,6 +5037,285 @@ mod end_to_end {
         assert!(
             !stderr.contains("unsupported"),
             "the argv form must be routed to the session, not refused, got {stderr:?}",
+        );
+    }
+
+    /// BOX-149: a command sent to a box that is not running is refused
+    /// with exit 2, and the refusal names the box's state. Nothing runs:
+    /// the marker a run on the daemon would leave is absent.
+    #[tokio::test]
+    async fn exec_into_non_running_box_refused_exit2_names_state() {
+        use minimald_rpc::exec::{ExecMode, ExecSpec};
+        use minimald_rpc::{CreateSession, Errorable, StopBox, StopBoxRequest};
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let marker = daemon_marker("not-running");
+        let _ = std::fs::remove_file(&marker);
+        let touch = vec!["touch".to_string(), marker.display().to_string()];
+
+        // A box still being created: its record is pending.
+        let pending = client
+            .call::<CreateSession>(&create_session_req("exec-pending", "/tmp"))
+            .await
+            .unwrap()
+            .id;
+        // A box that ran and was stopped.
+        let stopped = fresh_session(&mut client).await;
+        match client
+            .call::<StopBox>(&StopBoxRequest {
+                id: stopped,
+                force: true,
+            })
+            .await
+        {
+            Errorable::Ok(_) => {}
+            Errorable::Err { error } => panic!("StopBox failed: {error}"),
+        }
+
+        for (session_id, state) in [(pending, "pending"), (stopped, "stopped")] {
+            let session_str = session_id.to_string();
+            for request in [
+                ExecRequest::Argv(touch.clone()),
+                ExecRequest::Shell(format!("touch {}", marker.display())),
+                ExecRequest::Exec(ExecSpec {
+                    argv: touch.clone(),
+                    mode: ExecMode::Detached,
+                    timeout_secs: None,
+                }),
+            ] {
+                let out = client
+                    .exec(
+                        &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                        false,
+                        &request.encode(),
+                        &[],
+                    )
+                    .await
+                    .expect("the refusal is reported over the channel");
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                assert_eq!(out.exit_status, Some(2), "{request:?}: {stderr:?}");
+                assert!(
+                    stderr.contains(&format!("is {state}.")),
+                    "{request:?}: the refusal names the state, got {stderr:?}"
+                );
+                assert!(
+                    out.stdout.is_empty(),
+                    "{request:?}: no exec id for a refusal"
+                );
+                assert!(!marker.exists(), "{request:?}: nothing ran");
+            }
+        }
+    }
+
+    /// BOX-153: a box whose stored spec sets `[io] exec_enabled = false`
+    /// refuses every command with exit 5, and the refusal names the key.
+    /// Nothing runs: the marker a run on the daemon would leave is absent.
+    #[tokio::test]
+    async fn exec_disabled_refuses_exit5() {
+        use minimald_rpc::exec::{ExecMode, ExecSpec};
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+        let handle = server
+            .state
+            .sessions_manager()
+            .await
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("the box is live");
+        let exec_box = super::super::ExecBox::of(&handle).await.unwrap();
+        std::fs::write(
+            exec_box.dir.join(boxes::store::SPEC_FILE),
+            r#"{"v":0,"io":{"exec_enabled":false}}"#,
+        )
+        .unwrap();
+
+        let marker = daemon_marker("exec-disabled");
+        let _ = std::fs::remove_file(&marker);
+        let touch = vec!["touch".to_string(), marker.display().to_string()];
+        let session_str = session_id.to_string();
+        for request in [
+            ExecRequest::Argv(touch.clone()),
+            ExecRequest::Shell(format!("touch {}", marker.display())),
+            ExecRequest::Exec(ExecSpec {
+                argv: touch.clone(),
+                mode: ExecMode::Attached,
+                timeout_secs: None,
+            }),
+            ExecRequest::Exec(ExecSpec {
+                argv: touch.clone(),
+                mode: ExecMode::Detached,
+                timeout_secs: None,
+            }),
+        ] {
+            let out = client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    &request.encode(),
+                    &[],
+                )
+                .await
+                .expect("the refusal is reported over the channel");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.exit_status, Some(5), "{request:?}: {stderr:?}");
+            assert!(
+                stderr.contains("[io] exec_enabled = false"),
+                "{request:?}: the refusal names the key, got {stderr:?}"
+            );
+            assert!(
+                out.stdout.is_empty(),
+                "{request:?}: no exec id for a refusal"
+            );
+            assert!(!marker.exists(), "{request:?}: nothing ran");
+        }
+    }
+
+    /// BOX-151: a live attached exec is known by its id, so a stop of that
+    /// id ends it and leaves the box running. An id this daemon never
+    /// started in the box gets the "no exec" answer.
+    #[tokio::test]
+    async fn stop_exec_ends_process_group_of_a_live_attached_exec() {
+        use minimald_rpc::exec::{ExecMode, ExecSpec};
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+        let handle = server
+            .state
+            .sessions_manager()
+            .await
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("the box is live");
+        let exec_box = super::super::ExecBox::of(&handle).await.unwrap();
+        let events_path = exec_box.dir.join(boxes::events::EVENTS_FILE);
+        let state_dir = server.state.minimal_state_dir().await;
+
+        let session_str = session_id.to_string();
+        let request = ExecRequest::Exec(ExecSpec {
+            argv: vec!["sleep".to_string(), "600".to_string()],
+            mode: ExecMode::Attached,
+            timeout_secs: None,
+        });
+        let run = tokio::spawn(async move {
+            client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    &request.encode(),
+                    &[],
+                )
+                .await
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let exec_id = loop {
+            let started = std::fs::read_to_string(&events_path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| {
+                    serde_json_lenient::from_str::<boxes::events::BoxEvent>(line).ok()
+                })
+                .find(|e| e.kind == boxes::events::BoxEventType::ExecStarted)
+                .and_then(|e| {
+                    e.data
+                        .get("exec_id")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                });
+            if let Some(id) = started {
+                break id;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the exec never started"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+
+        let answer = tokio::time::timeout(
+            crate::nsenter::SHIM_ESCALATION + std::time::Duration::from_secs(10),
+            crate::rpc::stop_exec_answer(&state_dir, session_id, &exec_id),
+        )
+        .await
+        .expect("the stop ends the exec");
+        assert!(
+            matches!(answer, minimald_rpc::Errorable::Ok(_)),
+            "the stop finds the attached exec: {answer:?}"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(10), run)
+            .await
+            .expect("the attached client sees the end")
+            .unwrap()
+            .expect("the channel reports the end");
+
+        let unknown = super::super::mint_exec_id();
+        let answer = crate::rpc::stop_exec_answer(&state_dir, session_id, unknown.as_str()).await;
+        assert!(
+            matches!(&answer, minimald_rpc::Errorable::Err { error } if error.contains("has no exec")),
+            "{answer:?}"
+        );
+        assert_eq!(
+            handle.record().await.unwrap().status,
+            boxes::BoxState::Active,
+            "the box keeps running"
+        );
+    }
+
+    /// BOX-151: a stop of a live attached exec at the earliest point its id
+    /// is observable, as its `exec_started` event is written, finds the
+    /// exec and ends it. The client sees the end, and the box runs on.
+    #[tokio::test]
+    async fn stop_exec_ends_process_group_at_the_first_sight_of_an_attached_exec() {
+        use minimald_rpc::exec::{ExecMode, ExecSpec};
+
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+        let handle = server
+            .state
+            .sessions_manager()
+            .await
+            .get_session(crate::box_manager::BoxKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("the box is live");
+        super::super::stop_at_start::arm(session_id);
+
+        let session_str = session_id.to_string();
+        let request = ExecRequest::Exec(ExecSpec {
+            argv: vec!["sleep".to_string(), "600".to_string()],
+            mode: ExecMode::Attached,
+            timeout_secs: None,
+        });
+        tokio::time::timeout(
+            crate::nsenter::SHIM_ESCALATION + std::time::Duration::from_secs(10),
+            client.exec(
+                &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                false,
+                &request.encode(),
+                &[],
+            ),
+        )
+        .await
+        .expect("the stop at exec_started ends the exec")
+        .expect("the channel reports the end");
+
+        let seen = super::super::stop_at_start::seen(session_id);
+        assert_eq!(seen.len(), 1, "one exec started: {seen:?}");
+        assert!(
+            seen.values().all(|fired| *fired),
+            "the stop at exec_started found the exec: {seen:?}"
+        );
+        assert_eq!(
+            handle.record().await.unwrap().status,
+            boxes::BoxState::Active,
+            "the box keeps running"
         );
     }
 

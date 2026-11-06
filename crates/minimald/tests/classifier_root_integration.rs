@@ -6,7 +6,7 @@
 //! before it is loaded, and a request through the proxy is answered before
 //! anything refused it.
 //!
-//! Seven proofs, all `#[ignore]`d so the default suite and the surveyed
+//! Eleven proofs, all `#[ignore]`d so the default suite and the surveyed
 //! nextest lines never run them. The native lane's
 //! `minimald-root-integration` job runs this binary, and its recipe
 //! (`just test-root-integration`) runs it unprivileged — the same posture
@@ -32,7 +32,14 @@
 //! own leaf, completes while the same deny-all box's own connect to the
 //! same server is refused, and that the fetch is recorded as the
 //! node-plane traffic it is, naming that box
-//! (`daemon_fetch_survives_a_live_deny_leaf_over_a_loaded_table`) — and
+//! (`daemon_fetch_survives_a_live_deny_leaf_over_a_loaded_table`) — one
+//! proves NET-155: a package build placed in a box's deny leaf cannot
+//! connect to a local peer, and the same build in an allow leaf connects
+//! (`package_build_in_a_box_leaf_follows_its_verdict_over_a_loaded_table`),
+//! and its web-source fetch in a deny leaf is refused while the same fetch
+//! in an allow leaf completes
+//! (`web_source_fetch_in_a_box_leaf_follows_its_verdict_over_a_loaded_table`) —
+//! and
 //! four prove the classification itself, live on the kernel that loads
 //! it: that the installer's whole transaction — the classify chain at
 //! output's mangle priority, the mark-keyed postrouting — loads where
@@ -44,8 +51,13 @@
 //! only the mask's bits move (`foreign_ct_mark_bits_survive_classification`);
 //! and that the install refuses over a host already classing with the
 //! default bits, naming the rule and the override that escapes it
-//! (`install_refuses_an_overlapping_ct_mark_user`). The identity proof
-//! drives an eighth `#[ignore]`d test as its observer — the half of
+//! (`install_refuses_an_overlapping_ct_mark_user`). Three more close the
+//! classifier's gaps: the install refuses over a rule that writes the
+//! whole mark (`install_refuses_a_whole_mark_ct_writer`) and a mask in a
+//! well-known component's range (`install_refuses_a_well_known_mark_range`),
+//! and the table refuses an allow box's IPv6 connection to a peer
+//! (`host_ip_box_ipv6_egress_refused`). The identity proof drives an
+//! twelfth `#[ignore]`d test as its observer — the half of
 //! itself that runs re-exec'd inside the peer's namespace — which passes
 //! on its own, with nothing to observe.
 //!
@@ -63,7 +75,7 @@
 )]
 
 use std::io::{BufRead as _, Read as _, Write as _};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -501,7 +513,7 @@ fn push_dec4(buf: &mut [u8], at: &mut usize, n: libc::c_int) {
 /// `fork` and its `_exit`, where only async-signal-safe calls belong — the
 /// same discipline the probe's own child keeps, because the process that
 /// forked it may hold threads the child must not run code against. It
-/// waits for the proof's placement ack, binds its loopback listener after
+/// waits for the proof's placement ack, binds its 0.0.0.0 listener after
 /// the placement (every socket the backend owns is made inside the leaf
 /// its process was placed in, the way a box's processes' sockets are),
 /// reports the port it bound, answers the hostname proxy's connection,
@@ -536,8 +548,10 @@ unsafe fn backend_child_role(report: libc::c_int, target_port: u16) -> ! {
     let mut on: libc::sockaddr_in = unsafe { std::mem::zeroed() };
     on.sin_family = libc::AF_INET as libc::sa_family_t;
     on.sin_port = 0u16.to_be();
+    // 0.0.0.0, not 127.0.0.1: the hostname proxy refuses a host-address
+    // port that only a 127.0.0.1 listener holds (NET-071).
     on.sin_addr = libc::in_addr {
-        s_addr: u32::from_ne_bytes(Ipv4Addr::LOCALHOST.octets()),
+        s_addr: u32::from_ne_bytes(Ipv4Addr::UNSPECIFIED.octets()),
     };
     // SAFETY: `bind(2)` reads the `sockaddr_in` filled in above.
     let bound = unsafe {
@@ -847,7 +861,16 @@ fn the_installers_table_refuses_the_probe_over_a_scratch_tree() {
 
     // The reading: the table's refusal as the probe's legs met it, one
     // errno per family — the two loopbacks the decision's proofs name.
+    // `read_filter` is the per-launch reading, whose datagram leg pays no
+    // SYN retransmit: a refused TCP connect fails only at the first one, a
+    // second after it was sent.
+    let began = std::time::Instant::now();
     let reading = read_filter(&scratch);
+    let elapsed = began.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "the per-launch reading of a refusing table waits no retransmit: {elapsed:?}"
+    );
     let legs = reading.legs();
     assert!(
         matches!(reading, Reading::Refused(_)),
@@ -879,7 +902,7 @@ fn the_installers_table_refuses_the_probe_over_a_scratch_tree() {
 }
 
 /// NET-079, live over the loaded table: a deny-all host-address box with a
-/// loopback listener answers a request through the hostname proxy, while
+/// 0.0.0.0 listener answers a request through the hostname proxy, while
 /// the same box's own outbound connect is refused with EHOSTUNREACH — the
 /// live half of the lib's `deny_all_host_ip_box_answers_the_proxy`, whose
 /// request runs against no table at all. The backend is a forked child
@@ -1313,6 +1336,437 @@ fn daemon_fetch_survives_a_live_deny_leaf_over_a_loaded_table() {
         line.contains(PACKAGE_OBJECT),
         "the record names the object fetched: {line}"
     );
+}
+
+/// The connect probe a package build runs (NET-155): a static program that
+/// connects to `127.0.0.1:<argv[1]>` and reports the result the way `curl`
+/// reports a failed connect, so the line reads like a real download's.
+const BUILD_CONNECT_PROBE_C: &str = r#"
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/socket.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    if (argc < 2) return 2;
+    int port = atoi(argv[1]);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { fprintf(stderr, "socket failed: errno %d\n", errno); return 2; }
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((unsigned short)port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
+        fprintf(stderr, "Failed to connect to 127.0.0.1 port %d: errno %d\n", port, errno);
+        return 1;
+    }
+    fprintf(stderr, "connected to 127.0.0.1 port %d\n", port);
+    close(fd);
+    return 0;
+}
+"#;
+
+/// Compiles [`BUILD_CONNECT_PROBE_C`] statically and lays it out as a
+/// rootfs at `<base>/rootfs-src`, with the probe at `/usr/bin/probe`. Fails
+/// the proof when no C compiler is on `PATH`: this lane promised to run it.
+fn build_probe_rootfs(base: &Path) -> PathBuf {
+    let src = base.join("build_connect_probe.c");
+    let bin = base.join("build_connect_probe");
+    std::fs::write(&src, BUILD_CONNECT_PROBE_C).expect("writing the build probe's source");
+    let status = Command::new("gcc")
+        .args(["-static", "-o"])
+        .arg(&bin)
+        .arg(&src)
+        .status()
+        .expect("running gcc to compile the build probe (install build-essential)");
+    assert!(
+        status.success(),
+        "gcc failed to compile the build probe: {status:?}"
+    );
+    let rootfs = base.join("rootfs-src");
+    let usr_bin = rootfs.join("usr").join("bin");
+    std::fs::create_dir_all(&usr_bin).expect("the rootfs usr/bin dir");
+    std::fs::copy(&bin, usr_bin.join("probe")).expect("copying the probe into the rootfs");
+    std::fs::create_dir_all(rootfs.join("usr").join("lib")).expect("the rootfs usr/lib dir");
+    std::fs::create_dir_all(rootfs.join("etc")).expect("the rootfs etc dir");
+    rootfs
+}
+
+/// An async writer that keeps what a build prints, so the proof can read
+/// the build's own failure line.
+#[derive(Clone, Default)]
+struct BuildOutput(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl BuildOutput {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().expect("the build output lock")).into_owned()
+    }
+}
+
+impl tokio::io::AsyncWrite for BuildOutput {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.0
+            .lock()
+            .expect("the build output lock")
+            .extend_from_slice(buf);
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// A source fetcher the probe build never calls: its spec has no sources.
+#[derive(Debug)]
+struct NoSources;
+
+impl op::SourceFetcher for NoSources {
+    async fn download_web(
+        &self,
+        url: &str,
+        _sha256: &str,
+        _leaf: Option<&sandbox::config::ClassifierLeaf>,
+        _op: &ot::OpTracker,
+    ) -> anyhow::Result<(PathBuf, bool)> {
+        anyhow::bail!("the probe build has no sources, but it asked for {url}")
+    }
+
+    async fn download_gcs(
+        &self,
+        _bucket_id: String,
+        file: &str,
+        _sha256: &str,
+        _op: &ot::OpTracker,
+    ) -> anyhow::Result<PathBuf> {
+        anyhow::bail!("the probe build has no sources, but it asked for {file}")
+    }
+}
+
+/// Runs one package build of the connect probe in `leaf`, against the
+/// peer on `port`. Returns whether the build succeeded and what it printed.
+fn run_probe_build(
+    base: &Path,
+    rootfs: &Path,
+    leaf: sandbox::config::ClassifierLeaf,
+    port: u16,
+) -> (bool, String) {
+    let work = tempfile::tempdir_in(base).expect("a temp dir for the build");
+    // The cache opens over a directory that exists: `Cache::at_dir` makes
+    // its subdirectories, not its base.
+    let cache_dir = work.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).expect("the build's cache dir");
+    let cache = lcache::Cache::at_dir(&cache_dir).expect("the build's cache");
+    let graph = graph::Graph::new()
+        .ingest(
+            decode::Layer::new_for_test(format!(
+                r#"
+                let {{BuildSpec, ..}} = import "minimal.ncl" in
+                {{
+                    name = "downloads-at-build",
+                    build_deps = [],
+                    cmd = ["/usr/bin/probe", "{port}"],
+                }} | BuildSpec
+                "#
+            ))
+            .expect("the probe build's spec"),
+        )
+        .expect("the probe build's graph");
+    let spec = *graph
+        .by_name("downloads-at-build")
+        .expect("the probe build in its graph");
+    let output = BuildOutput::default();
+    let mut build = op::SpecBuild {
+        spec: &spec,
+        remote_fetcher: &NoSources,
+        // The rootfs is the probe alone. A build with its dependencies
+        // given shares the host's network, as a build that downloads does.
+        override_deps: Some(std::iter::once(rootfs.to_path_buf()).collect()),
+        stdout_writer: Some(Box::new(output.clone())),
+        stderr_writer: Some(Box::new(output.clone())),
+        cancel: tokio_util::sync::CancellationToken::new(),
+        cpu_weight: None,
+        classifier_leaf: Some(leaf),
+        box_network: None,
+    };
+    let opts = op::Options {
+        cache,
+        graph: &graph,
+        exec_base: work.path().join("exec"),
+        ot: None,
+        daemon_id: None,
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime for the build");
+    let result = runtime.block_on(async {
+        use op::Runnable as _;
+        tokio::time::timeout(Duration::from_secs(60), build.run(&opts)).await
+    });
+    let ok = match result {
+        Ok(Ok(_)) => true,
+        Ok(Err(e)) => {
+            eprintln!("the probe build failed: {e}");
+            false
+        }
+        Err(_) => panic!("the probe build did not finish in 60 s: {}", output.text()),
+    };
+    (ok, output.text())
+}
+
+/// NET-155, live: a package build placed for a box runs in that box's
+/// classifier leaf. In a deny leaf, the build's own connect to a local peer
+/// is refused by the loaded table. The same build in an allow leaf connects.
+#[test]
+#[ignore = "loads the installer's table and runs a real package build in a boxes/deny and a boxes/allow leaf; run by the native lane's minimald-root-integration job (just test-root-integration)"]
+fn package_build_in_a_box_leaf_follows_its_verdict_over_a_loaded_table() {
+    if !nft_present() {
+        eprintln!(
+            "skipping package_build_in_a_box_leaf_follows_its_verdict_over_a_loaded_table: \
+             no nft on this host — the install's nftables transaction is \
+             the artifact under proof (apt install nftables)"
+        );
+        return;
+    }
+    let _table = one_table_at_a_time();
+    let mountpoint = refuse_unless_the_root_lane_can_run();
+    let account = the_delegated_account();
+
+    let scratch = mountpoint.join(format!("minimald-proof-build-{}", std::process::id()));
+    let mut install = ScratchInstall {
+        root: scratch.clone(),
+        mountpoint: mountpoint.clone(),
+        leaf: None,
+        child: None,
+    };
+    install_over_scratch(&scratch, &account);
+    // In the tree before the build starts: the build's sandbox is born in
+    // this process's cgroup, and its move into the box leaf is checked at
+    // the common ancestor of the two.
+    place_this_process_in_the_tree(&scratch);
+    let deny_dir = create_box_leaf(&scratch, "builddeny", Verdict::Deny)
+        .expect("the step's deny subtree takes a box leaf");
+    install.leaf = Some(deny_dir.clone());
+    let allow_dir = create_box_leaf(&scratch, "buildallow", Verdict::Allow)
+        .expect("the step's allow subtree takes a box leaf");
+    // Dropped before `install`, so the allow leaf goes before the tree.
+    struct AllowLeaf(PathBuf);
+    impl Drop for AllowLeaf {
+        fn drop(&mut self) {
+            let _ = remove_box_leaf(&self.0);
+        }
+    }
+    let _allow_leaf = AllowLeaf(allow_dir.clone());
+    let deny = sandbox::config::ClassifierLeaf::under(&scratch, "builddeny", Verdict::Deny);
+    let allow = sandbox::config::ClassifierLeaf::under(&scratch, "buildallow", Verdict::Allow);
+    assert_eq!(
+        deny.dir(),
+        deny_dir.as_path(),
+        "the deny leaf the build is given"
+    );
+    assert_eq!(
+        allow.dir(),
+        allow_dir.as_path(),
+        "the allow leaf the build is given"
+    );
+
+    // The peer: one loopback listener, the one destination both builds
+    // reach for, so only the leaf differs between them.
+    let peer = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("binding the peer's port");
+    let port = peer.local_addr().expect("the peer's address").port();
+
+    let base = tempfile::tempdir().expect("a temp dir for the probe builds");
+    let rootfs = build_probe_rootfs(base.path());
+
+    let (ok, printed) = run_probe_build(base.path(), &rootfs, deny, port);
+    assert!(
+        !ok,
+        "the build in the deny leaf fails, because it cannot reach the peer: {printed}"
+    );
+    let refused = format!(
+        "Failed to connect to 127.0.0.1 port {port}: errno {}",
+        libc::EHOSTUNREACH
+    );
+    assert!(
+        printed.contains(&refused),
+        "the deny-leaf build's connect is refused with EHOSTUNREACH, the \
+         loaded chain's own rejection: {printed}"
+    );
+
+    let (ok, printed) = run_probe_build(base.path(), &rootfs, allow, port);
+    assert!(
+        ok && printed.contains(&format!("connected to 127.0.0.1 port {port}")),
+        "the same build in the allow leaf connects to the peer: {printed}"
+    );
+    drop(peer);
+}
+
+/// Serves `body` to every HTTP request on a loopback port, and counts the
+/// requests that reach it.
+fn serve_source(body: &'static [u8]) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("binding the source's port");
+    let port = listener.local_addr().expect("the source's address").port();
+    let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = served.clone();
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut conn) = conn else { continue };
+            let mut reader = std::io::BufReader::new(conn.try_clone().expect("a reader"));
+            let mut line = String::new();
+            while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
+                line.clear();
+            }
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = write!(
+                conn,
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = conn.write_all(body);
+        }
+    });
+    (port, served)
+}
+
+/// NET-155, live: a box build's web source is fetched in the box's
+/// classifier leaf, so the box's verdict decides it. The fetcher the daemon
+/// gives a box's build (`common::RemoteStorage`) refuses the source for a
+/// deny leaf. The placed download's own socket, made in the deny leaf with
+/// the early refusal turned off, is refused by the loaded table itself. The
+/// same fetch in an allow leaf reaches the source and passes the
+/// content-hash check.
+#[test]
+#[ignore = "loads the installer's table and runs a real web-source fetch in a boxes/deny and a boxes/allow leaf; run by the native lane's minimald-root-integration job (just test-root-integration)"]
+fn web_source_fetch_in_a_box_leaf_follows_its_verdict_over_a_loaded_table() {
+    use op::SourceFetcher as _;
+    use sha2::Digest as _;
+
+    if !nft_present() {
+        eprintln!(
+            "skipping web_source_fetch_in_a_box_leaf_follows_its_verdict_over_a_loaded_table: \
+             no nft on this host — the install's nftables transaction is \
+             the artifact under proof (apt install nftables)"
+        );
+        return;
+    }
+    let _table = one_table_at_a_time();
+    let mountpoint = refuse_unless_the_root_lane_can_run();
+    let account = the_delegated_account();
+
+    let scratch = mountpoint.join(format!("minimald-proof-source-{}", std::process::id()));
+    let mut install = ScratchInstall {
+        root: scratch.clone(),
+        mountpoint: mountpoint.clone(),
+        leaf: None,
+        child: None,
+    };
+    install_over_scratch(&scratch, &account);
+    // In the tree before the fetch starts: the child that makes each placed
+    // socket is born in this process's cgroup, and its move into the box
+    // leaf is checked at the common ancestor of the two.
+    place_this_process_in_the_tree(&scratch);
+    let deny_dir = create_box_leaf(&scratch, "sourcedeny", Verdict::Deny)
+        .expect("the step's deny subtree takes a box leaf");
+    install.leaf = Some(deny_dir.clone());
+    let allow_dir = create_box_leaf(&scratch, "sourceallow", Verdict::Allow)
+        .expect("the step's allow subtree takes a box leaf");
+    // Dropped before `install`, so the allow leaf goes before the tree.
+    struct AllowLeaf(PathBuf);
+    impl Drop for AllowLeaf {
+        fn drop(&mut self) {
+            let _ = remove_box_leaf(&self.0);
+        }
+    }
+    let _allow_leaf = AllowLeaf(allow_dir.clone());
+    let deny = sandbox::config::ClassifierLeaf::under(&scratch, "sourcedeny", Verdict::Deny);
+    let allow = sandbox::config::ClassifierLeaf::under(&scratch, "sourceallow", Verdict::Allow);
+    assert_eq!(
+        deny.dir(),
+        deny_dir.as_path(),
+        "the deny leaf the fetch is given"
+    );
+    assert_eq!(
+        allow.dir(),
+        allow_dir.as_path(),
+        "the allow leaf the fetch is given"
+    );
+
+    // The source: one loopback server, the one destination every fetch
+    // reaches for, so only the leaf differs between them.
+    let body: &'static [u8] = b"the declared web source";
+    let sha = hex::encode(sha2::Sha256::digest(body));
+    let (port, served) = serve_source(body);
+    let url = format!("http://127.0.0.1:{port}/pkg-1.0.tar.gz");
+
+    let base = tempfile::tempdir().expect("a temp dir for the source cache");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime for the fetches");
+    runtime.block_on(async {
+        let storage = common::RemoteStorage::new(base.path().join("cache"), false)
+            .await
+            .expect("the source cache");
+        let op = ot::OpTracker::new_root();
+
+        let refused = storage
+            .download_web(&url, &sha, Some(&deny), &op)
+            .await
+            .expect_err("the deny leaf's fetch is refused");
+        eprintln!("the deny leaf's fetch: {refused:#}");
+
+        // The early refusal off: the socket made in the deny leaf meets the
+        // loaded chain itself.
+        let procs = deny.procs();
+        let measured = storage
+            .download_web_with_verification_and_caching(&url, &sha, Some(&procs), false, &op)
+            .await
+            .expect_err("the loaded table refuses a socket made in the deny leaf");
+        let text = format!("{measured:#}");
+        assert!(
+            text.contains(&format!("could not connect to 127.0.0.1:{port}")),
+            "the placed connection names the source it could not reach: {text}"
+        );
+        assert!(
+            text.contains(&std::io::Error::from_raw_os_error(libc::EHOSTUNREACH).to_string()),
+            "the deny-leaf socket is refused with EHOSTUNREACH, the loaded \
+             chain's own rejection: {text}"
+        );
+        assert_eq!(
+            served.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no fetch from the deny leaf reached the source"
+        );
+
+        let (path, connected) = storage
+            .download_web(&url, &sha, Some(&allow), &op)
+            .await
+            .expect("the same fetch in the allow leaf reaches the source");
+        assert!(connected, "the allow leaf's fetch opened a connection");
+        assert_eq!(std::fs::read(path).expect("the fetched source"), body);
+        assert_eq!(
+            served.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the allow leaf's fetch reached the source once"
+        );
+    });
 }
 
 // ── The classification's own proofs ─────────────────────────────────────────
@@ -2217,4 +2671,289 @@ fn install_refuses_an_overlapping_ct_mark_user() {
          rendered it: {}",
         scratch.display()
     );
+}
+
+/// A refusal's whole text, stdout and stderr together, for the asserts.
+fn refusal_text(output: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+/// A rule that writes the connection mark with no mask writes every bit
+/// of it, so it overlaps the bits of any mask. The scan reads it live
+/// here: a fixture table stands in for such a component, as wg-quick's
+/// `ct mark set meta mark` is one, and is loaded before the install. The
+/// install refuses with the default mask and with a mask nothing else
+/// names, it names the rule with its table and chain, and it lays out
+/// nothing.
+///
+/// `#[ignore]`d like the proofs above, declined the same way on a runner
+/// with no `nft`.
+#[test]
+#[ignore = "proves the install's conflict scan live, over a standing whole-mark ct writer on this host; run by the native lane's minimald-root-integration job (just test-root-integration)"]
+fn install_refuses_a_whole_mark_ct_writer() {
+    if !nft_present() {
+        eprintln!(
+            "skipping install_refuses_a_whole_mark_ct_writer: no nft on this \
+             host — the install's nftables transaction is the artifact under \
+             proof (apt install nftables)"
+        );
+        return;
+    }
+    // One table at a time: this binary's proofs each load it.
+    let _table = one_table_at_a_time();
+    let mountpoint = refuse_unless_the_root_lane_can_run();
+    let account = the_delegated_account();
+    let scratch = mountpoint.join(format!("minimald-proof-whole-{}", std::process::id()));
+    let _install = ScratchInstall {
+        root: scratch.clone(),
+        mountpoint: mountpoint.clone(),
+        leaf: None,
+        child: None,
+    };
+
+    // The standing writer, kept inert by the narrowest match that still
+    // writes the whole mark.
+    let fixture = format!("minimald_proof_whole_{}", std::process::id());
+    load_fixture_table(
+        &fixture,
+        &format!(
+            "table inet {fixture} {{
+    chain set_mark {{
+        type filter hook output priority filter; policy accept;
+        oifname \"lo\" tcp dport 9 ct mark set meta mark
+    }}
+}}
+"
+        ),
+    );
+    let _fixture = FixtureTable(fixture.clone());
+
+    for extra in [&[][..], &["--ct-mark-mask", "0x0c000000"][..]] {
+        let refused = install_over_scratch_with(&scratch, &account, extra);
+        let refusal = refusal_text(&refused);
+        assert!(
+            !refused.status.success(),
+            "the install refuses over a whole-mark ct writer with {extra:?}: {refusal}"
+        );
+        assert!(
+            refusal.contains(&format!("table inet {fixture}, chain set_mark: ")),
+            "the refusal names the table and chain the rule is in: {refusal}"
+        );
+        // nft can list `meta mark` with or without its `meta`.
+        assert!(
+            refusal.contains("ct mark set meta mark") || refusal.contains("ct mark set mark"),
+            "the refusal names the rule it found: {refusal}"
+        );
+        assert!(
+            refusal.contains("writes every bit of the connection mark"),
+            "the refusal says why no mask avoids the rule: {refusal}"
+        );
+        assert!(
+            !scratch.exists(),
+            "the refused install laid out no tree: {refusal}"
+        );
+    }
+}
+
+/// `--ct-mark-mask` refuses a mask in a range a well-known component
+/// classes with, on a host that shows no user of it yet: the component
+/// can start after the install. The refusal names the range and the
+/// component, names `min finalize-install --ct-mark-mask <mask>`, and lays
+/// out nothing.
+///
+/// `#[ignore]`d like the proofs above, declined the same way on a runner
+/// with no `nft`.
+#[test]
+#[ignore = "runs the install over this host's real cgroup2 with a mask in a well-known range; run by the native lane's minimald-root-integration job (just test-root-integration)"]
+fn install_refuses_a_well_known_mark_range() {
+    if !nft_present() {
+        eprintln!(
+            "skipping install_refuses_a_well_known_mark_range: no nft on this \
+             host — the install's nftables transaction is the artifact under \
+             proof (apt install nftables)"
+        );
+        return;
+    }
+    // One table at a time: this binary's proofs each load it.
+    let _table = one_table_at_a_time();
+    let mountpoint = refuse_unless_the_root_lane_can_run();
+    let account = the_delegated_account();
+    let scratch = mountpoint.join(format!("minimald-proof-range-{}", std::process::id()));
+    let _install = ScratchInstall {
+        root: scratch.clone(),
+        mountpoint: mountpoint.clone(),
+        leaf: None,
+        child: None,
+    };
+    for (mask, component, range) in [
+        ("0x00030000", "Tailscale", "0x00ff0000"),
+        ("0x0000c000", "kube-proxy", "0x0000c000"),
+    ] {
+        let refused = install_over_scratch_with(&scratch, &account, &["--ct-mark-mask", mask]);
+        let refusal = refusal_text(&refused);
+        assert!(
+            !refused.status.success(),
+            "the install refuses mask {mask}: {refusal}"
+        );
+        assert!(
+            refusal.contains(&format!("uses bits in {range}, the range {component}")),
+            "the refusal names the range and its component: {refusal}"
+        );
+        assert!(
+            refusal.contains("min finalize-install --ct-mark-mask <mask>"),
+            "the refusal names the command that reruns with two other bits: {refusal}"
+        );
+        assert!(
+            !scratch.exists(),
+            "the refused install laid out no tree: {refusal}"
+        );
+    }
+}
+
+/// The host-side end of the IPv6 proof's veth pair and the two addresses
+/// on it, out of the IPv6 documentation prefix, which no host routes.
+const HOST_VETH6: &str = "mclass6-host";
+const PEER_VETH6: &str = "mclass6-peer";
+const HOST_VETH6_ADDRESS: &str = "2001:db8:6c::1";
+const PEER6_ADDRESS: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0x6c, 0, 0, 0, 0, 2);
+
+/// The packets the loaded table's named refusal counter holds, as
+/// `nft list counter` prints them.
+fn refused_packets() -> u64 {
+    let listed = nft(&["list", "counter", "inet", TABLE_NAME, "refused"]);
+    assert!(
+        listed.status.success(),
+        "listing the table's refusal counter: {}",
+        refusal_text(&listed)
+    );
+    let text = String::from_utf8_lossy(&listed.stdout).into_owned();
+    text.split("packets ")
+        .nth(1)
+        .and_then(|counted| counted.split_whitespace().next())
+        .and_then(|counted| counted.parse().ok())
+        .unwrap_or_else(|| panic!("the refusal counter's packets: {text}"))
+}
+
+/// NET-079, live: an allow box of the host-address cohort opens an IPv6
+/// connection to a peer behind a veth, and the loaded table refuses it,
+/// EACCES, the IPv6 reading of `reject with icmpx admin-prohibited`. A
+/// leg from the daemon's leaf, outside the boxes subtree, reaches the same
+/// peer, which answers with a reset (no listener there), so the refusal is
+/// the table's and not the path's. The box's IPv6 loopback stays open, and
+/// the refusal counts in the table's one refusal counter.
+///
+/// `#[ignore]`d like the proofs above, declined the same way on a runner
+/// with no `nft`.
+#[test]
+#[ignore = "loads the installer's table and drives an allow box's IPv6 connection to a peer behind a veth; run by the native lane's minimald-root-integration job (just test-root-integration)"]
+fn host_ip_box_ipv6_egress_refused() {
+    if !nft_present() {
+        eprintln!(
+            "skipping host_ip_box_ipv6_egress_refused: no nft on this host — \
+             the install's nftables transaction is the artifact under proof \
+             (apt install nftables)"
+        );
+        return;
+    }
+    // One table at a time: this binary's proofs each load it.
+    let _table = one_table_at_a_time();
+    let mountpoint = refuse_unless_the_root_lane_can_run();
+    let account = the_delegated_account();
+    let scratch = mountpoint.join(format!("minimald-proof-ipv6-{}", std::process::id()));
+    let mut install = ScratchInstall {
+        root: scratch.clone(),
+        mountpoint: mountpoint.clone(),
+        leaf: None,
+        child: None,
+    };
+    install_over_scratch(&scratch, &account);
+    place_this_process_in_the_tree(&scratch);
+    let leaf = create_box_leaf(&scratch, "ipv6box", Verdict::Allow)
+        .expect("the step's allow subtree takes a box leaf");
+    install.leaf = Some(leaf.clone());
+
+    // The veth pair and the peer's namespace. `nodad` makes each address
+    // usable at once, with no duplicate-address wait.
+    let _veth = Veth(HOST_VETH6);
+    let holder = spawn_netns_holder();
+    let host_prefix = format!("{HOST_VETH6_ADDRESS}/64");
+    let peer_prefix = format!("{PEER6_ADDRESS}/64");
+    ip(&[
+        "link", "add", HOST_VETH6, "type", "veth", "peer", "name", PEER_VETH6,
+    ]);
+    ip(&["link", "set", PEER_VETH6, "netns", &holder.pid.to_string()]);
+    ip(&[
+        "-6",
+        "address",
+        "add",
+        &host_prefix,
+        "dev",
+        HOST_VETH6,
+        "nodad",
+    ]);
+    ip(&["link", "set", HOST_VETH6, "up"]);
+    nsenter_ip(holder.pid, &["link", "set", "lo", "up"]);
+    nsenter_ip(
+        holder.pid,
+        &[
+            "-6",
+            "address",
+            "add",
+            &peer_prefix,
+            "dev",
+            PEER_VETH6,
+            "nodad",
+        ],
+    );
+    nsenter_ip(holder.pid, &["link", "set", PEER_VETH6, "up"]);
+    // Port 9 in a fresh namespace: nothing listens, so a SYN that arrives
+    // is answered with a reset.
+    let peer = SocketAddr::from((PEER6_ADDRESS, 9));
+
+    // The control leg, from the daemon's leaf: the peer is reachable, and
+    // answers with a reset.
+    migrate_self(&daemon_leaf(&scratch).join("cgroup.procs"));
+    let control = TcpStream::connect_timeout(&peer, Duration::from_secs(10));
+    assert_eq!(
+        control
+            .as_ref()
+            .err()
+            .and_then(std::io::Error::raw_os_error),
+        Some(libc::ECONNREFUSED),
+        "the daemon leaf's IPv6 leg reaches the peer, which resets it: {control:?}"
+    );
+
+    // The box's leg, from the allow leaf: refused by the table.
+    let before = refused_packets();
+    migrate_self(&leaf.join("cgroup.procs"));
+    let refused = TcpStream::connect_timeout(&peer, Duration::from_secs(10));
+    assert_eq!(
+        refused
+            .as_ref()
+            .err()
+            .and_then(std::io::Error::raw_os_error),
+        Some(libc::EACCES),
+        "the allow box's IPv6 connection to the peer is refused by the table: {refused:?}"
+    );
+    assert!(
+        refused_packets() > before,
+        "the IPv6 refusal counts in the table's refusal counter"
+    );
+
+    // The same box's IPv6 loopback is not refused.
+    let loopback =
+        TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).expect("binding an IPv6 loopback listener");
+    let loop_port = loopback
+        .local_addr()
+        .expect("the IPv6 loopback listener's address")
+        .port();
+    TcpStream::connect((Ipv6Addr::LOCALHOST, loop_port))
+        .expect("the allow box's IPv6 loopback leg is not refused");
+
+    // Out of the box's leaf before the guard removes it.
+    migrate_self(&daemon_leaf(&scratch).join("cgroup.procs"));
 }

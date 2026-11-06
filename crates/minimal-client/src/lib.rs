@@ -68,11 +68,11 @@ pub fn init_trace_context(ctx: minimald_rpc::trace::TraceContext) {
 
 static VM_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// Set the process-wide VM name (`--vm <NAME>`) so every provider dir this
+/// Set the process-wide VM name (`--vm <NAME>`) so every host dir this
 /// process resolves names the same VM (NET-052). First call wins; must be
 /// called at command dispatch, before any path resolution. A name outside
 /// the allowlist is rejected here rather than resolved to a directory outside
-/// the provider dir.
+/// the host dir.
 ///
 /// # Errors
 ///
@@ -520,7 +520,7 @@ impl Client {
         self.oneshot_rpc_within::<R>(request, deadline).await
     }
 
-    #[tracing::instrument(level = "info", name = "client.rpc", skip_all, fields(rpc = R::NAME, timeout_s = timeout.as_secs()))]
+    #[tracing::instrument(level = "info", name = "client.rpc", skip_all, fields(rpc = R::NAME, timeout_s = timeout.as_secs(), otel.status_code = tracing::field::Empty))]
     async fn oneshot_rpc_within<R: OneshotSshRpc>(
         &mut self,
         request: R::Request<'_>,
@@ -575,13 +575,27 @@ impl Client {
                 );
             }
 
-            serde_json_lenient::from_slice(&resp_buf)
-                .with_context(|| decode_context(R::NAME, &resp_buf))
+            let response: R::Response = serde_json_lenient::from_slice(&resp_buf)
+                .with_context(|| decode_context(R::NAME, &resp_buf))?;
+            // Most RPCs answer a refusal as `Errorable::Err` inside a decoded
+            // response, and `SubmitVerdict` as a `Fault` step; the caller
+            // still gets it as a response, and the span is marked failed.
+            if daemon_refused(&resp_buf) {
+                tracing::Span::current().record("otel.status_code", "ERROR");
+            }
+            Ok(response)
         };
 
-        tokio::time::timeout(timeout, rpc)
+        let result = tokio::time::timeout(timeout, rpc)
             .await
-            .map_err(|_| anyhow::anyhow!("{} RPC timed out after {timeout:?}", R::NAME))?
+            .map_err(|_| anyhow::anyhow!("{} RPC timed out after {timeout:?}", R::NAME))
+            .and_then(|r| r);
+        if result.is_err() {
+            // A failed or timed-out RPC marks its span, so a daemon-side
+            // "rpc failed" has a failed client-side span to match.
+            tracing::Span::current().record("otel.status_code", "ERROR");
+        }
+        result
     }
 
     /// Open a session channel and issue an `exec` request for `command`,
@@ -1034,6 +1048,138 @@ impl Client {
         Ok(())
     }
 
+    /// Opens a session channel for the box `box_id` and requests the
+    /// `subsystem` on it, returning the channel once the daemon accepts it.
+    ///
+    /// `MINIMAL_SESSION_ID` is set on the channel before the request, the
+    /// contract the daemon scopes a box's subsystems by (the `sftp` one
+    /// refuses a channel without it). A refused request is an error here,
+    /// because a bare refusal does not close the channel.
+    pub async fn open_box_subsystem(
+        &mut self,
+        box_id: boxes::BoxId,
+        subsystem: &str,
+    ) -> Result<russh::Channel<russh::client::Msg>, anyhow::Error> {
+        let mut channel = self
+            .handle
+            .channel_open_session()
+            .await
+            .with_context(|| format!("open channel for the {subsystem} subsystem"))?;
+        send_trace_context(&channel).await;
+        // No reply is asked for the env request: the daemon answers each
+        // request that wants one, in order, so the first answer on the
+        // channel is then the subsystem's.
+        channel
+            .set_env(false, "MINIMAL_SESSION_ID", box_id.to_string())
+            .await
+            .context("set MINIMAL_SESSION_ID env")?;
+        channel
+            .request_subsystem(true, subsystem)
+            .await
+            .with_context(|| format!("request the {subsystem} subsystem"))?;
+        loop {
+            match channel.wait().await {
+                Some(russh::ChannelMsg::Success) => return Ok(channel),
+                Some(russh::ChannelMsg::Failure) => {
+                    anyhow::bail!("the daemon refused the {subsystem} subsystem for box {box_id}")
+                }
+                // Window adjustments and env acks can precede the reply; the
+                // daemon sends nothing on the channel before it.
+                Some(_) => continue,
+                None => anyhow::bail!(
+                    "the channel closed before the daemon answered the {subsystem} request"
+                ),
+            }
+        }
+    }
+
+    /// Opens the `subsystem` for the box `box_id` as
+    /// [`Self::open_box_subsystem`] does, writes `request` and half-closes,
+    /// and returns the reply to read line by line.
+    ///
+    /// This is the shape of the daemon's streaming reads, such as
+    /// [`minimald_rpc::READ_EVENTS_SUBSYSTEM`]: one JSON request, then one
+    /// JSON update for each line until the daemon ends the stream.
+    pub async fn stream_box_subsystem(
+        &mut self,
+        box_id: boxes::BoxId,
+        subsystem: &str,
+        request: &[u8],
+    ) -> Result<SubsystemLines, anyhow::Error> {
+        let channel = self.open_box_subsystem(box_id, subsystem).await?;
+        channel
+            .data(request)
+            .await
+            .with_context(|| format!("write the {subsystem} request"))?;
+        channel
+            .eof()
+            .await
+            .with_context(|| format!("half-close the {subsystem} request"))?;
+        Ok(SubsystemLines {
+            channel,
+            buf: Vec::new(),
+            daemon_error: Vec::new(),
+            closed: false,
+        })
+    }
+
+    /// Reads the events of the box `box_id` (BOX-162): every retained
+    /// event, then, with `follow`, each new one until the box is reaped.
+    /// Each line of the reply is one JSON [`minimald_rpc::ReadEventsUpdate`].
+    pub async fn read_box_events(
+        &mut self,
+        box_id: boxes::BoxId,
+        follow: bool,
+    ) -> Result<SubsystemLines, anyhow::Error> {
+        let request = minimald_rpc::ReadEventsRequest { id: box_id, follow };
+        let body = serde_json_lenient::to_vec(&request).context("serialize the events request")?;
+        self.stream_box_subsystem(box_id, minimald_rpc::READ_EVENTS_SUBSYSTEM, &body)
+            .await
+    }
+
+    /// Opens the file at `path` in the box `box_id` for reading, over the
+    /// box's `sftp` subsystem. A stopped or exited box is served from its
+    /// retained files (BOX-017). A relative `path` is below the box's home.
+    ///
+    /// The returned file streams its contents, so a large file is never
+    /// held in memory. It keeps the sftp conversation open until it drops.
+    ///
+    /// # Errors
+    ///
+    /// [`BoxFileError`] says whether the box's files were not served at
+    /// all, or the open of `path` was refused, and why.
+    pub async fn open_box_file(
+        &mut self,
+        box_id: boxes::BoxId,
+        path: &str,
+    ) -> Result<russh_sftp::client::fs::File, BoxFileError> {
+        let channel = self
+            .open_box_subsystem(box_id, "sftp")
+            .await
+            .map_err(BoxFileError::Unavailable)?;
+        let sftp = russh_sftp::client::SftpSession::new(channel.into_stream())
+            .await
+            .context("start the sftp conversation")
+            .map_err(BoxFileError::Unavailable)?;
+        // The file holds its own reference to the conversation, so dropping
+        // `sftp` here does not end it.
+        sftp.open(path).await.map_err(|e| match e {
+            russh_sftp::client::error::Error::Status(status)
+                if status.status_code == russh_sftp::protocol::StatusCode::NoSuchFile =>
+            {
+                BoxFileError::NotFound
+            }
+            russh_sftp::client::error::Error::Status(status)
+                if status.status_code == russh_sftp::protocol::StatusCode::PermissionDenied =>
+            {
+                BoxFileError::PermissionDenied
+            }
+            other => {
+                BoxFileError::Refused(anyhow::Error::new(other).context(format!("open {path}")))
+            }
+        })
+    }
+
     /// Requests the daemon's diagnostic bundle (`min bug`): sends `req` on the
     /// [`minimald_rpc::DIAG_BUNDLE_SUBSYSTEM`] subsystem and collects the
     /// streamed tar+zstd archive, up to `max_bytes`.
@@ -1169,6 +1315,91 @@ const DAEMON_ERROR_MAX: usize = 64 * 1024;
 /// usable truncated bundle into a total loss.
 const TRUNCATED_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
+/// Why [`Client::open_box_file`] could not open a file in a box.
+#[derive(Debug)]
+pub enum BoxFileError {
+    /// The box host did not serve the box's files: the box is gone, or the
+    /// connection or the sftp conversation failed. The error carries the
+    /// detail, for the log.
+    Unavailable(anyhow::Error),
+    /// The box has no file at the path.
+    NotFound,
+    /// The box does not let the file be read.
+    PermissionDenied,
+    /// The box's file server refused the open for another reason. The
+    /// error carries the detail, for the log.
+    Refused(anyhow::Error),
+}
+
+impl std::fmt::Display for BoxFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(e) => write!(f, "the box's files were not served: {e:#}"),
+            Self::NotFound => f.write_str("no such file"),
+            Self::PermissionDenied => f.write_str("permission denied"),
+            Self::Refused(e) => write!(f, "the open was refused: {e:#}"),
+        }
+    }
+}
+
+impl std::error::Error for BoxFileError {}
+
+/// The reply of a subsystem channel, read one line at a time. See
+/// [`Client::stream_box_subsystem`].
+pub struct SubsystemLines {
+    channel: russh::Channel<russh::client::Msg>,
+    buf: Vec<u8>,
+    daemon_error: Vec<u8>,
+    closed: bool,
+}
+
+impl SubsystemLines {
+    /// The next line of the reply, without its newline, or `None` when the
+    /// daemon ended the stream. A last line with no newline is still a
+    /// line.
+    ///
+    /// # Errors
+    ///
+    /// The daemon's message on extended data when the stream ends with
+    /// one, such as the refusal of a request before its first line, and a
+    /// line that is not UTF-8.
+    pub async fn next_line(&mut self) -> Result<Option<String>, anyhow::Error> {
+        loop {
+            if let Some(end) = self.buf.iter().position(|b| *b == b'\n') {
+                let mut line: Vec<u8> = self.buf.drain(..=end).collect();
+                line.pop();
+                return String::from_utf8(line)
+                    .map(Some)
+                    .context("the daemon sent a line that is not UTF-8");
+            }
+            if self.closed {
+                if !self.buf.is_empty() {
+                    let line = std::mem::take(&mut self.buf);
+                    return String::from_utf8(line)
+                        .map(Some)
+                        .context("the daemon sent a line that is not UTF-8");
+                }
+                if !self.daemon_error.is_empty() {
+                    let message = String::from_utf8_lossy(&self.daemon_error)
+                        .trim()
+                        .to_owned();
+                    self.daemon_error.clear();
+                    anyhow::bail!("{message}");
+                }
+                return Ok(None);
+            }
+            match self.channel.wait().await {
+                Some(russh::ChannelMsg::Data { data }) => self.buf.extend_from_slice(&data),
+                Some(russh::ChannelMsg::ExtendedData { data, ext: 1 }) => {
+                    append_daemon_error(&mut self.daemon_error, &data);
+                }
+                Some(russh::ChannelMsg::Close) | None => self.closed = true,
+                Some(_) => {}
+            }
+        }
+    }
+}
+
 /// Appends `data` to the daemon's error message, bounded: a daemon streaming
 /// only extended data must not balloon the CLI past the bound the archive
 /// itself respects.
@@ -1181,6 +1412,26 @@ fn append_daemon_error(buf: &mut Vec<u8>, data: &[u8]) {
 /// for any oneshot response the daemon actually sends, bounded so a
 /// pathological body can't become the whole error message.
 const DECODE_EXCERPT_MAX: usize = 1024;
+
+/// Whether an RPC response body is a refusal: an `Errorable::Err` (an object
+/// whose only field is a string `error`), or a
+/// [`BoxStep::Fault`](boxes::wire::request::BoxStep::Fault), the
+/// `SubmitVerdict` reply for an unknown session, a wrong state or a failed
+/// resume. `Errorable` is untagged, so the body's shape is the only mark of
+/// a refusal a generic caller can read.
+fn daemon_refused(body: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Refusal {
+        #[expect(dead_code, reason = "only the shape is checked")]
+        error: String,
+    }
+    serde_json_lenient::from_slice::<Refusal>(body).is_ok()
+        || matches!(
+            serde_json_lenient::from_slice::<boxes::wire::request::BoxStep>(body),
+            Ok(boxes::wire::request::BoxStep::Fault { .. })
+        )
+}
 
 /// Context for a response that wouldn't decode, quoting the daemon's reply
 /// verbatim.
@@ -1324,18 +1575,18 @@ pub async fn ensure_version_match(client: &mut Client) -> Result<(), anyhow::Err
     ensure_version_reported(Some(&daemon.version))
 }
 
-/// The provider kind the CLI should talk to, given `--provider`.
+/// The host kind the CLI should talk to, given `--provider`.
 ///
-/// The native minimald and minvmd backends now occupy distinct provider dirs,
+/// The native minimald and minvmd backends now occupy distinct host dirs,
 /// so connecting — not just spawning — must pick the right one. macOS is always
 /// minvmd-backed regardless of the flag; keying on the compile target keeps the
 /// in-guest CLI (Linux, native) and the host CLI (macOS, minvmd) each pointed at
 /// the dir their local daemon actually uses.
-pub fn client_provider_kind(use_minvmd: bool) -> paths::ProviderKind {
+pub fn client_host_kind(use_minvmd: bool) -> paths::HostKind {
     if use_minvmd || cfg!(target_os = "macos") {
-        paths::ProviderKind::Minvmd
+        paths::HostKind::Minvmd
     } else {
-        paths::ProviderKind::Minimald
+        paths::HostKind::Minimald
     }
 }
 
@@ -1357,34 +1608,34 @@ fn resolve_state_base(
 }
 
 /// Adopt any pre-split `providers/local-<N>` dirs into the kind-tagged scheme
-/// before the CLI resolves a provider dir, so an upgraded client finds an
+/// before the CLI resolves a host dir, so an upgraded client finds an
 /// existing instance instead of missing it. Best-effort: a bad `--minimal-dir`
 /// is left for the resolve/connect path to report.
-pub fn migrate_legacy_provider_dirs(minimal_dir_override: Option<&std::path::Path>) {
+pub fn migrate_legacy_host_dirs(minimal_dir_override: Option<&std::path::Path>) {
     if let Ok(base) = resolve_state_base(minimal_dir_override) {
-        paths::migrate_legacy_provider_dirs(&base);
+        paths::migrate_legacy_host_dirs(&base);
     }
 }
 
-/// Resolve the provider-instance dir (`<state dir>/providers/local-<kind>0`) the
+/// Resolve the host dir (`<state dir>/providers/local-<kind>0`) the
 /// daemon and CLI agree on: `--minimal-dir` when set, else the default minimal
-/// state dir. `use_minvmd` selects the backend's dir (see [`client_provider_kind`]).
+/// state dir. `use_minvmd` selects the backend's dir (see [`client_host_kind`]).
 ///
 /// This is the default VM ([`paths::DEFAULT_VM_NAME`]); [`vm_name()`] selects the
 /// process's VM, so call [`set_vm_name`] first to talk to a named VM.
-pub fn resolve_provider_dir(
+pub fn resolve_host_dir(
     minimal_dir_override: Option<&std::path::Path>,
     use_minvmd: bool,
 ) -> std::io::Result<std::path::PathBuf> {
-    resolve_provider_dir_named(minimal_dir_override, use_minvmd, vm_name())
+    resolve_host_dir_named(minimal_dir_override, use_minvmd, vm_name())
 }
 
-/// [`resolve_provider_dir`] for an explicit VM. A named VM nests under its own
-/// subdirectory of the provider dir (NET-052/NET-054):
+/// [`resolve_host_dir`] for an explicit VM. A named VM nests under its own
+/// subdirectory of the host dir (NET-052/NET-054):
 /// `<state dir>/providers/local-minvmd0/<name>`; the default VM keeps the
-/// provider dir itself (NET-053). The native `minimald` backend hosts no VMs,
+/// host dir itself (NET-053). The native `minimald` backend hosts no VMs,
 /// so a named VM is an error there rather than a silent fall-back to the base
-/// provider dir — a `--vm` that resolves to the default daemon's directory
+/// host dir — a `--vm` that resolves to the default daemon's directory
 /// would mean a different VM than the one asked for.
 ///
 /// # Errors
@@ -1393,33 +1644,33 @@ pub fn resolve_provider_dir(
 /// the naming rule, with a "named VMs need the minvmd provider" message when
 /// the backend is native `minimald`, or when `minimal_dir_override` is not
 /// usable.
-pub fn resolve_provider_dir_named(
+pub fn resolve_host_dir_named(
     minimal_dir_override: Option<&std::path::Path>,
     use_minvmd: bool,
     vm: &str,
 ) -> std::io::Result<std::path::PathBuf> {
     let base = resolve_state_base(minimal_dir_override)?;
-    let kind = client_provider_kind(use_minvmd);
-    if kind != paths::ProviderKind::Minvmd && vm != paths::DEFAULT_VM_NAME {
+    let kind = client_host_kind(use_minvmd);
+    if kind != paths::HostKind::Minvmd && vm != paths::DEFAULT_VM_NAME {
         return Err(std::io::Error::other(
             "named VMs need the minvmd provider (`--provider local-minvmd`); \
              the native local-minimald backend hosts no VMs",
         ));
     }
-    let dir = if kind == paths::ProviderKind::Minvmd {
-        paths::provider_instance_dir_named(&base, kind, 0, vm).map_err(std::io::Error::other)?
+    let dir = if kind == paths::HostKind::Minvmd {
+        paths::host_dir_named(&base, kind, 0, vm).map_err(std::io::Error::other)?
     } else {
-        paths::provider_instance_dir(&base, kind, 0)
+        paths::host_dir(&base, kind, 0)
     };
     Ok(dir.as_utf8_path().as_std_path().to_path_buf())
 }
 
-/// Resolve the daemon socket path: `<provider dir>/ssh.sock`. Each backend
-/// serves this endpoint under its own provider dir, so `use_minvmd` must select
+/// Resolve the daemon socket path: `<host dir>/ssh.sock`. Each backend
+/// serves this endpoint under its own host dir, so `use_minvmd` must select
 /// the same backend the daemon was spawned as.
 ///
 /// This is the default VM's socket; a named VM serves its own (see
-/// [`resolve_provider_dir_named`]).
+/// [`resolve_host_dir_named`]).
 pub fn resolve_socket_path(
     minimal_dir_override: Option<&std::path::Path>,
     use_minvmd: bool,
@@ -1427,20 +1678,17 @@ pub fn resolve_socket_path(
     resolve_socket_path_named(minimal_dir_override, use_minvmd, vm_name())
 }
 
-/// [`resolve_socket_path`] for an explicit VM: `<named provider dir>/ssh.sock`.
+/// [`resolve_socket_path`] for an explicit VM: `<named host dir>/ssh.sock`.
 ///
 /// # Errors
 ///
-/// As [`resolve_provider_dir_named`].
+/// As [`resolve_host_dir_named`].
 pub fn resolve_socket_path_named(
     minimal_dir_override: Option<&std::path::Path>,
     use_minvmd: bool,
     vm: &str,
 ) -> std::io::Result<std::path::PathBuf> {
-    Ok(
-        resolve_provider_dir_named(minimal_dir_override, use_minvmd, vm)?
-            .join(paths::SSH_SOCK_FILE),
-    )
+    Ok(resolve_host_dir_named(minimal_dir_override, use_minvmd, vm)?.join(paths::SSH_SOCK_FILE))
 }
 
 /// One VM's daemon socket with the name that selects it: the pair a client
@@ -1456,7 +1704,7 @@ pub struct VmSocket {
 }
 
 /// Enumerate every VM's socket on this host, default VM first: the default
-/// VM's provider dir plus one entry per named VM that has a state dir
+/// VM's host dir plus one entry per named VM that has a state dir
 /// (NET-052's layout). A VM that is not running is still enumerated — its
 /// daemon simply is not answering, which each caller reports its own way —
 /// so the set is the host's, not the running half of it.
@@ -1465,13 +1713,13 @@ pub struct VmSocket {
 /// callers fall back to [`resolve_socket_path`], the one socket that backend
 /// serves (and the path that refuses a named `--vm` there, as it must).
 /// Directories whose name breaks the naming rule are skipped rather than
-/// reported: the provider dir also holds non-VM trappings — `ssh.sock`, the
+/// reported: the host dir also holds non-VM trappings — `ssh.sock`, the
 /// reserved `guest/` payload dir — and a stray must not fail a listing.
 ///
 /// # Errors
 ///
 /// [`std::io::Error`] when `minimal_dir_override` is not usable or the
-/// provider dir cannot be read. A provider dir that does not exist yet
+/// host dir cannot be read. A host dir that does not exist yet
 /// (no VM created, ever) is not an error: the default VM is still reported,
 /// with a socket nothing serves yet.
 pub fn enumerate_vm_sockets(
@@ -1479,12 +1727,12 @@ pub fn enumerate_vm_sockets(
     use_minvmd: bool,
 ) -> std::io::Result<Vec<VmSocket>> {
     let base = resolve_state_base(minimal_dir_override)?;
-    let kind = client_provider_kind(use_minvmd);
-    if kind != paths::ProviderKind::Minvmd {
+    let kind = client_host_kind(use_minvmd);
+    if kind != paths::HostKind::Minvmd {
         return Ok(Vec::new());
     }
-    let provider = paths::provider_instance_dir(&base, kind, 0);
-    let dir = provider.as_utf8_path().as_std_path();
+    let host_dir = paths::host_dir(&base, kind, 0);
+    let dir = host_dir.as_utf8_path().as_std_path();
     let mut vms = vec![VmSocket {
         vm: paths::DEFAULT_VM_NAME.to_string(),
         sock: dir.join(paths::SSH_SOCK_FILE),
@@ -1495,7 +1743,7 @@ pub fn enumerate_vm_sockets(
     let mut named: Vec<String> = Vec::new();
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        // No provider dir yet: no VM has ever been created on this host.
+        // No host dir yet: no VM has ever been created on this host.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vms),
         Err(e) => return Err(e),
     };
@@ -1509,7 +1757,7 @@ pub fn enumerate_vm_sockets(
             continue;
         };
         // `default` is the unnamed VM, already first; a name that breaks the
-        // rule is not a VM (see the provider dir's other trappings).
+        // rule is not a VM (see the host dir's other trappings).
         if name != paths::DEFAULT_VM_NAME && paths::validate_vm_name(name).is_ok() {
             named.push(name.to_string());
         }
@@ -1635,8 +1883,48 @@ pub async fn fill_git_info(entries: &mut [minimald_rpc::ListSessionsEntry]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Client, resolve_provider_dir, resolve_socket_path};
+    use super::{Client, resolve_host_dir, resolve_socket_path};
     use std::path::Path;
+
+    /// An `Errorable::Err` body is a refusal, which marks the RPC's span
+    /// failed; a successful response, one with an `error` field among
+    /// others, or one whose `error` is not a string is not.
+    #[test]
+    fn an_errorable_err_body_is_a_refusal() {
+        use minimald_rpc::Errorable;
+        let err: Errorable<String> = Errorable::Err {
+            error: "the daemon is shutting down".to_owned(),
+        };
+        assert!(super::daemon_refused(
+            &serde_json_lenient::to_vec(&err).unwrap()
+        ));
+        assert!(!super::daemon_refused(
+            br#"{"version":"v","long_version":"v","stdlib_version":"s"}"#
+        ));
+        assert!(!super::daemon_refused(br#"{"error":"x","id":1}"#));
+        assert!(!super::daemon_refused(br#"{"error":null}"#));
+        assert!(!super::daemon_refused(b"null"));
+    }
+
+    /// A `SubmitVerdict` fault is a refusal too, though it decodes as
+    /// `Errorable::Ok`; a materialized step is not.
+    #[test]
+    fn a_submit_verdict_fault_is_a_refusal() {
+        use boxes::wire::{errors::WireError, request::BoxStep};
+        use minimald_rpc::Errorable;
+        let fault: Errorable<BoxStep> = Errorable::Ok(BoxStep::Fault {
+            error: WireError::UnknownSessionId,
+        });
+        assert!(super::daemon_refused(
+            &serde_json_lenient::to_vec(&fault).unwrap()
+        ));
+        let done: Errorable<BoxStep> = Errorable::Ok(BoxStep::Materialized {
+            id: boxes::SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+        });
+        assert!(!super::daemon_refused(
+            &serde_json_lenient::to_vec(&done).unwrap()
+        ));
+    }
 
     /// The daemon-error accumulator is bounded: a daemon that sprays extended
     /// data on stream 1 (during a diagnostic download or a workspace upload)
@@ -1708,12 +1996,12 @@ mod tests {
         );
     }
 
-    /// A named VM must resolve to its own provider dir and socket under a
+    /// A named VM must resolve to its own host dir and socket under a
     /// per-name subdirectory (NET-052/NET-054).
     #[test]
     fn named_vm_gets_its_own_dir_and_socket() {
         let dir =
-            super::resolve_provider_dir_named(Some(Path::new("/tmp/minimal-test")), true, "alpha")
+            super::resolve_host_dir_named(Some(Path::new("/tmp/minimal-test")), true, "alpha")
                 .unwrap();
         assert_eq!(
             dir,
@@ -1735,7 +2023,7 @@ mod tests {
     fn default_vm_paths_are_unchanged() {
         let base = Path::new("/tmp/minimal-test/providers/local-minvmd0");
         for name in [None, Some("default")] {
-            let dir = super::resolve_provider_dir_named(
+            let dir = super::resolve_host_dir_named(
                 Some(Path::new("/tmp/minimal-test")),
                 true,
                 name.unwrap_or("default"),
@@ -1753,18 +2041,18 @@ mod tests {
     }
 
     /// The native `minimald` backend hosts no VMs, so a named VM must be
-    /// refused there rather than silently resolved to the base provider dir:
+    /// refused there rather than silently resolved to the base host dir:
     /// `min --vm alpha` against the native backend would otherwise talk to
     /// the default daemon while claiming to talk to alpha. The default VM
     /// still resolves — it is the only VM that backend has.
     ///
-    /// Linux-only: `client_provider_kind` forces Minvmd on macOS, so a
+    /// Linux-only: `client_host_kind` forces Minvmd on macOS, so a
     /// `false` there is not the native backend.
     #[cfg(target_os = "linux")]
     #[test]
     fn native_backend_refuses_a_named_vm() {
         let err =
-            super::resolve_provider_dir_named(Some(Path::new("/tmp/minimal-test")), false, "alpha")
+            super::resolve_host_dir_named(Some(Path::new("/tmp/minimal-test")), false, "alpha")
                 .expect_err("a named VM on the native backend must be refused");
         assert!(
             err.to_string()
@@ -1773,7 +2061,7 @@ mod tests {
         );
 
         assert_eq!(
-            super::resolve_provider_dir_named(
+            super::resolve_host_dir_named(
                 Some(Path::new("/tmp/minimal-test")),
                 false,
                 paths::DEFAULT_VM_NAME,
@@ -1784,7 +2072,7 @@ mod tests {
     }
 
     /// A VM name outside the allowlist must be refused, not resolved to a
-    /// directory outside the provider dir; the refusal states the rule.
+    /// directory outside the host dir; the refusal states the rule.
     #[test]
     fn vm_name_must_fit_the_allowlist() {
         for name in [
@@ -1799,7 +2087,7 @@ mod tests {
             "guest",
         ] {
             let err =
-                super::resolve_provider_dir_named(Some(Path::new("/tmp/minimal-test")), true, name)
+                super::resolve_host_dir_named(Some(Path::new("/tmp/minimal-test")), true, name)
                     .unwrap_err();
             assert!(
                 err.to_string().contains("invalid VM name"),
@@ -1822,7 +2110,7 @@ mod tests {
             // The child, whose process-global starts unset: the assertion.
             super::set_vm_name("alpha").unwrap();
             assert_eq!(super::vm_name(), "alpha");
-            let dir = resolve_provider_dir(Some(Path::new("/tmp/minimal-test")), true).unwrap();
+            let dir = resolve_host_dir(Some(Path::new("/tmp/minimal-test")), true).unwrap();
             assert_eq!(
                 dir,
                 Path::new("/tmp/minimal-test/providers/local-minvmd0/alpha")
@@ -2013,20 +2301,20 @@ mod tests {
 
     /// Enumerating the host's VMs covers the default VM plus every named one
     /// with a state dir — default first, the rest alphabetical — and skips the
-    /// trappings a provider dir also holds (NET-057 lists across every entry
+    /// trappings a host dir also holds (NET-057 lists across every entry
     /// this returns; NET-058's resolution probes them).
     #[test]
     fn enumerates_the_default_vm_then_every_named_one() {
         let base = tempfile::tempdir().unwrap();
-        let provider = base.path().join("providers").join("local-minvmd0");
+        let host_dir = base.path().join("providers").join("local-minvmd0");
         for vm in ["beta", "alpha"] {
-            std::fs::create_dir_all(provider.join(vm)).unwrap();
+            std::fs::create_dir_all(host_dir.join(vm)).unwrap();
         }
-        // The provider dir's own trappings: a socket file and a reserved,
+        // The host dir's own trappings: a socket file and a reserved,
         // non-VM directory. Neither is a VM, and neither must fail the
         // enumeration.
-        std::fs::write(provider.join("ssh.sock"), b"").unwrap();
-        std::fs::create_dir_all(provider.join("guest")).unwrap();
+        std::fs::write(host_dir.join("ssh.sock"), b"").unwrap();
+        std::fs::create_dir_all(host_dir.join("guest")).unwrap();
 
         let vms = super::enumerate_vm_sockets(Some(base.path()), true).unwrap();
         assert_eq!(
@@ -2034,25 +2322,25 @@ mod tests {
             vec![
                 super::VmSocket {
                     vm: "default".to_string(),
-                    sock: provider.join("ssh.sock"),
+                    sock: host_dir.join("ssh.sock"),
                 },
                 super::VmSocket {
                     vm: "alpha".to_string(),
-                    sock: provider.join("alpha").join("ssh.sock"),
+                    sock: host_dir.join("alpha").join("ssh.sock"),
                 },
                 super::VmSocket {
                     vm: "beta".to_string(),
-                    sock: provider.join("beta").join("ssh.sock"),
+                    sock: host_dir.join("beta").join("ssh.sock"),
                 },
             ]
         );
     }
 
-    /// A host with no provider dir yet still enumerates the default VM: a
+    /// A host with no host dir yet still enumerates the default VM: a
     /// socket nothing serves yet is a valid probe, not an error — the host's
     /// set is enumerated, not the running half of it.
     #[test]
-    fn a_host_with_no_provider_dir_still_lists_the_default_vm() {
+    fn a_host_with_no_host_dir_still_lists_the_default_vm() {
         let base = tempfile::tempdir().unwrap();
         let vms = super::enumerate_vm_sockets(Some(base.path()), true).unwrap();
         assert_eq!(
@@ -2070,7 +2358,7 @@ mod tests {
 
     /// The native `minimald` backend hosts no VMs, so it enumerates nothing:
     /// callers fall back to the one socket that backend serves. (Linux-only,
-    /// as [`super::native_backend_refuses_a_named_vm`]: `client_provider_kind`
+    /// as [`super::native_backend_refuses_a_named_vm`]: `client_host_kind`
     /// forces the minvmd kind on macOS, so a `false` there is not the native
     /// backend.)
     #[cfg(target_os = "linux")]
@@ -2374,6 +2662,410 @@ mod opt_out_tests {
                 super::trace_context().traceparent()
             )
         );
+        server.abort();
+    }
+}
+
+#[cfg(test)]
+mod subsystem_tests {
+    use std::sync::{Arc, Mutex};
+
+    /// A stand-in daemon for a box's subsystem: it records the env and the
+    /// request each channel carries, and answers once the request is
+    /// half-closed. `split` is refused, `refuse` answers with only an
+    /// extended-data message, and any other subsystem echoes the request,
+    /// then a reply split across frames in the middle of a line.
+    #[derive(Clone, Default)]
+    struct LineServer {
+        env: Arc<Mutex<Vec<(String, String)>>>,
+        request: Arc<Mutex<Vec<u8>>>,
+        subsystem: Arc<Mutex<String>>,
+    }
+
+    impl russh::server::Handler for LineServer {
+        type Error = russh::Error;
+
+        async fn auth_none(&mut self, _: &str) -> Result<russh::server::Auth, Self::Error> {
+            Ok(russh::server::Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            _: russh::Channel<russh::server::Msg>,
+            reply: russh::server::ChannelOpenHandle,
+            _: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            Ok(())
+        }
+
+        async fn env_request(
+            &mut self,
+            id: russh::ChannelId,
+            name: &str,
+            value: &str,
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            self.env
+                .lock()
+                .unwrap()
+                .push((name.to_owned(), value.to_owned()));
+            session.channel_success(id)?;
+            Ok(())
+        }
+
+        async fn subsystem_request(
+            &mut self,
+            id: russh::ChannelId,
+            name: &str,
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            name.clone_into(&mut self.subsystem.lock().unwrap());
+            if name == "split" {
+                session.channel_failure(id)?;
+            } else {
+                session.channel_success(id)?;
+            }
+            Ok(())
+        }
+
+        async fn data(
+            &mut self,
+            _: russh::ChannelId,
+            data: &[u8],
+            _: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            self.request.lock().unwrap().extend_from_slice(data);
+            Ok(())
+        }
+
+        async fn channel_eof(
+            &mut self,
+            id: russh::ChannelId,
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            if self.subsystem.lock().unwrap().as_str() == "refuse" {
+                session.extended_data(id, 1, "no box has this id\n".as_bytes().to_vec())?;
+            } else {
+                let mut echo = self.request.lock().unwrap().clone();
+                echo.push(b'\n');
+                session.data(id, echo)?;
+                session.data(id, b"first li".to_vec())?;
+                session.data(id, b"ne\nsecond line\nlast".to_vec())?;
+                session.eof(id)?;
+            }
+            session.close(id)?;
+            Ok(())
+        }
+    }
+
+    async fn serve(dir: &std::path::Path, server: LineServer) -> std::path::PathBuf {
+        let key = russh::keys::PrivateKey::random(
+            &mut russh::keys::key::safe_rng(),
+            russh::keys::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let config = Arc::new(russh::server::Config {
+            keys: vec![key],
+            auth_rejection_time_initial: Some(std::time::Duration::ZERO),
+            ..Default::default()
+        });
+        let sock = dir.join("ssh.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (config, server) = (config.clone(), server.clone());
+                tokio::spawn(async move {
+                    if let Ok(session) = russh::server::run_stream(config, stream, server).await {
+                        drop(session.await);
+                    }
+                });
+            }
+        });
+        sock
+    }
+
+    /// The box's subsystem channel carries `MINIMAL_SESSION_ID`, sends the
+    /// request whole, and gives back each line of the reply once, however
+    /// the daemon split it into frames, then `None`. A refusal of the
+    /// subsystem, and a stream that ends with only the daemon's message,
+    /// are errors that say so.
+    #[tokio::test]
+    async fn session_subsystem_channel_streams_reply_lines() {
+        let dir = tempfile::Builder::new()
+            .prefix("mcsl")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let server = LineServer::default();
+        let sock = serve(dir.path(), server.clone()).await;
+        let mut client = super::Client::connect(&sock).await.unwrap();
+        let id = boxes::SessionId::parse_str("019f8ab5-27ba-7260-a03c-3914b9595a1a").unwrap();
+
+        let mut lines = client
+            .stream_box_subsystem(id, "lines", br#"{"follow":true}"#)
+            .await
+            .unwrap();
+        let mut read = Vec::new();
+        while let Some(line) = lines.next_line().await.unwrap() {
+            read.push(line);
+        }
+        assert_eq!(
+            read,
+            [r#"{"follow":true}"#, "first line", "second line", "last"]
+        );
+        assert!(
+            server
+                .env
+                .lock()
+                .unwrap()
+                .contains(&("MINIMAL_SESSION_ID".to_owned(), id.to_string())),
+            "the channel names the box"
+        );
+        assert_eq!(server.subsystem.lock().unwrap().as_str(), "lines");
+
+        let refused = client.stream_box_subsystem(id, "split", b"{}").await;
+        let err = refused.err().expect("a refused subsystem is an error");
+        assert!(
+            format!("{err:#}").contains("refused the split subsystem"),
+            "{err:#}"
+        );
+
+        let mut lines = client
+            .stream_box_subsystem(id, "refuse", b"{}")
+            .await
+            .unwrap();
+        let err = lines.next_line().await.expect_err("the daemon's message");
+        assert_eq!(err.to_string(), "no box has this id");
+    }
+}
+
+#[cfg(test)]
+mod rpc_status_tests {
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    /// What the stand-in daemon does once the client has sent its request.
+    #[derive(Clone)]
+    enum Reply {
+        /// Answer with this body and close the channel.
+        Body(Vec<u8>),
+        /// Never answer.
+        Hang,
+    }
+
+    /// A stand-in daemon that accepts everything and answers every RPC with
+    /// the reply the test set last.
+    #[derive(Clone)]
+    struct Replier(Arc<Mutex<Reply>>);
+
+    impl russh::server::Handler for Replier {
+        type Error = russh::Error;
+
+        async fn auth_none(&mut self, _: &str) -> Result<russh::server::Auth, Self::Error> {
+            Ok(russh::server::Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            _: russh::Channel<russh::server::Msg>,
+            reply: russh::server::ChannelOpenHandle,
+            _: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            Ok(())
+        }
+
+        async fn subsystem_request(
+            &mut self,
+            id: russh::ChannelId,
+            _: &str,
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            session.channel_success(id)?;
+            Ok(())
+        }
+
+        async fn channel_eof(
+            &mut self,
+            id: russh::ChannelId,
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            let reply = self.0.lock().unwrap().clone();
+            if let Reply::Body(body) = reply {
+                session.data(id, body)?;
+                session.eof(id)?;
+                session.close(id)?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Records each `client.rpc` span's `otel.status_code`, if it gets one,
+    /// in the order the spans are created.
+    #[derive(Clone, Default)]
+    struct Statuses(Arc<Mutex<StatusLog>>);
+
+    #[derive(Default)]
+    struct StatusLog {
+        statuses: Vec<Option<String>>,
+        /// The index in `statuses` of each open `client.rpc` span, by id.
+        by_id: std::collections::HashMap<u64, usize>,
+    }
+
+    struct StatusField(Option<String>);
+
+    impl tracing::field::Visit for StatusField {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "otel.status_code" {
+                self.0 = Some(value.to_owned());
+            }
+        }
+
+        fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Statuses {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attrs.metadata().name() == "client.rpc" {
+                let mut log = self.0.lock().unwrap();
+                let at = log.statuses.len();
+                log.statuses.push(None);
+                log.by_id.insert(id.into_u64(), at);
+            }
+        }
+
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut field = StatusField(None);
+            values.record(&mut field);
+            let mut log = self.0.lock().unwrap();
+            if let (Some(status), Some(&at)) = (field.0, log.by_id.get(&id.into_u64())) {
+                log.statuses[at] = Some(status);
+            }
+        }
+    }
+
+    /// A `client.rpc` span carries the ERROR status when the daemon refuses
+    /// the call (`Errorable::Err` or a `SubmitVerdict` fault), when the
+    /// reply does not decode, and when the call times out; a successful
+    /// reply leaves it unset.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refused_failed_or_timed_out_rpc_marks_its_span() {
+        use boxes::wire::{errors::WireError, request::BoxStep};
+        use minimald_rpc::{Errorable, SubmitVerdict};
+
+        let key = russh::keys::PrivateKey::random(
+            &mut russh::keys::key::safe_rng(),
+            russh::keys::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let config = Arc::new(russh::server::Config {
+            keys: vec![key],
+            auth_rejection_time_initial: Some(std::time::Duration::ZERO),
+            ..Default::default()
+        });
+        let dir = tempfile::Builder::new()
+            .prefix("mcrs")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let sock = dir.path().join("ssh.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let reply = Arc::new(Mutex::new(Reply::Hang));
+        let server = {
+            let (config, replier) = (config.clone(), Replier(reply.clone()));
+            tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let (config, replier) = (config.clone(), replier.clone());
+                    tokio::spawn(async move {
+                        if let Ok(session) =
+                            russh::server::run_stream(config, stream, replier).await
+                        {
+                            drop(session.await);
+                        }
+                    });
+                }
+            })
+        };
+
+        let statuses = Statuses::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(statuses.clone()));
+        let session_id =
+            boxes::SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let verdict = || boxes::wire::request::ContributionVerdict {
+            session_id,
+            vars: Vec::new(),
+            patches: Vec::new(),
+            lifecycle_hooks: Vec::new(),
+        };
+        let body = |r: &Errorable<BoxStep>| serde_json_lenient::to_vec(r).unwrap();
+        let mut client = super::Client::connect(&sock).await.unwrap();
+        let within = std::time::Duration::from_secs(10);
+
+        *reply.lock().unwrap() = Reply::Body(body(&Errorable::Ok(BoxStep::Materialized {
+            id: session_id,
+        })));
+        let ok = client
+            .oneshot_rpc_with_deadline::<SubmitVerdict>(verdict(), within)
+            .await;
+        assert!(
+            matches!(ok, Ok(Errorable::Ok(BoxStep::Materialized { .. }))),
+            "{ok:?}"
+        );
+
+        *reply.lock().unwrap() = Reply::Body(body(&Errorable::Err {
+            error: "the daemon is shutting down".to_owned(),
+        }));
+        let refused = client
+            .oneshot_rpc_with_deadline::<SubmitVerdict>(verdict(), within)
+            .await;
+        assert!(matches!(refused, Ok(Errorable::Err { .. })), "{refused:?}");
+
+        *reply.lock().unwrap() = Reply::Body(body(&Errorable::Ok(BoxStep::Fault {
+            error: WireError::UnknownSessionId,
+        })));
+        let fault = client
+            .oneshot_rpc_with_deadline::<SubmitVerdict>(verdict(), within)
+            .await;
+        assert!(
+            matches!(fault, Ok(Errorable::Ok(BoxStep::Fault { .. }))),
+            "{fault:?}"
+        );
+
+        *reply.lock().unwrap() = Reply::Body(b"not json".to_vec());
+        let undecodable = client
+            .oneshot_rpc_with_deadline::<SubmitVerdict>(verdict(), within)
+            .await;
+        assert!(undecodable.is_err());
+
+        *reply.lock().unwrap() = Reply::Hang;
+        let timed_out = client
+            .oneshot_rpc_with_deadline::<SubmitVerdict>(
+                verdict(),
+                std::time::Duration::from_millis(200),
+            )
+            .await;
+        let err = timed_out.expect_err("a call nobody answers times out");
+        assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+
+        let error = Some("ERROR".to_owned());
+        assert_eq!(
+            statuses.0.lock().unwrap().statuses,
+            [None, error.clone(), error.clone(), error.clone(), error]
+        );
+        drop(client);
         server.abort();
     }
 }

@@ -7,6 +7,13 @@
 //! So the proxy reads the item without a prompt, and every other application,
 //! `security` included, prompts (BEP-051).
 //!
+//! The proxy program creates each item itself, through `bep store-add`. A
+//! login-keychain item also carries a partition, which comes from the program
+//! that created it, and a reader must pass the partition as well as the
+//! application list. An item that `/usr/bin/security` creates is in the
+//! `apple-tool:` partition, so the proxy gets `errSecAuthFailed` although the
+//! list names it.
+//!
 //! Other hosts have no native store yet: the Linux default waits on the store
 //! roster. [`HostStore`] there refuses every operation, and says so.
 //!
@@ -22,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use zeroize::{Zeroize as _, Zeroizing};
+use zeroize::Zeroizing;
 
 /// The keychain service of every item `min secret` stores.
 pub const SERVICE: &str = "dev.minimal.secret";
@@ -303,11 +310,6 @@ pub enum StoreError {
         "This host has no secret store that `min secret` can use. `min secret` stores secrets only in the macOS Keychain."
     )]
     Unsupported,
-    /// The proxy path cannot go in the item's access control.
-    #[error(
-        "The proxy path {0} contains a quote, a backslash or a line break, so the keychain cannot name it."
-    )]
-    ProxyPath(PathBuf),
     /// A user other than the current one or root can change the proxy
     /// program, so the item's access control cannot trust it.
     #[error(
@@ -534,59 +536,65 @@ impl ValueReader for MemoryReader {
     }
 }
 
-/// The line that `security -i` reads to store `value` under `id` with
-/// `proxy` as the one trusted application.
+/// The `bep` subcommand that stores one item, with the value on its
+/// standard input.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const ADD_COMMAND: &str = "store-add";
+
+/// The arguments that make the proxy program store `id` under `service`.
 ///
-/// The value goes in hexadecimal (`-X`), so no character of it needs
-/// quoting, and it goes on the tool's standard input, never on a command
-/// line. `-T` names the proxy. Without `-A`, every other application
-/// prompts. The line has no `-U`: an update in place keeps the access
-/// control of the item held under `id`, so the caller removes that item
-/// first. The caller zeroizes the line.
+/// The value is not among them, so it never reaches a command line.
 ///
 /// # Errors
 ///
-/// When `proxy` holds a character that the line cannot quote.
-pub fn keychain_add_line(id: &str, value: &[u8], proxy: &Path) -> Result<String, StoreError> {
-    add_line(SERVICE, id, value, proxy)
-}
-
-/// [`keychain_add_line`] under `service`.
-fn add_line(service: &str, id: &str, value: &[u8], proxy: &Path) -> Result<String, StoreError> {
-    // `security -i` splits the line on spaces and quotes, so an `id` that
-    // `valid_id` refuses can add options such as `-A`.
+/// When `id` is not one that [`valid_id`] admits.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn add_args<'a>(service: &str, id: &'a str) -> Result<Vec<&'a str>, StoreError> {
     if !valid_id(id) {
         return Err(StoreError::InvalidId(id.to_owned()));
     }
-    let proxy_text = proxy.to_string_lossy();
-    if proxy_text.contains(['"', '\\', '\n', '\r']) {
-        return Err(StoreError::ProxyPath(proxy.to_path_buf()));
+    let mut args = vec![ADD_COMMAND];
+    if service == STAGING_SERVICE {
+        args.push("--staging");
     }
-    let mut hex = String::with_capacity(value.len() * 2);
-    for b in value {
-        hex.push(char::from(HEX[usize::from(b >> 4)]));
-        hex.push(char::from(HEX[usize::from(b & 0x0f)]));
-    }
-    // `valid_id` admitted `id` above, so it needs no quoting.
-    let line = format!(
-        "add-generic-password -s {service} -a {id} -l \"Minimal secret {id}\" -T \"{proxy_text}\" -X {hex}\n"
-    );
-    hex.zeroize();
-    Ok(line)
+    args.push(id);
+    Ok(args)
 }
 
-const HEX: &[u8; 16] = b"0123456789abcdef";
+/// Add an item under `service` and `id` as the running program, which is
+/// the one way an item lands in the proxy's partition. The keychain names
+/// the creating program as the one trusted application, so every other
+/// application prompts. It refuses an item that is already held: an update
+/// in place keeps the access control of the old item, so the caller removes
+/// that item first.
+///
+/// # Errors
+///
+/// What the store said, when it refused the item.
+pub fn add_as_this_program(service: &str, id: &str, value: &[u8]) -> Result<(), String> {
+    if !valid_id(id) {
+        return Err(StoreError::InvalidId(id.to_owned()).to_string());
+    }
+    host::add_as_this_program(service, id, value)
+}
 
 /// The secret items in the output of `security dump-keychain -a`: each
-/// item under [`SERVICE`], by account, with whether an access-control entry
-/// that allows `decrypt` lists `proxy` among its applications.
+/// item under [`SERVICE`], by account, with whether the proxy can read it.
+/// It can when an access-control entry that allows `decrypt` lists `proxy`
+/// among its applications, and the item's partition list names `partition`,
+/// the proxy's own. With no `partition`, no item is readable.
 #[must_use]
-pub fn parse_dump(dump: &str, proxy: &Path) -> Vec<ItemInfo> {
-    parse_dump_service(dump, SERVICE, proxy)
+pub fn parse_dump(dump: &str, proxy: &Path, partition: Option<&str>) -> Vec<ItemInfo> {
+    parse_dump_service(dump, SERVICE, proxy, partition)
 }
 
 /// [`parse_dump`] for the items under `service`.
-fn parse_dump_service(dump: &str, service: &str, proxy: &Path) -> Vec<ItemInfo> {
+fn parse_dump_service(
+    dump: &str,
+    service: &str,
+    proxy: &Path,
+    partition: Option<&str>,
+) -> Vec<ItemInfo> {
     let proxy = proxy.to_string_lossy();
     // `dump-keychain -a` lists every keychain in the search list, so one
     // identifier can appear more than once. Review finding 4369647108: the
@@ -606,10 +614,9 @@ fn parse_dump_service(dump: &str, service: &str, proxy: &Path) -> Vec<ItemInfo> 
             continue;
         }
         let Some(id) = attr("acct") else { continue };
-        let proxy_access = record
-            .split("entry ")
-            .skip(1)
-            .any(|entry| entry_admits(entry, &proxy));
+        let mut entries = record.split("entry ").skip(1);
+        let proxy_access = entries.clone().any(|entry| entry_admits(entry, &proxy))
+            && partition.is_some_and(|name| entries.any(|entry| names_partition(entry, name)));
         items
             .entry(id)
             .and_modify(|access| *access &= proxy_access)
@@ -635,17 +642,60 @@ fn entry_admits(entry: &str, proxy: &str) -> bool {
             && !index.is_empty()
         {
             let path = rest.strip_suffix(" (OK)").unwrap_or(rest);
-            listed |= path == proxy;
+            listed |= path == proxy || is_bundle_of(path, proxy);
         }
     }
     decrypt && listed
 }
 
+/// Whether one access-control entry is the item's partition list and names
+/// `partition`. A program outside the list cannot read the item, whatever the
+/// application list says.
+fn names_partition(entry: &str, partition: &str) -> bool {
+    let mut lines = entry.lines().map(str::trim);
+    lines.clone().any(|line| {
+        line.strip_prefix("authorizations")
+            .is_some_and(|rest| rest.split_whitespace().any(|a| a == "partition_id"))
+    }) && lines.any(|line| {
+        line.strip_prefix("description:")
+            .is_some_and(|list| list.split(',').any(|name| name.trim() == partition))
+    })
+}
+
+/// The keychain partition of a program, from what `codesign -dvvv` prints:
+/// `teamid:<team>` for a team-signed program, else `cdhash:<hash>`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn signature_partition(display: &str) -> Option<String> {
+    let value = |key: &str| display.lines().find_map(|line| line.strip_prefix(key));
+    match value("TeamIdentifier=") {
+        Some(team) if team != "not set" => Some(format!("teamid:{team}")),
+        _ => value("CDHash=").map(|hash| format!("cdhash:{hash}")),
+    }
+}
+
+/// Whether `path` is the bundle whose main program is `proxy`.
+///
+/// The keychain records a bundle's main program as the bundle, with the
+/// bundle's requirement. It records any other program in the bundle under
+/// that program's own path, with that program's requirement. So an entry
+/// that names the bundle says nothing about another program inside it, and
+/// only `<name>.app/Contents/MacOS/<name>`, the form `bep.app` ships in,
+/// matches here. A bundle that names its main program differently reads as
+/// not listed, which refuses the item.
+fn is_bundle_of(path: &str, proxy: &str) -> bool {
+    let name = path.rsplit('/').next().and_then(|n| n.strip_suffix(".app"));
+    let program = proxy
+        .strip_prefix(path)
+        .and_then(|tail| tail.strip_prefix("/Contents/MacOS/"));
+    name.is_some() && name == program
+}
+
 /// The keychain operations that [`set_item`] puts in order.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 trait Keychain {
-    /// Add an item under `service` and `id` that names `proxy` as its one
-    /// trusted application. On success, what the tool printed as a warning.
+    /// Add an item under `service` and `id`, created by `proxy`, that names
+    /// `proxy` as its one trusted application. On success, what the program
+    /// printed as a warning.
     fn add(
         &self,
         service: &str,
@@ -728,9 +778,8 @@ fn add_checked(
     proxy: &Path,
 ) -> Result<(), StoreError> {
     let warnings = kc.add(service, id, value, proxy)?;
-    // `security -i` can exit 0 after a refused command, and it can warn on
-    // stderr after a write that succeeded. So the item itself, read back
-    // with its access control, decides the result.
+    // The program can warn on stderr after a write that succeeded. So the
+    // item itself, read back with its access control, decides the result.
     let mut detail = match kc.items(service, proxy) {
         Ok(items) if items.iter().any(|item| item.id == id && item.proxy_access) => {
             return Ok(());
@@ -804,29 +853,32 @@ impl ValueReader for HostStore {
 #[cfg(target_os = "macos")]
 mod host {
     use super::{
-        ItemInfo, Keychain, NATIVE_STORE, ReadError, SERVICE, StoreError, add_line, parse_dump,
-        parse_dump_service, set_item,
+        ItemInfo, Keychain, NATIVE_STORE, ReadError, SERVICE, StoreError, add_args, parse_dump,
+        parse_dump_service, set_item, signature_partition,
     };
-    use std::io::Write as _;
+    use std::io::{ErrorKind, Write as _};
     use std::path::Path;
     use std::process::{Command, Stdio};
-    use zeroize::{Zeroize as _, Zeroizing};
+    use zeroize::Zeroizing;
 
     const SECURITY: &str = "/usr/bin/security";
+    const CODESIGN: &str = "/usr/bin/codesign";
     /// `security` exits 44 when no item matches.
     const NOT_FOUND: i32 = 44;
 
-    fn run(
+    /// Run `program` to its exit, with `stdin` on its standard input.
+    pub(super) fn run(
+        program: &Path,
         action: &'static str,
         args: &[&str],
-        stdin: Option<&str>,
+        stdin: Option<&[u8]>,
     ) -> Result<std::process::Output, StoreError> {
         let refused = |detail: String| StoreError::Refused {
             store: NATIVE_STORE,
             action,
             detail,
         };
-        let mut cmd = Command::new(SECURITY);
+        let mut cmd = Command::new(program);
         cmd.args(args)
             .stdin(if stdin.is_some() {
                 Stdio::piped()
@@ -837,8 +889,14 @@ mod host {
             .stderr(Stdio::piped());
         let mut child = cmd.spawn().map_err(|e| refused(e.to_string()))?;
         if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
-            pipe.write_all(input.as_bytes())
-                .map_err(|e| refused(e.to_string()))?;
+            // A program that exits without reading closes the pipe. Its exit
+            // status and stderr say why, so they decide the message.
+            match pipe.write_all(input) {
+                Err(e) if e.kind() != ErrorKind::BrokenPipe => {
+                    return Err(refused(e.to_string()));
+                }
+                _ => {}
+            }
         }
         child.wait_with_output().map_err(|e| refused(e.to_string()))
     }
@@ -851,7 +909,8 @@ mod host {
         }
     }
 
-    /// The keychain through `/usr/bin/security`.
+    /// The keychain through `/usr/bin/security`, and through the proxy
+    /// program for an add.
     struct SecurityTool;
 
     impl Keychain for SecurityTool {
@@ -862,10 +921,8 @@ mod host {
             value: &[u8],
             proxy: &Path,
         ) -> Result<String, StoreError> {
-            let mut line = add_line(service, id, value, proxy)?;
-            let out = run("store the secret", &["-i"], Some(&line));
-            line.zeroize();
-            let out = out?;
+            let args = add_args(service, id)?;
+            let out = run(proxy, "store the secret", &args, Some(value))?;
             if !out.status.success() {
                 return Err(refused("store the secret", &out.stderr));
             }
@@ -874,7 +931,13 @@ mod host {
 
         fn items(&self, service: &str, proxy: &Path) -> Result<Vec<ItemInfo>, StoreError> {
             let out = dump()?;
-            Ok(parse_dump_service(&out, service, proxy))
+            let partition = proxy_partition(proxy);
+            Ok(parse_dump_service(
+                &out,
+                service,
+                proxy,
+                partition.as_deref(),
+            ))
         }
 
         fn delete(&self, service: &str, id: &str) -> Result<bool, StoreError> {
@@ -886,16 +949,44 @@ mod host {
         set_item(&SecurityTool, id, value, proxy)
     }
 
+    pub(super) fn add_as_this_program(service: &str, id: &str, value: &[u8]) -> Result<(), String> {
+        security_framework::os::macos::keychain::SecKeychain::default()
+            .and_then(|keychain| keychain.add_generic_password(service, id, value))
+            .map_err(|e| e.to_string())
+    }
+
     #[allow(clippy::unnecessary_wraps)]
     pub(super) fn check_available() -> Result<(), StoreError> {
         Ok(())
+    }
+
+    /// The partition that an item `proxy` creates lands in. `None` when its
+    /// signature cannot be read, which reports no item as readable.
+    pub(super) fn proxy_partition(proxy: &Path) -> Option<String> {
+        let out = run(
+            Path::new(CODESIGN),
+            "read the proxy's signature",
+            &["-dvvv", proxy.to_str()?],
+            None,
+        )
+        .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        // `codesign` prints what it displays on stderr.
+        signature_partition(&String::from_utf8_lossy(&out.stderr))
     }
 
     /// The output of `dump-keychain -a`.
     fn dump() -> Result<String, StoreError> {
         // `dump-keychain` without `-d` decrypts nothing, so it prints no
         // value and asks for no access.
-        let out = run("list the secrets", &["dump-keychain", "-a"], None)?;
+        let out = run(
+            Path::new(SECURITY),
+            "list the secrets",
+            &["dump-keychain", "-a"],
+            None,
+        )?;
         if !out.status.success() {
             return Err(refused("list the secrets", &out.stderr));
         }
@@ -903,7 +994,11 @@ mod host {
     }
 
     pub(super) fn list(proxy: &Path) -> Result<Vec<ItemInfo>, StoreError> {
-        Ok(parse_dump(&dump()?, proxy))
+        Ok(parse_dump(
+            &dump()?,
+            proxy,
+            proxy_partition(proxy).as_deref(),
+        ))
     }
 
     pub(super) fn remove(id: &str) -> Result<bool, StoreError> {
@@ -944,7 +1039,10 @@ mod host {
         match security_framework::passwords::get_generic_password(SERVICE, id) {
             Ok(value) => Ok(Zeroizing::new(value)),
             Err(e) if e.code() == ITEM_NOT_FOUND => Err(ReadError::Deleted(id.to_owned())),
-            Err(e) if DENIED.contains(&e.code()) => Err(ReadError::Disabled(id.to_owned())),
+            Err(e) if DENIED.contains(&e.code()) => {
+                tracing::warn!(id, status = e.code(), "the keychain denied a stored secret");
+                Err(ReadError::Disabled(id.to_owned()))
+            }
             Err(e) if e.code() == INTERACTION_NOT_ALLOWED => {
                 Err(ReadError::Store(StoreError::Refused {
                     store: NATIVE_STORE,
@@ -964,6 +1062,7 @@ mod host {
 
     fn delete(service: &str, id: &str) -> Result<bool, StoreError> {
         let out = run(
+            Path::new(SECURITY),
             "remove the secret",
             &["delete-generic-password", "-s", service, "-a", id],
             None,
@@ -990,6 +1089,10 @@ mod host {
 
     pub(super) fn set(_: &str, _: &[u8], _: &Path) -> Result<(), StoreError> {
         Err(StoreError::Unsupported)
+    }
+
+    pub(super) fn add_as_this_program(_: &str, _: &str, _: &[u8]) -> Result<(), String> {
+        Err(StoreError::Unsupported.to_string())
     }
 
     pub(super) fn list(_: &Path) -> Result<Vec<ItemInfo>, StoreError> {
@@ -1384,17 +1487,212 @@ mod tests {
         assert!(err.to_string().contains("not a regular file"), "{err}");
     }
 
-    // Review finding 4369348721: the line that `security -i` parses never
-    // carries an identifier that `valid_id` refuses.
+    // Review finding 4369348721: the arguments never carry an identifier that
+    // `valid_id` refuses, and the value is not among them.
     #[test]
-    fn keychain_add_line_refuses_an_invalid_id() {
-        let proxy = Path::new(PROXY);
+    fn add_args_refuse_an_invalid_id() {
         for id in ["a\" -A \"b", "claude -A", "", "-A"] {
-            let err = keychain_add_line(id, b"v", proxy).expect_err("refused");
+            let err = add_args(SERVICE, id).expect_err("refused");
             assert!(matches!(err, StoreError::InvalidId(_)), "{id:?}: {err:?}");
             assert!(err.to_string().contains("is not a name a secret can have"));
         }
-        keychain_add_line("claude", b"v", proxy).expect("valid");
+        assert_eq!(
+            add_args(SERVICE, "claude").unwrap(),
+            ["store-add", "claude"]
+        );
+        assert_eq!(
+            add_args(STAGING_SERVICE, "claude").unwrap(),
+            ["store-add", "--staging", "claude"]
+        );
+    }
+
+    // An item from a build before `bep store-add` is in the partition of
+    // Apple's tools. Its application list names the proxy, and the proxy's
+    // read still fails with `errSecAuthFailed`, so a listing must not say the
+    // proxy reads it. An item the proxy created is in the proxy's partition.
+    #[test]
+    fn a_listing_admits_only_the_proxys_own_partition() {
+        let dump = |entry: &str| {
+            format!(
+                "keychain: \"/Users/me/Library/Keychains/login.keychain-db\"
+class: \"genp\"
+attributes:
+    \"acct\"<blob>=\"claude\"
+    \"svce\"<blob>=\"dev.minimal.secret\"
+access: 3 entries
+    entry 0:
+        authorizations (6): decrypt derive export_clear export_wrapped mac sign
+        don't-require-password
+        description: dev.minimal.secret
+        applications (1):
+            0: {PROXY} (OK)
+{entry}    entry 2:
+        authorizations (1): change_acl
+        don't-require-password
+        description: dev.minimal.secret
+        applications (0):
+"
+            )
+        };
+        let access = |list: &str, own: Option<&str>| {
+            let entry = format!(
+                "    entry 1:
+        authorizations (1): partition_id
+        don't-require-password
+        description: {list}
+        applications: <null>
+"
+            );
+            parse_dump(&dump(&entry), Path::new(PROXY), own)[0].proxy_access
+        };
+        let team = Some("teamid:3G47C5HY64");
+        let hash = Some("cdhash:a9ee3da6b0baa9708b950b24f8a999741f97d3b4");
+        assert!(access("teamid:3G47C5HY64", team));
+        assert!(access(
+            "cdhash:a9ee3da6b0baa9708b950b24f8a999741f97d3b4",
+            hash
+        ));
+        assert!(access("apple-tool:,teamid:3G47C5HY64", team));
+        assert!(!access("apple-tool:", team));
+        assert!(!access("apple-tool:,apple:", team));
+        assert!(!access("teamid:AAAAAAAAAA", team));
+        assert!(!access("teamid:3G47C5HY64", hash));
+        assert!(!access("teamid:3G47C5HY64", None));
+        // An item with no partition list does not name the proxy's partition.
+        assert!(!parse_dump(&dump(""), Path::new(PROXY), team)[0].proxy_access);
+    }
+
+    #[test]
+    fn a_signature_gives_the_partition_of_the_program() {
+        assert_eq!(
+            signature_partition("CDHash=a9ee\nSignature=adhoc\nTeamIdentifier=not set\n"),
+            Some("cdhash:a9ee".to_owned())
+        );
+        assert_eq!(
+            signature_partition("CDHash=a9ee\nTeamIdentifier=3G47C5HY64\n"),
+            Some("teamid:3G47C5HY64".to_owned())
+        );
+        assert_eq!(
+            signature_partition("code object is not signed at all\n"),
+            None
+        );
+    }
+
+    /// `codesign` on a real program. This test binary is signed ad hoc by the
+    /// linker, so it is in a `cdhash:` partition.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_partition_of_a_real_program_comes_from_its_signature() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let partition = host::proxy_partition(&exe).expect("a signature");
+        let hash = partition.strip_prefix("cdhash:").expect("ad hoc signature");
+        assert_eq!(hash.len(), 40, "{partition}");
+        assert_eq!(host::proxy_partition(Path::new("/no/such/bep")), None);
+    }
+
+    // An installed proxy runs from a bundle, and the keychain records the
+    // bundle: `dump-keychain -a` then prints the bundle's path, with the
+    // requirement line under it, and never the inner binary. A listing must
+    // still admit the bundle's own proxy, and neither a directory on its
+    // path, another bundle, nor another program inside the bundle.
+    #[test]
+    fn secret_item_acl_admits_a_bundled_proxy() {
+        let proxy = Path::new("/Users/me/.local/bin/bep.app/Contents/MacOS/bep");
+        let dump = "keychain: \"/Users/me/Library/Keychains/login.keychain-db\"
+class: \"genp\"
+attributes:
+    \"acct\"<blob>=\"claude\"
+    \"svce\"<blob>=\"dev.minimal.secret\"
+access: 1 entries
+    entry 0:
+        authorizations (6): decrypt derive export_clear export_wrapped mac sign
+        don't-require-password
+        description: Minimal secret claude
+        applications (1):
+            0: /Users/me/.local/bin/bep.app (OK)
+            requirement: identifier \"dev.minimal.bep\" and anchor apple generic and certificate leaf[subject.CN] = \"Minimal\"
+    entry 1:
+        authorizations (1): partition_id
+        description: teamid:3G47C5HY64
+        applications: <null>
+keychain: \"/Users/me/Library/Keychains/login.keychain-db\"
+class: \"genp\"
+attributes:
+    \"acct\"<blob>=\"other\"
+    \"svce\"<blob>=\"dev.minimal.secret\"
+access: 1 entries
+    entry 0:
+        authorizations (6): decrypt derive export_clear export_wrapped mac sign
+        don't-require-password
+        description: Minimal secret other
+        applications (1):
+            0: /Applications/Other.app (OK)
+    entry 1:
+        authorizations (1): partition_id
+        description: teamid:3G47C5HY64
+        applications: <null>
+keychain: \"/Users/me/Library/Keychains/login.keychain-db\"
+class: \"genp\"
+attributes:
+    \"acct\"<blob>=\"partial\"
+    \"svce\"<blob>=\"dev.minimal.secret\"
+access: 1 entries
+    entry 0:
+        authorizations (6): decrypt derive export_clear export_wrapped mac sign
+        don't-require-password
+        description: Minimal secret partial
+        applications (1):
+            0: /Users/me/.local/bin (OK)
+    entry 1:
+        authorizations (1): partition_id
+        description: teamid:3G47C5HY64
+        applications: <null>
+";
+        let own = Some("teamid:3G47C5HY64");
+        assert_eq!(
+            parse_dump(dump, proxy, own),
+            vec![
+                ItemInfo {
+                    id: "claude".into(),
+                    proxy_access: true
+                },
+                ItemInfo {
+                    id: "other".into(),
+                    proxy_access: false
+                },
+                ItemInfo {
+                    id: "partial".into(),
+                    proxy_access: false
+                },
+            ]
+        );
+        for other in ["helper", "nested/bep"] {
+            let other = format!("/Users/me/.local/bin/bep.app/Contents/MacOS/{other}");
+            assert!(
+                parse_dump(dump, Path::new(&other), own)
+                    .iter()
+                    .all(|item| !item.proxy_access),
+                "{other} is not the bundle's main program"
+            );
+        }
+    }
+
+    /// A proxy program that exits without reading the value, such as an older
+    /// `bep` with no `store-add`, closes the pipe. Its exit status and stderr
+    /// still reach the caller. The value is larger than a pipe's buffer, so
+    /// the write always meets the closed pipe.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn run_keeps_the_stderr_of_a_program_that_reads_no_input() {
+        let out = host::run(
+            Path::new("/bin/sh"),
+            "store the secret",
+            &["-c", "echo no such subcommand >&2; exit 3"],
+            Some(&vec![0; 1 << 20]),
+        )
+        .expect("the program ran");
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(out.stderr, b"no such subcommand\n");
     }
 
     /// The BEP-051 leg on a real keychain: set, list, set again and remove
@@ -1447,6 +1745,10 @@ mod tests {
             }]
         );
 
+        // The proxy copy created the item, and this test is another program.
+        // The keychain refuses it with prompts off, where it would ask.
+        assert!(matches!(store.read(&id), Err(ReadError::Disabled(_))));
+
         store.set(&id, b"second", proxy).expect("second set");
         let items = mine(store.list(proxy).expect("list"));
         println!("after set again: {items:?}");
@@ -1463,5 +1765,21 @@ mod tests {
         println!("after remove: {items:?}");
         assert!(items.is_empty());
         assert!(!store.remove(&id).expect("remove again"));
+    }
+
+    /// The read that `bep serve` makes, on an item the same program created:
+    /// the keychain lets it past the partition and the application list.
+    /// Run it on a Mac with
+    /// `cargo nextest run -p bep host_store_reads_an_item_this_program_added --run-ignored only`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes to the login keychain of a real Mac"]
+    fn host_store_reads_an_item_this_program_added() {
+        let store = HostStore;
+        let id = format!("minimal-own-item-{}", std::process::id());
+        add_as_this_program(SERVICE, &id, b"value").expect("add");
+        let read = store.read(&id);
+        assert!(store.remove(&id).expect("remove"), "the item was held");
+        assert_eq!(read.expect("read").as_slice(), b"value");
     }
 }

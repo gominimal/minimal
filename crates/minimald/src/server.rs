@@ -845,6 +845,12 @@ impl ServerStateHandle {
     /// compile from it, not the configured port the daemon may have moved off.
     #[cfg(target_os = "linux")]
     pub(crate) async fn set_switch_hostname_proxy_port(&self, port: u16) {
+        // NET-162: from the bind on, no host exposure reaches this port.
+        crate::net::switch::MinimalListeners::daemon().hold(crate::net::switch::MinimalListener {
+            port,
+            protocol: None,
+            name: crate::net::switch::HOSTNAME_PROXY_LISTENER,
+        });
         let switch = Arc::clone(&self.0.lock().await.net_switch);
         let stranded = switch.lock().await.set_hostname_proxy_port(Some(port));
         if stranded > 0 {
@@ -884,6 +890,12 @@ impl ServerStateHandle {
     /// Records the port the box-zone answerer actually listens on (UDP),
     /// once its startup has bound (and, in a microVM, published) it.
     pub(crate) async fn set_zone_answerer_port(&self, port: u16) {
+        // NET-162: from the bind on, no host exposure reaches this port.
+        crate::net::switch::MinimalListeners::daemon().hold(crate::net::switch::MinimalListener {
+            port,
+            protocol: None,
+            name: crate::net::switch::ANSWERER_LISTENER,
+        });
         self.0.lock().await.zone_answerer_port = Some(port);
     }
 
@@ -950,7 +962,7 @@ impl ServerStateHandle {
         self.0.lock().await.config.minimal_state_dir.clone()
     }
 
-    /// The daemon's identity dir — the provider instance dir it runs under,
+    /// The daemon's identity dir — the host dir it runs under,
     /// whose canonical path is the node id its channel client publishes
     /// under (`main`'s `client_instance_dir`). `None` for a daemon with no
     /// identity dir configured (a harness server): its node id falls back
@@ -1020,6 +1032,87 @@ pub trait Listener: Send {
     const IS_LOCAL: bool;
 
     fn accept(&self) -> impl Future<Output = std::io::Result<(Self::Stream, Self::Addr)>> + Send;
+
+    /// The vsock CID of a peer this transport refuses at accept, or `None`
+    /// to serve it. The accept loop asks this before it reads a byte from
+    /// the connection, and drops a refused one unread. Only the vsock
+    /// transport refuses a peer ([`vsock_peer_refused`]); a UDS peer is
+    /// gated by its socket's file mode instead.
+    fn refused_cid(_peer: &Self::Addr) -> Option<u32> {
+        None
+    }
+}
+
+/// Whether a vsock peer at `cid` is refused by the in-VM daemon's RPC
+/// listener (NET-139): every CID but the host's (`VMADDR_CID_HOST`, 2). The
+/// vsock channel into a VM runs host to guest only, so a guest-local peer
+/// (loopback CID 1, the VM's own CID, or a sibling) is not the host and is
+/// refused, whatever the box seal's state.
+#[cfg(target_os = "linux")]
+pub(crate) fn vsock_peer_refused(cid: u32) -> bool {
+    cid != tokio_vsock::VMADDR_CID_HOST
+}
+
+/// How often the refusal line for one peer CID is written (NET-139): the
+/// first refusal in a window writes the line, and the line carries the
+/// count of refusals since the last one, so a peer that connects in a loop
+/// cannot flood the daemon's log.
+const PEER_REFUSAL_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The most peer CIDs the refusal limiter tracks at once. Past it the
+/// table is cleared, so a peer that cycles CIDs costs a line per CID, not
+/// memory.
+const PEER_REFUSAL_TRACKED: usize = 64;
+
+/// Per peer CID: when its refusal line was last written, and how many
+/// refusals came after that line.
+static PEER_REFUSALS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u32, (std::time::Instant, u64)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Records one refused peer at `cid` and answers how many refusals the
+/// line to write now covers, or `None` while the CID's window is still
+/// open and the line is suppressed.
+fn peer_refusal_due(cid: u32, now: std::time::Instant) -> Option<u64> {
+    let mut refusals = PEER_REFUSALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if refusals.len() >= PEER_REFUSAL_TRACKED && !refusals.contains_key(&cid) {
+        refusals.clear();
+    }
+    match refusals.get_mut(&cid) {
+        Some((last, unlogged)) if now.duration_since(*last) < PEER_REFUSAL_LOG_INTERVAL => {
+            *unlogged = unlogged.saturating_add(1);
+            None
+        }
+        Some((last, unlogged)) => {
+            let covered = unlogged.saturating_add(1);
+            *last = now;
+            *unlogged = 0;
+            Some(covered)
+        }
+        None => {
+            refusals.insert(cid, (now, 0));
+            Some(1)
+        }
+    }
+}
+
+/// Writes the audited line for a refused vsock peer (NET-139), rate-limited
+/// per CID by [`peer_refusal_due`]. The line names the CID and counts the
+/// refusals it covers. It is a warn line in the daemon's log, which the
+/// diagnostics bundle ships.
+fn log_refused_peer(transport: &'static str, cid: u32) {
+    if let Some(refused) = peer_refusal_due(cid, std::time::Instant::now()) {
+        tracing::warn!(
+            audit = true,
+            transport,
+            peer_cid = cid,
+            refused,
+            "refused an RPC connection from a vsock peer that is not the host; \
+             only the host (CID 2) may connect"
+        );
+    }
 }
 
 impl Listener for UnixListener {
@@ -1056,6 +1149,14 @@ impl Listener for tokio_vsock::VsockListener {
     async fn accept(&self) -> std::io::Result<(Self::Stream, Self::Addr)> {
         tokio_vsock::VsockListener::accept(self).await
     }
+
+    /// The vsock listener serves only the host (NET-139): a vsock listener
+    /// is what a VM-hosted daemon binds (`--vsock`), and its every peer
+    /// but CID 2 is refused at accept.
+    fn refused_cid(peer: &Self::Addr) -> Option<u32> {
+        let cid = peer.cid();
+        vsock_peer_refused(cid).then_some(cid)
+    }
 }
 
 /// How long [`Server::run`] waits for in-flight connections to drain after a
@@ -1075,6 +1176,30 @@ const HANDSHAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3
 /// Monotonic id carried by each accepted connection's span, so a
 /// connection's accept, channel bindings, and close correlate across the log.
 static CONN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a connection that ended with `e` was hung up by its peer rather
+/// than broken by a fault on this side.
+///
+/// A peer that closes its socket with bytes still unread in its receive queue
+/// makes the kernel answer the next read here with `ECONNRESET` instead of an
+/// end of file (Linux `AF_UNIX`, and TCP's RST). That is the same abrupt
+/// hangup as an end of file: which one arrives depends on whether the client
+/// had drained the daemon's last output when it went away. The rendered
+/// message is still matched for the cases russh reports as its own errors
+/// rather than as an io error.
+fn closed_by_peer(e: &crate::connection::ConnectionError) -> bool {
+    use std::io::ErrorKind;
+    if let crate::connection::ConnectionError::Protocol(russh::Error::IO(io)) = e
+        && matches!(
+            io.kind(),
+            ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
+        )
+    {
+        return true;
+    }
+    let msg = e.to_string();
+    msg.contains("early eof") || msg.contains("Broken pipe") || msg.contains("Disconnected")
+}
 
 /// A listening minimald server.
 #[derive(Debug)]
@@ -1129,6 +1254,10 @@ impl Server {
         // hostname registry they route against only exists on Linux.
         #[cfg(target_os = "linux")]
         start_host_proxies(&state, in_microvm, hostname_proxy_port, zone_answerer_port).await;
+        #[cfg(target_os = "linux")]
+        if in_microvm {
+            start_host_address_listen_watcher(&state).await;
+        }
 
         Self::serve(state, listener).await
     }
@@ -1173,12 +1302,25 @@ impl Server {
                 () = shutdown.cancelled() => break,
                 accepted = listener.accept() => accepted?,
             };
+            // NET-139: a peer the transport refuses is dropped here, at
+            // accept, before a byte of its stream is read and before it
+            // takes a connection id or a task.
+            if let Some(cid) = L::refused_cid(&peer) {
+                drop(stream);
+                log_refused_peer(L::TRANSPORT, cid);
+                continue;
+            }
             // One span per accepted connection: every record the connection
             // and its channels emit carries `conn`, so accept, channel
             // bindings, and close correlate across the log with a grep
             // instead of manual id fields on each line.
             let conn = CONN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let span = tracing::info_span!("conn", conn, transport = L::TRANSPORT);
+            let span = tracing::info_span!(
+                "conn",
+                conn,
+                transport = L::TRANSPORT,
+                outcome = tracing::field::Empty
+            );
             span.in_scope(|| tracing::info!(?peer, "accepted connection"));
             // The handshake runs in the spawned task, not here: awaiting it in
             // the loop would serialize accepts behind each client's id line,
@@ -1200,39 +1342,74 @@ impl Server {
                                 // A handshake failure must not take the daemon
                                 // down — in the guest minimald is pid-1. Drop
                                 // this connection and keep accepting.
-                                handshake_span.in_scope(|| {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "SSH handshake failed; dropping connection"
-                                    )
-                                });
+                                //
+                                // A peer that hung up before the id exchange is
+                                // the common case, not a failure: `min` probes
+                                // the socket that way before every command
+                                // (autospawn's liveness check), and a client
+                                // that gave up on a stalled daemon looks the
+                                // same. At WARN they would hide the
+                                // handshakes that did fail.
+                                if closed_by_peer(&e) {
+                                    handshake_span.record("outcome", "closed_before_id");
+                                    handshake_span.in_scope(|| {
+                                        tracing::debug!(
+                                            error = %e,
+                                            "peer closed before the SSH id exchange; dropping connection"
+                                        )
+                                    });
+                                } else {
+                                    handshake_span.record("outcome", "handshake_failed");
+                                    handshake_span.in_scope(|| {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "SSH handshake failed; dropping connection"
+                                        )
+                                    });
+                                }
                                 return;
                             }
                             Err(_) => {
+                                handshake_span.record("outcome", "handshake_timeout");
                                 handshake_span.in_scope(|| {
                                     tracing::warn!("SSH handshake timed out; dropping connection")
                                 });
                                 return;
                             }
                         };
+                    // `run_stream` returns once the SSH ids are exchanged; key
+                    // exchange still runs inside `session_fut`. The outcome
+                    // says only that much until the session ends.
+                    handshake_span.record("outcome", "id_exchanged");
                     // Log session errors instead of silently dropping the
                     // spawned future, so a failed handshake is visible on any
                     // transport.
-                    match session_fut.await {
+                    let ended = session_fut.await;
+                    let past_kex = conn_hnd.past_kex().await;
+                    let outcome = if conn_hnd.authenticated().await {
+                        "session"
+                    } else if !past_kex && ended.as_ref().is_err_and(|e| !closed_by_peer(e)) {
+                        "handshake_failed"
+                    } else {
+                        "closed_before_auth"
+                    };
+                    handshake_span.record("outcome", outcome);
+                    match ended {
                         Ok(()) => tracing::info!("connection closed"),
+                        // A peer that sent its id and then failed key exchange
+                        // failed its handshake, as one that failed before the
+                        // id did.
+                        Err(e) if !past_kex && !closed_by_peer(&e) => {
+                            tracing::warn!(error = %e, "SSH handshake failed; dropping connection");
+                        }
                         Err(e) => {
                             // Abrupt hangups are how the CLI's oneshot RPC
                             // connections and Ctrl-C'd attaches normally end;
                             // framing them as errors makes routine traffic
                             // read like a transport incident during field
-                            // analysis. Match on the rendered message: russh
-                            // wraps the underlying io error, and this is log
-                            // framing only.
+                            // analysis. This is log framing only.
                             let msg = e.to_string();
-                            if msg.contains("early eof")
-                                || msg.contains("Broken pipe")
-                                || msg.contains("Disconnected")
-                            {
+                            if closed_by_peer(&e) {
                                 tracing::info!(reason = %msg, "connection closed by peer");
                             } else {
                                 tracing::warn!(error = %msg, "session ended with error");
@@ -1338,7 +1515,12 @@ async fn close_connection(state: &ServerStateHandle, conn: &ConnectionHandle) {
     let created = conn.take_created_sessions().await;
     #[cfg(test)]
     reap_seam::park(&created).await;
-    reap_unfinalized_sessions(state, created).await;
+    // Only a connection that created a session has anything to reap; the
+    // span is not worth opening for the rest (every probe and every plain
+    // RPC connection).
+    if !created.is_empty() {
+        reap_unfinalized_sessions(state, created).await;
+    }
     conn.release_liveness().await;
 }
 
@@ -1572,6 +1754,29 @@ async fn start_host_proxies(
         state.clone(),
         hook_port,
         answerer_status,
+    ));
+}
+
+/// Starts the host-address listen watcher of a daemon inside a microVM for
+/// the daemon's life (NET-138): a host-address box shares the node's
+/// namespace, so the VM host daemon opens its listeners on the host only
+/// from the listen notices this watcher sends over the report door. It
+/// stops when the daemon shuts down.
+#[cfg(target_os = "linux")]
+async fn start_host_address_listen_watcher(state: &ServerStateHandle) {
+    let shutdown = state.shutdown_token().await;
+    let (stop_tx, stop) = tokio::sync::watch::channel(false);
+    crate::traced::spawn(async move {
+        shutdown.cancelled().await;
+        let _ = stop_tx.send(true);
+    });
+    crate::traced::spawn(crate::net::listeners::watch_host_address_listens(
+        crate::net::policy::ControlChannel::Vsock {
+            cid: crate::net::VSOCK_HOST_CID,
+            port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
+        },
+        crate::net::DEFAULT_SUBNET.daemon_ip(),
+        stop,
     ));
 }
 
@@ -2374,9 +2579,9 @@ pub(crate) async fn drive_proxy_until_serving(
                 // answer for, not this daemon's to out-wait. The VM host
                 // holds the reservation and owns the retry (a redraw hands
                 // a fresh port, or the start fails naming this one), and
-                // the report is how it hears the failure; a backoff loop
-                // here would leave the VM up with no hostname proxy, which
-                // the host forbids. `publish_on_host` is the in-VM flag, so
+                // the report is how it hears the failure. The VM host
+                // daemon then starts the VM with its proxy down and retries
+                // the port itself. `publish_on_host` is the in-VM flag, so
                 // the report has a listener exactly when it is sent; a
                 // native daemon never reaches this arm at all.
                 if publish_on_host && failure.port_taken && !choice.reselects_when_publish_refused()
@@ -2389,10 +2594,12 @@ pub(crate) async fn drive_proxy_until_serving(
                         %failure.report,
                         "the host holds the hostname proxy's port; reporting the terminal publish failure to the VM host daemon"
                     );
-                    // Recorded first, reported in the background: the drive
-                    // ends here and never waits on the report's vsock dial,
-                    // which can take seconds per try.
-                    proxy.record_unavailable(&state, failure.report).await;
+                    // The VM host daemon records the cause, naming the
+                    // holder it can see, and its held-port watcher owns the
+                    // retry (NET-021). The guest records none, so its note
+                    // never stands in for that cause. Reported in the
+                    // background: the drive ends here and never waits on the
+                    // report's vsock dial, which can take seconds per try.
                     crate::traced::spawn(report_proxy_port_held(host_port));
                     return;
                 }

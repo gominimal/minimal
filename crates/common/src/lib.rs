@@ -185,8 +185,114 @@ impl std::error::Error for HardlinkError {
     }
 }
 
+/// Why a path that two layers both ship was not linked twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkCollision {
+    /// The destination is the same inode, or a regular file with the same
+    /// bytes: the usual overlap, kept quiet.
+    Same,
+    /// Two regular files of equal size, too large to compare cheaply
+    /// ([`COLLISION_COMPARE_MAX`]): kept quiet, but never called the same.
+    Unchecked,
+    /// The destination differs in a way worth a WARN per file.
+    Differs(&'static str),
+}
+
+impl LinkCollision {
+    /// The note a log line puts after "already exists".
+    #[must_use]
+    pub fn note(self) -> &'static str {
+        match self {
+            Self::Same => "same file",
+            Self::Unchecked => "same size, too large to compare",
+            Self::Differs(why) => why,
+        }
+    }
+}
+
+/// The collisions one or more [`hardlink_dir_contents_counted`] calls found,
+/// by kind. The caller owns it, so concurrent assemblies never share counts.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LinkCollisions {
+    /// Same inode, same bytes, or a symlink to the same target.
+    pub same: u64,
+    /// Equal-size regular files too large to compare.
+    pub unchecked: u64,
+    /// Files or symlinks that differ: each one also logs a WARN.
+    pub differ: u64,
+}
+
+impl LinkCollisions {
+    fn add(&mut self, collision: LinkCollision) {
+        let n = match collision {
+            LinkCollision::Same => &mut self.same,
+            LinkCollision::Unchecked => &mut self.unchecked,
+            LinkCollision::Differs(_) => &mut self.differ,
+        };
+        *n = n.saturating_add(1);
+    }
+
+    /// Every collision counted, of any kind.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.same
+            .saturating_add(self.unchecked)
+            .saturating_add(self.differ)
+    }
+}
+
+/// Equal-size collisions up to this size are compared byte for byte. A
+/// version-string bump keeps the size and changes the bytes, so size alone
+/// cannot call two files the same; above this, reading both would cost
+/// more than the link it replaced.
+const COLLISION_COMPARE_MAX: u64 = 4 << 20;
+
+/// Compares the file at `src` (described by `src_meta`) with what already
+/// sits at `dst`. Same (device, inode) is the same file. A destination that
+/// is not a regular file (a symlink included: it is not followed) differs,
+/// as does one of another size. Equal sizes are compared by content up to
+/// [`COLLISION_COMPARE_MAX`].
+fn hardlink_collision(src: &Path, src_meta: &std::fs::Metadata, dst: &Path) -> LinkCollision {
+    use std::os::unix::fs::MetadataExt as _;
+    match std::fs::symlink_metadata(dst) {
+        Ok(d) if d.dev() == src_meta.dev() && d.ino() == src_meta.ino() => LinkCollision::Same,
+        Ok(d) if !d.is_file() => LinkCollision::Differs("not a regular file"),
+        Ok(d) if d.len() != src_meta.len() => LinkCollision::Differs("different size"),
+        Ok(d) if d.len() > COLLISION_COMPARE_MAX => LinkCollision::Unchecked,
+        Ok(_) => match (std::fs::read(src), std::fs::read(dst)) {
+            (Ok(a), Ok(b)) if a == b => LinkCollision::Same,
+            (Ok(_), Ok(_)) => LinkCollision::Differs("different content"),
+            _ => LinkCollision::Differs("unreadable"),
+        },
+        Err(_) => LinkCollision::Differs("unreadable"),
+    }
+}
+
+/// How the file at `src` compares with the one already at `dst`, by the
+/// rule [`hardlink_dir_contents`] uses, for a caller that places single
+/// files itself: quiet when they match, a WARN when they differ.
+#[must_use]
+pub fn link_collision(src: &Path, dst: &Path) -> LinkCollision {
+    match std::fs::metadata(src) {
+        Ok(src_meta) => hardlink_collision(src, &src_meta, dst),
+        Err(_) => LinkCollision::Differs("unreadable"),
+    }
+}
+
 /// Creates a hardlink farm in dst representing files in src, recursively.
 pub fn hardlink_dir_contents(src: &Path, dst: &Path) -> Result<(), HardlinkError> {
+    hardlink_dir_contents_counted(src, dst, &mut LinkCollisions::default())
+}
+
+/// [`hardlink_dir_contents`], adding each path already in place at `dst`
+/// to `counts`. A caller that assembles a tree from several layers passes
+/// one `counts` to every call and logs one summary line, instead of one
+/// line per path.
+pub fn hardlink_dir_contents_counted(
+    src: &Path,
+    dst: &Path,
+    counts: &mut LinkCollisions,
+) -> Result<(), HardlinkError> {
     use std::fs;
 
     for entry in
@@ -206,16 +312,29 @@ pub fn hardlink_dir_contents(src: &Path, dst: &Path) -> Result<(), HardlinkError
         if metadata.is_dir() {
             fs::create_dir_all(&dst_path)
                 .map_err(|e| HardlinkError::IO("create directory", dst_path.clone(), e))?;
-            hardlink_dir_contents(&path, &dst_path)?;
+            hardlink_dir_contents_counted(&path, &dst_path, counts)?;
         } else if metadata.is_file() {
             match fs::hard_link(&path, &dst_path) {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    warn!(
-                        "Not linking {} => {}, already exists",
-                        path.display(),
-                        dst_path.display()
-                    );
+                    // Two layers of one closure shipping the same path is the
+                    // rule, not the exception. The first-linked file stays;
+                    // the collision is a WARN only when the files differ.
+                    let collision = hardlink_collision(&path, &metadata, &dst_path);
+                    counts.add(collision);
+                    match collision {
+                        LinkCollision::Same | LinkCollision::Unchecked => tracing::debug!(
+                            "Not linking {} => {}, already exists ({})",
+                            path.display(),
+                            dst_path.display(),
+                            collision.note()
+                        ),
+                        LinkCollision::Differs(why) => warn!(
+                            "Not linking {} => {}, already exists ({why}; the first-linked file stays)",
+                            path.display(),
+                            dst_path.display()
+                        ),
+                    }
                     Ok(())
                 }
                 // The cache and destination can live on different filesystems
@@ -255,11 +374,27 @@ pub fn hardlink_dir_contents(src: &Path, dst: &Path) -> Result<(), HardlinkError
                 Ok(v) => Ok(v),
                 Err(e) => {
                     if e.kind() == std::io::ErrorKind::AlreadyExists {
-                        warn!(
-                            "Not symlinking {} => {}, already exists",
-                            path.display(),
-                            dst_path.display()
-                        );
+                        // Same rule as for files: a symlink to the same target
+                        // is the common overlap, a different target is worth
+                        // the WARN.
+                        match fs::read_link(&dst_path) {
+                            Ok(existing) if existing == target => {
+                                counts.add(LinkCollision::Same);
+                                tracing::debug!(
+                                    "Not symlinking {} => {}, already exists (same target)",
+                                    path.display(),
+                                    dst_path.display()
+                                );
+                            }
+                            _ => {
+                                counts.add(LinkCollision::Differs("another target"));
+                                warn!(
+                                    "Not symlinking {} => {}, already exists (another target or not a symlink; the first stays)",
+                                    path.display(),
+                                    dst_path.display()
+                                );
+                            }
+                        }
                         Ok(())
                     } else {
                         Err(HardlinkError::IO("create symlink", dst_path, e))
@@ -687,6 +822,102 @@ pub fn default_parallelism() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A path two layers both ship is linked once and counted, with a WARN
+    /// only when the two differ: another size, other bytes of the same size
+    /// (a version-string bump), or a destination that is not a regular file
+    /// (a symlink is not followed). The same inode or the same bytes is the
+    /// quiet case; equal-size files too large to compare are quiet too, but
+    /// counted apart as unchecked.
+    #[test]
+    fn a_second_layer_shipping_the_same_path_is_counted_not_warned_unless_it_differs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b, dst) = (
+            tmp.path().join("a"),
+            tmp.path().join("b"),
+            tmp.path().join("rootfs"),
+        );
+        for d in [&a, &b, &dst] {
+            std::fs::create_dir_all(d.join("usr/lib")).unwrap();
+        }
+        std::fs::write(a.join("usr/lib/same.txt"), b"same bytes").unwrap();
+        std::fs::write(b.join("usr/lib/same.txt"), b"same bytes").unwrap();
+        std::fs::write(a.join("usr/lib/bumped.txt"), b"v1.0.1").unwrap();
+        std::fs::write(b.join("usr/lib/bumped.txt"), b"v1.0.2").unwrap(); // equal size, other bytes
+        std::fs::write(a.join("usr/lib/differs.txt"), b"short").unwrap();
+        std::fs::write(b.join("usr/lib/differs.txt"), b"rather longer").unwrap();
+        std::os::unix::fs::symlink("target", a.join("usr/lib/link")).unwrap();
+        std::os::unix::fs::symlink("other", b.join("usr/lib/link")).unwrap();
+        // A symlink in place whose target holds the same bytes: compared
+        // through the target it would pass as the same file.
+        std::os::unix::fs::symlink("same.txt", a.join("usr/lib/alias")).unwrap();
+        std::fs::write(b.join("usr/lib/alias"), b"same bytes").unwrap();
+        let big = usize::try_from(COLLISION_COMPARE_MAX + 1).unwrap();
+        std::fs::write(a.join("usr/lib/big.bin"), vec![0u8; big]).unwrap();
+        std::fs::write(b.join("usr/lib/big.bin"), vec![1u8; big]).unwrap();
+
+        let mut counts = LinkCollisions::default();
+        hardlink_dir_contents_counted(&a, &dst, &mut counts).unwrap();
+        assert_eq!(
+            counts,
+            LinkCollisions::default(),
+            "the first layer collides with nothing"
+        );
+        hardlink_dir_contents_counted(&b, &dst, &mut counts).unwrap();
+        assert_eq!(
+            counts,
+            LinkCollisions {
+                same: 1,
+                unchecked: 1,
+                differ: 4
+            },
+            "same bytes; an unchecked large file; other bytes, another size, \
+             a differing symlink and a symlink destination"
+        );
+        assert_eq!(counts.total(), 6);
+        // the first-linked file stays
+        assert_eq!(
+            std::fs::read(dst.join("usr/lib/differs.txt")).unwrap(),
+            b"short"
+        );
+        assert_eq!(
+            std::fs::read(dst.join("usr/lib/bumped.txt")).unwrap(),
+            b"v1.0.1"
+        );
+        assert_eq!(
+            std::fs::read_link(dst.join("usr/lib/link"))
+                .unwrap()
+                .to_str(),
+            Some("target")
+        );
+        assert_eq!(
+            link_collision(
+                &b.join("usr/lib/bumped.txt"),
+                &dst.join("usr/lib/bumped.txt")
+            ),
+            LinkCollision::Differs("different content")
+        );
+        assert_eq!(
+            link_collision(&b.join("usr/lib/alias"), &dst.join("usr/lib/alias")),
+            LinkCollision::Differs("not a regular file")
+        );
+        assert_eq!(
+            link_collision(&b.join("usr/lib/same.txt"), &dst.join("usr/lib/same.txt")),
+            LinkCollision::Same
+        );
+        // an equal-size file too large to compare is unchecked, never the same
+        let big_collision =
+            link_collision(&b.join("usr/lib/big.bin"), &dst.join("usr/lib/big.bin"));
+        assert_eq!(big_collision, LinkCollision::Unchecked);
+        assert_eq!(big_collision.note(), "same size, too large to compare");
+        // the same inode is the same file
+        let src = a.join("usr/lib/same.txt");
+        let m = std::fs::metadata(&src).unwrap();
+        assert_eq!(
+            hardlink_collision(&src, &m, &dst.join("usr/lib/same.txt")),
+            LinkCollision::Same
+        );
+    }
 
     #[test]
     fn synth_user_group_config_sets_home_on_uid_1000() {

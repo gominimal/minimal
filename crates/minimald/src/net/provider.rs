@@ -68,6 +68,15 @@ struct RuntimeIngressState {
     /// They deliver to the spawn's lease as its attach's own forwards do,
     /// and come down with it the same way.
     handed: Vec<crate::net::policy::PortForwarder>,
+    /// Runtime forwards a move of the box's publish left behind at the old
+    /// address because their unbind failed (#2748). Nothing lists them, and
+    /// they come down with the spawn or the box's stop as the live ones do.
+    retired: Vec<crate::net::policy::PortForwarder>,
+    /// Clones of the declared forwards this spawn's attach bound (NET-121),
+    /// so a move of the box's publish can unbind the one at the old address
+    /// (#2748). A clone shares its forwarder's revoked mark, so the attach's
+    /// teardown skips one unbound here. The attach's guard still owns them.
+    attached: Vec<crate::net::policy::PortForwarder>,
 }
 
 /// The ports a box published at runtime with its own `min net expose`
@@ -154,7 +163,45 @@ impl RuntimeIngress {
     /// The box stopped: takes the forwards bound at a hand-over, for the
     /// session actor to release as declared forwards are.
     pub(crate) fn take_handed(&self) -> Vec<crate::net::policy::PortForwarder> {
-        std::mem::take(&mut self.state().handed)
+        let mut state = self.state();
+        state.attached.clear();
+        std::mem::take(&mut state.handed)
+    }
+
+    /// Keeps clones of the declared forwards a spawn's attach bound, for a
+    /// move of the box's publish to unbind the old one (#2748).
+    pub(crate) fn record_attached(&self, forwarders: &[crate::net::policy::PortForwarder]) {
+        self.state().attached = forwarders.to_vec();
+    }
+
+    /// The declared forwards still bound at `address:port`, the attach's and
+    /// the hand-overs' alike: what a move of the box's publish off `address`
+    /// unbinds once the port's forward stands at the new address (#2748).
+    pub(crate) fn declared_at(
+        &self,
+        address: std::net::Ipv4Addr,
+        port: u16,
+    ) -> Vec<crate::net::policy::PortForwarder> {
+        let host = address.to_string();
+        let state = self.state();
+        state
+            .attached
+            .iter()
+            .chain(&state.handed)
+            .filter(|forwarder| !forwarder.is_revoked())
+            .filter(|forwarder| forwarder.host_port() == Some((host.as_str(), port)))
+            .cloned()
+            .collect()
+    }
+
+    /// Whether a declared forward for `port` bound at a hand-over stands at
+    /// `address`.
+    pub(crate) fn holds_handed_at(&self, address: std::net::Ipv4Addr, port: u16) -> bool {
+        let host = address.to_string();
+        self.state()
+            .handed
+            .iter()
+            .any(|forwarder| forwarder.host_port() == Some((host.as_str(), port)))
     }
 
     /// The spawn ended: takes the forwards bound at a hand-over, for the
@@ -163,6 +210,7 @@ impl RuntimeIngress {
     pub(crate) fn detach_handed(&self) -> Vec<crate::net::policy::PortForwarder> {
         let mut state = self.state();
         state.detached = true;
+        state.attached.clear();
         std::mem::take(&mut state.handed)
     }
 
@@ -176,10 +224,74 @@ impl RuntimeIngress {
     pub(crate) fn detach(&self) -> Vec<crate::net::policy::PortForwarder> {
         let mut state = self.state();
         state.detached = true;
+        let retired = std::mem::take(&mut state.retired);
         std::mem::take(&mut state.forwards)
             .into_iter()
             .map(|live| live.forwarder)
+            .chain(retired)
             .collect()
+    }
+
+    /// The internal port and protocol of each runtime forward bound at
+    /// `address`: the forwards a move of the box's publish off `address`
+    /// must bind again at the new one (#2748).
+    pub(crate) fn bound_at(&self, address: std::net::Ipv4Addr) -> Vec<(u16, boxes::IpProto)> {
+        let host = address.to_string();
+        self.state()
+            .forwards
+            .iter()
+            .filter(|live| {
+                live.forwarder
+                    .host_port()
+                    .is_some_and(|(bound, _)| bound == host)
+            })
+            .map(|live| (live.mapping.internal_port, live.mapping.proto))
+            .collect()
+    }
+
+    /// Puts `moved`, bound at the box's new address, in the place of the
+    /// forward for the same port bound at `from` (#2748), and returns the
+    /// old forward for the caller to unbind. The row keeps what it said
+    /// about the port's admission: the gate names the port, not the
+    /// address, so a move changes neither. Refused, handing `moved` back
+    /// for the caller to unbind, when the spawn has ended or no forward for
+    /// the port stands at `from` any more.
+    pub(crate) fn rebind(
+        &self,
+        from: std::net::Ipv4Addr,
+        mut moved: LiveIngressForward,
+    ) -> Result<LiveIngressForward, LiveIngressForward> {
+        let host = from.to_string();
+        let mut state = self.state();
+        if state.detached {
+            return Err(moved);
+        }
+        let Some(standing) = state.forwards.iter_mut().find(|live| {
+            live.mapping.internal_port == moved.mapping.internal_port
+                && live
+                    .forwarder
+                    .host_port()
+                    .is_some_and(|(bound, _)| bound == host)
+        }) else {
+            return Err(moved);
+        };
+        moved.mapping.pending = standing.mapping.pending;
+        Ok(std::mem::replace(standing, moved))
+    }
+
+    /// Keeps a forward a move left behind because its unbind failed
+    /// (#2748), so the spawn's end or the box's stop unbinds it. Refused,
+    /// handing it back, when the spawn has ended.
+    pub(crate) fn retire(
+        &self,
+        forwarder: crate::net::policy::PortForwarder,
+    ) -> Result<(), crate::net::policy::PortForwarder> {
+        let mut state = self.state();
+        if state.detached {
+            return Err(forwarder);
+        }
+        state.retired.push(forwarder);
+        Ok(())
     }
 
     /// Takes the one runtime forward published for `port`, for the session
@@ -201,9 +313,12 @@ impl RuntimeIngress {
     /// The box stopped: takes every runtime forward for the session actor to
     /// unbind.
     pub(crate) fn take_all(&self) -> Vec<crate::net::policy::PortForwarder> {
-        std::mem::take(&mut self.state().forwards)
+        let mut state = self.state();
+        let retired = std::mem::take(&mut state.retired);
+        std::mem::take(&mut state.forwards)
             .into_iter()
             .map(|live| live.forwarder)
+            .chain(retired)
             .collect()
     }
 }
@@ -257,6 +372,26 @@ impl OwnAddressReporter {
         registry.report_own_address(self.session_id, session_name, lease, ports);
         drop(registry);
         self.runtime_ingress.attached();
+    }
+
+    /// Marks this box as attaching, with its lease not reported yet
+    /// (NET-070). While the mark stands, the hostname proxy refuses a peer
+    /// off the node, because it cannot tell this box's connections from one.
+    /// [`Self::report`] ends the mark, and so does [`Self::attach_ended`].
+    pub(crate) fn attach_started(&self) {
+        self.registry
+            .write()
+            .expect("hostname registry lock poisoned")
+            .begin_lease_attach(self.session_id);
+    }
+
+    /// Ends the mark [`Self::attach_started`] set, for an attach that failed
+    /// or was abandoned before it reported a lease (NET-070).
+    pub(crate) fn attach_ended(&self) {
+        self.registry
+            .write()
+            .expect("hostname registry lock poisoned")
+            .end_lease_attach(self.session_id);
     }
 
     /// The switch lease the attach reported for this box ([`Self::report`]),
@@ -694,95 +829,37 @@ impl Network for OwnIpNetwork {
     /// a self-allocated one otherwise, which only a native switch draws.
     fn plan(&self) -> PlanFuture<'_> {
         Box::pin(async move {
-            let (lease, control, subnet) = {
-                let mut s = self.switch.lock().await;
-                let subnet = s.subnet();
-                let attach = match (self.box_addresses.as_ref(), self.task_slots.as_deref()) {
-                    (Some(handed), _) => s
-                        .attach_handed(handed.switch_address)
-                        .await
-                        .map_err(NetworkError::new)?,
-                    (None, Some(slots)) => {
-                        s.attach_task_slot(slots).await.map_err(NetworkError::new)?
-                    }
-                    (None, None) => s.attach().await.map_err(NetworkError::new)?,
-                };
-                let control = match s.transport() {
-                    crate::net::SwitchTransport::LocalSpawn => {
-                        ControlChannel::Unix(s.control_socket())
-                    }
-                    crate::net::SwitchTransport::HostShuttle { cid, port } => {
-                        ControlChannel::Vsock { cid, port }
-                    }
-                };
-                (attach.lease, control, subnet)
-            };
-
-            let mechanism = tap_mechanism(&control);
-            *self.reserved.lock().unwrap() = Some(Reserved {
-                lease,
-                subnet,
-                control,
-                mechanism,
-            });
-            Ok(own_ip_plan(subnet, lease.ip, mechanism))
+            // NET-070: from here until the attach reports the lease, the box's
+            // connections come from a lease the node does not hold. A failed
+            // plan never reaches `attach` or `abandon`, so it ends the mark
+            // itself.
+            if let Some(own_address) = &self.own_address {
+                own_address.attach_started();
+            }
+            let planned = self.reserve().await;
+            if planned.is_err()
+                && let Some(own_address) = &self.own_address
+            {
+                own_address.attach_ended();
+            }
+            planned
         })
     }
 
     /// Relay the sandbox's tap onto the switch and apply its ingress. The
     /// reservation is read, not taken, until the attach has succeeded: a
     /// failed attach hands the release to [`abandon`](Self::abandon) (017-008).
-    fn attach(&self, mut spawned: Spawned) -> AttachFuture<'_> {
+    fn attach(&self, spawned: Spawned) -> AttachFuture<'_> {
         Box::pin(async move {
-            let Some(reserved) = self.reserved.lock().unwrap().clone() else {
-                return Err(NetworkError::new(std::io::Error::other(
-                    "own-IP attach without a plan: nothing was leased",
-                )));
-            };
-
-            // The mechanism `plan` chose; only the matching branch can succeed.
-            let tap_fd = match reserved.mechanism {
-                TapMechanism::InNamespace => {
-                    let Some(fd) = spawned.take_tap_fd() else {
-                        // Report what building one in-namespace needs: which
-                        // capability is missing separates a kernel-config
-                        // problem from a policy one.
-                        let tun = std::path::Path::new("/dev/net/tun").exists();
-                        let userns = sandbox::user_namespaces_restriction()
-                            .map_or_else(|| "available".to_string(), |r| r.to_string());
-                        return Err(NetworkError::new(std::io::Error::other(format!(
-                            "the box's sandbox could not create its network device \
-                             (/dev/net/tun present: {tun}; user namespaces: {userns})"
-                        ))));
-                    };
-                    fd
-                }
-                TapMechanism::Privileged => {
-                    privileged_tap(reserved.lease, reserved.subnet, spawned.netns_pid())
-                        .await
-                        .map_err(NetworkError::new)?
-                }
-            };
-
-            let guard = crate::net::gvproxy_network::complete_own_ip_attach(
-                &self.switch,
-                tap_fd,
-                reserved.control,
-                reserved.lease,
-                &self.identity,
-                self.policy.as_ref(),
-                self.own_address.as_ref(),
-                self.box_addresses.is_some()
-                    || self
-                        .task_slots
-                        .as_ref()
-                        .is_some_and(|slots| !slots.is_empty()),
-            )
-            .await
-            .map_err(NetworkError::new)?;
-            // Committed: the guard owns the release from here.
-            self.reserved.lock().unwrap().take();
-            Ok(Box::new(guard) as Box<dyn NetGuard>)
+            let attached = self.attach_reserved(spawned).await;
+            // NET-070: a successful attach ended the mark when it reported
+            // the lease. A failed one ends it here.
+            if attached.is_err()
+                && let Some(own_address) = &self.own_address
+            {
+                own_address.attach_ended();
+            }
+            attached
         })
     }
 
@@ -793,6 +870,10 @@ impl Network for OwnIpNetwork {
     /// which is what lets the same box's re-attach re-hand its address.
     fn abandon(&self) -> AbandonFuture<'_> {
         Box::pin(async move {
+            // NET-070: an abandoned launch reports no lease.
+            if let Some(own_address) = &self.own_address {
+                own_address.attach_ended();
+            }
             let Some(reserved) = self
                 .reserved
                 .lock()
@@ -807,6 +888,100 @@ impl Network for OwnIpNetwork {
                 tracing::warn!(error = %e, "detaching OwnIp PTask after an abandoned launch");
             }
         })
+    }
+}
+
+impl OwnIpNetwork {
+    /// The body of [`Network::plan`]: leases the address and records the
+    /// reservation.
+    async fn reserve(&self) -> Result<NetPlan, NetworkError> {
+        let (lease, control, subnet) = {
+            let mut s = self.switch.lock().await;
+            let subnet = s.subnet();
+            let attach = match (self.box_addresses.as_ref(), self.task_slots.as_deref()) {
+                (Some(handed), _) => s
+                    .attach_handed(handed.switch_address)
+                    .await
+                    .map_err(NetworkError::new)?,
+                (None, Some(slots)) => {
+                    s.attach_task_slot(slots).await.map_err(NetworkError::new)?
+                }
+                (None, None) => s.attach().await.map_err(NetworkError::new)?,
+            };
+            let control = match s.transport() {
+                crate::net::SwitchTransport::LocalSpawn => ControlChannel::Unix(s.control_socket()),
+                crate::net::SwitchTransport::HostShuttle { cid, port } => {
+                    ControlChannel::Vsock { cid, port }
+                }
+            };
+            (attach.lease, control, subnet)
+        };
+
+        let mechanism = tap_mechanism(&control);
+        *self.reserved.lock().unwrap() = Some(Reserved {
+            lease,
+            subnet,
+            control,
+            mechanism,
+        });
+        Ok(own_ip_plan(subnet, lease.ip, mechanism))
+    }
+
+    /// The body of [`Network::attach`]: relays the tap and applies the
+    /// ingress from the reservation `plan` made.
+    async fn attach_reserved(
+        &self,
+        mut spawned: Spawned,
+    ) -> Result<Box<dyn NetGuard>, NetworkError> {
+        let Some(reserved) = self.reserved.lock().unwrap().clone() else {
+            return Err(NetworkError::new(std::io::Error::other(
+                "own-IP attach without a plan: nothing was leased",
+            )));
+        };
+
+        // The mechanism `plan` chose; only the matching branch can succeed.
+        let tap_fd = match reserved.mechanism {
+            TapMechanism::InNamespace => {
+                let Some(fd) = spawned.take_tap_fd() else {
+                    // Report what building one in-namespace needs: which
+                    // capability is missing separates a kernel-config
+                    // problem from a policy one.
+                    let tun = std::path::Path::new("/dev/net/tun").exists();
+                    let userns = sandbox::user_namespaces_restriction()
+                        .map_or_else(|| "available".to_string(), |r| r.to_string());
+                    return Err(NetworkError::new(std::io::Error::other(format!(
+                        "the box's sandbox could not create its network device \
+                         (/dev/net/tun present: {tun}; user namespaces: {userns})"
+                    ))));
+                };
+                fd
+            }
+            TapMechanism::Privileged => {
+                privileged_tap(reserved.lease, reserved.subnet, spawned.netns_pid())
+                    .await
+                    .map_err(NetworkError::new)?
+            }
+        };
+
+        let guard = crate::net::gvproxy_network::complete_own_ip_attach(
+            &self.switch,
+            tap_fd,
+            reserved.control,
+            reserved.lease,
+            &self.identity,
+            self.policy.as_ref(),
+            self.own_address.as_ref(),
+            self.box_addresses.is_some()
+                || self
+                    .task_slots
+                    .as_ref()
+                    .is_some_and(|slots| !slots.is_empty()),
+        )
+        .await
+        .map_err(NetworkError::new)?;
+        // Committed: the guard owns the release from here.
+        self.reserved.lock().unwrap().take();
+        Ok(Box::new(guard) as Box<dyn NetGuard>)
     }
 }
 

@@ -34,6 +34,15 @@ pub struct PatchedBuild<'a, SF: crate::SourceFetcher> {
     /// The remote cache to consult before reporting a dependency missing.
     /// When `None`, dependency resolution stays purely local.
     pub remote_cache: Option<&'a RemoteCache<common::fetchers::AnyBackend>>,
+
+    /// The classifier leaf of the box this build runs for, if any (NET-155).
+    /// Carried to the spec build, so the box's egress verdict decides the
+    /// build's connections. `None` keeps the build as the caller's traffic.
+    pub classifier_leaf: Option<sandbox::config::ClassifierLeaf>,
+
+    /// The network of the own-address box this build runs for, if any
+    /// (NET-155). Carried to the spec build, the same as the leaf.
+    pub box_network: Option<crate::BuildNetwork>,
 }
 
 impl<'a, SF: crate::SourceFetcher> Runnable for PatchedBuild<'a, SF> {
@@ -76,7 +85,7 @@ impl<'a, SF: crate::SourceFetcher> Runnable for PatchedBuild<'a, SF> {
                                         .await
                                     {
                                         Ok(fetched) => fetched,
-                                        Err(rcache::Error::NotFound) => {
+                                        Err(rcache::Error::NotFound { .. }) => {
                                             // A plain miss: the dependency is
                                             // reported in the final error.
                                             missing.push(dep_build.name.clone());
@@ -146,6 +155,8 @@ impl<'a, SF: crate::SourceFetcher> Runnable for PatchedBuild<'a, SF> {
             stderr_writer: self.stderr_writer.take(),
             cancel: tokio_util::sync::CancellationToken::new(),
             cpu_weight: None,
+            classifier_leaf: self.classifier_leaf.clone(),
+            box_network: self.box_network.clone(),
         }
         .run(opts)
         .await?;
@@ -194,8 +205,9 @@ mod tests {
             &self,
             _url: &str,
             _sha256: &str,
+            _leaf: Option<&sandbox::config::ClassifierLeaf>,
             _op: &ot::OpTracker,
-        ) -> anyhow::Result<std::path::PathBuf> {
+        ) -> anyhow::Result<(std::path::PathBuf, bool)> {
             unreachable!("source fetch must not happen on these build paths")
         }
 
@@ -226,6 +238,8 @@ mod tests {
             stdout_writer: None,
             stderr_writer: None,
             remote_cache: None,
+            classifier_leaf: None,
+            box_network: None,
         }
     }
 
@@ -335,6 +349,8 @@ mod tests {
             stdout_writer: None,
             stderr_writer: None,
             remote_cache: Some(&remote_cache),
+            classifier_leaf: None,
+            box_network: None,
         };
         let opts = Options {
             cache: cache.clone(),
@@ -393,6 +409,8 @@ mod tests {
             stdout_writer: None,
             stderr_writer: None,
             remote_cache: Some(&remote_cache),
+            classifier_leaf: None,
+            box_network: None,
         };
         let opts = Options {
             cache: cache.clone(),
@@ -417,9 +435,70 @@ mod tests {
     }
 
     /// A dependency the remote index lists but whose artifact cannot be
-    /// fetched is reported as a fetch failure, not as absent.
+    /// fetched is reported as a fetch failure, not as absent. The failure
+    /// here is a corrupt artifact (its hash does not match the index); a
+    /// gone one is a miss, see the next test.
     #[tokio::test]
     async fn reports_remote_fetch_failure_distinctly_from_a_miss() {
+        let tmp = TempDir::new().unwrap();
+        let cache = Cache::at_dir(tmp.path()).unwrap();
+        let dg = graph_from(THREE_DEPS);
+
+        fake_build(&cache, &dg, "dep-a", "dep-a");
+        fake_build(&cache, &dg, "dep-c", "dep-c");
+
+        // The index lists dep-b, but its artifact is not what the index says.
+        let dep_b_hash = dg.spec_hash(dg.by_name("dep-b").unwrap());
+        let (index_bytes, sha256, _) = remote_artifact(std::slice::from_ref(&dep_b_hash));
+        let base = serve_objects(vec![
+            (INDEX_FILENAME.to_string(), index_bytes),
+            (
+                format!("{}.zst", hex::encode(sha256)),
+                b"not the artifact the index names".to_vec(),
+            ),
+        ]);
+        let remote_cache = RemoteCache::new_any_https(&base, None, None, IndexSource::Root)
+            .await
+            .expect("build remote cache over local server")
+            .with_fetch_retries(0);
+
+        let bsr = *dg.by_name("top").unwrap();
+        let fetcher = UnusedFetcher;
+        let mut pb = PatchedBuild {
+            spec: &bsr,
+            remote_fetcher: &fetcher,
+            stdout_writer: None,
+            stderr_writer: None,
+            remote_cache: Some(&remote_cache),
+            classifier_leaf: None,
+            box_network: None,
+        };
+        let opts = Options {
+            cache: cache.clone(),
+            graph: &dg,
+            exec_base: "/not-exists".into(),
+            ot: None,
+            daemon_id: None,
+        };
+
+        let err = pb.run(&opts).await.err().expect("dep-b cannot be fetched");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("could not fetch from the remote cache: dep-b"),
+            "dep-b must be reported as a fetch failure, got: {msg}"
+        );
+        assert!(
+            !msg.contains("could not find"),
+            "a fetch failure must not be reported as an absence, got: {msg}"
+        );
+    }
+
+    /// A dependency the remote index lists but whose artifact object is gone
+    /// (inbox#535: a snapshot index outlives the store's retention) is a
+    /// miss, reported as "could not find" like any other, not as a fetch
+    /// failure.
+    #[tokio::test]
+    async fn a_dangling_index_hit_is_reported_as_a_miss() {
         let tmp = TempDir::new().unwrap();
         let cache = Cache::at_dir(tmp.path()).unwrap();
         let dg = graph_from(THREE_DEPS);
@@ -444,6 +523,8 @@ mod tests {
             stdout_writer: None,
             stderr_writer: None,
             remote_cache: Some(&remote_cache),
+            classifier_leaf: None,
+            box_network: None,
         };
         let opts = Options {
             cache: cache.clone(),
@@ -453,15 +534,19 @@ mod tests {
             daemon_id: None,
         };
 
-        let err = pb.run(&opts).await.err().expect("dep-b cannot be fetched");
+        let err = pb
+            .run(&opts)
+            .await
+            .err()
+            .expect("dep-b is absent everywhere");
         let msg = format!("{err}");
         assert!(
-            msg.contains("could not fetch from the remote cache: dep-b"),
-            "dep-b must be reported as a fetch failure, got: {msg}"
+            msg.contains("could not find builds of: dep-b"),
+            "a dangling hit is a miss, got: {msg}"
         );
         assert!(
-            !msg.contains("could not find"),
-            "a fetch failure must not be reported as an absence, got: {msg}"
+            !msg.contains("could not fetch"),
+            "a gone artifact is not a fetch failure, got: {msg}"
         );
     }
 
@@ -487,6 +572,8 @@ mod tests {
             stdout_writer: None,
             stderr_writer: None,
             remote_cache: Some(&remote_cache),
+            classifier_leaf: None,
+            box_network: None,
         };
         let opts = Options {
             cache: cache.clone(),

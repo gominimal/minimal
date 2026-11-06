@@ -77,6 +77,11 @@ host can reach it. Minimal decides the request against the
 `ask` prompts the terminal attached to the session. With nobody attached,
 Minimal refuses the request at once. An unset or `deny` stance refuses it.
 
+Under `allow`, Minimal also publishes a port inside `--dynamic-range` when a
+process in the box listens on it. A `min net expose` of that port succeeds,
+names the address the port answers at, and publishes nothing more. That
+publication ends when the process stops listening on the port.
+
 The stances apply only to a `--network own_ip` box. On a `host_ip` box (the
 default), the port does not need exposing: the box shares the host's network
 and already answers at `<box>.min.internal:<PORT>`. Minimal refuses the

@@ -17,9 +17,10 @@
 //!   upstream unchanged (BEP-030). Its audit record is marked
 //!   [`FOREIGN_CREDENTIAL`] when it carries an `Authorization` header of its
 //!   own.
-//! - [`relay_responses`] writes each chunk the upstream sends to the box as
-//!   it arrives, and flushes it. It does not wait for the response to
-//!   complete (BEP-N01).
+//! - [`relay_responses`] reads each response head, removes every `Alt-Svc`
+//!   header (BEP-076), and writes the canonical head to the box. It writes
+//!   each part of the body to the box as it arrives, and flushes it. It does
+//!   not wait for the response to complete (BEP-N01).
 //!
 //! [`Unwired`], the redeemer [`crate::proxy::Proxy::new`] installs, is the
 //! test default. It refuses every sealed value as [`Check::Undecryptable`],
@@ -36,7 +37,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 use zeroize::{Zeroize as _, Zeroizing};
@@ -355,6 +356,24 @@ pub trait Redeemer: Send + Sync {
         }
         let (verdict, jti) = self.redeem_with_jti(box_id, authority, request, sealed);
         (Redeemed::Verdict(verdict), jti)
+    }
+
+    /// Decides one request as [`Self::redeem_reference`] does, and gives the
+    /// box id its audit record names as its subject, third. The default
+    /// subject is the flow's own box. A redeemer gives another box where the
+    /// flow names no single box, as a `host_ip` cohort delivery does
+    /// (BEP-084). It decides the subject in the same step as the verdict,
+    /// so the record names the box the verdict was reached for.
+    fn redeem_attributed(
+        &self,
+        box_id: &str,
+        authority: &Authority<String>,
+        request: &RequestAuthority<String>,
+        sealed: &str,
+        header: &str,
+    ) -> (Redeemed, String, String) {
+        let (redeemed, jti) = self.redeem_reference(box_id, authority, request, sealed, header);
+        (redeemed, jti, box_id.to_owned())
     }
 }
 
@@ -742,6 +761,43 @@ pub struct Flow {
     redeemer: Arc<dyn Redeemer>,
     validated: ValidatedUpstream,
     store: Option<Arc<dyn ValueReader>>,
+    /// Each forwarded request, in order, for the response half to frame its
+    /// response by.
+    sent: mpsc::UnboundedSender<Sent>,
+    /// The receiving end of `sent`, until [`Flow::responses`] takes it.
+    feed: Mutex<Option<mpsc::UnboundedReceiver<Sent>>>,
+}
+
+/// What the response half must know of a forwarded request to frame its
+/// response (RFC 9112 §6.3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Sent {
+    /// The request method is `HEAD`: its response has no body.
+    pub head: bool,
+    /// The request method is `CONNECT`: a `2xx` opens a tunnel.
+    pub connect: bool,
+    /// The request asks to leave HTTP/1.1, so it is the last on the flow.
+    /// The relay opens a tunnel on a `101` only when this is set.
+    pub switches: bool,
+}
+
+impl Sent {
+    fn of(request: &Request) -> Self {
+        Self {
+            head: request.method == "HEAD",
+            connect: request.method == "CONNECT",
+            switches: request.switches_protocol(),
+        }
+    }
+}
+
+/// The response half's view of a flow: the box, the authority, and each
+/// request the request half forwarded, in order.
+#[derive(Debug)]
+pub struct Responses {
+    box_id: String,
+    authority: String,
+    sent: mpsc::UnboundedReceiver<Sent>,
 }
 
 impl std::fmt::Debug for Flow {
@@ -784,6 +840,7 @@ impl Flow {
         redeemer: Arc<dyn Redeemer>,
         validated: ValidatedUpstream,
     ) -> Self {
+        let (sent, feed) = mpsc::unbounded_channel();
         Self {
             box_id: box_id.to_owned(),
             authority,
@@ -791,6 +848,25 @@ impl Flow {
             redeemer,
             validated,
             store: None,
+            sent,
+            feed: Mutex::new(Some(feed)),
+        }
+    }
+
+    /// The response half's view of this flow, for [`relay_responses`]. A
+    /// second call gets a view that receives no request.
+    #[must_use]
+    pub fn responses(&self) -> Responses {
+        let feed = self
+            .feed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            .unwrap_or_else(|| mpsc::unbounded_channel().1);
+        Responses {
+            box_id: self.box_id.clone(),
+            authority: format!("{}:{}", self.authority.host, self.authority.port),
+            sent: feed,
         }
     }
 
@@ -821,6 +897,7 @@ impl Flow {
         at: &SealedAt,
         admit: StoreAdmit,
         jti: &str,
+        subject: &str,
     ) -> Result<String, &'static str> {
         let span = tracing::Span::current();
         let identifier = admit.identifier();
@@ -879,9 +956,15 @@ impl Flow {
         );
         match result {
             Ok(()) => {
+                // The connection span names the reference as the audit
+                // record does, and never the value (BEP-028). It is set
+                // only for an injection that happened.
+                span.record("store", admit.store.as_str());
+                span.record("identifier", identifier.as_str());
                 span.record("substitution", "substituted");
                 span.record("cohort_attributed", admit.cohort_attributed);
-                self.record(
+                self.record_for(
+                    subject,
                     Outcome::Admit,
                     admit.marker,
                     Some(identifier),
@@ -892,7 +975,8 @@ impl Flow {
             }
             Err(marker) => {
                 span.record("substitution", "refused");
-                self.record(
+                self.record_for(
+                    subject,
                     Outcome::Refuse,
                     Some(marker),
                     Some(identifier),
@@ -916,9 +1000,22 @@ impl Flow {
         jti: &str,
         mapping: Mapping,
     ) {
+        self.record_for(&self.box_id, outcome, marker, identifier, jti, mapping);
+    }
+
+    /// [`Self::record`], with `subject` as the record's box.
+    fn record_for(
+        &self,
+        subject: &str,
+        outcome: Outcome,
+        marker: Option<&str>,
+        identifier: Option<String>,
+        jti: &str,
+        mapping: Mapping,
+    ) {
         self.audit.write(&Decision {
             kind: Kind::Decision,
-            box_id: self.box_id.clone(),
+            box_id: subject.to_owned(),
             authority: self.authority_text(),
             identifier,
             jti: jti.to_owned(),
@@ -963,11 +1060,14 @@ impl Flow {
         }
         match carried(request) {
             Carried::Sealed(at) => {
+                // The record's box is the one the redeemer names for the
+                // value: the flow's own, or for a cohort flow the box the
+                // value names (BEP-084).
                 let header = request
                     .headers
                     .get(at.header)
                     .map_or("", |h| h.name.as_str());
-                let (redeemed, jti) = self.redeemer.redeem_reference(
+                let (redeemed, jti, subject) = self.redeemer.redeem_attributed(
                     &self.box_id,
                     &self.authority,
                     &plain.request,
@@ -976,7 +1076,9 @@ impl Flow {
                 );
                 let verdict = match redeemed {
                     Redeemed::Store(admit) => {
-                        return self.inject_store(request, &at, admit, &jti).map(Some);
+                        return self
+                            .inject_store(request, &at, admit, &jti, &subject)
+                            .map(Some);
                     }
                     Redeemed::Verdict(verdict) => verdict,
                 };
@@ -992,7 +1094,8 @@ impl Flow {
                         if renewed {
                             // BEP-069: the renewal is its own audit record,
                             // written before the request's decision.
-                            self.record(
+                            self.record_for(
+                                &subject,
                                 Outcome::Admit,
                                 Some(SIGN_IN_RENEWED),
                                 Some(identifier.clone()),
@@ -1015,7 +1118,8 @@ impl Flow {
                             // The module mapped the request, so the refusal
                             // records the mapping (Gatehouse §6.10).
                             span.record("substitution", "refused");
-                            self.record(
+                            self.record_for(
+                                &subject,
                                 Outcome::Refuse,
                                 Some(marker),
                                 Some(identifier),
@@ -1029,12 +1133,20 @@ impl Flow {
                         // substitution never shows the cohort flag.
                         span.record("cohort_attributed", cohort_attributed);
                         // BEP-028: a cohort admission keeps its marker.
-                        self.record(Outcome::Admit, admitted, Some(identifier), &jti, mapping);
+                        self.record_for(
+                            &subject,
+                            Outcome::Admit,
+                            admitted,
+                            Some(identifier),
+                            &jti,
+                            mapping,
+                        );
                         Ok(None)
                     }
                     Verdict::Refuse(marker) => {
                         span.record("substitution", "refused");
-                        self.record(
+                        self.record_for(
+                            &subject,
                             Outcome::Refuse,
                             Some(marker),
                             None,
@@ -1102,6 +1214,52 @@ impl Flow {
             format!(
                 "The Box Egress Proxy refused the request to {authority}, because its Host header or its target names a different host."
             )
+        } else if marker == crate::redeemer::SIGN_IN_REQUIRED {
+            format!(
+                "The Box Egress Proxy refused the request to {authority}, because the GitHub sign-in on the host has ended. On the host, run `min auth login`, then send the request again."
+            )
+        } else if [
+            Check::Expired,
+            Check::Revoked,
+            Check::Undecryptable,
+            Check::UnboundedMember,
+        ]
+        .iter()
+        .any(|check| check.marker() == marker)
+        {
+            format!(
+                "The Box Egress Proxy refused the request to {authority}, because this box's sealed credential no longer works on this host. Create the box again to give it a new sealed credential."
+            )
+        } else if marker == Check::NoLiveBox.marker() {
+            // BEP-020: the source address resolves to no live box, so no box
+            // can be named as the owner of the sealed credential.
+            format!(
+                "The Box Egress Proxy refused the request to {authority}, because the request did not come from a running box on this host. Send the request from inside the running box that was given this sealed credential."
+            )
+        } else if marker == Check::CrossBox.marker() {
+            format!(
+                "The Box Egress Proxy refused the request to {authority}, because the sealed credential in the request belongs to another box. Send the request with the sealed credential that this box was given."
+            )
+        } else if marker == Check::OffPort.marker() {
+            // BEP-031: the hostname is credentialed, but not on this port.
+            format!(
+                "The Box Egress Proxy refused the request to {authority}, because this sealed credential is sent to {host} only on other ports, not on port {port}.",
+                host = self.authority.host,
+                port = self.authority.port,
+            )
+        } else if [Check::OutsideBoundSet, Check::OutsideCurrentSet]
+            .iter()
+            .any(|check| check.marker() == marker)
+        {
+            format!(
+                "The Box Egress Proxy refused the request to {authority}, because {authority} is not a host that this sealed credential is sent to."
+            )
+        } else if marker == Check::StoreHandleInvalid.marker() {
+            format!(
+                // BEP-064: the marker covers every `handle::Invalid` kind, so
+                // the text names each cause and no single remedy.
+                "The Box Egress Proxy refused the request to {authority}, because the reference to a stored secret in its sealed credential is not valid. Its signature can fail to verify, it can name another box or host, or it can be past its expiry. The host can also have nothing that admits it, admit it for other hosts than {authority}, or set a different header form for it."
+            )
         } else {
             format!(
                 "The Box Egress Proxy refused the request to {authority}, because it did not accept the sealed credential in the request."
@@ -1158,6 +1316,9 @@ pub fn forward_requests<R: Read, W: Write>(
                 header.value.zeroize();
             }
         }
+        // The response half learns of the request before the upstream can
+        // answer it, so it frames the answer by the request.
+        let _ = flow.sent.send(Sent::of(&request));
         let wrote = upstream.write_all(&head).and_then(|()| upstream.flush());
         head.zeroize();
         if let Err(err) = wrote {
@@ -1174,6 +1335,16 @@ pub fn forward_requests<R: Read, W: Write>(
         }
     };
     match &end {
+        // BEP-039: a refused head is audited, and its log line names the
+        // box and the framing rule, which the audit record has no field for.
+        HalfEnd::Closed(reason) if reason.audit_marker().is_some() => {
+            tracing::info!(
+                box_id = flow.box_id,
+                marker = reason.audit_marker(),
+                rule = reason.rule(),
+                "a request head was refused"
+            );
+        }
         HalfEnd::Closed(reason) => {
             tracing::debug!(
                 box_id = flow.box_id,
@@ -1210,50 +1381,53 @@ fn read_head<R: Read>(mut buf: Vec<u8>, reader: &mut R) -> Result<(Request, Vec<
     }
 }
 
-/// The response half of a flow: writes each chunk the upstream sends to the
-/// box, and flushes it, as it arrives (BEP-N01). It ends when the upstream
-/// closes. When the request half refuses a request, the box gets a `403`
-/// for it: at once when no request went upstream, and otherwise after the
-/// upstream closes.
+/// The response half of a flow. It reads each response head from the
+/// upstream, removes every `Alt-Svc` header (BEP-076), and writes the
+/// canonical head to the box. Then it relays the body by the response's
+/// framing, and writes and flushes each part as it arrives (BEP-N01). It
+/// does this for each response on a kept-alive flow.
+///
+/// A response to `HEAD`, a `1xx`, a `204` and a `304` have no body. A body
+/// that no header frames runs until the upstream closes. A `101` to a
+/// request that asks to switch protocols, or a `2xx` to `CONNECT`, leaves
+/// HTTP/1.1, and the relay copies the rest of the bytes unparsed. A `101` to
+/// any other request closes the flow. A response head that breaks the strict rules closes the flow,
+/// and no byte of it reaches the box.
+///
+/// It ends when the upstream closes. When the request half refuses a
+/// request, the box gets a `403` for it: at once when no request went
+/// upstream, and otherwise after the upstream closes.
 pub async fn relay_responses<R, W>(
     upstream: &mut R,
     client: &mut W,
+    responses: Responses,
     refused: oneshot::Receiver<Refusal>,
 ) where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buf = vec![0u8; RESPONSE_CHUNK];
-    let mut refused = Some(refused);
-    let mut refusal = None;
-    loop {
-        tokio::select! {
-            read = upstream.read(&mut buf) => match read {
-                Ok(0) => break,
-                Ok(n) => {
-                    if client.write_all(&buf[..n]).await.is_err() || client.flush().await.is_err() {
-                        return;
-                    }
-                }
-                Err(err) => {
-                    if err.kind() == io::ErrorKind::TimedOut {
-                        tracing::info!("the relayed flow was idle too long");
-                    }
-                    break;
-                }
-            },
-            got = async { refused.as_mut().expect("guarded").await }, if refused.is_some() => {
-                refused = None;
-                if let Ok(got) = got {
-                    let now = !got.after_forwarded;
-                    refusal = Some(got);
-                    if now {
-                        break;
-                    }
-                }
-            }
-        }
+    let mut relay = ResponseRelay {
+        upstream,
+        client,
+        chunk: vec![0u8; RESPONSE_CHUNK],
+        buf: Vec::new(),
+        out: Vec::new(),
+        refused: Some(refused),
+        refusal: None,
+        flow: responses,
+    };
+    if let Err(Stop::Client) = relay.run().await {
+        return;
     }
+    if relay.send().await.is_err() {
+        return;
+    }
+    let ResponseRelay {
+        client,
+        refused,
+        mut refusal,
+        ..
+    } = relay;
     // The upstream can close before the refusal arrives: take one that is
     // already sent, so the box sees the 403 and not a silent close.
     if refusal.is_none()
@@ -1266,6 +1440,242 @@ pub async fn relay_responses<R, W>(
         Some(refusal) => respond(client, 403, "Forbidden", &refusal.body).await,
         None => {
             let _ = client.shutdown().await;
+        }
+    }
+}
+
+/// Why the response relay stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    /// The upstream closed, failed or broke the framing, or a refusal came
+    /// for a request that never went upstream.
+    Upstream,
+    /// A write to the box failed.
+    Client,
+}
+
+/// The state of one response half.
+struct ResponseRelay<'a, R, W> {
+    upstream: &'a mut R,
+    client: &'a mut W,
+    /// The read buffer.
+    chunk: Vec<u8>,
+    /// The upstream bytes read and not yet relayed.
+    buf: Vec<u8>,
+    /// The bytes for the box that are not yet written.
+    out: Vec<u8>,
+    refused: Option<oneshot::Receiver<Refusal>>,
+    refusal: Option<Refusal>,
+    flow: Responses,
+}
+
+impl<R, W> ResponseRelay<'_, R, W>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    /// Relays responses until the upstream side stops.
+    async fn run(&mut self) -> Result<(), Stop> {
+        // The request that the next final response answers. Interim `1xx`
+        // responses answer it too.
+        let mut current: Option<Sent> = None;
+        loop {
+            let mut response = self.head().await?;
+            let request =
+                *current.get_or_insert_with(|| self.flow.sent.try_recv().unwrap_or_default());
+            // A `101` leaves HTTP/1.1 only for a request that asked to. Any
+            // other `101` would end the parse, and every later response
+            // would reach the box unread, with its `Alt-Svc` (BEP-076). So
+            // the flow closes before a byte of it reaches the box.
+            if response.status == 101 && !request.switches {
+                return Err(self.broken("unsolicited_switch"));
+            }
+            if response.headers.iter().any(|h| h.name == "alt-svc") {
+                response.strip_alt_svc();
+                tracing::debug!(
+                    box_id = self.flow.box_id,
+                    authority = self.flow.authority,
+                    status = response.status,
+                    "removed the Alt-Svc headers from a relayed response"
+                );
+            }
+            self.out.extend_from_slice(&response.serialize());
+            let status = response.status;
+            if status == 101 || (request.connect && (200..300).contains(&status)) {
+                return self.tunnel().await;
+            }
+            if (100..200).contains(&status) {
+                self.send().await?;
+                continue;
+            }
+            current = None;
+            if request.head || status == 204 || status == 304 {
+                self.send().await?;
+                continue;
+            }
+            match response.body {
+                http::BodyFraming::ContentLength(n) => self.copy(n).await?,
+                http::BodyFraming::Chunked => self.chunked().await?,
+                http::BodyFraming::None => return self.tunnel().await,
+            }
+            self.send().await?;
+        }
+    }
+
+    /// Writes and flushes the bytes for the box.
+    async fn send(&mut self) -> Result<(), Stop> {
+        if self.out.is_empty() {
+            return Ok(());
+        }
+        let wrote = self.client.write_all(&self.out).await;
+        self.out.clear();
+        if wrote.is_err() || self.client.flush().await.is_err() {
+            return Err(Stop::Client);
+        }
+        Ok(())
+    }
+
+    /// Sends what the box is owed, then reads more upstream bytes onto
+    /// `buf`. So no byte waits in a buffer while the relay waits for the
+    /// upstream (BEP-N01).
+    async fn fill(&mut self) -> Result<(), Stop> {
+        self.send().await?;
+        let Self {
+            upstream,
+            chunk,
+            buf,
+            refused,
+            refusal,
+            ..
+        } = self;
+        loop {
+            tokio::select! {
+                read = upstream.read(chunk) => return match read {
+                    Ok(0) => Err(Stop::Upstream),
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        Ok(())
+                    }
+                    Err(err) => {
+                        if err.kind() == io::ErrorKind::TimedOut {
+                            tracing::info!("the relayed flow was idle too long");
+                        }
+                        Err(Stop::Upstream)
+                    }
+                },
+                got = async { refused.as_mut().expect("guarded").await }, if refused.is_some() => {
+                    *refused = None;
+                    if let Ok(got) = got {
+                        let now = !got.after_forwarded;
+                        *refusal = Some(got);
+                        if now {
+                            return Err(Stop::Upstream);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reads one response head under the strict rules.
+    async fn head(&mut self) -> Result<http::Response, Stop> {
+        loop {
+            match http::parse_response(&self.buf) {
+                Ok(Parse::Complete { head, head_len }) => {
+                    self.buf.drain(..head_len);
+                    return Ok(head);
+                }
+                Ok(Parse::Partial) => self.fill().await?,
+                Err(reason) => return Err(self.broken(reason.rule())),
+            }
+        }
+    }
+
+    /// Logs the rule that a response broke, and stops.
+    fn broken(&self, rule: &'static str) -> Stop {
+        tracing::debug!(
+            box_id = self.flow.box_id,
+            authority = self.flow.authority,
+            rule,
+            "the upstream response broke the framing rules"
+        );
+        Stop::Upstream
+    }
+
+    /// Relays exactly `n` body bytes.
+    async fn copy(&mut self, mut n: u64) -> Result<(), Stop> {
+        while n > 0 {
+            if self.buf.is_empty() {
+                self.fill().await?;
+            }
+            let take = usize::try_from(n).map_or(self.buf.len(), |n| n.min(self.buf.len()));
+            self.out.extend(self.buf.drain(..take));
+            n -= take as u64;
+        }
+        Ok(())
+    }
+
+    /// One line, without its CRLF.
+    async fn line(&mut self) -> Result<Vec<u8>, Stop> {
+        loop {
+            if let Some(end) = self.buf.windows(2).position(|w| w == b"\r\n") {
+                if end > http::MAX_CHUNK_LINE_LEN {
+                    return Err(self.broken("chunk_line_too_long"));
+                }
+                let line: Vec<u8> = self.buf.drain(..end + 2).take(end).collect();
+                if line.iter().any(|&b| b == b'\r' || b == b'\n') {
+                    return Err(self.broken("bare_cr_or_lf"));
+                }
+                return Ok(line);
+            }
+            if self.buf.len() > http::MAX_CHUNK_LINE_LEN {
+                return Err(self.broken("chunk_line_too_long"));
+            }
+            self.fill().await?;
+        }
+    }
+
+    /// Relays a chunked body in the canonical form: each chunk as `size
+    /// CRLF data CRLF`, with its data as it arrives, then `0 CRLF CRLF`.
+    /// Chunk extensions and trailer fields are dropped.
+    async fn chunked(&mut self) -> Result<(), Stop> {
+        loop {
+            let line = self.line().await?;
+            let size = match http::parse_chunk_size(&line) {
+                Ok(size) => size,
+                Err(reason) => return Err(self.broken(reason.rule())),
+            };
+            if size == 0 {
+                break;
+            }
+            self.out
+                .extend_from_slice(format!("{size:x}\r\n").as_bytes());
+            self.copy(size).await?;
+            if !self.line().await?.is_empty() {
+                return Err(self.broken("chunk_data_crlf"));
+            }
+            self.out.extend_from_slice(b"\r\n");
+        }
+        let mut trailer_len = 0;
+        loop {
+            let line = self.line().await?;
+            if line.is_empty() {
+                break;
+            }
+            trailer_len += line.len() + 2;
+            if trailer_len > http::MAX_HEAD_LEN {
+                return Err(self.broken("trailer_too_large"));
+            }
+        }
+        self.out.extend_from_slice(b"0\r\n\r\n");
+        Ok(())
+    }
+
+    /// Copies every byte that is left, unparsed, until the upstream closes.
+    async fn tunnel(&mut self) -> Result<(), Stop> {
+        loop {
+            self.out.append(&mut self.buf);
+            self.fill().await?;
         }
     }
 }
@@ -2223,7 +2633,9 @@ mod tests {
             .unwrap();
             up_far.shutdown().await.unwrap();
             drop(up_far);
-            relay_responses(&mut up, &mut client, rx).await;
+            let (_, audit) = memory_audit();
+            let responses = plain_flow("api.github.com", audit).responses();
+            relay_responses(&mut up, &mut client, responses, rx).await;
             drop(client);
             let mut out = String::new();
             client_far.read_to_string(&mut out).await.unwrap();
@@ -2407,6 +2819,93 @@ mod tests {
         let records = Arc::new(Mutex::new(Vec::<Decision>::new()));
         let audit: Arc<dyn AuditWriter> = records.clone();
         (records, audit)
+    }
+
+    /// Runs `f` under a debug subscriber that also logs span closes. Gives
+    /// what it logged.
+    fn logged_spans(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().expect("log buffer").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .with_writer(move || sink.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.0.lock().expect("log buffer").clone();
+        String::from_utf8(bytes).expect("utf-8 log")
+    }
+
+    // BEP-028, T29: a redeemed store reference's `box_connection` span
+    // carries the store and the identifier, as the audit record names them,
+    // and never the stored value. A request with no reference leaves them
+    // empty.
+    #[test]
+    fn store_reference_span_names_store_and_identifier_not_value() {
+        let sealed = sealed_text();
+        let store = store_with(b"sk-span-secret");
+        let (records, audit) = memory_audit();
+        let flow = store_flow(&store, bearer_form(), audit);
+        let mut sent = None;
+        let log = logged_spans(|| {
+            let _entered = crate::proxy::connection_span("b", &"10.0.0.2:40000").entered();
+            sent = Some(send_store(
+                &flow,
+                &format!("Authorization: Bearer {sealed}"),
+            ));
+        });
+        let (upstream, end) = sent.expect("the request ran");
+        assert_eq!(refusal(&end), None, "{end:?}");
+        assert!(upstream.contains("sk-span-secret"), "{upstream}");
+        let close = log
+            .lines()
+            .find(|line| line.contains("box_connection{") && line.contains("close"))
+            .unwrap_or_else(|| panic!("no span close in {log}"));
+        assert!(close.contains(r#"store="keychain""#), "{close}");
+        assert!(close.contains(r#"identifier="keychain:openai""#), "{close}");
+        let records = records.lock().unwrap().clone();
+        assert_eq!(records[0].identifier.as_deref(), Some("keychain:openai"));
+        assert!(!log.contains("sk-span-secret"), "{log}");
+        assert!(!log.contains(&sealed), "{log}");
+
+        // No reference: the span has no store and no identifier.
+        let log = logged_spans(|| {
+            let _entered = crate::proxy::connection_span("b", &"10.0.0.2:40000").entered();
+            let _ = send_store(&flow, "Accept: */*");
+        });
+        let close = log
+            .lines()
+            .find(|line| line.contains("box_connection{") && line.contains("close"))
+            .unwrap_or_else(|| panic!("no span close in {log}"));
+        assert!(!close.contains("store="), "{close}");
+        assert!(!close.contains("identifier="), "{close}");
+
+        // A refused reference: nothing was injected, so the span has no
+        // store and no identifier, and says the substitution was refused.
+        let log = logged_spans(|| {
+            let _entered = crate::proxy::connection_span("b", &"10.0.0.2:40000").entered();
+            let (_, end) = send_store(&flow, &format!("x-api-key: {sealed}"));
+            assert_eq!(refusal(&end), Some(SEALED_HEADER_MISPLACED), "{end:?}");
+        });
+        let close = log
+            .lines()
+            .find(|line| line.contains("box_connection{") && line.contains("close"))
+            .unwrap_or_else(|| panic!("no span close in {log}"));
+        assert!(!close.contains("store="), "{close}");
+        assert!(!close.contains("identifier="), "{close}");
+        assert!(close.contains("refused"), "{close}");
     }
 
     // BEP-032: an admitted store reference reaches the rule's upstream with
@@ -2730,6 +3229,75 @@ mod tests {
         assert!(!upstream.contains("sk-old-key"));
     }
 
+    // BEP-003: each refusal of a sealed credential names its cause, and a
+    // next step where the person has one. The audit marker is unchanged.
+    #[test]
+    fn each_refusal_names_its_cause_and_next_step() {
+        let store = store_with(b"sk-key");
+        let (_records, audit) = memory_audit();
+        let flow = store_flow(&store, bearer_form(), audit);
+        let authority = flow.authority_text();
+        let prefix = format!("The Box Egress Proxy refused the request to {authority}, because ");
+        let body = |marker: &str| {
+            let body = flow.refusal_body(marker);
+            body.strip_prefix(&prefix)
+                .unwrap_or_else(|| panic!("{marker}: {body}"))
+                .to_owned()
+        };
+
+        assert_eq!(
+            body("github_sign_in_required"),
+            "the GitHub sign-in on the host has ended. On the host, run `min auth login`, \
+             then send the request again."
+        );
+        for marker in ["expired", "revoked", "undecryptable", "unbounded_member"] {
+            assert_eq!(
+                body(marker),
+                "this box's sealed credential no longer works on this host. Create the box \
+                 again to give it a new sealed credential.",
+                "{marker}"
+            );
+        }
+        assert_eq!(
+            body("no_live_box"),
+            "the request did not come from a running box on this host. Send the request \
+             from inside the running box that was given this sealed credential."
+        );
+        assert_eq!(
+            body("cross_box"),
+            "the sealed credential in the request belongs to another box. Send the \
+             request with the sealed credential that this box was given."
+        );
+        assert_eq!(
+            body("off_port"),
+            format!(
+                "this sealed credential is sent to {} only on other ports, not on port {}.",
+                flow.authority.host, flow.authority.port
+            )
+        );
+        for marker in ["outside_bound_set", "outside_current_set"] {
+            assert_eq!(
+                body(marker),
+                format!("{authority} is not a host that this sealed credential is sent to."),
+                "{marker}"
+            );
+        }
+        assert_eq!(
+            body("store_handle_invalid"),
+            format!(
+                "the reference to a stored secret in its sealed credential is not valid. Its \
+                 signature can fail to verify, it can name another box or host, or it can be \
+                 past its expiry. The host can also have nothing that admits it, admit it for \
+                 other hosts than {authority}, or set a different header form for it."
+            )
+        );
+        // A marker with no cause of its own keeps the general text.
+        assert_eq!(
+            body("some_other_marker"),
+            "it did not accept the sealed credential in the request."
+        );
+    }
+
     // BEP-066: a stored value or a prefix with a line break is refused, and
     // the audit record is marked `injection_invalid`.
     #[test]
@@ -2907,6 +3475,479 @@ mod tests {
         assert_eq!(
             records.last().unwrap().marker.as_deref(),
             Some(SIGN_IN_REQUIRED)
+        );
+    }
+
+    fn name_case(name: &str, mask: u64) -> String {
+        name.chars()
+            .enumerate()
+            .map(|(i, c)| {
+                if mask >> (i % 64) & 1 == 1 {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                }
+            })
+            .collect()
+    }
+
+    fn ows() -> impl Strategy<Value = &'static str> {
+        prop_oneof![Just(""), Just(" "), Just("  "), Just("\t"), Just(" \t ")]
+    }
+
+    fn header_line() -> impl Strategy<Value = (String, String, String, String, u64)> {
+        (
+            "x-[a-z0-9-]{1,12}",
+            "[!-~]([ !-~]{0,20}[!-~])?",
+            ows(),
+            ows(),
+            any::<u64>(),
+        )
+            .prop_map(|(n, v, a, b, m)| (n, v, a.to_owned(), b.to_owned(), m))
+    }
+
+    #[derive(Debug, Clone)]
+    enum FramingLine {
+        Length(String),
+        Te(&'static str),
+        Fold,
+    }
+
+    fn framing_line() -> impl Strategy<Value = FramingLine> {
+        prop_oneof![
+            (0u64..100_000).prop_map(|n| FramingLine::Length(n.to_string())),
+            Just(FramingLine::Length("5, 5".to_owned())),
+            Just(FramingLine::Length("5, 6".to_owned())),
+            Just(FramingLine::Length("+5".to_owned())),
+            Just(FramingLine::Length("0x5".to_owned())),
+            Just(FramingLine::Length("5,".to_owned())),
+            Just(FramingLine::Length(", 5".to_owned())),
+            Just(FramingLine::Te("chunked")),
+            Just(FramingLine::Te("Chunked")),
+            Just(FramingLine::Te("gzip")),
+            Just(FramingLine::Te("gzip, chunked")),
+            Just(FramingLine::Te("chunked, gzip")),
+            Just(FramingLine::Te("chunked, chunked")),
+            Just(FramingLine::Te("identity")),
+            Just(FramingLine::Te("chunked,")),
+            Just(FramingLine::Te(", chunked")),
+            Just(FramingLine::Fold),
+        ]
+    }
+
+    /// The oracle: whether a head with these framing lines is ambiguous
+    /// under BEP-077's rules.
+    fn oracle_ambiguous(lines: &[FramingLine]) -> bool {
+        let mut lengths = Vec::new();
+        let mut codings = Vec::new();
+        let mut has_te = false;
+        let mut fold = false;
+        for line in lines {
+            match line {
+                FramingLine::Length(v) => lengths.extend(v.split(',').map(|s| s.trim().to_owned())),
+                FramingLine::Te(v) => {
+                    has_te = true;
+                    codings.extend(v.split(',').map(|s| s.trim().to_ascii_lowercase()));
+                }
+                FramingLine::Fold => fold = true,
+            }
+        }
+        let invalid_length = lengths
+            .iter()
+            .any(|l| l.parse::<u64>().is_err() || l.starts_with('+'));
+        fold || (has_te && !lengths.is_empty())
+            || lengths.len() > 1
+            || invalid_length
+            || (has_te && codings != ["chunked"])
+    }
+
+    /// A flow for box `box-a` to `host`:443, whose box may reach the GitHub
+    /// hosts, and which audits to `audit`.
+    fn plain_flow(host: &str, audit: Arc<dyn AuditWriter>) -> Flow {
+        Flow::new(
+            "box-a",
+            Authority {
+                host: host.to_owned(),
+                port: 443,
+            },
+            audit,
+            Arc::new(Declared),
+            Validated::unchecked(()).proof(),
+        )
+    }
+
+    /// Runs the response half of a flow over the upstream bytes `upstream`,
+    /// and gives what reached the box.
+    fn relayed(responses: Responses, upstream: &[u8]) -> Vec<u8> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (_tx, rx) = oneshot::channel();
+            let mut up = upstream;
+            let mut client = Vec::new();
+            relay_responses(&mut up, &mut client, responses, rx).await;
+            client
+        })
+    }
+
+    /// Forwards the box's bytes `requests` on `flow`, and gives what reached
+    /// the upstream and how the request half ended.
+    fn forwarded(flow: &Flow, requests: &[u8]) -> (Vec<u8>, HalfEnd) {
+        let mut client = std::io::Cursor::new(requests.to_vec());
+        let mut upstream = Vec::new();
+        let end = forward_requests(flow, &mut client, &mut upstream);
+        (upstream, end)
+    }
+
+    // BEP-076: every `Alt-Svc` header leaves each response the live relay
+    // sends to the box, on every response of a kept-alive flow. The reply to
+    // `HEAD` has no body, so the next response is still read as a head.
+    #[test]
+    fn alt_svc_is_stripped_from_responses() {
+        let (_, audit) = memory_audit();
+        let flow = plain_flow("api.github.com", audit);
+        let responses = flow.responses();
+        let (upstream, end) = forwarded(
+            &flow,
+            b"POST /a HTTP/1.1\r\nHost: api.github.com\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi\
+              HEAD /b HTTP/1.1\r\nHost: api.github.com\r\n\r\n\
+              GET /c HTTP/1.1\r\nHost: api.github.com\r\n\r\n",
+        );
+        assert!(
+            matches!(end, HalfEnd::Closed(CloseReason::ClientClosed)),
+            "{end:?}"
+        );
+        assert_eq!(
+            String::from_utf8(upstream)
+                .unwrap()
+                .matches(" HTTP/1.1\r\n")
+                .count(),
+            3
+        );
+        let raw: &[u8] = b"HTTP/1.1 100 Continue\r\nAlt-Svc: h3=\":443\"\r\n\r\n\
+            HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+            Alt-Svc: h3=\":443\"; ma=86400\r\nContent-Length: 2\r\nalt-svc: clear\r\n\
+            ALT-SVC: h3-29=\":443\"\r\n\r\nok\
+            HTTP/1.1 200 OK\r\nContent-Length: 9\r\nAlt-Svc: h3=\":443\"\r\n\r\n\
+            HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nAlt-Svc: h3=\":443\"\r\n\r\n\
+            2\r\nab\r\n0\r\n\r\n";
+        let client = relayed(responses, raw);
+        assert_eq!(
+            String::from_utf8(client.clone()).unwrap(),
+            "HTTP/1.1 100 Continue\r\n\r\n\
+             HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 2\r\n\r\nok\
+             HTTP/1.1 200 OK\r\ncontent-length: 9\r\n\r\n\
+             HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n2\r\nab\r\n0\r\n\r\n"
+        );
+        let lower = String::from_utf8_lossy(&client).to_ascii_lowercase();
+        assert!(!lower.contains("alt-svc"));
+    }
+
+    // BEP-074: the h2 prior-knowledge preface closes the flow. Nothing
+    // reaches the upstream, and nothing comes back to the box.
+    #[test]
+    fn h2_prior_knowledge_preface_is_closed() {
+        assert_eq!(
+            http::parse_request(http::H2_PREFACE),
+            Err(CloseReason::H2Preface)
+        );
+        assert_eq!(
+            http::parse_request(b"PRI * HTTP/2.0\r\n"),
+            Err(CloseReason::H2Preface),
+            "the first line of the preface is enough"
+        );
+        let (records, audit) = memory_audit();
+        let flow = plain_flow("github.com", audit);
+        let responses = flow.responses();
+        let (upstream, end) = forwarded(&flow, http::H2_PREFACE);
+        let HalfEnd::Closed(reason) = end else {
+            panic!("{end:?}");
+        };
+        assert_eq!(reason, CloseReason::H2Preface);
+        assert_eq!(reason.rule(), "h2_prior_knowledge_preface");
+        assert!(upstream.is_empty(), "no byte reaches the upstream");
+        assert!(records.lock().unwrap().is_empty());
+        let mut responses = responses;
+        assert!(
+            responses.sent.try_recv().is_err(),
+            "the response half has no request to answer"
+        );
+    }
+
+    // BEP-076: a `101` to a request that did not ask to switch protocols
+    // closes the flow. Neither the `101` nor any later byte reaches the box,
+    // so a later `Alt-Svc` cannot pass unread.
+    #[test]
+    fn unsolicited_switch_is_refused() {
+        let (_, audit) = memory_audit();
+        let flow = plain_flow("api.github.com", audit);
+        let responses = flow.responses();
+        let (upstream, _) = forwarded(&flow, b"GET /a HTTP/1.1\r\nHost: api.github.com\r\n\r\n");
+        assert!(!upstream.is_empty());
+        let client = relayed(
+            responses,
+            b"HTTP/1.1 101 Switching\r\n\r\n\
+              HTTP/1.1 200 OK\r\nAlt-Svc: h3=\":443\"\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert!(client.is_empty(), "{:?}", String::from_utf8_lossy(&client));
+    }
+
+    // A `101` to a request that asks to switch protocols still opens the
+    // tunnel: the box gets the head, then the bytes after it unparsed.
+    #[test]
+    fn solicited_switch_opens_the_tunnel() {
+        let (_, audit) = memory_audit();
+        let flow = plain_flow("api.github.com", audit);
+        let responses = flow.responses();
+        let (_, end) = forwarded(
+            &flow,
+            b"GET /ws HTTP/1.1\r\nHost: api.github.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        );
+        assert!(
+            matches!(end, HalfEnd::Closed(CloseReason::ProtocolSwitch { .. })),
+            "{end:?}"
+        );
+        let client = relayed(
+            responses,
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n\x81\x02hi",
+        );
+        assert_eq!(
+            client,
+            b"HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\n\r\n\x81\x02hi"
+        );
+    }
+
+    // BEP-076: a chunked body that breaks the framing rules stops the relay.
+    // The box keeps what arrived before the break, and no later byte, so a
+    // later response with an `Alt-Svc` never reaches it.
+    #[test]
+    fn broken_chunked_body_stops_the_relay() {
+        let head = "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n";
+        let next = "HTTP/1.1 200 OK\r\nAlt-Svc: h3=\":443\"\r\nContent-Length: 0\r\n\r\n";
+        let trailer = format!("X-Trailer: {}\r\n", "a".repeat(4000)).repeat(17);
+        let cases = [
+            ("bad chunk size", format!("zz\r\n{next}"), ""),
+            (
+                "no CRLF after the chunk data",
+                format!("2\r\nabXY\r\n{next}"),
+                "2\r\nab",
+            ),
+            ("oversized trailer", format!("0\r\n{trailer}\r\n{next}"), ""),
+            ("EOF in a chunk", "5\r\nab".to_owned(), "5\r\nab"),
+        ];
+        for (case, body, kept) in cases {
+            let (_, audit) = memory_audit();
+            let flow = plain_flow("api.github.com", audit);
+            let responses = flow.responses();
+            let (_, end) = forwarded(
+                &flow,
+                b"GET /a HTTP/1.1\r\nHost: api.github.com\r\n\r\nGET /b HTTP/1.1\r\nHost: api.github.com\r\n\r\n",
+            );
+            assert!(
+                matches!(end, HalfEnd::Closed(CloseReason::ClientClosed)),
+                "{case}: {end:?}"
+            );
+            let raw = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{body}");
+            let client = relayed(responses, raw.as_bytes());
+            assert_eq!(
+                String::from_utf8(client).unwrap(),
+                format!("{head}{kept}"),
+                "{case}"
+            );
+        }
+    }
+
+    // BEP-076: a `204` and a `304` have no body, so the next bytes are read
+    // as a head and lose their `Alt-Svc`. A body that no header frames runs
+    // until the upstream closes, and reaches the box as it arrived.
+    #[test]
+    fn bodiless_and_close_delimited_responses_are_relayed() {
+        let (_, audit) = memory_audit();
+        let flow = plain_flow("api.github.com", audit);
+        let responses = flow.responses();
+        let (_, end) = forwarded(
+            &flow,
+            b"GET /a HTTP/1.1\r\nHost: api.github.com\r\n\r\n\
+              GET /b HTTP/1.1\r\nHost: api.github.com\r\n\r\n\
+              GET /c HTTP/1.1\r\nHost: api.github.com\r\n\r\n",
+        );
+        assert!(
+            matches!(end, HalfEnd::Closed(CloseReason::ClientClosed)),
+            "{end:?}"
+        );
+        let client = relayed(
+            responses,
+            b"HTTP/1.1 204 No Content\r\nAlt-Svc: h3=\":443\"\r\n\r\n\
+              HTTP/1.1 304 Not Modified\r\nAlt-Svc: h3=\":443\"\r\n\r\n\
+              HTTP/1.1 200 OK\r\nAlt-Svc: h3=\":443\"\r\n\r\nall of it, until close",
+        );
+        assert_eq!(
+            String::from_utf8(client).unwrap(),
+            "HTTP/1.1 204 No Content\r\n\r\n\
+             HTTP/1.1 304 Not Modified\r\n\r\n\
+             HTTP/1.1 200 OK\r\n\r\nall of it, until close"
+        );
+    }
+
+    // BEP-077: the forwarded head is the canonical serialization of the
+    // parsed request, never the box's bytes, and it parses back the same.
+    // BEP-076: the response that answers it reaches the box canonical, with
+    // no `Alt-Svc`.
+    proptest! {
+        #[test]
+        fn prop_forwarded_head_is_canonical(
+            method in "[A-Z]{1,10}",
+            target in "/[!-~]{0,40}",
+            host_mask in any::<u64>(),
+            alt_svc_mask in any::<u64>(),
+            headers in prop::collection::vec(header_line(), 0..8),
+            body in prop_oneof![
+                Just(None),
+                (0u64..1_000_000).prop_map(|n| Some(format!("Content-Length: {n}"))),
+                Just(Some("Transfer-Encoding: chunked".to_owned())),
+            ],
+        ) {
+            let mut raw = format!("{method} {target} HTTP/1.1\r\n{}: github.com\r\n", name_case("host", host_mask));
+            let mut expected = format!("{method} {target} HTTP/1.1\r\nhost: github.com\r\n");
+            let mut response = format!("HTTP/1.1 200 OK\r\n{}: h3=\":443\"\r\n", name_case("alt-svc", alt_svc_mask));
+            let mut relayed_head = String::from("HTTP/1.1 200 OK\r\n");
+            for (name, value, pre, post, mask) in &headers {
+                let line = format!("{}:{pre}{value}{post}\r\n", name_case(name, *mask));
+                raw.push_str(&line);
+                response.push_str(&line);
+                expected.push_str(&format!("{name}: {value}\r\n"));
+                relayed_head.push_str(&format!("{name}: {value}\r\n"));
+            }
+            if let Some(line) = &body {
+                raw.push_str(&format!("{line}\r\n"));
+                let (n, v) = line.split_once(": ").unwrap();
+                expected.push_str(&format!("{}: {v}\r\n", n.to_ascii_lowercase()));
+            }
+            raw.push_str("\r\n");
+            expected.push_str("\r\n");
+            response.push_str("Content-Length: 2\r\n\r\nok");
+            relayed_head.push_str("content-length: 2\r\n\r\n");
+            let mut input = raw.clone().into_bytes();
+            input.extend_from_slice(b"body-bytes");
+
+            let (records, audit) = memory_audit();
+            let flow = plain_flow("github.com", audit);
+            let responses = flow.responses();
+            let (upstream, end) = forwarded(&flow, &input);
+            prop_assert!(matches!(end, HalfEnd::Closed(_)), "{end:?}");
+            let head_len = upstream.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let head = &upstream[..head_len];
+            prop_assert_eq!(String::from_utf8(head.to_vec()).unwrap(), expected);
+            prop_assert!(records.lock().unwrap().iter().all(|d| d.outcome != Outcome::Refuse));
+            let Ok(Parse::Complete { head: again, head_len: len }) = http::parse_request(head) else {
+                panic!("the forwarded head parses");
+            };
+            prop_assert_eq!(len, head.len());
+            prop_assert_eq!(again.serialize(), head.to_vec());
+
+            let client = relayed(responses, response.as_bytes());
+            let mut want = relayed_head.into_bytes();
+            if method != "HEAD" {
+                want.extend_from_slice(b"ok");
+            }
+            prop_assert_eq!(client, want);
+        }
+    }
+
+    // BEP-077: a head is forwarded only when its framing is unambiguous, and
+    // otherwise the flow closes and the refusal is audited. A response head
+    // under the same rules reaches the box only when its framing is
+    // unambiguous.
+    proptest! {
+        #[test]
+        fn prop_ambiguous_framing_is_refused(
+            lines in prop::collection::vec(framing_line(), 0..4),
+            name_mask in any::<u64>(),
+        ) {
+            let mut framing = String::new();
+            for line in &lines {
+                match line {
+                    FramingLine::Length(v) => framing.push_str(&format!("{}: {v}\r\n", name_case("content-length", name_mask))),
+                    FramingLine::Te(v) => framing.push_str(&format!("{}: {v}\r\n", name_case("transfer-encoding", name_mask))),
+                    FramingLine::Fold => framing.push_str("X-Note: a\r\n folded\r\n"),
+                }
+            }
+            let raw = format!("POST /repo.git/git-receive-pack HTTP/1.1\r\nHost: github.com\r\n{framing}\r\n");
+            let response = format!("HTTP/1.1 200 OK\r\n{framing}\r\n");
+
+            let (records, audit) = memory_audit();
+            let flow = plain_flow("github.com", audit);
+            let responses = flow.responses();
+            let (upstream, end) = forwarded(&flow, raw.as_bytes());
+            let HalfEnd::Closed(reason) = end else {
+                panic!("{end:?}");
+            };
+            let client = relayed(responses, response.as_bytes());
+            let records = records.lock().unwrap().clone();
+            if oracle_ambiguous(&lines) {
+                prop_assert!(matches!(reason, CloseReason::FramingAmbiguous(_)), "{reason:?}");
+                prop_assert!(upstream.is_empty(), "no byte reaches the upstream");
+                prop_assert_eq!(records.len(), 1);
+                prop_assert_eq!(records[0].outcome, Outcome::Refuse);
+                prop_assert_eq!(records[0].marker.as_deref(), Some(http::FRAMING_AMBIGUOUS));
+                prop_assert!(client.is_empty(), "no byte of the response reaches the box");
+            } else {
+                let Ok(Parse::Complete { head, .. }) = http::parse_request(raw.as_bytes()) else {
+                    panic!("an unambiguous head parses");
+                };
+                prop_assert_eq!(upstream, head.serialize());
+                prop_assert!(records.iter().all(|d| d.outcome != Outcome::Refuse));
+                let Ok(Parse::Complete { head, .. }) = http::parse_response(response.as_bytes()) else {
+                    panic!("an unambiguous response head parses");
+                };
+                prop_assert_eq!(client, head.serialize());
+            }
+        }
+    }
+
+    // BEP-039, #2435: a head with ambiguous framing that the live request
+    // half reads is refused before any byte goes upstream. The audit log
+    // that `min box audit <box>` reads holds one `framing_ambiguous` refuse
+    // record for the box, and the log line names the box and the rule.
+    #[test]
+    fn live_path_audits_a_framing_ambiguous_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let flow = plain_flow("github.com", audit_log(&dir));
+        let raw = b"POST /repo.git/git-receive-pack HTTP/1.1\r\nHost: github.com\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+        let mut outcome = None;
+        let logged = logged_spans(|| outcome = Some(forwarded(&flow, raw)));
+        let (upstream, end) = outcome.unwrap();
+
+        assert!(upstream.is_empty(), "no byte reaches the upstream");
+        assert!(
+            matches!(
+                end,
+                HalfEnd::Closed(CloseReason::FramingAmbiguous(
+                    http::Ambiguity::ContentLengthWithTransferEncoding
+                ))
+            ),
+            "{end:?}"
+        );
+        let entries = LogReader::new(dir.path()).read_new().unwrap().entries;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        let record = &entries[0].record;
+        assert_eq!(record.subject, "box-a");
+        assert_eq!(record.upstream, "github.com:443");
+        assert_eq!(record.decision, Outcome::Refuse);
+        assert_eq!(record.marker.as_deref(), Some(http::FRAMING_AMBIGUOUS));
+
+        let line = logged
+            .lines()
+            .find(|line| line.contains("a request head was refused"))
+            .unwrap_or_else(|| panic!("no refusal line in {logged}"));
+        assert!(line.contains("INFO"), "{line}");
+        assert!(line.contains("box_id=\"box-a\""), "{line}");
+        assert!(line.contains("marker=\"framing_ambiguous\""), "{line}");
+        assert!(
+            line.contains("rule=\"content_length_with_transfer_encoding\""),
+            "{line}"
         );
     }
 }

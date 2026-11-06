@@ -311,6 +311,9 @@ pub(crate) async fn complete_own_ip_attach(
         .map(|policy| {
             BoxGate::for_session_steered(
                 lease_ip.to_string(),
+                // NET-163: another box's `allow_dns_hosts` names this box
+                // by its own name, so the gate carries it.
+                Some(session_name),
                 lease_ip,
                 policy,
                 subnet,
@@ -410,8 +413,17 @@ async fn finish_own_ip_attach(
             let yielded = own_address
                 .map(crate::net::provider::OwnAddressReporter::shared_port_collisions)
                 .unwrap_or_default();
-            match crate::net::policy::apply_ingress(
-                &control, published, lease_ip, ingress, gate, &yielded,
+            // A taken port's refusal names its holder (NET-144): the box
+            // whose publish stands at that address and port, or the host.
+            let registry = own_address.map(crate::net::provider::OwnAddressReporter::registry);
+            let holder_of = |port: u16| match &registry {
+                Some(registry) => {
+                    crate::net::policy::port_holder(registry, session_name, published, port)
+                }
+                None => minimald_rpc::PortHolder::Host,
+            };
+            match crate::net::policy::apply_ingress_naming_holders(
+                &control, published, lease_ip, ingress, gate, &yielded, &holder_of,
             )
             .await
             {
@@ -422,7 +434,10 @@ async fn finish_own_ip_attach(
                 // route reported, and the name finalize registered is
                 // withdrawn — a bind that failed never leaves a name standing
                 // for a port that refused (NET-121) — and no substitute
-                // address stands in for the port that could not bind.
+                // address stands in for the port that could not bind. A taken
+                // port comes back as the typed refusal, with the port and its
+                // holder, so the finalize that launched this attach can name
+                // both (NET-144).
                 Err(e) => {
                     drop(relay);
                     if let Some(own_address) = own_address {
@@ -535,6 +550,13 @@ async fn finish_own_ip_attach(
         own_address.report(session_name, lease_ip, ports);
     }
 
+    let runtime_ingress =
+        own_address.map(crate::net::provider::OwnAddressReporter::runtime_ingress);
+    // The box's actor unbinds a declared forward a move of its publish left
+    // at the old address (#2748), so it holds clones of the attach's.
+    if let Some(runtime_ingress) = &runtime_ingress {
+        runtime_ingress.record_attached(&exposed);
+    }
     Ok(OwnIpGuard {
         attach: Some(OwnIpAttach {
             _relay: relay,
@@ -542,8 +564,7 @@ async fn finish_own_ip_attach(
             control,
             exposed,
             lease,
-            runtime_ingress: own_address
-                .map(crate::net::provider::OwnAddressReporter::runtime_ingress),
+            runtime_ingress,
         }),
     })
 }
@@ -1997,6 +2018,110 @@ mod tests {
             locals_of(&unbound, "/services/forwarder/unexpose"),
             vec![format!("{HANDED}:8080"), format!("{HANDED}:9090")],
             "teardown unbinds what the hand addressed: {unbound:?}"
+        );
+        fake.abort();
+    }
+
+    /// NET-162 on a native host: a box port a forwarder publishes at
+    /// `127.0.0.1`, where the host alias lands, is held as one of Minimal's
+    /// own listeners from the bind until the forwarder unbinds. So no
+    /// `[host-exposures]` entry opens it to another box. The ports are ones
+    /// no other test binds, since the registry is the daemon's.
+    #[tokio::test]
+    async fn native_own_ip_published_box_port_held_until_its_forwarder_unbinds() {
+        const LEASE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 9);
+        const HANDED: Ipv4Addr = Ipv4Addr::LOCALHOST;
+        const TCP: u8 = 6;
+        const UDP: u8 = 17;
+        let dir = tempfile::TempDir::new().unwrap();
+        let scenario = attach_scenario(&dir, "gvproxy.sock");
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let (handed_tx, _handed_rx) = mpsc::channel(4);
+        let fake = spawn_control_channel_deciding(
+            scenario.control_path.clone(),
+            |_, _| ok(),
+            events_tx,
+            handed_tx,
+        );
+        let switch = vm_host_switch();
+        let mapping = |external_port| boxes::PortMapping {
+            external_port,
+            internal_port: 80,
+            proto: boxes::IpProto::Tcp,
+        };
+        let policy = boxes::BoxPolicy {
+            ingress: Some(boxes::IngressPolicy {
+                port_mappings: vec![mapping(47180), mapping(47190)],
+                dynamic_allowed_range: None,
+                dynamic_ingress: None,
+            }),
+            egress: None,
+            credentialed_upstream: None,
+            quic443: None,
+        };
+        scenario
+            .registry
+            .write()
+            .expect("registry lock")
+            .publish_own_address(
+                boxes::SessionId::nil(),
+                "web",
+                HANDED,
+                BTreeSet::from([47180, 47190]),
+            );
+        let registry = crate::net::switch::MinimalListeners::daemon();
+        assert_eq!(
+            registry.holder(TCP, 47180),
+            None,
+            "nothing holds the port yet"
+        );
+
+        let guard = crate::net::gvproxy_network::complete_own_ip_attach(
+            &switch,
+            scenario.tap_fd,
+            ControlChannel::Unix(scenario.control_path.clone()),
+            lease_at(LEASE),
+            "web",
+            Some(&policy),
+            Some(&scenario.reporter),
+            false,
+        )
+        .await
+        .expect("the attach completes at the handed address");
+        let _ = collect_until(&mut events_rx, "/services/dns/add", 1).await;
+        for port in [47180, 47190] {
+            assert_eq!(
+                registry.holder(TCP, port),
+                Some(crate::net::switch::PUBLISHED_BOX_PORT_LISTENER),
+                "the bound forward holds {port}"
+            );
+        }
+        assert_eq!(
+            registry.holder(UDP, 47180),
+            None,
+            "a TCP forward holds its port for TCP only"
+        );
+
+        guard
+            .revoke_ingress(47180)
+            .await
+            .expect("the forward of 47180 unbinds");
+        assert_eq!(
+            registry.holder(TCP, 47180),
+            None,
+            "an unbound forward holds its port no more"
+        );
+        assert_eq!(
+            registry.holder(TCP, 47190),
+            Some(crate::net::switch::PUBLISHED_BOX_PORT_LISTENER),
+            "the other forward still holds its port"
+        );
+
+        Box::new(guard).teardown().await;
+        assert_eq!(
+            registry.holder(TCP, 47190),
+            None,
+            "teardown lets every port go with its forward"
         );
         fake.abort();
     }

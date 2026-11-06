@@ -40,6 +40,13 @@
 //!                                directory relative to the uploaded tree
 //! min://package/build [args]     daemon-serviced: build packages
 //! min://check [args]             daemon-serviced: lint the session's config
+//! min://exec {"argv":[..],"mode":"detached","timeout_secs":30}
+//!                                exec this argv in the box, no shell, under
+//!                                an exec id; mode is attached, tty or
+//!                                detached, and timeout_secs is optional
+//! min://exec/attach <exec-id>    resume a tty exec's terminal
+//! min://exec/output <exec-id>    read an exec's captured output
+//! min://exec/wait <exec-id>      wait for an exec and take its exit code
 //! <anything else>                a shell command for the session
 //! ```
 //!
@@ -48,6 +55,8 @@
 //! gets here.
 
 use std::fmt;
+
+use serde::{Deserialize, Serialize};
 
 /// Prefix marking a request as one this vocabulary defines. A command that does
 /// not start with it is a shell command for the session, never a daemon one.
@@ -70,18 +79,28 @@ pub enum ExecRequest {
     Argv(Vec<String>),
     /// Run a task the session's project declares.
     ///
-    /// `owns_box` is the run's claim on the session it was created for
-    /// (NET-131): when it is set, the daemon ends the session once this
-    /// task's exit status is on the wire, whether or not the client that
-    /// started the run is still there. `min task run` sets it — its session
-    /// exists for the run and nothing else; `min session run` leaves it
-    /// unset — its box is an attachable session someone else keeps. A
-    /// payload without the marker parses as `owns_box: false`, which is
-    /// also what a client from before the flag sends.
+    /// On a task box whose spec names this task as its entry, with no
+    /// `args`, the daemon runs the box's entrypoint, the in-box `min task
+    /// run`, and relays its output and its exit code (T43). The task's
+    /// arguments ride the entrypoint's argv. The entrypoint starts in `cwd`.
+    /// `min task run` sends this form, with `owns_box` unset: the box ends
+    /// when its entrypoint returns and keeps its record.
+    ///
+    /// `owns_box` is the older request, kept for one release: the run's
+    /// claim on the session it was created for (NET-131). When it is set,
+    /// the daemon ends the session once this task's exit status is on the
+    /// wire, whether or not the client that started the run is still
+    /// there. `min task run` sets it for an interactive task, which has no
+    /// spec, and a `min task run` from before T43 sets it on every run.
+    /// `min session run`
+    /// leaves it unset: its box is an attachable session someone else
+    /// keeps. A payload without the marker parses as `owns_box: false`,
+    /// which is also what a client from before the flag sends.
     TaskRun {
         /// The task name, as the client typed it; the daemon trims it.
         task: String,
         /// The run owns its box: the daemon ends the session with the run.
+        /// Only a client from before T43 sets it on a task box's run.
         owns_box: bool,
         /// The task's declared arguments, as the client typed them after the
         /// task name. Empty when the client sent none — an older `min`, or a
@@ -100,6 +119,102 @@ pub enum ExecRequest {
     PackageBuild(String),
     /// Lint the session's `minimal.toml`, packages, profiles and stacks.
     Check(String),
+    /// An argv to exec in the box, no shell, under an exec id the daemon
+    /// mints, with its mode and its own timeout (BOX-149).
+    Exec(ExecSpec),
+    /// Resume the terminal of a [`ExecMode::Tty`] exec by its id.
+    ExecAttach(ExecId),
+    /// Read the output an exec captured, by its id.
+    ExecOutput(ExecId),
+    /// Wait for an exec to end and take its exit code, by its id.
+    ExecWait(ExecId),
+}
+
+/// How an exec's process meets its client (BOX-149).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecMode {
+    /// Stdio on the channel's pipes, for as long as the client stays. The
+    /// mode the older `min://argv` form always has.
+    #[default]
+    Attached,
+    /// A terminal the daemon allocates. The request returns the exec id at
+    /// once, and `min://exec/attach` resumes the terminal by it.
+    Tty,
+    /// Stdin closed at creation. The request returns the exec id at once,
+    /// and the output and the exit code read back by it.
+    Detached,
+}
+
+impl ExecMode {
+    /// The mode as the wire and the daemon log spell it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Attached => "attached",
+            Self::Tty => "tty",
+            Self::Detached => "detached",
+        }
+    }
+}
+
+/// The payload of [`ExecRequest::Exec`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecSpec {
+    /// The argv to exec. Never empty: [`ExecRequest::parse`] refuses an
+    /// empty one.
+    pub argv: Vec<String>,
+    /// How the process meets its client. Attached when the payload names
+    /// none.
+    #[serde(default)]
+    pub mode: ExecMode,
+    /// The exec's own timeout in whole seconds. `None` runs the exec under
+    /// the box's ceilings only. Never zero: [`ExecRequest::parse`] refuses
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+}
+
+/// An exec's id: a UUIDv7 the daemon mints when the exec starts, in its
+/// hyphenated lowercase spelling (BOX-149).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ExecId(String);
+
+impl ExecId {
+    /// Reads an exec id from its text.
+    ///
+    /// # Errors
+    ///
+    /// [`ExecParseError::ExecId`] when `text` is not a hyphenated UUID of
+    /// version 7 and the RFC 9562 variant.
+    pub fn parse(text: &str) -> Result<Self, ExecParseError> {
+        let text = text.trim();
+        let bytes = text.as_bytes();
+        let shaped = bytes.len() == 36
+            && bytes.iter().enumerate().all(|(i, b)| match i {
+                8 | 13 | 18 | 23 => *b == b'-',
+                _ => b.is_ascii_hexdigit(),
+            });
+        let v7 = shaped
+            && bytes[14] == b'7'
+            && matches!(bytes[19].to_ascii_lowercase(), b'8' | b'9' | b'a' | b'b');
+        if !v7 {
+            return Err(ExecParseError::ExecId(text.to_string()));
+        }
+        Ok(Self(text.to_ascii_lowercase()))
+    }
+
+    /// The id's text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ExecId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 /// Tag for [`ExecRequest::Shell`].
@@ -119,8 +234,27 @@ const PACKAGE_BUILD: &str = "package/build";
 /// Tag for [`ExecRequest::Check`].
 const CHECK: &str = "check";
 
+/// Tag for [`ExecRequest::Exec`].
+const EXEC: &str = "exec";
+/// Tag for [`ExecRequest::ExecAttach`].
+const EXEC_ATTACH: &str = "exec/attach";
+/// Tag for [`ExecRequest::ExecOutput`].
+const EXEC_OUTPUT: &str = "exec/output";
+/// Tag for [`ExecRequest::ExecWait`].
+const EXEC_WAIT: &str = "exec/wait";
+
 /// Every tag, for the error message that lists what the daemon accepts.
-const TAGS: [&str; 5] = [SHELL, ARGV, TASK_RUN, PACKAGE_BUILD, CHECK];
+const TAGS: [&str; 9] = [
+    SHELL,
+    ARGV,
+    TASK_RUN,
+    PACKAGE_BUILD,
+    CHECK,
+    EXEC,
+    EXEC_ATTACH,
+    EXEC_OUTPUT,
+    EXEC_WAIT,
+];
 
 impl ExecRequest {
     /// The wire string for this request.
@@ -167,6 +301,14 @@ impl ExecRequest {
             }
             Self::PackageBuild(args) => format!("{EXEC_SCHEME}{PACKAGE_BUILD} {args}"),
             Self::Check(args) => format!("{EXEC_SCHEME}{CHECK} {args}"),
+            Self::Exec(spec) => {
+                let json = serde_json_lenient::to_string(spec)
+                    .expect("an exec spec always serializes to JSON");
+                format!("{EXEC_SCHEME}{EXEC} {json}")
+            }
+            Self::ExecAttach(id) => format!("{EXEC_SCHEME}{EXEC_ATTACH} {id}"),
+            Self::ExecOutput(id) => format!("{EXEC_SCHEME}{EXEC_OUTPUT} {id}"),
+            Self::ExecWait(id) => format!("{EXEC_SCHEME}{EXEC_WAIT} {id}"),
         }
     }
 
@@ -248,6 +390,20 @@ impl ExecRequest {
             }
             PACKAGE_BUILD => Ok(Self::PackageBuild(payload.to_string())),
             CHECK => Ok(Self::Check(payload.to_string())),
+            EXEC => {
+                let spec: ExecSpec = serde_json_lenient::from_str(payload)
+                    .map_err(|e| ExecParseError::ExecSpec(e.to_string()))?;
+                if spec.argv.is_empty() {
+                    return Err(ExecParseError::EmptyArgv);
+                }
+                if spec.timeout_secs == Some(0) {
+                    return Err(ExecParseError::ZeroTimeout);
+                }
+                Ok(Self::Exec(spec))
+            }
+            EXEC_ATTACH => Ok(Self::ExecAttach(ExecId::parse(payload)?)),
+            EXEC_OUTPUT => Ok(Self::ExecOutput(ExecId::parse(payload)?)),
+            EXEC_WAIT => Ok(Self::ExecWait(ExecId::parse(payload)?)),
             unknown => Err(ExecParseError::UnknownTag(unknown.to_string())),
         }
     }
@@ -284,6 +440,12 @@ pub enum ExecParseError {
     /// The `argv` payload was a well-formed but empty array, which names no
     /// program to run.
     EmptyArgv,
+    /// The `exec` payload was not a JSON object with an `argv` array.
+    ExecSpec(String),
+    /// The `exec` payload asked for a timeout of zero seconds.
+    ZeroTimeout,
+    /// The text that names an exec is not an exec id.
+    ExecId(String),
 }
 
 impl fmt::Display for ExecParseError {
@@ -307,6 +469,15 @@ impl fmt::Display for ExecParseError {
                 "the {EXEC_SCHEME}{TASK_RUN} cwd '{cwd}' must be a relative path without '..'"
             ),
             Self::EmptyArgv => write!(f, "the {EXEC_SCHEME}{ARGV} payload names no program"),
+            Self::ExecSpec(e) => write!(
+                f,
+                "the {EXEC_SCHEME}{EXEC} payload is not a JSON object with an argv array: {e}"
+            ),
+            Self::ZeroTimeout => write!(
+                f,
+                "the {EXEC_SCHEME}{EXEC} timeout must be at least 1 second"
+            ),
+            Self::ExecId(text) => write!(f, "'{text}' is not an exec id"),
         }
     }
 }
@@ -333,6 +504,66 @@ mod tests {
             ExecRequest::Check(String::new()),
         ] {
             assert_eq!(ExecRequest::parse(&req.encode()), Ok(req));
+        }
+    }
+
+    const AN_EXEC_ID: &str = "01928a3b-4c5d-7e6f-8a9b-0c1d2e3f4a5b";
+
+    /// BOX-149: the exec form carries its argv as words, its mode and its
+    /// own timeout, and each survives the round trip. A payload that names
+    /// no mode is attached with no timeout. The id forms carry a UUIDv7.
+    #[test]
+    fn exec_request_carries_mode_and_timeout() {
+        for mode in [ExecMode::Attached, ExecMode::Tty, ExecMode::Detached] {
+            for timeout_secs in [None, Some(30)] {
+                let req = ExecRequest::Exec(ExecSpec {
+                    argv: vec!["sh".into(), "-c".into(), "echo A B C; echo $HOME".into()],
+                    mode,
+                    timeout_secs,
+                });
+                let wire = req.encode();
+                assert!(wire.contains(mode.name()), "{wire}");
+                assert_eq!(ExecRequest::parse(&wire), Ok(req));
+            }
+        }
+
+        assert_eq!(
+            ExecRequest::parse(r#"min://exec {"argv":["true"]}"#),
+            Ok(ExecRequest::Exec(ExecSpec {
+                argv: vec!["true".into()],
+                mode: ExecMode::Attached,
+                timeout_secs: None,
+            })),
+        );
+        assert_eq!(
+            ExecRequest::parse(
+                r#"min://exec {"argv":["true"],"mode":"detached","timeout_secs":0}"#
+            ),
+            Err(ExecParseError::ZeroTimeout),
+        );
+        assert_eq!(
+            ExecRequest::parse(r#"min://exec {"argv":[]}"#),
+            Err(ExecParseError::EmptyArgv),
+        );
+        assert!(matches!(
+            ExecRequest::parse(r#"min://exec {"argv":["true"],"mode":"background"}"#),
+            Err(ExecParseError::ExecSpec(_)),
+        ));
+
+        let id = ExecId::parse(AN_EXEC_ID).unwrap();
+        for req in [
+            ExecRequest::ExecAttach(id.clone()),
+            ExecRequest::ExecOutput(id.clone()),
+            ExecRequest::ExecWait(id.clone()),
+        ] {
+            assert_eq!(ExecRequest::parse(&req.encode()), Ok(req));
+        }
+        // A v4 UUID is not an exec id, and neither is a box name.
+        for text in ["01928a3b-4c5d-4e6f-8a9b-0c1d2e3f4a5b", "my-box", ""] {
+            assert_eq!(
+                ExecRequest::parse(&format!("min://exec/wait {text}")),
+                Err(ExecParseError::ExecId(text.to_string())),
+            );
         }
     }
 

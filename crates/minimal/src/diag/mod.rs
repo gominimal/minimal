@@ -3,7 +3,7 @@
 //!
 //! One command, one artifact: a `minimal-diag-<timestamp>.tar.zst` containing
 //! the logs, config (redacted), state listings, process/network state, and
-//! per-provider daemon bundles needed to root-cause field issues. Every
+//! per-host daemon bundles needed to root-cause field issues. Every
 //! collector is independent and failure-isolated: a fully broken install
 //! still yields a valid archive whose `manifest.json` explains what's
 //! missing. Nothing here mutates state or autospawns daemons — diagnosing a
@@ -237,7 +237,7 @@ pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::E
     collect_step!(w, "state", collect::state(&mut w, &paths));
     // Log prefixes that matched nothing on the host come back rather than
     // becoming skips here: whether "not under <state>/logs" also means "not in
-    // this bundle" is not known until the provider loop below has run.
+    // this bundle" is not known until the host loop below has run.
     let mut absent_log_prefixes = Vec::new();
     collect_step!(
         w,
@@ -256,40 +256,40 @@ pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::E
     );
     collect_step!(w, "telemetry-state", collect::telemetry(&mut w, &paths));
 
-    // ── Per-provider: files and liveness, then the staged socket probe, then
+    // ── Per-host: files and liveness, then the staged socket probe, then
     // (when the probe handshook and --no-guest wasn't given) the daemon's own
     // bundle over the connection the probe already opened. An unreadable
     // providers dir is an error, not absence.
-    let providers_started = std::time::Instant::now();
+    let hosts_started = std::time::Instant::now();
     // `None` is "the listing failed", which is not the same fact as an empty
-    // listing: one leaves provider existence unknown, the other settles it.
+    // listing: one leaves host existence unknown, the other settles it.
     // The log skips below turn on that difference.
-    let providers = match collect::provider_dirs(&paths.state).await {
-        Ok(providers) => {
-            if providers.is_empty() {
+    let hosts = match collect::host_dirs(&paths.state).await {
+        Ok(hosts) => {
+            if hosts.is_empty() {
                 w.skip(
                     "providers/",
                     "no provider instances found — no daemon was ever spawned here",
                 );
             }
-            Some(providers)
+            Some(hosts)
         }
         Err(e) => {
             w.error(
                 "providers".to_string(),
                 format!("listing provider dirs: {e}"),
-                providers_started.elapsed(),
+                hosts_started.elapsed(),
             );
             None
         }
     };
     let mut carriers: Vec<&str> = Vec::new();
     let mut unconfirmed: Vec<&str> = Vec::new();
-    for (name, dir) in providers.iter().flatten() {
+    for (name, dir) in hosts.iter().flatten() {
         collect_step!(
             w,
             format!("providers.{name}"),
-            collect::provider_files(&mut w, name, dir)
+            collect::host_files(&mut w, name, dir)
         );
         match collect_guest(&mut w, &args, name, dir).await {
             guest::GuestOutcome::BundleWithDaemonLogs => carriers.push(name),
@@ -306,7 +306,7 @@ pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::E
         &mut w,
         &paths,
         &absent_log_prefixes,
-        daemon_log_sources(providers.as_deref(), &carriers, &unconfirmed),
+        daemon_log_sources(hosts.as_deref(), &carriers, &unconfirmed),
     );
 
     let entries = w.entry_count();
@@ -370,27 +370,27 @@ async fn send(
     .await
 }
 
-/// Reduces what the provider loop learned to the single fact the held-back log
+/// Reduces what the host loop learned to the single fact the held-back log
 /// skips are read against.
 ///
-/// `providers` is `None` when the listing itself failed. A confirmed carrier
+/// `hosts` is `None` when the listing itself failed. A confirmed carrier
 /// outranks an unconfirmed one: if any nested bundle demonstrably holds the
 /// daemon's logs, naming it is true whatever the others managed.
 fn daemon_log_sources<'a>(
-    providers: Option<&[(String, PathBuf)]>,
+    hosts: Option<&[(String, PathBuf)]>,
     carriers: &'a [&'a str],
     unconfirmed: &'a [&'a str],
 ) -> collect::DaemonLogSources<'a> {
-    match (providers, carriers, unconfirmed) {
-        (None, ..) => collect::DaemonLogSources::ProvidersUnknown,
-        (Some([]), ..) => collect::DaemonLogSources::NoProviders,
+    match (hosts, carriers, unconfirmed) {
+        (None, ..) => collect::DaemonLogSources::HostsUnknown,
+        (Some([]), ..) => collect::DaemonLogSources::NoHosts,
         (Some(_), [], []) => collect::DaemonLogSources::NoneFetched,
         (Some(_), [], names) => collect::DaemonLogSources::NestedUnconfirmed(names),
         (Some(_), names, _) => collect::DaemonLogSources::Nested(names),
     }
 }
 
-/// Probes one provider's daemon socket and, when it answers, nests the
+/// Probes one host's daemon socket and, when it answers, nests the
 /// daemon's own bundle; otherwise falls back to the data volume image.
 ///
 /// Never fails: every outcome — including "this collector itself broke" —
@@ -398,7 +398,7 @@ fn daemon_log_sources<'a>(
 /// [`collect_step!`]: it carries its own, longer `--guest-timeout-secs`
 /// deadline, since a large bundle over a slow bridge is not a hang.
 ///
-/// Returns what the archive can now be said to hold for this provider, which
+/// Returns what the archive can now be said to hold for this host, which
 /// is what the log collector's held-back skips are read against: not merely
 /// whether a bundle arrived, but whether it was confirmed to carry the
 /// daemon's own logs.
@@ -878,17 +878,17 @@ mod tests {
         );
     }
 
-    /// `cmd_bug` with a state dir that has provider directories records
-    /// provider files.
+    /// `cmd_bug` with a state dir that has host directories records
+    /// host files.
     #[tokio::test]
-    async fn cmd_bug_collects_provider_files() {
+    async fn cmd_bug_collects_host_files() {
         let state = tempfile::TempDir::new().unwrap();
-        let providers_dir = state.path().join("providers").join("local-minvmd0");
-        std::fs::create_dir_all(&providers_dir).unwrap();
-        // A minvmd.toml so the provider-files collector has something to
+        let host_dir = state.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        // A minvmd.toml so the host-files collector has something to
         // read.
         std::fs::write(
-            providers_dir.join("minvmd.toml"),
+            host_dir.join("minvmd.toml"),
             b"state = \"running\"\npid = 42\n",
         )
         .unwrap();
@@ -925,10 +925,10 @@ mod tests {
         );
     }
 
-    /// `cmd_bug` with a state dir that has no providers records the absence
+    /// `cmd_bug` with a state dir that has no hosts records the absence
     /// as a skip.
     #[tokio::test]
-    async fn cmd_bug_no_providers_is_skip() {
+    async fn cmd_bug_no_hosts_is_skip() {
         let state = tempfile::TempDir::new().unwrap();
         // No providers/ directory.
 
@@ -957,21 +957,21 @@ mod tests {
         let manifest: serde_json_lenient::Value =
             serde_json_lenient::from_slice(&files["manifest.json"]).unwrap();
         let skipped = manifest["skipped"].as_array().unwrap();
-        let providers_skip = skipped
+        let hosts_skip = skipped
             .iter()
             .find(|s| s["what"].as_str().unwrap() == "providers/");
         assert!(
-            providers_skip.is_some(),
+            hosts_skip.is_some(),
             "no providers must be recorded as a skip: {skipped:?}"
         );
     }
 
-    /// `cmd_bug` with `--no-guest` records the skip for each provider.
+    /// `cmd_bug` with `--no-guest` records the skip for each host.
     #[tokio::test]
-    async fn cmd_bug_no_guest_records_per_provider_skip() {
+    async fn cmd_bug_no_guest_records_per_host_skip() {
         let state = tempfile::TempDir::new().unwrap();
-        let providers_dir = state.path().join("providers").join("local-minvmd0");
-        std::fs::create_dir_all(&providers_dir).unwrap();
+        let host_dir = state.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&host_dir).unwrap();
 
         let out_dir = tempfile::TempDir::new().unwrap();
         let out = out_dir.path().join("diag.tar.zst");

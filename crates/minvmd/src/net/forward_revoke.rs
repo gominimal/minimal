@@ -285,6 +285,23 @@ impl ForwardedFlows {
             .collect()
     }
 
+    /// Takes every connection tracked at the box address `addr` and the box
+    /// port `port`, leaving the others: one forward's listener is undone,
+    /// and these are the connections that forward still carries (NET-138).
+    #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+    pub(crate) fn take_at_port(&self, addr: [u8; 4], port: u16) -> Vec<(FlowKey, FlowTail)> {
+        let mut flows = self.lock();
+        let taken: Vec<FlowKey> = flows
+            .keys()
+            .filter(|(box_addr, box_port, _, _)| *box_addr == addr && *box_port == port)
+            .copied()
+            .collect();
+        taken
+            .into_iter()
+            .filter_map(|key| flows.remove(&key).map(|tail| (key, tail)))
+            .collect()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<FlowKey, FlowTail>> {
         self.flows
             .lock()

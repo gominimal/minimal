@@ -95,9 +95,9 @@ impl Cli {
 
     /// Returns the path to the directory containing sockets/info about this daemon for clients.
     pub fn client_instance_dir(&self) -> DaemonAbsPath {
-        paths::provider_instance_dir(
+        paths::host_dir(
             &self.minimal_state_dir(),
-            paths::ProviderKind::Minimald,
+            paths::HostKind::Minimald,
             self.instance_num(),
         )
     }
@@ -125,7 +125,7 @@ impl Cli {
                         .to_string(),
                 ),
             ],
-            paths::provider_instance_name(paths::ProviderKind::Minimald, self.instance_num()),
+            paths::host_name(paths::HostKind::Minimald, self.instance_num()),
         )
     }
 
@@ -908,7 +908,7 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
     }
 
     // NET-079: the guest's own classifier boot, after the tree above exists
-    // and before the decision below reads it — the one host whose table this
+    // and before the start-up decision reads it — the one host whose table this
     // daemon loads itself, because its kernel is its image's alone and no
     // person can run an installer inside a microVM. [`boot_guest_classifier`]
     // runs it in the one order its halves can keep: loopback up first —
@@ -922,7 +922,8 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
     // `nft -c`, loaded in one transaction, the presence marker written only
     // once it loaded. The load logs its own outcome — check line and load
     // line with the digest of the exact bytes it piped — and nothing here
-    // branches on it: the decision below is the fact's own reader, and a
+    // branches on it: the start-up decision after the bind
+    // (`read_host_ip_enforcement_fact`) is the fact's own reader, and a
     // boot whose load failed reports the guest as unable to decide per box
     // exactly as a native host without the step does.
     if guest::is_microvm_daemon() {
@@ -941,6 +942,12 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
             cohort_address: identity,
             node_plane_address: identity,
             ct_mark_mask: minimald::net::classifier::GUEST_CT_MARK_MASK,
+            // BEP-083: the proxy's listener, whose address the table refuses
+            // to every box whose own leaf is not in the lane set.
+            proxy_listener: std::net::SocketAddrV4::new(
+                minimald::net::DEFAULT_SUBNET.box_egress_proxy_address(),
+                boxes::core::egress::PROXY_LISTENER_PORT,
+            ),
             mountinfo_override: None,
         };
         minimald::net::classifier::boot_guest_classifier(
@@ -960,51 +967,6 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
         // lookups are untouched: they are keyed by the cgroup the daemon runs
         // in, which the deny subtree's rules never match.
         minimald::net::guest_dns::start(minimald::net::DEFAULT_SUBNET).await;
-    }
-
-    // NET-079: the start-time fact this daemon answers every create with —
-    // whether this host can decide a host-address box's egress verdict per
-    // box, and why not when it cannot. Read here with its probe attached,
-    // because the fact it rests on is the table's *effect* (design §7.4) —
-    // a marker survives a reboot whose reload failed, a refusal does not —
-    // and the same reading is taken again before each host-address launch,
-    // which is the other thing a table can change between. The one info
-    // line a host that cannot decide per box owes names the cause, and the
-    // exact command that ends it when one can — the step's install for a
-    // host without the step or one whose marker outlived its table, nothing
-    // for a host that cannot confine a box, a probe that could not read the
-    // table, or a guest whose image never loaded the table — and says what
-    // this host does with the boxes, because the two hosts answer it
-    // differently: natively the step's and the mount's causes keep the
-    // exception and run the boxes unenforced, while the two probe causes
-    // refuse the deny-all box rather than run it on a refusal nothing
-    // enforces — and the guest refuses more, the deny-all box on a table
-    // that is not loaded, every box on a tree that cannot confine — so the
-    // daemon's log carries what a session's start is about to tell the
-    // person in the terminal, and stays quiet on a host that decides, which
-    // is not a state to report.
-    let classifier_decision = minimald::net::classifier::decide_now(
-        tree_root,
-        sandbox::classifier::own_mountinfo().as_deref(),
-        guest::is_microvm_daemon(),
-    );
-    // The daemon's node half of per-box egress enforcement (NET-079): seeded
-    // here from the start-up read, so the daemon's first create answer
-    // already names this host, and refreshed by each host-address launch's
-    // own re-read — the state the create reply carries, the cause every
-    // surface's refusal gate answers over, and what lowers a box's own
-    // launch record to `none` when the host can no longer decide per box.
-    minimald::box_runtime::set_host_ip_enforcement_fact(&classifier_decision);
-    if let Some(cause) = classifier_decision.cause() {
-        tracing::info!(
-            tree = sandbox::classifier::TREE_ROOT,
-            cause = cause.detail(),
-            install = ?cause.install_command(),
-            host_ip_enforcement = "none",
-            "this host cannot decide a host-address box's egress verdict \
-             per box, so {}",
-            cause.host_ip_box_outcome(guest::is_microvm_daemon())
-        );
     }
 
     // R1.5/R1.6: when the microVM config requested a data volume
@@ -1114,7 +1076,7 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
     // Adopt any pre-split `providers/local-<N>` dir into the kind-tagged scheme
     // before resolving our own instance dir, so an upgraded daemon reuses its
     // existing state instead of orphaning it.
-    paths::migrate_legacy_provider_dirs(&cli.minimal_state_dir());
+    paths::migrate_legacy_host_dirs(&cli.minimal_state_dir());
 
     // The host-key path lives under the instance dir; ensure it exists for
     // both the UDS and vsock paths.
@@ -1129,16 +1091,15 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
     // instance's socket.
     //
     // As the microVM's pid-1 the lock lives on the /run tmpfs, not the
-    // provider dir: the provider dir sits on the persistent data volume, and
+    // host dir: the host dir sits on the persistent data volume, and
     // a lifetime-held write fd there pins the volume busy through the
     // shutdown quiesce (R2.1), leaving a dirty ext4 journal on every clean
     // stop. Nothing outside this boot reads the guest's lock (the host probes
-    // its own provider dir), so boot-ephemeral tmpfs is the honest home for
+    // its own host dir), so boot-ephemeral tmpfs is the honest home for
     // it. Keyed on being the VM init — pid-1 owns its /run — NOT on the
     // `--vsock` flag: a native (possibly non-root) `--vsock` daemon may not
-    // be able to write /run at all and keeps the provider-dir lock.
-    let instance_name =
-        paths::provider_instance_name(paths::ProviderKind::Minimald, cli.instance_num());
+    // be able to write /run at all and keeps the host-dir lock.
+    let instance_name = paths::host_name(paths::HostKind::Minimald, cli.instance_num());
     let instance_lock_path = if is_minimal_microvm() {
         DaemonAbsPath::try_new(format!("/run/minimald-{instance_name}.lock"))
             .expect("static /run lock path is absolute")
@@ -1164,7 +1125,7 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
         .set_len(0)
         .and_then(|()| writeln!(&*instance_guard, "{}", std::process::id()));
 
-    // Native minimald and minvmd now own distinct provider dirs
+    // Native minimald and minvmd now own distinct host dirs
     // (`local-minimald<N>` vs `local-minvmd<N>`), so they no longer share a
     // socket. This stays as a defensive guard for the unusual case of a minvmd
     // instance pointed at *this* dir: don't steal a live VM's ssh.sock.
@@ -1318,6 +1279,7 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
             .map_err(|e| MainError::IO(e, "listening to socket"))?;
 
         tracing::info!("Started listening on {}", cli.listen_on());
+        read_host_ip_enforcement_fact(tree_root);
         let (opts, ssh_name) = cli.ssh_args();
         tracing::info!(
             "Run the following to debug the socket:\n\nssh \\\n\t{} \\\n\t{}",
@@ -1364,6 +1326,7 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
         }
 
         tracing::info!("Started listening on vsock:{port_num}");
+        read_host_ip_enforcement_fact(tree_root);
 
         // `guest.ready`: the beacon to the host, a child of the host's
         // `vm.boot` when minvmd passed its `TRACEPARENT` on the boot line
@@ -1385,6 +1348,54 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
         Server::run(config, listener, log_release)
             .await
             .map_err(|e| MainError::IO(e, "serving on guest vsock"))
+    }
+}
+
+/// NET-079: the start-time fact this daemon answers every create with —
+/// whether this host can decide a host-address box's egress verdict per box,
+/// and why not when it cannot. Read with its probe attached, because the fact
+/// it rests on is the table's *effect* (design §7.4), and read again before
+/// each host-address launch.
+///
+/// It runs once the control socket is bound and the daemon has entered its
+/// own classifier leaf, never earlier. A native daemon is placed in the tree
+/// by the installer's `--pid` step or a `Delegate=yes` unit. A read taken
+/// before the daemon stands in its leaf finds no placement for the probe's
+/// child and reads the table as unreadable, which a host that decides per
+/// box is not. A create that still finds that cause re-reads the host itself
+/// (`box_manager`).
+///
+/// The one info line names the probe's outcome on every host. On a host
+/// that cannot decide per box it also names the cause, the command that
+/// ends it when one exists, and what this host does with the boxes.
+fn read_host_ip_enforcement_fact(tree_root: &std::path::Path) {
+    let guest = minimald::guest::is_microvm_daemon();
+    let classifier_decision = minimald::net::classifier::decide_now(
+        tree_root,
+        sandbox::classifier::own_mountinfo().as_deref(),
+        guest,
+    );
+    // The daemon's node half of per-box egress enforcement: seeded here, so
+    // the daemon's first create answer already names this host, and
+    // refreshed by each host-address launch's own re-read.
+    minimald::box_runtime::set_host_ip_enforcement_fact(&classifier_decision);
+    match classifier_decision.cause() {
+        Some(cause) => tracing::info!(
+            tree = sandbox::classifier::TREE_ROOT,
+            probe = "undecided",
+            cause = cause.detail(),
+            install = ?cause.install_command(),
+            host_ip_enforcement = "none",
+            "this host cannot decide a host-address box's egress verdict \
+             per box, so {}",
+            cause.host_ip_box_outcome(guest)
+        ),
+        None => tracing::info!(
+            tree = sandbox::classifier::TREE_ROOT,
+            probe = "decided",
+            host_ip_enforcement = "per_box",
+            "this host decides a host-address box's egress verdict per box"
+        ),
     }
 }
 
