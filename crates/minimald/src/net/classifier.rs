@@ -3249,10 +3249,9 @@ pub enum PlaceRequest {
 /// as that socket's holder. The connection carries nothing: systemd starts
 /// one placer per connection and closes the connection when it exits.
 ///
-/// A placement request replaces the path unit's inotify watch on the
-/// daemon's socket, which an SELinux policy can deny systemd for a socket
-/// under the account's home (gominimal/inbox#1206). Connecting to a socket
-/// systemd itself created in `/run` needs no such permission.
+/// The daemon connects to a socket systemd holds in `/run` because SELinux
+/// policy can deny systemd a watch on a socket under the account's home;
+/// connecting to a socket systemd itself created needs no such permission.
 pub fn request_daemon_placement(socket: &Path, wait: Duration) -> PlaceRequest {
     use std::io::Read as _;
     let mut stream = match std::os::unix::net::UnixStream::connect(socket) {

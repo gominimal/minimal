@@ -1092,37 +1092,44 @@ pub(crate) mod linux {
             // daemon is outside its leaf, or the placement socket that
             // places each later start is not listening. Each is its own
             // state, and the remedy is only what is missing: the socket
-            // started again, the step's --pid for that daemon, or both.
+            // started again, the step's --place-listener for the daemon
+            // holding the socket now, or both.
             let placer_down = facts.placer_listening == Some(false);
             let start_placer = format!(
                 "# The placement socket is installed but not listening, so no daemon\n\
                  # start is placed until it is started again.\n\
                  systemctl start {PLACE_SYSTEMD_UNIT}.socket\n"
             );
-            let place_pid = |pid: u32| {
-                format!(
-                    "# The running daemon, outside its leaf: the step's --pid places it.\n\
-                     {CLASSIFIER_PROGRAM_PATH} --pid {pid}\n"
-                )
-            };
+            // The daemon is found again when the block runs, by the socket
+            // it holds, never by the pid read now: the pid can be reused by
+            // then, and --place-listener moves only a holder of this
+            // account that stands outside the slice.
+            let place_daemon = format!(
+                "# The running daemon, outside its leaf: the step places the holder of\n\
+                 # its socket.\n\
+                 {CLASSIFIER_PROGRAM_PATH} --user '{operator}' --place-listener '{socket}'\n"
+            );
             let placer_cause = format!(
                 "the placement socket ({PLACE_SYSTEMD_UNIT}.socket) is not listening, so \
                  the next Minimal daemon start is not placed in its egress-enforcement cgroup"
             );
+            let daemon_cause = |pid: u32| {
+                format!(
+                    "the running Minimal daemon (pid {pid}) is not placed in its \
+                     egress-enforcement cgroup, so it cannot enforce egress per box for \
+                     boxes that share this machine's address"
+                )
+            };
             return match (facts.unplaced_daemon, placer_down) {
                 (None, false) => Item::done(CLASSIFIER_ID, CLASSIFIER_LABEL),
                 (Some(pid), false) => Item::missing(
                     CLASSIFIER_ID,
                     CLASSIFIER_LABEL,
-                    format!(
-                        "the running Minimal daemon (pid {pid}) is not placed in its \
-                         egress-enforcement cgroup, so it cannot enforce egress per box for \
-                         boxes that share this machine's address"
-                    ),
+                    daemon_cause(pid),
                     format!(
                         "places the running Minimal daemon (pid {pid}) in its egress-enforcement cgroup"
                     ),
-                    place_pid(pid),
+                    place_daemon,
                 ),
                 (None, true) => Item::missing(
                     CLASSIFIER_ID,
@@ -1133,20 +1140,24 @@ pub(crate) mod linux {
                         .to_string(),
                     start_placer,
                 ),
-                (Some(pid), true) => Item::missing(
-                    CLASSIFIER_ID,
-                    CLASSIFIER_LABEL,
-                    format!(
-                        "the running Minimal daemon (pid {pid}) is not placed in its \
-                         egress-enforcement cgroup, so it cannot enforce egress per box for \
-                         boxes that share this machine's address, and {placer_cause}"
-                    ),
-                    format!(
-                        "starts the placement socket and places the running Minimal daemon \
-                         (pid {pid}) in its egress-enforcement cgroup"
-                    ),
-                    format!("{start_placer}{}", place_pid(pid)),
-                ),
+                // Two causes, one per line in the summary: the daemon that
+                // runs now, then the next start.
+                (Some(pid), true) => {
+                    let causes = vec![daemon_cause(pid), placer_cause];
+                    Item {
+                        today_list: causes.clone(),
+                        ..Item::missing(
+                            CLASSIFIER_ID,
+                            CLASSIFIER_LABEL,
+                            causes.join("; "),
+                            format!(
+                                "starts the placement socket and places the running Minimal \
+                                 daemon (pid {pid}) in its egress-enforcement cgroup"
+                            ),
+                            format!("{start_placer}{place_daemon}"),
+                        )
+                    }
+                }
             };
         }
         let cause = match facts.mount {
@@ -1524,7 +1535,10 @@ pub(crate) mod linux {
     /// The pid is the holder of the instance lock beside the socket, as the
     /// kernel lists it in `/proc/locks`, never the pid written into the file:
     /// the file is the account's to edit, and a lock no process holds names
-    /// nothing. It counts only while `/proc/<pid>/comm` reads `minimald`.
+    /// nothing. It counts only while `/proc/<pid>/comm` reads `minimald`,
+    /// and only while its cgroup is readable and outside the tree: a holder
+    /// anywhere under `root` (a box leaf among them) is never reported, as
+    /// the step's `--place-listener` never moves it.
     fn unplaced_daemon_pid(root: &std::path::Path, socket: &std::path::Path) -> Option<u32> {
         use std::os::unix::fs::MetadataExt as _;
         let lock = socket.parent()?.join(paths::MINIMALD_LOCK_FILE);
@@ -1544,7 +1558,28 @@ pub(crate) mod linux {
         let placed = members
             .lines()
             .any(|member| member.trim().parse::<u32>() == Ok(pid));
-        (!placed).then_some(pid)
+        if placed {
+            return None;
+        }
+        let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+        (!stands_in_tree(&cgroup, std::path::Path::new("/sys/fs/cgroup"), root)?).then_some(pid)
+    }
+
+    /// Whether a `/proc/<pid>/cgroup` listing places the process under
+    /// `root` in the cgroup2 hierarchy mounted at `mount`, read from its
+    /// one unified `0::` line. `None` when there is no such line, which is
+    /// unknown and so never reported as outside.
+    pub(crate) fn stands_in_tree(
+        cgroup: &str,
+        mount: &std::path::Path,
+        root: &std::path::Path,
+    ) -> Option<bool> {
+        let path = cgroup.lines().find_map(|line| line.strip_prefix("0::"))?;
+        Some(
+            mount
+                .join(path.trim().trim_start_matches('/'))
+                .starts_with(root),
+        )
     }
 
     /// The pid holding an exclusive `flock` on the file at device `dev`
@@ -3402,8 +3437,9 @@ mod tests {
 
     /// gominimal/inbox#1206: a step that is installed while the running
     /// daemon stands outside its leaf is its own state. The item names the
-    /// daemon by its pid, and its step is the step's --pid for that daemon
-    /// alone, never the whole install again. A placed daemon, or none
+    /// daemon by its pid, and its step is the step's --place-listener for
+    /// the holder of the daemon's socket alone, never the whole install
+    /// again and never a pid read before the block runs. A placed daemon, or none
     /// running, leaves the item done.
     #[test]
     fn classifier_item_names_an_unplaced_daemon() {
@@ -3452,9 +3488,15 @@ mod tests {
         let script = unplaced
             .script
             .expect("an unplaced daemon carries its block");
+        let place_line =
+            format!("\n{CLASSIFIER_PROGRAM_PATH} --user 'alice' --place-listener '{sock}'\n");
         assert!(
-            script.contains(&format!("\n{CLASSIFIER_PROGRAM_PATH} --pid 4242\n")),
-            "the block places that daemon with the step's --pid: {script}"
+            script.contains(&place_line),
+            "the block places the socket's holder with the step's --place-listener: {script}"
+        );
+        assert!(
+            !script.contains("--pid") && !script.contains("4242"),
+            "the block never names the pid read now, which may be reused by then: {script}"
         );
         assert!(
             !script.contains("cat >"),
@@ -3492,7 +3534,7 @@ mod tests {
             "the block starts the placement socket: {script}"
         );
         assert!(
-            !script.contains("--pid") && !script.contains("cat >"),
+            !script.contains("--place-listener") && !script.contains("cat >"),
             "the block only starts the socket: {script}"
         );
         // Both at once: the block starts the socket, then places the
@@ -3507,16 +3549,29 @@ mod tests {
             sock,
         );
         assert_eq!(both.state, ItemState::Missing);
+        let summary = Plan {
+            items: vec![both.clone()],
+        }
+        .summary();
+        assert!(
+            summary.contains(
+                "      today: 2 things to fix:\n        - the running Minimal daemon (pid \
+                 4242) is not placed"
+            ) && summary.contains(
+                "\n        - the placement socket (minimald-place.socket) is not listening"
+            ),
+            "each cause is its own line: {summary}"
+        );
         let script = both.script.expect("both carry one block");
         let start = script
             .find("\nsystemctl start minimald-place.socket\n")
             .expect("the block starts the socket");
         let place = script
-            .find(&format!("\n{CLASSIFIER_PROGRAM_PATH} --pid 4242\n"))
+            .find(&place_line)
             .expect("the block places the daemon");
         assert!(
             start < place,
-            "the socket starts before the --pid: {script}"
+            "the socket starts before the daemon is placed: {script}"
         );
         // No systemctl on the host: no placer is owed, so none is missing.
         assert_eq!(
@@ -3595,6 +3650,32 @@ mod tests {
         // A holder whose fds cannot be read is not confirmed.
         let only_unreadable = format!("1: FLOCK  ADVISORY  WRITE 9999 {listed}:{ino} 0 EOF\n");
         assert_eq!(linux::lock_holder(&proc, &only_unreadable, dev, ino), None);
+    }
+
+    /// A lock holder anywhere under the tree, a box leaf among them, is not
+    /// an unplaced daemon: only a cgroup outside the tree is reported, and a
+    /// listing with no unified line is unknown, never outside.
+    #[test]
+    fn a_holder_under_the_tree_is_not_unplaced() {
+        use std::path::Path;
+        let mount = Path::new("/sys/fs/cgroup");
+        let root = Path::new("/sys/fs/cgroup/minimald.slice");
+        for (cgroup, wanted) in [
+            ("0::/minimald.slice/daemon\n", Some(true)),
+            ("0::/minimald.slice/box-17/leaf\n", Some(true)),
+            (
+                "0::/user.slice/user-1000.slice/session-2.scope\n",
+                Some(false),
+            ),
+            ("0::/minimald.slice-other\n", Some(false)),
+            ("1:name=systemd:/minimald.slice\n", None),
+        ] {
+            assert_eq!(
+                linux::stands_in_tree(cgroup, mount, root),
+                wanted,
+                "{cgroup:?}"
+            );
+        }
     }
 
     #[test]

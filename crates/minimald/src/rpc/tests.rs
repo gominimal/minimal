@@ -1884,7 +1884,7 @@ async fn deny_all_create_over_a_stale_unreadable_fact_answers_the_reread() {
     );
     assert_eq!(
         undecided.host_ip_enforcement, None,
-        "a box the launch refuses states no enforcement"
+        "a deny-all box on a host whose table cannot be read states no enforcement"
     );
 }
 

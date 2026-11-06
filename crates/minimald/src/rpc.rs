@@ -492,8 +492,9 @@ async fn serve_create_session(
             // re-reads the host when the stored fact says the start-up
             // probe could not read the table, and the reply must answer
             // over that re-read. The launch that follows reads the host
-            // again for its own gate, and its refusal holds whatever the
-            // create said.
+            // again for its own gate. Its refusal holds what the create said
+            // only for a box it places: a daemon outside its leaf places no
+            // box, so its deny-all box starts unenforced.
             //
             // Nothing is recorded at create: only a launch writes the
             // outcome, on the daemon-owned record field. The one key a
