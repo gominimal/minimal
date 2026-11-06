@@ -838,7 +838,7 @@ pub(crate) fn run_rm(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bep::store::{MemorySecretStore, keychain_add_line};
+    use bep::store::MemorySecretStore;
     use clap::Parser as _;
 
     fn set_args(argv: &[&str]) -> SecretSetArgs {
@@ -1308,22 +1308,6 @@ sentry
         assert!(!store.reads_without_prompt("claude", Path::new("/usr/bin/security")));
         assert!(!store.reads_without_prompt("claude", &proxy.with_file_name("min")));
 
-        // The keychain line names the proxy as the one trusted application,
-        // without `-A` (any application), and carries the value only as hex.
-        let line = keychain_add_line("claude", b"sk-ant", &proxy).unwrap();
-        let words: Vec<&str> = line.split_whitespace().collect();
-        assert_eq!(words.iter().filter(|w| **w == "-T").count(), 1, "{line}");
-        assert!(
-            line.contains(&format!("-T \"{}\"", proxy.display())),
-            "{line}"
-        );
-        assert!(!words.contains(&"-A"), "{line}");
-        // An update in place keeps the old access control, so no `-U`.
-        assert!(!words.contains(&"-U"), "{line}");
-        assert!(!line.contains("sk-ant"), "{line}");
-        assert!(line.trim_end().ends_with("-X 736b2d616e74"), "{line}");
-        assert!(keychain_add_line("claude", b"v", Path::new("/a\"b/bep")).is_err());
-
         // A listing reads the entry back from `security dump-keychain -a`.
         let dump = format!(
             "keychain: \"/Users/me/Library/Keychains/login.keychain-db\"
@@ -1341,6 +1325,10 @@ access: 2 entries
         description: Minimal secret claude
         applications (1):
             0: {p} (OK)
+    entry 2:
+        authorizations (1): partition_id
+        description: teamid:3G47C5HY64
+        applications: <null>
 keychain: \"/Users/me/Library/Keychains/login.keychain-db\"
 class: \"genp\"
 attributes:
@@ -1373,10 +1361,11 @@ attributes:
         // the first copy grants the proxy access. The copies merge, in
         // either order. Review thread 4369745218: the copy without the
         // proxy's entry prompts the proxy, so the merged item has no access.
-        let items = bep::store::parse_dump(&dump, &proxy);
+        let own = Some("teamid:3G47C5HY64");
+        let items = bep::store::parse_dump(&dump, &proxy, own);
         let (head, tail) = dump.split_at(dump.find("keychain: \"/Library").unwrap());
         let reordered = format!("{tail}\n{head}");
-        assert_eq!(bep::store::parse_dump(&reordered, &proxy), items);
+        assert_eq!(bep::store::parse_dump(&reordered, &proxy, own), items);
         assert_eq!(
             items,
             vec![

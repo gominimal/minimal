@@ -452,6 +452,7 @@ ID                                    NAME          TYPE     PARENT             
             record: stopped.clone(),
             identity: BoxIdentity::None,
             live_execs: Vec::new(),
+            disk_bytes: None,
         };
         let mut out = Vec::new();
         render_box_show(&mut out, &shown, "local", "local0").unwrap();
@@ -478,6 +479,7 @@ Host:       local0
             record: task.clone(),
             identity: BoxIdentity::Unknown,
             live_execs: vec!["exec-1".to_string()],
+            disk_bytes: None,
         };
         let mut out = Vec::new();
         render_box_show(&mut out, &shown, "local", "local0").unwrap();
@@ -678,6 +680,7 @@ ID                                    NAME   TYPE     PARENT  PROJECT         ST
             record: running,
             identity: BoxIdentity::Unknown,
             live_execs: Vec::new(),
+            disk_bytes: None,
         };
         let mut out = Vec::new();
         render_box_show(&mut out, &shown, "local-minvmd", "local-minvmd0").unwrap();
@@ -708,6 +711,7 @@ Host:       local-minvmd0
             record: stopped,
             identity: BoxIdentity::None,
             live_execs: Vec::new(),
+            disk_bytes: None,
         };
         let mut out = Vec::new();
         render_box_show(&mut out, &shown, "local", "local0").unwrap();

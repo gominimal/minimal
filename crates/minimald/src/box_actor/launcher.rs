@@ -178,7 +178,7 @@ impl BoxActor {
         _session: BoxHandle,
         record: &Record,
         spec: box_runtime::LaunchSpec,
-        _attach_env: box_runtime::AttachEnv,
+        attach_env: box_runtime::AttachEnv,
         _phase: LaunchPhase,
         _for_hooks: bool,
     ) -> Result<box_runtime::MockLauncher, AttachError> {
@@ -222,7 +222,9 @@ impl BoxActor {
         // and handed on: the mock starts its entrypoint as the real
         // launcher does.
         launch_spec_seam::observe(record.id, spec.clone());
-        let mut launcher = launcher.and_spec(spec);
+        let mut launcher = launcher
+            .and_spec(spec)
+            .and_entrypoint_env(attach_env.entrypoint);
         // A listen plan a test seeded ([`listen_plan_seam`]) rides the
         // mock's `Launched` the way the launch's own gathered plan rides a
         // real one — and a launch a test seeded no plan for starts no

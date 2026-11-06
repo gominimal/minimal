@@ -10,7 +10,9 @@
 //! documents, and this module reads it byte for byte:
 //!
 //! - byte 0: the wire version, [`DELIVERY_HEADER_VERSION`]
-//! - bytes 1..17: the box id, filled from the box's attachment
+//! - bytes 1..17: the box id, filled from the box's attachment, or the
+//!   reserved cohort id [`COHORT_BOX_ID`] for a connection from the
+//!   `host_ip` cohort address, which names no single box (BEP-084)
 //! - bytes 17..21 and 21..23: the box's switch address and source port
 //! - bytes 23..27 and 27..29: the destination address and port
 //!
@@ -58,6 +60,23 @@ pub const PRESENT_TIMEOUT: Duration = Duration::from_secs(5);
 /// names no box.
 pub type BoxId = [u8; 16];
 
+/// The reserved id a delivery from the `host_ip` cohort address carries:
+/// `switch::bep_host::COHORT_BOX_ID`. The cohort's boxes share the address,
+/// so the delivery names none of them (BEP-084). The proxy reads this id as
+/// [`crate::redeem::Attribution::HostIpCohort`], and the sealed value a
+/// request carries names the box the request is checked for.
+pub const COHORT_BOX_ID: BoxId = [0xff; 16];
+
+/// [`COHORT_BOX_ID`] in its text form, [`box_id_text`]: the subject of a
+/// cohort delivery's records that name no box.
+pub const COHORT_BOX_ID_TEXT: &str = "ffffffffffffffffffffffffffffffff";
+
+/// Whether `box_id`, in its text form, is the reserved cohort id.
+#[must_use]
+pub fn is_cohort_box_id(box_id: &str) -> bool {
+    box_id == COHORT_BOX_ID_TEXT
+}
+
 /// The box id in its one text form: 32 lowercase hex digits, the form every
 /// audit record's `subject` and `min box audit` use.
 #[must_use]
@@ -74,7 +93,8 @@ pub fn box_id_text(id: &BoxId) -> String {
 /// two endpoints as the box's connection gave them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Delivery {
-    /// The box the connection belongs to.
+    /// The box the connection belongs to, or [`COHORT_BOX_ID`] for a
+    /// connection from the `host_ip` cohort address.
     pub box_id: BoxId,
     /// The box's switch address and source port.
     pub source: SocketAddrV4,
@@ -84,7 +104,9 @@ pub struct Delivery {
 
 impl Delivery {
     /// Parses the fixed header. `None` when the version is not
-    /// [`DELIVERY_HEADER_VERSION`].
+    /// [`DELIVERY_HEADER_VERSION`]. A header that carries
+    /// [`COHORT_BOX_ID`] parses as a cohort delivery
+    /// ([`Self::is_cohort`]).
     #[must_use]
     pub fn parse(head: &[u8; DELIVERY_HEADER_LEN]) -> Option<Self> {
         if head[0] != DELIVERY_HEADER_VERSION {
@@ -116,6 +138,13 @@ impl Delivery {
         head[23..27].copy_from_slice(&self.destination.ip().octets());
         head[27..29].copy_from_slice(&self.destination.port().to_be_bytes());
         head
+    }
+
+    /// Whether the delivery is from the `host_ip` cohort address: its box
+    /// id is [`COHORT_BOX_ID`], and it names no box (BEP-084).
+    #[must_use]
+    pub fn is_cohort(&self) -> bool {
+        self.box_id == COHORT_BOX_ID
     }
 
     /// The box id as text, [`box_id_text`].

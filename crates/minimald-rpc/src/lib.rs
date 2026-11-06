@@ -583,7 +583,7 @@ pub struct BoxConfig {
     #[serde(default = "default_hooks_enabled")]
     pub hooks_enabled: bool,
     /// Whether the box ends with the one `min task run` it is created for
-    /// (NET-131): set by a run without `--keep`, and persisted onto the
+    /// (NET-131): set by every task run, and persisted onto the
     /// record as [`boxes::Record::ends_with_run`] by the create itself, so
     /// a daemon restart at any point after the create destroys the box
     /// rather than resuming it. Defaults to `false`, which is every other
@@ -625,6 +625,15 @@ pub struct BoxConfig {
     /// field. The daemon then records `project_path` as the root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_root: Option<paths::HostAbsPath>,
+    /// The name a `host_ip` grant box registered under with the VM host
+    /// daemon, when that is not the name the daemon gives the box. A fresh
+    /// instance registers under a creation key of its own, because the
+    /// daemon names it `<base>-<n>` only after the registration. The
+    /// daemon's id mint asks by this name. `None` for every other box, and
+    /// from a client that predates the field: the mint then asks by the
+    /// box's name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_ip_registration: Option<String>,
 }
 
 /// The client verb that asked for a box ([`BoxConfig::creating_verb`]).
@@ -2226,7 +2235,8 @@ impl CreateSessionRequest {
     /// a plain create sends: no handed addresses or box id, no task
     /// addresses, hooks on, not ended with a run, no attrs, no sealed
     /// deliveries, no root certificate, the session verb, no project root,
-    /// no version assertion, no spec, and no fresh instance.
+    /// no host-address registration name, no version assertion, no spec,
+    /// and no fresh instance.
     pub fn new(
         name: impl Into<String>,
         project_path: paths::HostAbsPath,
@@ -2249,6 +2259,7 @@ impl CreateSessionRequest {
                 root_certificate: None,
                 creating_verb: CreatingVerb::default(),
                 project_root: None,
+                host_ip_registration: None,
             },
             must_match_version: None,
             spec: None,
@@ -2850,6 +2861,14 @@ pub struct ShowBoxResponse {
     /// <https://github.com/gominimal/minimal/issues/2404> (T30, BOX-149).
     #[serde(default)]
     pub live_execs: Vec<String>,
+    /// The bytes on disk that a reap of the box frees: the box's
+    /// directory, with its filesystem, record, events and log. The daemon
+    /// gives it for a `stopped` or `exited` box only. It is absent for a
+    /// box in any other state, for a box whose disk the daemon cannot
+    /// measure, and from a daemon that predates the field. Absent never
+    /// means zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_bytes: Option<u64>,
 }
 
 impl OneshotSshRpc for ShowBox {
@@ -2947,6 +2966,42 @@ impl OneshotSshRpc for PruneBoxes {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "PruneBoxes");
     type Request<'a> = PruneBoxesRequest;
     type Response = Errorable<PruneBoxesResponse>;
+}
+
+/// An RPC to preview a [`PruneBoxes`]: it lists every box that a prune
+/// with the same selectors matches, with the disk each one holds, and
+/// reaps none (BOX-021). The request is a [`PruneBoxesRequest`], and the
+/// match is the one [`PruneBoxes`] makes.
+pub struct PreviewPrune;
+
+/// One box a [`PreviewPrune`] matched.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrunePreviewEntry {
+    /// The box's record, as a prune that reaps it reports it.
+    pub record: BoxListingEntry,
+    /// The bytes on disk that a reap of the box frees, as
+    /// [`ShowBoxResponse::disk_bytes`] gives them. Absent when the daemon
+    /// cannot measure them. Absent never means zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_bytes: Option<u64>,
+}
+
+/// The response for a [`PreviewPrune`] RPC.
+///
+/// `deny_unknown_fields`, so that `{"error": "..."}` never decodes as a
+/// preview that matched nothing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewPruneResponse {
+    /// Every box a prune with these selectors reaps now, in box id order.
+    #[serde(default)]
+    pub matched: Vec<PrunePreviewEntry>,
+}
+
+impl OneshotSshRpc for PreviewPrune {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "PreviewPrune");
+    type Request<'a> = PruneBoxesRequest;
+    type Response = Errorable<PreviewPruneResponse>;
 }
 
 /// An RPC to destroy an existing session.
@@ -3975,6 +4030,7 @@ mod box_listing_tests {
             record: stopped,
             identity: BoxIdentity::None,
             live_execs: vec!["exec-1".to_string()],
+            disk_bytes: Some(4096),
         };
         let bytes = serde_json_lenient::to_vec(&Errorable::Ok(show.clone())).unwrap();
         match serde_json_lenient::from_slice::<Errorable<ShowBoxResponse>>(&bytes).unwrap() {

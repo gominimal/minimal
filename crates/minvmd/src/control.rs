@@ -4652,6 +4652,98 @@ mod tests {
         assert_eq!(registry.table().rows().len(), 1);
     }
 
+    /// BEP-082: two fresh instances of one `host_ip` grant entry register
+    /// at once under creation keys of their own, `<base>~<hex>`, and each
+    /// gets its own id. Each in-VM mint asks by its key after the box is
+    /// named `<base>-<n>`, and takes its own registration's id, and both
+    /// boxes are admitted. A create under the fixed name is not a fresh
+    /// instance: a second registration of that name, while a live
+    /// registration holds it, is still refused.
+    #[test]
+    fn concurrent_fresh_instance_grant_boxes_get_distinct_ids() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let grant = |name: &str| RegisterBoxRequest {
+            host_ip: true,
+            hold: false,
+            credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
+            task_slots: minimald_rpc::TASK_SLOTS_PER_BOX,
+            ..box_request(name)
+        };
+        let minted = |reply: BoxControlReply| match reply {
+            BoxControlReply::BoxIdMinted { minted_box_id } => minted_box_id,
+            other => panic!("a host_ip registration is answered with a box id, got {other:?}"),
+        };
+        let keys = [
+            "dev~00112233445566778899aabbccddeeff",
+            "dev~ffeeddccbbaa99887766554433221100",
+        ];
+        let ids: Vec<minimald_rpc::BoxId> = std::thread::scope(|scope| {
+            let asks: Vec<_> = keys
+                .iter()
+                .map(|key| {
+                    let request = grant(key);
+                    let sock_path = &sock_path;
+                    scope.spawn(move || register(sock_path, &request))
+                })
+                .collect();
+            asks.into_iter()
+                .map(|ask| minted(ask.join().expect("no panic").expect("answered")))
+                .collect()
+        });
+        assert_ne!(ids[0], ids[1], "each fresh instance gets its own id");
+        for (key, id) in keys.iter().zip(&ids) {
+            assert_eq!(registry.host_ip_id_for(key), Some(id.to_bytes()));
+        }
+
+        // The in-VM daemon names the boxes `dev-1` and `dev-2`, then asks
+        // for each id by the key the create carried.
+        let guest = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        for (n, (key, id)) in keys.iter().zip(&ids).enumerate() {
+            let reply = control(
+                &guest,
+                &BoxControlRequest::MintBoxId(minimald_rpc::MintBoxIdRequest {
+                    switch_address: None,
+                    create_token: Some(format!("create-dev-{}", n + 1)),
+                    host_ip_name: Some((*key).to_owned()),
+                }),
+            )
+            .expect("the mint is answered");
+            assert_eq!(
+                reply,
+                BoxControlReply::BoxIdMinted { minted_box_id: *id },
+                "dev-{} takes its own registration's id",
+                n + 1
+            );
+            assert!(
+                registry.admit_host_ip_box_with_lane(
+                    boxes::SessionId::from_bytes(id.to_bytes()),
+                    None,
+                    true,
+                ),
+                "dev-{} is admitted",
+                n + 1
+            );
+        }
+
+        // A create under the fixed name registers it once. A second
+        // registration of the name a live registration holds is refused.
+        let fixed = minted(register(&sock_path, &grant("dev")).expect("answered"));
+        assert!(!ids.contains(&fixed));
+        match register(&sock_path, &grant("dev")).expect("answered") {
+            BoxControlReply::Error { error } => assert_eq!(
+                error,
+                AllocationError::NameAlreadyHeld {
+                    held: "dev".to_string()
+                }
+                .to_string()
+            ),
+            other => panic!("a second registration of a held name is refused, got {other:?}"),
+        }
+        assert_eq!(registry.host_ip_id_for("dev"), Some(fixed.to_bytes()));
+    }
+
     /// BEP-082: a `host_ip` box's record takes the id its registration
     /// minted, so the record and the sealed grants name one id. The in-VM
     /// daemon's mint ask names the box's creation name. The id goes to one
