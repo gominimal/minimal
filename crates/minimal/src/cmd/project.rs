@@ -938,7 +938,45 @@ fn find_init_mfile(
             ),
         }
         .into()),
-        Err(e) => Err(anyhow::Error::new(e).context("reading minimal.toml")),
+        Err(e @ mfile::Error::IO(..)) => Err(anyhow::Error::new(e).context("reading minimal.toml")),
+        // A file that does not parse or validate is invalid configuration:
+        // exit 3, as the architecture's exit-code table fixes it.
+        Err(e) => {
+            let file = located_init_mfile(dir, search_ancestors)
+                .map_or_else(|| "minimal.toml".to_string(), |p| p.display().to_string());
+            Err(InitRefusal {
+                code: 3,
+                message: format!(
+                    "min init did not add the entry: {file} is not valid. \
+                     Fix the file, then run the command again.\n{}",
+                    e.to_string().trim_end()
+                ),
+            }
+            .into())
+        }
+    }
+}
+
+/// The `minimal.toml` path that [`find_init_mfile`] read, found by the
+/// same search as `mfile::File::from_dir` and `from_dir_recursive`, so a
+/// refusal can name a file whose parse error does not carry its path.
+fn located_init_mfile(dir: &std::path::Path, search_ancestors: bool) -> Option<std::path::PathBuf> {
+    let home = std::env::home_dir();
+    let mut dir = dir;
+    loop {
+        for path in [
+            dir.join(mfile::MFILE_NAME),
+            dir.join(".minimal").join(mfile::MFILE_NAME),
+        ] {
+            if path.exists() {
+                return Some(path);
+            }
+        }
+        let parent = dir.parent()?;
+        if !search_ancestors || home.as_deref() == Some(parent) {
+            return None;
+        }
+        dir = parent;
     }
 }
 
@@ -1522,6 +1560,39 @@ mod init_tests {
             "no file in the subdirectory"
         );
         assert!(!root.path().join("src").join(mfile::MFILE_NAME).exists());
+    }
+
+    // BCLI-018: a minimal.toml that does not parse is invalid configuration,
+    // exit 3, and the refusal names the file.
+    #[test]
+    fn init_invalid_mfile_exit3_appends_nothing() {
+        const BROKEN: &str = "[boxes.dev\ntype = \"session\"\n";
+        let root = project(BROKEN);
+        let sub = root.path().join("src");
+        std::fs::create_dir(&sub).expect("create the subdirectory");
+        let file = root.path().join(mfile::MFILE_NAME);
+        for dir in [root.path(), sub.as_path()] {
+            let refusal = append_from(dir, "worker").unwrap_err();
+            assert_eq!(refusal.code, 3, "{}", refusal.message);
+            assert!(
+                refusal
+                    .message
+                    .starts_with("min init did not add the entry"),
+                "{}",
+                refusal.message
+            );
+            assert!(
+                refusal.message.contains(&file.display().to_string()),
+                "{}",
+                refusal.message
+            );
+            assert!(
+                refusal.message.contains("invalid TOML"),
+                "{}",
+                refusal.message
+            );
+            assert_eq!(read(&root), BROKEN, "the file is unchanged");
+        }
     }
 
     // BCLI-018: both layouts in one directory are refused, as mfile refuses them.
