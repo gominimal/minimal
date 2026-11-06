@@ -396,6 +396,9 @@ fn every_daemon_connection_is_classified() {
             // Test-only: the NET-058 and NET-152 tests' client on the selected
             // harness daemon, which is this build.
             "tests.rs::selected_client = ungated",
+            // Not a client path: the run tests' stand-in for a box's
+            // entrypoint, which answers no version.
+            "tests.rs::stand_in_daemon = ungated",
         ]
     );
 }
@@ -435,7 +438,7 @@ fn every_create_session_asserts_the_daemon_build() {
             // Not a create the dashboard sends: the unit tests' own-address
             // config, which only a fake create closure receives.
             "dash/rpc.rs::own_ip_config = asserts nothing",
-            "task.rs::run_create_request = asserts",
+            "task.rs::run_entry = asserts",
             // Not a client path: the two-VM fixture's own create. It asserts
             // like the real ones, so the inventory stays "every site asserts".
             "tests.rs::create_box_on = asserts",
@@ -445,6 +448,8 @@ fn every_create_session_asserts_the_daemon_build() {
             "tests.rs::created_box_name_is_the_entry_without_a_typed_name = asserts nothing",
             // A unit test's request, never sent: it checks the cleaned entry name.
             "tests.rs::entry_name_registers_and_creates_under_one_cleaned_name = asserts nothing",
+            // A unit test's request, never sent: it checks the fresh instance.
+            "tests.rs::run_and_start_new_request_fresh_instance = asserts nothing",
         ]
     );
 }
@@ -2057,33 +2062,24 @@ async fn run_style_propagates_entrypoint_exit() {
     assert!(task::exit_outcome(None).is_err());
 }
 
-// BCLI-070: `min task run` and `min box run` share one create request, and
-// it asks for a fresh instance under no name of the client's, so the
-// daemon names the box `<name>-<n>`.
+// BCLI-070: `min task run` and `min box run` share one run path, and its
+// create asks for a fresh instance under no name of the client's, so the
+// daemon names the box `<name>-<n>`. This branch has no `min box start` and
+// no `--new` on `min session start` yet, so only the runs request one.
 #[test]
 fn run_and_start_new_request_fresh_instance() {
-    let project = paths::HostAbsPath::try_new(camino::Utf8PathBuf::from("/tmp/project")).unwrap();
-    let request = task::run_create_request(project);
-    assert!(request.fresh_instance);
-    assert_eq!(request.config.name, None);
-    assert_eq!(
-        request.must_match_version,
-        minimal_client::version_assertion()
-    );
-
-    // A named request loses its name when it becomes a fresh instance.
-    let mut named = minimald_rpc::CreateSessionRequest::new(
+    let mut request = minimald_rpc::CreateSessionRequest::new(
         String::from("web"),
         paths::HostAbsPath::try_new(camino::Utf8PathBuf::from("/tmp/project")).unwrap(),
         boxes::NetworkMode::HostNet,
         boxes::BoxPolicy::default(),
     );
-    named.config.name = Some("web".into());
-    request_fresh_instance(&mut named);
-    assert!(named.fresh_instance);
-    assert_eq!(named.config.name, None);
+    request.config.name = Some("web".into());
+    request_fresh_instance(&mut request);
+    assert!(request.fresh_instance);
+    assert_eq!(request.config.name, None, "the client invents no name");
 
-    // Both verbs reach the one run path, which sends that request.
+    // Both verbs reach the one run path.
     let task_run = task::RunEntry::from(TaskRunArgs {
         task: "build".into(),
         path: None,
@@ -2097,10 +2093,18 @@ fn run_and_start_new_request_fresh_instance() {
         args: vec![],
     });
     assert_eq!(task_run.entry, box_run.entry);
+    assert_eq!(task_run.args, box_run.args);
+    // That path marks its create as a fresh instance, before it sends it.
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let text = std::fs::read_to_string(manifest.join("src/task.rs")).unwrap();
     let body = function_body(&text, "run_entry").expect("task.rs defines run_entry");
-    assert!(body.contains("run_create_request("));
+    let marked = body
+        .find("request_fresh_instance(&mut request)")
+        .expect("the run marks its create as a fresh instance");
+    let sent = body
+        .find("oneshot_rpc::<CreateSession>")
+        .expect("the run sends its create");
+    assert!(marked < sent, "the run marks its create before it sends it");
 }
 
 #[test]

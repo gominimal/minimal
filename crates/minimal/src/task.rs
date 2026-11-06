@@ -247,24 +247,6 @@ fn refuse_terminal_entry(file: Option<&mfile::File>, entry: &str) -> Result<(), 
     Ok(())
 }
 
-/// The create request of a run (BCLI-070): a fresh instance of the entry
-/// at `project`, for the daemon to name `<name>-<n>`.
-pub(crate) fn run_create_request(
-    project: paths::HostAbsPath,
-) -> minimald_rpc::CreateSessionRequest {
-    let mut request = minimald_rpc::CreateSessionRequest::new(
-        String::new(),
-        project,
-        boxes::NetworkMode::HostNet,
-        boxes::BoxPolicy::default(),
-    );
-    crate::request_fresh_instance(&mut request);
-    // Refused by a daemon of another build before it allocates anything;
-    // `None` under the skew override.
-    request.must_match_version = minimal_client::version_assertion();
-    request
-}
-
 /// Detaches a run from the box it started (BCLI-010 `--detach`): closes
 /// the box's stdin, lets the channel go and prints only the box's id on
 /// `out`. The entrypoint runs on without a client, and the box's log keeps
@@ -935,7 +917,16 @@ pub(crate) async fn run_entry(global: &GlobalArgs, args: RunEntry) -> Result<(),
     // BCLI-070, BOX-163: every run is a fresh instance. The daemon names the
     // box `<task>-<n>` from the spec's entry, with the smallest `n` no
     // retained box uses. The client invents no name.
-    let mut request = run_create_request(abs_path.clone());
+    let mut request = minimald_rpc::CreateSessionRequest::new(
+        String::new(),
+        abs_path.clone(),
+        boxes::NetworkMode::HostNet,
+        boxes::BoxPolicy::default(),
+    );
+    crate::request_fresh_instance(&mut request);
+    // Refused by a daemon of another build before it allocates anything;
+    // `None` under the skew override.
+    request.must_match_version = minimal_client::version_assertion();
     // The task box runs its task as its entrypoint and keeps its record
     // when the task returns (BOX-038). Every created box stores its spec
     // (BOX-068). An interactive task, which has no spec, takes the exec
