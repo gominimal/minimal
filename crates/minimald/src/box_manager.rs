@@ -1480,6 +1480,33 @@ impl BoxManager {
 
         let running = BTreeMap::new();
         let (sender, receiver) = crate::traced::channel(8);
+        // The manager's root (TEL-030): it serves every request for the
+        // daemon's life, so it never pins whatever span its creator ran in,
+        // and the hand-over and publish-move loops below run under it too,
+        // as its children: they live exactly as long, and a lifetime loop
+        // that is a root of its own reads as a stray trace in the export.
+        // Its ids are noted (`adopt_trace` with no caller), so the work no
+        // request asks for (the boot resume, a hand-over the daemon's own
+        // range walk makes) joins this trace instead of starting one. Made
+        // before the registry below, so a microVM daemon's start walk runs
+        // in it too.
+        //
+        // The root closes when the mainloop ends: the loops end with the
+        // mainloop (`mainloop_done`), not at the runtime's drop, so a root
+        // that never closed (and never exported) cannot hide the boot work
+        // as orphans.
+        let root = tracing::info_span!(
+            parent: None,
+            "sessions.manager",
+            trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty,
+        );
+        let root = crate::traced::detach(root);
+        crate::exec::adopt_trace(&root, None);
+        #[cfg(target_os = "linux")]
+        let lifetime = root.in_scope(crate::traced::caller_context);
+        #[cfg(target_os = "linux")]
+        let mainloop_done = CancellationToken::new();
         // Shared so the host-side proxies can resolve `Host:` headers directly;
         // a clone is held by both the actor (which mutates it) and the handle
         // (which hands it to the proxies via `hostnames()`). Whether the
@@ -1695,8 +1722,11 @@ impl BoxManager {
                 ));
                 // The cell is new and empty here, so the set cannot fail.
                 let _ = range_walk.set(Arc::clone(&walk));
-                crate::traced::spawn(async move {
-                    walk.daemon_start().await;
+                // In the manager's root (above), not in no span at all.
+                root.in_scope(|| {
+                    crate::traced::spawn(async move {
+                        walk.daemon_start().await;
+                    })
                 });
             }
             (hostnames, loopback)
@@ -1705,6 +1735,8 @@ impl BoxManager {
         let handle = BoxManagerHandle {
             sender,
             in_shutdown: in_shutdown.clone(),
+            #[cfg(target_os = "linux")]
+            lifetime,
             #[cfg(target_os = "linux")]
             hostnames: Arc::clone(&hostnames),
             #[cfg(target_os = "linux")]
@@ -1728,15 +1760,34 @@ impl BoxManager {
                 .expect("hostname registry lock poisoned")
                 .notify_hand_overs(sender);
             let manager = weak_self.clone();
-            // Serves hand-overs for the manager's life: a root of its own,
-            // like the manager's mainloop below.
-            crate::traced::spawn_detached(
-                tracing::info_span!(parent: None, "sessions.hand_overs"),
-                async move {
-                    while let Some(hand_over) = hand_overs.recv().await {
-                        let Some(manager) = manager.upgrade() else {
-                            return;
-                        };
+            // Serves hand-overs for the manager's life, under its root. Each
+            // hand-over is handled in a span of its own in the trace of the
+            // work that made it (a destroy, a release, a publish; TEL-022),
+            // or in the manager's when the daemon made it by itself.
+            let done = mainloop_done.clone();
+            let serve = async move {
+                loop {
+                    let next = tokio::select! {
+                        biased;
+                        () = done.cancelled() => None,
+                        next = hand_overs.recv() => next,
+                    };
+                    let Some((hand_over, caller)) = next else {
+                        return;
+                    };
+                    let Some(manager) = manager.upgrade() else {
+                        return;
+                    };
+                    let span = tracing::info_span!(
+                        parent: None,
+                        "sessions.hand_over",
+                        port = hand_over.port,
+                        trace_id = tracing::field::Empty,
+                        span_id = tracing::field::Empty,
+                        parent_span_id = tracing::field::Empty,
+                    );
+                    crate::exec::adopt_trace(&span, caller.or(lifetime));
+                    let bind = async {
                         let holder = manager
                             .get_session(BoxKeyPredicate::Id(hand_over.holder))
                             .await;
@@ -1745,9 +1796,13 @@ impl BoxManager {
                                 .bind_handed_port(hand_over.address, hand_over.port)
                                 .await;
                         }
-                    }
-                },
-            );
+                    };
+                    tracing::Instrument::instrument(bind, span).await;
+                }
+            };
+            let lifelong = tracing::info_span!(parent: &root, "sessions.hand_overs");
+            let serve = tracing::Instrument::instrument(serve, lifelong);
+            root.in_scope(|| crate::traced::spawn(serve));
         }
         // #2748: each move of a box's publish is passed to that box's
         // session, which binds its declared ports at the new address and
@@ -1764,22 +1819,44 @@ impl BoxManager {
                 .expect("hostname registry lock poisoned")
                 .notify_publish_moves(sender);
             let manager = weak_self.clone();
-            crate::traced::spawn_detached(
-                tracing::info_span!(parent: None, "sessions.publish_moves"),
-                async move {
-                    while let Some(moved) = moves.recv().await {
-                        let Some(manager) = manager.upgrade() else {
-                            return;
-                        };
+            // Under the manager's root, each move in its sender's trace, as
+            // the hand-overs above.
+            let done = mainloop_done.clone();
+            let serve = async move {
+                loop {
+                    let next = tokio::select! {
+                        biased;
+                        () = done.cancelled() => None,
+                        next = moves.recv() => next,
+                    };
+                    let Some((moved, caller)) = next else {
+                        return;
+                    };
+                    let Some(manager) = manager.upgrade() else {
+                        return;
+                    };
+                    let span = tracing::info_span!(
+                        parent: None,
+                        "sessions.publish_move",
+                        trace_id = tracing::field::Empty,
+                        span_id = tracing::field::Empty,
+                        parent_span_id = tracing::field::Empty,
+                    );
+                    crate::exec::adopt_trace(&span, caller.or(lifetime));
+                    let rebind = async {
                         if let Ok(Some(holder)) = manager.running_session(moved.holder).await {
                             let ports = moved.hand_overs.iter().map(|hand_over| hand_over.port);
                             holder
                                 .publish_moved(moved.from, moved.to, ports.collect())
                                 .await;
                         }
-                    }
-                },
-            );
+                    };
+                    tracing::Instrument::instrument(rebind, span).await;
+                }
+            };
+            let lifelong = tracing::info_span!(parent: &root, "sessions.publish_moves");
+            let serve = tracing::Instrument::instrument(serve, lifelong);
+            root.in_scope(|| crate::traced::spawn(serve));
         }
         let mngr = Self {
             in_shutdown,
@@ -1801,13 +1878,18 @@ impl BoxManager {
             deny_all_opt_out,
         };
 
-        // The manager serves every request for the daemon's life: a root of
-        // its own, so it never pins whatever span its creator ran in. Each
-        // message's span names its sender (see `mainloop`).
-        crate::traced::spawn_detached(
-            tracing::info_span!(parent: None, "sessions.manager"),
-            mngr.mainloop(),
-        );
+        // The manager's mainloop runs in its root (see above). Each
+        // message's span names its sender (see `mainloop`). Its end, however
+        // it ends (all senders gone, a panic, the runtime's drop), ends the
+        // loops above, so the root closes with it.
+        #[cfg(target_os = "linux")]
+        let ends_loops = mainloop_done.drop_guard();
+        let serve = async move {
+            #[cfg(target_os = "linux")]
+            let _ends_loops = ends_loops;
+            mngr.mainloop().await;
+        };
+        root.in_scope(|| crate::traced::spawn(serve));
         Ok(handle)
     }
 }

@@ -378,8 +378,8 @@ has a unit test. No repeatable macOS VM lane exists yet (minimal#2037).
   lab:      716, trace-health on every telemetry-on run (the daemon side)
 - **TEL-022** THE SYSTEM SHALL run the daemon's work for a request (manager and
   session messages, compose, checkouts, blocking-pool work, spawned
-  short-lived tasks, package fetches, orchestrator and check tasks) in
-  descendants of that request's span.
+  short-lived tasks, package fetches, orchestrator and check tasks, port
+  hand-overs and publish moves) in descendants of that request's span.
   tier:     T0
   verify:   cargo nextest run -p minimald a_message_carries_its_senders_context_not_its_span
   test:     crates/minimald/src/traced.rs::a_message_carries_its_senders_context_not_its_span;
@@ -393,6 +393,7 @@ has a unit test. No repeatable macOS VM lane exists yet (minimal#2037).
             crates/minimald/src/exec.rs::a_git_upload_lookup_runs_in_its_span;
             crates/minimald/src/exec.rs::a_git_receive_task_runs_in_its_span;
             crates/minimald/src/exec.rs::a_git_upload_task_runs_in_its_span;
+            crates/minimald/src/box_manager/tests.rs::a_hand_over_and_a_publish_move_join_the_requests_trace;
             crates/minimald/src/traced.rs::no_direct_tokio_spawn_blocking (a text guard;
             review S15 lists spawn forms it misses)
   lab:      710d, 713, 716
@@ -486,7 +487,17 @@ has a unit test. No repeatable macOS VM lane exists yet (minimal#2037).
             crates/minimald/src/traced.rs::a_spawned_task_holds_its_callers_span_open (the contrast);
             crates/minimald/src/traced.rs::a_message_carries_its_senders_context_not_its_span;
             crates/minimald/src/rpc.rs::a_request_span_closes_when_its_rpc_returns
-            (CreateSession's spans close at its answer; the session actor is a root)
+            (CreateSession's spans close at its answer; the session actor is a root);
+            crates/minimald/src/box_manager/tests.rs::the_managers_own_work_runs_in_its_root_trace
+            (the manager's loops and the work no request asks for are in its root's trace);
+            crates/minimald/src/box_manager/tests.rs::the_managers_root_closes_when_its_mainloop_ends
+  - A loop that lives exactly as long as an actor (the manager's
+    `sessions.hand_overs` and `sessions.publish_moves`) runs under that
+    actor's root, not in a root of its own, and work the daemon does by
+    itself (the boot resume, a microVM daemon's start walk) joins the
+    actor's trace. Such a loop ends with the actor's mainloop, so the root
+    closes, and exports, when the actor does. A root with no link that is
+    not one of the daemon-lifetime actors reads as a stray trace.
 - **TEL-031** WHEN `min` hands its process off (`exit()` with ssh's status
   after `session exec`, `run` or an attach, or dying of SIGTERM or SIGHUP in
   `min net forward`) THE SYSTEM
