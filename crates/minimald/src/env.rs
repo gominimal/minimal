@@ -4741,7 +4741,10 @@ exit $rc
             move |mut stream, line| {
                 use std::io::Read as _;
                 let request = run_request_data(&line);
-                assert!(request.stdin, "the request says it forwards stdin: {line:?}");
+                assert!(
+                    request.stdin,
+                    "the request says it forwards stdin: {line:?}"
+                );
                 assert_eq!(request.task, "query");
                 assert_eq!(
                     request.args,

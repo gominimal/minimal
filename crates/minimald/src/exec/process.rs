@@ -1047,7 +1047,10 @@ fn copy_forwarded_stdin(mut from: impl io::Read, to: impl io::Write) -> io::Resu
             Err(_) => return Ok(()),
         };
         if let Some(pipe) = to.as_mut()
-            && pipe.write_all(&buf[..n]).and_then(|()| pipe.flush()).is_err()
+            && pipe
+                .write_all(&buf[..n])
+                .and_then(|()| pipe.flush())
+                .is_err()
         {
             to = None;
         }
