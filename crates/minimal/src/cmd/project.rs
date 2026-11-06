@@ -951,9 +951,12 @@ pub async fn cmd_init(global: &GlobalArgs, args: InitArgs) -> Result<(), mctx::E
             let config = build_config(global)?;
             let outcome = run_init_flow(config, args.yes, args.force, INIT_ENTRY_SHAPE)
                 .map_err(mctx::Error::Other)?;
+            // The legacy shape has no `dev` entry, so `entry` is recorded only
+            // when the entry shape is written.
             tracing::info!(
                 verb = "init",
-                entry = "dev",
+                shape = if INIT_ENTRY_SHAPE { "entry" } else { "legacy" },
+                entry = INIT_ENTRY_SHAPE.then_some("dev"),
                 outcome = if outcome.result_line().is_some() {
                     "written"
                 } else {
