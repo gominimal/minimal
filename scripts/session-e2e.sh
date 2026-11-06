@@ -6749,6 +6749,8 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     printf '\n[stack]\nuse = "shell"\n'
     printf '\n[tasks.e2e-echo]\necho = "TASK_RUN_E2E_OK"\n'
     printf '\n[tasks.e2e-fail]\nbash = "exit 7"\n'
+    # shellcheck disable=SC2016 # $l is the task's, expanded in the box
+    printf '\n[tasks.e2e-stdin]\nbash = "read -r l; echo STDIN_GOT:$l"\n'
     printf '\n[tasks.e2e-sleep]\nbash = "sleep 300"\n'
     printf '\n[tasks.e2e-envprint]\nexec = "printenv E2E_INHERIT_MARKER"\nenv_vars.E2E_INHERIT_MARKER = { inherit = true }\n'
     # shellcheck disable=SC2016 # $PWD is the task's, expanded in the box
@@ -6835,6 +6837,25 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   fi
   task_kept_check e2e-fail "$WORK/task-fail.err"
   echo "task run exit-code relay: 7 → 7 OK"
+
+  # A piped stdin reaches the task through the in-box `min task run`
+  # (T123), and stdout is the task's alone: `cat q.sql | min task run
+  # query > out.csv`.
+  task_out="$(cd "$TASK_SEED_DIR" && printf 'piped-line\n' | mnl task run e2e-stdin 2>"$WORK/task-stdin.err")"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "::error::'min task run e2e-stdin' with a piped stdin exited $rc (expected 0)"
+    echo "--- task stderr ---"; cat "$WORK/task-stdin.err" 2>/dev/null || true
+    fail
+  fi
+  if [ "$task_out" != "STDIN_GOT:piped-line" ]; then
+    echo "::error::'min task run e2e-stdin' did not give the task its piped stdin, or stdout is not the task's alone"
+    echo "--- task stdout ---"; printf '%s\n' "$task_out"
+    echo "--- task stderr ---"; cat "$WORK/task-stdin.err" 2>/dev/null || true
+    fail
+  fi
+  task_kept_check e2e-stdin "$WORK/task-stdin.err"
+  echo "task run stdin: piped input reached the task OK"
 
   # Ctrl-C on a running task stops its box (BOX-013) and keeps its record
   # (BOX-038): the run exits 130, the box lists as stopped, and
