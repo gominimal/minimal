@@ -360,7 +360,7 @@ impl russh::server::Handler for ConnectionHandler {
         var_value: &str,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        protocol_trace!("Got env_request on channel {id}: {var_name}={var_value}");
+        protocol_trace!("Got env_request on channel {id}: {var_name}");
 
         match self.0.lock().await.pending_config_mut(id) {
             Some(p) => {
