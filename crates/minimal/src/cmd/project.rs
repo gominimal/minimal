@@ -94,8 +94,11 @@ pub(crate) fn offer_mfile_scaffold(
     // whose stdout is reserved for the bare session id that scripted callers
     // read (`id=$(min activate)`). A result line on stdout here would land
     // ahead of that id and corrupt the capture.
-    // The legacy shape: this tree reads `[session]` when it activates, and
-    // the entry shape that `min init` writes is not read yet.
+    // The legacy shape: session start reads packages from `[session]`, and
+    // `[defaults.session]` in the entry shape is still an unknown key of
+    // `[defaults]` in `mfile::File`. #2410 (T16, BOX-064) expands a box's
+    // spec over `[defaults.<type>]`. When it lands, pass `true` here, and
+    // then remove the `entry_shape` parameter of `run_init_flow`.
     if let Some(line) = run_init_flow(config, false, false, false)?.result_line() {
         eprintln!("{line}");
     }
@@ -517,6 +520,11 @@ impl InitOutcome {
 /// generate a `minimal.toml`, show the plan, prompt for confirmation,
 /// and write the file. Shared by `cmd_init` and the `cmd_activate`
 /// missing-mfile prompt.
+///
+/// `entry_shape` writes the entry shape (BCLI-017) in place of the legacy
+/// `[session]` shape. It is an interim until #2410 (T16, BOX-064) reads
+/// `[defaults.session]` at session start. Then every caller passes `true`
+/// and the parameter is removed.
 pub(crate) fn run_init_flow(
     config: mctx::Config,
     skip_confirm: bool,
@@ -592,8 +600,7 @@ pub(crate) fn run_init_flow(
 
 /// The message `min init` prints when it gets more than one way to name the
 /// entry's type. The task fixes this text.
-pub(crate) const INIT_ONE_TYPE_FLAG: &str =
-    "Pass one of --session, --task, --agent, --service or --type.";
+pub const INIT_ONE_TYPE_FLAG: &str = "Pass one of --session, --task, --agent, --service or --type.";
 
 /// The built-in types that `min init` can append an entry of.
 const INIT_EXPANDED_TYPES: [&str; 2] = ["session", "task"];
@@ -607,13 +614,17 @@ const ENTRY_TABLES: [&str; 5] = ["boxes", "sessions", "tasks", "agents", "servic
 
 /// A refusal from `min init`: the text for the user and the exit code the
 /// run ends with. Nothing is written when one is returned.
+///
+/// `cmd_init` returns it as the error, and `main.rs` `failure_exit_code`
+/// ends the run with [`InitRefusal::code`], so the `cmd` span closes and
+/// its outcome record reaches the spool first.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct InitRefusal {
+pub struct InitRefusal {
     /// The exit code: 2 for a usage error, 3 for a type this release
     /// refuses, 1 for anything else.
-    pub(crate) code: i32,
+    pub code: u8,
     /// What was refused, why, and the next step.
-    pub(crate) message: String,
+    pub message: String,
 }
 
 impl InitRefusal {
@@ -679,12 +690,28 @@ pub(crate) fn init_request(args: &InitArgs) -> Result<InitRequest, InitRefusal> 
         }
         (_, Some(_), Some(_)) => return Err(InitRefusal::usage(INIT_ONE_TYPE_FLAG)),
     };
-    if entry.trim().is_empty() {
-        return Err(InitRefusal::usage(
-            "The entry name is empty. Run min init <entry> --type <type>.",
-        ));
-    }
+    check_entry_name(&entry)?;
     Ok(InitRequest::Append { entry, box_type })
+}
+
+/// Refuse an entry name that no entry can take: `self`, or a name that is
+/// not a DNS label (BOX-007, BOX-046). It runs before any file read, so a
+/// refused name leaves `minimal.toml` unread and unchanged.
+fn check_entry_name(entry: &str) -> Result<(), InitRefusal> {
+    if entry == mfile::entry::RESERVED_ENTRY_NAME {
+        return Err(InitRefusal::usage(format!(
+            "min init did not add the entry {entry}: the name {entry} is reserved. \
+             Choose another name."
+        )));
+    }
+    if !mfile::entry::is_dns_safe(entry) {
+        return Err(InitRefusal::usage(format!(
+            "min init did not add the entry {entry:?}: an entry name must be 1 to 63 \
+             characters of a-z, 0-9 and -, and must not start or end with -. \
+             Choose another name."
+        )));
+    }
+    Ok(())
 }
 
 /// Rewrite the scaffold that the project initializer generates into the
@@ -889,16 +916,6 @@ pub(crate) fn append_entry_in(
     Ok(path)
 }
 
-/// Print a refusal and end the run with its exit code. `cmd_init`'s caller
-/// turns every error into exit 1, so the code is set here.
-fn exit_refused(refusal: &InitRefusal) -> ! {
-    use std::io::Write as _;
-    eprintln!("error: {}", refusal.message);
-    let _ = std::io::stderr().flush();
-    let _ = std::io::stdout().flush();
-    std::process::exit(refusal.code)
-}
-
 /// `min init`: scaffold a `minimal.toml` in the entry shape, or append one
 /// entry to it.
 pub async fn cmd_init(global: &GlobalArgs, args: InitArgs) -> Result<(), mctx::Error> {
@@ -906,7 +923,7 @@ pub async fn cmd_init(global: &GlobalArgs, args: InitArgs) -> Result<(), mctx::E
         Ok(request) => request,
         Err(refusal) => {
             tracing::info!(verb = "init", outcome = "refused", code = refusal.code);
-            exit_refused(&refusal)
+            return Err(mctx::Error::Other(anyhow::Error::new(refusal)));
         }
     };
     let (entry, box_type) = match request {
@@ -945,22 +962,19 @@ pub async fn cmd_init(global: &GlobalArgs, args: InitArgs) -> Result<(), mctx::E
             println!("Added the {box_type} entry {entry} to {}", path.display());
             Ok(())
         }
-        Err(e) => match e.downcast_ref::<InitRefusal>() {
-            Some(refusal) => {
-                tracing::info!(
+        Err(e) => {
+            match e.downcast_ref::<InitRefusal>() {
+                Some(refusal) => tracing::info!(
                     verb = "init",
                     entry,
                     box_type,
                     outcome = "refused",
                     code = refusal.code
-                );
-                exit_refused(refusal)
+                ),
+                None => tracing::info!(verb = "init", entry, box_type, outcome = "failed"),
             }
-            None => {
-                tracing::info!(verb = "init", entry, box_type, outcome = "failed");
-                Err(mctx::Error::Other(e))
-            }
-        },
+            Err(mctx::Error::Other(e))
+        }
     }
 }
 
@@ -1298,6 +1312,45 @@ mod init_tests {
                 }),
             );
         }
+    }
+
+    // BCLI-018, BOX-007, BOX-046: the name check runs before any file read.
+    #[test]
+    fn init_entry_name_invalid_exit2_appends_nothing() {
+        let long = "a".repeat(64);
+        let dir = project(LEGACY_SCAFFOLD);
+        let empty = tempfile::tempdir().expect("a temp dir");
+        for name in ["self", "My_Box", "-dev", long.as_str(), ""] {
+            let task_flag = format!("--task={name}");
+            for argv in [
+                vec!["init", "--type", "session", "--", name],
+                vec!["init", task_flag.as_str()],
+            ] {
+                let refusal = run(&dir, &argv).unwrap_err();
+                assert_eq!(refusal.code, 2, "{argv:?}: {}", refusal.message);
+                assert!(
+                    refusal.message.contains(name),
+                    "{argv:?}: names the value: {}",
+                    refusal.message
+                );
+                assert_eq!(
+                    read(&dir),
+                    LEGACY_SCAFFOLD,
+                    "{argv:?}: the file is unchanged"
+                );
+                // No minimal.toml: the name is refused before the file is looked for.
+                assert_eq!(run(&empty, &argv).unwrap_err().code, 2, "{argv:?}");
+            }
+        }
+        let refusal = run(&dir, &["init", "My_Box", "--type", "session"]).unwrap_err();
+        assert!(
+            refusal
+                .message
+                .contains("1 to 63 characters of a-z, 0-9 and -"),
+            "states the rule: {}",
+            refusal.message
+        );
+        run(&dir, &["init", "web-2", "--type", "session"]).expect("a DNS label is accepted");
     }
 
     // BCLI-018
