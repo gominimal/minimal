@@ -4141,6 +4141,381 @@ fn read_listener_reach(paths: &[(&str, bool)], port: u16, dial: Ipv4Addr) -> Lis
     )
 }
 
+/// The port a host-address box's steering answerer listens on (BEP-086):
+/// DNS's own, because a box's `/etc/resolv.conf` names only addresses.
+pub(crate) const STEERING_ANSWERER_PORT: u16 = 53;
+
+/// The `component` field of every steering answerer log line.
+const STEERING_COMPONENT: &str = "steering-answerer";
+
+/// The TTL of the A answer a steered name gets: the DNS gate's, so a box
+/// asks again soon and a listener that went down fails closed at the next
+/// lookup.
+const STEERING_TTL: u32 = 30;
+
+/// Largest datagram a steering answerer reads.
+const STEERING_MAX_DATAGRAM: usize = 4096;
+
+/// How long a forwarded lookup waits for the node's resolver.
+const STEERING_FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Upper bound on the forwards one steering answerer has in flight. A
+/// lookup that finds no room is dropped, and the box's resolver retries.
+const STEERING_MAX_IN_FLIGHT: usize = 256;
+
+/// How often the SERVFAIL warning for a steered name is written, at most,
+/// per answerer.
+const STEERING_SERVFAIL_WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The loopback addresses held by live steering answerers: each
+/// host-address box with steering has one of its own in `127.53.0.0/16`, so
+/// the classifier can admit its leaf alone to it.
+static STEERING_ADDRESSES: std::sync::Mutex<BTreeSet<Ipv4Addr>> =
+    std::sync::Mutex::new(BTreeSet::new());
+
+/// One claimed steering address, given back on drop.
+#[derive(Debug)]
+struct SteeringAddress(Ipv4Addr);
+
+impl SteeringAddress {
+    /// The lowest free address of `127.53.0.0/16`, past the network and
+    /// broadcast ends, or `None` when every one is held.
+    fn claim() -> Option<Self> {
+        let mut held = STEERING_ADDRESSES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let free = (1u32..0xffff)
+            .map(|n| Ipv4Addr::from(0x7f35_0000 | n))
+            .find(|address| !held.contains(address))?;
+        held.insert(free);
+        Some(Self(free))
+    }
+}
+
+impl Drop for SteeringAddress {
+    fn drop(&mut self) {
+        STEERING_ADDRESSES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
+/// What one host-address box's steering answerer answers (BEP-086): the
+/// box's steered names, the proxy's address, the proxy's listener state,
+/// and the node's resolver that every other name goes to.
+#[derive(Debug, Clone)]
+pub(crate) struct SteeringPlan {
+    /// The box the answerer serves, as its log lines name it.
+    box_label: String,
+    /// The steered names, lowercased with no root dot.
+    names: HashSet<String>,
+    /// The proxy's address, the one A answer a steered name gets.
+    proxy: Ipv4Addr,
+    /// Whether the proxy's listener is live (BEP-062).
+    listener: ProxyListenerState,
+    /// The node's resolver, which every name that is not steered goes to.
+    upstream: SocketAddr,
+}
+
+/// What a steering answerer does with one datagram.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SteeringVerdict {
+    /// Write this reply back to the box. Nothing is forwarded.
+    Answer(Vec<u8>),
+    /// Send the datagram to the node's resolver unchanged, and relay its
+    /// reply.
+    Forward,
+}
+
+/// A DNS name lowercased, with no root dot: `github.com` for `GitHub.com.`.
+fn steering_normalized(name: &str) -> String {
+    let lowered = name.to_ascii_lowercase();
+    lowered.strip_suffix('.').unwrap_or(&lowered).to_string()
+}
+
+impl SteeringPlan {
+    /// A plan for the box `box_label` that steers `names` to `proxy` while
+    /// `listener` reads live, and forwards every other name to `upstream`.
+    pub(crate) fn new<'a>(
+        box_label: impl Into<String>,
+        names: impl IntoIterator<Item = &'a str>,
+        proxy: Ipv4Addr,
+        listener: ProxyListenerState,
+        upstream: SocketAddr,
+    ) -> Self {
+        Self {
+            box_label: box_label.into(),
+            names: names.into_iter().map(steering_normalized).collect(),
+            proxy,
+            listener,
+            upstream,
+        }
+    }
+
+    /// Whether `question` asks for a steered name.
+    fn steers(&self, question: &hickory_proto::op::Query) -> bool {
+        self.names
+            .contains(&steering_normalized(&question.name().to_string()))
+    }
+
+    /// The verdict for one datagram from the box, with the same rules as
+    /// the switch's DNS gate for an `own_ip` box (BEP-062, BEP-078). A
+    /// datagram that is not a standard query, or that asks no steered name,
+    /// is forwarded. A query that mixes a steered name with another name is
+    /// answered SERVFAIL, so the steered name never reaches real DNS. A
+    /// query of steered names with no A question and an AAAA, HTTPS or SVCB
+    /// question is answered NODATA. Otherwise, while the proxy's listener
+    /// is down, the query is answered SERVFAIL. While it is live, each A
+    /// question gets the proxy's address, and every other type gets no
+    /// answer.
+    pub(crate) fn verdict(&self, datagram: &[u8]) -> SteeringVerdict {
+        use hickory_proto::op::{Message, MessageType, Metadata, OpCode, ResponseCode};
+        use hickory_proto::rr::{RData, Record, RecordType};
+
+        if datagram.len() > STEERING_MAX_DATAGRAM {
+            return SteeringVerdict::Forward;
+        }
+        let Ok(query) = Message::from_vec(datagram) else {
+            return SteeringVerdict::Forward;
+        };
+        if query.metadata.message_type != MessageType::Query
+            || query.metadata.op_code != OpCode::Query
+        {
+            return SteeringVerdict::Forward;
+        }
+        let Some(question) = query.queries.iter().find(|q| self.steers(q)).cloned() else {
+            return SteeringVerdict::Forward;
+        };
+        let name = steering_normalized(&question.name().to_string());
+        let reply = |rcode: ResponseCode, answers: Vec<Record>| {
+            let mut reply = Message::response(query.metadata.id, query.metadata.op_code);
+            reply.metadata = Metadata::response_from_request(&query.metadata);
+            reply.metadata.response_code = rcode;
+            reply.add_queries(query.queries.clone());
+            for answer in answers {
+                reply.add_answer(answer);
+            }
+            reply
+                .to_vec()
+                .map_or(SteeringVerdict::Forward, SteeringVerdict::Answer)
+        };
+        if query.queries.iter().any(|q| !self.steers(q)) {
+            tracing::debug!(
+                component = STEERING_COMPONENT,
+                box_name = %self.box_label,
+                name,
+                "answered SERVFAIL for a lookup that mixes a steered name with another name"
+            );
+            return reply(ResponseCode::ServFail, Vec::new());
+        }
+        let has_a = query
+            .queries
+            .iter()
+            .any(|q| q.query_type() == RecordType::A);
+        let nodata = query.queries.iter().any(|q| {
+            matches!(
+                q.query_type(),
+                RecordType::AAAA | RecordType::HTTPS | RecordType::SVCB
+            )
+        });
+        if !has_a && nodata {
+            tracing::debug!(
+                component = STEERING_COMPONENT,
+                box_name = %self.box_label,
+                name,
+                query_type = ?question.query_type(),
+                "answered NODATA for a steered name"
+            );
+            return reply(ResponseCode::NoError, Vec::new());
+        }
+        if !self.listener.is_live() {
+            tracing::debug!(
+                component = STEERING_COMPONENT,
+                box_name = %self.box_label,
+                name,
+                "answered SERVFAIL for a steered name: the Box Egress Proxy is not listening"
+            );
+            return reply(ResponseCode::ServFail, Vec::new());
+        }
+        let answers = query
+            .queries
+            .iter()
+            .filter(|q| q.query_type() == RecordType::A)
+            .map(|q| {
+                Record::from_rdata(
+                    q.name().clone(),
+                    STEERING_TTL,
+                    RData::A(hickory_proto::rr::rdata::A(self.proxy)),
+                )
+            })
+            .collect();
+        tracing::debug!(
+            component = STEERING_COMPONENT,
+            box_name = %self.box_label,
+            name,
+            query_type = ?question.query_type(),
+            proxy = %self.proxy,
+            "answered a steered lookup with the Box Egress Proxy's address"
+        );
+        reply(ResponseCode::NoError, answers)
+    }
+}
+
+/// A host-address box's own DNS answerer (BEP-086), in the guest's
+/// namespace at a loopback address no other box holds. The box's
+/// `/etc/resolv.conf` names it, so only this box's lookups come here. It
+/// answers the box's steered names as [`SteeringPlan::verdict`] says and
+/// forwards every other lookup to the node's resolver. It stops when it is
+/// dropped, and its address is free again.
+#[derive(Debug)]
+pub(crate) struct SteeringAnswerer {
+    bound: SocketAddrV4,
+    serve: tokio::task::JoinHandle<()>,
+    _address: SteeringAddress,
+}
+
+impl SteeringAnswerer {
+    /// Claims a steering address and serves `plan` on it at `port`: the
+    /// DNS port in production, and `0` in a test that cannot bind it.
+    ///
+    /// # Errors
+    ///
+    /// Every steering address is held, or the bind fails.
+    pub(crate) async fn start(plan: SteeringPlan, port: u16) -> std::io::Result<Self> {
+        let address = SteeringAddress::claim().ok_or_else(|| {
+            std::io::Error::other("every steering answerer address in 127.53.0.0/16 is in use")
+        })?;
+        let socket = tokio::net::UdpSocket::bind(SocketAddrV4::new(address.0, port)).await?;
+        let SocketAddr::V4(bound) = socket.local_addr()? else {
+            return Err(std::io::Error::other(
+                "a steering answerer bound an IPv6 address",
+            ));
+        };
+        tracing::info!(
+            component = STEERING_COMPONENT,
+            box_name = %plan.box_label,
+            %bound,
+            upstream = %plan.upstream,
+            proxy = %plan.proxy,
+            "a host-address box's steering answerer is serving its lookups"
+        );
+        let serve = crate::traced::spawn(serve_steering(std::sync::Arc::new(socket), plan));
+        Ok(Self {
+            bound,
+            serve,
+            _address: address,
+        })
+    }
+
+    /// The address and port the answerer is bound at.
+    pub(crate) fn bound(&self) -> SocketAddrV4 {
+        self.bound
+    }
+}
+
+impl Drop for SteeringAnswerer {
+    fn drop(&mut self) {
+        self.serve.abort();
+    }
+}
+
+/// The steering answerer's receive loop: one datagram per turn, answered
+/// here or forwarded in a task of its own.
+async fn serve_steering(socket: std::sync::Arc<tokio::net::UdpSocket>, plan: SteeringPlan) {
+    let in_flight = std::sync::Arc::new(tokio::sync::Semaphore::new(STEERING_MAX_IN_FLIGHT));
+    let mut buf = vec![0u8; STEERING_MAX_DATAGRAM + 1];
+    let mut warned: Option<std::time::Instant> = None;
+    loop {
+        let (len, peer) = match socket.recv_from(&mut buf).await {
+            Ok(received) => received,
+            Err(error) => {
+                tracing::warn!(
+                    component = STEERING_COMPONENT,
+                    box_name = %plan.box_label,
+                    %error,
+                    "a steering answerer's receive loop stopped"
+                );
+                return;
+            }
+        };
+        let datagram = &buf[..len];
+        match plan.verdict(datagram) {
+            SteeringVerdict::Answer(reply) => {
+                if !plan.listener.is_live()
+                    && warned.is_none_or(|at| at.elapsed() >= STEERING_SERVFAIL_WARN_EVERY)
+                {
+                    warned = Some(std::time::Instant::now());
+                    tracing::warn!(
+                        component = STEERING_COMPONENT,
+                        box_name = %plan.box_label,
+                        "answered a steered lookup without the proxy's address: \
+                         the Box Egress Proxy is not listening"
+                    );
+                }
+                if let Err(error) = socket.send_to(&reply, peer).await {
+                    tracing::debug!(
+                        component = STEERING_COMPONENT,
+                        %peer,
+                        %error,
+                        "could not send a steering answerer's reply"
+                    );
+                }
+            }
+            SteeringVerdict::Forward => {
+                let Ok(permit) = std::sync::Arc::clone(&in_flight).try_acquire_owned() else {
+                    tracing::debug!(
+                        component = STEERING_COMPONENT,
+                        box_name = %plan.box_label,
+                        "dropped a lookup at a steering answerer: too many forwards in flight"
+                    );
+                    continue;
+                };
+                let socket = std::sync::Arc::clone(&socket);
+                let datagram = datagram.to_vec();
+                let upstream = plan.upstream;
+                drop(crate::traced::spawn(async move {
+                    forward_steering(&socket, upstream, &datagram, peer).await;
+                    drop(permit);
+                }));
+            }
+        }
+    }
+}
+
+/// Sends one datagram to `upstream` from a socket connected to it, so no
+/// other sender can answer, and relays the reply to `peer` from the
+/// answerer's own address. A lookup that gets no reply is dropped, and the
+/// box's resolver retries.
+async fn forward_steering(
+    answerer: &tokio::net::UdpSocket,
+    upstream: SocketAddr,
+    datagram: &[u8],
+    peer: SocketAddr,
+) {
+    let forwarded = async {
+        let socket =
+            tokio::net::UdpSocket::bind(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)).await?;
+        socket.connect(upstream).await?;
+        socket.send(datagram).await?;
+        let mut buf = vec![0u8; STEERING_MAX_DATAGRAM];
+        let len = tokio::time::timeout(STEERING_FORWARD_TIMEOUT, socket.recv(&mut buf))
+            .await
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
+        buf.truncate(len);
+        answerer.send_to(&buf, peer).await
+    };
+    if let Err(error) = forwarded.await {
+        tracing::debug!(
+            component = STEERING_COMPONENT,
+            %upstream,
+            %peer,
+            %error,
+            "could not forward a lookup from a steering answerer"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
