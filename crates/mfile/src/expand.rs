@@ -466,6 +466,7 @@ const SPEC_KEYS: &[(&str, Shape)] = &[
     ("type", Shape::Str),
     ("upstream", Shape::Table),
     ("vars", Shape::Table),
+    ("vars_lenient", Shape::List),
     ("volumes", Shape::StrList),
 ];
 
@@ -1151,7 +1152,8 @@ mod tests {
         // sections an entry can set, are box settings.
         let ok = expand_in(
             "[sessions.dev]\nio = { stdin = \"null\" }\n\
-             [[sessions.dev.file_imports]]\nsrc = \"a\"\ndst = \"/a\"\n",
+             [[sessions.dev.file_imports]]\nsrc = \"a\"\ndst = \"/a\"\n\
+             [[sessions.dev.vars_lenient]]\nname = \"my.var\"\nvalue = \"1\"\n",
             "dev",
             Layers {
                 type_defaults: vec![(
