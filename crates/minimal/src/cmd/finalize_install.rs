@@ -447,6 +447,12 @@ fn cmd_finalize_install_undo(show: bool) -> Result<(), anyhow::Error> {
         print!("{script}");
         return Ok(());
     }
+    // A shared service (the macOS package's) is the package's to remove,
+    // not one of its users' to undo.
+    if let Some(refusal) = crate::resolver::shared_service_undo_refusal_on_this_host() {
+        eprintln!("min finalize-install: {refusal}");
+        exit(1);
+    }
     run_as_root(&script, UNDO_SCRIPT_POINTER)
 }
 
@@ -663,16 +669,28 @@ async fn names_item_on_this_host(global: &GlobalArgs) -> Item {
             );
         }
     };
-    let Some((port, bound)) = answerer else {
-        // No port to point a script at yet: the item waits on a daemon,
-        // and never blocks the items the script can carry without one.
-        let cause = match held_no_channel {
-            Some(port) => crate::resolver::port_held_no_channel_warning(port),
-            None => NO_PORT.to_string(),
-        };
-        return Item::waiting(NAMES_ID, NAMES_LABEL, cause);
-    };
     let (detection, answerer_step) = crate::cmd::session::advisory_host_reads(global).await;
+    let (port, bound) = match answerer {
+        Some(found) => found,
+        None => {
+            // No daemon of this user's reports a port. A system install (the
+            // macOS package) serves the zone with no user daemon at all: the
+            // host's hook names the port, and the service answers there. That
+            // is the port to judge by. Otherwise there is no port to point a
+            // script at yet: the item waits on a daemon, and never blocks the
+            // items the script can carry without one.
+            match detection.0.port {
+                Some(port) if crate::resolver::answerer_bound_at(port).await => (port, true),
+                _ => {
+                    let cause = match held_no_channel {
+                        Some(port) => crate::resolver::port_held_no_channel_warning(port),
+                        None => NO_PORT.to_string(),
+                    };
+                    return Item::waiting(NAMES_ID, NAMES_LABEL, cause);
+                }
+            }
+        }
+    };
     // The range read the live-surface verdict makes, so the item names the
     // same missing facts the surface line reports.
     let range_present =

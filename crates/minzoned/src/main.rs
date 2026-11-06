@@ -36,6 +36,17 @@ struct Cli {
     #[arg(long)]
     protocol_version: bool,
 
+    /// Admit the members of this group to the channel too (the installed
+    /// service of a Mac several users share), besides the service's own
+    /// uid and root. Box names are one space for the whole host: the first
+    /// publisher keeps a name while its row is up and for the answer TTL
+    /// after, then any member may take it, so the group is users who trust
+    /// each other with names. Each member's open connections and box
+    /// addresses are capped, so no one member takes the service from the
+    /// others.
+    #[arg(long, value_name = "GROUP")]
+    admit_group: Option<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -161,7 +172,7 @@ fn main() -> Result<()> {
         }
         #[cfg(target_os = "macos")]
         Some(Command::ReserveLocalRange) => reserve_local_range(),
-        None => minvmd::cmd::answerer::run(cli.protocol_version),
+        None => minvmd::cmd::answerer::run(cli.protocol_version, cli.admit_group.as_deref()),
     }
 }
 
