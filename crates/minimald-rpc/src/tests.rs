@@ -674,7 +674,7 @@ fn network_bep_secrets_passed_unchanged() {
             "allow_subnets": ["10.0.0.0/8"],
             "deny_subnets": ["10.1.0.0/16"],
         },
-        "ingress": {"ports": ["8080:80/tcp"]},
+        "ingress": [{"proto": "tcp", "port": 8080}],
         "bep": {"upstreams": [{"host": "api.example", "secret": "token"}]},
     });
     let secrets = serde_json_lenient::json!({

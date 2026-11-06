@@ -7,7 +7,8 @@
 //! rewrite returns one hint for the caller to print. The spec then carries
 //! only the canonical form, so its bytes and its projection never hold a
 //! legacy spelling. It also refuses `mode = "none"` with any egress key
-//! (BOX-080), and checks that `egress`, `ingress` and `bep` are tables.
+//! (BOX-080). It checks that `egress` and `bep` are tables and that
+//! `ingress` is a list, as `box.toml` writes them.
 //! Their contents pass to the daemon unchanged.
 //!
 //! The `--network` flag of `min` takes its hint from [`legacy_mode_hint`],
@@ -52,8 +53,8 @@ pub fn canonical_mode(raw: &str) -> Option<&'static str> {
 pub fn legacy_mode_hint(raw: &str) -> Option<String> {
     let (legacy, current) = LEGACY_MODES.iter().find(|(legacy, _)| *legacy == raw)?;
     Some(format!(
-        "note: network mode {legacy} still works for one release. \
-         The current spelling is {current}: --network {current}, \
+        "note: --network {legacy} and mode = \"{legacy}\" still work for one release. \
+         The current spelling is --network {current}, \
          or mode = \"{current}\" under [network] in minimal.toml."
     ))
 }
@@ -183,11 +184,21 @@ pub fn canonicalize(spec: &mut toml::Table) -> Result<Vec<String>, NetworkError>
         hints.extend(flat_egress_hint(flat));
     }
 
-    for section in ["egress", "ingress", "bep"] {
-        if network.get(section).is_some_and(|v| !v.is_table()) {
+    // `box.toml` writes `ingress = [{ proto = "tcp", port = 8080 }]`, a
+    // list of tables. `egress` and `bep` are tables.
+    for (section, is_shape, expected) in [
+        (
+            "egress",
+            toml::Value::is_table as fn(&toml::Value) -> bool,
+            "a table",
+        ),
+        ("ingress", toml::Value::is_array, "a list"),
+        ("bep", toml::Value::is_table, "a table"),
+    ] {
+        if network.get(section).is_some_and(|v| !is_shape(v)) {
             return Err(NetworkError::WrongShape {
                 key: format!("network.{section}"),
-                expected: "a table",
+                expected,
             });
         }
     }
@@ -321,10 +332,9 @@ mod tests {
                     egress_allow_dns = [\"a.example\"]\n\
                     egress_allow_subnets = [\"10.0.0.0/8\"]\n\
                     egress_deny_subnets = [\"10.1.0.0/16\"]\n\
+                    ingress = [{ proto = \"tcp\", port = 8080 }]\n\
                     [sessions.dev.network.egress]\n\
                     allow_dns_hosts = [\"b.example\", \"a.example\"]\n\
-                    [sessions.dev.network.ingress]\n\
-                    ports = [\"8080:80\"]\n\
                     [sessions.dev.network.bep]\n\
                     enabled = true\n";
         let (expansion, hints) = expand_network(file, "dev");
@@ -355,7 +365,8 @@ mod tests {
         assert_eq!(strings("deny_subnets"), ["10.1.0.0/16"]);
         assert_eq!(
             network["ingress"],
-            toml::Value::Table(toml::from_str("ports = [\"8080:80\"]").unwrap())
+            toml::from_str::<toml::Table>("ingress = [{ proto = \"tcp\", port = 8080 }]").unwrap()
+                ["ingress"]
         );
         assert_eq!(
             network["bep"],
@@ -379,5 +390,22 @@ mod tests {
                 expected: "a list",
             })
         );
+
+        // `ingress` is a list of tables, as `box.toml` writes it. A table
+        // `ingress` exits 3 naming `network.ingress`.
+        let (_, err) = expand_network(
+            "[sessions.dev.network.ingress]\nports = [\"8080:80\"]\n",
+            "dev",
+        );
+        let err = err.expect_err("a table ingress is refused");
+        assert_eq!(
+            err,
+            NetworkError::WrongShape {
+                key: "network.ingress".to_owned(),
+                expected: "a list",
+            }
+        );
+        assert_eq!(err.exit_code(), 3);
+        assert!(err.to_string().contains("network.ingress"), "{err}");
     }
 }
