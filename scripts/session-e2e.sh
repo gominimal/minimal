@@ -16070,7 +16070,7 @@ print(rcode, an, addr)' "$dq_b64"
 # that runs them.
 BEP_HI_PROXY_IP=100.64.255.252
 BEP_HI_PROXY_PORT=8118
-BEP_HI_CASE="" BEP_HI_SIDS="" BEP_HI_PUSHED=""
+BEP_HI_CASE="" BEP_HI_SIDS="" BEP_HI_PUSHED="" BEP_HI_ID=""
 
 # The proxy's debug records name each box connection. A daemon that runs
 # without them restarts in bep_live_gate. The debug directive follows
@@ -16105,8 +16105,13 @@ bep_hi_cleanup() {
   # delete once more from the same box, and name the branch if it stays.
   if [ -n "$BEP_HI_PUSHED" ]; then
     read -r cl_box cl_repo cl_branch <<<"$BEP_HI_PUSHED"
+    # The push can fail before it writes the branch: ls-remote exits 2 when
+    # the branch is not there, and then nothing is left to delete.
     if ! mnl session exec "$cl_box" sh -c \
-      "cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin --delete $cl_branch" \
+      "cd /tmp/bep-repo && export GIT_TERMINAL_PROMPT=0
+       timeout 60 git ls-remote --exit-code --heads origin $cl_branch >/dev/null; rc=\$?
+       [ \$rc -eq 2 ] && exit 0
+       timeout 120 git push origin --delete $cl_branch" \
       >/dev/null 2>&1 </dev/null; then
       echo "::warning::branch $cl_branch stays in $cl_repo: remove it with 'git push https://github.com/$cl_repo --delete $cl_branch'"
     fi
@@ -16142,10 +16147,14 @@ bep_hi_seed() {
   mkdir "$GRANT_SEED_DIR/.git"
 }
 
-# Activates GRANT_SEED_DIR as the host_ip box $1, records it for cleanup,
-# and prints its id. Any refusal fails the case.
+# Activates GRANT_SEED_DIR as the host_ip box $1 and sets BEP_HI_ID to its
+# id. The name goes in BEP_HI_SIDS before the activate, so cleanup destroys
+# a box that the activate made before it failed. On success the id takes
+# the name's place. Any refusal fails the case.
 bep_hi_activate() {
   local ha_out
+  BEP_HI_ID=""
+  BEP_HI_SIDS="${BEP_HI_SIDS:+$BEP_HI_SIDS }$1"
   ha_out="$(cd "$GRANT_SEED_DIR" && mnl session activate . --no-prompt --name "$1" \
     --network host_ip </dev/null 2>"$WORK/$BEP_HI_CASE.$1.activate.err")" || {
     echo "::error::'min session activate --network host_ip' of $1 failed" >&2
@@ -16155,7 +16164,9 @@ bep_hi_activate() {
   }
   ha_out="$(printf '%s\n' "$ha_out" | tail -n1 | tr -d '\r')"
   [ -n "$ha_out" ] || { echo "::error::'min session activate' of $1 printed no box id" >&2; return 1; }
-  printf '%s\n' "$ha_out"
+  BEP_HI_SIDS="${BEP_HI_SIDS% "$1"}"; BEP_HI_SIDS="${BEP_HI_SIDS%"$1"}"
+  BEP_HI_SIDS="${BEP_HI_SIDS:+$BEP_HI_SIDS }$ha_out"
+  BEP_HI_ID="$ha_out"
 }
 
 # A raw A query for $2 from inside box $1 to its own resolver, as the
@@ -16228,20 +16239,20 @@ bep_hi_repo_gate() { # $1 case, $2 repo
 bep_hi_git_and_gh_steps() {
   local gs_sid="$1" gs_steering="$2" gs_repo="$3" gs_branch gs_step gs_private
   gs_branch="e2e-bep-hostip-$(date +%s)-$$"
+  # The push records the branch before it runs: a push that writes the
+  # branch and then fails still leaves it for bep_hi_cleanup to delete.
   for gs_step in \
     "clone:rm -rf /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 180 git clone https://github.com/$gs_repo /tmp/bep-repo" \
     "push:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin HEAD:refs/heads/$gs_branch" \
     "delete:cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin --delete $gs_branch"; do
+    [ "${gs_step%%:*}" = push ] && BEP_HI_PUSHED="$gs_sid $gs_repo $gs_branch"
     if ! mnl session exec "$gs_sid" sh -c "${gs_step#*:}" \
       >"$WORK/$BEP_HI_CASE.${gs_step%%:*}.out" 2>&1; then
       echo "::error::'git ${gs_step%%:*}' against the private repository $gs_repo failed in the $gs_steering host_ip box"
       cat "$WORK/$BEP_HI_CASE.${gs_step%%:*}.out" 2>/dev/null || true
       return 1
     fi
-    case "${gs_step%%:*}" in
-      push) BEP_HI_PUSHED="$gs_sid $gs_repo $gs_branch" ;;
-      delete) BEP_HI_PUSHED="" ;;
-    esac
+    [ "${gs_step%%:*}" = delete ] && BEP_HI_PUSHED=""
     echo "git ${gs_step%%:*}: OK"
   done
   if ! gs_private="$(mnl session exec "$gs_sid" sh -c \
@@ -16258,10 +16269,18 @@ bep_hi_git_and_gh_steps() {
   echo "gh api repos/$gs_repo: OK (private)"
 }
 
-# Prints the box's proxy variable names, one a line.
+# Prints the box's proxy variable names, one a line. Returns 1 when `env`
+# in the box fails or prints no PATH, so an empty list is evidence.
 bep_hi_proxy_vars() {
-  mnl session exec "$1" sh -c 'env' 2>/dev/null | tr -d '\r' \
-    | grep -iE '^(https?|all)_proxy=' | cut -d= -f1
+  local pv_env
+  if ! pv_env="$(mnl session exec "$1" sh -c 'env' </dev/null 2>"$WORK/$BEP_HI_CASE.env.err")" \
+    || ! printf '%s\n' "$pv_env" | tr -d '\r' | grep -q '^PATH='; then
+    echo "::error::'env' in the box $1 failed or printed no PATH" >&2
+    cat "$WORK/$BEP_HI_CASE.env.err" >&2 2>/dev/null || true
+    return 1
+  fi
+  printf '%s\n' "$pv_env" | tr -d '\r' | grep -iE '^(https?|all)_proxy=' | cut -d= -f1
+  return 0
 }
 
 proof_bep_host_ip_git_and_gh_under_dns_steering() {
@@ -16272,14 +16291,14 @@ proof_bep_host_ip_git_and_gh_under_dns_steering() {
 
   # No steering line: the default steering is dns in every mode.
   bep_hi_seed grant ""
-  hd_sid="$(bep_hi_activate e2e-bep-hostip-dns)" || bep_hi_fail
-  BEP_HI_SIDS="$hd_sid"
+  bep_hi_activate e2e-bep-hostip-dns || bep_hi_fail
+  hd_sid="$BEP_HI_ID"
   rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
   mnl session exec "$hd_sid" 'test -x /usr/bin/socat && test -x /usr/bin/base64' >/dev/null 2>&1 || {
     echo "::error::the host_ip grant box has no /usr/bin/socat or /usr/bin/base64 (both launcher baseline packages)"
     bep_hi_fail
   }
-  hd_vars="$(bep_hi_proxy_vars "$hd_sid")"
+  hd_vars="$(bep_hi_proxy_vars "$hd_sid")" || bep_hi_fail
   if [ -n "$hd_vars" ]; then
     echo "::error::the host_ip grant box under the default steering has proxy variables: $(printf '%s' "$hd_vars" | tr '\n' ' ')"
     bep_hi_fail
@@ -16297,8 +16316,8 @@ proof_bep_host_ip_git_and_gh_under_dns_steering() {
   # A host_ip box with no grant shares the node's network, and its lookup of
   # github.com gets the real answer, never the proxy's address.
   bep_hi_seed none ""
-  hd_plain="$(bep_hi_activate e2e-bep-hostip-plain)" || bep_hi_fail
-  BEP_HI_SIDS="$BEP_HI_SIDS $hd_plain"
+  bep_hi_activate e2e-bep-hostip-plain || bep_hi_fail
+  hd_plain="$BEP_HI_ID"
   rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
   hd_ans="$(bep_hi_dns_a "$hd_plain" github.com)"
   echo "A github.com in the box with no grant -> rcode, answers and address: ${hd_ans:-no reply}"
@@ -16321,10 +16340,10 @@ proof_bep_host_ip_git_and_gh_under_proxy_env() {
   bep_hi_repo_gate "$BEP_HI_CASE" "$hp_repo" || { echo "::endgroup::"; return 0; }
 
   bep_hi_seed grant proxy_env
-  hp_sid="$(bep_hi_activate e2e-bep-hostip-proxy-env)" || bep_hi_fail
-  BEP_HI_SIDS="$hp_sid"
+  bep_hi_activate e2e-bep-hostip-proxy-env || bep_hi_fail
+  hp_sid="$BEP_HI_ID"
   rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
-  hp_vars="$(bep_hi_proxy_vars "$hp_sid")"
+  hp_vars="$(bep_hi_proxy_vars "$hp_sid")" || bep_hi_fail
   if ! printf '%s\n' "$hp_vars" | grep -qx HTTPS_PROXY; then
     echo "::error::the proxy_env host_ip grant box has no HTTPS_PROXY (proxy variables: ${hp_vars:-none})"
     bep_hi_fail
@@ -16346,8 +16365,8 @@ proof_bep_host_ip_grant_box_reaches_the_proxy_lane() {
   bep_live_gate "$BEP_HI_CASE" || { echo "::endgroup::"; return 0; }
 
   bep_hi_seed grant ""
-  hl_sid="$(bep_hi_activate e2e-bep-hostip-lane)" || bep_hi_fail
-  BEP_HI_SIDS="$hl_sid"
+  bep_hi_activate e2e-bep-hostip-lane || bep_hi_fail
+  hl_sid="$BEP_HI_ID"
   rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
   hl_shown="$(mnl box show e2e-bep-hostip-lane </dev/null 2>&1)" || hl_shown=""
   hl_id="$(printf '%s\n' "$hl_shown" | sed -n 's/^ID: *//p' | tr -d '\r' | head -n1)"
@@ -16380,8 +16399,8 @@ proof_bep_host_ip_grant_box_reaches_the_proxy_lane() {
   # With no grant box left, nothing admits the proxy's address for a
   # host_ip box: the connect fails.
   bep_hi_seed none ""
-  hl_plain="$(bep_hi_activate e2e-bep-hostip-nogrant)" || bep_hi_fail
-  BEP_HI_SIDS="$BEP_HI_SIDS $hl_plain"
+  bep_hi_activate e2e-bep-hostip-nogrant || bep_hi_fail
+  hl_plain="$BEP_HI_ID"
   rm -rf "${GRANT_SEED_DIR:?}"; GRANT_SEED_DIR=""
   # Probe socat first, so a missing tool or a failed exec does not pass as
   # a refusal. The connect error must then name a connect failure.
