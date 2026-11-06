@@ -71,8 +71,8 @@ pub struct BoxSpec {
     /// Whether the box runs its lifecycle hooks.
     pub hooks_enabled: bool,
     /// Whether a resume of the box runs its `on_activate` hooks again
-    /// (BOX-028). Serialized as the top-level `hooks_on_resume` key, the
-    /// key the expanded spec carries, and left out when `false`.
+    /// (BOX-028). Serialized as `execution.hooks_on_resume`, and left out
+    /// when `false`.
     pub hooks_on_resume: bool,
     /// The box's network settings.
     pub network: SpecNetwork,
@@ -285,9 +285,6 @@ struct SpecDoc {
     v: u32,
     entry: String,
     hooks_enabled: bool,
-    /// Absent from a spec that does not set it, which reads as `false`.
-    #[serde(default, skip_serializing_if = "is_false")]
-    hooks_on_resume: bool,
     #[serde(rename = "box")]
     box_table: DocBox,
     io: DocIo,
@@ -323,6 +320,9 @@ struct DocIo {
 struct DocExecution {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     exec: Option<Vec<String>>,
+    /// Absent from a spec that does not set it, which reads as `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    hooks_on_resume: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -380,7 +380,6 @@ impl From<BoxSpec> for SpecDoc {
             v: spec.v,
             entry: spec.entry,
             hooks_enabled: spec.hooks_enabled,
-            hooks_on_resume: spec.hooks_on_resume,
             box_table: DocBox {
                 box_type: spec.box_type,
                 name: spec.name,
@@ -394,6 +393,7 @@ impl From<BoxSpec> for SpecDoc {
                     Entrypoint::Shell => None,
                     Entrypoint::Exec(argv) => Some(argv),
                 },
+                hooks_on_resume: spec.hooks_on_resume,
             }),
             install: DocInstall {
                 packages: spec.packages,
@@ -408,6 +408,7 @@ impl From<BoxSpec> for SpecDoc {
 
 impl From<SpecDoc> for BoxSpec {
     fn from(doc: SpecDoc) -> Self {
+        let hooks_on_resume = doc.execution.as_ref().is_some_and(|e| e.hooks_on_resume);
         let entrypoint = match doc.execution {
             Some(execution) => execution.exec.map_or(Entrypoint::Shell, Entrypoint::Exec),
             None => Entrypoint::implied(&doc.box_table.box_type, &doc.entry),
@@ -423,7 +424,7 @@ impl From<SpecDoc> for BoxSpec {
             entrypoint,
             lifetime,
             hooks_enabled: doc.hooks_enabled,
-            hooks_on_resume: doc.hooks_on_resume,
+            hooks_on_resume,
             network: SpecNetwork {
                 mode: doc.network.mode,
                 policy: doc.network.policy,
@@ -628,7 +629,7 @@ mod tests {
     }
 
     // BOX-028: an entry that sets `hooks_on_resume = true` carries the key
-    // in its spec, under the same top-level name the expanded spec uses.
+    // in its spec, as `execution.hooks_on_resume`.
     #[test]
     fn spec_carries_hooks_on_resume() {
         let file: crate::File = toml::from_str(
@@ -654,11 +655,15 @@ mod tests {
         assert!(!plain.hooks_on_resume);
         assert!(!BoxSpec::for_session(None, SpecFlags::default()).hooks_on_resume);
 
-        // The key writes as `hooks_on_resume` and reads back.
+        // The key writes as `execution.hooks_on_resume` and reads back.
         for spec in [&session, &lint] {
             let text = toml::to_string(spec).unwrap();
             let value: toml::Value = toml::from_str(&text).unwrap();
-            assert_eq!(value["hooks_on_resume"].as_bool(), Some(true), "{text}");
+            assert_eq!(
+                value["execution"]["hooks_on_resume"].as_bool(),
+                Some(true),
+                "{text}"
+            );
             assert_eq!(&toml::from_str::<BoxSpec>(&text).unwrap(), spec, "{text}");
         }
 
@@ -666,6 +671,10 @@ mod tests {
         // spec stored before the key existed stay the same and read as unset.
         let text = toml::to_string(&plain).unwrap();
         let value: toml::Value = toml::from_str(&text).unwrap();
+        assert!(
+            value["execution"].get("hooks_on_resume").is_none(),
+            "{text}"
+        );
         assert!(value.get("hooks_on_resume").is_none(), "{text}");
         assert_eq!(toml::from_str::<BoxSpec>(&text).unwrap(), plain);
     }
