@@ -39,6 +39,17 @@ const PROBES: &[bool] = &[false, true];
 /// The sidebar group label the native `minimald`'s host carries.
 const HOST_LABEL: &str = "host";
 
+/// The kind of the host behind a sidebar group label: [`HOST_LABEL`] is the
+/// native `minimald`, and every other label is a VM's host.
+#[must_use]
+pub fn host_kind_of_label(label: &str) -> paths::HostKind {
+    if label == HOST_LABEL {
+        paths::HostKind::Minimald
+    } else {
+        paths::HostKind::Minvmd
+    }
+}
+
 /// The sidebar group label the default VM's host carries. A named VM's
 /// group carries the VM's own name; the default VM keeps this one because
 /// it is the identity every saved dashboard state has ever recorded
@@ -347,7 +358,7 @@ pub async fn prepare_attach(
             record.id,
             record.policy.egress.clone(),
             record.policy.credentialed_upstream.is_some(),
-            true,
+            crate::HostIpBoxChange::Admit,
         )
         .await
         && let Ok(None) = crate::attached_box_record(sock, record.id).await
@@ -356,7 +367,7 @@ pub async fn prepare_attach(
             minimal_client::box_registration::vm_host_control_sock(sock),
             record.id,
             None,
-            false,
+            crate::HostIpBoxChange::Retire(crate::HostIpBoxEnd::Destroyed),
         )
         .await;
     }
@@ -374,7 +385,7 @@ async fn settle_destroyed_box(sock: &Path, id: SessionId, record: &boxes::Record
             minimal_client::box_registration::vm_host_control_sock(sock),
             id,
             None,
-            false,
+            crate::HostIpBoxChange::Retire(crate::HostIpBoxEnd::Destroyed),
         )
         .await;
     }

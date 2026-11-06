@@ -237,7 +237,10 @@ fn answer_failure(
 /// of addresses (insufficient resources), the code a box address refusal
 /// carries (`minimal::BoxAddressRefusal`: 2 when a name matches boxes on
 /// more than one host, 4 when the address names no box, 7 when a host did
-/// not answer the lookup), and 1, the unspecified error,
+/// not answer the lookup), the code a `min box exec` refusal carries
+/// (`minimal::BoxExecRefusal`: 2 for `-t` without a terminal or a box that
+/// is not running, 5 when its spec turns exec off), 124 when an exec ran past its own timeout
+/// (`minimal::BoxExecTimedOut`), and 1, the unspecified error,
 /// for everything else — a refusal the host answered included. Both
 /// output modes end with the same code.
 fn failure_exit_code(e: &anyhow::Error) -> u8 {
@@ -248,6 +251,14 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     // BCLI-004: `min box rm` of a running box without `--force`.
     if e.downcast_ref::<minimal::BoxRunningRefusal>().is_some() {
         return minimal::BoxRunningRefusal::EXIT_CODE;
+    }
+    // BCLI-058: `min box rename` to a name BOX-010 refuses.
+    if e.downcast_ref::<minimal::BoxRenameRefusal>().is_some() {
+        return minimal::BoxRenameRefusal::EXIT_CODE;
+    }
+    // BCLI-005: `min box prune` off a terminal without `--yes`.
+    if e.downcast_ref::<minimal::PruneNeedsYes>().is_some() {
+        return minimal::PruneNeedsYes::EXIT_CODE;
     }
     // BOX-163: a create under a name a running box holds.
     if e.downcast_ref::<minimald_rpc::HeldNameRefusal>().is_some() {
@@ -273,6 +284,24 @@ fn failure_exit_code(e: &anyhow::Error) -> u8 {
     }
     // BCLI-002, BCLI-064: a box address that names no single box.
     if let Some(refused) = e.downcast_ref::<minimal::BoxAddressRefusal>() {
+        return refused.exit_code();
+    }
+    // BCLI-068: `min box attach` refused, or its connection failed.
+    if let Some(refused) = e.downcast_ref::<minimal::BoxAttachRefusal>() {
+        return refused.exit_code();
+    }
+    // BCLI-053: `min box exec -t` without a terminal, or into a box that is
+    // not running (2), or whose spec turns exec off (5).
+    if let Some(refused) = e.downcast_ref::<minimal::BoxExecRefusal>() {
+        return refused.exit_code();
+    }
+    // BCLI-053: an exec that its own timeout ended.
+    if e.downcast_ref::<minimal::BoxExecTimedOut>().is_some() {
+        return minimal::BoxExecTimedOut::EXIT_CODE;
+    }
+    // BCLI-034, BCLI-062: `min box cp` of a file the box does not have, or
+    // does not allow reading.
+    if let Some(refused) = e.downcast_ref::<minimal::BoxFileRefusal>() {
         return refused.exit_code();
     }
     1
@@ -362,6 +391,14 @@ fn machine_mode_answer(e: &anyhow::Error) -> MachineModeAnswer {
             hint,
         ));
     }
+    // BCLI-053: an exec that its own timeout ended is `timeout`.
+    if let Some(timed_out) = e.downcast_ref::<minimal::BoxExecTimedOut>() {
+        return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
+            minimal::BoxExecTimedOut::CODE,
+            format!("{e:#}"),
+            timed_out.hint().to_string(),
+        ));
+    }
     if e.downcast_ref::<minimal::OutputWriteError>().is_some() {
         return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
             "output_failed",
@@ -395,7 +432,8 @@ impl std::io::Write for DashLog {
 /// Whether the command's stdout is a data contract that tracing must not
 /// pollute, so its logs go to stderr instead. The `completions` handlers emit a
 /// shell shim on stdout, `session exec` carries only the exec'd
-/// command's output, and `task run` / `session run` stream the task's stdout —
+/// command's output, `box exec` carries the command's output or its exec
+/// id, and `task run` / `session run` stream the task's stdout —
 /// a log line in any of them would be read as content. A bare `min` (no subcommand) is
 /// one too: its non-TTY twin promises an empty stdout to pipelines, and its
 /// interactive activate path prints only the session id there. So is
@@ -416,6 +454,9 @@ fn stdout_is_data_contract(command: &Option<minimal::Command>) -> bool {
                 })
                 | minimal::Command::Task(minimal::TaskArgs {
                     command: minimal::TaskCommand::Run(_),
+                })
+                | minimal::Command::Box(minimal::BoxArgs {
+                    command: minimal::BoxCommand::Exec(_),
                 })
         )
     )
@@ -514,6 +555,11 @@ fn machine_output_mode(cli: &minimal::Cli) -> bool {
         Some(minimal::Command::Box(minimal::BoxArgs {
             command: minimal::BoxCommand::List(args),
         })) => args.output.is_some(),
+        // BCLI-016: a `min box events -o jsonl` failure is one
+        // `min/v1/error` object too.
+        Some(minimal::Command::Box(minimal::BoxArgs {
+            command: minimal::BoxCommand::Events(args),
+        })) => args.output == Some(minimal::BoxEventsOutputFormat::Jsonl),
         _ => false,
     }
 }
@@ -576,7 +622,6 @@ mod tests {
             command: minimal::TaskCommand::Run(minimal::TaskRunArgs {
                 task: "build".to_string(),
                 path: None,
-                keep: false,
                 args: vec![],
             }),
         }));
@@ -942,6 +987,25 @@ mod tests {
             assert_eq!(machine_output_mode(&cli), machine);
         }
 
+        // `min box events -o jsonl` is a machine mode, its text form is not.
+        for (output, machine) in [
+            (Some(minimal::BoxEventsOutputFormat::Jsonl), true),
+            (None, false),
+        ] {
+            let cli = minimal::Cli {
+                global_args: minimal::GlobalArgs::default(),
+                command: Some(Command::Box(minimal::BoxArgs {
+                    command: minimal::BoxCommand::Events(minimal::BoxEventsArgs {
+                        target: Some("web".to_string()),
+                        parent: None,
+                        output,
+                        follow: false,
+                    }),
+                })),
+            };
+            assert_eq!(machine_output_mode(&cli), machine);
+        }
+
         // Its defined refusal answers with its own code.
         match machine_mode_answer(&anyhow::Error::new(minimal::AuditSelfUnsupportedUnenrolled)) {
             MachineModeAnswer::Object(failure) => {
@@ -1025,6 +1089,85 @@ mod tests {
         }
     }
 
+    /// BCLI-053: an exec that its own timeout ended ends the run with 124
+    /// in both output modes, and a machine-mode run answers it with the
+    /// `timeout` object. The exec refusals end with 2 and 5.
+    #[test]
+    fn exec_timeout_returns_124_from_exec_and_wait_exec_in_machine_mode() {
+        for timed_out in [
+            minimal::BoxExecTimedOut::exec("web", 30),
+            minimal::BoxExecTimedOut::waited("web", "0190a3c4-0000-7000-8000-000000000000"),
+        ] {
+            let e = anyhow::Error::new(timed_out.clone());
+            assert_eq!(failure_exit_code(&e), 124);
+            match machine_mode_answer(&e) {
+                MachineModeAnswer::Object(failure) => {
+                    assert_eq!(failure.code(), "timeout");
+                    assert_eq!(failure.message(), timed_out.to_string());
+                    assert_eq!(failure.hint(), timed_out.hint());
+                }
+                MachineModeAnswer::Quiet => panic!("a timeout is an error object"),
+            }
+            let mut stderr = Vec::new();
+            assert_eq!(
+                answer_failure(&e, true, false, None, &mut stderr),
+                ExitCode::from(124)
+            );
+            let line = String::from_utf8(stderr).unwrap();
+            assert!(line.contains(r#""code":"timeout""#), "{line}");
+        }
+        let target = "web".to_string();
+        for (refusal, code) in [
+            (
+                minimal::BoxExecRefusal::NoTerminal {
+                    target: target.clone(),
+                },
+                2,
+            ),
+            (
+                minimal::BoxExecRefusal::NotRunning {
+                    target: target.clone(),
+                    state: "stopped".to_string(),
+                },
+                2,
+            ),
+            (
+                minimal::BoxExecRefusal::ExecDisabled {
+                    target: target.clone(),
+                },
+                5,
+            ),
+            (minimal::BoxExecRefusal::SpecUnreadable { target }, 5),
+        ] {
+            assert_eq!(failure_exit_code(&anyhow::Error::new(refusal)), code);
+        }
+    }
+
+    /// BCLI-034: `min box cp` ends with 4 for a file the box does not have,
+    /// and 5 for a file the box does not allow reading.
+    #[test]
+    fn box_file_refusals_exit_with_their_codes() {
+        for (refusal, code) in [
+            (
+                minimal::BoxFileRefusal::NotFound {
+                    address: "web".to_owned(),
+                    path: "out.txt".to_owned(),
+                },
+                4,
+            ),
+            (
+                minimal::BoxFileRefusal::PermissionDenied {
+                    address: "web".to_owned(),
+                    path: "secret.txt".to_owned(),
+                },
+                5,
+            ),
+        ] {
+            let err = anyhow::Error::new(refusal).context("copying the file");
+            assert_eq!(failure_exit_code(&err), code, "{err:#}");
+        }
+    }
+
     /// #1790: a VM host that could not be reached ends the run with 7 —
     /// provider/host unreachable — found through every context the
     /// activation adds over it, and a machine-mode run answers it with the
@@ -1088,6 +1231,22 @@ mod tests {
         };
         let e = anyhow::Error::new(refused).context("activating the session");
         assert_eq!(failure_exit_code(&e), 3);
+    }
+
+    /// BCLI-005: `min box prune` off a terminal without `--yes` ends with
+    /// exit 2, and the text names `--yes`.
+    #[test]
+    fn prune_off_tty_needs_yes_exits_2() {
+        let e = anyhow::Error::new(minimal::PruneNeedsYes);
+        assert_eq!(failure_exit_code(&e), 2);
+        let mut stderr = Vec::new();
+        let code = answer_failure(&e, false, false, None, &mut stderr);
+        assert_eq!(code, ExitCode::from(2));
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "error: Prune removes boxes. Pass --yes to confirm, \
+             or --dry-run to see what it would remove.\n"
+        );
     }
 
     /// BCLI-004: `min box rm` of a running box without `--force` ends with

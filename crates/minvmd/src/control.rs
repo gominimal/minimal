@@ -455,6 +455,19 @@ impl ProxyPublishStatus {
         }
     }
 
+    /// Clear any cause recorded on `port` (NET-022): the held-port watcher
+    /// published the port, so the proxy serves there now. A cause on another
+    /// port stays, because this publish does not answer it.
+    pub(crate) fn clear_down(&self, port: u16) {
+        let mut cell = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cell.as_ref().is_some_and(|(down, _)| *down == port) {
+            *cell = None;
+        }
+    }
+
     /// Record that the proxy serves on `port` and on no other host port:
     /// the port the start handed, once the publish decision brought the VM
     /// up.
@@ -601,6 +614,7 @@ pub fn spawn(
                 ControlDoor::Host,
                 &audit_path,
                 MAX_CONTROL_CONNECTIONS,
+                &HostIpReconcileNudge::default(),
             )
         })
 }
@@ -665,6 +679,12 @@ pub fn spawn_guest_reports_door_with_proxy(
     let listener = UnixListener::bind(&sock_path)?;
     crate::sock::enforce_socket_permissions(&sock_path)?;
     let audit_path = audit_log_path(&sock_path);
+    // The in-VM daemon's RPC bridge sits beside the control socket, as the
+    // stop path finds it (NET-085).
+    let reconcile = spawn_host_ip_reconcile(
+        boxes.clone(),
+        control_sock_path.with_file_name(paths::SSH_SOCK_FILE),
+    )?;
     tracing::info!(
         sock = %sock_path.display(),
         vsock_port = minimald_rpc::VM_HOST_BOX_REPORT_PORT,
@@ -683,6 +703,7 @@ pub fn spawn_guest_reports_door_with_proxy(
                 ControlDoor::GuestReports,
                 &audit_path,
                 MAX_CONTROL_CONNECTIONS,
+                &reconcile,
             )
         })
         // The door's bound path is the handle the caller pairs with the
@@ -721,6 +742,7 @@ fn accept_loop(
     door: ControlDoor,
     audit_path: &Path,
     cap: usize,
+    reconcile: &HostIpReconcileNudge,
 ) {
     let connections = Arc::new(crate::box_registry::ConnectionGauge::default());
     let order = Arc::new(ApplyOrder::default());
@@ -750,6 +772,7 @@ fn accept_loop(
                 let bep_listening = bep_listening.clone();
                 let audit_path = audit_path.to_path_buf();
                 let order = Arc::clone(&order);
+                let reconcile = reconcile.clone();
                 if let Err(error) = std::thread::Builder::new()
                     .name("minvmd-control-conn".to_string())
                     .spawn(move || {
@@ -763,6 +786,7 @@ fn accept_loop(
                             door,
                             &audit_path,
                             &order,
+                            &reconcile,
                         ) {
                             tracing::debug!(error = %error, "box control connection failed");
                         }
@@ -790,6 +814,7 @@ fn serve_connection(
     door: ControlDoor,
     audit_path: &Path,
     order: &Arc<ApplyOrder>,
+    reconcile: &HostIpReconcileNudge,
 ) -> std::io::Result<()> {
     let mut stream = stream;
     stream.set_read_timeout(Some(REGISTER_READ_TIMEOUT))?;
@@ -848,6 +873,15 @@ fn serve_connection(
             return write_reply(&mut stream, &BoxControlReply::Error { error });
         }
     };
+    // A box event on the guest door asks the host_ip reconcile to read the
+    // in-VM daemon's session list (NET-085). The nudge carries nothing the
+    // guest says: the list it reads decides. Root in the VM controls that
+    // list, so it can move the union, but only within the rules host clients
+    // admitted, never past them. A false `running` can restore a set-aside
+    // box's rules, and a box no client admitted gains nothing.
+    if door == ControlDoor::GuestReports && is_guest_box_event(&request) {
+        reconcile.nudge();
+    }
     if root_peer && !root_may_ask(&request) {
         tracing::warn!(
             peer_uid = uid,
@@ -974,6 +1008,173 @@ fn serve_connection(
         drain_until_peer_closes(&mut stream);
     }
     served
+}
+
+/// Whether a guest-door request is a box event: a box created, or a
+/// listener in a box opened or closed. A box that stops or is reaped
+/// closes its listeners, so each such end reaches the reconcile soon. The
+/// reads and the ask and decision reports are not box events.
+fn is_guest_box_event(request: &BoxControlRequest) -> bool {
+    matches!(
+        request,
+        BoxControlRequest::MintBoxId(_)
+            | BoxControlRequest::ListenNotice(_)
+            | BoxControlRequest::AdmitPort(_)
+            | BoxControlRequest::WithdrawPort(_)
+    )
+}
+
+/// How often the `host_ip` reconcile reads the in-VM daemon's session list
+/// with no box event to prompt it (NET-085).
+const HOST_IP_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The least time between two reconcile reads, so a guest that floods its
+/// door with box events costs one session list a second at most.
+const HOST_IP_RECONCILE_MIN_GAP: Duration = Duration::from_secs(1);
+
+/// The connect and the exchange bounds of one session-list read.
+const GUEST_LIST_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const GUEST_LIST_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The guest door's handle on the `host_ip` reconcile thread
+/// ([`spawn_host_ip_reconcile`]). A nudge asks for one reconcile soon. Nudges
+/// that arrive before it runs fold into it. The default handle is inert:
+/// the host door's.
+#[derive(Debug, Clone, Default)]
+struct HostIpReconcileNudge(Option<std::sync::mpsc::SyncSender<()>>);
+
+impl HostIpReconcileNudge {
+    fn nudge(&self) {
+        if let Some(sender) = &self.0 {
+            // A full channel is a reconcile already asked for.
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "a full or closed channel needs no second nudge"
+            )]
+            let _ = sender.try_send(());
+        }
+    }
+}
+
+/// Starts the thread that keeps the resident `host_ip` boxes in line with
+/// the in-VM daemon (NET-085): on each nudge from the guest door and every
+/// [`HOST_IP_RECONCILE_INTERVAL`], it reads the daemon's session list over
+/// `guest_rpc_sock` and hands it to
+/// [`BoxRegistry::reconcile_host_ip_boxes`]. A read that fails changes
+/// nothing: a failed read is no evidence that a box ended.
+fn spawn_host_ip_reconcile(
+    boxes: BoxRegistry,
+    guest_rpc_sock: PathBuf,
+) -> std::io::Result<HostIpReconcileNudge> {
+    spawn_host_ip_reconcile_with(boxes, HOST_IP_RECONCILE_INTERVAL, move || {
+        read_guest_box_states(&guest_rpc_sock)
+    })
+}
+
+/// [`spawn_host_ip_reconcile`] with its timer and its session-list read
+/// given, so a test can drive the thread without an in-VM daemon.
+fn spawn_host_ip_reconcile_with<R>(
+    boxes: BoxRegistry,
+    interval: Duration,
+    mut read_guest: R,
+) -> std::io::Result<HostIpReconcileNudge>
+where
+    R: FnMut() -> anyhow::Result<std::collections::BTreeMap<boxes::SessionId, boxes::BoxState>>
+        + Send
+        + 'static,
+{
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("minvmd-host-ip-reconcile".to_string())
+        .spawn(move || {
+            let mut last: Option<std::time::Instant> = None;
+            let mut failing = false;
+            // The mark the last pass that read the list took.
+            let mut previous: Option<crate::box_registry::HostIpAdmitMark> = None;
+            // A pass dropped a box a client admitted since the pass before
+            // it, which can be a resume still starting in the guest. One
+            // more pass runs soon, so a resumed box rejoins without waiting
+            // for the timer. The dropped box holds no rules until then.
+            let mut follow_up = false;
+            loop {
+                let wait = if follow_up {
+                    HOST_IP_RECONCILE_MIN_GAP
+                } else {
+                    interval
+                };
+                follow_up = false;
+                let trigger = match receiver.recv_timeout(wait) {
+                    Ok(()) => crate::box_registry::HostIpReconcileTrigger::BoxEvent,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        crate::box_registry::HostIpReconcileTrigger::Timer
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                };
+                if let Some(at) = last
+                    && let Some(wait) = HOST_IP_RECONCILE_MIN_GAP.checked_sub(at.elapsed())
+                {
+                    std::thread::sleep(wait);
+                }
+                while receiver.try_recv().is_ok() {}
+                last = Some(std::time::Instant::now());
+                if !boxes.holds_host_ip_boxes() {
+                    continue;
+                }
+                // Taken before the read, so a box a client admits while the
+                // list is in flight is not dropped on a list that predates it.
+                let mark = boxes.host_ip_admit_mark();
+                let since = previous;
+                match read_guest() {
+                    Ok(guest) => {
+                        failing = false;
+                        previous = Some(mark);
+                        let outcome = boxes.reconcile_host_ip_boxes(&guest, mark, trigger);
+                        follow_up = !outcome.dropped.is_empty()
+                            && since.is_none_or(|since| {
+                                boxes.host_ip_admitted_after(&outcome.dropped, since)
+                            });
+                    }
+                    Err(error) if !failing => {
+                        failing = true;
+                        tracing::warn!(
+                            error = %format!("{error:#}"),
+                            trigger = %trigger,
+                            "could not read the in-VM daemon's session list; the host_ip \
+                             boxes' egress rules stay as they are until a read succeeds"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::debug!(error = %format!("{error:#}"), "session list read failed again");
+                    }
+                }
+            }
+        })?;
+    Ok(HostIpReconcileNudge(Some(sender)))
+}
+
+/// The in-VM daemon's sessions, as each one's state.
+fn read_guest_box_states(
+    guest_rpc_sock: &Path,
+) -> anyhow::Result<std::collections::BTreeMap<boxes::SessionId, boxes::BoxState>> {
+    let listing = crate::rpc_client::call_oneshot_blocking::<minimald_rpc::ListSessions>(
+        guest_rpc_sock,
+        (),
+        GUEST_LIST_CONNECT_TIMEOUT,
+        GUEST_LIST_RPC_TIMEOUT,
+        None,
+    )?;
+    Ok(guest_box_states(&listing))
+}
+
+/// The state of each session in a listing.
+fn guest_box_states(
+    listing: &minimald_rpc::ListSessionsResponse,
+) -> std::collections::BTreeMap<boxes::SessionId, boxes::BoxState> {
+    listing
+        .sessions
+        .iter()
+        .map(|entry| (entry.id, entry.status))
+        .collect()
 }
 
 /// Wait for the peer's close on a guest-door connection whose reply was
@@ -1169,7 +1370,7 @@ fn serve_request(
             // suppressed-count line its audit window can still owe.
             let box_name = no_switch_box_name(boxes, request.session_id)
                 .unwrap_or_else(|| request.session_id.to_string());
-            boxes.retire_host_ip_box(request.session_id);
+            boxes.retire_host_ip_box(request.session_id, request.end);
             // A host-address box has no switch: its audit window, filed by
             // its box id, ends with it (NET-046).
             flush_guest_audit(
@@ -4379,7 +4580,10 @@ mod tests {
             Some(first.to_bytes()),
             "the refusal leaves the name with the first registration"
         );
-        registry.retire_host_ip_box(boxes::SessionId::from_bytes(first.to_bytes()));
+        registry.retire_host_ip_box(
+            boxes::SessionId::from_bytes(first.to_bytes()),
+            minimald_rpc::HostIpBoxEnd::Destroyed,
+        );
         let second = minted(register(&sock_path, &host_ip(true)).expect("answered"));
         assert_ne!(first, second, "each creation gets its own id");
         assert_eq!(registry.host_ip_id_for("agent"), Some(second.to_bytes()));
@@ -4446,6 +4650,98 @@ mod tests {
         assert_ne!(web.box_id, first);
         assert_ne!(web.box_id, second);
         assert_eq!(registry.table().rows().len(), 1);
+    }
+
+    /// BEP-082: two fresh instances of one `host_ip` grant entry register
+    /// at once under creation keys of their own, `<base>~<hex>`, and each
+    /// gets its own id. Each in-VM mint asks by its key after the box is
+    /// named `<base>-<n>`, and takes its own registration's id, and both
+    /// boxes are admitted. A create under the fixed name is not a fresh
+    /// instance: a second registration of that name, while a live
+    /// registration holds it, is still refused.
+    #[test]
+    fn concurrent_fresh_instance_grant_boxes_get_distinct_ids() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        let grant = |name: &str| RegisterBoxRequest {
+            host_ip: true,
+            hold: false,
+            credentialed_upstream: Some(boxes::CredentialedUpstream::default()),
+            task_slots: minimald_rpc::TASK_SLOTS_PER_BOX,
+            ..box_request(name)
+        };
+        let minted = |reply: BoxControlReply| match reply {
+            BoxControlReply::BoxIdMinted { minted_box_id } => minted_box_id,
+            other => panic!("a host_ip registration is answered with a box id, got {other:?}"),
+        };
+        let keys = [
+            "dev~00112233445566778899aabbccddeeff",
+            "dev~ffeeddccbbaa99887766554433221100",
+        ];
+        let ids: Vec<minimald_rpc::BoxId> = std::thread::scope(|scope| {
+            let asks: Vec<_> = keys
+                .iter()
+                .map(|key| {
+                    let request = grant(key);
+                    let sock_path = &sock_path;
+                    scope.spawn(move || register(sock_path, &request))
+                })
+                .collect();
+            asks.into_iter()
+                .map(|ask| minted(ask.join().expect("no panic").expect("answered")))
+                .collect()
+        });
+        assert_ne!(ids[0], ids[1], "each fresh instance gets its own id");
+        for (key, id) in keys.iter().zip(&ids) {
+            assert_eq!(registry.host_ip_id_for(key), Some(id.to_bytes()));
+        }
+
+        // The in-VM daemon names the boxes `dev-1` and `dev-2`, then asks
+        // for each id by the key the create carried.
+        let guest = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        for (n, (key, id)) in keys.iter().zip(&ids).enumerate() {
+            let reply = control(
+                &guest,
+                &BoxControlRequest::MintBoxId(minimald_rpc::MintBoxIdRequest {
+                    switch_address: None,
+                    create_token: Some(format!("create-dev-{}", n + 1)),
+                    host_ip_name: Some((*key).to_owned()),
+                }),
+            )
+            .expect("the mint is answered");
+            assert_eq!(
+                reply,
+                BoxControlReply::BoxIdMinted { minted_box_id: *id },
+                "dev-{} takes its own registration's id",
+                n + 1
+            );
+            assert!(
+                registry.admit_host_ip_box_with_lane(
+                    boxes::SessionId::from_bytes(id.to_bytes()),
+                    None,
+                    true,
+                ),
+                "dev-{} is admitted",
+                n + 1
+            );
+        }
+
+        // A create under the fixed name registers it once. A second
+        // registration of the name a live registration holds is refused.
+        let fixed = minted(register(&sock_path, &grant("dev")).expect("answered"));
+        assert!(!ids.contains(&fixed));
+        match register(&sock_path, &grant("dev")).expect("answered") {
+            BoxControlReply::Error { error } => assert_eq!(
+                error,
+                AllocationError::NameAlreadyHeld {
+                    held: "dev".to_string()
+                }
+                .to_string()
+            ),
+            other => panic!("a second registration of a held name is refused, got {other:?}"),
+        }
+        assert_eq!(registry.host_ip_id_for("dev"), Some(fixed.to_bytes()));
     }
 
     /// BEP-082: a `host_ip` box's record takes the id its registration
@@ -4520,7 +4816,7 @@ mod tests {
         // the name with no registration of its own takes a fresh id, not the
         // ended box's claimed one.
         let session = boxes::SessionId::from_bytes(registered.to_bytes());
-        registry.retire_host_ip_box(session);
+        registry.retire_host_ip_box(session, minimald_rpc::HostIpBoxEnd::Destroyed);
         assert_eq!(registry.host_ip_id_for("agent"), None);
         assert!(
             registry.holds_host_ip_id(registered.to_bytes()),
@@ -5804,11 +6100,20 @@ mod tests {
             control(&sock_path, &BoxControlRequest::AnswererStatus).expect("the read is answered"),
             BoxControlReply::Status(minimald_rpc::AnswererStatusReply {
                 answerer: ZoneAnswererStatus::Holder { port: 7_656 },
-                proxy_down: Some(minimald_rpc::ProxyDown { port, cause: late }),
+                proxy_down: Some(minimald_rpc::ProxyDown {
+                    port,
+                    cause: late.clone(),
+                }),
             }),
             "a late refusal rides beside the answerer's state with its \
              holder, and a confirm never clears it"
         );
+        // NET-022: the held-port watcher's publish clears the cause on its
+        // own port, and never a cause on another port.
+        proxy_publish.clear_down(port + 1);
+        assert_eq!(proxy_publish.down(), Some((port, late)));
+        proxy_publish.clear_down(port);
+        assert_eq!(proxy_publish.down(), None, "the publish clears the cause");
     }
 
     /// The operator's pin's story (T93): the first address-in-use publish
@@ -7649,6 +7954,7 @@ mod tests {
                 ControlDoor::Host,
                 &audit_path,
                 1,
+                &HostIpReconcileNudge::default(),
             )
         });
 
@@ -8681,6 +8987,7 @@ mod tests {
             &sock_path,
             &BoxControlRequest::RetireHostIpBox(minimald_rpc::RetireHostIpBoxRequest {
                 session_id: unnamed,
+                end: minimald_rpc::HostIpBoxEnd::Destroyed,
             }),
         )
         .expect("the retire is answered");
@@ -9182,5 +9489,274 @@ mod tests {
         let guest = spawn_guest_reports_door(&sock_path, boxes.clone(), answerer, proxy_publish)
             .expect("the guest door binds");
         assert_eq!(read_mirror_collisions(&guest).await, None);
+    }
+
+    /// The reconcile thread's read, as a test drives it: each call says it
+    /// started on `calls`, then waits for the test's answer on `answers`.
+    type GuestList = anyhow::Result<std::collections::BTreeMap<boxes::SessionId, boxes::BoxState>>;
+
+    fn scripted_guest_reader(
+        calls: std::sync::mpsc::Sender<()>,
+        answers: std::sync::mpsc::Receiver<GuestList>,
+    ) -> impl FnMut() -> GuestList + Send + 'static {
+        move || {
+            calls
+                .send(())
+                .map_err(|_| anyhow::anyhow!("the test ended"))?;
+            answers
+                .recv()
+                .map_err(|_| anyhow::anyhow!("the test ended"))?
+        }
+    }
+
+    fn reconcile_session(n: u8) -> boxes::SessionId {
+        boxes::SessionId::parse_str(&format!("00000000-0000-4000-8000-0000000000{n:02}"))
+            .expect("a session id")
+    }
+
+    fn resident_host_ip_sessions(registry: &BoxRegistry) -> Vec<boxes::SessionId> {
+        registry
+            .table()
+            .host_ip_boxes()
+            .iter()
+            .map(|rules| rules.session_id())
+            .collect()
+    }
+
+    /// Polls until the resident `host_ip` boxes are `want`, or panics.
+    fn wait_for_resident(registry: &BoxRegistry, want: &[boxes::SessionId]) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while resident_host_ip_sessions(registry) != want {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the resident host_ip boxes stayed {:?}, not {want:?}",
+                resident_host_ip_sessions(registry)
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// NET-085: the reconcile thread reads the in-VM daemon's session list
+    /// on a guest-door nudge and on its timer, and hands each list to the
+    /// registry. A read that fails changes nothing.
+    #[test]
+    fn host_ip_reconcile_thread_runs_on_nudge_and_timer() {
+        const NOT_SOON: Duration = Duration::from_secs(3600);
+        let read_timeout = Duration::from_secs(10);
+
+        // A nudge runs a pass, with the timer far away.
+        let registry = BoxRegistry::new(SUBNET);
+        let (stopped, live) = (reconcile_session(1), reconcile_session(2));
+        assert!(registry.admit_host_ip_box(stopped, None));
+        assert!(registry.admit_host_ip_box(live, None));
+        let (calls_tx, calls) = std::sync::mpsc::channel();
+        let (answers, answers_rx) = std::sync::mpsc::channel();
+        let nudge = spawn_host_ip_reconcile_with(
+            registry.clone(),
+            NOT_SOON,
+            scripted_guest_reader(calls_tx, answers_rx),
+        )
+        .expect("the reconcile thread starts");
+        nudge.nudge();
+        calls
+            .recv_timeout(read_timeout)
+            .expect("a nudge reads the session list");
+        answers
+            .send(Ok(std::collections::BTreeMap::from([
+                (stopped, boxes::BoxState::Stopped),
+                (live, boxes::BoxState::Active),
+            ])))
+            .expect("the reader waits");
+        wait_for_resident(&registry, &[live]);
+
+        // A failed read changes nothing: an empty list would drop `live`
+        // and forget `stopped`'s set-aside rules.
+        nudge.nudge();
+        calls
+            .recv_timeout(read_timeout)
+            .expect("a second nudge reads again");
+        answers
+            .send(Err(anyhow::anyhow!("the in-VM daemon did not answer")))
+            .expect("the reader waits");
+        // The next read starts only after the failed pass is done.
+        nudge.nudge();
+        calls
+            .recv_timeout(read_timeout)
+            .expect("a third nudge reads again");
+        assert_eq!(resident_host_ip_sessions(&registry), vec![live]);
+        assert!(registry.holds_host_ip_boxes());
+        // The guest runs the stopped box again: it rejoins.
+        answers
+            .send(Ok(std::collections::BTreeMap::from([
+                (stopped, boxes::BoxState::Active),
+                (live, boxes::BoxState::Active),
+            ])))
+            .expect("the reader waits");
+        wait_for_resident(&registry, &[stopped, live]);
+        drop(answers);
+
+        // The timer runs a pass with no nudge.
+        let registry = BoxRegistry::new(SUBNET);
+        let reaped = reconcile_session(3);
+        assert!(registry.admit_host_ip_box(reaped, None));
+        let (calls_tx, calls) = std::sync::mpsc::channel();
+        let (answers, answers_rx) = std::sync::mpsc::channel();
+        let _timer_only = spawn_host_ip_reconcile_with(
+            registry.clone(),
+            Duration::from_millis(50),
+            scripted_guest_reader(calls_tx, answers_rx),
+        )
+        .expect("the reconcile thread starts");
+        calls
+            .recv_timeout(read_timeout)
+            .expect("the timer reads the session list");
+        answers
+            .send(Ok(std::collections::BTreeMap::new()))
+            .expect("the reader waits");
+        wait_for_resident(&registry, &[]);
+        assert!(
+            !registry.holds_host_ip_boxes(),
+            "a box the guest no longer lists is forgotten"
+        );
+        drop(answers);
+    }
+
+    /// NET-085: a pass that drops a box a client admitted since the pass
+    /// before it runs one more pass after the least gap, with no nudge and
+    /// the timer far away. A resumed box then rejoins soon. A drop of a box
+    /// admitted before the previous pass runs no extra pass.
+    #[test]
+    fn host_ip_reconcile_thread_runs_again_after_dropping_a_new_admit() {
+        const NOT_SOON: Duration = Duration::from_secs(3600);
+        let read_timeout = Duration::from_secs(10);
+        let registry = BoxRegistry::new(SUBNET);
+        let (resumed, live) = (reconcile_session(1), reconcile_session(2));
+        assert!(registry.admit_host_ip_box(live, None));
+        let (calls_tx, calls) = std::sync::mpsc::channel();
+        let (answers, answers_rx) = std::sync::mpsc::channel();
+        let nudge = spawn_host_ip_reconcile_with(
+            registry.clone(),
+            NOT_SOON,
+            scripted_guest_reader(calls_tx, answers_rx),
+        )
+        .expect("the reconcile thread starts");
+        nudge.nudge();
+        calls
+            .recv_timeout(read_timeout)
+            .expect("a nudge reads the session list");
+        answers
+            .send(Ok(std::collections::BTreeMap::from([(
+                live,
+                boxes::BoxState::Active,
+            )])))
+            .expect("the reader waits");
+
+        // A resume admits the box before the guest runs it again.
+        assert!(registry.admit_host_ip_box(resumed, None));
+        nudge.nudge();
+        calls
+            .recv_timeout(read_timeout)
+            .expect("a second nudge reads again");
+        let resume_pending = || {
+            Ok(std::collections::BTreeMap::from([
+                (resumed, boxes::BoxState::Stopped),
+                (live, boxes::BoxState::Active),
+            ]))
+        };
+        answers.send(resume_pending()).expect("the reader waits");
+        wait_for_resident(&registry, &[live]);
+
+        // No nudge: the thread reads once more after the least gap.
+        calls
+            .recv_timeout(read_timeout)
+            .expect("a drop of a new admit runs one more pass");
+        answers
+            .send(Ok(std::collections::BTreeMap::from([
+                (resumed, boxes::BoxState::Active),
+                (live, boxes::BoxState::Active),
+            ])))
+            .expect("the reader waits");
+        wait_for_resident(&registry, &[resumed, live]);
+
+        // The box stops again. Its admit is older than the previous pass,
+        // so the drop runs no extra pass.
+        nudge.nudge();
+        calls
+            .recv_timeout(read_timeout)
+            .expect("a nudge reads again");
+        answers.send(resume_pending()).expect("the reader waits");
+        wait_for_resident(&registry, &[live]);
+        assert!(
+            calls.recv_timeout(HOST_IP_RECONCILE_MIN_GAP * 3).is_err(),
+            "an old admit's drop runs no extra pass"
+        );
+        drop(answers);
+    }
+
+    /// NET-085: a failed read does not advance the mark of the last pass
+    /// that read the list. A box a client admitted before the failed read
+    /// and dropped by the next good pass still gets its one more pass.
+    #[test]
+    fn host_ip_reconcile_thread_runs_again_after_a_failed_read() {
+        const NOT_SOON: Duration = Duration::from_secs(3600);
+        let read_timeout = Duration::from_secs(10);
+        let registry = BoxRegistry::new(SUBNET);
+        let (resumed, live) = (reconcile_session(1), reconcile_session(2));
+        assert!(registry.admit_host_ip_box(live, None));
+        let (calls_tx, calls) = std::sync::mpsc::channel();
+        let (answers, answers_rx) = std::sync::mpsc::channel();
+        let nudge = spawn_host_ip_reconcile_with(
+            registry.clone(),
+            NOT_SOON,
+            scripted_guest_reader(calls_tx, answers_rx),
+        )
+        .expect("the reconcile thread starts");
+        nudge.nudge();
+        calls
+            .recv_timeout(read_timeout)
+            .expect("a nudge reads the session list");
+        answers
+            .send(Ok(std::collections::BTreeMap::from([(
+                live,
+                boxes::BoxState::Active,
+            )])))
+            .expect("the reader waits");
+
+        // A resume admits the box, and the next read fails.
+        assert!(registry.admit_host_ip_box(resumed, None));
+        nudge.nudge();
+        calls
+            .recv_timeout(read_timeout)
+            .expect("a second nudge reads again");
+        answers
+            .send(Err(anyhow::anyhow!("the in-VM daemon did not answer")))
+            .expect("the reader waits");
+
+        // The next good read drops the box before the guest runs it again.
+        nudge.nudge();
+        calls
+            .recv_timeout(read_timeout)
+            .expect("a third nudge reads again");
+        answers
+            .send(Ok(std::collections::BTreeMap::from([
+                (resumed, boxes::BoxState::Stopped),
+                (live, boxes::BoxState::Active),
+            ])))
+            .expect("the reader waits");
+        wait_for_resident(&registry, &[live]);
+
+        // No nudge: the admit predates the last good read, so one more
+        // pass runs after the least gap.
+        calls
+            .recv_timeout(read_timeout)
+            .expect("a drop of an admit from before a failed read runs one more pass");
+        answers
+            .send(Ok(std::collections::BTreeMap::from([
+                (resumed, boxes::BoxState::Active),
+                (live, boxes::BoxState::Active),
+            ])))
+            .expect("the reader waits");
+        wait_for_resident(&registry, &[resumed, live]);
+        drop(answers);
     }
 }

@@ -66,6 +66,7 @@ pub async fn run(mut cli: Cli) -> Result<(), anyhow::Error> {
         trace_id = tracing::field::Empty,
         span_id = tracing::field::Empty,
         parent_span_id = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
     );
     // A caller may run `min` inside its own trace (a CI job, a test
     // harness, or a script in a session, whose daemon put the exec's
@@ -140,10 +141,17 @@ fn command_verb(command: Option<&Command>) -> &'static str {
             BoxCommand::Show(_) => "box show",
             BoxCommand::Stop(_) => "box stop",
             BoxCommand::Rm(_) => "box rm",
+            BoxCommand::Attach(_) => "box attach",
+            BoxCommand::Exec(_) => "box exec",
+            BoxCommand::Events(_) => "box events",
+            BoxCommand::Cp(_) => "box cp",
+            BoxCommand::Rename(_) => "box rename",
+            BoxCommand::Prune(_) => "box prune",
         },
         Some(Command::Host(HostArgs { command })) => match command {
             HostCommand::List => "host list",
             HostCommand::Show(_) => "host show",
+            HostCommand::Stop(_) => "host stop",
         },
         Some(Command::Provider(ProviderArgs { command })) => match command {
             ProviderCommand::List(_) => "provider list",
@@ -287,8 +295,8 @@ impl Drop for RootSpanSlot {
 /// Run `command` inside `root`, end `root`, and return the command's
 /// [`Handoff`], if it made one. Any other error is returned as is.
 ///
-/// `root` ends when the instrumented future is dropped, at the end of the
-/// `await`, so it has closed (and its exporter has it) by the time a caller
+/// `root` ends before this function returns, when the last handle on it
+/// drops, so it has closed (and its exporter has it) by the time a caller
 /// finishes the hand-off.
 async fn run_in_root<F>(root: tracing::Span, command: F) -> Result<Option<Handoff>, anyhow::Error>
 where
@@ -306,6 +314,11 @@ where
         Err(_) => "error",
     };
     span.record("outcome", outcome);
+    // A failed command marks its root span as an error, whether or not the
+    // failure was expected. A hand-off is not a failure.
+    if outcome == "error" {
+        span.record("otel.status_code", "ERROR");
+    }
     // Release every handle on the span, so it closes here.
     drop(slot);
     drop(span);
@@ -382,6 +395,12 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             BoxCommand::Show(args) => cmd_box_show(&cli.global_args, args).await,
             BoxCommand::Stop(args) => cmd_box_stop(&cli.global_args, args).await,
             BoxCommand::Rm(args) => cmd_box_rm(&cli.global_args, args).await,
+            BoxCommand::Attach(args) => cmd_box_attach(&cli.global_args, args).await,
+            BoxCommand::Exec(args) => cmd_box_exec(&cli.global_args, args).await,
+            BoxCommand::Events(args) => cmd_box_events(&cli.global_args, args).await,
+            BoxCommand::Cp(args) => cmd_box_cp(&cli.global_args, args).await,
+            BoxCommand::Rename(args) => cmd_box_rename(&cli.global_args, args).await,
+            BoxCommand::Prune(args) => cmd_box_prune(&cli.global_args, args).await,
         },
         Some(Command::Host(HostArgs { command })) => match command {
             HostCommand::List => {
@@ -389,6 +408,9 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             }
             HostCommand::Show(args) => {
                 hosts::cmd_host_show(&cli.global_args, &args, &mut std::io::stdout()).await
+            }
+            HostCommand::Stop(args) => {
+                hosts::cmd_host_stop(&cli.global_args, &args, &mut std::io::stdout()).await
             }
         },
         Some(Command::Provider(ProviderArgs { command })) => match command {
@@ -1407,7 +1429,8 @@ async fn withdraw_interrupted_box(
     slot: &std::sync::OnceLock<minimald_rpc::BoxId>,
 ) {
     if record.network == boxes::NetworkMode::HostNet {
-        retire_host_ip_box_with_vm_host(control_sock.clone(), record.id).await;
+        retire_host_ip_box_with_vm_host(control_sock.clone(), record.id, HostIpBoxEnd::Destroyed)
+            .await;
     }
     withdraw_box_row(
         control_sock,
@@ -1905,6 +1928,64 @@ mod handoff_tests {
         closed.0.lock().unwrap().clone()
     }
 
+    /// Records each span's `otel.status_code`, if it gets one, in the order
+    /// the spans are created.
+    #[derive(Clone, Default)]
+    struct Statuses(Arc<Mutex<StatusLog>>);
+
+    #[derive(Default)]
+    struct StatusLog {
+        statuses: Vec<Option<String>>,
+        /// The index in `statuses` of each open span, by span id.
+        by_id: std::collections::HashMap<u64, usize>,
+    }
+
+    struct StatusField(Option<String>);
+
+    impl tracing::field::Visit for StatusField {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "otel.status_code" {
+                self.0 = Some(value.to_owned());
+            }
+        }
+
+        fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Statuses {
+        fn on_new_span(
+            &self,
+            _: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            _: Context<'_, S>,
+        ) {
+            let mut log = self.0.lock().unwrap();
+            let at = log.statuses.len();
+            log.statuses.push(None);
+            log.by_id.insert(id.into_u64(), at);
+        }
+
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _: Context<'_, S>,
+        ) {
+            let mut field = StatusField(None);
+            values.record(&mut field);
+            let mut log = self.0.lock().unwrap();
+            if let (Some(status), Some(&at)) = (field.0, log.by_id.get(&id.into_u64())) {
+                log.statuses[at] = Some(status);
+            }
+        }
+    }
+
+    impl Statuses {
+        fn all(&self) -> Vec<Option<String>> {
+            self.0.lock().unwrap().statuses.clone()
+        }
+    }
+
     /// The TEL-031 contract: by the time `run` holds a hand-off (and so before
     /// it flushes and exits or raises), the `cmd` span and the spans under it
     /// have closed, which is what puts them in the exporter and the spool.
@@ -2007,20 +2088,29 @@ mod handoff_tests {
     }
 
     /// A command that returns, or fails, hands nothing off: its error comes
-    /// back as it was, and the span still ends.
+    /// back as it was, and the span still ends. Only the failed command's
+    /// span carries the ERROR status; a hand-off is not a failure.
     #[tokio::test]
     async fn ordinary_outcomes_pass_through() {
         let closed = Closed::default();
-        let _guard =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(closed.clone()));
-        let ok = run_in_root(tracing::info_span!("cmd"), async { Ok(()) }).await;
+        let statuses = Statuses::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry()
+                .with(closed.clone())
+                .with(statuses.clone()),
+        );
+        let cmd = || tracing::info_span!("cmd", otel.status_code = tracing::field::Empty);
+        let ok = run_in_root(cmd(), async { Ok(()) }).await;
         assert!(matches!(ok, Ok(None)));
-        let err = run_in_root(tracing::info_span!("cmd"), async {
-            Err(anyhow::anyhow!("no session found"))
-        })
-        .await
-        .unwrap_err();
+        let err = run_in_root(cmd(), async { Err(anyhow::anyhow!("no session found")) })
+            .await
+            .unwrap_err();
         assert_eq!(format!("{err:#}"), "no session found");
-        assert_eq!(closed_names(&closed), ["cmd", "cmd"]);
+        let handoff = run_in_root(cmd(), async { Err(Handoff::Exit(1).into()) })
+            .await
+            .unwrap();
+        assert!(matches!(handoff, Some(Handoff::Exit(1))), "{handoff:?}");
+        assert_eq!(closed_names(&closed), ["cmd", "cmd", "cmd"]);
+        assert_eq!(statuses.all(), [None, Some("ERROR".to_owned()), None]);
     }
 }

@@ -525,16 +525,16 @@ impl BoxManagerHandle {
         async {
             let (send, recv) = Responder::channel();
             // Ignore send errors - the recv will also fail.
-            let _ = self.sender.send(ManagerMessage::Records(send)).await;
+            let _ = self.sender.send(ManagerMessage::Listing(send)).await;
             let records = recv
                 .await
                 .expect("corresponding sessions manager is dead")?;
             let mut boxes: Vec<_> = records
                 .iter()
-                .filter(|record| {
+                .filter(|(record, _)| {
                     project_root.is_none_or(|root| record.project_root.as_ref() == Some(root))
                 })
-                .map(box_listing_entry)
+                .map(|(record, pty)| box_listing_entry(record, *pty))
                 .collect();
             boxes.sort_by_key(|entry| entry.box_id);
             tracing::Span::current().record("count", boxes.len());
@@ -555,11 +555,16 @@ impl BoxManagerHandle {
         id: SessionId,
     ) -> Result<Option<minimald_rpc::ShowBoxResponse>, BoxManagerError> {
         use tracing::Instrument as _;
-        let span = tracing::info_span!("box.show", session_id = %id, found = tracing::field::Empty);
+        let span = tracing::info_span!(
+            "box.show",
+            session_id = %id,
+            found = tracing::field::Empty,
+            disk = tracing::field::Empty
+        );
         async {
             let (send, recv) = Responder::channel();
             // Ignore send errors - the recv will also fail.
-            let _ = self.sender.send(ManagerMessage::Records(send)).await;
+            let _ = self.sender.send(ManagerMessage::Listing(send)).await;
             let records = recv
                 .await
                 .expect("corresponding sessions manager is dead")?;
@@ -567,13 +572,22 @@ impl BoxManagerHandle {
             // guest's differs from its `id`), so that key wins.
             let record = records
                 .iter()
-                .find(|record| record.box_id == Some(id))
-                .or_else(|| records.iter().find(|record| record.id == id))
-                .cloned();
+                .find(|(record, _)| record.box_id == Some(id))
+                .or_else(|| records.iter().find(|(record, _)| record.id == id));
             tracing::Span::current().record("found", record.is_some());
             tracing::info!(session_id = %id, found = record.is_some(), "read a box record");
-            Ok(record.map(|record| minimald_rpc::ShowBoxResponse {
-                record: box_listing_entry(&record),
+            let Some((record, pty)) = record else {
+                return Ok(None);
+            };
+            // BOX-159: the disk a reap frees, for a box a reap can take.
+            let disk_bytes = if is_ended(record) {
+                self.box_disk_bytes(record).await
+            } else {
+                None
+            };
+            tracing::Span::current().record("disk", disk_bytes.is_some());
+            Ok(Some(minimald_rpc::ShowBoxResponse {
+                record: box_listing_entry(record, *pty),
                 // BOX-140: no host this daemon runs on is enrolled with a
                 // Gatehouse, so every box reports the identity none.
                 identity: minimald_rpc::BoxIdentity::None,
@@ -582,10 +596,55 @@ impl BoxManagerHandle {
                 // the box. It fills when each exec has an id (BOX-149):
                 // https://github.com/gominimal/minimal/issues/2404 (T30).
                 live_execs: Vec::new(),
+                disk_bytes,
             }))
         }
         .instrument(span)
         .await
+    }
+
+    /// The bytes on disk that a reap of the box `record` names frees
+    /// (BOX-021, BOX-159), measured off the manager loop, so a large box
+    /// does not hold up other requests. `None` when the box cannot be
+    /// measured: the daemon log names the box and the error, and no figure
+    /// stands in for it.
+    async fn box_disk_bytes(&self, record: &boxes::Record) -> Option<u64> {
+        let box_id = record.box_id.unwrap_or(record.id);
+        let (send, recv) = Responder::channel();
+        // A send error means the manager is gone: the recv fails as well.
+        let _ = self
+            .sender
+            .send(ManagerMessage::EventsSource(record.id, send))
+            .await;
+        let measured = match recv.await {
+            Ok(Ok(Some(object))) => {
+                let dir = object.dir();
+                crate::traced::spawn_blocking(move || dir.disk_bytes())
+                    .await
+                    .unwrap_or_else(|join| Err(std::io::Error::other(join)))
+            }
+            Ok(Ok(None)) => Err(std::io::Error::new(
+                NotFound,
+                "no retained record names the box",
+            )),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                minimald_rpc::SHUTDOWN_REFUSAL,
+            )),
+        };
+        match measured {
+            Ok(bytes) => Some(bytes),
+            Err(error) => {
+                tracing::warn!(
+                    box_id = %box_id,
+                    session_id = %record.id,
+                    %error,
+                    "box disk: the disk the box holds cannot be measured; it has no figure"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -725,7 +784,8 @@ impl BoxManagerHandle {
                     .await?
                     .ok_or_else(|| unknown_box(key))?;
             }
-            let reaped = box_listing_entry(&record);
+            // The reaped box has no terminal left to attach to.
+            let reaped = box_listing_entry(&record, false);
             let (send, recv) = Responder::channel();
             // A send error means the manager is gone: the recv fails as well.
             let _ = self.sender.send(ManagerMessage::ReapEnded(key, send)).await;
@@ -883,25 +943,7 @@ impl BoxManagerHandle {
                     minimald_rpc::SHUTDOWN_REFUSAL,
                 ));
             }
-            let (send, recv) = Responder::channel();
-            // Ignore send errors - the recv will also fail.
-            let _ = self.sender.send(ManagerMessage::Records(send)).await;
-            let records = recv
-                .await
-                .expect("corresponding sessions manager is dead")?;
-            let mut matched = Vec::new();
-            for record in records {
-                if !prune_matches(&record, parent) {
-                    continue;
-                }
-                if let Some(older_than) = older_than
-                    && !self.ended_long_enough(&record, older_than, now).await
-                {
-                    continue;
-                }
-                matched.push(record);
-            }
-            matched.sort_by_key(|record| record.box_id.unwrap_or(record.id));
+            let matched = self.prune_candidates(older_than, parent, now).await?;
             tracing::Span::current().record("matched", matched.len());
             let mut reply = minimald_rpc::PruneBoxesResponse::default();
             for record in matched {
@@ -928,6 +970,112 @@ impl BoxManagerHandle {
         .instrument(span)
         .await
     }
+
+    /// The records a prune with these selectors reaps, in box id order
+    /// (BOX-021): every `stopped` or `exited` box that matches all the
+    /// given selectors. [`Self::prune_boxes_at`] reaps them and
+    /// [`Self::preview_prune_at`] lists them, so the two match the same
+    /// boxes.
+    async fn prune_candidates(
+        &self,
+        older_than: Option<std::time::Duration>,
+        parent: Option<SessionId>,
+        now: std::time::SystemTime,
+    ) -> Result<Vec<boxes::Record>, BoxManagerError> {
+        let (send, recv) = Responder::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self.sender.send(ManagerMessage::Records(send)).await;
+        let records = recv
+            .await
+            .expect("corresponding sessions manager is dead")?;
+        let mut matched = Vec::new();
+        for record in records {
+            if !prune_matches(&record, parent) {
+                continue;
+            }
+            if let Some(older_than) = older_than
+                && !self.ended_long_enough(&record, older_than, now).await
+            {
+                continue;
+            }
+            matched.push(record);
+        }
+        matched.sort_by_key(|record| record.box_id.unwrap_or(record.id));
+        Ok(matched)
+    }
+
+    /// Lists every box that [`Self::prune_boxes`] with the same selectors
+    /// reaps, with the disk each one holds, and reaps none (BOX-021). A
+    /// box whose disk cannot be measured is listed with no figure.
+    ///
+    /// # Errors
+    ///
+    /// The store's error from the read of the records.
+    pub async fn preview_prune(
+        &self,
+        older_than: Option<std::time::Duration>,
+        parent: Option<SessionId>,
+    ) -> Result<minimald_rpc::PreviewPruneResponse, BoxManagerError> {
+        self.preview_prune_at(older_than, parent, std::time::SystemTime::now())
+            .await
+    }
+
+    /// [`Self::preview_prune`] with `now` as the time that `older_than`
+    /// counts back from.
+    pub(crate) async fn preview_prune_at(
+        &self,
+        older_than: Option<std::time::Duration>,
+        parent: Option<SessionId>,
+        now: std::time::SystemTime,
+    ) -> Result<minimald_rpc::PreviewPruneResponse, BoxManagerError> {
+        use tracing::Instrument as _;
+        let span = tracing::info_span!(
+            "box.prune_preview",
+            older_than_secs = older_than.map(|d| d.as_secs()),
+            parent = parent.map(tracing::field::display),
+            matched = tracing::field::Empty,
+            unmeasured = tracing::field::Empty
+        );
+        async {
+            let matched = self.prune_candidates(older_than, parent, now).await?;
+            let mut reply = minimald_rpc::PreviewPruneResponse::default();
+            for record in matched {
+                let disk_bytes = self.box_disk_bytes(&record).await;
+                reply.matched.push(minimald_rpc::PrunePreviewEntry {
+                    // As a prune reports a reaped box: no terminal is left.
+                    record: box_listing_entry(&record, false),
+                    disk_bytes,
+                });
+            }
+            let unmeasured = reply
+                .matched
+                .iter()
+                .filter(|entry| entry.disk_bytes.is_none())
+                .count();
+            tracing::Span::current().record("matched", reply.matched.len());
+            tracing::Span::current().record("unmeasured", unmeasured);
+            tracing::info!(
+                older_than_secs = older_than.map(|d| d.as_secs()),
+                parent = parent.map(tracing::field::display),
+                matched = reply.matched.len(),
+                unmeasured,
+                "previewed a prune: no box was reaped"
+            );
+            Ok(reply)
+        }
+        .instrument(span)
+        .await
+    }
+}
+
+/// Whether `record` is `stopped` or `exited`: a box a reap that is not
+/// forced can take.
+fn is_ended(record: &boxes::Record) -> bool {
+    matches!(
+        record.state(),
+        Ok(boxes::core::record::RecordState::Stopped(_)
+            | boxes::core::record::RecordState::Exited(_))
+    )
 }
 
 /// Whether `record` is a prune candidate (BOX-021): it is `stopped` or
@@ -935,12 +1083,7 @@ impl BoxManagerHandle {
 /// `older_than` selector needs the record's events, so
 /// [`BoxManagerHandle::prune_boxes_at`] checks it after this one.
 fn prune_matches(record: &boxes::Record, parent: Option<SessionId>) -> bool {
-    let ended = matches!(
-        record.state(),
-        Ok(boxes::core::record::RecordState::Stopped(_)
-            | boxes::core::record::RecordState::Exited(_))
-    );
-    if !ended {
+    if !is_ended(record) {
         return false;
     }
     parent.is_none_or(|parent| record.parent == Some(parent))
@@ -972,7 +1115,8 @@ fn unknown_box(id: SessionId) -> BoxManagerError {
 /// state as BOX-011 spells it. A `stopped` or `exited` record whose stored
 /// ending is not a row of the BOX-011 table reports its status with the
 /// stored `reason`, `exit_code` and `signal` as they are.
-fn box_listing_entry(record: &boxes::Record) -> minimald_rpc::BoxListingEntry {
+/// `pty_enabled` is whether the box has a terminal ([`record_has_pty`]).
+fn box_listing_entry(record: &boxes::Record, pty_enabled: bool) -> minimald_rpc::BoxListingEntry {
     let (state, reason, exit_code, signal) = match record.state() {
         Ok(state) => (
             state.name(),
@@ -1006,6 +1150,21 @@ fn box_listing_entry(record: &boxes::Record) -> minimald_rpc::BoxListingEntry {
         reason,
         exit_code,
         signal,
+        pty_enabled,
+    }
+}
+
+/// Whether a box has a terminal (BCLI-068): its stored spec sets
+/// `io.pty_enabled`, as the PTY check of a resume reads it (BOX-030). A box
+/// filed with no spec has only its Box Type to go by, and a session has a
+/// terminal, as the resume reads it too.
+pub(crate) fn record_has_pty(record: &boxes::Record, stored_spec: Option<&[u8]>) -> bool {
+    match stored_spec {
+        Some(bytes) => crate::box_runtime::stored_spec_sets_pty(bytes),
+        None => record
+            .box_type
+            .as_deref()
+            .is_none_or(|box_type| box_type == boxes::SESSION_BOX_TYPE),
     }
 }
 
@@ -1039,6 +1198,9 @@ enum ManagerMessage {
     /// Every retained record, in any state (BOX-158). Read-only against
     /// the store: it starts no actor and probes no host.
     Records(Responder<Vec<boxes::Record>>),
+    /// [`Self::Records`], each record with whether its box has a terminal
+    /// ([`record_has_pty`]), for the listing and the read (BCLI-068).
+    Listing(Responder<Vec<(boxes::Record, bool)>>),
     GetRecord(BoxKeyPredicate, Responder<Option<boxes::Record>>),
     /// The retained box an events read follows (BOX-162): its on-disk
     /// object, so the read runs off the mainloop. `None` for an id no
@@ -1133,6 +1295,7 @@ impl ManagerMessage {
         match self {
             Self::List(..) => "List",
             Self::Records(..) => "Records",
+            Self::Listing(..) => "Listing",
             Self::GetRecord(..) => "GetRecord",
             Self::EventsSource(..) => "EventsSource",
             Self::EndedSource(..) => "EndedSource",
@@ -3345,6 +3508,9 @@ impl BoxManager {
                 .unwrap_or(crate::rpc::ANONYMOUS_SESSION),
         );
         let (name, source) = creation_name(config.name.as_deref(), spec.as_ref());
+        // BEP-082: only a fresh instance registered under a creation key,
+        // and only a key for its own base. See `host_ip_mint_name`.
+        let fresh_base = name.clone().filter(|_| fresh);
         let name = match name {
             Some(base) if fresh => {
                 let retained = self.retained_names().await?;
@@ -3399,7 +3565,7 @@ impl BoxManager {
         let switch_address = config.box_addresses.as_ref().map(|a| a.switch_address);
         // BEP-082: a `host_ip` grant box has no row, and its registration
         // minted its id under the box's name. See `host_ip_mint_name`.
-        let host_ip_name = host_ip_mint_name(&config);
+        let host_ip_name = host_ip_mint_name(&config, fresh_base.as_deref());
         let control = crate::box_actor::switch_control_of(&self.net_switch).await;
         let minted = match crate::net::listeners::mint_box_id(
             &control,
@@ -3440,6 +3606,7 @@ impl BoxManager {
                 box_id = %minted,
                 ?switch_address,
                 ?host_ip_name,
+                box_name = ?config.name,
                 client_box_id = ?client_box_id,
                 "took the box id the VM host daemon minted; the request's box id is ignored"
             );
@@ -3747,6 +3914,42 @@ impl BoxManager {
                         if !tearing_down.contains(handle.id()) {
                             records.push(handle.record().await?);
                         }
+                    }
+                    Ok::<_, BoxManagerError>(records)
+                })
+                .await;
+            }
+            // Gets every retained record, as `Records` does, with whether
+            // the box's stored spec gives it a terminal.
+            ManagerMessage::Listing(r) => {
+                let tearing_down = self
+                    .tearing_down
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                r.handle(async {
+                    let mut records = Vec::new();
+                    for handle in self.store.handles().await? {
+                        if tearing_down.contains(handle.id()) {
+                            continue;
+                        }
+                        let record = handle.record().await?;
+                        // A spec that cannot be read leaves the Box Type
+                        // to go by, as for a box filed with no spec, so a
+                        // session still lists with its terminal.
+                        let stored = match handle.object().await.and_then(|o| o.load_spec()) {
+                            Ok(stored) => stored,
+                            Err(error) => {
+                                tracing::warn!(
+                                    session_id = %record.id,
+                                    %error,
+                                    "could not read the box's stored spec; terminal taken from its box type"
+                                );
+                                None
+                            }
+                        };
+                        let pty = record_has_pty(&record, stored.as_deref());
+                        records.push((record, pty));
                     }
                     Ok::<_, BoxManagerError>(records)
                 })
@@ -4974,14 +5177,52 @@ impl Drop for TearingDown {
 /// registration (BEP-082), or `None` for a fresh mint.
 ///
 /// Only a `host_ip` box with no box addresses and a declared credentialed
-/// upstream registered under its name, so only that box sends the name.
-/// A `host_ip` box with no grant registered nothing. If it sent its name, it
-/// could take the id of another live box that registered the same name.
-fn host_ip_mint_name(config: &minimald_rpc::BoxConfig) -> Option<String> {
+/// upstream registered, so only that box sends a name. It sends the name
+/// it registered under: the config's `host_ip_registration`, else the
+/// box's name. A fresh instance registered under a creation key, because
+/// this daemon names it `<base>-<n>` only after the registration.
+/// `fresh_base` is that base, and `None` when the create is not a fresh
+/// instance. The key counts only as `<fresh_base>~<hex>`. Any other value
+/// is ignored, so a client cannot name another box's registration and
+/// take its id. A `host_ip` box with no grant registered nothing. If it
+/// sent its name, it could take the id of another live box that
+/// registered the same name.
+fn host_ip_mint_name(config: &minimald_rpc::BoxConfig, fresh_base: Option<&str>) -> Option<String> {
     let grant_box = matches!(config.network, boxes::NetworkMode::HostNet)
         && config.box_addresses.is_none()
         && config.policy.credentialed_upstream.is_some();
-    if grant_box { config.name.clone() } else { None }
+    if !grant_box {
+        return None;
+    }
+    if let Some(key) = config.host_ip_registration.as_deref() {
+        if fresh_base.is_some_and(|base| is_creation_key_of(key, base)) {
+            return Some(key.to_string());
+        }
+        tracing::warn!(
+            host_ip_registration = %key,
+            fresh_base = ?fresh_base,
+            box_name = ?config.name,
+            "ignored a host_ip registration key that is not a creation key \
+             for this fresh box's base; the mint asks by the box's name"
+        );
+    }
+    config.name.clone()
+}
+
+/// Whether `key` is a creation key for `base` (BEP-082): `<base>~` and
+/// then one or more lowercase hex digits. The base compares under ASCII
+/// case, as box names do.
+fn is_creation_key_of(key: &str, base: &str) -> bool {
+    let Some(head) = key.get(..base.len()) else {
+        return false;
+    };
+    if !head.eq_ignore_ascii_case(base) {
+        return false;
+    }
+    let Some(hex) = key[base.len()..].strip_prefix('~') else {
+        return false;
+    };
+    !hex.is_empty() && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 #[cfg(test)]
@@ -5005,6 +5246,7 @@ mod host_ip_mint_name_tests {
             root_certificate: None,
             creating_verb: minimald_rpc::CreatingVerb::Session,
             project_root: None,
+            host_ip_registration: None,
         }
     }
 
@@ -5018,7 +5260,7 @@ mod host_ip_mint_name_tests {
     #[test]
     fn host_ip_box_record_takes_the_registration_id_only_with_a_grant() {
         assert_eq!(
-            host_ip_mint_name(&config(boxes::NetworkMode::HostNet)),
+            host_ip_mint_name(&config(boxes::NetworkMode::HostNet), None),
             None
         );
     }
@@ -5027,7 +5269,7 @@ mod host_ip_mint_name_tests {
     #[test]
     fn host_ip_box_record_takes_the_registration_id_of_a_grant_box() {
         let config = with_upstream(config(boxes::NetworkMode::HostNet));
-        assert_eq!(host_ip_mint_name(&config), Some("agent".to_string()));
+        assert_eq!(host_ip_mint_name(&config, None), Some("agent".to_string()));
     }
 
     // BEP-082: a box with addresses takes its id from its row, never a name.
@@ -5038,7 +5280,38 @@ mod host_ip_mint_name_tests {
             switch_address: Ipv4Addr::new(100, 64, 0, 21),
             loopback_address: Ipv4Addr::new(127, 0, 0, 21),
         });
-        assert_eq!(host_ip_mint_name(&config), None);
+        assert_eq!(host_ip_mint_name(&config, None), None);
+    }
+
+    // BEP-082: the mint asks by a creation key only on a fresh instance,
+    // and only by a key for the box's own base.
+    #[test]
+    fn host_ip_box_record_takes_the_registration_key_only_for_its_own_fresh_base() {
+        let key = "agent~00112233445566778899aabbccddeeff";
+        let mut config = with_upstream(config(boxes::NetworkMode::HostNet));
+        config.host_ip_registration = Some(key.to_string());
+        assert_eq!(
+            host_ip_mint_name(&config, Some("agent")),
+            Some(key.to_string())
+        );
+        assert_eq!(
+            host_ip_mint_name(&config, None),
+            Some("agent".to_string()),
+            "a create that is not a fresh instance asks by its name"
+        );
+        assert_eq!(
+            host_ip_mint_name(&config, Some("other")),
+            Some("agent".to_string()),
+            "a key for another base is ignored"
+        );
+        for wrong in ["agent", "agent~", "agent~XYZ", "agent-1", "other~00"] {
+            config.host_ip_registration = Some(wrong.to_string());
+            assert_eq!(
+                host_ip_mint_name(&config, Some("agent")),
+                Some("agent".to_string()),
+                "{wrong} is not a creation key for agent"
+            );
+        }
     }
 }
 
@@ -5108,6 +5381,7 @@ mod create_stamp_tests {
             root_certificate: None,
             creating_verb: minimald_rpc::CreatingVerb::Session,
             project_root: None,
+            host_ip_registration: None,
         }
     }
 
@@ -5318,6 +5592,7 @@ mod ended_box_tests {
             root_certificate: None,
             creating_verb: minimald_rpc::CreatingVerb::Session,
             project_root: None,
+            host_ip_registration: None,
         }
     }
 

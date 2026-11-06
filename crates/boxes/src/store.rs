@@ -539,6 +539,63 @@ impl BoxDir {
         file.take(max as u64).read_to_end(&mut buf)?;
         Ok(buf)
     }
+
+    /// The bytes the filesystem allocates to the box's directory: what a
+    /// reap of the box frees (BOX-021, BOX-159). The reap deletes this
+    /// directory whole, so the figure counts every file, directory and
+    /// link under it, by its allocated blocks and not its length, so a
+    /// sparse file counts what it holds. A link is not followed. A file
+    /// with a hard link outside the directory counts nothing, since the
+    /// reap does not free it, and a file linked twice inside counts once.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` once the box is reaped, and an I/O error if an entry
+    /// under the directory cannot be read.
+    pub fn disk_bytes(&self) -> Result<u64, std::io::Error> {
+        allocated_bytes_under(self.root.as_utf8_path().as_std_path())
+    }
+}
+
+/// The bytes a delete of the tree at `root` frees: [`BoxDir::disk_bytes`].
+fn allocated_bytes_under(root: &std::path::Path) -> Result<u64, std::io::Error> {
+    // A file with more than one link counts once the walk sees every one
+    // of its links, as `(links, seen, bytes)` by its device and inode.
+    let mut linked: std::collections::HashMap<(u64, u64), (u64, u64, u64)> =
+        std::collections::HashMap::new();
+    let mut total = 0u64;
+    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+        let meta = entry?.metadata()?;
+        let (bytes, links) = allocated(&meta);
+        if links <= 1 || meta.is_dir() {
+            total = total.saturating_add(bytes);
+            continue;
+        }
+        let seen = linked.entry(file_id(&meta)).or_insert((links, 0, bytes));
+        seen.1 += 1;
+    }
+    for (links, seen, bytes) in linked.into_values() {
+        if seen >= links {
+            total = total.saturating_add(bytes);
+        }
+    }
+    Ok(total)
+}
+
+/// The bytes the filesystem allocates to one entry, and its link count.
+#[cfg(unix)]
+fn allocated(meta: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt as _;
+    // `st_blocks` counts 512-byte units on every unix, whatever the
+    // filesystem's own block size.
+    (meta.blocks().saturating_mul(512), meta.nlink())
+}
+
+/// Off unix no allocated size is known: the length stands for it, and
+/// each entry reads as linked once.
+#[cfg(not(unix))]
+fn allocated(meta: &std::fs::Metadata) -> (u64, u64) {
+    (meta.len(), 1)
 }
 
 /// The most bytes a box's output log holds on disk: 8 MiB, the same cap
@@ -2334,6 +2391,70 @@ mod tests {
         loader.delete(&key).unwrap();
         assert!(!record_dir.join(LOG_FILE).exists());
         assert_eq!(BoxDir::find(&root, &key.session_id).unwrap(), None);
+    }
+
+    /// BOX-021, BOX-159: a box directory's disk figure is the bytes its
+    /// files hold on disk, which a reap frees: a written file counts its
+    /// blocks, a sparse file counts what it holds and not its length, a
+    /// file with a link outside the directory counts nothing, and a file
+    /// linked twice inside counts once. A reaped box has no figure.
+    #[cfg(unix)]
+    #[test]
+    fn box_dir_disk_counts_what_a_reap_frees() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let key = loader.create(sample_record()).unwrap();
+        let object = loader.get(&key).unwrap();
+        let dir = object.dir();
+        let tree = object.workspace_path();
+        let tree = tree.as_utf8_path().as_std_path();
+        std::fs::create_dir_all(tree).unwrap();
+        let file = tree.join("data.bin");
+        let sparse = tree.join("sparse.bin");
+        std::fs::write(&file, b"").unwrap();
+        std::fs::write(&sparse, b"").unwrap();
+
+        let empty = dir.disk_bytes().unwrap();
+        assert!(empty > 0, "the directories themselves hold blocks");
+
+        std::fs::write(&file, vec![7u8; 256 * 1024]).unwrap();
+        let file_bytes = std::fs::metadata(&file).unwrap().blocks() * 512;
+        assert!(file_bytes >= 256 * 1024, "{file_bytes}");
+        let written = dir.disk_bytes().unwrap();
+        assert_eq!(written, empty + file_bytes, "the written file's blocks");
+
+        let big = 1024 * 1024 * 1024;
+        std::fs::File::options()
+            .write(true)
+            .open(&sparse)
+            .unwrap()
+            .set_len(big)
+            .unwrap();
+        let sparse_bytes = std::fs::metadata(&sparse).unwrap().blocks() * 512;
+        assert_eq!(dir.disk_bytes().unwrap(), written + sparse_bytes);
+        assert!(
+            dir.disk_bytes().unwrap() < big,
+            "a sparse file counts its blocks, not its length"
+        );
+        std::fs::remove_file(&sparse).unwrap();
+
+        // A link outside the box keeps the file after a reap.
+        let outside = tmp.path().join("kept.bin");
+        std::fs::hard_link(&file, &outside).unwrap();
+        assert_eq!(dir.disk_bytes().unwrap(), empty);
+        std::fs::remove_file(&outside).unwrap();
+        assert_eq!(dir.disk_bytes().unwrap(), written);
+
+        // A second link inside counts the file once.
+        std::fs::hard_link(&file, tree.join("again.bin")).unwrap();
+        let twice = dir.disk_bytes().unwrap();
+        assert!(twice >= written && twice < written + file_bytes, "{twice}");
+
+        loader.delete(&key).unwrap();
+        assert_eq!(dir.disk_bytes().unwrap_err().kind(), ErrorKind::NotFound);
     }
 
     /// BOX-164: a read of a box's log does not follow a link planted where

@@ -47,6 +47,7 @@ mod hooks;
 mod launcher;
 #[cfg(test)]
 mod mock;
+mod pipes;
 
 pub(crate) use backend::*;
 pub(crate) use binding::*;
@@ -56,6 +57,8 @@ use hooks::*;
 pub(crate) use launcher::*;
 #[cfg(test)]
 pub(crate) use mock::*;
+pub(crate) use pipes::EntrypointIoTake;
+use pipes::{HostPipes, PIPE_EXIT_POLL, PipeStream, read_ready};
 
 /// What a host loop returns when it ends: the portable exit code, and the
 /// reaped [`ExitReason`] when the backend accounted for the end.
@@ -110,8 +113,12 @@ pub(crate) struct Host<P: BoxProcess, G: BoxGuard> {
     /// of [`Host::mainloop`] reads it to tell a requested end from a pty
     /// failure. A pty error stashed before the kill does not hide the kill.
     kill_requested: bool,
-    /// The master-side fd of the Pty.
+    /// The master-side fd of the Pty. On a host whose entrypoint runs on
+    /// pipes, the read end of its stdout pipe (see [`Self::pipes`]).
     master: AsyncFd<std::fs::File>,
+    /// The entrypoint's stdin and stderr pipes, on a host whose launch ran
+    /// its entrypoint on pipes, not on a terminal (T43). `None` otherwise.
+    pipes: Option<HostPipes>,
     /// The box's output log (BOX-155). Every read from the master lands
     /// here first, whether or not a binding is attached, so the attached
     /// client is a second reader and the log is complete after it leaves.
@@ -810,12 +817,14 @@ const NO_PROXY_DEFAULTS: [&str; 4] = [
 ///
 /// Empty unless the box's steering is `proxy_env` or `both`, or its
 /// `[network.bep] proxy_env` is true. Also empty when the box declares no
-/// credentialed upstream, or its network mode puts the lane out of effect:
-/// such a box cannot reach the proxy's address, so the variables would send
-/// all of its HTTP traffic to an address that drops it.
+/// credentialed upstream, or its network mode on a host of kind `host` puts
+/// the lane out of effect (BEP-085): such a box cannot reach the proxy's
+/// address, so the variables would send all of its HTTP traffic to an
+/// address that drops it. A `host_ip` box on a VM host gets them.
 pub(crate) fn launch_proxy_env(
     record: &boxes::Record,
     subnet: switch::SwitchSubnet,
+    host: paths::HostKind,
 ) -> Vec<(String, String)> {
     use boxes::core::bep::Steering;
     let Some(upstream) = record.policy.credentialed_upstream.as_ref() else {
@@ -824,7 +833,7 @@ pub(crate) fn launch_proxy_env(
     let bep = &upstream.bep;
     let steered =
         matches!(bep.resolved_steering(), Steering::ProxyEnv | Steering::Both) || bep.proxy_env;
-    if !steered || !boxes::CredentialedUpstream::in_effect(record.network) {
+    if !steered || !boxes::CredentialedUpstream::in_effect(record.network, host) {
         return Vec::new();
     }
     let proxy = format!(
@@ -849,26 +858,43 @@ pub(crate) fn launch_proxy_env(
 /// Places the proxy variables (BEP-012) in a launch's connection layer, over
 /// any value the layer held there, so the shell's launch environment and
 /// everything the host runs in the box carry them. Call it before
-/// [`place_launch_deliveries`], which keeps the layer it reads. Logs one
-/// debug line for the box, naming the variables set.
+/// [`place_launch_deliveries`], which keeps the layer it reads.
+///
+/// Logs one debug line for a box that declares a credentialed upstream. The
+/// line names the variables set, the box's network mode, the host kind and
+/// whether the lane is in effect, so a box that got no variables shows why.
 pub(crate) fn place_launch_proxy_env(
     attach_env: &mut AttachEnv,
-    session_id: boxes::SessionId,
+    record: &boxes::Record,
+    host: paths::HostKind,
     vars: &[(String, String)],
 ) {
-    if vars.is_empty() {
-        return;
-    }
     for (name, value) in vars {
         attach_env.connection.retain(|(k, _)| k != name);
         attach_env.connection.push((name.clone(), value.clone()));
     }
+    if record.policy.credentialed_upstream.is_none() {
+        return;
+    }
     let names: Vec<&str> = vars.iter().map(|(name, _)| name.as_str()).collect();
     tracing::debug!(
-        session_id = %session_id,
+        session_id = %record.id,
+        network = record.network.word(),
+        host_kind = host.tag(),
+        lane_in_effect = boxes::CredentialedUpstream::in_effect(record.network, host),
         variables = %names.join(","),
-        "set the proxy variables in the box environment"
+        "proxy variables for the box environment"
     );
+}
+
+/// The host kind a launch reads from this daemon's switch transport: a
+/// switch reached over the VM's host shuttle means this daemon runs inside
+/// a VM, and every other transport is a native host.
+pub(crate) fn host_kind_of(transport: crate::net::SwitchTransport) -> paths::HostKind {
+    match transport {
+        crate::net::SwitchTransport::HostShuttle { .. } => paths::HostKind::Minvmd,
+        crate::net::SwitchTransport::LocalSpawn => paths::HostKind::Minimald,
+    }
 }
 
 /// The host's half of the name lifecycle (NET-128): the registry and the
@@ -1273,6 +1299,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             host_ip_enforcement,
             listen_plan,
             start_gate,
+            pipes,
         } = tracing::Instrument::instrument(
             launcher.launch(
                 crate::guest::is_microvm_daemon(),
@@ -1338,6 +1365,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             // fd stays open and names the same PTY master until it is dropped.
             unsafe { AsyncFd::register(file) }?
         };
+        let pipes = pipes.map(HostPipes::new).transpose()?;
 
         let mut host = Host {
             receiver,
@@ -1350,6 +1378,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             pending_pty_err: None,
             kill_requested: false,
             master,
+            pipes,
             output_log,
             box_dir,
             // The launch decided the box's egress verdict posture before
@@ -1568,6 +1597,20 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             }
         };
 
+        // An entrypoint that ended before its run took the streams, as a
+        // fast one can, still has its output held in the pipes. The run can
+        // take it until the hold ends. A kill asked for the end, so no run
+        // waits on it.
+        if matches!(&result, Ok(exit) if !exit.requested) {
+            self.hold_output_after_exit().await;
+        }
+
+        // What the entrypoint wrote before it ended and the host did not
+        // read yet, to the log and to the run. Then the run's streams end.
+        if let Some(pipes) = self.pipes.as_mut() {
+            pipes.drain(&self.master, &mut self.output_log).await;
+        }
+
         // The box's host has exited (NET-128): mark the name stopped *before*
         // the forwards come down, so there is no window in which a lookup is
         // answered at a forward whose process is already dead. The name stays
@@ -1601,22 +1644,73 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
 
     /// Whether a kill from the daemon waits in the mailbox. Called once the
     /// process is reaped and the loop ends, so it drains the mailbox: the
-    /// loop takes no message after this, and the other messages drop as
-    /// they do when the host ends.
+    /// loop takes no message after this. A run that asked for the
+    /// entrypoint's streams gets them, and the other messages drop as they
+    /// do when the host ends.
     fn kill_queued(&mut self) -> bool {
         let mut killed = false;
         while let Ok(msg) = self.receiver.try_recv() {
-            if let Message::Kill(for_shutdown) = msg {
-                tracing::info!(
-                    session_id = %self.session_id,
-                    session = %self.session_name,
-                    for_shutdown,
-                    "session host killed on request; the process was already reaped",
-                );
-                killed = true;
+            match msg {
+                Message::Kill(for_shutdown) => {
+                    tracing::info!(
+                        session_id = %self.session_id,
+                        session = %self.session_name,
+                        for_shutdown,
+                        "session host killed on request; the process was already reaped",
+                    );
+                    killed = true;
+                }
+                Message::TakeEntrypointIo(reply) => self.answer_take_entrypoint_io(reply),
+                _ => {}
             }
         }
         killed
+    }
+
+    /// Hands the entrypoint's streams to the run that asked for them, or
+    /// says why it gets none: the entrypoint has a terminal, or another run
+    /// relays it.
+    fn answer_take_entrypoint_io(&mut self, reply: oneshot::Sender<EntrypointIoTake>) {
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the run may already be gone; the output then goes to the log only"
+        )]
+        let _ = reply.send(
+            self.pipes
+                .as_mut()
+                .map_or(EntrypointIoTake::OnTerminal, HostPipes::take_io),
+        );
+    }
+
+    /// Holds an ended entrypoint's output for the run that started it, when
+    /// the entrypoint ended before the run took its streams. The pipes keep
+    /// what it wrote. The hold ends when the run takes the streams, when a
+    /// kill arrives, or at the hold's deadline ([`pipes::FIRST_RELAY_WAIT`]
+    /// from the launch). The process is reaped already, so every other
+    /// message drops as it does when the host ends.
+    async fn hold_output_after_exit(&mut self) {
+        let Some(deadline) = self.pipes.as_ref().and_then(|p| p.first_relay_deadline) else {
+            return;
+        };
+        loop {
+            tokio::select! {
+                msg = self.receiver.recv() => match msg {
+                    Some(Message::TakeEntrypointIo(reply)) => {
+                        self.answer_take_entrypoint_io(reply);
+                        return;
+                    }
+                    Some(Message::Kill(_)) | None => return,
+                    Some(_) => {}
+                },
+                () = tokio::time::sleep_until(deadline) => {
+                    let session = self.session_name.clone();
+                    if let Some(pipes) = self.pipes.as_mut() {
+                        pipes.first_relay_missed(&session);
+                    }
+                    return;
+                }
+            }
+        }
     }
 
     /// Logs a pty-master failure and stashes it for [`Self::mainloop`] to hand
@@ -1729,6 +1823,15 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                 .unwrap_or_else(|| tokio::time::Instant::now() + self.output_stall_timeout)
         });
         let output_stall_deadline = self.output_stall_deadline;
+        // An entrypoint on pipes (T43): the host reads them only while it
+        // does not hold the output for the first run and the run's relay
+        // has room. Snapshotted, so no arm below borrows `self`.
+        let on_pipes = self.pipes.is_some();
+        let reads_pipes = self.pipes.as_ref().is_none_or(HostPipes::reads);
+        let stdout_open = self.pipes.as_ref().is_none_or(|p| !p.stdout_eof);
+        let stderr_fd = self.pipes.as_ref().and_then(HostPipes::stderr_to_read);
+        let full_relay = self.pipes.as_ref().and_then(HostPipes::full_relay);
+        let first_relay_deadline = self.pipes.as_ref().and_then(|p| p.first_relay_deadline);
         tokio::select! {
             // Read actor messages.
             Some(msg) = self.receiver.recv() => {
@@ -1808,6 +1911,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                     Message::GetScreen(s) => {
                         let _ = s.send(self.screen_snapshot());
                     }
+                    Message::TakeEntrypointIo(reply) => self.answer_take_entrypoint_io(reply),
                     // NET-045: forward the ask to the attached client, whose
                     // binding renders the exit prompt's own dialog. Nobody
                     // attached — no binding, or one whose mailbox is wedged —
@@ -1920,7 +2024,9 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
             },
             // Read from master - stdout of session process => ssh channel (if any).
             // Not while the binding's mailbox is full; see `stalled_binding`.
-            r = self.master.readable(), if stalled_binding.is_none() => {
+            // On pipes, not while the host holds or cannot relay the output,
+            // and not after EOF.
+            r = self.master.readable(), if stalled_binding.is_none() && reads_pipes && stdout_open => {
                 let mut guard = match r {
                     Ok(g) => g,
                     Err(e) => {
@@ -1931,14 +2037,25 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                     }
                 };
                 match guard.try_io(|fd| fd.get_ref().read(&mut self.stdout_buf)) {
-                    Ok(Ok(0)) => {},
+                    // A stdout pipe at EOF stays readable, so the host stops
+                    // reading it. The exit poll below sees the end.
+                    Ok(Ok(0)) => {
+                        if let Some(pipes) = self.pipes.as_mut() {
+                            pipes.stdout_eof = true;
+                        }
+                    },
                     Ok(Ok(n)) => {
                         let b = &self.stdout_buf[..n];
                         self.attrs.stdout_last = Some(SystemTime::now());
                         // The log first: a client is a second reader, and
                         // the log has these bytes whatever the client does.
                         self.output_log.write(b);
-                        self.parser.process(b);
+                        // A pipe is no terminal: its output goes to the run,
+                        // and no screen models it.
+                        match self.pipes.as_mut() {
+                            Some(pipes) => pipes.relay(PipeStream::Stdout, b),
+                            None => self.parser.process(b),
+                        }
                         // Never an awaited send: this arm runs only while the
                         // mailbox has a free slot, and nothing else fills it
                         // in between. What can fail is a binding whose task
@@ -1962,6 +2079,77 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                     Err(_would_block) => {},
                 }
             },
+            // The entrypoint's stderr, on pipes: to the log and to the run,
+            // as a stream of its own.
+            r = async {
+                match stderr_fd {
+                    Some(fd) => read_ready(fd).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match r {
+                    Ok(b) if !b.is_empty() => {
+                        self.attrs.stdout_last = Some(SystemTime::now());
+                        self.output_log.write(&b);
+                        if let Some(pipes) = self.pipes.as_mut() {
+                            pipes.relay(PipeStream::Stderr, &b);
+                        }
+                    }
+                    Ok(_) => {
+                        if let Some(pipes) = self.pipes.as_mut() {
+                            pipes.stderr_ended();
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            session_id = %self.session_id,
+                            error = %e,
+                            "the entrypoint's stderr could not be read; it is no longer read",
+                        );
+                        if let Some(pipes) = self.pipes.as_mut() {
+                            pipes.stderr_ended();
+                        }
+                    }
+                }
+            }
+            // A slot freed up in the run's full relay: wake the loop so the
+            // pipe reads re-arm. A run that went away is dropped.
+            reserved = async {
+                match full_relay.as_ref() {
+                    Some(tx) => tx.reserve().await.map(drop),
+                    None => std::future::pending().await,
+                }
+            } => {
+                if reserved.is_err()
+                    && let Some(pipes) = self.pipes.as_mut()
+                {
+                    pipes.relay_gone();
+                }
+            }
+            // No run took the entrypoint's streams in time.
+            _ = async {
+                match first_relay_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let session = self.session_name.clone();
+                if let Some(pipes) = self.pipes.as_mut() {
+                    pipes.first_relay_missed(&session);
+                }
+            }
+            // On pipes, nothing like a terminal's hangup reports the exit,
+            // so the loop wakes to let `run` check for it.
+            _ = tokio::time::sleep(PIPE_EXIT_POLL), if on_pipes => {}
+            // Input typed into a box that runs on pipes has no terminal to
+            // go to. Only a task run writes the entrypoint's stdin.
+            _ = std::future::ready(()), if on_pipes && self.stdin_buf.is_some() => {
+                tracing::debug!(
+                    session_id = %self.session_id,
+                    "dropped input for an entrypoint that runs without a terminal",
+                );
+                self.stdin_buf = None;
+            }
             // A slot freed up in the stalled binding's mailbox. The permit is
             // dropped at once; the point is to wake the loop so the pty read
             // arm re-arms.
@@ -2102,7 +2290,7 @@ impl<P: BoxProcess, G: BoxGuard> Host<P, G> {
                 }
             },
             // Write buffered keystrokes into the pty, if any,
-            w = self.master.writable(), if self.stdin_buf.is_some() => {
+            w = self.master.writable(), if self.stdin_buf.is_some() && !on_pipes => {
                 let mut guard = match w {
                     Ok(g) => g,
                     Err(e) => {
@@ -2346,7 +2534,7 @@ mod proxy_env_tests {
     use super::*;
     use boxes::core::bep::{BepSettings, Steering};
 
-    fn record(network: NetworkMode, bep: Option<BepSettings>) -> boxes::Record {
+    pub(super) fn record(network: NetworkMode, bep: Option<BepSettings>) -> boxes::Record {
         boxes::Record {
             id: boxes::SessionId::nil(),
             name: None,
@@ -2381,7 +2569,7 @@ mod proxy_env_tests {
         }
     }
 
-    fn steering(steering: Steering) -> BepSettings {
+    pub(super) fn steering(steering: Steering) -> BepSettings {
         BepSettings {
             steering: Some(steering),
             ..BepSettings::default()
@@ -2403,6 +2591,7 @@ mod proxy_env_tests {
         let vars = launch_proxy_env(
             &record(NetworkMode::OwnIp, Some(bep)),
             switch::DEFAULT_SUBNET,
+            paths::HostKind::Minimald,
         );
         assert_eq!(
             get(&vars, "HTTPS_PROXY"),
@@ -2430,6 +2619,7 @@ mod proxy_env_tests {
             let vars = launch_proxy_env(
                 &record(NetworkMode::OwnIp, Some(bep.clone())),
                 switch::DEFAULT_SUBNET,
+                paths::HostKind::Minimald,
             );
             assert_eq!(get(&vars, "NODE_USE_ENV_PROXY"), Some("1"), "{bep:?}");
         }
@@ -2441,17 +2631,24 @@ mod proxy_env_tests {
             let vars = launch_proxy_env(
                 &record(NetworkMode::OwnIp, Some(bep.clone())),
                 switch::DEFAULT_SUBNET,
+                paths::HostKind::Minimald,
             );
             assert!(vars.is_empty(), "{bep:?}: {vars:?}");
         }
         // No credentialed upstream, or a network mode with no lane.
         assert!(
-            launch_proxy_env(&record(NetworkMode::OwnIp, None), switch::DEFAULT_SUBNET).is_empty()
+            launch_proxy_env(
+                &record(NetworkMode::OwnIp, None),
+                switch::DEFAULT_SUBNET,
+                paths::HostKind::Minimald,
+            )
+            .is_empty()
         );
         assert!(
             launch_proxy_env(
                 &record(NetworkMode::HostNet, Some(steering(Steering::ProxyEnv))),
                 switch::DEFAULT_SUBNET,
+                paths::HostKind::Minimald,
             )
             .is_empty()
         );
@@ -2468,12 +2665,11 @@ mod proxy_env_tests {
                     "http://elsewhere:3128".to_string(),
                 ),
             ],
+            entrypoint: vec![],
         };
-        let vars = launch_proxy_env(
-            &record(NetworkMode::OwnIp, Some(steering(Steering::ProxyEnv))),
-            switch::DEFAULT_SUBNET,
-        );
-        place_launch_proxy_env(&mut attach_env, boxes::SessionId::nil(), &vars);
+        let laned = record(NetworkMode::OwnIp, Some(steering(Steering::ProxyEnv)));
+        let vars = launch_proxy_env(&laned, switch::DEFAULT_SUBNET, paths::HostKind::Minimald);
+        place_launch_proxy_env(&mut attach_env, &laned, paths::HostKind::Minimald, &vars);
         let kept = place_launch_deliveries(&mut attach_env, boxes::SessionId::nil(), &[]);
         assert_eq!(
             kept.get("HTTPS_PROXY").map(String::as_str),

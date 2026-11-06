@@ -231,6 +231,10 @@ fn ready_entrypoint_exit(
     Some(ready)
 }
 
+/// How long the actor waits for the exit of a host whose mailbox is already
+/// closed. The loop drops its mailbox a moment before its task returns.
+const EXIT_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The exit `watch` receives, or never when nothing is watched.
 async fn next_entrypoint_exit(
     watch: &mut Option<EntrypointWatch>,
@@ -663,6 +667,14 @@ pub struct BoxActor {
     /// end the box. `None` before the first launch and after the watch fired.
     entrypoint_watch: Option<EntrypointWatch>,
 
+    /// Set while a message runs whose wait for the entrypoint's exit did
+    /// not settle: the closed host's exit did not come within
+    /// [`EXIT_SETTLE_TIMEOUT`], or its loop ended with no exit to read.
+    /// The box may be ending, so [`Self::ensure_host`] refuses and launches
+    /// nothing: a launch could run an `until_complete` entrypoint a second
+    /// time (BOX-038).
+    exit_unsettled: bool,
+
     /// Whether this daemon opted out of the deny-all egress default
     /// (NET-077), threaded from the server config: the launcher resolves
     /// this session's effective egress (NET-074) against it, and the task
@@ -760,6 +772,7 @@ impl BoxActor {
             held_spec: None,
             // No launch yet, so no loop to watch.
             entrypoint_watch: None,
+            exit_unsettled: false,
             // Forwards are registered as their channels open; a session
             // starts with none.
             forwards: Vec::new(),
@@ -1054,6 +1067,9 @@ impl BoxActor {
         self.destroying.cancel();
         drop(hook_slot);
         self.stop_running(false).await;
+        // The box's entrypoint has ended for good, so no in-box run reads
+        // its recorded names again.
+        entrypoint_env::forget(self.record.id());
         // Withdraw the hostname before the fallible record delete, so
         // a delete failure leaves a stale on-disk record (repairable
         // on restart) but never a stale routing entry pointing at a
@@ -1330,14 +1346,7 @@ impl BoxActor {
         // filed with no spec (a client that predates it, the dashboard
         // create) has only its Box Type to go by, and a session has a
         // terminal.
-        let pty = match &stored {
-            Some(bytes) => box_runtime::stored_spec_sets_pty(bytes),
-            None => record
-                .box_type
-                .as_deref()
-                .is_none_or(|box_type| box_type == boxes::SESSION_BOX_TYPE),
-        };
-        if !pty {
+        if !crate::box_manager::record_has_pty(&record, stored.as_deref()) {
             tracing::info!(
                 refusal = "terminal",
                 "resume: the box spec sets no terminal"
@@ -1509,6 +1518,41 @@ impl BoxActor {
         outcome
     }
 
+    /// The exit the watch holds before a message runs, as
+    /// [`ready_entrypoint_exit`] reads it. When the watched host already
+    /// closed its mailbox, its loop is about to return, so this waits for
+    /// that exit (bounded by [`EXIT_SETTLE_TIMEOUT`]). Otherwise an exec
+    /// queued beside the exit finds no live host and launches the
+    /// entrypoint again (BOX-038).
+    ///
+    /// A wait that does not settle sets [`Self::exit_unsettled`]: on a
+    /// timeout, which keeps the watch for the mainloop to read the exit
+    /// later, and on a loop that ended with no exit to read.
+    async fn settled_entrypoint_exit(&mut self) -> Option<Option<box_runtime::HostExit>> {
+        if let Some(exit) = ready_entrypoint_exit(&mut self.entrypoint_watch) {
+            self.exit_unsettled = exit.is_none();
+            return Some(exit);
+        }
+        if self.has_live_host() {
+            return None;
+        }
+        let watch = self.entrypoint_watch.as_mut()?;
+        let settle = EXIT_SETTLE_TIMEOUT;
+        #[cfg(test)]
+        let settle = exit_settle_seam::settle_timeout(self.record.id()).unwrap_or(settle);
+        let Ok(exit) = tokio::time::timeout(settle, watch).await else {
+            tracing::warn!(
+                box_id = %self.record.id(),
+                "the closed host's exit did not come in time; a launch for this message is refused"
+            );
+            self.exit_unsettled = true;
+            return None;
+        };
+        self.entrypoint_watch = None;
+        self.exit_unsettled = exit.is_err();
+        Some(exit.ok())
+    }
+
     /// The async task which handles interactions with the session.
     ///
     /// On an actor-initiated termination (abort, failed verdict resume) the
@@ -1534,8 +1578,9 @@ impl BoxActor {
                     // finds the box exited: an attach resumes it, and an
                     // exec is refused.
                     let mut ended = None;
+                    self.exit_unsettled = false;
                     if !goes_before_exit(&queued.0)
-                        && let Some(exit) = ready_entrypoint_exit(&mut self.entrypoint_watch)
+                        && let Some(exit) = self.settled_entrypoint_exit().await
                     {
                         if let Some(exit) = exit
                             && let ControlFlow::Break(t) = self.end_on_entrypoint_return(exit).await
@@ -1570,9 +1615,11 @@ impl BoxActor {
                 parent_span_id = tracing::field::Empty,
             );
             crate::exec::adopt_trace(&span, caller);
-            if let ControlFlow::Break(t) =
-                tracing::Instrument::instrument(self.handle_message(msg), span).await
-            {
+            let handled = tracing::Instrument::instrument(self.handle_message(msg), span).await;
+            // The refusal holds for the one message that found the wait
+            // unsettled.
+            self.exit_unsettled = false;
+            if let ControlFlow::Break(t) = handled {
                 teardown = t;
                 break;
             }
@@ -2212,6 +2259,49 @@ pub(crate) mod exit_record_seam {
             }
             _ => false,
         }
+    }
+}
+
+/// The test seam for an exit that does not settle (BOX-038): a test names
+/// a box whose watched host loop holds its exit back for a while, and
+/// whose actor waits a short time for that exit. Keyed by box id, so tests
+/// running beside each other never hold each other's exits.
+#[cfg(test)]
+pub(crate) mod exit_settle_seam {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use boxes::SessionId;
+
+    /// For each box: how long its exit is held, and how long its actor
+    /// waits for the exit.
+    static HELD: Mutex<Option<HashMap<SessionId, (Duration, Duration)>>> = Mutex::new(None);
+
+    /// Holds the exit of every host loop of box `id` for `hold`, and makes
+    /// its actor wait `settle` for it.
+    pub(crate) fn hold_exit(id: SessionId, hold: Duration, settle: Duration) {
+        HELD.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(id, (hold, settle));
+    }
+
+    fn get(id: &SessionId) -> Option<(Duration, Duration)> {
+        HELD.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|held| held.get(id).copied())
+    }
+
+    /// How long the exit of box `id` is held.
+    pub(super) fn held(id: &SessionId) -> Option<Duration> {
+        get(id).map(|(hold, _)| hold)
+    }
+
+    /// How long the actor of box `id` waits for a closed host's exit.
+    pub(super) fn settle_timeout(id: &SessionId) -> Option<Duration> {
+        get(id).map(|(_, settle)| settle)
     }
 }
 

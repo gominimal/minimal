@@ -36,7 +36,8 @@
 //! Every negative — NODATA and NXDOMAIN — is a negative the answerer is
 //! authoritative for, so it carries the zone's SOA in the reply's
 //! authority section for the host resolver to cache (NET-124, RFC 2308);
-//! REFUSED, a namespace that is not ours, carries nothing. The SOA, and
+//! REFUSED, a namespace that is not ours, carries nothing. The relays that
+//! answer an out-of-zone name NXDOMAIN cite [`out_of_zone_soa`]. The SOA, and
 //! the records the A answers come in, are wire things: the answerer that
 //! calls this decision builds them, at a TTL of at most
 //! [`ANSWER_TTL_SECS`] (NET-126).
@@ -280,6 +281,53 @@ pub fn decide(lookup: &Lookup, view: &ZoneView) -> Verdict {
     }
 }
 
+/// The fields of the SOA record that an NXDOMAIN for a name outside the
+/// box zone cites in its authority section (NET-141, NET-079). The owner is
+/// the root, `.`, so the record covers every name it can be cited for. A
+/// resolver caches the negative for the lesser of `ttl` and `minimum`
+/// (RFC 2308), and both are [`ANSWER_TTL_SECS`], so a refused name is
+/// cached no longer than a positive zone answer. The other timers are inert
+/// (there are no secondaries) and carry the same value, so no number on
+/// the wire exceeds the ceiling. Names are absolute, with the root dot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutOfZoneSoa {
+    /// The record's owner: the root, `.`.
+    pub owner: &'static str,
+    /// The primary name server the record names.
+    pub mname: &'static str,
+    /// The responsible mailbox the record names, in DNS form.
+    pub rname: &'static str,
+    /// The zone serial. Constant: nothing transfers the zone.
+    pub serial: u32,
+    /// The refresh timer, in seconds.
+    pub refresh: u32,
+    /// The retry timer, in seconds.
+    pub retry: u32,
+    /// The expire timer, in seconds.
+    pub expire: u32,
+    /// The negative-caching minimum, in seconds.
+    pub minimum: u32,
+    /// The TTL of the SOA record itself, in seconds.
+    pub ttl: u32,
+}
+
+/// The one SOA that every out-of-zone NXDOMAIN cites, the relay's and the
+/// in-VM listener's alike (NET-141, NET-079). See [`OutOfZoneSoa`].
+#[must_use]
+pub const fn out_of_zone_soa() -> OutOfZoneSoa {
+    OutOfZoneSoa {
+        owner: ".",
+        mname: "ns.min.internal.",
+        rname: "hostmaster.min.internal.",
+        serial: 1,
+        refresh: ANSWER_TTL_SECS,
+        retry: ANSWER_TTL_SECS,
+        expire: ANSWER_TTL_SECS,
+        minimum: ANSWER_TTL_SECS,
+        ttl: ANSWER_TTL_SECS,
+    }
+}
+
 /// The canonical form of a zone name: lower-case, no root dot — the form
 /// the view holds names in and the decision compares. DNS names are
 /// case-insensitive, and the wire renders them as FQDNs with the root dot
@@ -304,8 +352,8 @@ fn in_zone(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        HOST_ROW_LABEL, HOST_ROW_NAME, Lookup, NODE_ROW_LABEL, Origin, RecordType, Verdict,
-        ZONE_APEX, ZoneRow, ZoneView, decide, in_zone, normalize,
+        ANSWER_TTL_SECS, HOST_ROW_LABEL, HOST_ROW_NAME, Lookup, NODE_ROW_LABEL, Origin, RecordType,
+        Verdict, ZONE_APEX, ZoneRow, ZoneView, decide, in_zone, normalize, out_of_zone_soa,
     };
 
     /// An A lookup for `name` from this machine.
@@ -527,5 +575,35 @@ mod tests {
             "minimald.min.internal",
             "the managed node's label under the apex spells its zone name"
         );
+    }
+    /// The SOA an out-of-zone NXDOMAIN cites (NET-141, NET-079) is owned by
+    /// the root and caches the negative no longer than a positive answer.
+    #[test]
+    fn out_of_zone_soa_is_root_owned_with_zone_minimum() {
+        let soa = out_of_zone_soa();
+        assert_eq!(
+            soa.owner, ".",
+            "the root owns the record, so it covers any name"
+        );
+        assert_eq!(soa.minimum, 15, "the negative-caching minimum is 15 s");
+        assert_eq!(soa.ttl, 15, "the record TTL is 15 s");
+        assert_eq!(
+            soa.minimum, ANSWER_TTL_SECS,
+            "the minimum is the zone's answer TTL"
+        );
+        assert_eq!(
+            soa.ttl, ANSWER_TTL_SECS,
+            "the record TTL is the zone's answer TTL"
+        );
+        for (field, value) in [
+            ("refresh", soa.refresh),
+            ("retry", soa.retry),
+            ("expire", soa.expire),
+        ] {
+            assert!(value <= ANSWER_TTL_SECS, "{field} exceeds the TTL ceiling");
+        }
+        for name in [soa.owner, soa.mname, soa.rname] {
+            assert!(name.ends_with('.'), "{name} is absolute");
+        }
     }
 }

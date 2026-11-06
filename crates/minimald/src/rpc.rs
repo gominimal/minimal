@@ -1619,6 +1619,27 @@ async fn serve_prune_boxes(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<()
         .await
 }
 
+/// `PreviewPrune`: every stopped or exited box that a `PruneBoxes` with
+/// the request's selectors reaps, with the disk each one holds. It reaps
+/// none (BOX-021).
+async fn serve_preview_prune(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    minimald_rpc::PreviewPrune
+        .handle_channel(c, async |req: minimald_rpc::PruneBoxesRequest| {
+            let mngr = s.sessions_manager().await;
+            let older_than = req.older_than_secs.map(std::time::Duration::from_secs);
+            Ok(match mngr.preview_prune(older_than, req.parent).await {
+                Ok(reply) => Errorable::Ok(reply),
+                Err(e) => Errorable::Err {
+                    error: format!("The box records could not be read: {e}"),
+                },
+            })
+        })
+        .await
+}
+
 /// `ListBoxes`: every retained box record on this host, in any state,
 /// optionally scoped to one project root (BOX-158).
 async fn serve_list_boxes(s: ServerStateHandle, c: RuChannel<Msg>) -> Result<(), ConnectionError> {
@@ -3494,6 +3515,7 @@ pub async fn handle_ssh_rpc(
         | StopExec::NAME
         | minimald_rpc::ReapBox::NAME
         | minimald_rpc::PruneBoxes::NAME
+        | minimald_rpc::PreviewPrune::NAME
         | minimald_rpc::ListBoxes::NAME
         | minimald_rpc::ShowBox::NAME
         | Shutdown::NAME
@@ -3580,6 +3602,7 @@ pub async fn handle_ssh_rpc(
         StopExec::NAME => serve!(serve_stop_exec(s, channel)),
         minimald_rpc::ReapBox::NAME => serve!(serve_reap_box(s, channel)),
         minimald_rpc::PruneBoxes::NAME => serve!(serve_prune_boxes(s, channel)),
+        minimald_rpc::PreviewPrune::NAME => serve!(serve_preview_prune(s, channel)),
         minimald_rpc::ListBoxes::NAME => serve!(serve_list_boxes(s, channel)),
         minimald_rpc::ShowBox::NAME => serve!(serve_show_box(s, channel)),
         Shutdown::NAME => serve!(serve_shutdown(s, channel)),
