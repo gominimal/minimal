@@ -593,6 +593,40 @@ pub(crate) fn render_steering_fence(address: Ipv4Addr, port: u16, leaf: &Path) -
     )
 }
 
+/// The `nft -f` script that fences the steering answerer at
+/// `address`:`port` to no leaf at all: every socket's packet to it is
+/// counted, logged at a bounded rate and rejected (BEP-086). The plan sets
+/// it as soon as the answerer binds, so nothing reaches the answerer before
+/// attach knows the box's leaf and replaces it with
+/// [`render_steering_fence`].
+#[must_use]
+pub(crate) fn render_steering_closed_fence(address: Ipv4Addr, port: u16) -> String {
+    let chain = steering_fence_chain(address);
+    let to_answerer = format!("ip daddr {address} meta l4proto {{ tcp, udp }} th dport {port}");
+    format!(
+        "add table inet {TABLE_NAME}\n\
+         add chain inet {TABLE_NAME} {chain} {{ type filter hook output priority filter; policy accept; }}\n\
+         flush chain inet {TABLE_NAME} {chain}\n\
+         add rule inet {TABLE_NAME} {chain} {to_answerer} counter limit rate 1/second burst 4 packets \
+         log prefix \"minimal-classifier: refused \" level warn\n\
+         add rule inet {TABLE_NAME} {chain} {to_answerer} reject with icmpx admin-prohibited\n"
+    )
+}
+
+/// Closes the steering answerer at `address`:`port` to every leaf, until
+/// [`fence_steering_answerer`] admits the box's own.
+///
+/// # Errors
+///
+/// `nft` refuses the fence.
+pub(crate) async fn close_steering_answerer(
+    nft: &Path,
+    address: Ipv4Addr,
+    port: u16,
+) -> std::io::Result<()> {
+    run_nft_script(nft, &render_steering_closed_fence(address, port)).await
+}
+
 /// The `nft -f` script that removes the fence of the steering answerer at
 /// `address`.
 #[must_use]
@@ -620,6 +654,20 @@ pub(crate) fn unified_cgroup_path(text: &str) -> Option<PathBuf> {
 pub(crate) fn is_box_leaf(rel: &Path) -> bool {
     let mut parts = rel.components().map(|part| part.as_os_str().to_owned());
     parts.any(|part| part == sandbox::classifier::BOXES_DIR) && parts.next().is_some()
+}
+
+/// Whether `rel`, a leaf path that a fence writes into an `nft` script
+/// between double quotes, holds only characters that cannot end the quote
+/// or the line: ASCII letters, digits, and `.`, `_`, `-`, `@`, `:`, `+`
+/// and `/`.
+#[must_use]
+pub(crate) fn is_safe_leaf_path(rel: &Path) -> bool {
+    rel.to_str().is_some_and(|text| {
+        !text.is_empty()
+            && text
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-@:+/".contains(&b))
+    })
 }
 
 /// How many times a fence reads the box's cgroup before it gives up, and
@@ -702,7 +750,8 @@ pub(crate) async fn run_nft_script(nft: &Path, script: &str) -> std::io::Result<
 ///
 /// # Errors
 ///
-/// The process's leaf cannot be read, or `nft` refuses the fence.
+/// The process's leaf cannot be read, its path holds a character that
+/// [`is_safe_leaf_path`] refuses, or `nft` refuses the fence.
 pub(crate) async fn fence_steering_answerer(
     nft: &Path,
     address: Ipv4Addr,
@@ -710,6 +759,12 @@ pub(crate) async fn fence_steering_answerer(
     pid: u32,
 ) -> std::io::Result<PathBuf> {
     let leaf = box_leaf_of(pid).await?;
+    if !is_safe_leaf_path(&leaf) {
+        return Err(std::io::Error::other(format!(
+            "process {pid}'s box leaf {:?} holds a character an nft script cannot carry",
+            leaf.display().to_string()
+        )));
+    }
     run_nft_script(nft, &render_steering_fence(address, port, &leaf)).await?;
     tracing::info!(
         leaf = %leaf.display(),
@@ -9693,6 +9748,19 @@ mod tests {
             assert!(!is_box_leaf(Path::new(outside)), "{outside}");
         }
         assert_eq!(unified_cgroup_path("1:name=systemd:/x\n"), None);
+        assert!(is_safe_leaf_path(&leaf));
+        for unsafe_leaf in [
+            "minimald.slice/boxes/allow/a\"b",
+            "minimald.slice/boxes/allow/a\nadd rule",
+            "minimald.slice/boxes/allow/a b",
+            "minimald.slice/boxes/allow/a;b",
+            "",
+        ] {
+            assert!(
+                !is_safe_leaf_path(Path::new(unsafe_leaf)),
+                "{unsafe_leaf:?}"
+            );
+        }
 
         let address = Ipv4Addr::new(127, 53, 0, 7);
         let fence = render_steering_fence(address, 53, &leaf);
@@ -9720,6 +9788,23 @@ mod tests {
         assert!(
             fence.contains(&format!("flush chain inet {TABLE_NAME} {chain}\n")),
             "a second fence replaces the first: {fence}"
+        );
+        // Before attach knows the leaf, the answerer is closed to every
+        // leaf, in the same chain the fence later replaces.
+        let closed = render_steering_closed_fence(address, 53);
+        let closed_rules: Vec<&str> = closed
+            .lines()
+            .filter(|line| line.starts_with(&format!("add rule inet {TABLE_NAME} {chain} ")))
+            .collect();
+        assert_eq!(closed_rules.len(), 2, "{closed}");
+        assert!(!closed.contains("return"), "{closed}");
+        assert!(
+            closed_rules[1].ends_with(&format!("{to_answerer} reject with icmpx admin-prohibited")),
+            "{closed}"
+        );
+        assert!(
+            closed.contains(&format!("flush chain inet {TABLE_NAME} {chain}\n")),
+            "{closed}"
         );
         assert_eq!(
             render_steering_unfence(address),

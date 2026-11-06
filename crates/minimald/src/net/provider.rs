@@ -661,7 +661,6 @@ impl Default for SteeringSeams {
 /// teardown.
 struct SteeringGuard {
     answerer: Option<crate::net::dns::SteeringAnswerer>,
-    fenced: bool,
     nft: std::path::PathBuf,
 }
 
@@ -673,14 +672,9 @@ impl NetGuard for SteeringGuard {
             let Some(answerer) = self.answerer else {
                 return;
             };
-            if self.fenced {
-                crate::net::classifier::unfence_steering_answerer(
-                    &self.nft,
-                    *answerer.bound().ip(),
-                )
-                .await;
-            }
+            let address = *answerer.bound().ip();
             drop(answerer);
+            crate::net::classifier::unfence_steering_answerer(&self.nft, address).await;
         })
     }
 }
@@ -810,7 +804,26 @@ impl Network for HostIpAddressNetwork {
                          lookups to the Box Egress Proxy: {error}"
                     )))
                 })?;
-            let address = *answerer.bound().ip();
+            let bound = answerer.bound();
+            // Fail closed: until attach knows the box's leaf, no leaf
+            // reaches the answerer. A box whose answerer cannot be closed
+            // is not started.
+            if let Err(error) = crate::net::classifier::close_steering_answerer(
+                &self.seams.nft,
+                *bound.ip(),
+                bound.port(),
+            )
+            .await
+            {
+                drop(answerer);
+                crate::net::classifier::unfence_steering_answerer(&self.seams.nft, *bound.ip())
+                    .await;
+                return Err(NetworkError::new(std::io::Error::other(format!(
+                    "cannot keep other processes away from the DNS answerer that sends \
+                     this box's GitHub lookups to the Box Egress Proxy: {error}"
+                ))));
+            }
+            let address = *bound.ip();
             *self
                 .answerer
                 .lock()
@@ -821,9 +834,9 @@ impl Network for HostIpAddressNetwork {
 
     /// Fences the steering answerer the plan started to the box's own
     /// leaf (BEP-086), and hands both to the guard. A box with no answerer
-    /// needs no wiring. A fence that cannot be set is logged, and the box
-    /// goes on: its own lookups are steered either way, and only another
-    /// process that asks the answerer's address by hand is not refused.
+    /// needs no wiring. A fence that cannot be set fails the attach: the
+    /// answerer stops and its closed fence goes, so no other process of
+    /// the guest can use it as a relay or read the box's steered answers.
     fn attach(&self, spawned: Spawned) -> AttachFuture<'_> {
         Box::pin(async move {
             let answerer = self
@@ -831,44 +844,48 @@ impl Network for HostIpAddressNetwork {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
-            let mut fenced = false;
-            if let Some(answerer) = &answerer {
-                let bound = answerer.bound();
-                match crate::net::classifier::fence_steering_answerer(
+            if let Some(bound) = answerer
+                .as_ref()
+                .map(crate::net::dns::SteeringAnswerer::bound)
+                && let Err(error) = crate::net::classifier::fence_steering_answerer(
                     &self.seams.nft,
                     *bound.ip(),
                     bound.port(),
                     spawned.netns_pid(),
                 )
                 .await
-                {
-                    Ok(_) => fenced = true,
-                    Err(error) => tracing::warn!(
-                        %bound,
-                        %error,
-                        "cannot fence a host-address box's steering answerer to the box's \
-                         own leaf; other processes in the guest are not refused it"
-                    ),
-                }
+            {
+                drop(answerer);
+                crate::net::classifier::unfence_steering_answerer(&self.seams.nft, *bound.ip())
+                    .await;
+                return Err(NetworkError::new(std::io::Error::other(format!(
+                    "cannot limit the DNS answerer that sends this box's GitHub lookups \
+                     to the Box Egress Proxy to this box alone: {error}"
+                ))));
             }
             Ok(Box::new(SteeringGuard {
                 answerer,
-                fenced,
                 nft: self.seams.nft.clone(),
             }) as Box<dyn NetGuard>)
         })
     }
 
-    /// Stops the steering answerer the plan started, when no attach
-    /// follows.
+    /// Stops the steering answerer the plan started, and removes its
+    /// closed fence, when no attach follows.
     fn abandon(&self) -> AbandonFuture<'_> {
         let answerer = self
             .answerer
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        drop(answerer);
-        Box::pin(std::future::ready(()))
+        Box::pin(async move {
+            let Some(answerer) = answerer else {
+                return;
+            };
+            let address = *answerer.bound().ip();
+            drop(answerer);
+            crate::net::classifier::unfence_steering_answerer(&self.seams.nft, address).await;
+        })
     }
 }
 
@@ -1944,10 +1961,26 @@ mod tests {
                 port: 0,
                 upstream: Some(upstream),
                 listener: Some(listener.clone()),
-                nft: std::path::PathBuf::from("/nonexistent/nft"),
+                nft: stand_in_nft("nft", "cat > /dev/null\n"),
             },
             answerer: std::sync::Mutex::new(None),
         }
+    }
+
+    /// A stand-in `nft` called `name` that runs `body` as a shell script,
+    /// in a scratch dir that lives as long as the test binary.
+    fn stand_in_nft(name: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        let dir = DIR.get_or_init(|| tempfile::tempdir().expect("a scratch dir"));
+        let path = dir.path().join(name);
+        if !path.exists() {
+            let staged = dir.path().join(format!(".{name}.{}", std::process::id()));
+            std::fs::write(&staged, format!("#!/bin/sh\n{body}")).unwrap();
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::rename(&staged, &path).unwrap();
+        }
+        path
     }
 
     /// The real address the stand-in for the node's resolver gives every
@@ -2115,12 +2148,55 @@ mod tests {
             );
             assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), before + 1);
 
+            // A datagram the answerer cannot read never reaches real DNS.
+            let steering_plan = crate::net::dns::SteeringPlan::new(
+                "grant-box",
+                ["github.com"],
+                proxy,
+                listener.clone(),
+                upstream,
+            );
+            assert_eq!(
+                steering_plan.verdict(b"\x00\x01not a dns message"),
+                crate::net::dns::SteeringVerdict::Drop
+            );
+            assert_eq!(
+                steering_plan.verdict(&vec![0u8; 5000]),
+                crate::net::dns::SteeringVerdict::Drop
+            );
+
             net.abandon().await;
             assert!(
                 net.answerer.lock().unwrap().is_none(),
                 "abandon stops the answerer"
             );
         }
+
+        // Fail closed: an answerer that cannot be closed to other leaves
+        // starts no box.
+        let listener = crate::net::dns::ProxyListenerState::down();
+        let mut net = host_ip_network(&switch, Some(grant_policy(None)), upstream, &listener);
+        net.seams.nft = stand_in_nft("refusing", "cat > /dev/null\nexit 1\n");
+        assert!(
+            net.plan().await.is_err(),
+            "a refused closed fence fails the plan"
+        );
+        assert!(net.answerer.lock().unwrap().is_none());
+
+        // Fail closed: a fence that cannot admit the box's own leaf fails
+        // the attach, and the answerer stops.
+        let net = host_ip_network(&switch, Some(grant_policy(None)), upstream, &listener);
+        net.plan()
+            .await
+            .expect("the steered plan starts its answerer");
+        assert!(
+            net.attach(Spawned::new(u32::MAX)).await.is_err(),
+            "a process with no box leaf cannot be fenced"
+        );
+        assert!(
+            net.answerer.lock().unwrap().is_none(),
+            "a failed attach stops the answerer"
+        );
 
         // The plan the launch builds through `network_for` reads the same
         // policy: a grant box gets a seed, a plain box none.

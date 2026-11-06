@@ -4226,6 +4226,10 @@ pub(crate) enum SteeringVerdict {
     /// Send the datagram to the node's resolver unchanged, and relay its
     /// reply.
     Forward,
+    /// Send nothing anywhere. The datagram is too large or cannot be read,
+    /// so the answerer cannot tell whether it asks a steered name, and it
+    /// never reaches real DNS. The box's resolver gets no reply.
+    Drop,
 }
 
 /// A DNS name lowercased, with no root dot: `github.com` for `GitHub.com.`.
@@ -4261,7 +4265,8 @@ impl SteeringPlan {
 
     /// The verdict for one datagram from the box, with the same rules as
     /// the switch's DNS gate for an `own_ip` box (BEP-062, BEP-078). A
-    /// datagram that is not a standard query, or that asks no steered name,
+    /// datagram that is too large or cannot be read is dropped. A datagram
+    /// that is not a standard query, or that asks no steered name,
     /// is forwarded. A query that mixes a steered name with another name is
     /// answered SERVFAIL, so the steered name never reaches real DNS. A
     /// query of steered names with no A question and an AAAA, HTTPS or SVCB
@@ -4273,11 +4278,13 @@ impl SteeringPlan {
         use hickory_proto::op::{Message, MessageType, Metadata, OpCode, ResponseCode};
         use hickory_proto::rr::{RData, Record, RecordType};
 
+        // Fail closed: a datagram the answerer cannot read can hide a
+        // steered name, so it never reaches the node's resolver.
         if datagram.len() > STEERING_MAX_DATAGRAM {
-            return SteeringVerdict::Forward;
+            return SteeringVerdict::Drop;
         }
         let Ok(query) = Message::from_vec(datagram) else {
-            return SteeringVerdict::Forward;
+            return SteeringVerdict::Drop;
         };
         if query.metadata.message_type != MessageType::Query
             || query.metadata.op_code != OpCode::Query
@@ -4298,7 +4305,7 @@ impl SteeringPlan {
             }
             reply
                 .to_vec()
-                .map_or(SteeringVerdict::Forward, SteeringVerdict::Answer)
+                .map_or(SteeringVerdict::Drop, SteeringVerdict::Answer)
         };
         if query.queries.iter().any(|q| !self.steers(q)) {
             tracing::debug!(
@@ -4461,6 +4468,15 @@ async fn serve_steering(socket: std::sync::Arc<tokio::net::UdpSocket>, plan: Ste
                         "could not send a steering answerer's reply"
                     );
                 }
+            }
+            SteeringVerdict::Drop => {
+                tracing::debug!(
+                    component = STEERING_COMPONENT,
+                    box_name = %plan.box_label,
+                    %peer,
+                    len,
+                    "dropped a lookup at a steering answerer: it is too large or cannot be read"
+                );
             }
             SteeringVerdict::Forward => {
                 let Ok(permit) = std::sync::Arc::clone(&in_flight).try_acquire_owned() else {
