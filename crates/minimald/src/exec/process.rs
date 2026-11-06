@@ -797,6 +797,8 @@ impl Process for TaskProcess {
         match self {
             TaskProcess::Sandbox(p) => p.exit_notice(),
             TaskProcess::Echo(p) => p.exit_notice(),
+            TaskProcess::Entrypoint(p) => p.exit_notice(),
+            TaskProcess::Refused(p) => p.exit_notice(),
         }
     }
 }
