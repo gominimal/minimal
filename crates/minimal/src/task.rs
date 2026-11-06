@@ -247,19 +247,28 @@ fn refuse_terminal_entry(file: Option<&mfile::File>, entry: &str) -> Result<(), 
     Ok(())
 }
 
-/// Detaches a run from the box it started (BCLI-010 `--detach`): closes
-/// the box's stdin, lets the channel go and prints only the box's id on
-/// `out`. The entrypoint runs on without a client, and the box's log keeps
+/// Detaches a run from the box it started (BCLI-010 `--detach`): prints
+/// only the box's id on `out`, closes the box's stdin and lets the channel
+/// go. The entrypoint runs on without a client, and the box's log keeps
 /// its output.
+///
+/// The id goes out first, because the entrypoint already runs: a later
+/// failure must not leave a running box whose id nobody saw. A failure to
+/// close stdin or the channel after that is logged, not fatal. Dropping the
+/// channel and the connection closes both anyway.
 pub(crate) async fn detach_run(
     channel: russh::Channel<russh::client::Msg>,
     id: boxes::SessionId,
     out: &mut impl std::io::Write,
 ) -> Result<(), anyhow::Error> {
-    channel.eof().await.context("close the box's stdin")?;
-    channel.close().await.context("leave the box's run")?;
     writeln!(out, "{id}").context("write the box id")?;
     out.flush().context("write the box id")?;
+    if let Err(e) = channel.eof().await {
+        tracing::warn!(box_id = %id, error = %e, "detached run: closing the box's stdin failed");
+    }
+    if let Err(e) = channel.close().await {
+        tracing::warn!(box_id = %id, error = %e, "detached run: leaving the box's run failed");
+    }
     Ok(())
 }
 
