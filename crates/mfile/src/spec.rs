@@ -73,6 +73,10 @@ pub struct BoxSpec {
     /// Whether a resume of the box runs its `on_activate` hooks again
     /// (BOX-028). Serialized as `execution.hooks_on_resume`, and left out
     /// when `false`.
+    ///
+    /// The spec stores and round-trips this value, but the daemon does not
+    /// read this key yet. See <https://github.com/gominimal/minimal/issues/3111>,
+    /// the task that makes the daemon read it (BOX-028).
     pub hooks_on_resume: bool,
     /// The box's network settings.
     pub network: SpecNetwork,
