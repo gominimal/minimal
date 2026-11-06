@@ -16066,9 +16066,11 @@ print(rcode, an, addr)' "$dq_b64"
 # sign-in. A `host_ip` box takes no narrowing allow list, so the boxes here
 # declare no egress flags. On a failure each case prints `min box audit` for
 # each box it started and the proxy's log lines that name the box.
+# #2500 (https://github.com/gominimal/minimal/issues/2500) owns the macOS lane
+# that runs them.
 BEP_HI_PROXY_IP=100.64.255.252
 BEP_HI_PROXY_PORT=8118
-BEP_HI_CASE="" BEP_HI_SIDS=""
+BEP_HI_CASE="" BEP_HI_SIDS="" BEP_HI_PUSHED=""
 
 # The proxy's debug records name each box connection. A daemon that runs
 # without them restarts in bep_live_gate. The debug directive follows
@@ -16088,16 +16090,28 @@ bep_hi_debug_log() {
 # Prints the evidence for each box this case started: its `min box audit`
 # records, and the proxy's log lines that name its id.
 bep_hi_evidence() {
-  local ev_sid ev_log="$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log"
+  local ev_sid ev_lines ev_log="$XDG_STATE_HOME/minimal/providers/local-minvmd0/bep.log"
   for ev_sid in $BEP_HI_SIDS; do
     echo "--- min box audit $ev_sid ---"
     mnl box audit "$ev_sid" -o jsonl </dev/null 2>&1 | tail -40 || true
     echo "--- bep.log lines for $ev_sid (tail) ---"
-    grep -hF -- "$ev_sid" "$ev_log" 2>/dev/null | tail -40 || echo "(none)"
+    ev_lines="$(grep -hF -- "$ev_sid" "$ev_log" 2>/dev/null | tail -40)"
+    printf '%s\n' "${ev_lines:-(none)}"
   done
 }
 bep_hi_cleanup() {
-  local cl_sid
+  local cl_sid cl_box cl_repo cl_branch
+  # A branch that the push made and the delete step did not remove: try the
+  # delete once more from the same box, and name the branch if it stays.
+  if [ -n "$BEP_HI_PUSHED" ]; then
+    read -r cl_box cl_repo cl_branch <<<"$BEP_HI_PUSHED"
+    if ! mnl session exec "$cl_box" sh -c \
+      "cd /tmp/bep-repo && GIT_TERMINAL_PROMPT=0 timeout 120 git push origin --delete $cl_branch" \
+      >/dev/null 2>&1 </dev/null; then
+      echo "::warning::branch $cl_branch stays in $cl_repo: remove it with 'git push https://github.com/$cl_repo --delete $cl_branch'"
+    fi
+    BEP_HI_PUSHED=""
+  fi
   for cl_sid in $BEP_HI_SIDS; do
     mnl session destroy --force "$cl_sid" >/dev/null 2>&1 || true
   done
@@ -16224,6 +16238,10 @@ bep_hi_git_and_gh_steps() {
       cat "$WORK/$BEP_HI_CASE.${gs_step%%:*}.out" 2>/dev/null || true
       return 1
     fi
+    case "${gs_step%%:*}" in
+      push) BEP_HI_PUSHED="$gs_sid $gs_repo $gs_branch" ;;
+      delete) BEP_HI_PUSHED="" ;;
+    esac
     echo "git ${gs_step%%:*}: OK"
   done
   if ! gs_private="$(mnl session exec "$gs_sid" sh -c \
