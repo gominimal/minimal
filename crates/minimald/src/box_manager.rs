@@ -108,6 +108,27 @@ pub(crate) static CREATE_CLASSIFIER_TREE_STANDIN: std::sync::Mutex<
     Option<(std::path::PathBuf, String)>,
 > = std::sync::Mutex::new(None);
 
+/// The cgroup a create reads the daemon in, standing in for
+/// `/proc/self/cgroup` in a test that moves the daemon. `None` in every
+/// production path.
+#[cfg(test)]
+pub(crate) static CREATE_OWN_CGROUP_STANDIN: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+
+/// The daemon's cgroup as a create reads it (gominimal/inbox#1054): its
+/// own, read live, unless a test stood one in.
+fn create_own_cgroup() -> Option<String> {
+    #[cfg(test)]
+    if let Some(cgroup) = CREATE_OWN_CGROUP_STANDIN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+    {
+        return Some(cgroup);
+    }
+    sandbox::classifier::own_cgroup_path()
+}
+
 /// The tree and mount table a create's re-read answers over: the constant
 /// tree every launch reads and the daemon's own mount table, read live
 /// (`None`), unless a test stood a tree in.
@@ -132,7 +153,11 @@ fn create_classifier_tree() -> (std::path::PathBuf, Option<String>) {
 /// that is the one cause a later read can clear without anything on the
 /// host changing (a daemon not yet placed in its leaf at start reads so),
 /// so the create re-reads the host rather than answer from a stale read.
-/// A re-read that does not run keeps the stored fact.
+/// A re-read that does not run keeps the stored fact. A host-address create
+/// also re-reads when the daemon stands in another cgroup than the one the
+/// fact was read in (gominimal/inbox#1054: `min finalize-install` placed a
+/// running daemon after its start-up reading), so it never answers in the
+/// second before the daemon's own cgroup watch would notice the move.
 // The create lines carry the fact as `host_fact`, never as
 // `host_ip_enforcement`: that field marks the per-launch classifier record,
 // and readers of the log take every line with it as a launch decision.
@@ -140,10 +165,30 @@ async fn create_host_ip_fact(
     network: boxes::NetworkMode,
     session_name: &str,
 ) -> crate::box_runtime::HostIpEnforcementFact {
-    let stored = crate::box_runtime::host_ip_enforcement_fact();
     if !matches!(network, boxes::NetworkMode::HostNet) {
-        return stored;
+        return crate::box_runtime::host_ip_enforcement_fact();
     }
+    let (root, mountinfo) = create_classifier_tree();
+    if crate::box_runtime::re_read_if_moved(
+        root.clone(),
+        mountinfo.clone(),
+        create_own_cgroup(),
+        "a host-address create",
+    )
+    .await
+    {
+        let fact = crate::box_runtime::host_ip_enforcement_fact();
+        tracing::info!(
+            session_name,
+            reread = true,
+            host_fact = %fact.enforcement.machine_str(),
+            cause = fact.cause.map(crate::net::classifier::Cause::detail),
+            "host-address create re-read the classifier fact because the daemon \
+             moved since the fact was read"
+        );
+        return fact;
+    }
+    let stored = crate::box_runtime::host_ip_enforcement_fact();
     if stored.cause != Some(crate::net::classifier::Cause::ProbeUnreadable) {
         tracing::info!(
             session_name,
@@ -153,7 +198,6 @@ async fn create_host_ip_fact(
         );
         return stored;
     }
-    let (root, mountinfo) = create_classifier_tree();
     match crate::box_runtime::re_read_classifier_fact(
         root,
         mountinfo,

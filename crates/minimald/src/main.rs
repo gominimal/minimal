@@ -1280,11 +1280,20 @@ async fn async_main(egress: &mut GuestEgress) -> Result<(), MainError> {
 
         tracing::info!("Started listening on {}", cli.listen_on());
         request_daemon_placement(tree_root).await;
-        // Read before the start-up reading, so a placement that lands while
-        // the reading runs is still a move the watch sees.
-        let cgroup_at_reading = sandbox::classifier::own_cgroup_path();
-        read_host_ip_enforcement_fact(tree_root);
-        watch_own_placement(tree_root, cgroup_at_reading);
+        // gominimal/inbox#1054: a native daemon re-reads the fact each time
+        // its own cgroup changes, so a placement that lands after the
+        // start-up reading (`min finalize-install` under a running daemon, a
+        // late placer) reaches the creates that follow. The tree the daemon
+        // answers over, and its own mount table read live (no knob).
+        minimald::box_runtime::read_fact_and_watch_placement(
+            tree_root.to_path_buf(),
+            None,
+            minimald::guest::is_microvm_daemon(),
+            minimald::box_runtime::OWN_CGROUP_POLL,
+            sandbox::classifier::own_cgroup_path,
+            || read_host_ip_enforcement_fact(tree_root),
+        )
+        .await;
         let (opts, ssh_name) = cli.ssh_args();
         tracing::info!(
             "Run the following to debug the socket:\n\nssh \\\n\t{} \\\n\t{}",
@@ -1407,26 +1416,6 @@ async fn request_daemon_placement(tree_root: &std::path::Path) {
             "the placement request did not run"
         ),
     }
-}
-
-/// gominimal/inbox#1054: a native daemon re-reads its classifier fact each
-/// time its own cgroup changes, so a placement that lands after the start-up
-/// reading (`min finalize-install` under a running daemon, a late placer)
-/// reaches the creates that follow. A guest daemon mounts its own tree and
-/// is never moved, and a host without a unified cgroup line has nothing to
-/// watch. `at_reading` is the cgroup the daemon stood in when the start-up
-/// reading began.
-fn watch_own_placement(tree_root: &std::path::Path, at_reading: Option<String>) {
-    if minimald::guest::is_microvm_daemon() || at_reading.is_none() {
-        return;
-    }
-    minimald::traced::spawn(minimald::box_runtime::re_read_when_moved(
-        tree_root.to_path_buf(),
-        None,
-        at_reading,
-        minimald::box_runtime::OWN_CGROUP_POLL,
-        sandbox::classifier::own_cgroup_path,
-    ));
 }
 
 /// NET-079: the start-time fact this daemon answers every create with —

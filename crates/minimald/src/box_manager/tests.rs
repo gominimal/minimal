@@ -5366,25 +5366,46 @@ async fn host_ip_create_rereads_a_stale_unreadable_fact() {
     );
 }
 
-/// Resets the process-global classifier stand-ins and the fact on drop, a
-/// failed assert included, before the fact window's lock is released. The
+/// Resets the process-global classifier stand-ins, the fact and the cgroup
+/// it was read in on drop, a failed assert included, before the fact
+/// window's lock is released. A watch still running is aborted first. The
 /// tree drops after the reset, so no stand-in names a removed path.
-struct ResetClassifierStandins(Option<TempDir>);
+struct ResetClassifierStandins(Option<TempDir>, Option<tokio::task::JoinHandle<()>>);
 
 impl Drop for ResetClassifierStandins {
     fn drop(&mut self) {
+        if let Some(watch) = self.1.take() {
+            watch.abort();
+        }
         *CREATE_CLASSIFIER_TREE_STANDIN
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+        *CREATE_OWN_CGROUP_STANDIN
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = None;
         crate::box_runtime::clear_classifier_reading_standin();
         crate::box_runtime::clear_host_ip_enforcement_fact();
+        crate::box_runtime::clear_fact_cgroup();
         drop(self.0.take());
     }
 }
 
-/// gominimal/inbox#1054: a daemon moved into its leaf after its start-up
-/// reading (`min finalize-install` under a running daemon) re-reads the
-/// classifier fact, so the creates that follow answer over the host as it is
+/// A watch the test started, stopped and awaited, so the recorded cgroup's
+/// lock is free before the next phase.
+async fn stop_watch(reset: &mut ResetClassifierStandins) {
+    if let Some(watch) = reset.1.take() {
+        watch.abort();
+        let _ = watch.await;
+    }
+}
+
+/// gominimal/inbox#1054: the daemon's start-up wiring
+/// (`read_fact_and_watch_placement`, as `main` calls it). A guest daemon
+/// reads no cgroup and starts no watch, nor does a host whose cgroup is
+/// unreadable. A native daemon records the cgroup it stood in *before* its
+/// start-up reading, so a placement that lands while the reading runs is
+/// still a move; then its watch re-reads the classifier fact when it moves
+/// into its leaf, so the creates that follow answer over the host as it is
 /// now and not with the cause read before the move. The same cgroup, or an
 /// unreadable one, is no move and re-reads nothing.
 #[expect(
@@ -5401,24 +5422,94 @@ async fn a_daemon_moved_after_its_start_reading_re_reads_the_classifier_fact() {
         .unwrap_or_else(|p| p.into_inner());
     let capture = crate::test_harness::captured_log();
     let (tree, root, mountinfo) = stand_in_classifier_tree();
-    let _reset = ResetClassifierStandins(Some(tree));
+    let mut reset = ResetClassifierStandins(Some(tree), None);
     // The table refuses once the daemon can place the probe.
     crate::box_runtime::install_classifier_reading_standin(Reading::Refused(Vec::new()));
+    const BEFORE: &str = "/user.slice/user-1000.slice";
+    const LEAF: &str = "/minimald.slice/daemon";
+    let cgroup = Arc::new(Mutex::new(Some(BEFORE.to_string())));
+    let calls = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+    let own_cgroup = {
+        let cgroup = Arc::clone(&cgroup);
+        let calls = Arc::clone(&calls);
+        move || {
+            calls.lock().unwrap().push("cgroup");
+            cgroup.lock().unwrap().clone()
+        }
+    };
     // What the running daemon read at start, before the install.
-    crate::box_runtime::set_host_ip_enforcement_fact(&Decision::undecidable(
-        Cause::StepNotInstalled,
-    ));
-    let cgroup = Arc::new(Mutex::new(Some("/user.slice/user-1000.slice".to_string())));
-    let watch = crate::traced::spawn(crate::box_runtime::re_read_when_moved(
-        root,
-        Some(mountinfo),
-        Some("/user.slice/user-1000.slice".to_string()),
-        Duration::from_millis(10),
-        {
-            let cgroup = Arc::clone(&cgroup);
-            move || cgroup.lock().unwrap().clone()
-        },
-    ));
+    let start_reading = |moves_to: Option<&'static str>| {
+        let cgroup = Arc::clone(&cgroup);
+        let calls = Arc::clone(&calls);
+        move || {
+            calls.lock().unwrap().push("read");
+            crate::box_runtime::set_host_ip_enforcement_fact(&Decision::undecidable(
+                Cause::StepNotInstalled,
+            ));
+            if let Some(leaf) = moves_to {
+                *cgroup.lock().unwrap() = Some(leaf.to_string());
+            }
+        }
+    };
+    let poll = Duration::from_millis(10);
+    let wait_for_re_read = || async {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !crate::box_runtime::host_ip_enforcement_fact().can_decide_per_box() {
+            assert!(
+                Instant::now() < deadline,
+                "the moved daemon re-read the fact within the deadline"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+
+    // A guest daemon: the reading runs, and nothing else.
+    let watch = crate::box_runtime::read_fact_and_watch_placement(
+        root.clone(),
+        Some(mountinfo.clone()),
+        true,
+        poll,
+        own_cgroup.clone(),
+        start_reading(None),
+    )
+    .await;
+    assert!(watch.is_none(), "a guest daemon starts no watch");
+    assert_eq!(*calls.lock().unwrap(), ["read"], "a guest daemon reads no cgroup");
+    assert_eq!(crate::box_runtime::fact_cgroup().await, None);
+
+    // A native daemon whose cgroup is unreadable: nothing to compare.
+    calls.lock().unwrap().clear();
+    *cgroup.lock().unwrap() = None;
+    let watch = crate::box_runtime::read_fact_and_watch_placement(
+        root.clone(),
+        Some(mountinfo.clone()),
+        false,
+        poll,
+        own_cgroup.clone(),
+        start_reading(None),
+    )
+    .await;
+    assert!(watch.is_none(), "an unreadable cgroup starts no watch");
+    assert_eq!(
+        *calls.lock().unwrap(),
+        ["cgroup", "read"],
+        "the cgroup is read before the start-up reading"
+    );
+    assert_eq!(crate::box_runtime::fact_cgroup().await, None);
+
+    // A native daemon, not moved by its reading.
+    *cgroup.lock().unwrap() = Some(BEFORE.to_string());
+    reset.1 = crate::box_runtime::read_fact_and_watch_placement(
+        root.clone(),
+        Some(mountinfo.clone()),
+        false,
+        poll,
+        own_cgroup.clone(),
+        start_reading(None),
+    )
+    .await;
+    assert!(reset.1.is_some(), "a native daemon watches its cgroup");
+    assert_eq!(crate::box_runtime::fact_cgroup().await.as_deref(), Some(BEFORE));
     // Not moved, then unreadable: neither is a move.
     tokio::time::sleep(Duration::from_millis(80)).await;
     *cgroup.lock().unwrap() = None;
@@ -5428,25 +5519,109 @@ async fn a_daemon_moved_after_its_start_reading_re_reads_the_classifier_fact() {
         Some(Cause::StepNotInstalled),
         "a daemon that did not move keeps the fact it read"
     );
-
     // The install's placement moves the daemon into its leaf.
-    *cgroup.lock().unwrap() = Some("/minimald.slice/daemon".to_string());
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !crate::box_runtime::host_ip_enforcement_fact().can_decide_per_box() {
-        assert!(
-            Instant::now() < deadline,
-            "the moved daemon re-read the fact within the deadline"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    watch.abort();
+    *cgroup.lock().unwrap() = Some(LEAF.to_string());
+    wait_for_re_read().await;
     assert_eq!(crate::box_runtime::host_ip_enforcement_fact().cause, None);
+    stop_watch(&mut reset).await;
+    assert_eq!(crate::box_runtime::fact_cgroup().await.as_deref(), Some(LEAF));
     let logged = capture.contents();
     assert!(
         logged.lines().any(|line| line
             .contains("this daemon moved to another cgroup, so it re-read the classifier fact")
-            && line.contains("/minimald.slice/daemon")),
+            && line.contains(LEAF)
+            && line.contains("the cgroup watch")),
         "the move is one line naming the cgroup it moved to:\n{logged}"
+    );
+
+    // A placement that lands while the start-up reading runs: the cgroup
+    // recorded is the one read before it, so the watch still sees a move.
+    *cgroup.lock().unwrap() = Some(BEFORE.to_string());
+    reset.1 = crate::box_runtime::read_fact_and_watch_placement(
+        root.clone(),
+        Some(mountinfo.clone()),
+        false,
+        poll,
+        own_cgroup.clone(),
+        start_reading(Some(LEAF)),
+    )
+    .await;
+    wait_for_re_read().await;
+    stop_watch(&mut reset).await;
+    assert_eq!(crate::box_runtime::fact_cgroup().await.as_deref(), Some(LEAF));
+}
+
+/// gominimal/inbox#1054: a host-address create that finds the daemon in
+/// another cgroup than the one its fact was read in re-reads the fact
+/// itself, so a create in the second after `min finalize-install` placed
+/// the daemon does not wait for the cgroup watch's next poll. The move is
+/// recorded, so the next create in the same cgroup answers as stored.
+#[expect(
+    clippy::await_holding_lock,
+    reason = "the fact is process-global, so the guard must span the awaited \
+              creates it is set for"
+)]
+#[tokio::test]
+async fn a_host_address_create_after_a_move_re_reads_the_classifier_fact() {
+    use crate::net::classifier::{Cause, Decision, Reading};
+    let _fact_window = crate::box_runtime::PROBE_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let (_state, _cache, mngr) = manager().await;
+    let capture = crate::test_harness::captured_log();
+    let (tree, root, mountinfo) = stand_in_classifier_tree();
+    let _reset = ResetClassifierStandins(Some(tree), None);
+    *CREATE_CLASSIFIER_TREE_STANDIN
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some((root, mountinfo));
+    crate::box_runtime::install_classifier_reading_standin(Reading::Refused(Vec::new()));
+    let host_ip = |name: &str| {
+        let mut config = sample_config();
+        config.name = Some(name.to_string());
+        config.network = boxes::NetworkMode::HostNet;
+        config.policy = boxes::BoxPolicy::new(Some(boxes::EgressPolicy::deny_all()), None);
+        config
+    };
+    // The daemon read the host outside its leaf, before the install, and
+    // the install has since placed it.
+    crate::box_runtime::set_fact_cgroup(Some("/user.slice/user-1000.slice".to_string())).await;
+    crate::box_runtime::set_host_ip_enforcement_fact(&Decision::undecidable(
+        Cause::StepNotInstalled,
+    ));
+    *CREATE_OWN_CGROUP_STANDIN
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some("/minimald.slice/daemon".to_string());
+    mngr.create_session(host_ip("moved"), None)
+        .await
+        .expect("a deny-all host-address box is created");
+    let fact = crate::box_runtime::host_ip_enforcement_fact();
+    assert!(
+        fact.can_decide_per_box() && fact.cause.is_none(),
+        "the create re-read the host after the move"
+    );
+    assert_eq!(
+        crate::box_runtime::fact_cgroup().await.as_deref(),
+        Some("/minimald.slice/daemon"),
+        "the create recorded the cgroup it re-read in"
+    );
+    let logged = capture.contents();
+    assert!(
+        logged.contains("host-address create re-read the classifier fact because the daemon")
+            && logged.contains("a host-address create"),
+        "the create says it re-read because the daemon moved:\n{logged}"
+    );
+
+    // No move since: the next create answers as stored.
+    crate::box_runtime::set_host_ip_enforcement_fact(&Decision::undecidable(
+        Cause::StepNotInstalled,
+    ));
+    mngr.create_session(host_ip("not-moved"), None)
+        .await
+        .expect("a create over a stored cause is not refused at create");
+    assert_eq!(
+        crate::box_runtime::host_ip_enforcement_fact().cause,
+        Some(Cause::StepNotInstalled),
+        "a create in the cgroup the fact was read in does not re-read"
     );
 }
 
