@@ -608,10 +608,6 @@ const INIT_EXPANDED_TYPES: [&str; 2] = ["session", "task"];
 /// The built-in types that this release refuses an entry of (BOX-063).
 const INIT_REFUSED_TYPES: [&str; 4] = ["agent", "service", "build", "container-build"];
 
-/// The tables an entry name can be declared under: `[boxes.<name>]` and the
-/// per-noun tables that read as it (BOX-046).
-const ENTRY_TABLES: [&str; 5] = ["boxes", "sessions", "tasks", "agents", "services"];
-
 /// A refusal from `min init`: the text for the user and the exit code the
 /// run ends with. Nothing is written when one is returned.
 ///
@@ -621,7 +617,8 @@ const ENTRY_TABLES: [&str; 5] = ["boxes", "sessions", "tasks", "agents", "servic
 #[derive(Debug, PartialEq, Eq)]
 pub struct InitRefusal {
     /// The exit code: 2 for a usage error, 3 for a type this release
-    /// refuses, 1 for anything else.
+    /// refuses or for a name or type that makes `minimal.toml` invalid, 1
+    /// for anything else.
     pub code: u8,
     /// What was refused, why, and the next step.
     pub message: String,
@@ -699,17 +696,23 @@ pub(crate) fn init_request(args: &InitArgs) -> Result<InitRequest, InitRefusal> 
 /// refused name leaves `minimal.toml` unread and unchanged.
 fn check_entry_name(entry: &str) -> Result<(), InitRefusal> {
     if entry == mfile::entry::RESERVED_ENTRY_NAME {
-        return Err(InitRefusal::usage(format!(
-            "min init did not add the entry {entry}: the name {entry} is reserved. \
-             Choose another name."
-        )));
+        return Err(InitRefusal {
+            code: 3,
+            message: format!(
+                "min init did not add the entry {entry}: the name {entry} is reserved. \
+                 Choose another name."
+            ),
+        });
     }
     if !mfile::entry::is_dns_safe(entry) {
-        return Err(InitRefusal::usage(format!(
-            "min init did not add the entry {entry:?}: an entry name must be 1 to 63 \
-             characters of a-z, 0-9 and -, and must not start or end with -. \
-             Choose another name."
-        )));
+        return Err(InitRefusal {
+            code: 3,
+            message: format!(
+                "min init did not add the entry {entry:?}: an entry name must be 1 to 63 \
+                 characters of a-z, 0-9 and -, and must not start or end with -. \
+                 Choose another name."
+            ),
+        });
     }
     Ok(())
 }
@@ -776,9 +779,8 @@ fn resolve_builtin_root(
                 ),
             });
         }
-        let extends = doc
-            .get("box_types")
-            .and_then(|types| types.get(&current))
+        let declared = doc.get("box_types").and_then(|types| types.get(&current));
+        let extends = declared
             .and_then(|ty| ty.get("extends"))
             .and_then(toml_edit::Item::as_str)
             .map(str::to_owned);
@@ -786,6 +788,18 @@ fn resolve_builtin_root(
             Some(parent) => {
                 seen.push(current);
                 current = parent;
+            }
+            // A declared type with no `extends` is invalid minimal.toml:
+            // exit 3, as for any other validation error.
+            None if declared.is_some() => {
+                return Err(InitRefusal {
+                    code: 3,
+                    message: format!(
+                        "min init did not add the entry {entry}: [box_types.{current}] in \
+                         minimal.toml has no extends key. Add extends = \"session\" or \
+                         extends = \"task\" there."
+                    ),
+                });
             }
             None if seen.is_empty() => {
                 return Err(InitRefusal::usage(format!(
@@ -842,12 +856,12 @@ pub(crate) fn append_entry_text(
         });
     }
 
-    if ENTRY_TABLES
+    if mfile::entry::EntryTable::ALL
         .iter()
-        .any(|table| doc.get(table).and_then(|t| t.get(entry)).is_some())
+        .any(|table| doc.get(table.key()).and_then(|t| t.get(entry)).is_some())
     {
         return Err(InitRefusal {
-            code: 1,
+            code: 3,
             message: format!(
                 "minimal.toml already has an entry named {entry}. Choose another name."
             ),
@@ -1262,7 +1276,35 @@ mod init_tests {
 
         // A name that is already an entry is refused.
         let refusal = run(&dir, &["init", "site", "--type", "task"]).unwrap_err();
-        assert_eq!(refusal.code, 1);
+        assert_eq!(refusal.code, 3);
+    }
+
+    // BCLI-018: a [box_types] entry with no extends is invalid minimal.toml.
+    #[test]
+    fn init_box_type_without_extends_exit3_appends_nothing() {
+        let original = "[box_types.web]\nimage = \"x\"\n\n[boxes.dev]\ntype = \"session\"\n";
+        let dir = project(original);
+        let refusal = run(&dir, &["init", "x", "--type", "web"]).unwrap_err();
+        assert_eq!(refusal.code, 3, "{}", refusal.message);
+        assert!(
+            refusal.message.contains("[box_types.web]"),
+            "{}",
+            refusal.message
+        );
+        assert!(refusal.message.contains("extends"), "{}", refusal.message);
+        assert_eq!(read(&dir), original, "the file is unchanged");
+
+        // A type with no [box_types] entry at all stays a usage error.
+        let refusal = run(&dir, &["init", "x", "--type", "api"]).unwrap_err();
+        assert_eq!(refusal.code, 2, "{}", refusal.message);
+        assert!(
+            refusal
+                .message
+                .contains("is not a built-in type or a [box_types] entry"),
+            "{}",
+            refusal.message
+        );
+        assert_eq!(read(&dir), original, "the file is unchanged");
     }
 
     // BCLI-018, BOX-063
@@ -1316,7 +1358,7 @@ mod init_tests {
 
     // BCLI-018, BOX-007, BOX-046: the name check runs before any file read.
     #[test]
-    fn init_entry_name_invalid_exit2_appends_nothing() {
+    fn init_entry_name_invalid_exit3_appends_nothing() {
         let long = "a".repeat(64);
         let dir = project(LEGACY_SCAFFOLD);
         let empty = tempfile::tempdir().expect("a temp dir");
@@ -1327,7 +1369,7 @@ mod init_tests {
                 vec!["init", task_flag.as_str()],
             ] {
                 let refusal = run(&dir, &argv).unwrap_err();
-                assert_eq!(refusal.code, 2, "{argv:?}: {}", refusal.message);
+                assert_eq!(refusal.code, 3, "{argv:?}: {}", refusal.message);
                 assert!(
                     refusal.message.contains(name),
                     "{argv:?}: names the value: {}",
@@ -1339,7 +1381,7 @@ mod init_tests {
                     "{argv:?}: the file is unchanged"
                 );
                 // No minimal.toml: the name is refused before the file is looked for.
-                assert_eq!(run(&empty, &argv).unwrap_err().code, 2, "{argv:?}");
+                assert_eq!(run(&empty, &argv).unwrap_err().code, 3, "{argv:?}");
             }
         }
         let refusal = run(&dir, &["init", "My_Box", "--type", "session"]).unwrap_err();
