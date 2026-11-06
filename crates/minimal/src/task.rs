@@ -314,6 +314,160 @@ fn resolve_task_env(
     Ok(resolved)
 }
 
+/// Gate a task's `env_vars` against the user policy and resolve them
+/// against this shell ([`resolve_task_env`]), in the lane the terminal
+/// allows: the interactive prompt on a real terminal, the collect-and-refuse
+/// [`RefuseAndRecord`] anywhere else. Returns the resolved set and the
+/// policy as the prompt left it, which the interactive lane has already
+/// saved.
+///
+/// Shared by `min task run` and `min session run` (inbox#778), so the two
+/// verbs pass one gate and print one refusal.
+pub(crate) fn gate_task_env(
+    global: &GlobalArgs,
+    declared: &mfile::Task,
+    task_name: &str,
+    source: &boxes::core::source::Source,
+    user_policy: boxes::core::policy::UserPolicy,
+    policy_path: &std::path::Path,
+    env: impl Fn(&str) -> Result<String, std::env::VarError>,
+) -> Result<
+    (
+        minimald_rpc::taskenv::TaskEnv,
+        boxes::core::policy::UserPolicy,
+    ),
+    anyhow::Error,
+> {
+    // Gated against `[vars]` on the way, `allow` included. Resolving here
+    // reads the user's own shell, so the project naming a variable is the
+    // project asking for its value — the same two lanes as an activate: the
+    // interactive prompt on a real terminal, the collect-and-refuse
+    // `NoPromptHook` anywhere else.
+    let non_interactive = global.no_input || !crate::can_prompt_interactively();
+    if non_interactive {
+        let hooks = RefuseAndRecord::default();
+        let task_env = resolve_task_env(
+            declared,
+            task_name,
+            user_policy.vars().clone(),
+            policy_path,
+            source,
+            &hooks,
+            env,
+        );
+        // Checked before the result: the hook refused, so `task_env` is
+        // the abort error and the names are the useful half of it.
+        let refused = hooks.into_names();
+        if !refused.is_empty() {
+            let count = refused.len();
+            let snippet = refused_vars_snippet(&refused);
+            bail!(
+                "task '{task_name}' declares {count} environment variable{s} that your \
+                 policy does not allow, and stdin/stderr is not a terminal.\n\n\
+                 Add the following to {path}:\n\n{snippet}\n\
+                 Then re-run this command.",
+                path = policy_path.display(),
+                s = if count == 1 { "" } else { "s" },
+            );
+        }
+        Ok((task_env?, user_policy))
+    } else {
+        let hooks = crate::prompt::InteractivePrompt::new(policy_path, user_policy.clone());
+        let task_env = resolve_task_env(
+            declared,
+            task_name,
+            user_policy.vars().clone(),
+            policy_path,
+            source,
+            &hooks,
+            env,
+        );
+        // Persist before propagating a refusal: a rule the user chose to
+        // record is theirs whether or not this run goes on to fail.
+        let after = hooks.into_final_policy();
+        if after != user_policy {
+            match crate::prompt::save_user_policy(policy_path, &after) {
+                Ok(()) => eprintln!("Updated {}", policy_path.display()),
+                Err(e) => eprintln!("warning: failed to update {}: {e}", policy_path.display()),
+            }
+        }
+        Ok((task_env?, after))
+    }
+}
+
+/// The `env_vars` of `task` for a `min session run` against a session built
+/// from the project at `project_path`, gated and resolved here as
+/// `min task run` does them ([`gate_task_env`]) (inbox#778).
+///
+/// The declaration is read from the project on this host, the only copy the
+/// client can read. The daemon runs the task from the session's own copy,
+/// taken at activation, so the two can differ. The daemon is told the
+/// client resolved the task, and it then refuses an `inherit` this set does
+/// not answer rather than reading its own environment for it. A project
+/// with no `minimal.toml` here, or one that does not declare `task` (a task
+/// a stack provides), yields an empty set for the same reason: the run goes
+/// on, and only an `inherit` stops it.
+pub(crate) fn session_run_task_env(
+    global: &GlobalArgs,
+    project_path: &camino::Utf8Path,
+    task: &str,
+    env: impl Fn(&str) -> Result<String, std::env::VarError>,
+) -> Result<minimald_rpc::taskenv::TaskEnv, anyhow::Error> {
+    // The daemon trims the name it is sent, so the lookup does too.
+    let task = task.trim();
+    let file = match mfile::File::from_dir_recursive(project_path.as_std_path()) {
+        Ok(file) => file,
+        Err(e) => {
+            tracing::debug!(
+                project = %project_path,
+                error = %e,
+                "no readable minimal.toml for the session's project on this host"
+            );
+            return Ok(minimald_rpc::taskenv::TaskEnv::default());
+        }
+    };
+    let Some(declared) = file.task(task) else {
+        return Ok(minimald_rpc::taskenv::TaskEnv::default());
+    };
+    let policy_path = crate::config::user_policy_path(global);
+    let user_policy = crate::config::read_user_policy(global)?;
+    let source = boxes::core::source::Source::Project {
+        path: paths::HostPath::try_new(project_path.to_path_buf())
+            .context("Invalid project path")?,
+    };
+    let (task_env, _) = gate_task_env(
+        global,
+        &declared,
+        task,
+        &source,
+        user_policy,
+        &policy_path,
+        env,
+    )?;
+    ensure_carried_by_ssh(task, &task_env)?;
+    Ok(task_env)
+}
+
+/// Refuses a resolved variable the ssh transport of `min session run`
+/// cannot carry: ssh forwards a variable from its own environment, which
+/// holds no name with `=` or a NUL, and no value with a NUL. `min task run`
+/// sends its variables over the daemon's own channel and has no such limit.
+fn ensure_carried_by_ssh(
+    task: &str,
+    task_env: &minimald_rpc::taskenv::TaskEnv,
+) -> Result<(), anyhow::Error> {
+    for (name, value) in &task_env.set {
+        if name.is_empty() || name.contains(['=', '\0']) || value.contains('\0') {
+            bail!(
+                "task '{task}' declares `env_vars.{name:?}`, which `min session run` \
+                 cannot carry into the session: an environment variable's name holds \
+                 no `=` or NUL, and its value no NUL; use `min task run {task}`"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The non-interactive lane's hook: records what the policy could not
 /// decide and then **refuses**.
 ///
@@ -691,70 +845,22 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
     // values to the daemon on the exec channel (#585). Done alongside the
     // declared-task check, before `ensure_daemon`, so an unset inherited
     // variable also fails with no session built.
-    //
-    // Gated against `[vars]` on the way, `allow` included. Resolving here
-    // reads the user's own shell, so the project naming a variable is the
-    // project asking for its value — the same two lanes as an activate: the
-    // interactive prompt on a real terminal, the collect-and-refuse
-    // `NoPromptHook` anywhere else.
     let source = boxes::core::source::Source::Project {
         path: paths::HostPath::try_new(utf8_path.clone()).context("Invalid project path")?,
     };
-    let non_interactive = global.no_input || !crate::can_prompt_interactively();
-    // The policy amended by the task-env gating above: persisted to disk on
-    // the interactive path, and carried into `prepare_activation_inputs`
-    // below as an override, so composition and the pending gate run under the
-    // approved rules even when that save failed.
-    let (task_env, amended_policy) = if non_interactive {
-        let hooks = RefuseAndRecord::default();
-        let task_env = resolve_task_env(
-            &declared,
-            &args.task,
-            user_policy.vars().clone(),
-            &policy_path,
-            &source,
-            &hooks,
-            |k| std::env::var(k),
-        );
-        // Checked before the result: the hook refused, so `task_env` is
-        // the abort error and the names are the useful half of it.
-        let refused = hooks.into_names();
-        if !refused.is_empty() {
-            let count = refused.len();
-            let snippet = refused_vars_snippet(&refused);
-            bail!(
-                "task '{task}' declares {count} environment variable{s} that your \
-                 policy does not allow, and stdin/stderr is not a terminal.\n\n\
-                 Add the following to {path}:\n\n{snippet}\n\
-                 Then re-run this command.",
-                task = args.task,
-                path = policy_path.display(),
-                s = if count == 1 { "" } else { "s" },
-            );
-        }
-        (task_env?, user_policy)
-    } else {
-        let hooks = crate::prompt::InteractivePrompt::new(&policy_path, user_policy.clone());
-        let task_env = resolve_task_env(
-            &declared,
-            &args.task,
-            user_policy.vars().clone(),
-            &policy_path,
-            &source,
-            &hooks,
-            |k| std::env::var(k),
-        );
-        // Persist before propagating a refusal: a rule the user chose to
-        // record is theirs whether or not this run goes on to fail.
-        let after = hooks.into_final_policy();
-        if after != user_policy {
-            match crate::prompt::save_user_policy(&policy_path, &after) {
-                Ok(()) => eprintln!("Updated {}", policy_path.display()),
-                Err(e) => eprintln!("warning: failed to update {}: {e}", policy_path.display()),
-            }
-        }
-        (task_env?, after)
-    };
+    // The policy amended by the task-env gating: persisted to disk on the
+    // interactive path, and carried into `prepare_activation_inputs` below as
+    // an override, so composition and the pending gate run under the approved
+    // rules even when that save failed.
+    let (task_env, amended_policy) = gate_task_env(
+        global,
+        &declared,
+        &args.task,
+        &source,
+        user_policy,
+        &policy_path,
+        |k| std::env::var(k),
+    )?;
 
     crate::ensure_daemon(global)?;
 
@@ -2093,6 +2199,131 @@ mod tests {
             msg.contains("policy does not allow"),
             "names the gate: {msg}"
         );
+    }
+
+    /// A project on disk declaring `toml`, and a config dir whose
+    /// `user_policy.toml` holds `policy`, isolated from the developer's own.
+    fn session_run_fixture(
+        toml: &str,
+        policy: &str,
+    ) -> (tempfile::TempDir, tempfile::TempDir, GlobalArgs) {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join(mfile::MFILE_NAME), toml).unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let minimal_dir = config.path().join("minimal");
+        std::fs::create_dir_all(&minimal_dir).unwrap();
+        std::fs::write(minimal_dir.join("user_policy.toml"), policy).unwrap();
+        let global = GlobalArgs {
+            config_dir: Some(config.path().to_path_buf()),
+            no_input: true,
+            ..Default::default()
+        };
+        (project, config, global)
+    }
+
+    fn utf8(dir: &tempfile::TempDir) -> &camino::Utf8Path {
+        camino::Utf8Path::from_path(dir.path()).unwrap()
+    }
+
+    const SESSION_RUN_TOML: &str = "[tasks.t778]\nexec = 'true'\n\
+        env_vars.X778 = { inherit = true }\nenv_vars.LIT778 = 'lit'\n";
+
+    /// inbox#778: `min session run` resolves the task's `inherit` against
+    /// this shell, as `min task run` does, and carries literals too, so the
+    /// daemon never reads its own environment for the task.
+    #[test]
+    fn session_run_resolves_an_allowed_inherit_from_this_shell() {
+        let (project, _config, global) =
+            session_run_fixture(SESSION_RUN_TOML, "[vars]\nallow = [\"X778\", \"LIT778\"]\n");
+
+        let out = session_run_task_env(&global, utf8(&project), "t778", |k| match k {
+            "X778" => Ok("x-from-shell".to_string()),
+            _ => Err(std::env::VarError::NotPresent),
+        })
+        .expect("an allowed, set inherit resolves");
+
+        assert_eq!(
+            out.set.get("X778").map(String::as_str),
+            Some("x-from-shell")
+        );
+        assert_eq!(out.set.get("LIT778").map(String::as_str), Some("lit"));
+        assert!(out.drop.is_empty());
+    }
+
+    /// inbox#778: the policy gate `min task run` passes applies to
+    /// `min session run` too. With no terminal, a name the policy does not
+    /// allow refuses the run naming the policy file, and nothing is read
+    /// out of the shell.
+    #[test]
+    fn session_run_refuses_a_name_the_policy_does_not_allow() {
+        let (project, config, global) =
+            session_run_fixture(SESSION_RUN_TOML, "[vars]\nallow = [\"LIT778\"]\n");
+
+        let err = session_run_task_env(&global, utf8(&project), "t778", |_| {
+            panic!("no value may be read before the policy allows it")
+        })
+        .expect_err("an unallowed name must refuse the run");
+
+        let msg = err.to_string();
+        assert!(msg.contains("task 't778'"), "names the task: {msg}");
+        assert!(
+            msg.contains("policy does not allow"),
+            "names the gate: {msg}"
+        );
+        assert!(msg.contains("X778"), "names the variable: {msg}");
+        let policy = config.path().join("minimal").join("user_policy.toml");
+        assert!(
+            msg.contains(&policy.display().to_string()),
+            "names the policy file: {msg}"
+        );
+    }
+
+    /// The daemon trims the task name it is sent, so the lookup does too:
+    /// a padded name still passes the gate rather than skipping it.
+    #[test]
+    fn session_run_gates_a_padded_task_name() {
+        let (project, _config, global) = session_run_fixture(SESSION_RUN_TOML, "[vars]\n");
+        let err = session_run_task_env(&global, utf8(&project), " t778 ", |_| {
+            panic!("nothing is read")
+        })
+        .expect_err("the padded name is the same task");
+        assert!(err.to_string().contains("policy does not allow"), "{err}");
+    }
+
+    /// A task the project on this host does not declare (one a stack
+    /// provides, or one added to the session's copy only), and a project
+    /// with no `minimal.toml` here, resolve to an empty set. The run goes
+    /// on, and the daemon, told the client resolved it, refuses any
+    /// `inherit` the task has rather than reading its own environment.
+    #[test]
+    fn session_run_resolves_nothing_for_a_task_this_host_does_not_declare() {
+        let (project, _config, global) = session_run_fixture(SESSION_RUN_TOML, "[vars]\n");
+        let out = session_run_task_env(&global, utf8(&project), "other", |_| {
+            panic!("nothing is read")
+        })
+        .unwrap();
+        assert!(out.is_empty(), "{out:?}");
+
+        let empty = tempfile::tempdir().unwrap();
+        let out =
+            session_run_task_env(&global, utf8(&empty), "t778", |_| panic!("nothing is read"))
+                .unwrap();
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    /// A name or value ssh cannot carry is refused with the verb that can.
+    #[test]
+    fn session_run_refuses_a_var_ssh_cannot_carry() {
+        let mut env = minimald_rpc::taskenv::TaskEnv::default();
+        env.set.insert("OK".to_string(), "v".to_string());
+        ensure_carried_by_ssh("t", &env).expect("a plain name is carried");
+        env.set.insert("A=B".to_string(), "v".to_string());
+        let err = ensure_carried_by_ssh("t", &env).expect_err("`=` cannot be carried");
+        assert!(err.to_string().contains("min task run t"), "{err}");
+
+        let mut env = minimald_rpc::taskenv::TaskEnv::default();
+        env.set.insert("NUL".to_string(), "a\0b".to_string());
+        ensure_carried_by_ssh("t", &env).expect_err("a NUL cannot be carried");
     }
 
     /// `cmd_task_run` resolves a task's `env_vars` against the invoking

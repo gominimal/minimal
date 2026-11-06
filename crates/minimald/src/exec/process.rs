@@ -33,6 +33,12 @@ pub struct TaskExec {
     /// daemon's own environment — the very indirection #585 removes. A
     /// dropped name has to be named.
     pub drop_env: BTreeSet<String>,
+    /// The client resolved the task's `env_vars` itself and said so
+    /// ([`minimald_rpc::taskenv::TASK_ENV_RESOLVED`]), as `min session run`
+    /// does (inbox#778). An `inherit` that [`Self::env`] and
+    /// [`Self::drop_env`] leave in the task's declarations then refuses the
+    /// run: the daemon's own environment never answers it.
+    pub client_resolved: bool,
     /// The client's invocation directory relative to the uploaded tree,
     /// already refused by [`minimald_rpc::exec::ExecRequest::parse`] if it
     /// is absolute or holds a `..`. A task that declares `inherit_cwd`
@@ -307,6 +313,45 @@ pub(crate) fn task_build_refusal(
     Ok(())
 }
 
+/// Applies the client's resolution of a task's `env_vars` over the task's
+/// own declarations: the names the client dropped go, then the values it
+/// resolved are set.
+///
+/// When the client said it resolved them ([`TaskExec::client_resolved`]),
+/// an `inherit` left over is refused, naming the task and the variable,
+/// where the task's sandbox would otherwise read the daemon's environment
+/// for it. The client read its declaration from the project where it ran,
+/// and the session's copy declares more, so the name never passed the
+/// user's `[vars]` policy (inbox#778).
+pub(super) fn overlay_client_env(
+    exec: &TaskExec,
+    vars: &mut BTreeMap<String, mfile::EnvVarValue>,
+) -> Result<(), String> {
+    // Removals first. The two sets are disjoint, so the order is not
+    // load-bearing, but reading it in policy order — drop, then apply —
+    // matches how the client decided.
+    for name in &exec.drop_env {
+        vars.remove(name);
+    }
+    for (name, value) in &exec.env {
+        vars.insert(name.clone(), mfile::EnvVarValue::Value(value.clone()));
+    }
+    if exec.client_resolved
+        && let Some((name, _)) = vars
+            .iter()
+            .find(|(_, value)| matches!(value, mfile::EnvVarValue::Inherit))
+    {
+        return Err(format!(
+            "task '{task}' declares `env_vars.{name} = {{ inherit = true }}` in the \
+             session's copy of the project, but the minimal.toml where `min` ran does \
+             not, so `min` did not resolve it; re-activate the session to run the \
+             project as it is now",
+            task = exec.task,
+        ));
+    }
+    Ok(())
+}
+
 /// Producer side of [`TaskExec::exec`]. Inlined in one async fn so that
 /// `env` lives on a single stack frame across every spawn — that frame
 /// is alive for the whole life of this tokio task, which in turn is
@@ -387,16 +432,7 @@ pub(super) async fn task_producer(
         // reaches (#585). An entry the client did not send keeps whatever
         // the task declared, so the daemon-side path still serves in-box
         // `min run` and older clients.
-        // Removals first. The two sets are disjoint, so the order is not
-        // load-bearing, but reading it in policy order — drop, then apply —
-        // matches how the client decided.
-        for name in &exec.drop_env {
-            task.vars.remove(name);
-        }
-        for (name, value) in &exec.env {
-            task.vars
-                .insert(name.clone(), mfile::EnvVarValue::Value(value.clone()));
-        }
+        overlay_client_env(&exec, &mut task.vars).map_err(io::Error::other)?;
         let record = session.record().await?;
         let switch = session.net_switch().await?;
         ensure_task_rows_stand(&record, &switch).await?;

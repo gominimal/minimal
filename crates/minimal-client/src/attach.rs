@@ -235,6 +235,73 @@ pub fn attach_command(
     wire: Option<&str>,
     session_keys: Option<&boxes::keys::SessionKeys>,
 ) -> Result<std::process::Command, anyhow::Error> {
+    ssh_command(sock, id, wire, session_keys, None)
+}
+
+/// [`attach_command`] for a task run in an existing session, `min session
+/// run` (inbox#778): the exec `wire`, plus the task's `env_vars` the client
+/// resolved against its own shell.
+///
+/// The variables travel as `min task run`'s own channel sends them, under
+/// [`TASK_ENV_PREFIX`](minimald_rpc::taskenv::TASK_ENV_PREFIX) with the drop
+/// list beside them, each set in ssh's environment and forwarded by a
+/// matching `SendEnv`. [`TASK_ENV_RESOLVED`](minimald_rpc::taskenv::TASK_ENV_RESOLVED)
+/// goes with them, so the daemon refuses an `inherit` the set does not
+/// answer instead of reading its own environment for it.
+///
+/// # Errors
+///
+/// As [`attach_command`].
+pub fn task_run_command(
+    sock: &Path,
+    id: boxes::SessionId,
+    wire: &str,
+    task_env: &minimald_rpc::taskenv::TaskEnv,
+) -> Result<std::process::Command, anyhow::Error> {
+    ssh_command(sock, id, Some(wire), None, Some(task_env))
+}
+
+/// Sets `task_env` on `ssh` as [`task_run_command`] sends it. A variable of
+/// the same prefix that this process inherited is removed first: `SendEnv`
+/// forwards by pattern, and only what the client resolved may match it.
+fn set_task_env(ssh: &mut std::process::Command, task_env: &minimald_rpc::taskenv::TaskEnv) {
+    use minimald_rpc::taskenv::{TASK_ENV_DROP, TASK_ENV_PREFIX, TASK_ENV_RESOLVED};
+    for (name, _) in std::env::vars_os() {
+        let inherited = name.to_string_lossy();
+        if inherited.starts_with(TASK_ENV_PREFIX)
+            || inherited == TASK_ENV_DROP
+            || inherited == TASK_ENV_RESOLVED
+        {
+            ssh.env_remove(&name);
+        }
+    }
+    for (name, value) in &task_env.set {
+        ssh.env(minimald_rpc::taskenv::wire_name(name), value);
+    }
+    if !task_env.drop.is_empty() {
+        ssh.env(
+            TASK_ENV_DROP,
+            minimald_rpc::taskenv::encode_drops(&task_env.drop),
+        );
+    }
+    ssh.env(TASK_ENV_RESOLVED, "1");
+    ssh.args([
+        "-o",
+        &format!("SendEnv={TASK_ENV_PREFIX}*"),
+        "-o",
+        &format!("SendEnv={TASK_ENV_DROP}"),
+        "-o",
+        &format!("SendEnv={TASK_ENV_RESOLVED}"),
+    ]);
+}
+
+fn ssh_command(
+    sock: &Path,
+    id: boxes::SessionId,
+    wire: Option<&str>,
+    session_keys: Option<&boxes::keys::SessionKeys>,
+    task_env: Option<&minimald_rpc::taskenv::TaskEnv>,
+) -> Result<std::process::Command, anyhow::Error> {
     // ProxyCommand points at our own `proxy` subcommand so we don't
     // depend on socat or nc being installed. `--owner-lock` is a file this
     // process holds an exclusive `flock` on for its lifetime, and `--owner`
@@ -331,6 +398,10 @@ pub fn attach_command(
                 "-o",
                 &format!("SendEnv={}", boxes::keys::BELL_ENV),
             ]);
+    }
+
+    if let Some(task_env) = task_env {
+        set_task_env(&mut ssh, task_env);
     }
 
     // The interactive path opens the in-sandbox session shell via the daemon's
@@ -1255,6 +1326,85 @@ mod tests {
         for stdio in ["stdin", "stdout", "stderr"] {
             assert!(!debug.contains(stdio), "{stdio} overridden: {debug}");
         }
+    }
+
+    /// `min session run` carries the task's resolved `env_vars` the way the
+    /// daemon's own channel does (inbox#778): each value under the task-env
+    /// prefix, the drop list and the resolved marker beside them, every one
+    /// set in ssh's environment and forwarded by a `SendEnv` that comes
+    /// before the host alias, where ssh reads options.
+    #[test]
+    fn task_run_command_forwards_the_resolved_task_env() {
+        use minimald_rpc::taskenv::{TASK_ENV_DROP, TASK_ENV_PREFIX, TASK_ENV_RESOLVED};
+
+        let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
+        let mut task_env = minimald_rpc::taskenv::TaskEnv::default();
+        task_env
+            .set
+            .insert("X778".to_string(), "line1\nline2 = \"q\"".to_string());
+        task_env.drop.insert("IGNORED778".to_string());
+        let cmd = task_run_command(&sock, boxes::SessionId::nil(), "wire", &task_env).unwrap();
+
+        let envs: std::collections::BTreeMap<String, Option<String>> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            envs.get(&format!("{TASK_ENV_PREFIX}X778")),
+            Some(&Some("line1\nline2 = \"q\"".to_string())),
+            "the value travels verbatim: {envs:?}"
+        );
+        assert_eq!(
+            envs.get(TASK_ENV_DROP),
+            Some(&Some(minimald_rpc::taskenv::encode_drops(&task_env.drop)))
+        );
+        assert_eq!(envs.get(TASK_ENV_RESOLVED), Some(&Some("1".to_string())));
+
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let alias = args
+            .iter()
+            .position(|a| a == "local-minimald0")
+            .expect("the host alias");
+        for send in [
+            format!("SendEnv={TASK_ENV_PREFIX}*"),
+            format!("SendEnv={TASK_ENV_DROP}"),
+            format!("SendEnv={TASK_ENV_RESOLVED}"),
+        ] {
+            let at = args
+                .iter()
+                .position(|a| *a == send)
+                .unwrap_or_else(|| panic!("{send} missing: {args:?}"));
+            assert!(at < alias, "{send} must precede the host alias: {args:?}");
+        }
+        assert_eq!(args.last().map(String::as_str), Some("wire"));
+    }
+
+    /// Every other ssh command carries no task env and no resolved marker:
+    /// the daemon keeps its older behaviour for them.
+    #[test]
+    fn attach_command_carries_no_task_env() {
+        let sock = PathBuf::from("/tmp/x/providers/local-minimald0/ssh.sock");
+        let cmd = attach_command(&sock, boxes::SessionId::nil(), Some("wire"), None).unwrap();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !args.iter().any(|a| a.contains("MINIMAL_TASK_")),
+            "{args:?}"
+        );
+        assert!(
+            !cmd.get_envs()
+                .any(|(k, _)| k.to_string_lossy().starts_with("MINIMAL_TASK_")),
+        );
     }
 
     /// Every attach bounds its connect and handshake with the shared deadline;
