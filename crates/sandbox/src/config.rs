@@ -480,6 +480,17 @@ pub struct Invocation {
 }
 
 impl Config {
+    /// The session tree, home or workbench, that the host path `host` is in,
+    /// with the tree's host path and `host` relative to it; `None` outside a
+    /// session layout or outside both trees.
+    #[cfg(target_os = "linux")]
+    fn session_tree_of(&self, host: &Path) -> Option<(&Path, PathBuf)> {
+        let WdSetup::Session { home, working, .. } = &self.wd else {
+            return None;
+        };
+        crate::session_bind::within(&[home.as_path(), working.as_path()], host)
+    }
+
     /// The home directory a command in this sandbox sees, as an absolute path
     /// inside the sandbox. One definition, used for both `$HOME` and the
     /// synthesized passwd entry so the two can never disagree.
@@ -959,16 +970,31 @@ impl Config {
                     }
 
                     // Missing and needs to be created.
+                    let contents = if m.host_path.ends_with(".json") {
+                        "{}"
+                    } else {
+                        ""
+                    };
+                    // Inside a session's home or workbench the box owns every
+                    // name, and a dangling link there would carry `fs::write`
+                    // or `create_dir_all` out of the tree. The path is created
+                    // beneath the tree instead, never out of it (inbox#1152).
+                    #[cfg(target_os = "linux")]
+                    if let Some((root, rel)) = self.session_tree_of(Path::new(&m.host_path)) {
+                        let bytes = contents.as_bytes();
+                        let created =
+                            crate::session_bind::create_beneath(root, &rel, m.is_file, bytes);
+                        created.map_err(|e| {
+                            Error::IO(
+                                "create mapped path in the session's home or workbench",
+                                m.host_path.clone().into(),
+                                e,
+                            )
+                        })?;
+                        continue;
+                    }
                     if m.is_file {
-                        fs::write(
-                            &m.host_path,
-                            if m.host_path.ends_with(".json") {
-                                "{}"
-                            } else {
-                                ""
-                            },
-                        )
-                        .map_err(|e| {
+                        fs::write(&m.host_path, contents).map_err(|e| {
                             Error::IO("create mapped file", m.host_path.clone().into(), e)
                         })?;
                     } else {

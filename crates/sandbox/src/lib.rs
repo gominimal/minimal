@@ -39,6 +39,8 @@ pub use error::Error;
 pub use hakoniwa::Command;
 
 mod listener;
+#[cfg(target_os = "linux")]
+mod session_bind;
 
 /// Something that handles line-oriented RPCs from within the sandbox.
 pub trait Channel: Send {
@@ -490,6 +492,11 @@ pub struct Container {
     /// pre-exec closure, without taking a controlling terminal. Set by
     /// [`Container::set_session_leader_without_terminal`].
     new_session: bool,
+    /// The patches whose mount point is in the session's home or workbench,
+    /// bound by a command's pre-exec closure through handles rather than by
+    /// hakoniwa by path, sorted by where they land (inbox#1152; see the
+    /// `session_bind` module).
+    session_binds: Vec<session_bind::SessionBind>,
 }
 
 /// The prefix of a start gate's FIFO name in the box's `/run`; each gate adds
@@ -592,6 +599,7 @@ impl Container {
             sandbox.config.force_cover_fallback,
             self.start_gate.clone(),
             self.new_session,
+            self.session_binds.clone(),
         )?;
 
         Ok(command)
@@ -1280,6 +1288,7 @@ fn install_box_credentials(
     force_cover_fallback: bool,
     start_gate: Option<PathBuf>,
     new_session: bool,
+    session_binds: Vec<session_bind::SessionBind>,
 ) -> Result<(), Error> {
     let program = command.get_program().to_string();
     let args = command.get_args();
@@ -1330,6 +1339,7 @@ fn install_box_credentials(
                 closure_report.as_deref(),
                 start_gate.as_deref(),
                 new_session,
+                &session_binds,
             )
         })
     };
@@ -1513,7 +1523,19 @@ fn exec_box_program(
     closure_report: Option<&Path>,
     start_gate: Option<&Path>,
     new_session: bool,
+    session_binds: &[session_bind::SessionBind],
 ) -> ! {
+    // The patches in the session's home and workbench first, before anything
+    // else the box is given: each source and each mount point is opened once
+    // beneath its tree, refusing a path out of it, and the bind goes through
+    // those handles, so a link the box swaps in after any check cannot
+    // redirect it (inbox#1152). The box's user namespace still holds
+    // CAP_SYS_ADMIN over this mount namespace here. A patch that cannot be
+    // bound so ends the box: it must not run with a patch missing or
+    // misplaced.
+    if let Err((what, e)) = session_bind::bind_all(session_binds) {
+        exit_child(&what, &e, closure_report);
+    }
     // A new session and process group for the program, with no controlling
     // terminal: the box's own processes then share neither with the daemon,
     // and none of them can open the daemon's terminal as `/dev/tty`.
@@ -2336,20 +2358,54 @@ impl<C: Channel> Sandbox<C> {
             }
         }
         // Mount in any file mappings. hakoniwa applies mounts sorted by
-        // target, so a mapping inside a session's `/home` or `/workbench`
-        // lands on top of that directory's own mount.
-        for m in self.config.wd.fs_mappings() {
+        // target, and the closure's binds below follow the same order.
+        //
+        // A mapping whose source or mount point is in a session's home or
+        // workbench is not given to hakoniwa by that path: the box owns those
+        // trees and can swap any path in them for a link between a check and
+        // a bind made by path. The command's pre-exec closure binds it through
+        // handles instead (inbox#1152; see [`session_bind`]), after every
+        // mount here; one from outside the trees is bound here onto a stage
+        // the closure moves it from. No mount hakoniwa makes lies in a tree
+        // any more, so the order of the closure's binds among themselves is
+        // the whole of the layering under `/home` and `/workbench`.
+        let trees = match &self.config.wd {
+            WdSetup::Session {
+                home,
+                working,
+                working_name_override,
+                ..
+            } => session_bind::Tree::session(
+                home,
+                working,
+                working_name_override
+                    .as_deref()
+                    .unwrap_or(SESSION_DEFAULT_WD),
+            ),
+            _ => Vec::new(),
+        };
+        let plan = session_bind::plan(
+            &trees,
+            self.config.wd.fs_mappings(),
+            session_bind::locked_of,
+        )
+        .map_err(|path| {
+            Error::Execution(ExecutionError::MountError {
+                msg: "a patch from a session tree must land in the home or workbench",
+                path,
+            })
+        })?;
+        if plan.stages() {
+            container.tmpfsmount(session_bind::STAGE);
+        }
+        for (m, target) in &plan.by_path {
             let opts = BindOpts {
                 recursive: !m.is_file,
                 read_only: m.read_only,
             };
-            Self::bind_mount(
-                Path::new(&m.host_path),
-                &m.path_in_sandbox(),
-                opts,
-                &mut container,
-            )?;
+            Self::bind_mount(Path::new(&m.host_path), target, opts, &mut container)?;
         }
+        let session_binds = plan.binds;
 
         if let Some(hn) = &self.config.hostname {
             let etc_hostname = self.rootfs().join("etc").join("hostname");
@@ -2391,6 +2447,7 @@ impl<C: Channel> Sandbox<C> {
             fresh_netns: isolate,
             start_gate: None,
             new_session: false,
+            session_binds,
         })
     }
 
@@ -5642,6 +5699,75 @@ ff02::2\tip6-allrouters
             .expect("minenv_sock should be connectable after a bound-dir Sandbox::new");
     }
 
+    /// inbox#1152's wiring: in a session layout, no mapping whose source or
+    /// mount point is in the home or the workbench reaches hakoniwa's mount
+    /// list by that path. The container carries them for the pre-exec
+    /// closure instead, and hakoniwa binds the one from outside the trees
+    /// only onto its stage.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_session_tree_patch_never_reaches_hakoniwas_mount_list() {
+        let (_tmp, base) = make_base_with_synth();
+        let trees = tempfile::TempDir::new().unwrap();
+        let home = trees.path().join("home");
+        let working = trees.path().join("working");
+        let outside = trees.path().join("outside");
+        for dir in [&home, &working, &outside] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let mapping = |host: &Path, sandbox: &str| common::FsMapping {
+            host_path: host.to_str().unwrap().to_string(),
+            sandbox_path: Some(sandbox.to_string()),
+            read_only: true,
+            ..Default::default()
+        };
+        let mappings = vec![
+            mapping(&home.join(".config/x"), "/home/.config/x"),
+            mapping(&working.join("w"), "/workbench/w"),
+            mapping(&outside, "/home/o"),
+        ];
+        let config = Config::new("test-session-binds")
+            .with_dns(false)
+            .with_session_dirs_mapped(home.clone(), working.clone(), mappings);
+        let sandbox = Sandbox::new(base, config, ()).expect("a session sandbox");
+        let container = sandbox
+            .new_container(&network::NetPlan::host())
+            .expect("the session's container");
+
+        let mounts = format!("{:?}", container.container);
+        let source = |path: &Path| format!("source: {:?}", path.to_str().unwrap());
+        let target = |path: &str| format!("target: {path:?}");
+        assert!(
+            mounts.contains(&source(&home)) && mounts.contains(&target("/home")),
+            "the home itself is still hakoniwa's: {mounts}"
+        );
+        for (host, sandbox_path) in [
+            (home.join(".config/x"), "/home/.config/x"),
+            (working.join("w"), "/workbench/w"),
+        ] {
+            assert!(
+                !mounts.contains(&source(&host)) && !mounts.contains(&target(sandbox_path)),
+                "{sandbox_path} is not hakoniwa's to bind by path: {mounts}"
+            );
+        }
+        assert!(
+            mounts.contains(&source(&outside))
+                && mounts.contains(&target("/.minimal-patch/0"))
+                && !mounts.contains(&target("/home/o")),
+            "the mapping from outside lands on its stage, not under /home: {mounts}"
+        );
+        let binds: Vec<&str> = container
+            .session_binds
+            .iter()
+            .map(|b| b.target.as_str())
+            .collect();
+        assert_eq!(
+            binds,
+            vec!["/home/.config/x", "/home/o", "/workbench/w"],
+            "the closure binds every one of them, in target order"
+        );
+    }
+
     // ---------------------------------------------------------------------
     // NET-079: each host-address box in its own classifier leaf, kept there.
     // ---------------------------------------------------------------------
@@ -6224,6 +6350,20 @@ int main(int argc, char **argv) {
         force_cover_fallback: bool,
         plan: Option<network::NetPlan>,
     ) -> HeldProbe {
+        launch_box_probe_configured(name, leaf, probe_args, force_cover_fallback, plan, |c| c).await
+    }
+
+    /// [`launch_box_probe_under`], with the box's configuration passed
+    /// through `configure` before it is built: a session layout, say.
+    #[cfg(target_os = "linux")]
+    async fn launch_box_probe_configured(
+        name: &str,
+        leaf: Option<config::ClassifierLeaf>,
+        probe_args: &[String],
+        force_cover_fallback: bool,
+        plan: Option<network::NetPlan>,
+        configure: impl FnOnce(Config) -> Config,
+    ) -> HeldProbe {
         use std::io::Read as _;
 
         let base_dir = box_base_dir(name);
@@ -6233,9 +6373,10 @@ int main(int argc, char **argv) {
         let source = build.path().join("rootfs-src");
         probe_rootfs(&source, &probe);
 
-        let mut config = Config::new(name)
+        let config = Config::new(name)
             .with_rootfs(std::iter::once(SandboxMapped::Dir(source)))
             .with_dns(false);
+        let mut config = configure(config);
         if let Some(leaf) = leaf {
             config = config.with_classifier_leaf(leaf);
         }
@@ -6471,6 +6612,93 @@ int main(int argc, char **argv) {
     /// box's own unprivileged user can still open a PTY pair. A remount that
     /// restated only `max=` would reset `ptmxmode` to 0000 and break every
     /// PTY in every box; this is the test that catches it.
+    /// inbox#1152, end to end through the production launch: a session box
+    /// with a read-only patch in its home, one in its workbench, and one from
+    /// outside both that lands under `/home` has each of them mounted
+    /// read-only at its place by the pre-exec closure before the program
+    /// runs, and the stage the outside one came through is gone.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_closure_binds_a_session_boxs_patches_at_their_place() {
+        if let Some(reason) = user_namespaces_restriction() {
+            eprintln!(
+                "skipping the_closure_binds_a_session_boxs_patches_at_their_place: this host \
+                 denies the unprivileged user namespace every sandbox starts by unsharing: \
+                 {reason}"
+            );
+            return;
+        }
+        let name = "session-binds";
+        let base_dir = box_base_dir(name);
+        let trees = tempfile::tempdir_in(&base_dir)
+            .unwrap_or_else(|e| panic!("a temp dir under {}: {e}", base_dir.display()));
+        let home = trees.path().join("home");
+        let working = trees.path().join("working");
+        let outside = trees.path().join("outside");
+        for (dir, token) in [
+            (home.join("x"), "IN"),
+            (working.join("w"), "WB"),
+            (outside.clone(), "OUT"),
+        ] {
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("token"), token).unwrap();
+        }
+        let mapping = |host: &Path, sandbox: &str| common::FsMapping {
+            host_path: host.to_str().unwrap().to_string(),
+            sandbox_path: Some(sandbox.to_string()),
+            read_only: true,
+            ..Default::default()
+        };
+        let mappings = vec![
+            mapping(&home.join("x"), "/home/x"),
+            mapping(&working.join("w"), "/workbench/w"),
+            mapping(&outside, "/home/o"),
+        ];
+        let patches = ["/home/x", "/workbench/w", "/home/o"];
+        let mut probe_args: Vec<String> = patches
+            .iter()
+            .flat_map(|p| [format!("MOUNTINFO:{p}"), format!("WRITE:{p}/token")])
+            .collect();
+        probe_args.push("MOUNTINFO:/.minimal-patch".to_string());
+        let (session_home, session_working) = (home.clone(), working.clone());
+        let held = launch_box_probe_configured(name, None, &probe_args, false, None, |config| {
+            config.with_session_dirs_mapped(session_home, session_working, mappings)
+        })
+        .await;
+        let report = held.release_and_report().await;
+
+        for patch in patches {
+            let mount = report
+                .get(&format!("mountinfo {patch}"))
+                .cloned()
+                .unwrap_or_else(|| "no report".to_string());
+            let flags: Vec<&str> = mount
+                .split_whitespace()
+                .nth(5)
+                .unwrap_or_default()
+                .split(',')
+                .collect();
+            assert!(
+                mount != "absent" && flags.contains(&"ro") && flags.contains(&"nosuid"),
+                "{patch} is a read-only, nosuid mount of its own in the box: {mount:?}"
+            );
+            assert_eq!(
+                report.get(&format!("open {patch}/token")).map(String::as_str),
+                Some("errno 30"),
+                "{patch}/token cannot be opened for writing (EROFS): {report:?}"
+            );
+        }
+        assert_eq!(
+            report.get("mountinfo /.minimal-patch").map(String::as_str),
+            Some("absent"),
+            "the stage is unmounted before the program runs: {report:?}"
+        );
+        assert!(
+            home.join("o").is_dir() && !outside.join("o").exists(),
+            "the outside mapping's mount point was made in the home, beneath it"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn box_devpts_is_capped_and_still_opens_a_pty() {
