@@ -363,7 +363,10 @@ mod tests {
         );
 
         let bytes = expansion.spec_bytes().expect("spec writes");
-        assert!(!bytes.contains("egress_"), "no flat key in the bytes: {bytes}");
+        assert!(
+            !bytes.contains("egress_"),
+            "no flat key in the bytes: {bytes}"
+        );
 
         let (_, err) = expand_network(
             "[sessions.dev.network]\negress_allow_subnets = \"10.0.0.0/8\"\n",
