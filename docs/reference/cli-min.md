@@ -679,10 +679,11 @@ anything other than the `kvm` group membership ends with
 the `kvm` group ends with
 `KVM group membership starts at your next login: log out and back in, or restart the daemon from a new login.`
 When both apply, both lines print, the login line last. When the step that
-enforces deny-all egress installs while a daemon is running, the script also
-prints `note: a Minimal daemon is running. If a box you start next still says this machine cannot enforce its egress, restart the daemon: min stop --force, and your next min command starts it again (sessions survive the restart).`
+enforces deny-all egress installs while a daemon is running, on a host with
+systemd, the script also prints `note: a Minimal daemon is running. If a box you start next still says this machine cannot enforce its egress, restart the daemon: min stop --force, and your next min command starts it again (sessions survive the restart).`
 A daemon of this release reads the machine again once the step places it, so
-the restart is for a daemon started by an earlier release.
+the restart is for a daemon started by an earlier release. Without systemd no
+unit places a restarted daemon, so the script does not advise a restart.
 On a host that needs nothing it prints
 `Every part of the install is finished on this machine; there is nothing to run.`
 and exits 0. It lists a fact that no script can change, such as cgroup2

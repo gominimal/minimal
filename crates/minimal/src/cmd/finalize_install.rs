@@ -756,7 +756,8 @@ pub(crate) mod linux {
 
     /// What the step's `--place-listener` prints when no process holds the
     /// daemon's socket, so no daemon is running: the classifier block prints
-    /// [`DAEMON_RUNNING_NOTE`] for any other outcome.
+    /// [`DAEMON_RUNNING_NOTE`] for any other outcome, on a host where it
+    /// installed the socket unit that places the restarted daemon.
     pub(crate) const PLACE_NO_HOLDER: &str = "no process holds ";
 
     pub(crate) const USERNS_ID: &str = "userns-profile";
@@ -1345,6 +1346,7 @@ pub(crate) mod linux {
              # the script above.\n\
              if ! command -v systemctl >/dev/null 2>&1 ; then\n\
              \x20 echo 'note: no systemctl on this host: the placement socket is not installed, so place each daemon start by hand with the install script'\n\
+             \x20 place_units=no\n\
              else\n\
              cat > {CLASSIFIER_UNIT_SERVICE_PATH} <<\\MINIMAL_CLASSIFIER_SERVICE_EOF\n\
              [Unit]\n\
@@ -1395,14 +1397,18 @@ pub(crate) mod linux {
              systemctl daemon-reload\n\
              systemctl enable {CLASSIFIER_SYSTEMD_UNIT}.service\n\
              systemctl enable --now {PLACE_SYSTEMD_UNIT}.socket\n\
+             place_units=yes\n\
              fi\n\
              # The daemon that may already be listening is placed now; later starts ask\n\
              # the socket unit. A daemon that was running read this machine before the\n\
-             # step installed, so the run says how to make it read the machine again.\n\
+             # step installed, so the run says how to make it read the machine again: a\n\
+             # restart, which the socket unit places. Without the units a restarted\n\
+             # daemon stands outside its leaf, so the run does not advise one.\n\
              place_out=$({CLASSIFIER_PROGRAM_PATH} --user '{operator}' \
              --place-listener '{socket}')\n\
              printf '%s\\n' \"$place_out\"\n\
-             case \"$place_out\" in\n\
+             case \"$place_units:$place_out\" in\n\
+             no:*) ;;\n\
              *'{PLACE_NO_HOLDER}'*) ;;\n\
              *) echo '{DAEMON_RUNNING_NOTE}' ;;\n\
              esac\n"
@@ -3837,8 +3843,9 @@ mod tests {
             "WantedBy=multi-user.target\n".to_string(),
             "systemctl daemon-reload\n".to_string(),
             "systemctl enable minimald-classifier.service\n".to_string(),
-            "systemctl enable --now minimald-place.socket\n".to_string(),
+            "systemctl enable --now minimald-place.socket\nplace_units=yes\nfi\n".to_string(),
             "if ! command -v systemctl >/dev/null 2>&1 ; then\n".to_string(),
+            "  place_units=no\nelse\n".to_string(),
         ] {
             assert!(script.contains(&line), "the block runs {line:?}: {script}");
         }
@@ -3861,7 +3868,8 @@ mod tests {
         );
         // The daemon already listening is placed once the units are in,
         // with or without systemd, and a run that found it running says how
-        // to restart it (gominimal/inbox#1054).
+        // to restart it when the socket unit will place the restarted daemon
+        // (gominimal/inbox#1054).
         let (_, after_units) = unit_part
             .rsplit_once("\nfi\n")
             .expect("the unit guard closes");
@@ -3869,10 +3877,13 @@ mod tests {
             after_units.starts_with(&format!(
                 "# The daemon that may already be listening is placed now; later starts ask\n\
                  # the socket unit. A daemon that was running read this machine before the\n\
-                 # step installed, so the run says how to make it read the machine again.\n\
+                 # step installed, so the run says how to make it read the machine again: a\n\
+                 # restart, which the socket unit places. Without the units a restarted\n\
+                 # daemon stands outside its leaf, so the run does not advise one.\n\
                  place_out=$({CLASSIFIER_PROGRAM_PATH} --user 'alice' --place-listener '{sock}')\n"
             )) && after_units.ends_with(&format!(
-                "*'{PLACE_NO_HOLDER}'*) ;;\n*) echo '{DAEMON_RUNNING_NOTE}' ;;\nesac\n"
+                "case \"$place_units:$place_out\" in\nno:*) ;;\n\
+                 *'{PLACE_NO_HOLDER}'*) ;;\n*) echo '{DAEMON_RUNNING_NOTE}' ;;\nesac\n"
             )),
             "{unit_part}"
         );
@@ -3943,12 +3954,14 @@ mod tests {
 
         /// Runs the block under a fresh scratch root, with the step
         /// replaced by `stub` and, when `installed` is set, a previous copy
-        /// and units already in place. Returns the root, the exit code,
-        /// the scratch paths of the copy and the units directory, and what
-        /// the block printed.
+        /// and units already in place. Without `systemd` the block takes its
+        /// no-systemctl branch. Returns the root, the exit code, the scratch
+        /// paths of the copy and the units directory, and what the block
+        /// printed.
         fn run_block(
             stub: &str,
             installed: bool,
+            systemd: bool,
         ) -> (
             tempfile::TempDir,
             Option<i32>,
@@ -4003,9 +4016,17 @@ mod tests {
                 sock.to_str().expect("the temp root is UTF-8"),
             );
             let plan = Plan { items: vec![item] };
-            let script = plan
-                .script()
-                .expect("a missing item carries its block")
+            let guard = "if ! command -v systemctl >/dev/null 2>&1 ; then";
+            let script = plan.script().expect("a missing item carries its block");
+            assert!(script.contains(guard), "the block guards its units on systemctl");
+            // The host's own systemctl is on the confined PATH, so the
+            // no-systemctl branch is taken by rewriting the guard.
+            let script = if systemd {
+                script
+            } else {
+                script.replace(guard, "if true ; then")
+            };
+            let script = script
                 .replace(CLASSIFIER_SCRIPT, stub)
                 .replace(ANSWERER_PROGRAM_DIR, &lib.display().to_string())
                 .replace("/etc/systemd/system", &units.display().to_string())
@@ -4018,7 +4039,7 @@ mod tests {
         }
 
         let refusing = "#!/bin/sh\necho 'refusing: a connection-mark conflict' >&2\nexit 3\n";
-        let (root, code, copy, units, printed) = run_block(refusing, true);
+        let (root, code, copy, units, printed) = run_block(refusing, true, true);
         assert_eq!(code, Some(3), "the block exits with the step's status");
         assert_eq!(
             std::fs::read_to_string(&copy).expect("the copy is still there"),
@@ -4050,7 +4071,7 @@ mod tests {
             "a refused step touches no unit"
         );
 
-        let (_fresh, code, copy, _, _) = run_block(refusing, false);
+        let (_fresh, code, copy, _, _) = run_block(refusing, false, true);
         assert_eq!(code, Some(3));
         assert!(
             !copy.exists(),
@@ -4066,7 +4087,7 @@ mod tests {
         // running daemon holding its socket, so the run says to restart it.
         let installing = "#!/bin/sh\n[ \"${3:-}\" != --place-listener ] || \
                           echo \"placed 4242 in the daemon leaf (it holds $4)\"\nexit 0\n";
-        let (root, code, copy, units, printed) = run_block(installing, true);
+        let (root, code, copy, units, printed) = run_block(installing, true, true);
         assert!(
             printed.contains("placed 4242 in the daemon leaf")
                 && printed.contains(DAEMON_RUNNING_NOTE),
@@ -4095,11 +4116,22 @@ mod tests {
         // has no daemon to restart.
         let nobody = "#!/bin/sh\n[ \"${3:-}\" != --place-listener ] || \
                       echo \"no process holds $4: nothing to place\"\nexit 0\n";
-        let (_nobody, code, _, _, printed) = run_block(nobody, true);
+        let (_nobody, code, _, _, printed) = run_block(nobody, true, true);
         assert_eq!(code, Some(0));
         assert!(
             printed.contains(PLACE_NO_HOLDER) && !printed.contains(DAEMON_RUNNING_NOTE),
             "no daemon, no restart note: {printed}"
+        );
+        // No systemctl: the running daemon is placed live, but a restart
+        // would leave it outside its leaf with no unit to place it, so the
+        // run says nothing about restarting it.
+        let (_bare, code, _, _, printed) = run_block(installing, true, false);
+        assert_eq!(code, Some(0));
+        assert!(
+            printed.contains("the placement socket is not installed")
+                && printed.contains("placed 4242 in the daemon leaf")
+                && !printed.contains(DAEMON_RUNNING_NOTE),
+            "no units, no restart note: {printed}"
         );
         // The phrase the block matches is the one the step prints.
         assert!(
