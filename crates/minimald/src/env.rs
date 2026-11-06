@@ -2345,10 +2345,13 @@ impl BoxChannel {
         }
         let mut result = result.map(|_| ());
         // A stdin that stopped before its end, while the task read it, fails
-        // the run: the task did not get all of its input.
+        // a run that passed: the task did not get all of its input. A run
+        // that failed keeps its own error, so the task's exit code stays.
         if let Some(error) = forwarded.and_then(|f| f.failure()) {
             tracing::warn!(task = %task_name, %error, "the forwarded stdin stopped before its end");
-            result = Err(forwarded_stdin_error(&error));
+            if result.is_ok() {
+                result = Err(forwarded_stdin_error(&error));
+            }
         }
         if relays && let Some(code) = relayed_exit_code(&result) {
             // BCLI-010 (T62): the helper exits with this code, so a task
@@ -3400,7 +3403,7 @@ async fn run_invocations_in(
         if let Some(dir) = dir {
             cmd.current_dir(dir);
         }
-        let stdin = stdin.as_deref_mut().filter(|_| idx == 0);
+        let mut stdin = stdin.as_deref_mut().filter(|_| idx == 0);
         if stdin.is_some() {
             cmd.stdin(hakoniwa::Stdio::piped());
         }
@@ -3419,7 +3422,7 @@ async fn run_invocations_in(
                 return Err(e.into());
             }
         };
-        if let Some(slot) = stdin {
+        if let Some(slot) = stdin.as_deref_mut() {
             let started = match child.stdin.take() {
                 Some(pipe) => crate::exec::ForwardedStdin::start(
                     stream,
@@ -3456,6 +3459,11 @@ async fn run_invocations_in(
             child.wait()
         })
         .await;
+        // The task ended, so a read of the forwarded stdin that fails now
+        // does not fail the run.
+        if let Some(Some(forwarded)) = stdin.as_deref() {
+            forwarded.task_ended();
+        }
         guard.teardown().await;
         drop(container);
         let status = status
@@ -4827,6 +4835,7 @@ exit $rc
             out.join().unwrap();
             err.join().unwrap();
             let status = task.wait().unwrap();
+            forwarded.task_ended();
             let result = match status.code() {
                 Some(0) => Ok(true),
                 code => Err(Error::Execution {
@@ -4889,6 +4898,65 @@ exit $rc
         assert_eq!(code, 0, "{stdout} {stderr}");
         assert_eq!(stdout, "y\n");
         assert!(stderr.is_empty(), "{stderr}");
+    }
+
+    /// Ends a run with `result` while its forwarded stdin fails with a
+    /// reset connection, before or after the task ended, and returns what
+    /// the channel sends the helper.
+    fn end_run_after_a_stdin_reset(result: Result<bool, Error>, after_task_ended: bool) -> String {
+        use std::io::Read as _;
+        let (connection, helper) = UnixStream::pair().unwrap();
+        let mut forwarded =
+            crate::exec::ForwardedStdin::start(&connection, std::io::sink()).unwrap();
+        if after_task_ended {
+            forwarded.task_ended();
+        }
+        // A peer that closes with unread data resets the connection, so the
+        // copy's next read fails.
+        (&connection).write_all(b"unread").unwrap();
+        drop(helper);
+        forwarded.wait_for_copy_end();
+        let (mut ours, mut theirs) = UnixStream::pair().unwrap();
+        BoxChannel::end_task_run(
+            &mut ours,
+            true,
+            "err",
+            "query",
+            result,
+            Some(&mut forwarded),
+        );
+        drop(ours);
+        let mut sent = String::new();
+        theirs.read_to_string(&mut sent).unwrap();
+        sent
+    }
+
+    // T123, BOX-038: a task that fails with its own code while its
+    // forwarded stdin fails still ends with its own code.
+    #[test]
+    fn task_run_pipes_stdin_through_the_in_box_helper_keeps_a_failed_task_code() {
+        let failed = Err(Error::Execution {
+            idx: 0,
+            code: 4,
+            reason: String::new(),
+            stderr: String::new(),
+            stdout: String::new(),
+        });
+        let sent = end_run_after_a_stdin_reset(failed, false);
+        assert!(sent.ends_with("exit:4\n"), "{sent:?}");
+        // The same reset while the task read its stdin fails a run that
+        // passed, so the reset above did reach the run.
+        let sent = end_run_after_a_stdin_reset(Ok(true), false);
+        assert!(!sent.contains("exit:0"), "{sent:?}");
+        assert!(sent.contains("could not pass its stdin"), "{sent:?}");
+    }
+
+    // T123, BOX-038: a forwarded stdin that fails after the task ended
+    // with 0 leaves the run's code 0.
+    #[test]
+    fn task_run_pipes_stdin_through_the_in_box_helper_keeps_a_pass_after_the_task_ended() {
+        let sent = end_run_after_a_stdin_reset(Ok(true), true);
+        assert_eq!(sent, "exit:0\n");
     }
 
     /// BCLI-010 (T62): a refusal for a project configuration error exits 3,

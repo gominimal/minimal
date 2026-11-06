@@ -974,6 +974,7 @@ pub(crate) struct ForwardedStdin {
     connection: std::os::unix::net::UnixStream,
     done: std::sync::mpsc::Receiver<io::Result<()>>,
     ended: bool,
+    task_ended: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ForwardedStdin {
@@ -985,16 +986,35 @@ impl ForwardedStdin {
         let reader = connection.try_clone()?;
         let connection = connection.try_clone()?;
         let (tx, done) = std::sync::mpsc::channel();
+        let task_ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ended_flag = task_ended.clone();
         std::thread::Builder::new()
             .name("task-stdin".to_string())
             .spawn(move || {
-                let _ = tx.send(copy_forwarded_stdin(reader, task_stdin));
+                let _ = tx.send(copy_forwarded_stdin(reader, task_stdin, &ended_flag));
             })?;
         Ok(Self {
             connection,
             done,
             ended: false,
+            task_ended,
         })
+    }
+
+    /// Records that the task ended. A read of the connection that fails
+    /// after this is not an error: the task no longer reads its stdin.
+    pub(crate) fn task_ended(&self) {
+        self.task_ended
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Waits for the copy to end, and keeps its result for [`Self::failure`].
+    #[cfg(test)]
+    pub(crate) fn wait_for_copy_end(&mut self) {
+        let result = self.done.recv().unwrap_or(Ok(()));
+        let (tx, done) = std::sync::mpsc::channel();
+        let _ = tx.send(result);
+        self.done = done;
     }
 
     /// The error that stopped the copy while the task still read its
@@ -1034,8 +1054,13 @@ impl ForwardedStdin {
 /// Copies `from` to `to` until `from` ends, and closes `to` then. A write
 /// that fails means the task closed its stdin or ended. The copy then
 /// drops the rest of `from` and reads on to its end. Only a read that
-/// fails while the task reads its stdin is an error.
-fn copy_forwarded_stdin(mut from: impl io::Read, to: impl io::Write) -> io::Result<()> {
+/// fails while the task reads its stdin is an error. A read that fails
+/// once `task_ended` is set is not.
+fn copy_forwarded_stdin(
+    mut from: impl io::Read,
+    to: impl io::Write,
+    task_ended: &std::sync::atomic::AtomicBool,
+) -> io::Result<()> {
     let mut to = Some(to);
     let mut buf = vec![0u8; 64 * 1024];
     loop {
@@ -1043,7 +1068,9 @@ fn copy_forwarded_stdin(mut from: impl io::Read, to: impl io::Write) -> io::Resu
             Ok(0) => return Ok(()),
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) if to.is_some() => return Err(e),
+            Err(e) if to.is_some() && !task_ended.load(std::sync::atomic::Ordering::SeqCst) => {
+                return Err(e);
+            }
             Err(_) => return Ok(()),
         };
         if let Some(pipe) = to.as_mut()
