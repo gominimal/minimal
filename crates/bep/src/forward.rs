@@ -357,6 +357,24 @@ pub trait Redeemer: Send + Sync {
         let (verdict, jti) = self.redeem_with_jti(box_id, authority, request, sealed);
         (Redeemed::Verdict(verdict), jti)
     }
+
+    /// Decides one request as [`Self::redeem_reference`] does, and gives the
+    /// box id its audit record names as its subject, third. The default
+    /// subject is the flow's own box. A redeemer gives another box where the
+    /// flow names no single box, as a `host_ip` cohort delivery does
+    /// (BEP-084). It decides the subject in the same step as the verdict,
+    /// so the record names the box the verdict was reached for.
+    fn redeem_attributed(
+        &self,
+        box_id: &str,
+        authority: &Authority<String>,
+        request: &RequestAuthority<String>,
+        sealed: &str,
+        header: &str,
+    ) -> (Redeemed, String, String) {
+        let (redeemed, jti) = self.redeem_reference(box_id, authority, request, sealed, header);
+        (redeemed, jti, box_id.to_owned())
+    }
 }
 
 /// What [`SingleFlight::run`] gave its caller.
@@ -879,6 +897,7 @@ impl Flow {
         at: &SealedAt,
         admit: StoreAdmit,
         jti: &str,
+        subject: &str,
     ) -> Result<String, &'static str> {
         let span = tracing::Span::current();
         let identifier = admit.identifier();
@@ -944,7 +963,8 @@ impl Flow {
                 span.record("identifier", identifier.as_str());
                 span.record("substitution", "substituted");
                 span.record("cohort_attributed", admit.cohort_attributed);
-                self.record(
+                self.record_for(
+                    subject,
                     Outcome::Admit,
                     admit.marker,
                     Some(identifier),
@@ -955,7 +975,8 @@ impl Flow {
             }
             Err(marker) => {
                 span.record("substitution", "refused");
-                self.record(
+                self.record_for(
+                    subject,
                     Outcome::Refuse,
                     Some(marker),
                     Some(identifier),
@@ -979,9 +1000,22 @@ impl Flow {
         jti: &str,
         mapping: Mapping,
     ) {
+        self.record_for(&self.box_id, outcome, marker, identifier, jti, mapping);
+    }
+
+    /// [`Self::record`], with `subject` as the record's box.
+    fn record_for(
+        &self,
+        subject: &str,
+        outcome: Outcome,
+        marker: Option<&str>,
+        identifier: Option<String>,
+        jti: &str,
+        mapping: Mapping,
+    ) {
         self.audit.write(&Decision {
             kind: Kind::Decision,
-            box_id: self.box_id.clone(),
+            box_id: subject.to_owned(),
             authority: self.authority_text(),
             identifier,
             jti: jti.to_owned(),
@@ -1026,11 +1060,14 @@ impl Flow {
         }
         match carried(request) {
             Carried::Sealed(at) => {
+                // The record's box is the one the redeemer names for the
+                // value: the flow's own, or for a cohort flow the box the
+                // value names (BEP-084).
                 let header = request
                     .headers
                     .get(at.header)
                     .map_or("", |h| h.name.as_str());
-                let (redeemed, jti) = self.redeemer.redeem_reference(
+                let (redeemed, jti, subject) = self.redeemer.redeem_attributed(
                     &self.box_id,
                     &self.authority,
                     &plain.request,
@@ -1039,7 +1076,9 @@ impl Flow {
                 );
                 let verdict = match redeemed {
                     Redeemed::Store(admit) => {
-                        return self.inject_store(request, &at, admit, &jti).map(Some);
+                        return self
+                            .inject_store(request, &at, admit, &jti, &subject)
+                            .map(Some);
                     }
                     Redeemed::Verdict(verdict) => verdict,
                 };
@@ -1055,7 +1094,8 @@ impl Flow {
                         if renewed {
                             // BEP-069: the renewal is its own audit record,
                             // written before the request's decision.
-                            self.record(
+                            self.record_for(
+                                &subject,
                                 Outcome::Admit,
                                 Some(SIGN_IN_RENEWED),
                                 Some(identifier.clone()),
@@ -1078,7 +1118,8 @@ impl Flow {
                             // The module mapped the request, so the refusal
                             // records the mapping (Gatehouse §6.10).
                             span.record("substitution", "refused");
-                            self.record(
+                            self.record_for(
+                                &subject,
                                 Outcome::Refuse,
                                 Some(marker),
                                 Some(identifier),
@@ -1092,12 +1133,20 @@ impl Flow {
                         // substitution never shows the cohort flag.
                         span.record("cohort_attributed", cohort_attributed);
                         // BEP-028: a cohort admission keeps its marker.
-                        self.record(Outcome::Admit, admitted, Some(identifier), &jti, mapping);
+                        self.record_for(
+                            &subject,
+                            Outcome::Admit,
+                            admitted,
+                            Some(identifier),
+                            &jti,
+                            mapping,
+                        );
                         Ok(None)
                     }
                     Verdict::Refuse(marker) => {
                         span.record("substitution", "refused");
-                        self.record(
+                        self.record_for(
+                            &subject,
                             Outcome::Refuse,
                             Some(marker),
                             None,

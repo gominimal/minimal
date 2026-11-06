@@ -100,13 +100,106 @@ impl crate::net::classifier::CgroupMoves for HostMoves {
             leaf,
         )
     }
+
+    // BEP-083: the lane set changes through the helper's lane verbs.
+    fn add_lane_leaf(&self, leaf: &std::path::Path) -> std::io::Result<()> {
+        change_lane_set("lane-add", leaf)
+    }
+
+    fn remove_lane_leaf(&self, leaf: &std::path::Path) -> std::io::Result<()> {
+        change_lane_set("lane-remove", leaf)
+    }
+}
+
+/// Changes the guest table's lane set for the box leaf `leaf` (BEP-083):
+/// `verb` is the helper's `lane-add` or `lane-remove`. A daemon that does
+/// not run as root runs the helper through `sudo -n`, as it does for the
+/// blocked-leaves set. A daemon that runs as root, as the VM guest's does,
+/// has no helper and no `sudo` to run, so it hands `nft` the element the
+/// helper would.
+fn change_lane_set(verb: &str, leaf: &std::path::Path) -> std::io::Result<()> {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    if unsafe { libc::geteuid() } != 0 {
+        return run_quic443_leaf_helper(
+            std::path::Path::new("sudo"),
+            std::path::Path::new(QUIC443_LEAF_HELPER),
+            verb,
+            leaf,
+        );
+    }
+    run_lane_nft(
+        std::path::Path::new(crate::net::classifier::GUEST_NFT),
+        std::path::Path::new(sandbox::classifier::CONVENTIONAL_CGROUP2_MOUNTPOINT),
+        verb,
+        leaf,
+    )
+}
+
+/// The root daemon's half of [`change_lane_set`]: runs `nft` to add or
+/// delete the element for `leaf`, spelled as its path below the cgroup2
+/// mount `mount`, in the table's lane set. A refusal is logged with what
+/// `nft` said, and returned.
+fn run_lane_nft(
+    nft: &std::path::Path,
+    mount: &std::path::Path,
+    verb: &str,
+    leaf: &std::path::Path,
+) -> std::io::Result<()> {
+    // The helper refuses a verb it does not know, and so does this path.
+    let nft_verb = match verb {
+        "lane-add" => "add",
+        "lane-remove" => "delete",
+        other => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{other} is not a lane verb"),
+            ));
+        }
+    };
+    let rel = leaf.strip_prefix(mount).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not below {}", leaf.display(), mount.display()),
+        )
+    })?;
+    let ran = std::process::Command::new(nft)
+        .arg(nft_verb)
+        .arg("element")
+        .arg("inet")
+        .arg(crate::net::classifier::TABLE_NAME)
+        .arg(crate::net::classifier::PROXY_LANE_SET)
+        .arg(format!("{{ \"{}\" }}", rel.display()))
+        .stdin(std::process::Stdio::null())
+        .output();
+    let error = match ran {
+        Ok(ran) if ran.status.success() => return Ok(()),
+        Ok(ran) => std::io::Error::other(format!(
+            "{} exited with {}: {}",
+            nft.display(),
+            ran.status,
+            String::from_utf8_lossy(&ran.stderr).trim()
+        )),
+        Err(error) => std::io::Error::new(
+            error.kind(),
+            format!("cannot run {}: {error}", nft.display()),
+        ),
+    };
+    tracing::warn!(
+        leaf = %leaf.display(),
+        verb,
+        %error,
+        "nft refused a change to the set of leaves that can connect to the proxy's address"
+    );
+    Err(error)
 }
 
 /// The `host_ip` launch's half of the cohort's QUIC stance (BEP-018): the
 /// launched box joins the daemon's cohort with its resolved `quic443`
 /// stance, and its processes move into the cohort's blocked leaf while any
 /// member blocks. A box that is not a host-address box (no
-/// `host_ip_enforcement`) shares no address and joins nothing.
+/// `host_ip_enforcement`) shares no address and joins nothing. The box
+/// joins with its lane bit (BEP-083): it declares a credentialed upstream,
+/// and the lane is in effect on a host of kind `host`.
 ///
 /// # Errors
 ///
@@ -117,6 +210,7 @@ impl crate::net::classifier::CgroupMoves for HostMoves {
 pub(super) fn join_quic443_cohort(
     record: &Record,
     host_ip_enforcement: Option<minimald_rpc::HostIpEnforcement>,
+    host: paths::HostKind,
     root: &std::path::Path,
     cohort: &std::sync::Mutex<crate::net::classifier::CohortQuic443>,
     moves: &dyn crate::net::classifier::CgroupMoves,
@@ -126,8 +220,11 @@ pub(super) fn join_quic443_cohort(
     }
     let box_id = record.id.to_string();
     let blocked = crate::net::classifier::resolved_quic443_blocked(&record.policy);
-    let placed =
-        crate::net::classifier::cohort_quic443_admit_over(cohort, root, &box_id, blocked, moves);
+    let lane = record.policy.credentialed_upstream.is_some()
+        && boxes::CredentialedUpstream::in_effect(record.network, host);
+    let placed = crate::net::classifier::cohort_quic443_admit_over(
+        cohort, root, &box_id, blocked, lane, moves,
+    );
     if let Err(error) = &placed {
         tracing::warn!(
             box_id,
@@ -336,6 +433,162 @@ pub(super) fn watch_quic443_exit(
     })
 }
 
+/// The variables a task run hands the next entrypoint launch of its box
+/// (T43). `min task run` resolves a task's `env_vars` against the caller's
+/// shell and sends them on the run's exec channel. The box's entrypoint is
+/// the in-box `min task run`, which fills the task's `inherit` variables
+/// from its own environment, so the values must reach the launch that
+/// starts it. The exec stages them here by box id, and the next
+/// [`BoxActor::ensure_host`] of the box takes them, whether it launches or
+/// not, so no value outlives the run it was sent for.
+///
+/// The run also stages the names the client's `[vars] ignore` matched
+/// (`TaskExec::drop_env`). The in-box `min task run` reads the task's
+/// declarations again from the uploaded `minimal.toml`, so a launch of the
+/// entrypoint records the names for the box ([`record`], [`drops`]), and
+/// the daemon's in-box run removes each of them from the task's variables
+/// before it fills any `inherit` one. A dropped name then never reaches the
+/// task, as on the old path. A run that joins an entrypoint already running
+/// records nothing: the in-box run it relays is the one that launch
+/// started, with that launch's names.
+///
+/// Interim: a seam beside the actor, because the actor's `EnsureHost`
+/// message carries no environment. The values move into that message
+/// when it gains one: https://github.com/gominimal/minimal/issues/3043.
+pub(crate) mod entrypoint_env {
+    use std::collections::{BTreeSet, HashMap};
+    use std::sync::{LazyLock, Mutex};
+
+    /// The variables staged for one box.
+    type Vars = Vec<(String, String)>;
+
+    /// The names a task's variables lose for one box.
+    pub(crate) type Drops = BTreeSet<String>;
+
+    /// What one run stages for its box's entrypoint launch: the variables,
+    /// the directory in the box where the entrypoint starts (`None` starts
+    /// it at the root of the tree), and the names to drop.
+    type Staged = (Vars, Option<String>, Drops);
+
+    static STAGED: LazyLock<Mutex<HashMap<boxes::SessionId, Staged>>> =
+        LazyLock::new(Mutex::default);
+
+    /// The names to drop for each box whose entrypoint a launch started
+    /// with any. Replaced by the box's next entrypoint launch. A stopped box
+    /// keeps its record, and its names with it. They are removed when the
+    /// box is destroyed ([`forget`]).
+    static DROPS: LazyLock<Mutex<HashMap<boxes::SessionId, Drops>>> = LazyLock::new(Mutex::default);
+
+    /// Stages `vars`, `start_dir` and `drops` for the next entrypoint
+    /// launch of box `id`, in place of any staged before. Only a task run
+    /// that relays the box's entrypoint stages, so a staged entry also
+    /// tells the next [`super::BoxActor::ensure_host`] that it starts the
+    /// entrypoint.
+    pub(crate) fn stage(id: boxes::SessionId, vars: Vars, start_dir: Option<String>, drops: Drops) {
+        STAGED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id, (vars, start_dir, drops));
+    }
+
+    /// Takes what is staged for box `id`: the launch's entrypoint
+    /// variables (`AttachEnv::entrypoint`), and the names to drop. A staged directory rides among the
+    /// variables under [`crate::box_runtime::START_DIR_KEY`], which the
+    /// launch takes out and starts the entrypoint in. A dropped name is left
+    /// out of them. Only a launch records the names for the box's in-box run
+    /// ([`record`]). `None` when no run staged anything.
+    pub(crate) fn take(id: &boxes::SessionId) -> Option<(Vars, Drops)> {
+        let (mut vars, start_dir, dropped) = STAGED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id)?;
+        vars.retain(|(name, _)| {
+            name != crate::box_runtime::START_DIR_KEY && !dropped.contains(name)
+        });
+        if let Some(dir) = start_dir {
+            vars.push((crate::box_runtime::START_DIR_KEY.to_string(), dir));
+        }
+        Some((vars, dropped))
+    }
+
+    /// Records `dropped` as the names box `id`'s in-box run drops, in place
+    /// of any a launch recorded before. Called by a launch of the box's
+    /// entrypoint only.
+    pub(crate) fn record(id: boxes::SessionId, dropped: Drops) {
+        let mut recorded = DROPS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if dropped.is_empty() {
+            recorded.remove(&id);
+        } else {
+            recorded.insert(id, dropped);
+        }
+    }
+
+    /// Removes all that is staged or recorded for box `id`. Called when the
+    /// box is destroyed, so neither map keeps an entry for a box that is
+    /// gone.
+    pub(crate) fn forget(id: &boxes::SessionId) {
+        STAGED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
+        DROPS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
+    }
+
+    /// The names the launch of box `id`'s entrypoint recorded to drop from
+    /// its task's variables. Empty for a box no task run launched.
+    pub(crate) fn drops(id: &boxes::SessionId) -> Drops {
+        DROPS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// Why a task run cannot start the entrypoint of a box that has its own
+/// network address while a shell for its activate hooks runs (T43). The
+/// run prints it after the line that names the task and the box. No
+/// command ends that shell, so the text states the situation and stops.
+pub(crate) const ENTRYPOINT_BEHIND_HOOK_SHELL: &str = "The box has its own network address. \
+     The shell that ran the project's activate hooks holds that address, \
+     and that shell does not end.";
+
+/// The refusal of a task run whose entrypoint cannot start behind a hook
+/// shell, as [`BoxActor::ensure_host`] returns it inside
+/// [`AttachError::SpawnFailed`]. The run finds it by type, not by text,
+/// and answers with [`ENTRYPOINT_BEHIND_HOOK_SHELL`].
+///
+/// Known gap: this refusal fails closed, so a box with its own network
+/// address and activate hooks cannot run its task. Tracked by
+/// https://github.com/gominimal/minimal/issues/3042.
+#[derive(Debug)]
+pub(crate) struct EntrypointBehindHookShell;
+
+impl std::fmt::Display for EntrypointBehindHookShell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(ENTRYPOINT_BEHIND_HOOK_SHELL)
+    }
+}
+
+impl std::error::Error for EntrypointBehindHookShell {}
+
+impl EntrypointBehindHookShell {
+    /// Whether `error` is this refusal.
+    pub(crate) fn is(error: &AttachError) -> bool {
+        matches!(
+            error,
+            AttachError::SpawnFailed(e)
+                if e.get_ref().is_some_and(|inner| inner.is::<EntrypointBehindHookShell>())
+        )
+    }
+}
+
 /// The actor's end of an [`watch_entrypoint_exit`] watch: it receives how
 /// the watched host's runtime loop ended, once, when it ends with an exit.
 pub(super) type EntrypointWatch = tokio::sync::oneshot::Receiver<box_runtime::HostExit>;
@@ -345,6 +598,16 @@ pub(super) type EntrypointWatch = tokio::sync::oneshot::Receiver<box_runtime::Ho
 /// as a spec stored without `box.lifetime` does.
 pub(super) fn ends_with_entrypoint(spec: Option<&mfile::spec::BoxSpec>) -> bool {
     spec.is_none_or(|spec| spec.lifetime == mfile::spec::Lifetime::UntilComplete)
+}
+
+/// The entry a box runs as its entrypoint and ends with (T43): the spec
+/// sets `lifetime = "until_complete"` and names an argv entrypoint. A task
+/// run relays such a box's entrypoint, and the daemon log names the entry
+/// when it returns. The settings decide it, never the Box Type's name.
+pub(crate) fn entry_run_as_entrypoint(spec: &mfile::spec::BoxSpec) -> Option<&str> {
+    let runs = spec.lifetime == mfile::spec::Lifetime::UntilComplete
+        && matches!(spec.entrypoint, mfile::spec::Entrypoint::Exec(_));
+    runs.then_some(spec.entry.as_str())
 }
 
 /// Watches a host's runtime loop `task` for the box's actor. When the loop
@@ -358,9 +621,16 @@ pub(super) fn ends_with_entrypoint(spec: Option<&mfile::spec::BoxSpec>) -> bool 
 ///
 /// The handle it returns stands in for `task`, as [`watch_quic443_exit`]'s
 /// does: it yields the loop's result, and an abort of it aborts the loop.
+///
+/// `entry` names the task a launch runs as its entrypoint (see
+/// [`entry_run_as_entrypoint`]). When that entrypoint returns on its own,
+/// the watch logs the box, the task and the exit code. It logs whether or
+/// not a client is connected, so the daemon log names each task box's end.
 pub(super) fn watch_entrypoint_exit(
     task: JoinHandle<Result<box_runtime::HostExit, std::io::Error>>,
     box_id: boxes::SessionId,
+    box_name: String,
+    entry: Option<String>,
 ) -> (
     JoinHandle<Result<box_runtime::HostExit, std::io::Error>>,
     EntrypointWatch,
@@ -375,6 +645,26 @@ pub(super) fn watch_entrypoint_exit(
     let watched = crate::traced::spawn_detached(root, async move {
         let result = task.await;
         abort_loop.disarm();
+        if let (Ok(Ok(exit)), Some(task)) = (&result, entry.as_deref())
+            && !exit.requested
+        {
+            let exit_code = exit
+                .reason
+                .as_ref()
+                .and_then(|r| r.exit_code)
+                .unwrap_or(exit.code);
+            tracing::info!(
+                box_id = %box_id,
+                box_name = %box_name,
+                task,
+                exit_code,
+                "task box ended: its entrypoint returned"
+            );
+        }
+        #[cfg(test)]
+        if let Some(hold) = super::exit_settle_seam::held(&box_id) {
+            tokio::time::sleep(hold).await;
+        }
         if let Ok(Ok(exit)) = &result {
             // The actor may be gone, or may hold a later launch's watch: the
             // exit is then nobody's to act on.
@@ -874,19 +1164,17 @@ impl BoxActor {
                 ),
             ))
         })?;
-        // Interim: `run_by_exec` is `true` on every launch, so every launch,
-        // a hook launch and an attach included, starts the shell, and a task
-        // box does not start its spec's argv. `min task run` sends the task's
-        // run over the exec channel, so the shell keeps the task to one run.
-        // Flip condition: T43 (#2405) moves a task's run from the exec
-        // channel to the box's entrypoint, and removes this constant.
-        let spec = box_runtime::LaunchSpec {
-            spec,
-            run_by_exec: true,
-        };
+        // A hook launch holds the shell. Every other launch starts the
+        // spec's entrypoint, so a task box runs its task as its first
+        // process, and the box ends when that process returns (BOX-038).
+        let spec = box_runtime::LaunchSpec { spec, for_hooks };
         // Read before the launcher takes the spec: the host hands it to each
         // binding, which raises no shell-exit prompt for a box that ends.
         let ends_with_entrypoint = ends_with_entrypoint(spec.spec.as_deref());
+        let entry = (!for_hooks)
+            .then(|| spec.spec.as_deref().and_then(entry_run_as_entrypoint))
+            .flatten()
+            .map(str::to_string);
         let launcher = self
             .session_launcher(session_hnd, &record, spec, attach_env, phase, for_hooks)
             .await?;
@@ -1039,9 +1327,13 @@ impl BoxActor {
         let box_id = record.id.to_string();
         let joins = joins_quic443_cohort(&record, host_ip_enforcement);
         let launch = joins.then(|| begin_quic443_launch(&box_id, quic443_launches()));
+        // BEP-083: the lane bit is in effect for a host-address box on a VM
+        // host only, so the join reads the host kind from the switch.
+        let host_kind = box_runtime::host_kind_of(self.net_switch.lock().await.transport());
         if let Err(error) = join_quic443_cohort(
             &record,
             host_ip_enforcement,
+            host_kind,
             std::path::Path::new(sandbox::classifier::TREE_ROOT),
             crate::net::classifier::cohort_quic443(),
             &HostMoves,
@@ -1072,7 +1364,8 @@ impl BoxActor {
         };
         // BOX-038: the actor reads how this launch's loop ends. A later
         // launch replaces the watch, so an earlier loop never ends the box.
-        let (task, watch) = watch_entrypoint_exit(task, record.id);
+        let box_name = record.name.clone().unwrap_or_else(|| record.id.to_string());
+        let (task, watch) = watch_entrypoint_exit(task, record.id, box_name, entry);
         self.entrypoint_watch = Some(watch);
         // A write that fails costs only the restart's memory of who bound
         // the port, never this launch: said, and the box is handed back.
@@ -1266,18 +1559,21 @@ impl BoxActor {
         session_hnd: BoxHandle,
         conn_username: String,
     ) -> Result<box_runtime::HostHandle, AttachError> {
-        {
+        // Taken first, so a staged value never waits for a later launch.
+        let staged = entrypoint_env::take(self.record.id());
+        let entrypoint_run = staged.is_some();
+        let (staged_env, staged_drops) = staged.unwrap_or_default();
+        let holds_host_row = {
             let record = self
                 .record
                 .record()
                 .await
                 .map_err(AttachError::LoadoutFailed)?;
-            if record.status != BoxState::Active {
-                return Err(AttachError::SessionPending);
-            }
             // An ended box is resumed only by an attach (BOX-025). A host
             // launched here would run its entrypoint again behind the
-            // record's back.
+            // record's back. Checked before the `Active` gate below: an
+            // ended box is not `Active` either, and the gate's refusal says
+            // the box is still activating, which an ended box is not.
             if let Ok(
                 state @ (boxes::core::record::RecordState::Stopped(_)
                 | boxes::core::record::RecordState::Exited(_)),
@@ -1298,13 +1594,17 @@ impl BoxActor {
                     2,
                 ));
             }
+            if record.status != BoxState::Active {
+                return Err(AttachError::SessionPending);
+            }
             // Attach's refusal, for the same reason: neither the host a
             // later launch left in the slot nor a fresh one would hold the
             // registered box's host-side row.
             if self.host_row_lost(&record).await {
                 return Err(AttachError::BoxHostRowEnded);
             }
-        }
+            record.box_addresses.is_some()
+        };
 
         let running = match &self.inner {
             BoxInner::Draft { .. } => return Err(AttachError::SessionPending),
@@ -1314,22 +1614,98 @@ impl BoxActor {
             BoxInner::Active { .. } => None,
         };
         if let Some(host) = running {
-            // Same claim as the launch below, for a host this call did not
-            // mint: an exec is about to run in this sandbox, so a later
-            // attach must not replace the shell out from under it. Without
-            // this, a host minted for lifecycle hooks stays `Hooks` through
-            // every exec that reuses it, and the first interactive attach
-            // would respawn it — killing a command that is still running.
-            self.host_origin = HostOrigin::Exec;
-            return Ok(host);
+            // A hook launch holds the shell, never the spec's argv. A task
+            // run on a box whose entrypoint is an argv, a task box,
+            // replaces that shell with its entrypoint here, or the task
+            // never runs. Any other caller (an exec, an attach, a resume)
+            // keeps the shell: it staged no environment for the entrypoint.
+            // A box that holds a host-side row keeps it, as an attach keeps
+            // it.
+            let replace =
+                entrypoint_run && self.host_origin == HostOrigin::Hooks && self.starts_argv().await;
+            if replace && !holds_host_row {
+                tracing::info!(
+                    box_id = %self.record.id(),
+                    "replacing the hook-launched shell with the box's entrypoint"
+                );
+                if let BoxInner::Active {
+                    host: slot @ Some(_),
+                    ..
+                } = &mut self.inner
+                {
+                    let (handle, mut join) = slot.take().expect("matched on Some");
+                    Self::kill_and_stop_loop(&handle, &mut join, false).await;
+                }
+            } else {
+                if replace {
+                    // The hook shell never exits (BOX-015), so a run that
+                    // relayed it would wait for a task that never starts.
+                    tracing::warn!(
+                        box_id = %self.record.id(),
+                        "refused the run: replacing the hook-launched shell would end the \
+                         box's host-side row, so the box's entrypoint cannot start"
+                    );
+                    return Err(AttachError::SpawnFailed(std::io::Error::other(
+                        EntrypointBehindHookShell,
+                    )));
+                }
+                if entrypoint_run {
+                    self.clear_ends_with_run().await;
+                }
+                // Same claim as the launch below, for a host this call did
+                // not mint: an exec is about to run in this sandbox, so a
+                // later attach must not replace the shell out from under
+                // it. Without this, a host minted for lifecycle hooks stays
+                // `Hooks` through every exec that reuses it, and the first
+                // interactive attach would respawn it — killing a command
+                // that is still running.
+                self.host_origin = HostOrigin::Exec;
+                return Ok(host);
+            }
         }
 
+        // The wait for a closed host's exit did not settle, so the box may
+        // be ending. A launch here could run an `until_complete`
+        // entrypoint a second time (BOX-038): refuse, and launch nothing.
+        if self.exit_unsettled {
+            tracing::warn!(
+                box_id = %self.record.id(),
+                "refused the exec: the box's last host ended and its exit is not known yet"
+            );
+            let name = self
+                .record
+                .record()
+                .await
+                .ok()
+                .and_then(|record| record.name)
+                .unwrap_or_else(|| self.record.id().to_string());
+            return Err(AttachError::ResumeRefused(
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("box {name} is ending. Only a running box can run a command."),
+                ),
+                2,
+            ));
+        }
+        // Only a launch records the run's dropped names: a run that joined
+        // the running host above relays the in-box run an earlier launch
+        // started, with that launch's names. Recorded before the launch, so
+        // the in-box run the entrypoint starts finds them.
+        if entrypoint_run {
+            entrypoint_env::record(*self.record.id(), staged_drops);
+        }
         let (_, launched) = self
             .launch_host(
                 session_hnd,
                 conn_username,
                 UNATTACHED_WIN_SIZE,
-                box_runtime::AttachEnv::default(),
+                box_runtime::AttachEnv {
+                    inherited: Vec::new(),
+                    connection: Vec::new(),
+                    // For the entrypoint's process alone: a later exec in
+                    // the box never sees a task run's variables.
+                    entrypoint: staged_env,
+                },
                 None,
                 LaunchPhase::Attached,
                 false,
@@ -1345,7 +1721,52 @@ impl BoxActor {
         // later attach must not replace it. See [`HostOrigin::Exec`].
         self.host_origin = HostOrigin::Exec;
         self.publish_host();
+        if entrypoint_run {
+            self.clear_ends_with_run().await;
+        }
         Ok(host)
+    }
+
+    /// Clears the record's `ends_with_run` mark once a task run started
+    /// the box's entrypoint (T43, NET-131). Until then a daemon restart
+    /// destroys the box, so a client lost before the task starts strands
+    /// no box. After it, the box ends with its entrypoint and keeps its
+    /// record (BOX-038). A failed write keeps the mark, and is logged.
+    async fn clear_ends_with_run(&mut self) {
+        let cleared = async {
+            let mut record = self.record.record().await?;
+            if !record.ends_with_run {
+                return Ok(());
+            }
+            record.ends_with_run = false;
+            self.record.write(record).await
+        }
+        .await;
+        if let Err(error) = cleared {
+            tracing::warn!(
+                box_id = %self.record.id(),
+                %error,
+                "the task started, but the box's record still says a daemon restart \
+                 destroys it"
+            );
+        }
+    }
+
+    /// Whether a launch of this box that is not for hooks starts an argv,
+    /// not the shell: the spec names an argv entrypoint. A spec that cannot
+    /// be read says no here, and the launch refuses it.
+    async fn starts_argv(&mut self) -> bool {
+        let Ok(spec) = self.held_spec().await else {
+            return false;
+        };
+        let launch = box_runtime::LaunchSpec {
+            spec,
+            for_hooks: false,
+        };
+        matches!(
+            launch.entrypoint(),
+            Ok(box_runtime::LaunchEntrypoint::Argv { .. })
+        )
     }
 
     pub(super) async fn mint_session_host(
@@ -1966,6 +2387,100 @@ mod quic443_cohort_tests {
         }
     }
 
+    /// BEP-083 over the launch and stop paths: on a VM host, the own leaf
+    /// of a host-address box that declares a credentialed upstream is in
+    /// the lane set while it runs, and a member that declares none is never
+    /// in it. While the cohort blocks UDP 443, the lane member stays in its
+    /// own leaf, and its own leaf is in the blocked-leaves set. The
+    /// lane-less member moves into the blocked leaf. On a native host the
+    /// lane is not in effect, and the set stays empty.
+    #[test]
+    fn lane_less_cohort_member_stays_out_of_the_proxy_lane_set() {
+        use boxes::core::bep::Quic443;
+
+        let tree = tempfile::tempdir().unwrap();
+        let root = tree.path();
+        std::fs::create_dir_all(
+            root.join(sandbox::classifier::BOXES_DIR)
+                .join(sandbox::config::ALLOW_DIR),
+        )
+        .unwrap();
+        std::fs::create_dir(quic443_blocked_leaf(root)).unwrap();
+        let blocked_leaf = quic443_blocked_leaf(root);
+        let cohort = std::sync::Mutex::new(CohortQuic443::default());
+        let moves = StandinMoves::default();
+        let launch = |record: &Record, host: paths::HostKind, pid: i32| {
+            let leaf =
+                sandbox::classifier::create_box_leaf(root, &record.id.to_string(), Verdict::Allow)
+                    .unwrap();
+            moves.spawn_in(pid, &leaf);
+            join_quic443_cohort(
+                record,
+                record.host_ip_enforcement,
+                host,
+                root,
+                &cohort,
+                &moves,
+            )
+            .expect("the box is placed");
+            leaf
+        };
+        let mut grant = host_ip_record(None);
+        grant.policy.credentialed_upstream = Some(boxes::CredentialedUpstream::default());
+        let grant_leaf = launch(&grant, paths::HostKind::Minvmd, 100);
+        assert_eq!(
+            *moves.lane.lock().unwrap(),
+            [grant_leaf.clone()].into_iter().collect(),
+            "the declaring member's own leaf is in the lane set"
+        );
+
+        let plain = host_ip_record(Some(Quic443::Block));
+        let plain_leaf = launch(&plain, paths::HostKind::Minvmd, 200);
+        assert_eq!(
+            *moves.lane.lock().unwrap(),
+            [grant_leaf.clone()].into_iter().collect(),
+            "the member that declares no lane is never in the lane set"
+        );
+        assert_eq!(
+            moves.where_is(100),
+            grant_leaf,
+            "the lane member stays in its own leaf while the cohort blocks"
+        );
+        assert_eq!(
+            moves.where_is(200),
+            blocked_leaf,
+            "the lane-less member moves into the blocked leaf"
+        );
+        assert_eq!(
+            *moves.listed.lock().unwrap(),
+            [grant_leaf.clone(), plain_leaf].into_iter().collect(),
+            "both own leaves are refused UDP 443"
+        );
+        {
+            let cohort = cohort.lock().unwrap();
+            assert_eq!(cohort.injection_leaf(&grant.id.to_string()), None);
+            assert_eq!(
+                cohort.injection_leaf(&plain.id.to_string()),
+                Some(blocked_leaf.as_path())
+            );
+        }
+
+        leave_quic443_cohort(&grant.id.to_string(), &cohort, &moves);
+        assert!(
+            moves.lane.lock().unwrap().is_empty(),
+            "the stop takes the lane member's leaf out of the lane set"
+        );
+        leave_quic443_cohort(&plain.id.to_string(), &cohort, &moves);
+
+        let mut native = host_ip_record(None);
+        native.policy.credentialed_upstream = Some(boxes::CredentialedUpstream::default());
+        launch(&native, paths::HostKind::Minimald, 300);
+        assert!(
+            moves.lane.lock().unwrap().is_empty(),
+            "on a native host the lane is not in effect"
+        );
+    }
+
     /// BEP-018 over the launch and stop paths: a blocking launch puts the
     /// own leaf of every host-address member in the blocked-leaves set,
     /// and its stop takes them all out again.
@@ -1988,8 +2503,15 @@ mod quic443_cohort_tests {
                 sandbox::classifier::create_box_leaf(root, &record.id.to_string(), Verdict::Allow)
                     .unwrap();
             moves.spawn_in(pid, &leaf);
-            join_quic443_cohort(record, record.host_ip_enforcement, root, &cohort, &moves)
-                .expect("the box is placed");
+            join_quic443_cohort(
+                record,
+                record.host_ip_enforcement,
+                paths::HostKind::Minimald,
+                root,
+                &cohort,
+                &moves,
+            )
+            .expect("the box is placed");
             leaf
         };
         let plain = host_ip_record(None);
@@ -2077,8 +2599,15 @@ mod quic443_cohort_tests {
                 sandbox::classifier::create_box_leaf(root, &record.id.to_string(), Verdict::Allow)
                     .unwrap();
             moves.spawn_in(pid, &leaf);
-            join_quic443_cohort(record, record.host_ip_enforcement, root, &cohort, &moves)
-                .expect("the box is placed");
+            join_quic443_cohort(
+                record,
+                record.host_ip_enforcement,
+                paths::HostKind::Minimald,
+                root,
+                &cohort,
+                &moves,
+            )
+            .expect("the box is placed");
             leaf
         };
 
@@ -2108,7 +2637,8 @@ mod quic443_cohort_tests {
         let mut own = host_ip_record(Some(Quic443::Block));
         own.network = NetworkMode::OwnIp;
         own.host_ip_enforcement = None;
-        join_quic443_cohort(&own, None, root, &cohort, &moves).expect("nothing to place");
+        join_quic443_cohort(&own, None, paths::HostKind::Minimald, root, &cohort, &moves)
+            .expect("nothing to place");
         assert_eq!(
             cohort.lock().unwrap().blocking_members().count(),
             1,
@@ -2149,8 +2679,15 @@ mod quic443_cohort_tests {
             sandbox::classifier::create_box_leaf(root, &plain.id.to_string(), Verdict::Allow)
                 .unwrap();
         moves.spawn_in(100, &plain_leaf);
-        join_quic443_cohort(&plain, plain.host_ip_enforcement, root, &cohort, &moves)
-            .expect("nothing to place");
+        join_quic443_cohort(
+            &plain,
+            plain.host_ip_enforcement,
+            paths::HostKind::Minimald,
+            root,
+            &cohort,
+            &moves,
+        )
+        .expect("nothing to place");
 
         // This host's tree has no blocked leaf: the blocked box fails.
         let strict = host_ip_record(Some(Quic443::Block));
@@ -2158,8 +2695,15 @@ mod quic443_cohort_tests {
             sandbox::classifier::create_box_leaf(root, &strict.id.to_string(), Verdict::Allow)
                 .unwrap();
         moves.spawn_in(200, &strict_leaf);
-        let error = join_quic443_cohort(&strict, strict.host_ip_enforcement, root, &cohort, &moves)
-            .expect_err("no leaf to place the cohort in");
+        let error = join_quic443_cohort(
+            &strict,
+            strict.host_ip_enforcement,
+            paths::HostKind::Minimald,
+            root,
+            &cohort,
+            &moves,
+        )
+        .expect_err("no leaf to place the cohort in");
         assert!(
             !cohort.lock().unwrap().blocked(),
             "the block left with its box"
@@ -2176,8 +2720,15 @@ mod quic443_cohort_tests {
         let blocked_leaf = quic443_blocked_leaf(root);
         std::fs::create_dir(&blocked_leaf).unwrap();
         moves.refused.lock().unwrap().insert(100);
-        join_quic443_cohort(&strict, strict.host_ip_enforcement, root, &cohort, &moves)
-            .expect_err("a member that cannot move fails the launch");
+        join_quic443_cohort(
+            &strict,
+            strict.host_ip_enforcement,
+            paths::HostKind::Minimald,
+            root,
+            &cohort,
+            &moves,
+        )
+        .expect_err("a member that cannot move fails the launch");
         let guard = cohort.lock().unwrap();
         assert!(!guard.blocked(), "the block left with its box");
         assert_eq!(guard.blocking_members().count(), 0);
@@ -2224,8 +2775,15 @@ mod quic443_cohort_tests {
             }
             moves.spawn_in(pid, &leaf);
             let number = begin_quic443_launch(&box_id, launches);
-            join_quic443_cohort(record, record.host_ip_enforcement, root, cohort, moves)
-                .expect("the box is placed");
+            join_quic443_cohort(
+                record,
+                record.host_ip_enforcement,
+                paths::HostKind::Minimald,
+                root,
+                cohort,
+                moves,
+            )
+            .expect("the box is placed");
             let (exit, exited) = tokio::sync::oneshot::channel::<i32>();
             // A negative code stands in for a loop that panics.
             let task = crate::traced::spawn(async move {
@@ -2299,5 +2857,63 @@ mod quic443_cohort_tests {
         assert!(!cohort.lock().unwrap().blocked(), "the block lifted");
         assert_eq!(moves.where_is(100), plain_leaf, "UDP 443 leaves again");
         plain_task.abort();
+    }
+
+    /// BEP-083 on the root daemon's path: `run_lane_nft` hands `nft` the
+    /// element for the leaf's path below the mount, in the table's lane set.
+    /// It refuses a leaf that is not below the mount, and a verb that is not
+    /// a lane verb, without running `nft`.
+    #[test]
+    fn root_lane_change_runs_nft_on_the_lane_set() {
+        use crate::net::classifier::{nft_calls, recording_nft};
+        let stub = tempfile::tempdir().unwrap();
+        let nft = recording_nft(stub.path(), &[]);
+        let mount = tempfile::tempdir().unwrap();
+        let id = BoxId::mint().to_string();
+        let root = mount.path().join("minimald.slice");
+        let leaf = sandbox::classifier::box_leaf(&root, &id, Verdict::Allow);
+        let element = format!("{{ \"minimald.slice/boxes/allow/{id}\" }}");
+        let argv = |verb: &str| -> Vec<String> {
+            [
+                verb,
+                "element",
+                "inet",
+                "minimal_class",
+                "bep_lane_leaves",
+                &element,
+            ]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect()
+        };
+
+        super::run_lane_nft(&nft, mount.path(), "lane-add", &leaf).expect("lane-add runs nft");
+        super::run_lane_nft(&nft, mount.path(), "lane-remove", &leaf)
+            .expect("lane-remove runs nft");
+        let calls: Vec<Vec<String>> = nft_calls(stub.path())
+            .into_iter()
+            .map(|(argv, _)| argv)
+            .collect();
+        assert_eq!(calls, vec![argv("add"), argv("delete")]);
+
+        let elsewhere = tempfile::tempdir().unwrap();
+        let outside = sandbox::classifier::box_leaf(elsewhere.path(), &id, Verdict::Allow);
+        let refused = super::run_lane_nft(&nft, mount.path(), "lane-add", &outside)
+            .expect_err("a leaf outside the mount is refused");
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            nft_calls(stub.path()).len(),
+            2,
+            "no nft call for the refusal"
+        );
+
+        let unknown = super::run_lane_nft(&nft, mount.path(), "lane-flush", &leaf)
+            .expect_err("an unknown verb is refused");
+        assert_eq!(unknown.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            nft_calls(stub.path()).len(),
+            2,
+            "no nft call for the unknown verb"
+        );
     }
 }

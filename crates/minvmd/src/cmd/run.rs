@@ -2279,7 +2279,19 @@ impl switch::bep_host::BepBoxSource for CredentialedBoxes {
     }
 
     fn box_id_for_source(&self, source: std::net::Ipv4Addr) -> Option<crate::bep_attach::BoxId> {
+        // The cohort's address answers the reserved cohort id only while
+        // the acceptor listens and a lane member is resident (BEP-084).
+        if self.cohort_source() == Some(source) {
+            return Some(switch::bep_host::COHORT_BOX_ID);
+        }
         self.boxes.box_id_for_source(source)
+    }
+
+    fn cohort_source(&self) -> Option<std::net::Ipv4Addr> {
+        if !self.listening.load(std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
+        self.boxes.cohort_source()
     }
 }
 

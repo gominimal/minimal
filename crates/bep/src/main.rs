@@ -46,6 +46,7 @@ use bep::publish::{Identity, PublishError, certificate_fingerprint};
 use bep::redeemer::{BoxRedeemer, Revocations, StoreRules};
 use bep::revoke;
 use bep::signin::{self, HostKeychain, Keychain, RefreshError, Refreshed, TokenEndpoint};
+use bep::store;
 use clap::{Parser, Subcommand};
 use client_config::store_rules::StoreDenySet;
 use zeroize::{Zeroize as _, Zeroizing};
@@ -85,6 +86,21 @@ enum Command {
     /// Start the proxy and serve box connections. Give the connection token
     /// on standard input, as 64 hex digits.
     Serve(ServeArgs),
+    /// Store one secret as this program, so that the keychain puts the item
+    /// in this program's partition. `min secret set` runs this and gives the
+    /// value on standard input.
+    #[command(hide = true)]
+    StoreAdd(StoreAddArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct StoreAddArgs {
+    /// The secret's identifier.
+    id: String,
+
+    /// Store the item under the staging service, for a replacement.
+    #[arg(long)]
+    staging: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -176,6 +192,9 @@ fn run<S: KeyStore>(store: &S, args: &Args) -> ExitCode
 where
     S::Key: CaKey + Send + Sync + 'static,
 {
+    if let Some(Command::StoreAdd(add)) = &args.command {
+        return store_add(add);
+    }
     let path = match identity_path(args) {
         Ok(path) => path,
         Err(err) => {
@@ -227,12 +246,35 @@ where
     let held = rules.current();
     let started = start(store, &path, &held).and_then(|(keys, root)| match &args.command {
         Some(Command::Serve(serve_args)) => serve(serve_args, keys, root, rules, held, &path),
-        None => Ok(()),
+        Some(Command::StoreAdd(_)) | None => Ok(()),
     });
     match started {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("{err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `bep store-add`: store the value on standard input. It needs no proxy key.
+fn store_add(args: &StoreAddArgs) -> ExitCode {
+    // Reserved up front, so that a usual value is not left behind in a smaller
+    // buffer when the vector grows.
+    let mut value = Zeroizing::new(Vec::with_capacity(1 << 16));
+    if let Err(err) = io::stdin().lock().read_to_end(&mut value) {
+        eprintln!("bep did not read the value from standard input: {err}");
+        return ExitCode::FAILURE;
+    }
+    let service = if args.staging {
+        store::STAGING_SERVICE
+    } else {
+        store::SERVICE
+    };
+    match store::add_as_this_program(service, &args.id, &value) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(detail) => {
+            eprintln!("{detail}");
             ExitCode::FAILURE
         }
     }
@@ -3183,7 +3225,7 @@ mod tests {
             .expect("the arguments parse");
             match args.command {
                 Some(Command::Serve(serve)) => serve.exit_on_stdin_close,
-                None => panic!("no serve command"),
+                _ => panic!("no serve command"),
             }
         };
         assert!(!parsed(&[]), "a hand-run proxy outlives its input");
@@ -3203,7 +3245,7 @@ mod tests {
             )
             .map(|args| match args.command {
                 Some(Command::Serve(serve)) => serve,
-                None => panic!("no serve command"),
+                _ => panic!("no serve command"),
             })
         };
         assert_eq!(serve_args(&[]).unwrap().key_bound(), KeyBound::default());

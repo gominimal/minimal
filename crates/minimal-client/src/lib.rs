@@ -520,7 +520,7 @@ impl Client {
         self.oneshot_rpc_within::<R>(request, deadline).await
     }
 
-    #[tracing::instrument(level = "info", name = "client.rpc", skip_all, fields(rpc = R::NAME, timeout_s = timeout.as_secs()))]
+    #[tracing::instrument(level = "info", name = "client.rpc", skip_all, fields(rpc = R::NAME, timeout_s = timeout.as_secs(), otel.status_code = tracing::field::Empty))]
     async fn oneshot_rpc_within<R: OneshotSshRpc>(
         &mut self,
         request: R::Request<'_>,
@@ -575,13 +575,27 @@ impl Client {
                 );
             }
 
-            serde_json_lenient::from_slice(&resp_buf)
-                .with_context(|| decode_context(R::NAME, &resp_buf))
+            let response: R::Response = serde_json_lenient::from_slice(&resp_buf)
+                .with_context(|| decode_context(R::NAME, &resp_buf))?;
+            // Most RPCs answer a refusal as `Errorable::Err` inside a decoded
+            // response, and `SubmitVerdict` as a `Fault` step; the caller
+            // still gets it as a response, and the span is marked failed.
+            if daemon_refused(&resp_buf) {
+                tracing::Span::current().record("otel.status_code", "ERROR");
+            }
+            Ok(response)
         };
 
-        tokio::time::timeout(timeout, rpc)
+        let result = tokio::time::timeout(timeout, rpc)
             .await
-            .map_err(|_| anyhow::anyhow!("{} RPC timed out after {timeout:?}", R::NAME))?
+            .map_err(|_| anyhow::anyhow!("{} RPC timed out after {timeout:?}", R::NAME))
+            .and_then(|r| r);
+        if result.is_err() {
+            // A failed or timed-out RPC marks its span, so a daemon-side
+            // "rpc failed" has a failed client-side span to match.
+            tracing::Span::current().record("otel.status_code", "ERROR");
+        }
+        result
     }
 
     /// Open a session channel and issue an `exec` request for `command`,
@@ -1399,6 +1413,26 @@ fn append_daemon_error(buf: &mut Vec<u8>, data: &[u8]) {
 /// pathological body can't become the whole error message.
 const DECODE_EXCERPT_MAX: usize = 1024;
 
+/// Whether an RPC response body is a refusal: an `Errorable::Err` (an object
+/// whose only field is a string `error`), or a
+/// [`BoxStep::Fault`](boxes::wire::request::BoxStep::Fault), the
+/// `SubmitVerdict` reply for an unknown session, a wrong state or a failed
+/// resume. `Errorable` is untagged, so the body's shape is the only mark of
+/// a refusal a generic caller can read.
+fn daemon_refused(body: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Refusal {
+        #[expect(dead_code, reason = "only the shape is checked")]
+        error: String,
+    }
+    serde_json_lenient::from_slice::<Refusal>(body).is_ok()
+        || matches!(
+            serde_json_lenient::from_slice::<boxes::wire::request::BoxStep>(body),
+            Ok(boxes::wire::request::BoxStep::Fault { .. })
+        )
+}
+
 /// Context for a response that wouldn't decode, quoting the daemon's reply
 /// verbatim.
 ///
@@ -1851,6 +1885,46 @@ pub async fn fill_git_info(entries: &mut [minimald_rpc::ListSessionsEntry]) {
 mod tests {
     use super::{Client, resolve_host_dir, resolve_socket_path};
     use std::path::Path;
+
+    /// An `Errorable::Err` body is a refusal, which marks the RPC's span
+    /// failed; a successful response, one with an `error` field among
+    /// others, or one whose `error` is not a string is not.
+    #[test]
+    fn an_errorable_err_body_is_a_refusal() {
+        use minimald_rpc::Errorable;
+        let err: Errorable<String> = Errorable::Err {
+            error: "the daemon is shutting down".to_owned(),
+        };
+        assert!(super::daemon_refused(
+            &serde_json_lenient::to_vec(&err).unwrap()
+        ));
+        assert!(!super::daemon_refused(
+            br#"{"version":"v","long_version":"v","stdlib_version":"s"}"#
+        ));
+        assert!(!super::daemon_refused(br#"{"error":"x","id":1}"#));
+        assert!(!super::daemon_refused(br#"{"error":null}"#));
+        assert!(!super::daemon_refused(b"null"));
+    }
+
+    /// A `SubmitVerdict` fault is a refusal too, though it decodes as
+    /// `Errorable::Ok`; a materialized step is not.
+    #[test]
+    fn a_submit_verdict_fault_is_a_refusal() {
+        use boxes::wire::{errors::WireError, request::BoxStep};
+        use minimald_rpc::Errorable;
+        let fault: Errorable<BoxStep> = Errorable::Ok(BoxStep::Fault {
+            error: WireError::UnknownSessionId,
+        });
+        assert!(super::daemon_refused(
+            &serde_json_lenient::to_vec(&fault).unwrap()
+        ));
+        let done: Errorable<BoxStep> = Errorable::Ok(BoxStep::Materialized {
+            id: boxes::SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+        });
+        assert!(!super::daemon_refused(
+            &serde_json_lenient::to_vec(&done).unwrap()
+        ));
+    }
 
     /// The daemon-error accumulator is bounded: a daemon that sprays extended
     /// data on stream 1 (during a diagnostic download or a workspace upload)
@@ -2762,5 +2836,236 @@ mod subsystem_tests {
             .unwrap();
         let err = lines.next_line().await.expect_err("the daemon's message");
         assert_eq!(err.to_string(), "no box has this id");
+    }
+}
+
+#[cfg(test)]
+mod rpc_status_tests {
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    /// What the stand-in daemon does once the client has sent its request.
+    #[derive(Clone)]
+    enum Reply {
+        /// Answer with this body and close the channel.
+        Body(Vec<u8>),
+        /// Never answer.
+        Hang,
+    }
+
+    /// A stand-in daemon that accepts everything and answers every RPC with
+    /// the reply the test set last.
+    #[derive(Clone)]
+    struct Replier(Arc<Mutex<Reply>>);
+
+    impl russh::server::Handler for Replier {
+        type Error = russh::Error;
+
+        async fn auth_none(&mut self, _: &str) -> Result<russh::server::Auth, Self::Error> {
+            Ok(russh::server::Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            _: russh::Channel<russh::server::Msg>,
+            reply: russh::server::ChannelOpenHandle,
+            _: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            Ok(())
+        }
+
+        async fn subsystem_request(
+            &mut self,
+            id: russh::ChannelId,
+            _: &str,
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            session.channel_success(id)?;
+            Ok(())
+        }
+
+        async fn channel_eof(
+            &mut self,
+            id: russh::ChannelId,
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            let reply = self.0.lock().unwrap().clone();
+            if let Reply::Body(body) = reply {
+                session.data(id, body)?;
+                session.eof(id)?;
+                session.close(id)?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Records each `client.rpc` span's `otel.status_code`, if it gets one,
+    /// in the order the spans are created.
+    #[derive(Clone, Default)]
+    struct Statuses(Arc<Mutex<StatusLog>>);
+
+    #[derive(Default)]
+    struct StatusLog {
+        statuses: Vec<Option<String>>,
+        /// The index in `statuses` of each open `client.rpc` span, by id.
+        by_id: std::collections::HashMap<u64, usize>,
+    }
+
+    struct StatusField(Option<String>);
+
+    impl tracing::field::Visit for StatusField {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "otel.status_code" {
+                self.0 = Some(value.to_owned());
+            }
+        }
+
+        fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Statuses {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attrs.metadata().name() == "client.rpc" {
+                let mut log = self.0.lock().unwrap();
+                let at = log.statuses.len();
+                log.statuses.push(None);
+                log.by_id.insert(id.into_u64(), at);
+            }
+        }
+
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut field = StatusField(None);
+            values.record(&mut field);
+            let mut log = self.0.lock().unwrap();
+            if let (Some(status), Some(&at)) = (field.0, log.by_id.get(&id.into_u64())) {
+                log.statuses[at] = Some(status);
+            }
+        }
+    }
+
+    /// A `client.rpc` span carries the ERROR status when the daemon refuses
+    /// the call (`Errorable::Err` or a `SubmitVerdict` fault), when the
+    /// reply does not decode, and when the call times out; a successful
+    /// reply leaves it unset.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refused_failed_or_timed_out_rpc_marks_its_span() {
+        use boxes::wire::{errors::WireError, request::BoxStep};
+        use minimald_rpc::{Errorable, SubmitVerdict};
+
+        let key = russh::keys::PrivateKey::random(
+            &mut russh::keys::key::safe_rng(),
+            russh::keys::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let config = Arc::new(russh::server::Config {
+            keys: vec![key],
+            auth_rejection_time_initial: Some(std::time::Duration::ZERO),
+            ..Default::default()
+        });
+        let dir = tempfile::Builder::new()
+            .prefix("mcrs")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let sock = dir.path().join("ssh.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let reply = Arc::new(Mutex::new(Reply::Hang));
+        let server = {
+            let (config, replier) = (config.clone(), Replier(reply.clone()));
+            tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let (config, replier) = (config.clone(), replier.clone());
+                    tokio::spawn(async move {
+                        if let Ok(session) =
+                            russh::server::run_stream(config, stream, replier).await
+                        {
+                            drop(session.await);
+                        }
+                    });
+                }
+            })
+        };
+
+        let statuses = Statuses::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(statuses.clone()));
+        let session_id =
+            boxes::SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let verdict = || boxes::wire::request::ContributionVerdict {
+            session_id,
+            vars: Vec::new(),
+            patches: Vec::new(),
+            lifecycle_hooks: Vec::new(),
+        };
+        let body = |r: &Errorable<BoxStep>| serde_json_lenient::to_vec(r).unwrap();
+        let mut client = super::Client::connect(&sock).await.unwrap();
+        let within = std::time::Duration::from_secs(10);
+
+        *reply.lock().unwrap() = Reply::Body(body(&Errorable::Ok(BoxStep::Materialized {
+            id: session_id,
+        })));
+        let ok = client
+            .oneshot_rpc_with_deadline::<SubmitVerdict>(verdict(), within)
+            .await;
+        assert!(
+            matches!(ok, Ok(Errorable::Ok(BoxStep::Materialized { .. }))),
+            "{ok:?}"
+        );
+
+        *reply.lock().unwrap() = Reply::Body(body(&Errorable::Err {
+            error: "the daemon is shutting down".to_owned(),
+        }));
+        let refused = client
+            .oneshot_rpc_with_deadline::<SubmitVerdict>(verdict(), within)
+            .await;
+        assert!(matches!(refused, Ok(Errorable::Err { .. })), "{refused:?}");
+
+        *reply.lock().unwrap() = Reply::Body(body(&Errorable::Ok(BoxStep::Fault {
+            error: WireError::UnknownSessionId,
+        })));
+        let fault = client
+            .oneshot_rpc_with_deadline::<SubmitVerdict>(verdict(), within)
+            .await;
+        assert!(
+            matches!(fault, Ok(Errorable::Ok(BoxStep::Fault { .. }))),
+            "{fault:?}"
+        );
+
+        *reply.lock().unwrap() = Reply::Body(b"not json".to_vec());
+        let undecodable = client
+            .oneshot_rpc_with_deadline::<SubmitVerdict>(verdict(), within)
+            .await;
+        assert!(undecodable.is_err());
+
+        *reply.lock().unwrap() = Reply::Hang;
+        let timed_out = client
+            .oneshot_rpc_with_deadline::<SubmitVerdict>(
+                verdict(),
+                std::time::Duration::from_millis(200),
+            )
+            .await;
+        let err = timed_out.expect_err("a call nobody answers times out");
+        assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+
+        let error = Some("ERROR".to_owned());
+        assert_eq!(
+            statuses.0.lock().unwrap().statuses,
+            [None, error.clone(), error.clone(), error.clone(), error]
+        );
+        drop(client);
+        server.abort();
     }
 }
