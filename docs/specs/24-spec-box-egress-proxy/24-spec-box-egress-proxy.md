@@ -173,14 +173,14 @@ Minting and sealing
   tier:     T0
   verify:   ./scripts/session-e2e.sh bep_box_env_holds_sealed_value_only
 
-- **BEP-008** IF a box spec declares a GitHub grant and its `egress.allow_dns_hosts` does not admit every host in the module's host set THEN THE SYSTEM SHALL refuse expansion with exit 3 naming each missing host.
+- **BEP-008** IF a box spec declares a GitHub grant and its egress does not admit every host in the module's host set THEN THE SYSTEM SHALL refuse expansion with exit 3 naming each missing host.
   tier:     T1
   verify:   cargo nextest run -p boxes prop_grant_host_set_outside_egress_is_exit_3
+  property: for every box spec and every module host set, except a `host_ip` box with no `egress` section, expansion refuses with exit 3 iff some host of the set is absent from `egress.allow_dns_hosts`, and the refusal names exactly the absent hosts
   - WHERE a `host_ip` box has no `egress` section THE SYSTEM SHALL treat its egress as admitting every host in the module's host set.
     tier:   T0
     verify: cargo nextest run -p boxes host_ip_grant_box_with_no_egress_section_reaches_the_github_hosts
     <!-- such a box is allow-all, so it reaches the hosts this requirement protects; it can declare no list, because NET-079 refuses name rules on a host-address box -->
-  property: for every box spec and every module host set, expansion refuses with exit 3 iff some host of the set is absent from `egress.allow_dns_hosts`, and the refusal names exactly the absent hosts
 
 - **BEP-009** IF a box spec declares `network.mode = "none"` and a GitHub grant THEN THE SYSTEM SHALL refuse expansion with exit 3.
   tier:     T1
