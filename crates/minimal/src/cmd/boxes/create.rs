@@ -4878,14 +4878,13 @@ mod tests {
             ]
         );
 
-        // The policy the create request carries is the one the spec records.
-        let request = minimald_rpc::CreateSessionRequest::new(
-            String::new(),
-            paths::HostAbsPath::try_new(root.to_path_buf()).unwrap(),
-            boxes::NetworkMode::OwnIp,
-            boxes::BoxPolicy::new(effective.policy, None),
-        );
-        let spec = mfile::spec::BoxSpec::for_session(None, spec_flags(&request));
+        // The box spec records the policy that the create request carries.
+        let flags = mfile::spec::SpecFlags {
+            network: boxes::NetworkMode::OwnIp,
+            policy: boxes::BoxPolicy::new(effective.policy, None),
+            hooks_enabled: true,
+        };
+        let spec = mfile::spec::BoxSpec::for_session(None, flags);
         assert_eq!(spec.network.policy.egress, Some(expected));
 
         // `[sessions.default]` replaces `[defaults]`, and the flat legacy key
