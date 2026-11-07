@@ -3576,6 +3576,82 @@ fn task_spec(entry: &str, name: Option<&str>) -> serde_json_lenient::Value {
     serde_json_lenient::to_value(&spec).expect("a spec serializes")
 }
 
+/// BOX-076: a spec with sections the daemon does not enforce is stored
+/// whole, the box is created, and the daemon log warns once for each such
+/// section, naming it. A spec with none of them warns nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unenforced_sections_warn_once_each_naming_section() {
+    let log = crate::test_harness::captured_log();
+    let (_state, _cache, mngr) = manager().await;
+
+    let mut spec = task_spec("lint", None);
+    let object = spec.as_object_mut().expect("a spec is an object");
+    for key in ["file_imports", "file_exports", "github_imports"] {
+        object.insert(
+            key.to_string(),
+            serde_json_lenient::json!([{ "src": "a", "dst": "/a" }]),
+        );
+    }
+    object.insert(
+        "otel".to_string(),
+        serde_json_lenient::json!({ "endpoint": "http://localhost:4317" }),
+    );
+    object["network"]
+        .as_object_mut()
+        .expect("a spec has a network table")
+        .insert(
+            "vpn_network_names".to_string(),
+            serde_json_lenient::json!(["corp"]),
+        );
+    let id = mngr
+        .create_box_with_spec(unnamed_config(), Some(spec.clone()), None, None)
+        .await
+        .expect("a spec with unenforced sections creates its box");
+
+    let spec_path = mngr.box_events(id).await.unwrap().object.spec_path();
+    let bytes = std::fs::read(spec_path.as_utf8_path()).expect("the spec is stored");
+    let stored: serde_json_lenient::Value =
+        serde_json_lenient::from_slice(&bytes).expect("the stored spec is JSON");
+    assert_eq!(stored, spec, "the stored spec carries every section");
+
+    let plain = mngr
+        .create_box_with_spec(unnamed_config(), Some(task_spec("fmt", None)), None, None)
+        .await
+        .expect("a plain spec creates its box");
+
+    let logged = log.contents();
+    let warnings = |id: SessionId| -> Vec<String> {
+        logged
+            .lines()
+            .filter(|line| {
+                line.contains("WARN")
+                    && line.contains("a section this daemon does not enforce")
+                    && line.contains(&id.to_string())
+            })
+            .map(str::to_string)
+            .collect()
+    };
+    let warned = warnings(id);
+    for section in [
+        "[[file_imports]]",
+        "[[file_exports]]",
+        "[[github_imports]]",
+        "[otel]",
+        "[network] vpn_network_names",
+    ] {
+        let naming = warned
+            .iter()
+            .filter(|line| line.contains(&format!("section=\"{section}\"")))
+            .count();
+        assert_eq!(naming, 1, "one warning names {section}:\n{logged}");
+    }
+    assert_eq!(warned.len(), 5, "one warning per section:\n{logged}");
+    assert!(
+        warnings(plain).is_empty(),
+        "a spec with no unenforced section warns nothing:\n{logged}"
+    );
+}
+
 /// The name the record of box `id` carries.
 async fn record_name(mngr: &BoxManagerHandle, id: SessionId) -> Option<String> {
     mngr.get_record(BoxKeyPredicate::Id(id))

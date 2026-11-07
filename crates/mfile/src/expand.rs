@@ -487,7 +487,17 @@ fn check_keys(entry: &BoxEntry, expansion: &Expansion) -> Result<(), Error> {
                     check_upstream(entry, value, origin)?;
                     continue;
                 }
-                None => continue,
+                // BOX-076: a section's own keys follow the Box Spec schema.
+                None => match crate::spec::check_section(key, value) {
+                    Ok(()) => continue,
+                    Err(bad) => {
+                        return Err(Error::InvalidSpecKey {
+                            key: bad.key,
+                            layer: layer_words(entry, origin.and_then(ValueOrigin::first)),
+                            problem: bad.problem,
+                        });
+                    }
+                },
                 Some(found) => SpecKeyProblem::WrongShape {
                     expected: shape.words(),
                     found,

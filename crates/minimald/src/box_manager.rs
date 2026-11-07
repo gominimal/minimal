@@ -1222,6 +1222,38 @@ fn spec_bytes(spec: &serde_json_lenient::Value) -> Result<Vec<u8>, BoxManagerErr
         .map_err(|e| BoxManagerError::other(format!("could not serialize the box spec: {e}")))
 }
 
+/// The Box Spec sections that a spec can carry and that this daemon does
+/// not enforce (BOX-076): the top-level key, the key inside it when the
+/// section is one key of a table, and the section as the log names it.
+const UNENFORCED_SECTIONS: [(&str, Option<&str>, &str); 5] = [
+    ("file_imports", None, "[[file_imports]]"),
+    ("file_exports", None, "[[file_exports]]"),
+    ("github_imports", None, "[[github_imports]]"),
+    ("otel", None, "[otel]"),
+    (
+        "network",
+        Some("vpn_network_names"),
+        "[network] vpn_network_names",
+    ),
+];
+
+/// The sections of `spec` that the daemon carries in the stored spec but
+/// does not enforce, in the order of [`UNENFORCED_SECTIONS`], each once.
+fn unenforced_sections(spec: &serde_json_lenient::Value) -> Vec<&'static str> {
+    let Some(object) = spec.as_object() else {
+        return Vec::new();
+    };
+    UNENFORCED_SECTIONS
+        .iter()
+        .filter(|(key, inner, _)| match (object.get(*key), inner) {
+            (Some(_), None) => true,
+            (Some(value), Some(inner)) => value.get(*inner).is_some(),
+            (None, _) => false,
+        })
+        .map(|(_, _, section)| *section)
+        .collect()
+}
+
 enum ManagerMessage {
     List(Responder<Vec<BoxInfo>>),
     /// Every retained record, in any state (BOX-158). Read-only against
@@ -3568,6 +3600,9 @@ impl BoxManager {
             name.as_deref().unwrap_or(crate::rpc::ANONYMOUS_SESSION),
         );
         config.name = name;
+        // BOX-076: the sections the daemon carries but does not enforce,
+        // read before the spec becomes its stored bytes.
+        let unenforced = spec.as_ref().map(unenforced_sections).unwrap_or_default();
         // BOX-068: the spec is checked before the record exists, so a
         // refused spec leaves no record, id or name behind.
         let spec = match spec.as_ref().map(spec_bytes).transpose() {
@@ -3755,12 +3790,25 @@ impl BoxManager {
         if let Some(bytes) = &spec {
             let stored = object.store_spec(bytes).map(|()| object.spec_path());
             match stored {
-                Ok(path) => tracing::info!(
-                    session_id = %session_id,
-                    spec_bytes = bytes.len(),
-                    spec_path = %path.as_str(),
-                    "stored the box spec"
-                ),
+                Ok(path) => {
+                    tracing::info!(
+                        session_id = %session_id,
+                        spec_bytes = bytes.len(),
+                        spec_path = %path.as_str(),
+                        "stored the box spec"
+                    );
+                    // BOX-076: one warning for each unenforced section.
+                    // The stored spec keeps the section, and the box is
+                    // created.
+                    for section in &unenforced {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            section = ?section,
+                            "the box spec carries a section this daemon does not \
+                             enforce; the box is created without it"
+                        );
+                    }
+                }
                 Err(e) => {
                     tracing::warn!(
                         session_id = %session_id,
