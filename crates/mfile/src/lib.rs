@@ -978,6 +978,41 @@ pub struct File {
     layout: Option<Layout>,
 }
 
+/// The entry keys that `[session]` and a task keep among their unknown
+/// fields but that a box spec reads (BOX-049), so they are not reported
+/// as unknown.
+const SPEC_READ_ENTRY_KEYS: &[&str] = &["timeout"];
+
+/// An entry's unknown fields, in key order, less the ones a box spec reads.
+fn unknown_entry_keys(extra: &HashMap<String, toml::Value>) -> Vec<&str> {
+    let mut keys: Vec<&str> = extra
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !SPEC_READ_ENTRY_KEYS.contains(key))
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
+/// Refuses an entry's `timeout` that is not a duration, naming the key and
+/// the entry's table as `layer`.
+fn check_entry_timeout(layer: &str, extra: &HashMap<String, toml::Value>) -> Result<(), Error> {
+    let Some(value) = extra.get("timeout") else {
+        return Ok(());
+    };
+    match duration::spec_timeout(value) {
+        Ok(_) => Ok(()),
+        Err(found) => Err(Error::InvalidSpecKey {
+            key: "timeout".to_owned(),
+            layer: layer.to_owned(),
+            problem: SpecKeyProblem::WrongShape {
+                expected: duration::TIMEOUT_TAKES,
+                found,
+            },
+        }),
+    }
+}
+
 /// Maps a key that is unknown at the top level of an mfile to the nesting
 /// path where it is actually valid, when there is one. `lifecycle_hooks` is
 /// top-level in a loadout but nests under `[session]` in a project mfile, so a
@@ -1095,8 +1130,9 @@ impl File {
     ///
     /// Returns [`Error::MissingParamDefault`] if any `[params.X]` entry has
     /// no `default` field, [`Error::HarnessTable`] if the file names the
-    /// pre-v0.5.0 `harness` key, or [`Error::MultipleTaskActions`] if a task
-    /// sets more than one action key.
+    /// pre-v0.5.0 `harness` key, [`Error::MultipleTaskActions`] if a task
+    /// sets more than one action key, or [`Error::InvalidSpecKey`] if
+    /// `[session]` or a task sets a `timeout` that is not a duration.
     pub fn validate(&self) -> Result<(), Error> {
         if let Some(params) = &self.params {
             for (n, s) in params.0.iter() {
@@ -1128,6 +1164,18 @@ impl File {
             if keys.len() > 1 {
                 return Err(Error::MultipleTaskActions(task_name.clone(), keys));
             }
+        }
+        // BOX-049: an entry's `timeout` takes the duration grammar. A bad
+        // value is refused here, before a spec is built from the entry.
+        if let Some(session) = &self.session {
+            check_entry_timeout("`[session]` in minimal.toml", &session.extra)?;
+        }
+        for (task_name, task) in &self.tasks {
+            let layer = format!(
+                "`{}` in minimal.toml",
+                error::EntryHeader("tasks", task_name)
+            );
+            check_entry_timeout(&layer, &task.extra)?;
         }
         self.warn_unknown_fields();
         Ok(())
@@ -1586,10 +1634,8 @@ impl File {
             && !session.extra.is_empty()
         {
             boxes::core::bep::warn_project_store_rules(session.extra.keys().map(String::as_str));
-            let unknown: Vec<&str> = session
-                .extra
-                .keys()
-                .map(String::as_str)
+            let unknown: Vec<&str> = unknown_entry_keys(&session.extra)
+                .into_iter()
                 .filter(|key| *key != boxes::core::bep::STORE_RULES_TABLE)
                 .collect();
             if !unknown.is_empty() {
@@ -1603,11 +1649,12 @@ impl File {
         }
 
         for (task_name, task) in &self.tasks {
-            if !task.extra.is_empty() {
+            let unknown = unknown_entry_keys(&task.extra);
+            if !unknown.is_empty() {
                 tracing::warn!(
                     "unknown fields in task {}: {}",
                     task_name,
-                    task.extra.keys().cloned().collect::<Vec<_>>().join(",")
+                    unknown.join(",")
                 );
                 was_unknown_fields = true;
             }
@@ -3124,6 +3171,73 @@ mod tests {
         let out = capture.contents();
         assert!(!out.contains("unknown fields in task"), "{out}");
         assert!(!out.contains("update to a newer version"), "{out}");
+    }
+
+    /// BOX-049: a `timeout` that is not a duration, in `[session]` or a
+    /// task, refuses the load with exit 3, naming the key and the entry.
+    #[test]
+    fn invalid_timeout_exit3_names_key_and_entry() {
+        let takes = "but `timeout` takes a whole number of seconds, or a string of a \
+                     whole number followed by s, m or h, such as \"30s\", \"5m\" or \"1h\". \
+                     Fix the value.";
+        let cases = [
+            (
+                "[session]\ntimeout = \"2 days\"\n",
+                "`[session]` in minimal.toml sets `timeout` to a string that is not a duration",
+            ),
+            (
+                "[tasks.lint]\nexec = [\"true\"]\ntimeout = -5\n",
+                "`[tasks.lint]` in minimal.toml sets `timeout` to a negative number",
+            ),
+            (
+                "[tasks.lint]\nexec = [\"true\"]\ntimeout = 1.5\n",
+                "`[tasks.lint]` in minimal.toml sets `timeout` to a decimal number",
+            ),
+        ];
+        for (file, start) in cases {
+            let dir = tempdir().unwrap();
+            std::fs::write(dir.path().join(MFILE_NAME), file).unwrap();
+            let err = File::from_dir(dir.path()).expect_err("a bad timeout is refused");
+            assert!(matches!(&err, Error::InvalidSpecKey { .. }), "{err:?}");
+            assert_eq!(err.exit_code(), Some(3), "{err}");
+            assert_eq!(err.to_string(), format!("{start}, {takes}"));
+        }
+
+        // Every value in the grammar loads, zero included.
+        for timeout in ["\"30s\"", "\"5m\"", "\"1h\"", "45", "0", "\"0s\""] {
+            let file = format!("[session]\ntimeout = {timeout}\n");
+            let parsed: File = toml::from_str(&file).unwrap();
+            parsed.validate().expect(&file);
+        }
+    }
+
+    /// BOX-049: `timeout` in `[session]` or a task is a box setting, so the
+    /// load does not report it as an unknown field.
+    #[test]
+    fn timeout_entry_key_is_not_reported_unknown() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MFILE_NAME),
+            "[session]\ntimeout = \"8h\"\n\n[tasks.lint]\nexec = [\"true\"]\ntimeout = 90\n",
+        )
+        .unwrap();
+
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        File::from_dir(dir.path()).expect("a timeout in the grammar loads");
+        drop(guard);
+
+        let out = capture.contents();
+        assert!(!out.contains("unknown fields"), "{out}");
+        assert!(!out.contains("update to a newer version"), "{out}");
+
+        // Another unknown key in the same entry is still reported, alone.
+        let task: Task = toml::from_str("exec = [\"true\"]\ntimeout = 90\ncolour = 1\n").unwrap();
+        assert_eq!(unknown_entry_keys(&task.extra), ["colour"]);
     }
 
     #[test]
