@@ -3871,17 +3871,16 @@ async fn the_unenforced_record_fires_on_every_launch_and_carries_the_field() {
 /// A launch minted for lifecycle hooks is not a session start, so it advises
 /// on neither surface: the record would count one hook run as one session
 /// start on the daemon's log, and the banner would be written into a hook pty
-/// nobody reads. The same tree-less host, the same native host-address mode:
-/// the session's own launch records the advisory, the hook launch — whose box
-/// is placed (or left unenforced) exactly like the session's — stays silent.
+/// nobody reads. Both launches run over a stand-in tree root instead of the
+/// host's own — the same seam the unenforced-launch proof drives — so on any
+/// host, a delegated one included, the placement reads a tree that is not
+/// real: the session's own launch records the advisory, the hook launch —
+/// whose box is left unenforced exactly like the session's — stays silent.
 ///
 /// The record is the form this box can observe: the banner's write sits after
 /// the env build, which fails on this box's unit-test graph before any pty is
 /// opened, so the banner is pinned to the same `advise` gate by construction
 /// and its suppression is proved at the record.
-// `allow` rather than `expect` on purpose: this proof can skip, and on a host
-// whose tree can place a child it returns before its first await, where an
-// expectation the lint never meets would be its own warning.
 #[allow(
     clippy::await_holding_lock,
     reason = "the guard spans the launches because each host-address one \
@@ -3890,29 +3889,6 @@ async fn the_unenforced_record_fires_on_every_launch_and_carries_the_field() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hook_launch_does_not_advise_unenforced_placement() {
     use boxes::NetworkMode;
-
-    // The one host state this proof cannot run on: a tree this daemon can
-    // place a child in (the guest refusal test's skip, for the same reason).
-    // On a delegated host the launch gets a leaf and neither launch advises,
-    // so there is nothing to tell apart here.
-    if sandbox::classifier::probe_child_placement(
-        std::path::Path::new(sandbox::classifier::TREE_ROOT),
-        // The deny subtree: the strictest verdict's placement is the one
-        // these proofs need to be impossible here — if the daemon can place
-        // a child in it, a host-address launch gets its leaf and the proof
-        // would measure a different launch's answer.
-        sandbox::config::Verdict::Deny,
-    )
-    .is_ok()
-    {
-        eprintln!(
-            "skipping a_hook_launch_does_not_advise_unenforced_placement: this \
-             daemon can place a child in its classifier tree, so a native \
-             host-address launch gets a leaf here and neither launch advises; \
-             the gate is proved on a host with no placeable tree"
-        );
-        return;
-    }
 
     // The window the launches write the daemon's process-global classifier
     // fact in — every host-address launch re-reads it — taken for the whole
@@ -3925,12 +3901,11 @@ async fn a_hook_launch_does_not_advise_unenforced_placement() {
     let capture = crate::test_harness::captured_log();
     const RECORD: &str = "the session's host-address box runs unenforced on this host";
     // The per-launch note from the placement decision itself — not the
-    // advisory, and not gated with it. Which note a tree-less host records
-    // depends on what covers the tree root: under no cgroup2 mount the tree
-    // is not real; under one with no tree installed — every cgroup2 host,
-    // this test's CI runner included — the placement probe's throwaway leaf
-    // is what finds the tree missing. Either pins the launch to the same
-    // decision point.
+    // advisory, and not gated with it. The stand-in sits under no cgroup2
+    // mount, so the tree reads as not real and the first note is what every
+    // host records; the second — the probe's tree-missing note, for a root a
+    // mount covers — stays accepted so a stand-in that ever answers
+    // differently fails here rather than passing unmeasured.
     const HOOK_UNGATED_NOTES: [&str; 2] = [
         "this host has no classifier tree to place a box in",
         "the classifier tree is not installed on this host",
@@ -3940,12 +3915,21 @@ async fn a_hook_launch_does_not_advise_unenforced_placement() {
 
     let state = tempfile::tempdir().expect("a state dir for the daemon's context");
 
+    // The stand-in tree both launches read in place of the host's own: a
+    // bare directory no cgroup2 mount covers, so whatever the host
+    // installed — nothing, a delegated tree, or one outside this daemon's
+    // slice — the placement reads a tree that is not real and both launches
+    // take the same decision point on every host.
+    let stand_in = tempfile::tempdir().expect("a stand-in classifier tree root");
+
     // The session's own launch, first: its record is the control that keeps
     // the absence below honest — if the advisory stopped firing entirely,
     // both launches would be silent and the absence would prove nothing.
+    let mut session_launcher = launcher_in(NetworkMode::HostNet, state.path());
+    session_launcher.classifier_root = stand_in.path().to_path_buf();
     let session_launch = tokio::time::timeout(
         Duration::from_secs(30),
-        launcher_in(NetworkMode::HostNet, state.path()).launch(
+        session_launcher.launch(
             false,
             boxes::SessionId::nil(),
             SESSION.to_string(),
@@ -3969,6 +3953,7 @@ async fn a_hook_launch_does_not_advise_unenforced_placement() {
     // how the session's hook path mints it (`launch_host_for_hooks`).
     let mut hook_launcher = launcher_in(NetworkMode::HostNet, state.path());
     hook_launcher.for_hooks = true;
+    hook_launcher.classifier_root = stand_in.path().to_path_buf();
     let hook_launch = tokio::time::timeout(
         Duration::from_secs(30),
         hook_launcher.launch(
