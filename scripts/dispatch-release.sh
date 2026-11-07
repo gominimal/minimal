@@ -55,10 +55,17 @@ run_id="$(gh api -X POST "$repo/actions/workflows/release.yml/dispatches" \
 url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$run_id"
 printf 'dispatch-release: %s (dry_run=%s, restage=%s) on %s\n' "$url" "$DRY_RUN" "$RESTAGE" "$SHA"
 
-run_sha="$(gh api "$repo/actions/runs/$run_id" --jq .head_sha)"
+# Retry the read: an unchecked run could stage a commit that moved in. If
+# every read fails, treat the commit as unknown and cancel.
+run_sha=""
+for try in 1 2 3; do
+    if run_sha="$(gh api "$repo/actions/runs/$run_id" --jq .head_sha)"; then break; fi
+    run_sha=""
+    [ "$try" -eq 3 ] || sleep "${POLL_SECONDS:-60}"
+done
 if [ "$run_sha" != "$SHA" ]; then
     gh api -X POST "$repo/actions/runs/$run_id/cancel" >/dev/null
-    die "$url built $run_sha, not $SHA; cancelled it"
+    die "$url built ${run_sha:-an unknown commit}, not $SHA; cancelled it"
 fi
 
 # A failed read is not a failed run: the Nov 4 nightly lost an attempt to one

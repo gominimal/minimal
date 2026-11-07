@@ -113,7 +113,11 @@ case "$*" in
     *"/git/ref/heads/"*) echo "$GH_STUB_TIP" ;;
     *"/cancel"*) ;;
     *"/dispatches"*) echo "${GH_STUB_RUN_ID-101}" ;;
-    *".head_sha"*) echo "$GH_STUB_RUN_SHA" ;;
+    *".head_sha"*)
+        # Fail as many reads as GH_STUB_SHA_ERRORS holds.
+        n="$(cat "$GH_STUB_SHA_ERRORS" 2>/dev/null || echo 0)"
+        if [ "$n" -gt 0 ]; then echo $((n - 1)) >"$GH_STUB_SHA_ERRORS"; echo "HTTP 502" >&2; exit 1; fi
+        echo "$GH_STUB_RUN_SHA" ;;
     *)
         # One state per read, from the front of the file.
         state="$(head -n 1 "$GH_STUB_STATES")"
@@ -125,7 +129,7 @@ STUB
 chmod +x "$root/bin/gh"
 
 export PATH="$root/bin:$PATH" GITHUB_REPOSITORY=gominimal/minimal POLL_SECONDS=0
-export GH_STUB_LOG="$root/gh.log" GH_STUB_STATES="$root/states"
+export GH_STUB_LOG="$root/gh.log" GH_STUB_STATES="$root/states" GH_STUB_SHA_ERRORS="$root/sha_errors"
 export GH_STUB_TIP=abc GH_STUB_RUN_SHA=abc
 
 run_dispatch() { : >"$GH_STUB_LOG"; "$dispatch" --line release/0.7.x --sha abc --dry-run "$1" "${@:2}"; }
@@ -159,6 +163,15 @@ GH_STUB_RUN_SHA=def
 expect 1 "cancelled it" "a run on another commit is cancelled" -- run_dispatch false
 logged '/cancel' "cancel was sent"
 GH_STUB_RUN_SHA=abc
+
+echo 2 >"$GH_STUB_SHA_ERRORS"
+states "completed success"
+expect 0 "passed" "a failed read of the run's commit is retried" -- run_dispatch true
+
+echo 3 >"$GH_STUB_SHA_ERRORS"
+expect 1 "unknown commit" "a run whose commit can't be read is cancelled" -- run_dispatch true
+logged '/cancel' "cancel was sent for the unread commit"
+rm -f "$GH_STUB_SHA_ERRORS"
 
 export GH_STUB_RUN_ID=""
 expect 1 "no run id" "a dispatch with no run id fails" -- run_dispatch true
