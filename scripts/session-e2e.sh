@@ -6967,14 +6967,14 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   grep -q 'e2e-echo' "$WORK/task-unknown.err" \
     || { echo "::error::unknown-task error does not list the declared tasks"; cat "$WORK/task-unknown.err" 2>/dev/null || true; fail; }
 
-  # Muscle-memory catch: the hidden bare `min run <task>` errors naming the
-  # canonical spelling.
+  # The hidden bare `min run <task>` is gone (BCLI-011): `run` is no longer
+  # a subcommand, so clap refuses it as unrecognized.
   if mnl run e2e-echo >/dev/null 2>"$WORK/task-alias.err"; then
-    echo "::error::hidden 'min run' unexpectedly succeeded"
+    echo "::error::removed 'min run' unexpectedly succeeded"
     fail
   fi
-  grep -q 'min task run' "$WORK/task-alias.err" \
-    || { echo "::error::hidden 'min run' error does not name 'min task run'"; cat "$WORK/task-alias.err" 2>/dev/null || true; fail; }
+  grep -q "unrecognized subcommand 'run'" "$WORK/task-alias.err" \
+    || { echo "::error::removed 'min run' error does not say 'run' is not a subcommand"; cat "$WORK/task-alias.err" 2>/dev/null || true; fail; }
 
   # env_vars inherit crosses the VM boundary: the client reads the value out
   # of the invoking shell and the task's `printenv` sees it inside the
