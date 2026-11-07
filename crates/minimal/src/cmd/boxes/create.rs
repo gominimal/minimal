@@ -277,21 +277,30 @@ struct EffectiveEgress {
 }
 
 /// The `network.egress` table that the project's `minimal.toml` declares for
-/// a session box (NET-060). The layers are `[defaults]`,
-/// `[defaults.session]` and `[sessions.default]`, and a later layer replaces
-/// an earlier one. Only their `network` keys are read, so a key this read
-/// does not own never refuses an activation. `None` when there is no project
-/// file or no layer declares egress.
-fn project_egress(
-    project: &camino::Utf8Path,
-) -> Result<Option<boxes::EgressPolicy>, anyhow::Error> {
+/// a session box (NET-060), with the hint for each legacy spelling that the
+/// file uses.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ProjectEgress {
+    policy: Option<boxes::EgressPolicy>,
+    hints: Vec<String>,
+}
+
+/// The project's [`ProjectEgress`]. The layers are `[defaults]`,
+/// `[defaults.session]` and the session entry, and a later layer replaces an
+/// earlier one. The entry is `[sessions.default]` when the file declares it,
+/// or else the one `[sessions.<name>]` entry when the file declares exactly
+/// one. With no session entry, the implicit default entry applies. Only the
+/// `network` keys of the layers are read, so a key this read does not own
+/// never refuses an activation. The policy is `None` when there is no
+/// project file or no layer declares egress.
+fn project_egress(project: &camino::Utf8Path) -> Result<ProjectEgress, ProjectFileInvalid> {
     let file = match mfile::File::from_dir_recursive(project.as_std_path()) {
         Ok(file) => file,
-        Err(mfile::Error::NotFound) => return Ok(None),
-        Err(error) => return Err(ProjectFileInvalid { error }.into()),
+        Err(mfile::Error::NotFound) => return Ok(ProjectEgress::default()),
+        Err(error) => return Err(ProjectFileInvalid { error }),
     };
     let Some(root) = file.repo_path() else {
-        return Ok(None);
+        return Ok(ProjectEgress::default());
     };
     let Some(path) = [
         root.join(mfile::MFILE_NAME),
@@ -299,7 +308,7 @@ fn project_egress(
     ]
     .into_iter()
     .find(|path| path.is_file()) else {
-        return Ok(None);
+        return Ok(ProjectEgress::default());
     };
     let bytes = std::fs::read(&path).map_err(|e| ProjectFileInvalid {
         error: mfile::Error::IO("minimal file", path.clone(), e),
@@ -308,7 +317,7 @@ fn project_egress(
 }
 
 /// [`project_egress`] over the bytes of a `minimal.toml`.
-fn project_egress_from(bytes: &[u8]) -> Result<Option<boxes::EgressPolicy>, anyhow::Error> {
+fn project_egress_from(bytes: &[u8]) -> Result<ProjectEgress, ProjectFileInvalid> {
     let file: toml::Table = toml::from_slice(bytes).map_err(|e| ProjectFileInvalid {
         error: mfile::Error::Format(e),
     })?;
@@ -330,17 +339,25 @@ fn project_egress_from(bytes: &[u8]) -> Result<Option<boxes::EgressPolicy>, anyh
     );
     layers.defaults = network_of(Some(&layers.defaults));
     layers.defaults_type = network_of(Some(&layers.defaults_type));
-    let declared_entry = file
+    let sessions = file
         .get(mfile::entry::EntryTable::Sessions.key())
-        .and_then(toml::Value::as_table)
-        .and_then(|sessions| sessions.get(mfile::spec::DEFAULT_SESSION_ENTRY))
         .and_then(toml::Value::as_table);
-    let entry_body = network_of(declared_entry);
+    let declared_entry = sessions.and_then(|sessions| {
+        let entry = match sessions.get(mfile::spec::DEFAULT_SESSION_ENTRY) {
+            Some(entry) => Some((mfile::spec::DEFAULT_SESSION_ENTRY, entry)),
+            None if sessions.len() == 1 => sessions.iter().next().map(|(n, e)| (n.as_str(), e)),
+            None => None,
+        };
+        entry.and_then(|(name, entry)| entry.as_table().map(|entry| (name, entry)))
+    });
+    let entry_body = network_of(declared_entry.map(|(_, entry)| entry));
     if layers.defaults.is_empty() && layers.defaults_type.is_empty() && entry_body.is_empty() {
-        return Ok(None);
+        return Ok(ProjectEgress::default());
     }
     let entry = mfile::entry::BoxEntry {
-        name: mfile::spec::DEFAULT_SESSION_ENTRY.to_owned(),
+        name: declared_entry
+            .map_or(mfile::spec::DEFAULT_SESSION_ENTRY, |(name, _)| name)
+            .to_owned(),
         table: mfile::entry::EntryTable::Sessions,
         box_type: Some(boxes::SESSION_BOX_TYPE.to_owned()),
         body: entry_body,
@@ -349,39 +366,84 @@ fn project_egress_from(bytes: &[u8]) -> Result<Option<boxes::EgressPolicy>, anyh
     let mut expansion =
         mfile::expand::expand(&entry, &layers).map_err(|error| ProjectFileInvalid { error })?;
     // The network module's own read: a malformed egress table refuses the
-    // start. A legacy spelling still loads, so its hint goes to the log and
-    // never prints before the box shell on a healthy start.
-    let hints = mfile::network::canonicalize(&mut expansion.spec).map_err(|error| {
-        anyhow::anyhow!(
-            "Cannot start the box: the project's {name} does not load: {error}",
-            name = mfile::MFILE_NAME,
-        )
-    })?;
-    for hint in hints {
-        tracing::info!(hint = %hint, "the project's network keys use a legacy spelling");
-    }
+    // start with exit 3, as every invalid `minimal.toml` does.
+    let hints = mfile::network::canonicalize(&mut expansion.spec)
+        .map_err(|error| network_key_invalid(&expansion.spec, error))?;
     let Some(egress) = expansion
         .spec
         .get("network")
         .and_then(|network| network.get("egress"))
     else {
-        return Ok(None);
+        return Ok(ProjectEgress {
+            policy: None,
+            hints,
+        });
     };
-    let mut egress: boxes::EgressPolicy = egress.clone().try_into().map_err(|error| {
-        anyhow::anyhow!(
-            "Cannot start the box: [network.egress] in the project's {name} does not load: \
-             {error}",
-            name = mfile::MFILE_NAME,
-        )
-    })?;
+    let mut egress: boxes::EgressPolicy =
+        egress
+            .clone()
+            .try_into()
+            .map_err(|error| ProjectFileInvalid {
+                error: mfile::Error::Format(error),
+            })?;
     egress.allow_subnets = egress.allow_subnets.as_deref().map(normalize_subnets);
     egress.deny_subnets = egress.deny_subnets.as_deref().map(normalize_subnets);
-    Ok(Some(egress))
+    Ok(ProjectEgress {
+        policy: Some(egress),
+        hints,
+    })
+}
+
+/// The refusal for a `[network]` key that the network module cannot read:
+/// an invalid spec key of `minimal.toml`, named by its dotted path.
+fn network_key_invalid(
+    spec: &toml::Table,
+    error: mfile::network::NetworkError,
+) -> ProjectFileInvalid {
+    use mfile::network::NetworkError;
+    // What the value at a dotted `key` of the spec is, as the message names it.
+    let found_at = |key: &str| -> &'static str {
+        let mut parts = key.split('.');
+        let first = parts.next().and_then(|part| spec.get(part));
+        match parts.try_fold(first, |value, part| Some(value?.get(part))) {
+            Some(Some(toml::Value::String(_))) => "a string",
+            Some(Some(toml::Value::Integer(_))) => "a whole number",
+            Some(Some(toml::Value::Float(_))) => "a decimal number",
+            Some(Some(toml::Value::Boolean(_))) => "a true or false value",
+            Some(Some(toml::Value::Datetime(_))) => "a date or time",
+            Some(Some(toml::Value::Array(_))) => "a list",
+            Some(Some(toml::Value::Table(_))) => "a table",
+            _ => "another kind of value",
+        }
+    };
+    const MODES: &str = "\"none\", \"host_ip\" or \"own_ip\"";
+    let (key, expected, found) = match error {
+        NetworkError::UnknownMode(_) => (
+            "network.mode".to_owned(),
+            MODES,
+            "a value that is not a network mode",
+        ),
+        NetworkError::ModeNotString => ("network.mode".to_owned(), MODES, found_at("network.mode")),
+        NetworkError::WrongShape { key, expected } => {
+            let found = found_at(&key);
+            (key, expected, found)
+        }
+        NetworkError::ModeNoneWithEgress { key } => {
+            (key, "no value while `network.mode` is \"none\"", "a value")
+        }
+    };
+    ProjectFileInvalid {
+        error: mfile::Error::InvalidSpecKey {
+            key,
+            layer: mfile::MFILE_NAME.to_owned(),
+            problem: mfile::SpecKeyProblem::WrongShape { expected, found },
+        },
+    }
 }
 
 /// The box's effective egress: the project's declaration, with each field a
-/// flag names replaced by the flag's value. `--deny-all-egress` is the whole
-/// declaration, so it replaces every field.
+/// flag names replaced by the flag's value. `--deny-all-egress` replaces
+/// the three allow lists, and the file's `deny_subnets` stays.
 fn effective_egress(
     project: Option<boxes::EgressPolicy>,
     flags: Option<boxes::EgressPolicy>,
@@ -394,9 +456,22 @@ fn effective_egress(
         "deny_subnets",
     ];
     if deny_all_flag {
+        // `deny_all()` sets the three allow lists and leaves `deny_subnets`
+        // unset, so the file's deny ranges stay, under the file's name.
+        let deny_subnets = project.and_then(|project| project.deny_subnets);
+        let mut sources = FIELDS[..3]
+            .iter()
+            .map(|field| (*field, EgressSource::Flag))
+            .collect::<Vec<_>>();
+        if deny_subnets.is_some() {
+            sources.push((FIELDS[3], EgressSource::ProjectFile));
+        }
         return EffectiveEgress {
-            policy: Some(boxes::EgressPolicy::deny_all()),
-            sources: FIELDS.map(|field| (field, EgressSource::Flag)).to_vec(),
+            policy: Some(boxes::EgressPolicy {
+                deny_subnets,
+                ..boxes::EgressPolicy::deny_all()
+            }),
+            sources,
         };
     }
     if project.is_none() && flags.is_none() {
@@ -1768,8 +1843,19 @@ pub(crate) async fn activate_box(
                 project_bep_and_grants(&utf8_path)?;
             // NET-060: the project's egress, with each field a flag names
             // replaced by the flag.
-            let egress =
-                effective_egress(project_egress(&utf8_path)?, egress, args.deny_all_egress);
+            let project_egress = project_egress(&utf8_path)?;
+            // A legacy key spelling still loads. A start with no terminal
+            // prints its hint, and an interactive start logs it, so no line
+            // prints before the box shell.
+            let headless = args.no_prompt || global.no_input || !can_prompt_interactively();
+            for hint in &project_egress.hints {
+                if headless {
+                    eprintln!("{hint}");
+                } else {
+                    tracing::warn!(hint = %hint, "the project's network keys use a legacy spelling");
+                }
+            }
+            let egress = effective_egress(project_egress.policy, egress, args.deny_all_egress);
             tracing::debug!(
                 egress = ?egress.policy,
                 sources = ?egress.sources,
@@ -4773,7 +4859,7 @@ mod tests {
         let sub = root.join("sub");
         std::fs::create_dir_all(&sub).unwrap();
 
-        let project = project_egress(&sub).expect("the project file loads");
+        let project = project_egress(&sub).expect("the project file loads").policy;
         let effective = effective_egress(project, None, false);
         let expected = boxes::EgressPolicy {
             allow_subnets: Some(vec!["10.0.0.0/8".into()]),
@@ -4808,14 +4894,72 @@ mod tests {
             b"[defaults.network.egress]\nallow_dns_hosts = [\"a.example\"]\n\n\
               [sessions.default.network]\negress_allow_dns = [\"b.example\"]\n",
         )
-        .expect("the file loads")
-        .expect("egress is declared");
+        .expect("the file loads");
+        assert_eq!(
+            layered.hints.len(),
+            1,
+            "the flat legacy key gives one hint: {:?}",
+            layered.hints
+        );
+        let layered = layered.policy.expect("egress is declared");
         assert_eq!(layered.allow_dns_hosts, Some(vec!["b.example".to_owned()]));
+
+        // A file whose one session entry is `[sessions.dev]` gives that
+        // entry's egress, and `[sessions.default]` wins over another entry.
+        let only_dev = project_egress_from(
+            b"[sessions.dev.network.egress]\nallow_dns_hosts = [\"dev.example\"]\n",
+        )
+        .unwrap()
+        .policy
+        .expect("the one entry declares egress");
+        assert_eq!(
+            only_dev.allow_dns_hosts,
+            Some(vec!["dev.example".to_owned()])
+        );
+        let with_default = project_egress_from(
+            b"[sessions.dev.network.egress]\nallow_dns_hosts = [\"dev.example\"]\n\n\
+              [sessions.default.network.egress]\nallow_dns_hosts = [\"d.example\"]\n",
+        )
+        .unwrap()
+        .policy
+        .expect("the default entry declares egress");
+        assert_eq!(
+            with_default.allow_dns_hosts,
+            Some(vec!["d.example".to_owned()])
+        );
+
+        // A bad egress value is an invalid `minimal.toml`: the refusal is a
+        // `ProjectFileInvalid`, which `main.rs` ends with exit 3.
+        let refusal = project_egress_from(
+            b"[defaults.network.egress]\nallow_protocols = [\"carrier-pigeon\"]\n",
+        )
+        .expect_err("an unknown protocol refuses the start");
+        assert!(
+            matches!(refusal.error, mfile::Error::Format(_)),
+            "{refusal:?}"
+        );
+        let refusal = anyhow::Error::from(
+            project_egress_from(
+                b"[defaults.network]\nmode = \"none\"\n\n\
+              [defaults.network.egress]\nallow_dns_hosts = [\"a.example\"]\n",
+            )
+            .expect_err("egress with mode none refuses the start"),
+        );
+        let refusal = refusal
+            .downcast_ref::<ProjectFileInvalid>()
+            .expect("the refusal is an invalid project file");
+        assert!(
+            matches!(
+                &refusal.error,
+                mfile::Error::InvalidSpecKey { key, .. } if key.starts_with("network.egress.")
+            ),
+            "{refusal:?}"
+        );
 
         // No egress keys, and no project file, declare nothing.
         assert_eq!(
             project_egress_from(b"[session]\npackages = [\"git\"]\n").unwrap(),
-            None
+            ProjectEgress::default()
         );
         assert_eq!(
             effective_egress(None, None, false),
@@ -4830,9 +4974,11 @@ mod tests {
         let project = project_egress_from(
             b"[defaults.network.egress]\n\
               allow_subnets = [\"10.0.0.0/8\"]\n\
-              allow_dns_hosts = [\"github.com\"]\n",
+              allow_dns_hosts = [\"github.com\"]\n\
+              deny_subnets = [\"169.254.169.254/32\"]\n",
         )
-        .unwrap();
+        .unwrap()
+        .policy;
         let flags = boxes::EgressPolicy {
             allow_subnets: Some(vec!["192.168.0.0/16".into()]),
             ..boxes::EgressPolicy::default()
@@ -4844,7 +4990,7 @@ mod tests {
                 allow_subnets: Some(vec!["192.168.0.0/16".into()]),
                 allow_dns_hosts: Some(vec!["github.com".into()]),
                 allow_protocols: None,
-                deny_subnets: None,
+                deny_subnets: Some(vec!["169.254.169.254/32".into()]),
             })
         );
         assert_eq!(
@@ -4852,18 +4998,28 @@ mod tests {
             [
                 ("allow_subnets", EgressSource::Flag),
                 ("allow_dns_hosts", EgressSource::ProjectFile),
+                ("deny_subnets", EgressSource::ProjectFile),
             ]
         );
 
-        // `--deny-all-egress` is the whole declaration: it replaces every
-        // field the file sets.
+        // `--deny-all-egress` replaces the three allow lists. It sets no
+        // deny range, so the file's `deny_subnets` stays, under the file.
         let denied = effective_egress(project, None, true);
-        assert_eq!(denied.policy, Some(boxes::EgressPolicy::deny_all()));
-        assert!(
-            denied
-                .sources
-                .iter()
-                .all(|(_, source)| *source == EgressSource::Flag)
+        assert_eq!(
+            denied.policy,
+            Some(boxes::EgressPolicy {
+                deny_subnets: Some(vec!["169.254.169.254/32".into()]),
+                ..boxes::EgressPolicy::deny_all()
+            })
+        );
+        assert_eq!(
+            denied.sources,
+            [
+                ("allow_subnets", EgressSource::Flag),
+                ("allow_dns_hosts", EgressSource::Flag),
+                ("allow_protocols", EgressSource::Flag),
+                ("deny_subnets", EgressSource::ProjectFile),
+            ]
         );
     }
 }
