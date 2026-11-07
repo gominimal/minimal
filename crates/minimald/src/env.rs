@@ -5697,7 +5697,8 @@ exit $rc
             setup_channel_in(crate::box_actor::WeakBoxHandle::dangling(), "web", repo);
         let (mut ours, mut theirs) = UnixStream::pair().unwrap();
         let line = String::from_utf8_lossy(raw).into_owned();
-        chan.handle_raw(&line, Some(raw), None, &mut ours).await;
+        chan.handle_raw(&line, Some(raw), TaskTrace::Parent(None), &mut ours)
+            .await;
         drop(ours);
         let mut reply = String::new();
         std::io::Read::read_to_string(&mut theirs, &mut reply).unwrap();
