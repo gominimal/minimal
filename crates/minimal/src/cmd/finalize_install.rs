@@ -1403,10 +1403,13 @@ pub(crate) mod linux {
              # the socket unit. A daemon that was running read this machine before the\n\
              # step installed, so the run says how to make it read the machine again: a\n\
              # restart, which the socket unit places. Without the units a restarted\n\
-             # daemon stands outside its leaf, so the run does not advise one.\n\
+             # daemon stands outside its leaf, so the run does not advise one. A placement\n\
+             # that fails still prints what it said, and the run exits with its status.\n\
+             place_status=0\n\
              place_out=$({CLASSIFIER_PROGRAM_PATH} --user '{operator}' \
-             --place-listener '{socket}')\n\
+             --place-listener '{socket}') || place_status=$?\n\
              printf '%s\\n' \"$place_out\"\n\
+             [ \"$place_status\" -eq 0 ] || exit \"$place_status\"\n\
              case \"$place_units:$place_out\" in\n\
              no:*) ;;\n\
              *'{PLACE_NO_HOLDER}'*) ;;\n\
@@ -3879,10 +3882,15 @@ mod tests {
                  # the socket unit. A daemon that was running read this machine before the\n\
                  # step installed, so the run says how to make it read the machine again: a\n\
                  # restart, which the socket unit places. Without the units a restarted\n\
-                 # daemon stands outside its leaf, so the run does not advise one.\n\
-                 place_out=$({CLASSIFIER_PROGRAM_PATH} --user 'alice' --place-listener '{sock}')\n"
+                 # daemon stands outside its leaf, so the run does not advise one. A placement\n\
+                 # that fails still prints what it said, and the run exits with its status.\n\
+                 place_status=0\n\
+                 place_out=$({CLASSIFIER_PROGRAM_PATH} --user 'alice' --place-listener '{sock}') \
+                 || place_status=$?\n"
             )) && after_units.ends_with(&format!(
-                "case \"$place_units:$place_out\" in\nno:*) ;;\n\
+                "printf '%s\\n' \"$place_out\"\n\
+                 [ \"$place_status\" -eq 0 ] || exit \"$place_status\"\n\
+                 case \"$place_units:$place_out\" in\nno:*) ;;\n\
                  *'{PLACE_NO_HOLDER}'*) ;;\n*) echo '{DAEMON_RUNNING_NOTE}' ;;\nesac\n"
             )),
             "{unit_part}"
@@ -4124,6 +4132,16 @@ mod tests {
         assert!(
             printed.contains(PLACE_NO_HOLDER) && !printed.contains(DAEMON_RUNNING_NOTE),
             "no daemon, no restart note: {printed}"
+        );
+        // A placement that fails: its own lines still print, the run exits
+        // with its status, and there is no restart note.
+        let failing = "#!/bin/sh\n[ \"${3:-}\" != --place-listener ] || \
+                       { echo \"could not place 4242 (it holds $4)\"; exit 5; }\nexit 0\n";
+        let (_failing, code, _, _, printed) = run_block(failing, true, true);
+        assert_eq!(code, Some(5), "the block exits with the placement's status");
+        assert!(
+            printed.contains("could not place 4242") && !printed.contains(DAEMON_RUNNING_NOTE),
+            "a failed placement prints its lines and no restart note: {printed}"
         );
         // No systemctl: the running daemon is placed live, but a restart
         // would leave it outside its leaf with no unit to place it, so the

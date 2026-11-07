@@ -5461,6 +5461,11 @@ async fn a_daemon_moved_after_its_start_reading_re_reads_the_classifier_fact() {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        // The fact is set inside the re-read, but the watch still logs and
+        // records the move after it, holding the recorded cgroup's lock
+        // until then; taking the lock waits for that, so a watch stopped
+        // next has already logged and recorded the move.
+        let _ = crate::box_runtime::fact_cgroup().await;
     };
 
     // A guest daemon: the reading runs, and nothing else.
