@@ -8326,10 +8326,10 @@ mod tests {
 
     use super::test_support::{
         CaptureWriter, DEADLINE, arp_frame, box_cohort_frame, capture_log, connect_control,
-        connect_over, daemon_request, expect_frame, expect_silence, expect_teardown, expose_request,
-        gate_connected, gate_connected_with_phase, gate_over, gate_over_control, gate_over_shipped,
-        gate_over_with, gate_over_with_node_baseline, ipv4_frame, ipv6_frame, read_within,
-        send_frame, unexpose_request, wait_for_log,
+        connect_over, daemon_request, expect_frame, expect_silence, expect_teardown,
+        expose_request, gate_connected, gate_connected_with_phase, gate_over, gate_over_control,
+        gate_over_shipped, gate_over_with, gate_over_with_node_baseline, ipv4_frame, ipv6_frame,
+        read_within, send_frame, unexpose_request, wait_for_log,
     };
     use super::{
         AcceptFailure, AliasRow, CONNECT_REQUEST, CONTROL_VERBS, ControlVerb, DropLimiter,
@@ -18482,7 +18482,10 @@ mod tests {
             format!("{}{}", &key[..last], key[last..].to_ascii_uppercase()),
             format!("\\u{:04x}{rest}", u32::from(first)),
         ];
-        assert!(!key.contains('k'), "{key}: a key with a `k` needs its Kelvin-sign fold");
+        assert!(
+            !key.contains('k'),
+            "{key}: a key with a `k` needs its Kelvin-sign fold"
+        );
         if key.contains('s') {
             spellings.push(key.replace('s', "\u{17f}"));
         }
@@ -18733,7 +18736,14 @@ mod tests {
         let registry = BoxRegistry::new(SUBNET);
         tcp_lan_box(&registry, LEASE);
         let h = gate_connected(registry).await;
-        for zone in ["com.", ".", "", "MIN.INTERNAL.", "min.internal", "web.min.internal."] {
+        for zone in [
+            "com.",
+            ".",
+            "",
+            "MIN.INTERNAL.",
+            "min.internal",
+            "web.min.internal.",
+        ] {
             let body = format!(
                 r#"{{"name":"{zone}","records":[{{"name":"web","ip":"100.64.0.9"}},{{"name":"web.github","ip":"100.64.0.9"}}]}}"#
             );
