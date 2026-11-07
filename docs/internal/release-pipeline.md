@@ -695,3 +695,18 @@ one marked block in the shell rc file. `--uninstall` removes all of it with no
 network access, from the local install record. It keeps files that you
 changed unless you add `--force`. `--purge` also deletes the data, state, and
 cache folders.
+
+### ci.yml: the conflict-marker scan
+
+The `conflict-markers` job in
+[`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) runs
+[`scripts/check-conflict-markers.sh`](../../scripts/check-conflict-markers.sh)
+on every PR and push. It fails on a conflict marker in a tracked text file. The
+required check `ci-success` depends on it, so a PR with markers cannot merge.
+
+For a PR, GitHub runs the `ci.yml` of the merge with the base branch. The scan
+covers a release line only when that line has this job. A line cut from `main`
+has it. An older line needs this job and the script ported by PR.
+
+The scan does not see a modify/delete conflict, because that conflict leaves no
+markers. The list of conflicted paths in the draft PR body names those paths.
