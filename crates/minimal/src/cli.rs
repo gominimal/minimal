@@ -965,10 +965,12 @@ pub enum TaskCommand {
     /// project like `min session activate`, runs the task inside it, and
     /// exits with the task's exit code.
     ///
-    /// The task runs without a terminal. This command's stdin is the task's
-    /// stdin, and the task's stdout is this command's stdout. This command
-    /// prints its own lines on stderr, beside the task's stderr. So
-    /// `min task run query > out.csv` writes only the task's output.
+    /// The task runs without a terminal. A piped or redirected stdin goes to
+    /// the task, and the task reads EOF when that input ends. The task's
+    /// stdout is this command's stdout, and this command prints its own
+    /// lines on stderr, beside the task's stderr. So
+    /// `cat q.sql | min task run query > out.csv` gives the task q.sql and
+    /// writes only the task's output to out.csv.
     /// `--detach` starts the box, prints its id and returns.
     ///
     /// When the task ends, the box stays with its exit code: see it with

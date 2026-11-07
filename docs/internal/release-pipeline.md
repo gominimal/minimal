@@ -70,6 +70,15 @@ gh api orgs/gominimal/actions/runner-groups/3 --jq '{name, visibility, allows_pu
   | gh api -X PATCH orgs/gominimal/actions/runner-groups/3 --input -
 ```
 
+That update can empty the group's repository list. With an empty list, the
+signing jobs wait in the queue and the runner stays idle. Add the repository
+again, then check that the second command prints `gominimal/minimal`:
+
+```sh
+gh api -X PUT orgs/gominimal/actions/runner-groups/3/repositories/$(gh api repos/gominimal/minimal --jq .id)
+gh api orgs/gominimal/actions/runner-groups/3/repositories --jq '.repositories[].full_name'
+```
+
 ### 3. Rehearse the release run
 
 ```sh

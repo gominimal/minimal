@@ -325,6 +325,10 @@ struct CreateBoxMsg {
     /// Whether the create asks for a fresh instance (BOX-163): the box is
     /// named `<name>-<n>` and never refused for a held name.
     fresh: bool,
+    /// Where a created box's host-address fact goes: the one the create's
+    /// own gate read ([`create_host_ip_fact`]), so the reply states what
+    /// this create saw rather than whatever the global fact reads later.
+    fact: Option<tokio::sync::oneshot::Sender<crate::box_runtime::HostIpEnforcementFact>>,
 }
 
 /// The refusal of a create whose name a running box holds (BOX-163). It
@@ -459,7 +463,7 @@ impl BoxManagerHandle {
         username: Option<String>,
         creator: Option<std::sync::Weak<()>>,
     ) -> Result<SessionId, BoxManagerError> {
-        self.send_create_box(config, spec, false, username, creator)
+        self.send_create_box(config, spec, false, username, creator, None)
             .await
     }
 
@@ -474,8 +478,31 @@ impl BoxManagerHandle {
         username: Option<String>,
         creator: Option<std::sync::Weak<()>>,
     ) -> Result<SessionId, BoxManagerError> {
-        self.send_create_box(config, spec, true, username, creator)
+        self.send_create_box(config, spec, true, username, creator, None)
             .await
+    }
+
+    /// [`Self::create_box_with_spec`], or the fresh-instance create when
+    /// `fresh` is set, that also returns the host-address fact the create's
+    /// own gate read. The create reply states this fact, never a later read
+    /// of the global one, which another create or launch may have refreshed
+    /// in between.
+    pub(crate) async fn create_box_reporting_fact(
+        &self,
+        config: minimald_rpc::BoxConfig,
+        spec: Option<serde_json_lenient::Value>,
+        fresh: bool,
+        username: Option<String>,
+        creator: Option<std::sync::Weak<()>>,
+    ) -> Result<(SessionId, crate::box_runtime::HostIpEnforcementFact), BoxManagerError> {
+        let (send, recv) = tokio::sync::oneshot::channel();
+        let id = self
+            .send_create_box(config, spec, fresh, username, creator, Some(send))
+            .await?;
+        let fact = recv
+            .await
+            .expect("a created box's manager sends its fact before its id");
+        Ok((id, fact))
     }
 
     async fn send_create_box(
@@ -485,6 +512,7 @@ impl BoxManagerHandle {
         fresh: bool,
         username: Option<String>,
         creator: Option<std::sync::Weak<()>>,
+        fact: Option<tokio::sync::oneshot::Sender<crate::box_runtime::HostIpEnforcementFact>>,
     ) -> Result<SessionId, BoxManagerError> {
         let (send, recv) = Responder::channel();
         // Ignore send errors - the recv will also fail.
@@ -499,6 +527,7 @@ impl BoxManagerHandle {
                 },
                 spec,
                 fresh,
+                fact,
             })))
             .await;
         recv.await.expect("corresponding sessions manager is dead")
@@ -555,7 +584,12 @@ impl BoxManagerHandle {
         id: SessionId,
     ) -> Result<Option<minimald_rpc::ShowBoxResponse>, BoxManagerError> {
         use tracing::Instrument as _;
-        let span = tracing::info_span!("box.show", session_id = %id, found = tracing::field::Empty);
+        let span = tracing::info_span!(
+            "box.show",
+            session_id = %id,
+            found = tracing::field::Empty,
+            disk = tracing::field::Empty
+        );
         async {
             let (send, recv) = Responder::channel();
             // Ignore send errors - the recv will also fail.
@@ -571,7 +605,17 @@ impl BoxManagerHandle {
                 .or_else(|| records.iter().find(|(record, _)| record.id == id));
             tracing::Span::current().record("found", record.is_some());
             tracing::info!(session_id = %id, found = record.is_some(), "read a box record");
-            Ok(record.map(|(record, pty)| minimald_rpc::ShowBoxResponse {
+            let Some((record, pty)) = record else {
+                return Ok(None);
+            };
+            // BOX-159: the disk a reap frees, for a box a reap can take.
+            let disk_bytes = if is_ended(record) {
+                self.box_disk_bytes(record).await
+            } else {
+                None
+            };
+            tracing::Span::current().record("disk", disk_bytes.is_some());
+            Ok(Some(minimald_rpc::ShowBoxResponse {
                 record: box_listing_entry(record, *pty),
                 // BOX-140: no host this daemon runs on is enrolled with a
                 // Gatehouse, so every box reports the identity none.
@@ -581,10 +625,55 @@ impl BoxManagerHandle {
                 // the box. It fills when each exec has an id (BOX-149):
                 // https://github.com/gominimal/minimal/issues/2404 (T30).
                 live_execs: Vec::new(),
+                disk_bytes,
             }))
         }
         .instrument(span)
         .await
+    }
+
+    /// The bytes on disk that a reap of the box `record` names frees
+    /// (BOX-021, BOX-159), measured off the manager loop, so a large box
+    /// does not hold up other requests. `None` when the box cannot be
+    /// measured: the daemon log names the box and the error, and no figure
+    /// stands in for it.
+    async fn box_disk_bytes(&self, record: &boxes::Record) -> Option<u64> {
+        let box_id = record.box_id.unwrap_or(record.id);
+        let (send, recv) = Responder::channel();
+        // A send error means the manager is gone: the recv fails as well.
+        let _ = self
+            .sender
+            .send(ManagerMessage::EventsSource(record.id, send))
+            .await;
+        let measured = match recv.await {
+            Ok(Ok(Some(object))) => {
+                let dir = object.dir();
+                crate::traced::spawn_blocking(move || dir.disk_bytes())
+                    .await
+                    .unwrap_or_else(|join| Err(std::io::Error::other(join)))
+            }
+            Ok(Ok(None)) => Err(std::io::Error::new(
+                NotFound,
+                "no retained record names the box",
+            )),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                minimald_rpc::SHUTDOWN_REFUSAL,
+            )),
+        };
+        match measured {
+            Ok(bytes) => Some(bytes),
+            Err(error) => {
+                tracing::warn!(
+                    box_id = %box_id,
+                    session_id = %record.id,
+                    %error,
+                    "box disk: the disk the box holds cannot be measured; it has no figure"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -883,25 +972,7 @@ impl BoxManagerHandle {
                     minimald_rpc::SHUTDOWN_REFUSAL,
                 ));
             }
-            let (send, recv) = Responder::channel();
-            // Ignore send errors - the recv will also fail.
-            let _ = self.sender.send(ManagerMessage::Records(send)).await;
-            let records = recv
-                .await
-                .expect("corresponding sessions manager is dead")?;
-            let mut matched = Vec::new();
-            for record in records {
-                if !prune_matches(&record, parent) {
-                    continue;
-                }
-                if let Some(older_than) = older_than
-                    && !self.ended_long_enough(&record, older_than, now).await
-                {
-                    continue;
-                }
-                matched.push(record);
-            }
-            matched.sort_by_key(|record| record.box_id.unwrap_or(record.id));
+            let matched = self.prune_candidates(older_than, parent, now).await?;
             tracing::Span::current().record("matched", matched.len());
             let mut reply = minimald_rpc::PruneBoxesResponse::default();
             for record in matched {
@@ -928,6 +999,112 @@ impl BoxManagerHandle {
         .instrument(span)
         .await
     }
+
+    /// The records a prune with these selectors reaps, in box id order
+    /// (BOX-021): every `stopped` or `exited` box that matches all the
+    /// given selectors. [`Self::prune_boxes_at`] reaps them and
+    /// [`Self::preview_prune_at`] lists them, so the two match the same
+    /// boxes.
+    async fn prune_candidates(
+        &self,
+        older_than: Option<std::time::Duration>,
+        parent: Option<SessionId>,
+        now: std::time::SystemTime,
+    ) -> Result<Vec<boxes::Record>, BoxManagerError> {
+        let (send, recv) = Responder::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self.sender.send(ManagerMessage::Records(send)).await;
+        let records = recv
+            .await
+            .expect("corresponding sessions manager is dead")?;
+        let mut matched = Vec::new();
+        for record in records {
+            if !prune_matches(&record, parent) {
+                continue;
+            }
+            if let Some(older_than) = older_than
+                && !self.ended_long_enough(&record, older_than, now).await
+            {
+                continue;
+            }
+            matched.push(record);
+        }
+        matched.sort_by_key(|record| record.box_id.unwrap_or(record.id));
+        Ok(matched)
+    }
+
+    /// Lists every box that [`Self::prune_boxes`] with the same selectors
+    /// reaps, with the disk each one holds, and reaps none (BOX-021). A
+    /// box whose disk cannot be measured is listed with no figure.
+    ///
+    /// # Errors
+    ///
+    /// The store's error from the read of the records.
+    pub async fn preview_prune(
+        &self,
+        older_than: Option<std::time::Duration>,
+        parent: Option<SessionId>,
+    ) -> Result<minimald_rpc::PreviewPruneResponse, BoxManagerError> {
+        self.preview_prune_at(older_than, parent, std::time::SystemTime::now())
+            .await
+    }
+
+    /// [`Self::preview_prune`] with `now` as the time that `older_than`
+    /// counts back from.
+    pub(crate) async fn preview_prune_at(
+        &self,
+        older_than: Option<std::time::Duration>,
+        parent: Option<SessionId>,
+        now: std::time::SystemTime,
+    ) -> Result<minimald_rpc::PreviewPruneResponse, BoxManagerError> {
+        use tracing::Instrument as _;
+        let span = tracing::info_span!(
+            "box.prune_preview",
+            older_than_secs = older_than.map(|d| d.as_secs()),
+            parent = parent.map(tracing::field::display),
+            matched = tracing::field::Empty,
+            unmeasured = tracing::field::Empty
+        );
+        async {
+            let matched = self.prune_candidates(older_than, parent, now).await?;
+            let mut reply = minimald_rpc::PreviewPruneResponse::default();
+            for record in matched {
+                let disk_bytes = self.box_disk_bytes(&record).await;
+                reply.matched.push(minimald_rpc::PrunePreviewEntry {
+                    // As a prune reports a reaped box: no terminal is left.
+                    record: box_listing_entry(&record, false),
+                    disk_bytes,
+                });
+            }
+            let unmeasured = reply
+                .matched
+                .iter()
+                .filter(|entry| entry.disk_bytes.is_none())
+                .count();
+            tracing::Span::current().record("matched", reply.matched.len());
+            tracing::Span::current().record("unmeasured", unmeasured);
+            tracing::info!(
+                older_than_secs = older_than.map(|d| d.as_secs()),
+                parent = parent.map(tracing::field::display),
+                matched = reply.matched.len(),
+                unmeasured,
+                "previewed a prune: no box was reaped"
+            );
+            Ok(reply)
+        }
+        .instrument(span)
+        .await
+    }
+}
+
+/// Whether `record` is `stopped` or `exited`: a box a reap that is not
+/// forced can take.
+fn is_ended(record: &boxes::Record) -> bool {
+    matches!(
+        record.state(),
+        Ok(boxes::core::record::RecordState::Stopped(_)
+            | boxes::core::record::RecordState::Exited(_))
+    )
 }
 
 /// Whether `record` is a prune candidate (BOX-021): it is `stopped` or
@@ -935,12 +1112,7 @@ impl BoxManagerHandle {
 /// `older_than` selector needs the record's events, so
 /// [`BoxManagerHandle::prune_boxes_at`] checks it after this one.
 fn prune_matches(record: &boxes::Record, parent: Option<SessionId>) -> bool {
-    let ended = matches!(
-        record.state(),
-        Ok(boxes::core::record::RecordState::Stopped(_)
-            | boxes::core::record::RecordState::Exited(_))
-    );
-    if !ended {
+    if !is_ended(record) {
         return false;
     }
     parent.is_none_or(|parent| record.parent == Some(parent))
@@ -3305,7 +3477,7 @@ impl BoxManager {
         fresh: bool,
         username: Option<String>,
         creator: Option<std::sync::Weak<()>>,
-    ) -> Result<SessionId, BoxManagerError> {
+    ) -> Result<(SessionId, crate::box_runtime::HostIpEnforcementFact), BoxManagerError> {
         if self.in_shutdown.is_cancelled() {
             return Err(BoxManagerError::new(
                 std::io::ErrorKind::ConnectionRefused,
@@ -3615,7 +3787,7 @@ impl BoxManager {
         match BoxActor::run(seed).await {
             Ok(session) => {
                 self.running.insert(session_id, session);
-                Ok(session_id)
+                Ok((session_id, host_ip_fact))
             }
             // The actor never started, so no one else will delete the
             // record. Best-effort: the spawn error is what the client needs
@@ -3970,7 +4142,8 @@ impl BoxManager {
                 } = *msg;
                 let created = self
                     .create_session(config, None, false, username, creator)
-                    .await;
+                    .await
+                    .map(|(id, _)| id);
                 responder.handle(async move { created }).await;
             }
             ManagerMessage::CreateBox(msg) => {
@@ -3984,10 +4157,17 @@ impl BoxManager {
                         },
                     spec,
                     fresh,
+                    fact,
                 } = *msg;
                 let created = self
                     .create_session(config, spec, fresh, username, creator)
-                    .await;
+                    .await
+                    .map(|(id, host_ip_fact)| {
+                        if let Some(fact) = fact {
+                            let _ = fact.send(host_ip_fact);
+                        }
+                        id
+                    });
                 responder.handle(async move { created }).await;
             }
             // Deletes a session: see `delete_box`.
