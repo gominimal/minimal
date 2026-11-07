@@ -208,8 +208,7 @@ impl BoxSpec {
     }
 
     /// The spec of a task box, from the `[tasks.<name>]` entry and the
-    /// flags. A task's spec carries the request's box policy, which a task
-    /// leaves at the default.
+    /// flags. A task's spec carries the request's box policy.
     ///
     /// `None` for an interactive task. The `task` Box Type denies a
     /// terminal, so no `task` spec has `pty_enabled = true`.

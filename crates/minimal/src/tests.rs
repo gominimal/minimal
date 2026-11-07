@@ -436,6 +436,9 @@ fn every_create_session_asserts_the_daemon_build() {
             // config, which only a fake create closure receives.
             "dash/rpc.rs::own_ip_config = asserts nothing",
             "task.rs::cmd_task_run = asserts",
+            // A unit test's request, never sent: it checks the task box's
+            // network and egress.
+            "task.rs::task_box_network_flags_reach_the_create_request = asserts nothing",
             // Not a client path: the two-VM fixture's own create. It asserts
             // like the real ones, so the inventory stays "every site asserts".
             "tests.rs::create_box_on = asserts",
@@ -1696,6 +1699,98 @@ fn task_run_parses_task_and_path() {
     // The task name is required.
     assert!(Cli::try_parse_from(["min", "task", "run"]).is_err());
     assert!(Cli::try_parse_from(["min", "task"]).is_err());
+}
+
+/// NET-060: `min task run` takes `min session activate`'s `--network` flag
+/// and egress flags from the same definitions: they parse before or after
+/// the task name, `--deny-all-egress` conflicts with every rule flag, and a
+/// flag after `--` is a task argument.
+#[test]
+fn task_run_parses_network_and_egress_flags() {
+    use clap::Parser as _;
+    let run_args = |args: &[&str]| -> TaskRunArgs {
+        match Cli::try_parse_from(args)
+            .unwrap_or_else(|error| panic!("{args:?} must parse: {error}"))
+            .command
+        {
+            Some(Command::Task(TaskArgs {
+                command: TaskCommand::Run(a),
+            })) => a,
+            _ => panic!("expected `task run` for {args:?}"),
+        }
+    };
+
+    // No flag: the `host_ip` default and no egress flag.
+    let a = run_args(&["min", "task", "run", "build"]);
+    assert_eq!(a.network, CliNetworkMode::HostNet);
+    assert!(a.egress.allow_subnets.is_empty());
+    assert!(a.egress.allow_dns_hosts.is_empty());
+    assert!(a.egress.allow_protocols.is_empty());
+    assert!(a.egress.deny_subnets.is_empty());
+    assert!(!a.egress.deny_all_egress);
+
+    let a = run_args(&[
+        "min",
+        "task",
+        "run",
+        "--network",
+        "own_ip",
+        "--allow-subnets",
+        "10.0.0.0/8",
+        "--allow-dns-hosts",
+        "github.com",
+        "--allow-dns-hosts",
+        "api.github.com",
+        "--allow-protocols",
+        "tcp",
+        "--deny-subnets",
+        "169.254.169.254/32",
+        "build",
+    ]);
+    assert_eq!(a.task, "build");
+    assert_eq!(a.network, CliNetworkMode::OwnIp);
+    assert_eq!(a.egress.allow_subnets, ["10.0.0.0/8"]);
+    assert_eq!(a.egress.allow_dns_hosts, ["github.com", "api.github.com"]);
+    assert_eq!(a.egress.allow_protocols, ["tcp"]);
+    assert_eq!(a.egress.deny_subnets, ["169.254.169.254/32"]);
+    assert!(a.args.is_empty());
+
+    // After the task name, before its arguments.
+    let a = run_args(&[
+        "min",
+        "task",
+        "run",
+        "build",
+        "--network",
+        "none",
+        "--deny-all-egress",
+    ]);
+    assert_eq!(a.network, CliNetworkMode::NoNet);
+    assert!(a.egress.deny_all_egress);
+    assert!(a.args.is_empty());
+
+    // After `--`, a flag's name is the task's argument.
+    let a = run_args(&["min", "task", "run", "build", "--", "--network", "x"]);
+    assert_eq!(a.network, CliNetworkMode::HostNet);
+    assert_eq!(a.args, ["--network", "x"]);
+
+    let err = Cli::try_parse_from([
+        "min",
+        "task",
+        "run",
+        "--deny-all-egress",
+        "--allow-dns-hosts",
+        "github.com",
+        "build",
+    ])
+    .map(|_| ())
+    .expect_err("--deny-all-egress conflicts with a rule flag");
+    assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+    assert!(
+        Cli::try_parse_from(["min", "task", "run", "--network", "bridge", "build"]).is_err(),
+        "an unknown network mode is refused by the shared parser"
+    );
 }
 
 /// The hidden top-level `run` swallows any spelling — flags included —
@@ -3013,7 +3108,7 @@ fn deny_all_egress_conflicts_with_every_egress_flag() {
     match args.command {
         Some(Command::Session(SessionArgs {
             command: SessionCommand::Activate(a),
-        })) => assert!(a.deny_all_egress, "the flag must land on the args"),
+        })) => assert!(a.egress.deny_all_egress, "the flag must land on the args"),
         _ => panic!("expected an activate command"),
     }
 

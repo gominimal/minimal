@@ -627,6 +627,8 @@ mod tests {
             command: minimal::TaskCommand::Run(minimal::TaskRunArgs {
                 task: "build".to_string(),
                 path: None,
+                network: minimal::CliNetworkMode::HostNet,
+                egress: minimal::EgressArgs::default(),
                 args: vec![],
             }),
         }));
