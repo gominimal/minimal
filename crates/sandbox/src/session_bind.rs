@@ -662,6 +662,21 @@ mod tests {
         (meta.dev(), meta.ino())
     }
 
+    /// Whether this host lets the test's child set up the user namespace a
+    /// namespace test runs in. A host that denies it (a CI runner restricting
+    /// unprivileged user namespaces) skips `test` with the reason printed,
+    /// rather than failing on a setup it cannot make or passing silently.
+    fn skip_without_userns(test: &str) -> bool {
+        let Some(reason) = crate::user_namespaces_restriction() else {
+            return false;
+        };
+        eprintln!(
+            "skipping {test}: this host denies the unprivileged user namespace the test's \
+             child unshares: {reason}"
+        );
+        true
+    }
+
     /// A home holding `x/` (token IN), beside an `outside/` (token OUT) the
     /// box must never reach.
     fn home_and_outside() -> (tempfile::TempDir, PathBuf, PathBuf) {
@@ -737,6 +752,11 @@ mod tests {
     /// the link to `outside`.
     #[test]
     fn a_swap_between_the_resolve_and_the_bind_cannot_change_what_is_mounted() {
+        if skip_without_userns(
+            "a_swap_between_the_resolve_and_the_bind_cannot_change_what_is_mounted",
+        ) {
+            return;
+        }
         let (root, _home, _outside) = home_and_outside();
         let mut container = hakoniwa::Container::new();
         container.rootfs("/").unwrap();
@@ -793,6 +813,11 @@ mod tests {
     /// staged mount.
     #[test]
     fn bind_all_lays_a_home_patch_over_a_staged_mapping_as_hakoniwa_did() {
+        if skip_without_userns(
+            "bind_all_lays_a_home_patch_over_a_staged_mapping_as_hakoniwa_did",
+        ) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let t = root.path();
         std::fs::create_dir_all(t.join("home/a/b")).unwrap();
