@@ -23068,17 +23068,12 @@ source=203.0.113.7 destination=$esu_host:$ESU_LISTEN_PORT verdict=refused at the
 #     host-side boot log. The attempt never reads the server's SSH banner
 #     either way.
 #
-#   * the build leg (NET-155 under NET-130): `min add --session` of a
-#     project-local package whose one web source is a literal address in
-#     TEST-NET-2. An own-address box has no classifier leaf, so the daemon
-#     fetches the source from its own namespace with the node's address,
-#     and the host-side gate decides it by the node-plane baseline set: the
-#     address is no registry or cache pin, so the gate drops it and writes
-#     its `egress-node-plane-unpinned` line naming the destination. The
-#     build fails and the package is not installed. This is the interim
-#     that the NET-155 scope note names, and issue #2802 owns it. When #2802
-#     gives an own-address box its own leaf, change this leg to expect the
-#     box's own drop in place of the node's.
+#   * the build leg (NET-155): `min add --session` of a project-local
+#     package whose one web source is a literal address in TEST-NET-2. The
+#     box's rules admit no destination, so the fetch opens no connection.
+#     The build fails, its error names the destination and the box's rules,
+#     the package is not installed, and no frame reaches the host-side gate,
+#     so the gate writes no line for the destination.
 #
 #   * the escape leg (NET-085): a root escapee wearing the node's own
 #     address speaks the shuttle protocol at the gate's landing edge (the
@@ -23093,10 +23088,8 @@ source=203.0.113.7 destination=$esu_host:$ESU_LISTEN_PORT verdict=refused at the
 #     no infrastructure destination and no pin. The gate drops it under
 #     `egress-node-plane-unpinned`, which proves the pin itself.
 #
-# The build leg runs before the escape leg on purpose: the gate writes one
-# line per source per rule per 60 s, and both legs' lines are the node
-# address's under the same rule, so each escape probe waits out the window
-# that the line before it opened. Every leg's failure prints the record it expected
+# The gate writes one line per source per rule per 60 s, so each leg waits out
+# the window that the line before it opened. Every leg's failure prints the record it expected
 # and the host log lines it searched.
 proof_escapes_and_builds_stay_inside_box_rules() {
   local ebr_sid="" ebr_rec="" ebr_ip="" ebr_node="" ebr_host="" ebr_out=""
@@ -23431,11 +23424,11 @@ attempt=vsock CID $ebr_cid port 2222 refusal=refused at the guest daemon's accep
   # ---- the build leg: a deny-all box's package build (NET-155) -------------
   # The gate writes one line per source address per rule in a 60 s window,
   # whatever the destination. An earlier drop from the node's address (the
-  # activate, or an earlier case) can hold that window open and silence this
-  # leg's line. Wait it out, as the escape leg does.
+  # activate, or an earlier case) can hold that window open, and then a line
+  # this leg must not see could not appear. Wait it out, as the escape leg does.
   echo "waiting 61 s for the gate's per-source line window for $ebr_node to close"
   sleep 61
-  EBR_EXPECTED="'min add --session $ebr_pkg' fails inside the box, and the gate writes an egress-node-plane-unpinned line with source $ebr_node and destination $ebr_build_dst"
+  EBR_EXPECTED="'min add --session $ebr_pkg' fails inside the box, its error names $ebr_build_dst and the egress rules of box e2e-ebr, and the gate writes no line for $ebr_build_dst"
   ebr_prior="$(ebr_gate_lines "$ebr_node" egress-node-plane-unpinned "$ebr_build_dst" | wc -l)"
   # shellcheck disable=SC2016 # `$?` must reach the box's shell unexpanded.
   ebr_out="$(mnl session exec "$ebr_sid" \
@@ -23450,7 +23443,7 @@ attempt=vsock CID $ebr_cid port 2222 refusal=refused at the guest daemon's accep
   printf '%s\n' "$ebr_out" | tail -n 20 | sed 's/^/  /'
   ebr_rc="$(printf '%s\n' "$ebr_out" | sed -n 's/^min-add-exit=//p' | tail -n1)"
   if [ -z "$ebr_rc" ] || [ "$ebr_rc" = 0 ]; then
-    echo "::error::the deny-all box's build of $ebr_pkg did not fail (exit '$ebr_rc'): its web source at $ebr_build_dst is outside the box's rules and the baseline set"
+    echo "::error::the deny-all box's build of $ebr_pkg did not fail (exit '$ebr_rc'): its web source at $ebr_build_dst is outside the box's rules"
     ebr_fail
   fi
   if [ "$ebr_rc" = 124 ]; then
@@ -23462,17 +23455,22 @@ attempt=vsock CID $ebr_cid port 2222 refusal=refused at the guest daemon's accep
     echo "::error::the build never started: the box did not resolve the project's own package $ebr_pkg"
     ebr_fail
   fi
-  ebr_line="$(ebr_wait_new_gate_line "$ebr_node" egress-node-plane-unpinned \
-    "$ebr_build_dst" "$ebr_prior")" || {
-    echo "::error::the build failed, but the gate wrote no egress-node-plane-unpinned line for $ebr_node toward $ebr_build_dst ($ebr_prior such line(s) before the leg)"
+  if ! grep -q "could not reach $ebr_build_dst: the egress rules of box e2e-ebr do not allow it" <<<"$ebr_out"; then
+    echo "::error::the build failed, but its error does not name $ebr_build_dst and the box's rules"
     ebr_fail
-  }
+  fi
+  # A line takes a moment to reach the log, so look only after that moment.
+  sleep 5
+  if [ "$(ebr_gate_lines "$ebr_node" egress-node-plane-unpinned "$ebr_build_dst" | wc -l)" -gt "$ebr_prior" ]; then
+    echo "::error::the gate wrote a line for $ebr_node toward $ebr_build_dst: the fetch of a box whose rules admit nothing must send nothing"
+    ebr_fail
+  fi
   ebr_rows="$ebr_rows
-attempt=package build of $ebr_pkg, web source $ebr_build_dst:443 refusal=build failed (exit $ebr_rc) record=gate: $ebr_line"
-  echo "build leg OK: the deny-all box's build reached nothing outside its rules and the baseline set"
+attempt=package build of $ebr_pkg, web source $ebr_build_dst:443 refusal=build failed (exit $ebr_rc) record=the build's error, and no gate line"
+  echo "build leg OK: the deny-all box's fetch sent nothing, and its build named the rules"
 
   # ---- the escape leg: root in the VM wearing the node's address (NET-085) --
-  # Two probes, each after a 61 s wait: the build leg's line, and the first
+  # Two probes, each after a 61 s wait: an earlier drop, and the first
   # probe's line, each open the gate's 60 s window for this source and rule.
   #
   # Probe 1 aims at the runner's own address, where the host listener sits.
