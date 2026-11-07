@@ -2895,6 +2895,70 @@ async fn proxy_exits_when_the_daemon_closes_the_socket() {
     .expect("a bridge that ends on a closed socket is not an error");
 }
 
+/// `min task run --network` has its own help, worded for a task box: it
+/// names neither a session nor `--ingress`, which `min task run` does not
+/// take. `min session activate --network` keeps the session wording.
+#[test]
+fn task_run_help_describes_the_task_box_network() {
+    use clap::CommandFactory as _;
+
+    let mut cmd = Cli::command();
+    let run = cmd
+        .find_subcommand_mut("task")
+        .expect("`task` stays a subcommand")
+        .find_subcommand_mut("run")
+        .expect("`task run` stays a subcommand");
+    let network = run
+        .get_arguments()
+        .find(|a| a.get_id() == "network")
+        .expect("`task run` takes --network");
+    assert_eq!(
+        network.get_help().map(ToString::to_string).as_deref(),
+        Some(
+            "Network mode for the task box: `none` gives the box no network (every socket it \
+             opens to a destination outside itself fails), `host_ip` shares the host's network \
+             namespace (the default), and `own_ip` gives the box its own IP address; unless the \
+             host opts out, an `own_ip` box with no egress rules can reach no external address"
+        ),
+    );
+    assert_eq!(
+        network.get_long_help().map(ToString::to_string).as_deref(),
+        Some(concat!(
+            "Network mode for the task box: `none` gives the box no network (every socket it \
+             opens to a destination outside itself fails), `host_ip` shares the host's network \
+             namespace (the default), and `own_ip` gives the box its own IP address; unless the \
+             host opts out, an `own_ip` box with no egress rules can reach no external address.\n\n",
+            "On a host that runs boxes in a VM, `own_ip` is refused.\n\n",
+            "The hyphenated spellings `no-net`, `host-net`, and `own-ip` are still accepted, but \
+             each prints a one-line hint naming the current spelling."
+        )),
+    );
+
+    let help = run.render_long_help().to_string();
+    assert!(
+        help.contains("--network <none|host_ip|own_ip>"),
+        "--help must advertise the network modes: {help}"
+    );
+    assert!(
+        !help.contains("--ingress"),
+        "`task run` has no --ingress: {help}"
+    );
+
+    let activate = cmd
+        .find_subcommand_mut("session")
+        .expect("`session` stays a subcommand")
+        .find_subcommand_mut("activate")
+        .expect("`session activate` stays a subcommand");
+    let network = activate
+        .get_arguments()
+        .find(|a| a.get_id() == "network")
+        .expect("`session activate` takes --network");
+    assert_eq!(
+        network.get_help().map(ToString::to_string).as_deref(),
+        Some(NETWORK_HELP),
+    );
+}
+
 /// `--network` and `--ingress` are visible in `min session activate --help`
 /// (NET-035), with the `--network` value advertising the current
 /// `none|host_ip|own_ip` spellings.

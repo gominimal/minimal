@@ -973,15 +973,16 @@ pub struct TaskRunArgs {
     /// task name is a task argument, never a project path.
     #[arg(long)]
     pub path: Option<String>,
-    // The same flag as `min session activate --network`, from the same
-    // definition. With no flag, the box shares the host's network.
+    // The same values and parser as `min session activate --network`, with
+    // help worded for a task box. With no flag, the box shares the host's
+    // network.
     #[arg(
         long,
         value_name = NETWORK_VALUE_NAME,
         value_parser = parse_network_mode,
         default_value = NETWORK_DEFAULT,
-        help = NETWORK_HELP,
-        long_help = NETWORK_LONG_HELP
+        help = TASK_NETWORK_HELP,
+        long_help = TASK_NETWORK_LONG_HELP
     )]
     pub network: CliNetworkMode,
     #[command(flatten)]
@@ -1360,6 +1361,31 @@ pub(crate) const NETWORK_HELP: &str = network_help!();
 pub(crate) const NETWORK_LONG_HELP: &str = concat!(
     network_help!(),
     ".\n\n",
+    "The hyphenated spellings `no-net`, `host-net`, and `own-ip` are still accepted, but each \
+     prints a one-line hint naming the current spelling."
+);
+
+/// The first paragraph of `min task run --network`'s help, as a literal so
+/// that [`TASK_NETWORK_LONG_HELP`] can extend it. A task box has no
+/// `--ingress`, so this names neither a session nor ingress.
+macro_rules! task_network_help {
+    () => {
+        "Network mode for the task box: `none` gives the box no network (every socket it opens \
+         to a destination outside itself fails), `host_ip` shares the host's network namespace \
+         (the default), and `own_ip` gives the box its own IP address; unless the host opts \
+         out, an `own_ip` box with no egress rules can reach no external address"
+    };
+}
+
+/// The `min task run --network` short help.
+pub(crate) const TASK_NETWORK_HELP: &str = task_network_help!();
+
+/// The `min task run --network` long help: the short help, the VM-host
+/// refusal, and the legacy spellings.
+pub(crate) const TASK_NETWORK_LONG_HELP: &str = concat!(
+    task_network_help!(),
+    ".\n\n",
+    "On a host that runs boxes in a VM, `own_ip` is refused.\n\n",
     "The hyphenated spellings `no-net`, `host-net`, and `own-ip` are still accepted, but each \
      prints a one-line hint naming the current spelling."
 );
