@@ -10833,6 +10833,22 @@ async fn show_and_prune_dry_run_report_disk() {
         "No stopped or exited box matched, so prune would remove nothing.\n"
     );
 
+    // A host that failed was not checked, so with nothing matched the dry
+    // run does not claim that nothing matched. It ends with an error.
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let failed = PruneTally {
+        reaped: 0,
+        failed_hosts: vec![("remote0".to_owned(), anyhow::anyhow!("unreachable"))],
+        ..PruneTally::default()
+    };
+    let result = finish_prune_dry_run(&failed, &mut out, &mut err);
+    assert!(result.is_err(), "a failed host fails the dry run");
+    assert_eq!(String::from_utf8(out).unwrap(), "");
+    assert_eq!(
+        String::from_utf8(err).unwrap(),
+        "Could not check host remote0: unreachable\n"
+    );
+
     // A box whose disk is unknown is counted outside the sum.
     let mut out = Vec::new();
     let partial = PruneTally {

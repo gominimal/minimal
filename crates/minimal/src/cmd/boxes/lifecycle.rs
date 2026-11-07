@@ -1308,8 +1308,8 @@ pub(crate) fn finish_prune(
 
 /// Ends `min box prune --dry-run` from its `tally`: one line on `err` for
 /// each host it could not ask, the sum of the disk the matched boxes hold,
-/// and how many of them the sum leaves out. With nothing matched, it says
-/// so. A host that failed ends it with an error.
+/// and how many of them the sum leaves out. With nothing matched and no
+/// host failed, it says so. A host that failed ends it with an error.
 pub(crate) fn finish_prune_dry_run(
     tally: &PruneTally,
     out: &mut impl std::io::Write,
@@ -1319,10 +1319,14 @@ pub(crate) fn finish_prune_dry_run(
         writeln!(err, "Could not check host {host}: {e:#}")?;
     }
     if tally.reaped == 0 {
-        writeln!(
-            out,
-            "No stopped or exited box matched, so prune would remove nothing."
-        )?;
+        // A host that failed was not checked and can hold boxes that
+        // match, so the no-match line prints only when every host answered.
+        if tally.failed_hosts.is_empty() {
+            writeln!(
+                out,
+                "No stopped or exited box matched, so prune would remove nothing."
+            )?;
+        }
     } else {
         writeln!(out, "Total: {}", format_disk(tally.disk_bytes))?;
         match tally.unmeasured {
