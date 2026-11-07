@@ -393,7 +393,8 @@ impl UnansweredInherit {
 /// character is plain, single-quoted otherwise.
 fn shell_word(s: &str) -> String {
     let plain = !s.is_empty()
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || "/._-+,:@%=".contains(c));
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+,:@%=".contains(c));
     if plain {
         s.to_string()
     } else {
@@ -486,7 +487,7 @@ pub(super) async fn task_producer(
             io::Error::other(unanswered.refusal(
                 record.name.as_deref(),
                 &record.id.to_string(),
-                &record.project_path.to_string(),
+                record.project_path.as_ref(),
             ))
         })?;
         let switch = session.net_switch().await?;
