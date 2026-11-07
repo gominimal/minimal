@@ -129,6 +129,8 @@ fn pick_session_entry(
     }
     // An entry whose type is not built in has a session root that only
     // mfile can resolve, so the client cannot tell whether it is a session.
+    // gominimal/minimal#3140 tracks resolving a project Box Type's session
+    // root here. The refusal stays until then.
     if let Some(entry) = entries.iter().find(|entry| {
         entry
             .box_type
