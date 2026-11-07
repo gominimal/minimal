@@ -539,6 +539,20 @@ fn normalized(name: &str) -> String {
     lowered.strip_suffix('.').unwrap_or(&lowered).to_string()
 }
 
+/// Whether the `allow_dns_hosts` of a box that admits something lets it look
+/// up `host` (NET-141): the answer [`DnsGate::refuses`] gives the box's own
+/// query. A box that declared no names, or the empty list, is refused nothing.
+pub(crate) fn admits_name(policy: Option<&boxes::EgressPolicy>, host: &str) -> bool {
+    let Some(names) = policy
+        .and_then(|policy| policy.allow_dns_hosts.as_ref())
+        .filter(|names| !names.is_empty())
+    else {
+        return true;
+    };
+    let host = normalized(host);
+    names.iter().any(|name| normalized(name) == host) || super::dns::is_zone_name(&host)
+}
+
 /// The SOA record an NXDOMAIN for a name off the box's allow list cites
 /// (NET-141, NET-079): [`boxes::core::zone_answer::out_of_zone_soa`] on the
 /// wire. Its owner is the root, so it covers the asked name, and its 15 s
@@ -4240,6 +4254,23 @@ pub(crate) mod tests {
     /// Every refused name is logged, however many names a box asks for
     /// up to the bound: names that a hash of 256 buckets put together no
     /// longer share one line a minute (NET-141).
+    #[test]
+    fn admits_name_answers_as_the_gate_does() {
+        let policy = |hosts: Option<&[&str]>| boxes::EgressPolicy {
+            allow_subnets: Some(Vec::new()),
+            allow_dns_hosts: hosts.map(|hosts| hosts.iter().map(ToString::to_string).collect()),
+            allow_protocols: None,
+            deny_subnets: None,
+        };
+        let listed = policy(Some(&["storage.googleapis.com."]));
+        assert!(admits_name(Some(&listed), "Storage.GoogleApis.com"));
+        assert!(!admits_name(Some(&listed), "example.com"));
+        assert!(admits_name(Some(&listed), "web.min.internal"));
+        assert!(admits_name(None, "example.com"));
+        assert!(admits_name(Some(&policy(None)), "example.com"));
+        assert!(admits_name(Some(&policy(Some(&[]))), "example.com"));
+    }
+
     #[test]
     fn refused_names_sharing_a_bucket_each_logged() {
         let capture = captured_log();
