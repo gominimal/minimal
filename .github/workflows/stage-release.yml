@@ -66,7 +66,7 @@ jobs:
                   ref: ${{ steps.line.outputs.sha }}
                   path: line
                   persist-credentials: false
-                  # Full history and tags, for the used versions and --check.
+                  # Full history and tags, for the used versions.
                   fetch-depth: 0
                   fetch-tags: true
             - name: Verify required checks are green on the tip
@@ -115,13 +115,32 @@ jobs:
                   args=(--check --line "$LINE" --version "$version" --used "$RUNNER_TEMP/used")
                   [ "$RESTAGE" != "true" ] || args+=(--restage --smoked "$RUNNER_TEMP/smoked")
                   scripts/stage-version.sh "${args[@]}"
-                  # The line's own copy, as release.yml's assert-version runs it.
-                  (cd line && scripts/next-version.sh --check)
                   echo "version=$version" >> "$GITHUB_OUTPUT"
                   echo "Staging \`$version\` from \`$LINE\`" >> "$GITHUB_STEP_SUMMARY"
 
-    dry-run:
+    check-line:
+        # The line's own next-version.sh, as release.yml's assert-version runs
+        # it. A job of its own, without id-token, so the line's code never runs
+        # where it could get Google Cloud credentials.
         needs: preflight
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        permissions:
+            contents: read
+        steps:
+            - name: Check out the line
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  ref: ${{ needs.preflight.outputs.sha }}
+                  persist-credentials: false
+                  # Full history and tags, for --check.
+                  fetch-depth: 0
+                  fetch-tags: true
+            - name: Check the version against the commits
+              run: scripts/next-version.sh --check
+
+    dry-run:
+        needs: [preflight, check-line]
         runs-on: ubuntu-latest
         # Far above a normal run, for a wait on the one signing runner. Hitting
         # it stops the watching, not release.yml.
