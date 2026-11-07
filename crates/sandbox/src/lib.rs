@@ -2417,28 +2417,30 @@ impl<C: Channel> Sandbox<C> {
         // weight's scope would move the first of them out of the daemon's
         // tree before the closure joins the leaf, which the kernel then
         // refuses (gominimal/inbox#1219). See `Config::hakoniwa_cpu_weight`.
-        if let Some(leaf) = &self.config.classifier_leaf
-            && let Some(weight) = self.config.cpu_weight
-        {
-            tracing::debug!(
-                leaf = %leaf.dir().display(),
-                cpu_weight = weight,
-                "sandbox launch: the build's CPU weight is not applied: it runs in the box's \
-                 classifier leaf, which a cgroup scope of its own would take it out of"
-            );
-        }
-        if let Some(s) = self.config.hakoniwa_cpu_weight()
+        // Without systemd no weight is ever applied, so there is nothing to
+        // drop and nothing to log.
+        if let Some(weight) = self.config.cpu_weight
             && booted_with_systemd()
         {
-            container.cgroups_resources({
-                let mut resources = hakoniwa::cgroups::Resources::default();
-                resources.cpu({
-                    let mut cpu = hakoniwa::cgroups::Cpu::default();
-                    cpu.shares(s);
-                    cpu
-                });
-                resources
-            });
+            match self.config.hakoniwa_cpu_weight() {
+                Some(s) => {
+                    container.cgroups_resources({
+                        let mut resources = hakoniwa::cgroups::Resources::default();
+                        resources.cpu({
+                            let mut cpu = hakoniwa::cgroups::Cpu::default();
+                            cpu.shares(s);
+                            cpu
+                        });
+                        resources
+                    });
+                }
+                None => tracing::debug!(
+                    leaf = ?self.config.classifier_leaf.as_ref().map(|l| l.dir()),
+                    cpu_weight = weight,
+                    "sandbox launch: the build's CPU weight is not applied: it runs in the box's \
+                     classifier leaf, which a cgroup scope of its own would take it out of"
+                ),
+            }
         }
 
         Ok(Container {
