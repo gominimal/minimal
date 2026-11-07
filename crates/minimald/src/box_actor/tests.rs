@@ -7757,6 +7757,11 @@ async fn a_present_landing_moves_a_running_interim_boxs_runtime_publications_to_
         .expect("the daemon walks the range through the forwarder");
     assert_eq!(answer.moved, 1, "the landing moves the box off the interim");
 
+    // Every row is this test's: the mock box's leader is a host child, so its
+    // table is the host's, but under test the watcher keeps it to the
+    // listeners this test process holds (`box_listening_ports`) — a listener
+    // another process opens inside the range is never the box's, so it is
+    // never published at the interim for the move to leave behind.
     let rows = listed_once(&handle, |rows| {
         rows.exposed
             .iter()

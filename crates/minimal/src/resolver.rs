@@ -4651,6 +4651,23 @@ pub(crate) struct HostAnswererRead {
 /// claims nothing, and the CLI keeps that mapping for the daemons that
 /// still send it.
 pub(crate) async fn host_answerer_read(reply: AnswererStatusReply) -> HostAnswererRead {
+    host_answerer_read_probing(reply, answerer_bound_at).await
+}
+
+/// [`host_answerer_read`] with the liveness query passed in: `probe` is
+/// called at most once, with the port of an arm that earns the query, and
+/// its answer is [`HostAnswererRead::answerer_bound`]. The verbs pass
+/// [`answerer_bound_at`]; a unit test passes its own answer, so a zone
+/// answerer some other daemon on the machine holds at the reply's port
+/// cannot decide the test's read.
+async fn host_answerer_read_probing<P, F>(
+    reply: AnswererStatusReply,
+    probe: P,
+) -> HostAnswererRead
+where
+    P: FnOnce(u16) -> F,
+    F: std::future::Future<Output = bool>,
+{
     let proxy_down = reply
         .proxy_down
         .as_ref()
@@ -4676,7 +4693,7 @@ pub(crate) async fn host_answerer_read(reply: AnswererStatusReply) -> HostAnswer
         | ZoneAnswererStatus::Registered { port }
         | ZoneAnswererStatus::ManagerHeld { port } => HostAnswererRead {
             port: Some(port),
-            answerer_bound: answerer_bound_at(port).await,
+            answerer_bound: probe(port).await,
             held_no_channel: false,
             proxy_down,
         },
@@ -7679,8 +7696,21 @@ exit 0
             }),
         };
         // The session start's read: the answerer's port and its liveness
-        // query still run, and the cause rides whole beside them.
-        let read = host_answerer_read(reply.clone()).await;
+        // query still run, and the cause rides whole beside them. The
+        // query is this test's own stand-in, never a datagram to
+        // 127.0.0.1:7656: any daemon's zone answerer on the machine running
+        // the test holds that port, and would answer a real query.
+        let probed = std::cell::Cell::new(None);
+        let read = host_answerer_read_probing(reply.clone(), |port| {
+            probed.set(Some(port));
+            std::future::ready(false)
+        })
+        .await;
+        assert_eq!(
+            probed.get(),
+            Some(7_656),
+            "the liveness proof still ran at the holder's port"
+        );
         assert_eq!(
             read.port,
             Some(7_656),
@@ -7688,7 +7718,7 @@ exit 0
         );
         assert!(
             !read.answerer_bound,
-            "the liveness proof still ran at the holder's port"
+            "a query nobody answered proves no answerer"
         );
         assert!(
             !read.held_no_channel,
@@ -7698,6 +7728,17 @@ exit 0
             read.proxy_down,
             Some((19_911, ProxyDownCause::RedrawsRanOut)),
             "the sibling cause rides the same read whole"
+        );
+        // A query the holder answers is the proof, cause or no cause.
+        let live = host_answerer_read_probing(reply.clone(), |_| std::future::ready(true)).await;
+        assert!(
+            live.answerer_bound && live.port == Some(7_656),
+            "an answered query reads as a bound answerer beside the down proxy: {live:?}"
+        );
+        assert_eq!(
+            live.proxy_down,
+            Some((19_911, ProxyDownCause::RedrawsRanOut)),
+            "and the cause still rides beside it"
         );
         // The answerer row prints from the answerer field, not from the
         // cause — the DNS SERVICE line names the holder.
