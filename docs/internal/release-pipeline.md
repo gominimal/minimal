@@ -595,6 +595,47 @@ not keep an old result. For a nightly or plain build, `set-channel.sh` then
 moves `unstable` to the version, with no approval. A versioned build does not
 move `unstable`.
 
+### cut-minor.yml: start a minor release
+
+Only a minor release gets a new branch. Patches come from the line.
+[`.github/workflows/cut-minor.yml`](../../.github/workflows/cut-minor.yml) starts
+a minor. It runs only on dispatch, and it replaces step 2 above:
+
+```sh
+gh workflow run cut-minor.yml -f commit=<commit>
+```
+
+Leave out `commit` to cut from the tip of `main`. Use `-f dry_run=true` to make
+every check and create nothing.
+
+The workflow refuses a commit that is not on `main`, or that does not have the
+five required checks green. It also refuses one whose `package.version` is not
+`X.Y.0` or `X.Y.0-rcN`, and one that fails `next-version.sh --check`. Then it does
+these things as the `gominimal-aw-bot` App:
+
+1. It creates `release/X.Y.x` at the commit.
+2. It creates the `backport release/X.Y.x` label.
+3. It opens a PR that moves `main` to the next minor. Merge this PR before the
+   promotion creates `vX.Y.0`, or the version check fails on `main`.
+
+Run it again after a failure. It carries on if the line already exists at the same
+commit, and it refuses a line at any other commit.
+
+**Admin steps for each new line.** The workflow cannot do these, and a dry run of
+`release.yml` does not test the second one, because it skips the uploads.
+
+1. An organization owner adds
+   `gominimal/minimal/.github/workflows/release.yml@refs/heads/release/X.Y.x` to
+   the `signing` runner group. See [step 2](#2-give-the-commit-a-branch).
+2. A Google Cloud admin gives the identity
+   `repo:gominimal/minimal:ref:refs/heads/release/X.Y.x` write access to
+   `gs://minimal-shim`. Without it, the `release` job fails at the archive upload.
+   Check that the identity can also write to `gs://minimal-one`.
+
+The workflow itself needs one admin step, once: add `gominimal-aw-bot` as a bypass
+actor on the `release branches` repository rules. Those rules stop anyone else
+from creating a branch under `release/`.
+
 ### nightly.yml: the daily build
 
 [`.github/workflows/nightly.yml`](../../.github/workflows/nightly.yml) starts

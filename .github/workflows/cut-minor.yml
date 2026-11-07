@@ -1,0 +1,162 @@
+name: cut-minor
+
+# Start a minor release: create release/X.Y.x from a green main commit, create
+# its backport label, and open the PR that moves main to the next minor. Main
+# has to move before vX.Y.0 exists, or its version check fails. Patches never
+# come here: they are staged from the line.
+#
+# Needs a bypass actor on the `release branches` ruleset, because that ruleset
+# stops anyone else creating a branch under release/. The signing runner group
+# and the bucket grants are per branch too. See
+# docs/internal/release-pipeline.md.
+on:
+    workflow_dispatch:
+        inputs:
+            commit:
+                description: "main commit to cut from. Leave empty for the tip of main"
+                required: false
+                type: string
+            dry_run:
+                description: "Make every check, and create nothing"
+                type: boolean
+                default: false
+
+concurrency:
+    group: cut-minor
+    cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+    cut:
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        permissions:
+            contents: read
+            checks: read
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+                  # Full history and tags: the commit must be on main, and
+                  # --check reads the tags.
+                  fetch-depth: 0
+                  fetch-tags: true
+            - name: Resolve the commit and the line
+              id: plan
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  INPUT_COMMIT: ${{ inputs.commit }}
+              run: |
+                  set -euo pipefail
+                  sha="$(git rev-parse --verify "${INPUT_COMMIT:-origin/main}^{commit}")"
+                  git merge-base --is-ancestor "$sha" origin/main \
+                    || { echo "::error::$sha is not on main"; exit 1; }
+                  git show "$sha:Cargo.toml" > "$RUNNER_TEMP/Cargo.toml"
+                  version="$(sed -n 's/^package\.version[[:space:]]*=[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' "$RUNNER_TEMP/Cargo.toml" | head -n 1)"
+                  if [[ ! "$version" =~ ^([0-9]+)\.([0-9]+)\.0(-.*)?$ ]]; then
+                    echo "::error::package.version at $sha is '$version', which is not the start of a minor"
+                    exit 1
+                  fi
+                  line="release/${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.x"
+                  next="${BASH_REMATCH[1]}.$((BASH_REMATCH[2] + 1)).0"
+                  scripts/next-version.sh --rev "$sha" --cargo-toml "$RUNNER_TEMP/Cargo.toml" --check
+                  # A rerun after a later step failed finds the line on the same
+                  # commit and carries on. Any other commit means a stale line.
+                  existing=""
+                  if found="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$line" --jq .object.sha 2>/dev/null)"; then
+                    existing="$found"
+                  fi
+                  if [ -n "$existing" ] && [ "$existing" != "$sha" ]; then
+                    echo "::error::$line already exists at $existing"
+                    exit 1
+                  fi
+                  echo "cutting $line from $sha; main moves to $next"
+                  {
+                    echo "sha=$sha"
+                    echo "line=$line"
+                    echo "next=$next"
+                    echo "exists=${existing:+true}"
+                  } >> "$GITHUB_OUTPUT"
+            - name: Verify required checks are green on the commit
+              # Same list as release.yml's verify-ci.
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  SHA: ${{ steps.plan.outputs.sha }}
+              run: |
+                  set -euo pipefail
+                  required="ci-success ci-linux-native-success ci-linux-kvm-success ci-macos-success ci-shell-installer-success"
+                  runs="$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs" --paginate \
+                    --jq '.check_runs[] | "\(.name)\t\(.conclusion)"')"
+                  fail=0
+                  for name in $required; do
+                    c="$(printf '%s\n' "$runs" | awk -F'\t' -v n="$name" '$1==n {print $2}' | tail -1)"
+                    if [ "$c" != "success" ]; then
+                      echo "::error::required check '$name' is '${c:-missing}' on $SHA (need success)"
+                      fail=1
+                    fi
+                  done
+                  exit "$fail"
+            - name: Mint token (gominimal-aw-bot)
+              id: token
+              if: ${{ !inputs.dry_run }}
+              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+              with:
+                  app-id: ${{ vars.AW_BOT_APP_ID }}
+                  private-key: ${{ secrets.AW_BOT_PRIVATE_KEY }}
+                  owner: gominimal
+                  repositories: ${{ github.event.repository.name }}
+                  permission-contents: write
+                  permission-issues: write
+                  permission-pull-requests: write
+            - name: Create the line and its backport label
+              if: ${{ !inputs.dry_run }}
+              env:
+                  GH_TOKEN: ${{ steps.token.outputs.token }}
+                  SHA: ${{ steps.plan.outputs.sha }}
+                  LINE: ${{ steps.plan.outputs.line }}
+                  EXISTS: ${{ steps.plan.outputs.exists }}
+              run: |
+                  set -euo pipefail
+                  if [ -z "$EXISTS" ]; then
+                    gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
+                      -f ref="refs/heads/$LINE" -f sha="$SHA" --silent
+                  fi
+                  gh label create "backport $LINE" --repo "$GITHUB_REPOSITORY" --force \
+                    --color 0e8a16 --description "Backport this PR to $LINE"
+            - name: Open the main bump PR
+              if: ${{ !inputs.dry_run }}
+              env:
+                  GH_TOKEN: ${{ steps.token.outputs.token }}
+                  APP_SLUG: ${{ steps.token.outputs.app-slug }}
+                  LINE: ${{ steps.plan.outputs.line }}
+                  NEXT: ${{ steps.plan.outputs.next }}
+              run: |
+                  set -euo pipefail
+                  branch="chore/bump-main-$NEXT"
+                  remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+                  if git ls-remote --exit-code "$remote" "refs/heads/$branch" >/dev/null; then
+                    echo "::notice::$branch already exists; leaving it as it is"
+                    exit 0
+                  fi
+                  git switch -c "$branch" origin/main
+                  scripts/set-package-version.sh "$NEXT"
+                  bot="${APP_SLUG}[bot]"
+                  bot_id="$(gh api "users/$bot" --jq .id)"
+                  title="chore(release): bump main to $NEXT"
+                  git -c user.name="$bot" -c user.email="$bot_id+$bot@users.noreply.github.com" commit -am "$title"
+                  git push "$remote" "HEAD:refs/heads/$branch"
+                  gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$branch" --title "$title" \
+                    --body "$LINE now carries the current minor, so main moves to $NEXT. Merge this before that minor is promoted, or the version check fails on main. Opened by cut-minor.yml."
+            - name: Summarize
+              env:
+                  SHA: ${{ steps.plan.outputs.sha }}
+                  LINE: ${{ steps.plan.outputs.line }}
+                  NEXT: ${{ steps.plan.outputs.next }}
+                  DRY_RUN: ${{ inputs.dry_run }}
+              run: |
+                  if [ "$DRY_RUN" = "true" ]; then
+                    echo "Dry run: would cut \`$LINE\` from \`$SHA\` and move main to \`$NEXT\`." >> "$GITHUB_STEP_SUMMARY"
+                  else
+                    echo "Cut \`$LINE\` from \`$SHA\`. Main moves to \`$NEXT\` once its PR merges." >> "$GITHUB_STEP_SUMMARY"
+                  fi
