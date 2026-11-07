@@ -279,8 +279,6 @@ pub async fn upload(
     })
 }
 
-/// Deletes a bundle before it expires, with the token its upload printed.
-///
 /// Asks the portal to make a record, and reads back what it said.
 async fn create(
     client: &reqwest::Client,
@@ -311,6 +309,8 @@ async fn create(
     })
 }
 
+/// Deletes a bundle before it expires, with the token its upload printed.
+///
 /// The portal deletes the bundle and anything derived from it. Its three
 /// answers are told apart here because they mean different things to the
 /// person who asked: gone, not there (any more), or not theirs to delete.
