@@ -18,6 +18,19 @@ proof of concept, and your assessment of the impact. If you'd like to
 encrypt your report, say so in your first email and we'll coordinate a
 key exchange.
 
+If your report comes with a diagnostics bundle, you can also send it with:
+
+```shell
+min bug --upload --security --context "what you found"
+```
+
+For a bundle you already collected, use `min diag upload <path> --security`.
+Only portal owners can read the report, and it is never filed to public
+GitHub. The page the command prints only confirms receipt, and we cannot
+reply through it. To hear back, email **security@minimal.dev** with the id
+the command prints. If the upload fails, email us instead, and do not
+attach the bundle to a public issue.
+
 ## No bug bounty
 
 Minimal does not operate a paid bug bounty program. We genuinely
