@@ -478,12 +478,11 @@ impl From<SpecDoc> for BoxSpec {
 enum KeyShape {
     Str,
     Bool,
+    Int,
     StrOrInt,
     StrOrBool,
     StrList,
     StrOrStrList,
-    List,
-    TableOrList,
     /// A table whose keys are the ones listed.
     Keys(&'static [SectionKey]),
     /// Any value. Another check owns the value's shape, so this schema
@@ -502,12 +501,11 @@ impl KeyShape {
         match self {
             KeyShape::Str => "a string",
             KeyShape::Bool => "true or false",
+            KeyShape::Int => "a whole number",
             KeyShape::StrOrInt => "a string or a whole number",
             KeyShape::StrOrBool => "a string or true or false",
             KeyShape::StrList => "a list of strings",
             KeyShape::StrOrStrList => "a string or a list of strings",
-            KeyShape::List => "a list",
-            KeyShape::TableOrList => "a table or a list",
             KeyShape::Keys(_) => "a table",
             KeyShape::Owned(_) => "any value",
         }
@@ -521,10 +519,9 @@ impl KeyShape {
         let fits = match (self, value) {
             (KeyShape::Str | KeyShape::StrOrInt | KeyShape::StrOrBool, V::String(_))
             | (KeyShape::Bool | KeyShape::StrOrBool, V::Boolean(_))
-            | (KeyShape::StrOrInt, V::Integer(_))
+            | (KeyShape::Int | KeyShape::StrOrInt, V::Integer(_))
             | (KeyShape::StrOrStrList, V::String(_))
-            | (KeyShape::Keys(_) | KeyShape::TableOrList, V::Table(_))
-            | (KeyShape::List | KeyShape::TableOrList, V::Array(_))
+            | (KeyShape::Keys(_), V::Table(_))
             | (KeyShape::Owned(_), _) => true,
             (KeyShape::StrList | KeyShape::StrOrStrList, V::Array(items)) => {
                 if !items.iter().all(V::is_str) {
@@ -551,21 +548,22 @@ const fn value_words(value: &toml::Value) -> &'static str {
     }
 }
 
-/// `[box]`: the box's type, name and lifetime.
+/// `[box]`: the box's type, name, lifetime, loadout mode and volumes.
 const BOX_KEYS: &[SectionKey] = &[
-    ("description", KeyShape::Str),
     ("lifetime", KeyShape::Str),
+    ("loadout_mode", KeyShape::Str),
     ("name", KeyShape::Str),
     ("type", KeyShape::Str),
+    ("volumes", KeyShape::StrList),
 ];
 
 /// `[io]`: the terminal, the standard streams and `exec` into the box.
 const IO_KEYS: &[SectionKey] = &[
     ("exec_enabled", KeyShape::Bool),
     ("pty_enabled", KeyShape::Bool),
-    ("stderr", KeyShape::Str),
-    ("stdin", KeyShape::Str),
-    ("stdout", KeyShape::Str),
+    ("stderr_mimetype", KeyShape::Str),
+    ("stdin_mimetype", KeyShape::Str),
+    ("stdout_mimetype", KeyShape::Str),
 ];
 
 /// `[execution]`: what the box runs and how its run ends. `on_oom` is as
@@ -573,8 +571,6 @@ const IO_KEYS: &[SectionKey] = &[
 const EXECUTION_KEYS: &[SectionKey] = &[
     ("exec", KeyShape::StrOrStrList),
     ("hooks_on_resume", KeyShape::Bool),
-    ("inherit_cwd", KeyShape::Bool),
-    ("lifecycle_hooks", KeyShape::List),
     ("on_oom", KeyShape::Str),
     ("restart", KeyShape::Str),
     ("timeout", KeyShape::StrOrInt),
@@ -582,10 +578,8 @@ const EXECUTION_KEYS: &[SectionKey] = &[
 
 /// `[install]`: what the box gets installed.
 const INSTALL_KEYS: &[SectionKey] = &[
-    ("loadout_mode", KeyShape::Str),
-    ("loadouts", KeyShape::StrList),
     ("packages", KeyShape::StrList),
-    ("patches", KeyShape::TableOrList),
+    ("raw_packages", KeyShape::StrList),
 ];
 
 /// `[network.egress]`: the nested egress keys that the networking and
@@ -597,6 +591,14 @@ const EGRESS_KEYS: &[SectionKey] = &[
     ("deny_subnets", KeyShape::StrList),
 ];
 
+/// `[network.bep]`: the egress proxy's settings, the fields of
+/// [`boxes::core::bep::BepSettings`].
+const BEP_KEYS: &[SectionKey] = &[
+    ("no_proxy", KeyShape::StrList),
+    ("proxy_env", KeyShape::Bool),
+    ("steering", KeyShape::Str),
+];
+
 /// No keys inside it are named here.
 const ANY: KeyShape = KeyShape::Owned(&[]);
 
@@ -604,10 +606,10 @@ const ANY: KeyShape = KeyShape::Owned(&[]);
 /// release. [`crate::network::canonicalize`] then moves each one to its
 /// nested `egress.*` key, and it checks the shape of `mode`, `egress`,
 /// `ingress`, `bep` and the flat keys, so this schema checks only their
-/// names. The egress proxy's own settings check the keys of
-/// `[network.bep]`.
+/// names, and the names and shapes of the keys inside `egress` and `bep`.
 const NETWORK_KEYS: &[SectionKey] = &[
-    ("bep", ANY),
+    ("bep", KeyShape::Owned(BEP_KEYS)),
+    ("dynamic_ingress", KeyShape::Str),
     ("egress", KeyShape::Owned(EGRESS_KEYS)),
     ("egress_allow_dns", ANY),
     ("egress_allow_subnets", ANY),
@@ -618,18 +620,29 @@ const NETWORK_KEYS: &[SectionKey] = &[
     ("vpn_network_names", KeyShape::StrList),
 ];
 
+/// `[nesting]`: whether the box can create boxes, and which ones.
+const NESTING_KEYS: &[SectionKey] = &[
+    ("allowed", KeyShape::Bool),
+    ("dynamic_providers", KeyShape::Str),
+    ("max_depth", KeyShape::Int),
+    ("providers", KeyShape::StrList),
+    ("types", KeyShape::StrList),
+];
+
 /// The Box Spec sections whose keys this schema names, by top-level key.
 ///
 /// The other sections are tables whose keys belong to the part of the
 /// product that reads them. `[machine]` and `on_oom` belong to the
 /// resources spec (BRES). `[params]`, `[vars]`, `[env_vars]` and `[args]`
-/// carry the project's own names. `[secrets]`, `[nesting]` and `[otel]`
-/// are read by their own components.
+/// carry the project's own names. `[secrets]` and `[otel]` are read by
+/// their own components. No component reads `[nesting]` yet, so this
+/// schema is the only check of its keys.
 const SECTIONS: &[SectionKey] = &[
     ("box", KeyShape::Keys(BOX_KEYS)),
     ("execution", KeyShape::Keys(EXECUTION_KEYS)),
     ("install", KeyShape::Keys(INSTALL_KEYS)),
     ("io", KeyShape::Keys(IO_KEYS)),
+    ("nesting", KeyShape::Keys(NESTING_KEYS)),
     ("network", KeyShape::Keys(NETWORK_KEYS)),
 ];
 
@@ -1092,11 +1105,15 @@ mod tests {
             type = "session"
             name = "dev"
             lifetime = "until_stopped"
+            loadout_mode = "merge"
+            volumes = ["cache"]
 
             [sessions.dev.io]
             pty_enabled = true
             exec_enabled = false
-            stdin = "null"
+            stdin_mimetype = "text/plain"
+            stdout_mimetype = "text/plain"
+            stderr_mimetype = "text/plain"
 
             [sessions.dev.execution]
             exec = ["bash", "-l"]
@@ -1106,6 +1123,7 @@ mod tests {
 
             [sessions.dev.install]
             packages = ["git"]
+            raw_packages = ["ripgrep"]
 
             [sessions.dev.machine]
             cpus = 2
@@ -1116,6 +1134,7 @@ mod tests {
             quic443 = "auto"
             vpn_network_names = ["corp"]
             ingress = [{ proto = "tcp", port = 8080 }]
+            dynamic_ingress = "allow"
 
             [sessions.dev.network.egress]
             allow_dns_hosts = ["example.com"]
@@ -1125,9 +1144,15 @@ mod tests {
 
             [sessions.dev.network.bep]
             steering = "dns"
+            proxy_env = true
+            no_proxy = ["localhost"]
 
             [sessions.dev.nesting]
             allowed = true
+            max_depth = 2
+            providers = ["local"]
+            types = ["task"]
+            dynamic_providers = "deny"
 
             [sessions.dev.secrets.gh]
             source = "store"
@@ -1219,9 +1244,34 @@ mod tests {
                  strings. Fix the value.",
             ),
             (
-                "[sessions.dev.io]\nstdin = 0\n",
-                "`[sessions.dev]` in minimal.toml sets `io.stdin` to a whole number, \
-                 but `io.stdin` takes a string. Fix the value.",
+                "[sessions.dev.io]\nstdin_mimetype = 0\n",
+                "`[sessions.dev]` in minimal.toml sets `io.stdin_mimetype` to a whole \
+                 number, but `io.stdin_mimetype` takes a string. Fix the value.",
+            ),
+            (
+                "[sessions.dev.io]\nstdin = \"null\"\n",
+                "`[sessions.dev]` in minimal.toml sets `io.stdin`, \
+                 which is not a box setting. Remove the key or correct its name.",
+            ),
+            (
+                "[sessions.dev.nesting]\nalowed = true\n",
+                "`[sessions.dev]` in minimal.toml sets `nesting.alowed`, \
+                 which is not a box setting. Remove the key or correct its name.",
+            ),
+            (
+                "[sessions.dev.nesting]\nmax_depth = \"2\"\n",
+                "`[sessions.dev]` in minimal.toml sets `nesting.max_depth` to a \
+                 string, but `nesting.max_depth` takes a whole number. Fix the value.",
+            ),
+            (
+                "[sessions.dev.network.bep]\nstering = \"dns\"\n",
+                "`[sessions.dev]` in minimal.toml sets `network.bep.stering`, \
+                 which is not a box setting. Remove the key or correct its name.",
+            ),
+            (
+                "[sessions.dev.box]\ndescription = \"dev box\"\n",
+                "`[sessions.dev]` in minimal.toml sets `box.description`, \
+                 which is not a box setting. Remove the key or correct its name.",
             ),
             (
                 "[sessions.dev.network]\nmode = \"own_ip\"\nvpn = [\"corp\"]\n",

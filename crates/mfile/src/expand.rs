@@ -1176,7 +1176,7 @@ mod tests {
         // Every key a built-in type's defaults set, and the Box Spec
         // sections an entry can set, are box settings.
         let ok = expand_in(
-            "[sessions.dev]\nio = { stdin = \"null\" }\n\
+            "[sessions.dev]\nio = { stdin_mimetype = \"text/plain\" }\n\
              [[sessions.dev.file_imports]]\nsrc = \"a\"\ndst = \"/a\"\n\
              [[sessions.dev.vars_lenient]]\nname = \"my.var\"\nvalue = \"1\"\n",
             "dev",
