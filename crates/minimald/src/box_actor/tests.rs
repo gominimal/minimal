@@ -14362,7 +14362,9 @@ fn box_package_build_under_box_egress_verdict() {
             "the build of fetcher could not reach downloads.example.org: \
              the egress rules of box sealed do not allow it. \
              To allow it, activate a new session with \
-             --network own_ip --allow-dns-hosts downloads.example.org"
+             --network own_ip --allow-dns-hosts downloads.example.org. \
+             Or add downloads.example.org to network.egress.allow_dns_hosts under [defaults] in minimal.toml, \
+             then activate a new session with --network own_ip"
         )
     );
     assert_eq!(run("open", Some(open)), None);
@@ -14514,7 +14516,9 @@ async fn box_build_web_source_under_box_verdict() {
     let expected = "the build of fetcher could not reach downloads.example.org: \
                     the egress rules of box sealed do not allow it. \
                     To allow it, activate a new session with \
-                    --network own_ip --allow-dns-hosts downloads.example.org";
+                    --network own_ip --allow-dns-hosts downloads.example.org. \
+                    Or add downloads.example.org to network.egress.allow_dns_hosts under [defaults] in minimal.toml, \
+                    then activate a new session with --network own_ip";
 
     // The deny-all box: its build fails, naming the host and the box.
     let (mut spec_build, lines) = build(sealed.clone());
@@ -14660,7 +14664,9 @@ fn box_package_build_refusal_names_destination_and_box_for_materialize() {
             "the build of fetcher could not reach downloads.example.org: \
              the egress rules of box sealed do not allow it. \
              To allow it, activate a new session with \
-             --network own_ip --allow-dns-hosts downloads.example.org\n{failed}"
+             --network own_ip --allow-dns-hosts downloads.example.org. \
+             Or add downloads.example.org to network.egress.allow_dns_hosts under [defaults] in minimal.toml, \
+             then activate a new session with --network own_ip\n{failed}"
         )
     );
 }
@@ -14734,7 +14740,9 @@ fn box_package_build_refusal_names_destination_and_box() {
             "93.184.215.14" => String::new(),
             host => format!(
                 ". To allow it, activate a new session with \
-                --network own_ip --allow-dns-hosts {host}"
+                --network own_ip --allow-dns-hosts {host}. \
+                Or add {host} to network.egress.allow_dns_hosts under [defaults] in minimal.toml, \
+                then activate a new session with --network own_ip"
             ),
         };
         assert_eq!(
@@ -14847,7 +14855,9 @@ fn box_package_build_refusal_names_destination_and_box_only_for_the_error() {
             "the build of hello could not reach example.com:443: \
              the egress rules of box my-box do not allow it. \
              To allow it, activate a new session with \
-             --network own_ip --allow-dns-hosts example.com"
+             --network own_ip --allow-dns-hosts example.com. \
+             Or add example.com to network.egress.allow_dns_hosts under [defaults] in minimal.toml, \
+             then activate a new session with --network own_ip"
                 .to_string()
         )
     );
@@ -15103,7 +15113,9 @@ async fn box_package_build_under_box_egress_verdict_runs_own_address_box_on_its_
             "the build of fetcher could not reach downloads.example.org: \
              the egress rules of box sealed do not allow it. \
              To allow it, activate a new session with \
-             --network own_ip --allow-dns-hosts downloads.example.org"
+             --network own_ip --allow-dns-hosts downloads.example.org. \
+             Or add downloads.example.org to network.egress.allow_dns_hosts under [defaults] in minimal.toml, \
+             then activate a new session with --network own_ip"
         )
     );
     assert_eq!(run(open_network), None);

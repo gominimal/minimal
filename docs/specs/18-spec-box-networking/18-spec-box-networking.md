@@ -728,7 +728,7 @@ box that holds it returns to `running`. These terms follow the decision in
     tier:   T0
     verify: cargo nextest run -p minimald --run-ignored all a_placed_fetch_leaves_from_the_held_namespace
     verify: cargo nextest run -p common a_process_in_the_daemons_namespace_is_no_placement
-  - IF the egress rules of a box do not allow the host of a source its package build fetches, THEN THE SYSTEM SHALL fail the build before anything leaves for that host, its name query included, and name the host and the `--allow-dns-hosts` entry that allows it.
+  - IF the egress rules of a box do not allow the host of a source its package build fetches, THEN THE SYSTEM SHALL fail the build before anything leaves for that host, its name query included, and name the host, the `--allow-dns-hosts` entry that allows it, and the `minimal.toml` setting that does the same.
     tier:   T0
     verify: cargo nextest run -p common a_name_the_rules_do_not_allow_sends_no_query
     verify: cargo nextest run -p op a_fetch_on_a_closed_network_sends_nothing
@@ -753,7 +753,7 @@ box that holds it returns to `running`. These terms follow the decision in
     verify: cargo nextest run -p common a_placed_connect_carries_unused_time_to_the_next_address
     verify: cargo nextest run -p common a_placed_connect_counts_its_lookup_against_the_bound
     verify: cargo nextest run -p minimald unreachable_source_names_the_package_and_the_host
-  - IF the egress rules of a box refuse a connection its package build opened, or a source it fetched, to a host name that `--allow-dns-hosts` can admit, THEN THE SYSTEM SHALL state in the build's error the options of a new session that allow that host.
+  - IF the egress rules of a box refuse a connection its package build opened, or a source it fetched, to a host name that `--allow-dns-hosts` can admit, THEN THE SYSTEM SHALL state in the build's error the options of a new session that allow that host, and the `minimal.toml` setting that does the same.
     tier:   T0
     verify: cargo nextest run -p minimald a_refusal_gives_a_next_step_only_where_it_works
   - IF the destination is a literal address, THEN THE SYSTEM SHALL state no such options.

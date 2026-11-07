@@ -3890,13 +3890,16 @@ fn destination_host(destination: &str) -> &str {
 /// The next step that lets a box's builds reach `host`, or `None` when `host`
 /// is no name `--allow-dns-hosts` can admit. The step names `--network
 /// own_ip` because a box on the default network refuses that flag at create
-/// (`classifier::unenforceable_rules`). It names no `minimal.toml` key
-/// because none reaches a box yet
-/// ([#2702](https://github.com/gominimal/minimal/issues/2702)).
+/// (`classifier::unenforceable_rules`). It also names the `minimal.toml` key
+/// that does what the flag does: `min` reads `network.egress` under
+/// `[defaults]` into a new session's rules (NET-060). The file sets no
+/// network mode, so that step still names `--network own_ip`.
 fn egress_remedy(host: &str) -> Option<String> {
     (boxes::is_valid_dns_host(host) && host.parse::<std::net::Ipv4Addr>().is_err()).then(|| {
         format!(
-            "To allow it, activate a new session with --network own_ip --allow-dns-hosts {host}"
+            "To allow it, activate a new session with --network own_ip --allow-dns-hosts {host}. \
+             Or add {host} to network.egress.allow_dns_hosts under [defaults] in minimal.toml, \
+             then activate a new session with --network own_ip"
         )
     })
 }
@@ -3992,7 +3995,9 @@ mod tests {
                 "the build of foo could not reach sources.example.com: \
                      the egress rules of box x do not allow it. \
                      To allow it, activate a new session with \
-                     --network own_ip --allow-dns-hosts sources.example.com"
+                     --network own_ip --allow-dns-hosts sources.example.com. \
+                     Or add sources.example.com to network.egress.allow_dns_hosts under [defaults] in minimal.toml, \
+                     then activate a new session with --network own_ip"
             )
         );
         assert_eq!(
@@ -4006,7 +4011,9 @@ mod tests {
                 "the build of foo could not reach sources.example.com: \
                      box x has no network. \
                      To allow it, activate a new session with \
-                     --network own_ip --allow-dns-hosts sources.example.com"
+                     --network own_ip --allow-dns-hosts sources.example.com. \
+                     Or add sources.example.com to network.egress.allow_dns_hosts under [defaults] in minimal.toml, \
+                     then activate a new session with --network own_ip"
             )
         );
         assert_eq!(
@@ -4040,7 +4047,9 @@ mod tests {
                 "the build of foo could not reach {destination}: \
                  the egress rules of box x do not allow it. \
                  To allow it, activate a new session with \
-                 --network own_ip --allow-dns-hosts {host}"
+                 --network own_ip --allow-dns-hosts {host}. \
+                 Or add {host} to network.egress.allow_dns_hosts under [defaults] in minimal.toml, \
+                 then activate a new session with --network own_ip"
             )
         };
         let without_step = |destination: &str| {
