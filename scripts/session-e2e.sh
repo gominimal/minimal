@@ -376,6 +376,11 @@
 #                                    at the host-side gate (NET-155, NET-085),
 #                                    and each refusal's record is read back
 #                                    from the host's logs
+#   a_build_box_fetches_its_source
+#                                    NET-155, NET-165: a deny-all box's cold
+#                                    build of a package at the pinned commit
+#                                    fetches its source and succeeds, and the
+#                                    box stays deny-all
 #   host_ip_rules_follow_the_running_box
 #                                    NET-085, VM host: root in the VM
 #                                    wearing the node's address and the box
@@ -590,6 +595,7 @@ ESU_B_SEED_DIR="" # its box B seed; removed on teardown
 ESU_LISTENER_PID="" # its host listener; killed on teardown
 ESU_LISTEN_PORT="" # the port the listener binds; this proof's own band
 EBR_SEED_DIR="" # the escapes-and-builds proof's seed; removed on teardown
+BBF_SEED_DIR="" # the build-box fetch proof's seed; removed on teardown
 EBR_LISTENER_PID="" # its host listener; killed on teardown
 EBR_LISTEN_PORT="" # the port the listener binds, beside the escape-union band
 HRF_SEED_DIR="" # the host_ip rules proof's seed; removed on teardown
@@ -1307,6 +1313,7 @@ teardown() {
   fi
   # The escapes-and-builds proof's seed and listener, for the same reasons.
   [ -n "$EBR_SEED_DIR" ] && rm -rf "$EBR_SEED_DIR"
+  [ -n "$BBF_SEED_DIR" ] && rm -rf "$BBF_SEED_DIR"
   [ -n "$HRF_SEED_DIR" ] && rm -rf "$HRF_SEED_DIR"
   if [ -n "$EBR_LISTENER_PID" ]; then
     kill "$EBR_LISTENER_PID" 2>/dev/null || true
@@ -23207,6 +23214,51 @@ source=203.0.113.7 destination=$esu_host:$ESU_LISTEN_PORT verdict=refused at the
   echo "::endgroup::"
 }
 
+# NET-155, NET-165: every other proof of a build box stops at a refusal or at a
+# cache hit, so this one forces a cold build. The package comes from the pinned
+# upstream, its source is `gs://`, and the box allows nothing: only the table
+# `min` made at the box's creation can give the fetch its reach.
+proof_a_build_box_fetches_its_source() {
+  local bbf_pkg="jq" bbf_sid="" bbf_out="" bbf_rc="" bbf_policy=""
+  echo "::group::a build box fetches its source for a deny-all box (NET-155, NET-165)"
+  BBF_SEED_DIR="$(hook_mktemp /tmp/mnlbbf.XXXXXX)"
+  hook_seed_preamble > "$BBF_SEED_DIR/minimal.toml"
+  mkdir "$BBF_SEED_DIR/.git"
+  bbf_sid="$(cd "$BBF_SEED_DIR" && mnl session activate . --name e2e-bbf \
+    --network own_ip --deny-all-egress 2>"$WORK/bbf-activate.err")" || {
+    echo "::error::the deny-all box's activate failed"
+    cat "$WORK/bbf-activate.err" 2>/dev/null || true
+    fail
+  }
+  bbf_sid="$(printf '%s\n' "$bbf_sid" | tail -n1)"
+  # shellcheck disable=SC2016 # `$?` must reach the box's shell unexpanded.
+  bbf_out="$(mnl session exec "$bbf_sid" \
+    "timeout 600 min package build --rebuild $bbf_pkg 2>&1; echo build-exit=\$?" \
+    2>"$WORK/bbf-build.err")" || {
+    echo "::error::the in-box 'min package build --rebuild $bbf_pkg' could not run"
+    cat "$WORK/bbf-build.err" 2>/dev/null || true
+    fail
+  }
+  bbf_out="$(printf '%s\n' "$bbf_out" | tr -d '\r')"
+  printf '%s\n' "$bbf_out" | tail -n 20 | sed 's/^/  /'
+  bbf_rc="$(printf '%s\n' "$bbf_out" | sed -n 's/^build-exit=//p' | tail -n1)"
+  if [ "$bbf_rc" != 0 ]; then
+    echo "::error::the cold build of $bbf_pkg failed (exit '$bbf_rc'): the table should give its fetch the source's host"
+    fail
+  fi
+  bbf_policy="$(mnl session policy "$bbf_sid" 2>&1)"
+  if ! grep -qF 'deny-all' <<<"$bbf_policy"; then
+    echo "::error::the box's own rules changed: the reach is the build box's, not the box's"
+    printf '%s\n' "$bbf_policy"
+    fail
+  fi
+  mnl session destroy "$bbf_sid" --force >/dev/null 2>&1 </dev/null || true
+  rm -rf "$BBF_SEED_DIR"
+  BBF_SEED_DIR=""
+  echo "a build box fetches its source OK"
+  echo "::endgroup::"
+}
+
 # T108 on the VM host, end to end: escapes and builds stay inside the box's
 # rules. Each refusal that reaches the host leaves a record there. The
 # vsock refusal inside the box is the one exception (see the RPC leg). One deny-all
@@ -32984,6 +33036,7 @@ case "${1:-}" in
     # Beside the escape-union proof, for the same reason: it stops the daemon
     # pair and autospawns a fresh one under its own record filter.
     proof_escapes_and_builds_stay_inside_box_rules
+    proof_a_build_box_fetches_its_source
     # Beside them, for the same reason.
     proof_host_ip_rules_follow_the_running_box
     # Stops the VM host: its boxes, then the daemon and its VM. The next
@@ -33044,6 +33097,7 @@ case "${1:-}" in
     | published_proxy_routes_from_host \
     | escape_reaches_only_declared_union \
     | escapes_and_builds_stay_inside_box_rules \
+    | a_build_box_fetches_its_source \
     | host_ip_rules_follow_the_running_box \
     | host_ip_deny_all \
     | daemon_fetch_under_deny_all_host_address_box \
@@ -33125,6 +33179,7 @@ case "${1:-}" in
     echo "         published_proxy_routes_from_host"
     echo "         escape_reaches_only_declared_union"
     echo "         escapes_and_builds_stay_inside_box_rules"
+    echo "         a_build_box_fetches_its_source"
     echo "         host_ip_rules_follow_the_running_box"
     echo "         host_ip_deny_all"
     echo "         daemon_fetch_under_deny_all_host_address_box"
