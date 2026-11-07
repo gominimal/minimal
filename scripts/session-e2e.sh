@@ -95,7 +95,10 @@
 #                                    TCP 53 is dropped (NET-141)
 #   task_run                         `min task run` / `min session run` loop
 #   task_network_inherits_session    a task's network mode follows its session
-#                                    (own_ip egress + loopback isolation, none)
+#                                    (own_ip egress + loopback isolation, none);
+#                                    native: `min task run --network own_ip`
+#                                    cannot reach a host loopback listener
+#                                    no [host-exposures] entry opens
 #   hooks                            lifecycle hooks, loadouts, patches, shells
 #   skip_scaffold                    the daemon-scaffolded blueprint upload lane
 #   sandbox                          interactive attach: in-sandbox `min add`
@@ -7060,11 +7063,15 @@ fi
 # exit code, so a task that fails for another reason (curl missing, the task
 # never starting) cannot pass for a refused connection. A host_ip control
 # task reaches the same host listener, so the own-IP refusal is shown to
-# depend on the mode. The own-IP and host_ip legs are native-only: on a VM
-# lane a task self-allocates a switch address the host-side table holds no
-# row for, so the egress gate drops its traffic (NET-085, until NET-138
-# registers every box), and the listener is on the CI host while every task
-# runs in the guest. The none leg runs on every lane. Own seeded project (the
+# depend on the mode. The same loopback task then runs with no session, as
+# `min task run --network own_ip` and `--network host_ip` (NET-060): the
+# own-IP box cannot reach the host listener, whose port no [host-exposures]
+# entry opens, and the host_ip box can. The own-IP and host_ip legs (the
+# task-run ones too: `min task run` refuses own_ip on a VM host) are
+# native-only: on a VM lane a task self-allocates a switch address the
+# host-side table holds no row for, so the egress gate drops its traffic
+# (NET-085, until NET-138 registers every box), and the listener is on the
+# CI host while every task runs in the guest. The none leg runs on every lane. Own seeded project (the
 # shared seed declares no tasks), switch-gated like the own-IP proofs above
 # (a task in an own-IP session needs the tap the switch carries):
 # MINVMD_GVPROXY_BIN on a VM lane, E2E_NATIVE_SWITCH on the native one.
@@ -7225,6 +7232,53 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   fi
   echo "host_ip session task: 127.0.0.1:$TN_LB_PORT reachable (exit 0)"
   mnl session destroy --force "$tn_host_sid" >/dev/null 2>&1 || true
+
+  # -- `min task run --network own_ip`: a fresh task box, no session --------
+  # The same loopback task, run as its own box (NET-060). This lane writes no
+  # [host-exposures] table, so no entry opens the listener's port. The box
+  # declares reach to every address, so the only thing between it and the
+  # listener is that its 127.0.0.1 is its own: curl must exit 7. A host_ip
+  # task run reaches the same listener and exits 0, so the refusal is shown
+  # to follow the flag. Every task run keeps its box; each is removed here.
+  tn_rm_kept() {
+    local tn_kept
+    tn_kept="$(grep -o 'Kept box e2e-tn-loopback-[0-9][0-9]*' "$1" | head -n1)"
+    tn_kept="${tn_kept#Kept box }"
+    [ -n "$tn_kept" ] || return 0
+    for _ in $(seq 1 20); do
+      mnl box rm "$tn_kept" >/dev/null 2>&1 && return 0
+      sleep 0.5
+    done
+    echo "::warning::'min box rm $tn_kept' failed after the task-run leg"
+  }
+  (cd "$TN_SEED_DIR" && mnl task run --network own_ip --allow-subnets 0.0.0.0/0 \
+    e2e-tn-loopback >/dev/null 2>"$WORK/tn-taskrun-ownip.err")
+  rc=$?
+  tn_rm_kept "$WORK/tn-taskrun-ownip.err"
+  if [ "$rc" -ne 7 ]; then
+    if [ "$rc" -eq 0 ]; then
+      echo "::error::'min task run --network own_ip' reached the host's listener at 127.0.0.1:$TN_LB_PORT, which no [host-exposures] entry opens — the task box's loopback is not its own"
+    else
+      echo "::error::'min task run --network own_ip' of the loopback task exited $rc, want 7 (curl: could not connect) — it failed for a reason other than an empty loopback"
+      echo "--- task stderr ---"; cat "$WORK/tn-taskrun-ownip.err" 2>/dev/null || true
+    fi
+    kill "$TN_LISTENER_PID" 2>/dev/null || true
+    TN_LISTENER_PID=""
+    fail
+  fi
+  echo "own-IP task run: 127.0.0.1:$TN_LB_PORT unreachable (exit $rc: $(grep -m1 'curl:' "$WORK/tn-taskrun-ownip.err" 2>/dev/null || true))"
+  (cd "$TN_SEED_DIR" && mnl task run --network host_ip \
+    e2e-tn-loopback >/dev/null 2>"$WORK/tn-taskrun-hostip.err")
+  rc=$?
+  tn_rm_kept "$WORK/tn-taskrun-hostip.err"
+  if [ "$rc" -ne 0 ]; then
+    echo "::error::'min task run --network host_ip' could not reach the host's listener at 127.0.0.1:$TN_LB_PORT (exit $rc) — the own-IP task run's refusal above is not shown to follow the flag"
+    echo "--- task stderr ---"; cat "$WORK/tn-taskrun-hostip.err" 2>/dev/null || true
+    kill "$TN_LISTENER_PID" 2>/dev/null || true
+    TN_LISTENER_PID=""
+    fail
+  fi
+  echo "host_ip task run: 127.0.0.1:$TN_LB_PORT reachable (exit 0)"
   tn_own_proven=1
   else
     known_gap task_network_inherits_session "own-IP/host_ip task legs on a VM lane: a task self-allocates a switch address the host-side table holds no row for, so the egress gate drops its traffic (NET-085, closed by NET-138); the host listener is also unreachable from the guest"
@@ -7264,7 +7318,7 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   TN_LISTENER_PID=""
   rm -rf "$TN_SEED_DIR"; TN_SEED_DIR=""
   if [ -n "$tn_own_proven" ]; then
-    echo "task network proof OK (own-IP: egress via the switch, host loopback unreachable; host_ip: host loopback reachable; none: no network)"
+    echo "task network proof OK (own-IP: egress via the switch, host loopback unreachable, in a session and from 'min task run --network own_ip'; host_ip: host loopback reachable; none: no network)"
   else
     echo "task network proof OK (none: no network; own-IP and host_ip legs known_gap on this VM lane)"
   fi
