@@ -442,7 +442,9 @@ has a unit test. No repeatable macOS VM lane exists yet (minimal#2037).
     prefix, and only in the 55-character W3C form; the daemon's span for
     the request adopts it. The host binary does not forward an inherited
     context when it does not export: it sends the opt-out marker instead
-    (TEL-045).
+    (TEL-045). A box handed that marker (`MINIMAL_OTEL=off`) sends the
+    `otel%off%` prefix and no `TRACEPARENT`: the daemon's span for the
+    request records nothing, and a task the request runs gets the marker.
 - **TEL-026** WHEN `min task run` starts a task THE SYSTEM SHALL add the exec
   span's `TRACEPARENT` to the task's environment on opt-in, nothing from the
   host telemetry environment when off, and leave the task's own `env_vars`
