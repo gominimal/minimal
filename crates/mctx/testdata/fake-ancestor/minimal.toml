@@ -10,6 +10,5 @@ use = "rust"
 state_key = "dev"
 
 [tasks.shell]
-interactive = true
 packages = ["base"]
 exec = "bash --noprofile -l"

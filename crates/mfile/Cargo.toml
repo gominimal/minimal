@@ -25,6 +25,7 @@ serde.workspace = true
 toml.workspace = true
 shlex.workspace = true
 tracing.workspace = true
+version.workspace = true
 
 [lints]
 workspace = true
