@@ -480,7 +480,6 @@ enum KeyShape {
     Bool,
     Int,
     StrOrInt,
-    StrOrBool,
     StrList,
     StrOrStrList,
     /// A table whose keys are the ones listed.
@@ -503,7 +502,6 @@ impl KeyShape {
             KeyShape::Bool => "true or false",
             KeyShape::Int => "a whole number",
             KeyShape::StrOrInt => "a string or a whole number",
-            KeyShape::StrOrBool => "a string or true or false",
             KeyShape::StrList => "a list of strings",
             KeyShape::StrOrStrList => "a string or a list of strings",
             KeyShape::Keys(_) => "a table",
@@ -517,8 +515,8 @@ impl KeyShape {
     fn mismatch(self, value: &toml::Value) -> Option<&'static str> {
         use toml::Value as V;
         let fits = match (self, value) {
-            (KeyShape::Str | KeyShape::StrOrInt | KeyShape::StrOrBool, V::String(_))
-            | (KeyShape::Bool | KeyShape::StrOrBool, V::Boolean(_))
+            (KeyShape::Str | KeyShape::StrOrInt, V::String(_))
+            | (KeyShape::Bool, V::Boolean(_))
             | (KeyShape::Int | KeyShape::StrOrInt, V::Integer(_))
             | (KeyShape::StrOrStrList, V::String(_))
             | (KeyShape::Keys(_), V::Table(_))
@@ -616,7 +614,7 @@ const NETWORK_KEYS: &[SectionKey] = &[
     ("egress_deny_subnets", ANY),
     ("ingress", ANY),
     ("mode", ANY),
-    ("quic443", KeyShape::StrOrBool),
+    ("quic443", KeyShape::Str),
     ("vpn_network_names", KeyShape::StrList),
 ];
 
@@ -1277,6 +1275,11 @@ mod tests {
                 "[sessions.dev.network]\nmode = \"own_ip\"\nvpn = [\"corp\"]\n",
                 "`[sessions.dev]` in minimal.toml sets `network.vpn`, \
                  which is not a box setting. Remove the key or correct its name.",
+            ),
+            (
+                "[sessions.dev.network]\nquic443 = true\n",
+                "`[sessions.dev]` in minimal.toml sets `network.quic443` to a true \
+                 or false value, but `network.quic443` takes a string. Fix the value.",
             ),
             (
                 "[sessions.dev.install]\npackages = [\"git\", 3]\n",
