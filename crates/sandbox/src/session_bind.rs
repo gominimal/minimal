@@ -19,14 +19,17 @@
 //!
 //! 1. Every source is opened first, before any of these binds is made. A
 //!    source in a tree is opened once, `O_PATH`, with `openat2(2)` beneath the
-//!    tree's mount, `RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS`: a link that
-//!    stays in the tree is followed, as it was before; `..` or a link out of
-//!    the tree, and every absolute link, is refused (`EXDEV`), as is a `/proc`
-//!    magic link (`ELOOP`). A source outside the trees (a host path whose
-//!    mount point is under `/home`) is not the box's: hakoniwa binds it by
-//!    path, as before, but onto a stage, [`STAGE`]`/<n>` on a tmpfs of the
-//!    box's own that nothing of the box's reaches before it runs, and the
-//!    closure opens the stage.
+//!    tree's mount, `RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS`: a relative link
+//!    that stays in the tree is followed wherever it points from, as it was
+//!    before (a stow link `~/.config/nvim -> ../dotfiles/nvim/.config/nvim`
+//!    climbs above its own directory and stays in the home); `..` or a link
+//!    out of the tree, and every absolute link, is refused (`EXDEV`), as is a
+//!    `/proc` magic link (`ELOOP`). A refusal is then walked again by
+//!    [`walk`] to say which link or `..` it was and what to do ([`Refused`]).
+//!    A source outside the trees (a host path whose mount point is under
+//!    `/home`) is not the box's: hakoniwa binds it by path, as before, but
+//!    onto a stage, [`STAGE`]`/<n>` on a tmpfs of the box's own that nothing
+//!    of the box's reaches before it runs, and the closure opens the stage.
 //! 2. Then, in target order, each mount point is resolved beneath its tree
 //!    the same way (made first, beneath the tree, when it is missing), and
 //!    the source lands on it without another name being looked up: a tree
@@ -48,15 +51,20 @@
 //! the supported floor (Linux 5.10): `openat2` is 5.6, `open_tree` and
 //! `move_mount` are 5.2.
 //!
-//! [`create_beneath`] is the daemon-side twin for a read-write patch whose
-//! path does not exist yet: it creates the missing directories and file one
-//! component at a time beneath the tree, where `create_dir_all` and
-//! `fs::write` would follow a link out of it.
+//! A path that does not exist yet (a read-write patch the daemon creates
+//! with [`create_beneath`], a missing mount point the closure makes) is made
+//! by [`walk`]: one name at a time, each looked up without following it in
+//! a directory opened beneath the tree's root, a link's target spliced into
+//! the rest of the path and a `..` taken back up the walked path, never above
+//! the tree's root. So a link that stays in the tree is followed from
+//! wherever it is, a dangling one gets its target made in the tree, and
+//! nothing is made out of it, where `create_dir_all` and `fs::write` would
+//! follow a link anywhere.
 
-use std::ffi::{CStr, CString, OsStr};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::io::{self, Write as _};
 use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
-use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Component, Path, PathBuf};
 
 /// Where hakoniwa binds a mapping from outside the trees whose mount point
@@ -85,6 +93,13 @@ const RESOLVE_IN_TREE: u64 = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_MAGICLINKS
 /// How many times a resolve the kernel aborted with `EAGAIN` (a rename raced
 /// a `..` walk under `RESOLVE_BENEATH`) is retried before it fails.
 const RESOLVE_RETRIES: usize = 16;
+
+/// How many symbolic links one [`walk`] follows before it calls them a loop:
+/// the kernel's own limit.
+const MAX_LINKS: usize = 40;
+
+/// The longest link target [`read_link`] reads (`PATH_MAX`).
+const LINK_MAX: usize = 4096;
 
 /// `struct open_how` (`linux/openat2.h`). libc's own is `non_exhaustive`.
 #[repr(C)]
@@ -122,6 +137,171 @@ impl Tree {
             },
         ]
     }
+}
+
+/// How a person sees one of the trees, for a refusal: `~` for the home, its
+/// mount (`/workbench`) for the workbench, and the tree's name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TreeView<'a> {
+    pub(crate) shown: &'a str,
+    pub(crate) name: &'static str,
+}
+
+impl<'a> TreeView<'a> {
+    /// The view of the tree named `name` that the box sees at `mount`.
+    pub(crate) fn of(mount: &'a str, name: &'static str) -> Self {
+        let shown = if name == "home" { "~" } else { mount };
+        Self { shown, name }
+    }
+}
+
+/// Why a patch path was refused beneath its tree: what a [`walk`] of it found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Why {
+    /// A `..` in the patch path itself climbs above the tree.
+    Climbs,
+    /// The link at `link` (relative to the tree) points at `to`, which climbs
+    /// above the tree.
+    LinkClimbs { link: PathBuf, to: PathBuf },
+    /// The link at `link` points at the absolute path `to`. Whose root an
+    /// absolute link is read from (the daemon's or the box's) decides where
+    /// it leads, so none is followed, also one that names a place in the tree.
+    Absolute { link: PathBuf, to: PathBuf },
+    /// More than [`MAX_LINKS`] links on the path: they loop.
+    Loop,
+    /// The kernel refused the path with this errno (`EXDEV`, `ELOOP`) and a
+    /// walk of it afterwards found nothing to blame: a link the box changed
+    /// in between, or a `/proc` magic link.
+    Kernel(i32),
+}
+
+/// A patch path refused beneath its tree, with what to do about it. Carried
+/// in an [`io::Error`] (see [`refusal`]), whose text it is, so a failure
+/// shows this sentence and not an errno.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Refused {
+    /// The tree as the person sees it: `~`, `/workbench`.
+    pub(crate) shown: String,
+    /// The tree's name.
+    pub(crate) tree: &'static str,
+    /// The patch path, relative to the tree.
+    pub(crate) rel: PathBuf,
+    pub(crate) why: Why,
+}
+
+impl Refused {
+    /// The errno the refusal stands for, for the closure's report: `ELOOP`
+    /// for a loop, the kernel's own, or `EXDEV`.
+    pub(crate) fn errno(&self) -> i32 {
+        match self.why {
+            Why::Loop => libc::ELOOP,
+            Why::Kernel(errno) => errno,
+            Why::Climbs | Why::LinkClimbs { .. } | Why::Absolute { .. } => libc::EXDEV,
+        }
+    }
+
+    /// `rel` as the person sees it: `~/.config/nvim`.
+    fn show(&self, rel: &Path) -> String {
+        if rel.as_os_str().is_empty() {
+            self.shown.clone()
+        } else {
+            format!("{}/{}", self.shown, rel.display())
+        }
+    }
+
+    /// The link at `link`, named with the patch path it is on when that is
+    /// not the link itself.
+    fn the_link(&self, link: &Path) -> String {
+        if link == self.rel {
+            format!("`{}`", self.show(link))
+        } else {
+            format!(
+                "`{}`, on the patch path `{}`,",
+                self.show(link),
+                self.show(&self.rel)
+            )
+        }
+    }
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let tree = self.tree;
+        let path = self.show(&self.rel);
+        match &self.why {
+            Why::Climbs => write!(
+                f,
+                "the patch path `{path}` climbs out of the session's {tree} through `..`; \
+                 name the patch by a path that stays in the {tree}"
+            ),
+            Why::LinkClimbs { link, to } => write!(
+                f,
+                "{} is a symbolic link to `{}`, which climbs out of the session's {tree}; a \
+                 patch is reached only through links that stay in the {tree}: point that link \
+                 at a place in the {tree}, or remove it",
+                self.the_link(link),
+                to.display()
+            ),
+            Why::Absolute { link, to } => write!(
+                f,
+                "{} is a symbolic link to the absolute path `{}`, and a patch path follows only \
+                 relative links, also when an absolute one names a place in the {tree}: \
+                 replace it with a relative link that stays in the {tree}, or remove it",
+                self.the_link(link),
+                to.display()
+            ),
+            Why::Loop => write!(
+                f,
+                "the patch path `{path}` goes through more than {MAX_LINKS} symbolic links, so \
+                 they loop; remove the loop among the links on it"
+            ),
+            Why::Kernel(libc::ELOOP) => write!(
+                f,
+                "the patch path `{path}` goes through a /proc magic link or a loop of symbolic \
+                 links, which a patch never follows; remove that link"
+            ),
+            Why::Kernel(_) => write!(
+                f,
+                "the patch path `{path}` leads out of the session's {tree} through `..` or a \
+                 symbolic link that is absolute or leaves it; a patch is reached only through \
+                 relative links that stay in the {tree}: replace or remove that link"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// The [`Refused`] an error carries, if it is one.
+pub(crate) fn refusal(e: &io::Error) -> Option<&Refused> {
+    e.get_ref()?.downcast_ref()
+}
+
+/// The errno of `e`, a refusal's included.
+pub(crate) fn errno_of(e: &io::Error) -> Option<i32> {
+    if let Some(errno) = e.raw_os_error() {
+        return Some(errno);
+    }
+    refusal(e).map(Refused::errno)
+}
+
+/// `why` as the error a refused resolve or walk of `rel` returns.
+fn refused(view: TreeView<'_>, rel: &Path, why: Why) -> io::Error {
+    io::Error::other(Refused {
+        shown: view.shown.to_string(),
+        tree: view.name,
+        rel: rel.to_path_buf(),
+        why,
+    })
+}
+
+/// Which step of [`bind_all`] a failure is in, for its text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Step {
+    /// Opening the patch's source.
+    Source,
+    /// Resolving, or making, the place it is mounted at, and the mount.
+    MountPoint,
 }
 
 /// Where a closure bind's source comes from.
@@ -275,21 +455,22 @@ pub(crate) fn within<'p>(roots: &[&'p Path], host: &Path) -> Option<(&'p Path, P
 }
 
 impl SessionBind {
-    /// What the closure was doing when this bind failed with `err` in the
-    /// tree `tree`, for `exit_child`'s `<what> failed: <err>` line: a path
-    /// that leads out of the tree and a link loop are named as such.
-    pub(crate) fn failure(&self, tree: &str, err: &io::Error) -> String {
+    /// What the closure was doing when this bind failed in `step`, for
+    /// `exit_child`'s `<what> failed: <err>` line. A refused path is the
+    /// error's own text ([`Refused`]), which says what to do.
+    pub(crate) fn failure(&self, step: Step) -> String {
         let target = &self.target;
-        match err.raw_os_error() {
-            Some(libc::EXDEV) => format!(
-                "binding the patch at `{target}` (its path leads outside the session's {tree}, \
-                 through `..` or a symbolic link, and a patch is never mounted from outside it)"
-            ),
-            Some(libc::ELOOP) => format!(
-                "binding the patch at `{target}` (a symbolic link on its path in the session's \
-                 {tree} loops, or is a /proc magic link)"
-            ),
-            _ => format!("binding the patch at `{target}`"),
+        match (step, &self.source) {
+            (Step::Source, Source::Tree { name, .. }) => {
+                format!("reading the patch for `{target}` from the session's {name}")
+            }
+            (Step::Source, Source::Staged { .. }) => {
+                format!("opening the stage of the patch for `{target}`")
+            }
+            (Step::MountPoint, Source::Tree { .. }) => format!("placing the patch at `{target}`"),
+            (Step::MountPoint, Source::Staged { .. }) => {
+                format!("placing the patch from outside the session at `{target}`")
+            }
         }
     }
 }
@@ -314,12 +495,14 @@ pub(crate) fn bind_all(binds: &[SessionBind]) -> Result<(), (String, io::Error)>
             Source::Tree { mount, name, rel } => {
                 let root = open_dir(Path::new(mount));
                 let root = root.map_err(|e| (format!("opening `{mount}`"), e))?;
-                resolve(root.as_fd(), rel).map_err(|e| (bind.failure(name, &e), e))?
+                let view = TreeView::of(mount, *name);
+                let source = resolve(root.as_fd(), view, rel);
+                source.map_err(|e| (bind.failure(Step::Source), e))?
             }
-            Source::Staged { stage } => match open_path(Path::new(stage), !bind.is_file) {
-                Ok(fd) => fd,
-                Err(e) => return Err((format!("opening the stage of `{}`", bind.target), e)),
-            },
+            Source::Staged { stage } => {
+                let staged = open_path(Path::new(stage), !bind.is_file);
+                staged.map_err(|e| (bind.failure(Step::Source), e))?
+            }
         };
         sources.push(source);
     }
@@ -327,8 +510,10 @@ pub(crate) fn bind_all(binds: &[SessionBind]) -> Result<(), (String, io::Error)>
     for (bind, source) in binds.iter().zip(&sources) {
         let mount = &bind.mount;
         let root = open_dir(Path::new(mount)).map_err(|e| (format!("opening `{mount}`"), e))?;
-        let failed = |e: io::Error| (bind.failure(bind.name, &e), e);
-        let target = resolve_or_create(root.as_fd(), &bind.rel, bind.is_file).map_err(failed)?;
+        let failed = |e: io::Error| (bind.failure(Step::MountPoint), e);
+        let view = TreeView::of(mount, bind.name);
+        let target = resolve_or_create(root.as_fd(), view, &bind.rel, bind.is_file);
+        let target = target.map_err(failed)?;
         let bound = match bind.source {
             Source::Tree { .. } => bind_clone(
                 source.as_fd(),
@@ -348,25 +533,52 @@ pub(crate) fn bind_all(binds: &[SessionBind]) -> Result<(), (String, io::Error)>
     Ok(())
 }
 
-/// Resolves `rel` beneath the directory `root` into an `O_PATH` handle: a
-/// link that stays beneath `root` is followed, any path that leaves it is
-/// refused (`EXDEV`). An empty `rel` is `root` itself.
-pub(crate) fn resolve(root: BorrowedFd<'_>, rel: &Path) -> io::Result<OwnedFd> {
-    let rel = if rel.as_os_str().is_empty() {
+/// Resolves `rel` beneath the directory `root`, the tree `view`, into an
+/// `O_PATH` handle, in one `openat2(2)`: a relative link that stays beneath
+/// `root` is followed from wherever it is, and a path the kernel refuses
+/// (`..` above `root`, a link out of it, any absolute link, a magic link) is
+/// a [`Refused`] that says which and what to do. An empty `rel` is `root`.
+pub(crate) fn resolve(root: BorrowedFd<'_>, view: TreeView<'_>, rel: &Path) -> io::Result<OwnedFd> {
+    let path = if rel.as_os_str().is_empty() {
         Path::new(".")
     } else {
         rel
     };
-    openat2(root, rel, libc::O_PATH, RESOLVE_IN_TREE)
+    openat2(root, path, libc::O_PATH, RESOLVE_IN_TREE).map_err(|e| explain(root, view, rel, e))
+}
+
+/// The kernel's refusal `e` of `rel` (`EXDEV`, `ELOOP`) as a [`Refused`],
+/// with the link or `..` a [`walk`] of the path blames; any other error as
+/// it is. The walk only reads: what it finds names the cause, and the
+/// kernel's refusal stands whatever it finds.
+fn explain(root: BorrowedFd<'_>, view: TreeView<'_>, rel: &Path, e: io::Error) -> io::Error {
+    let Some(errno @ (libc::EXDEV | libc::ELOOP)) = e.raw_os_error() else {
+        return e;
+    };
+    match walk(root, view, rel, None) {
+        Err(walked) if refusal(&walked).is_some() => walked,
+        _ => refused(view, rel, Why::Kernel(errno)),
+    }
 }
 
 /// [`resolve`], making the path beneath `root` first when it is missing: a
-/// mount point hakoniwa used to make with `mkdir_p` or `touch` by path.
-fn resolve_or_create(root: BorrowedFd<'_>, rel: &Path, is_file: bool) -> io::Result<OwnedFd> {
-    match resolve(root, rel) {
+/// mount point hakoniwa used to make with `mkdir_p` or `touch` by path. A
+/// missing mount point under a link that stays in the tree, a dangling one
+/// included, is made where the link leads, in the tree.
+fn resolve_or_create(
+    root: BorrowedFd<'_>,
+    view: TreeView<'_>,
+    rel: &Path,
+    is_file: bool,
+) -> io::Result<OwnedFd> {
+    match resolve(root, view, rel) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            create_beneath_at(root, rel, is_file, b"")?;
-            resolve(root, rel)
+            let make = Make {
+                is_file,
+                contents: b"",
+            };
+            walk(root, view, rel, Some(make))?;
+            resolve(root, view, rel)
         }
         other => other,
     }
@@ -449,61 +661,182 @@ fn unmount_stage() {
     }
 }
 
-/// Creates the patch path `rel` beneath the tree at `root` when it does not
-/// exist yet: a read-write patch's missing directories and its file or
-/// directory, one component at a time, never out of the tree. A file is
-/// created holding `contents`; one that appears meanwhile is left as it is.
-/// `rel` must be plain names: a `..` is refused.
+/// Creates the patch path `rel` beneath the tree at `root`, the tree
+/// `view`, when it does not exist yet: a read-write patch's missing
+/// directories and its file or directory, by a [`walk`] that follows a link
+/// staying in the tree from wherever it is (a dangling one gets its target
+/// made) and never makes anything out of the tree. A file is created holding
+/// `contents`; one that appears meanwhile is left as it is. A path out of the
+/// tree is a [`Refused`].
 pub(crate) fn create_beneath(
     root: &Path,
+    view: TreeView<'_>,
     rel: &Path,
     is_file: bool,
     contents: &[u8],
 ) -> io::Result<()> {
     let dir = open_dir(root)?;
-    create_beneath_at(dir.as_fd(), rel, is_file, contents)
+    walk(dir.as_fd(), view, rel, Some(Make { is_file, contents }))
 }
 
-/// [`create_beneath`] from a directory already open.
-fn create_beneath_at(
-    root: BorrowedFd<'_>,
-    rel: &Path,
+/// What a [`walk`] makes of a name missing on its path: a directory, or the
+/// file holding `contents` when it is the last name and `is_file`.
+#[derive(Debug, Clone, Copy)]
+struct Make<'c> {
     is_file: bool,
-    contents: &[u8],
+    contents: &'c [u8],
+}
+
+/// One step of a [`walk`]: a name to look up, or a `..` with the link whose
+/// target it is in (an index into the walk's links; `None` for the patch
+/// path itself), for a refusal.
+enum Part {
+    Name(OsString),
+    Up(Option<usize>),
+}
+
+/// Walks `rel` beneath the directory `root`, the tree `view`, one name at a
+/// time, making each missing name when `make` asks for it.
+///
+/// The walk holds the path it has reached as plain names from `root`. Each
+/// name is looked up with `O_NOFOLLOW` in that path's directory, opened
+/// afresh beneath `root` (`RESOLVE_BENEATH`); a link found there has its
+/// target read and spliced in front of the rest of the path, so a relative
+/// link is followed from where it is, whatever it climbs, while it stays in
+/// the tree; a `..` takes the last name off the path reached. A `..` with no
+/// name left to take is above the tree, and an absolute link is refused
+/// before it is followed: each is a [`Refused`], as is a loop. A missing name
+/// is made in the directory reached, with `mkdirat(2)` or an `O_EXCL |
+/// O_NOFOLLOW` create, neither of which follows a link. Every directory the
+/// walk opens or makes in is one the kernel resolved beneath `root`, so
+/// whatever the box swaps in meanwhile, nothing is opened or made out of
+/// the tree.
+fn walk(
+    root: BorrowedFd<'_>,
+    view: TreeView<'_>,
+    rel: &Path,
+    make: Option<Make<'_>>,
 ) -> io::Result<()> {
-    let mut names = Vec::new();
-    for component in rel.components() {
+    let mut todo = Vec::new();
+    push_parts(&mut todo, rel, None)?;
+    let mut links: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut reached: Vec<OsString> = Vec::new();
+    while let Some(part) = todo.pop() {
+        let name = match part {
+            Part::Name(name) => name,
+            Part::Up(from) => {
+                if reached.pop().is_none() {
+                    let why = match from {
+                        None => Why::Climbs,
+                        Some(i) => {
+                            let (link, to) = links[i].clone();
+                            Why::LinkClimbs { link, to }
+                        }
+                    };
+                    return Err(refused(view, rel, why));
+                }
+                continue;
+            }
+        };
+        let dir = open_reached(root, &reached)?;
+        let flags = libc::O_PATH | libc::O_NOFOLLOW;
+        match openat2(dir.as_fd(), Path::new(&name), flags, RESOLVE_IN_TREE) {
+            Ok(fd) => {
+                let found = std::fs::File::from(fd);
+                if !found.metadata()?.file_type().is_symlink() {
+                    reached.push(name);
+                    continue;
+                }
+                if links.len() == MAX_LINKS {
+                    return Err(refused(view, rel, Why::Loop));
+                }
+                let link: PathBuf = reached.iter().chain(std::iter::once(&name)).collect();
+                let to = read_link(found.as_fd())?;
+                if to.has_root() {
+                    return Err(refused(view, rel, Why::Absolute { link, to }));
+                }
+                push_parts(&mut todo, &to, Some(links.len()))?;
+                links.push((link, to));
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let Some(make) = make else {
+                    return Err(e);
+                };
+                if make.is_file && todo.is_empty() {
+                    create_file(dir.as_fd(), &name, make.contents)?;
+                } else {
+                    make_dir(dir.as_fd(), &name)?;
+                }
+                reached.push(name);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Pushes the steps of `path` onto `todo`, first step last, each `..` marked
+/// with the link `from` it came from. An absolute `path` is refused by the
+/// caller first; here it is invalid input.
+fn push_parts(todo: &mut Vec<Part>, path: &Path, from: Option<usize>) -> io::Result<()> {
+    let mut parts = Vec::new();
+    for component in path.components() {
         match component {
-            Component::Normal(name) => names.push(name),
+            Component::Normal(name) => parts.push(Part::Name(name.to_os_string())),
+            Component::ParentDir => parts.push(Part::Up(from)),
             Component::CurDir => {}
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "a patch path in the session must name plain components, without `..`",
-                ));
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(io::Error::from(io::ErrorKind::InvalidInput));
             }
         }
     }
-    let Some((last, parents)) = names.split_last() else {
-        // The tree itself, which exists.
-        return Ok(());
+    todo.extend(parts.into_iter().rev());
+    Ok(())
+}
+
+/// The directory a [`walk`] has reached, `reached` from `root`, opened
+/// beneath `root`.
+fn open_reached(root: BorrowedFd<'_>, reached: &[OsString]) -> io::Result<OwnedFd> {
+    let path: PathBuf = if reached.is_empty() {
+        PathBuf::from(".")
+    } else {
+        reached.iter().collect()
     };
-    let mut dir: Option<OwnedFd> = None;
-    for name in parents {
-        let next = open_or_make_dir(dir.as_ref().map_or(root, AsFd::as_fd), name)?;
-        dir = Some(next);
+    openat2(root, &path, libc::O_PATH | libc::O_DIRECTORY, RESOLVE_IN_TREE)
+}
+
+/// The target of the link `link` holds (opened `O_PATH | O_NOFOLLOW`).
+fn read_link(link: BorrowedFd<'_>) -> io::Result<PathBuf> {
+    let mut buf = vec![0u8; LINK_MAX];
+    // SAFETY: `readlinkat(2)` with a live descriptor, a NUL-terminated empty
+    // path (the descriptor's own link) and a buffer of `buf.len()` writable
+    // bytes.
+    let n = unsafe {
+        libc::readlinkat(
+            link.as_raw_fd(),
+            c"".as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    let n = usize::try_from(n).map_err(|_| io::Error::last_os_error())?;
+    if n == buf.len() {
+        return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
     }
-    let at = dir.as_ref().map_or(root, AsFd::as_fd);
-    if !is_file {
-        return open_or_make_dir(at, last).map(drop);
-    }
-    let name = c_name(last)?;
+    buf.truncate(n);
+    Ok(PathBuf::from(OsString::from_vec(buf)))
+}
+
+/// Creates the file `name` in `dir` holding `contents`. One that is there
+/// already, made meanwhile, is left as it is.
+fn create_file(dir: BorrowedFd<'_>, name: &OsStr, contents: &[u8]) -> io::Result<()> {
+    let name = c_name(name)?;
     // SAFETY: `openat(2)` with a live directory descriptor, a NUL-terminated
     // name and a mode for `O_CREAT`; `O_EXCL | O_NOFOLLOW` never opens or
     // creates through a link.
     let fd = unsafe {
         libc::openat(
-            at.as_raw_fd(),
+            dir.as_raw_fd(),
             name.as_ptr(),
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             0o666 as libc::c_uint,
@@ -516,26 +849,19 @@ fn create_beneath_at(
     }
 }
 
-/// Opens the directory `name` in `dir` beneath it, making it first when it
-/// is missing. A directory made meanwhile by someone else is opened all the
-/// same; a link out of the tree in its place is refused.
-fn open_or_make_dir(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<OwnedFd> {
-    let path = Path::new(name);
-    match openat2(dir, path, libc::O_PATH | libc::O_DIRECTORY, RESOLVE_IN_TREE) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            let c = c_name(name)?;
-            // SAFETY: `mkdirat(2)` with a live directory descriptor and a
-            // NUL-terminated name; it never follows a link.
-            if unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o777) } == -1 {
-                let e = io::Error::last_os_error();
-                if e.raw_os_error() != Some(libc::EEXIST) {
-                    return Err(e);
-                }
-            }
-            openat2(dir, path, libc::O_PATH | libc::O_DIRECTORY, RESOLVE_IN_TREE)
+/// Makes the directory `name` in `dir`. One that is there already, made
+/// meanwhile, is left as it is.
+fn make_dir(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<()> {
+    let c = c_name(name)?;
+    // SAFETY: `mkdirat(2)` with a live directory descriptor and a
+    // NUL-terminated name; it never follows a link.
+    if unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o777) } == -1 {
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EEXIST) {
+            return Err(e);
         }
-        other => other,
     }
+    Ok(())
 }
 
 /// Opens `path`, a directory the daemon or the rootfs owns (not a name in a
@@ -635,6 +961,19 @@ mod tests {
         (meta.dev(), meta.ino())
     }
 
+    /// How the tests' home is shown in a refusal.
+    const HOME: TreeView<'static> = TreeView {
+        shown: "~",
+        name: "home",
+    };
+
+    /// The refusal `e` carries; panics, naming `what`, when it carries none.
+    fn why<'e>(e: &'e io::Error, what: &str) -> &'e Why {
+        &refusal(e)
+            .unwrap_or_else(|| panic!("{what}: not a refusal: {e:?}"))
+            .why
+    }
+
     /// Whether this host lets the test's child set up the user namespace a
     /// namespace test runs in. A host that denies it (a CI runner restricting
     /// unprivileged user namespaces) skips `test` with the reason printed,
@@ -667,9 +1006,9 @@ mod tests {
     fn a_plain_patch_path_resolves_to_its_own_object() {
         let (_root, home, _outside) = home_and_outside();
         let home_fd = open_dir(&home).unwrap();
-        let handle = resolve(home_fd.as_fd(), Path::new("x")).unwrap();
+        let handle = resolve(home_fd.as_fd(), HOME, Path::new("x")).unwrap();
         assert_eq!(identity(&handle), identity_of(&home.join("x")));
-        let whole = resolve(home_fd.as_fd(), Path::new("")).unwrap();
+        let whole = resolve(home_fd.as_fd(), HOME, Path::new("")).unwrap();
         assert_eq!(
             identity(&whole),
             identity_of(&home),
@@ -686,7 +1025,7 @@ mod tests {
         let (_root, home, outside) = home_and_outside();
         let home_fd = open_dir(&home).unwrap();
         let original = identity_of(&home.join("x"));
-        let handle = resolve(home_fd.as_fd(), Path::new("x")).unwrap();
+        let handle = resolve(home_fd.as_fd(), HOME, Path::new("x")).unwrap();
 
         std::fs::rename(home.join("x"), home.join("d")).unwrap();
         std::os::unix::fs::symlink(&outside, home.join("x")).unwrap();
@@ -709,11 +1048,15 @@ mod tests {
             "through the handle, the original directory"
         );
 
-        let again = resolve(home_fd.as_fd(), Path::new("x")).unwrap_err();
+        let again = resolve(home_fd.as_fd(), HOME, Path::new("x")).unwrap_err();
         assert_eq!(
-            again.raw_os_error(),
+            errno_of(&again),
             Some(libc::EXDEV),
             "a fresh resolve refuses the link out of the home"
+        );
+        assert!(
+            matches!(why(&again, "x"), Why::Absolute { link, .. } if link == Path::new("x")),
+            "and names the link: {again}"
         );
     }
 
@@ -742,7 +1085,7 @@ mod tests {
                 let Ok(home) = open_dir(Path::new("/t/home")) else {
                     return 10;
                 };
-                let Ok(handle) = resolve(home.as_fd(), Path::new("x")) else {
+                let Ok(handle) = resolve(home.as_fd(), HOME, Path::new("x")) else {
                     return 11;
                 };
                 // The box's swap, after the resolve.
@@ -882,10 +1225,10 @@ mod tests {
         std::os::unix::fs::symlink("../outside", home.join("rel")).unwrap();
         let home_fd = open_dir(&home).unwrap();
         for link in ["abs", "abs-in", "rel", "rel/token"] {
-            let err = resolve(home_fd.as_fd(), Path::new(link)).unwrap_err();
-            assert_eq!(err.raw_os_error(), Some(libc::EXDEV), "{link}");
+            let err = resolve(home_fd.as_fd(), HOME, Path::new(link)).unwrap_err();
+            assert_eq!(errno_of(&err), Some(libc::EXDEV), "{link}");
         }
-        let inside = resolve(home_fd.as_fd(), Path::new("inside")).unwrap();
+        let inside = resolve(home_fd.as_fd(), HOME, Path::new("inside")).unwrap();
         assert_eq!(
             identity(&inside),
             identity_of(&home.join("x")),
@@ -898,10 +1241,11 @@ mod tests {
         let (_root, home, _outside) = home_and_outside();
         let home_fd = open_dir(&home).unwrap();
         for path in ["../outside", "x/../../outside"] {
-            let err = resolve(home_fd.as_fd(), Path::new(path)).unwrap_err();
-            assert_eq!(err.raw_os_error(), Some(libc::EXDEV), "{path}");
+            let err = resolve(home_fd.as_fd(), HOME, Path::new(path)).unwrap_err();
+            assert_eq!(errno_of(&err), Some(libc::EXDEV), "{path}");
+            assert_eq!(why(&err, path), &Why::Climbs, "{path}");
         }
-        let inside = resolve(home_fd.as_fd(), Path::new("x/../x")).unwrap();
+        let inside = resolve(home_fd.as_fd(), HOME, Path::new("x/../x")).unwrap();
         assert_eq!(
             identity(&inside),
             identity_of(&home.join("x")),
@@ -909,9 +1253,13 @@ mod tests {
         );
     }
 
+    /// What the closure says it was doing: reading a tree patch's source,
+    /// or placing a patch at its mount point, with the patch from outside
+    /// the session named as such, so a refused mount point is never told as
+    /// a source from outside the home.
     #[test]
-    fn the_failure_names_the_patch_and_the_reason() {
-        let bind = SessionBind {
+    fn the_failure_names_the_step_and_the_patch() {
+        let tree = SessionBind {
             source: Source::Tree {
                 mount: "/home".into(),
                 name: "home",
@@ -925,21 +1273,175 @@ mod tests {
             is_file: false,
             locked: 0,
         };
-        let escaped = bind.failure("home", &io::Error::from_raw_os_error(libc::EXDEV));
-        assert!(
-            escaped.contains("`/home/x811`")
-                && escaped.contains("outside the session's home")
-                && escaped.contains("symbolic link"),
-            "{escaped}"
-        );
-        let looped = bind.failure("workbench", &io::Error::from_raw_os_error(libc::ELOOP));
-        assert!(
-            looped.contains("symbolic link") && looped.contains("session's workbench"),
-            "{looped}"
+        let staged = SessionBind {
+            source: Source::Staged {
+                stage: "/.minimal-patch/0".into(),
+            },
+            ..tree.clone()
+        };
+        assert_eq!(
+            tree.failure(Step::Source),
+            "reading the patch for `/home/x811` from the session's home"
         );
         assert_eq!(
-            bind.failure("home", &io::Error::from_raw_os_error(libc::ENOENT)),
-            "binding the patch at `/home/x811`"
+            tree.failure(Step::MountPoint),
+            "placing the patch at `/home/x811`"
+        );
+        assert_eq!(
+            staged.failure(Step::Source),
+            "opening the stage of the patch for `/home/x811`"
+        );
+        assert_eq!(
+            staged.failure(Step::MountPoint),
+            "placing the patch from outside the session at `/home/x811`"
+        );
+    }
+
+    /// The refusal says what was refused, why, and what to do, with no errno
+    /// in its text: an absolute link (also one naming a place in the home),
+    /// a link that climbs out, a `..` in the path itself, a loop.
+    #[test]
+    fn a_refusal_says_what_was_refused_why_and_what_to_do() {
+        let (_root, home, _outside) = home_and_outside();
+        std::fs::create_dir_all(home.join("dotfiles")).unwrap();
+        std::fs::write(home.join("dotfiles/gitconfig"), "[user]").unwrap();
+        std::os::unix::fs::symlink(home.join("dotfiles/gitconfig"), home.join(".gitconfig"))
+            .unwrap();
+        std::os::unix::fs::symlink("../../outside", home.join("x/up")).unwrap();
+        std::os::unix::fs::symlink("loop-b", home.join("loop-a")).unwrap();
+        std::os::unix::fs::symlink("loop-a", home.join("loop-b")).unwrap();
+        let home_fd = open_dir(&home).unwrap();
+        let refusal_of = |path: &str| {
+            let err = resolve(home_fd.as_fd(), HOME, Path::new(path)).unwrap_err();
+            let text = err.to_string();
+            assert!(
+                !text.contains("os error"),
+                "{path}: no bare errno: {text}"
+            );
+            (why(&err, path).clone(), text)
+        };
+
+        let (absolute, text) = refusal_of(".gitconfig");
+        assert_eq!(
+            absolute,
+            Why::Absolute {
+                link: ".gitconfig".into(),
+                to: home.join("dotfiles/gitconfig"),
+            }
+        );
+        assert!(
+            text.starts_with("`~/.gitconfig` is a symbolic link to the absolute path")
+                && text.contains("replace it with a relative link that stays in the home")
+                && !text.contains("outside"),
+            "an absolute link into the home is refused as absolute, not as outside: {text}"
+        );
+
+        let (climbs, text) = refusal_of("x/up/token");
+        assert_eq!(
+            climbs,
+            Why::LinkClimbs {
+                link: "x/up".into(),
+                to: "../../outside".into(),
+            }
+        );
+        assert!(
+            text.starts_with("`~/x/up`, on the patch path `~/x/up/token`, is a symbolic link")
+                && text.contains("climbs out of the session's home")
+                && text.contains("point that link at a place in the home, or remove it"),
+            "{text}"
+        );
+
+        let (up, text) = refusal_of("x/../../outside");
+        assert_eq!(up, Why::Climbs);
+        assert!(text.contains("through `..`"), "{text}");
+
+        let (looped, text) = refusal_of("loop-a");
+        assert_eq!(looped, Why::Loop);
+        assert!(text.contains("loop"), "{text}");
+    }
+
+    /// The stow shape (inbox#1152 review): `~/.config/nvim` is a relative
+    /// link that climbs above its own directory and stays in the home. A
+    /// patch under it resolves, a missing one is made where it leads, for
+    /// the daemon and for a missing mount point alike, and a sibling link
+    /// that climbs one level further, out of the home, is still refused.
+    #[test]
+    fn a_stow_link_that_climbs_within_the_home_is_followed() {
+        let (_root, home, outside) = home_and_outside();
+        let stowed = home.join("dotfiles/nvim/.config/nvim");
+        std::fs::create_dir_all(&stowed).unwrap();
+        std::fs::write(stowed.join("init.lua"), "-- in").unwrap();
+        std::fs::create_dir_all(home.join(".config")).unwrap();
+        std::os::unix::fs::symlink("../dotfiles/nvim/.config/nvim", home.join(".config/nvim"))
+            .unwrap();
+        let home_fd = open_dir(&home).unwrap();
+
+        let init = resolve(home_fd.as_fd(), HOME, Path::new(".config/nvim/init.lua")).unwrap();
+        assert_eq!(identity(&init), identity_of(&stowed.join("init.lua")));
+
+        let plugins = Path::new(".config/nvim/lua/plugins");
+        create_beneath(&home, HOME, plugins, false, b"").unwrap();
+        assert!(
+            stowed.join("lua/plugins").is_dir(),
+            "made where the link leads"
+        );
+        let lazy = Path::new(".config/nvim/lazy.json");
+        create_beneath(&home, HOME, lazy, true, b"{}").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(stowed.join("lazy.json")).unwrap(),
+            "{}"
+        );
+
+        let rel = Path::new(".config/nvim/after/ftplugin");
+        let made = resolve_or_create(home_fd.as_fd(), HOME, rel, false).unwrap();
+        assert_eq!(
+            identity(&made),
+            identity_of(&stowed.join("after/ftplugin")),
+            "a missing mount point under the stow link is made in the home, where it leads"
+        );
+
+        std::os::unix::fs::symlink("../../outside", home.join(".config/out")).unwrap();
+        let err = create_beneath(&home, HOME, Path::new(".config/out/new"), false, b"");
+        let err = err.unwrap_err();
+        assert!(
+            matches!(why(&err, ".config/out"), Why::LinkClimbs { .. }),
+            "{err}"
+        );
+        assert!(!outside.join("new").exists(), "nothing was made outside");
+    }
+
+    /// A file patch whose path is a dangling link that stays in the home
+    /// (`~/.c.json -> .dotfiles/c.json`, target missing): the daemon makes
+    /// the link's target in the home, the missing directory on the way
+    /// included, and the patch then resolves through the link. A missing
+    /// mount point that is such a link is made the same way.
+    #[test]
+    fn a_dangling_link_in_the_home_gets_its_target_made_in_the_home() {
+        let (_root, home, _outside) = home_and_outside();
+        std::os::unix::fs::symlink(".dotfiles/c.json", home.join(".c.json")).unwrap();
+        std::os::unix::fs::symlink("x/d.json", home.join(".d.json")).unwrap();
+        let home_fd = open_dir(&home).unwrap();
+
+        create_beneath(&home, HOME, Path::new(".c.json"), true, b"{}").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(home.join(".dotfiles/c.json")).unwrap(),
+            "{}",
+            "the link's target, made in the home"
+        );
+        let link = home.join(".c.json").symlink_metadata().unwrap();
+        assert!(link.is_symlink(), "the link is left as it is");
+        let source = resolve(home_fd.as_fd(), HOME, Path::new(".c.json")).unwrap();
+        assert_eq!(
+            identity(&source),
+            identity_of(&home.join(".dotfiles/c.json")),
+            "the patch resolves through the link to what was made"
+        );
+
+        let point = resolve_or_create(home_fd.as_fd(), HOME, Path::new(".d.json"), true).unwrap();
+        assert_eq!(
+            identity(&point),
+            identity_of(&home.join("x/d.json")),
+            "a dangling mount point gets its target made, as a file"
         );
     }
 
@@ -1041,21 +1543,21 @@ mod tests {
     #[test]
     fn create_beneath_makes_the_missing_path_in_the_home() {
         let (_root, home, _outside) = home_and_outside();
-        create_beneath(&home, Path::new("a/b/c"), false, b"").unwrap();
+        create_beneath(&home, HOME, Path::new("a/b/c"), false, b"").unwrap();
         assert!(home.join("a/b/c").is_dir());
-        create_beneath(&home, Path::new("cfg/app.json"), true, b"{}").unwrap();
+        create_beneath(&home, HOME, Path::new("cfg/app.json"), true, b"{}").unwrap();
         assert_eq!(
             std::fs::read_to_string(home.join("cfg/app.json")).unwrap(),
             "{}"
         );
-        create_beneath(&home, Path::new("cfg/app.json"), true, b"[]").unwrap();
+        create_beneath(&home, HOME, Path::new("cfg/app.json"), true, b"[]").unwrap();
         assert_eq!(
             std::fs::read_to_string(home.join("cfg/app.json")).unwrap(),
             "{}",
             "a file already there is left as it is"
         );
         std::os::unix::fs::symlink("a", home.join("in")).unwrap();
-        create_beneath(&home, Path::new("in/made"), false, b"").unwrap();
+        create_beneath(&home, HOME, Path::new("in/made"), false, b"").unwrap();
         assert!(
             home.join("a/made").is_dir(),
             "a link that stays in the home is followed"
@@ -1069,17 +1571,21 @@ mod tests {
         std::os::unix::fs::symlink("../outside", home.join("r")).unwrap();
         std::os::unix::fs::symlink(outside.join("made.json"), home.join("dangling.json")).unwrap();
 
-        for path in ["l/new", "r/new"] {
-            let err = create_beneath(&home, Path::new(path), false, b"").unwrap_err();
-            assert_eq!(err.raw_os_error(), Some(libc::EXDEV), "{path}");
+        std::os::unix::fs::symlink("../outside/rel.json", home.join("dangling-rel.json")).unwrap();
+
+        for path in ["l/new", "r/new", "dangling.json", "dangling-rel.json"] {
+            let err = create_beneath(&home, HOME, Path::new(path), true, b"{}").unwrap_err();
+            assert_eq!(errno_of(&err), Some(libc::EXDEV), "{path}: {err}");
         }
-        create_beneath(&home, Path::new("dangling.json"), true, b"{}").unwrap();
         assert!(
-            !outside.join("new").exists() && !outside.join("made.json").exists(),
+            !outside.join("new").exists()
+                && !outside.join("made.json").exists()
+                && !outside.join("rel.json").exists(),
             "nothing was created outside the home"
         );
-        let err = create_beneath(&home, Path::new("x/../../outside/up"), false, b"").unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let err = create_beneath(&home, HOME, Path::new("x/../../outside/up"), false, b"");
+        let err = err.unwrap_err();
+        assert_eq!(why(&err, "x/../../outside/up"), &Why::Climbs);
         assert!(!outside.join("up").exists());
     }
 }

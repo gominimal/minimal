@@ -1939,7 +1939,7 @@ fn wait_at_start_gate(gate: std::os::fd::OwnedFd) {
 fn exit_child(what: &str, err: &std::io::Error, report: Option<&Path>) -> ! {
     write_closure_report(
         report,
-        &format!("failed {what} errno {}", err.raw_os_error().unwrap_or(0)),
+        &format!("failed {what} errno {}", session_bind::errno_of(err).unwrap_or(0)),
     );
     let msg = format!("minimal: sandbox: {what} failed: {err}\n");
     // SAFETY: `write` and `_exit` are async-signal-safe; `msg` outlives the
