@@ -740,6 +740,11 @@ pub struct BoxActor {
     /// and a retried stop writes this ending, not one it has no process
     /// left to observe.
     unrecorded_stop: Option<boxes::core::record::StopEnding>,
+
+    /// How the box ended, kept when its timeout (BOX-037) ended its
+    /// processes but could not write the `exited` record. While it is set,
+    /// [`Self::launch_host`] refuses, and a stop writes this ending.
+    unrecorded_exit: Option<boxes::core::record::ExitEnding>,
 }
 
 impl BoxActor {
@@ -812,6 +817,8 @@ impl BoxActor {
             composed_graph_names: None,
             // No stop has run yet.
             unrecorded_stop: None,
+            // No timeout has ended the box yet.
+            unrecorded_exit: None,
             // The same for the ports the box publishes at runtime: nothing is
             // live until a `min net expose` inside it lands (NET-044).
             live_ingress: Default::default(),
@@ -1718,7 +1725,8 @@ impl BoxActor {
             tracing::debug!(box_id = %box_id, "the host ended on a kill; the box is not ended here");
             return ControlFlow::Continue(());
         }
-        if self.has_live_host() || self.unrecorded_stop.is_some() {
+        if self.has_live_host() || self.unrecorded_stop.is_some() || self.unrecorded_exit.is_some()
+        {
             return ControlFlow::Continue(());
         }
         let ends = match self.held_spec().await {
@@ -1874,15 +1882,38 @@ impl BoxActor {
             return ControlFlow::Continue(());
         };
         let box_id = *self.record.id();
-        match self.record.record().await {
+        #[cfg(test)]
+        let read = if timeout_read_seam::fail_this_read(&box_id) {
+            Err(std::io::Error::other(
+                "injected timeout record-read failure",
+            ))
+        } else {
+            self.record.record().await
+        };
+        #[cfg(not(test))]
+        let read = self.record.record().await;
+        match read {
             Ok(record) if record.status == BoxState::Active => {}
             Ok(_) => return ControlFlow::Continue(()),
-            Err(error) => {
+            // The actor's own host runs, so the entrypoint runs: the box ends.
+            Err(error) if self.has_live_host() => {
                 tracing::warn!(
                     box_id = %box_id,
                     timeout_secs = deadline.secs,
                     %error,
-                    "the box ran past its timeout, but the record could not be read; the box is not ended"
+                    "the box ran past its timeout and the record could not be read; its host runs, so the box ends"
+                );
+            }
+            Err(error) => {
+                self.timeout_deadline = Some(TimeoutDeadline {
+                    at: tokio::time::Instant::now() + EXIT_RECORD_RETRY_BACKOFF,
+                    secs: deadline.secs,
+                });
+                tracing::warn!(
+                    box_id = %box_id,
+                    timeout_secs = deadline.secs,
+                    %error,
+                    "the box ran past its timeout and the record could not be read; the timeout is tried again"
                 );
                 return ControlFlow::Continue(());
             }
@@ -2062,11 +2093,19 @@ impl BoxActor {
                 // A box stopped before its timeout ends `stopped`, never
                 // `exited` with `reason = "timeout"`.
                 self.timeout_deadline = None;
+                let kept_exit = self.unrecorded_exit.is_some();
                 let stopped = self.stop_box(force, grace).await;
                 // NET-128 fail-closed, as the `Stop` arm: the processes are
                 // dead whether or not the record write succeeded, so the
                 // name no longer answers for the box.
                 self.mark_name_stopped().await;
+                if stopped.is_err() && kept_exit && self.unrecorded_exit.is_none() {
+                    // The stop wrote the kept timeout ending (BOX-037). The
+                    // box is `exited`, and the manager answers from its
+                    // record. No actor hosts an ended box (#2393).
+                    let _ = reply.send(stopped);
+                    return ControlFlow::Break(Teardown::SelfInitiated);
+                }
                 if stopped.is_err() {
                     // The record is not `stopped` yet. The actor keeps
                     // hosting the box, so a retried stop can finish it.
@@ -2376,6 +2415,41 @@ pub(crate) mod exit_record_seam {
 
     /// Whether this write for `id` fails, using up one injected failure.
     pub(super) fn fail_this_write(id: &SessionId) -> bool {
+        let mut failing = FAILING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match failing.as_mut().and_then(|f| f.get_mut(id)) {
+            Some(left) if *left > 0 => {
+                *left -= 1;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The test seam for the record read of a timeout (BOX-037): a test makes
+/// the next reads for a box fail, as [`exit_record_seam`] fails a write.
+#[cfg(test)]
+pub(crate) mod timeout_read_seam {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use boxes::SessionId;
+
+    static FAILING: Mutex<Option<HashMap<SessionId, u32>>> = Mutex::new(None);
+
+    /// Makes the next `n` timeout record reads for `id` fail.
+    pub(crate) fn fail_next_reads(id: SessionId, n: u32) {
+        FAILING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(id, n);
+    }
+
+    /// Whether this read for `id` fails, using up one injected failure.
+    pub(super) fn fail_this_read(id: &SessionId) -> bool {
         let mut failing = FAILING
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);

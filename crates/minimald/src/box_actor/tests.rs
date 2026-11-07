@@ -17555,3 +17555,116 @@ async fn resumed_box_gets_its_full_timeout_again() {
         "{exited:?}"
     );
 }
+
+// BOX-037: a timeout whose record read fails still ends the box. The
+// actor's own host runs the entrypoint, so the box is active, and the
+// record ends `exited` with `reason = "timeout"`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timeout_record_read_failure_still_ends_box_reason_timeout() {
+    use boxes::core::record::{ExitEnding, RecordState};
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_task_box_with_timeout(
+        &mut client,
+        &["/bin/sh", "-c", "while :; do sleep 0.05; done"],
+        1,
+    )
+    .await;
+    crate::box_actor::timeout_grace_seam::set(id, Duration::from_millis(300));
+    crate::box_actor::timeout_read_seam::fail_next_reads(id, 1);
+    let manager = server.state.sessions_manager().await;
+    manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves")
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active box launches its entrypoint");
+
+    let record = record_once_exited(&manager, id).await;
+    assert_eq!(
+        record.state().unwrap(),
+        RecordState::Exited(ExitEnding::Timeout)
+    );
+    let exited = exited_events(&server, id).await;
+    assert_eq!(exited.len(), 1, "{exited:?}");
+    assert_eq!(exited[0].data["reason"], "timeout");
+}
+
+// BOX-037, BOX-013: a timeout that ends the box's processes and cannot
+// write the `exited` record keeps its ending on the actor. A resume is
+// refused while it is unrecorded, and a later stop writes `exited` with
+// `reason = "timeout"`, not a `stopped` ending.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timeout_record_write_failure_refuses_resume_and_stop_keeps_timeout() {
+    use boxes::core::record::{ExitEnding, RecordState};
+
+    let log = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = create_task_box_with_timeout(
+        &mut client,
+        &["/bin/sh", "-c", "while :; do sleep 0.05; done"],
+        1,
+    )
+    .await;
+    crate::box_actor::timeout_grace_seam::set(id, Duration::from_millis(300));
+    // Every attempt of the timeout's write fails.
+    crate::box_actor::exit_record_seam::fail_next_writes(id, 5);
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::box_manager::BoxKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .expect("the box resolves");
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("an Active box launches its entrypoint");
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let contents = log.contents();
+            if contents.lines().any(|line| {
+                line.contains("the record could not be set to exited")
+                    && line.contains("attempts=")
+                    && line.contains(&id.to_string())
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the timeout's record write fails: {}", log.contents()));
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        RecordState::Running
+    );
+
+    assert!(
+        handle.ensure_host("tester".to_string()).await.is_err(),
+        "a resume launched while the timeout's ending was unrecorded"
+    );
+
+    let answer = manager
+        .stop_box_answer(id, false, Duration::from_secs(5))
+        .await
+        .expect("the stop answers");
+    assert!(
+        matches!(
+            answer,
+            crate::box_manager::StopAnswer::AlreadyExited(ExitEnding::Timeout)
+        ),
+        "{answer:?}"
+    );
+    assert_eq!(
+        read_record(&server, id).await.state().unwrap(),
+        RecordState::Exited(ExitEnding::Timeout)
+    );
+    let exited = exited_events(&server, id).await;
+    assert_eq!(exited.len(), 1, "{exited:?}");
+    assert_eq!(exited[0].data["reason"], "timeout");
+}

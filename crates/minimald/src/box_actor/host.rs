@@ -1115,6 +1115,18 @@ impl BoxActor {
         // BOX-013: a stop ended the box's processes and could not set its
         // record to `stopped`. The record still says running, so no launch
         // starts new processes in the box before the retried stop.
+        // BOX-037: the same for a timeout that ended the box's processes and
+        // could not set its record to `exited`.
+        if let Some(ending) = self.unrecorded_exit {
+            tracing::warn!(
+                box_id = %self.record.id(),
+                ending = ?ending,
+                "launch refused: the timeout ended the box and its record is not exited yet"
+            );
+            return Err(AttachError::LaunchRecordUnwritable(std::io::Error::other(
+                "this session ran past its timeout and ended, and its exited state is not saved yet",
+            )));
+        }
         if let Some(ending) = self.unrecorded_stop {
             tracing::warn!(
                 box_id = %self.record.id(),
@@ -2266,6 +2278,14 @@ impl BoxActor {
             BoxInner::Draft { .. } => None,
         };
         self.publish_host();
+        // BOX-037: the timeout ended the processes and could not write the
+        // `exited` record. `launch_host` refuses while it is unrecorded, so
+        // no process runs, and this stop writes the timeout's ending.
+        if launched.is_none()
+            && let Some(ending) = self.unrecorded_exit
+        {
+            return self.write_kept_exit(ending).await;
+        }
         let ending = match (self.unrecorded_stop, launched) {
             // An earlier stop ended the processes and could not write the
             // record. This one writes how they ended then. `launch_host`
@@ -2455,7 +2475,10 @@ impl BoxActor {
         self.mark_name_stopped().await;
 
         let ending = boxes::core::record::ExitEnding::Timeout;
+        // Kept until the write succeeds, as a stop keeps `unrecorded_stop`.
+        self.unrecorded_exit = Some(ending);
         self.write_exited_record(ending).await?;
+        self.unrecorded_exit = None;
         tracing::info!(
             box_id = %box_id,
             timeout_secs,
@@ -2465,6 +2488,33 @@ impl BoxActor {
         );
         self.write_exited_event(ending).await;
         Ok(sent)
+    }
+
+    /// Writes the `exited` record and event that a timeout (BOX-037) kept
+    /// on the actor when its own write failed. On success the box is
+    /// `exited`, not `stopped`, so this answers an error, and the stop's
+    /// caller answers from the record that the box already exited.
+    async fn write_kept_exit(
+        &mut self,
+        ending: boxes::core::record::ExitEnding,
+    ) -> Result<boxes::core::record::StopEnding, std::io::Error> {
+        let box_id = *self.record.id();
+        tracing::info!(
+            box_id = %box_id,
+            ending = ?ending,
+            "stop: the timeout ended the processes earlier; writing its exited record"
+        );
+        self.write_exited_record(ending).await?;
+        self.unrecorded_exit = None;
+        tracing::info!(
+            box_id = %box_id,
+            ending = ?ending,
+            "box exited: it ran past its timeout"
+        );
+        self.write_exited_event(ending).await;
+        Err(std::io::Error::other(
+            "the session already ended at its timeout",
+        ))
     }
 
     /// Sets the box's record to `stopped` with `ending`.
