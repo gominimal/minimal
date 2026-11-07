@@ -70,6 +70,14 @@ pub struct BoxSpec {
     pub lifetime: Lifetime,
     /// Whether the box runs its lifecycle hooks.
     pub hooks_enabled: bool,
+    /// Whether a resume of the box runs its `on_activate` hooks again
+    /// (BOX-028). Serialized as `execution.hooks_on_resume`, and left out
+    /// when `false`.
+    ///
+    /// The spec stores and round-trips this value, but the daemon does not
+    /// read this key yet. See <https://github.com/gominimal/minimal/issues/3111>,
+    /// the task that makes the daemon read it (BOX-028).
+    pub hooks_on_resume: bool,
     /// The box's network settings.
     pub network: SpecNetwork,
 }
@@ -176,12 +184,14 @@ impl BoxSpec {
     #[must_use]
     pub fn for_session(session: Option<&Session>, flags: SpecFlags) -> Self {
         let packages = session.map_or(&[][..], |s| s.packages.as_slice());
+        let hooks_on_resume = session.is_some_and(|s| hooks_on_resume(&s.extra));
         Self::build(
             boxes::SESSION_BOX_TYPE,
             DEFAULT_SESSION_ENTRY,
             packages,
             true,
             Entrypoint::Shell,
+            hooks_on_resume,
             flags,
         )
     }
@@ -203,6 +213,7 @@ impl BoxSpec {
             &task.packages,
             false,
             Entrypoint::for_task(name),
+            hooks_on_resume(&task.extra),
             flags,
         ))
     }
@@ -213,6 +224,7 @@ impl BoxSpec {
         packages: &[String],
         pty_enabled: bool,
         entrypoint: Entrypoint,
+        hooks_on_resume: bool,
         flags: SpecFlags,
     ) -> Self {
         let mut seen = std::collections::BTreeSet::new();
@@ -233,6 +245,7 @@ impl BoxSpec {
             // when the entrypoint returns.
             lifetime: Lifetime::UntilComplete,
             hooks_enabled: flags.hooks_enabled,
+            hooks_on_resume,
             network: SpecNetwork {
                 mode: flags.network,
                 policy: flags.policy,
@@ -246,6 +259,22 @@ impl BoxSpec {
     pub fn box_name(&self) -> &str {
         self.name.as_deref().unwrap_or(&self.entry)
     }
+}
+
+/// Whether an entry's own table sets `hooks_on_resume = true` (BOX-028).
+/// The entry tables keep the key among the ones they do not read
+/// themselves, so it is read from there.
+fn hooks_on_resume(extra: &std::collections::HashMap<String, toml::Value>) -> bool {
+    extra
+        .get("hooks_on_resume")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Whether a flag is unset: the test that leaves `hooks_on_resume` out of
+/// the bytes of a spec that does not set it.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// The serialized shape of a [`BoxSpec`], under the `box.toml` tables.
@@ -295,6 +324,9 @@ struct DocIo {
 struct DocExecution {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     exec: Option<Vec<String>>,
+    /// Absent from a spec that does not set it, which reads as `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    hooks_on_resume: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -365,6 +397,7 @@ impl From<BoxSpec> for SpecDoc {
                     Entrypoint::Shell => None,
                     Entrypoint::Exec(argv) => Some(argv),
                 },
+                hooks_on_resume: spec.hooks_on_resume,
             }),
             install: DocInstall {
                 packages: spec.packages,
@@ -379,6 +412,7 @@ impl From<BoxSpec> for SpecDoc {
 
 impl From<SpecDoc> for BoxSpec {
     fn from(doc: SpecDoc) -> Self {
+        let hooks_on_resume = doc.execution.as_ref().is_some_and(|e| e.hooks_on_resume);
         let entrypoint = match doc.execution {
             Some(execution) => execution.exec.map_or(Entrypoint::Shell, Entrypoint::Exec),
             None => Entrypoint::implied(&doc.box_table.box_type, &doc.entry),
@@ -394,6 +428,7 @@ impl From<SpecDoc> for BoxSpec {
             entrypoint,
             lifetime,
             hooks_enabled: doc.hooks_enabled,
+            hooks_on_resume,
             network: SpecNetwork {
                 mode: doc.network.mode,
                 policy: doc.network.policy,
@@ -448,6 +483,7 @@ mod tests {
                 entrypoint: Entrypoint::Shell,
                 lifetime: Lifetime::UntilComplete,
                 hooks_enabled: false,
+                hooks_on_resume: false,
                 network: SpecNetwork {
                     mode: boxes::NetworkMode::OwnIp,
                     policy: policy.clone(),
@@ -594,6 +630,57 @@ mod tests {
             .unwrap()
             .insert("restart".to_string(), true.into());
         assert!(toml::from_str::<BoxSpec>(&toml::to_string(&value).unwrap()).is_err());
+    }
+
+    // BOX-028: an entry that sets `hooks_on_resume = true` carries the key
+    // in its spec, as `execution.hooks_on_resume`.
+    #[test]
+    fn spec_carries_hooks_on_resume() {
+        let file: crate::File = toml::from_str(
+            r#"
+            [session]
+            hooks_on_resume = true
+
+            [tasks.lint]
+            exec = ["cargo", "clippy"]
+            hooks_on_resume = true
+
+            [tasks.plain]
+            exec = ["true"]
+            "#,
+        )
+        .unwrap();
+
+        let session = BoxSpec::for_session(file.session.as_ref(), SpecFlags::default());
+        assert!(session.hooks_on_resume);
+        let lint = BoxSpec::for_task("lint", &file.tasks["lint"], SpecFlags::default()).unwrap();
+        assert!(lint.hooks_on_resume);
+        let plain = BoxSpec::for_task("plain", &file.tasks["plain"], SpecFlags::default()).unwrap();
+        assert!(!plain.hooks_on_resume);
+        assert!(!BoxSpec::for_session(None, SpecFlags::default()).hooks_on_resume);
+
+        // The key writes as `execution.hooks_on_resume` and reads back.
+        for spec in [&session, &lint] {
+            let text = toml::to_string(spec).unwrap();
+            let value: toml::Value = toml::from_str(&text).unwrap();
+            assert_eq!(
+                value["execution"]["hooks_on_resume"].as_bool(),
+                Some(true),
+                "{text}"
+            );
+            assert_eq!(&toml::from_str::<BoxSpec>(&text).unwrap(), spec, "{text}");
+        }
+
+        // A spec that does not set it leaves the key out, so the bytes of a
+        // spec stored before the key existed stay the same and read as unset.
+        let text = toml::to_string(&plain).unwrap();
+        let value: toml::Value = toml::from_str(&text).unwrap();
+        assert!(
+            value["execution"].get("hooks_on_resume").is_none(),
+            "{text}"
+        );
+        assert!(value.get("hooks_on_resume").is_none(), "{text}");
+        assert_eq!(toml::from_str::<BoxSpec>(&text).unwrap(), plain);
     }
 
     // BOX-163: a box takes the spec's `[box] name`, else the entry's name.
