@@ -17,10 +17,10 @@ runtime_packages = [
     "git",
 ]
 
-[defaults]
+[defaults.task]
 state_key = "dev"
 
-[session]
+[defaults.session]
 packages = ["just", "shellcheck", "python", "cargo-nextest"]
 
 [tasks.build]
