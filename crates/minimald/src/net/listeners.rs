@@ -3154,6 +3154,12 @@ fn box_listening_ports(leader: u32, lease: Ipv4Addr) -> io::Result<HashSet<u16>>
 /// and moved beside the test's own. The test's listeners are the sockets
 /// it binds in its own process, so the box's surface is exactly those, and
 /// an assertion over all of the box's rows is an assertion over the test's.
+///
+/// The filter only ever drops ports. A future in-crate test whose box
+/// listener is held by another process — a child the test spawns, or a real
+/// box in its own network namespace — will see no listeners through this
+/// read; such a test must read [`listening_ports`] directly or hold the
+/// socket in the test process.
 #[cfg(test)]
 fn box_listening_ports(leader: u32, lease: Ipv4Addr) -> io::Result<HashSet<u16>> {
     let own = listening_ports_held_by(Path::new("/proc/self"), lease)?;

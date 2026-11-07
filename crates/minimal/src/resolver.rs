@@ -4660,10 +4660,7 @@ pub(crate) async fn host_answerer_read(reply: AnswererStatusReply) -> HostAnswer
 /// [`answerer_bound_at`]; a unit test passes its own answer, so a zone
 /// answerer some other daemon on the machine holds at the reply's port
 /// cannot decide the test's read.
-async fn host_answerer_read_probing<P, F>(
-    reply: AnswererStatusReply,
-    probe: P,
-) -> HostAnswererRead
+async fn host_answerer_read_probing<P, F>(reply: AnswererStatusReply, probe: P) -> HostAnswererRead
 where
     P: FnOnce(u16) -> F,
     F: std::future::Future<Output = bool>,
