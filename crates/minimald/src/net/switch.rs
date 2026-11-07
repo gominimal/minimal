@@ -9313,10 +9313,11 @@ pub(crate) mod tests {
         );
     }
 
-    /// A reply-flow record ends four ways, and only those: at the FIN or RST
-    /// of its own conversation (from either end), at its window's edge, and
-    /// at revocation — where session stop lands too, ending the records
-    /// with the relay.
+    /// A reply-flow record ends four ways, and only those: at the box's FIN
+    /// or an RST from either end of its own conversation, at its window's
+    /// edge, and at revocation — where session stop lands too, ending the
+    /// records with the relay. The client's FIN is a half-close and ends
+    /// nothing (`reply_record_survives_the_client_half_close`).
     #[tokio::test]
     async fn reply_records_end_on_fin_rst_timeout_and_revocation() {
         let mut harness = spawn_test_relay_with(&deny_all_with_published_ports(), |gate| {

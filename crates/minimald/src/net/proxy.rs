@@ -1137,11 +1137,13 @@ where
             upstream.write_all(head).await?;
             let relayed =
                 relay_exchange(&mut client, &mut upstream, buffered, body, is_upgrade).await;
-            // The exchange's end, beside the line that opened it: how many
-            // of the upstream's bytes reached the client, and the error that
-            // ended it, if one did. A client reading an empty reply then says
-            // which side was empty — an upstream that closed or reset before
-            // answering reads `to_client=0` with its error, not as silence.
+            // Diagnostic (790d), to demote to debug or drop before this goes
+            // upstream. The exchange's end, beside the line that opened it:
+            // how many of the upstream's bytes reached the client, and the
+            // error that ended it, if one did. A client reading an empty reply
+            // then says which side was empty — an upstream that closed or
+            // reset before answering reads `to_client=0` with its error, not
+            // as silence.
             match &relayed {
                 Ok(to_client) => {
                     tracing::info!(
@@ -1683,13 +1685,14 @@ async fn relay_exchange<C: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// Relays the upstream's response heads to `client` up to the final one, and
-/// returns whether the exchange switched protocols, with how many bytes it
-/// wrote to the client. Each interim `1xx` head (`100 Continue`, `103 Early
-/// Hints`) passes through as is; the final head's
-/// `Connection` is set to `close`, so the client never reuses this connection
-/// for a request this upstream must not see. A `101 Switching Protocols`
-/// answer to an `upgrade` request passes through unchanged and switches.
-/// Bytes buffered past the final head are written on untouched.
+/// returns whether the exchange switched protocols and how many bytes it wrote
+/// to the client: interim heads, the final head as rewritten, and any bytes
+/// read past it. Each interim `1xx` head (`100 Continue`, `103 Early Hints`)
+/// passes through as is; the final head's `Connection` is set to `close`, so
+/// the client never reuses this connection for a request this upstream must
+/// not see. A `101 Switching Protocols` answer to an `upgrade` request passes
+/// through unchanged and switches. Bytes buffered past the final head are
+/// written on untouched.
 ///
 /// # Errors
 ///
@@ -1699,7 +1702,7 @@ async fn relay_response_head<U, C>(
     upstream: &mut U,
     client: &mut C,
     upgrade: bool,
-) -> io::Result<bool>
+) -> io::Result<(bool, u64)>
 where
     U: AsyncRead + Unpin,
     C: AsyncWrite + Unpin,
