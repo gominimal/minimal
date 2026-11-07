@@ -135,20 +135,20 @@ logged() { if grep -q -- "$1" "$GH_STUB_LOG"; then ok "$2"; else bad "$2"; fi; }
 
 states "queued null" "error" "in_progress null" "completed success"
 expect 0 "passed" "polls through a failed read until the run passes" -- run_dispatch true
-logged 'inputs\[dry_run\]=true' \"passes dry_run=true\"
-logged 'inputs\[versioned\]=true' \"runs versioned\"
-logged 'ref=release/0.7.x' \"dispatches on the line\"
+logged 'inputs\[dry_run\]=true' "passes dry_run=true"
+logged 'inputs\[versioned\]=true' "runs versioned"
+logged 'ref=release/0.7.x' "dispatches on the line"
 
 states "completed failure"
 expect 1 "ended: failure" "a failed run fails" -- run_dispatch false
-logged 'inputs\[dry_run\]=false' \"passes dry_run=false\"
+logged 'inputs\[dry_run\]=false' "passes dry_run=false"
 
 states "completed cancelled"
 expect 1 "ended: cancelled" "a cancelled run fails" -- run_dispatch true
 
 states "completed success"
 expect 0 "passed" "restage reaches the run" -- run_dispatch false --restage true
-logged 'inputs\[restage\]=true' \"passes restage=true\"
+logged 'inputs\[restage\]=true' "passes restage=true"
 
 GH_STUB_TIP=def
 expect 1 "moved from abc to def" "a moved tip is not dispatched" -- run_dispatch false
@@ -157,7 +157,7 @@ GH_STUB_TIP=abc
 
 GH_STUB_RUN_SHA=def
 expect 1 "cancelled it" "a run on another commit is cancelled" -- run_dispatch false
-logged '/cancel' \"cancel was sent\"
+logged '/cancel' "cancel was sent"
 GH_STUB_RUN_SHA=abc
 
 export GH_STUB_RUN_ID=""
