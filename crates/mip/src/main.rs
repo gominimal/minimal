@@ -286,6 +286,9 @@ mod tests {
     #[test]
     fn mip_contexts_gate_task_patches_on_the_user_policy() {
         let config = base_config().with_no_fetch(true).build().unwrap();
-        assert_eq!(config.task_patch_policy(), &mctx::TaskPatchPolicy::UserPolicy);
+        assert_eq!(
+            config.task_patch_policy(),
+            &mctx::TaskPatchPolicy::UserPolicy
+        );
     }
 }

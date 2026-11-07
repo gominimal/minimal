@@ -676,13 +676,19 @@ mod tests {
         let d = t.dir("proj-cfg");
         std::os::unix::fs::symlink(&sec, d.join("to-secret")).unwrap();
         let rules = format!("[patches]\nallow = [\"{d}\"]\ndeny = [\"{sec}\", \"{sec}/**\"]\n");
-        assert_eq!(gate(&t, &dir_patch(&d), &policy(&rules)).unwrap(), dir_patch(&d));
+        assert_eq!(
+            gate(&t, &dir_patch(&d), &policy(&rules)).unwrap(),
+            dir_patch(&d)
+        );
         // With a deny that reaches inside, the walk runs and still judges the
         // link by its own path, which no rule denies.
         let rules = format!(
             "[patches]\nallow = [\"{d}\"]\ndeny = [\"{sec}\", \"{sec}/**\", \"{d}/*.pem\"]\n"
         );
-        assert_eq!(gate(&t, &dir_patch(&d), &policy(&rules)).unwrap(), dir_patch(&d));
+        assert_eq!(
+            gate(&t, &dir_patch(&d), &policy(&rules)).unwrap(),
+            dir_patch(&d)
+        );
     }
 
     /// Deny outranks allow: an allowed directory holding a denied file is
@@ -693,7 +699,9 @@ mod tests {
         let t = Tree::new();
         let d = t.dir("proj-cfg");
         let key = t.file("proj-cfg/nested/id.pem");
-        let pol = policy(&format!("[patches]\nallow = [\"{d}\"]\ndeny = [\"**/*.pem\"]\n"));
+        let pol = policy(&format!(
+            "[patches]\nallow = [\"{d}\"]\ndeny = [\"**/*.pem\"]\n"
+        ));
         let err = gate(&t, &dir_patch(&d), &pol).unwrap_err().to_string();
         assert!(err.contains("policy denied"), "{err}");
         assert!(err.contains(key.as_str()), "{err}");
@@ -720,7 +728,9 @@ mod tests {
         let t = Tree::new();
         t.file("home/.ssh/id_ed25519");
         let mut patches = EnvPatches::default();
-        patches.dir.insert("~/.ssh".to_owned(), PatchSetting::ReadOnly);
+        patches
+            .dir
+            .insert("~/.ssh".to_owned(), PatchSetting::ReadOnly);
         let pol = policy("[patches]\ndeny = [\"~/.ssh/**\"]\n");
         let err = gate(&t, &patches, &pol).unwrap_err().to_string();
         assert!(err.contains("policy denied"), "{err}");
@@ -762,7 +772,10 @@ mod tests {
         let t = Tree::new();
         let link = t.dir("ok").join("dangling");
         std::os::unix::fs::symlink(t.root.join("nowhere/at/all"), &link).unwrap();
-        let pol = policy(&format!("[patches]\nallow = [\"{}/**\"]\n", t.root.join("ok")));
+        let pol = policy(&format!(
+            "[patches]\nallow = [\"{}/**\"]\n",
+            t.root.join("ok")
+        ));
         let err = gate(&t, &file_patch(&link), &pol).unwrap_err().to_string();
         assert!(err.contains("does not resolve"), "{err}");
     }
