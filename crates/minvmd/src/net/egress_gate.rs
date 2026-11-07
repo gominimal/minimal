@@ -4255,7 +4255,10 @@ fn warn_interim_publish(limiter: &DropLimiter, decision: &ControlDecision) -> bo
 /// diagnostic bundle's log tail is read for. Returns whether a line was
 /// written.
 fn refuse_request(limiter: &DropLimiter, refused: &RefusedRequest) -> bool {
-    let what = refused.what.as_deref().unwrap_or("none");
+    let what = refused
+        .what
+        .as_deref()
+        .map_or(std::borrow::Cow::Borrowed("none"), loggable_what);
     match limiter.should_warn_at(refused.addr, refused.rule, Instant::now()) {
         WarnDecision::Silent => false,
         WarnDecision::Named => {
@@ -4280,6 +4283,33 @@ fn refuse_request(limiter: &DropLimiter, refused: &RefusedRequest) -> bool {
             true
         }
     }
+}
+
+/// How many bytes of a refused value's escaped form a refusal line carries
+/// ([`loggable_what`]): the daemon's own values — a port, a loopback
+/// listener, a switch address, the box zone, a record's name — are a few
+/// dozen bytes at most.
+const MAX_LOGGED_WHAT: usize = 120;
+
+/// A refused value as the refusal line names it. The value is the guest's:
+/// a field of a body the gate refused to summarize, up to
+/// [`MAX_CONTROL_BODY`] bytes of anything a JSON string can spell, newlines
+/// and control characters included, and the line writes it with `%`. A
+/// value of printable ASCII within [`MAX_LOGGED_WHAT`] — every value the
+/// daemon's own client sends — is written as it is, so the line reads the
+/// same as before; anything else is written escaped (`{:?}`), so it cannot
+/// break the line or forge another, and cut to the bound on a char boundary
+/// with a marker naming the value's full length, so it cannot flood the log.
+fn loggable_what(what: &str) -> std::borrow::Cow<'_, str> {
+    if what.len() <= MAX_LOGGED_WHAT && what.bytes().all(|b| b == b' ' || b.is_ascii_graphic()) {
+        return std::borrow::Cow::Borrowed(what);
+    }
+    let mut escaped = format!("{what:?}");
+    if escaped.len() > MAX_LOGGED_WHAT {
+        escaped.truncate(escaped.floor_char_boundary(MAX_LOGGED_WHAT));
+        escaped.push_str(&format!("... ({} bytes in all)", what.len()));
+    }
+    std::borrow::Cow::Owned(escaped)
 }
 
 /// The per-decision name dictionary's bound: name records are `u8` indices,
@@ -18774,6 +18804,145 @@ mod tests {
             ),
         )
         .await;
+    }
+
+    /// The zone-add body [`super::summarize_dns_add`] refuses for its zone:
+    /// one record the row holds, under `zone`.
+    fn zone_add_in(zone: &str) -> String {
+        serde_json::json!({
+            "name": zone,
+            "records": [{"name": "web", "ip": "100.64.0.9"}],
+        })
+        .to_string()
+    }
+
+    /// inbox#1180 review: a refused value is the guest's, up to a body's
+    /// bound of anything a JSON string spells, so the refusal line names it
+    /// bounded and escaped. Every value the daemon's own client sends is
+    /// named as it is; a zone name carrying a newline or another control
+    /// character is named escaped, so it cannot break the line or forge one;
+    /// a name as long as a body can carry is cut to the bound on a char
+    /// boundary, with a marker naming its full length.
+    #[test]
+    fn a_refused_zone_name_is_named_bounded_and_escaped() {
+        use std::borrow::Cow;
+        use super::{MAX_LOGGED_WHAT, loggable_what};
+        for plain in [
+            "port 9999",
+            "127.0.0.2:8080",
+            "100.64.0.9",
+            "min.internal.",
+            "name \"web\"",
+            "",
+        ] {
+            assert!(
+                matches!(loggable_what(plain), Cow::Borrowed(named) if named == plain),
+                "{plain:?} is named as it is"
+            );
+        }
+        let refused = |zone: &str| {
+            let mut dictionary = Vec::new();
+            match super::summarize_dns_add(zone_add_in(zone).as_bytes(), &mut dictionary) {
+                Err(refused) => refused,
+                Ok(_) => panic!("a zone-add in {zone:?} summarized"),
+            }
+        };
+
+        // A newline: the refusal keeps the name, and its line names it escaped.
+        let forged = "evil.\nWARN refused nothing rule_matched=\"forged\"";
+        let refusal = refused(forged);
+        assert_eq!(refusal.rule, MALFORMED_PUBLISH_RULE);
+        assert_eq!(
+            refusal.what.as_deref(),
+            Some(forged),
+            "the refusal keeps the name"
+        );
+        let named = loggable_what(forged);
+        assert_eq!(
+            named,
+            format!("{forged:?}"),
+            "within the bound it is escaped whole"
+        );
+        assert!(
+            !named.contains('\n'),
+            "an escaped name has no newline: {named:?}"
+        );
+        for control in ["\r", "\u{0}", "\u{1b}", "\u{7f}", "\u{85}", "\u{2028}"] {
+            let name = format!("web{control}min.internal.");
+            let named = loggable_what(&name);
+            assert!(
+                !named.chars().any(|c| c.is_control() || c == '\u{2028}'),
+                "{name:?} is named with no raw control character: {named:?}"
+            );
+        }
+
+        // A long name: cut to the bound, marked with the name's full length.
+        let long = format!("{}.", "a".repeat(7000));
+        let refusal = refused(&long);
+        assert_eq!(
+            refusal.what.as_deref(),
+            Some(long.as_str()),
+            "the refusal keeps the name"
+        );
+        let named = loggable_what(&long);
+        let marker = format!("... ({} bytes in all)", long.len());
+        assert!(named.ends_with(&marker), "the cut is marked: {named:?}");
+        assert_eq!(
+            named.len(),
+            MAX_LOGGED_WHAT + marker.len(),
+            "the name is cut to the bound"
+        );
+        assert!(
+            named.starts_with("\"aaa"),
+            "the cut keeps the name's head: {named:?}"
+        );
+
+        // A cut inside a multi-byte character lands on its boundary, at every
+        // offset the bound can fall on.
+        for run in 0..=MAX_LOGGED_WHAT {
+            let name = format!("{}日{}", "x".repeat(run), "é".repeat(MAX_LOGGED_WHAT));
+            let named = loggable_what(&name);
+            let marker = format!("... ({} bytes in all)", name.len());
+            assert!(
+                named.len() <= MAX_LOGGED_WHAT + marker.len(),
+                "a {}-byte name is named within the bound, got {} bytes",
+                name.len(),
+                named.len()
+            );
+        }
+    }
+
+    /// The same two names through the gate: the refusal line is written,
+    /// names the zone escaped and bounded, and the guest's bytes reach the
+    /// log neither raw nor whole.
+    #[tokio::test]
+    async fn a_refused_zone_name_cannot_break_or_flood_the_refusal_line() {
+        let forged = "evil.\nforged=line".to_string();
+        let escaped = r#"port_or_name="evil.\nforged=line""#.to_string();
+        let long = format!("{}.", "a".repeat(7000));
+        let marker = format!("... ({} bytes in all)", long.len());
+        for (zone, needle) in [(forged, escaped), (long, marker)] {
+            let registry = BoxRegistry::new(SUBNET);
+            tcp_lan_box(&registry, LEASE);
+            let h = gate_connected(registry).await;
+            let (mut guest, _switch) = connect_control(&h).await;
+            let request = daemon_request("/services/dns/add", zone_add_in(&zone).as_bytes());
+            guest
+                .write_all(&request)
+                .await
+                .expect("writing the zone-add");
+            wait_for_log(&h.log, &needle).await;
+            let logged = h.log.contents();
+            assert!(
+                !logged.contains(zone.as_str()),
+                "the refused name never reaches the log raw, got: {logged}"
+            );
+            assert!(
+                !logged.lines().any(|line| line.starts_with("forged=line")),
+                "no line of the log is the guest's, got: {logged}"
+            );
+            expect_teardown(&mut guest).await;
+        }
     }
 
     /// Speaks `request` on a fresh control connection and answers it from
