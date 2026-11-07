@@ -1519,7 +1519,7 @@ impl BoxActor {
         // box goes back to the state it resumed from.
         tracing::Span::current().record("hooks_on_resume", hooks_on_resume);
         if hooks_on_resume
-            && let Err(why) = self.rerun_activate_hooks().await
+            && let Err(why) = self.rerun_activate_hooks(&name).await
         {
             self.stop_running(false).await;
             if let Err(restore_error) = self.record.write(record.clone()).await {
@@ -1545,9 +1545,27 @@ impl BoxActor {
     /// `hooks_on_resume` (BOX-028), on a host launched for them. The attach
     /// that follows reuses that host. Each run and its outcome is logged,
     /// and the `box.resume` span records how many ran. Answers the refusal
-    /// text when the launch or a hook fails.
-    async fn rerun_activate_hooks(&mut self) -> Result<(), String> {
+    /// text when the launch or a hook fails, and when the box has no
+    /// composition to read its hooks from.
+    async fn rerun_activate_hooks(&mut self, name: &str) -> Result<(), String> {
         let event = crate::hooks::HookEvent::Activate;
+        // A box with no composition (its sidecar is missing or unreadable)
+        // can declare an `on_activate` the daemon cannot see. A resume
+        // without it breaks the spec's promise, so it is refused.
+        if let BoxInner::Active {
+            composition: None, ..
+        } = &self.inner
+        {
+            tracing::info!(
+                refusal = "hooks",
+                "resume: hooks_on_resume is set, and the box has no composition to read its hooks from"
+            );
+            return Err(format!(
+                "The daemon cannot read its hook settings. Destroy it with \
+                 `min session destroy {name}`, then start a new one with \
+                 `min session activate`."
+            ));
+        }
         if !self.has_hooks_for(event) {
             tracing::Span::current().record("activate_hooks", 0);
             tracing::info!("resume: hooks_on_resume is set, and the box has no on_activate hook");

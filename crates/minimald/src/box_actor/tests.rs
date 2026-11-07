@@ -16398,6 +16398,52 @@ async fn hooks_on_resume_failing_on_activate_refuses_resume_keeps_state() {
     .await;
 }
 
+/// BOX-028: a `hooks_on_resume` box whose composition sidecar is gone
+/// cannot show the daemon its `on_activate` hooks. The resume is refused,
+/// names the commands that start over, and the box stays stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hooks_on_resume_missing_composition_refuses_resume_keeps_state() {
+    use boxes::core::record::RecordState;
+
+    let dir = tempfile::tempdir().unwrap();
+    let activated = dir.path().join("activated");
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = session_with_hook(
+        &mut client,
+        "resume-blind",
+        boxes::wire::primitives::WireLifecycleHook {
+            on_activate: Some(inline(format!("echo ran >> {}", activated.display()))),
+            ..Default::default()
+        },
+    )
+    .await;
+    rewrite_spec(&server, id, &hooks_on_resume_spec()).await;
+    let ending = stop_through_daemon(&server, id).await;
+    std::fs::remove_file(record_dir(&server, id).await.join("composition.json"))
+        .expect("the composition sidecar exists to delete");
+
+    assert_resume_refused(
+        &server,
+        &mut client,
+        id,
+        RecordState::Stopped(ending),
+        &[
+            "session `resume-blind` cannot resume, and it stays stopped. \
+           The daemon cannot read its hook settings. Destroy it with \
+           `min session destroy resume-blind`, then start a new one with \
+           `min session activate`.",
+        ],
+        1,
+    )
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(&activated).unwrap(),
+        "ran\n",
+        "on_activate did not run on the refused resume"
+    );
+}
+
 /// Reads the box's record until its state is `exited`, or panics after ten
 /// seconds.
 async fn record_once_exited(
