@@ -334,8 +334,8 @@ pub(crate) async fn release_held_name_after_attach(
 ) {
     match attached_box_record(sock, id).await {
         Ok(None) => match box_addresses {
-            // The record carries no box id, so the pair is the proof.
-            Some(addresses) => withdraw_box_row_with_vm_host(sock, name, addresses).await,
+            // The record is gone, so the pair is the proof.
+            Some(addresses) => withdraw_box_row_with_vm_host(sock, name, addresses, None).await,
             None => {
                 retire_host_ip_box_with_vm_host(
                     control_sock_beside(sock),
@@ -505,18 +505,21 @@ pub(crate) fn holds_name(record: &boxes::Record) -> bool {
 
 /// Withdraws a box's host row (T66) on the VM host daemon beside `sock`,
 /// off the async worker: the control exchange is a blocking socket call.
-/// The pair comes off the session record, which carries no box id, so the
-/// pair is the withdrawal's proof. `min session attach`'s post-attach
-/// release and the dashboard's destroy both go through this, so a change to
-/// the call (a timeout, a box id) reaches both.
+/// The pair comes off the session record, and so does the box id beside it
+/// where the caller holds the record: the id is what proves a session
+/// renamed since its registration, whose row the host keeps under the old
+/// name (#1116). `None` keeps the pair proof alone. `min session attach`'s
+/// post-attach release and the dashboard's destroy both go through this, so
+/// a change to the call (a timeout) reaches both.
 pub(crate) async fn withdraw_box_row_with_vm_host(
     sock: &std::path::Path,
     name: &str,
     addresses: boxes::BoxAddresses,
+    box_id: Option<boxes::BoxId>,
 ) {
     let (sock, name) = (sock.to_path_buf(), name.to_string());
     if let Err(error) = tokio::task::spawn_blocking(move || {
-        minimal_client::attach::withdraw_box_row_beside(&sock, &name, addresses, None);
+        minimal_client::attach::withdraw_box_row_beside(&sock, &name, addresses, box_id);
     })
     .await
     {

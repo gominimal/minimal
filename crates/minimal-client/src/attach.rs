@@ -689,7 +689,8 @@ pub fn host_ip_box_at(
 /// them to its hand-out books. `box_id` is the id the registration handed
 /// back beside the pair, where the caller still holds it: the daemon then
 /// withdraws only that box, never a newer one handed the same name and pair
-/// after the quarantine. `None` — a session record carries no id — is the
+/// after the quarantine, and proves a session renamed since its
+/// registration (#1116). `None` — a record that predates the id — is the
 /// pair proof alone.
 ///
 /// Best-effort and blocking: a withdrawal that cannot be made — the socket

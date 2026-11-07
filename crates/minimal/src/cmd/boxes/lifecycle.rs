@@ -169,21 +169,24 @@ pub(crate) async fn destroy_all_boxes(
     let mut failures = 0;
     for session in sessions {
         // The record carries the pair the box's registration handed back
-        // (T66), which the destroy-side withdrawal presents; a session that
-        // registered no box holds none, and the withdrawal stays silent for
-        // it. A record the daemon cannot answer destroys the session all the
-        // same — nothing is left on this path to withdraw the row by.
-        let box_addresses = get_session_record(client, &session.id.to_string())
+        // (T66), and the box id beside it, which the destroy-side withdrawal
+        // presents; a session that registered no box holds none, and the
+        // withdrawal stays silent for it. A record the daemon cannot answer
+        // destroys the session all the same — nothing is left on this path
+        // to withdraw the row by.
+        let record = get_session_record(client, &session.id.to_string())
             .await
             .ok()
-            .and_then(|resp| resp.record)
-            .and_then(|record| record.box_addresses);
+            .and_then(|resp| resp.record);
+        let box_addresses = record.as_ref().and_then(|record| record.box_addresses);
+        let box_id = record.as_ref().and_then(|record| record.box_id);
         if let Err(error) = destroy_box(
             client,
             global,
             session.id,
             session.name.as_deref(),
             box_addresses,
+            box_id,
             force,
         )
         .await
@@ -210,6 +213,7 @@ pub(crate) async fn destroy_box(
     id: boxes::SessionId,
     name: Option<&str>,
     box_addresses: Option<boxes::BoxAddresses>,
+    box_id: Option<boxes::BoxId>,
     force: bool,
 ) -> Result<(), anyhow::Error> {
     use minimald_rpc::{DestroySession, DestroySessionRequest};
@@ -236,15 +240,20 @@ pub(crate) async fn destroy_box(
             }
             // The session is gone; the row its activation bought outlives it on
             // the VM host daemon, and its creator withdraws it here (T66) —
-            // presenting the pair the registration handed back. Best-effort: a
-            // withdrawal that cannot be made leaves the row published and warns
-            // rather than failing a destroy that already succeeded.
+            // presenting the pair the registration handed back and the box id
+            // beside it. The id is what proves a session renamed since its
+            // registration: the host keeps the row under the name it was
+            // registered by (#1116). The id goes only with a pair: a box with
+            // no row withdraws nothing here. Best-effort: a withdrawal that
+            // cannot be made leaves the row published and warns rather than
+            // failing a destroy that already succeeded.
             // A box that registered no row held its name in the zone instead
             // (`host_ip`); the same destroy releases it, best-effort the same
             // way.
             let control_sock =
                 vm_host_control_sock(daemon_host_kind(global), global.minimal_dir.as_deref());
-            withdraw_box_row(control_sock.clone(), name, box_addresses, None).await;
+            let row_id = box_addresses.and(box_id);
+            withdraw_box_row(control_sock.clone(), name, box_addresses, row_id).await;
             release_held_box_name(control_sock, id, name, box_addresses).await;
         }
         minimald_rpc::Errorable::Err { error } => {
@@ -838,7 +847,8 @@ pub async fn cmd_box_rm(global: &GlobalArgs, args: BoxRmArgs) -> Result<(), anyh
     // kept the box, which need not be the selected one.
     let control_sock = box_host_control_sock(&host);
     let name = removed.name.as_deref();
-    withdraw_box_row(control_sock.clone(), name, removed.box_addresses, None).await;
+    let row_id = removed.box_addresses.and(removed.box_id);
+    withdraw_box_row(control_sock.clone(), name, removed.box_addresses, row_id).await;
     release_held_box_name(control_sock, removed.id, name, removed.box_addresses).await;
     // The line goes last, so a closed stdout cannot skip the cleanup above.
     writeln!(std::io::stdout().lock(), "Removed {}.", args.target)?;
@@ -852,6 +862,9 @@ pub(crate) struct RemovedBox {
     pub(crate) id: boxes::SessionId,
     pub(crate) name: Option<String>,
     pub(crate) box_addresses: Option<boxes::BoxAddresses>,
+    /// The id the box's registration handed back beside the pair, which
+    /// the withdrawal presents so a renamed box's row is still its own.
+    pub(crate) box_id: Option<boxes::BoxId>,
 }
 
 /// Resolves the address `target` over `hosts` and reaps that box on the
@@ -891,13 +904,15 @@ pub(crate) async fn rm_listed_box(
         return Err(refusal());
     }
     // The record carries the pair the box's registration handed back,
-    // which the withdrawal after the reap presents. A record the daemon
-    // cannot answer reaps the box all the same.
-    let box_addresses = get_session_record(client, &id.to_string())
+    // and the box id beside it, which the withdrawal after the reap
+    // presents. A record the daemon cannot answer reaps the box all the
+    // same.
+    let record = get_session_record(client, &id.to_string())
         .await
         .ok()
-        .and_then(|resp| resp.record)
-        .and_then(|record| record.box_addresses);
+        .and_then(|resp| resp.record);
+    let box_addresses = record.as_ref().and_then(|record| record.box_addresses);
+    let box_id = record.as_ref().and_then(|record| record.box_id);
     let name = listing
         .iter()
         .find(|entry| entry.box_id == id)
@@ -926,6 +941,7 @@ pub(crate) async fn rm_listed_box(
         id,
         name,
         box_addresses,
+        box_id,
     })
 }
 
@@ -1274,7 +1290,13 @@ pub(crate) async fn prune_host(
                     .await
                     .ok()
                     .and_then(|resp| resp.record);
-                addresses.insert(entry.box_id, record.and_then(|r| r.box_addresses));
+                addresses.insert(
+                    entry.box_id,
+                    (
+                        record.as_ref().and_then(|r| r.box_addresses),
+                        record.as_ref().and_then(|r| r.box_id),
+                    ),
+                );
             }
         }
     }
@@ -1289,8 +1311,9 @@ pub(crate) async fn prune_host(
     let control_sock = box_host_control_sock(host);
     for entry in &pruned.reaped {
         let name = entry.name.as_deref();
-        let box_addresses = addresses.get(&entry.box_id).copied().flatten();
-        withdraw_box_row(control_sock.clone(), name, box_addresses, None).await;
+        let (box_addresses, box_id) = addresses.get(&entry.box_id).copied().unwrap_or_default();
+        let row_id = box_addresses.and(box_id);
+        withdraw_box_row(control_sock.clone(), name, box_addresses, row_id).await;
         release_held_box_name(control_sock.clone(), entry.box_id, name, box_addresses).await;
     }
     write_prune_lines(out, &pruned)?;
@@ -1341,19 +1364,19 @@ mod tests {
         let global = GlobalArgs::default();
 
         // The first destroy wins the race.
-        destroy_box(&mut client, &global, id, Some("web"), None, false)
+        destroy_box(&mut client, &global, id, Some("web"), None, None, false)
             .await
             .expect("the first destroy succeeds");
 
         // The loser is told the session is already gone: under `--force`
         // that is the goal state, reported and not a failure.
-        destroy_box(&mut client, &global, id, Some("web"), None, true)
+        destroy_box(&mut client, &global, id, Some("web"), None, None, true)
             .await
             .expect("a forced destroy of a destroyed session succeeds");
 
         // Without `--force` the same answer is an error — one that names
         // the session rather than forwarding the daemon's internals.
-        let err = destroy_box(&mut client, &global, id, Some("web"), None, false)
+        let err = destroy_box(&mut client, &global, id, Some("web"), None, None, false)
             .await
             .expect_err("an unforced destroy of a destroyed session fails");
         assert!(
