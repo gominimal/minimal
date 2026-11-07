@@ -119,8 +119,11 @@ pub(crate) fn render_box_show(
         ));
         lines.push(("Signal", or_none(record.signal.map(|s| s.to_string()))));
         // BCLI-006: the disk a reap of the box frees. The daemon gives it
-        // only for a stopped or exited box, and `-` means it did not.
-        lines.push(("Disk", or_none(shown.disk_bytes.map(format_disk))));
+        // only for a stopped or exited box. With no figure the row is left
+        // out, because `-` there tells the person nothing.
+        if let Some(bytes) = shown.disk_bytes {
+            lines.push(("Disk", format_disk(bytes)));
+        }
     }
     lines.push(("Identity", identity.to_string()));
     lines.push(("Provider", provider.to_string()));
