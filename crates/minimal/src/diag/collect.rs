@@ -2011,6 +2011,7 @@ mod tests {
             upload: false,
             portal: crate::diag::PortalArgs {
                 context: None,
+                security: false,
                 endpoint: crate::diag::upload::DEFAULT_ENDPOINT.to_owned(),
             },
         };
