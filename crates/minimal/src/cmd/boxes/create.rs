@@ -222,13 +222,14 @@ impl std::fmt::Display for SessionEntryUndecided {
                     write!(
                         f,
                         "Set type = \"session\" in the entry \"{name}\", or rename that entry \
-                         and add a [sessions.<name>] entry to {file}."
+                         and add a [sessions.default] entry to {file}."
                     )
                 } else {
                     write!(
                         f,
                         "If \"{name}\" is the session to start, set type = \"session\" in it. \
-                         Otherwise, rename the session entry to start to \"default\" in {file}."
+                         Otherwise, name the session entry to start \"default\", or add a \
+                         [sessions.default] entry to {file}."
                     )
                 }
             }
@@ -5146,7 +5147,8 @@ mod tests {
             "Cannot start the box: the project's minimal.toml declares the entry \"dev\" \
              with the type \"devbox\", so the start cannot tell whether it is a session entry. \
              If \"dev\" is the session to start, set type = \"session\" in it. \
-             Otherwise, rename the session entry to start to \"default\" in minimal.toml."
+             Otherwise, name the session entry to start \"default\", or add a \
+             [sessions.default] entry to minimal.toml."
         );
         let refusal = project_egress_from(
             b"[defaults.network.egress]\nallow_dns_hosts = [\"a.example\"]\n\n\
@@ -5161,8 +5163,20 @@ mod tests {
             "Cannot start the box: the project's minimal.toml declares the entry \"default\" \
              with the type \"devbox\", so the start cannot tell whether it is a session entry. \
              Set type = \"session\" in the entry \"default\", or rename that entry \
-             and add a [sessions.<name>] entry to minimal.toml."
+             and add a [sessions.default] entry to minimal.toml."
         );
+
+        // The fix the refusal names works: a `[sessions.default]` entry
+        // beside the unresolved entry is picked, and gives the egress.
+        let fixed = project_egress_from(
+            b"[defaults.network.egress]\nallow_dns_hosts = [\"a.example\"]\n\n\
+              [boxes.dev]\ntype = \"devbox\"\n\n\
+              [sessions.default]\npackages = [\"git\"]\n",
+        )
+        .expect("a [sessions.default] entry is picked over an unresolved entry")
+        .policy
+        .expect("the defaults layer declares egress");
+        assert_eq!(fixed.allow_dns_hosts, Some(vec!["a.example".to_owned()]));
 
         // Egress only in a project Box Type's defaults is still egress: an
         // undecided pick refuses the start rather than drop it.
