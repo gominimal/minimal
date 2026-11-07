@@ -204,6 +204,18 @@ jobs:
               with:
                   channel: unstable
 
+    conflict-markers:
+        # A draft backport commits its conflicts, so this keeps markers from
+        # merging. No `needs: changes`: a docs-only PR can carry markers too.
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Refuse conflict markers
+              run: scripts/check-conflict-markers.sh
+
     workflow-lint:
         # PR-side gate for workflow changes. Mirrors the actionlint + zizmor
         # steps of the nightly `hygiene` job in nightly-tests.yml (same image,
@@ -239,7 +251,7 @@ jobs:
     # on failure/cancellation.
     ci-success:
         if: always()
-        needs: [changes, fmt, clippy, dogfood, cargo-deny, minimal-check, workflow-lint]
+        needs: [changes, fmt, clippy, dogfood, cargo-deny, minimal-check, conflict-markers, workflow-lint]
         runs-on: ubuntu-latest
         timeout-minutes: 10
         steps:
