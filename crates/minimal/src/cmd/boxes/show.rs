@@ -118,6 +118,9 @@ pub(crate) fn render_box_show(
             or_none(record.exit_code.map(|c| c.to_string())),
         ));
         lines.push(("Signal", or_none(record.signal.map(|s| s.to_string()))));
+        // BCLI-006: the disk a reap of the box frees. The daemon gives it
+        // only for a stopped or exited box, and `-` means it did not.
+        lines.push(("Disk", or_none(shown.disk_bytes.map(format_disk))));
     }
     lines.push(("Identity", identity.to_string()));
     lines.push(("Provider", provider.to_string()));
@@ -130,4 +133,24 @@ pub(crate) fn render_box_show(
         writeln!(out, "{label:<11} {value}")?;
     }
     Ok(())
+}
+
+/// Formats a disk figure in bytes in the largest binary unit that keeps it
+/// at 1 or more, with one decimal above bytes: `512 B`, `4.0 KiB`,
+/// `1.5 GiB`.
+pub(crate) fn format_disk(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = UNITS[0];
+    for next in &UNITS[1..] {
+        if value < 1024.0 {
+            break;
+        }
+        value /= 1024.0;
+        unit = next;
+    }
+    format!("{value:.1} {unit}")
 }

@@ -10747,3 +10747,105 @@ fn ls_warning_clears_on_recovery_with_no_guest_port() {
         "the held VM keeps its cause:\n{across}"
     );
 }
+
+// BCLI-006: `min box show` reports the disk a stopped box holds, and
+// `min box prune --dry-run` lists each box it would remove with the disk
+// it holds and the sum, and removes nothing.
+#[tokio::test]
+async fn show_and_prune_dry_run_report_disk() {
+    use minimald_rpc::{Errorable, ShowBox, ShowBoxRequest};
+
+    let minimal_dir = tempfile::tempdir().expect("a temp minimal state dir");
+    let state = tempfile::tempdir().expect("a temp daemon state dir");
+    let (server, global) = native_box_daemon(minimal_dir.path(), state).await;
+    let project = tempfile::tempdir().expect("a temp project dir");
+    let project = project.path().to_str().expect("a UTF-8 project path");
+    let mut daemon = server.connect().await;
+    let web = minimald::test_harness::create_configured_session(&mut daemon, "web", project).await;
+    let live =
+        minimald::test_harness::create_configured_session(&mut daemon, "live", project).await;
+    stop_box_on_hosts(local_hosts(&global).unwrap(), &mut Vec::new(), "web", false)
+        .await
+        .expect("the box stops");
+
+    let show = async |id: boxes::SessionId| {
+        let hosts = local_hosts(&global).unwrap();
+        let host = hosts.into_iter().find(|host| host.selected).unwrap();
+        let mut client = box_host_client(&host).await.unwrap();
+        let shown = match client
+            .oneshot_rpc::<ShowBox>(ShowBoxRequest { id })
+            .await
+            .unwrap()
+        {
+            Errorable::Ok(shown) => shown,
+            Errorable::Err { error } => panic!("ShowBox failed: {error}"),
+        };
+        let mut out = Vec::new();
+        render_box_show(&mut out, &shown, host.provider, &host.host).unwrap();
+        (shown, String::from_utf8(out).unwrap())
+    };
+
+    // The stopped box shows the disk it holds, and the running one shows
+    // no disk line.
+    let (shown, text) = show(web).await;
+    let bytes = shown.disk_bytes.expect("the daemon measures a stopped box");
+    let disk = format!("Disk:       {}", format_disk(bytes));
+    assert!(text.lines().any(|line| line == disk), "{text}");
+    let (_, text) = show(live).await;
+    assert!(!text.contains("Disk:"), "{text}");
+
+    // The dry run lists the stopped box with its disk and the sum, and
+    // leaves the running box out.
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let tally = prune_hosts(
+        local_hosts(&global).unwrap(),
+        false,
+        box_prune_request(None, None),
+        PruneMode::DryRun,
+        &mut out,
+    )
+    .await
+    .expect("the dry run");
+    finish_prune_dry_run(&tally, &mut out, &mut err).expect("the dry run ends cleanly");
+    let text = String::from_utf8(out).unwrap();
+    let size = format_disk(bytes);
+    assert_eq!(
+        text.lines().collect::<Vec<_>>(),
+        [
+            format!("Would remove web ({web}): {size}"),
+            format!("Total: {size}"),
+            "Nothing was removed.".to_owned(),
+        ],
+        "{text}"
+    );
+    assert_eq!(String::from_utf8_lossy(&err), "");
+
+    // The dry run removed nothing: the stopped box still shows.
+    let (shown, _) = show(web).await;
+    assert_eq!(shown.record.state, "stopped");
+
+    // With nothing that matches, the dry run says so.
+    let mut out = Vec::new();
+    let none = PruneTally::default();
+    finish_prune_dry_run(&none, &mut out, &mut Vec::new()).unwrap();
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "No stopped or exited box matched, so prune would remove nothing.\n"
+    );
+
+    // A box whose disk is unknown is counted outside the sum.
+    let mut out = Vec::new();
+    let partial = PruneTally {
+        reaped: 2,
+        disk_bytes: 1536,
+        unmeasured: 1,
+        ..PruneTally::default()
+    };
+    finish_prune_dry_run(&partial, &mut out, &mut Vec::new()).unwrap();
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "Total: 1.5 KiB\nThe total leaves out 1 box whose disk is unknown.\nNothing was removed.\n"
+    );
+    assert_eq!(format_disk(512), "512 B");
+    assert_eq!(format_disk(3 * 1024 * 1024 * 1024 / 2), "1.5 GiB");
+}
