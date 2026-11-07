@@ -206,9 +206,11 @@ Also delete any private pointer that you wrote in step 5.
 
 ### Roll back
 
-Run the promotion again with `target=stable` and an earlier version that has a
-smoke record. The promotion refuses a version without a smoke record. Choose
-your rollback version before you promote. Use `override_provenance=true` only
+Run the promotion again with `target=stable`, `rollback=true`, and an earlier
+version that has a smoke record. Without `rollback=true`, the promotion refuses
+a version below the current `stable`. It also refuses a version without a smoke
+record. Choose a version that was on `stable` before, and choose it before you
+promote. Use `override_provenance=true` only
 in an emergency. The approval issue shows that you used it.
 
 ## We test every artifact we release
@@ -612,7 +614,7 @@ See [docs/ci-strategy.md](../ci-strategy.md).
 
 [`.github/workflows/promote.yml`](../../.github/workflows/promote.yml), named
 `promote-cli` in the Actions list, moves `stable` or `unstable`. Its inputs are
-`version`, `target`, `dry_run`, and `override_provenance`. `version` is a
+`version`, `target`, `dry_run`, `override_provenance`, and `rollback`. `version` is a
 version number or a nightly commit hash. When you leave it empty, the
 workflow uses the newest staged nightly build.
 
@@ -625,6 +627,19 @@ or the team has no other member, the gate fails and the workflow promotes
 nothing. An approver comments
 `approved` or `denied`. If someone closes the issue without an approval, the
 workflow stops.
+
+**Version guards.** Before a promotion to `stable` moves anything, the `promote`
+job runs [`scripts/check-promotion.sh`](../../scripts/check-promotion.sh)
+against the current `stable`. The job runs after the approval, because `stable`
+can move while the approval waits. A dry run makes the same checks.
+
+- It refuses a candidate, such as `0.7.3-rc2`. No input turns this off. A
+  candidate is for soak only, so stage the final version.
+- It refuses a version below the current `stable`, unless you set `rollback`. For
+  example, a run stages `0.7.3`, an emergency promotes `0.7.4`, and someone then
+  promotes `0.7.3` on the planned day. The approval issue shows `rollback`.
+- A nightly commit hash has no order against a version, so it passes with a
+  warning.
 
 **Smoke check.** The `promote` job runs
 [`scripts/verify-smoked.sh`](../../scripts/verify-smoked.sh). It compares the
@@ -643,8 +658,7 @@ tag on the release commit. It does not start a build. The job fails if the
 release does not exist. If the release is already public, the job changes
 nothing, but it fails if the `vX.Y.Z` tag is missing or is not on the
 release commit. For a nightly commit hash, it prints a notice and does
-nothing. A prerelease, such as `0.6.0-rc1`, gets a public GitHub Release
-that is not marked Latest.
+nothing.
 
 ### prune-releases.yml: delete old nightly releases
 
