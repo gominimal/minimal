@@ -1135,7 +1135,37 @@ where
             };
             let (head, buffered) = head.split_at(head_end(&head));
             upstream.write_all(head).await?;
-            relay_exchange(&mut client, &mut upstream, buffered, body, is_upgrade).await?;
+            let relayed =
+                relay_exchange(&mut client, &mut upstream, buffered, body, is_upgrade).await;
+            // The exchange's end, beside the line that opened it: how many
+            // of the upstream's bytes reached the client, and the error that
+            // ended it, if one did. A client reading an empty reply then says
+            // which side was empty — an upstream that closed or reset before
+            // answering reads `to_client=0` with its error, not as silence.
+            match &relayed {
+                Ok(to_client) => {
+                    tracing::info!(
+                        component = "dns-proxy",
+                        host,
+                        session = route.session(),
+                        upstream = %upstream_addr,
+                        to_client,
+                        "ended a proxied exchange"
+                    );
+                }
+                Err(error) => {
+                    tracing::info!(
+                        component = "dns-proxy",
+                        host,
+                        session = route.session(),
+                        upstream = %upstream_addr,
+                        error_kind = ?error.kind(),
+                        %error,
+                        "a proxied exchange ended in an error"
+                    );
+                }
+            }
+            relayed?;
         }
     }
 
@@ -1606,26 +1636,30 @@ fn request_body(lines: &[&[u8]]) -> Option<RequestBody> {
 /// client that closes while the upstream is still working (a long-poll it gave
 /// up on) is noticed only once the upstream answers or closes; both sockets are
 /// held until then.
+///
+/// Returns how many of the upstream's bytes reached the client, heads included.
 async fn relay_exchange<C: AsyncRead + AsyncWrite + Unpin>(
     client: &mut C,
     upstream: &mut TcpStream,
     buffered: &[u8],
     body: RequestBody,
     upgrade: bool,
-) -> io::Result<()> {
+) -> io::Result<u64> {
     let (client_read, mut client_write) = tokio::io::split(client);
     let (mut upstream_read, mut upstream_write) = upstream.split();
     let (switched_tx, switched_rx) = tokio::sync::oneshot::channel::<bool>();
 
     let to_client = async {
-        let switched = relay_response_head(&mut upstream_read, &mut client_write, upgrade).await?;
+        let (switched, head_bytes) =
+            relay_response_head(&mut upstream_read, &mut client_write, upgrade).await?;
         #[expect(
             clippy::let_underscore_must_use,
             reason = "an error only means the request side has already ended"
         )]
         let _ = switched_tx.send(switched);
-        tokio::io::copy(&mut upstream_read, &mut client_write).await?;
-        client_write.shutdown().await
+        let body_bytes = tokio::io::copy(&mut upstream_read, &mut client_write).await?;
+        client_write.shutdown().await?;
+        Ok::<_, io::Error>(head_bytes.saturating_add(body_bytes))
     };
     let to_upstream = async {
         let mut reader = tokio::io::BufReader::new(AsyncReadExt::chain(buffered, client_read));
@@ -1649,8 +1683,9 @@ async fn relay_exchange<C: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// Relays the upstream's response heads to `client` up to the final one, and
-/// returns whether the exchange switched protocols. Each interim `1xx` head
-/// (`100 Continue`, `103 Early Hints`) passes through as is; the final head's
+/// returns whether the exchange switched protocols, with how many bytes it
+/// wrote to the client. Each interim `1xx` head (`100 Continue`, `103 Early
+/// Hints`) passes through as is; the final head's
 /// `Connection` is set to `close`, so the client never reuses this connection
 /// for a request this upstream must not see. A `101 Switching Protocols`
 /// answer to an `upgrade` request passes through unchanged and switches.
@@ -1670,6 +1705,7 @@ where
     C: AsyncWrite + Unpin,
 {
     let mut buf = Vec::with_capacity(512);
+    let mut written: usize = 0;
     loop {
         // An upstream that ends before a whole `\r\n\r\n` head (one answering
         // with bare-LF line endings, say) has its bytes passed on unchanged:
@@ -1679,25 +1715,32 @@ where
                 return Err(error);
             }
             client.write_all(&buf).await?;
-            return Ok(false);
+            return Ok((false, byte_count(written + buf.len())));
         }
         let (head, rest) = buf.split_at(head_end(&buf));
         match response_status(head) {
             Some(101) if upgrade => {
                 client.write_all(&buf).await?;
-                return Ok(true);
+                return Ok((true, byte_count(written + buf.len())));
             }
             Some(status) if (100..200).contains(&status) && status != 101 => {
                 client.write_all(head).await?;
+                written += head.len();
                 buf = rest.to_vec();
             }
             _ => {
-                client.write_all(&set_connection_close(head)).await?;
+                let head = set_connection_close(head);
+                client.write_all(&head).await?;
                 client.write_all(rest).await?;
-                return Ok(false);
+                return Ok((false, byte_count(written + head.len() + rest.len())));
             }
         }
     }
+}
+
+/// A byte count as the `u64` the relay's copies report theirs in.
+fn byte_count(bytes: usize) -> u64 {
+    u64::try_from(bytes).unwrap_or(u64::MAX)
 }
 
 /// Reads from `stream` into `buf` until `buf` holds a whole head (its
