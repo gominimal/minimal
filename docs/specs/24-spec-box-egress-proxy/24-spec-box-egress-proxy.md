@@ -176,7 +176,7 @@ Minting and sealing
 - **BEP-008** IF a box spec declares a GitHub grant and its egress does not admit every host in the module's host set THEN THE SYSTEM SHALL refuse expansion with exit 3 naming each missing host.
   tier:     T1
   verify:   cargo nextest run -p boxes prop_grant_host_set_outside_egress_is_exit_3
-  property: for every box spec and every module host set, except a `host_ip` box with no `egress` section, expansion refuses with exit 3 iff some host of the set is absent from `egress.allow_dns_hosts`, and the refusal names exactly the absent hosts
+  property: for every box spec that declares a GitHub grant and every module host set, except a `host_ip` box with no `egress` section, expansion refuses with exit 3 iff some host of the set is absent from `egress.allow_dns_hosts`, and the refusal names exactly the absent hosts
   - WHERE a `host_ip` box has no `egress` section THE SYSTEM SHALL treat its egress as admitting every host in the module's host set.
     tier:   T0
     verify: cargo nextest run -p boxes host_ip_grant_box_with_no_egress_section_reaches_the_github_hosts
