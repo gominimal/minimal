@@ -3085,11 +3085,12 @@ mod tests {
             "/../boxes/example_project/minimal.toml"
         );
         let src = std::fs::read_to_string(path).expect("example project is readable");
-        let file: File = toml::from_str(&src).expect("example project must parse as an mfile");
+        let file =
+            File::from_toml_bytes(src.as_bytes()).expect("example project must parse as an mfile");
 
         let session = file
             .session
-            .expect("the example declares a [session] block");
+            .expect("the example declares a [defaults.session] block");
         assert_eq!(session.lifecycle_hooks.len(), 1);
         let hook = &session.lifecycle_hooks[0];
         // All four transitions, so each can be exercised from the demo.
