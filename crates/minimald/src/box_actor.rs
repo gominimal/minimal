@@ -1571,11 +1571,39 @@ impl BoxActor {
             tracing::info!("resume: hooks_on_resume is set, and the box has no on_activate hook");
             return Ok(());
         }
-        if let Err(error) = self.launch_host_for_hooks(LaunchPhase::Attached).await {
-            tracing::info!(%error, "resume: launching the box for its on_activate hooks failed");
-            return Err(format!(
-                "It could not start to run its activation hooks: {error}."
-            ));
+        // Bounded as the destroy's hook launches are: a wedged sandbox build
+        // must not stall the actor and the resume forever. A launch cut off
+        // here is reaped by the launcher's drop guard.
+        let box_id = *self.record.id();
+        let limit = HOOK_LAUNCH_TIMEOUT;
+        #[cfg(test)]
+        let limit = resume_launch_seam::timeout(&box_id).unwrap_or(limit);
+        let launch = async {
+            #[cfg(test)]
+            if let Some(hold) = resume_launch_seam::held(&box_id) {
+                tokio::time::sleep(hold).await;
+            }
+            self.launch_host_for_hooks(LaunchPhase::Attached).await
+        };
+        match tokio::time::timeout(limit, launch).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::info!(%error, "resume: launching the box for its on_activate hooks failed");
+                return Err(format!(
+                    "It could not start to run its activation hooks: {error}."
+                ));
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    %box_id,
+                    timeout_secs = limit.as_secs_f64(),
+                    "resume: launching the box for its on_activate hooks timed out"
+                );
+                return Err(format!(
+                    "Its activation hooks did not start in time. \
+                     Run `min session attach {name}` to try the resume again."
+                ));
+            }
         }
         let outcomes = run_session_hooks(&self.inner, &self.record, event).await;
         tracing::Span::current().record("activate_hooks", outcomes.len());
@@ -2385,6 +2413,50 @@ pub(crate) mod exit_settle_seam {
     /// How long the actor of box `id` waits for a closed host's exit.
     pub(super) fn settle_timeout(id: &SessionId) -> Option<Duration> {
         get(id).map(|(_, settle)| settle)
+    }
+}
+
+/// The test seam for a resume whose `on_activate` launch does not start in
+/// time (BOX-028): a test names a box whose hook launch on resume waits
+/// `hold` first, and whose actor waits only `timeout` for that launch.
+/// Keyed by box id, so tests running beside each other never slow each
+/// other's launches.
+#[cfg(test)]
+pub(crate) mod resume_launch_seam {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use boxes::SessionId;
+
+    /// For each box: how long its launch waits, and how long its actor
+    /// waits for the launch.
+    static HELD: Mutex<Option<HashMap<SessionId, (Duration, Duration)>>> = Mutex::new(None);
+
+    /// Makes the resume's hook launch of box `id` wait `hold`, and makes
+    /// its actor give up on it after `timeout`.
+    pub(crate) fn stall(id: SessionId, hold: Duration, timeout: Duration) {
+        HELD.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(id, (hold, timeout));
+    }
+
+    fn get(id: &SessionId) -> Option<(Duration, Duration)> {
+        HELD.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|held| held.get(id).copied())
+    }
+
+    /// How long the resume's hook launch of box `id` waits.
+    pub(super) fn held(id: &SessionId) -> Option<Duration> {
+        get(id).map(|(hold, _)| hold)
+    }
+
+    /// How long the actor of box `id` waits for the resume's hook launch.
+    pub(super) fn timeout(id: &SessionId) -> Option<Duration> {
+        get(id).map(|(_, timeout)| timeout)
     }
 }
 
