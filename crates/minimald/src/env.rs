@@ -5440,8 +5440,8 @@ exit $rc
         };
 
         let run = format!("run%/workbench{RUN_GROUP_SEP}t");
-        let (span, request, trace) =
-            super::channel_request_span(&format!("otel%off%{run}"), "off", None);
+        let line = format!("otel%off%{run}");
+        let (span, request, trace) = super::channel_request_span(&line, "off", None);
         assert_eq!(request, run);
         assert_eq!(trace, TaskTrace::OptedOut);
         span.in_scope(|| drop(tracing::info_span!("under").entered()));
