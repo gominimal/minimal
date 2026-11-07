@@ -11,6 +11,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+pub mod duration;
 pub mod entry;
 mod error;
 pub use error::{EntryNameRule, Error, SpecKeyProblem};

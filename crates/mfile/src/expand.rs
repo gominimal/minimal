@@ -398,7 +398,7 @@ impl Shape {
 }
 
 /// What a value is, as the error message names it.
-const fn value_words(value: &toml::Value) -> &'static str {
+pub(crate) const fn value_words(value: &toml::Value) -> &'static str {
     match value {
         toml::Value::String(_) => "a string",
         toml::Value::Integer(_) => "a whole number",
