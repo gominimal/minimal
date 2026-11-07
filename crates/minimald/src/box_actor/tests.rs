@@ -14580,6 +14580,79 @@ async fn box_build_web_source_under_box_verdict() {
     );
 }
 
+/// NET-155 (T124): a box's launch builds the packages it lacks in the box's
+/// classifier leaf. When a deny-all box's launch build is refused its web
+/// source, the error names the source host and the box on one line, before
+/// the build's own error, as the build side operation's does. The box is
+/// named as `min ls` shows it, not by the id its leaf is named after. A box
+/// whose leaf allows the host, and a build that succeeds, are reported as
+/// before.
+#[tokio::test]
+async fn box_launch_build_refused_web_source_names_host_and_box() {
+    use crate::box_ops::BuildPlacement;
+    use crate::env::tapped_build;
+    use sandbox::config::{ClassifierLeaf, Verdict};
+
+    let root = std::path::Path::new("/sys/fs/cgroup/minimald.slice");
+    let box_id = "01a1b338-491b-766a-9c29-43184470ccf3";
+    let placement = |verdict| BuildPlacement {
+        box_name: "d876x1".to_string(),
+        leaf: Some(ClassifierLeaf::under(root, box_id, verdict)),
+        network: None,
+    };
+    let refused = "could not connect to deb.debian.org:443: the egress rules admit no destination";
+    // The line the package's spec build writes when its fetch fails, and the
+    // error the launch's build returns.
+    let output = format!(
+        "could not fetch the source \
+         https://deb.debian.org/debian/pool/main/m/minisat2/minisat2_2.2.1.orig.tar.gz: \
+         other: {refused}"
+    );
+    let failed = mctx::Error::from(orchestrator::Error::BuildFailed(
+        "fetch876".to_string(),
+        op::Error::Other(anyhow::anyhow!("{refused}")),
+    ))
+    .to_string();
+    let launch = |placement: BuildPlacement, failure: Option<String>| {
+        let output = output.clone();
+        async move {
+            let (log_tx, log_rx) = futures::channel::mpsc::unbounded();
+            let build = async move {
+                for event in build_events("fetch876", &[output.as_str()]) {
+                    log_tx.unbounded_send(event).unwrap();
+                }
+                failure
+            };
+            tapped_build(build, log_rx, &placement).await
+        }
+    };
+
+    let denied = launch(placement(Verdict::Deny), Some(failed.clone()))
+        .await
+        .expect_err("the deny-all box's launch build fails");
+    assert_eq!(
+        denied,
+        format!(
+            "the build of fetch876 could not reach deb.debian.org: \
+             the egress rules of box d876x1 do not allow it\n{failed}"
+        )
+    );
+    assert!(
+        denied
+            .lines()
+            .any(|line| line.contains("deb.debian.org") && line.contains("d876x1")),
+        "{denied}"
+    );
+    assert!(!denied.contains(box_id), "{denied}");
+
+    // A box its rules allow the host is never reported as refused.
+    assert_eq!(
+        launch(placement(Verdict::Allow), Some(failed.clone())).await,
+        Err(failed)
+    );
+    assert_eq!(launch(placement(Verdict::Deny), None).await, Ok(()));
+}
+
 /// NET-155: a web source that redirects to another host fails on that
 /// host, and the refusal names the host the download could not connect to.
 /// When the failure names no host, the source's own host stands in.
