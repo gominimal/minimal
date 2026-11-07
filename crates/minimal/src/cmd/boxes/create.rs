@@ -199,9 +199,10 @@ impl std::fmt::Display for SessionEntryUndecided {
                 names = candidates.join(", "),
             ),
             SessionEntryUndecided::DefaultNotSession { box_type } => {
-                let kind = box_type
-                    .as_deref()
-                    .map_or_else(|| "no type".to_owned(), |t| format!("the type \"{t}\""));
+                let kind = box_type.as_deref().map_or_else(
+                    || "no type".to_owned(),
+                    |t| format!("the type \"{}\"", printable(t)),
+                );
                 write!(
                     f,
                     "Cannot start the box: the project's {file} declares no session entry. \
@@ -210,9 +211,10 @@ impl std::fmt::Display for SessionEntryUndecided {
                 )
             }
             SessionEntryUndecided::TypeUnresolved { name, box_type } => {
-                let kind = box_type
-                    .as_deref()
-                    .map_or_else(|| "no type".to_owned(), |t| format!("the type \"{t}\""));
+                let kind = box_type.as_deref().map_or_else(
+                    || "no type".to_owned(),
+                    |t| format!("the type \"{}\"", printable(t)),
+                );
                 write!(
                     f,
                     "Cannot start the box: the project's {file} declares the entry \"{name}\" \
@@ -5194,6 +5196,19 @@ mod tests {
                 Some(SessionEntryUndecided::TypeUnresolved { name, .. }) if name == "dev"
             ),
             "{refusal:#}"
+        );
+
+        // The entry's type is any TOML string, so the refusal escapes it: a
+        // hostile file cannot write a terminal escape sequence to stderr.
+        let refusal = SessionEntryUndecided::TypeUnresolved {
+            name: "dev".to_owned(),
+            box_type: Some("dev\u{1b}[31mbox".to_owned()),
+        }
+        .to_string();
+        assert!(!refusal.contains('\u{1b}'), "{refusal:?}");
+        assert!(
+            refusal.contains("the type \"dev\\u{1b}[31mbox\""),
+            "{refusal:?}"
         );
 
         // A file that declares no egress starts with no project egress, even
