@@ -3193,6 +3193,10 @@ mod tests {
                 "[tasks.lint]\nexec = [\"true\"]\ntimeout = 1.5\n",
                 "`[tasks.lint]` in minimal.toml sets `timeout` to a decimal number",
             ),
+            (
+                "[session]\ntimeout = \"9223372036854775808\"\n",
+                "`[session]` in minimal.toml sets `timeout` to a duration that is too long",
+            ),
         ];
         for (file, start) in cases {
             let dir = tempdir().unwrap();

@@ -13,6 +13,10 @@ const NOT_A_DURATION: &str = "a string that is not a duration";
 /// What a negative `timeout` number is, as the refusal names it.
 const NEGATIVE: &str = "a negative number";
 
+/// What a `timeout` string past the largest TOML integer is, as the refusal
+/// names it. The spec writes the value as a TOML integer, which is an `i64`.
+const TOO_LONG: &str = "a duration that is too long";
+
 /// Reads a timeout as whole seconds: a number of seconds, or a number
 /// followed by `s`, `m` or `h`. Zero is refused, as the daemon refuses an
 /// exec timeout of zero seconds (BOX-149).
@@ -37,11 +41,17 @@ pub fn parse_timeout_secs(raw: &str) -> Result<u64, String> {
 /// # Errors
 ///
 /// What the value is, as the refusal names it, for a value that is not a
-/// whole number of seconds or a string in the grammar.
+/// whole number of seconds or a string in the grammar, or for a string
+/// whose seconds are more than `i64::MAX`, which `execution.timeout` cannot
+/// hold as a TOML integer.
 pub fn spec_timeout(value: &toml::Value) -> Result<Option<u64>, &'static str> {
     let secs = match value {
         toml::Value::Integer(n) => u64::try_from(*n).map_err(|_| NEGATIVE)?,
-        toml::Value::String(raw) => duration_secs(raw).ok_or(NOT_A_DURATION)?,
+        toml::Value::String(raw) => {
+            let secs = duration_secs(raw).ok_or(NOT_A_DURATION)?;
+            i64::try_from(secs).map_err(|_| TOO_LONG)?;
+            secs
+        }
         other => return Err(crate::expand::value_words(other)),
     };
     Ok((secs > 0).then_some(secs))
@@ -116,6 +126,14 @@ mod tests {
         assert_eq!(spec_timeout(&"30".into()), Ok(Some(30)));
         assert_eq!(spec_timeout(&toml::Value::Integer(-5)), Err(NEGATIVE));
         assert_eq!(spec_timeout(&"2 days".into()), Err(NOT_A_DURATION));
+        // `execution.timeout` is a TOML integer, so a string past `i64::MAX`
+        // seconds is refused, and `i64::MAX` itself is taken.
+        assert_eq!(spec_timeout(&"9223372036854775808".into()), Err(TOO_LONG));
+        assert_eq!(spec_timeout(&"3000000000000000h".into()), Err(TOO_LONG));
+        assert_eq!(
+            spec_timeout(&"9223372036854775807".into()),
+            Ok(Some(9_223_372_036_854_775_807))
+        );
         assert_eq!(
             spec_timeout(&toml::Value::Float(1.5)),
             Err("a decimal number")
