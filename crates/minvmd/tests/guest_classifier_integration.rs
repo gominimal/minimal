@@ -631,7 +631,7 @@ impl BoxSession {
             let mut contents = common::PKGS_UPSTREAM.to_string();
             if !packages.is_empty() {
                 contents.push_str(&format!(
-                    "\n[session]\npackages = [{}]\n",
+                    "\n[defaults.session]\npackages = [{}]\n",
                     packages
                         .iter()
                         .map(|p| format!("\"{p}\""))

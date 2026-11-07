@@ -1298,7 +1298,7 @@ impl BoxActor {
                 wsp.as_utf8_path()
                     .join(mfile::MFILE_NAME)
                     .into_std_path_buf(),
-                "[session]\npackages = [\"base\", \"vim\"]\n".to_string(),
+                "[defaults.session]\npackages = [\"base\", \"vim\"]\n".to_string(),
             ))
         }
         #[cfg(not(any(test, feature = "test-support")))]
