@@ -24,6 +24,7 @@ autospawns
 autotools
 backgrounded
 Backgrounding
+backport
 backports
 backpressure
 backtrace
@@ -313,6 +314,7 @@ rcache
 reachability
 readlinks
 README
+rebase
 rebuildable
 reflink
 regenerable

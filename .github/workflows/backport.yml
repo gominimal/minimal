@@ -1,0 +1,129 @@
+name: backport
+
+# Opens a PR on a release line from a merged PR with a `backport release/X.Y.x`
+# label. docs/internal/release-pipeline.md describes the flow.
+#
+# This does nothing until a person sets the repository variable
+# BACKPORT_ENABLED to `true`. Unset it to turn this off again.
+
+on:
+    # Runs this file from main, and no step runs code from the PR. Checkout
+    # takes main, and the action only cherry-picks. Without this trigger the App
+    # key is out of reach when the source PR came from a fork.
+    pull_request_target: # zizmor: ignore[dangerous-triggers]
+        types: [closed, labeled]
+        branches: [main]
+
+permissions: {}
+
+concurrency:
+    group: backport-${{ github.event.pull_request.number }}
+    cancel-in-progress: false
+
+jobs:
+    backport:
+        if: >-
+            vars.BACKPORT_ENABLED == 'true' &&
+            github.event.pull_request.merged == true &&
+            contains(toJSON(github.event.pull_request.labels.*.name), '"backport release/') &&
+            (github.event.action == 'closed' || startsWith(github.event.label.name, 'backport release/'))
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        steps:
+            # An App token, because a PR opened with GITHUB_TOKEN starts no CI.
+            # No `workflows` permission: GitHub refuses the push of a pick that
+            # changes .github/workflows, so a person backports those by hand.
+            - name: Mint token (gominimal-aw-bot)
+              id: app-token
+              uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+              with:
+                  app-id: ${{ vars.AW_BOT_APP_ID }}
+                  private-key: ${{ secrets.AW_BOT_PRIVATE_KEY }}
+                  owner: gominimal
+                  repositories: minimal
+                  permission-contents: write
+                  permission-pull-requests: write
+
+            # The action pushes with the credentials that checkout stores. Its
+            # github_token input covers only the API, so this token must stay
+            # in the git config.
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  token: ${{ steps.app-token.outputs.token }}
+                  persist-credentials: true
+
+            - name: Refuse a change that forces the next minor
+              env:
+                  GH_TOKEN: ${{ steps.app-token.outputs.token }}
+                  MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+                  PR_NUMBER: ${{ github.event.pull_request.number }}
+                  PR_TITLE: ${{ github.event.pull_request.title }}
+                  REPO: ${{ github.repository }}
+              run: |
+                  set -euo pipefail
+                  gh api "repos/$REPO/commits/$MERGE_SHA" --jq .commit.message >"$RUNNER_TEMP/message"
+                  if reason="$(scripts/backport-title-guard.sh "$PR_TITLE" "$RUNNER_TEMP/message")"; then
+                      exit 0
+                  fi
+                  gh api "repos/$REPO/issues/$PR_NUMBER/comments" \
+                      -f body="Backport refused. $reason"
+                  echo "::error::$reason"
+                  exit 1
+
+            # The action switches the workspace to the line, which may not
+            # have this script yet.
+            - name: Keep the conflict script
+              run: cp scripts/backport-conflict-paths.sh "$RUNNER_TEMP/"
+
+            # String.replace in the action fills only the first use of a
+            # placeholder. The description leaves out the source body on
+            # purpose: agent-runtime maps `Closes #n` to epics.
+            - name: Cherry-pick and open the PR
+              id: backport
+              uses: korthout/backport-action@0ebd44f9c79a4a0a171200dcdcceec3ed9ca732f # v4.7.1
+              with:
+                  github_token: ${{ steps.app-token.outputs.token }}
+                  git_committer_name: gominimal-aw-bot[bot]
+                  git_committer_email: 281738952+gominimal-aw-bot[bot]@users.noreply.github.com
+                  label_pattern: '^backport (release/[0-9]+\.[0-9]+\.x)$'
+                  branch_name: backport/${pull_number}-to-${target_branch}
+                  pull_title: ${pull_title}
+                  pull_description: |-
+                      Backport of #${pull_number} to `${target_branch}`.
+
+                      Squash-merge this PR and keep the PR title as the subject. The cherry-picked commit keeps the source subject.
+                  experimental: '{"conflict_resolution": "draft_commit_conflicts"}'
+
+            - name: Record a conflict on the draft
+              if: steps.backport.outputs.created_pull_numbers != ''
+              env:
+                  CREATED: ${{ steps.backport.outputs.created_pull_numbers }}
+                  GH_TOKEN: ${{ steps.app-token.outputs.token }}
+                  MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+                  PR_NUMBER: ${{ github.event.pull_request.number }}
+                  REPO: ${{ github.repository }}
+              run: |
+                  set -euo pipefail
+                  tick='`'
+                  for pr in $CREATED; do
+                      [ "$(gh api "repos/$REPO/pulls/$pr" --jq .draft)" = true ] || continue
+                      head="$(gh api "repos/$REPO/pulls/$pr" --jq .head.sha)"
+                      git fetch --quiet --depth=2 origin "$head"
+                      paths="$("$RUNNER_TEMP/backport-conflict-paths.sh" "$head~1" "$MERGE_SHA" | sed "s/.*/- $tick&$tick/")"
+                      body="$(gh api "repos/$REPO/pulls/$pr" --jq .body)"
+                      gh api -X PATCH "repos/$REPO/pulls/$pr" -f body="$body
+
+                  ## Conflict
+
+                  Source PR: #$PR_NUMBER
+                  Source commit: $MERGE_SHA
+
+                  Conflicted paths:
+                  $paths"
+                      gh api "repos/$REPO/issues/$pr/labels" -f 'labels[]=backport-conflict'
+                  done
+
+            # The action reports a failed pick in a comment and exits green.
+            - name: Fail the run if the backport failed
+              if: steps.backport.outputs.was_successful == 'false'
+              run: exit 1
