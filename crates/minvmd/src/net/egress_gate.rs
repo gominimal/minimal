@@ -18825,8 +18825,8 @@ mod tests {
     /// boundary, with a marker naming its full length.
     #[test]
     fn a_refused_zone_name_is_named_bounded_and_escaped() {
-        use std::borrow::Cow;
         use super::{MAX_LOGGED_WHAT, loggable_what};
+        use std::borrow::Cow;
         for plain in [
             "port 9999",
             "127.0.0.2:8080",
