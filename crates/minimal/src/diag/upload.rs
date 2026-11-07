@@ -180,42 +180,38 @@ pub async fn upload(
 
     let client = client(local_only)?;
 
-    let created = client
-        .post(format!("{base}/diag/api/diagnoses"))
-        .timeout(CREATE_TIMEOUT)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(
-            json!({
-                "name": name,
-                "bytes": bytes.len(),
-                "sha256": sha256,
-                "context": note,
-                "security": security,
-            })
-            .to_string(),
-        )
-        .send()
-        .await
-        .with_context(|| format!("asking {base} to take a bundle"))?;
-    let status = created.status();
-    let body = created.text().await.unwrap_or_default();
-    if !status.is_success() {
-        bail!(
-            "{base} would not take the bundle ({status}): {}",
-            refusal(&body)
-        );
+    let declared = |context: &str| {
+        json!({
+            "name": name,
+            "bytes": bytes.len(),
+            "sha256": sha256,
+            "context": context,
+            "security": security,
+        })
+    };
+
+    // The note is the disclosure, so it leaves only for a portal that has
+    // already said it will hold the report: a record with no note asks first,
+    // and has done its job once answered.
+    if security && !note.is_empty() {
+        let asked = create(&client, base, declared("")).await?;
+        if let (Some(id), Some(token)) = (asked["id"].as_str(), asked["delete_token"].as_str()) {
+            delete(base, id, token).await.ok();
+        }
+        if asked["security"] != Value::Bool(true) {
+            bail!(
+                "{base} did not confirm it would keep this private, so neither the bundle nor \
+                 your description was sent. Email security@minimal.dev instead"
+            );
+        }
     }
-    let created: Value = serde_json_lenient::from_str(&body).with_context(|| {
-        format!(
-            "{base} answered with something that is not JSON: {}",
-            refusal(&body)
-        )
-    })?;
+
+    let created = create(&client, base, declared(note)).await?;
     // A portal that does not say it held the report may have stored it where
     // anyone with the link can read it, so the bundle stays here and the
-    // receipt can never promise a privacy nobody confirmed. The create has
-    // already carried the note, so it is deleted, and the reporter is told
-    // what reached the portal either way.
+    // receipt can never promise a privacy nobody confirmed. With a note, this
+    // is a portal that changed its answer after the first ask: the note has
+    // gone, so the record is deleted and the reporter told how that went.
     if security && created["security"] != Value::Bool(true) {
         let removed = match (created["id"].as_str(), created["delete_token"].as_str()) {
             (Some(id), Some(token)) => delete(base, id, token).await.is_ok(),
@@ -285,6 +281,36 @@ pub async fn upload(
 
 /// Deletes a bundle before it expires, with the token its upload printed.
 ///
+/// Asks the portal to make a record, and reads back what it said.
+async fn create(
+    client: &reqwest::Client,
+    base: &str,
+    declared: Value,
+) -> Result<Value, anyhow::Error> {
+    let created = client
+        .post(format!("{base}/diag/api/diagnoses"))
+        .timeout(CREATE_TIMEOUT)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(declared.to_string())
+        .send()
+        .await
+        .with_context(|| format!("asking {base} to take a bundle"))?;
+    let status = created.status();
+    let body = created.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!(
+            "{base} would not take the bundle ({status}): {}",
+            refusal(&body)
+        );
+    }
+    serde_json_lenient::from_str(&body).with_context(|| {
+        format!(
+            "{base} answered with something that is not JSON: {}",
+            refusal(&body)
+        )
+    })
+}
+
 /// The portal deletes the bundle and anything derived from it. Its three
 /// answers are told apart here because they mean different things to the
 /// person who asked: gone, not there (any more), or not theirs to delete.
@@ -562,11 +588,11 @@ mod tests {
             .await
             .unwrap();
 
+        let confirmed = r#"{"id":"d-123","upload":"/diag/api/diagnoses/d-123/bundle","delete_token":"tok-xyz","expires_at":"2026-10-16T12:00:00Z","security":true}"#;
         let (base, served) = portal(vec![
-            (
-                201,
-                r#"{"id":"d-123","upload":"/diag/api/diagnoses/d-123/bundle","delete_token":"tok-xyz","expires_at":"2026-10-16T12:00:00Z","security":true}"#,
-            ),
+            (201, confirmed),
+            (204, ""),
+            (201, confirmed),
             (202, r#"{"id":"d-123","state":"stored"}"#),
         ])
         .await;
@@ -577,7 +603,11 @@ mod tests {
         let seen = served.await.unwrap();
         let base = base.trim_end_matches('/');
 
-        let declared: Value = serde_json_lenient::from_slice(&seen[0].body).unwrap();
+        let asked: Value = serde_json_lenient::from_slice(&seen[0].body).unwrap();
+        assert_eq!(asked["security"], Value::Bool(true));
+        assert_eq!(asked["context"], "");
+        assert_eq!(seen[1].method, "DELETE");
+        let declared: Value = serde_json_lenient::from_slice(&seen[2].body).unwrap();
         assert_eq!(declared["security"], Value::Bool(true));
         assert_eq!(declared["context"], "a sandbox escape");
 
@@ -596,11 +626,10 @@ mod tests {
         );
     }
 
-    /// A portal that does not confirm the mark gets no bundle: the record the
-    /// create left is deleted, and the reporter is told what reached the
-    /// portal and where to go instead of being told the report is private.
+    /// A portal that does not confirm the mark gets neither the bundle nor
+    /// the note: only a record with no note reaches it, and that is deleted.
     #[tokio::test]
-    async fn a_security_upload_sends_no_bundle_unless_the_portal_confirms_the_mark() {
+    async fn a_security_upload_sends_nothing_private_unless_the_portal_confirms_the_mark() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("minimal-diag-x.tar.zst");
         tokio::fs::write(&path, b"\x28\xb5\x2f\xfdnot really zstd")
@@ -608,12 +637,14 @@ mod tests {
             .unwrap();
         let unconfirmed = r#"{"id":"d-123","upload":"/diag/api/diagnoses/d-123/bundle","delete_token":"tok-xyz"}"#;
 
-        for (answer, note, says) in [
-            (204, "the flaw", "has been deleted"),
-            (500, "the flaw", "treat it as exposed"),
-            (204, "", "the bundle was not sent."),
+        for (note, says) in [
+            (
+                "the flaw",
+                "neither the bundle nor your description was sent",
+            ),
+            ("", "so the bundle was not sent."),
         ] {
-            let (base, served) = portal(vec![(201, unconfirmed), (answer, "")]).await;
+            let (base, served) = portal(vec![(201, unconfirmed), (204, "")]).await;
 
             let refused = upload(&path, &base, note, true)
                 .await
@@ -623,16 +654,47 @@ mod tests {
 
             assert_eq!(seen.len(), 2);
             assert_eq!(seen[0].method, "POST");
+            let asked: Value = serde_json_lenient::from_slice(&seen[0].body).unwrap();
+            assert_eq!(asked["context"], "");
             assert_eq!(seen[1].method, "DELETE");
             assert_eq!(seen[1].path, "/diag/api/diagnoses/d-123");
-            assert!(refused.contains("the bundle was not sent"), "{refused}");
             assert!(refused.contains(says), "{refused}");
             assert!(refused.contains("security@minimal.dev"), "{refused}");
-            assert_eq!(
-                refused.contains("description"),
-                !note.is_empty(),
-                "{refused}"
-            );
+        }
+    }
+
+    /// A portal that confirms and then changes its answer has the note, so
+    /// the reporter is told whether it could be deleted.
+    #[tokio::test]
+    async fn a_portal_that_stops_confirming_after_the_note_left_is_reported_as_it_went() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("minimal-diag-x.tar.zst");
+        tokio::fs::write(&path, b"\x28\xb5\x2f\xfdnot really zstd")
+            .await
+            .unwrap();
+        let confirmed = r#"{"id":"d-1","upload":"/diag/api/diagnoses/d-1/bundle","delete_token":"t","security":true}"#;
+        let unconfirmed =
+            r#"{"id":"d-2","upload":"/diag/api/diagnoses/d-2/bundle","delete_token":"t"}"#;
+
+        for (answer, says) in [(204, "has been deleted"), (500, "treat it as exposed")] {
+            let (base, served) = portal(vec![
+                (201, confirmed),
+                (204, ""),
+                (201, unconfirmed),
+                (answer, ""),
+            ])
+            .await;
+
+            let refused = upload(&path, &base, "the flaw", true)
+                .await
+                .unwrap_err()
+                .to_string();
+            let seen = served.await.unwrap();
+
+            assert_eq!(seen.len(), 4);
+            assert_eq!(seen[3].path, "/diag/api/diagnoses/d-2");
+            assert!(refused.contains("the bundle was not sent"), "{refused}");
+            assert!(refused.contains(says), "{refused}");
         }
     }
 
