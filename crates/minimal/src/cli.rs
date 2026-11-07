@@ -168,6 +168,13 @@ pub enum Command {
     Update(UpdateArgs),
     /// Print CLI and daemon version information
     Version,
+    /// Check now whether your channel has a newer release.
+    ///
+    /// min makes this check by itself once a day; see
+    /// https://docs.minimal.dev/reference/telemetry#update-check for what
+    /// it sends and how to turn it off.
+    #[command(name = "update-check", hide = true)]
+    UpdateCheck(UpdateCheckArgs),
     /// Demo the client's activity spinner (development aid).
     ///
     /// Draws the same build-hold-fade spinner used by the file-upload
@@ -1712,6 +1719,19 @@ pub struct SpinArgs {
     /// Ctrl-C cuts it short.
     #[arg(long, default_value_t = 10)]
     pub seconds: u64,
+}
+
+/// `min update-check`: see [`crate::update_check`].
+#[derive(Debug, Default, Args)]
+pub struct UpdateCheckArgs {
+    /// Check without printing anything and keep the answer for the next
+    /// command, as the daily check does. Always exits 0.
+    #[arg(long, conflicts_with = "dry_run")]
+    pub background: bool,
+    /// Print the request that would be made, and the switch that stops it
+    /// if one is set, without making it.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]
