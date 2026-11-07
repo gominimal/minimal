@@ -109,6 +109,94 @@ impl std::error::Error for ProjectFileInvalid {
     }
 }
 
+/// The session entry of the project's `minimal.toml` that egress is read from
+/// (NET-060): `[sessions.default]`, or `[boxes.default]` with
+/// `type = "session"`, else the only session entry, else the implicit
+/// default session entry. Every other case refuses the start, before the
+/// create request.
+fn pick_session_entry(
+    entries: &[mfile::entry::BoxEntry],
+) -> Result<mfile::entry::BoxEntry, SessionEntryUndecided> {
+    let candidates: Vec<&mfile::entry::BoxEntry> = entries
+        .iter()
+        .filter(|entry| entry.box_type.as_deref() == Some(boxes::SESSION_BOX_TYPE))
+        .collect();
+    if let Some(entry) = candidates
+        .iter()
+        .find(|entry| entry.name == mfile::entry::DEFAULT_ENTRY_NAME)
+    {
+        return Ok((*entry).clone());
+    }
+    match candidates.as_slice() {
+        [only] => Ok((*only).clone()),
+        [] => mfile::entry::implicit_default_entry(entries, |t| {
+            mfile::expand::BUILTIN_BOX_TYPES
+                .into_iter()
+                .find(|builtin| *builtin == t)
+        })
+        .ok_or_else(|| SessionEntryUndecided::DefaultNotSession {
+            box_type: entries
+                .iter()
+                .find(|entry| entry.name == mfile::entry::DEFAULT_ENTRY_NAME)
+                .and_then(|entry| entry.box_type.clone()),
+        }),
+        several => Err(SessionEntryUndecided::NoDefault {
+            candidates: several.iter().map(|entry| entry.name.clone()).collect(),
+        }),
+    }
+}
+
+/// A project `minimal.toml` whose session entry the start cannot pick. The
+/// activation refuses it before the create request, and the run ends with
+/// exit 2 (`main.rs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionEntryUndecided {
+    /// Two or more session entries, and none is named `default`.
+    NoDefault {
+        /// The names of the session entries, in the order the file is read.
+        candidates: Vec<String>,
+    },
+    /// No session entry, and an entry named `default` that is not a
+    /// session, so no implicit default session entry applies.
+    DefaultNotSession {
+        /// The type of the `default` entry, when the file gives one.
+        box_type: Option<String>,
+    },
+}
+
+impl std::fmt::Display for SessionEntryUndecided {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let file = mfile::MFILE_NAME;
+        match self {
+            SessionEntryUndecided::NoDefault { candidates } => write!(
+                f,
+                "Cannot start the box: the project's {file} declares the session entries \
+                 {names}. None of them is named \"default\", so the start cannot pick one. \
+                 Rename the entry to start to \"default\" in {file}.",
+                names = candidates.join(", "),
+            ),
+            SessionEntryUndecided::DefaultNotSession { box_type } => {
+                let kind = box_type
+                    .as_deref()
+                    .map_or_else(|| "no type".to_owned(), |t| format!("the type \"{t}\""));
+                write!(
+                    f,
+                    "Cannot start the box: the project's {file} declares no session entry. \
+                     Its entry \"default\" has {kind}, so the start has no session entry \
+                     to use. Add a [sessions.<name>] entry to {file}."
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SessionEntryUndecided {}
+
+impl SessionEntryUndecided {
+    /// The exit code of the refused start.
+    pub const EXIT_CODE: u8 = 2;
+}
+
 /// A grant the box cannot receive: a GitHub grant whose value cannot land
 /// in its environment (BEP-007), or a store reference that no rule admits
 /// (BEP-035). The creation is refused with exit 3, before the box exists.
@@ -293,11 +381,11 @@ struct ProjectEgress {
 /// `network` keys of the layers are read, so a key this read does not own
 /// never refuses an activation. The policy is `None` when there is no
 /// project file or no layer declares egress.
-fn project_egress(project: &camino::Utf8Path) -> Result<ProjectEgress, ProjectFileInvalid> {
+fn project_egress(project: &camino::Utf8Path) -> anyhow::Result<ProjectEgress> {
     let file = match mfile::File::from_dir_recursive(project.as_std_path()) {
         Ok(file) => file,
         Err(mfile::Error::NotFound) => return Ok(ProjectEgress::default()),
-        Err(error) => return Err(ProjectFileInvalid { error }),
+        Err(error) => return Err(ProjectFileInvalid { error }.into()),
     };
     let Some(root) = file.repo_path() else {
         return Ok(ProjectEgress::default());
@@ -317,13 +405,16 @@ fn project_egress(project: &camino::Utf8Path) -> Result<ProjectEgress, ProjectFi
 }
 
 /// [`project_egress`] over the bytes of a `minimal.toml`.
-fn project_egress_from(bytes: &[u8]) -> Result<ProjectEgress, ProjectFileInvalid> {
+fn project_egress_from(bytes: &[u8]) -> anyhow::Result<ProjectEgress> {
     let file: toml::Table = toml::from_slice(bytes).map_err(|e| ProjectFileInvalid {
         error: mfile::Error::Format(e),
     })?;
-    let network_of = |table: Option<&toml::Table>| -> toml::Table {
+    let entries =
+        mfile::entry::read_entries(bytes).map_err(|error| ProjectFileInvalid { error })?;
+    let entry = pick_session_entry(&entries)?;
+    let network_of = |table: &toml::Table| -> toml::Table {
         table
-            .and_then(|table| table.get("network"))
+            .get("network")
             .map(|network| toml::Table::from_iter([("network".to_owned(), network.clone())]))
             .unwrap_or_default()
     };
@@ -334,35 +425,18 @@ fn project_egress_from(bytes: &[u8]) -> Result<ProjectEgress, ProjectFileInvalid
         .unwrap_or_default();
     let mut layers = mfile::expand::Layers::default().with_file_defaults(
         &defaults,
-        Some(boxes::SESSION_BOX_TYPE),
+        entry.box_type.as_deref(),
         &std::collections::BTreeSet::new(),
     );
-    layers.defaults = network_of(Some(&layers.defaults));
-    layers.defaults_type = network_of(Some(&layers.defaults_type));
-    let sessions = file
-        .get(mfile::entry::EntryTable::Sessions.key())
-        .and_then(toml::Value::as_table);
-    let declared_entry = sessions.and_then(|sessions| {
-        let entry = match sessions.get(mfile::spec::DEFAULT_SESSION_ENTRY) {
-            Some(entry) => Some((mfile::spec::DEFAULT_SESSION_ENTRY, entry)),
-            None if sessions.len() == 1 => sessions.iter().next().map(|(n, e)| (n.as_str(), e)),
-            None => None,
-        };
-        entry.and_then(|(name, entry)| entry.as_table().map(|entry| (name, entry)))
-    });
-    let entry_body = network_of(declared_entry.map(|(_, entry)| entry));
-    if layers.defaults.is_empty() && layers.defaults_type.is_empty() && entry_body.is_empty() {
+    layers.defaults = network_of(&layers.defaults);
+    layers.defaults_type = network_of(&layers.defaults_type);
+    let entry = mfile::entry::BoxEntry {
+        body: network_of(&entry.body),
+        ..entry
+    };
+    if layers.defaults.is_empty() && layers.defaults_type.is_empty() && entry.body.is_empty() {
         return Ok(ProjectEgress::default());
     }
-    let entry = mfile::entry::BoxEntry {
-        name: declared_entry
-            .map_or(mfile::spec::DEFAULT_SESSION_ENTRY, |(name, _)| name)
-            .to_owned(),
-        table: mfile::entry::EntryTable::Sessions,
-        box_type: Some(boxes::SESSION_BOX_TYPE.to_owned()),
-        body: entry_body,
-        implicit: declared_entry.is_none(),
-    };
     let mut expansion =
         mfile::expand::expand(&entry, &layers).map_err(|error| ProjectFileInvalid { error })?;
     // The network module's own read: a malformed egress table refuses the
@@ -4927,6 +5001,55 @@ mod tests {
             Some(vec!["d.example".to_owned()])
         );
 
+        // A `[boxes.<name>]` entry with `type = "session"` is a session entry,
+        // the same as `[sessions.<name>]`.
+        let boxes_dev = project_egress_from(
+            b"[boxes.dev]\ntype = \"session\"\n\n\
+              [boxes.dev.network.egress]\nallow_dns_hosts = [\"box.example\"]\n",
+        )
+        .unwrap()
+        .policy
+        .expect("the boxes entry declares egress");
+        assert_eq!(
+            boxes_dev.allow_dns_hosts,
+            Some(vec!["box.example".to_owned()])
+        );
+
+        // Two session entries and none named `default`: the start cannot
+        // pick one, and refuses with exit 2 before the create request.
+        let refusal = project_egress_from(
+            b"[sessions.dev.network.egress]\nallow_dns_hosts = [\"dev.example\"]\n\n\
+              [boxes.web]\ntype = \"session\"\n",
+        )
+        .expect_err("two session entries and no default refuse the start");
+        let undecided = refusal
+            .downcast_ref::<SessionEntryUndecided>()
+            .expect("the refusal is an undecided session entry");
+        assert_eq!(SessionEntryUndecided::EXIT_CODE, 2);
+        assert_eq!(
+            undecided.to_string(),
+            "Cannot start the box: the project's minimal.toml declares the session entries \
+             web, dev. None of them is named \"default\", so the start cannot pick one. \
+             Rename the entry to start to \"default\" in minimal.toml."
+        );
+
+        // No session entry, and a `default` entry of another type: no
+        // implicit default session entry applies, so the start refuses.
+        let refusal = project_egress_from(
+            b"[defaults.network.egress]\nallow_dns_hosts = [\"a.example\"]\n\n\
+              [tasks.default]\ncommand = \"true\"\n",
+        )
+        .expect_err("a task named default blocks the implicit session entry");
+        let undecided = refusal
+            .downcast_ref::<SessionEntryUndecided>()
+            .expect("the refusal is an undecided session entry");
+        assert_eq!(
+            undecided.to_string(),
+            "Cannot start the box: the project's minimal.toml declares no session entry. \
+             Its entry \"default\" has the type \"task\", so the start has no session entry \
+             to use. Add a [sessions.<name>] entry to minimal.toml."
+        );
+
         // A bad egress value is an invalid `minimal.toml`: the refusal is a
         // `ProjectFileInvalid`, which `main.rs` ends with exit 3.
         let refusal = project_egress_from(
@@ -4934,16 +5057,19 @@ mod tests {
         )
         .expect_err("an unknown protocol refuses the start");
         assert!(
-            matches!(refusal.error, mfile::Error::Format(_)),
+            matches!(
+                refusal.downcast_ref::<ProjectFileInvalid>(),
+                Some(ProjectFileInvalid {
+                    error: mfile::Error::Format(_)
+                })
+            ),
             "{refusal:?}"
         );
-        let refusal = anyhow::Error::from(
-            project_egress_from(
-                b"[defaults.network]\nmode = \"none\"\n\n\
+        let refusal = project_egress_from(
+            b"[defaults.network]\nmode = \"none\"\n\n\
               [defaults.network.egress]\nallow_dns_hosts = [\"a.example\"]\n",
-            )
-            .expect_err("egress with mode none refuses the start"),
-        );
+        )
+        .expect_err("egress with mode none refuses the start");
         let refusal = refusal
             .downcast_ref::<ProjectFileInvalid>()
             .expect("the refusal is an invalid project file");
