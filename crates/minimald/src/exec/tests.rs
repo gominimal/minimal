@@ -5401,3 +5401,138 @@ mod end_to_end {
         let _ = out;
     }
 }
+
+/// A task whose sandbox failed before its command started: nothing on its
+/// stdio, hakoniwa's 125, and the reason kept for the client.
+struct FailedSandbox;
+
+impl super::Process for FailedSandbox {
+    type Stdin = tokio::io::Sink;
+    type Stdout = tokio::io::Empty;
+    type Stderr = tokio::io::Empty;
+
+    fn take_stdio(&mut self) -> Option<(Self::Stdin, Self::Stdout, Self::Stderr)> {
+        Some((tokio::io::sink(), tokio::io::empty(), tokio::io::empty()))
+    }
+
+    async fn wait(&mut self) -> std::io::Result<Option<i32>> {
+        Ok(Some(super::SANDBOX_FAILURE_CODE))
+    }
+
+    fn start_kill(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn exit_notice(&mut self) -> Option<String> {
+        Some(super::sandbox_failure_notice("mount /home/h810: ENOENT"))
+    }
+}
+
+/// A task whose sandbox failed ends with hakoniwa's 125 and nothing of its
+/// own on stdout or stderr; the reason reaches the client's stderr
+/// (inbox#1129). The process goes through [`bridge_noting_reason`], which
+/// wraps it in `StoppedOnDestroy` as production does, so the wrapper must
+/// pass the notice on.
+#[tokio::test]
+async fn a_sandbox_failure_reaches_the_client_stderr() {
+    let (mut bridge_stdout, mut client_stdout) = duplex(64 * 1024);
+    let (mut bridge_stderr, mut client_stderr) = duplex(64 * 1024);
+    let (client_stdin, mut stdin) = duplex(64);
+    drop(client_stdin);
+    let (status, _late) = bridge_noting_reason(
+        "test",
+        futures::stream::iter(vec![Ok(FailedSandbox)]),
+        &mut stdin,
+        &mut bridge_stdout,
+        &mut bridge_stderr,
+        client_lost(),
+        super::UnreadStdin::Keep,
+        None,
+        || false,
+    )
+    .await;
+    drop(bridge_stdout);
+    drop(bridge_stderr);
+    assert_eq!(status, 125);
+    let mut err = String::new();
+    client_stderr.read_to_string(&mut err).await.unwrap();
+    assert_eq!(err, "the task's sandbox failed: mount /home/h810: ENOENT\n");
+    let mut out = Vec::new();
+    client_stdout.read_to_end(&mut out).await.unwrap();
+    assert!(out.is_empty());
+}
+
+/// Only hakoniwa's own container failure counts: a command that exits 125
+/// itself, one that was signalled, a container that a SIGKILL ended, and a
+/// task the daemon killed are not reported as a sandbox failure.
+#[test]
+fn only_a_container_failure_is_a_sandbox_failure() {
+    let status = |code, exit_code: Option<i32>, reason: &str| hakoniwa::ExitStatus {
+        code,
+        reason: reason.to_string(),
+        exit_code,
+        rusage: None,
+        proc_pid_smaps_rollup: None,
+        proc_pid_status: None,
+    };
+    assert_eq!(
+        super::sandbox_failure(&status(125, None, "mount /home/h810: ENOENT"), false),
+        Some("mount /home/h810: ENOENT".to_string())
+    );
+    assert_eq!(
+        super::sandbox_failure(
+            &status(125, Some(125), "process(bash) exited with code 125"),
+            false
+        ),
+        None
+    );
+    assert_eq!(
+        super::sandbox_failure(
+            &status(137, None, "process(bash) received signal SIGKILL"),
+            false
+        ),
+        None
+    );
+    assert_eq!(
+        super::sandbox_failure(&status(125, None, super::CONTAINER_SIGKILL_REASON), false),
+        None,
+        "a container that a SIGKILL ended may have run its command"
+    );
+    assert_eq!(
+        super::sandbox_failure(&status(125, None, "mount /home/h810: ENOENT"), true),
+        None,
+        "a task the daemon killed is not a sandbox failure"
+    );
+}
+
+/// The notice quotes hakoniwa's reason, which can name a path the box
+/// chose; a control character in it is escaped, so the notice stays one line.
+#[test]
+fn the_sandbox_failure_notice_escapes_control_characters() {
+    assert_eq!(
+        super::sandbox_failure_notice("mount /home/x\n\u{1b}[2J: ENOENT"),
+        "the task's sandbox failed: mount /home/x\\n\\u{1b}[2J: ENOENT\n"
+    );
+}
+
+/// A client that stops reading does not hold the status back: the exit
+/// notice write gives up after [`super::EXIT_NOTICE_BOUND`].
+#[tokio::test(start_paused = true)]
+async fn an_unread_exit_notice_does_not_hold_the_status() {
+    let (mut bridge_stdout, _client_stdout) = duplex(64 * 1024);
+    // One byte of room and nobody reading: the notice write never completes.
+    let (mut bridge_stderr, _client_stderr) = duplex(1);
+    let (client_stdin, mut stdin) = duplex(64);
+    drop(client_stdin);
+    let status = bridge(
+        "test",
+        futures::stream::iter(vec![Ok(FailedSandbox)]),
+        &mut stdin,
+        &mut bridge_stdout,
+        &mut bridge_stderr,
+        client_lost(),
+        super::UnreadStdin::Keep,
+    )
+    .await;
+    assert_eq!(status, 125);
+}

@@ -3195,7 +3195,7 @@ fn unescape_run_item(item: &str) -> String {
 /// `text` with each control character escaped (`\n`, `\r`, `\u{1b}`), for
 /// a name or a path that the channel echoes. A newline in it would start a
 /// protocol line of its own, such as `exit:0`.
-fn one_line(text: &str) -> std::borrow::Cow<'_, str> {
+pub(crate) fn one_line(text: &str) -> std::borrow::Cow<'_, str> {
     if !text.chars().any(char::is_control) {
         return text.into();
     }
