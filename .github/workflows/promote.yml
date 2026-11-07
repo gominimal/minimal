@@ -29,6 +29,11 @@ on:
                 required: false
                 type: boolean
                 default: false
+            rollback:
+                description: "Move stable to a version below the current one, on purpose. Without this, a lower version is refused"
+                required: false
+                type: boolean
+                default: false
 
 env:
     # The gate's approvers are the members of this team of the repository's
@@ -99,6 +104,7 @@ jobs:
                   TARGET_INPUT: ${{ inputs.target }}
                   DRY_RUN: ${{ inputs.dry_run }}
                   OVERRIDE_PROVENANCE: ${{ inputs.override_provenance }}
+                  ROLLBACK: ${{ inputs.rollback }}
               run: |
                   set -euo pipefail
                   BODY="**Repo:** \`${REPO}\`
@@ -109,6 +115,7 @@ jobs:
                   **Target channel:** \`${TARGET_INPUT}\`
                   **Dry run:** \`${DRY_RUN}\`
                   **Smoke-provenance override (EMERGENCY):** \`${OVERRIDE_PROVENANCE}\`
+                  **Rollback:** \`${ROLLBACK}\`
 
                   Comment **\`approved\`** to proceed or **\`denied\`** to cancel.
                   Closing this issue without an approval comment counts as denial.
@@ -222,6 +229,7 @@ jobs:
                   INPUT_VERSION: ${{ inputs.version }}
                   INPUT_TARGET: ${{ inputs.target }}
                   OVERRIDE_PROVENANCE: ${{ inputs.override_provenance }}
+                  ROLLBACK: ${{ inputs.rollback }}
               run: |
                   set -euo pipefail
                   # Trim leading/trailing whitespace; users often paste versions with stray spaces.
@@ -236,6 +244,15 @@ jobs:
                     # deliberately, never as "whatever is newest".
                     VERSION="$(scripts/latest-staged-version.sh --bucket gs://minimal-one)"
                     echo "Latest staged SHA: ${VERSION}"
+                  fi
+
+                  # Checked here, after the approval, because `stable` can move
+                  # while the gate waits. An unreadable `stable` stops the run.
+                  if [ "$TARGET" = "stable" ]; then
+                    CURRENT="$(gcloud storage cat gs://minimal-one/stable)"
+                    ROLLBACK_FLAG=""
+                    [ "$ROLLBACK" = "true" ] && ROLLBACK_FLAG="--rollback"
+                    scripts/check-promotion.sh --version "$VERSION" --current "$CURRENT" $ROLLBACK_FLAG
                   fi
 
                   # Provenance gate: the row's bytes must be the bytes a
