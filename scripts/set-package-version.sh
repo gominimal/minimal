@@ -33,7 +33,7 @@ done
 
 toml="$REPO/Cargo.toml"
 lock="$REPO/Cargo.lock"
-[ -f "$toml" ] && [ -f "$lock" ] || die "no Cargo.toml and Cargo.lock in $REPO"
+if [ ! -f "$toml" ] || [ ! -f "$lock" ]; then die "no Cargo.toml and Cargo.lock in $REPO"; fi
 
 old="$(sed -n 's/^package\.version[[:space:]]*=[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' "$toml" | head -n 1)"
 [ -n "$old" ] || die "could not read package.version from $toml"
