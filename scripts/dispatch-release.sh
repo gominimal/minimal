@@ -38,7 +38,7 @@ while [ $# -gt 0 ]; do
         *)         die "unknown argument: $1 (try --help)" ;;
     esac
 done
-[ -n "$LINE" ] && [ -n "$SHA" ] || die "--line and --sha are required"
+if [ -z "$LINE" ] || [ -z "$SHA" ]; then die "--line and --sha are required"; fi
 [ "$DRY_RUN" = "true" ] || [ "$DRY_RUN" = "false" ] || die "--dry-run must be true or false"
 [ -n "${GITHUB_REPOSITORY:-}" ] || die "GITHUB_REPOSITORY is not set"
 repo="repos/$GITHUB_REPOSITORY"
