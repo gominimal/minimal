@@ -169,6 +169,9 @@ pub(crate) enum Why {
     Absolute { link: PathBuf, to: PathBuf },
     /// More than [`MAX_LINKS`] links on the path: they loop.
     Loop,
+    /// The path goes on, by a name or a `..`, after `at` (relative to the
+    /// tree), which is not a directory.
+    NotDir { at: PathBuf },
     /// The kernel refused the path with this errno (`EXDEV`, `ELOOP`) and a
     /// walk of it afterwards found nothing to blame: a link the box changed
     /// in between, or a `/proc` magic link.
@@ -195,6 +198,7 @@ impl Refused {
     pub(crate) fn errno(&self) -> i32 {
         match self.why {
             Why::Loop => libc::ELOOP,
+            Why::NotDir { .. } => libc::ENOTDIR,
             Why::Kernel(errno) => errno,
             Why::Climbs | Why::LinkClimbs { .. } | Why::Absolute { .. } => libc::EXDEV,
         }
@@ -254,6 +258,12 @@ impl std::fmt::Display for Refused {
                 f,
                 "the patch path `{path}` goes through more than {MAX_LINKS} symbolic links, so \
                  they loop; remove the loop among the links on it"
+            ),
+            Why::NotDir { at } => write!(
+                f,
+                "`{}`, on the patch path `{path}`, is not a directory, so the path cannot go on \
+                 after it; name the patch by a path through directories",
+                self.show(at)
             ),
             Why::Kernel(libc::ELOOP) => write!(
                 f,
@@ -704,14 +714,38 @@ enum Part {
 /// target read and spliced in front of the rest of the path, so a relative
 /// link is followed from where it is, whatever it climbs, while it stays in
 /// the tree; a `..` takes the last name off the path reached. A `..` with no
-/// name left to take is above the tree, and an absolute link is refused
-/// before it is followed: each is a [`Refused`], as is a loop. A missing name
-/// is made in the directory reached, with `mkdirat(2)` or an `O_EXCL |
-/// O_NOFOLLOW` create, neither of which follows a link. Every directory the
-/// walk opens or makes in is one the kernel resolved beneath `root`, so
-/// whatever the box swaps in meanwhile, nothing is opened or made out of
-/// the tree.
+/// name left to take is above the tree, an absolute link is refused before
+/// it is followed, and a name or `..` after something that is not a
+/// directory is refused as the kernel would (`ENOTDIR`): each is a
+/// [`Refused`], as is a loop.
+///
+/// The whole path is walked once without making anything first (see
+/// [`walk_pass`]), so a refusal anywhere on it leaves nothing behind; only
+/// then is it walked again, making each missing name in the directory
+/// reached, with `mkdirat(2)` or an `O_EXCL | O_NOFOLLOW` create, neither of
+/// which follows a link. Every directory the walk opens or makes in is one
+/// the kernel resolved beneath `root`, so whatever the box swaps in
+/// meanwhile, nothing is opened or made out of the tree; a swap between the
+/// two passes can at most leave a directory made in the tree before the
+/// second pass refuses.
 fn walk(
+    root: BorrowedFd<'_>,
+    view: TreeView<'_>,
+    rel: &Path,
+    make: Option<Make<'_>>,
+) -> io::Result<()> {
+    walk_pass(root, view, rel, None)?;
+    match make {
+        Some(make) => walk_pass(root, view, rel, Some(make)),
+        None => Ok(()),
+    }
+}
+
+/// One pass of a [`walk`]. Without `make` it makes nothing: a missing name
+/// and every name after it on the reached path are new, so they are taken
+/// as plain names with nothing to look up, until a `..` climbs back above
+/// them.
+fn walk_pass(
     root: BorrowedFd<'_>,
     view: TreeView<'_>,
     rel: &Path,
@@ -721,7 +755,16 @@ fn walk(
     push_parts(&mut todo, rel, None)?;
     let mut links: Vec<(PathBuf, PathBuf)> = Vec::new();
     let mut reached: Vec<OsString> = Vec::new();
+    // How many names at the end of `reached` do not exist (a pass without
+    // `make` only), and whether the last one is something other than a
+    // directory, which nothing may follow.
+    let mut fresh = 0usize;
+    let mut not_dir = false;
     while let Some(part) = todo.pop() {
+        if not_dir {
+            let at = reached.iter().collect();
+            return Err(refused(view, rel, Why::NotDir { at }));
+        }
         let name = match part {
             Part::Name(name) => name,
             Part::Up(from) => {
@@ -735,15 +778,23 @@ fn walk(
                     };
                     return Err(refused(view, rel, why));
                 }
+                fresh = fresh.saturating_sub(1);
                 continue;
             }
         };
+        if fresh > 0 {
+            reached.push(name);
+            fresh += 1;
+            continue;
+        }
         let dir = open_reached(root, &reached)?;
         let flags = libc::O_PATH | libc::O_NOFOLLOW;
         match openat2(dir.as_fd(), Path::new(&name), flags, RESOLVE_IN_TREE) {
             Ok(fd) => {
                 let found = std::fs::File::from(fd);
-                if !found.metadata()?.file_type().is_symlink() {
+                let meta = found.metadata()?;
+                if !meta.file_type().is_symlink() {
+                    not_dir = !meta.is_dir();
                     reached.push(name);
                     continue;
                 }
@@ -760,7 +811,9 @@ fn walk(
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 let Some(make) = make else {
-                    return Err(e);
+                    reached.push(name);
+                    fresh = 1;
+                    continue;
                 };
                 if make.is_file && todo.is_empty() {
                     create_file(dir.as_fd(), &name, make.contents)?;
@@ -1358,6 +1411,47 @@ mod tests {
         let (looped, text) = refusal_of("loop-a");
         assert_eq!(looped, Why::Loop);
         assert!(text.contains("loop"), "{text}");
+    }
+
+    /// A refusal anywhere on the path leaves nothing behind: the walk makes
+    /// nothing until the whole path is known to stay in the home, also when a
+    /// missing name comes before the `..`, link or loop that is refused. A
+    /// name or `..` after a file is refused as not a directory.
+    #[test]
+    fn a_refused_create_leaves_nothing_behind() {
+        let (_root, home, outside) = home_and_outside();
+        std::os::unix::fs::symlink("n/../../outside", home.join("climbs")).unwrap();
+        std::os::unix::fs::symlink(&outside, home.join("abs")).unwrap();
+        std::os::unix::fs::symlink("m/../loop-b", home.join("loop-a")).unwrap();
+        std::os::unix::fs::symlink("m/../loop-a", home.join("loop-b")).unwrap();
+        let cases: [(&str, &str, fn(&Why) -> bool); 5] = [
+            ("climbs/new", "n", |w| matches!(w, Why::LinkClimbs { .. })),
+            ("x/new/../../..", "x/new", |w| *w == Why::Climbs),
+            ("new2/../abs/new", "new2", |w| {
+                matches!(w, Why::Absolute { .. })
+            }),
+            ("loop-a/new", "m", |w| *w == Why::Loop),
+            ("x/token/../y", "x/y", |w| matches!(w, Why::NotDir { .. })),
+        ];
+        for (path, left, kind) in cases {
+            for is_file in [false, true] {
+                let err = create_beneath(&home, HOME, Path::new(path), is_file, b"{}");
+                let err = err.unwrap_err();
+                assert!(kind(why(&err, path)), "{path}: {err}");
+                assert!(
+                    std::fs::symlink_metadata(home.join(left)).is_err(),
+                    "{path}: `{left}` was left behind in the home"
+                );
+            }
+        }
+        let err = create_beneath(&home, HOME, Path::new("x/token/../y"), false, b"").unwrap_err();
+        assert_eq!(errno_of(&err), Some(libc::ENOTDIR));
+        assert!(
+            err.to_string()
+                .starts_with("`~/x/token`, on the patch path `~/x/token/../y`, is not a directory"),
+            "{err}"
+        );
+        assert!(!outside.join("new").exists(), "nothing was made outside");
     }
 
     /// The stow shape (inbox#1152 review): `~/.config/nvim` is a relative
