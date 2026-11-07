@@ -121,3 +121,27 @@ embedded standard library, in
 | `tests` | Map&lt;String, Test> | A list of tests that are run by [`mip check`](./cli-mip.md#check). |
 | `target` | String | The target string this package supports. Defaults to the current target. |
 | `prebuilt` | Bool | Indicates that a package is not built, but just the unpacked files from the first `Source` object in `build_deps`. |
+
+## Build boxes
+
+A package build for a box runs in a build box. A build box is a box of the
+`build` type. It holds the package's declared inputs and dependency outputs,
+and nothing of the box it builds for. A build that
+declares neither `needs.dns` nor `needs.internet`, on the package or in its
+dependencies, runs its steps in an empty network namespace.
+
+Where the package comes from decides what its build box can reach:
+
+| Package | Reach |
+|---|---|
+| From an `[upstream]` or a sideload, at the pin `minimal.toml` held when `min` created the box | The hosts of its declared sources and the hosts they redirect to, for the fetch alone. With `needs.dns` or `needs.internet`, on the package or in its dependencies, the internet. |
+| Written in the project, patched, or changed inside the box | The box's own rules. A box that admits nothing refuses a build that needs the network. |
+
+`min` reads the pins when it creates the box. The same reach applies to a
+package you add to a running box with `min add`. A change to `[upstream]` or
+its pin inside a box gives that box nothing new: the builds it changes follow
+the box's own rules. The next box you create reads your `minimal.toml`.
+
+While a build box runs, [`min box list`](./cli-min.md) lists it under the box
+it builds for, and `min session policy` and `min box show` print what it can
+reach. That reach is the build box's. The box's own rules do not change.
