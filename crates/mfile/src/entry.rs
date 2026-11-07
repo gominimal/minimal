@@ -89,6 +89,46 @@ pub struct BoxEntry {
     /// The entry's keys as the file wrote them, with `type` set to
     /// [`BoxEntry::box_type`] when it is known.
     pub body: toml::Table,
+    /// Whether the file does not declare the entry: the implicit default
+    /// session entry (BOX-165) that [`implicit_default_entry`] gives.
+    pub implicit: bool,
+}
+
+/// The name of the implicit default session entry.
+pub const DEFAULT_ENTRY_NAME: &str = "default";
+
+/// The implicit `[sessions.default]` entry of a project, when the project
+/// needs one (BOX-165).
+///
+/// A project needs one when none of `entries` has the type `session` or a
+/// type whose built-in root is `session`, and no entry is named `default`.
+/// A project with no `minimal.toml` has no entries, so it needs one.
+/// `builtin_root` gives the built-in root of a type: for a built-in type,
+/// the type itself, and `None` for a type it cannot resolve.
+///
+/// The entry has an empty body: it sets no value of its own, so every
+/// value of its expansion comes from the project's other layers.
+#[must_use]
+pub fn implicit_default_entry(
+    entries: &[BoxEntry],
+    builtin_root: impl Fn(&str) -> Option<&'static str>,
+) -> Option<BoxEntry> {
+    let blocks = |e: &BoxEntry| {
+        e.name == DEFAULT_ENTRY_NAME
+            || e.box_type
+                .as_deref()
+                .is_some_and(|t| t == "session" || builtin_root(t) == Some("session"))
+    };
+    if entries.iter().any(blocks) {
+        return None;
+    }
+    Some(BoxEntry {
+        name: DEFAULT_ENTRY_NAME.to_owned(),
+        table: EntryTable::Sessions,
+        box_type: Some("session".to_owned()),
+        body: toml::Table::new(),
+        implicit: true,
+    })
 }
 
 /// The entry tables of a `minimal.toml`. Every other key is ignored here.
@@ -153,6 +193,7 @@ pub fn read_entries(bytes: &[u8]) -> Result<Vec<BoxEntry>, Error> {
                 table,
                 box_type,
                 body,
+                implicit: false,
             });
         }
     }

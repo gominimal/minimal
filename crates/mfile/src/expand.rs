@@ -127,6 +127,9 @@ impl ValueOrigin {
 pub struct ExpansionReport {
     /// The origin of each top-level key's value, by key.
     pub values: BTreeMap<String, ValueOrigin>,
+    /// Whether the expanded entry is the implicit default session entry,
+    /// which the file does not declare (BOX-165).
+    pub implicit: bool,
 }
 
 /// The layers of one entry that are not in the entry's own table. Each
@@ -239,7 +242,8 @@ pub fn expand(entry: &BoxEntry, layers: &Layers) -> Result<Expansion, Error> {
     ordered.push((Origin::of(Layer::Entry), &entry.body));
     ordered.push((Origin::of(Layer::Loadouts), &layers.loadouts));
     ordered.push((Origin::of(Layer::Overrides), &layers.overrides));
-    let expansion = fold(&ordered);
+    let mut expansion = fold(&ordered);
+    expansion.report.implicit = entry.implicit;
     check_keys(entry, &expansion)?;
     Ok(expansion)
 }
@@ -592,7 +596,7 @@ fn layer_words(entry: &BoxEntry, origin: Option<&Origin>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entry::read_entries;
+    use crate::entry::{DEFAULT_ENTRY_NAME, EntryTable, implicit_default_entry, read_entries};
     use proptest::prelude::*;
 
     fn table(src: &str) -> toml::Table {
@@ -1270,5 +1274,144 @@ mod tests {
         ] {
             assert!(!bytes.contains(word), "{word} in {bytes}");
         }
+    }
+
+    /// The built-in root of a type, for the implicit default tests: each
+    /// built-in type is its own root, and `rust-dev` has the root `session`.
+    fn test_root(t: &str) -> Option<&'static str> {
+        BUILTIN_BOX_TYPES
+            .into_iter()
+            .find(|b| *b == t)
+            .or((t == "rust-dev").then_some("session"))
+    }
+
+    /// The implicit default entry of `file`, if the file needs one.
+    fn implicit_in(file: &str) -> Option<BoxEntry> {
+        let entries = read_entries(file.as_bytes()).expect("entries read");
+        implicit_default_entry(&entries, test_root)
+    }
+
+    // BOX-165: a project with no session entry expands an implicit
+    // `[sessions.default]` from its other layers, with no entry layer.
+    #[test]
+    fn no_session_entry_expands_implicit_default_session() {
+        let file = r#"
+            [defaults]
+            packages = ["git"]
+            timeout = "2h"
+
+            [defaults.session]
+            packages = ["fish"]
+            pty_enabled = true
+
+            [defaults.task]
+            timeout = "5m"
+
+            [tasks.test]
+            exec = ["cargo", "test"]
+
+            [boxes.ci]
+            type = "build"
+        "#;
+        let entry = implicit_in(file).expect("an implicit default entry");
+        assert_eq!(entry.name, DEFAULT_ENTRY_NAME);
+        assert_eq!(entry.table, EntryTable::Sessions);
+        assert_eq!(entry.box_type.as_deref(), Some("session"));
+        assert!(entry.body.is_empty(), "{:?}", entry.body);
+        assert!(entry.implicit);
+
+        let doc = table(file);
+        let defaults = doc["defaults"].as_table().expect("a table");
+        let layers = Layers {
+            upstream: table("commit = \"abc123\""),
+            type_defaults: vec![("session".to_owned(), table("lifetime = \"until_complete\""))],
+            ..Layers::default()
+        }
+        .with_file_defaults(defaults, entry.box_type.as_deref(), &BTreeSet::new());
+        let e = expand(&entry, &layers).expect("expands");
+
+        assert_eq!(strings(e.spec.get("packages")), ["git", "fish"]);
+        assert_eq!(e.spec["timeout"].as_str(), Some("2h"));
+        assert_eq!(e.spec["pty_enabled"].as_bool(), Some(true));
+        assert_eq!(e.spec["lifetime"].as_str(), Some("until_complete"));
+        assert!(e.spec.contains_key("upstream"));
+        assert!(!e.spec.contains_key("exec"), "{:?}", e.spec);
+        // No value comes from an entry layer.
+        for (key, origin) in &e.report.values {
+            let origins = match origin {
+                ValueOrigin::Value(o) => vec![o],
+                ValueOrigin::List(items) => items.iter().collect(),
+            };
+            assert!(
+                origins.iter().all(|o| o.layer != Layer::Entry),
+                "{key}: {origin:?}"
+            );
+        }
+
+        // A project with no minimal.toml has no entries, and gets one too.
+        let none = implicit_default_entry(&[], test_root).expect("an implicit entry");
+        assert_eq!(none, entry);
+        let e = expand(&none, &Layers::default()).expect("expands");
+        assert!(e.spec.is_empty(), "{:?}", e.spec);
+        assert!(e.report.implicit);
+
+        // A session entry, direct or through a type rooted at `session`,
+        // means no implicit entry.
+        for file in [
+            "[sessions.dev]\n",
+            "[boxes.dev]\ntype = \"session\"\n",
+            "[boxes.dev]\ntype = \"rust-dev\"\n",
+            "[sessions.default]\n",
+        ] {
+            assert_eq!(implicit_in(file), None, "{file}");
+        }
+    }
+
+    // BOX-165: an entry named `default` whose type is not rooted at
+    // `session` blocks the implicit default.
+    #[test]
+    fn non_session_default_entry_blocks_implicit_default() {
+        for file in [
+            "[tasks.default]\nexec = [\"true\"]\n",
+            "[boxes.default]\ntype = \"build\"\n",
+            "[boxes.default]\ntype = \"unknown-type\"\n",
+            "[boxes.default]\n",
+            "[agents.default]\n",
+        ] {
+            assert_eq!(implicit_in(file), None, "{file}");
+        }
+        // Another name with the same type does not block it.
+        assert!(implicit_in("[tasks.other]\n").is_some());
+    }
+
+    // BOX-161: the report of the implicit default entry marks it implicit,
+    // and the report of a declared entry does not.
+    #[test]
+    fn implicit_default_entry_reported_as_implicit() {
+        let file = "[defaults.session]\npty_enabled = true\n";
+        let entry = implicit_in(file).expect("an implicit default entry");
+        let layers = Layers::default().with_file_defaults(
+            table(file)["defaults"].as_table().expect("a table"),
+            Some("session"),
+            &BTreeSet::new(),
+        );
+        let implicit = expand(&entry, &layers).expect("expands");
+        assert!(implicit.report.implicit);
+        assert_eq!(
+            implicit.report.values["pty_enabled"],
+            ValueOrigin::Value(Origin::of(Layer::DefaultsType))
+        );
+
+        // The mark is beside the spec, never in its bytes.
+        let bytes = implicit.spec_bytes().expect("writes");
+        assert!(!bytes.contains("implicit"), "{bytes}");
+
+        let declared = expand_in(
+            "[sessions.default]\n[defaults.session]\npty_enabled = true\n",
+            "default",
+            Layers::default(),
+        )
+        .expect("expands");
+        assert!(!declared.report.implicit);
     }
 }
