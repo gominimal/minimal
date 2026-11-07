@@ -156,6 +156,10 @@ on it. Then the workflow does these things, in this order:
 If the release publish job fails, fix the cause and use **Re-run failed jobs**
 on the same run.
 
+The promotion also opens a PR that moves `release/X.Y.x` to the next patch.
+Someone on the team reviews and merges it before the next stage. If that job
+fails, use **Re-run failed jobs** too.
+
 ### 7. Clean up
 
 If the release commit is not on `main`, merge the tag back into `main`
@@ -636,6 +640,18 @@ approval issue shows that choice.
 **Channel move and docs.** `set-channel.sh` moves the channel. The job then
 sends a `reference-docs-promoted` event to `gominimal/webapp` with the release
 commit, and the docs site at docs.minimal.dev rebuilds from that commit.
+
+**Next-patch bump.** After a real `stable` promotion of `X.Y.Z`, the `bump-line`
+job sets `package.version` to the next patch with
+[`scripts/set-package-version.sh`](../../scripts/set-package-version.sh). It opens
+a PR from `chore/bump-X.Y.Z+1` to `release/X.Y.x`, as the `gominimal-aw-bot` App, so
+CI runs on the PR. The job does nothing unless the line still declares the version
+it just promoted, so a rollback changes nothing. A rerun also changes nothing,
+because the branch is already there. The job does nothing for a nightly commit
+hash, or when the line does not exist.
+
+To start the next version with a candidate, change the PR to `X.Y.Z-rc1` before
+you merge it.
 
 **Release publish.** A `stable` promotion that is not a dry run then runs
 the `publish` job. It publishes the draft `vX.Y.Z`. Publication creates the
