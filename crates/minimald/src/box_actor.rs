@@ -1555,7 +1555,9 @@ impl BoxActor {
         }
         if let Err(error) = self.launch_host_for_hooks(LaunchPhase::Attached).await {
             tracing::info!(%error, "resume: launching the box for its on_activate hooks failed");
-            return Err(format!("It could not start to run its activation hooks: {error}."));
+            return Err(format!(
+                "It could not start to run its activation hooks: {error}."
+            ));
         }
         let outcomes = run_session_hooks(&self.inner, &self.record, event).await;
         tracing::Span::current().record("activate_hooks", outcomes.len());
