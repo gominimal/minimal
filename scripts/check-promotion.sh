@@ -34,7 +34,7 @@ while [ $# -gt 0 ]; do
         *)          die "unknown argument: $1 (try --help)" ;;
     esac
 done
-[ -n "$VERSION" ] && [ -n "$CURRENT" ] || die "--version and --current are required"
+if [ -z "$VERSION" ] || [ -z "$CURRENT" ]; then die "--version and --current are required"; fi
 
 core='[0-9]+\.[0-9]+\.[0-9]+'
 sha='[0-9a-f]{7,40}'
