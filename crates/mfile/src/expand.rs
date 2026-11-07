@@ -355,7 +355,7 @@ fn canonical_value(value: &toml::Value) -> toml::Value {
 enum Shape {
     Str,
     Bool,
-    StrOrInt,
+    Duration,
     StrList,
     StrOrStrList,
     Table,
@@ -369,7 +369,7 @@ impl Shape {
         match self {
             Shape::Str => "a string",
             Shape::Bool => "true or false",
-            Shape::StrOrInt => "a string or a whole number",
+            Shape::Duration => crate::duration::TIMEOUT_TAKES,
             Shape::StrList => "a list of strings",
             Shape::StrOrStrList => "a string or a list of strings",
             Shape::Table => "a table",
@@ -381,11 +381,13 @@ impl Shape {
     /// `None` when `value` has this shape, else what the value is, as the
     /// error message names it.
     fn mismatch(self, value: &toml::Value) -> Option<&'static str> {
+        if let Shape::Duration = self {
+            return crate::duration::spec_timeout(value).err();
+        }
         let all_strings = |items: &[toml::Value]| items.iter().all(toml::Value::is_str);
         let fits = match (self, value) {
             (Shape::Str, toml::Value::String(_))
             | (Shape::Bool, toml::Value::Boolean(_))
-            | (Shape::StrOrInt, toml::Value::String(_) | toml::Value::Integer(_))
             | (Shape::StrOrStrList, toml::Value::String(_))
             | (Shape::Table | Shape::TableOrList, toml::Value::Table(_))
             | (Shape::List | Shape::TableOrList, toml::Value::Array(_)) => true,
@@ -402,7 +404,7 @@ impl Shape {
 }
 
 /// What a value is, as the error message names it.
-const fn value_words(value: &toml::Value) -> &'static str {
+pub(crate) const fn value_words(value: &toml::Value) -> &'static str {
     match value {
         toml::Value::String(_) => "a string",
         toml::Value::Integer(_) => "a whole number",
@@ -466,7 +468,7 @@ const SPEC_KEYS: &[(&str, Shape)] = &[
     ("restart", Shape::Str),
     ("secrets", Shape::Table),
     ("state_key", Shape::Str),
-    ("timeout", Shape::StrOrInt),
+    ("timeout", Shape::Duration),
     ("type", Shape::Str),
     ("upstream", Shape::Table),
     ("vars", Shape::Table),
@@ -805,16 +807,16 @@ mod tests {
         let file = r#"
             [defaults]
             packages = ["d"]
-            timeout = "defaults"
+            timeout = "1s"
             machine = { cpus = 3 }
 
             [defaults.session]
             packages = ["ds"]
-            timeout = "defaults.session"
+            timeout = "2s"
 
             [sessions.dev]
             packages = ["e"]
-            timeout = "entry"
+            timeout = "3s"
         "#;
         let layers = || Layers {
             upstream: table(
@@ -823,19 +825,19 @@ mod tests {
             type_defaults: vec![
                 (
                     "session".to_owned(),
-                    table("packages = [\"u\"]\ntimeout = \"upstream\"\npty_enabled = false"),
+                    table("packages = [\"u\"]\ntimeout = \"4s\"\npty_enabled = false"),
                 ),
                 (
                     "rust-dev".to_owned(),
-                    table("packages = [\"t1\"]\ntimeout = \"t1\""),
+                    table("packages = [\"t1\"]\ntimeout = \"5s\""),
                 ),
                 (
                     "rust-dev-plus".to_owned(),
-                    table("packages = [\"t2\"]\ntimeout = \"t2\""),
+                    table("packages = [\"t2\"]\ntimeout = \"6s\""),
                 ),
             ],
-            loadouts: table("packages = [\"l\", \"u\"]\ntimeout = \"loadouts\""),
-            overrides: table("timeout = \"overrides\"\nmachine = { memory = \"1G\" }"),
+            loadouts: table("packages = [\"l\", \"u\"]\ntimeout = \"7s\""),
+            overrides: table("timeout = \"8s\"\nmachine = { memory = \"1G\" }"),
             ..Layers::default()
         };
         let all = expand_in(file, "dev", layers()).expect("expands");
@@ -843,7 +845,7 @@ mod tests {
             strings(all.spec.get("packages")),
             ["u", "t1", "t2", "d", "ds", "e", "l"]
         );
-        assert_eq!(all.spec["timeout"].as_str(), Some("overrides"));
+        assert_eq!(all.spec["timeout"].as_str(), Some("8s"));
         assert_eq!(
             all.spec["machine"],
             toml::Value::Table(table("memory = \"1G\""))
@@ -866,23 +868,23 @@ mod tests {
         let mut l = layers();
         l.overrides = toml::Table::new();
         let e = expand_in(file, "dev", l.clone()).expect("expands");
-        assert_eq!(e.spec["timeout"].as_str(), Some("loadouts"));
+        assert_eq!(e.spec["timeout"].as_str(), Some("7s"));
         assert_eq!(e.spec["machine"], toml::Value::Table(table("cpus = 3")));
         l.loadouts = toml::Table::new();
         let e = expand_in(file, "dev", l.clone()).expect("expands");
-        assert_eq!(e.spec["timeout"].as_str(), Some("entry"));
-        let file_no_entry_timeout = file.replace("timeout = \"entry\"", "");
+        assert_eq!(e.spec["timeout"].as_str(), Some("3s"));
+        let file_no_entry_timeout = file.replace("timeout = \"3s\"", "");
         let e = expand_in(&file_no_entry_timeout, "dev", l.clone()).expect("expands");
-        assert_eq!(e.spec["timeout"].as_str(), Some("defaults.session"));
+        assert_eq!(e.spec["timeout"].as_str(), Some("2s"));
         let only_upstream_and_types = "[sessions.dev]\n";
         let e = expand_in(only_upstream_and_types, "dev", l.clone()).expect("expands");
-        assert_eq!(e.spec["timeout"].as_str(), Some("t2"));
+        assert_eq!(e.spec["timeout"].as_str(), Some("6s"));
         l.type_defaults.pop();
         let e = expand_in(only_upstream_and_types, "dev", l.clone()).expect("expands");
-        assert_eq!(e.spec["timeout"].as_str(), Some("t1"));
+        assert_eq!(e.spec["timeout"].as_str(), Some("5s"));
         l.type_defaults.pop();
         let e = expand_in(only_upstream_and_types, "dev", l.clone()).expect("expands");
-        assert_eq!(e.spec["timeout"].as_str(), Some("upstream"));
+        assert_eq!(e.spec["timeout"].as_str(), Some("4s"));
         l.type_defaults.clear();
         let e = expand_in(only_upstream_and_types, "dev", l).expect("expands");
         assert_eq!(e.spec.get("timeout"), None);
@@ -1044,7 +1046,15 @@ mod tests {
     // shape, exits 3 and names the key and the layer that set it.
     #[test]
     fn invalid_key_exit3_names_key_and_layer() {
-        let cases: [(&str, Layers, &str); 9] = [
+        let cases: [(&str, Layers, &str); 10] = [
+            (
+                "[sessions.dev]\ntimeout = \"2 days\"\n",
+                Layers::default(),
+                "`[sessions.dev]` in minimal.toml sets `timeout` to a string that is \
+                 not a duration, but `timeout` takes a whole number of seconds, or a \
+                 string of a whole number followed by s, m or h, such as \"30s\", \
+                 \"5m\" or \"1h\". Fix the value.",
+            ),
             (
                 "[defaults]\ntimeot = \"2h\"\n[sessions.dev]\n",
                 Layers::default(),
@@ -1078,8 +1088,9 @@ mod tests {
                     ..Layers::default()
                 },
                 "the `defaults` table of `[box_types.rust-dev]` sets `timeout` to a \
-                 decimal number, but `timeout` takes a string or a whole number. \
-                 Fix the value.",
+                 decimal number, but `timeout` takes a whole number of seconds, or a \
+                 string of a whole number followed by s, m or h, such as \"30s\", \
+                 \"5m\" or \"1h\". Fix the value.",
             ),
             (
                 "[sessions.dev]\n",

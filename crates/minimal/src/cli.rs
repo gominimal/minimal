@@ -667,38 +667,12 @@ pub struct BoxExecArgs {
     /// Stop the command when it runs for longer than this: a number of
     /// seconds, or a number followed by s, m or h, such as 30s, 5m or 1h.
     /// The command then ends with exit code 124
-    #[arg(long, value_name = "DURATION", value_parser = parse_exec_timeout)]
+    #[arg(long, value_name = "DURATION", value_parser = mfile::duration::parse_timeout_secs)]
     pub timeout: Option<u64>,
     /// The command and its arguments, after `--`. The command runs as these
     /// words, with no shell
     #[arg(last = true, required = true, num_args = 1.., value_name = "COMMAND")]
     pub command: Vec<String>,
-}
-
-/// Reads a `min box exec --timeout` value as whole seconds: a number of
-/// seconds, or a number followed by `s`, `m` or `h`. Zero is refused, as the
-/// daemon refuses a timeout of zero seconds (BOX-149).
-pub(crate) fn parse_exec_timeout(raw: &str) -> Result<u64, String> {
-    let refused = || {
-        format!(
-            "'{raw}' is not a timeout. Give a whole number of seconds, minutes or hours \
-             that is more than zero, such as 30s, 5m or 1h."
-        )
-    };
-    let (digits, scale) = match raw.char_indices().last() {
-        Some((at, 's')) => (&raw[..at], 1),
-        Some((at, 'm')) => (&raw[..at], 60),
-        Some((at, 'h')) => (&raw[..at], 3600),
-        _ => (raw, 1),
-    };
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(refused());
-    }
-    let count: u64 = digits.parse().map_err(|_| refused())?;
-    match count.checked_mul(scale) {
-        Some(secs) if secs > 0 => Ok(secs),
-        _ => Err(refused()),
-    }
 }
 
 /// Why `min box exec` ran no command in the box: `-t` without a terminal

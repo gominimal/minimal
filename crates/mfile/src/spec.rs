@@ -16,6 +16,9 @@
 //!   or maps them to `box.toml` tables.
 //! - `execution.exec` is an argv array, not the `box.toml` string. A shell
 //!   entrypoint leaves the key out.
+//! - `execution.timeout` is a whole number of seconds, not the `box.toml`
+//!   duration string, and a spec with no timeout leaves the key out in place
+//!   of `"0"`.
 //! - `network.ingress` keeps the [`boxes::IngressPolicy`] shape
 //!   (`port_mappings`, `dynamic_allowed_range`, `dynamic_ingress`), not the
 //!   `box.toml` `[{proto, port}]` list.
@@ -78,6 +81,15 @@ pub struct BoxSpec {
     /// read this key yet. See <https://github.com/gominimal/minimal/issues/3111>,
     /// the task that makes the daemon read it (BOX-028).
     pub hooks_on_resume: bool,
+    /// How long the box may run, in whole seconds, when its entry sets a
+    /// `timeout` other than zero (BOX-049). Serialized as
+    /// `execution.timeout`, and left out when `None`.
+    ///
+    /// The spec stores and round-trips this value, but the daemon does not
+    /// read this key yet, so the box runs with no limit. See
+    /// <https://github.com/gominimal/minimal/issues/3114>, the task that makes
+    /// the daemon end the box at its timeout (BOX-037).
+    pub timeout: Option<u64>,
     /// The box's network settings.
     pub network: SpecNetwork,
 }
@@ -184,14 +196,13 @@ impl BoxSpec {
     #[must_use]
     pub fn for_session(session: Option<&Session>, flags: SpecFlags) -> Self {
         let packages = session.map_or(&[][..], |s| s.packages.as_slice());
-        let hooks_on_resume = session.is_some_and(|s| hooks_on_resume(&s.extra));
         Self::build(
             boxes::SESSION_BOX_TYPE,
             DEFAULT_SESSION_ENTRY,
             packages,
             true,
             Entrypoint::Shell,
-            hooks_on_resume,
+            session.map(|s| &s.extra),
             flags,
         )
     }
@@ -213,7 +224,7 @@ impl BoxSpec {
             &task.packages,
             false,
             Entrypoint::for_task(name),
-            hooks_on_resume(&task.extra),
+            Some(&task.extra),
             flags,
         ))
     }
@@ -224,9 +235,13 @@ impl BoxSpec {
         packages: &[String],
         pty_enabled: bool,
         entrypoint: Entrypoint,
-        hooks_on_resume: bool,
+        extra: Option<&std::collections::HashMap<String, toml::Value>>,
         flags: SpecFlags,
     ) -> Self {
+        // The entry's own keys that its table keeps among the ones it does
+        // not read itself.
+        let hooks_on_resume = extra.is_some_and(hooks_on_resume);
+        let timeout = extra.and_then(entry_timeout);
         let mut seen = std::collections::BTreeSet::new();
         let packages = packages
             .iter()
@@ -246,6 +261,7 @@ impl BoxSpec {
             lifetime: Lifetime::UntilComplete,
             hooks_enabled: flags.hooks_enabled,
             hooks_on_resume,
+            timeout,
             network: SpecNetwork {
                 mode: flags.network,
                 policy: flags.policy,
@@ -269,6 +285,16 @@ fn hooks_on_resume(extra: &std::collections::HashMap<String, toml::Value>) -> bo
         .get("hooks_on_resume")
         .and_then(toml::Value::as_bool)
         .unwrap_or(false)
+}
+
+/// The entry's own `timeout` in whole seconds, read through
+/// [`crate::duration::spec_timeout`]: `None` when the entry sets none or
+/// sets zero. [`crate::File::validate`] refuses a bad value before a spec
+/// is built, so a bad value here reads as `None`.
+fn entry_timeout(extra: &std::collections::HashMap<String, toml::Value>) -> Option<u64> {
+    extra
+        .get("timeout")
+        .and_then(|value| crate::duration::spec_timeout(value).ok().flatten())
 }
 
 /// Whether a flag is unset: the test that leaves `hooks_on_resume` out of
@@ -327,6 +353,9 @@ struct DocExecution {
     /// Absent from a spec that does not set it, which reads as `false`.
     #[serde(default, skip_serializing_if = "is_false")]
     hooks_on_resume: bool,
+    /// Absent from a spec that sets no timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timeout: Option<u64>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -398,6 +427,7 @@ impl From<BoxSpec> for SpecDoc {
                     Entrypoint::Exec(argv) => Some(argv),
                 },
                 hooks_on_resume: spec.hooks_on_resume,
+                timeout: spec.timeout,
             }),
             install: DocInstall {
                 packages: spec.packages,
@@ -413,6 +443,7 @@ impl From<BoxSpec> for SpecDoc {
 impl From<SpecDoc> for BoxSpec {
     fn from(doc: SpecDoc) -> Self {
         let hooks_on_resume = doc.execution.as_ref().is_some_and(|e| e.hooks_on_resume);
+        let timeout = doc.execution.as_ref().and_then(|e| e.timeout);
         let entrypoint = match doc.execution {
             Some(execution) => execution.exec.map_or(Entrypoint::Shell, Entrypoint::Exec),
             None => Entrypoint::implied(&doc.box_table.box_type, &doc.entry),
@@ -429,6 +460,7 @@ impl From<SpecDoc> for BoxSpec {
             lifetime,
             hooks_enabled: doc.hooks_enabled,
             hooks_on_resume,
+            timeout,
             network: SpecNetwork {
                 mode: doc.network.mode,
                 policy: doc.network.policy,
@@ -484,6 +516,7 @@ mod tests {
                 lifetime: Lifetime::UntilComplete,
                 hooks_enabled: false,
                 hooks_on_resume: false,
+                timeout: None,
                 network: SpecNetwork {
                     mode: boxes::NetworkMode::OwnIp,
                     policy: policy.clone(),
@@ -681,6 +714,59 @@ mod tests {
         );
         assert!(value.get("hooks_on_resume").is_none(), "{text}");
         assert_eq!(toml::from_str::<BoxSpec>(&text).unwrap(), plain);
+    }
+
+    // BOX-049: an entry's `timeout` reaches its spec in whole seconds, as
+    // `execution.timeout`. No timeout, or a zero one, leaves the key out.
+    #[test]
+    fn spec_carries_timeout_under_execution() {
+        let file: crate::File = toml::from_str(
+            r#"
+            [session]
+            timeout = "8h"
+
+            [tasks.lint]
+            exec = ["cargo", "clippy"]
+            timeout = 90
+
+            [tasks.zero]
+            exec = ["true"]
+            timeout = "0m"
+
+            [tasks.plain]
+            exec = ["true"]
+            "#,
+        )
+        .unwrap();
+
+        let session = BoxSpec::for_session(file.session.as_ref(), SpecFlags::default());
+        assert_eq!(session.timeout, Some(8 * 3600));
+        let lint = BoxSpec::for_task("lint", &file.tasks["lint"], SpecFlags::default()).unwrap();
+        assert_eq!(lint.timeout, Some(90));
+        for spec in [&session, &lint] {
+            let text = toml::to_string(spec).unwrap();
+            let value: toml::Value = toml::from_str(&text).unwrap();
+            assert_eq!(
+                value["execution"]["timeout"].as_integer(),
+                spec.timeout.map(|t| i64::try_from(t).unwrap()),
+                "{text}"
+            );
+            assert!(value.get("timeout").is_none(), "{text}");
+            assert_eq!(&toml::from_str::<BoxSpec>(&text).unwrap(), spec, "{text}");
+        }
+
+        for name in ["zero", "plain"] {
+            let spec = BoxSpec::for_task(name, &file.tasks[name], SpecFlags::default()).unwrap();
+            assert_eq!(spec.timeout, None, "{name}");
+            let text = toml::to_string(&spec).unwrap();
+            let value: toml::Value = toml::from_str(&text).unwrap();
+            assert!(value["execution"].get("timeout").is_none(), "{text}");
+            assert_eq!(toml::from_str::<BoxSpec>(&text).unwrap(), spec);
+        }
+        assert_eq!(
+            BoxSpec::for_session(None, SpecFlags::default()).timeout,
+            None
+        );
     }
 
     // BOX-163: a box takes the spec's `[box] name`, else the entry's name.
