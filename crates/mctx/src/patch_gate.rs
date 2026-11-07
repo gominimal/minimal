@@ -600,7 +600,10 @@ mod tests {
         assert_eq!(kept, dir_patch(&ok));
 
         let f = t.file("conf/tool.toml");
-        let pol = policy(&format!("[patches]\nallow = [\"{}/**\"]\n", t.root.join("conf")));
+        let pol = policy(&format!(
+            "[patches]\nallow = [\"{}/**\"]\n",
+            t.root.join("conf")
+        ));
         assert_eq!(gate(&t, &file_patch(&f), &pol).unwrap(), file_patch(&f));
     }
 
@@ -610,7 +613,10 @@ mod tests {
     fn a_task_without_patches_passes_untouched() {
         let t = Tree::new();
         let pol = policy("[patches]\ndeny = [\"$UNSET_IN_THIS_TEST/**\"]\n");
-        assert_eq!(gate(&t, &EnvPatches::default(), &pol).unwrap(), EnvPatches::default());
+        assert_eq!(
+            gate(&t, &EnvPatches::default(), &pol).unwrap(),
+            EnvPatches::default()
+        );
     }
 
     /// No rule decides the entry: there is no prompt, so the run is refused

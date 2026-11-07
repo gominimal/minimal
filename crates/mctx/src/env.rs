@@ -2066,8 +2066,14 @@ mod tests {
 
         let lines = read_lines(&theirs);
         let text = lines.join("\n");
-        assert!(text.contains("policy denied"), "unexpected output: {lines:?}");
-        assert!(text.contains("/min-test-1128-denied"), "unexpected output: {lines:?}");
+        assert!(
+            text.contains("policy denied"),
+            "unexpected output: {lines:?}"
+        );
+        assert!(
+            text.contains("/min-test-1128-denied"),
+            "unexpected output: {lines:?}"
+        );
         assert!(
             text.contains(cfg_dir.path().join("user_policy.toml").to_str().unwrap()),
             "the refusal names the policy file: {lines:?}"
