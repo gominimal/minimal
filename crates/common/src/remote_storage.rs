@@ -548,14 +548,15 @@ mod placed {
                             None => system_nameservers()?,
                         };
                         let lookup = lookup_in_cgroup(&self.procs, &nameservers, host);
-                        tokio::time::timeout_at(deadline, lookup)
-                            .await
-                            .map_err(|_| {
-                                io::Error::new(
+                        match tokio::time::timeout_at(deadline, lookup).await {
+                            Ok(found) => found?,
+                            Err(_) => {
+                                return Err(io::Error::new(
                                     io::ErrorKind::TimedOut,
                                     format!("no answer after {:?}", self.connect_timeout),
-                                )
-                            })??
+                                ));
+                            }
+                        }
                     } else {
                         listed
                     }
