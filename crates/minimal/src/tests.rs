@@ -2897,7 +2897,7 @@ async fn proxy_exits_when_the_daemon_closes_the_socket() {
 
 /// `min task run --network` has its own help, worded for a task box: it
 /// names neither a session nor `--ingress`, which `min task run` does not
-/// take. `min session activate --network` keeps the session wording.
+/// take yet (#3163). `min session activate --network` keeps the session wording.
 #[test]
 fn task_run_help_describes_the_task_box_network() {
     use clap::CommandFactory as _;
@@ -2941,7 +2941,7 @@ fn task_run_help_describes_the_task_box_network() {
     );
     assert!(
         !help.contains("--ingress"),
-        "`task run` has no --ingress: {help}"
+        "`task run` does not take --ingress yet (#3163): {help}"
     );
 
     let activate = cmd

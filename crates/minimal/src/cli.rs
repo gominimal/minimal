@@ -1366,8 +1366,8 @@ pub(crate) const NETWORK_LONG_HELP: &str = concat!(
 );
 
 /// The first paragraph of `min task run --network`'s help, as a literal so
-/// that [`TASK_NETWORK_LONG_HELP`] can extend it. A task box has no
-/// `--ingress`, so this names neither a session nor ingress.
+/// that [`TASK_NETWORK_LONG_HELP`] can extend it. `min task run` does not
+/// take `--ingress` yet (#3163), so this names neither a session nor ingress.
 macro_rules! task_network_help {
     () => {
         "Network mode for the task box: `none` gives the box no network (every socket it opens \
