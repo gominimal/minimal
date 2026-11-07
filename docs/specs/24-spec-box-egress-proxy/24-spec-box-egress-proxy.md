@@ -176,6 +176,10 @@ Minting and sealing
 - **BEP-008** IF a box spec declares a GitHub grant and its `egress.allow_dns_hosts` does not admit every host in the module's host set THEN THE SYSTEM SHALL refuse expansion with exit 3 naming each missing host.
   tier:     T1
   verify:   cargo nextest run -p boxes prop_grant_host_set_outside_egress_is_exit_3
+  - WHERE a `host_ip` box has no `egress` section THE SYSTEM SHALL treat its egress as admitting every host in the module's host set.
+    tier:   T0
+    verify: cargo nextest run -p boxes host_ip_grant_box_with_no_egress_section_reaches_the_github_hosts
+    <!-- such a box is allow-all, so it reaches the hosts this requirement protects; it can declare no list, because NET-079 refuses name rules on a host-address box -->
   property: for every box spec and every module host set, expansion refuses with exit 3 iff some host of the set is absent from `egress.allow_dns_hosts`, and the refusal names exactly the absent hosts
 
 - **BEP-009** IF a box spec declares `network.mode = "none"` and a GitHub grant THEN THE SYSTEM SHALL refuse expansion with exit 3.
@@ -478,6 +482,10 @@ Redemption
   verify:   cargo nextest run -p bep prop_undeclared_egress_authority_is_refused
   property: for every egress declaration and every authority, the proxy admits only when the declaration admits the authority, whether or not the request carries a sealed value
   harness:  kani_redeem_requires_egress_admission, same bound and purity constraint as BEP-019
+  - WHEN a `host_ip` box that declares a GitHub grant and has no `egress` section registers with the proxy THE SYSTEM SHALL register the module's host set as its declared egress.
+    tier:   T0
+    verify: cargo nextest run -p minimal host_ip_grant_box_with_no_egress_section_registers_the_github_hosts
+    <!-- the box lists no names, so an empty registration would refuse the hosts BEP-008 lets it reach -->
 
 - **BEP-023** IF a request's `Host` header, or the authority of an absolute-form request target, differs from the connection authority it arrived on THEN THE SYSTEM SHALL refuse the request before substitution.
   tier:     T2
