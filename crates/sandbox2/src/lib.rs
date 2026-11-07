@@ -3087,8 +3087,8 @@ impl PlannedLaunch {
     /// is wired, as a short build step does: the process can end before the
     /// wiring does, and its namespace goes with it. Nothing is left to wire
     /// then, and the process's own exit status is the result, so `None`
-    /// stands for that outcome. The plan's release stays owed, as it does
-    /// for any failed attach.
+    /// stands for that outcome. The plan's release has run by then, because
+    /// a next step's plan can replace what the release gives back.
     ///
     /// # Errors
     ///
@@ -3105,17 +3105,22 @@ impl PlannedLaunch {
 
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     async fn attach_unless_ended(
-        self,
+        mut self,
         spawned: network::Spawned,
         ended: impl FnOnce() -> bool,
     ) -> Result<Option<Box<dyn NetGuard>>, Error> {
-        match self.attach(spawned).await {
-            Ok(guard) => Ok(Some(guard)),
+        match self.network.attach(spawned).await {
+            Ok(guard) => {
+                self.owed = false;
+                Ok(Some(guard))
+            }
             Err(error) => {
+                let error = Error::Network(error);
                 if !ended() {
                     return Err(error);
                 }
                 tracing::debug!(%error, "the process ended before its network attach did");
+                self.abandon().await;
                 Ok(None)
             }
         }
@@ -4011,8 +4016,9 @@ mod tests {
     }
 
     /// A process that ended while its namespace was being wired leaves its
-    /// own exit status as the result, and the plan's release still runs. A
-    /// failed attach of a process that still runs stays a failure.
+    /// own exit status as the result, and the plan's release has run when the
+    /// attach returns, so the next step's plan cannot overtake it. A failed
+    /// attach of a process that still runs stays a failure.
     #[tokio::test]
     async fn a_process_that_ended_during_attach_is_no_attach_failure() {
         let failing = || {
@@ -4026,7 +4032,6 @@ mod tests {
             .attach_unless_ended(network::Spawned::new(1), || true)
             .await;
         assert!(matches!(attached, Ok(None)));
-        tokio::task::yield_now().await;
         assert_eq!(rec.events(), vec!["plan", "attach", "abandon"]);
 
         let rec = failing();
