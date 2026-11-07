@@ -330,12 +330,12 @@ fn project_egress_from(bytes: &[u8]) -> Result<Option<boxes::EgressPolicy>, anyh
     );
     layers.defaults = network_of(Some(&layers.defaults));
     layers.defaults_type = network_of(Some(&layers.defaults_type));
-    let entry_body = network_of(
-        file.get(mfile::entry::EntryTable::Sessions.key())
-            .and_then(toml::Value::as_table)
-            .and_then(|sessions| sessions.get(mfile::spec::DEFAULT_SESSION_ENTRY))
-            .and_then(toml::Value::as_table),
-    );
+    let declared_entry = file
+        .get(mfile::entry::EntryTable::Sessions.key())
+        .and_then(toml::Value::as_table)
+        .and_then(|sessions| sessions.get(mfile::spec::DEFAULT_SESSION_ENTRY))
+        .and_then(toml::Value::as_table);
+    let entry_body = network_of(declared_entry);
     if layers.defaults.is_empty() && layers.defaults_type.is_empty() && entry_body.is_empty() {
         return Ok(None);
     }
@@ -344,11 +344,13 @@ fn project_egress_from(bytes: &[u8]) -> Result<Option<boxes::EgressPolicy>, anyh
         table: mfile::entry::EntryTable::Sessions,
         box_type: Some(boxes::SESSION_BOX_TYPE.to_owned()),
         body: entry_body,
+        implicit: declared_entry.is_none(),
     };
     let mut expansion =
         mfile::expand::expand(&entry, &layers).map_err(|error| ProjectFileInvalid { error })?;
-    // The network module's own read: legacy spellings print the hint that
-    // `--network` prints, and a malformed egress table refuses the start.
+    // The network module's own read: a malformed egress table refuses the
+    // start. A legacy spelling still loads, so its hint goes to the log and
+    // never prints before the box shell on a healthy start.
     let hints = mfile::network::canonicalize(&mut expansion.spec).map_err(|error| {
         anyhow::anyhow!(
             "Cannot start the box: the project's {name} does not load: {error}",
@@ -356,7 +358,7 @@ fn project_egress_from(bytes: &[u8]) -> Result<Option<boxes::EgressPolicy>, anyh
         )
     })?;
     for hint in hints {
-        eprintln!("{hint}");
+        tracing::info!(hint = %hint, "the project's network keys use a legacy spelling");
     }
     let Some(egress) = expansion
         .spec
