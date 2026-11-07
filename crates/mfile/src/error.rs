@@ -44,6 +44,16 @@ pub enum Error {
         layer: String,
         problem: SpecKeyProblem,
     },
+    /// The file carries a legacy table, and this release is past the one
+    /// release that read it (BOX-050). Carries the file, when it is known,
+    /// and the table. Exits 3.
+    LegacyTable {
+        path: Option<PathBuf>,
+        legacy: crate::legacy::LegacyTable,
+    },
+    /// A `[tasks.<name>]` entry sets `interactive = true` (BOX-054). Carries
+    /// the task name. Exits 3.
+    InteractiveTask(String),
 }
 
 /// What is wrong with a key of an expanded box spec.
@@ -107,7 +117,10 @@ impl Error {
     #[must_use]
     pub fn exit_code(&self) -> Option<u8> {
         match self {
-            Error::InvalidEntryName { .. } | Error::InvalidSpecKey { .. } => Some(3),
+            Error::InvalidEntryName { .. }
+            | Error::InvalidSpecKey { .. }
+            | Error::LegacyTable { .. }
+            | Error::InteractiveTask(_) => Some(3),
             _ => None,
         }
     }
@@ -230,6 +243,24 @@ impl fmt::Display for Error {
                      {expected}. Fix the value."
                 ),
             },
+            Error::LegacyTable { path, legacy } => {
+                match path {
+                    Some(path) => write!(f, "{}: ", path.display())?,
+                    None => write!(f, "minimal.toml: ")?,
+                }
+                write!(
+                    f,
+                    "this release no longer reads {}.\n{legacy}",
+                    legacy.what()
+                )
+            }
+            Error::InteractiveTask(name) => write!(
+                f,
+                "`{}` in minimal.toml sets `interactive = true`, and a task \
+                 cannot be interactive. Declare the entry as `{}` instead.",
+                EntryHeader("tasks", name),
+                EntryHeader("sessions", name)
+            ),
         }
     }
 }
@@ -249,6 +280,8 @@ impl std::error::Error for Error {
             Error::HarnessTable(_) => None,
             Error::InvalidEntryName { .. } => None,
             Error::InvalidSpecKey { .. } => None,
+            Error::LegacyTable { .. } => None,
+            Error::InteractiveTask(_) => None,
         }
     }
 }
