@@ -11947,14 +11947,15 @@ mod tests {
             "another box's id proves nothing of this row"
         );
         assert!(
-            registry
-                .rename_client_box(
+            matches!(
+                registry.rename_client_box(
                     "front",
                     web.switch_addr(),
                     api.loopback_addr(),
                     web.box_id()
-                )
-                .is_err(),
+                ),
+                Err(RenameError::NotTheHandedPair { .. })
+            ),
             "another pair proves nothing of this row"
         );
         assert_eq!(

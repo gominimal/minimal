@@ -4184,9 +4184,7 @@ mod rename_box_tests {
 
         let without_id = r#"{"verb":"rename_box","name":"web","new_name":"front",
             "switch_address":"100.64.0.7","loopback_address":"127.0.64.3"}"#;
-        assert!(
-            serde_json_lenient::from_str::<BoxControlRequest>(without_id).is_err(),
-            "a rename without the box id is refused at the parse"
-        );
+        serde_json_lenient::from_str::<BoxControlRequest>(without_id)
+            .expect_err("a rename without the box id is refused at the parse");
     }
 }
