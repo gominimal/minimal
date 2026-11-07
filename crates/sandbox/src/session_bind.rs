@@ -1081,7 +1081,7 @@ mod tests {
         // SAFETY: the closure runs in the forked child, which is
         // single-threaded; it makes plain filesystem calls and returns a code.
         let mut command = unsafe {
-            container.command_from_closure(|| {
+            container.command_from_closure(move || {
                 let Ok(home) = open_dir(Path::new("/t/home")) else {
                     return 10;
                 };
