@@ -148,7 +148,10 @@ fn task_box_network(
     // An own-address box on a VM host registers with the VM host daemon
     // under the name it will have, before its create (T66). A task box is a
     // fresh instance, which the daemon names only at the create, so the
-    // run refuses rather than create a box that no host row holds.
+    // run refuses rather than create a box that no host row holds. This is
+    // interim (#3162): the refusal goes when a fresh-instance task box can
+    // register its host row under the name the daemon gives it at the
+    // create (T66).
     if network == boxes::NetworkMode::OwnIp && kind == paths::HostKind::Minvmd {
         bail!(
             "Cannot run the task: --network own_ip is not available to `min task run` on a \
