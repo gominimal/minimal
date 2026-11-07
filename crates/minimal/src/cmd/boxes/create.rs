@@ -214,10 +214,23 @@ impl std::fmt::Display for SessionEntryUndecided {
                 write!(
                     f,
                     "Cannot start the box: the project's {file} declares the entry \"{name}\" \
-                     with {kind}, so the start cannot tell whether it is a session entry. \
-                     If \"{name}\" is the session to start, set type = \"session\" in it. \
-                     Otherwise, rename the session entry to start to \"default\" in {file}."
-                )
+                     with {kind}, so the start cannot tell whether it is a session entry. "
+                )?;
+                // An entry already holds the name `default`, so no other
+                // entry can take it.
+                if name == mfile::entry::DEFAULT_ENTRY_NAME {
+                    write!(
+                        f,
+                        "Set type = \"session\" in the entry \"{name}\", or rename that entry \
+                         and add a [sessions.<name>] entry to {file}."
+                    )
+                } else {
+                    write!(
+                        f,
+                        "If \"{name}\" is the session to start, set type = \"session\" in it. \
+                         Otherwise, rename the session entry to start to \"default\" in {file}."
+                    )
+                }
             }
         }
     }
@@ -438,7 +451,8 @@ fn project_egress(project: &camino::Utf8Path) -> anyhow::Result<ProjectEgress> {
 }
 
 /// Whether any `network` key appears in `[defaults]`, in a
-/// `[defaults.<type>]` table, or in an entry of the file.
+/// `[defaults.<type>]` table, in a `[box_types.<name>.defaults]` table, or
+/// in an entry of the file.
 fn declares_network(file: &toml::Table, entries: &[mfile::entry::BoxEntry]) -> bool {
     let defaults = file.get("defaults").and_then(toml::Value::as_table);
     let in_defaults = defaults.is_some_and(|defaults| {
@@ -448,7 +462,18 @@ fn declares_network(file: &toml::Table, entries: &[mfile::entry::BoxEntry]) -> b
                 .filter_map(toml::Value::as_table)
                 .any(|table| table.contains_key("network"))
     });
+    let in_type_defaults = file
+        .get("box_types")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|types| {
+            types
+                .values()
+                .filter_map(toml::Value::as_table)
+                .filter_map(|box_type| box_type.get("defaults").and_then(toml::Value::as_table))
+                .any(|defaults| defaults.contains_key("network"))
+        });
     in_defaults
+        || in_type_defaults
         || entries
             .iter()
             .any(|entry| entry.body.contains_key("network"))
@@ -5135,8 +5160,24 @@ mod tests {
             undecided.to_string(),
             "Cannot start the box: the project's minimal.toml declares the entry \"default\" \
              with the type \"devbox\", so the start cannot tell whether it is a session entry. \
-             If \"default\" is the session to start, set type = \"session\" in it. \
-             Otherwise, rename the session entry to start to \"default\" in minimal.toml."
+             Set type = \"session\" in the entry \"default\", or rename that entry \
+             and add a [sessions.<name>] entry to minimal.toml."
+        );
+
+        // Egress only in a project Box Type's defaults is still egress: an
+        // undecided pick refuses the start rather than drop it.
+        let refusal = project_egress_from(
+            b"[box_types.devbox]\nextends = \"session\"\n\n\
+              [box_types.devbox.defaults.network.egress]\nallow_dns_hosts = [\"t.example\"]\n\n\
+              [boxes.dev]\ntype = \"devbox\"\n",
+        )
+        .expect_err("egress in a type's defaults refuses an undecided start");
+        assert!(
+            matches!(
+                refusal.downcast_ref::<SessionEntryUndecided>(),
+                Some(SessionEntryUndecided::TypeUnresolved { name, .. }) if name == "dev"
+            ),
+            "{refusal:#}"
         );
 
         // A file that declares no egress starts with no project egress, even
