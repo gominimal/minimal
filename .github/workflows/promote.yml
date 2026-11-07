@@ -438,7 +438,7 @@ jobs:
               run: |
                   set -euo pipefail
                   if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                    echo "::notice::'$VERSION' is not a final version (a nightly sha); nothing to report"
+                    echo "::notice::'$VERSION' is not a final version (a nightly sha or a prerelease); not reported"
                     exit 0
                   fi
                   gh api repos/gominimal/release-ops/dispatches \
