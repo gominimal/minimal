@@ -4018,7 +4018,10 @@ mod tests {
             let plan = Plan { items: vec![item] };
             let guard = "if ! command -v systemctl >/dev/null 2>&1 ; then";
             let script = plan.script().expect("a missing item carries its block");
-            assert!(script.contains(guard), "the block guards its units on systemctl");
+            assert!(
+                script.contains(guard),
+                "the block guards its units on systemctl"
+            );
             // The host's own systemctl is on the confined PATH, so the
             // no-systemctl branch is taken by rewriting the guard.
             let script = if systemd {

@@ -458,7 +458,12 @@ pub async fn read_fact_and_watch_placement(
     read();
     let at_reading = at_reading?;
     *FACT_CGROUP.lock().await = Some(at_reading);
-    Some(crate::traced::spawn(re_read_when_moved(root, mountinfo_knob, poll, own_cgroup)))
+    Some(crate::traced::spawn(re_read_when_moved(
+        root,
+        mountinfo_knob,
+        poll,
+        own_cgroup,
+    )))
 }
 
 /// The watch [`read_fact_and_watch_placement`] starts: every `poll`, reads
@@ -473,7 +478,13 @@ pub async fn re_read_when_moved(
     loop {
         tokio::time::sleep(poll).await;
         let now = own_cgroup();
-        re_read_if_moved(root.clone(), mountinfo_knob.clone(), now, "the cgroup watch").await;
+        re_read_if_moved(
+            root.clone(),
+            mountinfo_knob.clone(),
+            now,
+            "the cgroup watch",
+        )
+        .await;
     }
 }
 

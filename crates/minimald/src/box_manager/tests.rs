@@ -5474,7 +5474,11 @@ async fn a_daemon_moved_after_its_start_reading_re_reads_the_classifier_fact() {
     )
     .await;
     assert!(watch.is_none(), "a guest daemon starts no watch");
-    assert_eq!(*calls.lock().unwrap(), ["read"], "a guest daemon reads no cgroup");
+    assert_eq!(
+        *calls.lock().unwrap(),
+        ["read"],
+        "a guest daemon reads no cgroup"
+    );
     assert_eq!(crate::box_runtime::fact_cgroup().await, None);
 
     // A native daemon whose cgroup is unreadable: nothing to compare.
@@ -5509,7 +5513,10 @@ async fn a_daemon_moved_after_its_start_reading_re_reads_the_classifier_fact() {
     )
     .await;
     assert!(reset.1.is_some(), "a native daemon watches its cgroup");
-    assert_eq!(crate::box_runtime::fact_cgroup().await.as_deref(), Some(BEFORE));
+    assert_eq!(
+        crate::box_runtime::fact_cgroup().await.as_deref(),
+        Some(BEFORE)
+    );
     // Not moved, then unreadable: neither is a move.
     tokio::time::sleep(Duration::from_millis(80)).await;
     *cgroup.lock().unwrap() = None;
@@ -5524,7 +5531,10 @@ async fn a_daemon_moved_after_its_start_reading_re_reads_the_classifier_fact() {
     wait_for_re_read().await;
     assert_eq!(crate::box_runtime::host_ip_enforcement_fact().cause, None);
     stop_watch(&mut reset).await;
-    assert_eq!(crate::box_runtime::fact_cgroup().await.as_deref(), Some(LEAF));
+    assert_eq!(
+        crate::box_runtime::fact_cgroup().await.as_deref(),
+        Some(LEAF)
+    );
     let logged = capture.contents();
     assert!(
         logged.lines().any(|line| line
@@ -5548,7 +5558,10 @@ async fn a_daemon_moved_after_its_start_reading_re_reads_the_classifier_fact() {
     .await;
     wait_for_re_read().await;
     stop_watch(&mut reset).await;
-    assert_eq!(crate::box_runtime::fact_cgroup().await.as_deref(), Some(LEAF));
+    assert_eq!(
+        crate::box_runtime::fact_cgroup().await.as_deref(),
+        Some(LEAF)
+    );
 }
 
 /// gominimal/inbox#1054: a host-address create that finds the daemon in
