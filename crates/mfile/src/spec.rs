@@ -6,7 +6,7 @@
 //! `[session]` table or a declared `[tasks.<name>]` entry, and from the
 //! command-line flags of the creating command. It serializes under the
 //! `box.toml` tables: `box.type`, `box.lifetime`, `io.pty_enabled`,
-//! `execution.exec`, `execution.timeout`, `install.packages`, `network.mode` and
+//! `execution.exec`, `install.packages`, `network.mode` and
 //! `network.egress.*`.
 //!
 //! The v0 bytes also carry keys that `box.toml` does not have. #2410 ends
@@ -16,6 +16,9 @@
 //!   or maps them to `box.toml` tables.
 //! - `execution.exec` is an argv array, not the `box.toml` string. A shell
 //!   entrypoint leaves the key out.
+//! - `execution.timeout` is a whole number of seconds, not the `box.toml`
+//!   duration string, and a spec with no timeout leaves the key out in place
+//!   of `"0"`.
 //! - `network.ingress` keeps the [`boxes::IngressPolicy`] shape
 //!   (`port_mappings`, `dynamic_allowed_range`, `dynamic_ingress`), not the
 //!   `box.toml` `[{proto, port}]` list.
@@ -81,6 +84,11 @@ pub struct BoxSpec {
     /// How long the box may run, in whole seconds, when its entry sets a
     /// `timeout` other than zero (BOX-049). Serialized as
     /// `execution.timeout`, and left out when `None`.
+    ///
+    /// The spec stores and round-trips this value, but the daemon does not
+    /// read this key yet, so the box runs with no limit. See
+    /// <https://github.com/gominimal/minimal/issues/3114>, the task that makes
+    /// the daemon end the box at its timeout (BOX-037).
     pub timeout: Option<u64>,
     /// The box's network settings.
     pub network: SpecNetwork,
