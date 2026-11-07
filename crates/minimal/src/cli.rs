@@ -847,8 +847,8 @@ pub struct BoxRenameArgs {
     pub new_name: String,
 }
 
-// BOX-021 (BCLI-061, BCLI-005): `min box prune [--older-than <d>]
-// [--parent <box>] [--yes]`.
+// BOX-021 (BCLI-061, BCLI-005, BCLI-006): `min box prune [--older-than <d>]
+// [--parent <box>] [--yes] [--dry-run]`.
 #[derive(Debug, Args)]
 pub struct BoxPruneArgs {
     /// Remove only the boxes that stopped or exited at least this long ago.
@@ -863,6 +863,10 @@ pub struct BoxPruneArgs {
     /// Remove the boxes without asking first
     #[arg(long, short)]
     pub yes: bool,
+    /// List the boxes prune would remove and the disk each one holds, and
+    /// remove nothing
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 /// Parses the `--older-than` age of `min box prune`: a whole number with a
