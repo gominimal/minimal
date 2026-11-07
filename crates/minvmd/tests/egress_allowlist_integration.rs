@@ -494,8 +494,8 @@ const BOX_PROBE: &str = "echo '--- cgroup ---'; cat /proc/self/cgroup; \
     echo '--- /proc/net/tcp ---'; cat /proc/net/tcp; \
     echo '--- resolv.conf ---'; cat /etc/resolv.conf";
 
-/// Project file to upload into the session workspace. Its `[session]` packages
-/// provide the toolchain binaries the test execs; `[upstream]` points at the
+/// Project file to upload into the session workspace. Its `[defaults.session]`
+/// packages provide the toolchain binaries the test execs; `[upstream]` points at the
 /// shared package repo the composer needs to resolve them.
 fn toolchain_project_toml() -> String {
     let upstream = r#"
@@ -507,7 +507,7 @@ locked_commit = "f4de33d06dada4edcf5076dded10e9c303cf597e"
     format!(
         r#"{}
 
-[session]
+[defaults.session]
 packages = [
     "base",
     "coreutils",
