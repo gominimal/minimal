@@ -54,6 +54,12 @@ expect 0 "nightly sha" "a sha in stable warns and passes" -- check 0.7.3 014fa3e
 # Bad input.
 expect 1 "neither a version" "junk is refused" -- check latest 0.7.2
 expect 1 "cannot read" "a junk stable is refused" -- check 0.7.3 "<html>"
+expect 1 "cannot read" "a junk stable is refused for a nightly sha" -- check 014fa3eb "<html>"
+expect 1 "cannot read" "a stable with a junk tail is refused" -- check 0.7.5 0.7.4garbage
+expect 1 "cannot read" "a stable with a junk candidate tail is refused" -- check 0.7.5 "0.7.4-rc1 x"
+expect 1 "cannot read" "a stable with a leading junk is refused" -- check 0.7.5 x0.7.4
+expect 1 "cannot read" "a partial version in stable is refused" -- check 0.7.5 0.7
+expect 0 "can replace stable" "a final replaces a dotted candidate" -- check 0.7.3 0.7.3-rc.1
 expect 1 "required" "an empty stable is refused" -- "$script" --version 0.7.3
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

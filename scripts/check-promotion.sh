@@ -38,6 +38,10 @@ if [ -z "$VERSION" ] || [ -z "$CURRENT" ]; then die "--version and --current are
 
 core='[0-9]+\.[0-9]+\.[0-9]+'
 sha='[0-9a-f]{7,40}'
+candidate="$core-[0-9A-Za-z.-]+"
+
+# Checked first, so nothing passes over an unreadable `stable`.
+[[ "$CURRENT" =~ ^($sha|$core|$candidate)$ ]] || die "cannot read the current stable: '$CURRENT'"
 
 if [[ "$VERSION" =~ ^$sha$ ]]; then
     printf '::warning::%s is a nightly sha, which has no order against stable (%s)\n' "$VERSION" "$CURRENT"
@@ -49,7 +53,6 @@ if [[ "$CURRENT" =~ ^$sha$ ]]; then
     printf '::warning::stable is the nightly sha %s, which has no order against %s\n' "$CURRENT" "$VERSION"
     exit 0
 fi
-[[ "$CURRENT" =~ ^$core ]] || die "cannot read the current stable: '$CURRENT'"
 
 # VERSION is a final, so only the core of CURRENT matters: a final outranks a
 # candidate of the same core.
