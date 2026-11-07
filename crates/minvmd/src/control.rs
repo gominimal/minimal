@@ -1269,12 +1269,14 @@ fn serve_request(
         }
         (BoxControlRequest::Withdraw(request), ControlDoor::Host) => {
             let reply = order.apply(|| {
-                let (name, switch_address) = (request.name.clone(), request.switch_address);
-                let reply = withdraw_box(boxes, answerer, request);
+                let switch_address = request.switch_address;
+                let (reply, held) = withdraw_box(boxes, answerer, request);
                 // The box is gone: its audit window ends, and the count of
-                // the records it suppressed lands now.
-                if matches!(reply, BoxControlReply::Addresses(_)) {
-                    flush_guest_audit(audit_path, &name, GuestAuditKey::Switch(switch_address));
+                // the records it suppressed lands now, labelled with the
+                // name the host held the box under — not the one a session
+                // renamed since its registration presents (#1116).
+                if let Some(held) = held {
+                    flush_guest_audit(audit_path, &held, GuestAuditKey::Switch(switch_address));
                 }
                 reply
             });
@@ -2423,12 +2425,14 @@ fn allocate_box_address_keeping(
 /// One info line per withdrawal names the box and both addresses, mirroring
 /// the registration's; a withdrawal that finds no row is the goal state
 /// already holding (already withdrawn, or the daemon restarted since) and
-/// is a debug line, not an error.
+/// is a debug line, not an error. Beside the reply, the name the host held
+/// the box under, on a withdrawal it accepted (`None` on a refusal): a
+/// session renamed since its registration presents another (#1116).
 fn withdraw_box(
     boxes: &BoxRegistry,
     answerer: &AnswererStatus,
     request: WithdrawBoxRequest,
-) -> BoxControlReply {
+) -> (BoxControlReply, Option<String>) {
     match boxes.withdraw_client_box_held(
         &request.name,
         request.switch_address,
@@ -2460,10 +2464,11 @@ fn withdraw_box(
                     "no host row held at the withdrawn switch address; already withdrawn"
                 );
             }
-            BoxControlReply::Addresses(BoxAddresses {
+            let reply = BoxControlReply::Addresses(BoxAddresses {
                 switch_address: request.switch_address,
                 loopback_address: request.loopback_address,
-            })
+            });
+            (reply, Some(held))
         }
         Err(error) => {
             tracing::debug!(
@@ -2472,9 +2477,10 @@ fn withdraw_box(
                 error = %error,
                 "box row withdrawal refused"
             );
-            BoxControlReply::Error {
+            let reply = BoxControlReply::Error {
                 error: error.to_string(),
-            }
+            };
+            (reply, None)
         }
     }
 }

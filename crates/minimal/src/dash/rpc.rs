@@ -344,7 +344,7 @@ pub async fn record_of(host: &mut Host, id: SessionId) -> Option<boxes::Record> 
 pub async fn prepare_attach(
     sock: &Path,
     record: Option<boxes::Record>,
-) -> anyhow::Result<Option<boxes::BoxAddresses>> {
+) -> anyhow::Result<Option<(boxes::BoxAddresses, Option<boxes::BoxId>)>> {
     minimal_client::box_registration::resume_box_row(sock, record.as_ref()).await?;
     // A `host_ip` box's egress, re-admitted as `min session attach` re-admits
     // it: a VM host daemon that restarted holds none, and its gate then drops
@@ -371,7 +371,10 @@ pub async fn prepare_attach(
         )
         .await;
     }
-    Ok(record.and_then(|record| record.box_addresses))
+    // The pair and the box id beside it, for the after-attach withdrawal:
+    // the id proves a box renamed since its registration (#1116), and goes
+    // only with a pair.
+    Ok(record.and_then(|record| record.box_addresses.map(|pair| (pair, record.box_id))))
 }
 
 /// Settles what destroyed session `id` held on the VM host daemon beside
@@ -1231,7 +1234,11 @@ mod tests {
         let pair = prepare_attach(&ssh_sock, Some(record))
             .await
             .expect("the VM host answers the resume");
-        assert_eq!(pair, Some(addresses), "the attach keeps the pair it read");
+        assert_eq!(
+            pair,
+            Some((addresses, None)),
+            "the attach keeps the pair it read"
+        );
         let lines = server.join().unwrap();
         assert_eq!(lines.len(), 1, "one resume before the attach");
         let request: minimald_rpc::BoxControlRequest =
